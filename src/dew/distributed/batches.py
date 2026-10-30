@@ -313,6 +313,12 @@ def prefetched_bytes(batch: Batch, shardings: Placement[Batch], depth: int = PRE
     return (depth + 1) * placed_bytes(placed_shapes(batch, shardings))
 
 
+def restore_position(source: Checkpointable, saved: bytes) -> None:
+    """Set `source` to the position `saved` holds, as its own `get_state` gives one: the bytes
+    themselves, or the JSON they encode."""
+    source.set_state(saved if isinstance(source.get_state(), bytes) else json.loads(saved))
+
+
 class DevicePrefetchIterator:
     """Reads batches on a worker thread and places them on the mesh ahead of the step.
 
@@ -455,9 +461,7 @@ class DevicePrefetchIterator:
             if not self._stop.is_set() and self.source_state is not None:
                 if source is None:
                     raise TypeError(f"{self._source_name} cannot resume from a saved position")
-                saved = self.source_state
-                source.set_state(saved if isinstance(source.get_state(), bytes)
-                                 else json.loads(saved))
+                restore_position(source, self.source_state)
             while not self._stop.is_set():
                 with region("data.read"):
                     batch = next(iterator)

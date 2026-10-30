@@ -424,15 +424,21 @@ DENSE_BIAS_SEEDS = 8
 """Check 1's declared seeds for a dense bias named onto the template."""
 
 
+@pytest.mark.parametrize("deterministic", [True, False], ids=["deterministic", "fast"])
 @pytest.mark.parametrize("rows, heads", [(2, HEADS), (1, HEADS), (1, 1)],
                          ids=["a bias a row", "one bias every row", "one bias every row and head"])
-def test_a_dense_bias_named_onto_the_template_is_on_par_with_the_reference_path(rows, heads):
+def test_a_dense_bias_named_onto_the_template_is_on_par_with_the_reference_path(rows, heads, deterministic,
+                                                                                request):
     """A causal bf16 call whose bias varies by query, `[B or 1, H or 1, Q, K]` (a learned relative
     position's, T5's one table for every row), named onto the template: its score hook reads the bias a
     tile at a time where it is shared, never broadcast (`template.biased`, a `Kind.TILE` parameter at
     `template.shared_place`), on par (check 1) with the reference path's dense bias from float64, its
     output and the query's, key's, value's and bias's gradients, the bias's in its own shape (rows 2081,
-    2523)."""
+    2523). In both of the Mosaic backward's schedules for a shared bias: deterministic mode's, each program
+    its own place summed after, and the default's, the programs' adds into one place (`deterministic`
+    False drops the lane's --xla_gpu_deterministic_ops, `without_deterministic_ops`; row 2645)."""
+    if not deterministic:
+        request.getfixturevalue("without_deterministic_ops")
     queries = 40
 
     def drawn(seed):

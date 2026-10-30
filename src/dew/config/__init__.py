@@ -83,7 +83,7 @@ from dew.registry import (
 )
 from dew.state import TrainState
 from dew.telemetry.records import RunRecord, TrialFinished, json_value, packages_installed
-from dew.training.ahead import AheadOfTime, AheadTarget, CompiledAhead, compile_only_gpus
+from dew.training.ahead import AheadOfTime, AheadTarget, CompiledAhead
 from dew.training.budget import Pause, Plateau, budget_tokens, run_length, run_steps
 from dew.training.cooldown import Cooldowns
 from dew.training.display import TrainingDisplay
@@ -614,15 +614,8 @@ class TrainerConfig:
     each of its Pallas kernels to Triton. A kernel that would fail the GPU's
     first compile there fails here, in seconds and without the GPU; XLA's
     compile of the whole step still needs one. The program exits with status
-    0 once the step lowers, and opens no W&B run.
-
-    A TPU topology, `--trainer.lower-for v5e:4x4` (as
-    `jax.experimental.topologies` names one), builds the run's mesh over that
-    topology's devices and compiles its first step for them on any host that
-    holds libtpu, as MaxText's train_compile does: the run saves the executable
-    in its checkpoint directory, `compiled-v5e-4x4`, with each device's memory
-    and work beside it (`compiled-v5e-4x4.json`, `dew.training._lowering.Lowered`),
-    and exits.
+    0 once the step lowers, and opens no W&B run. A TPU topology's step compiles ahead
+    (`compile_ahead`).
     """
     compile_ahead: Annotated[AheadTarget, tyro.conf.subcommand("ahead")] | None = None
     """Compile the run's first step for GPUs this host lacks, save it, then exit without training.
@@ -632,7 +625,9 @@ class TrainerConfig:
     H100s (`dew.training.ahead`), compiles its first step there with XLA's CUDA compiler, which needs
     the CUDA plugin and no GPU, and writes it with what it costs: each device's peak bytes and the
     step's FLOPs, read before booking the GPUs. The program exits with status 0, and writes no
-    checkpoint or tracking.
+    checkpoint or tracking. A TPU topology compiles the same way on any host that holds libtpu, as
+    MaxText's train_compile does: `--trainer.compile-ahead.generation v5e:4x4
+    --trainer.compile-ahead.devices 16`, the step loading on a host of that topology alone.
 
     `--trainer.compile-ahead.capacity-gib 80` states each GPU's memory, and the run's own fit search
     then plans the step there as a run would, its log and the saved step naming every program it
@@ -653,8 +648,8 @@ class TrainerConfig:
     """The links of the run's split axes, by axis name (`Trainer`'s `links`), stated where no process
     measures them as they are or should not: a step spreads an axis's projections as its stated link
     would, `--set trainer.links='{"tensor": {"bytes_per_second": 4.5e11, "flops_per_second": 9.9e14}}'`.
-    Unnamed, an axis's link is measured on its devices. A step compiled ahead states its target's own
-    (`AheadTarget.links`)."""
+    Unnamed, an axis's link is measured on its devices, and on compile-only ones none is: a step
+    compiled ahead compiles with these and records them (`AheadOfTime.links`)."""
     tune_kernels: bool = False
     """Measure each Pallas launch of the step that has no config measured on this GPU.
 
@@ -1727,7 +1722,7 @@ class RunConfig:
         if dataset.plan is not None:
             summary = {**(summary or {}), "data_plan": dataset.plan.record()}
         if trainer.compile_ahead is not None:
-            raise self.compiled_ahead(objective, dataset, steps, rollout)
+            raise self.compiled_ahead(objective, dataset, steps, rollout, name)
         tracker = checkpoints = None
         try:
             wandb_tracker = None
@@ -1797,16 +1792,21 @@ class RunConfig:
             _closed(tracker, checkpoints, sys.exception())
 
     def compiled_ahead[LossT, EffectsT](self, objective: Objective[LossT, EffectsT], dataset: Loader,
-                                         steps: int | None, rollout: Rollout | None) -> CompiledAhead:
+                                         steps: int | None, rollout: Rollout | None,
+                                         name: str) -> CompiledAhead:
         """The run's first step compiled for its `compile_ahead` target and saved
-        (`AheadTarget.compiled`), its trainer built as `train` builds it, over that target's
-        compile-only GPUs, with no checkpoints or tracker: what ends a run that compiles ahead."""
+        (`AheadTarget.compiled`), its trainer built as `train` builds it, its links the run's own, over
+        that target's compile-only devices (`AheadTarget.compile_only`), with no tracker: what ends a run
+        that compiles ahead. A run `name` whose directory holds its checkpoints reads them, and compiles the
+        step its resume takes; one that has none writes none."""
         target = self.trainer.compile_ahead
         assert target is not None
-        mesh = self.trainer.mesh.build(compile_only_gpus(target.generation, target.devices, target.capacity))
+        mesh = self.trainer.mesh.build(target.compile_only())
+        held = epath.Path(self.trainer.checkpoint_dir, name).is_dir()
+        trainer = self.built(objective, mesh, rollout,
+                             checkpoints=self.trainer.checkpoints(name) if held else None)
         with generation.run_precision(self.trainer.precision):
-            return target.compiled(self.built(objective, mesh, rollout, links=target.links), dataset, steps,
-                                   self.trainer.examples if steps is None else None)
+            return target.compiled(trainer, dataset, steps, self.trainer.examples if steps is None else None)
 
     def grouped(self, objective: Objective[Loss, Effects], name: str) -> OptimConfig:
         """The run's optimizer as it trains under `name`: each group it names that claims the modules its

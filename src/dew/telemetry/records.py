@@ -155,8 +155,9 @@ class StepCompiled:
     the mesh splits, by axis name, the arithmetic of the check that it
     fits this process's devices (`dew.training.memory.memory_record`), and
     its plan: the microbatches it reads each batch in, their rows, every
-    compile the search made (`dew.training.memory.Probe`), and its kernels
-    (`dew.training._lowering.KernelReport.record`)."""
+    compile the search made (`dew.training.memory.Probe`), its kernels
+    (`dew.training._lowering.KernelReport.record`), and the kernels those compiles found spilling and
+    the launch configs they refused (`dew.training.planning.FitSearch.kernels`)."""
     seconds: float
     remat: JSON
     links: Mapping[str, AxisLink]

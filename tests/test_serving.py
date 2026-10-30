@@ -511,6 +511,27 @@ def test_a_server_round_after_the_first_reuses_its_programs_and_reads_once_a_ste
         np.testing.assert_array_equal(mine.host().tokens, theirs.host().tokens)
 
 
+def test_a_servers_step_runs_one_executable_for_each_admission_size():
+    """A server's step (`dew.inference.serving_kernel.dispatched`) asks its program for the executable a
+    call takes once for each size of admission, and runs it with the dynamic arguments alone after: no
+    later step builds the program's dispatch key over the weights and cache (train 329's review: about 1
+    ms a step)."""
+    from dew.inference.serving_kernel import dispatched
+
+    asked: list[int | None] = []
+
+    class Program:
+        def executable(self, model, params, pad_id, placement, steps, resident, carried, admission, *rest):
+            asked.append(None if admission is None else len(admission["slots"]))
+            return lambda *dynamic: dynamic[3]
+
+    step = dispatched(Program())
+    sizes = [None, {"slots": np.zeros(2)}, None, {"slots": np.zeros(2)}, {"slots": np.zeros(4)}, None]
+    ran = [step("model", {}, 0, "placement", 1, "resident", "carried", admission, (), (), None)
+           for admission in sizes]
+    assert asked == [None, 2, 4] and ran == sizes
+
+
 @pytest.mark.parametrize("decode_steps", [1, 4])
 def test_a_step_whose_draw_has_no_distribution_stops_the_server(decode_steps):
     """A bigram policy that draws 5 after every id but 5, after which every score is 3e38, which
