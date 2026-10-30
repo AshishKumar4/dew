@@ -183,7 +183,7 @@ def test_a_packed_documents_engram_lookback_stops_at_its_start_whatever_its_posi
     from 10, which a lookback bounded by positions read as a predecessor of the first document's."""
     from dew.nn.engram import EngramHashes
 
-    spec = Engram(layer_ids=(0,), num_embeddings=(64,), max_ngram_size=3, vocab_size=16, n_heads=2,
+    spec = Engram(layer_ids=(0,), num_embeddings=(88,), max_ngram_size=3, vocab_size=16, n_heads=2,
                   head_dim=4, compressed_vocab_size=16)
     hashes = EngramHashes(spec, 16)
     packed = jnp.asarray([[3, 5, 7, 9, 11]], jnp.int32)
