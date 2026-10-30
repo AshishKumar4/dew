@@ -205,12 +205,14 @@ def test_a_run_names_its_lettered_question_read_in_context_on_the_command_line(t
     config = DecisionRunConfig.cli(
         ["--pretrained", str(LLAMA.parent / "qwen38-dense-tiny"), "--segments",
          json.dumps(to_record(SEGMENTS, tuple[Segment, ...])), "--context-layers", "0", "head:letters",
-         "--head.count", "4", "--trainer.name", "letters",
+         "--head.count", "4", "--head.labels", json.dumps(to_record(LABELS, Labels)),
+         "--trainer.name", "letters",
          "--trainer.checkpoint-dir", str(tmp_path / "runs"), "--trainer.steps", "1",
          "--trainer.checkpoint-every", "1", "--trainer.multi-host", "False",
          "--trainer.compilation-cache-dir", "None", "--model.dtype", "float32"],
         default=DecisionRunConfig(data=rows))
-    assert config.segments == SEGMENTS and isinstance(config.head, Letters)
+    # The run's own labels, each a single token of the backbone's byte-level vocabulary.
+    assert config.segments == SEGMENTS and isinstance(config.head, Letters) and config.head.labels == LABELS
     with pytest.raises(ValueError):
         dataclasses.replace(config, context_layers=None).prepare()
     # The same question read in the row, its option lines with it, needs no context layers.
