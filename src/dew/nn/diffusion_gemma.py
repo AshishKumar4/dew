@@ -27,6 +27,7 @@ from dew.nn.mlp import GatedMLP
 from dew.nn.multimodal import VisionConditioner
 from dew.nn.norms import RMSNorm
 from dew.nn.precision import at_least_fp32, float32_einsum
+from dew.nn.progress import Progress
 from dew.nn.protocols import OutputTable
 from dew.nn.wrapping import DecoderWrapper
 
@@ -177,20 +178,21 @@ class DiffusionGemma(DecoderWrapper):
                image_groups=None, block_groups=None, rotary_positions=None,
                attention_pairwise_mask=None, attention_key_positions=None,
                conditioning: Mapping[str, jax.Array] | None = None, train: bool = False,
-               states: bool = False):
+               states: bool = False, progress: Progress | None = None):
         """Append a clean prompt or committed canvas to the cache, evaluating media only when given.
 
         It returns the logits, or with `states` the final normalized states
         before the head. A loss that scores the vocabulary a tile at a time
         reads the states, so the vocabulary-sized logits of a whole row never
-        exist at once. The tokens are laid out by their `coordinates`.
+        exist at once. The tokens are laid out by their `coordinates`, at a
+        training step's `progress` (`dew.nn.progress`; None at the run's end).
         """
         read = self.text.hidden_states if states else self.text
         tokens, embeddings = self._clean_inputs(tokens, image_indices, conditioning, train)
         return read(tokens, decode=True, train=train, input_embeddings=embeddings, coordinates=coordinates,
                     image_groups=image_groups, block_groups=block_groups, rotary_positions=rotary_positions,
                     attention_pairwise_mask=attention_pairwise_mask,
-                    attention_key_positions=attention_key_positions)
+                    attention_key_positions=attention_key_positions, progress=progress)
 
     def _clean_inputs(self, tokens, image_indices, conditioning: Mapping[str, jax.Array] | None,
                       train: bool) -> tuple[jax.Array, jax.Array | None]:
@@ -239,14 +241,15 @@ class DiffusionGemma(DecoderWrapper):
                  self_conditioning_mask=None, train: bool = False, positions=None,
                  coordinates: Coordinates | None = None,
                  attention_pairwise_mask=None, attention_key_positions=None,
-                 states: bool = False):
+                 states: bool = False, progress: Progress | None = None):
         """Return the canvas logits, or with `states` the final normalized states before the head.
 
         `encode` explains why a loss reads the states. Self-conditioning reads
         `self_conditioning_logits`, and rows where `self_conditioning_mask` is
         false get a zero signal, as they do when no logits are given. The
         canvas's `positions` are converted once to its `coordinates`
-        (`token_coordinates`), the layout the decoder reads."""
+        (`token_coordinates`), the layout the decoder reads, at a training
+        step's `progress` as `encode` reads it."""
         tokens = jnp.asarray(tokens, jnp.int32)
         coordinates = token_coordinates(tokens.shape[:2], coordinates, positions=positions)
         if self.is_initializing() and self.conditioner is not None:
@@ -266,7 +269,7 @@ class DiffusionGemma(DecoderWrapper):
         return read(tokens, train=train, decode=not self.is_initializing(),
                     input_embeddings=conditioned, coordinates=coordinates,
                     attention_pairwise_mask=attention_pairwise_mask,
-                    attention_key_positions=attention_key_positions)
+                    attention_key_positions=attention_key_positions, progress=progress)
 
 
 def translate_weights(

@@ -18,6 +18,7 @@ from dew.inference.tasks import Processor, TextGeneration, TextSettings
 from dew.nn.dense import Dense
 from dew.nn.inputs import ModelInputs, local_rows, mesh_of
 from dew.nn.precision import at_least_fp32
+from dew.nn.progress import END, Progress, ReadsProgress, progressed
 from dew.nn.protocols import HiddenStates
 from dew.objectives.base import (
     OMITTED,
@@ -77,13 +78,23 @@ class ValueHead(nn.Module):
         as they are."""
         return projected_parts(params, {"backbone": self.backbone}, updated=updated)
 
+    @nn.nowrap
+    def reads_progress(self) -> bool:
+        """Whether its backbone's computation changes over a run (`dew.nn.progress.ReadsProgress`)."""
+        return isinstance(self.backbone, ReadsProgress) and self.backbone.reads_progress()
+
     @nn.compact
     def __call__(self, tokens: jax.Array, *, segment_ids: jax.Array | None = None,
-                 positions: jax.Array | None = None, coordinates: Coordinates | None = None) -> jax.Array:
+                 positions: jax.Array | None = None, coordinates: Coordinates | None = None,
+                 progress: Progress = END) -> jax.Array:
         """Each token's value, the backbone's states over `tokens` laid out by their `coordinates`, or
-        by their flat `segment_ids` and `positions` converted once (both refused, `token_coordinates`)."""
+        by their flat `segment_ids` and `positions` converted once (both refused, `token_coordinates`),
+        at the run's `progress` where the backbone reads it (`dew.nn.progress`)."""
         laid = token_coordinates(tokens.shape[:2], coordinates, segments=segment_ids, positions=positions)
-        hidden = self.backbone.hidden_states(tokens, train=False, coordinates=laid)
+        # A backbone that reads the run's progress takes it; any other is called as it always is.
+        hidden = (self.backbone.hidden_states(tokens, train=False, coordinates=laid, progress=progress)
+                  if self.reads_progress() else
+                  self.backbone.hidden_states(tokens, train=False, coordinates=laid))
         return Dense(1, dtype=at_least_fp32(hidden.dtype), name="value")(hidden)[..., 0]
 
 
@@ -136,6 +147,9 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
     saved_task = TextGeneration
     settings = TextSettings
     ema_is_reference = True
+    # The actor's loss passes its policy the run's progress (`GRPOObjective.loss`), and the critic's its
+    # critic (`_critic_scores`).
+    passes_progress = True
     _model_part = "policy"
 
     def __init__(self, model, seq_len: int, *, critic: nn.Module,
@@ -216,16 +230,17 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
         """
         return self._critic_scores(variables, batch)[0]
 
-    def _critic_scores(self, variables: Variables, batch: Mapping[str, object], *, qk_stats: bool = False
-                       ) -> tuple[jax.Array, Variables | None]:
-        """The critic's values and, when requested, the QK collection from that same forward."""
+    def _critic_scores(self, variables: Variables, batch: Mapping[str, object], *, qk_stats: bool = False,
+                       progress: Progress = END) -> tuple[jax.Array, Variables | None]:
+        """The critic's values and, when requested, the QK collection from that same forward, at the run's
+        `progress` where the critic reads it."""
         ids = jnp.asarray(batch[IDS_KEY], jnp.int32)
         segments = jnp.asarray(batch[SEGMENT_IDS_KEY], jnp.int32)
         # The rollout's packed columns laid out once (`Coordinates`), the layout the backbone reads.
         laid = coordinates(ids[:, :-1].shape, segments=segments[:, :-1],
                            positions=jnp.asarray(batch[POSITIONS_KEY], jnp.int32)[:, :-1])
         values = self.critic.apply(part(variables, "critic"), ids[:, :-1], coordinates=laid,
-                                   mutable=["qk"] if qk_stats else False)
+                                   mutable=["qk"] if qk_stats else False, **progressed(self.critic, progress))
         qk = None
         if qk_stats:
             values, gathered = values
@@ -246,7 +261,8 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
         policy_step = replace(step, ema=None if step.ema is None else part(step.ema, "policy"))
         pg, aux = self.actor.loss(part(variables, "policy"), batch, policy_step)
         mask = jnp.asarray(batch[RESPONSE_MASK_KEY])
-        values, critic_qk = self._critic_scores(variables, batch, qk_stats=step.qk_stats)
+        values, critic_qk = self._critic_scores(variables, batch, qk_stats=step.qk_stats,
+                                                progress=self.progress(step))
         terms = clipped_value_loss_terms(values, jnp.asarray(batch[RETURNS_KEY]),
                                          jnp.asarray(batch[OLD_VALUES_KEY]), self.value_clip)
         critic = Ratio(jnp.sum(jnp.where(mask != 0, terms, 0) * mask), jnp.sum(mask))

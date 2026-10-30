@@ -336,10 +336,34 @@ def factor(a, issue: Issue = portable):
 
 def paired(name: str, left, right, decay, issue: Issue = portable):
     """`sum_d left[s, d] right[t, d] decay[s, t, d]` within each chunk, `[..., C, C]`: one decay channel
-    scales the product `name` after it, one per key dimension weighs each term of it."""
+    scales the product `name` after it (`_decayed_product`), one per key dimension weighs each term of it. A
+    pair whose decay is zero (above the diagonal, across a document's start: `decays` masks its exponent)
+    weighs nothing, its derivatives included: selected, not multiplied by zero, where its product's tangent
+    may overflow (ledger 2470)."""
     if decay.shape[-1] == 1:
-        return issue(name, left, jnp.swapaxes(right, -1, -2)) * decay[..., 0]
-    return float32_einsum('...sd,...td,...std->...st', left, right, decay, precision=exact_float32(None))
+        return _decayed_product(name, issue, left, right, decay[..., 0])
+    summed = float32_einsum('...sd,...td,...std->...st', left, right, decay, precision=exact_float32(None))
+    return jnp.where(jnp.any(decay != 0, axis=-1), summed, 0.0)
+
+
+@functools.partial(jax.custom_jvp, nondiff_argnums=(0, 1))
+def _decayed_product(name: str, issue: Issue, left, right, decay):
+    """`(left @ right^T) * decay` of the pairs whose decay is nonzero, zero elsewhere (`paired`)."""
+    return jnp.where(decay != 0, issue(name, left, jnp.swapaxes(right, -1, -2)) * decay, 0.0)
+
+
+@_decayed_product.defjvp
+def _decayed_product_tangent(name: str, issue: Issue, primals, tangents):
+    """The product's tangent with each term weighed by its pair's decay before they are summed: the terms'
+    sum before the decay overflowed fp32 where the decayed tangent is finite (keys and queries near 2^63, the
+    two terms 2.6e38 and 8.5e37 past 3.4e38 against a decay of 0.6; ledger 2470)."""
+    left, right, decay = primals
+    d_left, d_right, d_decay = tangents
+    product = issue(name, left, jnp.swapaxes(right, -1, -2))
+    weighed = (issue(name, d_left, jnp.swapaxes(right, -1, -2)) * decay
+               + issue(name, left, jnp.swapaxes(d_right, -1, -2)) * decay + product * d_decay)
+    kept = decay != 0
+    return jnp.where(kept, product * decay, 0.0), jnp.where(kept, weighed, 0.0)
 
 
 def intra(key, keyed, pairs, issue: Issue = portable):
