@@ -155,13 +155,15 @@ def register_programs(threads: int, registers: int) -> int:
     return REGISTERS // (threads * allocated)
 
 
-def resident(target: generation.GpuTarget, staged: int, threads: int, registers: int, *, tmem: int = 0) -> int:
+def resident(target: generation.GpuTarget, staged: int, threads: int, registers: int, *,
+             tmem: int = 0) -> int:
     """How many programs, each staging `staged` bytes of shared memory and running `threads` threads of
     `registers` registers each and `tmem` tensor-memory columns, one multiprocessor of `target` holds at
     once. Zero means the launch exceeds a capacity."""
     shared = generation.shared_budget(target) + RESERVED_SHARED
     by_shared = shared // (staged + RESERVED_SHARED)
-    limits = [by_shared, register_programs(threads, registers), target.architecture.resident_threads // threads]
+    limits = [by_shared, register_programs(threads, registers),
+              target.architecture.resident_threads // threads]
     if tmem:
         limits.append((target.tmem_columns or 0) // tmem)
     return min(limits)

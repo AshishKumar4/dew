@@ -646,14 +646,17 @@ class LoweredRegisters:
     raised: int
     where: str
 
-    def model(self, target: GpuTarget, compiler: Compiler, *, shared: int, tmem: int) -> resources.RegisterModel:
+    def model(self, target: GpuTarget, compiler: Compiler, *, shared: int, tmem: int
+              ) -> resources.RegisterModel:
         """Its launch budget and residency, from this launch's geometry and resource allocations."""
         groups = self.threads // resources.THREADS
         consumers = groups - bool(self.producer)
-        budget = (self.raised if self.raised and not compiler.relocatable else resources.entry_registers(groups))
-        most = cost.resident(target, shared, self.threads, resources.entry_registers(groups), tmem=tmem)
+        entry = resources.entry_registers(groups)
+        budget = self.raised if self.raised and not compiler.relocatable else entry
+        most = cost.resident(target, shared, self.threads, entry, tmem=tmem)
         producer = (self.producer if not compiler.relocatable else budget) if self.producer else 0
-        return resources.RegisterModel(self.registers, budget, consumers, most, cost.REGISTER_STEP, producer, shared)
+        return resources.RegisterModel(self.registers, budget, consumers, most, cost.REGISTER_STEP,
+                                       producer, shared)
 
 
 def lowered_registers(module: bytes, compiler: Compiler) -> list[LoweredRegisters]:
