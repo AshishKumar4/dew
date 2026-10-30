@@ -52,8 +52,8 @@ from .documents import (
 )
 from .inputs import cu_seqlens
 from .kernels import decode_attention, generation
-from .kernels.generation import bf16_dot_runs, gpu_placed
-from .kernels.selection import forced, select, selected
+from .kernels.generation import Route, bf16_dot_runs, gpu_placed
+from .kernels.selection import select, selected
 from .kernels.templates import attention as template, attention_route
 from .precision import (
     asks_default_precision,
@@ -713,7 +713,7 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
         causal=causal, sliding_window=sliding_window, mask=mask, bias=bias,
         segment_ids=segment_ids, max_segments=max_segments, key_value_seq_lengths=lengths,
         key_value_seq_starts=starts, block_groups=block_groups, image_groups=image_groups,
-        key_valid=key_valid, key_runs=key_runs, places=places, dropout=dropout_seed is not None)
+        key_valid=key_valid, key_runs=key_runs, places=places, dropout=dropout_seed is not None).ran
     call = functools.partial(
         _attention_kernel, dtype=dtype, precision=precision, force_fp32_for_softmax=force_fp32_for_softmax,
         causal=causal, sliding_window=sliding_window, mask=mask, masked=masked, softcap=softcap,
@@ -920,8 +920,9 @@ def resolve_implementation(implementation: AttentionImpl, query, key, *, dtype=N
                            sliding_window=None, mask=None, bias=None, segment_ids=None, max_segments=None,
                            key_value_seq_lengths=None, key_value_seq_starts=None, block_groups=None,
                            image_groups=None, key_valid=None, key_runs=None, places=None,
-                           dropout: bool = False) -> str:
-    """The kernel an `AttentionImpl` names for this call on this host, as the attention selector
+                           dropout: bool = False) -> Route:
+    """The route an `AttentionImpl` takes for this call on this host (`Route.ran` its kernel,
+    `Route.forced` what forced it), as the attention selector
     reports it (`select`, over `attention_case`): 'auto' takes the kernel the target's row measured
     fastest for the call where it takes it, else the first that does; a named kernel is forced, and
     raises where it does not take the call (xla handing what it cannot honour to the reference path).
@@ -940,11 +941,12 @@ def resolve_implementation(implementation: AttentionImpl, query, key, *, dtype=N
                           image_groups=image_groups, key_valid=key_valid, key_runs=key_runs, places=places,
                           dropout=dropout, named=implementation)
     if not (decodes(case) and implementation in ('auto', 'cudnn', 'xla')):
-        return select(ATTENTION, case, None if implementation == 'auto' else implementation).ran
-    named = {'auto': None, 'cudnn': 'cudnn'}.get(implementation)
+        return select(ATTENTION, case, None if implementation == 'auto' else implementation)
     if implementation == 'xla':
-        named = 'xla' if forced(DECODE.choice) == 'xla' or DECODE.kernel('decode').failed(case) else 'decode'
-    return select(DECODE, case, named).ran
+        # An explicit xla's decode step: the decode kernel where it takes the call, else xla's lowering of
+        # it, a decode choice `chosen` names overriding both.
+        return select(DECODE, case, preference=('decode', 'xla', 'reference'))
+    return select(DECODE, case, {'auto': None, 'cudnn': 'cudnn'}[implementation])
 
 
 def kernel_for_materialized_mask(implementation: AttentionImpl, query, key, *, dtype=None, precision=None,
