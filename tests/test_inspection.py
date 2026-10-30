@@ -256,7 +256,7 @@ def test_a_watched_histogram_sums_to_its_whole_output():
     watching = Inspection(modules=("Block",), targets=("params",), histogram=True)
     run = watched_run(Stacked(scanned=False), watching)
     logged = inspected(run, {"x": ROWS})
-    bins = [value for name, value in logged.items() if "/Block_0/histogram/" in name]
+    bins = [value for name, value in logged.items() if "/Block_0/histogram_" in name]
     assert len(bins) > 1 and np.isclose(sum(bins), 1.0)
 
 
@@ -289,3 +289,42 @@ def test_every_kinds_run_logs_the_activations_its_command_line_watches(kind, tmp
     watched = {name.rsplit("/", 1)[1] for name in logged[2] if name.startswith("inspect/activations/")}
     assert {"mean", "std", "abs_max", "non_finite"} <= watched
     assert not any(name.startswith("inspect/activations/") for name in logged[1])
+
+
+class Headed(nn.Module):
+    """A module with a child named `output`, as a DiT's head is."""
+
+    @nn.compact
+    def __call__(self, x):
+        x = x.astype(jnp.float32)
+        return nn.Dense(1, name="output")(jnp.tanh(nn.Dense(x.shape[-1], name="hidden")(x)))
+
+
+def test_a_watched_module_with_a_child_named_output_is_summarized():
+    """A watched module whose child is named `output`, as a DiT's head is, is summarized beside it, its
+    summary's name no child's (`dew.nn.inspection.SOWN`)."""
+    logged = inspected(watched_run(Headed(), Inspection(modules=("Headed",), targets=("params",))),
+                       {"x": ROWS})
+    assert "inspect/activations/abs_max" in logged
+
+
+def accumulating(inspection, tracker=None):
+    return Trainer(Pulled(), optax.sgd(RATE), key=jax.random.key(0), tracker=tracker, inspection=inspection,
+                   accumulation=2)
+
+
+def test_a_log_at_a_step_that_commits_nothing_keeps_the_sample_before():
+    """With two microbatches an update, a log at a step that commits nothing carries the latest sample
+    that committed, not the uncommitted step's zeros."""
+    tracker = Kept()
+    accumulating(Inspection(paths=("w",), targets=("params",), every=1), tracker).fit(
+        Loader(lambda partition: stream(), None, batch=BATCH, records=None), steps=3, log_every=3,
+        eval_every=None, checkpoint_every=None)
+    assert tracker.rows[3]["inspect/params/l2"] > 0
+
+
+def test_an_accumulating_trainers_offline_view_steps_its_whole_window():
+    """The offline view of a trainer that accumulates steps its whole window and reports the update
+    that commits, its parameters' norm nonzero, not an uncommitted step's zeros."""
+    logged = inspected(accumulating(Inspection(paths=("w",), targets=("params",))), {"x": ROWS})
+    assert logged["inspect/params/l2"] > 0
