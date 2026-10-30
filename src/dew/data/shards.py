@@ -57,7 +57,10 @@ def bounded(manifest: ShardManifest, *, partition: DataPartition, seed: int | No
     later repeat replays, each share its own places again, its rows in every whole pass the bound spans
     and of its places the last pass reaches, in its own order: the repeat reads each pass whole before
     the next, so its interleave crosses no pass. So each share reads its own shards' part of the bound
-    and none repeats one while another's go unread. None where a shard states no rows."""
+    and none repeats one while another's go unread. Within that last pass, a share that interleaves its
+    places reads its count's first rows in its own interleaved order, not the walk's, which an interleave
+    defines on no process: the pool reads the bound's examples, each share's count exact, and no record
+    a pass more than another of the bound's. None where a shard states no rows."""
     shards = _shards(manifest, partition=partition, loading=loading)
     if any(shard.rows is None for shard in shards):
         return None
