@@ -663,18 +663,20 @@ def reached_by(run: RunConfig, root: Path, settings: type, flags, queued: dict[s
     task holds differs from the run that sets none by it alone: at its first alternative, or its next where
     a reader refuses one or the saved settings do not hold it (`holds`: a run's None that keeps the
     layout's own). The settings each saves, what its task holds and the value it was set to, for each
-    that trains so."""
-    reached = {}
+    that trains so, and why each other alternative did not."""
+    reached, refused = {}, {}
     for name, values in queued.items():
         for index, value in enumerate(values):
             try:
                 saved, after = saved_with(run, root, f"{name}{index}", settings, flags({name: value}))
-            except ValueError:  # A reader refused it, which names what refused it: the next.
+            except ValueError as error:  # A reader refused it, which names what refused it: the next.
+                refused.setdefault(name, []).append(f"{value!r}: {error}")
                 continue
             if holds(saved, name, value):
                 reached[name] = (saved, after, value)
                 break
-    return reached
+            refused.setdefault(name, []).append(f"{value!r}: saved {held_at(saved, name)!r}")
+    return reached, refused
 
 
 @pytest.mark.mesh(devices=8)
@@ -716,10 +718,10 @@ def test_each_option_a_saved_task_is_built_with_reaches_it_from_the_command_line
                   for name in assigned for path, value in BESIDE.get(name, {}).items()}
         return {**beside, **{reachable[name].path: flag(value, reachable[name].annotation)
                              for name, value in assigned.items()}}
-    reached = reached_by(run, tmp_path, settings, flags, queued,
-                         lambda saved, name, value: same(held_at(saved, name), reachable[name].made(value)))
+    reached, refused = reached_by(run, tmp_path, settings, flags, queued, lambda saved, name, value: same(
+        held_at(saved, name), reachable[name].made(value)))
     for name in queued:
-        assert name in reached, f"no alternative of {settings.__name__}.{name} trains: {queued[name]}"
+        assert name in reached, f"no alternative of {settings.__name__}.{name} trains: {refused.get(name)}"
         _, after, value = reached[name]
         option = reachable[name].made(value)
         assert consumed(before, after, option), f"the task loaded holds no {settings.__name__}.{name} set"
