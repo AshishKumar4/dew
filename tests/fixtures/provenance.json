@@ -2966,6 +2966,17 @@
    ],
    "note": "RoutedMoE.generate_masks' own body extracted from src/maxtext/layers/moe.py at the commit (SHA-256 checked), called on a stand-in self with its three fields and an identity sharding hint; dispatch and combine masks for four dropping cases. JAX 0.11.2.post3."
   },
+  "maxtext/gpt3.npz": {
+   "tool": "tools/gpt3_maxtext_reference.py",
+   "sources": [
+    {
+     "repo": "AI-Hypercomputer/maxtext",
+     "version": "0.2.5",
+     "runs": "maxtext"
+    }
+   ],
+   "note": "MaxText's GPT-3 (decoder_block gpt3, model gpt3-52k at two layers, a vocabulary and position table of 64) run by tools/maxtext_gpt3_worker.py on the CPU over each seed's drawn weights and eight tokens, in float32 and, its validated config's dtypes set to float64, in float64; kept as its evidence and its truth's sketch over 40 draws (8 declared seeds and their redraw)."
+  },
   "mdlm/continuation.npz": {
    "tool": "tools/mdlm_sampling_reference.py",
    "sources": [{"repo": "kuleshov-group/mdlm", "version": "c112c526d193436838c98d81455ee51f90309470", "runs": "fetched"}, {"repo": "pytorch/pytorch", "version": "2.14.0", "runs": "torch"}],

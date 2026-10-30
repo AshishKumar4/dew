@@ -10,6 +10,7 @@ MAXTEXT_PYTHON is the interpreter of a virtual environment holding `maxtext==0.2
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import tempfile
@@ -34,7 +35,8 @@ def main() -> None:
         raise SystemExit(f"the recording is of maxtext 0.2.5; {python} holds {version}")
     worker = subprocess.Popen([python, str(ROOT / "tools" / "maxtext_gpt3_worker.py"), "--serve"],
                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
-                              env={"JAX_PLATFORMS": "cpu", "PATH": "/usr/bin:/bin"})
+                              env={**{key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
+                                   "JAX_PLATFORMS": "cpu"})
     scratch = Path(tempfile.mkdtemp())
 
     def evaluate(inputs):

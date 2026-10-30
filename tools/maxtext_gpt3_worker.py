@@ -34,10 +34,15 @@ def model(dtype: str):
     from maxtext.utils import maxtext_utils
 
     base = os.path.join(os.path.dirname(maxtext.__file__), "configs", "base.yml")
+    # MaxText's config takes float32 at widest; its float64 run is the same model with its computation's
+    # and weights' dtypes set to float64 after validation, its own arithmetic carried in float64.
     config = pyconfig.initialize([sys.argv[0], base], run_name="gpt3-reference", enable_checkpointing=False,
-                                 model_name="gpt3-52k", dtype=dtype, weight_dtype=dtype, scan_layers=False,
+                                 model_name="gpt3-52k", dtype="float32", weight_dtype="float32",
+                                 scan_layers=False,
                                  enable_dropout=False, attention="dot_product", per_device_batch_size=1.0,
                                  skip_jax_distributed_system=True, override_model_config=True, **SHAPE)
+    if dtype == "float64":
+        config.get_keys().update(dtype=jax.numpy.dtype("float64"), weight_dtype=jax.numpy.dtype("float64"))
     mesh = Mesh(maxtext_utils.create_device_mesh(config, devices=[jax.devices()[0]]), config.mesh_axes)
     return config, models.transformer_as_linen(config=config, mesh=mesh,
                                                quant=quantizations.configure_quantization(config),
