@@ -2436,6 +2436,10 @@ class Trainer(Generic[Loss, Effects]):
                 averaged=averaged, preview=preview, mesh=mesh, loss=loss, split=split, training=training,
                 warm=warm, updates=state.updates,
                 scored_to=None if scored_to is None else os.path.join(scored_to, f"step-{int(state.step)}"))
+        # On the examples clock an evaluation is placed by the examples the run had consumed, its record
+        # their coordinate beside its step.
+        if state.consumed is not None:
+            evaluation = dataclasses.replace(evaluation, examples=int(jax.device_get(state.consumed)))
         if not warm:
             # The training values ride along for ranking (`_ranking`); the log interval reports
             # them, so the evaluation's own report leaves them out.
