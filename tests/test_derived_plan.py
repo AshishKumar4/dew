@@ -177,4 +177,3 @@ def test_a_run_over_a_tensor_axis_that_sets_its_remat_hears_its_derivation_canno
     assert compiles.count == 1 and trainer.plan["remat"] == "full"
     assert trainer.plan["derived"][-1]["label"] == "unknown"
     assert len([record for record in caplog.records if record.name == "dew.training.planning"]) == 1
-

@@ -368,6 +368,22 @@ def test_an_inspection_samples_every_nth_update_of_an_accumulating_run(every):
     assert sampled == [3 * every]
 
 
+def test_an_examples_runs_short_last_window_samples_its_commit():
+    """A run on the examples clock whose last window closes short samples the update that commits there
+    (row 2720): with three steps an update, every second update sampled and five batches, the second
+    update commits early, at the fifth step, and its log carries the sample."""
+    from dew.data import Memory
+    from dew.data.pipeline import Pipeline
+
+    tracker = Kept()
+    chain = Pipeline(Memory({"x": np.concatenate([ROWS] * 5)})).read("streamed").batch(BATCH)
+    Trainer(Pulled(), optax.sgd(RATE), key=jax.random.key(0), tracker=tracker, accumulation=3,
+            inspection=Inspection(paths=("w",), targets=("params",), every=2)).fit(
+        chain, examples=5 * BATCH, log_every=1, eval_every=None, checkpoint_every=None)
+    sampled = [step for step, row in sorted(tracker.rows.items()) if "inspect/params/l2" in row]
+    assert sampled == [5]
+
+
 def test_an_accumulating_trainers_offline_view_steps_its_whole_window():
     """The offline view of a trainer that accumulates steps its whole window and reports the update
     that commits, its parameters' norm nonzero, not an uncommitted step's zeros."""
