@@ -22,11 +22,11 @@ import jax
 import jax.numpy as jnp
 
 from dew.artifacts import TokenScores
-from dew.batch import Variables, real_slots, thaw
+from dew.batch import SEGMENTS_FIELD, Variables, real_slots, thaw
 from dew.data.prompts import LENGTH_KEY, PROMPT_KEY
 from dew.inputs import Field, InputSpec
 from dew.nn.inputs import rotate_rows
-from dew.nn.precision import at_least_fp32
+from dew.nn.precision import at_least_fp32, compensated_sum, weighted_total
 from dew.objectives.base import Aux, EMASpec, Ratio, Shown
 from dew.objectives.lm.chunked import final_read
 from dew.objectives.routing import ExpertBalance
@@ -35,8 +35,11 @@ from dew.rl.surrogate import (
     behavior_band_weights,
     cispo_terms,
     clipped_surrogate_terms,
+    gmpo_terms,
     mismatch_metrics,
+    reinforce_terms,
     sequence_rejection_mask,
+    sequence_sum,
 )
 
 from ..lm.objective import Scores, TokenScorer, _unpadded
@@ -55,9 +58,16 @@ from .sessions import (
     SUPPORT_KEY,
 )
 
-# Each surrogate was checked against verl at 12ebe0c.
-POLICY_LOSSES = ("ppo", "gspo", "cispo")
-AGGREGATIONS = ("token-mean", "session-mean")
+# ppo, gspo and cispo were checked against verl at 12ebe0c; every method against its paper's form
+# (tests/test_rl_methods.py).
+POLICY_LOSSES = ("ppo", "gspo", "cispo", "gmpo", "reinforce")
+AGGREGATIONS = ("token-mean", "session-mean", "constant")
+"""How the per-token terms reduce: over every kept token, over each session's then the sessions', or
+each session's sum over a constant number of tokens (`aggregation_tokens`, Dr. GRPO's generation
+budget, one for RLOO's sequence sums) averaged over the sessions."""
+KL_TERMS = ("k3", "k2")
+"""The reference penalty's estimator: k3 (GRPO's), or k2, half the squared log-ratio (REINFORCE++'s loss,
+arXiv:2501.03262 equation 8 and appendix B.1)."""
 
 
 class _Terms(NamedTuple):
@@ -109,6 +119,11 @@ class GRPOObjective(TokenScorer):
     with `k3`).
 
     `beta` is the KL strength, and at 0.0 no frozen reference is allocated.
+    `kl_term` is its estimator (`KL_TERMS`). `reward_kl` is a reference
+    penalty in the reward instead (RLOO's, arXiv:2402.14740 equation 3): the
+    rollout subtracts `reward_kl` times each call's summed log-ratio of the
+    proximal policy to the reference from that call's reward before its
+    estimator compares returns (`RolloutScheduler`), and the loss adds no term.
     `epsilon_low`, `epsilon_high` and `dual_clip` are the clip points.
     `model`, `seq_len` and the scoring `options` are `TokenScorer`'s, with
     `seq_len` one less than the row width; the response mask says which
@@ -180,16 +195,29 @@ class GRPOObjective(TokenScorer):
                  behavior_importance: float | tuple[float, float] | None = None,
                  sequence_mask: tuple[float, float] | None = None,
                  geometric_mask: tuple[float, float] | None = None,
-                 sampling_temperature: float = 1.0, balance: ExpertBalance | None = None, **options):
-        if beta < 0:
-            raise ValueError(f"beta scales the KL penalty, so it is non-negative, got {beta}")
+                 sampling_temperature: float = 1.0, balance: ExpertBalance | None = None,
+                 aggregation_tokens: int | None = None, kl_term: str = "k3", reward_kl: float = 0.0,
+                 **options):
+        if beta < 0 or reward_kl < 0:
+            raise ValueError(f"beta and reward_kl scale a KL penalty, so they are non-negative, got {beta} "
+                             f"and {reward_kl}")
         if policy_loss not in POLICY_LOSSES:
             raise ValueError(f"policy_loss must be one of {POLICY_LOSSES}, got {policy_loss!r}")
         if aggregation not in AGGREGATIONS:
             raise ValueError(f"aggregation must be one of {AGGREGATIONS}, got {aggregation!r}")
+        if (aggregation == "constant") != (aggregation_tokens is not None):
+            raise ValueError("aggregation_tokens is the constant a session's sum is divided by, which the "
+                             "constant aggregation alone reads and needs")
+        if aggregation_tokens is not None and (type(aggregation_tokens) is not int or aggregation_tokens < 1):
+            raise ValueError("aggregation_tokens is a positive number of tokens")
+        if kl_term not in KL_TERMS:
+            raise ValueError(f"kl_term must be one of {KL_TERMS}, got {kl_term!r}")
+        self.aggregation_tokens = aggregation_tokens
+        self.kl_term = kl_term
+        self.reward_kl = reward_kl
         super().__init__(model, seq_len, balance=balance, **options)
         # The reference is the starting policy, frozen at unit decay, where a KL term reads it.
-        self.ema = EMASpec.constant(1.0 if beta > 0 else None)
+        self.ema = EMASpec.constant(1.0 if beta > 0 or reward_kl > 0 else None)
         # The batch is packed `input_ids` rows, not the LM's text windows.
         self.inputs = InputSpec(sample=Field(IDS_KEY, (seq_len + 1,)))
         self.beta = beta
@@ -213,6 +241,16 @@ class GRPOObjective(TokenScorer):
         if not sampling_temperature > 0:
             raise ValueError(f"sampling_temperature is a positive temperature, got {sampling_temperature}")
         self.sampling_temperature = sampling_temperature
+
+    def reference_penalty(self, policy: jax.Array, reference: jax.Array, weights: jax.Array,
+                          mass: jax.Array) -> Ratio:
+        """The loss's reference penalty over the current likelihoods `policy` and the reference's, by
+        `kl_term` (k3, or k2: half the squared log-ratio), reduced as the policy term is: `weights` and
+        `mass` are `policy_ratio`'s, so it is a token, session or constant mean as the method's is."""
+        delta = policy - jax.lax.stop_gradient(reference)
+        # Halved before it is squared out: k2 is representable wherever its log-ratio's square halved is.
+        terms = k3_kl(policy, reference) if self.kl_term == "k3" else delta * (0.5 * delta)
+        return Ratio(weighted_total(terms, weights)[0], mass)
 
     def packed_log_probs(self, params: Variables, batch) -> jax.Array:
         """Return each packed id's log-probability given its own chain's prefix, placed by `onto_ids`.
@@ -323,12 +361,7 @@ class GRPOObjective(TokenScorer):
             keep = keep * (importance != 0)
             importance = None
         effective = mask * keep
-        per_token, aux = self._policy_terms(terms, effective)
-        if importance is not None:
-            per_token = per_token * importance
-        weights = self._weights(terms, effective, keep)
-        mass = jax.lax.stop_gradient(jnp.sum(weights))
-        pg = Ratio(jnp.sum(jnp.where(weights != 0, per_token, 0) * weights), mass)
+        pg, weights, mass, aux = self.policy_ratio(terms, effective, keep, importance)
         pg_loss, _ = pg.mean()
         metrics = {"pg": pg_loss, **{f"actor/{k}": v for k, v in aux.items()}, **metrics}
         if self.beta > 0:
@@ -336,8 +369,7 @@ class GRPOObjective(TokenScorer):
                 raise ValueError(
                     "the KL term reads step.ema, but the objective keeps no EMA; "
                     "a GRPO run with beta above zero always freezes one")
-            kl_terms = k3_kl(terms.policy, self.packed_log_probs(step.ema, batch))
-            kl = Ratio(jnp.sum(jnp.where(weights != 0, kl_terms, 0) * weights), mass)
+            kl = self.reference_penalty(terms.policy, self.packed_log_probs(step.ema, batch), weights, mass)
             metrics["kl"], _ = kl.mean()
             objective = Ratio(pg.total + self.beta * kl.total, mass)
         else:
@@ -346,7 +378,7 @@ class GRPOObjective(TokenScorer):
         if self.balance is not None:
             # The router positions that count are the response tokens the policy's forward reads: a token's
             # input (`[:, :-1]`) whose own target is trained, in a real chain.
-            fields = {"segment_ids": terms.segments}
+            fields = {SEGMENTS_FIELD: terms.segments}
             queries = (real_slots(fields, mask.shape)[:, :-1] & (mask[:, :-1] != 0)
                        & (self.row_weights(batch, mask.shape[0]) > 0)[:, None])
             statistics, effects, router_metrics = self.balance.compose(
@@ -354,11 +386,39 @@ class GRPOObjective(TokenScorer):
             metrics.update(router_metrics)
         return statistics, Aux[Variables](metrics, qk_stats=terms.qk_stats, effects=effects)
 
+    def policy_ratio(self, terms: _Terms, effective: jax.Array, keep: jax.Array, importance=None
+                     ) -> tuple[Ratio, jax.Array, jax.Array, dict[str, jax.Array]]:
+        """The method's policy term as the loss reduces it (`Ratio`), each token's weight, the mass and
+        the actor metrics, over `effective`, the trained tokens `keep` admits, each term scaled by the
+        behavior `importance` where given: the policy loss's per-token terms (`_policy_terms`) under
+        the aggregation (`_weights`)."""
+        per_token, aux = self._policy_terms(terms, effective)
+        if importance is not None:
+            per_token = per_token * importance
+        weights = self._weights(terms, effective, keep)
+        # Summed once rounded (`compensated_sum`): the session weights' sum is their count.
+        mass = jax.lax.stop_gradient(compensated_sum(weights, tuple(range(weights.ndim))))
+        if self.aggregation_tokens is not None:
+            # The constant aggregation: each session's sum over the constant, averaged over the sessions
+            # (their session weights sum to their count), a kept token weighing one over the constant.
+            weights = effective.astype(weights.dtype) / self.aggregation_tokens
+        if self.policy_loss in ("gspo", "gmpo"):
+            # A sequence's tokens share its term: summed once a sequence, as its paper's form sums it.
+            total = sequence_sum(per_token, weights, terms.segments)
+        else:
+            total, _ = weighted_total(per_token, weights)
+        return Ratio(total, mass), weights, mass, aux
+
     def _policy_terms(self, terms: _Terms, mask: jax.Array) -> tuple[jax.Array, dict[str, jax.Array]]:
         """The chosen surrogate's per-token terms and verl's three actor metrics."""
         if self.policy_loss == "cispo":
             return cispo_terms(terms.policy, terms.old, terms.advantages, mask,
                                self.epsilon_low, self.epsilon_high)
+        if self.policy_loss == "gmpo":
+            return gmpo_terms(terms.policy, terms.old, terms.advantages, mask, terms.segments,
+                              self.epsilon_low, self.epsilon_high)
+        if self.policy_loss == "reinforce":
+            return reinforce_terms(terms.policy, terms.advantages, mask)
         if self.policy_loss == "gspo":
             ratio = sequence_log_ratio(terms.policy, terms.old, mask, terms.segments)
             per_token, aux = clipped_surrogate_terms(ratio, terms.advantages, mask,
@@ -380,7 +440,7 @@ class GRPOObjective(TokenScorer):
         if self.aggregation == "token-mean":
             return effective
         if terms.session_weights is None:
-            raise ValueError(f"session-mean aggregation reads {SESSION_WEIGHTS_KEY} from pack")
+            raise ValueError(f"{self.aggregation} aggregation reads {SESSION_WEIGHTS_KEY} from pack")
         return terms.session_weights * keep * (effective != 0)
 
     def validation_loss(self, variables, batch, step):

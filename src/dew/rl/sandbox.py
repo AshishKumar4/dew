@@ -107,8 +107,11 @@ def _observation(value: object) -> Observation:
         state = EpisodeStatus[status.upper()]
     except KeyError:
         raise ValueError(f"unknown sandbox observation status {status!r}") from None
+    compacted, request = value.get("compacted", False), value.get("request")
+    if not isinstance(compacted, bool) or not (request is None or isinstance(request, Mapping)):
+        raise ValueError("sandbox observation's compacted is a boolean and its request an object or null")
     return Observation(tuple(context), state, detail, None if reward is None else finite(reward, "reward"),
-                       messages(value.get("messages", []), "messages"))
+                       messages(value.get("messages", []), "messages"), compacted, request)
 
 
 def launched(command: tuple[str, ...], limits: SandboxLimits,
