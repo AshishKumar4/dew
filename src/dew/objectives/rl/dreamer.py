@@ -326,6 +326,27 @@ class DreamerV3Objective(Objective[Ratio]):
         posterior = model.posterior(deter, model.embed(observation))
         return deter, model.categorical(posterior), posterior
 
+    def observed(self, variables: Variables, observation: jax.Array, previous: jax.Array, first: jax.Array,
+                 key: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+        """The posterior latents over windows `[B, T, ...]` from a zero latent: each step's
+        deterministic state, drawn categoricals and posterior log-probabilities, each step drawing from
+        its own of `T` keys split from `key`, as the code's scan seeds each step's sample
+        (rssm.py:63-90)."""
+        rows, length = first.shape
+
+        def step(latent, inputs):
+            deter, stoch = latent
+            observation, previous, first, key = inputs
+            at = self.model.bind(variables, rngs={"latent": key})
+            deter, stoch, posterior = self.observe(at, deter, stoch, observation, previous, first)
+            return (deter, stoch), (deter, stoch, posterior)
+
+        steps = (*(jnp.swapaxes(x, 0, 1) for x in (observation, previous, first)),
+                 jax.random.split(key, length))
+        _, found = jax.lax.scan(step, self.model.initial((rows,)), steps)
+        deter, stoch, posterior = (jnp.swapaxes(x, 0, 1) for x in found)
+        return deter, stoch, posterior
+
     def act(self, variables: Variables, observed: Mapping[str, jax.Array], key: jax.Array,
             memory: tuple[jax.Array, jax.Array, jax.Array]) -> tuple[jax.Array, dict, tuple]:
         """The agent's step in an environment (`dew.rl.env.Policy` over `Driven`): the posterior
@@ -356,18 +377,7 @@ class DreamerV3Objective(Objective[Ratio]):
         previous = jnp.concatenate([jnp.zeros_like(action[:, :1]), action[:, :-1]], 1)
         rows, length = reward.shape
 
-        def observed(latent, inputs):
-            deter, stoch = latent
-            observation, previous, first, key = inputs
-            # Each step's posterior draws its own key, as the code's scan seeds each step's sample.
-            at = self.model.bind(variables, rngs={"latent": key})
-            deter, stoch, posterior = self.observe(at, deter, stoch, observation, previous, first)
-            return (deter, stoch), (deter, stoch, posterior)
-
-        steps_in = (*(jnp.swapaxes(x, 0, 1) for x in (observation, previous, first)),
-                    jax.random.split(world_key, length))
-        _, (deter, stoch, posterior) = jax.lax.scan(observed, model.initial((rows,)), steps_in)
-        deter, stoch, posterior = (jnp.swapaxes(x, 0, 1) for x in (deter, stoch, posterior))
+        deter, stoch, posterior = self.observed(variables, observation, previous, first, world_key)
         prior = model.prior(deter)
         feature = WorldModel.feature(deter, stoch)
         losses = {

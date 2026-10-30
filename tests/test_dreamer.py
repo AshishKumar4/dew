@@ -161,3 +161,29 @@ def test_an_agent_learns_its_world_from_its_replay():
     before, after = losses(initial), losses(final)
     for name in ("loss_decoder", "loss_reward"):
         assert after[name] < before[name], (name, before[name], after[name])
+
+
+def test_each_replayed_step_draws_its_posterior_from_its_own_key():
+    """The replayed windows' posterior pass draws each step's categoricals from its own key, split
+    from the pass's key, as stepping the posterior a step at a time with those keys does, bit for bit;
+    a pass that reused one key would repeat its draws."""
+    model = tiny()
+    objective = DreamerV3Objective(model)
+    variables = objective.init(jax.random.key(11))
+    rng = np.random.default_rng(12)
+    observation = jnp.asarray(rng.normal(size=(3, 6, 1)), jnp.float32)
+    previous = jnp.asarray(rng.uniform(-1, 1, (3, 6, 1)), jnp.float32)
+    first = jnp.zeros((3, 6), bool).at[:, 0].set(True)
+    _, stoch, _ = jax.jit(objective.observed)(variables, observation, previous, first, jax.random.key(13))
+
+    @jax.jit
+    def stepped(variables):
+        deter, drawn = model.initial((3,))
+        draws = []
+        for t, key in enumerate(jax.random.split(jax.random.key(13), 6)):
+            at = model.bind(variables, rngs={"latent": key})
+            deter, drawn, _ = objective.observe(at, deter, drawn, observation[:, t], previous[:, t], first[:, t])
+            draws.append(drawn)
+        return jnp.stack(draws, 1)
+
+    np.testing.assert_array_equal(stoch, stepped(variables))

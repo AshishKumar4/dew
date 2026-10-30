@@ -14,7 +14,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from reference_error import assert_computes_the_oracle, chain_roundings
+from reference_error import assert_computes_the_oracle, chain_roundings, widened
 
 from dew.diffusion import FlowMatchingScheduler, FlowMatchPredictionTransform, Process
 from dew.inputs import CharTable, Condition, Field, InputSpec
@@ -160,3 +160,34 @@ def test_a_degenerate_strength_clip_or_regularizer_is_refused(asked):
     tree to read the base model from, is refused as the objective is made."""
     with pytest.raises(ValueError):
         objective(**asked)
+
+
+def test_the_loss_corrupts_by_its_process_own_noise_levels():
+    """A fresh DiT predicts zero velocity, so its clean estimate is the corrupted sample itself and the
+    live, old and implicit policies coincide: each sample's loss at time t is then the clip over beta
+    times sigma(t) |eps - x| squared over |eps - x| in the mean, sigma(t) the process's own noise level
+    at t (a shift of 2 here, 2t / (1 + t)): within float64 rounding of that closed form over the noise
+    the step draws."""
+    from dew.objectives.base import Step
+
+    nft = objective(beta=0.5)
+    variables = nft.init(jax.random.key(30))
+    rng = np.random.default_rng(31)
+    samples = rng.normal(size=(8, 4, 4, 1))
+    times = np.broadcast_to(np.asarray([1.0, 0.75, 0.5]), (8, 3))
+    batch = {"latents": samples, "timesteps": times, "advantages": rng.normal(size=8),
+             **nft.inputs.tokenize(["red"] * 8)}
+    step = Step(jnp.asarray(0), jax.random.key(32), {"params": variables["params"]})
+    with jax.enable_x64(new_val=True):
+        wide = widened(variables)
+        stats, _ = nft.loss(wide, batch, step)
+        found = float(stats.total / stats.mass)
+        noise = np.asarray(step.sample("noise", jax.random.normal, (3, 4, 4, 1), dtype=jnp.float32, rows=8),
+                           np.float64)
+        roundings = chain_roundings(jax.make_jaxpr(lambda v: nft.loss(v, batch, step)[0].total)(wide))
+    sigma = 2 * times / (1 + times)
+    difference = noise - samples[:, None]
+    per = (np.mean(np.square(difference), axis=(2, 3, 4)) / np.mean(np.abs(difference), axis=(2, 3, 4)))
+    expected = np.mean(nft.adv_clip_max / nft.beta * sigma * per)
+    assert_computes_the_oracle(np.asarray([found]), np.asarray([expected]), "the NFT loss",
+                               roundings=roundings)
