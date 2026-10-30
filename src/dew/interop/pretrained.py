@@ -490,9 +490,8 @@ class Pretrained:
         if not isinstance(loaded, cls):
             raise TypeError(f"{name_or_dir} is a {type(loaded).__name__} source, not a {cls.__name__}; "
                             f"load it with {type(loaded).__name__}.load or Pretrained.load")
-        extended = _extended(_published(loaded, name_or_dir, selected=bool(selected)
-                                        or reference.subfolder is not None or extracted), dex, placed,
-                             scan_layers)
+        extended = _extended(_published(loaded, name_or_dir, selected=bool(selected) or extracted
+                                        or reference.subfolder is not None), dex, placed, scan_layers)
         return replace(_resident(extended, weights=weights, streaming=streaming, on_host=on_host),
                        numerics=numerics)
 

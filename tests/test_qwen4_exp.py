@@ -36,7 +36,7 @@ def test_the_releases_ngram_lookups_hash_its_ids_as_transformers_does():
     media = np.zeros(tokens.shape, bool)
     media[:, 6:9] = True
     for marked in (None, media):
-        ids, _ = hashes.init_with_output(jax.random.key(0), tokens, None, None, decode=False, media=marked)
+        ids, _ = hashes.init_with_output(jax.random.key(0), tokens, None, decode=False, media=marked)
         np.testing.assert_array_equal(np.asarray(ids)[:, :, 0], recorded['ple_ids'])
     np.testing.assert_array_equal(spec.multipliers[0], recorded['layer_multipliers'])
     np.testing.assert_array_equal(np.ravel(spec.primes[0]), recorded['vocab_sizes'])
