@@ -235,33 +235,35 @@ class Mma(mosaic.Family):
 
     def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, consumer: Callable, *,
                 consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0) -> None:
-        # Each tile's pipeline is its own (`emit_pipeline` fills and drains it), its step count static; an
-        # output is staged after it in a buffer scoped beside the pipeline (Mosaic reserves both at once:
-        # `grouped_matmul._Mosaic.staged_bytes`), and stored through registers (no TMA before Hopper).
+        # Each tile's pipeline fills and drains before its output copy. Synchronize at that lifetime
+        # boundary so the output's shared memory can reuse the pipeline's slots.
         _one(consumers)
         del in_flight
 
-        def tiled(*staging):
-            def store(output, value, ref, place):
-                smem = staging[output]
-                # Unoptimized, as `copied`'s transfers: JAX 0.12 takes an unflagged store as optimized-only,
-                # which its layout inference searched to exhaustion beside the ladder's copies (ns-gate3).
+        staging = self.output_staging(outputs, consumers)
+
+        def store(output, value, ref, place):
+            plgpu.wait_gmem_to_smem(0)
+
+            def copied(smem):
+                # The row-copy ladder needs strided layouts, not optimized-only transfers.
                 plgpu.store(smem, value.astype(smem.dtype), optimized=False)
                 mosaic.store_rows(smem, ref, *place, copy=mosaic.copied,
                                   widest=resources.copied_rows(smem.shape[1], smem.dtype))
 
-            @plgpu.nd_loop(tiles, collective_axes=axis)
-            def _(loop: plgpu.NDLoopInfo):
-                active, steps, views, tile = schedule(loop.index)
+            pl.run_scoped(copied, staging[output])
+            plgpu.wait_gmem_to_smem(0)
 
-                def walk(step, start, shapes, *, initial=None):
-                    return self.walk(self.opened(streams, views), ((step, 0, steps),), start, shapes,
-                                     interpret, initial=initial)
+        @plgpu.nd_loop(tiles, collective_axes=axis)
+        def _(loop: plgpu.NDLoopInfo):
+            active, steps, views, tile = schedule(loop.index)
 
-                pl.when(active)(lambda: consumer(0, tile, walk, store, active=True))
-                pl.when(~active)(lambda: consumer(0, tile, mosaic.unwalked(self), store, active=False))
+            def walk(step, start, shapes, *, initial=None):
+                return self.walk(self.opened(streams, views), ((step, 0, steps),), start, shapes,
+                                 interpret, initial=initial)
 
-        pl.run_scoped(tiled, *self.output_staging(outputs, consumers))
+            pl.when(active)(lambda: consumer(0, tile, walk, store, active=True))
+            pl.when(~active)(lambda: consumer(0, tile, mosaic.unwalked(self), store, active=False))
 
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
                 first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None

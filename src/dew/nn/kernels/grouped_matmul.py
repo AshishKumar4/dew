@@ -778,9 +778,8 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         # The kernel's own allocations at `config` (`mosaic_gpu.Allocations`), counted as Mosaic's resource
         # estimate counts them (`resources.shared_bytes`): its streams' stages, its side operands' staging,
         # its outputs' staging as its family stages them, and every barrier (at a block's edge, a Hopper
-        # tile's barriers alone took it 128 bytes past). mma.sync's output staging is scoped beside its
-        # pipeline's walk, so the two add (an L4 refused 114688 bytes for a 98304-byte pipeline and its
-        # 16384-byte output, GEN4-gpu-l4).
+        # tile's barriers alone took it 128 bytes past). A scoped walk and the output staged after it
+        # reuse shared memory; persistent rings and output staging remain live together.
         del target
         family = mosaic_gpu.family_of(config, ba.arguments['tokens'].dtype)
         return resources.shared_bytes(family, self.launch_of(ba, config).scope(config.stages))
