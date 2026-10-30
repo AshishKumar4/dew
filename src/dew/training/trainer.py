@@ -306,14 +306,15 @@ class Trainer(Generic[Loss, Effects]):
         whole = read_whole(accumulation, split, step, layout, rollout, mesh)
         self.objective = objective
         built = isinstance(optimizer, optax.GradientTransformation)
-        self._config = None if built else optimizer
-        self._optimizer = objective.optimizer(optimizer) if built else None
+        self._config, self._optimizer = (None, objective.optimizer(optimizer)) if built else (optimizer, None)
         from dew.nn.inputs import seed_of
         # A seed's key is made when first read, after `fit` readies the process (`key`).
         self.seed, self._given_key, self._key = seed_of(key), key, None
-        self.mesh, self.layout, self._microbatches = mesh, layout, microbatches
-        self.accumulation, self.split = accumulation, split
-        self._loss_scale = loss_scale(dynamic_scale)
+        self.mesh = mesh
+        self.layout = layout
+        self.accumulation = accumulation
+        self.split = split
+        self._microbatches, self._loss_scale = microbatches, loss_scale(dynamic_scale)
         self.dynamic_scale = self._loss_scale is not None
         self.checkpoints = checkpoints
         self.tracker, self.step, self.rollout = tracker, step, rollout
