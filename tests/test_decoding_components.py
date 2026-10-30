@@ -20,7 +20,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
-from reference_error import assert_as_exact_as_the_reference
+from one_draw import assert_as_exact_as_the_reference
 from token_support import byte_level_tokenizer
 from transformers.generation.logits_process import (
     EncoderNoRepeatNGramLogitsProcessor,

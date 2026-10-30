@@ -1,10 +1,10 @@
 """The recurrence template's stability on the path a call takes: its Mosaic GPU mainloop
-(`recurrence_chunk.mosaic_rule` through `chunk(..., mainloop='mosaic')`), forward and fast backward, over
-every form the stability suite holds (test_recurrence_stability's `SITES`: the gated delta rule a decay a
-head and a key dimension, a write gate without the delta rule, the gated delta net's formed gates and
-Mamba2's rated decay) under its regimes (`REGIMES`: decays near one and near zero, the decay's bound,
-aligned keys with the write gate near one, resets on chunks' edges, saturated and spread gates, long and
-fading memories, steep then mild decays), held as test_recurrence_stability holds the portable math:
+(`recurrence_chunk.mosaic_rule`, the template named to the selectors, `chunk_on('mosaic_gpu', ...)`), forward
+and fast backward, over every form the stability suite holds (test_recurrence_stability's `SITES`: the gated
+delta rule a decay a head and a key dimension, a write gate without the delta rule, the gated delta net's
+formed gates and Mamba2's rated decay) under its regimes (`REGIMES`: decays near one and near zero, the
+decay's bound, aligned keys with the write gate near one, resets on chunks' edges, saturated and spread gates,
+long and fading memories, steep then mild decays), held as test_recurrence_stability holds the portable math:
 
 - finite wherever the recurrence a token at a time in float64 is;
 - check 1 (`assert_as_exact`): on par from float64 with its reference arm, the fla port where it runs the
@@ -23,19 +23,14 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import (
-    FEWEST_SEEDS,
-    assert_as_exact,
-    assert_as_exact_as_the_reference,
-    widened,
-    with_gradients,
-)
+from one_draw import assert_as_exact_as_the_reference
+from reference_error import FEWEST_SEEDS, assert_as_exact, widened, with_gradients
 from test_recurrence_chunk import chunk_on, token_by_token
 from test_recurrence_mosaic import NATIVE, REFUSED, taken, template_call
 from test_recurrence_stability import GRADIENT_SEEDS, REGIMES, SEEDS, SITES, cotangents, restarting, stressed
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.recurrence_chunk import Chunk, chunk
+from dew.nn.kernels.recurrence_chunk import Chunk
 from dew.nn.kernels.templates.recurrence import mainloop, template
 
 pytestmark = pytest.mark.kernel
@@ -118,7 +113,7 @@ def test_the_template_stays_finite_and_on_par_where_chunked_forms_break(name, re
     float64 recurrence's are on the regime's first draws, and on par with its reference arm's from float64
     over the site's declared seeds (check 1); a form or gradient it refuses is checked refused and skipped."""
     hooks = SITES[name]
-    mosaic = functools.partial(chunk, hooks, mainloop='mosaic')
+    mosaic = functools.partial(chunk_on, 'mosaic_gpu', hooks)
     reference, exact = reference_arm(hooks), functools.partial(token_by_token, hooks)
     if product == 'forward':
         dew, truth, seeds = mosaic, exact, SEEDS[name, regime]
@@ -149,7 +144,7 @@ def test_a_ragged_chunks_last_real_write_holds_the_final_memory_interpreted():
     product as the portable math peels it; the padded last slot's put the final memory 2.0 times the
     portable math's distance, interpreted and on an H100."""
     hooks = SITES['rated']
-    assert_as_exact(functools.partial(chunk, hooks, mainloop='mosaic'), reference_arm(hooks),
+    assert_as_exact(functools.partial(chunk_on, 'mosaic_gpu', hooks), reference_arm(hooks),
                     lambda seed: (bf16(stressed(hooks, 'the decay bound', seed)[0], hooks),),
                     'the template, rated under the decay bound, its forward', seeds=FEWEST_SEEDS,
                     truth_fn=functools.partial(token_by_token, hooks))
@@ -161,7 +156,7 @@ def test_each_form_the_template_takes_stays_finite_interpreted(name, regime):
     """Each form's 16-bit forward through the template, interpreted off a GPU, finite wherever the float64
     recurrence's is on the regime's first draw; a form it refuses is checked refused and skipped."""
     hooks = SITES[name]
-    mosaic = functools.partial(chunk, hooks, mainloop='mosaic')
+    mosaic = functools.partial(chunk_on, 'mosaic_gpu', hooks)
     drawn = (bf16(stressed(hooks, regime, 0)[0], hooks),)
     if not runs(mosaic, hooks, drawn[0], drawn, 'forward'):
         pytest.skip(f'the template refuses {name}: a refusal, not numerical coverage')
@@ -189,7 +184,7 @@ def test_the_fast_backward_decay_gradient_holds_under_decays_near_zero_interpret
     regime = 'decays near zero'
     operands, (out, final) = cotangents(HOOKS, regime, 0)
     drawn = (bf16(operands, HOOKS), (out.astype(jnp.bfloat16), final))
-    template = with_gradients(functools.partial(chunk, HOOKS, mainloop='mosaic'))
+    template = with_gradients(functools.partial(chunk_on, 'mosaic_gpu', HOOKS))
     if not fast_backward(restarting(lambda given: given, regime)(drawn[0])):
         with pytest.raises(NotImplementedError):
             jax.eval_shape(template, *drawn)

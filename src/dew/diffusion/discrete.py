@@ -114,6 +114,11 @@ class DiscreteProcess:
 
     schedule: MaskingSchedule
     mask_id: int
+    endpoint: float | None = None
+    """The time a release's sampling grid runs to (Dream's releases' `eps`): `times` walks
+    `linspace(T, endpoint, steps + 1)` with its last point taken to 0, where an `Unmask` step reveals
+    every position still masked, as their last step does (`p_transfer = 1`); None is MDLM's grid to
+    `NOISE_REMOVAL_TIME` and its closing fill."""
     T = 1.0
     """The fully masked end of the time domain, named `T` as in a Gaussian `Process`."""
 
@@ -155,8 +160,11 @@ class DiscreteProcess:
     def times(self, steps: int) -> jax.Array:
         """MDLM's sampling grid for `steps` reveal steps: `steps + 1` times from
         T to `NOISE_REMOVAL_TIME`, at which `sample`'s closing argmax fills what
-        is still masked, as MDLM's noise removal does."""
-        return jnp.linspace(self.T, NOISE_REMOVAL_TIME, steps + 1, dtype=jnp.float32)
+        is still masked, as MDLM's noise removal does; with an `endpoint`, the
+        release's grid to it, its last point 0."""
+        if self.endpoint is None:
+            return jnp.linspace(self.T, NOISE_REMOVAL_TIME, steps + 1, dtype=jnp.float32)
+        return jnp.linspace(self.T, self.endpoint, steps + 1, dtype=jnp.float32).at[-1].set(0.0)
 
     def noise(self, key, shape) -> jax.Array:
         """Return x_T, with every position masked.
@@ -344,11 +352,19 @@ class Unmask:
 
     Each masked position is revealed with probability
     (alpha(s) - alpha(t)) / (1 - alpha(t)), and a revealed position takes a
-    token drawn from the model's categorical distribution. The rest stay
-    masked, as does a position whose scores hold no distribution (a NaN), so
-    a walk never commits an arbitrary token: generation refuses a response
-    left masked. Stepping any other kind of process raises `ValueError`.
+    token drawn from the model's categorical distribution at `temperature`,
+    its best token at 0 (Dream's releases' `alg='origin'` at their default
+    temperature 0, `sample_tokens`). The rest stay masked, as does a position
+    whose scores hold no distribution (a NaN), so a walk never commits an
+    arbitrary token: generation refuses a response left masked. Stepping any
+    other kind of process raises `ValueError`.
     """
+
+    temperature: float = 1.0
+
+    def __post_init__(self) -> None:
+        if finite(self.temperature, "temperature") < 0.0:
+            raise ValueError(f"temperature is nonnegative, got {self.temperature}")
 
     def init(self, x, times, process, *, key) -> tuple:
         return ()
@@ -358,7 +374,7 @@ class Unmask:
         reveal_key, token_key = jax.random.split(key)
         reveal = jax.random.uniform(reveal_key, x.shape) < chance[:, None]
         revealed = denoise.masked(x) & reveal
-        drawn = draw(token_key, log_probs, revealed, REVEALED_UNDEFINED)
+        drawn = self._tokens(log_probs, lambda scores: draw(token_key, scores, revealed, REVEALED_UNDEFINED))
         # A position whose scores hold no distribution stays masked rather than take an arbitrary token.
         return jnp.where(revealed & wellformed(log_probs), drawn, x), state
 
@@ -369,8 +385,15 @@ class Unmask:
         split = jax.vmap(jax.random.split)(counted(keys))
         reveal = jax.vmap(lambda key: jax.random.uniform(key, x.shape[1:]))(split[:, 0]) < chance[:, None]
         revealed = denoise.masked(x) & reveal
-        drawn = row_draw(split[:, 1], log_probs, revealed, REVEALED_UNDEFINED)
+        drawn = self._tokens(log_probs,
+                             lambda scores: row_draw(split[:, 1], scores, revealed, REVEALED_UNDEFINED))
         return jnp.where(revealed & wellformed(log_probs), drawn, x), state
+
+    def _tokens(self, log_probs, drawn):
+        """Each position's token: its best at `temperature` 0, else `drawn` from its scores at it."""
+        if self.temperature == 0.0:
+            return jnp.argmax(log_probs, axis=-1).astype(jnp.int32)
+        return drawn(log_probs if self.temperature == 1.0 else log_probs / self.temperature)
 
     @staticmethod
     def _reveal_chance(process, t, t_next):
@@ -469,9 +492,11 @@ class MDLM:
 
     mask_id: int
     eps: float = 1e-3
+    endpoint: float | None = None
+    """The time the sampling grid runs to (`DiscreteProcess.endpoint`), None for MDLM's."""
 
     def __call__(self) -> DiscreteProcess:
-        return DiscreteProcess(schedule=LogLinear(eps=self.eps), mask_id=self.mask_id)
+        return DiscreteProcess(schedule=LogLinear(eps=self.eps), mask_id=self.mask_id, endpoint=self.endpoint)
 
 
 def refuse_causal(model: nn.Module) -> None:

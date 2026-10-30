@@ -234,6 +234,7 @@ def refuse_unbuildable(model: CausalTransformer, kinds: Mapping[str, ResolvedKin
     _streams(model)
     _cross_attention(model)
     _dex(model)
+    _gate_and_values(model)
     if model.swiglu_limit is not None and model.swiglu_limit <= 0:
         raise ValueError(
             f"swiglu_limit caps the gate and up projections, so it is positive, "
@@ -264,6 +265,23 @@ def _dex(model: CausalTransformer):
     if other:
         raise ValueError(f"DEX names layers {other}, whose mixers are no softmax attention; it extends a "
                          "softmax attention layer's heads")
+
+
+def _gate_and_values(model: CausalTransformer):
+    """Raise `ValueError` for an output gate activation the attention does not know, one set where no
+    output gate is, and value experts (`dew.nn.value_experts`) without the mixture whose routed layers
+    they sit on."""
+    from dew.nn.mixers.attention import GATE_ACTIVATIONS
+
+    if model.output_gate_activation not in GATE_ACTIVATIONS:
+        raise ValueError(f"output_gate_activation is one of {sorted(GATE_ACTIVATIONS)}, got "
+                         f"{model.output_gate_activation!r}")
+    if model.output_gate_activation != 'sigmoid' and not model.output_gate:
+        raise ValueError("output_gate_activation shapes the attention's output gate, which output_gate "
+                         "turns on")
+    if model.value_experts is not None and model.mixture is None:
+        raise ValueError("value_experts give the routed layers' values, and a model without a mixture "
+                         "routes none")
 
 
 def _cross_attention(model: CausalTransformer):

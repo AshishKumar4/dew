@@ -19,7 +19,8 @@ import numpy as np
 import optax
 import pytest
 from interop_support import gemma_features
-from reference_error import as_given, assert_as_exact, assert_as_exact_as_the_reference
+from one_draw import assert_as_exact_as_the_reference
+from reference_error import as_given, assert_as_exact
 from safetensors.numpy import load_file
 
 from dew.nn.audio import AudioLinear, Gemma3nAudio, audio_config, audio_weight_path, audio_weights

@@ -393,17 +393,26 @@ def record_key(python: str, row_name: str, held: str, inputs: str | None = None)
     `inputs`, the last of the runs on those shared inputs (`shared`), apart from the last runs' list
     (`listed`). Any run of another commit replaces the last record, so a commit's retry reads its own
     under its inputs first (`reused`). The Worker's key alphabet has no colon or hash."""
-    _, name, split = parsed_row(row_name)
     at = f"{CACHE_PREFIX}/{python}" if inputs is None else f"{CACHE_PREFIX}-inputs/{inputs[:16]}/{python}"
-    return f"{at}/{held}/{name}/" + ("-of-".join(split.split("/")) if split else "whole")
+    return f"{at}/{row_place(row_name, held)}"
 
 
-def green_key(held: str, key: str) -> str:
-    """Where a green row run on class `held` whose inputs hash to `key` (`cache_key`) is kept, apart from the
-    last run's record (`record_key`): every green run of a file on any inputs stays found by its own key, so a
-    run of another commit, which replaces the last record, loses none of them (`green_record`; owner,
-    2026-10-29: a lane's one-line change over a green verdict reran half its suite, its records replaced)."""
-    return f"{CACHE_PREFIX}-green/{held}/{key}"
+def row_place(row_name: str, held: str) -> str:
+    """Row `row_name`'s place on class `held` under a record prefix: `<class>/<test file>/<group>`, a group
+    `whole` or a split's `<index>-of-<count>` (`key_parts`)."""
+    _, name, split = parsed_row(row_name)
+    return f"{held}/{name}/" + ("-of-".join(split.split("/")) if split else "whole")
+
+
+def green_key(python: str, row_name: str, held: str, key: str) -> str:
+    """Where row `row_name`'s green run on class `held` whose inputs hash to `key` (`cache_key`) is kept,
+    apart from the last run's record (`record_key`): every green run of a row on any inputs stays found by
+    its own key, so a run of another commit, which replaces the last record, loses none of them
+    (`green_record`; owner, 2026-10-29: a lane's one-line change over a green verdict reran half its suite,
+    its records replaced). The row's own place holds it, as the files one process ran share what it executed
+    before them and so their keys (`executed.py`): kept by the key alone, one file's run stood for each of
+    them (2026-10-30: a kept task reported one file's row for six files)."""
+    return f"{CACHE_PREFIX}-green/{python}/{row_place(row_name, held)}/{key}"
 
 
 def key_parts(key: str) -> tuple[str, str, str]:
@@ -446,21 +455,48 @@ def pinned_classes() -> list[str]:
             ([cpu] if isinstance(cpu, dict) else cpu or [])]
 
 
-def reusable(python: str, names: list[str], common: str) -> set[str]:
+def reusable(python: str, names: list[str], common: str) -> dict[str, str]:
     """The files of `names` whose whole row ran green on exactly these inputs (`common`, and each file's
     own, `fresh`) on any class the tasks run on (`pinned_classes`), which a task of theirs could land on,
     read at plan time with the cache's read token (`READ_TOKEN`): a task of their own would only look each
-    up and exit. None where the plan has no token or no class (Main, 2026-10-28: a lane run with most files
-    unchanged booted a container a task; 2026-10-29: the suite pinned to 25/17 and 26/17)."""
+    up and exit. Each with where its green run is kept (`green_key`'s class and key, `KEPT_AT`'s token), which
+    the plan hands the task that holds it, so no run of another commit replacing a file's last record
+    between plan and task can hide it (2026-10-30: a kept task found 23 of its 259 files and ran the rest).
+    None where the plan has no token or no class (Main, 2026-10-28: a lane run with most files unchanged
+    booted a container a task; 2026-10-29: the suite pinned to 25/17 and 26/17)."""
     token, held = os.environ.get(READ_TOKEN), pinned_classes()
     if not token or not held or "DEW_XLA_CACHE_URL" not in os.environ:
-        return set()
+        return {}
 
-    def hit(name: str) -> bool:
-        return green_record(python, name, "", common, token, held) is not None
+    def hit(name: str) -> str | None:
+        for each in held:
+            found = green_record(python, name, "", common, token, [each])
+            # Kept only where its green run is kept by its key, as the task reads it.
+            if found is not None and recorded(green_key(python, row(python, name, ""), each, found["key"]),
+                                              token) is not None:
+                return f"{each}:{found['key']}"
+        return None
 
     with concurrent.futures.ThreadPoolExecutor(32) as pool:
-        return {name for name, found in zip(names, pool.map(hit, names), strict=True) if found}
+        return {name: found for name, found in zip(names, pool.map(hit, names), strict=True) if found}
+
+
+KEPT_AT = "@"
+"""What joins a kept file's name to where its green run is kept in a plan entry's tests (`reusable`):
+`tests/test_a.py@<class>:<key>`, which the task reads (`kept_of`)."""
+
+
+def kept_of(tests: list[str]) -> tuple[list[str], dict[str, tuple[str, str]]]:
+    """A task's `tests`, each a file's name, or a kept one's with where its green run is kept (`KEPT_AT`): the
+    names, and each kept one's class and key."""
+    names, kept = [], {}
+    for test in tests:
+        name, _, at = test.partition(KEPT_AT)
+        names.append(name)
+        if at:
+            held, _, key = at.partition(":")
+            kept[name] = (held, key)
+    return names, kept
 
 
 def green_record(python: str, name: str, split: str, common: str, token: str,
@@ -475,7 +511,7 @@ def green_record(python: str, name: str, split: str, common: str, token: str,
         # here, name the green run of exactly these, kept by its key (`green_key`) whatever ran since.
         if found is not None and found["depends"] is not None:
             key = cache_key(common, name, split, found["depends"])
-            kept = recorded(green_key(each, key), token)
+            kept = recorded(green_key(python, row(python, name, split), each, key), token)
             if kept is not None and kept["key"] == key:
                 return kept
     return None
@@ -489,14 +525,20 @@ def reused_classes(network: bool = False) -> list[str]:
     return held if own in held else [own]
 
 
-def reused(python: str, name: str, split: str, common: str, network: bool = False) -> dict | None:
+def reused(python: str, name: str, split: str, common: str, network: bool = False,
+           kept: tuple[str, str] | None = None) -> dict | None:
     """The green row of test file `name` (in `split`'s group) recorded on a class this host reuses
-    (`reused_classes`), if it ran green there on exactly these inputs; else None. The record of the last
-    run on these shared inputs decides: a key hashes them (`cache_key`), so no run on others, whose
-    record the last run's may be, can be fresh here."""
+    (`reused_classes`), if it ran green there on exactly these inputs; else None. A file its plan kept
+    (`kept`: its green run's class and key, `reusable`) reads that run, fresh here; any other, the record of
+    the last run on these shared inputs: a key hashes them (`cache_key`), so no run on others, whose record
+    the last run's may be, can be fresh here."""
     token = os.environ.get("DEW_XLA_CACHE_TOKEN")
     if not token or "DEW_XLA_CACHE_URL" not in os.environ:
         return None
+    if kept is not None:
+        found = recorded(green_key(python, row(python, name, split), *kept), token)
+        if found is not None and found["key"] == kept[1] and fresh(found, name, common):
+            return found["row"]
     found = green_record(python, name, split, common, token, reused_classes(network))
     return None if found is None else found["row"]
 
@@ -713,9 +755,10 @@ def plan(target: float, timings: dict) -> list[dict]:
         files = every if whole else [name for name in every if name in NEWEST_FILES]
         timings = borrowed(timings, python)
         timed = weights(files, timings, python)
-        kept = sorted(reusable(python, [name for name, seconds in timed.items() if seconds is None
-                                        or seconds <= target], shared(python))) if cache == "on" else []
-        timed = {name: seconds for name, seconds in timed.items() if name not in kept}
+        found = reusable(python, [name for name, seconds in timed.items() if seconds is None
+                                  or seconds <= target], shared(python)) if cache == "on" else {}
+        kept = sorted(found)
+        timed = {name: seconds for name, seconds in timed.items() if name not in found}
         # A lookup a file, in seconds: the task's weight is its container's start and those lookups.
         tasks: list[tuple[list[str], str, float]] = [(kept, "", float(len(kept)))] if kept else []
         tasks += [([name], "", target) for name, seconds in timed.items() if seconds is None]
@@ -734,7 +777,9 @@ def plan(target: float, timings: dict) -> list[dict]:
             tasks += [(names, "", held) for held, names in packed({name: light[name] for name in family},
                                                                   count) if names]
         for index, (names, group, weight) in enumerate(tasks, start=1):
-            entries.append({"name": f"{python}-{index}", "python": python, "tests": " ".join(names),
+            entries.append({"name": f"{python}-{index}", "python": python,
+                            "tests": " ".join(f"{name}{KEPT_AT}{found[name]}" if name in found else name
+                                              for name in names),
                             "split": group, "rows": [row(python, name, group) for name in names],
                             "weight": weight + (COLD_SECONDS if cache == "off" else 0.0), "cache": cache,
                             "whole": cells})
@@ -852,9 +897,11 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
     container's pace), which pytest's case times leave out. Weighed by case times, tasks planned
     at 300 seconds ran a median of 392. With `coverage`, pytest runs under coverage.py, whose data
     file goes there (`coverage_items`)."""
-    # Before any test writes under tests/, the inputs as the plan saw them.
-    return tested(python, tests, split, out, deadline, cache, grace, shared(python), {}, coverage,
-                  whole=whole, release=release)
+    # Before any test writes under tests/, the inputs as the plan saw them; the files its plan kept read
+    # where it found their green runs (`kept_of`).
+    names, kept = kept_of(tests)
+    return tested(python, names, split, out, deadline, cache, grace, shared(python), {}, coverage,
+                  whole=whole, release=release, kept=kept)
 
 
 def pytest_command(run: list[str], tests: list[str], split: str, release: str) -> list[str]:
@@ -869,9 +916,13 @@ def pytest_command(run: list[str], tests: list[str], split: str, release: str) -
             *command[1:]] if release else command
 
 
-def reused_rows(python: str, tests: list[str], group: str, common: str, network: bool) -> list[dict]:
-    """The green rows of `tests` in `group` recorded on these inputs on this host's class (`reused`), said."""
-    rows = [found for name in tests if (found := reused(python, name, group, common, network))]
+def reused_rows(python: str, tests: list[str], group: str, common: str, network: bool,
+                kept: Mapping[str, tuple[str, str]] | None = None) -> list[dict]:
+    """The green rows of `tests` in `group` recorded on these inputs on this host's class (`reused`), those
+    its plan kept read where it found them (`kept`), said."""
+    kept = kept or {}
+    rows = [found for name in tests
+            if (found := reused(python, name, group, common, network, kept.get(name)))]
     if rows:
         print(f"{len(rows)} files ran green on these inputs on {', '.join(reused_classes(network))}; "
               "their rows are reused")
@@ -880,13 +931,14 @@ def reused_rows(python: str, tests: list[str], group: str, common: str, network:
 
 def tested(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: str, grace: float,
            common: str, environ: Mapping[str, str], coverage: Path | None = None,
-           network: bool = False, whole: bool = False, release: str = "") -> int:
+           network: bool = False, whole: bool = False, release: str = "",
+           kept: Mapping[str, tuple[str, str]] | None = None) -> int:
     """`task` on the inputs `common` hashes, its pytest under `environ` beside this process's, a green row
     reused as the cache's policy (`policy`) allows. With `network`, the network-marked tests alone, with the
     Hub open, recorded on the network lane's class (`device_class`); `release`, a release check's."""
     began = time.monotonic()
     group = split or (f"{RELEASE}{release}" if release else "")
-    rows = [] if cache == "off" or release else reused_rows(python, tests, group, common, network)
+    rows = [] if cache == "off" or release else reused_rows(python, tests, group, common, network, kept)
     tests = [name for name in tests if row(python, name, group) not in {found["name"] for found in rows}]
     if not tests:
         out.write_text(json.dumps({"rows": rows}))
@@ -1046,7 +1098,7 @@ def record(python: str, rows: list[dict], executed_report: Path, common: str, ne
             ran_on = key if key is not None else None if ran["depends"] is None else cache_key(
                 common, name, parsed_row(row_["name"])[2], ran["depends"])
             if ran_on is not None:
-                written(green_key(held, ran_on), token, body)
+                written(green_key(python, row_["name"], held, ran_on), token, body)
 
 
 def written(key: str, token: str, body: bytes) -> bool:

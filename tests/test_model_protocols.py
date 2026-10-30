@@ -49,7 +49,10 @@ and `tiny_inputs`, which that file's registry-wide parametrization needs.
 
 import contextlib
 import dataclasses
+import functools
 import json
+from collections.abc import Callable
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -378,19 +381,42 @@ CAPACITY = LENGTH + STEPS
 """Room for the prompt and the greedy steps, below every checkpoint's own capacity."""
 
 
-def _greedy(model, variables, tokens, forced=None, **call):
-    """The cache `init_cache` allocates, the `STEPS` greedy draws after
-    `tokens` (or the `forced` ones) and the logits of every call, through
-    `call` (the decode mode, or DiffusionGemma's `encode`, the clean commits
-    a canvas reads)."""
-    cache = model.apply(variables, ROWS, method="init_cache", mutable=["cache"])[1]["cache"]
-    logits, held = model.apply({**variables, "cache": cache}, tokens, mutable=["cache"], **call)
+class _Served(NamedTuple):
+    """A model's cache allocation and call, compiled once as a server compiles its prefill and its step:
+    each a jitted program of the variables it reads, so a packed variables tree is its own trace."""
+
+    allocated: Callable
+    applied: Callable
+
+
+def _served(model, call: dict) -> _Served:
+    return _Served(jax.jit(lambda variables: model.apply(variables, ROWS, method="init_cache",
+                                                         mutable=["cache"])[1]["cache"]),
+                   jax.jit(lambda variables, cache, tokens: model.apply(
+                       {**variables, "cache": cache}, tokens, mutable=["cache"], **call)))
+
+
+@functools.cache
+def _programs(name: str, kind: str, call: tuple) -> _Served:
+    """`name`'s compiled call (`_served`) by `kind`: the model, the model `sized` to `CAPACITY`, or its
+    float64 twin (`wide`), each compiled once a process for every test that runs it."""
+    model = loaded(name).model
+    model = {"model": model, "sized": model.with_cache_capacity(CAPACITY),
+             "wide": float64_twin(model)}[kind]
+    return _served(model, dict(call))
+
+
+def _greedy(programs: _Served, variables, tokens, forced=None):
+    """The cache the programs allocate, the `STEPS` greedy draws after `tokens` (or the `forced` ones)
+    and the logits of every call, through their call (the decode mode, or DiffusionGemma's `encode`, the
+    clean commits a canvas reads)."""
+    cache = programs.allocated(variables)
+    logits, held = programs.applied(variables, cache, jnp.asarray(tokens))
     drawn, scores = [], [logits]
     for step in range(STEPS):
         drawn.append(jnp.argmax(logits[:, -1], axis=-1).astype(jnp.int32) if forced is None
-                     else forced[:, step])
-        logits, held = model.apply({**variables, "cache": held["cache"]}, drawn[-1][:, None],
-                                   mutable=["cache"], **call)
+                     else jnp.asarray(forced)[:, step])
+        logits, held = programs.applied(variables, held["cache"], drawn[-1][:, None])
         scores.append(logits)
     return cache, jnp.stack(drawn, axis=1), scores
 
@@ -414,25 +440,38 @@ def _continued(model):
     return draw
 
 
-def _scored(model, variables, *, wide: bool = False, **call):
+def _scored(programs: _Served, variables, *, wide: bool = False):
     """A drawn prompt's logits and each forced step's through the cache, as `_greedy` takes them: a host
-    loop over the model's own call, compiled once as a server compiles its prefill and its step, which the
-    gate runs as given; with `wide`, under x64, the float64 twin's truth."""
-    allocated = jax.jit(lambda variables: model.apply(variables, ROWS, method="init_cache",
-                                                      mutable=["cache"])[1]["cache"])
-    applied = jax.jit(lambda variables, cache, tokens: model.apply(
-        {**variables, "cache": cache}, tokens, mutable=["cache"], **call))
-
+    loop over the programs, which the gate runs as given; with `wide`, under x64, the float64 twin's
+    truth."""
     @as_given
     def run(tokens, forced):
         with jax.enable_x64(new_val=True) if wide else contextlib.nullcontext():
-            logits, held = applied(variables, allocated(variables), jnp.asarray(tokens))
-            scores = [logits]
-            for step in range(STEPS):
-                logits, held = applied(variables, held["cache"], jnp.asarray(forced)[:, step, None])
-                scores.append(logits)
+            _, _, scores = _greedy(programs, variables, tokens, forced)
             return [np.asarray(score, np.float64 if wide else score.dtype) for score in scores]
     return run
+
+
+@functools.cache
+def _reference(name: str, call: tuple) -> tuple[Callable, Callable]:
+    """`name`'s reference arm and its float64 truth over `_continued` draws (`_scored`), each draw's
+    scores kept once a process: the cache-capacity and packed-projection tests judge their programs
+    against the same two."""
+    variables = loaded(name).variables
+
+    def kept(run):
+        results: dict[tuple[bytes, bytes], object] = {}
+
+        @as_given
+        def held(tokens, forced):
+            key = (np.asarray(tokens).tobytes(), np.asarray(forced).tobytes())
+            if key not in results:
+                results[key] = run(tokens, forced)
+            return results[key]
+        return held
+
+    return (kept(_scored(_programs(name, "model", call), variables)),
+            kept(_scored(_programs(name, "wide", call), widened(variables), wide=True)))
 
 
 @pytest.mark.parametrize("name", PATHS)
@@ -447,16 +486,17 @@ def test_a_model_at_a_cache_capacity_decodes_what_the_model_does_within_it(name)
     same(sized.apply(variables, read.tokens, method="logits"), read.logits)
     if not model.causal:
         return
-    cache, drawn, _ = _greedy(model, variables, read.tokens, **_decoding(name))
-    sized_cache, sized_drawn, _ = _greedy(sized, variables, read.tokens, **_decoding(name))
+    call = tuple(_decoding(name).items())
+    own, at_capacity = _programs(name, "model", call), _programs(name, "sized", call)
+    cache, drawn, _ = _greedy(own, variables, read.tokens)
+    sized_cache, sized_drawn, _ = _greedy(at_capacity, variables, read.tokens)
     assert jax.tree.structure(sized_cache) == jax.tree.structure(cache)
     assert (any(CAPACITY in leaf.shape for leaf in jax.tree.leaves(sized_cache))
             == any(model.max_seq_len in leaf.shape for leaf in jax.tree.leaves(cache)))
     np.testing.assert_array_equal(np.asarray(sized_drawn), np.asarray(drawn))
-    call = _decoding(name)
-    assert_as_exact(_scored(sized, variables, **call), _scored(model, variables, **call), _continued(model),
-                    f"{name} cached logits at a capacity", seeds=CACHED_SEEDS,
-                    truth_fn=_scored(float64_twin(model), widened(variables), wide=True, **call))
+    reference, truth = _reference(name, call)
+    assert_as_exact(_scored(at_capacity, variables), reference, _continued(model),
+                    f"{name} cached logits at a capacity", seeds=CACHED_SEEDS, truth_fn=truth)
 
 
 def _packed(variables, groups) -> dict:
@@ -498,12 +538,14 @@ def test_packed_projections_serve_the_models_numbers(name):
         assert_as_exact(logits(model, packed), logits(model, variables), _continued(model), label,
                         seeds=CACHED_SEEDS, truth_fn=logits(float64_twin(model), widened(variables)))
         return
-    _, drawn, _ = _greedy(model, variables, read.tokens, decode=True)
-    _, packed_drawn, _ = _greedy(model, packed, read.tokens, decode=True)
+    call = (("decode", True),)
+    own = _programs(name, "model", call)
+    _, drawn, _ = _greedy(own, variables, read.tokens)
+    _, packed_drawn, _ = _greedy(own, packed, read.tokens)
     same(packed_drawn, drawn)
-    assert_as_exact(_scored(model, packed, decode=True), _scored(model, variables, decode=True),
-                    _continued(model), label, seeds=CACHED_SEEDS,
-                    truth_fn=_scored(float64_twin(model), widened(variables), wide=True, decode=True))
+    reference, truth = _reference(name, call)
+    assert_as_exact(_scored(own, packed), reference, _continued(model), label, seeds=CACHED_SEEDS,
+                    truth_fn=truth)
 
 
 def _request() -> ModelInputs:

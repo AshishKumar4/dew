@@ -386,7 +386,7 @@ def test_diffusers_reads_a_qwen_image_export(tmp_path):
     transformer run on fixed inputs in float32 and float64. The same export
     written here is the one that was read, file for file by SHA-256, and Dew's
     forward on the perturbed weights holds the float64 rule against it."""
-    from reference_error import assert_as_exact_as_the_reference
+    from one_draw import assert_as_exact_as_the_reference
 
     from tools.qwen_image_export_reference import GRID, digests, perturbed_export
 

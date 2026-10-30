@@ -71,8 +71,8 @@ PACKED = (False, True)
 
 def chunk_on(kernel: str, hooks, *args, **kwargs):
     """`chunk` on `kernel`, which `generation.chosen` names for the delta rule's selector, and for the rated
-    scan's the portable math where `kernel` is it ('xla')."""
-    named = {'gated_delta_rule': kernel, **({'ssd': kernel} if kernel == 'xla' else {})}
+    scan's where it runs both, the portable math ('xla') and the recurrence template ('mosaic_gpu')."""
+    named = {'gated_delta_rule': kernel, **({'ssd': kernel} if kernel in ('xla', 'mosaic_gpu') else {})}
     with generation.chosen(**named):
         return chunk(hooks, *args, **kwargs)
 """A row of one sequence, and of packed documents."""

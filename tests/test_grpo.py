@@ -17,14 +17,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import (
-    assert_as_exact,
-    assert_as_exact_as_the_reference,
-    declared_seeds,
-    indexed_recording,
-    recording,
-    with_gradients,
-)
+from one_draw import assert_as_exact_as_the_reference
+from reference_error import assert_as_exact, declared_seeds, indexed_recording, recording, with_gradients
 from rl_support import TinyHead, TinyLogits, clipped_surrogate, token_mean
 from steady_state import steady_state
 

@@ -21,15 +21,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from model_support import decode_through
-from reference_error import (
-    FACTOR,
-    assert_as_exact,
-    assert_as_exact_as_the_reference,
-    declared_seeds,
-    indexed_recording,
-    recording,
-    widened,
-)
+from one_draw import assert_as_exact_as_the_reference
+from reference_error import FACTOR, assert_as_exact, declared_seeds, indexed_recording, recording, widened
 from sequence_split_support import SPLIT_ROWS, assert_split_as_whole
 from ssd_support import mamba2_draw, mamba2_run
 
