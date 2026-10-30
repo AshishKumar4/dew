@@ -41,11 +41,13 @@ from dew.interop.decoder_parts import (
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind
-from dew.nn.kernels.recurrence_chunk import CHUNK_SIZE
 from dew.nn.mixers.lightning import ACTIVATIONS, LightningAttentionMixer
 
 _SPELLING = RopeSpelling(theta=1000000.0)
 """MiniMaxConfig's and MiniMaxText01Config's default rope base."""
+
+_BLOCK = 256
+"""MiniMaxConfig's `block_size` where a config states none, the remote code's `BLOCK` (:51)."""
 
 _OWN = ('minimax_text_01', 'minimax_m1')
 """The releases' own model types, read by their remote code (`attn_type_list`, `layernorm_*`)."""
@@ -142,7 +144,7 @@ def _minimax_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
     activation = _records.text(hf.get('hidden_act', 'silu'), 'hidden_act')
     if 'linear_attention' in types and activation not in ACTIVATIONS:
         refuse(f'hidden_act {activation!r}', f'the lightning projection takes {sorted(ACTIVATIONS)}')
-    chunk = _records.integer(hf.get('block_size', CHUNK_SIZE), 'block_size')
+    chunk = _records.integer(hf.get('block_size', _BLOCK), 'block_size')
     used.add('block_size')
     kinds = {name: kind for name, kind in kinds_of(config).items() if name != 'linear_attention'}
     named = []
@@ -185,7 +187,7 @@ def _minimax_export(model: CausalTransformer) -> Mapping[str, object]:
         **dict.fromkeys(_FACTORS['alpha'], model.stream_multiplier),
         **dict.fromkeys(_FACTORS['beta'], model.residual_multiplier),
         'rotary_dim': int(model.features_per_head * (model.partial_rotary_factor or 1.0)),
-        'block_size': chunks.pop() if chunks else CHUNK_SIZE,
+        'block_size': chunks.pop() if chunks else _BLOCK,
         'num_local_experts': None if mixture is None else mixture.experts,
         'num_experts_per_tok': None if mixture is None else mixture.top_k,
         'shared_intermediate_size': 0,
