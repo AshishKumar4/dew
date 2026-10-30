@@ -277,13 +277,17 @@ class AttentionTerms:
 
         self.total = total
         self.read = jax.jit(jax.grad(total, argnums=1, has_aux=True))
+        self.added: dict | None = None
 
     def __call__(self, variables) -> dict:
         """The terms carried to each attention's projections, by its module path: each projection's
         input and its heads' terms."""
-        _, shapes = jax.eval_shape(self.total, variables, {})
-        added = {path: jnp.zeros(record["out"].shape, record["out"].dtype) for path, record in shapes.items()}
-        cotangents, held = self.read(variables, added)
+        if self.added is None:
+            # Every draw's variables are of one tree, so its attentions' outputs of one shape.
+            _, shapes = jax.eval_shape(self.total, variables, {})
+            self.added = {path: jnp.zeros(record["out"].shape, record["out"].dtype)
+                          for path, record in shapes.items()}
+        cotangents, held = self.read(variables, self.added)
         carried = {}
         for path, record in held.items():
             query_name, key_name, value_name, out_name = self.names[path]
