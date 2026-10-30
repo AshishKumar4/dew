@@ -835,23 +835,26 @@ def decoding(model: CausalTransformer):
     return opened, step, last, scored
 
 
-def forced(programs, variables, prompt, tokens, *, prompt_rows: bool) -> jax.Array:
+def forced(programs, variables, prompt, tokens, *, prompt_rows: bool) -> np.ndarray:
     """Dew's log-probabilities at each position of `prompt` followed by `tokens`, the prompt
     prefilled and each token but the last decoded a step at a time through the cache (`programs`,
     `decoding`'s), as a run that drew `tokens` computes them: the prompt's rows (its last alone, the
-    vocabulary over that state alone, where `prompt_rows` is False), then a row a token."""
+    vocabulary over that state alone, where `prompt_rows` is False), then a row a token, each block
+    of rows scored and brought to the host as it is made, so the device never holds the vocabulary
+    over every row at once (a float64 4B's at 131072 tokens a row outgrows a 40 GB A100 beside its
+    cache)."""
     opened, step, last, scored = programs
     ids = jnp.asarray(np.asarray(prompt, np.int32)[None])
     if prompt_rows:
         logits, written = step(variables, opened(variables), ids)
-        rows = [logits[0]]
+        rows = [np.asarray(scored(logits[0]))]
     else:
         (_, logits), written = last(variables, opened(variables), ids)
-        rows = [logits]
+        rows = [np.asarray(scored(logits))]
     for token in tokens[:-1]:
         logits, written = step(variables, written['cache'], jnp.asarray([[token]], jnp.int32))
-        rows.append(logits[0])
-    return scored(jnp.concatenate(rows))
+        rows.append(np.asarray(scored(logits[0])))
+    return np.concatenate(rows)
 
 
 def assert_decodes_as_recorded(stored, site: str, model: CausalTransformer, weights, config: dict,
@@ -866,7 +869,7 @@ def assert_decodes_as_recorded(stored, site: str, model: CausalTransformer, weig
     programs = decoding(model)
 
     def rows(programs, variables):
-        return {'log_probabilities': jnp.concatenate([
+        return {'log_probabilities': np.concatenate([
             forced(programs, variables, prompt, tokens, prompt_rows=prompt_rows)
             for prompt, tokens, prompt_rows in parts.values()])}
 
