@@ -406,6 +406,28 @@ def test_a_run_handed_its_step_compiled_ahead_for_a_tpu_topology_trains_from_it(
     assert int(state.step) == 2 and first["ahead"] is True
 
 
+def test_a_run_naming_its_input_alone_compiles_its_step_ahead(tmp_path):
+    """An objective that names its input field alone (`Supervised(inputs="x")`) compiles its step ahead
+    (`AheadTarget.compiled`) as `fit` would start it: its input declared at the shape the loader's first
+    batch gives (`Trainer._declare_input`) before the run is checked (train 325's review of ledger
+    2551)."""
+    from flax import linen as nn
+
+    from dew.data.dataset import Loader
+    from dew.objectives.supervised import Supervised
+    from dew.training.ahead import AheadTarget, CompiledAhead, compile_only_gpus
+
+    data = Loader(train=lambda partition: iter([{"x": np.ones((BATCH, 8), np.float32),
+                                                  "y": np.zeros((BATCH, 4), np.float32)}] * 4),
+                  val=None, batch=BATCH, records=None)
+    trainer = Trainer(Supervised(nn.Dense(4), lambda outputs, batch: (outputs - batch["y"]) ** 2, inputs="x"),
+                      optax.sgd(0.1), key=jax.random.key(0),
+                      mesh=MeshSpec().build(compile_only_gpus("sm90", 1)))
+    with pytest.raises(CompiledAhead) as ended:
+        AheadTarget("sm90", 1, str(tmp_path / "step.dew-aot")).compiled(trainer, data, steps=1)
+    assert ended.value.ahead.devices == 1 and trainer.objective.inputs is not None
+
+
 FAST = {"tensor": Link(1e18, 1e9)}
 """A tensor axis whose link moves a projection's bytes in no time beside its FLOPs: any projection
 spreads over it, as over a measured NVLink one may."""

@@ -1075,6 +1075,61 @@ def test_a_step_compiles_ahead_here_for_a_tpu_topology_and_states_each_devices_m
         loaded.loaded()
 
 
+class _Placed:
+    """A reader of token rows that keeps its place (`get_state`) and has no `close`, noting in `read`
+    each place it reads a batch at."""
+
+    def __init__(self, read: list[int]):
+        self.at, self.read = 0, read
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        self.read.append(self.at)
+        self.at += 1
+        return {"text": np.full((4, 65), self.at % 256, np.int32)}
+
+    def get_state(self):
+        return json.dumps(self.at).encode()
+
+    def set_state(self, state):
+        self.at = json.loads(state)
+
+
+@pytest.mark.mesh(devices=4)
+def test_a_resumed_run_compiles_ahead_for_a_tpu_topology_where_its_checkpoint_left_it(tmp_path):
+    """A run trained a step here and compiled ahead for a TPU topology from its checkpoint
+    (`AheadTarget.compiled`) compiles the step its resume takes: its stream, a reader with no `close`,
+    reads its first batch from the checkpoint's position, not the start, at the rung its checkpoint
+    records, and nothing is placed on the topology's devices (train 325's review of ledger 2551)."""
+    import optax
+
+    from dew.checkpoints import Checkpoints
+    from dew.data.dataset import Loader
+    from dew.nn.backbones import CausalTransformer
+    from dew.objectives.lm import LMObjective
+    from dew.training import Layout, Trainer
+    from dew.training.ahead import AheadTarget, CompiledAhead
+
+    read: list[int] = []
+    data = Loader(train=lambda partition: _Placed(read), val=None, batch=4, records=None)
+    model = CausalTransformer(vocab_size=256, num_layers=2, num_heads=4, emb_features=128, mlp_features=256,
+                              dtype=jnp.bfloat16)
+    here = Trainer(LMObjective(model, 64), optax.adamw(1e-4), key=jax.random.key(0),
+                   mesh=Mesh(np.asarray(jax.devices()[:4]), ("fsdp",)), layout=Layout(min_shard=1),
+                   checkpoints=Checkpoints(str(tmp_path / "run")))
+    here.fit(data, steps=1, checkpoint_every=1)
+    assert read[0] == 0
+    read.clear()
+    target = AheadTarget("v5e:2x2", 4, str(tmp_path / "step.dew-aot"))
+    with pytest.raises(CompiledAhead) as ended:
+        target.compiled(_topology_trainer("v5e:2x2", checkpoints=Checkpoints(str(tmp_path / "run"))), data,
+                        steps=2)
+    assert read and read[0] == 1
+    assert ended.value.ahead.plan is not None and ended.value.ahead.devices == 4
+
+
 def test_a_topology_compile_neither_reads_nor_writes_the_persistent_cache(tmp_path, monkeypatch):
     """The executable a TPU topology's compile makes loads onto no client here, so the persistent cache
     is out of its way (`dew.cache.uncached`): a cache that a program here writes to gains nothing from
