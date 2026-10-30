@@ -242,7 +242,7 @@ def test_a_chosen_reference_kernel_runs_a_window_band_on_the_reference_path():
     """Under `chosen(attention='reference')` a window's band, its sequence past twice the window, runs the
     reference path the run names (bible §6), its mask's kernel the selector's alone (row 2664: the band's
     mask named xla over the context's choice): every attention call it reports ran on the reference."""
-    query, key, value = (jax.random.normal(jax.random.key(seed), (1, 64, 2, 16)) for seed in range(3))
+    query, key, value = (jax.random.normal(jax.random.key(seed), (1, 64, 2, 16), jnp.float32) for seed in range(3))
     with chosen(attention="reference"), generation.routes() as found:
         jax.jit(lambda q, k, v: local_attention(q, k, v, window=8)).trace(query, key, value)
     ran = {route.ran for route in found if route.choice == "attention"}
