@@ -873,8 +873,18 @@ def test_a_packed_runs_record_loads_where_its_token_store_is_not(tmp_path):
 
 def test_packing_a_token_store_that_states_no_document_ends_refuses_as_it_is_read(tmp_path):
     """A token store with neither a document index nor an EOS id reads as one document, whose pieces no
-    producer made, so its chain packed refuses as it is read, not as it is built."""
+    producer made, so its chain packed refuses as it is read, not as it is built: iterated, published
+    with its pack's plan, or packed by an objective (`ObjectiveData.pack`)."""
+    from dew.data.cache import Cache
+    from dew.data.compile import publish
+    from dew.data.pipeline import ObjectiveData, Pack
+
     tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ)
-    packed = TokenFiles(tokens.train).pipe(presets.lm, None, seq_len=SEQ, batch=8)
+    store = TokenFiles(tokens.train)
+    packed = store.pipe(presets.lm, None, seq_len=SEQ, batch=8)
     with pytest.raises(ValueError):
         next(iter(packed))
+    with pytest.raises(ValueError):
+        publish(store.pipe(presets.lm, None, seq_len=SEQ, batch=None), Cache(str(tmp_path / "cache")))
+    with pytest.raises(ValueError):
+        compile(store.batch(8), objective=ObjectiveData(pack=Pack(SEQ + 1)))
