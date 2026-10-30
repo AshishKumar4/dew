@@ -11,6 +11,8 @@ process (`gpu_flow`), each cell its own file's property:
 - A GPU host's CPU runs the seams its placement chooses and a projection without the Triton kernels
   (test_norm_swiglu, test_moe_precision).
 - A GPU reports its block, multiprocessors, clock and memory bandwidth (test_lowering).
+- A Gemma-sized vocabulary's chunked cross entropy is as exact as the whole logits, its float64 truth at
+  the seeds it needs (test_chunked_cross_entropy).
 """
 
 import functools
@@ -18,6 +20,7 @@ import functools
 import jax.numpy as jnp
 import pytest
 import test_audio as audio
+import test_chunked_cross_entropy as chunked_cross_entropy
 import test_fp8_base as fp8_base
 import test_lowering as lowering
 import test_moe_precision as moe_precision
@@ -83,6 +86,10 @@ def test_a_gpus_numerics_and_kernels_hold_on_this_gpu(tmp_path_factory):
              lowering.a_gpu_reports_its_block_and_multiprocessors_whether_or_not_a_row_names_it),
         Cell("a GPU reports its clock and memory bandwidth from its driver",
              lowering.a_gpu_reports_its_clock_and_memory_bandwidth_from_its_driver),
+        *(Cell(f"a Gemma-sized vocabulary is as exact as the whole logits: {chunks} chunks, {softcap}",
+               functools.partial(chunked_cross_entropy.a_gemma_sized_vocabulary_is_as_exact_as_the_whole_logits,
+                                 chunks, softcap))
+          for chunks in (4, 16) for softcap in (None, 30.0)),
     ])
 
 
