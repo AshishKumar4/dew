@@ -251,9 +251,10 @@ def coalesced(source, destination) -> None:
     inference's own choice was the MMA fragment's, a lane's 4 bytes a row, so a warp wrote half sectors: an
     A100's forward of Qwen3.5-27B's gated delta net took 1.162 ms against 0.941 with every store so, its
     states launch 0.422 against 0.314 and its output launch 0.299 against 0.258, the port's 0.984
-    (JS-a100copy-a100-0b4eb412b). A walk's stores alone (`Mma.stored`): the attention template's forward,
-    whose `persist` stores its output so, took 19% longer (JS-2075cells-a100-491c05798)."""
-    if len(source.shape) != 2 or source.shape[0] % 8:
+    (JS-a100copy-a100-0b4eb412b). A walk's 16-bit stores alone (`Mma.stored`): the attention template's
+    forward, whose `persist` stores its output so, took 19% longer (JS-2075cells-a100-491c05798), and an fp32
+    tile's copy so spilled 48 bytes in the training query/key launch (the recurrence resource gate, sm80)."""
+    if len(source.shape) != 2 or source.shape[0] % 8 or jnp.dtype(source.dtype).itemsize != 2:
         return copied(source, destination)
     rows, width = source.shape[0], source.shape[1] * jnp.dtype(source.dtype).itemsize
     for swizzle in (128, 64, 32, 16):
