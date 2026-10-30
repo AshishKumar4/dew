@@ -109,8 +109,8 @@ class DecisionModel(HeadedModel):
                 rngs=rngs, segments=inputs.context_segments, max_segments=inputs.max_segments)
             spanned = conditioning[CONTEXT] if inputs.spans_in_context else None
         if media is not None:
-            if inputs.slots is not None:
-                raise ValueError("a row of option positions holds no images")
+            if inputs.slots is not None or inputs.streams is not None:
+                raise ValueError("a row of option positions, or of streams, holds no images")
             def read_media(module, rows, given):
                 # The images' own conditioning beside the context's, one mapping the backbone reads;
                 # the rows' layout is the decision's coordinates alone, the processor's left out.
@@ -121,6 +121,16 @@ class DecisionModel(HeadedModel):
                     kwargs["conditioning"] = {**held, **conditioning}
                 return module.hidden_states(rows.tokens, train=train, coordinates=laid, **kwargs, **blocked)
             states, sown = applied(inputs, media, rngs=rngs, method=read_media)
+            return _array(states), spanned, sown
+        if inputs.streams is not None:
+            if blocked or inputs.slots is not None or inputs.reads is None:
+                raise ValueError("a row in streams reads as its layout's reads say, which blocks and "
+                                 "parallel options say otherwise")
+            # Each token reads the streams its record says, as runs over its document's (`stream_runs`).
+            runs = stream_runs(inputs.streams, inputs.segments, inputs.reads, inputs.fragments)
+            states, sown = applied(inputs.tokens, train=train, coordinates=laid, attention_key_runs=runs,
+                                   attention_key_positions=inputs.positions, method="hidden_states",
+                                   conditioning=conditioning, rngs=rngs)
             return _array(states), spanned, sown
         if inputs.slots is None:
             def read(module, tokens):
@@ -227,6 +237,47 @@ def key_runs(slots: jax.Array, segments: jax.Array, options: int, *, causal: boo
     if causal:
         hi = jnp.minimum(hi, index[None, :, None] + 1)
     kept = read & (hi > lo)
+    return jnp.stack([jnp.where(kept, lo, 0), jnp.where(kept, hi, 0)], axis=-1).astype(jnp.int32)
+
+
+def stream_runs(streams: jax.Array, segments: jax.Array, reads: Sequence[Sequence[int]],
+                fragments: int) -> jax.Array:
+    """Each token's key runs `[B, L, fragments, 2]` where its row's tokens stand in streams
+    (`DecisionInputs.streams`, `[B, L]`, -1 on the padding), the visibility `_read` gives its backbone as
+    runs (`AttentionMetadata.key_runs`): a token reads the runs of its own document's `fragments` (each
+    a run of one stream, `fragment_count`) its stream reads by `reads` (`Reads.lowered`: per stream, how
+    it reads itself, then each stream; 1 whole, 2 up to the token, 0 none), padding (segment 0) its own
+    span alone. An unread run is `(0, 0)`."""
+    batch, length = streams.shape
+    index = jnp.arange(length, dtype=jnp.int32)
+    first = block_starts(segments)
+    # A run opens where its document does or its stream turns; each token's run is numbered in its
+    # document, and every run keyed by its document's first token.
+    turned = jnp.concatenate([jnp.ones((batch, 1), bool), streams[:, 1:] != streams[:, :-1]], axis=1)
+    count = prefix_sum(turned | (index[None, :] == first), dtype=jnp.int32)
+    fragment = count - jnp.take_along_axis(count, first, axis=1)
+    keyed = first * fragments + fragment
+
+    def tables(keys, stream_row):
+        slots = length * fragments
+        return (jax.ops.segment_min(index, keys, num_segments=slots),
+                jax.ops.segment_max(index + 1, keys, num_segments=slots),
+                jax.ops.segment_max(stream_row, keys, num_segments=slots))
+
+    lo, hi, kind = jax.vmap(tables)(keyed, streams)
+    own = (first[..., None] * fragments + jnp.arange(fragments)).reshape(batch, -1)
+    lo, hi, kind = (jnp.take_along_axis(table, own, axis=1).reshape(batch, length, fragments)
+                    for table in (lo, hi, kind))
+    # The padding reads itself whole and nothing else: a stream of its own past the layout's.
+    count_streams = len(reads)
+    padding = [1, *[0] * (count_streams + 1)]
+    table = jnp.asarray([*([own_how, *others, 0] for own_how, *others in reads), padding], jnp.int32)
+    reader = jnp.where(streams < 0, count_streams, streams)
+    read = jnp.where(kind < 0, count_streams, kind)
+    how = jnp.where(read == reader[..., None], table[reader, 0][..., None],
+                    table[reader[..., None], 1 + read])
+    hi = jnp.where(how == 2, jnp.minimum(hi, index[None, :, None] + 1), hi)
+    kept = (how > 0) & (hi > lo)
     return jnp.stack([jnp.where(kept, lo, 0), jnp.where(kept, hi, 0)], axis=-1).astype(jnp.int32)
 
 
