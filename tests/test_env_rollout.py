@@ -95,7 +95,8 @@ def test_the_squashed_normals_log_density_is_the_change_of_variables():
     """The log-density of tanh(u), u normal, is the normal's less log(1 - tanh(u)^2), within float64
     rounding of that change of variables computed directly."""
     rng = np.random.default_rng(3)
-    raw, location = rng.normal(size=(64, 3)) * 2, rng.normal(size=(64, 3))
+    # Within 3 of zero, where 1 - tanh(u)^2 keeps the change of variables' own float64 digits.
+    raw, location = rng.uniform(-3, 3, size=(64, 3)), rng.normal(size=(64, 3))
     scale = rng.uniform(0.1, 2.0, size=(64, 3))
     with jax.enable_x64(new_val=True):
         found = np.asarray(tanh_normal_log_prob(raw, location, scale))
@@ -145,8 +146,8 @@ def test_ppo_raises_the_greedy_policys_return_on_the_walk():
     rollout = ControlRollout(objective, env, unroll_length=8, epochs=2, minibatches=2)
     trainer = Trainer(objective, optax.adam(3e-3), key=jax.random.key(5), rollout=rollout)
     initial = trainer.place()[0]
-    data = Loader(train=lambda partition: itertools.repeat({"step": np.zeros((4,), np.float32)}), val=None,
-                  records=4, batch=4)
+    data = Loader(train=lambda partition: itertools.repeat({"step": np.zeros((8,), np.float32)}), val=None,
+                  records=8, batch=8)
     before = episode_return(objective, env, initial.variables, jax.random.key(6), 8)
     final = trainer.fit(data, steps=60, log_every=60)
     after = episode_return(objective, env, final.variables, jax.random.key(6), 8)

@@ -33,8 +33,8 @@ import jax.numpy as jnp
 import optax
 from flax import linen as nn, struct
 
-from dew.batch import Batch, Variables, merge
-from dew.objectives.base import Aux, EMASpec, Objective, Ratio, Shown, Step, under
+from dew.batch import Batch, Variables, merge, under
+from dew.objectives.base import Aux, EMASpec, Objective, Ratio, Shown, Step
 from dew.rl.distributions import (
     categorical_kl,
     onehot_sample,

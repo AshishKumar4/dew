@@ -105,7 +105,8 @@ def fitted(nft, reward, prompts, **rollout):
     return sampled, initial, trainer.fit(data, steps=1, log_every=1)
 
 
-PROMPTS = ["red", "blue"]
+PROMPTS = ["red", "blue", "gold", "teal", "pink", "gray", "jade", "plum"]
+"""As many prompts as the data axis's eight devices take."""
 
 
 def reward(images, context):
@@ -125,10 +126,10 @@ def test_a_rollout_samples_the_old_policy_and_normalizes_by_the_batchs_spread():
     rollout, initial, final = fitted(nft, reward, prompts, groups=3, steps=5, train_steps=3)
     batch = rollout(initial, prompts, jax.random.key(23))
     rewards = np.asarray(batch["rewards"], np.float64)
-    grouped = rewards.reshape(2, 3)
+    grouped = rewards.reshape(8, 3)
     expected = (grouped - grouped.mean(axis=1, keepdims=True)) / (rewards.std() + 1e-4)
     np.testing.assert_array_equal(batch["advantages"], expected.reshape(-1).astype(np.float32))
-    np.testing.assert_array_equal(batch["timesteps"], np.broadcast_to(nft.process.times(5)[:3], (6, 3)))
+    np.testing.assert_array_equal(batch["timesteps"], np.broadcast_to(nft.process.times(5)[:3], (24, 3)))
 
     assert int(final.updates) == 1
     assert not np.array_equal(*(np.asarray(jax.tree.leaves(state.variables["params"])[0])

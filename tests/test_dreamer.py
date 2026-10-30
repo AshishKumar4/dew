@@ -147,8 +147,8 @@ def test_an_agent_learns_its_world_and_its_return_rises():
     rollout = DreamerRollout(objective, env, capacity=400, batch=8, length=16, train_ratio=32.0, prefill=24)
     tracker = RecordingTracker()
     trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(7), rollout=rollout, tracker=tracker)
-    data = Loader(train=lambda partition: itertools.repeat({"step": np.zeros((4,), np.float32)}), val=None,
-                  records=4, batch=4)
+    data = Loader(train=lambda partition: itertools.repeat({"step": np.zeros((8,), np.float32)}), val=None,
+                  records=8, batch=8)
     trainer.fit(data, steps=150, log_every=1)
     seen = [scalars for _, scalars in tracker.scalars if "loss_decoder" in scalars]
     early, late = seen[:20], seen[-20:]

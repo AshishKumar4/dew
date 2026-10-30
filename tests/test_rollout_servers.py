@@ -840,7 +840,7 @@ def test_an_nccl_push_delivers_every_tensor_to_each_replica_on_another_device(fi
     engines = nccl_replicas(worker, jax.devices()[1].local_hardware_id, 2)
     source = Pretrained.load(fixture, dtype="float32")
     changed = doubled(source)
-    push = NCCLPush(source, tuple(server.url for server in engines), library, chunk=4096, timeout=120)
+    push = NCCLPush(source, tuple(server.url for server in engines), library, chunk=2048, timeout=120)
     try:
         push(changed, 3)
     finally:
@@ -851,7 +851,7 @@ def test_an_nccl_push_delivers_every_tensor_to_each_replica_on_another_device(fi
     sent = jax.tree.map(lambda leaf: leaf.astype(jnp.bfloat16) if jnp.issubdtype(leaf.dtype, jnp.floating)
                         else leaf, changed)
     exported = source.export(sent)
-    assert len(exported) > 1 and max(np.asarray(tensor).nbytes for tensor in exported.values()) > 4096
+    assert len(exported) > 1 and max(np.asarray(tensor).nbytes for tensor in exported.values()) > 2048
     listings = []
     for server in engines:
         assert [path for _, _, path, _, _ in server.seen] == [
