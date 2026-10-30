@@ -124,10 +124,10 @@ class AheadProgram:
     trees: tuple
 
     @staticmethod
-    def of(lowered: jax.stages.Lowered, compiled: jax.stages.Compiled) -> AheadProgram:
-        """`compiled`, the executable `lowered` compiled to, as a program compiled ahead."""
+    def of(program: str, compiled: jax.stages.Compiled) -> AheadProgram:
+        """`compiled`, the executable `program` (`program_of`) compiled to, as a program compiled ahead."""
         executable, in_tree, out_tree = serialize_executable.serialize(compiled)
-        return AheadProgram(program_of(lowered), executable, (in_tree, out_tree))
+        return AheadProgram(program, executable, (in_tree, out_tree))
 
     def taken(self, lowered: jax.stages.Lowered, devices: list) -> jax.stages.Compiled:
         """The executable, loaded onto `devices`, for a run whose program lowered as `lowered`: refused
@@ -427,9 +427,8 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
     with assumed(generation), uncached() if on_tpus else contextlib.nullcontext():
         target = gpu_target()
         planned = trainer._compiled_plan(start.abstract, step_batch(trainer, batch), None, capacity)
-        # The sampled step's program, lowered for the target its executable was compiled for.
-        sampled = None if planned.sampled is None or planned.candidate.sampled is None else AheadProgram.of(
-            planned.candidate.sampled(), planned.sampled)
+    # The sampled step as the search compiled it, its program what it lowered then.
+    sampled = None if planned.sampled is None else AheadProgram.of(*planned.sampled)
     seconds = time.perf_counter() - began
     lowered, compiled = planned.candidate.lowered, planned.executable
     executable, in_tree, out_tree = serialize_executable.serialize(compiled)

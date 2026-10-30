@@ -1017,7 +1017,8 @@ class Trainer(Generic[Loss, Effects]):
 
         def run(current, batch, sampled: bool = False):
             # A sampled step summarizes what the run inspects (`Planned.sampled`); every other, the plan's.
-            executable = planned.sampled if sampled and planned.sampled is not None else planned.executable
+            executable = planned.sampled.executable if sampled and planned.sampled is not None else (
+                planned.executable)
             with self._traced_on(mesh):
                 # Each shape plans its copies (`_at_base_rung`), and a step reads the state with its own.
                 if not candidate.copies:
