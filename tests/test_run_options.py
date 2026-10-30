@@ -57,6 +57,7 @@ from dew.training.evaluation import Summary
 pytestmark = pytest.mark.mesh
 
 TINY_LAYA = Path(__file__).parent / "fixtures" / "laya" / "tiny"
+QWEN_TINY = Path(__file__).parent / "fixtures" / "hf" / "qwen38-dense-tiny"
 RATE = 0.0123
 """A learning rate no kind takes by default, which the run's optimizer logs as it steps."""
 
@@ -583,9 +584,18 @@ BESIDE = {"layout.framing": {"segments": built_in(None, "question_first"), "max_
 its own segments (`_budgeted`), here the question layout's own row as segments (`built_in`), in a row long
 enough for its conversation's turns."""
 
-TASK_RUNS = {"TextSettings": (prefixed, "lm"), "MaskedSettings": (masked, "masked_diffusion"),
-             "ImageSettings": (diffusion, "diffusion"), "DecideSettings": (contexted, "decision")}
-"""A run here of an objective that records each saved task's settings, and the objective's name."""
+def blocked(root: Path, drawn: bool) -> RunConfig:
+    """`decision`'s run as a fresh head over a tiny causal backbone whose full attention reads blocks
+    (`--source.attention`), whose rows a split takes, which a release's rows never are."""
+    return dataclasses.replace(decision(root, drawn), pretrained=str(QWEN_TINY), source=SourceOptions(
+        text_only=True, attention={"full_attention": "block_bidirectional"}))
+
+
+TASK_RUNS = {"TextSettings": ((prefixed, "lm"),), "MaskedSettings": ((masked, "masked_diffusion"),),
+             "ImageSettings": ((diffusion, "diffusion"),),
+             "DecideSettings": ((contexted, "decision"), (blocked, "decision"))}
+"""The runs here of an objective that records each saved task's settings, and the objective's name: a
+decision release's, and a fresh head's over a backbone that reads blocks."""
 
 
 def witnessed(settings: type, base=None) -> dict[str, list[object]]:
@@ -718,6 +728,65 @@ def reached_by(run: RunConfig, root: Path, settings: type, flags, queued: dict[s
     return reached, refused
 
 
+def witnessed_on(builder, objective: str, settings: type, root: Path
+                 ) -> tuple[dict[str, Option], dict[str, str]]:
+    """The options of `settings` the run `builder` makes saves (`options_of`), and why each the run does not
+    witness is not: one with no path its settings do not declare derived, or derived from data the run
+    leaves unfilled; one set alone to each alternative (`reached_by`) that no run trains with, whose
+    loaded task holds it nowhere it held another before (`held`), or which a request of that task reads
+    nowhere it holds it (`reading`), a consumer's own read, not its record's."""
+    root.mkdir(parents=True)
+    run = builder(root, drawn=False)
+    base, unset = saved_with(run, root, "unset", settings, {})
+    before = held(unset)
+    options = {option.name: option for option in options_of(run, objective, settings, base)}
+    failures = {}
+    for name, option in options.items():
+        if option.found is None and "derived" not in option.field.metadata:
+            failures[name] = "it has no path"
+        # A field of the settings' own the run fills from its data; one of a value the run builds is
+        # filled from the option its declaration names (`--head`'s labels).
+        elif option.found is None and "." not in name and held_at(base, name) == option.field.default:
+            failures[name] = "the run fills none"
+    # A builder's path is witnessed by its own alternatives, each the option its call makes; an option
+    # set beside what its reader takes it with (`BESIDE`) is judged by the run alone.
+    queued = {name: [value for value in (alternatives(found.annotation) if found.builds else option.values)
+                     if found.makes(value) and not same(found.made(value), held_at(base, name))
+                     and (name in BESIDE or accepted(base, name, found.made(value)))]
+              for name, option in options.items() if (found := option.found) is not None}
+    reachable = {name: option.found for name, option in options.items() if option.found is not None}
+    hints = typing.get_type_hints(type(run), include_extras=True)
+
+    def flags(assigned: dict[str, object]) -> dict[str, str]:
+        """The `--set`s of each option `assigned`, and of what its reader takes it only beside (`BESIDE`)."""
+        beside = {path: flag(value, hints[path])
+                  for name in assigned for path, value in BESIDE.get(name, {}).items()}
+        return {**beside, **{reachable[name].path: flag(value, reachable[name].annotation)
+                             for name, value in assigned.items()}}
+    reached, refused = reached_by(run, root, settings, flags, queued, lambda saved, name, value: same(
+        held_at(saved, name), reachable[name].made(value)))
+    for name in queued:
+        if name not in reached:
+            failures[name] = f"no alternative trains: {refused.get(name)}"
+            continue
+        task, value = reached[name]
+        option = reachable[name].made(value)
+        after = held_by(task)
+        # Where the loaded task holds the option it held another before, a request reads it there.
+        places = [after[path] for path, inner in held(task).items()
+                  if same(inner, option) and not same(before.get(path), inner)]
+        holders: dict[type, set[str]] = {}
+        for holder, attribute in places:
+            holders.setdefault(type(holder), set()).add(attribute)
+        with reading(holders) as reads:
+            requested(task)
+        if not places:
+            failures[name] = "the task loaded holds none set"
+        elif not any(same(found, option) for _, found in reads):
+            failures[name] = "a request of the loaded task reads none it holds"
+    return options, failures
+
+
 @pytest.mark.mesh(devices=8)
 @pytest.mark.parametrize("settings", SETTINGS, ids=lambda settings: settings.__name__)
 def test_each_option_a_saved_task_is_built_with_reaches_it_from_the_command_line(settings, tmp_path):
@@ -732,48 +801,13 @@ def test_each_option_a_saved_task_is_built_with_reaches_it_from_the_command_line
     which the run fills, or a value the run builds of fields of its own (a decision run's layout), whose
     fields are its options (`options_of`). A field of Dew's types that declares fewer than two
     alternatives fails, unless derived or a record (`unwitnessed`). Every settings type an objective
-    declares alternatives in has a run here (`TASK_RUNS`)."""
+    declares alternatives in has a run here (`TASK_RUNS`), and each option is witnessed on one of them
+    that holds it (`witnessed_on`)."""
     assert settings.__name__ in TASK_RUNS, f"no run here trains an objective whose task reads {settings}"
-    builder, objective = TASK_RUNS[settings.__name__]
-    run = builder(tmp_path, drawn=False)
-    base, unset = saved_with(run, tmp_path, "unset", settings, {})
-    before = held(unset)
-    options = {option.name: option for option in options_of(run, objective, settings, base)}
-    for option in (option for option in options.values() if option.found is None):
-        assert "derived" in option.field.metadata, f"{settings.__name__}.{option.name} has no path"
-        # A field of the settings' own the run fills from its data; one of a value the run builds is
-        # filled from the option its declaration names (`--head`'s labels).
-        assert "." in option.name or held_at(base, option.name) != option.field.default, \
-            f"the run fills no {settings.__name__}.{option.name}"
-    # A builder's path is witnessed by its own alternatives, each the option its call makes.
-    queued = {name: [value for value in (alternatives(found.annotation) if found.builds else option.values)
-                     if found.makes(value) and not same(found.made(value), held_at(base, name))
-                     and accepted(base, name, found.made(value))]
-              for name, option in options.items() if (found := option.found) is not None}
-    reachable = {name: option.found for name, option in options.items() if option.found is not None}
-    hints = typing.get_type_hints(type(run), include_extras=True)
-
-    def flags(assigned: dict[str, object]) -> dict[str, str]:
-        """The `--set`s of each option `assigned`, and of what its reader takes it only beside (`BESIDE`)."""
-        beside = {path: flag(value, hints[path])
-                  for name in assigned for path, value in BESIDE.get(name, {}).items()}
-        return {**beside, **{reachable[name].path: flag(value, reachable[name].annotation)
-                             for name, value in assigned.items()}}
-    reached, refused = reached_by(run, tmp_path, settings, flags, queued, lambda saved, name, value: same(
-        held_at(saved, name), reachable[name].made(value)))
-    for name in queued:
-        assert name in reached, f"no alternative of {settings.__name__}.{name} trains: {refused.get(name)}"
-        task, value = reached[name]
-        option = reachable[name].made(value)
-        after = held_by(task)
-        # Where the loaded task holds the option it held another before, a request reads it there.
-        places = [after[path] for path, inner in held(task).items()
-                  if same(inner, option) and not same(before.get(path), inner)]
-        assert places, f"the task loaded holds no {settings.__name__}.{name} set"
-        holders: dict[type, set[str]] = {}
-        for holder, attribute in places:
-            holders.setdefault(type(holder), set()).add(attribute)
-        with reading(holders) as reads:
-            requested(task)
-        assert any(same(found, option) for _, found in reads), \
-            f"a request of the loaded task reads no {settings.__name__}.{name} it holds"
+    found = [witnessed_on(builder, objective, settings, tmp_path / builder.__name__)
+             for builder, objective in TASK_RUNS[settings.__name__]]
+    # An option is witnessed on a run that holds it, which a release's settings may not (a split's).
+    missed = {name: [failures[name] for options, failures in found if name in options]
+              for name in {name for options, _ in found for name in options}
+              if all(name not in options or name in failures for options, failures in found)}
+    assert not missed, f"{settings.__name__}'s options no run here witnesses: {missed}"
