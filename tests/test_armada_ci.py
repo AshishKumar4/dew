@@ -499,17 +499,18 @@ def test_what_runs_after_the_last_test_is_every_files_input(ci, tmp_path, monkey
     assert reused() == [False, False]
 
 
-def test_a_module_imported_by_name_is_its_files_input(ci, tmp_path, monkeypatch, cache_worker):
+def test_a_module_imported_by_name_is_its_files_input_and_no_earlier_files(ci, tmp_path, monkeypatch,
+                                                                             cache_worker):
     """A module a test imports by name at run time (importlib.import_module) is its file's input as an
     import statement's is: a helper of that name added under tests/, which leads sys.path, reruns the
-    file."""
+    file, and no file the process ran before it, which never saw that module."""
     reused = lifetime_task(ci, tmp_path, monkeypatch, cache_worker, {
+        "test_b.py": PASSING["test_b.py"],
         "test_named.py": "import importlib\ndef test_named():\n"
-                         "    assert importlib.import_module('tabnanny')\n",
-        "test_b.py": PASSING["test_b.py"]}, {})
+                         "    assert importlib.import_module('tabnanny')\n"}, {})
     assert reused() == [True, True]
     (tmp_path / "tests/tabnanny.py").write_text("")
-    assert reused() == [False, True]
+    assert reused() == [True, False]
 
 
 def test_a_file_a_session_parameter_revisits_takes_what_ran_between_its_visits(ci, tmp_path, monkeypatch,
@@ -543,34 +544,36 @@ def test_a_process_ending_1_after_its_tests_passed_is_red(ci, tmp_path, monkeypa
 
 
 def test_each_files_record_is_its_own_where_files_share_a_process(ci, tmp_path, monkeypatch, cache_worker):
-    """Each input moves exactly the files that read it (row 2642): a fixture's arrival reruns its prober
-    alone, a helper shadowing a name only a file's child imported reruns that file alone, and a module
-    one file imported lazily, an earlier one in the process, reruns the later file that read what it
-    left; and two files whose records share inputs never take each other's row."""
+    """Each input moves exactly the files that may have seen it (row 2642): a fixture's arrival reruns its
+    prober, the process's last file, alone; a helper shadowing a name only a file's child imported reruns
+    that file alone; a module one file imported lazily reruns it and every file the process ran after it,
+    which what it left may serve; and two files whose records share inputs never take each other's row."""
     child = ("import site, sysconfig; site.addsitedir(sysconfig.get_paths()['purelib']); "
              "import tabnanny")
     reused = lifetime_task(ci, tmp_path, monkeypatch, cache_worker, {
-        "test_probe.py": "import os\ndef test_probe():\n    assert not os.path.exists('tests/data/f.txt')\n",
         "test_child.py": f"import subprocess, sys\ndef test_child():\n"
                          f"    subprocess.run([sys.executable, '-c', {child!r}], check=True)\n",
         "test_lazy.py": ON_SRC + "import holder\ndef test_lazy():\n    import lazy\n"
                                  "    holder.VALUES['lazy'] = lazy.VALUE\n",
         "test_later.py": "import holder\ndef test_later():\n    assert holder.VALUES.get('lazy', 1) == 1\n",
+        "test_probe.py": "import os\ndef test_probe():\n"
+                         "    assert not os.path.exists('tests/fixtures/f.txt')\n",
         "holder.py": "VALUES = {}\n"}, {"lazy.py": "VALUE = 1\n"})
     assert reused() == [True, True, True, True]
-    (tmp_path / "tests/data").mkdir()
-    (tmp_path / "tests/data/f.txt").write_text("")
-    assert reused() == [False, True, True, True]
-    (tmp_path / "tests/data/f.txt").unlink()
+    (tmp_path / "tests/fixtures").mkdir()
+    (tmp_path / "tests/fixtures/f.txt").write_text("")
+    assert reused() == [True, True, True, False]
+    (tmp_path / "tests/fixtures/f.txt").unlink()
     (tmp_path / "tests/tabnanny.py").write_text("")
-    assert reused() == [True, False, True, True]
+    assert reused() == [False, True, True, True]
     (tmp_path / "tests/tabnanny.py").unlink()
     (tmp_path / "src/lazy.py").write_text("VALUE = 2\n")
-    assert reused() == [True, True, False, False]
+    assert reused() == [True, False, False, False]
     (tmp_path / "src/lazy.py").write_text("VALUE = 1\n")
     common = ci.shared("3.12")
     names = ("tests/test_lazy.py", "tests/test_later.py")
-    assert [ci.reused("3.12", name, "", common)["name"] for name in names] == [f"3.12:{name}" for name in names]
+    found = [ci.reused("3.12", name, "", common)["name"] for name in names]
+    assert found == [f"3.12:{name}" for name in names]
 
 
 def fetcher(root: Path, *, due: bool = False) -> Path:
