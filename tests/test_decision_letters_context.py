@@ -43,7 +43,6 @@ from dew.registry import from_record, to_record
 pytestmark = pytest.mark.mesh
 
 SAVED_RECORDS = Path(__file__).parent / "fixtures" / "saved_records"
-SAVED_RECORDS = Path(__file__).parent / "fixtures" / "saved_records"
 LLAMA = Path(__file__).parent / "fixtures" / "hf" / "llama-tiny"
 SPECIALS = Specials(begin=None, separator=10, marker=0, marker_text="\x00", pad=255)
 TOKENIZER = ByteTokenizer()

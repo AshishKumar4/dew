@@ -20,7 +20,7 @@ import numpy as np
 
 from dew import _checkout
 from dew._hashing import array_header
-from dew._records import ADDED, JSON, json_value, record, set_added
+from dew._records import ADDED, JSON, json_value, record, set_added, without_removed
 from dew.data.compilation import checkout_now
 from dew.data.sources.codec import content_fingerprint
 from dew.position import PER_SHARE
@@ -503,7 +503,9 @@ class Plan:
                     or any(pools.get(name) != saved_pools.get(name) for name in compared)):
                 raise ValueError(f"saved per-share data plan topology changed (shares, workers or cycle "
                                  f"length): {PER_SHARE}")
-        changed = _changed(record(saved.get("manifest"), "saved data manifest"), self.manifest.semantic())
+        # Each identity without the fields its configurations lost since runs were saved (`without_removed`).
+        changed = _changed(without_removed(record(saved.get("manifest"), "saved data manifest")),
+                           without_removed(self.manifest.semantic()))
         if edited is not None:
             changed = tuple(name for name in changed if name not in ("source", "steps", "tokenizer"))
         if changed:

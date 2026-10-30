@@ -15,9 +15,11 @@ JSON. The `JSON` alias both directions speak is declared here, once.
 
 from __future__ import annotations
 
+import ast
 import dataclasses
 import datetime
 import functools
+import json
 import math
 import re
 from collections.abc import Callable, Mapping, Sequence
@@ -201,20 +203,58 @@ def set_added(value: DataclassInstance | Sequence[DataclassInstance] | Mapping[s
                or set_added(getattr(value, field.name)) for field in dataclasses.fields(value))
 
 
-def earlier_segments(segments: Sequence[JSON]) -> list[JSON]:
-    """A decision row's segment records (`dew.decision.layout`) in today's fields, as a saved run's
-    record holds them (`dew.config.earlier_run`, `dew.inference.tasks.earlier_shapes`): a question's
-    option lines without the stream they named between rows 2008 and 2450, which was always their
-    instructions' (one stream a question), as they follow their instructions now. Carried to 1.0
-    (ledger 1552)."""
-    def current(segment: JSON) -> JSON:
-        if not isinstance(segment, dict) or not isinstance(segment.get("fields"), dict):
-            return segment
-        name = segment.get("class")
-        if not (isinstance(name, str) and name.rsplit(":", 1)[-1].rsplit(".", 1)[-1] == "OptionLines"):
-            return segment
-        fields = segment["fields"]
-        assert isinstance(fields, dict)
-        return {**segment, "fields": {key: value for key, value in fields.items() if key != "stream"}}
+REMOVED_FIELDS: Mapping[str, frozenset[str]] = {"dew.decision.layout:OptionLines": frozenset({"stream"})}
+"""The fields a configuration lost after runs were saved with them, by its class's import path: each always
+another's (a question's option lines' stream, its instructions', rows 2008 to 2450), so a saved record of one
+means what today's, which has none, does. A saved run's records read without them (`earlier_fields`), and a
+saved data step's identity compares without them (`without_removed`). Carried to 1.0 (ledger 1552)."""
 
-    return [current(segment) for segment in segments]
+
+def earlier_fields(value: JSON) -> JSON:
+    """`value`, a saved run's record (its run.json, its checkpoint's task record) or any part of one, with
+    each component's fields its class lost since (`REMOVED_FIELDS`) left out: a component record names its
+    class and holds its fields (`{"class": ..., "fields": ...}`), wherever it nests."""
+    if isinstance(value, list):
+        return [earlier_fields(part) for part in value]
+    if not isinstance(value, dict):
+        return value
+    held = {key: earlier_fields(part) for key, part in value.items()}
+    removed = REMOVED_FIELDS.get(held["class"]) if isinstance(held.get("class"), str) else None
+    fields = held.get("fields")
+    if removed and isinstance(fields, dict):
+        held["fields"] = {name: field for name, field in fields.items() if name not in removed}
+    return held
+
+
+_REMOVED_BY_NAME = {path.rsplit(":", 1)[-1]: names for path, names in REMOVED_FIELDS.items()}
+"""`REMOVED_FIELDS` by class name, as a configuration's repr names it."""
+
+
+def without_removed(value: JSON) -> JSON:
+    """`value`, a data step's identity or a manifest of them (`dew.data.plan.StepIdentity`), with the fields
+    configurations lost since runs were saved (`REMOVED_FIELDS`) left out wherever its text records one: a
+    configuration's repr (`OptionLines(..., stream='context')`), within its JSON record or alone. An identity
+    that names no such configuration is as it was, so a saved identity and today's compare by what their steps
+    compute (`dew.data.plan.Plan.check`)."""
+    if isinstance(value, list):
+        return [without_removed(part) for part in value]
+    if isinstance(value, dict):
+        return {key: without_removed(part) for key, part in value.items()}
+    if not isinstance(value, str) or not any(f"{name}(" in value for name in _REMOVED_BY_NAME):
+        return value
+    try:
+        parsed = json.loads(value)
+    except ValueError:
+        parsed = None
+    if isinstance(parsed, dict | list):
+        return json.dumps(without_removed(parsed), sort_keys=True)
+    try:
+        tree = ast.parse(value, mode="eval")
+    except SyntaxError:
+        return value
+    for node in ast.walk(tree):
+        named = node.func.id if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) else None
+        if isinstance(node, ast.Call) and named in _REMOVED_BY_NAME:
+            removed = _REMOVED_BY_NAME[named]
+            node.keywords = [keyword for keyword in node.keywords if keyword.arg not in removed]
+    return ast.unparse(tree)

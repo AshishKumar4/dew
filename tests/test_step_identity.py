@@ -4,12 +4,14 @@ configuration after runs were saved with it (`dew._records.ADDED`)."""
 from __future__ import annotations
 
 import dataclasses
+import json
 
 import numpy as np
 import pytest
 
-from dew._records import ADDED
+from dew._records import ADDED, earlier_fields, without_removed
 from dew.data.plan import StepIdentity
+from dew.decision.layout import Instructions, OptionLines
 
 
 @dataclasses.dataclass(frozen=True)
@@ -72,3 +74,24 @@ class HeldScaledLater:
     scale: int
     weights: np.ndarray | None
     shift: int = dataclasses.field(default=0, repr=False, metadata={ADDED: True})
+
+
+def test_a_field_removed_after_runs_were_saved_leaves_their_identity_and_records_as_they_meant():
+    """A field a configuration lost after runs were saved with it (`dew._records.REMOVED_FIELDS`: a
+    question's option lines' stream, always its instructions') leaves a saved data step's identity naming it
+    the identity of today's step, wherever the identity records it (a repr, alone or within a JSON record),
+    and a saved run's component records read without it; an identity whose other fields differ still
+    differs, and one naming no such configuration is as it was."""
+    lines = OptionLines(line="\n{label}. {option}", bare="\n{label}. {option}", join="", noul_first="false")
+    today = StepIdentity.of(Holding((Instructions({"choice": "{}"}, stream="context"), lines))).semantic()
+    # The identity an earlier main saved: its option lines' repr naming their stream last, as theirs did.
+    earlier = json.dumps(today).replace("noul_first='false')", "noul_first='false', stream='context')")
+    saved = json.loads(earlier)
+    assert saved != today and without_removed(saved) == without_removed(today)
+    moved = json.loads(json.dumps(saved).replace("join=''", "join=' '"))
+    assert without_removed(moved) != without_removed(today)
+    plain = StepIdentity.of(Scaled(2)).semantic()
+    assert without_removed(plain) == plain
+    record = {"class": "dew.decision.layout:OptionLines", "fields": {"line": "x", "stream": "context"}}
+    assert earlier_fields({"segments": [record]}) == {
+        "segments": [{"class": "dew.decision.layout:OptionLines", "fields": {"line": "x"}}]}
