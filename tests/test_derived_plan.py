@@ -106,19 +106,23 @@ def test_an_objective_that_trains_two_modules_unset_reads_the_derivation(monkeyp
 
 
 def test_a_run_that_sets_its_remat_is_told_the_lighter_rung_its_derivation_fits(monkeypatch, tmp_path):
-    """A run that sets full recomputation compiles there alone, once, and before it compiles reads the
-    derivation from no remat up (row 2536): with room for every rung the base rung fits, which its plan
-    records beside the rung it compiled; with room for full recomputation alone, nothing below the rung
-    it set fits, and the derivation stops there."""
+    """A run that sets its remat compiles there alone, once, and before it compiles reads the derivation
+    from no remat up to its own (row 2536): with room for every rung, a run set to full recomputation
+    reads the base rung fit, which its plan records beside the rung it compiled; a run set to the least
+    rung that fits reads every rung below it refused, and the derivation stops there."""
     room = room_for_full_recompute_only(monkeypatch, tmp_path / "sizing")
-    for free_bytes, lighter in ((LIMIT, True), (room, False)):
-        monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / f"run-{lighter}"))
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "unset"))
+    free(monkeypatch, room)
+    unset = deep()
+    compiled(unset)
+    for free_bytes, remat, lighter in ((LIMIT, "full", True), (room, unset.plan["remat"], False)):
+        monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / f"run-{remat}"))
         free(monkeypatch, free_bytes)
-        trainer = deep(REMAT_POLICIES["full"])
+        trainer = deep(REMAT_POLICIES[remat])
         with Compiles("step") as compiles:
             compiled(trainer)
         derived = trainer.plan["derived"]
-        assert compiles.count == 1 and trainer.plan["probes"][0]["remat"] == trainer.plan["remat"] == "full"
-        assert derived and derived[0]["remat"] is None and all(entry["remat"] != "full" for entry in derived)
+        assert compiles.count == 1 and trainer.plan["probes"][0]["remat"] == trainer.plan["remat"] == remat
+        assert derived and derived[0]["remat"] is None and all(entry["remat"] != remat for entry in derived)
         assert [entry["label"] for entry in derived][-1] == ("fits" if lighter else "refuses")
         assert {entry["label"] for entry in derived[:-1]} <= {"refuses"}
