@@ -19,7 +19,7 @@ import numpy as np
 import pytest
 from one_draw import assert_as_exact_as_the_reference
 from reference_error import assert_as_exact, declared_seeds, indexed_recording, recording, with_gradients
-from rl_support import TinyHead, TinyLogits, clipped_surrogate, token_mean
+from rl_support import Published, ScriptedSource, TinyHead, TinyLogits, clipped_surrogate, token_mean
 from steady_state import steady_state
 
 from dew.data.prompts import INFO_KEY, LENGTH_KEY, PROMPT_KEY, SOURCE_KEY, TRUTH_KEY, _utf8
@@ -248,7 +248,6 @@ def test_an_asynchronous_rescore_reads_the_policy_at_the_progress_its_loss_reads
     likelihoods are those its loss scores at those updates, not the run's end's, so a ratio over
     unchanged weights is 1."""
     import itertools
-    from concurrent.futures import Future
 
     import optax
 
@@ -260,26 +259,9 @@ def test_an_asynchronous_rescore_reads_the_policy_at_the_progress_its_loss_reads
     from dew.objectives.rl.sessions import Call, Session, Status
     from dew.training import Trainer
 
-    class Scripted:
-        def submit(self, task, samples, *, version, key):
-            futures = []
-            for sample in range(samples):
-                call = Call((1, 2), (3 + sample, 4), (-0.5, -0.25), "stop", version)
-                future = Future()
-                future.set_result(Session(str(task.id), "", sample, 0, (call,), Status.COMPLETED,
-                                          float(sample)))
-                futures.append(future)
-            return futures
-
-        def cancel(self, futures):
-            for future in futures:
-                future.cancel()
-
-    class Publisher:
-        version = 0
-
-        def load(self, variables, version):
-            self.version = version
+    def drawn(task, sample, version):
+        call = Call((1, 2), (3 + sample, 4), (-0.5, -0.25), "stop", version)
+        return Session(str(task.id), "", sample, 0, (call,), Status.COMPLETED, float(sample))
 
     model = CausalTransformer(vocab_size=VOCAB, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
                               max_seq_len=12, dtype="float32", attention_impl="xla",
@@ -288,8 +270,8 @@ def test_an_asynchronous_rescore_reads_the_policy_at_the_progress_its_loss_reads
     objective = GRPOObjective(model, seq_len=7, behavior_importance=2.0)
     # A row a task, as many as a host's devices hold rows.
     tasks = np.arange(1, 9, dtype=np.int32)
-    scheduler = RolloutScheduler(Asynchronous(Scripted(), Publisher(), objective, width=8, rows=len(tasks),
-                                              max_lag=1, ahead=0), groups=2)
+    scheduler = RolloutScheduler(Asynchronous(ScriptedSource(drawn), Published(), objective, width=8,
+                                              rows=len(tasks), max_lag=1, ahead=0), groups=2)
     seen = []
 
     def rollout(state, batch, key):
