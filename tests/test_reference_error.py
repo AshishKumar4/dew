@@ -108,15 +108,17 @@ def test_a_check_whose_program_xla_cpu_compiles_only_with_ynnpacks_fusions_runs_
 
 @pytest.mark.skipif(jax.default_backend() != "cpu", reason="WITHOUT_YNN is XLA:CPU's")
 def test_a_process_whose_xla_refuses_the_ynn_options_moves_no_site_onto_the_fusions(monkeypatch):
-    """Where XLA:CPU refuses WITHOUT_YNN's options themselves, the gate raises before deciding any site
-    (`_ynn_option_held`), so no paired site moves onto the fusions and passes."""
+    """Where XLA:CPU refuses WITHOUT_YNN's options themselves, a site of two Dew paths raises before
+    deciding (`_ynn_option_held`), so it moves onto the fusions and passes nowhere."""
     import reference_error
 
     reference_error._ynn_option_held.cache_clear()
     monkeypatch.setattr(reference_error, "WITHOUT_YNN", {"xla_cpu_no_such_option": "none"})
     try:
         with pytest.raises(RuntimeError):
-            reference_error._ynn_option_held()
+            assert_as_exact(pulled_by_itself(xla_attention), pulled_by_itself(written_attention),
+                            one_key_draw, "attention over one key, its options refused", seeds=16)
+        assert not reference_error.SWITCHED
     finally:
         reference_error._ynn_option_held.cache_clear()
 

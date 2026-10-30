@@ -1019,6 +1019,32 @@ def test_a_task_reuses_a_green_row_only_on_the_cpu_class_and_inputs_it_ran_on(ci
 
 
 
+def test_every_row_carries_the_sites_its_cases_moved_onto_ynnpacks_fusions_and_a_reused_row_keeps_them(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """Each row a task runs carries `ynn_switched`, the sites its file's cases reported moving onto
+    YNNPACK's fusions (the JUnit property tests/conftest.py writes), green rows included and an empty list
+    where none moved; a green row a later task reuses keeps the field as it ran."""
+    sites = [{"label": "a site over one key", "refused": "Dot with multiple contracting dimensions"}]
+    written(tmp_path, {
+        "test_moved.py": "import json\n"
+                         "from pathlib import Path\n"
+                         "def test_moved(record_property):\n"
+                         "    with Path('runs').open('a') as runs: runs.write('x')\n"
+                         f"    record_property('ynn_switched', json.dumps({sites!r}))\n"
+                         "def test_still(): pass\n",
+        "test_unmoved.py": "def test_plain(): pass\n"})
+    out = cached_checkout(ci, tmp_path, monkeypatch, cache_worker)
+
+    def fields() -> dict[str, list]:
+        return {row["name"]: row["ynn_switched"] for row in armada_task(ci, monkeypatch, out)}
+
+    expected = {"3.12:tests/test_moved.py": [{"node": "tests/test_moved.py::test_moved", **sites[0]}],
+                "3.12:tests/test_unmoved.py": []}
+    assert fields() == expected
+    assert fields() == expected
+    assert (tmp_path / "runs").read_text() == "x", "the second task reused the rows"
+
+
 def cached_checkout(ci, root: Path, monkeypatch, cache_worker) -> Path:
     """Checkout `root` run by 3.12 tasks on one CPU class against the shared test cache, and where their
     verdict is written: beside the checkout's entries, not among them (the checkout's own directory is an
