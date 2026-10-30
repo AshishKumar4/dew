@@ -162,7 +162,7 @@ def checkpoint(args):
     import dew
     from dew.nn.autoencoders.sd_vae import StableDiffusionVAE
 
-    pipeline = dew.pipeline('dewml/hybrid-dit-176m', revision='8d891d967319e51cd0e73d3e5b7c29d68a238b52')
+    pipeline = dew.pipeline('dewml/hybrid-dit-176m', revision='b282fd7d06d6bafca2739747423ef8049f6feada')
     prompt = 'a watercolor painting of a mountain lake at sunrise'
 
     def sample(dilated=None):

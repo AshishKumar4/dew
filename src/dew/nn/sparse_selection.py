@@ -16,7 +16,7 @@ import jax
 import jax.numpy as jnp
 
 from dew.nn.inputs import sequence_blocks
-from dew.nn.precision import accumulated, at_least_fp32, float32_einsum, float32_products
+from dew.nn.precision import accumulated, at_least_fp32, float32_einsum
 from dew.nn.scatter import DROPPED
 
 
@@ -43,7 +43,7 @@ def index_scores(agreements, weights, width: int, precision=None):
     # einsum over the scores first, it ran a third slower forward and backward
     # on an H100 at the V3.2 indexer's 64 heads over 4096 keys.
     weighted = (weights.astype(wide) * heads ** -0.5)[..., None, :]
-    return accumulated(functools.partial(jnp.matmul, precision=float32_products(wide, precision)),
+    return accumulated(functools.partial(jnp.matmul, precision=precision),
                        weighted, scores).squeeze(-2)
 
 
