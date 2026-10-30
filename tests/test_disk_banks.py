@@ -323,14 +323,15 @@ def test_a_decision_release_streams_its_wrappers_float64_layers_as_the_resident_
 def test_a_config_naming_expert_dtype_alone_streams_as_the_unquantized_load(tmp_path):
     """`expert_dtype` names a quantized source's expert storage only beside its quantization config
     (`codecs.source_quantization`): a config that states it alone is the unquantized checkpoint the
-    loader reads, and the banks stream it as the resident load computes it."""
+    loader reads, and the banks stream it as the resident load computes it, bit for bit: a bank a
+    layer, so the two run one scan (ledger 2540)."""
     from dew.inference.banks import SafetensorsBanks
 
     config = {**json.loads((FIXTURE / "config.json").read_text()), "expert_dtype": "fp4"}
     (tmp_path / "config.json").write_text(json.dumps(config))
     shutil.copy2(FIXTURE / "model.safetensors", tmp_path / "model.safetensors")
     with SafetensorsBanks(tmp_path, cache_bytes=0, param_dtype="float32") as source:
-        model = decoder(source.config, None)
+        model = decoder(source.config, 1)
         resident = HeldBanks(translate_weights(
             read_weights(FIXTURE), translate_config(config), "mixtral"
         )).place(model, mesh=single_mesh(), layout=DEVICE)
