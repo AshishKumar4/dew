@@ -202,7 +202,7 @@ at 168 registers where a whole-program compile holds its 232."""
 def entry_registers(warpgroups: int) -> int:
     """The registers a thread of a program of `warpgroups` warpgroups launches with: its threads' share of
     the multiprocessor's 64K in the allocator's steps of 8, at most 255 (168 at three warpgroups)."""
-    return min(255, 64 * 1024 // (warpgroups * THREADS) // 8 * 8)
+    return min(255, cost.REGISTERS // (warpgroups * THREADS) // cost.REGISTER_STEP * cost.REGISTER_STEP)
 
 
 def raised_registers(consumers: int) -> int:
@@ -214,7 +214,7 @@ def raised_registers(consumers: int) -> int:
     CTA launch", NVIDIA forums 302068): four consumers' 640 threads launch at 96 a thread, so they hold 104,
     where the multiprocessor's share would ask 112 and wait for registers no warp gives back."""
     pool = entry_registers(consumers + 1) * (consumers + 1) * THREADS
-    return min(256, (pool - PRODUCER_REGISTERS * THREADS) // (consumers * THREADS) // 8 * 8)
+    return min(256, (pool - PRODUCER_REGISTERS * THREADS) // (consumers * THREADS) // cost.REGISTER_STEP * cost.REGISTER_STEP)
 
 
 def consumer_registers(consumers: int) -> int:

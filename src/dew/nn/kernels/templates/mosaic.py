@@ -437,7 +437,7 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     held_registers: int = 40
     """The registers a consumer thread holds beside its accumulator and operand fragments (addresses,
     indices, the walk's carry): CUTLASS's cooperative sm90 kernel's 168 less its accumulator's 128."""
-    register_step: int = 8
+    register_step: int = cost.REGISTER_STEP
     """The allocator's registers per thread in one step (setmaxnreg's eight-register granularity).
     A compile gate tests admits at their actual cap, refusals one such step below it."""
     operands_in_registers: bool

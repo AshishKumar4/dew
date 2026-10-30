@@ -506,15 +506,9 @@ def _register_evidence(record: dict) -> list[dict]:
                 continue
             model = resources.RegisterModel(**stated)
             need = kernel.get("need")
-            if isinstance(need, dict) and need["budget"] != model.budget:
-                # The compiler evidence belongs to this actual launch's budget. Keep the hand model's
-                # prediction beside it rather than treating a guarded kernel as its parent's geometry.
-                actual = resources.RegisterModel(**record["lowered_models"][found.kernel])
-                actual_evidence = _evidence(record, found, actual, need)
-                predicted = _evidence(record, found, model, None)
-                evidence = dataclasses.replace(predicted, compiled=actual_evidence.compiled)
-            else:
-                evidence = _evidence(record, found, model, need)
+            actual = record.get("lowered_models", {}).get(found.kernel)
+            evidence = _evidence(record, found, model, need,
+                                 measured_model=None if actual is None else resources.RegisterModel(**actual))
             rows.append({"source": source, **evidence.record()})
         if found.spilled:
             rows.append({"case_id": f"{record['name']} {found.kernel}", "kind": "spill",
@@ -523,10 +517,12 @@ def _register_evidence(record: dict) -> list[dict]:
 
 
 def _evidence(record: dict, kernel: "report.Report", model: resources.RegisterModel,
-              need: int | dict | None) -> compile_evidence.Evidence:
+              need: int | dict | None, *,
+              measured_model: resources.RegisterModel | None = None) -> compile_evidence.Evidence:
     """A modelled kernel's evidence: the model's registers and the decision they give against ptxas's need
     and its decision (`decisions`)."""
-    predicted, compiled = decisions(model.registers, model), decisions(need, model)
+    predicted = decisions(model.registers, model)
+    compiled = decisions(need, measured_model or model)
     # ptxas's registers a thread: its least spill-free cap, or where it decided at the launch's own caps
     # (`register_decisions`), its use at the budget.
     if isinstance(need, dict):
@@ -554,7 +550,7 @@ def _head() -> str:
 def _ptxas_version() -> str:
     """The version line of the ptxas the gate assembles with (`PTXAS`)."""
     ran = subprocess.run([str(PTXAS), "--version"], capture_output=True, text=True, check=False)
-    return (ran.stdout.strip().splitlines() or [""])[-1]
+    return ran.stdout.strip()
 
 
 @functools.cache
@@ -563,7 +559,7 @@ def _compiler() -> Compiler:
     matched = re.search(r"V(\d+)\.(\d+)", version)
     if matched is None:
         raise ValueError(f"ptxas states no compiler version: {version}")
-    return Compiler(tuple(map(int, matched.groups())), RELOCATABLE)
+    return Compiler((int(matched[1]), int(matched[2])), RELOCATABLE)
 
 
 TPU_TOPOLOGIES = {"v5e": "v5e:2x2", "v6e": "v6e:2x2"}
