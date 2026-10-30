@@ -87,7 +87,6 @@ from dew.nn.kernels import tuning
 from dew.nn.kernels.generation import assumed, gpu_mesh, gpu_target
 from dew.nn.kernels.options import compiler_options
 from dew.nn.precision import at_least_fp32
-from dew.nn.progress import training
 from dew.nn.sharding import (
     Link,
     Schedule,
@@ -934,7 +933,7 @@ class Trainer(Generic[Loss, Effects]):
         def run(current, batch, part, tokens, closes=None):
             advanced, loss, aux = custom(current, batch)
             return advanced, loss, aux, None
-        return training(run)
+        return run
 
     @ruled
     def compile(self, state: TrainState, batch: Batch, trials: Trials | None = None, *,

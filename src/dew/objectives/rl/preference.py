@@ -105,9 +105,11 @@ class DPOObjective(TokenScorer):
         # function, so a policy equal to its reference earns zero rewards wherever the two compile alike.
         pairs = jnp.concatenate((chosen_ids, rejected_ids))
         policy = self.token_scores(variables, pairs, qk_stats=step.qk_stats, predict=predict,
+                                   progress=self.progress(step),
                                    routing=self.balance is not None)
         policy_chosen, policy_rejected = jnp.split(-policy.losses, 2)
-        ref_chosen, ref_rejected = jnp.split(-self.token_scores(step.ema, pairs).losses, 2)
+        ref_chosen, ref_rejected = jnp.split(
+            -self.token_scores(step.ema, pairs, progress=self.progress(step)).losses, 2)
         terms, (pair_chosen, pair_rejected) = preference_logsigmoid_terms(
             policy_chosen, policy_rejected, ref_chosen, ref_rejected,
             chosen_mask, rejected_mask, self.beta)

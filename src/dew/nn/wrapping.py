@@ -57,6 +57,12 @@ class DecoderWrapper(nn.Module):
         return self.clone(**{self.wraps: decoder})
 
     @nn.nowrap
+    def reads_progress(self) -> bool:
+        """Whether its decoder's computation changes over a run (`dew.nn.progress.ReadsProgress`), which
+        a run's objective then passes or refuses."""
+        return self._decoder.reads_progress()
+
+    @nn.nowrap
     def replicated_flops(self, stages: int, lengths) -> float:
         return self._decoder.replicated_flops(stages, lengths)
 

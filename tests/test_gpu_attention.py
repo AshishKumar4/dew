@@ -20,8 +20,8 @@ runs on a GPU alone, run in one process (`gpu_flow`), each cell its own file's p
   nothing on the fused kernels (test_attention_masked_rows).
 - The Mosaic template on an H100, each test its own cells: forward, training forward, natural forward
   and backward over every call form, head width, hook and run (test_attention_mosaic); an fp16 call
-  through the route, a long sequence on par with the reference path, and the fast form's default route
-  not on par with IEEE fp32, the accurate form's control (test_attention_route).
+  through the route, and a long sequence on par with the reference path (test_attention_route); the fast
+  form's default route not on par with IEEE fp32, the accurate form's control (test_attention_accurate_form).
 """
 
 import functools
@@ -30,6 +30,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+import test_attention_accurate_form as accurate_form
 import test_attention_dropout as dropout
 import test_attention_masked_rows as masked_rows
 import test_attention_mosaic as mosaic
@@ -186,6 +187,6 @@ def test_the_mosaic_template_holds_on_an_h100():
         *(cell for check in MOSAIC_CELLS for cell in cells_of(check, "sm90")),
         *cells_of(route.an_fp16_call_on_an_h100_is_on_par, "sm90"),
         *cells_of(route.a_long_sequence_is_on_par_with_the_reference_path),
-        *cells_of(route.the_fast_form_on_a_gpus_default_route_is_not_on_par_with_ieee_fp32),
+        *cells_of(accurate_form.the_fast_form_on_a_gpus_default_route_is_not_on_par_with_ieee_fp32),
     ])
 

@@ -419,7 +419,7 @@ TEMPLATE_SUPPORTS = (
           "H100, or a table every row shares on a GPU without warpgroup MMA, where the template's frozen "
           "Triton mainloop reads it spread to every row, unmeasured; a shared table the warpgroup-MMA "
           "Mosaic mainloop runs a third faster in half the memory (ET-DBIAS-h100; named, it runs)",
-          row='2577', kind='measured'),
+          row='2625', kind='measured'),
     _Need('shards', lambda case: case.shards == 1,
           "an automatic sequence axis gathers the keys, and a pallas call would gather the queries back",
           row=INHERENT),
