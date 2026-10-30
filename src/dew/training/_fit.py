@@ -420,6 +420,20 @@ class FitRun:
         (`DevicePrefetchIterator.held`), none to hold once the stream is closed."""
         return contextlib.nullcontext() if self.train is None else self.train.held()
 
+    def further(self, interval: Interval) -> Callable[[], Batch | None]:
+        """A read of the training stream's next batch for a rollout that draws past its step's
+        (`Rollout.draws_further`): from inside the step's hold on placements (`read_held`), agreed as a
+        step's read is, its wait counted in `interval`; None where the stream ran out on every process.
+        Its position is the stream's after it, which the step saves as any read's."""
+        def read() -> Batch | None:
+            assert self.train is not None
+            asked = time.perf_counter()
+            batch = agreed_next("rollout read", iter(self.train.read_held, None))
+            interval.waited += time.perf_counter() - asked
+            return batch
+
+        return read
+
     def read(self) -> Batch:
         """The training stream's next batch, read through this run each time:
         a caller's alias would keep the closed stream reachable from a failed

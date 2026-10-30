@@ -1445,6 +1445,7 @@ mixers: Aliases[type[MixerBase], MixerBase] = Aliases("mixer", {
     "memory": "dew.nn.mixers.memory:InContextMemoryMixer",
     "mla": "dew.nn.mla:MLAMixer",
     "mlp": "dew.nn.mixers.mlp:MLPMixer",
+    "qsa_attention": "dew.nn.mixers.attention:QSAAttentionMixer",
     "short_conv": "dew.nn.mixers.short_conv:ShortConvMixer",
 }, base="dew.nn.mixer_base:MixerBase")
 towers: Aliases[type[TowerBase], TowerBase] = Aliases("tower", {

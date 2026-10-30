@@ -910,7 +910,7 @@ def test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edge
     _held_empty(family, differentiated(*draw(0)), label)
 
 
-def _default_is_finite(family_name: str, mainloop_name: str) -> None:
+def default_is_finite(family_name: str, mainloop_name: str) -> None:
     """A template mainloop's output and query, key and value gradients in the default form, finite wherever
     the reference's are (`assert_finite`) over the family's draws; a row that sees nothing, zero. Its error
     here is no claim, and its ties the documented divergence (the module's docstring)."""
@@ -926,22 +926,12 @@ def _default_is_finite(family_name: str, mainloop_name: str) -> None:
 @pytest.mark.parametrize("family", TEMPLATE_FAMILIES)
 def test_the_default_form_is_finite_where_the_reference_is_at_fp32s_edges(family):
     """The plain-JAX mainloop, which walks under the default's guards (`algebra.walked`: its sums' headroom,
-    the fold's reach), finite in the default form over every family (`_default_is_finite`)."""
-    _default_is_finite(family, "portable")
+    the fold's reach), finite in the default form over every family (`default_is_finite`)."""
+    default_is_finite(family, "portable")
 
 
 MOSAIC_FAMILIES = [family for family in TEMPLATE_FAMILIES if _mosaic_takes(FAMILIES[family])]
 """The template's families the Mosaic mainloop takes (`_mosaic_takes`)."""
-
-
-@pytest.mark.skipif(not ON_HOPPER, reason="runs the Mosaic mainloop compiled, on an H100")
-@pytest.mark.gpu(reason="runs the Mosaic mainloop compiled, on an H100")
-@pytest.mark.parametrize("family", MOSAIC_FAMILIES)
-def test_the_mosaic_mainloops_default_is_finite_where_the_reference_is_at_fp32s_edges(family):
-    """The Mosaic mainloop, which walks under the default's guards over whole launches
-    (`algebra.walked_launches`), finite in the default form over every family it takes (its legality rule,
-    `attention_mosaic.refused`: bf16 operands in its backward, hooks it lowers; `_default_is_finite`)."""
-    _default_is_finite(family, "mosaic")
 
 
 HOOKLESS_FAMILIES = [family for family in MOSAIC_FAMILIES if FAMILIES[family].draw(0)[3] is None]
@@ -949,32 +939,22 @@ HOOKLESS_FAMILIES = [family for family in MOSAIC_FAMILIES if FAMILIES[family].dr
 (`MosaicBackward.derived`)."""
 
 
-@pytest.mark.skipif(not ON_HOPPER, reason="runs the Mosaic mainloop compiled, on an H100")
-@pytest.mark.gpu(reason="runs the Mosaic mainloop compiled, on an H100")
-@pytest.mark.parametrize("family", HOOKLESS_FAMILIES)
-def test_the_mosaic_two_launch_backward_is_finite_where_the_reference_is_at_fp32s_edges(family):
-    """The Mosaic backward in two launches (`TWO_LAUNCHES`), deterministic mode's for a hookless call, whose
-    derived backward is one launch (`test_the_mosaic_mainloops_default_is_finite_…`), finite in the default
-    form over every family it takes (`_default_is_finite`)."""
-    _default_is_finite(family, "mosaic two launches")
-
-
 GPU_TRITON_FAMILIES = ("a small weight on a large value, bfloat16",)
-"""The families whose frozen Triton default-form check runs on a GPU alone, compiled as its route runs it:
-256 draws interpreted take past the CPU suite's 240 s target (218-257 s, row 1849)."""
+"""The families whose frozen Triton default-form check runs on a GPU alone, compiled as its route runs it
+(tests/test_gpu_attention.py): 256 draws interpreted take past the CPU suite's 240 s target (218-257 s,
+row 1849)."""
 
 
 @pytest.mark.parametrize("family", timed(PAST_TARGET, "frozen default", [
-    pytest.param(family, marks=pytest.mark.gpu(reason="256 draws of the Triton mainloop, compiled"))
-    if family in GPU_TRITON_FAMILIES else family
-    for family in TEMPLATE_FAMILIES if FAMILIES[family].folded or FAMILIES[family].overflows]))
+    family for family in TEMPLATE_FAMILIES
+    if (FAMILIES[family].folded or FAMILIES[family].overflows) and family not in GPU_TRITON_FAMILIES]))
 def test_the_frozen_triton_mainloops_default_is_finite_where_the_reference_is_at_fp32s_edges(family):
     """The Triton mainloop's default form finite over the families the fold holds and those whose sums pass
-    fp32's largest (`_default_is_finite`): it guards its sums' headroom in either form, as the template's
+    fp32's largest (`default_is_finite`): it guards its sums' headroom in either form, as the template's
     production route runs it on an sm80 or later GPU. Frozen until its Mosaic mainloop replaces it, it
     walks without the fold's reach (`algebra.walked`), so the fold's other divergences remain an open
     defect (ledger 1637)."""
-    _default_is_finite(family, "triton")
+    default_is_finite(family, "triton")
 
 
 @pytest.mark.parametrize("family", timed(PAST_TARGET, "frozen rows", [family for family in TEMPLATE_FAMILIES

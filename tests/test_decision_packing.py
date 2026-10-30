@@ -223,8 +223,8 @@ def decided(objective, variables, batch, segments: int):
 
 # The joint arm's float64 truth over the seeds its gradients need is numeric work at model size, a GPU's
 # (BIBLE §8): on armada it took 705 s of CPU, the suite's whole critical path; the others take 187 s and 36 s.
-@pytest.mark.parametrize("arm", [pytest.param("joint", marks=pytest.mark.gpu(
-    reason="the joint arm's float64 truth at the seeds it needs")), "marker", "parallel"])
+# The joint arm runs in the models' GPU flow (tests/test_gpu_models.py).
+@pytest.mark.parametrize("arm", ["marker", "parallel"])
 def test_a_packed_window_decides_each_row_as_the_row_alone(arm):
     """Rows packed into windows (segments, positions restarting per row, spans moved) give each
     question's logits and the parameters' gradients each row gives alone where its window packed it,
@@ -259,8 +259,7 @@ def test_a_labelled_readout_reads_each_packed_row_at_its_own_answer_cue():
                                           objective.model.head), PACKING_SEEDS["readout"])
 
 
-@pytest.mark.gpu(reason="FlashAttention's packed sequences run on CUDA")
-def test_a_bf16_joint_head_on_flash_reads_each_packed_row_alone(without_deterministic_ops):
+def a_bf16_joint_head_on_flash_reads_each_packed_row_alone(without_deterministic_ops):
     """The joint schema head in bf16 on flash: its routing and field layers read the window's tokens
     by documents, flash's packed sequences of the keys' own offsets, its padded questions and slots
     reading nothing. Each packed row's logits and the gradients are the row's alone within the
