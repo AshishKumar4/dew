@@ -281,29 +281,27 @@ class Trainer(Generic[Loss, Effects]):
     ):
         """Hold everything a run needs, without opening any of it.
 
-        The mesh, the compiled step and the capabilities' resources come into
-        being in `fit`, so constructing a Trainer allocates nothing.
+        The mesh, the compiled step and the capabilities' resources come into being in `fit`, so constructing
+        a Trainer allocates nothing.
 
-        `accumulation` is how many steps pool into one optimizer commit, and `split` how many
-        microbatches each step's batch is read in, its rows split evenly; None plans it, the
-        fewest that fit the devices before any recomputation (`compile`). `optimizer`
-        is an optax transformation, or an `OptimConfig` each `fit` builds over its `steps //
-        accumulation` updates; the run steps the objective's (`Objective.optimizer`), made from
-        it. `step` replaces the built-in transaction. A custom step then owns the clocks, the
-        scaler, the EMA and the mutable writes, and the compiled wrapper owns only the
-        attempted-step counter. `rollout` runs once per batch read, before the step and outside
-        replay. `layout` and `mesh` say where the state lives: `mesh` a `MeshSpec` or a native
-        `jax.sharding.Mesh` of any axes, which `layout`'s rules name (`Layout.data_axes` its rows').
-        `microbatches` is how many a pipelined step feeds through the mesh's stage axis, a
-        multiple of its size; None feeds one a stage. `lower_for`, a CUDA generation, lowers
-        the first step for it in place of compiling it (`dew.training._lowering.Lowered`); `ahead`, a
-        step compiled ahead (`dew.training.ahead`), runs as the first step where it is that program.
-        `tune_kernels` opts in to the tuner (`dew.nn.kernels.tuning.tune`), else each launch takes its
-        derived config. `record` makes each step return in its metrics what each evaluation, replays
-        too, sampled or passed as a boundary (`taken_record`).
-        `links` states an axis's `Link` by name in place of measuring it (`_links`). `param_dtype`, a dtype's
-        name, stores the parameters the run draws fresh, as Flax's `param_dtype` (`dew.state.drawn_in`);
-        None keeps each module's own.
+        `accumulation` is how many steps pool into one optimizer commit, and `split` how many microbatches
+        each step's batch is read in, its rows split evenly; None plans it, the fewest that fit the devices
+        before any recomputation (`compile`). `optimizer` is an optax transformation, or an `OptimConfig` each
+        `fit` builds over its `steps // accumulation` updates; the run steps the objective's
+        (`Objective.optimizer`), made from it. `step` replaces the built-in transaction. A custom step then
+        owns the clocks, the scaler, the EMA and the mutable writes, and the compiled wrapper owns only the
+        attempted-step counter. `rollout` runs once per batch read, before the step and outside replay.
+        `layout` and `mesh` say where the state lives: `mesh` a `MeshSpec` or a native `jax.sharding.Mesh` of
+        any axes, which `layout`'s rules name (`Layout.data_axes` its rows'). `microbatches` is how many a
+        pipelined step feeds through the mesh's stage axis, a multiple of its size; None feeds one a stage.
+        `lower_for`, a CUDA generation, lowers the first step for it in place of compiling it
+        (`dew.training._lowering.Lowered`); `ahead`, a step compiled ahead (`dew.training.ahead`), runs as the
+        first step where it is that program. `tune_kernels` opts in to the tuner
+        (`dew.nn.kernels.tuning.tune`), else each launch takes its derived config. `record` makes each step
+        return in its metrics what each evaluation, replays too, sampled or passed as a boundary
+        (`taken_record`). `links` states an axis's `Link` by name in place of measuring it (`_links`).
+        `param_dtype`, a dtype's name, stores the parameters the run draws fresh, as Flax's `param_dtype`
+        (`dew.state.drawn_in`); None keeps each module's own.
         """
         whole = read_whole(accumulation, split, step, layout, rollout, mesh)
         self.objective = objective
@@ -313,11 +311,8 @@ class Trainer(Generic[Loss, Effects]):
         from dew.nn.inputs import seed_of
         # A seed's key is made when first read, after `fit` readies the process (`key`).
         self.seed, self._given_key, self._key = seed_of(key), key, None
-        self.mesh = mesh
-        self.layout = layout
-        self._microbatches = microbatches
-        self.accumulation = accumulation
-        self.split = split
+        self.mesh, self.layout, self._microbatches = mesh, layout, microbatches
+        self.accumulation, self.split = accumulation, split
         self._loss_scale = loss_scale(dynamic_scale)
         self.dynamic_scale = self._loss_scale is not None
         self.checkpoints = checkpoints
