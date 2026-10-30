@@ -12,8 +12,9 @@ draws one a masked position, reads them at the masked positions in order), which
 walk too. The mask token's logit is held out (the loop's own `generation_logits_hook_func`), as Dew's
 walk never draws the mask token. Writes tests/fixtures/hf/dream-tiny/origin.json.
 
-`--vendor` pins each release's `generation_utils.py` into the fetched store with its license
-(`fetched_fixtures.pin_release`), which the test reads offline.
+`--vendor` pins each release's `generation_utils.py` with its license (`fetched_fixtures.pin_release`),
+which the test reads offline: Dream-v0's (apache-2.0) into the fetched store, DiffuCoder's (apple-amlr,
+which is not re-hosted) at its own repo's commit (`AT_ORIGIN`).
 
   PYTHONPATH=src:tools python tools/dream_walk_reference.py [--vendor]
 """
@@ -34,6 +35,9 @@ sys.path.insert(0, str(ROOT / "tests"))
 from dream_walk_support import NEW_TOKENS, PROMPTS, RELEASES, STEPS, uniforms  # noqa: E402
 
 FIXTURES = ROOT / "tests" / "fixtures" / "hf"
+AT_ORIGIN = {"diffucoder"}
+"""The releases whose sampling code is pinned at their own repo rather than re-hosted in the store
+(`pin_release(origin=True)`): DiffuCoder's, under the Apple Machine Learning Research License."""
 
 
 def sampling_code(release: str) -> Path:
@@ -102,7 +106,8 @@ def vendor() -> None:
     for release, (fixture, repo, revision, license) in RELEASES.items():
         print(pin_release(FIXTURES / fixture / "release" / "generation_utils.py",
                           sampling_code(release).read_bytes(),
-                          reference=f"{repo}@{revision}/generation_utils.py", license=license), flush=True)
+                          reference=f"{repo}@{revision}/generation_utils.py", license=license,
+                          origin=release in AT_ORIGIN), flush=True)
 
 
 if __name__ == "__main__":
