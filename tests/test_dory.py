@@ -835,11 +835,6 @@ def decoding(model: CausalTransformer):
     return opened, step, last, scored
 
 
-def _held(block: jax.Array) -> jax.Array | np.ndarray:
-    """`block` on the host, freeing its device copy, where it is a value; as it is under a trace."""
-    return block if isinstance(block, jax.core.Tracer) else np.asarray(block)
-
-
 def forced(programs, variables, prompt, tokens, *, prompt_rows: bool) -> jax.Array | np.ndarray:
     """Dew's log-probabilities at each position of `prompt` followed by `tokens`, the prompt
     prefilled and each token but the last decoded a step at a time through the cache (`programs`,
@@ -852,13 +847,13 @@ def forced(programs, variables, prompt, tokens, *, prompt_rows: bool) -> jax.Arr
     ids = jnp.asarray(np.asarray(prompt, np.int32)[None])
     if prompt_rows:
         logits, written = step(variables, opened(variables), ids)
-        rows = [_held(scored(logits[0]))]
+        rows = [jax.device_get(scored(logits[0]))]
     else:
         (_, logits), written = last(variables, opened(variables), ids)
-        rows = [_held(scored(logits))]
+        rows = [jax.device_get(scored(logits))]
     for token in tokens[:-1]:
         logits, written = step(variables, written['cache'], jnp.asarray([[token]], jnp.int32))
-        rows.append(_held(scored(logits[0])))
+        rows.append(jax.device_get(scored(logits[0])))
     return jnp.concatenate(rows) if isinstance(rows[0], jax.core.Tracer) else np.concatenate(rows)
 
 
