@@ -55,8 +55,8 @@ MAGNITUDES = frozenset({"abs", "numpy.abs", "numpy.absolute", "numpy.fabs", "jax
 """What a hand-written tolerance takes of an error before comparing it with a bound."""
 DISTANCES = frozenset({"dew.accuracy.distance", "reference_error.distance"})
 """Distances between two values: an error, whatever the values are."""
-ONE_DRAW = frozenset({"reference_error.assert_as_exact_as_the_reference",
-                      "reference_error.assert_leaves_as_exact", "reference_error.assert_no_less_exact"})
+ONE_DRAW = frozenset({"one_draw.assert_as_exact_as_the_reference", "one_draw.assert_leaves_as_exact",
+                      "one_draw.assert_no_less_exact"})
 """The gate's one-draw rules, a comparison each call until it judges through check 1's drawn seeds
 (`assert_as_exact`), under the inventory's ratchet (Main's ruling, row 2089)."""
 

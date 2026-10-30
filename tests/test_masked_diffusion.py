@@ -178,7 +178,7 @@ def test_a_masked_family_unmasks_each_position_from_the_logits_its_reference_rea
     repeated). One unmasking step's distribution at every position is the softmax of those logits of
     the released model, the mask's column left out, as exact as the release's own float32 forward
     is to float64."""
-    from reference_error import assert_as_exact_as_the_reference
+    from one_draw import assert_as_exact_as_the_reference
 
     from dew.diffusion.discrete import DiscreteProcess, LogLinear
 

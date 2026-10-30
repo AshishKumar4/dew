@@ -45,7 +45,7 @@ from etils import epath
 
 import dew.io
 from dew import registry, training
-from dew._coordination import agree_process_phase, agreed
+from dew._coordination import agree_process_phase, agreed, agreed_same
 from dew._records import JSON, duration, is_share, recorded_duration
 from dew.cache import dew_cache_dir
 from dew.checkpoints import RUN_FILE, Checkpoints, Keep, Resume
@@ -60,8 +60,9 @@ from dew.lora import LoRA
 from dew.nn.dex import DifferentialExtension
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import attention_route
+from dew.nn.sharding import Link
 from dew.objectives.base import Effects, Loss, Metric, Objective
-from dew.optim import OptimConfig
+from dew.optim import OptimConfig, ParamGroup
 from dew.quantization import Quantization
 from dew.registry import (
     Annotation,
@@ -254,6 +255,31 @@ _JSON_FLAG = tyro.constructors.PrimitiveConstructorSpec(
 def _flag_json(text: str) -> JSON:
     """A JSON flag's value: its JSON, or None for `None`, as every optional flag spells it."""
     return None if text == "None" else json.loads(text)
+
+
+def recorded_param_groups(saved: epath.Path) -> tuple[ParamGroup, ...] | None:
+    """The param groups the run whose record is `saved` trained in, read alone: the rest of the record,
+    a data chain only its Python holds among it, may not rebuild here. () for a record written before
+    runs took groups; None where the record holds no optimizer, a run defined in Python without one."""
+    fields = json.loads(saved.read_text()).get("fields")
+    optim = fields.get("optim") if isinstance(fields, Mapping) else None
+    if not isinstance(optim, Mapping):
+        return None
+    held = optim.get("fields", optim)
+    groups = held.get("param_groups", []) if isinstance(held, Mapping) else []
+    return from_record(tuple[ParamGroup, ...], groups)
+
+
+def trained_modules(objective: Objective[Loss, Effects], modules: Sequence[str]) -> tuple[str, ...]:
+    """Those of `modules`, paths under `params`, that hold a parameter `objective` trains, as its tree
+    is drawn (`Objective.init`, its shapes alone): a tied readout is drawn with none."""
+    if not modules:
+        return ()
+    from dew.optim import parameter_name
+
+    trained = jax.eval_shape(lambda: objective.init(jax.random.key(0)))["params"]
+    names = [parameter_name(path) for path, _ in jax.tree_util.tree_leaves_with_path(trained)]
+    return tuple(module for module in modules if any(name.startswith(f"{module}/") for name in names))
 
 
 def _best_argument():
@@ -524,7 +550,7 @@ class TrainerConfig:
     Scalars, records and objective previews are tracked; checkpoints are not uploaded.
     """
     publish: bool = False
-    """Publish the final checkpoint to W&B; requires `wandb` and `checkpoint_final`."""
+    """Publish the final checkpoint to W&B; requires `wandb`, online, and `checkpoint_final`."""
     multi_host: bool | None = None
     """Whether to join the JAX process pool.
 
@@ -554,6 +580,14 @@ class TrainerConfig:
     first compile there fails here, in seconds and without the GPU; XLA's
     compile of the whole step still needs one. The program exits with status
     0 once the step lowers, and opens no W&B run.
+
+    A TPU topology, `--trainer.lower-for v5e:4x4` (as
+    `jax.experimental.topologies` names one), builds the run's mesh over that
+    topology's devices and compiles its first step for them on any host that
+    holds libtpu, as MaxText's train_compile does: the run saves the executable
+    in its checkpoint directory, `compiled-v5e-4x4`, with each device's memory
+    and work beside it (`compiled-v5e-4x4.json`, `dew.training._lowering.Lowered`),
+    and exits.
     """
     compile_ahead: Annotated[AheadTarget, tyro.conf.subcommand("ahead")] | None = None
     """Compile the run's first step for GPUs this host lacks, save it, then exit without training.
@@ -579,6 +613,13 @@ class TrainerConfig:
     program, on a host of the topology it was compiled for; another program, from another config,
     data shape, Dew or a plan recorded for another rung, is refused before the run trains.
     """
+    links: Annotated[Mapping[str, Link], record_argument(Mapping[str, Link])] = dataclasses.field(
+        default_factory=dict)
+    """The links of the run's split axes, by axis name (`Trainer`'s `links`), stated where no process
+    measures them as they are or should not: a step spreads an axis's projections as its stated link
+    would, `--set trainer.links='{"tensor": {"bytes_per_second": 4.5e11, "flops_per_second": 9.9e14}}'`.
+    Unnamed, an axis's link is measured on its devices. A step compiled ahead states its target's own
+    (`AheadTarget.links`)."""
     tune_kernels: bool = False
     """Measure each Pallas launch of the step that has no config measured on this GPU.
 
@@ -612,6 +653,9 @@ class TrainerConfig:
             raise ValueError("--trainer.split reads each step's batch in that many microbatches, at least 1")
         if self.publish and (self.wandb is None or not self.checkpoint_final):
             raise ValueError("trainer.publish requires trainer.wandb and trainer.checkpoint_final")
+        if self.publish and self.wandb is not None and self.wandb.offline:
+            raise ValueError("trainer.publish links the final checkpoint into W&B's registry, which an "
+                             "offline W&B run cannot reach; track online to publish")
         if self.attention_form not in attention_route.FORMS:
             raise ValueError(f"--trainer.attention-form is one of the template's forms "
                              f"{attention_route.FORMS}, not {self.attention_form!r}")
@@ -626,9 +670,6 @@ class TrainerConfig:
             object.__setattr__(self, 'checkpoint_every', duration(self.checkpoint_every))
         if isinstance(self.keep, Mapping):
             object.__setattr__(self, 'keep', from_record(Keep, self.keep, dtypes=False))
-        if isinstance(self.stop, Mapping) and "class" not in self.stop:
-            # A record written while `stop` held a Pause alone names no class: its fields are a Pause's.
-            object.__setattr__(self, 'stop', from_record(Pause, self.stop, dtypes=False))
         if isinstance(self.keep, Keep) and self.keep.where is not None:
             raise TypeError("Keep.where is code-only; a recorded retention policy contains no callable")
         if self.best is not None:
@@ -1103,8 +1144,23 @@ class RunConfig:
         """Read back what `to_dict` wrote, for subclasses too. A field the
         record lacks takes its default; an unknown field raises. A chain
         recorded as unrecorded, or a recipe's record written before runs
-        recorded chains, is refused by name."""
+        recorded chains, is refused by name. A model recorded with an earlier
+        main's fields reads as its checkpoint's record does."""
+        from dew.inference.tasks import earlier_model
+
         rest = {name: value for name, value in values.items() if name not in _CHAINS}
+        trainer = rest.get("trainer")
+        fields = trainer.get("fields", trainer) if isinstance(trainer, Mapping) else {}
+        stop = fields.get("stop")
+        if isinstance(trainer, Mapping) and isinstance(stop, Mapping) and "class" not in stop:
+            # A record written while `stop` held a Pause alone names no class: its fields are a Pause's.
+            # Carried until 1.0 (ledger 1552).
+            fields = {**fields, "stop": {"class": f"{Pause.__module__}:Pause", "fields": stop}}
+            rest = {**rest, "trainer": {**trainer, "fields": fields} if "class" in trainer else fields}
+        # A model recorded before its components' fields changed reads as today's, as its checkpoint's
+        # record does (`earlier_model`, ledger 2423).
+        if isinstance(rest.get("model"), Mapping):
+            rest["model"] = earlier_model({"model": rest["model"]})["model"]
         chains = {name: _read_chain(name, values[name]) for name in _CHAINS if name in values}
         return dataclasses.replace(from_record(cls, rest, dtypes=False), **chains)
 
@@ -1553,6 +1609,7 @@ class RunConfig:
         # The record names the run's directory, so its run.json trains the same run again.
         self = dataclasses.replace(self.recorded(objective),
                                    trainer=dataclasses.replace(self.trainer, name=name))
+        self = dataclasses.replace(self, optim=self.grouped(objective, name))
         trainer = self.trainer
         if dataset.plan is not None:
             summary = {**(summary or {}), "data_plan": dataset.plan.record()}
@@ -1638,6 +1695,33 @@ class RunConfig:
             return target.compiled(self.built(objective, mesh, rollout, links=target.links), dataset, steps,
                                    self.trainer.examples if steps is None else None)
 
+    def grouped(self, objective: Objective[Loss, Effects], name: str) -> OptimConfig:
+        """The run's optimizer as it trains under `name`: each group it names that claims the modules its
+        objective draws fresh beside a loaded base matching those that hold a parameter
+        (`ParamGroup.fresh`, `trained_modules`). Where it names none, a resumed run trains in the groups
+        its record names, as its optimizer state holds them (none for a record written before runs took
+        them), and a new run that draws such modules in their default groups (`OptimConfig.fresh_groups`).
+        Every process agrees on the groups before any records them."""
+        def resolved() -> JSON:
+            named = self.optim.param_groups
+            if not named:
+                checkpoints = self.trainer.checkpoints(name)
+                saved = epath.Path(checkpoints.directory) / RUN_FILE
+                recorded = recorded_param_groups(saved) if checkpoints.resumed(
+                    self.trainer.resume) is not None and saved.exists() else None
+                if recorded is not None:
+                    return to_record(recorded, tuple[ParamGroup, ...])
+            groups = named or self.optim.fresh_groups()
+            modules = trained_modules(objective, objective.fresh_modules()) if any(
+                group.fresh for group in groups) else ()
+            if not named and not modules:
+                return to_record((), tuple[ParamGroup, ...])
+            claimed = dataclasses.replace(self.optim, param_groups=groups).with_fresh(modules)
+            return to_record(claimed.param_groups, tuple[ParamGroup, ...])
+        groups = from_record(tuple[ParamGroup, ...], agreed_same("run param groups", resolved))
+        return self.optim if groups == self.optim.param_groups else dataclasses.replace(
+            self.optim, param_groups=groups)
+
     def built[LossT, EffectsT](self, objective: Objective[LossT, EffectsT],
                                mesh: MeshSpec | jax.sharding.Mesh, rollout: Rollout | None,
                                **resources) -> "Trainer[LossT, EffectsT]":
@@ -1652,7 +1736,7 @@ class RunConfig:
             objective, self.optim, key=trainer.key, mesh=mesh, microbatches=trainer.microbatches,
             layout=trainer.layout, accumulation=trainer.accumulation, split=trainer.split,
             dynamic_scale=trainer.dynamic_scale, rollout=rollout, tune_kernels=trainer.tune_kernels,
-            **resources)
+            **{"links": trainer.links, **resources})
 
     def sweep(self, space: Space, *, train: Callable[[Self], float], trials: int, ledger: str | Path,
               tracker: Tracker, search: Search = _RANDOM_SEARCH) -> list[TrialFinished]:

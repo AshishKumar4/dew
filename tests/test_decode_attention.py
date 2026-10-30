@@ -12,12 +12,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from attention_oracle import attention_terms, exact_attention, float64_weights
-from reference_error import (
-    FEWEST_SEEDS,
-    assert_as_exact,
-    assert_as_exact_as_the_reference,
-    assert_fp32_reduction_bound,
-)
+from one_draw import assert_as_exact_as_the_reference
+from reference_error import FEWEST_SEEDS, assert_as_exact, assert_fp32_reduction_bound
 from whole_suite import timed
 
 from dew.nn.attention import attention_case, scaled_dot_product_attention
