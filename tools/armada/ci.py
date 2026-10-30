@@ -4,7 +4,7 @@
     python3 tools/armada/ci.py plan --target=SECONDS --timings=FILE
     python3 tools/armada/ci.py task --python=3.12 --tests="tests/a.py tests/b.py" --split=[G/N] --out=FILE
     python3 tools/armada/ci.py durations VERDICT
-    python3 tools/armada/ci.py gpu-tier [--marked] [--evidence] [--shards=N]
+    python3 tools/armada/ci.py gpu-tier [--evidence] [--shards=N]
     python3 tools/armada/ci.py gpu-lane --tests="tests/a.py tests/b.py" --out=FILE --cache=on --processes=N
     python3 tools/armada/ci.py gpu-lane --network [--tests=...] --out=FILE --cache=on --processes=N
     python3 tools/armada/ci.py coverage items --target=SECONDS --timings=FILE > ITEMS
@@ -1741,6 +1741,16 @@ def releasing(args: argparse.Namespace) -> int:
     return release(args.python, args.tests.split(), args.requirement, args.out)
 
 
+def tier_arguments(choosing: argparse.ArgumentParser) -> None:
+    """`gpu-tier`'s arguments: the tier it names is the checkout's gpu-marked files (`gpu_tier`)."""
+    choosing.add_argument("--evidence", action="store_true",
+                          help="each file of the tier with its marked tests and its records' backend reads")
+    choosing.add_argument("--shards", type=int, default=1, help="how many GPUs share the tier")
+    choosing.add_argument("--marked", action="store_true",
+                          help="the gpu-marked files, which the tier is: kept for dew-ops' GPU verifier "
+                               "(dewops.kernel_lab.verify.tier), which still passes it (ledger 2714)")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="tools/armada/ci.py")
     operations = parser.add_subparsers(dest="operation", required=True)
@@ -1763,11 +1773,7 @@ def main() -> int:
     itemizing.add_argument("--timings", type=Path, required=True)
     reporting = stages.add_parser("report")
     reporting.add_argument("directory", type=Path)
-    choosing = operations.add_parser("gpu-tier")
-    choosing.add_argument("--evidence", action="store_true", help="each file's backend reads and marks too")
-    choosing.add_argument("--marked", action="store_true",
-                          help="only the files with a test marked to run on a GPU, as collected here")
-    choosing.add_argument("--shards", type=int, default=1, help="how many GPUs share the tier")
+    tier_arguments(operations.add_parser("gpu-tier"))
     lane = operations.add_parser("gpu-lane")
     lane.add_argument("--tests", help="the test files; with --network, every file holding a "
                                        "network-marked test by default (`network_files`)")
@@ -1813,13 +1819,14 @@ def main() -> int:
         print(f"{len(changed)} files refolded in {session.DURATIONS}: {' '.join(changed) or 'none'}")
         return 0
     if args.operation == "gpu-tier":
-        # A GPU runs its marked files alone, a batch's and a day's alike (ledger 2452): the records' evidence
-        # (`gpu_tier`) is what --evidence reports, which a day's tier no longer chooses by.
-        tier = ({name: [f"{count} marked"] for name, count in marked(PYTHONS[0]).items()}
-                if args.marked or not args.evidence else gpu_tier(PYTHONS[0]))
+        # A GPU runs its marked files alone, a batch's and a day's alike (ledger 2452); --evidence prints that
+        # tier, each file with its records' backend reads beside its marked tests.
+        tier = marked(PYTHONS[0])
         if args.evidence:
-            for name, evidence in tier.items():
-                print(name, *evidence, sep="\t")
+            reads = gpu_tier(PYTHONS[0])
+            for name, count in tier.items():
+                evidence = [item for item in reads.get(name, []) if "marked" not in item]
+                print(name, f"{count} marked", *evidence, sep="\t")
             return 0
         # Each shard's files on a line, spread by their tests' recorded times.
         recorded = recorded_tests()

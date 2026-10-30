@@ -271,13 +271,18 @@ def build_objective(case: Case, attention_impl: AttentionImpl = 'auto', *,
     return objective
 
 
+OPTIMIZERS = {"adam": optax.adam, "adamw": optax.adamw}
+"""A case's optimizer by name (`Case.optimizer`), each at a learning rate."""
+
+
 def build_trainer(case: Case, attention_impl: AttentionImpl = 'auto',
                   optimizer: optax.GradientTransformation | None = None) -> Trainer:
     """The trainer a recipe would build for this case, minus the tracker and the
     checkpoints, on the case's device order. A case measures its own batch,
     so the step reads it whole and climbs the remat ladder where it must."""
     trainer = Trainer(
-        build_objective(case, attention_impl), optimizer or optax.adam(1e-4), key=jax.random.key(0),
+        build_objective(case, attention_impl), optimizer or OPTIMIZERS[case.optimizer](1e-4),
+        key=jax.random.key(0),
         **trainer_mesh(case.mesh), layout=Layout(min_shard=case.fsdp_min_param_size),
         accumulation=case.accumulation, split=1, checkpoints=None, tracker=None)
     if case.device_order is not None:
