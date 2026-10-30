@@ -112,6 +112,9 @@ even split (the DiT's fsdp2_sequence2 1.016), and a repeated matmul path 8%
 and more (the DiT's text projection under fsdp2_tensor2 9%, the dense
 decoder's head under fsdp2_tensor2 18%)."""
 
+ORDERS_OUT = Path("out/layout-parity-orders")
+"""Where a model with residual orders keeps its orders' files by default (`run_orders`)."""
+
 LAYOUTS: dict[str, dict[str, int]] = {
     "data4": {},
     "fsdp4": {"fsdp": 4},
@@ -405,9 +408,9 @@ def _trainer(case, fields: dict[str, int], *, one_device: bool = False, accumula
     the case's one-device state is computed (`_initial`), every other
     trainer copies it onto its mesh: every layout starts from the very state
     one device does, without a compile of the model's initialization on each.
-    A layout's own draw of it is another program, whose rounding a bitwise
-    comparison would judge (docs/design/testing.md). `record` makes each
-    step return what its loss drew and started from (`Arm`)."""
+    A layout's own draw of it is another program, which `held_draw` holds to
+    one device's by check 1 (docs/design/testing.md, Layout invariance).
+    `record` makes each step return what its loss drew and started from (`Arm`)."""
     import benchmark_models as bench
     import jax
     import optax
@@ -452,6 +455,50 @@ def _trainer(case, fields: dict[str, int], *, one_device: bool = False, accumula
     elif devices is not None:
         trainer.device_mesh = trainer.mesh.build(jax.devices()[:devices])
     return trainer
+
+
+def held_draw(model: str, layout: str, *, seeds: int, devices: int | None = None) -> None:
+    """Check 1 of `model`'s initial parameters as `layout` draws them, each split over its mesh, against
+    one device's draw (docs/design/testing.md, Layout invariance): over `seeds` keys, the layout's own
+    draw (Dew's arm) and one device's (the reference), each the trainer's initializer compiled with the
+    placement its mesh gives the parameters, held to their float64 truth, the one-device program
+    replayed in float64 from its own random bits (tests/float64_replay.py, compiled: an initializer's
+    eager replay costs seconds a draw), which every layout draws alike. The draws compile through Dew's seam (`compiler_options`), as the gate compiles a Dew arm
+    (`dew_programs`). A layout Dew refuses raises its `LayoutRefused`."""
+    import jax
+    import numpy as np
+
+    from dew.nn.kernels.options import compiler_options
+
+    sys.path.insert(0, str(REPO / "tests"))
+    from float64_replay import float64_replay
+    from reference_error import assert_as_exact, dew_programs
+
+    case, _ = model_case(model, "float32", {}, {})
+    split = _trainer(case, LAYOUTS[layout], devices=devices)
+    alone = _trainer(case, {}, one_device=True)
+    # Where the layout places the parameters, read from the abstract state through the trainer's own API.
+    split.validate()
+    placement = split.shardings(jax.eval_shape(split.initial_state)).variables["params"]
+
+    def drawing(trainer):
+        def draw(seed):
+            state = trainer.initial_state(trainer.objective.initializer, jax.random.key(seed))
+            return state.variables["params"]
+        return draw
+
+    def compiled(trainer, **placed):
+        programs: list[Any] = []
+
+        def run(seed):
+            if not programs:
+                programs.append(jax.jit(drawing(trainer), compiler_options=compiler_options(), **placed))
+            return programs[0](seed)
+        return dew_programs(run)
+
+    assert_as_exact(compiled(split, out_shardings=placement), compiled(alone),
+                    lambda seed: (np.int32(seed),), f"{model} on {layout}: its initial parameters",
+                    seeds=seeds, truth_fn=float64_replay(drawing(alone), compiled=True))
 
 
 _initial: dict[tuple[str, int], Any] = {}
@@ -1355,8 +1402,7 @@ def _floor_reference(model: str, case, reference, dtype: str, devices: int | Non
 
 def floored(model: str, layouts: Sequence[str], *, dtype: str, devices: int | None = None,
             mixture: dict[str, Any] | None = None, objective: dict[str, Any] | None = None,
-            out: Path = Path("out/layout-parity-orders"),
-            speak: Callable[[str], None] = lambda line: None) -> list[dict[str, Any]]:
+            out: Path = ORDERS_OUT, speak: Callable[[str], None] = lambda line: None) -> list[dict[str, Any]]:
     """Each of `layouts`' first step on `model` held to the one-device reference by the floor judge
     (`_floored`), a row each; a model with residual orders judged over them once for all its layouts
     instead (`run_orders`, its files under `out`), as `run` judges it. `mixture` and `objective` are
@@ -1832,12 +1878,11 @@ def run(models: Sequence[str], layouts: Sequence[str], *, dtype: str, seeds: int
     for model in models:
         case, reference = model_case(model, dtype, mixture, objective)
         count = seeds if isinstance(seeds, int) else seeds[model]
-        # A run of no draws runs each layout once (`ran`), a model with residual orders as any other.
+        # A run of no draws runs each layout once (`ran`), a model with residual orders as any other;
+        # with draws its orders judge it, as `floored` does.
         if case.orders and count:
-            with jax.enable_x64(new_val=True):
-                rows.extend(run_orders(
-                    [model], layouts, dtype=dtype, devices=devices, mixture=mixture, objective=objective,
-                    out=Path('out/layout-parity-orders') if orders_out is None else orders_out, speak=speak))
+            rows.extend(floored(model, layouts, dtype=dtype, devices=devices, mixture=mixture,
+                                objective=objective, out=orders_out or ORDERS_OUT, speak=speak))
             keep(rows)
             continue
         window = windows if isinstance(windows, int) else windows.get(model, 1)
@@ -1958,7 +2003,7 @@ def main(models: Annotated[tuple[str, ...], tyro.conf.arg(help="zoo() names")] =
             out.write_text(json.dumps(rows, indent=1))
 
     mixed, aimed = json.loads(mixture), json.loads(objective)
-    orders_out = Path('out/layout-parity-orders') if out is None else out.parent / f'{out.stem}-orders'
+    orders_out = ORDERS_OUT if out is None else out.parent / f'{out.stem}-orders'
     if seeds is None:
         # The floor judge, which CI's matrix and its multi-host gangs run until check 1's draws shard
         # across tasks (`floored`): a layout at a time, through agreed phases on a pool, a model with

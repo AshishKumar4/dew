@@ -30,7 +30,7 @@ from dew.decision.model import DecisionModel
 from dew.decision.questions import KINDS, Score
 from dew.decision.rows import ConfigureLayout, Fit, PackedRows, QuestionRows, _rows, option_width, packing
 from dew.decision.scoring import LogLoss, ScoringRule
-from dew.decision.task import Budget, Decide, DecideSettings, Weights, laid_out
+from dew.decision.task import Budget, Decide, DecideSettings, Weights, laid_out, whole_blocks_of
 from dew.inference.loading import RunProcessor
 from dew.inference.tasks import Processor as TaskProcessor
 from dew.inputs import Field, InputSpec
@@ -171,14 +171,16 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         lengths = self._context_lengths(batch)
         return 0.0 if lengths is None else counted_flops(model.backbone, lengths)
 
-    def _cross_flops(self, model, batch: Batch) -> float:
-        """The backbone's cross-attention work over each packed row's own context (`_row_contexts`):
-        none where rows carry none."""
+    def _cross_flops(self, model, batch: Batch, held: bool = False) -> float:
+        """The backbone's cross-attention work over each packed row's own context (`_row_contexts`), or
+        with `held` the part of it done by the backbone's own matrices (`held_cross_flops`): none where
+        rows carry none."""
         if "context_lengths" not in batch:
             return 0.0
         backbone = model.backbone
         assert isinstance(backbone, CrossAttending)
-        return backbone.cross_flops(self.real_lengths(batch), self._row_contexts(batch))
+        counted = backbone.held_cross_flops if held else backbone.cross_flops
+        return counted(self.real_lengths(batch), self._row_contexts(batch))
 
     def _head_flops(self, model, batch: Batch) -> float:
         """Forward and training work read the same layout geometry and head capability."""
@@ -197,8 +199,9 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         """The backbone's frozen and trainable work, then three passes of the trained cross-attention
         blocks and decision head: an adapted backbone's own count (`CountedTraining`); a backbone whose
         held parameters train nothing but its cross-attention blocks, as `with_cross_attention` holds a
-        source, its forward, input-gradient and no weight-gradient work (`frozen_training_flops`);
-        else, trained whole, three passes of everything."""
+        source, its forward, input-gradient and no weight-gradient work (`frozen_training_flops`), so
+        too a block's reads through its own matrices (`CrossBlocks.held_flops`); else, trained whole,
+        three passes of everything."""
         model = self.model if model is None else model
         lengths = self.real_lengths(batch)
         context = self._context_lengths(batch)
@@ -208,10 +211,12 @@ class DecisionObjective(Objective[Ratio | Weighted]):
             own = 0.0 if context is None else model.backbone.training_flops(context)
             return model.backbone.training_flops(lengths) + own + trained
         if self._backbone_frozen():
-            # A context's pass trains nothing, so it runs forward alone (`encode_context`).
+            # A context's pass trains nothing, so it runs forward alone (`encode_context`); a block's
+            # reads through the backbone's own matrices take no weight gradient (`held_flops`).
             forward = counted_flops(model.backbone, lengths)
+            held = self._cross_flops(model, batch, held=True)
             return (frozen_training_flops(forward, parameter_flops(model.backbone, lengths))
-                    + self._context_flops(model, batch) + trained)
+                    + self._context_flops(model, batch) + trained - held)
         return super().training_flops(model, batch)
 
     def _backbone_frozen(self) -> bool:
@@ -231,7 +236,7 @@ class DecisionObjective(Objective[Ratio | Weighted]):
                  segments: int | None = 16, context_encoder: ContextEncoder | None = None,
                  consistency: float = 0.0, context_window: int | None = None):
         held: Variables | None = None
-        widths: tuple[int, int] | None = None
+        widths: tuple[int | None, int] | None = None
         self.image_processor = None
         match backbone:
             case Decide():
@@ -243,10 +248,11 @@ class DecisionObjective(Objective[Ratio | Weighted]):
                 tokenizer = tokenizer or backbone.tokenizer
                 specials = specials or backbone.specials
                 module = model.backbone
-                # A task's passes pad to its budget's widths, kept until the run's data binds its own.
+                # A task's passes pad its questions to its budget's options, kept until the run's data
+                # binds its own; a pass's question slots are its windows' (`Decide.pass_shapes`).
                 budget = backbone.budget
-                if budget.questions is not None and budget.options is not None:
-                    widths = (budget.questions, budget.options)
+                if budget.options is not None:
+                    widths = (None, budget.options)
             case Adapter() | Source():
                 module, held = backbone.model, joined({"backbone": backbone.variables})
                 if isinstance(backbone, Source):
@@ -292,8 +298,9 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         self.none_of_the_above = none_of_the_above
         self.temperatures = temperatures
         self.segments = segments
-        # The most questions a row and options a question of the run's data hold, which its saved task
-        # pads each pass to (`DecideSettings.questions`), as its data binds them (`bind_widths`).
+        # The most questions a row and options a question of the run's data hold, which its run records
+        # (`DecideSettings.questions`, `DecideSettings.options`), its saved task padding each pass's
+        # questions to the options, as its data binds them (`bind_widths`).
         self.widths = widths
         held_context = self.context_length
         if context_window is not None and (held_context is None or context_window < held_context):
@@ -357,6 +364,7 @@ class DecisionObjective(Objective[Ratio | Weighted]):
 
     def loss(self, variables: Variables, batch: Batch, step: Step):
         inputs = laid_out(batch, self.bounds.segments, spans_in_context=self.schema_in_context,
+                          whole_blocks=whole_blocks_of(self.layout),
                           attention=self.layout.attention)
         logits = self.model.logits(
             variables, inputs, train=step.training, rngs=model_rngs(step.key, training=step.training)
@@ -390,12 +398,14 @@ class DecisionObjective(Objective[Ratio | Weighted]):
 
     def evaluate(self, params: Variables, batch: Batch, step: Step) -> Decisions:
         inputs = laid_out(batch, self.bounds.segments, spans_in_context=self.schema_in_context,
+                          whole_blocks=whole_blocks_of(self.layout),
                           attention=self.layout.attention)
         return self._decisions(self._logits(self.evaluation_variables(params, step), inputs), inputs, batch)
 
     def _validation_scores(self, params: Variables, batch: Batch, step: Step
                            ) -> tuple[Ratio | Weighted, Decisions]:
         inputs = laid_out(batch, self.bounds.segments, spans_in_context=self.schema_in_context,
+                          whole_blocks=whole_blocks_of(self.layout),
                           attention=self.layout.attention)
         logits = self.model.logits(params, inputs)
         return self._charged(logits, inputs, batch)[0], self._decisions(logits, inputs, batch)
@@ -510,7 +520,7 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         if processor is not OMITTED:
             raise TypeError("a Decide task encodes with the objective's tokenizer and takes no processor")
         averaged = not (ema is False or (ema is None and state.ema is None))
-        questions, options = self.widths or (None, None)
+        _, options = self.widths or (None, None)
         return Decide(
             self.model,
             self._pipeline_weights(state, ema),
@@ -519,5 +529,5 @@ class DecisionObjective(Objective[Ratio | Weighted]):
             self.specials,
             weights=Weights(int(state.step), averaged),
             processor=self.image_processor,
-            budget=Budget(questions=questions, options=options),
+            budget=Budget(options=options),
         )

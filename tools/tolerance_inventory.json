@@ -185,10 +185,6 @@
    "comparisons": 9,
    "lane": "Training"
   },
-  "tests/test_dory.py": {
-   "comparisons": 2,
-   "lane": "Recurrence & Dory"
-  },
   "tests/test_dpo.py": {
    "comparisons": 7,
    "lane": "Models, Serving & RL"
@@ -338,7 +334,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_kv_cache.py": {
-   "comparisons": 3,
+   "comparisons": 2,
    "lane": "Models, Serving & RL"
   },
   "tests/test_layer_stack.py": {

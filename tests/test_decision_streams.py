@@ -37,13 +37,13 @@ pytestmark = pytest.mark.mesh
 LLAMA = Path(__file__).parent / "fixtures" / "hf" / "llama-tiny"
 SPECIALS = Specials(begin=None, separator=10, marker=0, marker_text="\x00", pad=255)
 TOKENIZER = ByteTokenizer()
-JOINT = JointLayout(max_len=256, segments=(Text("STATE:\n"), State(), Schema(stream="schema"), Text("\n")),
+JOINT = JointLayout(max_len=768, segments=(Text("STATE:\n"), State(), Schema(stream="schema"), Text("\n")),
                     reads=Reads((("row", "self", "causal"), ("row", "schema", "whole"),
                                  ("schema", "self", "causal"))))
 """A joint row's two streams: its own tokens read the row's before them and the whole schema, though the
 schema follows the state, the schema's tokens the schema's before them alone."""
 LETTERED = StateFirstLayout(
-    labels=LABELS, max_len=128,
+    labels=LABELS, max_len=256,
     segments=(Text("STATE:\n"), State(), Instructions({"choice": "{}"}, stream="question"),
               OptionLines(line="\n{label}. {option}", bare="\n{label}. {option}", join="", noul_first="false",
                           stream="question"),
@@ -58,7 +58,7 @@ ROWS = ["one two three", "four five", "six seven eight nine", "ten eleven", "twe
 def in_streams(layout: Layout, segments: int = 1) -> DecisionObjective:
     """A decision over the tiny Llama whose rows stand in `layout`'s streams, at most `segments` rows a
     window: a joint row's head, or a lettered row's readout of its letters."""
-    source = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference", max_seq_len=512)
+    source = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference", max_seq_len=1024)
     width, dtype = DecisionModel.head_size(source.model)
     head = (JointSchemaHead(width, width=16, routing_layers=1, layers=1, heads=2, feedforward=32)
             if layout is JOINT else LabelReadout(features=width, label_ids=(), dtype=dtype, count=4))
@@ -135,7 +135,9 @@ def states_of(objective: DecisionObjective, variables, state: str,
     """The backbone's final states over a row of `state` and `questions` alone, and its tokens' streams."""
     [row] = objective.layout.rows(TOKENIZER, SPECIALS, state, questions)
     inputs = DecisionInputs.collate([row], SPECIALS.pad, attention=objective.layout.attention)
-    return np.asarray(objective.model.states(variables, inputs))[0], np.asarray(row.streams)
+    states = np.asarray(objective.model.states(variables, inputs))[0]
+    assert row.streams is not None and len(row.streams) == len(row.tokens) == len(states)
+    return states, np.asarray(row.streams)
 
 
 @pytest.mark.parametrize("layout", [JOINT, LETTERED], ids=["joint", "lettered"])
@@ -188,5 +190,6 @@ def test_a_layouts_reads_name_only_its_streams_and_every_stream_reads_itself():
         Reads((("row", "schema", "whole"),))
     with pytest.raises(ValueError):
         Reads((("row", "self", "sideways"),))
-    assert from_record(to_record(JOINT)) == JOINT and from_record(to_record(LETTERED)) == LETTERED
+    assert from_record(JointLayout, to_record(JOINT, JointLayout)) == JOINT
+    assert from_record(StateFirstLayout, to_record(LETTERED, StateFirstLayout)) == LETTERED
     assert JOINT.attention == (((2, 0, 1), (2, 0, 0)), 3)

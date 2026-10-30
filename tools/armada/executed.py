@@ -37,7 +37,7 @@ from pathlib import Path
 
 import followed
 import pytest
-from followed import CHILDREN, checkout, reads_backend
+from followed import CHILDREN, IMPORTED, checkout, reads_backend
 from session import DURATIONS, MARKS
 
 TOOL = 3
@@ -252,13 +252,18 @@ def pytest_sessionfinish(session):
         # module an earlier one imported lazily, a value it cached, a reader that probed a fixture, serve the
         # file without running again (row 2228; the bundle's review). A child's are its own process's.
         earlier: set[str] = set()
+        # The top-level modules the process imported, each a name a helper added under tests/ would shadow,
+        # as tests/ leads sys.path: an input of every file the process ran (ci.py's `contents`, IMPORTED),
+        # so a helper of a new name reruns none of them, and one of a name they imported reruns them all.
+        imported = {f"{IMPORTED}{module.partition('.')[0]}" for module in list(sys.modules)}
         for name, files in own.items():
             child = found.get(name, {"files": set(), "reads": set(), "peak": None, "shares": 0, "pools": 0})
             whole = name not in spawned | lost
             # The share a process of this file takes: its own peak, or a child's that took its fraction.
             peaks = [held for held in (gpu_peak(), child["peak"]) if held is not None]
             peak = max(peaks) if len(own) == 1 and whole and peaks else None
-            recorded[name] = {"depends": sorted(files | shared | child["files"] | earlier) if whole else None,
+            recorded[name] = {"depends": sorted(files | shared | child["files"] | earlier | imported) if whole
+                              else None,
                               "reads": sorted(reads[name] | module_reads.get(name, set()) | everywhere
                                               | child["reads"]),
                               "peak": peak, "shares": child["shares"], "pools": child["pools"]}

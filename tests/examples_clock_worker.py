@@ -56,7 +56,7 @@ def examples_clock(args) -> dict:
     x = np.repeat(ids[:, None].astype(np.float32), FEATURES, axis=1)
     chain = Pipeline(Memory({"x": x, "id": ids})).read("streamed").batch(BATCH)
     tracker = Logged()
-    optim = OptimConfig(optimizer="sgd", learning_rate=Linear(peak_value=1e-2, end_value=0.0))
+    optim = OptimConfig(optimizer="optax:sgd", learning_rate=Linear(peak_value=1e-2, end_value=0.0))
     trainer = Trainer(Pulled(), optim, key=jax.random.key(0), mesh=MeshSpec(), tracker=tracker)
     state = trainer.fit(chain, examples=args.records, log_every=1)
     return {"step": int(state.step), "consumed": int(state.consumed),

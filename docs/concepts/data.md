@@ -165,6 +165,30 @@ Use a fresh output directory: exports commit immutable shards and a manifest, an
 
 `mix(datasets, weights=..., by="records" | "tokens")` mixes accepted records before sharding and ends at its first exhausted member, as Grain's mix does; a member that repeats never ends. With `by="tokens"`, token stores' shares count valid targets, not padding. `phases((first, until_step), ..., (last, None))` reads datasets one after another, each until the training step it names and the last until the run ends; each phase is a whole chain of the same batch. `schedule([(first, tokens), ..., (last, None)])` reads them on the run's committed-token clock instead: each stage ends at the step whose commit brings the run's committed tokens, the count `fit(tokens=)` reads, to the stage's own. Each stage lays its rows out as it reads, so a context-extension schedule packs its later stage into longer rows than its first, which a language model trains at that length up to its `max_seq_len`.
 
+### A pinned text, code and chat mixture
+
+[recipes/lm/mixture.py](https://github.com/AshishKumar4/dew/blob/main/recipes/lm/mixture.py) mixes three public sources, each pinned to a Hub commit and streamed from its own Parquet shards: English Wikipedia's 2023-11-01 dump, The Stack v1's filtered Python functions and UltraChat 200k's SFT conversations. Text and code are tokenized, a conversation is rendered through the tokenizer's chat template (SmolLM2's, pinned), and the three are mixed at 70/20/10 by valid target tokens, then cut to the row's length and packed (the recipe pins each to a commit):
+
+<!-- not run: streams three datasets from the Hub -->
+```python
+from transformers import AutoTokenizer
+
+from dew.data import Hub, chat, mix, text
+
+tok = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM2-360M-Instruct")
+web = Hub("wikimedia/wikipedia", name="20231101.en", columns=("text",))
+code = Hub("bigcode/python-stack-v1-functions-filtered", columns=("content",))
+conversations = Hub("HuggingFaceH4/ultrachat_200k", split="train_sft", columns=("messages",))
+data = mix([web.read("streamed").map(text.tokenize(tok, eos=True)),
+            code.read("streamed").map(text.tokenize(tok, field="content", eos=True)),
+            conversations.read("streamed").map(chat.template(tok)).select_columns("text")],
+           [0.7, 0.2, 0.1], by="tokens")
+batches = (data.flat_map(text.Chunks(2049, overlap=1)).pack(seq_len=2049)
+           .shuffle(seed=0, window=10_000).batch(64))
+```
+
+`python recipes/lm/mixture.py --show 2000` reads the first 2,000 mixed documents and prints each source's share of their valid targets, the count the mix weighs.
+
 ## Token-budget batches
 
 `Pipeline.batch(tokens=24576)` takes as many rows as a token budget holds rather than a row count. Every row holds the same number of tokens, which the stage that lays the rows out states (`pack` and `windows`, each its inputs a row) or a record step declaring `TokenGeometry` (`FixedTokens` for rows a chain does not lay out itself, `PackedRows` for packed decision windows); the compiler does not guess from field names, and a budget that is not whole rows is refused.
@@ -206,6 +230,19 @@ With it, `r2://bucket/path` reads and publishes through s3fs with those options.
 `augment=True` on `presets.images` runs the crop, flip and colour jitter on a batch with JAX; `images.DeviceAugment(size, crop_scale=, flip=, jitter=)` sets them itself, and a random host step or a tuple of them, such as `images.RandomCrop(size)` or `images.Albumentations(aug)`, runs on the host instead. Without `augment`, the preset resizes deterministically. `staging_size` is the decoded square before cropping, and `crop_scale` is the area fraction kept.
 
 Each record's key comes from Grain's data seed and position. Changing reader threads or batch placement changes no augmentation draw. A backend change changes the transform and cannot be substituted silently on resume. Validation keeps the host's deterministic resize.
+
+### Which augmentation helps, measured
+
+On fixed data each of `augment=True`'s three steps adds to a classifier's accuracy. [tools/benchmark_augmentation.py](https://github.com/AshishKumar4/dew/blob/main/tools/benchmark_augmentation.py) trains a small residual network (2.8M parameters) on Oxford Flowers 102's 1,020 training images at 64 pixels for 3,000 steps at batch 64, once per policy and seed, and scores it on the 6,149 test images, resized and never augmented. A seed draws the weights and the data's order and augmentation alike, the same for every policy, so policies are compared seed by seed. Measured on 2026-10-29 on one H100 (jax 0.12.0.1.post35), three seeds each, as the mean ± the sample standard deviation over the seeds (not a confidence interval):
+
+| Policy (`images.DeviceAugment`) | Test top-1, mean ± SD (n = 3) |
+|---|---|
+| none | 38.5% ± 1.3 |
+| `flip=True` | 40.1% ± 0.8 |
+| `flip=True, crop_scale=(0.35, 1.0)`, staged at 80 px | 43.7% ± 1.1 |
+| the same with `jitter=True` (`augment=True`'s three) | 45.3% ± 0.4 |
+
+In every seed each added step raised the accuracy: the flip by 1.1 to 2.2 points over none, the random crop by 3.1 to 4.2 over the flip, the largest gain here (3.7 on average), and colour jitter by 0.8 to 2.1 over the crop. The last batch's training loss ended at 0.0005 to 0.0007 with the flip alone and 0.012 to 0.022 with all three. `python tools/benchmark_augmentation.py --output augmentation.json` runs the study again; `--policies`, `--seeds` and `--steps` narrow it.
 
 The following measurements predate the chain. They compare decoder and augmentation implementations on the stated machine, not startup or remote-storage performance of the new compiler.
 

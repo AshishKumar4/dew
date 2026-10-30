@@ -56,6 +56,7 @@ if TYPE_CHECKING:
     from dew.inputs.condition import ConditionWork
     from dew.nn.backbones.decoder_block import RematPolicy
     from dew.nn.cross_attention import CrossBlocks
+    from dew.nn.dex import DifferentialExtension
     from dew.nn.dit import TextContext
     from dew.nn.dspark import DSpark
     from dew.nn.hyper_connections import HyperConnections
@@ -118,6 +119,7 @@ __all__ = [
     "TimeScaled",
     "TokenModel",
     "TritonGemm",
+    "VocabularyRows",
     "label_logits",
 ]
 
@@ -147,6 +149,30 @@ class Lacks(TypeError, ValueError):
 
 
 @struct.dataclass
+class Projection:
+    """A bias-free linear map the final states take before a vocabulary matrix meets them
+    (`OutputTable.projection`): an embedding of its own width's `project_out` (OPT-350m's), its
+    `kernel` `[features, width]` as the layer multiplies by it (an adapter's update included), after a
+    checkpoint's quantizer of the layer's input, its operands promoted to `compute` as the layer
+    promotes them and multiplied at `precision` by the layer's own plain product (`dense.plain_product`:
+    the GEMM template's route, the fp32 sum taken in float64 on a CPU under Dew's tests)."""
+
+    kernel: jax.Array
+    precision: PrecisionLike = struct.field(pytree_node=False, default=None)
+    compute: DTypeLike | None = struct.field(pytree_node=False, default=None)
+    input_quantizer: InputQuantizer | None = None
+
+    def __call__(self, hidden: jax.Array) -> jax.Array:
+        """`hidden` `[..., features]` projected to `[..., width]`."""
+        from dew.nn.dense import plain_product
+
+        hidden = hidden if self.input_quantizer is None else self.input_quantizer.qdq(hidden)
+        dtype = jnp.result_type(hidden, self.kernel) if self.compute is None else self.compute
+        return plain_product()(hidden.astype(dtype), self.kernel.astype(dtype),
+                               (((jnp.ndim(hidden) - 1,), (0,)), ((), ())), precision=self.precision)
+
+
+@struct.dataclass
 class OutputTable:
     """A vocabulary head as a matrix a loss contracts: `matrix` as the tree
     stores it, `[vocab, features]` when `vocab_major` and `[features, vocab]`
@@ -156,7 +182,9 @@ class OutputTable:
     model's compute dtype, decides the product's operands
     (`dew.nn.precision.head_product`; the states' dtype where None), and an
     `input_quantizer` rounds the states first as a checkpoint's head input
-    quantization does.
+    quantization does. Where the matrix is an embedding's own width, the states
+    reach it through a `projection` first (`Projection`), so every reader of
+    the states the product takes (`states`) reads them at the matrix's width.
 
     Contracting the model's final states with it (`logits`) reproduces the
     model's own logits, scale, bias, softcap and any adapter on the head
@@ -172,9 +200,13 @@ class OutputTable:
     compute: DTypeLike | None = struct.field(pytree_node=False, default=None)
     input_quantizer: InputQuantizer | None = None
     scale: jax.Array | None = None
+    projection: Projection | None = None
 
     def states(self, hidden: jax.Array) -> jax.Array:
-        """`hidden` as the product reads it: through the input quantizer's QDQ."""
+        """`hidden` as the product reads it: through the `projection` where the head has one, then the
+        input quantizer's QDQ."""
+        if self.projection is not None:
+            hidden = self.projection(hidden)
         return hidden if self.input_quantizer is None else self.input_quantizer.qdq(hidden)
 
     def logits(self, hidden: jax.Array, *, temperature: float = 1.0) -> jax.Array:
@@ -220,8 +252,9 @@ class OutputTable:
 
     def rows(self) -> jax.Array:
         """Each vocabulary token's `[vocab, features]` row: the matrix's, times
-        the token's scale, whose dot product with a state is the token's logit
-        before its bias and softcap, in the wider of the two dtypes. A reader
+        the token's scale, whose dot product with a state as the product reads
+        it (`states`) is the token's logit before its bias and softcap, in the
+        wider of the two dtypes. A reader
         of tokens' vectors (a decision head's lexical prior) takes these."""
         rows = self.matrix if self.vocab_major else self.matrix.T
         return rows if self.scale is None else rows * self.scale[:, None]
@@ -620,12 +653,33 @@ class CrossAttending(Protocol):
         of `context_lengths` tokens."""
         ...
 
-    def token_embeddings(self, tokens: jax.Array) -> jax.Array:
-        """Each token's row of the model's own table, unscaled and without positions: a context's
-        tokens as a cross-attention reads them by the table (`dew.nn.cross_attention.encode_context`)."""
+    def held_cross_flops(self, lengths, context_lengths) -> float:
+        """The part of `cross_flops` done by the decoder's own matrices, which train as its trunk does."""
+        ...
+
+    def stream_embeddings(self, tokens: jax.Array) -> jax.Array:
+        """Each token's row of the model's own table at its stream's width, unscaled and without
+        positions: a context's tokens as a cross-attention reads them by the table
+        (`dew.nn.cross_attention.encode_context`)."""
         ...
 
     def with_cross_attention(self, cross: CrossBlocks | None) -> Self: ...
+
+
+@runtime_checkable
+class Differential(Protocol):
+    """A decoder whose softmax layers can take DEX's differential on chosen heads (`dew.nn.dex`):
+    CausalTransformer, and a wrapper over one."""
+
+    @property
+    def dex(self) -> DifferentialExtension | None: ...
+
+    def with_dex(self, extension: DifferentialExtension | None) -> Self: ...
+
+    def dex_sites(self) -> tuple[tuple[str, ...], frozenset[int]]:
+        """Where the decoder's parameters sit under `params` (`()` for its own, a wrapper's deeper), and
+        its softmax attention layers, by index: what DEX extends and its recipe trains."""
+        ...
 
 
 @runtime_checkable

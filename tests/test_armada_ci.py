@@ -1837,6 +1837,56 @@ def test_a_plan_pinned_to_several_classes_reuses_a_row_green_on_any_of_them(
     assert planned() == ["tests/test_a.py tests/test_b.py", "tests/test_c.py"]
 
 
+def test_a_row_run_green_on_these_inputs_is_reused_though_another_commits_run_of_its_file_came_after(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A file's row run green on exactly a checkout's inputs is reused there whatever runs of the file on
+    other inputs came after it, as lanes' checks and trains of other commits run it all day: a lane's one-line
+    change over a green verdict reruns only what that line reaches (owner, 2026-10-29: a verdict found 272 of
+    its own 504 green files reusable an hour later, the others' records replaced by other commits' runs)."""
+    verdict, planned = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
+    armada_task(ci, monkeypatch, verdict)
+    test_c = tmp_path / "tests/test_c.py"
+    first = test_c.read_text()
+    # Another commit's run of test_c, on other inputs, after this one's.
+    test_c.write_text(first + "\n# another commit\n")
+    armada_task(ci, monkeypatch, verdict)
+    test_c.write_text(first)
+    assert planned() == ["tests/test_a.py tests/test_b.py tests/test_c.py"]
+    rows = armada_task(ci, monkeypatch, verdict)
+    assert len(rows) == 3 and all(row["exitCode"] == 0 for row in rows)
+    assert [len((tmp_path / f"runs-{name}").read_text()) for name in "abc"] == [1, 1, 2]
+
+
+def test_a_helper_added_under_tests_reruns_only_the_runs_that_imported_a_module_of_its_name(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A helper module added under tests/ reruns no file whose run imported no module of its name, as it
+    shadows nothing they import; one named as a module they imported, which tests/ leading sys.path would
+    shadow, reruns each of them (owner, 2026-10-29: train 315's one new helper reran all 2490 tasks)."""
+    verdict, planned = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
+    armada_task(ci, monkeypatch, verdict)
+    (tmp_path / "tests/quantized_basis.py").write_text("BASIS = 1\n")
+    assert planned() == ["tests/test_a.py tests/test_b.py tests/test_c.py"]
+    (tmp_path / "tests/pathlib.py").write_text("")
+    assert planned() == ["tests/test_a.py", "tests/test_b.py", "tests/test_c.py"]
+
+
+def test_a_helper_named_as_a_module_only_a_child_process_imported_reruns_its_file(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A module only a test's child process imports (a tool run as a script) is that file's input as one its
+    own process imports is: a helper of its name added under tests/ reruns the file (row 2502: the recorder
+    named the pytest process's imports alone, so such a helper kept the file's green key)."""
+    verdict, planned = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
+    written(tmp_path, {"test_c.py": "import subprocess, sys\nfrom pathlib import Path\n"
+                                    "def test_c():\n"
+                                    "    with Path('runs-c').open('a') as runs: runs.write('x')\n"
+                                    "    subprocess.run([sys.executable, '-c', 'import wave'],\n"
+                                    "                   check=True)\n"})
+    armada_task(ci, monkeypatch, verdict)
+    assert planned() == ["tests/test_a.py tests/test_b.py tests/test_c.py"]
+    (tmp_path / "tests/wave.py").write_text("")
+    assert planned() == ["tests/test_a.py tests/test_b.py", "tests/test_c.py"]
+
+
 def test_a_task_on_another_pinned_class_reuses_the_rows_its_plan_kept(
         ci, tmp_path, monkeypatch, cache_worker):
     """The files a plan keeps for reuse, their rows green on any class the tasks are pinned to, are reused by

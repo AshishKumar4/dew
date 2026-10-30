@@ -27,8 +27,9 @@ import functools
 import json
 import operator
 import os
+import re
 import tempfile
-from collections.abc import Callable, Collection, Mapping
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import asdict
 from pathlib import Path
 from types import MappingProxyType
@@ -429,13 +430,22 @@ def translate_wrapper_config(hf_config: Mapping[str, object]) -> WrapperFields:
 def wrapper_route(name: str, record: WrapperFields) -> tuple[str, str]:
     """Return the wrapper component a source tensor belongs to, and its name there.
 
-    One leading `model.` comes off first, which is the released nesting. Gemma
+    A codec's sidecar of a weight (`codecs.SIDECARS`: its scales, its input scale, its packed codes)
+    routes as its weight does, the head's beside the head. One leading `model.` comes off first, which
+    is the released nesting. Gemma
     4 keeps its embedder under `embed_vision` and Qwen 3.5 its merger inside
     the vision model, so the projector prefix runs before the tower's. Gemma
     3n and Gemma 4 nest their audio encoder and embedder beside the vision
     ones. A family that reads its media bundle whole keeps the decoder's
     tensors unprefixed.
     """
+    from dew.interop.codecs import SIDECARS
+
+    # A codec's sidecar (a weight's scales, its input scale, its packed codes) goes where its weight does.
+    sidecar = next((suffix for suffix in SIDECARS if name.endswith(suffix)), None)
+    if sidecar is not None:
+        component, owner = wrapper_route(name[:-len(sidecar)] + ".weight", record)
+        return component, owner.removesuffix(".weight") + sidecar
     tower_prefix = (None if record["tower"] is None else
                     vision_nn.tower_layout(_kind_name(record, "tower")).prefix)
     projector_prefix = (None if record["projector"] is None else
@@ -543,6 +553,97 @@ def language_model_config(hf_config: Mapping[str, object]) -> Mapping[str, objec
     if family is not None and "architectures" not in text:
         text["architectures"] = [family.architecture]
     return text
+
+
+QUANTIZED_MODULE_LISTS = ("modules_to_not_convert", "ignore", "exclude_modules", "ignored_layers")
+"""The quantization_config fields of the module selections the formats Dew reads state."""
+
+
+def language_model_quantization(hf_config: Mapping[str, object], record: WrapperFields,
+                                inventory: Callable[[], Collection[str] | None]
+                                ) -> Mapping[str, object] | None:
+    """A wrapper's quantization_config as its language model's text checkpoint states it: every module
+    selection under the text family's names (`wrapper_route`), a tower's or a projector's modules left
+    out. The selections are the lists (`QUANTIZED_MODULE_LISTS`), ModelOpt's per-layer table
+    (`quantized_layers`, by its keys) and compressed-tensors' groups' `targets`. A name is renamed as its
+    `.weight` routes; a pattern (`re:`, matched as compressed-tensors matches it, from a module name's
+    start) is resolved over the wrapper's own modules, those of `inventory`'s tensor names, into the
+    text names of the language model's it matches; an entry no wrapper module is named by (a class, as
+    `Linear`) applies to either checkpoint alike and stays. ModelOpt's table is read per weight of the
+    wrapper's inventory, each taking the longest key naming its module or a container of it, as the
+    codec reads it (`_modelopt_algo`), and keyed by the text name of the language model's. The record
+    is the wrapper's or its text_config's (`codecs.quantization_record`); None where it is ModelOpt's
+    and no layer of the language model survives, which is a dense text checkpoint."""
+    from dew.interop.codecs import quantization_record
+
+    quantization = dict(_records.record(quantization_record(hf_config), "quantization_config"))
+    listed: Collection[str] | None = None
+
+    def names() -> Collection[str]:
+        nonlocal listed
+        if listed is None:
+            listed = inventory()
+            if listed is None:
+                raise ValueError("text_only resolves a quantization selection over the wrapper's tensor "
+                                 "names, which this checkpoint states nowhere before its weights load")
+        return listed
+
+    def wrapper_modules() -> list[str]:
+        return sorted({name.rsplit(".", 1)[0] for name in names() if "." in name})
+
+    def wrapper_weights() -> list[str]:
+        return sorted(name.removesuffix(".weight") for name in names() if name.endswith(".weight"))
+
+    def renamed(module: str) -> str | None:
+        component, name = wrapper_route(f"{module}.weight", record)
+        return name.removesuffix(".weight") if component == "language_model" else None
+
+    def projected(entries: Sequence[str]) -> list[str]:
+        out: list[str] = []
+        for entry in entries:
+            if entry.startswith("re:"):
+                pattern = re.compile(entry[3:])
+                out.extend(name for module in wrapper_modules() if pattern.match(module)
+                           and (name := renamed(module)) is not None)
+                continue
+            try:
+                name = renamed(entry)
+            except ValueError:  # no wrapper module's name: a class, or a format's own word
+                out.append(entry)
+                continue
+            if name is not None:
+                out.append(name)
+        return list(dict.fromkeys(out))
+
+    for field in QUANTIZED_MODULE_LISTS:
+        if isinstance(quantization.get(field), list):
+            quantization[field] = projected(_records.listed(quantization[field], field, read=_records.text,
+                                                            what="module names"))
+    if isinstance(quantization.get("quantized_layers"), Mapping):
+        layers = {str(module): entry for module, entry in
+                  _records.record(quantization["quantized_layers"], "quantized_layers").items()}
+
+        # Each of the wrapper's weights takes the longest key naming its module or a container of it, as
+        # the codec reads the table (`_modelopt_algo`), keyed by its text name.
+        table: dict[str, object] = {}
+        for module in wrapper_weights():
+            key = max((key for key in layers if module == key or module.startswith(key + ".")), key=len,
+                      default=None)
+            if key is not None and (name := renamed(module)) is not None:
+                table[name] = layers[key]
+        if not table:
+            return None
+        quantization["quantized_layers"] = table
+    if isinstance(quantization.get("config_groups"), Mapping):
+        groups = {}
+        for group, entry in _records.record(quantization["config_groups"], "config_groups").items():
+            held = dict(_records.record(entry, f"config_groups.{group}"))
+            if isinstance(held.get("targets"), list):
+                held["targets"] = projected(_records.listed(held["targets"], f"config_groups.{group}.targets",
+                                                            read=_records.text, what="module names"))
+            groups[group] = held
+        quantization["config_groups"] = groups
+    return quantization
 
 
 def language_model_names(names: Collection[str], read: Callable[[str], Stored], record: WrapperFields,
@@ -1080,8 +1181,7 @@ def export_config(model) -> Mapping[str, object]:
 
     overrides = {}
     for name in set(model.per_layer_types):
-        mixer = model.kind_of(name).mixer or model.mixer or AttentionMixer()
-        if isinstance(mixer, AttentionMixer) and mixer.bidirectional_blocks:
+        if (model.kind_of(name).mixer or model.mixer or AttentionMixer()).reads_blocks:
             overrides[name] = "block_bidirectional"
     if overrides:
         config["modeling_overrides"] = {"attention": overrides}

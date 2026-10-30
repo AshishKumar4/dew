@@ -153,8 +153,7 @@ class Encoding:
                 raise ValueError(f"a question of {count} options outgrows the encoding's {self.width} slots")
         questions = len(encoded.questions)
         row: Batch = {
-            "tokens": np.asarray(encoded.tokens, np.int32),
-            **question_fields(encoded, questions, self.width, labelled_rows([encoded])),
+            **model_row(encoded, self.width, self.context_length),
             **{field.name: field.empty(questions, self.width) for field in TRAINING_FIELDS
                if field.when == "trained"},
         }
@@ -174,19 +173,30 @@ class Encoding:
                 row["targets"][slot, :count] = shown
                 row["labels"][slot] = int(np.argmax(shown))
                 row["scored"][slot] = True
-        if encoded.positions is not None and encoded.slots is not None:
-            row["positions"] = np.asarray(encoded.positions, np.int32)
-            row["slots"] = np.asarray(encoded.slots, np.int32)
-        if encoded.blocks is not None:
-            row["blocks"] = np.asarray(encoded.blocks, np.int32)
-        if encoded.streams is not None:
-            row["streams"] = np.asarray(encoded.streams, np.int32)
-        if self.context_length is not None:
-            row["context"] = np.asarray(encoded.context or (), np.int32)
-            if self.grouped:
-                # A row of its own is a unit of one row, its context that row's (`_unit_row`).
-                row["context_row"] = np.zeros(len(row["context"]), np.int32)
+        if self.context_length is not None and self.grouped:
+            # A row of its own is a unit of one row, its context that row's (`_unit_row`).
+            row["context_row"] = np.zeros(len(row["context"]), np.int32)
         return row
+
+
+def model_row(encoded: Encoded, width: int, context_length: int | None = None) -> Batch:
+    """The fields of a laid-out row a model reads, as a window packs them (`packing`): its tokens, its
+    questions in `width` option slots each (`question_fields`), its tokens' positions and option slots
+    in the parallel layout, their blocks where it reads them in blocks, and with a `context_length` its
+    context's tokens. A training row (`Encoding`) is this and its gold; a scored row is this alone
+    (`dew.decision.task.Decide`)."""
+    row: Batch = {"tokens": np.asarray(encoded.tokens, np.int32),
+                  **question_fields(encoded, len(encoded.questions), width, labelled_rows([encoded]))}
+    if encoded.positions is not None and encoded.slots is not None:
+        row["positions"] = np.asarray(encoded.positions, np.int32)
+        row["slots"] = np.asarray(encoded.slots, np.int32)
+    if encoded.blocks is not None:
+        row["blocks"] = np.asarray(encoded.blocks, np.int32)
+    if encoded.streams is not None:
+        row["streams"] = np.asarray(encoded.streams, np.int32)
+    if context_length is not None:
+        row["context"] = np.asarray(encoded.context or (), np.int32)
+    return row
 
 
 
@@ -639,12 +649,13 @@ questions stand in consistency groups (`Example.groups`, `GroupedExamples`), eac
 option slot's `canonical` option, -1 for none, and its row in its unit of rows (`question_row`, `_unit`)."""
 
 
-def _along(layout: Layout, grouped: bool = False) -> tuple[str, ...]:
-    """The fields along the questions of `layout`'s training rows (`QUESTION_FIELDS`,
-    `TRAINING_FIELDS`): its readout's where its options stand under labels, and their consistency
-    groups' where they carry them (`grouped`)."""
+def _along(layout: Layout, grouped: bool = False, trained: bool = True) -> tuple[str, ...]:
+    """The fields along the questions of `layout`'s rows (`QUESTION_FIELDS`), with a training row's gold
+    (`TRAINING_FIELDS`) where they are `trained`: its readout's where its options stand under labels,
+    and their consistency groups' where they carry them (`grouped`)."""
     labelled = isinstance(layout, QuestionLayout) and layout.labels is not None
-    carried = ("always", "trained", *(("labelled",) if labelled else ()), *(("grouped",) if grouped else ()))
+    carried = ("always", *(("trained",) if trained else ()), *(("labelled",) if labelled else ()),
+               *(("grouped",) if grouped else ()))
     declared = (*QUESTION_FIELDS, *TRAINING_FIELDS)
     # The model's and training's fields, then the labelled readout, then the groups, as rows carry them.
     return tuple(field.name for when in carried for field in declared if field.when == when)
@@ -657,16 +668,19 @@ def _along_fields(element: Batch, when: tuple[str, ...] = ("always", "trained"))
                  if field.name in element and field.when in when)
 
 
-def packing(layout: Layout, bounds: Bounds, context_window: int | None = None, grouped: bool = False) -> Pack:
+def packing(layout: Layout, bounds: Bounds, context_window: int | None = None, grouped: bool = False,
+            trained: bool = True) -> Pack:
     """Rows of `layout` packed first-fit into windows of its `max_len`, each
     window's rows, questions and options within `bounds` (`Layout.bounds`),
     and with a `context_window` each row's context along an axis of its own of
     that many tokens, end to end in the order their rows stand (`PackedRows`'
-    `context_segments`): a window holds rows while both its streams do."""
+    `context_segments`): a window holds rows while both its streams do. A
+    `trained` row carries its gold along its questions; a scored one
+    (`model_row`) carries the model's fields alone."""
     parallel = isinstance(layout, QuestionLayout) and layout.parallel
     blocked = isinstance(layout, QuestionLayout) and layout.blocks
     streamed = layout.attention is not None
-    along = tuple((name, bounds.questions) for name in _along(layout, grouped))
+    along = tuple((name, bounds.questions) for name in _along(layout, grouped, trained))
     if context_window is not None:
         along = (*along, ("context", context_window))
         if grouped:

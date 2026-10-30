@@ -48,6 +48,7 @@ from dew.batch import EXAMPLE_ROWS, FROZEN, VALID_ROWS, Batch, PathFilter, Varia
 from dew.nn import categorical
 from dew.nn.kernels.options import Held, Option, compiler_options
 from dew.nn.precision import accumulated, at_least_fp32, compensated_sum, weighted_total
+from dew.nn.progress import Progress, stepping
 from dew.nn.protocols import HiddenStates, ProjectsParameters
 from dew.nn.sharding import rows_taken
 
@@ -492,13 +493,14 @@ class TrainingScalars[Statistics, Additions]:
 class Prediction:
     """What a token objective scored a batch with, for comparison with a teacher.
 
-    - `logits`: the `[B, S, vocab]` fp32 scores from the model's forward pass.
+    - `logits`: the `[B, S, vocab]` fp32 scores from the model's forward pass, None where the caller
+      asked for none (`predict`'s `logits`): its loss scored them a tile at a time and held none.
     - `losses`: the `[B, S]` per-position loss the objective sums.
     - `weights`: the `[B, S]` weight the objective gives each position.
     - `hidden`: the `[B, S, D]` states of the layers the caller asked for,
       in the order asked.
     """
-    logits: jax.Array
+    logits: jax.Array | None
     losses: jax.Array
     weights: jax.Array
     hidden: tuple[jax.Array, ...]
@@ -1151,7 +1153,8 @@ class Objective(ABC, Generic[Loss, Effects]):
             batch = {name: value for name, value in batch.items() if name != EXAMPLE_ROWS}
         witness = Witness() if step.record and not validation else None
         step = step if witness is None else replace(step, witness=witness)
-        loss = (self.validation_loss if validation else self.loss)(variables, batch, step)
+        with stepping(Progress(step.committed)):
+            loss = (self.validation_loss if validation else self.loss)(variables, batch, step)
         if _has_aux(loss):
             stats, aux = loss
         else:
@@ -1293,11 +1296,11 @@ class Objective(ABC, Generic[Loss, Effects]):
         raise TypeError("deferred effects require Objective.apply_effects")
 
     def predict(self, params: Variables, batch: Batch, step: Step, *, train: bool,
-                layers: Sequence[int] = ()) -> tuple[Ratio, Aux[Effects], Prediction]:
+                layers: Sequence[int] = (), logits: bool = True) -> tuple[Ratio, Aux[Effects], Prediction]:
         """Return the loss over `batch` as `loss` computes it, together with the prediction behind it.
 
         The result holds the statistics, the `Aux` reports and a `Prediction`
-        with the token logits, the weight of every position and the hidden
+        with the token logits (none unless `logits`), the weight of every position and the hidden
         states of `layers`. The statistics are one `Ratio` over the positions
         the weights count, so a distillation can mix in terms over the same
         mass. `train` turns dropout on, as `loss` has it; a frozen teacher
@@ -1343,7 +1346,15 @@ class Objective(ABC, Generic[Loss, Effects]):
         """
         weights = self.evaluation_variables(variables, step)
         if loss and evaluate and self._validation_scores is not None:
-            report = self.program('report', self._validation_scores)
+            scores = self._validation_scores
+
+            def progressed(weights: Variables, batch: Batch, step: Step):
+                # The loss reads the run's progress as `_loss`'s does, so a metric scored beside it
+                # leaves it as it is.
+                with stepping(Progress(step.committed)):
+                    return scores(weights, batch, step)
+
+            report = self.program('report', progressed)
             return report(weights, batch, replace(step, training=False))
         statistics = self._validation_loss(weights, batch, step) if loss else None
         return statistics, self.evaluate(variables, batch, step) if evaluate else None
