@@ -11,6 +11,8 @@ velocities, a walk's recorded densities and their rescoring alike; what is one
 computation, or exact arithmetic, is held exactly.
 """
 
+import contextlib
+import dataclasses
 import itertools
 import math
 from pathlib import Path
@@ -1323,17 +1325,35 @@ def test_a_transitions_density_keeps_a_residual_whose_square_overflows():
     np.testing.assert_array_equal(np.asarray(jax.grad(along_mean)(small.mean)), [[2.0 ** 90]])
 
 
-@pytest.mark.parametrize("guided", ["unguided", "unguided-over-a-guide", "autoguidance"])
+class Branched:
+    """A custom guidance that calls its denoiser inside a `lax.cond` of its own, returning what the call
+    opened through the cond's outputs, as the `Guidance` protocol asks."""
+
+    def walk(self, denoise, steps):
+        from dew.sampling.guidance import Walk
+
+        def predict(x, t):
+            def called(x):
+                output, sown = denoise.raw_observed(x, t)
+                return denoise.observed(denoise.convert(x, t, output), sown)
+            return jax.lax.cond(jnp.asarray(1) > 0, called, called, x)
+        return Walk.stateless(lambda index: predict)
+
+
+@pytest.mark.parametrize("guided", ["unguided", "unguided-over-a-guide", "autoguidance", "branched"])
 def test_a_watched_flow_step_summarizes_its_policys_own_first_call(guided):
     """A sampled Flow-GRPO step watching its policy model summarizes that model's output on the inputs
     its walk hands it at each trajectory's first transition, its own call's to the bit: unguided, over a
-    tree that holds an autoguidance's guide it does not read, and under an autoguidance whose main model
-    holds the guide out (2317)."""
+    tree that holds an autoguidance's guide it does not read, under an autoguidance whose main model
+    holds the guide out (2317), and under a custom guidance that calls its policy inside a `lax.cond` of
+    its own (2511). The summary is the trained call's, returned out of the step's scan: the watched loss
+    and gradient run the unwatched's matmuls alone (`step_flops`, 2512)."""
     from dew.nn.inspection import Watched, flattened, watching
     from dew.sampling.guidance import Autoguidance
+    from dew.telemetry.instrumentation import step_flops
 
     process, rows = Process(FlowMatchingScheduler(), VPredictionTransform()), 4
-    guidance = Autoguidance(2.0, AffineVelocity()) if guided == "autoguidance" else None
+    guidance = {"autoguidance": Autoguidance(2.0, AffineVelocity()), "branched": Branched()}.get(guided)
     objective = FlowGRPOObjective(AffineVelocity(), process, InputSpec(Field("image", (2,))),
                                   sde=FlowSDE(0.5), guidance=guidance)
     own = objective.init(jax.random.key(30))
@@ -1357,9 +1377,21 @@ def test_a_watched_flow_step_summarizes_its_policys_own_first_call(guided):
             outputs.append(output)
         return output
 
-    with nn.intercept_methods(kept):
+    # The policy's own call, run eagerly through any transform its guidance wraps it in.
+    with nn.intercept_methods(kept), jax.disable_jit():
         objective._walk(variables, batch).at((), 0)(batch["latents"][:, 0], batch["timesteps"][:, 0])
     expected = np.asarray(outputs[0], np.float32)
     logged = flattened(aux.inspected)
     assert logged["activations/abs_max"] == np.abs(expected).max()
     assert logged["activations/mean"] == expected.mean(dtype=np.float32)
+
+    def work(watching_step: Step) -> float:
+        def loss(params):
+            with watching(("AffineVelocity",)) if watching_step.watched else contextlib.nullcontext():
+                stats, _ = objective.loss({**variables, "params": params}, batch, watching_step)
+            return objective.reduce_loss(stats)[0]
+        flops = step_flops(jax.jit(jax.grad(loss)).lower(variables["params"]).compile())
+        assert flops is not None
+        return flops.hardware
+
+    assert work(step) == work(dataclasses.replace(step, watched=None))

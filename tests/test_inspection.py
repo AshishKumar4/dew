@@ -1,6 +1,7 @@
 """Live inspection (row 2317): what a run watches is summarized inside its step, from the arrays its commit
 holds, and logged one log late; a run that watches nothing compiles its step unchanged."""
 
+import contextlib
 import json
 
 import flax.linen as nn
@@ -365,29 +366,43 @@ def test_an_offline_view_restored_mid_window_steps_to_its_commit(tmp_path, split
         assert inspected(restored, {"x": ROWS})["inspect/params/l2"] > 0
 
 
-def test_called_with_reads_the_models_own_call_in_this_trace_alone():
-    """The inputs a forward hands a model over its weights are read off that call, past a call another
-    module makes first and past one the same architecture makes over other weights, even a guide sharing
-    some of them, and only
-    in the caller's own trace: a forward that calls it inside a transform of its own (a `cond`) is refused,
-    its inputs that transform's."""
-    from dew.nn.inspection import called_with
+TRANSFORMED = ("mean_flow", "ladd", "rcm")
+"""Objectives whose trained forward runs inside a transform (a `jax.jvp`, a `lax.cond`), whose watched
+forward at its inputs XLA computes once with it; Flow-GRPO's, inside its scan, returns its own
+(`test_flow_grpo`)."""
 
-    block, head = Block(), Headed()
-    x = jnp.asarray(ROWS)
-    weights = block.init(jax.random.key(0), x)
-    # A guide of the same architecture sharing the policy's bias, its kernel its own.
-    guide = jax.tree_util.tree_map_with_path(
-        lambda path, leaf, own: own if "bias" in jax.tree_util.keystr(path) else leaf,
-        block.init(jax.random.key(2), x), weights)
-    head_variables = head.init(jax.random.key(1), x)
 
-    def forward(rows):
-        head.apply(head_variables, rows)
-        block.apply(guide, rows * 3)
-        return block.apply(weights, rows * 2)
+@pytest.mark.parametrize("name", TRANSFORMED)
+def test_a_sampled_step_summarizes_its_trained_forward_at_no_forward_more(name):
+    """A sampled step of an objective whose trained forward runs inside a transform summarizes that very
+    forward, returned through the transform, and computes the model no more than an unsampled step does:
+    the sampled loss and gradient run the unsampled's matmuls, their work the same (`step_flops`), the
+    summaries elementwise alone (row 2512: one stop-gradient forward more, at its inputs)."""
+    from objective_cases import cases
 
-    args, _ = called_with(block, weights, lambda: forward(x))
-    np.testing.assert_array_equal(args[0], x * 2)
-    with pytest.raises(ValueError):
-        called_with(block, weights, lambda: jax.lax.cond(jnp.asarray(1) > 0, forward, forward, x))
+    from dew.nn.inspection import Watched, watching
+    from dew.objectives.base import Step
+    from dew.telemetry.instrumentation import step_flops
+
+    objective, batch = cases(None)[name]()
+    variables = objective.init(jax.random.key(0))
+    numeric = {key: value for key, value in batch.items()
+               if getattr(value, "dtype", None) is not None and value.dtype.kind in "biuf"}
+    held = {key: value for key, value in batch.items() if key not in numeric}
+    kinds = ("*Block*", "*Attention*", "*Mlp*", "*MLP*")
+
+    def work(*, watched: bool) -> tuple[float, object]:
+        def loss(params, numeric):
+            step = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(1), ema=None,
+                        watched=Watched(kinds) if watched else None)
+            with watching(kinds) if watched else contextlib.nullcontext():
+                stats, aux = objective.loss({**variables, "params": params}, {**numeric, **held}, step)
+            return objective.reduce_loss(stats)[0], aux.inspected
+        stepped = jax.value_and_grad(loss, has_aux=True)
+        flops = step_flops(jax.jit(stepped).lower(variables["params"], numeric).compile())
+        assert flops is not None
+        return flops.hardware, jax.eval_shape(stepped, variables["params"], numeric)[0][1]
+
+    plain, _ = work(watched=False)
+    sampled, inspected = work(watched=True)
+    assert inspected and sampled == plain
