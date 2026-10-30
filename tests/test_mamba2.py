@@ -20,7 +20,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from model_support import decode_through
+from model_support import as_stepped, decode_through
 from one_draw import assert_as_exact_as_the_reference
 from reference_error import FACTOR, assert_as_exact, declared_seeds, indexed_recording, recording, widened
 from sequence_split_support import SPLIT_ROWS, assert_split_as_whole
@@ -218,12 +218,12 @@ def test_the_layer_in_bfloat16_matches_the_reference_in_bfloat16(reference, geom
 
 def test_the_layer_decodes_as_it_prefills(reference, geometry):
     """A prefill against the cache and single-token steps after it reproduce
-    the parallel forward: the conv tail and the SSM state both cross the
-    step boundary."""
+    the parallel forwards, each step's at the width it reads (`as_stepped`):
+    the conv tail and the SSM state both cross the step boundary."""
     module = layer(geometry)
     variables = layer_params(reference)
     hidden = jnp.asarray(reference["layer.hidden"])
-    parallel = module.apply(variables, hidden)
+    parallel = as_stepped(jax.jit(lambda held: module.apply(variables, held)), hidden, 5)
 
     decoded, cache, _ = decode_through(module, variables, hidden, prefill=5)
     assert all(not jnp.any(leaf) for leaf in jax.tree.leaves(cache))

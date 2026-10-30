@@ -75,8 +75,9 @@ def test_drawn_tokens_continue_the_prompts_positions_as_its_response_does(rng):
     a document reset lowered below an earlier one in the first two rows, and
     past a left-padded row's offset ones and a plain row's. The greedy decode
     is then the walk of a full forward over the request extended token by
-    token, and each drawn token's log probability is on par with that
-    forward's from its float64 run over drawn prompts (check 1)."""
+    token, and each drawn token's log probability is on par with the walk's
+    forward that chose it, at the width its step reads (ledger 1543), from
+    the float64 forward over the walk over drawn prompts (check 1)."""
     from reference_error import as_given, assert_as_exact, widened
 
     from dew.nn.inputs import ModelInputs
@@ -99,19 +100,24 @@ def test_drawn_tokens_continue_the_prompts_positions_as_its_response_does(rng):
     def draw(seed):
         return (np.asarray(jax.random.randint(jax.random.key(seed), (4, 5), 0, VOCAB)),)
 
-    def walk(tokens):
-        """The request extended token by token by a full forward's greedy choice."""
-        walked = ModelInputs(jnp.asarray(tokens), metadata)
+    def walked_logits(tokens):
+        """The request extended token by token by a full forward's greedy choice, and each step's
+        logits, from its forward over the request so far."""
+        walked, steps = ModelInputs(jnp.asarray(tokens), metadata), []
         for _ in range(8):
             logits = forward(params, walked.tokens, walked.kwargs())[:, -1]
+            steps.append(logits)
             walked = walked.extended(jnp.argmax(logits, axis=-1)[:, None].astype(jnp.int32))
-        return walked
+        return walked, jnp.stack(steps, axis=1)
+
+    def walk(tokens):
+        return walked_logits(tokens)[0]
 
     @as_given
     def scored(tokens):
-        """Each drawn token's log probability under a full forward over the float32 walk."""
-        walked = walk(np.asarray(tokens))
-        log_probs = jax.nn.log_softmax(forward(params, walked.tokens, walked.kwargs())[:, 4:-1])
+        """Each drawn token's log probability under the walk's forward that chose it."""
+        walked, logits = walked_logits(np.asarray(tokens))
+        log_probs = jax.nn.log_softmax(logits)
         return np.asarray(jnp.take_along_axis(log_probs, walked.tokens[:, 5:, None], axis=-1)[..., 0])
 
     @as_given
