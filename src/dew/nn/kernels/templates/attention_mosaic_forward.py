@@ -150,10 +150,16 @@ def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
         # The natural form's rewalk at its own tiles (`Tiles.relaunch`), its spans' block map of them.
         at, at_spans = _form_tiles(spec, call, form, tiles, spans_of)
         if live is None:
-            status, out, *finished = _launch(q, k, v, at_spans, hooked, None, spec=form, hooks=hooks,
-                                             tiles=at, family=family, training=False, interpret=interpret,
-                                             counted=form.natural == spec.natural, finishes=rows)
-            return (out, *finished), status[0], status[1] > 0
+            # A launch a block of the value columns where its tiles walk a block (`Tiles.columns`), the
+            # blocks' outputs side by side, their rows' statistics alike.
+            launched = [_launch(q, k, values, at_spans, hooked, None, spec=form, hooks=hooks, tiles=at,
+                                family=family, training=False, interpret=interpret,
+                                counted=form.natural == spec.natural, finishes=rows, columns=first)
+                        for first, values in _value_blocks(v, at)]
+            status, _, *finished = launched[0]
+            out = jnp.concatenate([block[1] for block in launched], axis=-1)
+            overflowed = functools.reduce(jnp.logical_or, [block[0][1] > 0 for block in launched])
+            return (out, *finished), status[0], overflowed
         unit = guarded_columns(family, v.shape[-1], v.dtype)
         guarded = guarded_tiles(family, at, unit, v.dtype)
         hooked_blocks = hooks.output_mod is not None
@@ -190,6 +196,15 @@ def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
         return out
     maximum, total = (array[:, :, :call.queries] for array in finished[0])
     return out, maximum, total, jnp.full(maximum.shape, -1, jnp.int32), output_split(out)
+
+
+def _value_blocks(value: jax.Array, tiles: Tiles) -> list[tuple[int | None, jax.Array]]:
+    """The blocks of `value`'s columns a launch at `tiles` walks, each its first column and its slice: the
+    whole, first None, where its tiles walk every column (`Tiles.columns` None)."""
+    if tiles.columns is None or tiles.columns >= value.shape[-1]:
+        return [(None, value)]
+    return [(first, value[..., first:first + tiles.columns])
+            for first in range(0, value.shape[-1], tiles.columns)]
 
 
 def _form_tiles(spec: algebra.Forward, call, form: algebra.Forward, tiles: Tiles, spans_of):
@@ -238,9 +253,15 @@ def _trained_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
             at, at_spans = _form_tiles(spec, call, form, tiles, spans_of)
             found = _launch(q, k, v, at_spans, hooked, None, spec=form, hooks=hooks, tiles=at,
                             family=family, training=False, interpret=interpret, peaks=True, counted=counted)
-            status, rows, anchors, others = _launch(q, k, v, at_spans, hooked, None, spec=form, hooks=hooks,
-                                                    tiles=at, family=family, training=True,
-                                                    interpret=interpret, anchors=found, counted=counted)
+            # A training launch a block of the value columns where its tiles walk a block (`Tiles.columns`,
+            # row 2526), each block's split sums side by side, their rows alike.
+            launched = [_launch(q, k, values, at_spans, hooked, None, spec=form, hooks=hooks, tiles=at,
+                                family=family, training=True, interpret=interpret, anchors=found,
+                                counted=counted, columns=first)
+                        for first, values in _value_blocks(v, at)]
+            status, rows, anchors, _ = launched[0]
+            others = jnp.concatenate([block[3] for block in launched], axis=-1)
+            status = status.at[1].set(functools.reduce(jnp.maximum, [block[0][1] for block in launched]))
             split = Split(others, rows[2], rows[3], rows[4])
             # Each row's anchor's value row (`[B, H, Qp, Dv]`): its key head's at its key, gathered.
             batch, kv_heads, keys_count = v.shape[0], v.shape[2], v.shape[1]
