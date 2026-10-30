@@ -1496,18 +1496,24 @@ def load(source: sources.SourceReference, root: Path, *, dtype: str,
 
 
 def _in_storage(variables: Variables, param_dtype: str) -> Variables:
-    """`variables` with each floating parameter in its storage (`weights.checkpoint_dtype`), a leaf at a
-    time where it lies: on its devices where the load placed it, so the host holds the checkpoint's
-    memory-mapped tensors alone, else on the host, without a copy where it is stored so."""
-    def stored(leaf):
-        if isinstance(leaf, jax.ShapeDtypeStruct):
-            return leaf
-        target = checkpoint_dtype(np.dtype(leaf.dtype), param_dtype)
-        if isinstance(leaf, jax.Array):
-            return leaf if leaf.dtype == target else leaf.astype(target)
-        return np.asarray(leaf).astype(target, copy=False)
+    """`variables` with each floating parameter in its storage (`weights.checkpoint_dtype`), cast a leaf
+    at a time where it lies and written over the leaf it casts, in its own dict (`host.stream` places a
+    tree's leaves so): on its devices where the load placed it, the leaf it replaces freed as its cast
+    lands, so neither the devices nor the host, which holds the checkpoint memory-mapped, hold the
+    parameters twice; else on the host, without a copy where it is stored so."""
+    def cast(node: dict) -> None:
+        for name, leaf in node.items():
+            if isinstance(leaf, dict):
+                cast(leaf)
+            elif isinstance(leaf, jax.Array | np.ndarray):
+                target = checkpoint_dtype(np.dtype(leaf.dtype), param_dtype)
+                if leaf.dtype != target:
+                    node[name] = leaf.astype(target)
 
-    return {**variables, "params": jax.tree.map(stored, variables["params"])}
+    params = variables["params"]
+    assert isinstance(params, dict)
+    cast(params)
+    return variables
 
 
 def _unread(source: str | Path, names: Sequence[str]) -> str:
