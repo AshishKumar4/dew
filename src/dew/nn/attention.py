@@ -55,12 +55,7 @@ from .kernels import decode_attention, generation
 from .kernels.generation import Route, bf16_dot_runs
 from .kernels.selection import select, selected
 from .kernels.templates import attention as template, attention_route
-from .precision import (
-    asks_default_precision,
-    at_least_fp32,
-    capped_logits,
-    float32_einsum,
-)
+from .precision import asks_default_precision, at_least_fp32, capped_logits, float32_einsum
 from .sharding import SCORES, sequence_shards
 from .visibility import window_sides
 
