@@ -38,6 +38,7 @@ from dew.nn.kernels.templates import report
 from dew.objectives.base import RECORD, Objective
 from dew.state import TrainState, apart, together
 from dew.telemetry.profile import active_profile, capture_options
+from dew.training.ahead import handed
 from dew.training.distributed import batch_divisor
 from dew.training.footprint import Footprint
 from dew.training.memory import (
@@ -537,8 +538,8 @@ class FitSearch[LossT, EffectsT]:
     """The plan the search last found to fit: its candidate, executable and the options it compiled under."""
     ahead: AheadOfTime | None = None
     """A step compiled ahead (`dew.training.ahead`), run in place of the search's first compile where it
-    is that program (`AheadOfTime.taken`), which the trainer searches within the launch configs its
-    compiles refused alone (`AheadOfTime.refusals`, `dew.training.trainer.Trainer._planned`)."""
+    is that program (`AheadOfTime.taken`), which the search searches within the launch configs its
+    compiles refused alone (`AheadOfTime.refusals`, `admitted`)."""
     capacity: int | None = None
     """The bytes a device that states none holds (`step_headroom`): a compile-only GPU's, as a step
     compiled ahead for it states them (`AheadTarget.capacity`)."""
@@ -567,13 +568,15 @@ class FitSearch[LossT, EffectsT]:
         """The first fitting plan found by the split-and-rung search, and every compile it made, its
         first rung the one the derivation picks (`derived_start`). Once admission succeeds, no optional
         alternate policy is compiled."""
-        # A rung fits where its most microbatches do; the search then finds its split there.
-        self.derived_start(candidates[-1])
-        seen = len(report.misses())
-        split = planned(candidates, first, self.fits, self.climb,
-                        lambda split: self.forecast.likely(self.rung(), split))
-        spills: list[JSON] = [spill_record(miss) for miss in report.misses()[seen:]]
-        refused: list[JSON] = [refusal_record(*refusal) for refusal in report.refused_launches()]
+        # A rung fits where its most microbatches do; the search then finds its split there. A step
+        # compiled ahead is searched within the launch configs its compiles refused alone (`handed`).
+        with handed(self.ahead):
+            self.derived_start(candidates[-1])
+            seen = len(report.misses())
+            split = planned(candidates, first, self.fits, self.climb,
+                            lambda split: self.forecast.likely(self.rung(), split))
+            spills: list[JSON] = [spill_record(miss) for miss in report.misses()[seen:]]
+            refused: list[JSON] = [refusal_record(*refusal) for refusal in report.refused_launches()]
         self.kernels = {"spills": spills, "refused": refused}
         if split is None or self.fitted is None:
             raise PlanRefused(self.probes) from (self.refusals[-1] if self.refusals else None)

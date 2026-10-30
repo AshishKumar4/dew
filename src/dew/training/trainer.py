@@ -151,7 +151,6 @@ from dew.training._lowering import (
     topology_devices,
     uncompiled,
 )
-from dew.training.ahead import AheadOfTime, handed
 from dew.training.budget import Pause, Plateau
 from dew.training.cooldown import Cooldowns, Pending, check_branches, decay, resolved, schedule_ended
 from dew.training.display import TRAINER_SHOWN, TrainingDisplay, goodput
@@ -231,6 +230,7 @@ _log = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from dew.optim import OptimConfig
     from dew.telemetry.profile import Profiler
+    from dew.training.ahead import AheadOfTime
 
 StepFn = Callable[[TrainState, Batch], tuple[TrainState, jax.Array, Aux]]
 """A compiled step's body: the state and the global batch in, the new state,
@@ -1086,9 +1086,8 @@ class Trainer(Generic[Loss, Effects]):
             self.objective, mesh, self._xla_defaults, self._narrow, None if self._base_rung is None
             else self._base_rung[1], resumed, ahead=self._ahead, capacity=capacity,
             derive=None if recorded is not None else functools.partial(lower, lowering=False))
-        with handed(self._ahead):
-            planned, probes = search.admitted(
-                candidates, candidates.index(first) if isinstance(first, int) and first in candidates else 0)
+        planned, probes = search.admitted(
+            candidates, candidates.index(first) if isinstance(first, int) and first in candidates else 0)
         # Consume the artifact only after its program was accepted; a refusal leaves it pending.
         self._ahead = search.ahead
         self.objective.substitute(list(planned.modules))
