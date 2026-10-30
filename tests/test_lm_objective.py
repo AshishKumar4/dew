@@ -649,6 +649,15 @@ def float64_packed():
     return LMObjective(tiny_decoder().clone(dtype=jnp.float64), SEQ)
 
 
+
+def scored_by(objective):
+    """`objective`'s mean loss over a packed row, its documents and positions laid out as their
+    coordinates (`token_scores`), as check 1's arms take a row's fields."""
+    def scored(params, tokens, segment_ids, positions, *_):
+        laid = coordinates(segments=segment_ids, positions=positions)
+        return weighted_mean(*objective.token_scores(params, tokens, coordinates=laid)[:2])
+    return scored
+
 def test_a_packed_batch_ignores_the_boundary_and_the_padding():
     """A packed row trains on every transition inside a document and on none across the boundary or
     into the padding, and over drawn decoders and documents its loss is on par with the cross entropy
@@ -670,9 +679,7 @@ def test_a_packed_batch_ignores_the_boundary_and_the_padding():
     assert weights[len(doc_a) + 2:].sum() == 0, "padding was trained on"
     np.testing.assert_array_equal(np.asarray(scored_weights[0]), weights)
 
-    def scored(params, tokens, segment_ids, positions, *_):
-        laid = coordinates(segments=segment_ids, positions=positions)
-        return weighted_mean(*objective.token_scores(params, tokens, coordinates=laid)[:2])
+    scored = scored_by(objective)
 
     def written(of):
         return lambda params, tokens, segment_ids, positions, *_: weighted_mean(
@@ -700,9 +707,7 @@ def test_a_packed_batch_scores_like_its_documents_alone():
     _, packed_weights = counted_losses(objective, params, tokens, segment_ids, positions)
     assert float(jnp.sum(packed_weights)) == len(doc_a) + len(doc_b) - 2
 
-    def scored(params, tokens, segment_ids, positions, *_):
-        laid = coordinates(segments=segment_ids, positions=positions)
-        return weighted_mean(*objective.token_scores(params, tokens, coordinates=laid)[:2])
+    scored = scored_by(objective)
 
     def alone(score):
         def mean(params, tokens, segment_ids, positions, *pieces):
