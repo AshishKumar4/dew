@@ -27,14 +27,7 @@ from dew.nn.dense import Dense
 from dew.nn.fake_quant import straight_through
 from dew.nn.flops import projection_flops
 from dew.nn.norms import RMSNorm
-from dew.nn.precision import (
-    accumulated,
-    at_least_fp32,
-    float32_dot_general,
-    float32_einsum,
-    float32_products,
-    sqrt_or_zero,
-)
+from dew.nn.precision import accumulated, at_least_fp32, float32_dot_general, float32_einsum, sqrt_or_zero
 from dew.nn.sharding import logical_axes
 
 # The reference floors the magnitude a projected copy is rescaled by
@@ -143,7 +136,7 @@ class _Coefficients(nn.Module):
             clipped = jnp.clip(kernel, -self.clip, self.clip)
             kernel = straight_through(kernel, clipped) if self.stored else clipped
         dtype = x.dtype if self.dtype is None else self.dtype
-        return accumulated(functools.partial(jnp.dot, precision=float32_products(dtype, self.precision)),
+        return accumulated(functools.partial(jnp.dot, precision=self.precision),
                            x.astype(dtype), kernel.astype(dtype))
 
 

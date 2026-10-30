@@ -1,10 +1,12 @@
 """The training step's position, which a module whose computation changes over a run reads (`progress`):
 an annealed coefficient, a schedule of its own.
 
-A run's loss supplies it (`dew.objectives.base.Objective._loss`, the updates the run committed before the
-step, `Step.committed`), in training and in its validation alike; a step the trainer traces otherwise,
-a custom one, supplies none, and a module that reads it there is refused, never handed a stand-in.
-Outside a run (evaluation, inference, serving) it is the run's end: no updates, past every anneal.
+A run's training loss supplies it (`dew.objectives.base.Objective._loss`, the updates the run committed
+before the step, `Step.committed`), and so does a derivative that runs the model again (node
+perturbation's estimate); a step the trainer traces otherwise, a custom one, supplies none, and a module
+that reads it there is refused, never handed a stand-in. Outside the training step it is the run's end, no
+updates and past every anneal: a validation's loss and its evaluation alike, as the model the run would
+hand on, and evaluation, inference and serving after it.
 """
 
 from __future__ import annotations

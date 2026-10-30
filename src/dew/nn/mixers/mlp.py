@@ -75,6 +75,8 @@ class MLPMixer(MixerBase):
     intermediate_size: int
     activation: str = "relu2"
     use_bias: bool = False
+    """Whether its projections add a bias: none by default, as Nemotron-H's published `mlp_bias: false`,
+    where Flax's Dense adds one."""
     mixture: Mixture | None = None
 
     def __post_init__(self):
