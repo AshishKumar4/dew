@@ -16,7 +16,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.sharding import Mesh
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import mosaic
+from dew.nn.kernels.templates import bundles, mosaic
 
 pytestmark = pytest.mark.kernel
 
@@ -25,6 +25,53 @@ INTERPRETED = plgpu.InterpretGPUParams()
 """Mosaic GPU's own interpreter, which models warpgroups, barriers and shared memory."""
 TILES = 3
 STAGES = 2
+
+
+def _column_stream(x, *, family_name: str, consumers: int, interpret):
+    family = bundles.named(family_name, x.dtype)
+    rows, steps = 64, 5
+    width = x.shape[-1]
+    resident = family.column_staging((rows, width), x.dtype, consumers)
+    streams = family.streams({'x': ((rows, width), x.dtype)}, STAGES, consumers,
+                             column_streams=('x',))
+
+    def entry(x_ref, streamed_ref, resident_ref):
+        def scoped(saved, *, streams):
+            views = {'x': (x_ref, lambda step: (step, 0))}
+            opened = family.opened(streams, views)
+
+            def consumer(role):
+                family.columns_loaded(x_ref.at[pl.ds(0, rows)], saved, issued=role == 0)
+                family.rows_summed(saved['parts'].at[role], resident_ref.at[role])
+
+                def step(at, slots, carry, accs):
+                    family.rows_summed(slots['x'].at[role], streamed_ref.at[at, role])
+                    return carry, accs
+
+                family.walk(family.fed(opened, views, 0, steps, role), ((step, 0, steps),), (), (),
+                            bool(interpret))
+
+            family.roles(consumers, consumer, lambda: family.stream(opened, views, 0, steps))
+
+        family.scoped(scoped, resident, streams=streams)
+
+    out = (jax.ShapeDtypeStruct((steps, consumers, rows), jnp.float32),
+           jax.ShapeDtypeStruct((consumers, rows), jnp.float32))
+    return family.kernel(entry, out_type=out, grid=(1,), grid_names=('programs',), consumers=consumers,
+                         interpret=interpret, reducing_warpgroups=consumers, name='column_stream')(x)
+
+
+@INTERPRETS
+@pytest.mark.parametrize(('family', 'consumers'), [('mma.sync', 1), ('wgmma', 2), ('wgmma.fed', 2)])
+def test_role_column_staging_streams_and_reduces_without_mixing_slots(family, consumers):
+    """Resident and streamed column partitions agree through two slots over five distinct steps."""
+    rows, steps, columns = 64, 5, 128 * consumers
+    values = (np.arange(rows * steps * columns).reshape(rows * steps, columns) % 7 - 3).astype(np.float32)
+    streamed, resident = _column_stream(jnp.asarray(values, jnp.bfloat16), family_name=family,
+                                        consumers=consumers, interpret=INTERPRETED)
+    expected = values.reshape(steps, rows, consumers, columns // consumers).sum(-1).transpose(0, 2, 1)
+    np.testing.assert_array_equal(streamed, expected)
+    np.testing.assert_array_equal(resident, expected[0])
 
 
 def _first_step(tile):

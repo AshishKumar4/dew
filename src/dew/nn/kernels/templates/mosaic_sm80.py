@@ -28,10 +28,10 @@ def _staging(block: tuple, swizzle: int | None) -> tuple:
     return swizzled(shape, dtype) if swizzle is None else mosaic.swizzle_transforms(dtype, swizzle)
 
 
-def swizzled(shape: tuple[int, int], dtype) -> tuple:
+def swizzled(shape: tuple[int, ...], dtype) -> tuple:
     """A `[rows, columns]` shared-memory tile's transforms: 8-row tiles as wide as the swizzle its row
     bytes allow, swizzled (bank-conflict-free ldmatrix), as jax's Ampere examples stage their operands."""
-    return mosaic.swizzle_transforms(dtype, plgpu.find_swizzle(shape[1] * jnp.dtype(dtype).itemsize * 8))
+    return mosaic.swizzle_transforms(dtype, plgpu.find_swizzle(shape[-1] * jnp.dtype(dtype).itemsize * 8))
 
 
 class Slots:
@@ -61,6 +61,7 @@ class Pipeline:
     stages: int
     swizzles: dict = dataclasses.field(default_factory=dict)
     """The swizzle a stream's tiles stage at where `Mma.streams` names one (`mosaic.swizzle_for`)."""
+    column_streams: tuple[str, ...] = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -223,9 +224,11 @@ class Mma(mosaic.Family):
         consumer(0)
 
     def streams(self, blocks: dict, stages: int, consumers: int, multicast: tuple[str, ...] = (),
-                swizzles: dict[str, int] | None = None):
+                swizzles: dict[str, int] | None = None, column_streams: tuple[str, ...] = ()):
         _one(consumers, clustered=bool(multicast))
-        return Pipeline(blocks, stages, dict(swizzles or {}))
+        blocks = {name: (mosaic._column_block(shape, consumers) if name in column_streams else shape, dtype)
+                  for name, (shape, dtype) in blocks.items()}
+        return Pipeline(blocks, stages, dict(swizzles or {}), column_streams)
 
     def lifetimes(self, streams: Pipeline) -> tuple[tuple, tuple]:
         # `emit_pipeline` allocates a walk's slots in its own scope.
@@ -235,7 +238,11 @@ class Mma(mosaic.Family):
     def opened(self, allocated, views: dict | None = None):
         if views is None:
             raise ValueError("a pipelined family's streams take their views where they open (its walk loads)")
-        return Streams(allocated, views)
+        opened = dict(views)
+        for name in allocated.column_streams:
+            ref, index = opened[name]
+            opened[name] = (ref.reshape(1, *ref.shape), lambda j, index=index: (0, *index(j)))
+        return Streams(allocated, opened)
 
     def stream(self, streams, views, lo, hi) -> None:
         del streams, views, lo, hi
