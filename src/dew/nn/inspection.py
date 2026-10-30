@@ -13,7 +13,6 @@ import contextlib
 import dataclasses
 import fnmatch
 from collections.abc import Callable, Iterator, Mapping
-from typing import Any
 
 import flax.linen as nn
 import jax
@@ -98,7 +97,7 @@ class Watched:
     histogram: bool = False
 
 
-def called_with(model: nn.Module, variables: Mapping, run: Callable[[], Any]) -> tuple[tuple, dict]:
+def called_with(model: nn.Module, variables: Mapping, run: Callable[[], jax.Array]) -> tuple[tuple, dict]:
     """The arguments `run` first calls `model` over `variables` with, as its caller made them: for a
     forward an objective runs inside a transform, the inputs `Objective.watched_forward` reruns it on.
     Only that call counts, identified by its weights (it binds the arrays of `variables` and no others,
