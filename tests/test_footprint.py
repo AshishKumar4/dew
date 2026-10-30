@@ -164,3 +164,46 @@ def test_a_gpu_gives_each_gemm_the_workspace_xla_hands_it(generation, workspace)
     (gpu,) = compile_only_gpus(generation, 1, 1 << 30)
     assert gemm_workspace(gpu) == workspace
     assert gemm_workspace(jax.devices("cpu")[0]) == 0
+
+
+def test_a_loops_stacked_results_are_held_beside_each_turns_own():
+    """A loop's stacked results are held whole beside what each turn holds while it runs: ten turns, each
+    multiplying twice, hold the ten results and a turn's two products at once."""
+    from dew.training.footprint import peak_bytes
+
+    square = jax.ShapeDtypeStruct((8, 8), jnp.float32)
+
+    def stacked(rows, weights):
+        def turn(carried, _):
+            return carried, (carried @ weights) @ weights
+        return jax.lax.scan(turn, rows, None, length=10)[1]
+
+    program = jax.make_jaxpr(stacked)(square, square).jaxpr
+    assert peak_bytes(program, "gpu", 0) == (10 + 2) * 8 * 8 * 4
+
+
+def test_a_transposed_input_returned_flat_is_a_copy():
+    """A transpose of an input whose layout is fixed reorders its elements into a buffer of their own,
+    which a flattening of it returned holds, where a transpose of a value the program computes is laid
+    out by XLA as its reader needs (a returned gradient's)."""
+    from dew.training.footprint import peak_bytes
+
+    rows = jax.ShapeDtypeStruct((8, 16), jnp.float32)
+    program = jax.make_jaxpr(lambda rows: rows.T.reshape(-1))(rows).jaxpr
+    assert peak_bytes(program, "gpu", 0) == 8 * 16 * 4
+
+
+def test_a_product_too_small_for_cublas_takes_no_workspace():
+    """XLA hands a cuBLAS workspace to the products it rewrites to cuBLAS, not to one too small for it,
+    whose non-contracting sizes summed times its contracting size fall under
+    `xla_gpu_gemm_rewrite_size_threshold` (100 by default), which its own emitters compute."""
+    small, large = jax.ShapeDtypeStruct((2, 4), jnp.float32), jax.ShapeDtypeStruct((64, 64), jnp.float32)
+
+    def product(params, rows):
+        return jnp.sum(rows @ params), ()
+
+    for shape, workspace in ((small, 0), (large, 1 << 20)):
+        rows = jax.ShapeDtypeStruct((shape.shape[0], shape.shape[0]), jnp.float32)
+        with_workspace = gradient_peak(product, shape, (rows,), platform="gpu", workspace=1 << 20)
+        without = gradient_peak(product, shape, (rows,), platform="gpu", workspace=0)
+        assert with_workspace - without == workspace
