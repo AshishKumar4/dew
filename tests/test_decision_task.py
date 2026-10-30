@@ -10,7 +10,7 @@ import jax
 import numpy as np
 import pytest
 from decision_support import decision_rows
-from reference_error import as_given, assert_as_exact, assert_as_exact_as_the_reference
+from reference_error import as_given, assert_as_exact, assert_as_exact_as_the_reference, dew_programs
 from steady_state import steady_state
 
 from dew.artifacts import Decisions
@@ -184,6 +184,59 @@ def test_a_small_budget_splits_passes_without_moving_a_logit(decide):
                                          np.concatenate([reference[key] for key in keys]),
                                          np.concatenate([reference[f"{key}/f64"] for key in keys]),
                                          "budgeted logits")
+
+
+def drawn_about(variables):
+    """A draw of weights about `variables`, each leaf moved by a few percent, as a seed keys it."""
+    def draw(seed):
+        key = jax.random.key(seed)
+        return (jax.tree.map(lambda leaf: leaf * (1 + 0.05 * jax.random.normal(key, np.shape(leaf))),
+                             variables),)
+    return draw
+
+
+PACKED_SEEDS = 16
+"""Check 1's declared seeds for a packed pass against its rows alone."""
+
+
+def every_case_row(task: Decide) -> list:
+    """Every case's questions about one short state, as `task` lays them out, a row a question: rows a
+    window holds several of."""
+    return [row for request in CASES.values()
+            for row in task._encoded("A short note.", {name: Question.from_wire(wire)
+                                                       for name, wire in request["questions"].items()})]
+
+
+def test_a_pass_packs_rows_into_windows_and_answers_each_as_it_is_alone(decide):
+    """A pass packs its rows first-fit into windows, as a run's windows hold them (`Decide.packing`),
+    several a window and each attending its own tokens alone: each row's logits on par with the row
+    scored alone, a pass of its own, from the float64 task alone (check 1), over weights drawn about the
+    task's, the pass's rows in fewer windows than rows."""
+    # Windows of the encoder's 256 positions, which hold several of these rows each.
+    task = replace(decide, layout=replace(decide.layout, max_len=256))
+    rows = every_case_row(task)
+    plan = task.planned()
+    assert all(plan.add(row) for row in rows) and len(set(plan.windows())) < len(rows)
+    wide = replace(Decide.from_pretrained(TINY, dtype="float64", param_dtype="float64", attention_impl="xla"),
+                   layout=task.layout)
+
+    draw = drawn_about(decide.variables)
+
+    def real(scored: list[np.ndarray]) -> np.ndarray:
+        """Each row's questions' logits over their own options, the padding slots left out."""
+        return np.concatenate([logits[slot, :len(laid.options)]
+                               for row, logits in zip(rows, scored, strict=True)
+                               for slot, laid in enumerate(row.questions)])
+
+    @dew_programs
+    def packed(variables) -> np.ndarray:
+        return real(task.scored(rows, variables))
+
+    def alone(task: Decide):
+        return lambda variables: real([task.scored([row], variables)[0] for row in rows])
+
+    assert_as_exact(packed, dew_programs(alone(task)), draw, "packed pass", seeds=PACKED_SEEDS,
+                    truth_fn=alone(wide))
 
 
 def test_a_tournament_takes_each_group_winner_to_the_final(decide):
@@ -542,10 +595,12 @@ def test_a_task_under_lora_saves_its_factors_merged_and_reads_back_the_same(deci
     adapter."""
     from dew.batch import part
     from dew.decision.model import DecisionModel
+    from dew.inference.projections import unpacked
     from dew.lora import LoRA
     from dew.objectives.base import joined
 
-    backbone = part(decide.variables, "backbone")
+    # An adapter binds the model's own tree, the projections a served task packs split back.
+    backbone = unpacked(decide.model.backbone, part(decide.variables, "backbone"))
     adapter = LoRA(rank=4, modules=("q_proj", "v_proj")).apply(decide.model.backbone, backbone, key=1)
     moved = jax.tree_util.tree_map_with_path(
         lambda path, leaf: leaf + 0.05 if "lora_B" in jax.tree_util.keystr(path) else leaf, adapter.variables)
@@ -678,10 +733,7 @@ def test_a_task_whose_weights_span_a_mesh_scores_on_that_mesh(decide):
     def spread(variables) -> Decide:
         return replace(task, variables=jax.device_put(variables, NamedSharding(mesh, PartitionSpec())))
 
-    def draw(seed):
-        key = jax.random.key(seed)
-        return (jax.tree.map(lambda leaf: leaf * (1 + 0.05 * jax.random.normal(key, np.shape(leaf))),
-                             decide.variables),)
+    draw = drawn_about(decide.variables)
 
     @as_given
     def alone(variables) -> np.ndarray:
@@ -702,9 +754,9 @@ def test_a_task_whose_weights_span_a_mesh_scores_on_that_mesh(decide):
     assert scores["accuracy"] == alone["accuracy"]
 
 
-def trained_runs(decide, tmp_path, count: int, *, name: str = "run") -> list[str]:
+def trained_runs(decide, tmp_path, count: int, *, name: str = "run", examples=None) -> list[str]:
     """`count` runs of the task trained apart, one more step each, from one head (the task's own, held):
-    each a checkpoint of its own, as averaging reads them."""
+    each a checkpoint of its own, as averaging reads them, over `examples`, every case's where None."""
     import optax
 
     from dew.checkpoints import Checkpoints
@@ -714,7 +766,8 @@ def trained_runs(decide, tmp_path, count: int, *, name: str = "run") -> list[str
     runs = []
     for index in range(count):
         objective = DecisionObjective(decide)
-        data = decision_rows(answered() * 2, 8, answered(), objective=objective.data())
+        rows = answered() if examples is None else examples
+        data = decision_rows(rows * 2, 8, rows, objective=objective.data())
         directory = str(tmp_path / f"{name}{index}")
         checkpoints = Checkpoints(directory, keep=1)
         Trainer(objective, optax.adam(1e-3), key=index, checkpoints=checkpoints).fit(
@@ -754,6 +807,18 @@ def test_runs_that_share_a_head_average_as_the_checkpoints_average_them_and_refi
     calibrated = Decide.averaged(runs, calibrate_on=held_out)
     assert calibrated.calibration != Calibration()
     assert calibrated.calibration == two.calibrated(held_out).calibration
+
+
+def test_runs_whose_data_hold_other_widths_average_padded_to_the_widest(decide, tmp_path):
+    """The options a pass pads to are no part of a run's weights (`DecideSettings.options`): runs whose
+    data hold other widths average, the average padding each pass to the widest either recorded."""
+    narrow = [Example("a short state", {"q": Choice("Which?", ["one", "two"])}, {"q": "one"})] * 4
+    runs = (trained_runs(decide, tmp_path, 1)
+            + trained_runs(decide, tmp_path, 1, name="narrow", examples=narrow))
+    budgets = [Decide.from_run(run).budget for run in runs]
+    assert budgets[0].options is not None and budgets[1].options == 2 < budgets[0].options
+    average = Decide.averaged(runs).budget
+    assert average.options == budgets[0].options
 
 
 def test_runs_of_other_task_settings_or_a_single_run_do_not_average(decide, tmp_path):

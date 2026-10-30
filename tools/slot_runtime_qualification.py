@@ -270,8 +270,8 @@ class ObservedScoring:
         asked = tuple((name, len(question["criteria"])) for name, question in body["questions"].items())
         return Scored(admitted.rows, (asked, admitted.payload))
 
-    def fits(self, rows):
-        return self.task.fits(rows)
+    def planned(self):
+        return self.task.planned()
 
     def compile(self, variables):
         return self.task.compile(variables)

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import ClassVar
 
 import grain.python as pygrain
@@ -120,12 +120,54 @@ class FirstFitPacked(pygrain.IterDataset[Batch]):
         return _FirstFitPacking(self._documents.__iter__(), self._pack)
 
 
+def window_fields(pack: Pack) -> tuple[dict[str, int], tuple[str, ...]]:
+    """Each field a window of `pack` holds and its length, and the fields a document's sizes are counted
+    along, each with its segment ids and positions: the first token field, and each along an axis of
+    its own (`PackedWindows`)."""
+    return (dict.fromkeys(pack.fields, pack.seq_len) | dict(pack.along),
+            (pack.fields[0], *(name for name, _ in pack.along)))
+
+
+def first_fit_windows(documents: Sequence[Batch], pack: Pack) -> list[tuple[Batch, tuple[int, ...]]]:
+    """`documents`, each as `pack` reads one (`Pack.document`), packed first-fit into windows in the
+    order given, as the stream's packer packs them (`FirstFitPacked`): `pack.bins` windows open at a
+    time, a document that fits none emitting every one that holds a document and starting afresh.
+    Each window, its fields by name, with the indices of the documents it holds in the order it laid
+    them, which its segment ids number from 1."""
+    lengths, paired = window_fields(pack)
+    placement = FirstFit([lengths[name] for name in paired], pack.bins, pack.segments)
+    emitted: list[tuple[Batch, tuple[int, ...]]] = []
+    laid: PackedWindows | None = None
+    held: list[list[int]] = [[] for _ in range(pack.bins)]
+
+    def emit() -> None:
+        assert laid is not None
+        for window, batch in enumerate(laid.windows()):
+            emitted.append((dict(sorted(batch.items())), tuple(held[window])))
+
+    for index, document in enumerate(documents):
+        sizes = [entries(document[name]) for name in paired]
+        chosen = placement.place(sizes)
+        if chosen is None:
+            emit()
+            placement.restart()
+            laid, held = None, [[] for _ in range(pack.bins)]
+            chosen = placement.place(sizes)
+            assert chosen == 0
+        if laid is None:
+            laid = PackedWindows(document, lengths, paired, pack.bins)
+        laid.add(chosen, document)
+        held[chosen].append(index)
+    if laid is not None:
+        emit()
+    return emitted
+
+
 class _FirstFitPacking(pygrain.DatasetIterator[Batch]):
     def __init__(self, documents: pygrain.DatasetIterator[Batch], pack: Pack):
         super().__init__(documents)
         self._documents, self._pack = documents, pack
-        self._lengths = dict.fromkeys(pack.fields, pack.seq_len) | dict(pack.along)
-        self._paired = (pack.fields[0], *(name for name, _ in pack.along))
+        self._lengths, self._paired = window_fields(pack)
         self._placement = FirstFit([self._lengths[name] for name in self._paired], pack.bins, pack.segments)
         self._restart(documents.get_state())
         self._counter = 0

@@ -1,0 +1,9 @@
+{
+ "commit": "7f03fae28e2a4f541e83c113ba9dd422dc2e73c0",
+ "kinds": [
+  "decision",
+  "diffusion",
+  "jepa",
+  "lm"
+ ]
+}
