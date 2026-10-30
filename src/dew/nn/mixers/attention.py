@@ -398,8 +398,8 @@ class CausalSelfAttention(nn.Module):
                 # K2 Horizon's MoVA: the values are routed experts' projections (`RoutedValues`).
                 self.experts = RoutedValues(
                     self.ctx.value_experts, self.ctx.emb_features, self.ctx.num_kv_heads * self.value_dim,
-                    init_std=self.ctx.init_std, dtype=self.ctx.dtype, precision=self.ctx.precision,
-                    name='experts')
+                    mixture=self.ctx.mixture, init_std=self.ctx.init_std, dtype=self.ctx.dtype,
+                    precision=self.ctx.precision, name='experts')
             elif not self.ctx.k_eq_v:
                 self.v_proj = dense(projections['v_proj'][1], name='v_proj')
         if 'gate_proj' in projections:

@@ -471,10 +471,10 @@ def test_a_cut_loop_trains_the_layers_before_it_through_the_input_every_pass_rea
                               uncut['layers_1']['self_attn']['down_proj']['kernel'])
 
 
-def test_a_cut_loop_keeps_no_residual_of_the_passes_before_its_cut():
-    """The cut is static: at six passes with the last one's gradient alone, the gradient's compiled
-    program keeps none of the five passes' residuals before it, so it holds fewer temporary bytes than
-    the uncut loop's, whose every pass runs its backward."""
+def test_a_cut_loops_backward_memory_falls_with_its_backprop_steps():
+    """The cut is static (`backprop_steps`): at six passes the gradient's compiled program keeps no
+    residual of a pass before the cut, so its temporary bytes fall as the passes it trains through do,
+    from every pass to three to the last alone."""
     loaded = load()
     ids, cotangent = REFERENCE['input_ids'], REFERENCE['cotangent']
 
@@ -487,7 +487,8 @@ def test_a_cut_loop_keeps_no_residual_of_the_passes_before_its_cut():
         compiled = jax.jit(jax.grad(loss)).lower(loaded.variables['params']).compile()
         return compiled.memory_analysis().temp_size_in_bytes
 
-    assert temporaries(1) < temporaries(None)
+    held = [temporaries(steps) for steps in (None, 3, 1)]
+    assert held[0] > held[1] > held[2], held
 
 
 PROJECTIONS = ('q_proj', 'k_proj', 'v_proj', 'o_proj', 'g_proj', 'gate_proj', 'up_proj', 'down_proj')

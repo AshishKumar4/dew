@@ -305,7 +305,8 @@ with or without `text_only`. A run passes both through `--source.text-only` and
 `--source.prediction-depths` (`RunConfig.source`), whatever kind of run it is, the load's
 `modeling_overrides` through `--source.attention`, each layer kind causal or block_bidirectional,
 and its differential extension through `--source.dex`, the `DifferentialExtension`'s record as JSON
-(`dew.nn.dex`); a diffusion pipeline, which no override reaches, refuses them. `dew.pipeline` takes
+(`dew.nn.dex`), and `scan_layers` through `--source.scan-layers`, which runs a periodic stack's like
+layers, and a looped stack's later passes, as one scanned body (`Pretrained.load`); a diffusion pipeline, which no override reaches, refuses them. `dew.pipeline` takes
 the same choices for a source as `options=SourceOptions(...)`, and refuses them for a run directory,
 whose record holds its own.
 
