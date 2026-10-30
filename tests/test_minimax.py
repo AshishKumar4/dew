@@ -1,23 +1,16 @@
 """MiniMax-Text-01 and MiniMax-M1 (ledger 850): tools/minimax_reference.py writes minimax-tiny from the
 release's own remote code, whose logits tests/test_hf_reference_decoders.py holds Dew's to; this file
-holds the family's own checks: both spellings of a release read as one model, a model writes back as a
-`minimax` config where transformers computes it as Dew does and is refused where it would not, and a
-config Dew would compute otherwise is refused. tests/test_mixers.py runs the
-lightning layer among the registry's mixers."""
+holds the family's own checks: both spellings of a release read as one model, its export is refused
+where no other runtime would compute it, and a config Dew would compute otherwise is refused.
+tests/test_mixers.py runs the lightning layer among the registry's mixers."""
 
 import json
 from pathlib import Path
 
-import jax
-import numpy as np
 import pytest
-from reference_error import as_given, assert_as_exact
 
 from dew.interop import Pretrained, PretrainedDecoder
 from dew.interop.hf_decoders import translate_config
-from dew.interop.sources import load_shards
-from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.registry import from_record
 
 ROOT = Path(__file__).parent / 'fixtures' / 'hf'
 TINY = ROOT / 'minimax-tiny'
@@ -41,45 +34,14 @@ def test_a_releases_own_config_and_its_transformers_config_read_as_one_model():
     assert len(set(lightning)) == len(lightning) == 70
 
 
-def test_the_releases_geometry_writes_no_config_transformers_would_misread(tmp_path):
-    """minimax-tiny turns half of each head over six heads, as the releases turn half of each of 64,
-    which transformers' MiniMax does not compute (it turns every dimension, its slopes a power of two's):
-    its export is refused rather than written as a `minimax` config that would open as another model."""
+def test_a_minimax_model_writes_no_checkpoint_another_runtime_would_misread(tmp_path):
+    """No runtime outside Dew computes MiniMax as its release does (transformers' MiniMax turns every
+    dimension and scales the lightning rates otherwise; the release's code does not import under
+    transformers 5), so minimax-tiny's export is refused rather than written as a checkpoint that would
+    open as another model."""
     loaded = load()
     with pytest.raises(ValueError):
         PretrainedDecoder.from_model(loaded.model, loaded.variables).save(tmp_path)
-
-
-EXPORT_SEEDS = 8
-"""The export's declared draws of ids against transformers' MiniMax read of it (check 1), sized by
-`seeds_for` paired with Dew's logits on the CPU."""
-
-
-def test_a_model_transformers_computes_writes_back_as_minimax_and_reads_on_par(tmp_path):
-    """A MiniMax of four heads turning every dimension, minimax-tiny's config otherwise, at Dew's own
-    initialization, writes back as a `minimax` config with every tensor under the releases' names
-    (`block_sparse_moe`, `qkv_proj`, `output_gate`), which transformers' MiniMaxForCausalLM reads on par
-    with Dew from its float64 forward over drawn ids (check 1)."""
-    from tools.decoder_export_reference import Case, reference_logits
-
-    config = {**released('minimax-tiny'), 'num_attention_heads': 4, 'rotary_dim': 8}
-    model = from_record(CausalTransformer, {**translate_config(config), 'attention_impl': 'reference'})
-    ids = np.load(TINY / 'input_ids.npy')
-    variables = model.init(jax.random.key(0), ids)
-    PretrainedDecoder.from_model(model, variables).save(tmp_path)
-    assert json.loads((tmp_path / 'config.json').read_text())['model_type'] == 'minimax'
-    assert set(load_shards(tmp_path)) == set(load_shards(TINY))
-    case = Case('minimax', 'minimax-tiny',
-                derived=('slope_rate', 'query_decay', 'key_decay', 'diagonal_decay'))
-
-    def draw(seed):
-        return (np.random.default_rng(seed).integers(0, config['vocab_size'], ids.shape).astype(np.int32),)
-
-    def read(wide):
-        return as_given(lambda ids: reference_logits(case, tmp_path, np.asarray(ids), wide=wide))
-
-    assert_as_exact(lambda ids: model.apply(variables, ids), read(wide=False), draw, 'MiniMax export',
-                    seeds=EXPORT_SEEDS, truth_fn=read(wide=True))
 
 
 @pytest.mark.parametrize('field, value', [('mlp_alpha_factor', 2.0), ('shared_intermediate_size', 8),

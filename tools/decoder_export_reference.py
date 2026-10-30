@@ -81,12 +81,6 @@ class Case:
     otherwise. Torch and JAX can choose different valid indexer sets at
     equal scores. The V4 MTP-enabled step preserves the observed tied-score
     failure at 5e-3; a smaller step is not evidence resolving that failure.
-
-    `derived` names the buffers the reference class computes at its own
-    initialization and its released checkpoints do not hold, whose absence
-    from an export its load reports as missing: transformers' MiniMax
-    lightning tables (`slope_rate` and the three decays,
-    modeling_minimax.py:137-143, rebuilt by `_init_weights`, :606-613).
     """
 
     name: str
@@ -98,7 +92,6 @@ class Case:
     conversion_type: str | None = None
     rate: float = RATE
     orders: bool = False
-    derived: tuple[str, ...] = ()
 
 
 CASES = (
@@ -327,8 +320,6 @@ def reference_model(case: Case, directory: Path, dtype=None):
     if not isinstance(loaded, tuple) or len(loaded) != 2:
         raise TypeError("output_loading_info must return a model and its loading report")
     model, report = loaded
-    report = {**report, "missing_keys": [name for name in report.get("missing_keys", [])
-                                         if name.rpartition(".")[2] not in case.derived]}
     for category in ("missing_keys", "mismatched_keys", "error_msgs"):
         if report.get(category):
             raise ValueError(f"reference load {category}: {report[category]}")

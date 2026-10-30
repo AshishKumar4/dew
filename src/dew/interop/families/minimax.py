@@ -8,14 +8,13 @@ MiniMaxAI/MiniMax-Text-01 a7351bf2, :1024-1058; `BlockWiring.normed_residual`). 
 rotate the first `rotary_dim` of each head (:482-489, :430-437); transformers 5.16.1's MiniMax, which
 reads the `minimax` spelling of the same releases, turns every dimension of a head instead
 (`MiniMaxRotaryEmbedding`, modeling_minimax.py:266-310), and Dew reads the releases as their own code
-computes them. A model writes back as a `minimax` config where transformers' MiniMax computes it as
-Dew does, and is refused otherwise, naming what transformers would compute instead: a partial rotary
-(every release's), a block without the postnorm (which transformers builds whatever the config says), or
-heads past a power of two (whose slopes transformers takes from the power-of-two formula,
-`get_slope_rate`). The release's own code computes the releases, but transformers 5 cannot import it
-(`is_torch_fx_available`), and its softmax layers drop a padded row's mask (ledgers 2534, 2535). A
-lightning layer's rates follow its place in the stack (`lightning_rates`), so each is a kind of its own,
-`linear_attention_{index}`.
+computes them. No runtime outside Dew computes them so, so a model of this family writes no Hugging
+Face checkpoint: transformers' MiniMax turns every dimension of a head and scales each layer's rates by
+`1 - layer / (layers - 1 + 1e-5) + 1e-5` (`get_slope_rate`), its slopes a power of two's whatever the
+heads, and the release's own code does not import under transformers 5 (`is_torch_fx_available`) and
+drops a padded row's mask in its softmax layers (ledgers 2534, 2535); its export is refused, naming that.
+A lightning layer's rates follow its place in the stack (`lightning_rates`), so each is a kind of its
+own, `linear_attention_{index}`.
 
 The `minimax` configs spell the layer pattern as `layer_types` and the factors as
 `{full_attn,linear_attn,mlp}_{alpha,beta}_factor`; the releases' own as `attn_type_list` (0 for a
@@ -35,12 +34,10 @@ from dew.interop.decoder_parts import (
     DecoderFields,
     RopeSpelling,
     base_config,
-    decoder_tensors,
     kind_mixers,
     kinds_of,
     read_partial_rope,
     refuse,
-    renamed_name,
     renamed_path,
     softmax_top_k,
 )
@@ -179,34 +176,11 @@ def _lightning(model: CausalTransformer) -> list[LightningAttentionMixer]:
 
 
 def _minimax_export(model: CausalTransformer) -> Mapping[str, object]:
-    """The `minimax` config of a model transformers' MiniMax computes as Dew does: its layers' attention
-    by kind, the factors and the lightning layers' chunk; a model it would compute otherwise is refused
-    (the module docstring)."""
-    rotary = model.partial_rotary_factor or 1.0
-    if rotary != 1.0 or not model.normed_residual or model.num_heads & (model.num_heads - 1):
-        raise ValueError(
-            f"transformers' MiniMax turns every dimension of a head, joins each sublayer to its normed input "
-            f"and takes a power of two's slopes; this model turns {rotary} of each head, "
-            f"{'joins' if model.normed_residual else 'does not join'} its normed inputs and has "
-            f"{model.num_heads} heads, so a minimax config of it would open as another model (ledger 2534)")
-    mixers = _lightning(model)
-    chunks = {mixer.block_size for mixer in mixers}
-    if len(chunks) > 1:
-        raise ValueError(f"the lightning layers run chunks of {sorted(chunks)} tokens, and the config "
-                         "states one")
-    mixture = model.mixture
-    return {
-        'layer_types': ['linear_attention' if isinstance(model.kind_of(kind).mixer, LightningAttentionMixer)
-                        else 'full_attention' for kind in model.per_layer_types],
-        'postnorm': True,
-        **dict.fromkeys(_FACTORS['alpha'], model.stream_multiplier),
-        **dict.fromkeys(_FACTORS['beta'], model.residual_multiplier),
-        'rotary_dim': model.features_per_head,
-        'block_size': chunks.pop() if chunks else _BLOCK,
-        'num_local_experts': None if mixture is None else mixture.experts,
-        'num_experts_per_tok': None if mixture is None else mixture.top_k,
-        'shared_intermediate_size': 0,
-    }
+    """No config: no runtime outside Dew computes this family as its release does (the module docstring),
+    so a Hugging Face checkpoint of it would open as another model."""
+    raise ValueError("MiniMax-Text-01 and M1 write no Hugging Face checkpoint: transformers' MiniMax turns "
+                     "every dimension of a head and scales its lightning rates otherwise, and the release's "
+                     "own code does not import under transformers 5 (ledgers 2534, 2535)")
 
 
 MINIMAX = DecoderFamily(
@@ -217,9 +191,6 @@ MINIMAX = DecoderFamily(
     'MiniMaxForCausalLM',
     _minimax_export,
     weight_path=partial(renamed_path, MOE_NAMES, layer_leaves=_LIGHTNING_LEAVES),
-    export_path=partial(renamed_name, MOE_NAMES, layer_leaves=_LIGHTNING_LEAVES),
-    # Every leaf under its name, the lightning layers' among them (the dense encoder writes attention alone).
-    export_weights=decoder_tensors,
     preserve_source_layout=False,
     padding_idx=True,
     # MiniMaxConfig's defaults (configuration_minimax.py), the releases' own class's too.
