@@ -329,6 +329,12 @@ def _run(tree: Path, python: Path, tool: str, argv: list[str], newer: Path, time
     return subprocess.run(command, cwd=tree, env=env, capture_output=True, text=True, timeout=timeout)
 
 
+def claimed(row: Row) -> bool:
+    """A row `--claim` requires: an external reference's comparison on the device it names. A step sized
+    for one device (a fine-tune's) is limited to it too, and off it unmeasured, which fails no claim."""
+    return row.hardware is not None and row.head_only
+
+
 def hardware_status(row: Row, device_kind: str) -> str | None:
     """A hardware-limited row is unmeasured off its named device, never silently passed."""
     if row.hardware is not None and row.hardware not in device_kind:
@@ -356,7 +362,7 @@ def measure(tree: Path, python: Path, args: argparse.Namespace, newer: Path, is_
             external = all(row.head_only for row in probe.rows)
             if external and not is_head:
                 continue
-            claiming = args.claim and any(row.hardware for row in probe.rows)
+            claiming = args.claim and any(map(claimed, probe.rows))
             if args.only and not claiming and not any(word in name for name in names for word in args.only):
                 continue
             if not first and all(row.first_round for row in probe.rows):
@@ -412,7 +418,7 @@ def run(args: argparse.Namespace) -> int:
             unbuilt[name] = f"not run: {missing}"
     claiming = getattr(args, "claim", False)
     rows = [row for row in BATTERY if not args.only or any(word in row.name for word in args.only)
-            or (claiming and row.hardware)]
+            or (claiming and claimed(row))]
     results = {"base": base, "head": head, "rounds": args.rounds, "rows": [row.__dict__ for row in rows],
                "samples": {base: [], head: []}, "claim": claiming, "head settings": settings,
                "environments": {name: str(python.parent.parent) for name, python in pythons.items()},
@@ -476,11 +482,12 @@ def reference_verdict(head: list) -> tuple[str, dict]:
     return "passed", numbers
 
 
-def verdict(row: Row, base: list, head: list) -> tuple[str, dict]:
+def verdict(row: Row, base: list, head: list, noise: float = 0.0) -> tuple[str, dict]:
     """Whether `row` regressed from the `base` samples to the `head` ones, and the numbers that say so.
 
     A row moves when its median moves by more than the larger of the two trees' spreads (at
-    least FLOOR) and the two trees' samples do not overlap at all. With three rounds each, the
+    least FLOOR, and at least the row's calibrated `noise`) and the two trees' samples do not
+    overlap at all. With three rounds each, the
     samples separate by chance 1 time in 20 when nothing changed (1 / C(6, 3)), and the band
     lowers that further; it is also the smallest change the row can see. A row the base cannot
     run in any round (a tree older than its tool) is not compared; one the base runs and the head
@@ -506,7 +513,7 @@ def verdict(row: Row, base: list, head: list) -> tuple[str, dict]:
 
     def spread(xs):
         return (max(xs) - min(xs)) / statistics.median(xs)
-    band = max(spread(base), spread(head), row.floor)
+    band = max(spread(base), spread(head), row.floor, noise)
     change = worse * (statistics.median(head) - statistics.median(base)) / statistics.median(base)
     separated = (min(head) > max(base)) if worse > 0 else (max(head) < min(base))
     faster = (max(head) < min(base)) if worse > 0 else (min(head) > max(base))
@@ -516,26 +523,34 @@ def verdict(row: Row, base: list, head: list) -> tuple[str, dict]:
 
 
 def report(args: argparse.Namespace) -> int:
+    """The verdict table of a run's results, 1 when the head failed a row. With `--calibration`, each row's
+    band is at least its null noise, how far one tree's median moved against itself; a row whose noise
+    passes its floor cannot see a change of the floor's size and says so (insensitive), never widened in
+    silence. With `--verdicts`, each row's state and numbers as JSON, for a runner to act on."""
     results = json.loads(Path(args.results).read_text())
+    calibrated = (json.loads(Path(args.calibration).read_text())["noise"]
+                  if getattr(args, "calibration", None) else {})
     base, head = results["base"], results["head"]
     # A round a run never reached counts as unmeasured, so an interrupted run is partial.
     rounds = results.get("rounds", max(map(len, results["samples"].values())))
     samples = {name: [*taken, *[{}] * (rounds - len(taken))] for name, taken in results["samples"].items()}
     lines = [f"| row | unit | {base} | {head} | change | band | verdict |",
              "|---|---|---:|---:|---:|---:|---|"]
-    failed = []
+    failed, verdicts = [], {}
     claiming = getattr(args, "claim", False) or results.get("claim", False)
     if claiming:
         included = {row["name"] for row in results["rows"]}
         failed.extend(f"{row.name} (required hardware row omitted)" for row in BATTERY
-                      if row.hardware and row.name not in included)
+                      if claimed(row) and row.name not in included)
     for spec in results["rows"]:
         row = Row(**spec)
         taken = 1 if row.first_round else rounds
+        noise = calibrated.get(row.name, 0.0)
         state, numbers = verdict(row, [s.get(row.name) for s in samples[base][:taken]],
-                                 [s.get(row.name) for s in samples[head][:taken]])
+                                 [s.get(row.name) for s in samples[head][:taken]], noise)
+        verdicts[row.name] = {"state": state, "gated": row.gated, "insensitive": noise > row.floor, **numbers}
         if (state in ("broken", "incomplete", "partial", "failed") or (state == "regressed" and row.gated)
-                or (claiming and row.hardware and state in
+                or (claiming and claimed(row) and state in
                     ("not measured on this hardware", "not compared"))):
             failed.append(f"{row.name} ({state})")
         if not row.gated:
@@ -543,6 +558,8 @@ def report(args: argparse.Namespace) -> int:
         if state.startswith("partial"):
             state += " (" + ", ".join(f"{tree} {count} of {rounds} rounds unmeasured"
                                       for tree, count in numbers["unmeasured rounds"].items()) + ")"
+        if noise > row.floor:
+            state = f"{state}, insensitive (null noise {noise:.1%} over its {row.floor:.0%} floor)"
         cells = (["-"] * 4 if "base" not in numbers else
                  [f"{numbers['base']:.2f}", f"{numbers['head']:.2f}", f"{numbers['change']:+.1%}",
                   f"{numbers['band']:.1%}"])
@@ -565,6 +582,8 @@ def report(args: argparse.Namespace) -> int:
     print(table)
     if args.table:
         Path(args.table).write_text(table)
+    if getattr(args, "verdicts", None):
+        Path(args.verdicts).write_text(json.dumps({"rows": verdicts, "failed": failed}, indent=1))
     if failed:
         print(f"failed: {', '.join(failed)}")
     return 1 if failed else 0
@@ -585,7 +604,7 @@ def main() -> int:
     running.add_argument("--torch-python", default="",
                          help="pinned reference interpreter for the Qwen3.5 row")
     running.add_argument("--claim", action="store_true",
-                         help="require every hardware row, including under --only")
+                         help="require every reference row on its hardware, including under --only")
     running.add_argument("--only", nargs="*", default=[],
                          help="measure only the rows whose names hold one of these words")
     running.add_argument("--head-env", action="append", default=[], metavar="NAME=VALUE",
@@ -595,7 +614,11 @@ def main() -> int:
     reporting.add_argument("results")
     reporting.add_argument("--table")
     reporting.add_argument("--claim", action="store_true",
-                           help="fail if a required hardware row was unmeasured")
+                           help="fail if a reference row was unmeasured on its hardware")
+    reporting.add_argument("--calibration",
+                           help='JSON {"noise": {row: fraction}}: each row\'s null noise, the least band it '
+                                "is judged by")
+    reporting.add_argument("--verdicts", help="where each row's state and numbers are written as JSON")
     args = parser.parse_args()
     with contextlib.suppress(BrokenPipeError):
         return run(args) if args.operation == "run" else report(args)

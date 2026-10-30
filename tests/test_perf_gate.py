@@ -13,6 +13,9 @@ import pytest
 from tool_support import load
 
 ROOT = Path(__file__).resolve().parents[1]
+STANDING_IN = "NVIDIA A100-SXM4-80GB"
+"""The device the stood-in tools report: a row limited to another (an H100's fine-tune) is not measured
+on it."""
 
 
 @pytest.fixture(scope="module")
@@ -32,6 +35,41 @@ def test_the_report_fails_on_a_broken_row_and_not_on_an_ungated_one(gate, tmp_pa
     (tmp_path / "gate.json").write_text(json.dumps(results))
     monkeypatch.setattr(sys, "argv", ["perf_gate.py", "report", str(tmp_path / "gate.json")])
     assert gate.main() == code
+
+
+def test_a_row_is_judged_by_its_calibrated_noise_and_a_row_noisier_than_its_floor_says_so(
+        gate, tmp_path, monkeypatch, capsys):
+    """With a calibration, a row's band is at least its null noise (one tree against itself): a 4% slower
+    head regresses a row whose noise is 1%, and on a row whose noise is 6% it is level, the row named
+    insensitive since a change of its 2% floor is beneath its noise. A 10% slower head still regresses that
+    row: insensitive widens the band, never drops the row."""
+    rows = [gate.Row("quiet", "ms", "").__dict__, gate.Row("loud", "ms", "").__dict__]
+
+    def judged(slower: float) -> tuple[int, str]:
+        results = {"base": "main", "head": "head", "rows": rows, "rounds": 3,
+                   "samples": {"main": [{"quiet": 10.0, "loud": 10.0}, {"quiet": 10.01, "loud": 10.01},
+                                        {"quiet": 10.0, "loud": 10.0}],
+                               "head": [{"quiet": 10.0 * slower, "loud": 10.0 * slower}] * 3}}
+        (tmp_path / "gate.json").write_text(json.dumps(results))
+        (tmp_path / "noise.json").write_text(json.dumps({"noise": {"quiet": 0.01, "loud": 0.06}}))
+        monkeypatch.setattr(sys, "argv", ["perf_gate.py", "report", str(tmp_path / "gate.json"),
+                                          "--calibration", str(tmp_path / "noise.json"),
+                                          "--verdicts", str(tmp_path / "verdicts.json")])
+        code = gate.main()
+        return code, capsys.readouterr().out
+
+    code, table = judged(1.04)
+    assert code == 1 and "failed: quiet (regressed)" in table
+    verdicts = json.loads((tmp_path / "verdicts.json").read_text())
+    assert verdicts["failed"] == ["quiet (regressed)"]
+    assert {name: (row["state"], row["insensitive"], row["band"])
+            for name, row in verdicts["rows"].items()} == {"quiet": ("regressed", False, 0.02),
+                                                           "loud": ("level", True, 0.06)}
+    [loud] = [line for line in table.splitlines() if line.startswith("| loud |")]
+    assert loud.endswith("| level, insensitive (null noise 6.0% over its 2% floor) |"), loud
+    assert "| 6.0% |" in loud
+    code, table = judged(1.10)
+    assert code == 1 and "loud (regressed)" in table
 
 
 def after(command, flag):
@@ -70,7 +108,7 @@ def standing_in(gate, monkeypatch, *, passed: bool, peaks: bool = True) -> list:
     def child(command, **kwargs):
         commands.append(command)
         if command[1] == "-c":
-            return subprocess.CompletedProcess(command, 0, "NVIDIA A100-SXM4-80GB\n", "")
+            return subprocess.CompletedProcess(command, 0, f"{STANDING_IN}\n", "")
         # The checkpoint's script, written beside its probe's output.
         if Path(command[1]).is_file() and Path(command[1]).read_text() == gate.CHECKPOINT:
             printed = json.dumps({"save_ms": 5.0, "restore_ms": 6.0, "peak_device_bytes": peak})
@@ -106,7 +144,7 @@ def test_external_reference_subprocess_failure_keeps_its_measurement(gate, tmp_p
 def test_a_head_reads_every_row_of_the_battery_from_the_tool_it_names(gate, tmp_path, monkeypatch):
     """Each probe runs the tool its rows name and reads every one of its rows
     from that tool's output, so a head whose tools all ran has a measurement
-    for every row of the battery."""
+    for every row of the battery its device can take, and says so of the rest."""
     from types import SimpleNamespace
 
     standing_in(gate, monkeypatch, passed=True)
@@ -115,7 +153,10 @@ def test_a_head_reads_every_row_of_the_battery_from_the_tool_it_names(gate, tmp_
     sample = gate.measure(ROOT, Path(sys.executable), args, ROOT / "tools", is_head=True)
     for row in gate.BATTERY:
         value = sample[row.name]
-        assert value["exit_code"] == 0 if row.head_only else gate.measured(value), (row.name, value)
+        if gate.hardware_status(row, STANDING_IN) is not None and not row.head_only:
+            assert value == gate.hardware_status(row, STANDING_IN), (row.name, value)
+        else:
+            assert value["exit_code"] == 0 if row.head_only else gate.measured(value), (row.name, value)
 
 
 
@@ -139,6 +180,8 @@ def test_a_faster_head_whose_measured_peak_grows_regresses_and_an_unmeasured_pea
                            out=tmp_path / "gate.json")
     sample = gate.measure(ROOT, Path(sys.executable), args, ROOT / "tools", is_head=True)
     for battery_row in gate.BATTERY:
+        if gate.hardware_status(battery_row, STANDING_IN) is not None and not battery_row.head_only:
+            continue
         if battery_row.unit == "GiB":
             assert sample[battery_row.name] is None, battery_row.name
         elif not battery_row.head_only:
@@ -159,7 +202,8 @@ def test_a_step_reports_its_mfu_from_the_same_invocation_and_a_lower_one_regress
 def test_a_full_fine_tune_steps_adamw_on_the_device_it_is_sized_for_and_is_unmeasured_off_it(gate):
     """The fine-tune rows time a 4B decoder's full AdamW step on an H100 and a 1.7B one's on an A100:
     each case is one benchmark_step reads, on a declared field of the decoder, stepping the optimizer
-    it names, and off its device its four rows are not measured, never compared against another's."""
+    it names, and off its device its four rows are not measured, never compared against another's, nor
+    failing a claim, which requires the references alone."""
     import dataclasses
 
     import optax
@@ -177,6 +221,7 @@ def test_a_full_fine_tune_steps_adamw_on_the_device_it_is_sized_for_and_is_unmea
         rows = [row for row in gate.BATTERY if row.name.endswith(name.removeprefix("step "))]
         assert len(rows) == 4
         for row in rows:
+            assert not gate.claimed(row)
             assert gate.hardware_status(row, device) is None
             unmeasured = gate.hardware_status(row, other)
             assert unmeasured.startswith("not measured on this hardware")
