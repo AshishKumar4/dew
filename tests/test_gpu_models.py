@@ -21,11 +21,14 @@ import functools
 import pytest
 import test_causal_transformer as causal
 import test_decision_packing as decision_packing
+import test_gpu_attention as attention
 import test_hf_decoders as decoders
 import test_hf_modernbert as modernbert
 import test_kv_cache as kv_cache
 import test_rollout_servers as rollout
-from gpu_flow import Cell, run_cells
+from gpu_flow import Cell, run_cells, when
+
+from dew.nn.kernels.generation import bf16_dot_runs
 
 pytestmark = pytest.mark.gpu(reason="each model's own GPU kernels: flash, cuDNN, TF32 products, NCCL")
 
@@ -61,11 +64,13 @@ def test_the_models_run_their_gpu_kernels(rng, without_deterministic_ops):
              rollout.a_push_whose_replica_refuses_its_join_aborts_its_group_rather_than_waiting),
         *(Cell(f"the paged decode kernel's value and derivatives are the gathered attention's: width {width}"
                f"{' window' if windowed else ''}{' softcap' if softcap else ''}{' sinks' if sunk else ''}",
-               functools.partial(kv_cache.native_gpu_paged_value_and_derivatives_are_the_gathered_attentions,
-                                 without_deterministic_ops, width, windowed, softcap, sunk), "sm80")
+               when(bf16_dot_runs(), attention.BF16_PRODUCTS, functools.partial(
+                   kv_cache.native_gpu_paged_value_and_derivatives_are_the_gathered_attentions,
+                   without_deterministic_ops, width, windowed, softcap, sunk)))
           for width in (64, 256) for windowed in (False, True) for softcap in (None, 0.5)
           for sunk in (False, True)),
         Cell("a softcapped model decodes a paged cache on par with its compact cache",
-             functools.partial(kv_cache.a_softcapped_model_decodes_a_paged_cache_on_par_with_its_compact_cache,
-                               without_deterministic_ops), "sm80"),
+             when(bf16_dot_runs(), attention.BF16_PRODUCTS, functools.partial(
+                 kv_cache.a_softcapped_model_decodes_a_paged_cache_on_par_with_its_compact_cache,
+                 without_deterministic_ops))),
     ])
