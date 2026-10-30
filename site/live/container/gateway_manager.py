@@ -6,6 +6,7 @@ separate serving uid and are never loaded into these kernel processes.
 """
 
 import asyncio
+import contextlib
 import json
 import os
 import queue
@@ -188,12 +189,11 @@ class LimitedMappingKernelManager(SeedingMappingKernelManager):
         kernel), and one whose restart failed is released here, where jupyter-client drops it releasing none
         (ledger 2516). Then jupyter-server's own shutdown: its activity, buffers and count."""
         kernel = self.get_kernel(kernel_id)
-        # A restart replaces `ready` for each of its phases, its shutdown's then its start's: each is waited for.
+        # A restart replaces `ready` for each of its phases, its shutdown's then its start's: each is waited
+        # for, however it ends.
         while not kernel.ready.done():
-            try:
+            with contextlib.suppress(Exception):
                 await asyncio.shield(kernel.ready)
-            except Exception:
-                pass
         # Its restart failed: its relaunch raised, or it never answered.
         if not kernel.ready.cancelled() and kernel.ready.exception() is not None:
             await kernel.cleanup_resources(restart=False)
