@@ -635,7 +635,8 @@ class Route:
     runs for `choice` at `site` (module:function), `preferred` what it runs where nothing refuses (`chosen`,
     or its selector's preference), `refusal` why `preferred` did not take the
     call, and `ran` what this host executed, `kernel` but where the host cannot run it (cuDNN within
-    `assumed` on a CPU). A route is generic exactly where `kernel != preferred`."""
+    `assumed` on a CPU), and `forced` the kernel the call named or `chosen` named, which forced the choice
+    (None where the selector chose). A route is generic exactly where `kernel != preferred`."""
 
     choice: str
     kernel: str
@@ -644,6 +645,7 @@ class Route:
     ran: str
     target: str
     site: str
+    forced: str | None = None
 
 
 class _Routes:
@@ -680,7 +682,7 @@ _logged: set[tuple[str, str, str]] = set()
 
 
 def route(choice: str, *, kernel: str, preferred: str | None = None, refusal: Refusal | None = None,
-          ran: str | None = None) -> Route:
+          ran: str | None = None, forced: str | None = None) -> Route:
     """Report the dispatch of `choice` to `kernel`, the one call every dispatch site makes once it has
     decided (`dew.nn.kernels.selection.select`): `preferred` defaults to the kernel `chosen` names, else
     `kernel`; `ran` is what this host executes, `kernel` by default. Every `routes` block open records it.
@@ -691,7 +693,7 @@ def route(choice: str, *, kernel: str, preferred: str | None = None, refusal: Re
     _named((choice,))
     generation = device_generation()
     preferred = preferred or dict(cache.KERNEL_CHOICES.value).get(choice) or kernel
-    found = Route(choice, kernel, preferred, refusal, ran or kernel, generation, _site())
+    found = Route(choice, kernel, preferred, refusal, ran or kernel, generation, _site(), forced)
     for collected in cache.KERNEL_ROUTES.value:
         collected.found.append(found)
     detail = '' if refusal is None else refusal.detail
