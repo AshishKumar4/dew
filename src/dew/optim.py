@@ -360,6 +360,9 @@ def _spread_orthogonalized(updates, *, numbers, coeffs: jax.Array, steps: int, e
     for members in shapes.values():
         joined = jnp.concatenate([stacks[index][0] for index in members])
         padded = jnp.pad(joined, ((0, -joined.shape[0] % devices), (0, 0), (0, 0)))
+        if algorithm is not None and jnp.iscomplexobj(padded):
+            raise ValueError(f"ns_precision={algorithm.name} states real products, which a complex update's "
+                             f"Newton-Schulz cannot take: state none, so it multiplies in complex64")
         work = ns_operands(padded.dtype, preconditioning, algorithm)
         with configured_precision(algorithm):
             orthogonal = _orthogonalized(split(padded).astype(work), steps,
@@ -671,7 +674,8 @@ def ns_operands(dtype, preconditioning: Preconditioning = "frobenius",
                 algorithm: jax.lax.DotAlgorithmPreset | None = None) -> jnp.dtype:
     """The dtype Muon's Newton-Schulz takes its operands in: an `algorithm`'s own, where one states the
     iteration's products (`BF16_BF16_F32`'s bfloat16, `TF32_TF32_F32`'s and `F32_F32_F32`'s float32, which
-    a platform that has not the algorithm refuses in JAX's own words); else the run's numerics'
+    a platform that has not the algorithm refuses in JAX's own words, and a complex update, whose
+    products no real algorithm holds, refuses by name); else the run's numerics'
     (`dew.nn.kernels.generation.numerics`), each product at its precision (`Numerics.matmul`): bfloat16 in
     its fast forms, as Jordan's Muon (modded-nanogpt) and Moonlight (arXiv 2502.16982) iterate; float32 in
     its accurate ones, TF32 products on a GPU at the default precision and IEEE float32 under the accurate
