@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import dataclasses
 import fnmatch
-import functools
 import glob
 import inspect
 import json
@@ -36,8 +35,19 @@ import tyro
 
 from dew._hashing import fmix32
 from dew._records import share
-from dew.mesh import STAGE_AXIS, LogicalAxes
-from dew.nn.precision import at_least_fp32, configured_precision, stochastic_bf16
+from dew.mesh import LogicalAxes
+from dew.newton_schulz import (
+    NEWTON_SCHULZ,
+    Preconditioning,
+    as_matrices,
+    dot_algorithm,
+    headed,
+    matrix_axes,
+    muon_leaf,
+    orthogonalized,
+    polar_express,
+)
+from dew.nn.precision import at_least_fp32, stochastic_bf16
 from dew.nn.sharding import declarations, declared_axes
 from dew.registry import Aliases, JsonDict, from_record, record_argument, schedules, to_record
 
@@ -182,19 +192,13 @@ def _placement(path: jax.tree_util.KeyPath, param, decays: bool,
     return optax.contrib.MuonDimensionNumbers(), "muon"
 
 
-Preconditioning = Literal["frobenius", "spectral", "aol", "schatten"]
-"""How optax's Newton-Schulz scales a matrix before it iterates (`optax.contrib.muon`'s `preconditioning`)."""
-
-NEWTON_SCHULZ = (3.4445, -4.7750, 2.0315)
-"""Muon's quintic Newton-Schulz coefficients, Jordan's (modded-nanogpt), optax's default."""
-
-
 def _muon_groups(learning_rate, weight_decay=0.0, adam_weight_decay=None, *, ns_coeffs=NEWTON_SCHULZ,
                  ns_steps: int = 5, beta: float = 0.95, eps: float = 1e-8, weight_decay_mask=None,
                  mu_dtype=None, nesterov: bool = True, adaptive: bool = False,
                  preconditioning: Preconditioning = "frobenius", consistent_rms: float | None = None,
-                 ns_precision: jax.lax.DotAlgorithmPreset | str | None = None, adam_b1: float = 0.9,
-                 adam_b2: float = 0.999, adam_eps_root: float = 0.0,
+                 ns_precision: jax.lax.DotAlgorithmPreset | str | None = None,
+                 per_head: Mapping[str, int] | None = None, neuron_beta2: float | None = None,
+                 adam_b1: float = 0.9, adam_b2: float = 0.999, adam_eps_root: float = 0.0,
                  adam_learning_rate=None) -> optax.GradientTransformation:
     """Run Muon over the matrices and AdamW over the rest, on one schedule. The AdamW group decays
     its norms and biases too, at `adam_weight_decay` or else `weight_decay`: Moonlight shares the
@@ -204,14 +208,20 @@ def _muon_groups(learning_rate, weight_decay=0.0, adam_weight_decay=None, *, ns_
     the two groups (`muon_weight_dimension_numbers`), Muon's momentum, optax's shape scaling, which
     optax 0.2.8 does not export (`_scale_by_shape`), the decay and the rate, its Newton-Schulz optax's
     own in the run's numerics, or at `ns_precision`, a dot algorithm a record holds by its name, over whole
-    matrices spread across the devices (`scale_by_muon`)."""
+    matrices spread across the devices (`scale_by_muon`). Opt-in beside it: `per_head`, the parameters
+    whose output side is a stack of heads, by pattern (`parameter_name`), and each head's width, each
+    head's block orthogonalized and scaled alone (Kimi K3's per-head Muon, arXiv 2607.24653 2.5);
+    `ns_coeffs="polar_express"`, Polar Express's coefficients (`polar_express`); and `neuron_beta2`,
+    NorMuon's neuron-wise normalization of the orthogonal update at that second-moment decay
+    (`scale_by_neuron_norm`)."""
     def labels(params):
         return jax.tree.map(lambda numbers: "adam" if numbers is None else "muon",
-                            muon_weight_dimension_numbers(params), is_leaf=_muon_leaf)
+                            muon_weight_dimension_numbers(params), is_leaf=muon_leaf)
     muon = optax.chain(
         scale_by_muon(ns_coeffs, ns_steps, beta, eps, mu_dtype, nesterov=nesterov, adaptive=adaptive,
-                      preconditioning=preconditioning, ns_precision=ns_precision),
-        _scale_by_shape(consistent_rms),
+                      preconditioning=preconditioning, ns_precision=ns_precision, per_head=per_head),
+        *(() if neuron_beta2 is None else (scale_by_neuron_norm(neuron_beta2, per_head=per_head),)),
+        _scale_by_shape(consistent_rms, per_head),
         optax.add_decayed_weights(weight_decay, weight_decay_mask),
         optax.scale_by_learning_rate(learning_rate))
     adam = optax.adamw(learning_rate if adam_learning_rate is None else adam_learning_rate, b1=adam_b1,
@@ -220,22 +230,17 @@ def _muon_groups(learning_rate, weight_decay=0.0, adam_weight_decay=None, *, ns_
     return optax.partition({"muon": muon, "adam": adam}, labels)
 
 
-def _muon_leaf(node) -> bool:
-    """A leaf of a tree of Muon's dimension numbers: a parameter's, or None for AdamW's."""
-    return node is None or isinstance(node, optax.contrib.MuonDimensionNumbers)
-
-
 def scale_by_muon(ns_coeffs=NEWTON_SCHULZ, ns_steps: int = 5, beta: float = 0.95, eps: float = 1e-8,
                   mu_dtype=None, *, nesterov: bool = True, adaptive: bool = False,
                   preconditioning: Preconditioning = "frobenius",
-                  ns_precision: jax.lax.DotAlgorithmPreset | str | None = None
-                  ) -> optax.GradientTransformation:
+                  ns_precision: jax.lax.DotAlgorithmPreset | str | None = None,
+                  per_head: Mapping[str, int] | None = None) -> optax.GradientTransformation:
     """optax.contrib.scale_by_muon, its momentum, Nesterov step, bias correction and state (`MuonState`) as
     optax's, its coefficients `ns_coeffs` as optax's Muon reads them (a preset's name too,
     `_coefficients`), and each matrix's Newton-Schulz optax's own in the run's numerics, or at
     `ns_precision`'s dot algorithm (`ns_operands`), run whole on one device, the matrices spread across the
     devices (`orthogonalized`). Each parameter's matrix is its dimension numbers'
-    (`muon_weight_dimension_numbers`)."""
+    (`muon_weight_dimension_numbers`), or each of its heads' where `per_head` names it (`head_widths`)."""
     coefficients = _coefficients(ns_coeffs, ns_steps)
     algorithm = dot_algorithm(ns_precision)
 
@@ -254,7 +259,7 @@ def scale_by_muon(ns_coeffs=NEWTON_SCHULZ, ns_steps: int = 5, beta: float = 0.95
         else:
             mu_hat = optax.tree.bias_correction(mu, beta, count)
         orthogonal = orthogonalized(mu_hat, muon_weight_dimension_numbers(mu_hat), state.ns_coeffs, ns_steps,
-                                    eps, preconditioning, algorithm)
+                                    eps, preconditioning, algorithm, head_widths(mu_hat, per_head))
         if adaptive:
             # The orthogonal update scaled by the dual norm of the momentum's (arXiv 2409.20325).
             orthogonal = jax.tree.map(lambda moment, update: jnp.sum(moment.conj() * update) * update,
@@ -264,9 +269,11 @@ def scale_by_muon(ns_coeffs=NEWTON_SCHULZ, ns_steps: int = 5, beta: float = 0.95
 
 
 def _coefficients(ns_coeffs, ns_steps: int) -> jax.Array:
-    """The Newton-Schulz coefficients optax's Muon iterates by for `ns_coeffs`, a preset's name (`"dion"`) or
-    one triple or a schedule of them, as the state it builds holds them: its last `ns_steps` triples of a
-    schedule."""
+    """The Newton-Schulz coefficients optax's Muon iterates by for `ns_coeffs`, a preset's name (`"dion"`,
+    or Dew's `"polar_express"`, `polar_express`) or one triple or a schedule of them, as the state it
+    builds holds them: its last `ns_steps` triples of a schedule."""
+    if ns_coeffs == "polar_express":
+        ns_coeffs = polar_express(ns_steps)
     template = {"matrix": jnp.zeros((1, 1))}
     state = optax.contrib.muon(0.0, ns_coeffs=ns_coeffs, ns_steps=ns_steps).init(template)
     found = [leaf for leaf in jax.tree.leaves(state, is_leaf=lambda node: isinstance(
@@ -274,14 +281,16 @@ def _coefficients(ns_coeffs, ns_steps: int) -> jax.Array:
     return jnp.asarray(found[0].ns_coeffs)
 
 
-def _scale_by_shape(consistent_rms: float | None) -> optax.GradientTransformation:
-    """optax.contrib's shape scaling of Muon's update, each matrix's fans its dimension numbers': Jordan's
-    width transfer, `sqrt(max(1, fan_out / fan_in))`, or Moonlight's consistent RMS,
+def _scale_by_shape(consistent_rms: float | None, per_head: Mapping[str, int] | None = None
+                    ) -> optax.GradientTransformation:
+    """optax.contrib's shape scaling of Muon's update, each matrix's fans its dimension numbers', a head's
+    output fan its width where `per_head` names it (`head_widths`): Jordan's width transfer,
+    `sqrt(max(1, fan_out / fan_in))`, or Moonlight's consistent RMS,
     `sqrt(max(fan_in, fan_out)) * consistent_rms`, where it is given."""
-    def scaled(update, numbers):
-        reduction, output = _matrix_axes(update, numbers)
+    def scaled(update, numbers, width):
+        reduction, output = matrix_axes(update, numbers)
         fan_in = math.prod(update.shape[axis] for axis in reduction)
-        fan_out = math.prod(update.shape[axis] for axis in output)
+        fan_out = width or math.prod(update.shape[axis] for axis in output)
         if consistent_rms is None:
             return jnp.sqrt(jnp.maximum(1, fan_out / fan_in)) * update
         return jnp.sqrt(jnp.maximum(fan_in, fan_out)) * consistent_rms * update
@@ -289,90 +298,58 @@ def _scale_by_shape(consistent_rms: float | None) -> optax.GradientTransformatio
     def update_fn(updates, state, params=None):
         del params
         numbers = muon_weight_dimension_numbers(updates)
-        return jax.tree.map(scaled, updates, numbers, is_leaf=_muon_leaf), state
+        widths = jax.tree.leaves(head_widths(updates, per_head), is_leaf=lambda node: node is None)
+        leaves, structure = jax.tree.flatten(updates)
+        scaled_leaves = [scaled(leaf, shape, width) for leaf, shape, width in zip(
+            leaves, jax.tree.leaves(numbers, is_leaf=muon_leaf), widths, strict=True)]
+        return jax.tree.unflatten(structure, scaled_leaves), state
     return optax.GradientTransformation(lambda params: optax.EmptyState(), update_fn)
 
 
-def _matrix_axes(x: jax.Array, numbers: optax.contrib.MuonDimensionNumbers
-                 ) -> tuple[tuple[int, ...], tuple[int, ...]]:
-    """The reduction and output axes `numbers` name of `x`, each a tuple of axes counted from its first."""
-    def axes(given: int | Sequence[int]) -> tuple[int, ...]:
-        return tuple(axis % x.ndim for axis in ((given,) if isinstance(given, int) else given))
-    return axes(numbers.reduction_axis), axes(numbers.output_axis)
+def head_widths(updates, per_head: Mapping[str, int] | None):
+    """Each update's head width where `per_head` names its parameter by a pattern (`parameter_name`), the
+    first that matches, else None: a tree of the updates' shape."""
+    def width(path: jax.tree_util.KeyPath, _) -> int | None:
+        name = parameter_name(path)
+        return next((given for pattern, given in (per_head or {}).items()
+                     if fnmatch.fnmatchcase(name, pattern)), None)
+    return jax.tree_util.tree_map_with_path(width, updates)
 
 
-def _as_matrices(x: jax.Array, numbers: optax.contrib.MuonDimensionNumbers
-                 ) -> tuple[jax.Array, Callable[[jax.Array], jax.Array]]:
-    """`x` as a stack of its matrices, `[batch, reduction, output]`, and the reshape back, as optax lays a
-    parameter out for its Newton-Schulz: its other axes the batch's, in order."""
-    reduction, output = _matrix_axes(x, numbers)
-    batch = tuple(axis for axis in range(x.ndim) if axis not in (*reduction, *output))
-    order = (*batch, *reduction, *output)
-    moved = jnp.transpose(x, order)
-    stack = moved.reshape(*(math.prod(x.shape[axis] for axis in side) for side in (batch, reduction, output)))
-    back = tuple(sorted(range(x.ndim), key=order.__getitem__))
-    return stack, lambda matrices: jnp.transpose(matrices.reshape(moved.shape), back)
+def scale_by_neuron_norm(beta2: float = 0.95, eps: float = 1e-10, per_head: Mapping[str, int] | None = None
+                         ) -> optax.GradientTransformation:
+    """NorMuon's neuron-wise normalization of an orthogonal update (arXiv 2510.05491, Algorithm 1 lines
+    7-9, its code's `normuon_update`): each output neuron's second moment, the mean square of its row of
+    the update over the reduction side, decayed at `beta2`; the update divided by its root plus `eps`; and
+    each matrix (a head's, where `per_head` names it) scaled back to the orthogonal update's own Frobenius
+    norm, as its code keeps it, so the shape scaling after it (`_scale_by_shape`) sets its size: Jordan's
+    as its code, or Moonlight's consistent RMS of 0.2 as its paper's `0.2 sqrt(mn) / ||O||_F`."""
+    def stacks(tree) -> list[tuple[jax.Array, Callable[[jax.Array], jax.Array]]]:
+        # Each leaf's matrices by its own declared dimension numbers, read over the whole tree.
+        return [as_matrices(leaf, numbers) for leaf, numbers in zip(
+            jax.tree.leaves(tree), jax.tree.leaves(muon_weight_dimension_numbers(tree), is_leaf=muon_leaf),
+            strict=True)]
 
+    def init_fn(params):
+        return jax.tree.unflatten(jax.tree.structure(params), [
+            jnp.zeros((matrices.shape[0], matrices.shape[2]), jnp.float32) for matrices, _ in stacks(params)])
 
-def orthogonalized(updates: optax.Updates, numbers, coeffs: jax.Array, steps: int, eps: float,
-                   preconditioning: Preconditioning = "frobenius",
-                   algorithm: jax.lax.DotAlgorithmPreset | None = None) -> optax.Updates:
-    """Each update `numbers` makes a stack of matrices of (`_as_matrices`) orthogonalized by optax's
-    Newton-Schulz (`_orthogonalized`) in the run's numerics or `algorithm` (`ns_operands`), as Moonlight
-    distributes
-    it (arXiv 2502.16982, 3): the matrices of one shape gathered into one stack, spread across the mesh's
-    devices whole, each device iterating its own share, and handed back as the updates lie. A matrix split
-    across devices would exchange partial products at each of the iteration's products; spread whole, a
-    step moves each matrix twice, there and back. On a mesh with Explicit axes the spreading runs with
-    them Auto (`jax.sharding.auto_axes`), where a constraint may name them and a split stack slices,
-    each update leaving where it came; on one device, or none in context, each stack iterates whole."""
-    mesh = jax.sharding.get_abstract_mesh()
-    spread = functools.partial(_spread_orthogonalized, numbers=numbers, coeffs=coeffs, steps=steps, eps=eps,
-                               preconditioning=preconditioning, algorithm=algorithm)
-    if mesh.empty or not mesh.explicit_axes:
-        return spread(updates)
-    places = jax.tree.map(lambda leaf: jax.typeof(leaf).sharding.spec, updates)
-    with_auto = jax.sharding.auto_axes(axes=mesh.explicit_axes, out_sharding=places)
-    return with_auto(spread)(updates)
-
-
-def _spread_orthogonalized(updates, *, numbers, coeffs: jax.Array, steps: int, eps: float,
-                           algorithm: jax.lax.DotAlgorithmPreset | None,
-                           preconditioning: Preconditioning) -> optax.Updates:
-    """`orthogonalized`'s iteration over a mesh of Auto axes: each group of one shape stacked, padded with
-    zero matrices to a count the devices divide, its matrices split across every axis of the mesh but a
-    pipeline's stages before and after optax's iteration, which runs on each device's own."""
-    mesh = jax.sharding.get_abstract_mesh()
-    axes = () if mesh.empty else tuple(axis for axis, size in mesh.shape.items()
-                                       if size > 1 and axis != STAGE_AXIS)
-    devices = math.prod(mesh.shape[axis] for axis in axes)
-
-    def split(stack: jax.Array) -> jax.Array:
-        return stack if not axes else jax.lax.with_sharding_constraint(
-            stack, jax.sharding.PartitionSpec(axes, None, None))
-    leaves, structure = jax.tree.flatten(updates)
-    stacks = [_as_matrices(leaf, shape) for leaf, shape in zip(
-        leaves, jax.tree.leaves(numbers, is_leaf=_muon_leaf), strict=True)]
-    shapes: dict[tuple[tuple[int, ...], str], list[int]] = {}
-    for index, (stack, _) in enumerate(stacks):
-        shapes.setdefault((stack.shape[1:], str(stack.dtype)), []).append(index)
-    done: list[jax.Array | None] = [None] * len(leaves)
-    for members in shapes.values():
-        joined = jnp.concatenate([stacks[index][0] for index in members])
-        padded = jnp.pad(joined, ((0, -joined.shape[0] % devices), (0, 0), (0, 0)))
-        if algorithm is not None and jnp.iscomplexobj(padded):
-            raise ValueError(f"ns_precision={algorithm.name} states real products, which a complex update's "
-                             f"Newton-Schulz cannot take: state none, so it multiplies in complex64")
-        work = ns_operands(padded.dtype, preconditioning, algorithm)
-        with configured_precision(algorithm):
-            orthogonal = _orthogonalized(split(padded).astype(work), steps,
-                                         optax.contrib.MuonDimensionNumbers((1,), (2,)), coeffs=coeffs,
-                                         eps=eps, preconditioning=preconditioning)
-        orthogonal = split(orthogonal).astype(joined.dtype)
-        starts = np.cumsum([0, *(stacks[index][0].shape[0] for index in members)])
-        for index, start, end in zip(members, starts[:-1], starts[1:], strict=True):
-            done[index] = stacks[index][1](orthogonal[start:end])
-    return jax.tree.unflatten(structure, done)
+    def update_fn(updates, state, params=None):
+        del params
+        widths = jax.tree.leaves(head_widths(updates, per_head), is_leaf=lambda node: node is None)
+        structure = jax.tree.structure(updates)
+        moments = jax.tree.leaves(state)
+        normed, kept = [], []
+        for (matrices, back), moment, width in zip(stacks(updates), moments, widths, strict=True):
+            neuron = beta2 * moment + (1 - beta2) * jnp.mean(jnp.square(matrices.astype(jnp.float32)), axis=1)
+            divided = matrices / (jnp.sqrt(neuron)[:, None, :] + eps).astype(matrices.dtype)
+            blocks, blocked = headed(matrices, width), headed(divided, width)
+            norm = (jnp.linalg.norm(blocks[0], axis=(1, 2), keepdims=True)
+                    / (jnp.linalg.norm(blocked[0], axis=(1, 2), keepdims=True) + eps))
+            normed.append(back(blocked[1](blocked[0] * norm.astype(matrices.dtype))))
+            kept.append(neuron)
+        return jax.tree.unflatten(structure, normed), jax.tree.unflatten(jax.tree.structure(state), kept)
+    return optax.GradientTransformation(init_fn, update_fn)
 
 
 QK_PROJECTIONS = frozenset({'q_proj', 'q_b_proj', 'k_proj', 'kv_b_proj'})
@@ -665,59 +642,6 @@ def _muonclip_groups(learning_rate, qk_clip_threshold: float = 100.0, **opts) ->
         scale_by_qk_clip(qk_clip_threshold))
 
 
-def dot_algorithm(named: jax.lax.DotAlgorithmPreset | str | None) -> jax.lax.DotAlgorithmPreset | None:
-    """A dot algorithm as a record or a flag names it (`Numerics.matmul`'s vocabulary), or None."""
-    return jax.lax.DotAlgorithmPreset[named] if isinstance(named, str) else named
-
-
-def ns_operands(dtype, preconditioning: Preconditioning = "frobenius",
-                algorithm: jax.lax.DotAlgorithmPreset | None = None) -> jnp.dtype:
-    """The dtype Muon's Newton-Schulz takes its operands in: an `algorithm`'s own, where one states the
-    iteration's products (`BF16_BF16_F32`'s bfloat16, `TF32_TF32_F32`'s and `F32_F32_F32`'s float32, which
-    a platform that has not the algorithm refuses in JAX's own words, and a complex update, whose
-    products no real algorithm holds, refuses by name); else the run's numerics'
-    (`dew.nn.kernels.generation.numerics`), each product at its precision (`Numerics.matmul`): bfloat16 in
-    its fast forms, as Jordan's Muon (modded-nanogpt) and Moonlight (arXiv 2502.16982) iterate; float32 in
-    its accurate ones, TF32 products on a GPU at the default precision and IEEE float32 under the accurate
-    preset (`--precision accurate`); complex64 for a complex update; and float32 for a spectral
-    preconditioning, whose norm is an SVD of float32 operands.
-
-    The fast forms' bfloat16, where optax iterates in its momentum's own float32: the quintic brings the
-    singular values only near one, roughly within 0.7 to 1.2 (optax `orthogonalize_via_newton_schulz`), far
-    coarser than bfloat16's rounding. A Qwen3.5-4B decision fine-tune on one H100 (ed985281f, 8192 tokens a
-    step) stepped in 842 ms with its iteration in bfloat16, 1288 ms in float32 at TF32 and 4650 ms at IEEE
-    float32, against AdamW's 495 ms, its loss over 30 steps within 0.03 of the float32 iteration's; at
-    65536 tokens an update, eight microbatches accumulated, Muon's iteration cost the update 9% over AdamW's
-    (ledger 2685)."""
-    from dew.nn.kernels.generation import numerics
-
-    if jnp.issubdtype(dtype, jnp.complexfloating):
-        return jnp.dtype(jnp.complex64)
-    if preconditioning == "spectral":
-        return jnp.dtype(jnp.float32)
-    if algorithm is not None and algorithm.supported_lhs_types:
-        return jnp.dtype(algorithm.supported_lhs_types[0])
-    return jnp.dtype(jnp.bfloat16 if numerics().forms == "fast" else jnp.float32)
-
-
-def _orthogonalized(update: jax.Array, steps: int,
-                    dimension_numbers: optax.contrib.MuonDimensionNumbers | None, *,
-                    coeffs=NEWTON_SCHULZ, eps: float = 1e-8,
-                    preconditioning: Preconditioning = "frobenius") -> jax.Array:
-    """`update` orthogonalized by Muon's `steps` quintic Newton-Schulz iterations at `coeffs`, one triple
-    or a schedule of them, after `preconditioning`, optax's own: its Muon transform with no momentum
-    (`scale_by_muon`, `beta` 0 and no Nesterov step) hands back the update it is given orthogonalized, in
-    its own dtype, bit for bit its `orthogonalize_via_newton_schulz`, which optax 0.2.8 does not export.
-    A leaf with no `dimension_numbers` is one matrix, its rows the reduction axis (a Linen kernel's), its
-    other axes a stack of such matrices."""
-    numbers = optax.contrib.MuonDimensionNumbers() if dimension_numbers is None else dimension_numbers
-    muon = optax.contrib.scale_by_muon(coeffs, steps, beta=0.0, eps=eps, nesterov=False,
-                                       preconditioning=preconditioning, weight_dimension_numbers=numbers)
-    orthogonal, _ = muon.update(update, muon.init(update))
-    assert isinstance(orthogonal, jax.Array), "one array's update is an array"
-    return orthogonal
-
-
 class M3State(NamedTuple):
     """`scale_by_m3`'s state: the updates made so far, the fast momentum `M1`, the second moment `V`, the slow
     momentum `M2`, the gradients of the chunk in progress summed, and `M2` orthogonalized as the chunk
@@ -759,7 +683,7 @@ def scale_by_m3(*, beta1: float, beta2: float, beta3: float, alpha: float, eps: 
                    else weight_dimension_numbers)
         # A leaf with none is one matrix, its rows the reduction: MuonDimensionNumbers' own default.
         numbers = jax.tree.map(lambda shape: optax.contrib.MuonDimensionNumbers() if shape is None else shape,
-                               numbers, is_leaf=_muon_leaf)
+                               numbers, is_leaf=muon_leaf)
         return orthogonalized(moment, numbers, jnp.asarray(NEWTON_SCHULZ), ns_steps, 1e-8,
                               algorithm=dot_algorithm(ns_precision))
 
