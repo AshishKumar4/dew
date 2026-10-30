@@ -953,11 +953,15 @@ def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
     A configuration written today that names the earlier knobs is refused by name, as any field its class
     does not declare. A record in today's shapes passes as it is. Carried to 1.0, when it is deleted
     (ledger 1552)."""
-    if isinstance(record.get("fields"), Mapping):
-        # Each component in today's fields, those its class lost since left out (`earlier_fields`).
-        cleaned: Mapping[str, object] = {**record, "fields": earlier_fields(json_value(record["fields"]))}
-        record = cleaned
     fields = record.get("fields")
+    segments = fields.get("segments") if isinstance(fields, Mapping) else None
+    if isinstance(fields, Mapping) and isinstance(segments, list):
+        # A decision run's row of segments, each component in today's fields (`earlier_fields`): the
+        # segments alone, where a layout's components are, never a field of data a row holds.
+        migrated = earlier_fields(json_value(segments))
+        assert isinstance(migrated, list)
+        fields = {**fields, "segments": migrated}
+        record = {**record, "fields": fields}
     if not isinstance(fields, Mapping) or not isinstance(fields.get("trainer"), Mapping):
         return record
     trainer, fields = dict(fields["trainer"]), dict(fields)

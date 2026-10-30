@@ -211,9 +211,11 @@ saved data step's identity compares without them (`without_removed`). Carried to
 
 
 def earlier_fields(value: JSON) -> JSON:
-    """`value`, a saved run's record (its run.json, its checkpoint's task record) or any part of one, with
-    each component's fields its class lost since (`REMOVED_FIELDS`) left out: a component record names its
-    class and holds its fields (`{"class": ..., "fields": ...}`), wherever it nests."""
+    """`value`, a saved run's records of components (a decision layout's segments, in its run.json or its
+    checkpoint's task record), with each component's fields its class lost since (`REMOVED_FIELDS`) left
+    out: a component record names its class and holds its fields (`{"class": ..., "fields": ...}`),
+    wherever it nests. Its callers hand it components alone, never a record of data a row holds, which may
+    look like one."""
     if isinstance(value, list):
         return [earlier_fields(part) for part in value]
     if not isinstance(value, dict):

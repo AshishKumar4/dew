@@ -525,8 +525,15 @@ def earlier_shapes(record: Mapping[str, object]) -> Mapping[str, object]:
         from dew.registry import to_record
 
         current["processor"] = to_record(SourceReference.parse(processor), SourceReference)
-    # Each component in today's fields, those its class lost since left out (`earlier_fields`).
-    current = {key: earlier_fields(json_value(value, key)) for key, value in current.items()}
+    laid = current.get("layout")
+    if isinstance(laid, Mapping) and isinstance(laid.get("fields"), Mapping):
+        fields = laid["fields"]
+        segments = fields.get("segments")
+        if isinstance(segments, list | tuple):
+            # The layout's segments, each component in today's fields (`earlier_fields`).
+            migrated = earlier_fields(json_value(segments, "layout segments"))
+            assert isinstance(migrated, list)
+            current["layout"] = {**laid, "fields": {**fields, "segments": migrated}}
     if "attention_form" in current:
         # The form a step trained in, which its numerics' forms hold now (ledger 2500).
         current["precision"] = {"forms": current.pop("attention_form")}
