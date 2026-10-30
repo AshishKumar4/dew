@@ -339,18 +339,38 @@ def _paired_arms(arms) -> list[_Paired]:
             if isinstance(arm, _Paired)]
 
 
+SWITCHED: list[dict] = []
+"""The sites decided onto YNNPACK's fusions (`_ynn_decided`) since the last test's report took them: each its
+label and XLA:CPU's refusal, which tests/conftest.py reports as the test's JUnit property `ynn_switched`."""
+
+
+@functools.cache
+def _ynn_option_held() -> None:
+    """Raise unless XLA:CPU compiles a trivial program with WITHOUT_YNN's options, once a process: where an
+    XLA release refuses the options themselves, every paired site would otherwise move onto the fusions
+    and pass (`_ynn_decided`)."""
+    try:
+        without_ynn(lambda x: x * 2)(jnp.zeros((2, 2), jnp.float32))
+    except jax.errors.JaxRuntimeError as error:
+        raise RuntimeError(f"XLA:CPU refuses WITHOUT_YNN's options {WITHOUT_YNN} on a trivial program: "
+                           f"{str(error).splitlines()[0]}; no check may move its arms onto the fusions"
+                           ) from error
+
+
 def _ynn_decided(label: str, arms, inputs) -> None:
     """The mode of a site's paired arms (`_Paired`), decided once before its draws: each compiled ahead on
     its first draw's `inputs` without YNNPACK's fusions; where XLA:CPU refuses one so and compiles it with
     them (its algebraic simplifier forms a dot of no contracting dimension from a contraction of length
     one, which only YNNPACK's fusion runs: attention's XLA backward over a single key), every paired arm
-    of the site takes the fusions, logged (`_logged_mode`) and named in its findings
-    (`_with_mode`). One the fusions refuse too raises. An arm running Dew's own programs through Dew's
+    of the site takes the fusions, logged in its stages' lines (`_logged`), reported (`SWITCHED`) and named in
+    its findings (`_with_mode`). One the fusions refuse too raises, and so does a process whose XLA refuses
+    the options themselves (`_ynn_option_held`). An arm running Dew's own programs through Dew's
     seam (`dew_programs`) compiles at its call, without them, as does a window loop's arm, whose program
     takes each window's slices and not the draw (`over_windows`)."""
     pairings = {arm.pairing for arm in _paired_arms(arms)}
     if not pairings or all(pairing.decided for pairing in pairings):
         return
+    _ynn_option_held()
     refused = None
     for arm in arms:
         if not isinstance(arm, _Paired) or not hasattr(arm.without, "lower"):
@@ -363,13 +383,18 @@ def _ynn_decided(label: str, arms, inputs) -> None:
     for pairing in pairings:
         pairing.decided, pairing.refused = True, refused
     if refused is not None:
-        _logged_mode(label, refused)
+        SWITCHED.append({"label": label, "refused": refused})
+
+
+def _mode_of(arms) -> str | None:
+    """XLA:CPU's refusal that moved a site's arms onto YNNPACK's fusions (`_ynn_decided`), or None."""
+    return next((arm.pairing.refused for arm in _paired_arms(arms) if arm.pairing.refused), None)
 
 
 def _with_mode(findings: list, arms) -> list:
     """`findings`, each naming its site's arms' YNNPACK mode where they were decided onto the fusions
     (`_ynn_decided`), so a failure says which code its arms ran."""
-    refused = next((arm.pairing.refused for arm in _paired_arms(arms) if arm.pairing.refused), None)
+    refused = _mode_of(arms)
     if refused is None:
         return findings
     return [dataclasses.replace(finding, message=f"{finding.message} (both arms with YNNPACK's fusions: "
@@ -1482,7 +1507,7 @@ leaves of narrow rows (NARROW_FACTORS) to, one JSON line (`_logged`): what a tra
 stage-two rate from, every attempt counted, and which sites' local errors rest on check 2."""
 
 
-def _logged(label: str, stage: int, verdict: str, narrow_leaves: list[str]) -> None:
+def _logged(label: str, stage: int, verdict: str, narrow_leaves: list[str], ynn: str | None = None) -> None:
     import json
     import os
 
@@ -1491,21 +1516,7 @@ def _logged(label: str, stage: int, verdict: str, narrow_leaves: list[str]) -> N
         with open(path, "a", encoding="utf-8") as log:
             log.write(json.dumps({"site": os.environ.get("PYTEST_CURRENT_TEST", "").rsplit(" (", 1)[0],
                                   "label": label, "stage": stage, "verdict": verdict,
-                                  "narrow_leaves": narrow_leaves}) + "\n")
-
-
-def _logged_mode(label: str, refused: str) -> None:
-    """A site's arms decided onto YNNPACK's fusions (`_ynn_decided`), one JSON line in STAGES_LOG's file
-    beside its stages: the site, its label and XLA:CPU's refusal without them."""
-    import json
-    import os
-
-    path = os.environ.get(STAGES_LOG)
-    if path:
-        with open(path, "a", encoding="utf-8") as log:
-            site = os.environ.get("PYTEST_CURRENT_TEST", "").rsplit(" (", 1)[0]
-            log.write(json.dumps({"site": site, "label": label, "ynn": "with YNNPACK's fusions",
-                                  "refused": refused}) + "\n")
+                                  "narrow_leaves": narrow_leaves, "ynn": ynn}) + "\n")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1661,12 +1672,12 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
         return drawn
 
     overs, unresolveds = [], []
+    arms = [dew_fn, reference_fn, *([] if library_fn is None else [library_fn]), *further]
     for index, named in enumerate([label, *(f"{label}, against {name}" for name in also)]):
         over, unresolved, stage = _staged(drawn_for(index), seeds, named)
-        _logged(named, stage, _verdict(over, unresolved), narrow_leaves)
+        _logged(named, stage, _verdict(over, unresolved), narrow_leaves, _mode_of(arms))
         overs += over
         unresolveds += unresolved
-    arms = [dew_fn, reference_fn, *([] if library_fn is None else [library_fn]), *further]
     if overs:
         raise GateFailure(_with_mode(overs + unresolveds, arms))
     if unresolveds:

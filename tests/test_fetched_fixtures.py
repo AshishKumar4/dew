@@ -282,3 +282,42 @@ def test_upload_takes_a_release_file_beside_a_recording_each_by_its_own_path(sto
     subprocess.run(["git", "add", name], cwd=root, check=True)
     assert store.check(root)
 
+
+
+def test_a_release_file_kept_at_its_origin_is_fetched_from_its_release_and_never_uploaded(store, tmp_path,
+                                                                                         monkeypatch):
+    """A release file its license keeps from being re-hosted is pinned to its release's own repo at the
+    commit its reference names (`pin_release(origin=True)`): the pin holds that commit from the start, so
+    check passes with no upload, and upload has nothing due for it; `fetch` downloads it from the
+    release's model repo at that commit, as the store's are downloaded, and takes it only as its pin's
+    bytes. A pin whose repo or path is not its reference's is refused by check."""
+    import huggingface_hub
+
+    root = _checkout(tmp_path)
+    name, code = "tests/fixtures/hf/site/release/generation_site.py", b"def sample():\n    pass\n"
+    commit = "c" * 40
+    stored = store.pin_release(name, code, reference=f"org/site@{commit}/generation_site.py",
+                               license="other", origin=True, root=root)
+    pin = store.pins(root)[name]
+    assert (pin["origin"], pin["repo"], pin["revision"], pin["path"]) == (
+        "release", "org/site", commit, "generation_site.py")
+    assert store.check(root) == [] and store.local(name, root) == stored
+    commits = []
+    monkeypatch.setattr(huggingface_hub, "HfApi", _hub(commits, [False]))
+    store.upload(root)
+    assert commits == []
+    hub = tmp_path / "generation_site.py"
+    hub.write_bytes(code)
+    asked = []
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download",
+                        lambda repo, path, **where: asked.append((repo, path, where)) or str(hub))
+    stored.unlink()
+    store.fetch(root)
+    assert stored.read_bytes() == code
+    assert asked == [("org/site", "generation_site.py", {"repo_type": "model", "revision": commit})]
+    stored.unlink()
+    hub.write_bytes(_flipped(code))
+    with pytest.raises(AssertionError):
+        store.fetch(root)
+    store._pinned(name, {**pin, "path": "other.py"}, root)
+    assert store.check(root)

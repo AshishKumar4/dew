@@ -78,7 +78,7 @@ from dew.sampling.text import Sampling
 if TYPE_CHECKING:
     from jax.sharding import Mesh
 
-    from dew.diffusion.discrete import Confident
+    from dew.diffusion.discrete import Confident, Unmask
     from dew.distributed.placement import Layout, MeshSpec
     from dew.inference.tasks import SavedRun
     from dew.interop.torchax_fallback import TorchAdmission
@@ -780,20 +780,24 @@ class PretrainedMaskedDecoder(Pretrained):
     model: CausalTransformer
 
     @property
-    def masked_recipe(self) -> tuple[Confident, int, int] | None:
-        """The release's own walk this source generates by, its solver, steps and block
-        (`DecoderFamily.masked_walk` of its config, LLaDA2.0's; `Confident`), or None for a source
-        whose family declares none, an unregistered one among them, which unmasks the whole response
-        with Dew's MDLM. Its task (`text_generation`) and an objective over it
-        (`MaskedDiffusionObjective`) take it alike."""
-        from dew.diffusion.discrete import Confident
+    def masked_walk(self) -> decoder_parts.MaskedWalk | None:
+        """The release's own walk this source generates by (`DecoderFamily.masked_walk` of its config,
+        its generation config and its own code: LLaDA2.0's blocks, Dream's `origin`), or None for a
+        source whose family declares none, an unregistered one among them, which unmasks the whole
+        response with Dew's MDLM."""
         from dew.interop.hf_decoders import families
 
         family = families().get(str(self.config.get("model_type")))
-        walk = None if family is None or family.masked_walk is None else family.masked_walk(self.config)
-        if walk is None:
+        if family is None or family.masked_walk is None:
             return None
-        return Confident(threshold=walk.threshold, temperature=walk.temperature), walk.steps, walk.block
+        return family.masked_walk(self.config, self.generation_config, self.code)
+
+    @property
+    def masked_recipe(self) -> tuple[Unmask | Confident, int, int | None] | None:
+        """The release's own walk's solver, steps and block (`masked_walk`), or None. Its task
+        (`text_generation`) and an objective over it (`MaskedDiffusionObjective`) take it alike."""
+        walk = self.masked_walk
+        return None if walk is None else (walk.solver, walk.steps, walk.block)
 
     def pipeline(self):
         return self.packed().text_generation()
@@ -809,10 +813,13 @@ class PretrainedMaskedDecoder(Pretrained):
         mask_id = self.model.mask_token_id
         if mask_id is None:
             raise TypeError("a masked decoder generates by unmasking, and this model names no mask token")
-        audit_masked(config, generation)
-        recipe = self.masked_recipe
-        walked = {} if recipe is None else {"solver": recipe[0], "steps": recipe[1], "block": recipe[2]}
-        return MaskedGeneration(self.model, self.variables, MDLM(mask_id=mask_id)(),
+        walk = self.masked_walk
+        # The release's own walk reads its controls (Dream's `alg`, `steps` and `eps`), which a task
+        # without it refuses as MDLM cannot honour them.
+        audit_masked(config, generation, () if walk is None else walk.reads, mask_id)
+        walked = {} if walk is None else {"solver": walk.solver, "steps": walk.steps, "block": walk.block}
+        return MaskedGeneration(self.model, self.variables,
+                                MDLM(mask_id=mask_id, endpoint=None if walk is None else walk.endpoint)(),
                                 self.text_processor, **walked,
                                 eos_token_ids=self.eos_token_ids,
                                 pad_token_id=pad_id(config, generation),

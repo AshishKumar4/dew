@@ -101,6 +101,7 @@ from ..precision import (
 from ..protocols import OutputTable, Projection, ProjectionGroup, QuantizesInputs, declared_groups
 from ..rope import LongRopeScaling, Scaling, rope_scaling_from_record
 from ..sharding import RESIDUAL, constrain, logical_axes, pipeline_stages
+from ..value_experts import ValueExperts
 from .decoder_block import (
     DECODER_REMAT,
     NORM_SITES,
@@ -126,11 +127,12 @@ from .decoder_stack import (
     StageSplit,
     banked_collections,
     microbatch_count,
+    on_host,
     run_pipeline,
     run_stack,
     split_stages,
 )
-from .layer_plan import LayerKind, LayerSpec, ResolvedKind, layer_index, scan_groups
+from .layer_plan import LayerKind, LayerSpec, ResolvedKind, layer_index, run_period, scan_groups
 
 _INTERMEDIATES = "intermediates"
 """The collection flax's `capture_intermediates` fills."""
@@ -279,6 +281,8 @@ class CausalTransformer(nn.Module):
     attention_sinks: bool = False
     attn_logit_softcap: float | None = None  # Gemma 2's attn_logit_softcapping
     output_gate: bool = False                 # Qwen3.5 gates the attention branch
+    output_gate_activation: str = 'sigmoid'   # the gate's activation (MixerContext.output_gate_activation)
+    value_experts: ValueExperts | None = None  # MoVA: the routed layers' values from routed experts
     embedding_scale: bool = False            # Gemma scales embeddings by sqrt(d)
     embedding_multiplier: float = 1.0
     """The factor that multiplies the token embeddings before the first layer:
@@ -287,6 +291,8 @@ class CausalTransformer(nn.Module):
     """The factor that multiplies every sublayer output before it is added to the
     residual stream: lm-engine's m_residual, and GraniteMoeHybrid's
     `residual_multiplier`."""
+    normed_residual: bool = False      # MiniMax's postnorm block (`BlockWiring.normed_residual`)
+    stream_multiplier: float = 1.0     # MiniMax's alpha factors (`BlockWiring.stream_multiplier`)
     residual_in_fp32: bool = False
     """Whether the residual stream between layers sums in at least fp32 whatever
     the compute dtype, as mamba_ssm's `residual_in_fp32` keeps it (transformers'
@@ -421,7 +427,9 @@ class CausalTransformer(nn.Module):
     (Dream-v0); False reads each position's own (LLaDA). The forward ignores it: it says how
     the checkpoint's logits line up, which `dew.diffusion.discrete.aligned` applies for the
     masked loss and the sampler alike."""
-    scan_layers: bool = False                 # runs of like layers under flax's scan
+    scan_layers: bool = False
+    """Runs of like layers under flax's scan; a decode step over resident weights scans a period's repeats as
+    one body too (`scan_groups(periodic=True)`), so its program grows with the period, not the depth."""
     bank_layers: int | None = None
     """The most layers one scanned run holds, which is also how many layers its
     parameter bank stacks. A longer run of like layers is split into
@@ -499,7 +507,8 @@ class CausalTransformer(nn.Module):
         return BlockWiring(pre_norms=self.pre_norms, output_norms=self.sandwich_norms,
                            residual_norms=self.post_residual_norms,
                            layer_scalar=self.layer_scalar, parallel_residual=self.parallel_residual,
-                           shared_parallel_norm=self.shared_parallel_norm, ngpt=self.ngpt)
+                           shared_parallel_norm=self.shared_parallel_norm, ngpt=self.ngpt,
+                           normed_residual=self.normed_residual, stream_multiplier=self.stream_multiplier)
 
     @property
     def init_stds(self) -> tuple[float | None, float | None]:
@@ -644,7 +653,7 @@ class CausalTransformer(nn.Module):
         return self.vocab_size if self.per_layer_input_vocab is None else self.per_layer_input_vocab
 
     def mixer_context(self, kind: "ResolvedKind", layer_type: str,
-                      kv_shared: bool, dex: LayerDex | None = None) -> MixerContext:
+                      kv_shared: bool, dex: LayerDex | None = None, routed: bool = False) -> MixerContext:
         """Return one layer's mixer geometry as a `MixerContext` built from the resolved kind.
 
         `head_dim`, `rope_theta`, `window`, the rope scaling, the partial
@@ -663,7 +672,7 @@ class CausalTransformer(nn.Module):
             "kv_shared": kv_shared, "kv_store_key": layer_type,
             "partial_rotary_factor": kind.partial_rotary_factor, "attention_sinks": kind.sinks,
             "qk_norm": kind.qk_norm, "init_std": self.init_stds[0], "output_init_std": self.init_stds[1],
-            "precision": self.precision, "dex": dex}
+            "precision": self.precision, "dex": dex, "value_experts": self.value_experts if routed else None}
         return MixerContext(**resolved, **{field.name: getattr(self, field.name)
                                            for field in dataclasses.fields(MixerContext)
                                            if field.name not in resolved})
@@ -1060,7 +1069,7 @@ class CausalTransformer(nn.Module):
         spec = specs[index]
         return DecoderBlock(
             mixer=(spec.kind.mixer or mixer_spec).build(
-                self.mixer_context(spec.kind, spec.layer_type, spec.kv_shared, spec.dex)),
+                self.mixer_context(spec.kind, spec.layer_type, spec.kv_shared, spec.dex, spec.routed)),
             feedforward=(
                 functools.partial(routed, expert_bias=False, media_bias=False, hash_vocab=self.vocab_size)
                 if spec.hash_routed and routed is not None else
@@ -1112,8 +1121,8 @@ class CausalTransformer(nn.Module):
         """Layer `index`'s mixer, unbound, as its kind builds it over the layer's context."""
         types = self.per_layer_types
         spec = self._layer_specs(types, self.layer_kinds(types), self.layer_mixer)[index]
-        return (spec.kind.mixer or self.layer_mixer).build(
-            self.mixer_context(spec.kind, spec.layer_type, spec.kv_shared, spec.dex))(parent=None)
+        context = self.mixer_context(spec.kind, spec.layer_type, spec.kv_shared, spec.dex, spec.routed)
+        return (spec.kind.mixer or self.layer_mixer).build(context)(parent=None)
 
     @nn.nowrap
     def cross_flops(self, lengths, context_lengths) -> float:
@@ -1895,7 +1904,16 @@ class CausalTransformer(nn.Module):
             if span is not None and banked:
                 raise LayoutRefused(f"a loop over layers {span} runs part of the stack, and a store banked "
                                     f"by run holds whole runs; {list(banked)} arrived banked")
-            view, split = (StackView(self.groups if span is None else spanned, banked=banked),
+            groups = self.groups if span is None else spanned
+            # A decode step over resident weights scans by period; weights a step reads a layer at
+            # a time (banked, streamed from disk or in host memory) keep the runs their banks hold,
+            # and a layer that leaves what a later one reads (`_provides`) runs alone.
+            if decode and not (banked or self._provides or 'streaming' in self.variables
+                               or on_host(self.variables.get('params', {}))):
+                keys = self.scan_keys[first:end]
+                groups = tuple((first + start, count) for start, count in scan_groups(keys, periodic=True))
+            periods = tuple(run_period(self.scan_keys, start, count) for start, count in groups)
+            view, split = (StackView(groups, banked=banked, periods=periods),
                            StageSplit(0, self.num_layers, 0))
         else:
             view, split = self._pipelined(x, stages, decode=decode, banked=banked, span=span)
@@ -2048,7 +2066,7 @@ class CausalTransformer(nn.Module):
                 self.layers, self.block, self.specs, view.groups, x,
                 train=train, decode=decode, kv_store={} if self._provides else None,
                 per_layer_input=per_layer_input, attention_metadata=attention_metadata,
-                banked='params' in view.banked)
+                banked='params' in view.banked, periods=view.periods)
         return run_pipeline(
             self,
             view,
@@ -2418,7 +2436,7 @@ class CausalTransformer(nn.Module):
         default = self.layer_mixer
         for index, spec in enumerate(self._layer_specs(types, self.layer_kinds(types), default)):
             refusal = (spec.kind.mixer or default).mixed_refusal(
-                self.mixer_context(spec.kind, spec.layer_type, spec.kv_shared, spec.dex))
+                self.mixer_context(spec.kind, spec.layer_type, spec.kv_shared, spec.dex, spec.routed))
             if refusal is not None:
                 return f"layer {index}: {refusal}"
         return None

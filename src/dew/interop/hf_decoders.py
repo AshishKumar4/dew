@@ -901,7 +901,8 @@ def _stack_experts(params: LazyTree) -> None:
             continue
         if not any(index.isdigit() for index in experts):
             continue
-        indices = sorted(experts, key=int)
+        # The value experts' router sits beside their digit-keyed projections (`RoutedValues`).
+        indices = sorted((index for index in experts if index.isdigit()), key=int)
         if ([int(index) for index in indices]
                 != list(range(len(indices)))):
             raise ValueError(
@@ -920,7 +921,7 @@ def _stack_experts(params: LazyTree) -> None:
                     raise ValueError(f"{layer} expert {index} has no {projection} kernel")
                 leaves.append(leaf)
             stacked[projection] = {'kernel': SourceLeaf.stack(leaves, f"{layer} experts' {projection}")}
-        mlp['experts'] = stacked
+        mlp['experts'] = {**{name: node for name, node in experts.items() if not name.isdigit()}, **stacked}
 
 
 def held_depths(fields: dict, params: Mapping[str, object]) -> None:
