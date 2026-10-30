@@ -341,7 +341,7 @@ def test_layers_that_choose_their_own_heads_scan_and_pipeline_as_one_run():
     heads share one spec (ledger 2476): the four scan as one run and split over two pipeline stages,
     and the scanned run mid-anneal, each layer at its own heads and lambda_init, is on par with the
     plain loop from its float64 (check 1)."""
-    assert every_layer().stage_split(2).count == 2
+    assert every_layer().stage_split(2).per_stage == 2
     scanned, plain, draw, truth = scanned_site()
     variables, _ = draw(0)
     assert every_layer(scan_layers=True).apply(variables, method=lambda module: module.groups) == ((0, 4),)
