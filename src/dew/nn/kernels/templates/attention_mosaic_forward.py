@@ -149,7 +149,8 @@ def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
     call, spec, (raw, k, v), (spans_of, hooked), taken = _prepared(
         query, key, value, spans, hooks, scale=scale, natural=natural, tiles=tiles, family=family)
 
-    def launch(form: algebra.Forward, live: jax.Array | None) -> tuple[tuple, jax.Array, jax.Array]:
+    def launch(form: algebra.Forward, live: jax.Array | None, again: bool = False
+               ) -> tuple[tuple, jax.Array, jax.Array]:
         q, form = _rewalked(spec, form, raw, taken)
         # The natural form's rewalk at its own tiles (`Tiles.relaunch`), its spans' block map of them.
         at, at_spans = _form_tiles(spec, call, form, tiles, spans_of)
@@ -162,8 +163,8 @@ def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
             launched = [_launch(q, k, values, at_spans, held._replace(output=()) if split else held, None,
                                 spec=form, hooks=_unhooked(hooks) if split else hooks, tiles=at,
                                 family=family, training=False, interpret=interpret,
-                                counted=form.natural == spec.natural, finishes=rows, columns=first,
-                                out_dtype=jnp.float32 if split else None)
+                                counted=form.natural == spec.natural and not again, kept=again,
+                                finishes=rows, columns=first, out_dtype=jnp.float32 if split else None)
                         for first, values, held in blocks]
             status, _, *finished = launched[0]
             out = _output_whole(jnp.concatenate([block[1] for block in launched], axis=-1), hooks, hooked,
@@ -273,19 +274,20 @@ def _trained_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
         query, key, value, spans, hooks, scale=scale, natural=natural, tiles=tiles, family=family)
     value_width = value.shape[3]
 
-    def launch(form: algebra.Forward, live: jax.Array | None):
+    def launch(form: algebra.Forward, live: jax.Array | None, again: bool = False):
         q, form = _rewalked(spec, form, raw, taken)
         if live is None:
-            counted = form.natural == spec.natural
+            counted = form.natural == spec.natural and not again
             # The natural form's rewalk at its own tiles (`Tiles.relaunch`), its spans' block map of them.
             at, at_spans = _form_tiles(spec, call, form, tiles, spans_of)
             found = _launch(q, k, v, at_spans, hooked, None, spec=form, hooks=hooks, tiles=at,
-                            family=family, training=False, interpret=interpret, peaks=True, counted=counted)
+                            family=family, training=False, interpret=interpret, peaks=True, counted=counted,
+                            kept=again)
             # A training launch a block of the value columns where its tiles walk a block (`Tiles.columns`,
             # row 2526), each block's split sums side by side, their rows alike.
             launched = [_launch(q, k, values, at_spans, held, None, spec=form, hooks=hooks, tiles=at,
                                 family=family, training=True, interpret=interpret, anchors=found,
-                                counted=counted, columns=first)
+                                counted=counted, kept=again, columns=first)
                         for first, values, held in _column_blocks(v, hooked, at.columns)]
             status, rows, anchors, _ = launched[0]
             others = jnp.concatenate([block[3] for block in launched], axis=-1)
@@ -619,6 +621,7 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
             spec: algebra.Forward, hooks: Hooks, tiles: Tiles, family: mosaic.Family, training: bool,
             interpret: bool, columns: int | None = None, peaks: bool = False,
             anchors: tuple[jax.Array, jax.Array] | None = None, out_dtype=None, counted: bool = False,
+            kept: bool = False,
             finishes: bool = False):
     """The forward's launch in `spec`'s form (`guard`'s rows shifting where given): its rows' status `[2, B,
     H, Qp]` fp32, their maxima in the walk's units and 1 where their weighted values overflowed
@@ -638,7 +641,7 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
     leaves, treedef = jax.tree.flatten((spans, hooked, guard, anchors))
     # Each launch named apart, so its compile reports and profile rows say which it is.
     kind = "peaks" if peaks else "training" if training else "forward"
-    name = (f"attention_{kind}{'_natural' if spec.natural else ''}"
+    name = (f"attention_{kind}{'_natural' if spec.natural else ''}{'_kept' if kept else ''}"
             f"{'_guarded' if guard is not None else ''}{'' if columns is None else f'_columns{columns}'}")
     launch = _Launch(described((query, key, value)), treedef, described(hooks), spec, tiles, family, training,
                      interpret, peaks, None if out_dtype is None else jnp.dtype(out_dtype), counted, finishes)

@@ -427,9 +427,10 @@ def reach_of(maxima: jax.Array, *, unseen: bool) -> jax.Array:
     return jnp.max(jnp.where(maxima == -jnp.inf, 0.0, reached) if unseen else reached)
 
 
-type Launch[O] = Callable[[Forward, jax.Array | None], tuple[O, jax.Array, jax.Array]]
-"""A whole launch of a call in a form (`walked_launches`): its outputs, each row's running maximum and
-whether its weighted values overflowed."""
+type Launch[O] = Callable[..., tuple[O, jax.Array, jax.Array]]
+"""A whole launch of a call in a form (`walked_launches`), `launch(form, live, again=False)`: its outputs,
+each row's running maximum and whether its weighted values overflowed; `again` a plain launch run once more
+inside the guard's rare branch, a recomputation (its kernel named apart, its products counted once)."""
 
 
 def walked_launches[O](spec: Forward, launch: Launch[O], kept: Callable[[jax.Array, O, O], O]) -> O:
@@ -445,8 +446,13 @@ def walked_launches[O](spec: Forward, launch: Launch[O], kept: Callable[[jax.Arr
     def guarded_launch(form: Forward, outputs: O, over: jax.Array) -> O:
         if not form.headroom:
             return outputs
+        # The rows kept plain read from the plain launch run again inside the rare branch (`again`), so the
+        # plain launch's outputs reach one branch alone, whose result their buffer then is: read by both,
+        # XLA copied them in the common branch (ET-GUARDHLO-h100: `copy.7`, the whole output, 0.047 ms of
+        # Qwen3-8B's 0.66 ms causal forward).
         return jax.lax.cond(jnp.max(over.astype(jnp.int32)) > 0,
-                            lambda: kept(over, launch(form, over)[0], outputs), lambda: outputs)
+                            lambda: kept(over, launch(form, over)[0], launch(form, None, again=True)[0]),
+                            lambda: outputs)
 
     outputs, maxima, over = launch(spec, None)
     if not spec.base2:
