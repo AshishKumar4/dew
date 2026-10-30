@@ -1279,8 +1279,9 @@ def _served(model: DecisionModel, variables: Variables, *, owned: bool = True) -
     whatever its source stored, a run's packed or an export's apart, so its loads compute one program
     (ledger 2299). Weights it owns (`owned`, a load's) pack in place, their members freed
     (`packed_owned`); a bundle's borrowed ones (`Decide.of`) into a new tree that leaves the bundle's
-    whole (`inference_projections`). A frozen trunk's parameters keep the layout they were stored in
-    (ledger 2439). An adapter binds and an export writes the model's own tree (`unpacked`)."""
+    whole (`inference_projections`). A run that held some of them frozen packs as its export does,
+    its whole tree's groups, each frozen where all its members were (ledger 2439). An adapter binds
+    and an export writes the model's own tree (`unpacked`)."""
     from dew.batch import part
     from dew.inference.projections import inference_projections, packed_owned
 
@@ -1292,14 +1293,13 @@ def _served(model: DecisionModel, variables: Variables, *, owned: bool = True) -
 def trained_tree(model: DecisionModel, variables: Variables) -> Variables:
     """A task's weights as a run trains them, the model's own tree: the backbone's projections, packed
     to serve (`_served`), split back (`unpacked`, ledger 2299), so a run trains, and its resume builds,
-    one tree wherever it runs. A trunk held frozen keeps the layout it was stored in, as `_served`
-    leaves it (ledger 2439), and a task that holds no weights (a scoring task's, `Decide.scoring`)
-    has none to split."""
+    one tree wherever it runs: a trunk held frozen splits back frozen (ledger 2439). A task that holds
+    no weights (a scoring task's, `Decide.scoring`) has none to split."""
     from dew.batch import FROZEN, part
     from dew.inference.projections import unpacked
 
     backbone = part(variables, "backbone")
-    if "params" not in backbone or FROZEN in backbone:
+    if "params" not in backbone and FROZEN not in backbone:
         return variables
     return joined({"backbone": unpacked(model.backbone, backbone), "head": part(variables, "head")})
 

@@ -646,12 +646,13 @@ def freeze(variables: Variables, trainable: PathFilter) -> Variables:
 def thaw(variables: Variables) -> Variables:
     """Undo `freeze`, merging the frozen leaves back into one `params` collection.
 
-    Variables without a `FROZEN` collection are returned unchanged.
+    Variables without a `FROZEN` collection are returned unchanged, and a part that trains nothing
+    (`part` of a frozen module) holds its frozen leaves alone.
     """
     if FROZEN not in variables:
         return variables
     rest = {name: value for name, value in variables.items() if name != FROZEN}
-    return {**rest, "params": merge(variables[FROZEN], variables["params"])}
+    return {**rest, "params": merge(variables[FROZEN], variables.get("params", {}))}
 
 
 def dicts[Tree](tree: Tree) -> Tree:

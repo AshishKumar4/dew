@@ -369,6 +369,51 @@ def test_a_run_trains_a_loaded_tasks_own_tree_and_a_release_trains_unpacked(tmp_
     assert backbone(trained) == own
 
 
+@pytest.mark.parametrize("frozen", ["trunk", "keys and values"])
+def test_a_run_that_held_weights_frozen_serves_as_its_weights_unsplit_do(tmp_path, frozen):
+    """A run that held its trunk frozen, or some members of a projection group (each attention layer's
+    keys and values, its queries trained), loads as a task whose backbone packs as its export's, the
+    same weights in one collection, does (`dew.inference.projections`, ledger 2439): one layout, so the
+    two loads compute one program and answer alike. A run trained from the frozen trunk's task holds
+    the trunk frozen as its run stored it (`trained_tree`)."""
+    import dataclasses
+
+    from dew.batch import FROZEN, freeze, part, thaw
+
+    release = tmp_path / "release"
+    release.mkdir()
+    for source in [*BACKBONE.iterdir(), TINY / "joint_head_config.json", TINY / "joint_head.safetensors"]:
+        (release / source.name).symlink_to(source.resolve())
+    trains = {"trunk": lambda path: path[1] == "head",
+              "keys and values": lambda path: not {"k_proj", "v_proj"} & set(path)}[frozen]
+    bundle = Pretrained.load(release, dtype="float32", attention_impl="xla")
+    start = Decide.released(bundle)
+    objective = DecisionObjective(replace(start, variables=freeze(start.variables, trains)),
+                                  layout=JointLayout(max_len=1024))
+    team = Choice("Which team?", {"billing": "payments", "technical": "outages", "sales": "pricing"})
+    examples = [Example(state, {"team": team}, {"team": label})
+                for state, label in (("charged twice", "billing"), ("site is down", "technical"))] * 4
+    run = tmp_path / "run"
+    checkpoints = Checkpoints(str(run), keep=1)
+    state = Trainer(objective, optax.adam(1e-3), key=0, checkpoints=checkpoints).fit(
+        decision_rows(examples, 8, examples, objective=objective.data()), steps=1, log_every=100,
+        checkpoint_every=1)
+    checkpoints.wait()
+    assert FROZEN in state.variables
+
+    trained = thaw(jax.device_get(state.variables))
+    loaded = Decide.from_run(str(run))
+    unsplit = Decide.of(dataclasses.replace(bundle, variables=part(trained, "backbone"),
+                                            head_variables=part(trained, "head")))
+    assert jax.tree.structure(thaw(loaded.variables)) == jax.tree.structure(unsplit.variables)
+    for state_text in ("charged twice!", "is the site down?"):
+        found, expected = loaded(state_text, {"team": team}), unsplit(state_text, {"team": team})
+        np.testing.assert_array_equal(found["team"].probabilities, expected["team"].probabilities)
+    if frozen == "trunk":
+        resumed = DecisionObjective(loaded, layout=JointLayout(max_len=1024)).init(jax.random.key(0))
+        assert jax.tree.structure(resumed[FROZEN]) == jax.tree.structure(state.variables[FROZEN])
+
+
 def test_a_joint_release_fine_tunes_averages_and_reloads_from_its_runs(tmp_path):
     """A joint-head release is a whole task to fine-tune: its Qwen 3.5 backbone, joint head and layout
     train together on rows of several questions, and the saved run loads back as a task with identical
