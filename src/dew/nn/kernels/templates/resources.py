@@ -70,6 +70,27 @@ def allocated(*sizes: int) -> int:
     return sum(-(-size // SMEM_ALIGNMENT) * SMEM_ALIGNMENT for size in sizes)
 
 
+@dataclasses.dataclass(frozen=True)
+class RegisterAccount:
+    """A consumer's held workspace, charged once alongside its tile registers. Capacity derivations use
+    the inverse charge, and a separate phase contributes only its excess over that workspace."""
+    held: int
+
+    def total(self, live: int) -> int:
+        return self.held + live
+
+    def available(self, budget: int) -> int:
+        return budget - self.held
+
+    def extra(self, phase: int) -> int:
+        return max(0, self.available(phase))
+
+
+def register_account(family: "Family") -> RegisterAccount:
+    """The accounting for this family's held set; its current estimate has one reader here."""
+    return RegisterAccount(family.held_registers)
+
+
 def live_registers(family: "Family", carried, *phases) -> int:
     """The registers a consumer thread of `family` holds over a live set: the tiles it carries across its
     walk (`carried`, each `(rows, columns, dtype)`: its accumulators, a running statistic) and the largest
@@ -81,7 +102,7 @@ def live_registers(family: "Family", carried, *phases) -> int:
         return sum(rows * columns * jnp.dtype(dtype).itemsize / 4 for rows, columns, dtype in tiles)
 
     phase = max((words(tiles) for tiles in phases), default=0.0)
-    return int(-(-(words(carried) + phase) // THREADS)) + family.held_registers
+    return register_account(family).total(int(-(-(words(carried) + phase) // THREADS)))
 
 
 def operand_fragments(family: "Family", rows: int, depth: int, columns: int, lhs, rhs, *, lhs_parts: int = 1,
@@ -130,7 +151,7 @@ def program_shared(block: int, programs: int) -> int:
 def held_area(family: "Family", consumers: int) -> int:
     """The fp32 accumulator elements `consumers` consumers of `family` hold beside what they hold besides
     (`Family.held_registers`): a derived tile's rows times columns at most (`held_rows` at any columns)."""
-    return (family.registers(consumers) - family.held_registers) * THREADS * consumers
+    return register_account(family).available(family.registers(consumers)) * THREADS * consumers
 
 
 def held_rows(family: "Family", consumers: int, columns: int) -> int:
