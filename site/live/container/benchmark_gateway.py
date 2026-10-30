@@ -7,6 +7,7 @@ import pathlib
 import queue
 import statistics
 import sys
+import threading
 import time
 import urllib.request
 
@@ -14,6 +15,11 @@ from guests import GUEST_UIDS
 from jupyter_client import BlockingKernelClient
 from jupyter_core.utils import ensure_event_loop
 from shared_bridge import OOM_PROBE, load, processes
+from websockets.sync.client import connect
+
+CHANNELS = {}
+"""Each context's gateway channel and the reader that drains it, held from its create to its delete
+(`created`, `deleted`)."""
 
 
 def dump_processes():
@@ -22,6 +28,37 @@ def dump_processes():
             command.replace(b"\0", b" ").decode(errors="replace"))
         if any(str(uid) in text for uid in GUEST_UIDS[:2]):
             print('PROCESS_STATUS', text[:1600], flush=True)
+
+def created(name):
+    """A context of kernel spec `name` made on the gateway, its channel held open until `deleted`: the
+    benchmark's clients talk to it over IPC, which the gateway counts no connection of, and its culler ends a
+    kernel no connection holds once idle for the live contract's idle time (gateway_manager.py), as a context
+    here waits while the others are measured."""
+    kernel = request("/api/kernels", {"name": name})
+    token = pathlib.Path("/run/dew/gateway-token").read_text()
+    channel = connect(f"ws://127.0.0.1:8890/api/kernels/{kernel['id']}/channels",
+                      additional_headers={"Authorization": "token " + token})
+    # The gateway sends the channel the context's every output, which the IPC client reads already: each is
+    # read and dropped (`drained`), so none waits in memory and the connection stays read.
+    reader = threading.Thread(target=drained, args=(channel,), daemon=True)
+    reader.start()
+    CHANNELS[kernel["id"]] = channel, reader
+    return kernel
+
+
+def drained(channel):
+    """Every message `channel` receives, read and dropped, until it closes."""
+    for _ in channel:
+        pass
+
+
+def deleted(identifier):
+    """Context `identifier` deleted on the gateway, its channel closed (`created`)."""
+    channel, reader = CHANNELS.pop(identifier)
+    channel.close()
+    reader.join()
+    request("/api/kernels/" + identifier, method="DELETE")
+
 
 def request(path, data=None, method=None):
     token = pathlib.Path("/run/dew/gateway-token").read_text()
@@ -87,7 +124,7 @@ def training():
     """A training context reaches neither the network nor any path outside its scratch and its
     private overlay of the prepared cache, reads that cache offline, and says first what its
     caps changed."""
-    kernel = request("/api/kernels", {"name": "dew-train"})
+    kernel = created("dew-train")
     client = BlockingKernelClient(connection_file=f"/run/dew/gateway/kernel-{kernel['id']}.json")
     client.load_connection_file()
     client.start_channels()
@@ -100,7 +137,7 @@ def training():
                             "so it finishes in about two minutes."), lines
     finally:
         client.stop_channels()
-        request("/api/kernels/" + kernel["id"], method="DELETE")
+        deleted(kernel["id"])
     assert not pathlib.Path("/opt/train/escape").exists(), "a training context wrote the prepared cache"
 
 
@@ -127,7 +164,7 @@ def cell(name, code):
     # resident.
     code = (code + "\nimport resource\n"
             "print('peak', resource.getrusage(resource.RUSAGE_SELF).ru_maxrss >> 10)\n")
-    kernel = request("/api/kernels", {"name": "dew-train"})
+    kernel = created("dew-train")
     client = BlockingKernelClient(connection_file=f"/run/dew/gateway/kernel-{kernel['id']}.json")
     client.load_connection_file()
     client.start_channels()
@@ -141,7 +178,7 @@ def cell(name, code):
                              f"memory {memory()}; load {load()}") from None
     finally:
         client.stop_channels()
-        request("/api/kernels/" + kernel["id"], method="DELETE")
+        deleted(kernel["id"])
     # What a run keeps resident, which the host's memory must hold beside the model process.
     peak = int(output.rsplit("peak ", 1)[1].split()[0])
     assert peak < 4608, f"{name} held {peak} MiB; memory {memory()}"
@@ -158,7 +195,7 @@ def start_contexts(kernels, count):
     """Start up to eight contexts into `kernels`, each marked as its own, timing its start."""
     for _ in range(min(count, 8)):
         start = time.perf_counter()
-        model = request("/api/kernels", {"name": "python3"})
+        model = created("python3")
         connection = pathlib.Path("/run/dew/gateway") / f"kernel-{model['id']}.json"
         client = BlockingKernelClient(connection_file=str(connection))
         client.load_connection_file()
@@ -261,7 +298,7 @@ def main():
         for identifier, client, _ in kernels:
             client.stop_channels()
             started = time.perf_counter()
-            request("/api/kernels/" + identifier, method="DELETE")
+            deleted(identifier)
             assert time.perf_counter() - started < 5, "kernel shutdown required a forced timeout"
         assert not list(pathlib.Path("/sessions/connections").glob("kernel-*.json"))
         ensure_event_loop().close()

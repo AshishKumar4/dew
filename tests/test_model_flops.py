@@ -201,6 +201,15 @@ def test_an_embedding_of_its_own_width_counts_both_projections_and_its_narrower_
     assert projected.logits_flops(LENGTHS) == 2 * 8 * 4 * 7 + 2 * 4 * 64 * 7
 
 
+def test_a_projected_heads_projection_runs_on_every_prediction_depth():
+    """The shared head a prediction depth scores with runs `project_out` before its table, so an adapter
+    on it works on each depth's shorter states, as on the head's: one fewer token a depth."""
+    projected = decoder(embedding_features=4, num_nextn_predict_layers=2)
+    usage = projected.prediction_matrix_usage(("params", "project_out"), LENGTHS)
+    np.testing.assert_array_equal(usage, np.concatenate([np.maximum(np.asarray(LENGTHS) - depth, 0)
+                                                         for depth in (1, 2)]))
+
+
 def test_hybrid_backbone_reuses_its_mixer_factory_geometry():
     mixer = GatedDeltaNetMixer(linear_num_key_heads=2, linear_num_value_heads=2,
                                linear_key_head_dim=4, linear_value_head_dim=4)
