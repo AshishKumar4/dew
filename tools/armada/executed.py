@@ -34,30 +34,12 @@ release_env mark, recorded before any selection: its row names them, and a whole
 tasks from it (`ci.py release-plan`)."""
 whole_suite: dict[str, list[str]] = {}
 """Each test file's tests marked whole_suite, by their node ids, as pytest resolves a node's marks (its own,
-its class's, its module's, a parameter set's, a conftest's), which `ci.py slow` reads in the file's row."""
+its class's, its module's, a parameter set's, a conftest's), every one collected, those the selection sets
+aside among them: the file's row names its cells (`ci.py slow`, verdict.sh's record of what main holds)."""
 SHARED_SCOPES = ("session", "package")
 """The fixture scopes whose making and ending serve every file after them: they run for every file."""
 
 
-def finished(finish):
-    """`FixtureDef.finish`, every file's (`lifetime.SHARED`) for a session- or package-scoped fixture: its
-    finalizers run inside whichever test's teardown, or the session's end, ended it, but for all the files."""
-
-    def finishing(self, request):
-        if self.scope not in SHARED_SCOPES:
-            return finish(self, request)
-        lifetime.push(lifetime.SHARED)
-        lifetime.readers.append(lifetime.SHARED)
-        try:
-            return finish(self, request)
-        finally:
-            lifetime.readers.pop()
-            lifetime.pop()
-
-    return finishing
-
-
-pytest.FixtureDef.finish = finished(pytest.FixtureDef.finish)
 # pytest put its assertion rewriter first before it loaded this plugin.
 lifetime.leading()
 
@@ -107,6 +89,11 @@ def tally(counts: dict[str, int], items) -> None:
 @pytest.hookimpl(tryfirst=True)
 def pytest_collection_modifyitems(items):
     tally(collected, items)
+    # Every cell collected, those a train's run sets aside among them: main holds its cells though its train
+    # CI never times one, so a whole-suite run of one main has is no new slow test (verdict.sh).
+    for item in items:
+        if item.get_closest_marker("whole_suite"):
+            whole_suite.setdefault(item.nodeid.split("::")[0], []).append(item.nodeid)
     # Before any selection sets them aside, as every run but a release check's does (`ci.py selected`).
     # A mark that names no one requirement string fails the collection: set aside from every run, no
     # release task would plan its test, which would run nowhere.
@@ -129,26 +116,48 @@ def pytest_deselected(items):
     tally(deselected, items)
 
 
-def pytest_collection_finish(session):
-    for item in session.items:
-        if item.get_closest_marker("whole_suite"):
-            whole_suite.setdefault(item.nodeid.split("::")[0], []).append(item.nodeid)
-
-
-@pytest.hookimpl(hookwrapper=True)
+@pytest.hookimpl(hookwrapper=True, tryfirst=True)
 def pytest_fixture_setup(fixturedef, request):
-    """A session- or package-scoped fixture's making is every file's (`lifetime.SHARED`), whichever test
-    first asked for it."""
+    """A session- or package-scoped fixture's making and its ending are every file's (`lifetime.SHARED`),
+    whichever test first asked for it and whichever test's teardown, or the session's end, ends it: its
+    finalizers run last in, first out, so `shared` registered before its own and `owned` after them bracket
+    them."""
     if fixturedef.scope not in SHARED_SCOPES:
         yield
         return
-    lifetime.push(lifetime.SHARED)
-    lifetime.readers.append(lifetime.SHARED)
+    fixturedef.addfinalizer(owned)
+    shared()
     try:
         yield
     finally:
-        lifetime.readers.pop()
-        lifetime.pop()
+        owned()
+        fixturedef.addfinalizer(shared)
+
+
+@pytest.hookimpl(hookwrapper=True, tryfirst=True)
+def pytest_fixture_post_finalizer(fixturedef, request):
+    """What runs as a session- or package-scoped fixture's ending is done (pytest's hook after its
+    finalizers) is every file's too, a conftest's wrapper of it among it: this wrapper runs first, around
+    theirs."""
+    if fixturedef.scope not in SHARED_SCOPES:
+        yield
+        return
+    shared()
+    try:
+        yield
+    finally:
+        owned()
+
+
+def shared() -> None:
+    """What runs from here is every file's, until `owned`."""
+    lifetime.push(lifetime.SHARED)
+    lifetime.readers.append(lifetime.SHARED)
+
+
+def owned() -> None:
+    lifetime.readers.pop()
+    lifetime.pop()
 
 
 @pytest.hookimpl(tryfirst=True)

@@ -54,6 +54,23 @@ def test_every_pass_gates_its_exit_as_the_remote_code_does():
                     seeds=seeds, truth_fn=truth)
 
 
+def test_a_capture_of_a_module_only_later_passes_call_appends_each_passs_output():
+    """A capture of the final norm alone, which no layer calls and each pass after the first does before
+    it (`looping.run_loop`), first records inside the scan over those passes: each further loop appends
+    the norm's output once, as an unrolled pass did."""
+    loaded = load()
+    ids = np.load(TINY / 'input_ids.npy')
+
+    def captured(loops: int) -> int:
+        _, state = loaded.model.with_passes(loops).apply(
+            loaded.variables, ids, mutable=['intermediates'],
+            capture_intermediates=lambda module, method: module.name == 'norm' and method == '__call__')
+        return len(state['intermediates']['norm']['__call__'])
+
+    three, four, five = captured(3), captured(4), captured(5)
+    assert four - three == five - four == 1
+
+
 def test_a_saved_checkpoint_reloads_bit_for_bit(tmp_path):
     loaded = load()
     loaded.save(tmp_path)

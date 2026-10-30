@@ -1,8 +1,8 @@
 """Every decoder fixture with padded rows against the reference that wrote it: tools/hf_reference.py,
-tools/mamba_reference.py, tools/ouro_reference.py, tools/k2_horizon_reference.py and
-tools/minimax_reference.py write each directory's ids, its left-padded rows and mask, the reference's
-logits for both and its greedy continuation, and the remote-code ones their logits over check 1's
-seeds. A family's own checks stay in its own file."""
+tools/mamba_reference.py, tools/ouro_reference.py, tools/k2_horizon_reference.py,
+tools/minimax_reference.py and tools/qwen4_exp_reference.py write each directory's ids, its left-padded
+rows and mask, the reference's logits for both and its greedy continuation, and the remote-code ones
+their logits over check 1's seeds. A family's own checks stay in its own file."""
 
 from pathlib import Path
 
@@ -21,6 +21,7 @@ FIXTURES = {
     'phi-tiny': {}, 'gptj-tiny': {}, 'gpt-neo-tiny': {}, 'falcon-tiny': {}, 'falcon-mha-tiny': {},
     'gpt-bigcode-tiny': {}, 'gpt-bigcode-mha-tiny': {}, 'starcoder2-tiny': {}, 'mimo-v2-flash-tiny': {},
     'mamba-tiny': {}, 'ouro-tiny': {}, 'k2-horizon-tiny': {}, 'k2-horizon-mova-tiny': {}, 'minimax-tiny': {},
+    'qwen4-exp-tiny': {},
     # BLOOM's ALiBi config states no context length.
     'bloom-tiny': {'max_seq_len': 32},
 }
