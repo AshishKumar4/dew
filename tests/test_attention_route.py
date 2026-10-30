@@ -403,6 +403,21 @@ def test_a_bf16_attention_with_a_side_of_one_is_on_par_with_float64(sides):
                     f"bf16 attention of {queries} queries over {keys} keys", seeds=SIDE_OF_ONE_SEEDS)
 
 
+def test_a_bias_of_the_key_heads_is_refused_by_the_template_not_read_past():
+    """A bias of the key heads `[B, Hk, Q, K]` (Hk neither 1 nor the query heads) broadcasts to no call's
+    heads: the template refuses it by name, as the reference path's broadcast does, and reads no head past
+    the bias (row 2578)."""
+    from dew.nn.kernels import selection
+
+    queries = 40
+    rng = np.random.default_rng(0)
+    query = jnp.asarray(rng.standard_normal((2, queries, HEADS, WIDTH)), jnp.bfloat16)
+    key = jnp.asarray(rng.standard_normal((2, queries, KV_HEADS, WIDTH)), jnp.bfloat16)
+    bias = jnp.zeros((2, KV_HEADS, queries, queries), jnp.float32)
+    with pytest.raises(selection.KernelRefused):
+        scaled_dot_product_attention(query, key, key, bias=bias, causal=True, implementation="template")
+
+
 DENSE_BIAS_SEEDS = 8
 """Check 1's declared seeds for a dense bias named onto the template."""
 

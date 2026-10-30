@@ -35,6 +35,7 @@ from dew.nn.kernels.templates.attention import (
     kept_dtype,
     logit_scale,
     power_of_two,
+    prescale,
 )
 from dew.nn.kernels.templates.attention_mosaic_backward import _launch_backward
 from dew.nn.kernels.templates.attention_mosaic_dkv import _dkv_allocations
@@ -256,7 +257,7 @@ class MosaicForward(_Mainloop[Tiles]):
 
         config = _derived(family, query.dtype, query.shape[1], key.shape[1], tiles,
                           lambda config: self.legal(ba, config, target), overlapped=True)
-        if config is None or self._natural:
+        if config is None or self._natural(ba):
             return config
         # The natural form's rewalk at the largest tile and the most consumers that hold its own registers,
         # each dividing the config's (et-fwdhooks3: at the fold's tiles it spilled 2 KB at width 64).
@@ -269,11 +270,12 @@ class MosaicForward(_Mainloop[Tiles]):
             return None
         return dataclasses.replace(config, relaunch_k=relaunch.block_k, relaunch_consumers=relaunch.consumers)
 
-    @property
-    def _natural(self) -> bool:
-        """Whether the call keeps its logits natural (`algebra.Forward.base2`'s condition: a score hook reads
-        them, or its scale times log2(e) reaches 1): its one form the natural one, no fold to rewalk."""
-        return self.natural or self.score_mod is not None or abs(self.scale) * algebra.LOG2E >= 1.0
+    def _natural(self, ba: tokamax.BoundArguments) -> bool:
+        """Whether the call keeps its logits natural, as its launch decides (`algebra.folds`, at the scale
+        and power of two its queries take, `prescale`): its one form the natural one, no fold to rewalk."""
+        query = ba.arguments["query"]
+        power, scale = prescale(query.dtype, query.shape[3], self.scale)
+        return not algebra.folds(scale, power, natural=self.natural, score_mod=self.score_mod)
 
     def staged_bytes(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> int:
         """The program's shared memory (`_forward_allocations`, `resources.shared_bytes`), at the call's
@@ -291,7 +293,7 @@ class MosaicForward(_Mainloop[Tiles]):
     def registers(self, ba: tokamax.BoundArguments, config: Tiles) -> int:
         family = bundle_of(config, ba.arguments["query"].dtype)
         query, value = ba.arguments["query"], ba.arguments["value"]
-        natural = config.natural_form or self._natural
+        natural = config.natural_form or self._natural(ba)
         return _forward_registers(family, config, _width(value.shape[-1], family, query.dtype), query.dtype,
                                   ba.arguments.get("residuals") is Kept.SPLIT, natural=natural)
 

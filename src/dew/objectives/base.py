@@ -47,9 +47,9 @@ from dew.artifacts import Artifact, Artifacts, TokenScores
 from dew.batch import EXAMPLE_ROWS, FROZEN, VALID_ROWS, Batch, PathFilter, Variables, dicts, everything, part
 from dew.nn import categorical
 from dew.nn.kernels.options import Held, Option, compiler_options
-from dew.nn.precision import accumulated, at_least_fp32, compensated_sum, weighted_total
+from dew.nn.precision import Numerics, accumulated, at_least_fp32, compensated_sum, weighted_total
 from dew.nn.progress import Progress, stepping
-from dew.nn.protocols import HiddenStates, ProjectsParameters
+from dew.nn.protocols import HiddenStates, ProjectionGroup, ProjectsParameters
 from dew.nn.sharding import rows_taken
 
 if TYPE_CHECKING:
@@ -1161,8 +1161,12 @@ class Objective(ABC, Generic[Loss, Effects]):
             batch = {name: value for name, value in batch.items() if name != EXAMPLE_ROWS}
         witness = Witness() if step.record and not validation else None
         step = step if witness is None else replace(step, witness=witness)
-        with stepping(Progress(step.committed)):
-            loss = (self.validation_loss if validation else self.loss)(variables, batch, step)
+        if validation:
+            # A validation scores the model the run would hand on, its schedules ended (`dew.nn.progress`).
+            loss = self.validation_loss(variables, batch, step)
+        else:
+            with stepping(Progress(step.committed)):
+                loss = self.loss(variables, batch, step)
         if _has_aux(loss):
             stats, aux = loss
         else:
@@ -1354,15 +1358,7 @@ class Objective(ABC, Generic[Loss, Effects]):
         """
         weights = self.evaluation_variables(variables, step)
         if loss and evaluate and self._validation_scores is not None:
-            scores = self._validation_scores
-
-            def progressed(weights: Variables, batch: Batch, step: Step):
-                # The loss reads the run's progress as `_loss`'s does, so a metric scored beside it
-                # leaves it as it is.
-                with stepping(Progress(step.committed)):
-                    return scores(weights, batch, step)
-
-            report = self.program('report', progressed)
+            report = self.program('report', self._validation_scores)
             return report(weights, batch, replace(step, training=False))
         statistics = self._validation_loss(weights, batch, step) if loss else None
         return statistics, self.evaluate(variables, batch, step) if evaluate else None
@@ -1420,6 +1416,14 @@ class Objective(ABC, Generic[Loss, Effects]):
         """
         return None
 
+    def served_groups(self, variables: Variables) -> tuple[ProjectionGroup, ...]:
+        """The projection groups, their paths from the `params` root, that a checkpoint of this
+        objective's run may hold packed as a served task holds them, which a resume splits back
+        (`dew.checkpoints`): none, but where a run trained a task's packed tree (`DecisionObjective`).
+        Carried to 1.0, when it is deleted (ledger 1552)."""
+        del variables
+        return ()
+
     def recorded_model(self) -> nn.Module:
         """The model a saved step's record names (`inference_record`): the objective's own."""
         return self.model
@@ -1428,9 +1432,9 @@ class Objective(ABC, Generic[Loss, Effects]):
         """Return the model and task settings that let a saved step be rebuilt.
 
         It records the objective's import path, its `recorded_model`'s record,
-        `task_settings`, field by field, and the attention form the step trained in
-        (`generation.chosen(attention_form=...)`), which a loaded task's calls trace in
-        (`dew.inference.tasks.SavedRunTask.traced`). An objective that declares no task
+        `task_settings`, field by field, and the numerics the step trained under
+        (`generation.run_precision`), which a loaded task's calls trace under
+        (`dew.inference.tasks.InItsForm.traced`). An objective that declares no task
         settings returns None; a custom research method can still restore its
         raw state.
         """
@@ -1443,7 +1447,7 @@ class Objective(ABC, Generic[Loss, Effects]):
         return {'objective': import_path(type(self)),
                 'model': to_record(ModelConfig.from_model(self.recorded_model()), ModelConfig),
                 **record_fields(settings, type(settings)),
-                'attention_form': generation.chosen_kernel('attention_form', 'fast')}
+                'precision': to_record(generation.numerics(), Numerics)}
 
     def build_task(self, variables: Variables, *,
                    processor: Processor | None | Omitted = OMITTED) -> Task | SavedTask:

@@ -993,6 +993,7 @@ class RMSNormGated(nn.Module):
     """
 
     epsilon: float = 1e-6
+    """Qwen3-Next's published `rms_norm_eps`, the gated norm's family, and Flax's RMSNorm's default."""
     activation: str = 'silu'
     dtype: Dtype | None = None
     implementation: str = 'auto'

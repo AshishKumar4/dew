@@ -55,8 +55,8 @@ from dew.nn.precision import (
     bf16_product,
     capped_logits,
     compensated_sum,
+    exact_float32,
     float32_einsum,
-    float32_products,
     head_product,
     paired_sum,
     rounded_operand,
@@ -787,7 +787,7 @@ def chunked_cross_entropy(hidden, head: OutputTable, targets, chunks: int, *,
     # held vocabulary-major so a column tile is a row slice.
     cap = None if head.softcap is None else jnp.asarray(head.softcap, at_least_fp32(hidden.dtype))
     table = head.matrix if vocab_major else head.matrix.T
-    product = BF16 if rounds_to_bf16(compute, precision) else float32_products(compute, precision)
+    product = BF16 if rounds_to_bf16(compute, precision) else exact_float32(precision)
 
     def scored(hidden, table, targets, excluded, cap, columns, *, picked: bool = False,
                group: tuple[str, ...] = ()):
@@ -800,7 +800,7 @@ def chunked_cross_entropy(hidden, head: OutputTable, targets, chunks: int, *,
     def column_logits(states, rows, cap, columns):
         """The capped logit of each state against its own row of the head,
         as the head's tiles score it."""
-        effective = BF16 if rounds_to_bf16(compute, precision) else float32_products(compute, precision)
+        effective = BF16 if rounds_to_bf16(compute, precision) else exact_float32(precision)
         operands = _operand_dtype(effective, at_least_fp32(states.dtype))
         logits = jax.vmap(lambda state, row: _tile_logits(
             state[None].astype(operands), row[None], effective)[0, 0])(states, rows)
@@ -954,7 +954,7 @@ def fused_head_loss(hidden, head: OutputTable, targets, weights, *, z_loss: floa
         raise ValueError(f"{hidden.shape[:-1]} states, {targets.shape} targets and {weights.shape} weights")
     states = head.states(hidden)
     compute = states.dtype if head.compute is None else head.compute
-    precision = BF16 if rounds_to_bf16(compute, head.precision) else float32_products(compute, head.precision)
+    precision = BF16 if rounds_to_bf16(compute, head.precision) else exact_float32(head.precision)
     table = head.matrix if head.vocab_major else head.matrix.T
     columns = _Columns.of(head, at_least_fp32(states.dtype))
     statics = (float(z_loss), head.softcap)

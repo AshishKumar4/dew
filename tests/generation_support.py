@@ -17,7 +17,6 @@ from flax.linen.dtypes import canonicalize_dtype
 
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates.gemm import template
-from dew.nn.precision import float32_products
 
 INTERPRETS = pytest.mark.skipif(jax.default_backend() != "cpu",
                                 reason="interprets the Mosaic GPU kernels, which a CPU process alone does")
@@ -80,4 +79,4 @@ def interpreted_projection(x, kernel, group_sizes, dtype, precision=None):
     never asks for it): the projection's law, its launches each selected as on that GPU."""
     compute = canonicalize_dtype(x, kernel, dtype=dtype)
     return template.gemm(x, kernel, group_sizes, compute=compute, out_dtype=compute,
-                         precision=float32_products(compute, precision), interpret_on_cpu=True)
+                         precision=precision, interpret_on_cpu=True)

@@ -21,6 +21,8 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from jax.sharding import AbstractMesh, Mesh
 
+    from dew.nn.precision import Numerics
+
     from .selection import Refusal
 
 _log = logging.getLogger(__name__)
@@ -97,6 +99,38 @@ def chosen(**kernels: str) -> Iterator[None]:
     _named(kernels)
     with cache.KERNEL_CHOICES(tuple(sorted({**dict(cache.KERNEL_CHOICES.value), **kernels}.items()))):
         yield
+
+
+_NUMERICS: contextvars.ContextVar[Numerics | None] = contextvars.ContextVar("dew_numerics", default=None)
+
+
+def numerics() -> Numerics:
+    """The run's numerics in effect (`run_precision`), the defaults outside any."""
+    from dew.nn.precision import Numerics
+
+    held = _NUMERICS.get()
+    return Numerics() if held is None else held
+
+
+@contextlib.contextmanager
+def run_precision(policy: Numerics) -> Iterator[None]:
+    """Within the block, programs trace under a run's numerics' products and forms
+    (`dew.nn.precision.Numerics`): every product that states no precision at `policy.matmul`
+    (`jax.default_matmul_precision`; "default" leaves JAX's configuration as it stands), and each op's
+    accurate form where its forms are "accurate", the attention template's (`attention_form`) among
+    them. The dtypes are the model's and the optimizer's own fields, which the run sets from the
+    numerics: a bf16 operand has lost its bits before any product reads it, whatever its precision."""
+    import jax
+
+    matmul = policy.matmul if isinstance(policy.matmul, str) else policy.matmul.name
+    stated = contextlib.nullcontext() if matmul == "default" else jax.default_matmul_precision(matmul)
+    forms = chosen(attention_form="accurate") if policy.forms == "accurate" else contextlib.nullcontext()
+    token = _NUMERICS.set(policy)
+    try:
+        with stated, forms:
+            yield
+    finally:
+        _NUMERICS.reset(token)
 
 
 PALLAS_CHOICES = frozenset({'pallas', 'fla'})

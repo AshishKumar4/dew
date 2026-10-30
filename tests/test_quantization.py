@@ -1325,8 +1325,8 @@ def test_the_trainer_knob_quantizes_what_a_distillation_trains_and_not_its_teach
 @pytest.mark.parametrize("precision", [None, "highest"])
 def test_a_matmul_quantizes_whatever_precision_it_pins(precision, dtype):
     """A quantized product has no precision to honour, so a matmul a rule matches quantizes
-    whatever precision it pins: a float32 model's layers pin float32 products
-    (`float32_products`) and quantize as a bfloat16 model's do."""
+    whatever precision it pins: a float32 model's layers pinned at "highest" quantize as a bfloat16
+    model's do."""
     x = jnp.linspace(-2, 2, 16, dtype=jnp.float32).reshape(2, 8).astype(dtype)
     model = nn.Dense(16, dtype=dtype, param_dtype=dtype, precision=precision)
     variables = model.init(jax.random.key(0), x)
