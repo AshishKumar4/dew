@@ -731,7 +731,7 @@ class PretrainedDecoder(Pretrained):
     model: CausalTransformer | MultimodalTransformer
 
     def pipeline(self):
-        return self.formed(self.packed().text_generation())
+        return self.packed().text_generation()
 
     @classmethod
     def from_model(cls, model: nn.Module, variables: Variables, *,
@@ -819,7 +819,7 @@ class PretrainedMaskedDecoder(Pretrained):
         return None if walk is None else (walk.solver, walk.steps, walk.block)
 
     def pipeline(self):
-        return self.formed(self.packed().text_generation())
+        return self.packed().text_generation()
 
     def text_generation(self) -> MaskedGeneration:
         """Build the masked generation task this source describes, walking as its release does where
@@ -837,14 +837,14 @@ class PretrainedMaskedDecoder(Pretrained):
         # without it refuses as MDLM cannot honour them.
         audit_masked(config, generation, () if walk is None else walk.reads, mask_id)
         walked = {} if walk is None else {"solver": walk.solver, "steps": walk.steps, "block": walk.block}
-        return MaskedGeneration(self.model, self.variables,
+        return self.formed(MaskedGeneration(self.model, self.variables,
                                 MDLM(mask_id=mask_id, endpoint=None if walk is None else walk.endpoint)(),
                                 self.text_processor, **walked,
                                 eos_token_ids=self.eos_token_ids,
                                 pad_token_id=pad_id(config, generation),
                                 max_new_tokens=generation_limit(config, generation, "max_new_tokens"),
                                 max_length=generation_limit(config, generation, "max_length"),
-                                n=return_sequences(config, generation))
+                                n=return_sequences(config, generation)))
 
 
 @dataclass(frozen=True)
@@ -858,13 +858,13 @@ class PretrainedBlockDecoder(Pretrained):
     names_tokenizer: ClassVar[bool] = False
 
     def pipeline(self):
-        return self.formed(self.packed().block_generation())
+        return self.packed().block_generation()
 
     def block_generation(self) -> BlockGeneration:
         """Build the DiffusionGemma canvas task, with the source's sampler config as its default."""
         from dew.interop import diffusion_gemma
 
-        return BlockGeneration(
+        return self.formed(BlockGeneration(
             self.model,
             self.variables,
             diffusion_gemma.generation_process(self.config, self.generation_config),
@@ -874,7 +874,7 @@ class PretrainedBlockDecoder(Pretrained):
             max_new_tokens=generation_limit(self.config, self.generation_config, "max_new_tokens"),
             max_length=generation_limit(self.config, self.generation_config, "max_length"),
             n=return_sequences(self.config, self.generation_config),
-        )
+        ))
 
 
 
@@ -895,7 +895,7 @@ class PretrainedPipeline(Pretrained):
     finish: Callable[[Mapping[str, object], jax.Array], jax.Array] | None = field(default=None, repr=False)
 
     def pipeline(self):
-        return self.formed(self.text_to_image())
+        return self.text_to_image()
 
     def text_to_image(self) -> TextToImage:
         """Build the pipeline as a sampling task with its published policy.
@@ -903,9 +903,10 @@ class PretrainedPipeline(Pretrained):
         A video source's task (Wan's) samples clips of shape
         `[N, frames, height, width, 3]`.
         """
-        return TextToImage(self.model, self.process, self.inputs, self.variables, self.autoencoder,
-                           grid=self.task.grid, final_denoise=False, solver=self.schedule.solver,
-                           steps=self.task.steps, guidance=self.task.guidance, finish=self.finish)
+        return self.formed(TextToImage(
+            self.model, self.process, self.inputs, self.variables, self.autoencoder, grid=self.task.grid,
+            final_denoise=False, solver=self.schedule.solver, steps=self.task.steps,
+            guidance=self.task.guidance, finish=self.finish))
 
     @property
     def _adaptable(self) -> Mapping[str, WeightLayout]:
@@ -953,7 +954,7 @@ class PretrainedFallback(Pretrained):
     """
 
     def pipeline(self):
-        return self.formed(self.text_generation())
+        return self.text_generation()
 
     def text_generation(self, *, sampling: Sampling | None = None) -> TextGeneration:
         """The text generation task this source describes, as a native decoder's
@@ -966,7 +967,7 @@ def _text_generation(loaded: Pretrained, sampling: Sampling | None) -> TextGener
     rows = return_sequences(loaded.config, loaded.generation_config)
     policy, logits, strategy = source_decoding(loaded.config, loaded.generation_config, loaded.model, rows,
                                                sampling)
-    return TextGeneration(
+    return loaded.formed(TextGeneration(
         loaded.model,
         loaded.variables,
         loaded.text_processor,
@@ -976,7 +977,7 @@ def _text_generation(loaded: Pretrained, sampling: Sampling | None) -> TextGener
         n=rows,
         logits=logits,
         strategy=strategy,
-    )
+    ))
 
 
 def _no_language_model(name: str, kind: str) -> NoReturn:

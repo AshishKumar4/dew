@@ -284,7 +284,7 @@ class Decide(SavedRunTask, InItsForm):
         variables = joined({"backbone": bundle.variables, "head": bundle.head_variables})
         return cls(model, variables, bundle.layout, bundle.decision_tokenizer, bundle.specials,
                    bundle.calibration, name=name or str(bundle.origin or bundle.source),
-                   processor=bundle.processor)
+                   processor=bundle.processor, precision=bundle.numerics)
 
     @classmethod
     def _recorded(cls, directory: str, record: Mapping[str, object], backbone, variables: Variables,

@@ -351,7 +351,7 @@ def test_a_runs_numerics_are_named_on_the_command_line_in_its_record_and_at_a_lo
     llama = Path(__file__).parent / "fixtures" / "hf" / "llama-tiny"
     loaded = Pretrained.load(llama, precision="accurate", attention_impl="reference")
     assert loaded.model.dtype == jnp.float32 and loaded.numerics == ACCURATE
-    assert loaded.pipeline().precision == ACCURATE
+    assert loaded.pipeline().precision == ACCURATE and loaded.text_generation().precision == ACCURATE
     with pytest.raises(ValueError):
         Pretrained.load(llama, precision="accurate", dtype=jnp.float16)
     with pytest.raises(ValueError):
