@@ -34,6 +34,7 @@ from dew.distributed.host import snapshot
 from dew.distributed.placement import Layout, MeshSpec, Placement, explicit_axes, placed_bytes
 from dew.mesh import LayoutRefused
 from dew.nn.kernels.options import compiler_options
+from dew.nn.protocols import RematChoosing
 from dew.objectives.base import RECORD, Objective
 from dew.state import TrainState, apart, together
 from dew.telemetry.profile import active_profile, capture_options
@@ -537,15 +538,34 @@ class FitSearch[LossT, EffectsT]:
         compiles, so the search's first compile confirms it and a miss climbs on as a correction; the
         rungs read are `derived`. A rung the derivation cannot judge ('unknown': residuals over several
         devices, devices stating no memory) ends the walk where it started, at the base rung, as does a
-        ladder no rung of which fits; so does a run that sets its remat, which compiles at it alone.
-        The derivation names no XLA workspace, so a 'fits' is a first guess and the compile the
-        decision."""
-        if self.derive is None or self.resumed is not None or self.remat_set:
+        ladder no rung of which fits. A run that sets its remat compiles at it alone, told first where
+        the derivation fits a lighter rung (`advise`). The derivation names no XLA workspace, so a
+        'fits' is a first guess and the compile the decision."""
+        if self.derive is None or self.resumed is not None:
+            return
+        if self.remat_set:
+            self.advise(split)
             return
         base = (tuple(entry.module for entry in self.objective.program_key()), head_tile_of(self.objective),
                 head_fused_of(self.objective))
-        narrow = self.narrow
-        while True:
+        label, narrow = self.walked(split)
+        if label != "fits":
+            self.objective.substitute(list(base[0]))
+            self.objective.restore_head(base[1], fused=base[2])
+            narrow = self.narrow
+        elif self.remat_rung() != self.started:
+            _log.info("the derivation says the step fits from remat %s; compiling there first",
+                      self.remat_rung())
+        self.narrow = narrow
+
+    def walked(self, split: int, until: str | None = None) -> tuple[str, bool]:
+        """Climb the objective from its rung to the least-recompute one whose derived footprint at `split`
+        fits the devices, each rung read appended to `derived`: the label the walk ends on, and whether
+        the rung keeps the narrow copies. It ends where a rung fits, where the derivation cannot judge one,
+        where the ladder ends, and, with `until`, at that remat (`remat_rung`), which it does not read."""
+        assert self.derive is not None
+        narrow, label = self.narrow, "refuses"
+        while until is None or self.remat_rung() != until:
             candidate = self.derive(split, narrow)
             footprint = candidate.footprint
             headroom = None if footprint is None else derived_headroom(
@@ -562,14 +582,31 @@ class FitSearch[LossT, EffectsT]:
             narrow = False
             if not self.onward(lambda: recompute_more(self.objective, self.base)):
                 break
-        if label != "fits":
-            self.objective.substitute(list(base[0]))
-            self.objective.restore_head(base[1], fused=base[2])
-            narrow = self.narrow
-        elif self.remat_rung() != self.started:
-            _log.info("the derivation says the step fits from remat %s; compiling there first",
-                      self.remat_rung())
-        self.narrow = narrow
+        return label, narrow
+
+    def advise(self, split: int) -> None:
+        """Tell a run that sets its remat, before it compiles there alone (row 2111), the least-recompute
+        rung its derivation finds fits where that recomputes less (row 2536): each trained module that
+        chooses its remat (`RematChoosing`) is read from no remat up to the run's own, which the walk
+        never reads, and the run's own modules and head are put back. A run whose remat no rung of the
+        ladder reaches (one off `DECODER_REMAT`) is told nothing: no rung below it is known."""
+        entries = self.objective.program_key()
+        if not any(entry.trained and isinstance(entry.module, RematChoosing) for entry in entries):
+            return
+        held, own = [entry.module for entry in entries], self.remat_rung()
+        tile, fused = head_tile_of(self.objective), head_fused_of(self.objective)
+        self.objective.substitute([entry.module.with_remat(None) if entry.trained and isinstance(
+            entry.module, RematChoosing) else entry.module for entry in entries])
+        try:
+            label, _ = self.walked(split, until=own)
+            found = self.remat_rung()
+        finally:
+            self.objective.substitute(held)
+            self.objective.restore_head(tile, fused=fused)
+        if label == "fits" and found != own:
+            _log.warning("the run sets remat %s, and the derivation says the step fits from remat %s, which "
+                         "recomputes less: leave the remat unset and the run compiles there first", own,
+                         found)
 
     def current(self) -> dict[str, JSON]:
         return rung_record(self.objective, self.xla_defaults, narrow=self.narrow)
@@ -642,7 +679,7 @@ class FitSearch[LossT, EffectsT]:
         own rung alone (row 2111), and planning it ahead at each policy, with each GPU's memory stated
         (`--trainer.compile-ahead.capacity-gib`), compiles the others offline."""
         remat = admitted.rung["remat"]
-        if remat is not None and json.dumps(remat, sort_keys=True) == self.started:
+        if self.remat_set and json.dumps(remat, sort_keys=True) == self.started:
             _log.info("the run sets remat %r and compiles at it alone; --trainer.compile-ahead with "
                       "--trainer.compile-ahead.capacity-gib plans it on its GPUs offline, at each remat "
                       "policy asked, to tell what else fits", remat)
