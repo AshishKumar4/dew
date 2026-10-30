@@ -121,11 +121,16 @@ if sys.argv[2:] != ["--peak-run"]:
 """
 
 
+HIGHER_IS_BETTER = ("items/s", "% mfu")
+"""The units a larger value of is the better (`Row.unit`)."""
+
+
 @dataclass(frozen=True)
 class Row:
     name: str
     unit: str
-    """'ms', 's' or 'GiB' (a measured peak), lower is better, or 'items/s', higher is better."""
+    """'ms', 's' or 'GiB' (a measured peak), lower is better, or 'items/s' or '% mfu' (model FLOPs
+    utilization), higher is better."""
     tool: str
     """The tools/ file the row runs, or '' for a script of this file's."""
     gated: bool = True
@@ -171,9 +176,12 @@ def peak(record: dict) -> float | None:
 
 
 def _stepped(out: Path) -> tuple:
-    """A step's time, the time its program took to compile, and its measured peak."""
+    """A step's time, the time its program took to compile, its measured peak and its model FLOPs utilization
+    (benchmark_step's train/mfu, in percent), all from the one invocation; a tree whose tool predates the MFU
+    wrote none, which the gate shows unmeasured."""
     [step] = json.loads(out.read_text())
-    return step["ms_per_step"], step["compile_seconds"], peak(step)
+    mfu = step.get("mfu")
+    return step["ms_per_step"], step["compile_seconds"], peak(step), None if mfu is None else 100.0 * mfu
 
 
 def _forwarded(out: Path, name: str) -> tuple:
@@ -214,7 +222,8 @@ PROBES = [
     *[Probe((Row(name, "ms", "benchmark_step.py"),
              Row(f"compile {name.removeprefix('step ')}", "s", "benchmark_step.py", floor=COMPILE_FLOOR,
                  first_round=True),
-             Row(f"peak {name}", "GiB", "benchmark_step.py")),
+             Row(f"peak {name}", "GiB", "benchmark_step.py"),
+             Row(f"mfu {name}", "% mfu", "benchmark_step.py")),
             lambda _, out, case=case: ["--cases", json.dumps([case]), "--warmup", "10", "--steps", "30",
                                        "--json-out", str(out)],
             lambda _, out: _stepped(out))
@@ -483,7 +492,7 @@ def verdict(row: Row, base: list, head: list) -> tuple[str, dict]:
                for name, samples in (("base", base), ("head", head)) if not all(map(measured, samples))}
     if missing:
         return "partial", {"unmeasured rounds": missing}
-    worse = -1.0 if row.unit == "items/s" else 1.0
+    worse = -1.0 if row.unit in HIGHER_IS_BETTER else 1.0
 
     def spread(xs):
         return (max(xs) - min(xs)) / statistics.median(xs)

@@ -45,7 +45,7 @@ def standing_in(gate, monkeypatch, *, passed: bool, peaks: bool = True) -> list:
     peak = 3 * 2 ** 30 if peaks else None
     outputs = {
         "benchmark_step.py": lambda command: [{"ms_per_step": 5.0, "compile_seconds": 30.0,
-                                               "peak_device_bytes": peak}],
+                                               "peak_device_bytes": peak, "mfu": 0.4}],
         "benchmark_forward.py": lambda command: {after(command, "--cases"): {"ms": 5.0,
                                                                              "peak_device_bytes": peak}},
         "benchmark_serving_compile.py": lambda command: {
@@ -143,6 +143,17 @@ def test_a_faster_head_whose_measured_peak_grows_regresses_and_an_unmeasured_pea
             assert sample[battery_row.name] is None, battery_row.name
         elif not battery_row.head_only:
             assert gate.measured(sample[battery_row.name]), (battery_row.name, sample[battery_row.name])
+
+
+def test_a_step_reports_its_mfu_from_the_same_invocation_and_a_lower_one_regresses(gate):
+    """Each step probe's MFU row reads benchmark_step's train/mfu from the invocation that times it, in
+    percent, higher the better: a head whose MFU falls past its band regresses, one whose tool predates the
+    MFU is not compared on it, never read as zero."""
+    [row] = [row for row in gate.BATTERY if row.name == "mfu step lm-dense 4x1024"]
+    assert row.unit == "% mfu" and row.gated
+    assert gate.verdict(row, [40.0, 40.2, 40.1], [36.0, 36.1, 36.0])[0] == "regressed"
+    assert gate.verdict(row, [40.0, 40.2, 40.1], [44.0, 44.1, 44.0])[0] == "faster"
+    assert gate.verdict(row, [None, None, None], [40.0, 40.0, 40.0])[0] == "not compared"
 
 
 def standing_in_environments(gate, monkeypatch) -> tuple[list, list]:
