@@ -394,8 +394,25 @@ def flag(value, annotation) -> str:
     return json.dumps(registry.to_record(value, bare(annotation)))
 
 
-TASK_RUNS = {"TextSettings": (lm, "lm"), "MaskedSettings": (masked, "masked_diffusion"),
-             "ImageSettings": (diffusion, "diffusion"), "DecideSettings": (decision, "decision")}
+def prefixed(root: Path, drawn: bool) -> RunConfig:
+    """`lm`'s run over a decoder whose attention reads a prefix's blocks, which a prefix run needs."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer, LayerKind
+    from dew.nn.mixers.attention import AttentionMixer
+
+    run = lm(root, drawn)
+    kinds = {"blocks": LayerKind(mixer=AttentionMixer(bidirectional_blocks=True))}
+    record = registry.to_record(kinds, typing.get_type_hints(CausalTransformer)["kinds"])
+    return dataclasses.replace(run, model=ModelConfig("causal_transformer", {
+        **run.model.fields, "layer_types": ["blocks"], "kinds": record}))
+
+
+def contexted(root: Path, drawn: bool) -> RunConfig:
+    """`decision`'s run with context layers, which read a row's context as its encoder says."""
+    return dataclasses.replace(decision(root, drawn), context_layers=(0,), context_length=16)
+
+
+TASK_RUNS = {"TextSettings": (prefixed, "lm"), "MaskedSettings": (masked, "masked_diffusion"),
+             "ImageSettings": (diffusion, "diffusion"), "DecideSettings": (contexted, "decision")}
 """A run here of an objective that records each saved task's settings, and the objective's name."""
 
 
@@ -411,9 +428,27 @@ SETTINGS = sorted({cls.settings for cls in (objectives[name] for name in objecti
                   key=lambda settings: settings.__name__)
 
 
+def held(task, depth: int = 3) -> dict[str, object]:
+    """What the loaded `task` holds, by path: its attributes, and theirs where they are Dew's objects or
+    dataclasses (its model's fields), `depth` deep."""
+    found, frontier = {}, [("", task)]
+    for _ in range(depth):
+        following = []
+        for prefix, value in frontier:
+            names = ([field.name for field in dataclasses.fields(value)] if dataclasses.is_dataclass(value)
+                     else list(vars(value)) if type(value).__module__.startswith("dew.") else [])
+            for name in names:
+                inner = getattr(value, name, None)
+                found[prefix + name] = inner
+                if dataclasses.is_dataclass(inner) or type(inner).__module__.startswith("dew."):
+                    following.append((f"{prefix}{name}.", inner))
+        frontier = following
+    return found
+
+
 def saved_with(run: RunConfig, root: Path, name: str, settings: type, assigned: dict[str, str]):
     """The `settings` the task of `run` saves after one step of `dew train` with each `path=value` of
-    `assigned` set, its task built from them (`dew.pipeline`)."""
+    `assigned` set, and what the task loaded from them holds (`dew.pipeline`, `held`)."""
     import dew
     from dew.inference.tasks import SavedRun, saved_settings
 
@@ -424,30 +459,46 @@ def saved_with(run: RunConfig, root: Path, name: str, settings: type, assigned: 
              "trainer.multi_host": "False", "trainer.compilation_cache_dir": "None", **assigned}
     assert main(["train", str(record / "run.json"),
                  *(part for path, value in given.items() for part in ("--set", f"{path}={value}"))]) == 0
-    dew.pipeline(str(runs / name))
-    return saved_settings(SavedRun.pinned(str(runs / name)).record, settings)
+    return (saved_settings(SavedRun.pinned(str(runs / name)).record, settings),
+            held(dew.pipeline(str(runs / name))))
 
 
-def witness_runs(settings: type, options: dict[str, list[object]], recorded) -> dict[str, object]:
-    """What the second of two runs sets each option to, the first having set each to its first
-    alternative and a registered type's (`registered_alternatives`) to none, saving `recorded`: its second
-    alternative, and a registered type's first member other than the one the first run saved that the
-    settings accept beside the rest it saved."""
-    hints, second = typing.get_type_hints(settings), {}
-    for name, values in options.items():
-        if not registered_alternatives(bare(hints[name])):
-            second[name] = values[1]
-            continue
-        for value in values:
-            if value == getattr(recorded, name):
-                continue
-            try:
-                dataclasses.replace(recorded, **{name: value})
-            except (TypeError, ValueError):
-                continue
-            second[name] = value
-            break
-    return second
+def consumed(before: dict[str, object], after: dict[str, object], value) -> bool:
+    """Whether a task holds `value` where the task before it held another (`held`): the option reached
+    what the task reads, not its record alone."""
+    def same(first, second) -> bool:
+        return type(first) is type(second) and bool(first == second)
+    return any(same(inner, value) and not same(before.get(path), inner) for path, inner in after.items())
+
+
+def accepted(saved, name: str, value) -> bool:
+    """Whether `saved` settings take `value` for `name` beside the rest they hold."""
+    try:
+        dataclasses.replace(saved, **{name: value})
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def reached_by(run: RunConfig, root: Path, settings: type, flags, queued: dict[str, list[object]]):
+    """Each option of `queued` set through `dew train` (`flags` writes its `--set`s) to its first
+    alternative, all in one run, or, where a reader refuses one, each alone at its next alternative: the
+    settings each saves, what its task holds and the value it was set to, for each that trains."""
+    try:
+        first = {name: values[0] for name, values in queued.items()}
+        saved, after = saved_with(run, root, "set", settings, flags(first))
+        return {name: (saved, after, value) for name, value in first.items()}
+    except ValueError:
+        reached = {}
+        for name, values in queued.items():
+            for index, value in enumerate(values):
+                try:
+                    reached[name] = (*saved_with(run, root, f"{name}{index}", settings, flags({name: value})),
+                                     value)
+                    break
+                except ValueError:  # A reader refused it, which names what refused it: the next.
+                    continue
+        return reached
 
 
 @pytest.mark.mesh(devices=8)
@@ -455,39 +506,29 @@ def witness_runs(settings: type, options: dict[str, list[object]], recorded) -> 
 def test_each_option_a_saved_task_is_built_with_reaches_it_from_the_command_line(settings, tmp_path):
     """Every option a saved task is built with that its settings' types declare alternatives for
     (`alternatives`: a literal's values, an optional's, a flag's, a registered type's members, a
-    dataclass's instances over its own) reaches the task `dew train` saves from its path (`reach`): two
-    runs set every one at its first and at its second alternative (`witness_runs`), and the task each
-    saves holds each as set, or a run refuses one, judged by what reads it. One with no path is filled by
-    the run itself, not left at its default: a task option nothing sets is row 1061's blockwise walk.
-    Every settings type an objective declares alternatives in has a run here (`TASK_RUNS`)."""
+    dataclass's instances over its own) reaches the task `dew train` saves from its path (`reach`): beside
+    a run that sets none, a run sets each to an alternative its settings accept other than the one saved
+    (the next where a run refuses it, each alone, `reached_by`), and the task saves it and, loaded, holds
+    it where the first held another (`consumed`). An option with no path is row 1061's blockwise walk,
+    unless its settings declare it derived from the run's data (`metadata={"derived": ...}`), which the
+    run fills. Every settings type an objective declares alternatives in has a run here (`TASK_RUNS`)."""
     assert settings.__name__ in TASK_RUNS, f"no run here trains an objective whose task reads {settings}"
     builder, objective = TASK_RUNS[settings.__name__]
     hints = typing.get_type_hints(settings)
+    fields = {field.name: field for field in dataclasses.fields(settings)}
     run, options = builder(tmp_path, drawn=False), witnessed(settings)
     paths = {name: reach(run, objective, name, hints[name]) for name in options}
-    defaults = {field.name: field.default for field in dataclasses.fields(settings)}
-    first = {name: values[0] for name, values in options.items()
-             if paths[name] is not None and not registered_alternatives(bare(hints[name]))}
-    saved = None
-    for index in (0, 1):
-        assigned = first if saved is None else {name: value for name, value in witness_runs(
-            settings, options, saved).items() if paths[name] is not None}
-        flags = {paths[name]: flag(value, hints[name]) for name, value in assigned.items()}
-        try:
-            saved = saved_with(run, tmp_path, f"set{index}", settings, flags)
-        except ValueError:
-            # A refusal names what refused it; each option alone shows which reached a reader that did.
-            for name, value in assigned.items():
-                try:
-                    alone = saved_with(run, tmp_path, f"{name}{index}", settings,
-                                       {paths[name]: flag(value, hints[name])})
-                except ValueError:
-                    continue
-                assert getattr(alone, name) == value, (name, value)
-                saved = saved or alone
-            assert saved is not None, f"no option of {settings.__name__} saves at its first alternative"
-            continue
-        assert {name: getattr(saved, name) for name in assigned} == assigned
-        for name in options:
-            if paths[name] is None and defaults[name] is not dataclasses.MISSING:
-                assert getattr(saved, name) != defaults[name], f"{settings.__name__}.{name} has no path"
+    base, before = saved_with(run, tmp_path, "unset", settings, {})
+    for name in (name for name in options if paths[name] is None):
+        assert "derived" in fields[name].metadata, f"{settings.__name__}.{name} has no path"
+        assert getattr(base, name) != fields[name].default, f"the run fills no {settings.__name__}.{name}"
+    queued = {name: [value for value in values
+                     if value != getattr(base, name) and accepted(base, name, value)]
+              for name, values in options.items() if paths[name] is not None}
+    reached = reached_by(run, tmp_path, settings, lambda assigned: {
+        paths[name]: flag(value, hints[name]) for name, value in assigned.items()}, queued)
+    for name in queued:
+        assert name in reached, f"no alternative of {settings.__name__}.{name} trains: {queued[name]}"
+        saved, after, value = reached[name]
+        assert getattr(saved, name) == value, (name, value)
+        assert consumed(before, after, value), f"the task loaded holds no {settings.__name__}.{name} set"
