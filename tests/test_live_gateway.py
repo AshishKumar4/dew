@@ -100,7 +100,7 @@ def serving(port: int) -> bool:
 
 def process(connection: Path) -> int:
     """The process of the kernel whose connection file is `connection`: of the processes running now, the one
-    whose command names it, a process that ends between the listing and its reading passed over (ledger 2691)."""
+    whose command names it, one that ends between the listing and its reading passed over (ledger 2691)."""
 
     def command(path: Path) -> bytes:
         try:
