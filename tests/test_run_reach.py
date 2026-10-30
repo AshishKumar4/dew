@@ -345,3 +345,25 @@ def test_a_run_recorded_before_its_stop_took_a_plateau_still_pauses(tmp_path):
     assert main(["train", str(record / "run.json"),
                  *(flag for path, value in settings.items() for flag in ("--set", f"{path}={value}"))]) == 0
     assert max(scalars(runs / "paused")) == 2
+
+
+def test_a_run_saved_with_its_earlier_dtype_knobs_reads_as_the_numerics_they_named(tmp_path):
+    """A run.json saved while its config named a loaded checkpoint's storage dtype
+    (`pretrained_param_dtype`) and the trainer a loss scale (`dynamic_scale`) reads back with that storage
+    as its numerics' parameter dtype, the loss scale derived from its compute dtype (`dew.config.
+    earlier_run`, ledger 2500); a configuration written today that names either is refused."""
+    from dew.config.lm import LMRunConfig
+
+    record = tmp_path / "record"
+    run = lm(tmp_path, drawn=False)
+    run.save(str(record))
+    written = json.loads((record / "run.json").read_text())
+    trainer = {name: value for name, value in written["fields"]["trainer"].items() if name != "precision"}
+    written["fields"] = {**written["fields"], "pretrained_param_dtype": "bfloat16",
+                         "trainer": {**trainer, "dynamic_scale": True}}
+    (record / "run.json").write_text(json.dumps(written))
+    loaded = RunConfig.load(str(record))
+    assert loaded.trainer.precision.dtypes.params == "bfloat16"
+    assert not hasattr(loaded.trainer, "dynamic_scale")
+    with pytest.raises(ValueError):
+        LMRunConfig.read(written)
