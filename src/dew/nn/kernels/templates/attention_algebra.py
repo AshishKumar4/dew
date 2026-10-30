@@ -452,6 +452,10 @@ def walked_launches[O](spec: Forward, launch: Launch[O], kept: Callable[[jax.Arr
     return jax.lax.cond(reach >= FOLD_REACH, unfolded_launch, lambda: guarded_launch(spec, outputs, over))
 
 
+NATURAL_EXPONENT_REACH = 150.0
+"""The largest `|k|` `natural_exp` hands `power2`: its reduced exponent's integral part, its argument held to
+[-150, 128] (every fp32 exponential outside is zero or infinite), rounded up by at most one."""
+
 POWER2_REACH = 381.0
 """The largest `|k|` `power2` takes apart: past it every fp32 `x * 2^k` is zero or infinite (`2^-381` of
 fp32's largest flushes, `2^381` of its least overflows), so `k` is held there."""
@@ -467,13 +471,19 @@ def exact_power2(k: jax.Array) -> jax.Array:
     return jax.lax.bitcast_convert_type(bits, jnp.float32)
 
 
-def power2(x: jax.Array, k: jax.Array) -> jax.Array:
+def power2(x: jax.Array, k: jax.Array, reach: float = POWER2_REACH) -> jax.Array:
     """`x * 2^k` for an integral `k` of any size, exactly wherever the result is a normal fp32: three exact
     factors each within 2^±127 (`exact_power2`), of `k`'s sign, so each partial product lies between `x`
-    and the result; `k` held within `POWER2_REACH`, past which the result is zero or infinite. `k` is
-    carried as the integer its contract makes it, so its thirds and halves are integer divisions, exact,
-    floored, which keeps each part of `k`'s sign, and no factor converts it again."""
-    k = jnp.clip(jnp.asarray(k, jnp.float32), -POWER2_REACH, POWER2_REACH).astype(jnp.int32)
+    and the result; `k` held within `reach` (`POWER2_REACH`, past which the result is zero or infinite, by
+    default). `k` is carried as the integer its contract makes it, so its thirds and halves are integer
+    divisions, exact, floored, which keeps each part of `k`'s sign, and no factor converts it again. A caller
+    whose `k` stays within twice 127 states its `reach` and takes two factors, each built as its product
+    takes it: one integer tile live, not two (et-livehook1: power2's factor tiles 66 of the natural forward's
+    281 registers at its peak)."""
+    k = jnp.clip(jnp.asarray(k, jnp.float32), -reach, reach).astype(jnp.int32)
+    if reach <= 2 * 127:
+        half = k // 2
+        return x * exact_power2(half) * exact_power2(k - half)
     first = k // 3
     second = (k - first) // 2
     return x * exact_power2(first) * exact_power2(second) * exact_power2(k - first - second)
@@ -508,7 +518,8 @@ def natural_exp(x: jax.Array, scale: float = 1.0) -> jax.Array:
     exponent += (bounded - exponent >= 0.5).astype(x.dtype)
     live = (jnp.abs(x) < jnp.inf) & (hi >= -150.0) & (hi <= 128.0)
     lo = jnp.where(live, lo, 0.0)
-    return power2(jnp.exp2((bounded - exponent) + lo), exponent)
+    # The exponent within [-150, 129]: two factors take it (`power2`'s `reach`).
+    return power2(jnp.exp2((bounded - exponent) + lo), exponent, reach=NATURAL_EXPONENT_REACH)
 
 
 def headroom(dtype) -> bool:

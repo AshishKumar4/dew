@@ -76,17 +76,30 @@ class Tiles:
     """A forward launch's config: each consumer's query block (`block_q`), the key tile (`block_k`), the key
     and value tiles in flight (`stages`), the consumers a program (`consumers`: on wgmma FlashAttention-3's
     two warpgroups take turns on the tensor cores, one's softmax under the other's products) and the
-    instruction family whose bundle runs it (`family`, `bundle`)."""
+    instruction family whose bundle runs it (`family`, `bundle`). A fold's call rewalks a row past its reach
+    in the natural form at its own key tile and consumers (`relaunch_k`, `relaunch_consumers`; the config's
+    where None, `relaunch`), which divide the config's so its padded blocks hold; `natural_form` marks the
+    natural form's tiles, whose register model differs (`MosaicForward.registers`)."""
 
     block_q: int
     block_k: int
     stages: int
     consumers: int
     family: str = mosaic_sm90.WGMMA.name
+    relaunch_k: int | None = None
+    relaunch_consumers: int | None = None
+    natural_form: bool = False
 
     def __post_init__(self):
         if self.stages < 2:
             raise ValueError(f"{self}: two stages or more")
+
+    @property
+    def relaunch(self) -> "Tiles":
+        """The natural form's rewalk's tiles (`algebra.walked_launches`)."""
+        return dataclasses.replace(self, block_k=self.relaunch_k or self.block_k,
+                                   consumers=self.relaunch_consumers or self.consumers, relaunch_k=None,
+                                   relaunch_consumers=None, natural_form=True)
 
 
 @dataclasses.dataclass(frozen=True, order=True)

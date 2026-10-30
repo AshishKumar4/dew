@@ -197,8 +197,9 @@ def _check_spans(label: str, spans: template.KeySpans, shape, *, interpret: bool
     def ours(query, key, value, dout, params, initial):
         hooks = hooked(params, initial)
         # The forward at the call forms' tiles 64 wide, else at its derivation's (two consumers' hooked sums
-        # 128 wide pass their registers).
-        with _device(interpret), _pinned(FORM_TILES if width == 64 else None, config):
+        # 128 wide pass their registers, and a hooked training forward's natural walk theirs 64 wide).
+        with _device(interpret), _pinned(FORM_TILES if width == 64 and not (backward and score) else None,
+                                         config):
             if not backward:
                 return attention_mosaic.forward(query, key, value, spans, hooks, natural=natural,
                                                 interpret=interpret)
@@ -427,13 +428,14 @@ def test_the_backward_at_a_width_of_256_is_on_par_under_bidirectional_blocks_int
     """The derived backward of heads 256 wide (dK's and dV's widths split among programs,
     `BackwardTiles.columns`, where one program's sums pass a consumer's registers) over a packed row's two
     documents read causally, each document one block read both ways (row 2110's `--split whole`), under the
-    interpreter."""
+    interpreter, from the training forward that keeps its output (`template.OUTPUT`, the route's at this
+    width: the anchored one's natural rewalk holds no tile, row 2526)."""
     rows, queries = SHAPES["interpreted"][:2]
     documents = jnp.asarray([[1] * (queries // 2 - 10) + [2] * (queries // 2 + 10)] * rows, jnp.int32)
     spans = template.spans(queries, queries, rows, causal=True, segment_ids=documents,
                            block_groups=documents)
     _check_backward("causal", SHAPES["interpreted"], form=None, interpret=True, width=256, value_width=256,
-                    spans=spans)
+                    spans=spans, kept=template.OUTPUT)
 
 
 @INTERPRETS
@@ -683,11 +685,16 @@ def test_the_derived_tiles_stage_within_a_hoppers_block(width, value_width, resi
     """On an H100 the forward's tiles derived from the facts (`MosaicForward.derived`) stage within its
     block (`generation.shared_budget`) and a consumer's registers (`register_budget`), whatever the widths,
     the training forward's too (its anchored walk keeps no value row): no table's tile, which at heads 256
-    wide staged 320 KiB against its 227 (ledger 1582)."""
+    wide staged 320 KiB against its 227 (ledger 1582). The anchored training forward of values 256 wide
+    derives none: no tile holds its natural rewalk's registers (et-fsweep256: 255 and 224 B spilled at
+    64 x 64 on one consumer), so the route takes those calls elsewhere."""
     with generation.assumed("sm90"):
         target = generation.gpu_target()
         op, ba = _forward_call((2, 4096, 32, 8), width, value_width, residuals)
         derived = op.derived(ba, target)
+        if residuals and value_width == 256:
+            assert derived is None
+            return
         assert derived is not None
         assert op.legal(ba, derived, target)
         assert op.staged_bytes(ba, derived, target) <= generation.shared_budget(target)
@@ -1339,6 +1346,61 @@ def test_an_a100_derives_no_mosaic_backward(accurate):
     """The mma.sync family is not one this mainloop qualifies (`attention_mosaic_program.QUALIFIED`, row
     2078): an A100's backward derives no config, so the route takes another mainloop there."""
     assert _gated_backward("sm80", 128, accurate)[2] is None
+
+
+FORWARD_GATE = [(width, training, "none") for width in (64, 128, 256) for training in (False, True)
+                if (width, training) != (256, True)]
+FORWARD_GATE += [(width, training, hooks) for width in (64, 128) for training in (False, True)
+                 for hooks in BACKWARD_HOOKS if hooks != "none"]
+"""The forward resource gate's cases on an H100: a causal call's head widths, the inference and the training
+forward, hookless, and each score hook at the widths a hooked call's derivation takes (row 2281: its live
+set beside the walk's); the anchored training forward 256 wide derives none (row 2526)."""
+
+
+def _forward_kernels(op, ba, config) -> dict:
+    """The forward's register model by each launch's kernel name (`attention_forward`, its training,
+    peaks, natural and guarded launches, `attention_mosaic_forward._launch`), all the op's
+    (`MosaicForward.registers`, a bound on the peak walk's), a natural launch's at its own tiles."""
+    family = attention_mosaic_program.bundle_of(config, jnp.bfloat16)
+    # A fold's natural rewalk at its own tiles (`Tiles.relaunch`), its model theirs.
+    models = {"": resources.register_model(family, config.consumers, op.registers(ba, config)),
+              "_natural": resources.register_model(family, config.relaunch.consumers,
+                                                   op.registers(ba, config.relaunch))}
+    return {f"attention_{kind}{natural}{guarded}": models[natural]
+            for kind in ("forward", "training", "peaks") for natural in models
+            for guarded in ("", "_guarded")}
+
+
+@COMPILES_ON_CPU
+@pytest.mark.parametrize(("width", "training", "hooks"), FORWARD_GATE)
+def test_the_forward_compiles_spill_free_as_its_model_decides(width, training, hooks):
+    """The forward, the training forward where `training`, at its derived tiles of a causal call `width`
+    wide under the score hook `hooks` names, lowered and compiled by ptxas for an H100 on this CPU
+    (tests/kernel_compile.py): every launch within its shared memory, spilling nothing, and its register
+    model's decision ptxas's (`mosaic_failures`)."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    queries = 512
+    spans = template.spans(queries, queries, 1, causal=True)
+    query = jax.ShapeDtypeStruct((1, queries, 4, width), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((1, queries, 2, width), jnp.bfloat16)
+    hooked = _gated_hooks(hooks, queries, width)
+
+    def forward(query, key, value):
+        return attention_mosaic.forward(query, key, value, spans, hooked, residuals=training)
+
+    with generation.assumed("sm90"):
+        zeros = [jnp.zeros(array.shape, array.dtype) for array in (query, key, key)]
+        op, args = attention_mosaic._forward_call(*zeros, spans, hooked, scale=None,
+                                                  natural=attention_mosaic.NATURAL)
+        ba = op.bind(*args, residuals=training, interpret=False)
+        config = op.derived(ba, generation.gpu_target())
+        assert config is not None, f"the Mosaic forward derives no config {width} wide"
+        found = compile_mosaic_kernels(
+            [KernelCase("forward", lambda: (forward, (query, key, key)), _forward_kernels(op, ba, config))],
+            "sm90")
+    assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
 
 
 @COMPILES_ON_CPU

@@ -147,16 +147,18 @@ def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
                                                           natural=natural, tiles=tiles, family=family)
 
     def launch(form: algebra.Forward, live: jax.Array | None) -> tuple[tuple, jax.Array, jax.Array]:
+        # The natural form's rewalk at its own tiles (`Tiles.relaunch`), its spans' block map of them.
+        at, at_spans = _form_tiles(spec, call, form, tiles, spans_of)
         if live is None:
-            status, out, *finished = _launch(q, k, v, spans_of, hooked, None, spec=form, hooks=hooks,
-                                             tiles=tiles, family=family, training=False, interpret=interpret,
+            status, out, *finished = _launch(q, k, v, at_spans, hooked, None, spec=form, hooks=hooks,
+                                             tiles=at, family=family, training=False, interpret=interpret,
                                              counted=form.natural == spec.natural, finishes=rows)
             return (out, *finished), status[0], status[1] > 0
         unit = guarded_columns(family, v.shape[-1], v.dtype)
-        guarded = guarded_tiles(family, tiles, unit, v.dtype)
+        guarded = guarded_tiles(family, at, unit, v.dtype)
         hooked_blocks = hooks.output_mod is not None
-        # The plain launch's legality held a guarded tile at `tiles` (`MosaicForward.legal`).
-        assert guarded is not None, tiles
+        # The plain launch's legality held a guarded tile at its tiles (`MosaicForward.legal`).
+        assert guarded is not None, at
         # A spans call's block map counts blocks of the launch's own key tile.
         guarded_spans = _spans_of(spec, call, guarded.block_q, guarded.block_k)
         blocks = []
@@ -190,6 +192,18 @@ def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
     return out, maximum, total, jnp.full(maximum.shape, -1, jnp.int32), output_split(out)
 
 
+def _form_tiles(spec: algebra.Forward, call, form: algebra.Forward, tiles: Tiles, spans_of):
+    """The tiles a launch of `form` takes, and its spans' block map: the call's own (`spec`'s form) at
+    `tiles`, the natural form's rewalk of a fold's call at `tiles.relaunch`, whose block map counts its own
+    key tile (`_spans_of`)."""
+    if form.natural == spec.natural:
+        return tiles, spans_of
+    at = tiles.relaunch
+    if (at.block_k, at.consumers) == (tiles.block_k, tiles.consumers):
+        return at, spans_of
+    return at, _spans_of(spec, call, at.block_q, at.block_k)
+
+
 def _output_hooked(out: jax.Array, hooks: Hooks, hooked: _Hooked) -> jax.Array:
     """The normalized output `out` `[B, H, Qp, Dv]` fp32 under the output hook in XLA, its parameters as the
     launches read them (`hooked`, padded to the call's blocks; `template.output_hooked`)."""
@@ -220,10 +234,12 @@ def _trained_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
     def launch(form: algebra.Forward, live: jax.Array | None):
         if live is None:
             counted = form.natural == spec.natural
-            found = _launch(q, k, v, spans_of, hooked, None, spec=form, hooks=hooks, tiles=tiles,
+            # The natural form's rewalk at its own tiles (`Tiles.relaunch`), its spans' block map of them.
+            at, at_spans = _form_tiles(spec, call, form, tiles, spans_of)
+            found = _launch(q, k, v, at_spans, hooked, None, spec=form, hooks=hooks, tiles=at,
                             family=family, training=False, interpret=interpret, peaks=True, counted=counted)
-            status, rows, anchors, others = _launch(q, k, v, spans_of, hooked, None, spec=form, hooks=hooks,
-                                                    tiles=tiles, family=family, training=True,
+            status, rows, anchors, others = _launch(q, k, v, at_spans, hooked, None, spec=form, hooks=hooks,
+                                                    tiles=at, family=family, training=True,
                                                     interpret=interpret, anchors=found, counted=counted)
             split = Split(others, rows[2], rows[3], rows[4])
             # Each row's anchor's value row (`[B, H, Qp, Dv]`): its key head's at its key, gathered.

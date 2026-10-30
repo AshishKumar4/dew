@@ -253,8 +253,26 @@ class MosaicForward(_Mainloop[Tiles]):
         def tiles(rows: int, walked: int, consumers: int) -> Tiles:
             return Tiles(rows, walked, 2, consumers, family.name)
 
-        return _derived(family, query.dtype, query.shape[1], key.shape[1], tiles,
-                        lambda config: self.legal(ba, config, target), overlapped=True)
+        config = _derived(family, query.dtype, query.shape[1], key.shape[1], tiles,
+                          lambda config: self.legal(ba, config, target), overlapped=True)
+        if config is None or self._natural:
+            return config
+        # The natural form's rewalk at the largest tile and the most consumers that hold its own registers,
+        # each dividing the config's (et-fwdhooks3: at the fold's tiles it spilled 2 KB at width 64).
+        relaunches = (dataclasses.replace(config, block_k=block, consumers=consumers, natural_form=True)
+                      for consumers in range(config.consumers, 0, -1)
+                      for block in extents(family, query.dtype, config.block_k)
+                      if config.block_k % block == 0)
+        relaunch = next((tiles for tiles in relaunches if self.legal(ba, tiles, target)), None)
+        if relaunch is None:
+            return None
+        return dataclasses.replace(config, relaunch_k=relaunch.block_k, relaunch_consumers=relaunch.consumers)
+
+    @property
+    def _natural(self) -> bool:
+        """Whether the call keeps its logits natural (`algebra.Forward.base2`'s condition: a score hook reads
+        them, or its scale times log2(e) reaches 1): its one form the natural one, no fold to rewalk."""
+        return self.natural or self.score_mod is not None or abs(self.scale) * algebra.LOG2E >= 1.0
 
     def staged_bytes(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> int:
         """The program's shared memory (`_forward_allocations`, `resources.shared_bytes`), at the call's
@@ -271,8 +289,9 @@ class MosaicForward(_Mainloop[Tiles]):
     def registers(self, ba: tokamax.BoundArguments, config: Tiles) -> int:
         family = bundle_of(config, ba.arguments["query"].dtype)
         query, value = ba.arguments["query"], ba.arguments["value"]
+        natural = config.natural_form or self._natural
         return _forward_registers(family, config, _width(value.shape[-1], family, query.dtype), query.dtype,
-                                  ba.arguments.get("residuals") is True)
+                                  ba.arguments.get("residuals") is True, natural=natural)
 
 
     def refusal(self, ba: tokamax.BoundArguments, family: mosaic.Family) -> Refusal | None:
@@ -284,16 +303,20 @@ class MosaicForward(_Mainloop[Tiles]):
         return refused(query.dtype, query.shape[3], value.shape[3], hooks, backward=False, family=family)
 
 
-def _forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dtype, residuals: bool) -> int:
+def _forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dtype, residuals: bool, *,
+                       natural: bool = False) -> int:
     """The registers a forward consumer holds at `tiles` (`resources.live_registers`): its weighted values'
     sums `[bq, Dv]` fp32 carried, and a step's logits fp32 beside its weights in the operands' dtype. A
     training forward (`_trained`, at its anchor known) holds the other keys' weights beside them too, in the
     operands' dtype, and the key indices int32 its anchor test compares, a thread's one per column its
     fragment holds, which its fragment's two rows share (an MMA accumulator's layout: half the tile's words;
     TWOPASS5-h100: uncounted, 64 x 128 on two consumers derived and spilled, 6.6 ms against 64 x 64's 1.06);
-    its peak walk holds less."""
+    its peak walk holds less. The `natural` form holds a step's masked logits beside their exponentials
+    (`algebra.natural_exp`), one fp32 tile more (et-livehook2: its peak's selects and exp2 beside the logits;
+    et-fwdhooks2: every hooked forward, the natural form alone, spilled at the fold's count)."""
     block_q, block_k = tiles.block_q, tiles.block_k
-    step = [(block_q, block_k, jnp.float32)] + [(block_q, block_k, dtype)] * (2 if residuals else 1)
+    step = ([(block_q, block_k, jnp.float32)] * (2 if natural else 1)
+            + [(block_q, block_k, dtype)] * (2 if residuals else 1))
     if residuals:
         step.append((block_q // 2, block_k, jnp.int32))
     return resources.live_registers(family, [(block_q, value_width, jnp.float32)], step)
