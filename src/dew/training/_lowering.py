@@ -240,7 +240,7 @@ class KernelReport:
 def kernel_report(routes, lowered: jax.stages.Lowered) -> KernelReport:
     """The `KernelReport` of a step whose trace reported `routes` and lowered to `lowered`, its calls without
     their kernels' IR, which nothing that reads a report reads: a run keeps the report after it releases
-    the program (`planning.Planned.released`, TightLynx)."""
+    the program (`planning.Planned.released`, the data lane)."""
     return KernelReport(tuple(routes), tuple(replace(call, ir=b"") for call in kernel_calls(lowered)))
 
 
