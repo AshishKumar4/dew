@@ -11,10 +11,10 @@ from __future__ import annotations
 import importlib
 import json
 import logging
-import multiprocessing
-import multiprocessing.process
 import os
 import shlex
+import subprocess
+import sys
 import tempfile
 import threading
 from collections.abc import Mapping, Sequence
@@ -414,9 +414,10 @@ class Profiler:
 
     def stop(self, *, wait: bool = True) -> None:
         """Stop the capture and export its reports and manifest: at once, or where not `wait`, in a process
-        of its own beside the caller's work, the capture already stopped, which `exported` completes and
-        the program's exit waits for. A training run's window stops so, since converting a capture takes
-        far longer than the steps it traced (row 2017: minutes for a 3-step window)."""
+        of its own beside the caller's work (`dew.telemetry.export`), the capture already stopped, which
+        `exported` waits for. A training run's window stops so, since converting a capture takes far longer
+        than the steps it traced (row 2017: minutes for a 3-step window). A stop that failed exports at
+        once, so its manifest records why, as it raises."""
         self._stop("completed", wait=wait)
 
     def _stop(self, body: str, *, wait: bool = True) -> None:
@@ -448,17 +449,14 @@ class Profiler:
         metadata["body_status"] = body
         if self._temporary:
             _logger.info("Profile saved under %s", self._directory)
-        if wait:
+        if wait or failures:
             _export(capture, converter, metadata, failures)
             return
-        if failures:
-            raise BaseExceptionGroup("Profile cleanup failed", failures)
-        # A fresh interpreter's: the conversion reads and writes on its own, and holds no lock the caller's
-        # steps take (the converter's native calls may hold the GIL throughout).
-        exporting = multiprocessing.get_context("spawn").Process(
-            target=_exported, args=(str(capture), metadata), name=f"dew-profile-export-{capture.name}")
-        exporting.start()
-        _exporting[capture] = exporting
+        # A fresh interpreter of the exporter alone, never the caller's program again: the conversion reads
+        # and writes on its own, and holds no lock the caller's steps take (the converter's native calls
+        # may hold the GIL throughout).
+        _exporting[capture] = subprocess.Popen(
+            [sys.executable, "-m", "dew.telemetry.export", str(capture), json.dumps(metadata)])
 
     def __enter__(self) -> Self:
         return self.start()
@@ -474,7 +472,7 @@ class Profiler:
                 exc.add_note(f"Profile cleanup/report failure: {error}")
 
 
-_exporting: dict[Path, multiprocessing.process.BaseProcess] = {}
+_exporting: dict[Path, subprocess.Popen[bytes]] = {}
 """The captures a stop left exporting in a process of their own (`Profiler.stop`), until `exported`."""
 
 
@@ -486,10 +484,9 @@ def exported(directory: Path | None = None) -> None:
     waited = [capture for capture in _exporting if root is None or capture.is_relative_to(root)]
     failed = []
     for capture in waited:
-        process = _exporting.pop(capture)
-        process.join()
-        if process.exitcode:
-            failed.append(f"{capture} (exit {process.exitcode}; its manifest records why)")
+        code = _exporting.pop(capture).wait()
+        if code:
+            failed.append(f"{capture} (exit {code}; its manifest records why)")
     if failed:
         raise RuntimeError("Profile export failed for " + ", ".join(failed))
 
@@ -510,8 +507,9 @@ def _export(capture: Path, converter: _Converter, metadata: dict[str, JSON],
         raise BaseExceptionGroup("Profile cleanup or export failed", failures)
 
 
-def _exported(capture: str, metadata: dict[str, JSON]) -> None:
-    """`_export` in an export's own process (`Profiler.stop`), whose exit code says whether it failed."""
+def exporting(capture: str, metadata: dict[str, JSON]) -> None:
+    """`_export` in an export's own process (`Profiler.stop`, `dew.telemetry.export`), whose exit code says
+    whether it failed."""
     _export(Path(capture), require_profile_support(), metadata, [])
 
 

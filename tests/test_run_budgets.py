@@ -208,8 +208,10 @@ POOL_DEALS = {
     # Physical shards each share reads its own of, the stream repeating them, one at a time or two.
     "dealt shards": lambda rows: rows,
     "dealt shards interleaved": lambda rows: rows.interleave(2),
-    # The stream repeated after a step, each share replaying its own shards.
+    # The stream repeated after a step, each share replaying its own shards, one at a time or two.
     "dealt shards rewound": lambda rows: rows.random_map(Untouched(), identity="untouched@1").repeat(),
+    "dealt shards rewound interleaved": lambda rows: rows.interleave(2).random_map(
+        Untouched(), identity="untouched@1").repeat(),
 }
 
 
@@ -232,6 +234,16 @@ def test_a_pools_shares_read_its_bound_once_however_its_read_deals_them(deal, ex
               for index in range(POOLED)]
     if deal == "one order":
         assert sum(shares, collections.Counter()) == examples_read(loader, DataPartition(), expanded=expanded)
+    elif deal.endswith("rewound interleaved"):
+        # A pass a later repeat replays is read whole before the next, so a share's interleave crosses no
+        # pass: the share reads its own shards' part of each pass the bound reaches, in its own order.
+        dealt = [dealt_shards(ids, examples, index, rewound=True) for index in range(POOLED)]
+        whole = [dealt_shards(ids, (examples // RECORDS + 1) * RECORDS, index, rewound=True)
+                 for index in range(POOLED)]
+        assert [sum(share.values()) for share in shares] == [sum(share.values()) for share in dealt]
+        assert all(set(share) <= set(own) for share, own in zip(shares, whole, strict=True))
+        passes = examples // RECORDS
+        assert all(count in (passes, passes + 1) for share in shares for count in share.values())
     elif streamed:
         assert shares == [dealt_shards(ids, examples, index, rewound=deal.endswith("rewound"))
                           for index in range(POOLED)]

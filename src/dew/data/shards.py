@@ -5,7 +5,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import threading
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 
 import grain.experimental as experimental
 import grain.python as grain
@@ -26,14 +26,14 @@ def streamed(
     loading: Loading,
     epochs: int | None = 1,
     name: str | None = None,
-    examples: int | None = None,
+    places: Sequence[tuple[Shard, int]] | None = None,
 ) -> grain.IterDataset:
     """The shards of `manifest` read `epochs` times over (endlessly where None), this share's part
-    of them interleaved `cycle_length` at a time; an endless read bounded to the stream's first `examples`
-    rows reads this share's places among them alone, the last in part (`bounded_places`), so its
-    interleave reads no later place's rows in their stead. An endless read of a store whose shards all
-    state they hold no row is refused, as it would read nothing forever; any other run of empty shards is
-    read through, logged at each doubling from `LONG_RUN` (`logged_run`)."""
+    of them interleaved `cycle_length` at a time; or, given an endless read's bound, this share's
+    `places` among the stream's first rows alone, each with the rows it reads of it (`bounded_places`),
+    so its interleave reads no later pass's rows in their stead. An endless read of a store whose shards
+    all state they hold no row is refused, as it would read nothing forever; any other run of empty
+    shards is read through, logged at each doubling from `LONG_RUN` (`logged_run`)."""
     if cycle_length < 1:
         raise ValueError("interleave cycle_length must be positive")
     described = name or (manifest.shards[0].uri if manifest.shards else "a stream")
@@ -41,8 +41,6 @@ def streamed(
         raise ValueError(f"{described} holds no rows, so reading it endlessly reads nothing forever")
     if not manifest.shards:
         return grain.MapDataset.source(()).to_iter_dataset()
-    places = None if examples is None else bounded_places(
-        manifest, partition=partition, seed=seed, loading=loading, epochs=epochs, examples=examples)
     if places is not None:
         reader = _Taken(manifest.reader)
         return _ShardPass(grain.MapDataset.source(places), reader, cycle_length, loading, described)
@@ -57,8 +55,9 @@ def bounded(manifest: ShardManifest, *, partition: DataPartition, seed: int | No
     `streamed` deals them (every count-th from the share's index): of an endless read, each pass its own
     order of places, the rows of each of its places the bound reaches (`_reached`); of one pass that a
     later repeat replays, each share its own places again, its rows in every whole pass the bound spans
-    and of its places the last pass reaches. So each share reads its own shards' part of the bound and
-    none repeats one while another's go unread. None where a shard states no rows."""
+    and of its places the last pass reaches, in its own order: the repeat reads each pass whole before
+    the next, so its interleave crosses no pass. So each share reads its own shards' part of the bound
+    and none repeats one while another's go unread. None where a shard states no rows."""
     shards = _shards(manifest, partition=partition, loading=loading)
     if any(shard.rows is None for shard in shards):
         return None

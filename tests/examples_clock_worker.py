@@ -118,7 +118,7 @@ def examples_clock(args) -> dict:
     # A run whose plan counts its steps ahead keeps no clock (`TrainState.consumed`).
     consumed = None if state.consumed is None else int(state.consumed)
     return {"step": int(state.step), "consumed": consumed, "counts": counts, "dealt": dealt,
-            "cooled": cooled, "logged": [scalars["train/examples_consumed"] for scalars in trained]}
+            "cooled": cooled, "logged": [scalars.get("train/examples_consumed") for scalars in trained]}
 
 
 MODES = {"examples_clock": examples_clock}
