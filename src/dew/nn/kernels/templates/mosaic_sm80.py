@@ -400,7 +400,7 @@ class Mma(mosaic.Family):
         transposed = isinstance(rhs, state_types.TransformedRef) and any(
             isinstance(transform, state_types.TransposeTransform) for transform in rhs.transforms)
         right = (plgpu.load(rhs, layout=self.rhs)
-                 if self.rhs_fragment_depth(rhs.shape[0], transposed=transposed) == rhs.shape[0] else None)
+                 if self.rhs_fragment_depth(int(rhs.shape[0]), transposed=transposed) == rhs.shape[0] else None)
         for start in range(0, rhs.shape[0], depth):
             part = (right[start:start + depth] if right is not None
                     else plgpu.load(rhs.at[pl.ds(start, depth)], layout=self.rhs))

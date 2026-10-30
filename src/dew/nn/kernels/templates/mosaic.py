@@ -353,9 +353,9 @@ class Ring:
     and each program's load barrier awaits the whole block. A release arrives at each program's barrier, so
     a slot is free once every consumer of every program has released it (CUTLASS's PipelineTmaAsync), and
     the producer's drain holds its program until the others' last releases have reached it."""
-    smem: Ref
-    full: state_types.AbstractRef
-    consumed: state_types.AbstractRef
+    smem: jax.Ref | state_types.TransformedRef
+    full: jax.Ref
+    consumed: jax.Ref
 
     @property
     def stages(self) -> int:
