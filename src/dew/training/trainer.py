@@ -217,6 +217,7 @@ from dew.training.tracker import Tracker
 from dew.training.transaction import (
     COMMIT_FIELDS,
     Committed,
+    PassesProgress,
     Transaction,
     compact_qk,
     loss_scale,
@@ -290,18 +291,18 @@ class Trainer(Generic[Loss, Effects]):
         `fit` builds over its `steps // accumulation` updates; the run steps the objective's
         (`Objective.optimizer`), made from it. `step` replaces the built-in transaction. A custom step then
         owns the clocks, the scaler, the EMA and the mutable writes, and the compiled wrapper owns only the
-        attempted-step counter. `rollout` runs once per batch read, before the step and outside replay.
-        `layout` and `mesh` say where the state lives: `mesh` a `MeshSpec` or a native `jax.sharding.Mesh` of
-        any axes, which `layout`'s rules name (`Layout.data_axes` its rows'). `microbatches` is how many a
-        pipelined step feeds through the mesh's stage axis, a multiple of its size; None feeds one a stage.
-        `lower_for`, a CUDA generation, lowers the first step for it in place of compiling it
-        (`dew.training._lowering.Lowered`); `ahead`, a step compiled ahead (`dew.training.ahead`), runs as the
-        first step where it is that program. `tune_kernels` opts in to the tuner
-        (`dew.nn.kernels.tuning.tune`), else each launch takes its derived config. `record` makes each step
-        return in its metrics what each evaluation, replays too, sampled or passed as a boundary
-        (`taken_record`). `links` states an axis's `Link` by name in place of measuring it (`_links`).
-        `param_dtype`, a dtype's name, stores the parameters the run draws fresh, as Flax's `param_dtype`
-        (`dew.state.drawn_in`); None keeps each module's own.
+        attempted-step counter; it passes a model that reads the run's progress it (`PassesProgress`).
+        `rollout` runs once per batch read, before the step and outside replay. `layout` and `mesh` say where
+        the state lives: `mesh` a `MeshSpec` or a native `jax.sharding.Mesh` of any axes, which `layout`'s
+        rules name (`Layout.data_axes` its rows'). `microbatches` is how many a pipelined step feeds through
+        the mesh's stage axis, a multiple of its size; None feeds one a stage. `lower_for`, a CUDA generation,
+        lowers the first step for it in place of compiling it (`dew.training._lowering.Lowered`); `ahead`, a
+        step compiled ahead (`dew.training.ahead`), runs as the first step where it is that program.
+        `tune_kernels` opts in to the tuner (`dew.nn.kernels.tuning.tune`), else each launch takes its derived
+        config. `record` makes each step return in its metrics what each evaluation, replays too, sampled or
+        passed as a boundary (`taken_record`). `links` states an axis's `Link` by name in place of measuring
+        it (`_links`). `param_dtype`, a dtype's name, stores the parameters the run draws fresh, as Flax's
+        `param_dtype` (`dew.state.drawn_in`); None keeps each module's own.
         """
         whole = read_whole(accumulation, split, step, layout, rollout, mesh)
         self.objective = objective
@@ -928,6 +929,9 @@ class Trainer(Generic[Loss, Effects]):
         if self.step is None:
             return Transaction(self.objective, self.optimizer, split * self.accumulation, shapes, copies,
                                split=split, record=self.record, fetch=fetch, examples=self._examples).step()
+        if not isinstance(self.step, PassesProgress):
+            # A custom step need not run the objective's loss, which refuses a model it passes no progress.
+            self.objective._refuse_unpassed_progress()
         custom = self.step(self.objective, self.optimizer)
 
         def run(current, batch, part, tokens, closes=None):

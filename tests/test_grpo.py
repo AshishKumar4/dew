@@ -19,7 +19,7 @@ import numpy as np
 import pytest
 from one_draw import assert_as_exact_as_the_reference
 from reference_error import assert_as_exact, declared_seeds, indexed_recording, recording, with_gradients
-from rl_support import TinyHead, TinyLogits, clipped_surrogate, token_mean
+from rl_support import Published, ScriptedSource, TinyHead, TinyLogits, clipped_surrogate, token_mean
 from steady_state import steady_state
 
 from dew.data.prompts import INFO_KEY, LENGTH_KEY, PROMPT_KEY, SOURCE_KEY, TRUTH_KEY, _utf8
@@ -239,6 +239,57 @@ def test_a_synchronous_collection_refuses_a_ratio_read_at_another_temperature():
         collected(GRPOObjective(TinyHead(vocab_size=VOCAB), PROMPT_WIDTH + RESPONSE_WIDTH - 1,
                                 sampling_temperature=0.7))
     collected(GRPOObjective(TinyHead(vocab_size=VOCAB), PROMPT_WIDTH + RESPONSE_WIDTH - 1))
+
+
+def test_an_asynchronous_rescore_reads_the_policy_at_the_progress_its_loss_reads():
+    """An asynchronous collection's proximal policy, rescored under the trainer's weights
+    (`Asynchronous.rescore`), is the policy the step's loss reads, at the updates the run has committed
+    (`Progress(state.updates)`; ledger 2635): over a DEX decoder half way through its anneal its
+    likelihoods are those its loss scores at those updates, not the run's end's, so a ratio over
+    unchanged weights is 1."""
+    import itertools
+
+    import optax
+
+    from dew.data.dataset import Loader
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.dex import DifferentialExtension
+    from dew.nn.progress import END, Progress
+    from dew.objectives.rl.scheduler import Asynchronous, scored_rows
+    from dew.objectives.rl.sessions import Call, Session, Status
+    from dew.training import Trainer
+
+    def drawn(task, sample, version):
+        call = Call((1, 2), (3 + sample, 4), (-0.5, -0.25), "stop", version)
+        return Session(str(task.id), "", sample, 0, (call,), Status.COMPLETED, float(sample))
+
+    model = CausalTransformer(vocab_size=VOCAB, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
+                              max_seq_len=12, dtype="float32", attention_impl="xla",
+                              dex=DifferentialExtension(((0, (0, 1)),), anneal_steps=10))
+    # A stale rollout's off-policy correction, which an asynchronous collection takes.
+    objective = GRPOObjective(model, seq_len=7, behavior_importance=2.0)
+    # A row a task, as many as a host's devices hold rows.
+    tasks = np.arange(1, 9, dtype=np.int32)
+    scheduler = RolloutScheduler(Asynchronous(ScriptedSource(drawn), Published(), objective, width=8,
+                                              rows=len(tasks), max_lag=1, ahead=0), groups=2)
+    seen = []
+
+    def rollout(state, batch, key):
+        # Each step's rescored rows beside the same rows scored at the step's updates and at the run's end.
+        packed = scheduler(state, batch, key)
+        seen.append((int(state.updates), np.asarray(packed[OLD_LOG_PROBS_KEY]),
+                     scored_rows(objective, state.variables, packed, Progress(state.updates)),
+                     scored_rows(objective, state.variables, packed, END)))
+        return packed
+
+    data = scheduler.tasks(Loader(train=lambda partition: itertools.repeat({"task_id": tasks}), val=None,
+                                  records=len(tasks), batch=len(tasks)))
+    Trainer(objective, optax.sgd(0.0), key=0, rollout=rollout).fit(data, steps=6, log_every=100,
+                                                                   checkpoint_every=None)
+    updates, rescored, stepped, ended = seen[-1]
+    assert updates == 5
+    np.testing.assert_array_equal(rescored, stepped)
+    assert not np.array_equal(rescored, ended)
 
 
 def test_a_run_names_a_method_that_builds_its_objective_and_its_rollout(tmp_path):
