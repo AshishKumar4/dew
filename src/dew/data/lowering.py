@@ -1548,10 +1548,13 @@ class _Build:
                 stored = _Marked(stored)
             placed = _Placed(identifiers=identifiers, rows=len(stored))
             rows = stored.map_with_index(placed) if last >= 0 else stored
-            # A store's missing record held as a marker is dropped later, so its pass holds no count known
-            # ahead; a memory source's root is the records it holds (`_Present`), every one of them.
-            records = len(stored) if _in_memory(source) or not marked else None
-            return self.shared(rows, pipeline, partition), 0, self.dealt(partition, records)
+            # A missing record held as a marker is dropped later: a source held in memory, or rows a memory
+            # read made, counts its records ahead, and a store's pass holds no count known ahead.
+            count: int | None = len(stored)
+            if present is None and marked:
+                count = (sum(record is not None for record in records)
+                         if _in_memory(source) or materialized(source) else None)
+            return self.shared(rows, pipeline, partition), 0, self.dealt(partition, count)
         keyed = _keyed(source)
         if materialized(source) and keyed is not source:
             # A memory read that ran no step before the cache holds the rows of the source it keys,
