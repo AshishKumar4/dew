@@ -102,6 +102,7 @@ def compile_only_tpus(topology: str) -> tuple:
     return tuple(topologies.get_topology_desc(topology, "tpu").devices)
 
 
+@functools.cache
 def compile_only_gpus(generation: str, count: int = 1, capacity: int | None = None) -> tuple:
     """`count` compile-only devices of the CUDA `generation`, none attached: XLA's CUDA backend compiles a
     program over them, a mesh's collectives included, as for that many of the generation's GPUs.
