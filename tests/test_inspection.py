@@ -3,6 +3,7 @@ holds, and logged one log late; a run that watches nothing compiles its step unc
 
 import json
 
+import flax.linen as nn
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -134,15 +135,15 @@ def test_a_custom_step_refuses_an_inspection():
 
 
 def test_a_non_finite_parameter_shows_in_its_summary():
-    """A parameter holding an infinity reports it in its non-finite count and its largest magnitude,
-    not a finite stand-in."""
+    """A parameter holding an infinity reports it in its non-finite share, one entry in four, and its
+    largest magnitude, not a finite stand-in."""
     class Infinite(Pulled):
         def fresh_variables(self, key, held):
             return {"params": {"w": jnp.asarray([jnp.inf, 1.0, 2.0, 3.0])}}
 
     logged = inspected(Trainer(Infinite(), optax.sgd(RATE), key=jax.random.key(0),
                                inspection=Inspection(paths=("w",), targets=("params",))), {"x": ROWS})
-    assert logged["inspect/params/w/non_finite"] == 1 and logged["inspect/params/w/abs_max"] == np.inf
+    assert logged["inspect/params/w/non_finite"] == 0.25 and logged["inspect/params/w/abs_max"] == np.inf
 
 
 def test_an_offline_view_builds_a_configured_optimizer():
@@ -181,3 +182,87 @@ def test_a_recorded_run_inspects_what_its_command_line_names(tmp_path):
     logged = scalars(runs / "inspected")
     assert "inspect/grads/l2" in logged[2] and "inspect/grads/l2" not in logged[1]
     assert any("q_proj" in name and name.endswith("/rms") for name in logged[2])
+
+
+class Block(nn.Module):
+    """A residual tanh layer, whose output a run watches by its kind."""
+
+    @nn.compact
+    def __call__(self, x, _=None):
+        return x + jnp.tanh(nn.Dense(x.shape[-1], name="dense")(x)), None
+
+
+class Stacked(nn.Module):
+    """Three blocks, run as a remat-scanned stack (`nn.scan` over `nn.remat`) or one after another."""
+
+    scanned: bool
+
+    @nn.compact
+    def __call__(self, x):
+        x = x.astype(jnp.float32)
+        if self.scanned:
+            scan = nn.scan(nn.remat(Block), variable_axes={True: 0}, split_rngs={True: True}, length=3)
+            x, _ = scan(name="blocks")(x, None)
+        else:
+            for _ in range(3):
+                x, _ = Block()(x)
+        return nn.Dense(1, name="head")(x)
+
+
+def watched_run(model, inspection):
+    from dew.inputs import Field, InputSpec
+    from dew.objectives.supervised import Supervised
+
+    objective = Supervised(model, lambda outputs, batch: jnp.square(outputs[:, 0]),
+                           inputs=InputSpec(Field("x", (FEATURES,))))
+    return Trainer(objective, optax.sgd(RATE), key=jax.random.key(0), inspection=inspection)
+
+
+def outputs_of(run, layers):
+    """Each block's output on the rows, from the run's own start, as the step's forward computes it."""
+    state, _, _ = run.place()
+    def blocks(module, name):
+        return isinstance(module, Block)
+    _, captured = run.objective.model.apply(jax.device_get(state.variables), jnp.asarray(ROWS),
+                                            capture_intermediates=blocks, mutable=["intermediates"])
+    leaves = jax.tree_util.tree_flatten_with_path(captured["intermediates"])[0]
+    found = [np.asarray(leaf) for path, leaf in leaves if "__call__" in jax.tree_util.keystr(path)]
+    # A scanned stack captures its blocks' outputs stacked on a first axis, in one leaf.
+    return list(found[0]) if len(found) == 1 else found[:layers]
+
+
+@pytest.mark.parametrize("scanned", [False, True], ids=["unrolled", "remat-scanned"])
+def test_a_sampled_step_summarizes_each_watched_modules_output(scanned):
+    """A sampled step summarizes the output of each module of a watched kind as its forward computed it:
+    each block's, one a layer under a remat-scanned stack, its mean, standard deviation and largest
+    magnitude the outputs' own within float32's summation error over them (n machine epsilons of their
+    mean magnitude), its non-finite share none, and nothing of a kind it does not watch (the head)."""
+    run = watched_run(Stacked(scanned=scanned), Inspection(modules=("Block",), targets=("params",)))
+    logged = inspected(run, {"x": ROWS})
+    blocks = sorted({name.rsplit("/", 1)[0] for name in logged if name.startswith("inspect/activations/")})
+    assert len(blocks) == 3 and not any("head" in name for name in logged if "activations" in name)
+    for prefix, values in zip(blocks, outputs_of(run, 3), strict=True):
+        truth = values.astype(np.float64)
+        bound = values.size * np.finfo(np.float32).eps * np.abs(truth).mean()
+        exact = {"mean": truth.mean(), "std": truth.std(), "abs_max": np.abs(truth).max()}
+        for statistic, value in exact.items():
+            assert abs(logged[f"{prefix}/{statistic}"] - value) <= bound, statistic
+        assert logged[f"{prefix}/non_finite"] == 0
+
+
+def test_a_watched_histogram_sums_to_its_whole_output():
+    """An opt-in histogram reports the share of a watched output's magnitudes in each decade, one scalar
+    a bin, which together are the whole output."""
+    watching = Inspection(modules=("Block",), targets=("params",), histogram=True)
+    run = watched_run(Stacked(scanned=False), watching)
+    logged = inspected(run, {"x": ROWS})
+    bins = [value for name, value in logged.items() if "/Block_0/histogram/" in name]
+    assert len(bins) > 1 and np.isclose(sum(bins), 1.0)
+
+
+def test_watching_a_kind_no_module_is_refused():
+    """A run watching a kind no module of its model is, which would log nothing it asked for, is refused
+    at its sampled step's trace, naming the kinds."""
+    with pytest.raises(ValueError):
+        unmatched = Inspection(modules=("*Attention",), targets=("params",))
+        inspected(watched_run(Stacked(scanned=False), unmatched), {"x": ROWS})
