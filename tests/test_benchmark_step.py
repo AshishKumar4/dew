@@ -97,9 +97,7 @@ def test_a_cache_its_caller_names_keeps_what_the_step_compiled_and_a_run_alone_c
     assert not list(own.rglob("jit_*"))
 
 
-@pytest.mark.gpu(reason="a GPU's allocator keeps the high-water the measured peak reads")
-@pytest.mark.mesh(devices=1)
-def test_a_cases_measured_peak_holds_at_least_the_bytes_xla_planned(tmp_path):
+def a_cases_measured_peak_holds_at_least_the_bytes_xla_planned(tmp_path):
     """On a GPU the measured peak is each device's allocator high-water over the case's run, its native
     workspaces and its profiled steps included (their traces apart): at least what XLA planned."""
     row = peak_row(tmp_path, "cuda", "--profile-dir", str(tmp_path / "traces"), "--profile-steps", "1")

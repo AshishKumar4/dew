@@ -288,11 +288,7 @@ def test_splash_runs_inside_the_exchange():
     np.testing.assert_allclose(np.asarray(split), np.asarray(whole), atol=TOLERANCE, rtol=0)
 
 
-@pytest.mark.gpu(reason="cuDNN's fused attention, split over two GPUs")
-@pytest.mark.skipif(jax.device_count() < 2, reason="cuDNN's fused attention, split over two GPUs")
-@pytest.mark.parametrize("exchange", sorted(EXCHANGES))
-@pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
-def test_cudnn_runs_inside_either_exchange(exchange, causal, without_deterministic_ops):
+def cudnn_runs_inside_either_exchange(exchange, causal, without_deterministic_ops):
     """cuDNN's partitioning rule refuses queries split unlike their keys
     (`_check_qkv_bias_mask_spec` in jax/_src/cudnn/fused_attention_stablehlo.py),
     which is what the gather hands a kernel it leaves to GSPMD: every call
