@@ -115,10 +115,13 @@ def inspected(trainer: Trainer, batch: Batch, *, steps: int | None = None) -> di
     trainer.scheduled(None if steps is None else steps // trainer.accumulation)
     state, _, _ = trainer.place()
     step, window = trainer.compile(state, batch), int(state.window_size)
-    # A window is split x accumulation microbatches (`TrainState.window_size`), and each call steps one
-    # split's parts of it, so the window's rest takes its rest over the split calls.
+    # A window is split x accumulation microbatches (`TrainState.window_size`), and each call steps a
+    # split's parts of it, a rejected part's place too: the window's rest, rounded up, in calls.
     split = window // trainer.accumulation
-    for _ in range((window - int(state.microstep) % window) // split):
+    committed = None
+    for _ in range(-(-(window - int(state.microstep) % window) // split)):
         state, *_, committed = step(state, batch, sampled=True)
-    assert committed is not None, "a trainer that inspects runs its own transaction, which commits"
+    if committed is None or not int(committed.count):
+        raise ValueError("the sampled window did not commit over this batch (a part of it rejected, its "
+                         "loss not finite); inspect a batch whose window commits")
     return logged(jax.device_get(committed.inspected))

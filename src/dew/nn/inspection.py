@@ -18,6 +18,7 @@ import flax.linen as nn
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax._src import core as jax_core
 
 INSPECTED = "inspected"
 """The collection watched modules sow their outputs' summaries into."""
@@ -96,19 +97,23 @@ class Watched:
     histogram: bool = False
 
 
-def called_with(run: Callable[[], object]) -> tuple[tuple, dict]:
-    """The arguments the first module call of `run` received, its model's own, as its caller made them:
-    for a forward an objective runs inside a transform, the inputs `Objective.watched_forward` reruns it on.
-    `run`'s outputs are unused, so a compiled step keeps only what computes the arguments."""
-    calls: list[tuple[tuple, dict]] = []
+def called_with(model: nn.Module, run: Callable[[], object]) -> tuple[tuple, dict]:
+    """The arguments `run` first calls `model` with, as its caller made them: for a forward an objective
+    runs inside a transform, the inputs `Objective.watched_forward` reruns it on. Only a call of `model`
+    itself (another module's, a guidance's own, is passed over) made in this trace counts, so its arguments
+    are this trace's values, never a transform's inside `run` (a `cond`, a `jit`); refused where `run`
+    makes none. `run`'s outputs are unused, so a compiled step keeps only what computes the arguments."""
+    traced, calls = jax_core.trace_ctx.trace, []
 
     def interceptor(next_fun, args, kwargs, context):
-        if not calls and context.method_name == "__call__":
+        if (not calls and context.method_name == "__call__" and type(context.module) is type(model)
+                and jax_core.trace_ctx.trace is traced):
             calls.append((args, kwargs))
         return next_fun(*args, **kwargs)
 
     with nn.intercept_methods(interceptor):
         run()
     if not calls:
-        raise ValueError("the forward called no module")
+        raise ValueError(f"the forward calls no {type(model).__name__} outside a transform of its own, whose "
+                         f"inputs a watched step would read; its activations cannot be watched")
     return calls[0]

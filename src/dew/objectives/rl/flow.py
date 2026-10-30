@@ -254,7 +254,7 @@ class FlowGRPOObjective(DiffusionObjective):
             # prediction hands the model there, whatever its guidance makes of them (a doubled batch, an
             # autoguidance's main call), read off that call (`called_with`).
             policy = self._policy(variables, batch)
-            args, kwargs = called_with(lambda: walk.at((), 0)(latents[:, 0], times[:, 0]))
+            args, kwargs = called_with(policy.model, lambda: walk.at((), 0)(latents[:, 0], times[:, 0]))
             inspected = self.watched_forward(step, policy.model, policy.params, *args, **kwargs)
         return Ratio(pg + self.beta * kl, mass), Aux(metrics, inspected=inspected)
 
