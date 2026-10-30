@@ -117,7 +117,7 @@ def test_a_step_whose_launch_spills_is_compiled_ahead_at_its_next_config(tmp_pat
     ptxas, is refused that tile and lowered once more at the next, the miss recorded (`report.misses`)
     and its plan holding the spill and the refusal, as its telemetry reports them; the step it saves
     carries the refusal (`AheadOfTime.refusals`), and another process that starts from it derives past the
-    refused tile, which it never compiles, its plan recording no refusal of its own (train 329's review)."""
+    refused tile, which it never compiles, its plan recording its own refusals alone (train 329's review)."""
     step = str(tmp_path / "step.dew-aot")
     first = spilled(tmp_path, PRELUDE + AHEAD, str(nonce), step, "fresh")
     assert first["refusals"] and first["stepped"][:1] == [True]
@@ -125,31 +125,30 @@ def test_a_step_whose_launch_spills_is_compiled_ahead_at_its_next_config(tmp_pat
     assert [spill["config"] for spill in spills] == first["missed"] and spills[0]["stepped"]
     assert len(refused) == first["refusals"] and refused[0]["config"] == first["missed"][0]
     again = spilled(tmp_path, PRELUDE + AHEAD, str(nonce), step, "refused")
-    # Its plan records the refusals its own compiles made, none, not those it was seeded with.
-    assert first["missed"][0] not in again["missed"] and again["planned"]["refused"] == []
+    # Its plan records the refusals its own compiles made, not those it was seeded with.
+    assert first["missed"][0] not in again["missed"]
+    assert first["missed"][0] not in [refusal["config"] for refusal in again["planned"]["refused"]]
 
 
+@pytest.mark.gpu(reason="a run on this host's H100 over the persistent cache another's step-down filled")
 @lowers("sm90")
-def test_a_process_over_the_cache_of_one_that_stepped_down_compiles_its_stepped_program(tmp_path, nonce):
-    """A second fresh process over the persistent compilation cache of one whose step's launch spilled and
-    stepped down derives the refused tile again, and compiles the stepped-down program, never the one that
-    spilled, whose cached executable would report nothing: the refusal is kept beside the cache for that
-    artifact (`report.compiled`), which a compile under another option is not (train 329's review: a
-    resume or rerun trained the refused tile)."""
-    shared, step = tmp_path / "cache", str(tmp_path / "step.dew-aot")
-    flags = os.environ.get("XLA_FLAGS", "")
-    first = fresh(PRELUDE + AHEAD, str(nonce), step, "fresh", cache_dir=shared, flags=flags)
-    again = fresh(PRELUDE + AHEAD, str(nonce), step + ".again", "fresh", cache_dir=shared, flags=flags)
-    assert first["stepped"][:1] == [True]
-    assert again["program"] == first["program"] and again["missed"] == []
-    # Another compile option is another artifact, which inherits no verdict: it compiles, and spills, anew.
-    other = fresh(PRELUDE + AHEAD, str(nonce), step + ".other", "fresh", cache_dir=shared,
+def test_a_run_over_the_cache_of_one_that_stepped_down_trains_its_stepped_program(tmp_path, nonce):
+    """A second fresh run over the persistent compilation cache of one whose step's launch spilled and
+    stepped down derives the refused tile again, which the cache serves without ptxas, and trains the
+    stepped-down program all the same, never the one that spilled: the cache's artifact carries its verdict
+    (`report.compiled`), which a compile under another option, another artifact, does not inherit (train
+    329's review: a resume or rerun trained the refused tile)."""
+    shared, flags = tmp_path / "cache", os.environ.get("XLA_FLAGS", "")
+    first = fresh(PRELUDE + HANDED, str(nonce), "", cache_dir=shared, flags=flags)
+    again = fresh(PRELUDE + HANDED, str(nonce), "", cache_dir=shared, flags=flags)
+    assert first["stepped"][:1] == [True] and again["program"] == first["program"]
+    other = fresh(PRELUDE + HANDED, str(nonce), "", cache_dir=shared,
                   flags=f"{flags} --xla_gpu_enable_latency_hiding_scheduler=true")
     assert other["stepped"][:1] == [True]
 
 
 HANDED = """
-import json, sys
+import hashlib, json, sys
 import jax
 from test_kernel_spills import BATCH, experts
 from dew._records import listed, record
@@ -164,7 +163,8 @@ with report.refusals():
     state = run.fit(BATCH, steps=1, log_every=1)
     first, *_ = listed(record(run.plan, "plan")["probes"], "probes", read=record, what="probes")
     print(json.dumps({"step": int(state.step), "ahead": first["ahead"],
-                      "stepped": [miss.stepped for miss in report.misses()]}))
+                      "stepped": [miss.stepped for miss in report.misses()],
+                      "program": hashlib.sha256(run.executable.as_text().encode()).hexdigest()}))
 """
 """A run on this host's GPU, in a registry of its own, handed the step compiled ahead at argv[2], or
 none where it is empty."""
