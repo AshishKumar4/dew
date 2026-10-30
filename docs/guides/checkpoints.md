@@ -300,17 +300,17 @@ A Colab runtime's disk goes with the runtime. Mounted Google Drive is a director
 
 <!-- not run: needs a Colab runtime with Google Drive; its objective, optimizer and key are the run's -->
 ```python
-import jax
 import tensorflow_datasets as tfds
 from google.colab import drive
 
 import dew
+from dew.cache import enable_compilation_cache
 from dew.data import TFDS, presets
 
 drive.mount("/content/drive")
 root = "/content/drive/MyDrive/runs/flowers"
 
-jax.config.update("jax_compilation_cache_dir", f"{root}/xla")  # compiled steps, which Dew keeps there
+enable_compilation_cache(f"{root}/xla")                      # compiled steps and the GPU's kernel picks
 # Prepared on the first runtime; a later one finds it there and prepares nothing.
 tfds.builder("oxford_flowers102", data_dir=f"{root}/data").download_and_prepare(file_format="array_record")
 train = TFDS("oxford_flowers102", path=f"{root}/data")

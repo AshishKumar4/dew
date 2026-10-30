@@ -1,5 +1,5 @@
 """The same program from two checkouts of Dew shares one compiled executable: a Pallas kernel's Triton
-module carries its source locations, which the pinned JAX's cache key strips (constraints.txt)."""
+module carries its source locations, which the pinned JAX's cache key strips (docs/installation.md)."""
 
 import json
 import os
