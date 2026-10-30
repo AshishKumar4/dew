@@ -131,6 +131,7 @@ def test_a_field_no_step_reads_stays_on_the_host_across_processes(tmp_path):
         assert report["unused_shape"] == [MESH_DEVICES]
         assert report["sum"] == 3 * MESH_DEVICES
 
+
 TOKEN_POOL_WAIT = 2 * 147.0
 """How long the token-budget pool's processes may take, from their spawn, before the test calls it hung: a
 hang guard, twice the slowest run measured, so a loaded container never reads as a hang. Its run is a spawn,
