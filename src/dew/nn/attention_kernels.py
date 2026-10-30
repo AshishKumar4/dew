@@ -130,9 +130,10 @@ class AttentionCase:
     """Whether the call's bias is one the template reads as a score hook in fp32 (`attention.
     template_attention`): 4-D, one term a key `[B or 1, H or 1, 1, K]` (ALiBi's) or dense `[B or 1, H or 1,
     Q, K]`, of at most fp32's width."""
-    dense_bias: bool
-    """Whether the call's bias varies by query (`[B or 1, H or 1, Q, K]`, a learned relative position's),
-    which the template reads a tile at a time (`template.biased`)."""
+    row_bias: bool
+    """Whether the call's bias varies by query and by batch row (`[B, H or 1, Q, K]`), which the template
+    reads a tile at a time a row (`template.biased`); a table every row shares (T5's `[1, H, Q, K]`) it
+    reads once a tile (`template.shared_place`)."""
     sinks: bool
     softcap: float | None
     arithmetic: bool
@@ -141,6 +142,11 @@ class AttentionCase:
     dropout: bool
     splash_mask: bool
     shards: int
+    form: str = "fast"
+    """The form the template computes in where it runs the call (`attention_route.FORMS`), as the
+    run chose it (`generation.chosen(attention_form=...)`): the old routes compute their own arithmetic
+    and take only 'fast', so an accurate call runs the template, or the reference path where the
+    template does not take it."""
 
     @property
     def cell(self) -> tuple[str | None, str]:
@@ -185,8 +191,12 @@ _ARITHMETIC = _Need('arithmetic', lambda case: not case.arithmetic,
                           "the call asks for arithmetic only the reference path computes "
                           "(`reference_only`)", row=INHERENT)
 _ON_GPU = _Need('backend', _on_gpu, "it runs on a GPU", row=INHERENT)
+_FAST = _Need('form', lambda case: case.form == "fast", "no accurate form", row=INHERENT)
+_FAST_HANDOFF = _Need('form', lambda case: case.form == "fast", "no accurate form", row=INHERENT,
+                      kind='handoff')
 
 FLASH_SUPPORTS = (
+    _FAST,
     _ON_GPU,
     _Need('document_bound', lambda case: case.documents is None or case.max_segments is not None,
                 "the call packs documents with no bound on a row's (`Coordinates.max_segments`), which its "
@@ -287,6 +297,7 @@ ops. Every
 fused kernel runs at the query's head width, values included (`widen_value_heads`)."""
 
 TRITON_SUPPORTS = (
+    _FAST,
     _ON_GPU,
     _Need('capability', lambda case: bf16_dot_runs(), "tokamax's Triton kernel needs sm80",
                 row=INHERENT),
@@ -334,6 +345,7 @@ TPU_BACKEND = _Need('backend', lambda case: generation.backend() == 'tpu', "it r
 descriptor (`AttentionCase.splash_mask`), the one fact that costs host-side work."""
 
 TPU_SUPPORTS = (
+    _FAST,
     # Elsewhere it runs interpreted, where 'tpu' is named.
     TPU_BACKEND,
     _Need('bias', lambda case: not case.bias, "splash takes no bias", row=INHERENT, kind='measured'),
@@ -396,10 +408,10 @@ TEMPLATE_SUPPORTS = (
     _Need('bias', lambda case: not case.bias or case.bias_hook,
           "the call's bias is not 4-D one term a key or a query's every key, or is wider than fp32, which "
           "the template's score hook reads it in", row=INHERENT),
-    _Need('dense_bias', lambda case: not case.dense_bias,
-          "the call's bias varies by query, which the template reads broadcast to every batch row and head, "
-          "unmeasured against the xla kernel in time and peak memory (named, it runs)", row='2523',
-          kind='measured'),
+    _Need('row_bias', lambda case: not case.row_bias,
+          "the call's bias varies by query and by batch row, which the xla kernel runs 7% faster (named, it "
+          "runs, in less memory); a table every row shares the template runs a third faster in half the "
+          "memory (ET-DBIAS-h100)", row='2523', kind='measured'),
     _Need('shards', lambda case: case.shards == 1,
           "an automatic sequence axis gathers the keys, and a pallas call would gather the queries back",
           row=INHERENT),
@@ -465,15 +477,17 @@ def _hosted(kernel: str) -> str:
 ATTENTION = Op[AttentionCase]('attention', (
     Kernel[AttentionCase]('flash', FLASH_SUPPORTS),
     Kernel[AttentionCase]('triton', TRITON_SUPPORTS),
-    Kernel[AttentionCase]('cudnn', CUDNN_SUPPORTS),
+    Kernel[AttentionCase]('cudnn', (_FAST, *CUDNN_SUPPORTS)),
     Kernel[AttentionCase]('tpu', TPU_SUPPORTS),
-    Kernel[AttentionCase]('xla', XLA_SUPPORTS, generic=True),
+    Kernel[AttentionCase]('xla', (_FAST_HANDOFF, *XLA_SUPPORTS), generic=True),
     Kernel[AttentionCase]('reference', (), generic=True),
     Kernel[AttentionCase]('template', TEMPLATE_SUPPORTS),
 ), _attention_preferred, _hosted, DECLARED)
 """Attention's selector: a declared cell's old route where it takes the call (`DECLARED`), else the call's
 kernel (`_attention_preferred`: the template on a GPU or a TPU, xla on a CPU), then flash, triton, cuDNN,
-splash, xla and the reference path, the first that takes the call. The template comes last, after the
+splash, xla and the reference path, the first that takes the call. The old routes take only the fast
+form (`AttentionCase.form`): an accurate call runs the template, or the reference path on a CPU; a
+decode call keeps its own kernels whatever the form (`DECODE`). The template comes last, after the
 reference path, which takes every call, so it runs where the preference names it or a call names it."""
 
 

@@ -37,13 +37,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import (
-    as_given,
-    assert_as_exact,
-    assert_as_exact_as_the_reference,
-    float64_forward,
-    ieee_fixture,
-)
+from float64_terms import float64_forward
+from one_draw import assert_as_exact_as_the_reference
+from reference_error import as_given, assert_as_exact, ieee_fixture
 from safetensors.numpy import load_file
 
 from dew.nn.vision import (

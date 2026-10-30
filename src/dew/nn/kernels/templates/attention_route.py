@@ -25,11 +25,13 @@ from dew.nn.kernels.templates import attention_mosaic, attention_portable, atten
 from dew.nn.kernels.templates.attention import (
     ACCURATE,
     NATURAL,
-    OUTPUT,
     Gradients,
     Hooks,
+    Kept,
     KeySpans,
+    Kind,
     Split,
+    shared_sum,
     takes_output_residuals,
 )
 
@@ -162,9 +164,9 @@ class _Pass:
 _ON_GPU = selection.Requirement[_Pass]('off_gpu', lambda case: case.on_gpu, "the call runs off a GPU",
                                        generation.INHERENT)
 MAINLOOP = selection.Op[_Pass]('attention_mainloop', (
-    selection.Kernel[_Pass]('mosaic', (_ON_GPU, selection.Requirement[_Pass].analysed(
+    selection.Kernel[_Pass]('mosaic', (_ON_GPU, selection.analysed(
         'declined', lambda case: case.mosaic, 'roadmap: the Mosaic template takes every call'))),
-    selection.Kernel[_Pass]('triton', (_ON_GPU, selection.Requirement[_Pass].analysed(
+    selection.Kernel[_Pass]('triton', (_ON_GPU, selection.analysed(
         'spans', lambda case: case.triton, generation.INHERENT))),
     selection.Kernel[_Pass]('portable', (), generic=True),
 ), preferred=lambda case: 'mosaic' if case.on_gpu else 'portable')
@@ -190,8 +192,12 @@ def _forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     backward's D where the call takes that (`takes_output_residuals`), whichever mainloop runs the backward
     (the residuals are every mainloop's, `output_split`)."""
     form = {"scale": config.scale, "natural": config.natural}
-    kept = (OUTPUT if residuals and takes_output_residuals(hooks, query.dtype, accurate=config.accurate)
-            else residuals)
+    if not residuals:
+        kept = Kept.NONE
+    elif takes_output_residuals(hooks, query.dtype, accurate=config.accurate):
+        kept = Kept.OUTPUT
+    else:
+        kept = Kept.SPLIT
     declined = attention_mosaic.forward_declined(query, key, value, spans, hooks, residuals=kept,
                                                  **form) if _on_gpu() else None
     mainloop = _mainloop(declined, spans, hooks, functools.partial(
@@ -199,7 +205,8 @@ def _forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     if mainloop == 'mosaic':
         return attention_mosaic.forward(query, key, value, spans, hooks, residuals=kept, **form)
     if mainloop == 'triton':
-        return attention_triton.forward(query, key, value, spans, hooks, residuals=residuals, **form)
+        return attention_triton.forward(query, key, value, spans, _spread(hooks, query), residuals=residuals,
+                                        **form)
     return attention_portable.attend(query, key, value, spans, hooks, block_q=PLAIN_TILE, block_k=PLAIN_TILE,
                                      pad=PLAIN_TILE, residuals=residuals, **form)
 
@@ -231,9 +238,24 @@ def _backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     if mainloop == 'mosaic':
         return attention_mosaic.backward(*call, residuals=residuals, rounded=rounded, **form)
     if mainloop == 'triton':
-        return attention_triton.backward(*call, residuals=residuals, rounded=rounded, **form)
+        grads = attention_triton.backward(query, key, value, spans, _spread(hooks, query), dout,
+                                          residuals=residuals, rounded=rounded, **form)
+        return dataclasses.replace(grads, score_params=tuple(
+            shared_sum(grad, param) for grad, param in zip(grads.score_params, hooks.score_params,
+                                                           strict=True)))
     return attention_portable.backward(*call, block_q=PLAIN_TILE, block_k=PLAIN_TILE, pad=PLAIN_TILE,
                                        residuals=residuals, rounded=rounded, **form)
+
+
+def _spread(hooks: Hooks, query: jax.Array) -> Hooks:
+    """`hooks` with each query, key or tile parameter spread over the batch rows and query heads it shares
+    (`template.shared_place`), as the frozen Triton mainloop indexes them; the other mainloops read them
+    shared."""
+    batch, heads = query.shape[0], query.shape[2]
+    return dataclasses.replace(hooks, score_params=tuple(
+        dataclasses.replace(param, value=jnp.broadcast_to(param.value,
+                                                          (batch, heads, *param.value.shape[2:])))
+        if param.kind in (Kind.QUERY, Kind.KEY, Kind.TILE) else param for param in hooks.score_params))
 
 
 def _hooks_cotangent(hooks: Hooks, grads: Gradients) -> Hooks:

@@ -23,13 +23,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import (
-    FEWEST_SEEDS,
-    assert_as_exact,
-    assert_as_exact_as_the_reference,
-    widened,
-    with_gradients,
-)
+from one_draw import assert_as_exact_as_the_reference
+from reference_error import FEWEST_SEEDS, assert_as_exact, widened, with_gradients
 from test_recurrence_chunk import chunk_on, token_by_token
 from test_recurrence_mosaic import NATIVE, REFUSED, refuses_its_gradient, taken, template_call
 from test_recurrence_stability import GRADIENT_SEEDS, REGIMES, SEEDS, SITES, cotangents, restarting, stressed

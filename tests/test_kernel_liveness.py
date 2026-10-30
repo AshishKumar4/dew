@@ -8,8 +8,7 @@ from jax._src.interpreters import mlir as jax_mlir
 from jax.extend.mlir import ir
 from jaxlib.mlir import passmanager
 from jaxlib.mosaic.python import mosaic_gpu as mosaic_gpu_dialect
-
-from dew.nn.kernels.templates.liveness import Compiler, kernel_peaks
+from kernel_liveness import Compiler, kernel_peaks, lowered_registers
 
 
 def serialized(body: str):
@@ -140,7 +139,6 @@ def test_the_compiler_input_accounts_for_a_transcendental_chain_kept_as_a_vector
 
 def test_each_lowered_launch_has_its_own_budget_and_residency():
     from dew.nn.kernels.generation import gpu_target
-    from dew.nn.kernels.templates import resources
 
     body = """
       module {
@@ -164,7 +162,7 @@ def test_each_lowered_launch_has_its_own_budget_and_residency():
       }
     """
     compiler = Compiler((13, 4), relocatable=True)
-    small, large = resources.lowered_registers(serialized(body), compiler)
+    small, large = lowered_registers(serialized(body), compiler)
     target = gpu_target("sm100")
     first = small.model(target, compiler, shared=0, tmem=0)
     second = large.model(target, compiler, shared=0, tmem=0)
@@ -172,3 +170,21 @@ def test_each_lowered_launch_has_its_own_budget_and_residency():
     assert first.most > second.most
     assert small.model(target, compiler, shared=target.shared_limit, tmem=0).most == 1
     assert small.model(target, compiler, shared=0, tmem=target.tmem_columns).most == 1
+
+
+def test_residency_charges_whole_register_allocation_units():
+    from dew.nn.kernels.generation import gpu_target
+    from dew.nn.kernels.templates import cost
+
+    # Two 384-thread blocks at 85 live registers would fit without allocation rounding. At the
+    # hardware's 88-register allocation they need 67,584 registers, beyond the 64K file.
+    assert cost.resident(gpu_target("sm90"), 0, 384, 85) == 1
+
+
+def test_a_launch_past_an_allocation_limit_has_no_residency():
+    from dew.nn.kernels.generation import gpu_target
+    from dew.nn.kernels.templates import cost
+
+    target = gpu_target("sm100")
+    assert cost.resident(target, target.shared_limit + 1, 256, 128) == 0
+    assert cost.resident(target, 0, 256, 128, tmem=target.tmem_columns + 1) == 0

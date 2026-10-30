@@ -30,6 +30,7 @@ from dew.nn.kernels.templates.attention import (
     floating_params,
     kept_dtype,
     power_of_two,
+    shared_place,
     whole,
 )
 
@@ -427,6 +428,8 @@ def _param(family: mosaic.Family, ref, kind: Kind, row, head, first, like, k_fir
     (`keys_first`, `[bk, bq]`) reads a tile parameter's entries from its keys-first copy `[B, H, Kp, Qp]`."""
     queries, keys = like.shape[::-1] if keys_first else like.shape
     rows, columns = pl.ds(first, queries), pl.ds(k_first, keys)
+    if kind in (Kind.QUERY, Kind.KEY, Kind.TILE):
+        row, head = shared_place(ref.shape, row, head)
     match kind:
         case Kind.HEAD:
             return ref[head]

@@ -149,7 +149,7 @@ class Mma(mosaic.Family):
         # keeps one program (`mosaic_gpu.derived`). On an A100 two took 0.73 to 0.93 of one program's
         # time, a product's geomean over 6 grouped and 4 dense rows, their outputs bitwise one program's
         # (CONSUMERS2); two consumers in one program took 1.04 to 1.50 (CONSUMERS1).
-        return cost.REGISTERS // (consumers * resources.THREADS * self.registers(consumers))
+        return cost.register_programs(consumers * resources.THREADS, self.registers(consumers))
 
     def column_registers(self, columns: int, dtype) -> int:
         # The accumulator's tiles are `m_warps * 16` rows by `n_warps * 8` columns, each warp's 16 x 8 a

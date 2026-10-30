@@ -335,8 +335,17 @@ def template_attention(query, key, value, causal: bool, sliding_window, *, sinks
                       key_runs=(key_runs, ("activation_batch", None, None, None)),
                       places=(places, ("activation_batch", None)), seed=(dropout_seed, (None,)),
                       bias=(None if bias is None else jnp.broadcast_to(
-                          bias, (query.shape[0], query.shape[2], jnp.shape(bias)[2], key.shape[1])),
-                            ("activation_batch", "activation_heads", None, None)))
+                          bias, (*jnp.shape(bias)[:3], key.shape[1])), _bias_axes(bias)))
+
+
+def _bias_axes(bias: jax.Array | None) -> tuple[str | None, ...]:
+    """A template call's bias's axes on the mesh: its batch rows and heads split with the call's where it
+    holds one a row and a head, and shared whole where it holds one for them all (`template.shared_place`:
+    T5's `[1, H, Q, K]` table read by every row, never broadcast); none for a call without one."""
+    if bias is None:
+        return (None,) * 4
+    rows, heads = jnp.shape(bias)[:2]
+    return ("activation_batch" if rows > 1 else None, "activation_heads" if heads > 1 else None, None, None)
 
 
 def weighted_values(equation, weights, value, *, precision=None) -> jax.Array:
@@ -823,6 +832,9 @@ def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, 
     if implementation == 'reference' or (implementation == 'xla' and (
             sinks is not None or softcap is not None or dropout_seed is not None)):
         mask = combined_attention_mask(query.shape[-3], key.shape[-3], causal, sliding_window, masked)
+        # The accurate form's products are IEEE fp32 (`attention_route.FORMS`), never a GPU's TF32.
+        if generation.chosen_kernel("attention_form", "fast") == "accurate":
+            precision = jax.lax.Precision.HIGHEST
         return reference_attention(query, key, value, mask=mask, bias=bias, sinks=sinks, softcap=softcap,
                                    dtype=dtype, precision=precision,
                                    force_fp32_for_softmax=force_fp32_for_softmax,
@@ -902,12 +914,14 @@ def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_sof
         mask=mask is not None, bias=bias is not None,
         bias_hook=(bias is not None and jnp.ndim(bias) == 4 and jnp.shape(bias)[-2] in (1, query.shape[1])
                    and jnp.dtype(bias.dtype).itemsize <= 4),
-        dense_bias=bias is not None and jnp.ndim(bias) == 4 and jnp.shape(bias)[-2] > 1,
+        row_bias=(bias is not None and jnp.ndim(bias) == 4 and jnp.shape(bias)[-2] > 1
+                  and jnp.shape(bias)[0] > 1),
         sinks=sinks is not None, softcap=softcap,
         arithmetic=reference_only(query, dtype, precision, force_fp32_for_softmax),
         narrows=_xla_kernel_narrows(query) or _xla_kernel_widens_less(),
         folds=folds(query, key, bias, mask, causal, sliding_window),
-        splash_mask=False, shards=sequence_shards(), dropout=dropout)
+        splash_mask=False, shards=sequence_shards(), dropout=dropout,
+        form=generation.chosen_kernel("attention_form", "fast"))
     # Splash's descriptor reads a concrete mask on the host, so it is built only where splash may run,
     # under a name that may choose it on a TPU (`TPU_BACKEND`); its tiling and every other requirement
     # read the case (`TPU_SUPPORTS`).

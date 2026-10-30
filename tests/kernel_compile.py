@@ -25,10 +25,10 @@ import jax
 import jax.experimental.topologies as topologies
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
+from kernel_liveness import Compiler, LoweredRegisters, lowered_registers
 
 from dew.nn.kernels.generation import assumed, capability, gpu_mesh, gpu_target
 from dew.nn.kernels.templates import report, resources
-from dew.nn.kernels.templates.liveness import Compiler
 from dew.training._lowering import kernel_calls, triton_kernels
 from dew.training.ahead import compile_only_gpus
 
@@ -124,7 +124,7 @@ def _compiled(case, generation: str, record: dict) -> tuple[list[str], dict[str,
     if "models" in record:
         record["lowered"] = {
             call.name: [dataclasses.asdict(launch)
-                        for launch in resources.lowered_registers(call.ir, _compiler())]
+                        for launch in lowered_registers(call.ir, _compiler())]
             for call in kernel_calls(lowered) if call.kind == "mosaic_gpu"}
     # A process whose persistent compilation cache is on keeps it on here (JAX settles that once a
     # process): a compile-only device's entry reads back as unloadable, with a warning, and compiles.
@@ -415,7 +415,7 @@ def _lowered_models(record: dict, kernels: list[dict], generation: str) -> dict[
             continue
         if len(launches) != 1:
             raise ValueError(f"{kernel['kernel']} has {len(launches)} launches but one compiled report")
-        launch = resources.LoweredRegisters(**launches[0])
+        launch = LoweredRegisters(**launches[0])
         models[kernel["kernel"]] = launch.model(target, _compiler(), shared=kernel["shared"],
                                                 tmem=kernel["tmem"])
     record["lowered_models"] = {name: dataclasses.asdict(model) for name, model in models.items()}

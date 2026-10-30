@@ -22,11 +22,11 @@ from dew.nn.kernels.templates import attention_algebra as algebra, mosaic, resou
 from dew.nn.kernels.templates.attention import (
     ACCURATE,
     NATURAL,
-    OUTPUT,
     TRACED_TILE,
     AttentionLaunch,
     Gradients,
     Hooks,
+    Kept,
     KeySpans,
     Kind,
     Param,
@@ -36,13 +36,9 @@ from dew.nn.kernels.templates.attention import (
     logit_scale,
     power_of_two,
 )
-from dew.nn.kernels.templates.attention_mosaic_backward import (
-    _dkv_allocations,
-    _dq_allocations,
-    _fused_allocations,
-    _launch_backward,
-    split_queries,
-)
+from dew.nn.kernels.templates.attention_mosaic_backward import _launch_backward
+from dew.nn.kernels.templates.attention_mosaic_dkv import _dkv_allocations
+from dew.nn.kernels.templates.attention_mosaic_dq import _dq_allocations
 from dew.nn.kernels.templates.attention_mosaic_forward import (
     _forward_allocations,
     _plain_forward,
@@ -50,6 +46,7 @@ from dew.nn.kernels.templates.attention_mosaic_forward import (
     guarded_columns,
     guarded_tiles,
 )
+from dew.nn.kernels.templates.attention_mosaic_fused import _fused_allocations
 from dew.nn.kernels.templates.attention_mosaic_program import (
     BackwardTiles,
     Tiles,
@@ -64,6 +61,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     refused,
     whole_tiles,
 )
+from dew.nn.kernels.templates.attention_mosaic_scores import split_queries
 from dew.nn.kernels.templates.base import Template, Unfitted
 
 
@@ -212,7 +210,7 @@ class MosaicForward(_Mainloop[Tiles]):
     output_width: int = TRACED_TILE
 
     def _fwd(self, query, key, value, start, end, query_ids, key_ids, score_params, output_params, initial,
-             drop=None, *, residuals: bool | str, interpret: bool, config: Tiles,
+             drop=None, *, residuals: Kept, interpret: bool, config: Tiles,
              return_residuals: bool = False):
         hooks = Hooks(self.score_mod, tuple(map(Param, score_params, self.score_kinds)), initial,
                       self.output_mod, tuple(map(Param, output_params, self.output_kinds)), drop)
@@ -221,10 +219,13 @@ class MosaicForward(_Mainloop[Tiles]):
             raise NotImplementedError(reason)
         spans = self.spans(start, end, query_ids, key_ids)
         form = {"scale": self.scale, "natural": self.natural, "tiles": config, "interpret": interpret}
-        if residuals is True:
-            return _trained_forward(query, key, value, spans, hooks, **form), None
-        # The inference walk, its rows beside the output where it keeps them (`OUTPUT`).
-        return _plain_forward(query, key, value, spans, hooks, rows=residuals == OUTPUT, **form), None
+        match residuals:
+            case Kept.SPLIT:
+                return _trained_forward(query, key, value, spans, hooks, **form), None
+            case Kept.NONE | Kept.OUTPUT:
+                # The inference walk, its rows beside the output where it keeps them.
+                return _plain_forward(query, key, value, spans, hooks, rows=residuals is Kept.OUTPUT,
+                                      **form), None
 
     def legal(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> bool:
         """`_Mainloop.legal`'s, and on a plain launch whose sums can pass fp32's largest (`algebra.headroom`),
@@ -233,7 +234,7 @@ class MosaicForward(_Mainloop[Tiles]):
         if not super().legal(ba, config, target):
             return False
         query, value = ba.arguments["query"], ba.arguments["value"]
-        if ba.arguments["residuals"] is True or not algebra.headroom(value.dtype):
+        if ba.arguments["residuals"] is Kept.SPLIT or not algebra.headroom(value.dtype):
             return True
         family = bundle_of(config, query.dtype)
         columns = guarded_columns(family, value.shape[3], value.dtype)
@@ -282,7 +283,8 @@ class MosaicForward(_Mainloop[Tiles]):
         width, value_width = (_width(array.shape[-1], family, query.dtype) for array in (query, value))
         steps = _padded(query.shape[1], key.shape[1], config)[1] // config.block_k
         allocations = _forward_allocations(family, config, width, value_width, query.dtype,
-                                           ba.arguments.get("residuals") is True, min(config.stages, steps))
+                                           ba.arguments.get("residuals") is Kept.SPLIT,
+                                           min(config.stages, steps))
         return resources.shared_bytes(family, _scope(family, allocations, reducing(
             family, config.consumers, self.score_mod, self.output_mod)))
 
@@ -291,7 +293,7 @@ class MosaicForward(_Mainloop[Tiles]):
         query, value = ba.arguments["query"], ba.arguments["value"]
         natural = config.natural_form or self._natural
         return _forward_registers(family, config, _width(value.shape[-1], family, query.dtype), query.dtype,
-                                  ba.arguments.get("residuals") is True, natural=natural)
+                                  ba.arguments.get("residuals") is Kept.SPLIT, natural=natural)
 
 
     def refusal(self, ba: tokamax.BoundArguments, family: mosaic.Family) -> Refusal | None:
@@ -324,27 +326,28 @@ def _forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dt
 
 @overload
 def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
-            *, scale: float | None = None, natural: bool = NATURAL, residuals: Literal[False] = False,
-            interpret: bool = False) -> jax.Array:
+            *, scale: float | None = None, natural: bool = NATURAL,
+            residuals: Literal[Kept.NONE] = Kept.NONE, interpret: bool = False) -> jax.Array:
     ...
 
 
 @overload
 def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
-            *, scale: float | None = None, natural: bool = NATURAL, residuals: Literal[True, "output"],
+            *, scale: float | None = None, natural: bool = NATURAL,
+            residuals: Literal[Kept.SPLIT, Kept.OUTPUT],
             interpret: bool = False) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, Split]:
     ...
 
 
 def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
-            *, scale: float | None = None, natural: bool = NATURAL, residuals: bool | str = False,
+            *, scale: float | None = None, natural: bool = NATURAL, residuals: Kept = Kept.NONE,
             interpret: bool = False):
     """The template's forward on this mainloop (`MosaicForward`): `query` `[B, Q, H, D]` over `key`
     `[B, K, Hk, D]` and `value` `[B, K, Hk, Dv]`, and the keys `spans` leaves each query under `hooks`, as
-    `dew.nn.kernels.templates.attention.reference` computes it; with `residuals` the training forward's,
-    its output with the backward's residuals as every mainloop's training forward gives them
+    `dew.nn.kernels.templates.attention.reference` computes it; with `residuals` `Kept.SPLIT` the training
+    forward's, its output with the backward's residuals as every mainloop's training forward gives them
     (`attention_portable.attend(residuals=True)`): the maxima and denominators `[B, H, Q]`, each query's
-    anchor key `[B, H, Q]` int32 and the split sums (`Split`); `residuals=OUTPUT` the same residuals of the
+    anchor key `[B, H, Q]` int32 and the split sums (`Split`); `Kept.OUTPUT` the same residuals of the
     inference walk, which keeps its output for the backward's D in place of an anchor (`output_split`,
     `takes_output_residuals`). `natural` keeps the logits natural
     (`algebra.Forward.base2`); `interpret` runs it on the CPU (Mosaic GPU's interpret mode), as a GPU of the
@@ -355,7 +358,7 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
 
 def forward_declined(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
                      hooks: Hooks | None = None, *, scale: float | None = None, natural: bool = NATURAL,
-                     residuals: bool | str = False) -> Refusal | None:
+                     residuals: Kept = Kept.NONE) -> Refusal | None:
     """Why `forward` runs no call of these arrays compiled on this device, or None
     (`MosaicForward.declined`)."""
     op, args = _forward_call(query, key, value, spans, hooks, scale=scale, natural=natural)
@@ -364,7 +367,7 @@ def forward_declined(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
 
 def forward_takes(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
                   hooks: Hooks | None = None, *, scale: float | None = None, natural: bool = NATURAL,
-                  residuals: bool | str = False) -> bool:
+                  residuals: Kept = Kept.NONE) -> bool:
     """Whether `forward` runs the call compiled on this device (`forward_declined`): its family has a
     bundle here, the call is one this mainloop takes (`refused`) and a config fits the device."""
     return forward_declined(query, key, value, spans, hooks, scale=scale, natural=natural,
@@ -400,7 +403,7 @@ DQ_ROWS = 7
 """The per-query rows a dQ step holds across its walk (`_backward_registers`)."""
 DKV_STATISTICS = 5
 """The per-query statistics a dK/dV step holds, the maximum, the denominator, the anchor, D and the anchor
-key (`attention_mosaic_backward._scores`): column vectors keys first, row vectors in a fused launch's queries
+key (`attention_mosaic_scores._scores`): column vectors keys first, row vectors in a fused launch's queries
 first (`_backward_registers`)."""
 
 
@@ -432,7 +435,7 @@ def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int
     carried = [(block_k, width // config.columns, jnp.float32), (block_k, value_width // config.columns,
                                                                  jnp.float32)]
     if config.fused and not split:
-        # Queries first (`attention_mosaic_backward._fused_launch`), on either layout: its statistics row
+        # Queries first (`attention_mosaic_fused._fused_launch`), on either layout: its statistics row
         # vectors.
         statistics = DKV_STATISTICS * family.row_registers(block_q, jnp.float32)
         dq_tile = [(block_q, width, jnp.float32)]

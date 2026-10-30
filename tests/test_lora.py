@@ -32,7 +32,8 @@ from affine_run import Replaying
 from flax import linen as nn
 from interop_support import extract_fixture, fixture_ids, hub_cache, peft_twin, transformers_arms
 from model_support import flat_tree
-from reference_error import as_given, assert_as_exact, assert_as_exact_as_the_reference, dew_programs, widened
+from one_draw import assert_as_exact_as_the_reference
+from reference_error import as_given, assert_as_exact, dew_programs, widened
 from safetensors.numpy import load_file
 from test_joined import row_joins
 

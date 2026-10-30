@@ -31,7 +31,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from attention_oracle import exact_attention
-from reference_error import as_given, assert_as_exact, assert_as_exact_as_the_reference, with_gradients
+from one_draw import assert_as_exact_as_the_reference
+from reference_error import as_given, assert_as_exact, with_gradients
 from whole_suite import timed
 
 from dew.nn.documents import CrossDocuments
@@ -807,7 +808,7 @@ def _mainloops(family: Family, options: dict) -> dict[str, Callable]:
     def mosaic_backward(query, key, value, spans, hooks, dout):
         # From the mainloop's own training forward's residuals, a guarded one's (its overflowed rows walk
         # again guarded, in the launch's form).
-        residuals = attention_mosaic.forward(query, key, value, spans, hooks, residuals=True,
+        residuals = attention_mosaic.forward(query, key, value, spans, hooks, residuals=template.Kept.SPLIT,
                                              **forward_options)[1:]
         return attention_mosaic.backward(query, key, value, spans, hooks, dout, residuals=residuals,
                                          **options)

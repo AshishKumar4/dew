@@ -16,13 +16,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from delta_rule_support import NAMES, fla_side, float64_truth, math, plain_prefix, recurrence, through
-from reference_error import (
-    as_given,
-    assert_as_exact,
-    assert_as_exact_as_the_reference,
-    widened,
-    with_gradients,
-)
+from one_draw import assert_as_exact_as_the_reference
+from reference_error import as_given, assert_as_exact, widened, with_gradients
 from tuned import taken
 
 from dew.nn import kernels
