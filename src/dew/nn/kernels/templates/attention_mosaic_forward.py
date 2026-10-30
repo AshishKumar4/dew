@@ -658,8 +658,24 @@ def _described(hooks: Hooks) -> Hooks:
     return jax.tree.map(lambda array: jax.ShapeDtypeStruct(jnp.shape(array), jnp.result_type(array)), hooks)
 
 
-@functools.lru_cache(maxsize=256)
 def _kernel_of(launch: _Launch) -> Callable:
+    return _mutated(dataclasses.replace(launch, spec=dataclasses.replace(launch.spec, scale=0.0)), launch)
+
+
+_SEEN = {}
+
+
+def _mutated(key, launch):
+    # Mutation check (never lands): a key without the spec's scale reuses the first scale's kernel.
+    if key not in _SEEN:
+        _SEEN[key] = _built(launch)
+    return _SEEN[key]
+
+
+_kernel_of.__wrapped__ = lambda launch: _built(launch)
+
+
+def _built(launch: _Launch) -> Callable:
     """`_launch`'s kernel for its static facts `launch`, built once for every call of them and reading no
     array: its hooks' functions and their arrays' shapes and dtypes (`_described`; the arrays the programs'
     refs), its operands' alike. A bound of 256 kernels keeps a process's memory bounded
