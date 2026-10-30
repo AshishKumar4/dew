@@ -47,13 +47,6 @@ def _coop_allocations(family: mosaic.Family, config: BackwardTiles, width: int, 
     return scoped, family.streams(blocks, stages, consumers)
 
 
-def _added(family: mosaic.Family, value: jax.Array, view, interpret: bool, smem) -> None:
-    """`value` added into `view` through `smem` a chunk of its columns at a time (`Family.added`)."""
-    chunk = smem.shape[-1]
-    for first in range(0, value.shape[1], chunk):
-        family.added(value[:, first:first + chunk], view.at[:, pl.ds(first, chunk)], interpret, smem=smem)
-
-
 def _coop_step(walk: _Backward, share: int, resident: tuple, exchanged, rows_of, coords_of, whole, add_dq,
                turns: tuple, index, slots, carry, accumulators, *, masked: bool | None = None):
     """Consumer `share`'s query tile `index` over the program's resident keys and values (`resident`):
@@ -145,8 +138,8 @@ def _coop_launch(query, key, value, dout, peak, total, anchor, delta, key_index,
             smem = out_smem.at[share]
 
             def add_dq(q_first, dq):
-                _added(family, dq, dq_ref.at[row, pl.ds(q_first, block_q), head, mine], walk.interpret,
-                       smem.at[pl.ds(0, block_q)])
+                family.added(dq, dq_ref.at[row, pl.ds(q_first, block_q), head, mine], walk.interpret,
+                             smem=smem.at[pl.ds(0, block_q)])
 
             step = functools.partial(_coop_step, walk, share, (k_smem, v_smem), exchanged, rows_of, coords_of,
                                      whole, add_dq, (staged_turn, read_turn))
@@ -167,8 +160,8 @@ def _coop_launch(query, key, value, dout, peak, total, anchor, delta, key_index,
                 lambda streams, lo, hi, counted: family.walk(streams, segments(lo, hi), (), shapes,
                                                              walk.interpret, first=counted))
             for value, ref in ((dk, dk_ref), (dv, dv_ref)):
-                _added(family, value, ref.at[row, pl.ds(k_first, block_k), key_head, mine], walk.interpret,
-                       smem.at[pl.ds(0, block_k)])
+                family.added(value, ref.at[row, pl.ds(k_first, block_k), key_head, mine], walk.interpret,
+                             smem=smem.at[pl.ds(0, block_k)])
 
         def consumer(index):
             for share in range(consumers):

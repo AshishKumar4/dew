@@ -188,17 +188,29 @@ def loaded(copies, issued: jax.Array | bool = True) -> None:
         plgpu.barrier_wait(barrier)
 
 
+def chunked(value: jax.Array, view, smem) -> list[tuple[jax.Array, object]]:
+    """`value` and its `view` a chunk of `smem`'s columns at a time, the whole where `smem` holds every one:
+    a stage narrower than the tile it moves (CUTLASS's sub-tiled epilogue, `staged_columns`)."""
+    width = smem.shape[-1]
+    if width >= value.shape[-1]:
+        return [(value, view)]
+    return [(value[..., first:first + width], view.at[..., pl.ds(first, width)])
+            for first in range(0, value.shape[-1], width)]
+
+
 def stored(parts, views, *, smem, wait: bool = True) -> None:
-    """Each of `parts` written whole to its view of `views` through the shared buffer `smem`, in turn, the
-    buffer reused once its copy has read it; the last copy waited for unless `wait` is false, when it
-    stays in flight, one store group (`Family.store_wait`)."""
-    last = len(parts) - 1
-    for index, (part, view) in enumerate(zip(parts, views, strict=True)):
+    """Each of `parts` written whole to its view of `views` through the shared buffer `smem`, in turn, a
+    chunk of its columns at a time where `smem` is narrower (`chunked`), the buffer reused once its copy
+    has read it; the last copy waited for unless `wait` is false, when it stays in flight, one store group
+    (`Family.store_wait`)."""
+    pieces = [piece for part, view in zip(parts, views, strict=True) for piece in chunked(part, view, smem)]
+    last = len(pieces) - 1
+    for index, (part, view) in enumerate(pieces):
         smem[...] = part.astype(smem.dtype)
         plgpu.commit_smem()
         plgpu.copy_smem_to_gmem(smem, view)
         if index < last:
-            # The next part writes `smem`: this copy's reads of it done first.
+            # The next piece writes `smem`: this copy's reads of it done first.
             plgpu.wait_smem_to_gmem(0, wait_read_only=True)
         elif wait:
             plgpu.wait_smem_to_gmem(0)
@@ -795,8 +807,9 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
 
     @abc.abstractmethod
     def added(self, value: jax.Array, view, interpret: bool, *, smem) -> None:
-        """`value` added into its view (fp32, in global memory) through `smem`, atomically against every
-        other role's adds into it; interpreted, a read and a write of the view, atomic against other
+        """`value` added into its view (fp32, in global memory) through `smem` (a chunk of its columns at a
+        time where `smem` is narrower, `chunked`), atomically against every other role's adds into it;
+        interpreted, a read and a write of the view, atomic against other
         programs' alone (the interpreter runs a program's roles at once and a grid's programs in turn)."""
 
     @abc.abstractmethod
@@ -1167,11 +1180,13 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
             # Mosaic GPU's interpreter (jax 0.11.2) takes no TMA reduction.
             view[...] = view[...] + value
             return
-        # A TMA reduce from `smem`, the previous add's reads of it done first; its writes go on.
-        plgpu.wait_smem_to_gmem(0, wait_read_only=True)
-        smem[...] = value
-        plgpu.commit_smem()
-        plgpu.copy_smem_to_gmem(smem, view, reduction_op="add")
+        # A TMA reduce from `smem` a chunk of its columns at a time (`chunked`), the previous add's reads of
+        # it done first; its writes go on.
+        for piece, place in chunked(value, view, smem):
+            plgpu.wait_smem_to_gmem(0, wait_read_only=True)
+            smem[...] = piece
+            plgpu.commit_smem()
+            plgpu.copy_smem_to_gmem(smem, place, reduction_op="add")
 
     def partials_ready(self, shape: tuple[int, ...], interpret: bool):
         return None if interpret else pl.get_global(plgpu.SemaphoreType.REGULAR(shape))
