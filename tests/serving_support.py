@@ -68,9 +68,15 @@ def assert_served_as_exact(task: TextGeneration, requests: Sequence[Served], lab
     # One server for every draw, as a deployment serves request after request: its programs compile
     # once, and a draw's prompts share no page with another's, their tokens drawn apart.
     server = Server.from_task(task, **serving)
+    services: dict[bytes, list] = {}
 
     def serve(row) -> list:
-        """The server's generations of `row`'s requests, queued in `rounds`, its prefix hits checked."""
+        """The server's generations of `row`'s requests, queued in `rounds`, its prefix hits checked: each row
+        served once, as a deployment serves a prompt, and asked again (the gate's check that a draw and an
+        arm are functions of their inputs) the generations of that one service, as a second would read the
+        pages and states the first left, which no other draw's prompt shares."""
+        if (key := np.asarray(row).tobytes()) in services:
+            return services[key]
         tickets, shared, before = [], [], server.prefix_hits
         for end in itertools.accumulate(rounds):
             tickets.extend(server.submit(served_inputs(row, requests[index], vocab), budget, key=index)
@@ -78,7 +84,8 @@ def assert_served_as_exact(task: TextGeneration, requests: Sequence[Served], lab
             server.run()
             shared.append(server.prefix_hits - before)
         assert hits is None or shared == list(hits), shared
-        return [ticket.result().host() for ticket in tickets]
+        services[key] = [ticket.result().host() for ticket in tickets]
+        return services[key]
 
     def likelihoods(generations) -> tuple:
         return tuple(np.asarray(generation.raw_log_probs[0], np.float32) for generation in generations)
