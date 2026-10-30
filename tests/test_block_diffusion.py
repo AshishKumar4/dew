@@ -18,6 +18,7 @@ from one_draw import assert_as_exact_as_the_reference
 from reference_error import as_given
 from safetensors.numpy import load_file
 
+from dew.batch import coordinates
 from dew.interop import diffusion_gemma as adapter
 from dew.nn.inputs import ModelInputs
 
@@ -316,8 +317,9 @@ def test_padded_prefill_keeps_each_rows_logical_cache_position(system):
     mask = jnp.array([[0, 0, 1, 1, 1], [1, 1, 1, 1, 1]], bool)
     positions = jnp.maximum(jnp.cumsum(mask, axis=1) - 1, 0)
     cache = model.apply(variables, 2, method=model.init_cache, mutable=["cache"])[1]["cache"]
-    cache = model.apply({**variables, "cache": cache}, tokens, attention_mask=mask,
-                        positions=positions, method=model.encode, mutable=["cache"])[1]["cache"]
+    cache = model.apply({**variables, "cache": cache}, tokens,
+                        coordinates=coordinates(tokens.shape, valid=mask, positions=positions),
+                        method=model.encode, mutable=["cache"])[1]["cache"]
     batched = np.asarray(model.apply({**variables, "cache": cache}, reference["canvas"]))
     for row, start in ((0, 2), (1, 0)):
         individual = prefill(model, variables, tokens[row:row + 1, start:])

@@ -16,6 +16,7 @@ import numpy as np
 import pytest
 from model_support import parameter_loss
 
+from dew.batch import coordinates
 from dew.interop import Pretrained
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
@@ -219,11 +220,12 @@ def test_prediction_cache_matches_reference_candidate_steps(source):
                                 method=loaded.model.init_mtp_cache, mutable=["cache"])[1]
     chunks = []
     for index in range(inputs.tokens.shape[1] - 1):
-        options = {"attention_mask": jnp.asarray(reference["valid"][:, index:index + 1]),
-                   "input_embeddings": jnp.asarray(reference["embeddings"][:, index + 1:index + 2])}
-        if rotary is None:
-            options["positions"] = jnp.asarray(positions[:, index:index + 1])
-        else:
+        valid = jnp.asarray(reference["valid"][:, index:index + 1])
+        options = {"input_embeddings": jnp.asarray(reference["embeddings"][:, index + 1:index + 2])}
+        # The step's layout laid out once (`Coordinates`): its validity, and one-axis positions where given.
+        options["coordinates"] = coordinates(valid.shape, valid=valid, positions=None if rotary is not None
+                                             else jnp.asarray(positions[:, index:index + 1]))
+        if rotary is not None:
             options["rotary_positions"] = jnp.asarray(rotary[:, index:index + 1])
         (logits, _), state = loaded.model.apply(
             {**loaded.variables, **state}, jnp.asarray(reference["hidden"][:, index:index + 1]),

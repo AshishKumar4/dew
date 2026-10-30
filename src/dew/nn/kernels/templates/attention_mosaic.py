@@ -146,10 +146,11 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
         registers `Template.legal` holds it to. A pinned or stored config is held to it as a derived one."""
         found = {family.name: family for family in layouts(target.generation, ba.arguments["query"].dtype)}
         family = found.get(config.family)
-        # A dQ launch's layout streams through a producer (`Family.stream`); a layout whose consumers feed
-        # their own rings (`split_queries`) runs the forward and the dK/dV launches, the keys-first one and
-        # the fused one, each consumer its own queries or keys over the stream they walk whole.
-        walks_whole = isinstance(config, Tiles) or config.queries_first
+        # A forward's and a dQ launch's layout streams through a producer (`Family.stream`); a layout whose
+        # consumers feed their own rings (`split_queries`) runs the dK/dV launches alone, the keys-first one
+        # and the fused one, each consumer its own keys over the stream they walk whole. The forward on it
+        # has no use the producer's layout does not serve, and deadlocked (row 2599): it is no config.
+        walks_whole = not isinstance(config, Tiles) and config.queries_first
         return (family is not None and (walks_whole or not split_queries(family))
                 and whole_tiles(family, config) and self.refusal(ba, family) is None
                 and super().legal(ba, config, target))
@@ -218,6 +219,13 @@ class MosaicForward(_Mainloop[Tiles]):
         if reason := refused(query.dtype, query.shape[3], value.shape[3], hooks, backward=False,
                              family=bundle_of(config, query.dtype)):
             raise NotImplementedError(reason)
+        if not (config.natural_form or self._natural(query)) and config.relaunch_k is None:
+            # A config naming no rewalk tiles (a pin's) rewalks at the ones derived for it (row 2621).
+            ba = self.bind(query, key, value, start, end, query_ids, key_ids, score_params, output_params,
+                           initial, drop, residuals=residuals, interpret=interpret)
+            relaunched = self._relaunched(ba, config, generation.gpu_target())
+            assert relaunched is not None, config
+            config = relaunched
         spans = self.spans(start, end, query_ids, key_ids)
         form = {"scale": self.scale, "natural": self.natural, "tiles": config, "interpret": interpret}
         match residuals:
@@ -229,15 +237,16 @@ class MosaicForward(_Mainloop[Tiles]):
                                       **form), None
 
     def legal(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> bool:
-        """Its launch's (`_launch_legal`), and a fold's natural rewalk where the config names its own tiles
-        (`Tiles.relaunch`: the derivation's and a tuning neighbour's, `_relaunched`), their key tile dividing
-        the config's and their consumers at most its, holding too (row 2584); a config that names none (a
-        pin's) rewalks at its own tiles, as a launch takes it."""
+        """Its launch's (`_launch_legal`), and a fold's natural rewalk: at the tiles the config names (the
+        derivation's and a tuning neighbour's, `Tiles.relaunch`), their key tile dividing the config's and
+        their consumers at most its, holding too (row 2584); a config that names none (a pin's) at the tiles
+        derived for it, which its launch takes (`_relaunched`, row 2621)."""
         if not self._launch_legal(ba, config, target):
             return False
-        if (config.natural_form or self._natural(ba)
-                or (config.relaunch_k, config.relaunch_consumers) == (None, None)):
+        if config.natural_form or self._natural(ba.arguments["query"]):
             return True
+        if (config.relaunch_k, config.relaunch_consumers) == (None, None):
+            return self._relaunched(ba, config, target) is not None
         relaunch = config.relaunch
         return (config.block_k % relaunch.block_k == 0 and relaunch.consumers <= config.consumers
                 and self._launch_legal(ba, relaunch, target))
@@ -280,7 +289,7 @@ class MosaicForward(_Mainloop[Tiles]):
         tiles it spilled 2 KB at width 64); a call that keeps its logits natural rewalks nothing. None where
         no tile holds the rewalk."""
         config = dataclasses.replace(config, relaunch_k=None, relaunch_consumers=None)
-        if self._natural(ba):
+        if self._natural(ba.arguments["query"]):
             return config
         family = bundle_of(config, ba.arguments["query"].dtype)
         relaunches = (dataclasses.replace(config, block_k=block, consumers=consumers, natural_form=True)
@@ -299,10 +308,10 @@ class MosaicForward(_Mainloop[Tiles]):
         found = (self._relaunched(ba, neighbour, target) for neighbour in super().neighbours(ba, config))
         return tuple(neighbour for neighbour in found if neighbour is not None)
 
-    def _natural(self, ba: tokamax.BoundArguments) -> bool:
-        """Whether the call keeps its logits natural, as its launch decides (`algebra.folds`, at the scale
-        and power of two its queries take, `prescale`): its one form the natural one, no fold to rewalk."""
-        query = ba.arguments["query"]
+    def _natural(self, query: jax.Array) -> bool:
+        """Whether the call of `query` keeps its logits natural, as its launch decides (`algebra.folds`, at
+        the scale and power of two its queries take, `prescale`): its one form the natural one, no fold to
+        rewalk."""
         power, scale = prescale(query.dtype, query.shape[3], self.scale)
         return not algebra.folds(scale, power, natural=self.natural, score_mod=self.score_mod)
 
@@ -322,7 +331,7 @@ class MosaicForward(_Mainloop[Tiles]):
     def registers(self, ba: tokamax.BoundArguments, config: Tiles) -> int:
         family = bundle_of(config, ba.arguments["query"].dtype)
         query, value = ba.arguments["query"], ba.arguments["value"]
-        natural = config.natural_form or self._natural(ba)
+        natural = config.natural_form or self._natural(ba.arguments["query"])
         return _forward_registers(family, config, _width(value.shape[-1], family, query.dtype), query.dtype,
                                   ba.arguments.get("residuals") is Kept.SPLIT, natural=natural)
 
@@ -629,7 +638,8 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
             launches = [(family, config, _fused_allocations(family, config, width, dtype, q_stages))]
         else:
             launches = [(dkv_family, config.dkv, _dkv_allocations(
-                dkv_family, config.dkv, width, value_width, dtype, stages=q_stages, columns=config.columns))]
+                dkv_family, config.dkv, width, value_width, dtype, stages=q_stages, columns=config.columns,
+                tiled=Kind.TILE in self.score_kinds))]
         if not config.fused:
             launches.append((family, config, _dq_allocations(family, config, width, value_width, dtype,
                                                              min(config.stages, padded_k // config.block_k))))

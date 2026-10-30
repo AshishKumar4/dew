@@ -19,6 +19,7 @@ from block_support import VOCAB, block_causal, model, wrapped
 from model_support import model_draw
 from reference_error import assert_as_exact
 
+from dew.batch import coordinates, token_coordinates
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.kernels import generation
 from dew.nn.mixers import AttentionMixer
@@ -372,6 +373,10 @@ def test_whole_blocks_read_as_their_block_causal_reading(case):
     params = decoder.init(jax.random.key(1), ids)
     given = {name: jnp.asarray(value) if isinstance(value, np.ndarray) else value
              for name, value in fields.items()}
+    # The case's flat layout laid out once (`Coordinates`), the layout `hidden_states` reads.
+    given["coordinates"] = token_coordinates(ids.shape, segments=given.pop("segment_ids", None),
+                                             valid=given.pop("attention_mask", None),
+                                             right_padded=given.pop("right_padded", False))
 
     def states(**whole):
         return decoder.apply(params, ids, method=CausalTransformer.hidden_states, mutable=["qk"], **given,
@@ -392,7 +397,7 @@ def test_whole_blocks_route_as_the_non_causal_call_by_documents():
     segments, blocks = jnp.asarray(SEGMENTS), jnp.asarray(WHOLE)
 
     def states(decoder, **fields):
-        return np.asarray(decoder.apply(params, ids, segment_ids=segments,
+        return np.asarray(decoder.apply(params, ids, coordinates=coordinates(ids.shape, segments=segments),
                                         method=CausalTransformer.hidden_states, **fields))
 
     np.testing.assert_array_equal(states(decoder, block_groups=blocks, whole_blocks=True),
@@ -402,7 +407,8 @@ def test_whole_blocks_route_as_the_non_causal_call_by_documents():
         bf16 = decoder.clone(attention_impl="auto", dtype="bfloat16", head_dim=64)
         shapes = jax.eval_shape(lambda: bf16.init(jax.random.key(1), ids))
         with generation.assumed("sm90"), generation.routes() as found:
-            jax.jit(lambda params: bf16.apply(params, ids, segment_ids=segments,
+            laid = coordinates(ids.shape, segments=segments)
+            jax.jit(lambda params: bf16.apply(params, ids, coordinates=laid,
                                               method=CausalTransformer.hidden_states, **fields)).trace(shapes)
         return [(route.choice, route.kernel) for route in found]
 

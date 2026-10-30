@@ -15,6 +15,7 @@ import numpy as np
 import pytest
 from one_draw import assert_as_exact_as_the_reference
 
+from dew.batch import coordinates
 from dew.interop.pretrained import Pretrained
 from dew.objectives.rl.grpo import GRPOObjective
 from dew.objectives.rl.sessions import ROUTED_EXPERTS_KEY, ROUTED_KEY, Call, Session, Status, pack
@@ -80,7 +81,8 @@ def test_the_trainer_routes_every_token_as_the_record_says(objective):
     grpo, variables = objective
     _, batch = engine_batch()
     ids = batch["input_ids"]
-    packing = {"segment_ids": batch["text_segment_ids"], "positions": batch["text_positions"]}
+    packing = {"coordinates": coordinates(segments=batch["text_segment_ids"],
+                                          positions=batch["text_positions"])}
     covered = batch[ROUTED_KEY][:, :-1]
 
     def sown(record):

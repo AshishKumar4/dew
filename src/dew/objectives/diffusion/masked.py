@@ -32,12 +32,13 @@ import jax.numpy as jnp
 from flax import linen as nn
 
 from dew.artifacts import TokenScores
-from dew.batch import TEXT_KEY, Batch, Variables, real_slots, thaw
+from dew.batch import TEXT_KEY, Batch, Variables, flat_field, real_slots, thaw
 from dew.diffusion.discrete import MDLM_STEPS, REVEALED_UNDEFINED, Confident, DiscreteProcess, Unmask, aligned
 from dew.inference.tasks import MaskedGeneration, MaskedSettings, recorded_processor, recorded_tokenizer
 from dew.inputs import Field, InputSpec
 from dew.nn.moe import ROUTER_COLLECTION
 from dew.nn.precision import at_least_fp32
+from dew.nn.progress import progressed
 from dew.nn.protocols import Lacks, TokenModel
 from dew.objectives.base import OMITTED, Aux, EMASpec, Omitted, Ratio, Shown, Source, Step, ended, model_rngs
 from dew.objectives.lm.chunked import final_read, refuse_without_logits
@@ -73,6 +74,7 @@ class MaskedDiffusionObjective(HeadedObjective[Ratio | RoutedStatistics, Variabl
 
     saved_task = MaskedGeneration
     settings = MaskedSettings
+    passes_progress = True
     shown: Mapping[str, Shown] = {
         "masked_accuracy": Shown(better="higher", percent=True), "masked_fraction": Shown(percent=True)}
 
@@ -253,8 +255,9 @@ class MaskedDiffusionObjective(HeadedObjective[Ratio | RoutedStatistics, Variabl
         fields = prepared.token_fields
         real = real_slots(fields, tokens.shape)
         for media in ("image_indices", "audio_indices"):
-            if media in fields:
-                real &= fields[media] < 0
+            indices = flat_field(fields, media)
+            if indices is not None:
+                real &= indices < 0
         rows = tokens.shape[0]
         # MDLM's antithetic times: each example a point in its own stratum of the update's examples.
         places, count = step.places(rows)
@@ -272,7 +275,7 @@ class MaskedDiffusionObjective(HeadedObjective[Ratio | RoutedStatistics, Variabl
         observed = final_read(self.model, params, masked, train=train,
                               rngs=model_rngs(dropout_key, training=train),
                               mutable=opened or False, capture_intermediates=False,
-                              **prepared.kwargs())
+                              **prepared.kwargs(), **progressed(self.model, self.progress(step)))
         read, sown = observed if opened else (observed, {})
         read = aligned(self.model, read, fields)
         # MDLM's SUBS parameterization gives the mask token no mass: it is

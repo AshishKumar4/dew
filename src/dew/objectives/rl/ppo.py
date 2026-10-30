@@ -12,12 +12,13 @@ import numpy as np
 from flax import linen as nn, struct
 
 from dew._coordination import agreed, from_every_process
-from dew.batch import Batch, Variables, part
+from dew.batch import Batch, Coordinates, Variables, coordinates, part, token_coordinates
 from dew.distributed.batches import shard_batch
 from dew.inference.tasks import Processor, TextGeneration, TextSettings
 from dew.nn.dense import Dense
 from dew.nn.inputs import ModelInputs, local_rows, mesh_of
 from dew.nn.precision import at_least_fp32
+from dew.nn.progress import END, Progress, ReadsProgress, progressed
 from dew.nn.protocols import HiddenStates
 from dew.objectives.base import (
     OMITTED,
@@ -64,8 +65,9 @@ class ValueHead(nn.Module):
     """Projects a decoder's hidden states to one value per position, at least float32: a bf16 or
     float32 backbone's in float32, a float64 twin's in float64.
 
-    Packed rows pass their chains' `segment_ids` and `positions`, so no
-    hidden state sees another chain.
+    Packed rows pass their chains' layout, as `coordinates` or as their
+    `segment_ids` and `positions`, which the call converts once
+    (`token_coordinates`), so no hidden state sees another chain.
     """
 
     backbone: HiddenStates
@@ -76,12 +78,23 @@ class ValueHead(nn.Module):
         as they are."""
         return projected_parts(params, {"backbone": self.backbone}, updated=updated)
 
+    @nn.nowrap
+    def reads_progress(self) -> bool:
+        """Whether its backbone's computation changes over a run (`dew.nn.progress.ReadsProgress`)."""
+        return isinstance(self.backbone, ReadsProgress) and self.backbone.reads_progress()
+
     @nn.compact
     def __call__(self, tokens: jax.Array, *, segment_ids: jax.Array | None = None,
-                 positions: jax.Array | None = None) -> jax.Array:
-        hidden = self.backbone.hidden_states(
-            tokens, train=False, segment_ids=segment_ids, positions=positions
-        )
+                 positions: jax.Array | None = None, coordinates: Coordinates | None = None,
+                 progress: Progress = END) -> jax.Array:
+        """Each token's value, the backbone's states over `tokens` laid out by their `coordinates`, or
+        by their flat `segment_ids` and `positions` converted once (both refused, `token_coordinates`),
+        at the run's `progress` where the backbone reads it (`dew.nn.progress`)."""
+        laid = token_coordinates(tokens.shape[:2], coordinates, segments=segment_ids, positions=positions)
+        # A backbone that reads the run's progress takes it; any other is called as it always is.
+        hidden = (self.backbone.hidden_states(tokens, train=False, coordinates=laid, progress=progress)
+                  if self.reads_progress() else
+                  self.backbone.hidden_states(tokens, train=False, coordinates=laid))
         return Dense(1, dtype=at_least_fp32(hidden.dtype), name="value")(hidden)[..., 0]
 
 
@@ -122,9 +135,9 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
     `value_coefficient` weights verl's half-squared, clipped value error, and
     `value_clip` is that error's clip range.
 
-    `critic` reads packed token rows with their `segment_ids` and
-    `positions` and returns `[B, T]` values; `ValueHead` gives a decoder that
-    interface.
+    `critic` reads packed token rows laid out by their `coordinates`
+    (`dew.batch.Coordinates`) and returns `[B, T]` values; `ValueHead` gives a
+    decoder that interface, and takes flat `segment_ids` and `positions` too.
     """
 
     # The loss is a policy-gradient surrogate plus the critic's, so only the
@@ -134,6 +147,9 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
     saved_task = TextGeneration
     settings = TextSettings
     ema_is_reference = True
+    # The actor's loss passes its policy the run's progress (`GRPOObjective.loss`), and the critic's its
+    # critic (`_critic_scores`).
+    passes_progress = True
     _model_part = "policy"
 
     def __init__(self, model, seq_len: int, *, critic: nn.Module,
@@ -214,14 +230,17 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
         """
         return self._critic_scores(variables, batch)[0]
 
-    def _critic_scores(self, variables: Variables, batch: Mapping[str, object], *, qk_stats: bool = False
-                       ) -> tuple[jax.Array, Variables | None]:
-        """The critic's values and, when requested, the QK collection from that same forward."""
+    def _critic_scores(self, variables: Variables, batch: Mapping[str, object], *, qk_stats: bool = False,
+                       progress: Progress = END) -> tuple[jax.Array, Variables | None]:
+        """The critic's values and, when requested, the QK collection from that same forward, at the run's
+        `progress` where the critic reads it."""
         ids = jnp.asarray(batch[IDS_KEY], jnp.int32)
         segments = jnp.asarray(batch[SEGMENT_IDS_KEY], jnp.int32)
-        values = self.critic.apply(part(variables, "critic"), ids[:, :-1], segment_ids=segments[:, :-1],
-                                   positions=jnp.asarray(batch[POSITIONS_KEY], jnp.int32)[:, :-1],
-                                   mutable=["qk"] if qk_stats else False)
+        # The rollout's packed columns laid out once (`Coordinates`), the layout the backbone reads.
+        laid = coordinates(ids[:, :-1].shape, segments=segments[:, :-1],
+                           positions=jnp.asarray(batch[POSITIONS_KEY], jnp.int32)[:, :-1])
+        values = self.critic.apply(part(variables, "critic"), ids[:, :-1], coordinates=laid,
+                                   mutable=["qk"] if qk_stats else False, **progressed(self.critic, progress))
         qk = None
         if qk_stats:
             values, gathered = values
@@ -242,7 +261,8 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
         policy_step = replace(step, ema=None if step.ema is None else part(step.ema, "policy"))
         pg, aux = self.actor.loss(part(variables, "policy"), batch, policy_step)
         mask = jnp.asarray(batch[RESPONSE_MASK_KEY])
-        values, critic_qk = self._critic_scores(variables, batch, qk_stats=step.qk_stats)
+        values, critic_qk = self._critic_scores(variables, batch, qk_stats=step.qk_stats,
+                                                progress=self.progress(step))
         terms = clipped_value_loss_terms(values, jnp.asarray(batch[RETURNS_KEY]),
                                          jnp.asarray(batch[OLD_VALUES_KEY]), self.value_clip)
         critic = Ratio(jnp.sum(jnp.where(mask != 0, terms, 0) * mask), jnp.sum(mask))

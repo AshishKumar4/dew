@@ -35,10 +35,10 @@ from typing_extensions import TypeVar
 from dew._hashing import array_fingerprint
 from dew._records import finite
 from dew.batch import (
-    POSITIONS_FIELD,
     VALIDITY_FIELD,
     Variables,
-    coordinates as token_layout,
+    coordinates as laid_out,
+    flat_field,
     prefix_sum,
     real_slots,
     token_positions,
@@ -409,8 +409,8 @@ def prefill_state(model: nn.Module, params: Variables, inputs: ModelInputs, ops:
     if ops.record is not None:
         states = _context(model, params, updated)
     drawn = logits if selective else logits[rows, slot]
-    rotary = inputs.token_fields.get("rotary_positions")
-    logical = rotary if rotary is not None else token_positions(inputs.token_fields)
+    rotary = flat_field(inputs.token_fields, "rotary_positions")
+    logical = jnp.asarray(rotary) if rotary is not None else token_positions(inputs.token_fields)
     state = DecoderState(updated["cache"], drawn, next_position(inputs.token_fields, real),
                          None if states is None else states[rows, slot])
     if rebuild_position(model) is not None:
@@ -530,14 +530,15 @@ def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | N
     def run(state: DecoderState, tokens: jax.Array, valid: jax.Array
             ) -> tuple[DecoderState, jax.Array, jax.Array | None]:
         width = tokens.shape[1]
-        positions = ({} if state.positions is None else
-                     {POSITIONS_FIELD: state.positions[:, None] + jnp.arange(width)[None, :]})
+        # The step's tokens laid out once (`Coordinates`): the real ones, at the places the rows reach.
+        laid = laid_out(tokens.shape, valid=valid, positions=None if state.positions is None else
+                        state.positions[:, None] + jnp.arange(width)[None, :])
+
         def append():
             return model.apply(
                 {**params, "cache": state.cache}, jnp.where(valid, tokens, pad_id),
-                decode=True, attention_mask=valid, mutable=["cache", *recorded], rngs=None,
-                method="states_and_logits" if exposed else None,
-                capture_intermediates=False, **positions)
+                decode=True, coordinates=laid, mutable=["cache", *recorded], rngs=None,
+                method="states_and_logits" if exposed else None, capture_intermediates=False)
 
         history, lengths = state.tokens, state.lengths
         original = rebuild_position(model)
@@ -562,7 +563,8 @@ def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | N
                     state.cache)
                 answer, updated = model.apply(
                     {**params, 'cache': empty}, history,
-                    attention_mask=jnp.arange(history.shape[1])[None, :] < following[:, None],
+                    coordinates=laid_out(history.shape, valid=jnp.arange(history.shape[1])[None, :]
+                                         < following[:, None]),
                     decode=True, mutable=['cache'], method='states_and_logits' if exposed else None)
                 rows = jnp.arange(tokens.shape[0])[:, None]
                 # The same answer `append` gives: states beside the logits where the model exposes them.
@@ -619,7 +621,7 @@ def _drafting(model: nn.Module, params: Variables, pad_id: int):
         # position, and a depth takes it under its own name.
         rotary = positions.ndim == 3
         rows, width = valid.shape
-        laid = token_layout((rows, width), valid=valid, positions=None if rotary else positions)
+        laid = laid_out((rows, width), valid=valid, positions=None if rotary else positions)
         (logits, states), updated = model.apply(
             {**params, "cache": state.cache}, hidden, ids, depth=depth, coordinates=laid,
             rotary_positions=positions if rotary else None, input_embeddings=embeds, decode=True,
@@ -638,8 +640,9 @@ def _drafting(model: nn.Module, params: Variables, pad_id: int):
 def _block_drafting(model: nn.Module, params: Variables):
     """`DecodeOps.record` and `DecodeOps.draft` over the model's block drafter."""
     def record(state: DecoderState, context: jax.Array, valid: jax.Array) -> DecoderState:
-        _, updated = model.apply({**params, "cache": state.cache}, context, None, valid=valid,
-                                 method="draft", mutable=["cache"])
+        _, updated = model.apply({**params, "cache": state.cache}, context, None,
+                                 coordinates=laid_out(valid.shape, valid=valid), method="draft",
+                                 mutable=["cache"])
         return dataclasses.replace(state, cache=updated["cache"])
 
     def draft(state: DecoderState, tokens: jax.Array,

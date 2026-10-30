@@ -17,6 +17,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from attention_oracle import attention_terms, kept
 from flax import linen as nn
 from jax.sharding import Mesh, PartitionSpec
 from reference_error import assert_as_exact, with_gradients
@@ -44,6 +45,7 @@ from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.inputs import counted_places
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import attention as template, attention_route
+from dew.nn.precision import Numerics
 
 HEADS, KV_HEADS, WIDTH = 4, 2, 32
 MESH_TENSOR, MESH_HEADS = 4, 8
@@ -418,21 +420,6 @@ def test_a_bias_of_the_key_heads_is_refused_by_the_template_not_read_past():
         scaled_dot_product_attention(query, key, key, bias=bias, causal=True, implementation="template")
 
 
-@pytest.mark.parametrize(("target", "rows", "template_runs"),
-                         [("sm90", 1, True), ("sm90", 2, False), ("sm80", 1, False)],
-                         ids=["a shared table on an H100", "a bias a row", "a shared table off an H100"])
-def test_auto_takes_a_dense_bias_to_the_template_where_it_measured_faster(target, rows, template_runs):
-    """A call whose bias varies by query goes to the template by itself only where it measured faster
-    than the xla kernel (ET-DBIAS-h100): a table every batch row shares, on an H100, whose Mosaic mainloop
-    reads it once a tile; a bias a row, or a shared table off an H100 (its Triton mainloop reads it spread
-    to every row), goes to the attention kernels' other paths (rows 2523, 2577)."""
-    query = jnp.zeros((2, 64, HEADS, 64), jnp.bfloat16)
-    bias = jnp.zeros((rows, HEADS, 64, 64), jnp.float32)
-    with generation.assumed(target):
-        route = attention.resolve_implementation("auto", query, query, bias=bias)
-    assert (route.kernel == "template") is template_runs
-
-
 DENSE_BIAS_SEEDS = 8
 """Check 1's declared seeds for a dense bias named onto the template."""
 
@@ -461,8 +448,33 @@ def test_a_dense_bias_named_onto_the_template_is_on_par_with_the_reference_path(
         return with_gradients(lambda query, key, value, bias: scaled_dot_product_attention(
             query, key, value, bias=bias, causal=True, implementation=implementation))
 
+    keep = kept(queries, queries, causal=True)
+
+    def terms(query, key, value, bias, dout):
+        # A query of one key has a dQ of zero in float64, which a D from the rounded output rounds to
+        # its own size (`attention_terms`, its bias's terms the fifth).
+        return tuple(attention_terms(query, key, value, dout, keep, bias=bias))
+
     assert_as_exact(jax.jit(attended("template")), jax.jit(attended("reference")), drawn,
-                    f"a dense bias of {rows} rows and {heads} heads on the template", seeds=DENSE_BIAS_SEEDS)
+                    f"a dense bias of {rows} rows and {heads} heads on the template", seeds=DENSE_BIAS_SEEDS,
+                    terms=terms)
+
+
+def test_a_biased_query_of_one_key_has_nonzero_gradient_terms_where_its_gradient_is_zero():
+    """attention_terms with a bias every row shares: the first query of a causal call keeps one key, so its
+    query gradient is zero in float64, and its terms are not (a D from the rounded output rounds it to their
+    size); the bias's own gradient's terms have the bias's shape, summed over the rows it shares."""
+    rng = np.random.default_rng(0)
+    query, key, value, dout = (rng.standard_normal((3, 16, 2, 8)) for _ in range(4))
+    bias = 0.5 * rng.standard_normal((1, 2, 16, 16))
+    keep = kept(16, 16, causal=True)
+    _, dq_terms, _, _, bias_terms = attention_terms(query, key, value, dout, keep, bias=bias)
+    with jax.enable_x64(new_val=True):
+        _, pull = jax.vjp(lambda q, k, v, b: scaled_dot_product_attention(
+            q, k, v, bias=b, causal=True, implementation="reference"), query, key, value, bias)
+        dq = np.asarray(pull(dout)[0])
+    assert np.all(dq[:, 0] == 0) and np.all(dq_terms[:, 0] > 0)
+    assert bias_terms.shape == bias.shape
 
 
 @pytest.mark.skipif(generation.device_generation() != "sm90",
@@ -471,12 +483,31 @@ def test_a_dense_bias_named_onto_the_template_is_on_par_with_the_reference_path(
 @pytest.mark.parametrize("case", ["causal", "packed-documents", "sinks-softcap"])
 def test_an_fp16_call_on_an_h100_is_on_par(case):
     """fp16 on an H100, whose Mosaic backward takes bf16 alone (`attention_mosaic.refused`), so its forward
-    and backward compose two mainloops: on par with the reference path (check 1) whatever they run."""
+    and backward compose two mainloops: on par with the reference path (check 1) whatever they run. A call
+    without sinks is judged a term at a time (`attention_terms`): a query that keeps one key has a dQ of
+    zero in float64, which a D formed from the rounded output rounds to its own size (G14's H100 flow,
+    gate-g14f-h100)."""
     queries, keys = geometry(CASES[case])
     draw = drawing(queries, keys, jnp.float16, sinks=bool(CASES[case].get("sinks")))
     template_pass = jax.jit(pulled("template", CASES[case]))
     assert_as_exact(template_pass, jax.jit(pulled("reference", CASES[case])), draw,
-                    f"fp16 Mosaic forward, Triton backward, {case}", seeds=SEEDS)
+                    f"fp16 Mosaic forward, Triton backward, {case}", seeds=SEEDS,
+                    terms=False if CASES[case].get("sinks") else _terms(CASES[case], queries, keys))
+
+
+def _terms(case: dict, queries: int, keys: int):
+    """The float64 terms of `case`'s output and gradients (`attention_terms`) over the keys it keeps, a
+    function of a draw `(query, key, value, sinks, dout)`."""
+    names = keywords(case)
+    keep = kept(queries, keys, causal=case.get("causal", False), sliding_window=case.get("sliding_window"),
+                segment_ids=names.get("segment_ids"))
+
+    def terms(query, key, value, sinks, dout):
+        del sinks
+        # The sinks' gradient, which a call without sinks holds as None.
+        return (*attention_terms(query, key, value, dout, keep), None)
+
+    return terms
 
 
 @pytest.mark.gpu(reason="walks a sequence of thousands of keys, on a GPU")
@@ -494,11 +525,12 @@ def test_a_long_sequence_is_on_par_with_the_reference_path(length, dtype):
 
 
 def test_the_accurate_form_is_one_option_away():
-    """`generation.chosen(attention_form='accurate')` runs every template call in the accurate form (natural
-    logits and the accurate products, `attention_route.FORMS`), its forward and gradients bitwise a call's
-    that names that form, and 'fast' runs the default, a call's that names none; the two forms differ; a
-    form the template does not have is refused. Bit for bit by construction: the choice resolves to the
-    named form's arguments before the call traces, so the two calls trace one program."""
+    """A run's numerics in the accurate forms (`generation.run_precision`, `Numerics.forms`) run every
+    template call in the accurate form (natural logits and the accurate products, `attention_route.FORMS`),
+    its forward and gradients bitwise a call's that names that form, and the fast forms run the default, a
+    call's that names none; the two forms differ; a form the template does not have is refused. Bit for bit
+    by construction: the forms resolve to the named form's arguments before the call traces, so the two
+    calls trace one program."""
     spans = template.spans(QUERIES, KEYS, ROWS, causal=True)
     query, key, value, _, dout = drawing(QUERIES, KEYS, jnp.float32, sinks=False)(0)
 
@@ -508,14 +540,14 @@ def test_the_accurate_form_is_one_option_away():
 
     found = {}
     for form, named in (("accurate", {"natural": True, "accurate": True}), ("fast", {})):
-        with generation.chosen(attention_form=form):
+        with generation.run_precision(Numerics(forms=form)):
             found[form] = jax.tree.leaves(jax.jit(routed)(query, key, value))
         want = jax.tree.leaves(jax.jit(functools.partial(routed, **named))(query, key, value))
         for mine, theirs in zip(found[form], want, strict=True):
             np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs), err_msg=form)
     assert any(not np.array_equal(accurate, fast) for accurate, fast in zip(*found.values(), strict=True))
-    with generation.chosen(attention_form="exact"), pytest.raises(ValueError):
-        attention_route.attend(query, key, value, spans)
+    with pytest.raises(ValueError):
+        Numerics(forms="exact")
 
 
 def test_narrowed_operands_hand_back_their_gradients_unrounded():
@@ -690,56 +722,3 @@ def test_a_pass_the_mosaic_mainloop_declines_reports_its_reason_under_its_row():
     [refused] = attention_route.MAINLOOP.kernel("triton").failed(
         attention_route._Pass(on_gpu=True, mosaic=None, triton=spans))
     assert (refused.code, refused.row) == ("dropout", generation.INHERENT)
-
-
-@pytest.mark.parametrize("target", [None, "sm80", "sm90"], ids=["cpu", "a100", "h100"])
-@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
-def test_an_accurate_call_on_the_default_route_runs_the_template_or_the_reference_path(target, dtype):
-    """Under `generation.chosen(attention_form='accurate')`, the default route ('auto') runs a call on the
-    template or the reference path, which compute the form, never on an old route, whose arithmetic is
-    its own (row 2350: FlashAttention, cuDNN, xla and splash ran an accurate run's calls fast); the fast
-    form keeps its kernels as before."""
-    import contextlib
-
-    from dew.nn.attention import attention_case
-    from dew.nn.attention_kernels import ATTENTION
-    from dew.nn.kernels.generation import assumed, chosen
-    from dew.nn.kernels.selection import select
-
-    query = jnp.zeros((2, 64, 4, 32), dtype)
-    placed = contextlib.nullcontext() if target is None else assumed(target)
-    with placed:
-        with chosen(attention_form="accurate"):
-            accurate = select(ATTENTION, attention_case(query, query, causal=True)).kernel
-        fast = select(ATTENTION, attention_case(query, query, causal=True)).kernel
-    assert accurate in ("template", "reference"), accurate
-    # On a GPU the fast form takes an old route (FlashAttention's, xla's), which the accurate one refuses;
-    # a CPU runs both on the reference path.
-    if target is not None:
-        assert fast not in ("template", "reference"), fast
-    else:
-        assert fast == accurate
-
-
-@pytest.mark.gpu(reason="a GPU's fp32 products default to TF32, which a CPU's never do")
-def test_an_accurate_call_the_template_refuses_runs_the_reference_path_on_ieee_products():
-    """An accurate call the template does not take on a GPU, one with an arbitrary mask, runs the
-    reference path, whose fp32 products the accurate form holds to IEEE fp32 (`Precision.HIGHEST`),
-    never TF32, forward and backward, so a run recorded accurate computes in its form (row 2350's
-    review, Attention)."""
-    import re
-
-    from dew.nn.kernels.generation import chosen
-
-    query = jnp.ones((1, 64, 4, 32), jnp.float32)
-    mask = jnp.tril(jnp.ones((64, 64), bool))[None, None]
-
-    def attend(query):
-        # A caller's explicit default precision, which the float32 products keep where it is named.
-        return attention.scaled_dot_product_attention(query, query, query, mask=mask,
-                                                      precision=jax.lax.Precision.DEFAULT)
-
-    with chosen(attention_form="accurate"):
-        lowered = jax.jit(jax.grad(lambda query: attend(query).sum())).lower(query).as_text()
-    dots = [line for line in lowered.splitlines() if "dot_general" in line and "f32" in line]
-    assert dots and all(re.search(r"precision = \[HIGHEST, HIGHEST\]", line) for line in dots), dots

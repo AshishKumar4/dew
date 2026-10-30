@@ -20,7 +20,7 @@ from jax.experimental import checkify
 from jax.experimental.layout import Format, Layout
 from jax.sharding import Mesh, NamedSharding
 
-from dew.batch import VALIDITY_FIELD, Variables
+from dew.batch import VALIDITY_FIELD, Variables, coordinates, real_slots
 from dew.inference.tasks import cache_sized
 from dew.mesh import logical_spec
 from dew.nn.attention_blocks import CROSS_KEY, CROSS_VALUE
@@ -290,7 +290,7 @@ def _advanced(model: nn.Module, params: Variables, pad_id: int, placement: Place
     mixed = admission is not None and placement.mixed
     if mixed:
         assert admission is not None
-        real = jnp.any(admission.prompts.token_fields[VALIDITY_FIELD], axis=1)
+        real = jnp.any(real_slots(admission.prompts.token_fields, admission.prompts.tokens.shape), axis=1)
         state = _seated(state, state.decoder, real, admission, placement.groups)
     elif admission is not None:
         state = _seated(state, *placement.prefilled(model, params, pad_id, state, admission), admission,
@@ -334,13 +334,15 @@ def _mixed_step(model: nn.Module, params: Variables, pad_id: int, placement: Pla
     step takes its last piece's. A piece continuing its row (a paged cache's
     shared prefix, a chunked prompt) reads the row's earlier keys."""
     rows = last.shape[0]
-    tokens, valid = admission.prompts.tokens, admission.prompts.token_fields[VALIDITY_FIELD]
+    tokens = admission.prompts.tokens
+    valid = real_slots(admission.prompts.token_fields, tokens.shape)
     pieces, width = tokens.shape
     flat = jnp.concatenate([jnp.where(fed, last, pad_id), jnp.where(valid, tokens, pad_id).reshape(-1)])
     real = jnp.concatenate([fed, valid.reshape(-1)])
     scored = jnp.concatenate([jnp.arange(rows), rows + jnp.arange(pieces) * width + width - 1])
     (_, logits), updated = model.apply(
-        {**params, "cache": decoder.cache}, flat[None], scored[None], decode=True, attention_mask=real[None],
+        {**params, "cache": decoder.cache}, flat[None], scored[None], decode=True,
+        coordinates=coordinates(flat[None].shape, valid=real[None]),
         admitted=Admitted(slots=admission.slots, cursors=admission.cursors,
                           tables=admission.tables if isinstance(placement, Paged) else None,
                           continuing=placement.continuing),

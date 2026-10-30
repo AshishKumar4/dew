@@ -87,7 +87,6 @@ from dew.nn.kernels import tuning
 from dew.nn.kernels.generation import assumed, gpu_mesh, gpu_target
 from dew.nn.kernels.options import compiler_options
 from dew.nn.precision import at_least_fp32
-from dew.nn.progress import training
 from dew.nn.sharding import (
     Link,
     Schedule,
@@ -129,6 +128,7 @@ from dew.training._fit import (
     afresh,
     check_inputs,
     clocked,
+    closes_window,
     consumption_counted,
     declarations,
     first_batch,
@@ -457,8 +457,7 @@ class Trainer(Generic[Loss, Effects]):
         return self._key
 
     def reading(self, loader: Loader, prefetch: int = PREFETCH_DEPTH, *, examples=None, steps=None) -> None:
-        """Take `loader`'s device steps, the batches to prefetch and the run's clock (`clocked`), as `fit`
-        does before it compiles, and a step compiled ahead (`dew.training.ahead`)."""
+        """Take `loader`'s device steps, prefetch and clock (`clocked`), as fit and compile-ahead do."""
         self._device, self._prefetch = loader.device, prefetch
         self._examples = clocked(examples, steps, custom=self.step is not None,
                                  rollout=self.rollout is not None, bound_ends=loader.bound_ends)
@@ -934,7 +933,7 @@ class Trainer(Generic[Loss, Effects]):
         def run(current, batch, part, tokens, closes=None):
             advanced, loss, aux = custom(current, batch)
             return advanced, loss, aux, None
-        return training(run)
+        return run
 
     @ruled
     def compile(self, state: TrainState, batch: Batch, trials: Trials | None = None, *,
@@ -1906,7 +1905,7 @@ class Trainer(Generic[Loss, Effects]):
                         break
                     batch = rolled_out(self.rollout, cooled, batch, self.device_mesh, self._marked, counted,
                                        branched)
-                    device, _ = split_fields(batch)
+                    device = closes_window(split_fields(batch)[0], self._examples)
                     step, _, cooled = self._compiled_for(run.compiled, cooled, device, branched,
                                                          reported=run.current)
                     factor = decay(shape, done // self.accumulation, steps // self.accumulation)
