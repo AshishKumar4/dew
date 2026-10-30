@@ -149,8 +149,10 @@ def peak_bytes(program: jcore.Jaxpr, platform: str) -> int:
             return frozenset()
         if value not in reads:
             equation = producers.get(value)
-            fused = equation is not None and recomputed(equation, platform)
-            reads[value] = frozenset().union(*map(anchors, equation.invars)) if fused else frozenset([value])
+            if equation is not None and recomputed(equation, platform):
+                reads[value] = frozenset().union(*map(anchors, equation.invars))
+            else:
+                reads[value] = frozenset([value])
         return reads[value]
 
     last = {anchor: index for index, equation in enumerate(program.eqns)
@@ -162,14 +164,22 @@ def peak_bytes(program: jcore.Jaxpr, platform: str) -> int:
         if not recomputed(equation, platform):
             inner = max((peak_bytes(body, platform) for body in bodies(equation)), default=0)
             for out in equation.outvars:
-                if out in last and out.aval.memory_space == jax.memory.Space.Device:
+                if out in last:
                     held.add(out)
-                    live += math.prod(out.aval.shape) * out.aval.dtype.itemsize
+                    live += device_share(out)
         most = max(most, live + inner)
         for done in [value for value in held if last[value] == index]:
             held.discard(done)
-            live -= math.prod(done.aval.shape) * done.aval.dtype.itemsize
+            live -= device_share(done)
     return most
+
+
+def device_share(value: jcore.Var) -> int:
+    """The device bytes `value` holds: none for one in pinned host memory or no array (a token)."""
+    aval = value.aval
+    if not isinstance(aval, ShapedArray) or aval.memory_space != jax.memory.Space.Device:
+        return 0
+    return math.prod(aval.shape) * aval.dtype.itemsize
 
 
 def bodies(equation: jcore.JaxprEqn) -> list[jcore.Jaxpr]:
@@ -214,7 +224,8 @@ def recomputed(equation: jcore.JaxprEqn, platform: str) -> bool:
     if platform == "gpu":
         return name in ELEMENTWISE
     if name in REAL_CHEAP:
-        return not any(np.issubdtype(out.aval.dtype, np.complexfloating) for out in equation.outvars)
+        return not any(isinstance(out.aval, ShapedArray) and np.issubdtype(out.aval.dtype, np.complexfloating)
+                       for out in equation.outvars)
     return name in CHEAP
 
 
@@ -237,10 +248,11 @@ def traced_loss[LossT, EffectsT](objective: Objective[LossT, EffectsT], state: T
 
 def candidate_footprint[LossT, EffectsT](objective: Objective[LossT, EffectsT],
                                           micro: Batch, window: int, prepared: TrainState,
-                                          held: int) -> Footprint:
+                                          held: int, platform: str) -> Footprint:
     """What a step over microbatches of `micro`'s shapes, its state `prepared` as placed, takes of a
-    device beside that state (`Footprint`): its loss's residuals at one microbatch, its trained
-    parameters' gradient, laid out as they are, and `held`. Over several devices that split the
+    device of `platform` beside that state (`Footprint`): its loss's residuals and its gradient
+    program's peak at one microbatch, as that platform's compiler keeps them, its trained parameters'
+    gradient, laid out as they are, and `held`. Over several devices that split the
     microbatch's rows alone (data and fully sharded data parallelism, `row_axes`) the residuals are one
     device's: the loss traced as one device's step, over a mesh of the run's axes each of one device,
     at that device's share of the microbatch (each leaf's shard, `shard_shape`), its parameters whole as
@@ -271,7 +283,6 @@ def candidate_footprint[LossT, EffectsT](objective: Objective[LossT, EffectsT],
         with contextlib.nullcontext() if device is None else jax.set_mesh(jax.sharding.Mesh(
                 np.asarray([device]).reshape((1,) * len(mesh.axis_names)), mesh.axis_names,
                 axis_types=mesh.axis_types)):
-            platform = jax.default_backend() if device is None else device.platform
             residuals = residual_bytes(trained, arguments[0]["params"], arguments, platform=platform)
             peak = gradient_peak(trained, arguments[0]["params"], arguments, platform=platform)
     resident = {name: device_bytes(value) for name, value in {
