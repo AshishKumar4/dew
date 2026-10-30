@@ -227,3 +227,16 @@ def test_a_run_names_its_rows_streams_on_the_command_line_trains_and_serves_them
     assert decide.layout.attention == JOINT.attention
     answers = decide("one two three", JOINT_QUESTIONS)
     assert all(answers[name].choice in question.options for name, question in JOINT_QUESTIONS.items())
+
+
+def test_a_row_of_one_stream_reads_as_its_reads_say():
+    """A row whose segments name no stream of their own stands in the row's one stream: its tokens all
+    read as the reads say, a table of the row reading itself whole lowered so, its packed window's keys
+    the row's whole document (row 2628's witness)."""
+    layout = dataclasses.replace(LETTERED, segments=tuple(
+        dataclasses.replace(segment, stream="row") if isinstance(segment, Instructions) else segment
+        for segment in LETTERED.segments), reads=Reads((("row", "self", "whole"),)))
+    example = examples(LETTERED)[0]
+    [row] = layout.rows(TOKENIZER, SPECIALS, example.state, example.questions)
+    assert row.streams == (0,) * len(row.tokens)
+    assert layout.attention == (((1, 0),), 1)
