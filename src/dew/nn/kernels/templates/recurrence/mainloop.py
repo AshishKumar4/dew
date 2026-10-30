@@ -907,10 +907,8 @@ def _intra(q, k, hi, lo, beta, taken, call: _Call, *, scale: float):
 
         def step(index, slots, carry, accumulators):
             del index
-            # Every slot acquired in the step's own trace: the rolled sub-chunks read them, and a slot first
-            # acquired in a loop's body kept that body's slot index past it (`Slots`' cache), a scalar the
-            # kernel then took as an input.
-            slots.held()
+            # Every slot acquired in the step's own trace: the rolled sub-chunks read them.
+            slots.acquire_all()
             # The sub-chunks' first tokens' prefix halves read once a step into a plain tile, a row each:
             # read from global memory in each rolled turn, their latency bound an H100's launch (ncu: 59% of
             # its stalls on L1TEX scoreboards, JS-kdakept-h100-797377e5d).
