@@ -4,6 +4,7 @@ wherever the row lays them. The layout marks each token's stream, a window keeps
 model lowers the record to key runs over each row's own runs of one stream (`stream_runs`), so no token
 reads another row's, and each reads exactly what its stream's record says."""
 import dataclasses
+import json
 from pathlib import Path
 
 import jax
@@ -12,8 +13,10 @@ import pytest
 from test_decision_context import assert_packed_as_alone, windows_of
 from test_decision_letters_context import LABELS, QUESTIONS as LETTERED_QUESTIONS, STATES
 
+from dew.data import Memory
 from dew.data.text import ByteTokenizer
-from dew.decision import Choice, Example, JointLayout, Schema, State, Text
+from dew.decision import Choice, Decide, Example, JointLayout, Schema, State, Text, decisions
+from dew.decision.config import DecisionRunConfig
 from dew.decision.head import JointSchemaHead, LabelReadout
 from dew.decision.layout import (
     AnswerCue,
@@ -22,6 +25,7 @@ from dew.decision.layout import (
     Layout,
     OptionLines,
     Reads,
+    Segment,
     Specials,
     StateFirstLayout,
 )
@@ -35,6 +39,8 @@ from dew.registry import from_record, to_record
 pytestmark = pytest.mark.mesh
 
 LLAMA = Path(__file__).parent / "fixtures" / "hf" / "llama-tiny"
+QWEN = LLAMA.parent / "qwen38-dense-tiny"
+"""A backbone with a tokenizer of its own, which a run lays its rows out with."""
 SPECIALS = Specials(begin=None, separator=10, marker=0, marker_text="\x00", pad=255)
 TOKENIZER = ByteTokenizer()
 JOINT = JointLayout(max_len=1024, segments=(Text("STATE:\n"), State(), Schema(stream="schema"), Text("\n")),
@@ -194,3 +200,28 @@ def test_a_layouts_reads_name_only_its_streams_and_every_stream_reads_itself():
     assert from_record(JointLayout, to_record(JOINT, JointLayout)) == JOINT
     assert from_record(StateFirstLayout, to_record(LETTERED, StateFirstLayout)) == LETTERED
     assert JOINT.attention == (((2, 0, 1), (2, 0, 0)), 3)
+
+
+def test_a_run_names_its_rows_streams_on_the_command_line_trains_and_serves_them(tmp_path):
+    """A decision run's row streams are two flags, its segments and its reads: the parsed run lays its
+    schema in a stream of its own, trains a step, and the task loaded from its run lays and reads its rows
+    in those streams, answering each question with one of its options; segments that name a stream with
+    no reads are refused (row 2626)."""
+    rows = Memory([{"example": example} for example in examples(JOINT)[:8]]).read("memory").pipe(
+        decisions).batch(8)
+    flags = ["--pretrained", str(QWEN), "--segments",
+             json.dumps(to_record(JOINT.segments, tuple[Segment, ...])), "--trainer.name", "streams",
+             "--trainer.checkpoint-dir", str(tmp_path / "runs"), "--trainer.steps", "1",
+             "--trainer.checkpoint-every", "1", "--trainer.eval-every", "None", "--trainer.multi-host",
+             "False", "--trainer.compilation-cache-dir", "None", "--model.dtype", "float32"]
+    unread = DecisionRunConfig.cli(flags, default=DecisionRunConfig(data=rows))
+    with pytest.raises(ValueError):
+        unread.prepare()
+    config = DecisionRunConfig.cli([*flags, "--reads", json.dumps(to_record(JOINT.reads, Reads))],
+                                   default=DecisionRunConfig(data=rows))
+    assert config.reads == JOINT.reads
+    config.run()
+    decide = Decide.from_run(str(tmp_path / "runs" / "streams"))
+    assert decide.layout.attention == JOINT.attention
+    answers = decide("one two three", JOINT_QUESTIONS)
+    assert all(answers[name].choice in question.options for name, question in JOINT_QUESTIONS.items())

@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 from reference_error import assert_as_exact
 
-from dew.batch import TEXT_KEY
+from dew.batch import TEXT_KEY, VALID_ROWS
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
@@ -205,3 +205,42 @@ def test_a_training_steps_tiled_head_contracts_the_vocabulary_three_times_and_ma
             assert_as_exact(stepped(objective, training=True), stepped(fused, training=False), draw,
                             f"a {label} head's step, tiles of {tile_tokens}", seeds=HEAD_STEP_SEEDS,
                             truth_fn=stepped(wide, training=False))
+
+
+def test_a_batch_that_marks_its_real_rows_keeps_the_fused_head_and_counts_each_real_row_once():
+    """A batch that marks its real rows (`VALID_ROWS`), as every batch of a run on the examples clock does
+    and a filled short batch does, keeps the fused head (`fused_head_loss`: the vocabulary contracted three
+    times), its filled rows' targets weighed at nothing, so its step's loss and gradients are the per-token
+    tiled head's over its real rows (check 1), where the batch once dropped the fused head (row 2629)."""
+    vocab = 61
+    model, tokens = head_scored(vocab, remat="full")
+    fused = LMObjective(model, 8, ema_decay=None, z_loss=1e-3, pad_id=0, head_tile=(4, 16))
+    params = fused.init(jax.random.key(0))
+    real = jnp.asarray([True, False])
+
+    def loss(objective, *, training):
+        step = Step(jnp.asarray(0), jax.random.key(1), None, training=training)
+
+        def scalar(params, ids):
+            # The second row a filled copy of the first.
+            stats, _ = objective.loss(params, {TEXT_KEY: ids.at[1].set(ids[0]), VALID_ROWS: real}, step)
+            return objective.reduce_loss(stats)[0]
+        return scalar
+
+    program = jax.make_jaxpr(jax.grad(loss(fused, training=True)))(params, tokens)
+    assert vocabulary_products(program.jaxpr, vocab) == 3
+    initialized = jax.jit(fused.init)
+
+    def draw(seed):
+        return initialized(jax.random.key(seed)), jax.random.randint(jax.random.key(seed + (1 << 20)),
+                                                                     tokens.shape, 0, vocab)
+
+    def stepped(objective, *, training):
+        return jax.value_and_grad(loss(objective, training=training))
+
+    wide = LMObjective(model.clone(dtype=jnp.float64), 8, ema_decay=None, z_loss=1e-3, pad_id=0,
+                       head_tile=(4, 16))
+    with jax.default_matmul_precision("highest"):
+        assert_as_exact(stepped(fused, training=True), stepped(fused, training=False), draw,
+                        "a fused head's step over a batch's real rows", seeds=HEAD_STEP_SEEDS,
+                        truth_fn=stepped(wide, training=False))
