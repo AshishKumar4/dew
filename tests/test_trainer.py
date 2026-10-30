@@ -42,7 +42,7 @@ from affine_run import (
     val_batches,
 )
 from flax.core import FrozenDict, freeze as frozen_dict
-from recording import Preempting, RecordingTracker
+from recording import RecordingTracker, preempting
 from reference_error import as_given, assert_as_exact
 from steady_state import steady_state
 from token_support import write_token_corpus
@@ -615,7 +615,7 @@ def stream(reader):
 def preempted(tmp_path, data, at=3, steps=6):
     """`data` trained toward `steps` and preempted when step `at` is logged, its checkpoint written."""
     with pytest.raises(Preempted):
-        make_trainer(tmp_path, tracker=Preempting(at)).fit(data, steps=steps, log_every=1)
+        make_trainer(tmp_path).fit(data, steps=steps, log_every=1, observe=preempting(at))
     assert Checkpoints(str(tmp_path / "run")).latest is not None
 
 
@@ -1505,13 +1505,14 @@ def test_a_cooldown_a_preemption_cuts_short_runs_again_on_resume(tmp_path, best)
     expected = {step: scalars["cooldown_val/loss"] for step, scalars in uninterrupted.scalars
                 if "cooldown_val/loss" in scalars}
     optimizer = OptimConfig(optimizer="adamw", learning_rate=stable)
-    # The notice step 3's log sends reaches the run after step 4, as its branch begins.
-    stopped = Preempting(3)
+    # The notice sent after step 3 reaches the run after step 4, as its branch begins.
+    stopped = RecordingTracker()
     weights = Best(lambda scores: scores["val/loss"], weights_only=True)
     ranked = {"eval_every": 4, "best": weights} if best else {"eval_every": 12}
     with pytest.raises(Preempted):
         make_trainer(tmp_path, tracker=stopped, optimizer=optimizer).fit(
-            dataset(val=val_batches(2)), steps=12, log_every=1, cooldowns=cooldowns, **ranked)
+            dataset(val=val_batches(2)), steps=12, log_every=1, cooldowns=cooldowns,
+            observe=preempting(3), **ranked)
     assert not any("cooldown_val/loss" in scalars for _, scalars in stopped.scalars)
     assert Checkpoints(str(tmp_path / "run")).latest == 4
     resumed = RecordingTracker()
@@ -1543,9 +1544,9 @@ def test_a_cooldown_at_the_runs_last_step_a_preemption_cuts_short_runs_on_resume
     optimizer = OptimConfig(optimizer="adamw", learning_rate=stable)
     best = Best(lambda scores: scores["val/loss"], weights_only=True) if saves == "weights-best" else None
     with pytest.raises(Preempted):
-        make_trainer(tmp_path, tracker=Preempting(7), optimizer=optimizer).fit(
+        make_trainer(tmp_path, optimizer=optimizer).fit(
             dataset(val=val_batches(2)), steps=8, log_every=1, eval_every=8, cooldowns=cooldowns,
-            checkpoint_final=saves == "final", best=best)
+            checkpoint_final=saves == "final", best=best, observe=preempting(7))
     assert Checkpoints(str(tmp_path / "run")).latest == 8
     assert Checkpoints(str(tmp_path / "run")).cooldown(8) is not None
     resumed, again = RecordingTracker(), RecordingTracker()
@@ -1751,6 +1752,19 @@ def test_the_log_tick_carries_the_loss_the_objective_metrics_and_the_throughput(
         assert np.isfinite(scalars["train/loss"])
         assert scalars["train/step_time_ms"] > 0
         assert scalars["train/samples_per_sec"] > 0
+
+
+def test_an_interval_read_no_later_than_the_last_reports_its_counts_and_no_rates():
+    """A log the writer reads no later than the one before it was done (`Taken.read`), an interval of
+    no seconds, still reports the tokens, work, compile and waits its steps counted, which a run's
+    committed tokens are summed from; only its rates, which need seconds, are left out."""
+    from dew.training.interval import throughput
+
+    counted = {"train/tokens": 15.0, "train/flops": 30.0, "train/compile_s": 0.5, "train/data_wait_ms": 2.0}
+    interval = {"waited": 0.004, "compiling": 0.5, "training_flops": 60.0, "tokens": 30}
+    assert throughput(0.5, 2, 16, None, 1, **interval) == counted
+    timed = throughput(1.5, 2, 16, None, 1, **interval)
+    assert timed.items() >= counted.items() and timed["train/tokens_per_s"] == 30.0
 
 
 # --------------------------------------------------------------------------

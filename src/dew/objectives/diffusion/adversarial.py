@@ -330,7 +330,12 @@ class AdversarialDistillationObjective(FlowDistillationObjective):
             metrics["distillation"] = jnp.mean(distillation)
             total = total + distillation
         updates = {SPECTRAL: jax.lax.stop_gradient(spectral)} if step.training else None
-        return self.row_mean(total, batch), Aux(metrics=metrics, variables=updates)
+        # The student's forward its denoiser runs (`Denoiser._raw`), at the step's own input, for its
+        # summaries.
+        c_in = self.process.prediction.get_input_scale(broadcast_rates(schedule, t, noisy))
+        inspected = self.watched_forward(step, self.model, self.model_variables(variables), noisy * c_in,
+                                         schedule.model_time(t), **conditions)
+        return self.row_mean(total, batch), Aux(metrics=metrics, variables=updates, inspected=inspected)
 
 
 __all__ = ["AdversarialDistillationObjective"]

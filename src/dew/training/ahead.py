@@ -24,6 +24,7 @@ compiling its first step, where it is the very program the run compiles first (`
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import functools
 import hashlib
@@ -31,7 +32,7 @@ import json
 import logging
 import pickle
 import time
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated
 
@@ -43,6 +44,7 @@ from jax.experimental import serialize_executable
 from dew._records import JSON, record
 from dew.batch import Batch
 from dew.nn.kernels.generation import assumed, capability, gpu_target
+from dew.nn.kernels.templates import report
 from dew.nn.sharding import Link
 from dew.registry import record_argument
 from dew.telemetry.instrumentation import StepFlops, step_flops
@@ -144,6 +146,10 @@ class AheadOfTime:
     before its first step on those GPUs."""
     capacity: int | None = None
     """The stated bytes per target GPU, or None where no memory capacity was supplied."""
+    refusals: tuple = ()
+    """The kernel launch configs its compiles found spilling and refused
+    (`dew.nn.kernels.templates.report.refused_launches`), which a run handed the step refuses before it
+    lowers (`FitSearch`), so its derivations step down as the compile's did and it lowers this program."""
 
     @property
     def peak_bytes(self) -> int:
@@ -200,6 +206,20 @@ class AheadOfTime:
                              "(--trainer.compile-ahead), with this Dew, and no plan recorded for another "
                              "rung")
         return self.loaded()
+
+
+@contextlib.contextmanager
+def handed(ahead: AheadOfTime | None) -> Iterator[None]:
+    """Within the block, the kernel launch configs refused are `ahead`'s alone, its compiles' refusals
+    (`AheadOfTime.refusals`), in a scope of their own (`report.refusals`): a run handed a step compiled
+    ahead lowers it as its compile did, whatever this process or its cache refused of other programs.
+    Without one, the process's own."""
+    if ahead is None:
+        yield
+        return
+    with report.refusals():
+        report.refuse(ahead.refusals)
+        yield
 
 
 def program_of(lowered: jax.stages.Lowered) -> str:
@@ -324,4 +344,4 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
         argument_bytes=memory.argument_size_in_bytes, output_bytes=memory.output_size_in_bytes,
         alias_bytes=memory.alias_size_in_bytes, temp_bytes=memory.temp_size_in_bytes,
         code_bytes=memory.generated_code_size_in_bytes, plan=trainer.plan, planned_seconds=seconds,
-        capacity=capacity, links=dict(trainer.links))
+        capacity=capacity, links=dict(trainer.links), refusals=report.refused_launches())

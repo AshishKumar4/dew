@@ -43,6 +43,7 @@ from process_support import (
     terminate,
     worker_env as worker_env,
 )
+from test_whole_validation import POOLED
 from token_support import Corpus, write_token_corpus
 
 from dew.checkpoints import FROZEN_STORE
@@ -65,6 +66,9 @@ BLOCK_AFTER = 5
 RECORDS = worker.BATCH * 16
 AVERAGING = Path(__file__).with_name("averaging_worker.py")
 """The worker of the pools that average runs."""
+
+LOG_WRITER = Path(__file__).with_name("log_writer_worker.py")
+"""The worker of the pool whose tracker fails off the step loop."""
 
 
 def dumped_params(out: Path, suffix: str = ".npz") -> dict:
@@ -346,27 +350,23 @@ def test_processes_read_disjoint_windows_of_one_packing(tmp_path):
         assert report["windows"] % (worker.BATCH // 2) == 0, "a partial batch came out"
 
 
-WHOLE_VALIDATION_PARTS = 3
-"""The pools the objectives' passes are spread over: one pool ran all of them
-in 371 s, the longest test CI had, which no other test could run beside."""
-
-
 @pytest.mark.distributed
-@pytest.mark.parametrize("part", range(WHOLE_VALIDATION_PARTS))
+@pytest.mark.parametrize("part", range(len(POOLED)))
 def test_every_objective_scores_every_record_of_a_split_once_on_two_processes(tmp_path, part):
     """`tests/test_whole_validation.py`'s passes on a pool of two: each
     process reads its share of a split of a batch and one record, the share
     that runs out first scoring its last batch's copy with every row a
     repeat, and every objective's loss and `Perplexity` count each record once.
     A split of one record leaves process 1's share empty, and it is scored once.
-    Each part is a pool of its own over every third objective, and the first
-    also scores `Perplexity`."""
+    Each part is a pool of its own over its objectives (`POOLED`, which holds
+    every evaluated objective once), and the first also scores `Perplexity`."""
     from test_whole_validation import EVALUATED, assert_every_record_once, assert_the_metric_over_every_record
 
+    assert sorted(name for names in POOLED for name in names) == EVALUATED
     reports = run_pool("whole_validation", tmp_path / "out", 2, run_dir=tmp_path / "run", timeout=1800,
-                       part=f"{part}/{WHOLE_VALIDATION_PARTS}")
+                       part=str(part))
     assert reports[0]["passes"] == reports[1]["passes"]
-    assert sorted(reports[0]["passes"]) == EVALUATED[part::WHOLE_VALIDATION_PARTS]
+    assert sorted(reports[0]["passes"]) == sorted(POOLED[part])
     for name, report in reports[0]["passes"].items():
         assert_every_record_once(name, report)
     if part == 0:
@@ -1524,6 +1524,19 @@ def test_evaluation_coordinates_root_consumers_keys_and_host_failures(tmp_path):
             assert "deleted" in report["results"][failure]["error"]
             assert failure in report["closed"]
         assert "gather plan differs between the processes" in report["results"]["mismatched_plan"]["error"]
+
+
+@pytest.mark.distributed
+def test_a_tracker_failing_off_the_step_loop_stops_both_processes_at_one_tick(tmp_path):
+    """Rank 0's tracker fails writing its second log, which its writer does off the step loop (row 2313):
+    both processes end with rank 0's error, the peer through the agreement, having run the same steps,
+    as the loop agrees on each write's outcome at a tick every process reaches alike, never on the
+    writer's threads. Which tick that is depends on when the writer runs, so the steps run are the
+    processes' agreement, not a count."""
+    reports = run_pool("training_log_failure", tmp_path, 2, script=LOG_WRITER)
+    # Rank 0 raises its tracker's own error; its peer, the agreement's report of it.
+    assert [report["error"] for report in reports] == ["ValueError", "PeerFailure"], reports
+    assert reports[0]["steps"] == reports[1]["steps"], reports
 
 
 @pytest.mark.distributed

@@ -300,7 +300,8 @@ def test_an_euler_walk_stays_put_over_a_plateau_of_its_table():
 def test_a_source_noise_sampler_seed_pins_the_brownian_path():
     """`noise_sampler_seed` makes the tree's entropy the checkpoint's, so two
     walks with different keys integrate one path; without it the walk's own
-    key decides, as the source's unseeded tree draws its entropy per run."""
+    key decides, as the source's unseeded tree draws its entropy per run. A
+    walk lowered ahead of its call, its seed data, integrates the same path."""
 
     _, process, times, x_T = source_case("dpm_sde.default")
     model = SourceOracle()
@@ -315,6 +316,9 @@ def test_a_source_noise_sampler_seed_pins_the_brownian_path():
     np.testing.assert_array_equal(run(pinned, 0), run(pinned, 1))
     free = DPMSolverSDE()
     assert not np.allclose(run(free, 0), run(free, 1), atol=1e-3)
+    # Lowered ahead of its call, a walk taking the seed as data compiles and integrates the same path.
+    walked = jax.jit(run, static_argnums=1).lower(pinned, 0).compile()
+    np.testing.assert_array_equal(walked(pinned), run(pinned, 0))
 
 
 BROWNIAN_SEEDS = 8

@@ -693,10 +693,12 @@ def test_a_fitting_policy_compiles_once_even_with_frontier_trials(monkeypatch, r
 
 
 @pytest.mark.mesh(devices=2)
-@pytest.mark.parametrize("remat", ["minimal", "full"])
+@pytest.mark.parametrize("remat", sorted(REMAT_POLICIES))
 def test_fit_keeps_an_explicit_policy_without_a_frontier_probe(tmp_path, monkeypatch, remat):
-    """A real fit over two devices keeps its nonterminal or terminal explicit policy once admitted.
-    No optional compile or timing is hidden in fit's internally created Trials (row 2153)."""
+    """A real fit over two devices keeps each explicit policy it is given once admitted, whether the
+    policy has a further rung or is its ladder's last: its step compiles once and runs its one
+    microbatch alone, no optional compile or trial hidden in fit's internally created Trials (row 2153;
+    the compile-once gate, row 2286)."""
     free(monkeypatch, LIMIT)
     corpus = token_files(tmp_path)
     trainer = windowed(tmp_path, 1, remat=REMAT_POLICIES[remat], objective=Counted)
@@ -931,7 +933,7 @@ def test_a_gemm_autotuner_out_of_memory_is_a_refusal_for_memory(code, message, r
 
     refusals = []
     try:
-        outcome = compiled_if_it_fits(Program(), None, refusals)
+        outcome = compiled_if_it_fits(Program(), None, refusals, relower=Program)
     except jax.errors.JaxRuntimeError as raised:
         outcome = raised
     assert (outcome, refusals) == ((None, [error]) if refused else (error, []))

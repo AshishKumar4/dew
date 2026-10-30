@@ -366,6 +366,31 @@ class ConsistencyDistillationObjective(FlowDistillationObjective):
         return backward_simulation(lambda x, t: trig_prediction(network, x, t)[0], draws.start, times,
                                    draws.simulation_noises, live)
 
+    def _watched_point(self, samples: jax.Array, draws: _Draws, student_phase: jax.Array
+                       ) -> tuple[jax.Array, jax.Array]:
+        """The TrigFlow `(x, t)` at which the step's loss first runs the student: in a critic phase, or for
+        distribution matching alone, the simulation's start from noise at t = pi/2 (`backward_simulation`,
+        `_generated`); else sCM's continuous point or rCM's discrete one, the first of its shifted grid
+        (`discrete_consistency_loss`)."""
+        start = (draws.start, jnp.full(draws.start.shape[:1], math.pi / 2, jnp.float32))
+        if self.consistency_weight == 0:
+            return start
+        x, t = self._consistency_point(samples, draws)
+        return (jnp.where(student_phase, x, start[0]),
+                jnp.where(student_phase, t, start[1]).astype(t.dtype))
+
+    def _consistency_point(self, samples: jax.Array, draws: _Draws) -> tuple[jax.Array, jax.Array]:
+        """The consistency loss's student point: rCM's discrete grid's first, or sCM's continuous one."""
+        if self.consistency == "discrete":
+            u = draws.consistency_time * (1 - self.discrete_skip / self.discrete_steps)
+            rf = static_shift(self.discrete_shift, 1.0 - u)
+            rf = jnp.clip(rf, 0.0, 1.0 - jnp.finfo(rf.dtype).eps)
+            t = jnp.arctan(rf / (1 - rf))
+        else:
+            t = self._times(draws.consistency_time, self.student_times)
+        noise = draws.consistency_noise
+        return expand(jnp.cos(t), samples) * samples + expand(jnp.sin(t), samples) * noise, t
+
     def loss(self, variables, batch, step: Step):
         encode_key, drop_key = jax.random.split(jax.random.fold_in(step.key, 1))
         samples = self.clean_samples(variables, batch, encode_key, step)
@@ -414,7 +439,14 @@ class ConsistencyDistillationObjective(FlowDistillationObjective):
             return critic_loss(generated, fake, t)
 
         losses = jax.lax.cond(student_phase, student_losses, critic_losses, variables)
-        return self.row_mean(losses, batch), Aux(metrics={})
+        # The student's forward at the point its loss first runs it, as `trig_prediction` feeds it, for its
+        # summaries (`_watched_point`).
+        x, t = self._watched_point(samples, draws, student_phase)
+        rf = jnp.sin(t) / (jnp.cos(t) + jnp.sin(t))
+        inspected = self.watched_forward(step, self.model, self.model_variables(variables),
+                                         x / expand(jnp.cos(t) + jnp.sin(t), x),
+                                         self.process.schedule.model_time(rf), **given)
+        return self.row_mean(losses, batch), Aux(metrics={}, inspected=inspected)
 
     def _distribution_matching(self, params, student_params, given, blank, draws: _Draws, iteration):
         generated = self._generated(student_params, given, draws, iteration)

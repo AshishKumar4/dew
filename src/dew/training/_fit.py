@@ -7,6 +7,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import datetime
+import functools
 import math
 import time
 import types
@@ -21,7 +22,7 @@ from flax.training.early_stopping import EarlyStopping
 from jax.sharding import Mesh
 
 from dew import position
-from dew._coordination import agreed_next
+from dew._coordination import agreed, agreed_next
 from dew._records import JSON
 from dew.batch import CLOSES_WINDOW, CONSUMED_COUNT, EXAMPLES_CONSUMED, Batch, ConsumedCount
 from dew.checkpoints import Checkpoints
@@ -38,7 +39,7 @@ from dew.training.budget import Pause, Plateau, every_step, recorded
 from dew.training.cadence import Cadence, Counted
 from dew.training.cooldown import Branch
 from dew.training.evaluation import EvalSuite, Evaluation, Summary
-from dew.training.interval import Interval, Taken, TokenClock
+from dew.training.interval import Interval, LogWriter, Taken, TokenClock
 from dew.training.observe import Observe
 from dew.training.profiling import ProfileWindow, start_capture
 from dew.training.runtime import PreemptionNotice
@@ -326,6 +327,8 @@ class FitRun:
     notice: PreemptionNotice | None = None
     endless: bool = False
     taken: Taken | None = None
+    writer: LogWriter = dataclasses.field(default_factory=LogWriter)
+    """Where the logs the loop takes are read and reported, off the loop (`Trainer._read_taken`)."""
     scored: frozenset[str] = frozenset()
     """The suites `evaluation` scored at its step, which a run whose stream ends there scores once."""
     ahead: tuple[Batch | None] | None = None
@@ -632,6 +635,18 @@ def _handed_split(entry: Dataset | Handed | Reader | EvalSuite) -> Dataset | Rea
     if isinstance(entry, Mapping | pygrain.MapDataset | pygrain.IterDataset):
         return native(entry, training=False)
     return entry
+
+
+def check_inputs(trainer, device: Batch) -> None:
+    """Refuse a training batch's device fields (`split_fields`) the objective's declared inputs do not
+    take, as every process agrees, before its first step compiles: the batch its device steps make,
+    which the objective reads (`Trainer._model_batch`)."""
+    inputs = trainer.objective.inputs
+    if inputs is None:
+        return
+    with jax.set_mesh(trainer.device_mesh):
+        checked = trainer._model_shapes(device) if trainer._device else device
+    agreed("training input declaration", functools.partial(inputs.check, checked))
 
 
 def unrecorded_parts(objective: str, dataset: Dataset | Loader | Handed, *, optimized: bool,

@@ -29,6 +29,7 @@ from typing_extensions import TypeVar
 from dew.averaging import ema_update
 from dew.batch import EXAMPLE_ROWS, Batch, Variables, dicts, merge
 from dew.data.dataset import rows_of
+from dew.nn.inspection import Watched, flattened
 from dew.nn.kernels.options import compiler_options
 from dew.nn.precision import at_least_fp32
 from dew.nn.progress import training
@@ -45,6 +46,7 @@ from dew.objectives.base import (
 )
 from dew.optim import clips_qk, stepped
 from dew.state import Accumulation, TrainState, apart, together
+from dew.training.inspection import Inspection, summaries
 from dew.training.model_flops import _TokenCount, step_counts
 from dew.training.narrow import forward_variables, narrowed
 
@@ -67,6 +69,9 @@ class Committed:
     norm: jax.Array
     count: jax.Array
     tokens: jax.Array
+    inspected: dict[str, jax.Array] = dataclasses.field(default_factory=dict)
+    """A sampled step's summaries (`dew.training.inspection.summaries`), zero where it committed nothing;
+    none in a step that samples nothing."""
 
 
 def _chosen(take, taken, kept):
@@ -129,6 +134,21 @@ def outcome(current: TrainState, advanced: TrainState, loss: jax.Array, aux: Aux
     clock = None if current.consumed is None else (current.consumed + consumed).astype(current.consumed.dtype)
     return (dataclasses.replace(advanced, step=current.step + stepped, consumed=clock), loss, metrics,
             jnp.isfinite(loss), advanced.microstep > current.microstep, committed)
+
+
+def watched_activations(watched: Watched, aux: Aux) -> dict[str, jax.Array]:
+    """The activation summaries a sampled step's latest microbatch sowed (`Aux.inspected`), by their
+    logged names (`dew.nn.inspection.flattened`). Refused where the objective's model call opened no
+    `inspected` collection (`Step.sown`), or where no module of a watched kind ran in it, either of which
+    would log nothing a run asked for."""
+    if aux.inspected is None:
+        raise ValueError("the run watches activations (Inspection.modules), which its objective's model "
+                         "calls do not return: they open Step.sown() and return what it sowed "
+                         "(Aux.inspected)")
+    if not jax.tree.leaves(aux.inspected):
+        raise ValueError(f"no module of the watched kinds {list(watched.kinds)} runs in the objective's "
+                         f"model; name them by class (`*Attention`, `MLP`)")
+    return flattened(aux.inspected)
 
 
 def evaluation_of(aux: Aux) -> Evaluated | None:
@@ -329,7 +349,7 @@ class Transaction:
     """
     def __init__(self, objective, optimizer, accumulation: int, shapes, copies=None, split: int = 1,
                  record: bool = False, fetch: Callable[[TrainState], TrainState] | None = None,
-                 examples: int | None = None):
+                 inspection: Inspection | None = None, examples: int | None = None):
         """Hold the objective, the optimizer and the shapes a step traces for.
 
         `accumulation` is the microbatches a window pools, and `split` the
@@ -354,6 +374,9 @@ class Transaction:
         """
         self.fetch = fetch
         self.record = record
+        # What a sampled step summarizes at its commit (`Committed.inspected`); None in every other step.
+        self.inspection = inspection
+        self.watched = None if inspection is None else inspection.watched
         self.bound = examples
         self.objective = objective
         self.optimizer = optimizer
@@ -499,7 +522,7 @@ class Transaction:
         # The part its input ran as, which an attempt counts (`step` times `split` plus its part).
         step_info = Step(accepted // self.split, jax.random.fold_in(state.key, attempt),
                          with_ema(variables, self.fetched(state).ema), committed=state.updates,
-                         record=self.record, qk_stats=clips_qk(state.opt_state),
+                         record=self.record, qk_stats=clips_qk(state.opt_state), watched=self.watched,
                          **self.examples(state, index, batch, part=attempt % self.split,
                                          rejected=attempt - accepted))
         return self.read(variables, state.compute), batch, step_info
@@ -579,14 +602,18 @@ class Transaction:
                 at = self.progress(current) if self.objective.ema.progressed else current.updates
                 averaged = _chosen(self.objective.averages(current.updates),
                                    ema_update(averaged, params, self.objective.ema.decay(at)), averaged)
+            inspected = {} if self.inspection is None else summaries(
+                self.inspection, stored, native, update, params["params"])
             return dataclasses.replace(current, variables=params, opt_state=opt_state, ema=averaged,
-                                       updates=current.updates + 1)
+                                       updates=current.updates + 1), inspected
 
         if current.scale is None:
-            return apply(current), native_finite, norm
+            return *apply(current), native_finite, norm
         if self.size == 1:
-            return _chosen(native_finite, apply(current), current), native_finite, norm
-        return _only_when(native_finite, apply, lambda x: x, current), native_finite, norm
+            applied, inspected = apply(current)
+            return _chosen(native_finite, applied, current), inspected, native_finite, norm
+        unapplied = jax.tree.map(jnp.zeros_like, jax.eval_shape(apply, current)[1])
+        return *_only_when(native_finite, apply, lambda x: (x, unapplied), current), native_finite, norm
 
     def finish_attempt(self, state, batch, aux, pending, gradient, attempt, tokens):
         """Commit the window when it is due, then advance the state's clocks.
@@ -625,10 +652,10 @@ class Transaction:
         def recopied(current):
             # A window of several microbatches reads one set of copies
             # throughout and rewrites them only as it commits.
-            committed, native_finite, norm = commit(current)
+            committed, inspected, native_finite, norm = commit(current)
             if committed.compute is not None:
                 committed = dataclasses.replace(committed, compute=narrowed(committed.variables, self.copies))
-            return committed, native_finite, norm
+            return committed, inspected, native_finite, norm
 
         due = pending.due & pending.active & accepted
         # The microbatch's real tokens (`tokens`, two uint32 words), which its window's commit trains on,
@@ -636,18 +663,21 @@ class Transaction:
         read = tokens
         held = read if previous is None or previous.tokens is None else _TokenCount.add(previous.tokens, read)
         if self.size == 1:
-            committed, native_finite, norm = commit(numerical)
+            committed, inspected, native_finite, norm = commit(numerical)
             numerical = _chosen(due, committed, numerical)
             native_finite = native_finite | ~due
         else:
             dtype = jnp.result_type(*jax.tree.leaves(state.variables["params"]), jnp.float32)
             zero = jnp.real(jnp.zeros((), dtype))
+            uncommitted = jax.tree.map(jnp.zeros_like, jax.eval_shape(recopied, numerical)[1])
             # The window goes round the commit, which never reads it: a
             # conditional copies what it passes through.
-            numerical, native_finite, norm = _only_when(
-                due, recopied, lambda x: (x, jnp.asarray(a=True), zero),
+            numerical, inspected, native_finite, norm = _only_when(
+                due, recopied, lambda x: (x, uncommitted, jnp.asarray(a=True), zero),
                 dataclasses.replace(numerical, accumulation=None))
             numerical = dataclasses.replace(numerical, accumulation=previous)
+        if self.watched is not None:
+            inspected = {**inspected, **watched_activations(self.watched, aux)}
         finite = finite & native_finite
         if scale is not None:
             accepted = finite & _all_finite((numerical.variables, numerical.opt_state, numerical.ema))
@@ -692,8 +722,10 @@ class Transaction:
         if scale is not None:
             advanced = dataclasses.replace(advanced, scale=_advance_scale(scale, finite))
         counted = due & accepted
-        return advanced, loss, aux, Committed(jnp.where(counted, norm, 0.), counted.astype(jnp.int32),
-                                              jnp.where(counted, held, jnp.zeros((2,), jnp.uint32)))
+        return advanced, loss, aux, Committed(
+            jnp.where(counted, norm, 0.), counted.astype(jnp.int32),
+            jnp.where(counted, held, jnp.zeros((2,), jnp.uint32)),
+            {name: jnp.where(counted, value, 0.) for name, value in inspected.items()})
 
     def step(self, *, realize=None, host=False):
         """Build the function that runs one attempt over the shared phases.
@@ -726,7 +758,7 @@ class Transaction:
             rejected = attempt - state.microstep
             step_info = Step(state.microstep // self.split, jax.random.fold_in(state.key, attempt),
                              with_ema(state.variables, self.fetched(state).ema), committed=state.updates,
-                             record=self.record, qk_stats=clips_qk(state.opt_state),
+                             record=self.record, qk_stats=clips_qk(state.opt_state), watched=self.watched,
                              **self.examples(state, state.microstep % self.size, batch, part, rejected))
             factor = jnp.asarray(1., jnp.float32) if state.scale is None else state.scale.scale
             realized = realize(self.read(state.variables, state.compute), batch, step_info)

@@ -105,7 +105,7 @@ class DPOObjective(TokenScorer):
         # function, so a policy equal to its reference earns zero rewards wherever the two compile alike.
         pairs = jnp.concatenate((chosen_ids, rejected_ids))
         policy = self.token_scores(variables, pairs, qk_stats=step.qk_stats, predict=predict,
-                                   routing=self.balance is not None)
+                                   routing=self.balance is not None, watched=step.watched is not None)
         policy_chosen, policy_rejected = jnp.split(-policy.losses, 2)
         ref_chosen, ref_rejected = jnp.split(-self.token_scores(step.ema, pairs).losses, 2)
         terms, (pair_chosen, pair_rejected) = preference_logsigmoid_terms(
@@ -124,7 +124,8 @@ class DPOObjective(TokenScorer):
                 variables, statistics, policy.routing or {}, self._routed_batch(batch),
                 self._routed_queries(batch), {})
             reported.update(metrics)
-        return statistics, Aux[Variables](reported, qk_stats=policy.qk, effects=effects), policy
+        return statistics, Aux[Variables](reported, qk_stats=policy.qk, effects=effects,
+                                          inspected=policy.inspected), policy
 
     def _routed_queries(self, batch) -> jax.Array:
         """The router positions that count, `[2 * pairs, seq_len]`: each half's completion tokens among its

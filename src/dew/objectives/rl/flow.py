@@ -29,18 +29,19 @@ from dew._coordination import agreed, agreed_same, broadcast_from_process_zero, 
 from dew.batch import Batch, Variables
 from dew.data.dataset import rows_of
 from dew.diffusion.presets import Preset
-from dew.diffusion.process import Process
+from dew.diffusion.process import Denoiser, Process
 from dew.diffusion.schedules.source import SourceGrid
 from dew.distributed.batches import row_origins, shared_host_fields, split_fields, with_host
 from dew.inputs import InputSpec
 from dew.nn.autoencoders import AutoEncoder
+from dew.nn.inspection import called_with
 from dew.nn.precision import at_least_fp32, weighted_total
 from dew.objectives.base import OMITTED, Aux, Omitted, Ratio, Shown, Step
 from dew.objectives.diffusion.objective import DiffusionObjective
 from dew.rl.advantage import group_normalised
 from dew.rl.surrogate import clipped_surrogate_terms
 from dew.sampling.flow import FlowSDE, FlowTrajectory, GaussianTransition
-from dew.sampling.guidance import CFG, Walk
+from dew.sampling.guidance import CFG, Autoguidance, Walk
 from dew.sampling.solvers import Euler, Solver
 
 from .sessions import ADVANTAGES_KEY, OLD_LOG_PROBS_KEY
@@ -131,17 +132,19 @@ class FlowGRPOObjective(DiffusionObjective):
         return ("Flow-GRPO has no source-batch validation loss; rank checkpoints by a reward metric "
                 "with an explicit Best, or pass no validation data")
 
-    def _walk(self, params: Variables, batch: Batch) -> Walk:
-        """The walk of the denoiser this batch's conditions select, guided as
-        the rollout's walk was: over its `rollout_steps` points, a
-        transition's column being its step's index."""
+    def _policy(self, params: Variables, batch: Batch) -> Denoiser:
+        """The denoiser this batch's conditions select."""
         given = self.encoded_conditions(params, batch)
         # An inpainting model's masked-image inputs, as the rollout encoded them (`FlowRollout`).
         spatial = batch.get("spatial", {})
-        denoise = self.denoiser(params, {**given, **spatial},
-                                {**self.blank_conditions(params, given), **spatial})
+        return self.denoiser(params, {**given, **spatial},
+                             {**self.blank_conditions(params, given), **spatial})
+
+    def _walk(self, params: Variables, batch: Batch) -> Walk:
+        """The walk of the denoiser this batch's conditions select (`_policy`), guided as the rollout's
+        walk was: over its `rollout_steps` points, a transition's column being its step's index."""
         points = jnp.asarray(batch["rollout_steps"], jnp.int32)
-        return Walk.over(denoise, self.guidance, points[0] - 1)
+        return Walk.over(self._policy(params, batch), self.guidance, points[0] - 1)
 
     def _transition(self, predict: Predictor, x: jax.Array,
                     t: jax.Array, following: jax.Array) -> GaussianTransition:
@@ -245,7 +248,21 @@ class FlowGRPOObjective(DiffusionObjective):
             metrics["transition_kl"] = kl / denominator
         if REWARDS_KEY in batch:
             metrics["reward"] = jnp.asarray(batch[REWARDS_KEY], jnp.float32).mean()
-        return Ratio(pg + self.beta * kl, mass), Aux(metrics)
+        inspected = None
+        if step.watched is not None:
+            # The policy's forward at each trajectory's first transition, on the inputs its walk's own
+            # prediction hands the model there, whatever its guidance makes of them (a doubled batch, an
+            # autoguidance's main call), read off that call (`called_with`).
+            policy = self._policy(variables, batch)
+            # The policy's weights as its guidance binds its model's call over them: an autoguidance's
+            # main model holds its weaker model's, `guide`, out (`Autoguidance.walk`); every other
+            # guidance binds the denoiser's whole tree (`Denoiser._raw`).
+            own = policy.params if not isinstance(self.guidance, Autoguidance) else {
+                name: tree for name, tree in policy.params.items() if name != "guide"}
+            args, kwargs = called_with(policy.model, own,
+                                       lambda: walk.at((), 0)(latents[:, 0], times[:, 0]))
+            inspected = self.watched_forward(step, policy.model, own, *args, **kwargs)
+        return Ratio(pg + self.beta * kl, mass), Aux(metrics, inspected=inspected)
 
     def _rows(self, batch: Batch) -> int:
         """One sample per source row, which a prompt-only batch has too."""

@@ -3,6 +3,7 @@
 import dataclasses
 import functools
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import jax
@@ -40,6 +41,7 @@ from dew.nn import categorical
 from dew.nn.cross_attention import ContextEncoder, crosses_alone
 from dew.nn.flops import MissingFlopsCount, counted_flops, frozen_training_flops, parameter_flops
 from dew.nn.inputs import ModelInputs
+from dew.nn.inspection import INSPECTED
 from dew.nn.protocols import CountedDecisions, CountedTraining, CrossAttending, TokenModel
 from dew.objectives.base import (
     OMITTED,
@@ -259,6 +261,12 @@ class DecisionObjective(Objective[Ratio | Weighted]):
                     tokenizer = tokenizer or tokenizer_of(backbone.text_processor)
             case _:
                 module = backbone
+        from dew.interop.pretrained import Pretrained
+
+        # What the backbone's source drew fresh over the weights it holds, under the model's `backbone`:
+        # none where other variables replace them.
+        self._fresh_backbone = tuple(f"backbone/{module}" for module in backbone.fresh) if (
+            variables is OMITTED and isinstance(backbone, Pretrained)) else ()
         if variables is not OMITTED:
             held = variables
         if tokenizer is None:
@@ -328,6 +336,14 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         """Nothing beyond the held parts: `complete_variables` draws the part the tree lacks."""
         return held or {}
 
+    def fresh_modules(self) -> tuple[str, ...]:
+        """What the backbone's source drew fresh (`Pretrained.fresh`), and the head where it is drawn
+        beside a held backbone (`complete_variables`)."""
+        held = self.variables or {}
+        loaded = any("backbone" in collection for collection in held.values())
+        drawn = loaded and not any("head" in collection for collection in held.values())
+        return self._fresh_backbone + (("head",) if drawn else ())
+
     def complete_variables(self, key: jax.Array, tree: Variables) -> Variables:
         """Draw whichever of the backbone and the head `tree` does not hold."""
         backbone_key, head_key = jax.random.split(key)
@@ -365,10 +381,11 @@ class DecisionObjective(Objective[Ratio | Weighted]):
     def loss(self, variables: Variables, batch: Batch, step: Step):
         inputs = laid_out(batch, self.bounds.segments, spans_in_context=self.schema_in_context,
                           whole_blocks=whole_blocks_of(self.layout))
-        logits = self.model.logits(
-            variables, inputs, train=step.training, rngs=model_rngs(step.key, training=step.training)
-        )
-        return self._charged(logits, inputs, batch)
+        logits, sown = self.model.observed_logits(
+            variables, inputs, train=step.training, rngs=model_rngs(step.key, training=step.training),
+            opened=step.sown())
+        loss, aux = self._charged(logits, inputs, batch)
+        return loss, replace(aux, inspected=sown.get(INSPECTED, {}) if step.watched is not None else None)
 
     def _charged(self, logits: jax.Array, inputs: DecisionInputs, batch: Batch
                  ) -> tuple[Ratio | Weighted, Aux]:

@@ -29,6 +29,7 @@ from flax import linen as nn
 from dew.batch import FROZEN, Batch, Variables
 from dew.inputs import InputSpec
 from dew.nn import categorical
+from dew.nn.inspection import INSPECTED
 from dew.nn.precision import at_least_fp32
 from dew.nn.protocols import Lacks
 from dew.objectives.base import Aux, Objective, Ratio, Source, Step, model_rngs
@@ -118,14 +119,16 @@ class Supervised(Objective[Ratio]):
         mode = {} if self.mode is None else {self.mode: step.training}
         outputs, updates = self.model.apply(variables, batch[self.field],
                                             rngs=model_rngs(step.key, training=step.training),
-                                            mutable=held, method="__call__", **mode)
+                                            mutable=step.sown(*held), method="__call__", **mode)
+        sown = dict(updates).get(INSPECTED, {}) if step.watched is not None else None
+        updates = {name: value for name, value in updates.items() if name in held}
         losses = self.criterion(outputs, batch)
         if jnp.ndim(losses) == 0:
             raise ValueError("the loss returns one loss per example, not their mean; Supervised "
                              "takes the mean over the batch's rows itself")
         metrics = {name: self.row_mean(metric(outputs, batch), batch).mean()[0]
                    for name, metric in self.metrics.items()}
-        aux = Aux(metrics, variables=dict(updates) if held else None)
+        aux = Aux(metrics, variables=dict(updates) if held else None, inspected=sown)
         return self.row_mean(losses, batch), aux, losses
 
 

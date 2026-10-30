@@ -1,6 +1,6 @@
 """A backbone and a decision head, applied as two modules over one variables tree."""
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 
 import jax
@@ -79,9 +79,15 @@ class DecisionModel(HeadedModel):
         return self._read(variables, inputs, media=media, train=train, rngs=rngs)[0]
 
     def _read(self, variables: Variables, inputs: DecisionInputs, *, media: ModelInputs | None,
-              train: bool, rngs: dict[str, jax.Array] | None) -> tuple[jax.Array, jax.Array | None]:
-        """The row's final states (`states`), and the context's where the questions' spans are in it."""
+              train: bool, rngs: dict[str, jax.Array] | None, opened: Sequence[str] = ()
+              ) -> tuple[jax.Array, jax.Array | None, Variables]:
+        """The row's final states (`states`), the context's where the questions' spans are in it, and
+        what the row's pass sowed into the `opened` collections."""
         backbone = thaw(part(variables, "backbone"))
+
+        def applied(*args, **kwargs) -> tuple[jax.Array, Variables]:
+            out = self.backbone.apply(backbone, *args, mutable=list(opened) or False, **kwargs)
+            return out if opened else (out, {})
         laid = inputs.coordinates()
         # A row in blocks is read by the backbone's attention whole within each block, on the kinds
         # that read blocks (`AttentionMetadata.block_groups`); a row in order passes none.
@@ -116,27 +122,38 @@ class DecisionModel(HeadedModel):
                     assert isinstance(held, Mapping)
                     kwargs["conditioning"] = {**held, **conditioning}
                 return module.hidden_states(rows.tokens, train=train, coordinates=laid, **kwargs, **blocked)
-            return _array(self.backbone.apply(backbone, inputs, media, rngs=rngs, method=read_media)), spanned
+            states, sown = applied(inputs, media, rngs=rngs, method=read_media)
+            return _array(states), spanned, sown
         if inputs.slots is None:
             def read(module, tokens):
                 return module.hidden_states(tokens, train=train, coordinates=laid, conditioning=conditioning,
                                             **blocked)
-            return _array(self.backbone.apply(backbone, inputs.tokens, rngs=rngs, method=read)), spanned
+            states, sown = applied(inputs.tokens, rngs=rngs, method=read)
+            return _array(states), spanned, sown
         if blocked:
             raise ValueError("a row of option positions sets what each token reads, which blocks set too")
         # A token reads its own document's keys but another option's, as runs (`key_runs`): no [B, L, L] mask;
         # a causal backbone's runs end at each token.
         causal = isinstance(self.backbone, TokenModel) and self.backbone.causal
         runs = key_runs(inputs.slots, inputs.segments, inputs.options.shape[-1], causal=causal)
-        return _array(self.backbone.apply(backbone, inputs.tokens, train=train, coordinates=laid,
-                                          attention_key_runs=runs,
-                                          attention_key_positions=inputs.positions, method="hidden_states",
-                                          conditioning=conditioning, rngs=rngs)), spanned
+        states, sown = applied(inputs.tokens, train=train, coordinates=laid, attention_key_runs=runs,
+                               attention_key_positions=inputs.positions, method="hidden_states",
+                               conditioning=conditioning, rngs=rngs)
+        return _array(states), spanned, sown
 
     def logits(self, variables: Variables, inputs: DecisionInputs, *, media: ModelInputs | None = None,
                train: bool = False, rngs: dict[str, jax.Array] | None = None) -> jax.Array:
         """Return the `[B, Q, K]` fp32 option logits, with -inf past each question's options."""
-        states, spanned = self._read(variables, inputs, media=media, train=train, rngs=rngs)
+        return self.observed_logits(variables, inputs, media=media, train=train, rngs=rngs)[0]
+
+    def observed_logits(self, variables: Variables, inputs: DecisionInputs, *,
+                        media: ModelInputs | None = None, train: bool = False,
+                        rngs: dict[str, jax.Array] | None = None,
+                        opened: Sequence[str] = ()) -> tuple[jax.Array, Variables]:
+        """The option logits (`logits`), and what the row's pass sowed into the `opened` collections
+        (`dew.objectives.base.Step.sown`)."""
+        states, spanned, sown = self._read(variables, inputs, media=media, train=train, rngs=rngs,
+                                           opened=opened)
         head = thaw(part(variables, "head"))
         # The questions' spans are pooled from the pass that holds them: the context's, where it holds
         # them. A head that pools none reads a question in its context through the cross-attention alone.
@@ -157,7 +174,7 @@ class DecisionModel(HeadedModel):
             logits = _array(
                 self.head.apply(head, states, inputs, table, train=train, rngs=rngs) if spans is None
                 else self.head.apply(head, states, inputs, table, spanned=spans, train=train, rngs=rngs))
-        return jnp.where(inputs.options, logits, -jnp.inf)
+        return jnp.where(inputs.options, logits, -jnp.inf), sown
 
     def readout_logits(self, variables: Variables, states: jax.Array, inputs: DecisionInputs,
                        labels: tuple[tuple[int, ...], ...]) -> jax.Array:

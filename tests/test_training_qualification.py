@@ -30,6 +30,7 @@ import numpy as np
 import pytest
 import qualification_worker as worker
 import torch
+from process_support import ProcessGroup
 from token_support import encoded_token_fixture
 from transformers import (
     AutoModelForCausalLM,
@@ -139,8 +140,14 @@ def qualified(tmp_path_factory, request) -> Path:
     torch.manual_seed(13)
     source_model(request.param, len(tokenizer)).save_pretrained(directory / "source")
     tokenizer.save_pretrained(directory / "source")
-    finish(spawn(directory, "baseline"), "baseline")
-    kill_when_ready(spawn(directory, "interrupted"), directory / "ready-to-kill")
+    # The baseline and the interrupted run share nothing, each compiling into a cache of its own, so they
+    # run together; the resumed run reads the interruption's checkpoint, and every program from its
+    # cache, after both. A failure on the way stops both.
+    with ProcessGroup() as started:
+        started.running.append(baseline := spawn(directory, "baseline"))
+        started.running.append(interrupted := spawn(directory, "interrupted"))
+        kill_when_ready(interrupted, directory / "ready-to-kill")
+        finish(baseline, "baseline")
     finish(spawn(directory, "resumed"), "resumed")
     return directory
 

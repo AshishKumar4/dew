@@ -70,6 +70,7 @@ from dew.inputs import Field, InputSpec
 from dew.nn.cross_attention import crosses_alone
 from dew.nn.flops import MissingFlopsCount, counted_flops, frozen_training_flops, parameter_flops
 from dew.nn.inputs import CONTEXT, CONTEXT_LENGTHS, ModelInputs, pad_token_rows, rotate_rows
+from dew.nn.inspection import INSPECTED
 from dew.nn.mla import INDEXER, INDEXER_COLLECTION
 from dew.nn.moe import ROUTER_COLLECTION
 from dew.nn.precision import at_least_fp32
@@ -435,6 +436,7 @@ class Scores(NamedTuple):
     indexer: dict | None
     total: jax.Array | None = None
     logits: jax.Array | None = None
+    inspected: dict | None = None
 
 
 def _phase_filter(model: nn.Module, indexer: IndexerTraining | None,
@@ -756,7 +758,7 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
     def token_scores(self, params, tokens, train: bool = False, rngs=None,
                      segment_ids=None, positions=None, routing: bool = False,
                      depths: bool = False, roles=None, qk_stats: bool = False,
-                     indexer: bool = False, layers: Sequence[int] = (),
+                     indexer: bool = False, layers: Sequence[int] = (), watched: bool = False,
                      routes: tuple[jax.Array, jax.Array | None] | None = None,
                      predict: bool | None = None, z_loss: float | None = None, logits: bool = False):
         """Score per-token next-token cross entropy over a `[B, seq_len + 1]` batch.
@@ -814,7 +816,7 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
             if covered is not None:
                 replay["routed"] = jnp.asarray(covered, bool)[:, :-1]
         collections = (([ROUTER_COLLECTION] if routing else []) + (["qk"] if qk_stats else [])
-                       + ([INDEXER_COLLECTION] if indexer else []))
+                       + ([INDEXER_COLLECTION] if indexer else []) + ([INSPECTED] if watched else []))
         stream_depth = depths and _streamed_depths(self.model)
         opened = [*collections, 'prediction_inputs'] if stream_depth else collections
         hidden, gathered = self._hidden_states(params, inputs, train, rngs, opened,
@@ -822,6 +824,7 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         sown = gathered.get(ROUTER_COLLECTION, {}) if routing else None
         qk = gathered.get("qk", {}) if qk_stats else None
         kls = gathered.get(INDEXER_COLLECTION) if indexer else None
+        inspected = gathered.get(INSPECTED, {}) if watched else None
         kept = tuple(self._layer_states().layer_state(gathered, index) for index in layers)
         predict = self.token_accuracy if predict is None else predict
         table = self.fused_head(self.model, params) if z_loss is not None else None
@@ -860,7 +863,7 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
                                                          predict=False)
                 depth_scores.append((depth_losses, depth_weights, depth_total))
         return Scores(losses, weights, log_z, correct, hidden, kept, sown, depth_scores, qk, kls, total,
-                      whole)
+                      whole, inspected)
 
     def _head_scores(self, params, hidden, targets, weights, prepared, table, *, predict: bool,
                      z_loss: float | None, logits: bool):
@@ -1299,7 +1302,7 @@ class LMObjective(TokenScorer):
         assert self.indexer is not None
         prepared = self._text(batch)
         inputs, _ = self._rows(prepared.tokens)
-        collections = [INDEXER_COLLECTION] + (["qk"] if step.qk_stats else [])
+        collections = step.sown(INDEXER_COLLECTION)
         _, gathered = self._hidden_states(
             thaw(params), inputs, train=step.training, rngs=model_rngs(step.key, training=step.training),
             collections=collections, packing=prepared.slice_tokens(stop=-1).kwargs())
@@ -1310,7 +1313,8 @@ class LMObjective(TokenScorer):
             peak = _global_qk_max(qk)
             if peak is not None:
                 reported["qk/max_logit"] = peak
-        return statistics, Aux(reported, qk_stats=qk)
+        return statistics, Aux(reported, qk_stats=qk, inspected=gathered.get(INSPECTED, {})
+                               if step.watched is not None else None)
 
     def _warmup_statistics(self, sown, prepared: ModelInputs, batch: Batch) -> tuple[Ratio, jax.Array]:
         """The warm-up's loss, the indexer's weighted KL over the queries it
@@ -1392,8 +1396,9 @@ class LMObjective(TokenScorer):
             routing=balance is not None,
             depths=self.mtp_weight is not None, roles=self._batch_roles(batch),
             qk_stats=step.qk_stats, indexer=self.indexer is not None, layers=layers,
+            watched=step.watched is not None,
             z_loss=self.z_loss if summed else None, logits=logits, predict=predict)
-        losses, weights, log_z, correct, _, _, routing, depths, qk, kls, sums, _ = scores
+        losses, weights, log_z, correct, _, _, routing, depths, qk, kls, sums, _, _ = scores
         width, length = at_least_fp32(losses.dtype), losses.shape[1]
 
         def shares(values: jax.Array, counts: jax.Array) -> jax.Array:
@@ -1454,7 +1459,8 @@ class LMObjective(TokenScorer):
             peak = _global_qk_max(qk)
             if peak is not None:
                 reported["qk/max_logit"] = peak
-        return _Scored(statistics, Aux(reported, qk_stats=qk, effects=effects), scores, units)
+        return _Scored(statistics, Aux(reported, qk_stats=qk, effects=effects, inspected=scores.inspected),
+                       scores, units)
 
     def evaluate(self, params, batch, step: Step):
         """Score the complete batch teacher-forced, using EMA when present; the

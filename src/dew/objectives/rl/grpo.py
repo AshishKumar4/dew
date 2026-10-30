@@ -87,6 +87,7 @@ class _Terms(NamedTuple):
     proximal: bool
     qk_stats: Variables | None
     routing: Variables | None
+    inspected: Variables | None = None
 
 
 def onto_ids(batch, scores: jax.Array) -> jax.Array:
@@ -264,10 +265,11 @@ class GRPOObjective(TokenScorer):
         """
         return self._packed_scores(params, batch)[0]
 
-    def _packed_scores(self, params: Variables, batch, *, qk_stats: bool = False, routing: bool = False
-                       ) -> tuple[jax.Array, Scores]:
+    def _packed_scores(self, params: Variables, batch, *, qk_stats: bool = False, routing: bool = False,
+                       watched: bool = False) -> tuple[jax.Array, Scores]:
         """The packed policy likelihoods and their live `Scores`: the QK collection where `qk_stats` asks
-        for it, and the routers' choices where `routing` does."""
+        for it, the routers' choices where `routing` does, and the watched activations where the step
+        watches (`watched`)."""
         ids = jnp.asarray(batch[IDS_KEY], jnp.int32)
         segments = jnp.asarray(batch[SEGMENT_IDS_KEY], jnp.int32)
         for key in (SEGMENT_IDS_KEY, POSITIONS_KEY, RESPONSE_MASK_KEY):
@@ -278,13 +280,13 @@ class GRPOObjective(TokenScorer):
                   else (batch[ROUTED_EXPERTS_KEY], batch.get(ROUTED_KEY)))
         scores = self.token_scores(params, ids, segment_ids=segments,
                                    positions=jnp.asarray(batch[POSITIONS_KEY], jnp.int32), routes=routes,
-                                   qk_stats=qk_stats, routing=routing)
+                                   qk_stats=qk_stats, routing=routing, watched=watched)
         support = (None if SUPPORT_KEY not in batch
                    else (batch[SUPPORT_KEY], batch[SUPPORT_COLUMNS_KEY]))
         sampled = self.sampled_log_probs(params, scores, ids, support, self.sampling_temperature)
         return onto_ids(batch, sampled), scores
 
-    def _terms(self, params, batch, *, qk_stats: bool = False) -> _Terms:
+    def _terms(self, params, batch, *, qk_stats: bool = False, watched: bool = False) -> _Terms:
         """Read a packed batch onto its own `[rows, width]` grid.
 
         The old policy is `old_log_probs` when a rescoring or the sampler
@@ -301,11 +303,12 @@ class GRPOObjective(TokenScorer):
         # collection MuonClip reads and the routers the balance reads come from the
         # same live forward when asked for.
         routed = self.balance is not None
-        if qk_stats or routed:
-            policy, scores = self._packed_scores(params, batch, qk_stats=qk_stats, routing=routed)
-            qk, sown = scores.qk, scores.routing
+        if qk_stats or routed or watched:
+            policy, scores = self._packed_scores(params, batch, qk_stats=qk_stats, routing=routed,
+                                                 watched=watched)
+            qk, sown, inspected = scores.qk, scores.routing, scores.inspected
         else:
-            policy, qk, sown = self.packed_log_probs(params, batch), None, None
+            policy, qk, sown, inspected = self.packed_log_probs(params, batch), None, None, None
         dtype = at_least_fp32(policy.dtype)
         mask = jnp.asarray(batch[RESPONSE_MASK_KEY], dtype)
         behavior = jnp.asarray(batch[BEHAVIOR_LOG_PROBS_KEY], dtype)
@@ -315,7 +318,7 @@ class GRPOObjective(TokenScorer):
         return _Terms(policy, old, behavior,
                       jnp.asarray(batch[ADVANTAGES_KEY], dtype), mask,
                       jnp.asarray(batch[SEGMENT_IDS_KEY], jnp.int32),
-                      None if weights is None else jnp.asarray(weights, dtype), proximal, qk, sown)
+                      None if weights is None else jnp.asarray(weights, dtype), proximal, qk, sown, inspected)
 
     def loss(self, variables, batch, step):
         """Compute the policy surrogate over the trainable tokens, plus the KL to the reference.
@@ -323,7 +326,7 @@ class GRPOObjective(TokenScorer):
         The policy's log-probabilities are recomputed from the rollout's own
         ids, so every term uses the tokens that were actually sampled.
         """
-        terms = self._terms(variables, batch, qk_stats=step.qk_stats)
+        terms = self._terms(variables, batch, qk_stats=step.qk_stats, watched=step.watched is not None)
         mask = terms.mask
         correction = self.behavior_importance
         if isinstance(correction, float) and not terms.proximal:
@@ -384,7 +387,8 @@ class GRPOObjective(TokenScorer):
             statistics, effects, router_metrics = self.balance.compose(
                 variables, objective, terms.routing or {}, batch, queries, fields)
             metrics.update(router_metrics)
-        return statistics, Aux[Variables](metrics, qk_stats=terms.qk_stats, effects=effects)
+        return statistics, Aux[Variables](metrics, qk_stats=terms.qk_stats, effects=effects,
+                                          inspected=terms.inspected)
 
     def policy_ratio(self, terms: _Terms, effective: jax.Array, keep: jax.Array, importance=None
                      ) -> tuple[Ratio, jax.Array, jax.Array, dict[str, jax.Array]]:

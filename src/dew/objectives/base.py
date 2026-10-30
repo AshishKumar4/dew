@@ -13,6 +13,7 @@ reports. These values are JAX pytrees.
 
 from __future__ import annotations
 
+import contextlib
 import enum
 import functools
 import math
@@ -46,6 +47,7 @@ from dew._records import JSON
 from dew.artifacts import Artifact, Artifacts, TokenScores
 from dew.batch import EXAMPLE_ROWS, FROZEN, VALID_ROWS, Batch, PathFilter, Variables, dicts, everything, part
 from dew.nn import categorical
+from dew.nn.inspection import INSPECTED, Watched, watching
 from dew.nn.kernels.options import Held, Option, compiler_options
 from dew.nn.precision import accumulated, at_least_fp32, compensated_sum, weighted_total
 from dew.nn.progress import Progress, stepping
@@ -298,6 +300,18 @@ class Step:
     """Whether the run's optimizer reads the step's attention logit maxima (`dew.optim.clips_qk`, its
     QK-Clip): the objective opens the `qk` collection in the model calls it trains through and returns
     what they sowed (`Aux.qk_stats`). Static, as opening a collection changes the program."""
+    watched: Watched | None = struct.field(pytree_node=False, default=None)
+    """The activations a sampled step watches (`dew.nn.inspection.watching`): the objective opens the
+    `inspected` collection in the model call it trains through and returns what it sowed
+    (`Aux.inspected`). None on every other step; static, as `qk_stats` is."""
+
+    def sown(self, *collections: str) -> list[str]:
+        """The collections a model call the objective trains through opens: `collections`, the ones its
+        objective reads, and those the step asks for, `qk` where the optimizer clips by it and
+        `inspected` where the step watches activations. A call opening none returns an empty mapping
+        beside its output."""
+        return [*collections, *(["qk"] if self.qk_stats else []),
+                *([INSPECTED] if self.watched is not None else [])]
 
     def places(self, rows: int) -> tuple[jax.Array, int]:
         """The places among the update's examples of a batch's `rows` rows (`examples`) and how many
@@ -430,6 +444,9 @@ class Aux(Generic[Effects]):
     clips by it refuses a step that returns None."""
     effects: Effects | None = None
     """Additive observations that `Objective.apply_effects` applies once per optimizer commit."""
+    inspected: Variables | None = None
+    """What the watched modules of the model call the objective trains through sowed
+    (`dew.nn.inspection.INSPECTED`), where the step watches (`Step.watched`); None otherwise."""
     record: Evaluated | Recorded | None = None
     """What a recording evaluation's `Step.sample` and `Step.boundary` calls produced (`Step.record`),
     which `Objective._loss` fills (`Evaluated`) and a transaction stacks with its replays' (`Recorded`);
@@ -963,6 +980,14 @@ class Objective(ABC, Generic[Loss, Effects]):
         raise NotImplementedError(f"{type(self).__name__} draws no fresh tree: give it variables, "
                                   "or implement fresh_variables")
 
+    def fresh_modules(self) -> tuple[str, ...]:
+        """The modules this objective trains that are drawn fresh beside a loaded base, by their paths
+        under `params` (`backbone/layers_1/cross_attention`, `head`), which a run trains in a fresh group
+        (`dew.optim.OptimConfig.fresh_groups`): none by default, an objective declaring what it draws beside
+        the base it holds and what its source drew (`Pretrained.fresh`). One drawn with no parameter, a
+        tied readout, the group leaves out (`dew.config.trained_modules`)."""
+        return ()
+
     def complete_variables(self, key: jax.Array, tree: Variables) -> Variables:
         """Return `tree`, held or drawn, with what the objective's own modules
         add: a loss head, a projector, a phase's split. The default adds nothing."""
@@ -1006,12 +1031,10 @@ class Objective(ABC, Generic[Loss, Effects]):
         kept = (*holds, *modules)
         if held is None or len(held[0]) != len(kept) or any(
                 now is not was for now, was in zip(kept, held[0], strict=True)):
-            # A fresh callable gives JAX a fresh trace even for the same bound method.
-            @functools.wraps(function)
-            def run(*args, **kwargs):
-                return function(*args, **kwargs)
+            from dew.nn.kernels.options import OuterProgram
 
-            held = (kept, jax.jit(run, static_argnames=static_argnames, compiler_options=options))
+            # A program jits a fresh callable, so JAX traces it afresh even for the same bound method.
+            held = (kept, OuterProgram(function, static_argnames=static_argnames, compiler_options=options))
             cached[1][key] = held
         return held[1]
 
@@ -1153,7 +1176,9 @@ class Objective(ABC, Generic[Loss, Effects]):
             batch = {name: value for name, value in batch.items() if name != EXAMPLE_ROWS}
         witness = Witness() if step.record and not validation else None
         step = step if witness is None else replace(step, witness=witness)
-        with stepping(Progress(step.committed)):
+        watched = step.watched if not validation else None
+        with stepping(Progress(step.committed)), (watching(watched.kinds, histogram=watched.histogram)
+                                                  if watched else contextlib.nullcontext()):
             loss = (self.validation_loss if validation else self.loss)(variables, batch, step)
         if _has_aux(loss):
             stats, aux = loss
@@ -1164,6 +1189,18 @@ class Objective(ABC, Generic[Loss, Effects]):
             places = jnp.zeros((0,), jnp.int32) if step.example_index is None else step.example_index
             aux = replace(aux, record=witness.report(marked, places))
         return stats, aux
+
+    @staticmethod
+    def watched_forward(step: Step, model: nn.Module, variables: Variables, *args,
+                        **kwargs) -> Variables | None:
+        """What the watched modules sow in one forward of `model` at these arguments where the step
+        watches (`Step.watched`), else None: for an objective whose training forward runs inside a
+        transform (a `jax.jvp`, a sampler's loop), which returns none of its collections, the forward at
+        the step's own inputs, run apart for its summaries alone, its weights held out of the backward."""
+        if step.watched is None:
+            return None
+        _, sown = model.apply(jax.lax.stop_gradient(variables), *args, mutable=[INSPECTED], **kwargs)
+        return sown.get(INSPECTED, {})
 
     def reduce_loss(self, stats: Loss) -> tuple[jax.Array, jax.Array]:
         """Return the objective value of summed statistics and whether they have any mass.
@@ -1420,10 +1457,13 @@ class Objective(ABC, Generic[Loss, Effects]):
         """Return the model and task settings that let a saved step be rebuilt.
 
         It records the objective's import path, its `recorded_model`'s record,
-        and `task_settings`, field by field. An objective that declares no task
+        `task_settings`, field by field, and the attention form the step trained in
+        (`generation.chosen(attention_form=...)`), which a loaded task's calls trace in
+        (`dew.inference.tasks.SavedRunTask.traced`). An objective that declares no task
         settings returns None; a custom research method can still restore its
         raw state.
         """
+        from dew.nn.kernels import generation
         from dew.registry import ModelConfig, import_path, record_fields, to_record
 
         settings = self.task_settings()
@@ -1431,7 +1471,8 @@ class Objective(ABC, Generic[Loss, Effects]):
             return None
         return {'objective': import_path(type(self)),
                 'model': to_record(ModelConfig.from_model(self.recorded_model()), ModelConfig),
-                **record_fields(settings, type(settings))}
+                **record_fields(settings, type(settings)),
+                'attention_form': generation.chosen_kernel('attention_form', 'fast')}
 
     def build_task(self, variables: Variables, *,
                    processor: Processor | None | Omitted = OMITTED) -> Task | SavedTask:

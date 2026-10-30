@@ -136,8 +136,9 @@ def _set_environment(wandb: Wandb | None, xla_flags: str | None,
     before a backend opens."""
     if wandb is not None and wandb.offline:
         os.environ['WANDB_MODE'] = 'offline'
-    # HF tokenizers fork a thread pool; grain's workers fork the process.
-    os.environ['TOKENIZERS_PARALLELISM'] = "false"
+    # HF tokenizers fork a thread pool, and grain's workers fork the process, which deadlocks a pool
+    # the parent started; a value the user set is theirs.
+    os.environ.setdefault('TOKENIZERS_PARALLELISM', "false")
     if xla_flags and not flags_hold(xla_flags):
         if backend_open():
             raise ValueError(f"XLA reads its flags as JAX opens its backend, which has opened: {xla_flags!r} "
