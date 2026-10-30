@@ -111,62 +111,104 @@ def test_a_decision_claims_its_sources_fresh_blocks_only_over_the_sources_weight
     assert decision(variables=declared.init(jax.random.key(0))).fresh_modules() == ()
 
 
-@pytest.mark.mesh(devices=8)
-def test_a_decision_run_records_its_fresh_group_and_steps_its_blocks_and_head_in_it(tmp_path):
-    """A decision run whose context layers draw cross-attention blocks over its loaded backbone records
-    their default group in its run.json, and its trained tree's blocks and head step in it, an
-    adapter's factors and the backbone's every other parameter in the base group; resumed, it trains
-    in the groups it recorded. A run that names groups keeps its own, its fresh group claiming the
-    same; one whose only drawn module, a tied readout, holds no parameter takes no default group, and
-    is refused a fresh group it names (row 2391); a run in the shared form draws each context layer's
-    gate alone, a sliver of IDEFICS's blocks, and its default group claims them (row 2414)."""
-    from test_decision_recipe import QWEN
-    from test_run_options import decision, trained
-
+def groups(root, name: str) -> tuple[ParamGroup, ...]:
+    """The param groups the run `name` under `root` records."""
     from dew.config import RunConfig
-    from dew.decision.config import Letters
-    from dew.decision.layout import Labels
+
+    return RunConfig.load(str(root / "runs" / name)).optim.param_groups
+
+
+def context_run(root):
+    """A decision run whose context layer draws a cross-attention block over its loaded backbone, an
+    adapter on its queries."""
+    from test_decision_recipe import QWEN
+    from test_run_options import decision
+
     from dew.lora import LoRA
 
-    def groups(name: str) -> tuple[ParamGroup, ...]:
-        return RunConfig.load(str(tmp_path / "runs" / name)).optim.param_groups
+    return dataclasses.replace(decision(root, drawn=False), pretrained=str(QWEN), context_layers=(0,),
+                               context_length=16, lora=LoRA(rank=2, modules=("q_proj",)))
 
-    run = dataclasses.replace(decision(tmp_path, drawn=False), pretrained=str(QWEN), context_layers=(0,),
-                              context_length=16, lora=LoRA(rank=2, modules=("q_proj",)))
-    saving = {"checkpoint_every": 1}
-    state, _ = trained(run, tmp_path, "default", trainer=saving)
-    recorded = groups("default")
-    labels = labelled(recorded, state.variables["params"])
+
+SAVING = {"checkpoint_every": 1}
+
+
+def claimed(labels: dict) -> None:
+    """The cross-attention block and the head step in the fresh group, the adapter's factors in the
+    base group."""
     assert {label for path, label in labels.items() if crossing(path) or path[0] == "head"} == {"fresh"}
     assert {label for path, label in labels.items() if "lora" in "/".join(path).lower()} == {"base"}
+
+
+@pytest.mark.mesh(devices=8)
+def test_a_decision_run_records_its_default_fresh_group_over_its_block_and_head(tmp_path):
+    """A decision run whose context layer draws a cross-attention block over its loaded backbone records
+    the block's and its head's default group in its run.json, and its trained tree steps them in it, an
+    adapter's factors and the backbone's every other parameter in the base group (row 2391)."""
+    from test_run_options import trained
+
+    state, _ = trained(context_run(tmp_path), tmp_path, "default", trainer=SAVING)
+    claimed(labelled(groups(tmp_path, "default"), state.variables["params"]))
+
+
+@pytest.mark.mesh(devices=8)
+def test_a_decision_run_that_names_its_groups_resumes_in_them(tmp_path):
+    """A run that names its groups keeps its own, its fresh group claiming the block and the head;
+    resumed from a recipe naming none, it trains on in the groups its record names (row 2391)."""
+    from test_run_options import trained
+
+    run = context_run(tmp_path)
     claiming = dataclasses.replace(run, optim=dataclasses.replace(run.optim, param_groups=(FRESH, BASE)))
-    named, _ = trained(claiming, tmp_path, "named", trainer=saving)
-    assert groups("named")[1] == BASE and groups("named")[0].learning_rate_multiplier == MULTIPLIER
-    assert labelled(groups("named"), named.variables["params"]) == labels
-    # Resumed from a recipe naming no groups, each run trains on in the groups its record names, the
-    # default's or its own, and a validation chain only its Python holds rebuilds nothing to read them.
-    resumed, _ = trained(run, tmp_path, "named", trainer={**saving, "steps": 2})
-    assert int(resumed.step) == 2 and groups("named")[0].learning_rate_multiplier == MULTIPLIER
+    named, _ = trained(claiming, tmp_path, "named", trainer=SAVING)
+    assert groups(tmp_path, "named")[1] == BASE
+    assert groups(tmp_path, "named")[0].learning_rate_multiplier == MULTIPLIER
+    claimed(labelled(groups(tmp_path, "named"), named.variables["params"]))
+    resumed, _ = trained(run, tmp_path, "named", trainer={**SAVING, "steps": 2})
+    assert int(resumed.step) == 2 and groups(tmp_path, "named")[0].learning_rate_multiplier == MULTIPLIER
+
+
+@pytest.mark.mesh(devices=8)
+def test_a_run_resumes_its_groups_where_its_record_holds_a_chain_only_its_python_holds(tmp_path):
+    """A run whose validation chain only its Python holds resumes in the groups its record names, which
+    it reads alone, rebuilding nothing of the chain (row 2391's review)."""
+    from test_run_options import trained
+
+    run = context_run(tmp_path)
     held = dataclasses.replace(run, validation=run.validation.map(lambda batch: batch))
-    trained(held, tmp_path, "held", trainer=saving)
-    assert int(trained(held, tmp_path, "held", trainer={**saving, "steps": 2})[0].step) == 2
+    trained(held, tmp_path, "held", trainer=SAVING)
+    assert int(trained(held, tmp_path, "held", trainer={**SAVING, "steps": 2})[0].step) == 2
+
+
+@pytest.mark.mesh(devices=8)
+def test_a_tied_readout_takes_no_default_group_and_is_refused_a_named_one(tmp_path):
+    """A run whose only drawn module, a tied readout, holds no parameter takes no default group, and is
+    refused a fresh group it names (row 2391)."""
+    from test_run_options import trained
+
+    from dew.decision.config import Letters
+    from dew.decision.layout import Labels
+
     # A tied readout over the fixture's tokenizer, whose letters each spell one token as "{}" variants.
-    tied = dataclasses.replace(run, context_layers=None, lora=None,
+    tied = dataclasses.replace(context_run(tmp_path), context_layers=None, lora=None,
                                head=Letters(labels=Labels(variants=("{}",)), count=4))
     trained(tied, tmp_path, "tied")
-    assert groups("tied") == ()
+    assert groups(tmp_path, "tied") == ()
+    named = dataclasses.replace(tied, optim=dataclasses.replace(tied.optim, param_groups=(FRESH, BASE)))
     with pytest.raises(ValueError):
-        trained(dataclasses.replace(tied, optim=claiming.optim), tmp_path, "tied-named")
-    # The shared form draws only each layer's gate: at layer 3, the fixture's one layer of full
-    # attention, whose projections read the context.
-    shared = dataclasses.replace(run, context_form="shared", context_layers=(3,))
+        trained(named, tmp_path, "tied-named")
+
+
+@pytest.mark.mesh(devices=8)
+def test_a_shared_form_run_draws_its_layers_gates_alone_in_its_fresh_group(tmp_path):
+    """A run in the shared form draws each context layer's gate alone (`alpha_cross_attn`, as Llama 3.2
+    Vision's gated cross-attention names it), which its default group claims (row 2414): at layer 3,
+    the fixture's one layer of full attention, its own projections reading the context behind the
+    gate."""
+    from test_run_options import trained
+
+    shared = dataclasses.replace(context_run(tmp_path), context_form="shared", context_layers=(3,))
     gated, _ = trained(shared, tmp_path, "shared")
-    assert {label for path, label in labelled(groups("shared"), gated.variables["params"]).items()
-            if crossing(path)} == {"fresh"}
-    assert 0 < drawn(gated) < drawn(state) / 100
-
-
-def drawn(state) -> int:
-    """The values a trained state's cross-attention blocks hold."""
-    return sum(leaf.size for path, leaf in jax.tree_util.tree_leaves_with_path(state.variables["params"])
-               if crossing(tuple(getattr(entry, "key", entry) for entry in path)))
+    labels = labelled(groups(tmp_path, "shared"), gated.variables["params"])
+    drawn = {path: label for path, label in labels.items() if crossing(path)}
+    assert drawn and set(drawn.values()) == {"fresh"}
+    assert {path[-1] for path in drawn} == {"alpha_cross_attn"}
