@@ -262,6 +262,25 @@ def test_a_program_runs_the_executable_its_calls_kernel_choice_traces():
             np.testing.assert_array_equal(output, expected)
 
 
+def test_a_programs_calls_of_two_shapes_compile_at_once_from_two_threads():
+    """Two threads calling one program at two shapes each lower their own executable while the other
+    does, as jit's calls do: each tracing waits for the other's, which a call that held the program for
+    its whole compile would never reach (train 329's review: `Decide.compile_scoring`'s threads)."""
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    met = threading.Barrier(2, timeout=30)
+
+    def doubled(x):
+        met.wait()
+        return x * 2
+
+    run = program(doubled)
+    with ThreadPoolExecutor(2) as pool:
+        outputs = list(pool.map(run, (jnp.ones(2), jnp.ones(3))))
+    np.testing.assert_array_equal(outputs[1], jnp.full(3, 2.0))
+
+
 def test_a_program_is_its_jit_within_another_trace_and_keys_its_statics_as_jit_does():
     """Within `jax.grad`, `jax.vmap` or an enclosing jit a program is its jit, traced into theirs, its
     tracers its arguments or ones its function closes over, and under `jax.disable_jit` Python; called

@@ -511,6 +511,29 @@ def test_a_server_round_after_the_first_reuses_its_programs_and_reads_once_a_ste
         np.testing.assert_array_equal(mine.host().tokens, theirs.host().tokens)
 
 
+def test_a_servers_steps_after_its_first_run_their_executables_with_no_dispatch_key(monkeypatch):
+    """A server's decoding and admitting steps build their programs' dispatch key once, at their first
+    call, and run their executables after it (`dew.inference.serving_kernel.dispatched`): a step's Python
+    walks no tree of its weights and cache (train 329's review: about 1 ms a step)."""
+    from dew.nn.kernels.options import OuterProgram
+
+    server = Server.from_task(task(), slots=4, capacity=128, admission=2, decode_steps=4)
+    rows = [np.asarray(Digits().encode(prompt), np.int32) for prompt in PROMPTS]
+    keyed = []
+    original = OuterProgram._keyed
+    monkeypatch.setattr(OuterProgram, "_keyed",
+                        lambda self, *given: keyed.append(1) or original(self, *given))
+    for round in range(2):
+        tickets = [server.submit(prompt, budget, key=jax.random.key(10 * round + index))
+                   for index, (prompt, budget) in enumerate(zip(rows, BUDGETS, strict=True))]
+        server.run()
+        for ticket in tickets:
+            ticket.result()
+        if round == 0:
+            first = len(keyed)
+    assert len(keyed) == first <= 2
+
+
 @pytest.mark.parametrize("decode_steps", [1, 4])
 def test_a_step_whose_draw_has_no_distribution_stops_the_server(decode_steps):
     """A bigram policy that draws 5 after every id but 5, after which every score is 3e38, which
