@@ -1,7 +1,7 @@
 {
  "step": 2,
  "compute": "float32",
- "task_compute": null,
+ "products": null,
  "params": [
   "float32"
  ],

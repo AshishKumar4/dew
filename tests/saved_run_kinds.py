@@ -4,10 +4,14 @@ and each variant a run serializes apart (row 2640): a decision row of its own se
 a lettered one, a block-diffusion run over a nested decoder, a run on the examples clock, fresh runs in
 bfloat16 and in float16 (whose loss a dynamic scale scales), and a run over a source stored as it states."""
 
+import collections
 import dataclasses
+import re
+import tempfile
 from pathlib import Path
 
-import jax.numpy as jnp
+import jax
+import numpy as np
 import test_run_options as run_options
 from test_lm_recipe import SEQ, write_token_files
 from test_run_options import KINDS, decision, lm, read
@@ -15,7 +19,12 @@ from test_run_options import KINDS, decision, lm, read
 from dew.config import RunConfig, SourceOptions, TrainerConfig
 from dew.data import presets
 from dew.data.sources.tokens import TokenFiles
+from dew.decision import Choice
 from dew.decision.layout import built_in
+from dew.decision.task import Decide
+from dew.inference.images import TextToImage
+from dew.inference.tasks import BlockGeneration, TextGeneration
+from dew.nn.kernels import options
 from dew.nn.precision import numerics_of
 from dew.registry import ModelConfig
 from dew.training.budget import Pause
@@ -100,20 +109,58 @@ def stored(root: Path, drawn: bool) -> RunConfig:
     return dataclasses.replace(over(QWEN, root, drawn), source=SourceOptions(param_dtype="bfloat16"))
 
 
-def computed(model) -> str | None:
-    """The dtype a built model computes in: the first a module of it states (Flax's `dtype`), its own or
-    a module's it holds, breadth first (a decision model's backbone's, a wrapper's decoder's)."""
-    import flax.linen as nn
+def computed(task) -> dict[str, int]:
+    """How many matrix products a loaded task multiplies in each dtype, its operands' dtypes joined by a
+    comma where they differ: the products of the programs one request of it lowers (`answered`), read
+    from the StableHLO JAX writes as it lowers them (`jax_dump_ir_to`). A model whose outer module states
+    bfloat16 while one projection of its decoder computes in float32 multiplies one product fewer in
+    bfloat16. JAX's caches and Dew's outer programs (`dew.nn.kernels.options.program`, which an equal
+    model's earlier task compiled) are cleared first, so every program lowers anew. The products are the
+    suite's CPU's, as the corpus's writer counts them under the suite's environment, whose wide
+    arithmetic multiplies a product summed in float32 in float64 (`dew.nn.precision.accumulated`); an
+    accelerator lowers its own (bible §7 runs these files on the CPU)."""
+    assert jax.default_backend() == "cpu", "a saved run's products are counted on the suite's CPU"
+    jax.clear_caches()
+    options._program.cache_clear()
+    before = jax.config.values["jax_dump_ir_to"]
+    with tempfile.TemporaryDirectory() as dump:
+        jax.config.update("jax_dump_ir_to", dump)
+        try:
+            answered(task)
+        finally:
+            jax.config.update("jax_dump_ir_to", before)
+        lowered = "".join(path.read_text() for path in Path(dump).glob("*.mlir"))
+    products = collections.Counter(",".join(sorted({DTYPES[operand.rsplit("x", 1)[-1]] for operand in pair}))
+                                   for pair in PRODUCT.findall(lowered))
+    assert products, "the request lowered no matrix product"
+    return dict(sorted(products.items()))
 
-    frontier = [model]
-    while frontier:
-        module = frontier.pop(0)
-        stated = getattr(module, "dtype", None)
-        if stated is not None:
-            return str(jnp.dtype(stated))
-        frontier += [value for field in dataclasses.fields(module)
-                     if isinstance(value := getattr(module, field.name, None), nn.Module)]
-    return None
+
+PRODUCT = re.compile(r"stablehlo\.dot_general [^\n]*: \(tensor<([^>]*)>, tensor<([^>]*)>\)")
+"""A matrix product of a lowered program and its operands' tensor types, shape and element type."""
+
+DTYPES = {"bf16": "bfloat16", "f16": "float16", "f32": "float32", "f64": "float64"}
+"""The dtype StableHLO's element type names."""
+
+
+def answered(task) -> None:
+    """One request of a loaded task, as its kind's users make it, and its answer: a language model
+    continues a prompt by one token through the tokenizer its run recorded, a decision answers a
+    question about a state, and a text-to-image run draws an image in one step."""
+    if isinstance(task, TextGeneration):
+        assert len(task.decode(task("ab", max_new_tokens=1, key=0))) == 1
+    elif isinstance(task, BlockGeneration):
+        # A response of at least one token past the prompt, its decoder having stepped.
+        generated = task([[4, 5, 6, 7]], 4, key=0).host()
+        assert (np.asarray(generated.lengths) > 0).all() and (np.asarray(generated.decoder_steps) > 0).all()
+    elif isinstance(task, Decide):
+        question = {"team": Choice("which team", ["billing", "technical", "sales"])}
+        [answers] = task([({"text": "the site is down"}, question)])
+        assert answers["team"].choice in ("billing", "technical", "sales")
+    elif isinstance(task, TextToImage):
+        assert len(task(["a cat"], steps=1, key=0).pil()) == 1
+    else:
+        raise AssertionError(f"no request is written for a saved {type(task).__name__}")
 
 
 SAVED_KINDS = {**KINDS, "multimodal": multimodal, "decision-segments": segmented,
