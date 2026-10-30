@@ -118,6 +118,18 @@ def test_a_loaded_runs_view_is_the_live_runs():
     assert offline == {name: value for name, value in live.items() if name.startswith("inspect/")}
 
 
+def test_an_offline_view_of_an_objective_naming_its_input_alone_declares_it_from_its_batch():
+    """The offline view of a trainer whose objective names its input field alone (`Supervised(inputs="x")`,
+    the documented form) declares that input at the shape its batch gives, as `fit` does from its loader's
+    first, and reports the sampled update (row 2719)."""
+    from dew.objectives.supervised import Supervised
+
+    objective = Supervised(nn.Dense(2), lambda outputs, batch: jnp.sum(outputs ** 2, axis=-1), inputs="x")
+    trainer = Trainer(objective, optax.sgd(RATE), key=jax.random.key(0),
+                      inspection=Inspection(paths=("*",), targets=("params",)))
+    assert inspected(trainer, {"x": ROWS})["inspect/params/l2"] > 0
+
+
 def test_a_custom_step_refuses_an_inspection():
     """A custom step (`Trainer(step=...)`) commits no update an inspection reads, so asking for one is
     refused as the trainer is built, not dropped."""
