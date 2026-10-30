@@ -64,7 +64,9 @@ def test_a_server_draws_at_its_tasks_progress_and_at_each_version_it_loads():
     """A server built from a task that draws at a run's progress (a DEX decoder half way through its
     anneal, `TextGeneration.progress`) draws as the task does, and reloaded at another version's
     (`Server.reload`, as `NativeRolloutServer.load` reloads it) as the task at that progress does; one
-    built at the run's end serves that end, refusing a run's progress (ledger 2695)."""
+    built at the run's end serves that end, refusing a run's progress, and a rollout server, which loads
+    each run version at its progress, refuses it (ledger 2695)."""
+    from dew.inference.rollouts import NativeRolloutServer
     from dew.nn.dex import DifferentialExtension
     from dew.nn.progress import END, Progress
 
@@ -86,6 +88,8 @@ def test_a_server_draws_at_its_tasks_progress_and_at_each_version_it_loads():
                               at(1)(PROMPTS[0], 5, key=3).host().raw_log_probs)
     with pytest.raises(ValueError):
         Server.from_task(at(None), slots=2, capacity=128).reload(params, Progress(jnp.asarray(1, jnp.int32)))
+    with pytest.raises(ValueError):
+        NativeRolloutServer(Server.from_task(at(None), slots=2, capacity=128))
 
 
 @pytest.mark.mesh(devices=2)

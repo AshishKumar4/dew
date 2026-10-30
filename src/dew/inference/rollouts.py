@@ -306,6 +306,12 @@ class NativeRolloutServer:
             raise ValueError("a rollout's draws end on its policy's EOS ids or stop strings, or are cut "
                              "short; this server's task also ends rows on criteria of its own, which no "
                              "draw's policy names")
+        reads = bool(progressed(server.model, Progress(jnp.asarray(version, jnp.int32))))
+        if reads and server.progress.updates is None:
+            raise ValueError("a run's versions draw a model that reads the run's progress at their updates "
+                             "(`load`), and this server draws at the run's end; build it from the task at "
+                             "the version's progress (LMObjective.policy(..., Progress(version)), "
+                             "Server.from_task)")
         self._server = server
         self._version = version
         self._engine = Engine(server, name="dew-rollout-server")
