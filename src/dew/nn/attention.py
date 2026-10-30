@@ -59,9 +59,7 @@ from .precision import (
     asks_default_precision,
     at_least_fp32,
     capped_logits,
-    configured_precision,
     float32_einsum,
-    float32_products,
     wide_cpu_arithmetic,
 )
 from .sharding import SCORES, sequence_shards
@@ -640,14 +638,11 @@ def _fused_attention(query, key, value, bias, mask, causal, sliding_window, impl
     elif implementation == 'xla':
         # A window of (l, r) keeps the l keys before the query and the r after
         # it on both the xla and the cudnn path, the sides `window_sides` counts.
-        # jax.nn's products take the precision their dtype does (`float32_products`) through the
-        # matmul config, which it reads for float32 operands.
-        with configured_precision(float32_products(query.dtype)):
-            out = jax.nn.dot_product_attention(
-                query, key, value, bias=bias, mask=mask, is_causal=causal,
-                key_value_seq_lengths=key_value_seq_lengths,
-                local_window_size=None if sliding_window is None else window_sides(causal, sliding_window),
-                implementation='xla')
+        out = jax.nn.dot_product_attention(
+            query, key, value, bias=bias, mask=mask, is_causal=causal,
+            key_value_seq_lengths=key_value_seq_lengths,
+            local_window_size=None if sliding_window is None else window_sides(causal, sliding_window),
+            implementation='xla')
     elif implementation == 'template':
         out = template_attention(query, key, value, causal, sliding_window, sinks=sinks, softcap=softcap,
                                  segment_ids=segment_ids, lengths=key_value_seq_lengths,

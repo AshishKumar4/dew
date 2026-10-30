@@ -30,9 +30,7 @@ from dew.nn.precision import (
     L2NORM_EPS,
     at_least_fp32,
     compensated_add,
-    float32_products,
     l2norm,
-    products_dtype,
     rms_statistics,
     rms_weighted,
     stochastic_bf16,
@@ -362,15 +360,14 @@ def _skip_backward(saved, operands, grad):
     stated = (None if placed is None
               else jax.sharding.NamedSharding(placed.mesh, jax.typeof(skip).sharding.spec))
     leading = 'abcdefg'[:value.ndim - 2]
-    summed = jnp.einsum(f'{leading}hv,{leading}hv->h', grad, value, out_sharding=stated,
-                        precision=float32_products(products_dtype(grad, value)))
+    summed = jnp.einsum(f'{leading}hv,{leading}hv->h', grad, value, out_sharding=stated)
     return summed.astype(skip.dtype), (grad * skip[:, None]).astype(value.dtype)
 
 
 _skip = linear_tangent(_skip_forward, _skip_backward, _skip_product)
 """`D v` (`_skip_product`) differentiated at every order (`generation.linear_tangent`): forward mode the
 product's own tangent, reverse mode its gradient in `D` summing every token's and value's product as a
-product (at `float32_products`' precision) rather than one reduction over them all: XLA:CPU's reduction,
+product (at JAX's configured precision) rather than one reduction over them all: XLA:CPU's reduction,
 without YNNPACK's fusions, summed a chunked call's `B S Dv` products in turn, 2.1 times the token-by-token
 recurrence's distance from float64 (Mamba2's rated decay, test_recurrence_stability after the gate compiled
 both arms without them). A custom VJP alone refused `jax.jvp` through a decode step's reference."""

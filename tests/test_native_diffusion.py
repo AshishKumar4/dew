@@ -49,11 +49,14 @@ STREAMED = ("sd", "xl", "safety")
 (tests/test_pipeline_streaming.py) and hold it to the source beside the whole load."""
 
 
+@pytest.mark.parametrize("part", ["walk", "update"])
 @pytest.mark.parametrize(
     "task", ["sd", "xl", "img2img", "inpaint", "xl-img2img", "xl-inpaint", "refiner", "safety"]
 )
-def test_native_bundle_trajectory_update_and_source_roundtrip(saved_pipelines, task):
-    run_check(saved_pipelines / task, *(["--streamed"] if task in STREAMED else []))
+def test_native_bundle_trajectory_update_and_source_roundtrip(saved_pipelines, task, part):
+    """A saved pipeline's walk held to the source's (`part` 'walk'), or its update, reload and export
+    ('update'), each in a process of its own (tools/check_native_diffusion.py)."""
+    run_check(saved_pipelines / task, "--part", part, *(["--streamed"] if task in STREAMED else []))
 
 
 SCHEDULER_GRIDS = ROOT / "tests/fixtures/diffusers_pipeline_schedulers.npz"
