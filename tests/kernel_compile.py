@@ -452,18 +452,14 @@ def decisions(registers: int | dict | None, model: resources.RegisterModel,
 
 
 def mosaic_failures(found: list[dict]) -> list[str]:
-    """Compile errors, spills, missing or excessive shared/TMEM allocations, and a declared model no
-    compiled kernel is named for (a launch renamed past its model, which the gate would then not compare).
-    A spill-free register model disagreement remains an advisory row until the model matches allocation."""
+    """Compile errors, spills, and missing or excessive shared/TMEM allocations. A spill-free register
+    model disagreement remains an advisory row until the model matches allocation."""
     failed = failures(found)
     for record in found:
         if refused(record):
             continue
         if not record["kernels"]:
             failed.append(f"{record['name']}: no Mosaic GPU kernel compiled")
-        compiled = {_report(kernel).kernel for kernel in record.get("kernels", ())}
-        for name in sorted(set(record.get("models", {})) - compiled):
-            failed.append(f"{record['name']}: a register model is declared for {name}, which no kernel is")
         for kernel in record.get("kernels", ()):
             found_kernel = _report(kernel)
             if (why := found_kernel.failure(record["limit"], record["tmem_limit"])) is not None:
@@ -474,6 +470,11 @@ def mosaic_failures(found: list[dict]) -> list[str]:
                               f"bytes of scratch, the kernel asks for {found_kernel.shared}")
         record["evidence"] = _register_evidence(record)
     return failed
+
+
+def compiled_kernels(record: dict) -> set[str]:
+    """The names of the kernels `record` compiled, as its models name them (`report.Report.kernel`)."""
+    return {_report(kernel).kernel for kernel in record.get("kernels", ())}
 
 
 def _report(kernel: dict) -> report.Report:
