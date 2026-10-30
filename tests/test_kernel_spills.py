@@ -233,6 +233,11 @@ def test_a_handed_step_derives_for_its_target_on_a_gpu_that_runs_it_alone():
         with handed(step):
             assert gpu_target() == canonical
         assert gpu_target() == pcie
+    # A step compiled ahead before steps recorded their GPU, unpickled with no target, is refused so too.
+    earlier = AheadOfTime("sm90", 1, {}, "", b"", (), None, 0, 0, 0, 0, 0, {})
+    vars(earlier).pop("target")
+    with assumed(pcie), pytest.raises(ValueError), handed(earlier):
+        pass
     smaller = dataclasses.replace(pcie, shared_limit=canonical.shared_limit - 1)
     unknown = dataclasses.replace(pcie, shared_limit=None)
     for other in (gpu_target("sm80"), smaller, unknown):

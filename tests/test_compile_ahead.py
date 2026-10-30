@@ -170,6 +170,7 @@ def test_a_step_compiled_ahead_is_one_program_and_a_run_of_another_refuses_it(tm
     to (`AheadOfTime.program`); a wider model's is another. A run handed another program's step
     refuses it before it trains, and refuses it again on its next fit, rather than compiling its own
     (row 1915)."""
+    from dew.nn.kernels.generation import assumed
     from dew.training.ahead import AheadOfTime, compile_ahead, compile_only_gpus
 
     batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
@@ -181,9 +182,11 @@ def test_a_step_compiled_ahead_is_one_program_and_a_run_of_another_refuses_it(tm
     assert first.program == again.program != wide.program
     wide.save(tmp_path / "wide.dew-aot")
     run = fine_tune(MeshSpec().build(jax.devices()[:1]), ahead=AheadOfTime.load(tmp_path / "wide.dew-aot"))
-    for _ in range(2):
-        with pytest.raises(ValueError):
-            run.fit(batch, steps=1, log_every=1)
+    # On the GPU it was compiled for, which a CPU is not, its program is what refuses it (train 332's review).
+    with assumed(wide.target):
+        for _ in range(2):
+            with pytest.raises(ValueError):
+                run.fit(batch, steps=1, log_every=1)
 
 
 def test_a_configured_run_compiles_its_step_ahead_for_gpus_it_lacks_and_trains_nothing(tmp_path):
