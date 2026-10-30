@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 import jax
@@ -34,14 +34,14 @@ from dew.diffusion.schedules.source import SourceGrid
 from dew.distributed.batches import row_origins, shared_host_fields, split_fields, with_host
 from dew.inputs import InputSpec
 from dew.nn.autoencoders import AutoEncoder
-from dew.nn.inspection import called_with
+from dew.nn.inspection import INSPECTED
 from dew.nn.precision import at_least_fp32, weighted_total
 from dew.objectives.base import OMITTED, Aux, Omitted, Ratio, Shown, Step
 from dew.objectives.diffusion.objective import DiffusionObjective
 from dew.rl.advantage import group_normalised
 from dew.rl.surrogate import clipped_surrogate_terms
 from dew.sampling.flow import FlowSDE, FlowTrajectory, GaussianTransition
-from dew.sampling.guidance import CFG, Autoguidance, Walk
+from dew.sampling.guidance import CFG, Guidance, Walk, pair_of
 from dew.sampling.solvers import Euler, Solver
 
 from .sessions import ADVANTAGES_KEY, OLD_LOG_PROBS_KEY
@@ -51,9 +51,6 @@ REWARDS_KEY = "rewards"
 
 if TYPE_CHECKING:
     from dew.state import TrainState
-
-Predictor = Callable[[jax.Array, jax.Array], tuple[jax.Array, jax.Array]]
-
 
 
 def _source(inputs: InputSpec, batch: Batch) -> jax.Array:
@@ -132,23 +129,24 @@ class FlowGRPOObjective(DiffusionObjective):
         return ("Flow-GRPO has no source-batch validation loss; rank checkpoints by a reward metric "
                 "with an explicit Best, or pass no validation data")
 
-    def _policy(self, params: Variables, batch: Batch) -> Denoiser:
-        """The denoiser this batch's conditions select."""
+    def _policy(self, params: Variables, batch: Batch, opened: tuple[str, ...] = ()) -> Denoiser:
+        """The denoiser this batch's conditions select, its model's calls opening `opened`."""
         given = self.encoded_conditions(params, batch)
         # An inpainting model's masked-image inputs, as the rollout encoded them (`FlowRollout`).
         spatial = batch.get("spatial", {})
-        return self.denoiser(params, {**given, **spatial},
-                             {**self.blank_conditions(params, given), **spatial})
+        policy = self.denoiser(params, {**given, **spatial},
+                               {**self.blank_conditions(params, given), **spatial})
+        return replace(policy, opened=opened)
 
-    def _walk(self, params: Variables, batch: Batch) -> Walk:
+    def _walk(self, params: Variables, batch: Batch, opened: tuple[str, ...] = ()) -> Walk:
         """The walk of the denoiser this batch's conditions select (`_policy`), guided as the rollout's
         walk was: over its `rollout_steps` points, a transition's column being its step's index."""
         points = jnp.asarray(batch["rollout_steps"], jnp.int32)
-        return Walk.over(self._policy(params, batch), self.guidance, points[0] - 1)
+        return Walk.over(self._policy(params, batch, opened), self.guidance, points[0] - 1)
 
-    def _transition(self, predict: Predictor, x: jax.Array,
+    def _transition(self, pair: tuple[jax.Array, jax.Array], x: jax.Array,
                     t: jax.Array, following: jax.Array) -> GaussianTransition:
-        denoised, eps = predict(x, t)
+        denoised, eps = pair
         return self.sde.transition(x, t, following, denoised, eps, self.process)
 
     def _window(self, batch: Batch) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
@@ -183,7 +181,7 @@ class FlowGRPOObjective(DiffusionObjective):
 
         def score(_, values):
             x, action, t, s, index = values
-            return None, self._transition(walk.at((), index), x, t, s).log_prob(action)
+            return None, self._transition(pair_of(walk.at((), index)(x, t)), x, t, s).log_prob(action)
 
         _, values = jax.lax.scan(score, None, (*(
             jnp.swapaxes(value, 0, 1) for value in (latents, following, times, next_times)),
@@ -208,7 +206,10 @@ class FlowGRPOObjective(DiffusionObjective):
         if advantages.shape != times.shape:
             raise ValueError("advantages must hold one value per trajectory or per transition")
         advantages = jnp.clip(advantages, -self.adv_clip_max, self.adv_clip_max)
-        walk = self._walk(variables, batch)
+        # A watched step's policy calls return what they sow, through its guidance's own outputs
+        # (`Guidance`), so the step summarizes the forward that trains.
+        opened = (INSPECTED,) if step.watched is not None else ()
+        walk = self._walk(variables, batch, opened)
         reference = None
         if self.beta > 0:
             if step.ema is None:
@@ -218,7 +219,8 @@ class FlowGRPOObjective(DiffusionObjective):
 
         def terms(_, values):
             x, action, t, s, old_log_prob, advantage, selected, index = values
-            transition = self._transition(walk.at((), index), x, t, s)
+            pair, sown = observed(walk.at((), index)(x, t), opened, self.guidance)
+            transition = self._transition(pair, x, t, s)
             # NaN variance remains selected and fails the numerical check. Only
             # a zero-variance interval is outside the Gaussian policy's support.
             keep = selected & (transition.variance != 0)
@@ -234,12 +236,12 @@ class FlowGRPOObjective(DiffusionObjective):
             if reference is not None:
                 # The released scripts/train_sd3.py that the module docstring
                 # compares this KL with is at 879042cf5707f8b90daa98d147d7deac2317c5da.
-                reference_mean = self._transition(reference.at((), index), x, t, s).mean
+                reference_mean = self._transition(pair_of(reference.at((), index)(x, t)), x, t, s).mean
                 kl, _ = weighted_total(transition.kl(reference_mean) / dimensions, keep)
             clipped_count = (keep & (jnp.abs(ratio - 1) > self.clip_range)).sum()
-            return None, (pg, kl, mass, clipped_count)
+            return None, ((pg, kl, mass, clipped_count), sown)
 
-        _, summed = jax.lax.scan(terms, None, (*(jnp.swapaxes(value, 0, 1) for value in (
+        _, (summed, sown) = jax.lax.scan(terms, None, (*(jnp.swapaxes(value, 0, 1) for value in (
             latents, following, times, next_times, old, advantages, mask)), jnp.arange(times.shape[1])))
         pg, kl, mass, clipped_count = (value.sum() for value in summed)
         denominator = jnp.where(mass > 0, mass, 1)
@@ -248,25 +250,29 @@ class FlowGRPOObjective(DiffusionObjective):
             metrics["transition_kl"] = kl / denominator
         if REWARDS_KEY in batch:
             metrics["reward"] = jnp.asarray(batch[REWARDS_KEY], jnp.float32).mean()
-        inspected = None
-        if step.watched is not None:
-            # The policy's forward at each trajectory's first transition, on the inputs its walk's own
-            # prediction hands the model there, whatever its guidance makes of them (a doubled batch, an
-            # autoguidance's main call), read off that call (`called_with`).
-            policy = self._policy(variables, batch)
-            # The policy's weights as its guidance binds its model's call over them: an autoguidance's
-            # main model holds its weaker model's, `guide`, out (`Autoguidance.walk`); every other
-            # guidance binds the denoiser's whole tree (`Denoiser._raw`).
-            own = policy.params if not isinstance(self.guidance, Autoguidance) else {
-                name: tree for name, tree in policy.params.items() if name != "guide"}
-            args, kwargs = called_with(policy.model, own,
-                                       lambda: walk.at((), 0)(latents[:, 0], times[:, 0]))
-            inspected = self.watched_forward(step, policy.model, own, *args, **kwargs)
+        # The policy's forward at each trajectory's first transition, its own trained call's.
+        inspected = None if sown is None else jax.tree.map(lambda summary: summary[0], sown).get(
+            INSPECTED, {})
         return Ratio(pg + self.beta * kl, mass), Aux(metrics, inspected=inspected)
 
     def _rows(self, batch: Batch) -> int:
         """One sample per source row, which a prompt-only batch has too."""
         return _source(self.inputs, batch).shape[0]
+
+
+def observed(predicted, opened: tuple[str, ...], guidance: Guidance | None
+             ) -> tuple[tuple[jax.Array, jax.Array], Variables | None]:
+    """A walk's prediction as its pair and what its policy's call opened (`Denoiser.observed`), None where
+    the walk's denoiser opens nothing; refused by name where a guidance returns a bare pair over an opened
+    denoiser, which the `Guidance` protocol asks it not to."""
+    if not opened:
+        return predicted, None
+    pair, sown = predicted
+    if not isinstance(sown, Mapping):
+        raise TypeError(f"{type(guidance).__name__}'s prediction over an opened denoiser returns no "
+                        "observation: read the model through raw_observed or raw_both_observed and return "
+                        "denoise.observed(pair, sown) (dew.sampling.guidance.Guidance)")
+    return pair, dict(sown)
 
 
 type FlowReward = Callable[[np.ndarray, Batch], np.ndarray | jax.Array | Sequence[float]]

@@ -12,13 +12,12 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import fnmatch
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Iterator, Mapping
 
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax._src import core as jax_core
 
 INSPECTED = "inspected"
 """The collection watched modules sow their outputs' summaries into."""
@@ -95,33 +94,3 @@ class Watched:
 
     kinds: tuple[str, ...]
     histogram: bool = False
-
-
-def called_with[Output](model: nn.Module, variables: Mapping,
-                        run: Callable[[], Output]) -> tuple[tuple, dict]:
-    """The arguments `run` first calls `model` over `variables` with, as its caller made them: for a
-    forward an objective runs inside a transform, the inputs `Objective.watched_forward` reruns it on.
-    Only that call counts, identified by its weights (it binds the arrays of `variables` and no others,
-    which a call over other weights does not, another module's or a guide's of the same architecture,
-    even one sharing some of them), made in this
-    trace, so its arguments are this trace's values, never a transform's inside `run` (a `cond`, a
-    `jit`); refused where `run` makes none. `run`'s outputs are unused, so a compiled step keeps only
-    what computes them."""
-    traced, calls = jax_core.trace_ctx.trace, []
-    weights = {id(leaf) for leaf in jax.tree.leaves(variables)}
-
-    def interceptor(next_fun, args, kwargs, context):
-        module = context.module
-        if (not calls and context.method_name == "__call__" and type(module) is type(model)
-                and jax_core.trace_ctx.trace is traced and module.scope is not None
-                and {id(leaf) for leaf in jax.tree.leaves(module.scope.variables())} == weights):
-            calls.append((args, kwargs))
-        return next_fun(*args, **kwargs)
-
-    with nn.intercept_methods(interceptor):
-        run()
-    if not calls:
-        raise ValueError(f"the forward calls no {type(model).__name__} over its weights outside a transform "
-                         f"of its own, whose inputs a watched step would read; its activations cannot be "
-                         f"watched")
-    return calls[0]
