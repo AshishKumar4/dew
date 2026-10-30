@@ -236,36 +236,28 @@ def store_rows(o_smem, o_gmem, row_start, first, stored, column, most: int, leas
 
 def copied(source, destination) -> None:
     """`source` (in shared memory) to `destination` (in global memory) through registers: a GPU without
-    TMA's `store_rows` copy, in `copy_layout`'s layout where the tile takes it. The layout inference's own
-    choice was the MMA fragment's, a lane's 4 bytes a row, so a warp wrote half sectors: an A100's forward
-    of Qwen3.5-27B's gated delta net took 1.162 ms against 0.941 in the copy layout, its states launch
-    0.422 against 0.314, and the port's 0.984 (JS-a100copy-a100-0b4eb412b). Explicitly unoptimized: JAX
-    0.12 takes a transfer with no `optimized` flag as optimized-only (0.11 downgraded it), which a ladder
-    rung of a row or two cannot be, so its layout inference searched every rung's layouts to exhaustion
-    (ns-gate1: the sm80 forward failed after about 1000 s; without the ladder, or with these transfers
-    unoptimized, it lowers in seconds: ns-noladder2, ns-abort1)."""
-    loaded = plgpu.load(source, layout=copy_layout(source.shape, source.dtype), optimized=False)
-    plgpu.store(destination, loaded, optimized=False)
+    TMA's `store_rows` copy, explicitly unoptimized. JAX 0.12 takes a transfer with no `optimized` flag as
+    optimized-only (0.11 downgraded it), which a ladder rung of a row or two cannot be, so its layout
+    inference searched every rung's layouts to exhaustion (ns-gate1: the sm80 forward failed after about
+    1000 s; without the ladder, or with these transfers unoptimized, it lowers in seconds:
+    ns-noladder2, ns-abort1)."""
+    plgpu.store(destination, plgpu.load(source, optimized=False), optimized=False)
 
 
-def copy_layout(shape: tuple[int, ...], dtype) -> plgpu_core.SomeLayout | None:
-    """The layout `copied` moves a tile of `shape` and `dtype` through registers in: Mosaic GPU's
-    shared-to-global copy layout (`Layout.SMEM_GMEM_COPY`), each lane up to 16 bytes along a row and a
-    warp's lanes along whole tiles of 8 rows and the widest swizzle a row's bytes are a multiple of, so its
-    stores write whole sectors. None where no such tiling gives a warpgroup's four warps whole tiles (the
-    layout's own condition): a ladder rung of a few rows, which the layout inference lays out."""
-    if len(shape) != 2:
-        return None
-    rows, columns = shape
-    width = columns * jnp.dtype(dtype).itemsize
-    for swizzle in (128, 64, 32, 16):
-        if rows % 8 or width % swizzle:
-            continue
-        row_tiles, column_tiles = rows // 8, width // swizzle
-        # The warps' tiles four down the rows, two by two, or four across.
-        if row_tiles % 4 == 0 or (row_tiles % 2 == 0 and column_tiles % 2 == 0) or column_tiles % 4 == 0:
-            return plgpu.Layout.SMEM_GMEM_COPY(tuple(shape), jnp.dtype(dtype), swizzle)
-    return None
+def coalesced(source, destination) -> None:
+    """`copied`, through registers in Mosaic GPU's shared-to-global copy layout (`Layout.SMEM_GMEM_COPY`)
+    where a row of `source` is one of its tiles' rows (16 to 128 bytes): each lane 16 bytes of a row, a
+    warp's lanes along whole rows, so its stores write whole sectors and its shared reads meet no bank
+    twice. The layout inference's own choice was the MMA fragment's, a lane's 4 bytes a row, so a warp wrote
+    half sectors: an A100's forward of Qwen3.5-27B's gated delta net took 1.162 ms against 0.941 with its
+    walks' stores so, its states launch 0.422 against 0.314, the port's 0.984 (JS-a100copy-a100-0b4eb412b).
+    A wider row takes a tile narrower than it, whose rows' reads meet the same banks: the attention
+    template's forward stores so took 19% longer (JS-2075cells-a100-491c05798), and keep `copied`."""
+    rows, width = source.shape[0], source.shape[-1] * jnp.dtype(source.dtype).itemsize
+    if len(source.shape) != 2 or rows % 32 or width not in (16, 32, 64, 128):
+        return copied(source, destination)
+    layout = plgpu.Layout.SMEM_GMEM_COPY(tuple(source.shape), jnp.dtype(source.dtype), width)
+    plgpu.store(destination, plgpu.load(source, layout=layout, optimized=False), optimized=False)
 
 
 @dataclasses.dataclass(frozen=True)
