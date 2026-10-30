@@ -120,7 +120,11 @@ profiler = dew.Profiler({str(tmp_path / "capture")!r}).start()
 profiler.stop(wait=False)
 profile.exported()
 """
-    subprocess.run([sys.executable, "-"], input=script, text=True, check=True)
+    # The Dew under test first on the program's path, as on this one's.
+    source = str(Path(dew.__file__).resolve().parents[1])
+    path = os.pathsep.join([source, *filter(None, [os.environ.get("PYTHONPATH")])])
+    subprocess.run([sys.executable, "-"], input=script, text=True, check=True,
+                   env={**os.environ, "PYTHONPATH": path})
     assert (tmp_path / "runs").read_text() == "ran\n"
     record = manifest(*captures(tmp_path / "capture"))
     assert record["export_status"] == "completed"

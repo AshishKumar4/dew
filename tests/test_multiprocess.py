@@ -220,18 +220,19 @@ def test_a_pool_paused_inside_its_uneven_tail_resumes_to_the_run_that_never_paus
 
 @pytest.mark.distributed
 def test_a_pools_cooldown_across_its_uneven_tail_reads_its_shares_as_its_run_does(tmp_path):
-    """A pool on the examples clock whose cooldown branch, at 60% of its examples, reads on to the stream's
-    end, through the steps its shares run out apart at: the branch's reads are the pool's (a share that ran
-    out stepping emptied), so it runs to its end on every process and scores once, and the run reads on
-    after it and trains its bound once (`assert_trained_once`). A pool planned in one order cools as one
-    process of two devices does, to its score."""
-    reports = clocked_pool(tmp_path / "pool", 2, deal="records", cooldown=CLOCKED)
+    """A pool on the examples clock whose cooldown branches from the step before its first share's stream
+    ends to the step its last one's does, across the steps its shares end apart at: the branch's reads are
+    the pool's (a share that ran out stepping emptied), so it runs to its end on every process and scores
+    once, and the run reads on after it and trains its bound once (`assert_trained_once`). A pool planned
+    in one order cools as one process of two devices does, to the bit."""
+    reports = clocked_pool(tmp_path / "pool", 2, deal="records", cooldown=True)
+    assert max(reports[0]["batches"]) > min(reports[0]["batches"]), "the shares' streams end at one step"
     assert_trained_once(reports)
     assert len(reports[0]["cooled"]) == 1 and np.isfinite(reports[0]["cooled"]).all()
-    planned = clocked_pool(tmp_path / "planned", 2, deal="order", cooldown=1)
-    alone = clocked_pool(tmp_path / "alone", 1, devices=2, deal="order", cooldown=1)
-    # The same programs over the same rows, a sum of two devices' parts in either order: to the bit.
-    assert planned[0]["cooled"] == alone[0]["cooled"]
+    planned = clocked_pool(tmp_path / "planned", 2, deal="order", cooldown=True)
+    alone = clocked_pool(tmp_path / "alone", 1, devices=2, deal="order", cooldown=True)
+    # The same programs over the same rows, a sum of two devices' parts in either order.
+    assert len(planned[0]["cooled"]) == 1 and planned[0]["cooled"] == alone[0]["cooled"]
 
 
 @pytest.mark.distributed

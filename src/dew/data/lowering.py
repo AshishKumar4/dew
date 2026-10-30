@@ -2055,8 +2055,11 @@ class _Build:
         rows = whole[held]
         batches = rows.batch(size, drop_remainder=drop, batch_fn=_Batched(batch_stage.batch_fn))
         if not drop and fill:
-            batches = batches.map(FilledBatch(size, real=real))
-            if self.training and partition.count > 1 and not self.lowering.records_unending and len(whole):
+            # A pool's shares of a global order that ends step together, a share past the order's last
+            # batch with batches of no real row (`_evened`), so each marks its rows, filled or whole.
+            evened = self.training and partition.count > 1 and not self.lowering.records_unending
+            batches = batches.map(FilledBatch(size, real=real, marked=evened))
+            if evened and len(whole):
                 batches = _evened(batches, whole, -(-len(whole) // batch_stage.size), size, batch_stage)
         batches = self.placed(batches, pipeline, partition, after)
         batches = batches[offset // batch_stage.size :]

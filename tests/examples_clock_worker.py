@@ -37,12 +37,13 @@ def examples_clock(args) -> dict:
     `order`, one global order; `records`, each share its own, an objective making `id % 3 + 1` rows of
     each; `shards`, physical shards of SHARD_ROWS rows and a last short one, each share its own, the
     objective making rows likewise. Its mesh puts `--tensor` processes on each share; `--pause` pauses it
-    there (`Pause`) and resumes it; `--cooldown` branches it to a cooldown of that many steps at 60% of its
-    examples. Reports the step it ends at, the examples its state consumed, the examples each log read,
-    each id's examples its steps trained on (each step's real rows by id over the rows each example
-    makes, the objective's aux, which the pool's first process logs), each id's examples the pool's shares
-    read apart (every share's stream of the run's data read on this process, `dealt`) and the cooldown's
-    validation loss, its parameters beside the report."""
+    there (`Pause`) and resumes it; `--cooldown` branches it to a cooldown from the step before the first
+    share's stream ends to the step the last one's does, across the steps they end apart at. Reports the
+    step it ends at, the examples its state consumed, the examples each log read, each id's examples its
+    steps trained on (each step's real rows by id over the rows each example makes, the objective's aux,
+    which the pool's first process logs), each id's examples the pool's shares read apart (every share's
+    stream of the run's data read on this process, `dealt`), the batches each share's stream holds and
+    the cooldown's validation loss, its parameters beside the report."""
     import jax
     import jax.numpy as jnp
 
@@ -96,27 +97,32 @@ def examples_clock(args) -> dict:
     checkpoints = Checkpoints(str(args.out.parent / "run")) if args.pause else None
     trainer = Trainer(Pulled(), optim, key=jax.random.key(0), mesh=MeshSpec(tensor=args.tensor),
                       tracker=tracker, checkpoints=checkpoints)
-    options = {"examples": args.examples, "log_every": 1}
-    if args.cooldown:
-        options.update(validation=held, cooldowns=Cooldowns(at=("60%",), length=args.cooldown))
-    if args.pause:
-        trainer.fit(chain, stop=Pause(args.pause), **options)
-    state = trainer.fit(chain, **options)
-    dump_params(args.out.with_suffix(".npz"), state.variables)
-    # The examples each share's stream deals it, read as the run's loader reads them, apart from the run.
+    # The examples each share's stream deals it and the batches it reads, read as the run's loader reads
+    # them, apart from the run.
     loader, _ = fitted(chain, None, objective=Pulled().data(), examples=args.examples)
     pool = DataPartition.of(trainer.device_mesh)
-    dealt = dict.fromkeys(range(1, RECORDS + 1), 0.0)
+    dealt, batches = dict.fromkeys(range(1, RECORDS + 1), 0.0), []
     for index in range(pool.count):
         stream = loader.train(dataclasses.replace(pool, index=index))
+        batches.append(0)
         try:
             for batch in stream:
+                batches[-1] += 1
                 real = np.asarray(batch.get(VALID_ROWS, np.ones(len(batch["id"]), bool)), bool)
                 for record in np.asarray(batch["id"])[real].tolist():
                     dealt[record] += 1 / (record % 3 + 1 if expands else 1)
         finally:
             if isinstance(stream, Closeable):
                 stream.close()
+    options = {"examples": args.examples, "log_every": 1}
+    if args.cooldown:
+        # A branch from the step before the first share's stream ends to the step the last one's does.
+        at, length = min(batches) - 1, max(batches) - min(batches) + 1
+        options.update(validation=held, cooldowns=Cooldowns(at=(at,), length=length))
+    if args.pause:
+        trainer.fit(chain, stop=Pause(args.pause), **options)
+    state = trainer.fit(chain, **options)
+    dump_params(args.out.with_suffix(".npz"), state.variables)
     trained = [scalars for scalars in tracker.scalars if "train/loss" in scalars]
     counts = {record: sum(scalars[f"train/id_{record}"] for scalars in trained)
               for record in range(1, RECORDS + 1)}
@@ -124,7 +130,8 @@ def examples_clock(args) -> dict:
     # A run whose plan counts its steps ahead keeps no clock (`TrainState.consumed`).
     consumed = None if state.consumed is None else int(state.consumed)
     return {"step": int(state.step), "consumed": consumed, "counts": counts, "dealt": dealt,
-            "cooled": cooled, "logged": [scalars.get("train/examples_consumed") for scalars in trained]}
+            "batches": batches, "cooled": cooled,
+            "logged": [scalars.get("train/examples_consumed") for scalars in trained]}
 
 
 MODES = {"examples_clock": examples_clock}
@@ -136,7 +143,7 @@ def main(argv=None) -> None:
     parser.add_argument("--examples", type=int, default=RECORDS)
     parser.add_argument("--tensor", type=int, default=1)
     parser.add_argument("--pause", type=float, default=0.0)
-    parser.add_argument("--cooldown", type=int, default=0)
+    parser.add_argument("--cooldown", action="store_true")
     serve_mode(MODES, parser.parse_args(argv))
 
 
