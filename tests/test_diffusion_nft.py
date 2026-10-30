@@ -175,9 +175,9 @@ def test_a_degenerate_strength_clip_or_regularizer_is_refused(asked):
 def test_the_loss_corrupts_by_its_process_own_noise_levels():
     """A fresh DiT predicts zero velocity, so its clean estimate is the corrupted sample itself and the
     live, old and implicit policies coincide: each sample's loss at time t is then the clip over beta
-    times sigma(t) |eps - x| squared over |eps - x| in the mean, sigma(t) the process's own noise level
-    at t (a shift of 2 here, 2t / (1 + t)): within float64 rounding of that closed form over the noise
-    the step draws."""
+    times the mean squared over the mean absolute error of alpha(t) x + sigma(t) eps against x, alpha
+    and sigma the process's own rates at t (a noise level of 2t / (1 + t) under its shift of 2): within
+    float64 rounding of that closed form over the noise the step draws."""
     from dew.objectives.base import Step
 
     nft = objective(jnp.float64, beta=0.5)
@@ -196,9 +196,14 @@ def test_the_loss_corrupts_by_its_process_own_noise_levels():
         noise = np.asarray(step.sample("noise", jax.random.normal, (3, 4, 4, 1), dtype=jnp.float32, rows=8),
                            np.float64)
         roundings = chain_roundings(jax.make_jaxpr(lambda v: nft.loss(v, batch, step)[0].total)(wide))
-    sigma = 2 * times / (1 + times)
-    difference = noise - samples[:, None]
-    per = (np.mean(np.square(difference), axis=(2, 3, 4)) / np.mean(np.abs(difference), axis=(2, 3, 4)))
-    expected = np.mean(nft.adv_clip_max / nft.beta * sigma * per)
+        # The process's own rates at each time, a noise level of 2t / (1 + t) under a shift of 2, as it
+        # computes them.
+        alpha, sigma = (np.stack([np.asarray(rate).reshape(-1) for rate in rates], 1) for rates in zip(
+            *(nft.process.rates(jnp.asarray(column), like=samples) for column in times.T), strict=True))
+    assert not np.allclose(sigma, times)
+    shape = (8, 3, 1, 1, 1)
+    error = alpha.reshape(shape) * samples[:, None] + sigma.reshape(shape) * noise - samples[:, None]
+    per = np.mean(np.square(error), axis=(2, 3, 4)) / np.mean(np.abs(error), axis=(2, 3, 4))
+    expected = np.mean(nft.adv_clip_max / nft.beta * per)
     assert_computes_the_oracle(np.asarray([found]), np.asarray([expected]), "the NFT loss",
                                roundings=roundings)
