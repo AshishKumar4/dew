@@ -274,8 +274,9 @@ def test_a_decision_run_that_ends_on_its_best_loads_at_its_calibrated_step(tmp_p
     saved task loads there by default, through `Decide.from_run` and `dew.pipeline` alike, where the
     run's latest checkpoint is its last step (row 2352: the load refused the calibration's step), and
     `dew export` writes it from there (row 2553), the run's every reader pinning one default step
-    (`SavedRun.pinned`)."""
+    (`SavedRun.pinned`); an average reads each run at its latest step, as it states (2553's review)."""
     import dew
+    from dew.checkpoints import averaged
     from dew.decision.task import Decide
     from dew.training.selection import Best
 
@@ -291,6 +292,7 @@ def test_a_decision_run_that_ends_on_its_best_loads_at_its_calibrated_step(tmp_p
     for loaded in (Decide.from_run(str(runs / "ended")), dew.pipeline(str(runs / "ended"))):
         assert loaded.weights.step == best
     assert main(["export", str(runs / "ended"), str(tmp_path / "exported")]) == 0
+    assert [step for _, step, _ in averaged([runs / "ended"] * 2).runs] == [checkpoints.latest] * 2
 
 
 def test_a_run_recorded_before_its_stop_took_a_plateau_still_pauses(tmp_path):
