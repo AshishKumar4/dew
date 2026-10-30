@@ -291,6 +291,12 @@ class CausalTransformer(nn.Module):
     """The factor that multiplies every sublayer output before it is added to the
     residual stream: lm-engine's m_residual, and GraniteMoeHybrid's
     `residual_multiplier`."""
+    normed_residual: bool = False
+    """Whether each sublayer's output joins its normed input in place of the stream it read, as
+    MiniMax-Text-01's `postnorm` block does (`BlockWiring.normed_residual`)."""
+    stream_multiplier: float = 1.0
+    """The factor that multiplies the stream a sublayer's output joins, MiniMax's alpha factors
+    (`BlockWiring.stream_multiplier`)."""
     residual_in_fp32: bool = False
     """Whether the residual stream between layers sums in at least fp32 whatever
     the compute dtype, as mamba_ssm's `residual_in_fp32` keeps it (transformers'
@@ -507,7 +513,9 @@ class CausalTransformer(nn.Module):
         return BlockWiring(pre_norms=self.pre_norms, output_norms=self.sandwich_norms,
                            residual_norms=self.post_residual_norms,
                            layer_scalar=self.layer_scalar, parallel_residual=self.parallel_residual,
-                           shared_parallel_norm=self.shared_parallel_norm, ngpt=self.ngpt)
+                           shared_parallel_norm=self.shared_parallel_norm,
+                           normed_residual=self.normed_residual, stream_multiplier=self.stream_multiplier,
+                           ngpt=self.ngpt)
 
     @property
     def init_stds(self) -> tuple[float | None, float | None]:

@@ -328,6 +328,11 @@ class BlockWiring:
     normalized transformer's block, which has neither: each sublayer reads the
     unit residual and joins it by a learned step along
     the sphere (`dew.nn.ngpt.stepped`), `attn_alpha` and `mlp_alpha` its rates.
+    `normed_residual` makes each sublayer's normed input the stream its output
+    joins, and `stream_multiplier` scales that stream as it does, the branch
+    scaled by the model's `residual_multiplier`: MiniMax-Text-01's `postnorm`
+    block and its alpha factors (modeling_minimax_text_01.py at a7351bf2,
+    :1024-1058), `x <- alpha norm(x) + beta f(norm(x))` a sublayer.
     The output norms are separate modules named for the sublayer outputs, so
     the input norms keep their names, and a checkpoint without
     output norms loads with two fewer leaves per layer. `layer_scalar` selects
@@ -345,6 +350,8 @@ class BlockWiring:
     layer_scalar: Literal["frozen", "trainable"] | None = None
     branch_scale: float | None = None
     """Initial value of learned per-feature attention and feed-forward residual scales."""
+    normed_residual: bool = False
+    stream_multiplier: float = 1.0
     ngpt: NGPT | None = None
 
     def __post_init__(self):
@@ -360,6 +367,9 @@ class BlockWiring:
                                     or self.ngpt is not None):
             raise ValueError("a post-LN block norms its stream after each sublayer joins it: it takes no "
                              "pre- or output norms, parallel residual or nGPT step")
+        if self.normed_residual and (not self.pre_norms or self.parallel_residual or self.ngpt is not None):
+            raise ValueError("normed_residual joins each sublayer's output to its normed input: it needs pre "
+                             "norms, and takes no parallel residual or nGPT step")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -696,6 +706,13 @@ class DecoderBlock(nn.Module):
                                            or self.parallel is not None or not self.attention_norm):
             raise ValueError("a post-LN block norms the plain stream: it takes no hyper-connections, AltUp, "
                              "depth residuals, LAuReL or parallel experts")
+        if ((self.wiring.normed_residual or self.wiring.stream_multiplier != 1.0)
+                and (self.hyper_connections is not None or self.altup is not None
+                     or self.residual_site is not None or self.laurel_rank is not None
+                     or self.parallel is not None or not self.attention_norm or self.cross is not None)):
+            raise ValueError("normed_residual and stream_multiplier join the plain stream: they take no "
+                             "hyper-connections, AltUp, depth residuals, LAuReL, parallel experts, "
+                             "cross-attention or an unnormed attention")
         if self.wiring.output_norms:
             self.attention_output_norm = norm(name='attention_output_norm')
             if self.feedforward is not None:
@@ -847,6 +864,8 @@ class DecoderBlock(nn.Module):
             state, normed = self._stream_normed(self.input_layernorm, state, None)
         else:
             normed = self.input_layernorm(read)
+        if self.wiring.normed_residual:
+            state = state._replace(x=normed)
         routes = self._routes(per_layer_input)
         mixed = self._mix(
             normed, decode, kv_store, attention_metadata, prediction_phase, train,
@@ -872,6 +891,8 @@ class DecoderBlock(nn.Module):
                 state, read, site = self._read(state, "mlp")
                 mlp_input = (normed if self.wiring.shared_parallel_norm else
                              self.post_attention_layernorm(read) if self.wiring.pre_norms else read)
+                if self.wiring.normed_residual:
+                    state = state._replace(x=mlp_input)
             hidden = self.mlp(mlp_input,
                               **self._feedforward_inputs(attention_metadata, mlp_input.shape),
                               **({} if self.parallel is not None else routes),
@@ -924,7 +945,8 @@ class DecoderBlock(nn.Module):
         attention branch to the stream itself (`_stream_normed`): no other
         sublayer reads the stream between the attention and the MLP."""
         if (self.feedforward is None or not self.wiring.pre_norms or self.laurel_rank is not None
-                or self.wiring.parallel_residual or self.wiring.shared_parallel_norm):
+                or self.wiring.parallel_residual or self.wiring.shared_parallel_norm
+                or self.wiring.normed_residual or self.wiring.stream_multiplier != 1.0):
             return None
         norm = self.post_attention_layernorm
         return (norm, state) if isinstance(norm, SeamNorm) and isinstance(state, _Plain) else None
@@ -1050,7 +1072,8 @@ class DecoderBlock(nn.Module):
             norm = self.input_layernorm if site == "attention" else self.post_attention_layernorm
             return state._replace(x=constrain(norm(state.x + output), RESIDUAL))
         if isinstance(state, _Plain):
-            return state._replace(x=constrain(state.x + output, RESIDUAL))
+            stream = scaled(state.x, self.wiring.stream_multiplier)
+            return state._replace(x=constrain(stream + output, RESIDUAL))
         if isinstance(state, _Streams):
             post, comb = mapping
             return state._replace(streams=constrain(mix_streams(post, comb, output, state.streams), STREAMS))
