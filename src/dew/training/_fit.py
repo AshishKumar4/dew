@@ -7,6 +7,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import datetime
+import functools
 import math
 import time
 import types
@@ -18,7 +19,7 @@ from flax.training.early_stopping import EarlyStopping
 from jax.sharding import Mesh
 
 from dew import position
-from dew._coordination import agreed_next
+from dew._coordination import agreed, agreed_next
 from dew._records import JSON
 from dew.batch import Batch
 from dew.checkpoints import Checkpoints
@@ -471,6 +472,18 @@ def _handed_split(entry: Dataset | Handed | Reader | EvalSuite) -> Dataset | Rea
     if isinstance(entry, Mapping | pygrain.MapDataset | pygrain.IterDataset):
         return native(entry, training=False)
     return entry
+
+
+def check_inputs(trainer, device: Batch) -> None:
+    """Refuse a training batch's device fields (`split_fields`) the objective's declared inputs do not
+    take, as every process agrees, before its first step compiles: the batch its device steps make,
+    which the objective reads (`Trainer._model_batch`)."""
+    inputs = trainer.objective.inputs
+    if inputs is None:
+        return
+    with jax.set_mesh(trainer.device_mesh):
+        checked = trainer._model_shapes(device) if trainer._device else device
+    agreed("training input declaration", functools.partial(inputs.check, checked))
 
 
 def unrecorded_parts(objective: str, dataset: Dataset | Loader | Handed, *, optimized: bool,
