@@ -295,7 +295,8 @@ class Pretrained:
     @classmethod
     def from_run(cls, directory: str | Path, *, step: int | str | None = None,
                  ema: bool | None = None, trust: Sequence[str] = ()) -> Self:
-        """Return a trained run's selected checkpoint, its latest or `step`, rebuilt from the run's
+        """Return a trained run's selected checkpoint, `step` or the one its task loads by default
+        (`SavedRun.pinned`), rebuilt from the run's
         own inference record (`from_saved`). `trust` names the packages outside Dew the record may
         import (`TextGeneration.from_run`)."""
         from dew.inference.tasks import SavedRun
