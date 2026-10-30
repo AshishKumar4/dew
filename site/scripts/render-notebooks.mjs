@@ -37,6 +37,7 @@ const LABELS = {
 	'09-sft-for-llms': 'SFT for LLMs',
 	'10-rl-with-verifiable-rewards': 'RL with verifiable rewards',
 	'11-llms-in-an-agent-harness': 'LLMs in an agent harness',
+	'12-world-models': 'World models',
 };
 
 function fence(code) {
