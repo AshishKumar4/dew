@@ -357,11 +357,12 @@ def members_of(annotation: type, base=None) -> list[object]:
     return values
 
 
-WITNESSES = {Reads: (Reads((("row", "self", "whole"),)),),
+WITNESSES = {Reads: (Reads((("row", "self", "whole"),)), Reads((("row", "self", "causal"),))),
              tuple[QuestionSegment, ...]: (built_in(None, "question_first"),)}
 """Values of Dew's classes that build from no defaults, and of tuples of them, each one a run here trains
 with: a row's reads of its streams (`Reads`), here its one stream reading its whole document both ways,
-and a question layout's own row written as its segments (`built_in`)."""
+or up to each token (a bidirectional backbone's rows read so apart), and a question layout's own row
+written as its segments (`built_in`)."""
 
 
 def members_built(member: type) -> list[object]:
@@ -580,10 +581,11 @@ def options_of(run: RunConfig, objective: str, kind: type, base, prefix: str = "
         # builds (a decision objective's segments count, a layout's segments).
         path = reach(run, objective, name, hints[name], argument=not derived and not prefix)
         value = getattr(base, name)
+        # A derived value the run builds is itself an option the run fills (`--head`'s labels), and its
+        # fields are options of their own.
+        found.append(Option(prefix + name, values, path, fields[name]))
         if path is None and derived and dataclasses.is_dataclass(value) and not isinstance(value, type):
             found += options_of(run, objective, type(value), value, f"{prefix}{name}.")
-        else:
-            found.append(Option(prefix + name, values, path, fields[name]))
     return found
 
 
@@ -627,11 +629,13 @@ def prefixed(root: Path, drawn: bool) -> RunConfig:
 
 
 BESIDE = {"layout.framing": {"segments": built_in(None, "question_first"), "max_len": 256},
+          "layout.unit": {"segments": built_in(None, "question_first"), "max_len": 256},
           "context_encoder": {"context_layers": (0,), "context_length": 64}}
 """What an option's reader takes it only beside, by the run's path, set with it: a framing frames a row of
 its own segments (`_budgeted`), here the question layout's own row as segments (`built_in`), in a row long
-enough for its conversation's turns; a context's encoder encodes it for context layers, which read a
-row's context."""
+enough for its conversation's turns; a unit encodes a row of segments, the built-in row piece by piece;
+a context's encoder encodes it for context layers, which read a row's context."""
+
 
 def lettered(root: Path, drawn: bool) -> RunConfig:
     """A decision run of a fresh letter readout (`--head letters`) over a tiny causal source, its rows
@@ -993,9 +997,9 @@ def test_a_masked_run_over_a_release_saves_and_reads_the_walk_the_release_declar
     """A masked-diffusion run over a Dream release (dream-tiny as the release ships it, its generation
     config and its own sampling code, `test_dream_walk.snapshot`), setting nothing of its task, saves the
     walk the release's own task declares (`Pretrained.text_generation`): its process, the grid's endpoint
-    among it (ledger 2563), its solver, its steps and its blocks; and the walk its loaded task takes
-    reads that endpoint: the same task with no endpoint answers apart (`answers`), a loaded source's
-    default reaching its consumer."""
+    among it (ledger 2563), its solver, its steps and its blocks; and the grid its loaded task walks runs
+    to that endpoint, a loaded source's default reaching its consumer. A walk's tokens show the endpoint
+    only where a last step leaves a place masked, which no request here reaches."""
     from dew.inference.tasks import MaskedSettings
     from dew.interop import Pretrained
 
@@ -1006,10 +1010,9 @@ def test_a_masked_run_over_a_release_saves_and_reads_the_walk_the_release_declar
     options = {name: getattr(declared, name) for name in ("process", "solver", "steps", "block")}
     assert {name: same(getattr(task, name), option) for name, option in options.items()} == dict.fromkeys(
         options, True)
-    assert task.process.endpoint is not None
-    drawn = drawn_afresh(task)
-    unended = dataclasses.replace(drawn, process=dataclasses.replace(drawn.process, endpoint=None))
-    assert not answered_alike(answers(drawn), answers(unended))
+    # The grid its walk takes runs to that endpoint (`DiscreteProcess.times`), not MDLM's.
+    unended = dataclasses.replace(task.process, endpoint=None)
+    assert not np.array_equal(task.process.times(task.steps), unended.times(task.steps))
 
 
 def test_a_decision_run_over_a_release_saves_and_reads_the_task_the_release_declares(tmp_path):
