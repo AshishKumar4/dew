@@ -974,20 +974,21 @@ def test_the_backward_is_on_par_under_every_score_hook_interpreted(hooks, form):
 
 
 @INTERPRETS
-def test_a_forward_kernel_built_for_its_facts_runs_each_calls_own_interpreted(monkeypatch):
+def test_a_forward_kernel_built_for_its_facts_runs_each_calls_own_interpreted():
     """The forward's kernel is built once for every call of its static facts (`_kernel_of`, row 2440): calls
     alike but for their scale, past their queries' power of two (0.2 and 0.3, which leave different scales
-    in their launches' form), each run their own though their kernels' names agree (the launch report's
-    name, which would tell them apart, held to its base), each on par (check 1) with the reference's at its
-    scale from float64."""
-    monkeypatch.setattr(attention_mosaic_forward.report, "named", lambda name: name)
+    in their launches' form), each run their own though their kernels' names agree (launched outside an
+    op's report, which names them by its launch, `report.named`), each on par (check 1) with the reference's
+    at its scale from float64."""
     shape = SHAPES["interpreted"]
     spans = template.spans(shape[1], shape[1], shape[0], causal=True)
     for scale in (0.2, 0.3):
         def ours(query, key, value, dout, scale=scale):
             del dout
             with _device(interpret=True):
-                return attention_mosaic.forward(query, key, value, spans, scale=scale, interpret=True)
+                return attention_mosaic_forward._plain_forward(
+                    query, key, value, spans, template.Hooks(), scale=scale, natural=attention_mosaic.NATURAL,
+                    tiles=FORM_TILES, interpret=True)
 
         def reference(query, key, value, dout, scale=scale):
             del dout
