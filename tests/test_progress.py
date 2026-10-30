@@ -17,7 +17,7 @@ from dew.inputs import Field, InputSpec
 from dew.nn.progress import END, Progress
 from dew.objectives.base import Aux
 from dew.objectives.supervised import Supervised
-from dew.training import Trainer
+from dew.training import PassesProgress, Trainer
 
 
 class Annealed(nn.Module):
@@ -87,8 +87,8 @@ def test_a_compiled_forward_keys_on_the_progress_it_is_passed():
 
 def test_an_objective_that_passes_no_progress_refuses_a_model_that_reads_it():
     """An objective whose loss passes its model no progress (`Objective.passes_progress`) refuses a model
-    that reads it, which would otherwise train at the run's end; a custom training step passes it as any
-    other input, and the model reads what the step passes."""
+    that reads it, which would otherwise train at the run's end; a custom training step that says it
+    passes it (`PassesProgress`) passes it as any other input, and the model reads what the step passes."""
     class Unstepped(Supervised):
         passes_progress = False
 
@@ -104,10 +104,30 @@ def test_an_objective_that_passes_no_progress_refuses_a_model_that_reads_it():
         return step
 
     tracker = RecordingTracker()
-    Trainer(objective(), optax.sgd(0.0), key=0, step=make_step, tracker=tracker).fit(data(), steps=2,
-                                                                                    log_every=1)
+    Trainer(objective(), optax.sgd(0.0), key=0, step=PassesProgress(make_step), tracker=tracker).fit(
+        data(), steps=2, log_every=1)
     losses = [scalars["train/loss"] for _, scalars in tracker.scalars if "train/loss" in scalars]
     np.testing.assert_array_equal(losses, [0.0, 1.0])
+
+
+def test_a_custom_training_step_refuses_a_module_that_reads_the_progress_it_does_not_supply():
+    """A training step the trainer traces that does not run an objective's loss (a custom step) and does
+    not say it passes the run's progress (`PassesProgress`) refuses a module that reads it, which it would
+    train at the run's end (ledger 2634); the same step over a module that reads none trains."""
+    def stepping(model):
+        def make_step(objective, optimizer):
+            def step(state, batch):
+                loss = jnp.mean(model.apply(state.variables, batch["x"]))
+                return state.replace(microstep=state.microstep + 1, updates=state.updates + 1), loss, Aux({})
+            return step
+        return make_step
+
+    with pytest.raises(ValueError):
+        Trainer(objective(), optax.sgd(0.0), key=0, step=stepping(Annealed())).fit(data(), steps=1)
+    plain = Supervised(nn.Dense(1), lambda outputs, batch: jnp.mean(outputs, axis=-1),
+                       inputs=InputSpec(Field("x", (2,))))
+    trained = Trainer(plain, optax.sgd(0.0), key=0, step=stepping(nn.Dense(1))).fit(data(), steps=1)
+    assert int(trained.step) == 1
 
 
 def test_a_step_that_is_no_training_step_passes_the_run_s_end_and_keeps_its_clock():

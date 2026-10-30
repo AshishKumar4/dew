@@ -34,6 +34,7 @@ if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
         WandbTracker,
     )
     from dew.training.trainer import Rollout, Trainer
+    from dew.training.transaction import PassesProgress
 
 _EXPORTS = {
     "Aux": "dew.objectives.base",
@@ -55,6 +56,7 @@ _EXPORTS = {
     "Observe": "dew.training.observe",
     "Pause": "dew.training.budget",
     "Plateau": "dew.training.budget",
+    "PassesProgress": "dew.training.transaction",
     "Preempted": "dew.training.runtime",
     "ProfileWindow": "dew.training.profiling",
     "Rollout": "dew.training.trainer",
@@ -96,6 +98,7 @@ __all__ = [
     "Metric",
     "Objective",
     "Observe",
+    "PassesProgress",
     "Pause",
     "Plateau",
     "Preempted",
