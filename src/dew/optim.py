@@ -2073,9 +2073,8 @@ class OptimConfig:
     0); for 'adam' it is torch's coupled L2 penalty, added to the gradient before the moments
     read it, for 'adamw' the decoupled decay. Either decay, the default included, spares biases
     and vectors such as a norm's scale, timm's split for every optimizer and for an Optax factory
-    given one (`dew.optim.weight_decay_mask`, its `mask`); Muon decays them as Moonlight does, and
-    `param_groups` replace the split. Records written before this change decayed every
-    parameter; ParamGroup('all', ('*',)) restores that."""
+    given one (`dew.optim.weight_decay_mask`, its `mask`), unless `spared` is off; Muon decays them as
+    Moonlight does, and a param group follows the split unless it says (`ParamGroup.spared`)."""
     spared: bool = True
     """Whether the decay spares biases and vectors such as a norm's scale (`weight_decay_mask`), where the
     optimizer takes a mask: nanoGPT's, Megatron Core's and timm's split, since decaying a norm's scale or
