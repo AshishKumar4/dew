@@ -548,7 +548,8 @@ def report(args: argparse.Namespace) -> int:
         noise = calibrated.get(row.name, 0.0)
         state, numbers = verdict(row, [s.get(row.name) for s in samples[base][:taken]],
                                  [s.get(row.name) for s in samples[head][:taken]], noise)
-        verdicts[row.name] = {"state": state, "gated": row.gated, "insensitive": noise > row.floor, **numbers}
+        verdicts[row.name] = {"state": state, "unit": row.unit, "gated": row.gated,
+                              "insensitive": noise > row.floor, **numbers}
         if (state in ("broken", "incomplete", "partial", "failed") or (state == "regressed" and row.gated)
                 or (claiming and claimed(row) and state in
                     ("not measured on this hardware", "not compared"))):

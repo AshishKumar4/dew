@@ -62,9 +62,9 @@ def test_a_row_is_judged_by_its_calibrated_noise_and_a_row_noisier_than_its_floo
     assert code == 1 and "failed: quiet (regressed)" in table
     verdicts = json.loads((tmp_path / "verdicts.json").read_text())
     assert verdicts["failed"] == ["quiet (regressed)"]
-    assert {name: (row["state"], row["insensitive"], row["band"])
-            for name, row in verdicts["rows"].items()} == {"quiet": ("regressed", False, 0.02),
-                                                           "loud": ("level", True, 0.06)}
+    assert {name: (row["state"], row["unit"], row["insensitive"], row["band"])
+            for name, row in verdicts["rows"].items()} == {"quiet": ("regressed", "ms", False, 0.02),
+                                                           "loud": ("level", "ms", True, 0.06)}
     [loud] = [line for line in table.splitlines() if line.startswith("| loud |")]
     assert loud.endswith("| level, insensitive (null noise 6.0% over its 2% floor) |"), loud
     assert "| 6.0% |" in loud
