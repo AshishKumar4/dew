@@ -2098,6 +2098,9 @@ def _query_key_views(call: _Call, keyed: tuple, served: tuple, memory: tuple, *,
     q_ref, k_ref = keyed
     operands = dict(zip(("values", "out", "value_grads"), ((held, served[0]), (given, served[1]),
                                                            (held, served[2])), strict=True))
+    if not call.delta:
+        # Without the delta rule no weights, so no stream of the corrected values' gradient.
+        del operands["value_grads"]
     memory_row = (chunk * call.heads + first) * width + block * call.block
     return {**_views(lambda i: (0, 0), queries=given.views(q_ref, row, CHUNK, key_columns, call.block),
                      keys=given.views(k_ref, row, CHUNK, key_columns, call.block)),
@@ -2210,7 +2213,7 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, call: _Call, *
             after, leaving = algebra.memory_gradients(
                 functools.partial(whole, "queries", given), functools.partial(whole, "keys", given), 1,
                 functools.partial(column, "values", held), functools.partial(column, "out", given),
-                functools.partial(column, "value_grads", held),
+                functools.partial(column, "value_grads", held) if call.delta else None,
                 lambda i, j: column("entered", memories, j), lambda i, j: column("leaving", memories, j),
                 blocks, _tile(slots, "ds", held), gate, low, ending, ending_low, None, scale, issue,
                 emit=stored)
@@ -2234,15 +2237,17 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, call: _Call, *
 
     tiles = _streamed(queries=((CHUNK, call.block), given), keys=((CHUNK, call.block), given),
                       values=((CHUNK, value_width), held), out=((CHUNK, value_width), given),
-                      value_grads=((CHUNK, value_width), held), entered=((call.block, value_width), memories),
+                      **({"value_grads": ((CHUNK, value_width), held)} if call.delta else {}),
+                      entered=((call.block, value_width), memories),
                       leaving=((call.block, value_width), memories), ds=((CHUNK, CHUNK), held))
     keyed_out = jax.ShapeDtypeStruct((call.rows, call.heads // group * width), jnp.float32)
     terms = jax.ShapeDtypeStruct((width // call.block, call.heads, call.rows), jnp.float32)
     out_type = (keyed_out, keyed_out, held.shape(call.heads * width), terms, terms,
                 jax.ShapeDtypeStruct((width // call.block, call.heads, call.chunks * call.block),
                                      jnp.float32))
-    # Each value head of the group: three memory products and the scores' gradient's two.
-    each = 3 * CHUNK * value_width * call.block + 2 * CHUNK * CHUNK * call.block
+    # Each value head of the group: three memory products (two without the delta rule's weights) and the
+    # scores' gradient's two.
+    each = (2 + call.delta) * CHUNK * value_width * call.block + 2 * CHUNK * CHUNK * call.block
     work = Work(2 * each * group, group)
     return _kernel(program, call, out_type=out_type,
                    grid=(width // call.block, call.chunks, call.heads // group),

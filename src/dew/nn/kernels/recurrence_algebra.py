@@ -904,7 +904,8 @@ def memory_gradients(queries: TileLoad, keys: TileLoad, columns: int, values: Ti
     | 'dw', c, grad)` as it is final; and the decay's range terms `(after, leaving)` (`summed_back`'s),
     `leaving` `[C]` each token's write into the memory the chunk leaves. `memory_decay` is the decay's
     gradient through the memory the chunk leaves, `sum(S dS)` (a row's vector of it; None where a caller
-    summing key blocks apart adds it once)."""
+    summing key blocks apart adds it once). Without the delta rule (`value_grads` None) there are no weights
+    and no `dw`."""
     row_decay = raised(gate, low)[:, None]
     leaving_decay = range_decay(last, last_low, gate, low)[:, None]
     leaving_terms, after = [], []
@@ -917,7 +918,9 @@ def memory_gradients(queries: TileLoad, keys: TileLoad, columns: int, values: Ti
         dk = dk * leaving_decay
         leaving_terms.append(jnp.sum(dk * keys(c).value().astype(jnp.float32), axis=1))
         emit("dk", c, dk + issue("scores_dq", Transposed(ds), queries(c)))
-        emit("dw", c, -_summed(issue("memory_dw", value_grads(j), entered(c, j).T) for j in range(blocks)))
+        if value_grads is not None:
+            emit("dw", c, -_summed(issue("memory_dw", value_grads(j), entered(c, j).T)
+                                   for j in range(blocks)))
     after = _summed(after)
     if memory_decay is not None:
         lag = _lags((after.shape[0],) * 2)
