@@ -96,31 +96,17 @@ def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple, co
     """A queries-first step's tile of a hookless fast-form call (`_fused_step`'s, `_coop_step`'s): its
     logits from the query slot taken by its power in registers (`_Backward.scaled`) against the resident
     keys (`resident`, `[bk, D]` and `[bk, Dv]` refs, a consumer's share of them where keys are shared), dP
-    from the output-cotangent slot against the values, each a sum over the operands' column parts (each of
-    `slots` and `resident` a tuple of them, one where a consumer holds every column), then `_scores` under
-    the tile's queries' statistics `rows` (read before its products, which their loads run under:
-    ET-A05AB5/6-h100, 2.05 against 2.32 ms
+    from the output-cotangent slot against the values, then `_scores` under the tile's queries' statistics
+    `rows` (read before its products, which their loads run under: ET-A05AB5/6-h100, 2.05 against 2.32 ms
     read past them at Qwen3-8B causal) and `coords`, masked where `masked`, or where it is None chosen at run
     time, unmasked where every query sees the tile `whole`. Returns its weights narrowed for dV
     (`algebra.value_weights`) and its score cotangents' one part in the operands' dtype (dK's and dQ's)."""
     family = walk.program.family
-    (q_parts, do_parts), (key_parts, value_parts) = slots, resident
-
-    def logits(acc):
-        for q, held in zip(q_parts, key_parts, strict=True):
-            held = held.transpose((1, 0))
-            acc = (family.register_products(acc, ((by_power(family.tile_of(q), walk.spec.prescale), None),),
-                                            held, walk.interpret)
-                   if walk.scaled else family.products(acc, q, held, walk.interpret))
-        return acc
-
-    def cotangent_products(acc):
-        for do, values in zip(do_parts, value_parts, strict=True):
-            acc = family.products(acc, do, values.transpose((1, 0)), walk.interpret)
-        return acc
-
-    s = family.summed(shape, logits, walk.interpret)
-    dp = family.summed(shape, cotangent_products, walk.interpret)
+    (q_slot, do_slot), (keys, values) = slots, resident
+    held = keys.transpose((1, 0))
+    s = (family.registers_product(by_power(family.tile_of(q_slot), walk.spec.prescale), held, walk.interpret)
+         if walk.scaled else family.product(q_slot, held, shape))
+    dp = family.product(do_slot, values.transpose((1, 0)), shape)
 
     def scores(*, masked: bool):
         # A tile every query sees whole (`masked` False) takes no mask (`_dq_step`'s choice).
@@ -132,8 +118,8 @@ def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple, co
                                                      functools.partial(scores, masked=True))
     else:
         exponentials, weights, cotangents = scores(masked=masked)
-    ((part, _),) = algebra.cotangent_parts(cotangents * walk.grad_scale, q_parts[0].dtype, accurate=False)
-    return algebra.value_weights(exponentials, weights, do_parts[0].dtype), part
+    ((part, _),) = algebra.cotangent_parts(cotangents * walk.grad_scale, q_slot.dtype, accurate=False)
+    return algebra.value_weights(exponentials, weights, do_slot.dtype), part
 
 
 def _scores(walk: _Backward, coords: algebra.Coords, params: tuple, s, dp, peak, total, anchor, delta,

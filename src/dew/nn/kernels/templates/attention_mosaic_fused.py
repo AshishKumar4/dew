@@ -61,8 +61,8 @@ def _fused_step(walk: _Backward, resident: tuple, rows_of, staged, coords_of, wh
     dk_acc, dv_acc = accumulators
     q_slot, do_slot = slots["queries"], slots["douts"]
     q_first = index * tiles.block_q
-    narrowed, part = _tile_scores(walk, ((q_slot,), (do_slot,)), tuple((ref,) for ref in resident),
-                                  rows_of(q_first), coords_of(q_first), whole(index), shape, masked=masked)
+    narrowed, part = _tile_scores(walk, (q_slot, do_slot), resident, rows_of(q_first), coords_of(q_first),
+                                  whole(index), shape, masked=masked)
     family.staged(narrowed, staged.at[0])
     dv_acc = family.products(dv_acc, staged.at[0].transpose((1, 0)), do_slot, walk.interpret)
     cotangents_staged = staged.at[1]
