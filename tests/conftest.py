@@ -220,6 +220,14 @@ def rng():
     return jax.random.PRNGKey(0)
 
 
+@pytest.fixture(scope="module")
+def lint():
+    """tools/lint_slop.py, as the lint tests read it."""
+    from tool_support import load
+
+    return load("lint_slop")
+
+
 @pytest.fixture
 def cache_worker():
     """The dew-xla-cache Worker's protocol over a dict: GET, PUT, a listing two keys a page, a 404 on
