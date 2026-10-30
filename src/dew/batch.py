@@ -467,20 +467,26 @@ def token_layout(fields: Mapping[str, jax.Array | np.ndarray | Coordinates], *, 
 
 def with_validity(fields: Mapping[str, jax.Array | np.ndarray | Coordinates],
                   valid: jax.Array | np.ndarray | None) -> dict:
-    """`fields` holding `valid` as their validity where `token_validity` reads it, None removing it: in
-    their `Coordinates` where the fields carry them, built again from it (`coordinates`) so their
-    documents' starts and firsts follow it, else in the validity field."""
+    """`fields` holding `valid` as their validity where `token_validity` reads it, None removing it, their
+    layout one `Coordinates` built again from it (`coordinates`, its documents' starts and firsts
+    following it), whether the fields carried coordinates or flat layout fields (ledger 1122); none where
+    nothing is left to lay out (one document a row, every token real, at its slot), as fields that
+    carry no layout. A field dict's layout so takes one shape for one set of given fields, which a
+    pool's processes agree on (`dew.nn.inputs.agreed_validity`). Arrays stay on the host where `valid`
+    and the fields are numpy."""
     laid = laid_coordinates(fields)
-    if laid is not None:
-        aligned = next(iter(laid.tokens().values()), valid)
-        if aligned is None:
-            return dict(fields)
-        rebuilt = coordinates(tuple(jnp.shape(aligned)[:2]), segments=laid.segments, valid=valid,
-                              positions=laid.positions, max_segments=laid.max_segments,
-                              right_padded=laid.right_padded)
-        return {**fields, COORDINATES_FIELD: rebuilt}
-    rest = {name: value for name, value in fields.items() if name != VALIDITY_FIELD}
-    return rest if valid is None else {**rest, VALIDITY_FIELD: valid}
+    segments = laid.segments if laid is not None else flat_field(fields, SEGMENTS_FIELD)
+    positions = laid.positions if laid is not None else flat_field(fields, POSITIONS_FIELD)
+    rest = {name: value for name, value in fields.items()
+            if name not in (*TOKEN_LAYOUT_FIELDS, COORDINATES_FIELD)}
+    given = [field for field in (valid, segments, positions) if field is not None]
+    if not given:
+        return rest
+    host = all(isinstance(field, np.ndarray) for field in given)
+    rebuilt = coordinates(tuple(np.shape(given[0])[:2]), segments=segments, valid=valid, positions=positions,
+                          max_segments=None if laid is None else laid.max_segments,
+                          right_padded=laid is not None and laid.right_padded, xp=np if host else jnp)
+    return {**rest, COORDINATES_FIELD: rebuilt}
 
 
 def token_positions(fields: Mapping[str, jax.Array | np.ndarray | Coordinates], *, xp=jnp):

@@ -13,6 +13,7 @@ from reference_error import assert_as_exact
 from sampling_gate import assert_draws_as_declared
 from scipy import stats
 
+from dew.batch import token_coordinates
 from dew.data.dataset import Loader
 from dew.diffusion import EpsilonPredictionTransform, Process
 from dew.diffusion.discrete import MDLM, DiscreteProcess, LogLinear, Unmask
@@ -423,8 +424,10 @@ class FieldReader(nn.Module):
     def setup(self):
         self.scale = self.param("scale", nn.initializers.constant(30.0), ())
 
-    def __call__(self, tokens, **fields):
-        return self.logits(tokens, **fields)
+    def __call__(self, tokens, positions=None, coordinates=None, **fields):
+        # The call's flat positions laid out once, as a model's call converts them (`token_coordinates`).
+        laid = token_coordinates(tokens.shape, coordinates, positions=positions)
+        return self.logits(tokens, coordinates=laid, **fields)
 
     def logits(self, tokens, *, train=False, coordinates=None, image_indices=None, conditioning=None,
                **fields):
