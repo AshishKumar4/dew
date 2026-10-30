@@ -43,7 +43,7 @@ from dew.data.pipeline import Rejected
 from dew.data.sources.tokens import TokenFiles
 from dew.decision import decisions
 from dew.decision.config import DecisionRunConfig
-from dew.decision.layout import Reads
+from dew.decision.layout import Reads, built_in
 from dew.diffusion.presets import Flow
 from dew.inputs import TextCondition
 from dew.lora import LoRA
@@ -574,6 +574,10 @@ def contexted(root: Path, drawn: bool) -> RunConfig:
     return dataclasses.replace(decision(root, drawn), context_layers=(0,), context_length=16)
 
 
+BESIDE = {"layout.framing": {"segments": built_in(None, "question_first")}}
+"""What an option's reader takes it only beside, by the run's path, set with it: a framing frames a row of
+its own segments (`_budgeted`), here the question layout's own row as segments (`built_in`)."""
+
 TASK_RUNS = {"TextSettings": (prefixed, "lm"), "MaskedSettings": (masked, "masked_diffusion"),
              "ImageSettings": (diffusion, "diffusion"), "DecideSettings": (contexted, "decision")}
 """A run here of an objective that records each saved task's settings, and the objective's name."""
@@ -704,9 +708,16 @@ def test_each_option_a_saved_task_is_built_with_reaches_it_from_the_command_line
                      and accepted(base, name, found.made(value))]
               for name, option in options.items() if (found := option.found) is not None}
     reachable = {name: option.found for name, option in options.items() if option.found is not None}
-    reached = reached_by(run, tmp_path, settings, lambda assigned: {
-        reachable[name].path: flag(value, reachable[name].annotation) for name, value in assigned.items()},
-        queued, lambda saved, name, value: same(held_at(saved, name), reachable[name].made(value)))
+    hints = typing.get_type_hints(type(run), include_extras=True)
+
+    def flags(assigned: dict[str, object]) -> dict[str, str]:
+        """The `--set`s of each option `assigned`, and of what its reader takes it only beside (`BESIDE`)."""
+        beside = {path: flag(value, hints[path])
+                  for name in assigned for path, value in BESIDE.get(name, {}).items()}
+        return {**beside, **{reachable[name].path: flag(value, reachable[name].annotation)
+                             for name, value in assigned.items()}}
+    reached = reached_by(run, tmp_path, settings, flags, queued,
+                         lambda saved, name, value: same(held_at(saved, name), reachable[name].made(value)))
     for name in queued:
         assert name in reached, f"no alternative of {settings.__name__}.{name} trains: {queued[name]}"
         _, after, value = reached[name]
