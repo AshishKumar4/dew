@@ -169,9 +169,11 @@ def raised(whole, part):
     its ulp, 1.9e-6 near -43 (a pair of tokens at -30 a token), a decay's relative 1.3e-6, which put the
     port's decay gradient under decays near zero 7 to 10 times the token-by-token recurrence's distance from
     float64; and exp2 of a whole exponent, which a CPU takes as `exp(x ln 2)`, rounds its product with ln 2
-    the same way."""
+    the same way. Its power of two within twice 127 (`power2`'s two factors): the fraction's exp2 lies in
+    [1, 2), so `n` past fp32's exponents gives zero or infinity at any reach, and the two factors held an
+    A100's query_key launch spill-free where three spilled it (ledger 2519)."""
     n = _floor(whole)
-    return power2(jnp.exp2((whole - n) + part), n)
+    return power2(jnp.exp2((whole - n) + part), n, reach=2 * 127)
 
 
 def _floor(x):

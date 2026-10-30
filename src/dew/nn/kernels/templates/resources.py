@@ -20,8 +20,6 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from dew.nn.kernels.templates import cost
 
 if TYPE_CHECKING:
-    from dew.nn.kernels.generation import GpuTarget
-    from dew.nn.kernels.templates.liveness import Compiler
     from dew.nn.kernels.templates.mosaic import Family
 
 
@@ -306,48 +304,6 @@ class RegisterModel:
     step: int
     producer: int
     shared: int | None = None
-
-
-@dataclasses.dataclass(frozen=True)
-class LoweredRegisters:
-    """One launch's live register set, before the assembler schedules and allocates it."""
-    name: str
-    registers: int
-    fragments: int
-    scalars: int
-    threads: int
-    producer: int
-    raised: int
-    where: str
-
-    def model(self, target: "GpuTarget", compiler: "Compiler", *, shared: int, tmem: int) -> RegisterModel:
-        """Its launch budget and residency, from this launch's geometry and resource allocations."""
-        groups = self.threads // THREADS
-        consumers = groups - bool(self.producer)
-        budget = (self.raised if self.raised and not compiler.relocatable else entry_registers(groups))
-        most = target.architecture.resident_threads // self.threads
-        if target.shared_limit is not None:
-            most = min(most, (target.shared_limit + cost.RESERVED_SHARED) // (shared + cost.RESERVED_SHARED))
-        if tmem:
-            most = min(most, (target.tmem_columns or 0) // tmem)
-        producer = (self.producer if not compiler.relocatable else budget) if self.producer else 0
-        return RegisterModel(self.registers, budget, consumers, most, cost.REGISTER_STEP, producer, shared)
-
-
-def lowered_registers(module: bytes, compiler: "Compiler") -> list[LoweredRegisters]:
-    """Analyze the module an existing Mosaic custom call carries, without tracing or compiling it again.
-    The compiler version and assembly mode are inputs, never read from a process-global installation."""
-    from dew.nn.kernels.templates.liveness import kernel_peaks
-
-    found = []
-    for name, peak, _ in kernel_peaks(module, compiler):
-        if peak.threads is None:
-            continue
-        if peak.threads % THREADS or peak.threads < THREADS:
-            raise ValueError(f"Mosaic launch has {peak.threads} threads, not whole warpgroups")
-        found.append(LoweredRegisters(name, peak.total, peak.fragments, peak.scalars, peak.threads,
-                                       peak.producer, peak.raised, peak.where))
-    return found
 
 
 def register_model(family: "Family", consumers: int, registers: int | None, *,

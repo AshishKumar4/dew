@@ -25,6 +25,7 @@ from test_recurrence_mosaic import (
     geometry,
     interpreted,
     on_the_mainloop,
+    refuses_its_gradient,
     template_call,
 )
 from whole_suite import timed
@@ -117,8 +118,7 @@ def test_the_mosaic_gradient_is_as_exact_as_its_reference(case, dtype, remat):
     draws = functools.partial(drawn, dtype, **geometry(case))
     (sample,) = draw(dtype, 0, **geometry(case))
     if not trained(sample, hooks):
-        with pytest.raises(NotImplementedError):
-            jax.eval_shape(compiled(on), *draws(0))
+        refuses_its_gradient(compiled(on), *draws(0))
         return
     assert_as_exact(compiled(on), compiled(functools.partial(chunk_on, 'fla', hooks)), draws,
                     f'the mosaic gradient, {case} in {jnp.dtype(dtype).name}', seeds=SEEDS, truth_fn=truth)
