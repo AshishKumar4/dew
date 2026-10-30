@@ -83,7 +83,7 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
     value_width = value.shape[-1]
     # The query taken by its scale's power of two before its products (`prescaled`), so a logit finite at
     # the call's scale is finite in the product.
-    query, scale, power = prescaled(query, query.shape[3] ** -0.5 if scale is None else scale)
+    query, scale, power = prescaled(query, scale)
     # Queries and keys padded to whole tiles of both: a program's query block and a walk's key tile.
     call = padded_call(query, key, value, spans, Hooks(), math.lcm(TCGEN05.rows, tiles.block_k))
     spec = algebra.Forward(spans.form, spans.keys, ids=False, scale=scale, natural=natural,

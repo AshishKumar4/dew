@@ -23,6 +23,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.attention import AttentionImpl
+from dew.nn.dex import LayerDex
 from dew.nn.kv_cache import KVCache
 from dew.nn.ngpt import NGPT
 from dew.nn.rope import Scaling
@@ -137,6 +138,8 @@ class MixerContext:
     rotated query and key head, scales the query by its learned gain, scales the output gate's
     logits by theirs and unit-norms its gated output; None for none."""
     output_gate: bool = False
+    dex: LayerDex | None = None
+    """The layer's differential extension on its chosen heads' outputs (`dew.nn.dex`), or None."""
     """The attention's output gate (Qwen3.5's attn_output_gate), where the
     kind's projection doubles its query and a sigmoid of the second half
     gates the branch. The delta net's own gate activation is a field of its

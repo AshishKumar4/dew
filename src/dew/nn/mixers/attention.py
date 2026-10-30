@@ -36,6 +36,7 @@ from dew.nn.attention_masks import (
 )
 from dew.nn.blocks import normal_kernel
 from dew.nn.dense import Dense
+from dew.nn.dex import annealed, differential
 from dew.nn.documents import CrossDocuments
 from dew.nn.flops import attention_flops, cross_attention_flops, projection_flops
 from dew.nn.inputs import (
@@ -66,6 +67,7 @@ from dew.nn.mixer_base import QKV_RESIDUALS, MixerBase, MixerContext
 from dew.nn.ngpt import NGPT, gain
 from dew.nn.norms import RMSNorm
 from dew.nn.precision import at_least_fp32, float32_dot_general, l2norm, rounded_to, scaled
+from dew.nn.progress import progress
 from dew.nn.protocols import ProjectionGroup
 from dew.nn.rope import LongRopeScaling, axis_halves, axis_tables, rotary_freqs, rotate
 from dew.nn.sharding import HEADS, KV_HEADS, constrain, logical_axes
@@ -263,6 +265,10 @@ CONTEXT_LOGITS = "context_max_logits"
     # like the query's; the longer suffix outranks the MLP's `gate_proj`.
     ("self_attn", "gate_proj"): ("embed", "heads"),
     ("o_proj",): ("attention", "embed"),
+    # DEX's projections of a chosen subset of heads, which no head split divides, and its lambda: whole on
+    # every device (`dew.nn.dex`).
+    ("dex_projection",): (None, None, None),
+    ("dex_lambda",): (),
 })
 class CausalSelfAttention(nn.Module):
     """Causal self-attention with grouped-query heads, rotary positions, qk
@@ -388,6 +394,15 @@ class CausalSelfAttention(nn.Module):
                 self.k_norm = norm(name='k_norm')
         if self.ctx.ngpt is not None:
             self._ngpt_gains(self.ctx.ngpt)
+        if self.ctx.dex is not None:
+            # DEX's per-head projections of the chosen heads' outputs and its learned lambda, zero at the
+            # start as the paper's lambda_learn (`dew.nn.dex`).
+            if self.ctx.dex.heads[-1] >= self.ctx.num_heads:
+                raise ValueError(f"DEX names heads {self.ctx.dex.heads} of a layer of {self.ctx.num_heads}")
+            self.dex_projection = self.param(
+                'dex_projection', nn.initializers.lecun_normal(in_axis=-2, out_axis=-1, batch_axis=(0,)),
+                (len(self.ctx.dex.heads), self.value_dim, self.value_dim), jnp.float32)
+            self.dex_lambda = self.param('dex_lambda', nn.initializers.zeros, (), jnp.float32)
         # A head's learned logit beside its keys', which a read of the layer's own sequence and one of
         # a context (`attend_context`) both take.
         self.sinks = (self.param('sinks', nn.initializers.zeros, (self.ctx.num_heads,))
@@ -440,9 +455,10 @@ class CausalSelfAttention(nn.Module):
 
     @nn.nowrap
     def model_flops(self, lengths) -> float:
-        """Query/output maps and unshared K/V maps, plus QK and AV."""
+        """Query/output maps, unshared K/V maps and DEX's maps of its chosen heads, plus QK and AV."""
         window = self.ctx.sliding_window if self.ctx.causal or self.ctx.bidirectional_window else None
         return (sum(projection_flops(lengths, *shape) for shape in self.projections().values())
+                + self._dex_flops(lengths)
                 + attention_flops(lengths, self.ctx.num_heads, self.ctx.head_dim, self.value_dim,
                                   causal=self.ctx.causal, window=window, chunk=self.ctx.attention_chunk))
 
@@ -453,6 +469,19 @@ class CausalSelfAttention(nn.Module):
         products = attention_flops(lengths, self.ctx.num_heads, self.ctx.head_dim, self.value_dim,
                                    causal=self.ctx.causal, window=window, chunk=self.ctx.attention_chunk)
         return self.model_flops(lengths) - products
+
+    @nn.nowrap
+    def head_outputs(self) -> tuple[int, int]:
+        """Its heads' count and each one's output width, which DEX extends (`dew.nn.dex.HeadOutputs`)."""
+        return self.ctx.num_heads, self.value_dim
+
+    @nn.nowrap
+    def _dex_flops(self, lengths) -> float:
+        """DEX's work on each token's chosen heads (`dew.nn.dex`): a `[Dv, Dv]` map of each, none
+        without it."""
+        if self.ctx.dex is None:
+            return 0.0
+        return projection_flops(lengths, len(self.ctx.dex.heads) * self.value_dim, self.value_dim)
 
     @nn.nowrap
     def projections(self) -> dict[str, tuple[int, int]]:
@@ -632,6 +661,17 @@ class CausalSelfAttention(nn.Module):
         return group_fields(self.ctx.causal, images=self.bidirectional_images,
                             blocks=self.bidirectional_blocks)
 
+    def _reads_whole_blocks(self, metadata: AttentionMetadata | None, prefix, append: Append | None,
+                            decode: bool) -> bool:
+        """Whether an uncached call of the layer (no canvas `prefix`, no `append` and not `decode`) reads
+        blocks each its document's whole (`AttentionMetadata.whole_blocks`): the blocks read both ways are
+        the documents (the rows where the call names none), the non-causal call by documents, which every
+        kernel that takes one (FlashAttention's, cuDNN's) runs. A block's keys are past the window, so it
+        bounds none, and its blocks go unread. A cached call reads its cache's groups as before."""
+        uncached = prefix is None and append is None and not decode
+        reads = "block_groups" in self._group_fields()  # a causal layer's blocks, a non-causal one's none
+        return uncached and reads and metadata is not None and metadata.whole_blocks
+
     def _key_groups(self, metadata: AttentionMetadata | None, history: dict[str, jax.Array], decode: bool,
                     length: int) -> _Groups:
         """The block and image groups the layer reads over its call's keys, those the call carries: an
@@ -653,7 +693,7 @@ class CausalSelfAttention(nn.Module):
         return {name: append.groups(name, None if metadata is None else getattr(metadata, name))
                 for name in self._group_fields()}
 
-    def _restricts_visibility(self, metadata: AttentionMetadata | None, decode: bool) -> bool:
+    def _restricts_visibility(self, metadata: AttentionMetadata | None, decode: bool, causal: bool) -> bool:
         """Whether metadata narrows who sees whom, so the mask has to be built.
 
         Key validity does; rotary positions, block groups and an explicit pairwise
@@ -662,14 +702,14 @@ class CausalSelfAttention(nn.Module):
         the call to the xla kernel (docs/performance.md). A validity array is
         opaque at trace time, so a host that knows a row is unpadded passes none,
         and one that right-pads its rows says so (`AttentionMetadata.right_padded`):
-        causality alone keeps a real query off the padding after it, whose block
+        a `causal` call alone keeps a real query off the padding after it, whose block
         groups are -1. A decode step's mask carries the cache's validity.
         """
         if decode:
             return metadata is not None
         # QK-Clip's logit maxima are taken under the mask (`_attended`), so a
         # layer that sows them keeps it.
-        implied = (metadata is not None and metadata.right_padded and self.ctx.causal
+        implied = (metadata is not None and metadata.right_padded and causal
                    and not (not self.is_initializing() and self.is_mutable_collection("qk")))
         return metadata is not None and metadata.valid is not None and not implied
 
@@ -850,15 +890,21 @@ class CausalSelfAttention(nn.Module):
     @nn.nowrap
     def context_flops(self, lengths, context_lengths) -> float:
         """Its read of a context's work over rows of `lengths` tokens reading `context_lengths`
-        (`attend_context`): the query, gate and output projections over the rows, the key and value
-        projections over the context, and the attention between them."""
+        (`attend_context`): its projections' (`context_projection_flops`) and the attention between
+        them."""
+        return self.context_projection_flops(lengths, context_lengths) + cross_attention_flops(
+            lengths, context_lengths, self.ctx.num_heads, self.ctx.head_dim, self.value_dim)
+
+    @nn.nowrap
+    def context_projection_flops(self, lengths, context_lengths) -> float:
+        """The part of its read of a context done by its own matrices: the query, gate and output
+        projections over the rows of `lengths` tokens, the key and value projections over the context's
+        `context_lengths`."""
         maps = self.projections()
-        rows = sum(projection_flops(lengths, *maps[name]) for name in ('q_proj', 'gate_proj', 'o_proj')
-                   if name in maps)
-        context = sum(projection_flops(context_lengths, *maps[name]) for name in ('k_proj', 'v_proj')
-                      if name in maps)
-        return rows + context + cross_attention_flops(lengths, context_lengths, self.ctx.num_heads,
-                                                      self.ctx.head_dim, self.value_dim)
+        rows = self._dex_flops(lengths) + sum(projection_flops(lengths, *maps[name])
+                                              for name in ('q_proj', 'gate_proj', 'o_proj') if name in maps)
+        return rows + sum(projection_flops(context_lengths, *maps[name]) for name in ('k_proj', 'v_proj')
+                          if name in maps)
 
     def _turned(self, heads):
         """Query or key heads in the layout their rotation reads: with
@@ -1020,13 +1066,15 @@ class CausalSelfAttention(nn.Module):
             # from them (`attention_kernel`).
             documents = segment_ids
         groups = _Groups() if prefix is not None else self._key_groups(attention_metadata, history, decode, S)
+        if self._reads_whole_blocks(attention_metadata, prefix, append, decode):
+            causal, window, groups = False, None, groups._replace(block_groups=None)
         # Over the keys the call reads, the cache's or the prefix's joined.
         masked = self._mask_kernel(query, key, decode)
         cached = isinstance(documents, CrossDocuments)
         if (cached or groups != _Groups()) and self.ctx.attention_impl != 'auto':
             implementation = masked  # a named kernel's handoff (`_mask_kernel`)
         valid = None
-        if prefix is None and self._restricts_visibility(attention_metadata, decode) and not cached:
+        if prefix is None and self._restricts_visibility(attention_metadata, decode, causal) and not cached:
             # A decode step's mask and a cache call's documents hold the rows' validity; an uncached
             # call's real keys reach the kernel beside the rest, its window counting real tokens.
             valid = None if decode or attention_metadata is None else attention_metadata.valid
@@ -1301,8 +1349,14 @@ class CausalSelfAttention(nn.Module):
             and all(getattr(metadata, name) is None for name in self._group_fields()))
 
     def _output(self, attention, gate, batch: int, length: int, own_value):
-        """Exclude the own value where the layer does and the call has one (None for a read of
-        another sequence), gate the attended values where it gates, then project them."""
+        """Take the differential on the chosen heads where the layer carries DEX (`dew.nn.dex`), exclude
+        the own value where the layer does and the call has one (None for a read of another sequence),
+        gate the attended values where it gates, then project them."""
+        if self.ctx.dex is not None:
+            # Lambda annealed over the run's updates (`dew.nn.progress`), its learned value outside a run.
+            strength = annealed(progress().updates, self.ctx.dex, self.dex_lambda)
+            attention = differential(attention, self.ctx.dex.heads, self.dex_projection, strength,
+                                     self.ctx.precision)
         if self.exclusive_self_attention and own_value is not None:
             attention = exclusive_self_attention(attention, own_value)
         if gate is not None and self.ctx.ngpt is not None:

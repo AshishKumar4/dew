@@ -84,6 +84,7 @@ from ..precision import (
     at_least_fp32,
     compensated_add,
     compensated_total,
+    rms_statistics,
     rms_weighted,
     rounded_to,
     two_product,
@@ -491,9 +492,8 @@ def _rms_forward(x_ref, branch_ref, scale_ref, gate_ref, y_ref, stream_ref, mean
         branch = plgpu.load(branch_ref.at[at], mask=mask, other=0)
         x = _round(x + branch.astype(jnp.float32), stream_ref.dtype, interpret)
         plgpu.store(stream_ref.at[at], x.astype(stream_ref.dtype), mask=mask)
-    # XLA's mean multiplies by the fp32 reciprocal, not an fp32 division.
-    mean_square = jnp.sum(x * x, axis=1) * (1.0 / width) + epsilon
-    inverse = jax.lax.rsqrt(mean_square)
+    mean, inverse = rms_statistics(x, epsilon, axis=1, keepdims=False, count=width)
+    mean_square = mean + epsilon
     weight = (None if scale_ref is None
               else _weight(scale_ref, columns, width, offset, stored, interpret)[None, :])
     gate = None if gate_ref is None else plgpu.load(gate_ref.at[at], mask=mask, other=0).astype(jnp.float32)

@@ -1128,9 +1128,9 @@ def _token_places(batch: Batch) -> tuple[int, int]:
     tokens = batch.get("text")
     if not isinstance(tokens, np.ndarray) or tokens.dtype.kind not in "iu":
         return 0, 0
-    from dew.batch import COORDINATES_FIELD, VALIDITY_FIELD, real_slots
+    from dew.batch import COORDINATES_FIELD, SEGMENTS_FIELD, VALIDITY_FIELD, real_slots
 
-    fields = {name: batch[f"text_{name}"] for name in (COORDINATES_FIELD, VALIDITY_FIELD, "segment_ids")
+    fields = {name: batch[f"text_{name}"] for name in (COORDINATES_FIELD, VALIDITY_FIELD, SEGMENTS_FIELD)
               if f"text_{name}" in batch}
     real = real_slots(fields, tokens.shape, xp=np)
     return int(tokens.size), int(tokens.size - np.count_nonzero(real))

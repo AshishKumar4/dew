@@ -4,10 +4,11 @@ tools/ouro_reference.py writes tests/fixtures/hf/ouro-tiny and the 1.4B probe.""
 import json
 from pathlib import Path
 
+import jax.numpy as jnp
 import numpy as np
 import pytest
-from interop_support import assert_reloads, assert_same_stored_tensors
-from reference_error import assert_as_exact_as_the_reference
+from interop_support import assert_reloads, assert_same_stored_tensors, fixture_ids
+from reference_error import assert_as_exact, declared_seeds, indexed_recording, recording, widened
 
 from dew.interop import Pretrained, PretrainedDecoder
 from dew.interop.sources import load_shards
@@ -29,12 +30,28 @@ def fixture(name):
 
 
 def test_every_pass_gates_its_exit_as_the_remote_code_does():
+    """The logits and each pass's exit-gate logits are on par with the remote code's fp32 run from its
+    float64 run (check 1), over its recording's seeds of ids (tools/ouro_reference.py `--recording`):
+    Dew's own float64 run is the truth, held at every seed to the recording's sketch."""
     loaded = load()
-    logits, sown = loaded.model.apply(loaded.variables, fixture('input_ids'), mutable=['exits'])
-    assert_as_exact_as_the_reference(logits, fixture('logits'), fixture('logits_f64'), 'Ouro logits')
-    gates = np.stack(sown['exits']['logits'])
-    assert_as_exact_as_the_reference(gates, fixture('exit_logits'), fixture('exit_logits_f64'),
-                                     'Ouro exit gates')
+    wide = loaded.model.clone(dtype=jnp.float64)
+    path = TINY / 'recorded_logits.npz'
+    seeds = declared_seeds(path)['logits']
+    draw = fixture_ids(TINY)
+
+    def passes(model, variables):
+        def run(ids):
+            logits, sown = model.apply(variables, ids, mutable=['exits'])
+            return {'logits': logits, 'exit_logits': jnp.stack(sown['exits']['logits'])}
+        return run
+
+    truth_of = passes(wide, widened(loaded.variables))
+    recorded, reference, truth = indexed_recording(
+        recording(path), 'logits', seeds, truth_fn=lambda inputs: truth_of(inputs['input_ids']),
+        inputs_of=lambda seed: {'input_ids': draw(seed)[0]}, leaves=('logits', 'exit_logits'))
+    ours = passes(loaded.model, loaded.variables)
+    assert_as_exact(lambda index, inputs: ours(inputs['input_ids']), reference, recorded, 'Ouro passes',
+                    seeds=seeds, truth_fn=truth)
 
 
 def test_a_saved_checkpoint_reloads_bit_for_bit(tmp_path):

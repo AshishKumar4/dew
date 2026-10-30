@@ -189,16 +189,20 @@ def test_an_explicit_config_the_call_cannot_hold_is_refused_as_a_pin_is():
         assert jnp.array_equal(Doubling().replace(config=Block(64))(x), x * 2)
 
 
-def test_a_launch_builds_its_key_only_where_something_reads_it(monkeypatch):
+def test_a_launch_builds_its_key_only_where_something_reads_it():
     """A launch with no collector, pin or tuning read never builds its key (`KernelOp.keyed`, which traces
     its hooks; row 1866 K4); a collector reads it."""
     built = []
-    original = Doubling.keyed
-    monkeypatch.setattr(Doubling, "keyed", lambda self, ba: built.append(1) or original(self, ba))
+
+    class Counted(Doubling):
+        def keyed(self, ba):
+            built.append(1)
+            return super().keyed(ba)
+
     x = jnp.ones((64, 8), jnp.float32)
     with generation.assumed("sm80"):
-        Doubling()(x)
+        Counted()(x)
         assert built == []
         with tuning.seen():
-            Doubling()(x)
+            Counted()(x)
     assert built == [1]

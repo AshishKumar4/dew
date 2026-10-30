@@ -16,9 +16,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from attention_oracle import attention_terms
 from generation_support import COMPILES_ON_CPU, INTERPRETS, lowers
 from jax.sharding import Mesh
-from reference_error import as_given, assert_as_exact, assert_as_exact_as_the_reference
+from reference_error import as_given, assert_as_exact
 from test_attention_template import CASES, ROWS, RUN_CASES, arguments, geometry as core_geometry
 from test_attention_triton import BACKWARD_SEEDS, HOOKS, SCORE_HOOKS, gate_of, hooks_for, score_hooks
 
@@ -27,6 +28,7 @@ from dew.nn.kernels.templates import (
     attention as template,
     attention_mosaic,
     attention_mosaic_program,
+    attention_portable,
     attention_triton,
     resources,
 )
@@ -290,12 +292,14 @@ def _check_backward(call: str, shape, *, form: str | None, interpret: bool, keys
                     residuals_from=None, target: generation.GpuTarget | None = None,
                     config: attention_mosaic.BackwardTiles | None = None, width: int = 128,
                     value_width: int | None = None, spans: template.KeySpans | None = None,
-                    drop: bool = False):
+                    drop: bool = False, kept: bool | str = True):
     """The backward in the form `form` names (`_backward_form`; None, the default form at `config`, else its
     derived one) over the call form `call` of `shape` (or `spans` where given; its keys `keys`, its query
     heads `width` wide and its value heads `value_width`) on `target` (`_device`), from the training
-    forward's residuals at its pick: this mainloop's, or `residuals_from`'s (another mainloop's `forward`, as
-    the route feeds the Triton mainloop's), with `drop` under probability dropout (`_dropping`)."""
+    forward's residuals at its pick: this mainloop's, those `kept` names (its anchor's split sums, or
+    `template.OUTPUT`'s output, check 1 then judging D's rounding a term at a time), or `residuals_from`'s
+    (another mainloop's `forward`, as the route feeds the Triton mainloop's), with `drop` under probability
+    dropout (`_dropping`)."""
     keys = shape[1] if keys is None else keys
     spans = template.spans(shape[1], keys, shape[0], **CALLS[call]) if spans is None else spans
     hooks = _dropping(shape) if drop else None
@@ -305,7 +309,7 @@ def _check_backward(call: str, shape, *, form: str | None, interpret: bool, keys
 
     def ours(query, key, value, dout):
         with _device(interpret, target):
-            residuals = trained(query, key, value, spans, hooks, residuals=True, interpret=interpret)[1:]
+            residuals = trained(query, key, value, spans, hooks, residuals=kept, interpret=interpret)[1:]
             with _pinned(backward=config):
                 grads = attention_mosaic.backward(query, key, value, spans, hooks, dout, residuals=residuals,
                                                   accurate=accurate, interpret=interpret)
@@ -315,7 +319,56 @@ def _check_backward(call: str, shape, *, form: str | None, interpret: bool, keys
         _, pull = jax.vjp(lambda q, k, v: template.reference(q, k, v, spans, hooks), query, key, value)
         return pull(dout)
 
-    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, f"mosaic backward {call} {form}", seeds=SEEDS)
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, f"mosaic backward {call} {form} {kept}",
+                    seeds=SEEDS, terms=_gradient_terms(spans) if kept == template.OUTPUT else False)
+
+
+def _gradient_terms(spans: template.KeySpans):
+    """The float64 terms of the query's, key's and value's gradients over `spans` (`attention_terms`): a
+    logit's gradient `P (dP - D)` sized by `P (|dP| + sum |out dout|)`, the rounding a D formed from the
+    rounded output carries (`template.OUTPUT`'s, FlashAttention's), so a row that cancels to zero in float64
+    is held to it, not to its own zero."""
+    keep = template.dense(spans)[:, None]
+
+    def terms(query, key, value, dout):
+        return tuple(attention_terms(query, key, value, dout, keep)[1:])
+
+    return terms
+
+
+@INTERPRETS
+@pytest.mark.parametrize("form", ["default", "fused"])
+@pytest.mark.parametrize("call", CALLS)
+def test_the_backward_from_the_kept_output_is_on_par_interpreted(call, form):
+    """The backward from a training forward that keeps its output for D (`template.OUTPUT`: the inference
+    walk's rows, no anchor, `rowsum(dO ⊙ O)` of the rounded output, as FlashAttention's is), in two launches
+    and in one: within check 1 of the reference from float64, its D's rounding judged a term at a time."""
+    _check_backward(call, SHAPES["interpreted"], form=form, interpret=True, kept=template.OUTPUT)
+
+
+@INTERPRETS
+def test_the_plain_jax_backward_takes_the_kept_outputs_residuals():
+    """The plain-JAX mainloop's backward from residuals a Mosaic training forward keeps its output in
+    (`template.OUTPUT`: no anchor key, each query's -1, the seam's anchor value row zero there), as the
+    route hands a Mosaic forward's residuals to whichever mainloop runs the backward: within check 1 of the
+    reference from float64, a term at a time."""
+    shape = SHAPES["interpreted"]
+    spans = template.spans(shape[1], shape[1], shape[0], causal=True)
+
+    def ours(query, key, value, dout):
+        with _device(interpret=True):
+            residuals = attention_mosaic.forward(query, key, value, spans, residuals=template.OUTPUT,
+                                                 interpret=True)[1:]
+        grads = attention_portable.backward(query, key, value, spans, None, dout, block_q=64, block_k=64,
+                                            pad=64, residuals=residuals)
+        return grads.query, grads.key, grads.value
+
+    def reference(query, key, value, dout):
+        _, pull = jax.vjp(lambda q, k, v: template.reference(q, k, v, spans), query, key, value)
+        return pull(dout)
+
+    assert_as_exact(jax.jit(ours), jax.jit(reference), _drawn(shape, jnp.bfloat16, 128),
+                    "plain-JAX backward from the kept output", seeds=SEEDS, terms=_gradient_terms(spans))
 
 
 @INTERPRETS
@@ -426,20 +479,31 @@ in both forms; and a tile's worth of queries under two consumers, which pads to 
 second wholly padding (the accurate form's one consumer pads 64 queries to no more)."""
 
 
-def _keys_first_gradients(query, key, value, dout, spans, *, form: str, scale: float):
+def _keys_first(spans, *, form: str, scale: float):
     """The two-launch backward's gradients in the form `form` names, interpreted, from this mainloop's own
-    training forward at `scale`; and the float64 reference's (`template.reference` widened)."""
+    training forward at `scale`, as a function of the queries, keys, values and output cotangent."""
     accurate, config = _backward_form(form)
-    with _device(interpret=True), _pinned(FORM_TILES, config):
-        residuals = attention_mosaic.forward(query, key, value, spans, scale=scale, residuals=True,
-                                             interpret=True)[1:]
-        grads = attention_mosaic.backward(query, key, value, spans, None, dout, residuals=residuals,
-                                          scale=scale, accurate=accurate, interpret=True)
+
+    def gradients(query, key, value, dout):
+        with _device(interpret=True), _pinned(FORM_TILES, config):
+            residuals = attention_mosaic.forward(query, key, value, spans, scale=scale, residuals=True,
+                                                 interpret=True)[1:]
+            grads = attention_mosaic.backward(query, key, value, spans, None, dout, residuals=residuals,
+                                              scale=scale, accurate=accurate, interpret=True)
+        return grads.query, grads.key, grads.value
+
+    return gradients
+
+
+def _keys_first_gradients(query, key, value, dout, spans, *, form: str, scale: float):
+    """`_keys_first`'s gradients at these arrays, and the float64 reference's (`template.reference`
+    widened)."""
+    grads = _keys_first(spans, form=form, scale=scale)(query, key, value, dout)
     with jax.enable_x64(new_val=True):
         wide = [jnp.asarray(np.asarray(array, np.float64)) for array in (query, key, value, dout)]
         _, pull = jax.vjp(lambda q, k, v: template.reference(q, k, v, spans, scale=scale), *wide[:3])
         truth = tuple(np.asarray(grad) for grad in pull(wide[3]))
-    return tuple(np.asarray(grad, np.float64) for grad in (grads.query, grads.key, grads.value)), truth
+    return tuple(np.asarray(grad, np.float64) for grad in grads), truth
 
 
 @INTERPRETS
@@ -468,18 +532,25 @@ def test_the_keys_first_backward_keeps_the_logits_of_keys_the_power_would_flush_
     """Queries of 2^126 over keys of 2^-126 and 2^-125 in turn, 64 wide at the scale 2^-10: the forward's
     logits are 1/16 and 1/8, where keys taken by the scale's power would fall below bf16's least subnormal
     and flush to zero. The two-launch backward takes the power on its queries, as the forward does, so its
-    gradients are within check 1's rule of the fp32 reference's against float64."""
+    gradients are on par (check 1) with the fp32 reference's from float64, over drawn values and
+    cotangents."""
     tokens, width, scale = 64, 64, 2.0 ** -10
-    rng = np.random.default_rng(0)
     query = jnp.full((1, tokens, 1, width), 2.0 ** 126, jnp.bfloat16)
     key = jnp.where((jnp.arange(tokens) % 2 == 0)[None, :, None, None], 2.0 ** -126, 2.0 ** -125)
     key = jnp.broadcast_to(key, (1, tokens, 1, width)).astype(jnp.bfloat16)
-    value, dout = (jnp.asarray(rng.standard_normal((1, tokens, 1, width)), jnp.bfloat16) for _ in range(2))
     spans = template.spans(tokens, tokens, 1)
-    found, truth = _keys_first_gradients(query, key, value, dout, spans, form=form, scale=scale)
-    _, pull = jax.vjp(lambda q, k, v: template.reference(q, k, v, spans, scale=scale), query, key, value)
-    for name, mine, theirs, true in zip(("query", "key", "value"), found, pull(dout), truth, strict=True):
-        assert_as_exact_as_the_reference(mine, np.asarray(theirs, np.float64), true, f"{form} {name}")
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        return query, key, *(jnp.asarray(rng.standard_normal((1, tokens, 1, width)), jnp.bfloat16)
+                             for _ in range(2))
+
+    def reference(query, key, value, dout):
+        _, pull = jax.vjp(lambda q, k, v: template.reference(q, k, v, spans, scale=scale), query, key, value)
+        return pull(dout)
+
+    assert_as_exact(jax.jit(_keys_first(spans, form=form, scale=scale)), jax.jit(reference), draw,
+                    f"keys-first backward {form} over keys the power would flush", seeds=SEEDS)
 
 
 @INTERPRETS

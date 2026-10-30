@@ -139,6 +139,9 @@ PROBED = "probe:"
 """What a probed path's name is recorded under: a probe's answer is whether the path is there and of
 what kind, and a file's size, so ci.py's `contents` keys a probed directory by its kind, not by the
 entries a listing of it reads."""
+IMPORTED = "import:"
+"""What a top-level module a run imported is recorded under (executed.py): a helper of that name under
+tests/, which leads sys.path, would shadow it, so ci.py's `contents` keys whether tests/ holds one."""
 
 
 def opening(recorded: Callable[[str], None], root: str) -> None:

@@ -642,6 +642,20 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
         del views, lo, hi, wg, refills
         return streams
 
+    def walk_own[R](self, streams, views: dict, own: tuple, streamed: tuple, wg,
+                    walk: Callable[..., R], *, between=None) -> R:
+        """Consumer `wg`'s walk of its own steps `own` (`lo`, `hi`) among its program's `streamed` ones,
+        `walk(streams, lo, hi, first)` its walk of steps `lo` to `hi` counted from `first`: on a layout with a
+        producer, the steps before and after its own passed (`passed`, `between()` after each), which its
+        partners read; on one whose consumers feed their rings (`ConsumerFed.walk_own`), every streamed step
+        over its own feed (`fed`), a step none of its own masked by its step. Returns `walk`'s value."""
+        del views, wg
+        lo, hi = own
+        self.passed(streams, streamed[0], lo, first=streamed[0], between=between)
+        walked = walk(streams, lo, hi, streamed[0])
+        self.passed(streams, hi, streamed[1], first=streamed[0], between=between)
+        return walked
+
     @abc.abstractmethod
     def stream(self, streams, views: dict, lo, hi) -> None:
         """The producer's loads of steps `lo` to `hi` from `views` (`opened`'s), where the family has one."""
@@ -809,6 +823,11 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
         """`value` in `dtype` (fp32 unless given) in the accumulator's layout or a row's (`zeros`)."""
         layout = self.layout if len(shape) == 2 else self.row
         return plgpu.layout_cast(jnp.full(shape, value, dtype), layout)
+
+    def column_full(self, columns: int, value: float) -> jax.Array:
+        """`value` fp32 in a column's layout, `[columns]`: a tile's per-column state where its rows are its
+        keys (a keys-first walk's maxima and denominators)."""
+        return plgpu.layout_cast(jnp.full((columns,), value, jnp.float32), self.column)
 
     def iota(self, shape: tuple[int, ...], dimension: int) -> jax.Array:
         """Indices along `dimension` of a tile in the accumulator's layout or a row's (`zeros`)."""
@@ -1231,6 +1250,13 @@ class ConsumerFed[Accumulator](RingFamily[Accumulator]):
 
     def passed(self, streams, lo, hi, *, first: jax.Array | int = 0, between=None) -> None:
         raise NotImplementedError(f"{self.name}'s consumers each walk every step of their rings (`fed`)")
+
+    def walk_own[R](self, streams, views: dict, own: tuple, streamed: tuple, wg,
+                    walk: Callable[..., R], *, between=None) -> R:
+        # Every consumer walks each streamed step over its own feed: no partner reads a step it skips.
+        del own, between
+        lo, hi = streamed
+        return walk(self.fed(streams, views, lo, hi, wg), lo, hi, lo)
 
     def fed(self, streams: dict[str, Ring], views: dict, lo, hi, wg, *,
             refills: bool = True) -> "dict[str, Ring] | Feed":

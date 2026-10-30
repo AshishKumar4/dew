@@ -13,7 +13,13 @@ from flax import linen as nn, struct
 from flax.typing import Dtype, PrecisionLike
 
 from dew._model_types import GEMMA4_TYPES
-from dew.batch import Coordinates, coordinates as build_coordinates, prefix_sum, token_coordinates
+from dew.batch import (
+    POSITIONS_FIELD,
+    Coordinates,
+    coordinates as build_coordinates,
+    prefix_sum,
+    token_coordinates,
+)
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.flops import MissingFlopsCount, counted_flops, parameter_flops
 from dew.nn.inputs import CrossContext, next_position
@@ -25,6 +31,7 @@ from dew.nn.wrapping import DecoderWrapper
 
 if TYPE_CHECKING:
     from dew.nn.cross_attention import CrossBlocks
+    from dew.nn.dex import DifferentialExtension
     from dew.nn.hyper_connections import HyperConnections
     from dew.nn.mla import MLAMixer
 
@@ -266,8 +273,25 @@ class MultimodalTransformer(DecoderWrapper):
         return self.language_model.cross_flops(lengths, context_lengths)
 
     @nn.nowrap
+    def held_cross_flops(self, lengths, context_lengths) -> float:
+        return self.language_model.held_cross_flops(lengths, context_lengths)
+
+    @nn.nowrap
     def with_cross_attention(self, cross: CrossBlocks | None) -> Self:
         return self._over(self.language_model.with_cross_attention(cross))
+
+    @property
+    def dex(self) -> DifferentialExtension | None:
+        return self.language_model.dex
+
+    @nn.nowrap
+    def with_dex(self, extension: DifferentialExtension | None) -> Self:
+        return self._over(self.language_model.with_dex(extension))
+
+    @nn.nowrap
+    def dex_sites(self) -> tuple[tuple[str, ...], frozenset[int]]:
+        held, attention = self.language_model.dex_sites()
+        return ("language_model", *held), attention
 
     @nn.nowrap
     def logits_flops(self, lengths) -> float:
@@ -409,7 +433,7 @@ class MultimodalTransformer(DecoderWrapper):
                       conditioning: Mapping[str, jax.Array] | None = None,
                       attention_mask=None, image_groups=None, block_groups=None, rotary_positions=None,
                       audio_indices=None, routed_experts=None, routed=None, right_padded: bool = False,
-                      coordinates: Coordinates | None = None):
+                      coordinates: Coordinates | None = None, whole_blocks: bool = False):
         """Run the decoder over text with the media embeddings spliced in.
 
         `conditioning` holds the towers' payloads, and `image_indices` and
@@ -419,8 +443,8 @@ class MultimodalTransformer(DecoderWrapper):
         `routed_experts` and `routed` replay a routing record and go to the
         language model unchanged. Engines record a row for every placeholder
         position too, so the `[B, S, layers, top_k]` layout matches the text.
-        `right_padded` and `coordinates` are the language model's
-        (`CausalTransformer.hidden_and_mtp_inputs`).
+        `right_padded`, `coordinates` and `whole_blocks` are the language
+        model's (`CausalTransformer.hidden_and_mtp_inputs`).
         """
         # The tokens as the decoder reads them (`Coordinates`), whichever fields the caller gave
         # them in, so the cursor counts the places the layers do.
@@ -439,7 +463,7 @@ class MultimodalTransformer(DecoderWrapper):
             # The response's rule (`next_position`): past the last real token's position, or past
             # the largest coordinate of a multi-axis one.
             fields = {name: value for name, value in (("rotary_positions", rotary_positions),
-                                                      ("positions", positions)) if value is not None}
+                                                      (POSITIONS_FIELD, positions)) if value is not None}
             following = next_position(fields, valid)
             assert following is not None
             if allocated:
@@ -455,8 +479,8 @@ class MultimodalTransformer(DecoderWrapper):
         return self.language_model.hidden_states(
             fused.tokens, train=train, decode=decode, input_embeddings=fused.embeddings,
             image_groups=image_groups, block_groups=block_groups, rotary_positions=rotary_positions,
-            media_mask=fused.media,
-            routed_experts=routed_experts, routed=routed, coordinates=coordinates, conditioning=context)
+            media_mask=fused.media, routed_experts=routed_experts, routed=routed, coordinates=coordinates,
+            conditioning=context, whole_blocks=whole_blocks)
 
     def __call__(self, tokens, train: bool = False, decode: bool = False,
                  positions=None, segment_ids=None, image_indices=None,

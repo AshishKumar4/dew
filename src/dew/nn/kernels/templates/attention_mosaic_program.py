@@ -126,6 +126,12 @@ class BackwardTiles:
         other than the config's own, overrides naming the config's own aside."""
         return self.dkv != dataclasses.replace(self, dkv_family=None, dkv_consumers=None)
 
+    @property
+    def queries_first(self) -> bool:
+        """Whether the backward is the fused launch queries first (`_fused_launch`), on the config's own
+        layout and consumers: each consumer its own keys over the whole query slot, on either layout."""
+        return self.fused and not self.dkv_apart
+
     def __post_init__(self):
         if self.stages < 2:
             raise ValueError(f"{self}: two stages or more")

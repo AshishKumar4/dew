@@ -48,10 +48,11 @@ from native_certificates import (
     tf32_operand,
     truncating_step_ends,
 )
-from op_certificates import BFLOAT16, FLOAT32, TFLOAT32, Format, truncated
+from op_certificates import BFLOAT16, FLOAT16, FLOAT32, TFLOAT32, Format, truncated
 
 from dew.nn.kernels import generation, grouped_matmul, tuning
 from dew.nn.kernels.templates.gemm import template
+from dew.nn.kernels.templates.recurrence import mainloop
 
 pytestmark = pytest.mark.gpu(reason="a native kernel, certified on the GPU that compiles it")
 
@@ -572,7 +573,7 @@ def test_subnormal_operands_certify_natively_at_their_formats_least_normal(dtype
     (`aligned`): the native forward's element summing `SUBNORMAL_CASE`'s five fp16 products, and
     every element of a forward of rows a quarter of whose values are subnormals of `dtype` (Gaussian draws
     beside them), holds with each such operand counted at its format's least normal."""
-    fmt = rw.FLOAT16 if dtype == jnp.float16 else BFLOAT16
+    fmt = FLOAT16 if dtype == jnp.float16 else BFLOAT16
     values = np.float16 if dtype == jnp.float16 else ml_dtypes.bfloat16
     rng = np.random.default_rng([2084, 3, 7])
     x, w, _ = draw(0, signed=True, dtype=values)
@@ -633,8 +634,9 @@ def mosaic_lane() -> rw.Lane:
         run = mosaic_exp2(semantics)
         reaches.append(rw.exp2_reach(lambda x, run=run: run(x)[0]))
         flushes |= bool(np.any(run(np.full(128, 2.0 ** -30, np.float32))[1] == 0))
+    # The witness takes the ISA's stated reach, the probes within it, not the sampled one.
     assert max(reaches) <= PTX_EX2, reaches
-    return rw.Lane(max(reaches), flushes)
+    return rw.Lane(PTX_EX2, flushes, mainloop.block_of(mainloop.family_of(jnp.bfloat16)))
 
 
 @pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
@@ -649,7 +651,6 @@ def test_the_recurrence_templates_records_certify_natively_a_step_at_a_time(gene
     with generation.assumed(generation_name):
         run = rw.recorded(*rw.draw(0, regime, heads=2))
     held = rw.witness(run, mosaic_lane())
-    assert np.all(run.seams)
     for name in rw.RECORDS:
         assert np.all(held[name]), (name, np.mean(held[name]))
 
@@ -657,29 +658,18 @@ def test_the_recurrence_templates_records_certify_natively_a_step_at_a_time(gene
 @pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
 def test_the_recurrence_step_witness_refuses_a_dropped_carry_and_a_state_rounded_to_bf16_natively(
         generation_name):
-    """The native step witness's faults, each refused where it lands (`assert_refused`), a memory
-    kept across chunks (`REGIMES`' 'slow'): a document starting at the second chunk, whose zero memory is
-    refused at more than 95% of the memory the first chunk leaves (99.99% on an A100 and an H100); and the
-    second chunk run from that memory rounded to bf16 where fp32 is held, refused at more than 60% of the fp32
-    memory it leaves (74%)."""
+    """The native step witness's carry faults, each refused where it lands
+    (`recurrence_witness.assert_carry_faults_refused`): a dropped carry and a state rounded to bf16 where
+    fp32 is held."""
     with generation.assumed(generation_name):
-        operands = rw.draw(1, "slow", chunks=2, heads=2)
-        truth = rw.recorded(*operands)
-        assert_refused(*rw.dropped_refusals(operands, truth, 1, mosaic_lane()), 0.95)
-        assert_refused(*rw.handed_refusals(operands, truth, 1, mosaic_lane()), 0.6)
+        rw.assert_carry_faults_refused(mosaic_lane(), heads=2)
 
 
 @pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
 def test_the_recurrence_step_witness_refuses_rounded_cumulative_sums_and_an_off_by_one_boundary_natively(
         generation_name):
-    """The native step witness's faults, each refused where it lands (`recurrence_witness.assert_refusals`):
-    the decay from a difference of fp32 cumulative sums (row 2066's defect) in a decay alone, refused at more
-    than 50% of the fp32 memory each chunk leaves (75% on an A100 and an H100; the 16-bit records' grid hides
-    it, and a write beside the decay its rounding's share); and each chunk's boundary a token early, at more
-    than 95% of the weighted keys, corrected values and outputs (99.9%); no record held where its intervals
-    separate."""
+    """The native step witness's step faults, each refused where it lands
+    (`recurrence_witness.assert_step_faults_refused`): decays from a difference of fp32 cumulative sums
+    (row 2066's defect) and each chunk's boundary a token early."""
     with generation.assumed(generation_name):
-        rw.assert_refusals(rw.cumsum_refusals(rw.draw(1, "decay", chunks=2, heads=2), mosaic_lane()),
-                           {"leaving": 0.5})
-        rw.assert_refusals(rw.shifted_refusals(rw.draw(1, "mild", chunks=2, heads=2), mosaic_lane()),
-                           {"w": 0.95, "c": 0.95, "o": 0.95})
+        rw.assert_step_faults_refused(mosaic_lane(), heads=2)

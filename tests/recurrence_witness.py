@@ -27,19 +27,31 @@ decay's base-2 prefix within `EXPONENT_BOUND` of its exact value (XLA's compensa
 then the kernel's own roundings of its differences."""
 
 import dataclasses
+import functools
 import math
 from typing import NamedTuple
 
-import ml_dtypes
 import numpy as np
-from op_certificates import BFLOAT16, FLOAT32, Format, rounded
+from certified import allowance
+from native_certificates import TRUNCATING, truncating_underflow
+from op_certificates import (
+    BFLOAT16,
+    FLOAT16,
+    FLOAT32,
+    Format,
+    above,
+    below,
+    exp2_rounded,
+    grid_index,
+    nearest,
+    stepped,
+)
 
-FLOAT16 = Format("float16", 11, -14, 15)
-"""fp16, the inverse's merges' staged dtype in a 16-bit call (`mainloop._merges`)."""
+from dew.nn.kernels import recurrence_algebra
+from dew.nn.kernels.templates.recurrence import mainloop
 
-DTYPES = {"float32": np.float32, "bfloat16": ml_dtypes.bfloat16, "float16": np.float16}
-CHUNK = 64
-LOG2E = math.log2(math.e)
+CHUNK = mainloop.CHUNK
+LOG2E = mainloop.LOG2_E
 EXPONENT_BOUND = 2.0 ** -38
 """How far a position's prefix `hi + lo` (`mainloop.prefix`) lies from its exact `log2(e) cumsum(g)`, as a
 share of `log2(e) sum |g|` over the positions it spans: each compensated add rounds two adds of its
@@ -52,8 +64,8 @@ rounded twice to nearest."""
 PAIR_FRACTION = 2.0 ** -21
 """What `algebra.decayed` rounds off a pair's exponent: each side's fraction (where the side is under one, its
 distance from its floor rounds), their difference and its sum with the low halves', each under 2."""
-PAIR_FLOOR = -124
-"""`algebra.PAIR_FLOOR`: a pair whose integers differ by less weighs zero."""
+PAIR_FLOOR = recurrence_algebra.PAIR_FLOOR
+"""A pair whose integers differ by less weighs zero (`algebra.PAIR_FLOOR`)."""
 
 
 class Iv(NamedTuple):
@@ -71,30 +83,6 @@ def _outward(lo, hi) -> Iv:
     return Iv(np.nextafter(lo, -np.inf), np.nextafter(hi, np.inf))
 
 
-def nearest(x, fmt: Format) -> np.ndarray:
-    x = np.asarray(x, np.float64)
-    return rounded(x, np.zeros_like(x), fmt)
-
-
-def _toward(x, fmt: Format, direction: float) -> np.ndarray:
-    """The next value of `fmt` after each of its values `x` toward `direction`."""
-    dtype = DTYPES[fmt.name]
-    x = np.asarray(x, np.float64).astype(dtype)
-    return np.nextafter(x, np.full(x.shape, direction, dtype)).astype(np.float64)
-
-
-def below(x, fmt: Format) -> np.ndarray:
-    """The greatest value of `fmt` at or below each `x`."""
-    found = nearest(x, fmt)
-    return np.where(found > x, _toward(found, fmt, -np.inf), found)
-
-
-def above(x, fmt: Format) -> np.ndarray:
-    """The least value of `fmt` at or above each `x`."""
-    found = nearest(x, fmt)
-    return np.where(found < x, _toward(found, fmt, np.inf), found)
-
-
 def onto(iv: Iv, fmt: Format) -> Iv:
     """The values of `fmt` within `iv`: what a value known to be on `fmt`'s grid takes."""
     return Iv(above(iv.lo, fmt), below(iv.hi, fmt))
@@ -108,7 +96,7 @@ def cast(iv: Iv, fmt: Format) -> Iv:
 def cell(x, fmt: Format) -> Iv:
     """The values that round to nearest to each `x` of `fmt`: between its midpoints with its neighbours."""
     x = np.asarray(x, np.float64)
-    return Iv((x + _toward(x, fmt, -np.inf)) / 2, (x + _toward(x, fmt, np.inf)) / 2)
+    return Iv((x + stepped(x, fmt, -np.inf)) / 2, (x + stepped(x, fmt, np.inf)) / 2)
 
 
 def meet(a: Iv, b: Iv) -> Iv:
@@ -150,9 +138,11 @@ class Lane:
     """The arithmetic a launch runs in: `exp2`'s reach (the most steps of the fp32 grid its result lies from
     its correctly rounded value) and whether fp32 results below the normal range flush to zero. The witness
     is of bf16 calls, whose launches store their values in bf16 (an fp32 call's, the template takes none at
-    these widths, is a later link's)."""
+    these widths, is a later link's), and `block`, its family's tile width, over which a product's
+    contraction is issued in column blocks (`mainloop.block_of`)."""
     reach: int
     flushes: bool
+    block: int
 
 
 def fp32(iv: Iv, lane: Lane) -> Iv:
@@ -172,7 +162,7 @@ def fused(iv: Iv, lane: Lane) -> Iv:
     return hull(iv, fp32(iv, lane))
 
 
-def staged(iv: Iv, lane: Lane) -> Iv:
+def staged(iv: Iv) -> Iv:
     """A register value staged for a product as the call's launches hold it: cast to bf16."""
     return cast(iv, BFLOAT16)
 
@@ -195,17 +185,17 @@ def dot(a: Iv, b: Iv, lane: Lane, fmt: Format = BFLOAT16) -> Iv:
     terms = mul(Iv(a.lo[:, None, :], a.hi[:, None, :]), Iv(b.lo.T[None, :, :], b.hi.T[None, :, :]))
     live = ((terms.lo != 0) | (terms.hi != 0)).sum(-1)
     magnitude = (aligned(a, fmt)[:, None, :] * aligned(b, fmt).T[None, :, :]).sum(-1) * (1 + 2.0 ** -50)
-    unit = 2.0 ** -(FLOAT32.precision - 1)  # a truncating add's
-    gammas = np.nextafter(live * unit / (1 - live * unit), np.inf)
-    underflow = 2.0 ** FLOAT32.emin if lane.flushes else 2.0 ** (FLOAT32.emin - FLOAT32.precision + 1)
-    allowance = (gammas + (live + 2) * 2.0 ** -52) * magnitude + live * underflow
-    return onto(_outward(terms.lo.sum(-1) - allowance, terms.hi.sum(-1) + allowance), FLOAT32)
+    # The native-dot contract's allowance, and the float64 interval sums' own roundings beside it.
+    slack = (allowance(magnitude, live, TRUNCATING["float32"], truncating_underflow(lane.flushes))
+             + (live + 1) * 2.0 ** -52 * magnitude)
+    return onto(_outward(terms.lo.sum(-1) - slack, terms.hi.sum(-1) + slack), FLOAT32)
 
 
-def blocked(a: Iv, b: Iv, lane: Lane, block: int = CHUNK) -> Iv:
-    """`a @ b` as the mainloop issues it over its contraction's `block`-wide column blocks: each block's
-    product a fresh accumulator (`dot`), summed in fp32 from zero (`sum`'s first add exact)."""
-    width = a.lo.shape[1]
+def blocked(a: Iv, b: Iv, lane: Lane) -> Iv:
+    """`a @ b` as the mainloop issues it over its contraction's column blocks, the lane's family's tile
+    width (`Lane.block`): each block's product a fresh accumulator (`dot`), summed in fp32 from zero
+    (`sum`'s first add exact)."""
+    width, block = a.lo.shape[1], lane.block
     total = None
     for start in range(0, width, block):
         part = dot(Iv(a.lo[:, start:start + block], a.hi[:, start:start + block]),
@@ -215,15 +205,14 @@ def blocked(a: Iv, b: Iv, lane: Lane, block: int = CHUNK) -> Iv:
 
 
 def exp2(x: Iv, lane: Lane) -> Iv:
-    """`exp2` of a value within `x`: within `lane.reach` steps of the fp32 grid of its correctly rounded
-    value, the float64 `exp2` within 2^-50 of it; zero where it may fall below the normal range (ex2's flush,
-    or a scaling's last product rounding there)."""
-    # The correctly rounded results' least and greatest (round to nearest is monotone), then the reach: a
-    # floor or ceiling onto the grid first would admit one step more than the measured reach.
-    lo = np.asarray(np.float32(np.exp2(x.lo) * (1 - 2.0 ** -50)), np.float64)
-    hi = np.asarray(np.float32(np.exp2(x.hi) * (1 + 2.0 ** -50)), np.float64)
+    """`exp2` of an fp32 value within `x`: within `lane.reach` steps of the fp32 grid of its correctly rounded
+    value (`op_certificates.exp2_rounded`, verified), at the least and greatest fp32 operands within `x`
+    (round to nearest is monotone); zero where it may fall below the normal range (ex2's flush, or a
+    scaling's last product rounding there)."""
+    lo = exp2_rounded(above(x.lo, FLOAT32), FLOAT32)
+    hi = exp2_rounded(below(x.hi, FLOAT32), FLOAT32)
     for _ in range(lane.reach):
-        lo, hi = _toward(lo, FLOAT32, -np.inf), _toward(hi, FLOAT32, np.inf)
+        lo, hi = stepped(lo, FLOAT32, -np.inf), stepped(hi, FLOAT32, np.inf)
     return Iv(np.where(lo < 2.0 ** FLOAT32.emin, 0.0, lo), hi)
 
 
@@ -306,8 +295,8 @@ def weighted(lower, tile, beta, decay: Iv | None, lane: Lane) -> tuple[Iv, Iv]:
     scaled = fp32(mul(point(tile), point(np.asarray(beta)[:, None])), lane)
     if decay is not None:
         scaled = fp32(mul(scaled, Iv(decay.lo[:, None], decay.hi[:, None])), lane)
-    value = fp32(add(scaled, dot(point(lower), staged(scaled, lane), lane)), lane)
-    return value, staged(value, lane)
+    value = fp32(add(scaled, dot(point(lower), staged(scaled), lane)), lane)
+    return value, staged(value)
 
 
 def corrected(values: Iv, weights, entering, lane: Lane) -> Iv:
@@ -323,7 +312,7 @@ def carried(carry: Iv, values: Iv, k, exponents: Exponents, lane: Lane) -> Iv:
     gate = exponents.gated(lane)
     gated = fp32(mul(values, Iv(gate.lo[:, None], gate.hi[:, None])), lane)
     keys = point(np.asarray(k).T)
-    write = dot(keys, staged(gated, lane), lane)
+    write = dot(keys, staged(gated), lane)
     decay = exponents.raised(lane)
     held = Iv(np.full(carry.lo.shape, decay.lo[-1]), np.full(carry.lo.shape, decay.hi[-1]))
     return fp32(add(fused(mul(carry, held), lane), write), lane)
@@ -334,7 +323,7 @@ def output(q, k, entering, values, exponents: Exponents, scale: float, lane: Lan
     scores staged as the call holds them, the memory it entered read through the decayed queries, each term
     scaled by fp32's `scale` and their sum rounded once, either product before it maybe contracted."""
     scores = fp32(mul(blocked(point(q), point(np.asarray(k).T), lane), exponents.pairs(lane)), lane)
-    scores = staged(where(_lags() >= 0, scores, point(np.zeros((CHUNK, CHUNK)))), lane)
+    scores = staged(where(_lags() >= 0, scores, point(np.zeros((CHUNK, CHUNK)))))
     memory = blocked(point(q), point(entering), lane)
     decay = exponents.raised(lane)
     memory = fp32(mul(memory, Iv(decay.lo[:, None], decay.hi[:, None])), lane)
@@ -368,55 +357,45 @@ def enclosures(step: Step, scale: float, lane: Lane) -> dict[str, Iv]:
     c = corrected(u, step.w, step.h, lane)
     # The corrected values the write takes: fp32, within their enclosure and rounding to the stored `c`.
     values = meet(c, cell(step.c, BFLOAT16))
-    stored = staged(inverse(step.k, step.beta, exponents, lane), lane)
-    return {"a": stored, "w": w, "c": staged(c, lane),
+    stored = staged(inverse(step.k, step.beta, exponents, lane))
+    return {"a": stored, "w": w, "c": staged(c),
             "h": carried(step.carry, values, step.k, exponents, lane),
-            "o": staged(output(step.q, step.k, step.h, step.c, exponents, scale, lane), lane)}
+            "o": staged(output(step.q, step.k, step.h, step.c, exponents, scale, lane))}
 
 
 def stored_memory(iv: Iv, lane: Lane) -> Iv:
     """The memory as the states launch stores it: bf16, or fp32 exactly."""
-    return staged(iv, lane)
-
-
-def _index(x) -> np.ndarray:
-    """Each fp32 value's place on fp32's grid, in steps from zero."""
-    bits = np.abs(np.asarray(x, np.float64)).astype(np.float32).view(np.uint32).astype(np.int64)
-    return np.where(np.signbit(np.asarray(x, np.float64)), -bits, bits)
-
-
-def ulps(iv: Iv, record, fmt: Format) -> np.ndarray:
-    """Each enclosure's width in units of `fmt`'s last place at its record (at the least normal's for a zero):
-    how far apart two values it admits may lie, on the record's own grid."""
-    record = np.abs(np.asarray(record, np.float64))
-    _, exponent = np.frexp(np.maximum(record, 2.0 ** fmt.emin))
-    return (iv.hi - iv.lo) / np.ldexp(1.0, exponent - fmt.precision)
+    return staged(iv)
 
 
 def exp2_reach(native) -> int:
     """The most steps of the fp32 grid `native(x)`, an fp32 `exp2` of fp32 operands, lies from `2^x` correctly
     rounded (`op_certificates.exp2_rounded`), over the fractions `algebra.raised` and `algebra.decayed` take,
     (-2, 2): 2^17 of them, densely and drawn, the integers there (exact cases) among them."""
-    from op_certificates import exp2_rounded
-
     rng = np.random.default_rng(2084)
     x = np.concatenate([np.linspace(-2, 2, 1 << 16, dtype=np.float32), np.arange(-2, 3, dtype=np.float32),
                         rng.uniform(-2, 2, (1 << 16) - 5).astype(np.float32)])
-    return int(np.max(np.abs(_index(np.asarray(native(x), np.float64)) - _index(exp2_rounded(x, FLOAT32)))))
+    found = grid_index(np.asarray(native(x), np.float64))
+    return int(np.max(np.abs(found - grid_index(exp2_rounded(x, FLOAT32)))))
 
 
 RECORDS = ("a", "w", "c", "o", "h", "leaving")
 """The records the witness holds (`enclosed`)."""
 
 
+@functools.cache
 def interpreted_lane() -> Lane:
-    """The arithmetic Mosaic GPU's interpreter runs a launch in, a CPU process's XLA: its `exp2`'s reach
-    (`exp2_reach`) and whether it flushes (`certified.lane`), a 16-bit call."""
+    """The arithmetic Mosaic GPU's interpreter runs a launch in, a CPU process's XLA, measured once: its
+    `exp2`'s reach over the witness's own operands (`exp2_reach`: XLA's CPU exp2, computed as exp(x ln 2), is
+    a step off some powers of two, 2^71 among them, which check 2's exact cases admit no lane breaking, so
+    its reach is the witness's own measure, not `certified.lane`'s) and whether it flushes (`certified.lane`),
+    a 16-bit call."""
     import jax
     import jax.numpy as jnp
     from certified import lane
 
-    return Lane(exp2_reach(lambda x: jax.jit(jnp.exp2)(jnp.asarray(x))), lane().flushes)
+    return Lane(exp2_reach(lambda x: jax.jit(jnp.exp2)(jnp.asarray(x))), lane().flushes,
+                mainloop.block_of(mainloop.INTERPRETED))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -427,7 +406,7 @@ class Run:
     corrected values `c` and output `o` `[N, H, C, Dv]`, an fp32 call's three parts summed; and the fp32
     memory each chunk leaves, `carries` `[N + 1, H, Dk, Dv]` from the initial memory: the final memory of the
     call over the chunks before it, at the same tiles (`recorded`), the state the states launch carries in
-    fp32 and stores rounded as `h` (`seams`)."""
+    fp32 and stores rounded as `h`, which `h`'s enclosure holds bit for bit (`enclosed`)."""
     q: np.ndarray
     k: np.ndarray
     v: np.ndarray
@@ -439,7 +418,6 @@ class Run:
     c: np.ndarray
     o: np.ndarray
     carries: np.ndarray
-    seams: np.ndarray
 
     @property
     def chunks(self) -> int:
@@ -471,7 +449,7 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
     import jax.numpy as jnp
 
     from dew.nn.kernels import generation, recurrence_chunk, tuning
-    from dew.nn.kernels.templates.recurrence import mainloop, template
+    from dew.nn.kernels.templates.recurrence import template
 
     operands = (q, k, v, g, beta, h0)
     dtype = jnp.result_type(q, k, v)
@@ -498,21 +476,17 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
         ends = [kept(*(x[:, :n * CHUNK] for x in operands[:5]), h0,
                      starts=None if starts is None else starts[:, :n * CHUNK])[1]
                 for n in range(1, chunks)] if carried else []
-    parts = 3 if jnp.dtype(dtype) == jnp.float32 else 1
     # The chunks the launches lay out (a packed call's every sequence's, its worst case's), of which the
     # call's come first where its documents start on the chunks' grid.
-    laid = np.shape(a)[0] // parts // CHUNK
+    laid = np.shape(a)[0] // CHUNK
 
     def summed(x, rows):
-        return np.asarray(x, np.float64).reshape(parts, rows, -1).sum(0)
+        return np.asarray(x, np.float64).reshape(rows, -1)
 
     def chunked(x, width):
         return summed(x, laid * CHUNK).reshape(laid, CHUNK, heads, width).transpose(0, 2, 1, 3)[:chunks]
 
     memories = summed(h, laid * heads * key_width).reshape(laid, heads, key_width, value_width)[:chunks]
-    stored = jnp.float32 if parts == 3 else dtype
-    seams = np.asarray([np.array_equal(np.asarray(np.asarray(end[0]).astype(stored), np.float64),
-                                       memories[n + 1]) for n, end in enumerate(ends)], bool)
     carries = [np.asarray(h0, np.float64)[0], *(np.asarray(end, np.float64)[0] for end in ends)]
     unknown = np.full(carries[0].shape, np.nan)
     carries += [unknown] * (chunks - len(carries)) + [np.asarray(kept_final, np.float64)[0]]
@@ -520,7 +494,7 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
                c=chunked(c, value_width),
                o=np.asarray(kept_o, np.float64)[0].reshape(chunks, CHUNK, heads, value_width).transpose(
                    0, 2, 1, 3),
-               carries=np.stack(carries), seams=seams)
+               carries=np.stack(carries))
 
 
 def hosted(operands: tuple) -> dict[str, np.ndarray]:
@@ -561,18 +535,9 @@ def records(run: Run) -> dict[str, np.ndarray]:
 
 
 def witness(run: Run, lane: Lane) -> dict:
-    """Whether each record of `run` lies inside its step's enclosure (`enclosed`), by record `[N, H, ...]`,
-    and each enclosure's width in units of the last place of its record's grid, at the record (`ulps`) and
-    at its row's largest (`spans`)."""
+    """Whether each record of `run` lies inside its step's enclosure (`enclosed`), by record `[N, H, ...]`."""
     found, recorded_ = enclosed(run, lane), records(run)
-    held = {name: within(recorded_[name], found[name]) for name in found}
-
-    def grid(name):
-        return FLOAT32 if name == "leaving" else BFLOAT16
-
-    largest = {name: np.max(np.abs(record), -1, keepdims=True) for name, record in recorded_.items()}
-    return {**held, "ulps": {name: ulps(found[name], recorded_[name], grid(name)) for name in found},
-            "spans": {name: ulps(found[name], largest[name], grid(name)) for name in found}}
+    return {name: within(recorded_[name], found[name]) for name in found}
 
 
 def refusals(faulty: Run, claimed: Run, lane: Lane) -> dict[str, tuple[np.ndarray, np.ndarray]]:
@@ -698,3 +663,38 @@ def assert_refusals(found: dict, shares: dict) -> None:
         assert not np.any(held & apart), name
     for name, share in shares.items():
         assert_refused(*found[name], share)
+
+
+DROPPED_SHARE = 0.95
+"""The least share of the memory the first chunk leaves at which a dropped carry is refused (99.99% natively
+on an A100 and an H100)."""
+HANDED_SHARE = 0.6
+"""The least share of the fp32 memory the second chunk leaves at which its entering memory rounded to bf16,
+where fp32 is held, is refused (74% natively)."""
+CUMSUM_SHARES = {"leaving": 0.5}
+"""The least share of each chunk's leaving fp32 memory at which decays from a difference of fp32 cumulative
+sums (row 2066's defect) are refused (75% natively; the 16-bit records' grid hides it)."""
+SHIFTED_SHARES = {"w": 0.95, "c": 0.95, "o": 0.95}
+"""The least shares of the weighted keys, corrected values and outputs at which each chunk's boundary a
+token early is refused (99.9% natively)."""
+
+
+def assert_carry_faults_refused(lane: Lane, heads: int | None = None) -> None:
+    """A memory kept across chunks (`REGIMES`' 'slow'): a document starting at the second chunk, whose zero
+    memory is refused at `DROPPED_SHARE` of the memory the first chunk leaves; and the second chunk run from
+    that memory rounded to bf16 where fp32 is held, at `HANDED_SHARE` of the fp32 memory it leaves."""
+    from native_certificates import assert_refused
+
+    operands = draw(1, "slow", chunks=2, **({} if heads is None else {"heads": heads}))
+    truth = recorded(*operands)
+    assert_refused(*dropped_refusals(operands, truth, 1, lane), DROPPED_SHARE)
+    assert_refused(*handed_refusals(operands, truth, 1, lane), HANDED_SHARE)
+
+
+def assert_step_faults_refused(lane: Lane, heads: int | None = None) -> None:
+    """Decays from a difference of fp32 cumulative sums in a decay alone, refused at `CUMSUM_SHARES`; and each
+    chunk's boundary a token early, at `SHIFTED_SHARES`; no record held where its intervals separate."""
+    sized = {} if heads is None else {"heads": heads}
+    assert_refusals(cumsum_refusals(draw(1, "decay", chunks=2, **sized), lane), CUMSUM_SHARES)
+    assert_refusals(shifted_refusals(draw(1, "mild", chunks=2, **sized), lane), SHIFTED_SHARES)
+

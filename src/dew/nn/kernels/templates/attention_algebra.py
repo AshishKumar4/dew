@@ -222,10 +222,15 @@ class Coords(NamedTuple):
         tile = jnp.broadcast_to(self.q_pos, jnp.broadcast_shapes(self.q_pos.shape, self.k_pos.shape))
         return jnp.max(tile, axis=0 if self.keys_first else -1)
 
+    @property
+    def key_axis(self) -> int:
+        """The tile's axis of keys, which a softmax reduces along: its rows where they are its keys."""
+        return 0 if self.keys_first else -1
+
     def key_count(self, like: jax.Array) -> int:
         """The keys the walk's tile holds: `like`'s, or the tile's whole where `like` is a part of it
         (`tile_keys`)."""
-        return like.shape[0 if self.keys_first else 1] if self.tile_keys is None else self.tile_keys
+        return like.shape[self.key_axis] if self.tile_keys is None else self.tile_keys
 
     def hooked(self, score_mod: Callable | None) -> Callable | None:
         """`score_mod`, written over `[bq, bk]` tiles, as this tile's layout runs it: taken axis for axis on a
@@ -467,7 +472,11 @@ def power2(x: jax.Array, k: jax.Array) -> jax.Array:
     factors each within 2^±127 (`exact_power2`), of `k`'s sign, so each partial product lies between `x`
     and the result; `k` held within `POWER2_REACH`, past which the result is zero or infinite."""
     k = jnp.clip(jnp.asarray(k, jnp.float32), -POWER2_REACH, POWER2_REACH)
-    first = jnp.trunc(k / 3)
+    # k's third by its product with fp32's 1/3, the integer quotient for every integral |k| the clip leaves
+    # (POWER2_REACH): k * fl(1/3) exceeds k / 3 by under |k| * 2^-25, far below the 1/3 by which a
+    # non-multiple of 3 falls short of the next integer, so the truncation lands where the division's would.
+    # An integer division costs the Mosaic mainloops registers they don't have (sm80's GDN training spilled).
+    first = jnp.trunc(k * np.float32(1 / 3))
     second = jnp.trunc((k - first) / 2)
     return x * exact_power2(first) * exact_power2(second) * exact_power2(k - first - second)
 
@@ -611,11 +620,11 @@ def tile(state: Partial, alpha: jax.Array, p: jax.Array, largest: Callable[[], j
     return held.weights, alpha, held
 
 
-def denominator_after(total: jax.Array, factor: jax.Array, p: jax.Array, held: Room | None = None
-                      ) -> jax.Array:
+def denominator_after(total: jax.Array, factor: jax.Array, p: jax.Array, held: Room | None = None, *,
+                      axis: int = -1) -> jax.Array:
     """A row's denominator after a tile: the state's taken by `factor` (`carry_factor`) and the tile's
-    weights `p` added at the row's shift (`beyond_weights`)."""
-    return carry_factor(total, factor, held) + beyond_weights(p.sum(axis=-1), held)
+    weights `p`, their keys along `axis`, added at the row's shift (`beyond_weights`)."""
+    return carry_factor(total, factor, held) + beyond_weights(p.sum(axis=axis), held)
 
 
 def stepped(state: Partial, m: jax.Array, factor: jax.Array, p: jax.Array, products: tuple[jax.Array, ...],
@@ -820,7 +829,7 @@ def _safe(spec: Forward, m: jax.Array) -> jax.Array:
     return jnp.where(m == -jnp.inf, 0.0, m) if spec.guarded else m
 
 
-def peak(spec: Forward, m: jax.Array, s: jax.Array, products: jax.Array | None = None
+def peak(spec: Forward, m: jax.Array, s: jax.Array, products: jax.Array | None = None, *, axis: int = -1
          ) -> tuple[jax.Array, jax.Array]:
     """The running maximum after a tile's logits `s`, and `alpha`, the factor the state before it
     takes to the new maximum. In the accurate form the exponent `m - new` is compensated (its subtraction's
@@ -829,11 +838,12 @@ def peak(spec: Forward, m: jax.Array, s: jax.Array, products: jax.Array | None =
     do, an error some sqrt(keys) times the reference's where the maximum jumps far. Where the logits are
     `products` times `Forward.factor` (`logits_of`), the tile's maximum is their extreme times it, the
     same bits (fp32's rounding is monotonic: the largest of `fl(p c)` is `fl(max(p) c)` for a positive `c`,
-    `fl(min(p) c)` for a negative one), taken once a row."""
+    `fl(min(p) c)` for a negative one), taken once a row. The tile's keys are along `axis` (its rows where
+    they are its keys, `Coords.key_axis`)."""
     if products is None:
-        tile = s.max(axis=-1)
+        tile = s.max(axis=axis)
     else:
-        tile = (products.max(axis=-1) if spec.factor > 0 else products.min(axis=-1)) * spec.factor
+        tile = (products.max(axis=axis) if spec.factor > 0 else products.min(axis=axis)) * spec.factor
     return peaked(spec, m, jnp.maximum(m, tile))
 
 
@@ -862,14 +872,16 @@ def carried(spec: Forward, m: jax.Array, safe: jax.Array) -> jax.Array:
     return jnp.where(finite(corrected), corrected, spec.power(difference))
 
 
-def weights(spec: Forward, s: jax.Array, m: jax.Array) -> jax.Array:
+def weights(spec: Forward, s: jax.Array, m: jax.Array, coords: Coords | None = None) -> jax.Array:
     """A tile's unnormalized weights `[bq, bk]` under the running maximum `m`, fp32. The fold computes
     `exp2(s c - m)`, which a compiler contracts to `fma(s, c, -m)` (FlashAttention 2's by design): the
     largest logit's exponent is then its product's rounding, up to an ulp of the logit, so at logits near
     fp32's largest its weight is 0 or infinite, one of the fold's documented divergences. In the accurate
     form (`Forward.natural`) the largest logit weighs 1 exactly: raw logits subtract before they scale
-    (`Forward.raw`), and scaled ones (under a hook or an initial state) hold it to 1 by a select."""
-    peak = expand(_safe(spec, m), s)
+    (`Forward.raw`), and scaled ones (under a hook or an initial state) hold it to 1 by a select. The
+    maximum a query's broadcast over its keys as `coords` hold them (its rows by default)."""
+    safe = _safe(spec, m)
+    peak = expand(safe, s) if coords is None else coords.queries(safe, s)
     if spec.natural and not spec.raw:
         # The accurate form's scaled logits: the largest's weight held to 1 against the contraction.
         return spec.power(jnp.where(s < peak, s - peak, 0.0))
@@ -999,8 +1011,8 @@ def chunk_of(spec: Forward) -> int | None:
 def _softmax(spec: Forward, state: Partial, keys: Keys):
     """A tile's softmax: the running maximum, the factor the state's sums take, the weights for the
     product (the guarded walk's at the row's shift, `tile`), the tile's values and the guarded `Room`."""
-    m, alpha = peak(spec, state.m, keys.logits, keys.products)
-    p = weights(spec, keys.logits, m)
+    m, alpha = peak(spec, state.m, keys.logits, keys.products, axis=keys.coords.key_axis)
+    p = weights(spec, keys.logits, m, keys.coords)
     value = keys.load()
     largest = keys.largest if keys.largest is not None else functools.partial(magnitudes, value)
     bound = 1.0 if keys.coords.drop is None else keys.coords.drop.bound
@@ -1016,7 +1028,8 @@ def magnitudes(value: jax.Array) -> jax.Array:
 def plain_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
     """The state after a tile `keys`: its softmax and the product of its weights with its values, the
     mainloop's own running sums taking it where it holds them (`Keys.accumulate`, the state's `acc` in its
-    form)."""
+    form). A tile held keys first (`Coords.keys_first`, a decode program's `K Qᵀ`) takes its sums so: the
+    mainloop's, `[Dv, bq]`, its queries their columns, on the plain walk."""
     m, factor, p, value, held = _softmax(spec, state, keys)
     multiplier = drawn(keys.coords, keys.coords.q_pos, keys.coords.k_pos)
     if held is None and keys.accumulate is not None:
@@ -1024,8 +1037,10 @@ def plain_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
         # the undropped weights'.
         parts = (((narrow(p, value.dtype), None),) if multiplier is None
                  else weights_parts(p * multiplier, value.dtype))
-        acc = keys.accumulate(state.acc, lambda acc: carry_factor(acc, factor, None), parts, value)
-        return Partial(acc, m, denominator_after(state.total, factor, p))
+        # `carry_factor`'s plain factor, each query's broadcast over its sums as the mainloop holds them.
+        acc = keys.accumulate(state.acc, lambda acc: keys.coords.queries(factor, acc) * acc, parts, value)
+        return Partial(acc, m, denominator_after(state.total, factor, p, axis=keys.coords.key_axis))
+    assert not keys.coords.keys_first, "a tile held keys first takes the plain walk's mainloop sums"
     times = functools.partial(_times, keys.dot, value, multiplier=multiplier, chunk=chunk_of(spec))
     return stepped(state, m, factor, p, times(p), held, times)
 
@@ -1570,6 +1585,16 @@ def off_anchor(state: OffAnchor, exponentials: jax.Array, rest: jax.Array, own: 
                      state.own + taken(own))
 
 
+def nearer_centre(anchor: jax.Array, about_anchor: jax.Array, about_zero: jax.Array, key_index: jax.Array
+                  ) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """D's centre, the nearer to D of the anchor key's `dP` (`anchor`) and zero, each sum's difference from
+    it (`about_anchor`, `about_zero`): the centre, D less it, and the anchor key's index (`key_index`), -1
+    where zero is the nearer."""
+    anchored = jnp.abs(about_anchor) <= jnp.abs(about_zero)
+    return (jnp.where(anchored, anchor, 0.0), jnp.where(anchored, about_anchor, about_zero),
+            jnp.where(anchored, key_index, -1))
+
+
 def off_anchor_delta(state: OffAnchor, anchor_value: jax.Array, dout: jax.Array, state_total: jax.Array,
                      mean0: jax.Array, key_index: jax.Array,
                      shift: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
@@ -1592,9 +1617,7 @@ def off_anchor_delta(state: OffAnchor, anchor_value: jax.Array, dout: jax.Array,
     about_zero = jnp.sum((others + own * anchor_value) * cotangent, axis=-1) + state_weight * mean0
     about_anchor = (jnp.sum((others - others_total * anchor_value) * cotangent, axis=-1)
                     + state_weight * (mean0 - anchor))
-    anchored = jnp.abs(about_anchor) <= jnp.abs(about_zero)
-    return (jnp.where(anchored, anchor, 0.0), jnp.where(anchored, about_anchor, about_zero),
-            jnp.where(anchored, key_index, -1))
+    return nearer_centre(anchor, about_anchor, about_zero, key_index)
 
 
 def split_delta(others: jax.Array, own: jax.Array, others_total: jax.Array, total: jax.Array,
@@ -1620,9 +1643,7 @@ def split_delta(others: jax.Array, own: jax.Array, others_total: jax.Array, tota
     about_zero = jnp.sum(split_output(others, own, anchor_value) * cotangent, axis=-1)
     about_anchor = (jnp.sum((others - expand(others_total, anchor_value) * anchor_value) * cotangent, axis=-1)
                     - state_weight * anchor)
-    anchored = jnp.abs(about_anchor) <= jnp.abs(about_zero)
-    return (jnp.where(anchored, anchor, 0.0), jnp.where(anchored, about_anchor, about_zero),
-            jnp.where(anchored, key_index, -1))
+    return nearer_centre(anchor, about_anchor, about_zero, key_index)
 
 
 def split_mass(own: jax.Array, others_total: jax.Array, total: jax.Array, shift: jax.Array) -> jax.Array:
