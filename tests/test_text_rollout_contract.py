@@ -464,7 +464,7 @@ def test_a_synchronous_collection_draws_from_the_policy_at_the_runs_updates():
     model = decoder().with_dex(DifferentialExtension(((0, (0, 1)),), anneal_steps=10))
     objective = GRPOObjective(model, seq_len=7)
     params = objective.init(jax.random.key(0))
-    rollout = RolloutScheduler.sampled(objective, lambda text, record: 1.0, groups=1, max_new_tokens=3,
+    rollout = RolloutScheduler.sampled(objective, lambda text, record: 1.0, groups=2, max_new_tokens=3,
                                        sampling=Sampling(temperature=0))
     held = {updates: rollout(SimpleNamespace(variables=params, step=0, updates=updates), prompts(),
                              jax.random.key(1)) for updates in (0, 5)}
