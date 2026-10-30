@@ -671,12 +671,8 @@ def reading(holders: dict[type, set[str]]) -> Iterator[list[tuple[str, object]]]
         yield reads
 
 
-def saved_with(run: RunConfig, root: Path, name: str, settings: type, assigned: dict[str, str]):
-    """The `settings` the task of `run` saves after one step of `dew train` with each `path=value` of
-    `assigned` set, and the task loaded from them (`dew.pipeline`)."""
-    import dew
-    from dew.inference.tasks import SavedRun, saved_settings
-
+def trained_by_cli(run: RunConfig, root: Path, name: str, assigned: dict[str, str]) -> Path:
+    """The run directory one step of `dew train` writes for `run` with each `path=value` of `assigned`."""
     record, runs = root / f"{name}-record", root / "runs"
     run.save(str(record))
     given = {"trainer.name": name, "trainer.checkpoint_dir": str(runs), "trainer.steps": "1",
@@ -684,7 +680,17 @@ def saved_with(run: RunConfig, root: Path, name: str, settings: type, assigned: 
              "trainer.multi_host": "False", "trainer.compilation_cache_dir": "None", **assigned}
     assert main(["train", str(record / "run.json"),
                  *(part for path, value in given.items() for part in ("--set", f"{path}={value}"))]) == 0
-    return saved_settings(SavedRun.pinned(str(runs / name)).record, settings), dew.pipeline(str(runs / name))
+    return runs / name
+
+
+def saved_with(run: RunConfig, root: Path, name: str, settings: type, assigned: dict[str, str]):
+    """The `settings` the task of `run` saves after one step of `dew train` with each `path=value` of
+    `assigned` set (`trained_by_cli`), and the task loaded from them (`dew.pipeline`)."""
+    import dew
+    from dew.inference.tasks import SavedRun, saved_settings
+
+    directory = trained_by_cli(run, root, name, assigned)
+    return saved_settings(SavedRun.pinned(str(directory)).record, settings), dew.pipeline(str(directory))
 
 
 def same(first, second) -> bool:
@@ -869,3 +875,20 @@ def test_a_decision_run_over_a_release_saves_and_reads_the_task_the_release_decl
     assert {name: same(getattr(task, name), option) for name, option in options.items()} == dict.fromkeys(
         options, True)
     assert read_where_held(task, options) == []
+
+
+@pytest.mark.gpu(reason="a GPU's fast form multiplies float32 in TF32, which a CPU's never does")
+def test_the_attention_forms_a_run_names_reach_its_step(tmp_path):
+    """The attention forms a run's numerics name on the command line (`--set trainer.precision`,
+    `Numerics.forms`) reach its step through the default route: a step in the accurate forms (IEEE fp32
+    products) and one in the fast (a GPU's TF32), the model's compute float32 in both, score its batch
+    apart, so the route reads the run's forms, not its record alone (ledger 2350). A CPU multiplies fp32
+    one way in both, so only a GPU tells them apart."""
+    from process_support import logged_losses
+
+    from dew.nn.precision import Numerics
+
+    run = lm(tmp_path, drawn=False)
+    losses = {forms: logged_losses(trained_by_cli(run, tmp_path, forms, {
+        "trainer.precision": flag(Numerics(forms=forms), Numerics)})) for forms in ("fast", "accurate")}
+    assert losses["fast"] and losses["fast"] != losses["accurate"]
