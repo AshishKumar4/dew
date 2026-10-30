@@ -131,10 +131,19 @@ def test_a_field_no_step_reads_stays_on_the_host_across_processes(tmp_path):
         assert report["unused_shape"] == [MESH_DEVICES]
         assert report["sum"] == 3 * MESH_DEVICES
 
+TOKEN_POOL_WAIT = 2 * 147.0
+"""How long the token-budget pool's processes may take, from their spawn, before the test calls it hung: a
+hang guard, twice the slowest run measured, so a loaded container never reads as a hang. Its run is a spawn,
+a compile and three steps: 18-35 s on an idle fleet (6 runs across the gang), at most 67.7 s across the gang
+under one CPU hog a core (12 runs), and at most 146.9 s on one host under that load (24 runs, compile 15-39 s,
+steps 0.06-1.7 s) (2026-10-30; a 60 s bound failed CI's gang, its process 0 compiling 10.8 s and running its
+first step 12.0 s)."""
+
+
 def test_a_real_token_budget_agrees_across_processes_after_logging_ticks(tmp_path):
     corpus = token_corpus(tmp_path / "tokens", records=16, seq_len=4)
     reports = run_pool("token_budget", tmp_path / "pool", 2, devices=1, tokens=corpus.train, seq_len=4,
-                       timeout=60)
+                       timeout=TOKEN_POOL_WAIT)
     assert [report["step"] for report in reports] == [3, 3]
     assert [report["updates"] for report in reports] == [3, 3]
     assert [report["logged"] for report in reports] == [3, 0]
