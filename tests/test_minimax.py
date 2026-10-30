@@ -69,7 +69,8 @@ def test_a_model_transformers_computes_writes_back_as_minimax_and_reads_on_par(t
     PretrainedDecoder.from_model(model, variables).save(tmp_path)
     assert json.loads((tmp_path / 'config.json').read_text())['model_type'] == 'minimax'
     assert set(load_shards(tmp_path)) == set(load_shards(TINY))
-    case = Case('minimax', 'minimax-tiny')
+    case = Case('minimax', 'minimax-tiny',
+                derived=('slope_rate', 'query_decay', 'key_decay', 'diagonal_decay'))
 
     def draw(seed):
         return (np.random.default_rng(seed).integers(0, config['vocab_size'], ids.shape).astype(np.int32),)
