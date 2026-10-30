@@ -1185,6 +1185,8 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
         """Every arm's evidence on the draw at `seed`, the `at`th, its orders' worst rows the larger."""
         nonlocal names, widths
         inputs = draw(seed)
+        # The site's arms' mode, decided on its first draw's inputs before any arm runs, no draw of its own.
+        _ynn_decided(label, [dew_fn, *arms], inputs)
         truth, terms = truth_and_terms(inputs)
         if reference_seeds is None:
             their_inputs, their_truth, their_terms = inputs, truth, terms
@@ -1220,8 +1222,6 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
                     for first, later in zip(rows[at_arm], evidence, strict=True)]
         return rows
 
-    if len(seeds):
-        _ynn_decided(label, [dew_fn, *arms], draw(seeds[0]))
     for at, seed in enumerate(seeds):
         rows = rows_at(at, seed)
         mine.append([entry[0] for entry in rows[0]])
