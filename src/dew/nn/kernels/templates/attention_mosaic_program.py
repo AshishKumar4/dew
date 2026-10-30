@@ -79,8 +79,10 @@ class Tiles:
     two warpgroups take turns on the tensor cores, one's softmax under the other's products) and the
     instruction family whose bundle runs it (`family`, `bundle`). A fold's call rewalks a row past its reach
     in the natural form at its own key tile and consumers (`relaunch_k`, `relaunch_consumers`; the config's
-    where None, `relaunch`), which divide the config's so its padded blocks hold; `natural_form` marks the
-    natural form's tiles, whose register model differs (`MosaicForward.registers`)."""
+    where None, `relaunch`), which divide the config's so its padded blocks hold, and the value columns each
+    of its launches walks (`relaunch_columns`, a launch a block of them; all of them where None);
+    `natural_form` marks the natural form's tiles, whose register model differs (`MosaicForward.registers`),
+    and `columns` the value columns a launch at them walks."""
 
     block_q: int
     block_k: int
@@ -89,7 +91,9 @@ class Tiles:
     family: str = mosaic_sm90.WGMMA.name
     relaunch_k: int | None = None
     relaunch_consumers: int | None = None
+    relaunch_columns: int | None = None
     natural_form: bool = False
+    columns: int | None = None
 
     def __post_init__(self):
         if self.stages < 2:
@@ -100,7 +104,8 @@ class Tiles:
         """The natural form's rewalk's tiles (`algebra.walked_launches`)."""
         return dataclasses.replace(self, block_k=self.relaunch_k or self.block_k,
                                    consumers=self.relaunch_consumers or self.consumers, relaunch_k=None,
-                                   relaunch_consumers=None, natural_form=True)
+                                   relaunch_consumers=None, relaunch_columns=None, natural_form=True,
+                                   columns=self.relaunch_columns)
 
 
 @dataclasses.dataclass(frozen=True, order=True)
