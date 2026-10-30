@@ -866,20 +866,28 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
                     qk = {**(qk or {}), **depth_sown.get("qk", {})}
                 if indexer:
                     kls = {**(kls or {}), **depth_sown.get(INDEXER_COLLECTION, {})}
-            for depth, state in enumerate(states, start=1):
-                depth_weights = self._depth_weights(prepared, roles, losses.dtype, depth)
-                if rows is not None:
-                    depth_weights = jnp.where(rows[:, None] > 0, depth_weights, 0)
-                depth_total = None
-                if table is not None:
-                    depth_total, (depth_losses, _, _) = fused_head_loss(
-                        state, table, targets[:, depth:], depth_weights, tile=self.head_tile, predict=False)
-                else:
-                    depth_losses, _, _ = self.head_terms(self.model, params, state, targets[:, depth:],
-                                                         predict=False)
-                depth_scores.append((depth_losses, depth_weights, depth_total))
+            depth_scores = self._depth_scores(params, states, targets, prepared, roles, losses.dtype, table,
+                                              rows)
         return Scores(losses, weights, log_z, correct, hidden, kept, sown, depth_scores, qk, kls, total,
                       whole, inspected)
+
+    def _depth_scores(self, params, states, targets, prepared, roles, dtype, table, rows):
+        """Each prediction depth's `(losses, weights, total)` from its states, depth d's targets the row's
+        from d on, a filled row's (`rows`) at nothing, through the fused head where `table` is given."""
+        scores = []
+        for depth, state in enumerate(states, start=1):
+            depth_weights = self._depth_weights(prepared, roles, dtype, depth)
+            if rows is not None:
+                depth_weights = jnp.where(rows[:, None] > 0, depth_weights, 0)
+            depth_total = None
+            if table is not None:
+                depth_total, (depth_losses, _, _) = fused_head_loss(
+                    state, table, targets[:, depth:], depth_weights, tile=self.head_tile, predict=False)
+            else:
+                depth_losses, _, _ = self.head_terms(self.model, params, state, targets[:, depth:],
+                                                     predict=False)
+            scores.append((depth_losses, depth_weights, depth_total))
+        return scores
 
     def _head_scores(self, params, hidden, targets, weights, prepared, table, *, predict: bool,
                      z_loss: float | None, logits: bool):
