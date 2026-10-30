@@ -179,6 +179,11 @@ def boot() -> None:
         # A targeted run (ci.py's `targeted`) records nothing: the site, then the module, as `-m` would.
         run()
         return
+    # A recorded process is no followed child of one that started it (a test of these tools runs a task):
+    # one recorder each, so the `.pth` the site runs leaves this process alone, and the start that made it
+    # owes the starter a record it never writes, keeping no key there.
+    for name in (followed.CHILDREN, "DEW_EXECUTED_ROOT", "DEW_EXECUTED_FOLLOWER", "DEW_EXECUTED_SHARE"):
+        os.environ.pop(name, None)
     path = Path(os.environ[LOG])
     log = path.open("a", buffering=1)
     atexit.register(closing)
