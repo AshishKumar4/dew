@@ -277,14 +277,18 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
 
     def _predictions(self, params: Variables, batch: Batch, step: Step
                      ) -> tuple[Ratio, Aux[Effects], Prediction, Prediction]:
-        """Score the student in the step's mode and the frozen teacher in evaluation mode."""
+        """Score the student in the step's mode and the frozen teacher in evaluation mode, each with its
+        whole logits where the divergence reads every column (`full`), and none where it reads the
+        sampled ids' likelihoods alone (`selected`), each loss scoring its head as it trains."""
+        whole = self.divergence == "full"
         statistics, aux, student = self.student.predict(
             self.student_variables(params), batch, self._student_step(step), train=step.training,
-            layers=tuple(student_layer for _, student_layer in self.features))
+            layers=tuple(student_layer for _, student_layer in self.features), logits=whole)
         _, _, teacher = self.teacher.predict(
             params[TEACHER], batch, replace(step, ema=None), train=False,
-            layers=tuple(teacher_layer for teacher_layer, _ in self.features))
-        if student.logits.shape[-1] != teacher.logits.shape[-1]:
+            layers=tuple(teacher_layer for teacher_layer, _ in self.features), logits=whole)
+        if (student.logits is not None and teacher.logits is not None
+                and student.logits.shape[-1] != teacher.logits.shape[-1]):
             raise ValueError(
                 f"the KL compares the two distributions column by column, so the "
                 f"teacher and the student share a tokenizer and a vocabulary; the "
@@ -314,13 +318,13 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
         # states, is left out of every term, each made finite before any arithmetic so no NaN reaches a
         # gradient through the masked branch.
         states = teacher.hidden if self.features else ()
-        finite = jnp.all(jnp.isfinite(teacher.logits), axis=-1) & jnp.isfinite(teacher.losses)
-        for state in states:
+        finite = jnp.isfinite(teacher.losses)
+        for state in (*states, *(() if teacher.logits is None else (teacher.logits,))):
             finite = finite & jnp.all(jnp.isfinite(state), axis=-1)
-        held = jnp.where(finite[..., None], teacher.logits, 0)
         teacher_losses = jnp.where(finite, teacher.losses, 0)
         scored = weights * finite
-        if self.divergence == "full":
+        if teacher.logits is not None and student.logits is not None:
+            held = jnp.where(finite[..., None], teacher.logits, 0)
             divergence = categorical.kl_divergence(student.logits / temperature, held / temperature)
             soft = self.row_mean(divergence, batch, weights=scored).total
             estimate = soft
