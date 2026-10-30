@@ -481,24 +481,20 @@ def accepted(saved, name: str, value) -> bool:
 
 
 def reached_by(run: RunConfig, root: Path, settings: type, flags, queued: dict[str, list[object]]):
-    """Each option of `queued` set through `dew train` (`flags` writes its `--set`s) to its first
-    alternative, all in one run, or, where a reader refuses one, each alone at its next alternative: the
-    settings each saves, what its task holds and the value it was set to, for each that trains."""
-    try:
-        first = {name: values[0] for name, values in queued.items()}
-        saved, after = saved_with(run, root, "set", settings, flags(first))
-        return {name: (saved, after, value) for name, value in first.items()}
-    except ValueError:
-        reached = {}
-        for name, values in queued.items():
-            for index, value in enumerate(values):
-                try:
-                    reached[name] = (*saved_with(run, root, f"{name}{index}", settings, flags({name: value})),
-                                     value)
-                    break
-                except ValueError:  # A reader refused it, which names what refused it: the next.
-                    continue
-        return reached
+    """Each option of `queued` set alone through `dew train` (`flags` writes its `--set`s), so what its
+    task holds differs from the run that sets none by it alone: at its first alternative, or its next where
+    a reader refuses one. The settings each saves, what its task holds and the value it was set to, for each
+    that trains."""
+    reached = {}
+    for name, values in queued.items():
+        for index, value in enumerate(values):
+            try:
+                saved, after = saved_with(run, root, f"{name}{index}", settings, flags({name: value}))
+                reached[name] = (saved, after, value)
+                break
+            except ValueError:  # A reader refused it, which names what refused it: the next.
+                continue
+    return reached
 
 
 @pytest.mark.mesh(devices=8)
@@ -507,9 +503,9 @@ def test_each_option_a_saved_task_is_built_with_reaches_it_from_the_command_line
     """Every option a saved task is built with that its settings' types declare alternatives for
     (`alternatives`: a literal's values, an optional's, a flag's, a registered type's members, a
     dataclass's instances over its own) reaches the task `dew train` saves from its path (`reach`): beside
-    a run that sets none, a run sets each to an alternative its settings accept other than the one saved
-    (the next where a run refuses it, each alone, `reached_by`), and the task saves it and, loaded, holds
-    it where the first held another (`consumed`). An option with no path is row 1061's blockwise walk,
+    a run that sets none, a run sets each alone to an alternative its settings accept other than the one
+    saved (the next where a run refuses it, `reached_by`), and the task saves it and, loaded, holds it
+    where the first held another (`consumed`). An option with no path is row 1061's blockwise walk,
     unless its settings declare it derived from the run's data (`metadata={"derived": ...}`), which the
     run fills. Every settings type an objective declares alternatives in has a run here (`TASK_RUNS`)."""
     assert settings.__name__ in TASK_RUNS, f"no run here trains an objective whose task reads {settings}"
