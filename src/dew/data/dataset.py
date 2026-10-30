@@ -765,20 +765,21 @@ class Loader:
         (`examples`), with every row the objective makes of each, its last batch short where they end
         inside one, in whole updates of `window` steps, where a global order's plan counts them ahead
         (`order_records`); None for one read in its own order, as a pack that runs as rows arrive makes,
-        or one an objective expands after the bound, which no pass reads ahead to count: its run keeps
-        its progress in the examples its batches consume (`dew.batch.EXAMPLES_CONSUMED`). Refused where
-        the read is bounded to another count, in a pool, whose processes split the short batch the
-        examples end in unevenly, so each would end at a step of its own, and where the last steps would
-        make no whole update, so some examples would train nothing."""
+        or one an objective expands after the bound, which no pass reads ahead to count: its run keeps its
+        progress in the examples its batches consume (`dew.batch.EXAMPLES_CONSUMED`). Refused where the
+        read is bounded to another count; in a pool, whose processes each read records of their own, so
+        neither the bound's first examples nor the step the shares end at are one the pool agrees on yet;
+        and where the last steps would make no whole update, so some examples would train nothing."""
         if self.examples != examples:
             held = "not bounded" if self.examples is None else f"bounded to {self.examples}"
             raise ValueError(f"examples={examples} reads a training chain bounded to that many records "
                              f"before packing, and this loader's is {held}; give fit the Dataset chain, "
                              "which it bounds and compiles")
         if jax.process_count() > 1:
-            raise ValueError("examples end in a short batch, which a pool's processes would split unevenly "
-                             "and end at steps of their own; train them on one process or count the run "
-                             "in steps")
+            raise ValueError("a run bounded in examples trains on one process: a pool's processes each read "
+                             "records of their own, so the bound's first examples and the step their shares "
+                             "end at are not yet one the pool agrees on; count the run in steps or tokens, "
+                             "or train it on one process")
         if self.order_records is None:
             return None
         steps = self._steps(self.order_records, window)

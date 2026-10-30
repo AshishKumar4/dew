@@ -703,7 +703,8 @@ class Decide(SavedRunTask, InItsForm):
         `Images.joined` takes them (`seen_together`)."""
         assert self.processor is not None, "a row of images was laid out with the processor"
         encoded = [row for row, _ in rows]
-        inputs = DecisionInputs.collate(encoded, self.specials.pad, context_length=self.context_length)
+        inputs = DecisionInputs.collate(encoded, self.specials.pad, context_length=self.context_length,
+                                        attention=self.layout.attention)
         held = self.variables if variables is None else variables
         scores = np.asarray(self._forward(held, inputs, media=Images.joined(self.processor, rows)))
         return [scores[index, :len(row.questions)] for index, row in enumerate(encoded)]
@@ -789,7 +790,7 @@ class Decide(SavedRunTask, InItsForm):
         laid = [read.map(window) for window, _ in windows]
         batch = {name: np.stack([window[name] for window in laid]) for name in laid[0]}
         inputs = laid_out(batch, bounds.segments, spans_in_context=in_context,
-                          whole_blocks=whole_blocks_of(self.layout))
+                          whole_blocks=whole_blocks_of(self.layout), attention=self.layout.attention)
         padded = RowPlan(None, len(windows), shape.rows, 0, 1).pad(inputs)
         held = self.variables if variables is None else variables
         plan = RowPlan.over(mesh_of(held), shape.rows)
@@ -922,7 +923,8 @@ class Decide(SavedRunTask, InItsForm):
         segments = self.layout.bounds(self.tokenizer, self.specials, self.context_length).segments
         for batch in reader(DataPartition()):
             inputs = laid_out(batch, segments, spans_in_context=self.layout.spans_in_context,
-                              whole_blocks=whole_blocks_of(self.layout))
+                              whole_blocks=whole_blocks_of(self.layout),
+                              attention=self.layout.attention)
             logits = np.asarray(self._forward(self.variables, inputs))
             answered = (np.asarray(batch["scored"])
                         & (np.asarray(Objective.row_weights(batch, len(logits))) > 0)[:, None])
@@ -1349,11 +1351,13 @@ def _ordered(laid: Laid, logits: np.ndarray) -> np.ndarray:
 
 
 def laid_out(batch: Mapping[str, object], max_segments: int, *, spans_in_context: bool = False,
-             whole_blocks: bool = False) -> DecisionInputs:
+             whole_blocks: bool = False,
+             attention: tuple[tuple[tuple[int, ...], ...], int] | None = None) -> DecisionInputs:
     """The `DecisionInputs` of a batch of packed windows (`PackedRows`), each
     holding at most `max_segments` rows, the questions' spans in each row's context where
-    `spans_in_context` (`JointLayout.schema_in_context`), each row's block the whole row where
-    `whole_blocks` (`whole_blocks_of`)."""
+    `spans_in_context` (`JointLayout.spans_in_context`), each row's block the whole row where
+    `whole_blocks` (`whole_blocks_of`), its rows read in their streams as their layout's `attention`
+    says (`Layout.attention`)."""
     def array(name: str) -> jax.Array:
         return jnp.asarray(batch[name])
 
@@ -1367,7 +1371,9 @@ def laid_out(batch: Mapping[str, object], max_segments: int, *, spans_in_context
                           option_slots=given("option_slots"), slotted=given("slotted"),
                           context=given("context"), context_lengths=given("context_lengths"),
                           context_segments=given("context_segments"), question_rows=given("question_rows"),
-                          blocks=given("blocks"), max_segments=max_segments,
+                          blocks=given("blocks"), streams=given("streams"),
+                          reads=None if attention is None else attention[0],
+                          fragments=1 if attention is None else attention[1], max_segments=max_segments,
                           spans_in_context=spans_in_context, whole_blocks=whole_blocks and "blocks" in batch)
 
 
