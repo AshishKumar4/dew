@@ -1,6 +1,9 @@
 """What the policy-gradient suites share: a position-wise policy with the
-causal stack's scoring contract, and verl's token-mean reduction of the
-surrogate terms they check `dew.rl` against."""
+causal stack's scoring contract, verl's token-mean reduction of the
+surrogate terms they check `dew.rl` against, and an asynchronous scheduler's
+scripted source and publisher."""
+
+from concurrent.futures import Future
 
 import jax.numpy as jnp
 from flax import linen as nn
@@ -86,3 +89,34 @@ def prompt_inputs(records):
 def completion_length(text: str, record) -> float:
     """A reward of a completion's length, which varies within a group, so every group has an advantage."""
     return float(len(text))
+
+
+class ScriptedSource:
+    """An asynchronous scheduler's source (`dew.objectives.rl.scheduler.Asynchronous`) whose sessions
+    `drawn(task, sample, version)` draws at once, each submitted call's future done; a cancel cancels
+    them."""
+
+    def __init__(self, drawn):
+        self.drawn = drawn
+
+    def submit(self, task, samples, *, version, key):
+        futures = []
+        for sample in range(samples):
+            future = Future()
+            future.set_result(self.drawn(task, sample, version))
+            futures.append(future)
+        return futures
+
+    def cancel(self, futures):
+        for future in futures:
+            future.cancel()
+
+
+class Published:
+    """An asynchronous scheduler's publisher that serves no weights: it takes each version published as
+    loaded."""
+
+    version = 0
+
+    def load(self, variables, version):
+        self.version = version

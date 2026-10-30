@@ -36,6 +36,7 @@ from dew.objectives.base import (
     EXAMPLE_STREAM,
     Aux,
     Evaluated,
+    Objective,
     Ratio,
     Recorded,
     Step,
@@ -49,6 +50,21 @@ from dew.training.narrow import forward_variables, narrowed
 
 Loss = TypeVar("Loss", default=Ratio | jax.Array | float)
 Effects = TypeVar("Effects", default=None)
+
+
+@dataclasses.dataclass(frozen=True)
+class PassesProgress[L, E]:
+    """A custom training step (`Trainer(step=)`) that passes the run's progress to a model that reads
+    it (`dew.nn.progress`, `Progress(state.updates)`), as the objective's own loss does: `make`, its
+    factory, wrapped. A custom step not so declared refuses such a model, which it would otherwise
+    train at the run's end."""
+
+    make: Callable[[Objective[L, E], optax.GradientTransformation],
+                   Callable[[TrainState, Batch], tuple[TrainState, jax.Array, Aux]]]
+
+    def __call__(self, objective: Objective[L, E], optimizer: optax.GradientTransformation
+                 ) -> Callable[[TrainState, Batch], tuple[TrainState, jax.Array, Aux]]:
+        return self.make(objective, optimizer)
 
 
 @struct.dataclass
