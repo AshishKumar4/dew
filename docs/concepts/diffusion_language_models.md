@@ -2,7 +2,7 @@
 
 A diffusion language model writes a span of text by denoising it, all its positions at once, rather than one token after another. Dew trains masked diffusion models (MDLM's objective), runs LLaDA and Dream from their released weights, and runs and fine-tunes DiffusionGemma's block diffusion. The examples run on CPU at toy sizes and show how the calls work; [Language models](language_models.md) covers the autoregressive decoders, tokenizers and token files they share.
 
-The masked example below trains on the same small corpus as that page's, written in the token-store layout:
+The masked example below trains on the same small corpus as that page's, written in the token-store layout. The examples after it read the tiny checkpoints under `tests/fixtures/hf` in a Dew repository checkout; the models are too small to say anything about language quality.
 
 ```python
 import jax
@@ -155,7 +155,7 @@ print("Optimizer updates:", int(block_state.updates))
 Training DiffusionGemma from step 0 to 1: 1,858 parameters, on 1 × cpu, batch 2, float32
 step 1/1  loss 6.674  canvas_ce 3.131  encoder_ce 3.542  step_time_ms 93.39  samples_per_sec 21.42  accepted 100.0%
 Trained 1 steps in 0:00:15: first step after 15.06 s
-0.1% of the wall time in steps, final loss 6.802
+0.1% of the wall time in steps, final loss 6.674
 Optimizer updates: 1
 ```
 
