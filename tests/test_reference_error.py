@@ -469,7 +469,9 @@ def test_further_references_judge_one_dew_arm_each_by_its_own_check_once_a_draw(
     dew = arm(1.0, "mine", "dew")
     assert_as_exact(dew, arm(1.0, "theirs"), draw, "two references", seeds=16, truth_fn=truth,
                     also={"another": arm(1.0, "other")})
-    assert calls == {"dew": 16, "truth": 16}, calls
+    # Dew's arm once a draw, and once more on the first, the check that it depends on its inputs alone
+    # (`_of_its_inputs`).
+    assert calls == {"dew": 17, "truth": 16}, calls
     with pytest.raises(GateFailure) as failed:
         assert_as_exact(arm(3.0, "mine"), arm(3.0, "theirs"), draw, "one far", seeds=16, truth_fn=truth,
                         also={"another": arm(1.0, "other")})
@@ -1641,7 +1643,10 @@ def test_null_runs_judge_the_reference_against_itself_on_draws_no_other_run_take
         assert_as_exact(residue, exact, one_truth, "orbit", seeds=8, truth_fn=truth)
     [(verdict, _, _)] = null_runs(exact, one_truth, "orbit", seeds=8, runs=1, truth_fn=truth, dew_fn=residue)
     assert verdict == "over"
-    assert len(taken) == len(set(taken))
+    # Each run draws its first seed again, the check that its seed fixes it (`_of_its_seed`); its draws are
+    # otherwise its own.
+    drawn = [seed for at, seed in enumerate(taken) if not at or taken[at - 1] != seed]
+    assert len(drawn) == len(set(drawn)) and len(taken) - len(drawn) == 3
     assert null_rate_bound(0, 1400) == pytest.approx(1 - 0.001 ** (1 / 1400), rel=1e-9)
     assert null_rate_bound(0, 200) > 0.03
     assert null_rate_bound(3, 3) == 1.0
