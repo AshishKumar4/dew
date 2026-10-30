@@ -106,15 +106,17 @@ def logged(inspected: Mapping[str, SupportsFloat]) -> dict[str, float]:
 def inspected(trainer: Trainer, batch: Batch, *, steps: int | None = None) -> dict[str, float]:
     """The scalars `trainer`'s inspection logs, of one sampled update over `batch` from the state the
     trainer places, its checkpoints' latest where it has them, else its start: the view a live run
-    logs, for a loaded run on one batch offline. A trainer that accumulates steps its whole window,
-    `batch` each of its microbatches, and reports the step that commits. An `OptimConfig` is built over
+    logs, for a loaded run on one batch offline. A trainer that accumulates steps to the end of its window,
+    from where its state stands in it (a fresh window or a restored part of one), `batch` each of its
+    microbatches, and reports the step that commits. An `OptimConfig` is built over
     `steps`, the run's length, as `fit(steps=...)` builds it. The stepped state is discarded."""
     if trainer.inspection is None:
         raise ValueError("the trainer names no inspection (Trainer(inspection=...)) to report")
     trainer.scheduled(None if steps is None else steps // trainer.accumulation)
     state, _, _ = trainer.place()
-    step = trainer.compile(state, batch)
-    for _ in range(trainer.accumulation):
+    step, window = trainer.compile(state, batch), int(state.window_size)
+    # Each call steps one microbatch of the window (`TrainState.window_size`, split x accumulation).
+    for _ in range(window - int(state.microstep) % window):
         state, *_, committed = step(state, batch, sampled=True)
     assert committed is not None, "a trainer that inspects runs its own transaction, which commits"
     return logged(jax.device_get(committed.inspected))

@@ -41,7 +41,7 @@ from dew.objectives.diffusion.objective import DiffusionObjective
 from dew.rl.advantage import group_normalised
 from dew.rl.surrogate import clipped_surrogate_terms
 from dew.sampling.flow import FlowSDE, FlowTrajectory, GaussianTransition
-from dew.sampling.guidance import CFG, Walk
+from dew.sampling.guidance import APG, CFG, CFGPlusPlus, Walk
 from dew.sampling.solvers import Euler, Solver
 
 from .sessions import ADVANTAGES_KEY, OLD_LOG_PROBS_KEY
@@ -251,11 +251,11 @@ class FlowGRPOObjective(DiffusionObjective):
         inspected = None
         if step.watched is not None:
             # The policy's forward at each trajectory's first transition, as its walk calls it: over the
-            # conditional and unconditional halves where it is guided (`Denoiser.raw_both`), else the
-            # conditional alone (`Denoiser._raw`); every transition's runs these weights.
+            # conditional and unconditional halves where its guidance reads both (`Denoiser.raw_both`, on
+            # every step), else the conditional alone (`Denoiser.raw`, an autoguidance's main model too).
             policy, x, t = self._policy(variables, batch), latents[:, 0], times[:, 0]
             conditions = policy.conditions
-            if self.guidance is not None:
+            if isinstance(self.guidance, (CFG, CFGPlusPlus, APG)):
                 assert policy.unconditional is not None, "a guided policy holds its unconditional conditions"
                 conditions = jax.tree.map(lambda given, null: jnp.concatenate(
                     [given, jnp.broadcast_to(null, given.shape)], axis=0),
