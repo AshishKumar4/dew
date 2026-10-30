@@ -63,6 +63,7 @@ from dew.interop.pipeline_assembly import (
 )
 from dew.interop.processors import Processor, hosts
 from dew.interop.safetensors_io import MAX_SHARD_SIZE, LazyTensors, tensor_specs
+from dew.interop.saved_sources import released_run
 from dew.interop.streaming import WeightLayout
 from dew.interop.weights import AUTO, checkpoint_dtype, declared_dtype
 from dew.nn.autoencoders import AutoEncoder
@@ -384,7 +385,8 @@ class Pretrained:
              modeling_overrides: Mapping[str, object] | None = None,
              trust_remote_code: bool = False, text_only: bool = False,
              prediction_depths: int | None = None, dex: DifferentialExtension | None = None,
-             precision: Numerics | str | None = None, scan_layers: bool = False) -> Self:
+             precision: Numerics | str | None = None, scan_layers: bool = False,
+             step: int | str | None = None, ema: bool | None = None) -> Self:
         """Load a source as a native Flax model with explicit parameter trees, as the kind of source it is.
 
         `name_or_dir` is a local HF directory or a Hub model ID. Decoder, tower and
@@ -462,19 +464,12 @@ class Pretrained:
         (`AttentionMixer.bidirectional_blocks`, a call's `block_groups`) on any decoder or wrapper this
         loads natively, and "causal" turns a release's back off. A saved model states it in its own
         config. `dex` attaches DEX (`with_dex`) from key 0; `scan_layers` scans like layers (`Scanning`).
+        A saved Dew run loads as `dew export` writes it, at `step` with `ema` (`released_run`).
         """
+        name_or_dir = released_run(name_or_dir, step=step, ema=ema)
         selected = _selected_payload(fallback, gguf_file=gguf_file, single_file=single_file,
                                      dduf_file=dduf_file)
-        if on_host and (mesh is not None or layout is not None):
-            raise ValueError("on_host keeps the variables as host arrays, and mesh and layout place them; "
-                             "pass one")
-        streaming = mesh is not None or layout is not None
-        if streaming and not weights:
-            raise ValueError("a source loaded without its weights has nothing to place; the restore that "
-                             "fills it places it, so pass no mesh or layout")
-
-        def placed(variables: Variables) -> Variables:
-            return place(variables, mesh, layout) if streaming else variables
+        streaming, placed = _placement(mesh, layout, on_host=on_host, weights=weights)
 
         numerics, dtype, param_dtype = _load_settings(precision, dtype, param_dtype, prediction_depths)
         # The reference refuses a folder outside the source before anything is fetched.
@@ -979,13 +974,32 @@ def _no_language_model(name: str, kind: str) -> NoReturn:
     raise ValueError(f"{name} is a {kind}, which has no wrapper's language model for text_only to take")
 
 
+def _placement(mesh: MeshSpec | Mesh | None, layout: Layout | None, *, on_host: bool,
+               weights: bool) -> tuple[bool, Callable[[Variables], Variables]]:
+    """Whether a load places what it reads on `mesh` by `layout` (`Pretrained.load`), and its placement
+    of a tree, a leaf at a time (`place`), or none: refused beside `on_host`, which keeps the variables
+    as host arrays, or a load without its weights, whose restore places them."""
+    if on_host and (mesh is not None or layout is not None):
+        raise ValueError("on_host keeps the variables as host arrays, and mesh and layout place them; "
+                         "pass one")
+    streaming = mesh is not None or layout is not None
+    if streaming and not weights:
+        raise ValueError("a source loaded without its weights has nothing to place; the restore that "
+                         "fills it places it, so pass no mesh or layout")
+
+    def placed(variables: Variables) -> Variables:
+        return place(variables, mesh, layout) if streaming else variables
+
+    return streaming, placed
+
 def load_diffusion_source(checkpoint: str, *, dtype: str = "bfloat16", param_dtype: str = "float32",
                           revision: str | None = None, attention_impl: AttentionImpl = "auto",
                           size: tuple[int, ...] | None = None, variables: Variables | None = None,
                           mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
                           text: bool = True, text_only: bool = False,
                           prediction_depths: int | None = None,
-                          modeling_overrides: Mapping[str, object] | None = None) -> PretrainedPipeline:
+                          modeling_overrides: Mapping[str, object] | None = None,
+                          step: int | str | None = None, ema: bool | None = None) -> PretrainedPipeline:
     """A published diffusion pipeline, to train from its own weights.
 
     `size` is the (height, width) in pixels the pipeline runs at instead of
@@ -1009,8 +1023,10 @@ def load_diffusion_source(checkpoint: str, *, dtype: str = "bfloat16", param_dty
     `text_only`, `prediction_depths` and `modeling_overrides` read as
     `Pretrained.load`'s do: a pipeline has no wrapper's language model for
     `text_only` to take, its components hold no prediction depths, so any
-    count keeps them all, and none reads overrides, which are refused.
+    count keeps them all, and none reads overrides, which are refused. A saved Dew run loads as
+    `Pretrained.load` loads it, at its `step` and `ema` (`released_run`).
     """
+    checkpoint = str(released_run(checkpoint, step=step, ema=ema))
     _unread_overrides(modeling_overrides, "a diffusion pipeline")
     if text_only:
         _no_language_model(checkpoint, "diffusion pipeline")

@@ -406,6 +406,13 @@ class SourceOptions:
     source the run trains in its numerics' `dtypes.params` and one it keeps frozen as its checkpoint
     does (`RunConfig.source_keywords`). A frozen bfloat16 base beside a float32 head and adapter is
     `--source.param-dtype bfloat16`."""
+    step: int | str | None = None
+    """Where the run starts from a saved Dew run (`--pretrained <run directory>`), the checkpoint it reads:
+    a step, `latest`, `best`, `best:<metric>`, or None for the one the run's task loads by default
+    (`dew.interop.saved_sources.released_run`). The run records the step it read (`RunConfig.pinned`)."""
+    ema: bool | None = None
+    """Where the run starts from a saved Dew run, whether it reads that run's EMA weights; None its
+    task's own choice (`SavedRun.variables`)."""
 
     def overrides(self) -> Mapping[str, object] | None:
         """The `modeling_overrides` these options state, None where they state none."""
@@ -418,7 +425,8 @@ class SourceOptions:
         PyTorch pickles alone, whose shapes no header states, is read whole): a check that a base
         loads under a run's options, on a disk too small for its weights."""
         return {"text_only": self.text_only, "prediction_depths": self.prediction_depths,
-                "modeling_overrides": self.overrides(), "dex": self.dex, "scan_layers": self.scan_layers}
+                "modeling_overrides": self.overrides(), "dex": self.dex, "scan_layers": self.scan_layers,
+                "step": self.step, "ema": self.ema}
 
 
 class SourcePlacement(TypedDict, total=False):
@@ -439,6 +447,8 @@ class SourceBuild(TypedDict, total=False):
     modeling_overrides: Mapping[str, object] | None
     dex: DifferentialExtension | None
     scan_layers: bool
+    step: int | str | None
+    ema: bool | None
 
 
 class SourceOptionsKeywords(SourcePlacement, SourceBuild, total=False):
@@ -1590,6 +1600,19 @@ class RunConfig:
         its own sources beside it. Itself where nothing is left to pin."""
         lora = None if self.lora is None else self.lora.resolved()
         return self if lora == self.lora else dataclasses.replace(self, lora=lora)
+
+    def with_pinned_run(self, pretrained: str | None) -> Self:
+        """This run with the checkpoint it reads of the saved Dew run it starts from (`pretrained`, a
+        run's directory) pinned to the step its selection resolves to now (`SourceOptions.step`:
+        `best`, `best:<metric>` or its task's default), so its record names the run and the step it
+        read and a resume reads them again. Itself where it starts from no saved run, or names a step."""
+        from dew.inference.tasks import SavedRun
+        from dew.interop.saved_sources import is_saved_run
+
+        if pretrained is None or not is_saved_run(pretrained) or isinstance(self.source.step, int):
+            return self
+        step = SavedRun.pinned(pretrained, self.source.step).step
+        return dataclasses.replace(self, source=dataclasses.replace(self.source, step=step))
 
     def profile(self, directory: str | None = None, *, warmup: int = 20, steps: int = 10,
                 capture: ProfileWindow | None = None) -> ProfileReport | None:
