@@ -565,10 +565,10 @@ def _response_inputs(inputs: ModelInputs, width: int, mask_id: int) -> tuple[Mod
     valid = real_slots(fields, (batch, prompt))
     _, segments = token_layout(fields)
     given = laid_coordinates(fields)
-    positions = coordinates((batch, prompt), segments=segments, valid=valid,
-                            positions=token_positions(fields)).places()
-    laid = coordinates((batch, prompt), segments=segments, valid=valid, positions=positions,
-                       max_segments=None if given is None else given.max_segments)
+    built = coordinates((batch, prompt), segments=segments, valid=valid, positions=token_positions(fields),
+                        max_segments=None if given is None else given.max_segments)
+    # Each token at its place in its document (`Coordinates.places`), the one layout built once.
+    laid = replace(built, positions=built.places())
     rest = {name: value for name, value in fields.items()
             if name not in (*TOKEN_LAYOUT_FIELDS, COORDINATES_FIELD)}
     extended = replace(inputs, token_fields={**rest, COORDINATES_FIELD: laid}).extended(

@@ -35,7 +35,7 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from dew.batch import Coordinates, prefix_sum, real_places, valid_order
+from dew.batch import Coordinates, document_ranks, prefix_sum, real_places, valid_order
 from dew.nn.dense import Dense
 
 from .precision import at_least_fp32, float32_dot_general, rms_statistics
@@ -213,7 +213,8 @@ class EngramHashes(nn.Module):
     checkpoint derives from its tokenizer and a fresh model fills with each id
     modulo the compressed vocabulary. Each position hashes with the valid tokens
     before it, skipping padding and stopping at a row's start, a packed
-    document's (`positions`), a `media` position (engram.py:164-166) and, while
+    document's (its rank in its document, `Coordinates.starts`, whatever logical
+    positions the call gives), a `media` position (engram.py:164-166) and, while
     decoding, where the cached history runs out.
     """
 
@@ -228,9 +229,10 @@ class EngramHashes(nn.Module):
         compressed = jnp.take(table, tokens, axis=0)
         if media is not None:
             compressed = jnp.where(media, _DEAD, compressed)
-        # The call's layout (`Coordinates`): its real tokens and their places.
-        valid, positions = (None, None) if coordinates is None else (coordinates.valid, coordinates.positions)
-        valid = jnp.ones(tokens.shape, bool) if valid is None else jnp.asarray(valid, bool)
+        # The call's layout (`Coordinates`): its real tokens, and their places a decode's history reads.
+        laid = Coordinates() if coordinates is None else coordinates
+        valid = jnp.ones(tokens.shape, bool) if laid.valid is None else jnp.asarray(laid.valid, bool)
+        positions = laid.positions
         size = spec.max_ngram_size
         history = held = None
         allocated = False
@@ -241,8 +243,10 @@ class EngramHashes(nn.Module):
             if positions is None:
                 # The history knows where a row starts; a call's positions do not.
                 positions = jnp.full(tokens.shape, size, jnp.int32)
-        elif positions is None:
-            positions = real_places(valid)
+        else:
+            # Each token's rank in its document bounds its lookback, the packed documents' by their starts.
+            real = valid if laid.segments is None else valid & (jnp.asarray(laid.segments) != 0)
+            positions = real_places(valid) if laid.starts is None else document_ranks(real, laid.starts)
         ids, blocked, history = _lookback(compressed, valid, jnp.asarray(positions), size, history)
         if held is not None and allocated:
             held.value = history

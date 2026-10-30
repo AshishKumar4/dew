@@ -177,6 +177,24 @@ def test_the_engram_hash_is_the_releases_int64_arithmetic():
     np.testing.assert_array_equal(ids, np.concatenate(expected, -1) + offsets)
 
 
+def test_a_packed_documents_engram_lookback_stops_at_its_start_whatever_its_positions():
+    """Each token hashes with its own document's predecessors alone (`EngramHashes`, review of ledger
+    1122): a packed row's second document hashes as it does alone, though its logical positions run on
+    from 10, which a lookback bounded by positions read as a predecessor of the first document's."""
+    from dew.nn.engram import EngramHashes
+
+    spec = Engram(layer_ids=(0,), num_embeddings=(64,), max_ngram_size=3, vocab_size=16, n_heads=2,
+                  head_dim=4, compressed_vocab_size=16)
+    hashes = EngramHashes(spec, 16)
+    packed = jnp.asarray([[3, 5, 7, 9, 11]], jnp.int32)
+    laid = coordinates(packed.shape, segments=jnp.asarray([[1, 1, 2, 2, 2]]),
+                       positions=jnp.asarray([[0, 1, 10, 11, 12]]), max_segments=2)
+    variables = hashes.init(jax.random.key(0), packed, laid, decode=False)
+    together = hashes.apply(variables, packed, laid, decode=False)
+    alone = hashes.apply(variables, packed[:, 2:], None, decode=False)
+    np.testing.assert_array_equal(together[:, 2:], alone)
+
+
 @pytest.fixture(scope="module")
 def released():
     """The released bundle's config, its wrapper record, the model it builds
@@ -347,7 +365,9 @@ def test_an_uncached_draft_reads_a_padded_context_at_its_real_positions(source):
     """Uncached, DSpark drafts after a context whose padding `valid` marks, after it in one row and
     before it in the other, as after the context alone: its real positions keep their ranks, the
     padding is no key, and the block follows the last real position. The two drafts' logits, each
-    within FACTOR of the reference's rounding, lie within twice that of each other."""
+    within FACTOR of the reference's rounding, lie within twice that of each other. Padding a layout
+    marks as document 0 instead (`real_slots`) drafts as its validity does, bit for bit, and a context
+    of two documents a row is refused (review of ledger 1122)."""
     loaded, plain, reference = source
     ids, prompt, pad = jnp.asarray(reference["input_ids"]), int(reference["decode_prompt"]), 3
     _, sown = plain.apply(loaded.variables, ids[:, :prompt], mutable=["prediction_inputs"])
@@ -360,6 +380,13 @@ def test_an_uncached_draft_reads_a_padded_context_at_its_real_positions(source):
     _, drafted, _ = plain.apply(loaded.variables, padded, drawn, decode=False,
                                 coordinates=coordinates(valid.shape, valid=valid), method="draft")
     assert distance(drafted, alone) <= 2 * FACTOR * rounding("draft_logits")
+    documents = coordinates(valid.shape, segments=valid.astype(jnp.int32), max_segments=1)
+    _, by_documents, _ = plain.apply(loaded.variables, padded, drawn, decode=False, coordinates=documents,
+                                     method="draft")
+    np.testing.assert_array_equal(by_documents, drafted)
+    two = coordinates(valid.shape, segments=1 + jnp.broadcast_to(places >= prompt // 2, valid.shape))
+    with pytest.raises(ValueError):
+        plain.apply(loaded.variables, padded, drawn, decode=False, coordinates=two, method="draft")
 
 
 def test_speculative_decoding_drafts_with_dspark_and_emits_the_greedy_walk(source):

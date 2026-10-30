@@ -38,6 +38,7 @@ from dew.batch import (
     VALIDITY_FIELD,
     Variables,
     coordinates as laid_out,
+    flat_field,
     prefix_sum,
     real_slots,
     token_positions,
@@ -408,8 +409,8 @@ def prefill_state(model: nn.Module, params: Variables, inputs: ModelInputs, ops:
     if ops.record is not None:
         states = _context(model, params, updated)
     drawn = logits if selective else logits[rows, slot]
-    rotary = inputs.token_fields.get("rotary_positions")
-    logical = rotary if rotary is not None else token_positions(inputs.token_fields)
+    rotary = flat_field(inputs.token_fields, "rotary_positions")
+    logical = jnp.asarray(rotary) if rotary is not None else token_positions(inputs.token_fields)
     state = DecoderState(updated["cache"], drawn, next_position(inputs.token_fields, real),
                          None if states is None else states[rows, slot])
     if rebuild_position(model) is not None:

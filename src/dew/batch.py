@@ -368,9 +368,7 @@ def field_coordinates(fields: Mapping[str, jax.Array | np.ndarray | Coordinates]
     """A row's token fields' layout as one `Coordinates`, the one conversion of a field dict's flat
     layout (`token_coordinates`): their `Coordinates` as they are, else built from their flat
     `segment_ids`, `attention_mask` and `positions`, None where they carry neither; both refused."""
-    laid = fields.get(COORDINATES_FIELD)
-    return token_coordinates(shape, laid if isinstance(laid, Coordinates) else None,
-                             segments=flat_field(fields, SEGMENTS_FIELD),
+    return token_coordinates(shape, laid_coordinates(fields), segments=flat_field(fields, SEGMENTS_FIELD),
                              valid=flat_field(fields, VALIDITY_FIELD),
                              positions=flat_field(fields, POSITIONS_FIELD))
 
@@ -435,10 +433,13 @@ def flat_field(fields: Mapping[str, jax.Array | np.ndarray | Coordinates], name:
 def laid_coordinates(fields: Mapping[str, jax.Array | np.ndarray | Coordinates]) -> Coordinates | None:
     """The `Coordinates` a row's token fields carry, or None where they carry flat layout fields or
     none; fields carrying both are refused, as a call giving both is (`token_coordinates`), since one
-    would silently win over the other (ledger 1122)."""
+    would silently win over the other, and so is anything but `Coordinates` under their key (ledger
+    1122)."""
     laid = fields.get(COORDINATES_FIELD)
-    if not isinstance(laid, Coordinates):
+    if laid is None:
         return None
+    if not isinstance(laid, Coordinates):
+        raise TypeError(f"token field {COORDINATES_FIELD!r} holds Coordinates, not {type(laid).__name__}")
     flat = [name for name in TOKEN_LAYOUT_FIELDS if fields.get(name) is not None]
     if flat:
         raise ValueError(f"token fields are laid out by their coordinates or by their fields, not both: "

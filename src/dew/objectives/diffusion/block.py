@@ -30,6 +30,8 @@ from dew.batch import (
     Batch,
     Variables,
     coordinates,
+    flat_field,
+    laid_coordinates,
     real_places,
     shifted_span,
     thaw,
@@ -377,7 +379,7 @@ class BlockDiffusionObjective(HeadedObjective[BlockSFTStatistics]):
         if full_valid.shape != tokens.shape:
             raise ValueError("attention_mask must align with the full sequence")
         canvas_mask &= full_valid[:, self.prompt_length:]
-        image_indices = fields.get("image_indices")
+        image_indices = flat_field(fields, "image_indices")
         text_slots = None if image_indices is None else image_indices < 0
         if text_slots is not None:
             # Zero-weight targets still reach embeddings and integer-label CE.
@@ -447,20 +449,24 @@ class BlockDiffusionObjective(HeadedObjective[BlockSFTStatistics]):
         prepared, tokens, response, validity, full_valid, canvas_mask, text_slots = self._row(batch)
         noisy, selected, use_sc = self._corrupted(response, canvas_mask, step)
         fields = prepared.token_fields
+        groups = flat_field(fields, "image_groups")
         positions, encoder_mask, encoder_keys, decoder_mask, decoder_keys = _cache_geometry(
             full_valid, selected, self.prompt_length, self.canvas_size,
-            token_positions(fields), fields.get("image_groups"))
+            token_positions(fields), None if groups is None else jnp.asarray(groups))
         model = self.training_model
         rngs = model_rngs(step.key, training=train)
         observed = ["qk"] if step.qk_stats else []
         cache = model.apply(params, tokens.shape[0], method=model.init_cache, mutable=["cache"])[1]["cache"]
-        # The encoder's row laid out once (`Coordinates`): its documents as given, every slot of the full
-        # row real and placed as the cache's geometry places it.
+        # The encoder's row laid out once (`Coordinates`): its documents as given, at the bound its layout
+        # declares (`max_segments`), every slot of the full row real and placed as the cache's geometry
+        # places it.
         _, segments = token_layout(fields)
+        given = laid_coordinates(fields)
         encoder_kwargs = {name: value for name, value in prepared.kwargs().items()
                           if name != COORDINATES_FIELD}
-        encoder_kwargs[COORDINATES_FIELD] = coordinates(tokens.shape[:2], segments=segments, valid=full_valid,
-                                                        positions=positions)
+        encoder_kwargs[COORDINATES_FIELD] = coordinates(
+            tokens.shape[:2], segments=segments, valid=full_valid, positions=positions,
+            max_segments=None if given is None else given.max_segments)
         encoder_states, mutated = model.apply(
             {**params, "cache": cache}, tokens, **encoder_kwargs,
             attention_pairwise_mask=encoder_mask, attention_key_positions=encoder_keys,

@@ -12,7 +12,7 @@ import numpy as np
 from flax import linen as nn, struct
 
 from dew._coordination import agreed, from_every_process
-from dew.batch import Batch, Coordinates, Variables, coordinates, part
+from dew.batch import Batch, Coordinates, Variables, coordinates, part, token_coordinates
 from dew.distributed.batches import shard_batch
 from dew.inference.tasks import Processor, TextGeneration, TextSettings
 from dew.nn.dense import Dense
@@ -64,8 +64,9 @@ class ValueHead(nn.Module):
     """Projects a decoder's hidden states to one value per position, at least float32: a bf16 or
     float32 backbone's in float32, a float64 twin's in float64.
 
-    Packed rows pass their chains' `segment_ids` and `positions`, so no
-    hidden state sees another chain.
+    Packed rows pass their chains' layout, as `coordinates` or as their
+    `segment_ids` and `positions`, which the call converts once
+    (`token_coordinates`), so no hidden state sees another chain.
     """
 
     backbone: HiddenStates
@@ -77,9 +78,12 @@ class ValueHead(nn.Module):
         return projected_parts(params, {"backbone": self.backbone}, updated=updated)
 
     @nn.compact
-    def __call__(self, tokens: jax.Array, *, coordinates: Coordinates | None = None) -> jax.Array:
-        """Each token's value, the backbone's states over `tokens` laid out by their `coordinates`."""
-        hidden = self.backbone.hidden_states(tokens, train=False, coordinates=coordinates)
+    def __call__(self, tokens: jax.Array, *, segment_ids: jax.Array | None = None,
+                 positions: jax.Array | None = None, coordinates: Coordinates | None = None) -> jax.Array:
+        """Each token's value, the backbone's states over `tokens` laid out by their `coordinates`, or
+        by their flat `segment_ids` and `positions` converted once (both refused, `token_coordinates`)."""
+        laid = token_coordinates(tokens.shape[:2], coordinates, segments=segment_ids, positions=positions)
+        hidden = self.backbone.hidden_states(tokens, train=False, coordinates=laid)
         return Dense(1, dtype=at_least_fp32(hidden.dtype), name="value")(hidden)[..., 0]
 
 
@@ -120,9 +124,9 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
     `value_coefficient` weights verl's half-squared, clipped value error, and
     `value_clip` is that error's clip range.
 
-    `critic` reads packed token rows with their `segment_ids` and
-    `positions` and returns `[B, T]` values; `ValueHead` gives a decoder that
-    interface.
+    `critic` reads packed token rows laid out by their `coordinates`
+    (`dew.batch.Coordinates`) and returns `[B, T]` values; `ValueHead` gives a
+    decoder that interface, and takes flat `segment_ids` and `positions` too.
     """
 
     # The loss is a policy-gradient surrogate plus the critic's, so only the

@@ -327,3 +327,15 @@ def test_a_traced_packed_batch_holds_its_documents_apart_from_its_tokens():
     np.testing.assert_array_equal(sliced_firsts, [[0, 3, 6], [0, 5, 6]])
     # The first row rotated left a slot: its second document from slot 2.
     np.testing.assert_array_equal(rotated_firsts, [[0, 2, 8], [0, 5, 8]])
+
+
+def test_a_field_dict_refuses_anything_but_coordinates_under_their_key():
+    """The reserved `coordinates` token field holds `Coordinates` alone: an array there is refused where
+    the layout is read, never dropped for the flat fields beside it (review of ledger 1122)."""
+    from dew.batch import COORDINATES_FIELD, field_coordinates, laid_coordinates
+
+    held = {COORDINATES_FIELD: np.zeros((1, 4), np.int32), "attention_mask": np.ones((1, 4), bool)}
+    with pytest.raises(TypeError):
+        laid_coordinates(held)
+    with pytest.raises(TypeError):
+        field_coordinates(held, (1, 4))

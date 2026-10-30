@@ -959,8 +959,7 @@ class Exposing(Protocol):
     """A decoder that hands back its hidden states beside its logits, which a
     drafting strategy seeds from; without them a model decodes but cannot draft."""
 
-    def states_and_logits(self, tokens: jax.Array, **kwargs: jax.Array | bool | None
-                          ) -> tuple[jax.Array, jax.Array]: ...
+    def states_and_logits(self, tokens: jax.Array, **kwargs: ModelKwarg) -> tuple[jax.Array, jax.Array]: ...
 
 
 @runtime_checkable
@@ -968,7 +967,7 @@ class Selective(Protocol):
     """A decoder that scores one position per row instead of them all, so its
     prefill runs the head only on the slot the first draw reads."""
 
-    def states_and_logits_at(self, tokens: jax.Array, slots: jax.Array, **kwargs: jax.Array | bool | None
+    def states_and_logits_at(self, tokens: jax.Array, slots: jax.Array, **kwargs: ModelKwarg
                              ) -> tuple[jax.Array, jax.Array]: ...
 
 

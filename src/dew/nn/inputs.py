@@ -28,6 +28,7 @@ from dew.batch import (
     document_ranks,
     document_starts,
     field_coordinates,
+    flat_field,
     laid_coordinates,
     padded_rows,
     prefix_max,
@@ -179,7 +180,7 @@ class ModelInputs:
     """
 
     tokens: jax.Array
-    token_fields: Mapping[str, jax.Array] = struct.field(default_factory=dict)
+    token_fields: Mapping[str, jax.Array | Coordinates] = struct.field(default_factory=dict)
     conditioning: Mapping[str, jax.Array] = struct.field(default_factory=dict)
 
     @classmethod
@@ -797,16 +798,16 @@ def unruled_fields(fields: Mapping[str, object],
     return sorted(set(fields) - set(RESPONSE_FIELDS) - set(rules or ()) - {COORDINATES_FIELD})
 
 
-def next_position(fields: Mapping[str, jax.Array], valid: jax.Array) -> jax.Array | None:
+def next_position(fields: Mapping[str, jax.Array | Coordinates], valid: jax.Array) -> jax.Array | None:
     """Each row's logical position after its last real token `[B]`, its
     response's first by `RESPONSE_FIELDS`: one past the largest coordinate a
     real token holds on any axis of its `rotary_positions`, else one past its
     last real token's position (`token_positions`), which a document reset may
     have lowered below an earlier one. None where the request gives neither,
     and a cache's cursor counts each row on. `valid` is its real slots (`real_slots`)."""
-    rotary = fields.get("rotary_positions")
+    rotary = flat_field(fields, "rotary_positions")
     if rotary is not None:
-        return _response_coordinates(rotary, valid, 1).reshape(rotary.shape[0], -1)[:, 0]
+        return _response_coordinates(jnp.asarray(rotary), valid, 1).reshape(rotary.shape[0], -1)[:, 0]
     positions = token_positions(fields)
     return None if positions is None else _response_positions(positions, valid, 1)[:, 0]
 

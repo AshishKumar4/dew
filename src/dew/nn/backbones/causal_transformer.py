@@ -37,11 +37,13 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew._records import JSON
 from dew.batch import (
+    COORDINATES_FIELD,
     Coordinates,
     Variables,
     coordinates as build_coordinates,
     merge,
     prefix_sum,
+    real_slots,
     shifted_span,
     token_coordinates,
 )
@@ -1450,7 +1452,9 @@ class CausalTransformer(nn.Module):
 
         `context` `[B, M, targets * D]` comes from `draft_context` (the stream
         means the target layers sow), its `coordinates` mark its real
-        positions (`valid`, None for every one), and `tokens` `[B]` are the
+        positions (`real_slots`: its validity less a padding document, every
+        one where None; one document a row, as a draft continues one), and
+        `tokens` `[B]` are the
         tokens drawn after it. Returns
         `(ids [B, block + 1], logits [B, block, vocab], confidence [B, block])`.
         Tokens are chosen by `choose(index, logits)`, or greedily when `choose`
@@ -1465,7 +1469,7 @@ class CausalTransformer(nn.Module):
         assert hc is not None
         return dspark_draft(self.dspark_stages, self.dspark, self.stream_embeddings, self._logits,
                             hc, context, tokens, decode=decode,
-                            valid=None if coordinates is None else coordinates.valid, choose=choose)
+                            valid=self._draft_context_validity(context, coordinates), choose=choose)
 
     def reach_drafter(self, tokens, dtype):
         """Create the DSpark drafter's parameters, which no forward pass reaches.
@@ -1476,6 +1480,17 @@ class CausalTransformer(nn.Module):
         assert self.dspark is not None
         width = len(self.dspark.target_layers) * self.emb_features
         self.draft(jnp.zeros((tokens.shape[0], 1, width), dtype), tokens[:, -1], decode=False)
+
+    @nn.nowrap
+    def _draft_context_validity(self, context, coordinates: Coordinates | None) -> jax.Array | None:
+        """The draft context's real positions `[B, M]` (`draft`): its layout's real slots, a padding
+        document's left out (`real_slots`), None where every one is; a context of several documents a
+        row is refused, since a draft continues one."""
+        if coordinates is None:
+            return None
+        if coordinates.segments is not None and coordinates.max_segments > 1:
+            raise ValueError("a draft continues one document a row, and this context holds several")
+        return real_slots({COORDINATES_FIELD: coordinates}, tuple(context.shape[:2]))
 
     def draft_context(self, prediction_inputs: Mapping) -> jax.Array:
         """Return DSpark's context `[B, S, targets * D]` from `prediction_inputs`.
