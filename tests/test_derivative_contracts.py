@@ -693,15 +693,18 @@ root of each."""
 @pytest.mark.parametrize("edge", [edge for edge in LINEAR_EDGES if edge != "near the largest"])
 def test_a_frozen_fp8_product_holds_every_order(edge):
     """A frozen FP8 kernel's product (`quantization.frozen_fp8_product`, its tangent the decoded kernel's):
-    every order in the input finite wherever float64 is a normal float32 and the product with the decoded
-    kernel as written is, the kernel a unit draw and the input at `LINEAR_EDGES`, so the product itself nears
+    every order in the input finite wherever float64 is a normal float32 and the product with the kernel its
+    codes decode to (each row's codes times its scale) is, the kernel a unit draw and the input at
+    `LINEAR_EDGES`, so the product itself nears
     float32's ends. Near the largest its input's scale overflows before the kernel's applies (ledger 2715),
     that row's head adds the edge."""
-    from dew.quantization import FROZEN_FP8, frozen_fp8_kernel, frozen_fp8_leaves
+    from dew.quantization import FROZEN_FP8, frozen_fp8_leaves
 
     (kernel,) = normal_draw(475, (16, 8))
     leaves = frozen_fp8_leaves(kernel)
-    decoded = frozen_fp8_kernel(leaves)
+    # The forward's [out, in] E4M3 codes times each row's scale, decoded here apart from the product's own.
+    decoded = (jnp.asarray(leaves["fp8_forward"]).astype(jnp.float32)
+               * jnp.asarray(leaves["fp8_forward_scale"]).astype(jnp.float32)).T
 
     def frozen(x):
         from dew.quantization import frozen_fp8_product
@@ -718,28 +721,45 @@ def test_a_frozen_fp8_product_holds_every_order(edge):
                     plain_fn=plain)
 
 
-@pytest.mark.parametrize("edge", EDGES)
-def test_a_quantized_convolution_holds_every_order_it_takes(edge):
-    """A quantized convolution under Qwix's quantized training (`quantization`'s grouped convolution, a
-    custom VJP whose backward is the float convolution's transpose at the dequantized operands): every order
-    it takes finite wherever float64 is a normal float32 and the float convolution is; it takes no forward
-    derivative of itself, nor a second (ledger 2658), every forward derivative of its gradient running."""
+def int8_round_trip(values, kept: int):
+    """`values` quantized to int8 and back as Qwix's absmax calibration has it: one scale per index of axis
+    `kept` (an activation's example, a kernel's output feature), the absolute maximum over the rest over
+    127.5, the codes rounded and clipped to int8's."""
+    over = tuple(axis for axis in range(values.ndim) if axis != kept)
+    scale = jnp.max(jnp.abs(values), axis=over, keepdims=True) / 127.5
+    scale = jnp.where(scale > 0, scale, 1)
+    return jnp.clip(jnp.round(values / scale), -128, 127) * scale
+
+
+@pytest.mark.parametrize(("groups", "edge"), [case for case in itertools.product((1, 2), EDGES)
+                                              if case != (2, "near the largest")])
+def test_a_quantized_convolution_holds_every_order_it_takes(groups, edge):
+    """A quantized convolution under Qwix's quantized training, one group and two (`quantization`'s grouped
+    convolution, a custom VJP whose backward is the float convolution's transpose at the dequantized
+    operands): every order it takes finite wherever float64 is a normal float32 and the convolution of the
+    operands quantized to int8 and back (each example's scale, each output feature's) is, its derivatives
+    taken straight through the rounding at the dequantized operands, as the seam declares; it takes no
+    forward derivative of itself, nor a second (ledger 2658), every forward derivative of its gradient
+    running. Two groups' input gradient is NaN near the largest (ledger 2717), that row's head adds it."""
     from dew.nn.conv import Conv
     from dew.quantization import Quantization
 
-    conv = Conv(features=8, kernel_size=(3, 3), padding="SAME", use_bias=False)
+    conv = Conv(features=8, kernel_size=(3, 3), padding="SAME", use_bias=False, feature_group_count=groups)
     quantized = Quantization().apply(conv)
 
     def convolved(x, kernel):
         return quantized.apply({"params": {"kernel": kernel}}, x)
 
     def plain(x, kernel):
-        return conv.clone(dtype=x.dtype).apply({"params": {"kernel": kernel}}, x)
+        held = (x + jax.lax.stop_gradient(int8_round_trip(x, 0) - x),
+                kernel + jax.lax.stop_gradient(int8_round_trip(kernel, 3) - kernel))
+        return jax.lax.conv_general_dilated(*held, (1, 1), "SAME", dimension_numbers=("NHWC", "HWIO", "NHWC"),
+                                            feature_group_count=groups)
 
-    primals = normal_draw(1134, (1, 6, 6, 4), (3, 3, 4, 8), scale=EDGES[edge])
-    direction = normal_draw(1135, (1, 6, 6, 4), (3, 3, 4, 8), scale=EDGES[edge])
+    primals = normal_draw(1134, (1, 6, 6, 4), (3, 3, 4 // groups, 8), scale=EDGES[edge])
+    direction = normal_draw(1135, (1, 6, 6, 4), (3, 3, 4 // groups, 8), scale=EDGES[edge])
     (cotangent,) = normal_draw(1136, (1, 6, 6, 8))
-    assert_contract(convolved, primals, direction, cotangent, f"a quantized convolution {edge}",
+    assert_contract(convolved, primals, direction, cotangent, f"a quantized convolution of {groups} {edge}",
                     truth_fn=plain, plain_fn=plain, without=OWN_FORWARD_ORDERS)
 
 
