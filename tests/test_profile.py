@@ -4,6 +4,8 @@ import gzip
 import json
 import os
 import shutil
+import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -101,6 +103,27 @@ def test_a_stop_that_does_not_wait_exports_its_capture_in_a_process_of_its_own(t
     work().block_until_ready()
     waited.stop()
     assert manifest(*captures(tmp_path / "waited"))["exported_by"] == os.getpid()
+
+
+def test_a_program_read_from_stdin_exports_beside_itself_and_runs_once(tmp_path, native_reports):
+    """A program that stops its capture without waiting runs once, its export in an interpreter of the
+    exporter alone (`dew.telemetry.export`), never the program again: one read from stdin, which no
+    process could run a second time, writes its manifest, and its own lines are written once."""
+    script = f"""
+import jax.numpy as jnp
+import dew
+from dew.telemetry import profile
+with open({str(tmp_path / "runs")!r}, "a") as runs:
+    runs.write("ran\\n")
+profiler = dew.Profiler({str(tmp_path / "capture")!r}).start()
+(jnp.ones((32, 32)) @ jnp.ones((32, 32))).block_until_ready()
+profiler.stop(wait=False)
+profile.exported()
+"""
+    subprocess.run([sys.executable, "-"], input=script, text=True, check=True)
+    assert (tmp_path / "runs").read_text() == "ran\n"
+    record = manifest(*captures(tmp_path / "capture"))
+    assert record["export_status"] == "completed"
 
 
 def test_body_failure_keeps_trace_and_releases_for_next_capture(tmp_path, native_reports):

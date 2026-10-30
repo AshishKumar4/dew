@@ -454,9 +454,11 @@ class Profiler:
             return
         # A fresh interpreter of the exporter alone, never the caller's program again: the conversion reads
         # and writes on its own, and holds no lock the caller's steps take (the converter's native calls
-        # may hold the GIL throughout).
+        # may hold the GIL throughout). It reads files alone, so its JAX opens no accelerator, whose
+        # memory the run holds.
         _exporting[capture] = subprocess.Popen(
-            [sys.executable, "-m", "dew.telemetry.export", str(capture), json.dumps(metadata)])
+            [sys.executable, "-m", "dew.telemetry.export", str(capture), json.dumps(metadata)],
+            env={**os.environ, "JAX_PLATFORMS": "cpu"})
 
     def __enter__(self) -> Self:
         return self.start()
