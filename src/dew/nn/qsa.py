@@ -37,7 +37,7 @@ from dew.nn.dense import Dense
 
 from .norms import RMSNorm
 from .precision import float32_dot_general
-from .sparse_selection import index_agreements, top_k_selection
+from .sparse_selection import index_agreements, top_k_keys
 
 
 @dataclasses.dataclass(frozen=True)
@@ -125,10 +125,7 @@ def qsa_selection(spec: QSA, query, keys, visible, turn, indexer: QSAIndexer):
     # A block is a candidate for a query that sees its last key, whole.
     complete = (count == ratio)[:, None, :] & jnp.take_along_axis(
         visible, jnp.broadcast_to(jnp.maximum(last_slot, 0)[:, None, :], (batch, length, total)), axis=-1)
-    kept = top_k_selection(scores, complete, spec.blocks)  # [B, S, blocks]
-    chosen = jnp.zeros((batch, length, total + 1), bool).at[
-        jnp.arange(batch)[:, None, None], jnp.arange(length)[None, :, None], jnp.where(kept >= 0, kept, total)
-    ].set(True)[..., :total]
+    chosen = top_k_keys(scores, complete, spec.blocks)  # [B, S, G]: whether each query keeps each block
     key_block = jnp.broadcast_to(jnp.minimum(block, total - 1)[:, None, :], (batch, length, total))
     in_complete = jnp.take_along_axis(complete, key_block, axis=-1) & (block < total)[:, None, :]
     picked = jnp.take_along_axis(chosen, key_block, axis=-1)

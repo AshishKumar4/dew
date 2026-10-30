@@ -4,12 +4,13 @@ Vision translation reads these without importing the interop package, whose
 public entry point imports the vision classes itself.
 """
 
-QWEN35_TYPES = ('qwen3_5', 'qwen3_5_moe')
+QWEN35_TYPES = ('qwen3_5', 'qwen3_5_moe', 'qwen4_exp')
+"""The wrappers of Qwen 3.5's kind: its tower, merger, packed media, M-RoPE and root prediction layer.
+Qwen4-Exp's are Qwen 3.5's, class for class (modeling_qwen4_exp.py:1660-1964), its processor
+Qwen3VLProcessor."""
 GEMMA4_TYPES = ('gemma4', 'gemma4_unified')
 QWEN35_TEXT_TYPES = tuple(f'{name}_text' for name in QWEN35_TYPES)
-# Qwen4-Exp's tower is Qwen 3.5's, class for class (modeling_qwen4_exp.py:1660-1964).
-_QWEN35_VISION_TYPES = (*QWEN35_TYPES, *(f'{name}_vision' for name in QWEN35_TYPES), 'qwen4_exp',
-                        'qwen4_exp_vision')
+_QWEN35_VISION_TYPES = (*QWEN35_TYPES, *(f'{name}_vision' for name in QWEN35_TYPES))
 
 SANDWICH_NORMS = {
     'input_layernorm': 'input_layernorm',

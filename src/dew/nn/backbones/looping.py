@@ -8,8 +8,10 @@ names, and the stack holds them as each pass stores them (`PassStack`). Under `s
 pass starts from the cache as the step entered it and only the last pass's writes stay
 (`SharedPassView`): the passes before it carry the cache through the scan, each reading the step's
 entering cache in place of the one the pass before left, and the carry is dropped; the last runs after
-the scan, as the first does. The passes before the last `backprop_steps` pass no gradient back, a cut
-each scanned pass's input takes where its index says so.
+the scan, as the first does. What a pass sows, a router's or attention's statistics or captured
+intermediates, extends the step's sows pass by pass, as the unrolled passes' did. The passes before
+the last `backprop_steps` pass no gradient back, a cut each scanned pass's input takes where its index
+says so.
 """
 
 from __future__ import annotations
@@ -41,25 +43,32 @@ def _preamble(model, loop: Loop, x, stop, injected):
 
 @dataclasses.dataclass
 class PassStack:
-    """What later passes write (`WRITTEN`), stacked on a leading pass axis under the block's own layer
-    names as a scan over `views`' passes reads it, and each pass's back where it stores it. A pass's
-    view (`PassView`) names its stored layers; with `appended`, under `shared_cache`, every pass's
-    entries are the block's own, which a pass's sows extend in pass order, and the cache is the scan's
-    carry, which comes back dropped. Names of no layer stay outside. Flax calls `inside` before
-    `outside` within one trace, which holding the tree relies on."""
+    """What later passes write, stacked on a leading pass axis as a scan over `views`' passes reads it,
+    and each pass's back where the unrolled passes put it. A collection a stack writes (`WRITTEN`) holds
+    a pass's layer entries under the names its view (`PassView`) stores them by; under `shared` every
+    pass's entries are the block's own, its sows extending them in pass order, and the cache is the
+    scan's carry, which comes back dropped. What a pass sows elsewhere (`appended`: captured
+    intermediates, a name of no layer) extends the tuples it sows into at each leaf, pass by pass, as
+    the unrolled passes' sows did. Flax calls `inside` before `outside` within one trace, which holding
+    the tree relies on."""
 
     views: Sequence[PassView]
-    appended: bool = False
+    shared: bool = False
+    appended: frozenset[str] = frozenset()
     held: dict = dataclasses.field(default_factory=dict)
+
+    def _per_pass(self, collection: str) -> bool:
+        """Whether `collection` keeps each pass's layer entries apart, under the pass's own names."""
+        return collection in WRITTEN and not self.shared
 
     def inside(self, variables: Mapping[str, Mapping]) -> dict:
         self.held = {collection: dict(tree) for collection, tree in variables.items()}
         out = {}
         for collection, tree in self.held.items():
-            if self.appended and collection == 'cache':
+            if self.shared and collection == 'cache':
                 # The scan's carry, which each pass replaces with the step's entering cache.
                 out[collection] = tree
-            elif not self.appended:
+            elif self._per_pass(collection):
                 passes = [view.inside({collection: tree})[collection] for view in self.views]
                 named = [{name: value for name, value in entries.items() if _is_layer(name)}
                          for entries in passes]
@@ -67,25 +76,38 @@ class PassStack:
                                                       *(entries[name] for entries in named))
                                    for name in named[0]}
             else:
+                # Each pass sows afresh; `outside` appends its sows to the step's.
                 out[collection] = {}
         return out
 
     def outside(self, variables: Mapping[str, Mapping]) -> dict:
         out = {collection: dict(tree) for collection, tree in self.held.items()}
         for collection, tree in variables.items():
-            if self.appended and collection == 'cache':
+            if self.shared and collection == 'cache':
                 continue
-            target = out.setdefault(collection, {})
             for index, view in enumerate(self.views):
                 entries = {name: jax.tree.map(lambda leaf, index=index: leaf[index], value)
                            for name, value in tree.items()}
-                if self.appended:
-                    for name, value in entries.items():
-                        target[name] = (*target.get(name, ()), *value)
-                else:
-                    target.update({view._moved(name, view.offset - view.first): value
-                                   for name, value in entries.items()})
+                if self._per_pass(collection):
+                    out.setdefault(collection, {}).update(
+                        {view._moved(name, view.offset - view.first): value
+                         for name, value in entries.items() if _is_layer(name)})
+                    entries = {name: value for name, value in entries.items() if not _is_layer(name)}
+                out[collection] = _appended(out.get(collection, {}), entries)
         return out
+
+
+def _appended(held, sown):
+    """`held` with `sown` appended at each leaf: a sown tuple extends the held one, a mapping merges
+    key by key, and any other value replaces the held one, as a sow's reduction does."""
+    if isinstance(sown, Mapping):
+        merged = dict(held or {})
+        for name, value in sown.items():
+            merged[name] = _appended(merged.get(name), value)
+        return merged
+    if isinstance(sown, tuple):
+        return (*(held or ()), *sown)
+    return sown
 
 
 def _is_layer(name: str) -> bool:
@@ -135,7 +157,12 @@ def run_loop(model, x, *, train: bool, decode: bool, **inputs):
     elif len(scanned) > 1:
         views = [PassView(model.num_layers + (step - 1) * (end - first), first, end - first)
                  for step in scanned]
-        view = PassStack(views, appended=shared is not None)
+        # The collections a pass sows into beside those a stack writes: captured intermediates, among
+        # others, which an unrolled pass appended to.
+        appended = frozenset(collection for collection in model.variables
+                             if model.is_mutable_collection(collection)) - {*WRITTEN, 'params', 'constants'}
+        view = PassStack(views, shared=shared is not None, appended=appended)
+        mapped = (*WRITTEN, *sorted(appended))
         # Each shared pass reads the step's entering cache, else, where the step allocates it, the
         # cache the first pass just allocated, whose later writes the scan's dropped carry takes.
         entering = None if shared is None else (shared.entering if shared.entering is not None
@@ -151,12 +178,12 @@ def run_loop(model, x, *, train: bool, decode: bool, **inputs):
                                        mutable=True)
             return reading(module, x, **inputs), logit
 
-        stacked = tuple(collection for collection in WRITTEN if shared is None or collection != 'cache')
-        scan = nn.scan(later, variable_axes=dict.fromkeys(stacked, 0),
+        stacked = tuple(collection for collection in mapped if shared is None or collection != 'cache')
+        scan = nn.scan(later, variable_axes={stacked: 0},
                        variable_carry='cache' if shared is not None else False,
-                       variable_broadcast=DenyList(WRITTEN), split_rngs={'params': False, 'dropout': True},
+                       variable_broadcast=DenyList(mapped), split_rngs={'params': False, 'dropout': True},
                        length=len(scanned))
-        run = nn.map_variables(scan, mapped_collections=WRITTEN, trans_in_fn=view.inside,
+        run = nn.map_variables(scan, mapped_collections=mapped, trans_in_fn=view.inside,
                                trans_out_fn=view.outside, mutable=True)
         stops = jnp.asarray([step == cut for step in scanned])
         x, logits = run(model, x, stops)

@@ -80,6 +80,27 @@ def test_a_scanned_minimax_decodes_as_its_plain_loop():
                     'scanned MiniMax decode', seeds=SCAN_SEEDS, truth_fn=truth)
 
 
+def test_a_record_saved_with_a_kind_for_each_lightning_layer_computes_as_it_did():
+    """A run saved before the stack handed each lightning layer its place recorded a kind for each,
+    `linear_attention_{index}` stating its `layer_idx` (ledger 2564); its record still builds and
+    computes minimax-tiny's logits bit for bit as the record of one kind does."""
+    loaded = load()
+    record = translate_config(released('minimax-tiny'))
+    lightning = record['kinds']['linear_attention']
+    legacy = dict(record)
+    legacy['layer_types'] = tuple(kind if kind != 'linear_attention' else f'linear_attention_{index}'
+                                  for index, kind in enumerate(record['layer_types']))
+    others = {name: kind for name, kind in record['kinds'].items() if name != 'linear_attention'}
+    fields = lightning['mixer']['fields']
+    legacy['kinds'] = {**others, **{
+        name: {**lightning, 'mixer': {**lightning['mixer'], 'fields': {**fields, 'layer_idx': index}}}
+        for index, name in enumerate(legacy['layer_types']) if name.startswith('linear_attention_')}}
+    model = from_record(CausalTransformer, {**legacy, 'attention_impl': 'reference'})
+    ids = np.load(TINY / 'input_ids.npy')
+    np.testing.assert_array_equal(model.apply(loaded.variables, ids),
+                                  loaded.model.apply(loaded.variables, ids))
+
+
 def test_a_minimax_model_writes_no_checkpoint_another_runtime_would_misread(tmp_path):
     """No runtime outside Dew computes MiniMax as its release does (transformers' MiniMax turns every
     dimension and scales the lightning rates otherwise; the release's code does not import under

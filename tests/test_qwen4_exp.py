@@ -9,6 +9,7 @@ from pathlib import Path
 import jax
 import numpy as np
 from interop_support import assert_reloads, fixture_ids, token_draw, transformers_arms, transformers_model
+from one_draw import assert_as_exact_as_the_reference
 from reference_error import assert_as_exact
 
 from dew.interop import Pretrained, PretrainedDecoder
@@ -70,11 +71,27 @@ WRAPPER_SEEDS = 8
 """The wrapper's declared draws of ids against transformers' (check 1), sized as `EXPORT_SEEDS`."""
 
 
+MTP = {'mtp.fc_embedding.weight': (8, 16), 'mtp.layers.0.self_attn.q_proj.weight': (16, 8)}
+"""Two of the root names the release stores its prediction layer under (its
+model.safetensors.index.json), which transformers' class leaves out, at shapes of no consequence."""
+
+
+def with_mtp(directory: Path) -> None:
+    """`directory`'s single checkpoint file with the release's root prediction-layer names beside it."""
+    from safetensors.numpy import load_file, save_file
+
+    stored = load_file(directory / 'model.safetensors')
+    drawn = {name: np.random.default_rng(len(name)).normal(size=shape).astype(np.float32)
+             for name, shape in MTP.items()}
+    save_file({**stored, **drawn}, directory / 'model.safetensors', metadata={'format': 'pt'})
+
+
 def test_the_release_wrapper_loads_whole_and_text_only_as_its_language_model(tmp_path):
     """Qwen3.8-Flash-Next's wrapper (Qwen4ExpForConditionalGeneration at the release's config, its text half
-    qwen4-exp-tiny's config and its tower one block of Qwen 3.5's, transformers' own draw) loads whole,
-    its tower Qwen 3.5's, and computes transformers' text logits on par from its float64 twin (check 1);
-    its language model alone (`text_only`) computes them bit for bit as the whole does."""
+    qwen4-exp-tiny's config and its tower one block of Qwen 3.5's, transformers' own draw, the release's
+    root prediction-layer names beside it) loads whole, its tower Qwen 3.5's, and computes transformers'
+    text logits on par from its float64 twin (check 1); its language model alone (`text_only`) computes
+    them bit for bit as the whole does; and the whole writes back and reloads as itself."""
     import torch
     from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpConfig
     from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpForConditionalGeneration
@@ -89,13 +106,61 @@ def test_the_release_wrapper_loads_whole_and_text_only_as_its_language_model(tmp
     torch.manual_seed(0)
     Qwen4ExpForConditionalGeneration(Qwen4ExpConfig(text_config=text, vision_config=vision, **special)).to(
         torch.float32).save_pretrained(tmp_path)
-    whole = Pretrained.load(tmp_path, dtype='float32', attention_impl='reference')
-    alone = Pretrained.load(tmp_path, dtype='float32', attention_impl='reference', text_only=True)
     reference, truth = transformers_arms(
         transformers_model(tmp_path), lambda model, ids: model(input_ids=ids, use_cache=False).logits)
+    with_mtp(tmp_path)
+    whole = Pretrained.load(tmp_path, dtype='float32', attention_impl='reference')
+    alone = Pretrained.load(tmp_path, dtype='float32', attention_impl='reference', text_only=True)
     draw = token_draw(0x4E, 240, (2, 12))
     assert_as_exact(lambda ids: whole.model.apply(whole.variables, ids), reference, draw,
                     'Qwen4-Exp wrapper logits', seeds=WRAPPER_SEEDS, truth_fn=truth)
     (ids,) = draw(0)
     np.testing.assert_array_equal(alone.model.apply(alone.variables, ids),
                                   whole.model.apply(whole.variables, ids))
+    whole.save(tmp_path / 'saved')
+    assert_reloads(whole, tmp_path / 'saved', ids)
+
+
+def test_a_loaded_checkpoint_of_a_sharded_table_writes_back_and_reloads(tmp_path):
+    """qwen4-exp-tiny, its n-gram table in four row shards and the release's root prediction-layer names
+    beside it, loads as without them and writes back (its table one shard beside its buffers) to a
+    checkpoint that reloads as the model it was."""
+    import shutil
+
+    source = Path(shutil.copytree(TINY, tmp_path / 'source'))
+    with_mtp(source)
+    loaded = Pretrained.load(source, dtype='float32', attention_impl='reference')
+    plain = Pretrained.load(TINY, dtype='float32', attention_impl='reference')
+    ids = np.load(TINY / 'input_ids.npy')
+    np.testing.assert_array_equal(loaded.model.apply(loaded.variables, ids),
+                                  plain.model.apply(plain.variables, ids))
+    loaded.save(tmp_path / 'saved')
+    assert_reloads(loaded, tmp_path / 'saved', ids)
+
+
+NATIVE = ROOT / 'qwen4-exp-native-tiny'
+
+
+def test_images_and_a_video_read_through_the_processor_as_transformers_reads_them():
+    """qwen4-exp-native-tiny (tools/qwen4_exp_reference.py --native) through its own Qwen3-VL processor:
+    two prompts over three images and one over a video of two frames, their tower Qwen 3.5's, their
+    positions M-RoPE's over the media's grids, and the n-gram lookups hashing the placeholders the
+    media fill, compute the conditional reference's logits as exactly as its fp32 run does, from its
+    float64 run (check 1 against the recording)."""
+    from tool_support import load as tool
+
+    loaded = Pretrained.load(NATIVE, dtype='float32', attention_impl='reference')
+    assert loaded.processor is not None
+    recorded = np.load(NATIVE / 'reference.npz')
+    prompts = json.loads((NATIVE / 'prompts.json').read_text())
+    images = recorded['images']
+    inputs = loaded.processor(prompts['images'], images=[[images[0]], [images[1], images[2]]])
+    valid = np.asarray(inputs.token_fields['attention_mask']).astype(bool)
+    logits = np.asarray(loaded.model.apply(loaded.variables, inputs.tokens, **inputs.kwargs()))
+    assert_as_exact_as_the_reference(logits[valid], recorded['logits'][valid],
+                                     recorded['logits_f64'][valid], 'Qwen4-Exp image logits')
+    clip = loaded.processor([prompts['video']], videos=[recorded['video']],
+                            video_metadata=[tool('qwen4_exp_reference').VIDEO_METADATA])
+    logits = np.asarray(loaded.model.apply(loaded.variables, clip.tokens, **clip.kwargs()))
+    assert_as_exact_as_the_reference(logits, recorded['video_logits'], recorded['video_logits_f64'],
+                                     'Qwen4-Exp video logits')

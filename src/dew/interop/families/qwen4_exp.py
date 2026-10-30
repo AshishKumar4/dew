@@ -267,7 +267,9 @@ QWEN4_EXP_TEXT = DecoderFamily(
     prepare=_qwen4_exp_prepare,
     constants=_qwen4_exp_constants,
     packed=FUSED_EXPERTS,
-    preserve_source_layout=True,
+    # A load joins the table's row shards and drops its buffers, so a save writes through the family's
+    # own writer (`_qwen4_exp_export_weights`) rather than back over the source's names.
+    preserve_source_layout=False,
     padding_idx=True,
     # Qwen4ExpTextConfig's defaults for the fields its decoder reads.
     defaults={'max_position_embeddings': 32768, 'num_experts_per_tok': 10, 'rms_norm_eps': 1e-6},

@@ -364,6 +364,12 @@ class CausalSelfAttention(nn.Module):
             if self.ctx.kv_shared or not self.ctx.causal or self.ctx.kv_cache != KVCache():
                 raise ValueError("QSA's indexer keeps its keys beside a causal layer's own dense cache: "
                                  "no KV sharing, bidirectional reading or other cache layout")
+            # Its blocks pool each key once, where every query that sees it counts it at one rank
+            # (`qsa_selection`): a query sees its document's real keys from the first on.
+            if self.ctx.sliding_window or self.ctx.attention_chunk or self._group_fields():
+                raise ValueError("QSA pools each key into one block for every query that sees it, so a "
+                                 "query sees its document's keys from the first: no sliding window, "
+                                 "chunks or groups read whole")
             self.indexer = QSAIndexer(self.qsa, norm_eps=self.ctx.norm_eps, dtype=self.ctx.dtype,
                                       precision=self.ctx.precision, name='indexer')
         if self.exclusive_self_attention and self.ctx.kv_shared:
@@ -1526,6 +1532,13 @@ class AttentionMixer(MixerBase):
 
 
 
+class QSASelfAttention(CausalSelfAttention):
+    """`CausalSelfAttention` under QSA (`qsa`), which reads no pairwise mask or key runs: either may hide a
+    key from one query that sees it from another, where QSA pools each key once (`qsa_selection`)."""
+
+    reads: ClassVar[frozenset[str]] = CausalSelfAttention.reads - {"pairwise_mask", "key_runs"}
+
+
 @dataclasses.dataclass(frozen=True)
 class QSAAttentionMixer(AttentionMixer):
     """Qwen4-Exp's `qwen_sparse_attention` layer: the attention reading the keys its QSA indexer picks
@@ -1544,4 +1557,4 @@ class QSAAttentionMixer(AttentionMixer):
         kind = {field.name: getattr(self, field.name) for field in dataclasses.fields(self)
                 if field.name not in own}
         qsa = QSA(**{name: getattr(self, name) for name in own})
-        return functools.partial(CausalSelfAttention, ctx=ctx, qsa=qsa, **kind)
+        return functools.partial(QSASelfAttention, ctx=ctx, qsa=qsa, **kind)

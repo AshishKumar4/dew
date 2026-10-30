@@ -111,9 +111,89 @@ def write_release() -> None:
     print(f"{directory}: {sorted(path.name for path in directory.iterdir())}")
 
 
+NATIVE_TEXT = {**TINY, 'vocab_size': 256, 'eos_token_id': 1, 'bos_token_id': 2, 'pad_token_id': 0,
+               'ple_layer_ids': [1, 3]}
+"""qwen4-exp-native-tiny's text half: qwen4-exp-tiny's over the Qwen3-VL processor's 256 ids
+(`multimodal_reference.qwen3_vl_processor`), its n-gram lookups at the first and third layers."""
+NATIVE_VISION = {'model_type': 'qwen4_exp_vision', 'hidden_size': 32, 'intermediate_size': 48, 'depth': 1,
+                 'num_heads': 4, 'patch_size': 8, 'temporal_patch_size': 2, 'spatial_merge_size': 2,
+                 'num_position_embeddings': 64, 'out_hidden_size': 64}
+"""Its tower, Qwen 3.5's at the processor's patch geometry."""
+
+
+VIDEO_METADATA = {'total_num_frames': 2, 'fps': 2.0, 'width': 32, 'height': 32, 'frames_indices': [0, 1]}
+"""The video's own metadata, which its prompt's timestamps read (Qwen3VLProcessor)."""
+
+
+def widened(inputs: dict) -> dict:
+    """A model call's tensors with its floating ones in float64, for the float64 twin."""
+    return {name: value.double() if value.is_floating_point() else value for name, value in inputs.items()}
+
+
+def write_native() -> None:
+    """qwen4-exp-native-tiny: a random Qwen4ExpForConditionalGeneration (`NATIVE_TEXT`, `NATIVE_VISION`)
+    beside its Qwen3-VL processor, with two prompts' fp32 and float64 logits over three images, each row
+    run alone (`multimodal_reference._row_slices`), and one prompt's over a video of two frames; the
+    n-gram lookups hash the placeholders the media fill (`ple_input_ids`)."""
+    import torch
+    import transformers
+    from multimodal_reference import _row_slices, qwen3_vl_processor
+    from torch_precision import float64, float64_twin
+    from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpConfig
+    from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpForConditionalGeneration
+
+    directory = FIXTURES / 'qwen4-exp-native-tiny'
+    directory.mkdir(parents=True, exist_ok=True)
+    config = Qwen4ExpConfig(text_config=NATIVE_TEXT, vision_config=NATIVE_VISION, image_token_id=200,
+                            video_token_id=201, vision_start_token_id=202, vision_end_token_id=203,
+                            tie_word_embeddings=False)
+    # Eager attention and experts: the float64 twin runs no grouped matmul, which takes no float64.
+    config._attn_implementation = 'eager'
+    config._experts_implementation = 'eager'
+    torch.manual_seed(0)
+    model = Qwen4ExpForConditionalGeneration(config).float().eval()
+    scatter_weights(model, 1234)
+    model.save_pretrained(directory, safe_serialization=True)
+    truth = float64_twin(model)
+    processor, _ = qwen3_vl_processor(directory)
+    generator = np.random.default_rng(1735)
+    images = generator.integers(0, 256, (3, 32, 32, 3), dtype=np.uint8)
+    video = generator.integers(0, 256, (2, 32, 32, 3), dtype=np.uint8)
+    prompts = ['token7 <start_of_image><image_soft_token><end_of_image> token9',
+               'token5 <start_of_image><image_soft_token><end_of_image> token8 '
+               '<start_of_image><image_soft_token><end_of_image> token6']
+    encoded = dict(processor(text=prompts, images=[[images[0]], [images[1], images[2]]],
+                             return_tensors='pt', padding=True))
+    valid = encoded['attention_mask'].bool()
+    arrays = {name: np.zeros((*encoded['input_ids'].shape, 256), dtype)
+              for name, dtype in (('logits', np.float32), ('logits_f64', np.float64))}
+    for row, single in enumerate(_row_slices(encoded, model)):
+        with torch.no_grad():
+            arrays['logits'][row, valid[row].numpy()] = model(**single, use_cache=False).logits[0].numpy()
+        with float64(), torch.no_grad():
+            wide = truth(**widened(single), use_cache=False).logits[0]
+            arrays['logits_f64'][row, valid[row].numpy()] = wide
+    video_prompt = 'token4 <start_of_image><video><end_of_image> token6'
+    clip = dict(processor(text=[video_prompt], videos=[video], return_tensors='pt',
+                          video_metadata=[VIDEO_METADATA],
+                          videos_kwargs={'do_resize': False, 'do_sample_frames': False}))
+    with torch.no_grad():
+        arrays['video_logits'] = model(**clip, use_cache=False).logits.numpy()
+    with float64(), torch.no_grad():
+        arrays['video_logits_f64'] = truth(**widened(clip), use_cache=False).logits.numpy()
+    np.savez(directory / 'reference.npz', images=images, video=video, **arrays)
+    (directory / 'prompts.json').write_text(json.dumps({'images': prompts, 'video': video_prompt}) + '\n')
+    (directory / 'meta.json').write_text(json.dumps({
+        'transformers': transformers.__version__, 'torch': torch.__version__, 'attention': 'eager',
+        'command': 'PYTHONPATH=src:tools python tools/qwen4_exp_reference.py --native'}, indent=2) + '\n')
+    print(f"{directory}: {sorted(path.name for path in directory.iterdir())}")
+
+
 if __name__ == '__main__':
     if sys.argv[1:] == ['--release']:
         write_release()
+    elif sys.argv[1:] == ['--native']:
+        write_native()
     else:
         write_tiny()
         write_release()
