@@ -22,7 +22,8 @@ from jax.typing import ArrayLike
 
 from dew.diffusion.process import Denoiser, Process
 from dew.diffusion.schedules import RectifiedFlow, expand
-from dew.nn.precision import at_least_fp32
+from dew.nn.kernels.generation import linear_map
+from dew.nn.precision import at_least_fp32, divided
 
 from .guidance import Guidance, Walk
 from .solvers.common import _check_endpoint_domain
@@ -189,6 +190,17 @@ def _quotient(numerator: jax.Array, power: jax.Array, divisor: jax.Array) -> Spl
     return top / bottom, top_power + power - bottom_power
 
 
+def _sum(left: Split, right: Split) -> jax.Array:
+    """`left + right`, two values given as quotients and powers (`_quotient`), the plain sum of the two
+    restored values, both shifted first as `_shift` asks for the larger and their sum, and restored
+    once."""
+    (left_value, left_power), (right_value, right_power) = left, right
+    top = jnp.maximum(jnp.where(left_value != 0, left_power + _exponent(left_value), FLOOR),
+                      jnp.where(right_value != 0, right_power + _exponent(right_value), FLOOR))
+    shift = _shift(top, 1)
+    return _scaled(_scaled(left_value, left_power - shift) + _scaled(right_value, right_power - shift), shift)
+
+
 def _divergence_parts(mean: jax.Array, reference: jax.Array, variance: jax.Array):
     """The parts of `|mean - reference|**2 / (2 variance)` (`_divergence`): the differences and their
     shifts (`_differences`), and the KL as a quotient and its power (`_quotient`), the half in its power."""
@@ -211,43 +223,49 @@ def _divergence(mean: jax.Array, reference: jax.Array, variance: jax.Array) -> j
 
 @jax.custom_jvp
 def _half_mahalanobis(value: jax.Array, mean: jax.Array, variance: jax.Array) -> jax.Array:
-    """`|value - mean|**2 / (2 variance)` per row, the density's quadratic term, as the KL forms it
+    """`|value - mean|**2 / (2 variance)` per row, the density's quadratic term and the KL's
     (`_divergence`): the plain float32 formula bit for bit wherever it stays in range, and finite
     wherever the term is (a residual of 2**64 under a variance of 2**126; a value of 2**127 beside a
-    mean of -2**127). Its derivatives are the plain formula's at every order (`_half_mahalanobis_jvp`)."""
+    mean of -2**127). Its derivative is one linear map (`linear_map`) whose forward mode is
+    `_directional`'s and whose reverse mode is `_pullback`'s, each formed from operands scaled to
+    range, so a tangent or a cotangent finite in float64 is finite here however far its terms pass
+    float32's range; a higher order differentiates the two through XLA."""
     return _divergence(value, mean, variance)
 
 
 @_half_mahalanobis.defjvp
 def _half_mahalanobis_jvp(primals, tangents):
-    """The plain formula's tangent, `sum((value - mean) * (t_value - t_mean)) / variance - term * t_variance
-    / variance`, formed from the residual and the term as they are held, shifted to range
-    (`_divergence_parts`), and restored once: finite wherever the derivative is. It is linear in the
-    tangents, so reverse mode transposes it, and its coefficients are functions of the primals, so it
-    differentiates again."""
-    value, mean, variance = primals
-    along_value, along_mean, along_variance = tangents
-    difference, shift, (quotient, power) = _divergence_parts(value, mean, variance)
-    # Each term's power of two restored half before the tangent's product and half after, so neither a
-    # tangent of zero meets a coefficient past float32's largest (inf * 0) nor reverse mode a cotangent
-    # taken below its least normal: `sum(residual * tangent) / variance` and `-term * t_variance /
-    # variance`, the plain formula's in range, bit for bit, the powers of two exact.
+    return _half_mahalanobis(*primals), linear_map(_directional, _pullback, primals, tangents)
+
+
+def _directional(primals: tuple[jax.Array, ...], tangents: tuple[jax.Array, ...]) -> jax.Array:
+    """The plain formula's tangent, `sum(d * (t_value - t_mean)) / v - term * t_v / v`, formed as the
+    term is: the tangents' difference (`_differences`), its sum of products against the difference
+    (`_summed_products`), each quotient as its significands' (`_quotient`), and the two terms joined
+    (`_sum`), each taken down only by what keeps it in range."""
+    value_tangent, mean_tangent, variance_tangent = tangents
+    difference, shift, (quotient, power) = _divergence_parts(*primals)
+    along, excess = _summed_products(difference, shift, *_differences(value_tangent, mean_tangent))
+    stretch, stretch_power = _split(variance_tangent)
+    variance_term = _quotient(-(quotient * stretch), power + stretch_power, primals[2])
+    return _sum(_quotient(along, excess, primals[2]), variance_term)
+
+
+def _pullback(primals: tuple[jax.Array, ...], cotangent: jax.Array) -> tuple[jax.Array, ...]:
+    """The plain formula's reverse mode: each element's `cotangent * (value - mean) / variance`, the
+    mean's its negation, and the variance's `-cotangent * term / variance`, each product of
+    significands (`_split`) with its exponents added, each quotient as its significands'
+    (`_quotient`), and each power restored once (`_scaled`)."""
+    difference, shift, (quotient, power) = _divergence_parts(*primals)
+    variance = primals[2]
+    (scale, scale_power), (part, part_power) = _split(cotangent), _split(difference)
     level, spread = _split(variance)
-    axes = tuple(range(1, value.ndim))
-    widest = jnp.max(shift, axis=axes)
-    residual_power = widest - spread
-    before = _half(residual_power)
-    products = _scaled(difference, shift - expand(widest - before, shift)) * (along_value - along_mean)
-    moved = _scaled(products.sum(axis=axes) / level, residual_power - before)
-    stretch_power = power - spread
-    stretched = _scaled(-quotient, _half(stretch_power)) * along_variance / level
-    return (_half_mahalanobis(value, mean, variance),
-            moved + _scaled(stretched, stretch_power - _half(stretch_power)))
-
-
-def _half(power: jax.Array) -> jax.Array:
-    """Half an integer power of two's exponent, rounded toward zero, the rest restored apart."""
-    return (power.astype(jnp.float32) * 0.5).astype(jnp.int32)
+    # The plain order, the product then the division, and the division IEEE's (`divided`), where
+    # XLA:CPU takes a division by a broadcast as a product with its reciprocal.
+    pulled = _scaled(divided(expand(scale, part) * part, expand(level, part)),
+                     expand(scale_power - spread, part) + part_power + shift)
+    to_variance = _quotient(-(scale * quotient), scale_power + power, variance)
+    return pulled, -pulled, _scaled(*to_variance)
 
 
 def flow_transition(x: ArrayLike, velocity: ArrayLike, sigma: ArrayLike,
