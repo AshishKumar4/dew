@@ -129,6 +129,20 @@ def test_a_step_whose_launch_spills_is_compiled_ahead_at_its_next_config(tmp_pat
     assert first["missed"][0] not in again["missed"] and again["planned"]["refused"] == []
 
 
+@lowers("sm90")
+def test_a_process_over_the_cache_of_one_that_stepped_down_compiles_its_stepped_program(tmp_path, nonce):
+    """A second fresh process over the persistent compilation cache of one whose step's launch spilled and
+    stepped down derives the refused tile again, and compiles the stepped-down program, never the one that
+    spilled, whose cached executable would report nothing: the refusal is kept beside the cache for that
+    exact program (`report.compiled`) (train 329's review: a resume or rerun trained the refused tile)."""
+    shared, step = tmp_path / "cache", str(tmp_path / "step.dew-aot")
+    flags = os.environ.get("XLA_FLAGS", "")
+    first = fresh(PRELUDE + AHEAD, str(nonce), step, "fresh", cache_dir=shared, flags=flags)
+    again = fresh(PRELUDE + AHEAD, str(nonce), step + ".again", "fresh", cache_dir=shared, flags=flags)
+    assert first["stepped"][:1] == [True]
+    assert again["program"] == first["program"] and again["missed"] == []
+
+
 HANDED = """
 import json, sys
 import jax
