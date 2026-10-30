@@ -84,6 +84,20 @@ CONTRACTED = {
         "test_the_template_rule_holds_its_orders",
     "src/dew/nn/kernels/short_conv.py::conv.linear_tangent":
         "test_the_short_conv_holds_every_order",
+    "src/dew/objectives/base.py::_ruled":
+        "test_a_ruled_loss_holds_every_order",
+    "src/dew/objectives/lm/chunked.py::_bounded_head":
+        "test_the_lm_heads_hold_their_reverse_orders",
+    "src/dew/objectives/lm/chunked.py::_whole_head":
+        "test_the_lm_heads_hold_their_reverse_orders",
+    "src/dew/objectives/lm/chunked.py::_fused":
+        "test_the_lm_heads_hold_their_reverse_orders",
+    "src/dew/objectives/lm/chunked.py::_whole_losses":
+        "test_the_whole_logits_losses_hold_every_order",
+    "src/dew/objectives/residuals.py::_pulled":
+        "test_the_residual_pullbacks_hold_their_reverse_orders",
+    "src/dew/objectives/residuals.py::_stepped":
+        "test_the_residual_pullbacks_hold_their_reverse_orders",
 }
 """Each contracted seam, `path::qualified name`, and the test of tests/test_derivative_contracts.py that holds
 it."""
@@ -99,14 +113,7 @@ PENDING = frozenset({
     "src/dew/nn/kernels/templates/layout.py::_custom.held",
     "src/dew/nn/moe.py::_stored_primal",
     "src/dew/nn/precision.py::at_default_precision.run",
-    "src/dew/objectives/base.py::_ruled",
-    "src/dew/objectives/lm/chunked.py::_bounded_head",
-    "src/dew/objectives/lm/chunked.py::_whole_head",
-    "src/dew/objectives/lm/chunked.py::_fused",
-    "src/dew/objectives/lm/chunked.py::_whole_losses",
     "src/dew/objectives/perturbation.py::NodePerturbation.loss.estimated",
-    "src/dew/objectives/residuals.py::_pulled",
-    "src/dew/objectives/residuals.py::_stepped",
     "src/dew/quantization.py::frozen_fp8_product",
     "src/dew/quantization.py::_grouped_convolution_gradient.grouped_conv_qt",
     "src/dew/sampling/flow.py::_directional",
