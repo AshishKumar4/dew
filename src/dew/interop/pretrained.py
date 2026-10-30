@@ -31,7 +31,7 @@ from dew import _records
 from dew._model_types import QWEN35_TYPES
 from dew.batch import Variables
 from dew.diffusion.process import Process
-from dew.diffusion.schedules.source import SourceSchedule
+from dew.diffusion.schedules.source import SourceGrid, SourceSchedule
 from dew.distributed.placement import Layout, MeshSpec, RefinesLayout
 from dew.inference import BlockGeneration, MaskedGeneration, TextGeneration
 from dew.inference.images import TextToImage
@@ -64,7 +64,7 @@ from dew.interop.pipeline_assembly import (
 )
 from dew.interop.processors import Processor, hosts
 from dew.interop.safetensors_io import MAX_SHARD_SIZE, LazyTensors, tensor_specs
-from dew.interop.saved_sources import is_saved_run, released_run
+from dew.interop.saved_sources import pinned_run, released_run, samples_images
 from dew.interop.streaming import WeightLayout
 from dew.interop.weights import AUTO, checkpoint_dtype, declared_dtype
 from dew.nn.autoencoders import AutoEncoder
@@ -87,6 +87,8 @@ if TYPE_CHECKING:
     from dew.nn.attention import AttentionImpl
     from dew.nn.cross_attention import CrossBlocks
     from dew.nn.dex import DifferentialExtension
+    from dew.sampling.guidance import Guidance
+    from dew.sampling.solvers.common import Solver
 
 
 def _refined(layout: Layout | None, model: RefinesLayout | None) -> Layout | None:
@@ -903,6 +905,26 @@ class PretrainedPipeline(Pretrained):
     def pipeline(self):
         return self.text_to_image()
 
+    @property
+    def solver(self) -> Solver:
+        """The native solver its scheduler file names (`SourceSchedule.solver`)."""
+        return self.schedule.solver
+
+    @property
+    def steps(self) -> int:
+        """The step count its call samples with by default (`SourceTask.steps`)."""
+        return self.task.steps
+
+    @property
+    def guidance(self) -> Guidance | None:
+        """The guidance its call samples with by default (`SourceTask.guidance`)."""
+        return self.task.guidance
+
+    @property
+    def grid(self) -> SourceGrid:
+        """The sampling grid its call prepares (`SourceTask.grid`)."""
+        return self.task.grid
+
     def text_to_image(self) -> TextToImage:
         """Build the pipeline as a sampling task with its published policy.
 
@@ -910,9 +932,9 @@ class PretrainedPipeline(Pretrained):
         `[N, frames, height, width, 3]`.
         """
         return self.formed(TextToImage(
-            self.model, self.process, self.inputs, self.variables, self.autoencoder, grid=self.task.grid,
-            final_denoise=False, solver=self.schedule.solver, steps=self.task.steps,
-            guidance=self.task.guidance, finish=self.finish))
+            self.model, self.process, self.inputs, self.variables, self.autoencoder, grid=self.grid,
+            final_denoise=False, solver=self.solver, steps=self.steps, guidance=self.guidance,
+            finish=self.finish))
 
     @property
     def _adaptable(self) -> Mapping[str, WeightLayout]:
@@ -1017,8 +1039,10 @@ def load_diffusion_source(checkpoint: str, *, dtype: str = "bfloat16", param_dty
                           text: bool = True, text_only: bool = False,
                           prediction_depths: int | None = None,
                           modeling_overrides: Mapping[str, object] | None = None,
-                          step: int | str | None = None, ema: bool | None = None) -> PretrainedPipeline:
-    """A published diffusion pipeline, to train from its own weights.
+                          step: int | str | None = None,
+                          ema: bool | None = None) -> PretrainedPipeline | TextToImage:
+    """A published diffusion pipeline, to train from its own weights, or a saved Dew diffusion run's own
+    sampling task (`TextToImage.from_saved`), its checkpoint at `step` with `ema` (`pinned_run`).
 
     `size` is the (height, width) in pixels the pipeline runs at instead of
     its own, or a video pipeline's (frames, height, width): the geometry its
@@ -1041,16 +1065,20 @@ def load_diffusion_source(checkpoint: str, *, dtype: str = "bfloat16", param_dty
     `text_only`, `prediction_depths` and `modeling_overrides` read as
     `Pretrained.load`'s do: a pipeline has no wrapper's language model for
     `text_only` to take, its components hold no prediction depths, so any
-    count keeps them all, and none reads overrides, which are refused. A saved Dew run, which Dew
-    writes no diffusion release of, is refused, as a step or EMA choice beside a release is.
+    count keeps them all, and none reads overrides, which are refused.
+
+    A saved run is no published pipeline: Dew writes no diffusers layout of one, so it loads as the task
+    its run built (`_saved_task`), which a `DiffusionObjective` trains as it trains a pipeline. A step
+    or EMA choice beside a pipeline is refused, as it selects nothing.
     """
-    if is_saved_run(checkpoint) or step is not None or ema is not None:
-        raise ValueError(f"{checkpoint}: a diffusion run starts from a published pipeline; Dew writes no "
-                         "diffusion release of a saved run to start from, so resume the run under its "
-                         "name (--trainer.resume) or serve it (TextToImage.from_run)")
+    run = pinned_run(checkpoint, step=step, ema=ema)
     _unread_overrides(modeling_overrides, "a diffusion pipeline")
     if text_only:
         _no_language_model(checkpoint, "diffusion pipeline")
+    if run is not None:
+        return _saved_task(run, checkpoint, dtype=dtype, param_dtype=param_dtype, revision=revision,
+                           attention_impl=attention_impl, size=size, variables=variables, mesh=mesh,
+                           layout=layout, text=text, ema=ema)
     directory = sources.snapshot(checkpoint, revision, weights=False)
     if variables is not None and not text:
         raise ValueError("supplied variables bind every component; text=False skips reading one")
@@ -1067,6 +1095,44 @@ def load_diffusion_source(checkpoint: str, *, dtype: str = "bfloat16", param_dty
         raise ValueError(f"{checkpoint} is not a diffusion pipeline: it has no model_index.json, or its "
                          "config.json names the model it is")
     return _published(loaded, checkpoint, selected=False)
+
+
+def _saved_task(run: SavedRun, checkpoint: str, *, dtype: str, param_dtype: str, revision: str | None,
+                attention_impl: AttentionImpl, size: tuple[int, ...] | None, variables: Variables | None,
+                mesh: MeshSpec | Mesh | None, layout: Layout | None, text: bool,
+                ema: bool | None) -> TextToImage:
+    """The diffusion run `run` as `load_diffusion_source` loads it: its own task (`TextToImage.from_saved`),
+    computing in `dtype`, its weights restored stored in `param_dtype` (as saved where `auto`) where
+    `mesh` and `layout` place them, or bound from supplied `variables`, its denoiser attending through
+    `attention_impl` where its class takes a kernel, and its sample at `size` in its own channels.
+
+    A run of another task, a revision of a directory, and `text=False`, which the restore of a run's
+    tree cannot skip, are refused, as is a kernel other than `auto` for a denoiser that takes none."""
+    if not samples_images(run):
+        raise ValueError(f"{checkpoint} is a {run.objective.__name__} run, which Pretrained.load reads; a "
+                         "diffusion run starts from a published pipeline or a saved diffusion run")
+    if revision is not None:
+        raise ValueError(f"{checkpoint} is a saved run's directory, which has no revision {revision!r}")
+    if not text:
+        raise ValueError(f"{checkpoint} is a saved run, whose tree restores its text encoder with its "
+                         "denoiser; text=False skips none of it")
+    task = TextToImage.from_saved(run, ema=ema, mesh=mesh, layout=layout, dtype=dtype,
+                                  param_dtype=None if param_dtype == AUTO else param_dtype,
+                                  variables=variables)
+    model = task.model
+    if "attention_impl" in {field.name for field in dataclasses.fields(model)}:
+        model = model.clone(attention_impl=attention_impl)
+    elif attention_impl != "auto":
+        raise ValueError(f"{type(model).__name__} takes no attention_impl: the attention its record states "
+                         "is its run's")
+    inputs = task.inputs
+    if size is not None:
+        sample = inputs.sample
+        if len(size) != len(sample.shape) - 1:
+            raise ValueError(f"{checkpoint} samples {sample.key} of shape {sample.shape}, which size {size} "
+                             "does not shape")
+        inputs = replace(inputs, sample=replace(sample, shape=(*size, sample.shape[-1])))
+    return replace(task, model=model, inputs=inputs)
 
 
 def _published[K: Pretrained](loaded: K, name_or_dir: str | Path, *, selected: bool) -> K:

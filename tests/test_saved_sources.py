@@ -1,15 +1,25 @@
 """A run that starts from a saved Dew run (`--pretrained <run directory>`, ledger 2713): its source is the
-release `dew export` writes of the run's checkpoint (`dew.interop.saved_sources`), at the step its
-selection pins, which its record names."""
+release `dew export` writes of the run's checkpoint (`dew.interop.saved_sources`), or a diffusion run's
+own sampling task, at the step its selection pins, which its record names."""
+
+import dataclasses
 
 import jax
 import numpy as np
 import pytest
-from test_run_options import decision, trained
+from test_run_options import decision, diffusion, trained
 
+from dew.batch import FROZEN
+from dew.config import ObjectiveConfig, SourceOptions
+from dew.config.diffusion import DEFAULT_MODEL_CONFIG, DiffusionRunConfig
 from dew.decision.config import DecisionRunConfig
+from dew.inference import TextToImage
 from dew.inference.tasks import SavedRun
+from dew.interop.pretrained import load_diffusion_source
 from dew.interop.saved_sources import export_run, released_run
+from dew.lora import LoRA
+from dew.registry import ModelConfig
+from dew.sampling.solvers import Euler
 
 
 @pytest.mark.mesh(devices=8)
@@ -41,3 +51,45 @@ def test_a_decision_run_starts_from_a_saved_decision_run_as_from_its_export(tmp_
     assert released_run(source, step="latest") == released_run(source)
     with pytest.raises(ValueError):
         released_run(exported, step="latest")
+    with pytest.raises(ValueError):
+        load_diffusion_source(str(source))
+
+
+def leaves_alike(tree, alike) -> None:
+    for leaf, other in zip(jax.tree.leaves(jax.device_get(tree)), jax.tree.leaves(jax.device_get(alike)),
+                           strict=True):
+        np.testing.assert_array_equal(np.asarray(leaf), np.asarray(other), strict=True)
+
+
+@pytest.mark.mesh(devices=8)
+def test_a_diffusion_run_starts_from_a_saved_diffusion_run_as_from_its_task(tmp_path):
+    """A diffusion run that starts from a saved diffusion run (`--pretrained <run>`, `--source.step latest`)
+    starts from the weights the run's own task restores (`TextToImage.from_run`), bit for bit, and samples
+    by that task's policy where it states none. It trains a step, and its record names the run it started
+    from and the step it read; an adapter over it trains its factors over the run's frozen weights. The
+    task takes the data's size, and a language model's loader refuses a diffusion run, which has no
+    release."""
+    first = diffusion(tmp_path, drawn=False)
+    trained(first, tmp_path, "first", trainer={"checkpoint_final": True})
+    source = tmp_path / "runs" / "first"
+    run = dataclasses.replace(first, pretrained=str(source), source=SourceOptions(step="latest"), text=None,
+                              model=ModelConfig("unet", dict(DEFAULT_MODEL_CONFIG)),
+                              objective=ObjectiveConfig("diffusion", {}))
+    task = TextToImage.from_run(str(source))
+
+    objective = run.build()
+    leaves_alike(objective.variables["params"], task.variables["params"])
+    assert (objective.steps, objective.solver) == (task.steps, task.solver) == (2, Euler())
+    trained(run, tmp_path, "from_run")
+    recorded = DiffusionRunConfig.load(str(tmp_path / "runs" / "from_run"))
+    assert recorded.pretrained == str(source)
+    assert recorded.source.step == SavedRun.pinned(str(source)).step
+    adapted, _ = trained(run, tmp_path, "adapted", lora=LoRA(rank=2, modules=("ada_proj",)))
+    assert FROZEN in adapted.variables
+    factors = sum(leaf.size for leaf in jax.tree.leaves(adapted.variables["params"]))
+    assert 0 < factors < sum(leaf.size for leaf in jax.tree.leaves(task.variables["params"]))
+
+    resized = load_diffusion_source(str(source), dtype="float32", size=(8, 8))
+    assert isinstance(resized, TextToImage) and resized.inputs.sample.shape == (8, 8, 3)
+    with pytest.raises(ValueError):
+        released_run(source)
