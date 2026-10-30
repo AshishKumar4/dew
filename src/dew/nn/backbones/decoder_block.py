@@ -23,20 +23,23 @@ from dew.nn.dropout import Dropout
 from ..activations import GatedActivation, gated_product
 from ..attention_residuals import DepthAttention, ResidualSite, sources
 from ..cross_attention import NAME as CROSS_ATTENTION, AttendsContext, LayerReads
+from ..engram import PLELayer
 from ..flops import MissingFlopsCount, counted_flops, parameter_flops, projection_flops
 from ..gemma3n import AltUp, AltUpLayer, LaurelBlock
 from ..gemma4_moe import Gemma4Experts
 from ..gpt_oss import GptOssMLP
 from ..hyper_connections import (
     Carried,
+    GatedResidual,
     HyperConnection,
     HyperConnections,
     HyperHead,
     collapse_by,
     collapse_streams,
+    gated_write,
     mix_streams,
 )
-from ..inputs import LayerInputs, MixerCall, PredictionPhase, routing_blocks
+from ..inputs import LayerInputs, MixerCall, PredictionPhase, coordinates_of, routing_blocks
 from ..kernels.recurrence_chunk import recomputing
 from ..mixer_base import ATTENTION_RESIDUALS, MLP_RESIDUALS, QKV_RESIDUALS, RESIDUALS
 from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, SparseMLP
@@ -638,7 +641,7 @@ class DecoderBlock(nn.Module):
         count = self._submodule_flops(lengths, counted_flops)
         if self.altup is not None:
             count += AltUpLayer(self.altup, self.emb_features, parent=None).mixing_flops(lengths)
-        if self.hyper_connections is not None:
+        if self.hyper_connections is not None and not self.hyper_connections.gated:
             site = HyperConnection(self.hyper_connections, self.emb_features, parent=None)
             count += (1 + (self.feedforward is not None)) * site.mixing_flops(lengths)
         if self.residual_site is not None:
@@ -680,7 +683,8 @@ class DecoderBlock(nn.Module):
         if self.altup is not None:
             count += AltUpLayer(self.altup, self.emb_features, parent=None).parameter_flops(lengths)
         if self.hyper_connections is not None:
-            site = HyperConnection(self.hyper_connections, self.emb_features, parent=None)
+            site = (GatedResidual if self.hyper_connections.gated else HyperConnection)(
+                self.hyper_connections, self.emb_features, parent=None)
             count += (1 + (self.feedforward is not None)) * site.parameter_flops(lengths)
         if self.residual_site is not None:
             count += DepthAttention(self.emb_features, parent=None).depth_parameter_flops(
@@ -760,16 +764,20 @@ class DecoderBlock(nn.Module):
                 norm_eps=self.norm_eps, dtype=self.dtype, precision=self.precision,
                 name='laurel')
         if self.hyper_connections is not None:
-            if (not self.wiring.pre_norms or self.wiring.output_norms or self.wiring.layer_scalar
+            gated = self.hyper_connections.gated
+            if (self.wiring.pre_norms == gated or self.wiring.output_norms or self.wiring.layer_scalar
                     or self.parallel is not None or self.altup is not None
                     or self.laurel_rank is not None or self.per_layer_input_dim
                     or self.residual_multiplier != 1.0):
                 raise ValueError(
                     "hyper_connections runs the mHC block, a plain pre-norm block whose "
-                    "residual is the stream stack: no output norms, layer scalar, parallel "
-                    "branch, altup, laurel, per-layer inputs or residual multiplier")
-            site = functools.partial(HyperConnection, spec=self.hyper_connections,
-                                     emb_features=self.emb_features, norm_eps=self.norm_eps)
+                    "residual is the stream stack, or Qwen4-Exp's gated one, which norms in its read "
+                    "and takes no pre norms: no output norms, layer scalar, parallel branch, altup, "
+                    "laurel, per-layer inputs or residual multiplier")
+            site = (functools.partial(GatedResidual, dtype=self.dtype, precision=self.precision) if gated
+                    else HyperConnection)
+            site = functools.partial(site, spec=self.hyper_connections, emb_features=self.emb_features,
+                                     norm_eps=self.norm_eps)
             self.attn_hc = site(name='attn_hc')
             self.ffn_hc = site(name='ffn_hc')
         if self.residual_site is not None:
@@ -857,7 +865,7 @@ class DecoderBlock(nn.Module):
         next block its residual; the sublayers, norms and branches are the same for
         every form.
         """
-        state = self._enter(x, train, attention_metadata)
+        state = self._enter(x, train, attention_metadata, decode)
         if self.cross is not None:
             state = self._crossed(state, None if attention_metadata is None else attention_metadata.context,
                                   decode, train)
@@ -985,7 +993,7 @@ class DecoderBlock(nn.Module):
             output = output * (self.attention_scale if site == "attention" else self.mlp_scale)
         return self.dropout(scaled(output, self.residual_multiplier), deterministic=not train)
 
-    def _enter(self, residual, train: bool, attention_metadata) -> _BlockState:
+    def _enter(self, residual, train: bool, attention_metadata, decode: bool = False) -> _BlockState:
         """The residual the block received, as the state its sublayers read."""
         if self.hyper_connections is not None:
             streams, pre = residual if self.hyper_connections.single_pass else (residual, None)
@@ -993,11 +1001,18 @@ class DecoderBlock(nn.Module):
                 if attention_metadata is None or attention_metadata.engram_ids is None:
                     raise ValueError("an engram layer reads the bucket ids the model hashes into "
                                      "attention_metadata.engram_ids")
-                # A media position takes no engram contribution (V4.1 model.py:351-365), and
-                # the lookup lands before anything reads the streams (:1261-1263).
-                streams = self.engram_layer(
-                    streams, attention_metadata.engram_ids[:, :, self.engram_index],
-                    None if attention_metadata.media is None else ~attention_metadata.media)
+                ids = attention_metadata.engram_ids[:, :, self.engram_index]
+                if isinstance(self.engram_layer, PLELayer):
+                    # Qwen4-Exp's lookup adds nothing at a padded slot, its conv stepping over it
+                    # (modeling_qwen4_exp.py:1176-1190), each packed document's alone.
+                    tokens = coordinates_of(attention_metadata, *streams.shape[:2])
+                    streams = self.engram_layer(streams, ids, tokens.valid, segments=tokens.segments,
+                                                decode=decode)
+                else:
+                    # A media position takes no engram contribution (V4.1 model.py:351-365), and
+                    # the lookup lands before anything reads the streams (:1261-1263).
+                    streams = self.engram_layer(
+                        streams, ids, None if attention_metadata.media is None else ~attention_metadata.media)
             if self.prediction_site == 'input':
                 # V4.1's DSpark reads each target layer's attention input,
                 # after its engram (V4.1 inference/model.py:1264-1266).
@@ -1020,6 +1035,9 @@ class DecoderBlock(nn.Module):
         if isinstance(state, _Streams):
             spec = self.hyper_connections
             assert spec is not None
+            if spec.gated:
+                read, injection = (self.attn_hc if site == "attention" else self.ffn_hc)(state.streams)
+                return state, read, injection
             pre, post, comb = (self.attn_hc if site == "attention" else self.ffn_hc).mapping(state.streams)
             # Under Single-Pass, a site collapses by the `pre` the site before
             # it computed and hands its own on (V4.1 inference/model.py:968-994).
@@ -1079,6 +1097,9 @@ class DecoderBlock(nn.Module):
             stream = scaled(state.x, self.wiring.stream_multiplier)
             return state._replace(x=constrain(stream + output, RESIDUAL))
         if isinstance(state, _Streams):
+            assert self.hyper_connections is not None
+            if self.hyper_connections.gated:
+                return state._replace(streams=constrain(gated_write(state.streams, mapping, output), STREAMS))
             post, comb = mapping
             return state._replace(streams=constrain(mix_streams(post, comb, output, state.streams), STREAMS))
         site_spec = self.residual_site

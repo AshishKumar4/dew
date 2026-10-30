@@ -7,7 +7,9 @@ public entry point imports the vision classes itself.
 QWEN35_TYPES = ('qwen3_5', 'qwen3_5_moe')
 GEMMA4_TYPES = ('gemma4', 'gemma4_unified')
 QWEN35_TEXT_TYPES = tuple(f'{name}_text' for name in QWEN35_TYPES)
-_QWEN35_VISION_TYPES = (*QWEN35_TYPES, *(f'{name}_vision' for name in QWEN35_TYPES))
+# Qwen4-Exp's tower is Qwen 3.5's, class for class (modeling_qwen4_exp.py:1660-1964).
+_QWEN35_VISION_TYPES = (*QWEN35_TYPES, *(f'{name}_vision' for name in QWEN35_TYPES), 'qwen4_exp',
+                        'qwen4_exp_vision')
 
 SANDWICH_NORMS = {
     'input_layernorm': 'input_layernorm',

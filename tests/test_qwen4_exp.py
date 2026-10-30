@@ -1,0 +1,100 @@
+"""Qwen4-Exp (ledger 849): tools/qwen4_exp_reference.py writes qwen4-exp-tiny from transformers' own class,
+whose logits and greedy continuation tests/test_hf_reference_decoders.py holds Dew's to; this file holds
+what the tiny cannot: the release's n-gram lookups, whose primes it cannot hold, its write-back and the
+release's wrapper."""
+
+import json
+from pathlib import Path
+
+import jax
+import numpy as np
+from interop_support import assert_reloads, fixture_ids, token_draw, transformers_arms, transformers_model
+from reference_error import assert_as_exact
+
+from dew.interop import Pretrained, PretrainedDecoder
+from dew.interop.hf_decoders import translate_config
+from dew.nn.engram import Engram, EngramHashes
+
+ROOT = Path(__file__).parent / 'fixtures' / 'hf'
+RELEASE = ROOT / 'qwen3.8-flash-next'
+TINY = ROOT / 'qwen4-exp-tiny'
+
+
+def test_the_releases_ngram_lookups_hash_its_ids_as_transformers_does():
+    """Qwen3.8-Flash-Next's n-gram per-layer embedding, read from the release's own config, hashes rows
+    with end-of-sequence ids inside them and before them to the ids transformers' `NGramEmbedding`
+    gathers at that config, bit for bit (release_ple_ids.npz): SplitMix64's multipliers, the release's
+    primes from 20000003 on, which pass 2**24, and each look-back stopped at an end of sequence; its
+    multipliers and primes are the buffers transformers builds. A position an image holds hashes its
+    placeholder id as any other, transformers' lookup reading the ids alone."""
+    config = translate_config(json.loads((RELEASE / 'config.json').read_text())['text_config'])
+    spec = Engram(**config['engram'])
+    recorded = np.load(RELEASE / 'release_ple_ids.npz')
+    tokens = recorded['input_ids']
+    hashes = EngramHashes(spec=spec, vocab_size=config['vocab_size'])
+    media = np.zeros(tokens.shape, bool)
+    media[:, 6:9] = True
+    for marked in (None, media):
+        ids, _ = hashes.init_with_output(jax.random.key(0), tokens, None, None, decode=False, media=marked)
+        np.testing.assert_array_equal(np.asarray(ids)[:, :, 0], recorded['ple_ids'])
+    np.testing.assert_array_equal(spec.multipliers[0], recorded['layer_multipliers'])
+    np.testing.assert_array_equal(np.ravel(spec.primes[0]), recorded['vocab_sizes'])
+
+
+EXPORT_SEEDS = 8
+"""The export's declared draws of ids against transformers' read of it (check 1)."""
+
+
+def test_an_export_opens_in_transformers_as_the_model_it_was(tmp_path):
+    """qwen4-exp-tiny written back (a qwen4_exp_text config, its experts fused, its n-gram table one shard
+    beside the buffers the class holds) opens in transformers' Qwen4ExpForCausalLM with no tensor missing,
+    left over or misshapen, which computes Dew's logits on par from its float64 twin (check 1), and Dew
+    reads it back as the model it was."""
+    import torch
+    from transformers import AutoModelForCausalLM
+
+    loaded = Pretrained.load(TINY, dtype='float32', attention_impl='reference')
+    PretrainedDecoder.from_model(loaded.model, loaded.variables).save(tmp_path)
+    model, report = AutoModelForCausalLM.from_pretrained(
+        tmp_path, dtype=torch.float32, attn_implementation='eager', experts_implementation='eager',
+        output_loading_info=True)
+    assert not any(report[key] for key in ('missing_keys', 'unexpected_keys', 'mismatched_keys')), report
+    reference, truth = transformers_arms(model.eval(), lambda model, ids: model(ids, use_cache=False).logits)
+    assert_as_exact(lambda ids: loaded.model.apply(loaded.variables, ids), reference, fixture_ids(TINY),
+                    'Qwen4-Exp export', seeds=EXPORT_SEEDS, truth_fn=truth)
+    assert_reloads(loaded, tmp_path, np.load(TINY / 'input_ids.npy'))
+
+
+WRAPPER_SEEDS = 8
+"""The wrapper's declared draws of ids against transformers' (check 1)."""
+
+
+def test_the_release_wrapper_loads_whole_and_text_only_as_its_language_model(tmp_path):
+    """Qwen3.8-Flash-Next's wrapper (Qwen4ExpForConditionalGeneration at the release's config, its text half
+    qwen4-exp-tiny's config and its tower one block of Qwen 3.5's, transformers' own draw) loads whole,
+    its tower Qwen 3.5's, and computes transformers' text logits on par from its float64 twin (check 1);
+    its language model alone (`text_only`) computes them bit for bit as the whole does."""
+    import torch
+    from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpConfig
+    from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpForConditionalGeneration
+
+    release = json.loads((RELEASE / 'config.json').read_text())
+    text = {key: value for key, value in json.loads((TINY / 'config.json').read_text()).items()
+            if key not in ('architectures', 'transformers_version')}
+    vision = {**release['vision_config'], 'depth': 1, 'hidden_size': 32, 'intermediate_size': 64,
+              'num_heads': 2, 'out_hidden_size': text['hidden_size'], 'num_position_embeddings': 16}
+    special = {'image_token_id': 250, 'video_token_id': 251, 'vision_start_token_id': 252,
+               'vision_end_token_id': 253}
+    torch.manual_seed(0)
+    Qwen4ExpForConditionalGeneration(Qwen4ExpConfig(text_config=text, vision_config=vision, **special)).to(
+        torch.float32).save_pretrained(tmp_path)
+    whole = Pretrained.load(tmp_path, dtype='float32', attention_impl='reference')
+    alone = Pretrained.load(tmp_path, dtype='float32', attention_impl='reference', text_only=True)
+    reference, truth = transformers_arms(
+        transformers_model(tmp_path), lambda model, ids: model(input_ids=ids, use_cache=False).logits)
+    draw = token_draw(0x4E, 240, (2, 12))
+    assert_as_exact(lambda ids: whole.model.apply(whole.variables, ids), reference, draw,
+                    'Qwen4-Exp wrapper logits', seeds=WRAPPER_SEEDS, truth_fn=truth)
+    (ids,) = draw(0)
+    np.testing.assert_array_equal(alone.model.apply(alone.variables, ids),
+                                  whole.model.apply(whole.variables, ids))

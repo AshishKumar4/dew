@@ -60,17 +60,17 @@ from ..deepseek_v4 import DeepseekV4Mixer
 from ..dex import DifferentialExtension, LayerDex
 from ..dsa_kpool import KPoolSparseAttentionMixer
 from ..dspark import DSpark, DSparkStage, draft as dspark_draft
-from ..engram import Engram, EngramHashes, EngramLayer
+from ..engram import Engram, EngramHashes, EngramLayer, PLELayer
 from ..flops import MissingFlopsCount, counted_flops, parameter_flops, projection_flops
 from ..gemma3n import AltUp, AltUpLayer, clamped_predictions, rescale_to
 from ..hyper_connections import (
     Carried,
     HyperConnections,
-    HyperHead,
     collapse_by,
     collapse_streams,
     expand_streams,
     first_stream,
+    stream_head,
 )
 from ..inputs import (
     AttentionMetadata,
@@ -397,12 +397,9 @@ class CausalTransformer(nn.Module):
     over finished blocks of layers that replaces the running residual. None
     disables them."""
     engram: Engram | None = None
-    """DeepSeek-V4.1's n-gram lookups (`dew.nn.engram`). Each layer it names
-    gates its table rows into the residual streams before its attention. The
-    tokenizer's compressed vocabulary is stored as `engram_hashes/token_map` in
-    the `constants` collection. A loaded checkpoint derives it from its
-    tokenizer, and a fresh model fills it with each id modulo the compressed
-    vocabulary's size."""
+    """DeepSeek-V4.1's n-gram lookups, or Qwen4-Exp's per-layer embedding (`dew.nn.engram`), each layer it
+    names adding its table rows to the streams before its attention. The compressed vocabulary,
+    `engram_hashes/token_map` in `constants`, is a loaded tokenizer's, else each id modulo its size."""
     dex: DifferentialExtension | None = None
     """The chosen heads whose attention outputs take a learned differential (`dew.nn.dex`), or None."""
     cross_attention: CrossBlocks | None = None
@@ -763,8 +760,9 @@ class CausalTransformer(nn.Module):
         maps = self.projections()
         count = sum(projection_flops(lengths, *shape) for name, shape in maps.items()
                      if name.startswith(('altup_projections_', 'altup_unembed_projections_', 'project_in')))
-        if self.hyper_connections is not None and self.hyper_connections.head == 'weighted':
-            count += HyperHead(self.hyper_connections, self.emb_features, parent=None).model_flops(lengths)
+        if self.hyper_connections is not None and self.hyper_connections.head in ('weighted', 'gated'):
+            count += stream_head(self.hyper_connections, self.emb_features, self.norm_eps,
+                                 parent=None).model_flops(lengths)
         if self.attention_residuals is not None:
             sources = self.attention_residuals.blocks(self.num_layers) + 1
             count += depth_counter(DepthAttention(self.emb_features, parent=None), lengths, sources)
@@ -983,9 +981,9 @@ class CausalTransformer(nn.Module):
                 projection(projections[f'altup_unembed_projections_{index}'][1],
                            name=f'altup_unembed_projections_{index}')
                 for index in range(self.altup.num_inputs - 1)]
-        if self.hyper_connections is not None and self.hyper_connections.head == 'weighted':
-            self.hc_head = HyperHead(spec=self.hyper_connections, emb_features=self.emb_features,
-                                     norm_eps=self.norm_eps, name='hc_head')
+        if self.hyper_connections is not None and self.hyper_connections.head in ('weighted', 'gated'):
+            self.hc_head = stream_head(self.hyper_connections, self.emb_features, self.norm_eps,
+                                       name='hc_head')
         if self.attention_residuals is not None:
             self.output_res = DepthAttention(emb_features=self.emb_features, norm_eps=self.norm_eps,
                                              name='output_res')
@@ -1085,7 +1083,10 @@ class CausalTransformer(nn.Module):
             media_routed=(spec.routed and not spec.hash_routed
                           and self.mixture is not None and self.mixture.media_bias),
             engram=None if spec.engram is None or self.engram is None else functools.partial(
-                EngramLayer, rows=self.engram.num_embeddings[spec.engram], head_dim=self.engram.head_dim,
+                EngramLayer if self.engram.ple_conv_kernel_size is None else functools.partial(
+                    PLELayer, kernel_size=self.engram.ple_conv_kernel_size,
+                    dilation=self.engram.max_ngram_size),
+                rows=self.engram.num_embeddings[spec.engram], head_dim=self.engram.head_dim,
                 hc_mult=self.hyper_connections.hc_mult if self.hyper_connections else 1,
                 emb_features=self.emb_features, norm_eps=self.norm_eps,
                 dtype=self.dtype, precision=self.precision),
@@ -1249,7 +1250,7 @@ class CausalTransformer(nn.Module):
             x = collapse_by(x.pre, x.streams)
         elif hc is not None:
             x = collapse_streams(x.streams if isinstance(x, Carried) else x,
-                                 self.hc_head if hc.head == 'weighted' else None)
+                                 self.hc_head if hc.head in ('weighted', 'gated') else None)
         if self.attention_residuals is not None:
             # Every block is finished after the last layer, so the whole state,
             # the blocks and the last partial, is what the output site mixes
