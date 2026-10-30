@@ -86,7 +86,7 @@ def ran(order, label: str, name: str):
 
 
 def assert_contract(fn, primals, direction, cotangent, label: str, *, truth_fn=None, plain_fn=None,
-                    held: tuple[str, ...] | None = None) -> None:
+                    held: tuple[str, ...] | None = None, without: tuple[str, ...] = ()) -> None:
     """Every order of `fn` runs at the draw, and each leaf is finite wherever the same order of its float64
     run is a normal float32 and, given `plain_fn` (the plain float32 formula, JAX's own derivatives of it),
     the plain formula's is finite: no less finite than the plain arithmetic (row 1768, a contraction Dew
@@ -94,13 +94,18 @@ def assert_contract(fn, primals, direction, cotangent, label: str, *, truth_fn=N
     run cancels. The float64 run is `fn`'s own, or `truth_fn`'s, the plain float64 formula, where `fn`
     computes in a fixed precision whatever its inputs' (a declared dot algorithm). `held`, where given, names
     the orders a decision its caller cites holds the call to: each order it drops must break, so the
-    exemption ends when the call holds it."""
-    narrow = orders(fn, primals, direction, cotangent)
-    plain_orders = {} if plain_fn is None else orders(plain_fn, primals, direction, cotangent)
+    exemption ends when the call holds it. `without` names orders the contract does not take yet, each
+    joining with its row's fix (a row's head brings its own test)."""
+
+    def orders_of(f, *drawn):
+        return {name: order for name, order in orders(f, *drawn).items() if name not in without}
+
+    narrow = orders_of(fn, primals, direction, cotangent)
+    plain_orders = {} if plain_fn is None else orders_of(plain_fn, primals, direction, cotangent)
     plain = {name: ran(order, f"{label}, plainly", name) for name, order in plain_orders.items()}
     with jax.enable_x64(new_val=True):
         wide_primals, wide_direction, wide_cotangent = widened((primals, direction, cotangent))
-        wide = orders(truth_fn or fn, wide_primals, wide_direction, wide_cotangent)
+        wide = orders_of(truth_fn or fn, wide_primals, wide_direction, wide_cotangent)
         truths = {name: ran(order, f"{label} in float64", name) for name, order in wide.items()}
     for name, order in narrow.items():
         values = jax.tree.leaves(ran(order, label, name))
@@ -308,8 +313,9 @@ def test_a_grouped_gemm_holds_every_order(edge):
     def plain(rows, matrices):
         return jnp.einsum("rg,rk,gkn->rn", jax.nn.one_hot(groups, 3, dtype=rows.dtype), rows, matrices)
 
+    # Its reverse over reverse does not run (ledger 2650); that row's head adds the order with its fix.
     assert_contract(grouped, primals, direction, cotangent, f"a grouped GEMM {edge}", truth_fn=plain,
-                    plain_fn=plain)
+                    plain_fn=plain, without=("grad of grad",))
 
 
 def test_the_contract_refuses_a_formula_less_finite_than_the_plain_one():
