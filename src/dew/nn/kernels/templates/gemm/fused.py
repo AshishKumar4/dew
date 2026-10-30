@@ -44,7 +44,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import fuser
 from jax.extend import core as jax_core
 
-from dew.nn.kernels.selection import Kernel, Op, Refusal, select
+from dew.nn.kernels.selection import Kernel, Op, Refusal, Requirement, select
 from dew.nn.kernels.templates.gemm import template
 
 FUSION_ROW = 'ledger 1295'
@@ -122,13 +122,13 @@ def _stage[S: tuple](op: Op[Tiling], found: S | Refusal) -> S | None:
 
 
 EPILOGUE: Op[Tiling] = Op('gemm_epilogue', (
-    Kernel('fused', (lambda case: case.refusal,)),
+    Kernel('fused', (Requirement.analysed('tiled', lambda case: case.refusal, FUSION_ROW),)),
     Kernel('xla', (), generic=True)))
 """The epilogue's selector: the consumers in the kernel's epilogue where the analysis takes them tile by
 tile (`_axes`), else after the product in XLA."""
 
 PROLOGUE: Op[Tiling] = Op('gemm_prologue', (
-    Kernel('fused', (lambda case: case.refusal,)),
+    Kernel('fused', (Requirement.analysed('tiled', lambda case: case.refusal, FUSION_ROW),)),
     Kernel('xla', (), generic=True)))
 """The prologue's selector: the producer's element stage in the kernel's prologue where the analysis
 takes it tile by tile (`_split`), else before the product in XLA."""
