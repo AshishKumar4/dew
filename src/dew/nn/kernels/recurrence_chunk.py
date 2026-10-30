@@ -1338,8 +1338,8 @@ SCAN_CELLS: dict[tuple[str | None, str], tuple[str, str]] = {
                   "(ssd-rounded-h100-fdab2424c)"),
     ('wgmma', 'training'): (
         'pallas', "on an H100 80GB HBM3, the port's forward and gradient 1.593 ms against the template's "
-                  "1.840 on Nemotron-H 4B's SSD and 0.663 against 1.018 on 30B's, its query/key launch 0.499 and "
-                  "0.277 of them (ssd-train-h100-fdab2424c)"),
+                  "1.840 on Nemotron-H 4B's SSD and 0.663 against 1.018 on 30B's, its query/key launch "
+                  "0.499 and 0.277 of them (ssd-train-h100-fdab2424c)"),
     ('mma.sync', 'training'): (
         'pallas', "on an A100 SXM4 40GB, the port's forward and gradient 3.954 ms against the template's "
                   "4.217 on Nemotron-H 4B's SSD and 1.584 against 2.200 on 30B's (ssd-train-a100-fdab2424c)"),
