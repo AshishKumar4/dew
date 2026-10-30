@@ -40,10 +40,11 @@ from dew.nn.kernels.templates.attention import (
     KeySpans,
     Param,
     Split,
+    by_power,
     output_hooked,
     output_split,
     padded_call,
-    prescaled,
+    prescale,
 )
 from dew.nn.kernels.templates.attention_mosaic_program import (
     Tiles,
@@ -280,7 +281,8 @@ def _trained_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
         # The overflowed rows' guarded training walk, the plain-JAX mainloop's over this call's padding in
         # this launch's form (the rewalk's units kept, `algebra.unfolded`); its maxima and overflows
         # `walked_launches` does not read.
-        out, rows = attention_portable.padded_walk(form, call, hooks, block_q=tiles.block_q,
+        prescaled = dataclasses.replace(call, query=by_power(call.query, form.prescale))
+        out, rows = attention_portable.padded_walk(form, prescaled, hooks, block_q=tiles.block_q,
                                                    block_k=tiles.block_k, residuals=True)
         maximum, total, anchors, split = rows
         widened = (_widened(out, v.shape[-1]), maximum, total, anchors,
@@ -328,8 +330,10 @@ def _prepared(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     (`refused`, which the op's eligibility reads too)."""
     if reason := refused(query.dtype, query.shape[3], value.shape[3], hooks, backward=False, family=family):
         raise NotImplementedError(reason)
-    # The query taken by its scale's power of two before its products (`prescale`).
-    query, scale, power = prescaled(query, scale)
+    # The query's power of two before its products (`prescale`), taken on each program's resident tile
+    # (`_held_query`): XLA's pass over the call's queries cost 0.073 ms of Qwen3-8B's 0.90 ms causal
+    # forward (ET-STEPHLO-h100, ET-OVERLAP1-h100).
+    power, scale = prescale(query.dtype, query.shape[3], scale)
     call = padded_call(query, key, value, spans, hooks, _block(tiles))
     spec = algebra.Forward(spans.form, spans.keys, ids=spans.query_ids is not None, scale=scale,
                            score_mod=hooks.score_mod, natural=natural, headroom=algebra.headroom(value.dtype),
@@ -376,6 +380,16 @@ def _scored(program: _Program, spec: algebra.Forward, q, index, slots, first, sp
     return k_first, coords, logits, products
 
 
+def _held_query(family: mosaic.Family, spec: algebra.Forward, q_view, q_smem, q_loaded):
+    """A consumer's query block loaded from `q_view` into `q_smem` (its barrier `q_loaded`) and taken there
+    by its call's power of two (`spec.prescale`, `by_power`), once before every product of the walk reads
+    it, the operand every step reads (`Family.held`)."""
+    family.loaded(((q_view, q_smem, q_loaded),))
+    if spec.prescale != 1.0:
+        family.staged(by_power(family.tile_of(q_smem), spec.prescale), q_smem)
+    return family.held(q_smem)
+
+
 def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_view, status_views, q_smem,
               q_loaded, out_smem, row_smem, streams, views: dict, turn, streamed: tuple, first,
               spans: _Spans | None, hooked: _Hooked, guard: _Guard | None, place: tuple, *, hooks: Hooks,
@@ -395,8 +409,7 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
     row, head, kv_head = place
     family, tiles = program.family, program.tiles
     lo, hi, whole = program.reach(first, spans, row)
-    family.loaded(((q_view, q_smem, q_loaded),))
-    q = family.held(q_smem)
+    q = _held_query(family, spec, q_view, q_smem, q_loaded)
     # The output's sums are as wide as its stage (a training walk's its split sums'), the values' width
     # whatever the query's.
     value_width = out_smem.shape[-1]
@@ -542,8 +555,7 @@ def _peak_consumer(program: _Program, spec: algebra.Forward, consumer, q_view, p
     own (`_consumer`)."""
     family, tiles = program.family, program.tiles
     lo, hi, whole = program.reach(first, spans, place[0])
-    family.loaded(((q_view, q_smem, q_loaded),))
-    q = family.held(q_smem)
+    q = _held_query(family, spec, q_view, q_smem, q_loaded)
     pl.when(consumer == 1)(turn)
 
     def step(index, slots, arg, accumulators):
