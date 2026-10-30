@@ -306,6 +306,19 @@ def test_a_programs_calls_of_two_shapes_compile_at_once_from_two_threads():
     np.testing.assert_array_equal(outputs[1], jnp.full(3, 2.0))
 
 
+def test_a_program_without_mosaic_compiles_while_kernel_reports_are_held(tmp_path):
+    """A plain program needs no Mosaic report: another thread's report scope must not block its compile."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from dew.nn.kernels.templates import report
+
+    run = program(lambda x: x * 7 + 3)
+    values = np.arange(11, dtype=np.float32)
+    with ThreadPoolExecutor(1) as pool, report.reported(str(tmp_path)):
+        executable = pool.submit(run.executable, values).result(timeout=30)
+    np.testing.assert_array_equal(executable(values), values * 7 + 3)
+
+
 def test_a_program_is_its_jit_within_another_trace_and_keys_its_statics_as_jit_does():
     """Within `jax.grad`, `jax.vmap` or an enclosing jit a program is its jit, traced into theirs, its
     tracers its arguments or ones its function closes over, and under `jax.disable_jit` Python; called
