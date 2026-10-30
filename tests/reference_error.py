@@ -911,6 +911,24 @@ def leaf_summaries(references, truths) -> list[RecordedLeaf]:
     return _summaries(references, _LaidTruths.of(truths))
 
 
+def rows_summary(rows, truth, *, finite: bool, dtype: str, mse: float | None = None) -> RecordedLeaf:
+    """`leaf_summary` of a leaf from each row's RMS distance from its float64 truth `rows` alone, where the
+    reference ran apart and kept those (a recorder whose outputs are too large to keep, its rows its
+    leaf's every axis but the last, in C order): its mean squared error the rows' mean square, every row
+    one width, unless `mse` gives it; `finite` whether the reference's leaf was, and `dtype` its dtype.
+    The truth's rows are read as `_summaries` reads them (`_LaidTruths`), and an empty leaf is exact,
+    as `leaf_summary` reads one."""
+    if not np.size(truth):
+        return RecordedLeaf(0.0, 0.0, np.zeros(0, np.int64), np.zeros(0), finite=finite, dtype=dtype)
+    held, rows = _LaidTruths.of([truth]), np.asarray(rows, np.float64)
+    sized = held.sizes > 0
+    logged = float(np.max(_log_over(rows[sized], held.sizes[sized]))) if sized.any() else LOG_ZERO
+    return RecordedLeaf(float(np.mean(np.square(rows))) if mse is None else mse,
+                        float(np.max(_over(rows[sized], held.sizes[sized]))) if sized.any() else 0.0,
+                        np.flatnonzero(~sized), rows[~sized], finite=finite and bool(held.finite.all()),
+                        dtype=dtype, zero_sizes=held.own[~sized], worst_log=logged)
+
+
 @dataclasses.dataclass(frozen=True)
 class _LaidTruths:
     """A draw's truth leaves read at once for both arms (`_summaries`). Every leaf that is not empty lies
@@ -2251,6 +2269,13 @@ def _applied(equation, inputs, given, wanted: bool):
                      for energy, value in zip(made, outputs, strict=True)]
 
 
+def scan_groups(params, operands: int) -> tuple[int, int]:
+    """A scan equation's (`params`, of `operands` operands) constants and carries, its step's first
+    operands, as its operand tree declares them (`ft_in`)."""
+    constants, carries, _ = (len(group) for group in params["ft_in"].update(range(operands)).unpack())
+    return constants, carries
+
+
 def scanned_steps(params, inputs: list[tuple], body, lanes: int) -> list[tuple]:
     """A scan (lax.scan's equation `params`) over `inputs` a step at a time, as the gate's evaluators
     walk one (`float64_terms`, check 2's `certified`): each input a tuple of lanes, a value and what an
@@ -2259,7 +2284,7 @@ def scanned_steps(params, inputs: list[tuple], body, lanes: int) -> list[tuple]:
     thread from step to step and each further output stacks over the steps in scan order, a lane where
     every step has one (else None); an empty scan's from its outvars' avals, its `lanes` - 1 others None."""
     jaxpr = params["jaxpr"].jaxpr
-    constants, carries, _ = (len(group) for group in params["ft_in"].update(range(len(inputs))).unpack())
+    constants, carries = scan_groups(params, len(inputs))
     consts, carry, xs = (inputs[:constants], inputs[constants:constants + carries],
                          inputs[constants + carries:])
     ys = []
