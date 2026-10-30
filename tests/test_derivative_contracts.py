@@ -335,11 +335,11 @@ def test_an_exact_gelu_holds_every_order(edge):
                     plain_fn=plain)
 
 
-@pytest.mark.parametrize("edge", EDGES)
+@pytest.mark.parametrize("edge", ["normal", "near the least normal"])
 def test_a_time_shift_holds_every_order(edge):
     """`schedules.flow.time_shift` (its derivative in the regular form): every order finite wherever float64
-    is a normal float32 and the plain shifted time, shift t / (1 + (shift - 1) t), is, over times in (0, 1]
-    scaled to the edge."""
+    is a normal float32 and the plain shifted time, shift t / (1 + (shift - 1) t), is, over times in (0, 1],
+    its domain, and near its least normal; a time past 1 is no time of a schedule's."""
     rng = np.random.default_rng(2644)
     t = jnp.asarray(rng.uniform(1e-3, 1.0, (9,)) * EDGES[edge], jnp.float32)
     direction = jnp.asarray(rng.standard_normal(t.shape) * EDGES[edge], jnp.float32)
