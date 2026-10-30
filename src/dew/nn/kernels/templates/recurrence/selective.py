@@ -359,8 +359,10 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan):
 
 def _summed_rows(tile, view, smem, family) -> None:
     """Each row of `tile` `[rows, block]` fp32 summed over its columns (the program's channels) and stored to
-    `view` `[rows]` through `smem`."""
-    family.stored([jnp.sum(tile[...], axis=1)], [view], smem=smem)
+    `view` `[rows]`: the tile loaded in the family's accumulator layout, whose rows' sums its row layout
+    holds (as the mainloop's range terms leave)."""
+    del smem
+    view[...] = jnp.sum(plgpu.load(tile, (), layout=family.layout, optimized=False), axis=1)
 
 
 def selective_scan(x, dt, A, B, C, D, state=None, starts=None, *, family: mosaic.Family, chunk: int = 32,
