@@ -1,0 +1,158 @@
+"""DreamerV3 (`dew.objectives.rl.dreamer`, `dew.rl.distributions`) against its code's arithmetic
+(danijar/dreamerv3 at e01491fad6434b2245a3b8ca201dd7faedcc458c) transcribed here in NumPy float64,
+an episode driver's records against the steps it took, and an agent that learns its world."""
+
+import itertools
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+import optax
+from flax import struct
+from recording import RecordingTracker
+from reference_error import assert_computes_the_oracle, chain_roundings
+
+from dew.objectives.rl.dreamer import DreamerRollout, DreamerV3Objective, LatentEnv, WorldModel, lambda_return
+from dew.rl.distributions import symexp, symlog, twohot_bins, twohot_loss, twohot_mean
+from dew.rl.env import Batched, Carry, Driven, TimeLimit, TimeStep, env_rollout, start
+
+
+def test_two_hot_predicts_zero_at_uniform_odds_and_trains_toward_its_encoding():
+    """Uniform logits predict exactly zero over the symmetric bins; the loss is the cross-entropy of
+    the target's two-hot encoding, its weight split between the neighbouring bins in inverse
+    proportion to their distances (outs.py:311-323), within float64 rounding of that encoding built
+    bin by bin; and symexp inverts symlog."""
+    bins = np.asarray(twohot_bins(255), np.float64)
+    assert float(twohot_mean(jnp.zeros(255), jnp.asarray(bins, jnp.float32))) == 0.0
+    rng = np.random.default_rng(0)
+    targets = np.concatenate([symexp(rng.uniform(-8, 8, 30)), [bins[0] * 2, bins[-1] * 2, bins[130]]])
+    logits = rng.normal(size=(len(targets), 255))
+    with jax.enable_x64(new_val=True):
+        found = np.asarray(twohot_loss(logits, targets, jnp.asarray(bins)))
+        roundings = chain_roundings(jax.make_jaxpr(twohot_loss)(logits, targets, jnp.asarray(bins)))
+        inverted = np.asarray(symexp(symlog(jnp.asarray(targets))))
+    log_softmax = logits - np.log(np.sum(np.exp(logits - logits.max(-1, keepdims=True)), -1,
+                                         keepdims=True)) - logits.max(-1, keepdims=True)
+    expected = []
+    for target, row in zip(targets, log_softmax, strict=True):
+        below = min(max(int(np.sum(bins <= target)) - 1, 0), 254)
+        above = min(max(255 - int(np.sum(bins > target)), 0), 254)
+        if below == above:
+            expected.append(-row[below])
+            continue
+        span = bins[above] - bins[below]
+        share = (bins[above] - target) / span
+        expected.append(-(share * row[below] + (1 - share) * row[above]))
+    assert_computes_the_oracle(found, np.asarray(expected), "the two-hot loss", roundings=roundings)
+    assert_computes_the_oracle(inverted, targets, "symexp of symlog", roundings=8)
+
+
+def test_lambda_returns_are_the_codes_recursion():
+    """The lambda-returns over sequences that end and terminate within them, within float64 rounding
+    of the code's Python loop (agent.py:482-490) run here in NumPy."""
+    rng = np.random.default_rng(1)
+    shape = (5, 9)
+    last, term = (rng.uniform(size=shape) < 0.2).astype(float), (rng.uniform(size=shape) < 0.2).astype(float)
+    reward, value, boot = (rng.normal(size=shape) for _ in range(3))
+    with jax.enable_x64(new_val=True):
+        found = np.asarray(lambda_return(last, term, reward, value, boot, 0.997, 0.95))
+        roundings = chain_roundings(jax.make_jaxpr(
+            lambda *a: lambda_return(*a, 0.997, 0.95))(last, term, reward, value, boot))
+    rets = [boot[:, -1]]
+    live = (1 - term)[:, 1:] * 0.997
+    cont = (1 - last)[:, 1:] * 0.95
+    interm = reward[:, 1:] + (1 - cont) * live * boot[:, 1:]
+    for t in reversed(range(live.shape[1])):
+        rets.append(interm[:, t] + live[:, t] * cont[:, t] * rets[-1])
+    expected = np.stack(list(reversed(rets))[:-1], 1)
+    assert_computes_the_oracle(found, expected, "lambda-returns", roundings=roundings)
+
+
+@struct.dataclass
+class Target:
+    """A point on a line the action moves by itself, paid minus its squared distance from 1, its
+    episode terminated past 3 from the origin."""
+
+    action_size: int = struct.field(pytree_node=False, default=1)
+
+    def reset(self, key):
+        x = jax.random.uniform(key, (), minval=-1, maxval=1)
+        return x, TimeStep(x[None], jnp.zeros(()), jnp.zeros((), bool), jnp.zeros((), bool))
+
+    def step(self, x, action):
+        x = x + 0.5 * action[0]
+        return x, TimeStep(x[None], -jnp.square(x - 1), jnp.abs(x) > 3, jnp.zeros((), bool))
+
+
+def test_a_driver_records_an_episodes_last_observation_then_restarts():
+    """Driven answers each step whole: an episode's last observation is a step of its own, `last`,
+    with the reward that came with it, and the step after it, whatever the action, starts the next
+    episode, `first`, with no reward."""
+    env = Driven(Batched(TimeLimit(Target(), episode_length=3), 4))
+
+    def push(params, observed, key, memory):
+        return jnp.ones((4, 1)), {}, None
+
+    _, recorded = env_rollout(env, push, None, start(env, jax.random.key(2)), 9, reset=False)
+    first, last = np.asarray(recorded.observation["first"]), np.asarray(recorded.observation["last"])
+    np.testing.assert_array_equal(first, np.broadcast_to((np.arange(9) % 4 == 0)[:, None], (9, 4)))
+    np.testing.assert_array_equal(last, np.broadcast_to((np.arange(9) % 4 == 3)[:, None], (9, 4)))
+    rewards = np.asarray(recorded.observation["reward"])
+    assert (rewards[first] == 0).all() and (rewards[~first] != 0).all()
+
+
+def tiny(observation_size=1, action_size=1):
+    return WorldModel(observation_size, action_size, deter=16, hidden=8, stoch=4, classes=4, blocks=2,
+                      units=8)
+
+
+def test_imagination_is_the_world_models_prior_stepped_in_an_env_rollout():
+    """Imagining through `env_rollout` over the `LatentEnv` takes the GRU and the prior's draw each
+    step, as stepping the model's own functions one at a time from the same keys does, bit for bit."""
+    model = tiny()
+    objective = DreamerV3Objective(model)
+    variables = objective.init(jax.random.key(3))
+    bins = twohot_bins(model.bins)
+    env = LatentEnv(model, variables, bins)
+    deter, stoch = model.initial((6,))
+    state, begin = env.at(deter, stoch, jax.random.key(4))
+    actions = jnp.asarray(np.random.default_rng(5).uniform(-1, 1, (4, 6, 1)), jnp.float32)
+
+    def scripted(params, feature, key, memory):
+        return actions[memory], {}, memory + 1
+
+    _, imagined = jax.jit(lambda carry: env_rollout(env, scripted, None, carry, 4, reset=False))(
+        Carry(state, begin, jax.random.key(6), jnp.zeros((), jnp.int32)))
+
+    @jax.jit
+    def stepped(state):
+        features = []
+        for index in range(4):
+            state, step = env.step(state, actions[index])
+            features.append(step.observation)
+        return jnp.stack(features)
+
+    np.testing.assert_array_equal(imagined.following.observation, stepped(state))
+
+
+def test_an_agent_learns_its_world_and_its_return_rises():
+    """A small DreamerV3 agent acting in batched target walks, trained from its replay at the code's
+    ratio, lowers its world model's prediction losses and raises its episodes' return over its
+    first collections."""
+    from dew.data.dataset import Loader
+    from dew.training import Trainer
+
+    env = Batched(TimeLimit(Target(), episode_length=20), 8)
+    objective = DreamerV3Objective(tiny())
+    rollout = DreamerRollout(objective, env, capacity=400, batch=8, length=16, train_ratio=32.0, prefill=24)
+    tracker = RecordingTracker()
+    trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(7), rollout=rollout, tracker=tracker)
+    data = Loader(train=lambda partition: itertools.repeat({"step": np.zeros((4,), np.float32)}), val=None,
+                  records=4, batch=4)
+    trainer.fit(data, steps=150, log_every=1)
+    seen = [scalars for _, scalars in tracker.scalars if "loss_decoder" in scalars]
+    early, late = seen[:20], seen[-20:]
+    for name in ("loss_decoder", "loss_reward"):
+        assert np.mean([m[name] for m in late]) < np.mean([m[name] for m in early]), name
+    returns = [m["episode_return"] for m in seen if np.isfinite(m.get("episode_return", np.nan))]
+    assert np.mean(returns[-5:]) > np.mean(returns[:5]), returns

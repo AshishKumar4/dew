@@ -1,0 +1,537 @@
+"""DreamerV3 (Hafner et al., arXiv 2301.04104 v2 and Nature 2025) for vector observations, as its code
+computes it (danijar/dreamerv3 at e01491fad6434b2245a3b8ca201dd7faedcc458c, cited by file:line).
+
+The world model is an RSSM: a block-diagonal GRU's deterministic state `deter` (rssm.py:135-158),
+a posterior over `stoch` categoricals of `classes` classes from it and the encoded observation, a
+prior from it alone (1% unimix, straight-through draws, rssm.py:161-176), and heads off the two
+concatenated: the symlog-MSE decoder, the two-hot reward, the Bernoulli continue. It is trained
+on replayed windows by the decoder's, reward's and continue's losses and the dynamics and
+representation KLs with one free nat (rssm.py:120-133, agent.py:156-182).
+
+The world model is an `Env` whose state is the latent and whose step is the prior (`LatentEnv`), so
+the actor and critic learn in imagination through the same `env_rollout` acting in a simulator
+runs: from every replayed posterior state, 15 imagined steps (agent.py:189-201). The critic is a
+two-hot head trained toward the imagination's lambda-returns and toward its own slow EMA
+(agent.py:382-447), and toward the replay's lambda-returns at 0.3 (agent.py:449-480); the actor by
+REINFORCE on the returns less the values, over the 5th-to-95th percentile range of the returns
+floored at 1 (utils.py:16-72), with an entropy bonus of 3e-4.
+
+Two differences from the code: a window starts from a zero latent at its first step, which the
+code's replay context instead resumes from a latent stored at acting time; and the computation runs
+in float32 where the code runs bfloat16.
+"""
+
+from __future__ import annotations
+
+import math
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+import jax
+import jax.numpy as jnp
+import optax
+from flax import linen as nn, struct
+
+from dew.batch import Batch, Variables, merge
+from dew.objectives.base import Aux, EMASpec, Objective, Ratio, Shown, Step, under
+from dew.rl.distributions import (
+    categorical_kl,
+    onehot_sample,
+    symlog,
+    twohot_bins,
+    twohot_loss,
+    twohot_mean,
+    unimix_log_probs,
+)
+from dew.rl.env import Carry, Driven, Env, TimeStep, env_rollout, start
+from dew.rl.replay import ReplayBuffer
+
+if TYPE_CHECKING:
+    from dew.state import TrainState
+
+
+def _init(scale: float = 1.0) -> nn.initializers.Initializer:
+    """The code's `trunc_normal_in`: a normal truncated to two deviations, times 1.1368 sqrt(1 / fan
+    in), times `scale` (nets.py:144-186)."""
+    if scale == 0:
+        return nn.initializers.zeros
+    return nn.initializers.variance_scaling((1.1368 * scale) ** 2, "fan_in", "truncated_normal")
+
+
+class _Layers(nn.Module):
+    """`count` layers of a linear map to `units`, an RMS norm and SiLU (nets.py:565)."""
+
+    units: int
+    count: int
+
+    @nn.compact
+    def __call__(self, x: jax.Array) -> jax.Array:
+        for _ in range(self.count):
+            x = nn.silu(nn.RMSNorm(epsilon=1e-4)(nn.Dense(self.units, kernel_init=_init())(x)))
+        return x
+
+
+class _BlockLinear(nn.Module):
+    """A block-diagonal linear map of `blocks` blocks to `features` (nets.py:254)."""
+
+    features: int
+    blocks: int
+
+    @nn.compact
+    def __call__(self, x: jax.Array) -> jax.Array:
+        grouped = x.reshape(*x.shape[:-1], self.blocks, x.shape[-1] // self.blocks)
+        fan = grouped.shape[-1]
+        kernel = self.param("kernel", _init(), (self.blocks, fan, self.features // self.blocks))
+        bias = self.param("bias", nn.initializers.zeros, (self.features,))
+        return jnp.einsum("...gi,gio->...go", grouped, kernel).reshape(*x.shape[:-1], self.features) + bias
+
+
+class WorldModel(nn.Module):
+    """DreamerV3's networks over observations of `observation_size` and continuous actions of
+    `action_size` in [-1, 1]. The defaults are the code's 1M model (configs.yaml `size1m`, which its
+    DM Control proprio preset trains): a 512-wide deterministic state in 8 blocks, 32 categoricals of
+    4 classes, 64 hidden and 64 units a layer."""
+
+    observation_size: int
+    action_size: int
+    deter: int = 512
+    hidden: int = 64
+    stoch: int = 32
+    classes: int = 4
+    blocks: int = 8
+    units: int = 64
+    bins: int = 255
+    unimix: float = 0.01
+    min_std: float = 0.1
+    max_std: float = 1.0
+
+    def setup(self) -> None:
+        self.encoder = _Layers(self.units, 3)
+        self.dynamics_in = [nn.Dense(self.hidden, kernel_init=_init()) for _ in range(3)]
+        self.dynamics_norms = [nn.RMSNorm(epsilon=1e-4) for _ in range(3)]
+        self.dynamics_hidden = _BlockLinear(self.deter, self.blocks)
+        self.dynamics_hidden_norm = nn.RMSNorm(epsilon=1e-4)
+        self.gru = _BlockLinear(3 * self.deter, self.blocks)
+        self.posterior_layers = _Layers(self.hidden, 1)
+        self.posterior_logits = nn.Dense(self.stoch * self.classes, kernel_init=_init())
+        self.prior_layers = _Layers(self.hidden, 2)
+        self.prior_logits = nn.Dense(self.stoch * self.classes, kernel_init=_init())
+        self.decoder = _Layers(self.units, 3)
+        self.decoded = nn.Dense(self.observation_size, kernel_init=_init())
+        self.reward_layers = _Layers(self.units, 1)
+        self.reward_logits = nn.Dense(self.bins, kernel_init=_init(0.0))
+        self.continue_layers = _Layers(self.units, 1)
+        self.continue_logit = nn.Dense(1, kernel_init=_init())
+        self.policy_layers = _Layers(self.units, 3)
+        self.policy_mean = nn.Dense(self.action_size, kernel_init=_init(0.01))
+        self.policy_std = nn.Dense(self.action_size, kernel_init=_init(0.01))
+        self.value = Critic(self.units, self.bins)
+
+    def __call__(self, observation: jax.Array, action: jax.Array) -> jax.Array:
+        """Every network once, for initialization: a step from a zero latent."""
+        deter, stoch = self.initial(observation.shape[:-1])
+        deter = self.core(deter, stoch, action)
+        stoch = self.categorical(self.posterior(deter, self.embed(observation)))
+        feature = self.feature(deter, stoch)
+        mean, _ = self.policy(feature)
+        return (self.decode(feature).sum() + self.reward(feature).sum() + self.continue_(feature).sum()
+                + mean.sum() + self.value(feature).sum() + self.prior(deter).sum())
+
+    def initial(self, batch: tuple[int, ...]) -> tuple[jax.Array, jax.Array]:
+        return jnp.zeros((*batch, self.deter)), jnp.zeros((*batch, self.stoch, self.classes))
+
+    def embed(self, observation: jax.Array) -> jax.Array:
+        """The encoder's tokens of an observation, symlogged first (rssm.py:218)."""
+        return self.encoder(symlog(observation))
+
+    def core(self, deter: jax.Array, stoch: jax.Array, action: jax.Array) -> jax.Array:
+        """The block GRU's next deterministic state (rssm.py:135-158)."""
+        action = action / jax.lax.stop_gradient(jnp.maximum(1, jnp.abs(action)))
+        parts = [nn.silu(norm(dense(x))) for dense, norm, x in
+                 zip(self.dynamics_in, self.dynamics_norms,
+                     (deter, stoch.reshape(*stoch.shape[:-2], -1), action), strict=True)]
+        joined = jnp.concatenate(parts, -1)[..., None, :].repeat(self.blocks, -2)
+        grouped = deter.reshape(*deter.shape[:-1], self.blocks, -1)
+        x = jnp.concatenate([grouped, joined], -1).reshape(*deter.shape[:-1], -1)
+        x = nn.silu(self.dynamics_hidden_norm(self.dynamics_hidden(x)))
+        gates = self.gru(x).reshape(*deter.shape[:-1], self.blocks, -1)
+        reset, candidate, update = (part.reshape(*deter.shape[:-1], -1) for part in jnp.split(gates, 3, -1))
+        candidate = jnp.tanh(jax.nn.sigmoid(reset) * candidate)
+        update = jax.nn.sigmoid(update - 1)
+        return update * candidate + (1 - update) * deter
+
+    def posterior(self, deter: jax.Array, tokens: jax.Array) -> jax.Array:
+        """The posterior's log-probabilities `[..., stoch, classes]` (rssm.py:75-92)."""
+        logits = self.posterior_logits(self.posterior_layers(jnp.concatenate([deter, tokens], -1)))
+        return unimix_log_probs(logits.reshape(*logits.shape[:-1], self.stoch, self.classes), self.unimix)
+
+    def prior(self, deter: jax.Array) -> jax.Array:
+        logits = self.prior_logits(self.prior_layers(deter))
+        return unimix_log_probs(logits.reshape(*logits.shape[:-1], self.stoch, self.classes), self.unimix)
+
+    def categorical(self, log_probs: jax.Array) -> jax.Array:
+        return onehot_sample(self.make_rng("latent"), log_probs)
+
+    @staticmethod
+    def feature(deter: jax.Array, stoch: jax.Array) -> jax.Array:
+        return jnp.concatenate([deter, stoch.reshape(*stoch.shape[:-2], -1)], -1)
+
+    def decode(self, feature: jax.Array) -> jax.Array:
+        return self.decoded(self.decoder(feature))
+
+    def reward(self, feature: jax.Array) -> jax.Array:
+        return self.reward_logits(self.reward_layers(feature))
+
+    def continue_(self, feature: jax.Array) -> jax.Array:
+        return self.continue_logit(self.continue_layers(feature))[..., 0]
+
+    def policy(self, feature: jax.Array) -> tuple[jax.Array, jax.Array]:
+        """The bounded normal's mean, tanh of its head, and its deviation between the floor and the
+        ceiling (heads.py:146-155)."""
+        x = self.policy_layers(feature)
+        std = (self.max_std - self.min_std) * jax.nn.sigmoid(self.policy_std(x) + 2.0) + self.min_std
+        return jnp.tanh(self.policy_mean(x)), std
+
+
+class Critic(nn.Module):
+    """The two-hot value head, 3 layers then zero-initialized logits (configs.yaml `value`)."""
+
+    units: int
+    bins: int
+
+    @nn.compact
+    def __call__(self, feature: jax.Array) -> jax.Array:
+        return nn.Dense(self.bins, kernel_init=_init(0.0))(_Layers(self.units, 3)(feature))
+
+
+def normal_log_prob(action: jax.Array, mean: jax.Array, std: jax.Array) -> jax.Array:
+    return jnp.sum(-0.5 * jnp.square((action - mean) / std) - jnp.log(std) - 0.5 * math.log(2 * math.pi), -1)
+
+
+def normal_entropy(std: jax.Array) -> jax.Array:
+    return jnp.sum(0.5 + 0.5 * math.log(2 * math.pi) + jnp.log(std), -1)
+
+
+def lambda_return(last: jax.Array, term: jax.Array, reward: jax.Array, value: jax.Array, boot: jax.Array,
+                  discount: float, lam: float) -> jax.Array:
+    """The code's lambda-returns `[B, T - 1]` of sequences `[B, T]` (agent.py:482-490): from the last
+    bootstrap backward, each step's reward plus the discounted blend of its bootstrap and the next
+    return, cut where the episode ended (`last`) or terminated (`term`)."""
+    live = (1 - term)[:, 1:] * discount
+    cont = (1 - last)[:, 1:] * lam
+    between = reward[:, 1:] + (1 - cont) * live * boot[:, 1:]
+
+    def back(following, inputs):
+        step, alive, kept = inputs
+        current = step + alive * kept * following
+        return current, current
+
+    _, returns = jax.lax.scan(back, boot[:, -1], (between.T, live.T, cont.T), reverse=True)
+    return returns.T
+
+
+@struct.dataclass
+class _Latent:
+    deter: jax.Array
+    stoch: jax.Array
+    key: jax.Array
+
+
+@struct.dataclass
+class LatentEnv:
+    """The world model as an `Env`: its state the latent and a key, its step the GRU and a draw from
+    the prior, its observation the latent's feature, its reward the reward head's two-hot mean and
+    its `terminated` never set: the continue head's probability weighs an imagined step instead
+    (agent.py:396-405). It starts where it is given (`at`), never by `reset`."""
+
+    model: WorldModel = struct.field(pytree_node=False)
+    variables: Variables
+    bins: jax.Array
+
+    @property
+    def action_size(self) -> int:
+        return self.model.action_size
+
+    def at(self, deter: jax.Array, stoch: jax.Array, key: jax.Array) -> tuple[_Latent, jax.Array]:
+        return _Latent(deter, stoch, key), WorldModel.feature(deter, stoch)
+
+    def reset(self, key: jax.Array) -> tuple[_Latent, TimeStep]:
+        raise TypeError("an imagination starts from replayed latents (LatentEnv.at), never a reset")
+
+    def step(self, state: _Latent, action: jax.Array) -> tuple[_Latent, TimeStep]:
+        key, latent = jax.random.split(state.key)
+        model = self.model.bind(self.variables, rngs={"latent": latent})
+        deter = model.core(state.deter, state.stoch, action)
+        stoch = model.categorical(model.prior(deter))
+        feature = WorldModel.feature(deter, stoch)
+        reward = twohot_mean(model.reward(feature), self.bins)
+        never = jnp.zeros(reward.shape, bool)
+        return _Latent(deter, stoch, key), TimeStep(feature, reward, never, never)
+
+
+class DreamerV3Objective(Objective[Ratio]):
+    """DreamerV3 over a `WorldModel` (the module docstring). A batch holds replayed windows `[B, T]`
+    of DreamerV3's steps (`Driven`): `observation`, the `action` taken at it, the `reward` that came
+    with it, and whether it was its episode's `first`, `last` or `terminal`. The scales weigh the
+    losses (configs.yaml `loss_scales`); `horizon` sets the continue target's discount, 1 - 1/333;
+    `imagination` is the imagined steps from each replayed state, `lam` the lambda-returns' lambda,
+    `entropy` the actor's bonus, `slow_decay` the slow critic's EMA and `return_rate` the rate of
+    the returns' percentile EMA. The slow critic is the EMA slot over the critic alone."""
+
+    shown: Mapping[str, Shown] = {"loss": Shown(), "episode_return": Shown(better="higher")}
+    scales: Mapping[str, float] = {"decoder": 1.0, "reward": 1.0, "continue": 1.0, "dynamics": 1.0,
+                                   "representation": 0.1, "policy": 1.0, "value": 1.0, "replay_value": 0.3}
+
+    def __init__(self, model: WorldModel, *, horizon: float = 333.0, imagination: int = 15,
+                 lam: float = 0.95, entropy: float = 3e-4, free_nats: float = 1.0, slow_decay: float = 0.98,
+                 return_rate: float = 0.01, variables: Variables | None = None):
+        if imagination < 1 or not 0 <= lam <= 1 or horizon <= 1:
+            raise ValueError("imagination must be positive, lam in [0, 1] and the horizon past one step")
+        self.model, self.horizon, self.imagination, self.lam = model, horizon, imagination, lam
+        self.entropy, self.free_nats, self.return_rate = entropy, free_nats, return_rate
+        self.variables = variables
+        self.ema = EMASpec(optax.constant_schedule(slow_decay), under("params", "value"))
+        self.bins = twohot_bins(model.bins)
+
+    def held_variables(self) -> Variables | None:
+        return self.variables
+
+    def fresh_variables(self, key: jax.Array, held: Variables | None) -> Variables:
+        params_key, latent = jax.random.split(key)
+        inputs = jnp.zeros((1, self.model.observation_size)), jnp.zeros((1, self.model.action_size))
+        tree = self.model.init({"params": params_key, "latent": latent}, *inputs)
+        # The returns' 5th and 95th percentiles, an EMA from zero (utils.py:16-72, debias off).
+        return {**tree, "returns": {"low": jnp.zeros(()), "high": jnp.zeros(())}}
+
+    @property
+    def validation_loss_refusal(self) -> str | None:
+        return "DreamerV3 scores its agent by its episodes' returns, not a validation loss"
+
+    def observe(self, model: WorldModel, deter: jax.Array, stoch: jax.Array, observation: jax.Array,
+                previous: jax.Array, first: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+        """One posterior step: the latent and action masked where an episode starts, the GRU, then
+        the posterior's draw; the new latent, beside the posterior's log-probabilities."""
+        keep = (~first)[..., None]
+        deter, previous = deter * keep, previous * keep
+        stoch = stoch * keep[..., None]
+        deter = model.core(deter, stoch, previous)
+        posterior = model.posterior(deter, model.embed(observation))
+        return deter, model.categorical(posterior), posterior
+
+    def act(self, variables: Variables, observed: Mapping[str, jax.Array], key: jax.Array,
+            memory: tuple[jax.Array, jax.Array, jax.Array]) -> tuple[jax.Array, dict, tuple]:
+        """The agent's step in an environment (`dew.rl.env.Policy` over `Driven`): the posterior
+        given the step's observation, then an action drawn from the policy, clipped to [-1, 1]."""
+        latent, draw = jax.random.split(key)
+        model = self.model.bind(variables, rngs={"latent": latent})
+        deter, stoch, previous = memory
+        deter, stoch, _ = self.observe(model, deter, stoch, observed["observation"], previous,
+                                       observed["first"])
+        mean, std = model.policy(WorldModel.feature(deter, stoch))
+        action = jnp.clip(mean + std * jax.random.normal(draw, mean.shape), -1, 1)
+        return action, {}, (deter, stoch, action)
+
+    def memory(self, count: int) -> tuple[jax.Array, jax.Array, jax.Array]:
+        """The agent's memory at the start: a zero latent and a zero previous action for each of
+        `count` environments."""
+        deter, stoch = self.model.initial((count,))
+        return deter, stoch, jnp.zeros((count, self.model.action_size))
+
+    def loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[Ratio, Aux]:
+        world_key, imagine_key = jax.random.split(step.key)
+        model = self.model.bind(variables, rngs={"latent": world_key})
+        observation, action = batch["observation"], batch["action"]
+        reward = jnp.asarray(batch["reward"], jnp.float32)
+        # A window starts its episode's latent afresh at its first step.
+        first = jnp.asarray(batch["first"], bool).at[:, 0].set(True)
+        last, terminal = jnp.asarray(batch["last"], jnp.float32), jnp.asarray(batch["terminal"], jnp.float32)
+        previous = jnp.concatenate([jnp.zeros_like(action[:, :1]), action[:, :-1]], 1)
+        rows, length = reward.shape
+
+        def observed(latent, inputs):
+            deter, stoch = latent
+            observation, previous, first = inputs
+            deter, stoch, posterior = self.observe(model, deter, stoch, observation, previous, first)
+            return (deter, stoch), (deter, stoch, posterior)
+
+        _, (deter, stoch, posterior) = jax.lax.scan(
+            observed, model.initial((rows,)),
+            tuple(jnp.swapaxes(x, 0, 1) for x in (observation, previous, first)))
+        deter, stoch, posterior = (jnp.swapaxes(x, 0, 1) for x in (deter, stoch, posterior))
+        prior = model.prior(deter)
+        feature = WorldModel.feature(deter, stoch)
+        losses = {
+            "dynamics": jnp.maximum(categorical_kl(jax.lax.stop_gradient(posterior), prior).sum(-1),
+                                    self.free_nats),
+            "representation": jnp.maximum(categorical_kl(posterior, jax.lax.stop_gradient(prior)).sum(-1),
+                                          self.free_nats),
+            "decoder": jnp.sum(jnp.square(model.decode(feature) - symlog(observation)), -1),
+            "reward": twohot_loss(model.reward(feature), reward, self.bins),
+        }
+        alive = (1 - terminal) * (1 - 1 / self.horizon)
+        logit = model.continue_(feature)
+        losses["continue"] = -(alive * jax.nn.log_sigmoid(logit) + (1 - alive) * jax.nn.log_sigmoid(-logit))
+
+        # Imagination from every replayed posterior state, its inputs held still (agent.py:189-196).
+        env = LatentEnv(self.model, jax.lax.stop_gradient(variables), self.bins)
+        starts = jax.tree.map(lambda x: jax.lax.stop_gradient(x.reshape(rows * length, *x.shape[2:])),
+                              (deter, stoch))
+        latent_key, act_key = jax.random.split(imagine_key)
+        state, begin = env.at(*starts, latent_key)
+
+        def policy(params, feature, key, memory):
+            mean, std = self.model.apply(params, feature, method=WorldModel.policy)
+            return mean + std * jax.random.normal(key, mean.shape), {}, None
+
+        held = jax.lax.stop_gradient(variables)
+        _, imagined = env_rollout(env, policy, held, Carry(state, begin, act_key), self.imagination,
+                                  reset=False)
+        # The start's feature then each imagined one, and the action taken at each [B*T, H + 1].
+        features = jnp.concatenate([begin[:, None], jnp.swapaxes(imagined.following.observation, 0, 1)], 1)
+        last_action, _, _ = policy(held, features[:, -1], jax.random.fold_in(act_key, -1), None)
+        actions = jnp.concatenate([jnp.swapaxes(imagined.action, 0, 1), last_action[:, None]], 1)
+        rewards = twohot_mean(self.model.apply(held, features, method=WorldModel.reward), self.bins)
+        cont = jax.nn.sigmoid(self.model.apply(held, features, method=WorldModel.continue_))
+        values = twohot_mean(model.value(features), self.bins)
+        slow = merge(variables, jax.lax.stop_gradient(step.ema)) if step.ema is not None else held
+        slow_values = twohot_mean(self.model.apply(slow, features, method=lambda m, f: m.value(f)), self.bins)
+        weight = jax.lax.stop_gradient(jnp.cumprod(cont, 1))
+        returns = jax.lax.stop_gradient(lambda_return(jnp.zeros_like(cont), 1 - cont, rewards, values, values,
+                                                      1.0, self.lam))
+        rate, held_returns = self.return_rate, variables["returns"]
+        low = (1 - rate) * held_returns["low"] + rate * jnp.percentile(returns, 5)
+        high = (1 - rate) * held_returns["high"] + rate * jnp.percentile(returns, 95)
+        scale = jnp.maximum(1.0, high - low)
+        advantage = jax.lax.stop_gradient((returns - values[:, :-1]) / scale)
+        mean, std = model.policy(features)
+        log_pi = normal_log_prob(jax.lax.stop_gradient(actions), mean, std)[:, :-1]
+        imagined_policy = weight[:, :-1] * -(log_pi * advantage + self.entropy * normal_entropy(std)[:, :-1])
+        value_logits = model.value(features)
+        targets = jnp.concatenate([returns, jnp.zeros_like(returns[:, -1:])], 1)
+        imagined_value = weight[:, :-1] * (twohot_loss(value_logits, targets, self.bins)
+                                           + twohot_loss(value_logits, slow_values, self.bins))[:, :-1]
+        losses["policy"] = imagined_policy.mean(1).reshape(rows, length)
+        losses["value"] = imagined_value.mean(1).reshape(rows, length)
+
+        # The critic toward the replay's own lambda-returns, bootstrapped by imagination's (agent.py:449-480).
+        replay_logits = model.value(feature)
+        replay_values = twohot_mean(replay_logits, self.bins)
+        boot = returns[:, 0].reshape(rows, length)
+        replay_returns = jax.lax.stop_gradient(lambda_return(last, terminal, reward, replay_values, boot,
+                                                             1 - 1 / self.horizon, self.lam))
+        replay_slow = twohot_mean(self.model.apply(slow, feature, method=lambda m, f: m.value(f)), self.bins)
+        replay_targets = jnp.concatenate([replay_returns, jnp.zeros_like(replay_returns[:, -1:])], 1)
+        replay_value = (twohot_loss(replay_logits, replay_targets, self.bins)
+                        + twohot_loss(replay_logits, replay_slow, self.bins))
+        losses["replay_value"] = (1 - last)[:, :-1] * replay_value[:, :-1]
+
+        total = sum(self.scales[name] * jnp.mean(value) for name, value in losses.items())
+        metrics = {f"loss_{name}": jnp.mean(value) for name, value in losses.items()}
+        metrics.update(return_scale=scale, imagined_return=jnp.mean(returns))
+        stats = {"returns": {"low": jax.lax.stop_gradient(low), "high": jax.lax.stop_gradient(high)}}
+        return Ratio(total, jnp.ones(())), Aux(metrics, variables=stats)
+
+
+@dataclass
+class DreamerRollout:
+    """The trainer's rollout of a `DreamerV3Objective` (`dew.training.rollout.Rollout`): its agent acts
+    in `env`, a batched `Env` driven as `Driven` drives it, writing each step to a device replay of
+    `capacity` steps an environment; each update trains on `batch` windows of `length` replayed steps
+    while the agent takes environment steps so that each replays `train_ratio` steps (the code's
+    `run.train_ratio`), after `prefill` steps of each environment taken uniformly at random.
+    `metrics` reports the mean return of the episodes that ended since the last update."""
+
+    objective: DreamerV3Objective
+    env: Env
+    capacity: int = 100_000
+    batch: int = 16
+    length: int = 64
+    train_ratio: float = 1024.0
+    prefill: int = 64
+    _driven: Env = field(init=False, repr=False)
+    _carry: Carry | None = field(default=None, init=False, repr=False)
+    _replay: ReplayBuffer | None = field(default=None, init=False, repr=False)
+    _returns: jax.Array | None = field(default=None, init=False, repr=False)
+    _taken: int = field(default=0, init=False, repr=False)
+    _ended: tuple[float, int] = field(default=(0.0, 0), init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.prefill < self.length:
+            raise ValueError("the prefill must hold at least one window")
+        self._driven = Driven(self.env)
+        self._acted = jax.jit(self._steps, static_argnames=("steps", "random"))
+        self._sample = jax.jit(lambda replay, key: replay.sample(key, self.batch, self.length))
+
+    @property
+    def metrics(self) -> Mapping[str, float]:
+        total, count = self._ended
+        return {"episode_return": total / count if count else float("nan")}
+
+    @property
+    def environment_steps(self) -> int:
+        """The steps every environment has taken so far, summed."""
+        return self._taken
+
+    def _steps(self, variables: Variables, carry: Carry, replay: ReplayBuffer, returns: jax.Array, *,
+               steps: int, random: bool) -> tuple[Carry, ReplayBuffer, jax.Array, jax.Array, jax.Array]:
+        def uniform(params, observed, key, memory):
+            shape = (observed["reward"].shape[0], self.env.action_size)
+            return jax.random.uniform(key, shape, minval=-1, maxval=1), {}, memory
+
+        policy = uniform if random else self.objective.act
+        carry, recorded = env_rollout(self._driven, policy, variables, carry, steps, reset=False)
+        observed = recorded.observation
+        replay = replay.add({**observed, "action": recorded.action})
+        # Each environment's running return, read where its episode ends.
+        def tally(held, observed):
+            total = jnp.where(observed["first"], 0, held) + observed["reward"]
+            return total, (total, observed["last"])
+
+        returns, (totals, ended) = jax.lax.scan(tally, returns, observed)
+        return carry, replay, returns, jnp.sum(jnp.where(ended, totals, 0)), jnp.sum(ended)
+
+    def __call__(self, state: TrainState, batch: Batch, key: jax.Array) -> Batch:
+        act_key, sample_key = jax.random.split(key)
+        variables = state.variables
+        if self._carry is None:
+            count = self.env.reset(act_key)[1].reward.shape[0]
+            self._carry = start(self._driven, act_key, self.objective.memory(count))
+            observed = jax.tree.map(lambda leaf: leaf, self._carry.observation)
+            example = {**observed, "action": jnp.zeros((count, self.env.action_size))}
+            self._replay = ReplayBuffer.empty(example, self.capacity)
+            self._returns = jnp.zeros(count)
+            self._advance(variables, self.prefill, random=True)
+        owed = math.ceil((int(state.updates) + 1) * self.batch * self.length / self.train_ratio)
+        envs = self._returns.shape[0]
+        due = max(owed - (self._taken - self.prefill * envs), 0)
+        if due:
+            self._advance(variables, -(-due // envs), random=False)
+        windows = self._sample(self._replay, sample_key)
+        return jax.device_get(windows)
+
+    def _advance(self, variables: Variables, steps: int, *, random: bool) -> None:
+        self._carry, self._replay, self._returns, total, count = self._acted(
+            variables, self._carry, self._replay, self._returns, steps=steps, random=random)
+        self._taken += steps * self._returns.shape[0]
+        self._ended = (float(total), int(count))
+
+
+def episodes_return(objective: DreamerV3Objective, env: Env, variables: Variables, key: jax.Array,
+                    steps: int) -> float:
+    """The mean return of `env`'s environments over `steps` steps of the agent from fresh episodes,
+    each episode summed from its first step: one episode each where `steps` is its length."""
+    driven = Driven(env)
+    count = env.reset(key)[1].reward.shape[0]
+
+    @jax.jit
+    def run(variables: Variables, key: jax.Array) -> jax.Array:
+        carry = start(driven, key, objective.memory(count))
+        _, recorded = env_rollout(driven, objective.act, variables, carry, steps, reset=False)
+        return jnp.mean(jnp.sum(recorded.observation["reward"], axis=0))
+
+    return float(run(variables, key))
+
+
+__all__ = ["Critic", "DreamerRollout", "DreamerV3Objective", "LatentEnv", "WorldModel", "episodes_return",
+           "lambda_return", "normal_entropy", "normal_log_prob"]
