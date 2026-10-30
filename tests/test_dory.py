@@ -538,26 +538,52 @@ def test_a_float64_model_computes_in_float64():
 def test_a_cut_loop_trains_the_layers_before_it_through_the_input_every_pass_reads():
     """Cutting the loop before its last pass moves no forward value and no gradient past the
     loop, sends the layers before it a gradient through the input the last pass reinjects, and
-    drops the earlier passes' share of every gradient before the loop."""
+    drops the earlier passes' share of every gradient before the loop. The cut traces its passes apart
+    from the uncut loop's scan, so the two are held in float64, each within float64 rounding of the
+    other (`assert_computes_the_oracle`) where they compute the same."""
     loaded = load()
-    ids, cotangent = REFERENCE['input_ids'], REFERENCE['cotangent']
+    ids, cotangent = REFERENCE['input_ids'], REFERENCE['cotangent'].astype(np.float64)
 
     def run(backprop_steps):
-        model = loaded.model.with_passes(3, backprop_steps=backprop_steps)
+        model = loaded.model.with_passes(3, backprop_steps=backprop_steps).clone(dtype=jnp.float64)
+        variables = widened(loaded.variables)
 
         def loss(params):
-            return jnp.sum(model.apply({**loaded.variables, 'params': params}, ids) * cotangent)
+            return jnp.sum(model.apply({**variables, 'params': params}, ids) * cotangent)
 
-        return jax.value_and_grad(loss)(loaded.variables['params'])
+        stepped = jax.value_and_grad(loss)
+        return stepped(variables['params']), chain_roundings(jax.make_jaxpr(stepped)(variables['params']))
 
-    (whole, uncut), (cut, truncated) = run(None), run(1)
-    assert whole == cut
-    np.testing.assert_array_equal(truncated['layers_7']['self_attn']['down_proj']['kernel'],
-                                  uncut['layers_7']['self_attn']['down_proj']['kernel'])
+    with jax.enable_x64(new_val=True):
+        ((whole, uncut), roundings), ((cut, truncated), _) = run(None), run(1)
+    assert_computes_the_oracle(np.asarray(cut), np.asarray(whole), "the cut loop's loss", roundings=roundings)
+    assert_computes_the_oracle(np.asarray(truncated['layers_7']['self_attn']['down_proj']['kernel']),
+                               np.asarray(uncut['layers_7']['self_attn']['down_proj']['kernel']),
+                               'the gradient past the loop', roundings=roundings)
     assert np.any(truncated['embed_tokens']['embedding'])
     assert np.any(truncated['layers_1']['self_attn']['down_proj']['kernel'])
     assert not np.array_equal(truncated['layers_1']['self_attn']['down_proj']['kernel'],
                               uncut['layers_1']['self_attn']['down_proj']['kernel'])
+
+
+def test_a_cut_loops_backward_memory_falls_with_its_backprop_steps():
+    """The cut is static (`backprop_steps`): at six passes the gradient's compiled program keeps no
+    residual of a pass before the cut, so its temporary bytes fall as the passes it trains through do,
+    from every pass to three to the last alone."""
+    loaded = load()
+    ids, cotangent = REFERENCE['input_ids'], REFERENCE['cotangent']
+
+    def temporaries(backprop_steps):
+        model = loaded.model.with_passes(6, backprop_steps=backprop_steps)
+
+        def loss(params):
+            return jnp.sum(model.apply({**loaded.variables, 'params': params}, ids) * cotangent)
+
+        compiled = jax.jit(jax.grad(loss)).lower(loaded.variables['params']).compile()
+        return compiled.memory_analysis().temp_size_in_bytes
+
+    held = [temporaries(steps) for steps in (None, 3, 1)]
+    assert held[0] > held[1] > held[2], held
 
 
 PROJECTIONS = ('q_proj', 'k_proj', 'v_proj', 'o_proj', 'g_proj', 'gate_proj', 'up_proj', 'down_proj')
