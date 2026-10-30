@@ -15,7 +15,7 @@ from jax._src.state import types as state_types
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels.templates import cost, mosaic, resources
+from dew.nn.kernels.templates import cost, mosaic, report, resources
 from dew.nn.sharding import per_shard
 
 
@@ -213,7 +213,8 @@ class Mma(mosaic.Family):
         per_shard(name or self.name)
         return plgpu.kernel(entry, out_type=out_type, grid=grid, grid_names=grid_names,
                             compiler_params=plgpu.CompilerParams(approx_math=approx_math),
-                            interpret=mosaic.interpreted(interpret), kernel_name=name, cost_estimate=cost)
+                            interpret=mosaic.interpreted(interpret),
+                            kernel_name=report.named(name), cost_estimate=cost)
 
     def scoped(self, body, *allocations, streams):
         return pl.run_scoped(lambda *refs: body(*refs, streams=streams), *allocations)
@@ -227,6 +228,11 @@ class Mma(mosaic.Family):
                 swizzles: dict[str, int] | None = None):
         _one(consumers, clustered=bool(multicast))
         return Pipeline(blocks, stages, dict(swizzles or {}))
+
+    def lifetimes(self, streams: Pipeline) -> tuple[tuple, tuple]:
+        # `emit_pipeline` allocates a walk's slots in its own scope.
+        return (), (tuple(plgpu.SMEM((streams.stages, *shape), dtype)
+                          for shape, dtype in streams.blocks.values()),)
 
     def opened(self, allocated, views: dict | None = None):
         if views is None:
@@ -301,9 +307,12 @@ class Mma(mosaic.Family):
     def passed(self, streams, lo, hi, *, first: jax.Array | int = 0, between=None) -> None:
         del streams, lo, hi, first, between
 
-    def loaded(self, copies) -> None:
+    def loaded(self, copies, *, issued: jax.Array | bool = True) -> None:
         # Through registers (no TMA before Hopper), in a layout of the tile's rank: a side vector's the
-        # accumulator's column vector layout, a tile's the left operand's.
+        # accumulator's column vector layout, a tile's the left operand's. Each caller its own: a shared
+        # `ref` loaded by one role would need a barrier past its stores that no caller here waits on.
+        if issued is not True:
+            raise NotImplementedError(f"{self.name} loads no shared copy for its roles")
         for view, ref, _ in copies:
             layout = self.lhs if len(ref.shape) > 1 else self.column
             ref[...] = plgpu.load(view, layout=layout, optimized=False)
@@ -313,16 +322,18 @@ class Mma(mosaic.Family):
         # MMA-layout tile stored from registers writes partial 32-byte sectors, which JAX 0.12's global
         # transfers refuse, and its row-sliced copies lay out whole ones. Its copies go through registers,
         # done when they return: nothing stays in flight (`wait` asks nothing of it).
-        # A vector (a row's per-row statistics, attention's `[bq]` and `[bk]`) is copied out whole.
+        # A vector (a row's per-row statistics, attention's `[bq]` and `[bk]`) is stored whole from its
+        # registers: reloaded from shared memory it takes no layout Mosaic GPU's inference finds (a 64-entry
+        # one has no strided layout, which wants a multiple of 128), where its registers keep their own.
         del wait
         for part, view in zip(parts, views, strict=True):
             if smem is None:
                 view[...] = part.astype(view.dtype)
                 continue
-            plgpu.store(smem, part.astype(smem.dtype), optimized=False)
             if len(smem.shape) == 1:
-                mosaic.copied(smem, view)
+                plgpu.store(view, part.astype(view.dtype), optimized=False)
                 continue
+            plgpu.store(smem, part.astype(smem.dtype), optimized=False)
             rows = smem.shape[0]
             mosaic.store_rows(smem, view, 0, 0, jnp.int32(rows), 0, rows, copy=mosaic.copied,
                               widest=resources.copied_rows(smem.shape[1], smem.dtype))
@@ -390,16 +401,6 @@ class Mma(mosaic.Family):
     def register_products(self, acc, parts, rhs, interpret: bool):
         for formed in parts:
             acc = self.products(acc, mosaic.unscaled_part(formed), rhs, interpret)
-        return acc
-
-    def staged_products(self, acc, parts, rhs, buffers, interpret: bool, *, transposed: bool = False):
-        del interpret
-        mosaic.unscaled(parts)
-        operand = plgpu.load(rhs, layout=self.rhs)
-        for place, (part, _) in enumerate(parts):
-            buffers.at[place][...] = part.astype(buffers.dtype)
-            staged = buffers.at[place].transpose((1, 0)) if transposed else buffers.at[place]
-            acc = plgpu.mma(acc, plgpu.load(staged, layout=self.lhs), operand, m_warps=self.m_warps)
         return acc
 
     def rescaled_products(self, acc, scale, parts, rhs, interpret: bool):

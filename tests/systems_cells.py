@@ -4,7 +4,7 @@ interpreters of its own:
 - Rematerialization is invisible to everything but memory use: a compilation counts the memory kept alive
   outside its state, in a fresh 2 GiB allocator (`compilation_counts_memory_kept_alive_outside_its_state`).
 - The same program from two checkouts of Dew shares one compiled executable: a Pallas kernel's Triton
-  module carries its source locations, which the pinned JAX's cache key strips (constraints.txt;
+  module carries its source locations, which the pinned JAX's cache key strips (docs/installation.md;
   `two_checkouts_share_one_compiled_kernel`).
 """
 

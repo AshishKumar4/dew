@@ -1347,18 +1347,23 @@ def _per_input(values: Stored, scheme: _WeightScheme, shape: tuple[int, int],
     return values[np.arange(outputs) // scheme.block[0]][:, np.arange(inputs) // scheme.block[1]]
 
 
+CT_PARTS = {'scale': '.weight_scale', 'packed': '.weight_packed', 'shape': '.weight_shape',
+            'global': '.weight_global_scale', 'input_global': '.input_global_scale',
+            'zero': '.weight_zero_point', 'order': '.weight_g_idx'}
+"""compressed-tensors' tensors beside a weight it codes, by role, each a suffix of the module's name
+(`_ct_parts`, `_ct_partners`; `SIDECARS`)."""
+
+
 def _ct_parts(scheme: _WeightScheme, name: str) -> dict[str, str]:
-    stem = name.removesuffix('.weight')
-    parts = {'scale': stem + '.weight_scale'}
+    roles = ['scale']
     if scheme.format == 'pack-quantized':
-        parts |= {'packed': stem + '.weight_packed', 'shape': stem + '.weight_shape'}
+        roles += ['packed', 'shape']
     if scheme.format == 'nvfp4-pack-quantized':
-        parts |= {'packed': stem + '.weight_packed', 'global': stem + '.weight_global_scale'}
-        if scheme.input_scale_dtype is not None:
-            parts['input_global'] = stem + '.input_global_scale'
+        roles += ['packed', 'global', *(['input_global'] if scheme.input_scale_dtype is not None else [])]
     if not scheme.symmetric:
-        parts['zero'] = stem + '.weight_zero_point'
-    return parts
+        roles.append('zero')
+    stem = name.removesuffix('.weight')
+    return {role: stem + CT_PARTS[role] for role in roles}
 
 
 def _ct_names(scheme: _WeightScheme, tensors: Mapping[str, Stored]) -> tuple[str, ...]:
@@ -1377,7 +1382,7 @@ def _ct_names(scheme: _WeightScheme, tensors: Mapping[str, Stored]) -> tuple[str
 def _ct_partners(scheme: _WeightScheme, name: str) -> tuple[str, ...]:
     """The stored tensors besides `name` itself: act-order's `weight_g_idx`
     goes with them when the checkpoint carries one."""
-    return (*_ct_parts(scheme, name).values(), name.removesuffix('.weight') + '.weight_g_idx')
+    return (*_ct_parts(scheme, name).values(), name.removesuffix('.weight') + CT_PARTS['order'])
 
 
 @overload
@@ -1416,7 +1421,7 @@ def _ct_zero(scheme: _WeightScheme, tensors: Mapping[str, Stored], name: str,
 
 
 def _ct_order(tensors: Mapping[str, Stored], name: str) -> Stored | None:
-    order = tensors.get(name.removesuffix('.weight') + '.weight_g_idx')
+    order = tensors.get(name.removesuffix('.weight') + CT_PARTS['order'])
     return None if order is None else unread.held(order)
 
 
@@ -1470,7 +1475,7 @@ def _ct_encode(name: str, weight: np.ndarray, *, scheme: _WeightScheme,
     parts = _ct_parts(scheme, name)
     kept = {role: part for role, part in parts.items()
             if role in ('scale', 'zero', 'shape', 'global', 'input_global')}
-    order_name = name.removesuffix('.weight') + '.weight_g_idx'
+    order_name = name.removesuffix('.weight') + CT_PARTS['order']
     stored = dict(zip(kept, _gridded(grid, name, tuple(kept.values())), strict=True))
     order = None if grid is None or order_name not in grid else np.asarray(grid[order_name])
     scales = stored['scale']
@@ -1523,19 +1528,15 @@ def compressed_tensors(quantization: Mapping[str, object],
         partial(_ct_names, scheme), partial(_ct_partners, scheme),
         partial(_ct_decode, scheme=scheme), partial(_ct_encode, scheme=scheme, grid=grid),
         grid=lambda name: (*(part for role, part in _ct_parts(scheme, name).items() if role != 'packed'),
-                           name.removesuffix('.weight') + '.weight_g_idx'),
+                           name.removesuffix('.weight') + CT_PARTS['order']),
         input_scale_dtype=scheme.input_scale_dtype)
 
 
 MODELOPT_PARTS = ('.weight_scale', '.weight_scale_2', '.input_scale')
 """ModelOpt's E4M3 block scales, fp32 global weight multiplier and fp32 input multiplier."""
 
-CT_PARTS = ('.weight_scale', '.weight_packed', '.weight_shape', '.weight_global_scale', '.input_global_scale',
-            '.weight_zero_point', '.weight_g_idx')
-"""compressed-tensors' tensors beside a weight it codes (`_ct_parts`, `_ct_partners`)."""
-
 SIDECARS = tuple(sorted({*PACKED_SUFFIXES, '.weight' + SCALE_SUFFIX, '.weight' + STORE_SCALE_SUFFIX,
-                         *MODELOPT_PARTS, *GPTQ_SUFFIXES, *CT_PARTS}, key=len, reverse=True))
+                         *MODELOPT_PARTS, *GPTQ_SUFFIXES, *CT_PARTS.values()}, key=len, reverse=True))
 """Every codec's tensors beside a weight it stores, by suffix, longest first: they belong to the
 module whose `.weight` they code (`hf_decoders.wrapper_route`)."""
 

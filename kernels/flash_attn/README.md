@@ -17,8 +17,9 @@ in the same environment (`jax[cuda12]` or `jax[cuda13]`), whose libcudart it
 loads.
 
 With it installed, Dew's `attention_impl="auto"` runs FlashAttention
-on an A100 (sm80), an Ada GPU (sm89) and an H100 (sm90) for calls without a mask, bias or softcap,
-sliding windows and attention sinks included, with heads up to 256 wide. `attention_impl="flash"` asks for it on any sm8x, sm90 or sm120 GPU.
+on an A100 (sm80), an Ada GPU (sm89) and an H100 (sm90) for calls without a mask, bias, softcap or
+attention sinks, sliding windows included, with heads up to 256 wide (Dew takes calls with sinks
+elsewhere: this backward's rows whose sink holds most of the softmax lose its cancellation). `attention_impl="flash"` asks for it on any sm8x, sm90 or sm120 GPU.
 
 FlashAttention-2 is compiled for sm80, which every compute capability 8.x runs, and for sm120,
 Blackwell's workstation and consumer parts (the RTX PRO 6000 and the RTX 50 series).

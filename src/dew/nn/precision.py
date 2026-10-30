@@ -30,6 +30,7 @@ import contextlib
 import functools
 import os
 from collections.abc import Callable, Sequence
+from typing import overload
 
 import jax
 import jax.numpy as jnp
@@ -124,11 +125,13 @@ def at_least_fp32(dtype: DTypeLike | None) -> jnp.dtype:
 def rms_statistics(x: jax.Array, epsilon: float, *, axis=-1, keepdims: bool = True,
                    count: int | None = None) -> tuple[jax.Array, jax.Array]:
     """Mean square and inverse RMS in at least fp32. A padded kernel tile supplies its logical
-    `count` after zeroing padding; an ordinary array uses its reduction dimensions. Callers own
-    when the inverse, normalized values and learned scale round."""
+    `count` after zeroing padding; an ordinary array uses its reduction dimensions. Both means multiply
+    by the reciprocal count, as XLA's mean does. Callers own when the inverse, normalized values and
+    learned scale round. The count's reciprocal is a Python float, where `jnp.reciprocal` of the count's
+    array is an integer power, which a Pallas Triton kernel cannot lower on a folded constant."""
     square = jnp.square(x.astype(at_least_fp32(x.dtype)))
     mean = (jnp.mean(square, axis=axis, keepdims=keepdims) if count is None
-            else jnp.sum(square, axis=axis, keepdims=keepdims) / count)
+            else jnp.sum(square, axis=axis, keepdims=keepdims) * (1.0 / count))
     return mean, jax.lax.rsqrt(mean + epsilon)
 
 
@@ -151,12 +154,13 @@ def rms_weighted(x: jax.Array, inverse: jax.Array, *, weight: jax.Array | None =
     """An RMS norm's arithmetic past its statistics: `x` times its rows' `inverse` RMS (`rms_statistics`'s,
     or a kernel's own), times `weight`, times `activation(gate)` (`activation_and_slope`: Qwen3-Next's gated
     norm), in that order and in `x`'s dtype, which the caller widens (at least fp32) and rounds once after.
-    `rounded` rounds the normalized rows before the weight multiplies them (Llama's and Qwen3's cast first,
-    `RMSNorm.scale_after_cast`). The fused norm kernel, the recurrence's gated output norm and the portable
-    gated norm compute it alike, each keeping its own memory schedule and derivative."""
-    y = x * inverse
+    `rounded` rounds the normalized rows, before any weight multiplies them (Llama's and Qwen3's cast first,
+    `RMSNorm.scale_after_cast`; a norm computing in its input's dtype). The fused norm kernel, the
+    recurrence's gated output norm, the portable norm and the portable gated norm compute it alike, each
+    keeping its own statistics, memory schedule and derivative."""
+    y = x * inverse if rounded is None else rounded(x * inverse)
     if weight is not None:
-        y = (y if rounded is None else rounded(y)) * weight
+        y = y * weight
     return y if gate is None else y * activation_and_slope(gate, activation)[0]
 
 
@@ -835,20 +839,38 @@ def paired_sum(shape: tuple[int, ...], dtype: DTypeLike) -> jax.Array:
     return jnp.zeros((3, *shape), dtype)
 
 
-def added_to(running: jax.Array, term: jax.Array) -> jax.Array:
-    """`running` (`running_sum`) with `term` added: through `compensated_add` where it is a pair."""
-    term = term.astype(running.dtype)
-    if running.shape[0] == 1:
-        return running + term[None]
-    pair = compensated_add((running[0], running[1]), (term, jnp.zeros_like(term)))
-    return jnp.stack((*pair, running[2] + term))
+type Running = jax.Array | tuple[jax.Array, ...]
+"""A running sum (`running_sum`), stacked along its leading axis or held as that axis's parts."""
 
 
-def running_total(running: jax.Array) -> jax.Array:
-    """A running sum's value (`running_sum`): a pair's rounded once (`compensated_total`), else the sum."""
-    if running.shape[0] == 1:
-        return running[0]
-    return compensated_total((running[0], running[1]), running[2])
+@overload
+def added_to(running: jax.Array, term: jax.Array) -> jax.Array: ...
+
+
+@overload
+def added_to(running: tuple[jax.Array, ...], term: jax.Array) -> tuple[jax.Array, ...]: ...
+
+
+def added_to(running: Running, term: jax.Array) -> Running:
+    """`running` (`running_sum`) with `term` added: through `compensated_add` where it is a pair. A running
+    sum held as its leading axis's parts (a tuple) stays one, as a kernel whose layouts hold no unit axis
+    carries it."""
+    held = running if isinstance(running, tuple) else tuple(running)
+    term = term.astype(held[0].dtype)
+    if len(held) == 1:
+        added = (held[0] + term,)
+    else:
+        added = (*compensated_add((held[0], held[1]), (term, jnp.zeros_like(term))), held[2] + term)
+    return added if isinstance(running, tuple) else jnp.stack(added)
+
+
+def running_total(running: Running) -> jax.Array:
+    """A running sum's value (`running_sum`, or its leading axis's parts): a pair's rounded once
+    (`compensated_total`), else the sum."""
+    held = running if isinstance(running, tuple) else tuple(running)
+    if len(held) == 1:
+        return held[0]
+    return compensated_total((held[0], held[1]), held[2])
 
 
 def compensated_total(pair: tuple[jax.Array, jax.Array], plain: jax.Array) -> jax.Array:

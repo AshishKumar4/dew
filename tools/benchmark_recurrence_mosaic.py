@@ -80,9 +80,11 @@ def compiled_arm(name: str, arm: str, dtype, training: bool = False):
     shape = SHAPES[name]
     given = {key: jnp.asarray(value) for key, value in operands(shape).items()
              if key in ('q', 'k', 'v', 'g', 'beta')}
-    # Kimi delta attention's declared floor (its layer's `lower_bound`), which the draws' decays lie above.
+    # Kimi delta attention's declared floor (its layer's `lower_bound`), which the draws' decays lie above,
+    # and the draws' sigmoid write gates of unit keys (`recurrence.Hooks.write_bound`), as the layers declare.
     hooks = recurrence.Hooks(decay='vector' if shape.kind == 'kda' else 'scalar',
-                             scale=shape.key_width ** -0.5, floor=-5.0 if shape.kind == 'kda' else None)
+                             scale=shape.key_width ** -0.5, floor=-5.0 if shape.kind == 'kda' else None,
+                             write_bound=1.0)
     args = (*(given[key].astype(dtype) for key in ('q', 'k', 'v')), given['g'], given['beta'].astype(dtype))
 
     def forward(q, k, v, g, beta):

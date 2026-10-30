@@ -1,6 +1,6 @@
 import { DurableObject } from 'cloudflare:workers';
 import type { SnapshotRecord } from './snapshot-ledger';
-import { becameReady, health, restore } from './container';
+import { becameReady, ending, health, kept, restore } from './container';
 import type { SnapshotGeneration } from './snapshots';
 
 type Phase = (name: string) => Promise<void>;
@@ -61,7 +61,7 @@ export async function buildSnapshot(container: Container, commit: string, phase:
 	await phase('install and warm');
 	container.start({ image: 'cloudflare/debian-trixie', instance: 'standard-4',
 		enableInternet: true, entrypoint: ['sleep', 'infinity'] });
-	await container.setInactivityTimeout(15 * 60_000);
+	await kept(container, 15 * 60_000, ending(container, 'preparation build', commit), 'preparation build');
 	const source = await fetch(`https://raw.githubusercontent.com/AshishKumar4/dew/${commit}/site/live/container/setup-managed.sh`);
 	if (!source.ok || !source.body) throw new Error('cannot read pinned preparation script');
 	const copy = await container.exec(['sh', '-c', 'cat > /root/setup.sh'], { stdin: source.body });
@@ -87,9 +87,9 @@ export async function smokeSnapshot(container: Container, snapshot: ContainerSna
 	phase: Phase): Promise<number> {
 	const started = Date.now();
 	await phase('offline restore');
-	restore(container, snapshot, 'preparation',
+	const ended = restore(container, snapshot, 'preparation',
 		{ entrypoint: ['sh', '/opt/live/start-shared.sh'], env: { DEW_SHARED_SECRET: relaySecret } });
-	await container.setInactivityTimeout(15 * 60_000);
+	await kept(container, 15 * 60_000, ended, 'preparation smoke');
 	if (!(await becameReady(container, async () => (await health(container, 8888))?.ok === true))) {
 		// A container that never came up may not answer an exec either.
 		const logs = await Promise.race([

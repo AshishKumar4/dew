@@ -1960,3 +1960,28 @@ def test_a_float64_twin_rotates_by_its_whole_complex_table():
     angles = torch.arange(1, 5, dtype=torch.float64)
     table = torch.polar(torch.ones_like(angles), angles)
     assert torch.equal(rotated, torch.view_as_real(torch.view_as_complex(pairs) * table))
+
+
+FRESH_DEVICE_CONTEXT = """
+import torch
+from tools.torch_precision import dtype_widened, replaced
+
+with replaced((torch, "arange", dtype_widened(torch.arange))):
+    with torch.device("meta"):
+        inside = torch.arange(4, dtype=torch.float32)
+with torch.device("meta"):
+    after = torch.arange(4)
+print(inside.device, inside.dtype, after.device, after.dtype)
+"""
+"""A fresh process whose first device context runs inside `replaced` (ledger 1553)."""
+
+
+def test_a_replaced_constructor_leaves_device_contexts_their_own_in_a_fresh_process():
+    """torch's device contexts learn their constructors at their first use in a process. In a fresh
+    process whose first `torch.device("meta")` runs inside a block that widens `torch.arange`, the widened
+    arange still makes its tensor on the meta device, in float64, and after the block a meta-device arange
+    is torch's own again: on meta, at its own int64 (`replaced` primes the contexts first)."""
+    done = subprocess.run([sys.executable, "-c", FRESH_DEVICE_CONTEXT], cwd=REPO_ROOT, capture_output=True,
+                          text=True, check=False)
+    assert done.returncode == 0, done.stderr[-2000:]
+    assert done.stdout.split() == ["meta", "torch.float64", "meta", "torch.int64"]

@@ -300,27 +300,42 @@ def test_the_port_takes_each_packed_tokens_output_and_gradients_as_its_document_
 def test_the_port_keeps_each_row_to_itself_at_its_rows_tightest_document_bound():
     """Two right-padded rows of two packed documents each (segment 0 after them) at the tightest
     bound their coordinates give (`Coordinates.max_segments`, two): each document's output on the
-    port (`fla_rule`) is bitwise the document run alone, a row's first from the row's memory.
-    A row's padding runs as a sequence of its own, so a bound without it ran the second row's last
-    document on from its first."""
+    port (`fla_rule`) on par with the document run alone, a row's first from the row's memory, both
+    measured from the float64 recurrence (check 1). A row's padding runs as a sequence of its own, so a
+    bound without it ran the second row's last document on from its first."""
     from dew.batch import coordinates
 
     segments = jnp.asarray([[1] * 70 + [2] * 50 + [0] * 8, [1] * 50 + [2] * 50 + [0] * 28])
     tokens = coordinates(segments=segments, max_segments=2, right_padded=True)
-    keys = jax.random.split(jax.random.key(31), 5)
-    q, k, v = (0.3 * jax.random.normal(key, (2, 128, 1, 64)) for key in keys[:3])
-    g = -0.1 * jax.nn.softplus(jax.random.normal(keys[3], (2, 128, 1)))
-    beta = jnp.full((2, 128, 1), 0.5)
-    h0 = 0.1 * jax.random.normal(keys[4], (2, 1, 64, 64))
-    packed = jax.jit(lambda *a: fla_rule(*a, starts=tokens.starts, max_segments=tokens.max_segments))
-    out, _ = packed(q, k, v, g, beta, h0)
-    rule = jax.jit(fla_rule)
-    for row, cuts in ((0, (0, 70, 120)), (1, (0, 50, 100))):
-        for begin, end in itertools.pairwise(cuts):
-            alone, _ = rule(*(x[row:row + 1, begin:end] for x in (q, k, v, g, beta)),
-                            h0[row:row + 1] if begin == 0 else None)
-            np.testing.assert_array_equal(np.asarray(out[row:row + 1, begin:end]), np.asarray(alone),
-                                          err_msg=f"row {row} from {begin}")
+    documents = [(row, begin, end) for row, cuts in ((0, (0, 70, 120)), (1, (0, 50, 100)))
+                 for begin, end in itertools.pairwise(cuts)]
+
+    def draw(seed):
+        keys = jax.random.split(jax.random.key(31 + seed), 5)
+        q, k, v = (0.3 * jax.random.normal(key, (2, 128, 1, 64)) for key in keys[:3])
+        g = -0.1 * jax.nn.softplus(jax.random.normal(keys[3], (2, 128, 1)))
+        beta = jnp.full((2, 128, 1), 0.5)
+        return q, k, v, g, beta, 0.1 * jax.random.normal(keys[4], (2, 1, 64, 64))
+
+    def document(operands, row, begin, end):
+        return [x[row:row + 1, begin:end] for x in operands[:5]]
+
+    def packed(*operands):
+        out, _ = fla_rule(*operands, starts=tokens.starts, max_segments=tokens.max_segments)
+        return {f"row {row} from {begin}": out[row:row + 1, begin:end] for row, begin, end in documents}
+
+    def alone(*operands):
+        return {f"row {row} from {begin}": fla_rule(*document(operands, row, begin, end),
+                                                    operands[5][row:row + 1] if begin == 0 else None)[0]
+                for row, begin, end in documents}
+
+    def truth(*operands):
+        return {f"row {row} from {begin}": recurrence(*document(operands, row, begin, end),
+                                                      operands[5][row:row + 1] if begin == 0
+                                                      else jnp.zeros_like(operands[5][row:row + 1]))[0]
+                for row, begin, end in documents}
+
+    assert_as_exact(packed, alone, draw, "packed rows on the port", seeds=8, truth_fn=truth)
 
 
 def test_strong_decay_has_the_same_finite_gradient_in_both_forms():
@@ -977,11 +992,12 @@ def test_the_fused_decode_step_computes_the_layers_token(heads, width, rows, hel
     assert state.dtype == held
 
 
-def test_a_cached_layer_traced_for_a_jvp_decodes_its_token():
-    """A cached gated delta net on an A100, whose row's step kernel decodes its tokens, traces for
-    `jax.jvp` (`forward_mode_attention`, as MeanFlow and consistency training trace it): its token
-    decodes with a tangent, which the in-place kernels do not give."""
-    from dew.nn.attention import forward_mode_attention
+@pytest.mark.parametrize("staged", ["plain", "remat"])
+def test_a_cached_layer_traced_for_a_jvp_decodes_its_token(staged):
+    """A cached gated delta net on an A100, whose row's step kernel decodes its tokens, traced for
+    `jax.jvp` as MeanFlow and consistency training trace it, plainly or under a remat that hides the
+    tangent from the layer: its token decodes with the portable step's tangent (`recurrence.step`'s
+    `generation.linear_tangent`), which the in-place launch does not give (row 2395)."""
     from dew.nn.kernels.generation import assumed
 
     layer, variables, cache, token = fused_case(4, 32, 2, jnp.float32, jnp.float32)
@@ -989,12 +1005,10 @@ def test_a_cached_layer_traced_for_a_jvp_decodes_its_token():
     def step(token):
         return layer.apply({**variables, "cache": cache}, token, MixerCall(decode=True), mutable=["cache"])[0]
 
-    def traced():
-        tangent = jax.random.normal(jax.random.key(9), token.shape)
-        jax.make_jaxpr(lambda token, tangent: jax.jvp(step, (token,), (tangent,)))(token, tangent)
-
-    with assumed("sm80"), forward_mode_attention():
-        traced()
+    staged_step = jax.checkpoint(step) if staged == "remat" else step
+    tangent = jax.random.normal(jax.random.key(9), token.shape)
+    with assumed("sm80"):
+        jax.make_jaxpr(lambda token, tangent: jax.jvp(staged_step, (token,), (tangent,)))(token, tangent)
 
 
 def test_the_fused_decode_step_leaves_an_idle_row_alone():
