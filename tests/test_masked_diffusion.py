@@ -32,6 +32,7 @@ from dew.inference.projections import unpacked
 from dew.interop import Pretrained
 from dew.interop.hf_decoders import translate_config, translate_weights
 from dew.nn.inputs import ModelInputs, request_axes
+from dew.nn.progress import END, Progress
 from dew.nn.protocols import OutputTable
 from dew.objectives.base import Step
 from dew.objectives.diffusion.masked import MaskedDiffusionObjective
@@ -99,6 +100,53 @@ def test_a_media_slot_reaches_the_model_and_is_never_masked_or_scored():
     np.testing.assert_array_equal(real, slots < 0)
     assert not counted[:, :2].any() and counted[:, 2:].any()
     assert not np.allclose(losses[:, 2:], plain[:, 2:])
+
+
+class _Annealed(nn.Module):
+    """A bidirectional model whose every state is offset by `offset`, or, where it states none, by the
+    updates the run committed before the step and -1 at the run's end (`dew.nn.progress`)."""
+
+    causal = False
+    mask_token_id = None
+    offset: float | None = None
+
+    @nn.nowrap
+    def reads_progress(self) -> bool:
+        return self.offset is None
+
+    @nn.compact
+    def hidden_states(self, tokens, train=False, progress: Progress = END):
+        offset = self.offset if self.offset is not None else (
+            -1.0 if progress.updates is None else progress.updates.astype(jnp.float32))
+        return nn.Embed(32, 8)(tokens) + offset * self.param("anneal", nn.ones, (8,))
+
+    def output_table(self):
+        return OutputTable(self.variables["params"]["Embed_0"]["embedding"], vocab_major=True)
+
+    def __call__(self, tokens, **fields):
+        return self.hidden_states(tokens, **fields)
+
+
+def test_a_masked_step_passes_its_model_the_run_s_progress():
+    """A masked diffusion step passes a model that reads the run's progress the step's
+    (`MaskedDiffusionObjective.passes_progress`; review of ledger 2537): its loss at a step three updates
+    came before is the loss of the model offset by 3, and at a step that is no training step, the run's
+    end's, over the same weights and masks."""
+    tokens = jnp.tile(jnp.arange(1, 9, dtype=jnp.int32), (8, 1))
+
+    def objective(offset=None) -> MaskedDiffusionObjective:
+        return MaskedDiffusionObjective(_Annealed(offset), MDLM(mask_id=31)(), seq_len=8, ema_decay=None)
+
+    variables = objective().init(jax.random.key(0))
+
+    def loss(objective: MaskedDiffusionObjective, step: Step) -> np.ndarray:
+        return np.asarray(objective.reduce_loss(objective.loss(variables, {"text": tokens}, step)[0])[0])
+
+    trained = Step(jnp.asarray(0), jax.random.key(1), None, committed=jnp.asarray(3, jnp.int32))
+    validated = replace(trained, training=False)
+    np.testing.assert_array_equal(loss(objective(), trained), loss(objective(3.0), trained))
+    np.testing.assert_array_equal(loss(objective(), validated), loss(objective(-1.0), validated))
+    assert loss(objective(), trained) != loss(objective(), validated)
 
 
 @pytest.mark.parametrize("given", ["attention_mask", "coordinates"])
