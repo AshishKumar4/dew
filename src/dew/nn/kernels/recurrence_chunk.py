@@ -655,19 +655,19 @@ itself; and keys wider than the port takes in their dtype. Packed documents take
 stores the memories by where they pass, as many as the tokens' chunks, a row's and one, whatever the bound
 (`chunked_launch.Sequences`)."""
 
-PORT_CELLS: dict[tuple[str | None, str], tuple[str, str]] = {
-    ('mma.sync', 'forward'): ('fla', "on an A100 SXM4 40GB, 16-bit, the port's forward 0.892 ms against the "
-                                     "template's 1.213 on Qwen3.5-27B's gated delta net and 0.690 against "
-                                     "0.942 on Qwen3-Next's (SE-family-a100-1a31d279a)"),
-}
+PORT_CELLS: dict[tuple[str | None, str], tuple[str, str]] = {}
 """The cells, each an instruction family and a product (`PortCase.cell`), where a receipt shows the fla
 port faster than the recurrence template, each its old route's kernel and that receipt: the delta rule's
 selector runs the port on them where it takes the call (`Op.declared`, owner, bible da64ae5); the list
-shrinks as the template wins its cells, and no cell is picked or ranked at run time. Training is the
-template's, its keys launch a key block a program and its query/key launch's memory sum a product: its
-forward and gradient on an H100 2.46 ms against the port's 3.12 on Qwen3.5-27B's gated delta net and 1.92
-against 2.44 on Qwen3-Next's (JS-train80-h100-db2c4aca0), and on an A100 SXM4 40GB 4.56 against 4.83 and
-3.44 against 4.69 (JS-train80-a100-db2c4aca0).
+shrinks as the template wins its cells, and no cell is picked or ranked at run time. It holds none: the
+template wins every cell. Training is the template's, its keys launch a key block a program and its
+query/key launch's memory sum a product: its forward and gradient on an H100 2.46 ms against the port's 3.12
+on Qwen3.5-27B's gated delta net and 1.92 against 2.44 on Qwen3-Next's (JS-train80-h100-db2c4aca0), and on an
+A100 SXM4 40GB 3.46 against 4.21 and 2.50 against 3.24 (JS-2075cellsd-a100-863706e94).
+An A100's forward is the template's, its walks' 16-bit stores coalesced (`mosaic.coalesced`): 0.931 ms
+against the port's 0.981 on Qwen3.5-27B's gated delta net and 0.692 against 0.759 on Qwen3-Next's, each in a
+process of its own, three rounds (JS-2075cellsd-a100-863706e94; the port's Qwen3-Next forward took 0.650 in
+two runs that followed a training run in one process, JS-2075cells-a100-491c05798).
 An H100's forward is the template's, its solve launch two programs a multiprocessor on warpgroup MMA's layout
 without a producer (`mainloop._solving`): on an H100 80GB HBM3 0.364 ms against the port's 0.514 on
 Qwen3.5-27B's gated delta net and 0.279 against 0.327 on Qwen3-Next's (JS-solvefed-h100-92eacee68; on an

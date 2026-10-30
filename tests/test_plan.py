@@ -926,14 +926,18 @@ def test_a_gemm_autotuner_out_of_memory_is_a_refusal_for_memory(code, message, r
     from dew.training.memory import compiled_if_it_fits
 
     error = Refused(code, message)
+    lowered = jax.jit(lambda: None).lower()
 
     class Program:
+        def compiler_ir(self, dialect):
+            return lowered.compiler_ir(dialect)
+
         def compile(self, options):
             raise error
 
     refusals = []
     try:
-        outcome = compiled_if_it_fits(Program(), None, refusals)
+        outcome = compiled_if_it_fits(Program(), None, refusals, relower=Program)
     except jax.errors.JaxRuntimeError as raised:
         outcome = raised
     assert (outcome, refusals) == ((None, [error]) if refused else (error, []))
