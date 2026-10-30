@@ -417,6 +417,11 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
             if stage is not None:
                 # The read turn's last phase, past the walk's last product, observed.
                 family.turn(stage[2], consumers, arrive=False)
+            if tile_refs:
+                # The tile gradients' last adds read their stage before the scope's shared memory goes on to
+                # the key block's summing (`mosaic.summing`) or the next program (ET-DETDIAG-h100: the last
+                # query tile's gradient read from a stage already reused, in no fixed order).
+                family.store_wait(0)
             if split:
                 # The consumers' sums, added in a scope after the walk's (`_summed_stored`).
                 return dk, dv, *key_sums
