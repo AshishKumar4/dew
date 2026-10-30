@@ -34,6 +34,12 @@ class Rollout(Protocol):
     tracker and the display as `rollout/<name>`. It may declare how the display
     shows them in `shown`, as an objective does.
 
+    A rollout whose `draws_further` is true may read data batches past the
+    step's, as DAPO's dynamic sampling does until its training batch is full:
+    the trainer calls it with `further`, a read of the training stream's next
+    batch, None where it ran out (`FitRun.further`), every process reading
+    as many, whose position the step's checkpoint saves as any read's.
+
     A rollout whose calls change more than the batch they return (its metrics,
     a log, a journal, rollouts in flight) may have `branch(name)`, a context
     manager a cooldown branch's calls run inside, on the branch's states, `name`
@@ -68,8 +74,10 @@ def rolled_out(rollout: Rollout | None, state: TrainState, batch: Batch, mesh: M
         return batch
     began = time.perf_counter()
     key = jax.random.fold_in(jax.random.fold_in(state.key, state.step), 1)
+    # A rollout drawing past its step's batch is any callable, so the trainer reads it at this boundary.
+    further = {"further": run.further(interval)} if getattr(rollout, "draws_further", False) else {}
     with run.held():
-        batch = shard_batch(mesh, marked(rollout(state, batch, key)))
+        batch = shard_batch(mesh, marked(rollout(state, batch, key, **further)))
     interval.rollout_seconds += time.perf_counter() - began
     return batch
 
