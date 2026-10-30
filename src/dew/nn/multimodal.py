@@ -423,9 +423,10 @@ class MultimodalTransformer(DecoderWrapper):
         prepared = fused.embeddings if input_embeddings is None else input_embeddings
         return self.language_model.mtp_step(hidden, fused.tokens, input_embeddings=prepared, **kwargs)
 
-    def token_embeddings(self, tokens):
-        """Return the decoder's own embeddings of `tokens`; a sampled token is always text, never media."""
-        return self.language_model.token_embeddings(tokens)
+    def stream_embeddings(self, tokens):
+        """Return the decoder's own embeddings of `tokens` at its stream's width (`stream_embeddings`); a
+        sampled token is always text, never media."""
+        return self.language_model.stream_embeddings(tokens)
 
     def init_mtp_cache(self, batch_size: int):
         self.language_model.init_mtp_cache(batch_size)

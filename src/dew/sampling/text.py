@@ -628,7 +628,7 @@ def _drafting(model: nn.Module, params: Variables, pad_id: int):
         return dataclasses.replace(state, cache=updated["cache"]), logits, states
 
     def embed(tokens: jax.Array) -> jax.Array:
-        prepared = model.apply(params, tokens, method="token_embeddings")
+        prepared = model.apply(params, tokens, method="stream_embeddings")
         assert isinstance(prepared, jax.Array)
         return prepared
 

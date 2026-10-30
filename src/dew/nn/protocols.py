@@ -37,6 +37,7 @@ callers add flags and absent values.
 from __future__ import annotations
 
 import dataclasses
+import functools
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Literal, Protocol, Self, runtime_checkable
 
@@ -48,7 +49,7 @@ from flax.typing import PrecisionLike, VariableDict
 from jax.typing import DTypeLike
 
 from dew.nn.inputs import ModelKwarg
-from dew.nn.precision import capped_logits, head_product, scaled_logits
+from dew.nn.precision import accumulated, capped_logits, head_product, scaled_logits
 
 if TYPE_CHECKING:
     from dew._records import JSON
@@ -119,6 +120,7 @@ __all__ = [
     "TimeScaled",
     "TokenModel",
     "TritonGemm",
+    "VocabularyRows",
     "label_logits",
 ]
 
@@ -148,6 +150,29 @@ class Lacks(TypeError, ValueError):
 
 
 @struct.dataclass
+class Projection:
+    """A bias-free linear map the final states take before a vocabulary matrix meets them
+    (`OutputTable.projection`): an embedding of its own width's `project_out` (OPT-350m's), its
+    `kernel` `[features, width]` as the layer multiplies by it (an adapter's update included), after a
+    checkpoint's quantizer of the layer's input, its operands promoted to `compute` as the layer
+    promotes them and multiplied at `precision`, the fp32 sum taken in float64 on a CPU under Dew's tests
+    (`accumulated`), as the layer's plain product takes it."""
+
+    kernel: jax.Array
+    precision: PrecisionLike = struct.field(pytree_node=False, default=None)
+    compute: DTypeLike | None = struct.field(pytree_node=False, default=None)
+    input_quantizer: InputQuantizer | None = None
+
+    def __call__(self, hidden: jax.Array) -> jax.Array:
+        """`hidden` `[..., features]` projected to `[..., width]`."""
+        hidden = hidden if self.input_quantizer is None else self.input_quantizer.qdq(hidden)
+        dtype = jnp.result_type(hidden, self.kernel) if self.compute is None else self.compute
+        product = functools.partial(jax.lax.dot_general, precision=self.precision,
+                                    dimension_numbers=(((jnp.ndim(hidden) - 1,), (0,)), ((), ())))
+        return accumulated(product, hidden.astype(dtype), self.kernel.astype(dtype))
+
+
+@struct.dataclass
 class OutputTable:
     """A vocabulary head as a matrix a loss contracts: `matrix` as the tree
     stores it, `[vocab, features]` when `vocab_major` and `[features, vocab]`
@@ -157,7 +182,9 @@ class OutputTable:
     model's compute dtype, decides the product's operands
     (`dew.nn.precision.head_product`; the states' dtype where None), and an
     `input_quantizer` rounds the states first as a checkpoint's head input
-    quantization does.
+    quantization does. Where the matrix is an embedding's own width, the states
+    reach it through a `projection` first (`Projection`), so every reader of
+    the states the product takes (`states`) reads them at the matrix's width.
 
     Contracting the model's final states with it (`logits`) reproduces the
     model's own logits, scale, bias, softcap and any adapter on the head
@@ -173,9 +200,13 @@ class OutputTable:
     compute: DTypeLike | None = struct.field(pytree_node=False, default=None)
     input_quantizer: InputQuantizer | None = None
     scale: jax.Array | None = None
+    projection: Projection | None = None
 
     def states(self, hidden: jax.Array) -> jax.Array:
-        """`hidden` as the product reads it: through the input quantizer's QDQ."""
+        """`hidden` as the product reads it: through the `projection` where the head has one, then the
+        input quantizer's QDQ."""
+        if self.projection is not None:
+            hidden = self.projection(hidden)
         return hidden if self.input_quantizer is None else self.input_quantizer.qdq(hidden)
 
     def logits(self, hidden: jax.Array, *, temperature: float = 1.0) -> jax.Array:
@@ -221,8 +252,9 @@ class OutputTable:
 
     def rows(self) -> jax.Array:
         """Each vocabulary token's `[vocab, features]` row: the matrix's, times
-        the token's scale, whose dot product with a state is the token's logit
-        before its bias and softcap, in the wider of the two dtypes. A reader
+        the token's scale, whose dot product with a state as the product reads
+        it (`states`) is the token's logit before its bias and softcap, in the
+        wider of the two dtypes. A reader
         of tokens' vectors (a decision head's lexical prior) takes these."""
         rows = self.matrix if self.vocab_major else self.matrix.T
         return rows if self.scale is None else rows * self.scale[:, None]
@@ -625,9 +657,10 @@ class CrossAttending(Protocol):
         """The part of `cross_flops` done by the decoder's own matrices, which train as its trunk does."""
         ...
 
-    def token_embeddings(self, tokens: jax.Array) -> jax.Array:
-        """Each token's row of the model's own table, unscaled and without positions: a context's
-        tokens as a cross-attention reads them by the table (`dew.nn.cross_attention.encode_context`)."""
+    def stream_embeddings(self, tokens: jax.Array) -> jax.Array:
+        """Each token's row of the model's own table at its stream's width, unscaled and without
+        positions: a context's tokens as a cross-attention reads them by the table
+        (`dew.nn.cross_attention.encode_context`)."""
         ...
 
     def with_cross_attention(self, cross: CrossBlocks | None) -> Self: ...
