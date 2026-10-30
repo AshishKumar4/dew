@@ -4,13 +4,6 @@ import textwrap
 from pathlib import Path
 
 import pytest
-from tool_support import load
-
-
-@pytest.fixture(scope="module")
-def lint():
-    return load("lint_slop")
-
 
 INPUTS = 'MIXING = ("pairwise_mask", "position_bias", "admitted")\n'
 CASES = {

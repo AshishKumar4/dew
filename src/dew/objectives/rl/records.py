@@ -29,7 +29,8 @@ def observation_record(value: Mapping[str, object]) -> Observation:
     return Observation(integers(record["context"], "context"),
                        EpisodeStatus(integer(record["status"], "status")), text(record["detail"], "detail"),
                        None if reward is None else finite(reward, "reward"),
-                       messages(record["messages"], "messages"))
+                       messages(record["messages"], "messages"), bool(record.get("compacted", False)),
+                       None if record.get("request") is None else section(record["request"], "request"))
 
 
 messages = functools.partial(listed, read=section, what="a list of chat messages")

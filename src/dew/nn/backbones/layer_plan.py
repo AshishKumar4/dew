@@ -13,6 +13,7 @@ import dataclasses
 from collections.abc import Hashable, Mapping, Sequence
 from typing import TYPE_CHECKING
 
+from dew.nn.dex import LayerDex
 from dew.registry import read_arguments
 
 from ..mixer_base import MixerBase
@@ -169,6 +170,8 @@ class LayerSpec:
     the decoder and its configuration, held in a tuple of one (`CrossBlocks.layer_key`, whatever it is);
     None for a layer that reads none. Layers of equal specs build one block, which a scanned run of them
     runs for each."""
+    dex: LayerDex | None = None
+    """The layer's differential extension on its attention's chosen heads (`dew.nn.dex`), or None."""
 
 
 def scan_groups(specs: Sequence[Hashable],
