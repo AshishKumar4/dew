@@ -193,6 +193,40 @@ def record_released_padding() -> None:
                    json.loads((DESTINATION / "config.json").read_text()), DESTINATION, ("text_config",))
 
 
+STEPPED_PREFILL = 40
+"""The prefill of tests/test_kimi_k3.py's cached decode, whose steps `record_stepped` records the reference
+at the shapes of."""
+
+
+def record_stepped() -> None:
+    """reference.npz's `stepped_logits` [1, tokens, vocab] for the committed fixture: the released model on
+    the CUDA device as `main` runs it (`released_modules`), holding the fixture's weights (`load_weights`),
+    over its batch's first row at the shapes tests/test_kimi_k3.py's cached decode computes them (ledger
+    1543): the first `STEPPED_PREFILL` positions from one forward over them, each later one from a forward
+    over the row up to it. Every other array of the file is kept as it is."""
+    from safetensors.torch import load_file
+
+    configuration, modeling, _ = released_modules()
+    config = json.loads((DESTINATION / "config.json").read_text())
+    model = modeling.KimiK3ForConditionalGeneration(
+        configuration.KimiK3Config(**copy.deepcopy(config))).float()
+    model.language_model.config._attn_implementation = "eager"
+    load_weights(model, load_file(str(DESTINATION / "model.safetensors")))
+    model = model.cuda().eval()
+    with np.load(DESTINATION / "reference.npz") as stored:
+        arrays = {name: stored[name] for name in stored.files}
+    row = torch.tensor(arrays["input_ids"][:1], device="cuda")
+    with torch.no_grad():
+        def forward(length: int) -> np.ndarray:
+            return model(input_ids=row[:, :length], use_cache=False).logits.cpu().numpy()
+
+        stepped = np.concatenate([forward(STEPPED_PREFILL), *(forward(length)[:, -1:]
+                                                               for length in range(STEPPED_PREFILL + 1,
+                                                                                   row.shape[1] + 1))], 1)
+    np.savez(DESTINATION / "reference.npz", **arrays, stepped_logits=stepped)
+    print("wrote", DESTINATION / "reference.npz", "stepped_logits", stepped.shape)
+
+
 def remote_modules():
     """The pinned configuration, modeling and linear modules as the release writes them, the routed experts
     in the backward pass (the second of the changes above)."""
@@ -483,6 +517,8 @@ if __name__ == "__main__":
         orders(Path(sys.argv[2]))
     elif sys.argv[1:] == ["padding"]:
         record_released_padding()
+    elif sys.argv[1:] == ["stepped"]:
+        record_stepped()
     elif sys.argv[1:2] == ["truth"]:
         write_truth(Path(sys.argv[2]) if len(sys.argv) > 2 else DESTINATION, truth)
     else:

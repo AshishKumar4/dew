@@ -69,6 +69,8 @@ def assert_routed(name: str, ours, label: str, leaf: str = 'logits', *, wide=Non
     if name in RECORDED:
         path = directory / 'recorded_logits.npz'
         seeds = declared_seeds(path)['logits']
+        # A cached decode's reference is the recording's at the shapes its steps compute.
+        leaf = leaf if prefill is None else 'stepped_logits'
         fp32 = ours(model, variables)
         wide = (wide or ours)(model.clone(dtype=jnp.float64), widened(variables))
         recorded, reference, truth = indexed_recording(
