@@ -1491,10 +1491,8 @@ def power_schedule(peak: jax.typing.ArrayLike, warmup_steps: int, a: jax.typing.
     and then decays linearly to `end_value` at `decay_end`, which is how
     Rigel ends its run; lm-engine's scheduler has no tail.
     """
-    def law(step):
-        return jnp.minimum(peak, a * (jnp.asarray(step, jnp.float32) * c) ** b)
-
-    warm = jnp.minimum(peak, a * (warmup_steps * c) ** b) if warmup_steps else peak
+    law = power_law(peak, a, b, c)
+    warm = law(warmup_steps) if warmup_steps else peak
     pieces = [optax.linear_schedule(0.0, warm, warmup_steps)] if warmup_steps else []
     pieces.append(lambda count: law(count + warmup_steps))
     boundaries = [warmup_steps] if warmup_steps else []
@@ -1507,6 +1505,27 @@ def power_schedule(peak: jax.typing.ArrayLike, warmup_steps: int, a: jax.typing.
                                             decay_end - decay_start))
         boundaries.append(decay_start)
     return optax.join_schedules(pieces, boundaries) if boundaries else pieces[0]
+
+
+def power_law(peak: jax.typing.ArrayLike, a: jax.typing.ArrayLike, b: float,
+              c: float = 1.0) -> Callable[[jax.typing.ArrayLike], jax.Array]:
+    """The power scheduler's law at a step, `min(peak, a * (step * c) ** b)` with its step in float32
+    (`power_schedule`), as a schedule of steps and one over a run's progress read it (`Power`)."""
+    def law(step: jax.typing.ArrayLike) -> jax.Array:
+        return jnp.minimum(peak, a * (jnp.asarray(step, jnp.float32) * c) ** b)
+
+    return law
+
+
+def anneal(start: jax.Array | float, stop: jax.Array | float, elapsed: jax.Array,
+           span: jax.Array | float) -> jax.Array:
+    """A half cosine from `start` to `stop`, `elapsed` of `span` through it (`OneCycle`): each end weighed
+    by the cosine's halves, `start * c + stop * (1 - c)`, so it lands on each end exactly and takes any two
+    rates, a zero start or ends far apart; torch's form, `stop + (start - stop) / 2 * (cos + 1)`, rounds the
+    difference of the ends in float32. The angle is optax's cosine decay's, `pi * elapsed / span`, in that
+    order: near a phase's end the cosine's halves cancel, so the angle's rounding is most of the rate's."""
+    turned = jnp.cos(jnp.pi * elapsed / span)
+    return start * (0.5 * (1 + turned)) + stop * (0.5 * (1 - turned))
 
 
 def linear_schedule(peak: jax.typing.ArrayLike, warmup_steps: int, decay_start: int | None,
@@ -1634,7 +1653,7 @@ class ScheduleBase:
         own reads its updates there as anywhere."""
         return False
 
-    def written_warmup(self) -> int | str | None:
+    def written_warmup(self) -> int | str | float | None:
         """Its warmup as written, in its own steps or as a share of the run, which a run that counts no
         updates ahead records as it is (`OptimConfig.warmups`); None where it has none."""
         return None
@@ -1699,7 +1718,7 @@ class Cosine(ScheduleBase):
     def run_relative(self) -> bool:
         return self.decay_steps is None
 
-    def written_warmup(self) -> int | str | None:
+    def written_warmup(self) -> int | str | float | None:
         return self.warmup_steps
 
     def marks(self) -> dict[str, int]:
@@ -1713,9 +1732,10 @@ class Cosine(ScheduleBase):
             raise ValueError(f"Cosine's warmup of {self.warmup_steps} leaves its run no decay")
         through, over, start = self._warm(self.warmup_steps, progress, updates, marks)
         alpha = 0.0 if self.peak_value == 0.0 else self.end_value / self.peak_value
-        warm = rates['init_value'] + (rates['peak_value'] - rates['init_value']) * through
-        cosine = 0.5 * (1 + jnp.cos(jnp.pi * _after(progress, start)))
-        return jnp.where(over, rates['peak_value'] * ((1 - alpha) * cosine + alpha), warm)
+        # `values`' optax pieces, each read at the fraction of its own span the run stands through.
+        warm = optax.linear_schedule(rates['init_value'], rates['peak_value'], 1)(through)
+        decayed = optax.cosine_decay_schedule(rates['peak_value'], 1, alpha)(_after(progress, start))
+        return jnp.where(over, decayed, warm)
 
     def values(self, steps: int | None, rates: Rates | None = None
                ) -> optax.Schedule:
@@ -1772,7 +1792,7 @@ class Power(ScheduleBase):
     def run_relative(self) -> bool:
         return isinstance(self.warmup_steps, str) or (self.tail is not None and self.tail.steps is None)
 
-    def written_warmup(self) -> int | str | None:
+    def written_warmup(self) -> int | str | float | None:
         return self.warmup_steps
 
     def marks(self) -> dict[str, int]:
@@ -1785,19 +1805,14 @@ class Power(ScheduleBase):
         A warmup written as a share of the run rises over that share of the progress to the law's value
         at the update it reaches, the law scaled by how far through it the run stands."""
         count = self._counted(updates)
-
-        def law(step):
-            # Its step in float32, as `power_schedule`'s law reads it.
-            scaled = jnp.asarray(step, jnp.float32) * self.c
-            return jnp.minimum(rates['peak_value'], rates['a'] * scaled ** self.b)
-
+        law = power_law(rates['peak_value'], rates['a'], self.b, self.c)
         written = self.warmup_steps
         if isinstance(written, str):
             through, _, _ = self._warm(written, progress, updates, marks)
             value = law(jnp.maximum(count, 1)) * through
         elif written:
-            warm = jnp.minimum(rates['peak_value'], rates['a'] * (written * self.c) ** self.b)
-            value = jnp.where(count < written, warm * count.astype(progress.dtype) / written, law(count))
+            value = jnp.where(count < written, optax.linear_schedule(0.0, law(written), written)(count),
+                              law(count))
         else:
             value = law(count)
         tail = self.tail
@@ -1805,10 +1820,12 @@ class Power(ScheduleBase):
             return value
         start = law(tail.start)
         if tail.steps is None:
-            done = _after(progress, marks["tail"])
+            through_tail = _after(progress, marks["tail"])
+            decayed = optax.linear_schedule(start, rates['tail.end_value'], 1)(through_tail)
         else:
-            done = jnp.clip((count - tail.start).astype(progress.dtype) / (tail.steps - tail.start), 0.0, 1.0)
-        return jnp.where(count >= tail.start, start + (rates['tail.end_value'] - start) * done, value)
+            decayed = optax.linear_schedule(start, rates['tail.end_value'], tail.steps - tail.start)(
+                count - tail.start)
+        return jnp.where(count >= tail.start, decayed, value)
 
     def values(self, steps: int | None, rates: Rates | None = None
                ) -> optax.Schedule:
@@ -1845,7 +1862,7 @@ class Linear(ScheduleBase):
     def run_relative(self) -> bool:
         return self.decay_steps is None
 
-    def written_warmup(self) -> int | str | None:
+    def written_warmup(self) -> int | str | float | None:
         return self.warmup_steps
 
     def marks(self) -> dict[str, int]:
@@ -1862,8 +1879,10 @@ class Linear(ScheduleBase):
         if self.decay_start is not None:
             decaying, start = self._counted(updates) >= self.decay_start, marks["decay_start"]
         peak = rates['peak_value']
-        decayed = peak + (rates['end_value'] - peak) * _after(progress, start)
-        return jnp.where(decaying, decayed, jnp.where(over, peak, peak * through))
+        # `linear_schedule`'s optax pieces, each read at the fraction of its own span the run stands through.
+        decayed = optax.linear_schedule(peak, rates['end_value'], 1)(_after(progress, start))
+        warm = optax.linear_schedule(0.0, peak, 1)(through)
+        return jnp.where(decaying, decayed, jnp.where(over, peak, warm))
 
     def values(self, steps: int | None, rates: Rates | None = None
                ) -> optax.Schedule:
@@ -1917,9 +1936,8 @@ class OneCycle(ScheduleBase):
     def run_relative(self) -> bool:
         return True
 
-    def written_warmup(self) -> int | str | None:
-        fraction = self.warmup_fraction
-        return fraction if isinstance(fraction, str) else f"{fraction:.0%}"
+    def written_warmup(self) -> int | str | float | None:
+        return self.warmup_fraction
 
     def progressed(self, rates: Rates, progress: jax.Array, updates: jax.Array,
                    marks: Mapping[str, jax.Array]) -> jax.Array:
@@ -1931,13 +1949,9 @@ class OneCycle(ScheduleBase):
         if not 0 < rise < 1:
             raise ValueError(f"a one-cycle schedule with warmup fraction {fraction} has no rise or no fall")
 
-        def anneal(start, stop, through):
-            turned = jnp.cos(jnp.pi * through)
-            return start * (0.5 * (1 + turned)) + stop * (0.5 * (1 - turned))
-
         at = jnp.clip(progress, 0.0, 1.0)
-        return jnp.where(at <= rise, anneal(rates['init_value'], rates['peak_value'], at / rise),
-                         anneal(rates['peak_value'], rates['end_value'], (at - rise) / (1 - rise)))
+        return jnp.where(at <= rise, anneal(rates['init_value'], rates['peak_value'], at, rise),
+                         anneal(rates['peak_value'], rates['end_value'], at - rise, 1 - rise))
 
     def values(self, steps: int | None, rates: Rates | None = None
                ) -> optax.Schedule:
@@ -1947,17 +1961,8 @@ class OneCycle(ScheduleBase):
         if not 0 < rise < last:
             raise ValueError(f"a one-cycle schedule over {steps} steps with warmup fraction "
                              f"{self.warmup_fraction} has no rise or no fall; give it more steps")
-        # Each half cosine weighs its two ends by the cosine's halves, `start * c + stop * (1 - c)`, so it
-        # lands on each end exactly and takes any two rates, a zero start or ends far apart; torch's
-        # form, `stop + (start - stop) / 2 * (cos + 1)`, rounds the difference of the ends in float32,
-        # which put the run's first rate 25 times further from float64 than optax's cosine decay.
-        # The phase's angle is optax's cosine decay's, `pi * elapsed / span`, in that order: near a
-        # phase's end the cosine's halves cancel, so the angle's rounding is most of the rate's.
-        def anneal(start: jax.Array | float, stop: jax.Array | float, elapsed: jax.Array,
-                   span: float) -> jax.Array:
-            turned = jnp.cos(jnp.pi * elapsed / span)
-            return start * (0.5 * (1 + turned)) + stop * (0.5 * (1 - turned))
-
+        # Each phase a half cosine (`anneal`); torch's own form put the run's first rate 25 times further
+        # from float64 than optax's cosine decay.
         def value(count) -> jax.Array:
             # The default float: float32 in a run, float64 where a test reads the definition under x64.
             step = jnp.minimum(jnp.asarray(count, float), last)
@@ -2121,7 +2126,7 @@ class OptimConfig:
     Empty keeps none.
     """
 
-    def warmups(self, steps: int | None, clocked: bool = False) -> dict[str, int | str]:
+    def warmups(self, steps: int | None, clocked: bool = False) -> dict[str, int | str | float]:
         """Each of its schedules' warmup in that schedule's own steps over a run of `steps` updates,
         its share of the run resolved (`ScheduleBase.warmup`), by where the config holds it, as a
         run's plan records it; a schedule with no warmup of steps is not among them. A `clocked` run
@@ -2133,7 +2138,7 @@ class OptimConfig:
             # group names none.
             rate = "learning_rate" if group.schedule is None else f"param_groups.{group.name}.schedule"
             held += [(rate, group.rate(self.learning_rate)), (f"param_groups.{group.name}.b1", group.b1)]
-        warmups: dict[str, int | str] = {}
+        warmups: dict[str, int | str | float] = {}
         for name, schedule in held:
             if not isinstance(schedule, ScheduleBase):
                 continue
