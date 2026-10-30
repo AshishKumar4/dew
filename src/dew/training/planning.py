@@ -551,8 +551,8 @@ class FitSearch[LossT, EffectsT]:
     """Each rung the derivation read before the first compile: its rung, terms, headroom and label."""
     kernels: dict[str, JSON] = dataclasses.field(default_factory=dict)
     """What the templates' reports found where the search compiled (`admitted`): each kernel its compiles
-    found spilling (`report.misses`, `spill_record`) and each launch config refused in this process's
-    registry (`report.refused_launches`)."""
+    found spilling (`report.misses`, `spill_record`) and each launch config they refused
+    (`report.refused_launches`), none the registry held before it searched."""
 
     def __post_init__(self):
         self.factor = temporaries_factor(self.mesh, self.capacity)
@@ -570,11 +570,12 @@ class FitSearch[LossT, EffectsT]:
         alternate policy is compiled."""
         # A rung fits where its most microbatches do; the search then finds its split there.
         self.derived_start(candidates[-1])
-        seen = len(report.misses())
+        seen, held = len(report.misses()), set(report.refused_launches())
         split = planned(candidates, first, self.fits, self.climb,
                         lambda split: self.forecast.likely(self.rung(), split))
         spills: list[JSON] = [spill_record(miss) for miss in report.misses()[seen:]]
-        refused: list[JSON] = [refusal_record(*refusal) for refusal in report.refused_launches()]
+        refused: list[JSON] = [refusal_record(*refusal) for refusal in report.refused_launches()
+                               if refusal not in held]
         self.kernels = {"spills": spills, "refused": refused}
         if split is None or self.fitted is None:
             raise PlanRefused(self.probes) from (self.refusals[-1] if self.refusals else None)
