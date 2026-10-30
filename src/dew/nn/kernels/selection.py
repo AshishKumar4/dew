@@ -48,54 +48,63 @@ class Refusal:
         return self.detail
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, init=False)
 class Requirement[C]:
-    """One fact a kernel needs of a case `C`, the description its op's selector reads: `code` names
-    it in a refusal, `holds(case)` tests it on the target (`generation`'s facts, honouring
-    `assumed`), and `detail` (text, or a function of the case) says why a call fails it. A limit
-    the code could lift names the `row` of the roadmap or ledger that tracks lifting it; one no
-    implementation of the kernel lifts names `INHERENT`. Its
-    `kind` is 'capability', what the kernel cannot compute; 'measured', where the target measured
-    another kernel faster or never qualified this one, which a forced choice overrides; or
-    'handoff', a call structurally outside what the kernel applies to, which it hands to the op's next
-    kernel even when forced (a generic kernel's to the next generic one, a join's projections run apart, a
-    decode token with nothing to fuse runs the step alone)."""
+    """One fact a kernel needs of a case `C`, the description its op's selector reads: its `analysis` of a
+    case, the refusal a call that fails it gets (its `code` and the detail a log names), or None where the
+    case holds it (`generation`'s facts, honouring `assumed`). A limit the code could lift names the `row`
+    of the roadmap or ledger that tracks lifting it; one no implementation of the kernel lifts names
+    `INHERENT`; every refusal the requirement reports carries them (`check`). Its `kind` is 'capability',
+    what the kernel cannot compute; 'measured', where the target measured another kernel faster or never
+    qualified this one, which a forced choice overrides; or 'handoff', a call structurally outside what the
+    kernel applies to, which it hands to the op's next kernel even when forced (a generic kernel's to the
+    next generic one, a join's projections run apart, a decode token with nothing to fuse runs the step
+    alone).
+
+    Built from a predicate, `Requirement(code, holds, detail, row, kind)`: it holds where `holds(case)` does,
+    its refusal `code` with `detail` (text, or a function of the case); or from an analysis that finds its
+    own refusal (`analysed`)."""
 
     code: str
-    holds: Callable[[C], bool]
-    detail: str | Callable[[C], str]
+    analysis: Callable[[C], Refusal | None]
     row: str
-    kind: str = 'capability'
-    analysis: Callable[[C], Refusal | None] | None = None
-    """An analysis whose own refusal the requirement reports (`analysed`), stamped with its row and kind."""
+    kind: str
 
-    def __post_init__(self) -> None:
-        if not self.row:
-            raise ValueError(f"requirement {self.code!r} names the row that tracks lifting it, or INHERENT")
-        if self.kind not in ('capability', 'measured', 'handoff'):
-            raise ValueError(f"requirement {self.code!r} is of kind {self.kind!r}, not capability, measured "
-                             "or handoff")
+    def __init__(self, code: str, holds: Callable[[C], bool] | None = None,
+                 detail: str | Callable[[C], str] = "", row: str = "", kind: str = 'capability', *,
+                 analysis: Callable[[C], Refusal | None] | None = None) -> None:
+        if not row:
+            raise ValueError(f"requirement {code!r} names the row that tracks lifting it, or INHERENT")
+        if kind not in ('capability', 'measured', 'handoff'):
+            raise ValueError(f"requirement {code!r} is of kind {kind!r}, not capability, measured or handoff")
+        if holds is not None and analysis is None:
+            def predicate(case: C, holds: Callable[[C], bool] = holds) -> Refusal | None:
+                return None if holds(case) else Refusal(code, detail(case) if callable(detail) else detail)
+
+            analysis = predicate
+        elif (holds is None) == (analysis is None):
+            raise ValueError(f"requirement {code!r} is a predicate `holds` or an `analysis`, one of them")
+        for name, value in (("code", code), ("analysis", analysis), ("row", row), ("kind", kind)):
+            object.__setattr__(self, name, value)
+
+    def holds(self, case: C) -> bool:
+        """Whether `case` meets the requirement."""
+        return self.analysis(case) is None
 
     def check(self, case: C) -> Refusal | None:
-        """The failed requirement's data, or None when it holds."""
-        if self.analysis is not None:
-            found = self.analysis(case)
-            return None if found is None else dataclasses.replace(found, row=self.row, kind=self.kind)
-        if self.holds(case):
-            return None
-        return Refusal(self.code, self.detail(case) if callable(self.detail) else self.detail,
-                       self.row, self.kind)
+        """The refusal `case` gets, under the requirement's row and kind, or None when it holds."""
+        found = self.analysis(case)
+        return None if found is None else dataclasses.replace(found, row=self.row, kind=self.kind)
 
 
 def analysed[C](code: str, analysis: Callable[[C], Refusal | None], row: str,
                 kind: str = 'capability') -> Requirement[C]:
     """The requirement an analysis decides (a mainloop's reason it declines a pass,
-    `attention_route.MAINLOOP`): it holds where the analysis finds no refusal, and reports the analysis's
-    own refusal, its code and detail, under this requirement's row and kind. A function, not a method of
-    `Requirement`: its case in a return position would make the requirement's case invariant, and a
-    requirement of a protocol's case (`recurrence_chunk.Templated`) would no longer serve its ops'."""
-    return Requirement(code, lambda case: analysis(case) is None, lambda case: str(analysis(case)), row, kind,
-                       analysis)
+    `attention_route.MAINLOOP`): it reports the analysis's own refusal, its code and detail, under its row
+    and kind. A function, not a method of `Requirement`: its case in a return position would make the
+    requirement's case invariant, and a requirement of a protocol's case (`recurrence_chunk.Templated`)
+    would no longer serve its ops'."""
+    return Requirement(code, row=row, kind=kind, analysis=analysis)
 
 
 @dataclasses.dataclass(frozen=True)
