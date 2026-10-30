@@ -201,7 +201,7 @@ from dew.training.planning import (
     splits,
     whole_step,
 )
-from dew.training.profiling import ProfileWindow, owned_capture, pgle_runs, stop_capture
+from dew.training.profiling import ProfileWindow, export_wait, owned_capture, pgle_runs, stop_capture
 from dew.training.rollout import Rollout, _branched, _reported, _rollout_metrics, rolled_out
 from dew.training.rungs import keep_rung, plan_flops, recorded_launches, recorded_rung
 from dew.training.runtime import Preempted, PreemptionNotice, ready_process
@@ -1554,8 +1554,9 @@ class Trainer(Generic[Loss, Effects]):
         # A run's last log is written at its cleanup, a failed run's only where no write waits on a step
         # its peers may never finish (`LogWriter.raise_failure`).
         unread = functools.partial(self._read_taken, run, agree=False)
+        exported = None if profile is None else functools.partial(self._exported_profile, run, profile)
         cleanups = (("Training log", unread), ("Log writer", run.writer.close), ("Training iterator", close),
-                    ("Profiler", stop_trace),
+                    ("Profiler", stop_trace), ("Profile export", exported),
                     ("Checkpoint wait", None if checkpoints is None else checkpoints.wait),
                     ("Display", self._display.close))
         try:
@@ -2475,8 +2476,18 @@ class Trainer(Generic[Loss, Effects]):
     # ------------------------------------------------------------------
 
     def _stop_trace(self, run: FitRun, profile: ProfileWindow, profiler: Profiler) -> None:
-        """Stop the window's owned capture (`stop_capture`), then report it on process zero."""
+        """Stop the window's owned capture (`stop_capture`), its reports exported beside the steps after
+        it until the run's cleanup waits for them (`_exported_profile`)."""
         stop_capture(profiler, run.loss)
-        self._report(ProfileWindowRecord(profile.directory, run.traced), run.current)
+        run.profiled = (run.traced, run.current)
+
+    def _exported_profile(self, run: FitRun, profile: ProfileWindow) -> None:
+        """Wait at the run's cleanup for the export its window left running (`export_wait`), a failed one
+        raised on every rank, then report the window on process zero, its reports written."""
+        if run.profiled is None:
+            return
+        traced, step = run.profiled
+        export_wait(profile.directory)
+        self._report(ProfileWindowRecord(profile.directory, traced), step)
         agreed("profile announcement", lambda: self._display.note(
-            f"Wrote profile for {run.traced} steps to {profile.directory}"))
+            f"Wrote profile for {traced} steps to {profile.directory}"))

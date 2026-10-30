@@ -10,7 +10,6 @@ import dataclasses
 import functools
 import gc
 import json
-import os
 import struct
 import weakref
 from collections.abc import Callable, Iterator
@@ -21,6 +20,7 @@ import numpy as np
 import optax
 import pytest
 from affine_run import FEATURES, Regression
+from export_support import Stalled
 from jax.extend.backend import get_backend
 from reference_error import as_given, assert_as_exact, seeds_for
 from sharded import collectives
@@ -42,7 +42,6 @@ from dew.objectives.lm import LMObjective
 from dew.objectives.lm.chunked import chunked_tile
 from dew.registry import mixers
 from dew.state import TrainState, apart
-from dew.telemetry import profile as telemetry_profile
 from dew.telemetry.instrumentation import Compiles
 from dew.training import Trainer
 from dew.training.distributed import microbatch
@@ -446,11 +445,12 @@ def test_the_executable_a_profile_replaces_goes_with_its_program():
     assert live_executables() == trials.live and int(state.step) == 3
 
 
-def test_a_profile_window_traces_steps_past_the_first_compile_and_is_refused_under_autopgle(tmp_path):
+def test_a_profile_window_traces_steps_past_the_first_compile_and_is_refused_under_autopgle(tmp_path,
+                                                                                            monkeypatch):
     """A fit's window opens once its warmup steps have run and its first step has compiled, so a window of
     no warmup traces the three steps after the first, never the compile; its reports are exported in a
-    process of their own while the run trains on, never by the run's (row 2017), and are whole once
-    `exported` returns. Under JAX's AutoPGLE, which
+    process of their own while the run trains on, a step after the window logging while the export waits
+    (`Stalled`, row 2017), and the run's end waits for them, whole. Under JAX's AutoPGLE, which
     profiles each program's first runs in a profiling session of its own where a process holds one at a
     time, a fit with a window is refused before it trains, naming JAX's way to capture guided programs
     (`PGLE_CAPTURE`): JAX's sessions would fail inside the window, as the trainer's would."""
@@ -462,7 +462,22 @@ def test_a_profile_window_traces_steps_past_the_first_compile_and_is_refused_und
     from dew.training import ProfileWindow
     from dew.training.profiling import traced_steps
 
-    tracker = RecordingTracker()
+    stalled = Stalled.under(tmp_path / "stalled", monkeypatch)
+
+    class Releasing(RecordingTracker):
+        """The run's logs, the window's export released at the first a step makes while it waits."""
+
+        def __init__(self):
+            super().__init__()
+            self.stepped: list[int] = []
+
+        def log(self, scalars, step):
+            super().log(scalars, step)
+            if stalled.started and not (stalled.held / "release").exists():
+                self.stepped.append(step)
+                stalled.release()
+
+    tracker = Releasing()
 
     def fit(directory):
         model = CausalTransformer(vocab_size=64, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
@@ -474,12 +489,12 @@ def test_a_profile_window_traces_steps_past_the_first_compile_and_is_refused_und
         trainer.fit(Loader(lambda partition: rows, None, None, ROWS), steps=5, log_every=1)
 
     fit(tmp_path / "window")
-    telemetry_profile.exported(tmp_path / "window")
+    # A step after the window logged while its export waited, which the run's end waited for in turn.
+    assert tracker.stepped == [5] and stalled.released
     (window,) = [value for _, value in tracker.artifacts if type(value).__name__ == "ProfileWindow"]
     (capture,) = (tmp_path / "window").glob("capture-*")
     assert window.steps == 3 and traced_steps(capture) == (1, 2, 3)
-    record = json.loads((capture / "manifest.json").read_text())
-    assert record["export_status"] == "completed" and record["exported_by"] != os.getpid()
+    assert json.loads((capture / "manifest.json").read_text())["export_status"] == "completed"
     with autopgle(2), pytest.raises(ValueError):
         fit(tmp_path / "pgle")
     assert not (tmp_path / "pgle").exists()

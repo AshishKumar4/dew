@@ -11,6 +11,7 @@ import pytest
 from examples_clock_worker import Questioned
 from recording import RecordingTracker
 from reference_error import as_given, assert_as_exact
+from test_barren_reads import Untouched
 
 from dew.batch import EXAMPLES_CONSUMED, VALID_ROWS
 from dew.config import RunConfig, TrainerConfig
@@ -187,17 +188,6 @@ def dealt_shards(ids: np.ndarray, examples: int, index: int, *, rewound: bool) -
         examples -= len(shard)
         place += 1
     return read
-
-
-@dataclasses.dataclass(frozen=True)
-class Untouched:
-    """A random step that leaves its record as it is, which keeps a stream's repeat where it is written,
-    after the shards each share reads."""
-
-    identity = "untouched@1"
-
-    def __call__(self, row, rng):
-        return row
 
 
 POOL_DEALS = {

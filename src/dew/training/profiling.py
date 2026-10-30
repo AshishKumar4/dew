@@ -130,9 +130,9 @@ def stop_capture(profiler: "Profiler", loss: "jax.Array | None") -> None:
 
     The core Profiler drains the backend and stops the trace here, and
     exports its native reports in a process of its own while the run
-    trains on (`Profiler.stop`, row 2017), which `ProfileReport.read`
-    waits for. The run's last `loss` is blocked on only to order the
-    primary's failure ahead of the profiler's own drain."""
+    trains on (`Profiler.stop`, row 2017), which the run's cleanup waits
+    for (`export_wait`). The run's last `loss` is blocked on only to order
+    the primary's failure ahead of the profiler's own drain."""
     def stop() -> None:
         try:
             if loss is not None:
@@ -147,6 +147,15 @@ def stop_capture(profiler: "Profiler", loss: "jax.Array | None") -> None:
                 primary.add_note(f"Profiler stop failed: {failure!r}")
 
     agreed("profile stop", stop)
+
+
+def export_wait(directory: str | Path) -> None:
+    """Wait on every rank for the export each one's window under `directory` left running
+    (`dew.telemetry.profile.exported`), a failed export raised on every rank, as a failed stop is
+    (`stop_capture`): no export outlives the run that captured it."""
+    from dew.telemetry.profile import exported
+
+    agreed("profile export", lambda: exported(Path(directory)))
 
 
 def traced_steps(capture: Path) -> tuple[int, ...]:
@@ -226,11 +235,9 @@ class ProfileReport:
         traced into `window`, this process's newest capture's. The run logged its steps once at the
         window's end, so that log's scalars are the steps the capture's annotations hold
         (`traced_steps`), or the report is refused."""
-        from dew.telemetry.profile import exported, process_directory
+        from dew.telemetry.profile import process_directory
         from dew.telemetry.trace import device_events
 
-        # The window's export runs beside the run (`stop_capture`), which its report waits for.
-        exported(window)
         capture = max(process_directory(window).glob("capture-*"), key=lambda path: path.stat().st_mtime)
         traced = traced_steps(capture)
         if traced != tuple(range(warmup, warmup + steps)):

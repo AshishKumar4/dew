@@ -332,6 +332,14 @@ class Map:
     configured: Bound | None = None
 
 
+def examples_bound(stages: Sequence[object]) -> int | None:
+    """Where a run bounded in examples marks the source examples it reads (`MarkConsumed`), the stage
+    after the bound's limit (`dew.data.compile._bounded`): its index in `stages`, None for a read the run
+    bounds otherwise. The one locator of the bound every compile and lowering step asks."""
+    return next((index for index, stage in enumerate(stages)
+                 if isinstance(stage, Map) and isinstance(stage.step, MarkConsumed)), None)
+
+
 @dataclasses.dataclass(frozen=True)
 class RandomMap:
     step: RandomStep
