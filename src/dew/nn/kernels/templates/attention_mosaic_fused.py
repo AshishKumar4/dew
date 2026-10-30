@@ -116,16 +116,7 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
             shapes = ((block_k, width), (block_k, width))
             run = program.whole_run(k_first, q_steps, spans_of)
 
-            def segments(lo, hi):
-                if run is None:
-                    return ((step, lo, hi),)
-                # Its whole tiles one segment of their own, unmasked, and the tiles around them masked: no
-                # step chooses at run time, whose two branches' registers join (FlashAttention 3's masked
-                # and unmasked iterations).
-                start, end = (jnp.clip(bound, lo, hi) for bound in run)
-                return ((functools.partial(step, masked=True), lo, start),
-                        (functools.partial(step, masked=False), start, end),
-                        (functools.partial(step, masked=True), end, hi))
+            segments = functools.partial(program.segmented, step, run)
 
             # The tiles its partner reads around its own (`Family.walk_own`); on a layout whose consumers
             # feed their rings, every tile any of the program's keys' readers reads, a tile none of a

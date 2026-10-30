@@ -127,15 +127,7 @@ def _coop_launch(query, key, value, dout, peak, total, anchor, delta, key_index,
             step = functools.partial(_coop_step, walk, share, (k_smem, v_smem), exchanged, rows_of, coords_of,
                                      whole, add_dq, (staged_turn, read_turn))
 
-            def segments(lo, hi):
-                if run is None:
-                    return ((step, lo, hi),)
-                # Its whole tiles one segment of their own, unmasked, and the tiles around them masked
-                # (`_fused_launch`'s).
-                start, end = (jnp.clip(bound, lo, hi) for bound in run)
-                return ((functools.partial(step, masked=True), lo, start),
-                        (functools.partial(step, masked=False), start, end),
-                        (functools.partial(step, masked=True), end, hi))
+            segments = functools.partial(program.segmented, step, run)
 
             shapes = ((block_k, columns), (block_k, columns))
             _, (dk, dv) = family.walk_own(
@@ -147,8 +139,7 @@ def _coop_launch(query, key, value, dout, peak, total, anchor, delta, key_index,
                              smem=smem.at[pl.ds(0, block_k)])
 
         def consumer(index):
-            for share in range(consumers):
-                pl.when(index == share)(functools.partial(cooperate, share, index))
+            mosaic.per_role(index, consumers, cooperate)
 
         def producer():
             family.stream(streams, views, *streamed)
