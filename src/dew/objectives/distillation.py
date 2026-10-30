@@ -183,6 +183,9 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
         self.inputs = student.inputs
         # The student's batches and their tokens, which the teacher scores too.
         self.counts_tokens = student.counts_tokens
+        # The student's loss runs as its own (`predict`), passing the run's progress as it does; the
+        # frozen teacher reads the run's end.
+        self.passes_progress = student.passes_progress
         averaged = student.ema
         # The EMA follows what moves; the teacher never does.
         self.ema = None if averaged is None else EMASpec(
@@ -296,7 +299,7 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
             self.student_variables(params), batch, self._student_step(step), train=step.training,
             layers=tuple(student_layer for _, student_layer in self.features), logits=whole)
         _, _, teacher = self.teacher.predict(
-            params[TEACHER], batch, replace(step, ema=None), train=False,
+            params[TEACHER], batch, replace(step, ema=None, training=False), train=False,
             layers=tuple(teacher_layer for teacher_layer, _ in self.features), logits=whole)
         if (student.logits is not None and teacher.logits is not None
                 and student.logits.shape[-1] != teacher.logits.shape[-1]):

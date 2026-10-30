@@ -17,6 +17,12 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   converts them once. `ModelInputs.from_value` and `ModelInputs.kwargs` lay a request's flat fields out
   as its `coordinates`, `LMObjective.token_scores` takes `coordinates=`, and a field dict carrying both
   a `Coordinates` and a flat layout field is refused where it is read.
+- A run's progress (`dew.nn.progress.Progress`, the updates committed before a step) is a declared
+  input: a model whose computation changes over a run (`ReadsProgress`, a DEX decoder) takes it as its
+  call's `progress=` keyword and carries it to its layers in `AttentionMetadata.progress`, so a compiled
+  forward keys on it. A run's training loss passes it (`Objective.progress`); a call that passes none
+  reads the run's end. `dew.nn.progress.progress()` and `stepping` are gone, and an objective that
+  passes no progress (`Objective.passes_progress`) refuses a model that reads it.
 - One entry point and one path for scoring decisions: `decide(state, questions)` answers a request and
   `decide([(state, questions), ...], contexts=...)` many, their rows packed into the passes a scoring
   server runs and over its compiled programs. `Decide.batch` and `Decide.fits` are gone; call the task
