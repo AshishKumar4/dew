@@ -141,7 +141,9 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
         one id's probabilities on both sides.
 
         A position whose teacher scores are not finite is left out of the term, its count reported
-        (`distill/teacher_nonfinite`), never trained on.
+        (`distill/teacher_nonfinite`), never trained on: under `full` any of its logits, and under
+        `selected`, which reads the sampled id's likelihood alone, that likelihood (a token of zero
+        probability elsewhere, a logit of minus infinity, is a distribution's, and kept).
 
         Each of `alpha`, `temperature` and `beta` is a constant or an
         `optax.Schedule` of the step. A constant outside its range (alpha in
@@ -153,6 +155,11 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
             raise ValueError("selected distillation scores the sampled tokens at temperature 1")
         if tokenizers is not None:
             _refuse_other_tokenizers(*tokenizers)
+        # The selected term holds no logits whose widths the step compares, so the models' own sizes are.
+        sizes = {getattr(objective.model, "vocab_size", None) for objective in (student, teacher)}
+        if divergence == "selected" and None not in sizes and len(sizes) > 1:
+            raise ValueError(f"the selected term reads one id's likelihood on both sides, so the teacher and "
+                             f"the student share a vocabulary; they score {sorted(sizes)} ids")
         for name, value, ok in (("alpha", alpha, lambda v: 0 <= v <= 1),
                                 ("temperature", temperature, lambda v: v > 0),
                                 ("beta", beta, lambda v: v >= 0)):

@@ -138,11 +138,21 @@ DecisionRunConfig.cli(["--pretrained", "local/chat", "--trainer.name", "run",
 rows' table and the runs' root."""
 
 
+def recorded(script: str, data: str, root, environment) -> dict:
+    """The fields the run `script` records in its run.json under `root`, run over `data` in a process of
+    its own under `environment`."""
+    import json
+
+    done = subprocess.run([sys.executable, "-c", script, data, str(root)], env=environment,
+                          capture_output=True, text=True, check=False)
+    assert done.returncode == 0, done.stderr[-3000:]
+    return json.loads((root / "run" / "run.json").read_text())["fields"]
+
+
 def test_a_run_records_its_hub_backbone_at_its_commit_online_and_from_the_cache_offline(tmp_path):
     """An LM run whose `--pretrained` names a Hub repo alone, run from the command line, writes the
     commit the Hub serves into its run.json; with the Hub gone and none of Dew's recorded answers, the
     same command reads the Hub cache's ref the online run wrote and records the same commit."""
-    import json
 
     from token_support import write_token_corpus
 
@@ -152,11 +162,7 @@ def test_a_run_records_its_hub_backbone_at_its_commit_online_and_from_the_cache_
     files = {name: FIXTURE / name for name in ("config.json", "model.safetensors")}
 
     def ran(name, environment):
-        root = tmp_path / name
-        done = subprocess.run([sys.executable, "-c", TRAIN_PRETRAINED, tokens.train, str(root)],
-                              env=environment, capture_output=True, text=True, check=False)
-        assert done.returncode == 0, done.stderr[-3000:]
-        return json.loads((root / "run" / "run.json").read_text())["fields"]["pretrained"]
+        return recorded(TRAIN_PRETRAINED, tokens.train, tmp_path / name, environment)["pretrained"]
 
     with LocalHub({"local/llama": files}) as hub:
         commit = hub.commit("local/llama")
@@ -191,11 +197,7 @@ def test_a_decision_run_records_its_hub_backbone_at_its_commit_online_and_from_t
                                                          ("the site is down", "technical")] * 4])
 
     def ran(name, environment):
-        root = tmp_path / name
-        done = subprocess.run([sys.executable, "-c", TRAIN_DECISION, str(table), str(root)],
-                              env=environment, capture_output=True, text=True, check=False)
-        assert done.returncode == 0, done.stderr[-3000:]
-        return json.loads((root / "run" / "run.json").read_text())["fields"]["revision"]
+        return recorded(TRAIN_DECISION, str(table), tmp_path / name, environment)["revision"]
 
     with LocalHub({"local/chat": files}) as hub:
         commit = hub.commit("local/chat")

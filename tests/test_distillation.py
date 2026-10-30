@@ -504,7 +504,8 @@ def test_selected_distillation_weights_each_sampled_tokens_score_by_its_reverse_
     gradient is the score function of each sampled token weighted by its log-ratio
     log pi_s(y) - log pi_t(y), the teacher frozen, as the hand formula over the two models' own
     log-likelihoods gives it, bit for bit, each scored as its loss scores it with no whole logits held
-    (`predict`'s `logits`); the reported estimate is that log-ratio's mean."""
+    (`predict`'s `logits`); the reported estimate is that log-ratio's mean. A temperature, and a teacher
+    of another vocabulary size, are refused."""
     arrays = fixture()
     objective, params = fixture_objective(arrays, alpha=1.0, temperature=1.0, beta=0.0, features=[],
                                           divergence="selected")
@@ -527,6 +528,10 @@ def test_selected_distillation_weights_each_sampled_tokens_score_by_its_reverse_
                  objective.student_variables({"params": expected})["params"])
     with pytest.raises(ValueError):
         DistillationObjective(student, teacher, divergence="selected", temperature=2.0)
+    # A teacher scoring another vocabulary's ids: the selected term, holding no logits, reads the sizes.
+    wider = LMObjective(teacher.model.clone(vocab_size=teacher.model.vocab_size + 1), SEQ, ema_decay=None)
+    with pytest.raises(ValueError):
+        DistillationObjective(student, wider, divergence="selected")
 
 
 @pytest.mark.parametrize("scores", [True, False], ids=["scores and states", "states alone"])
