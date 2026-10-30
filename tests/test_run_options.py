@@ -596,7 +596,9 @@ def flag(value, annotation) -> str:
 
 
 def prefixed(root: Path, drawn: bool) -> RunConfig:
-    """`lm`'s run over a decoder whose attention reads a prefix's blocks, which a prefix run needs."""
+    """`lm`'s run over a decoder whose attention reads a prefix's blocks, which a prefix run needs, in two
+    layers: one alone answers a generation from the prompt's last place, which a prefix's block shows
+    nothing new, where a second reads what the block's places saw."""
     from dew.nn.backbones.causal_transformer import CausalTransformer, LayerKind
     from dew.nn.mixers.attention import AttentionMixer
 
@@ -604,7 +606,7 @@ def prefixed(root: Path, drawn: bool) -> RunConfig:
     kinds = {"blocks": LayerKind(mixer=AttentionMixer(bidirectional_blocks=True))}
     record = registry.to_record(kinds, typing.get_type_hints(CausalTransformer)["kinds"])
     return dataclasses.replace(run, model=ModelConfig("causal_transformer", {
-        **run.model.fields, "layer_types": ["blocks"], "kinds": record}))
+        **run.model.fields, "layer_types": ["blocks", "blocks"], "kinds": record}))
 
 
 BESIDE = {"layout.framing": {"segments": built_in(None, "question_first"), "max_len": 256},
@@ -873,10 +875,10 @@ def witnessed_on(builder, objective: str, settings: type, root: Path
 
 
 UNHELD = ("states a layout's window, budgets and option layout alone",
-          "Laya's layout holds a ModernBERT encoder")
+          "Laya's layout holds a ModernBERT encoder", "the source's format holds no cross-attention layers")
 """What `dew export` says refusing a run whose format holds not all it saved, rather than dropping it: a
-release's config (Laya's) its layout's window, budgets and option layout alone, and its weights a
-ModernBERT encoder's."""
+release's config (Laya's) its layout's window, budgets and option layout alone, its weights a ModernBERT
+encoder's, and its source's format no cross-attention layer a context reads through."""
 
 
 def exported(run: Path, destination: Path) -> bool:
