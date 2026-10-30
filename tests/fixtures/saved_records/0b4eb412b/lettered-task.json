@@ -1,0 +1,358 @@
+{
+    "context_encoder": "table",
+    "head": {
+        "class": "dew.decision.head:LabelReadout",
+        "fields": {
+            "count": 4,
+            "dtype": "bfloat16",
+            "label_ids": [
+                [
+                    32
+                ],
+                [
+                    33
+                ],
+                [
+                    34
+                ],
+                [
+                    35
+                ]
+            ],
+            "untied": false
+        }
+    },
+    "layout": {
+        "class": "dew.decision.layout:StateFirstLayout",
+        "fields": {
+            "blocks": false,
+            "framing": null,
+            "head_max_len": null,
+            "labels": {
+                "cue": "\nAnswer:",
+                "names": [
+                    "A",
+                    "B",
+                    "C",
+                    "D"
+                ],
+                "variants": [
+                    "{}"
+                ]
+            },
+            "max_len": 512,
+            "option_tokens": null,
+            "order": null,
+            "parallel": false,
+            "segments": [
+                {
+                    "class": "dew.decision.layout:Text",
+                    "fields": {
+                        "text": "STATE:\n"
+                    }
+                },
+                {
+                    "class": "dew.decision.layout:State",
+                    "fields": {
+                        "keep": "start",
+                        "max_tokens": null,
+                        "render": "compact"
+                    }
+                },
+                {
+                    "class": "dew.decision.layout:Instructions",
+                    "fields": {
+                        "defaults": {},
+                        "headers": {
+                            "choice": "{}"
+                        },
+                        "render": "question",
+                        "span": "instructions",
+                        "stream": "context"
+                    }
+                },
+                {
+                    "class": "dew.decision.layout:OptionLines",
+                    "fields": {
+                        "bare": "\n{label}. {option}",
+                        "criteria": {},
+                        "join": "",
+                        "level": "level {}",
+                        "line": "\n{label}. {option}",
+                        "marker": "none",
+                        "noul": [
+                            "yes",
+                            "no"
+                        ],
+                        "noul_first": "false",
+                        "render": "entry",
+                        "stream": "context"
+                    }
+                },
+                {
+                    "class": "dew.decision.layout:AnswerCue",
+                    "fields": {
+                        "at": 26,
+                        "join": ", ",
+                        "many": "\nAnswer:",
+                        "template": "\nAnswer:"
+                    }
+                }
+            ],
+            "split": null,
+            "unit": "pieces"
+        }
+    },
+    "model": {
+        "defaults": {},
+        "fields": {
+            "audio": null,
+            "audio_projection": null,
+            "audio_soft_tokens": null,
+            "dtype": "bfloat16",
+            "extra_placeholder_ids": [],
+            "family": "qwen3_5",
+            "image_token_id": 268,
+            "language_model": {
+                "activation_sparsity_pattern": null,
+                "altup": null,
+                "attention_bias": false,
+                "attention_dropout_rate": 0.0,
+                "attention_impl": "auto",
+                "attention_k_eq_v": false,
+                "attention_residuals": null,
+                "attention_scale": null,
+                "attention_sinks": false,
+                "attn_logit_softcap": null,
+                "bank_layers": null,
+                "causal": true,
+                "context_length": 512,
+                "continuum": null,
+                "cross_attention": {
+                    "class": "dew.nn.cross_attention:CrossAttention",
+                    "fields": {
+                        "activation": "swiglu",
+                        "context_features": null,
+                        "context_length": 256,
+                        "intermediate_size": null,
+                        "layer_ids": [
+                            0
+                        ]
+                    }
+                },
+                "depth_scaled_init": false,
+                "dex": null,
+                "dropout_rate": 0.0,
+                "dspark": null,
+                "dtype": "bfloat16",
+                "emb_features": 32,
+                "embedding_dropout_rate": 0.0,
+                "embedding_features": null,
+                "embedding_multiplier": 1.0,
+                "embedding_norm": false,
+                "embedding_norm_reads": "inputs",
+                "embedding_scale": false,
+                "embedding_zero_ids": [],
+                "engram": null,
+                "final_logit_softcap": null,
+                "final_norm": true,
+                "first_attention_norm": true,
+                "force_fp32_for_softmax": true,
+                "head_bias": false,
+                "head_dim": 32,
+                "head_transform": null,
+                "hyper_connections": null,
+                "index_share_for_mtp_iteration": false,
+                "initializer_range": null,
+                "kinds": {
+                    "full_attention": {
+                        "bidirectional_window": false,
+                        "chunk": null,
+                        "head_dim": null,
+                        "mixer": {
+                            "class": "dew.nn.mixers.attention:AttentionMixer",
+                            "fields": {
+                                "alibi": false,
+                                "bidirectional_blocks": false,
+                                "bidirectional_images": false,
+                                "exclusive_self_attention": false,
+                                "gate_projection": "query",
+                                "mrope_section": [
+                                    11,
+                                    11,
+                                    10
+                                ],
+                                "nope": false,
+                                "qk_norm_weight": true,
+                                "rotary_pairs": "half",
+                                "temperature_tuning": null
+                            }
+                        },
+                        "num_kv_heads": null,
+                        "partial_rotary_factor": null,
+                        "qk_norm": null,
+                        "rope_scaling": null,
+                        "rope_theta": null,
+                        "sinks": null,
+                        "window": null
+                    },
+                    "linear_attention": {
+                        "bidirectional_window": false,
+                        "chunk": null,
+                        "head_dim": null,
+                        "mixer": {
+                            "class": "dew.nn.mixers.gated_delta_net:GatedDeltaNetMixer",
+                            "fields": {
+                                "fused_in_proj": false,
+                                "linear_conv_kernel_dim": 4,
+                                "linear_key_head_dim": 8,
+                                "linear_num_key_heads": 1,
+                                "linear_num_value_heads": 3,
+                                "linear_value_head_dim": 8,
+                                "output_gate_type": "silu"
+                            }
+                        },
+                        "num_kv_heads": null,
+                        "partial_rotary_factor": null,
+                        "qk_norm": null,
+                        "rope_scaling": null,
+                        "rope_theta": null,
+                        "sinks": null,
+                        "window": null
+                    }
+                },
+                "kv_cache": {
+                    "groups": 1,
+                    "page_size": null,
+                    "pages": null,
+                    "quantized": null
+                },
+                "kv_shared_layers": null,
+                "laurel_rank": null,
+                "layer_scalar": null,
+                "layer_types": [
+                    "linear_attention",
+                    "linear_attention",
+                    "linear_attention",
+                    "full_attention"
+                ],
+                "logits_scaling": 1.0,
+                "loop": null,
+                "mask_token_id": null,
+                "max_seq_len": 512,
+                "mixer": null,
+                "mixture": null,
+                "mlp": "swiglu",
+                "mlp_bias": false,
+                "mlp_features": 112,
+                "mtp_feedforward_type": null,
+                "mtp_hyper_connections": null,
+                "mtp_layer_type": null,
+                "narrow_rotary_tables": false,
+                "ngpt": null,
+                "norm_bias": false,
+                "norm_eps": 1e-06,
+                "norm_type": "rms",
+                "normed_residual": false,
+                "norms": null,
+                "num_heads": 3,
+                "num_kv_heads": 1,
+                "num_layers": 4,
+                "num_nextn_predict_layers": 1,
+                "o_proj_bias": null,
+                "output_gate": true,
+                "output_gate_activation": "sigmoid",
+                "padding_idx": 256,
+                "parallel_residual": false,
+                "partial_rotary_factor": 0.25,
+                "partial_rotary_type": "default",
+                "per_layer_input_dim": null,
+                "per_layer_input_vocab": null,
+                "position_embedding": "rotary",
+                "position_embedding_offset": 0,
+                "position_embedding_size": null,
+                "post_residual_norms": false,
+                "pre_norms": true,
+                "precision": null,
+                "qk_norm": true,
+                "qk_norm_scope": "head",
+                "remat": null,
+                "residual_in_fp32": false,
+                "residual_multiplier": 1.0,
+                "rope_scaling": null,
+                "rope_theta": 10000000.0,
+                "sandwich_norms": false,
+                "scale_after_cast": false,
+                "scale_offset": true,
+                "scan_layers": false,
+                "shared_parallel_norm": false,
+                "shifted_logits": false,
+                "stream_multiplier": 1.0,
+                "swiglu_limit": null,
+                "tie_embeddings": false,
+                "use_double_wide_mlp": false,
+                "v_norm": false,
+                "value_experts": null,
+                "value_head_dim": null,
+                "value_scale": null,
+                "vocab_size": 289
+            },
+            "pad_token_id": 256,
+            "precision": null,
+            "projection": {
+                "class": "dew.nn.vision.qwen35:Qwen35Projector",
+                "fields": {
+                    "activation": "gelu",
+                    "activation_after": false,
+                    "bias": true,
+                    "channel_major": false,
+                    "dtype": null,
+                    "hidden_size": 32,
+                    "norm": true,
+                    "out_width": 32,
+                    "precision": null,
+                    "spatial_merge_size": 2,
+                    "width": 128
+                }
+            },
+            "vision": {
+                "class": "dew.nn.vision.qwen35:Qwen35Vision",
+                "fields": {
+                    "depth": 2,
+                    "hidden_act": "gelu_pytorch_tanh",
+                    "hidden_size": 32,
+                    "in_channels": 3,
+                    "intermediate_size": 64,
+                    "num_heads": 4,
+                    "num_position_embeddings": 16,
+                    "patch_size": 16,
+                    "spatial_merge_size": 2,
+                    "temporal_patch_size": 2
+                }
+            }
+        },
+        "name": "dew.nn.multimodal:MultimodalTransformer",
+        "wrappers": []
+    },
+    "objective": "dew.decision.objective:DecisionObjective",
+    "options": 4,
+    "precision": {
+        "dtypes": {
+            "compute": "bfloat16",
+            "output": "float32",
+            "params": "float32"
+        },
+        "forms": "fast",
+        "matmul": "default"
+    },
+    "processor": null,
+    "questions": 1,
+    "specials": {
+        "begin": null,
+        "marker": 258,
+        "marker_text": "<|im_end|>",
+        "pad": 256,
+        "separator": 258
+    },
+    "tokenizer": "tests/fixtures/hf/qwen38-dense-tiny"
+}
