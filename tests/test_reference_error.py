@@ -8,6 +8,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
+from one_draw import assert_as_exact_as_the_reference, assert_leaves_as_exact
 from reference_error import (
     FACTOR,
     PARITY,
@@ -16,8 +17,6 @@ from reference_error import (
     Inconclusive,
     as_given,
     assert_as_exact,
-    assert_as_exact_as_the_reference,
-    assert_leaves_as_exact,
     assert_moves,
     assert_same_artifact,
     declared_seeds,
@@ -82,16 +81,25 @@ def written_attention(query, key, value):
 
 
 @pytest.mark.skipif(jax.default_backend() != "cpu", reason="WITHOUT_YNN is XLA:CPU's")
-def test_a_check_whose_program_xla_cpu_compiles_only_with_ynnpacks_fusions_runs_both_arms_with_them():
+def test_a_check_whose_program_xla_cpu_compiles_only_with_ynnpacks_fusions_runs_both_arms_with_them(
+        tmp_path, monkeypatch):
     """XLA:CPU refuses jax.nn's XLA attention's backward over a single key without YNNPACK's fusions, at
-    every matmul precision (`YNN_REFUSED`); check 1 turns both arms over to the fusions there (`_Paired`),
-    the two still of one kind, and judges them."""
-    from reference_error import without_ynn
+    every matmul precision; check 1 decides, once before its draws, that both arms of that site take the
+    fusions (`_ynn_decided`), the two still of one kind, logs that decision once beside its stages
+    (STAGES_LOG), and judges them."""
+    import json
+
+    from reference_error import STAGES_LOG, without_ynn
 
     with pytest.raises(jax.errors.JaxRuntimeError):
         without_ynn(pulled_by_itself(xla_attention))(*one_key_draw(0))
+    log = tmp_path / "stages.jsonl"
+    monkeypatch.setenv(STAGES_LOG, str(log))
     assert_as_exact(pulled_by_itself(xla_attention), pulled_by_itself(written_attention), one_key_draw,
                     "attention over one key", seeds=16)
+    decided = [entry for entry in map(json.loads, log.read_text().splitlines()) if "ynn" in entry]
+    assert [(entry["label"], entry["ynn"]) for entry in decided] == [("attention over one key",
+                                                                       "with YNNPACK's fusions")]
 
 
 @pytest.mark.skipif(jax.default_backend() != "cpu", reason="WITHOUT_YNN is XLA:CPU's")
