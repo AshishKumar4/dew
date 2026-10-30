@@ -162,9 +162,10 @@ def run_loop(model, x, *, train: bool, decode: bool, **inputs):
     elif len(scanned) > 1:
         views = [PassView(model.num_layers + (step - 1) * (end - first), first, end - first)
                  for step in scanned]
-        # The collections a pass sows into beside those a stack writes: captured intermediates, among
-        # others, which an unrolled pass appended to.
-        appended = frozenset(collection for collection in model.variables
+        # The collections a pass sows into beside those a stack writes, which an unrolled pass appended
+        # to: those the first pass made, and captured intermediates, which a capture of a module only the
+        # later passes call first makes inside the scan (the final norm `_preamble` reads by).
+        appended = frozenset(collection for collection in (*model.variables, 'intermediates')
                              if model.is_mutable_collection(collection)) - {*WRITTEN, 'params', 'constants'}
         view = PassStack(views, shared=shared is not None, appended=appended)
         mapped = (*WRITTEN, *sorted(appended))
