@@ -77,8 +77,9 @@ def test_a_dream_release_walks_its_responses_as_its_own_sampling_does(release, t
 
 def test_a_dream_release_asking_what_its_walk_does_not_take_is_refused_by_name(tmp_path):
     """A Dream release whose generation config asks its sampling for what `alg='origin'` does not take
-    (another `alg`, a `top_k`) builds no task: the control is refused by name. One whose sampling code
-    Dew does not know walks Dew's MDLM instead, refusing the controls that code would read."""
+    (another `alg`, a `top_k`) or names a mask other than the model's builds no task: the control is
+    refused by name. One whose sampling code Dew does not know walks Dew's MDLM instead, refusing the
+    controls that code would read."""
     for index, (asked, refused) in enumerate((({"alg": "entropy"}, "alg"),
                                               ({"alg": "origin", "top_k": 5}, "top_k"))):
         source = Pretrained.load(snapshot("diffucoder", tmp_path / str(index), asked), dtype="float32",
@@ -86,6 +87,12 @@ def test_a_dream_release_asking_what_its_walk_does_not_take_is_refused_by_name(t
         assert source.masked_walk is None
         with pytest.raises(ValueError, match=refused):
             source.text_generation()
+    other = snapshot("dream", tmp_path / "other-mask")
+    stated = json.loads((other / "generation_config.json").read_text())
+    stated["mask_token_id"] -= 1
+    (other / "generation_config.json").write_text(json.dumps(stated))
+    with pytest.raises(ValueError, match="mask_token_id"):
+        Pretrained.load(other, dtype="float32", attention_impl="reference").text_generation()
     unknown = snapshot("dream", tmp_path / "unknown", {"steps": 64})
     (unknown / "generation_utils.py").write_text("# another sampling\n")
     source = Pretrained.load(unknown, dtype="float32", attention_impl="reference")

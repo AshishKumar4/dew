@@ -271,16 +271,18 @@ def _active(config: Mapping[str, object], generation_config: Mapping[str, object
 
 
 def audit_masked(config: Mapping[str, object], generation_config: Mapping[str, object],
-                 walked: Collection[str] = ()) -> None:
+                 walked: Collection[str] = (), mask_id: int | None = None) -> None:
     """Refuse the active source controls a masked model cannot honour.
 
     Native MDLM has no AR policy chain and no KV cache, so only the controls a
     task owns are left standing, and those the release's own walk reads
     (`walked`, its family's `masked_walk`, as Dream's `alg`, `steps` and `eps`).
+    A `mask_token_id` naming the id the task unmasks (`mask_id`) is the task's own.
     """
     refused = []
     for name in sorted(_CONTROLS.keys() | generation_config.keys()):
-        if name in walked:
+        if name in walked or (name == "mask_token_id"
+                              and _generation_value(config, generation_config, name) in (None, mask_id)):
             continue
         rule = _CONTROLS.get(name)
         if rule is not None and rule.owner in ("task", "metadata", "inapplicable"):
