@@ -57,7 +57,7 @@ from ..attention_residuals import AttentionResiduals, DepthAttention
 from ..blocks import TokenEmbedding, normal_kernel
 from ..cross_attention import CrossBlocks, crossed_flops
 from ..deepseek_v4 import DeepseekV4Mixer
-from ..dex import DifferentialExtension, LayerDex
+from ..dex import DexStart, DifferentialExtension, LayerDex
 from ..dsa_kpool import KPoolSparseAttentionMixer
 from ..dspark import DSpark, DSparkStage, draft as dspark_draft
 from ..engram import Engram, EngramHashes, EngramLayer
@@ -643,8 +643,8 @@ class CausalTransformer(nn.Module):
     def per_layer_vocab(self) -> int:
         return self.vocab_size if self.per_layer_input_vocab is None else self.per_layer_input_vocab
 
-    def mixer_context(self, kind: "ResolvedKind", layer_type: str,
-                      kv_shared: bool, dex: LayerDex | None = None) -> MixerContext:
+    def mixer_context(self, kind: "ResolvedKind", layer_type: str, kv_shared: bool,
+                      dex: LayerDex | None = None, dex_start: DexStart | None = None) -> MixerContext:
         """Return one layer's mixer geometry as a `MixerContext` built from the resolved kind.
 
         `head_dim`, `rope_theta`, `window`, the rope scaling, the partial
@@ -663,7 +663,7 @@ class CausalTransformer(nn.Module):
             "kv_shared": kv_shared, "kv_store_key": layer_type,
             "partial_rotary_factor": kind.partial_rotary_factor, "attention_sinks": kind.sinks,
             "qk_norm": kind.qk_norm, "init_std": self.init_stds[0], "output_init_std": self.init_stds[1],
-            "precision": self.precision, "dex": dex}
+            "precision": self.precision, "dex": dex, "dex_start": dex_start}
         return MixerContext(**resolved, **{field.name: getattr(self, field.name)
                                            for field in dataclasses.fields(MixerContext)
                                            if field.name not in resolved})
@@ -1059,8 +1059,8 @@ class CausalTransformer(nn.Module):
         ple = self.per_layer_input_dim
         spec = specs[index]
         return DecoderBlock(
-            mixer=(spec.kind.mixer or mixer_spec).build(
-                self.mixer_context(spec.kind, spec.layer_type, spec.kv_shared, spec.dex)),
+            mixer=(spec.kind.mixer or mixer_spec).build(self.mixer_context(
+                spec.kind, spec.layer_type, spec.kv_shared, spec.dex, self._dex_start(index))),
             feedforward=(
                 functools.partial(routed, expert_bias=False, media_bias=False, hash_vocab=self.vocab_size)
                 if spec.hash_routed and routed is not None else
@@ -1112,8 +1112,13 @@ class CausalTransformer(nn.Module):
         """Layer `index`'s mixer, unbound, as its kind builds it over the layer's context."""
         types = self.per_layer_types
         spec = self._layer_specs(types, self.layer_kinds(types), self.layer_mixer)[index]
-        return (spec.kind.mixer or self.layer_mixer).build(
-            self.mixer_context(spec.kind, spec.layer_type, spec.kv_shared, spec.dex))(parent=None)
+        return (spec.kind.mixer or self.layer_mixer).build(self.mixer_context(
+            spec.kind, spec.layer_type, spec.kv_shared, spec.dex, self._dex_start(index)))(parent=None)
+
+    @nn.nowrap
+    def _dex_start(self, index: int) -> DexStart | None:
+        """What layer `index`'s extension starts from, which its variables keep (`dew.nn.dex`)."""
+        return None if self.dex is None else self.dex.start(index)
 
     @nn.nowrap
     def cross_flops(self, lengths, context_lengths) -> float:
@@ -1875,7 +1880,11 @@ class CausalTransformer(nn.Module):
         # supplied layout; the scan's init=True pass would draw over it first.
         if (self.is_initializing() and stages == 1 and not decode
                 and not self.has_variable('params', f'layers_{first}')):
-            groups = spanned
+            # A run draws its layers under one scan where they draw alike: a layer whose start is its own
+            # (DEX's heads and lambda_init, `_dex_start`) draws apart, and its run stacks it after.
+            drawn = tuple((key, self._dex_start(index)) for index, key in enumerate(self.scan_keys))
+            groups = tuple((first + start, count)
+                           for start, count in scan_groups(drawn[first:end], self.bank_layers))
             if any(count > 1 for _, count in groups):
                 view = StackView(groups)
                 run = nn.map_variables(type(self)._stacked, mapped_collections=True, trans_in_fn=view.stack,

@@ -36,7 +36,7 @@ from dew.nn.attention_masks import (
 )
 from dew.nn.blocks import normal_kernel
 from dew.nn.dense import Dense
-from dew.nn.dex import annealed, differential
+from dew.nn.dex import DEX_COLLECTION, DexStart, LayerDex, annealed, differential
 from dew.nn.documents import CrossDocuments
 from dew.nn.flops import attention_flops, cross_attention_flops, projection_flops
 from dew.nn.inputs import (
@@ -265,10 +265,12 @@ CONTEXT_LOGITS = "context_max_logits"
     # like the query's; the longer suffix outranks the MLP's `gate_proj`.
     ("self_attn", "gate_proj"): ("embed", "heads"),
     ("o_proj",): ("attention", "embed"),
-    # DEX's projections of a chosen subset of heads, which no head split divides, and its lambda: whole on
-    # every device (`dew.nn.dex`).
+    # DEX's projections of a chosen subset of heads, which no head split divides, its lambda, and the
+    # heads and lambda_init it holds: whole on every device (`dew.nn.dex`).
     ("dex_projection",): (None, None, None),
     ("dex_lambda",): (),
+    ("dex_heads",): (None,),
+    ("dex_lambda_init",): (),
 })
 class CausalSelfAttention(nn.Module):
     """Causal self-attention with grouped-query heads, rotary positions, qk
@@ -395,14 +397,7 @@ class CausalSelfAttention(nn.Module):
         if self.ctx.ngpt is not None:
             self._ngpt_gains(self.ctx.ngpt)
         if self.ctx.dex is not None:
-            # DEX's per-head projections of the chosen heads' outputs and its learned lambda, zero at the
-            # start as the paper's lambda_learn (`dew.nn.dex`).
-            if self.ctx.dex.heads[-1] >= self.ctx.num_heads:
-                raise ValueError(f"DEX names heads {self.ctx.dex.heads} of a layer of {self.ctx.num_heads}")
-            self.dex_projection = self.param(
-                'dex_projection', nn.initializers.lecun_normal(in_axis=-2, out_axis=-1, batch_axis=(0,)),
-                (len(self.ctx.dex.heads), self.value_dim, self.value_dim), jnp.float32)
-            self.dex_lambda = self.param('dex_lambda', nn.initializers.zeros, (), jnp.float32)
+            self._dex_variables(self.ctx.dex, self.ctx.dex_start)
         # A head's learned logit beside its keys', which a read of the layer's own sequence and one of
         # a context (`attend_context`) both take.
         self.sinks = (self.param('sinks', nn.initializers.zeros, (self.ctx.num_heads,))
@@ -475,13 +470,36 @@ class CausalSelfAttention(nn.Module):
         """Its heads' count and each one's output width, which DEX extends (`dew.nn.dex.HeadOutputs`)."""
         return self.ctx.num_heads, self.value_dim
 
+    def _dex_variables(self, dex: LayerDex, start: DexStart | None) -> None:
+        """DEX's per-head projections of the chosen heads' outputs and its learned lambda, zero at the
+        start as the paper's lambda_learn, and the heads and lambda_init the layer holds as constants
+        (`DEX_COLLECTION`), which `start` gives where they are drawn (`dew.nn.dex`)."""
+        if start is not None and start.heads[-1] >= self.ctx.num_heads:
+            raise ValueError(f"DEX names heads {start.heads} of a layer of {self.ctx.num_heads}")
+
+        def held(name: str, value: tuple[int, ...] | float, dtype) -> jax.Array:
+            def drawn() -> jax.Array:
+                if start is None:
+                    raise ValueError("a DEX layer's chosen heads and lambda_init are its variables, which "
+                                     "a layer built without them reads from the variables it is given")
+                return jnp.asarray(value, dtype)
+            return self.variable(DEX_COLLECTION, name, drawn).value
+
+        self.dex_projection = self.param(
+            'dex_projection', nn.initializers.lecun_normal(in_axis=-2, out_axis=-1, batch_axis=(0,)),
+            (dex.count, self.value_dim, self.value_dim), jnp.float32)
+        self.dex_lambda = self.param('dex_lambda', nn.initializers.zeros, (), jnp.float32)
+        self.dex_heads = held('dex_heads', () if start is None else start.heads, jnp.int32)
+        self.dex_lambda_init = held('dex_lambda_init', 0.0 if start is None else start.lambda_init,
+                                    jnp.float32)
+
     @nn.nowrap
     def _dex_flops(self, lengths) -> float:
         """DEX's work on each token's chosen heads (`dew.nn.dex`): a `[Dv, Dv]` map of each, none
         without it."""
         if self.ctx.dex is None:
             return 0.0
-        return projection_flops(lengths, len(self.ctx.dex.heads) * self.value_dim, self.value_dim)
+        return projection_flops(lengths, self.ctx.dex.count * self.value_dim, self.value_dim)
 
     @nn.nowrap
     def projections(self) -> dict[str, tuple[int, int]]:
@@ -1354,8 +1372,8 @@ class CausalSelfAttention(nn.Module):
         gate the attended values where it gates, then project them."""
         if self.ctx.dex is not None:
             # Lambda annealed over the run's updates (`dew.nn.progress`), its learned value outside a run.
-            strength = annealed(progress().updates, self.ctx.dex, self.dex_lambda)
-            attention = differential(attention, self.ctx.dex.heads, self.dex_projection, strength,
+            strength = annealed(progress().updates, self.ctx.dex, self.dex_lambda_init, self.dex_lambda)
+            attention = differential(attention, self.dex_heads, self.dex_projection, strength,
                                      self.ctx.precision)
         if self.exclusive_self_attention and own_value is not None:
             attention = exclusive_self_attention(attention, own_value)

@@ -553,13 +553,14 @@ class Pretrained:
     def with_dex(self, extension: DifferentialExtension, *, key: int | jax.Array) -> Self:
         """Return this source with DEX's differential on `extension`'s chosen heads (`dew.nn.dex`), its
         projections drawn from `key` under `params` and its lambdas zero, so the model computes what the
-        source does until they train; the rest trains as the extension's recipe says
+        source does until they train, and each layer's chosen heads and lambda_init held beside them
+        (`dew.nn.dex.DEX_CONSTANTS`); the rest trains as the extension's recipe says
         (`DifferentialExtension.trains`: the paper's, the attention's key, value and output projections
         beside it and the rest under `FROZEN`, or all of it), a source's frozen weights staying frozen. A
         source loaded without its weights takes the extension's shapes. The source's own format holds no
         extension, so `save` and `export` refuse the result; a run's checkpoint keeps it."""
         from dew.batch import FROZEN, freeze, merge, select, thaw
-        from dew.nn.dex import DEX_PARAMETERS
+        from dew.nn.dex import DEX_COLLECTION, DEX_CONSTANTS, DEX_PARAMETERS
         from dew.nn.inputs import request_key
         from dew.nn.protocols import Differential, Predicting
 
@@ -572,7 +573,8 @@ class Pretrained:
         def drawn(draw: jax.Array) -> Variables:
             # Only the extension leaves the program, so the source's own draws are dead code to XLA.
             return select(thaw(model.init(draw, jnp.zeros((1, length), jnp.int32))),
-                          lambda path: path[0] == "params" and path[-1] in DEX_PARAMETERS)
+                          lambda path: (path[0] == "params" and path[-1] in DEX_PARAMETERS)
+                          or (path[0] == DEX_COLLECTION and path[-1] in DEX_CONSTANTS))
 
         shaped = any(isinstance(leaf, jax.ShapeDtypeStruct) for leaf in jax.tree.leaves(self.variables))
         added = jax.eval_shape(drawn, request_key(key)) if shaped else jax.jit(drawn)(request_key(key))
