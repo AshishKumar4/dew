@@ -246,18 +246,27 @@ def copied(source, destination) -> None:
 
 def coalesced(source, destination) -> None:
     """`copied`, through registers in Mosaic GPU's shared-to-global copy layout (`Layout.SMEM_GMEM_COPY`)
-    where a row of `source` is one of its tiles' rows (16 to 128 bytes): each lane 16 bytes of a row, a
-    warp's lanes along whole rows, so its stores write whole sectors and its shared reads meet no bank
-    twice. The layout inference's own choice was the MMA fragment's, a lane's 4 bytes a row, so a warp wrote
-    half sectors: an A100's forward of Qwen3.5-27B's gated delta net took 1.162 ms against 0.941 with its
-    walks' stores so, its states launch 0.422 against 0.314, the port's 0.984 (JS-a100copy-a100-0b4eb412b).
-    A wider row takes a tile narrower than it, whose rows' reads meet the same banks: the attention
-    template's forward stores so took 19% longer (JS-2075cells-a100-491c05798), and keep `copied`."""
-    rows, width = source.shape[0], source.shape[-1] * jnp.dtype(source.dtype).itemsize
-    if len(source.shape) != 2 or rows % 32 or width not in (16, 32, 64, 128):
+    where `source` tiles it: each lane 16 bytes of a row, a warp's lanes along tiles of 8 rows and the
+    widest swizzle a row's bytes are a multiple of, so its stores write whole sectors. The layout
+    inference's own choice was the MMA fragment's, a lane's 4 bytes a row, so a warp wrote half sectors: an
+    A100's forward of Qwen3.5-27B's gated delta net took 1.162 ms against 0.941 with every store so, its
+    states launch 0.422 against 0.314 and its output launch 0.299 against 0.258, the port's 0.984
+    (JS-a100copy-a100-0b4eb412b). A walk's stores alone (`Mma.stored`): the attention template's forward,
+    whose `persist` stores its output so, took 19% longer (JS-2075cells-a100-491c05798)."""
+    if len(source.shape) != 2 or source.shape[0] % 8:
         return copied(source, destination)
-    layout = plgpu.Layout.SMEM_GMEM_COPY(tuple(source.shape), jnp.dtype(source.dtype), width)
-    plgpu.store(destination, plgpu.load(source, layout=layout, optimized=False), optimized=False)
+    rows, width = source.shape[0], source.shape[1] * jnp.dtype(source.dtype).itemsize
+    for swizzle in (128, 64, 32, 16):
+        if width % swizzle:
+            continue
+        row_tiles, column_tiles = rows // 8, width // swizzle
+        # The layout's own condition: a warpgroup's four warps' tiles four down the rows, two by two, or
+        # four across.
+        if row_tiles % 4 == 0 or (row_tiles % 2 == 0 and column_tiles % 2 == 0) or column_tiles % 4 == 0:
+            layout = plgpu.Layout.SMEM_GMEM_COPY(tuple(source.shape), jnp.dtype(source.dtype), swizzle)
+            plgpu.store(destination, plgpu.load(source, layout=layout, optimized=False), optimized=False)
+            return
+    copied(source, destination)
 
 
 @dataclasses.dataclass(frozen=True)
