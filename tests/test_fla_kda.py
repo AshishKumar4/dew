@@ -5,7 +5,8 @@ its output, final memory and every gradient against the float64 token recurrence
 share, at shapes that pad to the kernels' blocks, with value heads sharing a key head, and on a mesh;
 its packed documents are test_fla_gdn's packed test. These run interpreted on a CPU; a GPU's native runs
 are tests/test_gpu_recurrence.py's: a Kimi delta attention layer trained on its port, held to float64,
-and its step repeated bit for bit.
+its step repeated bit for bit, and the port in fp32 and mixed dtypes held to fla's own distance from
+float64 (test_fla_gdn.the_port_is_as_exact_as_fla).
 """
 
 
@@ -23,8 +24,9 @@ pytestmark = pytest.mark.kernel
 
 ON_A_GPU = pytest.mark.skipif(
     jax.default_backend() == "gpu",
-    reason="on a GPU the port's fp32 products are fla's TF32, held to float64 trained natively "
-           "(tests/test_gpu_recurrence.py); interpreted, they are exact")
+    reason="on a GPU the port's fp32 products are fla's TF32, held to fla's own distance from float64 "
+           "(test_fla_gdn.the_port_is_as_exact_as_fla, a cell of tests/test_gpu_recurrence.py); interpreted, "
+           "they are exact")
 
 
 def fla_math(q, k, v, g, beta, h0):

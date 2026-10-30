@@ -13,9 +13,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from delta_rule_support import NAMES, checkpointed, math as portable, recurrence, rule_math, through
+from delta_rule_support import NAMES, checkpointed, fla_side, math as portable, recurrence, rule_math, through
 from gdn_cases import CASES
 from reference_error import (
+    FEWEST_SEEDS,
     assert_as_exact,
     assert_computes_the_oracle,
     chain_roundings,
@@ -454,8 +455,8 @@ def test_dews_fla_rule_follows_the_recurrence_for_any_heads_widths_and_length(
 
 
 @pytest.mark.parametrize("per_key", [False, pytest.param(True, marks=pytest.mark.skipif(
-    not INTERPRETED, reason="on a GPU Kimi delta attention's fp32 products are fla's TF32; its packed bar "
-                            "is fla's own distance (test_fla_kda's packed case)"))])
+    not INTERPRETED, reason="on a GPU Kimi delta attention's fp32 products are fla's TF32, held to fla's own "
+                            "distance by the_port_is_as_exact_as_fla (tests/test_gpu_recurrence.py)"))])
 @pytest.mark.parametrize("begun", [False, True])
 def test_dews_fla_rule_runs_packed_documents_as_their_own_sequences(per_key, begun):
     """Packed documents (`starts`, each a sequence of its own, fla's varlen), with a
@@ -839,6 +840,50 @@ def test_the_port_keeps_the_kernel_contract_on_a_mesh(axis, split, per_key):
     assert_runs_per_shard(through(fla_rule, do, every), draw, [spec] * 5, mesh,
                           f"fla rule split over {axis}, {'per key' if per_key else 'per head'}",
                           seeds=SHARDED_SEEDS[per_key], truth_fn=exact)
+
+
+FLA_SHAPE = (1, 1024, 2, 4, 128)
+"""The port's cell against fla's own: a row of 1024 tokens, two key heads each serving two value heads, 128
+wide (Qwen3.5's gated delta net's head)."""
+
+FLA_DTYPES = {"float32": (jnp.float32,) * 3, "mixed dtypes": (jnp.bfloat16, jnp.float32, jnp.bfloat16)}
+"""The queries', keys' and values' dtypes of the port's cells against fla's own: fp32, whose products the port
+takes in TF32x3 and fla in one TF32, and mixed, which each runs in their common dtype."""
+
+
+def the_port_is_as_exact_as_fla(per_key: bool, dtypes: str):
+    """The rule on the port's kernels natively (`fla_rule`), a decay a head (fla_gdn) or a key dimension
+    (fla_kda), its queries, keys and values in `FLA_DTYPES[dtypes]` (beta in the values'): its output, final
+    memory and every operand's gradient on par from float64 with fla 0.5.2's own on the same operands
+    (`fla_side`, in its own interpreter, in their common dtype), check 1, the float64 token recurrence the
+    truth, at `FLA_SHAPE`. A GPU cell (tests/test_gpu_recurrence.py)."""
+    batch, length, key_heads, value_heads, width = FLA_SHAPE
+    kinds = FLA_DTYPES[dtypes]
+    common = jnp.result_type(*kinds)
+
+    def draw(seed):
+        q, k, v, g, beta, h0, do, dht = support.delta_operands(
+            seed, batch, length, key_heads, value_heads, width, width, per_key=per_key)
+        return (q.astype(kinds[0]), k.astype(kinds[1]), v.astype(kinds[2]), g, beta.astype(kinds[2]), h0,
+                do.astype(common), dht)
+
+    def port(q, k, v, g, beta, h0, do, dht):
+        return through(fla_rule, do, dht)(q, k, v, g, beta, h0)
+
+    def fla(*inputs):
+        shapes = jax.eval_shape(port, *inputs)
+
+        def run(*arrays):
+            return tuple(np.asarray(x, s.dtype) for x, s in zip(fla_side(arrays, None, common), shapes,
+                                                                   strict=True))
+
+        return jax.pure_callback(run, shapes, *inputs)
+
+    def truth(q, k, v, g, beta, h0, do, dht):
+        return through(recurrence, do, dht)(q, k, v, g, beta, h0)
+
+    assert_as_exact(port, fla, draw, f"the port ({'kda' if per_key else 'gdn'}, {dtypes}) against fla's own",
+                    seeds=FEWEST_SEEDS, truth_fn=truth)
 
 
 def _lowered_dot(product, default: str) -> list:
