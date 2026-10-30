@@ -526,6 +526,15 @@ class Dtypes:
                 raise ValueError(f"a run's {name} dtype is a floating one, not {getattr(self, name)!r}")
 
 
+def output_dtype(dtype: Dtype | None) -> jnp.dtype:
+    """The dtype a model returns its outputs (its logits) in: its run's `Dtypes.output`
+    (`dew.nn.kernels.generation.numerics`, float32 outside a run), never narrower than its compute
+    `dtype` (None for Flax's float32), so a float64 truth's stay float64."""
+    from dew.nn.kernels.generation import numerics
+
+    return jnp.promote_types(numerics().dtypes.output, jnp.float32 if dtype is None else dtype)
+
+
 DTYPE_PRESETS = {
     "bf16-mixed": Dtypes(),
     "32-true": Dtypes(compute="float32"),
