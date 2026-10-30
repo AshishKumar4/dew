@@ -60,6 +60,7 @@ pytestmark = pytest.mark.mesh
 TINY_LAYA = Path(__file__).parent / "fixtures" / "laya" / "tiny"
 QWEN_TINY = Path(__file__).parent / "fixtures" / "hf" / "qwen38-dense-tiny"
 DIFFUSION_GEMMA = Path(__file__).parent / "fixtures" / "hf" / "diffusion-gemma-sft"
+DEEPSEEK_TINY = Path(__file__).parent / "fixtures" / "hf" / "deepseek-v41-tiny"
 RATE = 0.0123
 """A learning rate no kind takes by default, which the run's optimizer logs as it steps."""
 
@@ -629,16 +630,16 @@ def prefixed(root: Path, drawn: bool) -> RunConfig:
 
 
 BESIDE = {"layout.framing": {"segments": built_in(None, "question_first"), "max_len": 256},
-          "layout.unit": {"segments": tuple(dataclasses.replace(segment, line="{option}", bare="{option}")
+          "layout.unit": {"segments": tuple(dataclasses.replace(segment, line="r{option}e", bare="r{option}e")
                                             if isinstance(segment, OptionLines) else segment
                                             for segment in built_in(None, "question_first")),
-                          "max_len": 256, "head_max_len": None, "option_tokens": None},
+                          "max_len": 256},
           "context_encoder": {"context_layers": (0,), "context_length": 64}}
 """What an option's reader takes it only beside, by the run's path, set with it: a framing frames a row of
 its own segments (`_budgeted`), here the question layout's own row as segments (`built_in`), in a row long
 enough for its conversation's turns; a unit encodes a row of segments, the built-in row piece by piece,
-here one whose option lines abut, which a row encoded whole reads as one text, no budget cutting its
-pieces;
+here one whose option lines abut where a tokenizer merges "e" and "r" (`merged`'s), so a row encoded whole
+reads them as other tokens;
 a context's encoder encodes it for context layers, which read a row's context."""
 
 
@@ -648,6 +649,14 @@ def lettered(root: Path, drawn: bool) -> RunConfig:
     # The tiny tokenizer spells each letter as one token bare ("{}"), not after a space.
     return dataclasses.replace(decision(root, drawn), pretrained=str(QWEN_TINY),
                                head=Letters(labels=Labels(variants=("{}",)), count=4),
+                               source=SourceOptions(text_only=True))
+
+
+def merged(root: Path, drawn: bool) -> RunConfig:
+    """A decision run of a fresh head over a tiny causal source whose tokenizer merges pairs of characters
+    (DeepSeek V4.1's, "e" and "r" among them), where a row encoded whole and one encoded piece by piece
+    are other tokens, which a byte-level tokenizer never makes them."""
+    return dataclasses.replace(decision(root, drawn), pretrained=str(DEEPSEEK_TINY),
                                source=SourceOptions(text_only=True))
 
 
@@ -675,10 +684,12 @@ def blocked(root: Path, drawn: bool) -> RunConfig:
 TASK_RUNS = {"TextSettings": ((prefixed, "lm"),),
              "MaskedSettings": ((masked, "masked_diffusion"), (dreamed, "masked_diffusion")),
              "ImageSettings": ((diffusion, "diffusion"),), "BlockSettings": ((blockwise, "block_diffusion"),),
-             "DecideSettings": ((decision, "decision"), (blocked, "decision"), (lettered, "decision"))}
+             "DecideSettings": ((decision, "decision"), (blocked, "decision"), (lettered, "decision"),
+                                (merged, "decision"))}
 """The runs here of an objective that records each saved task's settings, and the objective's name: a
-decision release's, which exports, a fresh head's over a backbone that reads blocks, and a fresh letter
-readout's, whose labels its layout takes; a masked run over a release, whose walk it takes."""
+decision release's, which exports, a fresh head's over a backbone that reads blocks, a fresh letter
+readout's, whose labels its layout takes, and a fresh head's over a tokenizer that merges, whose unit a row
+shows; a masked run over a release, whose walk it takes."""
 
 
 def witnessed(settings: type, base=None) -> dict[str, list[object]]:
