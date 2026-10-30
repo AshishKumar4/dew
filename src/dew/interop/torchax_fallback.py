@@ -1527,6 +1527,8 @@ def _built(directory: Path, param_dtype: str, weights: bool
         return built, None
     with init_empty_weights(include_buffers=False):
         model = AutoModelForCausalLM.from_config(stated, dtype=built_as, experts_implementation=EXPERTS)
+    # Its tied parameters one, as transformers' load ties them, which `_stored_tensors` reads by each name.
+    model.tie_weights()
     stored = _stored_tensors(model, directory, None if param_dtype == AUTO else jnp.dtype(param_dtype))
     if stored is None:
         return AutoModelForCausalLM.from_pretrained(str(directory), dtype=storage, local_files_only=True,
