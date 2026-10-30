@@ -1203,8 +1203,9 @@ def test_the_lm_heads_hold_their_reverse_orders(head, edge):
     per-token cross entropy and log partition of `hidden @ table.T`, whole, in tiles, or summed with its
     gradient taken in the forward. Their reverse orders, reverse over reverse among them, finite wherever
     float64 is a normal float32 and the plain formula, the whole logits' log-softmax, is. JAX runs no
-    forward derivative through a custom VJP, nor transposes one, so a forward rule beside the hand-written
-    backward has no place to stand: a custom JVP would replace it with JAX's transpose of the tangent's."""
+    forward derivative through a custom VJP; a forward rule beside the hand-written backward is a custom
+    JVP whose tangent is a linear map transposing to it (`dew.nn.kernels.generation.linear_tangent`),
+    which the heads do not take yet (row 2690)."""
     scale = EDGES[edge]
     hidden, table = normal_draw(2704, (2, 4, 8), (11, 8), scale=scale)
     direction = normal_draw(2705, hidden.shape, table.shape, scale=scale)
@@ -1241,8 +1242,8 @@ def test_a_node_perturbation_estimate_holds_its_reverse_orders(edge):
     rule is its estimate of the gradient from the model's forwards at perturbed sites): over a two-layer
     linear model's squared error, its primal, its estimate and the estimate's own reverse derivative finite
     wherever its float64 run, the same perturbations drawn at float64, is a normal float32. Its estimate
-    is of the reverse product against a cotangent; a forward rule would be another estimator, or one
-    estimate a statistic, which a reverse derivative through it would then take too."""
+    is of the reverse product, linear in the cotangent; a forward rule is the estimate's transpose at the
+    same draws, which it does not take yet (row 2690)."""
     from flax import linen as nn
     from model_support import parameter_loss
     from test_perturbation import squared
