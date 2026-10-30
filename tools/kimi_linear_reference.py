@@ -7,8 +7,8 @@ kernels, whose 0.4.0 `fused_kda_gate` signature the release calls (0.5
 changed it), so this runs on a CUDA device, in fp32, with
 TRITON_F32_DEFAULT=ieee for every dot that leaves its precision unset.
 
-Environment (~/.cache/dew/reference-venvs/kimi-linear): torch 2.8.0+cu128,
-transformers 4.57.1, fla-core 0.4.0.
+Environment: tools/kimi_linear_reference.requirements.txt (torch 2.8.0+cu128,
+transformers 4.57.1, fla-core 0.4.0).
 
 Four things change how the reference runs, not what it computes:
 
@@ -67,9 +67,9 @@ from kimi_k3_reference import (
     float64_truth,
     greedy,
     record_orders,
+    record_picks,
     scatter,
     sgd_step,
-    symmetric,
     write_fixture,
     write_truth,
 )
@@ -215,8 +215,7 @@ def main() -> None:
     model, ids, mask, input_ids, attention_mask = fixture_on_gpu(model)
     logits, loss, updated = sgd_step(model, input_ids, attention_mask, lambda name: True)
     with torch.no_grad():
-        for name, parameter in model.named_parameters():
-            parameter.copy_(tensors[name].to(parameter))
+        load_weights(model, tensors)
         again = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).logits
         assert torch.equal(again, logits), "restoring the written weights must restore the logits"
         generated, step_logits = greedy(model, input_ids, attention_mask)
@@ -224,7 +223,15 @@ def main() -> None:
              logits=logits.detach().cpu().numpy(), loss=np.float32(loss.detach().cpu()),
              learning_rate=np.float32(LEARNING_RATE), updated_logits=updated.cpu().numpy(),
              generated=generated, step_logits=step_logits, precision=matmul_precision())
+    record_picks(DESTINATION)
     print("wrote", DESTINATION, "tensors", len(tensors))
+
+
+def load_weights(model: torch.nn.Module, tensors: dict[str, torch.Tensor]) -> None:
+    """Copy stored tensors into `model`'s parameters, each in its parameter's dtype and device."""
+    with torch.no_grad():
+        for name, parameter in model.named_parameters():
+            parameter.copy_(tensors[name].to(parameter))
 
 
 def truth(directory: Path) -> dict[str, np.ndarray]:
@@ -243,9 +250,7 @@ def truth(directory: Path) -> dict[str, np.ndarray]:
         model = modeling.KimiLinearForCausalLM(
             configuration.KimiLinearConfig(**copy.deepcopy(config))).double()
         model.config._attn_implementation = "eager"
-        with torch.no_grad():
-            for name, parameter in model.named_parameters():
-                parameter.copy_(tensors[name])
+        load_weights(model, tensors)
         return float64_truth(model.eval(), directory, lambda name: True)
 
 
@@ -257,14 +262,7 @@ def orders(drawn: Path) -> None:
     config = json.loads((DESTINATION / "config.json").read_text())
     model = modeling.KimiLinearForCausalLM(configuration.KimiLinearConfig(**copy.deepcopy(config))).float()
     model.config._attn_implementation = "eager"
-    model = model.cuda().eval()
-
-    def load(model, weights):
-        with torch.no_grad():
-            for name, parameter in model.named_parameters():
-                parameter.copy_(weights[name].to(parameter))
-
-    record_orders(model, drawn, DESTINATION, load, lambda name: True, matmul_precision())
+    record_orders(model, drawn, DESTINATION, load_weights, lambda name: True, matmul_precision())
 
 if __name__ == "__main__":
     import sys
@@ -273,9 +271,7 @@ if __name__ == "__main__":
         record_released_padding()
     elif sys.argv[1:2] == ["orders"]:
         orders(Path(sys.argv[2]))
-    elif sys.argv[1:] == ["truth"]:
-        write_truth(DESTINATION, truth)
-    elif sys.argv[1:2] == ["symmetric"]:
-        symmetric(DESTINATION, Path(sys.argv[2]), truth)
+    elif sys.argv[1:2] == ["truth"]:
+        write_truth(Path(sys.argv[2]) if len(sys.argv) > 2 else DESTINATION, truth)
     else:
         main()
