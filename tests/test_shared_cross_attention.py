@@ -365,13 +365,15 @@ LATENT_KINDS = {
 ledger 2418): DeepSeek V3's MLA, GLM's k-pool sparse attention, which reads a context densely as its
 latent attention does, and DeepSeek V4's attention of one shared key and value head."""
 CONTEXT_WIDTH = 16
+WINDOWED = {"v4": 4}
+"""The window a kind's layers attend over their own sequence, where every layer of it attends one."""
 
 
 def context_layer(kind: str):
     """A layer of `kind`'s attention at `CONTEXT_WIDTH`, unbound."""
     return LATENT_KINDS[kind].build(MixerContext(emb_features=CONTEXT_WIDTH, num_heads=2, num_kv_heads=2,
                                                  head_dim=8, max_seq_len=16, norm_eps=1e-5,
-                                                 sliding_window=4))(name="self_attn")
+                                                 sliding_window=WINDOWED.get(kind)))(name="self_attn")
 
 
 def context_read(layer):
@@ -490,8 +492,9 @@ def test_an_attention_of_its_own_reads_a_context_through_its_own_projections(kin
     assert layer.reads_context
     assert_as_exact(context_read(layer), REFERENCES[kind](layer), context_draw(layer), f"context read {kind}",
                     seeds=SHARED_SEEDS[f"context read {kind}"])
+    windowed = {"full_attention": LayerKind(window=WINDOWED[kind])} if kind in WINDOWED else None
     model = CausalTransformer(vocab_size=VOCAB, emb_features=CONTEXT_WIDTH, num_layers=2, num_heads=2,
-                              head_dim=8, mlp_features=32, max_seq_len=16, sliding_window=4, qk_norm=False,
+                              head_dim=8, mlp_features=32, max_seq_len=16, qk_norm=False, kinds=windowed,
                               mixer=LATENT_KINDS[kind], cross_attention=SharedCrossAttention((0, 1), 6))
     ids = jnp.ones((B, SEQ), jnp.int32)
     conditioning = {CONTEXT: jnp.ones((B, 6, CONTEXT_WIDTH)), CONTEXT_LENGTHS: jnp.full((B,), 6, jnp.int32)}
