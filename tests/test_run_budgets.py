@@ -871,6 +871,30 @@ def test_a_clocked_run_of_a_warmup_as_a_share_trains_and_records_it_as_written(s
     assert consumed == sorted(consumed) and consumed[-1] == CLOCKED_RECORDS
 
 
+def test_a_clocked_runs_validation_records_the_examples_it_had_consumed():
+    """A run bounded in examples that counts no steps ahead records with each validation, beside its step,
+    the examples it had consumed when it validated (`evaluation/examples_consumed`), the coordinate its
+    own clock places it at: at a share of its examples, each the count its step's log records, rising to
+    its bound; a run counted in steps records none."""
+    (x,) = clocked_records(0)
+    held = Pipeline(Memory({"x": x[:BATCH]})).batch(BATCH)
+    optim = OptimConfig(optimizer="adam", learning_rate=PEAK)
+    tracker = RecordingTracker()
+    Trainer(Echoed(), optim, key=0, tracker=tracker).fit(
+        clocked_chain(x), examples=CLOCKED_RECORDS, log_every=1, validation=held, eval_every="25%")
+    trained = {step: scalars["train/examples_consumed"] for step, scalars in tracker.scalars
+               if "train/loss" in scalars}
+    validated = [(step, scalars["evaluation/examples_consumed"]) for step, scalars in tracker.scalars
+                 if "val/loss" in scalars]
+    assert len(validated) > 1 and all(trained[step] == consumed for step, consumed in validated)
+    assert validated[-1][1] == CLOCKED_RECORDS
+    stepped = RecordingTracker()
+    Trainer(Echoed(), optim, key=0, tracker=stepped).fit(clocked_chain(x), steps=4, log_every=1,
+                                                         validation=held, eval_every=2)
+    scored = [scalars for _, scalars in stepped.scalars if "val/loss" in scalars]
+    assert scored and not any("evaluation/examples_consumed" in scalars for scalars in scored)
+
+
 def test_a_causal_windows_last_target_is_consumed_by_the_window_that_holds_it():
     """A document whose last token is the last target of the stream's final causal window is consumed by
     that window, the first that holds it, though the next window's stride would begin at it."""
