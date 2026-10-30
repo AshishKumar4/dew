@@ -239,3 +239,19 @@ def test_an_inner_product_of_vectors_takes_no_workspace():
         with_workspace = gradient_peak(loss, vector, (other,), platform="gpu", workspace=1 << 20)
         without = gradient_peak(loss, vector, (other,), platform="gpu", workspace=0)
         assert with_workspace - without == workspace
+
+
+def test_a_ragged_product_holds_its_ragged_operand_once_a_group_on_a_gpu():
+    """XLA's GPU compiler expands a ragged product its grouped kernels do not take, every float32 one, into
+    a product over its groups (`RaggedDotRewriter`, xla/hlo/transforms/expanders/ragged_dot_rewriter.cc):
+    one of rows ragged in their non-contracting dimension holds those rows masked once a group while it
+    multiplies; its gradient in the weights, ragged in its contracting dimension, holds both operands so."""
+    from dew.training.footprint import peak_bytes
+
+    rows, sizes = jax.ShapeDtypeStruct((64, 16), jnp.float32), jax.ShapeDtypeStruct((4,), jnp.int32)
+    weights = jax.ShapeDtypeStruct((4, 16, 32), jnp.float32)
+    program = jax.make_jaxpr(lambda rows, weights, sizes: jax.lax.ragged_dot(rows, weights, sizes))(
+        rows, weights, sizes).jaxpr
+    # The output (64 x 32) beside the rows masked once for each of the 4 groups.
+    assert peak_bytes(program, "gpu", 0) == (64 * 32 + 4 * 64 * 16) * 4
+    assert peak_bytes(program, "cpu", 0) == 64 * 32 * 4
