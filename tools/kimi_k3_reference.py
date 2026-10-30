@@ -223,7 +223,8 @@ def record_stepped() -> None:
         stepped = np.concatenate([forward(STEPPED_PREFILL), *(forward(length)[:, -1:]
                                                                for length in range(STEPPED_PREFILL + 1,
                                                                                    row.shape[1] + 1))], 1)
-    np.savez(DESTINATION / "reference.npz", **arrays, stepped_logits=stepped)
+    arrays["stepped_logits"] = stepped
+    np.savez(DESTINATION / "reference.npz", **arrays)
     print("wrote", DESTINATION / "reference.npz", "stepped_logits", stepped.shape)
 
 

@@ -322,8 +322,9 @@ def test_decode_matches_prefill(name):
     decoded = jax.jit(lambda variables, hidden: decode_loop(module, variables, hidden))
 
     draw = block_draw(name)
+    # The truth one float64 pass over the whole sequence, whose products round alike at every shape.
     assert_as_exact(decoded, full, lambda seed: (variables, draw(seed)[0]), f"{name} decode",
-                    seeds=SEEDS["decode"])
+                    seeds=SEEDS["decode"], truth_fn=jax.jit(module.apply))
 
 
 @pytest.mark.parametrize("quantized", [None, "int8", "float8_e4m3fn"])
@@ -981,7 +982,7 @@ def test_a_windowed_dense_mla_decodes_as_it_prefills():
     decoded = jax.jit(lambda v, h: decode_loop(windowed, v, h))
     full = jax.jit(lambda v, h: as_stepped(lambda held: windowed.apply(v, held), h, 1))
     assert_as_exact(decoded, full, visibility_draw(variables), "mla windowed decode",
-                    seeds=SEEDS["visibility"])
+                    seeds=SEEDS["visibility"], truth_fn=jax.jit(windowed.apply))
 
 
 def test_a_mla_model_reads_key_runs_as_their_pairwise_mask():

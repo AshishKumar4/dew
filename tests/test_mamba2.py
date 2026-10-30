@@ -427,12 +427,13 @@ def tiny_lm(**overrides) -> CausalTransformer:
 def test_the_model_decodes_as_it_scores_in_parallel():
     """A prefill of four tokens and eight single-token steps, every layer's
     state riding the flax cache collection, against the same twelve tokens
-    scored at once."""
+    scored by full passes, each step's at the width it reads (`as_stepped`),
+    from the twelve scored at once in float64."""
     model = tiny_lm()
     rng = jax.random.key(0)
     ids = jax.random.randint(rng, (2, 12), 0, 32)
     params = model.init(rng, ids)
-    full = jnp.asarray(model.apply(params, ids))
+    full = as_stepped(jax.jit(lambda held: model.apply(params, held)), ids, 4)
 
     cache = model.apply(params, 2, method=CausalTransformer.init_cache, mutable=["cache"])[1]["cache"]
     assert all(not jnp.any(leaf) for leaf in jax.tree.leaves(cache))

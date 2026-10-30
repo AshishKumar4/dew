@@ -6,7 +6,7 @@ import json
 import os
 import subprocess
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import jax
@@ -95,17 +95,23 @@ def decode_through(module: nn.Module, variables, hidden, prefill: int):
     return jnp.concatenate(outputs, axis=1), allocated["cache"], cache["cache"]
 
 
+def called_outputs(forward: Callable[[int], jax.Array], calls: Sequence[tuple[int, int]]) -> jax.Array:
+    """A sequence's outputs at the shapes a cached rollout's `calls` compute them, each `(lo, hi)` a call
+    over positions `lo` to `hi`, `forward(n)` a forward over the sequence's first `n` positions: each
+    call's positions from a forward of its own over the sequence up to the call's last, at the width
+    the call reads (ledger 1543, the gate's ruling: a call's reference at the shapes the call computes,
+    where one forward over the whole sequence would compute every call's products at one row count,
+    which a GPU's kernel rounds apart by row count). Joined along the sequence, as one forward over it
+    would be; a float64 truth, whose products round alike at every shape, reads that one forward."""
+    return jnp.concatenate([forward(hi)[:, lo:hi] for lo, hi in calls], axis=1)
+
+
 def stepped_outputs(forward: Callable[[int], jax.Array], length: int, prefill: int) -> jax.Array:
-    """A sequence's outputs `[B, length, ...]` at the shapes a cached decode computes them, `forward(n)`
-    a forward over its first `n` positions: the first `prefill` positions from one forward over them, as
-    the prefill computes them, and each later position from a forward of its own over the sequence up to
-    it, at the width the step that computes it reads (ledger 1543, the gate's ruling: a step's reference
-    at the shapes the step computes, where one forward over the whole sequence would compute every step's
-    products at one row count, which a GPU's kernel rounds apart by row count). Joined along the
-    sequence, as one forward over it would be; a float64 truth, whose products round alike at every
-    shape, reads that one forward instead."""
-    later = [forward(position + 1)[:, -1:] for position in range(prefill, length)]
-    return jnp.concatenate([forward(prefill), *later], axis=1)
+    """A sequence's outputs `[B, length, ...]` at the shapes a cached decode computes them (`called_outputs`),
+    `forward(n)` a forward over its first `n` positions: a prefill of its first `prefill` positions, then
+    one position a step."""
+    return called_outputs(forward, [(0, prefill), *((position, position + 1)
+                                                     for position in range(prefill, length))])
 
 
 def as_stepped(forward: Callable[[jax.Array], jax.Array], sequence: jax.Array, prefill: int) -> jax.Array:

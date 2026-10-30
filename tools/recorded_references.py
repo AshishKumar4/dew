@@ -188,7 +188,7 @@ def record_logits(directory: Path, model, wide, command: str, *, reference: str,
         def draw(seed):
             return {"input_ids": ids_of(seed)[0]}
 
-    def logits(network, ids):
+    def logits(network, ids, *, prefixes: bool = True):
         tokens = torch.from_numpy(ids.astype(np.int64))
         with torch.no_grad():
             out = {"logits": network(input_ids=tokens, use_cache=False).logits.numpy()}
@@ -197,7 +197,10 @@ def record_logits(directory: Path, model, wide, command: str, *, reference: str,
                 out["padded_logits"] = network(input_ids=rows, **fields, use_cache=False).logits.numpy()[mask]
             if extra is not None:
                 out.update({name: value.numpy() for name, value in extra(network, tokens).items()})
-            if stepped is not None:
+            if stepped is not None and not prefixes:
+                # A truth's products round alike at every shape: the one forward's.
+                out["stepped_logits"] = out["logits"]
+            elif stepped is not None:
                 out["stepped_logits"] = np.concatenate([
                     network(input_ids=tokens[:, :stepped], use_cache=False).logits.numpy(),
                     *(network(input_ids=tokens[:, :length], use_cache=False).logits.numpy()[:, -1:]
@@ -206,7 +209,7 @@ def record_logits(directory: Path, model, wide, command: str, *, reference: str,
 
     def evaluate(inputs):
         with float64():
-            truth = logits(wide, inputs["input_ids"])
+            truth = logits(wide, inputs["input_ids"], prefixes=False)
         return logits(model, inputs["input_ids"]), truth
 
     def ours(network, variables):
