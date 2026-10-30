@@ -10,6 +10,7 @@ import dataclasses
 import json
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
@@ -330,6 +331,39 @@ def test_a_runs_numerics_read_back_from_its_record(tmp_path):
         numerics = Numerics(DTYPE_PRESETS["bf16-true"], matmul=matmul, forms="accurate")
         written = dataclasses.replace(run, trainer=dataclasses.replace(run.trainer, precision=numerics))
         assert RunConfig.read(json.loads(json.dumps(written.record()))).trainer.precision == numerics
+
+
+@pytest.mark.mesh(devices=8)
+def test_a_run_draws_and_trains_its_fresh_parameters_in_its_numerics(tmp_path):
+    """A run whose numerics store parameters in bf16 (`bf16-true`) draws its fresh model's in bf16 and
+    trains them so; under the default's float32 they are float32 (review of ledger 2500)."""
+    run = lm(tmp_path, drawn=False)
+    for name, numerics in (("bf16", Numerics(DTYPE_PRESETS["bf16-true"])), ("f32", Numerics())):
+        state, _ = trained(run, tmp_path, name, trainer={"precision": numerics})
+        stored = {leaf.dtype for leaf in jax.tree.leaves(state.variables["params"])}
+        assert stored == {jnp.dtype(numerics.dtypes.params)}
+
+
+def test_a_decoder_returns_its_logits_in_its_runs_output_dtype():
+    """A decoder's logits leave it in the run's output dtype (`dtypes.output`, `run_precision`): bf16
+    under `bf16-true`, float32 under the default's numerics and outside any run, and never narrower
+    than its compute dtype (review of ledger 2500)."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.kernels.generation import run_precision
+
+    tokens = jnp.ones((1, 4), jnp.int32)
+    returned = {}
+    for compute in ("bfloat16", "float32"):
+        model = CausalTransformer(vocab_size=32, emb_features=16, num_layers=1, num_heads=2, max_seq_len=8,
+                                  dtype=compute)
+        variables = model.init(jax.random.key(0), tokens)
+        returned[compute, None] = model.apply(variables, tokens).dtype
+        for preset in ("bf16-true", "bf16-mixed"):
+            with run_precision(Numerics(DTYPE_PRESETS[preset])):
+                returned[compute, preset] = model.apply(variables, tokens).dtype
+    assert returned == {("bfloat16", None): jnp.float32, ("bfloat16", "bf16-true"): jnp.bfloat16,
+                        ("bfloat16", "bf16-mixed"): jnp.float32, ("float32", None): jnp.float32,
+                        ("float32", "bf16-true"): jnp.float32, ("float32", "bf16-mixed"): jnp.float32}
 
 
 def test_a_run_recorded_before_its_stop_took_a_plateau_still_pauses(tmp_path):
