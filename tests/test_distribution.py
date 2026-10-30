@@ -313,9 +313,7 @@ def test_a_declared_pool_without_a_coordinator_is_refused():
     assert alone.returncode == 0, alone.stdout + alone.stderr
 
 
-@pytest.mark.gpu(reason="a cluster pins device ids on GPU; the CPU backend takes none")
-@pytest.mark.mesh(devices=2)
-def test_a_launched_process_keeps_every_device_inside_a_slurm_step():
+def a_launched_process_keeps_every_device_inside_a_slurm_step():
     """`dew launch --processes-per-host 1` gives its one process every local
     device, and names none of them. Inside a Slurm step, JAX's detection would
     still place it:
@@ -577,9 +575,7 @@ def test_a_pool_whose_program_ends_while_its_failure_watches_read_exits_cleanly(
     assert code == 0, output
 
 
-@pytest.mark.gpu(reason="the execution bound is XLA's GPU watchdog; CPU pools have none")
-@pytest.mark.mesh(devices=2)
-def test_a_rank_that_stalls_between_collectives_ends_the_pool():
+def a_rank_that_stalls_between_collectives_ends_the_pool():
     """Rank 1 stops before its fourth step without failing, as a rank blocked
     on a read, or on a compile that waits for its peers, does. Rank 0 waits
     inside that step's reduction. Every process stays alive and none fails,
@@ -714,9 +710,7 @@ def test_a_rank_whose_leaf_cannot_be_read_reports_at_the_gather_preflight():
     assert done.returncode != 0, done.stdout + done.stderr
 
 
-@pytest.mark.gpu(reason="a CPU array reaches its host without a device-to-host transfer")
-@pytest.mark.mesh(devices=2)
-def test_a_rank_that_holds_nothing_copies_none_of_the_tree_to_its_host():
+def a_rank_that_holds_nothing_copies_none_of_the_tree_to_its_host():
     """With held_by="first" only process 0 holds the gathered tree. Process 1
     takes part in every computation and agreement, and copies none of the
     tree's values to its host: its preflight waits on each shard, which raises
