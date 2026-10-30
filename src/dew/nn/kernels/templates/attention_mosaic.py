@@ -8,7 +8,7 @@ set (`legal`): no table, no sweep, no space ranked. A GPU nobody measured of a f
 
 import dataclasses
 import functools
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Hashable, Sequence
 from typing import ClassVar, Literal, overload
 
 import jax
@@ -38,6 +38,7 @@ from dew.nn.kernels.templates.attention import (
     prescale,
 )
 from dew.nn.kernels.templates.attention_mosaic_backward import _launch_backward
+from dew.nn.kernels.templates.attention_mosaic_coop import _coop_allocations
 from dew.nn.kernels.templates.attention_mosaic_dkv import _dkv_allocations
 from dew.nn.kernels.templates.attention_mosaic_dq import _dq_allocations
 from dew.nn.kernels.templates.attention_mosaic_forward import (
@@ -146,10 +147,11 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
         registers `Template.legal` holds it to. A pinned or stored config is held to it as a derived one."""
         found = {family.name: family for family in layouts(target.generation, ba.arguments["query"].dtype)}
         family = found.get(config.family)
-        # A dQ launch's layout streams through a producer (`Family.stream`); a layout whose consumers feed
-        # their own rings (`split_queries`) runs the forward and the dK/dV launches, the keys-first one and
-        # the fused one, each consumer its own queries or keys over the stream they walk whole.
-        walks_whole = isinstance(config, Tiles) or config.queries_first
+        # A forward's and a dQ launch's layout streams through a producer (`Family.stream`); a layout whose
+        # consumers feed their own rings (`split_queries`) runs the dK/dV launches alone, the keys-first one
+        # and the fused one, each consumer its own keys over the stream they walk whole. The forward on it
+        # has no use the producer's layout does not serve, and deadlocked (row 2599): it is no config.
+        walks_whole = not isinstance(config, Tiles) and config.queries_first
         return (family is not None and (walks_whole or not split_queries(family))
                 and whole_tiles(family, config) and self.refusal(ba, family) is None
                 and super().legal(ba, config, target))
@@ -228,10 +230,33 @@ class MosaicForward(_Mainloop[Tiles]):
                 return _plain_forward(query, key, value, spans, hooks, rows=residuals is Kept.OUTPUT,
                                       **form), None
 
+    def completed(self, ba: tokamax.BoundArguments, config: Hashable) -> Hashable:
+        """A pin's or an explicit config's natural rewalk derived once where it names none (`_relaunched`,
+        rows 2621, 2647); the config as it is where it names any of its rewalk's tiles (its key tile, its
+        consumers, its value columns: row 2675) or none derives (a config of another type, which `pinnable`
+        refuses)."""
+        if (not isinstance(config, Tiles) or config.natural_form
+                or (config.relaunch_k, config.relaunch_consumers, config.relaunch_columns) != (None,) * 3):
+            return config
+        return self._relaunched(ba, config, generation.gpu_target()) or config
+
     def legal(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> bool:
-        """`_Mainloop.legal`'s, and on a plain launch whose sums can pass fp32's largest (`algebra.headroom`),
-        a guarded key tile its consumers' registers hold beside it (`guarded_tiles`), which the launch walks
-        where the plain one overflowed."""
+        """Its launch's (`_launch_legal`), and a fold's natural rewalk at the tiles the config names (the
+        derivation's, a tuning neighbour's, a pin's completed one, `completed`), their key tile dividing the
+        config's and their consumers at most its, holding too (row 2584); a fold's config that names none
+        rewalks at its own tiles, which must hold (rows 2621, 2647)."""
+        if not self._launch_legal(ba, config, target):
+            return False
+        if config.natural_form or self._natural(ba.arguments["query"]):
+            return True
+        relaunch = config.relaunch
+        return (config.block_k % relaunch.block_k == 0 and relaunch.consumers <= config.consumers
+                and self._launch_legal(ba, relaunch, target))
+
+    def _launch_legal(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> bool:
+        """`_Mainloop.legal`'s for one launch at `config`, and on a plain launch whose sums can pass fp32's
+        largest (`algebra.headroom`), a guarded key tile its consumers' registers hold beside it
+        (`guarded_tiles`), which the launch walks where the plain one overflowed."""
         if not super().legal(ba, config, target):
             return False
         query, value = ba.arguments["query"], ba.arguments["value"]
@@ -256,24 +281,49 @@ class MosaicForward(_Mainloop[Tiles]):
             return Tiles(rows, walked, 2, consumers, family.name)
 
         config = _derived(family, query.dtype, query.shape[1], key.shape[1], tiles,
-                          lambda config: self.legal(ba, config, target), overlapped=True)
-        if config is None or self._natural(ba):
+                          lambda config: self._launch_legal(ba, config, target), overlapped=True)
+        return None if config is None else self._relaunched(ba, config, target)
+
+    def _relaunched(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget
+                    ) -> Tiles | None:
+        """`config` with its natural rewalk's tiles, a fold's (`Tiles.relaunch`): the largest key tile and the
+        most consumers that hold its own registers, each dividing the config's (et-fwdhooks3: at the fold's
+        tiles it spilled 2 KB at width 64); a call that keeps its logits natural rewalks nothing. None where
+        no tile holds the rewalk."""
+        config = dataclasses.replace(config, relaunch_k=None, relaunch_consumers=None, relaunch_columns=None)
+        if self._natural(ba.arguments["query"]):
             return config
-        # The natural form's rewalk at the largest tile and the most consumers that hold its own registers,
-        # each dividing the config's (et-fwdhooks3: at the fold's tiles it spilled 2 KB at width 64).
-        relaunches = (dataclasses.replace(config, block_k=block, consumers=consumers, natural_form=True)
+        query, value = ba.arguments["query"], ba.arguments["value"]
+        family = bundle_of(config, query.dtype)
+        # Its value columns whole first, then halved while a block of them stays a whole column unit: a
+        # launch a block (row 2526: at width 256 no tile held the anchored rewalk's whole sums).
+        whole = _width(value.shape[-1], family, query.dtype)
+        unit = family.column_unit(query.dtype)
+        widths = [whole // 2 ** halved for halved in range(whole.bit_length())
+                  if whole % 2 ** halved == 0 and (whole // 2 ** halved) % unit == 0]
+        relaunches = (dataclasses.replace(config, block_k=block, consumers=consumers, natural_form=True,
+                                          columns=None if columns == whole else columns)
+                      for columns in widths
                       for consumers in range(config.consumers, 0, -1)
                       for block in extents(family, query.dtype, config.block_k)
                       if config.block_k % block == 0)
-        relaunch = next((tiles for tiles in relaunches if self.legal(ba, tiles, target)), None)
+        relaunch = next((tiles for tiles in relaunches if self._launch_legal(ba, tiles, target)), None)
         if relaunch is None:
             return None
-        return dataclasses.replace(config, relaunch_k=relaunch.block_k, relaunch_consumers=relaunch.consumers)
+        return dataclasses.replace(config, relaunch_k=relaunch.block_k, relaunch_consumers=relaunch.consumers,
+                                   relaunch_columns=relaunch.columns)
 
-    def _natural(self, ba: tokamax.BoundArguments) -> bool:
-        """Whether the call keeps its logits natural, as its launch decides (`algebra.folds`, at the scale
-        and power of two its queries take, `prescale`): its one form the natural one, no fold to rewalk."""
-        query = ba.arguments["query"]
+    def neighbours(self, ba: tokamax.BoundArguments, config: Tiles) -> Sequence[Tiles]:
+        """`_Mainloop.neighbours`', each with its own natural rewalk's tiles (`_relaunched`), not the
+        derived config's, which need not divide it (row 2584)."""
+        target = generation.gpu_target()
+        found = (self._relaunched(ba, neighbour, target) for neighbour in super().neighbours(ba, config))
+        return tuple(neighbour for neighbour in found if neighbour is not None)
+
+    def _natural(self, query: jax.Array) -> bool:
+        """Whether the call of `query` keeps its logits natural, as its launch decides (`algebra.folds`, at
+        the scale and power of two its queries take, `prescale`): its one form the natural one, no fold to
+        rewalk."""
         power, scale = prescale(query.dtype, query.shape[3], self.scale)
         return not algebra.folds(scale, power, natural=self.natural, score_mod=self.score_mod)
 
@@ -283,6 +333,8 @@ class MosaicForward(_Mainloop[Tiles]):
         family = bundle_of(config, ba.arguments["query"].dtype)
         query, key, value = (ba.arguments[name] for name in ("query", "key", "value"))
         width, value_width = (_width(array.shape[-1], family, query.dtype) for array in (query, value))
+        # A launch of a block of the value columns (`Tiles.columns`) stages that block.
+        value_width = config.columns or value_width
         steps = _padded(query.shape[1], key.shape[1], config)[1] // config.block_k
         allocations = _forward_allocations(family, config, width, value_width, query.dtype,
                                            ba.arguments.get("residuals") is Kept.SPLIT,
@@ -293,8 +345,9 @@ class MosaicForward(_Mainloop[Tiles]):
     def registers(self, ba: tokamax.BoundArguments, config: Tiles) -> int:
         family = bundle_of(config, ba.arguments["query"].dtype)
         query, value = ba.arguments["query"], ba.arguments["value"]
-        natural = config.natural_form or self._natural(ba)
-        return _forward_registers(family, config, _width(value.shape[-1], family, query.dtype), query.dtype,
+        natural = config.natural_form or self._natural(ba.arguments["query"])
+        value_width = config.columns or _width(value.shape[-1], family, query.dtype)
+        return _forward_registers(family, config, value_width, query.dtype,
                                   ba.arguments.get("residuals") is Kept.SPLIT, natural=natural)
 
 
@@ -434,6 +487,16 @@ def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int
         # (DQROWPROOF64/128: seven rows, D64 at 128 queries past the budget).
         rows = DQ_ROWS * family.row_registers(block_q, jnp.float32)
         return resources.live_registers(family, carried, products, cotangents) + rows
+    if config.shared_keys:
+        # Shared keys (`attention_mosaic_coop`): a consumer's share of the head's columns of dK and dV
+        # carried, beside a step's two products over its share of the keys and its share of the dQ tile,
+        # its statistics row vectors.
+        share = config.consumers
+        carried = [(block_k, width // share, jnp.float32), (block_k, value_width // share, jnp.float32)]
+        products = [(block_q, block_k // share, jnp.float32)] * 2 + [(block_q, block_k // share, jnp.int8)]
+        statistics = DKV_STATISTICS * family.row_registers(block_q, jnp.float32)
+        return resources.live_registers(family, carried, products, [(block_q, width // share, jnp.float32)]
+                                        ) + statistics
     carried = [(block_k, width // config.columns, jnp.float32), (block_k, value_width // config.columns,
                                                                  jnp.float32)]
     if config.fused and not split:
@@ -508,9 +571,17 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
             return False
         if (config.fused and (self.accurate or hooked)) or not super().legal(ba, config, target):
             return False
-        # A width split among programs adds its dQ once, in no fused launch, each share whole swizzled rows.
         dtype = ba.arguments["query"].dtype
         family = bundle_of(config, dtype)
+        if config.shared_keys:
+            # Every consumer's share of the keys whole rows of a swizzle the exchange stages them at
+            # (`mosaic.swizzle_for`), its share of the columns whole swizzled rows (`attention_mosaic_coop`).
+            share = _width(ba.arguments["query"].shape[-1], family, dtype) // config.consumers
+            narrowest = mosaic.NARROWEST_SWIZZLE_BYTES // jnp.dtype(dtype).itemsize
+            return (config.fused and config.queries_first and config.consumers > 1 and config.columns == 1
+                    and (config.block_k // config.consumers) % narrowest == 0
+                    and share % family.column_unit(dtype) == 0)
+        # A width split among programs adds its dQ once, in no fused launch, each share whole swizzled rows.
         shares = [_width(ba.arguments[name].shape[-1], family, dtype) / config.columns
                   for name in ("query", "value")]
         return config.columns == 1 or (not config.fused and all(
@@ -568,6 +639,18 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
                 # width 64: 64 x 64 on two consumers 0.47 ms against 128 x 64 on one, 0.59).
                 return max(found, key=lambda config: (config.block_q * config.block_k * config.consumers,
                                                       config.consumers))
+            # Where no consumer's registers hold its own keys' whole dK and dV sums, the consumers share
+            # one key block, each its share of the columns (FlashAttention 3's width 256: ET-COOP1-h100,
+            # 0.68 ms against the two launches' 1.30 at Qwen3-8B's heads 256 wide, causal; where the sums
+            # fit, sharing cost 9% at width 128 and 46% at 64, ET-COOP2-h100).
+            for layout in fed:
+                def sharing(rows: int, walked: int, consumers: int, layout=layout) -> BackwardTiles:
+                    return BackwardTiles(walked, rows, 2, consumers, fused=True, family=layout.name,
+                                         shared_keys=True)
+
+                if config := _derived(layout, query.dtype, key.shape[1], query.shape[1], sharing, fits,
+                                      overlapped=True):
+                    return config
         # The fewest dK/dV programs a key block's widths split among whose share of the sums its consumer's
         # registers hold (`BackwardTiles.columns`: a width of 256's whole dK and dV sums pass them).
         # Its logits' queries a stream of their own, else where that passes the block staged a step
@@ -597,10 +680,12 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         dkv_family = bundle_of(config.dkv, dtype)
         q_stages = min(config.stages, padded_q // config.block_q)
         if config.queries_first:
-            launches = [(family, config, _fused_allocations(family, config, width, dtype, q_stages))]
+            allocations = _coop_allocations if config.shared_keys else _fused_allocations
+            launches = [(family, config, allocations(family, config, width, dtype, q_stages))]
         else:
             launches = [(dkv_family, config.dkv, _dkv_allocations(
-                dkv_family, config.dkv, width, value_width, dtype, stages=q_stages, columns=config.columns))]
+                dkv_family, config.dkv, width, value_width, dtype, stages=q_stages, columns=config.columns,
+                tiled=Kind.TILE in self.score_kinds))]
         if not config.fused:
             launches.append((family, config, _dq_allocations(family, config, width, value_width, dtype,
                                                              min(config.stages, padded_k // config.block_k))))

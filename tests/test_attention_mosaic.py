@@ -11,6 +11,8 @@ the device's, a site pinning one where it names a schedule (`tuning.pinned`)."""
 import contextlib
 import dataclasses
 import functools
+import gc
+import weakref
 
 import jax
 import jax.numpy as jnp
@@ -27,6 +29,7 @@ from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import (
     attention as template,
     attention_mosaic,
+    attention_mosaic_forward,
     attention_mosaic_program,
     attention_portable,
     attention_triton,
@@ -63,16 +66,17 @@ HOOK_FORMS = {"bfloat16": (jnp.bfloat16, False), "float16": (jnp.float16, False)
 FED = {"dkv_family": "wgmma.fed", "dkv_consumers": 2}
 """The dK/dV launch on an H100's layout whose consumers feed their rings, its two consumers splitting each
 slot's queries (`attention_mosaic_scores.split_queries`), as the derivation takes it."""
-BACKWARD_FORMS = ("default", "fused", "fused-keys-first", "accurate")
-"""The backward's forms (`_backward_form`): the fast in two launches and in one either way, and the
+BACKWARD_FORMS = ("default", "fused", "fused-keys-first", "fused-shared-keys", "accurate")
+"""The backward's forms (`_backward_form`): the fast in two launches and in one each way, and the
 accurate."""
 HOOKED_FORMS = ("default", "accurate")
 """The forms a hooked or dropping call takes: its fast form's one launch is a hookless call's alone."""
 
 
-FORM_WIDTHS = {"fused-keys-first": 64}
-"""The head width a backward form takes where its derivation's is narrower than the checks' 128: the
-keys-first one launch holds width 64 alone (its dK, dV and dQ tiles past a consumer's registers at 128)."""
+FORM_WIDTHS = {"fused-keys-first": 64, "fused-shared-keys": 128}
+"""The head width a backward form takes where the checks' own (128, a call form's 64) is not one it holds:
+the keys-first one launch holds width 64 alone (its dK, dV and dQ tiles past a consumer's registers at
+128), the shared keys' consumers 128 and wider (each its share of the columns whole swizzled rows)."""
 
 
 def _backward_form(form: str) -> tuple[bool, attention_mosaic.BackwardTiles]:
@@ -80,9 +84,13 @@ def _backward_form(form: str) -> tuple[bool, attention_mosaic.BackwardTiles]:
     beside a producer and the keys-first dK/dV launch two consumers sharing a key block (`FED`), the
     accurate form's sums in two column halves where it is `accurate-halves` (a width split's,
     `BackwardTiles.columns`); or the fast form's one launch (`fused`), queries first on the dQ launch's
-    layout, or keys first on `FED`'s (`fused-keys-first`), each consumer 64 of a slot's 128 queries."""
+    layout, or keys first on `FED`'s (`fused-keys-first`), each consumer 64 of a slot's 128 queries, or
+    queries first over keys its two consumers share on `FED`'s layout (`fused-shared-keys`)."""
     if form == "fused":
         return False, attention_mosaic.BackwardTiles(64, 64, 2, 1, fused=True)
+    if form == "fused-shared-keys":
+        return False, attention_mosaic.BackwardTiles(64, 64, 2, 2, fused=True, family=FED["dkv_family"],
+                                                     shared_keys=True)
     if form == "fused-keys-first":
         return False, attention_mosaic.BackwardTiles(128, 64, 2, 1, fused=True, **FED)
     columns = 2 if form == "accurate-halves" else 1
@@ -134,14 +142,23 @@ def _pinned(forward: attention_mosaic.Tiles | None = None,
 def _check_forward(call: str, dtype, shape, *, natural: bool, interpret: bool, width: int = 128,
                    value_width: int = 128, tiles: attention_mosaic.Tiles | None = None,
                    training: template.Kept = template.Kept.NONE, target: generation.GpuTarget | None = None,
-                   drop: bool = False):
+                   drop: bool = False, query_scale: float = 1.0, sinks: bool = False):
     """The forward, or with `training` (what it keeps, `template.Kept`) the training forward's output, over
     the call form `call` of `shape`,
     its query and key heads `width` wide and its value heads `value_width`, at `tiles` (the default when
-    None), with `drop` under probability dropout at `DROP_RATE` (`_dropping`)."""
+    None), with `drop` under probability dropout at `DROP_RATE` (`_dropping`), with `sinks` a sink a query
+    head (`template.sinks`, the initial state), its queries drawn times `query_scale` (a power of two,
+    exact)."""
     spans = template.spans(shape[1], shape[1], shape[0], **CALLS[call])
     hooks = _dropping(shape) if drop else None
-    draw = _drawn(shape, dtype, width=width, value_width=value_width)
+    if sinks:
+        hooks = template.Hooks(initial=template.sinks(jnp.linspace(-1.0, 1.0, shape[2]), shape[0], shape[1],
+                                                      value_width))
+    unscaled = _drawn(shape, dtype, width=width, value_width=value_width)
+
+    def draw(seed):
+        query, *rest = unscaled(seed)
+        return (query * jnp.asarray(query_scale, query.dtype), *rest)
 
     def ours(query, key, value, dout):
         del dout
@@ -173,7 +190,8 @@ def _dropping(shape) -> template.Hooks:
 
 def _check_spans(label: str, spans: template.KeySpans, shape, *, interpret: bool, backward: bool = False,
                  form: str = "default", score: tuple = (), gate: bool = False, dtype=jnp.bfloat16,
-                 natural: bool = False, seeds: int | None = None, width: int = 64):
+                 natural: bool = False, seeds: int | None = None, width: int = 64,
+                 param_rows: int | None = None):
     """The forward, or the backward in the form `form` names (`_backward_form`), over `spans` at `FORM_TILES`
     (64 wide) under the score hooks `score` (`test_attention_triton.score_hooks`, their parameters and
     initial state drawn with the operands) and with `gate` an output gate (`hooks_for`), draws of `shape`
@@ -182,7 +200,9 @@ def _check_spans(label: str, spans: template.KeySpans, shape, *, interpret: bool
     values, the hook's parameters and the initial state, over `seeds` draws where given (the site's own,
     else the template site's)."""
     rows, queries, heads, _ = shape
-    score_mod, kinds, draw_hooks = score_hooks(score, queries, spans.keys, width, rows=rows, heads=heads)
+    # A hook's parameters drawn for `param_rows` batch rows where given (one every row shares).
+    score_mod, kinds, draw_hooks = score_hooks(score, queries, spans.keys, width,
+                                               rows=rows if param_rows is None else param_rows, heads=heads)
     output = hooks_for(HOOKS["gate" if gate else "none"], queries, width, gate_of(queries, width))
     draw_operands = _drawn(shape, dtype, width=width, keys=spans.keys)
 
@@ -263,20 +283,23 @@ grow as heads shrink. The H100 site (`_check_hooked_backward`, compiled) keeps t
 and seeds, at full resolution."""
 
 
-def _check_hooked_backward(hooks: str, *, form: str, interpret: bool, width: int = 64):
+def _check_hooked_backward(hooks: str, *, form: str, interpret: bool, width: int = 64, shared: bool = False):
     """The backward in the form `form` names (`_backward_form`) under the score hook `SCORE_HOOKS[hooks]` over
     the template core's causal packed documents under a window (`_check_hooks`' site), heads `width` wide:
     the gradients of the queries, keys, values, of the hook's parameters and of the initial state.
-    Interpreted, at the hook's own site (`INTERPRETED_HOOK_SITES`)."""
+    Interpreted, at the hook's own site (`INTERPRETED_HOOK_SITES`); with `shared` over two rows, the hook's
+    parameters one every row shares."""
     case = CASES["causal-documents-window"]
     queries, keys = core_geometry(case)
     (rows, heads, kv_heads), seeds = INTERPRETED_HOOK_SITES[hooks] if interpret else ((ROWS, 4, 2), None)
+    rows = 2 if shared else rows
     # The call's documents of its first `rows` rows.
     called = {name: value[:rows] if hasattr(value, "shape") else value
               for name, value in arguments(case).items()}
     spans = template.spans(queries, keys, rows, **called)
     _check_spans("causal-documents-window", spans, (rows, queries, heads, kv_heads), interpret=interpret,
-                 backward=True, form=form, score=SCORE_HOOKS[hooks], seeds=seeds, width=width)
+                 backward=True, form=form, score=SCORE_HOOKS[hooks], seeds=seeds, width=width,
+                 param_rows=1 if shared else None)
 
 
 def _check_call_form(case: str, *, interpret: bool, backward: bool = False, form: str = "default"):
@@ -288,7 +311,8 @@ def _check_call_form(case: str, *, interpret: bool, backward: bool = False, form
     queries, keys = core_geometry(call)
     spans = template.spans(queries, keys, ROWS, **arguments(call))
     heads = (2, 1) if interpret else (4, 2)
-    _check_spans(case, spans, (ROWS, queries, *heads), interpret=interpret, backward=backward, form=form)
+    _check_spans(case, spans, (ROWS, queries, *heads), interpret=interpret, backward=backward, form=form,
+                 width=FORM_WIDTHS.get(form, 64))
 
 
 def _check_backward(call: str, shape, *, form: str | None, interpret: bool, keys: int | None = None,
@@ -396,9 +420,8 @@ def test_the_training_forward_is_on_par_interpreted(call, natural):
 
 
 @ON_HOPPER
-@pytest.mark.gpu(reason="runs the sm90 mainloop compiled, on an H100")
 @pytest.mark.parametrize("call", CALLS)
-def test_the_training_forward_is_on_par_on_an_h100(call):
+def the_training_forward_is_on_par_on_an_h100(call):
     """The training forward's output, bf16, compiled on an H100."""
     _check_forward(call, jnp.bfloat16, SHAPES["compiled"], natural=False, interpret=False,
                    training=template.Kept.SPLIT)
@@ -434,14 +457,13 @@ def test_the_backward_at_a_width_of_256_is_on_par_under_bidirectional_blocks_int
     """The derived backward of heads 256 wide (dK's and dV's widths split among programs,
     `BackwardTiles.columns`, where one program's sums pass a consumer's registers) over a packed row's two
     documents read causally, each document one block read both ways (row 2110's `--split whole`), under the
-    interpreter, from the training forward that keeps its output (`template.Kept.OUTPUT`, the route's at this
-    width: the anchored one's natural rewalk holds no tile, row 2526)."""
+    interpreter."""
     rows, queries = SHAPES["interpreted"][:2]
     documents = jnp.asarray([[1] * (queries // 2 - 10) + [2] * (queries // 2 + 10)] * rows, jnp.int32)
     spans = template.spans(queries, queries, rows, causal=True, segment_ids=documents,
                            block_groups=documents)
     _check_backward("causal", SHAPES["interpreted"], form=None, interpret=True, width=256, value_width=256,
-                    spans=spans, kept=template.Kept.OUTPUT)
+                    spans=spans)
 
 
 @INTERPRETS
@@ -698,20 +720,31 @@ def test_the_derived_tiles_stage_within_a_hoppers_block(width, value_width, resi
     """On an H100 the forward's tiles derived from the facts (`MosaicForward.derived`) stage within its
     block (`generation.shared_budget`) and a consumer's registers (`register_budget`), whatever the widths,
     the training forward's too (its anchored walk keeps no value row): no table's tile, which at heads 256
-    wide staged 320 KiB against its 227 (ledger 1582). The anchored training forward of values 256 wide
-    derives none: no tile holds its natural rewalk's registers (et-fsweep256: 255 and 224 B spilled at
-    64 x 64 on one consumer), so the route takes those calls elsewhere."""
+    wide staged 320 KiB against its 227 (ledger 1582); the anchored training forward of values 256 wide
+    rewalks a block of its value columns a launch (`Tiles.relaunch_columns`, row 2526)."""
     with generation.assumed("sm90"):
         target = generation.gpu_target()
         op, ba = _forward_call((2, 4096, 32, 8), width, value_width, residuals)
         derived = op.derived(ba, target)
-        if residuals is template.Kept.SPLIT and value_width == 256:
-            assert derived is None
-            return
         assert derived is not None
         assert op.legal(ba, derived, target)
         assert op.staged_bytes(ba, derived, target) <= generation.shared_budget(target)
         assert op.registers(ba, derived) <= op.register_budget(derived)
+
+
+@pytest.mark.parametrize("named", [{"relaunch_k": 64}, {"relaunch_columns": 64}], ids=["key-tile", "columns"])
+def test_a_pinned_rewalk_runs_whichever_of_its_tiles_the_pin_names(named):
+    """A pin naming any of its natural rewalk's tiles (its key tile, its value columns) runs that rewalk, the
+    op deriving none over it (`MosaicForward.completed`, rows 2647, 2675); a pin naming none takes the
+    derived one."""
+    with generation.assumed("sm90"):
+        op, ba = _forward_call((2, 4096, 32, 8), 256, 256, template.Kept.SPLIT)
+        derived = op.derived(ba, generation.gpu_target())
+        unnamed = dataclasses.replace(derived, relaunch_k=None, relaunch_consumers=None,
+                                      relaunch_columns=None)
+        pinned = dataclasses.replace(unnamed, **named)
+        assert op.completed(ba, unnamed) == derived
+        assert op.completed(ba, pinned) == pinned
 
 
 def _backward_call(shape, width: int, accurate: bool):
@@ -965,6 +998,104 @@ def test_the_backward_is_on_par_under_every_score_hook_interpreted(hooks, form):
 
 
 @INTERPRETS
+def test_a_folded_forward_whose_products_pass_fp32_below_zero_rewalks_natural_interpreted():
+    """A full call whose raw products pass fp32's range below zero (a query 2^126 against keys -8, scale 1/4)
+    takes its query by the scale's power of two first, so its products stay finite (-2^127): its rows'
+    maxima pass the fold's reach, they walk again natural, and every equal logit weighs its values alike,
+    the output the values' mean, 1 (a power taken into the scale instead overflowed to -inf, which reads as
+    a row that saw no key: review of the FA3-gap batch's F3)."""
+    shape = (1, 64, 1, 16)
+    query = jnp.zeros(shape, jnp.bfloat16).at[..., 0].set(2.0 ** 126)
+    key = jnp.zeros(shape, jnp.bfloat16).at[..., 0].set(-8.0)
+    value = jnp.ones(shape, jnp.bfloat16)
+    spans = template.spans(shape[1], shape[1], shape[0])
+    with _device(interpret=True):
+        out = attention_mosaic.forward(query, key, value, spans, scale=0.25, interpret=True)
+    assert np.array_equal(np.asarray(out, np.float32), np.ones(shape, np.float32))
+
+
+@INTERPRETS
+def test_a_forward_kernel_built_for_its_facts_runs_each_calls_own_interpreted():
+    """The forward's kernel is built once for every call of its static facts (`_kernel_of`, row 2440): calls
+    alike but for their scale, past their queries' one power of two (0.2 and 0.24, both 2^-3 times a scale
+    left of 1.6 and 1.92), each run their own though their kernels' names agree (launched outside an
+    op's report, which names them by its launch, `report.named`), each on par (check 1) with the reference's
+    at its scale from float64."""
+    shape = SHAPES["interpreted"]
+    spans = template.spans(shape[1], shape[1], shape[0], causal=True)
+    for scale in (0.2, 0.24):
+        def ours(query, key, value, dout, scale=scale):
+            del dout
+            with _device(interpret=True):
+                return attention_mosaic_forward._plain_forward(
+                    query, key, value, spans, template.Hooks(), scale=scale, natural=attention_mosaic.NATURAL,
+                    tiles=FORM_TILES, interpret=True)
+
+        def reference(query, key, value, dout, scale=scale):
+            del dout
+            return template.reference(query, key, value, spans, scale=scale)
+
+        assert_as_exact(jax.jit(ours), jax.jit(reference), _drawn(shape, jnp.bfloat16),
+                        f"mosaic forward at scale {scale}", seeds=SEEDS)
+
+
+@INTERPRETS
+def test_a_forward_kernel_built_for_its_facts_holds_no_calls_arrays_interpreted():
+    """The forward's kernel, built once for every call of its static facts (`_kernel_of`, row 2440), holds
+    none of a call's arrays, its operands' nor its hooks' (an initial state's sums, which its key describes
+    by shape and dtype, `_described`): each is released once the call is. (A hook closing over an array is
+    built for its call alone, `_holdable`: JAX's own trace caches hold such a closure as they did before.)"""
+    shape = SHAPES["interpreted"]
+    spans = template.spans(shape[1], shape[1], shape[0], causal=True)
+    query, key, value, _ = _drawn(shape, jnp.bfloat16)(0)
+    hooks = template.Hooks(initial=template.sinks(jnp.linspace(-1.0, 1.0, shape[2]), shape[0], shape[1], 128))
+    refs = [weakref.ref(array) for array in (query, key, value, hooks.initial.m, hooks.initial.acc)]
+    with _device(interpret=True):
+        jax.block_until_ready(attention_mosaic.forward(query, key, value, spans, hooks, interpret=True))
+    del query, key, value, hooks
+    gc.collect()
+    assert [ref() is None for ref in refs] == [True] * len(refs)
+
+
+@INTERPRETS
+@pytest.mark.parametrize("call", ["causal", "full"])
+def test_a_backward_256_wide_shares_its_keys_and_is_on_par_interpreted(call):
+    """The fast backward 256 wide, whose consumers' own keys' whole dK and dV sums pass their registers, at
+    its derived tiles: one launch whose two consumers share a key block, each its share of the columns
+    (`BackwardTiles.shared_keys`), every gradient on par (check 1) with the reference's, under the
+    interpreter."""
+    with generation.assumed("sm90"):
+        op, ba = _backward_call((1, 160, 2, 1), 256, accurate=False)
+        assert op.derived(ba, generation.gpu_target()).shared_keys
+    _check_backward(call, SHAPES["interpreted"], form=None, interpret=True, width=256)
+
+
+@INTERPRETS
+@pytest.mark.parametrize("sinks", [False, True], ids=["plain", "sinks"])
+@pytest.mark.parametrize("call", ["causal", "full"])
+def test_a_training_forward_256_wide_past_the_folds_reach_is_on_par_interpreted(call, sinks):
+    """An anchored training forward 256 wide whose logits pass the fold's reach (`algebra.FOLD_REACH`, its
+    queries drawn 2^16 times larger) walks again in the natural form, whose launches take a block of the
+    value columns each (`Tiles.relaunch_columns`, row 2526: no tile holds its whole sums), with attention
+    sinks each block from its own columns of the initial state's sums (row 2671), its output on par
+    (check 1) with the reference's from float64, under the interpreter."""
+    _check_forward(call, jnp.bfloat16, SHAPES["interpreted"], natural=False, interpret=True, width=256,
+                   value_width=256, training=template.Kept.SPLIT, query_scale=2.0 ** 16, sinks=sinks)
+
+
+@INTERPRETS
+@pytest.mark.parametrize(("hooks", "deterministic"), [("key-bias", False), ("tile-bias", False),
+                                                      ("tile-bias", True)])
+def test_a_parameter_every_row_shares_takes_each_rows_gradient_interpreted(hooks, deterministic, request):
+    """A key's or a tile's parameter one for every batch row (`[1, H, ...]`, T5's shared bias): the dK/dV
+    programs read it at its shared place and add each row's gradient into its own shape in the program
+    (`shared_place`, `Family.added`, row 2577), or under --xla_gpu_deterministic_ops each program writes its
+    own place, summed after (row 2645), every gradient the reference's, under the interpreter."""
+    request.getfixturevalue("with_deterministic_ops" if deterministic else "without_deterministic_ops")
+    _check_hooked_backward(hooks, form="default", interpret=True, shared=True)
+
+
+@INTERPRETS
 @pytest.mark.parametrize("hooks", ["key-bias", "tile-bias"])
 def test_a_width_split_backward_writes_its_score_parameters_gradients_once_interpreted(hooks):
     """The accurate backward 128 wide, its sums in two column halves (`BackwardTiles.columns`), under a hook
@@ -1133,35 +1264,31 @@ def test_the_backward_under_every_score_hook_lowers_for_an_h100(hooks, accurate)
 
 
 @ON_HOPPER
-@pytest.mark.gpu(reason="runs the sm90 mainloop compiled, on an H100")
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16], ids=["bfloat16", "float16"])
 @pytest.mark.parametrize("call", CALLS)
-def test_the_forward_is_on_par_on_an_h100(call, dtype):
+def the_forward_is_on_par_on_an_h100(call, dtype):
     """The forward, the base-2 fold, compiled on an H100."""
     _check_forward(call, dtype, SHAPES["compiled"], natural=False, interpret=False)
 
 
 @ON_HOPPER
-@pytest.mark.gpu(reason="runs the sm90 mainloop compiled, on an H100")
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16], ids=["bfloat16", "float16"])
 @pytest.mark.parametrize("call", CALLS)
-def test_the_natural_forward_is_on_par_on_an_h100(call, dtype):
+def the_natural_forward_is_on_par_on_an_h100(call, dtype):
     """The forward with natural logits compiled on an H100."""
     _check_forward(call, dtype, SHAPES["compiled"], natural=True, interpret=False)
 
 
 @ON_HOPPER
-@pytest.mark.gpu(reason="runs the sm90 mainloop compiled, on an H100")
 @pytest.mark.parametrize("form", CASES)
-def test_the_forward_is_on_par_over_every_call_form_on_an_h100(form):
+def the_forward_is_on_par_over_every_call_form_on_an_h100(form):
     """The forward over each of the template core's call forms compiled on an H100."""
     _check_call_form(form, interpret=False)
 
 
 @ON_HOPPER
-@pytest.mark.gpu(reason="runs the sm90 mainloop compiled, on an H100")
 @pytest.mark.parametrize(("width", "value_width"), HEAD_WIDTHS)
-def test_the_forward_is_on_par_at_head_widths_on_an_h100(width, value_width):
+def the_forward_is_on_par_at_head_widths_on_an_h100(width, value_width):
     """The forward of query heads `width` wide and value heads `value_width` over a causal call at
     `FORM_TILES`, compiled on an H100."""
     _check_forward("causal", jnp.bfloat16, SHAPES["compiled"], natural=False, interpret=False, width=width,
@@ -1169,9 +1296,8 @@ def test_the_forward_is_on_par_at_head_widths_on_an_h100(width, value_width):
 
 
 @ON_HOPPER
-@pytest.mark.gpu(reason="runs the sm90 mainloop compiled, on an H100")
 @pytest.mark.parametrize(("width", "value_width"), HEAD_WIDTHS)
-def test_the_backward_is_on_par_at_head_widths_on_an_h100(width, value_width):
+def the_backward_is_on_par_at_head_widths_on_an_h100(width, value_width):
     """The backward in its derived form of query heads `width` wide and value heads `value_width` over a
     causal call, compiled on an H100."""
     _check_backward("causal", SHAPES["compiled"], form=None, interpret=False, width=width,
@@ -1179,55 +1305,49 @@ def test_the_backward_is_on_par_at_head_widths_on_an_h100(width, value_width):
 
 
 @ON_HOPPER
-@pytest.mark.gpu(reason="runs the sm90 mainloop compiled, on an H100")
 @pytest.mark.parametrize(("dtype", "natural"), HOOK_FORMS.values(), ids=HOOK_FORMS)
 @pytest.mark.parametrize("hooks", FORWARD_HOOKS)
-def test_the_forward_is_on_par_under_every_hook_on_an_h100(hooks, dtype, natural):
+def the_forward_is_on_par_under_every_hook_on_an_h100(hooks, dtype, natural):
     """The forward under each hook compiled on an H100."""
     _check_hooks(hooks, dtype, natural, interpret=False)
 
 
 @ON_HOPPER
-@pytest.mark.gpu(reason="runs the sm90 mainloop compiled, on an H100")
 @pytest.mark.parametrize("form", BACKWARD_FORMS)
 @pytest.mark.parametrize("case", CASES)
-def test_the_backward_is_on_par_over_every_call_form_on_an_h100(case, form):
+def the_backward_is_on_par_over_every_call_form_on_an_h100(case, form):
     """The backward in both forms over each of the template core's call forms compiled on an H100."""
     _check_call_form(case, interpret=False, backward=True, form=form)
 
 
 @ON_HOPPER
-@pytest.mark.gpu(reason="runs the sm90 mainloop compiled, on an H100")
 @pytest.mark.parametrize("form", ["forward", *BACKWARD_FORMS])
 @pytest.mark.parametrize("case", RUN_CASES)
-def test_a_call_over_runs_is_on_par_on_an_h100(case, form):
+def a_call_over_runs_is_on_par_on_an_h100(case, form):
     """A decision row's runs compiled on an H100, the forward and the backward in each form."""
     backward = form != "forward"
     _check_call_form(case, interpret=False, backward=backward, form=form if backward else "default")
 
 
 @ON_HOPPER
-@pytest.mark.gpu(reason="runs the sm90 mainloop compiled, on an H100")
-def test_a_causal_backward_of_more_keys_than_queries_is_on_par_on_an_h100():
+def a_causal_backward_of_more_keys_than_queries_is_on_par_on_an_h100():
     """A causal call of 64 queries over 256 keys compiled on an H100, where a consumer waiting for a load
     the producer never issues hangs (the interpreted test's case)."""
     _check_backward("causal", (2, 64, 4, 2), form="default", interpret=False, keys=256)
 
 
 @ON_HOPPER
-@pytest.mark.gpu(reason="runs the sm90 mainloop compiled, on an H100")
 @pytest.mark.parametrize("form", BACKWARD_FORMS)
 @pytest.mark.parametrize("call", CALLS)
-def test_the_backward_is_on_par_on_an_h100(call, form):
+def the_backward_is_on_par_on_an_h100(call, form):
     """The backward in both forms compiled on an H100."""
     _check_backward(call, SHAPES["compiled"], form=form, interpret=False, width=FORM_WIDTHS.get(form, 128))
 
 
 @ON_HOPPER
-@pytest.mark.gpu(reason="runs the sm90 mainloop compiled, on an H100")
 @pytest.mark.parametrize("form", ["default", "accurate"])
 @pytest.mark.parametrize("hooks", BACKWARD_HOOKS)
-def test_the_backward_is_on_par_under_every_score_hook_on_an_h100(hooks, form):
+def the_backward_is_on_par_under_every_score_hook_on_an_h100(hooks, form):
     """The backward in both forms under each score hook compiled on an H100."""
     _check_hooked_backward(hooks, form=form, interpret=False)
 
@@ -1363,14 +1483,13 @@ def test_an_a100_derives_no_mosaic_backward(accurate):
 
 
 FORWARD_GATE = [(width, training, "none") for width in (64, 128, 256)
-                for training in (template.Kept.NONE, template.Kept.SPLIT)
-                if (width, training) != (256, template.Kept.SPLIT)]
+                for training in (template.Kept.NONE, template.Kept.SPLIT)]
 FORWARD_GATE += [(width, training, hooks) for width in (64, 128)
                  for training in (template.Kept.NONE, template.Kept.SPLIT)
                  for hooks in BACKWARD_HOOKS if hooks != "none"]
 """The forward resource gate's cases on an H100: a causal call's head widths, the inference and the training
 forward, hookless, and each score hook at the widths a hooked call's derivation takes (row 2281: its live
-set beside the walk's); the anchored training forward 256 wide derives none (row 2526)."""
+set beside the walk's)."""
 
 
 def _forward_kernels(op, ba, config) -> dict:
@@ -1427,6 +1546,7 @@ def test_the_backward_compiles_spill_free_as_its_model_decides(generation_name, 
     (tests/kernel_compile.py): every launch within its shared memory, spilling nothing, and its register
     model's decision ptxas's (`mosaic_failures`, each launch's model `resources.register_model` at its own
     layout and consumers, `MosaicBackward._launch_registers`)."""
+    import kernel_compile
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
@@ -1452,6 +1572,8 @@ def test_the_backward_compiles_spill_free_as_its_model_decides(generation_name, 
             [KernelCase("backward", lambda: (backward, (query, key, key, query, shapes)), models)],
             generation_name)
     assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+    # Every launch's model names a kernel it compiled: a launch renamed past its model is compared with none.
+    assert set(models) <= kernel_compile.compiled_kernels(found[0]), (set(models), found[0].get("kernels"))
 
 
 def _residuals(shape) -> tuple:
@@ -1465,12 +1587,13 @@ def _residuals(shape) -> tuple:
 
 def _backward_models(op, ba, config) -> dict:
     """Each backward launch's register model by its kernel's name (`attention_dq`, `attention_dkv`, a width
-    share's `_columnsN`, the one launch's `attention_dkv_fused`), at its own layout and consumers
-    (`BackwardTiles.dkv`)."""
+    share's `_columnsN`, the one launch's `attention_dkv_fused`, or `attention_dkv_shared` over shared
+    keys), at its own layout and consumers (`BackwardTiles.dkv`)."""
     dq, dkv = op._launch_registers(ba, config)
     if config.fused:
         family = attention_mosaic_program.bundle_of(config, jnp.bfloat16)
-        return {"attention_dkv_fused": resources.register_model(family, config.consumers, dkv)}
+        name = "attention_dkv_shared" if config.shared_keys else "attention_dkv_fused"
+        return {name: resources.register_model(family, config.consumers, dkv)}
     models = {}
     for kind, tiles, registers in (("dq", config, dq), ("dkv", config.dkv, dkv)):
         family = attention_mosaic_program.bundle_of(tiles, jnp.bfloat16)

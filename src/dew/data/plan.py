@@ -20,7 +20,7 @@ import numpy as np
 
 from dew import _checkout
 from dew._hashing import array_header
-from dew._records import JSON, json_value, record
+from dew._records import ADDED, JSON, json_value, record, set_added
 from dew.data.compilation import checkout_now
 from dew.data.sources.codec import content_fingerprint
 from dew.position import PER_SHARE
@@ -133,7 +133,7 @@ class StepIdentity:
             else {}
         )
         if dataclasses.is_dataclass(step) and not isinstance(step, type) and (
-                dependencies or _holds_arrays(step)):
+                dependencies or _holds_arrays(step) or set_added(step)):
             config = json.dumps(_configuration(step), sort_keys=True)
         named = cls(name, config, exact, modules, declared, dependencies)
         if cache and not named.keyable(function=inspect.isfunction(step), external=external):
@@ -183,9 +183,10 @@ def _dependencies(step: DataclassInstance) -> Mapping[str, object]:
 def _configuration(step: DataclassInstance) -> dict[str, JSON]:
     configured: dict[str, JSON] = {"class": f"{type(step).__module__}.{type(step).__qualname__}"}
     for field in dataclasses.fields(step):
-        if not field.repr:
-            continue
         value = getattr(step, field.name)
+        # A field added after runs were saved is recorded where it is set (`dew._records.ADDED`).
+        if not field.repr and not (field.metadata.get(ADDED) and value != field.default):
+            continue
         if isinstance(value, _Dependencies):
             configured[field.name] = json_value(value.dependencies(), field.name)
         else:
@@ -196,11 +197,14 @@ def _configuration(step: DataclassInstance) -> dict[str, JSON]:
 def _configured(value) -> JSON:
     """A step's field, any value, as its configuration records it: a dataclass by its own fields, a
     value that holds an array entry by entry with the array by its fingerprint, which its repr
-    rounds to eight digits and cuts short past a thousand entries, and anything else by its repr,
-    without addresses."""
+    rounds to eight digits and cuts short past a thousand entries, and one that holds a configuration
+    setting an added field (`dew._records.ADDED`) entry by entry; anything else by its repr, without
+    addresses."""
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         return _configuration(value)
-    if _holds_arrays(value):
+    # A container holding an array, or a configuration that sets an added field, entry by entry, as the
+    # repr of either would not hold it whole.
+    if _holds_arrays(value) or (isinstance(value, (list, tuple, Mapping)) and set_added(value)):
         if isinstance(value, (list, tuple)):
             return [_configured(entry) for entry in value]
         if isinstance(value, Mapping):

@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Concatenate, Literal, Protocol, TypeGuard, run
 import grain.python as pygrain
 import numpy as np
 
+from dew._records import integer
 from dew.batch import Batch
 from dew.data.dataset import WORKER_BUFFER, Records, phase_ends
 
@@ -38,18 +39,39 @@ class Rejected:
 
 CONSUMED = "_dew_consumed"
 """A row's count of the source examples it is the last row of, set on each source example a run bounded in
-examples reads (`Consumed`) and carried through every step to the batch: each example's count goes to the last
-row a step makes of it, the next row kept where a step rejects or makes none of it, and a packed window's is
-its rows' sum. A batch's sum is the source examples its dispatch consumes (`dew.batch.EXAMPLES_CONSUMED`)."""
+examples reads (`MarkConsumed`) and carried through every step to the batch: each example's count goes to the
+last row a step makes of it, the next row kept where a step rejects or makes none of it (`Owed`), and a packed
+window's is its rows' sum. A batch's sum is the source examples its dispatch consumes
+(`dew.batch.EXAMPLES_CONSUMED`)."""
 
 
 @dataclasses.dataclass(frozen=True)
-class Consumed:
+class MarkConsumed:
     """The step that marks each source example a run bounded in examples reads as one consumed by the row it
     is read in (`CONSUMED`), set where the bound is (`dew.data.compile`)."""
 
     def __call__(self, element: Batch) -> Batch:
         return {**element, CONSUMED: 1}
+
+
+@dataclasses.dataclass
+class Owed:
+    """The source examples rows a step dropped or made none of were the last of (`Rejected.consumed`),
+    owed to the next row kept: the one carrier the reading process's (`dew.data.mixing.Accepted`), a
+    batched step's (`dew.data.mixing.Carried`) and a loading worker's group (`dew.data.lowering`) use."""
+
+    examples: int = 0
+
+    def owe(self, consumed: int) -> None:
+        """Owe `consumed` more examples to the next row kept."""
+        self.examples += consumed
+
+    def paid(self, row: Batch) -> Batch:
+        """`row`, kept, taking the examples owed (`CONSUMED`), none owed after it."""
+        owed, self.examples = self.examples, 0
+        if not owed:
+            return row
+        return {**row, CONSUMED: owed + integer(row.get(CONSUMED, 0), "a row's consumed examples")}
 
 
 type Cuts = Mapping[str, tuple[int, int]]

@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 from model_support import TINY_DECODER
 
+from dew.batch import coordinates
 from dew.decision.layout import _parallel
 from dew.decision.model import key_runs
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -99,7 +100,8 @@ def test_a_layer_reading_key_runs_computes_what_it_computes_over_the_same_mask(k
     places = jnp.asarray(positions)
 
     def read(**visibility):
-        return decoder.apply(params, ids, positions=places, attention_key_positions=places, mutable=["qk"],
+        return decoder.apply(params, ids, coordinates=coordinates(ids.shape, positions=places),
+                             attention_key_positions=places, mutable=["qk"],
                              method=CausalTransformer.hidden_states, **visibility)
 
     ran, sown = read(attention_key_runs=runs)

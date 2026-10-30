@@ -80,6 +80,7 @@ __all__ = [
     "head_dot_general",
     "head_product",
     "l2norm",
+    "numerics_of",
     "operand_precision",
     "paired_sum",
     "precision_names",
@@ -521,6 +522,9 @@ class Dtypes:
 
     params: str = "float32"
     compute: str = "bfloat16"
+    """bf16 by default, Lightning's bf16-mixed, where Flax computes in its parameters' float32: a run's
+    matmuls run on the tensor cores' bf16 rate, its float32 masters and moments keep the update exact,
+    and the float32 products a run needs say so (`exact_float32`); "32-true" computes in float32."""
     output: str = "float32"
 
     def __post_init__(self):
@@ -569,6 +573,12 @@ class Numerics:
     forms: Literal["fast", "accurate"] = "fast"
 
     def __post_init__(self):
+        if isinstance(self.dtypes, str):
+            # A record or a flag names the usual dtypes by Lightning's name (`DTYPE_PRESETS`).
+            if self.dtypes not in DTYPE_PRESETS:
+                raise ValueError(f"a run's dtypes are a Dtypes record or one of {sorted(DTYPE_PRESETS)}, not "
+                                 f"{self.dtypes!r}")
+            object.__setattr__(self, "dtypes", DTYPE_PRESETS[self.dtypes])
         if isinstance(self.matmul, str) and self.matmul in jax.lax.DotAlgorithmPreset.__members__:
             # A record holds a preset by its name (`dew.registry.to_record`).
             object.__setattr__(self, "matmul", jax.lax.DotAlgorithmPreset[self.matmul])
@@ -585,6 +595,22 @@ IEEE float32 and each op's accurate form."""
 
 NUMERICS_PRESETS = {"accurate": ACCURATE}
 """The named run numerics beside the default (`Numerics()`)."""
+
+
+def numerics_of(given: Numerics | str) -> Numerics:
+    """A run's numerics from what a flag, a record or a load names: a `Numerics` as it is, a preset's
+    name (`NUMERICS_PRESETS`, "default" for `Numerics()`), or the usual dtypes' Lightning name
+    (`DTYPE_PRESETS`) at the default precision and forms."""
+    if isinstance(given, Numerics):
+        return given
+    if given == "default":
+        return Numerics()
+    if given in NUMERICS_PRESETS:
+        return NUMERICS_PRESETS[given]
+    if given in DTYPE_PRESETS:
+        return Numerics(DTYPE_PRESETS[given])
+    raise ValueError(f"a run's precision is a Numerics record, 'default', one of {sorted(NUMERICS_PRESETS)} "
+                     f"or a dtype preset of {sorted(DTYPE_PRESETS)}, not {given!r}")
 
 
 def exact_float32(precision: jax.lax.PrecisionLike) -> jax.lax.PrecisionLike:

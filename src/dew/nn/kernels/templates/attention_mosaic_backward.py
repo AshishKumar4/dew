@@ -9,12 +9,12 @@ import functools
 
 import jax
 import jax.numpy as jnp
-from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels.templates import attention_algebra as algebra, bundles, mosaic
 from dew.nn.kernels.templates.attention import DQ_GRADS, Dropout, Hooks, Kind, PaddedCall, Param, by_power
+from dew.nn.kernels.templates.attention_mosaic_coop import _coop_launch
 from dew.nn.kernels.templates.attention_mosaic_dkv import _dkv_launch
 from dew.nn.kernels.templates.attention_mosaic_dq import _dq_launch
 from dew.nn.kernels.templates.attention_mosaic_fused import _fused_launch
@@ -26,12 +26,15 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _rows,
     _Spans,
     _spans_of,
-    _streamed,
-    _views_of,
     approximate,
     stated,
 )
-from dew.nn.kernels.templates.attention_mosaic_scores import _Backward, _score_params
+from dew.nn.kernels.templates.attention_mosaic_scores import (
+    _Backward,
+    _query_program,
+    _query_tile_loaded,
+    _score_params,
+)
 from dew.nn.precision import running_sum
 
 
@@ -58,18 +61,14 @@ def _centre_launch(query, key, value, dout, peak, spans: _Spans | None, score_pa
         (q_ref, k_ref, v_ref, do_ref, peak_ref), refs = refs[:5], refs[5:]
         (spans_of, score_refs, drop_of), refs = treedef.unflatten(refs[:len(leaves)]), refs[len(leaves):]
         centre_ref, (q_smem, do_smem, row_smem, q_loaded, do_loaded) = refs[0], refs[1:]
-        row, head = lax.axis_index("batch"), lax.axis_index("heads")
-        views = _views_of({"keys": k_ref, "values": v_ref}, row, lax.div(head, heads // kv_heads))
-        streams = family.opened(streams, views)
-        pair_first = program.query_tile(queries // pair) * pair
-        streamed = _streamed([program.reach(pair_first + index * block_q, spans_of, row)[:2]
-                              for index in range(consumers)])
+        row, head, views, streams, pair_first, streamed = _query_program(
+            program, streams, k_ref, v_ref, spans_of, heads=heads, kv_heads=kv_heads, queries=queries,
+            consumers=consumers)
 
         def consumer(index):
             first = pair_first + index * block_q
-            rows = (row, pl.ds(first, block_q), head)
-            family.loaded(((q_ref.at[rows], q_smem.at[index], q_loaded.at[index]),
-                           (do_ref.at[rows], do_smem.at[index], do_loaded.at[index])))
+            _query_tile_loaded(family, (q_ref, do_ref), (q_smem, do_smem), (q_loaded, do_loaded), (row, head),
+                               first, index)
             peak = _rows(family, peak_ref, row, head, first, block_q)
             lo, hi, _ = program.reach(first, spans_of, row)
             shape = (block_q, block_k)
@@ -188,7 +187,10 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
         program, family=bundles.named(dkv_tiles.family, query.dtype), tiles=dkv_tiles),
         consumers=dkv_tiles.consumers)
     if walk.fused:
-        if tiles.dkv_apart:
+        if tiles.shared_keys:
+            dq, dk, dv = _coop_launch(query, key, value, dout, maximum, forward_total, anchor, delta, chosen,
+                                      spans, walk=walk)
+        elif tiles.dkv_apart:
             # The fused launch keys first on its own layout (`BackwardTiles.dkv`): its consumers' shares of a
             # slot's queries each a warpgroup MMA's rows, dQ added a tile at a time.
             dq, dk, dv = _dkv_launch(query, key, value, dout, maximum, forward_total, anchor, delta, chosen,

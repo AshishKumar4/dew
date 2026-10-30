@@ -27,10 +27,10 @@ from jax.ad_checkpoint import checkpoint_name
 
 from dew.mesh import LogicalAxes
 from dew.nn.attention import AttentionImpl, kernel_for_materialized_mask, scaled_dot_product_attention
-from dew.nn.attention_masks import causal_attention_mask, chunk_mask, max_attention_logits
+from dew.nn.attention_masks import causal_attention_mask, chunk_mask, max_attention_logits, visibility_mask
 from dew.nn.dense import Dense
-from dew.nn.documents import document_mask
-from dew.nn.flops import MissingFlopsCount, attention_flops, projection_flops
+from dew.nn.documents import CrossDocuments, document_mask
+from dew.nn.flops import MissingFlopsCount, attention_flops, cross_attention_flops, projection_flops
 from dew.nn.inputs import (
     PLAIN_CALL,
     MixerCall,
@@ -45,7 +45,7 @@ from dew.nn.kv_cache import KVCache, cached_validity, open_kv_cache, write_cache
 # contracts from base avoids importing the kind hub back during this module's
 # initialization, so either kind can be the first imported.
 from dew.nn.mixer_base import ATTENTION_CONTEXT_RESIDUALS, MixerBase, MixerContext
-from dew.nn.mixers.attention import call_visibility, dense_visibility, group_fields
+from dew.nn.mixers.attention import CONTEXT_LOGITS, call_visibility, dense_visibility, group_fields
 from dew.nn.norms import LayerNorm, RMSNorm
 from dew.nn.precision import (
     at_least_fp32,
@@ -474,21 +474,10 @@ class MultiHeadLatentAttention(nn.Module):
         """The latent and expanded projections plus training's QK and AV."""
         if self.indexed or self.index_shared:
             raise MissingFlopsCount("MultiHeadLatentAttention needs indexer selection geometry for train/mfu")
-        query = self.num_heads * (self.qk_nope_head_dim + self.qk_rope_head_dim)
-        if self.q_lora_rank is None:
-            count = projection_flops(lengths, self.emb_features, query)
-        else:
-            count = (projection_flops(lengths, self.emb_features, self.q_lora_rank)
-                     + projection_flops(lengths, self.q_lora_rank, query))
-        count += projection_flops(lengths, self.emb_features, self.kv_lora_rank + self.qk_rope_head_dim)
-        count += projection_flops(lengths, self.kv_lora_rank,
-                                   self.num_heads * (self.qk_nope_head_dim + self.v_head_dim))
-        count += projection_flops(lengths, self.num_heads * self.v_head_dim, self.emb_features)
-        if self.output_gate:
-            count += projection_flops(lengths, self.emb_features, self.num_heads * self.v_head_dim)
-        return count + attention_flops(lengths, self.num_heads,
-                                       self.qk_nope_head_dim + self.qk_rope_head_dim,
-                                       self.v_head_dim, causal=self.causal)
+        # Its projections are its read of a context's, over its own sequence (`context_projection_flops`).
+        return self.context_projection_flops(lengths, lengths) + attention_flops(
+            lengths, self.num_heads, self.qk_nope_head_dim + self.qk_rope_head_dim, self.v_head_dim,
+            causal=self.causal)
 
     def _select(self, index_scores, keep, kv_store):
         """The keys each query attends among `keep`, as `top_k_selection`
@@ -576,6 +565,79 @@ class MultiHeadLatentAttention(nn.Module):
         rot = jnp.broadcast_to(
             rot[:, :, None, :], (batch, length, self.num_heads, self.qk_rope_head_dim))
         return jnp.concatenate([nope, rot], axis=-1), values
+
+    @property
+    def reads_context(self) -> bool:
+        """Whether it projects keys and values of its own to read a context with (`context_keys`): a
+        latent attention always does (`dew.nn.cross_attention.AttendsContext`)."""
+        return True
+
+    @nn.nowrap
+    def context_heads(self) -> tuple[int, int, int]:
+        """Its key heads' count and the widths of a key and a value head, as `context_keys` gives them:
+        a key head for each query head, its no-position part and its rope head together."""
+        return self.num_heads, self.qk_nope_head_dim + self.qk_rope_head_dim, self.v_head_dim
+
+    def context_query(self, x):
+        """Its query heads over `x` `[B, S, E]` as it reads another sequence (`attend_context`): through
+        its query latent as its own call projects them, YaRN's scale on them, their rope parts
+        unrotated, a context having no positions to rotate by. With the output gate, `x`, which the
+        gate reads (`_output`), else None."""
+        queries, _ = self._queries(x, RESIDUAL)
+        q_pass, q_rot = jnp.split(queries, [self.qk_nope_head_dim], axis=-1)
+        return self._scaled_query(q_pass, q_rot), x if self.output_gate else None
+
+    def context_keys(self, context):
+        """Its key and value heads over a context `[B, C, E]`: the context's normed latent expanded by
+        its own projection, beside its decoupled rope head unrotated (`_expand`)."""
+        return self._expand(*self._latents(context, RESIDUAL))
+
+    def attend_context(self, query, gate, key, value, *, lengths, queries=None, segments=None,
+                       max_segments=None, progress=None):
+        """Its attention of `query` heads (`context_query`) over a context's `key` and `value` heads
+        (`context_keys`), each row's first `lengths` keys real (none for a row without context, whose
+        read its block leaves out) and, where given, each query reading its own document's keys alone
+        (`queries` `[B, S]`, `segments` `[B, C]`), unmasked by causality, then its output gate and
+        projection (`_output`); a latent attention anneals nothing over a run (`progress`)."""
+        if self._qk_open():
+            # The read's logits through the layer's own projections, which its own call's maxima take in
+            # beside its own sequence's (`_attend`), so the QK-Clip bounds both.
+            documents = None if queries is None or segments is None else CrossDocuments(queries, segments)
+            seen = visibility_mask(query.shape[1], key.shape[-3], causal=False, sliding_window=None,
+                                   segment_ids=documents, key_value_seq_lengths=lengths)
+            self.sow("qk", CONTEXT_LOGITS, max_attention_logits(query, key, mask=seen))
+        # A row without context reads its first slot, so its softmax stays finite (`CausalSelfAttention`).
+        attention = checkpoint_name(scaled_dot_product_attention(
+            query, key, value, dtype=self.dtype, precision=self.precision,
+            force_fp32_for_softmax=self.force_fp32_for_softmax, implementation=self.attention_impl,
+            key_value_seq_lengths=jnp.maximum(lengths, 1), segment_ids=queries, key_segment_ids=segments,
+            max_segments=max_segments), 'context')
+        return self._output(attention, gate)
+
+    @nn.nowrap
+    def context_flops(self, lengths, context_lengths) -> float:
+        """Its read of a context's work over rows of `lengths` tokens reading `context_lengths`
+        (`attend_context`): its projections' (`context_projection_flops`) and the attention between them."""
+        return self.context_projection_flops(lengths, context_lengths) + cross_attention_flops(
+            lengths, context_lengths, self.num_heads, self.qk_nope_head_dim + self.qk_rope_head_dim,
+            self.v_head_dim)
+
+    @nn.nowrap
+    def context_projection_flops(self, lengths, context_lengths) -> float:
+        """The part of its read of a context done by its own matrices: the query latent's, the output
+        gate's and the output projection's over the rows of `lengths` tokens, the key latent's and its
+        expansion's over the context's `context_lengths`; its own call's over its sequence alike
+        (`model_flops`)."""
+        query = self.num_heads * (self.qk_nope_head_dim + self.qk_rope_head_dim)
+        rows = (projection_flops(lengths, self.emb_features, query) if self.q_lora_rank is None else
+                projection_flops(lengths, self.emb_features, self.q_lora_rank)
+                + projection_flops(lengths, self.q_lora_rank, query))
+        rows += projection_flops(lengths, self.num_heads * self.v_head_dim, self.emb_features)
+        if self.output_gate:
+            rows += projection_flops(lengths, self.emb_features, self.num_heads * self.v_head_dim)
+        return rows + projection_flops(context_lengths, self.emb_features,
+                                       self.kv_lora_rank + self.qk_rope_head_dim) + projection_flops(
+            context_lengths, self.kv_lora_rank, self.num_heads * (self.qk_nope_head_dim + self.v_head_dim))
 
     @nn.compact
     def __call__(self, x, call: MixerCall = PLAIN_CALL, prediction_phase: PredictionPhase = "ordinary"):
@@ -834,8 +896,11 @@ class MultiHeadLatentAttention(nn.Module):
         # caller opened the collection. Under a sparse selection the mask
         # holds the selected keys, so the maximum is over those.
         if self._qk_open():
-            self.sow("qk", "max_logits", max_attention_logits(
-                query, key, causal=causal, mask=mask, bias=bias))
+            found = max_attention_logits(query, key, causal=causal, mask=mask, bias=bias)
+            if self.has_variable("qk", CONTEXT_LOGITS):
+                # A context this call read through the same projections first (`attend_context`).
+                found = jnp.maximum(found, self.get_variable("qk", CONTEXT_LOGITS)[-1])
+            self.sow("qk", "max_logits", found)
             self.sow("qk", "qk_nope", jnp.asarray(self.qk_nope_head_dim))
         attention = scaled_dot_product_attention(
             query, key, value, dtype=self.dtype, precision=self.precision,

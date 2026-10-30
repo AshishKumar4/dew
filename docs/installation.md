@@ -99,7 +99,7 @@ A run applies it too: on a machine with an NVIDIA GPU, `prepare_process`, or the
 ### Dew's JAX build
 
 <!-- BEGIN JAX requirement (site/scripts/gen_install.py) -->
-Dew requires `jax>=0.12.0.1.post37,<0.12.1`.
+Dew requires `jax>=0.12.0.1.post38,<0.12.1`.
 <!-- END JAX requirement -->
 
 It is the JAX release that requirement names, with fixes no JAX release has yet, built from [AshishKumar4/jax](https://github.com/AshishKumar4/jax) and served by Dew's package index, the one every install above names, which serves jax alone. Every other package, jaxlib and its CUDA plugins included, comes from PyPI. The fixes:
@@ -129,6 +129,7 @@ It is the JAX release that requirement names, with fixes no JAX release has yet,
 - `JAX_EXPLAIN_CACHE_MISSES` explains, rather than fails, a Pallas Triton reduction, whose body's earlier traces are keyed by keyword.
 - Pallas's Mosaic GPU interpreter hands its own callbacks the host's NumPy arrays, with no transfer to the CPU device a call; `jax.experimental.io_callback` still hands its callback `jax.Array`s.
 - Pallas Mosaic GPU's snake traversal keeps a full power-of-two band as a shift and mask and selects its coordinates without branching, preventing the full-band and partial-tail divisors from becoming one runtime divisor.
+- A compiled executable keeps the SHA-256 of its exact serialized bytes, taken where the persistent compilation cache writes or reads them, so an executable loaded from the cache names the artifact its writer compiled.
 
 Each fix goes from the build once a JAX release has it, and Dew then returns to that release.
 
@@ -213,7 +214,7 @@ The `ci` extra is the test suite's environment, every package a test file import
 
 CI runs on CPUs, so a JAX bump first runs these on a GPU, on Colab, in one session:
 
-- `tests/test_linear_attention.py::test_the_decode_kernel_steps_as_the_recurrence_does` and `tests/test_decode_attention.py::test_the_decode_kernel_reads_each_row_to_its_length_at_every_config`: the gated delta net's and the decode attention's kernels are on the Pallas Triton backend JAX 0.11 deprecates, and each one's `fits` is its off switch;
+- `tests/test_gpu_recurrence.py`'s cell "a gated delta net decodes on its step kernel" and `tests/test_decode_attention.py::test_the_decode_kernel_reads_each_row_to_its_length_at_every_config`: the gated delta net's and the decode attention's kernels are on the Pallas Triton backend JAX 0.11 deprecates, and each one's `fits` is its off switch;
 - `python tools/gpu_profile_check.py --out out/profile-check`, about a minute: a warmed step captured under `dew.Profiler` with command buffers on and off. It fails unless the capture with them off attributes device time to HLO ops and every capture's device time a step is positive and within its wall time. It records whether the default capture attributes ops (none on 0.11.2) and whether XLA ran its command buffers op by op for the session, so a release that changes either shows. While the cause of the default capture's missing attribution is open, every Colab GPU session runs it first too.
 
 ## Compilation cache

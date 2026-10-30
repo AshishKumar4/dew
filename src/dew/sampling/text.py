@@ -35,10 +35,10 @@ from typing_extensions import TypeVar
 from dew._hashing import array_fingerprint
 from dew._records import finite
 from dew.batch import (
-    POSITIONS_FIELD,
     VALIDITY_FIELD,
     Variables,
-    coordinates as token_layout,
+    coordinates as laid_out,
+    flat_field,
     prefix_sum,
     real_slots,
     token_positions,
@@ -386,7 +386,7 @@ def prefill_state(model: nn.Module, params: Variables, inputs: ModelInputs, ops:
     call (`dew.nn.kv_cache.with_rounding_keys`); None leaves the cache's.
     """
     batch, width = inputs.tokens.shape
-    held = _empty_cache(model, params, batch, ops) if cache is None else cache
+    held = _empty_cache(model, params, batch, ops.depths, ops.record is not None) if cache is None else cache
     if rounding is not None:
         held = with_rounding_keys(held, rounding)
     exposed = isinstance(model, Exposing)
@@ -409,22 +409,19 @@ def prefill_state(model: nn.Module, params: Variables, inputs: ModelInputs, ops:
     if ops.record is not None:
         states = _context(model, params, updated)
     drawn = logits if selective else logits[rows, slot]
-    rotary = inputs.token_fields.get("rotary_positions")
-    logical = rotary if rotary is not None else token_positions(inputs.token_fields)
+    rotary = flat_field(inputs.token_fields, "rotary_positions")
+    logical = jnp.asarray(rotary) if rotary is not None else token_positions(inputs.token_fields)
     state = DecoderState(updated["cache"], drawn, next_position(inputs.token_fields, real),
                          None if states is None else states[rows, slot])
     if rebuild_position(model) is not None:
         if cache is not None or logical is not None or inputs.conditioning:
             raise ValueError('LongRoPE cache rebuilding requires a fresh text prompt '
                              'without custom coordinates')
-        if ops.depths or ops.record is not None:
-            raise ValueError("LongRoPE cache rebuilding recomputes the trunk's prefix alone, not a "
-                             "prediction depth's or a block drafter's cache, so it decodes without drafting")
         lengths = jnp.sum(real, axis=1, dtype=jnp.int32)
         slots = jnp.where(real, prefix_sum(real, dtype=jnp.int32) - 1, -1)
         history = write_cache(jnp.zeros((batch, model.max_seq_len), inputs.tokens.dtype),
                               inputs.tokens, slots)
-        state = dataclasses.replace(state, tokens=history, lengths=lengths)
+        state = dataclasses.replace(state, tokens=history, lengths=lengths, rebuilt=jnp.zeros(batch, bool))
     prepared = jax.tree.leaves(updated.get("embeddings", {}))
     if ops.depths > 1 and states is not None:
         # Every later depth needs a predecessor slot in the carry from the
@@ -438,15 +435,16 @@ def prefill_state(model: nn.Module, params: Variables, inputs: ModelInputs, ops:
     return state, last >= 0
 
 
-def _empty_cache(model: nn.Module, params: Variables, batch: int, ops: DecodeOps) -> Variables:
-    """A zeroed decode cache for `batch` rows, with the drafter's own beside it. A decoder whose every
-    mixer is tokenwise (`MLPMixer`) keeps no cache, and its collection is empty."""
+def _empty_cache(model: nn.Module, params: Variables, batch: int, depths: int, drafter: bool) -> Variables:
+    """A zeroed decode cache for `batch` rows, with the prediction depths' (`depths`) and the block
+    drafter's own (`drafter`) beside it. A decoder whose every mixer is tokenwise (`MLPMixer`) keeps no
+    cache, and its collection is empty."""
     def initialized(method: str) -> dict:
         _, mutated = model.apply(params, batch, method=method, mutable=["cache"])
         return flatten_dict(dict(mutated["cache"])) if "cache" in mutated else {}
 
     cache = initialized("init_cache")
-    for method in ("init_mtp_cache",) * bool(ops.depths) + ("init_draft_cache",) * (ops.record is not None):
+    for method in ("init_mtp_cache",) * bool(depths) + ("init_draft_cache",) * drafter:
         cache.update(initialized(method))
     return unflatten_dict(cache)
 
@@ -519,7 +517,13 @@ def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | N
     the cache moves with the rows. A model with a block drafter hands its
     drafter's context back as the states `verify` returns.
     A LongRoPE crossing costs one full-prefix forward over the whole batch
-    to keep static shapes; it happens once per request.
+    to keep static shapes; it happens once per request. It rebuilds every
+    cache the decode keeps: the trunk's over the history, and the prediction
+    depths' and a block drafter's reseeded from it as `prefill_state` seeds
+    them, the crossing rows marked (`DecoderState.rebuilt`). A call whose
+    tokens cross answers each as the walk a token at a time does: those up
+    to the change at the short table, over the cache as it stands, and those
+    past it from the rebuilt history.
     """
     exposed = isinstance(model, Exposing)
     blocks = (_block_drafting(model, params)
@@ -530,64 +534,50 @@ def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | N
     def run(state: DecoderState, tokens: jax.Array, valid: jax.Array
             ) -> tuple[DecoderState, jax.Array, jax.Array | None]:
         width = tokens.shape[1]
-        positions = ({} if state.positions is None else
-                     {POSITIONS_FIELD: state.positions[:, None] + jnp.arange(width)[None, :]})
-        def append():
+
+        def append(valid):
+            # The step's tokens laid out once (`Coordinates`): the real ones, at the places the rows reach.
+            laid = laid_out(tokens.shape, valid=valid, positions=None if state.positions is None else
+                            state.positions[:, None] + jnp.arange(width)[None, :])
             return model.apply(
                 {**params, "cache": state.cache}, jnp.where(valid, tokens, pad_id),
-                decode=True, attention_mask=valid, mutable=["cache", *recorded], rngs=None,
-                method="states_and_logits" if exposed else None,
-                capture_intermediates=False, **positions)
+                decode=True, coordinates=laid, mutable=["cache", *recorded], rngs=None,
+                method="states_and_logits" if exposed else None, capture_intermediates=False)
 
-        history, lengths = state.tokens, state.lengths
+        history, lengths, drafts, rebuilt = state.tokens, state.lengths, state.drafts, None
         original = rebuild_position(model)
         if original is not None and history is not None and lengths is not None:
             slots = lengths[:, None] + prefix_sum(valid, dtype=jnp.int32) - 1
             history = write_cache(history, tokens, jnp.where(valid, slots, -1))
             following = lengths + jnp.sum(valid, axis=1, dtype=jnp.int32)
             crossing = (lengths <= original) & (following > original)
-            ordinary = append()
+            # A crossing row's tokens up to the change, which the walk answers at the short table
+            # (its rotary reads a row's last real place); the rest come from the rebuilt history.
+            before = slots < original
+            answer, updated = append(valid & (before | ~crossing[:, None]))
+            ordinary = (answer, updated["cache"], drafts,
+                        None if blocks is None else _context(model, params, updated))
 
             def rebuild():
-                """Recompute the prefix at its new table, Phi-3's intended policy.
+                fresh = _rebuilt(model, params, made, state, history, following, slots)
+                # A crossing row's tokens up to the change answer at the short table, the rest rebuilt.
+                answer, context = jax.tree.map(lambda fresh, held: _chosen(before, held, fresh),
+                                               (fresh[0], fresh[3]), (ordinary[0], ordinary[3]))
+                return jax.tree.map(lambda fresh, held: _chosen(crossing, fresh, held),
+                                    (answer, fresh[1], fresh[2], context), ordinary)
 
-                Transformers 5.16.1 slices to one token before clearing KV:
-                at the tiny fixture's position 8 its hook sees [[32], [59]],
-                no cache, and predicts 2 where its full-prefix forward predicts
-                32. Rebuilding the prefix retains the prompt's information.
-                https://github.com/huggingface/transformers/issues/49334
-                """
-                empty = with_rounding_keys_of(
-                    model.apply(params, tokens.shape[0], method='init_cache', mutable=['cache'])[1]['cache'],
-                    state.cache)
-                answer, updated = model.apply(
-                    {**params, 'cache': empty}, history,
-                    attention_mask=jnp.arange(history.shape[1])[None, :] < following[:, None],
-                    decode=True, mutable=['cache'], method='states_and_logits' if exposed else None)
-                rows = jnp.arange(tokens.shape[0])[:, None]
-                # The same answer `append` gives: states beside the logits where the model exposes them.
-                picked = jax.tree.map(lambda leaf: leaf[rows, slots], answer)
-                rebuilt = picked, updated
-
-                def replaced(fresh, held):
-                    selected = crossing.reshape(-1, *(1,) * (fresh.ndim - 1))
-                    return jnp.where(selected, fresh, held)
-
-                return jax.tree.map(replaced, rebuilt, ordinary)
-
-            answer, updated = jax.lax.cond(
-                jnp.any(crossing), rebuild, lambda: ordinary)
-            lengths = following
+            answer, cache, drafts, context = jax.lax.cond(jnp.any(crossing), rebuild, lambda: ordinary)
+            lengths, rebuilt = following, crossing
         else:
-            answer, updated = append()
+            answer, updated = append(valid)
+            cache, context = updated["cache"], None if blocks is None else _context(model, params, updated)
         states, logits = answer if exposed else (None, answer)
         if blocks is not None:
-            states = _context(model, params, updated)
+            states = context
         moved = (None if state.positions is None else
                  state.positions + jnp.sum(valid, axis=1, dtype=state.positions.dtype))
-        return (dataclasses.replace(state, cache=updated["cache"], logits=logits[:, -1],
-                                    positions=moved,
-                                    tokens=history, lengths=lengths,
+        return (dataclasses.replace(state, cache=cache, logits=logits[:, -1], positions=moved,
+                                    tokens=history, lengths=lengths, drafts=drafts, rebuilt=rebuilt,
                                     hidden=None if states is None else states[:, -1]),
                 logits, states)
 
@@ -602,11 +592,63 @@ def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | N
                          dataclasses.replace(state, cache={})),
             cache=gather_cache_rows(state.cache, rows))
 
+    # `run`'s rebuild reseeds the depths through these ops, bound once they are made.
     if blocks is not None:
-        return DecodeOps(advance, reindex, run, record=blocks[0], draft=blocks[1])
-    if not depths or not exposed:
-        return DecodeOps(advance, reindex, run)
-    return DecodeOps(advance, reindex, run, *_drafting(model, params, pad_id), depths)
+        made = DecodeOps(advance, reindex, run, record=blocks[0], draft=blocks[1])
+    elif not depths or not exposed:
+        made = DecodeOps(advance, reindex, run)
+    else:
+        made = DecodeOps(advance, reindex, run, *_drafting(model, params, pad_id), depths)
+    return made
+
+
+type _Answer = jax.Array | tuple[jax.Array, jax.Array]
+"""A decode call's answer: its logits, or its states beside them where the model exposes them."""
+
+
+def _rebuilt(model: nn.Module, params: Variables, ops: DecodeOps, state: DecoderState, history: jax.Array,
+             following: jax.Array, slots: jax.Array
+             ) -> tuple[_Answer, Variables, tuple[jax.Array, ...], jax.Array | None]:
+    """Recompute the prefix at its new table, Phi-3's intended policy, every cache with it: the answer
+    at each of a call's `slots` from the `history` of `following` tokens a row, the trunk's cache over it,
+    the prediction depths' and a block drafter's reseeded from it as `prefill_state` seeds them, and
+    the drafter's context at the slots, None without one.
+
+    Transformers 5.16.1 slices to one token before clearing KV:
+    at the tiny fixture's position 8 its hook sees [[32], [59]],
+    no cache, and predicts 2 where its full-prefix forward predicts
+    32. Rebuilding the prefix retains the prompt's information.
+    https://github.com/huggingface/transformers/issues/49334
+    """
+    exposed, drafter = isinstance(model, Exposing), ops.record is not None
+    (batch, width), rows = history.shape, jnp.arange(history.shape[0])[:, None]
+    real = jnp.arange(width)[None, :] < following[:, None]
+    empty = with_rounding_keys_of(_empty_cache(model, params, batch, ops.depths, drafter), state.cache)
+    answer, updated = model.apply(
+        {**params, 'cache': empty}, history, coordinates=laid_out(history.shape, valid=real), decode=True,
+        mutable=['cache', *(['embeddings'] if ops.depths else []),
+                 *(['prediction_inputs'] if drafter else [])],
+        method='states_and_logits' if exposed else None)
+    states = answer[0] if exposed else None
+    reseeded = dataclasses.replace(state, cache=updated['cache'])
+    context = None
+    if ops.record is not None:
+        # The drafter's windows over the history's context, as a prefill records them.
+        context = _context(model, params, updated)
+        reseeded = ops.record(reseeded, context, real)
+        context = context[rows, slots]
+    if ops.depths and states is not None:
+        # The depths' caches and predecessors over the history, as a prefill seeds them.
+        reseeded = dataclasses.replace(reseeded,
+                                       drafts=(states[rows[:, 0], following - 1],) * (ops.depths - 1))
+        embedded = jax.tree.leaves(updated['embeddings'])[0]
+        reseeded = _seeded_depths(ops, reseeded, states, embedded, real, None, batch, width)
+    return jax.tree.map(lambda leaf: leaf[rows, slots], answer), reseeded.cache, reseeded.drafts, context
+
+
+def _chosen(where: jax.Array, chosen: jax.Array, otherwise: jax.Array) -> jax.Array:
+    """`chosen` where `where` holds over its leading axes, else `otherwise`."""
+    return jnp.where(where.reshape(*where.shape, *(1,) * (chosen.ndim - where.ndim)), chosen, otherwise)
 
 
 def _drafting(model: nn.Module, params: Variables, pad_id: int):
@@ -619,7 +661,7 @@ def _drafting(model: nn.Module, params: Variables, pad_id: int):
         # position, and a depth takes it under its own name.
         rotary = positions.ndim == 3
         rows, width = valid.shape
-        laid = token_layout((rows, width), valid=valid, positions=None if rotary else positions)
+        laid = laid_out((rows, width), valid=valid, positions=None if rotary else positions)
         (logits, states), updated = model.apply(
             {**params, "cache": state.cache}, hidden, ids, depth=depth, coordinates=laid,
             rotary_positions=positions if rotary else None, input_embeddings=embeds, decode=True,
@@ -638,8 +680,9 @@ def _drafting(model: nn.Module, params: Variables, pad_id: int):
 def _block_drafting(model: nn.Module, params: Variables):
     """`DecodeOps.record` and `DecodeOps.draft` over the model's block drafter."""
     def record(state: DecoderState, context: jax.Array, valid: jax.Array) -> DecoderState:
-        _, updated = model.apply({**params, "cache": state.cache}, context, None, valid=valid,
-                                 method="draft", mutable=["cache"])
+        _, updated = model.apply({**params, "cache": state.cache}, context, None,
+                                 coordinates=laid_out(valid.shape, valid=valid), method="draft",
+                                 mutable=["cache"])
         return dataclasses.replace(state, cache=updated["cache"])
 
     def draft(state: DecoderState, tokens: jax.Array,

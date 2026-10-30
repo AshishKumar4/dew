@@ -31,24 +31,40 @@ and the final norm reads the last site's collapse (:1268), head 'carried'.
 Parameters are the checkpoints': `fn` `[(2 + H) H, H D]` in torch's `[out,
 in]` layout, `base` `[(2 + H) H]` and `scale` `[3]` under `attn_hc` and
 `ffn_hc`; the weighted head's `hc_fn`, `hc_base`, `hc_scale` under `hc_head`.
+
+Qwen4-Exp's gated residual (`Qwen4ExpTextGatedResidual`,
+modeling_qwen4_exp.py:941-969 in transformers 5.16.1; `hc_lowrank`) reads
+and writes the streams without mixing them:
+
+    normed = rmsnorm(streams), each stream's own statistics, (1 + w)
+    weights = sigmoid(up(silu(down(normed) / H)))        # [B, S, H, D]
+    read    = mean_h(weights[h] * normed[h])             # the sublayer's input
+    streams'[h] = streams[h] + 2 sigmoid(inject(normed) / H)[h] * sublayer(read)
+
+`down` is `[r, H D]` and `up` `[H D, r]` for the rank `r`; the model's head
+is the read alone, with no inject, and no norm after it.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import functools
 from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
+from flax.typing import Dtype, PrecisionLike
+
+from dew.nn.dense import Dense
 
 from .flops import projection_flops
-from .norms import unweighted_rmsnorm
-from .precision import at_least_fp32, float32_einsum, float32_matmul
+from .norms import RMSNorm, unweighted_rmsnorm
+from .precision import at_least_fp32, float32_dot_general, float32_einsum, float32_matmul
 
 __all__ = ["HyperConnections"]
 
-HEADS = ('mean', 'weighted', 'carried')
+HEADS = ('mean', 'weighted', 'carried', 'gated')
 
 
 @dataclasses.dataclass(frozen=True)
@@ -59,7 +75,9 @@ class HyperConnections:
     A model names this on `hyper_connections`. The field names are the
     references' own config fields. `head` picks what collapses the streams
     before the final norm; 'carried' is the last site's `pre`, which only
-    the `single_pass` schedule carries (the module doc).
+    the `single_pass` schedule carries (the module doc). `hc_lowrank` makes
+    the sites Qwen4-Exp's gated residual of that rank (`GatedResidual`), its
+    head 'gated'.
     """
 
     hc_mult: int = 4
@@ -67,6 +85,7 @@ class HyperConnections:
     hc_sinkhorn_iters: int = 20
     head: str = 'mean'
     single_pass: bool = False
+    hc_lowrank: int | None = None
 
     def __post_init__(self):
         if self.hc_mult < 1:
@@ -79,6 +98,15 @@ class HyperConnections:
         if self.head == 'carried' and not self.single_pass:
             raise ValueError("the carried head collapses by the pre the Single-Pass schedule "
                              "carries, so it needs single_pass")
+        if (self.hc_lowrank is not None) != (self.head == 'gated') or (
+                self.hc_lowrank is not None and (self.hc_lowrank < 1 or self.single_pass)):
+            raise ValueError("Qwen4-Exp's gated residual (hc_lowrank, a rank of one or more) reads its "
+                             "streams through its gated head, without Single-Pass, and only it does")
+
+    @property
+    def gated(self) -> bool:
+        """Whether the sites are Qwen4-Exp's gated residual (`GatedResidual`)."""
+        return self.hc_lowrank is not None
 
 
 class Carried(NamedTuple):
@@ -241,12 +269,73 @@ class HyperHead(nn.Module):
         return collapse_by(pre, streams)
 
 
-def collapse_streams(streams, head: HyperHead | None):
+class GatedResidual(nn.Module):
+    """One Qwen4-Exp site over the streams `[B, S, H, D]` (the module doc):
+    the sublayer's read `[B, S, D]` and, where it `injects`, the streams'
+    write weights `[B, S, H]`, else None, as the model's head. Its weights are
+    the release's `hc_norm`, `input_mix_weight_down`, `input_mix_weight_up`
+    and `block_inject_weight`."""
+
+    spec: HyperConnections
+    emb_features: int
+    norm_eps: float = 1e-6
+    injects: bool = True
+    dtype: Dtype | None = None
+    precision: PrecisionLike = None
+
+    @nn.nowrap
+    def projections(self) -> dict[str, tuple[int, int]]:
+        width, rank = self.spec.hc_mult * self.emb_features, self.spec.hc_lowrank
+        assert rank is not None
+        return {'input_mix_weight_down': (width, rank), 'input_mix_weight_up': (rank, width),
+                **({'block_inject_weight': (width, self.spec.hc_mult)} if self.injects else {})}
+
+    @nn.nowrap
+    def model_flops(self, lengths) -> float:
+        """Its projections; the gating and the mean are pointwise work."""
+        return sum(projection_flops(lengths, *shape) for shape in self.projections().values())
+
+    @nn.nowrap
+    def parameter_flops(self, lengths) -> float:
+        return self.model_flops(lengths)
+
+    @nn.compact
+    def __call__(self, streams):
+        batch, length, hc, width = streams.shape
+        dense = functools.partial(Dense, use_bias=False, dtype=self.dtype, precision=self.precision,
+                                  dot_general=float32_dot_general)
+        normed = RMSNorm(epsilon=self.norm_eps, scale_offset=True, groups=hc, dtype=streams.dtype,
+                         name='hc_norm')(streams.reshape(batch, length, hc * width))
+        down = dense(self.projections()['input_mix_weight_down'][1], name='input_mix_weight_down')(normed)
+        weights = nn.sigmoid(dense(hc * width, name='input_mix_weight_up')(nn.silu(down / hc)))
+        read = jnp.mean(weights.reshape(streams.shape) * normed.reshape(streams.shape), axis=2)
+        if not self.injects:
+            return read, None
+        return read, 2 * nn.sigmoid(dense(hc, name='block_inject_weight')(normed) / hc)
+
+
+def gated_write(streams, injection, output):
+    """Each stream plus the sublayer's `output` `[B, S, D]` at its own weight `injection` `[B, S, H]`
+    (`GatedResidual`), in the streams' dtype (modeling_qwen4_exp.py:1236-1237)."""
+    return streams + (output[:, :, None, :] * injection[..., None]).astype(streams.dtype)
+
+
+def stream_head(spec: HyperConnections, emb_features: int, norm_eps: float, **module):
+    """The module that collapses the streams before the final norm under `spec.head`: V4's learned
+    collapse (`HyperHead`), or Qwen4-Exp's gated read without its inject (`GatedResidual`)."""
+    if spec.head == 'gated':
+        return GatedResidual(spec, emb_features, norm_eps, injects=False, **module)
+    return HyperHead(spec, emb_features, norm_eps, **module)
+
+
+def collapse_streams(streams, head: HyperHead | GatedResidual | None):
     """Collapse the streams to the one vector the final norm reads.
 
     Without a head that is their mean (modeling_glm5_next.py:301-302), and
-    with one it is the head's weighted sum.
+    with one it is the head's weighted sum, or Qwen4-Exp's gated read.
     """
     if head is None:
         return jnp.mean(streams, axis=2)
-    return head(streams)
+    collapsed = head(streams)
+    # Qwen4-Exp's gated head returns its read beside the inject it does not take.
+    return collapsed[0] if isinstance(collapsed, tuple) else collapsed

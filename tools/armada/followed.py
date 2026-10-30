@@ -4,27 +4,26 @@ file without a key, as code no event sees ran.
 
 A child is this checkout's Python started with an environment that names DEW_EXECUTED_CHILDREN, the
 parent's or one passed on with it. The `.pth` the parent installs in the environment (`installed`)
-runs `follow` as the child starts: it records the checkout's files the child executed and read
-(`read`, as the parent records its own), where it read the backend, the processes it started in turn,
-and the GPU pool it held, and writes them as it exits.
-A child marks its start, and one that ends without its record (killed, or leaving through os._exit)
-has a mark and no record, and the parent then counts its file's starts as unfollowed (`gathered`), as
-it does a child whose record names another file or a count of records other than the starts it saw.
+runs `follow` as the child starts: it logs the checkout's files the child executed and read (`read`, as
+the parent logs its own, lifetime.py), the modules it imported, where it read the backend, the processes it
+started in turn and the GPU pool it held, each as it happens, and a closing line as its last atexit runs.
+A child whose log never closed (killed, or leaving through os._exit) is lost, and the parent then counts
+its file's starts as unfollowed (`gathered`), as it does a count of logs other than the starts it saw.
 It imports the standard library alone, since the `.pth` runs it in every child before the child's own
-imports, so its two writes publish by a rename of their own rather than through dew.files."""
+imports."""
 
 import atexit
 import dis
 import functools
-import json
+import importlib.machinery
 import os
 import pathlib
 import subprocess
 import sys
-import sysconfig
 import threading
 import time
 import types
+from collections import Counter
 from collections.abc import Callable
 from pathlib import Path
 
@@ -45,7 +44,9 @@ LIMITS = {"cpu.max": "limit:cpu", "memory.max": "limit:memory"}
 `LIMITS`, which this module cannot import (it runs inside every test process, before the checkout's tools)."""
 """Audit events of a read: a file opened, a directory listed."""
 IMPORTING = {"<frozen importlib._bootstrap>", "<frozen importlib._bootstrap_external>", "<frozen zipimport>"}
-"""The import system's frozen modules, which list the directories it imports from."""
+"""The import system's frozen modules, which list the directories it imports from and read the modules it
+executes: what a run executed of a module is its record's (`code_unit`), the code it entered, not the text
+the loader read to compile it."""
 CHILDREN = "DEW_EXECUTED_CHILDREN"
 """Where a followed child writes its record and its start mark, and what makes it one."""
 FOLLOWER_TOOL = 4
@@ -62,6 +63,24 @@ jax.extend.backend's `backends()` and `get_backend()` open every backend they re
 would itself take a pool. This private function's name and its `platform` argument are the one private
 use of another library in tools/armada; the pool is then read through `jax.devices()`."""
 FRACTION = "XLA_PYTHON_CLIENT_MEM_FRACTION"
+SHARED = ""
+"""The owner of what runs for every file: before the first test, around them, and after the last."""
+CLOSED = "closed"
+"""The last line of a log the process wrote to its end: its atexit, registered before any other."""
+READ = "read:"
+"""What a read of the backend, or a test's mark of session.py's `MARKS`, is logged as: the GPU tier's
+evidence (ci.py's `gpu_tier`), no input."""
+STARTED = "start:"
+"""What a process start is logged as: `start:followed` for a child that records itself (followed.py),
+`start:unfollowed` for one no event sees."""
+PEAK = "peak:"
+"""What the most GPU memory the process held is logged as, read before jax's backend closes."""
+VISIT = "visit"
+"""A switch of the owner of what runs (`switch`): a file's tests begin, or the session's end does."""
+UNOPENED = "unopened:"
+"""What a process whose GPU backend never opened logs instead of its peak: why, as jax said."""
+EVIDENCE = (READ, STARTED, PEAK, CLOSED, VISIT, UNOPENED)
+"""What a log holds beside the record's inputs."""
 decided: dict[types.CodeType, bool] = {}
 placing = threading.local()
 """Whether the `os.open` this thread is making opens relative to a directory descriptor (`opening`)."""
@@ -71,6 +90,39 @@ def checkout(name: str, root: str) -> bool:
     """Whether `name` is a Python file of the checkout at `root`. The environment's packages, which CI
     installs in the checkout, are the locks' to key."""
     return name.startswith(root) and name.endswith(".py") and "site-packages" not in name
+
+
+def code_unit(code: types.CodeType, root: str) -> str:
+    """How a record names code object `code` of a checkout file run under `root`: a test file or conftest
+    whole, as its text is the run's; else the file, CODE, and the unit holding the code (ci.py's `units`): the
+    outermost function it lies in, by its qualified name, whose text holds every function and class nested in
+    it, or `TOP`, a module's or a class's body, or a lambda or a generator expression outside any function,
+    whose text the module's top level holds."""
+    name = code.co_filename[len(root):]
+    if Path(name).name.startswith("test_") or Path(name).name == "conftest.py":
+        return name
+    unit = code.co_qualname.split(".<locals>", 1)[0]
+    body = not code.co_flags & OPTIMIZED
+    return f"{name}{CODE}{TOP if body or unit.split('.')[-1].startswith('<') else unit}"
+
+
+def coded(event: str, args: tuple, root: str) -> str | None:
+    """The unit (`code_unit`) of the checkout function whose code a run took (`object.__getattr__`'s audit of
+    `__code__`): its body is then the run's input though it never ran (its constants, its bytecode)."""
+    if event != "object.__getattr__" or args[1] != "__code__" or getattr(taking, "code", False):
+        return None
+    taking.code = True
+    try:
+        code = getattr(args[0], "__code__", None)
+    finally:
+        taking.code = False
+    if isinstance(code, types.CodeType) and checkout(code.co_filename, root):
+        return code_unit(code, root)
+    return None
+
+
+taking = threading.local()
+"""Whether `coded` itself takes a function's code, which audits again."""
 
 
 def reads_backend(code: types.CodeType) -> bool:
@@ -91,8 +143,9 @@ def read(event: str, args: tuple, root: str) -> str | None:
     """The checkout's file or directory, relative to `root`, that a read event names, or None: a file
     opened only to read (`open`'s mode, or its flags for `os.open`), or a directory listed but by a
     listing tool (`listing_tool`), the code that listed it two frames up, beneath the audit hook that
-    calls this. An open relative to a directory descriptor is `opening`'s to place. An open has no
-    caller to ask about: the interpreter audits the main script's from no frame at all."""
+    calls this; nor a module's source or bytecode the import system's loader reads to execute it, whose
+    record is the code it ran (`code_unit`). An open relative to a directory descriptor is `opening`'s to
+    place. The interpreter audits the main script's open from no frame at all."""
     path = args[0]
     if isinstance(path, int):
         return None
@@ -101,6 +154,15 @@ def read(event: str, args: tuple, root: str) -> str | None:
         written = any(letter in mode for letter in "wax+") if mode is not None else (
             flags & os.O_ACCMODE != os.O_RDONLY)
         if written or (mode is None and getattr(placing, "relative", False)):
+            return None
+        # The source loader's read of the module's text on its way to compiling it (its get_code beneath
+        # get_data), not a caller's get_source or get_data, nor a sourceless loader's bytecode, nor
+        # zipimport's archive, which are the module's only text.
+        loader = sys._getframe(1).f_back
+        compiling = loader is not None and loader.f_back is not None and \
+            loader.f_back.f_code.co_name == "get_code" and \
+            isinstance(loader.f_back.f_locals.get("self"), importlib.machinery.SourceFileLoader)
+        if compiling and loader.f_code.co_filename == "<frozen importlib._bootstrap_external>":
             return None
     elif listing_tool(sys._getframe(2).f_code.co_filename):
         return None
@@ -139,6 +201,14 @@ PROBED = "probe:"
 """What a probed path's name is recorded under: a probe's answer is whether the path is there and of
 what kind, and a file's size, so ci.py's `contents` keys a probed directory by its kind, not by the
 entries a listing of it reads."""
+CODE = "::"
+"""How a record names the code a run executed in a checkout module (`code_unit`): the file, CODE, and the unit
+the key hashes (ci.py's `contents`), a function its run entered, or the module's top level."""
+OPTIMIZED = 0x1
+"""A code object's flag that marks a function's body (inspect.CO_OPTIMIZED), which a module's or a class's
+body lacks: the child imports no more of the standard library than it must."""
+TOP = "<module>"
+"""The unit of a module's top level: all its text but its functions' bodies (ci.py's `units`)."""
 IMPORTED = "import:"
 """What a top-level module a run imported is recorded under (executed.py): a helper of that name under
 tests/, which leads sys.path, would shadow it, so ci.py's `contents` keys whether tests/ holds one."""
@@ -149,7 +219,7 @@ def opening(recorded: Callable[[str], None], root: str) -> None:
     such an open, once it has opened to read, is passed to `recorded` as what the descriptor it
     opened names (`placed`). Each existence or size probe (`PROBES`) is passed to `recorded` as the path it
     asks after (`probed`), there or not, which the record then keys (ci.py's `contents`): a fixture's
-    arrival reruns its probers, and no other file (Main, 2026-10-29)."""
+    arrival reruns its probers, and no other file (the maintainer, 2026-10-29)."""
     for owner, names in PROBES:
         for name in names:
             setattr(owner, name, probed(getattr(owner, name), recorded, root))
@@ -265,6 +335,9 @@ def installed() -> None:
     """The `.pth` that starts `follow` in every Python of this environment launched with
     DEW_EXECUTED_CHILDREN set, and in no other: written once, the same for every checkout, as the
     environment's checkouts share it."""
+    # Imported here, once the site has made the environment's paths (lifetime.py boots without it).
+    import sysconfig
+
     line = (f"import os; os.environ.get({CHILDREN!r}) and __import__('runpy').run_path("
             f"os.environ['DEW_EXECUTED_FOLLOWER'], run_name='dew_followed')\n")
     path = Path(sysconfig.get_paths()["purelib"]) / PTH
@@ -274,22 +347,68 @@ def installed() -> None:
         written.replace(path)
 
 
+def closed_imports(seen: set[str], root: str):
+    """The import system's first finder once a process's log closed: a module of the checkout at `root` that
+    `seen` does not name is not imported, so no code the record misses changes what the process did (the
+    maintainer, 2026-10-30: a finalizer that execs a checkout file by hand past the audit hooks' clearing is
+    out of contract)."""
+
+    class Closed:
+        @staticmethod
+        def find_spec(name, path=None, target=None):
+            spec = importlib.machinery.PathFinder.find_spec(name, path)
+            origin = getattr(spec, "origin", None) or ""
+            if checkout(origin, root) and origin[len(root):] not in seen:
+                raise ImportError(f"{origin[len(root):]} was not imported before the run's record closed")
+
+    return Closed
+
+
+def imports(write: Callable[[str], None]):
+    """The import system's first finder that passes each module imported by name, a statement's or
+    `importlib.import_module`'s, to `write` as the top-level name a helper under tests/ would shadow
+    (`IMPORTED`); it finds nothing itself."""
+
+    class Imports:
+        @staticmethod
+        def find_spec(name, path=None, target=None):
+            write(f"{IMPORTED}{name.partition('.')[0]}")
+
+    return Imports
+
+
 def follow() -> None:
-    """Record this child for the process that started it, as it exits: once, though the environment
-    processes its site-packages' `.pth` files twice (a uv environment's `site` adds the directory
-    again), so a second start finds the recorder holding its tool and leaves it. Where another tool
-    holds that id the child records no files, and says so (`unfollowed`): its file then has no key,
-    and the child starts as it would without the recorder."""
+    """Log this child for the process that started it, as it runs, once: though the environment processes
+    its site-packages' `.pth` files twice (a uv environment's `site` adds the directory again), a second
+    start finds the recorder holding its tool and leaves it. Where another tool holds that id the child
+    records no files, and says so (`unfollowed`): its file then has no key, and the child starts as it would
+    without the recorder."""
     holder = sys.monitoring.get_tool(FOLLOWER_TOOL)
     if holder == FOLLOWER:
         return
     directory, root = Path(os.environ[CHILDREN]), os.environ["DEW_EXECUTED_ROOT"]
-    mark = directory / f"{os.getpid()}.started"
+    log = (directory / f"{os.getpid()}.log").open("a", buffering=1)
+    logged: set[str] = set()
+    seen: set[str] = set()
+
+    def write(kind: str, value: object) -> None:
+        line = f"{kind}\t{value}"
+        if line not in logged:
+            logged.add(line)
+            log.write(line + "\n")
+
+    def recorded(name: str) -> None:
+        path = name.partition(CODE)[0]
+        if checkout(os.path.join(root, path), root):
+            seen.add(path)
+        write("file", name)
+
     # A child given its parent's fraction holds one more of the parent's shares where it opens the GPU.
-    inherited = os.environ.get(FRACTION, "") == os.environ.get("DEW_EXECUTED_SHARE", "")
-    record = {"file": os.environ.get("DEW_EXECUTED_FILE", ""), "files": set(), "reads": set(), "expected": 0,
-              "unfollowed": False, "began": time.time(), "pool": None, "peak": None, "inherited": inherited}
-    mark.write_text(record["file"])
+    write("owner", os.environ.get("DEW_EXECUTED_FILE", ""))
+    write("inherited", int(os.environ.get(FRACTION, "") == os.environ.get("DEW_EXECUTED_SHARE", "")))
+    write("began", time.time())
+    for name in list(sys.modules):
+        write("file", f"{IMPORTED}{name.partition('.')[0]}")
 
     def started(code, offset):
         if code.co_name == OPENED[0] and code.co_filename.endswith(OPENED[1]):
@@ -299,77 +418,113 @@ def follow() -> None:
             return None
         name = code.co_filename
         if checkout(name, root):
-            record["files"].add(name[len(root):])
+            recorded(code_unit(code, root))
             if reads_backend(code):
-                record["reads"].add(f"{name[len(root):]}:{code.co_qualname}")
+                write("read", f"{name[len(root):]}:{code.co_qualname}")
         return sys.monitoring.DISABLE
 
     def held() -> None:
-        import jax
-
-        try:
-            devices = jax.local_devices(backend="gpu")
-        except RuntimeError as error:  # the backend failed to open, and holds no pool
-            record["unopened"] = str(error)
+        memory = gpu_memory()
+        if isinstance(memory, str):
+            write("unopened", memory)
             return
-        stats = [device.memory_stats() or {} for device in devices]
-        record["pool"] = sum(stat.get("peak_pool_bytes", stat.get("bytes_limit", 0)) for stat in stats)
-        record["peak"] = max(stat.get("peak_bytes_in_use", 0) for stat in stats)
+        write("pool", memory[0])
+        write("peak", memory[1])
 
     def audited(event, args):
         if event in READS:
             name = read(event, args, root)
             if name is not None:
-                record["files"].add(name)
+                write("file", name)
+            return
+        if (taken := coded(event, args, root)) is not None:
+            recorded(taken)
             return
         kind = start(event, args, str(directory))
         if kind == "followed":
-            record["expected"] += 1
+            log.write("start\tfollowed\n")
         elif kind == "unfollowed":
-            record["unfollowed"] = True
+            write("unfollowed", 1)
 
-    def written() -> None:
-        # The top-level modules it imported: inputs of its file, as its pytest process's are (`IMPORTED`).
-        imported = {f"{IMPORTED}{module.partition('.')[0]}" for module in list(sys.modules)}
-        ended = {**record, "files": sorted(record["files"] | imported), "reads": sorted(record["reads"]),
-                 "ended": time.time()}
-        # Whole or not at all, beside the mark, which stays: the parent may read either as this child ends.
-        partial = directory / f"{os.getpid()}.partial"
-        partial.write_text(json.dumps(ended))
-        partial.replace(directory / f"{os.getpid()}.json")
+    def closing() -> None:
+        write("ended", time.time())
+        write("closed", 1)
+        sys.meta_path.insert(0, closed_imports(seen, root))
 
-    atexit.register(written)
+    atexit.register(closing)
     if holder is not None:
-        record["unfollowed"] = True
+        write("unfollowed", 1)
         return
-    opening(record["files"].add, root)
+    sys.meta_path.insert(0, imports(lambda item: write("file", item)))
+    opening(lambda item: write("file", item), root)
     sys.monitoring.use_tool_id(FOLLOWER_TOOL, FOLLOWER)
     sys.monitoring.register_callback(FOLLOWER_TOOL, sys.monitoring.events.PY_START, started)
     sys.monitoring.set_events(FOLLOWER_TOOL, sys.monitoring.events.PY_START)
     sys.addaudithook(audited)
 
 
+def gpu_memory() -> tuple[int, int] | str:
+    """The GPU pool this process held and the most memory it used, read as its last atexit before jax's
+    backend closes; or why the backend never opened, as jax said, where it holds none."""
+    import jax
+
+    try:
+        devices = jax.local_devices(backend="gpu")
+    except RuntimeError as error:  # the backend failed to open, and holds no pool
+        return " ".join(str(error).split())
+    stats = [device.memory_stats() or {} for device in devices]
+    return (sum(stat.get("peak_pool_bytes", stat.get("bytes_limit", 0)) for stat in stats),
+            max(stat.get("peak_bytes_in_use", 0) for stat in stats))
+
+
+def logged(path: Path) -> dict:
+    """A child's log read back: whose it is, the files it executed and read and the modules it imported, its
+    reads of the backend, how many children it followed in turn, whether it started one no event sees or
+    was not followed itself, its life, its GPU pool, and whether it closed."""
+    record = {"file": "", "files": set(), "reads": set(), "expected": 0, "unfollowed": False, "began": 0.0,
+              "ended": None, "pool": None, "peak": None, "inherited": False, "closed": False}
+    for line in path.read_text().splitlines():
+        kind, _, value = line.partition("\t")
+        if kind == "owner":
+            record["file"] = value
+        elif kind == "file":
+            record["files"].add(value)
+        elif kind == "read":
+            record["reads"].add(value)
+        elif kind == "start":
+            record["expected"] += 1
+        elif kind == "unfollowed":
+            record["unfollowed"] = True
+        elif kind in ("began", "ended"):
+            record[kind] = float(value)
+        elif kind in ("pool", "peak"):
+            record[kind] = int(value)
+        elif kind == "inherited":
+            record["inherited"] = value == "1"
+        elif kind == "closed":
+            record["closed"] = True
+    return record
+
+
 def gathered(directory: Path, expected: dict[str, int]) -> dict[str, dict]:
-    """What each test file's children recorded in `directory`, by the file that started them, given
-    how many children each file's own process started (`expected`): their files and reads, whether
-    every start was followed, the most GPU memory a child that took the parent's fraction held
-    (`peak`), and the GPU pools they held at once, the parent's share counted apart (`shares`, the
-    children that took its fraction) from the bytes of those that named their own. Records are read
-    before marks, so a child that ends between the two counts as one without its record."""
-    published = list(directory.glob("*.json"))
-    records = [json.loads(path.read_text()) for path in published]
-    ended = {path.stem for path in published}
-    lost = {path.read_text() for path in directory.glob("*.started") if path.stem not in ended}
+    """What each test file's children logged in `directory`, by the file that started them (`""`, every
+    file's, for those started outside a file's tests), given how many children each file's own process
+    started (`expected`): their files and reads, whether every start was followed and every child's log
+    closed, the most GPU memory a child that took the parent's fraction held (`peak`), and the GPU pools they
+    held at once, the parent's share counted apart (`shares`, the children that took its fraction) from the
+    bytes of those that named their own. Read once the process group has exited, so every log is whole."""
+    records = [logged(path) for path in directory.glob("*.log")] if directory.is_dir() else []
     found: dict[str, dict] = {}
     for name in {*expected, *(record["file"] for record in records)}:
         own = [record for record in records if record["file"] == name]
         starts = expected.get(name, 0) + sum(record["expected"] for record in own)
-        pooled = [record for record in own if record["pool"]]
+        whole = [record for record in own if record["closed"]]
+        pooled = [record for record in whole if record["pool"]]
         inherited = [record for record in pooled if record["inherited"]]
         found[name] = {
             "files": {path for record in own for path in record["files"]},
             "reads": {site for record in own for site in record["reads"]},
-            "followed": name not in lost and len(own) == starts and not any(r["unfollowed"] for r in own),
+            "followed": len(whole) == len(own) == starts and not any(r["unfollowed"] for r in own),
             "peak": max((record["peak"] for record in inherited if record["peak"] is not None), default=None),
             "shares": _most_at_once(inherited, lambda record: 1),
             "pools": _most_at_once([r for r in pooled if not r["inherited"]], lambda record: record["pool"])}
@@ -385,6 +540,48 @@ def _most_at_once(records: list[dict], weight) -> int:
         held += change
         most = max(most, held)
     return most
+
+
+def recorded(path: Path) -> dict[str, dict]:
+    """Each test file's record in the log at `path` and its children's (followed.py's `gathered`): the files
+    it executed and read, every earlier file's up to the end of its last visit, `SHARED`'s whenever, and its
+    own and `SHARED`'s children's (`depends`, None for a file without a key); its reads of the backend and its
+    marks; and the GPU memory it held, its children's pools and shares. A file the log never names has no
+    record."""
+    text = path.read_text() if path.is_file() else ""
+    # A line cut short by a kill names no event.
+    lines = [line.split("\t", 1) for line in text.splitlines() if "\t" in line]
+    closed = [SHARED, CLOSED] in lines
+    starts = Counter(name for name, item in lines if item == f"{STARTED}followed")
+    children = gathered(path.with_name(f"{path.name}.children"), dict(starts))
+    blank = {"files": set(), "reads": set(), "followed": True, "peak": None, "shares": 0, "pools": 0}
+    shared_child = children.get(SHARED, blank)
+    visits = [(index, name) for index, (name, item) in enumerate(lines) if item == VISIT]
+    files = list(dict.fromkeys(name for _, name in visits if name != SHARED))
+    shared = [item for name, item in lines if name == SHARED]
+    peaks = [int(item[len(PEAK):]) for item in shared if item.startswith(PEAK)]
+    out = {}
+    for file in files:
+        # Up to the end of its last visit: the next owner's visit, or the log's end.
+        last = max(index for index, name in visits if name == file)
+        end = next((index for index, _ in visits if index > last), len(lines))
+        before = lines[:end]
+        child = children.get(file, blank)
+        unfollowed = any(item == f"{STARTED}unfollowed" for _, item in before) or \
+            f"{STARTED}unfollowed" in shared
+        whole = closed and not unfollowed and child["followed"] and shared_child["followed"]
+        inputs = {item for _, item in before if not item.startswith(EVIDENCE)} | {
+            item for item in shared if not item.startswith(EVIDENCE)}
+        held = [each for each in (*peaks, child["peak"], shared_child["peak"]) if each is not None]
+        out[file] = {
+            "depends": sorted(inputs | child["files"] | shared_child["files"]) if whole else None,
+            "reads": sorted({item[len(READ):] for name, item in lines if name in (file, SHARED)
+                             and item.startswith(READ)} | child["reads"] | shared_child["reads"]),
+            "peak": max(held) if len(files) == 1 and whole and held else None,
+            # The shared children may run beside the file's own: their counts together bound both.
+            "shares": child["shares"] + shared_child["shares"],
+            "pools": child["pools"] + shared_child["pools"]}
+    return out
 
 
 if __name__ == "dew_followed":

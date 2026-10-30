@@ -9,6 +9,7 @@ are tests/test_run_options.py's. Nothing here reads a config's fields back."""
 
 import dataclasses
 import json
+import os
 import typing
 from pathlib import Path
 
@@ -49,9 +50,10 @@ MESH = {"tensor": 2}
 the rest): two rows each, which a split in two and a ramp's first batch of four still divide."""
 
 
-def trained(kind: str, root: Path, name: str, run: RunConfig | None = None, **settings: object) -> Path:
-    """`dew train` over `kind`'s run.json under `root`, or `run`'s where given, its options `settings`
-    (`--set path=value`, a mapping as JSON), at most as many steps as it is given: the run's directory."""
+def train_arguments(kind: str, root: Path, name: str, run: RunConfig | None = None,
+                    **settings: object) -> list[str]:
+    """`dew train`'s arguments over `kind`'s run.json under `root`, or `run`'s where given, its options
+    `settings` (`--set path=value`, a mapping as JSON), at most as many steps as it is given."""
     record, data = root / f"record-{name}", root / name
     data.mkdir()
     (run or KINDS[kind](data, drawn=False)).save(str(record))
@@ -59,9 +61,13 @@ def trained(kind: str, root: Path, name: str, run: RunConfig | None = None, **se
              "trainer.eval_every": "None", "trainer.checkpoint_every": "None", "trainer.mesh": MESH,
              "trainer.multi_host": "False", "trainer.compilation_cache_dir": "None", "val_metrics": "[]",
              **settings}
-    flags = [flag for path, value in given.items()
-             for flag in ("--set", f"{path}={json.dumps(value) if isinstance(value, dict) else value}")]
-    assert main(["train", str(record / "run.json"), *flags]) == 0
+    return [str(record / "run.json"), *(flag for path, value in given.items() for flag in (
+        "--set", f"{path}={json.dumps(value) if isinstance(value, dict) else value}"))]
+
+
+def trained(kind: str, root: Path, name: str, run: RunConfig | None = None, **settings: object) -> Path:
+    """`dew train` here over `train_arguments`: the run's directory."""
+    assert main(["train", *train_arguments(kind, root, name, run, **settings)]) == 0
     return root / "runs" / name
 
 
@@ -286,30 +292,40 @@ def test_a_kinds_run_publishing_from_an_offline_wandb_run_is_refused_before_it_t
     assert not (tmp_path / "runs" / "published").exists()
 
 
-@pytest.mark.gpu(reason="measures a run's kernel launches, which only a GPU runs")
-@pytest.mark.mesh(devices=1)
-@pytest.mark.usefixtures("without_deterministic_ops")
-def test_an_lm_run_measures_its_kernel_launches_as_set(tmp_path):
-    """An LM run whose attention takes Triton's kernel, a launch of configs to measure, that measures its
-    step's launches on this GPU (`tune_kernels`) adds what it picked to the picks of this GPU's kind
-    beside the compilation cache (`dew.cache.kernel_picks_path`), where a later run reads them. Every
-    kind's trainer is built through the one `RunConfig.built`, which hands it the option; the other
-    kinds' tiny models launch nothing Triton takes (a decision backbone's sliding window, heads narrower
-    than its kernel computes). The suite's GPUs run deterministic ops, under which no process keeps
-    picks (`dew.cache.keeps_picks`); the run here does not."""
+def an_lm_run_measures_its_kernel_launches_as_set(tmp_path):
+    """An LM run whose attention takes Dew's attention template (`model.attention_impl="template"`,
+    `AttentionLaunch`), a launch of configs to measure, that measures its step's launches on this GPU
+    (`tune_kernels`) adds what it picked to the picks of this GPU's kind beside the compilation cache
+    (`dew.cache.kernel_picks_path`), where a later run reads them: the tuner measures Dew's own launches
+    (`tuning.KernelOp`), not tokamax's ops, which keep their heuristic (row 2661). Every kind's trainer is
+    built through the one `RunConfig.built`, which hands it the option. The suite's GPUs run
+    deterministic ops, under which no process keeps picks (`dew.cache.keeps_picks`); the run here does
+    not. It runs as `dew train` in a process of its own, whose compilation cache is its own
+    (JAX_COMPILATION_CACHE_DIR): no run before it measured into that cache, and no picks this process holds
+    reach it."""
     import jax
+    from lane_environment import without_deterministic_ops
+    from process_support import REPO_ROOT, dew_train
 
     from dew.cache import kernel_picks_path
 
-    picks = Path(kernel_picks_path(jax.devices()[0].device_kind))
-
-    def stored() -> list:
-        return json.loads(picks.read_text())["data"] if picks.exists() else []
-    before = stored()
-    trained("lm", tmp_path, "tuned", **{"trainer.steps": 1, "trainer.tune_kernels": "True",
-                                          "trainer.mesh": {}, "model.attention_impl": "triton",
-                                          "model.head_dim": 16})
-    assert [pick for pick in stored() if pick not in before]
+    compiled = tmp_path / "compiled"
+    cached = jax.config.jax_compilation_cache_dir
+    jax.config.update("jax_compilation_cache_dir", str(compiled))
+    try:
+        picks = Path(kernel_picks_path(jax.devices()[0].device_kind))
+    finally:
+        jax.config.update("jax_compilation_cache_dir", cached)
+    # This process holds its share of the GPU; the run takes memory as it needs it, not the 95% a
+    # training process preallocates (`dew.devices`), which a 40 GB card cannot give beside it.
+    environment = {**os.environ, "JAX_COMPILATION_CACHE_DIR": str(compiled),
+                   "PYTHONPATH": str(REPO_ROOT / "src"), "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
+                   "XLA_FLAGS": without_deterministic_ops(os.environ.get("XLA_FLAGS", ""))}
+    dew_train(tmp_path, environment, *train_arguments("lm", tmp_path, "tuned", **{
+        "trainer.steps": 1, "trainer.tune_kernels": "True", "trainer.mesh": {},
+        "trainer.compilation_cache_dir": str(compiled), "model.attention_impl": "template",
+        "model.head_dim": 16}))
+    assert json.loads(picks.read_text())["data"]
 
 
 @pytest.mark.parametrize("kind", list(KINDS))

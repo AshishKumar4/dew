@@ -313,6 +313,12 @@ def prefetched_bytes(batch: Batch, shardings: Placement[Batch], depth: int = PRE
     return (depth + 1) * placed_bytes(placed_shapes(batch, shardings))
 
 
+def restore_position(source: Checkpointable, saved: bytes) -> None:
+    """Set `source` to the position `saved` holds, as its own `get_state` gives one: the bytes
+    themselves, or the JSON they encode."""
+    source.set_state(saved if isinstance(source.get_state(), bytes) else json.loads(saved))
+
+
 class DevicePrefetchIterator:
     """Reads batches on a worker thread and places them on the mesh ahead of the step.
 
@@ -455,9 +461,7 @@ class DevicePrefetchIterator:
             if not self._stop.is_set() and self.source_state is not None:
                 if source is None:
                     raise TypeError(f"{self._source_name} cannot resume from a saved position")
-                saved = self.source_state
-                source.set_state(saved if isinstance(source.get_state(), bytes)
-                                 else json.loads(saved))
+                restore_position(source, self.source_state)
             while not self._stop.is_set():
                 with region("data.read"):
                     batch = next(iterator)
@@ -534,7 +538,8 @@ class DevicePrefetchIterator:
         temporaries take whole, and stays there until a later step reads it (row 2088: a 4B's step that
         fit its 50.35 GiB block before its first validation pass found it split after the pass, by a
         batch the stream read ahead of the pass). The block must not read this iterator, whose next
-        batch may wait on the placement it holds; closing it stops the worker as ever."""
+        batch may wait on the placement it holds, but through `read_held`; closing it stops the worker
+        as ever."""
         with self._ready:
             self._holds += 1
             self._ready.wait_for(lambda: not self._placing_now)
@@ -544,6 +549,21 @@ class DevicePrefetchIterator:
             with self._ready:
                 self._holds -= 1
                 self._ready.notify_all()
+
+    def read_held(self) -> Batch:
+        """The next batch, read by a block that holds this iterator's placements (`held`): the hold is
+        let go for the read, whose batch may wait on a placement, and taken again after it, once a
+        placement it let through finishes. A rollout that draws further batches reads them so
+        (`dew.training.rollout.rolled_out`)."""
+        with self._ready:
+            self._holds -= 1
+            self._ready.notify_all()
+        try:
+            return next(self)
+        finally:
+            with self._ready:
+                self._holds += 1
+                self._ready.wait_for(lambda: not self._placing_now)
 
     def _discard(self) -> None:
         """Drop every batch already queued, without waiting for more."""

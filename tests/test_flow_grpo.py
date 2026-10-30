@@ -11,6 +11,8 @@ velocities, a walk's recorded densities and their rescoring alike; what is one
 computation, or exact arithmetic, is held exactly.
 """
 
+import contextlib
+import dataclasses
 import itertools
 import math
 from pathlib import Path
@@ -1168,7 +1170,7 @@ KL_LEVELS = (-126, -125, -100, -63, -26, -1, 0, 1, 26, 63, 100, 126, 127)
 FIXED_ROWS = (
     # (mean, reference, variance, mean tangent, reference tangent, variance tangent, cotangent), three
     # coordinates: each a review's or the second opinion's input. A JVP of products [2**120, -2**120,
-    # 2**-100], which a plain float32 sum keeps and aligning to the largest flushed (Main, 1778).
+    # 2**-100], which a plain float32 sum keeps and aligning to the largest flushed (the maintainer, 1778).
     ([2.0**60, 2.0**60, 2.0**-100], [0, 0, 0], 1, [2.0**60, -2.0**60, 1], [0, 0, 0], 0, 1),
     ([2.0**60, 2.0**60, 1], [0, 0, 0], 1, [2.0**60, -2.0**60, 2.0**-5], [0, 0, 0],
      (1 + 2.0**-23) * 2.0**-125, 1),
@@ -1321,3 +1323,99 @@ def test_a_transitions_density_keeps_a_residual_whose_square_overflows():
     _, moved = jax.jvp(along_mean, (small.mean,), (jnp.ones((1, 1), jnp.float32),))
     np.testing.assert_array_equal(np.asarray(moved), 2.0 ** 90)
     np.testing.assert_array_equal(np.asarray(jax.grad(along_mean)(small.mean)), [[2.0 ** 90]])
+
+
+class Branched:
+    """A custom guidance that calls its denoiser inside a `lax.cond` of its own, returning what the call
+    opened through the cond's outputs, as the `Guidance` protocol asks."""
+
+    def walk(self, denoise, steps):
+        from dew.sampling.guidance import Walk
+
+        def predict(x, t):
+            return jax.lax.cond(jnp.asarray(1) > 0, denoise.predict, denoise.predict, x, t)
+        return Walk.stateless(lambda index: predict)
+
+
+@pytest.mark.parametrize("guided", ["unguided", "unguided-over-a-guide", "autoguidance", "branched"])
+def test_a_watched_flow_step_summarizes_its_policys_own_first_call(guided):
+    """A sampled Flow-GRPO step watching its policy model summarizes that model's output on the inputs
+    its walk hands it at each trajectory's first transition, its own call's to the bit: unguided, over a
+    tree that holds an autoguidance's guide it does not read, under an autoguidance whose main model
+    holds the guide out (2317), and under a custom guidance that calls its policy inside a `lax.cond` of
+    its own (2511)."""
+    from dew.nn.inspection import Watched, flattened, watching
+    from dew.sampling.guidance import Autoguidance
+
+    process, rows = Process(FlowMatchingScheduler(), VPredictionTransform()), 4
+    guidance = {"autoguidance": Autoguidance(2.0, AffineVelocity()), "branched": Branched()}.get(guided)
+    objective = FlowGRPOObjective(AffineVelocity(), process, InputSpec(Field("image", (2,))),
+                                  sde=FlowSDE(0.5), guidance=guidance)
+    own = objective.init(jax.random.key(30))
+    variables = own if guided == "unguided" else {**own, "guide": AffineVelocity().init(
+        jax.random.key(31), jnp.zeros((rows, 2)), jnp.ones(rows))}
+    bound = own if guided == "autoguidance" else variables
+    policy = objective.process.denoiser(objective.model, variables, {})
+    trajectory = objective.sde.trajectory(policy, jnp.ones((rows, 2)), 3, key=32, guidance=guidance)
+    batch = trajectory_batch(trajectory, np.ones(rows, np.float32))
+    step = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(33), ema=None,
+                watched=Watched(("AffineVelocity",)))
+    # The step's loss under the watcher its trainer enters (`Objective._loss`).
+    with watching(("AffineVelocity",)):
+        _, aux = objective.loss(variables, batch, step)
+    outputs = []
+
+    def kept(next_fun, args, kwargs, context):
+        output = next_fun(*args, **kwargs)
+        if not outputs and context.method_name == "__call__" and {id(leaf) for leaf in jax.tree.leaves(
+                context.module.scope.variables())} == {id(leaf) for leaf in jax.tree.leaves(bound)}:
+            outputs.append(output)
+        return output
+
+    # The policy's own call, run eagerly through any transform its guidance wraps it in.
+    with nn.intercept_methods(kept), jax.disable_jit():
+        objective._walk(variables, batch).at((), 0)(batch["latents"][:, 0], batch["timesteps"][:, 0])
+    # Its largest magnitude, which no order of a reduction rounds: a sum's order is the compiled program's
+    # own, which a scan's body and a call of its own need not share.
+    expected = np.asarray(outputs[0], np.float32)
+    assert flattened(aux.inspected)["activations/abs_max"] == np.abs(expected).max()
+
+
+class DenseVelocity(nn.Module):
+    """A velocity through one dense layer, whose matmuls a step's work counts."""
+
+    @nn.compact
+    def __call__(self, x, temb):
+        return nn.Dense(x.shape[-1])(x) + (temb / 1000)[:, None] * 0.1
+
+
+@pytest.mark.parametrize("guided", ["unguided", "branched"])
+def test_a_watched_flow_step_runs_its_unwatched_steps_matmuls(guided):
+    """A sampled Flow-GRPO step summarizes its policy's trained call, returned out of its scan, and runs
+    the unwatched step's matmuls alone (`step_flops`): no forward more at the first transition's inputs
+    (2512), under a custom guidance that calls its policy inside a `lax.cond` of its own too (2511)."""
+    from dew.nn.inspection import Watched, watching
+    from dew.telemetry.instrumentation import step_flops
+
+    process, rows = Process(FlowMatchingScheduler(), VPredictionTransform()), 4
+    guidance = Branched() if guided == "branched" else None
+    objective = FlowGRPOObjective(DenseVelocity(), process, InputSpec(Field("image", (2,))), sde=FlowSDE(0.5),
+                                  guidance=guidance)
+    variables = objective.init(jax.random.key(30))
+    policy = objective.process.denoiser(objective.model, variables, {})
+    trajectory = objective.sde.trajectory(policy, jnp.ones((rows, 2)), 3, key=32, guidance=guidance)
+    batch = trajectory_batch(trajectory, np.ones(rows, np.float32))
+    step = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(33), ema=None,
+                watched=Watched(("DenseVelocity",)))
+
+    def work(watched: bool) -> float:
+        def loss(params):
+            with watching(("DenseVelocity",)) if watched else contextlib.nullcontext():
+                stats, aux = objective.loss({**variables, "params": params}, batch,
+                                            step if watched else dataclasses.replace(step, watched=None))
+            return objective.reduce_loss(stats)[0], aux.inspected
+        flops = step_flops(jax.jit(jax.grad(loss, has_aux=True)).lower(variables["params"]).compile())
+        assert flops is not None
+        return flops.hardware
+
+    assert work(watched=True) == work(watched=False)

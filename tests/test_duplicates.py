@@ -378,7 +378,7 @@ def test_a_checkout_carrying_its_base_is_held_to_it_and_fetches_nothing(tmp_path
     """A gate's container checkout carries its commit's history (armada's history full) and is given BASE,
     its head's merge-base with main, with no origin/main and no reachable origin: tools/base_history.sh
     points origin/main at BASE from the history it holds, fetching nothing, and the gate then fails the
-    head's new copy; a checkout whose history lacks BASE fails, naming it, fetching nothing (Main,
+    head's new copy; a checkout whose history lacks BASE fails, naming it, fetching nothing (the maintainer,
     2026-10-28: the gates' fetches of main over HTTPS failed lanes' lint, curl 92)."""
     root = repository(tmp_path, {"spread.py": SPREAD, "ranges.py": RANGE_OVER_COUNT})
     base = subprocess.run(["git", "rev-parse", "main"], cwd=root, check=True, capture_output=True,

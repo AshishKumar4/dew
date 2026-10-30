@@ -85,7 +85,15 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from jax.typing import ArrayLike
 
 from dew._hashing import array_fingerprint
-from dew.batch import POSITIONS_FIELD, VALIDITY_FIELD, Variables
+from dew.batch import (
+    COORDINATES_FIELD,
+    POSITIONS_FIELD,
+    VALIDITY_FIELD,
+    Variables,
+    laid_coordinates,
+    token_positions,
+    token_validity,
+)
 from dew.inference.engine import Timed, normalized, reloaded, settled
 from dew.inference.pages import Pages, States, prefix_hashes
 from dew.inference.projections import pack_projections, packed_layout
@@ -96,6 +104,7 @@ from dew.inference.serving_kernel import (
     Paged,
     Placement,
     decode_programs,
+    dispatched,
     joined,
     mixed_refusal,
     opened,
@@ -596,7 +605,8 @@ class Server:
             formats, chosen = resident_formats(
                 model, self.variables, self.pad_id, rows.placement, decode_steps, shapes,
                 state_shardings(self.mesh, shapes), self._admitted, transforms, stopping, grammar)
-            self._step, self._admitting = decode_programs(formats, self._admitted, compiler_options(model))
+            self._step, self._admitting = map(dispatched, decode_programs(formats, self._admitted,
+                                                                          compiler_options(model)))
             if chosen is not None:
                 # The compile that chose the layout is the decoding step: compiling it again at the
                 # formats would repeat the server's largest compile (`resident_formats`).
@@ -833,14 +843,22 @@ class Server:
             if self.cross is not None and CONTEXT in conditioning:
                 context = self._request_context(conditioning.pop(CONTEXT),
                                                   conditioning.pop(CONTEXT_LENGTHS, None))
-            if set(inputs.token_fields) - {VALIDITY_FIELD, POSITIONS_FIELD, *GROUPS} or conditioning:
+            # The prompt's layout, its coordinates or its flat fields (`laid_coordinates`): one document.
+            laid = laid_coordinates(inputs.token_fields)
+            if (set(inputs.token_fields) - {VALIDITY_FIELD, POSITIONS_FIELD, COORDINATES_FIELD, *GROUPS}
+                    or conditioning or (laid is not None and laid.segments is not None)):
                 raise ValueError(
                     "a served prompt carries tokens, validity, positions, image and block groups and a "
-                    "cross-attention decoder's context only; media and custom token fields do not slot"
+                    "cross-attention decoder's context only; media, packed documents and custom token "
+                    "fields do not slot"
                 )
             ids = np.asarray(inputs.tokens)
-            fields = {name: np.asarray(value) for name, value in inputs.token_fields.items()}
-            positions = fields.pop(POSITIONS_FIELD, None)
+            fields = {name: np.asarray(value) for name, value in inputs.token_fields.items()
+                      if name in GROUPS}
+            valid, positions = token_validity(inputs.token_fields), token_positions(inputs.token_fields)
+            if valid is not None:
+                fields[VALIDITY_FIELD] = np.asarray(valid)
+            positions = None if positions is None else np.asarray(positions)
         else:
             ids = host_token_rows(np.atleast_2d(np.asarray(prompt)))
             fields = {}

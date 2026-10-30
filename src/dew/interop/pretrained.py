@@ -71,14 +71,14 @@ from dew.nn.backbones.decoder_block import layer_scalar_mode
 from dew.nn.backbones.layer_plan import LayerKind, group_layers
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.multimodal import MultimodalTransformer
+from dew.nn.precision import Numerics, numerics_of
 from dew.objectives.base import SavedTask
-from dew.registry import dtype_name, from_record, projectors, record_fields, resolve_dtype, towers
+from dew.registry import DtypeName, dtype_name, from_record, projectors, record_fields, resolve_dtype, towers
 from dew.sampling.text import Sampling
 
 if TYPE_CHECKING:
     from jax.sharding import Mesh
 
-    from dew.diffusion.discrete import Confident, Unmask
     from dew.distributed.placement import Layout, MeshSpec
     from dew.inference.tasks import SavedRun
     from dew.interop.torchax_fallback import TorchAdmission
@@ -237,6 +237,10 @@ class Pretrained:
     """The modules of `model` drawn fresh beside the loaded weights, by their paths under `params`
     (`layers_1/cross_attention`): what `with_cross_attention` adds, which a run trains in a fresh group
     (`Objective.fresh_modules`, `dew.optim.OptimConfig.fresh_groups`)."""
+    numerics: Numerics | None = None
+    """The numerics the load was asked for (`load(precision=...)`), whose dtypes it computes and stores
+    in and whose products' precision and forms its tasks trace under (`formed`); None for its dtypes
+    alone."""
     names_tokenizer: ClassVar[bool] = True
     """Whether generation_config.json may record the tokenizer's name.
 
@@ -258,6 +262,15 @@ class Pretrained:
     def pipeline(self) -> SavedTask:
         """The native task declared by this source kind."""
         raise TypeError(f"{type(self).__name__} has no native task")
+
+    def formed[TaskT](self, task: TaskT) -> TaskT:
+        """`task`, built from this source, under the numerics its load was asked for (`numerics`) where
+        it traces under numerics (`dew.inference.tasks.InItsForm`)."""
+        from dew.inference.tasks import InItsForm
+
+        if self.numerics is None or not isinstance(task, InItsForm):
+            return task
+        return replace(task, precision=self.numerics)
 
     def packed(self) -> Self:
         """A serving view with packed projections, preserving this bundle's arrays for reuse."""
@@ -281,7 +294,8 @@ class Pretrained:
     @classmethod
     def from_run(cls, directory: str | Path, *, step: int | str | None = None,
                  ema: bool | None = None, trust: Sequence[str] = ()) -> Self:
-        """Return a trained run's selected checkpoint, its latest or `step`, rebuilt from the run's
+        """Return a trained run's selected checkpoint, `step` or the one its task loads by default
+        (`SavedRun.pinned`), rebuilt from the run's
         own inference record (`from_saved`). `trust` names the packages outside Dew the record may
         import (`TextGeneration.from_run`)."""
         from dew.inference.tasks import SavedRun
@@ -369,7 +383,8 @@ class Pretrained:
              fallback: str | None = None, weights: bool = True, on_host: bool = False,
              modeling_overrides: Mapping[str, object] | None = None,
              trust_remote_code: bool = False, text_only: bool = False,
-             prediction_depths: int | None = None, dex: DifferentialExtension | None = None) -> Self:
+             prediction_depths: int | None = None, dex: DifferentialExtension | None = None,
+             precision: Numerics | str | None = None, scan_layers: bool = False) -> Self:
         """Load a source as a native Flax model with explicit parameter trees, as the kind of source it is.
 
         `name_or_dir` is a local HF directory or a Hub model ID. Decoder, tower and
@@ -381,6 +396,8 @@ class Pretrained:
         dtype of floating parameters. It defaults to FP32 master weights, and 'auto'
         keeps each tensor in the dtype the checkpoint stores it in; a quantized
         source's packed weights decode to the dtype it declares (`declared_dtype`).
+        `precision`, a run's numerics or their name (`dew.nn.precision.numerics_of`), sets both
+        from its dtypes, and the bundle's tasks trace under its precision and forms (`formed`).
         Each is a dtype (`jnp.bfloat16`) or its name, and the model's record keeps
         the name. Frozen components (text encoders and the VAE) follow `param_dtype`
         too, while router, clipping, positional and safety state keep their own FP32
@@ -444,7 +461,7 @@ class Pretrained:
         "block_bidirectional"}}` lets that layer kind's tokens read their whole block
         (`AttentionMixer.bidirectional_blocks`, a call's `block_groups`) on any decoder or wrapper this
         loads natively, and "causal" turns a release's back off. A saved model states it in its own
-        config. `dex` attaches DEX (`with_dex`) drawn from key 0, one extension for each run naming it.
+        config. `dex` attaches DEX (`with_dex`) from key 0; `scan_layers` scans like layers (`Scanning`).
         """
         selected = _selected_payload(fallback, gguf_file=gguf_file, single_file=single_file,
                                      dduf_file=dduf_file)
@@ -459,11 +476,7 @@ class Pretrained:
         def placed(variables: Variables) -> Variables:
             return place(variables, mesh, layout) if streaming else variables
 
-        dtype = dtype_name(dtype)
-        param_dtype = AUTO if param_dtype == AUTO else dtype_name(param_dtype)
-        if prediction_depths is not None and (isinstance(prediction_depths, bool) or prediction_depths < 0):
-            raise ValueError(f"prediction_depths keeps the first that many depths, 0 or more, not "
-                             f"{prediction_depths!r}")
+        numerics, dtype, param_dtype = _load_settings(precision, dtype, param_dtype, prediction_depths)
         # The reference refuses a folder outside the source before anything is fetched.
         directory, reference, composite = _source_metadata(
             sources.SourceReference(str(name_or_dir), revision, subfolder), selected, fallback,
@@ -477,9 +490,10 @@ class Pretrained:
         if not isinstance(loaded, cls):
             raise TypeError(f"{name_or_dir} is a {type(loaded).__name__} source, not a {cls.__name__}; "
                             f"load it with {type(loaded).__name__}.load or Pretrained.load")
-        extended = _extended(_published(loaded, name_or_dir, selected=bool(selected)
-                                        or reference.subfolder is not None or extracted), dex, placed)
-        return _resident(extended, weights=weights, streaming=streaming, on_host=on_host)
+        extended = _extended(_published(loaded, name_or_dir, selected=bool(selected) or extracted
+                                        or reference.subfolder is not None), dex, placed, scan_layers)
+        return replace(_resident(extended, weights=weights, streaming=streaming, on_host=on_host),
+                       numerics=numerics)
 
     @property
     def layouts(self) -> Mapping[str, WeightLayout]:
@@ -778,8 +792,9 @@ class PretrainedMaskedDecoder(Pretrained):
     """A masked-diffusion decoder (LLaDA, Dream).
 
     It is a non-causal decoder with a mask id that generates by unmasking a whole
-    response, or, where its family declares its release's walk (LLaDA2.0's), a
-    block at a time as the release does (`masked_recipe`).
+    response, or, where its family declares its release's walk (LLaDA2.0's
+    blocks, Dream's grid), as the release does (`masked_walk`), which its task
+    and an objective over it (`MaskedDiffusionObjective`) take alike.
     """
 
     model: CausalTransformer
@@ -797,19 +812,12 @@ class PretrainedMaskedDecoder(Pretrained):
             return None
         return family.masked_walk(self.config, self.generation_config, self.code)
 
-    @property
-    def masked_recipe(self) -> tuple[Unmask | Confident, int, int | None] | None:
-        """The release's own walk's solver, steps and block (`masked_walk`), or None. Its task
-        (`text_generation`) and an objective over it (`MaskedDiffusionObjective`) take it alike."""
-        walk = self.masked_walk
-        return None if walk is None else (walk.solver, walk.steps, walk.block)
-
     def pipeline(self):
         return self.packed().text_generation()
 
     def text_generation(self) -> MaskedGeneration:
         """Build the masked generation task this source describes, walking as its release does where
-        its family declares the walk (`masked_recipe`), else refining a whole response with Dew's MDLM
+        its family declares the walk (`masked_walk`), else refining a whole response with Dew's MDLM
         sampler (`Unmask`), not its family's own recipe.
         """
         from dew.diffusion.discrete import MDLM
@@ -823,14 +831,14 @@ class PretrainedMaskedDecoder(Pretrained):
         # without it refuses as MDLM cannot honour them.
         audit_masked(config, generation, () if walk is None else walk.reads, mask_id)
         walked = {} if walk is None else {"solver": walk.solver, "steps": walk.steps, "block": walk.block}
-        return MaskedGeneration(self.model, self.variables,
+        return self.formed(MaskedGeneration(self.model, self.variables,
                                 MDLM(mask_id=mask_id, endpoint=None if walk is None else walk.endpoint)(),
                                 self.text_processor, **walked,
                                 eos_token_ids=self.eos_token_ids,
                                 pad_token_id=pad_id(config, generation),
                                 max_new_tokens=generation_limit(config, generation, "max_new_tokens"),
                                 max_length=generation_limit(config, generation, "max_length"),
-                                n=return_sequences(config, generation))
+                                n=return_sequences(config, generation)))
 
 
 @dataclass(frozen=True)
@@ -850,7 +858,7 @@ class PretrainedBlockDecoder(Pretrained):
         """Build the DiffusionGemma canvas task, with the source's sampler config as its default."""
         from dew.interop import diffusion_gemma
 
-        return BlockGeneration(
+        return self.formed(BlockGeneration(
             self.model,
             self.variables,
             diffusion_gemma.generation_process(self.config, self.generation_config),
@@ -860,7 +868,7 @@ class PretrainedBlockDecoder(Pretrained):
             max_new_tokens=generation_limit(self.config, self.generation_config, "max_new_tokens"),
             max_length=generation_limit(self.config, self.generation_config, "max_length"),
             n=return_sequences(self.config, self.generation_config),
-        )
+        ))
 
 
 
@@ -889,9 +897,10 @@ class PretrainedPipeline(Pretrained):
         A video source's task (Wan's) samples clips of shape
         `[N, frames, height, width, 3]`.
         """
-        return TextToImage(self.model, self.process, self.inputs, self.variables, self.autoencoder,
-                           grid=self.task.grid, final_denoise=False, solver=self.schedule.solver,
-                           steps=self.task.steps, guidance=self.task.guidance, finish=self.finish)
+        return self.formed(TextToImage(
+            self.model, self.process, self.inputs, self.variables, self.autoencoder, grid=self.task.grid,
+            final_denoise=False, solver=self.schedule.solver, steps=self.task.steps,
+            guidance=self.task.guidance, finish=self.finish))
 
     @property
     def _adaptable(self) -> Mapping[str, WeightLayout]:
@@ -952,7 +961,7 @@ def _text_generation(loaded: Pretrained, sampling: Sampling | None) -> TextGener
     rows = return_sequences(loaded.config, loaded.generation_config)
     policy, logits, strategy = source_decoding(loaded.config, loaded.generation_config, loaded.model, rows,
                                                sampling)
-    return TextGeneration(
+    return loaded.formed(TextGeneration(
         loaded.model,
         loaded.variables,
         loaded.text_processor,
@@ -962,7 +971,7 @@ def _text_generation(loaded: Pretrained, sampling: Sampling | None) -> TextGener
         n=rows,
         logits=logits,
         strategy=strategy,
-    )
+    ))
 
 
 def _no_language_model(name: str, kind: str) -> NoReturn:
@@ -1689,10 +1698,19 @@ def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, unread.S
 
 
 def _extended[Loaded: Pretrained](loaded: Loaded, dex: DifferentialExtension | None,
-                                   placed: Callable[[Variables], Variables]) -> Loaded:
+                                   placed: Callable[[Variables], Variables], scan: bool = False) -> Loaded:
     """`loaded` with DEX attached where a load names it (`Pretrained.with_dex`), drawn from key 0, its
-    parameters placed as the load places the source's (`placed`), before the load's residency."""
-    return loaded if dex is None else loaded.with_dex(dex, key=0).map_variables(placed)
+    parameters placed as the load places the source's (`placed`), before the load's residency; and its
+    decoder, or a wrapper's language model, scanning its runs where `scan` says (`Scanning`), a field of
+    how the model runs, its stored tree unchanged, as its stack reads the layers through its view."""
+    from dew.nn.protocols import Scanning
+
+    extended = loaded if dex is None else loaded.with_dex(dex, key=0).map_variables(placed)
+    if not scan:
+        return extended
+    if not isinstance(extended.model, Scanning):
+        raise TypeError(f"scan_layers scans a decoder's layers; a {type(extended.model).__name__} has none")
+    return replace(extended, model=extended.model.with_scanned_layers())
 
 
 def _within(name: str, layers: frozenset[int]) -> bool:
@@ -1728,6 +1746,25 @@ def _selected_payload(fallback: str | None, **files: str | None) -> list[str]:
                          "load it without fallback")
     return selected
 
+
+
+def _load_settings(precision: Numerics | str | None, dtype: DTypeLike,
+                   param_dtype: DTypeLike | Literal["auto"], prediction_depths: int | None
+                   ) -> tuple[Numerics | None, DtypeName, DtypeName | Literal["auto"]]:
+    """A load's numerics, where `precision` names them, and the compute and storage dtypes it loads in,
+    by name: the numerics' dtypes, which another dtype stated beside them would contradict, else the
+    ones stated (`Pretrained.load`); `prediction_depths` is refused where it is no count of depths."""
+    if prediction_depths is not None and (isinstance(prediction_depths, bool) or prediction_depths < 0):
+        raise ValueError(f"prediction_depths keeps the first that many depths, 0 or more, not "
+                         f"{prediction_depths!r}")
+    numerics = None if precision is None else numerics_of(precision)
+    stated = (dtype_name(dtype), AUTO if param_dtype == AUTO else dtype_name(param_dtype))
+    if numerics is None:
+        return None, *stated
+    if stated != ("bfloat16", "float32"):
+        raise ValueError("precision sets a load's dtype and param_dtype; pass the numerics or the dtypes, "
+                         "not both")
+    return numerics, dtype_name(numerics.dtypes.compute), dtype_name(numerics.dtypes.params)
 
 
 def _source_metadata(requested: sources.SourceReference, selected: list, fallback: str | None,

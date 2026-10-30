@@ -5,14 +5,16 @@ makes new ones; one that only regroups (a cast between a warpgroup array and its
 bitcast, an element taken from or put into a vector or struct, an MMA accumulating in place) names its
 operands' own. Split into fragment registers (float data) and scalar ones (integers, addresses).
 
-The compile gate compares this pass with the family rules and ptxas. This module never compiles a kernel
-or chooses a live run's configuration. Its estimate describes the lowered program; the compiler's
-allocation and scheduling constraints are checked separately."""
+The compile gate compares this pass with the family rules and ptxas. A derivation can inspect a candidate
+with `prepare` and keep its native JAX export, so the chosen kernel lowers once, not again in the program
+that calls it. The estimate describes the lowered program; the compiler's allocation and scheduling
+constraints are checked separately."""
 import collections
 import dataclasses
 import math
 import re
 
+import jax
 from jax._src.interpreters import mlir as jax_mlir
 from jax.extend.mlir import ir
 from jaxlib.mlir import passmanager
@@ -20,15 +22,27 @@ from jaxlib.mlir.dialects import gpu, llvm
 from jaxlib.mosaic.python import mosaic_gpu as mosaic_gpu_dialect
 
 from dew.nn.kernels.generation import GpuTarget
-from dew.nn.kernels.templates import cost, resources
+from dew.nn.kernels.templates import resources
 
 
 @dataclasses.dataclass(frozen=True)
 class Compiler:
-    """The assembler whose scheduling the estimate describes. Relocatable assembly ignores register
-    raises; CUDA 13 streams transcendental chains that CUDA 12 keeps as vectors."""
-    version: tuple[int, int]
-    relocatable: bool
+    """The assembler whose scheduling the estimate describes: CUDA 13 streams transcendental chains
+    that CUDA 12 keeps as vectors. A compile gate knows its assembler's version; a native launch reads
+    the selected Mosaic compilation provider's supported PTX ISA, not a package's installed version."""
+    version: tuple[int, int] | None = None
+    ptx_isa: int | None = None
+
+    @classmethod
+    def selected(cls) -> "Compiler":
+        from jax._src.lib import mosaic_gpu
+
+        return cls(ptx_isa=mosaic_gpu._mosaic_gpu_ext._get_ptxas_isa_version())
+
+    @property
+    def streams_transcendentals(self) -> bool:
+        # PTX 9.0 starts with CUDA 13.0; this is the selected assembler's capability, not the GPU's.
+        return self.version >= (13, 0) if self.version is not None else (self.ptx_isa or 0) >= 90
 
 
 FREE = {"arith.constant", "llvm.mlir.constant", "llvm.mlir.undef", "llvm.mlir.poison", "llvm.mlir.zero",
@@ -309,7 +323,7 @@ class _Pass:
                                                               str(op.results[0].type))):
             # Only a pure one-result float assembly is an elementwise math op (ex2.approx, rcp.approx).
             return False
-        if self.compiler is not None and self.compiler.version < (13, 0):
+        if self.compiler is not None and not self.compiler.streams_transcendentals:
             assembly = (ir.StringAttr(op.attributes["asm_string"]).value
                         if "asm_string" in op.attributes else "")
             if name.startswith(("math.exp", "math.tanh")) or re.search(r"\b(ex2|tanh)\.", assembly):
@@ -646,22 +660,23 @@ class LoweredRegisters:
     raised: int
     where: str
 
-    def model(self, target: GpuTarget, compiler: Compiler, *, shared: int, tmem: int
-              ) -> resources.RegisterModel:
-        """Its launch budget and residency, from this launch's geometry and resource allocations."""
-        groups = self.threads // resources.THREADS
-        consumers = groups - bool(self.producer)
-        entry = resources.entry_registers(groups)
-        budget = self.raised if self.raised and not compiler.relocatable else entry
-        most = cost.resident(target, shared, self.threads, entry, tmem=tmem)
-        producer = (self.producer if not compiler.relocatable else budget) if self.producer else 0
-        return resources.RegisterModel(self.registers, budget, consumers, most, cost.REGISTER_STEP,
-                                       producer, shared)
+    def model(self, stated: resources.RegisterModel, target: GpuTarget, *, shared: int,
+              tmem: int) -> resources.RegisterModel:
+        """Apply the launch's family rules to its observed geometry and estimated live registers."""
+        family = stated.family
+        if family is None:
+            raise ValueError("lowered register evidence needs the launch's declared family")
+        producers = family.warpgroups(stated.consumers) - stated.consumers
+        consumers = self.threads // resources.THREADS - producers
+        if consumers < 1:
+            raise ValueError("the launch geometry does not hold its family's consumer roles")
+        return resources.register_model(family, consumers, self.registers, shared=shared, target=target,
+                                        tmem=tmem)
 
 
 def lowered_registers(module: bytes, compiler: Compiler) -> list[LoweredRegisters]:
     """Analyze the module an existing Mosaic custom call carries, without tracing or compiling it again.
-    The compiler version and assembly mode are inputs, never read from a process-global installation."""
+    The compiler version is an input, never read from a process-global installation."""
     found = []
     for name, peak, _ in kernel_peaks(module, compiler):
         if peak.threads is None:
@@ -671,3 +686,19 @@ def lowered_registers(module: bytes, compiler: Compiler) -> list[LoweredRegister
         found.append(LoweredRegisters(name, peak.total, peak.fragments, peak.scalars, peak.threads,
                                        peak.producer, peak.raised, peak.where))
     return found
+
+
+def prepare(kernel, *specs: jax.ShapeDtypeStruct, compiler: Compiler
+            ) -> tuple[jax.export.Exported, tuple[LoweredRegisters, ...]]:
+    """Lower a shape-only native candidate once, returning its reusable export and each launch's live set.
+    The caller keeps `exported.call` for the selected candidate; no executable is compiled here. A caller
+    caching that call still checks its invocation's mesh (`mosaic.checked`)."""
+    from dew.training._lowering import kernel_calls_in
+
+    exported = jax.export.export(jax.jit(kernel), platforms=('cuda',))(*specs)
+    with jax_mlir.make_ir_context():
+        module = exported.mlir_module(serialized=False)
+        calls = kernel_calls_in(module)
+    registers = tuple(launch for call in calls if call.kind == 'mosaic_gpu'
+                      for launch in lowered_registers(call.ir, compiler))
+    return exported, registers

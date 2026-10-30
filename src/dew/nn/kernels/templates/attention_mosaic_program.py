@@ -7,6 +7,7 @@ and each tile's coordinates (`_Program`, `_Spans`, `_coords`), its hooks' parame
 import dataclasses
 import functools
 import math
+from collections.abc import Callable
 from typing import NamedTuple
 
 import jax
@@ -79,8 +80,10 @@ class Tiles:
     two warpgroups take turns on the tensor cores, one's softmax under the other's products) and the
     instruction family whose bundle runs it (`family`, `bundle`). A fold's call rewalks a row past its reach
     in the natural form at its own key tile and consumers (`relaunch_k`, `relaunch_consumers`; the config's
-    where None, `relaunch`), which divide the config's so its padded blocks hold; `natural_form` marks the
-    natural form's tiles, whose register model differs (`MosaicForward.registers`)."""
+    where None, `relaunch`), which divide the config's so its padded blocks hold, and the value columns each
+    of its launches walks (`relaunch_columns`, a launch a block of them; all of them where None);
+    `natural_form` marks the natural form's tiles, whose register model differs (`MosaicForward.registers`),
+    and `columns` the value columns a launch at them walks."""
 
     block_q: int
     block_k: int
@@ -89,7 +92,9 @@ class Tiles:
     family: str = mosaic_sm90.WGMMA.name
     relaunch_k: int | None = None
     relaunch_consumers: int | None = None
+    relaunch_columns: int | None = None
     natural_form: bool = False
+    columns: int | None = None
 
     def __post_init__(self):
         if self.stages < 2:
@@ -100,7 +105,8 @@ class Tiles:
         """The natural form's rewalk's tiles (`algebra.walked_launches`)."""
         return dataclasses.replace(self, block_k=self.relaunch_k or self.block_k,
                                    consumers=self.relaunch_consumers or self.consumers, relaunch_k=None,
-                                   relaunch_consumers=None, natural_form=True)
+                                   relaunch_consumers=None, relaunch_columns=None, natural_form=True,
+                                   columns=self.relaunch_columns)
 
 
 @dataclasses.dataclass(frozen=True, order=True)
@@ -126,6 +132,10 @@ class BackwardTiles:
     """Whether the keys-first dK/dV launch stages its logits' queries (the call's taken by its power) a
     step from the call's own in its consumers' shared memory, where a stream of them beside the call's
     passes the block (width 256's)."""
+    shared_keys: bool = False
+    """Whether the fused launch's consumers share one key block (`attention_mosaic_coop._coop_launch`):
+    each forms the logits of its share of the keys and holds its share of the head's columns of dK, dV and
+    dQ, where a consumer's own keys' whole dK and dV sums pass its registers (width 256's)."""
 
     @property
     def dkv(self) -> "BackwardTiles":
@@ -181,7 +191,7 @@ def _parts(accurate: bool, dtype) -> int:
 
 DROPPING = Refusal('dropout_places',
                   "the Mosaic mainloop draws dropout at its own places; a sequence exchange slice draws at "
-                  "its global places, a table gather a tile (`DropPlaces`)", row='1521')
+                  "its global places, a table gather a tile (`DropPlaces`)")
 """Why this mainloop refuses a dropping call that draws at a slice's global places (`refused`)."""
 
 
@@ -219,8 +229,7 @@ def refused(dtype, width: int, value_width: int, hooks: Hooks | None, *, backwar
     if hooks.drop is not None and jnp.dtype(dtype) == jnp.dtype(jnp.float16):
         # fp16's dropped weights take scaled parts (`algebra.weights_parts`), which the mainloop's register
         # products do not take back (`mosaic.unscaled_part`).
-        return Refusal('dropout_dtype', "the Mosaic dropping walk takes bf16 operands, not float16",
-                       row='1521')
+        return Refusal('dropout_dtype', "the Mosaic dropping walk takes bf16 operands, not float16")
     if backward and jnp.dtype(dtype) != jnp.dtype(jnp.bfloat16):
         return Refusal('dtype', f"the Mosaic backward takes bf16 operands, not {jnp.dtype(dtype)}")
     if jnp.dtype(dtype) not in sixteen:
@@ -603,6 +612,18 @@ class _Program[T: (Tiles, BackwardTiles)]:
             return inside & (doc != 0) & (doc == spans.query_doc[row, index])
 
         return spans.q_lo[row, block], spans.q_hi[row, block], seen_whole
+
+    def segmented(self, step: Callable, run: tuple[jax.Array, jax.Array] | None, lo, hi) -> tuple:
+        """A key block's walk of query tiles `[lo, hi)` as `Family.walk`'s segments, `step` each: where its
+        whole tiles run unbroken (`run`, `whole_run`), those one segment of their own, unmasked, and the
+        tiles around them masked, so no step chooses at run time, whose two branches' registers join
+        (FlashAttention 3's masked and unmasked iterations); else one segment choosing a tile at a time."""
+        if run is None:
+            return ((step, lo, hi),)
+        start, end = (jnp.clip(bound, lo, hi) for bound in run)
+        return ((functools.partial(step, masked=True), lo, start),
+                (functools.partial(step, masked=False), start, end),
+                (functools.partial(step, masked=True), end, hi))
 
     def whole_run(self, k_first, q_steps: int, spans: _Spans | None) -> tuple[jax.Array, jax.Array] | None:
         """The query tiles `[a, b)` that see the key block from `k_first` whole (`readers`' `whole`), one run

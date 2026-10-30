@@ -2328,11 +2328,11 @@ class Averaged:
 
 def averaged(runs: Sequence[str | os.PathLike[str]], *, step: int | str | None = None,
              ema: bool | None = None, mesh=None, layout=None, trust: Sequence[str] = ()) -> Averaged:
-    """The fp32 mean of `runs`' effective weights, each run's at `step` (its latest where None, pinned
-    as `SavedRun.pinned` pins it, with `trust`) and `ema` as its loaders read them (`averaged_pinned`)."""
+    """The fp32 mean of `runs`' effective weights, each run's at `step`, its latest where None
+    (`SavedRun.at`, with `trust`), and `ema` as its loaders read them (`averaged_pinned`)."""
     from dew.inference.tasks import SavedRun
 
-    return averaged_pinned([SavedRun.pinned(str(epath.Path(run)), step, trust) for run in runs], ema=ema,
+    return averaged_pinned([SavedRun.at(str(epath.Path(run)), step, trust) for run in runs], ema=ema,
                            mesh=mesh, layout=layout)
 
 

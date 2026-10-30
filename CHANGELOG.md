@@ -5,6 +5,24 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- A run's numerics are named where they are set: `--trainer.precision accurate` (or a Lightning dtype
+  preset, "bf16-true", or a `Numerics` record's JSON), `"precision": "accurate"` in a run.json, and
+  `Pretrained.load(precision=...)` and `dew.pipeline(source, precision=...)`, which load in their dtypes
+  and serve under their precision and forms. The attention template's form is the run's numerics' alone
+  (`run_precision`); `generation.chosen(attention_form=...)` is gone.
+- A token layout is one `dew.batch.Coordinates` past a model's `__call__`: `hidden_states`, `logits`,
+  `states_and_logits`, the prediction depths' methods, `draft` and `DiffusionGemma.encode` take
+  `coordinates=` (`dew.batch.coordinates(shape, segments=..., valid=..., positions=...)`) where they
+  took `segment_ids`, `attention_mask` and `positions`; `__call__` still takes the flat fields and
+  converts them once. `ModelInputs.from_value` and `ModelInputs.kwargs` lay a request's flat fields out
+  as its `coordinates`, `LMObjective.token_scores` takes `coordinates=`, and a field dict carrying both
+  a `Coordinates` and a flat layout field is refused where it is read.
+- A run's progress (`dew.nn.progress.Progress`, the updates committed before a step) is a declared
+  input: a model whose computation changes over a run (`ReadsProgress`, a DEX decoder) takes it as its
+  call's `progress=` keyword and carries it to its layers in `AttentionMetadata.progress`, so a compiled
+  forward keys on it. A run's training loss passes it (`Objective.progress`); a call that passes none
+  reads the run's end. `dew.nn.progress.progress()` and `stepping` are gone, and an objective that
+  passes no progress (`Objective.passes_progress`) refuses a model that reads it.
 - One entry point and one path for scoring decisions: `decide(state, questions)` answers a request and
   `decide([(state, questions), ...], contexts=...)` many, their rows packed into the passes a scoring
   server runs and over its compiled programs. `Decide.batch` and `Decide.fits` are gone; call the task

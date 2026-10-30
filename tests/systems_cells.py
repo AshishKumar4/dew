@@ -1,9 +1,14 @@
-"""Rematerialization must be invisible to everything except memory use.
+"""Two of a run's systems on the GPU, cells of its flow (tests/test_gpu_systems.py), each run in fresh
+interpreters of its own:
 
-Same parameter tree, same forward values, same gradients: a difference in
-any of them would invalidate checkpoints or change what a run converges to.
+- Rematerialization is invisible to everything but memory use: a compilation counts the memory kept alive
+  outside its state, in a fresh 2 GiB allocator (`compilation_counts_memory_kept_alive_outside_its_state`).
+- The same program from two checkouts of Dew shares one compiled executable: a Pallas kernel's Triton
+  module carries its source locations, which the pinned JAX's cache key strips (docs/installation.md;
+  `two_checkouts_share_one_compiled_kernel`).
 """
 
+import json
 import os
 import shutil
 import subprocess
@@ -14,9 +19,40 @@ import jax
 import jax.numpy as jnp
 import pytest
 
+ROOT = Path(__file__).resolve().parents[1]
 
-@pytest.mark.gpu(reason="needs GPU allocator memory statistics")
-def test_compilation_counts_memory_kept_alive_outside_its_state(tmp_path):
+PROGRAM = """
+import json, sys
+import jax, jax.numpy as jnp
+from dew.cache import enable_compilation_cache
+from dew.nn.norms import rms_normalized
+from dew.telemetry.instrumentation import compilation_cache_counts, count_compilation_cache
+enable_compilation_cache(sys.argv[1])
+count_compilation_cache()
+x, scale = jnp.ones((4, 128, 1024), jnp.bfloat16), jnp.ones((1024,), jnp.float32)
+jax.jit(lambda x, scale: rms_normalized(x, scale, 1e-6, jnp.bfloat16, False, False, True,
+                                        implementation="pallas")).lower(x, scale).compile()
+print(json.dumps(compilation_cache_counts()))
+"""
+
+
+def two_checkouts_share_one_compiled_kernel(tmp_path):
+    """A second checkout (here the same tree under another path) finds the first's executable."""
+    other = tmp_path / "checkout" / "src"
+    other.mkdir(parents=True)
+    (other / "dew").symlink_to(ROOT / "src" / "dew", target_is_directory=True)
+    counts = []
+    for source in (ROOT / "src", other):
+        path = os.pathsep.join(filter(None, (str(source), os.environ.get("PYTHONPATH"))))
+        done = subprocess.run([sys.executable, "-c", PROGRAM, str(tmp_path / "cache")], capture_output=True,
+                              text=True, timeout=600, env={**os.environ, "PYTHONPATH": path})
+        assert done.returncode == 0, done.stderr[-3000:]
+        counts.append(json.loads(done.stdout.splitlines()[-1]))
+    assert counts[0]["train/cache_misses"] >= 1
+    assert counts[1]["train/cache_misses"] == 0 and counts[1]["train/cache_hits"] >= 1
+
+
+def compilation_counts_memory_kept_alive_outside_its_state(tmp_path):
     """A fresh 2 GiB allocator isolates the accounting regression from
     fragmentation left by earlier GPU tests. Its real held buffers force
     the compiler to fit the remaining memory, then the step runs there.
@@ -44,7 +80,7 @@ def test_compilation_counts_memory_kept_alive_outside_its_state(tmp_path):
                    "XLA_PYTHON_CLIENT_MEM_FRACTION": str(pool_mib / int(total)),
                    "XLA_PYTHON_CLIENT_PREALLOCATE": "true"}
     done = subprocess.run(
-        [sys.executable, "-c", "from test_remat import _resident_memory_step; _resident_memory_step()"],
+        [sys.executable, "-c", "from systems_cells import _resident_memory_step; _resident_memory_step()"],
         cwd=root, env=environment, capture_output=True, text=True, timeout=180)
     assert done.returncode == 0, done.stdout + done.stderr
 

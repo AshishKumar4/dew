@@ -15,8 +15,7 @@ from dew.mesh import SEQUENCE_AXIS, logical_spec
 from .attention import (
     AttentionImpl,
     attention_kernel,
-    cudnn_takes_mask,
-    kernel_for_materialized_mask,
+    mask_kernel,
     resolve_implementation,
     scaled_dot_product_attention,
 )
@@ -110,11 +109,10 @@ def _local_attention(query, key, value, *, window, chunk, places, segment_ids, m
     whole = functools.partial(
         scaled_dot_product_attention, query, key, value, dtype=dtype, precision=precision,
         force_fp32_for_softmax=force_fp32_for_softmax, sinks=sinks, softcap=softcap)
-    route = resolve_implementation(
+    resolved = resolve_implementation(
         implementation, query, key, dtype=dtype, precision=precision,
         force_fp32_for_softmax=force_fp32_for_softmax, softcap=softcap, sinks=sinks,
-        causal=True, sliding_window=window, segment_ids=segment_ids, max_segments=max_segments)
-    resolved = route.ran
+        causal=True, sliding_window=window, segment_ids=segment_ids, max_segments=max_segments).ran
     if resolved == 'template':
         # The template walks only the key tiles its spans reach, in memory linear in the sequence, so it
         # takes the whole call: the window, or each query's run of its chunk's keys (`chunk_runs`), with
@@ -123,20 +121,6 @@ def _local_attention(query, key, value, *, window, chunk, places, segment_ids, m
                 else chunk_runs(places, segment_ids, valid, query.shape[0], length, chunk))
         return whole(implementation=implementation, causal=True, sliding_window=window,
                      segment_ids=segment_ids, max_segments=max_segments, key_valid=valid, key_runs=runs)
-    # A mask built here is at most `[S, 2W]` per head, so cudnn takes it as
-    # its additive bias where cudnn runs (docs/performance.md: 16384 packed
-    # tokens at window 4096 in 0.60 GiB of temporaries on an L4, where xla
-    # asked for 10.0 GiB at 8192). Flash takes no mask, and the whole call's
-    # packed documents keep cuDNN off it (they reach it only as this mask), so
-    # where 'auto' chose either for the window, a masked call still goes to
-    # cudnn, unless the caller chose xla (`generation.chosen`).
-    banded = resolved == 'flash' or (resolved == 'xla' and route.forced is None)
-    on_cudnn = resolved == 'cudnn' or (implementation == 'auto' and banded
-                                       and cudnn_takes_mask(implementation, query, softcap=softcap,
-                                                            sinks=sinks is not None))
-    masked = 'cudnn' if on_cudnn else kernel_for_materialized_mask(
-        implementation, query, key, dtype=dtype, precision=precision,
-        force_fp32_for_softmax=force_fp32_for_softmax)
     if window is not None and valid is None:
         # An explicit 'tpu' at a length splash cannot tile would reach the
         # flash kernel, whose default 128-row blocks must divide the length
@@ -148,6 +132,13 @@ def _local_attention(query, key, value, *, window, chunk, places, segment_ids, m
         if on_splash or (packs and (windowed or length <= 2 * span)):
             return whole(implementation=implementation, causal=True, sliding_window=window,
                          segment_ids=segment_ids, max_segments=max_segments)
+    # Past the whole call, a mask built here is at most `[S, 2W]` per head, which cuDNN takes as its
+    # additive bias (`mask_kernel`'s `as_bias`): flash takes no mask, and the whole call's packed documents
+    # keep cuDNN off it, so the band goes to cuDNN where it takes the call, a kernel a run's context forces
+    # as forced.
+    masked = mask_kernel(implementation, query, key, as_bias=True, dtype=dtype, precision=precision,
+                         force_fp32_for_softmax=force_fp32_for_softmax, softcap=softcap,
+                         sinks=sinks is not None)
     shards = sequence_shards()
     # Under a sequence axis each shard's first block reads the previous
     # shard's last `span` rows, which only one neighbour holds when a shard's

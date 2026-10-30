@@ -23,6 +23,7 @@ import numpy as np
 import pytest
 from interop_support import extract_fixture, fixture_arrays, scaled_gap as relative_gap
 
+from dew.batch import coordinates
 from dew.diffusion.process import DenoisingCondition
 from dew.interop.diffusion import component_tensors, qwen_image_fields, qwen_image_path, read_transformer
 from dew.nn.backbones.qwen_image import QwenImageTransformer
@@ -119,8 +120,7 @@ def test_a_padded_row_is_its_own_prompt_alone(source, arrays, record):
     assert relative_gap(unmasked[1], nhwc(arrays["padded.output"], rows, columns)[1]) > 1e-3
 
 
-@pytest.mark.gpu(reason="needs a cuda device")
-def test_cudnn_attends_a_padded_batch_as_xla_does(without_deterministic_ops):
+def cudnn_attends_a_padded_batch_as_xla_does(without_deterministic_ops):
     """The fused kernel runs both of the block's attention calls over a
     padded prompt, forward and backward, and computes what xla computes.
 
@@ -264,7 +264,8 @@ def test_a_hidden_states_conditioner_reads_a_looped_tower_at_its_last_pass():
     mask = np.ones(ids.shape, bool)
     condition = conditioner.encode({"text_encoder": params}, {"input_ids": ids, "attention_mask": mask})
     positions = jnp.broadcast_to(jnp.arange(ids.shape[1]), ids.shape)
-    hidden = model.apply(params, ids, method="hidden_states", attention_mask=mask, positions=positions)
+    hidden = model.apply(params, ids, method="hidden_states",
+                         coordinates=coordinates(ids.shape, valid=mask, positions=positions))
     normed = model.apply(params, condition.context, method=lambda decoder, x: decoder.norm(x))
     np.testing.assert_array_equal(normed, hidden)
 

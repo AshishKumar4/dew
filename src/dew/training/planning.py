@@ -16,9 +16,9 @@ import json
 import logging
 import tempfile
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Hashable, Mapping, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -34,12 +34,16 @@ from dew.distributed.host import snapshot
 from dew.distributed.placement import Layout, MeshSpec, Placement, explicit_axes, placed_bytes
 from dew.mesh import LayoutRefused
 from dew.nn.kernels.options import compiler_options
+from dew.nn.kernels.templates import report
+from dew.nn.protocols import RematChoosing
 from dew.objectives.base import RECORD, Objective
 from dew.state import TrainState, apart, together
 from dew.telemetry.profile import active_profile, capture_options
+from dew.training.ahead import handed, program_of
 from dew.training.distributed import batch_divisor
 from dew.training.footprint import Footprint
 from dew.training.memory import (
+    climbed,
     compiled_if_it_fits,
     derived_headroom,
     head_fused_of,
@@ -48,6 +52,7 @@ from dew.training.memory import (
     recompute_more,
     recompute_record,
     remat_half,
+    remat_more,
     rung_record,
     step_fits,
     temporaries_factor,
@@ -129,12 +134,41 @@ class Candidate:
     kernels: KernelReport
     footprint: Footprint | None
     """Its derived device footprint; None for a custom step not differentiating the objective."""
+    sampled: Callable[[], jax.stages.Lowered] | None = None
+    """The same step summarizing what the run inspects at its commit, lowered on call
+    (`dew.training.inspection`); None in a run that inspects nothing."""
 
     @property
     def lowered(self) -> jax.stages.Lowered:
         """The program, which a plan's search and its guided compile read before it is released."""
         assert self.program is not None, "a plan's program is released once the plan is admitted"
         return self.program
+
+
+class Relowered:
+    """What a compile lowered afresh where a kernel spilled (`report.compiled`'s `relower`): each
+    candidate `lower` gives, the last the one the executable compiled from, its lowering and kernel
+    report the executable's."""
+
+    def __init__(self, lower: Callable[[], Candidate]):
+        self.lower, self.last = lower, None
+
+    def __call__(self) -> jax.stages.Lowered:
+        self.last = self.lower()
+        return self.last.lowered
+
+    def candidate(self, compiled: Candidate) -> Candidate:
+        """The candidate the executable compiled from: `compiled`, the one first lowered, where the
+        compile lowered none afresh."""
+        return compiled if self.last is None else self.last
+
+
+class SampledStep(NamedTuple):
+    """A step that also summarizes what the run inspects (`Candidate.sampled`): the program it compiled
+    from (`dew.training.ahead.program_of`) and its executable."""
+
+    program: str
+    executable: jax.stages.Compiled
 
 
 @jax.jit
@@ -292,6 +326,9 @@ class Planned:
     tile: tuple[int, int] | None
     fused: bool
     profiled: tuple[int, int] | None = None
+    sampled: SampledStep | None = None
+    """The step that also summarizes what the run inspects (`Candidate.sampled`), compiled under the
+    plan's options and admitted with it (`FitSearch.measured`); None in a run that inspects nothing."""
 
     def record(self) -> dict[str, JSON]:
         record: dict[str, JSON] = {"split": self.split, "rows": rows_of(self.candidate.micro), **self.rung}
@@ -304,23 +341,28 @@ class Planned:
         """The microbatch index of each of the step's `split` calls, on every device of `mesh`."""
         return [jax.device_put(np.int32(part), NamedSharding(mesh, P())) for part in range(self.split)]
 
-    def guided(self, profile: bytes, runs: int, mesh: Mesh) -> Planned:
+    def guided(self, profile: bytes, runs: int, mesh: Mesh, relower: Callable[[], Candidate]) -> Planned:
         """This plan with its program compiled again under the options its executable compiled under,
         guided by `profile` of `runs` runs (`Trials.profiled`) as JAX's jit guides AutoPGLE's (XLA's
         feedback-directed `fdo_profile`, which JAX shares across a pool's processes under AutoPGLE), and
         held to the fit check the plan passed: a schedule the profile guides may keep more alive at once,
-        and one that no longer fits is refused. An empty profile, of a backend XLA profiles none of, leaves
-        the executable as it is. The plan given up holds the executable it replaces, which goes with it
-        and its program (`released`)."""
+        and one that no longer fits is refused. It compiles through the kernel templates' reports
+        (`report.compiled`), the plan's step lowered afresh where a kernel spills (`relower`, `Relowered`).
+        An empty profile, of a backend XLA profiles none of, leaves the executable as it is. The plan
+        given up holds the executable it replaces, which goes with it and its program (`released`)."""
         if not profile:
             return dataclasses.replace(self, profiled=(runs, 0))
-        executable = self.candidate.lowered.compile({**(self.options or {}), "fdo_profile": profile})
-        fit, headroom = step_fits(executable, mesh, self.candidate.held)
+        relowered = Relowered(relower)
+        executable = report.compiled(self.candidate.lowered, {**(self.options or {}), "fdo_profile": profile},
+                                     relower=relowered)
+        candidate = relowered.candidate(self.candidate)
+        fit, headroom = step_fits(executable, mesh, candidate.held)
         if not fit:
             raise RuntimeError(f"the step guided by its profile (jax_enable_pgle) needs {-(headroom or 0)} "
                                "bytes more than its tightest device has, where unguided it fits; train it "
                                "without AutoPGLE")
-        return dataclasses.replace(self, executable=executable, profiled=(runs, len(profile)))
+        return dataclasses.replace(self, candidate=candidate, executable=executable,
+                                   profiled=(runs, len(profile)))
 
     def released(self) -> Planned:
         """This plan as the run keeps it once admitted: its executable without the program it was lowered
@@ -448,13 +490,28 @@ class Forecast:
         return min(guesses, default=None)
 
 
-def settled(planned: Planned, probes: Sequence[Probe], derived: Sequence[JSON] = ()) -> dict[str, JSON]:
-    """The admitted plan, its kernel report, every compile needed to find it and each rung the
-    derivation read before them (`FitSearch.derived`). There is no alternative-policy timing or
-    selection in the run's admission record."""
+def settled(planned: Planned, probes: Sequence[Probe], search: FitSearch) -> dict[str, JSON]:
+    """The admitted plan, its kernel report, every compile needed to find it, each rung the derivation
+    read before them (`FitSearch.derived`), and the kernels those compiles found spilling and the launch
+    configs refused where it searched (`FitSearch.kernels`), which the run's telemetry reports with it
+    (`StepCompiled`). There is no alternative-policy timing or selection in the run's admission record."""
     _log.info("the step's %s", planned.candidate.kernels.summary())
     return {**planned.record(), "kernels": planned.candidate.kernels.record(),
-            "probes": [probe.record() for probe in probes], "derived": list(derived)}
+            "probes": [probe.record() for probe in probes], "derived": list(search.derived), **search.kernels}
+
+
+def refusal_record(identity: str, config: Hashable, names: frozenset[str]) -> dict[str, JSON]:
+    """A launch config refused for its kernels' spills (`report.refused_launches`), the config by its
+    text."""
+    kernels: list[JSON] = [*sorted(names)]
+    return {"launch": identity, "config": repr(config), "kernels": kernels}
+
+
+def spill_record(miss: report.Miss) -> dict[str, JSON]:
+    """A kernel a compile found spilling (`report.Miss`), its launch's config by its text."""
+    return {"kernel": miss.kernel, "op": miss.op,
+            "config": None if miss.config is None else repr(miss.config), "registers": miss.registers,
+            "spilled": miss.spilled, "stepped": miss.stepped}
 
 
 @dataclasses.dataclass
@@ -496,9 +553,14 @@ class FitSearch[LossT, EffectsT]:
     chosen: jax.stages.CompilerOptions | None = None
     fitted: tuple[Candidate, jax.stages.Compiled, jax.stages.CompilerOptions | None] | None = None
     """The plan the search last found to fit: its candidate, executable and the options it compiled under."""
+    sampled: SampledStep | None = None
+    """The last measured candidate's sampled step (`measured`)."""
+    fitted_sampled: SampledStep | None = None
+    """The fitted plan's sampled step, which summarizes what the run inspects (`Candidate.sampled`)."""
     ahead: AheadOfTime | None = None
     """A step compiled ahead (`dew.training.ahead`), run in place of the search's first compile where it
-    is that program (`AheadOfTime.taken`)."""
+    is that program (`AheadOfTime.taken`), lowered as its own compile lowered it (`handed`: within its
+    refusals, for its GPU, `fits_here`)."""
     capacity: int | None = None
     """The bytes a device that states none holds (`step_headroom`): a compile-only GPU's, as a step
     compiled ahead for it states them (`AheadTarget.capacity`)."""
@@ -508,6 +570,10 @@ class FitSearch[LossT, EffectsT]:
     for a run that starts from a plan, recorded, compiled ahead or resumed, which the search tries first."""
     derived: list[dict[str, JSON]] = dataclasses.field(default_factory=list)
     """Each rung the derivation read before the first compile: its rung, terms, headroom and label."""
+    kernels: dict[str, JSON] = dataclasses.field(default_factory=dict)
+    """What the templates' reports found where the search compiled (`admitted`): each kernel its compiles
+    found spilling (`report.misses`, `spill_record`) and each launch config they refused
+    (`report.refused_launches`), none the registry held before it searched."""
 
     def __post_init__(self):
         self.factor = temporaries_factor(self.mesh, self.capacity)
@@ -525,8 +591,13 @@ class FitSearch[LossT, EffectsT]:
         alternate policy is compiled."""
         # A rung fits where its most microbatches do; the search then finds its split there.
         self.derived_start(candidates[-1])
+        seen, held = len(report.misses()), set(report.refused_launches())
         split = planned(candidates, first, self.fits, self.climb,
                         lambda split: self.forecast.likely(self.rung(), split))
+        spills: list[JSON] = [spill_record(miss) for miss in report.misses()[seen:]]
+        refused: list[JSON] = [refusal_record(*refusal) for refusal in report.refused_launches()
+                               if refusal not in held]
+        self.kernels = {"spills": spills, "refused": refused}
         if split is None or self.fitted is None:
             raise PlanRefused(self.probes) from (self.refusals[-1] if self.refusals else None)
         return self.found(split), tuple(self.probes)
@@ -537,15 +608,34 @@ class FitSearch[LossT, EffectsT]:
         compiles, so the search's first compile confirms it and a miss climbs on as a correction; the
         rungs read are `derived`. A rung the derivation cannot judge ('unknown': residuals over several
         devices, devices stating no memory) ends the walk where it started, at the base rung, as does a
-        ladder no rung of which fits; so does a run that sets its remat, which compiles at it alone.
-        The derivation names no XLA workspace, so a 'fits' is a first guess and the compile the
-        decision."""
-        if self.derive is None or self.resumed is not None or self.remat_set:
+        ladder no rung of which fits. A run that sets its remat compiles at it alone, told first where
+        the derivation fits a lighter rung (`advise`). The derivation names no XLA workspace, so a
+        'fits' is a first guess and the compile the decision."""
+        if self.derive is None or self.resumed is not None:
+            return
+        if self.remat_set:
+            self.advise(split)
             return
         base = (tuple(entry.module for entry in self.objective.program_key()), head_tile_of(self.objective),
                 head_fused_of(self.objective))
-        narrow = self.narrow
-        while True:
+        label, narrow = self.walked(split)
+        if label != "fits":
+            self.objective.substitute(list(base[0]))
+            self.objective.restore_head(base[1], fused=base[2])
+            narrow = self.narrow
+        elif self.remat_rung() != self.started:
+            _log.info("the derivation says the step fits from remat %s; compiling there first",
+                      self.remat_rung())
+        self.narrow = narrow
+
+    def walked(self, split: int, until: str | None = None) -> tuple[str, bool]:
+        """Climb the objective from its rung to the least-recompute one whose derived footprint at `split`
+        fits the devices, each rung read appended to `derived`: the label the walk ends on, and whether
+        the rung keeps the narrow copies. It ends where a rung fits, where the derivation cannot judge one,
+        where the ladder ends, and, with `until`, at that remat (`remat_rung`), which it does not read."""
+        assert self.derive is not None
+        narrow, label = self.narrow, "refuses"
+        while until is None or self.remat_rung() != until:
             candidate = self.derive(split, narrow)
             footprint = candidate.footprint
             headroom = None if footprint is None else derived_headroom(
@@ -562,14 +652,40 @@ class FitSearch[LossT, EffectsT]:
             narrow = False
             if not self.onward(lambda: recompute_more(self.objective, self.base)):
                 break
-        if label != "fits":
-            self.objective.substitute(list(base[0]))
-            self.objective.restore_head(base[1], fused=base[2])
-            narrow = self.narrow
-        elif self.remat_rung() != self.started:
-            _log.info("the derivation says the step fits from remat %s; compiling there first",
-                      self.remat_rung())
-        self.narrow = narrow
+        return label, narrow
+
+    def advise(self, split: int) -> None:
+        """Tell a run that sets its remat, before it compiles there alone (row 2111), the least-recompute
+        rung its derivation finds fits where that recomputes less (row 2536): each trained module that
+        chooses its remat (`RematChoosing`) is read from no remat up to the run's own, which the walk
+        never reads, and the run's own modules and head are put back. A run whose remat the ladder's climb
+        from none never reaches (a policy off `DECODER_REMAT`, or a rung the climb passes over) is told
+        nothing, and traces nothing for it: no rung below its own is known."""
+        entries = self.objective.program_key()
+        if not any(entry.trained and isinstance(entry.module, RematChoosing) for entry in entries):
+            return
+        held, own = [entry.module for entry in entries], self.remat_rung()
+        tile, fused = head_tile_of(self.objective), head_fused_of(self.objective)
+        lightest = [entry.module.with_remat(None) if entry.trained and isinstance(entry.module, RematChoosing)
+                    else entry.module for entry in entries]
+        label = found = None
+        try:
+            # The rungs the climb takes, read off the modules alone, which trace nothing.
+            self.objective.substitute(lightest)
+            climbed = [self.remat_rung()]
+            while remat_more(self.objective):
+                climbed.append(self.remat_rung())
+            if own in climbed:
+                self.objective.substitute(lightest)
+                label, _ = self.walked(split, until=own)
+                found = self.remat_rung()
+        finally:
+            self.objective.substitute(held)
+            self.objective.restore_head(tile, fused=fused)
+        if label == "fits" and found != own:
+            _log.warning("the run sets remat %s, and the derivation says the step fits from remat %s, which "
+                         "recomputes less: leave the remat unset and the run compiles there first", own,
+                         found)
 
     def current(self) -> dict[str, JSON]:
         return rung_record(self.objective, self.xla_defaults, narrow=self.narrow)
@@ -600,35 +716,65 @@ class FitSearch[LossT, EffectsT]:
         self.objective.substitute(held)
         return False
 
-    def measured(self, split: int, candidate: Candidate
-                 ) -> tuple[jax.stages.CompilerOptions | None, jax.stages.Compiled | None, Probe]:
+    def measured(self, split: int, candidate: Candidate) -> tuple[
+            jax.stages.CompilerOptions | None, Candidate, jax.stages.Compiled | None, Probe]:
         """`candidate`, the step at `split` at the objective's rung, compiled under the rung's options
         where it fits the devices, or for the search's first compile the step compiled ahead
-        (`ahead`), and the measure of its fit (`Probe`), the search's state else untouched."""
+        (`ahead`); the candidate its executable compiled from, lowered afresh where a kernel spilled
+        (`compiled_if_it_fits`, `Relowered`); and the measure of its fit (`Probe`), the search's state
+        else untouched. A run that inspects compiles the candidate's sampled step too
+        (`Candidate.sampled`), or takes the one compiled ahead with the step (`AheadOfTime.sampled`), which
+        must fit as the step must, so a rung fits only where both do; it is `sampled` until the next
+        measure."""
         options = self.required if self.xla_defaults else self.options(candidate)
-        taken = self.ahead is not None
+        taken, ahead = self.ahead is not None, self.ahead
         began = time.perf_counter()
-        if self.ahead is not None:
-            executable, self.ahead = self.ahead.taken(candidate.lowered), None
+        if ahead is not None:
+            executable, self.ahead = ahead.taken(candidate.lowered), None
         else:
-            executable = compiled_if_it_fits(candidate.lowered, options, self.refusals)
-        seconds = time.perf_counter() - began
+            relowered = Relowered(lambda: self.lower(split, self.narrow))
+            executable = compiled_if_it_fits(candidate.lowered, options, self.refusals, relower=relowered)
+            candidate = relowered.candidate(candidate)
         fit, headroom = step_fits(executable, self.mesh, candidate.held, self.capacity, candidate.built)
+        self.sampled = None
+        if fit and candidate.sampled is not None and ahead is not None and ahead.sampled is not None:
+            # The sampled step compiled ahead with the step, lowered as its compile lowered it (`handed`),
+            # which its target compiles none of.
+            with handed(ahead):
+                sampled = candidate.sampled()
+            self.sampled = SampledStep(ahead.sampled.program, ahead.sampled.taken(sampled, jax.devices()))
+        elif fit and candidate.sampled is not None:
+            lowered = [candidate.sampled()]
+
+            def resampled() -> jax.stages.Lowered:
+                """The sampled step lowered afresh, its launches derived past a spilled one's config."""
+                again = self.lower(split, self.narrow).sampled
+                assert again is not None
+                lowered.append(again())
+                return lowered[-1]
+            compiled = compiled_if_it_fits(lowered[0], options, self.refusals, relower=resampled)
+            self.sampled = None if compiled is None else SampledStep(program_of(lowered[-1]), compiled)
+            fit, headroom = step_fits(compiled, self.mesh, candidate.held, self.capacity, candidate.built)
+        seconds = time.perf_counter() - began
         probe = Probe.read(split, candidate, self.current(), fit, headroom, executable)
-        return options, executable, dataclasses.replace(probe, ahead=taken, compile_seconds=seconds)
+        probe = dataclasses.replace(probe, ahead=taken, compile_seconds=seconds)
+        return options, candidate, executable, probe
 
     def fits_here(self, split: int) -> bool:
         key = (split, self.rung())
         if key not in self.lowered:
-            self.lowered[key] = self.lower(split, self.narrow)
-        candidate = self.lowered[key]
-        self.chosen, executable, probe = self.measured(split, candidate)
+            # A step compiled ahead, its first compile, is lowered as its own compile lowered it (`handed`):
+            # within its refusals, for its GPU; every other compile within this process's, for this GPU.
+            with handed(self.ahead):
+                self.lowered[key] = self.lower(split, self.narrow)
+        self.chosen, candidate, executable, probe = self.measured(split, self.lowered[key])
+        self.lowered[key] = candidate
         fit, headroom = probe.fits, probe.headroom
         self.probes.append(probe)
         self.forecast.read(self.rung(), split, executable, headroom, self.factor)
         if fit:
             assert executable is not None
-            self.fitted = candidate, executable, self.chosen
+            self.fitted, self.fitted_sampled = (candidate, executable, self.chosen), self.sampled
             return True
         if self.resumed is not None:
             _log.warning("the step does not fit the devices at the rung its checkpoint trained on (%s); from "
@@ -642,7 +788,7 @@ class FitSearch[LossT, EffectsT]:
         own rung alone (row 2111), and planning it ahead at each policy, with each GPU's memory stated
         (`--trainer.compile-ahead.capacity-gib`), compiles the others offline."""
         remat = admitted.rung["remat"]
-        if remat is not None and json.dumps(remat, sort_keys=True) == self.started:
+        if self.remat_set and json.dumps(remat, sort_keys=True) == self.started:
             _log.info("the run sets remat %r and compiles at it alone; --trainer.compile-ahead with "
                       "--trainer.compile-ahead.capacity-gib plans it on its GPUs offline, at each remat "
                       "policy asked, to tell what else fits", remat)
@@ -660,10 +806,19 @@ class FitSearch[LossT, EffectsT]:
             return True
         self.xla_defaults = False
         self.lowered.clear()
-        return self.onward(lambda: recompute_more(self.objective, self.base))
+        return self.onward(self.compiled_again)
+
+    def compiled_again(self) -> bool:
+        """Climb the objective one rung, as `recompute_more` does, saying it compiles the step again
+        there."""
+        moved = climbed(self.objective, self.base)
+        if moved is not None:
+            _log.warning("the step does not fit the devices %s", moved)
+        return moved is not None
 
     def found(self, split: int) -> Planned:
         assert self.fitted is not None
         modules = tuple(entry.module for entry in self.objective.program_key())
         return Planned(split, *self.fitted, self.xla_defaults, self.narrow, self.current(), modules,
-                       head_tile_of(self.objective), head_fused_of(self.objective))
+                       head_tile_of(self.objective), head_fused_of(self.objective),
+                       sampled=self.fitted_sampled)

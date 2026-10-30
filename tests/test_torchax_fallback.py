@@ -501,9 +501,9 @@ def test_a_training_call_that_drops_attention_reads_each_documents_real_tokens(t
 
     @jax.jit
     def trained(ids, segments, valid):
-        logits = loaded.model.apply(loaded.variables, ids, train=True, segment_ids=segments,
-                                    attention_mask=valid, method="logits",
-                                    rngs={"dropout": jax.random.key(5)})
+        logits = loaded.model.apply(loaded.variables, ids, train=True,
+                                    coordinates=coordinates(ids.shape, segments=segments, valid=valid),
+                                    method="logits", rngs={"dropout": jax.random.key(5)})
         return {"logits": jnp.where(valid[..., None], logits, 0)}
 
     def ours(ids, segments, valid, _):
@@ -761,8 +761,7 @@ TORCHAX_SEEDS = 8
 `seeds_for` paired with the model on an A100."""
 
 
-@pytest.mark.gpu(reason="TF32 is a GPU's default float32 product")
-def test_a_float32_forwards_logits_and_its_output_tables_are_as_exact_as_torchs(tmp_path):
+def a_float32_forwards_logits_and_its_output_tables_are_as_exact_as_torchs(tmp_path):
     """On a GPU, a float32 torchax model's own logits and its output table's over the same
     states are each on par with torch's float32 forward from torch's in float64 over drawn token
     ids (check 1), under JAX's own default precision (the test lane sets 'highest' for every
@@ -862,7 +861,8 @@ def test_a_tier_3_models_final_states_and_head_are_transformers(case, tmp_path):
         keys = {"attention_key_positions": positions} if keyed else {}
         stated = ({"attention_key_runs": key_runs(slots, jnp.ones_like(slots), 3, causal=True)} if runs
                   else {"attention_pairwise_mask": visible})
-        hidden = loaded.model.apply(variables, tokens, positions=positions, method="hidden_states", **stated,
+        laid = coordinates(tokens.shape, positions=positions)
+        hidden = loaded.model.apply(variables, tokens, coordinates=laid, method="hidden_states", **stated,
                                     **keys)
         return hidden, loaded.model.apply(variables, hidden, method="logits_from_hidden")
 

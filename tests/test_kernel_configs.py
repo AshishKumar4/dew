@@ -253,7 +253,8 @@ def test_a_spilling_launch_is_refused_and_its_derivation_steps_down_once(exhaust
 
     with (report.refusals(), generation.assumed("sm90"),
           jax.sharding.use_abstract_mesh(generation.gpu_mesh(devices, "sm90"))):
-        report.compiled(lowered(), relower=lowered)
+        original = lowered()
+        report.compiled(original, relower=lowered)
         misses, refused = report.misses(), report.refused_launches()
     first = traced[0]
     if exhausted:
@@ -273,6 +274,14 @@ def test_a_spilling_launch_is_refused_and_its_derivation_steps_down_once(exhaust
         report.refuse(refused)
         lowered()
     assert traced[-1] == kept
+    # An already compiled artifact emits no new ptxas report. A fresh decision scope still steps past
+    # its observed spill, while an exhausted derivation retains the artifact without a false refusal.
+    with (report.refusals(), generation.assumed("sm90"),
+          jax.sharding.use_abstract_mesh(generation.gpu_mesh(devices, "sm90"))):
+        report.compiled(original, relower=lowered)
+        assert [(miss.config, miss.stepped) for miss in report.misses()[:1]] == [
+            (miss.config, miss.stepped) for miss in misses[:1]]
+        assert report.refused_launches() == refused
 
 
 GEMM_SHAPES = {"qwen3 gate": (4096, 2048, 768, 128), "mixtral up": (4096, 4096, 14336, 8),
@@ -661,7 +670,7 @@ def test_the_resource_gate_refuses_spills_and_invalid_allocations():
     for past in ({"shared": 4096}, {"tmem": 513}, {"spilled": 40}):
         assert mosaic_failures([{**record, "kernels": [{**within, **past}]}])
     overestimated = resources.RegisterModel(200, 168, 2, 1, 8, 168, shared=1024)
-    disagreement = {**record, "models": {"k": dataclasses.asdict(overestimated)},
+    disagreement = {**record, "models": {"k": overestimated.record()},
                     "kernels": [{**within, "need": 160}]}
     assert not mosaic_failures([disagreement])
     assert any(not row["agrees"] for row in disagreement["evidence"])

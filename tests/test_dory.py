@@ -156,19 +156,23 @@ def test_bf16_keys_rotate_and_normalize_where_vllm_rounds():
     assert_rounds_where_the_reference_does(keys, REFERENCE['keys_bf16'], REFERENCE['keys_f64'], 'bf16 keys')
 
 
+@pytest.mark.parametrize('loops', [None, 4])
 @pytest.mark.parametrize('mode', ['per_loop', 'last_loop'])
-def test_a_cached_greedy_continuation_reads_each_cache_as_vllm_keeps_it(mode):
+def test_a_cached_greedy_continuation_reads_each_cache_as_vllm_keeps_it(mode, loops):
     """Greedy decoding over the cache vLLM keeps: one entry a recurrent layer and pass
     ('per_loop'), or one a recurrent layer that each pass overwrites ('last_loop', a pass reading
-    its own keys for the step's tokens and the last pass's for the earlier ones). The tokens are
-    the reference's and each step's logits within the rule of its fp32 decode against float64.
+    its own keys for the step's tokens and the last pass's for the earlier ones), at the tiny's own
+    two loops and at four, whose later passes a step runs under one scan (`looping.run_loop`). The
+    tokens are the reference's and each step's logits within the rule of its fp32 decode against
+    float64.
     A per-pass cache is exact, the full forward's: the uncached logits of the whole continuation
     hold to the same rule at the positions each step decoded, and the cached steps to the rule of
     those uncached logits. A last-loop cache is the model's own approximation, held to the
     reference's decoding under it."""
     loaded = load()
-    model = with_cache(loaded.model, mode)
-    expected = REFERENCE[f'generated_{mode}']
+    model = with_cache(loaded.model if loops is None else loaded.model.with_passes(loops), mode)
+    tag = mode if loops is None else f'{mode}_{loops}'
+    expected = REFERENCE[f'generated_{tag}']
     prompt = jnp.asarray(expected[None, :6])
     variables = loaded.variables
     cache = model.apply(variables, 1, method=CausalTransformer.init_cache, mutable=['cache'])[1]['cache']
@@ -180,12 +184,74 @@ def test_a_cached_greedy_continuation_reads_each_cache_as_vllm_keeps_it(mode):
         steps.append(np.asarray(logits[0, -1]))
     steps = np.stack(steps)
     np.testing.assert_array_equal(steps.argmax(-1), expected[6:])
-    reference, truth = REFERENCE[f'step_logits_{mode}'], REFERENCE[f'step_logits_{mode}_f64']
-    assert_as_exact_as_the_reference(steps, reference, truth, f"Dory's {mode} decoding")
+    reference, truth = REFERENCE[f'step_logits_{tag}'], REFERENCE[f'step_logits_{tag}_f64']
+    assert_as_exact_as_the_reference(steps, reference, truth, f"Dory's {tag} decoding")
     if mode == 'per_loop':
         whole = np.asarray(model.apply(variables, jnp.asarray(expected[None, :-1])))[0, 5:]
         assert_as_exact_as_the_reference(whole, reference, truth, "Dory's forward over its continuation")
         assert_as_exact_as_the_reference(steps, whole, truth, "Dory's per-pass cache against its forward")
+
+
+@pytest.mark.parametrize('mode', ['per_loop', 'last_loop'])
+def test_a_cached_step_runs_its_later_passes_as_one_body(mode):
+    """A decode step runs its block's later passes as one scan over them (`looping.run_loop`, ledger
+    642): at four loops and at eight, one scan of three and seven passes with the same body; under the
+    last-loop cache, whose last pass keeps its writes, of two and six, the last after it. So a step's
+    program holds the first pass, one later pass and, under that cache, the last, whatever the count."""
+    loaded = load()
+    ids = jnp.asarray(REFERENCE['input_ids'][:, :1])
+
+    def program(loops):
+        model = with_cache(loaded.model.with_passes(loops), mode)
+        cache = model.init(jax.random.key(0), ids, decode=True)['cache']
+        graph = jax.make_jaxpr(lambda variables, cache: model.apply(
+            {**variables, 'cache': cache}, ids, decode=True, mutable=['cache']))(loaded.variables, cache)
+        (scan,) = (equation for equation in graph.jaxpr.eqns if equation.primitive.name == 'scan')
+        body = sorted(str(equation.primitive) for equation in scan.params['jaxpr'].eqns)
+        return scan.params['length'], body
+
+    (four, body), (eight, deep) = program(4), program(8)
+    kept = mode == 'last_loop'
+    assert (four, eight) == (3 - kept, 7 - kept) and body == deep
+
+
+@pytest.mark.parametrize('mode, loops', [('per_loop', 4), ('last_loop', 4)])
+def test_what_each_scanned_pass_sows_extends_what_the_passes_before_it_sowed(mode, loops):
+    """A forward at one loop more than `loops` sows in its looped layers (its attention's logits, `qk`,
+    and every module's output, captured intermediates) what one at `loops` does and its last pass's
+    beside it: the scan over the later passes keeps each pass's sows apart where the cache does, and
+    extends the block's own otherwise, pass by pass (ledger 642). Under the per-pass cache each pass is
+    one program in both, so the sows are bit for bit; under the last-loop cache the last pass runs after
+    the scan, a program the two counts do not share, so each sow keeps its place and shape. The layers
+    after the block read the last pass's output, which differs."""
+    loaded = load()
+    ids = REFERENCE['input_ids']
+    _, end = loaded.model.loop.layers
+
+    def looped(path) -> bool:
+        layer = getattr(path[1], 'key', '')
+        return layer.startswith('layers_') and not end <= int(layer.split('_')[1]) < loaded.model.num_layers
+
+    def sown(loops):
+        model = with_cache(loaded.model.with_passes(loops), mode)
+        _, state = model.apply(loaded.variables, ids, mutable=['qk', 'intermediates'],
+                               capture_intermediates=True)
+        flat, _ = jax.tree_util.tree_flatten_with_path(state, is_leaf=lambda node: isinstance(node, tuple))
+        return {path: entries for path, entries in flat if looped(path)}
+
+    four, five = sown(loops), sown(loops + 1)
+    longer = 0
+    for path, entries in four.items():
+        assert isinstance(five[path], tuple) and len(five[path]) >= len(entries), path
+        for kept, extended in zip(entries, five[path][:len(entries)], strict=True):
+            if mode == 'per_loop':
+                np.testing.assert_array_equal(np.asarray(kept), np.asarray(extended), err_msg=str(path))
+            else:
+                # The last-loop cache's passes run as programs that differ between the two counts (its
+                # last pass after the scan), so their values differ in their last bits: their places do not.
+                assert np.shape(kept) == np.shape(extended), path
+        longer += len(five[path]) > len(entries)
+    assert longer and set(four) <= set(five)
 
 
 @pytest.mark.parametrize('attention_impl', ['xla', 'reference'])
@@ -383,26 +449,52 @@ def test_a_float64_model_computes_in_float64():
 def test_a_cut_loop_trains_the_layers_before_it_through_the_input_every_pass_reads():
     """Cutting the loop before its last pass moves no forward value and no gradient past the
     loop, sends the layers before it a gradient through the input the last pass reinjects, and
-    drops the earlier passes' share of every gradient before the loop."""
+    drops the earlier passes' share of every gradient before the loop. The cut traces its passes apart
+    from the uncut loop's scan, so the two are held in float64, each within float64 rounding of the
+    other (`assert_computes_the_oracle`) where they compute the same."""
     loaded = load()
-    ids, cotangent = REFERENCE['input_ids'], REFERENCE['cotangent']
+    ids, cotangent = REFERENCE['input_ids'], REFERENCE['cotangent'].astype(np.float64)
 
     def run(backprop_steps):
-        model = loaded.model.with_passes(3, backprop_steps=backprop_steps)
+        model = loaded.model.with_passes(3, backprop_steps=backprop_steps).clone(dtype=jnp.float64)
+        variables = widened(loaded.variables)
 
         def loss(params):
-            return jnp.sum(model.apply({**loaded.variables, 'params': params}, ids) * cotangent)
+            return jnp.sum(model.apply({**variables, 'params': params}, ids) * cotangent)
 
-        return jax.value_and_grad(loss)(loaded.variables['params'])
+        stepped = jax.value_and_grad(loss)
+        return stepped(variables['params']), chain_roundings(jax.make_jaxpr(stepped)(variables['params']))
 
-    (whole, uncut), (cut, truncated) = run(None), run(1)
-    assert whole == cut
-    np.testing.assert_array_equal(truncated['layers_7']['self_attn']['down_proj']['kernel'],
-                                  uncut['layers_7']['self_attn']['down_proj']['kernel'])
+    with jax.enable_x64(new_val=True):
+        ((whole, uncut), roundings), ((cut, truncated), _) = run(None), run(1)
+    assert_computes_the_oracle(np.asarray(cut), np.asarray(whole), "the cut loop's loss", roundings=roundings)
+    assert_computes_the_oracle(np.asarray(truncated['layers_7']['self_attn']['down_proj']['kernel']),
+                               np.asarray(uncut['layers_7']['self_attn']['down_proj']['kernel']),
+                               'the gradient past the loop', roundings=roundings)
     assert np.any(truncated['embed_tokens']['embedding'])
     assert np.any(truncated['layers_1']['self_attn']['down_proj']['kernel'])
     assert not np.array_equal(truncated['layers_1']['self_attn']['down_proj']['kernel'],
                               uncut['layers_1']['self_attn']['down_proj']['kernel'])
+
+
+def test_a_cut_loops_backward_memory_falls_with_its_backprop_steps():
+    """The cut is static (`backprop_steps`): at six passes the gradient's compiled program keeps no
+    residual of a pass before the cut, so its temporary bytes fall as the passes it trains through do,
+    from every pass to three to the last alone."""
+    loaded = load()
+    ids, cotangent = REFERENCE['input_ids'], REFERENCE['cotangent']
+
+    def temporaries(backprop_steps):
+        model = loaded.model.with_passes(6, backprop_steps=backprop_steps)
+
+        def loss(params):
+            return jnp.sum(model.apply({**loaded.variables, 'params': params}, ids) * cotangent)
+
+        compiled = jax.jit(jax.grad(loss)).lower(loaded.variables['params']).compile()
+        return compiled.memory_analysis().temp_size_in_bytes
+
+    held = [temporaries(steps) for steps in (None, 3, 1)]
+    assert held[0] > held[1] > held[2], held
 
 
 PROJECTIONS = ('q_proj', 'k_proj', 'v_proj', 'o_proj', 'g_proj', 'gate_proj', 'up_proj', 'down_proj')

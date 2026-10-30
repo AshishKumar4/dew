@@ -90,7 +90,6 @@ from dew.data.pipeline import (
     Artifact,
     Batched,
     BatchStage,
-    Consumed,
     Expansion,
     Filter,
     FlatMap,
@@ -99,8 +98,10 @@ from dew.data.pipeline import (
     Map,
     MapBatch,
     MapWithIndex,
+    MarkConsumed,
     Mixture,
     Native,
+    Owed,
     Pack,
     Phases,
     Pipeline,
@@ -408,8 +409,8 @@ def _chained(
 
 def _consumes(pipeline: Pipeline) -> bool:
     """Whether `pipeline`'s rows carry the source examples they consume (`CONSUMED`): a run bounded in
-    examples marks each where its bound is (`Consumed`), so every row after it holds a count."""
-    return any(isinstance(stage, Map) and isinstance(stage.step, Consumed) for stage in pipeline.stages)
+    examples marks each where its bound is (`MarkConsumed`), so every row after it holds a count."""
+    return any(isinstance(stage, Map) and isinstance(stage.step, MarkConsumed) for stage in pipeline.stages)
 
 
 def _consumed_by(given: Record, step: Callable[[Record], tuple[Record, ...]]) -> tuple[Record, ...]:
@@ -524,19 +525,19 @@ def _consumed_forward(elements: Sequence[Record]) -> list[Record]:
     holds its markers apart from its rows (`_Grouped`) moves none to an earlier row: only a marker no row
     follows in the group keeps its count, which `_Ungrouped` hands on after the group's rows."""
     carried: list[Record] = []
-    owed: list[int] = []
+    markers: list[int] = []
+    owed = Owed()
     for element in elements:
         if isinstance(element, Rejected) and element.consumed:
-            owed.append(len(carried))
-        elif owed and isinstance(element, Mapping) and CONSUMED in element:
-            pending = 0
-            for at in owed:
+            markers.append(len(carried))
+            owed.owe(element.consumed)
+        elif markers and isinstance(element, Mapping) and CONSUMED in element:
+            # The markers' counts move to this row; none follows them in the group otherwise.
+            for at in markers:
                 marker = carried[at]
                 assert isinstance(marker, Rejected)
-                pending += marker.consumed
                 carried[at] = dataclasses.replace(marker, consumed=0)
-            element = {**element, CONSUMED: integer(element[CONSUMED], "a row's consumed examples") + pending}
-            owed = []
+            element, markers = owed.paid(element), []
         carried.append(element)
     return carried
 

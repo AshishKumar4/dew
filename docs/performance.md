@@ -264,8 +264,11 @@ and the SD VAE's decoder at their released sizes, with random weights;
 Qwen3-0.6B served at 32 and 128 slots; the warm compiles of a 16-slot server over Dory 1.0 4B as released,
 its construction's decode step and each admission width's prefill (each gated as a compile); causal attention forward and backward
 (cudnn and xla, 2048 tokens, 128-wide heads); the Oxford Flowers input pipeline;
-and the save and restore of lm-dense's training state, and each step's compile time (gated at a
-25% change: compile time is performance). Each tree keeps its programs in a compile cache of its own
+the save and restore of lm-dense's training state; a full AdamW fine-tune's step, a 4B
+decoder at Qwen3-4B's shape on an H100 and a 1.7B one at Qwen3-1.7B's on an A100 (1 x 2048 tokens, each
+row of either not measured on the other device); and each step's compile time (gated at a
+25% change: compile time is performance). Each step's MFU is a row of its own, read from the invocation
+that times it, higher the better. Each tree keeps its programs in a compile cache of its own
 for the run: its first round compiles cold, which the compile rows time, and its later rounds load,
 so the timed rounds cost no compile; the table ends with the two budgets apart. Each row runs in a
 process of its own, in the tree's own environment (its `locks/<build>.txt` for
@@ -281,7 +284,12 @@ compared. A row the base runs and the head runs in no round is broken, a row nei
 battery incomplete, and a row either tree measured in only some rounds, or as
 NaN, an infinity or zero, is partial and not judged on the rounds that ran; all
 three fail the gate, as a regression does. `report` writes the table and exits 1
-on any of them. The battery runs once for each release candidate on a Colab
+on any of them. `report --calibration <file>` takes each row's null noise, how far one tree's median
+moved against itself (`{"noise": {row: fraction}}`), as the least band the row is judged by; a row whose
+noise passes its floor is marked *insensitive*, since it cannot see a change of its floor's size, and a
+change past its noise still regresses it. `report --verdicts <file>` writes each row's state and numbers
+as JSON, and with `--anchors <file>` (`{"rows": {row: samples}}`, a run's samples kept as the row's anchor)
+each row's head judged against its anchor too, by the same rule. The battery runs once for each release candidate on a Colab
 A100, and as an A/B, base against head, for a deliberate change to a hot path
 (a kernel, the trainer's step, the input pipeline); a promotion to main does
 not run it. Each table is kept in
@@ -337,8 +345,9 @@ records its separately reset steady-window peak. JAX cannot reset its
 memory differently, so their peaks are not a device-wide free-memory measure.
 
 The battery includes this as a hardware-qualified row. Pass `--torch-python`
-to `perf_gate.py run` and `--claim` to require all hardware rows even under
-`--only`; `report --claim` also refuses missing required rows. On other
+to `perf_gate.py run` and `--claim` to require every reference row on its hardware even under
+`--only`; `report --claim` also refuses missing required rows. A fine-tune's rows are limited to their
+device too, but a claim does not require them. On other
 devices the row says **not measured on this hardware**, never passed. The
 reference row runs on the head tree only: a base that trails torch must not
 prevent a head that reaches parity from qualifying. A slower pair is
@@ -906,7 +915,16 @@ addresses.
 
 The alternative, waiting on the device every step, costs 45%. The same
 simple_dit loop with `block_until_ready` after each step runs at 10.3 ms
-against 7.1, so the trainer's loop does not wait between logging ticks.
+against 7.1, so the trainer's loop does not wait between logging ticks. Nor at them: a log's numbers are copied to the host as the
+loop takes the log, and a writer thread reads and reports them while the loop
+steps on, so a tracker or the display holds no step back (row 2313). On one
+H100 PCIe, a quarter-depth Dory 1.0 4B at 2 x 2048 under full remat ran
+1957.4, 1945.2 and 1941.7 ms a step logging every step, every 100 and never
+when the loop read each log itself, and 1910.0, 1940.1 and 1941.7 ms with the
+writer, the same job and GPU for both: logging every step cost 15.7 ms a step
+and now costs nothing past the run's noise. The two host reads a log adds,
+the allocator's peak (`peak_memory_gib`) and the compilation cache counts,
+take 4.0 and 2.7 us a call, now on the writer's thread.
 Running ahead does not raise the peak allocation (0.823 GiB at 27 steps
 ahead against 0.819 in lockstep, and 3.499 against 3.495 GiB for
 hierarchical_mmdit).
@@ -2394,8 +2412,8 @@ bf16 near-tie. Teacher-forced through the fp32 model, the two chosen tokens'
 logits are a median 0.64 bf16 spacings apart at their magnitude and at most
 2.78; 77% are under one spacing and 98% under two. The fp32 argmax is the
 xla prefill's choice in 31 rows and cuDNN's in 23.
-`tests/test_causal_transformer.py::test_a_padded_prefill_attends_through_cudnn_where_it_runs`
-checks the routing. The distances apply `tests/reference_error.py`'s
+`a_padded_prefill_attends_through_cudnn_where_it_runs` in `tests/test_causal_transformer.py`, a cell of
+`tests/test_gpu_models.py`, checks the routing. The distances apply `tests/reference_error.py`'s
 `distance` to the cache prefill and to `dew.pipeline(..., dtype="float32")`
 under `jax.default_matmul_precision("highest")` over the same tokens.
 

@@ -1,16 +1,17 @@
 """A backbone and a decision head, applied as two modules over one variables tree."""
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 
 import jax
 import jax.numpy as jnp
 
-from dew.batch import TOKEN_LAYOUT_FIELDS, Variables, part, prefix_sum, thaw
+from dew.batch import COORDINATES_FIELD, Variables, part, prefix_sum, thaw
 from dew.decision.head import Head
 from dew.decision.layout import DecisionInputs
 from dew.nn.cross_attention import ContextEncoder, encode_context
 from dew.nn.inputs import CONTEXT, ModelInputs
+from dew.nn.progress import END, Progress, ReadsProgress, progressed
 from dew.nn.protocols import TokenModel, VocabularyRows
 from dew.nn.scatter import gather_positions
 from dew.nn.visibility import block_ends, block_starts
@@ -33,6 +34,10 @@ class DecisionModel(HeadedModel):
     """How a row's context becomes the states its cross-attention reads (`encode_context`): `table`, its
     tokens through the backbone's own embedding table, or `backbone`, the backbone's final states over
     it in a pass of its own, as a schema read in context always is."""
+
+    def reads_progress(self) -> bool:
+        """Whether its backbone's computation changes over a run (`dew.nn.progress.ReadsProgress`)."""
+        return isinstance(self.backbone, ReadsProgress) and self.backbone.reads_progress()
 
     def initialize_head(self, key: jax.Array, backbone: Variables, tokens: jax.Array) -> Variables:
         """Draw the head over a held backbone, at `tokens`' shape, without running the backbone.
@@ -65,7 +70,8 @@ class DecisionModel(HeadedModel):
         return head.init(key, states, inputs, table)
 
     def states(self, variables: Variables, inputs: DecisionInputs, *, media: ModelInputs | None = None,
-               train: bool = False, rngs: dict[str, jax.Array] | None = None) -> jax.Array:
+               train: bool = False, rngs: dict[str, jax.Array] | None = None,
+               progress: Progress = END) -> jax.Array:
         """Return the backbone's `[B, L, features]` final states, each packed
         row read apart from the others in its window.
 
@@ -74,14 +80,23 @@ class DecisionModel(HeadedModel):
         context (`DecisionInputs.context`) hand the backbone's cross-attention
         each row's context, embedded by the backbone's own table (`stream_embeddings`),
         or, where the context holds the schema (`DecisionInputs.spans_in_context`),
-        the backbone's own final states over it (`encode_context`).
+        the backbone's own final states over it (`encode_context`). The backbone reads the run's
+        `progress` where it reads it (`dew.nn.progress`), the run's end by default.
         """
-        return self._read(variables, inputs, media=media, train=train, rngs=rngs)[0]
+        return self._read(variables, inputs, media=media, train=train, rngs=rngs, progress=progress)[0]
 
     def _read(self, variables: Variables, inputs: DecisionInputs, *, media: ModelInputs | None,
-              train: bool, rngs: dict[str, jax.Array] | None) -> tuple[jax.Array, jax.Array | None]:
-        """The row's final states (`states`), and the context's where the questions' spans are in it."""
+              train: bool, rngs: dict[str, jax.Array] | None, progress: Progress,
+              opened: Sequence[str] = ()) -> tuple[jax.Array, jax.Array | None, Variables]:
+        """The row's final states (`states`), the context's where the questions' spans are in it, and
+        what the row's pass sowed into the `opened` collections."""
         backbone = thaw(part(variables, "backbone"))
+        # The run's progress, the declared input of a backbone that reads it (`dew.nn.progress`).
+        stepped = progressed(self.backbone, progress)
+
+        def applied(*args, **kwargs) -> tuple[jax.Array, Variables]:
+            out = self.backbone.apply(backbone, *args, mutable=list(opened) or False, **kwargs)
+            return out if opened else (out, {})
         laid = inputs.coordinates()
         # A row in blocks is read by the backbone's attention whole within each block, on the kinds
         # that read blocks (`AttentionMetadata.block_groups`); a row in order passes none.
@@ -100,43 +115,67 @@ class DecisionModel(HeadedModel):
             conditioning = encode_context(
                 self.backbone, part(variables, "backbone"), inputs.context, inputs.context_lengths,
                 encoder="backbone" if inputs.spans_in_context else self.context_encoder, train=train,
-                rngs=rngs, segments=inputs.context_segments, max_segments=inputs.max_segments)
+                rngs=rngs, segments=inputs.context_segments, max_segments=inputs.max_segments,
+                progress=progress)
             spanned = conditioning[CONTEXT] if inputs.spans_in_context else None
         if media is not None:
-            if inputs.slots is not None:
-                raise ValueError("a row of option positions holds no images")
+            if inputs.slots is not None or inputs.streams is not None:
+                raise ValueError("a row of option positions, or of streams, holds no images")
             def read_media(module, rows, given):
                 # The images' own conditioning beside the context's, one mapping the backbone reads;
-                # the rows' layout is the decision's coordinates alone, the processor's flat fields
-                # left out (`token_coordinates`).
-                kwargs = {name: value for name, value in given.kwargs().items()
-                          if name not in TOKEN_LAYOUT_FIELDS}
+                # the rows' layout is the decision's coordinates alone, the processor's left out.
+                kwargs = {name: value for name, value in given.kwargs().items() if name != COORDINATES_FIELD}
                 if conditioning is not None:
                     held = kwargs.get("conditioning", {})
                     assert isinstance(held, Mapping)
                     kwargs["conditioning"] = {**held, **conditioning}
-                return module.hidden_states(rows.tokens, train=train, coordinates=laid, **kwargs, **blocked)
-            return _array(self.backbone.apply(backbone, inputs, media, rngs=rngs, method=read_media)), spanned
+                return module.hidden_states(rows.tokens, train=train, coordinates=laid, **kwargs, **blocked,
+                                            **stepped)
+            states, sown = applied(inputs, media, rngs=rngs, method=read_media)
+            return _array(states), spanned, sown
+        if inputs.streams is not None:
+            if blocked or inputs.slots is not None or inputs.reads is None:
+                raise ValueError("a row in streams reads as its layout's reads say, which blocks and "
+                                 "parallel options say otherwise")
+            # Each token reads the streams its record says, as runs over its document's (`stream_runs`).
+            runs = stream_runs(inputs.streams, inputs.segments, inputs.reads, inputs.fragments)
+            states, sown = applied(inputs.tokens, train=train, coordinates=laid, attention_key_runs=runs,
+                                   attention_key_positions=inputs.positions, method="hidden_states",
+                                   conditioning=conditioning, rngs=rngs, **stepped)
+            return _array(states), spanned, sown
         if inputs.slots is None:
             def read(module, tokens):
                 return module.hidden_states(tokens, train=train, coordinates=laid, conditioning=conditioning,
-                                            **blocked)
-            return _array(self.backbone.apply(backbone, inputs.tokens, rngs=rngs, method=read)), spanned
+                                            **blocked, **stepped)
+            states, sown = applied(inputs.tokens, rngs=rngs, method=read)
+            return _array(states), spanned, sown
         if blocked:
             raise ValueError("a row of option positions sets what each token reads, which blocks set too")
         # A token reads its own document's keys but another option's, as runs (`key_runs`): no [B, L, L] mask;
         # a causal backbone's runs end at each token.
         causal = isinstance(self.backbone, TokenModel) and self.backbone.causal
         runs = key_runs(inputs.slots, inputs.segments, inputs.options.shape[-1], causal=causal)
-        return _array(self.backbone.apply(backbone, inputs.tokens, train=train, coordinates=laid,
-                                          attention_key_runs=runs,
-                                          attention_key_positions=inputs.positions, method="hidden_states",
-                                          conditioning=conditioning, rngs=rngs)), spanned
+        states, sown = applied(inputs.tokens, train=train, coordinates=laid, attention_key_runs=runs,
+                               attention_key_positions=inputs.positions, method="hidden_states",
+                               conditioning=conditioning, rngs=rngs, **stepped)
+        return _array(states), spanned, sown
 
     def logits(self, variables: Variables, inputs: DecisionInputs, *, media: ModelInputs | None = None,
-               train: bool = False, rngs: dict[str, jax.Array] | None = None) -> jax.Array:
-        """Return the `[B, Q, K]` fp32 option logits, with -inf past each question's options."""
-        states, spanned = self._read(variables, inputs, media=media, train=train, rngs=rngs)
+               train: bool = False, rngs: dict[str, jax.Array] | None = None,
+               progress: Progress = END) -> jax.Array:
+        """Return the `[B, Q, K]` fp32 option logits, with -inf past each question's options, the
+        backbone at the run's `progress` (`states`)."""
+        return self.observed_logits(variables, inputs, media=media, train=train, rngs=rngs,
+                                    progress=progress)[0]
+
+    def observed_logits(self, variables: Variables, inputs: DecisionInputs, *,
+                        media: ModelInputs | None = None, train: bool = False,
+                        rngs: dict[str, jax.Array] | None = None, progress: Progress = END,
+                        opened: Sequence[str] = ()) -> tuple[jax.Array, Variables]:
+        """The option logits (`logits`), and what the row's pass sowed into the `opened` collections
+        (`dew.objectives.base.Step.sown`)."""
+        states, spanned, sown = self._read(variables, inputs, media=media, train=train, rngs=rngs,
+                                           progress=progress, opened=opened)
         head = thaw(part(variables, "head"))
         # The questions' spans are pooled from the pass that holds them: the context's, where it holds
         # them. A head that pools none reads a question in its context through the cross-attention alone.
@@ -157,7 +196,7 @@ class DecisionModel(HeadedModel):
             logits = _array(
                 self.head.apply(head, states, inputs, table, train=train, rngs=rngs) if spans is None
                 else self.head.apply(head, states, inputs, table, spanned=spans, train=train, rngs=rngs))
-        return jnp.where(inputs.options, logits, -jnp.inf)
+        return jnp.where(inputs.options, logits, -jnp.inf), sown
 
     def readout_logits(self, variables: Variables, states: jax.Array, inputs: DecisionInputs,
                        labels: tuple[tuple[int, ...], ...]) -> jax.Array:
@@ -212,6 +251,47 @@ def key_runs(slots: jax.Array, segments: jax.Array, options: int, *, causal: boo
     if causal:
         hi = jnp.minimum(hi, index[None, :, None] + 1)
     kept = read & (hi > lo)
+    return jnp.stack([jnp.where(kept, lo, 0), jnp.where(kept, hi, 0)], axis=-1).astype(jnp.int32)
+
+
+def stream_runs(streams: jax.Array, segments: jax.Array, reads: Sequence[Sequence[int]],
+                fragments: int) -> jax.Array:
+    """Each token's key runs `[B, L, fragments, 2]` where its row's tokens stand in streams
+    (`DecisionInputs.streams`, `[B, L]`, -1 on the padding), the visibility `_read` gives its backbone as
+    runs (`AttentionMetadata.key_runs`): a token reads the runs of its own document's `fragments` (each
+    a run of one stream, `fragment_count`) its stream reads by `reads` (`Reads.lowered`: per stream, how
+    it reads itself, then each stream; 1 whole, 2 up to the token, 0 none), padding (segment 0) its own
+    span alone. An unread run is `(0, 0)`."""
+    batch, length = streams.shape
+    index = jnp.arange(length, dtype=jnp.int32)
+    first = block_starts(segments)
+    # A run opens where its document does or its stream turns; each token's run is numbered in its
+    # document, and every run keyed by its document's first token.
+    turned = jnp.concatenate([jnp.ones((batch, 1), bool), streams[:, 1:] != streams[:, :-1]], axis=1)
+    count = prefix_sum(turned | (index[None, :] == first), dtype=jnp.int32)
+    fragment = count - jnp.take_along_axis(count, first, axis=1)
+    keyed = first * fragments + fragment
+
+    def tables(keys, stream_row):
+        slots = length * fragments
+        return (jax.ops.segment_min(index, keys, num_segments=slots),
+                jax.ops.segment_max(index + 1, keys, num_segments=slots),
+                jax.ops.segment_max(stream_row, keys, num_segments=slots))
+
+    lo, hi, kind = jax.vmap(tables)(keyed, streams)
+    own = (first[..., None] * fragments + jnp.arange(fragments)).reshape(batch, -1)
+    lo, hi, kind = (jnp.take_along_axis(table, own, axis=1).reshape(batch, length, fragments)
+                    for table in (lo, hi, kind))
+    # The padding reads itself whole and nothing else: a stream of its own past the layout's.
+    count_streams = len(reads)
+    padding = [1, *[0] * (count_streams + 1)]
+    table = jnp.asarray([*([own_how, *others, 0] for own_how, *others in reads), padding], jnp.int32)
+    reader = jnp.where(streams < 0, count_streams, streams)
+    read = jnp.where(kind < 0, count_streams, kind)
+    how = jnp.where(read == reader[..., None], table[reader, 0][..., None],
+                    table[reader[..., None], 1 + read])
+    hi = jnp.where(how == 2, jnp.minimum(hi, index[None, :, None] + 1), hi)
+    kept = (how > 0) & (hi > lo)
     return jnp.stack([jnp.where(kept, lo, 0), jnp.where(kept, hi, 0)], axis=-1).astype(jnp.int32)
 
 

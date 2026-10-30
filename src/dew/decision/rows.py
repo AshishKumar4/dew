@@ -192,6 +192,8 @@ def model_row(encoded: Encoded, width: int, context_length: int | None = None) -
         row["slots"] = np.asarray(encoded.slots, np.int32)
     if encoded.blocks is not None:
         row["blocks"] = np.asarray(encoded.blocks, np.int32)
+    if encoded.streams is not None:
+        row["streams"] = np.asarray(encoded.streams, np.int32)
     if context_length is not None:
         row["context"] = np.asarray(encoded.context or (), np.int32)
     return row
@@ -677,6 +679,7 @@ def packing(layout: Layout, bounds: Bounds, context_window: int | None = None, g
     (`model_row`) carries the model's fields alone."""
     parallel = isinstance(layout, QuestionLayout) and layout.parallel
     blocked = isinstance(layout, QuestionLayout) and layout.blocks
+    streamed = layout.attention is not None
     along = tuple((name, bounds.questions) for name in _along(layout, grouped, trained))
     if context_window is not None:
         along = (*along, ("context", context_window))
@@ -687,7 +690,7 @@ def packing(layout: Layout, bounds: Bounds, context_window: int | None = None, g
         # A unit of rows packs as one document, one entry a row on an axis of the window's rows.
         along = (*along, ("unit_rows", bounds.segments))
     fields = ("tokens", *(("positions", "slots") if parallel else ()), *(("blocks",) if blocked else ()),
-              *(("row",) if grouped else ()))
+              *(("streams",) if streamed else ()), *(("row",) if grouped else ()))
     return Pack(layout.max_len, fields, segments=bounds.segments, along=along)
 
 
@@ -807,6 +810,9 @@ class PackedRows(pygrain.MapTransform):
         if "blocks" in element:
             # Each row keeps its own blocks where the window packed it; the padding is in none.
             laid["blocks"] = np.where(segments > 0, np.asarray(element["blocks"]), -1).astype(np.int32)
+        if "streams" in element:
+            # Each row keeps its tokens' streams where the window packed it; the padding is in none.
+            laid["streams"] = np.where(segments > 0, np.asarray(element["streams"]), -1).astype(np.int32)
         if contexts is not None:
             laid["context"] = element["context"]
             laid["context_segments"] = contexts

@@ -35,8 +35,8 @@ from dew.decision.layout import (
     Instructions,
     Labels,
     Layout,
-    OptionLines,
     QuestionLayout,
+    Reads,
     RowOrder,
     RowSegment,
     Schema,
@@ -44,6 +44,7 @@ from dew.decision.layout import (
 )
 from dew.decision.model import DecisionModel
 from dew.decision.objective import DecisionObjective
+from dew.decision.renderer import Unit
 from dew.decision.scoring import default_metrics
 from dew.decision.task import Decide
 from dew.nn.backbones.decoder_block import remat_policy
@@ -140,6 +141,17 @@ class DecisionRunConfig(DecoderRunConfig):
     question row's text (`QuestionLayout.segments`): its instructions, option lines and answer cue
     beside the state, the question first or the state first, its blocks following that order
     (`QuestionLayout.blocks`). None keeps the layout's own, the release's turn."""
+    reads: Annotated[Reads, record_argument(Reads)] | None = None
+    """Which of the row's streams each reads (`Reads`), where its `segments` name a stream of the row's
+    own (`Schema(stream=...)`, `Instructions(stream=...)`): two streams in one pass, the state reading
+    the schema and the schema itself alone, are its table. None reads the row in order."""
+    parallel: bool | None = None
+    """Whether a question row reads its options in parallel, each at positions of its own after the
+    question (`QuestionLayout.parallel`), which a head that reads option slots needs. None keeps the
+    layout's own."""
+    unit: Unit | None = None
+    """How a question row's `segments` encode their text, piece by piece or whole
+    (`QuestionLayout.unit`). None keeps the layout's own, piece by piece."""
     order: RowOrder | None = None
     """The order a question row's own text writes its parts in (`QuestionLayout.order`): the state
     first, the question first, or the state, the question and the state again (`re_read`), each part as
@@ -193,8 +205,8 @@ class DecisionRunConfig(DecoderRunConfig):
         """Refuse each context option a run without context layers would read nothing of: a schema read
         as the row's context, its encoder, its frozen backbone and its block's form."""
         # A schema, or a question's instructions and options, read as the row's context.
-        in_context = any(isinstance(segment, (Schema, Instructions, OptionLines))
-                         and segment.stream == "context" for segment in self.segments or ())
+        in_context = any(isinstance(segment, (Schema, Instructions)) and segment.stream == "context"
+                         for segment in self.segments or ())
         if in_context and self.context_layers is None:
             raise ValueError("a row whose questions are read as its context is read by context layers; set "
                              "--context-layers")
@@ -225,8 +237,8 @@ class DecisionRunConfig(DecoderRunConfig):
         attention_impl = self.source_attention()
         budgets = {"max_len": self.max_len, "head_max_len": self.head_max_len,
                    "option_tokens": self.option_tokens, "max_state_tokens": self.max_state_tokens,
-                   "framing": self.framing, "segments": self.segments, "order": self.order,
-                   "split": self.split}
+                   "framing": self.framing, "segments": self.segments, "reads": self.reads,
+                   "parallel": self.parallel, "unit": self.unit, "order": self.order, "split": self.split}
         self._refuse_unread_context()
         derived = {}
         if self.context_layers is not None:

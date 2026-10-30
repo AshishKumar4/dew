@@ -20,6 +20,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from dew.nn.kernels.templates import cost
 
 if TYPE_CHECKING:
+    from dew.nn.kernels.generation import GpuTarget
     from dew.nn.kernels.templates.mosaic import Family
 
 
@@ -85,32 +86,32 @@ def live_registers(family: "Family", carried, *phases) -> int:
 
 
 def operand_fragments(family: "Family", rows: int, depth: int, columns: int, lhs, rhs, *, lhs_parts: int = 1,
-                      rhs_parts: int = 1) -> list:
+                      rhs_parts: int = 1, rhs_transposed: bool = False) -> list:
     """The operand fragments a product `[rows, depth] @ [depth, columns]` holds at once where its family's
     products read registers (`Family.operands_in_registers`), none where they read shared memory: its left
-    operand a step deep, its right one a sub-step (`Family.fragment_depth`), each in the warps replicating it
-    (`lhs_copies`, `rhs_copies`), each in its dtype (`lhs`, `rhs`) and as many times as it has parts (an fp32
-    operand split into 16-bit parts): the GEMM's tiles' (`tile_registers`) and the recurrence's products'."""
+    operand a step deep, its right one's loaded depth (`Family.rhs_fragment_depth`), each in the warps
+    replicating it (`lhs_copies`, `rhs_copies`), each in its dtype (`lhs`, `rhs`), repeated for its parts
+    (an fp32 operand split into 16-bit parts): GEMM's tiles' (`tile_registers`) and recurrence's products'."""
     if not family.operands_in_registers:
         return []
     return ([(rows * family.lhs_copies, depth, lhs)] * lhs_parts
-            + [(family.fragment_depth(depth), columns * family.rhs_copies, rhs)] * rhs_parts)
+            + [(family.rhs_fragment_depth(depth, transposed=rhs_transposed),
+                columns * family.rhs_copies, rhs)] * rhs_parts)
 
 
 def tile_registers(family: "Family", consumers: int, block: tuple[int, int, int], dtype, *,
-                   stored=()) -> int:
+                   stored=(), rhs_transposed: bool = False) -> int:
     """The registers a consumer thread holds at a `(rows, columns, depth)` GEMM tile of `consumers` roles
     of `family` (`live_registers`): its share of the fp32 accumulator carried, and a step's operand
     fragments where its products read registers (`Family.operands_in_registers`; the right operand's in
     each of its replicating warps: `lhs_copies`, `rhs_copies`), the right one's a sub-step deep where
-    it loads it so (`Family.fragment_depth`), a transposed one's too: the input gradient needs no more
-    than the forward at any mma.sync tile measured (GEMMMODEL4/5: 104-120 against 112-128 at 64 x 128 x 32,
-    184-216 against 184-224 at 128 x 128 x 32). Where the family copies its outputs out through its
-    registers (`Family.stores_through_registers`), its epilogue holds one copy's rows (`copied_rows`) in the
-    widest of the `stored` dtypes beside the accumulator."""
+    it loads it so (`Family.rhs_fragment_depth`), or held whole when its transposed storage requires it.
+    Where the family copies its outputs out through its registers (`Family.stores_through_registers`),
+    its epilogue holds one copy's rows (`copied_rows`) in the widest `stored` dtype beside the accumulator."""
     rows, columns, depth = block
     share = rows // consumers
-    fragments = operand_fragments(family, share, depth, columns, dtype, dtype)
+    fragments = operand_fragments(family, share, depth, columns, dtype, dtype,
+                                 rhs_transposed=rhs_transposed)
     accumulator = (share, columns, jnp.float32)
     walk = live_registers(family, [accumulator], fragments)
     if not (family.stores_through_registers and stored):
@@ -289,6 +290,19 @@ class LaunchPlan:
     shared: int
 
 
+def _register_allocation(registers: int, consumers: int, producer: int, step: int) -> int:
+    consumed = -(-registers // step) * step
+    produced = -(-producer // step) * step
+    return (consumers * consumed + produced) * THREADS
+
+
+def register_programs(family: "Family", consumers: int) -> int:
+    """Programs held by the family's role allocations, including the producer where it has one."""
+    producer = producer_registers(consumers) if family.warpgroups(consumers) > consumers else 0
+    allocated = _register_allocation(family.registers(consumers), consumers, producer, family.register_step)
+    return cost.REGISTERS // allocated
+
+
 @dataclasses.dataclass(frozen=True)
 class RegisterModel:
     """A launch's register decision as its template's model states it, which the compile gate holds the
@@ -304,15 +318,45 @@ class RegisterModel:
     step: int
     producer: int
     shared: int | None = None
+    family: "Family | None" = dataclasses.field(default=None, compare=False, repr=False)
+
+    def resident(self, registers: int, *, honored: bool = RAISES_HONORED) -> int:
+        """Residency at this consumer allocation, bounded by the launch's other resources."""
+        producer = self.producer if honored or not self.producer else registers
+        allocated = _register_allocation(registers, self.consumers, producer, self.step)
+        return min(self.most, cost.REGISTERS // allocated) if allocated else self.most
+
+    def cap(self, programs: int, *, honored: bool = RAISES_HONORED) -> int:
+        """The consumer cap that leaves room for `programs` copies of this launch."""
+        share = cost.REGISTERS // (THREADS * programs)
+        if honored or not self.producer:
+            return (share - self.producer) // self.consumers // self.step * self.step
+        return share // (self.consumers + 1) // self.step * self.step
+
+    def record(self) -> dict:
+        """The model's numeric facts; its live family supplies rules, not serialized state."""
+        return {field.name: getattr(self, field.name) for field in dataclasses.fields(self)
+                if field.name != "family"}
 
 
 def register_model(family: "Family", consumers: int, registers: int | None, *,
-                   shared: int | None = None) -> RegisterModel:
+                   shared: int | None = None, target: "GpuTarget | None" = None,
+                   tmem: int = 0) -> RegisterModel:
     """`family`'s register decision for a launch of `consumers` whose consumer thread holds `registers`
     (`RegisterModel`): its producer's registers where its layout has one (`Family.warpgroups`)."""
-    producer = family.warpgroups(consumers) > consumers
-    return RegisterModel(registers, family.registers(consumers), consumers, family.programs(consumers),
-                         family.register_step, producer_registers(consumers) if producer else 0, shared)
+    warpgroups = family.warpgroups(consumers)
+    most = register_programs(family, consumers)
+    if target is not None:
+        from dew.nn.kernels import generation
+
+        most = min(most, target.architecture.resident_threads // (warpgroups * THREADS))
+        if shared is not None:
+            block = generation.shared_budget(target)
+            most = next((count for count in range(most, 0, -1) if shared <= program_shared(block, count)), 0)
+        if tmem:
+            most = min(most, (target.tmem_columns or 0) // tmem)
+    return RegisterModel(registers, family.registers(consumers), consumers, most, family.register_step,
+                         producer_registers(consumers) if warpgroups > consumers else 0, shared, family)
 
 
 @dataclasses.dataclass(frozen=True)

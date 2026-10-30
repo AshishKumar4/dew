@@ -52,7 +52,7 @@ from .documents import (
 )
 from .inputs import cu_seqlens
 from .kernels import decode_attention, generation
-from .kernels.generation import Route, bf16_dot_runs, gpu_placed
+from .kernels.generation import Route, bf16_dot_runs
 from .kernels.selection import select, selected
 from .kernels.templates import attention as template, attention_route
 from .precision import (
@@ -174,14 +174,6 @@ def cudnn_attention(query, key, value, bias, mask, causal, sliding_window,
                     mask=(None if mask is None else four_dimensional(mask), SCORES),
                     key_value_seq_lengths=(kv_lengths, ("activation_batch",)))
     return out[:, :q_len] if q_pad else out
-
-
-def cudnn_runs(query, softcap=None) -> bool:
-    """Whether cudnn's fused kernel runs a query of this dtype and width here: the target takes it
-    (`CUDNN_SUPPORTS`) and this process places it on its own GPU (`gpu_placed`), which a CUDA
-    library call needs."""
-    case = attention_case(query, query, softcap=softcap)
-    return gpu_placed() and not ATTENTION.kernel('cudnn').failed(case)
 
 
 def flash_attention(query, key, value, causal: bool, sliding_window=None, sinks=None, segment_ids=None,
@@ -828,7 +820,7 @@ def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, 
             sinks is not None or softcap is not None or dropout_seed is not None)):
         mask = combined_attention_mask(query.shape[-3], key.shape[-3], causal, sliding_window, masked)
         # The accurate form's products are IEEE fp32 (`attention_route.FORMS`), never a GPU's TF32.
-        if generation.chosen_kernel("attention_form", "fast") == "accurate":
+        if generation.numerics().forms == "accurate":
             precision = jax.lax.Precision.HIGHEST
         return reference_attention(query, key, value, mask=mask, bias=bias, sinks=sinks, softcap=softcap,
                                    dtype=dtype, precision=precision,
@@ -910,6 +902,7 @@ def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_sof
         bias_hook=(bias is not None and jnp.ndim(bias) == 4 and jnp.shape(bias)[-2] in (1, query.shape[1])
                    and jnp.shape(bias)[0] in (1, query.shape[0]) and jnp.shape(bias)[1] in (1, query.shape[2])
                    and jnp.dtype(bias.dtype).itemsize <= 4),
+        dense_bias=bias is not None and jnp.ndim(bias) == 4 and jnp.shape(bias)[-2] > 1,
         row_bias=(bias is not None and jnp.ndim(bias) == 4 and jnp.shape(bias)[-2] > 1
                   and jnp.shape(bias)[0] > 1),
         sinks=sinks is not None, softcap=softcap,
@@ -917,7 +910,7 @@ def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_sof
         narrows=_xla_kernel_narrows(query) or _xla_kernel_widens_less(),
         folds=folds(query, key, bias, mask, causal, sliding_window),
         splash_mask=False, shards=sequence_shards(), dropout=dropout,
-        form=generation.chosen_kernel("attention_form", "fast"))
+        form=generation.numerics().forms)
     # Splash's descriptor reads a concrete mask on the host, so it is built only where splash may run,
     # under a name that may choose it on a TPU (`TPU_BACKEND`); its tiling and every other requirement
     # read the case (`TPU_SUPPORTS`).
@@ -963,7 +956,9 @@ def resolve_implementation(implementation: AttentionImpl, query, key, *, dtype=N
 
 def kernel_for_materialized_mask(implementation: AttentionImpl, query, key, *, dtype=None, precision=None,
                                  force_fp32_for_softmax=True) -> AttentionImpl:
-    """Send a call that built an explicit mask to the xla kernel.
+    """The kernel a call that built an explicit mask runs: a kernel the call names, cuDNN aside, which runs
+    the mask as xla does; else the attention selector's (`_masked_kernel`): one a run's context forces
+    (`generation.chosen`), else the xla kernel, the reference path where xla hands the call on.
 
     cuDNN has no mask argument: jax hands it a bool mask as an additive bias of
     -2**41 in the compute dtype (`combine_bias_and_mask` in
@@ -971,24 +966,42 @@ def kernel_for_materialized_mask(implementation: AttentionImpl, query, key, *, d
     then refuses an odd length while training. The xla kernel masks by
     exclusion with the same fp32 softmax, at 83.6 ms and 5.80 GiB a step against
     cuDNN's fixed window at 75.8 ms and 4.99 GiB
-    (docs/concepts/language_models.md). A call the xla kernel hands off goes to
-    the reference path as its requirements say (`attention_kernels.XLA_SUPPORTS`),
-    an explicit 'cudnn' among them, which runs here as xla.
+    (docs/concepts/language_models.md).
     """
-    masked = 'xla' if implementation in ('auto', 'cudnn') else implementation
-    if masked != 'xla':
-        return masked
-    case = dataclasses.replace(attention_case(query, key, dtype=dtype, precision=precision,
-                                              force_fp32_for_softmax=force_fp32_for_softmax, named='xla'),
-                               mask=True, folds=False)
-    return attention_implementation(selected(ATTENTION, case, 'xla').name)
+    if implementation not in ('auto', 'cudnn', 'xla'):
+        return implementation
+    return _masked_kernel(implementation, 'xla' if implementation == 'xla' else None, query, key,
+                          ('xla', 'reference'), dtype=dtype, precision=precision,
+                          force_fp32_for_softmax=force_fp32_for_softmax)
 
 
-def cudnn_takes_mask(implementation: AttentionImpl, query, *, softcap=None, sinks: bool = False) -> bool:
-    """Whether cuDNN may take a call's materialized mask as its additive bias:
-    the call names cudnn or chooses ('auto'), cuDNN runs it (`cudnn_runs`,
-    which also keeps the deterministic-ops lane off it) and it has no sinks,
-    which cuDNN cannot honor. A caller adds why its mask suits cuDNN's bias,
-    where `kernel_for_materialized_mask` sends the rest to xla: a forward-only
-    call, or a mask a window bounds."""
-    return implementation in ('auto', 'cudnn') and not sinks and cudnn_runs(query, softcap)
+def mask_kernel(implementation: AttentionImpl, query, key, *, as_bias: bool, dtype=None, precision=None,
+                force_fp32_for_softmax=True, softcap=None, sinks: bool = False) -> AttentionImpl:
+    """The kernel a call that built its mask runs, decided where the call builds it: where the mask suits
+    cuDNN's dense bias (`as_bias`: a window's band, a forward-only cache call over several queries) and the
+    call chooses ('auto') or names cudnn, cuDNN where it takes the call, then xla (a call cuDNN cannot
+    honour: sinks, a dtype or a width it refuses, a GPU this process does not place it on), then the
+    reference path; elsewhere `kernel_for_materialized_mask`'s. A kernel a run's context forces
+    (`generation.chosen`) is taken as forced."""
+    if not (as_bias and implementation in ('auto', 'cudnn')):
+        return kernel_for_materialized_mask(implementation, query, key, dtype=dtype, precision=precision,
+                                            force_fp32_for_softmax=force_fp32_for_softmax)
+    return _masked_kernel(implementation, None if implementation == 'auto' else implementation, query, key,
+                          ('cudnn', 'xla', 'reference'), dtype=dtype, precision=precision,
+                          force_fp32_for_softmax=force_fp32_for_softmax, softcap=softcap, sinks=sinks)
+
+
+def _masked_kernel(implementation: AttentionImpl, named: str | None, query, key,
+                   preference: tuple[str, ...], *, dtype, precision, force_fp32_for_softmax, softcap=None,
+                   sinks: bool = False) -> AttentionImpl:
+    """The attention selector's kernel for a call of `implementation` with a mask (`selection.selected`,
+    reporting nothing: the dispatch that runs it reports its route): `named` where it takes the call, else
+    one a run's context forces, else `preference`'s first that takes it, the reference path where xla hands
+    it on (`attention_kernels.XLA_SUPPORTS`)."""
+    case = dataclasses.replace(
+        attention_case(query, key, dtype=dtype, precision=precision,
+                       force_fp32_for_softmax=force_fp32_for_softmax, softcap=softcap,
+                       sinks=True if sinks else None, named=implementation),
+        mask=True, folds=False)
+    return attention_implementation(ATTENTION.hosted(selected(ATTENTION, case, named,
+                                                              preference=preference).name))

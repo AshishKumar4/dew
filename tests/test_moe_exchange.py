@@ -254,3 +254,29 @@ def test_capacity_drops_compute_maxtexts_experts(maxtext, case, dispatch, spec):
 
 def test_exchange_collectives_work_across_two_real_processes(tmp_path):
     assert_exchange_across_processes(Path(__file__).with_name('moe_exchange_worker.py'), tmp_path, 3e-5)
+
+
+@pytest.mark.mesh(devices=4)
+@pytest.mark.parametrize("dispatch", ["global", "exchange"])
+def test_value_experts_drop_and_dispatch_as_their_models_routed_mlp(dispatch):
+    """MoVA's value experts run under their layer's mixture (`RoutedValues.mixture`, ledger 2565): at its
+    capacity factor of one, on an expert mesh under either dispatch, they compute the float64 expert loop
+    over the slots MaxText's queue keeps (`capacity_positions`), each kept expert's SiLU projection at its
+    router weight, the dropped slots none."""
+    from dew.nn.value_experts import RoutedValues, ValueExperts
+
+    layer = RoutedValues(ValueExperts(experts=8, top_k=2), in_features=8, features=12,
+                         mixture=Mixture(experts=8, top_k=2, dispatch=dispatch, capacity_factor=1.0))
+    with jax.enable_x64(new_val=True):
+        x = jnp.asarray(np.random.default_rng(23).normal(size=(4, 12, 8)))
+        parameters = jax.tree.map(lambda leaf: leaf.astype(jnp.float64), layer.init(jax.random.key(3), x))
+        weights, indices = layer.apply(parameters, x, method=lambda module, x: module.router(x))
+        positions, capacity = capacity_positions(indices, 8, 1.0)
+        kept = positions < capacity
+        assert not bool(kept.all())
+        kernel = parameters["params"]["v_proj"]["kernel"]
+        slots = jax.nn.silu(jnp.einsum("bsi,bskio->bsko", x, kernel[indices]))
+        truth = np.asarray(jnp.einsum("bsko,bsk->bso", slots, weights * kept))
+        with jax.set_mesh(MeshSpec(expert=4).build(jax.devices()[:4])):
+            actual = np.asarray(jax.jit(layer.apply)(parameters, x))
+    assert_computes_the_oracle(actual, truth, f"value experts under {dispatch}", roundings=16)

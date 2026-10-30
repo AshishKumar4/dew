@@ -30,9 +30,11 @@ from reference_error import (
     without_ynn,
 )
 
+from dew.batch import coordinates
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.hyper_connections import HyperConnections
+from dew.nn.kernels.generation import chosen
 from dew.nn.kernels.selection import KernelRefused
 from dew.nn.kernels.templates.attention import dropout_keep, dropout_seed
 from dew.nn.mixers import AttentionMixer
@@ -342,8 +344,7 @@ def test_decode_cache_matches_the_full_sequence(rng, attention_impl):
     decoded_against_full(model, 4, f"{attention_impl} decode", SEEDS['decode'])
 
 
-@pytest.mark.gpu(reason="FlashAttention runs on CUDA")
-def test_a_cached_prompt_reads_its_cache_as_the_uncached_forward(without_deterministic_ops):
+def a_cached_prompt_reads_its_cache_as_the_uncached_forward(without_deterministic_ops):
     """A bf16 prompt prefilled into the cache under 'auto' reads it as the documents its tokens end, no
     mask, whatever kernel the GPU takes: its logits are on par with the xla kernel's uncached forward from
     the float64 forward over drawn weights and prompts (check 1)."""
@@ -352,6 +353,23 @@ def test_a_cached_prompt_reads_its_cache_as_the_uncached_forward(without_determi
     assert_as_exact(lambda params, prompt: step(params, made(params, prompt.shape[0]), prompt)[0],
                     applied(model.clone(attention_impl='xla')), drawn(model, length=6), "cached prefill",
                     seeds=SEEDS['cached prefill'], truth_fn=applied(float64(model)))
+
+
+def test_a_cached_prompt_reads_its_cache_under_a_chosen_template():
+    """A prompt prefilled into the cache under `chosen(attention='template')` builds no mask, so the mask's
+    kernel is never decided and the template takes the call (row 2662: decided eagerly, the template's
+    refusal of a mask raised): its logits on par with the xla kernel's uncached forward from the float64
+    forward over drawn weights and prompts (check 1)."""
+    model = tiny()
+    made, step = decode_steps(model)
+
+    def prefilled(params, prompt):
+        with chosen(attention='template'):
+            return step(params, made(params, prompt.shape[0]), prompt)[0]
+
+    assert_as_exact(prefilled, applied(model.clone(attention_impl='xla')), drawn(model, length=6),
+                    "cached prefill on a chosen template", seeds=SEEDS['cached prefill'],
+                    truth_fn=applied(float64(model)))
 
 
 def test_reference_and_xla_kernels_agree_when_causal():
@@ -876,8 +894,7 @@ def test_padding_in_a_packed_row_reaches_no_query(rng):
     assert jnp.all(jnp.isfinite(changed))
 
 
-@pytest.mark.gpu(reason="cuDNN runs on CUDA")
-def test_a_layer_naming_cudnn_takes_a_packed_batch_as_its_document_mask(rng, without_deterministic_ops):
+def a_layer_naming_cudnn_takes_a_packed_batch_as_its_document_mask(rng, without_deterministic_ops):
     """A bf16 model whose layers name cudnn (`attention_impl`) runs a packed batch on cuDNN, its
     documents reaching the kernel as their mask, an additive bias (`_attention_kernel`): the logits are
     on par with the xla kernel's from the float64 model over drawn weights and tokens (check 1)."""
@@ -1421,8 +1438,7 @@ def test_a_decode_step_reads_each_key_head_once_for_its_group(rng):
     decoded_against_full(model, 4, "grouped decode", SEEDS['grouped decode'])
 
 
-@pytest.mark.gpu(reason="needs a GPU")
-def test_a_plain_decode_step_attends_through_cudnn_where_it_runs(rng, without_deterministic_ops):
+def a_plain_decode_step_attends_through_cudnn_where_it_runs(rng, without_deterministic_ops):
     """A decode step's keys are the cache's filled slots, a count per row, so
     they reach cuDNN as its padding lengths rather than as a materialized mask:
     that mask sent Qwen3-0.6B's decode to xla's two dense dots over the whole
@@ -1435,8 +1451,7 @@ def test_a_plain_decode_step_attends_through_cudnn_where_it_runs(rng, without_de
 
 
 
-@pytest.mark.gpu(reason="needs a GPU")
-def test_a_padded_prefill_attends_through_cudnn_where_it_runs(rng, without_deterministic_ops):
+def a_padded_prefill_attends_through_cudnn_where_it_runs(rng, without_deterministic_ops):
     """A cache prefill of left-padded prompts builds its cursor mask, which
     sends a training call to xla (`kernel_for_materialized_mask`); a prefill
     runs forward only, so cuDNN takes that mask as its bias (xla's dense dots
@@ -1476,9 +1491,10 @@ def test_right_padded_rows_attend_causally_with_no_mask(rng, causal):
     model = tiny(causal=causal)
     valid = jnp.arange(SEQ)[None, :] < jnp.asarray([[7], [SEQ]])
 
-    def states(model, **declared):
+    def states(model, right_padded: bool = False):
+        laid = coordinates(valid.shape, valid=valid, right_padded=right_padded)
         return jax.jit(lambda params, ids: jnp.where(valid[..., None], model.apply(
-            params, ids, attention_mask=valid, method=CausalTransformer.hidden_states, **declared), 0))
+            params, ids, coordinates=laid, method=CausalTransformer.hidden_states), 0))
 
     assert_as_exact(states(model, right_padded=True), states(model), drawn(model), f"{causal} right padded",
                     seeds=SEEDS['right padded'], truth_fn=states(model.clone(dtype=jnp.float64)))

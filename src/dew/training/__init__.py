@@ -19,6 +19,7 @@ if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
     from dew.training.budget import Pause, Plateau
     from dew.training.cooldown import Cooldowns
     from dew.training.evaluation import EvalSuite, Evaluation
+    from dew.training.inspection import Inspection, inspected
     from dew.training.observe import Observe
     from dew.training.profiling import ProfileWindow
     from dew.training.runtime import Preempted, prepare_process, run_timestamp
@@ -33,12 +34,15 @@ if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
         WandbTracker,
     )
     from dew.training.trainer import Rollout, Trainer
+    from dew.training.transaction import PassesProgress
 
 _EXPORTS = {
     "Aux": "dew.objectives.base",
     "Best": "dew.training.selection",
     "Checkpoints": "dew.checkpoints",
     "Cooldowns": "dew.training.cooldown",
+    "Inspection": "dew.training.inspection",
+    "inspected": "dew.training.inspection",
     "EMASpec": "dew.objectives.base",
     "EvalSuite": "dew.training.evaluation",
     "Evaluation": "dew.training.evaluation",
@@ -52,6 +56,7 @@ _EXPORTS = {
     "Observe": "dew.training.observe",
     "Pause": "dew.training.budget",
     "Plateau": "dew.training.budget",
+    "PassesProgress": "dew.training.transaction",
     "Preempted": "dew.training.runtime",
     "ProfileWindow": "dew.training.profiling",
     "Rollout": "dew.training.trainer",
@@ -84,6 +89,7 @@ __all__ = [
     "EMASpec",
     "EvalSuite",
     "Evaluation",
+    "Inspection",
     "Keep",
     "Layout",
     "LocalTracker",
@@ -92,6 +98,7 @@ __all__ = [
     "Metric",
     "Objective",
     "Observe",
+    "PassesProgress",
     "Pause",
     "Plateau",
     "Preempted",
@@ -105,6 +112,7 @@ __all__ = [
     "Wandb",
     "WandbTracker",
     "ema_update",
+    "inspected",
     "prepare_process",
     "run_timestamp",
 ]

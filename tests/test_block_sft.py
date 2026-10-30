@@ -21,7 +21,7 @@ from reference_error import as_given, assert_as_exact
 from safetensors.numpy import load_file
 
 from dew import Trainer
-from dew.batch import FROZEN, freeze, select, thaw
+from dew.batch import FROZEN, coordinates, freeze, laid_coordinates, select, thaw, token_layout
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import Loader
 from dew.interop import Pretrained
@@ -270,6 +270,23 @@ def test_loss_weights_apply_after_independent_row_normalization(source):
     wrong = (2.7 * np.average(reference["canvas_loss"], weights=canvas_mass)
              + 0.3 * np.average(reference["encoder_loss"], weights=encoder_mass))
     assert abs(float(loss) - wrong) > 1e-3
+
+
+def test_a_block_step_passes_a_decoder_that_reads_the_runs_progress_the_steps(source):
+    """A block diffusion step passes a DiffusionGemma whose decoder reads the run's progress the step's,
+    at the encoder's pass and each denoising pass (`BlockDiffusionObjective.passes_progress`; review of
+    ledger 2537): a DEX decoder trains through its anneal, its loss half way through it no longer its loss
+    at the start, where the step refused it."""
+    from dew.nn.dex import DifferentialExtension
+
+    loaded, batch, step, _ = source
+    extension = DifferentialExtension(((0, (0, 1)),), anneal_steps=10)
+    obj = BlockDiffusionObjective(loaded.model.clone(text=loaded.model.text.with_dex(extension)),
+                                  prompt_length=4, num_canvases=2)
+    variables = obj.init(jax.random.key(0))
+    started, halfway = (float(obj.scalar_loss(variables, batch, replace(
+        step, committed=jnp.asarray(updates, jnp.int32)))[0]) for updates in (0, 5))
+    assert started != halfway
 
 
 def test_scoring_reports_the_denoiser_cross_entropy_of_every_canvas_target(source):
@@ -636,8 +653,11 @@ def sown_passes(obj, variables, batch, step):
     model, params = obj.training_model, thaw(variables)
     rngs = model_rngs(step.key, training=step.training)
     cache = model.apply(params, tokens.shape[0], method=model.init_cache, mutable=["cache"])[1]["cache"]
-    encoder_kwargs = prepared.kwargs()
-    encoder_kwargs.update(positions=positions, attention_mask=full_valid)
+    _, segments = token_layout(prepared.token_fields)
+    given = laid_coordinates(prepared.token_fields)
+    encoder_kwargs = {**prepared.kwargs(), "coordinates": coordinates(
+        tokens.shape[:2], segments=segments, valid=full_valid, positions=positions,
+        max_segments=None if given is None else given.max_segments)}
     encoder_states, encoded = model.apply(
         {**params, "cache": cache}, tokens, **encoder_kwargs, attention_pairwise_mask=encoder_mask,
         attention_key_positions=encoder_keys, method=model.encode, train=step.training, states=True,

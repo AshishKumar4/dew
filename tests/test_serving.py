@@ -511,6 +511,27 @@ def test_a_server_round_after_the_first_reuses_its_programs_and_reads_once_a_ste
         np.testing.assert_array_equal(mine.host().tokens, theirs.host().tokens)
 
 
+def test_a_servers_step_runs_one_executable_for_each_admission_size():
+    """A server's step (`dew.inference.serving_kernel.dispatched`) asks its program for the executable a
+    call takes once for each size of admission, and runs it with the dynamic arguments alone after: no
+    later step builds the program's dispatch key over the weights and cache (train 329's review: about 1
+    ms a step)."""
+    from dew.inference.serving_kernel import dispatched
+
+    asked: list[int | None] = []
+
+    class Program:
+        def executable(self, model, params, pad_id, placement, steps, resident, carried, admission, *rest):
+            asked.append(None if admission is None else len(admission["slots"]))
+            return lambda *dynamic: dynamic[3]
+
+    step = dispatched(Program())
+    sizes = [None, {"slots": np.zeros(2)}, None, {"slots": np.zeros(2)}, {"slots": np.zeros(4)}, None]
+    ran = [step("model", {}, 0, "placement", 1, "resident", "carried", admission, (), (), None)
+           for admission in sizes]
+    assert asked == [None, 2, 4] and ran == sizes
+
+
 @pytest.mark.parametrize("decode_steps", [1, 4])
 def test_a_step_whose_draw_has_no_distribution_stops_the_server(decode_steps):
     """A bigram policy that draws 5 after every id but 5, after which every score is 3e38, which
@@ -1022,6 +1043,37 @@ def test_a_user_decoder_module_is_packed_where_it_names_its_groups():
                         bound.sampling, bound.processor)
     for actual, prompt in zip(server(PROMPTS[:2], 5, key=3), PROMPTS[:2], strict=True):
         assert_same_generation(actual, retrained(prompt, 5, key=3))
+
+
+def test_a_tree_split_for_training_packs_as_its_whole_tree_and_splits_back_as_it_was():
+    """A tree split for training (`dew.batch.freeze`), its first layer's keys and values frozen and its
+    queries trained and its second layer trained whole, packs as its whole tree does (ledger 2439): thawed,
+    it is the unsplit weights packed, the flags of its frozen members (`PACKED_FROZEN`) gone with the
+    split, so a model reads the same tree whatever its layers' membership; split, it is the tree it was,
+    each member in its own collection; and a server of it reloads its unsplit source weights."""
+    from dew.batch import PACKED_FROZEN, freeze, thaw
+    from dew.inference.projections import inference_projections, packed_owned, unpacked
+
+    model = decoder().clone(num_layers=2, max_seq_len=128)
+    whole = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+    split = freeze(whole, lambda path: not ("layers_0" in path and {"k_proj", "v_proj"} & set(path)))
+    packed = packed_owned(model, jax.tree.map(jnp.array, split))
+    assert PACKED_FROZEN in packed and PACKED_FROZEN not in thaw(packed)
+
+    def assert_trees_equal(tree, expected):
+        assert jax.tree.structure(tree) == jax.tree.structure(expected)
+        for leaf, alike in zip(jax.tree.leaves(tree), jax.tree.leaves(expected), strict=True):
+            np.testing.assert_array_equal(np.asarray(leaf), np.asarray(alike), strict=True)
+
+    assert_trees_equal(thaw(packed), inference_projections(model, whole))
+    assert_trees_equal(unpacked(model, packed), split)
+    sampling = Sampling(temperature=0, eos_token_ids=None)
+    server = Server.from_task(TextGeneration(model, packed, RunProcessor(Digits()), sampling=sampling),
+                              slots=2, capacity=128)
+    server.reload(whole)
+    alone = TextGeneration(model, whole, RunProcessor(Digits()), sampling=sampling)
+    for actual, prompt in zip(server(PROMPTS[:2], 5, key=3), PROMPTS[:2], strict=True):
+        assert_same_generation(actual, alone(prompt, 5, key=3))
 
 
 def test_a_projection_quantized_apart_from_its_group_is_served_unpacked():

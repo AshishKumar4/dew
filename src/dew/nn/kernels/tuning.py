@@ -429,8 +429,10 @@ class KernelOp(tokamax.Op):
             config = self._chosen(ba)
             if collected is not None:
                 collected.found.taken.append((config, ba))
-        elif not self.pinnable(ba, config):
-            raise Unpinnable(type(self).__name__, config, self.unpinnable(ba, config))
+        else:
+            config = self.completed(ba, config)
+            if not self.pinnable(ba, config):
+                raise Unpinnable(type(self).__name__, config, self.unpinnable(ba, config))
         # The launch runs on its bound arguments, the facts its binding states from its operands (a
         # template's `bind`: a grouped launch's hooks' dtypes and accumulators) as its key reads them; its
         # kernels carry it in their names, so a compile's reports name it (`report.launching`).
@@ -452,7 +454,7 @@ class KernelOp(tokamax.Op):
     def _chosen(self, ba: tokamax.BoundArguments) -> Hashable:
         pins = dict(cache.KERNEL_PINS.value)
         if type(self) in pins:
-            pin = pins[type(self)]
+            pin = self.completed(ba, pins[type(self)])
             # A pin holds for the call's own shapes, as an explicit config does (`__call__`).
             if not self.pinnable(ba, pin):
                 raise Unpinnable(type(self).__name__, pin, self.unpinnable(ba, pin))
@@ -473,6 +475,13 @@ class KernelOp(tokamax.Op):
 
     def _get_autotuning_configs(self, ba: tokamax.BoundArguments) -> set[Hashable]:
         return set(self.variants(ba))
+
+    def completed(self, ba: tokamax.BoundArguments, config: Hashable) -> Hashable:
+        """A pinned or explicit `config` as the launch of `ba` takes it, the parts it leaves to the launch
+        derived once (a Mosaic forward's natural rewalk, `MosaicForward.completed`): itself, where the
+        launch derives nothing beside it."""
+        del ba
+        return config
 
     def pinnable(self, ba: tokamax.BoundArguments, config: Hashable) -> bool:
         """Whether a pin (or a stored pick) may name `config` for the launch of `ba`: any config of its

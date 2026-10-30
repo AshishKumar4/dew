@@ -12,7 +12,7 @@ import json
 import logging
 import math
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING
 
 import jax
@@ -27,6 +27,7 @@ from dew.distributed.placement import parameter_axes
 from dew.mesh import batch_axes, mesh_axes
 from dew.nn.kernels.generation import backend, device_generation, gpu_target
 from dew.nn.kernels.options import Option, compiler_options
+from dew.nn.kernels.templates import report
 from dew.nn.protocols import Recomputing, TritonGemm
 from dew.objectives.base import Objective
 from dew.state import TrainState
@@ -106,18 +107,21 @@ def step_compiler_options(objective, tokens: float, frozen: bool,
 
 
 def compiled_if_it_fits(program: jax.stages.Lowered, options: jax.stages.CompilerOptions | None,
-                        refusals: list[RuntimeError]) -> jax.stages.Compiled | None:
+                        refusals: list[RuntimeError], *, relower: Callable[[], jax.stages.Lowered]
+                        ) -> jax.stages.Compiled | None:
     """Return `program` compiled under `options`, or None if XLA refuses it for memory (`refused_for_memory`).
 
-    A refusal is appended to `refusals`. XLA:TPU checks a program's temporaries
-    against HBM while it compiles and raises RESOURCE_EXHAUSTED instead of
-    returning an executable whose memory `step_fits` could read, so the refusal
-    means the step does not fit. For example, on a v6e, Qwen3-0.6B at 16 x 1024
+    It compiles through the kernel templates' reports (`report.compiled`): where a launch's kernel
+    spills, its config is refused and the step lowered afresh (`relower`), its derivation taking the
+    next config, and compiled once more. A refusal is appended to `refusals`. XLA:TPU checks a
+    program's temporaries against HBM while it compiles and raises RESOURCE_EXHAUSTED instead of
+    returning an executable whose memory `step_fits` could read, so the refusal means the step does
+    not fit. For example, on a v6e, Qwen3-0.6B at 16 x 1024
     tokens asked for 38.47G of temporaries next to 31.24G of HBM. Any other
     compile error is raised.
     """
     try:
-        return program.compile(options)
+        return report.compiled(program, options, relower=relower)
     except jax.errors.JaxRuntimeError as error:
         if not refused_for_memory(error.error_code_string, str(error)):
             raise
@@ -302,10 +306,10 @@ def derived_headroom(footprint: Footprint, devices: Sequence, capacity: int | No
     """The bytes a step whose derived footprint is `footprint` would leave free on its tightest device, as
     `step_headroom` reads a compiled step's: its temporaries the derivation names, its residuals and
     gradient, in one block beside what it holds (`Footprint.held`), twice where the allocator strands
-    them; None where the derivation names no residuals (a step over several devices) or a device
-    states no memory. The resident state is in use already, or, on a stated device, its arguments but
-    the `built` bytes its first call builds, which `held` counts. XLA's workspace beyond these is no
-    term of it (`dew.training.footprint`): a compile confirms."""
+    them; None where the derivation names no residuals or a device states no memory. The resident
+    state is in use already, or, on a stated device, its arguments but the `built` bytes its first
+    call builds, which `held` counts. XLA's workspace beyond these is no term of it
+    (`dew.training.footprint`): a compile confirms."""
     if footprint.residuals is None:
         return None
     memory = [device_memory(device, capacity, sum(footprint.resident.values()) - built) for device in devices]
@@ -496,24 +500,26 @@ def recompute_more[LossT, EffectsT](objective: Objective[LossT, EffectsT],
     where a tile holds a tile's: at an 8B's head on an A100 (4096 tokens in
     one chunk) 58.4 ms against 64.9.
     """
+    return climbed(objective, base) is not None
+
+
+def climbed[LossT, EffectsT](objective: Objective[LossT, EffectsT],
+                             base: tuple[int, int] | None = None) -> str | None:
+    """Move the objective one rung up its ladder as `recompute_more` does, and say what it moved to,
+    None where there was no rung: the words a search that compiles again there logs
+    (`dew.training.planning.FitSearch.climb`), which a derivation's walk, compiling nothing, does not."""
     if head_tile_of(objective) == base:
         moved = objective.tile_head()
         if moved is not None:
-            _log.warning("the step does not fit the devices with the whole logits kept; compiling it again "
-                         "with %s", moved)
-            return True
+            return f"with the whole logits kept; compiling it again with {moved}"
     moved = objective.unfuse_head()
     if moved is not None:
-        _log.warning("the step does not fit the devices with the head fused; compiling it again with %s",
-                     moved)
-        return True
+        return f"with the head fused; compiling it again with {moved}"
     current = recompute_record(objective)
     if not remat_more(objective):
-        return False
+        return None
     objective.restore_head(base, fused=True)
-    _log.warning("the step does not fit the devices under remat %r; compiling it again under %r",
-                 current, recompute_record(objective))
-    return True
+    return f"under remat {current!r}; compiling it again under {recompute_record(objective)!r}"
 
 
 def remat_half[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> list | None:

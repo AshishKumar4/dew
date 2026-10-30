@@ -54,11 +54,10 @@ class ToolPolicy(nn.Module):
     def init_cache(self, batch_size):
         self.variable("cache", "seen", lambda: jnp.zeros(batch_size, jnp.int32))
 
-    def __call__(
-        self, tokens, train=False, decode=False, attention_mask=None, positions=None, segment_ids=None
-    ):
+    def __call__(self, tokens, train=False, decode=False, coordinates=None):
         if decode:
             seen = self.get_variable("cache", "seen")
-            valid = jnp.ones_like(tokens, bool) if attention_mask is None else attention_mask
+            valid = (jnp.ones_like(tokens, bool) if coordinates is None or coordinates.valid is None
+                     else coordinates.valid)
             self.put_variable("cache", "seen", seen + valid.sum(-1))
         return self.hidden_states(tokens) @ self.table

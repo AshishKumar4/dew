@@ -1737,12 +1737,18 @@ def stored_order(path: tuple[str, ...], stored_ndim: int, leaf_ndim: int) -> tup
     return (*range(lead), lead + 1, lead)
 
 
+SLICED = ('experts', 'shards')
+"""The nodes whose digit-keyed children a load stacks on a leaf's first axis (`expert_slot`): a layer's
+experts, and a table's equal row shards (Qwen4-Exp's n-gram table, `split_ngram_parts`)."""
+
+
 def expert_slot(path: tuple[str, ...]) -> tuple[tuple[str, ...], int] | None:
-    """The stacked leaf a per-expert `experts/K/<projection>/kernel` path is a slice of, and K: a load
-    stacks the experts' kernels in K's order on the leaf's first axis (`hf_decoders._stack_experts`),
-    and an export writes each back from its slice (`WeightLayout.expert_index`). None for any other
-    path. `expert_path` is its inverse."""
-    if len(path) >= 4 and path[-4] == 'experts' and path[-3].isdigit() and path[-1] == 'kernel':
+    """The stacked leaf a per-slice `experts/K/<projection>/kernel` (or `shards/K/<table>/embedding`) path
+    is a slice of, and K: a load stacks the slices in K's order on the leaf's first axis
+    (`hf_decoders._stack_experts`), and an export writes each back from its slice
+    (`WeightLayout.expert_index`). None for any other path. `expert_path` is its inverse."""
+    if (len(path) >= 4 and path[-4] in SLICED and path[-3].isdigit()
+            and path[-1] == ('kernel' if path[-4] == 'experts' else 'embedding')):
         return (*path[:-3], path[-2], path[-1]), int(path[-3])
     return None
 

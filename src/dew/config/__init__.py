@@ -22,6 +22,7 @@ too (`ModelConfig.defaults`), so a default changed since leaves the record
 building what it built.
 """
 
+import contextvars
 import copy
 import dataclasses
 import datetime
@@ -46,7 +47,7 @@ from etils import epath
 import dew.io
 from dew import registry, training
 from dew._coordination import agree_process_phase, agreed, agreed_same
-from dew._records import JSON, duration, is_share, recorded_duration
+from dew._records import JSON, duration, earlier_segments, is_share, recorded_duration
 from dew.cache import dew_cache_dir
 from dew.checkpoints import RUN_FILE, Checkpoints, Keep, Resume
 from dew.config.sweep import RandomSearch, Search, Space, read_ledger, write_ledger
@@ -60,7 +61,7 @@ from dew.interop.weights import AUTO
 from dew.lora import LoRA
 from dew.nn.dex import DifferentialExtension
 from dew.nn.kernels import generation
-from dew.nn.precision import Numerics
+from dew.nn.precision import Numerics, numerics_of
 from dew.nn.sharding import Link
 from dew.objectives.base import Effects, Loss, Metric, Objective
 from dew.optim import OptimConfig, ParamGroup
@@ -83,11 +84,12 @@ from dew.registry import (
 )
 from dew.state import TrainState
 from dew.telemetry.records import RunRecord, TrialFinished, json_value, packages_installed
-from dew.training.ahead import AheadOfTime, AheadTarget, CompiledAhead, compile_only_gpus
+from dew.training.ahead import AheadOfTime, AheadTarget, CompiledAhead
 from dew.training.budget import Pause, Plateau, budget_tokens, run_length, run_steps
 from dew.training.cooldown import Cooldowns
 from dew.training.display import TrainingDisplay
 from dew.training.evaluation import EvalSuite, Summary
+from dew.training.inspection import Inspection
 from dew.training.profiling import ProfileReport, ProfileWindow
 from dew.training.quantization import quantize_trunk
 from dew.training.rollout import Rollout
@@ -329,6 +331,19 @@ def _record_argument[T](kind: type[T]):
     )
 
 
+def _numerics_argument():
+    """A run's numerics on the command line: a preset's name ("accurate", "default"), the usual dtypes'
+    Lightning name ("bf16-true"), or a `Numerics` record's JSON (`dew.nn.precision.numerics_of`)."""
+    return tyro.constructors.PrimitiveConstructorSpec(
+        nargs=1,
+        metavar="NAME|JSON",
+        instance_from_str=lambda given: (from_record(Numerics, json.loads(given[0]))
+                                         if given[0].startswith("{") else numerics_of(given[0])),
+        is_instance=lambda value: isinstance(value, Numerics),
+        str_from_instance=lambda value: [json.dumps(to_record(value, Numerics))],
+    )
+
+
 def _keep_argument():
     return tyro.constructors.PrimitiveConstructorSpec(
         nargs=1,
@@ -385,6 +400,14 @@ class SourceOptions:
     """DEX's differential on chosen heads (`dew.nn.dex`, `Pretrained.load`'s `dex`), its record as
     JSON: `--source.dex '{"layers": [[0, [1, 3]], [5, [0, 2]]], "anneal_steps": 1000}'`, its
     `trains` the paper's recipe unless "all"; None for none."""
+    scan_layers: bool = False
+    """The decoder's runs of like layers, and of layers repeating one period, under flax's scan
+    (`Pretrained.load`'s `scan_layers`): a decode step's program grows with the period, not the depth."""
+    param_dtype: str | None = None
+    """The dtype the source's parameters are stored in, its checkpoint's own as 'auto'; None stores a
+    source the run trains in its numerics' `dtypes.params` and one it keeps frozen as its checkpoint
+    does (`RunConfig.source_keywords`). A frozen bfloat16 base beside a float32 head and adapter is
+    `--source.param-dtype bfloat16`."""
 
     def overrides(self) -> Mapping[str, object] | None:
         """The `modeling_overrides` these options state, None where they state none."""
@@ -397,7 +420,7 @@ class SourceOptions:
         PyTorch pickles alone, whose shapes no header states, is read whole): a check that a base
         loads under a run's options, on a disk too small for its weights."""
         return {"text_only": self.text_only, "prediction_depths": self.prediction_depths,
-                "modeling_overrides": self.overrides(), "dex": self.dex}
+                "modeling_overrides": self.overrides(), "dex": self.dex, "scan_layers": self.scan_layers}
 
 
 class SourcePlacement(TypedDict, total=False):
@@ -417,6 +440,7 @@ class SourceBuild(TypedDict, total=False):
     prediction_depths: int | None
     modeling_overrides: Mapping[str, object] | None
     dex: DifferentialExtension | None
+    scan_layers: bool
 
 
 class SourceOptionsKeywords(SourcePlacement, SourceBuild, total=False):
@@ -526,7 +550,11 @@ class TrainerConfig:
     way there is one optimizer update a step, and the compiled step is traced
     once per stage.
     """
-    precision: Numerics = dataclasses.field(default_factory=Numerics)
+    dynamic_scale: bool | None = None
+    """Whether the run scales its loss dynamically (`flax.training.dynamic_scale.DynamicScale`): None
+    for a float16 compute's alone, which needs it (`RunConfig.built`); a run states True or False to
+    choose, as a run saved before its numerics records the one it trained under."""
+    precision: Annotated[Numerics, _numerics_argument()] = dataclasses.field(default_factory=Numerics)
     """The run's numerics, set once and recorded with it (`dew.nn.precision.Numerics`; `ACCURATE` for
     scientific runs): its dtypes by Lightning's names, its products' precision by JAX's levels and its
     ops' forms, over every program it traces, the step and its evaluations
@@ -588,15 +616,8 @@ class TrainerConfig:
     each of its Pallas kernels to Triton. A kernel that would fail the GPU's
     first compile there fails here, in seconds and without the GPU; XLA's
     compile of the whole step still needs one. The program exits with status
-    0 once the step lowers, and opens no W&B run.
-
-    A TPU topology, `--trainer.lower-for v5e:4x4` (as
-    `jax.experimental.topologies` names one), builds the run's mesh over that
-    topology's devices and compiles its first step for them on any host that
-    holds libtpu, as MaxText's train_compile does: the run saves the executable
-    in its checkpoint directory, `compiled-v5e-4x4`, with each device's memory
-    and work beside it (`compiled-v5e-4x4.json`, `dew.training._lowering.Lowered`),
-    and exits.
+    0 once the step lowers, and opens no W&B run. A TPU topology's step compiles ahead
+    (`compile_ahead`).
     """
     compile_ahead: Annotated[AheadTarget, tyro.conf.subcommand("ahead")] | None = None
     """Compile the run's first step for GPUs this host lacks, save it, then exit without training.
@@ -606,7 +627,9 @@ class TrainerConfig:
     H100s (`dew.training.ahead`), compiles its first step there with XLA's CUDA compiler, which needs
     the CUDA plugin and no GPU, and writes it with what it costs: each device's peak bytes and the
     step's FLOPs, read before booking the GPUs. The program exits with status 0, and writes no
-    checkpoint or tracking.
+    checkpoint or tracking. A TPU topology compiles the same way on any host that holds libtpu, as
+    MaxText's train_compile does: `--trainer.compile-ahead.generation v5e:4x4
+    --trainer.compile-ahead.devices 16`, the step loading on a host of that topology alone.
 
     `--trainer.compile-ahead.capacity-gib 80` states each GPU's memory, and the run's own fit search
     then plans the step there as a run would, its log and the saved step naming every program it
@@ -622,13 +645,17 @@ class TrainerConfig:
     program, on a host of the topology it was compiled for; another program, from another config,
     data shape, Dew or a plan recorded for another rung, is refused before the run trains.
     """
+    inspection: Annotated[Inspection, tyro.conf.subcommand("inspect")] | None = None
+    """What the run watches at its sampled steps (`dew.training.inspection.Inspection`): parameter paths by
+    glob, the trees summarized there and every how many steps, `--trainer.inspection.paths '*norm*'
+    --trainer.inspection.every 100`; unset, the step compiles unchanged."""
     links: Annotated[Mapping[str, Link], record_argument(Mapping[str, Link])] = dataclasses.field(
         default_factory=dict)
     """The links of the run's split axes, by axis name (`Trainer`'s `links`), stated where no process
     measures them as they are or should not: a step spreads an axis's projections as its stated link
     would, `--set trainer.links='{"tensor": {"bytes_per_second": 4.5e11, "flops_per_second": 9.9e14}}'`.
-    Unnamed, an axis's link is measured on its devices. A step compiled ahead states its target's own
-    (`AheadTarget.links`)."""
+    Unnamed, an axis's link is measured on its devices, and on compile-only ones none is: a step
+    compiled ahead compiles with these and records them (`AheadOfTime.links`)."""
     tune_kernels: bool = False
     """Measure each Pallas launch of the step that has no config measured on this GPU.
 
@@ -654,6 +681,8 @@ class TrainerConfig:
         return dataclasses.replace(self, accumulation=accumulation)
 
     def __post_init__(self):
+        # A record names its numerics as a preset's name or by their fields (`numerics_of`).
+        object.__setattr__(self, "precision", numerics_of(self.precision))
         if self.update_tokens is not None and self.update_tokens < 1:
             raise ValueError("--trainer.update-tokens must be positive")
         if self.update_tokens is not None and self.batch_ramp is not None:
@@ -832,6 +861,19 @@ def _artifact_name(name: str) -> str:
     return re.sub(r"[^\w.-]", "-", name)
 
 
+_VIEWING: contextvars.ContextVar[bool] = contextvars.ContextVar("viewing", default=False)
+"""Set while a run is viewed offline (`RunConfig.inspected`): its `train` views one sampled update and
+ends there, training nothing (`_Viewed`)."""
+
+
+class _Viewed(Exception):
+    """What ends a run's `train` under `RunConfig.inspected`: the view it took (`RunConfig.viewed`)."""
+
+    def __init__(self, scalars: dict[str, float]):
+        super().__init__()
+        self.scalars = scalars
+
+
 @dataclasses.dataclass(frozen=True)
 class Prepared:
     """What a run trains, as its class builds it (`RunConfig.prepare`).
@@ -921,37 +963,61 @@ def takes_dtype(model: ModelConfig) -> bool:
 def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
     """A saved run's record (its run.json, `{"class": ..., "fields": ...}`) with its fields in the shapes
     Dew writes now, every earlier shape of a saved run read here and nowhere else (`RunConfig.load`,
-    `check_resume`): a trainer's `attention_form`, which its precision policy's `forms` hold now; a
-    loaded checkpoint's `pretrained_param_dtype` and a decision's `param_dtype`, which its `dtypes.params`
-    hold; and a trainer's `dynamic_scale`, which a float16 compute derives (`dew.nn.precision.Numerics`,
-    ledger 2500).
-    A configuration written today that names any of them is refused by name, as any field its class does
-    not declare. A record in today's shapes passes as it is. Carried to 1.0, when it is deleted (ledger
-    1552)."""
+    `check_resume`). A record written before its trainer held a precision policy (`dew.nn.precision.
+    Numerics`, ledger 2500) reads as its main trained it (train 328's review): its trainer's
+    `attention_form` as the policy's `forms`; a loaded checkpoint's `pretrained_param_dtype`, and a
+    decision's `param_dtype`, as the storage of the source alone (`SourceOptions.param_dtype`), the head
+    and adapter it drew fresh kept in float32; its compute as its main's (`earlier_compute`); and its
+    `dynamic_scale` as it trained under it.
+    A configuration written today that names the earlier knobs is refused by name, as any field its class
+    does not declare. A record in today's shapes passes as it is. Carried to 1.0, when it is deleted
+    (ledger 1552)."""
     fields = record.get("fields")
+    segments = fields.get("segments") if isinstance(fields, Mapping) else None
+    if isinstance(fields, Mapping) and isinstance(segments, list):
+        # A decision run's row of segments, in today's fields (`earlier_segments`).
+        fields = {**fields, "segments": earlier_segments(segments)}
+        record = {**record, "fields": fields}
     if not isinstance(fields, Mapping) or not isinstance(fields.get("trainer"), Mapping):
         return record
     trainer, fields = dict(fields["trainer"]), dict(fields)
     stated = {name: fields.pop(name) for name in ("pretrained_param_dtype", "param_dtype") if name in fields}
-    earlier = {name for name in ("attention_form", "dynamic_scale") if name in trainer} | set(stated)
-    if not earlier:
-        return record
     if "precision" in trainer:
-        raise ValueError(f"a saved run records {sorted(earlier)} beside its trainer's precision, which "
-                         f"holds them now")
-    policy: dict[str, object] = {}
+        if "attention_form" in trainer or stated:
+            raise ValueError(f"a saved run records {sorted({'attention_form'} & set(trainer) | set(stated))} "
+                             "beside its trainer's precision, which holds them now")
+        return record
+    if "attention_form" not in trainer and "dynamic_scale" not in trainer and not stated:
+        return record
+    policy: dict[str, object] = {"dtypes": {"compute": earlier_compute(record)}}
     if "attention_form" in trainer:
         policy["forms"] = trainer.pop("attention_form")
-    trainer.pop("dynamic_scale", None)
-    params = next(iter(stated.values()), None)
-    # The compute an earlier record trained in was its model's stated dtype, where it states one.
-    model = fields.get("model")
-    computed = model.get("fields", {}).get("dtype") if isinstance(model, Mapping) else None
-    dtypes = {**({"params": params} if params is not None else {}),
-              **({"compute": computed} if isinstance(computed, str) else {})}
-    if dtypes:
-        policy["dtypes"] = dtypes
+    stored = next(iter(stated.values()), None)
+    # The storage named a loaded checkpoint's alone, which a run that loads none never read.
+    if stored is not None and fields.get("pretrained") is not None:
+        source = fields.get("source")
+        fields["source"] = {**(source if isinstance(source, Mapping) else {}), "param_dtype": stored}
     return {**record, "fields": {**fields, "trainer": {**trainer, "precision": policy}}}
+
+
+def earlier_compute(record: Mapping[str, object]) -> str:
+    """The dtype a run saved before its numerics computed in: its model's stated dtype, where it states
+    one; else bfloat16 where it loaded a language model or a diffusion pipeline, as those mains loaded
+    them; else float32, Flax's own for a model drawn fresh and a decision run's backbone."""
+    from dew.config.diffusion import DiffusionRunConfig
+    from dew.config.lm import LMRunConfig
+
+    fields = record.get("fields")
+    assert isinstance(fields, Mapping)
+    model = fields.get("model")
+    stated = model.get("fields", {}).get("dtype") if isinstance(model, Mapping) else None
+    if isinstance(stated, str):
+        return stated
+    named = record.get("class")
+    kind = registry.runs[named] if isinstance(named, str) else None
+    loads = fields.get("pretrained") is not None and isinstance(kind, type) and issubclass(
+        kind, LMRunConfig | DiffusionRunConfig)
+    return "bfloat16" if loads else "float32"
 
 
 
@@ -1093,6 +1159,7 @@ class RunConfig:
     """
 
     _FLAG_SELECTED: ClassVar[Mapping[str, str]] = {"lora": "lora", "trainer.stop": "pause",
+                                                   "trainer.inspection": "inspect",
                                                    "trainer.cooldowns": "cooldowns",
                                                    "trainer.compile-ahead": "ahead"}
     """The optional settings `cli` turns on by their own flags, each with the
@@ -1290,9 +1357,11 @@ class RunConfig:
         (`param_dtype='auto'`), since no update reaches it: a float32 copy of a bf16 checkpoint doubles
         its memory and is cast back to bf16 every pass for nothing, while a cast to the compute dtype
         would round the float32 tensors a bf16 checkpoint keeps (Mamba's `A_log`). A `dtypes.params`
-        narrower than float32 stores it so too."""
+        narrower than float32 stores it so too. A storage the run's source options state wins
+        (`SourceOptions.param_dtype`)."""
         params = self.trainer.precision.dtypes.params
-        stored = AUTO if frozen and jax.numpy.dtype(params) == jax.numpy.float32 else params
+        stored = (self.source.param_dtype if self.source.param_dtype is not None
+                  else AUTO if frozen and jax.numpy.dtype(params) == jax.numpy.float32 else params)
         return {**self.source.keywords(), **self.trainer.source_placement(frozen=frozen),
                 "param_dtype": stored}
 
@@ -1677,8 +1746,8 @@ class RunConfig:
         trainer = self.trainer
         if dataset.plan is not None:
             summary = {**(summary or {}), "data_plan": dataset.plan.record()}
-        if trainer.compile_ahead is not None:
-            raise self.compiled_ahead(objective, dataset, steps, rollout)
+        if trainer.compile_ahead is not None or _VIEWING.get():
+            raise self.ended(objective, dataset, steps, rollout, name)
         tracker = checkpoints = None
         try:
             wandb_tracker = None
@@ -1748,16 +1817,64 @@ class RunConfig:
             _closed(tracker, checkpoints, sys.exception())
 
     def compiled_ahead[LossT, EffectsT](self, objective: Objective[LossT, EffectsT], dataset: Loader,
-                                         steps: int | None, rollout: Rollout | None) -> CompiledAhead:
+                                         steps: int | None, rollout: Rollout | None,
+                                         name: str) -> CompiledAhead:
         """The run's first step compiled for its `compile_ahead` target and saved
-        (`AheadTarget.compiled`), its trainer built as `train` builds it, over that target's
-        compile-only GPUs, with no checkpoints or tracker: what ends a run that compiles ahead."""
+        (`AheadTarget.compiled`), its trainer built as `train` builds it, its links the run's own, over
+        that target's compile-only devices (`AheadTarget.compile_only`), with no tracker: what ends a run
+        that compiles ahead. A run `name` whose directory holds its checkpoints reads them, and compiles the
+        step its resume takes; one that has none writes none."""
         target = self.trainer.compile_ahead
         assert target is not None
-        mesh = self.trainer.mesh.build(compile_only_gpus(target.generation, target.devices, target.capacity))
+        mesh = self.trainer.mesh.build(target.compile_only())
+        held = epath.Path(self.trainer.checkpoint_dir, name).is_dir()
+        trainer = self.built(objective, mesh, rollout,
+                             checkpoints=self.trainer.checkpoints(name) if held else None)
         with generation.run_precision(self.trainer.precision):
-            return target.compiled(self.built(objective, mesh, rollout, links=target.links), dataset, steps,
-                                   self.trainer.examples if steps is None else None)
+            return target.compiled(trainer, dataset, steps, self.trainer.examples if steps is None else None)
+
+    def ended[LossT, EffectsT](self, objective: Objective[LossT, EffectsT], dataset: Loader,
+                                steps: int | None, rollout: Rollout | None,
+                                name: str) -> CompiledAhead | _Viewed:
+        """What ends a run before it trains: its first step compiled ahead (`compiled_ahead`), or, viewed
+        offline, its view (`viewed`, `inspected`)."""
+        if self.trainer.compile_ahead is not None:
+            return self.compiled_ahead(objective, dataset, steps, rollout, name)
+        return _Viewed(self.viewed(objective, dataset, steps, rollout, name))
+
+    def viewed[LossT, EffectsT](self, objective: Objective[LossT, EffectsT], dataset: Loader,
+                                 steps: int | None, rollout: Rollout | None, name: str) -> dict[str, float]:
+        """The run's inspection of one sampled update over its training data's first batch
+        (`dew.training.inspected`), its trainer built as `train` builds it, from the checkpoints its
+        directory `name` holds, their latest, else its start, with no tracker: what `inspected` returns."""
+        from dew.training import inspected
+        from dew.training._fit import first_batch
+
+        held = epath.Path(self.trainer.checkpoint_dir, name).is_dir()
+        trainer = self.built(objective, self.trainer.mesh, rollout,
+                             checkpoints=self.trainer.checkpoints(name) if held else None)
+        with generation.run_precision(self.trainer.precision):
+            trainer.reading(dataset, examples=self.trainer.examples if steps is None else None, steps=steps)
+            return inspected(trainer, first_batch(dataset, trainer.device_mesh), steps=steps)
+
+    def inspected(self) -> dict[str, float]:
+        """What the run's inspection (`TrainerConfig.inspection`) logs of one sampled update over its training
+        data's first batch, from its checkpoints' latest, else its start, offline (`viewed`): the view its
+        training logs, for a saved run, which this trains and writes nothing of (`dew inspect`)."""
+        from dew.training import prepare_process
+
+        trainer = self.trainer
+        if trainer.inspection is None:
+            raise ValueError("the run names no inspection to view; name one, as --set trainer.inspection=...")
+        prepare_process(None, trainer.multi_host, trainer.xla_flags, trainer.compilation_cache_dir)
+        token = _VIEWING.set(True)
+        try:
+            self.prepare().train(trainer.name or "inspected")
+        except _Viewed as view:
+            return view.scalars
+        finally:
+            _VIEWING.reset(token)
+        raise RuntimeError(f"{type(self).__name__} trained without its RunConfig.train, which views the run")
 
     def grouped(self, objective: Objective[Loss, Effects], name: str) -> OptimConfig:
         """The run's optimizer as it trains under `name`: each group it names that claims the modules its
@@ -1799,8 +1916,9 @@ class RunConfig:
         return training.Trainer(
             objective, self.optim, key=trainer.key, mesh=mesh, microbatches=trainer.microbatches,
             layout=trainer.layout, accumulation=trainer.accumulation, split=trainer.split,
-            dynamic_scale=self.compute_dtype() == "float16", rollout=rollout,
-            tune_kernels=trainer.tune_kernels, param_dtype=self.drawn_dtype(),
+            dynamic_scale=(self.compute_dtype() == "float16" if trainer.dynamic_scale is None
+                           else trainer.dynamic_scale), rollout=rollout,
+            tune_kernels=trainer.tune_kernels, param_dtype=self.drawn_dtype(), inspection=trainer.inspection,
             **{"links": trainer.links, **resources})
 
     def compute_dtype(self) -> str:

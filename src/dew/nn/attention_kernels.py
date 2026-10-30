@@ -131,10 +131,12 @@ class AttentionCase:
     template_attention`): 4-D, one term a key `[B or 1, H or 1, 1, K]` (ALiBi's) or dense `[B or 1, H or 1,
     Q, K]`, its rows and heads the call's or one for them all (a key head's `[B, Hk, Q, K]` broadcasts to
     none of them, row 2578), of at most fp32's width."""
+    dense_bias: bool
+    """Whether the call's bias varies by query (`[B or 1, H or 1, Q, K]`), which the template reads a tile at
+    a time (`template.biased`)."""
     row_bias: bool
-    """Whether the call's bias varies by query and by batch row (`[B, H or 1, Q, K]`), which the template
-    reads a tile at a time a row (`template.biased`); a table every row shares (T5's `[1, H, Q, K]`) it
-    reads once a tile (`template.shared_place`)."""
+    """Whether that dense bias varies by batch row too (`[B, H or 1, Q, K]`); a table every row shares (T5's
+    `[1, H, Q, K]`) the Mosaic mainloop reads once a tile (`template.shared_place`)."""
     sinks: bool
     softcap: float | None
     arithmetic: bool
@@ -145,7 +147,7 @@ class AttentionCase:
     shards: int
     form: str = "fast"
     """The form the template computes in where it runs the call (`attention_route.FORMS`), as the
-    run chose it (`generation.chosen(attention_form=...)`): the old routes compute their own arithmetic
+    run's numerics name it (`generation.numerics().forms`): the old routes compute their own arithmetic
     and take only 'fast', so an accurate call runs the template, or the reference path where the
     template does not take it."""
 
@@ -272,7 +274,7 @@ CUDNN_SUPPORTS = (
                 "named)", row='measured: cuDNN dense-mask bias (docs/performance.md)', kind='measured'),
     _Need('mask', lambda case: not case.mask,
                 "cuDNN takes an arbitrary mask as a dense bias, which costs more than the xla kernel's "
-                "mask but in a forward-only cache call (`kernel_for_materialized_mask`)",
+                "mask but for a window's band or a forward-only cache call (`attention.mask_kernel`)",
                 row='measured: cuDNN dense-mask bias (docs/performance.md)', kind='measured'),
     _Need('spans_only', lambda case: not case.spans_only,
                 "cuDNN takes block groups, key validity or counted places only as the mask the call's spans "
@@ -410,10 +412,14 @@ TEMPLATE_SUPPORTS = (
           "the call's bias is not 4-D one term a key or a query's every key, its rows and heads the call's "
           "or one for them all, or is wider than fp32, which the template's score hook reads it in",
           row=INHERENT),
-    _Need('row_bias', lambda case: not case.row_bias,
-          "the call's bias varies by query and by batch row, which the xla kernel runs 7% faster (named, it "
-          "runs, in less memory); a table every row shares the template runs a third faster in half the "
-          "memory (ET-DBIAS-h100)", row='2523', kind='measured'),
+    _Need('dense_bias',
+          lambda case: not case.dense_bias or (not case.row_bias
+                                               and generation.gpu_target().architecture.wgmma),
+          "the call's bias varies by query: by batch row too, which the xla kernel runs 7% faster on an "
+          "H100, or a table every row shares on a GPU without warpgroup MMA, where the template's frozen "
+          "Triton mainloop reads it spread to every row, unmeasured; a shared table the warpgroup-MMA "
+          "Mosaic mainloop runs a third faster in half the memory (ET-DBIAS-h100; named, it runs)",
+          row='2625', kind='measured'),
     _Need('shards', lambda case: case.shards == 1,
           "an automatic sequence axis gathers the keys, and a pallas call would gather the queries back",
           row=INHERENT),

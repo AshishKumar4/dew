@@ -12,7 +12,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from decision_support import decision_rows, zeroed
+from decision_support import decision_rows
 from recording import RecordingTracker
 from reference_error import as_given, assert_as_exact
 
@@ -157,7 +157,12 @@ def at_offset(batch, window: int, row: int) -> dict:
     if "positions" in batch:
         filler = np.cumsum(before) - 1
         one["positions"] = np.where(mine, batch["positions"][window], np.where(before, filler, 0))[None]
-    return one | {"segments": (before + mine * (1 + before.any())).astype(np.int32)[None]}
+    # The row's document is 1 + whether a filler document stands before it, and its questions are its own:
+    # each question's row the row's new document, or its queries would read no document's tokens.
+    document = 1 + int(before.any())
+    if "question_rows" in batch:
+        one["question_rows"] = np.full((1, asked.size), document, np.int32)
+    return one | {"segments": (before + mine * document).astype(np.int32)[None]}
 
 
 def in_place(batch, placed: list[tuple[int, int]]) -> dict:
@@ -218,8 +223,8 @@ def decided(objective, variables, batch, segments: int):
 
 # The joint arm's float64 truth over the seeds its gradients need is numeric work at model size, a GPU's
 # (BIBLE §8): on armada it took 705 s of CPU, the suite's whole critical path; the others take 187 s and 36 s.
-@pytest.mark.parametrize("arm", [pytest.param("joint", marks=pytest.mark.gpu(
-    reason="the joint arm's float64 truth at the seeds it needs")), "marker", "parallel"])
+# The joint arm runs in the models' GPU flow (tests/test_gpu_models.py).
+@pytest.mark.parametrize("arm", ["marker", "parallel"])
 def test_a_packed_window_decides_each_row_as_the_row_alone(arm):
     """Rows packed into windows (segments, positions restarting per row, spans moved) give each
     question's logits and the parameters' gradients each row gives alone where its window packed it,
@@ -229,9 +234,9 @@ def test_a_packed_window_decides_each_row_as_the_row_alone(arm):
     fp32, bf16 and fp16).
 
     The reference runs the same kernels at the same shapes as the window (`rows_alone`), so this
-    holds what packing does; on a GPU the delta rule runs on its port in both, and its algorithm's
-    parity with fla is held at the layer, against fla's own packed sequences (test_fla_gdn,
-    test_fla_kda)."""
+    holds what packing does; on a GPU the delta rule runs on its port in both, and its algorithm is held
+    at the layer: against the token recurrence in float64 on packed documents (test_fla_gdn), and trained
+    natively on a GPU (tests/test_gpu_recurrence.py's port cells)."""
     objective = objective_for(arm)
     assert_rows_decided_alone(objective, (objective.model.backbone.clone(dtype=jnp.float64,
                                                                          attention_impl="reference"),
@@ -254,8 +259,7 @@ def test_a_labelled_readout_reads_each_packed_row_at_its_own_answer_cue():
                                           objective.model.head), PACKING_SEEDS["readout"])
 
 
-@pytest.mark.gpu(reason="FlashAttention's packed sequences run on CUDA")
-def test_a_bf16_joint_head_on_flash_reads_each_packed_row_alone(without_deterministic_ops):
+def a_bf16_joint_head_on_flash_reads_each_packed_row_alone(without_deterministic_ops):
     """The joint schema head in bf16 on flash: its routing and field layers read the window's tokens
     by documents, flash's packed sequences of the keys' own offsets, its padded questions and slots
     reading nothing. Each packed row's logits and the gradients are the row's alone within the
@@ -326,8 +330,7 @@ def assert_rows_decided_alone(objective, wide_modules, seeds: int, count: int = 
     """`count` packed windows of the examples decide each row's questions as the row does alone where
     its window packed it (`rows_alone`), logits and every parameter's gradient on par with it (check 1)
     over drawn parameters, the truth `wide_modules`, the backbone and head in float64, over the rows
-    in windows of their own, and the algebraic zeros' exactly zero under the loss (`decision_support.zeroed`):
-    residue there, rounding alike on no two hosts."""
+    in windows of their own, a leaf zero by algebra sized by the terms its sum adds."""
     batch = windows(objective, count)
     assert max(int(segments.max()) for segments in batch["segments"]) > 1, "no window packed two rows"
     # A sequence kernel runs as many documents as the coordinates bound, and a window's padding as one
@@ -354,15 +357,18 @@ def assert_rows_decided_alone(objective, wide_modules, seeds: int, count: int = 
         return wide.model.logits(variables, laid_out(rows, segments)), gradient(wide, variables, rows)
 
     def truth(variables):
-        # The truth of the algebraic zeros is exactly zero, which each of their rows is held to.
+        # A leaf zero by algebra (a key's bias, the scorer's shared bias under the loss) cancels in its
+        # sum, which the check sizes by the terms it adds (`terms`).
         logits, grads = apart_in_float64(variables)
-        return np.asarray(logits)[rows["options"]], zeroed(grads, loss=True)
+        return jnp.asarray(logits)[rows["options"]], grads
 
     # A logit sums within its row's window; a parameter's gradient over every window's tokens, in
     # another order than the rows alone.
     initialized = jax.jit(objective.init)
+    # A leaf whose float64 truth cancels, an algebraic zero's, is sized by the terms its sums add
+    # (`terms`), so each arm's rounding of them is on par, on every backend.
     assert_as_exact(packed, alone, lambda seed: (initialized(jax.random.key(seed)),), "packed window",
-                    seeds=seeds, truth_fn=truth)
+                    seeds=seeds, truth_fn=truth, terms=True)
 
 
 def test_a_decision_run_steps_one_program_over_rows_of_every_length():

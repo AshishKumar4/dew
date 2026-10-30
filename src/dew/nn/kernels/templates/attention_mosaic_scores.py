@@ -3,12 +3,21 @@ static choices (`_Backward`), whether a layout's consumers share a key block (`s
 hook parameters and its weights and score cotangents under the forward's statistics (`_scores`)."""
 
 import dataclasses
+import functools
 
+import jax
+from jax import lax
 from jax.experimental import pallas as pl
 
 from dew.nn.kernels.templates import attention_algebra as algebra, mosaic
-from dew.nn.kernels.templates.attention import DQ_GRADS, Kind
-from dew.nn.kernels.templates.attention_mosaic_program import BackwardTiles, _param, _Program
+from dew.nn.kernels.templates.attention import DQ_GRADS, Kind, by_power
+from dew.nn.kernels.templates.attention_mosaic_program import (
+    BackwardTiles,
+    _param,
+    _Program,
+    _streamed,
+    _views_of,
+)
 
 
 def split_queries(family: mosaic.Family) -> bool:
@@ -72,6 +81,37 @@ def _score_params(family: mosaic.Family, refs, kinds: tuple[Kind, ...], row, hea
     return tuple(_param(family, ref, kind, row, head, first, like, k_first, keys_first=keys_first)
                  for ref, kind in zip(refs, kinds, strict=True))
 
+def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple, coords: algebra.Coords, whole,
+                 shape: tuple[int, int], *, masked: bool | None) -> tuple[jax.Array, jax.Array]:
+    """A queries-first step's tile of a hookless fast-form call (`_fused_step`'s, `_coop_step`'s): its
+    logits from the query slot taken by its power in registers (`_Backward.scaled`) against the resident
+    keys (`resident`, `[bk, D]` and `[bk, Dv]` refs, a consumer's share of them where keys are shared), dP
+    from the output-cotangent slot against the values, then `_scores` under the tile's queries' statistics
+    `rows` (read before its products, which their loads run under: ET-A05AB5/6-h100, 2.05 against 2.32 ms
+    read past them at Qwen3-8B causal) and `coords`, masked where `masked`, or where it is None chosen at run
+    time, unmasked where every query sees the tile `whole`. Returns its weights narrowed for dV
+    (`algebra.value_weights`) and its score cotangents' one part in the operands' dtype (dK's and dQ's)."""
+    family = walk.program.family
+    (q_slot, do_slot), (keys, values) = slots, resident
+    held = keys.transpose((1, 0))
+    s = (family.registers_product(by_power(family.tile_of(q_slot), walk.spec.prescale), held, walk.interpret)
+         if walk.scaled else family.product(q_slot, held, shape))
+    dp = family.product(do_slot, values.transpose((1, 0)), shape)
+
+    def scores(*, masked: bool):
+        # A tile every query sees whole (`masked` False) takes no mask (`_dq_step`'s choice).
+        exponentials, weights, cotangents, _, _ = _scores(walk, coords, (), s, dp, *rows, masked=masked)
+        return exponentials, weights, cotangents
+
+    if masked is None:
+        exponentials, weights, cotangents = lax.cond(whole, functools.partial(scores, masked=False),
+                                                     functools.partial(scores, masked=True))
+    else:
+        exponentials, weights, cotangents = scores(masked=masked)
+    ((part, _),) = algebra.cotangent_parts(cotangents * walk.grad_scale, q_slot.dtype, accurate=False)
+    return algebra.value_weights(exponentials, weights, do_slot.dtype), part
+
+
 def _scores(walk: _Backward, coords: algebra.Coords, params: tuple, s, dp, peak, total, anchor, delta,
             chosen, *, masked: bool):
     """A backward tile's weights unnormalized and over `total`, its score cotangents (`algebra.grad_scores`)
@@ -104,3 +144,30 @@ def _dq_added(walk: _Backward, dq_ref, out_smem, place: tuple, index, q_first, d
     rows = dq.shape[0]
     view = dq_ref.at[index if walk.interpret else 0, row, pl.ds(q_first, rows), head]
     walk.program.family.added(dq, view, walk.interpret, smem=out_smem.at[index, pl.ds(0, rows)])
+
+
+def _query_program(program: _Program, streams, k_ref, v_ref, spans, *, heads: int, kv_heads: int,
+                   queries: int, consumers: int) -> tuple:
+    """A program over query tiles' place and key streams (the dQ launch's and dropout's first pass's): its
+    batch row and query head, its key and value views (`_views_of`) and their streams opened, its
+    consumers' first query (`_Program.query_tile`, a tile each) and the key tiles any of them reads
+    (`_Program.reach`, `_streamed`)."""
+    block_q = program.tiles.block_q
+    row, head = lax.axis_index("batch"), lax.axis_index("heads")
+    views = _views_of({"keys": k_ref, "values": v_ref}, row, lax.div(head, heads // kv_heads))
+    streams = program.family.opened(streams, views)
+    pair = consumers * block_q
+    pair_first = program.query_tile(queries // pair) * pair
+    streamed = _streamed([program.reach(pair_first + index * block_q, spans, row)[:2]
+                          for index in range(consumers)])
+    return row, head, views, streams, pair_first, streamed
+
+
+def _query_tile_loaded(family: mosaic.Family, refs: tuple, smem: tuple, loaded: tuple, place: tuple, first,
+                       index) -> None:
+    """Consumer `index`'s query tile from `first` and its output cotangents, each `(ref, smem)` of `refs`
+    and `smem` loaded whole against its `loaded` barrier at the program's batch row and head (`place`)."""
+    row, head = place
+    rows = (row, pl.ds(first, smem[0].shape[1]), head)
+    family.loaded(tuple((ref.at[rows], stage.at[index], barrier.at[index])
+                        for ref, stage, barrier in zip(refs, smem, loaded, strict=True)))

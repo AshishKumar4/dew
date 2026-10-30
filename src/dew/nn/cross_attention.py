@@ -66,6 +66,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew.batch import coordinates
 from dew.nn.dropout import Dropout
+from dew.nn.progress import END, Progress, progressed
 
 from .activations import GatedActivation
 from .attention import AttentionImpl
@@ -108,7 +109,7 @@ over it in a pass of its own."""
 def encode_context(model: nn.Module, variables: Mapping, tokens: jax.Array, lengths: jax.Array, *,
                    encoder: ContextEncoder, train: bool = False,
                    rngs: dict[str, jax.Array] | None = None, segments: jax.Array | None = None,
-                   max_segments: int = 1) -> dict[str, jax.Array]:
+                   max_segments: int = 1, progress: Progress = END) -> dict[str, jax.Array]:
     """The conditioning a model's cross-attention layers read (`CrossAttending`) for contexts of
     token ids: `tokens` `[B, C]`, each row's first `lengths` real, as `encoder` says, and where a row
     packs the contexts of up to `max_segments` documents, each token's document, `segments` `[B, C]`
@@ -118,7 +119,8 @@ def encode_context(model: nn.Module, variables: Mapping, tokens: jax.Array, leng
     `table` gives each token's row of the model's own table at its stream's width (`stream_embeddings`);
     `backbone` the
     model's final states over each context alone (`HiddenStates`), its real tokens one document, with
-    the weights of the model's own pass, an adapter's included. Where the model trains nothing but its
+    the weights of the model's own pass, an adapter's included, at the run's `progress` where the model
+    reads it (`dew.nn.progress`). Where the model trains nothing but its
     cross-attention blocks (`crosses_alone`), which a pass without a context runs none of, that pass
     trains nothing and its gradient is not taken. The states keep the dtype they are computed in, and
     the model casts them to its blocks' (`context_dtype`). `variables` are the model's own, whole or
@@ -142,7 +144,8 @@ def encode_context(model: nn.Module, variables: Mapping, tokens: jax.Array, leng
         documents = real.astype(jnp.int32) if segments is None else jnp.where(real, segments, 0)
         laid = coordinates(segments=documents, max_segments=max_segments if segments is not None else 1,
                            right_padded=True)
-        states = model.apply(whole, tokens, train=train, coordinates=laid, method="hidden_states", rngs=rngs)
+        states = model.apply(whole, tokens, train=train, coordinates=laid, method="hidden_states", rngs=rngs,
+                             **progressed(model, progress))
         if crosses_alone(variables.get("params", {})):
             states = jax.lax.stop_gradient(states)
     else:
@@ -200,7 +203,8 @@ class AttendsContext(Protocol):
     projects keys and values of its own to read one with, the key heads' count and the widths of a
     key and a value head, its query heads over the layer's input, its key and value heads over a
     context, its attention of the one over the other through its output projection, and that read's
-    work (`dew.nn.mixers.attention.CausalSelfAttention`)."""
+    work: `dew.nn.mixers.attention.CausalSelfAttention`'s, `dew.nn.mla.MultiHeadLatentAttention`'s (and
+    so k-pool's) and `dew.nn.deepseek_v4.DeepseekV4Attention`'s."""
 
     @property
     def reads_context(self) -> bool: ...
@@ -217,15 +221,18 @@ class AttendsContext(Protocol):
 
     def attend_context(self, query: jax.Array, gate: jax.Array | None, key: jax.Array,
                        value: jax.Array, *, lengths: jax.Array, queries: jax.Array | None = None,
-                       segments: jax.Array | None = None, max_segments: int | None = None) -> jax.Array: ...
+                       segments: jax.Array | None = None, max_segments: int | None = None,
+                       progress: jax.Array | None = None) -> jax.Array: ...
 
 
 class LayerReads(NamedTuple):
     """What a block that reads through its layer (`reads_layer`) is handed: the layer's attention
-    input from the states a sublayer reads, normed as its attention reads it, and its attention."""
+    input from the states a sublayer reads, normed as its attention reads it, its attention, and the
+    call's progress (`AttentionMetadata.progress`), which that attention may read."""
 
     normed: Callable[[jax.Array], jax.Array]
     attention: AttendsContext
+    progress: jax.Array | None = None
 
 
 def crossed_flops(decoder: CausalTransformer, lengths, context_lengths, *, held: bool = False) -> float:
@@ -382,8 +389,9 @@ class SharedCrossAttention:
         mixer = decoder.mixer_of(index)
         if not isinstance(mixer, AttendsContext):
             raise ValueError(f"layer {index}'s mixer ({type(mixer).__name__}) reads no context through its "
-                             "own attention (AttendsContext, which CausalSelfAttention implements); name "
-                             "layers of standard attention, or read the context with CrossAttention's block")
+                             "own attention (AttendsContext, which standard, latent (MLA, k-pool) and "
+                             "DeepSeek V4 attention implement); name layers of those, or read the context "
+                             "with CrossAttention's block")
         if not mixer.reads_context:
             raise ValueError(f"layer {index} shares its keys and values with an earlier layer, so it "
                              "projects none of its own to read a context with")
@@ -549,7 +557,8 @@ class SharedGatedCrossAttention(nn.Module):
             key, value = attention.context_keys(embeddings)
         documents = ({} if context is None or context.segments is None
                      else {"queries": context.queries, "segments": context.segments})
-        branch = attention.attend_context(query, gate, key, value, lengths=lengths, **documents)
+        branch = attention.attend_context(query, gate, key, value, lengths=lengths, progress=layer.progress,
+                                          **documents)
         branch = Dropout(rate=self.dropout_rate)(branch, deterministic=not train)
         return _joined(self, "alpha_cross_attn", stream, branch, _present(stream, context, lengths),
                        ngpt=self.ngpt, precision=self.precision)

@@ -11,7 +11,7 @@ import functools
 import math
 import time
 import types
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 
 import grain.python as pygrain
 import jax
@@ -24,12 +24,12 @@ from jax.sharding import Mesh
 from dew import position
 from dew._coordination import agreed, agreed_next
 from dew._records import JSON
-from dew.batch import CLOSES_WINDOW, CONSUMED_COUNT, EXAMPLES_CONSUMED, Batch, ConsumedCount
+from dew.batch import CLOSES_WINDOW, CONSUMED_COUNT, EXAMPLES_CONSUMED, VALID_ROWS, Batch, ConsumedCount
 from dew.checkpoints import Checkpoints
 from dew.data.compile import Handed, native
-from dew.data.dataset import Closeable, DataPartition, Loader, PhasedStream, Reader
+from dew.data.dataset import Checkpointable, Closeable, DataPartition, Loader, PhasedStream, Reader
 from dew.data.pipeline import Dataset
-from dew.distributed.batches import DevicePrefetchIterator, Signature
+from dew.distributed.batches import DevicePrefetchIterator, Signature, restore_position
 from dew.distributed.placement import MeshSpec, Placement
 from dew.objectives.base import Initializer, Metric, Objective, TrainingScalar
 from dew.optim import OptimConfig, reclocked
@@ -39,7 +39,7 @@ from dew.training.budget import Pause, Plateau, every_step, recorded
 from dew.training.cadence import Cadence, Counted
 from dew.training.cooldown import Branch
 from dew.training.evaluation import EvalSuite, Evaluation, Summary
-from dew.training.interval import Interval, Taken, TokenClock
+from dew.training.interval import Interval, LogWriter, Taken, TokenClock
 from dew.training.observe import Observe
 from dew.training.profiling import ProfileWindow, start_capture
 from dew.training.runtime import PreemptionNotice
@@ -327,6 +327,8 @@ class FitRun:
     notice: PreemptionNotice | None = None
     endless: bool = False
     taken: Taken | None = None
+    writer: LogWriter = dataclasses.field(default_factory=LogWriter)
+    """Where the logs the loop takes are read and reported, off the loop (`Trainer._read_taken`)."""
     scored: frozenset[str] = frozenset()
     """The suites `evaluation` scored at its step, which a run whose stream ends there scores once."""
     ahead: tuple[Batch | None] | None = None
@@ -405,12 +407,26 @@ class FitRun:
         last = self.ends_here(interval)
         if self.ran_out:
             batch = drained(batch, interval.consumed, examples)
-        return {**batch, CLOSES_WINDOW: np.bool_(last)}, position
+        return closes_window(batch, examples, last=last), position
 
     def held(self) -> contextlib.AbstractContextManager[None]:
         """The training stream's placements held for a block of device work beside the steps
         (`DevicePrefetchIterator.held`), none to hold once the stream is closed."""
         return contextlib.nullcontext() if self.train is None else self.train.held()
+
+    def further(self, interval: Interval) -> Callable[[], Batch | None]:
+        """A read of the training stream's next batch for a rollout that draws past its step's
+        (`Rollout.draws_further`): from inside the step's hold on placements (`read_held`), agreed as a
+        step's read is, its wait counted in `interval`; None where the stream ran out on every process.
+        Its position is the stream's after it, which the step saves as any read's."""
+        def read() -> Batch | None:
+            assert self.train is not None
+            asked = time.perf_counter()
+            batch = agreed_next("rollout read", iter(self.train.read_held, None))
+            interval.waited += time.perf_counter() - asked
+            return batch
+
+        return read
 
     def read(self) -> Batch:
         """The training stream's next batch, read through this run each time:
@@ -501,8 +517,8 @@ def validation_read(name: str, suite: EvalSuite, *, read: bool, previewed: bool)
 def consumption_counted(batch: Batch, *, clocked: bool) -> Batch:
     """A clocked run's `batch` with the examples it consumes counted on the host (`ConsumedCount`) as it is
     prepared; one a step after the bound rebuilt without its count is refused, as the run would stay at
-    its start. A run on another clock, one bounded in examples whose plan counts its steps ahead, keeps
-    no count: none rides to its step."""
+    its start, and each marks its real rows (`VALID_ROWS`). A run on another clock, one
+    bounded in examples whose plan counts its steps ahead, keeps no count: none rides to its step."""
     if not clocked:
         return batch if EXAMPLES_CONSUMED not in batch else {
             name: value for name, value in batch.items() if name != EXAMPLES_CONSUMED}
@@ -510,7 +526,12 @@ def consumption_counted(batch: Batch, *, clocked: bool) -> Batch:
         raise ValueError("a step after the examples bound dropped the batch's count of the examples it "
                          f"consumes ({EXAMPLES_CONSUMED!r}), which this run's progress reads: a native Grain "
                          "step that rebuilds its records keeps no count")
-    return {**batch, CONSUMED_COUNT: ConsumedCount(int(np.sum(batch[EXAMPLES_CONSUMED])))}
+    counted_batch = {**batch, CONSUMED_COUNT: ConsumedCount(int(np.sum(batch[EXAMPLES_CONSUMED])))}
+    if VALID_ROWS not in batch:
+        # A clocked read ends at its bound, in a short batch filled and marked: each of its batches marks
+        # its real rows, so every one is the same tree, the run's one program.
+        counted_batch[VALID_ROWS] = np.ones(len(np.asarray(batch[EXAMPLES_CONSUMED])), bool)
+    return counted_batch
 
 
 def waited_read(run: FitRun, interval: Interval, *, agree: bool, peek: bool = False) -> Batch | None:
@@ -534,6 +555,14 @@ def waited_read(run: FitRun, interval: Interval, *, agree: bool, peek: bool = Fa
     if batch is None and not run.current:
         raise ValueError("the training data holds no batch to train on")
     return batch
+
+
+def closes_window(batch: Batch, examples: int | None, *, last: bool = False) -> Batch:
+    """`batch` as a run on the examples clock (bounded to `examples`) hands its step: marked whether it is
+    the run's `last`, closing its update window (`CLOSES_WINDOW`), every batch of such a run marked, so
+    every step it compiles is one program, fit's, one compiled ahead (`dew.training.ahead.step_batch`)
+    and a cooldown's; a run on another clock's batch as it is."""
+    return batch if examples is None else {**batch, CLOSES_WINDOW: np.bool_(last)}
 
 
 def fit_policies[LossT, EffectsT](objective: Objective[LossT, EffectsT], best, stop, scored,
@@ -595,12 +624,17 @@ def fit_policies[LossT, EffectsT](objective: Objective[LossT, EffectsT], best, s
     return selection, plateau, pause
 
 
-def first_batch(loader: Loader, mesh: Mesh) -> Batch:
-    """The first batch `loader`'s training stream gives this process's share of `mesh`, the stream then
-    closed: what an objective that names its input alone reads the shape off (`Trainer._declare_input`), once,
-    before the run opens its stream where it starts."""
+def first_batch(loader: Loader, mesh: Mesh, position: bytes | None = None) -> Batch:
+    """The first batch `loader`'s training stream gives this process's share of `mesh`, from the saved
+    `position` a resume continues at where given, the stream then closed: what an objective that names
+    its input alone reads the shape off (`Trainer._declare_input`), once, before the run opens its stream
+    where it starts, and the batch a step compiled ahead is compiled over (`AheadTarget.compiled`)."""
     stream = loader.train(DataPartition.of(mesh))
     try:
+        if position is not None:
+            if not isinstance(stream, Checkpointable):
+                raise TypeError("the training stream keeps no position a resume reads its batch from")
+            restore_position(stream, position)
         batch = next(iter(stream), None)
     finally:
         if isinstance(stream, Closeable):

@@ -1,5 +1,6 @@
 """Dew's CI plan and task on armada (tools/armada/ci.py), on small test files written here."""
 
+import functools
 import itertools
 import json
 import os
@@ -14,6 +15,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 import pytest
+from armada_support import cached, interpreter, loaded, written
 from tool_support import git, load
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -21,32 +23,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 @pytest.fixture
 def ci(tmp_path, monkeypatch):
-    module = load("ci", "tools/armada")
-    monkeypatch.chdir(tmp_path)
-    # CI's own environment names the shared test cache; these runs of the tools must not read or write it.
-    for name in ("DEW_XLA_CACHE_URL", "DEW_XLA_CACHE_TOKEN", "DEW_XLA_CACHE_READ_TOKEN", "DEW_TEST_CACHE"):
-        monkeypatch.delenv(name, raising=False)
-    (tmp_path / "tests").mkdir()
-    return module
-
-
-def interpreter(root: Path, version: str) -> None:
-    """The checkout's `.venv-<version>` python, as the CI image has it: here, this interpreter."""
-    venv = root / f".venv-{version}/bin"
-    venv.mkdir(parents=True)
-    (venv / "python").write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
-    (venv / "python").chmod(0o755)
-
-
-def written(root: Path, files: dict[str, str]) -> None:
-    for name, source in files.items():
-        (root / "tests" / name).write_text(source)
-
-
-def cached(monkeypatch, url: str) -> None:
-    """The shared test cache at `url`, as CI's environment names it."""
-    monkeypatch.setenv("DEW_XLA_CACHE_URL", url)
-    monkeypatch.setenv("DEW_XLA_CACHE_TOKEN", "token")
+    return loaded(tmp_path, monkeypatch)
 
 
 def gpu_driver(root: Path, monkeypatch) -> None:
@@ -158,6 +135,8 @@ def test_a_collect_task_rows_each_file_red_where_it_would_not_import(ci, tmp_pat
     assert {name: (row["kind"], row["failed"]) for name, row in rows.items() if row["exitCode"]} == {
         "3.14:tests/test_broken.py#collect": ("collect", []),
         "3.14:tests/test_missing.py#collect": ("collect", [])}
+    # A collection runs no test, so its rows count no site moved onto YNNPACK's fusions.
+    assert all(row["ynn_switched"] == [] for row in rows.values())
 
 
 def test_a_targeted_pytest_selects_the_tests_a_task_would_and_its_own_arguments_override(ci, tmp_path):
@@ -217,7 +196,7 @@ def test_a_task_rows_each_file_red_where_ci_would_fail(ci, tmp_path):
 
 def test_a_tasks_tests_run_with_no_timed_stack_dump_armed(ci, tmp_path):
     """A task's pytest arms no timed dump of every thread's stack, which killed a multithreaded test mid-dump
-    (exit 245, a SIGSEGV, Main 2026-10-25): the test process CI starts carries no dump timer. A test running
+    (exit 245, a SIGSEGV, 2026-10-25): the test process CI starts carries no dump timer. A test running
     past the old ten minutes through a task is green with no dump (armada receipt in the head's review)."""
     (tmp_path / "tests/test_timer.py").write_text(
         "def test_no_dump_timer(request):\n"
@@ -370,68 +349,28 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
     assert [ci.reused("3.12", f"tests/{name}", "", common) is not None
             for name in ("test_machine.py", "test_tool.py", "test_spawn.py", "test_forkserver.py",
                          "test_fork.py", "test_shell.py")] == [True, True, False, False, False, False]
-    monkeypatch.setattr(sys, "argv", ["ci.py", "gpu-tier", "--shards=2"])
+    # A day's tier is the checkout's gpu-marked files, whatever the records say a file reads (ledger 2452);
+    # --marked names it for the caller that still passes it (2714); --evidence prints each beside its reads.
+    tier = functools.partial(named_tier, ci, monkeypatch, capsys)
+    assert tier("--shards=2") == tier("--marked") == ["tests/test_marked.py"]
+    assert [line.split("\t")[:2] for line in tier("--evidence", lines=True)] == [
+        ["tests/test_marked.py", "1 marked"]]
+    # A file gains a GPU test after its record: the checkout's marks choose, not records; a kernel's test is
+    # the CPU's, interpreted.
+    (tmp_path / "tests/test_plain.py").write_text(
+        "import pytest\n@pytest.mark.gpu\ndef test_lowers(): pass\n")
+    (tmp_path / "tests/test_new.py").write_text(
+        "import pytest\n@pytest.mark.kernel\ndef test_interpreted(): pass\n")
+    assert tier() == ["tests/test_marked.py", "tests/test_plain.py"]
+
+
+def named_tier(ci, monkeypatch, capsys, *flags: str, lines: bool = False) -> list:
+    """What `ci.py gpu-tier` with `flags` prints: its files, or its lines where `lines`."""
+    monkeypatch.setattr(sys, "argv", ["ci.py", "gpu-tier", *flags])
     capsys.readouterr()
     assert ci.main() == 0
-    shards = [line.split() for line in capsys.readouterr().out.splitlines()]
-    assert len(shards) == 2 and all(shards)
-    assert sorted(name for names in shards for name in names) == sorted(ci.gpu_tier("3.12"))
-    # A file gains a kernel's test after its record: per batch the checkout's marks choose, not records.
-    (tmp_path / "tests/test_plain.py").write_text(
-        "import pytest\n@pytest.mark.kernel\ndef test_lowers(): pass\n")
-    monkeypatch.setattr(sys, "argv", ["ci.py", "gpu-tier", "--marked"])
-    assert ci.main() == 0
-    assert capsys.readouterr().out.split() == ["tests/test_marked.py", "tests/test_plain.py"]
-
-
-def test_a_python_child_joins_its_files_record(ci, tmp_path, monkeypatch, cache_worker):
-    """A Python child a test file starts with its environment records itself
-    (tools/armada/followed.py), once and silently though its site-packages are
-    processed again: its reads of the backend join the file's evidence, and
-    the files it executed and the pages it read the file's key, which holds
-    until one changes. A child given an environment of its own, or killed
-    before it wrote its record, leaves its file without a key."""
-    url, _, _ = cache_worker
-    cached(monkeypatch, url)
-    started = "import os, subprocess, sys\ndef test_child():\n    "
-    files = {
-        "devices.py": "class Device:\n    platform = 'gpu'\ndef placed(device): return device.platform\n",
-        "plain.py": "def helper(): return 1\n",
-        "child.py": "import site, sysconfig\n"
-                    "site.addsitedir(sysconfig.get_paths()['purelib'])\n"
-                    "import devices, plain\n"
-                    "assert devices.placed(devices.Device()) == 'gpu' and plain.helper()\n"
-                    "assert open('notes/page.md').read()\n",
-        "test_child.py": started + "done = subprocess.run([sys.executable, 'tests/child.py'], check=True,\n"
-                                   "                      capture_output=True, text=True)\n"
-                                   "    assert not done.stderr, done.stderr\n",
-        "test_quiet.py": started + "subprocess.run([sys.executable, '-c', 'pass'], check=True)\n",
-        "test_killed.py": started + "child = subprocess.Popen([sys.executable, '-c', 'input()'], stdin=-1)\n"
-                                    "    child.kill()\n    child.wait()\n",
-        "test_own_environment.py": started + "subprocess.run([sys.executable, '-c', 'pass'], check=True,\n"
-                                             "                   env={'PATH': os.environ['PATH']})\n",
-    }
-    written(tmp_path, files)
-    (tmp_path / "notes").mkdir()
-    (tmp_path / "notes/page.md").write_text("page\n")
-    interpreter(tmp_path, "3.12")
-    tests = [f"tests/{name}" for name in files if name.startswith("test_")]
-    ci.task("3.12", tests, "", tmp_path / "verdict.json", 600.0)
-
-    def reused() -> list[bool]:
-        common = ci.shared("3.12")
-        return [ci.reused("3.12", name, "", common) is not None for name in tests]
-
-    assert reused() == [True, True, False, False]
-    (tmp_path / "notes/page.md").write_text("page again\n")
-    assert reused() == [False, True, False, False]
-    (tmp_path / "notes/page.md").write_text("page\n")
-    assert reused() == [True, True, False, False]
-    (tmp_path / "tests/plain.py").write_text("def helper(): return 2 - 1\n")
-    assert reused() == [False, True, False, False]
-    assert ci.gpu_tier("3.12") == {"tests/test_child.py": ["tests/devices.py:placed"],
-                                   "tests/test_killed.py": ["changed"],
-                                   "tests/test_own_environment.py": ["changed"]}
+    out = capsys.readouterr().out
+    return out.splitlines() if lines else out.split()
 
 
 def fetcher(root: Path, *, due: bool = False) -> Path:
@@ -475,7 +414,8 @@ def test_a_network_lane_runs_the_network_marked_tests_with_the_hub_open_and_reco
     """The network lane runs each file's network-marked tests alone, which every other task sets aside,
     with the Hub open, and records them on a class of their own: the same file's CUDA lane, Hub closed,
     runs its other tests and is no reuse of the network lane's run, and a second network lane on the same
-    inputs reuses its own (Main, 2026-10-25: no CI run reached the published checkpoints' parity tests)."""
+    inputs reuses its own (the maintainer, 2026-10-25: no CI run reached the published checkpoints' parity
+    tests)."""
     url, _, _ = cache_worker
     gpu_lane_at(tmp_path, monkeypatch, url, 0)
     interpreter(tmp_path, "3.12")
@@ -709,37 +649,6 @@ def test_a_first_gpu_lane_on_a_class_borrows_another_classs_measured_shares(
     assert ci.gpu_lane("3.12", ["tests/test_tight.py"], out, cache="off", processes=4, deadline=600.0) == 0
     assert [share for share, *_ in ran("test_tight")][-1] != borrowed
     assert "interference" not in json.loads(out.read_text())["rows"][0]
-
-
-def test_a_files_children_hold_what_they_held_at_once_and_each_start_must_leave_its_record(tmp_path):
-    """The children's records join the file that started them (`followed.gathered`): their files,
-    and the GPU they held, the most a child that took the parent's fraction used, those children as
-    shares and the bytes of those that named their own, counted only while they lived at once. A
-    file is followed only where every start it and its children saw left a record naming it and none
-    started a process it did not follow; one whose child marked its start and left no record, killed
-    before it wrote, is not."""
-    followed = load("followed", "tools/armada")
-    gib = 2 ** 30
-
-    def child(index, file, began, ended, pool=None, inherited=True, expected=0, unfollowed=False, peak=None):
-        (tmp_path / f"{index}.started").write_text(file)
-        (tmp_path / f"{index}.json").write_text(json.dumps({
-            "file": file, "files": [f"src/{index}.py"], "reads": [], "expected": expected, "peak": peak,
-            "unfollowed": unfollowed, "began": began, "ended": ended, "pool": pool, "inherited": inherited}))
-
-    child(1, "tests/a.py", 0, 10, pool=6 * gib, peak=5 * gib)
-    child(2, "tests/a.py", 5, 15, pool=6 * gib, expected=1, peak=gib)
-    child(3, "tests/a.py", 20, 30, pool=3 * gib, inherited=False)
-    child(4, "tests/a.py", 25, 35, pool=2 * gib, inherited=False)
-    child(5, "tests/a.py", 40, 41)
-    child(6, "tests/b.py", 0, 1)
-    child(7, "tests/c.py", 0, 1)
-    (tmp_path / "8.started").write_text("tests/c.py")
-    child(9, "tests/d.py", 0, 1, unfollowed=True)
-    found = followed.gathered(tmp_path, {"tests/a.py": 4, "tests/b.py": 2, "tests/c.py": 2, "tests/d.py": 1})
-    assert found["tests/a.py"] == {"files": {f"src/{index}.py" for index in range(1, 6)}, "reads": set(),
-                                   "followed": True, "peak": 5 * gib, "shares": 2, "pools": 5 * gib}
-    assert [found[name]["followed"] for name in ("tests/b.py", "tests/c.py", "tests/d.py")] == [False] * 3
 
 
 def test_coverage_combines_each_tasks_branches_into_one_report_a_module_a_line(ci, tmp_path):
@@ -1019,6 +928,34 @@ def test_a_task_reuses_a_green_row_only_on_the_cpu_class_and_inputs_it_ran_on(ci
 
 
 
+def test_every_row_carries_its_cases_reports_and_a_reused_row_keeps_them(ci, tmp_path, monkeypatch,
+                                                                         cache_worker):
+    """Each row a task runs carries the sites its file's cases moved onto YNNPACK's fusions (`ynn_switched`),
+    and its GPU flows' counts by case (`cells`), from the JUnit properties tests/conftest.py writes, green
+    rows included, empty where its cases report none; a green row a later task reuses keeps them as it ran."""
+    sites = [{"label": "a site over one key", "refused": "Dot with multiple contracting dimensions"}]
+    counts = {"passed": 2, "failed": 0, "skipped": 1, "device": "cpu"}
+    written(tmp_path, {
+        "test_gpu_band.py": "import json\nfrom pathlib import Path\n"
+                            "def test_the_band_runs(record_property):\n"
+                            "    with Path('runs').open('a') as runs: runs.write('x')\n"
+                            f"    record_property('ynn_switched', json.dumps({sites!r}))\n"
+                            f"    record_property('cells', json.dumps({counts!r}))\n"
+                            "def test_still(): pass\n",
+        "test_plain.py": "def test_plain(): pass\n"})
+    out = cached_checkout(ci, tmp_path, monkeypatch, cache_worker)
+
+    def fields() -> dict[str, tuple]:
+        return {row["name"]: (row["ynn_switched"], row["cells"]) for row in armada_task(ci, monkeypatch, out)}
+
+    node = "tests/test_gpu_band.py::test_the_band_runs"
+    expected = {"3.12:tests/test_gpu_band.py": ([{"node": node, **sites[0]}], {node: counts}),
+                "3.12:tests/test_plain.py": ([], {})}
+    assert fields() == expected
+    assert fields() == expected
+    assert (tmp_path / "runs").read_text() == "x", "the second task reused the rows"
+
+
 def cached_checkout(ci, root: Path, monkeypatch, cache_worker) -> Path:
     """Checkout `root` run by 3.12 tasks on one CPU class against the shared test cache, and where their
     verdict is written: beside the checkout's entries, not among them (the checkout's own directory is an
@@ -1065,9 +1002,9 @@ def test_the_policy_reruns_what_a_change_reaches_and_everything_where_it_cannot_
     place what changed, a tool and a workflow among them, and every file runs ('off') for a change to what
     every test process runs or reads, or to a file the records do not place. .armada.json's pool decides
     where tasks run, not what a test sees (owner, 2026-10-27: a pool change reran every file), and a workflow
-    is an input of the files that read it alone (Main, 2026-10-28: 5 of 10 trains ran with the cache off, and
-    0.75% of rows were reused). The recorder (executed.py, followed.py, watched.py) stays every file's input:
-    an old record may lack a dependency a new recorder finds."""
+    is an input of the files that read it alone (the maintainer, 2026-10-28: 5 of 10 trains ran with the cache
+    off, and 0.75% of rows were reused). The recorder (executed.py, followed.py, watched.py) stays every
+    file's input: an old record may lack a dependency a new recorder finds."""
     armada = '{"environment": {"base": "debian"}, "env": {"MODE": "1"}, "pool": 160}\n'
     for name, text in {"src/pkg/mod.py": "VALUE = 1\n", "pyproject.toml": "[project]\nname = 'x'\n",
                        "locks/cpu.txt": "jax==1\n", ".armada.json": armada}.items():
@@ -1124,8 +1061,8 @@ def test_a_durations_change_reruns_only_the_groups_it_moves(ci, tmp_path, monkey
     own entries: a change to another file's entries reuses every row, and so does one to the split file's
     seconds that leaves each of its tests in its group, as a group's key holds the tests it runs, not their
     timings; one that moves a test to another group reruns the groups (a refresh reran the whole suite while
-    the record was every file's input; Main, 2026-10-28: each train's fold of main's durations re-keyed every
-    split file, row 2000)."""
+    the record was every file's input; the maintainer, 2026-10-28: each train's fold of main's durations
+    re-keyed every split file, row 2000)."""
     count = {"heavy": 3, "light": 2}
     for name, tests in count.items():
         (tmp_path / f"tests/test_{name}.py").write_text(
@@ -1185,8 +1122,8 @@ def commit(root: Path, message: str) -> str:
 def test_a_watch_the_kernel_cannot_hold_whole_is_blind_and_keys_nothing(tmp_path):
     """A tree with more directories than inotify will watch (fs.inotify.max_user_watches; here a user
     namespace's own limit, lowered to 2) leaves the open watch blind: closing it gives no opened files, so
-    no record keeps a key, and nothing raises (Main, 2026-10-28: a failed watch left the reader unset, and
-    its close crashed)."""
+    no record keeps a key, and nothing raises (the maintainer, 2026-10-28: a failed watch left the reader
+    unset, and its close crashed)."""
     for name in ("a", "b", "c"):
         (tmp_path / "tests" / name).mkdir(parents=True)
     script = (
@@ -1205,7 +1142,8 @@ def test_a_watch_the_kernel_cannot_hold_whole_is_blind_and_keys_nothing(tmp_path
 def test_a_changed_workflow_reruns_only_the_files_that_read_it(ci, tmp_path, monkeypatch, cache_worker):
     """A change under .github/ reruns the files whose runs read the changed file, which the records place as
     any of the checkout's files, and reuses every other file's green row, under the policy CI computes for
-    the change from main (Main, 2026-10-28: a workflow change turned the cache off for the whole suite)."""
+    the change from main (the maintainer, 2026-10-28: a workflow change turned the cache off for the whole
+    suite)."""
     (tmp_path / ".github/workflows").mkdir(parents=True)
     (tmp_path / ".github/workflows/ci.yml").write_text("name: CI\n")
     (tmp_path / "tests/test_reader.py").write_text(
@@ -1241,8 +1179,8 @@ def test_a_changed_workflow_reruns_only_the_files_that_read_it(ci, tmp_path, mon
 def test_a_run_that_read_its_limits_runs_again_where_they_change(ci, tmp_path, monkeypatch, cache_worker):
     """A test whose run read its cgroup's CPU or memory limit (dew.data's `Host.current` sizes loading by
     them) keys those limits: on a container of other limits its row is not reused though nothing else
-    changed, and a file that read none is reused (row 1998; Main, 2026-10-28: a row green on 4 vCPUs was
-    reused on 8)."""
+    changed, and a file that read none is reused (row 1998; the maintainer, 2026-10-28: a row green on 4 vCPUs
+    was reused on 8)."""
     cgroup = tmp_path.parent / f"{tmp_path.name}-cgroup"
     cgroup.mkdir()
     (cgroup / "cpu.max").write_text("400000 100000\n")
@@ -1276,8 +1214,8 @@ def test_a_fixture_reruns_only_the_files_that_opened_listed_or_probed_it(ci, tmp
     """A fixture's arrival reruns the files whose runs opened it, listed its directory, or asked whether it
     exists (`Path.is_file`, `os.path.exists`: recorded as a read, in a test, at collection or in a child it
     started), and no other: an existence probe is a read the record keeps, so a fixture's name is no other
-    file's input (Main, 2026-10-29: train 277 reused 2 of 1967 rows once a head added fixtures; train 253's
-    review: a test asserting a fixture's absence must not be reused once it comes)."""
+    file's input (the maintainer, 2026-10-29: train 277 reused 2 of 1967 rows once a head added fixtures;
+    train 253's review: a test asserting a fixture's absence must not be reused once it comes)."""
     fixtures = tmp_path / "tests/fixtures"
     (fixtures / "model").mkdir(parents=True)
     (fixtures / "model/config.json").write_text("{}\n")
@@ -1579,8 +1517,8 @@ def test_a_reused_row_runs_again_when_a_page_its_tests_read_or_a_directory_they_
 def test_a_tool_that_comes_or_goes_runs_no_file_again_that_imported_none(tmp_path, monkeypatch, cache_worker):
     """A tool added under tools/, or taken away, runs no file again whose tests imported no tool: the harness
     its test process runs, tools/armada's recorder and plugins, is every row's input through its own files
-    (`SHARED`), not through tools/'s entries, which only a test that imports a tool by its name reads (Main,
-    2026-10-29: train 296 added tools/fla_float64.py and reused 1 of 1795 rows)."""
+    (`SHARED`), not through tools/'s entries, which only a test that imports a tool by its name reads (the
+    maintainer, 2026-10-29: train 296 added tools/fla_float64.py and reused 1 of 1795 rows)."""
     # The harness as a checkout holds it, under the checkout's root, beside the project it reads.
     shutil.copytree(ROOT / "tools/armada", tmp_path / "tools/armada",
                     ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
@@ -1759,8 +1697,8 @@ def test_a_run_plans_only_the_files_whose_inputs_changed_and_its_verdict_names_e
     """The plan reads the test cache with its read token: the files whose rows ran green on exactly these
     inputs, on the class .armada.json pins the tasks to, share one task, which looks each row up again in
     its container, and only a changed file plans a task of its own, so containers scale with the change;
-    the verdict still names every file, the unchanged ones' rows reused (Main, 2026-10-28: a lane run with
-    most files unchanged booted a container a task, each exiting after a lookup)."""
+    the verdict still names every file, the unchanged ones' rows reused (the maintainer, 2026-10-28: a lane
+    run with most files unchanged booted a container a task, each exiting after a lookup)."""
     verdict, planned = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
     assert planned() == ["tests/test_a.py", "tests/test_b.py", "tests/test_c.py"]
     rows = armada_task(ci, monkeypatch, verdict)
@@ -1778,8 +1716,8 @@ def test_a_plan_without_build_output_or_fetched_payloads_finds_what_a_task_recor
     """The plan's checkout, clean, keys rows as the task's checkout does, though the task's holds an editable
     install's metadata under src/ (setuptools' dewml.egg-info) and the fetched fixtures' payloads, which the
     planner never downloads: a build's output is no input, and a fetched payload is keyed by the digest its
-    manifest pins (Main, 2026-10-28: a one-file change planned 493 tasks, as the planner's src/ listing and
-    walk lacked them)."""
+    manifest pins (the maintainer, 2026-10-28: a one-file change planned 493 tasks, as the planner's src/
+    listing and walk lacked them)."""
     verdict, planned = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
     payload = tmp_path / "tests/fixtures/model.npz"
     payload.parent.mkdir(parents=True, exist_ok=True)
@@ -1828,8 +1766,8 @@ def test_a_plan_pinned_to_several_classes_reuses_a_row_green_on_any_of_them(
         ci, tmp_path, monkeypatch, cache_worker):
     """Tasks pinned to several CPU classes (.armada.json's task.cpu a list) land on any of them, so the plan
     reuses a file whose row ran green on these inputs on any pinned class, and plans the rest: rows split by
-    class, the plan reading each pinned class's (Main, 2026-10-29: the suite widened to 25/17 and 26/17, the
-    fleet's own classes, as one class starved lanes' verdicts)."""
+    class, the plan reading each pinned class's (the maintainer, 2026-10-29: the suite widened to 25/17 and
+    26/17, the fleet's own classes, as one class starved lanes' verdicts)."""
     verdict, planned = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "AuthenticAMD-25-17",
                                         "GenuineIntel-6-143")
     armada_task(ci, monkeypatch, verdict)
@@ -1958,8 +1896,8 @@ def test_a_task_on_another_pinned_class_reuses_the_rows_its_plan_kept(
 def test_whole_suite_tests_run_on_a_whole_suite_run_alone(ci, tmp_path, monkeypatch):
     """A test marked whole_suite runs on the whole suite alone (DEW_WHOLE_SUITE, every fifth publish's
     ci/full-whole-* run), and is set aside on every other run, a train's whatever the cache's policy: a
-    policy-off train runs every file, but not a whole-suite cell (Main, 2026-10-28, via Models: train
-    250's policy-off suite ran G03's GRPO cells, 826-1,430 s each, to its deadline)."""
+    policy-off train runs every file, but not a whole-suite cell (the maintainer, 2026-10-28, via Models:
+    train 250's policy-off suite ran G03's GRPO cells, 826-1,430 s each, to its deadline)."""
     interpreter(tmp_path, "3.12")
     written(tmp_path, {"test_matrix.py": "import pytest\nfrom pathlib import Path\n"
                        "@pytest.mark.whole_suite\ndef test_cell():\n"
@@ -2011,7 +1949,8 @@ def test_a_tip_the_land_queue_graded_green_is_proven_for_mains_push_alone(tmp_pa
     """Main's push run proves nothing again at a tip the land queue graded green, which it posts before main
     moves (a commit status, context land-queue): a train whose CI was red on a row its regrade passed has no
     successful run at its tip, and main's run re-ran the suite for 11 minutes and held the next train's test
-    job (Main, 2026-10-27). Only main's push reads it: a lane's push of a commit carrying one runs as ever."""
+    job (the maintainer, 2026-10-27). Only main's push reads it: a lane's push of a commit carrying one runs
+    as ever."""
     status = "4242\n"
     assert proven_step(tmp_path / "main", "refs/heads/main", "", status) == "4242"
     assert proven_step(tmp_path / "lane", "refs/heads/fix/lane", "", status) == ""
@@ -2064,8 +2003,8 @@ def test_a_proven_push_runs_no_suite_though_its_stored_verdict_is_red(tmp_path):
 def test_the_lint_job_runs_every_gate_on_armada_against_the_merge_base(tmp_path):
     """CI's lint job runs each gate of tools/check_gates on an armada container of its own, given the commit's
     merge-base with main as BASE, so the job lasts as long as its slowest gate rather than their sum on the
-    runner (Main, 2026-10-28: the lint job set trains' wall at 35-41 min); a train's gates start at its
-    priority."""
+    runner (the maintainer, 2026-10-28: the lint job set trains' wall at 35-41 min); a train's gates start at
+    its priority."""
     import yaml
 
     workflow = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
@@ -2108,8 +2047,8 @@ def test_a_cold_suite_is_planned_with_its_cold_cost_and_given_a_long_deadline(ci
     """A suite the test cache's policy turns off (a lock, JAX's build or the recorder changed) runs every
     file cold: each task pays the compiles and imports no warm run did, so its weight carries COLD_SECONDS
     beside its estimate, which sizes armada's pool to the fleet rather than to the longest task, and its
-    deadline is 5400 s, not 2700 (Main, 2026-10-28: train 254's cold suite, 2,169 tasks planned on 242
-    containers, about 470 s a task against an estimated 120, left 780 tasks unstarted at its 2,698 s
+    deadline is 5400 s, not 2700 (the maintainer, 2026-10-28: train 254's cold suite, 2,169 tasks planned on
+    242 containers, about 470 s a task against an estimated 120, left 780 tasks unstarted at its 2,698 s
     deadline). A warm suite keeps both."""
     for name in ("test_a", "test_b"):
         (tmp_path / "tests" / f"{name}.py").write_text("")
@@ -2140,7 +2079,8 @@ def run_options(tmp_path: Path, ref: str, policy: str, option: str) -> list[str]
 def test_a_staged_trains_suite_asks_no_more_than_its_lease(tmp_path):
     """A train staged on the testing train's tip runs its suite on the pool its branch names
     (ci/stage-...-p<N>, the share of its lease the queue's promote.sh leaves the suite), never the whole
-    pool, so it asks armada no more than it leased (Main, 2026-10-28); a train on main asks the whole pool."""
+    pool, so it asks armada no more than it leased (the maintainer, 2026-10-28); a train on main asks the
+    whole pool."""
     assert run_options(tmp_path, "ci/stage-abc-1-p120", "on", "--pool") == ["--pool=120"]
     assert run_options(tmp_path, "ci/batch-abc-1", "on", "--pool") == []
 
@@ -2149,14 +2089,15 @@ def test_base_pushes_and_the_background_suite_run_at_a_lanes_whole_suite_priorit
     """A push to base/kernels, a base/<producer> promote and the background whole suite run their suite
     at a lane's whole-suite priority, -10 as verdict.sh's, so they never take containers from a train (10)
     or a lane's precheck or targeted run (0); a train's runs at 10, and a lane's branch at the default
-    (Main, 2026-10-28: base pushes ran at 0, outside the lanes' lease ledger)."""
+    (the maintainer, 2026-10-28: base pushes ran at 0, outside the lanes' lease ledger)."""
     def priority(ref: str) -> list[str]:
         return run_options(tmp_path, ref, "off", "--priority")
 
     for ref in ("base/kernels", "ci/base-abc-1", "ci/full-whole-1"):
         assert priority(ref) == ["--priority=-10"], ref
     assert priority("ci/batch-abc-1") == ["--priority=10"]
-    # A train staged on the testing train's tip runs beside it, below it (owner and Main, 2026-10-28).
+    # A train staged on the testing train's tip runs beside it, below it (owner and the maintainer,
+    # 2026-10-28).
     assert priority("ci/stage-abc-1") == ["--priority=5"]
     assert priority("fix/lane") == []
 
@@ -2199,6 +2140,24 @@ def test_a_test_past_the_group_target_is_flagged_and_a_new_one_fails(ci, tmp_pat
     assert slow() == (0, {"test_new": False, "test_old": False, "test_sized[1]": False, "test_cell": True,
                           "test_named": True, "TestHeld::test_inside": True, "test_sized[big]": True})
     assert slow("--new", str(base)) == (1, {"test_new": False, "test_sized[big]": True})
+
+
+def test_a_train_runs_row_names_the_whole_suite_cells_it_set_aside(ci, tmp_path, monkeypatch):
+    """A train's run sets a file's whole_suite cells aside, yet its row names them, as pytest marks them: main
+    then holds them though its train CI never times one, so a lane's whole-suite run of a cell main has is no
+    new slow test (verdict.sh), while one main has not stays new (2026-10-30: row 2116's two cells failed
+    every whole-suite run)."""
+    interpreter(tmp_path, "3.12")
+    written(tmp_path, {"test_cells.py": "import pytest\ncell = pytest.mark.whole_suite\n"
+                       "def test_plain(): pass\n"
+                       "@cell\ndef test_cell(): pass\n"
+                       "@pytest.mark.parametrize('n', [1, pytest.param(2, marks=cell, id='big')])\n"
+                       "def test_sized(n): pass\n"})
+    (tmp_path / ".verdict").mkdir()
+    rows = armada_task(ci, monkeypatch, tmp_path / ".verdict/verdict.json", "off")
+    assert [(sorted(row["tests"]), row.get("whole_suite")) for row in rows] == [
+        (["tests/test_cells.py::test_plain", "tests/test_cells.py::test_sized[1]"],
+         ["tests/test_cells.py::test_cell", "tests/test_cells.py::test_sized[big]"])]
 
 
 def a_wheel(root: Path, name: str, version: str) -> Path:
@@ -2249,7 +2208,7 @@ def test_a_release_check_marked_whole_suite_or_network_too_runs_in_its_release_t
 def test_a_release_mark_without_one_requirement_fails_its_files_collection(ci, tmp_path, monkeypatch, mark):
     """A release_env mark that names no one requirement string (none, a keyword's, two, or not a string)
     fails its file's collection, naming its test: every suite task sets a marked test aside, and no release
-    task would plan it, so it would run nowhere (Main's read of b94d89999)."""
+    task would plan it, so it would run nowhere (the maintainer's read of b94d89999)."""
     interpreter(tmp_path, "3.12")
     written(tmp_path, {"test_release.py": f"import pytest\n@pytest.mark.{mark}\n"
                        "def test_under_the_release():\n    pass\n"

@@ -67,6 +67,9 @@ RECORDS = worker.BATCH * 16
 AVERAGING = Path(__file__).with_name("averaging_worker.py")
 """The worker of the pools that average runs."""
 
+LOG_WRITER = Path(__file__).with_name("log_writer_worker.py")
+"""The worker of the pool whose tracker fails off the step loop."""
+
 
 def dumped_params(out: Path, suffix: str = ".npz") -> dict:
     """The parameter leaves a worker wrote next to its report, or, at suffix ".update.npz", the
@@ -131,10 +134,21 @@ def test_a_field_no_step_reads_stays_on_the_host_across_processes(tmp_path):
         assert report["unused_shape"] == [MESH_DEVICES]
         assert report["sum"] == 3 * MESH_DEVICES
 
+
+TOKEN_POOL_WAIT = 2 * 147.0
+"""How long the token-budget pool waits on each process's exit and report, in rank order, a fresh wait
+each (`run_pool`), before it calls the pool hung: a hang guard, not a pool deadline nor a speed bound,
+twice the slowest run measured, rounded up. A process's run is a spawn, a compile and three steps: 18-35 s
+on an idle fleet (6 runs across the gang), at most 67.7 s across the gang under one CPU hog a core (12
+runs), and at most 146.9 s on one host under that load (24 runs, compile 15-39 s, steps 0.06-1.7 s)
+(2026-10-30; a 60 s wait failed CI's gang, its process 0 compiling 10.8 s and running its first step
+12.0 s)."""
+
+
 def test_a_real_token_budget_agrees_across_processes_after_logging_ticks(tmp_path):
     corpus = token_corpus(tmp_path / "tokens", records=16, seq_len=4)
     reports = run_pool("token_budget", tmp_path / "pool", 2, devices=1, tokens=corpus.train, seq_len=4,
-                       timeout=60)
+                       timeout=TOKEN_POOL_WAIT)
     assert [report["step"] for report in reports] == [3, 3]
     assert [report["updates"] for report in reports] == [3, 3]
     assert [report["logged"] for report in reports] == [3, 0]
@@ -1329,10 +1343,11 @@ def test_a_pool_agrees_one_validity_schema_when_only_some_ranks_padded(tmp_path)
     single = run_worker("mixed_validity", tmp_path / "single.json", fsdp_size=2,
                         explicit=True)
 
-    # The producers really did disagree, and the seams really did agree.
+    # The producers really did disagree, and the seams really did agree, on one layout: each rank's
+    # validity laid out as its rows' coordinates (ledger 1122).
     assert reports[0]["local_fields"] == [] and reports[1]["local_fields"] == ["attention_mask"]
-    assert [report["agreed_fields"] for report in reports] == [["attention_mask"]] * 2
-    assert [report["placed_fields"] for report in reports] == [["attention_mask"]] * 2
+    assert [report["agreed_fields"] for report in reports] == [["coordinates"]] * 2
+    assert [report["placed_fields"] for report in reports] == [["coordinates"]] * 2
     assert reports[0]["agreed_all_true"] is True and reports[1]["agreed_all_true"] is False
     assert reports[0]["batch_sharding"]["fully_addressable"] == [False]
 
@@ -1376,7 +1391,8 @@ def test_a_pool_trains_a_hybrid_split_over_the_sequence(tmp_path):
     reports = run_pool("sequence_hybrid", tmp_path / "pool", 2, script=worker_script, devices=1, fsdp_size=1,
                        timeout=180)
     assert [report["sequence_processes"] for report in reports] == [[[0, 1]]] * 2
-    assert [report["placed_fields"] for report in reports] == [["attention_mask"]] * 2
+    # Each rank's validity laid out as its rows' coordinates, one layout (ledger 1122).
+    assert [report["placed_fields"] for report in reports] == [["coordinates"]] * 2
     assert reports[0]["loss"] == reports[1]["loss"], "the processes disagreed with each other"
     assert np.isfinite(reports[0]["loss"]) and np.isfinite(reports[0]["update_scale"])
     assert reports[0]["update_scale"] > 0
@@ -1521,6 +1537,19 @@ def test_evaluation_coordinates_root_consumers_keys_and_host_failures(tmp_path):
             assert "deleted" in report["results"][failure]["error"]
             assert failure in report["closed"]
         assert "gather plan differs between the processes" in report["results"]["mismatched_plan"]["error"]
+
+
+@pytest.mark.distributed
+def test_a_tracker_failing_off_the_step_loop_stops_both_processes_at_one_tick(tmp_path):
+    """Rank 0's tracker fails writing its second log, which its writer does off the step loop (row 2313):
+    both processes end with rank 0's error, the peer through the agreement, having run the same steps,
+    as the loop agrees on each write's outcome at a tick every process reaches alike, never on the
+    writer's threads. Which tick that is depends on when the writer runs, so the steps run are the
+    processes' agreement, not a count."""
+    reports = run_pool("training_log_failure", tmp_path, 2, script=LOG_WRITER)
+    # Rank 0 raises its tracker's own error; its peer, the agreement's report of it.
+    assert [report["error"] for report in reports] == ["ValueError", "PeerFailure"], reports
+    assert reports[0]["steps"] == reports[1]["steps"], reports
 
 
 @pytest.mark.distributed
