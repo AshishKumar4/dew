@@ -217,8 +217,8 @@ def test_a_handed_step_derives_for_its_target_on_a_gpu_that_runs_it_alone():
     """While a step compiled ahead is reproduced (`handed`), its launches derive for the GPU it was
     compiled for (`AheadOfTime.target`), where this process's GPU is of its generation and holds a
     block's shared memory its launches take, however many multiprocessors it counts; outside, the
-    process's own facts. A GPU of another generation, or one holding less shared memory a block, is
-    refused (ledger 2453)."""
+    process's own facts. A GPU of another generation, one holding less shared memory a block, or one
+    whose shared memory is unknown, is refused (ledger 2453)."""
     import dataclasses
 
     from dew.nn.kernels.generation import assumed, gpu_target
@@ -232,7 +232,8 @@ def test_a_handed_step_derives_for_its_target_on_a_gpu_that_runs_it_alone():
             assert gpu_target() == canonical
         assert gpu_target() == pcie
     smaller = dataclasses.replace(pcie, shared_limit=canonical.shared_limit - 1)
-    for other in (gpu_target("sm80"), smaller):
+    unknown = dataclasses.replace(pcie, shared_limit=None)
+    for other in (gpu_target("sm80"), smaller, unknown):
         with assumed(other), pytest.raises(ValueError), handed(step):
             pass
 
