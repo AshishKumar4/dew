@@ -31,21 +31,22 @@ from dew.nn.kernels.templates.attention_mosaic_scores import _Backward, _launch_
 def _coop_allocations(family: mosaic.Family, config: BackwardTiles, width: int, dtype, stages: int
                       ) -> tuple[list, dict]:
     """The shared-keys launch's allocations as `Family.scoped` takes them, in `_coop_launch`'s order: the
-    program's resident keys and values; a tile's weights and score cotangents, every consumer's share of
+    program's resident keys and values, each consumer's share of their columns a tile of its own
+    (`Family.column_staging`); a tile's weights and score cotangents, every consumer's share of
     the keys whole rows of their swizzle, the widest whose row divides it and the products' contractions
     over the tile's queries and keys (`mosaic.swizzle_for`: 64 bytes at a share of 32); each consumer's
     fp32 stage of its adds a chunk of its columns at a time (`mosaic.staged_columns`: width 256's two
-    stages of its 64 x 256 slots fit beside it); the two loads' barriers and the exchange's
-    (`Family.exchange`); and its query and output-cotangent streams in `stages` slots (`Family.streams`)."""
+    stages of its 64 x 256 slots fit beside it); the exchange's barriers (`Family.exchange`); and its query
+    and output-cotangent streams in `stages` slots, each consumer's share of their columns a tile of its own
+    (`Family.streams`' `column_streams`)."""
     consumers, block_q, block_k = config.consumers, config.block_q, config.block_k
     chunk = mosaic.staged_columns(width // consumers, (jnp.float32,))
     swizzle = mosaic.swizzle_for(dtype, block_k // consumers, block_q, block_k)
-    scoped = [plgpu.SMEM((block_k, width), dtype), plgpu.SMEM((block_k, width), dtype),
-              mosaic.staged((2, block_q, block_k), dtype, swizzle),
-              plgpu.SMEM((consumers, max(block_q, block_k), chunk), jnp.float32),
-              family.load_barriers(2), *family.exchange(consumers)]
+    resident = [family.column_staging((block_k, width), dtype, consumers) for _ in range(2)]
+    scoped = [*resident, mosaic.staged((2, block_q, block_k), dtype, swizzle),
+              plgpu.SMEM((consumers, max(block_q, block_k), chunk), jnp.float32), *family.exchange(consumers)]
     blocks = {"queries": ((block_q, width), dtype), "douts": ((block_q, width), dtype)}
-    return scoped, family.streams(blocks, stages, consumers)
+    return scoped, family.streams(blocks, stages, consumers, column_streams=("queries", "douts"))
 
 
 def _coop_step(walk: _Backward, share: int, resident: tuple, exchanged, rows_of, coords_of, whole, add_dq,
@@ -59,24 +60,40 @@ def _coop_step(walk: _Backward, share: int, resident: tuple, exchanged, rows_of,
     reads of the last tile's done, awaited only past this tile's products and softmax), then, once every
     consumer's are published, its share of the head's columns of dV, dK and dQ over every key of the block
     (`aᵀ @ b`, `a @ b`), dQ added into dQ (`add_dq`), and the block released."""
-    k_smem, v_smem = resident
     family, tiles, consumers = walk.program.family, walk.program.tiles, walk.consumers
-    keys, columns = tiles.block_k // consumers, k_smem.shape[-1] // consumers
+    k_parts, v_parts = (allocated["parts"] for allocated in resident)
+    keys = tiles.block_k // consumers
     dk_acc, dv_acc = accumulators
     q_slot, do_slot = slots["queries"], slots["douts"]
     q_first = index * tiles.block_q
     own = pl.ds(share * keys, keys)
-    narrowed, part = _tile_scores(walk, (q_slot, do_slot), (k_smem.at[own], v_smem.at[own]), rows_of(q_first),
+
+    def parts(ref, rows=None):
+        held = (family.column_part(ref, column) for column in range(consumers))
+        return tuple(held if rows is None else (column.at[rows] for column in held))
+
+    narrowed, part = _tile_scores(walk, (parts(q_slot), parts(do_slot)),
+                                  (parts(k_parts, own), parts(v_parts, own)), rows_of(q_first),
                                   coords_of(q_first), whole(index), (tiles.block_q, keys), masked=masked)
     weights_ref, cotangents_ref = exchanged.at[0], exchanged.at[1]
+
+    def staged(role, _):
+        # A role's share of the exchange's keys at its static columns (Mosaic GPU slices a swizzled tile at
+        # static columns, `mosaic.per_role`), each read whole.
+        theirs = pl.ds(role * keys, keys)
+        family.staged(narrowed, weights_ref.at[:, theirs])
+        family.staged(part, cotangents_ref.at[:, theirs])
+
     exchange.claim()
-    family.staged(narrowed, weights_ref.at[:, own])
-    family.staged(part, cotangents_ref.at[:, own])
+    mosaic.per_role(share, consumers, staged)
     exchange.publish()
-    mine = pl.ds(share * columns, columns)
-    dv_acc = family.products(dv_acc, weights_ref.transpose((1, 0)), do_slot.at[:, mine], walk.interpret)
-    dk_acc = family.products(dk_acc, cotangents_ref.transpose((1, 0)), q_slot.at[:, mine], walk.interpret)
-    add_dq(q_first, family.product(cotangents_ref, k_smem.at[:, mine], (tiles.block_q, columns)))
+    dv_acc = family.products(dv_acc, weights_ref.transpose((1, 0)), family.column_part(do_slot, share),
+                             walk.interpret)
+    dk_acc = family.products(dk_acc, cotangents_ref.transpose((1, 0)), family.column_part(q_slot, share),
+                             walk.interpret)
+    columns = q_slot.shape[-1]
+    held = family.column_part(k_parts, share)
+    add_dq(q_first, family.product(cotangents_ref, held, (tiles.block_q, columns)))
     exchange.release()
     return carry, (dk_acc, dv_acc)
 
@@ -111,7 +128,7 @@ def _coop_kernel(walk: _Backward, operands: tuple, treedef, *, name: str, kernel
     def body(*refs, streams):
         (q_ref, k_ref, v_ref, do_ref, *stat_refs), refs = refs[:9], refs[9:]
         spans_of, refs = treedef.unflatten(refs[:treedef.num_leaves]), refs[treedef.num_leaves:]
-        dq_ref, dk_ref, dv_ref, k_smem, v_smem, exchanged, out_smem, loads, staged_turn, read_turn = refs
+        dq_ref, dk_ref, dv_ref, k_staged, v_staged, exchanged, out_smem, staged_turn, read_turn = refs
         exchange = mosaic.Exchange(family, staged_turn, read_turn, consumers)
         row, head = lax.axis_index("batch"), lax.axis_index("heads")
         key_head = lax.div(head, heads // kv_heads)
@@ -125,22 +142,22 @@ def _coop_kernel(walk: _Backward, operands: tuple, treedef, *, name: str, kernel
         def rows_of(q_first):
             return tuple(_rows(family, ref, row, head, q_first, block_q) for ref in stat_refs)
 
-        def cooperate(share: int, index):
-            # Each consumer's columns its own, so each slices its tiles at offsets it holds statically.
+        def consumer(index):
+            # Each consumer's columns a tile of its own (`Family.column_part`), the consumer lowered once.
             keys_view = (row, pl.ds(k_first, block_k), key_head)
-            family.loaded(((k_ref.at[keys_view], k_smem, loads.at[0]),
-                           (v_ref.at[keys_view], v_smem, loads.at[1])), issued=share == 0)
-            coords_of = functools.partial(_coords, family, spans_of, row, k_first=k_first + share * (
+            for source, staged in ((k_ref.at[keys_view], k_staged), (v_ref.at[keys_view], v_staged)):
+                family.columns_loaded(source, staged, issued=index == 0)
+            coords_of = functools.partial(_coords, family, spans_of, row, k_first=k_first + index * (
                 block_k // consumers), shape=(block_q, block_k // consumers))
-            mine = pl.ds(share * columns, columns)
-            smem = out_smem.at[share]
+            mine = pl.ds(index * columns, columns)
+            smem = out_smem.at[index]
 
             def add_dq(q_first, dq):
                 family.added(dq, dq_ref.at[row, pl.ds(q_first, block_q), head, mine], walk.interpret,
                              smem=smem.at[pl.ds(0, block_q)])
 
-            step = functools.partial(_coop_step, walk, share, (k_smem, v_smem), exchanged, rows_of, coords_of,
-                                     whole, add_dq, exchange)
+            step = functools.partial(_coop_step, walk, index, (k_staged, v_staged), exchanged, rows_of,
+                                     coords_of, whole, add_dq, exchange)
 
             segments = functools.partial(program.segmented, step, run)
 
@@ -153,9 +170,6 @@ def _coop_kernel(walk: _Backward, operands: tuple, treedef, *, name: str, kernel
             for value, ref in ((dk, dk_ref), (dv, dv_ref)):
                 family.added(value, ref.at[row, pl.ds(k_first, block_k), key_head, mine], walk.interpret,
                              smem=smem.at[pl.ds(0, block_k)])
-
-        def consumer(index):
-            mosaic.per_role(index, consumers, cooperate)
 
         def producer():
             family.stream(streams, views, *streamed)
