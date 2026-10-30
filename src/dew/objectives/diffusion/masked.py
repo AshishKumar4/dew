@@ -32,7 +32,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 
 from dew.artifacts import TokenScores
-from dew.batch import TEXT_KEY, Batch, Variables, real_slots, thaw
+from dew.batch import TEXT_KEY, Batch, Variables, flat_field, real_slots, thaw
 from dew.diffusion.discrete import MDLM_STEPS, REVEALED_UNDEFINED, Confident, DiscreteProcess, Unmask, aligned
 from dew.inference.tasks import MaskedGeneration, MaskedSettings, recorded_processor, recorded_tokenizer
 from dew.inputs import Field, InputSpec
@@ -255,8 +255,9 @@ class MaskedDiffusionObjective(HeadedObjective[Ratio | RoutedStatistics, Variabl
         fields = prepared.token_fields
         real = real_slots(fields, tokens.shape)
         for media in ("image_indices", "audio_indices"):
-            if media in fields:
-                real &= fields[media] < 0
+            indices = flat_field(fields, media)
+            if indices is not None:
+                real &= indices < 0
         rows = tokens.shape[0]
         # MDLM's antithetic times: each example a point in its own stratum of the update's examples.
         places, count = step.places(rows)

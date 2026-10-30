@@ -44,7 +44,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import fuser
 from jax.extend import core as jax_core
 
-from dew.nn.kernels.selection import Kernel, Op, Refusal, select
+from dew.nn.kernels.selection import Kernel, Op, Refusal, analysed, select
 from dew.nn.kernels.templates.gemm import template
 
 FUSION_ROW = 'ledger 1295'
@@ -79,7 +79,7 @@ def _product(transpose_rhs: bool, interpret_on_cpu: bool, dense: bool, *fusions)
     acc = jax.ShapeDtypeStruct((lhs.shape[0], width), jnp.float32)
     consumer, values, prefetch = fuser.get_fusion_values(out_fusion, acc)
     leaves, treedef = jax.tree.flatten(values)
-    axes = _stage(EPILOGUE, Refusal('scalar_prefetch', "the consumer reads scalar prefetch", row=FUSION_ROW)
+    axes = _stage(EPILOGUE, Refusal('scalar_prefetch', "the consumer reads scalar prefetch")
                   if prefetch else _axes(consumer, values, acc))
     if axes is None:
         summed = template.gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs, out_dtype=jnp.float32,
@@ -122,13 +122,13 @@ def _stage[S: tuple](op: Op[Tiling], found: S | Refusal) -> S | None:
 
 
 EPILOGUE: Op[Tiling] = Op('gemm_epilogue', (
-    Kernel('fused', (lambda case: case.refusal,)),
+    Kernel('fused', (analysed('tiled', lambda case: case.refusal, FUSION_ROW),)),
     Kernel('xla', (), generic=True)))
 """The epilogue's selector: the consumers in the kernel's epilogue where the analysis takes them tile by
 tile (`_axes`), else after the product in XLA."""
 
 PROLOGUE: Op[Tiling] = Op('gemm_prologue', (
-    Kernel('fused', (lambda case: case.refusal,)),
+    Kernel('fused', (analysed('tiled', lambda case: case.refusal, FUSION_ROW),)),
     Kernel('xla', (), generic=True)))
 """The prologue's selector: the producer's element stage in the kernel's prologue where the analysis
 takes it tile by tile (`_split`), else before the product in XLA."""
@@ -143,7 +143,7 @@ def _prologue(fusion) -> tuple[jax.Array, dict]:
     (the module's docstring), or the operand itself and none where the kernels cannot take its producer,
     each reported ('gemm_prologue')."""
     producer, values, prefetch = fuser.get_fusion_values(fusion)
-    split = (Refusal('scalar_prefetch', "the producer reads scalar prefetch", row=FUSION_ROW) if prefetch
+    split = (Refusal('scalar_prefetch', "the producer reads scalar prefetch") if prefetch
              else _split(producer, values))
     # An operand as given has no producer to fuse, and no stage to choose.
     if isinstance(split, Refusal) and split.code == 'no_producer':
@@ -181,24 +181,22 @@ def _split(producer, values):
     [out] = jaxpr.outvars
     shape = tuple(getattr(out.aval, 'shape', ()))
     if len(shape) != 2 or not isinstance(out, jax_core.Var) or not jaxpr.eqns:
-        return Refusal('no_producer', "the operand is an array as given", row=FUSION_ROW)
+        return Refusal('no_producer', "the operand is an array as given")
     stage, inputs = _tile_stage(jaxpr, out, shape)
     full = [var for var in inputs if _shape(var) == shape and var in jaxpr.invars]
     if not full:
-        return Refusal('no_base', "the operand's every element is computed, none loaded", row=FUSION_ROW)
+        return Refusal('no_base', "the operand's every element is computed, none loaded")
     base = full[0]
     if _dtype(base) != _dtype(out):
         return Refusal('dtype_changes', f"the producer turns its {_dtype(base)} base into "
-                                                   f"{_dtype(out)}, which the kernels would multiply in",
-                        row=FUSION_ROW)
+                                                   f"{_dtype(out)}, which the kernels would multiply in")
     sides = [var for var in inputs if var is not base]
     given = {var: index for index, var in enumerate(jaxpr.invars)}
     read = {given[var] for var in (base, *sides) if var in given}
     if any(index not in read for index, leaf in enumerate(leaves)
            if jnp.issubdtype(jnp.result_type(leaf), jnp.inexact)):
         return Refusal('input_unstaged',
-                                  "an input reaches the operand only through a row or depth value",
-                        row=FUSION_ROW)
+                                  "an input reaches the operand only through a row or depth value")
     # What the stage reads, each computed whole in XLA (the operand itself, unread, is left out there).
     arrays = jax_core.jaxpr_as_fun(jax_core.Jaxpr(jaxpr.replace(outvars=[base, *sides]),
                                                   closed.consts))(*leaves)
@@ -337,12 +335,12 @@ def _prologue_axes(whole, arrays: list, shape: tuple) -> tuple | Refusal:
         return pulled
     tiled, specs, _ = pulled
     if not _is_tile(specs[0], probe):
-        return Refusal('base_untiled', "the producer reads its base at other than the tile", row=FUSION_ROW)
+        return Refusal('base_untiled', "the producer reads its base at other than the tile")
     axes = []
     for array, side_spec in zip(arrays[1:], specs[1:], strict=True):
         block_shape, index_map = _block_and_map(side_spec)
         if block_shape is None or index_map is None:
-            return Refusal('value_unblocked', f"a {array.shape} side array has no block", row=FUSION_ROW)
+            return Refusal('value_unblocked', f"a {array.shape} side array has no block")
         named = []
         for block, index, size in zip(block_shape, index_map(1, 2), array.shape, strict=True):
             if index in (1, 2) and block == probe[index - 1] and size == shape[index - 1]:
@@ -351,18 +349,16 @@ def _prologue_axes(whole, arrays: list, shape: tuple) -> tuple | Refusal:
                 named.append(None)
             else:
                 return Refusal(
-                    'value_off_axes', f"a {array.shape} side array follows no launch axis tile by tile",
-                        row=FUSION_ROW)
+                    'value_off_axes', f"a {array.shape} side array follows no launch axis tile by tile")
         if all(axis is None for axis in named):
-            return Refusal('value_off_axes', f"a {array.shape} side array follows no launch axis",
-                        row=FUSION_ROW)
+            return Refusal('value_off_axes', f"a {array.shape} side array follows no launch axis")
         axes.append(tuple(named))
     blocks = [jax.ShapeDtypeStruct(block.block_shape, array.dtype)
               for block, array in zip(specs, arrays, strict=True)]
     ids = (jnp.int32(0), jnp.int32(0))
     closed = jax.make_jaxpr(lambda ids, *blocks: tiled(ids, (), *blocks))(ids, *blocks)
     if any(var in template._needed(closed.jaxpr, closed.jaxpr.outvars) for var in closed.jaxpr.invars[:2]):
-        return Refusal('reads_position', "the producer reads its tile's position", row=FUSION_ROW)
+        return Refusal('reads_position', "the producer reads its tile's position")
     return tuple(axes)
 
 
@@ -392,23 +388,22 @@ def _axes(consumer, values, acc) -> tuple | Refusal:
     tiled, (value_specs, acc_spec), _ = pulled
     if not _is_tile(acc_spec, probe):
         return Refusal('product_untiled',
-                                  "the consumer reads the product at other than its tile", row=FUSION_ROW)
+                                  "the consumer reads the product at other than its tile")
     axes = []
     specs = jax.tree.leaves(value_specs, is_leaf=_is_spec)
     for leaf, leaf_spec in zip(jax.tree.leaves(values), specs, strict=True):
         block_shape, index_map = _block_and_map(leaf_spec)
         if block_shape is None or index_map is None:
-            return Refusal('value_unblocked', f"a captured {leaf.shape} array has no block", row=FUSION_ROW)
+            return Refusal('value_unblocked', f"a captured {leaf.shape} array has no block")
         named = []
         for block, index, size in zip(block_shape, index_map(1, 2), leaf.shape, strict=True):
             if index not in (1, 2) or block != probe[index - 1] or size != acc.shape[index - 1]:
                 return Refusal(
-                    'value_off_axes', f"a captured {leaf.shape} array follows no launch axis tile by tile",
-                        row=FUSION_ROW)
+                    'value_off_axes', f"a captured {leaf.shape} array follows no launch axis tile by tile")
             named.append(AXES[index - 1])
         axes.append(tuple(named))
     if _reads_position(tiled, value_specs, values, probe):
-        return Refusal('reads_position', "the consumer reads its tile's position", row=FUSION_ROW)
+        return Refusal('reads_position', "the consumer reads its tile's position")
     return tuple(axes)
 
 
@@ -421,7 +416,7 @@ def _pulled(function, specs, *args):
         return fuser.pull_block_spec(function, specs, grid_len=2)(*args)
     except NotImplementedError as error:
         what = error.args[0] if error.args else "one of its equations"
-        return Refusal('untileable', f"the fuser has no rule to tile {what}", row=FUSION_ROW)
+        return Refusal('untileable', f"the fuser has no rule to tile {what}")
 
 
 def _specs(consumer, values, acc, block: tuple):

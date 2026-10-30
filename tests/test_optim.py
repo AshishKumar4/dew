@@ -22,6 +22,7 @@ from model_support import largest_difference
 from optim_support import LR, decoder_params, drawn_tree
 from reference_error import as_given, assert_as_exact, assert_computes_the_oracle, chain_roundings, equations
 
+from dew.batch import coordinates
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.dit import SimpleDiT
 from dew.optim import (
@@ -840,8 +841,8 @@ def test_policy_steps_carry_live_qk_statistics_to_muonclip(kind):
                  "behavior_log_probs": jnp.full(ids.shape, -3.),
                  "old_values": jnp.zeros_like(mask), "returns": mask}
         scoring_ids = ids
-        packing = {"segment_ids": batch["text_segment_ids"][:, :-1],
-                   "positions": batch["text_positions"][:, :-1]}
+        packing = {"coordinates": coordinates(segments=batch["text_segment_ids"][:, :-1],
+                                              positions=batch["text_positions"][:, :-1])}
     threshold = .01
     optimizer = OptimConfig(optimizer="muonclip", learning_rate=0.,
                             optimizer_opts={"qk_clip_threshold": threshold}).build(1)

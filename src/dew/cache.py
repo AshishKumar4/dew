@@ -250,6 +250,11 @@ KERNEL_CHOICES = jax.make_user_context(())
 this thread, keyed on as `KERNEL_TUNES` is, so a program traced before a
 choice traces again within it."""
 
+NUMERICS = jax.make_user_context(default_value=None)
+"""The run's numerics `dew.nn.kernels.generation.run_precision` holds in this thread
+(`dew.nn.precision.Numerics`, None outside any), keyed on as `KERNEL_TUNES` is, so a program traced under one
+run's numerics, its outputs' dtype and its ops' forms, traces again under another's."""
+
 QUANTIZED_TRACE = jax.make_user_context(default_value=None)
 """What a quantized model's methods trace under, its provider's kind and spec
 (`dew.quantization`), keyed on as `KERNEL_TUNES` is. Qwix intercepts
