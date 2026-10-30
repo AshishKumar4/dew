@@ -745,7 +745,7 @@ def test_refusals_cross_processes_only_through_an_explicit_handoff(tmp_path):
     snapshot = ("print(json.dumps([[identity, tuning.encoded(config), sorted(kernels)] "
                 "for identity, config, kernels in report.refused_launches()]))")
     environment = {**os.environ, "JAX_COMPILATION_CACHE_DIR": str(tmp_path / "cache")}
-    environment.pop("DEW_REFUSAL_RECORDS", None)
+
     seed = preamble + f"report.refuse([('a launch', {tile}, {{'dew_gmm'}})])\n" + snapshot
     exported = subprocess.run([sys.executable, "-c", seed], check=True, env=environment,
                               capture_output=True, text=True).stdout

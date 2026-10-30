@@ -115,6 +115,21 @@ def interpreted(interpret) -> plgpu.InterpretGPUParams | None:
     return plgpu.InterpretGPUParams() if interpret else None
 
 
+def kernel(entry, *, out_type, grid: tuple, grid_names: tuple, warpgroups: int,
+           interpret, family: str, name: str | None = None, scratch: tuple = (),
+           approx_math: bool = False, cluster: int = 1, cost: pl.CostEstimate | None = None,
+           reduction_scratch: int = 0) -> Callable:
+    """Build a per-shard launch with the same reporting and interpreter semantics for every family."""
+    per_shard(name or family)
+    clustered = {'cluster': (cluster,), 'cluster_names': (CLUSTER,)} if cluster > 1 else {}
+    return plgpu.kernel(entry, out_type=out_type, grid=grid, grid_names=grid_names,
+                        num_threads=warpgroups, thread_name="wg", scratch_types=scratch,
+                        compiler_params=compiler_params(approx_math=approx_math,
+                                                        reduction_scratch=reduction_scratch),
+                        interpret=interpreted(interpret), kernel_name=report.named(name),
+                        cost_estimate=cost, **clustered)
+
+
 def unwalked(family: "Family") -> Callable:
     """A walk of no steps (`Family.persist`'s, where a tile streams nothing): its carry and accumulators as
     they start."""
@@ -916,16 +931,10 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
                reducing_warpgroups: int = 0) -> Callable:
         if cluster > self.cluster:
             raise ValueError(f"{self.name} launches a cluster of at most {self.cluster}, not {cluster}")
-        per_shard(name or self.name)
-        clustered = {'cluster': (cluster,), 'cluster_names': (CLUSTER,)} if cluster > 1 else {}
-        return plgpu.kernel(entry, out_type=out_type, grid=grid, grid_names=grid_names,
-                            num_threads=self.warpgroups(consumers), thread_name="wg",
-                            compiler_params=compiler_params(
-                                approx_math=approx_math,
-                                reduction_scratch=self.warpgroup_reduction_scratch * reducing_warpgroups),
-                            interpret=interpreted(interpret), kernel_name=report.named(name),
-                            cost_estimate=cost,
-                            **clustered)
+        return kernel(entry, out_type=out_type, grid=grid, grid_names=grid_names,
+                      warpgroups=self.warpgroups(consumers), family=self.name, interpret=interpret,
+                      name=name, approx_math=approx_math, cluster=cluster, cost=cost,
+                      reduction_scratch=self.warpgroup_reduction_scratch * reducing_warpgroups)
 
     def scoped(self, body, *allocations, streams):
         return pl.run_scoped(lambda *refs, **rings: body(*refs, streams=rings), *allocations, **streams,

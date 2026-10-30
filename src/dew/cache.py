@@ -113,8 +113,8 @@ def default_compilation_cache_dir() -> str:
 
 
 def beside_compilation_cache(variable: str, name: str) -> Path | None:
-    """Where a record every process sharing the persistent compilation cache shares lives (a step's rungs,
-    the kernels' refusals): the environment `variable` when set, else `name` in the directory JAX is
+    """Where a record every process sharing the persistent compilation cache shares lives (a step's rungs):
+    the environment `variable` when set, else `name` in the directory JAX is
     configured with (`jax_compilation_cache_dir`), or nowhere when the process keeps no cache."""
     if path := os.environ.get(variable):
         return Path(path)
