@@ -199,7 +199,8 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan):
         blocks["resets"] = ((chunk, RESET_WIDTH), jnp.int8)
     once = {"parameters": ((states + PARAMETER_ROWS, block), jnp.float32),
             "leaving": ((states, block), jnp.float32)}
-    streams = {"walked": family.streams(blocks, 2, 1, swizzles=dict.fromkeys(blocks, mosaic.UNSWIZZLED)),
+    # One stage of each stream: two put an H100's program past its shared memory beside the replay's tiles.
+    streams = {"walked": family.streams(blocks, 1, 1, swizzles=dict.fromkeys(blocks, mosaic.UNSWIZZLED)),
                "once": family.streams(once, 1, 1, swizzles=dict.fromkeys(once, mosaic.UNSWIZZLED))}
     shape = (scan.rows, scan.length, scan.channels)
     partial = (scan.rows, scan.blocks, scan.chunks, groups, chunk * GROUP)
@@ -229,8 +230,7 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan):
                       "leaving": (dfinal_ref.at[row, :, columns], _down)}
 
         def body(staged, *, streams):
-            (kept_smem, summed_smem, writes_smem, decays_smem, dx_smem, ddt_smem, sums_smem,
-             vector_smem) = staged
+            kept_smem, summed_smem, writes_smem, decays_smem, sums_smem, vector_smem = staged
             walked = family.opened(streams["walked"], views)
             given = family.opened(streams["once"], once_views)
 
@@ -310,16 +310,17 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan):
                     def tokens(t, d_skip):
                         out_grad = dys[t, :].astype(jnp.float32)
                         value = xs[t, :].astype(jnp.float32)
-                        writes = writes_smem[t, :]
-                        dx_smem[t, :] = skip * out_grad + writes * dts[t, :].astype(jnp.float32)
-                        # `exp2(dt rate)`'s derivative in `dt` is `rate ln(2)` times it.
-                        ddt_smem[t, :] = writes * value + decays_smem[t, :] * math.log(2.0)
+                        writes, decays = writes_smem[t, :], decays_smem[t, :]
+                        # Each token's gradients in place of its sums: `exp2(dt rate)`'s derivative in `dt` is
+                        # `rate ln(2)` times it.
+                        writes_smem[t, :] = skip * out_grad + writes * dts[t, :].astype(jnp.float32)
+                        decays_smem[t, :] = writes * value + decays * math.log(2.0)
                         return d_skip + out_grad * value
 
                     d_skip = lax.fori_loop(0, chunk, tokens, d_skip, unroll=UNROLLED)
                     span = pl.ds(n_chunk * chunk, chunk)
-                    family.stored([dx_smem[...]], [dx_ref.at[row, span, columns]], smem=dx_smem)
-                    family.stored([ddt_smem[...]], [ddt_ref.at[row, span, columns]], smem=ddt_smem)
+                    family.stored([writes_smem[...]], [dx_ref.at[row, span, columns]], smem=writes_smem)
+                    family.stored([decays_smem[...]], [ddt_ref.at[row, span, columns]], smem=decays_smem)
                     return (g, d_rates, d_skip), accumulators
 
                 carry = (list(g0), [vector] * states, vector)
@@ -341,7 +342,6 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan):
 
         allocations = (plgpu.SMEM((chunk, GROUP, block), jnp.float32),
                        plgpu.SMEM((chunk * GROUP, block), jnp.float32),
-                       plgpu.SMEM((chunk, block), jnp.float32), plgpu.SMEM((chunk, block), jnp.float32),
                        plgpu.SMEM((chunk, block), jnp.float32), plgpu.SMEM((chunk, block), jnp.float32),
                        plgpu.SMEM((chunk * GROUP,), jnp.float32), plgpu.SMEM((block,), jnp.float32))
         family.scoped(body, allocations, streams=streams)
