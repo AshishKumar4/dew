@@ -293,11 +293,8 @@ def cells(names: Iterable[str], targets: Iterable[str] | None = None,
                     cell["error"] = f"{type(refusal).__name__}: {refusal}"
                     yield cell
                     continue
-                rows = {(r.choice, r.site, r.kernel, r.refusal.code if r.refusal else None): r for r in seen}
-                cell["routes"] = [{"choice": r.choice, "site": r.site, "kernel": r.kernel,
-                                   "preferred": r.preferred, "ran": r.ran, "verdict": verdict(r),
-                                   "refusal": dataclasses.asdict(r.refusal) if r.refusal else None}
-                                  for r in rows.values()]
+                cell["routes"] = [{**dataclasses.asdict(r), "verdict": verdict(r)}
+                                  for r in dict.fromkeys(seen)]
                 yield cell
 
 
