@@ -130,6 +130,9 @@ class AttentionCase:
     """Whether the call's bias is one the template reads as a score hook in fp32 (`attention.
     template_attention`): 4-D, one term a key `[B or 1, H or 1, 1, K]` (ALiBi's) or dense `[B or 1, H or 1,
     Q, K]`, of at most fp32's width."""
+    dense_bias: bool
+    """Whether the call's bias varies by query (`[B or 1, H or 1, Q, K]`, a learned relative position's),
+    which the template reads a tile at a time (`template.biased`)."""
     sinks: bool
     softcap: float | None
     arithmetic: bool
@@ -393,6 +396,10 @@ TEMPLATE_SUPPORTS = (
     _Need('bias', lambda case: not case.bias or case.bias_hook,
           "the call's bias is not 4-D one term a key or a query's every key, or is wider than fp32, which "
           "the template's score hook reads it in", row=INHERENT),
+    _Need('dense_bias', lambda case: not case.dense_bias,
+          "the call's bias varies by query, which the template reads broadcast to every batch row and head, "
+          "unmeasured against the xla kernel in time and peak memory (named, it runs)", row='2523',
+          kind='measured'),
     _Need('shards', lambda case: case.shards == 1,
           "an automatic sequence axis gathers the keys, and a pallas call would gather the queries back",
           row=INHERENT),
