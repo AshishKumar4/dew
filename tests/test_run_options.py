@@ -574,15 +574,13 @@ def prefixed(root: Path, drawn: bool) -> RunConfig:
         **run.model.fields, "layer_types": ["blocks"], "kinds": record}))
 
 
-def contexted(root: Path, drawn: bool) -> RunConfig:
-    """`decision`'s run with context layers, which read a row's context as its encoder says."""
-    return dataclasses.replace(decision(root, drawn), context_layers=(0,), context_length=16)
-
-
-BESIDE = {"layout.framing": {"segments": built_in(None, "question_first"), "max_len": 256}}
+BESIDE = {"layout.framing": {"segments": built_in(None, "question_first"), "max_len": 256},
+          "context_encoder": {"context_layers": (0,), "context_length": 16}}
 """What an option's reader takes it only beside, by the run's path, set with it: a framing frames a row of
 its own segments (`_budgeted`), here the question layout's own row as segments (`built_in`), in a row long
-enough for its conversation's turns."""
+enough for its conversation's turns; a context's encoder encodes it for context layers, which read a
+row's context. Such a witness's run is judged alone, its export too: a release's format holds no
+cross-attention layer."""
 
 def blocked(root: Path, drawn: bool) -> RunConfig:
     """`decision`'s run as a fresh head over a tiny causal backbone whose full attention reads blocks
@@ -593,9 +591,9 @@ def blocked(root: Path, drawn: bool) -> RunConfig:
 
 TASK_RUNS = {"TextSettings": ((prefixed, "lm"),), "MaskedSettings": ((masked, "masked_diffusion"),),
              "ImageSettings": ((diffusion, "diffusion"),),
-             "DecideSettings": ((contexted, "decision"), (blocked, "decision"))}
+             "DecideSettings": ((decision, "decision"), (blocked, "decision"))}
 """The runs here of an objective that records each saved task's settings, and the objective's name: a
-decision release's, and a fresh head's over a backbone that reads blocks."""
+decision release's, which exports, and a fresh head's over a backbone that reads blocks."""
 
 
 def witnessed(settings: type, base=None) -> dict[str, list[object]]:
@@ -790,7 +788,7 @@ def witnessed_on(builder, objective: str, settings: type, root: Path
         task, value = reached[name]
         option = reachable[name].made(value)
         missed = unread(task, before, option)
-        if missed is None and exports:
+        if missed is None and exports and name not in BESIDE:
             # A released task's export (`dew export`), reloaded as its users load one, holds it too.
             destination = root / "exported" / name
             assert exported(root / "runs" / f"{name}{queued[name].index(value)}", destination)
