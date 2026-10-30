@@ -117,7 +117,7 @@ def test_a_step_whose_launch_spills_is_compiled_ahead_at_its_next_config(tmp_pat
     ptxas, is refused that tile and lowered once more at the next, the miss recorded (`report.misses`)
     and its plan holding the spill and the refusal, as its telemetry reports them; the step it saves
     carries the refusal (`AheadOfTime.refusals`), and another process that starts from it derives past the
-    refused tile, which it never compiles."""
+    refused tile, which it never compiles, its plan recording no refusal of its own (train 329's review)."""
     step = str(tmp_path / "step.dew-aot")
     first = spilled(tmp_path, PRELUDE + AHEAD, str(nonce), step, "fresh")
     assert first["refusals"] and first["stepped"][:1] == [True]
@@ -125,7 +125,8 @@ def test_a_step_whose_launch_spills_is_compiled_ahead_at_its_next_config(tmp_pat
     assert [spill["config"] for spill in spills] == first["missed"] and spills[0]["stepped"]
     assert len(refused) == first["refusals"] and refused[0]["config"] == first["missed"][0]
     again = spilled(tmp_path, PRELUDE + AHEAD, str(nonce), step, "refused")
-    assert first["missed"][0] not in again["missed"]
+    # Its plan records the refusals its own compiles made, none, not those it was seeded with.
+    assert first["missed"][0] not in again["missed"] and again["planned"]["refused"] == []
 
 
 HANDED = """
