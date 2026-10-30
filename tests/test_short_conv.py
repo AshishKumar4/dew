@@ -13,10 +13,10 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from fla_gdn_support import CONV_SHAPES
+from one_draw import assert_as_exact_as_the_reference
 from reference_error import (
     FACTOR,
     assert_as_exact,
-    assert_as_exact_as_the_reference,
     assert_rounds_where_the_reference_does,
     chain_roundings,
     distance,

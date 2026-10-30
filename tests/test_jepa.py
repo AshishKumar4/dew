@@ -641,3 +641,23 @@ def test_the_loss_is_the_mean_squared_error_to_normalized_targets_of_the_same_bl
     label = f"JEPA loss {weights}"
     assert_as_exact(scored, loss_in(np.float32), draw, label, seeds=SEEDS[label],
                     truth_fn=loss_in(np.float64))
+
+
+def test_an_explicit_momentum_count_keeps_its_law_and_none_reads_the_runs_progress(mask):
+    """A momentum ramp over `momentum_steps` updates reads the update count, an explicit 0 holding the first
+    momentum at every update (optax's empty ramp); with None it ramps over the run's progress, 0 to 1,
+    from the first momentum to the last at the run's end and on past it. Exact where the schedule holds
+    or reaches an end; strictly between them on the way."""
+    def at(spec, *points):
+        return [float(spec.decay(point)) for point in points]
+
+    held = make_objective(mask, momentum=(0.9, 0.99), momentum_steps=0).ema
+    assert not held.progressed and at(held, 0, 1, 100) == [0.9] * 3
+    # A ramp computes in float32, from the first momentum as float32 holds it.
+    first = float(np.float32(0.9))
+    counted = make_objective(mask, momentum=(0.9, 0.99), momentum_steps=10).ema
+    start, middle, end, past = at(counted, 0, 5, 10, 1000)
+    assert not counted.progressed and start == first and end == past and start < middle < end
+    progressed = make_objective(mask, momentum=(0.9, 0.99), momentum_steps=None).ema
+    start, middle, end, past = at(progressed, 0.0, 0.5, 1.0, 2.0)
+    assert progressed.progressed and start == first and end == past and start < middle < end
