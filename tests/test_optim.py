@@ -165,6 +165,15 @@ def test_muon_takes_optaxs_coefficients_and_preconditioning(opts):
                       [('params', 'layers_0', 'self_attn', 'q_proj', 'kernel')], f"Muon with {opts}")
 
 
+def test_muons_default_precision_preconditions_spectrally():
+    """A spectral preconditioning at Muon's default bfloat16 products, whose norm is an SVD of float32
+    operands: its update on par with optax's spectral Muon of the matrix (check 1)."""
+    opts = {"preconditioning": "spectral"}
+    assert_updates_as(muon_solver("bfloat16", optimizer_opts=opts), optax.contrib.muon(LR, **opts),
+                      decoder_params(), [('params', 'layers_0', 'self_attn', 'q_proj', 'kernel')],
+                      "spectral Muon in bfloat16")
+
+
 def test_muon_steps_a_complex_matrix_as_optax_does():
     """A purely imaginary matrix's update, which a real iteration would zero, on par with optax's Muon of
     it, complex64 its iteration's dtype at every precision (check 1)."""
