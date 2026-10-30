@@ -87,26 +87,26 @@ def test_a_kernel_no_connection_holds_is_culled_once_idle_for_the_live_contracts
             assert gateway.poll() is None and time.monotonic() < deadline, log.read_text()
             time.sleep(0.2)
 
+        # Culled on the culler's first look past the idle time, which comes every tenth of it, and gone from
+        # the gateway once jupyter-client's shutdown of it returns, within its own wait; then its cleanup, the
+        # manager's removal and this poll's own reading of it (`OBSERVED`).
+        bound = idle + max(1, idle // 10) + KernelManager.shutdown_wait_time.default_value + OBSERVED
+
         async def scenario() -> float:
             """Seconds from the unconnected kernel's last activity to the gateway holding it no more."""
             held = created(port)
             async with connect(f"ws://127.0.0.1:{port}/api/kernels/{held}/channels",
                                additional_headers={"Authorization": f"token {TOKEN}"}):
                 left = created(port)
-                deadline = time.monotonic() + 3 * idle
                 while (model := kernel(port, left)) is not None:
                     last = datetime.fromisoformat(model["last_activity"]).timestamp()
-                    assert time.monotonic() < deadline, "the idle kernel no connection holds stayed"
+                    assert time.time() - last <= bound, "the idle kernel no connection holds stayed"
                     await asyncio.sleep(0.1)
                 gone = time.time()
                 assert kernel(port, held) is not None
             return gone - last
 
-        # Culled on the culler's first look past the idle time, which comes every tenth of it, and gone from
-        # the gateway once jupyter-client's shutdown of it returns, within its own wait; then its cleanup, the
-        # manager's removal and this poll's own reading of it (`OBSERVED`).
-        shutdown = KernelManager.shutdown_wait_time.default_value
-        assert idle <= asyncio.run(scenario()) <= idle + max(1, idle // 10) + shutdown + OBSERVED
+        assert idle <= asyncio.run(scenario()) <= bound
     finally:
         gateway.terminate()
         gateway.wait(30)
