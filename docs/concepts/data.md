@@ -242,7 +242,7 @@ On fixed data each of `augment=True`'s three steps adds to a classifier's accura
 | `flip=True, crop_scale=(0.35, 1.0)`, staged at 80 px | 43.7% ± 1.1 |
 | the same with `jitter=True` (`augment=True`'s three) | 45.3% ± 0.4 |
 
-The random crop does most of the work, 3.6 points over the flip alone; colour jitter adds 1.6 more and narrows the spread. Every policy fits the training split (its final loss near 0.02), so on data this small augmentation trades that fit for what carries to the test images. `python tools/benchmark_augmentation.py --output augmentation.json` runs the study again; `--policies`, `--seeds` and `--steps` narrow it.
+The random crop does most of the work, 3.6 points over the flip alone; colour jitter adds 1.6 more and narrows the spread. Every run all but memorizes the 1,020 training images (a final training loss of 0.0005 with the flip alone, 0.022 at most with all three), so on data this small what an augmentation buys is what carries to the test images. `python tools/benchmark_augmentation.py --output augmentation.json` runs the study again; `--policies`, `--seeds` and `--steps` narrow it.
 
 The following measurements predate the chain. They compare decoder and augmentation implementations on the stated machine, not startup or remote-storage performance of the new compiler.
 
