@@ -82,7 +82,7 @@ def test_the_registrys_gates_run_together_or_one_at_a_time(tmp_path):
 def test_the_ratchet_gate_alone_holds_the_inventory_to_the_base_its_checkout_carries(tmp_path):
     """A gate run on its own container (the lanes' lint gate on armada) has a checkout that carries its
     commit's history and is given BASE, its merge-base with main, with no origin/main and no reachable
-    origin: the ratchet holds the inventory to BASE, fetching nothing (Main, 2026-10-28: the gates'
+    origin: the ratchet holds the inventory to BASE, fetching nothing (the maintainer, 2026-10-28: the gates'
     fetches of main over HTTPS failed lanes' lint)."""
     root = checkout(tmp_path)
     git(root, "checkout", "-q", "main")
