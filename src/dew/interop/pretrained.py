@@ -566,13 +566,16 @@ class Pretrained:
     def with_dex(self, extension: DifferentialExtension, *, key: int | jax.Array) -> Self:
         """Return this source with DEX's differential on `extension`'s chosen heads (`dew.nn.dex`), its
         projections drawn from `key` under `params` and its lambdas zero, so the model computes what the
-        source does until they train; the rest trains as the extension's recipe says
+        source does until they train, and each layer's chosen heads and lambda_init held beside them
+        (`dew.nn.dex.DEX_CONSTANTS`); the rest trains as the extension's recipe says
         (`DifferentialExtension.trains`: the paper's, the attention's key, value and output projections
         beside it and the rest under `FROZEN`, or all of it), a source's frozen weights staying frozen. A
         source loaded without its weights takes the extension's shapes. The source's own format holds no
-        extension, so `save` and `export` refuse the result; a run's checkpoint keeps it."""
+        extension: `save` and `export` write each layer's differential at its learned lambda folded into
+        its output projection (`dew.nn.dex.folded`), what the model computes outside a run, and refuse a
+        layer whose heads' outputs pass through more before it; a run's checkpoint keeps the extension."""
         from dew.batch import FROZEN, freeze, merge, select, thaw
-        from dew.nn.dex import DEX_PARAMETERS
+        from dew.nn.dex import DEX_COLLECTION, DEX_CONSTANTS, DEX_PARAMETERS
         from dew.nn.inputs import request_key
         from dew.nn.protocols import Differential, Predicting
 
@@ -585,7 +588,8 @@ class Pretrained:
         def drawn(draw: jax.Array) -> Variables:
             # Only the extension leaves the program, so the source's own draws are dead code to XLA.
             return select(thaw(model.init(draw, jnp.zeros((1, length), jnp.int32))),
-                          lambda path: path[0] == "params" and path[-1] in DEX_PARAMETERS)
+                          lambda path: (path[0] == "params" and path[-1] in DEX_PARAMETERS)
+                          or (path[0] == DEX_COLLECTION and path[-1] in DEX_CONSTANTS))
 
         shaped = any(isinstance(leaf, jax.ShapeDtypeStruct) for leaf in jax.tree.leaves(self.variables))
         added = jax.eval_shape(drawn, request_key(key)) if shaped else jax.jit(drawn)(request_key(key))
@@ -613,20 +617,21 @@ class Pretrained:
         merged into their kernels, as PEFT's `merge_and_unload` does, from its
         variables or a trainer's split of them; `adapter.save` writes the factors
         alone. A loaded task's tree, its projections packed for serving, is written
-        as the source's own members (`dew.inference.projections.unpacked`).
+        as the source's own members (`dew.inference.projections.unpacked`). A model with DEX writes
+        each layer's differential folded into its output projection (`dew.nn.dex.folded`).
         """
+        from dew.batch import thaw
         from dew.inference.projections import unpacked
         from dew.nn.protocols import CrossAttending, Differential
 
         if isinstance(self.model, CrossAttending) and self.model.cross_attention is not None:
             raise ValueError("the source's format holds no cross-attention layers; a run's checkpoint "
                              "keeps this model")
-        if isinstance(self.model, Differential) and self.model.dex is not None:
-            raise ValueError("the source's format holds no differential extension (DEX); a run's "
-                             "checkpoint keeps this model")
         values = unpacked(self.model, self.variables if variables is None else variables)
         if self.adapter is not None:
             values = self.adapter.merge(values)
+        if isinstance(self.model, Differential) and self.model.dex is not None:
+            values = self.model.dex_exported(thaw(values))
         quantization = self._quantization()
         # Their values, each read as it is written: a load without its weights holds none (`PayloadUnread`).
         retained = LazyTensors(tensor_specs(self.retained_tensors),

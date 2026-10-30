@@ -130,6 +130,7 @@ from dew.nn.inputs import (
 from dew.nn.kernels import generation
 from dew.nn.kernels.options import compiler_options
 from dew.nn.kv_cache import GROUPS, ROUNDING_KEYS, KVCache, is_paged, leaf_name
+from dew.nn.precision import Numerics
 from dew.nn.protocols import CrossAttending, Layered, ProjectionGroup, Serving
 from dew.nn.scatter import DROPPED
 from dew.nn.visibility import with_served_blocks
@@ -500,7 +501,7 @@ class Server:
                  sampling: Sampling, transforms: tuple[LogitsTransform, ...], stopping: Finishing,
                  grammar: Grammar | None, rows: Rows, slots: int, capacity: int, admission: int,
                  default_budget: int | None, max_length: int | None, decode_steps: int,
-                 prefix: int | Literal["prompt"] | None = None, attention_form: str | None = None) -> None:
+                 prefix: int | Literal["prompt"] | None = None, precision: Numerics | None = None) -> None:
         if type(slots) is not int or slots < 1:
             raise ValueError("slots must be a positive number of resident rows")
         if type(admission) is not int or not 1 <= admission <= slots:
@@ -539,9 +540,9 @@ class Server:
         self.default_budget = default_budget
         self.max_length = max_length
         self.prefix: int | Literal["prompt"] | None = prefix
-        # The form its task's run trained in (`InItsForm`), which every step traces in; None, the one
-        # chosen around it.
-        self.attention_form = attention_form
+        # The numerics its task's run trained in (`InItsForm`), which every step traces under; None,
+        # those in effect around it.
+        self.precision = precision
         self.decode_steps = decode_steps
         self.steps = 0
         self._queue: deque[_Row] = deque()
@@ -628,10 +629,10 @@ class Server:
     @contextlib.contextmanager
     def _context(self) -> Iterator[None]:
         """The mesh the model traces under, so a layer that reads it, such as an expert exchange, finds it,
-        in the attention form its task's run trained in."""
+        under the numerics its task's run trained in."""
         with (contextlib.nullcontext() if self.mesh is None else jax.set_mesh(self.mesh),
-              contextlib.nullcontext() if self.attention_form is None
-              else generation.chosen(attention_form=self.attention_form)):
+              contextlib.nullcontext() if self.precision is None
+              else generation.run_precision(self.precision)):
             yield
 
     @classmethod
@@ -752,7 +753,7 @@ class Server:
             ),
             default_budget=task.max_new_tokens,
             max_length=task.max_length,
-            decode_steps=decode_steps, prefix=task.prefix, attention_form=task.attention_form,
+            decode_steps=decode_steps, prefix=task.prefix, precision=task.precision,
         )
 
     @property

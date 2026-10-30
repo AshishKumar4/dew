@@ -142,7 +142,7 @@ import dew
 from dew.quantization import Quantization
 
 pipe = dew.pipeline("dewml/hybrid-dit-176m", dtype=jnp.bfloat16,
-                    revision="8d891d967319e51cd0e73d3e5b7c29d68a238b52")
+                    revision="b282fd7d06d6bafca2739747423ef8049f6feada")
 served = pipe.quantized(Quantization(dtype="int8", patterns=("^(?!.*spatial_fusion).*",)))
 images = served(["a red fox in a snowy forest"], steps=20, key=0).host().images
 ```
