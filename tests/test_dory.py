@@ -217,19 +217,25 @@ def test_a_cached_step_runs_its_later_passes_as_one_body(mode):
 
 @pytest.mark.parametrize('mode', ['per_loop', 'last_loop'])
 def test_what_each_scanned_pass_sows_extends_what_the_passes_before_it_sowed(mode):
-    """A forward at five loops sows (its attention's logits, `qk`, and every module's output, captured
-    intermediates) what one at four does, bit for bit, and its fifth pass's beside it: the scan over
-    the later passes keeps each pass's sows apart where the cache does, and extends the block's own
-    otherwise, pass by pass (ledger 642)."""
+    """A forward at five loops sows in its looped layers (its attention's logits, `qk`, and every
+    module's output, captured intermediates) what one at four does, bit for bit, and its fifth pass's
+    beside it: the scan over the later passes keeps each pass's sows apart where the cache does, and
+    extends the block's own otherwise, pass by pass (ledger 642). The layers after the block read the
+    last pass's output, which differs."""
     loaded = load()
     ids = REFERENCE['input_ids']
+    _, end = loaded.model.loop.layers
+
+    def looped(path) -> bool:
+        layer = getattr(path[1], 'key', '')
+        return layer.startswith('layers_') and not end <= int(layer.split('_')[1]) < loaded.model.num_layers
 
     def sown(loops):
         model = with_cache(loaded.model.with_passes(loops), mode)
         _, state = model.apply(loaded.variables, ids, mutable=['qk', 'intermediates'],
                                capture_intermediates=True)
         flat, _ = jax.tree_util.tree_flatten_with_path(state, is_leaf=lambda node: isinstance(node, tuple))
-        return dict(flat)
+        return {path: entries for path, entries in flat if looped(path)}
 
     four, five = sown(4), sown(5)
     longer = 0

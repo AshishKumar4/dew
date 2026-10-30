@@ -95,6 +95,9 @@ class Engram:
     ple_conv_kernel_size: int | None = None
     """Qwen4-Exp's per-layer embedding: each lookup a `PLELayer`, its conv of this many taps
     `max_ngram_size` apart; None for V4.1's `EngramLayer`."""
+    table_parts: int = 1
+    """The equal row shards each table is stored in (Qwen4-Exp's `split_ngram_parts`), a PLE layer's
+    table one leaf of them stacked (`PLELayer`), each written back as stored."""
     media_stops: bool = True
     """Whether a media position is dead, its look-back stopped there (V4.1, engram.py:164-166); Qwen4-Exp
     hashes an image's placeholder ids as it does any token's (`ple_input_ids`, modeling_qwen4_exp.py:1361)."""
@@ -124,6 +127,9 @@ class Engram:
             raise ValueError(
                 f"engram_num_embeddings {self.num_embeddings} are not the tables the "
                 f"bucket primes lay out, {declared}")
+        if any(rows % self.table_parts for rows in self.num_embeddings) or self.table_parts < 1:
+            raise ValueError(f"each table's rows {self.num_embeddings} split into {self.table_parts} "
+                             "equal shards")
 
     @functools.cached_property
     def primes(self) -> tuple[tuple[tuple[int, ...], ...], ...]:
@@ -356,11 +362,40 @@ class EngramLayer(nn.Module):
         return (h + gate[..., None] * value[..., None, :]).astype(streams.dtype)
 
 
+class ShardedTable(nn.Module):
+    """A table of `rows` stored in `parts` equal row shards, one `[parts, rows / parts, features]` leaf at
+    `embed/embedding`, which a load stacks from the shards and an export writes back shard by shard
+    (`decoder_parts.expert_slot`); a lookup reads the rows in order. The rows are gathered in the
+    table's storage dtype and cast after, so the table itself is never cast whole."""
+
+    parts: int
+    rows: int
+    features: int
+
+    @nn.compact
+    def __call__(self, ids):
+        table = Embedded(self.parts, self.rows // self.parts, self.features, name='embed')()
+        return jnp.take(table.reshape(self.rows, self.features), ids, axis=0)
+
+
+class Embedded(nn.Module):
+    """The `[parts, rows, features]` leaf `embedding` of a `ShardedTable`, drawn as `nn.Embed` draws."""
+
+    parts: int
+    rows: int
+    features: int
+
+    @nn.compact
+    def __call__(self):
+        return self.param('embedding', nn.initializers.normal(1.0), (self.parts, self.rows, self.features),
+                          jnp.float32)
+
+
 class PLELayer(nn.Module):
     """Qwen4-Exp's n-gram per-layer embedding, added to the residual streams
     (`Qwen4ExpTextPLELayer`, modeling_qwen4_exp.py:1117-1190).
 
-    The looked-up rows of `embed` `[rows, head_dim]` project to one key per
+    The looked-up rows of `shards` (`ShardedTable`) project to one key per
     stream (`key_proj`) and one shared value (`value_proj`). Each stream's
     normed activations meet its normed key, and the sign-preserving root of
     their scaled product gates the value into it; the gated values, normed
@@ -381,6 +416,7 @@ class PLELayer(nn.Module):
     norm_eps: float
     kernel_size: int
     dilation: int
+    parts: int = 1
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
@@ -389,7 +425,7 @@ class PLELayer(nn.Module):
         batch, length, hc, width = streams.shape
         tokens = coordinates_of(call.metadata, batch, length)
         token_mask, segments = tokens.valid, tokens.segments
-        table = nn.Embed(self.rows, self.head_dim, embedding_init=nn.initializers.normal(1.0), name='embed')
+        table = ShardedTable(self.parts, self.rows, self.head_dim, name='shards')
         dtype = streams.dtype if self.dtype is None else self.dtype
         looked = table(hash_ids).astype(dtype).reshape(batch, length, -1)
         dense = functools.partial(Dense, use_bias=False, dtype=self.dtype, precision=self.precision,

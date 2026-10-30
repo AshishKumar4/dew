@@ -1,24 +1,23 @@
 """Translate Qwen4-Exp (`qwen4_exp_text`, Qwen3.8-Flash-Next's language model; transformers 5.16.1's
 models/qwen4_exp).
 
-Its layers are Qwen3.5-MoE's hybrid block, gated delta nets with the release's sigmoid output gate between
-gated attention layers, under three of the family's own: the residual is four streams that each sublayer
-reads and writes through a gated residual (`HyperConnections.hc_lowrank`) with no norms around it and none
-at the end; its attention layers read the keys their QSA indexer picks (`qwen_sparse_attention`,
-`QSAAttentionMixer`); and the layers `ple_layer_ids` names (one-indexed) add an n-gram per-layer embedding
-to the streams first (`Engram.ple_conv_kernel_size`, `PLELayer`). The release's n-gram table is stored in
-`split_ngram_parts` row shards, which a load joins (`_qwen4_exp_prepare`), and its buffers, the
-multipliers and the primes' layout, are checked against the ones Dew derives from the config and dropped;
-an export writes the table as one shard beside the buffers transformers' class holds
-(`_qwen4_exp_export_weights`). The release's prediction layer (`mtp.*`) is left out, as transformers
-leaves it (`_keys_to_ignore_on_load_unexpected`, modeling_qwen4_exp.py:1535), which builds and runs none.
+Its layers are Qwen3.5-MoE's hybrid block, gated delta nets with the release's sigmoid output gate
+between gated attention layers, under three of the family's own: the residual is four streams that each
+sublayer reads and writes through a gated residual (`HyperConnections.hc_lowrank`) with no norms around
+it and none at the end; its attention layers read the keys their QSA indexer picks
+(`qwen_sparse_attention`, `QSAAttentionMixer`); and the layers `ple_layer_ids` names (one-indexed) add
+an n-gram per-layer embedding to the streams first (`Engram.ple_conv_kernel_size`, `PLELayer`). The
+release stores each n-gram table in `split_ngram_parts` equal row shards, which a load stacks into one
+leaf and an export writes back shard by shard (`ShardedTable`); its buffers, the multipliers and the
+primes' layout, are checked against the ones Dew derives from the config and written back as stored, as
+is the prediction layer (`mtp.*`) transformers leaves out (`_keys_to_ignore_on_load_unexpected`,
+modeling_qwen4_exp.py:1535) and builds and runs none of.
 """
 
 from __future__ import annotations
 
 import re
 from collections.abc import Mapping
-from functools import partial
 
 import jax
 import numpy as np
@@ -63,7 +62,6 @@ _LEAVES = {
     **{f'ple.{name}.weight': ('engram', name, 'kernel') for name in ('key_proj', 'value_proj')},
     **{f'ple.{norm}.weight': ('engram', norm, 'scale') for norm in ('norm_key', 'norm_query', 'norm_conv')},
     'ple.conv1d.weight': ('engram', 'conv1d', 'weight'),
-    'ple.ple_embedding.ngram_embedding.shard_0.weight': ('engram', 'embed', 'embedding'),
     **_QWEN_MOE_LEAVES,
     # The delta net's, by Qwen3.5's names (`dew_path`), which a write names back.
     **{f'linear_attn.{name}.weight': ('self_attn', name, 'kernel')
@@ -78,7 +76,9 @@ _HEAD = {**{f'model.hyper_connection_mixer.{name}.weight': ('hc_head', name, 'ke
          'model.hyper_connection_mixer.hc_norm.weight': ('hc_head', 'hc_norm', 'scale')}
 """The model's head, the gated read without its inject."""
 
-_SHARD = re.compile(r'^(?P<stem>.*\.ple\.ple_embedding\.ngram_embedding)\.shard_(?P<index>\d+)\.weight$')
+_SHARD = re.compile(r'^model\.layers\.(?P<layer>\d+)\.ple\.ple_embedding\.ngram_embedding'
+                    r'\.shard_(?P<index>\d+)\.weight$')
+_TABLE = re.compile(r'^layers_(?P<layer>\d+)\.engram\.shards\.embed\.embedding$')
 _BUFFERS = ('layer_multipliers', 'ngram_heads_vocab_sizes', 'ngram_heads_offsets')
 
 
@@ -109,7 +109,7 @@ def _engram(hf: Mapping[str, object], used: set[str], layers: int) -> NativeFiel
         row_multiple=_records.integer(hf.get('make_ngram_vocab_size_divisible_by', 128),
                                       'make_ngram_vocab_size_divisible_by'),
         ple_conv_kernel_size=_records.integer(hf.get('ple_conv_kernel_size', 4), 'ple_conv_kernel_size'),
-        media_stops=False)
+        table_parts=_records.integer(hf.get('split_ngram_parts', 1), 'split_ngram_parts'), media_stops=False)
 
 
 def _qwen4_exp_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
@@ -157,20 +157,12 @@ def _qwen4_exp_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields
 
 def _qwen4_exp_prepare(tensors: Mapping[str, Stored], config: Mapping[str, object] | None = None
                        ) -> dict[str, Stored]:
-    """The checkpoint with each n-gram table's row shards joined in order, its buffers checked against
-    the translated lookups (`Engram.multipliers`, `Engram.primes`) and dropped, and its prediction layer
-    left out (the module doc)."""
-    prepared: dict[str, Stored] = {}
-    shards: dict[str, dict[int, Stored]] = {}
+    """The checkpoint as stored, its n-gram buffers checked against the translated lookups
+    (`Engram.multipliers`, `Engram.primes`): no leaf takes them, so they are written back as stored."""
     spec = (None if config is None or config.get('engram') is None
             else from_record(Engram, _records.record(config['engram'], 'engram')))
     for name, tensor in tensors.items():
-        found = _SHARD.match(name)
-        if found is not None:
-            shards.setdefault(found['stem'], {})[int(found['index'])] = tensor
-        elif name.startswith('mtp.'):
-            continue
-        elif name.rsplit('.', 1)[-1] in _BUFFERS and '.ple.ple_embedding.' in name:
+        if _buffer(name):
             if spec is None:
                 raise ValueError(f'{name} needs the translated n-gram lookups to check it against')
             layer = spec.layer_ids.index(int(name.split('.')[2]))
@@ -179,15 +171,33 @@ def _qwen4_exp_prepare(tensors: Mapping[str, Stored], config: Mapping[str, objec
                         'ngram_heads_offsets': np.concatenate([[0], np.cumsum(primes)[:-1]])}
             if not equal(tensor, np.asarray(expected[name.rsplit('.', 1)[-1]], tensor.dtype)):
                 raise ValueError(f'{name} is not the layout the config derives')
-        else:
-            prepared[name] = tensor
-    for stem, parts in shards.items():
-        if sorted(parts) != list(range(len(parts))):
-            raise ValueError(f'{stem} holds shards {sorted(parts)}, not each of 0 to {len(parts) - 1}')
-        # The rows in order, under the one shard name the tree's table maps to (`_LEAVES`).
-        prepared[f'{stem}.shard_0.weight'] = (parts[0] if len(parts) == 1 else
-                                             np.concatenate([parts[index] for index in range(len(parts))]))
-    return prepared
+    return dict(tensors)
+
+
+def _buffer(name: str) -> bool:
+    """Whether `name` is one of an n-gram table's buffers (`_BUFFERS`)."""
+    return '.ple.ple_embedding.' in name and name.rsplit('.', 1)[-1] in _BUFFERS
+
+
+def _qwen4_exp_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
+    """Each tensor's leaf: a table's row shard its slice of the stacked table (`ShardedTable`); none
+    for the table's buffers and the prediction layer, which are written back as stored."""
+    if name.startswith('mtp.') or _buffer(name):
+        return None
+    found = _SHARD.match(name)
+    if found is not None:
+        layer = f"layers_{found['layer']}"
+        return ('params', layer, 'engram', 'shards', found['index'], 'embed', 'embedding')
+    return renamed_path(_NAMES, name, config, leaves=_HEAD, layer_leaves=_LEAVES)
+
+
+def _qwen4_exp_name(name: str, config: Mapping[str, object]) -> str | None:
+    """Each leaf's source name, a stacked table's the whole table's (`_qwen4_exp_export_weights` writes it
+    back shard by shard)."""
+    found = _TABLE.match(name)
+    if found is not None:
+        return f"model.layers.{found['layer']}.ple.ple_embedding.ngram_embedding.weight"
+    return renamed_name(_NAMES, name, config, leaves=_HEAD, layer_leaves=_LEAVES)
 
 
 def _qwen4_exp_constants(directory, record: Mapping[str, object]) -> Mapping[str, object]:
@@ -232,26 +242,40 @@ def _qwen4_exp_export(model: CausalTransformer) -> Mapping[str, object]:
             ple_embed_dim=engram.head_dim * engram.n_heads * (engram.max_ngram_size - 1),
             ple_conv_kernel_size=engram.ple_conv_kernel_size, ngram_vocab_size_base=engram.vocab_size,
             make_ngram_vocab_size_divisible_by=engram.row_multiple, seed=engram.multiplier_seed,
-            split_ngram_parts=1, eos_token_id=engram.stop_token_id)
+            split_ngram_parts=engram.table_parts, eos_token_id=engram.stop_token_id)
     return fields
 
 
 def _qwen4_exp_export_weights(family: DecoderFamily, model: CausalTransformer,
                               variables: Mapping[str, object], config: Mapping[str, object]) -> LazyTensors:
-    """Every leaf under its name (`decoder_tensors`), and each n-gram table's buffers, which transformers'
-    class holds and a load reads back (`_qwen4_exp_prepare`)."""
+    """Every leaf under its name (`decoder_tensors`), each n-gram table shard by shard as the release
+    stores it, and each table's buffers, which transformers' class holds and a load checks
+    (`_qwen4_exp_prepare`)."""
     tensors = decoder_tensors(family, model, variables, config)
-    engram, buffers = model.engram, {}
+    engram, added, tables = model.engram, {}, {}
     for index, layer in enumerate(() if engram is None else engram.layer_ids):
         assert engram is not None
         primes = np.asarray(engram.primes[index], np.int64).reshape(-1)
         stem = f'model.layers.{layer}.ple.ple_embedding'
-        buffers.update({f'{stem}.layer_multipliers': engram.multipliers[index].astype(np.int64),
-                        f'{stem}.ngram_heads_vocab_sizes': primes,
-                        f'{stem}.ngram_heads_offsets': np.concatenate([[0], np.cumsum(primes)[:-1]])})
-    specs = {**tensors.specs, **{name: jax.ShapeDtypeStruct(value.shape, value.dtype)
-                                 for name, value in buffers.items()}}
-    return LazyTensors(specs, lambda name: buffers[name] if name in buffers else tensors[name])
+        added.update({f'{stem}.layer_multipliers': engram.multipliers[index].astype(np.int64),
+                      f'{stem}.ngram_heads_vocab_sizes': primes,
+                      f'{stem}.ngram_heads_offsets': np.concatenate([[0], np.cumsum(primes)[:-1]])})
+        tables[f'{stem}.ngram_embedding.weight'] = stem
+    specs = {name: spec for name, spec in tensors.specs.items() if name not in tables}
+    for whole, stem in tables.items():
+        shape, dtype = tensors.specs[whole].shape, tensors.specs[whole].dtype
+        for shard in range(shape[0]):
+            specs[f'{stem}.ngram_embedding.shard_{shard}.weight'] = jax.ShapeDtypeStruct(shape[1:], dtype)
+    specs.update({name: jax.ShapeDtypeStruct(value.shape, value.dtype) for name, value in added.items()})
+
+    def tensor(name: str):
+        found = _SHARD.match(name)
+        if found is not None:
+            return tensors[f"model.layers.{found['layer']}.ple.ple_embedding.ngram_embedding.weight"][
+                int(found['index'])]
+        return added[name] if name in added else tensors[name]
+
+    return LazyTensors(specs, tensor)
 
 
 QWEN4_EXP_TEXT = DecoderFamily(
@@ -261,15 +285,13 @@ QWEN4_EXP_TEXT = DecoderFamily(
     'qwen4_exp_text',
     'Qwen4ExpForCausalLM',
     _qwen4_exp_export,
-    weight_path=partial(renamed_path, _NAMES, leaves=_HEAD, layer_leaves=_LEAVES),
-    export_path=partial(renamed_name, _NAMES, leaves=_HEAD, layer_leaves=_LEAVES),
+    weight_path=_qwen4_exp_path,
+    export_path=_qwen4_exp_name,
     export_weights=_qwen4_exp_export_weights,
     prepare=_qwen4_exp_prepare,
     constants=_qwen4_exp_constants,
     packed=FUSED_EXPERTS,
-    # A load joins the table's row shards and drops its buffers, so a save writes through the family's
-    # own writer (`_qwen4_exp_export_weights`) rather than back over the source's names.
-    preserve_source_layout=False,
+    preserve_source_layout=True,
     padding_idx=True,
     # Qwen4ExpTextConfig's defaults for the fields its decoder reads.
     defaults={'max_position_embeddings': 32768, 'num_experts_per_tok': 10, 'rms_norm_eps': 1e-6},

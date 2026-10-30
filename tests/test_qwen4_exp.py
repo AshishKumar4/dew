@@ -48,10 +48,10 @@ paired with Dew's logits on armada."""
 
 
 def test_an_export_opens_in_transformers_as_the_model_it_was(tmp_path):
-    """qwen4-exp-tiny written back (a qwen4_exp_text config, its experts fused, its n-gram table one shard
-    beside the buffers the class holds) opens in transformers' Qwen4ExpForCausalLM with no tensor missing,
-    left over or misshapen, which computes Dew's logits on par from its float64 twin (check 1), and Dew
-    reads it back as the model it was."""
+    """qwen4-exp-tiny written back (a qwen4_exp_text config, its experts fused, its n-gram table in its row
+    shards beside the buffers the class holds) opens in transformers' Qwen4ExpForCausalLM with no tensor
+    missing, left over or misshapen, which computes Dew's logits on par from its float64 twin (check 1),
+    and Dew reads it back as the model it was."""
     import torch
     from transformers import AutoModelForCausalLM
 
@@ -123,8 +123,9 @@ def test_the_release_wrapper_loads_whole_and_text_only_as_its_language_model(tmp
 
 def test_a_loaded_checkpoint_of_a_sharded_table_writes_back_and_reloads(tmp_path):
     """qwen4-exp-tiny, its n-gram table in four row shards and the release's root prediction-layer names
-    beside it, loads as without them and writes back (its table one shard beside its buffers) to a
-    checkpoint that reloads as the model it was."""
+    beside it, loads as without them and writes back as stored (each shard from its slice of the
+    stacked table, the buffers and the prediction layer as they were) to a checkpoint that reloads as
+    the model it was."""
     import shutil
 
     source = Path(shutil.copytree(TINY, tmp_path / 'source'))
@@ -147,8 +148,6 @@ def test_images_and_a_video_read_through_the_processor_as_transformers_reads_the
     positions M-RoPE's over the media's grids, and the n-gram lookups hashing the placeholders the
     media fill, compute the conditional reference's logits as exactly as its fp32 run does, from its
     float64 run (check 1 against the recording)."""
-    from tool_support import load as tool
-
     loaded = Pretrained.load(NATIVE, dtype='float32', attention_impl='reference')
     assert loaded.processor is not None
     recorded = np.load(NATIVE / 'reference.npz')
@@ -160,7 +159,7 @@ def test_images_and_a_video_read_through_the_processor_as_transformers_reads_the
     assert_as_exact_as_the_reference(logits[valid], recorded['logits'][valid],
                                      recorded['logits_f64'][valid], 'Qwen4-Exp image logits')
     clip = loaded.processor([prompts['video']], videos=[recorded['video']],
-                            video_metadata=[tool('qwen4_exp_reference').VIDEO_METADATA])
+                            video_metadata=[prompts['video_metadata']])
     logits = np.asarray(loaded.model.apply(loaded.variables, clip.tokens, **clip.kwargs()))
     assert_as_exact_as_the_reference(logits, recorded['video_logits'], recorded['video_logits_f64'],
                                      'Qwen4-Exp video logits')

@@ -115,10 +115,6 @@ def _wrapper_layouts(tensors, record, variables, language: Sequence[decoder_part
     retained = {}
     for name, tensor in tensors.items():
         group, local = decoders.wrapper_route(name, record)
-        if group == "language_model" and local not in readings:
-            # One the decoder family's `prepare` took in: a buffer it checked against the config, a
-            # table's row shard it joined into another (`DecoderFamily.prepare`).
-            continue
         if group == "language_model":
             layout = reading_layout(name, readings[local]._replace(stored=tensor), record["text"],
                                     record["text_model_type"], language_tree, _in_language_model)

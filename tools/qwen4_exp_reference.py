@@ -182,7 +182,8 @@ def write_native() -> None:
     with float64(), torch.no_grad():
         arrays['video_logits_f64'] = truth(**widened(clip), use_cache=False).logits.numpy()
     np.savez(directory / 'reference.npz', images=images, video=video, **arrays)
-    (directory / 'prompts.json').write_text(json.dumps({'images': prompts, 'video': video_prompt}) + '\n')
+    (directory / 'prompts.json').write_text(json.dumps({'images': prompts, 'video': video_prompt,
+                                                        'video_metadata': VIDEO_METADATA}) + '\n')
     (directory / 'meta.json').write_text(json.dumps({
         'transformers': transformers.__version__, 'torch': torch.__version__, 'attention': 'eager',
         'command': 'PYTHONPATH=src:tools python tools/qwen4_exp_reference.py --native'}, indent=2) + '\n')
