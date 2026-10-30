@@ -164,9 +164,9 @@ class _Pass:
 _ON_GPU = selection.Requirement[_Pass]('off_gpu', lambda case: case.on_gpu, "the call runs off a GPU",
                                        generation.INHERENT)
 MAINLOOP = selection.Op[_Pass]('attention_mainloop', (
-    selection.Kernel[_Pass]('mosaic', (_ON_GPU, selection.Requirement[_Pass].analysed(
+    selection.Kernel[_Pass]('mosaic', (_ON_GPU, selection.analysed(
         'declined', lambda case: case.mosaic, 'roadmap: the Mosaic template takes every call'))),
-    selection.Kernel[_Pass]('triton', (_ON_GPU, selection.Requirement[_Pass].analysed(
+    selection.Kernel[_Pass]('triton', (_ON_GPU, selection.analysed(
         'spans', lambda case: case.triton, generation.INHERENT))),
     selection.Kernel[_Pass]('portable', (), generic=True),
 ), preferred=lambda case: 'mosaic' if case.on_gpu else 'portable')

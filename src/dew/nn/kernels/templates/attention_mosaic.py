@@ -36,13 +36,9 @@ from dew.nn.kernels.templates.attention import (
     logit_scale,
     power_of_two,
 )
-from dew.nn.kernels.templates.attention_mosaic_backward import (
-    _dkv_allocations,
-    _dq_allocations,
-    _fused_allocations,
-    _launch_backward,
-    split_queries,
-)
+from dew.nn.kernels.templates.attention_mosaic_backward import _launch_backward
+from dew.nn.kernels.templates.attention_mosaic_dkv import _dkv_allocations
+from dew.nn.kernels.templates.attention_mosaic_dq import _dq_allocations
 from dew.nn.kernels.templates.attention_mosaic_forward import (
     _forward_allocations,
     _plain_forward,
@@ -50,6 +46,7 @@ from dew.nn.kernels.templates.attention_mosaic_forward import (
     guarded_columns,
     guarded_tiles,
 )
+from dew.nn.kernels.templates.attention_mosaic_fused import _fused_allocations
 from dew.nn.kernels.templates.attention_mosaic_program import (
     BackwardTiles,
     Tiles,
@@ -64,6 +61,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     refused,
     whole_tiles,
 )
+from dew.nn.kernels.templates.attention_mosaic_scores import split_queries
 from dew.nn.kernels.templates.base import Template, Unfitted
 
 
@@ -405,7 +403,7 @@ DQ_ROWS = 7
 """The per-query rows a dQ step holds across its walk (`_backward_registers`)."""
 DKV_STATISTICS = 5
 """The per-query statistics a dK/dV step holds, the maximum, the denominator, the anchor, D and the anchor
-key (`attention_mosaic_backward._scores`): column vectors keys first, row vectors in a fused launch's queries
+key (`attention_mosaic_scores._scores`): column vectors keys first, row vectors in a fused launch's queries
 first (`_backward_registers`)."""
 
 
@@ -437,7 +435,7 @@ def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int
     carried = [(block_k, width // config.columns, jnp.float32), (block_k, value_width // config.columns,
                                                                  jnp.float32)]
     if config.fused and not split:
-        # Queries first (`attention_mosaic_backward._fused_launch`), on either layout: its statistics row
+        # Queries first (`attention_mosaic_fused._fused_launch`), on either layout: its statistics row
         # vectors.
         statistics = DKV_STATISTICS * family.row_registers(block_q, jnp.float32)
         dq_tile = [(block_q, width, jnp.float32)]
