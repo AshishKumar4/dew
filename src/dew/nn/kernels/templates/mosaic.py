@@ -867,7 +867,7 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     def column_staging(self, shape: tuple, dtype, consumers: int) -> dict:
         """A resident block's per-role column tiles and their load completions."""
         block = self.column_shape(shape, consumers)
-        return {'parts': staged(block, dtype, self.swizzle_for(block[-1], dtype)),
+        return {'parts': staged(block, dtype),
                 'barriers': self.load_barriers(consumers)}
 
     def column_shape(self, shape: tuple, consumers: int) -> tuple:
