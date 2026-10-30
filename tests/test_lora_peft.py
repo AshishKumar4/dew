@@ -15,8 +15,8 @@ import optax
 import pytest
 import torch
 from flax import linen as nn
-from peft import LoraConfig, inject_adapter_in_model
 from one_draw import assert_as_exact_as_the_reference
+from peft import LoraConfig, inject_adapter_in_model
 from reference_error import (
     GateFailure,
     as_given,
