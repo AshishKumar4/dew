@@ -35,6 +35,7 @@ from dew.inputs import Field, InputSpec
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import REMAT_POLICIES
 from dew.nn.multimodal import MultimodalTransformer
+from dew.nn.progress import progress
 from dew.nn.vision import GemmaProjector, SiglipVision
 from dew.objectives.base import Objective, Ratio, Step
 from dew.objectives.lm import IndexerTraining, LMObjective
@@ -208,15 +209,12 @@ def test_a_language_models_estimate_is_its_configured_objectives():
     assert rejected(estimates["Dense_1"]["bias"], without["Dense_1"]["bias"]) < 1e-9
 
 
-def tied(kind: str):
-    """A one-layer tied decoder, that decoder with an embedding of its own width (`embedding_features`),
-    whose states reach the table through `project_out` (`Projection`), or under a multimodal wrapper
-    whose head read delegates to the decoder's (`MultimodalTransformer.output_table`), and the path of
-    its embedding's parameters."""
+def tied(wrapped: bool):
+    """A one-layer tied decoder, or that decoder under a multimodal wrapper whose head read delegates to
+    the decoder's (`MultimodalTransformer.output_table`), and the path of its embedding's parameters."""
     decoder = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
-                                mlp_features=32, max_seq_len=8, dtype="float32",
-                                embedding_features=8 if kind == "projected" else None)
-    if kind != "wrapped":
+                                mlp_features=32, max_seq_len=8, dtype="float32")
+    if not wrapped:
         return decoder, ("embed_tokens", "embedding")
     return (MultimodalTransformer(decoder, SiglipVision(hidden_size=16, intermediate_size=32, num_layers=1,
                                                         num_heads=2, image_size=8, patch_size=4),
@@ -225,25 +223,21 @@ def tied(kind: str):
             ("language_model", "embed_tokens", "embedding"))
 
 
-@pytest.mark.parametrize("kind", ["decoder", "projected", "wrapped"])
-def test_a_tied_heads_rows_the_batch_only_predicts_are_estimated_once(kind):
+@pytest.mark.parametrize("wrapped", [False, True], ids=["decoder", "wrapped"])
+def test_a_tied_heads_rows_the_batch_only_predicts_are_estimated_once(wrapped):
     """A decoder whose head is its embedding, tied, read as a matrix its loss contracts, over rows of the
-    ids 2 to 6 alone, bare, projected out of its stream (`embedding_features`) or under a wrapper whose
-    read delegates to the decoder's: the rows of the ids 7 to 12, which no input looks up and every
-    prediction's normalizer reads, take their estimate from the outermost read alone, its matrix
-    jittered there once and added to the lookup's estimate: over 256 steps' keys it is the analytic
-    gradient of those rows in expectation (the t-test rejects in no coordinate), where the lookup's
-    alone would leave them at zero and a read counted at each nesting twice the gradient. A projected
-    head's `project_out`, which the read applies and no layer call makes, is its gradient in
-    expectation too."""
-    model, embedding = tied(kind)
+    ids 2 to 6 alone, bare or under a wrapper whose read delegates to the decoder's: the rows of the ids
+    7 to 12, which no input looks up and every prediction's normalizer reads, take their estimate from
+    the outermost read alone, its matrix jittered there once and added to the lookup's estimate: over
+    256 steps' keys it is the analytic gradient of those rows in expectation (the t-test rejects in no
+    coordinate), where the lookup's alone would leave them at zero and a read counted at each nesting
+    twice the gradient."""
+    model, embedding = tied(wrapped)
     objective = ForwardLM(model, seq_len=6, draws=4, weight_draws=64, weight_sigma=0.01)
     variables = objective.init(jax.random.key(0))
     batch = {"text": jnp.asarray(np.random.default_rng(3).integers(2, 7, (8, 7)), jnp.int32)}
     estimates = estimated(objective, variables, batch)
     truth = gradient(LMObjective(model, seq_len=6), variables, batch, jax.random.key(0))
-    if kind == "projected":
-        assert rejected(estimates["project_out"]["kernel"], truth["project_out"]["kernel"]) > 1e-9
     for key in embedding:
         estimates, truth = estimates[key], truth[key]
     predicted = truth[7:]
@@ -436,6 +430,38 @@ def test_a_run_trains_without_differentiating_its_model():
     state = Trainer(objective, optax.sgd(0.01), key=0, layout=LAYOUT).fit(batches, steps=40)
     for moved, held in zip(jax.tree.leaves(state.variables), jax.tree.leaves(start), strict=True):
         assert not np.array_equal(np.asarray(moved), np.asarray(held))
+
+
+class Progressing(nn.Module):
+    """A Dense layer whose output the run's progress scales (`dew.nn.progress`): by the updates the run
+    committed before the step, zero at its first step."""
+
+    @nn.compact
+    def __call__(self, x):
+        updates = progress().updates
+        return nn.Dense(2)(x) * (1.0 if updates is None else updates.astype(jnp.float32))
+
+
+def test_the_estimate_runs_the_model_at_the_progress_its_loss_read():
+    """The estimate runs the model again in the step's derivative, at the progress the step's loss read
+    (ledger 2477): a model the progress scales to zero at a run's first step is estimated zero there and
+    not at its third, and a run trains it, every step's derivative at its own step's progress."""
+    objective = Forward(Progressing(), squared, inputs=InputSpec(Field("x", (3,))))
+    variables = objective.init(jax.random.key(0))
+    batch = {name: jnp.asarray(value) for name, value in rows((3,)).items()}
+
+    def estimate(updates: int) -> list[jax.Array]:
+        step = Step(jnp.asarray(0), jax.random.key(1), None, committed=jnp.asarray(updates, jnp.int32))
+        derivative = jax.grad(parameter_loss(objective, variables, batch, step))
+        return jax.tree.leaves(derivative(variables["params"]))
+
+    for leaf in estimate(0):
+        np.testing.assert_array_equal(leaf, np.zeros_like(leaf))
+    assert all(np.any(np.asarray(leaf) != 0) for leaf in estimate(2))
+    data = rows((3,))
+    batches = Memory([{"x": x, "y": y} for x, y in zip(data["x"], data["y"], strict=True)]).repeat().batch(16)
+    state = Trainer(objective, optax.sgd(0.01), key=0, layout=LAYOUT).fit(batches, steps=3)
+    assert int(state.updates) == 3
 
 
 class Normed(nn.Module):
