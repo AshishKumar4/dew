@@ -168,12 +168,14 @@ def test_the_port_is_as_exact_as_mamba_ssm(case):
                     truth_fn=as_given(lambda *args: (truth(*args),) * count))
 
 
-def test_the_template_is_as_exact_as_mamba_ssm():
+def the_template_is_as_exact_as_mamba_ssm():
     """The SSD on the recurrence template under the run's fast forms (`chunk_ssd` with the scan's selector
     named 'mosaic_gpu'), whose 16-bit numbers are mamba_ssm's (`mainloop._prepared`): every output and
     gradient on par with recorded mamba_ssm on its bf16 case's declared draws, mamba_ssm's own distance from
     float64 at the same inputs the bound (check 1), the truth Dew's float64 path as the port's test takes
-    it. Its fp32 cases are the accurate forms' bar's (test_recurrence_template_stability)."""
+    it. A GPU cell (tests/test_gpu_recurrence.py): interpreted, the template's training at the case's shape
+    outlasts a test's budget. Its fp32 cases are the accurate forms' bar's
+    (test_recurrence_template_stability)."""
     case = "bf16"
     stored = recording(SEEDED)
     stored.pop(PRECISION, None)
