@@ -854,20 +854,21 @@ def test_a_first_gpu_lane_on_a_class_borrows_another_classs_measured_shares(
 
 
 def test_a_files_children_hold_what_they_held_at_once_and_each_start_must_leave_its_record(tmp_path):
-    """The children's records join the file that started them (`followed.gathered`): their files,
-    and the GPU they held, the most a child that took the parent's fraction used, those children as
-    shares and the bytes of those that named their own, counted only while they lived at once. A
-    file is followed only where every start it and its children saw left a record naming it and none
-    started a process it did not follow; one whose child marked its start and left no record, killed
-    before it wrote, is not."""
+    """The children's logs join the file that started them (`followed.gathered`): their files, and the
+    GPU they held, the most a child that took the parent's fraction used, those children as shares and
+    the bytes of those that named their own, counted only while they lived at once. A file is followed
+    only where every start it and its children saw left a closed log naming it and none started a
+    process it did not follow; one whose child's log never closed, killed before its end, is not."""
     followed = load("followed", "tools/armada")
     gib = 2 ** 30
 
-    def child(index, file, began, ended, pool=None, inherited=True, expected=0, unfollowed=False, peak=None):
-        (tmp_path / f"{index}.started").write_text(file)
-        (tmp_path / f"{index}.json").write_text(json.dumps({
-            "file": file, "files": [f"src/{index}.py"], "reads": [], "expected": expected, "peak": peak,
-            "unfollowed": unfollowed, "began": began, "ended": ended, "pool": pool, "inherited": inherited}))
+    def child(index, file, began, ended, pool=None, inherited=True, expected=0, unfollowed=False, peak=None,
+              closed=True):
+        lines = [f"owner\t{file}", f"inherited\t{int(inherited)}", f"began\t{began}", f"file\tsrc/{index}.py",
+                 *["start\tfollowed"] * expected, *(["unfollowed\t1"] if unfollowed else []),
+                 *([f"pool\t{pool}"] if pool else []), *([f"peak\t{peak}"] if peak is not None else []),
+                 *([f"ended\t{ended}", "closed\t1"] if closed else [])]
+        (tmp_path / f"{index}.log").write_text("\n".join(lines) + "\n")
 
     child(1, "tests/a.py", 0, 10, pool=6 * gib, peak=5 * gib)
     child(2, "tests/a.py", 5, 15, pool=6 * gib, expected=1, peak=gib)
@@ -876,7 +877,7 @@ def test_a_files_children_hold_what_they_held_at_once_and_each_start_must_leave_
     child(5, "tests/a.py", 40, 41)
     child(6, "tests/b.py", 0, 1)
     child(7, "tests/c.py", 0, 1)
-    (tmp_path / "8.started").write_text("tests/c.py")
+    child(8, "tests/c.py", 0, 1, closed=False)
     child(9, "tests/d.py", 0, 1, unfollowed=True)
     found = followed.gathered(tmp_path, {"tests/a.py": 4, "tests/b.py": 2, "tests/c.py": 2, "tests/d.py": 1})
     assert found["tests/a.py"] == {"files": {f"src/{index}.py" for index in range(1, 6)}, "reads": set(),
