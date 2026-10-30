@@ -279,6 +279,30 @@ def test_a_scheduled_weight_reads_the_step():
     assert min(at_start, at_end) < between < max(at_start, at_end)
 
 
+def test_a_student_that_reads_the_runs_progress_is_passed_it_and_the_teacher_reads_the_runs_end():
+    """A distillation passes its student the run's progress as the student's own loss does
+    (`DistillationObjective.passes_progress`; review of ledger 2537), so a DEX student trains through its
+    anneal, its loss half way through it no longer its loss at the start, where the step refused it; the
+    frozen teacher, a finished run, reads the run's end at every step."""
+    from dew.nn.dex import DifferentialExtension
+
+    extension = DifferentialExtension(((0, (0, 1)),), anneal_steps=10)
+    batch = fixture_batch(fixture())
+
+    def losses(student_model: CausalTransformer, teacher_model: CausalTransformer) -> list[float]:
+        objective = DistillationObjective(LMObjective(student_model, SEQ, ema_decay=None),
+                                          LMObjective(teacher_model, SEQ, ema_decay=None))
+        params = objective.init(jax.random.key(0))
+        return [float(objective.scalar_loss(params, batch, dataclasses.replace(
+            step_at(), committed=jnp.asarray(updates, jnp.int32)))[0]) for updates in (0, 5)]
+
+    student, teacher = models()
+    started, halfway = losses(student.with_dex(extension), teacher)
+    assert started != halfway
+    started, halfway = losses(student, teacher.with_dex(extension))
+    assert started == halfway
+
+
 def test_a_pair_of_equal_widths_needs_no_projection():
     """Teacher and student of the same width: no `distillation` leaves in
     the params, and the feature term still reaches the loss."""

@@ -24,6 +24,7 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.flops import MissingFlopsCount, counted_flops, parameter_flops
 from dew.nn.inputs import CrossContext, next_position
 from dew.nn.kv_cache import POSITION
+from dew.nn.progress import Progress
 from dew.nn.protocols import OutputTable, ProjectionGroup, ReadsTrain, held_groups
 from dew.nn.sharding import explicit_spec
 from dew.nn.vision import ProjectorBase, TowerBase, TowerGeometry
@@ -443,7 +444,8 @@ class MultimodalTransformer(DecoderWrapper):
                       conditioning: Mapping[str, jax.Array] | None = None,
                       image_groups=None, block_groups=None, rotary_positions=None,
                       audio_indices=None, routed_experts=None, routed=None,
-                      coordinates: Coordinates | None = None, whole_blocks: bool = False):
+                      coordinates: Coordinates | None = None, whole_blocks: bool = False,
+                      progress: Progress | None = None):
         """Run the decoder over text with the media embeddings spliced in.
 
         `conditioning` holds the towers' payloads, and `image_indices` and
@@ -453,7 +455,7 @@ class MultimodalTransformer(DecoderWrapper):
         `routed_experts` and `routed` replay a routing record and go to the
         language model unchanged. Engines record a row for every placeholder
         position too, so the `[B, S, layers, top_k]` layout matches the text.
-        `coordinates` and `whole_blocks` are the language model's
+        `coordinates`, `whole_blocks` and `progress` are the language model's
         (`CausalTransformer.hidden_and_mtp_inputs`): the tokens as the decoder reads them, so the
         cursor counts the places the layers do.
         """
@@ -487,20 +489,21 @@ class MultimodalTransformer(DecoderWrapper):
             fused.tokens, train=train, decode=decode, input_embeddings=fused.embeddings,
             image_groups=image_groups, block_groups=block_groups, rotary_positions=rotary_positions,
             media_mask=fused.media, routed_experts=routed_experts, routed=routed, coordinates=coordinates,
-            conditioning=context, whole_blocks=whole_blocks)
+            conditioning=context, whole_blocks=whole_blocks, progress=progress)
 
     def __call__(self, tokens, train: bool = False, decode: bool = False,
                  positions=None, segment_ids=None, image_indices=None,
                  conditioning: Mapping[str, jax.Array] | None = None,
                  attention_mask=None, image_groups=None, block_groups=None, rotary_positions=None,
-                 audio_indices=None, coordinates: Coordinates | None = None):
+                 audio_indices=None, coordinates: Coordinates | None = None,
+                 progress: Progress | None = None):
         # The call's token layout converted once (`token_coordinates`), read alone from here on.
         coordinates = token_coordinates(tokens.shape, coordinates, segments=segment_ids, valid=attention_mask,
                                         positions=positions)
         hidden = self.hidden_states(tokens, train=train, decode=decode, image_indices=image_indices,
                                     conditioning=conditioning, image_groups=image_groups,
                                     block_groups=block_groups, rotary_positions=rotary_positions,
-                                    audio_indices=audio_indices, coordinates=coordinates)
+                                    audio_indices=audio_indices, coordinates=coordinates, progress=progress)
         if self.is_initializing() and self.language_model.dspark is not None:
             self.language_model.reach_drafter(tokens, hidden.dtype)
         if self.is_initializing() and self.num_nextn_predict_layers:

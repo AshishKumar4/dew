@@ -181,7 +181,7 @@ def _parts(accurate: bool, dtype) -> int:
 
 DROPPING = Refusal('dropout_places',
                   "the Mosaic mainloop draws dropout at its own places; a sequence exchange slice draws at "
-                  "its global places, a table gather a tile (`DropPlaces`)", row='1521')
+                  "its global places, a table gather a tile (`DropPlaces`)")
 """Why this mainloop refuses a dropping call that draws at a slice's global places (`refused`)."""
 
 
@@ -219,8 +219,7 @@ def refused(dtype, width: int, value_width: int, hooks: Hooks | None, *, backwar
     if hooks.drop is not None and jnp.dtype(dtype) == jnp.dtype(jnp.float16):
         # fp16's dropped weights take scaled parts (`algebra.weights_parts`), which the mainloop's register
         # products do not take back (`mosaic.unscaled_part`).
-        return Refusal('dropout_dtype', "the Mosaic dropping walk takes bf16 operands, not float16",
-                       row='1521')
+        return Refusal('dropout_dtype', "the Mosaic dropping walk takes bf16 operands, not float16")
     if backward and jnp.dtype(dtype) != jnp.dtype(jnp.bfloat16):
         return Refusal('dtype', f"the Mosaic backward takes bf16 operands, not {jnp.dtype(dtype)}")
     if jnp.dtype(dtype) not in sixteen:
