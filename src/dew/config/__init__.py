@@ -1721,8 +1721,6 @@ class RunConfig:
         groups = from_record(tuple[ParamGroup, ...], agreed_same("run param groups", resolved))
         return self.optim if groups == self.optim.param_groups else dataclasses.replace(
             self.optim, param_groups=groups)
-=======
->>>>>>> theirs
 
     def built[LossT, EffectsT](self, objective: Objective[LossT, EffectsT],
                                mesh: MeshSpec | jax.sharding.Mesh, rollout: Rollout | None,
