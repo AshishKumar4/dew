@@ -338,10 +338,12 @@ def template_attention(query, key, value, causal: bool, sliding_window, *, sinks
                           bias, (*jnp.shape(bias)[:3], key.shape[1])), _bias_axes(bias)))
 
 
-def _bias_axes(bias: jax.Array) -> tuple[str | None, ...]:
+def _bias_axes(bias: jax.Array | None) -> tuple[str | None, ...]:
     """A template call's bias's axes on the mesh: its batch rows and heads split with the call's where it
     holds one a row and a head, and shared whole where it holds one for them all (`template.shared_place`:
-    T5's `[1, H, Q, K]` table read by every row, never broadcast)."""
+    T5's `[1, H, Q, K]` table read by every row, never broadcast); none for a call without one."""
+    if bias is None:
+        return (None,) * 4
     rows, heads = jnp.shape(bias)[:2]
     return ("activation_batch" if rows > 1 else None, "activation_heads" if heads > 1 else None, None, None)
 
