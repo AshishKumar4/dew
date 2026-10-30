@@ -6,13 +6,15 @@ Built so far: the joint row's user turn as segments (`JointLayout.segments`: `Te
 `Schema`); layouts and heads recorded by import path; and the schema's stream (`Schema.stream`): the
 schema read as the row's context, in a backbone pass of its own over the same weights, which the
 cross-attention reads and the head pools its questions and options from (§2, §3); and a lettered
-question row's question as its context (`Instructions.stream`, `OptionLines.stream`, both "context"
-together): the row holds the state and the answer cue, whose state reads the letters
+question row's question as its context (`Instructions.stream`, "context", its option lines following
+it): the row holds the state and the answer cue, whose state reads the letters
 (`Labels`), the context the question and its lettered options, which the cross-attention reads and a
 head that pools option lines (`SlotReadout`) pools from; a label readout (`LabelReadout`) pools nothing.
 A question longer than the context its backbone reads is counted unfit, and a "none of the above" a
 read draws that would pass it is declined, as one past `max_len` is. Several such rows pack a window,
-each reading its own context. Next: a stream for the other segments. Owner: Training (`dew.decision`); cross-attention and `dew.inputs`' encoders: Models.
+each reading its own context. And a row's own streams in one pass (§2a): a segment names a stream of
+the row (`Schema.stream`, `Instructions.stream`), and the layout's `Reads` says which stream's tokens
+each stream attends to. Owner: Training (`dew.decision`); cross-attention and `dew.inputs`' encoders: Models.
 
 ## Today
 
@@ -47,6 +49,32 @@ So today's `Example.context` is one segment, `State`-like over the example's con
 - **Work.** FLOPs count every pass: the main forward; each stream's encoder, a forward alone where it trains nothing and `frozen_training_flops` where gradients flow through it; and the cross-attention blocks over each stream's real tokens.
 - **Budget.** A stream's token budget is at most its cross-attention's `context_length`; a layout whose stream budget exceeds it is refused when it is built.
 - **Serving.** A task's `admit` runs a stream's encoder once per request and hands its embeddings to the existing context path (the request's digest salt, slot-resident keys and values), so the `Server` never calls the model outside its programs.
+
+## 2a. A row's own streams, in one pass
+
+A segment may name a stream of the row itself rather than a conditioning stream: `Schema(stream="schema")`,
+`Instructions(stream="question")`, its option lines following their instructions. The row's tokens stand in
+streams, `"row"` and each one its segments name, and the layout's `reads` (`Reads`) is a table of
+`(reader, read, how)`: a token of `reader` attends to the tokens of `read` (`"self"`, its own stream), all of
+them (`"whole"`) or those up to itself (`"causal"`); a pair the table omits reads none, and every stream
+reads itself. Two streams in one pass, the state reading the schema though the schema follows it
+and the schema reading itself alone, are
+`Reads((("row", "self", "causal"), ("row", "schema", "whole"), ("schema", "self", "causal")))`. A row with
+no stream segments stands in the row's one stream, which a one-entry table reads.
+
+- **Lowering.** The layout lowers its table over its streams (`Layout.attention`: per stream, how it reads
+  itself and each stream) and the most runs of one stream a row lays (`fragment_count`). Each token's
+  stream rides the batch (`Encoded.streams`, `DecisionInputs.streams`), and the model turns them into each
+  token's key runs over its own document (`stream_runs`), passed as the backbone's `attention_key_runs`:
+  no `[B, L, L]` mask, and packing keeps each row's runs within its document.
+- **Positions.** A row's positions run along it as it lays its tokens, whatever its streams.
+- **Refusals.** A row's reads take the place of blocks and parallel options, which set what a token reads
+  otherwise, and of images, whose tokens read each other whole; a layout naming a stream with no reads, or
+  reads naming a stream its segments do not lay, is refused when it is built.
+- **Runs.** A run states its reads on the command line (`--reads`, a `Reads` record) beside its
+  `--segments`, and its saved task records them with its layout, so the task loaded from the run reads
+  its rows as it trained; a layout field added after runs were saved keeps their data identity until a run
+  sets it (`dew._records.ADDED`).
 
 ## 3. The head reads the main pass
 

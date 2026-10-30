@@ -199,3 +199,22 @@ def set_added(value: DataclassInstance | Sequence[DataclassInstance] | Mapping[s
         return False
     return any((field.metadata.get(ADDED) and getattr(value, field.name) != field.default)
                or set_added(getattr(value, field.name)) for field in dataclasses.fields(value))
+
+
+def earlier_segments(segments: Sequence[JSON]) -> list[JSON]:
+    """A decision row's segment records (`dew.decision.layout`) in today's fields, as a saved run's
+    record holds them (`dew.config.earlier_run`, `dew.inference.tasks.earlier_shapes`): a question's
+    option lines without the stream they named between rows 2008 and 2450, which was always their
+    instructions' (one stream a question), as they follow their instructions now. Carried to 1.0
+    (ledger 1552)."""
+    def current(segment: JSON) -> JSON:
+        if not isinstance(segment, dict) or not isinstance(segment.get("fields"), dict):
+            return segment
+        # Option lines are recorded by their import path (`dew.registry.to_record`).
+        if segment.get("class") != "dew.decision.layout:OptionLines":
+            return segment
+        fields = segment["fields"]
+        assert isinstance(fields, dict)
+        return {**segment, "fields": {key: value for key, value in fields.items() if key != "stream"}}
+
+    return [current(segment) for segment in segments]

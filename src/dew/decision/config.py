@@ -33,9 +33,11 @@ from dew.decision.laya import LAYA
 from dew.decision.layout import (
     Framing,
     Instructions,
+    JointLayout,
     Labels,
     Layout,
     QuestionLayout,
+    Reads,
     RowOrder,
     RowSegment,
     Schema,
@@ -43,6 +45,7 @@ from dew.decision.layout import (
 )
 from dew.decision.model import DecisionModel
 from dew.decision.objective import DecisionObjective
+from dew.decision.renderer import Unit
 from dew.decision.scoring import default_metrics
 from dew.decision.task import Decide
 from dew.nn.backbones.decoder_block import remat_policy
@@ -139,6 +142,17 @@ class DecisionRunConfig(DecoderRunConfig):
     question row's text (`QuestionLayout.segments`): its instructions, option lines and answer cue
     beside the state, the question first or the state first, its blocks following that order
     (`QuestionLayout.blocks`). None keeps the layout's own, the release's turn."""
+    reads: Annotated[Reads, record_argument(Reads)] | None = None
+    """Which of the row's streams each reads (`Reads`), where its `segments` name a stream of the row's
+    own (`Schema(stream=...)`, `Instructions(stream=...)`): two streams in one pass, the state reading
+    the schema and the schema itself alone, are its table. None reads the row in order."""
+    parallel: bool | None = None
+    """Whether a question row reads its options in parallel, each at positions of its own after the
+    question (`QuestionLayout.parallel`), which a head that reads option slots needs. None keeps the
+    layout's own."""
+    unit: Unit | None = None
+    """How a question row's `segments` encode their text, piece by piece or whole
+    (`QuestionLayout.unit`). None keeps the layout's own, piece by piece."""
     order: RowOrder | None = None
     """The order a question row's own text writes its parts in (`QuestionLayout.order`): the state
     first, the question first, or the state, the question and the state again (`re_read`), each part as
@@ -222,10 +236,7 @@ class DecisionRunConfig(DecoderRunConfig):
                              "attention_impl are choices")
         dtype = self.compute_dtype()
         attention_impl = self.source_attention()
-        budgets = {"max_len": self.max_len, "head_max_len": self.head_max_len,
-                   "option_tokens": self.option_tokens, "max_state_tokens": self.max_state_tokens,
-                   "framing": self.framing, "segments": self.segments, "order": self.order,
-                   "split": self.split}
+        budgets = self._row_fields()
         self._refuse_unread_context()
         derived = {}
         if self.context_layers is not None:
@@ -318,6 +329,11 @@ class DecisionRunConfig(DecoderRunConfig):
         return Prepared(self, lambda name: self.train(objective, dataset, name=name, metrics=metrics,
                                                       summary=summary, after=after, validation=held))
 
+    def _row_fields(self) -> Budgets:
+        """The run's fields that lay its rows out, by the layouts' field names (`ROW_FIELDS`), which
+        `_budgeted` sets on the layout the run reads."""
+        return {name: getattr(self, name) for name in ROW_FIELDS}
+
     def _fresh_head(self, start, blocked: bool, budgets: Budgets) -> Mapping[str, object]:
         """The head a fresh backbone `start` reads and its rows' layout: the joint schema head, the
         letter readout of its own logits (`Letters`), its labels named by the backbone's tokenizer, or
@@ -382,8 +398,15 @@ class DecisionRunConfig(DecoderRunConfig):
         return tuple(MetricConfig(import_path(type(metric))) for metric in default_metrics())
 
 
-type Budgets = dict[str, int | bool | str | Framing | Labels | tuple[RowSegment, ...] | None]
-"""A run's budgets of a row's layout, by the layout's field names (`_budgeted`)."""
+type Budgets = dict[str, object]
+"""A run's fields of a row's layout, by the layout's field names (`_budgeted`)."""
+
+ROW_FIELDS = tuple(sorted(
+    {entry.name for layout in (QuestionLayout, JointLayout) for entry in dataclasses.fields(layout)}
+    & {entry.name for entry in dataclasses.fields(DecisionRunConfig)}))
+"""The run's fields that lay out its rows: each a field of a decision layout (`QuestionLayout`,
+`JointLayout`) the run declares by the same name, so a layout field the run states reaches its layout
+(`_budgeted`) without a list of its own to keep."""
 
 
 def _fresh_layout(causal: bool, one_question: bool, budgets: Budgets, blocked: bool = False,
