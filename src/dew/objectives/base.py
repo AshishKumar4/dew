@@ -1445,16 +1445,20 @@ class Objective(ABC, Generic[Loss, Effects]):
         is for what else reads it."""
         return Progress(step.committed) if step.training else END
 
+    def progress_readers(self) -> tuple[nn.Module, ...]:
+        """The trained modules its programs run (`program_key`), whatever the objective holds, whose
+        computation changes over a run (`ReadsProgress`): those a training step passes the run's
+        progress, or trains at the run's end."""
+        return tuple(entry.module for entry in self.program_key() if entry.trained
+                     and isinstance(entry.module, ReadsProgress) and entry.module.reads_progress())
+
     def _refuse_unpassed_progress(self) -> None:
-        """Refuse a trained module whose computation changes over a run (`ReadsProgress`) under an
-        objective whose loss passes it no progress (`passes_progress`): it would train at the run's
-        end. The modules are those its programs run (`program_key`), whatever the objective holds."""
-        for entry in self.program_key():
-            module = entry.module
-            if entry.trained and isinstance(module, ReadsProgress) and module.reads_progress():
-                raise ValueError(f"{type(self).__name__} passes its model no run's progress, which a "
-                                 f"{type(module).__name__} reads (dew.nn.progress): it would train at the "
-                                 f"run's end")
+        """Refuse a module that reads the run's progress (`progress_readers`) under an objective whose
+        loss passes it none (`passes_progress`): it would train at the run's end."""
+        for module in self.progress_readers()[:1]:
+            raise ValueError(f"{type(self).__name__} passes its model no run's progress, which a "
+                             f"{type(module).__name__} reads (dew.nn.progress): it would train at the "
+                             f"run's end")
 
     def recorded_model(self) -> nn.Module:
         """The model a saved step's record names (`inference_record`): the objective's own."""
