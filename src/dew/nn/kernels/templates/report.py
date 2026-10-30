@@ -12,6 +12,7 @@ import contextlib
 import contextvars
 import dataclasses
 import hashlib
+import json
 import logging
 import os
 import re
@@ -22,7 +23,9 @@ from pathlib import Path
 
 import jax
 import tokamax
+from filelock import FileLock
 
+from dew.files import write_atomically
 from dew.nn.kernels import generation
 
 DUMPS = {"MOSAIC_GPU_DUMP_PTXAS": "1", "MOSAIC_GPU_DUMP_RESOURCES": "1"}
@@ -252,7 +255,9 @@ def compiled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | 
     again, so every process derives the program this compile keeps; a relowering whose derivations find no
     config left (`Exhausted`) keeps the first program, its misses recorded as not stepped. Refusals commit
     only when a replacement compiles, so a later process derives the program kept here. A program loaded
-    from the persistent compilation cache runs no ptxas and reports nothing."""
+    from the persistent compilation cache runs no ptxas: its exact native artifact carries the spill
+    reports earlier compiles observed, which take the same step-down path. No reports is not a clean
+    verdict, and never writes one."""
     executable, spilling = _compiled_reported(lowered, options)
     found = _misses_of(spilling)
     refusals = [(refusal, report.kernel) for refusal, report, _ in found if refusal is not None]
@@ -301,10 +306,45 @@ def _recorded(found: list, *, stepped: bool) -> None:
 
 def _compiled_reported(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None
                        ) -> tuple[jax.stages.Compiled, list["Report"]]:
+    from dew.training._lowering import kernel_calls
+
+    if not any(call.kind == "mosaic_gpu" for call in kernel_calls(lowered)):
+        return lowered.compile(options), []
     with tempfile.TemporaryDirectory() as directory:
         with reported(directory):
             executable = lowered.compile(options)
-        return executable, [found for found in reports(directory) if found.spilled]
+        spilling = [found for found in reports(directory) if found.spilled]
+    if jax.config.jax_compilation_cache_dir:
+        spilling = _artifact_spills(executable, spilling)
+    return executable, spilling
+
+
+def _artifact_spills(executable: jax.stages.Compiled, observed: list["Report"]) -> list["Report"]:
+    """Spill reports observed for this exact native artifact, never an IR or a cache lookup key.
+
+    JAX retains the SHA-256 of the original serialization at its cache read/write boundary: serializing
+    a loaded executable again can change its bytes. Reports are evidence about that artifact, not a
+    refusal of its launch: `compiled` commits a refusal only after its replacement compiles. Empty
+    reports give no evidence (Mosaic also caches kernels within a process), so never erase earlier
+    spills or establish a clean verdict.
+    """
+    digest = executable._executable_digest().hex()
+    path = Path(jax.config.jax_compilation_cache_dir) / "kernel-spills" / f"{digest}.json"
+
+    def read() -> list[Report]:
+        if not path.exists():
+            return []
+        return [Report(**{**entry, "unread": tuple(entry["unread"])})
+                for entry in json.loads(path.read_text())]
+
+    if not observed:
+        return read()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with FileLock(str(path) + ".lock"):
+        by_launch = {(report.kernel, report.launch): report for report in (*read(), *observed)}
+        found = list(by_launch.values())
+        write_atomically(path, json.dumps([dataclasses.asdict(report) for report in found]))
+    return found
 
 
 @dataclasses.dataclass(frozen=True)
