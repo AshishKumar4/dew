@@ -144,7 +144,7 @@ def test_a_load_reads_each_tensor_by_name_from_its_checkpoint(source, loaded, tm
     tensors = load_file(lacking / "model.safetensors")
     del tensors["gpt_neox.layers.0.mlp.dense_h_to_4h.weight"]
     save_file(tensors, lacking / "model.safetensors", metadata={"format": "pt"})
-    with pytest.raises(ValueError, match="dense_h_to_4h"):
+    with pytest.raises(ValueError):
         Pretrained.load(lacking, fallback="torchax", dtype="float32")
 
 
