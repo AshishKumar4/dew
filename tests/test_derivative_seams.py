@@ -36,6 +36,8 @@ CONTRACTED = {
         "test_the_chunked_delta_rule_holds_every_order",
     "src/dew/nn/kernels/recurrence_algebra.py::remembered":
         "test_the_chunked_delta_rule_holds_every_order",
+    "src/dew/nn/kernels/recurrence_algebra.py::_decayed_product":
+        "test_the_chunked_delta_rule_holds_every_order",
 }
 """Each contracted seam, `path::qualified name`, and the test of tests/test_derivative_contracts.py that holds
 it."""
