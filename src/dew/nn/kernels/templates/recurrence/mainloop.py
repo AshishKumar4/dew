@@ -175,7 +175,7 @@ class _Issuer:
         # By product name: each set's value (held, so its identity stays its own) and its last use.
         self.held: dict = {}
 
-    def _operand(self, x, name: str, other=None, read: list | None = None) -> tuple:
+    def _operand(self, x, name: str, other=None, read: dict | None = None) -> tuple:
         """`x`'s parts' shared-memory tiles, staged into its product's buffers where it is a register value;
         `read` the tiles products issued before it may still read (`summed`'s), waited for where it would
         stage into one of them."""
@@ -206,14 +206,15 @@ class _Issuer:
         values = product.formed(x, len(buffers)) if len(buffers) > 1 else (x,)
         return tuple(self._staged(value, buffer, read) for value, buffer in zip(values, buffers, strict=True))
 
-    def _staged(self, value, buffer, read: list | None):
-        """`value` staged into `buffer` (`Family.staged`), the products in flight done first where one may
-        read it (`read`, then emptied), and `buffer` added to `read` for the products after it."""
+    def _staged(self, value, buffer, read: dict | None):
+        """`value` staged into `buffer` (`Family.staged`), once the last product issued that reads it is done
+        (`read`: each tile's last reader, by its place among the products issued, and the count issued,
+        `summed`'s), the products after it left in flight."""
         if read is not None:
-            if any(buffer is tile for tile in read):
-                self.call.family.settled(0)
-                read.clear()
-            read.append(buffer)
+            last = read["readers"].get(id(buffer))
+            if last is not None:
+                self.call.family.settled(read["issued"] - last - 1)
+            read["readers"][id(buffer)] = read["issued"]
         return self.call.family.staged(value, buffer)
 
     def summed(self, products: Iterable, shape: tuple[int, int] | None = None) -> jax.Array:
@@ -229,10 +230,11 @@ class _Issuer:
         family, interpret = self.call.family, self.call.interpret
 
         def issued(acc):
-            read: list = []
+            read: dict = {"readers": {}, "issued": 0}
             for name, lhs, rhs in itertools.chain([first], products):
                 left, right = self._operand(lhs, name, rhs, read), self._operand(rhs, name, lhs, read)
                 acc = family.issued(acc, left, right, interpret)
+                read["issued"] += len(product.terms(len(left), len(right)))
             return acc
 
         shape = (first[1].shape[0], first[2].shape[1]) if shape is None else shape
@@ -1073,9 +1075,10 @@ def _pairing_operand(call: _Call) -> _Operand:
 
 
 def _pairing(call: _Call) -> list:
-    """The factored pairs' staging (`_Issuer`'s 'pairs'): two sets, the gated rows' and the gated keys',
-    each a `[C, block]` tile a part (`_pairing_operand`)."""
-    return [_staging(_pairing_operand(call), (CHUNK, INTRA_KEYS))[0] for _ in range(2)]
+    """The factored pairs' staging (`_Issuer`'s 'pairs'): four sets, a product's gated rows' and gated keys'
+    and the next one's, each a `[C, INTRA_KEYS]` tile a part (`_pairing_operand`), so a product's operands
+    stage while the one before it runs."""
+    return [_staging(_pairing_operand(call), (CHUNK, INTRA_KEYS))[0] for _ in range(4)]
 
 
 WEIGHTED_KEYS = 32
