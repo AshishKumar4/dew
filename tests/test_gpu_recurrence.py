@@ -33,7 +33,7 @@ from reference_error import FEWEST_SEEDS, assert_as_exact, with_gradients
 from test_linear_attention import fused_case
 
 from dew.batch import coordinates
-from dew.nn.inputs import MixerCall
+from dew.nn.inputs import AttentionMetadata, MixerCall
 from dew.nn.kda import KimiDeltaAttention
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates.recurrence import mainloop
@@ -85,10 +85,11 @@ def trains_on_its_port(make):
     every parameter under a drawn cotangent on its port (`PORT_KERNELS`, named), on par from float64 with
     the portable rule's (check 1, the layer in float64 the truth)."""
     layer = make()
-    tokens = coordinates(segments=jnp.asarray([[1] * 150 + [2] * 106, [1] * 90 + [2] * 166]), max_segments=2)
+    packed = MixerCall(AttentionMetadata(coordinates=coordinates(
+        segments=jnp.asarray([[1] * 150 + [2] * 106, [1] * 90 + [2] * 166]), max_segments=2)))
 
     def apply(params, x):
-        return layer.apply(params, x, MixerCall(tokens=tokens))
+        return layer.apply(params, x, packed)
 
     def draw(seed):
         x = jax.random.normal(jax.random.key(seed), (ROWS, TOKENS, WIDTH)).astype(jnp.bfloat16)
@@ -98,8 +99,7 @@ def trains_on_its_port(make):
 
     def truth(params, x, cotangent):
         wide = layer.clone(dtype=jnp.float64)
-        return with_gradients(lambda params, x: wide.apply(params, x, MixerCall(tokens=tokens)))(
-            params, x, cotangent)
+        return with_gradients(lambda params, x: wide.apply(params, x, packed))(params, x, cotangent)
 
     assert_as_exact(named(with_gradients(apply), gated_delta_rule="fla"),
                     named(with_gradients(apply), gated_delta_rule="xla"), draw,
@@ -184,9 +184,12 @@ def test_the_recurrences_run_on_this_gpu():
              functools.partial(trains_on_its_port, gated_delta_net)),
         Cell(f"a Kimi delta attention layer trains on its port on par with the portable rule "
              f"({PORT_KERNELS['kda']})", functools.partial(trains_on_its_port, kimi_delta_attention)),
+        # The template takes no Kimi delta attention call on these GPUs yet (its intra launch's registers,
+        # ledger 1445): its port's step alone.
         *(Cell(f"a {make.__name__} training step on {kernel} repeats bit for bit",
                functools.partial(repeats_bit_for_bit, make, kernel))
-          for make in (gated_delta_net, kimi_delta_attention) for kernel in ("fla", "mosaic_gpu")),
+          for make, kernels in ((gated_delta_net, ("fla", "mosaic_gpu")), (kimi_delta_attention, ("fla",)))
+          for kernel in kernels),
         *(Cell(f"a gated delta net decodes on its {kernel} kernel on par with the portable step",
                functools.partial(decodes_on_its_kernel, kernel)) for kernel in ("fused", "step")),
     ])
