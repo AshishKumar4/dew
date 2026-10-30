@@ -7,8 +7,9 @@ its checkpoint, the two runs alike bit for bit.
 examples/train_flowers.py's diffusion model and objective on Oxford Flowers 102 (the Hub's copy at a pinned
 commit) at 256 pixels, batch 16, under XLA's deterministic GPU ops, each run in a fresh `output`: one trains
 `steps` straight; the other trains half of them and ends, and a new process resumes it from its checkpoint to
-`steps` (`train`, a process each). Each saves 8 samples (samples.png). It prints whether every loss the two
-logged, and their samples, are equal.
+`steps` (`train`, a process each). Each saves 8 samples (samples.png). It prints whether the two runs'
+states at `steps` (their checkpoints, every leaf bit for bit), their samples (samples.png's bytes) and the
+losses they printed are equal.
 """
 
 import dataclasses
@@ -19,6 +20,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import numpy as np
 import tyro
 
 FLOWERS, REVISION = "dpdl-benchmark/oxford_flowers102", "544b55c9af69a05742ead7571cd7ae23cfcd758b"
@@ -60,17 +62,35 @@ def trained(output: Path, steps: int) -> list[tuple[str, str]]:
     return re.findall(r"^step (\d+)/\d+\s+loss (\S+)", log, re.MULTILINE)
 
 
+def weights(output: Path, step: int) -> dict[str, np.ndarray]:
+    """What the run in `output` checkpointed at `step`: every leaf of its state, a host array by its path."""
+    import jax
+
+    from dew import Checkpoints
+
+    state, _ = Checkpoints(str(output / "checkpoints")).restore(step=step)
+    return {jax.tree_util.keystr(path): np.asarray(leaf)
+            for path, leaf in jax.tree_util.tree_leaves_with_path(state)}
+
+
 def compare(args: Compare) -> None:
     # Each run from no checkpoint: one left in its directory would resume it.
-    for run in ("straight", "resumed"):
-        (args.output / run).mkdir(parents=True)
-    straight = trained(args.output / "straight", args.steps)
-    resumed = trained(args.output / "resumed", args.steps // 2) + trained(args.output / "resumed", args.steps)
-    samples = {run: hashlib.sha256((args.output / run / "samples.png").read_bytes()).hexdigest()
-               for run in ("straight", "resumed")}
-    print(f"losses: {len(straight)} logged, {'equal' if straight == resumed else 'NOT equal'}")
-    same = samples["straight"] == samples["resumed"]
-    print(f"samples: {'equal' if same else 'NOT equal'} ({samples['straight']})")
+    runs = [args.output / run for run in ("straight", "resumed")]
+    if taken := [str(run) for run in runs if run.exists()]:
+        raise SystemExit(f"{', '.join(taken)} exists: compare trains each run afresh; name a new --output")
+    for run in runs:
+        run.mkdir(parents=True)
+    straight = trained(runs[0], args.steps)
+    resumed = trained(runs[1], args.steps // 2) + trained(runs[1], args.steps)
+    first, second = (weights(run, args.steps) for run in runs)
+    same = first.keys() == second.keys() and all(
+        first[name].dtype == second[name].dtype and np.array_equal(first[name], second[name])
+        for name in first)
+    print(f"states at step {args.steps}: {'equal' if same else 'NOT equal'} ({len(first)} leaves)")
+    samples = [hashlib.sha256((run / "samples.png").read_bytes()).hexdigest() for run in runs]
+    print(f"samples: {'equal' if samples[0] == samples[1] else 'NOT equal'} ({samples[0]})")
+    alike = "equal" if straight == resumed else "NOT equal"
+    print(f"printed losses: {len(straight)}, {alike} to the digits shown")
 
 
 if __name__ == "__main__":
