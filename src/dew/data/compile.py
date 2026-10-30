@@ -420,10 +420,12 @@ def _bounded(pipeline: Pipeline, examples: int) -> Pipeline:
     packs or windows them, or its batch: never the rows an objective makes of an example or the windows
     a pack lays them in. A repeat without end goes before the bound
     where none is written, so the records may span passes, and the batch keeps the short one the
-    bound ends inside, filled and marked, so each record bounded is read once (`Loader.examples`).
-    Refuses a bound it cannot place: a repeat with a count before it, or any repeat after it, the
-    batch's included, a mixed corpus that packs on its own, and phases, which end by steps. A chain
-    without a batch is left for `compile` to refuse."""
+    bound ends inside, filled and marked, so each record bounded is read once (`Loader.examples`); in a
+    pool, a read in one order takes the bound before it cuts its shares, and a read whose shares each
+    read records of their own takes on each its part of the pool's first `examples`
+    (`dew.data.lowering._Build.bounded`). Refuses a bound it cannot place: a repeat with a count before
+    it, or any repeat after it, the batch's included, a mixed corpus that packs on its own, and phases,
+    which end by steps. A chain without a batch is left for `compile` to refuse."""
     if examples < 1:
         raise ValueError(f"examples must be at least 1, got {examples}")
     if isinstance(pipeline.source, Phases):

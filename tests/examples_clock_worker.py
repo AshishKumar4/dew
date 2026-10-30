@@ -1,0 +1,117 @@
+"""Workers for a pool's run on the examples clock (`dew.training._fit.pooled_read`): each process a rank
+of a run bounded in examples whose shares run out at steps apart.
+
+dew is imported inside the modes, as `multiprocess_worker`'s are, so the pool starts before JAX does.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from multiprocess_worker import BATCH, dump_params
+from process_support import serve_mode, worker_parser
+
+RECORDS = 10
+"""The records each run reads, ids 1 to RECORDS, which its bound reaches past in a second pass."""
+
+FEATURES = 3
+SHARD_ROWS = 3
+"""The rows of each physical shard a streamed read deals its shares, the last one short."""
+
+
+def examples_clock(args) -> dict:
+    """A run bounded to `--examples` of RECORDS records, read as `--deal` deals them to the pool's shares:
+    `order`, one global order; `records`, each share its own, an objective making `id % 3 + 1` rows of
+    each; `shards`, physical shards of SHARD_ROWS rows and a last short one, each share its own, the
+    objective making rows likewise. Its mesh puts `--tensor` processes on each share; `--pause` pauses it
+    there (`Pause`) and resumes it; `--cooldown` branches it to a cooldown of that many steps at 60% of its
+    examples. Reports the step it ends at, the examples its state consumed, the examples each log read,
+    each id's examples its steps trained on (each step's real rows by id over the rows each example
+    makes, the objective's aux, which the pool's first process logs) and the cooldown's validation loss,
+    its parameters beside the report."""
+    import jax
+    import jax.numpy as jnp
+
+    from dew.batch import VALID_ROWS
+    from dew.data import Memory
+    from dew.data.pipeline import ObjectiveData, Pipeline
+    from dew.objectives.base import Aux, Objective
+    from dew.optim import Linear, OptimConfig
+    from dew.training import Checkpoints, Cooldowns, MeshSpec, Pause, Trainer
+
+    expands = args.deal != "order"
+
+    class Questioned:
+        """Each record made `id % 3 + 1` rows, as a decision layout makes a row of each question."""
+
+        def flat_map(self, element):
+            return tuple({"id": element["id"]} for _ in range(int(element["id"]) % 3 + 1))
+
+    class Pulled(Objective):
+        """A weight pulled toward each real row's id, counting each id's examples among the rows it trains."""
+
+        def fresh_variables(self, key, held):
+            return {"params": {"w": jnp.zeros(FEATURES)}}
+
+        def loss(self, variables, batch, step):
+            ids = batch["id"]
+            x = jnp.repeat(ids.astype(jnp.float32)[:, None], FEATURES, axis=1)
+            loss = self.row_mean(jnp.square(variables["params"]["w"] - x), batch)
+            real = jnp.asarray(batch[VALID_ROWS], bool) if VALID_ROWS in batch else jnp.ones(ids.shape, bool)
+            rows = ids % 3 + 1 if expands else jnp.ones_like(ids)
+            return loss, Aux({f"id_{record}": jnp.sum(jnp.where(real & (ids == record), 1.0 / rows, 0.0))
+                              for record in range(1, RECORDS + 1)})
+
+        def data(self):
+            return ObjectiveData(train=(Questioned(),)) if expands else ObjectiveData()
+
+    class Logged:
+        def __init__(self):
+            self.scalars: list[dict] = []
+
+        def log(self, scalars, step):
+            self.scalars.append(dict(scalars))
+
+        def artifact(self, value, step):
+            pass
+
+    ids = np.arange(1, RECORDS + 1, dtype=np.int32)
+    source = Memory({"id": ids}, shard_rows=SHARD_ROWS)
+    read = "streamed" if args.deal == "shards" else "memory"
+    shuffled = {"seed": 3, "window": RECORDS} if read == "streamed" else {"seed": 3}
+    chain = Pipeline(source).shuffle(**shuffled).read(read).batch(BATCH)
+    held = Pipeline(Memory({"id": ids[:BATCH]})).read("memory").batch(BATCH)
+    tracker = Logged()
+    optim = OptimConfig(optimizer="optax:sgd", learning_rate=Linear(peak_value=1e-2, end_value=0.0))
+    checkpoints = Checkpoints(str(args.out.parent / "run")) if args.pause else None
+    trainer = Trainer(Pulled(), optim, key=jax.random.key(0), mesh=MeshSpec(tensor=args.tensor),
+                      tracker=tracker, checkpoints=checkpoints)
+    options = {"examples": args.examples, "log_every": 1}
+    if args.cooldown:
+        options.update(validation=held, cooldowns=Cooldowns(at=("60%",), length=args.cooldown))
+    if args.pause:
+        trainer.fit(chain, stop=Pause(args.pause), **options)
+    state = trainer.fit(chain, **options)
+    dump_params(args.out.with_suffix(".npz"), state.variables)
+    trained = [scalars for scalars in tracker.scalars if "train/loss" in scalars]
+    counts = {record: sum(scalars[f"train/id_{record}"] for scalars in trained)
+              for record in range(1, RECORDS + 1)}
+    cooled = [scalars["cooldown_val/loss"] for scalars in tracker.scalars if "cooldown_val/loss" in scalars]
+    return {"step": int(state.step), "consumed": int(state.consumed), "counts": counts, "cooled": cooled,
+            "logged": [scalars["train/examples_consumed"] for scalars in trained]}
+
+
+MODES = {"examples_clock": examples_clock}
+
+
+def main(argv=None) -> None:
+    parser = worker_parser(MODES, __doc__)
+    parser.add_argument("--deal", choices=("order", "records", "shards"), default="order")
+    parser.add_argument("--examples", type=int, default=RECORDS)
+    parser.add_argument("--tensor", type=int, default=1)
+    parser.add_argument("--pause", type=float, default=0.0)
+    parser.add_argument("--cooldown", type=int, default=0)
+    serve_mode(MODES, parser.parse_args(argv))
+
+
+if __name__ == "__main__":
+    main()

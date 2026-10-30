@@ -110,6 +110,19 @@ class DataPartition:
         """
         return dataclasses.replace(_partition(mesh, batch_axes(mesh)), window=window)
 
+    def bounded(self, examples: int, records: int | None = None) -> int:
+        """This share's examples of the pool's first `examples`, where each share reads records of its own
+        dealt `index :: count` (`cut`) from a root of `records` a pass, each pass over its own: its records
+        in every whole pass the bound spans, and its records among those the last pass reaches. Where no
+        pass's count is known ahead (a step before the bound drops records), the examples themselves are
+        dealt so, every count-th from its index."""
+        if records is None:
+            return len(range(self.index, examples, self.count))
+        if not records:
+            return 0
+        passes, rest = divmod(examples, records)
+        return passes * len(range(self.index, records, self.count)) + len(range(self.index, rest, self.count))
+
     def held(self, rows: int, offset: int = 0) -> tuple[slice, bool]:
         """Which of `rows` rows a validation read of this share holds, and whether they are real:
         every count-th from its index, `offset` places on as a resume's count inside a batch leaves
@@ -765,22 +778,18 @@ class Loader:
         (`examples`), with every row the objective makes of each, its last batch short where they end
         inside one, in whole updates of `window` steps, where a global order's plan counts them ahead
         (`order_records`); None for one read in its own order, as a pack that runs as rows arrive makes,
-        or one an objective expands after the bound, which no pass reads ahead to count: its run keeps its
-        progress in the examples its batches consume (`dew.batch.EXAMPLES_CONSUMED`). Refused where the
-        read is bounded to another count; in a pool, whose processes each read records of their own, so
-        neither the bound's first examples nor the step the shares end at are one the pool agrees on yet;
-        and where the last steps would make no whole update, so some examples would train nothing."""
+        or one an objective expands after the bound, which no pass reads ahead to count, and for any read
+        in a pool, whose shares can end steps apart (the last batch the bound ends inside split unevenly,
+        or each share's rows its own): its run keeps its progress in the examples its batches consume
+        (`dew.batch.EXAMPLES_CONSUMED`), every share reading on until each has run out
+        (`dew.training._fit.pooled_read`). Refused where the read is bounded to another count, and where
+        the last steps would make no whole update, so some examples would train nothing."""
         if self.examples != examples:
             held = "not bounded" if self.examples is None else f"bounded to {self.examples}"
             raise ValueError(f"examples={examples} reads a training chain bounded to that many records "
                              f"before packing, and this loader's is {held}; give fit the Dataset chain, "
                              "which it bounds and compiles")
-        if jax.process_count() > 1:
-            raise ValueError("a run bounded in examples trains on one process: a pool's processes each read "
-                             "records of their own, so the bound's first examples and the step their shares "
-                             "end at are not yet one the pool agrees on; count the run in steps or tokens, "
-                             "or train it on one process")
-        if self.order_records is None:
+        if self.order_records is None or jax.process_count() > 1:
             return None
         steps = self._steps(self.order_records, window)
         if steps % window:

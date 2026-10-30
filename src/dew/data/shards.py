@@ -38,6 +38,38 @@ def streamed(
         raise ValueError(f"{described} holds no rows, so reading it endlessly reads nothing forever")
     if not manifest.shards:
         return grain.MapDataset.source(()).to_iter_dataset()
+    root = _dealt(manifest, partition=partition, seed=seed, loading=loading, epochs=epochs)[partition.cut()]
+    return _ShardPass(root, manifest.reader, cycle_length, loading, described)
+
+
+def bounded(manifest: ShardManifest, *, partition: DataPartition, seed: int | None, loading: Loading,
+            epochs: int | None, examples: int) -> int | None:
+    """This share's rows of the stream's first `examples`, its shards dealt to the shares place by place as
+    `streamed` deals them (every count-th from the share's index) and read in that order, a read that
+    repeats after them repeating each share's own places: the rows of each of its shards the bound
+    reaches, so each share reads its own shards' part of the bound and none repeats one while another's
+    go unread. None where a shard states no rows."""
+    if any(shard.rows is None for shard in manifest.shards):
+        return None
+    if not any(shard.rows for shard in manifest.shards):
+        return 0
+    root = _dealt(manifest, partition=partition, seed=seed, loading=loading, epochs=epochs)
+    held = place = 0
+    while examples > 0:
+        rows = root[place % len(root)].rows
+        assert rows is not None, "a subdivided shard states its rows where its shard does"
+        if place % partition.count == partition.index:
+            held += min(rows, examples)
+        examples -= rows
+        place += 1
+    return held
+
+
+def _dealt(manifest: ShardManifest, *, partition: DataPartition, seed: int | None, loading: Loading,
+           epochs: int | None) -> grain.MapDataset:
+    """The shards a stream reads, place by place over every pass, before the shares are cut from them: the
+    manifest's, subdivided where too few fill the readers and their workers, shuffled where `seed` is
+    given (each pass its own order) and repeated `epochs` times (endlessly where None)."""
     workers = loading.workers if isinstance(loading.workers, int) else 1
     required = partition.count * max(workers, 1)
     shards = manifest.shards
@@ -53,8 +85,7 @@ def streamed(
         root = root.shuffle(seed=seed)
     if epochs != 1:
         root = root.repeat(epochs)
-    root = root[partition.cut()]
-    return _ShardPass(root, manifest.reader, cycle_length, loading, described)
+    return root
 
 
 class _ShardPass(grain.IterDataset):

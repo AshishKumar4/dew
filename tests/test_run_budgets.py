@@ -16,7 +16,7 @@ from dew.config import RunConfig, TrainerConfig
 from dew.data import Memory
 from dew.data.compile import compile, fitted
 from dew.data.dataset import Closeable, DataPartition, Loader, Loading
-from dew.data.pipeline import Pipeline
+from dew.data.pipeline import ObjectiveData, Pipeline
 from dew.distributed.batches import batch_signature
 from dew.objectives import Aux, Objective
 from dew.optim import Cosine, Linear, OneCycle, OptimConfig
@@ -106,9 +106,10 @@ def trained(x, directory=None, stops: tuple[Pause | None, ...] = (None,)):
     return {"w": np.asarray(state.variables["params"]["w"]), "loss": np.asarray(stepped)}
 
 
-def ids_read(loader: Loader, field: str) -> collections.Counter:
-    """The real values of `field` in every training batch of `loader`, whose read ends at its bound."""
-    stream = loader.train(DataPartition())
+def ids_read(loader: Loader, field: str, partition: DataPartition | None = None) -> collections.Counter:
+    """The real values of `field` in every training batch `partition`'s share of `loader` reads (a single
+    reader's where None), whose read ends at its bound."""
+    stream = loader.train(DataPartition() if partition is None else partition)
     read: collections.Counter = collections.Counter()
     try:
         for batch in stream:
@@ -134,6 +135,53 @@ def test_an_examples_budget_reads_each_record_once_and_its_read_ends_there(examp
     assert sum(read.values()) == examples
     assert collections.Counter(read.values()) == collections.Counter(
         {passes + 1: rest, passes: RECORDS - rest} if passes else {1: rest})
+
+
+POOLED = 3
+"""The shares of the pools a bound in examples is dealt between, which the ten records' passes do not
+split evenly."""
+
+
+@pytest.mark.parametrize("examples", [7, 23])
+@pytest.mark.parametrize("deal", ["one order", "dealt records", "dealt shards"])
+def test_a_pools_shares_read_its_bound_once_however_its_read_deals_them(deal, examples):
+    """A pool of three shares bounded to `examples` reads them once between its shares, however its read
+    deals its source: one global order, cut into shares after the bound; records each share reads its own
+    of (`index :: count`), an objective making rows of each; and physical shards of 3, 3, 3 and 1 rows,
+    each share reading its own: every record is read once for each pass the bound reaches, as one
+    process reads them, so no share repeats a record while another's go unread, and a share dealt records
+    reads only its own."""
+    ids = np.arange(1, RECORDS + 1, dtype=np.int32)
+    read, shuffled = {"one order": ("memory", {"seed": 3}), "dealt records": ("memory", {"seed": 3}),
+                      "dealt shards": ("streamed", {"seed": 3, "window": RECORDS})}[deal]
+    objective = None if deal == "one order" else ObjectiveData(train=(Questioned(),))
+    loader = compile(Pipeline(Memory({"id": ids}, shard_rows=3)).shuffle(**shuffled).batch(2 * POOLED),
+                     read=read, objective=objective, examples=examples)
+    shares = [ids_read(loader, "id", DataPartition(index=index, count=POOLED)) for index in range(POOLED)]
+    # An objective's rows of an example are `id % 3 + 1`, each read whole.
+    rows = (lambda record: 1) if objective is None else (lambda record: record % 3 + 1)
+    counts = [{record: count // rows(record) for record, count in share.items()} for share in shares]
+    pooled = sum((collections.Counter(share) for share in counts), collections.Counter())
+    passes, rest = divmod(examples, RECORDS)
+    assert sum(pooled.values()) == examples
+    assert sorted(pooled.values()) == sorted([passes + 1] * rest + [passes] * (RECORDS - rest)
+                                             if passes else [1] * rest)
+    if deal == "dealt records":
+        assert all((record - 1) % POOLED == index for index, share in enumerate(counts) for record in share)
+
+
+@pytest.mark.parametrize("examples", [7, 23])
+def test_a_pools_shares_whose_records_a_step_drops_before_the_bound_read_it_dealt_by_example(examples):
+    """A pool of three shares whose read drops records before the bound (a filter that keeps the even
+    ids), so no share knows ahead how many of its records reach it: the bound's examples are dealt to the
+    shares every count-th, each share reading its part of them, kept records alone, the pool the bound."""
+    ids = np.arange(1, RECORDS + 1, dtype=np.int32)
+    loader = compile(Pipeline(Memory({"id": ids})).filter_map(Evens()).shuffle(3).batch(2 * POOLED),
+                     read="indexed", objective=ObjectiveData(train=(Questioned(),)), examples=examples)
+    shares = [ids_read(loader, "id", DataPartition(index=index, count=POOLED)) for index in range(POOLED)]
+    read = [sum(count // (record % 3 + 1) for record, count in share.items()) for share in shares]
+    assert read == [len(range(index, examples, POOLED)) for index in range(POOLED)]
+    assert all(record % 2 == 0 for share in shares for record in share)
 
 
 def test_an_examples_budget_counts_documents_before_they_are_packed():

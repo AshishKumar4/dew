@@ -66,6 +66,11 @@ BLOCK_AFTER = 5
 RECORDS = worker.BATCH * 16
 AVERAGING = Path(__file__).with_name("averaging_worker.py")
 """The worker of the pools that average runs."""
+EXAMPLES_CLOCK = Path(__file__).with_name("examples_clock_worker.py")
+"""The worker of the pools that run on the examples clock."""
+CLOCKED = 17
+"""The examples a pooled run on the examples clock is bounded to: of ten records, seven read twice, and a
+last global batch of one row, which one share holds and the other does not."""
 
 
 def dumped_params(out: Path, suffix: str = ".npz") -> dict:
@@ -138,6 +143,78 @@ def test_a_real_token_budget_agrees_across_processes_after_logging_ticks(tmp_pat
     assert [report["step"] for report in reports] == [3, 3]
     assert [report["updates"] for report in reports] == [3, 3]
     assert [report["logged"] for report in reports] == [3, 0]
+
+
+def clocked_pool(directory: Path, processes: int, devices: int = 1, **flags) -> list[dict]:
+    """`processes` processes of `devices` each training a run bounded to CLOCKED examples as `flags` set it
+    (`examples_clock_worker.examples_clock`), each's report."""
+    return run_pool("examples_clock", directory, processes, script=EXAMPLES_CLOCK, devices=devices,
+                    examples=CLOCKED, **flags)
+
+
+def assert_trained_once(reports: list[dict]) -> None:
+    """A pooled run on the examples clock bounded to CLOCKED: it ended on every process at one step with its
+    bound consumed, its clock the pool's (the examples its logs read rising to the bound), and its steps
+    trained seven of its ten records twice and the others once, each example's rows whole."""
+    assert len({report["step"] for report in reports}) == 1
+    assert [report["consumed"] for report in reports] == [CLOCKED] * len(reports)
+    logged = reports[0]["logged"]
+    assert logged == sorted(logged) and logged[-1] == CLOCKED
+    assert all(not report["logged"] for report in reports[1:])
+    assert sorted(round(count, 4) for count in reports[0]["counts"].values()) == [1] * 3 + [2] * 7
+
+
+@pytest.mark.distributed
+@pytest.mark.parametrize("deal", ["order", "records", "shards"])
+def test_a_pool_on_the_examples_clock_trains_its_bound_once_however_its_read_deals_it(tmp_path, deal):
+    """Two processes bounded to CLOCKED examples of ten records, read in one global order, as records each
+    share reads its own of (an objective making one to three rows of each), or as physical shards of 3,
+    3, 3 and 1 rows each share reads its own: the shares run out at steps apart, each reading on with a
+    batch of the pool's emptied until both have, and the run trains its bound once (`assert_trained_once`)
+    where a pool once refused it (row 2538). In one order the pool trains the batches one process of two
+    devices does, to its parameters."""
+    reports = clocked_pool(tmp_path / "pool", 2, deal=deal)
+    assert_trained_once(reports)
+    if deal == "order":
+        alone = clocked_pool(tmp_path / "alone", 1, devices=2, deal=deal)
+        assert_trained_once(alone)
+        for index in range(2):
+            assert_same_parameters(dumped_params(tmp_path / "pool" / f"process{index}.json"),
+                                   dumped_params(tmp_path / "alone" / "process0.json"))
+
+
+@pytest.mark.distributed
+def test_a_pool_whose_shares_two_processes_each_read_counts_each_share_once(tmp_path):
+    """Four processes, two to each share of the data (a tensor axis across them, `DataPartition.readers`):
+    each share's examples count once, by its first reader, so the run trains its bound once
+    (`assert_trained_once`) and every process's clock is the pool's."""
+    reports = clocked_pool(tmp_path / "pool", 4, deal="records", tensor=2)
+    assert_trained_once(reports)
+
+
+@pytest.mark.distributed
+def test_a_pool_paused_inside_its_uneven_tail_resumes_to_the_run_that_never_paused(tmp_path):
+    """A pool paused at the step where one share has run out and the other has a batch to read, and
+    resumed: the share that ran out reads none from its first read on, and steps with a batch of the
+    pool's emptied, so the resumed run trains its bound once (`assert_trained_once`), to the parameters
+    of the run that never paused."""
+    paused = clocked_pool(tmp_path / "paused", 2, deal="order", pause=0.9)
+    whole = clocked_pool(tmp_path / "whole", 2, deal="order")
+    assert [report["step"] for report in paused] == [report["step"] for report in whole]
+    assert [report["consumed"] for report in paused] == [CLOCKED, CLOCKED]
+    assert paused[0]["counts"] == whole[0]["counts"]
+    for index in range(2):
+        assert_same_parameters(dumped_params(tmp_path / "paused" / f"process{index}.json"),
+                               dumped_params(tmp_path / "whole" / f"process{index}.json"))
+
+
+@pytest.mark.distributed
+def test_a_pools_cooldown_across_its_uneven_tail_reads_its_shares_as_its_run_does(tmp_path):
+    """A pool whose cooldown branch reads on through the steps its shares run out apart at: the branch's
+    reads are the pool's (a share that ran out stepping emptied), so it runs on every process, and the
+    run reads on after it and trains its bound once (`assert_trained_once`)."""
+    reports = clocked_pool(tmp_path / "pool", 2, deal="records", cooldown=3)
+    assert_trained_once(reports)
 
 
 @pytest.mark.distributed
