@@ -819,7 +819,7 @@ def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, 
             sinks is not None or softcap is not None or dropout_seed is not None)):
         mask = combined_attention_mask(query.shape[-3], key.shape[-3], causal, sliding_window, masked)
         # The accurate form's products are IEEE fp32 (`attention_route.FORMS`), never a GPU's TF32.
-        if generation.chosen_kernel("attention_form", "fast") == "accurate":
+        if generation.numerics().forms == "accurate":
             precision = jax.lax.Precision.HIGHEST
         return reference_attention(query, key, value, mask=mask, bias=bias, sinks=sinks, softcap=softcap,
                                    dtype=dtype, precision=precision,
@@ -905,7 +905,7 @@ def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_sof
         narrows=_xla_kernel_narrows(query) or _xla_kernel_widens_less(),
         folds=folds(query, key, bias, mask, causal, sliding_window),
         splash_mask=False, shards=sequence_shards(), dropout=dropout,
-        form=generation.chosen_kernel("attention_form", "fast"))
+        form=generation.numerics().forms)
     # Splash's descriptor reads a concrete mask on the host, so it is built only where splash may run,
     # under a name that may choose it on a TPU (`TPU_BACKEND`); its tiling and every other requirement
     # read the case (`TPU_SUPPORTS`).

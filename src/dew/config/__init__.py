@@ -60,7 +60,7 @@ from dew.interop.weights import AUTO
 from dew.lora import LoRA
 from dew.nn.dex import DifferentialExtension
 from dew.nn.kernels import generation
-from dew.nn.precision import Numerics
+from dew.nn.precision import Numerics, numerics_of
 from dew.nn.sharding import Link
 from dew.objectives.base import Effects, Loss, Metric, Objective
 from dew.optim import OptimConfig, ParamGroup
@@ -329,6 +329,19 @@ def _record_argument[T](kind: type[T]):
     )
 
 
+def _numerics_argument():
+    """A run's numerics on the command line: a preset's name ("accurate", "default"), the usual dtypes'
+    Lightning name ("bf16-true"), or a `Numerics` record's JSON (`dew.nn.precision.numerics_of`)."""
+    return tyro.constructors.PrimitiveConstructorSpec(
+        nargs=1,
+        metavar="NAME|JSON",
+        instance_from_str=lambda given: (from_record(Numerics, json.loads(given[0]))
+                                         if given[0].startswith("{") else numerics_of(given[0])),
+        is_instance=lambda value: isinstance(value, Numerics),
+        str_from_instance=lambda value: [json.dumps(to_record(value, Numerics))],
+    )
+
+
 def _keep_argument():
     return tyro.constructors.PrimitiveConstructorSpec(
         nargs=1,
@@ -526,7 +539,7 @@ class TrainerConfig:
     way there is one optimizer update a step, and the compiled step is traced
     once per stage.
     """
-    precision: Numerics = dataclasses.field(default_factory=Numerics)
+    precision: Annotated[Numerics, _numerics_argument()] = dataclasses.field(default_factory=Numerics)
     """The run's numerics, set once and recorded with it (`dew.nn.precision.Numerics`; `ACCURATE` for
     scientific runs): its dtypes by Lightning's names, its products' precision by JAX's levels and its
     ops' forms, over every program it traces, the step and its evaluations
@@ -654,6 +667,8 @@ class TrainerConfig:
         return dataclasses.replace(self, accumulation=accumulation)
 
     def __post_init__(self):
+        # A record names its numerics as a preset's name or by their fields (`numerics_of`).
+        object.__setattr__(self, "precision", numerics_of(self.precision))
         if self.update_tokens is not None and self.update_tokens < 1:
             raise ValueError("--trainer.update-tokens must be positive")
         if self.update_tokens is not None and self.batch_ramp is not None:

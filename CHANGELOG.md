@@ -5,6 +5,11 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- A run's numerics are named where they are set: `--trainer.precision accurate` (or a Lightning dtype
+  preset, "bf16-true", or a `Numerics` record's JSON), `"precision": "accurate"` in a run.json, and
+  `Pretrained.load(precision=...)` and `dew.pipeline(source, precision=...)`, which load in their dtypes
+  and serve under their precision and forms. The attention template's form is the run's numerics' alone
+  (`run_precision`); `generation.chosen(attention_form=...)` is gone.
 - A token layout is one `dew.batch.Coordinates` past a model's `__call__`: `hidden_states`, `logits`,
   `states_and_logits`, the prediction depths' methods, `draft` and `DiffusionGemma.encode` take
   `coordinates=` (`dew.batch.coordinates(shape, segments=..., valid=..., positions=...)`) where they

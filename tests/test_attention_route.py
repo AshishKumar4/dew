@@ -44,6 +44,7 @@ from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.inputs import counted_places
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import attention as template, attention_route
+from dew.nn.precision import Numerics
 
 HEADS, KV_HEADS, WIDTH = 4, 2, 32
 MESH_TENSOR, MESH_HEADS = 4, 8
@@ -461,11 +462,12 @@ def test_a_long_sequence_is_on_par_with_the_reference_path(length, dtype):
 
 
 def test_the_accurate_form_is_one_option_away():
-    """`generation.chosen(attention_form='accurate')` runs every template call in the accurate form (natural
-    logits and the accurate products, `attention_route.FORMS`), its forward and gradients bitwise a call's
-    that names that form, and 'fast' runs the default, a call's that names none; the two forms differ; a
-    form the template does not have is refused. Bit for bit by construction: the choice resolves to the
-    named form's arguments before the call traces, so the two calls trace one program."""
+    """A run's numerics in the accurate forms (`generation.run_precision`, `Numerics.forms`) run every
+    template call in the accurate form (natural logits and the accurate products, `attention_route.FORMS`),
+    its forward and gradients bitwise a call's that names that form, and the fast forms run the default, a
+    call's that names none; the two forms differ; a form the template does not have is refused. Bit for bit
+    by construction: the forms resolve to the named form's arguments before the call traces, so the two
+    calls trace one program."""
     spans = template.spans(QUERIES, KEYS, ROWS, causal=True)
     query, key, value, _, dout = drawing(QUERIES, KEYS, jnp.float32, sinks=False)(0)
 
@@ -475,14 +477,14 @@ def test_the_accurate_form_is_one_option_away():
 
     found = {}
     for form, named in (("accurate", {"natural": True, "accurate": True}), ("fast", {})):
-        with generation.chosen(attention_form=form):
+        with generation.run_precision(Numerics(forms=form)):
             found[form] = jax.tree.leaves(jax.jit(routed)(query, key, value))
         want = jax.tree.leaves(jax.jit(functools.partial(routed, **named))(query, key, value))
         for mine, theirs in zip(found[form], want, strict=True):
             np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs), err_msg=form)
     assert any(not np.array_equal(accurate, fast) for accurate, fast in zip(*found.values(), strict=True))
-    with generation.chosen(attention_form="exact"), pytest.raises(ValueError):
-        attention_route.attend(query, key, value, spans)
+    with pytest.raises(ValueError):
+        Numerics(forms="exact")
 
 
 def test_narrowed_operands_hand_back_their_gradients_unrounded():
@@ -640,21 +642,21 @@ def test_a_call_no_triton_config_fits_lowers_on_another_mainloop(generation_name
 @pytest.mark.parametrize("target", [None, "sm80", "sm90"], ids=["cpu", "a100", "h100"])
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
 def test_an_accurate_call_on_the_default_route_runs_the_template_or_the_reference_path(target, dtype):
-    """Under `generation.chosen(attention_form='accurate')`, the default route ('auto') runs a call on the
-    template or the reference path, which compute the form, never on an old route, whose arithmetic is
+    """Under a run's accurate forms (`generation.run_precision`), the default route ('auto') runs a call on
+    the template or the reference path, which compute the form, never on an old route, whose arithmetic is
     its own (row 2350: FlashAttention, cuDNN, xla and splash ran an accurate run's calls fast); the fast
     form keeps its kernels as before."""
     import contextlib
 
     from dew.nn.attention import attention_case
     from dew.nn.attention_kernels import ATTENTION
-    from dew.nn.kernels.generation import assumed, chosen
+    from dew.nn.kernels.generation import assumed, run_precision
     from dew.nn.kernels.selection import select
 
     query = jnp.zeros((2, 64, 4, 32), dtype)
     placed = contextlib.nullcontext() if target is None else assumed(target)
     with placed:
-        with chosen(attention_form="accurate"):
+        with run_precision(Numerics(forms="accurate")):
             accurate = select(ATTENTION, attention_case(query, query, causal=True)).kernel
         fast = select(ATTENTION, attention_case(query, query, causal=True)).kernel
     assert accurate in ("template", "reference"), accurate
@@ -674,7 +676,7 @@ def test_an_accurate_call_the_template_refuses_runs_the_reference_path_on_ieee_p
     review, Attention)."""
     import re
 
-    from dew.nn.kernels.generation import chosen
+    from dew.nn.kernels.generation import run_precision
 
     query = jnp.ones((1, 64, 4, 32), jnp.float32)
     mask = jnp.tril(jnp.ones((64, 64), bool))[None, None]
@@ -684,7 +686,7 @@ def test_an_accurate_call_the_template_refuses_runs_the_reference_path_on_ieee_p
         return attention.scaled_dot_product_attention(query, query, query, mask=mask,
                                                       precision=jax.lax.Precision.DEFAULT)
 
-    with chosen(attention_form="accurate"):
+    with run_precision(Numerics(forms="accurate")):
         lowered = jax.jit(jax.grad(lambda query: attend(query).sum())).lower(query).as_text()
     dots = [line for line in lowered.splitlines() if "dot_general" in line and "f32" in line]
     assert dots and all(re.search(r"precision = \[HIGHEST, HIGHEST\]", line) for line in dots), dots

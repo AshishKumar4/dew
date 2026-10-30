@@ -8,6 +8,7 @@ makes, the placement a harness loads into, and the form a run's attention trains
 
 import dataclasses
 import json
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -223,7 +224,7 @@ def test_a_saved_run_is_served_scored_and_loaded_in_the_form_it_trained_in(tmp_p
     assert attention_forms(lambda: dew.pipeline(accurate)("ab", max_new_tokens=1, key=0)) <= {"accurate"}
     assert attention_forms(served) <= {"accurate"}
     assert scored(TextGeneration.from_run(fast)) == {"fast"}
-    with generation.chosen(attention_form="accurate"):
+    with generation.run_precision(Numerics(forms="accurate")):
         built = TextGeneration(loaded.model, loaded.variables, loaded.processor, sampling=loaded.sampling)
         assert scored(built) == {"accurate"}
 
@@ -320,6 +321,41 @@ def test_a_run_saved_with_its_attention_form_reads_as_the_precision_it_named(tmp
         run.check_resume(earlier_run(written))
     with pytest.raises(ValueError):
         RunConfig.read(written)
+
+
+@pytest.mark.mesh(devices=8)
+def test_a_runs_numerics_are_named_on_the_command_line_in_its_record_and_at_a_load(tmp_path):
+    """A run's numerics are reachable by name (ledger 2500, review row 2589): `dew train --set
+    trainer.precision=accurate` trains a recorded run under `ACCURATE` and records it whole; a record that
+    names "accurate" or a Lightning dtype preset reads as those numerics; `Pretrained.load(precision=...)`
+    loads in their dtypes and serves under them, an explicit dtype beside them refused, and
+    `dew.pipeline` refuses them for a run directory, whose record names its own."""
+    import dew
+    from dew.interop import Pretrained
+    from dew.nn.precision import ACCURATE
+
+    record, runs = tmp_path / "record", tmp_path / "runs"
+    run = lm(tmp_path, drawn=False)
+    run.save(str(record))
+    settings = {"trainer.checkpoint_dir": str(runs), "trainer.steps": "1", "trainer.log_every": "1",
+                "trainer.eval_every": "None", "trainer.checkpoint_every": "None",
+                "trainer.multi_host": "False", "trainer.compilation_cache_dir": "None",
+                "trainer.precision": "accurate"}
+    flags = [flag for path, value in settings.items() for flag in ("--set", f"{path}={value}")]
+    assert main(["train", str(record / "run.json"), "--set", "trainer.name=named", *flags]) == 0
+    assert RunConfig.load(str(runs / "named")).trainer.precision == ACCURATE
+    written = json.loads((record / "run.json").read_text())
+    for name, numerics in (("accurate", ACCURATE), ("bf16-true", Numerics(DTYPE_PRESETS["bf16-true"]))):
+        written["fields"]["trainer"] = {**written["fields"]["trainer"], "precision": name}
+        assert RunConfig.read(written).trainer.precision == numerics
+    llama = Path(__file__).parent / "fixtures" / "hf" / "llama-tiny"
+    loaded = Pretrained.load(llama, precision="accurate", attention_impl="reference")
+    assert loaded.model.dtype == jnp.float32 and loaded.numerics == ACCURATE
+    assert loaded.pipeline().precision == ACCURATE
+    with pytest.raises(ValueError):
+        Pretrained.load(llama, precision="accurate", dtype=jnp.float16)
+    with pytest.raises(ValueError):
+        dew.pipeline(str(runs / "named"), precision="accurate")
 
 
 def test_a_runs_numerics_read_back_from_its_record(tmp_path):

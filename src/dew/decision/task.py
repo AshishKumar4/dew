@@ -513,7 +513,6 @@ class Decide(SavedRunTask, InItsForm):
             checkpoints.save(self.weights.step, state, artifact=record)
             checkpoints.wait()
 
-    @traced_in_its_form
     @overload
     def __call__(self, state: JSON, questions: Mapping[str, Question], *,
                  images: Sequence[Image.Image] = (), context: JSON | None = None) -> dict[str, Answer]: ...
@@ -522,6 +521,7 @@ class Decide(SavedRunTask, InItsForm):
     def __call__(self, state: Sequence[tuple[JSON, Mapping[str, Question]]], questions: None = None, *,
                  contexts: Sequence[JSON | None] | None = None) -> list[dict[str, Answer]]: ...
 
+    @traced_in_its_form
     def __call__(self, state, questions=None, *, images=(), context=None, contexts=None):
         """Return one answer per question in `questions`, about `state` and any `images`; or, given a
         sequence of `(state, questions)` requests and no `questions`, each request's answers in order.
@@ -611,6 +611,12 @@ class Decide(SavedRunTask, InItsForm):
         return replace(packing(replace(self.layout, max_len=shape.length), widened,
                                None if held is None else max(shape.length, held), trained=False),
                        bins=shape.rows)
+
+    @functools.cached_property
+    def _row_scoring(self) -> "RowScoring":
+        """The task's rows as a scoring task over no weights, held once so its passes' plans and
+        compiled programs are built once (`logits`)."""
+        return RowScoring(replace(self, variables={}))
 
     @functools.cached_property
     def _bounds(self) -> dict[int, Bounds]:
@@ -741,7 +747,7 @@ class Decide(SavedRunTask, InItsForm):
         programs (`RowScoring`, `dew.inference.scoring.ScoringServer`), one path for a call and a
         server alike.
         """
-        server = scoring.ScoringServer(RowScoring(replace(self, variables={})), self.variables)
+        server = scoring.ScoringServer(self._row_scoring, self.variables)
         order = sorted(range(len(rows)), key=lambda index: len(rows[index].tokens))
         futures = {index: server.submit(rows[index]) for index in order}
         server.run()
