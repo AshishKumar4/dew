@@ -1,10 +1,10 @@
 {
  "step": 2,
  "compute": "bfloat16",
- "products": [
-  "bfloat16",
-  "float64"
- ],
+ "products": {
+  "bfloat16": 14,
+  "float64": 13
+ },
  "params": [
   "float32"
  ],

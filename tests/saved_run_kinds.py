@@ -4,6 +4,7 @@ and each variant a run serializes apart (row 2640): a decision row of its own se
 a lettered one, a block-diffusion run over a nested decoder, a run on the examples clock, fresh runs in
 bfloat16 and in float16 (whose loss a dynamic scale scales), and a run over a source stored as it states."""
 
+import collections
 import dataclasses
 import re
 import tempfile
@@ -120,14 +121,17 @@ def stored(root: Path, drawn: bool) -> RunConfig:
     return dataclasses.replace(over(QWEN, root, drawn), source=SourceOptions(param_dtype="bfloat16"))
 
 
-def computed(task) -> list[str]:
-    """The dtypes a loaded task multiplies in: each dtype an operand of a matrix product holds in the
-    programs one request of it lowers (`answered`), read from the StableHLO JAX writes as it lowers them
-    (`jax_dump_ir_to`), JAX's caches and Dew's outer programs (`dew.nn.kernels.options.program`, which
-    an equal model's earlier task compiled) cleared first so every program lowers anew. A model whose
-    outer module states bfloat16 while its decoder computes in float32 multiplies in float32. The suite's
-    CPU sums a float32 product in float64 (`dew.nn.precision.accumulated`), as the corpus's writer does
-    under the suite's environment, so a float32 product's operands read float64 here."""
+def computed(task) -> dict[str, int]:
+    """How many matrix products a loaded task multiplies in each dtype, its operands' dtypes joined by a
+    comma where they differ: the products of the programs one request of it lowers (`answered`), read
+    from the StableHLO JAX writes as it lowers them (`jax_dump_ir_to`). A model whose outer module states
+    bfloat16 while one projection of its decoder computes in float32 multiplies one product fewer in
+    bfloat16. JAX's caches and Dew's outer programs (`dew.nn.kernels.options.program`, which an equal
+    model's earlier task compiled) are cleared first, so every program lowers anew. The products are the
+    suite's CPU's, as the corpus's writer counts them under the suite's environment, whose wide
+    arithmetic multiplies a product summed in float32 in float64 (`dew.nn.precision.accumulated`); an
+    accelerator lowers its own (bible §7 runs these files on the CPU)."""
+    assert jax.default_backend() == "cpu", "a saved run's products are counted on the suite's CPU"
     jax.clear_caches()
     options._program.cache_clear()
     before = jax.config.values["jax_dump_ir_to"]
@@ -138,9 +142,10 @@ def computed(task) -> list[str]:
         finally:
             jax.config.update("jax_dump_ir_to", before)
         lowered = "".join(path.read_text() for path in Path(dump).glob("*.mlir"))
-    found = {DTYPES[operand.rsplit("x", 1)[-1]] for pair in PRODUCT.findall(lowered) for operand in pair}
-    assert found, "the request lowered no matrix product"
-    return sorted(found)
+    products = collections.Counter(",".join(sorted({DTYPES[operand.rsplit("x", 1)[-1]] for operand in pair}))
+                                   for pair in PRODUCT.findall(lowered))
+    assert products, "the request lowered no matrix product"
+    return dict(sorted(products.items()))
 
 
 PRODUCT = re.compile(r"stablehlo\.dot_general [^\n]*: \(tensor<([^>]*)>, tensor<([^>]*)>\)")

@@ -1,9 +1,9 @@
 {
  "step": 2,
  "compute": "float32",
- "products": [
-  "float64"
- ],
+ "products": {
+  "float64": 42
+ },
  "params": [
   "float32"
  ],
