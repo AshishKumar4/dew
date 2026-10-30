@@ -463,8 +463,33 @@ def test_a_dense_bias_named_onto_the_template_is_on_par_with_the_reference_path(
         return with_gradients(lambda query, key, value, bias: scaled_dot_product_attention(
             query, key, value, bias=bias, causal=True, implementation=implementation))
 
+    keep = kept(queries, queries, causal=True)
+
+    def terms(query, key, value, bias, dout):
+        # A query of one key has a dQ of zero in float64, which a D from the rounded output rounds to
+        # its own size (`attention_terms`, its bias's terms the fifth).
+        return tuple(attention_terms(query, key, value, dout, keep, bias=bias))
+
     assert_as_exact(jax.jit(attended("template")), jax.jit(attended("reference")), drawn,
-                    f"a dense bias of {rows} rows and {heads} heads on the template", seeds=DENSE_BIAS_SEEDS)
+                    f"a dense bias of {rows} rows and {heads} heads on the template", seeds=DENSE_BIAS_SEEDS,
+                    terms=terms)
+
+
+def test_a_biased_query_of_one_key_has_nonzero_gradient_terms_where_its_gradient_is_zero():
+    """attention_terms with a bias every row shares: the first query of a causal call keeps one key, so its
+    query gradient is zero in float64, and its terms are not (a D from the rounded output rounds it to their
+    size); the bias's own gradient's terms have the bias's shape, summed over the rows it shares."""
+    rng = np.random.default_rng(0)
+    query, key, value, dout = (rng.standard_normal((3, 16, 2, 8)) for _ in range(4))
+    bias = 0.5 * rng.standard_normal((1, 2, 16, 16))
+    keep = kept(16, 16, causal=True)
+    _, dq_terms, _, _, bias_terms = attention_terms(query, key, value, dout, keep, bias=bias)
+    with jax.enable_x64(new_val=True):
+        _, pull = jax.vjp(lambda q, k, v, b: scaled_dot_product_attention(
+            q, k, v, bias=b, causal=True, implementation="reference"), query, key, value, bias)
+        dq = np.asarray(pull(dout)[0])
+    assert np.all(np.abs(dq[:, 0]) < 1e-12) and np.all(dq_terms[:, 0] > 0)
+    assert bias_terms.shape == bias.shape
 
 
 @pytest.mark.skipif(generation.device_generation() != "sm90",
