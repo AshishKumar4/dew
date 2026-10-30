@@ -132,25 +132,29 @@ class Transition:
 @struct.dataclass
 class Carry:
     """A rollout's running state between calls: the environments' state, the observation each
-    acts on next, and the key the next restarts and actions draw from."""
+    acts on next, the key the next restarts and actions draw from, and the policy's own `memory`
+    (a recurrent policy's state, None for one that keeps none)."""
 
     state: EnvState
     observation: Observation
     key: jax.Array
+    memory: Any = None
 
 
 type Params = Any
 """A policy's weights, a pytree."""
 
-type Policy = Callable[[Params, Observation, jax.Array], tuple[jax.Array, Any]]
-"""`policy(params, observation, key) -> (action, extras)`: an action for each environment."""
+type Policy = Callable[[Params, Observation, jax.Array, Any], tuple[jax.Array, Any, Any]]
+"""`policy(params, observation, key, memory) -> (action, extras, memory)`: an action for each
+environment, what to record beside it, and the policy's memory after it (None for one that keeps
+none)."""
 
 
-def start(env: Env, key: jax.Array) -> Carry:
-    """A rollout's carry at fresh episodes of `env`."""
+def start(env: Env, key: jax.Array, memory: Any = None) -> Carry:  # noqa: ANN401
+    """A rollout's carry at fresh episodes of `env`, the policy's `memory` as it starts."""
     reset_key, key = jax.random.split(key)
     state, step = env.reset(reset_key)
-    return Carry(state, step.observation, key)
+    return Carry(state, step.observation, key, memory)
 
 
 def env_rollout(env: Env, policy: Policy, params: Params, carry: Carry, steps: int, *,
@@ -163,7 +167,7 @@ def env_rollout(env: Env, policy: Policy, params: Params, carry: Carry, steps: i
     environment, whose imagined episodes never restart, passes False."""
     def one(carry: Carry, _):
         key, act_key, reset_key = jax.random.split(carry.key, 3)
-        action, extras = policy(params, carry.observation, act_key)
+        action, extras, memory = policy(params, carry.observation, act_key, carry.memory)
         state, following = env.step(carry.state, action)
         observation = following.observation
         if reset:
@@ -180,10 +184,61 @@ def env_rollout(env: Env, policy: Policy, params: Params, carry: Carry, steps: i
 
             # A reset runs only at a step where some episode ended.
             state, observation = jax.lax.cond(jnp.any(done), restart, lambda *held: held, state, observation)
-        return Carry(state, observation, key), Transition(carry.observation, action, extras, following)
+        recorded = Transition(carry.observation, action, extras, following)
+        return Carry(state, observation, key, memory), recorded
 
     return jax.lax.scan(one, carry, None, length=steps)
 
 
-__all__ = ["Batched", "Carry", "Env", "EnvState", "Observation", "Params", "Policy", "TimeLimit", "TimeStep",
+@struct.dataclass
+class _Driven:
+    inner: EnvState
+    last: jax.Array
+    key: jax.Array
+
+
+@struct.dataclass
+class Driven:
+    """`env` (batched) stepped as an agent's driver steps it: its observation is the whole step a
+    world-model learner records, a dict of the `observation`, the `reward` that came with it, and
+    whether it is the episode's `first`, its `last` or `terminal`; an episode's last observation is
+    answered as a step of its own, and the step after it, whatever its action, starts the next
+    episode (DreamerV3's driver, embodied/core/driver.py). A rollout over it passes `reset=False`."""
+
+    env: Env = struct.field(pytree_node=False)
+
+    @property
+    def action_size(self) -> int:
+        return self.env.action_size
+
+    @staticmethod
+    def _observed(step: TimeStep, first: jax.Array) -> TimeStep:
+        observed = {"observation": step.observation, "reward": step.reward, "first": first,
+                    "last": step.done, "terminal": step.terminated}
+        return TimeStep(observed, step.reward, step.terminated, step.truncated)
+
+    def reset(self, key: jax.Array) -> tuple[_Driven, TimeStep]:
+        reset_key, key = jax.random.split(key)
+        state, step = self.env.reset(reset_key)
+        observed = self._observed(step, jnp.ones_like(step.done))
+        return _Driven(state, jnp.zeros_like(step.done), key), observed
+
+    def step(self, state: _Driven, action: jax.Array) -> tuple[_Driven, TimeStep]:
+        key, reset_key = jax.random.split(state.key)
+        inner, step = self.env.step(state.inner, action)
+
+        def restart(inner, step):
+            fresh_state, fresh = self.env.reset(reset_key)
+
+            def chosen(new, old):
+                last = state.last.reshape(state.last.shape + (1,) * (new.ndim - state.last.ndim))
+                return jnp.where(last, new, old)
+
+            return jax.tree.map(chosen, fresh_state, inner), jax.tree.map(chosen, fresh, step)
+
+        inner, step = jax.lax.cond(jnp.any(state.last), restart, lambda *held: held, inner, step)
+        return _Driven(inner, step.done, key), self._observed(step, state.last)
+
+
+__all__ = ["Batched", "Carry", "Driven", "Env", "EnvState", "Observation", "Params", "Policy", "TimeLimit", "TimeStep",
            "Transition", "env_rollout", "start"]

@@ -41,9 +41,9 @@ class Walk:
         return x, TimeStep(x[None], -jnp.square(x), jnp.abs(x) > self.limit, jnp.zeros((), bool))
 
 
-def pushes(params, observation, key):
+def pushes(params, observation, key, memory):
     """A policy pushing each point by the sign of a drawn number, half a step a time."""
-    return 0.5 * jnp.sign(jax.random.normal(key, (observation.shape[0], 1))), {}
+    return 0.5 * jnp.sign(jax.random.normal(key, (observation.shape[0], 1))), {}, None
 
 
 def test_a_rollout_steps_restarts_and_records_as_a_step_by_step_loop_does():
@@ -58,7 +58,7 @@ def test_a_rollout_steps_restarts_and_records_as_a_step_by_step_loop_does():
     state, observation, key = carry.state, carry.observation, carry.key
     for index in range(11):
         key, act_key, reset_key = jax.random.split(key, 3)
-        action, _ = pushes(None, observation, act_key)
+        action, _, _ = pushes(None, observation, act_key, None)
         state, following = env.step(state, action)
         for name in ("observation", "reward", "terminated", "truncated"):
             np.testing.assert_array_equal(getattr(steps.following, name)[index], getattr(following, name))

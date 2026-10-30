@@ -123,17 +123,20 @@ class ControlPPOObjective(Objective[Ratio]):
     def validation_loss_refusal(self) -> str | None:
         return "control PPO scores its policy by its episodes' returns, not a validation loss"
 
-    def act(self, params: Variables, observation: Observation, key: jax.Array) -> tuple[jax.Array, dict]:
+    def act(self, params: Variables, observation: Observation, key: jax.Array,
+            memory: None) -> tuple[jax.Array, dict, None]:
         """An action for each observation, tanh of a draw from the policy, beside the draw and its
         log-probability (`dew.rl.env.Policy`)."""
         location, scale = self.model.apply(params, observation, method=ActorCritic.policy)
         raw = location + scale * jax.random.normal(key, location.shape, location.dtype)
-        return jnp.tanh(raw), {"raw_action": raw, "log_prob": tanh_normal_log_prob(raw, location, scale)}
+        extras = {"raw_action": raw, "log_prob": tanh_normal_log_prob(raw, location, scale)}
+        return jnp.tanh(raw), extras, None
 
-    def greedy(self, params: Variables, observation: Observation, key: jax.Array) -> tuple[jax.Array, dict]:
+    def greedy(self, params: Variables, observation: Observation, key: jax.Array,
+               memory: None) -> tuple[jax.Array, dict, None]:
         """The policy's deterministic action, tanh of its location, as Brax evaluates it."""
         location, _ = self.model.apply(params, observation, method=ActorCritic.policy)
-        return jnp.tanh(location), {}
+        return jnp.tanh(location), {}, None
 
     def advantages(self, values: jax.Array, following: jax.Array,
                    batch: Batch) -> tuple[jax.Array, jax.Array]:
