@@ -471,8 +471,8 @@ def decisions(registers: int | dict | None, model: resources.RegisterModel,
 
 
 def mosaic_failures(found: list[dict]) -> list[str]:
-    """Compile errors and missing or excessive shared/TMEM allocations. Register model disagreements
-    and spills are advisory rows until the model matches allocation; runtime step-down handles them."""
+    """Compile errors, spills, and missing or excessive shared/TMEM allocations. A spill-free register
+    model disagreement remains an advisory row until the model matches allocation."""
     failed = failures(found)
     for record in found:
         if refused(record):
@@ -481,10 +481,7 @@ def mosaic_failures(found: list[dict]) -> list[str]:
             failed.append(f"{record['name']}: no Mosaic GPU kernel compiled")
         for kernel in record.get("kernels", ()):
             found_kernel = _report(kernel)
-            # Preserve the report's missing-field check and hard allocation limits. Spills have their
-            # own evidence row; masking that count here never masks an assembler failure.
-            hard = dataclasses.replace(found_kernel, spilled=0)
-            if (why := hard.failure(record["limit"], record["tmem_limit"])) is not None:
+            if (why := found_kernel.failure(record["limit"], record["tmem_limit"])) is not None:
                 failed.append(f"{record['name']} {found_kernel.kernel}: {why}")
             stated = record.get("models", {}).get(found_kernel.kernel)
             if stated is not None and stated["shared"] not in (None, found_kernel.shared):

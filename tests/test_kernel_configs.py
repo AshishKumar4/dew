@@ -646,19 +646,21 @@ def test_records_a_failed_process_of_their_own_wrote_are_refused():
         compiled_apart()
 
 
-def test_the_resource_gate_reports_spills_and_refuses_invalid_allocations():
+def test_the_resource_gate_refuses_spills_and_invalid_allocations():
     """A record the gate reads (`mosaic_failures`): a kernel past its shared memory, its tensor memory or
-    spilling is reported; invalid allocations fail."""
+    spilling fails; a spill-free model disagreement is reported."""
     from kernel_compile import mosaic_failures, mosaic_kernels
 
     within = {"kernel": "k", "unread": [], "shared": 1024, "tmem": 256, "registers": 168, "spilled": 0}
     record = {"name": "case", "limit": 2048, "tmem_limit": 512, "kernels": [within]}
     assert not mosaic_failures([record])
-    for past in ({"shared": 4096}, {"tmem": 513}):
+    for past in ({"shared": 4096}, {"tmem": 513}, {"spilled": 40}):
         assert mosaic_failures([{**record, "kernels": [{**within, **past}]}])
-    spilled = {**record, "kernels": [{**within, "spilled": 40}]}
-    assert not mosaic_failures([spilled])
-    assert any(row.get("spilled") == 40 for row in spilled["evidence"])
+    overestimated = resources.RegisterModel(200, 168, 2, 1, 8, 168, shared=1024)
+    disagreement = {**record, "models": {"k": dataclasses.asdict(overestimated)},
+                    "kernels": [{**within, "need": 160}]}
+    assert not mosaic_failures([disagreement])
+    assert any(not row["agrees"] for row in disagreement["evidence"])
     # A kernel whose reports state no resources, spilling nothing, is no evidence: it fails, as a record
     # with no kernel does (row 1877: a contract gate read only its shared count and positive spills).
     unstated = {**within, "unread": ["shared bytes", "tensor memory columns"], "shared": None, "tmem": None}
