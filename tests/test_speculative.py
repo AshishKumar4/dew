@@ -105,33 +105,44 @@ def test_a_longrope_crossing_reseeds_the_prediction_depth_as_a_prefill_of_its_hi
         return {jax.tree_util.keystr(path): np.asarray(leaf) for path, leaf in leaves
                 if jnp.issubdtype(leaf.dtype, jnp.floating)}
 
-    def prefilled(model, params, prompts, stretch):
-        joined = jnp.concatenate([prompts, stretch], axis=1)
-        history = jnp.zeros((2, width), jnp.int32).at[:, :7].set(joined)
-        real = jnp.broadcast_to(jnp.arange(width)[None, :] < 7, history.shape)
+    def prefill(model, params):
+        """The prefill of a prompt and its stretch as one history, compiled once."""
         ops = decode_ops(model, params, 0, 1)
-        return floats(prefill_state(model, params, ModelInputs(history, {"attention_mask": real}), ops)[0])
+
+        @jax.jit
+        def run(prompts, stretch):
+            history = jnp.zeros((2, width), jnp.int32).at[:, :7].set(jnp.concatenate([prompts, stretch], 1))
+            real = jnp.broadcast_to(jnp.arange(width)[None, :] < 7, history.shape)
+            return prefill_state(model, params, ModelInputs(history, {"attention_mask": real}), ops)[0]
+
+        return lambda prompts, stretch: floats(run(jnp.asarray(prompts), jnp.asarray(stretch)))
+
+    ops = decode_ops(model, params, 0, 1)
+
+    @jax.jit
+    def verified(prompts, stretch):
+        state, _ = prefill_state(model, params, ModelInputs(prompts), ops)
+        return ops.verify(state, stretch, jnp.ones(stretch.shape, bool))[0]
 
     @as_given
     def crossed(prompts, stretch):
-        ops = decode_ops(model, params, 0, 1)
-        state, _ = prefill_state(model, params, ModelInputs(jnp.asarray(prompts)), ops)
-        after, _, _ = ops.verify(state, jnp.asarray(stretch), jnp.ones(stretch.shape, bool))
+        after = verified(jnp.asarray(prompts), jnp.asarray(stretch))
         assert np.asarray(after.rebuilt).all()
         return floats(after)
 
+    with jax.enable_x64(new_val=True):
+        wide = prefill(model.clone(dtype=jnp.float64), widened(params))
+
     def truth(prompts, stretch):
         with jax.enable_x64(new_val=True):
-            return prefilled(model.clone(dtype=jnp.float64), widened(params), jnp.asarray(prompts),
-                             jnp.asarray(stretch))
+            return wide(prompts, stretch)
 
     def draw(seed):
         rng = np.random.default_rng([0x1899, seed])
         return tuple(rng.integers(1, VOCAB, (2, width)).astype(np.int32) for width in (3, 4))
 
-    assert_as_exact(crossed, as_given(lambda prompts, stretch: prefilled(
-        model, params, jnp.asarray(prompts), jnp.asarray(stretch))), draw, "a LongRoPE crossing's reseed",
-        seeds=RESEED_SEEDS, truth_fn=truth)
+    assert_as_exact(crossed, as_given(prefill(model, params)), draw, "a LongRoPE crossing's reseed",
+                    seeds=RESEED_SEEDS, truth_fn=truth)
 
 
 def test_an_eos_inside_a_block_ends_the_row_on_the_token_that_drew_it():
