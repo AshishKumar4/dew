@@ -61,8 +61,8 @@ from ..dex import DexStart, DifferentialExtension, HeadOutputs, LayerDex
 from ..dsa_kpool import KPoolSparseAttentionMixer
 from ..dspark import DSpark, DSparkStage, draft as dspark_draft
 from ..engram import Engram, EngramHashes, EngramLayer
-from ..flops import MissingFlopsCount, counted_flops, parameter_flops, projection_flops
-from ..gemma3n import AltUp, AltUpLayer, clamped_predictions, rescale_to
+from ..flops import counted_flops, parameter_flops
+from ..gemma3n import AltUp, clamped_predictions, rescale_to
 from ..hyper_connections import (
     Carried,
     HyperConnections,
@@ -101,6 +101,7 @@ from ..precision import (
 from ..protocols import OutputTable, Projection, ProjectionGroup, QuantizesInputs, declared_groups
 from ..rope import LongRopeScaling, Scaling, rope_scaling_from_record
 from ..sharding import RESIDUAL, constrain, logical_axes, pipeline_stages
+from . import decoder_counts
 from .decoder_block import (
     DECODER_REMAT,
     NORM_SITES,
@@ -744,28 +745,14 @@ class CausalTransformer(nn.Module):
 
     @nn.nowrap
     def model_flops(self, lengths) -> float:
-        """Real-row hidden-state work, summing the same block factories as setup. A context's
-        cross-attention work is `cross_flops`, which needs the context's lengths."""
-        return (self._layer_flops(lengths, counted_flops)
-                + self._root_flops(lengths, DepthAttention.depth_flops))
-
-    @nn.nowrap
-    def _root_flops(self, lengths, depth_counter) -> float:
-        maps = self.projections()
-        count = sum(projection_flops(lengths, *shape) for name, shape in maps.items()
-                     if name.startswith(('altup_projections_', 'altup_unembed_projections_', 'project_in')))
-        if self.hyper_connections is not None and self.hyper_connections.head == 'weighted':
-            count += HyperHead(self.hyper_connections, self.emb_features, parent=None).model_flops(lengths)
-        if self.attention_residuals is not None:
-            sources = self.attention_residuals.blocks(self.num_layers) + 1
-            count += depth_counter(DepthAttention(self.emb_features, parent=None), lengths, sources)
-        return count
+        """Real-row hidden-state work, summing the same block factories as setup (`decoder_counts`). A
+        context's cross-attention work is `cross_flops`, which needs the context's lengths."""
+        return decoder_counts.model_flops(self, lengths)
 
     @nn.nowrap
     def parameter_flops(self, lengths) -> float:
         """Learned matrices, separately from nonparameter attention/state work."""
-        return (self._layer_flops(lengths, parameter_flops)
-                + self._root_flops(lengths, DepthAttention.depth_parameter_flops))
+        return decoder_counts.trained_flops(self, lengths)
 
     @nn.nowrap
     def projections(self) -> dict[str, tuple[int, int]]:
@@ -794,120 +781,57 @@ class CausalTransformer(nn.Module):
         return sites
 
     @nn.nowrap
-    def _layer_counts(self, lengths, counter) -> list[float]:
-        """Each layer's work by `counter`, over the passes a call runs it."""
-        types = self.per_layer_types
-        kinds = self.layer_kinds(types)
-        mixer = self.layer_mixer
-        specs = self._layer_specs(types, kinds, mixer)
+    def counted_blocks(self) -> list[DecoderBlock]:
+        """Each layer's block as setup builds it, unbound, which its counts read (`decoder_counts`)."""
+        types, mixer = self.per_layer_types, self.layer_mixer
+        specs = self._layer_specs(types, self.layer_kinds(types), mixer)
         factories = self.feedforward_factories()
-        return [self.layer_passes(index) * counter(
-                    self._block(specs, mixer, factories, self.wiring, index, f'layers_{index}'), lengths)
+        return [self._block(specs, mixer, factories, self.wiring, index, f'layers_{index}')
                 for index in range(self.num_layers)]
+
+    @nn.nowrap
+    def prediction_blocks(self) -> list[MTPBlock]:
+        """Each prediction depth's block as setup builds it, unbound, which its counts read."""
+        types, factories = self.per_layer_types, self.feedforward_factories()
+        return self._prediction_depths(types, self.layer_kinds(types), self.layer_mixer, factories[0],
+                                       factories[1], self.wiring)
 
     @nn.nowrap
     def replicated_flops(self, stages: int, lengths) -> float:
         """The work of the layers a pipeline of `stages` runs on every stage rather than once
         (`stage_split`): those before and after the run its stages repeat."""
-        split = self.stage_split(stages)
-        counts = self._layer_counts(lengths, counted_flops)
-        return sum(counts[:split.prefix]) + sum(counts[self.num_layers - split.suffix:])
-
-    @nn.nowrap
-    def _layer_flops(self, lengths, counter) -> float:
-        total = sum(self._layer_counts(lengths, counter))
-        if self.per_layer_input_dim:
-            total += projection_flops(lengths, *self.projections()['per_layer_model_projection'])
-        if self.loop is not None and self.loop.exit_gate:
-            total += self.loop.steps * projection_flops(lengths, *self.projections()['early_exit_gate'])
-        return total
+        return decoder_counts.replicated_flops(self, stages, lengths)
 
     @nn.nowrap
     def layer_passes(self, index: int) -> int:
         """How many times a call runs layer `index`: a loop's steps for a layer it repeats, else once."""
-        if self.loop is None:
-            return 1
-        start, end = (0, self.num_layers) if self.loop.layers is None else self.loop.layers
-        return self.loop.steps if start <= index < end else 1
+        return decoder_counts.layer_passes(self, index)
 
     @nn.nowrap
     def logits_flops(self, lengths) -> float:
         """The vocabulary matrix and optional prediction transform, `project_out`'s included. A tied
         head reads the embedding table, `vocab_size` rows of the embedding's width."""
-        projections = self.projections()
-        tied = (self.embedding_features or self.emb_features, self.vocab_size)
-        count = projection_flops(lengths, *projections.get('lm_head', tied))
-        for site in ('head_dense', 'continuum_down', 'continuum_up', 'project_out'):
-            if site in projections:
-                count += projection_flops(lengths, *projections[site])
-        return count
+        return decoder_counts.logits_flops(self, lengths)
 
     @nn.nowrap
     def prediction_flops(self, lengths, *, prediction_lengths=None) -> float:
         """Each trained prediction depth shortens the real sequence by one token."""
-        return self._prediction_flops(lengths, counted_flops, prediction_lengths)
+        return decoder_counts.prediction_flops(self, lengths, counted_flops, prediction_lengths)
 
     @nn.nowrap
     def prediction_parameter_flops(self, lengths, *, prediction_lengths=None) -> float:
         """The same shortened depth forwards' learned matrices, head included."""
-        return self._prediction_flops(lengths, parameter_flops, prediction_lengths)
-
-    @nn.nowrap
-    def _prediction_rows(self, lengths, prediction_lengths):
-        if prediction_lengths is not None:
-            return prediction_lengths
-        return [(shorter, shorter) for depth in range(1, self.num_nextn_predict_layers + 1)
-                for shorter in (np.maximum(np.asarray(lengths) - depth, 0),)]
-
-    @nn.nowrap
-    def _prediction_flops(self, lengths, counter, prediction_lengths) -> float:
-        types, factories = self.per_layer_types, self.feedforward_factories()
-        kinds = self.layer_kinds(types)
-        blocks = self._prediction_depths(types, kinds, self.layer_mixer, factories[0], factories[1],
-                                         self.wiring)
-        count = 0.0
-        rows = self._prediction_rows(lengths, prediction_lengths)
-        for block, (inputs, outputs) in zip(blocks, rows, strict=True):
-            count += counter(block, inputs) + self.logits_flops(outputs)
-        return count
+        return decoder_counts.prediction_flops(self, lengths, parameter_flops, prediction_lengths)
 
     @nn.nowrap
     def prediction_matrix_usage(self, path: tuple[str, ...], lengths, *, prediction_lengths=None):
         """Each depth's maps run once; the shared head runs on every shorter state."""
-        relative = path[1:] if path and path[0] == 'params' else path
-        if not relative:
-            raise MissingFlopsCount("CausalTransformer prediction matrix has no native scope")
-        lengths = np.asarray(lengths)
-        rows = self._prediction_rows(lengths, prediction_lengths)
-        if relative[0].startswith('mtp_'):
-            depth = int(relative[0].removeprefix('mtp_'))
-            copies = (self.mtp_hyper_connections.hc_mult
-                      if relative[1] == 'h_proj' and self.mtp_hyper_connections is not None else 1)
-            return rows[depth][0] * copies
-        if relative[0] in ('lm_head', 'head_dense', 'continuum', 'project_out'):
-            return np.concatenate([np.empty((0,), np.int64), *(outputs for _, outputs in rows)])
-        return np.zeros_like(lengths)
+        return decoder_counts.prediction_matrix_usage(self, path, lengths, prediction_lengths)
 
     @nn.nowrap
     def matrix_usage(self, path: tuple[str, ...], lengths, *, logits: bool = False):
         """Native matrix scopes declare head versus trunk work and repeated loop passes."""
-        relative = path[1:] if path and path[0] == 'params' else path
-        if not relative:
-            raise MissingFlopsCount("CausalTransformer adapter matrix has no native scope")
-        # The continuum level stands before the head, which every head read takes it through.
-        head = relative[0] in ('lm_head', 'head_dense', 'continuum', 'project_out')
-        if head != logits or relative[0].startswith(('mtp_', 'dspark_')):
-            return np.zeros(np.shape(lengths), np.int64)
-        passes = 1
-        if self.loop is not None and relative[0].startswith('layers_'):
-            layer = int(relative[0].removeprefix('layers_'))
-            first, end = (0, self.num_layers) if self.loop.layers is None else self.loop.layers
-            if first <= layer < end:
-                passes = self.loop.steps
-        if self.altup is not None and relative[-1] == 'modality_router':
-            site = AltUpLayer(self.altup, self.emb_features, parent=None)
-            passes *= site.projection_uses()['modality_router']
-        return np.asarray(lengths) * passes
+        return decoder_counts.matrix_usage(self, path, lengths, logits=logits)
 
     def setup(self):
         """Build the embeddings, the layers, the prediction depths `mtp`, the final
