@@ -29,3 +29,18 @@ def test_a_truths_sketch_is_its_signed_block_sums_summed_exactly(size):
     stacked = np.concatenate(blocks)
     defined = np.asarray([math.fsum(stacked[:, index].tolist()) for index in range(SKETCH)])
     np.testing.assert_array_equal(truth_sketch(truth, 5), defined)
+
+
+def test_a_devices_block_sums_are_the_hosts_where_each_block_sums_exactly():
+    """The blocks' sums a GPU takes (`_device_partials`, here on the CPU's device) are the host's
+    (`_host_partials`) bit for bit where every block sums exactly in any order (dyadic entries, signed
+    zeros among them), across a device chunk's edge and a last block padded with zeros: the same
+    products in the same blocks, so on any truth the two part by each block's own rounding alone, within
+    gamma(SKETCH_BLOCK) of its magnitudes."""
+    from reference_error import DEVICE_CHUNK, _device_partials, _host_partials, _sign_bits
+
+    size = DEVICE_CHUNK + (1 << 16) + 70
+    truth = np.random.default_rng(size).integers(-(1 << 20), 1 << 20, size) / 1024.0
+    truth[::7] = -0.0
+    bits = _sign_bits(size, 5)
+    np.testing.assert_array_equal(_device_partials(truth, bits), _host_partials(truth, bits))

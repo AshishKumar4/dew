@@ -955,11 +955,23 @@ def truth_sketch(truth, seed: int) -> np.ndarray:
     signs of that seed's own (`_sign_bits`), each sign's
     product exact, in blocks of SKETCH_BLOCK whose float64 sums are summed exactly (`math.fsum`), so a
     truth recomputed apart is held to the recorded one without the recording keeping it, every host
-    rounding the sketch alike within `sketch_rounding` (`indexed_recording`)."""
+    rounding the sketch alike within `sketch_rounding` (`indexed_recording`). The products and the
+    blocks' sums run on a GPU's float64 units where the process has one (`_device_partials`), never on
+    its host while the GPU idles (ledger 1568), and on the host otherwise (`_host_partials`); the signs
+    and the exact sum are the host's either way."""
     flat = np.asarray(truth, np.float64).reshape(-1)
     if not flat.size:
         return np.zeros(SKETCH)
-    bits, partials = _sign_bits(flat.size, seed), []
+    bits = _sign_bits(flat.size, seed)
+    partials = (_device_partials if jax.default_backend() == "gpu" else _host_partials)(flat, bits)
+    return np.asarray([math.fsum(column) for column in partials.T.tolist()])
+
+
+def _host_partials(flat: np.ndarray, bits: np.ndarray) -> np.ndarray:
+    """`flat`'s blocks' sums `[blocks, SKETCH]` under the signs `bits` holds, on the host: each entry times
+    each of its signs, summed in blocks of SKETCH_BLOCK over chunks of 2^16 entries, the last block padded
+    with zeros."""
+    partials = []
     for start in range(0, flat.size, 1 << 16):
         chunk = flat[start:start + (1 << 16)]
         # Sign k of an entry is its word's bit k: its low four bytes, read little-endian whatever the host's
@@ -968,7 +980,34 @@ def truth_sketch(truth, seed: int) -> np.ndarray:
         products = np.zeros((chunk.size + -chunk.size % SKETCH_BLOCK, SKETCH))
         np.multiply(chunk[:, None], _BYTE_SIGNS[words].reshape(chunk.size, SKETCH), out=products[:chunk.size])
         partials.append(products.reshape(-1, SKETCH_BLOCK, SKETCH).sum(axis=1))
-    return np.asarray([math.fsum(column) for column in np.concatenate(partials).T.tolist()])
+    return np.concatenate(partials)
+
+
+DEVICE_CHUNK = 1 << 20
+"""The entries one call of `_device_block_sums` takes: their `[DEVICE_CHUNK, SKETCH]` float64 products,
+256 MiB, a multiple of SKETCH_BLOCK so its blocks are the host's."""
+
+
+@jax.jit
+def _device_block_sums(chunk: jax.Array, words: jax.Array) -> jax.Array:
+    """`chunk`'s blocks' sums `[DEVICE_CHUNK // SKETCH_BLOCK, SKETCH]` under the signs `words` hold, each
+    sign its word's bit."""
+    signs = ((words[:, None] >> jnp.arange(SKETCH, dtype=jnp.uint64)) & 1).astype(jnp.float64) * 2 - 1
+    return (chunk[:, None] * signs).reshape(-1, SKETCH_BLOCK, SKETCH).sum(axis=1)
+
+
+def _device_partials(flat: np.ndarray, bits: np.ndarray) -> np.ndarray:
+    """`_host_partials` on the default device in float64: the same products, exact, each block summed
+    in whatever order the device takes it, within gamma(SKETCH_BLOCK) of its magnitudes, a chunk at a
+    time (`DEVICE_CHUNK`, the last padded with zeros, whose blocks past the entries' are dropped)."""
+    blocks = -(-flat.size // SKETCH_BLOCK)
+    padded = -flat.size % DEVICE_CHUNK
+    flat, bits = np.pad(flat, (0, padded)), np.pad(bits, (0, padded))
+    with jax.enable_x64(new_val=True):
+        partials = [np.asarray(_device_block_sums(jnp.asarray(flat[start:start + DEVICE_CHUNK]),
+                                                  jnp.asarray(bits[start:start + DEVICE_CHUNK])))
+                    for start in range(0, flat.size, DEVICE_CHUNK)]
+    return np.concatenate(partials)[:blocks]
 
 
 def sketch_rounding(magnitude: float) -> float:

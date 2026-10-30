@@ -104,7 +104,7 @@ def moved(tree, seed: int):
 
 @pytest.mark.parametrize("held", [7, 1])
 def test_the_last_batch_is_filled_out_and_marked_on_every_process_count(held):
-    """The maintainer's repro: eight training records in batches of four, and seven or
+    """Main's repro: eight training records in batches of four, and seven or
     one to validate. The pass reads each record once, on one process or two,
     and the repeats that fill the last batch out are marked; with one record,
     process 1's share is empty and reads one batch of repeats alone."""
