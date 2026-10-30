@@ -725,10 +725,9 @@ class Decide(SavedRunTask, InItsForm):
 
         The rows are scored shortest first, in the passes a server of this task runs and over its
         programs (`RowScoring`, `dew.inference.scoring.ScoringServer`), one path for a call and a
-        server alike, every row looked at for each pass.
+        server alike.
         """
-        server = scoring.ScoringServer(RowScoring(replace(self, variables={})), self.variables,
-                                       rows=max(1, len(rows)))
+        server = scoring.ScoringServer(RowScoring(replace(self, variables={})), self.variables)
         order = sorted(range(len(rows)), key=lambda index: len(rows[index].tokens))
         futures = {index: server.submit(rows[index]) for index in order}
         server.run()
@@ -971,7 +970,7 @@ class Decide(SavedRunTask, InItsForm):
         `dew.inference.scoring.ScoringServer`): each body admitted on its own, so a refusal is its
         body's alone, and the admitted ones' rows scored together, a pass at a time."""
         # A call's server compiles the passes it runs as it runs them, not every shape up front.
-        server = scoring.ScoringServer(*self.scoring(details=details, strict=strict, whole=whole), rows=64)
+        server = scoring.ScoringServer(*self.scoring(details=details, strict=strict, whole=whole))
         answered: dict[int, dict[str, JSON] | ValueError] = {}
         futures = {}
         for index, request in enumerate(requests):

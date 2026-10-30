@@ -292,6 +292,21 @@ def test_a_batch_scores_in_a_servers_passes_over_the_programs_it_compiled(decide
         assert discrete(answers) == discrete(alone)
 
 
+def test_a_scoring_pass_looks_at_every_waiting_request(decide):
+    """A pass takes rows from every waiting request while its plan takes them, not from a bounded few: a
+    hundred short requests one pass's windows hold are answered in one step, where a pass of 64 requests
+    at most left the rest to a second, its windows part empty (ledger 2514)."""
+    from dew.decision import Question
+
+    single = {**REQUEST, "questions": dict(list(REQUEST["questions"].items())[:1])}
+    questions = {name: Question.from_wire(wire) for name, wire in single["questions"].items()}
+    assert decide.fits([row for _ in range(100) for row in decide._encoded(single["state"], questions)])
+    server = ScoringServer(*decide.scoring())
+    futures = [server.submit(single) for _ in range(100)]
+    server.step()
+    assert all(future.done() for future in futures)
+
+
 def test_a_reload_after_a_cancelled_request_plans_the_next_pass_with_the_new_task(decide):
     """A request cancelled while it waits leaves the queue as its pass is chosen, and with it any plan of its
     row, so the request after it, laid out by the task a reload put in place, is planned by that task: a
