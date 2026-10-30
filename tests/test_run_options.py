@@ -574,9 +574,10 @@ def contexted(root: Path, drawn: bool) -> RunConfig:
     return dataclasses.replace(decision(root, drawn), context_layers=(0,), context_length=16)
 
 
-BESIDE = {"layout.framing": {"segments": built_in(None, "question_first")}}
+BESIDE = {"layout.framing": {"segments": built_in(None, "question_first"), "max_len": 256}}
 """What an option's reader takes it only beside, by the run's path, set with it: a framing frames a row of
-its own segments (`_budgeted`), here the question layout's own row as segments (`built_in`)."""
+its own segments (`_budgeted`), here the question layout's own row as segments (`built_in`), in a row long
+enough for its conversation's turns."""
 
 TASK_RUNS = {"TextSettings": (prefixed, "lm"), "MaskedSettings": (masked, "masked_diffusion"),
              "ImageSettings": (diffusion, "diffusion"), "DecideSettings": (contexted, "decision")}
