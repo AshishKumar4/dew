@@ -862,8 +862,10 @@ def collect(python: str, tests: list[str], out: Path, deadline: float) -> int:
     if done.returncode not in (0, 2, 5) and not errors:
         errors = dict.fromkeys(tests, f"pytest --collect-only exited {done.returncode}\n{output[-4000:]}")
     seconds = (time.monotonic() - began) / len(tests)
+    # A collection runs no test, so it moved no site onto YNNPACK's fusions: counted, not unknown.
     rows = [{"name": row(python, name, COLLECT), "exitCode": 1 if name in errors else 0, "seconds": seconds,
-             "output": errors.get(name, ""), **(red_as(COLLECT, []) if name in errors else {})}
+             "output": errors.get(name, ""), "ynn_switched": [],
+             **(red_as(COLLECT, []) if name in errors else {})}
             for name in tests]
     out.write_text(json.dumps({"rows": rows}))
     return 0
