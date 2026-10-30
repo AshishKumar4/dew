@@ -783,24 +783,32 @@ def key_decayed_pairs(rows: Callable[[int], jax.Array], keys: Callable[[int], ja
     The products accumulate in one sum as fla_kda's into its `b_A` (`summed`, an iterable of `(name, lhs,
     rhs)` taken a product at a time): each its own sum, added after, they were live together (Kimi delta
     attention's intra launch, 1170 registers a thread on an A100, 519 on an H100)."""
-    def products(s, c, prefix):
+    def products(s, c, prefix, down):
         place = s * sub
         start_whole, start_fraction = separated(*reference(s, c))
         start = start_whole[None, :], start_fraction[None, :]
         index, _ = _grid(prefix[0].shape)
         # Each operand formed as its product stages it (`summed` calls it), so one is live at a time.
-        yield ("pairs",
-               lambda: jnp.where((index >= place) & (index < place + sub), rows(c) * between(prefix, start),
-                                 0.0),
+        yield ("pairs", lambda: jnp.where((index >= place) & (index < place + sub), down, 0.0),
                lambda: Transposed(jnp.where(index < place + sub, keys(c) * between(start, prefix), 0.0)))
 
     total = jnp.zeros((chunk, chunk), jnp.float32)
     for c in range(columns):
         # A key block's prefix read once, before its sub-chunks' turns, which are rolled: each one's addresses
-        # live within its own turn.
+        # live within its own turn. Its rows gated down at once, each to its own sub-chunk's first token:
+        # gated a sub-chunk at a time, every row was gated for each, and the exponentials were two thirds of
+        # the launch (the intra launch 1.51 ms on an H100, 0.53 without them).
         prefix = separated(*gates(c))
-        total = jax.lax.fori_loop(0, chunk // sub, lambda s, total, c=c, prefix=prefix: total + summed(
-            products(s, c, prefix), shape=(chunk, chunk)), total)
+        index, _ = _grid(prefix[0].shape)
+        starts = [separated(*reference(s, c)) for s in range(chunk // sub)]
+        start = tuple(functools.reduce(lambda below, s, half=half: jnp.where(index >= s * sub,
+                                                                            starts[s][half][None, :], below),
+                                       range(1, chunk // sub), jnp.broadcast_to(starts[0][half][None, :],
+                                                                                index.shape))
+                      for half in (0, 1))
+        down = rows(c) * between(prefix, start)
+        total = jax.lax.fori_loop(0, chunk // sub, lambda s, total, c=c, prefix=prefix, down=down: (
+            total + summed(products(s, c, prefix, down), shape=(chunk, chunk))), total)
     lag = _lags(total.shape)
     return jnp.where(lag > 0 if strict else lag >= 0, total, 0.0)
 
