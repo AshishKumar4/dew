@@ -1175,6 +1175,32 @@ def test_the_residual_pullbacks_hold_every_order(edge):
 
 
 @pytest.mark.parametrize("edge", EDGES)
+def test_a_heads_row_terms_hold_every_order(edge):
+    """A head's row terms (`chunked._row_terms`, a custom JVP over its one reduction): each row's log
+    partition, its maximum, the sum of its exponentials scaled to it and that sum without the label's
+    column, every order finite wherever float64 is a normal float32 and the plain formula, jnp's maximum
+    and sums, is."""
+    (logits,) = normal_draw(2711, (4, 7), scale=EDGES[edge])
+    (direction,) = normal_draw(2712, logits.shape, scale=EDGES[edge])
+    (cotangent,) = normal_draw(2713, (4, 4))
+    labels = jnp.asarray([0, 3, 6, 2], jnp.int32)
+
+    def terms(logits):
+        log_z, _, (maximum, total, rest) = chunked._row_terms(logits, predict=False, labels=labels)
+        return jnp.stack([log_z, maximum, total, rest])
+
+    def plain(logits):
+        maximum = jnp.max(logits, axis=-1)
+        shares = jnp.exp(logits - maximum[:, None])
+        rest = jnp.sum(jnp.where(jnp.arange(logits.shape[1]) != labels[:, None], shares, 0), axis=-1)
+        total = jnp.sum(shares, axis=-1)
+        return jnp.stack([maximum + jnp.log(total), maximum, total, rest])
+
+    assert_contract(terms, (logits,), (direction,), cotangent, f"a head's row terms {edge}", truth_fn=plain,
+                    plain_fn=plain)
+
+
+@pytest.mark.parametrize("edge", EDGES)
 def test_the_whole_logits_losses_hold_every_order(edge):
     """`chunked._whole_losses` (a custom JVP, the categorical's own derivative): each row's cross entropy
     and log partition of whole logits, every order finite wherever float64 is a normal float32 and the
