@@ -504,8 +504,9 @@ class Plan:
                 raise ValueError(f"saved per-share data plan topology changed (shares, workers or cycle "
                                  f"length): {PER_SHARE}")
         # Each identity without the fields its configurations lost since runs were saved (`without_removed`).
-        changed = _changed(without_removed(record(saved.get("manifest"), "saved data manifest")),
-                           without_removed(self.manifest.semantic()))
+        manifests = (json_value(record(saved.get("manifest"), "saved data manifest"), "saved data manifest"),
+                     json_value(self.manifest.semantic(), "data manifest"))
+        changed = _changed(*(record(without_removed(manifest), "data manifest") for manifest in manifests))
         if edited is not None:
             changed = tuple(name for name in changed if name not in ("source", "steps", "tokenizer"))
         if changed:

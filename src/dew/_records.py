@@ -231,27 +231,44 @@ _REMOVED_BY_NAME = {path.rsplit(":", 1)[-1]: names for path, names in REMOVED_FI
 
 
 def without_removed(value: JSON) -> JSON:
-    """`value`, a data step's identity or a manifest of them (`dew.data.plan.StepIdentity`), with the fields
-    configurations lost since runs were saved (`REMOVED_FIELDS`) left out wherever its text records one: a
-    configuration's repr (`OptionLines(..., stream='context')`), within its JSON record or alone. An identity
-    that names no such configuration is as it was, so a saved identity and today's compare by what their steps
-    compute (`dew.data.plan.Plan.check`)."""
+    """`value`, a data step's identity or a manifest of them (`dew.data.plan.StepIdentity.semantic`), each
+    identity of a Dew step that declares none of its own with the fields configurations lost since runs were
+    saved (`REMOVED_FIELDS`) left out of its configuration's repr (`OptionLines(..., stream='context')`),
+    within its JSON record or alone (`_unremoved`). Another step's identity, a declared one and any other
+    text are as they were, so a saved identity and today's compare by what their steps compute
+    (`dew.data.plan.Plan.check`), and a changed step of a user's still differs."""
     if isinstance(value, list):
         return [without_removed(part) for part in value]
-    if isinstance(value, dict):
-        return {key: without_removed(part) for key, part in value.items()}
-    if not isinstance(value, str) or not any(f"{name}(" in value for name in _REMOVED_BY_NAME):
+    if not isinstance(value, dict):
         return value
+    held = {key: without_removed(part) for key, part in value.items()}
+    name, config = held.get("name"), held.get("config")
+    if isinstance(name, str) and name.startswith("dew.") and held.get("declared") is None and isinstance(
+            config, str):
+        held["config"] = _unremoved(config)
+    return held
+
+
+def _unremoved(config: JSON) -> JSON:
+    """A Dew step's configuration (`without_removed`) without the fields its configurations lost: in a
+    configuration's repr (a call named as the class `REMOVED_FIELDS` names) and in each string of a JSON
+    record of one (a configured step's binding), wherever it nests."""
+    if isinstance(config, list):
+        return [_unremoved(part) for part in config]
+    if isinstance(config, dict):
+        return {key: _unremoved(part) for key, part in config.items()}
+    if not isinstance(config, str) or not any(f"{name}(" in config for name in _REMOVED_BY_NAME):
+        return config
     try:
-        parsed = json.loads(value)
+        parsed = json.loads(config)
     except ValueError:
         parsed = None
     if isinstance(parsed, dict | list):
-        return json.dumps(without_removed(parsed), sort_keys=True)
+        return json.dumps(_unremoved(parsed), sort_keys=True)
     try:
-        tree = ast.parse(value, mode="eval")
+        tree = ast.parse(config, mode="eval")
     except SyntaxError:
-        return value
+        return config
     for node in ast.walk(tree):
         named = node.func.id if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) else None
         if isinstance(node, ast.Call) and named in _REMOVED_BY_NAME:

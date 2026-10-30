@@ -949,12 +949,10 @@ def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
     A configuration written today that names the earlier knobs is refused by name, as any field its class
     does not declare. A record in today's shapes passes as it is. Carried to 1.0, when it is deleted
     (ledger 1552)."""
-    fields = record.get("fields")
-    if isinstance(fields, dict):
+    if isinstance(record.get("fields"), Mapping):
         # Each component in today's fields, those its class lost since left out (`earlier_fields`).
-        fields = earlier_fields(fields)
-        assert isinstance(fields, dict)
-        record = {**record, "fields": fields}
+        record = {**record, "fields": earlier_fields(json_value(record["fields"]))}
+    fields = record.get("fields")
     if not isinstance(fields, Mapping) or not isinstance(fields.get("trainer"), Mapping):
         return record
     trainer, fields = dict(fields["trainer"]), dict(fields)

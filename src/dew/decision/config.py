@@ -398,7 +398,7 @@ class DecisionRunConfig(DecoderRunConfig):
         return tuple(MetricConfig(import_path(type(metric))) for metric in default_metrics())
 
 
-type Budgets = dict[str, object]
+type Budgets = dict[str, int | bool | str | Framing | Labels | tuple[RowSegment, ...] | None]
 """A run's fields of a row's layout, by the layout's field names (`_budgeted`)."""
 
 ROW_FIELDS = tuple(sorted(
