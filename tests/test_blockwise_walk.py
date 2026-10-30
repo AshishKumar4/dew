@@ -147,7 +147,7 @@ def test_llada2s_task_continues_stops_and_takes_a_zero_budget():
 
 
 def test_a_run_over_llada2_saves_and_serves_its_walk(tmp_path):
-    """An objective over a loaded LLaDA2.0 source takes its walk by default (`masked_recipe`); a run of
+    """An objective over a loaded LLaDA2.0 source takes its walk by default (`masked_walk`); a run of
     it saves the walk in its record, and the run's task (`MaskedGeneration.from_run`, `dew.pipeline` of
     the run) holds the same solver, block and steps and generates the live task's tokens, as
     `dew.pipeline` of the source itself walks (ledger 2174)."""
@@ -164,12 +164,13 @@ def test_a_run_over_llada2_saves_and_serves_its_walk(tmp_path):
     from dew.training import Trainer
 
     source = Pretrained.load(FIXTURES / "llada2-tiny", dtype="float32", attention_impl="xla")
-    solver, steps, block = source.masked_recipe
+    walk = source.masked_walk
+    solver, steps, block = walk.solver, walk.steps, walk.block
     # LLaDA2.2 generates with an editing stage Dew does not run: its source, and a config Dew's export
     # writes for it (its block routing, no DELETE or SPLIT ids), take MDLM.
     from dew.interop.hf_decoders import family_entry
 
-    assert Pretrained.load(FIXTURES / "llada22-tiny").masked_recipe is None
+    assert Pretrained.load(FIXTURES / "llada22-tiny").masked_walk is None
     exported = {**json.loads((FIXTURES / "llada22-tiny" / "config.json").read_text())}
     for field in ("delete_token_id", "split_token_id"):
         exported.pop(field)

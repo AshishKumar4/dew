@@ -13,8 +13,8 @@ Face checkpoint: transformers' MiniMax turns every dimension of a head and scale
 `1 - layer / (layers - 1 + 1e-5) + 1e-5` (`get_slope_rate`), its slopes a power of two's whatever the
 heads, and the release's own code does not import under transformers 5 (`is_torch_fx_available`) and
 drops a padded row's mask in its softmax layers (ledgers 2534, 2535); its export is refused, naming that.
-A lightning layer's rates follow its place in the stack (`lightning_rates`), so each is a kind of its
-own, `linear_attention_{index}`.
+A lightning layer's rates follow its place in the stack, data the stack hands it (`MixerCall.depth`),
+so the lightning layers are one kind and the releases' seven-to-one pattern scans as a period of eight.
 
 The `minimax` configs spell the layer pattern as `layer_types` and the factors as
 `{full_attn,linear_attn,mlp}_{alpha,beta}_factor`; the releases' own as `attn_type_list` (0 for a
@@ -149,20 +149,14 @@ def _minimax_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
         refuse(f'hidden_act {activation!r}', f'the lightning projection takes {sorted(ACTIVATIONS)}')
     chunk = _records.integer(hf.get('block_size', _BLOCK), 'block_size')
     used.add('block_size')
-    kinds = {name: kind for name, kind in kinds_of(config).items() if name != 'linear_attention'}
-    named = []
-    for index, kind in enumerate(types):
-        if kind == 'full_attention':
-            named.append(kind)
-            continue
-        name = f'linear_attention_{index}'
-        named.append(name)
-        kinds[name] = native_fields(LayerKind)(mixer=None)
-        kinds[name]['mixer'] = {'class': 'lightning_attention', 'fields': {
-            'layer_idx': index, 'num_hidden_layers': layers, 'hidden_act': activation, 'block_size': chunk}}
+    kinds = dict(kinds_of(config))
+    if 'linear_attention' in types:
+        kinds['linear_attention'] = native_fields(LayerKind)(mixer=None)
+        kinds['linear_attention']['mixer'] = {'class': 'lightning_attention', 'fields': {
+            'num_hidden_layers': layers, 'hidden_act': activation, 'block_size': chunk}}
     used.update(('num_local_experts', 'num_experts'))
     config.update(
-        layer_types=tuple(named), kinds=kinds, partial_rotary_factor=factor, partial_rotary_type='default',
+        kinds=kinds, partial_rotary_factor=factor, partial_rotary_type='default',
         normed_residual=postnorm, stream_multiplier=_factor(hf, used, 'alpha'),
         residual_multiplier=_factor(hf, used, 'beta'),
         mixture=native_fields(Mixture)(

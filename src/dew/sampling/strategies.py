@@ -56,6 +56,10 @@ class DecoderState:
     tokens: jax.Array | None = None
     lengths: jax.Array | None = None
     """Compact token history for a positional table change that invalidates KV."""
+    rebuilt: jax.Array | None = None
+    """The rows whose last step crossed that change and rebuilt every cache from the history, the
+    prediction depths' reseeded as a prefill seeds them (`text.decode_ops`); None where no row can
+    cross."""
 
 
 
@@ -850,17 +854,27 @@ def _block(carry: _SpeculativeCarry, plan: Speculative, ops: DecodeOps, transfor
     following, again, seen = verify(dataclasses.replace(state, cache=saved), emitted, keep)
     assert seen is not None
     last = jnp.maximum(count - 1, 0)
+    # A row whose replay rebuilt its caches across a positional table change was reseeded over its
+    # whole history, the emitted tokens among it (`DecoderState.rebuilt`): its stretch is not written
+    # again, and its predecessors are the rebuilt ones.
+    rebuilt = (jnp.zeros(keep.shape[0], bool) if following.rebuilt is None else following.rebuilt)
+    stretch = keep & ~rebuilt[:, None]
     if ops.record is not None:
-        following = ops.record(following, seen, keep)
+        following = ops.record(following, seen, stretch)
     else:
         assert ops.embed is not None
         # The tails reseed hands back are every depth's predecessor at the
         # last emitted slot, the target's own state first; a row that
         # emitted nothing keeps what it had.
-        following, carried = reseed(
+        replayed, carried = reseed(
             ops, following, (state.hidden, *state.drafts), seen, ops.embed(emitted),
-            keep, base, last, prior_tokens=step.total())
-        following = dataclasses.replace(following, hidden=carried[0], drafts=carried[1:])
+            stretch, base, last, prior_tokens=step.total())
+
+        def kept(fresh, held):
+            return jnp.where(rebuilt.reshape(-1, *(1,) * (fresh.ndim - 1)), held, fresh)
+
+        drafts = tuple(kept(fresh, held) for fresh, held in zip(carried[1:], following.drafts, strict=True))
+        following = dataclasses.replace(replayed, hidden=kept(carried[0], following.hidden), drafts=drafts)
     following = dataclasses.replace(
         following, logits=jnp.where((count > 0)[:, None],
                                     jnp.take_along_axis(again, last[:, None, None], axis=1)[:, 0],
