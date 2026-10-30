@@ -19,6 +19,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from model_support import decoder
+from whole_suite import timed
 
 from dew.sampling import Sampling, Speculative, decoding, generate
 
@@ -71,15 +72,13 @@ DSPARK = Path(__file__).parent / "fixtures" / "hf" / "deepseek-v4-dspark-tiny"
 def longrope_drafter():
     """The tiny DeepSeek V4-Flash-0731 (`DSPARK`) with its DSpark block drafter over a trunk of plain
     attention whose rotary switches tables past its sixth position (LongRoPE), the drafter's own sliding
-    V4 kind rotating under YaRN, which V4's attention takes where it refuses LongRoPE; its like layers
-    scanned, so each compiles once."""
+    V4 kind rotating under YaRN, which V4's attention takes where it refuses LongRoPE."""
     from dew.interop import Pretrained
     from dew.nn.backbones.layer_plan import LayerKind
     from dew.nn.mixers.attention import AttentionMixer
     from dew.nn.rope import LongRopeScaling, YarnScaling
 
     model = Pretrained.load(DSPARK, weights=False, dtype="float32", attention_impl="reference").model
-    model = model.clone(scan_layers=True)
     drafter = model.dspark.layer_type
     head = model.head_dim or model.emb_features // model.num_heads
     pairs = int(head * (model.partial_rotary_factor or 1.0)) // 2
@@ -98,7 +97,14 @@ LONGROPE_DRAFTING = {"depth": (longrope_predictor, 1), "drafter": (longrope_draf
 decode runs (`decode_ops`): a prediction depth's, and a block drafter's, which runs none."""
 
 
-@pytest.mark.parametrize("kind", ["attention", "recurrent", "dspark"])
+PAST_TARGET = {"greedy": {"dspark": 124}}
+"""The greedy-walk cases a group's 120 s target sends to the whole suite (`timed`), each its seconds on
+armada at 09fab1340: the drafter's, whose crossing its cheaper siblings hold every train, a block across
+the change answering each token as the walk does and the crossing reseeding the drafter's windows (each
+`[drafter]`)."""
+
+
+@pytest.mark.parametrize("kind", timed(PAST_TARGET, "greedy", ["attention", "recurrent", "dspark"]))
 def test_speculation_across_a_longrope_rebuild_reproduces_the_greedy_walk(kind):
     """A LongRoPE crossing rebuilds every cache the decode keeps (`decode_ops`), a prediction depth's or
     a block drafter's with the trunk's, so speculating across it at zero temperature emits the greedy
