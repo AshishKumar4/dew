@@ -182,7 +182,8 @@ def test_each_replayed_step_draws_its_posterior_from_its_own_key():
         draws = []
         for t, key in enumerate(jax.random.split(jax.random.key(13), 6)):
             at = model.bind(variables, rngs={"latent": key})
-            deter, drawn, _ = objective.observe(at, deter, drawn, observation[:, t], previous[:, t], first[:, t])
+            inputs = observation[:, t], previous[:, t], first[:, t]
+            deter, drawn, _ = objective.observe(at, deter, drawn, *inputs)
             draws.append(drawn)
         return jnp.stack(draws, 1)
 
