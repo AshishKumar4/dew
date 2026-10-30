@@ -68,6 +68,7 @@ from dew.distributed.batches import (
     batch_signature,
     placed_abstract,
     prefetched_bytes,
+    shard_batch,
     split_fields,
 )
 from dew.distributed.host import snapshot
@@ -121,6 +122,7 @@ from dew.telemetry.records import (
     StepCompiled,
 )
 from dew.training._fit import (
+    Emptied,
     FitPlan,
     FitRun,
     HandedSplits,
@@ -134,6 +136,9 @@ from dew.training._fit import (
     first_batch,
     fit_policies,
     handed_splits,
+    pooled,
+    pooled_first,
+    pooled_read,
     refuse_unclocked,
     stage_reached,
     unrecorded_parts,
@@ -1743,9 +1748,12 @@ class Trainer(Generic[Loss, Effects]):
             # corpus, and none reads a record before all agree it is one.
             agreed_same("training data", lambda: (
                 f"{plan.dataset.batch} records a step of {stream_identity(source)}"))
-        run.endless = stream_endless(source)
+        run.endless, run.pooled = stream_endless(source), pooled(self._examples)
         self._marked = marked(run.partition, self._counted_batch)
         prepare = self._marked if self.rollout is None else None
+        if run.pooled:
+            run.emptied = Emptied(functools.partial(pooled_first, plan.dataset, run.partition), self._marked,
+                                  functools.partial(shard_batch, self.device_mesh, reads=run.reads))
         return DevicePrefetchIterator(source, self.device_mesh, self._prefetch, source_state=position,
                                       reads=run.reads, prepare=prepare)
 
@@ -1906,7 +1914,8 @@ class Trainer(Generic[Loss, Effects]):
                         break
                     self._scheduled(plan, branched)
                     assert branched.train is not None
-                    batch = agreed_next("cooldown read", branched.train)
+                    batch = (pooled_read(branched, branched.train, phase="cooldown read") if branched.pooled
+                             else agreed_next("cooldown read", branched.train))
                     if batch is None:
                         break
                     batch = rolled_out(self.rollout, cooled, batch, self.device_mesh, self._marked, counted,

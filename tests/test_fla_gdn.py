@@ -7,15 +7,18 @@ speed against fla's kernels are the GPU session's (c53 onwards).
 
 import contextlib
 import functools
+import os
 
 import fla_gdn_support as support
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from delta_rule_support import NAMES, checkpointed, math as portable, recurrence, rule_math, through
+from delta_rule_support import NAMES, checkpointed, fla_side, math as portable, recurrence, rule_math, through
 from gdn_cases import CASES
 from reference_error import (
+    FEWEST_SEEDS,
+    as_given,
     assert_as_exact,
     assert_computes_the_oracle,
     chain_roundings,
@@ -435,7 +438,8 @@ def test_dews_fla_rule_follows_the_recurrence_for_any_heads_widths_and_length(
     """`fla_rule`, the port as a GPU runs it, for calls its blocks do not fit as they come: padded to
     them and cut back, through the custom VJP, its output, final memory and gradients within fp32
     rounding of the token recurrence in float64. The padding is exact, so this checks the shaping;
-    the port's distance against fla's own at the training shapes is the GPU tier's float64 gate.
+    the port trained natively at a training shape is held to float64 on a GPU by
+    tests/test_gpu_recurrence.py's port cells.
     (Its decay gradient, fla's base-2 sum, sits 2.0x the portable IEEE math's distance here, so the
     math is no budget for it.)"""
     q, k, v, g, beta, h0, do, dht = support.delta_operands(17, 1, length, key_heads, value_heads, width,
@@ -453,8 +457,9 @@ def test_dews_fla_rule_follows_the_recurrence_for_any_heads_widths_and_length(
 
 
 @pytest.mark.parametrize("per_key", [False, pytest.param(True, marks=pytest.mark.skipif(
-    not INTERPRETED, reason="on a GPU Kimi delta attention's fp32 products are fla's TF32; its packed bar "
-                            "is fla's own distance (test_fla_kda's packed case)"))])
+    not INTERPRETED, reason="on a GPU Kimi delta attention's fp32 products are the port's BF16x6 (fla's own "
+                            "one TF32), held to fla's own distance by the_port_is_as_exact_as_fla "
+                            "(tests/test_gpu_recurrence.py)"))])
 @pytest.mark.parametrize("begun", [False, True])
 def test_dews_fla_rule_runs_packed_documents_as_their_own_sequences(per_key, begun):
     """Packed documents (`starts`, each a sequence of its own, fla's varlen), with a
@@ -584,8 +589,8 @@ def test_a_gated_delta_net_on_fla_matches_it_on_xla(dtype, bound):
 def test_dews_fla_rule_takes_wide_keys_up_to_fla_s_256_in_bf16(width):
     """192- and 256-wide bf16 keys on the port, the 192 padded to 256, a width every key block of
     the configs divides: the output and final memory of the token recurrence in float64, within
-    bf16 storage's rounding. A coverage check of the shapes; the port's accuracy against fla's own
-    is the GPU tier's float64 gate (the kernel lab's verify)."""
+    bf16 storage's rounding. A coverage check of the shapes; the port trained natively is held to
+    float64 on a GPU by tests/test_gpu_recurrence.py's port cells."""
     keys = jax.random.split(jax.random.key(59), 5)
     q = l2norm(jax.random.normal(keys[0], (1, 64, 1, width))).astype(jnp.bfloat16)
     k = l2norm(jax.random.normal(keys[1], q.shape)).astype(jnp.bfloat16)
@@ -838,6 +843,52 @@ def test_the_port_keeps_the_kernel_contract_on_a_mesh(axis, split, per_key):
     assert_runs_per_shard(through(fla_rule, do, every), draw, [spec] * 5, mesh,
                           f"fla rule split over {axis}, {'per key' if per_key else 'per head'}",
                           seeds=SHARDED_SEEDS[per_key], truth_fn=exact)
+
+
+FLA_SHAPE = (1, 1024, 2, 4, 128)
+"""The port's cell against fla's own: a row of 1024 tokens, two key heads each serving two value heads, 128
+wide (Qwen3.5's gated delta net's head)."""
+
+FLA_DTYPES = {"float32": (jnp.float32,) * 3, "mixed dtypes": (jnp.bfloat16, jnp.float32, jnp.bfloat16)}
+"""The queries', keys' and values' dtypes of the port's cells against fla's own: fp32, whose products the port
+takes in BF16x6 (six bf16 products, `fla_gdn`'s BF16_BF16_F32_X6) and fla in one TF32, and mixed, which each
+runs in their common dtype."""
+
+
+def the_port_is_as_exact_as_fla(per_key: bool, dtypes: str):
+    """The rule on the port's kernels natively (`fla_rule`), a decay a head (fla_gdn) or a key dimension
+    (fla_kda), its queries, keys and values in `FLA_DTYPES[dtypes]` (beta in the values'): its output, final
+    memory and every operand's gradient on par from float64 with fla 0.5.2's own on the same operands
+    (`fla_side`, in its own interpreter, in their common dtype), check 1, the float64 token recurrence the
+    truth, at `FLA_SHAPE`. A GPU cell (tests/test_gpu_recurrence.py), skipped where its session names no fla
+    (`DEW_FLA_PYTHON`)."""
+    if not os.environ.get("DEW_FLA_PYTHON"):
+        pytest.skip("DEW_FLA_PYTHON names no interpreter with fla 0.5.2 and torch, the cell's reference")
+    batch, length, key_heads, value_heads, width = FLA_SHAPE
+    kinds = FLA_DTYPES[dtypes]
+    common = jnp.result_type(*kinds)
+
+    def draw(seed):
+        q, k, v, g, beta, h0, do, dht = support.delta_operands(
+            seed, batch, length, key_heads, value_heads, width, width, per_key=per_key)
+        return (q.astype(kinds[0]), k.astype(kinds[1]), v.astype(kinds[2]), g, beta.astype(kinds[2]), h0,
+                do.astype(common), dht)
+
+    def port(q, k, v, g, beta, h0, do, dht):
+        return through(fla_rule, do, dht)(q, k, v, g, beta, h0)
+
+    @as_given
+    def fla(*inputs):
+        # fla's own run on the host, each result in the port's result dtype.
+        shapes = jax.eval_shape(port, *inputs)
+        return tuple(np.asarray(x, s.dtype)
+                     for x, s in zip(fla_side(inputs, None, common), shapes, strict=True))
+
+    def truth(q, k, v, g, beta, h0, do, dht):
+        return through(recurrence, do, dht)(q, k, v, g, beta, h0)
+
+    assert_as_exact(port, fla, draw, f"the port ({'kda' if per_key else 'gdn'}, {dtypes}) against fla's own",
+                    seeds=FEWEST_SEEDS, truth_fn=truth)
 
 
 def _lowered_dot(product, default: str) -> list:
