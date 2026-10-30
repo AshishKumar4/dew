@@ -472,11 +472,9 @@ def test_a_synchronous_collection_draws_from_the_policy_at_the_runs_updates():
     assert not np.array_equal(held[0]["old_log_probs"], held[5]["old_log_probs"])
 
 
-def test_a_task_at_a_runs_progress_keeps_it_rebound_and_is_not_served():
+def test_a_task_at_a_runs_progress_keeps_it_rebound():
     """A task that draws at a run's progress (`LMObjective.policy`) keeps it rebound to other weights
-    (`TextGeneration.bind`), and a server, which draws at the run's end, refuses it rather than serve
-    another policy (review of ledger 2667)."""
-    from dew.inference.serving import Server
+    where none is named (`TextGeneration.bind`), and takes the one named (review of ledger 2667)."""
     from dew.nn.dex import DifferentialExtension
 
     model = decoder().with_dex(DifferentialExtension(((0, (0, 1)),), anneal_steps=10))
@@ -486,8 +484,6 @@ def test_a_task_at_a_runs_progress_keeps_it_rebound_and_is_not_served():
     task = objective.policy(params, Sampling(temperature=0), halfway)
     assert task.bind(params).progress is halfway
     assert task.bind(params, END).progress is END
-    with pytest.raises(ValueError):
-        Server.from_task(task, slots=2, capacity=64)
 
 
 @pytest.mark.parametrize("kind", ["attention", "recurrent"])

@@ -60,6 +60,34 @@ def assert_same_generation(served, alone):
     np.testing.assert_allclose(served.raw_log_probs, alone.raw_log_probs, atol=2e-6, rtol=2e-6)
 
 
+def test_a_server_draws_at_its_tasks_progress_and_at_each_version_it_loads():
+    """A server built from a task that draws at a run's progress (a DEX decoder half way through its
+    anneal, `TextGeneration.progress`) draws as the task does, and reloaded at another version's
+    (`Server.reload`, as `NativeRolloutServer.load` reloads it) as the task at that progress does; one
+    built at the run's end serves that end, refusing a run's progress (ledger 2695)."""
+    from dew.nn.dex import DifferentialExtension
+    from dew.nn.progress import END, Progress
+
+    model = decoder().clone(max_seq_len=128).with_dex(DifferentialExtension(((0, (0, 1)),), anneal_steps=10))
+    params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+
+    def at(updates: int | None) -> TextGeneration:
+        progress = END if updates is None else Progress(jnp.asarray(updates, jnp.int32))
+        return TextGeneration(model, params, RunProcessor(Digits()), sampling=task().sampling,
+                              progress=progress)
+
+    server = Server.from_task(at(5), slots=2, capacity=128)
+    for actual, prompt in zip(server(PROMPTS[:2], 5, key=3), PROMPTS[:2], strict=True):
+        assert_same_generation(actual, at(5)(prompt, 5, key=3))
+    server.reload(params, Progress(jnp.asarray(1, jnp.int32)))
+    for actual, prompt in zip(server(PROMPTS[:2], 5, key=3), PROMPTS[:2], strict=True):
+        assert_same_generation(actual, at(1)(prompt, 5, key=3))
+    assert not np.array_equal(at(5)(PROMPTS[0], 5, key=3).host().raw_log_probs,
+                              at(1)(PROMPTS[0], 5, key=3).host().raw_log_probs)
+    with pytest.raises(ValueError):
+        Server.from_task(at(None), slots=2, capacity=128).reload(params, Progress(jnp.asarray(1, jnp.int32)))
+
+
 @pytest.mark.mesh(devices=2)
 def test_a_meshless_server_draws_on_the_selected_default_device():
     """Weights and resident slots both follow a nonzero default device, so the server can compile

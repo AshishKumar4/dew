@@ -39,6 +39,7 @@ from dew._coordination import agreed, collective_host
 from dew._records import JSON, finite
 from dew.batch import Variables, thaw, token_id
 from dew.nn.inputs import key_seed, request_key
+from dew.nn.progress import Progress, progressed
 from dew.sampling.decoding import EndOfSequence, StopStrings
 from dew.sampling.text import Generation, Sampling
 
@@ -378,9 +379,14 @@ class NativeRolloutServer:
             return True
 
     def load(self, variables: Variables, version: int) -> None:
+        # A version is the updates the run committed (`Snapshot.updates`), which a model that reads the
+        # run's progress draws at (`Server.reload`).
+        at = Progress(jnp.asarray(version, jnp.int32))
+        progress = at if progressed(self._server.model, at) else None
+
         def loading() -> None:
             with self._loading:
-                self._server.reload(thaw(variables))
+                self._server.reload(thaw(variables), progress)
                 self._version = version
 
         self._engine.reload(loading)
