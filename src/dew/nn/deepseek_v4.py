@@ -54,8 +54,9 @@ from dew.mesh import LogicalAxes
 from dew.nn.attention import reference_attention
 from dew.nn.attention_masks import causal_attention_mask, visibility_mask
 from dew.nn.dense import Dense, DenseGeneral
-from dew.nn.documents import document_mask
+from dew.nn.documents import CrossDocuments, document_mask
 from dew.nn.fake_quant import FakeQuantizing
+from dew.nn.flops import cross_attention_flops, projection_flops
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of, counted_places
 from dew.nn.kv_cache import KVCache, KVStore, cache_positions, cached_validity, open_kv_cache, write_cache
 from dew.nn.mixer_base import ATTENTION_CONTEXT_RESIDUALS, MixerBase, MixerContext
@@ -794,25 +795,25 @@ class DeepseekV4Attention(FakeQuantizing):
         """The heads' queries of `x` `[B, S, width]`: the residual projected down to the query latent
         where `place` puts it (`down_projection`), normed, projected up and marked `q_proj` for a
         remat policy, split into heads, normed without a weight where the release does
-        (`query_norm`), and rotated by `cos` and `sin` on their trailing channels: the ordinary
-        forward's and DSpark's draft step's alike. Returns them with the normed query latent, which
-        a compressor's indexer reads."""
+        (`query_norm`), and rotated by `cos` and `sin` on their trailing channels (None for a read of
+        a context, which has no positions): the ordinary forward's and DSpark's draft step's alike.
+        Returns them with the normed query latent, which a compressor's indexer reads."""
         q_resid = constrain(self.q_a_norm(self.q_a_proj(constrain(x, place))), place)
         query = checkpoint_name(self.q_b_proj(constrain(q_resid, RESIDUAL)), 'q_proj').reshape(
             *x.shape[:2], self.num_heads, self.head_dim)
         if self.query_norm:
             query = unweighted_rmsnorm(query, self.norm_eps)
-        return _rotate_rope(query, cos, sin), q_resid
+        return (query if cos is None else _rotate_rope(query, cos, sin)), q_resid
 
     def _window_keys(self, x, cos, sin, place: LogicalAxes):
         """The shared key head, projected where `place` puts it and gathered
-        for the query heads the tensor axis splits."""
-        projected = constrain(self.kv_norm(self.kv_proj(constrain(x, place))), place)
-        keys = constrain(_rotate_rope(checkpoint_name(projected, 'kv_proj'), cos, sin), RESIDUAL)
+        for the query heads the tensor axis splits, rotated by `cos` and `sin` (None for a context's)."""
+        projected = checkpoint_name(constrain(self.kv_norm(self.kv_proj(constrain(x, place))), place),
+                                    'kv_proj')
+        keys = constrain(projected if cos is None else _rotate_rope(projected, cos, sin), RESIDUAL)
         return self.fp8(keys, 32) if self.kv_qat else keys
 
     def _attend(self, query, keys, values, allowed, cos, sin):
-        batch, length = query.shape[:2]
         # One shared key/value head under every query head, its logits in fp32 scaled after the
         # product, the per-head sink beside them, softmax in fp32 and the sink dropped (:708-736).
         # A quantized cache reads its keys and values back each as stored; otherwise they are one.
@@ -820,10 +821,75 @@ class DeepseekV4Attention(FakeQuantizing):
                                       sinks=self.sinks, precision=self.precision, wide_logits=True)
         # The values are the rotated keys, so the rope slice of the output is
         # turned back at the query's position (:853-859).
-        context = _rotate_rope(checkpoint_name(context, 'context'), cos, -sin)
+        return self._output(_rotate_rope(checkpoint_name(context, 'context'), cos, -sin))
+
+    def _output(self, context):
+        """The heads' context `[B, S, H, head_dim]` through the grouped output projection: each head
+        group's own `o_a_proj` block, then `o_b_proj` over them all."""
+        batch, length = context.shape[:2]
         grouped = jnp.moveaxis(context.reshape(batch, length, self.o_groups, -1), 2, 0)
         mixed = jnp.moveaxis(self.o_a_proj(grouped), 0, 2)
         return checkpoint_name(self.o_b_proj(mixed.reshape(batch, length, -1)), 'o_proj')
+
+    @property
+    def reads_context(self) -> bool:
+        """Whether it projects keys and values of its own to read a context with (`context_keys`): its
+        window's key head is its own (`kv_proj`) whatever its compressed entries share, so it always
+        does (`dew.nn.cross_attention.AttendsContext`)."""
+        return True
+
+    @nn.nowrap
+    def context_heads(self) -> tuple[int, int, int]:
+        """Its key heads' count and the widths of a key and a value head, as `context_keys` gives them:
+        the one shared head its values are too."""
+        return 1, self.head_dim, self.head_dim
+
+    def context_query(self, x):
+        """Its query heads over `x` `[B, S, E]` as it reads another sequence (`attend_context`): through
+        its query latent as its own call projects them, normed per head where the release does,
+        unrotated, a context having no positions; no output gate."""
+        query, _ = self._queries(x, None, None, RESIDUAL)
+        return query, None
+
+    def context_keys(self, context):
+        """Its shared key head over a context `[B, C, E]`, which its values are too: projected and
+        normed as its window's (`_window_keys`), unrotated, rounded as its cache rounds them. Its
+        compressor's entries summarize its own sequence, and read no context."""
+        keys = self._window_keys(context, None, None, RESIDUAL)
+        return keys[:, :, None], keys[:, :, None]
+
+    def attend_context(self, query, gate, key, value, *, lengths, queries=None, segments=None,
+                       max_segments=None, progress=None):
+        """Its attention of `query` heads (`context_query`) over a context's shared `key` and `value`
+        head (`context_keys`), each row's first `lengths` keys real (its first where it has none, whose
+        read its block leaves out) and, where given, each query reading its own document's keys alone
+        (`queries` `[B, S]`, `segments` `[B, C]`): its logits in float32 after the product, its per-head
+        sink beside them, unmasked by causality, then its grouped output projection (`_output`)."""
+        documents = None if queries is None or segments is None else CrossDocuments(queries, segments)
+        seen = visibility_mask(query.shape[1], key.shape[1], causal=False, sliding_window=None,
+                               segment_ids=documents, key_value_seq_lengths=jnp.maximum(lengths, 1))
+        context = reference_attention(query, key, value, mask=seen, sinks=self.sinks,
+                                      precision=self.precision, wide_logits=True)
+        return self._output(checkpoint_name(context, 'context'))
+
+    @nn.nowrap
+    def context_flops(self, lengths, context_lengths) -> float:
+        """Its read of a context's work over rows of `lengths` tokens reading `context_lengths`
+        (`attend_context`): its projections' (`context_projection_flops`) and the attention between them."""
+        return self.context_projection_flops(lengths, context_lengths) + cross_attention_flops(
+            lengths, context_lengths, self.num_heads, self.head_dim, self.head_dim)
+
+    @nn.nowrap
+    def context_projection_flops(self, lengths, context_lengths) -> float:
+        """The part of its read of a context done by its own matrices: the query latent's and the
+        grouped output projection's over the rows of `lengths` tokens, the key head's over the
+        context's `context_lengths`."""
+        width = self.num_heads * self.head_dim
+        rows = (projection_flops(lengths, self.emb_features, self.q_lora_rank)
+                + projection_flops(lengths, self.q_lora_rank, width)
+                + projection_flops(lengths, width, self.o_lora_rank)
+                + projection_flops(lengths, self.o_groups * self.o_lora_rank, self.emb_features))
+        return rows + projection_flops(context_lengths, self.emb_features, self.head_dim)
 
 
 DRAFT_CONTEXT = 'draft_context'
