@@ -7,6 +7,3 @@ alone and imports nothing."""
 LFM3 = ("LiquidAI/LFM3-1.7B", "40ebe0aa6662c9d40389c2f5d565b6a2c6aebacd",
         {"AutoConfig": "configuration_lfm3.Lfm3Config", "AutoModel": "modeling_lfm3.Lfm3Model",
          "AutoModelForCausalLM": "modeling_lfm3.Lfm3ForCausalLM"})
-MINIMAX_TEXT_01 = ("MiniMaxAI/MiniMax-Text-01", "a7351bf2bee0e1253919d349f1ad304e6dac13e9",
-                   {"AutoConfig": "configuration_minimax_text_01.MiniMaxText01Config",
-                    "AutoModelForCausalLM": "modeling_minimax_text_01.MiniMaxText01ForCausalLM"})

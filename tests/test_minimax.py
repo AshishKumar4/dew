@@ -1,19 +1,23 @@
 """MiniMax-Text-01 and MiniMax-M1 (ledger 850): tools/minimax_reference.py writes minimax-tiny from the
 release's own remote code, whose logits tests/test_hf_reference_decoders.py holds Dew's to; this file
-holds the family's own checks: both spellings of a release read as one model, the checkpoint writes back
-as it was read, and a config Dew would compute otherwise is refused. tests/test_mixers.py runs the
+holds the family's own checks: both spellings of a release read as one model, a model writes back as a
+`minimax` config where transformers computes it as Dew does and is refused where it would not, and a
+config Dew would compute otherwise is refused. tests/test_mixers.py runs the
 lightning layer among the registry's mixers."""
 
 import json
 from pathlib import Path
 
+import jax
 import numpy as np
 import pytest
-from interop_support import assert_reloads, assert_same_stored_tensors
+from reference_error import as_given, assert_as_exact
 
-from dew.interop import Pretrained, PretrainedDecoder, release_pins
+from dew.interop import Pretrained, PretrainedDecoder
 from dew.interop.hf_decoders import translate_config
 from dew.interop.sources import load_shards
+from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.registry import from_record
 
 ROOT = Path(__file__).parent / 'fixtures' / 'hf'
 TINY = ROOT / 'minimax-tiny'
@@ -37,39 +41,44 @@ def test_a_releases_own_config_and_its_transformers_config_read_as_one_model():
     assert len(set(lightning)) == len(lightning) == 70
 
 
-CODE = ('configuration_minimax_text_01.py', 'modeling_minimax_text_01.py')
-"""The release's own code, which an export writes beside it."""
-
-
-def test_the_checkpoint_writes_back_as_the_release_beside_its_own_code(tmp_path, monkeypatch):
-    """minimax-tiny writes back as the release's own config (`minimax_text_01`: its pattern as
-    `attn_type_list`, its factors as `layernorm_*`, its rotary's width) beside the release's own code,
-    which computes the partial rotary transformers' MiniMax drops, every tensor bit for bit under the
-    release's names (`block_sparse_moe`, `qkv_proj`, `output_gate`), and reloads to the same logits.
-    The code is read from the hub's cache, seeded at the release's commit from its pinned copies
-    (tools/minimax_reference.py --vendor)."""
-    import huggingface_hub.constants
-    from tool_support import load as tool
-
-    repo, revision, auto_map = release_pins.MINIMAX_TEXT_01
-    snapshot = tmp_path / 'hub' / f"models--{repo.replace('/', '--')}" / 'snapshots' / revision
-    snapshot.mkdir(parents=True)
-    code = {file: tool('fetched_fixtures').local(ROOT / 'minimax-text-01' / 'release' / file).read_bytes()
-            for file in CODE}
-    for file, data in code.items():
-        (snapshot / file).write_bytes(data)
-    monkeypatch.setattr(huggingface_hub.constants, 'HF_HUB_CACHE', str(tmp_path / 'hub'))
+def test_the_releases_geometry_writes_no_config_transformers_would_misread(tmp_path):
+    """minimax-tiny turns half of each head over six heads, as the releases turn half of each of 64,
+    which transformers' MiniMax does not compute (it turns every dimension, its slopes a power of two's):
+    its export is refused rather than written as a `minimax` config that would open as another model."""
     loaded = load()
-    export = tmp_path / 'export'
-    PretrainedDecoder.from_model(loaded.model, loaded.variables).save(export)
-    config, tiny = json.loads((export / 'config.json').read_text()), released('minimax-tiny')
-    assert (config['model_type'], config['auto_map']) == ('minimax_text_01', auto_map)
-    for field in ('attn_type_list', 'postnorm', 'rotary_dim', 'layernorm_full_attention_alpha',
-                  'layernorm_linear_attention_beta', 'layernorm_mlp_alpha', 'num_local_experts'):
-        assert config[field] == tiny[field], field
-    assert {file: (export / file).read_bytes() for file in CODE} == code
-    assert_same_stored_tensors(load_shards(export), load_shards(TINY))
-    assert_reloads(loaded, export, np.load(TINY / 'input_ids.npy'))
+    with pytest.raises(ValueError):
+        PretrainedDecoder.from_model(loaded.model, loaded.variables).save(tmp_path)
+
+
+EXPORT_SEEDS = 8
+"""The export's declared draws of ids against transformers' MiniMax read of it (check 1), sized by
+`seeds_for` paired with Dew's logits on the CPU."""
+
+
+def test_a_model_transformers_computes_writes_back_as_minimax_and_reads_on_par(tmp_path):
+    """A MiniMax of four heads turning every dimension, minimax-tiny's config otherwise, at Dew's own
+    initialization, writes back as a `minimax` config with every tensor under the releases' names
+    (`block_sparse_moe`, `qkv_proj`, `output_gate`), which transformers' MiniMaxForCausalLM reads on par
+    with Dew from its float64 forward over drawn ids (check 1)."""
+    from tools.decoder_export_reference import Case, reference_logits
+
+    config = {**released('minimax-tiny'), 'num_attention_heads': 4, 'rotary_dim': 8}
+    model = from_record(CausalTransformer, {**translate_config(config), 'attention_impl': 'reference'})
+    ids = np.load(TINY / 'input_ids.npy')
+    variables = model.init(jax.random.key(0), ids)
+    PretrainedDecoder.from_model(model, variables).save(tmp_path)
+    assert json.loads((tmp_path / 'config.json').read_text())['model_type'] == 'minimax'
+    assert set(load_shards(tmp_path)) == set(load_shards(TINY))
+    case = Case('minimax', 'minimax-tiny')
+
+    def draw(seed):
+        return (np.random.default_rng(seed).integers(0, config['vocab_size'], ids.shape).astype(np.int32),)
+
+    def read(wide):
+        return as_given(lambda ids: reference_logits(case, tmp_path, np.asarray(ids), wide=wide))
+
+    assert_as_exact(lambda ids: model.apply(variables, ids), read(wide=False), draw, 'MiniMax export',
+                    seeds=EXPORT_SEEDS, truth_fn=read(wide=True))
 
 
 @pytest.mark.parametrize('field, value', [('mlp_alpha_factor', 2.0), ('shared_intermediate_size', 8),

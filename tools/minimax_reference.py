@@ -14,9 +14,6 @@ read (its blocks are 256 tokens, :51), runs Dew's recurrence in chunks of 4. `--
 instead its unpadded and left-padded logits over check 1's seeds (`recorded_references.record_logits`),
 as recorded_logits.npz there, which the tests read where the remote code cannot run. minimax-text-01
 and minimax-text-01-hf pin the released config in the release's own spelling and in transformers'.
-`--vendor` pins the release's two code files under minimax-text-01/release/ at the release's own repo
-and commit (`fetched_fixtures.pin_release(origin=True)`), which `fetch` reads from there, so the test
-of an export, which writes them beside it (`DecoderFamily.release_code`), reads them offline.
 
 Three things of transformers 5 and of a CPU stand in for what the remote code was written against,
 and one mends its padded rows: transformers 5 removed `is_torch_fx_available`, which the module
@@ -178,20 +175,6 @@ def write_recording(configuration, modeling) -> None:
                   padded={'attention_mask': mask, 'position_ids': np.maximum(np.cumsum(mask, -1) - 1, 0)})
 
 
-CODE = ('configuration_minimax_text_01.py', 'modeling_minimax_text_01.py')
-"""The release's own code an export writes beside it (`release_pins.MINIMAX_TEXT_01`)."""
-
-
-def vendor() -> None:
-    """The release's code files, pinned at its own repo and commit under minimax-text-01/release/."""
-    from fetched_fixtures import pin_release
-
-    for file in CODE:
-        print(pin_release(FIXTURES / 'minimax-text-01' / 'release' / file,
-                          Path(hf_hub_download(REPO, file, revision=REVISION)).read_bytes(),
-                          reference=f'{REPO}@{REVISION}/{file}', license='mit', origin=True), flush=True)
-
-
 def write_released() -> None:
     for name, (repo, revision) in RELEASES.items():
         directory = FIXTURES / name
@@ -203,8 +186,6 @@ def write_released() -> None:
 if __name__ == '__main__':
     if sys.argv[1:] == ['--recording']:
         write_recording(*remote())
-    elif sys.argv[1:] == ['--vendor']:
-        vendor()
     else:
         write_tiny(*remote())
         write_released()
