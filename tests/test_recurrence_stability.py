@@ -33,6 +33,7 @@ import numpy as np
 import pytest
 from reference_error import assert_as_exact, widened, with_gradients
 from test_recurrence_chunk import CHUNK, KEY_WIDTH, VALUE_HEADS, chunk_on, draw, token_by_token
+from whole_suite import timed
 
 from dew.nn.kernels import generation, recurrence
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk
@@ -359,14 +360,12 @@ its kernels, whose compilers fuse and round its arithmetic as the CPU's do not (
 dimension under the regimes its chunked forms break hardest."""
 
 
-WHOLE_SUITE_GRADIENTS = {('rated', 'a fading memory'): 246}
+PAST_TARGET = {"gradient": {('rated', 'a fading memory'): 246}}
 """The gradient's cases whose draws take a group past its two minutes (seconds, train 270's CI on
-f58abb8a3, ledger 2125), which the whole suite runs."""
+f58abb8a3, ledger 2125), which the whole suite runs (`timed`)."""
 
 
-@pytest.mark.parametrize('name, regime', [
-    pytest.param(*case.values, id=case.id, marks=(*case.marks, pytest.mark.whole_suite))
-    if tuple(case.values) in WHOLE_SUITE_GRADIENTS else case for case in CASES + ACCELERATED])
+@pytest.mark.parametrize('name, regime', timed(PAST_TARGET, "gradient", CASES + ACCELERATED))
 def test_the_chunked_ops_gradient_is_as_exact_as_the_recurrences(name, regime):
     """The portable math's gradient finite wherever the reference's in float64 is, and on par with the
     token-by-token recurrence's from float64 (check 1) over the site's declared seeds."""

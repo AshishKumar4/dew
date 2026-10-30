@@ -6,6 +6,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
+from ..dex import HeadOutputs
 from ..mixers import AttentionMixer
 from ..mixers.mamba2 import Mamba2Mixer
 from ..mixers.mlp import MLPMixer
@@ -232,6 +233,8 @@ def refuse_unbuildable(model: CausalTransformer, kinds: Mapping[str, ResolvedKin
             "copies through the layers, so a model has one or the other")
     _streams(model)
     _cross_attention(model)
+    _dex(model)
+    _embedding_width(model)
     if model.swiglu_limit is not None and model.swiglu_limit <= 0:
         raise ValueError(
             f"swiglu_limit caps the gate and up projections, so it is positive, "
@@ -241,6 +244,39 @@ def refuse_unbuildable(model: CausalTransformer, kinds: Mapping[str, ResolvedKin
         raise ValueError(
             f"mask_token_id names a vocabulary id, got {mask!r}; None is a "
             "model trained on plain next-token prediction")
+
+def _embedding_width(model: CausalTransformer):
+    """Raise `ValueError` where an embedding of its own width (`embedding_features`) meets what reads the
+    token embedding at the stream's: a prediction depth or an encoded context. A head transform and a
+    continuum level read the stream before `project_out`, and take it."""
+    beside = [name for name, held in (("num_nextn_predict_layers", model.num_nextn_predict_layers),
+                                      ("cross_attention", model.cross_attention)) if held]
+    if model.embedding_features is not None and beside:
+        raise ValueError(f"embedding_features projects the embedding in and out of the stream, which "
+                         f"{', '.join(beside)} would read at the stream's width")
+
+
+def softmax_attention_layers(model: CausalTransformer) -> frozenset[int]:
+    """`model`'s layers whose mixer's heads' outputs DEX extends (`dew.nn.dex.HeadOutputs`, softmax
+    attention), by index: those it extends and its recipe trains the projections of."""
+    return frozenset(index for index in range(model.num_layers)
+                     if isinstance(model.mixer_of(index), HeadOutputs))
+
+
+def _dex(model: CausalTransformer):
+    """Raise `ValueError` where DEX names a layer this model lacks or one whose mixer is no softmax
+    attention, which takes no differential (`softmax_attention_layers`)."""
+    if model.dex is None:
+        return
+    named = {layer for layer, _ in model.dex.layers}
+    outside = sorted(named - set(range(model.num_layers)))
+    if outside:
+        raise ValueError(f"DEX layers {outside} are outside the {model.num_layers} layers")
+    other = sorted(named - softmax_attention_layers(model))
+    if other:
+        raise ValueError(f"DEX names layers {other}, whose mixers are no softmax attention; it extends a "
+                         "softmax attention layer's heads")
+
 
 def _cross_attention(model: CausalTransformer):
     """Raise `ValueError` where `cross_attention` names a layer this model lacks, or one whose block

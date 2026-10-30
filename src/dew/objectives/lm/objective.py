@@ -45,6 +45,8 @@ from dew.batch import (
     BLOCKS_FIELD,
     COORDINATES_FIELD,
     FROZEN,
+    POSITIONS_FIELD,
+    SEGMENTS_FIELD,
     TEXT_KEY,
     VALID_ROWS,
     Batch,
@@ -262,7 +264,7 @@ def _prepared(tokens: ModelInputs | jax.Array, segment_ids: jax.Array | None = N
     the packing off what this returns (`dew.batch.token_layout`).
     """
     prepared = tokens if isinstance(tokens, ModelInputs) else ModelInputs(jnp.asarray(tokens, jnp.int32))
-    columns = {name: column for name, column in (("positions", positions), ("segment_ids", segment_ids),
+    columns = {name: column for name, column in ((POSITIONS_FIELD, positions), (SEGMENTS_FIELD, segment_ids),
                                                  (COORDINATES_FIELD, coordinates),
                                                  (BLOCKS_FIELD, block_groups))
                if column is not None}
@@ -344,7 +346,7 @@ def prefixed_fields(fields: Mapping[str, jax.Array | Coordinates], shape: tuple[
         raise ValueError(f"a prompt prefix run reads each row's roles ({ROLES_KEY}) to find its "
                          "prompt, and this batch has none")
     laid = fields.get(COORDINATES_FIELD)
-    positions = laid.positions if isinstance(laid, Coordinates) else fields.get("positions")
+    positions = laid.positions if isinstance(laid, Coordinates) else fields.get(POSITIONS_FIELD)
     groups = prefix_groups(xp.ones(shape, xp.int32) if documents is None else documents, real, prefix,
                            positions=positions, roles=roles, assistant=Role.ASSISTANT, xp=xp)
     return {**fields, BLOCKS_FIELD: groups}
@@ -624,10 +626,12 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         if self._trains_cross_attention_alone(model):
             if self.mtp_weight:
                 raise MissingFlopsCount("a frozen trunk's prediction depths have no frozen training count")
-            # Every trunk and head matrix frozen: its forward and its input's gradient, no weight's.
+            # Every trunk and head matrix frozen: its forward and its input's gradient, no weight's; so
+            # too a block's reads through its layer's own matrices (`CrossBlocks.held_flops`).
             trunk, head = counted_flops(model, lengths), model.logits_flops(targets)
             return (frozen_training_flops(trunk, parameter_flops(model, lengths))
-                    + frozen_training_flops(head, head) + 3 * crossed)
+                    + frozen_training_flops(head, head)
+                    + frozen_training_flops(crossed, self._context_flops(model, batch, held=True)))
         if not isinstance(model, CountedLogitsTraining):
             return super().training_flops(model, batch)
         # Every cross-attention matrix trains: its forward, its input's gradient and its own.
@@ -669,11 +673,11 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
             return False
         return crosses_alone(held["params"])
 
-    def _context_flops(self, model, batch: Batch) -> float:
+    def _context_flops(self, model, batch: Batch, held: bool = False) -> float:
         """The forward work of the cross-attention blocks over the batch's context
-        (`CrossAttending.cross_flops`), each row's real tokens reading its context's;
-        none without conditioning. Media needs its own count, which raises
-        `MissingFlopsCount`."""
+        (`CrossAttending.cross_flops`), each row's real tokens reading its context's, or with `held`
+        the part of it done by the decoder's own matrices (`held_cross_flops`); none without
+        conditioning. Media needs its own count, which raises `MissingFlopsCount`."""
         raw = batch[TEXT_KEY]
         conditioning = raw.conditioning if isinstance(raw, ModelInputs) else {}
         if not conditioning:
@@ -686,7 +690,8 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         lengths = conditioning.get(CONTEXT_LENGTHS)
         lengths = (np.full(context.shape[:1], context.shape[1]) if lengths is None
                    else np.asarray(lengths)).astype(np.int64)
-        return float(model.cross_flops(np.sum(valid[:, :-1], axis=-1, dtype=np.int64), lengths))
+        counted = model.held_cross_flops if held else model.cross_flops
+        return float(counted(np.sum(valid[:, :-1], axis=-1, dtype=np.int64), lengths))
 
     def _prediction_lengths(self, batch: Batch, depth: int = 0) -> np.ndarray:
         """Each row's targets the loss scores at `depth` (`scored_targets`)."""

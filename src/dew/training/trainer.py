@@ -87,6 +87,7 @@ from dew.nn.kernels import tuning
 from dew.nn.kernels.generation import assumed, backend, chosen_kernel, gpu_mesh, gpu_target
 from dew.nn.kernels.options import compiler_options
 from dew.nn.precision import at_least_fp32
+from dew.nn.progress import training
 from dew.nn.sharding import (
     Link,
     Schedule,
@@ -134,7 +135,7 @@ from dew.training._fit import (
     unrecorded_parts,
     waited_read,
 )
-from dew.training._lowering import Lowered, Routed, routed
+from dew.training._lowering import KernelReport, Lowered, Routed, routed
 from dew.training.budget import Pause, Plateau
 from dew.training.cooldown import Cooldowns, Pending, check_branches, decay, resolved, schedule_ended
 from dew.training.display import TRAINER_SHOWN, TrainingDisplay, goodput
@@ -482,8 +483,7 @@ class Trainer(Generic[Loss, Effects]):
         """The axes the objective's modules box on their own parameters
         (`nn.with_logical_partitioning`), which its init returns and the state
         unboxes: what `initial_state` last traced, else one abstract init, for
-        a state the trainer did not build. A checkpoint records them for its
-        restore."""
+        a state the trainer did not build. A checkpoint records them for its restore."""
         if self._boxed is None:
             self._boxed = boxed_axes(jax.eval_shape(self.objective.initializer, jax.random.key(0)))
         return self._boxed
@@ -854,20 +854,18 @@ class Trainer(Generic[Loss, Effects]):
         return dataclasses.replace(state, accumulation=pending)
 
     @functools.cached_property
-    def _ahead_links(self) -> dict[str, float | None]:
-        """The figures the step compiled ahead traced with (`AheadOfTime.links`), at the run's first trace."""
-        return {} if self._ahead is None else self._ahead.links
+    def _ahead_links(self) -> dict[str, Link]:
+        """The links the step compiled ahead traced with, at the run's first trace (`AheadOfTime.over`)."""
+        return {} if self._ahead is None else self._ahead.over(self._stated_links)
 
     def _links(self, mesh: Mesh) -> dict[str, Link]:
-        """The links of `mesh`'s tensor and sequence axes, those it splits,
-        for one trace. Every process lists the mesh's devices alike and
-        `link_bandwidth` agrees one figure across the pool, so every process
-        decides alike and compiles the same program. The peak is the fastest
-        device's, on which the FLOPs a spread saves take the least time. Each
-        axis's bandwidth is measured once per mesh, and not at all for a
-        device the peak table does not name (a CPU's among them), where it
-        decides nothing, or over a compile-only GPU (`dew.training.ahead`), which no process holds to
-        measure; a link the run states (`links`) as stated, unless a step compiled ahead holds its own."""
+        """The links of `mesh`'s tensor and sequence axes, those it splits, for one trace. Every process
+        lists the mesh's devices alike and `link_bandwidth` agrees one figure across the pool, so every
+        process decides alike and compiles the same program. The peak is the fastest device's, on which
+        the FLOPs a spread saves take the least time. Each axis's bandwidth is measured once per mesh, and
+        not at all for a device the peak table does not name (a CPU's among them), where it decides
+        nothing, or over a compile-only GPU (`dew.training.ahead`), which no process holds to measure; a
+        stated link (`links`) as stated, a step compiled ahead's over it (`AheadOfTime.over`)."""
         devices = list(mesh.devices.flat)
         peaks = [peak for device in devices if (peak := gpu_target(device.device_kind).bf16_peak) is not None]
         peak = max(peaks) if len(peaks) == len(devices) else None
@@ -875,16 +873,17 @@ class Trainer(Generic[Loss, Effects]):
         for axis in (TENSOR_AXIS, SEQUENCE_AXIS):
             if mesh.shape.get(axis, 1) == 1:
                 continue
-            if axis in self._stated_links and axis not in self._ahead_links:
-                stated = self._stated_links[axis]
+            stated = self._ahead_links.get(axis, self._stated_links.get(axis))
+            if stated is not None:
                 links[axis] = Link(stated.bytes_per_second, stated.flops_per_second)
+                self._bandwidths[mesh, axis] = stated.bytes_per_second
                 continue
             if not all(device in jax.devices() for device in devices):
                 links[axis] = Link(None, peak)
                 continue
             if (mesh, axis) not in self._bandwidths:
                 self._bandwidths[mesh, axis] = None if peak is None else link_figure(
-                    mesh, axis, self._ahead_links, self._resumed_links)
+                    mesh, axis, self._resumed_links)
             links[axis] = Link(self._bandwidths[mesh, axis], peak)
         return links
 
@@ -913,7 +912,7 @@ class Trainer(Generic[Loss, Effects]):
         def run(current, batch, part, tokens):
             advanced, loss, aux = custom(current, batch)
             return advanced, loss, aux, None
-        return run
+        return training(run)
 
     @ruled
     def compile(self, state: TrainState, batch: Batch, trials: Trials | None = None, *,
@@ -1034,10 +1033,10 @@ class Trainer(Generic[Loss, Effects]):
         placement = batch_shardings(mesh, batch)
         candidates = splits(self._rows, batch, mesh, self.microbatches, self._split)
 
-        def lower(split: int, narrow: bool) -> Candidate:
+        def lower(split: int, narrow: bool, lowering: bool = True) -> Candidate:
             rung = {**self._rung(), 'narrow': narrow, 'split': split}
             return self._candidate(state, batch, schedule, placement, replicated, split, narrow,
-                                   recorded_launches(recorded, rung))
+                                   recorded_launches(recorded, rung), lowering=lowering)
 
         # Read before anything traces, so a recorded rung is the first one lowered.
         record_path, key, recorded = recorded_rung(self.objective.program_key(), (state, batch), candidates,
@@ -1053,9 +1052,9 @@ class Trainer(Generic[Loss, Effects]):
         search = FitSearch(
             lower, lambda candidate: step_options(self.objective, candidate.micro,
                                                   candidate.prepared.variables, mesh),
-            self.objective, mesh, self._xla_defaults, self._narrow,
-            None if self._base_rung is None else self._base_rung[1], resumed, ahead=self._ahead,
-            capacity=capacity)
+            self.objective, mesh, self._xla_defaults, self._narrow, None if self._base_rung is None
+            else self._base_rung[1], resumed, ahead=self._ahead, capacity=capacity,
+            derive=None if recorded is not None else functools.partial(lower, lowering=False))
         planned, probes = search.admitted(
             candidates, candidates.index(first) if isinstance(first, int) and first in candidates else 0)
         # Consume the artifact only after its program was accepted; a refusal leaves it pending.
@@ -1074,44 +1073,52 @@ class Trainer(Generic[Loss, Effects]):
         flops, counted = plan_flops(recorded, planned.executable)
         if record_path is not None:
             keep_rung(record_path, key, {**chosen, 'flops': counted, 'launches': planned.candidate.launches})
-        self.plan = settled(planned, probes)
+        self.plan = settled(planned, probes, search.derived)
         search.told(planned)
         if planned.split != candidates[0]:
             _log.info("the step fits the devices in the plan %s", self.plan)
         return planned, flops
 
     def _candidate(self, state: TrainState, batch: Batch, schedule: Schedule, placement, replicated,
-                   split: int, narrow: bool, launches: str | None) -> Candidate:
-        """The step reading `batch` in `split` microbatches, lowered at the
-        objective's current rung, with what the fit check holds beside it.
-        `launches` are its kernel launches where a record holds them, which
-        settle their configs before it lowers; otherwise, or where the run
-        measures configs (`tune_kernels`), its lowering records them (`tune`)."""
+                   split: int, narrow: bool | None, launches: str | None, lowering: bool = True, *,
+                   mesh: Mesh | AbstractMesh | None = None, platforms: tuple[str, ...] | None = None
+                   ) -> Candidate:
+        """The step reading `batch` in `split` microbatches, lowered at the objective's current rung (traced
+        alone where not `lowering`, for its derived footprint), with what the fit check holds beside it.
+        `launches` are its kernel launches where a record holds them, which settle their configs before it
+        lowers; otherwise, or where the run measures configs (`tune_kernels`), its lowering records them
+        (`tune`). `mesh` and `platforms` lower it for other devices, untuned (`_lowered_for`)."""
         micro = microbatch_shapes(batch, split)
         shapes, copies, prepared = self._prepared(state, micro, schedule, split * self.accumulation, narrow)
         shardings = self.shardings(prepared)
+        if mesh is not None:
+            shardings = jax.tree.map(lambda s: NamedSharding(mesh, s.spec, memory_kind=s.memory_kind),
+                                     shardings)
         prepared = placed_shapes(prepared, shardings)
         # The check reads the state's arguments as already on the devices. The copies and accumulators
         # `run` builds on the first call are not yet, so they count with the prefetched batches beside
         # the step, a ramp stage's window too, which `run` builds beside the last, already resident.
         last = state.accumulation
         rebuilt = last is not None and not last.replays(prepared.accumulation)
-        built = placed_bytes([field for field, kept in ((prepared.compute, state.compute),
-                                                         (prepared.accumulation, None if rebuilt else last))
-                              if kept is None and field is not None])
-        held = prefetched_bytes(batch, placement, self._prefetch) + built
+        # A step lowered for other devices is checked against none of this process's.
+        built = 0 if mesh is not None else placed_bytes([field for field, kept in (
+            (prepared.compute, state.compute), (prepared.accumulation, None if rebuilt else last))
+            if kept is None and field is not None])
+        held = 0 if mesh is not None else prefetched_bytes(batch, placement, self._prefetch) + built
         jitted = self._jitted(shapes, copies, shardings, placement, replicated, split)
         part = jax.ShapeDtypeStruct((), jnp.int32, sharding=replicated)
-        lower = Routed(functools.partial(jitted.lower, *apart(prepared), batch, part))
-        if self.tune_kernels:
+        lower = Routed(functools.partial(
+            lambda *arguments: jitted.trace(*arguments).lower(lowering_platforms=platforms),
+            *apart(prepared), placed_shapes(batch, placement) if mesh is not None else batch, part))
+        if self.tune_kernels and lowering and platforms is None:
             lowered, launches = tuning.tune(lower, measure=True)
         else:
             # The tuner is off (bible §6): each launch takes its derived config, nothing settled or read.
-            lowered, launches = lower(), launches or "[]"
-        footprint = None if self.step is not None else candidate_footprint(
+            lowered, launches = lower() if lowering else None, launches or "[]"
+        footprint = None if self.step is not None or mesh is not None else candidate_footprint(
             self.objective, self._model_shapes(micro), split * self.accumulation, prepared, held)
         return Candidate(micro, shapes, copies, shardings, prepared, held, built, lowered, launches,
-                         lower.report(), footprint)
+                         lower.report() if lowering else KernelReport((), ()), footprint)
 
     def _prepared(self, state: TrainState, batch: Batch, schedule: Schedule, window: int,
                   narrow: bool | None = None):
@@ -1172,16 +1179,9 @@ class Trainer(Generic[Loss, Effects]):
         with assumed(generation), self._traced_on(mesh) as schedule:
             state, batch = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), (state, batch))
             split = splits(self._rows, batch, mesh, self.microbatches, self._split)[0]
-            placement = batch_shardings(mesh, batch)
-            replicated = NamedSharding(mesh, P())
-            micro = microbatch_shapes(batch, split)
-            shapes, copies, prepared = self._prepared(state, micro, schedule, split * self.accumulation)
-            shardings = jax.tree.map(lambda s: NamedSharding(mesh, s.spec, memory_kind=s.memory_kind),
-                                     self.shardings(prepared))
-            jitted = self._jitted(shapes, copies, shardings, placement, replicated, split)
-            traced = jitted.trace(*apart(placed_shapes(prepared, shardings)), placed_shapes(batch, placement),
-                                  jax.ShapeDtypeStruct((), jnp.int32, sharding=replicated))
-            return traced.lower(lowering_platforms=('cuda',))
+            placement, replicated = batch_shardings(mesh, batch), NamedSharding(mesh, P())
+            return self._candidate(state, batch, schedule, placement, replicated, split, None, None,
+                                   mesh=mesh, platforms=('cuda',)).lowered
 
     def _narrow_copies(self, state: TrainState, batch: Batch) -> dict:
         """The parameters the step reads through narrow copies
