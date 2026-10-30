@@ -370,6 +370,42 @@ def mixed_terms(x, w):
     return {"rows": np.sqrt(np.square(sizes) @ np.square(MIX.astype(np.float64)))}
 
 
+def a_product_draw(seed):
+    """A [16, 64] by [64, 8] fp32 product's operands."""
+    rng = np.random.default_rng([2641, seed])
+    return (jnp.asarray(rng.standard_normal((16, 64)), jnp.float32),
+            jnp.asarray(rng.standard_normal((64, 8)), jnp.float32))
+
+
+def test_check_1_refuses_a_draw_its_seed_does_not_fix_and_an_arm_of_more_than_its_inputs():
+    """Planted controls (ledger 2641): a draw from a generator its seed does not fix, and an arm drawing a
+    noise of its own, each compare draws no seed pairs, and check 1 refuses both before judging them
+    (`UnpairedDraw`); a planted non-finite entry in Dew's arm fails it."""
+    from reference_error import UnpairedDraw
+
+    unseeded = np.random.default_rng()
+
+    def unfixed_draw(seed):
+        x, w = a_product_draw(seed)
+        return x + jnp.asarray(unseeded.standard_normal(x.shape) * 1e-3, jnp.float32), w
+
+    with pytest.raises(UnpairedDraw):
+        assert_as_exact(jnp.matmul, jnp.matmul, unfixed_draw, "a draw its seed does not fix", seeds=16)
+    noise = iter(range(10**6))
+
+    def noisy(x, w):
+        return x @ w + 1e-6 * jax.random.normal(jax.random.key(next(noise)), (16, 8))
+
+    with pytest.raises(UnpairedDraw):
+        assert_as_exact(as_given(noisy), jnp.matmul, a_product_draw, "an arm of its own noise", seeds=16)
+
+    def planted(x, w):
+        return (x @ w).at[3, 5].set(jnp.nan)
+
+    with pytest.raises(GateFailure):
+        assert_as_exact(planted, jnp.matmul, a_product_draw, "a planted non-finite entry", seeds=16)
+
+
 def test_check_1_sizes_rows_by_their_terms_beside_an_output_held_as_none():
     """Term sizing reads a truth's terms by the truth's own structure (`_term_leaves`): an output held as
     None (a gradient of an input given as None, as `with_gradients` returns one) takes no leaf of the

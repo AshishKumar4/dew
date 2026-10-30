@@ -1166,6 +1166,41 @@ def _summaries(references, held: _LaidTruths) -> list[RecordedLeaf | None]:
     return summaries
 
 
+class UnpairedDraw(AssertionError):
+    """A check's draw or arm that depends on more than its seed or its inputs (`_of_its_seed`,
+    `_of_its_inputs`): randomness of its own, or state a call left, so its arms compare draws no seed
+    pairs."""
+
+
+def _same_bits(one, other) -> str | None:
+    """The first leaf path at which `one` and `other` differ in structure, shape or bits, or None."""
+    if jax.tree.structure(one) != jax.tree.structure(other):
+        return "its structure"
+    for (path, first), second in zip(jax.tree_util.tree_leaves_with_path(one), jax.tree.leaves(other),
+                                     strict=True):
+        first, second = np.asarray(first), np.asarray(second)
+        if first.shape != second.shape or first.dtype != second.dtype or first.tobytes() != second.tobytes():
+            return jax.tree_util.keystr(path) or "its value"
+    return None
+
+
+def _of_its_seed(label: str, draw, seed, inputs) -> None:
+    """Raise unless `draw` gives `inputs` again at `seed`: a draw of a randomness its seed does not fix (a
+    global generator) gives each run of a site other inputs (ledger 2641)."""
+    if (where := _same_bits(inputs, draw(seed))) is not None:
+        raise UnpairedDraw(f"{label}: the draw at seed {seed} differs at {where} drawn again, so its seed "
+                           f"does not fix it")
+
+
+def _of_its_inputs(label: str, name: str, fn, inputs, first) -> None:
+    """Raise unless `fn`, `name` of a check's arms, gives `first` again on the same `inputs`: an arm that
+    draws a noise of its own, or reads state its last call left, compares Dew with a reference on draws no
+    seed pairs (ledger 2641)."""
+    if (where := _same_bits(first, fn(*inputs))) is not None:
+        raise UnpairedDraw(f"{label}: {name} differs at {where} run again on the same inputs, so its output "
+                           f"depends on more than them")
+
+
 def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=None, orders=None,
            library_fn=None, library_leaves: Sequence[str] = (), also: Sequence = (), terms_fn=None,
            label: str = ""):
@@ -1210,6 +1245,8 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
         """Every arm's evidence on the draw at `seed`, the `at`th, its orders' worst rows the larger."""
         nonlocal names, widths
         inputs = draw(seed)
+        if not at:
+            _of_its_seed(label, draw, seed, inputs)
         # The site's arms' mode, decided on its first draw's inputs before any arm runs, no draw of its own.
         _ynn_decided(label, [dew_fn, *arms], inputs)
         truth, terms = truth_and_terms(inputs)
@@ -1227,6 +1264,8 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
         rows = [None for _ in arms]
         for mine_at, theirs_at in ordered:
             dew = dew_fn(*mine_at)
+            if not at and mine_at is ordered[0][0]:
+                _of_its_inputs(label, "Dew's arm", dew_fn, mine_at, dew)
             names = names or [jax.tree_util.keystr(path)
                               for path, _ in jax.tree_util.tree_leaves_with_path(dew)]
             widths = widths or tuple(int(np.shape(leaf)[-1]) if np.ndim(leaf) >= 2 else 0
@@ -1239,6 +1278,8 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
                 here, true_here, terms_here = ((theirs_at, their_truth, their_terms) if arm is reference_fn
                                                else (mine_at, truth, terms))
                 other = dew if dew_fn is arm and here is mine_at else arm(*here)
+                if not at and arm is reference_fn and arm is not dew_fn and here is ordered[0][1]:
+                    _of_its_inputs(label, "the reference", arm, here, other)
                 evidence = _evidence(prepared, other, true_here, shared=true_here is truth,
                                      their_terms=terms_here)
                 rows[at_arm] = evidence if rows[at_arm] is None else [
