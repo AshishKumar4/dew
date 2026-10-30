@@ -2317,12 +2317,24 @@ class Averaged:
 
 def averaged(runs: Sequence[str | os.PathLike[str]], *, step: int | str | None = None,
              ema: bool | None = None, mesh=None, layout=None, trust: Sequence[str] = ()) -> Averaged:
-    """The fp32 mean of `runs`' effective weights, each run's at `step` (its latest where None, pinned
-    as `SavedRun.pinned` pins it, with `trust`) and `ema` as its loaders read them (`averaged_pinned`)."""
+    """The fp32 mean of `runs`' effective weights, each run's at `step` (`averaged_runs`) and `ema` as
+    its loaders read them (`averaged_pinned`)."""
+    return averaged_pinned(averaged_runs(runs, step, trust), ema=ema, mesh=mesh, layout=layout)
+
+
+def averaged_runs(runs: Sequence[str | os.PathLike[str]], step: int | str | None = None,
+                  trust: Sequence[str] = ()) -> list[SavedRun]:
+    """`runs` as an average reads them: each pinned at `step` (`SavedRun.pinned`, with `trust`), its
+    latest where None, whatever step its task loads by default."""
     from dew.inference.tasks import SavedRun
 
-    return averaged_pinned([SavedRun.pinned(str(epath.Path(run)), step, trust) for run in runs], ema=ema,
-                           mesh=mesh, layout=layout)
+    pinned = []
+    for run in runs:
+        directory = str(epath.Path(run))
+        with Checkpoints(directory) as checkpoints:
+            chosen = checkpoints.pinned(step)
+        pinned.append(SavedRun.pinned(directory, chosen, trust))
+    return pinned
 
 
 def averaged_pinned(runs: Sequence[SavedRun], *, ema: bool | None = None, mesh=None, layout=None) -> Averaged:
