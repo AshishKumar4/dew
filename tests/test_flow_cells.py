@@ -78,3 +78,57 @@ def test_a_flow_reports_its_counts_once_however_its_cells_nest():
         {"passed": 1, "failed": 0, "skipped": 1}, {"passed": 0, "failed": 0, "skipped": 1}]
     gpu_flow.REPORTED.clear()
 
+
+def test_a_cell_failing_by_pytests_own_failures_ends_no_flow_and_is_counted():
+    """A cell's `pytest.fail`, and a `pytest.raises` that saw nothing, are its failures (they derive from
+    BaseException): each is kept and raised with the rest, the cells after it still run, and the flow's
+    counts are reported (`gpu_flow.REPORTED`) however it ends."""
+    ran = []
+
+    def unraised():
+        with pytest.raises(ValueError):
+            ran.append("unraised")
+
+    gpu_flow.REPORTED.clear()
+    with pytest.raises(CellsFailed) as raised:
+        run_cells([Cell("failed", lambda: pytest.fail("its pool never ended")), Cell("unraised", unraised),
+                   Cell("after", lambda: ran.append("after"))])
+    assert raised.value.labels == ["failed", "unraised"] and ran == ["unraised", "after"]
+    assert [{key: run[key] for key in ("passed", "failed", "skipped")} for run in gpu_flow.REPORTED] == [
+        {"passed": 1, "failed": 2, "skipped": 0}]
+    gpu_flow.REPORTED.clear()
+
+
+def test_a_repeated_step_holds_its_bits_and_a_changed_one_fails():
+    """`gpu_flow.repeats_bit_for_bit`: a step that gives the same bits each run passes, compiled afresh after
+    its first; one whose bits change between runs fails, naming its leaf."""
+    import jax.numpy as jnp
+
+    gpu_flow.repeats_bit_for_bit(lambda x: {"sum": x + 1, "product": x * 2}, jnp.arange(4.0), runs=3)
+    counter = iter(range(10))
+
+    def drifting(x):
+        return {"drift": x + next(counter) * 1e-6}
+
+    with pytest.raises(AssertionError, match="drift"):
+        gpu_flow.repeats_bit_for_bit(drifting, jnp.arange(4.0))
+
+
+def test_an_isolated_cell_takes_its_own_directory_and_the_suites_per_test_settings(tmp_path_factory):
+    """`gpu_flow.isolated`: a cell runs in a directory of its own, with its own rung records, data cache and
+    Hub answers beneath it, the fixtures it names passed, and each setting undone after it."""
+    import os
+
+    seen = {}
+
+    def check(tmp_path, monkeypatch):
+        seen.update(directory=tmp_path, rungs=os.environ["DEW_RUNG_RECORDS"],
+                    cache=os.environ["DEW_DATA_CACHE"], answers=os.environ["DEW_HUB_ANSWERS"],
+                    patch=monkeypatch)
+
+    before = os.environ.get("DEW_RUNG_RECORDS")
+    gpu_flow.isolated(tmp_path_factory)(check, "own")()
+    directory = seen["directory"]
+    assert seen["rungs"] == str(directory / "rungs") and seen["cache"] == str(directory / "data-cache")
+    assert seen["answers"] == str(directory / "hub-answers") and os.environ.get("DEW_RUNG_RECORDS") == before
+

@@ -18,9 +18,9 @@ cases the CPU does not interpret, run in one process (`gpu_flow`), each cell its
 
 import functools
 
+import gpu_flow
 import jax
 import jax.numpy as jnp
-import numpy as np
 import pytest
 import test_recurrence_mosaic as forward
 import test_recurrence_mosaic_gradient as gradient
@@ -113,13 +113,7 @@ def repeats_bit_for_bit(make, kernel: str):
     params = named(layer.init, gated_delta_rule="xla")(jax.random.key(6), x)
     step = jax.jit(named(jax.grad(lambda params, x: jnp.sum(layer.apply(params, x).astype(jnp.float32) ** 2),
                                   argnums=(0, 1)), gated_delta_rule=kernel))
-    first = jax.tree.map(np.asarray, step(params, x))
-    jax.clear_caches()  # compiled afresh: a schedule its compiler picks must repeat too
-    again = jax.tree.map(np.asarray, step(params, x))
-    for (path, one), other in zip(jax.tree_util.tree_leaves_with_path(first), jax.tree.leaves(again),
-                                  strict=True):
-        np.testing.assert_array_equal(one.view(np.uint8), other.view(np.uint8),
-                                      err_msg=jax.tree_util.keystr(path))
+    gpu_flow.repeats_bit_for_bit(step, params, x)
 
 
 def decodes_on_its_kernel(kernel: str):

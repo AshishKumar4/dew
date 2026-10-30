@@ -26,7 +26,7 @@ import test_lowering as lowering
 import test_moe_precision as moe_precision
 import test_norm_swiglu as norm_swiglu_tests
 import test_precision_policy as precision_policy
-from gpu_flow import Cell, run_cells
+from gpu_flow import Cell, run_cells, when
 
 from dew.nn.kernels import grouped_matmul, norm_swiglu
 from dew.nn.kernels.generation import triton_runs
@@ -34,15 +34,6 @@ from dew.nn.kernels.generation import triton_runs
 pytestmark = pytest.mark.gpu(reason="a GPU's own numerics, its kernels' configs and its driver's facts")
 
 DTYPES = (jnp.float32, jnp.bfloat16, jnp.float16)
-
-
-def when(holds: bool, reason: str, check):
-    """`check` where `holds`, else skipped for `reason` (`gpu_flow.run_cells` reports it)."""
-    def run():
-        if not holds:
-            pytest.skip(reason)
-        check()
-    return run
 
 
 def test_a_gpus_numerics_and_kernels_hold_on_this_gpu(tmp_path_factory):
