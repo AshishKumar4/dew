@@ -1197,19 +1197,13 @@ checked once."""
 
 def _first_asking(draw, fn=None) -> bool:
     """Whether `draw` (with `fn`, one of its arms, where given) has not yet been checked to be a function of
-    its seed (of its inputs); True where no weak reference holds them (checked every time)."""
-    try:
-        asked = _PAIRED.setdefault(draw, weakref.WeakSet())
-        if fn is None:
-            first = draw not in asked
-            asked.add(draw)
-            return first
-        if fn in asked:
-            return False
-        asked.add(fn)
-    except TypeError:
-        pass
-    return True
+    its seed (of its inputs); True for one no weak reference can hold (checked every time)."""
+    if not all(type(held).__weakrefoffset__ for held in (draw, fn) if held is not None):
+        return True
+    asked = _PAIRED.setdefault(draw, weakref.WeakSet())
+    first = (draw if fn is None else fn) not in asked
+    asked.add(draw if fn is None else fn)
+    return first
 
 
 def _of_its_seed(label: str, draw, seed, inputs) -> None:
