@@ -1862,8 +1862,11 @@ def main() -> int:
 
 def pinned(argv: list[str]) -> None:
     """This file run again under HASHED_BY, as uv finds or fetches it, with `argv`, where another Python
-    runs it: on a planner's machine, a GitHub runner or a GPU node."""
-    if f"{sys.version_info.major}.{sys.version_info.minor}" != HASHED_BY:
+    runs it: on a planner's machine, a GitHub runner or a GPU node. Not `coverage report`, which keys nothing
+    and reads coverage.py's data under the interpreter its caller installed coverage.py in
+    (`coverage_report`)."""
+    running = f"{sys.version_info.major}.{sys.version_info.minor}"
+    if argv[:2] != ["coverage", "report"] and running != HASHED_BY:
         os.execvp("uv", ["uv", "run", "--no-project", "--python", HASHED_BY, "python",
                          str(Path(__file__).resolve()), *argv])
 
