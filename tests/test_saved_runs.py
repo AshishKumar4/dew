@@ -19,9 +19,10 @@ import tarfile
 from pathlib import Path
 
 import jax
+import numpy as np
 import pytest
 from reference_error import recording
-from saved_run_kinds import SAVED_KINDS
+from saved_run_kinds import SAVED_KINDS, computed
 
 from dew.checkpoints import Checkpoints
 from dew.config import RunConfig
@@ -44,9 +45,11 @@ ABSOLUTE = re.compile(rb"/(?:home|Users|root|tmp|mnt|private|var)/")
 
 def evidence(recorded: str, kind: str) -> dict | None:
     """What `kind`'s run the main `recorded` saved serialized (`saved_runs_reference.evidence`), None where
-    that main recorded none."""
-    path = CORPUS / recorded / f"{kind}.evidence.json"
-    return json.loads(path.read_text()) if path.exists() else None
+    that main's generation records none: one recorded before its version (`source.json`'s `evidence`).
+    A generation that states one holds every kind's."""
+    if "evidence" not in json.loads((CORPUS / recorded / "source.json").read_text()):
+        return None
+    return json.loads((CORPUS / recorded / f"{kind}.evidence.json").read_text())
 
 
 def archived(recorded: str, kind: str) -> tarfile.TarFile:
@@ -77,7 +80,9 @@ def answered(task) -> None:
     if isinstance(task, TextGeneration):
         assert len(task.decode(task("ab", max_new_tokens=1, key=0))) == 1
     elif isinstance(task, BlockGeneration):
-        assert task([[4, 5, 6, 7]], 4, key=0).host().tokens.shape[-1] >= 4
+        # A response of at least one token past the prompt, its decoder having stepped.
+        generated = task([[4, 5, 6, 7]], 4, key=0).host()
+        assert (np.asarray(generated.lengths) > 0).all() and (np.asarray(generated.decoder_steps) > 0).all()
     elif isinstance(task, Decide):
         question = {"team": Choice("which team", ["billing", "technical", "sales"])}
         [answers] = task([({"text": "the site is down"}, question)])
@@ -104,9 +109,12 @@ def test_a_run_an_earlier_main_saved_loads_and_answers(tmp_path, recorded, kind)
     run = extracted(tmp_path, recorded, kind)
     recorded_run = RunConfig.load(str(run))
     seen = evidence(recorded, kind)
+    task = objectives[recorded_run.objective.name].saved_task
     if seen is not None:
         assert recorded_run.compute_dtype() == seen["compute"]
-    task = objectives[recorded_run.objective.name].saved_task
+        if task is not None:
+            # The task loaded computes as the one the run saved did, its model built so.
+            assert computed(task.from_run(str(run)).model) == seen["task_compute"]
     with Checkpoints(str(run)) as checkpoints:
         last = checkpoints.latest
         declared = checkpoints.artifact(last) is not None
@@ -124,9 +132,9 @@ def test_a_run_an_earlier_main_saved_resumes_from_its_checkpoint(tmp_path, monke
     a decision backbone, in float32 unless its model names a dtype; train 328's review of ledger 2500):
     the fit starts at that step, from that checkpoint, and trains the one step past it. Where its main
     recorded what it serialized (`evidence`), the resumed run holds its parameters in the dtypes it
-    stored them in, scales its loss as it did, counts on from the examples it consumed (a run on the
-    examples clock restores them at its bound, which its data's order names), and compiles its step at
-    the rung it was admitted at."""
+    stored them in, scales its loss as it did, its count of finite steps going on, counts on from the
+    examples it consumed (a run on the examples clock paused before its bound trains on to it), and
+    compiles its step at the rung it was admitted at."""
     run = extracted(tmp_path, recorded, kind)
     recorded_run = RunConfig.load(str(run))
     seen = evidence(recorded, kind)
@@ -138,28 +146,34 @@ def test_a_run_an_earlier_main_saved_resumes_from_its_checkpoint(tmp_path, monke
     # A source the repo holds is recorded by its path in the repo (a decision run's backbone), read from
     # the checkout's root as the run that wrote it read it.
     monkeypatch.chdir(Path(__file__).resolve().parents[1])
-    # A run on the examples clock, which names its bound among its data's order, resumes at that bound:
-    # its progress the examples it consumed, which it restores, and no step more to take.
+    # A run on the examples clock paused before its bound (`Pause`) trains on to it, its progress the
+    # examples it consumed; a run counted in steps trains one step more.
     clocked = seen is not None and recorded_run.trainer.examples is not None
-    trainer = dataclasses.replace(recorded_run.trainer, checkpoint_dir=str(tmp_path / "runs"),
+    trainer = dataclasses.replace(recorded_run.trainer, checkpoint_dir=str(tmp_path / "runs"), stop=None,
                                   **({} if clocked else {"steps": last + 1}), resume="require",
                                   compilation_cache_dir=None, multi_host=False)
     sources = {"data": here.data, "validation": here.validation}
     state = dataclasses.replace(recorded_run, trainer=trainer, **sources).prepare().train(kind)
     records = [json.loads(line) for line in (run / "tracking" / "records.jsonl").read_text().splitlines()]
-    started = [row["value"] for row in records if row["type"] == "FitStarted"][-1]
+    resumed = max(index for index, row in enumerate(records) if row["type"] == "FitStarted")
+    started = records[resumed]["value"]
     assert (started["start_step"], started["resumed_from"] is not None) == (last, True)
     scalars = (run / "tracking" / "scalars.jsonl").read_text().splitlines()
     stepped = [json.loads(line)["step"] for line in scalars]
-    assert max(stepped) == (last if clocked else last + 1)
+    assert max(stepped) > last if clocked else max(stepped) == last + 1
     if seen is not None:
         stored = sorted({str(leaf.dtype) for leaf in jax.tree.leaves(state.variables["params"])})
         assert stored == seen["params"]
+        # The scale as it was, and its count of finite steps on from the recorded one, not from none.
         assert (None if state.scale is None else float(state.scale.scale)) == seen["scale"]
-        # The examples it consumed count on from the recorded ones, not from none.
+        assert (None if state.scale is None else int(state.scale.fin_steps)) == (
+            None if seen["finite_steps"] is None else seen["finite_steps"] + int(state.step) - last)
+        # The examples it consumed count on from the recorded ones to the bound.
         consumed = None if state.consumed is None else int(state.consumed)
         assert (consumed is None) == (seen["consumed"] is None)
-        assert consumed is None or (consumed == seen["consumed"] if clocked else consumed > seen["consumed"])
-        compiled = [row["value"] for row in records if row["type"] == "StepCompiled"][-1]
+        assert consumed is None or consumed > seen["consumed"]
+        assert not clocked or consumed == recorded_run.trainer.examples
+        # The step the resumed fit compiled, at the rung it was admitted at.
+        compiled = [row["value"] for row in records[resumed:] if row["type"] == "StepCompiled"][-1]
         assert compiled["remat"] == seen["remat"]
         assert {name: (compiled["plan"] or {}).get(name) for name in seen["plan"]} == seen["plan"]

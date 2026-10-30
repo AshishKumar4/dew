@@ -7,6 +7,7 @@ bfloat16 and in float16 (whose loss a dynamic scale scales), and a run over a so
 import dataclasses
 from pathlib import Path
 
+import jax.numpy as jnp
 import numpy as np
 from test_lm_recipe import SEQ, write_token_files
 from test_run_options import KINDS, decision, lm, read
@@ -19,6 +20,7 @@ from dew.decision.config import Letters
 from dew.decision.layout import Labels, built_in
 from dew.nn.precision import numerics_of
 from dew.registry import ModelConfig
+from dew.training.budget import Pause
 
 MULTIMODAL = "tests/fixtures/hf/gemma3-tiny-mm"
 """A multimodal source whose decoder its model nests (`MultimodalTransformer.language_model`), by its
@@ -80,10 +82,11 @@ def blockwise(root: Path, drawn: bool) -> RunConfig:
 
 
 def clocked(root: Path, drawn: bool) -> RunConfig:
-    """An LM run on the examples clock (`--trainer.examples`), its progress the examples it consumed:
-    `lm`'s windows, unpacked, which its record reads back with no store to read (a packed chain checks
-    its store's document ends as it is built)."""
-    return dataclasses.replace(lm(root, drawn), trainer=TrainerConfig(examples=16))
+    """An LM run on the examples clock (`--trainer.examples`), its progress the examples it consumed,
+    paused halfway (`--trainer.stop.fraction`), so a resume trains on to its bound: `lm`'s windows,
+    unpacked, which its record reads back with no store to read (a packed chain checks its store's
+    document ends as it is built)."""
+    return dataclasses.replace(lm(root, drawn), trainer=TrainerConfig(examples=32, stop=Pause(0.5)))
 
 
 def fresh(root: Path, drawn: bool, precision: str = "bf16-mixed") -> RunConfig:
@@ -99,13 +102,35 @@ def scaled(root: Path, drawn: bool) -> RunConfig:
     return fresh(root, drawn, "16-mixed")
 
 
+def chosen_scale(root: Path, drawn: bool) -> RunConfig:
+    """An LM run computing in float32 that states a dynamic loss scale, which no compute would choose
+    (`--trainer.dynamic-scale`), as a run saved before its numerics records it."""
+    return dataclasses.replace(lm(root, drawn), trainer=TrainerConfig(dynamic_scale=True))
+
+
 def stored(root: Path, drawn: bool) -> RunConfig:
     """An LM run over a source whose parameters it stores in bfloat16 (`--source.param-dtype`)."""
     return dataclasses.replace(over(QWEN, root, drawn), source=SourceOptions(param_dtype="bfloat16"))
 
 
+def computed(model) -> str | None:
+    """The dtype a built model computes in: the first a module of it states (Flax's `dtype`), its own or
+    a module's it holds, breadth first (a decision model's backbone's, a wrapper's decoder's)."""
+    import flax.linen as nn
+
+    frontier = [model]
+    while frontier:
+        module = frontier.pop(0)
+        stated = getattr(module, "dtype", None)
+        if stated is not None:
+            return str(jnp.dtype(stated))
+        frontier += [value for field in dataclasses.fields(module)
+                     if isinstance(value := getattr(module, field.name, None), nn.Module)]
+    return None
+
+
 SAVED_KINDS = {**KINDS, "multimodal": multimodal, "decision-segments": segmented,
                "decision-lettered": lettered, "block-diffusion": blockwise, "lm-examples": clocked,
-               "lm-bf16": fresh, "lm-float16": scaled, "lm-stored": stored}
+               "lm-bf16": fresh, "lm-float16": scaled, "lm-scaled": chosen_scale, "lm-stored": stored}
 """Each kind the corpus saves a run of: every run kind (`test_run_options.KINDS`), an LM run whose decoder
 its source's model nests, and each serialized variant beside them."""

@@ -67,20 +67,33 @@ def anonymous(run: Path, name: str, places: dict[str, str]) -> bytes:
     return packed.getvalue()
 
 
+EVIDENCE = 1
+"""The version of what a recorded generation's runs record they serialized (`evidence`), which its
+`source.json` states; a generation that states one holds every kind's."""
+
+
 def evidence(run, state, directory: Path) -> dict:
     """What a saved run serialized, as a later main's load and resume read it back
-    (tests/test_saved_runs.py): its parameters' dtypes and its compute's, its dynamic loss scale, the
-    examples it consumed, its last step, and the rung its step compiled at, the remat and the plan it
-    was admitted under (`StepCompiled`) but the plan's probes and kernels."""
+    (tests/test_saved_runs.py): its parameters' dtypes, its compute's as its run states it and as the
+    task loaded from it computes (`computed`), its dynamic loss scale and the finite steps it counted,
+    the examples it consumed, its last step, and the rung its step compiled at, the remat and the plan
+    it was admitted under (`StepCompiled`) but the plan's probes and kernels."""
     import jax
+    from saved_run_kinds import computed
+
+    import dew
+    from dew.registry import objectives
 
     lines = (directory / "tracking" / "records.jsonl").read_text().splitlines()
     records = [json.loads(line) for line in lines]
     compiled = [row["value"] for row in records if row["type"] == "StepCompiled"][-1]
     plan = compiled["plan"] or {}
+    task = None if objectives[run.objective.name].saved_task is None else dew.pipeline(str(directory))
     return {"step": int(state.step), "compute": run.compute_dtype(),
+            "task_compute": None if task is None else computed(task.model),
             "params": sorted({str(leaf.dtype) for leaf in jax.tree.leaves(state.variables["params"])}),
             "scale": None if state.scale is None else float(state.scale.scale),
+            "finite_steps": None if state.scale is None else int(state.scale.fin_steps),
             "consumed": None if state.consumed is None else int(state.consumed), "remat": compiled["remat"],
             "plan": {name: value for name, value in plan.items()
                      if name not in ("kernels", "probes", "derived")}}
@@ -127,7 +140,7 @@ def main() -> None:
             save(written / f"{kind}.npz", {"run": np.frombuffer(packed, np.uint8)},
                  reference=f"Dew {commit[:12]}, tools/saved_runs_reference.py", license="MIT", root=args.root)
             (args.root / written / f"{kind}.evidence.json").write_text(json.dumps(seen, indent=1) + "\n")
-    source = {"commit": commit, "kinds": sorted(SAVED_KINDS)}
+    source = {"commit": commit, "kinds": sorted(SAVED_KINDS), "evidence": EVIDENCE}
     (args.root / written / "source.json").write_text(json.dumps(source, indent=1) + "\n")
 
 
