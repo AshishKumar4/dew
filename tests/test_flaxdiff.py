@@ -130,7 +130,7 @@ def test_a_run_imported_by_from_flaxdiff_samples_what_flaxdiffs_preview_did(tmp_
     draws its noise needs the tool rerun."""
     from dataclasses import replace
 
-    from reference_error import assert_as_exact_as_the_reference
+    from one_draw import assert_as_exact_as_the_reference
 
     from dew.inference import TextToImage
     from dew.interop.flaxdiff import _towers

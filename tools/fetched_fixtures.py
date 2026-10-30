@@ -17,6 +17,9 @@ store's second kind (`RELEASE`, `pin_release`): kept whole whatever its size, un
 releases/<sha256>/<its name> in the store and releases/<sha256>.release in the checkout's local copy
 (no Python suffix, so no linter reads a release's code as the checkout's), its pin naming the release
 and its license, read and checked by sha256 as a recording is and held to none of the recordings' rules.
+A release file whose license keeps it from being re-hosted stays in its release's own repo: its pin's
+`origin` is the release's (`ORIGINS`), its repo, commit and path the file's there, which `fetch`
+reads it from as it reads the store's, and which `upload` leaves alone.
 
 Usage, from the checkout:
   python tools/fetched_fixtures.py fetch
@@ -49,6 +52,10 @@ FIELDS = ("repo", "revision", "path", "sha256", "bytes", "reference", "license")
 RELEASE = "release"
 """The `kind` of a pin that holds a release's own file (`pin_release`); a pin without one is a
 recording's."""
+ORIGINS = {"store": "dataset", "release": "model"}
+"""Where a pinned file is fetched from, by its pin's `origin` (the store where none is named), and that
+repo's type on the Hub: the store (`STORE`), where `upload` puts what it holds, or a release's own repo
+at its commit, for a release file its license keeps from being re-hosted (`pin_release(origin=)`)."""
 REDRAWN = ".redraw.npy"
 """The member every recording holds (record_case's `<site>.redraw`, which `indexed_recording` reads),
 which marks an NPZ as one."""
@@ -112,11 +119,13 @@ def _store_path(pin: dict, name: str) -> str:
     return f"recordings/{pin['sha256']}.npz"
 
 
-def pin_release(path, data: bytes, *, reference: str, license: str, root: Path = REPO_ROOT) -> Path:
+def pin_release(path, data: bytes, *, reference: str, license: str, origin: bool = False,
+                root: Path = REPO_ROOT) -> Path:
     """Keep `data`, a release's own file, in the local store whole, pinned at `path` under
     tests/fixtures/ with no revision until `upload`: by its sha256 and its own name, the release it
-    is from (`reference`, its repo, commit and file) and that release's `license`. Returns the stored
-    file, which `local(path)` reads."""
+    is from (`reference`, its repo, commit and file) and that release's `license`; with `origin`,
+    pinned instead to the release's own repo at that commit (`ORIGINS`), which `fetch` reads it from
+    and `upload` never re-hosts. Returns the stored file, which `local(path)` reads."""
     name = fixture(path, root)
     # Written where it resolves to: a symlink at the place, or above it, may not carry a write out.
     if name is None or not (root / name).resolve().is_relative_to((root / FIXTURES).resolve()):
@@ -125,6 +134,9 @@ def pin_release(path, data: bytes, *, reference: str, license: str, root: Path =
     pin = {"repo": STORE, "revision": None, "sha256": sha, "bytes": len(data), "reference": reference,
            "license": license, "kind": RELEASE}
     pin["path"] = _store_path(pin, name)
+    if origin:
+        repo, revision, file = _released(reference)
+        pin.update(repo=repo, revision=revision, path=file, origin="release")
     stored = _stored(pin, root)
     stored.parent.mkdir(parents=True, exist_ok=True)
     stored.write_bytes(data)
@@ -133,6 +145,14 @@ def pin_release(path, data: bytes, *, reference: str, license: str, root: Path =
     target.parent.mkdir(parents=True, exist_ok=True)
     _pinned(name, pin, root)
     return stored
+
+
+def _released(reference: str) -> tuple[str, str, str]:
+    """A release file's `reference`, `<repo>@<commit>/<path>`, as its repo, commit and path."""
+    found = re.fullmatch(r"([\w.-]+/[\w.-]+)@([0-9a-f]{40})/(.+)", reference)
+    if found is None:
+        raise ValueError(f"{reference!r} names no file of a repo at a commit, <repo>@<commit>/<path>")
+    return found.group(1), found.group(2), found.group(3)
 
 
 def _checked(data: bytes, pin: dict, name: str) -> bytes:
@@ -199,8 +219,8 @@ def fetch(root: Path = REPO_ROOT) -> None:
             raise SystemExit(f"{name}: pinned with no revision and not in {LOCAL}: its upload is due")
         from huggingface_hub import hf_hub_download
 
-        downloaded = Path(hf_hub_download(pin["repo"], pin["path"], repo_type="dataset",
-                                          revision=pin["revision"]))
+        kind = ORIGINS[pin.get("origin", "store")]
+        downloaded = Path(hf_hub_download(pin["repo"], pin["path"], repo_type=kind, revision=pin["revision"]))
         data = _checked(downloaded.read_bytes(), pin, name)
         stored.parent.mkdir(parents=True, exist_ok=True)
         partial = stored.with_name(f".{stored.name}.partial")
@@ -290,10 +310,15 @@ def check(root: Path = REPO_ROOT) -> list[str]:
             problems.append(f"{name}: its pin holds no {', '.join(missing)}"
                             + (" (its upload is due)" if "revision" in missing else ""))
             continue
-        if not re.fullmatch(r"[0-9a-f]{64}", pin["sha256"]) or pin.get("kind") not in (None, RELEASE) or (
-                pin["path"] != _store_path(pin, name)):
+        released = pin.get("origin") == "release"
+        # A file kept at its release's origin is the release's own file there, its reference's.
+        where = ((pin["repo"], pin["revision"], pin["path"]) == _released(pin["reference"]) if released
+                 else pin["path"] == _store_path(pin, name) and pin["repo"] == STORE)
+        if (not re.fullmatch(r"[0-9a-f]{64}", pin["sha256"]) or pin.get("kind") not in (None, RELEASE)
+                or pin.get("origin", "store") not in ORIGINS or (released and pin.get("kind") != RELEASE)
+                or not where):
             problems.append(f"{name}: its pin's sha256 {pin['sha256']!r} or path {pin['path']!r} is not "
-                            f"of the store's form")
+                            f"of its origin's form")
         if not re.fullmatch(r"[0-9a-f]{40}", pin["revision"]):
             problems.append(f"{name}: its pin's revision {pin['revision']!r} is not a commit")
         if pin["bytes"] <= IN_GIT and pin.get("kind") != RELEASE:

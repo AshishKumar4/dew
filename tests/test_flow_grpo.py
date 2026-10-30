@@ -22,11 +22,11 @@ import optax
 import pytest
 from certified import assert_certified
 from flax import linen as nn
+from one_draw import assert_as_exact_as_the_reference
 from recording import RecordingTracker
 from reference_error import (
     as_given,
     assert_as_exact,
-    assert_as_exact_as_the_reference,
     assert_fp32_reduction_bound,
     chain_roundings,
     declared_seeds,

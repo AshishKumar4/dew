@@ -43,7 +43,8 @@ and tools/diffusers_extended_reference.py)."""
 def held(errors, task, name, actual, reference, key):
     """`actual` as near float64 as the source's float32 `reference`, the truth
     the same saved pipeline computes in float64 (tests/reference_error.py)."""
-    from reference_error import assert_as_exact_as_the_reference, distance
+    from one_draw import assert_as_exact_as_the_reference
+    from reference_error import distance
 
     with np.load(TRUTH) as truth:
         wide = truth[f"{task}/{key}"]
@@ -128,7 +129,7 @@ def public_start(task, source, reference, meta, key, given, null, process, times
         return source.autoencoder.encode(source.variables["autoencoder"], pixels_in_range, None)
 
     if kind == "xl-img2img":
-        from reference_error import assert_as_exact_as_the_reference
+        from one_draw import assert_as_exact_as_the_reference
 
         prepared = task.prepare(**shared, image=pixels, noise=noise)
         bypassed = task.prepare(**shared, image_latents=clean(), noise=noise)
@@ -162,7 +163,8 @@ def diffusers_reads(source, export, prediction, noise, given):
     same noise, timestep and conditions in float32 and float64, holds Dew's
     trained `prediction` to tests/reference_error.py's rule, and returns
     the rule's ratio."""
-    from reference_error import assert_as_exact_as_the_reference, distance
+    from one_draw import assert_as_exact_as_the_reference
+    from reference_error import distance
     from safetensors.numpy import load_file
 
     from tools import diffusers_consumer as consumer
@@ -313,7 +315,8 @@ def streamed_parity(errors, directory, whole, reference, meta, key):
 
 
 def check_grids(directory, grids, case=None):
-    from reference_error import assert_as_exact_as_the_reference, distance
+    from one_draw import assert_as_exact_as_the_reference
+    from reference_error import distance
 
     oracle = np.load(grids)
     source = bundle(directory)
@@ -350,7 +353,7 @@ def handoff(directory, source, task, key):
     latents (`initial=`) below it, as Diffusers' denoising_end and
     denoising_start split them. tools/diffusers_handoff_reference.py
     recorded Diffusers' own base and refiner pipelines doing so."""
-    from reference_error import assert_as_exact_as_the_reference
+    from one_draw import assert_as_exact_as_the_reference
 
     recorded = np.load(Path(__file__).resolve().parents[1] / "tests/fixtures/diffusers_handoff.npz")
     refiner = bundle(Path(directory).parent / "refiner")
@@ -488,7 +491,8 @@ def check_model(directory):
     # --float64) by the float64 rule: a constant between two float32 implementations read one input's
     # VJP 1.1e-4 off on one CPU and within on another.
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
-    from reference_error import assert_as_exact_as_the_reference, distance
+    from one_draw import assert_as_exact_as_the_reference
+    from reference_error import distance
 
     truth = np.load(Path(__file__).resolve().parents[1] / "tests/fixtures/native_unet_float64.npz")
     errors = {}

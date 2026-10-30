@@ -10,6 +10,7 @@ whose data axis crosses the two is hybrid sharding; the losses it trains to
 have to be the reference's.
 """
 
+import concurrent.futures
 import json
 import os
 import re
@@ -479,16 +480,19 @@ def stopped_by_sigterm(process: subprocess.Popen, after: str, timeout: float = 3
 
 
 def resumed_where_it_stopped(tmp_path: Path, run) -> None:
-    """Train the worker's varying stream for eight steps uninterrupted; again,
+    """Train the worker's varying stream for eight steps uninterrupted and, beside it, again,
     SIGTERMed after its second step; and once more from its checkpoints.
     `run(arguments, stop)` runs the worker with `arguments` and returns its
     exit code and output, SIGTERMed after the second step when `stop`."""
     steps, checkpoints = 8, tmp_path / "checkpoints"
     worker = ["--steps", str(steps), "--vary"]
-    code, output = run([*worker, "--out", str(tmp_path / "whole.json")], stop=False)
-    assert code == 0, output
-    code, output = run([*worker, "--out", str(tmp_path / "stopped.json"), "--checkpoints", str(checkpoints),
-                        "--step-seconds", "1"], stop=True)
+    # The uninterrupted run shares nothing with the stopped one, which it runs beside (ledger 2190).
+    with concurrent.futures.ThreadPoolExecutor(1) as beside:
+        uninterrupted = beside.submit(run, [*worker, "--out", str(tmp_path / "whole.json")], stop=False)
+        code, output = run([*worker, "--out", str(tmp_path / "stopped.json"), "--checkpoints",
+                            str(checkpoints), "--step-seconds", "1"], stop=True)
+        whole_code, whole_output = uninterrupted.result()
+    assert whole_code == 0, whole_output
     assert code == 128 + signal.SIGTERM, output
     stopped = re.search(r"Preempted at step (\d+)", output)
     assert stopped is not None, output

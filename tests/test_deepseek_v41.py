@@ -39,8 +39,9 @@ import numpy as np
 import pytest
 from flax.traverse_util import flatten_dict, unflatten_dict
 from model_support import decode_through
+from one_draw import assert_as_exact_as_the_reference
 from quantized_basis import dequantized_in_own_basis
-from reference_error import FACTOR, assert_as_exact_as_the_reference, distance
+from reference_error import FACTOR, distance
 
 from dew.batch import coordinates
 from dew.interop import Pretrained

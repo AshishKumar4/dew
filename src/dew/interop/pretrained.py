@@ -78,7 +78,7 @@ from dew.sampling.text import Sampling
 if TYPE_CHECKING:
     from jax.sharding import Mesh
 
-    from dew.diffusion.discrete import Confident
+    from dew.diffusion.discrete import Confident, Unmask
     from dew.distributed.placement import Layout, MeshSpec
     from dew.inference.tasks import SavedRun
     from dew.interop.torchax_fallback import TorchAdmission
@@ -233,6 +233,10 @@ class Pretrained:
     ran them (`trust_remote_code`) or, mapped natively, kept them unexecuted, so a save opens through the
     source's own transformers loader as the source does; read from the source's snapshot, which a
     weights conversion may not be, when the save writes it."""
+    fresh: tuple[str, ...] = ()
+    """The modules of `model` drawn fresh beside the loaded weights, by their paths under `params`
+    (`layers_1/cross_attention`): what `with_cross_attention` adds, which a run trains in a fresh group
+    (`Objective.fresh_modules`, `dew.optim.OptimConfig.fresh_groups`)."""
     names_tokenizer: ClassVar[bool] = True
     """Whether generation_config.json may record the tokenizer's name.
 
@@ -530,9 +534,10 @@ class Pretrained:
         checkpoint keeps it.
         """
         from dew.batch import freeze, merge, select, thaw
-        from dew.nn.cross_attention import crossing
+        from dew.nn.cross_attention import NAME, crossing
         from dew.nn.inputs import request_key
         from dew.nn.protocols import CrossAttending, Predicting
+        from dew.optim import parameter_name
 
         if not isinstance(self.model, CrossAttending):
             raise TypeError(f"a {type(self.model).__name__} takes no cross-attention layers")
@@ -547,8 +552,13 @@ class Pretrained:
             return select(thaw(model.init(draw, jnp.zeros((1, length), jnp.int32))),
                           lambda path: path[0] == "params" and crossing(path))
 
-        variables = merge(self.variables, jax.jit(drawn)(request_key(key)))
-        return replace(self, model=model, variables=freeze(variables, crossing) if frozen else variables)
+        blocks = jax.jit(drawn)(request_key(key))
+        variables = merge(self.variables, blocks)
+        # Each block's module, its path under `params` to and with the block's own name.
+        added = {"/".join(keys[1:keys.index(NAME) + 1]) for keys in (
+            parameter_name(path).split("/") for path, _ in jax.tree_util.tree_leaves_with_path(blocks))}
+        return replace(self, model=model, variables=freeze(variables, crossing) if frozen else variables,
+                       fresh=tuple(sorted({*self.fresh, *added})))
 
     def with_dex(self, extension: DifferentialExtension, *, key: int | jax.Array) -> Self:
         """Return this source with DEX's differential on `extension`'s chosen heads (`dew.nn.dex`), its
@@ -770,20 +780,24 @@ class PretrainedMaskedDecoder(Pretrained):
     model: CausalTransformer
 
     @property
-    def masked_recipe(self) -> tuple[Confident, int, int] | None:
-        """The release's own walk this source generates by, its solver, steps and block
-        (`DecoderFamily.masked_walk` of its config, LLaDA2.0's; `Confident`), or None for a source
-        whose family declares none, an unregistered one among them, which unmasks the whole response
-        with Dew's MDLM. Its task (`text_generation`) and an objective over it
-        (`MaskedDiffusionObjective`) take it alike."""
-        from dew.diffusion.discrete import Confident
+    def masked_walk(self) -> decoder_parts.MaskedWalk | None:
+        """The release's own walk this source generates by (`DecoderFamily.masked_walk` of its config,
+        its generation config and its own code: LLaDA2.0's blocks, Dream's `origin`), or None for a
+        source whose family declares none, an unregistered one among them, which unmasks the whole
+        response with Dew's MDLM."""
         from dew.interop.hf_decoders import families
 
         family = families().get(str(self.config.get("model_type")))
-        walk = None if family is None or family.masked_walk is None else family.masked_walk(self.config)
-        if walk is None:
+        if family is None or family.masked_walk is None:
             return None
-        return Confident(threshold=walk.threshold, temperature=walk.temperature), walk.steps, walk.block
+        return family.masked_walk(self.config, self.generation_config, self.code)
+
+    @property
+    def masked_recipe(self) -> tuple[Unmask | Confident, int, int | None] | None:
+        """The release's own walk's solver, steps and block (`masked_walk`), or None. Its task
+        (`text_generation`) and an objective over it (`MaskedDiffusionObjective`) take it alike."""
+        walk = self.masked_walk
+        return None if walk is None else (walk.solver, walk.steps, walk.block)
 
     def pipeline(self):
         return self.packed().text_generation()
@@ -799,10 +813,13 @@ class PretrainedMaskedDecoder(Pretrained):
         mask_id = self.model.mask_token_id
         if mask_id is None:
             raise TypeError("a masked decoder generates by unmasking, and this model names no mask token")
-        audit_masked(config, generation)
-        recipe = self.masked_recipe
-        walked = {} if recipe is None else {"solver": recipe[0], "steps": recipe[1], "block": recipe[2]}
-        return MaskedGeneration(self.model, self.variables, MDLM(mask_id=mask_id)(),
+        walk = self.masked_walk
+        # The release's own walk reads its controls (Dream's `alg`, `steps` and `eps`), which a task
+        # without it refuses as MDLM cannot honour them.
+        audit_masked(config, generation, () if walk is None else walk.reads, mask_id)
+        walked = {} if walk is None else {"solver": walk.solver, "steps": walk.steps, "block": walk.block}
+        return MaskedGeneration(self.model, self.variables,
+                                MDLM(mask_id=mask_id, endpoint=None if walk is None else walk.endpoint)(),
                                 self.text_processor, **walked,
                                 eos_token_ids=self.eos_token_ids,
                                 pad_token_id=pad_id(config, generation),
