@@ -1420,6 +1420,7 @@ objectives: Aliases[type[Objective], Objective] = Aliases("objective", {
     "diffusion": "dew.objectives.diffusion.objective:DiffusionObjective",
     "distillation": "dew.objectives.distillation:DistillationObjective",
     "dpo": "dew.objectives.rl.preference:DPOObjective",
+    "diffusion_nft": "dew.objectives.rl.nft:DiffusionNFTObjective",
     "flow_grpo": "dew.objectives.rl.flow:FlowGRPOObjective",
     "grpo": "dew.objectives.rl.grpo:GRPOObjective",
     "guidance_distillation": "dew.objectives.diffusion.guidance_distillation:GuidanceDistillationObjective",

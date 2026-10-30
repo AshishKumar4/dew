@@ -708,6 +708,18 @@ def test_an_nccl_push_delivers_every_tensor_to_each_replica_on_another_gpu(fixtu
                for arrived, answered in received)
 
 
+@pytest.mark.parametrize("asked", ["a replica twice", "no library"])
+def test_a_push_naming_a_replica_twice_or_no_library_is_refused_as_it_is_made(tmp_path, asked):
+    """A push that names one replica twice, whose second /update_weights would wait for a broadcast
+    that never comes, or a library path that holds no file, is refused as the push is made, before
+    any group opens or any replica is asked."""
+    library = tmp_path / "libnccl.so.2"
+    library.write_bytes(b"")
+    engines = ("http://127.0.0.1:9", "http://127.0.0.1:9") if asked == "a replica twice" else ("http://127.0.0.1:9",)
+    with pytest.raises(ValueError):
+        NCCLPush(None, engines, str(library if asked == "a replica twice" else tmp_path / "absent.so.2"))
+
+
 @pytest.mark.gpu(reason="an NCCL group opens on a cuda device")
 def test_a_push_whose_replica_refuses_its_join_aborts_its_group_rather_than_waiting():
     """The sender opens its NCCL group while the replica's HTTP join runs. A replica that refuses

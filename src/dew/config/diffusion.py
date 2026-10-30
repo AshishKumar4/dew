@@ -59,6 +59,7 @@ if TYPE_CHECKING:
 
     from dew.diffusion.presets import Preset
     from dew.objectives.rl.flow import FlowGRPOObjective, FlowRollout
+    from dew.objectives.rl.nft import DiffusionNFTObjective, NFTRollout
 
     # A kind's `union` imports every aliased class, so the run builds it at
     # the end of the module, where the annotations, read when a command line
@@ -83,10 +84,12 @@ DEFAULT_MODEL_CONFIG = {
 
 @dataclasses.dataclass(frozen=True)
 class FlowRolloutConfig:
-    """A run's Flow-GRPO rollout: `groups` samples of each prompt over `steps` time points, the first
-    `train_steps` transitions trained (all of them when None), each scored by the image metric
-    `reward` names, an alias or an import path, against its own prompt, higher being better
-    (`clip_score`). `build` makes the `FlowRollout` over an objective."""
+    """A run's flow RL rollout: `groups` samples of each prompt over `steps` time points, each scored by
+    the image metric `reward` names, an alias or an import path, against its own prompt, higher being
+    better (`clip_score`). Flow-GRPO trains the first `train_steps` transitions of each trajectory (all
+    of them when None) and DiffusionNFT each clean sample at the first `train_steps` times of its
+    sampler's grid (the released 9 when None). `build` makes the objective's rollout, a `FlowRollout`
+    or an `NFTRollout`."""
 
     reward: str = "clip_score"
     groups: int = 4
@@ -98,11 +101,12 @@ class FlowRolloutConfig:
             raise ValueError(f"reward names {self.reward!r}, which no metric alias names; the aliases are "
                              f"{sorted(metrics)}, or name a metric by its import path")
 
-    def build(self, objective: FlowGRPOObjective) -> FlowRollout:
+    def build(self, objective: FlowGRPOObjective | DiffusionNFTObjective) -> FlowRollout | NFTRollout:
         """The rollout over `objective`, scoring each sample with the metric's per-sample measure."""
         from dew.artifacts import ImageGrid
         from dew.eval.common import ImageMetric
         from dew.objectives.rl.flow import FlowRollout
+        from dew.objectives.rl.nft import DiffusionNFTObjective, NFTRollout
 
         metric = metrics[self.reward]()
         if not isinstance(metric, ImageMetric):
@@ -112,6 +116,9 @@ class FlowRolloutConfig:
         def reward(images, batch):
             return np.asarray(metric.fn(ImageGrid(images), batch))
 
+        if isinstance(objective, DiffusionNFTObjective):
+            trained = {} if self.train_steps is None else {"train_steps": self.train_steps}
+            return NFTRollout(objective, reward, groups=self.groups, steps=self.steps, **trained)
         return FlowRollout(objective, reward, groups=self.groups, steps=self.steps,
                            train_steps=self.train_steps)
 
@@ -184,12 +191,13 @@ class DiffusionRunConfig(RunConfig):
         if not issubclass(objectives[self.objective.name], DiffusionObjective):
             raise ValueError(f"--objective {self.objective.name} trains no diffusion model")
         from dew.objectives.rl.flow import FlowGRPOObjective
+        from dew.objectives.rl.nft import DiffusionNFTObjective
 
-        flow = issubclass(objectives[self.objective.name], FlowGRPOObjective)
+        flow = issubclass(objectives[self.objective.name], (FlowGRPOObjective, DiffusionNFTObjective))
         if flow and self.rollout is None:
             object.__setattr__(self, "rollout", FlowRolloutConfig())
         if not flow and self.rollout is not None:
-            raise ValueError(f"--rollout configures a Flow-GRPO run's rollout, and --objective "
+            raise ValueError(f"--rollout configures a flow RL run's rollout, and --objective "
                              f"{self.objective.name} trains on its data")
 
         if self.pretrained is not None:
@@ -366,6 +374,7 @@ class DiffusionRunConfig(RunConfig):
         tokenize. `val_metrics` score each validation, and Flow-GRPO samples
         the batches it trains on (`rollout`)."""
         from dew.objectives.rl.flow import FlowGRPOObjective
+        from dew.objectives.rl.nft import DiffusionNFTObjective
 
         run = self
         objective = run.build()
@@ -373,7 +382,7 @@ class DiffusionRunConfig(RunConfig):
         dataset, held = run.compiled(objective.data(), run.chain(), run.validation)
         metrics = run.validation_metrics(validates=bool(held))
         rollout = None
-        if isinstance(objective, FlowGRPOObjective) and run.rollout is not None:
+        if isinstance(objective, (FlowGRPOObjective, DiffusionNFTObjective)) and run.rollout is not None:
             rollout = run.rollout.build(objective)
         return Prepared(run, lambda name: run.train(objective, dataset, name=name, metrics=metrics,
                                                     rollout=rollout, validation=held))
