@@ -170,10 +170,11 @@ def test_a_decision_run_that_names_its_groups_resumes_in_them(tmp_path):
 @pytest.mark.mesh(devices=8)
 def test_a_run_resumes_its_groups_where_its_record_holds_a_chain_only_its_python_holds(tmp_path):
     """A run whose validation chain only its Python holds resumes in the groups its record names, which
-    it reads alone, rebuilding nothing of the chain (row 2391's review)."""
+    it reads alone, rebuilding nothing of the chain (row 2391's review): its default fresh group, over its
+    context block and head, an adapter left out to keep the run small."""
     from test_run_options import trained
 
-    run = context_run(tmp_path)
+    run = dataclasses.replace(context_run(tmp_path), lora=None)
     held = dataclasses.replace(run, validation=run.validation.map(lambda batch: batch))
     trained(held, tmp_path, "held", trainer=SAVING)
     assert int(trained(held, tmp_path, "held", trainer={**SAVING, "steps": 2})[0].step) == 2

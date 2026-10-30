@@ -39,7 +39,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from interop_support import fixture_ids, transformers_arms, transformers_model
-from reference_error import as_given, assert_as_exact, assert_as_exact_as_the_reference
+from one_draw import assert_as_exact_as_the_reference
+from reference_error import as_given, assert_as_exact
 from safetensors.numpy import load_file
 
 from dew.interop import Pretrained, diffusion_gemma as adapter

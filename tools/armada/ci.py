@@ -393,17 +393,26 @@ def record_key(python: str, row_name: str, held: str, inputs: str | None = None)
     `inputs`, the last of the runs on those shared inputs (`shared`), apart from the last runs' list
     (`listed`). Any run of another commit replaces the last record, so a commit's retry reads its own
     under its inputs first (`reused`). The Worker's key alphabet has no colon or hash."""
-    _, name, split = parsed_row(row_name)
     at = f"{CACHE_PREFIX}/{python}" if inputs is None else f"{CACHE_PREFIX}-inputs/{inputs[:16]}/{python}"
-    return f"{at}/{held}/{name}/" + ("-of-".join(split.split("/")) if split else "whole")
+    return f"{at}/{row_place(row_name, held)}"
 
 
-def green_key(held: str, key: str) -> str:
-    """Where a green row run on class `held` whose inputs hash to `key` (`cache_key`) is kept, apart from the
-    last run's record (`record_key`): every green run of a file on any inputs stays found by its own key, so a
-    run of another commit, which replaces the last record, loses none of them (`green_record`; owner,
-    2026-10-29: a lane's one-line change over a green verdict reran half its suite, its records replaced)."""
-    return f"{CACHE_PREFIX}-green/{held}/{key}"
+def row_place(row_name: str, held: str) -> str:
+    """Row `row_name`'s place on class `held` under a record prefix: `<class>/<test file>/<group>`, a group
+    `whole` or a split's `<index>-of-<count>` (`key_parts`)."""
+    _, name, split = parsed_row(row_name)
+    return f"{held}/{name}/" + ("-of-".join(split.split("/")) if split else "whole")
+
+
+def green_key(python: str, row_name: str, held: str, key: str) -> str:
+    """Where row `row_name`'s green run on class `held` whose inputs hash to `key` (`cache_key`) is kept,
+    apart from the last run's record (`record_key`): every green run of a row on any inputs stays found by
+    its own key, so a run of another commit, which replaces the last record, loses none of them
+    (`green_record`; owner, 2026-10-29: a lane's one-line change over a green verdict reran half its suite,
+    its records replaced). The row's own place holds it, as the files one process ran share what it executed
+    before them and so their keys (`executed.py`): kept by the key alone, one file's run stood for each of
+    them (2026-10-30: a kept task reported one file's row for six files)."""
+    return f"{CACHE_PREFIX}-green/{python}/{row_place(row_name, held)}/{key}"
 
 
 def key_parts(key: str) -> tuple[str, str, str]:
@@ -463,7 +472,8 @@ def reusable(python: str, names: list[str], common: str) -> dict[str, str]:
         for each in held:
             found = green_record(python, name, "", common, token, [each])
             # Kept only where its green run is kept by its key, as the task reads it.
-            if found is not None and recorded(green_key(each, found["key"]), token) is not None:
+            if found is not None and recorded(green_key(python, row(python, name, ""), each, found["key"]),
+                                              token) is not None:
                 return f"{each}:{found['key']}"
         return None
 
@@ -501,7 +511,7 @@ def green_record(python: str, name: str, split: str, common: str, token: str,
         # here, name the green run of exactly these, kept by its key (`green_key`) whatever ran since.
         if found is not None and found["depends"] is not None:
             key = cache_key(common, name, split, found["depends"])
-            kept = recorded(green_key(each, key), token)
+            kept = recorded(green_key(python, row(python, name, split), each, key), token)
             if kept is not None and kept["key"] == key:
                 return kept
     return None
@@ -526,7 +536,7 @@ def reused(python: str, name: str, split: str, common: str, network: bool = Fals
     if not token or "DEW_XLA_CACHE_URL" not in os.environ:
         return None
     if kept is not None:
-        found = recorded(green_key(*kept), token)
+        found = recorded(green_key(python, row(python, name, split), *kept), token)
         if found is not None and found["key"] == kept[1] and fresh(found, name, common):
             return found["row"]
     found = green_record(python, name, split, common, token, reused_classes(network))
@@ -1088,7 +1098,7 @@ def record(python: str, rows: list[dict], executed_report: Path, common: str, ne
             ran_on = key if key is not None else None if ran["depends"] is None else cache_key(
                 common, name, parsed_row(row_["name"])[2], ran["depends"])
             if ran_on is not None:
-                written(green_key(held, ran_on), token, body)
+                written(green_key(python, row_["name"], held, ran_on), token, body)
 
 
 def written(key: str, token: str, body: bytes) -> bool:

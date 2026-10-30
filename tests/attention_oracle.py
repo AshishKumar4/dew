@@ -141,7 +141,7 @@ def float64_weights(q, k, keep, sinks, softcap, *, anchored: bool = False):
 
 def attention_terms(query, key, value, cotangent, keep, sinks=None, softcap=None):
     """Each entry's float64 terms of attention's output and its query, key and
-    value gradients under `cotangent`, sized as `reference_error.float64_terms`
+    value gradients under `cotangent`, sized as `float64_terms.float64_terms`
     sizes them: the root sum of squares of the terms its final sum adds, for
     `[B, S, H, D]` operands with key heads repeated over their group and the
     keys `keep` `[B or 1, 1, q, k]` keeps, a sink joining each head's

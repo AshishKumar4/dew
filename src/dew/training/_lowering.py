@@ -36,11 +36,11 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import pickle
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, replace
-from pathlib import Path
 
 import jax
 from jax.extend.mlir import ir
@@ -379,7 +379,7 @@ class Lowered(SystemExit):
         return {name: float(found[key]) for name, key in (("flops", "flops"), ("bytes", "bytes accessed"))
                 if key in found}
 
-    def save(self, path: str | Path) -> None:
+    def save(self, path: str | os.PathLike[str]) -> None:
         """Write the compiled step to `path`, local or remote, and beside it (`path.json`) the target it
         was compiled for and each device's memory and work.
 

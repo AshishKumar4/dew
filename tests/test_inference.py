@@ -145,7 +145,7 @@ def test_pil_bytes_and_unit_range_are_diffusers_image_processor():
     against 2.7e-8 rms)."""
     import torch
     from diffusers.image_processor import VaeImageProcessor
-    from reference_error import assert_as_exact_as_the_reference
+    from one_draw import assert_as_exact_as_the_reference
 
     processor = VaeImageProcessor()
     levels = np.arange(256, dtype=np.float64)

@@ -10,7 +10,8 @@ import jax
 import numpy as np
 import pytest
 from decision_support import decision_rows
-from reference_error import as_given, assert_as_exact, assert_as_exact_as_the_reference, dew_programs
+from one_draw import assert_as_exact_as_the_reference
+from reference_error import as_given, assert_as_exact, dew_programs
 from steady_state import steady_state
 
 from dew.artifacts import Decisions

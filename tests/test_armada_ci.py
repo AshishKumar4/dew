@@ -1891,6 +1891,22 @@ def test_a_kept_task_reuses_its_rows_after_another_commit_changes_the_recorded_d
     assert [len((tmp_path / f"runs-{name}").read_text()) for name in "abc"] == [2, 1, 1]
 
 
+def test_a_kept_task_reuses_each_files_own_row_where_files_that_ran_in_one_process_share_a_key(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """Files one task ran in one process share what it executed before them, so their keys are one: a kept
+    task still reuses each file's own green row, and names every file once (2026-10-30: a kept task reported
+    one file's row for six files, and a verdict was not graded)."""
+    verdict, planned = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
+    (tmp_path / "tests/test_durations.json").write_text(json.dumps(
+        {f"tests/test_{name}.py::test_{name}": 50.0 for name in "abc"}))
+    armada_task(ci, monkeypatch, verdict)
+    assert planned() == ["tests/test_a.py tests/test_b.py tests/test_c.py"]
+    rows = armada_task(ci, monkeypatch, verdict)
+    assert sorted(row["name"] for row in rows) == ["3.12:tests/test_a.py", "3.12:tests/test_b.py",
+                                                   "3.12:tests/test_c.py"]
+    assert [len((tmp_path / f"runs-{name}").read_text()) for name in "abc"] == [1, 1, 1]
+
+
 def test_a_helper_added_under_tests_reruns_only_the_runs_that_imported_a_module_of_its_name(
         ci, tmp_path, monkeypatch, cache_worker):
     """A helper module added under tests/ reruns no file whose run imported no module of its name, as it
