@@ -59,6 +59,9 @@ GRADIENT_ORDERS = ("jvp of grad", "jvp of grad, remat", "jvp of grad, nested jit
 REVERSE_ORDERS = ("vjp", *GRADIENT_ORDERS)
 """The orders a reverse derivative takes part in: those a forward mode alone, whose reverse mode is another
 seam's, does not take."""
+OWN_FORWARD_ORDERS = ("jvp", "second jvp", "second jvp, remat")
+"""The orders that take a forward derivative of the seam itself, not of its gradient: those a custom VJP whose
+backward JAX differentiates does not run."""
 
 
 def orders(fn, primals, direction, cotangent):
@@ -622,7 +625,8 @@ def softly_rectified(scores):
 def test_a_transposed_hooks_custom_derivative_holds_every_order_it_takes(edge):
     """A custom derivative within a hook a mainloop runs on transposed tiles (`layout.transposed`, its rule
     held entry by entry, `_custom.held`): every order it takes finite wherever float64 is a normal float32
-    and the hook on the tile as its caller holds it is; it takes no forward mode (ledger 2658)."""
+    and the hook on the tile as its caller holds it is; it takes no forward-derivative order, under a nested
+    jit and a scan too (ledger 2658)."""
     from dew.nn.kernels.templates import layout
 
     (tile,) = normal_draw(105, (6, 4), scale=EDGES[edge])
@@ -667,7 +671,8 @@ def test_a_stored_expert_primal_holds_every_order(edge):
 def test_a_default_precision_call_holds_every_order_it_takes(edge):
     """A function traced at the default matmul precision (`precision.at_default_precision`, a custom VJP):
     every order it takes finite wherever float64 is a normal float32 and the product as written is; it takes
-    no forward mode (ledger 2658)."""
+    no forward derivative of itself, nor a second (ledger 2658), every forward derivative of its gradient
+    running."""
     def product(x, y):
         return x @ y
 
@@ -676,14 +681,22 @@ def test_a_default_precision_call_holds_every_order_it_takes(edge):
     (cotangent,) = normal_draw(1210, (5, 3))
     assert_contract(precision.at_default_precision(product), primals, direction, cotangent,
                     f"a default-precision call {edge}", truth_fn=product, plain_fn=product,
-                    without=FORWARD_ORDERS)
+                    without=OWN_FORWARD_ORDERS)
 
 
-@pytest.mark.parametrize("edge", EDGES)
+LINEAR_EDGES = {"normal": 1.0, "near the largest": 2.0**122, "near the least normal": 2.0**-122}
+"""The scales at which a product linear in one operand (the other a fixed unit draw) nears float32's ends: its
+sums of sixteen products near the largest and the least normal, where `EDGES`' scale an operand by the square
+root of each."""
+
+
+@pytest.mark.parametrize("edge", [edge for edge in LINEAR_EDGES if edge != "near the largest"])
 def test_a_frozen_fp8_product_holds_every_order(edge):
     """A frozen FP8 kernel's product (`quantization.frozen_fp8_product`, its tangent the decoded kernel's):
     every order in the input finite wherever float64 is a normal float32 and the product with the decoded
-    kernel as written is."""
+    kernel as written is, the kernel a unit draw and the input at `LINEAR_EDGES`, so the product itself nears
+    float32's ends. Near the largest its input's scale overflows before the kernel's applies (ledger 2715),
+    that row's head adds the edge."""
     from dew.quantization import FROZEN_FP8, frozen_fp8_kernel, frozen_fp8_leaves
 
     (kernel,) = normal_draw(475, (16, 8))
@@ -698,8 +711,8 @@ def test_a_frozen_fp8_product_holds_every_order(edge):
     def plain(x):
         return x @ decoded.astype(x.dtype)
 
-    (x,) = normal_draw(476, (5, 16), scale=EDGES[edge])
-    (direction,) = normal_draw(477, (5, 16), scale=EDGES[edge])
+    (x,) = normal_draw(476, (5, 16), scale=LINEAR_EDGES[edge])
+    (direction,) = normal_draw(477, (5, 16), scale=LINEAR_EDGES[edge])
     (cotangent,) = normal_draw(478, (5, 8))
     assert_contract(frozen, (x,), (direction,), cotangent, f"a frozen FP8 product {edge}", truth_fn=plain,
                     plain_fn=plain)
@@ -710,8 +723,7 @@ def test_a_quantized_convolution_holds_every_order_it_takes(edge):
     """A quantized convolution under Qwix's quantized training (`quantization`'s grouped convolution, a
     custom VJP whose backward is the float convolution's transpose at the dequantized operands): every order
     it takes finite wherever float64 is a normal float32 and the float convolution is; it takes no forward
-    mode (ledger 2658)."""
-    pytest.importorskip("qwix")
+    derivative of itself, nor a second (ledger 2658), every forward derivative of its gradient running."""
     from dew.nn.conv import Conv
     from dew.quantization import Quantization
 
@@ -728,7 +740,7 @@ def test_a_quantized_convolution_holds_every_order_it_takes(edge):
     direction = normal_draw(1135, (1, 6, 6, 4), (3, 3, 4, 8), scale=EDGES[edge])
     (cotangent,) = normal_draw(1136, (1, 6, 6, 8))
     assert_contract(convolved, primals, direction, cotangent, f"a quantized convolution {edge}",
-                    truth_fn=plain, plain_fn=plain, without=FORWARD_ORDERS)
+                    truth_fn=plain, plain_fn=plain, without=OWN_FORWARD_ORDERS)
 
 
 def test_the_contract_refuses_a_formula_less_finite_than_the_plain_one():
@@ -1044,13 +1056,6 @@ def test_the_short_conv_holds_every_order(edge):
 
     assert_contract(kernel, primals, direction, cotangent, f"the short conv {edge}", truth_fn=plain,
                     plain_fn=plain)
-
-
-FORWARD_ORDERS = ("jvp", "jvp of grad", "second jvp", "jvp of grad, remat", "second jvp, remat",
-                  "jvp of grad, nested jit", "jvp of grad, scanned")
-"""The orders through a forward derivative, which a custom VJP with no forward rule does not run: Training &
-Data's (`chunked`'s heads, `residuals`' pullbacks, a node perturbation's estimate), each joining with row
-2690's fix."""
 
 
 @pytest.mark.parametrize("edge", EDGES)
