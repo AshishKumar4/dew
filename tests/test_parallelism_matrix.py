@@ -90,7 +90,6 @@ REFUSED: dict[tuple[str, str], str] = {
 
 RUN_ONCE: frozenset[tuple[str, str]] = frozenset({
     ("edm2", "tensor4"), ("edm2", "fsdp2_tensor2"), ("edm2", "sequence4"),
-    ("edm2_level", "tensor4"), ("edm2_level", "fsdp2_tensor2"),
 })
 """The cells no accuracy test judges. edm2's zoo model joined the matrix with check 1 as its
 accuracy judge; the floor judge has never judged it, and one floor-judged cell of it runs 180 s
@@ -117,7 +116,8 @@ PAST_TARGET = {"test_each_layout_of_a_model_runs_or_is_refused_as_stated": {
 """The run-once cells past a group's 120 s target, which the whole suite alone runs (`whole_suite.timed`):
 compile-bound, each timed alone on an armada 25/17 worker (om-edm2-time, 2026-10-29), about 1.35 times
 that on the fleet's 26/17 workers. EDM2's one-level model (`edm2_level`) splits over the same tensor
-layouts in every train's run, 75.4 s and 66.3 s alone (IG2504M, 2026-10-30, ledger 2504)."""
+layouts in every train's run, its step judged by the floor judge as every cell's is, 73.6 s and 78.2 s
+alone (IGEDMJ, 2026-10-30, ledger 2504)."""
 
 
 def cells(*, judged: bool) -> list[tuple[str, str, int | None]]:
