@@ -540,11 +540,12 @@ def expert_dispatch[Parameters](
     token order.
 
     `project` takes rows sorted by expert, the group sizes, the sorted expert
-    ids and the expert-major parameters, and returns rows of the same width;
-    `parameter_axes` names the parameters' dimensions. The caller owns the
-    activation, biases and output weights; `input_weights` scales each expert's
-    input instead, as Llama 4 does. `x` is `[batch, length, width]` or
-    `[tokens, width]`.
+    ids and the expert-major parameters, and returns a row per slot, of its own
+    width, which may differ from the tokens' (MoVA's values,
+    `dew.nn.value_experts`); `parameter_axes` names the parameters' dimensions.
+    The caller owns the activation, biases and output weights; `input_weights`
+    scales each expert's input instead, as Llama 4 does. `x` is
+    `[batch, length, width]` or `[tokens, width]`.
 
     `dispatch='global'` routes the tokens where they are, in a `shard_map` that
     holds them as the residual stream does, so each device runs its own rows
@@ -743,7 +744,7 @@ def _sorted_locally[Parameters](
     projected = project(grouped, jnp.bincount(experts, length=num_experts),
                         experts[order], parameters)
     projected = jnp.where((experts[order] < num_experts)[:, None], projected, 0)
-    return projected[jnp.argsort(order)].reshape(*indices.shape, x.shape[-1])
+    return projected[jnp.argsort(order)].reshape(*indices.shape, projected.shape[-1])
 
 
 def _exchange_shard[Parameters](
@@ -809,7 +810,8 @@ def _exchange_shard[Parameters](
         return returned, jnp.where(valid, order[addresses], slots)
 
     returned, targets = exchange_round(0)
-    combined = jnp.zeros((slots, tokens.shape[-1]), output_dtype).at[targets].set(
+    # A projection's rows may be wider or narrower than the tokens' (MoVA's values).
+    combined = jnp.zeros((slots, returned.shape[-1]), output_dtype).at[targets].set(
         returned, mode='drop')
     if capacity is None and slots > first:
         rounds = -(-(slots - first) // first)
@@ -826,7 +828,7 @@ def _exchange_shard[Parameters](
             return jax.lax.cond(iteration < needed, active, lambda out: out, out), None
 
         combined, _ = jax.lax.scan(step, combined, jnp.arange(rounds))
-    return combined.reshape(*indices.shape, tokens.shape[-1])
+    return combined.reshape(*indices.shape, combined.shape[-1])
 
 
 def _widened[Tree](parameters: Tree) -> Tree:
