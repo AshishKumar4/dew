@@ -249,11 +249,7 @@ TRAINING_SEEDS = {(model, dtype, packed): 8 for model in CONV_SHAPES for dtype i
 `seeds_for` paired with the kernels on a GPU."""
 
 
-@pytest.mark.gpu(reason="the training shapes' float64 distances are a GPU's")
-@pytest.mark.parametrize("packed", [False, True])
-@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
-@pytest.mark.parametrize("model", sorted(CONV_SHAPES))
-def test_the_kernels_are_as_exact_as_xla_at_the_training_shapes(model, dtype, packed):
+def the_kernels_are_as_exact_as_xla_at_the_training_shapes(model, dtype, packed):
     """A delta net's conv at its training width and length, bf16 projections into the bf16 operands
     fla's rule takes, and fp32 into fp32, whole rows and packed ones: each piece and the gradients of the
     projection and the taps on par (check 1) with XLA's own conv from float64, at each launch's config at

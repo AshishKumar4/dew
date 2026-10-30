@@ -844,8 +844,8 @@ def _summed_back(index, pairs, after, *, exact: bool):
     `s`. Each token sums only the terms whose range holds it, `sum_{j < t <= i} pairs + sum_{s >= t}
     after`, where fla takes the gradient of each cumulated decay (row sums less column sums) and sums
     those back, adding and taking back every term whose range misses the token: fp32's residue where
-    the gradient is exactly zero (keys of zero before a token, 1.7e-10 in
-    test_a_range_late_in_a_long_decayed_chunk_is_as_exact_as_fla), and the cancellation of terms
+    the gradient is exactly zero (keys of zero before a token, 1.7e-10 at a range late in a long decayed
+    chunk), and the cancellation of terms
     many times the gradient where it is not. Each row's pairs before `t` are their sum, a product with
     the strictly upper mask (`_exactly`): a running sum less its `t`th lost a small pair beside a large
     one (1 beside 2^24 summed to 2^24, then less 2^24, nothing)."""
