@@ -133,6 +133,7 @@ class DecisionObjective(Objective[Ratio | Weighted]):
 
     saved_task = Decide
     settings = DecideSettings
+    passes_progress = True
     _held_parts = True
     # The record is the backbone's; the head beside it is a task setting.
     _recorded_part = "backbone"
@@ -390,7 +391,7 @@ class DecisionObjective(Objective[Ratio | Weighted]):
                           attention=self.layout.attention)
         logits, sown = self.model.observed_logits(
             variables, inputs, train=step.training, rngs=model_rngs(step.key, training=step.training),
-            opened=step.sown())
+            progress=self.progress(step), opened=step.sown())
         loss, aux = self._charged(logits, inputs, batch)
         return loss, replace(aux, inspected=sown.get(INSPECTED, {}) if step.watched is not None else None)
 

@@ -27,6 +27,7 @@ from dew.data.prompts import LENGTH_KEY, PROMPT_KEY
 from dew.inputs import Field, InputSpec
 from dew.nn.inputs import rotate_rows
 from dew.nn.precision import at_least_fp32, compensated_sum, weighted_total
+from dew.nn.progress import END, Progress
 from dew.objectives.base import Aux, EMASpec, Ratio, Shown
 from dew.objectives.lm.chunked import final_read
 from dew.objectives.routing import ExpertBalance
@@ -253,8 +254,9 @@ class GRPOObjective(TokenScorer):
         terms = k3_kl(policy, reference) if self.kl_term == "k3" else delta * (0.5 * delta)
         return Ratio(weighted_total(terms, weights)[0], mass)
 
-    def packed_log_probs(self, params: Variables, batch) -> jax.Array:
-        """Return each packed id's log-probability given its own chain's prefix, placed by `onto_ids`.
+    def packed_log_probs(self, params: Variables, batch, *, progress: Progress = END) -> jax.Array:
+        """Return each packed id's log-probability given its own chain's prefix, placed by `onto_ids`, the
+        policy at the run's `progress` where it reads it (`dew.nn.progress`), its end by default.
 
         The loss and a proximal rescoring share its scoring path. A
         packed column whose shape differs from `input_ids` raises `ValueError`.
@@ -263,10 +265,10 @@ class GRPOObjective(TokenScorer):
         `_packed_scores`, which returns them from the same forward, so an override
         of this method must override that one too.
         """
-        return self._packed_scores(params, batch)[0]
+        return self._packed_scores(params, batch, progress=progress)[0]
 
     def _packed_scores(self, params: Variables, batch, *, qk_stats: bool = False, routing: bool = False,
-                       watched: bool = False) -> tuple[jax.Array, Scores]:
+                       watched: bool = False, progress: Progress = END) -> tuple[jax.Array, Scores]:
         """The packed policy likelihoods and their live `Scores`: the QK collection where `qk_stats` asks
         for it, the routers' choices where `routing` does, and the watched activations where the step
         watches (`watched`)."""
@@ -282,13 +284,14 @@ class GRPOObjective(TokenScorer):
         laid = coordinates(ids.shape, segments=segments,
                            positions=jnp.asarray(batch[POSITIONS_KEY], jnp.int32))
         scores = self.token_scores(params, ids, coordinates=laid, routes=routes, qk_stats=qk_stats,
-                                   routing=routing, watched=watched)
+                                   routing=routing, watched=watched, progress=progress)
         support = (None if SUPPORT_KEY not in batch
                    else (batch[SUPPORT_KEY], batch[SUPPORT_COLUMNS_KEY]))
         sampled = self.sampled_log_probs(params, scores, ids, support, self.sampling_temperature)
         return onto_ids(batch, sampled), scores
 
-    def _terms(self, params, batch, *, qk_stats: bool = False, watched: bool = False) -> _Terms:
+    def _terms(self, params, batch, *, qk_stats: bool = False, watched: bool = False,
+               progress: Progress = END) -> _Terms:
         """Read a packed batch onto its own `[rows, width]` grid.
 
         The old policy is `old_log_probs` when a rescoring or the sampler
@@ -307,10 +310,11 @@ class GRPOObjective(TokenScorer):
         routed = self.balance is not None
         if qk_stats or routed or watched:
             policy, scores = self._packed_scores(params, batch, qk_stats=qk_stats, routing=routed,
-                                                 watched=watched)
+                                                 watched=watched, progress=progress)
             qk, sown, inspected = scores.qk, scores.routing, scores.inspected
         else:
-            policy, qk, sown, inspected = self.packed_log_probs(params, batch), None, None, None
+            policy = self.packed_log_probs(params, batch, progress=progress)
+            qk, sown, inspected = None, None, None
         dtype = at_least_fp32(policy.dtype)
         mask = jnp.asarray(batch[RESPONSE_MASK_KEY], dtype)
         behavior = jnp.asarray(batch[BEHAVIOR_LOG_PROBS_KEY], dtype)
@@ -328,7 +332,8 @@ class GRPOObjective(TokenScorer):
         The policy's log-probabilities are recomputed from the rollout's own
         ids, so every term uses the tokens that were actually sampled.
         """
-        terms = self._terms(variables, batch, qk_stats=step.qk_stats, watched=step.watched is not None)
+        terms = self._terms(variables, batch, qk_stats=step.qk_stats, watched=step.watched is not None,
+                            progress=self.progress(step))
         mask = terms.mask
         correction = self.behavior_importance
         if isinstance(correction, float) and not terms.proximal:
@@ -374,7 +379,8 @@ class GRPOObjective(TokenScorer):
                 raise ValueError(
                     "the KL term reads step.ema, but the objective keeps no EMA; "
                     "a GRPO run with beta above zero always freezes one")
-            kl = self.reference_penalty(terms.policy, self.packed_log_probs(step.ema, batch), weights, mass)
+            reference = self.packed_log_probs(step.ema, batch, progress=self.progress(step))
+            kl = self.reference_penalty(terms.policy, reference, weights, mass)
             metrics["kl"], _ = kl.mean()
             objective = Ratio(pg.total + self.beta * kl.total, mass)
         else:

@@ -43,6 +43,7 @@ from dew.inputs import Field, InputSpec
 from dew.nn.inputs import ModelInputs
 from dew.nn.inspection import INSPECTED
 from dew.nn.precision import at_least_fp32, weighted_total
+from dew.nn.progress import progressed
 from dew.nn.protocols import BlockDenoiser, CacheCapacity, Lacks, LayerScalars
 from dew.nn.sharding import LOGITS, constrain
 from dew.nn.visibility import same_group
@@ -183,6 +184,7 @@ class BlockDiffusionObjective(HeadedObjective[BlockSFTStatistics]):
 
     saved_task = BlockGeneration
     settings = BlockSettings
+    passes_progress = True
 
     def __init__(self, model: DiffusionGemma | Source, *, prompt_length: int,
                  num_canvases: int = 1, canvas_size: int | None = None,
@@ -469,11 +471,13 @@ class BlockDiffusionObjective(HeadedObjective[BlockSFTStatistics]):
         encoder_kwargs[COORDINATES_FIELD] = coordinates(
             tokens.shape[:2], segments=segments, valid=full_valid, positions=positions,
             max_segments=None if given is None else given.max_segments)
+        # The run's progress, which the encoder and each denoising pass read where the model does.
+        at_progress = progressed(model, self.progress(step))
         encoder_states, mutated = model.apply(
             {**params, "cache": cache}, tokens, **encoder_kwargs,
             attention_pairwise_mask=encoder_mask, attention_key_positions=encoder_keys,
             method=model.encode, train=train, states=True, mutable=["cache", *observed], rngs=rngs,
-            capture_intermediates=False)
+            capture_intermediates=False, **at_progress)
         cache = mutated["cache"]
         if self.stop_gradient_from_denoiser_to_encoder:
             cache = jax.lax.stop_gradient(cache)
@@ -483,7 +487,7 @@ class BlockDiffusionObjective(HeadedObjective[BlockSFTStatistics]):
                 {**params, "cache": cache}, noisy, self_conditioning_logits=sc_logits,
                 train=train, rngs=rngs, positions=positions[:, self.prompt_length:],
                 attention_pairwise_mask=decoder_mask, attention_key_positions=decoder_keys,
-                states=True, mutable=observed or False)
+                states=True, mutable=observed or False, **at_progress)
             return read if observed else (read, {})
 
         # The zero signal in the dtype the model's states compute in, at least fp32, so a float64 model's

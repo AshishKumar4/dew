@@ -35,7 +35,7 @@ from dew.inputs import Field, InputSpec
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import REMAT_POLICIES
 from dew.nn.multimodal import MultimodalTransformer
-from dew.nn.progress import progress
+from dew.nn.progress import END, Progress
 from dew.nn.vision import GemmaProjector, SiglipVision
 from dew.objectives.base import Objective, Ratio, Step
 from dew.objectives.lm import IndexerTraining, LMObjective
@@ -443,9 +443,13 @@ class Progressing(nn.Module):
     """A Dense layer whose output the run's progress scales (`dew.nn.progress`): by the updates the run
     committed before the step, zero at its first step."""
 
+    @nn.nowrap
+    def reads_progress(self) -> bool:
+        return True
+
     @nn.compact
-    def __call__(self, x):
-        updates = progress().updates
+    def __call__(self, x, progress: Progress = END):
+        updates = progress.updates
         return nn.Dense(2)(x) * (1.0 if updates is None else updates.astype(jnp.float32))
 
 
