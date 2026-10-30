@@ -33,8 +33,8 @@ from gateway_manager import LimitedMappingKernelManager
 
 
 class Relaunching(KernelGatewayIOLoopKernelManager):
-    """A plain kernel whose restart says it began (RELAUNCHED) and then, as DEW_TEST_RELAUNCH says, takes three
-    seconds in its shutdown (`slow-stop`) or its relaunch (`slow`), or its relaunch raises (`fail`)."""
+    """A plain kernel whose restart says it began (RELAUNCHED) and then, as DEW_TEST_RELAUNCH says, takes
+    three seconds in its shutdown (`slow-stop`) or its relaunch (`slow`), or its relaunch raises (`fail`)."""
 
     launches = 0
 
@@ -191,8 +191,8 @@ def test_a_kernel_deleted_while_it_restarts_or_after_its_relaunch_failed_leaves_
         tmp_path, relaunch):
     """A kernel deleted while it restarts, in the restart's shutdown or its relaunch, as the bridge deletes a
     context it hears restarting, ends once the restart settles, where the delete had failed and kept it; one
-    whose relaunch raised, which no restarter ends, is released by its delete. Either way no connection file is
-    left (ledger 2516)."""
+    whose relaunch raised, which no restarter ends, is released by its delete. Either way no connection file
+    is left (ledger 2516)."""
     options = ("--KernelRestarter.time_to_dead=0.5",)
     with gateway(tmp_path, 300, *options, relaunch=relaunch) as port:
         identifier = created(port)
