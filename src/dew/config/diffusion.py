@@ -440,7 +440,7 @@ class DiffusionRunConfig(RunConfig):
         placement = self.source_keywords(frozen=self.lora is not None)
         return load_diffusion_source(
             reference.name, revision=reference.revision,
-            dtype=dtype_name(resolve_dtype(self.compute_dtype())),
+            dtype=dtype_name(jax.numpy.dtype(self.compute_dtype())),
             param_dtype=self.trainer.precision.dtypes.params,
             attention_impl=self.source_attention(),
             size=self.sample_field().shape[:-1],
