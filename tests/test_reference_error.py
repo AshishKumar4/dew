@@ -30,6 +30,8 @@ from reference_error import (
     widened,
 )
 
+from dew.nn.precision import accumulated
+
 
 @pytest.mark.skipif(jax.default_backend() != "cpu", reason="WITHOUT_YNN is XLA:CPU's")
 def test_without_ynn_computes_what_xla_cpu_computes_with_every_ynnpack_fusion_off(tmp_path):
@@ -50,6 +52,48 @@ def test_without_ynn_computes_what_xla_cpu_computes_with_every_ynnpack_fusion_of
     with np.load(out) as theirs:
         for name, value in ynn_programs.outputs(without_ynn).items():
             np.testing.assert_array_equal(np.asarray(value), theirs[name], err_msg=name)
+
+
+def one_key_draw(seed):
+    """bf16 queries [2, 5, 4, 32] over a single key and value of two heads."""
+    rng = np.random.default_rng([1698, 1, seed])
+    return tuple(jnp.asarray(rng.standard_normal(shape), jnp.bfloat16)
+                 for shape in ((2, 5, 4, 32), (2, 1, 2, 32), (2, 1, 2, 32)))
+
+
+def pulled_by_itself(attention):
+    """`attention`'s output and the gradients of its inputs under that output as the cotangent."""
+    def run(query, key, value):
+        out, pull = jax.vjp(attention, query, key, value)
+        return out, *pull(out)
+    return run
+
+
+def xla_attention(query, key, value):
+    """jax.nn's attention, its XLA implementation."""
+    return jax.nn.dot_product_attention(query, key, value, implementation="xla")
+
+
+def written_attention(query, key, value):
+    """The same attention written out: grouped heads, fp32 logits, a softmax in fp32 rounded to bf16."""
+    group = query.shape[2] // key.shape[2]
+    keys, values = jnp.repeat(key, group, axis=2), jnp.repeat(value, group, axis=2)
+    logits = jnp.einsum("btnh,bsnh->bnts", query, keys, preferred_element_type=jnp.float32)
+    weights = jax.nn.softmax(logits / np.sqrt(query.shape[-1]), axis=-1).astype(query.dtype)
+    return jnp.einsum("bnts,bsnh->btnh", weights, values)
+
+
+@pytest.mark.skipif(jax.default_backend() != "cpu", reason="WITHOUT_YNN is XLA:CPU's")
+def test_a_check_whose_program_xla_cpu_compiles_only_with_ynnpacks_fusions_runs_both_arms_with_them():
+    """XLA:CPU refuses jax.nn's XLA attention's backward over a single key without YNNPACK's fusions, at
+    every matmul precision (`YNN_REFUSED`); check 1 turns both arms over to the fusions there (`_Paired`),
+    the two still of one kind, and judges them."""
+    from reference_error import without_ynn
+
+    with pytest.raises(jax.errors.JaxRuntimeError):
+        without_ynn(pulled_by_itself(xla_attention))(*one_key_draw(0))
+    assert_as_exact(pulled_by_itself(xla_attention), pulled_by_itself(written_attention), one_key_draw,
+                    "attention over one key", seeds=16)
 
 
 @pytest.mark.skipif(jax.default_backend() != "cpu", reason="WITHOUT_YNN is XLA:CPU's")
@@ -323,6 +367,36 @@ def test_check_1_sizes_a_row_that_cancels_behind_its_final_sum_by_the_sites_own_
     with pytest.raises(ValueError):
         assert_as_exact(mixed(cancelling(split=True)), reference, cancelling_draw, "another tree", seeds=16,
                         terms=lambda x, w: mixed_terms(x, w)["rows"])
+
+
+def long_dot_draw(seed):
+    """A [16, 4096] by [4096, 8] fp32 dot's operands: sums long enough that fp32's own rounding of them is
+    several times the half ulp of a float64 sum rounded once."""
+    rng = np.random.default_rng([1698, seed])
+    return (jnp.asarray(rng.standard_normal((16, 4096)), jnp.float32),
+            jnp.asarray(rng.standard_normal((4096, 8)), jnp.float32))
+
+
+def dews_product(x, w):
+    """Dew's product (`accumulated`): in the suite's wide CPU arithmetic, float64 sums rounded once."""
+    return accumulated(jnp.matmul, x, w)
+
+
+def summed_wide(x, w):
+    """Dew's product stating a precision of its own inside its arm, so it keeps the float64 sums."""
+    with jax.default_matmul_precision("highest"):
+        return dews_product(x, w)
+
+
+@pytest.mark.skipif(jax.default_backend() != "cpu", reason="the suite's wide arithmetic is a CPU's")
+def test_check_1_runs_each_arm_as_its_users_sum_their_products():
+    """On the CPU lane check 1 runs each arm with fp32 products summed in fp32 (`_summed_as_run`), the
+    truth outside that: Dew's product, which sums in float64 only under the suite's wide arithmetic, is
+    judged as its users run it, so XLA's plain fp32 dot is on par with it; and against the same
+    product kept to its float64 sums, the plain dot fails, so the truth is still float64's."""
+    assert_as_exact(jnp.matmul, dews_product, long_dot_draw, "as its users sum", seeds=16)
+    with pytest.raises(GateFailure):
+        assert_as_exact(jnp.matmul, summed_wide, long_dot_draw, "summed wide", seeds=16)
 
 
 def test_further_references_judge_one_dew_arm_each_by_its_own_check_once_a_draw():
