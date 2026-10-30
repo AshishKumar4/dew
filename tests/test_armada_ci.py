@@ -158,6 +158,8 @@ def test_a_collect_task_rows_each_file_red_where_it_would_not_import(ci, tmp_pat
     assert {name: (row["kind"], row["failed"]) for name, row in rows.items() if row["exitCode"]} == {
         "3.14:tests/test_broken.py#collect": ("collect", []),
         "3.14:tests/test_missing.py#collect": ("collect", [])}
+    # A collection runs no test, so its rows count no site moved onto YNNPACK's fusions.
+    assert all(row["ynn_switched"] == [] for row in rows.values())
 
 
 def test_a_targeted_pytest_selects_the_tests_a_task_would_and_its_own_arguments_override(ci, tmp_path):
