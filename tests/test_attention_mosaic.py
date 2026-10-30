@@ -999,30 +999,19 @@ def test_a_forward_kernel_built_for_its_facts_runs_each_calls_own_interpreted():
 
 
 @INTERPRETS
-@pytest.mark.parametrize("hooked", ["initial", "shape-reading"])
-def test_a_forward_kernel_built_for_its_facts_holds_no_calls_arrays_interpreted(hooked):
+def test_a_forward_kernel_built_for_its_facts_holds_no_calls_arrays_interpreted():
     """The forward's kernel, built once for every call of its static facts (`_kernel_of`, row 2440), holds
-    none of a call's arrays: its operands, its hooks' arrays (an initial state's sums) and an array its
-    score hook closes over (one reading its shape, which no cached kernel may keep) are each released once
-    the call is."""
+    none of a call's arrays, its operands' nor its hooks' (an initial state's sums, which its key describes
+    by shape and dtype, `_described`): each is released once the call is. (A hook closing over an array is
+    built for its call alone, `_holdable`: JAX's own trace caches hold such a closure as they did before.)"""
     shape = SHAPES["interpreted"]
     spans = template.spans(shape[1], shape[1], shape[0], causal=True)
     query, key, value, _ = _drawn(shape, jnp.bfloat16)(0)
-    held = [query, key, value]
-    if hooked == "initial":
-        hooks = template.Hooks(initial=template.sinks(jnp.linspace(-1.0, 1.0, shape[2]), shape[0], shape[1],
-                                                      128))
-        held += [hooks.initial.m, hooks.initial.acc]
-    else:
-        def shape_reading(operand):
-            return lambda s, q_pos, k_pos: s / operand.shape[-1]
-
-        held.append(jnp.ones((shape[1],)))
-        hooks = template.Hooks(score_mod=shape_reading(held[-1]))
-    refs = [weakref.ref(array) for array in held]
+    hooks = template.Hooks(initial=template.sinks(jnp.linspace(-1.0, 1.0, shape[2]), shape[0], shape[1], 128))
+    refs = [weakref.ref(array) for array in (query, key, value, hooks.initial.m, hooks.initial.acc)]
     with _device(interpret=True):
         jax.block_until_ready(attention_mosaic.forward(query, key, value, spans, hooks, interpret=True))
-    del query, key, value, hooks, held
+    del query, key, value, hooks
     gc.collect()
     assert [ref() is None for ref in refs] == [True] * len(refs)
 
