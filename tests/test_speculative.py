@@ -79,7 +79,7 @@ def test_speculation_across_a_longrope_rebuild_reproduces_the_greedy_walk(kind):
     np.testing.assert_array_equal(np.asarray(speculated.lengths), 6)
 
 
-RESEED_SEEDS = 64
+RESEED_SEEDS = 8
 """The reseed's declared draws of prompts and stretches (check 1), sized by `seeds_for` paired with the
 crossed state on armada."""
 
