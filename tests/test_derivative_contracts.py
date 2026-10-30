@@ -988,3 +988,46 @@ def test_the_lm_heads_hold_their_reverse_orders(head, edge):
     (cotangent,) = normal_draw(2706, jax.eval_shape(plain, hidden, table).shape)
     assert_contract(heads, (hidden, table), direction, cotangent, f"the {head} LM head {edge}",
                     truth_fn=plain, plain_fn=plain, without=(*FORWARD_ORDERS, "grad of grad"))
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_a_node_perturbation_estimate_holds_its_reverse_orders(edge):
+    """A node perturbation objective's loss (`NodePerturbation.loss.estimated`, a custom VJP whose reverse
+    rule is its estimate of the gradient from the model's forwards at perturbed sites): over a two-layer
+    linear model's squared error, its primal, its estimate and the estimate's own reverse derivative finite
+    wherever its float64 run, the same perturbations drawn at float64, is a normal float32; forward mode,
+    which an estimate from forwards alone has none of, row 2690's."""
+    from flax import linen as nn
+    from model_support import parameter_loss
+
+    from dew.inputs import Field, InputSpec
+    from dew.objectives.base import Step
+    from dew.objectives.perturbation import NodePerturbation
+    from dew.objectives.supervised import Supervised
+
+    class Linear(nn.Module):
+        @nn.compact
+        def __call__(self, x):
+            return nn.Dense(2)(nn.Dense(4)(x))
+
+    class Perturbed(NodePerturbation, Supervised):
+        """`Supervised` trained by node perturbation."""
+
+    def squared(outputs, batch):
+        return jnp.sum(jnp.square(outputs.astype(jnp.float32) - batch["y"]), -1)
+
+    objective = Perturbed(Linear(), squared, inputs=InputSpec(Field("x", (3,))), draws=4)
+    variables = objective.init(jax.random.key(0))
+    leaves, structure = jax.tree.flatten(variables["params"])
+    x, y = normal_draw(2707, (6, 3), (6, 2))
+    step = Step(jnp.asarray(0), jax.random.key(1), None)
+
+    def loss(*params):
+        batch = {"x": x.astype(params[0].dtype), "y": y.astype(params[0].dtype)}
+        return parameter_loss(objective, variables, batch, step)(jax.tree.unflatten(structure, params))
+
+    primals = tuple(leaf * EDGES[edge] for leaf in normal_draw(2708, *(leaf.shape for leaf in leaves)))
+    direction = normal_draw(2709, *(leaf.shape for leaf in leaves), scale=EDGES[edge])
+    (cotangent,) = normal_draw(2710, ())
+    assert_contract(loss, primals, direction, cotangent, f"a node perturbation estimate {edge}",
+                    without=FORWARD_ORDERS)

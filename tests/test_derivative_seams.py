@@ -108,6 +108,8 @@ CONTRACTED = {
         "test_the_fused_norms_and_products_hold_every_order",
     "src/dew/nn/kernels/norm_swiglu.py::packed_swiglu.linear_tangent":
         "test_the_fused_norms_and_products_hold_every_order",
+    "src/dew/objectives/perturbation.py::NodePerturbation.loss.estimated":
+        "test_a_node_perturbation_estimate_holds_its_reverse_orders",
 }
 """Each contracted seam, `path::qualified name`, and the test of tests/test_derivative_contracts.py that holds
 it."""
@@ -118,7 +120,6 @@ PENDING = frozenset({
     "src/dew/nn/kernels/templates/layout.py::_custom.held",
     "src/dew/nn/moe.py::_stored_primal",
     "src/dew/nn/precision.py::at_default_precision.run",
-    "src/dew/objectives/perturbation.py::NodePerturbation.loss.estimated",
     "src/dew/quantization.py::frozen_fp8_product",
     "src/dew/quantization.py::_grouped_convolution_gradient.grouped_conv_qt",
     "src/dew/sampling/flow.py::_directional",
