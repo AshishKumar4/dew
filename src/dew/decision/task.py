@@ -1286,12 +1286,13 @@ def trained_tree(model: DecisionModel, variables: Variables) -> Variables:
     """A task's weights as a run trains them, the model's own tree: the backbone's projections, packed
     to serve (`_served`), split back (`unpacked`, ledger 2299), so a run trains, and its resume builds,
     one tree wherever it runs. A trunk held frozen keeps the layout it was stored in, as `_served`
-    leaves it (ledger 2439)."""
+    leaves it (ledger 2439), and a task that holds no weights (a scoring task's, `Decide.scoring`)
+    has none to split."""
     from dew.batch import FROZEN, part
     from dew.inference.projections import unpacked
 
     backbone = part(variables, "backbone")
-    if FROZEN in backbone:
+    if "params" not in backbone or FROZEN in backbone:
         return variables
     return joined({"backbone": unpacked(model.backbone, backbone), "head": part(variables, "head")})
 

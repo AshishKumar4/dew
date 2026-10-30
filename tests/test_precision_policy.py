@@ -509,6 +509,26 @@ def test_a_runs_precision_policy_sets_every_product_that_states_none(policy):
         assert form == "fast"
 
 
+def test_a_bf16_head_under_a_runs_highest_precision_leaves_the_bf16_algorithm():
+    """A bf16 decoder's vocabulary head takes the bf16 dot algorithm at the default precision; under a
+    run's ACCURATE numerics, which configure "highest", every product of its forward and of its chunked
+    head multiplies at HIGHEST, none at the bf16 algorithm (`operand_precision`, review of ledger 2500)."""
+    from dew.objectives.lm.chunked import chunked_cross_entropy
+
+    model = LAYERS["packed"](dtype=jnp.bfloat16)
+    tokens = jnp.arange(16, dtype=jnp.int32).reshape(1, 16) % 64
+    variables = model.init(jax.random.key(0), tokens)
+
+    def traced(variables, tokens):
+        with generation.run_precision(ACCURATE):
+            states = model.apply(variables, tokens, method="hidden_states")
+            table = model.apply(variables, method="output_table")
+            return model.apply(variables, tokens), chunked_cross_entropy(states, table, tokens, 2)
+
+    precisions = dot_precisions(traced, variables, tokens)
+    assert precisions and all(precision == HIGHEST for precision, _, _ in precisions), precisions
+
+
 def test_a_layer_over_bf16_parameters_fed_float32_multiplies_at_jax_s_configured_precision():
     """flax promotes a layer with no dtype over bf16 parameters and a float32 input to float32, and
     its products multiply at JAX's configured precision, as a float32 layer's do."""
@@ -560,25 +580,28 @@ def test_a_tiled_head_takes_each_tile_as_the_whole_head_takes_its_logits(tied):
     """A chunked head multiplies each vocabulary tile by `bf16_product` over the tile's rows
     (`dew.objectives.lm.chunked`): of a bf16 model those are its forward's logits' columns, bitwise,
     so the chunked head predicts those logits' argmax wherever a tile cuts; its scores are held to
-    those logits' cross entropy by check 1 (tests/test_chunked_cross_entropy.py)."""
+    those logits' cross entropy by check 1 (tests/test_chunked_cross_entropy.py). Under JAX's default
+    precision, as a run's default numerics multiply: a run's "highest" leaves the bf16 algorithm, the
+    head's and each tile's alike (`operand_precision`)."""
     from dew.nn.precision import bf16_product
     from dew.objectives.lm.chunked import chunked_cross_entropy
 
     model = CausalTransformer(vocab_size=97, emb_features=32, num_layers=2, num_heads=4, mlp_features=64,
                               max_seq_len=16, tie_embeddings=tied, dtype=jnp.bfloat16)
-    ids = jax.random.randint(jax.random.key(0), (2, 12), 0, 97)
-    targets = jax.random.randint(jax.random.key(1), (2, 12), 0, 97)
-    variables = model.init(jax.random.key(0), ids)
-    logits = np.asarray(model.apply(variables, ids)).reshape(-1, 97)
-    states = model.apply(variables, ids, method="hidden_states")
-    table = model.apply(variables, method="output_table")
-    rows = table.matrix if table.vocab_major else table.matrix.T
-    for first in range(0, 97, 25):
-        tile = np.asarray(bf16_product("td,vd->tv", states.reshape(-1, 32), rows[first:first + 25]))
-        np.testing.assert_array_equal(tile, logits[:, first:first + 25])
-    for chunks in (1, 4):
-        _, predicted, _ = chunked_cross_entropy(states, table, targets, chunks)
-        np.testing.assert_array_equal(np.asarray(predicted).reshape(-1), logits.argmax(-1))
+    with jax.default_matmul_precision(None):
+        ids = jax.random.randint(jax.random.key(0), (2, 12), 0, 97)
+        targets = jax.random.randint(jax.random.key(1), (2, 12), 0, 97)
+        variables = model.init(jax.random.key(0), ids)
+        logits = np.asarray(model.apply(variables, ids)).reshape(-1, 97)
+        states = model.apply(variables, ids, method="hidden_states")
+        table = model.apply(variables, method="output_table")
+        rows = table.matrix if table.vocab_major else table.matrix.T
+        for first in range(0, 97, 25):
+            tile = np.asarray(bf16_product("td,vd->tv", states.reshape(-1, 32), rows[first:first + 25]))
+            np.testing.assert_array_equal(tile, logits[:, first:first + 25])
+        for chunks in (1, 4):
+            _, predicted, _ = chunked_cross_entropy(states, table, targets, chunks)
+            np.testing.assert_array_equal(np.asarray(predicted).reshape(-1), logits.argmax(-1))
 
 
 @pytest.mark.parametrize("axis", [None, 1, (0, 1), -1])
