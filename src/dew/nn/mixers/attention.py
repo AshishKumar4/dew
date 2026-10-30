@@ -1117,8 +1117,7 @@ class CausalSelfAttention(nn.Module):
         groups = _Groups() if prefix is not None else self._key_groups(attention_metadata, history, decode, S)
         if self._reads_whole_blocks(attention_metadata, prefix, append, decode):
             causal, window, groups = False, None, groups._replace(block_groups=None)
-        # Over the keys the call reads, the cache's or the prefix's joined, decided only where the call
-        # takes it: a kernel a run's context forces refuses a mask it would never build.
+        # Over the keys the call reads (the cache's or the prefix's joined), decided only where it is taken.
         masked = functools.partial(self._mask_kernel, query, key, decode)
         cached = isinstance(documents, CrossDocuments)
         if (cached or groups != _Groups()) and self.ctx.attention_impl != 'auto':
