@@ -17,11 +17,13 @@ import jax
 import numpy as np
 import optax
 import pytest
-from affine_run import TimingRegression as Regression, batches
+from affine_run import FEATURES, TimingRegression as Regression, batches
 from PIL import Image
 
 from dew.artifacts import Decisions, ImageGrid, Representations, TextSamples, TokenScores, VideoGrid
+from dew.data import Memory
 from dew.data.dataset import Loader
+from dew.data.pipeline import Pipeline
 from dew.pool import PREEMPTED_EXIT
 from dew.telemetry.records import FitEnded
 from dew.training import Checkpoints, LocalTracker, Trackers, Trainer
@@ -394,6 +396,16 @@ def test_a_run_on_the_examples_clock_shows_its_progress_in_examples_and_estimate
     assert "10/≈40" in shown and "25%" in shown
     counted = TrainingDisplay(total=40)
     assert counted.steps_total() == (40, "40")
+
+
+def test_a_clocked_fit_announces_its_bound_and_logs_its_estimated_steps(capsys):
+    """A clocked fit printed without a live panel names its length as the examples it is bounded to, not
+    a token count it has none of, and each logged step its estimated total (row 2528)."""
+    x = np.random.default_rng(0).normal(size=(24, FEATURES)).astype(np.float32)
+    Trainer(Regression(), optax.sgd(0.01), key=jax.random.key(0)).fit(
+        Pipeline(Memory({"x": x, "y": 2 * x[:, :2]})).read("streamed").batch(8), examples=24, log_every=1)
+    printed = capsys.readouterr().out
+    assert "for 24 examples" in printed and "None" not in printed and "step 3/≈3" in printed
 
 
 def test_the_panel_names_a_lower_bound_utilization_and_its_uncounted_kernels_within_its_name_column():

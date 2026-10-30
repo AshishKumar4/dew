@@ -569,6 +569,40 @@ def test_a_clocked_run_whose_split_is_planned_compiles_one_step():
     assert len(logged) > 1 and logged[0]["train/compiles"] == logged[-1]["train/compiles"] > 0
 
 
+class Traced(Pulled):
+    """`Pulled`, keeping the fields of each batch its loss is traced over."""
+
+    def __init__(self):
+        super().__init__()
+        self.traced: list[frozenset[str]] = []
+
+    def loss(self, variables, batch, step):
+        self.traced.append(frozenset(batch))
+        return super().loss(variables, batch, step)
+
+
+def test_a_clocked_runs_cooldown_and_its_step_compiled_ahead_take_its_batches_as_its_fit_does():
+    """Every step a clocked run compiles takes its batches marked whether they close their window
+    (`closes_window`): a cooldown branch's step traces the batch fit's does, so the run keeps one
+    program, and a step compiled ahead for the run (`step_batch`) is handed the batch fit hands its
+    step, so the run takes the saved program as its own (row 2527)."""
+    from dew.batch import CLOSES_WINDOW
+    from dew.training import Cooldowns
+    from dew.training._fit import first_batch
+    from dew.training.ahead import step_batch
+
+    (x,) = clocked_records(0)
+    optim = OptimConfig(optimizer="adam", learning_rate=Linear(peak_value=PEAK, end_value=CLOCKED_END))
+    traced = Traced()
+    Trainer(traced, optim, key=0, cooldowns=Cooldowns(at=("50%",), length=1)).fit(
+        clocked_chain(x), examples=CLOCKED_RECORDS, log_every=1)
+    assert traced.traced and set(traced.traced) == {traced.traced[0]} and CLOSES_WINDOW in traced.traced[0]
+    trainer = Trainer(Pulled(), optim, key=0)
+    loader, _ = fitted(clocked_chain(x), None, objective=Pulled().data(), examples=CLOCKED_RECORDS)
+    trainer.reading(loader, examples=CLOCKED_RECORDS)
+    assert set(step_batch(trainer, first_batch(loader, trainer.device_mesh))) >= traced.traced[0]
+
+
 def test_a_batched_step_that_makes_no_rows_of_a_group_carries_its_examples_on():
     """A batched step after a pack that makes no rows of a group of windows leaves the examples whose last
     tokens those windows held to the next window kept: the batches of a read bounded in examples consume
