@@ -1495,6 +1495,7 @@ def test_the_backward_compiles_spill_free_as_its_model_decides(generation_name, 
     (tests/kernel_compile.py): every launch within its shared memory, spilling nothing, and its register
     model's decision ptxas's (`mosaic_failures`, each launch's model `resources.register_model` at its own
     layout and consumers, `MosaicBackward._launch_registers`)."""
+    import kernel_compile
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
@@ -1520,6 +1521,8 @@ def test_the_backward_compiles_spill_free_as_its_model_decides(generation_name, 
             [KernelCase("backward", lambda: (backward, (query, key, key, query, shapes)), models)],
             generation_name)
     assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+    # Every launch's model names a kernel it compiled: a launch renamed past its model is compared with none.
+    assert set(models) <= kernel_compile.compiled_kernels(found[0]), (set(models), found[0].get("kernels"))
 
 
 def _residuals(shape) -> tuple:
