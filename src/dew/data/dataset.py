@@ -34,7 +34,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from dew import position
 from dew._records import record
-from dew.batch import VALID_ROWS, Batch, padded_rows
+from dew.batch import EXAMPLES_CONSUMED, VALID_ROWS, Batch, padded_rows
 from dew.mesh import LayoutRefused, batch_axes
 
 _log = logging.getLogger(__name__)
@@ -717,6 +717,10 @@ class Loader:
     """The records the training read is bounded to before they are packed (`compile`'s
     `examples`), whose steps a run's `examples=` budget takes (`example_steps`); None where it is
     not bounded."""
+    bound_ends: bool = True
+    """Whether a read bounded in `examples` ends where its bound does, having read every one: no take or
+    slice after the bound ends it first, which a run on the examples clock refuses
+    (`dew.training._fit.clocked`), whose last batch consumes the examples no batch counted (`drained`)."""
     token_ends: tuple[int | None, ...] | None = None
     """The committed tokens each phase of a schedule ends at (`dew.data.pipeline.schedule`), the last
     where the data ends or None where it runs on, which the trainer reads its commits against and ends
@@ -756,15 +760,16 @@ class Loader:
                              "steps")
         return steps
 
-    def example_steps(self, examples: int, window: int = 1) -> int:
+    def example_steps(self, examples: int, window: int = 1) -> int | None:
         """The steps that read the `examples` source examples this loader's training read is bounded to
         (`examples`), with every row the objective makes of each, its last batch short where they end
-        inside one, in whole updates of `window` steps. A global order's plan counts them ahead
-        (`order_records`); one read in its own order, as a pack that runs as rows arrive makes, or one
-        an objective expands after the bound, is counted by reading it once to its end, on the host.
-        Refused where the read is bounded to another count, in a pool, whose processes split the short
-        batch the examples end in unevenly, so each would end at a step of its own, and where the last
-        steps would make no whole update, so some examples would train nothing."""
+        inside one, in whole updates of `window` steps, where a global order's plan counts them ahead
+        (`order_records`); None for one read in its own order, as a pack that runs as rows arrive makes,
+        or one an objective expands after the bound, which no pass reads ahead to count: its run keeps
+        its progress in the examples its batches consume (`dew.batch.EXAMPLES_CONSUMED`). Refused where
+        the read is bounded to another count, in a pool, whose processes split the short batch the
+        examples end in unevenly, so each would end at a step of its own, and where the last steps would
+        make no whole update, so some examples would train nothing."""
         if self.examples != examples:
             held = "not bounded" if self.examples is None else f"bounded to {self.examples}"
             raise ValueError(f"examples={examples} reads a training chain bounded to that many records "
@@ -774,15 +779,9 @@ class Loader:
             raise ValueError("examples end in a short batch, which a pool's processes would split unevenly "
                              "and end at steps of their own; train them on one process or count the run "
                              "in steps")
-        if self.order_records is not None:
-            steps = self._steps(self.order_records, window)
-        else:
-            stream = self.train(DataPartition())
-            try:
-                steps = sum(1 for _ in stream)
-            finally:
-                if isinstance(stream, Closeable):
-                    stream.close()
+        if self.order_records is None:
+            return None
+        steps = self._steps(self.order_records, window)
         if steps % window:
             raise ValueError(f"{examples} examples fill {steps} batches, which are not whole updates of "
                              f"{window} steps: the last {steps % window} would update nothing; change the "
@@ -1058,7 +1057,11 @@ class FilledBatch(pygrain.MapTransform):
         valid = ~repeats & self._real
         if VALID_ROWS in element:
             valid = valid & np.asarray(element[VALID_ROWS], bool)[indices]
-        return {**take_batch(element, indices), VALID_ROWS: valid}
+        filled = {**take_batch(element, indices), VALID_ROWS: valid}
+        if EXAMPLES_CONSUMED in element:
+            # A repeat consumes nothing: its row's examples are the real row's.
+            filled[EXAMPLES_CONSUMED] = np.where(valid, filled[EXAMPLES_CONSUMED], 0).astype(np.int32)
+        return filled
 
 
 def rows_of(batch: Mapping[str, object]) -> int:
