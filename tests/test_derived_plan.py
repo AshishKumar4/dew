@@ -217,9 +217,9 @@ GATE_LAYERS = {
 """The gate's decoders (row 2113): dense, hybrid of Mamba-2 and attention layers, and mixture of experts."""
 
 
-def gated(layers: str, generation: str, remat: str, capacity: int):
+def gated(layers: str, generation: str, remat: str, capacity: int, records) -> list[dict]:
     """A gate case's step compiled ahead for one compile-only GPU of `generation` stating `capacity`
-    bytes: its first compile's probe."""
+    bytes, its rungs recorded under `records`: every compile its plan made, refused or not."""
     from dew.registry import models
     from dew.training.ahead import compile_ahead, compile_only_gpus
 
@@ -229,34 +229,44 @@ def gated(layers: str, generation: str, remat: str, capacity: int):
     trainer = Trainer(LMObjective(model, seq_len=128), optax.adamw(1e-3), key=jax.random.key(0), split=1,
                       mesh=MeshSpec().build(compile_only_gpus(generation, 1)))
     tokens = ((np.arange(4 * 129).reshape(4, 129) * 7) % 128).astype(np.int32)
-    compile_ahead(trainer, {"text": tokens}, capacity=capacity)
-    return trainer.plan["probes"][0]
+    # At JAX's default matmul precision, a run's fast forms', not the suite's highest: an expert
+    # decoder's step at highest on an Ampere holds twice what its derivation finds (row 2750).
+    with pytest.MonkeyPatch.context() as patch, jax.default_matmul_precision("default"):
+        patch.setenv("DEW_RUNG_RECORDS", str(records))
+        try:
+            compile_ahead(trainer, {"text": tokens}, capacity=capacity)
+        except PlanRefused as refused:
+            return [probe.record() for probe in refused.probes]
+    return list(trainer.plan["probes"])
 
 
 @pytest.mark.parametrize("remat", ["none", "full"])
 @pytest.mark.parametrize("generation", ["sm80", "sm90"])
 @pytest.mark.parametrize("layers", list(GATE_LAYERS))
-def test_the_derivation_decides_a_steps_fit_as_its_compile_does(layers, generation, remat, monkeypatch,
-                                                                   tmp_path):
-    """The derived footprint admits a step on a GPU of 1.6 times what its compile needs and refuses it on
-    0.6 times, as the compile does, over decoders dense, hybrid and of experts, Ampere and Hopper, no
-    recomputation and full (row 2113's gate, in the kernel gate's evidence shape, `compile_evidence`).
-    Both needs are read off one compile at a roomy GPU, the bytes beyond what each leaves free there:
-    the headroom either reads grows byte for byte with the GPU's (`derived_headroom`, `step_headroom`),
-    and XLA's own rematerialization, which a tight GPU's compile runs, cuts too little to move a
-    decision at these margins."""
+def test_the_derivation_decides_a_steps_fit_as_its_compile_does(layers, generation, remat, tmp_path):
+    """The derivation judges a step's fit as its compile does at 0.6 and 1.6 times what the compile needs,
+    over decoders dense, hybrid and of experts, Ampere and Hopper, no recomputation and full (row 2113's
+    gate, in the kernel gate's evidence shape, `compile_evidence`). The need is the program's as XLA lays
+    it out on a roomy GPU, and the derivation's, read off that compile, admits it at 1.6 times and refuses
+    it at 0.6. On a GPU stating 1.6 times, the compile fits and the derivation judged so. On one stating
+    0.6, a step set to full recomputation compiles there alone: where XLA refuses it the derivation did,
+    and where XLA fits it, it fits by XLA's own rematerialization against the stated memory, which the
+    derivation does not model and the compile decides (its temporaries below the roomy compile's)."""
     from compile_evidence import Evidence, Facts, Measurement, Prediction
 
-    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path))
-    roomy = 1 << 34
-    probe = gated(layers, generation, remat, roomy)
-    need, derived = roomy - probe["headroom"], roomy - probe["derived_headroom"]
-    terms = probe["derived"]
+    (roomy,) = gated(layers, generation, remat, 1 << 34, tmp_path / "roomy")
+    need, derived = (1 << 34) - roomy["headroom"], (1 << 34) - roomy["derived_headroom"]
     for margin, admits in ((1.6, True), (0.6, False)):
         budget = int(need * margin)
         evidence = Evidence(
             f"{layers} {generation} remat {remat} at {margin} of its need", "",
             Facts((layers, remat), generation),
-            Prediction({"peak": terms["peak"]}, derived, budget, derived <= budget, "bytes"),
-            Measurement({"temp": probe["temp"]}, need <= budget, "xla", jax.__version__))
+            Prediction({"peak": roomy["derived"]["peak"]}, derived, budget, derived <= budget, "bytes"),
+            Measurement({"temp": roomy["temp"]}, need <= budget, "xla", jax.__version__))
         assert evidence.compiled.admits == admits and evidence.agrees, evidence.describe()
+    (fitting, *_) = gated(layers, generation, remat, int(need * 1.6), tmp_path / "1.6")
+    assert fitting["fits"] and fitting["derived_headroom"] >= 0, fitting
+    if remat == "full":
+        tight = gated(layers, generation, remat, int(need * 0.6), tmp_path / "0.6")[0]
+        assert tight["derived_headroom"] < 0, tight
+        assert not tight["fits"] or tight["temp"] < roomy["temp"], tight
