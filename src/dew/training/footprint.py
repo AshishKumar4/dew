@@ -31,6 +31,7 @@ from dew.batch import Batch
 from dew.data.dataset import rows_of
 from dew.distributed.placement import placed_bytes
 from dew.mesh import DATA_AXIS, FSDP_AXIS, row_axes
+from dew.nn.kernels.generation import _compute_capability
 from dew.objectives.base import Objective, Step
 from dew.optim import clips_qk
 from dew.state import TrainState
@@ -158,16 +159,16 @@ def peak_bytes(program: jcore.Jaxpr, platform: str, workspace: int) -> int:
     live, held, most = 0, set(), 0
     for index, equation in enumerate(program.eqns):
         made = [out for out in equation.outvars if out in last and frontier.buffered(out)]
-        results = sum(map(device_share, made))
+        made_bytes = sum(map(device_share, made))
         if made or not frontier.fusing(equation):
             inner = max((peak_bytes(body, platform, workspace) for body in bodies(equation)), default=0)
             operands = 0 if frontier.fusing(equation) else sum(
                 device_share(value) for value in {value for value in equation.invars if computed(value)}
                 if frontier.made_for(value))
             products = workspace if equation.primitive.name == "dot_general" else 0
-            most = max(most, live + max(inner, results) + operands + products)
+            most = max(most, live + max(inner, made_bytes) + operands + products)
         held.update(made)
-        live += results
+        live += made_bytes
         for done in [value for value in held if last[value] == index]:
             held.discard(done)
             live -= device_share(done)
@@ -279,10 +280,10 @@ def gemm_workspace(device) -> int:
     Hopper on 32 MiB, before it 4 MiB (xla/backends/gpu/transforms/gemm_rewriter.cc's
     `GemmWorkspaceRewriteVisitor`; `GemmConfig::kHopperWorkspace`, `kDefaultWorkspace`,
     xla/service/gpu/matmul_utils.h); none where the device is no CUDA GPU, whose matmuls take none."""
-    capability = getattr(device, 'compute_capability', None)
-    if device.platform != 'gpu' or not capability:
+    capability = _compute_capability(device) if device.platform == 'gpu' else None
+    if not capability:
         return 0
-    return (32 if int(str(capability).split('.')[0]) >= 9 else 4) << 20
+    return (32 if int(capability.split('.')[0]) >= 9 else 4) << 20
 
 
 def traced_loss[LossT, EffectsT](objective: Objective[LossT, EffectsT], state: TrainState, window: int
