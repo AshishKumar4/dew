@@ -795,17 +795,25 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
         return plgpu.Barrier(num_barriers=count)
 
     def column_staging(self, shape: tuple, dtype, consumers: int) -> dict:
-        """A resident block's column tiles along a leading role axis and their load completions."""
-        block = _column_block(shape, consumers)
+        """A resident block's per-role column tiles and their load completions."""
+        block = self.column_shape(shape, consumers)
         return {'parts': staged(block, dtype, self.swizzle_for(block[-1], dtype)),
                 'barriers': self.load_barriers(consumers)}
 
+    def column_shape(self, shape: tuple, consumers: int) -> tuple:
+        """A column-partitioned block's physical shape: its independent tiles along the role axis."""
+        return _column_block(shape, consumers)
+
+    def column_part(self, ref, role):
+        """A role's native ref to its column tile, resident or streamed."""
+        return ref.at[role]
+
     def columns_loaded(self, source, allocated: dict, *, issued: jax.Array | bool = True) -> None:
-        """Load a resident block into its role-leading column staging, each source slice static."""
-        parts = allocated['parts']
+        """Load a resident block into its per-role column staging, each source slice static."""
+        parts, barriers = allocated['parts'], allocated['barriers']
         width = parts.shape[-1]
-        self.loaded(tuple((source.at[..., pl.ds(part * width, width)], parts.at[part],
-                           allocated['barriers'].at[part]) for part in range(parts.shape[0])),
+        self.loaded(tuple((source.at[..., pl.ds(part * width, width)], self.column_part(parts, part),
+                           barriers.at[part]) for part in range(barriers.shape[0])),
                     issued=issued)
 
     def schedule(self, consumers: int):

@@ -42,10 +42,10 @@ def _column_stream(x, *, family_name: str, consumers: int, interpret):
 
             def consumer(role):
                 family.columns_loaded(x_ref.at[pl.ds(0, rows)], saved, issued=role == 0)
-                family.rows_summed(saved['parts'].at[role], resident_ref.at[role])
+                family.rows_summed(family.column_part(saved['parts'], role), resident_ref.at[role])
 
                 def step(at, slots, carry, accs):
-                    family.rows_summed(slots['x'].at[role], streamed_ref.at[at, role])
+                    family.rows_summed(family.column_part(slots['x'], role), streamed_ref.at[at, role])
                     return carry, accs
 
                 family.walk(family.fed(opened, views, 0, steps, role), ((step, 0, steps),), (), (),
@@ -72,6 +72,16 @@ def test_role_column_staging_streams_and_reduces_without_mixing_slots(family, co
     expected = values.reshape(steps, rows, consumers, columns // consumers).sum(-1).transpose(0, 2, 1)
     np.testing.assert_array_equal(streamed, expected)
     np.testing.assert_array_equal(resident, expected[0])
+
+
+@pytest.mark.parametrize(('family', 'consumers', 'target'),
+                         [('mma.sync', 1, 'sm80'), ('wgmma', 2, 'sm90'), ('wgmma.fed', 2, 'sm90')])
+def test_role_column_staging_lowers_for_its_instruction_family(family, consumers, target):
+    operand = jax.ShapeDtypeStruct((5 * 64, 128 * consumers), jnp.bfloat16)
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ('data',)), target)
+    with generation.assumed(target), jax.sharding.use_abstract_mesh(mesh):
+        jax.jit(functools.partial(_column_stream, family_name=family, consumers=consumers,
+                                  interpret=False)).trace(operand).lower(lowering_platforms=('cuda',))
 
 
 def _first_step(tile):

@@ -61,7 +61,6 @@ class Pipeline:
     stages: int
     swizzles: dict = dataclasses.field(default_factory=dict)
     """The swizzle a stream's tiles stage at where `Mma.streams` names one (`mosaic.swizzle_for`)."""
-    column_streams: tuple[str, ...] = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -226,9 +225,16 @@ class Mma(mosaic.Family):
     def streams(self, blocks: dict, stages: int, consumers: int, multicast: tuple[str, ...] = (),
                 swizzles: dict[str, int] | None = None, column_streams: tuple[str, ...] = ()):
         _one(consumers, clustered=bool(multicast))
-        blocks = {name: (mosaic._column_block(shape, consumers) if name in column_streams else shape, dtype)
-                  for name, (shape, dtype) in blocks.items()}
-        return Pipeline(blocks, stages, dict(swizzles or {}), column_streams)
+        del column_streams  # Its one consumer owns every column of each stream.
+        return Pipeline(blocks, stages, dict(swizzles or {}))
+
+    def column_shape(self, shape: tuple, consumers: int) -> tuple:
+        _one(consumers)
+        return shape
+
+    def column_part(self, ref, role):
+        del role
+        return ref
 
     def lifetimes(self, streams: Pipeline) -> tuple[tuple, tuple]:
         # `emit_pipeline` allocates a walk's slots in its own scope.
@@ -238,11 +244,7 @@ class Mma(mosaic.Family):
     def opened(self, allocated, views: dict | None = None):
         if views is None:
             raise ValueError("a pipelined family's streams take their views where they open (its walk loads)")
-        opened = dict(views)
-        for name in allocated.column_streams:
-            ref, index = opened[name]
-            opened[name] = (ref.reshape(1, *ref.shape), lambda j, index=index: (0, *index(j)))
-        return Streams(allocated, opened)
+        return Streams(allocated, views)
 
     def stream(self, streams, views, lo, hi) -> None:
         del streams, views, lo, hi
@@ -257,7 +259,9 @@ class Mma(mosaic.Family):
         staging = self.output_staging(outputs, consumers)
 
         def store(output, value, ref, place):
-            plgpu.wait_gmem_to_smem(0)
+            # Interpreted pipelines use barrier-tracked copies, not cp.async groups.
+            if not interpret:
+                plgpu.wait_gmem_to_smem(0)
 
             def copied(smem):
                 # The row-copy ladder needs strided layouts, not optimized-only transfers.
@@ -266,7 +270,8 @@ class Mma(mosaic.Family):
                                   widest=resources.copied_rows(smem.shape[1], smem.dtype))
 
             pl.run_scoped(copied, staging[output])
-            plgpu.wait_gmem_to_smem(0)
+            if not interpret:
+                plgpu.wait_gmem_to_smem(0)
 
         @plgpu.nd_loop(tiles, collective_axes=axis)
         def _(loop: plgpu.NDLoopInfo):
