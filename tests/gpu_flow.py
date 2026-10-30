@@ -11,6 +11,7 @@ its own `pytest.mark.parametrize` marks gives a cell a parameter set (`cells_of`
 
 import dataclasses
 import functools
+import inspect
 import itertools
 import traceback
 from collections.abc import Callable, Iterable
@@ -100,16 +101,18 @@ def _parameter_sets(mark) -> list[tuple[str, dict, list]]:
 
 def cells_of(check, generation: str | None = None, **fixtures) -> list[Cell]:
     """A cell for each parameter set `check`'s own `pytest.mark.parametrize` marks give (their product, as
-    pytest collects them), each run with that set and `fixtures` by name, under `generation`; a `skipif`
-    mark of `check`'s own, or of a set's, whose condition holds skips its cell with its reason, as pytest
-    would. So a cell function keeps its test's grid where its test kept it, and a flow names the function
-    alone."""
+    pytest collects them), each run with that set and those of `fixtures` it takes by name, under
+    `generation`; a `skipif` mark of `check`'s own, or of a set's, whose condition holds skips its cell
+    with its reason, as pytest would. So a cell function keeps its test's grid where its test kept it,
+    and a flow names the function alone."""
     marks = list(getattr(check, "pytestmark", []))
+    taken = inspect.signature(check).parameters
     grids = [_parameter_sets(mark) for mark in reversed(marks) if mark.name == "parametrize"]
     name = check.__name__.replace("_", " ")
     cells = []
     for combination in itertools.product(*grids) if grids else [()]:
-        arguments, own, labels = dict(fixtures), list(marks), []
+        arguments = {name: value for name, value in fixtures.items() if name in taken}
+        own, labels = list(marks), []
         for label, values, set_marks in combination:
             labels.append(label)
             arguments.update(values)

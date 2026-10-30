@@ -6,15 +6,18 @@ one process (`gpu_flow`), each cell its own file's property:
   routes a row (test_grouped_gemm).
 - A ring streams tiles of their own trip counts, and consumers feeding their own ring split a step, on an
   H100 (test_mosaic_toolkit).
+- The Blackwell grouped matmul holds check 1 on a B200 or a B300, sm100 and sm103 alike
+  (test_gemm_blackwell).
 """
 
 import functools
 
 import pytest
+import test_gemm_blackwell as gemm_blackwell
 import test_gemm_template as gemm_template
 import test_grouped_gemm as grouped_gemm
 import test_mosaic_toolkit as mosaic_toolkit
-from gpu_flow import Cell, run_cells
+from gpu_flow import Cell, cells_of, run_cells
 
 from dew.nn.kernels import generation
 
@@ -43,4 +46,5 @@ def test_the_gemm_kernels_run_on_this_gpu():
                functools.partial(mosaic_toolkit.consumers_feeding_their_own_ring_split_a_step_on_an_h100,
                                  consumers, lo), "sm90")
           for consumers, lo in ((1, 0), (2, 0), (2, 3))),
+        *cells_of(gemm_blackwell.the_blackwell_gmm_holds_check_1_on_blackwell),
     ])

@@ -12,18 +12,28 @@ runs on a GPU alone, run in one process (`gpu_flow`), each cell its own file's p
   decode kernel's attention differentiates as the folded attention (test_decode_attention).
 - Fused routes, without XLA's deterministic ops, which Dew refuses them under: flash reads a cache call's
   documents as exactly as jax.nn reads its mask (test_decode_attention), and packed windowed bf16
-  attention runs its band on par (test_local_attention).
+  attention runs its band on par (test_local_attention); flash, cuDNN and the Triton kernel train, take
+  packed and odd-length calls, sinks, windows and empty contexts on par with XLA from float64, and each
+  kernel's requirements are what it takes on this GPU (test_kernels); a row that sees no key reads
+  nothing on the fused kernels (test_attention_masked_rows).
+- The Mosaic template on an H100, each test its own cells: forward, training forward, natural forward
+  and backward over every call form, head width, hook and run (test_attention_mosaic); an fp16 call
+  through the route, and a long sequence on par with the reference path (test_attention_route).
 """
 
 import functools
 
 import pytest
 import test_attention_dropout as dropout
+import test_attention_masked_rows as masked_rows
+import test_attention_mosaic as mosaic
+import test_attention_route as route
 import test_attention_stability as stability
 import test_attention_triton as triton
 import test_decode_attention as decode
+import test_kernels as kernels
 import test_local_attention as local
-from gpu_flow import Cell, run_cells
+from gpu_flow import Cell, cells_of, run_cells
 
 pytestmark = pytest.mark.gpu(reason="each route's GPU kernel: Triton, Mosaic, flash and the band")
 
@@ -77,3 +87,60 @@ def test_the_fused_attention_routes_run_on_this_gpu(without_deterministic_ops):
              functools.partial(local.packed_windowed_bf16_attention_runs_its_band_on_par,
                                without_deterministic_ops), "sm80"),
     ])
+
+
+MOSAIC_CELLS = (mosaic.the_forward_is_on_par_on_an_h100, mosaic.the_training_forward_is_on_par_on_an_h100,
+                mosaic.the_natural_forward_is_on_par_on_an_h100,
+                mosaic.the_forward_is_on_par_over_every_call_form_on_an_h100,
+                mosaic.the_forward_is_on_par_at_head_widths_on_an_h100,
+                mosaic.the_forward_is_on_par_under_every_hook_on_an_h100,
+                mosaic.the_backward_is_on_par_on_an_h100,
+                mosaic.the_backward_is_on_par_at_head_widths_on_an_h100,
+                mosaic.the_backward_is_on_par_over_every_call_form_on_an_h100,
+                mosaic.the_backward_is_on_par_under_every_score_hook_on_an_h100,
+                mosaic.a_call_over_runs_is_on_par_on_an_h100,
+                mosaic.a_causal_backward_of_more_keys_than_queries_is_on_par_on_an_h100)
+"""The Mosaic template's H100 checks, each test its own cells, so a red names its form."""
+
+KERNEL_CELLS = (kernels.flash_through_dews_attention_refuses_rows_it_would_misread,
+                kernels.a_fused_kernel_takes_forward_mode_through_the_reference,
+                kernels.cudnn_trains_odd_lengths_and_agrees_with_xla,
+                kernels.triton_trains_and_agrees_with_xla,
+                kernels.triton_trains_at_large_logits_on_par_with_xla,
+                kernels.triton_at_saturated_large_logits_is_finite_where_xla_is,
+                kernels.flash_trains_and_agrees_with_xla,
+                kernels.packed_sequences_attend_within_themselves_as_far_from_float64_as_one_at_a_time,
+                kernels.queries_packed_against_keys_of_their_own_lengths_attend_their_own_documents,
+                kernels.fused_kernels_are_as_exact_as_the_xla_kernel_from_float64,
+                kernels.flash_with_a_window_and_sinks_is_as_exact_as_the_xla_kernel_from_float64,
+                kernels.a_window_over_more_keys_than_queries_keeps_the_keys_each_row_centres,
+                kernels.packed_rows_on_flash_are_as_exact_as_the_document_mask_from_float64,
+                kernels.queries_reading_another_sequences_documents_on_flash_are_as_exact_as_the_document_mask,
+                kernels.queries_over_a_context_of_no_tokens_read_nothing_on_flash,
+                kernels.cudnn_takes_key_lengths_and_agrees_with_xla,
+                kernels.single_query_cudnn_decode_matches_float64_attention_and_gradients,
+                kernels.a_kernels_requirements_are_what_the_kernel_takes_on_this_gpu)
+"""test_kernels' fused and Triton kernels on a GPU of cuDNN's bf16 floor (sm80) or later; its mesh cell
+is the two-GPU flow's (tests/test_gpu_mesh.py)."""
+
+
+def test_the_fused_kernels_hold_on_this_gpu(without_deterministic_ops):
+    """Every test_kernels and masked-rows cell above on this GPU (`gpu_flow.cells_of`), without XLA's
+    deterministic ops, each one's failure kept and all raised together."""
+    run_cells([
+        *(cell for check in KERNEL_CELLS
+          for cell in cells_of(check, "sm80", without_deterministic_ops=without_deterministic_ops)),
+        *cells_of(masked_rows.a_row_that_sees_no_key_reads_nothing_on_the_fused_gpu_kernels,
+                  without_deterministic_ops=without_deterministic_ops),
+    ])
+
+
+def test_the_mosaic_template_holds_on_an_h100():
+    """Every Mosaic template cell above on an H100 (`gpu_flow.cells_of`), and the route's fp16 call and
+    long sequence, each one's failure kept and all raised together."""
+    run_cells([
+        *(cell for check in MOSAIC_CELLS for cell in cells_of(check, "sm90")),
+        *cells_of(route.an_fp16_call_on_an_h100_is_on_par, "sm90"),
+        *cells_of(route.a_long_sequence_is_on_par_with_the_reference_path),
+    ])
+
