@@ -807,7 +807,7 @@ def _mainloops(family: Family, options: dict) -> dict[str, Callable]:
     def mosaic_backward(query, key, value, spans, hooks, dout):
         # From the mainloop's own training forward's residuals, a guarded one's (its overflowed rows walk
         # again guarded, in the launch's form).
-        residuals = attention_mosaic.forward(query, key, value, spans, hooks, residuals=True,
+        residuals = attention_mosaic.forward(query, key, value, spans, hooks, residuals=template.Kept.SPLIT,
                                              **forward_options)[1:]
         return attention_mosaic.backward(query, key, value, spans, hooks, dout, residuals=residuals,
                                          **options)
