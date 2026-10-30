@@ -5,12 +5,33 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- One entry point and one path for scoring decisions: `decide(state, questions)` answers a request and
+  `decide([(state, questions), ...], contexts=...)` many, their rows packed into the passes a scoring
+  server runs and over its compiled programs. `Decide.batch` and `Decide.fits` are gone; call the task
+  with the sequence. A scoring server's pass now looks at every waiting request while its plan takes
+  their rows (`ScoringServer(rows=None)`, the default), where it looked at 64 at most and left larger
+  shapes' windows part empty.
+- A float32 product with no stated precision follows JAX's configured precision
+  (`jax_default_matmul_precision`), TF32 on recent GPUs as JAX documents, where Dew pinned it at
+  `Precision.HIGHEST`; a model's `precision` field still sets its own. A float32 run on an A100 trained
+  2.8 times slower for the pin. A router's logits, a vocabulary head's (the loss's) and a recurrence's
+  state products keep IEEE float32 where nothing states a precision, each for its stated reason.
+- One typed record of a run's numerics, `trainer.precision` (`dew.nn.precision.Numerics`), set once
+  and recorded with the run: its dtypes (`Dtypes`: parameters, compute and outputs, Flax's
+  `param_dtype` and `dtype`, the usual ones by Lightning's names in `DTYPE_PRESETS`: "bf16-mixed" by
+  default, "32-true", "bf16-true", "16-mixed"), its matmul
+  precision by JAX's own levels ("default", "high", "highest", or a `jax.lax.DotAlgorithmPreset`), and
+  its ops' forms ("fast" or "accurate"). `ACCURATE` names the scientific one: "32-true", "highest" and
+  the accurate forms. It replaces `trainer.attention_form`; a run saved with that field loads and
+  resumes with it as its forms.
 - DEX (arXiv 2505.16333): a learned differential on chosen heads' attention outputs, `O'_h = O_h -
   lambda(t) O_h W_D,h`, with lambda annealed from zero over the run's first updates
   (`dew.nn.dex.DifferentialExtension`). Attach it with `Pretrained.load(..., dex=...)` or
   `with_dex`, or from a run with `--source.dex '{"layers": [[layer, [heads...]], ...]}'`. By default
   it follows the paper's recipe: the attention's key, value and output projections train beside the
-  extension, and the rest is frozen.
+  extension, and the rest is frozen. Layers that choose as many heads scan as one run and split over
+  pipeline stages, each holding its heads and `lambda_init` as constants of its own; `save` and
+  `export` write each layer's differential at its learned lambda folded into its output projection.
 - A decoder's cross-attention is any configuration that builds a block per layer (`CrossBlocks`), which
   `with_cross_attention` takes. `SharedCrossAttention` is a new one: each named layer reads the
   conditioning sequence through its own attention's projections and norms, and the read joins the

@@ -52,7 +52,7 @@ def discrete(response: dict) -> dict:
 def clear(decide: Decide, request: dict) -> bool:
     """Whether every choice of `request`, alone, holds its two likeliest options `MARGIN` apart."""
     questions = {name: Question.from_wire(wire) for name, wire in request["questions"].items()}
-    [(answers, _)] = decide.batch([(request["state"], questions)])
+    [answers] = decide([(request["state"], questions)])
     gaps = [np.diff(np.sort(answer.probabilities)[-2:])[0] for answer in answers.values()
             if isinstance(answer, ChoiceAnswer) and len(answer.probabilities) > 1]
     return all(float(gap) > MARGIN for gap in gaps)
@@ -95,7 +95,7 @@ def test_a_batchs_probabilities_are_each_bodys_alone(decide):
     forwards = {}
 
     def scored(task: Decide, seed, *, together: bool) -> np.ndarray:
-        """The bodies' real options' logits, laid out as `Decide.batch` lays a batch out (`Decide.rows`)
+        """The bodies' real options' logits, laid out as a call over requests lays them out (`Decide.rows`)
         and scored in one pass together or each request alone, through the model compiled without
         YNNPACK's fusions: both arms are Dew's."""
         bodies = bodies_of(seed)
