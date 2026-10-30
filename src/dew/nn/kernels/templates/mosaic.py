@@ -488,6 +488,15 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
         registers (`operands_in_registers`): the step's, unless the family loads them a sub-step at a
         time (the left operand's it holds a step deep)."""
         return depth
+
+    def rhs_fragment_depth(self, depth: int, *, transposed: bool = False) -> int:
+        """The right operand's depth held in registers, including its storage orientation."""
+        del transposed
+        return self.fragment_depth(depth)
+
+    def swizzle_for(self, columns: int, dtype) -> int:
+        """The staging swizzle for a block whose contiguous extent is `columns` elements."""
+        return swizzle_for(dtype, columns)
     widest_product: int | None = None
     """The most columns one product spans (warpgroup MMA's 256, wgmma's widest N), which a tile's columns
     are at most; None where a tile's columns are many products' (mma.sync's 8 each), held by its

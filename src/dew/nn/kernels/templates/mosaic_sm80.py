@@ -129,6 +129,10 @@ class Mma(mosaic.Family):
         # `MMALayouts`' k), CUTLASS's warp-level k-iterations, sliced along the stage's rows, which its
         # 8-row tiles allow (a swizzled row takes no slice narrower than its tile).
         return min(depth, 8 * max(32 // (jnp.dtype(self.dtype).itemsize * 8), 1))
+
+    def rhs_fragment_depth(self, depth: int, *, transposed: bool = False) -> int:
+        # A transposed shared view cannot take the narrow row slices used by the ordinary RHS.
+        return depth if transposed else self.fragment_depth(depth)
     most_shared = 163 * 1024  # sm80's and sm87's opt-in block (sm86's and sm89's 99 KiB)
     copies_vectors = False  # cp.async spreads a copy over the warpgroup's threads, 128 elements at least
     reduction_scratch = plgpu.CompilerParams().reduction_scratch_bytes  # its kernels' default parameters
@@ -380,7 +384,8 @@ class Mma(mosaic.Family):
             return plgpu.mma(acc, left, plgpu.load(rhs, layout=self.rhs), m_warps=self.m_warps)
         transposed = isinstance(rhs, state_types.TransformedRef) and any(
             isinstance(transform, state_types.TransposeTransform) for transform in rhs.transforms)
-        right = plgpu.load(rhs, layout=self.rhs) if transposed else None
+        right = (plgpu.load(rhs, layout=self.rhs)
+                 if self.rhs_fragment_depth(rhs.shape[0], transposed=transposed) == rhs.shape[0] else None)
         for start in range(0, rhs.shape[0], depth):
             part = (right[start:start + depth] if right is not None
                     else plgpu.load(rhs.at[pl.ds(start, depth)], layout=self.rhs))
