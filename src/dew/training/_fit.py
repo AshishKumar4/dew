@@ -507,7 +507,7 @@ def validation_read(name: str, suite: EvalSuite, *, read: bool, previewed: bool)
 def consumption_counted(batch: Batch, *, clocked: bool) -> Batch:
     """A clocked run's `batch` with the examples it consumes counted on the host (`ConsumedCount`) as it is
     prepared; one a step after the bound rebuilt without its count is refused, as the run would stay at
-    its start, and in a pool each marks its real rows (`VALID_ROWS`). A run on another clock, one
+    its start, and each marks its real rows (`VALID_ROWS`). A run on another clock, one
     bounded in examples whose plan counts its steps ahead, keeps no count: none rides to its step."""
     if not clocked:
         return batch if EXAMPLES_CONSUMED not in batch else {
@@ -517,9 +517,10 @@ def consumption_counted(batch: Batch, *, clocked: bool) -> Batch:
                          f"consumes ({EXAMPLES_CONSUMED!r}), which this run's progress reads: a native Grain "
                          "step that rebuilds its records keeps no count")
     counted_batch = {**batch, CONSUMED_COUNT: ConsumedCount(int(np.sum(batch[EXAMPLES_CONSUMED])))}
-    if jax.process_count() > 1 and VALID_ROWS not in batch:
-        # A pool's share steps on with its last batch emptied once its stream runs out (`emptied`), so
-        # each of its batches marks its real rows, and every one is the same tree, one program.
+    if VALID_ROWS not in batch:
+        # A clocked read ends at its bound, in a short batch filled and marked, and a pool's share steps on
+        # with its last batch emptied (`emptied`): each of its batches marks its real rows, so every one
+        # is the same tree, the run's one program.
         counted_batch[VALID_ROWS] = np.ones(len(np.asarray(batch[EXAMPLES_CONSUMED])), bool)
     return counted_batch
 

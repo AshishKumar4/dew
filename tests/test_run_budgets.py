@@ -553,16 +553,15 @@ def test_only_a_run_on_the_examples_clock_carries_its_count_to_the_step(tmp_path
 
 
 def test_a_clocked_run_whose_split_is_planned_compiles_one_step():
-    """Every batch of a clocked run carries whether it closes its window, so a run whose first compile
-    plans its split keeps one step program: nothing compiles after its first step over batches of one
-    shape, its last among them (16 records, two whole batches)."""
+    """Every batch of a clocked run marks its real rows and whether it closes its window, so a run whose
+    first compile plans its split keeps one step program: nothing compiles after its first step, its
+    short last batch, filled and marked, among them (18 records, two whole batches and a short one;
+    row 2532)."""
     (x,) = clocked_records(0)
     tracker = RecordingTracker()
     optim = OptimConfig(optimizer="adam", learning_rate=Linear(peak_value=PEAK, end_value=CLOCKED_END))
-    whole = 2 * BATCH
-    chain = Pipeline(Memory({"x": x[:whole], "id": np.arange(1, whole + 1, dtype=np.int32)})
-                     ).read("streamed").batch(BATCH)
-    Trainer(Echoed(), optim, key=0, tracker=tracker).fit(chain, examples=whole, log_every=1)
+    Trainer(Echoed(), optim, key=0, tracker=tracker).fit(clocked_chain(x), examples=CLOCKED_RECORDS,
+                                                         log_every=1)
     # `train/compiles` counts the step's compiles over the whole fit (`Interval.compiles`): the first
     # step's planning and its program, and none after.
     logged = [scalars for _, scalars in tracker.scalars if "train/loss" in scalars]
