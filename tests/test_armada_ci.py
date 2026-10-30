@@ -195,7 +195,7 @@ def test_a_task_rows_each_file_red_where_ci_would_fail(ci, tmp_path):
 
 def test_a_tasks_tests_run_with_no_timed_stack_dump_armed(ci, tmp_path):
     """A task's pytest arms no timed dump of every thread's stack, which killed a multithreaded test mid-dump
-    (exit 245, a SIGSEGV, Main 2026-10-25): the test process CI starts carries no dump timer. A test running
+    (exit 245, a SIGSEGV, 2026-10-25): the test process CI starts carries no dump timer. A test running
     past the old ten minutes through a task is green with no dump (armada receipt in the head's review)."""
     (tmp_path / "tests/test_timer.py").write_text(
         "def test_no_dump_timer(request):\n"
@@ -2253,7 +2253,7 @@ def test_a_release_check_marked_whole_suite_or_network_too_runs_in_its_release_t
 def test_a_release_mark_without_one_requirement_fails_its_files_collection(ci, tmp_path, monkeypatch, mark):
     """A release_env mark that names no one requirement string (none, a keyword's, two, or not a string)
     fails its file's collection, naming its test: every suite task sets a marked test aside, and no release
-    task would plan it, so it would run nowhere (Main's read of b94d89999)."""
+    task would plan it, so it would run nowhere (the maintainer's read of b94d89999)."""
     interpreter(tmp_path, "3.12")
     written(tmp_path, {"test_release.py": f"import pytest\n@pytest.mark.{mark}\n"
                        "def test_under_the_release():\n    pass\n"
