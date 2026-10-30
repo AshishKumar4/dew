@@ -45,6 +45,7 @@ from dew._distributions import counter_key
 from dew._records import JSON
 from dew.artifacts import Artifact, Artifacts, TokenScores
 from dew.batch import EXAMPLE_ROWS, FROZEN, VALID_ROWS, Batch, PathFilter, Variables, dicts, everything, part
+from dew.distributed.placement import Layout, RefinesLayout
 from dew.nn import categorical
 from dew.nn.kernels.options import Held, Option, compiler_options
 from dew.nn.precision import Numerics, accumulated, at_least_fp32, compensated_sum, weighted_total
@@ -880,6 +881,15 @@ class Objective(ABC, Generic[Loss, Effects]):
         """
         model = vars(self).get("model")
         return () if model is None else (ProgramModule(model, None, trained=True),)
+
+    def placement(self, layout: Layout) -> Layout:
+        """The run's `layout` as the modules this objective's programs run refine it for their own trees
+        (`dew.distributed.placement.RefinesLayout`, a tier-3 model's torch names), each in its turn; the
+        layout as it is where none does."""
+        for entry in self.program_key():
+            if isinstance(entry.module, RefinesLayout):
+                layout = entry.module.placement(layout)
+        return layout
 
     def towers(self) -> tuple[Held, ...]:
         """Every network this objective's programs run, whose quantization the options they compile

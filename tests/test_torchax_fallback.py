@@ -35,6 +35,7 @@ from reference_error import as_given, assert_as_exact, equations, torch_with_gra
 
 from dew.batch import coordinates
 from dew.data.dataset import Loader
+from dew.distributed.placement import Layout
 from dew.interop import Pretrained
 from dew.interop.pretrained import PretrainedFallback
 from dew.interop.torchax_fallback import TorchLayout, TransformersTierWarning
@@ -159,7 +160,8 @@ def test_the_gradients_are_transformers(source, loaded, tokens):
 def test_trainer_steps_move_the_params_and_place_them_by_name(loaded, tokens):
     """AdamW through the Trainer on a fsdp x tensor mesh: the loss falls,
     every parameter moves, the rotary buffers come back bitwise, and the
-    torch names take the specs the name table gives them."""
+    torch names take the specs the model's tensor-parallel plan gives them, the run's layout as the
+    objective's model refines it (`Objective.placement`), as a run's trainer takes it."""
     params, buffers = loaded.variables["params"], loaded.variables["buffers"]
     assert set(buffers) == {"gpt_neox.rotary_emb.inv_freq", "gpt_neox.rotary_emb.original_inv_freq"}
     assert not set(params) & set(buffers)
@@ -168,7 +170,7 @@ def test_trainer_steps_move_the_params_and_place_them_by_name(loaded, tokens):
     batch = tokens[np.arange(rows) % ROWS]
     data = Loader(train=lambda partition: iter([{"text": batch}] * 4), val=None, records=rows, batch=rows)
     trainer = Trainer(objective, optax.adamw(1e-2), key=jax.random.key(0),
-                      mesh=MeshSpec(fsdp=2, tensor=2), layout=TorchLayout(min_shard=1))
+                      mesh=MeshSpec(fsdp=2, tensor=2), layout=objective.placement(Layout(min_shard=1)))
 
     state = trainer.fit(data, steps=4, log_every=1)
 
@@ -187,10 +189,27 @@ def test_trainer_steps_move_the_params_and_place_them_by_name(loaded, tokens):
 
 
 @pytest.mark.mesh(devices=4)
+def test_a_load_onto_a_mesh_places_the_torch_names_by_the_models_plan(source):
+    """A tier-3 source loaded onto a mesh (a run's frozen source, `RunConfig.source_placement`) lies as its
+    model's tensor-parallel plan places its torch names (`TorchCausalLM.placement`): a column-split
+    projection's output width on the tensor axis and its input on fsdp, a row-split one's the other way,
+    its token table's rows over both; a tensor the plan names nothing for, a norm's, by the shape."""
+    with pytest.warns(UserWarning):
+        placed = Pretrained.load(source[0], fallback="torchax", dtype="float32",
+                                 mesh=MeshSpec(fsdp=2, tensor=2), layout=Layout(min_shard=1))
+    assert isinstance(placed.model.placement(Layout()), TorchLayout)
+    params, layer = placed.variables["params"], "gpt_neox.layers.0"
+    assert params[f"{layer}.attention.query_key_value.weight"].sharding.spec == P("tensor", "fsdp")
+    assert params[f"{layer}.attention.dense.weight"].sharding.spec == P("fsdp", "tensor")
+    assert params[f"{layer}.mlp.dense_h_to_4h.weight"].sharding.spec == P("tensor", "fsdp")
+    assert params["gpt_neox.embed_in.weight"].sharding.spec == P(("fsdp", "tensor"))
+
+
+@pytest.mark.mesh(devices=4)
 def test_a_frozen_torch_base_kept_whole_drops_fsdp_from_the_name_tables_placement(loaded, tokens):
-    """`Layout.frozen_whole` reaches a torch-named tree: TorchLayout's name table picks each
-    tensor's axes, and the one placement keeps the frozen tensors whole over fsdp, split over the
-    tensor axis as the table splits them, while the trained ones, their moments and one step's
+    """`Layout.frozen_whole` reaches a torch-named tree: the model's tensor-parallel plan picks each
+    tensor's axes (`TorchLayout`), and the one placement keeps the frozen tensors whole over fsdp, split
+    over the tensor axis as the plan splits them, while the trained ones, their moments and one step's
     update lie as the split layout lays them."""
     from dew.batch import FROZEN, freeze
     from dew.distributed.batches import shard_batch
@@ -204,7 +223,8 @@ def test_a_frozen_torch_base_kept_whole_drops_fsdp_from_the_name_tables_placemen
     def stepped(frozen_whole: bool):
         objective = LMObjective(loaded, seq_len=SEQ, ema_decay=None, variables=variables)
         trainer = Trainer(objective, optax.adamw(1e-2), key=jax.random.key(0), mesh=mesh, checkpoints=None,
-                          tracker=None, layout=TorchLayout(min_shard=1, frozen_whole=frozen_whole))
+                          tracker=None,
+                          layout=objective.placement(Layout(min_shard=1, frozen_whole=frozen_whole)))
         trainer.device_mesh = mesh.build(jax.devices()[:4])
         state, shardings, _ = trainer.place()
         placed = shard_batch(trainer.device_mesh, batch)

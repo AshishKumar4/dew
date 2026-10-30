@@ -18,7 +18,7 @@ from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar, Literal, NamedTuple, NoReturn, Self
+from typing import TYPE_CHECKING, ClassVar, Literal, NamedTuple, NoReturn, Protocol, Self
 
 import jax
 import jax.numpy as jnp
@@ -32,6 +32,7 @@ from dew._model_types import QWEN35_TYPES
 from dew.batch import Variables
 from dew.diffusion.process import Process
 from dew.diffusion.schedules.source import SourceSchedule
+from dew.distributed.placement import Layout, MeshSpec, RefinesLayout
 from dew.inference import BlockGeneration, MaskedGeneration, TextGeneration
 from dew.inference.images import TextToImage
 from dew.inference.loading import place
@@ -80,13 +81,26 @@ if TYPE_CHECKING:
     from jax.sharding import Mesh
 
     from dew.diffusion.discrete import Confident, Unmask
-    from dew.distributed.placement import Layout, MeshSpec
     from dew.inference.tasks import SavedRun
     from dew.interop.torchax_fallback import TorchAdmission
     from dew.lora import Adapter, LoRA
     from dew.nn.attention import AttentionImpl
     from dew.nn.cross_attention import CrossBlocks
     from dew.nn.dex import DifferentialExtension
+
+
+def _refined(layout: Layout | None, model: RefinesLayout | None) -> Layout | None:
+    """`layout`, Dew's default where None, as `model` places its own tree (`RefinesLayout`); as it is
+    where no model refines it."""
+    return layout if model is None else model.placement(layout or Layout())
+
+
+class Placing(Protocol):
+    """A load's placement of what it read (`Pretrained.load`'s `mesh` and `layout`): its variables placed
+    a leaf at a time, by the layout as `model`, where it places its own tree, refines it
+    (`RefinesLayout`); as they are where the load places nothing."""
+
+    def __call__(self, variables: Variables, model: RefinesLayout | None = None) -> Variables: ...
 
 
 
@@ -474,8 +488,8 @@ class Pretrained:
             raise ValueError("a source loaded without its weights has nothing to place; the restore that "
                              "fills it places it, so pass no mesh or layout")
 
-        def placed(variables: Variables) -> Variables:
-            return place(variables, mesh, layout) if streaming else variables
+        def placed(variables: Variables, model: RefinesLayout | None = None) -> Variables:
+            return place(variables, mesh, _refined(layout, model)) if streaming else variables
 
         numerics, dtype, param_dtype = _load_settings(precision, dtype, param_dtype, prediction_depths)
         # The reference refuses a folder outside the source before anything is fetched.
@@ -1269,7 +1283,7 @@ def _names_a_model(directory: Path) -> bool:
 
 def _loaded_kind(reference: sources.SourceReference, directory: Path, composite: CompositeSource | None, *,
                  fallback: str | None, gguf_file: str | None, single_file: str | None,
-                 dduf_file: str | None, placed: Callable[[Variables], Variables], streaming: bool,
+                 dduf_file: str | None, placed: Placing, streaming: bool,
                  weights: bool, dtype: str, param_dtype: str, attention_impl: AttentionImpl,
                  max_seq_len: int | None, overrides: Mapping[str, object] | None,
                  trust_remote_code: bool, text_only: bool,
@@ -1305,8 +1319,7 @@ def _loaded_kind(reference: sources.SourceReference, directory: Path, composite:
         _unread_overrides(overrides, "the transformers forward")
         loaded = torchax_fallback.load(reference, directory, dtype=dtype, param_dtype=param_dtype,
                                        attention_impl=attention_impl, max_seq_len=max_seq_len,
-                                       weights=weights)
-        loaded = replace(loaded, variables=placed(loaded.variables))
+                                       weights=weights, placed=placed)
     elif gguf_file is None:
         # A selected GGUF file is a decoder, whatever pipeline index the repo also ships.
         loaded = _pipeline_source(reference, directory, single_file, dduf_file, placed,
@@ -1794,7 +1807,7 @@ def _composite_description(directory: Path,
 
 
 def _load_composite_source(source: sources.SourceReference, root: Path,
-                           description: CompositeSource, *, placed: Callable[[Variables], Variables],
+                           description: CompositeSource, *, placed: Placing,
                            streaming: bool, dtype: str, param_dtype: str, attention_impl: AttentionImpl,
                            max_seq_len: int | None, weights: bool,
                            overrides: Mapping[str, object] | None = None,
@@ -2071,7 +2084,7 @@ def _kept_tensors(tensors: Mapping[str, unread.Stored], config: Mapping[str, obj
 
 
 def _load_native_source(source: sources.SourceReference, root: Path, *,
-                        gguf_file: str | None, placed: Callable[[Variables], Variables], streaming: bool,
+                        gguf_file: str | None, placed: Placing, streaming: bool,
                         dtype: str, param_dtype: str, attention_impl: AttentionImpl,
                         max_seq_len: int | None, weights: bool = True,
                         component: NativeComponent | None = None,
@@ -2124,8 +2137,8 @@ def _load_native_source(source: sources.SourceReference, root: Path, *,
         selected = source if component is None else source.component(component.config_folder)
         loaded = torchax_fallback.load(selected, root, dtype=dtype, param_dtype=param_dtype,
                                        attention_impl=attention_impl, max_seq_len=max_seq_len,
-                                       admission=route.admitted, weights=weights)
-        return replace(loaded, variables=placed(loaded.variables)), False
+                                       admission=route.admitted, weights=weights, placed=placed)
+        return loaded, False
     if tensors is None and not weights:
         tensors = sources.stored_tensors(source, root)
     if tensors is None:

@@ -12,6 +12,7 @@ import fnmatch
 import json
 import math
 from collections.abc import Callable, Mapping, Sequence
+from typing import Protocol, runtime_checkable
 
 import jax
 import numpy as np
@@ -857,6 +858,16 @@ def placed_shapes[TreeT](tree: TreeT, placement: Placement[TreeT]) -> TreeT:
                                                                     sharding=sharding), tree, placement)
 
 
+@runtime_checkable
+class RefinesLayout(Protocol):
+    """A model that places its own tree's leaves: a tier-3 model's torch-named tree, which no module
+    declares axes for, placed by its tensor-parallel plan (`dew.interop.torchax_fallback.TorchLayout`).
+    A run's objective (`Objective.placement`) and a source's load hand it the run's layout, and it keeps
+    every choice the layout makes."""
+
+    def placement(self, layout: Layout) -> Layout: ...
+
+
 def link_topology(mesh: Mesh, axis: str) -> str:
     """What a figure of `mesh`'s `axis` is a figure of: the axis, the mesh's axes and their widths in
     order, and its devices in the mesh's order, each by id, process, kind and slice. A device's id is
@@ -868,4 +879,4 @@ def link_topology(mesh: Mesh, axis: str) -> str:
     return json.dumps([axis, [[name, width] for name, width in mesh.shape.items()], devices])
 
 
-__all__ = ["Layout", "LeafPlacement", "MeshSpec", "Validation"]
+__all__ = ["Layout", "LeafPlacement", "MeshSpec", "RefinesLayout", "Validation"]
