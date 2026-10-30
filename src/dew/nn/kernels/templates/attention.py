@@ -719,9 +719,26 @@ class Hooks:
     drop: Dropout | None = None
 
 
+def shared_place(shape: tuple[int, ...], row, head) -> tuple:
+    """The batch row and head a query, key or tile parameter of `shape` (`[B or 1, H or 1, ...]`) holds for
+    a program's batch `row` and query `head`: its own where its extent holds every one, else the one it
+    shares (a bias one table for every batch row, T5's `[1, H, Q, K]`), so no caller broadcasts it."""
+    return (row if shape[0] > 1 else 0), (head if shape[1] > 1 else 0)
+
+
+def shared_sum(grad: jax.Array, param: Param) -> jax.Array:
+    """A parameter's gradient `[B, H, ...]` (a mainloop's, a program a batch row and head) summed over the
+    batch rows and heads it shares (`shared_place`), its own shape; a mainloop that adds them in its
+    programs hands it back that shape already."""
+    shared = tuple(axis for axis in (0, 1) if param.value.shape[axis] == 1 and grad.shape[axis] > 1)
+    return grad.sum(axis=shared, keepdims=True) if shared else grad
+
+
 def _per_head(param: Param, row: jax.Array, head: jax.Array) -> jax.Array:
     """`param` as the reference reads it for one batch row and query head, over every query and key."""
     value = param.value
+    if param.kind in (Kind.QUERY, Kind.KEY, Kind.TILE):
+        row, head = shared_place(value.shape, row, head)
     match param.kind:
         case Kind.HEAD:
             return value[head]
@@ -1278,11 +1295,11 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
             case Kind.HEAD:
                 grads.append(dq_grads.pop(0).sum(axis=(0, 1))[:param.value.shape[0], 0])
             case Kind.QUERY:
-                grads.append(dq_grads.pop(0)[:, :, :queries])
+                grads.append(shared_sum(dq_grads.pop(0)[:, :, :queries], param))
             case Kind.TILE:
-                grads.append(key_grads.pop(0)[:, :, :queries, :keys])
+                grads.append(shared_sum(key_grads.pop(0)[:, :, :queries, :keys], param))
             case Kind.KEY:
-                grads.append(key_grads.pop(0)[:, :, :keys])
+                grads.append(shared_sum(key_grads.pop(0)[:, :, :keys], param))
             case Kind.OUTPUT:
                 raise ValueError("a score hook takes no output parameter")
     initial = None

@@ -29,7 +29,9 @@ from dew.nn.kernels.templates.attention import (
     Gradients,
     Hooks,
     KeySpans,
+    Kind,
     Split,
+    shared_sum,
     takes_output_residuals,
 )
 
@@ -199,7 +201,8 @@ def _forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     if mainloop == 'mosaic':
         return attention_mosaic.forward(query, key, value, spans, hooks, residuals=kept, **form)
     if mainloop == 'triton':
-        return attention_triton.forward(query, key, value, spans, hooks, residuals=residuals, **form)
+        return attention_triton.forward(query, key, value, spans, _spread(hooks, query), residuals=residuals,
+                                        **form)
     return attention_portable.attend(query, key, value, spans, hooks, block_q=PLAIN_TILE, block_k=PLAIN_TILE,
                                      pad=PLAIN_TILE, residuals=residuals, **form)
 
@@ -231,9 +234,24 @@ def _backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     if mainloop == 'mosaic':
         return attention_mosaic.backward(*call, residuals=residuals, rounded=rounded, **form)
     if mainloop == 'triton':
-        return attention_triton.backward(*call, residuals=residuals, rounded=rounded, **form)
+        grads = attention_triton.backward(query, key, value, spans, _spread(hooks, query), dout,
+                                          residuals=residuals, rounded=rounded, **form)
+        return dataclasses.replace(grads, score_params=tuple(
+            shared_sum(grad, param) for grad, param in zip(grads.score_params, hooks.score_params,
+                                                           strict=True)))
     return attention_portable.backward(*call, block_q=PLAIN_TILE, block_k=PLAIN_TILE, pad=PLAIN_TILE,
                                        residuals=residuals, rounded=rounded, **form)
+
+
+def _spread(hooks: Hooks, query: jax.Array) -> Hooks:
+    """`hooks` with each query, key or tile parameter spread over the batch rows and query heads it shares
+    (`template.shared_place`), as the frozen Triton mainloop indexes them; the other mainloops read them
+    shared."""
+    batch, heads = query.shape[0], query.shape[2]
+    return dataclasses.replace(hooks, score_params=tuple(
+        dataclasses.replace(param, value=jnp.broadcast_to(param.value,
+                                                          (batch, heads, *param.value.shape[2:])))
+        if param.kind in (Kind.QUERY, Kind.KEY, Kind.TILE) else param for param in hooks.score_params))
 
 
 def _hooks_cotangent(hooks: Hooks, grads: Gradients) -> Hooks:

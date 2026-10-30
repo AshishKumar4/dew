@@ -407,12 +407,15 @@ DENSE_BIAS_SEEDS = 8
 """Check 1's declared seeds for a dense bias named onto the template."""
 
 
-@pytest.mark.parametrize("rows", [2, 1], ids=["a bias a row", "one bias every row"])
-def test_a_dense_bias_named_onto_the_template_is_on_par_with_the_reference_path(rows):
-    """A causal bf16 call whose bias varies by query, `[B or 1, H, Q, K]` (a learned relative position's),
-    named onto the template: its score hook reads the bias a tile at a time (`template.biased`, a
-    `Kind.TILE` parameter), on par (check 1) with the reference path's dense bias from float64, its output
-    and the query's, key's, value's and bias's gradients (row 2081)."""
+@pytest.mark.parametrize("rows, heads", [(2, HEADS), (1, HEADS), (1, 1)],
+                         ids=["a bias a row", "one bias every row", "one bias every row and head"])
+def test_a_dense_bias_named_onto_the_template_is_on_par_with_the_reference_path(rows, heads):
+    """A causal bf16 call whose bias varies by query, `[B or 1, H or 1, Q, K]` (a learned relative
+    position's, T5's one table for every row), named onto the template: its score hook reads the bias a
+    tile at a time where it is shared, never broadcast (`template.biased`, a `Kind.TILE` parameter at
+    `template.shared_place`), on par (check 1) with the reference path's dense bias from float64, its
+    output and the query's, key's, value's and bias's gradients, the bias's in its own shape (rows 2081,
+    2523)."""
     queries = 40
 
     def drawn(seed):
@@ -421,7 +424,7 @@ def test_a_dense_bias_named_onto_the_template_is_on_par_with_the_reference_path(
             jnp.asarray(rng.standard_normal(shape), jnp.bfloat16) for shape in (
                 (2, queries, HEADS, WIDTH), (2, queries, KV_HEADS, WIDTH), (2, queries, KV_HEADS, WIDTH),
                 (2, queries, HEADS, WIDTH)))
-        bias = jnp.asarray(0.5 * rng.standard_normal((rows, HEADS, queries, queries)), jnp.float32)
+        bias = jnp.asarray(0.5 * rng.standard_normal((rows, heads, queries, queries)), jnp.float32)
         return query, key, value, bias, cotangent
 
     def attended(implementation):
@@ -429,7 +432,7 @@ def test_a_dense_bias_named_onto_the_template_is_on_par_with_the_reference_path(
             query, key, value, bias=bias, causal=True, implementation=implementation))
 
     assert_as_exact(jax.jit(attended("template")), jax.jit(attended("reference")), drawn,
-                    f"a dense bias of {rows} rows on the template", seeds=DENSE_BIAS_SEEDS)
+                    f"a dense bias of {rows} rows and {heads} heads on the template", seeds=DENSE_BIAS_SEEDS)
 
 
 @pytest.mark.skipif(generation.device_generation() != "sm90",
