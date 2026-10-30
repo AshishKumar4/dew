@@ -28,12 +28,14 @@ def _fused_allocations(family: mosaic.Family, config: BackwardTiles, width: int,
     """The fused launch's allocations as `Family.scoped` takes them, in `_fused_launch`'s order: its
     consumers' resident keys and values; a tile's weights and score cotangents staged for the transposed
     products' left operands and dQ's; dK's and dV's output stage, which a tile's dQ adds take too (fp32, the
-    head widths equal, `MosaicBackward.legal`); the two loads' barriers; and its query and output-cotangent
-    streams in `stages` slots (`Family.streams`)."""
+    head widths equal, `MosaicBackward.legal`), a chunk of its columns at a time (`mosaic.staged_columns`,
+    `mosaic.chunked`: the block's room for a third stage at width 128); the two loads' barriers; and its
+    query and output-cotangent streams in `stages` slots (`Family.streams`)."""
     consumers, block_q, block_k = config.consumers, config.block_q, config.block_k
+    chunk = mosaic.staged_columns(width, (jnp.float32,))
     scoped = [plgpu.SMEM((consumers, block_k, width), dtype), plgpu.SMEM((consumers, block_k, width), dtype),
               plgpu.SMEM((consumers, 2, block_q, block_k), dtype),
-              plgpu.SMEM((consumers, max(block_q, block_k), width), jnp.float32),
+              plgpu.SMEM((consumers, max(block_q, block_k), chunk), jnp.float32),
               family.load_barriers(consumers), family.load_barriers(consumers)]
     blocks = {"queries": ((block_q, width), dtype), "douts": ((block_q, width), dtype)}
     return scoped, family.streams(blocks, stages, consumers)
