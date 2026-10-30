@@ -19,6 +19,7 @@ from dew.config import RunConfig, TrainerConfig
 from dew.config.diffusion import DiffusionRunConfig
 from dew.data.dataset import Loader, Ramp
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.precision import Dtypes, Numerics
 from dew.nn.vision import GemmaProjector, SiglipVision
 from dew.optim import OptimConfig
 from dew.registry import Aliases, ModelConfig, projectors, towers
@@ -382,7 +383,8 @@ def test_train_runs_the_trainer_its_config_describes(tmp_path):
     trace = tmp_path / "trace"
     config = TrainerConfig(
         name="built", checkpoint_dir=str(tmp_path / "runs"), steps=3, accumulation=2,
-        dynamic_scale=True, mesh=MeshSpec(fsdp=2), layout=Layout(min_shard=1, tolerance=1.0),
+        precision=Numerics(Dtypes(compute="float16")), mesh=MeshSpec(fsdp=2),
+        layout=Layout(min_shard=1, tolerance=1.0),
         profile=ProfileWindow(str(trace), steps=1, warmup=1), eval_every=None, checkpoint_every=None)
 
     state = RunConfig(trainer=config).train(Regression(), Loader(lambda partition: batches(), None, None, 8),
