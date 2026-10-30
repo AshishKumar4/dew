@@ -173,16 +173,17 @@ def test_a_degenerate_strength_clip_or_regularizer_is_refused(asked):
 
 
 def test_the_loss_corrupts_by_its_process_own_noise_levels():
-    """A fresh DiT predicts zero velocity, so its clean estimate is the corrupted sample itself and the
-    live, old and implicit policies coincide: each sample's loss at time t is then the clip over beta
-    times the mean squared over the mean absolute error of alpha(t) x + sigma(t) eps against x, alpha
-    and sigma the process's own rates at t (a noise level of 2t / (1 + t) under its shift of 2): within
-    float64 rounding of that closed form over the noise the step draws."""
+    """A DiT of zero weights predicts zero velocity, so its clean estimate is the corrupted sample
+    itself and the live, old and implicit policies coincide: each sample's loss at time t is then the
+    clip over beta times the mean squared over the mean absolute error of alpha(t) x + sigma(t) eps
+    against x, alpha and sigma the process's own rates at t (a noise level of 2t / (1 + t) under its
+    shift of 2): within float64 rounding of that closed form over the noise the step draws."""
     from dew.objectives.base import Step
 
     nft = objective(jnp.float64, beta=0.5)
     with jax.enable_x64(new_val=True):
-        variables = nft.init(jax.random.key(30))
+        # Every weight zero, so the DiT's velocity is exactly zero.
+        variables = jax.tree.map(jnp.zeros_like, nft.init(jax.random.key(30)))
     rng = np.random.default_rng(31)
     samples = rng.normal(size=(8, 4, 4, 1))
     times = np.broadcast_to(np.asarray([1.0, 0.75, 0.5]), (8, 3))
