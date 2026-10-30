@@ -71,11 +71,11 @@ DSPARK = Path(__file__).parent / "fixtures" / "hf" / "deepseek-v4-dspark-tiny"
 def longrope_drafter():
     """The tiny DeepSeek V4-Flash-0731 (`DSPARK`) with its DSpark block drafter over a trunk of plain
     attention whose rotary switches tables past its sixth position (LongRoPE), the drafter's own sliding
-    V4 kind keeping the release's YaRN, which V4's attention takes."""
+    V4 kind rotating under YaRN, which V4's attention takes where it refuses LongRoPE."""
     from dew.interop import Pretrained
     from dew.nn.backbones.layer_plan import LayerKind
     from dew.nn.mixers.attention import AttentionMixer
-    from dew.nn.rope import LongRopeScaling
+    from dew.nn.rope import LongRopeScaling, YarnScaling
 
     model = Pretrained.load(DSPARK, weights=False, dtype="float32", attention_impl="reference").model
     drafter = model.dspark.layer_type
@@ -84,7 +84,8 @@ def longrope_drafter():
     return model.clone(
         layer_types=("trunk",) * model.num_layers,
         kinds={"trunk": LayerKind(mixer=AttentionMixer()),
-               drafter: dataclasses.replace(model.kinds[drafter], rope_scaling=model.rope_scaling)},
+               drafter: dataclasses.replace(model.kinds[drafter], rope_scaling=YarnScaling(
+                   factor=4.0, original_max_position_embeddings=8))},
         rope_scaling=LongRopeScaling(short_factor=(1.0,) * pairs,
                                      long_factor=tuple(2.0 + pair for pair in range(pairs)),
                                      original_max_position_embeddings=6))
@@ -228,8 +229,9 @@ def test_a_longrope_crossing_reseeds_the_drafter_as_a_prefill_of_its_history_doe
         rng = np.random.default_rng([0x1899, seed])
         return tuple(rng.integers(1, model.vocab_size, (2, width)).astype(np.int32) for width in (3, 4))
 
-    assert_as_exact(crossed, as_given(prefill(model, params)), draw,
-                    f"a LongRoPE crossing's {drafting} reseed", seeds=CROSSING_SEEDS[drafting], truth_fn=truth)
+    label = f"a LongRoPE crossing's {drafting} reseed"
+    assert_as_exact(crossed, as_given(prefill(model, params)), draw, label, seeds=CROSSING_SEEDS[drafting],
+                    truth_fn=truth)
 
 
 def test_an_eos_inside_a_block_ends_the_row_on_the_token_that_drew_it():
