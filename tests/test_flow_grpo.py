@@ -1168,7 +1168,7 @@ KL_LEVELS = (-126, -125, -100, -63, -26, -1, 0, 1, 26, 63, 100, 126, 127)
 FIXED_ROWS = (
     # (mean, reference, variance, mean tangent, reference tangent, variance tangent, cotangent), three
     # coordinates: each a review's or the second opinion's input. A JVP of products [2**120, -2**120,
-    # 2**-100], which a plain float32 sum keeps and aligning to the largest flushed (Main, 1778).
+    # 2**-100], which a plain float32 sum keeps and aligning to the largest flushed (the maintainer, 1778).
     ([2.0**60, 2.0**60, 2.0**-100], [0, 0, 0], 1, [2.0**60, -2.0**60, 1], [0, 0, 0], 0, 1),
     ([2.0**60, 2.0**60, 1], [0, 0, 0], 1, [2.0**60, -2.0**60, 2.0**-5], [0, 0, 0],
      (1 + 2.0**-23) * 2.0**-125, 1),

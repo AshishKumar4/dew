@@ -438,7 +438,7 @@ def test_a_stopped_pool_ends_its_ranks_without_aborts():
     SIGKILLed after the grace. Rank 0's process holds the pool's coordination
     service: killed first, it left the others to abort in XLA's error
     polling, with "Check failure" stack traces that read as crashes of their
-    own (DistSequence's land7 run, stopped by its timeout). Stopped last, it
+    own (the sequence-parallel lane's land7 run, stopped by its timeout). Stopped last, it
     leaves no rank to abort."""
     program = ("import os, time\n"
                "from dew.training.runtime import prepare_process\n"
@@ -929,7 +929,7 @@ def test_a_pools_second_run_loads_what_its_first_compiled(tmp_path):
     starts none whose fingerprints differ, openxla/xla#49677;
     docs/guides/multi-node.md), every process does; on the CPU, where a
     process's topology is its own devices, the others compile the step again,
-    as upstream JAX does (Main, 2026-10-26: no fork code for the CPU alone)."""
+    as upstream JAX does (the maintainer, 2026-10-26: no fork code for the CPU alone)."""
     cache, records = tmp_path / "cache", tmp_path / "records"
     program = (
         "import json, sys\n"

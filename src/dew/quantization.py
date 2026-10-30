@@ -1287,7 +1287,7 @@ def _group_scaled_convolution() -> type:
             depthwise convolution took lax's path on CUDA, and quantized
             training of the hybrid DiT parted from Qwix's own and from the
             unwrapped model after its zero-initialized fusion kernels'
-            first update (ColabPlan-2, the RTX 4080)."""
+            first update (the Colab lane, the RTX 4080)."""
             rule, _ = self._get_current_rule_and_op_id("conv_general_dilated", only_rule=True)
             if rule is None or rule.weight_qtype is None:
                 return dew_conv._conv_general_dilated(lhs, rhs, *args, **kwargs)

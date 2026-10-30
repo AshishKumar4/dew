@@ -58,7 +58,7 @@ DISTANCES = frozenset({"dew.accuracy.distance", "reference_error.distance"})
 ONE_DRAW = frozenset({"one_draw.assert_as_exact_as_the_reference", "one_draw.assert_leaves_as_exact",
                       "one_draw.assert_no_less_exact"})
 """The gate's one-draw rules, a comparison each call until it judges through check 1's drawn seeds
-(`assert_as_exact`), under the inventory's ratchet (Main's ruling, row 2089)."""
+(`assert_as_exact`), under the inventory's ratchet (the maintainer's ruling, row 2089)."""
 
 TOLERANCE_KEYWORDS = frozenset({"atol", "rtol"})
 TOLERANCE_NAME = re.compile(r"(?:^|_)(?:tolerance|tol|atol|rtol)s?$", re.IGNORECASE)

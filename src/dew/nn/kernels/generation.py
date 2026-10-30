@@ -531,7 +531,7 @@ def gpu_mesh(mesh: Mesh, generation: str) -> AbstractMesh:
 # rejects the BF16_BF16_F32 dot algorithm at run time ("UNIMPLEMENTED:
 # Unsupported algorithm on the current device(s): ALG_DOT_BF16_BF16_F32"),
 # cuDNN's fused attention refuses bf16 ("SDPA FP16/BF16 requires SM80"), and
-# Triton does not compile; measured on a T4 (sm75), KernelMatrix 2026-09-22.
+# Triton does not compile; measured on a T4 (sm75), the kernel-matrix lane 2026-09-22.
 BF16_GPU = 80
 
 
