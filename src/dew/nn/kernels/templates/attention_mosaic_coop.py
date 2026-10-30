@@ -53,9 +53,11 @@ def _coop_step(walk: _Backward, share: int, resident: tuple, exchanged, rows_of,
     and output-cotangent slots, under the tile's queries' statistics (`rows_of`) and coordinates
     (`coords_of`), a tile every query sees whole (`whole(index)`) unmasked, or each tile `masked` or not
     where the walk's segment says; its weights and score cotangents staged into the exchange (`exchanged`)
-    at its share of the keys, then, once every consumer's are (`turns[0]`), its share of the head's columns
-    of dV, dK and dQ over every key of the block (`aᵀ @ b`, `a @ b`), dQ added into dQ (`add_dq`); and
-    once every consumer read the exchange (`turns[1]`), the next tile's may be staged."""
+    at its share of the keys once every consumer read the last tile's (`turns[1]`, awaited only now, past
+    this tile's products and softmax, its arrival the last step's), then, once every consumer's are staged
+    (`turns[0]`), its share of the head's columns of dV, dK and dQ over every key of the block
+    (`aᵀ @ b`, `a @ b`), dQ added into dQ (`add_dq`), and its reads of the exchange done (`turns[1]`'s
+    arrival)."""
     k_smem, v_smem = resident
     family, tiles, consumers = walk.program.family, walk.program.tiles, walk.consumers
     keys, columns = tiles.block_k // consumers, k_smem.shape[-1] // consumers
@@ -66,6 +68,7 @@ def _coop_step(walk: _Backward, share: int, resident: tuple, exchanged, rows_of,
     narrowed, part = _tile_scores(walk, (q_slot, do_slot), (k_smem.at[own], v_smem.at[own]), rows_of(q_first),
                                   coords_of(q_first), whole(index), (tiles.block_q, keys), masked=masked)
     weights_ref, cotangents_ref = exchanged.at[0], exchanged.at[1]
+    family.turn(turns[1], consumers, arrive=False)
     family.staged(narrowed, weights_ref.at[:, own])
     family.staged(part, cotangents_ref.at[:, own])
     family.turn(turns[0], consumers)
@@ -73,7 +76,7 @@ def _coop_step(walk: _Backward, share: int, resident: tuple, exchanged, rows_of,
     dv_acc = family.products(dv_acc, weights_ref.transpose((1, 0)), do_slot.at[:, mine], walk.interpret)
     dk_acc = family.products(dk_acc, cotangents_ref.transpose((1, 0)), q_slot.at[:, mine], walk.interpret)
     add_dq(q_first, family.product(cotangents_ref, k_smem.at[:, mine], (tiles.block_q, columns)))
-    family.turn(turns[1], consumers)
+    family.turn(turns[1], consumers, wait=False)
     return carry, (dk_acc, dv_acc)
 
 
@@ -138,6 +141,8 @@ def _coop_launch(query, key, value, dout, peak, total, anchor, delta, key_index,
                         (functools.partial(step, masked=True), end, hi))
 
             shapes = ((block_k, columns), (block_k, columns))
+            # The exchange free before the first tile: its reads' turn arrived at once (`_coop_step`).
+            family.turn(read_turn, consumers, wait=False)
             _, (dk, dv) = family.walk_own(
                 streams, views, (lo, hi), streamed, index,
                 lambda streams, lo, hi, counted: family.walk(streams, segments(lo, hi), (), shapes,
