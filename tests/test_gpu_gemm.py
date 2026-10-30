@@ -34,7 +34,8 @@ pytestmark = pytest.mark.gpu(reason="the GEMM template's and the Mosaic toolkit'
 def _fused_projection_training():
     """One routed projection update, including an empty expert and rows beyond the routed ones. The
     input cotangent exercises both paths through RMS normalization, and the updated parameters run
-    another forward. The reference computes each expert's product directly, outside the template."""
+    another forward. The reference is the plain program main's GEMM tests take: the RMS norm as a model
+    writes it and XLA's ragged product (`test_gemm_template`), outside the template."""
     rows, depth, width = 256, 256, 256
     sizes = (0, 100, 150)
     groups = jnp.asarray(sizes, jnp.int32)
@@ -47,17 +48,11 @@ def _fused_projection_training():
 
     def reference(x, params):
         work = jnp.promote_types(x.dtype, jnp.float32)
-        wide = x.astype(work)
-        normalized = (wide * jax.lax.rsqrt(jnp.mean(wide * wide, axis=-1, keepdims=True) + 1e-6)
-                      * params["norm"]).astype(x.dtype)
+        normalized = gemm_template.rms_norm(x, params["norm"])
         matrices = params["weight"].astype(x.dtype).astype(work)
-        products, start = [], 0
-        for index, count in enumerate(sizes):
-            products.append(normalized[start:start + count].astype(work) @ matrices[index])
-            start += count
-        products.append(jnp.zeros((rows - start, width), work))
-        projected = jnp.concatenate(products)
-        return jax.nn.silu(projected + params["bias"]) + wide[:, :width]
+        # Rows past the routed ones take no expert: ragged_dot leaves them zero.
+        projected = jax.lax.ragged_dot(normalized.astype(work), matrices, groups, preferred_element_type=work)
+        return jax.nn.silu(projected + params["bias"]) + x.astype(work)[:, :width]
 
     def step(forward):
         def update(x, params, targets):
