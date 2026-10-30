@@ -477,7 +477,9 @@ def held_draw(model: str, layout: str, *, seeds: int, devices: int | None = None
     case, _ = model_case(model, "float32", {}, {})
     split = _trainer(case, LAYOUTS[layout], devices=devices)
     alone = _trainer(case, {}, one_device=True)
-    placement = split._started().shardings.variables["params"]
+    # Where the layout places the parameters, read from the abstract state through the trainer's own API.
+    split.validate()
+    placement = split.shardings(jax.eval_shape(split.initial_state)).variables["params"]
 
     def drawing(trainer):
         def draw(seed):
