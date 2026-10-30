@@ -50,17 +50,11 @@ class Export:
 
     def run_command(self) -> int:
         from dew.inference.tasks import SavedRun
-        from dew.interop import Pretrained
-        from dew.objectives.base import ReleasedTask
+        from dew.interop.saved_sources import export_run
 
         # A task that publishes its own released layout (a decision run's) writes it; any other
         # run writes its model in the source layout its family reads, both at the step pinned here.
-        run = SavedRun.pinned(self.run, self.step, self.trust)
-        task = run.objective.saved_task
-        if task is not None and issubclass(task, ReleasedTask):
-            task.from_saved(run, ema=self.ema).save_pretrained(self.destination)
-        else:
-            Pretrained.from_saved(run, ema=self.ema).save(self.destination)
+        export_run(SavedRun.pinned(self.run, self.step, self.trust), self.destination, ema=self.ema)
         emit(f"exported {self.run} to {self.destination}")
         return 0
 
