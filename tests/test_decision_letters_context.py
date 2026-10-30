@@ -100,7 +100,7 @@ def test_a_lettered_row_writes_its_question_to_its_context_and_answers_at_its_ow
     assert [text(row.context[start:end]) for start, end in laid.options] == ["\nA. cards", "\nB. loans",
                                                                             "\nC. fraud"]
     in_row = dataclasses.replace(LAYOUT, segments=tuple(
-        dataclasses.replace(segment, stream="row") if isinstance(segment, (Instructions, OptionLines))
+        dataclasses.replace(segment, stream="row") if isinstance(segment, Instructions)
         else segment for segment in SEGMENTS))
     [own] = in_row.rows(TOKENIZER, SPECIALS, "my card is lost", {"q": question})
     assert text(own.tokens) == "STATE:\nmy card is lost" + context + "\nAnswer:"
@@ -211,6 +211,10 @@ def test_a_run_names_its_lettered_question_read_in_context_on_the_command_line(t
     assert config.segments == SEGMENTS and isinstance(config.head, Letters)
     with pytest.raises(ValueError):
         dataclasses.replace(config, context_layers=None).prepare()
+    # The same question read in the row, its option lines with it, needs no context layers.
+    in_row = tuple(dataclasses.replace(segment, stream="row") if isinstance(segment, Instructions)
+                   else segment for segment in SEGMENTS)
+    assert dataclasses.replace(config, segments=in_row, context_layers=None).prepare() is not None
     config.run()
     decide = Decide.from_run(str(tmp_path / "runs" / "letters"))
     asked = QUESTIONS[0]

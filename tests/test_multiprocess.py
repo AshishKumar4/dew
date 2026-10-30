@@ -64,7 +64,6 @@ SAVE_EVERY = 3
 BLOCK_AFTER = 5
 RECORDS = worker.BATCH * 16
 AVERAGING = Path(__file__).with_name("averaging_worker.py")
-EXAMPLES_CLOCK = Path(__file__).with_name("examples_clock_worker.py")
 """The worker of the pools that average runs."""
 
 
@@ -138,23 +137,6 @@ def test_a_real_token_budget_agrees_across_processes_after_logging_ticks(tmp_pat
     assert [report["step"] for report in reports] == [3, 3]
     assert [report["updates"] for report in reports] == [3, 3]
     assert [report["logged"] for report in reports] == [3, 0]
-
-
-@pytest.mark.distributed
-def test_a_pools_shares_on_the_examples_clock_end_apart_and_the_run_at_its_bound(tmp_path):
-    """A run bounded in examples whose objective expands them unevenly leaves the pool's shares other
-    counts of rows, so they run out at steps apart: each reads on, a share that ran out stepping with its
-    last batch emptied, until every one has, and the run ends on every process at one step with its whole
-    bound consumed, its clock the pool's on every step (the examples its logs read rising to the bound),
-    where the pool once refused the run (row 2009)."""
-    reports = run_pool("examples_clock", tmp_path / "pool", 2, script=EXAMPLES_CLOCK, records=24, timeout=300)
-    # Each share credits the examples whose last rows it holds, the pool's shares the bound once.
-    assert sum(report["credited"] for report in reports) == 24
-    assert reports[0]["rows"] != reports[1]["rows"]
-    assert len({report["step"] for report in reports}) == 1
-    assert [report["consumed"] for report in reports] == [24, 24]
-    logged = reports[0]["logged"]
-    assert logged == sorted(logged) and logged[-1] == 24 and reports[1]["logged"] == []
 
 
 @pytest.mark.distributed

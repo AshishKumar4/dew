@@ -17,6 +17,7 @@ from dew.data import Memory
 from dew.data.compile import compile, fitted
 from dew.data.dataset import Closeable, DataPartition, Loader, Loading
 from dew.data.pipeline import Pipeline
+from dew.distributed.batches import batch_signature
 from dew.objectives import Aux, Objective
 from dew.optim import Cosine, Linear, OneCycle, OptimConfig
 from dew.telemetry.records import FitStarted
@@ -568,38 +569,41 @@ def test_a_clocked_run_whose_split_is_planned_compiles_one_step():
     assert len(logged) > 1 and logged[0]["train/compiles"] == logged[-1]["train/compiles"] > 0
 
 
-class Traced(Pulled):
-    """`Pulled`, keeping the fields of each batch its loss is traced over."""
+class Signed(Pulled):
+    """`Pulled`, keeping the signature of each batch the trainer hands a step (`batch_signature`), as it
+    reads each one's row geometry (`Objective.row_tokens`)."""
 
     def __init__(self):
         super().__init__()
-        self.traced: list[frozenset[str]] = []
+        self.signed: list = []
 
-    def loss(self, variables, batch, step):
-        self.traced.append(frozenset(batch))
-        return super().loss(variables, batch, step)
+    def row_tokens(self, batch):
+        self.signed.append(batch_signature(batch))
+        return super().row_tokens(batch)
 
 
 def test_a_clocked_runs_cooldown_and_its_step_compiled_ahead_take_its_batches_as_its_fit_does():
     """Every step a clocked run compiles takes its batches marked whether they close their window
-    (`closes_window`): a cooldown branch's step traces the batch fit's does, so the run keeps one
-    program, and a step compiled ahead for the run (`step_batch`) is handed the batch fit hands its
-    step, so the run takes the saved program as its own (row 2527)."""
-    from dew.batch import CLOSES_WINDOW
+    (`closes_window`): its cooldown branch steps on batches of the signature its fit's are, and compiles
+    no program of its own (the run's compile count unchanged through the branch), and a step compiled
+    ahead for the run (`step_batch`) is handed a batch of that one signature, so the run takes the saved
+    program as its own (rows 2527, 2434)."""
     from dew.training import Cooldowns
     from dew.training._fit import first_batch
     from dew.training.ahead import step_batch
 
     (x,) = clocked_records(0)
     optim = OptimConfig(optimizer="adam", learning_rate=Linear(peak_value=PEAK, end_value=CLOCKED_END))
-    traced = Traced()
-    Trainer(traced, optim, key=0, cooldowns=Cooldowns(at=("50%",), length=1)).fit(
+    signed, tracker = Signed(), RecordingTracker()
+    Trainer(signed, optim, key=0, tracker=tracker, cooldowns=Cooldowns(at=("50%",), length=1)).fit(
         clocked_chain(x), examples=CLOCKED_RECORDS, log_every=1)
-    assert traced.traced and set(traced.traced) == {traced.traced[0]} and CLOSES_WINDOW in traced.traced[0]
+    assert len(signed.signed) > 1 and all(signature == signed.signed[0] for signature in signed.signed)
+    logged = [scalars["train/compiles"] for _, scalars in tracker.scalars if "train/compiles" in scalars]
+    assert logged and logged[0] == logged[-1]
     trainer = Trainer(Pulled(), optim, key=0)
     loader, _ = fitted(clocked_chain(x), None, objective=Pulled().data(), examples=CLOCKED_RECORDS)
     trainer.reading(loader, examples=CLOCKED_RECORDS)
-    assert set(step_batch(trainer, first_batch(loader, trainer.device_mesh))) >= traced.traced[0]
+    assert batch_signature(step_batch(trainer, first_batch(loader, trainer.device_mesh))) == signed.signed[0]
 
 
 def test_a_batched_step_that_makes_no_rows_of_a_group_carries_its_examples_on():

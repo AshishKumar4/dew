@@ -23,7 +23,6 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import ClassVar, Literal, Protocol, runtime_checkable
 
 import grain.python as pygrain
-import jax
 import numpy as np
 
 from dew._records import JSON, integer, json_value
@@ -421,10 +420,10 @@ def _bounded(pipeline: Pipeline, examples: int) -> Pipeline:
     packs or windows them, or its batch: never the rows an objective makes of an example or the windows
     a pack lays them in. A repeat without end goes before the bound
     where none is written, so the records may span passes, and the batch keeps the short one the
-    bound ends inside, filled and marked, so each record bounded is read once (`Loader.examples`); in a
-    pool each process reads its share of the bound. Refuses a bound it cannot place: a repeat with a
-    count before it, or any repeat after it, the batch's included, a mixed corpus that packs on its own,
-    and phases, which end by steps. A chain without a batch is left for `compile` to refuse."""
+    bound ends inside, filled and marked, so each record bounded is read once (`Loader.examples`).
+    Refuses a bound it cannot place: a repeat with a count before it, or any repeat after it, the
+    batch's included, a mixed corpus that packs on its own, and phases, which end by steps. A chain
+    without a batch is left for `compile` to refuse."""
     if examples < 1:
         raise ValueError(f"examples must be at least 1, got {examples}")
     if isinstance(pipeline.source, Phases):
@@ -442,12 +441,8 @@ def _bounded(pipeline: Pipeline, examples: int) -> Pipeline:
             isinstance(stage, Repeat) for stage in pipeline.stages[at:]):
         raise ValueError(f"{_name(pipeline)} repeats with a count, or after the records it packs or batches, "
                          f"which a bound of {examples} examples would cut or repeat; leave the repeat out")
-    # Each example the bound reads is consumed by the last row a step makes of it (`MarkConsumed`). A pool's
-    # processes each read records of their own, so each reads its share of the bound, the first the extra
-    # one each where it does not divide, and the pool reads the bound once.
-    count, rank = jax.process_count(), jax.process_index()
-    bound = (*(() if repeats else (Repeat(None),)), Limit(examples // count + int(rank < examples % count)),
-             Map(MarkConsumed()))
+    # Each example the bound reads is consumed by the last row a step makes of it (`MarkConsumed`).
+    bound = (*(() if repeats else (Repeat(None),)), Limit(examples), Map(MarkConsumed()))
     batch = dataclasses.replace(pipeline.stages[batched], drop_remainder=False)
     return dataclasses.replace(pipeline, stages=(*pipeline.stages[:at], *bound, *pipeline.stages[at:batched],
                                                  batch, *pipeline.stages[batched + 1:]))

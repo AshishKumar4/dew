@@ -135,7 +135,6 @@ from dew.training._fit import (
     first_batch,
     fit_policies,
     handed_splits,
-    pooled,
     refuse_unclocked,
     stage_reached,
     unrecorded_parts,
@@ -1742,7 +1741,7 @@ class Trainer(Generic[Loss, Effects]):
             # corpus, and none reads a record before all agree it is one.
             agreed_same("training data", lambda: (
                 f"{plan.dataset.batch} records a step of {stream_identity(source)}"))
-        run.endless, run.pooled = stream_endless(source), pooled(self._examples)
+        run.endless = stream_endless(source)
         self._marked = marked(run.partition, self._counted_batch)
         prepare = self._marked if self.rollout is None else None
         return DevicePrefetchIterator(source, self.device_mesh, self._prefetch, source_state=position,
