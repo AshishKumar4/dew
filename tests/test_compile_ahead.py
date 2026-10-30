@@ -415,7 +415,7 @@ def test_a_run_naming_its_input_alone_compiles_its_step_ahead(tmp_path):
 
     from dew.data.dataset import Loader
     from dew.objectives.supervised import Supervised
-    from dew.training.ahead import AheadTarget, CompiledAhead, compile_only_gpus
+    from dew.training.ahead import AheadTarget, compile_only_gpus
 
     data = Loader(train=lambda partition: iter([{"x": np.ones((BATCH, 8), np.float32),
                                                   "y": np.zeros((BATCH, 4), np.float32)}] * 4),
@@ -423,9 +423,8 @@ def test_a_run_naming_its_input_alone_compiles_its_step_ahead(tmp_path):
     trainer = Trainer(Supervised(nn.Dense(4), lambda outputs, batch: (outputs - batch["y"]) ** 2, inputs="x"),
                       optax.sgd(0.1), key=jax.random.key(0),
                       mesh=MeshSpec().build(compile_only_gpus("sm90", 1)))
-    with pytest.raises(CompiledAhead) as ended:
-        AheadTarget("sm90", 1, str(tmp_path / "step.dew-aot")).compiled(trainer, data, steps=1)
-    assert ended.value.ahead.devices == 1 and trainer.objective.inputs is not None
+    ended = AheadTarget("sm90", 1, str(tmp_path / "step.dew-aot")).compiled(trainer, data, steps=1)
+    assert ended.ahead.devices == 1 and trainer.objective.inputs is not None
 
 
 FAST = {"tensor": Link(1e18, 1e9)}

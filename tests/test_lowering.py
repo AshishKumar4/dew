@@ -1110,7 +1110,7 @@ def test_a_resumed_run_compiles_ahead_for_a_tpu_topology_where_its_checkpoint_le
     from dew.nn.backbones import CausalTransformer
     from dew.objectives.lm import LMObjective
     from dew.training import Layout, Trainer
-    from dew.training.ahead import AheadTarget, CompiledAhead
+    from dew.training.ahead import AheadTarget
 
     read: list[int] = []
     data = Loader(train=lambda partition: _Placed(read), val=None, batch=4, records=None)
@@ -1123,11 +1123,10 @@ def test_a_resumed_run_compiles_ahead_for_a_tpu_topology_where_its_checkpoint_le
     assert read[0] == 0
     read.clear()
     target = AheadTarget("v5e:2x2", 4, str(tmp_path / "step.dew-aot"))
-    with pytest.raises(CompiledAhead) as ended:
-        target.compiled(_topology_trainer("v5e:2x2", checkpoints=Checkpoints(str(tmp_path / "run"))), data,
-                        steps=2)
+    resumed = _topology_trainer("v5e:2x2", checkpoints=Checkpoints(str(tmp_path / "run")))
+    ended = target.compiled(resumed, data, steps=2)
     assert read and read[0] == 1
-    assert ended.value.ahead.plan is not None and ended.value.ahead.devices == 4
+    assert ended.ahead.plan is not None and ended.ahead.devices == 4
 
 
 def test_a_topology_compile_neither_reads_nor_writes_the_persistent_cache(tmp_path, monkeypatch):
