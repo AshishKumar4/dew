@@ -164,13 +164,15 @@ _FILES: dict[str, Path] = {}
 """The modules `module_from_file` imported, by name, each its file."""
 
 
-def module_from_file(path: str | os.PathLike[str], name: str) -> types.ModuleType:
+def module_from_file(path: str | os.PathLike[str], name: str, *, beside: bool = False) -> types.ModuleType:
     """The Python file at `path` imported as the module `name`, which `sys.modules` holds before it runs,
     so what it defines is named by `name` (`import_path`) and a record of it reads back here
     (`imported`). Each call runs the file again; a file this imported before under `name` gives way
     to this one. A name that is another module's, imported or importable (the standard library's
     `json` for a `json.py`), or a package's module (a dotted name), is refused rather than shadowed
-    or read in its place."""
+    or read in its place, the process as it was. `beside` puts the file's directory first on the path
+    once the file is accepted, as `python -m` runs one beside its siblings, so it imports them; a file
+    that fails as it runs leaves the path as it was."""
     location = Path(path).resolve()
     if "." in name:
         raise ValueError(f"{location} would import as {name}, a module of the package "
@@ -188,11 +190,17 @@ def module_from_file(path: str | os.PathLike[str], name: str) -> types.ModuleTyp
     if spec is None or spec.loader is None:
         raise ValueError(f"{location} is not a Python file")
     module = importlib.util.module_from_spec(spec)
+    directory = str(location.parent)
+    placed = beside and directory not in sys.path
+    if placed:
+        sys.path.insert(0, directory)
     sys.modules[name], _FILES[name] = module, location
     try:
         spec.loader.exec_module(module)
     except BaseException:
         del sys.modules[name], _FILES[name]
+        if placed:
+            sys.path.remove(directory)
         raise
     return module
 
