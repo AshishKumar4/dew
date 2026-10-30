@@ -356,7 +356,9 @@ def _event(key: jax.Array, step: int | jax.Array, schedule_step: int | jax.Array
         event_key = _folded(_folded(key, 0x4556414C), at)
         schedule = jax.device_put(np.asarray(schedule_at, np.dtype(dtype)))
         committed = jax.device_put(np.asarray(updates_at, np.dtype(dtype)))
-        return (Step(step=schedule, key=event_key, ema=averaged, committed=committed),
+        # An evaluation's model calls train nothing, its metrics, loss and preview alike, so a model that
+        # reads the run's progress reads its end (`Objective.progress`) whatever the pass reports.
+        return (Step(step=schedule, key=event_key, ema=averaged, training=False, committed=committed),
                 jax.random.key_data(event_key))
 
     context, event_data = agreed("evaluation context", event)
