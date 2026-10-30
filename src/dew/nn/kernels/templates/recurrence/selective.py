@@ -270,10 +270,13 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan):
                             h = [decay(t, n) * h[i] + written * bs[t, n].astype(jnp.float32)
                                  for i, n in enumerate(own)]
                             for i in range(GROUP):
-                                kept_smem[t, i, :] = h[i]
+                                kept_smem[t + 1, i, :] = h[i]
                                 summed_smem[t * GROUP + i, :] = out_grad * h[i]
                             return h
 
+                        # The entering state the replay's first row, each token's a row past it.
+                        for i, n in enumerate(own):
+                            kept_smem[0, i, :] = entering[n, :]
                         lax.fori_loop(0, chunk, replay, [entering[n, :] for n in own], unroll=UNROLLED)
                         _summed_rows(summed_smem, dc_ref.at[row, part, n_chunk, k], sums_smem, family)
 
@@ -288,8 +291,7 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan):
                             writes = writes_smem[t, :]
                             decays = decays_smem[t, :]
                             for j, n in enumerate(own):
-                                before = jnp.where(t > 0, kept_smem[jnp.maximum(t - 1, 0), j, :],
-                                                   entering[n, :])
+                                before = kept_smem[t, j, :]
                                 a = decay(t, n)
                                 writes = writes + g_own[j] * bs[t, n].astype(jnp.float32)
                                 through = g_own[j] * before * a
@@ -340,7 +342,7 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan):
 
             family.roles(1, consumer, producer)
 
-        allocations = (plgpu.SMEM((chunk, GROUP, block), jnp.float32),
+        allocations = (plgpu.SMEM((chunk + 1, GROUP, block), jnp.float32),
                        plgpu.SMEM((chunk * GROUP, block), jnp.float32),
                        plgpu.SMEM((chunk, block), jnp.float32), plgpu.SMEM((chunk, block), jnp.float32),
                        plgpu.SMEM((chunk * GROUP,), jnp.float32), plgpu.SMEM((block,), jnp.float32))
