@@ -635,7 +635,7 @@ def clocked_records(seed: int) -> tuple[np.ndarray]:
 def test_a_clocked_runs_share_of_its_examples_falls_where_its_batches_pass_it():
     """A run bounded in examples that counts no steps ahead logs at a share of its examples (`25%`, every 5
     of 18) at each step whose batch brings its consumed examples past a multiple of that share
-    (`Examples`), and at its last."""
+    (`Counted(every, "examples")`), and at its last."""
     ids = np.arange(1, CLOCKED_RECORDS + 1)
     owner = np.repeat(np.arange(CLOCKED_RECORDS), ids % 3 + 1)
     last = np.r_[owner[1:] != owner[:-1], True]
@@ -846,18 +846,19 @@ def test_asking_a_streamed_runs_steps_reads_none_of_its_data():
     assert loader.example_steps(23) is None and len(seen) == read
 
 
-@pytest.mark.parametrize("schedule", [OneCycle(peak_value=PEAK, warmup_fraction=0.25),
-                                      Cosine(peak_value=PEAK, warmup_steps="25%")],
-                         ids=["one-cycle", "cosine"])
-def test_a_clocked_run_of_a_warmup_as_a_share_trains_and_records_it_as_written(schedule):
+@pytest.mark.parametrize(("schedule", "written"),
+                         [(OneCycle(peak_value=PEAK, warmup_fraction=0.125), 0.125),
+                          (Cosine(peak_value=PEAK, warmup_steps="25%"), "25%")], ids=["one-cycle", "cosine"])
+def test_a_clocked_run_of_a_warmup_as_a_share_trains_and_records_it_as_written(schedule, written):
     """A run bounded in examples that counts no steps ahead trains under a schedule whose warmup is a share
-    of the run, which it records at its start as written (`OptimConfig.warmups`), there being no updates
-    ahead to count it in; its start records its length, its bound, and each step's log the examples it
-    has consumed, ending at the bound (row 2436)."""
+    of the run, which it records at its start as written (`OptimConfig.warmups`), the fraction as the
+    schedule holds it, never rounded (row 2531), there being no updates ahead to count it in; its start
+    records its length, its bound, and each step's log the examples it has consumed, ending at the bound
+    (row 2436)."""
     state, tracker = clocked_fit(*clocked_records(0), 1, learning_rate=schedule)
     assert state is not None and int(state.consumed) == CLOCKED_RECORDS
     started = next(value for _, value in tracker.artifacts if isinstance(value, FitStarted))
-    assert started.cadences["warmup_steps.learning_rate"] == "25%"
+    assert started.cadences["warmup_steps.learning_rate"] == written
     assert started.target_steps is None and started.examples == CLOCKED_RECORDS
     consumed = [scalars["train/examples_consumed"] for _, scalars in tracker.scalars
                 if "train/loss" in scalars]
