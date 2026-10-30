@@ -471,6 +471,22 @@ def test_a_pretrained_run_stores_a_source_it_keeps_frozen_as_its_checkpoint_does
             np.testing.assert_array_equal(np.asarray(before), np.asarray(after))
 
 
+def test_a_lora_run_under_bf16_parameters_keeps_its_factors_float32_and_its_base_bf16(tmp_path):
+    """Under parameters stored in bf16 (`dtypes.params`), a LoRA run stores its frozen base in that
+    narrower dtype and keeps its factors float32, as PEFT keeps an adapter over a bf16 base
+    (`dew.lora.FACTOR_DTYPE`) (review of ledger 2500)."""
+    from dew.batch import FROZEN
+
+    tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
+    checkpoint = export_tiny_decoder(tmp_path / "checkpoint")
+    state = pretrained_config(tokens, checkpoint, "--trainer.steps", "1", "--max-new-tokens", "0",
+                              "--trainer.name", "bf16", "--lora.rank", "4", "--lora.modules", "q_proj",
+                              "--trainer.precision.dtypes.params", "bfloat16").run()
+    for collection, dtype in (("params", jnp.float32), (FROZEN, jnp.bfloat16)):
+        stored = {leaf.dtype for leaf in jax.tree.leaves(state.variables[collection])}
+        assert stored == {jnp.dtype(dtype)}, collection
+
+
 class Started(LMRunConfig):
     """A run that hands back the objective it would train, rather than training it."""
 

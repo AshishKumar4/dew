@@ -344,6 +344,26 @@ def test_a_run_draws_and_trains_its_fresh_parameters_in_its_numerics(tmp_path):
         assert stored == {jnp.dtype(numerics.dtypes.params)}
 
 
+@pytest.mark.mesh(devices=8)
+def test_a_decision_run_draws_its_context_blocks_beside_its_source_in_its_numerics(tmp_path):
+    """A decision run whose numerics store parameters in bf16 draws the context blocks it trains beside
+    its loaded backbone in bf16 (`Objective.fresh_modules`), its frozen backbone in that narrower dtype
+    too (review of ledger 2500)."""
+    from test_decision_recipe import QWEN
+
+    from dew.batch import FROZEN
+
+    run = dataclasses.replace(decision(tmp_path, drawn=False), pretrained=str(QWEN), context_layers=(0,),
+                              context_length=16)
+    state, _ = trained(run, tmp_path, "context", trainer={"precision": Numerics(DTYPE_PRESETS["bf16-true"])})
+    drawn = jax.tree_util.tree_leaves_with_path(state.variables["params"])
+    assert any("cross_attention" in jax.tree_util.keystr(path) for path, _ in drawn)
+    for collection in ("params", FROZEN):
+        stored = {leaf.dtype for leaf in jax.tree.leaves(state.variables[collection])
+                  if jnp.issubdtype(leaf.dtype, jnp.floating)}
+        assert stored == {jnp.dtype(jnp.bfloat16)}, collection
+
+
 def test_a_decoder_returns_its_logits_in_its_runs_output_dtype():
     """A decoder's logits leave it in the run's output dtype (`dtypes.output`, `run_precision`): bf16
     under `bf16-true`, float32 under the default's numerics and outside any run, and never narrower
