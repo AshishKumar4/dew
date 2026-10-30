@@ -354,7 +354,7 @@ class LMRunConfig(DecoderRunConfig):
                              "is a number of tokens")
         reference = SourceReference.parse(self.pretrained)
         # The checkpoint computes in the run's compute dtype and stores its parameters in its numerics'.
-        loaded = Pretrained.load(reference.name, dtype=self.compute_dtype(),
+        loaded = Pretrained.load(reference.name, dtype=jnp.dtype(self.compute_dtype()),
                                  param_dtype=self.trainer.precision.dtypes.params,
                                  attention_impl=self.source_attention(),
                                  max_seq_len=reach, revision=reference.revision,
