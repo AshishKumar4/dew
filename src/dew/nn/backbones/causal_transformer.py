@@ -117,12 +117,9 @@ from .decoder_block import (
 )
 from .decoder_fields import refuse_unbuildable, softmax_attention_layers
 from .decoder_stack import (
-    WRITTEN,
     DecoderBank,
     Loop,
-    PassView,
     PipelineStage,
-    SharedPassView,
     StackView,
     StageSplit,
     banked_collections,
@@ -133,6 +130,7 @@ from .decoder_stack import (
     split_stages,
 )
 from .layer_plan import LayerKind, LayerSpec, ResolvedKind, layer_index, run_period, scan_groups
+from .looping import run_loop
 
 _INTERMEDIATES = "intermediates"
 """The collection flax's `capture_intermediates` fills."""
@@ -1803,50 +1801,9 @@ class CausalTransformer(nn.Module):
             whole_blocks=whole_blocks and block_groups is not None)
 
     def looped(self, x, **stack):
-        """Run the layer stack over `x` once, or as `loop` says: the layers before
-        its block once, the block `steps` times, each pass after the first
-        reading the last one's output, normed under `step_norm`, and the layers
-        after it once; the passes before the last `backprop_steps` pass no
-        gradient back. `remat` checkpoints each block pass outside decode,
-        leaving its span and the train/decode choices static in the closure;
-        the per-pass collection view stays outside that checkpoint."""
-        loop = self.loop
-        if loop is None:
-            return self.stack(x, **stack)
-        first, end = loop.layers or (0, self.num_layers)
-        block = None if loop.layers is None else (first, end)
-        train, decode = stack['train'], stack['decode']
-        dynamic = {name: value for name, value in stack.items() if name not in ('train', 'decode')}
-
-        def pass_block(module, x, **inputs):
-            return module.stack(x, span=block, train=train, decode=decode, **inputs)
-
-        run_block = nn.remat(pass_block) if loop.remat and not decode else pass_block
-        if first:
-            x = self.stack(x, span=(0, first), **stack)
-        injected = x
-        shared = SharedPassView() if loop.shared_cache else None
-        first_pass = run_block if shared is None else nn.map_variables(
-            run_block, mapped_collections=WRITTEN, trans_in_fn=shared.first, trans_out_fn=shared.outside,
-            mutable=True)
-        x = first_pass(self, self.norm(x + injected) if loop.reinject else x, **dynamic)
-        for step in range(1, loop.steps):
-            normed = self.norm(x)
-            self._gate_exit(normed)
-            x = normed if loop.step_norm else x
-            if loop.backprop_steps is not None and step == loop.steps - loop.backprop_steps:
-                x = jax.lax.stop_gradient(x)
-            if loop.reinject:
-                x = self.norm(x + injected)
-            view = shared or PassView(self.num_layers + (step - 1) * (end - first), first, end - first)
-            run = nn.map_variables(run_block, mapped_collections=WRITTEN, trans_in_fn=view.inside,
-                                   trans_out_fn=view.outside, mutable=True)
-            x = run(self, x, **dynamic)
-        if loop.reinject:
-            x = self.norm(x)
-        if end < self.num_layers:
-            x = self.stack(x, span=(end, self.num_layers), **stack)
-        return x
+        """Run the layer stack over `x` once, or as `loop` says (`looping.run_loop`): its block's later
+        passes under one scan, so a step's program holds two passes whatever the loop's count."""
+        return run_loop(self, x, **stack)
 
     def _gate_exit(self, normed):
         """Sow the exit gate's logit for a pass's normed states into `exits`."""

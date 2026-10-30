@@ -156,19 +156,23 @@ def test_bf16_keys_rotate_and_normalize_where_vllm_rounds():
     assert_rounds_where_the_reference_does(keys, REFERENCE['keys_bf16'], REFERENCE['keys_f64'], 'bf16 keys')
 
 
+@pytest.mark.parametrize('loops', [None, 4])
 @pytest.mark.parametrize('mode', ['per_loop', 'last_loop'])
-def test_a_cached_greedy_continuation_reads_each_cache_as_vllm_keeps_it(mode):
+def test_a_cached_greedy_continuation_reads_each_cache_as_vllm_keeps_it(mode, loops):
     """Greedy decoding over the cache vLLM keeps: one entry a recurrent layer and pass
     ('per_loop'), or one a recurrent layer that each pass overwrites ('last_loop', a pass reading
-    its own keys for the step's tokens and the last pass's for the earlier ones). The tokens are
-    the reference's and each step's logits within the rule of its fp32 decode against float64.
+    its own keys for the step's tokens and the last pass's for the earlier ones), at the tiny's own
+    two loops and at four, whose later passes a step runs under one scan (`looping.run_loop`). The
+    tokens are the reference's and each step's logits within the rule of its fp32 decode against
+    float64.
     A per-pass cache is exact, the full forward's: the uncached logits of the whole continuation
     hold to the same rule at the positions each step decoded, and the cached steps to the rule of
     those uncached logits. A last-loop cache is the model's own approximation, held to the
     reference's decoding under it."""
     loaded = load()
-    model = with_cache(loaded.model, mode)
-    expected = REFERENCE[f'generated_{mode}']
+    model = with_cache(loaded.model if loops is None else loaded.model.with_passes(loops), mode)
+    tag = mode if loops is None else f'{mode}_{loops}'
+    expected = REFERENCE[f'generated_{tag}']
     prompt = jnp.asarray(expected[None, :6])
     variables = loaded.variables
     cache = model.apply(variables, 1, method=CausalTransformer.init_cache, mutable=['cache'])[1]['cache']
@@ -180,12 +184,35 @@ def test_a_cached_greedy_continuation_reads_each_cache_as_vllm_keeps_it(mode):
         steps.append(np.asarray(logits[0, -1]))
     steps = np.stack(steps)
     np.testing.assert_array_equal(steps.argmax(-1), expected[6:])
-    reference, truth = REFERENCE[f'step_logits_{mode}'], REFERENCE[f'step_logits_{mode}_f64']
-    assert_as_exact_as_the_reference(steps, reference, truth, f"Dory's {mode} decoding")
+    reference, truth = REFERENCE[f'step_logits_{tag}'], REFERENCE[f'step_logits_{tag}_f64']
+    assert_as_exact_as_the_reference(steps, reference, truth, f"Dory's {tag} decoding")
     if mode == 'per_loop':
         whole = np.asarray(model.apply(variables, jnp.asarray(expected[None, :-1])))[0, 5:]
         assert_as_exact_as_the_reference(whole, reference, truth, "Dory's forward over its continuation")
         assert_as_exact_as_the_reference(steps, whole, truth, "Dory's per-pass cache against its forward")
+
+
+@pytest.mark.parametrize('mode', ['per_loop', 'last_loop'])
+def test_a_cached_step_runs_its_later_passes_as_one_body(mode):
+    """A decode step runs its block's later passes as one scan over them (`looping.run_loop`, ledger
+    642): at four loops and at eight, one scan of three and seven passes with the same body; under the
+    last-loop cache, whose last pass keeps its writes, of two and six, the last after it. So a step's
+    program holds the first pass, one later pass and, under that cache, the last, whatever the count."""
+    loaded = load()
+    ids = jnp.asarray(REFERENCE['input_ids'][:, :1])
+
+    def program(loops):
+        model = with_cache(loaded.model.with_passes(loops), mode)
+        cache = model.init(jax.random.key(0), ids, decode=True)['cache']
+        graph = jax.make_jaxpr(lambda variables, cache: model.apply(
+            {**variables, 'cache': cache}, ids, decode=True, mutable=['cache']))(loaded.variables, cache)
+        (scan,) = (equation for equation in graph.jaxpr.eqns if equation.primitive.name == 'scan')
+        body = sorted(str(equation.primitive) for equation in scan.params['jaxpr'].eqns)
+        return scan.params['length'], body
+
+    (four, body), (eight, deep) = program(4), program(8)
+    kept = mode == 'last_loop'
+    assert (four, eight) == (3 - kept, 7 - kept) and body == deep
 
 
 @pytest.mark.parametrize('attention_impl', ['xla', 'reference'])
