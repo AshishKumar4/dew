@@ -99,9 +99,17 @@ def serving(port: int) -> bool:
 
 
 def process(connection: Path) -> int:
-    """The process of the kernel whose connection file is `connection`."""
+    """The process of the kernel whose connection file is `connection`: of the processes running now, the one
+    whose command names it, a process that ends between the listing and its reading passed over (ledger 2691)."""
+
+    def command(path: Path) -> bytes:
+        try:
+            return path.read_bytes()
+        except (FileNotFoundError, ProcessLookupError):
+            return b""
+
     found, = [int(path.parent.name) for path in Path("/proc").glob("[0-9]*/cmdline")
-              if str(connection).encode() in path.read_bytes()]
+              if str(connection).encode() in command(path)]
     return found
 
 
