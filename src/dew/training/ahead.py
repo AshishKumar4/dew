@@ -427,6 +427,9 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
     with assumed(generation), uncached() if on_tpus else contextlib.nullcontext():
         target = gpu_target()
         planned = trainer._compiled_plan(start.abstract, step_batch(trainer, batch), None, capacity)
+        # The sampled step's program, lowered for the target its executable was compiled for.
+        sampled = None if planned.sampled is None or planned.candidate.sampled is None else AheadProgram.of(
+            planned.candidate.sampled(), planned.sampled)
     seconds = time.perf_counter() - began
     lowered, compiled = planned.candidate.lowered, planned.executable
     executable, in_tree, out_tree = serialize_executable.serialize(compiled)
@@ -441,5 +444,4 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
         alias_bytes=memory.alias_size_in_bytes, temp_bytes=memory.temp_size_in_bytes,
         code_bytes=memory.generated_code_size_in_bytes, plan=trainer.plan, planned_seconds=seconds,
         capacity=capacity, links=dict(trainer.links), target=target, refusals=report.refused_launches(),
-        sampled=None if planned.sampled is None or planned.candidate.sampled is None else AheadProgram.of(
-            planned.candidate.sampled(), planned.sampled))
+        sampled=sampled)
