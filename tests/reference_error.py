@@ -68,6 +68,7 @@ import functools
 import hashlib
 import itertools
 import math
+import weakref
 from collections.abc import Callable, Mapping, Sequence
 
 import jax
@@ -1188,6 +1189,29 @@ def _same_bits(one, other) -> str | None:
     return None
 
 
+_PAIRED: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+"""Each draw checked as a function of its seed, with the arms checked as functions of its inputs
+(`_first_asking`): a sizing asks a site's draw over several blocks, and each draw and each arm on it is
+checked once."""
+
+
+def _first_asking(draw, fn=None) -> bool:
+    """Whether `draw` (with `fn`, one of its arms, where given) has not yet been checked to be a function of
+    its seed (of its inputs); True where no weak reference holds them (checked every time)."""
+    try:
+        asked = _PAIRED.setdefault(draw, weakref.WeakSet())
+        if fn is None:
+            first = draw not in asked
+            asked.add(draw)
+            return first
+        if fn in asked:
+            return False
+        asked.add(fn)
+    except TypeError:
+        pass
+    return True
+
+
 def _of_its_seed(label: str, draw, seed, inputs) -> None:
     """Raise unless `draw` gives `inputs` again at `seed`: a draw of a randomness its seed does not fix (a
     global generator) gives each run of a site other inputs (ledger 2641)."""
@@ -1245,11 +1269,14 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
         with jax.enable_x64(new_val=True):
             return float64_terms(terms_fn, *widened(inputs))
 
+    checking = {arm: _first_asking(draw, arm) for arm in dict.fromkeys((dew_fn, reference_fn))}
+    checking[draw] = _first_asking(draw)
+
     def rows_at(at, seed):
         """Every arm's evidence on the draw at `seed`, the `at`th, its orders' worst rows the larger."""
         nonlocal names, widths
         inputs = draw(seed)
-        if not at:
+        if checking[draw] and not at:
             _of_its_seed(label, draw, seed, inputs)
         # The site's arms' mode, decided on its first draw's inputs before any arm runs, no draw of its own.
         _ynn_decided(label, [dew_fn, *arms], inputs)
@@ -1268,7 +1295,7 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
         rows = [None for _ in arms]
         for mine_at, theirs_at in ordered:
             dew = dew_fn(*mine_at)
-            if not at and mine_at is ordered[0][0]:
+            if checking[dew_fn] and not at and mine_at is ordered[0][0]:
                 _of_its_inputs(label, "Dew's arm", dew_fn, mine_at, dew)
             names = names or [jax.tree_util.keystr(path)
                               for path, _ in jax.tree_util.tree_leaves_with_path(dew)]
@@ -1282,7 +1309,8 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
                 here, true_here, terms_here = ((theirs_at, their_truth, their_terms) if arm is reference_fn
                                                else (mine_at, truth, terms))
                 other = dew if dew_fn is arm and here is mine_at else arm(*here)
-                if not at and arm is reference_fn and arm is not dew_fn and here is ordered[0][1]:
+                if (checking[reference_fn] and not at and arm is reference_fn and arm is not dew_fn
+                        and here is ordered[0][1]):
                     _of_its_inputs(label, "the reference", arm, here, other)
                 evidence = _evidence(prepared, other, true_here, shared=true_here is truth,
                                      their_terms=terms_here)

@@ -61,7 +61,8 @@ def test_a_sizing_evaluates_each_draw_once_however_many_doublings_it_takes(heavy
     """A sizing that doubles past its first count runs each arm and the truth once on each draw it
     takes, paired (its draws at a count are its predecessor's and the seeds it adds, twice the count with
     the confirming block) and the reference against itself (each block's first half against its second,
-    the reference once on each)."""
+    the reference once on each), and each arm once more on its first draw, the gate's check that it is a
+    function of its inputs (`reference_error._of_its_inputs`), once however many blocks."""
     import collections
 
     calls = collections.Counter()
@@ -77,14 +78,14 @@ def test_a_sizing_evaluates_each_draw_once_however_many_doublings_it_takes(heavy
     truth = counted("truth", _truth)
     seeds = seeds_for(reference, heavy, "heavy sums", truth_fn=truth, dew_fn=twin)
     assert seeds > 8
-    assert calls == {"reference": 2 * seeds, "twin": 2 * seeds, "truth": 2 * seeds}
+    assert calls == {"reference": 2 * seeds + 1, "twin": 2 * seeds + 1, "truth": 2 * seeds}
     calls.clear()
 
     def light(seed):
         return (np.random.default_rng(seed).standard_normal((32, 128)).astype(np.float32),)
 
     seeds = seeds_for(reference, light, "light sums", truth_fn=truth)
-    assert calls == {"reference": 4 * seeds, "truth": 4 * seeds}
+    assert calls == {"reference": 4 * seeds + 1, "truth": 4 * seeds}
 
 
 def test_a_recorded_reference_is_refused_a_paired_sizing(heavy):

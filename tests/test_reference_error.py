@@ -1643,10 +1643,10 @@ def test_null_runs_judge_the_reference_against_itself_on_draws_no_other_run_take
         assert_as_exact(residue, exact, one_truth, "orbit", seeds=8, truth_fn=truth)
     [(verdict, _, _)] = null_runs(exact, one_truth, "orbit", seeds=8, runs=1, truth_fn=truth, dew_fn=residue)
     assert verdict == "over"
-    # Each run draws its first seed again, the check that its seed fixes it (`_of_its_seed`); its draws are
-    # otherwise its own.
+    # The draw is drawn again once, on its first run's first seed, the check that its seed fixes it
+    # (`_of_its_seed`, once a draw however many runs ask it); its draws are otherwise each run's own.
     drawn = [seed for at, seed in enumerate(taken) if not at or taken[at - 1] != seed]
-    assert len(drawn) == len(set(drawn)) and len(taken) - len(drawn) == 3
+    assert len(drawn) == len(set(drawn)) and len(taken) - len(drawn) == 1
     assert null_rate_bound(0, 1400) == pytest.approx(1 - 0.001 ** (1 / 1400), rel=1e-9)
     assert null_rate_bound(0, 200) > 0.03
     assert null_rate_bound(3, 3) == 1.0
