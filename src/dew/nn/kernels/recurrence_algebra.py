@@ -34,7 +34,7 @@ the portable math's issuer is XLA's (`portable`), a kernel's its own dot."""
 
 import functools
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import NamedTuple, Protocol
 
 import jax
@@ -769,8 +769,8 @@ def factored_range(floor: float, sub: int = SUB) -> bool:
 
 def key_decayed_pairs(rows: Callable[[int], jax.Array], keys: Callable[[int], jax.Array], columns: int,
                       gates: Callable[[int], tuple],
-                      reference: Callable[[int, int], tuple], issue: Issue, *, chunk: int, strict: bool,
-                      sub: int = SUB):
+                      reference: Callable[[int, int], tuple], summed: Callable[[Iterable], jax.Array], *,
+                      chunk: int, strict: bool, sub: int = SUB):
     """A chunk's pairs' products under a decay a key dimension `[C, C]` fp32, `sum_k r_ik k_jk exp2(g_ik -
     g_jk)` for `j <= i` (`j < i` where `strict`), zero elsewhere: the rows `rows(c)` (the queries, or the
     write-gated keys) and keys `keys(c)` of each key block `c` of `columns`, fp32, `gates(c)` its prefix
@@ -779,18 +779,28 @@ def key_decayed_pairs(rows: Callable[[int], jax.Array], keys: Callable[[int], ja
     `r exp2(g - g_ref)`, against every key up to its end gated up from it, `k exp2(g_ref - g)`, one product a
     sub-chunk and key block ('pairs'): fla_kda's sub-chunk factoring, its diagonal sub-chunks' too, which a
     declared floor bounds (`factored_range`). Each factor is of the separated prefix (`between`), its exponent
-    within a sub-chunk's range of zero down the rows (and up the keys); past it every pair's value is zero."""
+    within a sub-chunk's range of zero down the rows (and up the keys); past it every pair's value is zero.
+    The products accumulate in one sum as fla_kda's into its `b_A` (`summed`, an iterable of `(name, lhs,
+    rhs)` taken a product at a time): each its own sum, added after, they were live together (Kimi delta
+    attention's intra launch, 1170 registers a thread on an A100, 519 on an H100)."""
+    def products(s, c, prefix):
+        place = s * sub
+        start_whole, start_fraction = separated(*reference(s, c))
+        start = start_whole[None, :], start_fraction[None, :]
+        index, _ = _grid(prefix[0].shape)
+        # Each operand formed as its product stages it (`summed` calls it), so one is live at a time.
+        yield ("pairs",
+               lambda: jnp.where((index >= place) & (index < place + sub), rows(c) * between(prefix, start),
+                                 0.0),
+               lambda: Transposed(jnp.where(index < place + sub, keys(c) * between(start, prefix), 0.0)))
+
     total = jnp.zeros((chunk, chunk), jnp.float32)
-    for place in range(0, chunk, sub):
-        for c in range(columns):
-            # Each tile read where it is used, a sub-chunk and key block at a time: few live at once.
-            prefix = separated(*gates(c))
-            start_whole, start_fraction = separated(*reference(place // sub, c))
-            start = start_whole[None, :], start_fraction[None, :]
-            index, _ = _grid(prefix[0].shape)
-            down = jnp.where((index >= place) & (index < place + sub), rows(c) * between(prefix, start), 0.0)
-            up = jnp.where(index < place + sub, keys(c) * between(start, prefix), 0.0)
-            total = total + issue("pairs", down, Transposed(up))
+    for c in range(columns):
+        # A key block's prefix read once, before its sub-chunks' turns, which are rolled: each one's addresses
+        # live within its own turn.
+        prefix = separated(*gates(c))
+        total = jax.lax.fori_loop(0, chunk // sub, lambda s, total, c=c, prefix=prefix: total + summed(
+            products(s, c, prefix), shape=(chunk, chunk)), total)
     lag = _lags(total.shape)
     return jnp.where(lag > 0 if strict else lag >= 0, total, 0.0)
 
