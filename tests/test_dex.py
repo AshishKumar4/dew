@@ -29,7 +29,7 @@ from dew.nn.progress import Progress, stepping
 LLAMA = Path(__file__).parent / "fixtures" / "hf" / "llama-tiny"
 HEADS = (1, 3)
 SEEDS = {"dex differential": 256, "dex through the decoder": 8, "dex at the anneal's start": 8,
-         "dex gradients through the decoder": 256, "dex scanned": 8}
+         "dex gradients through the decoder": 256, "dex scanned": 8, "dex exported": 8}
 """Check 1's declared seeds for each site, sized paired by `seeds_for` on armada (IGDEXS, IGDEXS4)."""
 
 
@@ -176,12 +176,40 @@ def test_a_loaded_source_takes_dex_by_the_papers_recipe():
     held = flatten_dict(loaded.variables[DEX_COLLECTION])
     np.testing.assert_array_equal(held[("layers_0", "self_attn", "dex_heads")], HEADS)
     assert float(held[("layers_0", "self_attn", "dex_lambda_init")]) == np.float32(diff_lambda_init(1))
-    # The source's format holds no extension: its export refuses it, where a run's checkpoint, which keeps
-    # it, reads back as a bundle of the decoder it extends.
-    with pytest.raises(ValueError):
-        loaded.export()
+    # A run's checkpoint keeps the extension, and reads back as a bundle of the decoder it extends.
     rebuilt = PretrainedDecoder.from_model(loaded.model, loaded.variables)
     assert rebuilt.model.dex == loaded.model.dex
+
+
+def exported_site(directory: Path):
+    """Check 1's arms for an export of the extended decoder: the source loaded back from what `save`
+    writes of a draw's variables, the source's forward over the folded output projection (`folded`),
+    a draw of moved variables, and the folded route's float64 as truth."""
+    source, loaded = loads()
+
+    @as_given
+    def reloaded(variables, ids, _):
+        loaded.save(directory, variables=variables)
+        back = Pretrained.load(directory, dtype="float32", attention_impl="reference")
+        return np.asarray(back.model.apply(back.variables, ids))
+
+    wide = source.model.clone(dtype=jnp.float64)
+    return (reloaded, jax.jit(lambda variables, ids, _: source.model.apply(folded(variables), ids)),
+            moved_draw(loaded.variables, loaded.model.features_per_head),
+            jax.jit(lambda variables, ids, _: wide.apply(folded(traced_wide(variables)), ids)))
+
+
+def test_an_export_writes_dex_folded_into_its_output_projections(tmp_path):
+    """The source's format holds no extension, so an export writes each layer's differential at its
+    learned lambda folded into its output projection (ledger 2478): the source loaded back from it
+    computes what the extended decoder does outside a run, on par with the folded route through the
+    source's forward from its float64 (check 1). A layer whose output gate scales its heads' outputs
+    before the projection does not fold, and its export refuses."""
+    reloaded, through, draw, truth = exported_site(tmp_path)
+    assert_as_exact(reloaded, through, draw, "dex exported", seeds=SEEDS["dex exported"], truth_fn=truth)
+    assert every_layer(output_gate=True).dex_export_refusal() == (
+        "layer 0: its output gate scales its heads' outputs channel by channel")
+    assert every_layer().dex_export_refusal() is None
 
 
 def test_a_run_starts_from_its_source_and_its_learned_lambda_once_annealed():

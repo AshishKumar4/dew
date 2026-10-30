@@ -470,6 +470,18 @@ class CausalSelfAttention(nn.Module):
         """Its heads' count and each one's output width, which DEX extends (`dew.nn.dex.HeadOutputs`)."""
         return self.ctx.num_heads, self.value_dim
 
+    @nn.nowrap
+    def dex_fold_refusal(self) -> str | None:
+        """What its heads' outputs pass through before `o_proj`, past DEX's differential, which keeps
+        the differential out of the projection (`dew.nn.dex.folded`); None where nothing does."""
+        if self.exclusive_self_attention:
+            return "exclusive self attention takes each token's own value out of its heads' outputs"
+        if self.ctx.output_gate:
+            return "its output gate scales its heads' outputs channel by channel"
+        if self.ctx.ngpt is not None:
+            return "nGPT unit-norms its heads' outputs together"
+        return None
+
     def _dex_variables(self, dex: LayerDex, start: DexStart | None) -> None:
         """DEX's per-head projections of the chosen heads' outputs and its learned lambda, zero at the
         start as the paper's lambda_learn, and the heads and lambda_init the layer holds as constants

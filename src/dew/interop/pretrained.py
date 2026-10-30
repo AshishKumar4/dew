@@ -558,7 +558,9 @@ class Pretrained:
         (`DifferentialExtension.trains`: the paper's, the attention's key, value and output projections
         beside it and the rest under `FROZEN`, or all of it), a source's frozen weights staying frozen. A
         source loaded without its weights takes the extension's shapes. The source's own format holds no
-        extension, so `save` and `export` refuse the result; a run's checkpoint keeps it."""
+        extension: `save` and `export` write each layer's differential at its learned lambda folded into
+        its output projection (`dew.nn.dex.folded`), what the model computes outside a run, and refuse a
+        layer whose heads' outputs pass through more before it; a run's checkpoint keeps the extension."""
         from dew.batch import FROZEN, freeze, merge, select, thaw
         from dew.nn.dex import DEX_COLLECTION, DEX_CONSTANTS, DEX_PARAMETERS
         from dew.nn.inputs import request_key
@@ -602,20 +604,28 @@ class Pretrained:
         merged into their kernels, as PEFT's `merge_and_unload` does, from its
         variables or a trainer's split of them; `adapter.save` writes the factors
         alone. A loaded task's tree, its projections packed for serving, is written
-        as the source's own members (`dew.inference.projections.unpacked`).
+        as the source's own members (`dew.inference.projections.unpacked`). A model with DEX writes
+        each layer's differential folded into its output projection (`dew.nn.dex.folded`).
         """
+        from dew.batch import thaw
         from dew.inference.projections import unpacked
+        from dew.nn.dex import folded
         from dew.nn.protocols import CrossAttending, Differential
 
         if isinstance(self.model, CrossAttending) and self.model.cross_attention is not None:
             raise ValueError("the source's format holds no cross-attention layers; a run's checkpoint "
                              "keeps this model")
-        if isinstance(self.model, Differential) and self.model.dex is not None:
-            raise ValueError("the source's format holds no differential extension (DEX); a run's "
-                             "checkpoint keeps this model")
+        differential = isinstance(self.model, Differential) and self.model.dex is not None
+        refusal = self.model.dex_export_refusal() if isinstance(self.model, Differential) else None
+        if refusal is not None:
+            raise ValueError(f"the source's format holds no differential extension (DEX), and this one "
+                             f"does not fold into its output projections ({refusal}); a run's checkpoint "
+                             f"keeps this model")
         values = unpacked(self.model, self.variables if variables is None else variables)
         if self.adapter is not None:
             values = self.adapter.merge(values)
+        if differential:
+            values = folded(thaw(values))
         quantization = self._quantization()
         # Their values, each read as it is written: a load without its weights holds none (`PayloadUnread`).
         retained = LazyTensors(tensor_specs(self.retained_tensors),

@@ -14,7 +14,9 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   (`dew.nn.dex.DifferentialExtension`). Attach it with `Pretrained.load(..., dex=...)` or
   `with_dex`, or from a run with `--source.dex '{"layers": [[layer, [heads...]], ...]}'`. By default
   it follows the paper's recipe: the attention's key, value and output projections train beside the
-  extension, and the rest is frozen.
+  extension, and the rest is frozen. Layers that choose as many heads scan as one run and split over
+  pipeline stages, each holding its heads and `lambda_init` as constants of its own; `save` and
+  `export` write each layer's differential at its learned lambda folded into its output projection.
 - A decoder's cross-attention is any configuration that builds a block per layer (`CrossBlocks`), which
   `with_cross_attention` takes. `SharedCrossAttention` is a new one: each named layer reads the
   conditioning sequence through its own attention's projections and norms, and the read joins the

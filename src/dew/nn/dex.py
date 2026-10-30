@@ -26,14 +26,18 @@ the attention's key, value and output projections with the extension and freezes
 
 import dataclasses
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Literal, Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
+import numpy as np
+from flax.traverse_util import unflatten_dict
+
+from dew.batch import leaves_by_path
 
 __all__ = ["DEX_COLLECTION", "DEX_CONSTANTS", "DEX_PARAMETERS", "DexStart", "DifferentialExtension",
-           "HeadOutputs", "LayerDex", "annealed", "diff_lambda_init", "differential"]
+           "HeadOutputs", "LayerDex", "annealed", "diff_lambda_init", "differential", "folded"]
 
 TRAINED_PROJECTIONS = ("k_proj", "v_proj", "o_proj")
 """The attention projections the paper's recipe trains beside the extension, the feed-forward and the
@@ -58,6 +62,11 @@ class HeadOutputs(Protocol):
 
     def head_outputs(self) -> tuple[int, int]:
         """Its heads' count and the width of each one's output."""
+        ...
+
+    def dex_fold_refusal(self) -> str | None:
+        """Why DEX on its heads does not fold into its output projection (`folded`): what its heads'
+        outputs pass through between the two; None where nothing does."""
         ...
 
 
@@ -157,3 +166,29 @@ def differential(attention: jax.Array, heads: jax.Array | tuple[int, ...], proje
     taken = attention[:, :, chosen]
     moved = jnp.einsum("bshd,hde->bshe", taken, projection.astype(attention.dtype), precision=precision)
     return attention.at[:, :, chosen].add(-(strength.astype(attention.dtype) * moved))
+
+
+def folded(variables: Mapping[str, Mapping]) -> dict[str, Mapping]:
+    """`variables` with each DEX layer's differential at its learned lambda folded into its output
+    projection, the extension's parameters and constants dropped: a layer's `o_proj` kernel
+    `[H Dv, D]` has each chosen head `h`'s rows `K_h` made `(I - lambda_learn W_h) K_h`, in float64
+    and rounded once to the kernel's dtype, so the source's own layer computes what the extended one
+    does outside a run (`annealed`), `O'_h K_h = O_h (I - lambda W_h) K_h`. A layer whose heads'
+    outputs pass through more before `o_proj` does not fold (`HeadOutputs.dex_fold_refusal`)."""
+    params: dict[tuple[str, ...], jax.Array | np.ndarray] = dict(leaves_by_path(variables["params"]))
+    held = leaves_by_path(variables.get(DEX_COLLECTION, {}))
+    for prefix in [key[:-1] for key in params if key[-1] == "dex_projection"]:
+        projection = np.asarray(params.pop((*prefix, "dex_projection")), np.float64)
+        strength = np.asarray(params.pop((*prefix, "dex_lambda")), np.float64)
+        heads = np.asarray(held.pop((*prefix, "dex_heads")))
+        del held[(*prefix, "dex_lambda_init")]
+        kernel = params[(*prefix, "o_proj", "kernel")]
+        wide = np.array(kernel, np.float64)
+        width = projection.shape[-1]
+        for slot, head in enumerate(heads):
+            rows = slice(int(head) * width, (int(head) + 1) * width)
+            wide[rows] -= strength * projection[slot] @ wide[rows]
+        params[(*prefix, "o_proj", "kernel")] = wide.astype(np.asarray(kernel).dtype)
+    rest = {name: tree for name, tree in variables.items() if name not in ("params", DEX_COLLECTION)}
+    kept = {DEX_COLLECTION: unflatten_dict(held)} if held else {}
+    return {**rest, "params": unflatten_dict(params), **kept}
