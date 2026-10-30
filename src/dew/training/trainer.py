@@ -1017,7 +1017,8 @@ class Trainer(Generic[Loss, Effects]):
 
         def run(current, batch, sampled: bool = False):
             # A sampled step summarizes what the run inspects (`Planned.sampled`); every other, the plan's.
-            executable = planned.sampled if sampled and planned.sampled is not None else planned.executable
+            executable = planned.sampled.executable if sampled and planned.sampled is not None else (
+                planned.executable)
             with self._traced_on(mesh):
                 # Each shape plans its copies (`_at_base_rung`), and a step reads the state with its own.
                 if not candidate.copies:
@@ -1131,9 +1132,10 @@ class Trainer(Generic[Loss, Effects]):
         held = 0 if mesh is not None else prefetched_bytes(batch, placement, self._prefetch) + built
         jitted = self._jitted(shapes, copies, shardings, placement, replicated, split)
         part = jax.ShapeDtypeStruct((), jnp.int32, sharding=replicated)
+        given = placed_shapes(batch, placement) if mesh is not None else batch
         lower = Routed(functools.partial(
             lambda *arguments: jitted.trace(*arguments).lower(lowering_platforms=platforms),
-            *apart(prepared), placed_shapes(batch, placement) if mesh is not None else batch, part))
+            *apart(prepared), given, part))
         if self.tune_kernels and lowering and platforms is None:
             lowered, launches = tuning.tune(lower, measure=True)
         else:
@@ -1141,11 +1143,12 @@ class Trainer(Generic[Loss, Effects]):
             lowered, launches = lower() if lowering else None, launches or "[]"
         footprint = None if self.step is not None or mesh is not None else candidate_footprint(
             self.objective, self._model_shapes(micro), split * self.accumulation, prepared, held)
-        # The batch's shapes and placements alone, which the lowering reads: the thunk holds no batch.
-        sampled = None if self.inspection is None else functools.partial(
-            self._jitted(shapes, copies, shardings, placement, replicated, split, sampled=True).lower,
-            *apart(prepared), jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(
-                leaf.shape, leaf.dtype, sharding=getattr(leaf, "sharding", None)), batch), part)
+        # The sampled step lowers as the step does, over the same arguments, for the same platforms.
+        watched = None if self.inspection is None else self._jitted(shapes, copies, shardings, placement,
+                                                                    replicated, split, sampled=True)
+        sampled = None if watched is None else functools.partial(
+            lambda *arguments: watched.trace(*arguments).lower(lowering_platforms=platforms),
+            *apart(prepared), given, part)
         return Candidate(micro, shapes, copies, shardings, prepared, held, built, lowered, launches,
                          lower.report() if lowering else KernelReport((), ()), footprint, sampled)
 

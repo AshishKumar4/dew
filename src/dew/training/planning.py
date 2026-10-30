@@ -18,7 +18,7 @@ import tempfile
 import time
 from collections.abc import Callable, Hashable, Mapping, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -39,7 +39,7 @@ from dew.nn.protocols import RematChoosing
 from dew.objectives.base import RECORD, Objective
 from dew.state import TrainState, apart, together
 from dew.telemetry.profile import active_profile, capture_options
-from dew.training.ahead import handed
+from dew.training.ahead import handed, program_of
 from dew.training.distributed import batch_divisor
 from dew.training.footprint import Footprint
 from dew.training.memory import (
@@ -161,6 +161,14 @@ class Relowered:
         """The candidate the executable compiled from: `compiled`, the one first lowered, where the
         compile lowered none afresh."""
         return compiled if self.last is None else self.last
+
+
+class SampledStep(NamedTuple):
+    """A step that also summarizes what the run inspects (`Candidate.sampled`): the program it compiled
+    from (`dew.training.ahead.program_of`) and its executable."""
+
+    program: str
+    executable: jax.stages.Compiled
 
 
 @jax.jit
@@ -318,7 +326,7 @@ class Planned:
     tile: tuple[int, int] | None
     fused: bool
     profiled: tuple[int, int] | None = None
-    sampled: jax.stages.Compiled | None = None
+    sampled: SampledStep | None = None
     """The step that also summarizes what the run inspects (`Candidate.sampled`), compiled under the
     plan's options and admitted with it (`FitSearch.measured`); None in a run that inspects nothing."""
 
@@ -545,9 +553,9 @@ class FitSearch[LossT, EffectsT]:
     chosen: jax.stages.CompilerOptions | None = None
     fitted: tuple[Candidate, jax.stages.Compiled, jax.stages.CompilerOptions | None] | None = None
     """The plan the search last found to fit: its candidate, executable and the options it compiled under."""
-    sampled: jax.stages.Compiled | None = None
+    sampled: SampledStep | None = None
     """The last measured candidate's sampled step (`measured`)."""
-    fitted_sampled: jax.stages.Compiled | None = None
+    fitted_sampled: SampledStep | None = None
     """The fitted plan's sampled step, which summarizes what the run inspects (`Candidate.sampled`)."""
     ahead: AheadOfTime | None = None
     """A step compiled ahead (`dew.training.ahead`), run in place of the search's first compile where it
@@ -715,27 +723,38 @@ class FitSearch[LossT, EffectsT]:
         (`ahead`); the candidate its executable compiled from, lowered afresh where a kernel spilled
         (`compiled_if_it_fits`, `Relowered`); and the measure of its fit (`Probe`), the search's state
         else untouched. A run that inspects compiles the candidate's sampled step too
-        (`Candidate.sampled`), which must fit as the step must, so a rung fits only where both do; it is
-        `sampled` until the next measure."""
+        (`Candidate.sampled`), or takes the one compiled ahead with the step (`AheadOfTime.sampled`), which
+        must fit as the step must, so a rung fits only where both do; it is `sampled` until the next
+        measure."""
         options = self.required if self.xla_defaults else self.options(candidate)
-        taken = self.ahead is not None
+        taken, ahead = self.ahead is not None, self.ahead
         began = time.perf_counter()
-        if self.ahead is not None:
-            executable, self.ahead = self.ahead.taken(candidate.lowered), None
+        if ahead is not None:
+            executable, self.ahead = ahead.taken(candidate.lowered), None
         else:
             relowered = Relowered(lambda: self.lower(split, self.narrow))
             executable = compiled_if_it_fits(candidate.lowered, options, self.refusals, relower=relowered)
             candidate = relowered.candidate(candidate)
         fit, headroom = step_fits(executable, self.mesh, candidate.held, self.capacity, candidate.built)
         self.sampled = None
-        if fit and candidate.sampled is not None:
+        if fit and candidate.sampled is not None and ahead is not None and ahead.sampled is not None:
+            # The sampled step compiled ahead with the step, lowered as its compile lowered it (`handed`),
+            # which its target compiles none of.
+            with handed(ahead):
+                sampled = candidate.sampled()
+            self.sampled = SampledStep(ahead.sampled.program, ahead.sampled.taken(sampled, jax.devices()))
+        elif fit and candidate.sampled is not None:
+            lowered = [candidate.sampled()]
+
             def resampled() -> jax.stages.Lowered:
                 """The sampled step lowered afresh, its launches derived past a spilled one's config."""
                 again = self.lower(split, self.narrow).sampled
                 assert again is not None
-                return again()
-            self.sampled = compiled_if_it_fits(candidate.sampled(), options, self.refusals, relower=resampled)
-            fit, headroom = step_fits(self.sampled, self.mesh, candidate.held, self.capacity, candidate.built)
+                lowered.append(again())
+                return lowered[-1]
+            compiled = compiled_if_it_fits(lowered[0], options, self.refusals, relower=resampled)
+            self.sampled = None if compiled is None else SampledStep(program_of(lowered[-1]), compiled)
+            fit, headroom = step_fits(compiled, self.mesh, candidate.held, self.capacity, candidate.built)
         seconds = time.perf_counter() - began
         probe = Probe.read(split, candidate, self.current(), fit, headroom, executable)
         probe = dataclasses.replace(probe, ahead=taken, compile_seconds=seconds)
