@@ -78,7 +78,13 @@ the tail. With `varied`, DAPO's dynamic sampling (arXiv:2503.14476 equation
 left out, since it gives each of them a zero advantage, and admission goes
 on through the batch's other groups, drawn under the same weights, until
 `admit` groups are admitted or the batch has none left: a batch of more
-tasks than `admit` is DAPO's generation batch over its training batch.
+tasks than `admit` is DAPO's generation batch over its training batch. With
+`generation_batches` above one, a call still short of its groups draws the
+data stream's next batch, as many as that in all, and admits from its groups
+too, until the step's batch is full (DAPO's Algorithm 1, verl's
+`max_num_gen_batches`): every process draws while any share's first reader
+is short, so the streams read alike, and the step's checkpoint saves the
+stream's position after the last batch drawn.
 
 Rollouts that are running when new weights are pushed keep running. Their
 later calls are stamped with the new version, and a rollout's staleness is
@@ -139,7 +145,7 @@ from typing import ClassVar, Protocol
 import jax
 import numpy as np
 
-from dew._coordination import agreed, from_every_process
+from dew._coordination import agreed, agreed_count, from_every_process
 from dew.batch import Batch, Variables
 from dew.cleanup import attempted
 from dew.data.dataset import DataPartition, Loader, tapped
@@ -272,6 +278,9 @@ class _Entry:
     tasks: tuple[Task, ...]
     groups: list[_Group] = field(default_factory=list)
     complete: list[_Group] = field(default_factory=list)
+    packs: _Entry | None = None
+    """The entry whose rows this one's groups pack into: a call's first, for a batch it drew further
+    (`RolloutScheduler.generation_batches`); None for its own."""
 
 
 @dataclass
@@ -550,7 +559,9 @@ class RolloutScheduler:
       its share packs nothing and logs nothing.
     - `varied` is DAPO's dynamic sampling (the module docstring), and
       `overlong` its soft overlong punishment, `(L_max, L_cache)`
-      (`sessions.overlong_penalty`).
+      (`sessions.overlong_penalty`). `generation_batches` is the most data
+      batches a call admits groups from, its step's and those it draws
+      further (`further`, the trainer's read of its stream).
     - `reference` is the objective whose reward-side reference penalty
       (`GRPOObjective.reward_kl`) each call's reward pays before the
       estimator compares returns: the packed rows are scored under its
@@ -573,8 +584,10 @@ class RolloutScheduler:
                  admit: int | None = None, estimator: str = "group", truncation: str = "mask",
                  credit: str = "session", support_capacity: int | None = None,
                  log: Callable[[SchedulerRecord], None] | None = None, varied: bool = False,
-                 overlong: tuple[int, int] | None = None, reference: GRPOObjective | None = None):
-        for name, value, least in (("groups", groups, 2), ("oversample", oversample, 0)):
+                 overlong: tuple[int, int] | None = None, reference: GRPOObjective | None = None,
+                 generation_batches: int = 1):
+        for name, value, least in (("groups", groups, 2), ("oversample", oversample, 0),
+                                   ("generation_batches", generation_batches, 1)):
             if type(value) is not int or value < least:
                 raise ValueError(f"{name} must be an integer of at least {least}")
         check_truncation(truncation)
@@ -594,8 +607,15 @@ class RolloutScheduler:
             raise ValueError("reference names the objective whose reward-side penalty (reward_kl) the "
                              "rewards pay, and this one's is 0")
         self.reference = reference
+        self.generation_batches = generation_batches
         self.metrics: dict[str, float] = {}
         self._branch: str | None = None
+
+    @property
+    def draws_further(self) -> bool:
+        """Whether a call may draw data batches past its step's (`generation_batches`), which the trainer
+        hands it a read of (`dew.training.rollout.Rollout`)."""
+        return self.generation_batches > 1
 
     @classmethod
     def sampled(cls, objective: TokenScorer, reward: Reward, *,
@@ -603,7 +623,8 @@ class RolloutScheduler:
                 groups: int = 4, max_new_tokens: int = 32, estimator: str = "group",
                 truncation: str = "score", sampling: Sampling | None = None,
                 log: Callable[[SchedulerRecord], None] | None = None, varied: bool = False,
-                overlong: tuple[int, int] | None = None, admit: int | None = None) -> RolloutScheduler:
+                overlong: tuple[int, int] | None = None, admit: int | None = None,
+                generation_batches: int = 1) -> RolloutScheduler:
         """Draw `groups` completions of each prompt row from `objective`'s policy at every call and
         train on them (`PolicyCollector` over `prompt_tasks`; GRPO's synchronous loop). A completion
         that runs out of `max_new_tokens` trains on its reward, as `truncation='score'` says. A reward-side
@@ -623,7 +644,7 @@ class RolloutScheduler:
         return cls(Synchronous(collector), tasks=prompt_tasks, groups=groups, estimator=estimator,
                    truncation=truncation, log=log, varied=varied, overlong=overlong, admit=admit,
                    reference=objective if isinstance(objective, GRPOObjective) and objective.reward_kl > 0
-                   else None)
+                   else None, generation_batches=generation_batches)
 
     @classmethod
     def episodes(cls, policy: EpisodeInference, environment: EnvironmentFactory, verifier: Verifier, *,
@@ -742,7 +763,8 @@ class RolloutScheduler:
         A session whose calls do not extend each other packs as one chain
         per call, so the rows a group needs are known only once it is done.
         """
-        width, rows = self.acquisition.width, self.acquisition.rows(len(entry.tasks), self.groups)
+        home = entry.packs or entry
+        width, rows = self.acquisition.width, self.acquisition.rows(len(home.tasks), self.groups)
         group.lengths = chain_lengths(group.done, width, truncation=self.truncation)
         alone = rows_needed(group.lengths, width)
         if alone > rows:
@@ -754,18 +776,24 @@ class RolloutScheduler:
                                       overlong=self.overlong):
             tally.uniform += 1
             return
-        admitted = [length for complete in entry.complete for length in complete.lengths]
+        admitted = [length for complete in home.complete for length in complete.lengths]
         if rows_needed([*admitted, *group.lengths], width) <= rows:
-            entry.complete.append(group)
+            home.complete.append(group)
             return
         tally.cut += 1
         tally.cancelled += len(group.live)
         self.acquisition.cancel(group.live)
         group.live.clear()
 
-    def _admit(self, entry: _Entry, updates: int, tally: _Tally) -> list[_Group]:
-        """Wait for the entry's first `admit` complete groups that fit, then cancel the rest."""
-        target = len(entry.groups) if self.admit is None else min(self.admit, len(entry.groups))
+    def _target(self, home: _Entry) -> int:
+        """The groups a call admits: `admit`, or every task of its step's batch (`home`)."""
+        return len(home.groups) if self.admit is None else min(self.admit, len(home.groups))
+
+    def _admit(self, entry: _Entry, updates: int, tally: _Tally) -> None:
+        """Wait until the call's first entry holds its `_target` complete groups that fit, or `entry`
+        has none left to complete, then cancel the rest of `entry`'s."""
+        home = entry.packs or entry
+        target = self._target(home)
         try:
             while True:
                 pending = [group for group in entry.groups
@@ -775,7 +803,7 @@ class RolloutScheduler:
                 pending = [
                     group for group in pending if not group.abandoned and len(group.done) < self.groups
                 ]
-                if len(entry.complete) >= target or not pending:
+                if len(home.complete) >= target or not pending:
                     break
                 live = [sample.future for group in pending for sample in group.live]
                 wait(live, return_when=FIRST_COMPLETED)
@@ -785,25 +813,32 @@ class RolloutScheduler:
             self.acquisition.cancel(leftover)
             for group in entry.groups:
                 group.live.clear()
-        if not entry.complete and tally.uniform:
-            raise RuntimeError(
-                f"no group of batch {entry.serial} varied: the members of each of its {tally.uniform} "
-                "complete groups earned one return (varied); a batch of more tasks than admit= draws the "
-                "groups that replace them")
-        if not entry.complete:
-            raise RuntimeError(f"no group of batch {entry.serial} completed: every one was abandoned")
-        return entry.complete[:target]
 
-    def __call__(self, state: TrainState, batch: Batch, key: jax.Array) -> dict[str, np.ndarray]:
+    def _admitted_groups(self, home: _Entry, tally: _Tally, drawn: int) -> list[_Group]:
+        """The call's admitted groups, its first `_target` complete ones; refused where none completed."""
+        if not home.complete and tally.uniform:
+            raise RuntimeError(
+                f"no group of batch {home.serial} varied: the members of each of the {tally.uniform} "
+                f"complete groups of the {drawn} batches it drew earned one return (varied); a batch of "
+                "more tasks than admit=, or generation_batches= above 1, draws the groups that replace "
+                "them")
+        if not home.complete:
+            raise RuntimeError(f"no group of batch {home.serial} completed: every one was abandoned")
+        return home.complete[:self._target(home)]
+
+    def __call__(self, state: TrainState, batch: Batch, key: jax.Array,
+                 further: Callable[[], Batch | None] | None = None) -> dict[str, np.ndarray]:
+        if self.draws_further and further is None:
+            raise ValueError("generation_batches above 1 draws further batches through the trainer's read of "
+                             "its stream (further=), and this call was handed none")
         mesh = mesh_of(state.variables)
         partition = DataPartition() if mesh is None else DataPartition.of(mesh)
         snapshot = Snapshot(state.variables, int(state.step), int(state.updates), key, self._branch)
         self.acquisition.begin(snapshot, partition)
         entries = _within(mesh, "rollout preparation", lambda: self.acquisition.entries(batch, self.tasks_of))
         acquiring = self.acquisition.acquires(partition)
-        rollouts, latencies, groups, tally, waited = _within(
-            mesh, "rollout admission",
-            lambda: self._admitted(entries, snapshot, partition) if acquiring else ([], [], 0, _Tally(), 0.0))
+        rollouts, latencies, groups, tally, waited, drawn = self._admitted(
+            mesh, entries, snapshot, partition, acquiring, further)
         sampling = partition.reader == 0
         mine = rollouts if sampling else []
         # Rewards that pay the reference penalty are known once the packed rows are scored (`_penalized`).
@@ -830,28 +865,63 @@ class RolloutScheduler:
                                      tally.cancelled, tally.abandoned, tally.cut, waited, metrics)
             self.metrics = {**metrics, "lag": float(record.lag), "groups": float(groups),
                             "resubmitted": float(sum(record.resubmitted.values())),
-                            "waited_seconds": waited, "uniform_groups": float(tally.uniform)}
+                            "waited_seconds": waited, "uniform_groups": float(tally.uniform),
+                            "generation_batches": float(drawn)}
             if self.log is not None:
                 self.log(record)
         return packed
 
-    def _admitted(self, entries: Sequence[_Entry], snapshot: Snapshot, partition: DataPartition
-                  ) -> tuple[list[Session], list[float], int, _Tally, float]:
-        """This process's admitted rollouts for the call's entry, their latencies, the group count,
-        the tally and the wait, the entries ahead of it opened as well. A share's later reader opens
-        what the first does and admits nothing: it trains on the first reader's rows."""
-        # The wait counts a synchronous collection, which opening its entry runs.
+    def _admitted(self, mesh, entries: Sequence[_Entry], snapshot: Snapshot, partition: DataPartition,
+                  acquiring: bool, further: Callable[[], Batch | None] | None
+                  ) -> tuple[list[Session], list[float], int, _Tally, float, int]:
+        """This process's admitted rollouts for the call, their latencies, the group count, the tally,
+        the wait and the data batches drawn. The call's first entry is its step's batch, whose rows
+        every admitted group packs into; while its first reader is short of groups on some share, every
+        process draws the stream's next batch (`further`), up to `generation_batches` in all, and admits
+        from it too. A share's later reader opens what the first does and admits nothing: it trains on
+        the first reader's rows."""
+        home, tally, drawn = entries[0], _Tally(), 1
+        admitting = acquiring and partition.reader == 0
+        # The wait counts a synchronous collection, which opening an entry runs.
         began = time.perf_counter()
-        for pending in entries:
-            self.acquisition.open(pending, self.groups + self.oversample, snapshot)
-        if partition.reader != 0:
-            return [], [], 0, _Tally(), time.perf_counter() - began
-        tally = _Tally()
-        admitted = self._admit(entries[0], snapshot.updates, tally)
+
+        def admitted(opened: Sequence[_Entry], drawn: int) -> None:
+            # A batch drawn further samples from its own key, apart from the step's batch's draws.
+            keyed = snapshot if drawn == 1 else dataclasses.replace(
+                snapshot, key=jax.random.fold_in(snapshot.key, drawn - 1))
+            for pending in opened:
+                self.acquisition.open(pending, self.groups + self.oversample, keyed)
+            if admitting:
+                self._admit(opened[0], snapshot.updates, tally)
+
+        def short() -> bool:
+            return admitting and len(home.complete) < self._target(home)
+
+        def drawn_entries(batch: Batch) -> list[_Entry]:
+            opened = self.acquisition.entries(batch, self.tasks_of)
+            opened[0].packs = home
+            return opened
+
+        opened: Sequence[_Entry] = entries
+        while True:
+            admission = functools.partial(admitted, opened, drawn) if acquiring else list
+            _within(mesh, "rollout admission", admission)
+            if drawn == self.generation_batches or not agreed_count("rollout draw", short, bool)[1]:
+                break
+            assert further is not None
+            batch = further()
+            if batch is None:
+                break
+            drawn += 1
+            opened = _within(mesh, "rollout preparation", functools.partial(drawn_entries, batch))
+        groups = _within(mesh, "rollout admission",
+                         lambda: self._admitted_groups(home, tally, drawn) if admitting else [])
+        if not admitting:
+            return [], [], 0, _Tally(), time.perf_counter() - began, drawn
         waited = time.perf_counter() - began
-        return ([rollout for group in admitted for rollout in group.done[:self.groups]],
-                [latency for group in admitted for latency in group.latencies[:self.groups]],
-                len(admitted), tally, waited)
+        return ([rollout for group in groups for rollout in group.done[:self.groups]],
+                [latency for group in groups for latency in group.latencies[:self.groups]],
+                len(groups), tally, waited, drawn)
 
     def _whitening(self, mesh, rollouts: Sequence[Session], shaping: Mapping[int, Sequence[float]] | None
                    ) -> tuple[float, float]:

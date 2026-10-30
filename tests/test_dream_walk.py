@@ -12,7 +12,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from dream_walk_support import NEW_TOKENS, PROMPTS, RELEASES, STEPS, uniforms
+from dream_walk_support import CODE, NEW_TOKENS, PROMPTS, RELEASES, STEPS, uniforms
 from tool_support import load
 
 from dew.diffusion.discrete import Unmask
@@ -26,7 +26,8 @@ TOKEN_IDS = ("bos_token_id", "eos_token_id", "pad_token_id", "mask_token_id")
 def snapshot(release: str, root: Path, generation: dict | None = None) -> Path:
     """dream-tiny as `release` ships it, under `root`: its config naming its own code (`auto_map`), its
     generation config (`generation`, else the release's pinned file whole) at the tiny's ids, and the
-    release's `generation_utils.py` (the fetched store's pinned copy)."""
+    release's own code, the modules its config names and the `generation_utils.py` its model imports
+    (`CODE`, each its pinned copy)."""
     fixture = RELEASES[release][0]
     directory = Path(shutil.copytree(FIXTURES / "dream-tiny", root / release))
     config = json.loads((directory / "config.json").read_text())
@@ -37,8 +38,8 @@ def snapshot(release: str, root: Path, generation: dict | None = None) -> Path:
               else generation)
     tiny = {"bos_token_id": 1, "pad_token_id": 0, "mask_token_id": config["mask_token_id"]}
     (directory / "generation_config.json").write_text(json.dumps({**stated, **tiny}))
-    code = load("fetched_fixtures").local(FIXTURES / fixture / "release" / "generation_utils.py")
-    shutil.copy(code, directory / "generation_utils.py")
+    for file in CODE:
+        shutil.copy(load("fetched_fixtures").local(FIXTURES / fixture / "release" / file), directory / file)
     return directory
 
 
@@ -100,3 +101,42 @@ def test_a_dream_release_asking_what_its_walk_does_not_take_is_refused(tmp_path)
     assert source.masked_walk is None
     with pytest.raises(ValueError):
         source.text_generation()
+
+
+def test_a_run_over_a_dream_release_saves_and_serves_its_walk(tmp_path):
+    """An objective over a loaded Dream release takes the release's walk by default, the end of its grid
+    among it (ledger 2563): a run of it saves the walk, and the run's task (`MaskedGeneration.from_run`,
+    `dew.pipeline` of the run) walks the release's grid and generates the live task's tokens. The source
+    written back (`Pretrained.save`) carries its own code, its sampling among it, and reloads with the
+    same walk."""
+    import grain.python as grain
+    import optax
+
+    from dew.checkpoints import Checkpoints
+    from dew.data import ByteTokenizer
+    from dew.data.dataset import Loader
+    from dew.diffusion.discrete import MDLM
+    from dew.inference import RunProcessor, pipeline
+    from dew.inference.tasks import MaskedGeneration
+    from dew.objectives.diffusion.masked import MaskedDiffusionObjective
+    from dew.training import Trainer
+
+    source = Pretrained.load(snapshot("dream", tmp_path), dtype="float32", attention_impl="xla")
+    walk = source.masked_walk
+    walked = (walk.solver, walk.steps, walk.block, walk.endpoint)
+    objective = MaskedDiffusionObjective(source, MDLM(mask_id=source.model.mask_token_id)(), 8,
+                                         ema_decay=None, processor=RunProcessor(ByteTokenizer()))
+    assert (objective.solver, objective.steps, objective.block, objective.process.endpoint) == walked
+    rows = jax.device_count()
+    stream = grain.MapDataset.source([{"text": np.full((rows, 8), 7, np.int32)}]).repeat().to_iter_dataset()
+    data = Loader(train=lambda partition: iter(stream), val=None, records=rows, batch=rows)
+    run = tmp_path / "run"
+    trainer = Trainer(objective, optax.sgd(0.05), key=jax.random.key(19), checkpoints=Checkpoints(str(run)))
+    state = trainer.fit(data, steps=1, checkpoint_every=1, log_every=1)
+    prompt = jnp.asarray([[3, 5, 6]], jnp.int32)
+    expected = objective.pipeline(state)(prompt, 8, key=7).host().tokens
+    for restored in (MaskedGeneration.from_run(str(run)), pipeline(str(run))):
+        assert (restored.solver, restored.steps, restored.block, restored.process.endpoint) == walked
+        np.testing.assert_array_equal(restored(prompt, 8, key=7).host().tokens, expected)
+    source.save(tmp_path / "saved")
+    assert Pretrained.load(tmp_path / "saved", dtype="float32", attention_impl="xla").masked_walk == walk
