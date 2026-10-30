@@ -998,19 +998,22 @@ def test_the_backward_is_on_par_under_every_score_hook_interpreted(hooks, form):
 
 
 @INTERPRETS
-def test_a_folded_forward_whose_products_pass_fp32_below_zero_rewalks_natural_interpreted():
-    """A full call whose raw products pass fp32's range below zero (a query 2^126 against keys -8, scale 1/4)
-    takes its query by the scale's power of two first, so its products stay finite (-2^127): its rows'
-    maxima pass the fold's reach, they walk again natural, and every equal logit weighs its values alike,
-    the output the values' mean, 1 (a power taken into the scale instead overflowed to -inf, which reads as
-    a row that saw no key: review of the FA3-gap batch's F3)."""
+@pytest.mark.parametrize("kept", [template.Kept.NONE, template.Kept.SPLIT], ids=["forward", "training"])
+def test_a_folded_forward_whose_products_pass_fp32_below_zero_rewalks_natural_interpreted(kept):
+    """A full call whose raw products pass fp32's range below zero (a query 2^126 against keys -8, scale
+    1/4: its power of two taken into the launch's scale, `_prepared`): every row's maximum reads -inf, which
+    a call whose every row sees a key takes as past the fold's reach (`reach_of`), so it walks again
+    natural on the query taken by the power, where its products stay finite (-2^127), and every equal
+    logit weighs its values alike: the output, the training forward's too, the values' mean, 1 (as an empty
+    row's -inf it read nothing: review of the FA3-gap batch's F3)."""
     shape = (1, 64, 1, 16)
     query = jnp.zeros(shape, jnp.bfloat16).at[..., 0].set(2.0 ** 126)
     key = jnp.zeros(shape, jnp.bfloat16).at[..., 0].set(-8.0)
     value = jnp.ones(shape, jnp.bfloat16)
     spans = template.spans(shape[1], shape[1], shape[0])
     with _device(interpret=True):
-        out = attention_mosaic.forward(query, key, value, spans, scale=0.25, interpret=True)
+        out = attention_mosaic.forward(query, key, value, spans, scale=0.25, residuals=kept, interpret=True)
+    out = out if kept is template.Kept.NONE else out[0]
     assert np.array_equal(np.asarray(out, np.float32), np.ones(shape, np.float32))
 
 
