@@ -9,6 +9,7 @@ them imports another for these."""
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from typing import Any, ClassVar
@@ -72,6 +73,32 @@ EXAMPLE_ROWS = "example_rows"
 records' stream holds them in, whatever process read a row (`dew.training.distributed.marked`). The
 trainer's transaction reads it for the examples' draws (`Step.example_index`) and takes it out of the
 batch the objective sees."""
+
+
+EXAMPLES_CONSUMED = "examples_consumed"
+"""A training batch's column of the source examples each row is the last of, int32, in a run bounded in
+examples (`dew.data.pipeline.CONSUMED`): the batch's sum over its real rows is the examples its dispatch
+consumes, which the trainer's step adds to the run's clock (`TrainState.consumed`) and takes out of the
+batch the objective sees. A repeat filling out a short batch holds none."""
+
+
+CLOSES_WINDOW = "closes_window"
+"""A training batch's step-wide flag, in a run bounded in examples that counts no steps ahead: whether it
+is the last its stream holds, so the update window it ends commits over the microbatches it holds however
+few (`dew.training.transaction.Transaction.prepare_attempt`), where a window of a whole update's would be
+left open, and the examples it consumed with it, as the stream ends."""
+
+CONSUMED_COUNT = "consumed_count"
+"""A training batch's host field of the examples it consumes (`ConsumedCount`), which the trainer counts
+as it prepares the batch, so its loop reads the run's progress without waiting on its devices."""
+
+
+@dataclasses.dataclass(frozen=True)
+class ConsumedCount:
+    """A training batch's consumed examples as its host counted them before placing it, the sum of its
+    `EXAMPLES_CONSUMED` column: an object no device holds (`dew.distributed.batches.split_fields`)."""
+
+    examples: int
 
 
 def padded_rows(rows: int, count: int) -> tuple[np.ndarray, np.ndarray]:
