@@ -186,6 +186,16 @@ def test_muons_default_precision_preconditions_spectrally():
                       "spectral Muon in bfloat16")
 
 
+def test_muon_refuses_a_real_dot_algorithm_for_a_complex_update():
+    """A dot algorithm states real products (`ns_precision`), which a complex update's Newton-Schulz cannot
+    take: Muon refuses it by name rather than multiply the update's real part alone."""
+    solver = OptimConfig(optimizer="muon", learning_rate=LR,
+                         optimizer_opts={"ns_precision": "F32_F32_F32"}).build(10)
+    params = {"w": jnp.zeros((16, 24), jnp.complex64)}
+    with pytest.raises(ValueError):
+        solver.update({"w": jnp.ones((16, 24), jnp.complex64) * 1j}, solver.init(params), params)
+
+
 def test_muon_steps_a_complex_matrix_as_optax_does():
     """A purely imaginary matrix's update, which a real iteration would zero, on par with optax's Muon of
     it, complex64 its iteration's dtype at every precision (check 1)."""
@@ -229,19 +239,25 @@ def test_muons_newton_schulz_multiplies_in_the_runs_numerics(forms):
     program's products state them."""
     params = decoder_params()
     solver = OPTIMIZER_MAP["muon"](LR)
-    policy = Numerics() if forms == "fast" else ACCURATE
-
-    def update(grads, state):
-        with run_precision(policy):
-            return solver.update(grads, state, params)
-    text = jax.jit(update).lower(fixed_gradients(params), solver.init(params)).as_text()
-    # The iteration's products, X X^T and A A, each over a stack of square operands' batch.
-    products = [line for line in text.splitlines() if "dot_general" in line and "batching_dims" in line]
-    assert products
+    policies = ({"fast": Numerics()} if forms == "fast"
+                else {"default": Numerics(forms="accurate"), "highest": ACCURATE})
+    found = {}
+    for name, policy in policies.items():
+        def update(grads, state, policy=policy):
+            with run_precision(policy):
+                return solver.update(grads, state, params)
+        # The process's own default cleared, so what the products state is the policy's alone.
+        with jax.default_matmul_precision(None):
+            text = jax.jit(update).lower(fixed_gradients(params), solver.init(params)).as_text()
+        # The iteration's products, X X^T and A A, each over a stack of square operands' batch.
+        products = [line for line in text.splitlines() if "dot_general" in line and "batching_dims" in line]
+        assert products
+        found[name] = products
     if forms == "fast":
-        assert all("xbf16>" in line for line in products)
+        assert all("xbf16>" in line for line in found["fast"])
     else:
-        assert all("xf32>" in line and "HIGHEST" in line for line in products)
+        assert all("xf32>" in line and "HIGHEST" not in line for line in found["default"])
+        assert all("xf32>" in line and "HIGHEST" in line for line in found["highest"])
 
 
 @pytest.mark.parametrize("algorithm", ["BF16_BF16_F32", "TF32_TF32_F32", "F32_F32_F32"])
@@ -266,7 +282,11 @@ def test_a_stated_dot_algorithm_is_muons_products_or_its_platforms_refusal(algor
     lowered = jax.jit(update).lower(*arguments)
     products = [line for line in lowered.as_text().splitlines()
                 if "dot_general" in line and "batching_dims" in line]
-    assert products and all(f"x{operand}>" in line and "algorithm" in line for line in products)
+    # The algorithm itself, its operands' and accumulation's types and its one primitive product.
+    stated = (f"algorithm = <lhs_precision_type = {operand}, rhs_precision_type = {operand}, "
+              "accumulation_type = f32, lhs_component_count = 1, rhs_component_count = 1, "
+              "num_primitive_operations = 1,")
+    assert products and all(f"x{operand}>" in line and stated in line for line in products)
     lowered.compile()
 
 
