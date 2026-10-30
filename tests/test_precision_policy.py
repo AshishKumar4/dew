@@ -21,7 +21,7 @@ from dew.nn.mixer_base import MixerContext
 from dew.nn.mixers.attention import AttentionMixer
 from dew.nn.mla import MultiHeadLatentAttention
 from dew.nn.mlp import GatedMLP
-from dew.nn.precision import PRECISION_PRESETS, fp32_result_dot_general
+from dew.nn.precision import ACCURATE, Numerics, fp32_result_dot_general
 from dew.telemetry.instrumentation import hlo_instructions
 
 BF16_QKV = (1, 4, 2, 8)  # [B, S, H, D]
@@ -481,22 +481,25 @@ def test_a_model_with_no_dtype_multiplies_each_product_as_its_operands_compute(s
                                vocab=64)
 
 
-@pytest.mark.parametrize("policy", sorted(PRECISION_PRESETS))
+NUMERICS = {"default": Numerics(), "accurate": ACCURATE}
+
+
+@pytest.mark.parametrize("policy", sorted(NUMERICS))
 def test_a_runs_precision_policy_sets_every_product_that_states_none(policy):
-    """Under a run's ACCURATE policy (`generation.run_precision`, ledger 2500) every product of a float32
+    """Under a run's ACCURATE numerics (`generation.run_precision`, ledger 2500) every product of a float32
     decoder multiplies at HIGHEST, IEEE float32, and the attention template takes its accurate form;
-    under FAST each takes JAX's default but the vocabulary head's, which states IEEE float32
+    under the default each takes JAX's default but the vocabulary head's, which states IEEE float32
     (`dew.nn.precision.exact_float32`)."""
     model = LAYERS["packed"](dtype=jnp.float32)
     tokens = jnp.arange(16, dtype=jnp.int32).reshape(1, 16) % 64
     variables = model.init(jax.random.key(0), tokens)
 
     def traced(variables, tokens):
-        with generation.run_precision(PRECISION_PRESETS[policy]):
+        with generation.run_precision(NUMERICS[policy]):
             return model.apply(variables, tokens)
 
     precisions = dot_precisions(traced, variables, tokens)
-    with generation.run_precision(PRECISION_PRESETS[policy]):
+    with generation.run_precision(NUMERICS[policy]):
         form = generation.chosen_kernel("attention_form", "fast")
     if policy == "accurate":
         assert precisions and all(precision == HIGHEST for precision, _, _ in precisions), precisions

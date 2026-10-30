@@ -59,7 +59,7 @@ from dew.files import write_atomically
 from dew.lora import LoRA
 from dew.nn.dex import DifferentialExtension
 from dew.nn.kernels import generation
-from dew.nn.precision import FAST, Numerics
+from dew.nn.precision import Numerics
 from dew.objectives.base import Effects, Loss, Metric, Objective
 from dew.optim import OptimConfig
 from dew.quantization import Quantization
@@ -497,12 +497,12 @@ class TrainerConfig:
     once per stage.
     """
     dynamic_scale: bool = False
-    precision: Numerics = FAST
-    """The run's numerics, set once and recorded with it (`dew.nn.precision.Numerics`, the presets
-    `FAST` and `ACCURATE`): its products' precision and its ops' forms over every program it traces, the
-    step and its evaluations (`dew.nn.kernels.generation.run_precision`), and the dtypes its model and
-    optimizer take. A precision the model states still wins, and a resumed run traces under the policy
-    it records."""
+    precision: Numerics = dataclasses.field(default_factory=Numerics)
+    """The run's numerics, set once and recorded with it (`dew.nn.precision.Numerics`; `ACCURATE` for
+    scientific runs): its dtypes by Lightning's names, its products' precision by JAX's levels and its
+    ops' forms, over every program it traces, the step and its evaluations
+    (`dew.nn.kernels.generation.run_precision`). A precision the model states still wins, and a resumed
+    run traces under the numerics it records."""
     mesh: MeshSpec = dataclasses.field(default_factory=MeshSpec)
     microbatches: int | None = None
     """Microbatches a pipelined step feeds through the mesh's stages, a

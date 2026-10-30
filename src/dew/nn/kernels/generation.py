@@ -101,16 +101,16 @@ def chosen(**kernels: str) -> Iterator[None]:
 
 @contextlib.contextmanager
 def run_precision(policy: Numerics) -> Iterator[None]:
-    """Within the block, programs trace under a run's precision `policy`'s products and forms
+    """Within the block, programs trace under a run's numerics' products and forms
     (`dew.nn.precision.Numerics`): every product that states no precision at `policy.matmul`
-    (`jax.default_matmul_precision`; DEFAULT leaves JAX's configuration as it stands), and each op's
+    (`jax.default_matmul_precision`; "default" leaves JAX's configuration as it stands), and each op's
     accurate form where its forms are "accurate", the attention template's (`attention_form`) among
-    them. The dtypes are the model's and the optimizer's own fields, which the run sets from the policy:
-    a bf16 operand has lost its bits before any product reads it, whatever its precision."""
+    them. The dtypes are the model's and the optimizer's own fields, which the run sets from the
+    numerics: a bf16 operand has lost its bits before any product reads it, whatever its precision."""
     import jax
 
-    stated = contextlib.nullcontext() if policy.matmul == jax.lax.Precision.DEFAULT else (
-        jax.default_matmul_precision(policy.matmul.name.lower()))
+    matmul = policy.matmul if isinstance(policy.matmul, str) else policy.matmul.name
+    stated = contextlib.nullcontext() if matmul == "default" else jax.default_matmul_precision(matmul)
     forms = chosen(attention_form="accurate") if policy.forms == "accurate" else contextlib.nullcontext()
     with stated, forms:
         yield

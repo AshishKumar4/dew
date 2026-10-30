@@ -42,10 +42,11 @@ from jax.typing import DTypeLike
 
 __all__ = [
     "ACCURATE",
-    "FAST",
+    "DTYPE_PRESETS",
     "FP32_SUMS",
     "L2NORM_EPS",
-    "PRECISION_PRESETS",
+    "MATMUL_PRECISIONS",
+    "NUMERICS_PRESETS",
     "WIDE_CPU_ARITHMETIC",
     "Numerics",
     "accumulated",
@@ -507,45 +508,70 @@ def float32_matmul(lhs, rhs, precision: jax.lax.PrecisionLike = None) -> jax.Arr
     return accumulated(functools.partial(jnp.matmul, precision=precision), lhs, rhs)
 
 
+DtypePreset = Literal["bf16-mixed", "32-true", "bf16-true", "16-mixed"]
+"""A run's dtypes by Lightning's names, each jmp's three: the parameters', the compute's and the
+output's (`DTYPE_PRESETS`)."""
+
+DTYPE_PRESETS: dict[str, tuple[str, str, str]] = {
+    "bf16-mixed": ("float32", "bfloat16", "float32"),
+    "32-true": ("float32", "float32", "float32"),
+    "bf16-true": ("bfloat16", "bfloat16", "bfloat16"),
+    "16-mixed": ("float32", "float16", "float32"),
+}
+"""Each dtype preset's parameter, compute and output dtypes (jmp's `Policy`), which a model takes as
+Flax's `param_dtype` and `dtype` and its optimizer's moments as its parameters' own. "16-mixed" scales
+its loss, as float16's narrow range needs."""
+
+MATMUL_PRECISIONS = ("default", "high", "highest")
+"""JAX's matmul precision levels (`jax_default_matmul_precision`): "default" TF32 for a float32 product
+on a GPU and one bf16 pass on a TPU, "highest" IEEE float32."""
+
+
 @dataclasses.dataclass(frozen=True)
 class Numerics:
-    """A run's numerics, set once and recorded with it, which its model, optimizer and trainer read: the
-    dtype the model computes in (Flax's `dtype`) and stores its parameters in (`param_dtype`), the
-    optimizer state's (`dew.optim.OptimConfig.state_dtype`, int8 a quantized store), the precision every
-    product that states none multiplies at (JAX's `jax_default_matmul_precision`; DEFAULT leaves JAX's
-    configuration as it stands, TF32 for a float32 product on a GPU), and each op's form, its kernels'
-    fast or accurate arithmetic (`dew.nn.kernels.generation.run_precision`). A precision a call or a
-    model states still wins, and determinism is a setting of its own. Two presets name the usual ones:
-    `FAST` and `ACCURATE` (`PRECISION_PRESETS`)."""
+    """A run's numerics, set once and recorded with it, which its model, optimizer and trainer read:
+    its dtypes by Lightning's names (`DTYPE_PRESETS`, mapped onto Flax's `param_dtype` and `dtype`),
+    the precision every product that states none multiplies at (JAX's own `jax_default_matmul_precision`
+    level, or a `jax.lax.DotAlgorithmPreset`), and each op's form, its kernels' fast or accurate
+    arithmetic (`dew.nn.kernels.generation.run_precision`). A precision a call or a model states still
+    wins, and determinism is a setting of its own. The default is bf16-mixed at JAX's default precision
+    in the fast forms; `ACCURATE` names the scientific one (`NUMERICS_PRESETS`)."""
 
-    compute: str = "bfloat16"
-    params: str = "float32"
-    optimizer_state: Literal["float32", "bfloat16", "int8"] = "float32"
-    matmul: jax.lax.Precision = jax.lax.Precision.DEFAULT
+    dtypes: DtypePreset = "bf16-mixed"
+    matmul: str | jax.lax.DotAlgorithmPreset = "default"
     forms: Literal["fast", "accurate"] = "fast"
 
     def __post_init__(self):
-        for name in ("compute", "params"):
-            if not jnp.issubdtype(jnp.dtype(getattr(self, name)), jnp.floating):
-                raise ValueError(f"a precision policy's {name} dtype is a floating one, "
-                                 f"not {getattr(self, name)!r}")
-        if self.optimizer_state not in ("float32", "bfloat16", "int8"):
-            raise ValueError(f"a precision policy's optimizer state is float32, bfloat16 or int8, not "
-                             f"{self.optimizer_state!r}")
+        if self.dtypes not in DTYPE_PRESETS:
+            raise ValueError(f"a run's dtypes are one of {sorted(DTYPE_PRESETS)}, not {self.dtypes!r}")
+        if not isinstance(self.matmul, jax.lax.DotAlgorithmPreset) and self.matmul not in MATMUL_PRECISIONS:
+            raise ValueError(f"a run's matmul precision is one of JAX's levels {MATMUL_PRECISIONS} or a "
+                             f"jax.lax.DotAlgorithmPreset, not {self.matmul!r}")
         if self.forms not in ("fast", "accurate"):
-            raise ValueError(f"a precision policy's forms are fast or accurate, not {self.forms!r}")
+            raise ValueError(f"a run's forms are fast or accurate, not {self.forms!r}")
+
+    @property
+    def params(self) -> str:
+        """The dtype the model stores its parameters and its optimizer its moments in."""
+        return DTYPE_PRESETS[self.dtypes][0]
+
+    @property
+    def compute(self) -> str:
+        """The dtype the model computes in, Flax's `dtype`."""
+        return DTYPE_PRESETS[self.dtypes][1]
+
+    @property
+    def output(self) -> str:
+        """The dtype the model's outputs are cast to."""
+        return DTYPE_PRESETS[self.dtypes][2]
 
 
-FAST = Numerics()
-"""Speed: bf16 compute over float32 parameters and optimizer moments, JAX's default matmul precision
-(TF32 on a GPU, one bf16 pass on a TPU) and each op's fast form."""
+ACCURATE = Numerics(dtypes="32-true", matmul="highest", forms="accurate")
+"""Accurate, scientific work at its cost: float32 throughout, every product that states no precision in
+IEEE float32 and each op's accurate form."""
 
-ACCURATE = Numerics(compute="float32", matmul=jax.lax.Precision.HIGHEST, forms="accurate")
-"""Accurate, scientific work at its cost: float32 compute, parameters and moments, every product that
-states no precision in IEEE float32 (`Precision.HIGHEST`) and each op's accurate form."""
-
-PRECISION_PRESETS = {"fast": FAST, "accurate": ACCURATE}
-"""The named precision policies."""
+NUMERICS_PRESETS = {"accurate": ACCURATE}
+"""The named run numerics beside the default (`Numerics()`)."""
 
 
 def exact_float32(precision: jax.lax.PrecisionLike) -> jax.lax.PrecisionLike:
