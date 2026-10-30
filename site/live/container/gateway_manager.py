@@ -188,10 +188,14 @@ class LimitedMappingKernelManager(SeedingMappingKernelManager):
         kernel), and one whose restart failed is released here, where jupyter-client drops it releasing none
         (ledger 2516). Then jupyter-server's own shutdown: its activity, buffers and count."""
         kernel = self.get_kernel(kernel_id)
-        try:
-            await asyncio.shield(kernel.ready)
+        # A restart replaces `ready` for each of its phases, its shutdown's then its start's: each is waited for.
+        while not kernel.ready.done():
+            try:
+                await asyncio.shield(kernel.ready)
+            except Exception:
+                pass
         # Its restart failed: its relaunch raised, or it never answered.
-        except Exception:
+        if not kernel.ready.cancelled() and kernel.ready.exception() is not None:
             await kernel.cleanup_resources(restart=False)
         return await super().shutdown_kernel(kernel_id, now=now, restart=restart)
 
