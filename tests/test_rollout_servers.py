@@ -584,6 +584,169 @@ class Worker:
             self.checked(self.nccl.ncclCommAbort(self.comm))
 
 
+class Fabric:
+    """NCCL's rendezvous and collectives over host memory, for the push and the workers on CPU
+    devices: a group opens once its every rank has joined it under its unique id, and its k-th
+    collective runs once every rank has issued its k-th, a broadcast copying rank 0's buffer into
+    the others' and an all-reduce summing float32 buffers into each. An aborted group fails every
+    call its ranks wait on. Device buffers on the CPU are host memory, so a collective reads and
+    writes them where `unsafe_buffer_pointer` places them."""
+
+    def __init__(self):
+        self.lock = threading.Condition()
+        self.groups = {}
+
+    def join(self, uid, rank, world):
+        with self.lock:
+            group = self.groups.setdefault(bytes(uid.internal), {"world": world, "ranks": set(),
+                                                                 "issued": {}, "done": 0, "aborted": False})
+            assert group["world"] == world and rank not in group["ranks"]
+            group["ranks"].add(rank)
+            self.lock.notify_all()
+            return group
+
+    def opened(self, group):
+        return group["aborted"] or len(group["ranks"]) == group["world"]
+
+    def issue(self, group, rank, kind, pointer, count, dtype):
+        """Rank `rank`'s next collective of `group`; it runs once every rank has issued it."""
+        with self.lock:
+            if group["aborted"]:
+                raise RuntimeError("the group was aborted")
+            index = group["issued"].setdefault(rank, [])
+            index.append((kind, pointer, count, dtype))
+            ready = len(index) - 1
+            if all(len(group["issued"].get(peer, ())) > ready for peer in range(group["world"])):
+                calls = [group["issued"][peer][ready] for peer in range(group["world"])]
+                assert len({(kind, count, dtype) for kind, _, count, dtype in calls}) == 1, calls
+                size = count * np.dtype(jnp.dtype(dtype)).itemsize
+                if kind == "broadcast":
+                    for _, target, _, _ in calls[1:]:
+                        ctypes.memmove(target, calls[0][1], size)
+                else:
+                    total = sum(np.ctypeslib.as_array(ctypes.cast(pointer, ctypes.POINTER(ctypes.c_float)),
+                                                      (count,)).copy() for _, pointer, _, _ in calls)
+                    for _, pointer, _, _ in calls:
+                        ctypes.memmove(pointer, total.ctypes.data, size)
+                group["done"] = ready + 1
+                self.lock.notify_all()
+            return ready + 1
+
+    def finished(self, group, issued):
+        return group["aborted"] or group["done"] >= issued
+
+    def wait(self, group, test, timeout=60):
+        with self.lock:
+            if not self.lock.wait_for(lambda: test(group), timeout):
+                raise TimeoutError("the emulated group's peers never came")
+            if group["aborted"]:
+                raise RuntimeError("the group was aborted")
+
+    def abort(self, group):
+        with self.lock:
+            group["aborted"] = True
+            self.lock.notify_all()
+
+
+class EmulatedLibrary:
+    """`dew.inference.nccl._Library` over a `Fabric`: the push's nonblocking communicators, whose
+    waits watch the replicas' HTTP calls as NCCL's polls do, a failed call raising."""
+
+    def __init__(self, fabric):
+        self.fabric, self.comms = fabric, {}
+
+    def unique_id(self):
+        uid = UniqueId()
+        ctypes.memmove(uid.internal, np.random.default_rng().bytes(128), 128)
+        return uid
+
+    def open(self, uid, rank, world):
+        comm = ctypes.c_void_p(len(self.comms) + 1)
+        self.comms[comm.value] = {"group": self.fabric.join(uid, rank, world), "rank": rank, "issued": 0}
+        return comm
+
+    def all_reduce(self, comm, pointer, count, dtype):
+        self._issue(comm, "all_reduce", pointer, count, dtype)
+
+    def broadcast(self, comm, pointer, count, dtype):
+        self._issue(comm, "broadcast", pointer, count, dtype)
+
+    def _issue(self, comm, kind, pointer, count, dtype):
+        held = self.comms[comm.value]
+        held["issued"] = self.fabric.issue(held["group"], held["rank"], kind, pointer, count, dtype)
+
+    def ready(self, comms, peers):
+        """A call is issued as it is made, so no communicator is ever still issuing one."""
+
+    def settled(self, comms, peers):
+        from concurrent.futures import FIRST_EXCEPTION, wait
+
+        while True:
+            held = [self.comms[comm.value] for comm in comms]
+            if any(each["group"]["aborted"] for each in held):
+                raise RuntimeError("the group was aborted")
+            if all(self.fabric.opened(each["group"]) and self.fabric.finished(each["group"], each["issued"])
+                   for each in held):
+                return
+            answered, _ = wait(peers, timeout=0.001, return_when=FIRST_EXCEPTION)
+            failure = next((peer.exception() for peer in answered if peer.exception() is not None), None)
+            if failure is not None:
+                raise RuntimeError("a replica's HTTP call failed while its NCCL group waited") from failure
+
+    def abort(self, comm):
+        self.fabric.abort(self.comms.pop(comm.value)["group"])
+
+
+class EmulatedWorker:
+    """`Worker` over a `Fabric`: a blocking communicator at its join's rank that matches the sender's
+    warm-up all-reduce and receives each listed tensor into a buffer of its own."""
+
+    def __init__(self, fabric):
+        self.fabric, self.group, self.issued, self.received = fabric, None, 0, {}
+
+    def receive(self, shape, dtype, kind):
+        host = np.zeros(shape, np.dtype(jnp.dtype(dtype)))
+        issued = self.fabric.issue(self.group, self.rank, kind, host.ctypes.data, host.size, str(host.dtype))
+        self.fabric.wait(self.group, lambda group: self.fabric.finished(group, issued))
+        return host
+
+    def join(self, init):
+        uid = UniqueId.from_buffer_copy(base64.b64decode(init["nccl_unique_id_b64"]))
+        self.rank = init["rank_offset"]
+        self.group = self.fabric.join(uid, self.rank, init["world_size"])
+        self.fabric.wait(self.group, self.fabric.opened)
+        self.receive((1,), "float32", "all_reduce")
+
+    def update(self, info):
+        for name, dtype, shape in zip(info["names"], info["dtype_names"], info["shapes"], strict=True):
+            self.received[name] = self.receive(tuple(shape), dtype, "broadcast")
+
+    def close(self):
+        if self.group is not None:
+            self.fabric.abort(self.group)
+
+
+def transport(kind, tmp_path, monkeypatch):
+    """The library path a push loads and the maker of a replica's worker on device `ordinal`: NCCL's
+    own on a GPU, else the `Fabric` emulating it on the host's devices, which the push's library
+    then is."""
+    if kind == "nccl":
+        return str(nccl_library()), lambda ordinal: Worker(nccl_library(), ordinal)
+    from dew.inference import nccl
+
+    fabric = Fabric()
+    monkeypatch.setattr(nccl, "_Library", lambda library, ordinal: EmulatedLibrary(fabric))
+    library = tmp_path / "libnccl.so.2"
+    library.write_bytes(b"")
+    return str(library), lambda ordinal: EmulatedWorker(fabric)
+
+
+TRANSPORTS = [pytest.param("nccl", marks=pytest.mark.gpu(reason="an NCCL group joins cuda devices")),
+              "emulated"]
+"""A push's transports: NCCL itself on GPUs, and its rendezvous and collectives emulated over host
+memory (`Fabric`), which every CPU run holds the push's protocol, ordering and delivery to."""
+
+
 def nccl_library():
     """The NCCL library JAX's CUDA wheels ship, which the push and a worker both load."""
     import importlib.util
@@ -634,13 +797,13 @@ class NCCLReplica(BaseHTTPRequestHandler):
         pass
 
 
-def nccl_replicas(ordinal, count, refuses=()):
-    """`count` replicas, each with a worker of its own on CUDA device `ordinal`."""
+def nccl_replicas(worker, ordinal, count, refuses=()):
+    """`count` replicas, each with a worker of its own on device `ordinal`, `worker(ordinal)`."""
     started = []
     for _ in range(count):
         server = ThreadingHTTPServer(("127.0.0.1", 0), NCCLReplica)
         server.seen, server.refuses = [], refuses
-        server.worker = Worker(nccl_library(), ordinal)
+        server.worker = worker(ordinal)
         server.url = f"http://127.0.0.1:{server.server_port}"
         threading.Thread(target=server.serve_forever, daemon=True).start()
         started.append(server)
@@ -659,24 +822,25 @@ def test_an_fp8_sources_push_has_a_collective_for_every_tensor_it_publishes():
     assert "float8_e4m3fn" in dtypes and dtypes <= _DTYPES.keys(), dtypes
 
 
-@pytest.mark.gpu(reason="an NCCL group joins two cuda devices")
 @pytest.mark.mesh(devices=2)
+@pytest.mark.parametrize("kind", TRANSPORTS)
 @pytest.mark.parametrize("fixture", [FIXTURE, FP8], ids=["bfloat16", "fp8"])
-def test_an_nccl_push_delivers_every_tensor_to_each_replica_on_another_gpu(fixture):
-    """A push over real NCCL groups from the trainer's GPU to two one-worker replicas on a second
-    GPU, each standing in for vLLM's weight-transfer endpoints with a worker that receives as
+def test_an_nccl_push_delivers_every_tensor_to_each_replica_on_another_device(fixture, kind, tmp_path,
+                                                                                 monkeypatch):
+    """A push over NCCL groups (`TRANSPORTS`) from the trainer's device to two one-worker replicas on
+    a second, each standing in for vLLM's weight-transfer endpoints with a worker that receives as
     vLLM's does, in a group of its own. Each replica is asked its world size and joins its group
     once, then pauses, starts the update, takes the listing of every tensor, finishes the update
     under the version, resets its prefix cache and resumes. Each group opens with the sender at
     rank 0 of two. The tensors go one after another to both groups, in chunks smaller than the
-    policy: every replica receives the whole listing after every replica started the update and
-    before any finished it, and each worker holds every listed tensor, the trainer's export of the
-    pushed policy, an FP8 source's E4M3 weights among them."""
-    engines = nccl_replicas(jax.devices()[1].local_hardware_id, 2)
+    policy and than its largest tensor: every replica receives the whole listing after every replica
+    started the update and before any finished it, and each worker holds every listed tensor, the
+    trainer's export of the pushed policy, an FP8 source's E4M3 weights among them."""
+    library, worker = transport(kind, tmp_path, monkeypatch)
+    engines = nccl_replicas(worker, jax.devices()[1].local_hardware_id, 2)
     source = Pretrained.load(fixture, dtype="float32")
     changed = doubled(source)
-    push = NCCLPush(source, tuple(server.url for server in engines), str(nccl_library()), chunk=4096,
-                    timeout=120)
+    push = NCCLPush(source, tuple(server.url for server in engines), library, chunk=4096, timeout=120)
     try:
         push(changed, 3)
     finally:
@@ -687,7 +851,7 @@ def test_an_nccl_push_delivers_every_tensor_to_each_replica_on_another_gpu(fixtu
     sent = jax.tree.map(lambda leaf: leaf.astype(jnp.bfloat16) if jnp.issubdtype(leaf.dtype, jnp.floating)
                         else leaf, changed)
     exported = source.export(sent)
-    assert len(exported) > 1 and sum(np.asarray(tensor).nbytes for tensor in exported.values()) > 4096
+    assert len(exported) > 1 and max(np.asarray(tensor).nbytes for tensor in exported.values()) > 4096
     listings = []
     for server in engines:
         assert [path for _, _, path, _, _ in server.seen] == [
@@ -720,17 +884,20 @@ def test_a_push_naming_a_replica_twice_or_no_library_is_refused_as_it_is_made(tm
         NCCLPush(None, engines, str(library if asked == "a replica twice" else tmp_path / "absent.so.2"))
 
 
-@pytest.mark.gpu(reason="an NCCL group opens on a cuda device")
-def test_a_push_whose_replica_refuses_its_join_aborts_its_group_rather_than_waiting():
+@pytest.mark.parametrize("kind", TRANSPORTS)
+def test_a_push_whose_replica_refuses_its_join_aborts_its_group_rather_than_waiting(kind, tmp_path,
+                                                                                    monkeypatch):
     """The sender opens its NCCL group while the replica's HTTP join runs. A replica that refuses
     the join never enters the rendezvous, so the push aborts the group and raises the refusal
     within seconds, where a blocking open waited on that peer for ever. The aborted group is not
     kept: a second push asks the replica to join a new one."""
     from dew.inference.rollouts import InfrastructureError
 
-    [server] = nccl_replicas(jax.devices()[0].local_hardware_id, 1, refuses=("/init_weight_transfer_engine",))
+    library, worker = transport(kind, tmp_path, monkeypatch)
+    [server] = nccl_replicas(worker, jax.devices()[0].local_hardware_id, 1,
+                             refuses=("/init_weight_transfer_engine",))
     source = Pretrained.load(FIXTURE, dtype="float32")
-    push = NCCLPush(source, (server.url,), str(nccl_library()), timeout=30)
+    push = NCCLPush(source, (server.url,), library, timeout=30)
     raised = []
 
     def attempts():
