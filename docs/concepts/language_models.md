@@ -55,7 +55,7 @@ model = CausalTransformer(vocab_size=tokenizer.vocab_size,
                           max_seq_len=128)
 objective = LMObjective(model, seq_len=64)
 lm_state = Trainer(objective, OptimConfig(learning_rate=3e-3), key=jax.random.key(0)).fit(
-    data, validation=held, steps=300, log_every=100, eval_every=300, metrics=(Perplexity(),))
+    data, validation=held, steps=100, log_every=50, eval_every=100, metrics=(Perplexity(),))
 continuation = generate(model, lm_state.variables, [tokenizer.encode("One day, Lily")],
                         max_new_tokens=40, key=jax.random.key(1),
                         sampling=Sampling(temperature=0.0))
@@ -63,13 +63,12 @@ print(tokenizer.decode(continuation.tokens[0]))
 ```
 
 ```text
-Training CausalTransformer from step 0 to 300: 147,904 parameters, on 1 × cpu, batch 16, float32
-step 100/300  loss 0.09353  ce 0.09353  perplexity 1.098  token_accuracy 97.2%  step_time_ms 29.97  samples_per_sec 533.9  accepted 100.0%  0:00:05 left
-step 200/300  loss 0.06881  ce 0.06881  perplexity 1.071  token_accuracy 97.7%  step_time_ms 34.53  samples_per_sec 463.4  accepted 100.0%  0:00:03 left
-step 300/300  loss 0.06941  ce 0.06941  perplexity 1.072  token_accuracy 97.8%  step_time_ms 36.10  samples_per_sec 443.3  accepted 100.0%
-eval val at step 300: perplexity 1.065 (32 records in 0.93 s)
-Trained 300 steps in 0:00:14: first step after 2.76 s, then 30.0 step/s
-72.9% of the wall time in steps, final loss 0.06941
+Training CausalTransformer from step 0 to 100: 147,904 parameters, on 1 × cpu, batch 16, float32
+step 50/100  loss 0.2531  ce 0.2531  perplexity 1.288  token_accuracy 95.6%  step_time_ms 32.71  samples_per_sec 489.1  accepted 100.0%  0:00:01 left
+step 100/100  loss 0.09353  ce 0.09353  perplexity 1.098  token_accuracy 97.2%  step_time_ms 27.76  samples_per_sec 576.4  accepted 100.0%
+eval val at step 100: perplexity 1.087   loss 0.08359 (40 records in 0.91 s)
+Trained 100 steps in 0:00:10: first step after 6.46 s, then 35.6 step/s
+27.2% of the wall time in steps, final loss 0.09353
 One day, Lily saw a big dog in the park. The dog want
 ```
 
@@ -434,22 +433,22 @@ masked_model = CausalTransformer(vocab_size=mask_id + 1,
                                  mlp_features=256, max_seq_len=64, causal=False)
 masked_objective = MaskedDiffusionObjective(masked_model, process, seq_len=64)
 masked_state = Trainer(masked_objective, OptimConfig(learning_rate=3e-3), key=jax.random.key(4)).fit(
-    masked_data, steps=1000, log_every=500)
+    masked_data, steps=300, log_every=150)
 drawn = process.generate(masked_model, masked_state.variables,
                          [tokenizer.encode("One day, Lily")], 24, key=jax.random.key(5))
 print(tokenizer.decode(drawn.tokens[0]))
 ```
 
 ```text
-Training CausalTransformer from step 0 to 1000: 147,968 parameters, on 1 × cpu, batch 16, float32
-step  500/1000  loss 0.6956  masked_accuracy 64.9%  masked_fraction 45.6%  step_time_ms 20.22  samples_per_sec 791.4  accepted 100.0%  0:00:11 left
-step 1000/1000  loss 0.7562  masked_accuracy 64.4%  masked_fraction 51.6%  step_time_ms 18.57  samples_per_sec 861.4  accepted 100.0%
-Trained 1000 steps in 0:00:20: first step after 1.16 s, then 51.7 step/s
-94.3% of the wall time in steps, final loss 0.7562
-One day, Lily. She da b tfte,dAt nigl
+Training CausalTransformer from step 0 to 300: 147,968 parameters, on 1 × cpu, batch 16, float32
+step 150/300  loss 2.317  masked_accuracy 32.2%  masked_fraction 47.3%  step_time_ms 29.55  samples_per_sec 541.4  accepted 100.0%  0:00:04 left
+step 300/300  loss 1.414  masked_accuracy 43.1%  masked_fraction 50.5%  step_time_ms 29.13  samples_per_sec 549.3  accepted 100.0%
+Trained 300 steps in 0:00:16: first step after 7.19 s, then 34.5 step/s
+54.7% of the wall time in steps, final loss 1.414
+One day, Lily tond �ara d Linted thed
 ```
 
-The loss is MDLM's negative ELBO per token. `process.generate` unmasks the 24 tokens after the prompt together, in MDLM's 128 reveal steps by default (`steps=`), then fills what is still masked with the model's most likely tokens, as MDLM's noise removal does, so a model this small draws fragments of its corpus rather than a sentence.
+The loss is MDLM's negative ELBO per token. `process.generate` unmasks the 24 tokens after the prompt together, in MDLM's 128 reveal steps by default (`steps=`), then fills what is still masked with the model's most likely tokens, as MDLM's noise removal does. A model this small, after 300 steps, draws broken fragments of words rather than a sentence, and a byte it draws that ends no character decodes as `�`.
 
 On TinyStories, with the GPT-2 tokenizer, a 4-layer, 256-wide model trained on 128-token rows at batch 64 took about five minutes for 4,000 steps on an L4. Its loss fell from 3.48 at step 1,000 to 2.78 at step 4,000, and validation perplexity reached 15.0. That perplexity is exp of the ELBO, an upper bound on the model's own perplexity, so it does not compare directly with an autoregressive decoder's. One draw of 48 tokens read:
 

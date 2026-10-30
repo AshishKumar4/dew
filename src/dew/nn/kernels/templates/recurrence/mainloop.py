@@ -1123,10 +1123,8 @@ def _sequence_walk(call: _Call, memory: _Operand, name: str, entering: tuple, wa
     (entered, entered_views), (chunks, views) = entering, walked
 
     def consumer(wg):
-        # Each role's columns and tiles at static offsets: Mosaic GPU slices a swizzled tile at static
-        # columns.
-        for role in range(walkers):
-            pl.when(wg == role)(functools.partial(walk, role, wg))
+        # Each role's columns and tiles at static offsets (`mosaic.per_role`).
+        mosaic.per_role(wg, walkers, walk)
 
     def walk(role, wg):
         walked_step = role_step = step(role)

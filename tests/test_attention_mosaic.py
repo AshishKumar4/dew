@@ -11,6 +11,8 @@ the device's, a site pinning one where it names a schedule (`tuning.pinned`)."""
 import contextlib
 import dataclasses
 import functools
+import gc
+import weakref
 
 import jax
 import jax.numpy as jnp
@@ -27,6 +29,7 @@ from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import (
     attention as template,
     attention_mosaic,
+    attention_mosaic_forward,
     attention_mosaic_program,
     attention_portable,
     attention_triton,
@@ -63,16 +66,17 @@ HOOK_FORMS = {"bfloat16": (jnp.bfloat16, False), "float16": (jnp.float16, False)
 FED = {"dkv_family": "wgmma.fed", "dkv_consumers": 2}
 """The dK/dV launch on an H100's layout whose consumers feed their rings, its two consumers splitting each
 slot's queries (`attention_mosaic_scores.split_queries`), as the derivation takes it."""
-BACKWARD_FORMS = ("default", "fused", "fused-keys-first", "accurate")
-"""The backward's forms (`_backward_form`): the fast in two launches and in one either way, and the
+BACKWARD_FORMS = ("default", "fused", "fused-keys-first", "fused-shared-keys", "accurate")
+"""The backward's forms (`_backward_form`): the fast in two launches and in one each way, and the
 accurate."""
 HOOKED_FORMS = ("default", "accurate")
 """The forms a hooked or dropping call takes: its fast form's one launch is a hookless call's alone."""
 
 
-FORM_WIDTHS = {"fused-keys-first": 64}
-"""The head width a backward form takes where its derivation's is narrower than the checks' 128: the
-keys-first one launch holds width 64 alone (its dK, dV and dQ tiles past a consumer's registers at 128)."""
+FORM_WIDTHS = {"fused-keys-first": 64, "fused-shared-keys": 128}
+"""The head width a backward form takes where the checks' own (128, a call form's 64) is not one it holds:
+the keys-first one launch holds width 64 alone (its dK, dV and dQ tiles past a consumer's registers at
+128), the shared keys' consumers 128 and wider (each its share of the columns whole swizzled rows)."""
 
 
 def _backward_form(form: str) -> tuple[bool, attention_mosaic.BackwardTiles]:
@@ -80,9 +84,13 @@ def _backward_form(form: str) -> tuple[bool, attention_mosaic.BackwardTiles]:
     beside a producer and the keys-first dK/dV launch two consumers sharing a key block (`FED`), the
     accurate form's sums in two column halves where it is `accurate-halves` (a width split's,
     `BackwardTiles.columns`); or the fast form's one launch (`fused`), queries first on the dQ launch's
-    layout, or keys first on `FED`'s (`fused-keys-first`), each consumer 64 of a slot's 128 queries."""
+    layout, or keys first on `FED`'s (`fused-keys-first`), each consumer 64 of a slot's 128 queries, or
+    queries first over keys its two consumers share on `FED`'s layout (`fused-shared-keys`)."""
     if form == "fused":
         return False, attention_mosaic.BackwardTiles(64, 64, 2, 1, fused=True)
+    if form == "fused-shared-keys":
+        return False, attention_mosaic.BackwardTiles(64, 64, 2, 2, fused=True, family=FED["dkv_family"],
+                                                     shared_keys=True)
     if form == "fused-keys-first":
         return False, attention_mosaic.BackwardTiles(128, 64, 2, 1, fused=True, **FED)
     columns = 2 if form == "accurate-halves" else 1
@@ -303,7 +311,8 @@ def _check_call_form(case: str, *, interpret: bool, backward: bool = False, form
     queries, keys = core_geometry(call)
     spans = template.spans(queries, keys, ROWS, **arguments(call))
     heads = (2, 1) if interpret else (4, 2)
-    _check_spans(case, spans, (ROWS, queries, *heads), interpret=interpret, backward=backward, form=form)
+    _check_spans(case, spans, (ROWS, queries, *heads), interpret=interpret, backward=backward, form=form,
+                 width=FORM_WIDTHS.get(form, 64))
 
 
 def _check_backward(call: str, shape, *, form: str | None, interpret: bool, keys: int | None = None,
@@ -989,6 +998,79 @@ def test_the_backward_is_on_par_under_every_score_hook_interpreted(hooks, form):
 
 
 @INTERPRETS
+def test_a_folded_forward_whose_products_pass_fp32_below_zero_rewalks_natural_interpreted():
+    """A full call whose raw products pass fp32's range below zero (a query 2^126 against keys -8, scale 1/4)
+    takes its query by the scale's power of two first, so its products stay finite (-2^127): its rows'
+    maxima pass the fold's reach, they walk again natural, and every equal logit weighs its values alike,
+    the output the values' mean, 1 (a power taken into the scale instead overflowed to -inf, which reads as
+    a row that saw no key: review of the FA3-gap batch's F3)."""
+    shape = (1, 64, 1, 16)
+    query = jnp.zeros(shape, jnp.bfloat16).at[..., 0].set(2.0 ** 126)
+    key = jnp.zeros(shape, jnp.bfloat16).at[..., 0].set(-8.0)
+    value = jnp.ones(shape, jnp.bfloat16)
+    spans = template.spans(shape[1], shape[1], shape[0])
+    with _device(interpret=True):
+        out = attention_mosaic.forward(query, key, value, spans, scale=0.25, interpret=True)
+    assert np.array_equal(np.asarray(out, np.float32), np.ones(shape, np.float32))
+
+
+@INTERPRETS
+def test_a_forward_kernel_built_for_its_facts_runs_each_calls_own_interpreted():
+    """The forward's kernel is built once for every call of its static facts (`_kernel_of`, row 2440): calls
+    alike but for their scale, past their queries' one power of two (0.2 and 0.24, both 2^-3 times a scale
+    left of 1.6 and 1.92), each run their own though their kernels' names agree (launched outside an
+    op's report, which names them by its launch, `report.named`), each on par (check 1) with the reference's
+    at its scale from float64."""
+    shape = SHAPES["interpreted"]
+    spans = template.spans(shape[1], shape[1], shape[0], causal=True)
+    for scale in (0.2, 0.24):
+        def ours(query, key, value, dout, scale=scale):
+            del dout
+            with _device(interpret=True):
+                return attention_mosaic_forward._plain_forward(
+                    query, key, value, spans, template.Hooks(), scale=scale, natural=attention_mosaic.NATURAL,
+                    tiles=FORM_TILES, interpret=True)
+
+        def reference(query, key, value, dout, scale=scale):
+            del dout
+            return template.reference(query, key, value, spans, scale=scale)
+
+        assert_as_exact(jax.jit(ours), jax.jit(reference), _drawn(shape, jnp.bfloat16),
+                        f"mosaic forward at scale {scale}", seeds=SEEDS)
+
+
+@INTERPRETS
+def test_a_forward_kernel_built_for_its_facts_holds_no_calls_arrays_interpreted():
+    """The forward's kernel, built once for every call of its static facts (`_kernel_of`, row 2440), holds
+    none of a call's arrays, its operands' nor its hooks' (an initial state's sums, which its key describes
+    by shape and dtype, `_described`): each is released once the call is. (A hook closing over an array is
+    built for its call alone, `_holdable`: JAX's own trace caches hold such a closure as they did before.)"""
+    shape = SHAPES["interpreted"]
+    spans = template.spans(shape[1], shape[1], shape[0], causal=True)
+    query, key, value, _ = _drawn(shape, jnp.bfloat16)(0)
+    hooks = template.Hooks(initial=template.sinks(jnp.linspace(-1.0, 1.0, shape[2]), shape[0], shape[1], 128))
+    refs = [weakref.ref(array) for array in (query, key, value, hooks.initial.m, hooks.initial.acc)]
+    with _device(interpret=True):
+        jax.block_until_ready(attention_mosaic.forward(query, key, value, spans, hooks, interpret=True))
+    del query, key, value, hooks
+    gc.collect()
+    assert [ref() is None for ref in refs] == [True] * len(refs)
+
+
+@INTERPRETS
+@pytest.mark.parametrize("call", ["causal", "full"])
+def test_a_backward_256_wide_shares_its_keys_and_is_on_par_interpreted(call):
+    """The fast backward 256 wide, whose consumers' own keys' whole dK and dV sums pass their registers, at
+    its derived tiles: one launch whose two consumers share a key block, each its share of the columns
+    (`BackwardTiles.shared_keys`), every gradient on par (check 1) with the reference's, under the
+    interpreter."""
+    with generation.assumed("sm90"):
+        op, ba = _backward_call((1, 160, 2, 1), 256, accurate=False)
+        assert op.derived(ba, generation.gpu_target()).shared_keys
+    _check_backward(call, SHAPES["interpreted"], form=None, interpret=True, width=256)
+
+
+@INTERPRETS
 @pytest.mark.parametrize("sinks", [False, True], ids=["plain", "sinks"])
 @pytest.mark.parametrize("call", ["causal", "full"])
 def test_a_training_forward_256_wide_past_the_folds_reach_is_on_par_interpreted(call, sinks):
@@ -1464,6 +1546,7 @@ def test_the_backward_compiles_spill_free_as_its_model_decides(generation_name, 
     (tests/kernel_compile.py): every launch within its shared memory, spilling nothing, and its register
     model's decision ptxas's (`mosaic_failures`, each launch's model `resources.register_model` at its own
     layout and consumers, `MosaicBackward._launch_registers`)."""
+    import kernel_compile
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
@@ -1489,6 +1572,8 @@ def test_the_backward_compiles_spill_free_as_its_model_decides(generation_name, 
             [KernelCase("backward", lambda: (backward, (query, key, key, query, shapes)), models)],
             generation_name)
     assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+    # Every launch's model names a kernel it compiled: a launch renamed past its model is compared with none.
+    assert set(models) <= kernel_compile.compiled_kernels(found[0]), (set(models), found[0].get("kernels"))
 
 
 def _residuals(shape) -> tuple:
@@ -1502,12 +1587,13 @@ def _residuals(shape) -> tuple:
 
 def _backward_models(op, ba, config) -> dict:
     """Each backward launch's register model by its kernel's name (`attention_dq`, `attention_dkv`, a width
-    share's `_columnsN`, the one launch's `attention_dkv_fused`), at its own layout and consumers
-    (`BackwardTiles.dkv`)."""
+    share's `_columnsN`, the one launch's `attention_dkv_fused`, or `attention_dkv_shared` over shared
+    keys), at its own layout and consumers (`BackwardTiles.dkv`)."""
     dq, dkv = op._launch_registers(ba, config)
     if config.fused:
         family = attention_mosaic_program.bundle_of(config, jnp.bfloat16)
-        return {"attention_dkv_fused": resources.register_model(family, config.consumers, dkv)}
+        name = "attention_dkv_shared" if config.shared_keys else "attention_dkv_fused"
+        return {name: resources.register_model(family, config.consumers, dkv)}
     models = {}
     for kind, tiles, registers in (("dq", config, dq), ("dkv", config.dkv, dkv)):
         family = attention_mosaic_program.bundle_of(tiles, jnp.bfloat16)

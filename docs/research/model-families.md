@@ -165,7 +165,7 @@ heads, `head_dim=128`, `rope_theta=1000000`, `tie_word_embeddings=true`,
 This family is already inside Dew's field set. Nothing new is needed.
 
 [skip] Already covered by `CausalTransformer`. The Qwen3-0.6B parity fixture
-belongs to the HfDecoders branch, not here.
+belongs to the HF decoders branch, not here.
 
 ### Qwen3-Next: GatedDeltaNet, and the shape of every later Qwen
 
@@ -363,7 +363,7 @@ Four facts a port must match exactly.
 `config.json` fetch returns 401. This is a real obstacle for CI.
 
 [borrow: reimplement the idea] Sandwich norms and `query_pre_attn_scalar` are
-two fields plus two norm calls in `DecoderBlock`. The HfDecoders branch owns
+two fields plus two norm calls in `DecoderBlock`. The HF decoders branch owns
 the Gemma 3 translation; this note only records that the gating means the parity
 fixture needs a token or a locally cached copy.
 
@@ -1013,7 +1013,7 @@ are comfortable, 11 to 14 GB needs care, over 14 GB needs the CPU backend.
 This column is about a forward pass, not about training. A parity test runs
 one forward with no optimizer state, so the budget is roughly weights plus
 activations. Training the same checkpoint needs several times that. Measured on
-this workstation by the HfDecoders branch on 2026-09-02: continued pretraining
+this workstation by the HF decoders branch on 2026-09-02: continued pretraining
 of `Qwen/Qwen3-0.6B`, whose weights are 1.5 GB in bf16, peaks at 11.82 GB for
 batch 1 at sequence 512 with AdamW, fp32 parameters and EMA, and does not fit
 at batch 4 (XLA asks for 14.67 GiB, cannot rematerialise below 11.54 GiB, and
