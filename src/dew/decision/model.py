@@ -136,7 +136,7 @@ class DecisionModel(HeadedModel):
             return _array(self.backbone.apply(
                 backbone, inputs.tokens, train=train, coordinates=laid, attention_key_runs=runs,
                 attention_key_positions=inputs.positions, method="hidden_states", conditioning=conditioning,
-                rngs=rngs)), spanned
+                rngs=rngs, **stepped)), spanned
         if inputs.slots is None:
             def read(module, tokens):
                 return module.hidden_states(tokens, train=train, coordinates=laid, conditioning=conditioning,

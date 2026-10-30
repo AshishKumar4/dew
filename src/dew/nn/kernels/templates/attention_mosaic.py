@@ -8,7 +8,7 @@ set (`legal`): no table, no sweep, no space ranked. A GPU nobody measured of a f
 
 import dataclasses
 import functools
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Hashable, Sequence
 from typing import ClassVar, Literal, overload
 
 import jax
@@ -219,13 +219,6 @@ class MosaicForward(_Mainloop[Tiles]):
         if reason := refused(query.dtype, query.shape[3], value.shape[3], hooks, backward=False,
                              family=bundle_of(config, query.dtype)):
             raise NotImplementedError(reason)
-        if not (config.natural_form or self._natural(query)) and config.relaunch_k is None:
-            # A config naming no rewalk tiles (a pin's) rewalks at the ones derived for it (row 2621).
-            ba = self.bind(query, key, value, start, end, query_ids, key_ids, score_params, output_params,
-                           initial, drop, residuals=residuals, interpret=interpret)
-            relaunched = self._relaunched(ba, config, generation.gpu_target())
-            assert relaunched is not None, config
-            config = relaunched
         spans = self.spans(start, end, query_ids, key_ids)
         form = {"scale": self.scale, "natural": self.natural, "tiles": config, "interpret": interpret}
         match residuals:
@@ -236,17 +229,24 @@ class MosaicForward(_Mainloop[Tiles]):
                 return _plain_forward(query, key, value, spans, hooks, rows=residuals is Kept.OUTPUT,
                                       **form), None
 
+    def completed(self, ba: tokamax.BoundArguments, config: Hashable) -> Hashable:
+        """A pin's or an explicit config's natural rewalk derived once where it names none (`_relaunched`,
+        rows 2621, 2647); the config as it is where it names its rewalk's tiles or none derives (a config of
+        another type, which `pinnable` refuses)."""
+        if (not isinstance(config, Tiles) or config.natural_form
+                or (config.relaunch_k, config.relaunch_consumers) != (None, None)):
+            return config
+        return self._relaunched(ba, config, generation.gpu_target()) or config
+
     def legal(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> bool:
-        """Its launch's (`_launch_legal`), and a fold's natural rewalk: at the tiles the config names (the
-        derivation's and a tuning neighbour's, `Tiles.relaunch`), their key tile dividing the config's and
-        their consumers at most its, holding too (row 2584); a config that names none (a pin's) at the tiles
-        derived for it, which its launch takes (`_relaunched`, row 2621)."""
+        """Its launch's (`_launch_legal`), and a fold's natural rewalk at the tiles the config names (the
+        derivation's, a tuning neighbour's, a pin's completed one, `completed`), their key tile dividing the
+        config's and their consumers at most its, holding too (row 2584); a fold's config that names none
+        rewalks at its own tiles, which must hold (rows 2621, 2647)."""
         if not self._launch_legal(ba, config, target):
             return False
         if config.natural_form or self._natural(ba.arguments["query"]):
             return True
-        if (config.relaunch_k, config.relaunch_consumers) == (None, None):
-            return self._relaunched(ba, config, target) is not None
         relaunch = config.relaunch
         return (config.block_k % relaunch.block_k == 0 and relaunch.consumers <= config.consumers
                 and self._launch_legal(ba, relaunch, target))
@@ -288,18 +288,28 @@ class MosaicForward(_Mainloop[Tiles]):
         most consumers that hold its own registers, each dividing the config's (et-fwdhooks3: at the fold's
         tiles it spilled 2 KB at width 64); a call that keeps its logits natural rewalks nothing. None where
         no tile holds the rewalk."""
-        config = dataclasses.replace(config, relaunch_k=None, relaunch_consumers=None)
+        config = dataclasses.replace(config, relaunch_k=None, relaunch_consumers=None, relaunch_columns=None)
         if self._natural(ba.arguments["query"]):
             return config
-        family = bundle_of(config, ba.arguments["query"].dtype)
-        relaunches = (dataclasses.replace(config, block_k=block, consumers=consumers, natural_form=True)
+        query, value = ba.arguments["query"], ba.arguments["value"]
+        family = bundle_of(config, query.dtype)
+        # Its value columns whole first, then halved while a block of them stays a whole column unit: a
+        # launch a block (row 2526: at width 256 no tile held the anchored rewalk's whole sums).
+        whole = _width(value.shape[-1], family, query.dtype)
+        unit = family.column_unit(query.dtype)
+        widths = [whole // 2 ** halved for halved in range(whole.bit_length())
+                  if whole % 2 ** halved == 0 and (whole // 2 ** halved) % unit == 0]
+        relaunches = (dataclasses.replace(config, block_k=block, consumers=consumers, natural_form=True,
+                                          columns=None if columns == whole else columns)
+                      for columns in widths
                       for consumers in range(config.consumers, 0, -1)
-                      for block in extents(family, ba.arguments["query"].dtype, config.block_k)
+                      for block in extents(family, query.dtype, config.block_k)
                       if config.block_k % block == 0)
         relaunch = next((tiles for tiles in relaunches if self._launch_legal(ba, tiles, target)), None)
         if relaunch is None:
             return None
-        return dataclasses.replace(config, relaunch_k=relaunch.block_k, relaunch_consumers=relaunch.consumers)
+        return dataclasses.replace(config, relaunch_k=relaunch.block_k, relaunch_consumers=relaunch.consumers,
+                                   relaunch_columns=relaunch.columns)
 
     def neighbours(self, ba: tokamax.BoundArguments, config: Tiles) -> Sequence[Tiles]:
         """`_Mainloop.neighbours`', each with its own natural rewalk's tiles (`_relaunched`), not the
@@ -321,6 +331,8 @@ class MosaicForward(_Mainloop[Tiles]):
         family = bundle_of(config, ba.arguments["query"].dtype)
         query, key, value = (ba.arguments[name] for name in ("query", "key", "value"))
         width, value_width = (_width(array.shape[-1], family, query.dtype) for array in (query, value))
+        # A launch of a block of the value columns (`Tiles.columns`) stages that block.
+        value_width = config.columns or value_width
         steps = _padded(query.shape[1], key.shape[1], config)[1] // config.block_k
         allocations = _forward_allocations(family, config, width, value_width, query.dtype,
                                            ba.arguments.get("residuals") is Kept.SPLIT,
@@ -332,7 +344,8 @@ class MosaicForward(_Mainloop[Tiles]):
         family = bundle_of(config, ba.arguments["query"].dtype)
         query, value = ba.arguments["query"], ba.arguments["value"]
         natural = config.natural_form or self._natural(ba.arguments["query"])
-        return _forward_registers(family, config, _width(value.shape[-1], family, query.dtype), query.dtype,
+        value_width = config.columns or _width(value.shape[-1], family, query.dtype)
+        return _forward_registers(family, config, value_width, query.dtype,
                                   ba.arguments.get("residuals") is Kept.SPLIT, natural=natural)
 
 
