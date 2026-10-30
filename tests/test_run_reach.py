@@ -19,7 +19,7 @@ from test_block_sft import assert_tree_equal
 from test_eval_harness import instance
 from test_lm_recipe import SEQ, export_tiny_decoder, recipe_args, write_token_files
 from test_run_option_matrix import recorded
-from test_run_options import decision, diffusion, lm, scalars, trained
+from test_run_options import TINY_LAYA, decision, diffusion, lm, scalars, trained
 
 from dew.checkpoints import Checkpoints
 from dew.cli.main import main
@@ -438,23 +438,71 @@ def test_a_run_recorded_before_its_stop_took_a_plateau_still_pauses(tmp_path):
     assert max(scalars(runs / "paused")) == 2
 
 
-def test_a_run_saved_with_its_earlier_dtype_knobs_reads_as_the_numerics_they_named(tmp_path):
-    """A run.json saved while its config named a loaded checkpoint's storage dtype
-    (`pretrained_param_dtype`) and the trainer a loss scale (`dynamic_scale`) reads back with that storage
-    as its numerics' parameter dtype, the loss scale derived from its compute dtype (`dew.config.
-    earlier_run`, ledger 2500); a configuration written today that names either is refused."""
-    from dew.config.lm import LMRunConfig
-
-    record = tmp_path / "record"
-    run = lm(tmp_path, drawn=False)
+def earlier(run: RunConfig, root: Path, **fields) -> Path:
+    """`run` saved as a main before numerics saved it: no `precision`, its trainer's `attention_form`, and
+    `fields` its config named then (`pretrained_param_dtype`, `param_dtype`, `trainer`'s `dynamic_scale`)."""
+    record = root / "earlier"
     run.save(str(record))
     written = json.loads((record / "run.json").read_text())
     trainer = {name: value for name, value in written["fields"]["trainer"].items() if name != "precision"}
-    written["fields"] = {**written["fields"], "pretrained_param_dtype": "bfloat16",
-                         "trainer": {**trainer, "dynamic_scale": True}}
+    trainer = {**trainer, "attention_form": "fast", **fields.pop("trainer", {})}
+    written["fields"] = {**written["fields"], **fields, "trainer": trainer}
     (record / "run.json").write_text(json.dumps(written))
-    loaded = RunConfig.load(str(record))
-    assert loaded.trainer.precision.dtypes.params == "bfloat16"
-    assert not hasattr(loaded.trainer, "dynamic_scale")
+    return record
+
+
+def test_a_run_saved_with_its_earlier_dtype_knobs_reads_as_the_numerics_they_named(tmp_path):
+    """A run.json saved while its config named a loaded checkpoint's storage dtype
+    (`pretrained_param_dtype`, a decision's `param_dtype`) reads back with it as its source's storage
+    alone (`SourceOptions.param_dtype`), the parameters it draws fresh in its numerics' float32, and a
+    loss scale it trained under (`dynamic_scale`) kept, whatever its compute (`dew.config.earlier_run`,
+    train 328's review of ledger 2500); a configuration written today that names the storage knobs is
+    refused."""
+    from dew.config.lm import LMRunConfig
+
+    pretrained = dataclasses.replace(lm(tmp_path, drawn=False), pretrained=str(TINY_LAYA))
+    loaded = RunConfig.load(str(earlier(pretrained, tmp_path, pretrained_param_dtype="bfloat16",
+                                        trainer={"dynamic_scale": True})))
+    assert loaded.source.param_dtype == "bfloat16" and loaded.trainer.precision.dtypes.params == "float32"
+    assert loaded.drawn_dtype() is None and loaded.trainer.dynamic_scale is True
     with pytest.raises(ValueError):
-        LMRunConfig.read(written)
+        LMRunConfig.read(json.loads((tmp_path / "earlier" / "run.json").read_text()))
+
+
+@pytest.mark.parametrize(("kind", "sourced", "computed"), [
+    ("lm", False, "float32"), ("lm", True, "bfloat16"), ("diffusion", False, "float32"),
+    ("decision", True, "float32")])
+def test_a_run_saved_before_numerics_computes_in_what_its_main_computed_in(tmp_path, kind, sourced, computed):
+    """A run.json saved before numerics, its model naming no dtype, reads back in the compute its main
+    trained in (`dew.config.earlier_run`, train 328's review of ledger 2500): a model drawn fresh in Flax's
+    float32, a loaded language model's or diffusion pipeline's in bfloat16, a decision run's backbone in
+    float32; and a model that names its dtype computes in it."""
+    run = {"lm": lm, "diffusion": diffusion, "decision": decision}[kind](tmp_path, drawn=False)
+    fields = {name: value for name, value in run.model.fields.items() if name != "dtype"}
+    run = dataclasses.replace(run, model=ModelConfig(run.model.name, fields),
+                              **({"pretrained": str(TINY_LAYA)} if sourced and kind == "lm" else {}))
+    assert RunConfig.load(str(earlier(run, tmp_path))).compute_dtype() == computed
+    stated = dataclasses.replace(run, model=ModelConfig(run.model.name, {**fields, "dtype": "float16"}))
+    assert RunConfig.load(str(earlier(stated, tmp_path / "stated"))).compute_dtype() == "float16"
+
+
+@pytest.mark.mesh(devices=8)
+def test_a_decision_runs_source_storage_leaves_its_head_and_adapter_in_float32(tmp_path):
+    """A decision run over a backbone whose head it draws, storing its source in bfloat16
+    (`SourceOptions.param_dtype`, as an earlier run's `param_dtype` reads back), keeps its frozen backbone
+    so and draws its head and adapter in float32, the numerics' parameters' (train 328's review of ledger
+    2500)."""
+    from test_decision_recipe import QWEN
+
+    from dew.batch import FROZEN
+    from dew.config import SourceOptions
+    from dew.lora import LoRA
+
+    run = dataclasses.replace(decision(tmp_path, drawn=False), pretrained=str(QWEN),
+                              source=SourceOptions(param_dtype="bfloat16"),
+                              lora=LoRA(rank=2, modules=("q_proj",)))
+    state, _ = trained(run, tmp_path, "stored")
+    for collection, dtype in (("params", jnp.float32), (FROZEN, jnp.bfloat16)):
+        stored = {leaf.dtype for leaf in jax.tree.leaves(state.variables[collection])
+                  if jnp.issubdtype(leaf.dtype, jnp.floating)}
+        assert stored == {jnp.dtype(dtype)}, collection
