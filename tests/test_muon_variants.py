@@ -26,19 +26,43 @@ def one_matrix(tree):
     return jax.tree.map(lambda _: optax.contrib.MuonDimensionNumbers(0, 1), tree)
 
 
-@pytest.mark.parametrize("optimizer", ["muon", "muonclip"])
-def test_per_head_muon_orthogonalizes_each_head_alone(optimizer):
+def test_per_head_muon_orthogonalizes_each_head_alone():
     """Per-head Muon (`per_head`, Kimi K3's, arXiv 2607.24653 2.5): a query projection's update, its
     output side two heads 16 wide, is optax's Muon of each head's block alone, `[embed, head_dim]`, its
-    momentum and its shape scaling the block's (check 1); under MuonClip too, whose per-head rescale of
-    the weights follows the update as it follows Muon's (`scale_by_qk_clip`)."""
+    momentum and its shape scaling the block's (check 1)."""
     def heads(path, value):
         # `[embed, heads * head_dim]` as `[embed, head_dim, heads]`: each head's block one matrix.
         return value.reshape(32, 2, 16).transpose(0, 2, 1) if path == QUERY else value
 
-    assert_updates_as(muon_solver(optimizer=optimizer, optimizer_opts={"per_head": HEADS}),
+    assert_updates_as(muon_solver(optimizer_opts={"per_head": HEADS}),
                       optax.contrib.muon(LR, muon_weight_dimension_numbers=one_matrix), decoder_params(),
-                      [QUERY], f"{optimizer} per head", flatten=heads)
+                      [QUERY], "Muon per head", flatten=heads)
+
+
+def test_per_head_muonclip_clips_each_head_after_its_own_update():
+    """MuonClip with per-head Muon: a step under sown maxima past the threshold stores each query and key
+    head's weights as the paper's QK-Clip of per-head Muon's step (tools/muonclip_reference.py), its
+    heads' rescale following the heads' own updates (check 1)."""
+    from test_optim import CLIP_SEEDS, clip_step, qk_stats, qk_tree
+
+    from tools.muonclip_reference import clip_qk_kernel, clip_scale
+
+    stats = qk_stats(values=[[200.0, 150.0, 10.0, 5.0], [10.0] * 4, [10.0] * 4])
+    per_head = {"*q_proj/kernel": 8, "*k_proj/kernel": 8}
+    applied = clip_step(muon_solver(optimizer="muonclip", optimizer_opts={"per_head": per_head}), stats)
+    muon = muon_solver(optimizer_opts={"per_head": per_head})
+
+    def paper(params, grads):
+        updates, _ = muon.update(grads, muon.init(params), params)
+        s_max = jnp.max(jnp.asarray(stats['layers_0']['self_attn']['max_logits'][0]), axis=0)
+        gamma = clip_scale(s_max, 100.0, guard=0.0)
+        return {'layers_0': {'self_attn': {projection: {'kernel': clip_qk_kernel(
+            params['layers_0']['self_attn'][projection]['kernel']
+            + updates['layers_0']['self_attn'][projection]['kernel'], gamma, 4)}
+            for projection in ('q_proj', 'k_proj')}}}
+
+    assert_as_exact(applied, paper, lambda seed: qk_tree(seed=seed), "MuonClip per head", seeds=CLIP_SEEDS,
+                    truth_fn=paper)
 
 
 def test_per_head_muon_orthogonalizes_each_latent_attention_head_alone():
@@ -125,6 +149,16 @@ def test_polar_express_orthogonalizes_as_its_paper_does(steps):
                     truth_fn=paper(np.float64))
 
 
+@pytest.mark.parametrize("steps", [3, 5])
+def test_polar_express_is_a_muon_preset(steps):
+    """`ns_coeffs="polar_express"` names Polar Express's coefficients to Muon: its update is optax's Muon
+    at those coefficients (`polar_express`), its momentum and shape scaling Muon's (check 1)."""
+    assert_updates_as(muon_solver(optimizer_opts={"ns_coeffs": "polar_express", "ns_steps": steps}),
+                      optax.contrib.muon(LR, ns_coeffs=polar_express(steps), ns_steps=steps),
+                      decoder_params(), [QUERY, ('params', 'layers_1', 'mlp', 'down_proj', 'kernel')],
+                      f"Polar Express {steps}")
+
+
 def neuron_normed(update: np.ndarray, moment: np.ndarray, beta2: float) -> tuple[np.ndarray, np.ndarray]:
     """NorMuon's `normuon_update` lines past the orthogonalization, as its code writes them, for a matrix
     laid `[reduction, output]` (each output neuron a column here, a row in its `[out, in]`): the neuron's
@@ -168,3 +202,20 @@ def test_normuon_normalizes_each_neuron_as_its_paper_does():
         return -LR * np.sqrt(max(1.0, fan_out / fan_in)) * normed
 
     assert_as_exact(dew, paper, draw, "NorMuon's update", seeds=UPDATE_SEEDS, truth_fn=paper)
+
+
+def test_normuon_normalizes_a_half_precision_update_in_float32():
+    """NorMuon's normalization of a float16 update works in float32 (`scale_by_neuron_norm`): a zero
+    update stays zero, its neurons' guard held, and a block whose squared sum is past float16's range
+    keeps its norm, finite."""
+    from dew.optim import scale_by_neuron_norm
+
+    norm = scale_by_neuron_norm(0.95)
+    zero = {"w": jnp.zeros((64, 32), jnp.float16)}
+    updated, _ = norm.update(zero, norm.init(zero))
+    assert not np.any(np.asarray(updated["w"]))
+    large = {"w": jnp.full((512, 512), 100.0, jnp.float16)}
+    updated, _ = norm.update(large, norm.init(large))
+    assert np.all(np.isfinite(np.asarray(updated["w"], np.float32)))
+    assert np.linalg.norm(np.asarray(updated["w"], np.float64)) == np.linalg.norm(
+        np.asarray(large["w"], np.float64))
