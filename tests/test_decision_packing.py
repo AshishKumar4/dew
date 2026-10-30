@@ -157,7 +157,12 @@ def at_offset(batch, window: int, row: int) -> dict:
     if "positions" in batch:
         filler = np.cumsum(before) - 1
         one["positions"] = np.where(mine, batch["positions"][window], np.where(before, filler, 0))[None]
-    return one | {"segments": (before + mine * (1 + before.any())).astype(np.int32)[None]}
+    # The row's document is 1 + whether a filler document stands before it, and its questions are its own:
+    # each question's row the row's new document, or its queries would read no document's tokens.
+    document = 1 + int(before.any())
+    if "question_rows" in batch:
+        one["question_rows"] = np.full((1, asked.size), document, np.int32)
+    return one | {"segments": (before + mine * document).astype(np.int32)[None]}
 
 
 def in_place(batch, placed: list[tuple[int, int]]) -> dict:
