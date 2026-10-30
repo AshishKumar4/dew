@@ -48,6 +48,9 @@ class Slots:
     def release(self, name: str) -> None:
         del name
 
+    def held(self) -> None:
+        """Every slot acquired: `emit_pipeline` hands the step its tiles whole."""
+
 
 @dataclasses.dataclass(frozen=True)
 class Pipeline:
