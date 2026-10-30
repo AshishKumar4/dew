@@ -127,8 +127,8 @@ It is the JAX release that requirement names, with fixes no JAX release has yet,
 - Mosaic GPU's TMA load coordinates reach ptxas as values it cannot fold: ptxas had miscompiled a literal coordinate into a misaligned copy, which stopped the attention training forward at head dim 128 on an H100 on an illegal instruction.
 - A persistent compilation cache entry is written aside and renamed into place, so a process reading the cache beside its writer, as packed jobs on one GPU do, sees the whole entry or none of it.
 - `JAX_EXPLAIN_CACHE_MISSES` explains, rather than fails, a Pallas Triton reduction, whose body's earlier traces are keyed by keyword.
-- Pallas's Mosaic GPU interpreter hands its own callbacks the host's NumPy arrays, with no transfer to the CPU device a call, which made each interpreted kernel check about twice as fast; `jax.experimental.io_callback` still hands its callback `jax.Array`s.
-- Pallas Mosaic GPU's snake traversal keeps a full power-of-two band as a shift and mask and selects its coordinates without branching, where a division by a runtime divisor had slowed every snake-ordered grid: a weight gradient's grouped GEMM ran 2.2x faster on an H100.
+- Pallas's Mosaic GPU interpreter hands its own callbacks the host's NumPy arrays, with no transfer to the CPU device a call; `jax.experimental.io_callback` still hands its callback `jax.Array`s.
+- Pallas Mosaic GPU's snake traversal keeps a full power-of-two band as a shift and mask and selects its coordinates without branching, where a division by a runtime divisor had slowed every snake-ordered grid.
 
 Each fix goes from the build once a JAX release has it, and Dew then returns to that release.
 
