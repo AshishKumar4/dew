@@ -638,13 +638,15 @@ def test_a_call_no_triton_config_fits_lowers_on_another_mainloop(generation_name
 
 
 def routed_call(form: str):
-    """A causal call on the default route ('auto') under `form` (`generation.chosen`), as a function of
-    `(query, key, value, sinks, dout)`: its output, then its gradients of the query, key and value."""
+    """A causal call on the default route ('auto') under `form` (`generation.chosen`), at JAX's own default
+    matmul precision, as a run's default numerics multiply (the suite's environment states 'highest'), as
+    a function of `(query, key, value, sinks, dout)`: its output, then its gradients of the query, key and
+    value."""
     from dew.nn.kernels.generation import chosen
 
     def run(query, key, value, sinks, dout):
         del sinks
-        with chosen(attention_form=form):
+        with chosen(attention_form=form), jax.default_matmul_precision("default"):
             out, pull = jax.vjp(lambda q, k, v: scaled_dot_product_attention(q, k, v, causal=True),
                                 query, key, value)
         return (out, *pull(dout))
