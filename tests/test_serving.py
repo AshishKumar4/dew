@@ -559,7 +559,7 @@ def test_a_servers_step_runs_one_executable_for_each_admission_size():
 
     step = dispatched(Program())
     sizes = [None, {"slots": np.zeros(2)}, None, {"slots": np.zeros(2)}, {"slots": np.zeros(4)}, None]
-    ran = [step("model", {}, 0, "placement", 1, "resident", "carried", admission, (), (), None)
+    ran = [step("model", {}, 0, "placement", 1, "resident", "carried", admission, (), (), None, "progress")
            for admission in sizes]
     assert asked == [None, 2, 4] and ran == sizes
 
