@@ -351,6 +351,19 @@ def mixed_terms(x, w):
     return {"rows": np.sqrt(np.square(sizes) @ np.square(MIX.astype(np.float64)))}
 
 
+def test_check_1_sizes_rows_by_their_terms_beside_an_output_held_as_none():
+    """Term sizing reads a truth's terms by the truth's own structure (`_term_leaves`): an output held as
+    None (a gradient of an input given as None, as `with_gradients` returns one) takes no leaf of the
+    terms, so the leaves after it are sized by their own, not their neighbour's."""
+    def holding_none(arm):
+        def run(x, w):
+            return {"before": arm(x, w)["rows"], "none": None, "after": arm(x, w)["rows"][:, :2]}
+        return run
+
+    assert_as_exact(holding_none(cancelling(split=True)), holding_none(cancelling(split=False)),
+                    cancelling_draw, "terms beside a None", seeds=16, terms=True)
+
+
 def test_check_1_sizes_a_row_that_cancels_behind_its_final_sum_by_the_sites_own_terms():
     """A site's own terms program (`assert_as_exact`'s `terms`): the traced terms are a leaf's final
     sums' alone, so rows that cancel before a further product (`mixed`, as an attention query that keeps

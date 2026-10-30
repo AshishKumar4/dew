@@ -1253,11 +1253,13 @@ class _Prepared:
     mine: list
 
 
-def _term_leaves(terms):
-    """A truth's terms tree (`float64_terms`) as its leaves on the host, a leaf no sum made None; or None."""
+def _term_leaves(terms, truth):
+    """A truth's terms tree (`float64_terms`) as its leaves on the host, one a leaf of `truth`, a leaf no
+    sum made None; or None. Read by the truth's own structure, so an output the truth holds as None (a
+    gradient of an input given as None) takes no leaf of the terms either."""
     if terms is None:
         return None
-    return jax.tree.leaves(jax.device_get(terms), is_leaf=lambda leaf: leaf is None)
+    return jax.tree.structure(truth).flatten_up_to(jax.device_get(terms))
 
 
 def _prepared(dew, truth, terms=None) -> _Prepared:
@@ -1272,7 +1274,7 @@ def _prepared(dew, truth, terms=None) -> _Prepared:
     for path, leaf, true in zip(paths, leaves, truths, strict=True):
         if np.shape(leaf) != np.shape(true):
             raise AssertionError(f"{path}: dew's shape is {np.shape(leaf)}, the truth's {np.shape(true)}")
-    held = _LaidTruths.of(truths, _term_leaves(terms))
+    held = _LaidTruths.of(truths, _term_leaves(terms, truth))
     return _Prepared(truth, paths, leaves, truths, held, _summaries(leaves, held))
 
 
@@ -1300,7 +1302,8 @@ def _evidence(prepared: _Prepared, reference, their_truth, *, shared: bool, thei
     # The truths' rows are read once a draw, for both arms where the two truths are the same values.
     same = all(their_true is true for their_true, true in zip(their_truths, truths, strict=True))
     theirs = _summaries([None if was else leaf for leaf, was in zip(references, recorded, strict=True)],
-                        prepared.held if same else _LaidTruths.of(their_truths, _term_leaves(their_terms)))
+                        prepared.held if same else _LaidTruths.of(their_truths,
+                                                                   _term_leaves(their_terms, their_truth)))
     row = []
     for path, leaf, their_leaf, true, their_true, was, summary, their_summary in zip(
             paths, leaves, references, truths, their_truths, recorded, prepared.mine, theirs, strict=True):
