@@ -2,9 +2,12 @@
 later main (row 2282).
 
 Each kind's run (tests/saved_run_kinds.py's `SAVED_KINDS`: tests/test_run_options.py's `KINDS`, its data
-as there, synthetic tickets, the repo's tiny image records and token files, the tiny Laya fixture, and an
-LM run over a tiny multimodal source) trains two steps from Python and keeps its last
-checkpoint; its run directory, the run.json and the checkpoint, is packed as an xz tarball, held as the
+as there, synthetic tickets, the repo's tiny image records and token files, the tiny Laya fixture, an LM
+run over a tiny multimodal source, and each serialized variant beside them) trains two steps from Python,
+or to its examples clock's bound, its own trainer otherwise, and keeps its last checkpoint; what
+the run serialized is recorded beside it (`evidence`: its parameters' and compute dtypes, its loss scale,
+the examples it consumed and the rung its step compiled at), which a later main's load and resume
+assert; its run directory, the run.json and the checkpoint, is packed as an xz tarball, held as the
 bytes of one recording (`run`) at `<commit>/<kind>.npz` under tests/fixtures/saved_runs
 (`fetched_fixtures.save`: committed where it is small, in the fetched store pinned by its digest where it
 is not, as a decision run's pretrained backbone and its optimizer state make it), and `source.json` names
@@ -64,6 +67,38 @@ def anonymous(run: Path, name: str, places: dict[str, str]) -> bytes:
     return packed.getvalue()
 
 
+EVIDENCE = 1
+"""The version of what a recorded generation's runs record they serialized (`evidence`), which its
+`source.json` states; a generation that states one holds every kind's."""
+
+
+def evidence(run, state, directory: Path) -> dict:
+    """What a saved run serialized, as a later main's load and resume read it back
+    (tests/test_saved_runs.py): its parameters' dtypes, its compute's as its run states it and as the
+    task loaded from it computes (`computed`), its dynamic loss scale and the finite steps it counted,
+    the examples it consumed, its last step, and the rung its step compiled at, the remat and the plan
+    it was admitted under (`StepCompiled`) but the plan's probes and kernels."""
+    import jax
+    from saved_run_kinds import computed
+
+    import dew
+    from dew.registry import objectives
+
+    lines = (directory / "tracking" / "records.jsonl").read_text().splitlines()
+    records = [json.loads(line) for line in lines]
+    compiled = [row["value"] for row in records if row["type"] == "StepCompiled"][-1]
+    plan = compiled["plan"] or {}
+    task = None if objectives[run.objective.name].saved_task is None else dew.pipeline(str(directory))
+    return {"step": int(state.step), "compute": run.compute_dtype(),
+            "task_compute": None if task is None else computed(task.model),
+            "params": sorted({str(leaf.dtype) for leaf in jax.tree.leaves(state.variables["params"])}),
+            "scale": None if state.scale is None else float(state.scale.scale),
+            "finite_steps": None if state.scale is None else int(state.scale.fin_steps),
+            "consumed": None if state.consumed is None else int(state.consumed), "remat": compiled["remat"],
+            "plan": {name: value for name, value in plan.items()
+                     if name not in ("kernels", "probes", "derived")}}
+
+
 def main() -> None:
     import os
 
@@ -80,28 +115,32 @@ def main() -> None:
     from fetched_fixtures import save
     from saved_run_kinds import SAVED_KINDS
 
-    from dew.config import TrainerConfig
-
     commit = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], check=True, capture_output=True,
                             text=True).stdout.strip()
     written = Path(CORPUS) / commit[:12]
     for kind, build in SAVED_KINDS.items():
         with tempfile.TemporaryDirectory() as scratch:
             root = Path(scratch)
-            # The run keeps its last step alone: a later main pins and resumes from the latest.
-            trainer = TrainerConfig(checkpoint_dir=str(root / "runs"), steps=2, log_every=1, eval_every=None,
-                                    checkpoint_every=None, multi_host=False, compilation_cache_dir=None)
-            run = dataclasses.replace(build(root, drawn=False), trainer=trainer)
+            # The run keeps its last step alone: a later main pins and resumes from the latest. Its own
+            # trainer, its clock and numerics, otherwise.
+            built = build(root, drawn=False)
+            steps = None if built.trainer.examples else 2
+            trainer = dataclasses.replace(built.trainer, checkpoint_dir=str(root / "runs"), steps=steps,
+                                          log_every=1, eval_every=None, checkpoint_every=None,
+                                          multi_host=False, compilation_cache_dir=None)
+            run = dataclasses.replace(built, trainer=trainer)
             # A source the repo holds is recorded by its path in the repo, which a later checkout reads
             # where it sits; a resume refuses another source (`RunConfig.check_resume`).
             if getattr(run, "pretrained", None) is not None:
                 held = (ROOT / run.pretrained).resolve()
                 run = dataclasses.replace(run, pretrained=held.relative_to(ROOT).as_posix())
-            run.prepare().train(kind)
+            state = run.prepare().train(kind)
+            seen = evidence(run, state, root / "runs" / kind)
             packed = anonymous(root / "runs" / kind, kind, {str(root): ".", str(ROOT): "."})
             save(written / f"{kind}.npz", {"run": np.frombuffer(packed, np.uint8)},
                  reference=f"Dew {commit[:12]}, tools/saved_runs_reference.py", license="MIT", root=args.root)
-    source = {"commit": commit, "kinds": sorted(SAVED_KINDS)}
+            (args.root / written / f"{kind}.evidence.json").write_text(json.dumps(seen, indent=1) + "\n")
+    source = {"commit": commit, "kinds": sorted(SAVED_KINDS), "evidence": EVIDENCE}
     (args.root / written / "source.json").write_text(json.dumps(source, indent=1) + "\n")
 
 

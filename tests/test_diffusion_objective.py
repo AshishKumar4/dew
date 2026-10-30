@@ -428,6 +428,19 @@ def test_guided_samples_use_bound_encoder_not_constructor_weights(conditional_mm
     np.testing.assert_array_equal(actual, expected)
 
 
+def test_an_image_task_walks_under_cfg_plus_plus_and_a_brownian_solver(conditional_mmdit):
+    """An image task built from the objective walks under CFG++ guidance and an SDE solver with a seed,
+    each a struct whose data leaf a lowered program describes (`jax.stages.ArgInfo`), which their checks
+    leave alone, as jit's tracers (train 329's review: CFG++ raised TypeError once programs lowered)."""
+    from dew.sampling import CFGPlusPlus, DPMSolverSDE
+
+    objective, variables, _, _ = conditional_mmdit
+    task = objective.build_task(variables)
+    images = task(["ab", "cd"], steps=2, guidance=CFGPlusPlus(0.6), key=0).host().images
+    seeded = task(["ab", "cd"], steps=2, solver=DPMSolverSDE(seed=3), key=0).host().images
+    assert np.isfinite(images).all() and np.isfinite(seeded).all()
+
+
 def test_each_example_draws_its_own_times_noise_and_dropout_on_every_layout():
     """A step's draws are each example's own (`Step.sample`): the batch whole on one device, its two
     halves pooled in an accumulation window, and the batch read in two microbatches give every
