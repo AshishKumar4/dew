@@ -29,19 +29,19 @@ from dew._coordination import agreed, agreed_same, broadcast_from_process_zero, 
 from dew.batch import Batch, Variables
 from dew.data.dataset import rows_of
 from dew.diffusion.presets import Preset
-from dew.diffusion.process import Denoiser, Process, aligned_conditions
+from dew.diffusion.process import Denoiser, Process
 from dew.diffusion.schedules.source import SourceGrid
-from dew.diffusion.transforms import broadcast_rates
 from dew.distributed.batches import row_origins, shared_host_fields, split_fields, with_host
 from dew.inputs import InputSpec
 from dew.nn.autoencoders import AutoEncoder
+from dew.nn.inspection import called_with
 from dew.nn.precision import at_least_fp32, weighted_total
 from dew.objectives.base import OMITTED, Aux, Omitted, Ratio, Shown, Step
 from dew.objectives.diffusion.objective import DiffusionObjective
 from dew.rl.advantage import group_normalised
 from dew.rl.surrogate import clipped_surrogate_terms
 from dew.sampling.flow import FlowSDE, FlowTrajectory, GaussianTransition
-from dew.sampling.guidance import APG, CFG, CFGPlusPlus, Walk
+from dew.sampling.guidance import CFG, Walk
 from dew.sampling.solvers import Euler, Solver
 
 from .sessions import ADVANTAGES_KEY, OLD_LOG_PROBS_KEY
@@ -250,20 +250,12 @@ class FlowGRPOObjective(DiffusionObjective):
             metrics["reward"] = jnp.asarray(batch[REWARDS_KEY], jnp.float32).mean()
         inspected = None
         if step.watched is not None:
-            # The policy's forward at each trajectory's first transition, as its walk calls it: over the
-            # conditional and unconditional halves where its guidance reads both (`Denoiser.raw_both`, on
-            # every step), else the conditional alone (`Denoiser.raw`, an autoguidance's main model too).
-            policy, x, t = self._policy(variables, batch), latents[:, 0], times[:, 0]
-            conditions = policy.conditions
-            if isinstance(self.guidance, (CFG, CFGPlusPlus, APG)):
-                assert policy.unconditional is not None, "a guided policy holds its unconditional conditions"
-                conditions = jax.tree.map(lambda given, null: jnp.concatenate(
-                    [given, jnp.broadcast_to(null, given.shape)], axis=0),
-                    conditions, aligned_conditions(conditions, policy.unconditional))
-                x, t = jnp.concatenate([x, x], axis=0), jnp.concatenate([t, t], axis=0)
-            c_in = self.process.prediction.get_input_scale(broadcast_rates(policy.schedule, t, x))
-            inspected = self.watched_forward(step, policy.model, policy.params, x * c_in,
-                                             policy.schedule.model_time(t), **conditions)
+            # The policy's forward at each trajectory's first transition, on the inputs its walk's own
+            # prediction hands the model there, whatever its guidance makes of them (a doubled batch, an
+            # autoguidance's main call), read off that call (`called_with`).
+            policy = self._policy(variables, batch)
+            args, kwargs = called_with(lambda: walk.at((), 0)(latents[:, 0], times[:, 0]))
+            inspected = self.watched_forward(step, policy.model, policy.params, *args, **kwargs)
         return Ratio(pg + self.beta * kl, mass), Aux(metrics, inspected=inspected)
 
     def _rows(self, batch: Batch) -> int:

@@ -12,7 +12,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import fnmatch
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 
 import flax.linen as nn
 import jax
@@ -94,3 +94,21 @@ class Watched:
 
     kinds: tuple[str, ...]
     histogram: bool = False
+
+
+def called_with(run: Callable[[], object]) -> tuple[tuple, dict]:
+    """The arguments the first module call of `run` received, its model's own, as its caller made them:
+    for a forward an objective runs inside a transform, the inputs `Objective.watched_forward` reruns it on.
+    `run`'s outputs are unused, so a compiled step keeps only what computes the arguments."""
+    calls: list[tuple[tuple, dict]] = []
+
+    def interceptor(next_fun, args, kwargs, context):
+        if not calls and context.method_name == "__call__":
+            calls.append((args, kwargs))
+        return next_fun(*args, **kwargs)
+
+    with nn.intercept_methods(interceptor):
+        run()
+    if not calls:
+        raise ValueError("the forward called no module")
+    return calls[0]
