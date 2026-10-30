@@ -68,15 +68,6 @@ class Requirement[C]:
     analysis: Callable[[C], Refusal | None] | None = None
     """An analysis whose own refusal the requirement reports (`analysed`), stamped with its row and kind."""
 
-    @classmethod
-    def analysed(cls, code: str, analysis: Callable[[C], Refusal | None], row: str,
-                 kind: str = 'capability') -> Requirement[C]:
-        """The requirement an analysis decides (a mainloop's reason it declines a pass,
-        `attention_route.MAINLOOP`): it holds where the analysis finds no refusal, and reports the
-        analysis's own refusal, its code and detail, under this requirement's row and kind."""
-        return cls(code, lambda case: analysis(case) is None,
-                   lambda case: str(analysis(case)), row, kind, analysis)
-
     def __post_init__(self) -> None:
         if not self.row:
             raise ValueError(f"requirement {self.code!r} names the row that tracks lifting it, or INHERENT")
@@ -93,6 +84,17 @@ class Requirement[C]:
             return None
         return Refusal(self.code, self.detail(case) if callable(self.detail) else self.detail,
                        self.row, self.kind)
+
+
+def analysed[C](code: str, analysis: Callable[[C], Refusal | None], row: str,
+                kind: str = 'capability') -> Requirement[C]:
+    """The requirement an analysis decides (a mainloop's reason it declines a pass,
+    `attention_route.MAINLOOP`): it holds where the analysis finds no refusal, and reports the analysis's
+    own refusal, its code and detail, under this requirement's row and kind. A function, not a method of
+    `Requirement`: its case in a return position would make the requirement's case invariant, and a
+    requirement of a protocol's case (`recurrence_chunk.Templated`) would no longer serve its ops'."""
+    return Requirement(code, lambda case: analysis(case) is None, lambda case: str(analysis(case)), row, kind,
+                       analysis)
 
 
 @dataclasses.dataclass(frozen=True)

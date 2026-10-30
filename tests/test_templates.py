@@ -11,7 +11,7 @@ import jax.numpy as jnp
 import pytest
 
 from dew.nn.kernels import generation, tuning
-from dew.nn.kernels.selection import Kernel, KernelRefused, Op, Refusal, Requirement, select
+from dew.nn.kernels.selection import Kernel, KernelRefused, Op, Refusal, Requirement, analysed, select
 from dew.nn.kernels.templates.base import Call, Template, Unfitted, call
 from dew.nn.kernels.tuning import Unpinnable
 
@@ -19,7 +19,7 @@ from dew.nn.kernels.tuning import Unpinnable
 def test_a_templates_refusal_reaches_the_forced_call_without_reconstruction():
     limit = Refusal("workspace", "the call exceeds the available workspace", "resource model")
     operation = Op("grouped_matmul", (
-        Kernel("native", (Requirement.analysed("workspace", lambda size: limit if size > 4 else None,
+        Kernel("native", (analysed("workspace", lambda size: limit if size > 4 else None,
                                                "resource model"),)),
         Kernel("plain", (), generic=True)))
     select(operation, 4, named="native")
