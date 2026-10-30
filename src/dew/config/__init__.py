@@ -57,6 +57,7 @@ from dew.data.pipeline import Dataset, ObjectiveData
 from dew.distributed.placement import Layout, MeshSpec
 from dew.files import write_atomically
 from dew.lora import LoRA
+from dew.nn.dex import DifferentialExtension
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import attention_route
 from dew.objectives.base import Effects, Loss, Metric, Objective
@@ -289,6 +290,18 @@ def _best_argument():
         str_from_instance=write)
 
 
+def _record_argument[T](kind: type[T]):
+    """A record's command-line form, its JSON (`to_record`'s, read back by `from_record`), or None."""
+    return tyro.constructors.PrimitiveConstructorSpec(
+        nargs=1,
+        metavar="JSON|None",
+        instance_from_str=lambda given: (None if given[0] == "None"
+                                         else from_record(kind, json.loads(given[0]))),
+        is_instance=lambda value: value is None or isinstance(value, kind),
+        str_from_instance=lambda value: ["None" if value is None else json.dumps(to_record(value, kind))],
+    )
+
+
 def _keep_argument():
     return tyro.constructors.PrimitiveConstructorSpec(
         nargs=1,
@@ -341,19 +354,23 @@ class SourceOptions:
     block_bidirectional, each of a row's blocks read whole, which a run's rows then lie in
     (`Pretrained.load`'s `modeling_overrides`); None the checkpoint's own:
     `--source.attention full_attention block_bidirectional`."""
+    dex: Annotated[DifferentialExtension | None, _record_argument(DifferentialExtension)] = None
+    """DEX's differential on chosen heads (`dew.nn.dex`, `Pretrained.load`'s `dex`), its record as
+    JSON: `--source.dex '{"layers": [[0, [1, 3]], [5, [0, 2]]], "anneal_steps": 1000}'`, its
+    `trains` the paper's recipe unless "all"; None for none."""
 
     def overrides(self) -> Mapping[str, object] | None:
         """The `modeling_overrides` these options state, None where they state none."""
         return None if self.attention is None else {"attention": dict(self.attention)}
 
-    def keywords(self) -> "SourceOptionsKeywords":
+    def keywords(self) -> "SourceBuild":
         """`Pretrained.load`'s keywords for what a run builds of its source. With `weights=False` beside
         them a load is the run's base as the run builds it, its config and its variables' shapes, read
         from the source's config and safetensors headers alone, no weight downloaded (a release of
         PyTorch pickles alone, whose shapes no header states, is read whole): a check that a base
         loads under a run's options, on a disk too small for its weights."""
         return {"text_only": self.text_only, "prediction_depths": self.prediction_depths,
-                "modeling_overrides": self.overrides()}
+                "modeling_overrides": self.overrides(), "dex": self.dex}
 
 
 class SourcePlacement(TypedDict, total=False):
@@ -366,13 +383,18 @@ class SourcePlacement(TypedDict, total=False):
     layout: Layout
 
 
-class SourceOptionsKeywords(SourcePlacement, total=False):
-    """`Pretrained.load`'s keywords for a run's source: what it builds of it (`SourceOptions`) and
-    where it reads it (`SourcePlacement`, `RunConfig.source_keywords`)."""
+class SourceBuild(TypedDict, total=False):
+    """`Pretrained.load`'s keywords for what a run builds of its source (`SourceOptions.keywords`)."""
 
     text_only: bool
     prediction_depths: int | None
     modeling_overrides: Mapping[str, object] | None
+    dex: DifferentialExtension | None
+
+
+class SourceOptionsKeywords(SourcePlacement, SourceBuild, total=False):
+    """`Pretrained.load`'s keywords for a run's source: what it builds of it (`SourceOptions`) and
+    where it reads it (`SourcePlacement`, `RunConfig.source_keywords`)."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1613,7 +1635,7 @@ class RunConfig:
         assert target is not None
         mesh = self.trainer.mesh.build(compile_only_gpus(target.generation, target.devices, target.capacity))
         with generation.chosen(attention_form=self.trainer.attention_form):
-            return target.compiled(self.built(objective, mesh, rollout), dataset, steps,
+            return target.compiled(self.built(objective, mesh, rollout, links=target.links), dataset, steps,
                                    self.trainer.examples if steps is None else None)
 
     def built[LossT, EffectsT](self, objective: Objective[LossT, EffectsT],

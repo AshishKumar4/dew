@@ -30,7 +30,7 @@ from typing_extensions import get_protocol_members
 
 from dew import _records
 from dew._records import JSON
-from dew.batch import Coordinates, coordinates
+from dew.batch import POSITIONS_FIELD, VALIDITY_FIELD, Coordinates, coordinates
 from dew.data.text import HFTokenizer, Offsets, Tokenizer
 from dew.data.tokens import share_tokens
 from dew.decision.questions import Choice, Noul, Question, Score, kind_of
@@ -446,6 +446,22 @@ class Layout:
             return "unfit"
         return "options_alike" if row.options_alike else None
 
+    def shortest_row(self, encoder: Tokenizer, specials: Specials) -> tuple[int, int]:
+        """The tokens of the row `bounds` counts by, one one-option question about an empty state laid
+        out with room to spare, and its context's (its schema where the row reads it there): no window
+        shorter, nor a context, holds its bounds."""
+        return self._laid_size(encoder, specials, 1, empty=self.state(encoder, specials, ""))
+
+    def _laid_size(self, encoder: Tokenizer, specials: Specials, *options: int,
+                   empty: Sequence[int]) -> tuple[int, int]:
+        """A row's tokens and its context's, of a question of each of `options` one-option questions about
+        an empty state, its tokens `empty`, laid out with room to spare (`bounds`)."""
+        roomy = dataclasses.replace(self, max_len=1 << 30)
+        asked = {f"q{index}": Choice("x", [str(option) for option in range(count)])
+                 for index, count in enumerate(options)}
+        laid = roomy.rows(encoder, specials, "", asked, tokens=empty)
+        return sum(len(row.tokens) for row in laid), sum(len(row.context or ()) for row in laid)
+
     def row_questions(self, questions: int) -> int:
         """The most questions a row of this layout holds where an example asks `questions`: all of them,
         a row an example."""
@@ -482,11 +498,7 @@ class Layout:
                              "context's length; give its context_length")
 
         def size(*options: int) -> tuple[int, int]:
-            # A row's tokens and its context's, of a one-option question about an empty state for each.
-            asked = {f"q{index}": Choice("x", [str(option) for option in range(count)])
-                     for index, count in enumerate(options)}
-            laid = roomy.rows(encoder, specials, "", asked, tokens=empty)
-            return sum(len(row.tokens) for row in laid), sum(len(row.context or ()) for row in laid)
+            return self._laid_size(encoder, specials, *options, empty=empty)
 
         row, held = size(1)
         if row > self.max_len:
@@ -1837,6 +1849,9 @@ class DecisionInputs:
     spans_in_context: bool = struct.field(pytree_node=False, default=False)
     """Whether the questions' spans are positions in `context`, which holds the schema
     (`Schema.stream`), rather than in `tokens`."""
+    whole_blocks: bool = struct.field(pytree_node=False, default=False)
+    """Whether each row's one block is the whole row (`QuestionLayout.split` 'whole'), which a backbone
+    reads as non-causal attention by rows (`AttentionMetadata.whole_blocks`)."""
 
     @property
     def valid(self) -> jnp.ndarray:
@@ -1885,13 +1900,13 @@ class DecisionInputs:
         blocked = rows[0].blocks is not None
         if any((row.blocks is not None) != blocked for row in rows):
             raise ValueError("one batch reads its rows one way, in blocks or in order")
-        fields = ({"positions": [row.positions or () for row in rows],
+        fields = ({POSITIONS_FIELD: [row.positions or () for row in rows],
                    "slots": [row.slots or () for row in rows]} if parallel else {})
         if blocked:
             fields["blocks"] = [row.blocks or () for row in rows]
         tokens, padded = pad_token_rows([row.tokens for row in rows], pad_id=pad, padding_side="right",
                                         fields=fields or None)
-        valid = padded.get("attention_mask", np.ones(tokens.shape, bool))
+        valid = padded.get(VALIDITY_FIELD, np.ones(tokens.shape, bool))
         count = max(questions or 1, *(len(row.questions) for row in rows))
         width = max(options or 1, *(len(laid.options) for row in rows for laid in row.questions))
         labelled = labelled_rows(rows)
@@ -1920,7 +1935,7 @@ class DecisionInputs:
             lengths = jnp.asarray([len(tokens) for tokens in held], jnp.int32)
         return cls(tokens=jnp.asarray(tokens), segments=jnp.asarray(valid, jnp.int32),
                    **along,
-                   positions=jnp.asarray(padded["positions"], jnp.int32) if parallel else None,
+                   positions=jnp.asarray(padded[POSITIONS_FIELD], jnp.int32) if parallel else None,
                    slots=jnp.asarray(padded["slots"], jnp.int32) if parallel else None,
                    option_slots=slots_of, slotted=slotted,
                    context=context, context_lengths=lengths,

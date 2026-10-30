@@ -48,6 +48,7 @@ from dew.batch import EXAMPLE_ROWS, FROZEN, VALID_ROWS, Batch, PathFilter, Varia
 from dew.nn import categorical
 from dew.nn.kernels.options import Held, Option, compiler_options
 from dew.nn.precision import accumulated, at_least_fp32, compensated_sum, weighted_total
+from dew.nn.progress import Progress, stepping
 from dew.nn.protocols import HiddenStates, ProjectsParameters
 from dew.nn.sharding import rows_taken
 
@@ -1151,7 +1152,8 @@ class Objective(ABC, Generic[Loss, Effects]):
             batch = {name: value for name, value in batch.items() if name != EXAMPLE_ROWS}
         witness = Witness() if step.record and not validation else None
         step = step if witness is None else replace(step, witness=witness)
-        loss = (self.validation_loss if validation else self.loss)(variables, batch, step)
+        with stepping(Progress(step.committed)):
+            loss = (self.validation_loss if validation else self.loss)(variables, batch, step)
         if _has_aux(loss):
             stats, aux = loss
         else:
@@ -1343,7 +1345,15 @@ class Objective(ABC, Generic[Loss, Effects]):
         """
         weights = self.evaluation_variables(variables, step)
         if loss and evaluate and self._validation_scores is not None:
-            report = self.program('report', self._validation_scores)
+            scores = self._validation_scores
+
+            def progressed(weights: Variables, batch: Batch, step: Step):
+                # The loss reads the run's progress as `_loss`'s does, so a metric scored beside it
+                # leaves it as it is.
+                with stepping(Progress(step.committed)):
+                    return scores(weights, batch, step)
+
+            report = self.program('report', progressed)
             return report(weights, batch, replace(step, training=False))
         statistics = self._validation_loss(weights, batch, step) if loss else None
         return statistics, self.evaluate(variables, batch, step) if evaluate else None

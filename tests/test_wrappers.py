@@ -249,22 +249,27 @@ def test_a_text_only_load_is_the_wrappers_language_model_as_its_text_checkpoint(
 
 
 def test_the_pipeline_selects_what_a_source_loads(tmp_path):
-    """`dew.pipeline` takes a source's selection as `Pretrained.load` does (ledger 2248): `text_only`
-    builds Qwen3.5's text task over its language model alone, and `prediction_depths=0` DeepSeek V3's
-    without its prediction depth; a run directory's record selects its own, so either is refused there."""
+    """`dew.pipeline` takes what a source builds as a run's `--source` options state it (`SourceOptions`,
+    ledgers 2248 and 2412): text-only builds Qwen3.5's text task over its language model alone, no
+    prediction depth DeepSeek V3's without one, and an attention override reads each block of a row
+    whole; a run directory's record selects its own, so options are refused there."""
+    from dew.config import SourceOptions
     from dew.inference import pipeline
     from dew.nn.backbones.causal_transformer import CausalTransformer
 
     blind = _without(FIXTURES / "qwen35-native-tiny", tmp_path / "blind",
                      lambda name: name.startswith("model.visual."))
-    text = pipeline(str(blind), text_only=True)
+    text = pipeline(str(blind), options=SourceOptions(text_only=True))
     assert isinstance(text.model, CausalTransformer)
-    trimmed = pipeline(str(FIXTURES / "deepseek-v3-tiny"), prediction_depths=0)
+    trimmed = pipeline(str(FIXTURES / "deepseek-v3-tiny"), options=SourceOptions(prediction_depths=0))
     assert trimmed.model.num_nextn_predict_layers == 0
+    blocked = pipeline(str(blind), options=SourceOptions(
+        text_only=True, attention={"full_attention": "block_bidirectional"}))
+    assert blocked.model != text.model
     (tmp_path / "run").mkdir()
     (tmp_path / "run" / "run.json").write_text("{}")
     with pytest.raises(ValueError):
-        pipeline(str(tmp_path / "run"), text_only=True)
+        pipeline(str(tmp_path / "run"), options=SourceOptions(text_only=True))
 
 
 def test_a_text_only_load_takes_a_checkpoint_without_its_prediction_depth():
@@ -489,3 +494,163 @@ def test_a_wrapper_missing_a_tensor_of_a_component_it_builds_is_refused(tmp_path
     save_file(kept, target / "model.safetensors", metadata={"format": "pt"})
     with pytest.raises(ValueError):
         Pretrained.load(target, dtype="float32", attention_impl="reference")
+
+
+def quantized_fp8(directory, prefix: str, modules_to_not_convert: list[str]):
+    """The checkpoint at `directory` with every 2-D weight under `prefix` whose sides divide 16 stored
+    in FP8 blocks of 16 (`quantize_fp8_blocks`, DeepSeek's `weight_scale_inv` partners), its
+    quantization_config naming `modules_to_not_convert`."""
+    from dew.interop.codecs import SCALE_SUFFIX, quantize_fp8_blocks
+    from dew.interop.safetensors_io import read_file, write_file
+
+    tensors, _ = read_file(directory / "model.safetensors")
+    stored = dict(tensors)
+    for name, tensor in tensors.items():
+        if (name.startswith(prefix) and name.endswith(".weight") and np.ndim(tensor) == 2
+                and not any(name.startswith(f"{module}.") for module in modules_to_not_convert)
+                and tensor.shape[0] % 16 == 0 and tensor.shape[1] % 16 == 0):
+            stored[name], stored[name + SCALE_SUFFIX] = quantize_fp8_blocks(np.asarray(tensor, np.float32),
+                                                                            (16, 16))
+    write_file(stored, directory / "model.safetensors", {"format": "pt"})
+    config = json.loads((directory / "config.json").read_text())
+    config["quantization_config"] = {"quant_method": "fp8", "fmt": "e4m3", "activation_scheme": "dynamic",
+                                     "weight_block_size": [16, 16],
+                                     "modules_to_not_convert": modules_to_not_convert}
+    (directory / "config.json").write_text(json.dumps(config))
+    return directory
+
+
+def test_a_quantized_wrapper_loads_text_only_as_its_quantized_text_checkpoint(tmp_path):
+    """A Qwen3.5 wrapper whose language model is stored in FP8 blocks, one projection and the tower left
+    unconverted by name, loads `text_only` as the quantized text checkpoint does: its module selection
+    renamed with its tensors, the tower's dropped, its variables that checkpoint's leaf for leaf."""
+    import shutil
+
+    from dew.interop import Pretrained
+
+    source = FIXTURES / "qwen35-native-tiny"
+    kept = "model.language_model.layers.0.mlp.down_proj"
+    wrapper = quantized_fp8(Path(shutil.copytree(source, tmp_path / "wrapper")), "model.language_model.",
+                            [kept, "model.visual"])
+    plain = Pretrained.load(source, dtype="float32", attention_impl="reference", text_only=True)
+    plain.save(tmp_path / "text")
+    text = quantized_fp8(tmp_path / "text", "model.", ["model.layers.0.mlp.down_proj"])
+    taken = Pretrained.load(wrapper, dtype="float32", attention_impl="reference", text_only=True)
+    expected = Pretrained.load(text, dtype="float32", attention_impl="reference")
+    assert taken.model == expected.model
+    jax.tree.map(np.testing.assert_array_equal, taken.variables, expected.variables)
+
+
+def modelopt_fp8(directory, layers: list[str], *, table: dict | None = None, nested: bool = False):
+    """The checkpoint at `directory` with the weight of each module of `layers` stored as ModelOpt's FP8
+    exporter writes it (E4M3 codes under one float32 `weight_scale`, beside a static `input_scale`), as
+    a MIXED_PRECISION table naming those modules, or `table` where given; declared on its text_config
+    where `nested`."""
+    import ml_dtypes
+
+    from dew.interop.safetensors_io import read_file, write_file
+
+    tensors, _ = read_file(directory / "model.safetensors")
+    stored = dict(tensors)
+    for module in layers:
+        weight = np.asarray(tensors[f"{module}.weight"], np.float32)
+        scale = np.float32(np.abs(weight).max() / 448)
+        stored[f"{module}.weight"] = (weight / scale).astype(ml_dtypes.float8_e4m3fn)
+        stored[f"{module}.weight_scale"] = np.asarray(scale, np.float32)
+        stored[f"{module}.input_scale"] = np.asarray(0.05, np.float32)
+    write_file(stored, directory / "model.safetensors", {"format": "pt"})
+    config = json.loads((directory / "config.json").read_text())
+    producer = {"name": "modelopt", "version": "0.47.0"}
+    record = {"quant_method": "modelopt", "quant_algo": "MIXED_PRECISION", "kv_cache_quant_algo": None,
+              "producer": producer,
+              "quantized_layers": table or {module: {"quant_algo": "FP8"} for module in layers}}
+    (config["text_config"] if nested else config)["quantization_config"] = record
+    (directory / "config.json").write_text(json.dumps(config))
+    return directory
+
+
+TEXT_FP8 = ["model.language_model.layers.0.mlp.down_proj", "lm_head"]
+"""The wrapper's language-model modules the ModelOpt scenarios store in FP8."""
+
+
+@pytest.mark.parametrize("table", ["modules", "container", "nested head", "nested", "tower alone"])
+def test_a_modelopt_mixed_wrapper_loads_text_only_as_its_text_checkpoint_head_and_all(table, tmp_path):
+    """A Qwen3.5 wrapper whose ModelOpt per-layer table puts a projection, the head and a tower's layer in
+    FP8 loads `text_only` as the text checkpoint quantized alike does: the table keyed by the text
+    family's names, the tower's entry dropped, the head's scales read beside it, its variables that
+    checkpoint's leaf for leaf and its logits that checkpoint's. So does a table that names a layer's
+    projections by their container (`model.language_model.layers.0.mlp`), each a module of the text
+    checkpoint's table, one whose head the wrapper stores under its language model
+    (`model.language_model.lm_head`) beside a longer key under the container, one declared on the
+    wrapper's text_config, and one whose tower's layer alone is quantized, whose language model is the
+    dense text checkpoint."""
+    import shutil
+
+    from dew.interop import Pretrained
+
+    source = FIXTURES / "qwen35-native-tiny"
+    tower = "model.visual.blocks.0.attn.qkv"
+    fp8 = {"quant_algo": "FP8"}
+    mlp = [f"model.language_model.layers.0.mlp.{name}_proj" for name in ("gate", "up", "down")]
+    texts = {"modules": TEXT_FP8, "container": [*mlp, "lm_head"], "nested head": [*mlp, "lm_head"],
+             "nested": TEXT_FP8, "tower alone": []}[table]
+    tables = {"container": {"model.language_model.layers.0.mlp": fp8, "lm_head": fp8, tower: fp8},
+              "nested head": {"model.language_model.layers.0.mlp": fp8, mlp[2]: fp8,
+                              "model.language_model.lm_head": fp8, tower: fp8}}
+    wrapper = modelopt_fp8(Path(shutil.copytree(source, tmp_path / "wrapper")), [*texts, tower],
+                           table=tables.get(table), nested=table == "nested")
+    if table == "nested head":
+        from dew.interop.safetensors_io import read_file, write_file
+
+        stored, _ = read_file(wrapper / "model.safetensors")
+        write_file({f"model.language_model.{name}" if name.startswith("lm_head.") else name: value
+                    for name, value in stored.items()}, wrapper / "model.safetensors", {"format": "pt"})
+    plain = Pretrained.load(source, dtype="float32", attention_impl="reference", text_only=True)
+    plain.save(tmp_path / "text")
+    renamed = [module.replace("model.language_model.", "model.") for module in texts]
+    text = modelopt_fp8(tmp_path / "text", renamed) if renamed else tmp_path / "text"
+    load = {"dtype": "float32", "attention_impl": "reference"}
+    taken, expected = Pretrained.load(wrapper, text_only=True, **load), Pretrained.load(text, **load)
+    # Each load binds its input quantization in a class of its own, so the two compute alike, not one class.
+    jax.tree.map(np.testing.assert_array_equal, taken.variables, expected.variables)
+    ids = np.load(source / "input_ids.npy")[:1]
+    np.testing.assert_array_equal(np.asarray(taken.model.apply(taken.variables, ids)),
+                                  np.asarray(expected.model.apply(expected.variables, ids)))
+
+
+def test_a_quantized_wrappers_selections_name_its_text_checkpoints_modules(tmp_path):
+    """A wrapper's compressed-tensors groups and ignore list, by name and by a pattern over the wrapper's
+    own modules (`re:`), read `text_only` under its text checkpoint's names: a pattern resolved into the
+    language model's modules it matches, the tower's matches dropped, a class target kept as it is."""
+    from dew.interop.hf_decoders import language_model_quantization, translate_wrapper_config
+    from dew.interop.safetensors_io import read_file
+
+    source = FIXTURES / "qwen35-native-tiny"
+    config = json.loads((source / "config.json").read_text())
+    names, _ = read_file(source / "model.safetensors")
+    quantization = {"quant_method": "compressed-tensors", "format": "float-quantized",
+                    "config_groups": {"fp8": {
+                        "targets": ["Linear", "re:.*layers\\.0\\.mlp\\.(up|down)_proj$"]}},
+                    "ignore": ["lm_head", "re:.*visual\\.blocks\\.0\\..*", "model.language_model.layers.1"]}
+    projected = language_model_quantization({**config, "quantization_config": quantization},
+                                            translate_wrapper_config(config), lambda: names.keys())
+    assert projected["config_groups"]["fp8"]["targets"] == [
+        "Linear", "model.layers.0.mlp.down_proj", "model.layers.0.mlp.up_proj"]
+    assert projected["ignore"] == ["lm_head", "model.layers.1"]
+
+
+def test_every_codecs_tensors_beside_a_weight_route_as_the_weight_does():
+    """Each tensor a codec stores beside a weight (`codecs.SIDECARS`: compressed-tensors' packed codes,
+    shape, scales, zero points and act order, ModelOpt's and GPTQ's) routes where its weight does, the
+    head's beside the head and a layer's beside its language model's module, a tower's to the tower."""
+    from dew.interop.codecs import SIDECARS
+    from dew.interop.hf_decoders import translate_wrapper_config, wrapper_route
+
+    config = json.loads((FIXTURES / "qwen35-native-tiny" / "config.json").read_text())
+    record = translate_wrapper_config(config)
+    for module in ("lm_head", "model.language_model.layers.0.mlp.down_proj",
+                   "model.visual.blocks.0.attn.qkv"):
+        component, weight = wrapper_route(f"{module}.weight", record)
+        stem = weight.removesuffix(".weight")
+        for suffix in SIDECARS:
+            assert wrapper_route(module + suffix, record) == (component, stem + suffix)

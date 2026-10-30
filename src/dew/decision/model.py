@@ -72,7 +72,7 @@ class DecisionModel(HeadedModel):
         `media` are the backbone's own inputs for images a request's one row
         holds (`Images.inputs`), with which it reads them. Rows that carry a
         context (`DecisionInputs.context`) hand the backbone's cross-attention
-        each row's context, embedded by the backbone's own table (`token_embeddings`),
+        each row's context, embedded by the backbone's own table (`stream_embeddings`),
         or, where the context holds the schema (`DecisionInputs.spans_in_context`),
         the backbone's own final states over it (`encode_context`).
         """
@@ -85,7 +85,9 @@ class DecisionModel(HeadedModel):
         laid = inputs.coordinates()
         # A row in blocks is read by the backbone's attention whole within each block, on the kinds
         # that read blocks (`AttentionMetadata.block_groups`); a row in order passes none.
-        blocked: dict[str, jax.Array] = {} if inputs.blocks is None else {"block_groups": inputs.blocks}
+        blocked: dict[str, object] = {} if inputs.blocks is None else {"block_groups": inputs.blocks}
+        if inputs.whole_blocks:
+            blocked["whole_blocks"] = True
         spanned = conditioning = None
         if inputs.context is not None:
             if self.context_length is None:
