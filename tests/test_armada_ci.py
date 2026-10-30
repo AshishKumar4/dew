@@ -421,8 +421,7 @@ def test_a_python_child_joins_its_files_record(ci, tmp_path, monkeypatch, cache_
     ci.task("3.12", tests, "", tmp_path / "verdict.json", 600.0)
 
     def reused() -> list[bool]:
-        common = ci.shared("3.12")
-        return [ci.reused("3.12", name, "", common) is not None for name in tests]
+        return reusable_now(ci, tests)
 
     assert reused() == [True, True, False, False]
     (tmp_path / "notes/page.md").write_text("page again\n")
@@ -451,12 +450,13 @@ def lifetime_task(ci, tmp_path, monkeypatch, cache_worker, files: dict[str, str]
     ci.task("3.12", tests, "", tmp_path / "verdict.json", 600.0)
     rows = json.loads((tmp_path / "verdict.json").read_text())["rows"]
     assert all(row["exitCode"] == 0 for row in rows), rows
+    return lambda: reusable_now(ci, tests)
 
-    def reused() -> list[bool]:
-        common = ci.shared("3.12")
-        return [ci.reused("3.12", name, "", common) is not None for name in tests]
 
-    return reused
+def reusable_now(ci, tests: list[str]) -> list[bool]:
+    """Whether each of `tests` would reuse its 3.12 row now."""
+    common = ci.shared("3.12")
+    return [ci.reused("3.12", name, "", common) is not None for name in tests]
 
 
 ON_SRC = "import sys\nsys.path.insert(0, 'src')\n"

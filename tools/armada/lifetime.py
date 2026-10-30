@@ -22,7 +22,7 @@ from multiprocessing.process import BaseProcess
 from pathlib import Path
 
 import followed
-from followed import CLOSED, EVIDENCE, PEAK, READ, SHARED, STARTED, VISIT
+from followed import CLOSED, EVIDENCE, PEAK, READ, SHARED, STARTED, UNOPENED, VISIT
 from session import DURATIONS
 
 LOG = "DEW_EXECUTED_LOG"
@@ -149,14 +149,8 @@ def audited(event, args):
 
 
 def peaked() -> None:
-    import jax
-
-    try:
-        devices = jax.local_devices(backend="gpu")
-    except RuntimeError:  # the backend failed to open, and holds no memory
-        return
-    peak = max((device.memory_stats() or {}).get("peak_bytes_in_use", 0) for device in devices)
-    write(SHARED, f"{PEAK}{peak}")
+    memory = followed.gpu_memory()
+    write(SHARED, f"{UNOPENED}{memory}" if isinstance(memory, str) else f"{PEAK}{memory[1]}")
 
 
 def closing() -> None:

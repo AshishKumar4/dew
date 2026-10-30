@@ -76,7 +76,9 @@ PEAK = "peak:"
 """What the most GPU memory the process held is logged as, read before jax's backend closes."""
 VISIT = "visit"
 """A switch of the owner of what runs (`switch`): a file's tests begin, or the session's end does."""
-EVIDENCE = (READ, STARTED, PEAK, CLOSED, VISIT)
+UNOPENED = "unopened:"
+"""What a process whose GPU backend never opened logs instead of its peak: why, as jax said."""
+EVIDENCE = (READ, STARTED, PEAK, CLOSED, VISIT, UNOPENED)
 """What a log holds beside the record's inputs."""
 decided: dict[types.CodeType, bool] = {}
 placing = threading.local()
@@ -366,15 +368,12 @@ def follow() -> None:
         return sys.monitoring.DISABLE
 
     def held() -> None:
-        import jax
-
-        try:
-            devices = jax.local_devices(backend="gpu")
-        except RuntimeError:  # the backend failed to open, and holds no pool
+        memory = gpu_memory()
+        if isinstance(memory, str):
+            write("unopened", memory)
             return
-        stats = [device.memory_stats() or {} for device in devices]
-        write("pool", sum(stat.get("peak_pool_bytes", stat.get("bytes_limit", 0)) for stat in stats))
-        write("peak", max(stat.get("peak_bytes_in_use", 0) for stat in stats))
+        write("pool", memory[0])
+        write("peak", memory[1])
 
     def audited(event, args):
         if event in READS:
@@ -403,6 +402,20 @@ def follow() -> None:
     sys.monitoring.register_callback(FOLLOWER_TOOL, sys.monitoring.events.PY_START, started)
     sys.monitoring.set_events(FOLLOWER_TOOL, sys.monitoring.events.PY_START)
     sys.addaudithook(audited)
+
+
+def gpu_memory() -> tuple[int, int] | str:
+    """The GPU pool this process held and the most memory it used, read as its last atexit before jax's
+    backend closes; or why the backend never opened, as jax said, where it holds none."""
+    import jax
+
+    try:
+        devices = jax.local_devices(backend="gpu")
+    except RuntimeError as error:  # the backend failed to open, and holds no pool
+        return " ".join(str(error).split())
+    stats = [device.memory_stats() or {} for device in devices]
+    return (sum(stat.get("peak_pool_bytes", stat.get("bytes_limit", 0)) for stat in stats),
+            max(stat.get("peak_bytes_in_use", 0) for stat in stats))
 
 
 def logged(path: Path) -> dict:

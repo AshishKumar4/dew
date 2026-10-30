@@ -943,6 +943,22 @@ def reused_rows(python: str, tests: list[str], group: str, common: str, network:
     return rows
 
 
+def exit_red(code: int, cases: list[ET.Element], own: list[ET.Element], deselected: bool,
+             name: str) -> list[str]:
+    """Why pytest's exit `code` reddens file `name`'s row, whose own cases are `own` among the process's
+    `cases`, and every one of whose tests the selection set aside where `deselected`. pytest exits 1 for
+    failed tests and 5 for none collected; any other exit (a crash, a signal, an internal error) leaves even
+    a written report untrustworthy, so every row it holds is red, as does an exit 1 no failed case explains
+    (a late hook's os._exit): its tests ran in a process that failed. A file whose every test the selection
+    set aside has no report however pytest exits, another file's failure among the task's included."""
+    failed = any(case.find(kind) is not None for case in cases for kind in ("failure", "error"))
+    if code == 1 and cases and not failed:
+        return ["the process ended 1 after its tests passed"]
+    if code not in (0, 1, 5) or (not own and not deselected and code == 1):
+        return [f"pytest exited {code}" + ("" if own else f" with no report of {name}")]
+    return []
+
+
 def tested(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: str, grace: float,
            common: str, environ: Mapping[str, str], coverage: Path | None = None,
            network: bool = False, whole: bool = False, release: str = "",
@@ -1012,10 +1028,6 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     # by the selection, as pytest reported it (executed.py); a run that wrote no report greens nothing.
     counts = json.loads(collection.read_text()) if collection.is_file() else {}
     ran = []
-    # A process that ended 1 though no case it reported failed (a late hook's os._exit): its tests ran in a
-    # process that failed, so no row it held is green.
-    late = done.returncode == 1 and cases and not any(
-        case.find(kind) is not None for case in cases for kind in ("failure", "error"))
     own_seconds = {name: sum(float(case.get("time") or 0) for case in cases if file_of(case) == name)
                    for name in tests}
     shares = apportioned(own_seconds, time.monotonic() - began, len(tests))
@@ -1028,16 +1040,9 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
         skipped = [f"SKIPPED on a missing import {case.get('classname')}::{case.get('name')}: "
                    f"{node.get('message')}" for case in own for node in case.iter("skipped")
                    if "could not import" in f"{node.get('message')} {node.text}"]
-        # pytest exits 1 for failed tests and 5 for none collected; any other exit (a crash, a signal,
-        # an internal error) leaves even a written report untrustworthy, so every row it holds is red. A file
-        # whose every test the selection set aside has no report however pytest exits, another file's failure
-        # among the task's included.
         counted = counts.get(name, {})
         deselected = bool(counted) and counted["collected"] == counted["deselected"]
-        exited = (["the process ended 1 after its tests passed"] if late
-                  else [f"pytest exited {done.returncode}" + ("" if own else f" with no report of {name}")]
-                  if done.returncode not in (0, 1, 5) or (not own and not deselected and done.returncode == 1)
-                  else [])
+        exited = exit_red(done.returncode, cases, own, deselected, name)
         unaccounted = ([] if exited or (report.is_file() and (own or deselected))
                        else [f"no evidence {name} ran: " + ("pytest wrote no report" if not report.is_file()
                                                             else "pytest reported none of its tests, and its "
