@@ -318,8 +318,7 @@ def restarting(fn, regime: str):
     return lambda operands: fn(_reset(operands))
 
 
-def assert_finite_and_on_par(dew, reference, draws, label: str, *, seeds: int, finite_seeds: int,
-                             terms: bool = False) -> None:
+def assert_finite_and_on_par(dew, reference, draws, label: str, *, seeds: int, finite_seeds: int) -> None:
     """A scan path's claim here: every leaf of `dew` finite wherever the float64 `reference`'s is over
     `finite_seeds` draws, and on par with `reference`'s from float64 over `seeds` (check 1). Plain
     functions: the gate compiles both arms alike (`reference_error._arms`)."""
@@ -333,7 +332,7 @@ def assert_finite_and_on_par(dew, reference, draws, label: str, *, seeds: int, f
             finite = np.isfinite(np.asarray(exact))
             assert np.all(np.isfinite(np.asarray(ours))[finite]), (
                 f'{label}{jax.tree_util.keystr(path)}: not finite where float64 is, seed {seed}')
-    assert_as_exact(dew, reference, draws, label, seeds=seeds, terms=terms)
+    assert_as_exact(dew, reference, draws, label, seeds=seeds)
 
 
 CASES = [pytest.param(name, regime, id=f'{name}-{regime}') for name in SITES for regime in REGIMES]
@@ -342,16 +341,13 @@ CASES = [pytest.param(name, regime, id=f'{name}-{regime}') for name in SITES for
 @pytest.mark.parametrize('name, regime', CASES)
 def test_the_chunked_op_stays_finite_and_exact_where_chunked_forms_break(name, regime):
     """The portable math's output and final memory finite wherever the float64 reference's are on every
-    declared seed, and on par with the reference's from float64 (module docstring), a row that cancels
-    sized by its float64 terms (check 1's `terms`): a steep decay between mild ones leaves rows whose
-    readout's pairs cancel to a fraction of their terms, whose products' rounding no order of the sum
-    keeps from them (row 2467)."""
+    declared seed, and on par with the reference's from float64 (module docstring)."""
     hooks = SITES[name]
     assert_finite_and_on_par(functools.partial(chunk_on, 'xla', hooks, chunk_size=CHUNK),
                              functools.partial(token_by_token, hooks),
                              functools.partial(stressed, hooks, regime),
                              f'the portable math, {name} under {regime}', seeds=SEEDS[name, regime],
-                             finite_seeds=SEEDS[name, regime], terms=True)
+                             finite_seeds=SEEDS[name, regime])
 
 
 ACCELERATED = [(name, regime) for name in ('scalar delta', 'vector delta')

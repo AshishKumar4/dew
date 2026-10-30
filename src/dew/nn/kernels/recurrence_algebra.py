@@ -339,9 +339,9 @@ def paired(name: str, left, right, decay, issue: Issue = portable):
     scales the product `name` after it (`_decayed_product`), one per key dimension weighs each term of it. A
     pair whose decay is zero (above the diagonal, across a document's start: `decays` masks its exponent)
     weighs nothing, its derivatives included: selected, not multiplied by zero, where its product's tangent
-    may overflow (ledger 2470). Its depth is summed in two halves added compensated (`_halved`): the chunk
-    form's solve and readout cancel what these sums carry where keys align, and one fp32 sum over the key
-    width put the portable math's output 1.52 times the token recurrence's distance from float64 where fp32
+    may overflow (ledger 2470). Its depth is summed in two halves, then added (`_halved`): the chunk form's
+    solve and readout cancel what these sums carry where keys align, and one fp32 sum over the key width
+    put the portable math's output 1.52 times the token recurrence's distance from float64 where fp32
     products sum in fp32 (1.34 in halves; ledger 2467)."""
     if decay.shape[-1] == 1:
         return _decayed_product(name, issue, left, right, decay[..., 0])
@@ -354,23 +354,20 @@ def paired(name: str, left, right, decay, issue: Issue = portable):
 
 
 def _halved(summed: Callable[[slice], jax.Array], depth: int) -> jax.Array:
-    """`summed(slice(None))`, a product's sum over its `depth`, as its two halves' sums added compensated
-    (`compensated_add`, `paired`)."""
+    """`summed(slice(None))`, a product's sum over its `depth`, as its two halves' sums added (`paired`)."""
     half = depth // 2
-    first, second = summed(slice(None, half)), summed(slice(half, None))
-    total, error = compensated_add((first, jnp.zeros_like(first)), (second, jnp.zeros_like(second)))
-    return total + error
+    return summed(slice(None, half)) + summed(slice(half, None))
 
 
 @functools.partial(jax.custom_jvp, nondiff_argnums=(0, 1))
 def _decayed_product(name: str, issue: Issue, left, right, decay):
     """`(left @ right^T) * decay` of the pairs whose decay is nonzero, zero elsewhere (`paired`), its depth in
-    two compensated halves (`_halved`)."""
+    two halves (`_halved`)."""
     return jnp.where(decay != 0, _product(name, issue, left, right) * decay, 0.0)
 
 
 def _product(name: str, issue: Issue, left, right) -> jax.Array:
-    """`left @ right^T`, the product `name`, summed over the depth in two compensated halves (`paired`)."""
+    """`left @ right^T`, the product `name`, summed over the depth in two halves (`paired`)."""
     return _halved(lambda depth: issue(name, left[..., depth], jnp.swapaxes(right[..., depth], -1, -2)),
                    left.shape[-1])
 
