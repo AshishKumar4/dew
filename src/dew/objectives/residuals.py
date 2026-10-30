@@ -74,41 +74,36 @@ class RowEquations:
     update: int = struct.field(pytree_node=False)
 
 
-@functools.partial(jax.custom_vjp, nondiff_argnums=(2,))
+@functools.partial(jax.custom_jvp, nondiff_argnums=(2,))
 def _pulled(params: Variables, pulled: jax.Array, share: float) -> jax.Array:
-    """`pulled`, a microbatch's J_i^T r_i, whose pullback takes the step's cotangent c to the parameters'
-    `share` c, in their tree: the microbatch's rows' share of the update's, so the shares of a whole
-    update sum to its step."""
+    """`pulled`, a microbatch's J_i^T r_i, whose derivative takes the parameters' move to its `share`,
+    raveled, and leaves `pulled`'s own: a reverse derivative takes the step's cotangent c to the
+    parameters' `share` c, in their tree, the microbatch's rows' share of the update's, so the shares of a
+    whole update sum to its step."""
     return pulled
 
 
-def _pulled_fwd(params, pulled, share):
-    return pulled, params
+@_pulled.defjvp
+def _pulled_jvp(share, primals, tangents):
+    pulled = primals[1]
+    moved, _ = ravel_pytree(tangents[0])
+    return pulled, share * moved.astype(pulled.dtype)
 
 
-def _pulled_bwd(share, params, cotangent):
-    _, unravel = ravel_pytree(params)
-    return unravel(cotangent * share), jnp.zeros_like(cotangent)
-
-
-_pulled.defvjp(_pulled_fwd, _pulled_bwd)
-
-
-@functools.partial(jax.custom_vjp, nondiff_argnums=(0, 1))
+@functools.partial(jax.custom_jvp, nondiff_argnums=(0, 1))
 def _stepped(damping: float, update: int, rows: jax.Array, pulled: jax.Array,
              system: tuple[jax.Array, ...]) -> jax.Array:
     """Zero, whose derivative in the pooled `pulled` is the update's damped Gauss-Newton step: the normal
     equations' solve against J^T r where `system` is (J^T J,), the dual's J^T (J J^T + damping I)^-1 r
-    where it is (J, r), once the statistics hold the update's every row, and zero before."""
+    where it is (J, r), once the statistics hold the update's every row, and zero before. Its move is
+    the step's inner product with `pulled`'s, which a reverse derivative transposes to the step times
+    the cotangent; the step's own derivatives in `system` are its later orders'."""
     return jnp.zeros((), pulled.dtype)
 
 
-def _stepped_fwd(damping, update, rows, pulled, system):
-    return jnp.zeros((), pulled.dtype), (rows, pulled, system)
-
-
-def _stepped_bwd(damping, update, saved, cotangent):
-    rows, pulled, system = saved
+@_stepped.defjvp
+def _stepped_jvp(damping, update, primals, tangents):
+    rows, pulled, system = primals
 
     def solved(_) -> jax.Array:
         if len(system) == 1:
@@ -122,10 +117,7 @@ def _stepped_bwd(damping, update, saved, cotangent):
 
     # A provisional reduction, of a microbatch the update has more of, steps nothing and solves nothing.
     step = jax.lax.cond(rows >= update, solved, lambda _: jnp.zeros_like(pulled), None)
-    return jnp.zeros_like(rows), cotangent * step, jax.tree.map(jnp.zeros_like, system)
-
-
-_stepped.defvjp(_stepped_fwd, _stepped_bwd)
+    return jnp.zeros((), pulled.dtype), jnp.sum(step * tangents[1])
 
 
 class Residuals(Objective[Ratio | NormalEquations | RowEquations]):
