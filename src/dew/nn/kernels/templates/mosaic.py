@@ -254,9 +254,18 @@ def coalesced(source, destination) -> None:
     (JS-a100copy-a100-0b4eb412b). A walk's 16-bit stores alone (`Mma.stored`): the attention template's
     forward, whose `persist` stores its output so, took 19% longer (JS-2075cells-a100-491c05798), and an fp32
     tile's copy so spilled 48 bytes in the training query/key launch (the recurrence resource gate, sm80)."""
-    if len(source.shape) != 2 or source.shape[0] % 8 or jnp.dtype(source.dtype).itemsize != 2:
-        return copied(source, destination)
-    rows, width = source.shape[0], source.shape[1] * jnp.dtype(source.dtype).itemsize
+    layout = _copy_layout(source.shape, source.dtype)
+    if layout is None:
+        copied(source, destination)
+    else:
+        plgpu.store(destination, plgpu.load(source, layout=layout, optimized=False), optimized=False)
+
+
+def _copy_layout(shape: tuple[int, ...], dtype) -> plgpu_core.SomeLayout | None:
+    """`coalesced`'s layout for a 16-bit tile of `shape`, None where the copy layout tiles none of it."""
+    if len(shape) != 2 or shape[0] % 8 or jnp.dtype(dtype).itemsize != 2:
+        return None
+    rows, width = shape[0], shape[1] * jnp.dtype(dtype).itemsize
     for swizzle in (128, 64, 32, 16):
         if width % swizzle:
             continue
@@ -264,10 +273,8 @@ def coalesced(source, destination) -> None:
         # The layout's own condition: a warpgroup's four warps' tiles four down the rows, two by two, or
         # four across.
         if row_tiles % 4 == 0 or (row_tiles % 2 == 0 and column_tiles % 2 == 0) or column_tiles % 4 == 0:
-            layout = plgpu.Layout.SMEM_GMEM_COPY(tuple(source.shape), jnp.dtype(source.dtype), swizzle)
-            plgpu.store(destination, plgpu.load(source, layout=layout, optimized=False), optimized=False)
-            return
-    copied(source, destination)
+            return plgpu.Layout.SMEM_GMEM_COPY(tuple(shape), jnp.dtype(dtype), swizzle)
+    return None
 
 
 @dataclasses.dataclass(frozen=True)
