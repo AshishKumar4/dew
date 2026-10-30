@@ -449,3 +449,25 @@ def test_a_run_saved_before_numerics_computes_in_what_its_main_computed_in(tmp_p
     assert RunConfig.load(str(earlier(run, tmp_path))).compute_dtype() == computed
     stated = dataclasses.replace(run, model=ModelConfig(run.model.name, {**fields, "dtype": "float16"}))
     assert RunConfig.load(str(earlier(stated, tmp_path / "stated"))).compute_dtype() == "float16"
+
+
+@pytest.mark.mesh(devices=8)
+def test_a_decision_runs_source_storage_leaves_its_head_and_adapter_in_float32(tmp_path):
+    """A decision run over a backbone whose head it draws, storing its source in bfloat16
+    (`SourceOptions.param_dtype`, as an earlier run's `param_dtype` reads back), keeps its frozen backbone
+    so and draws its head and adapter in float32, the numerics' parameters' (train 328's review of ledger
+    2500)."""
+    from test_decision_recipe import QWEN
+
+    from dew.batch import FROZEN
+    from dew.config import SourceOptions
+    from dew.lora import LoRA
+
+    run = dataclasses.replace(decision(tmp_path, drawn=False), pretrained=str(QWEN),
+                              source=SourceOptions(param_dtype="bfloat16"),
+                              lora=LoRA(rank=2, modules=("q_proj",)))
+    state, _ = trained(run, tmp_path, "stored")
+    for collection, dtype in (("params", jnp.float32), (FROZEN, jnp.bfloat16)):
+        stored = {leaf.dtype for leaf in jax.tree.leaves(state.variables[collection])
+                  if jnp.issubdtype(leaf.dtype, jnp.floating)}
+        assert stored == {jnp.dtype(dtype)}, collection
