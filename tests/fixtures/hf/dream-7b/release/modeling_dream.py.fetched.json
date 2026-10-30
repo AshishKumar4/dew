@@ -1,0 +1,11 @@
+{
+ "bytes": 36763,
+ "kind": "release",
+ "license": "apache-2.0",
+ "origin": "release",
+ "path": "modeling_dream.py",
+ "reference": "Dream-org/Dream-v0-Base-7B@6572adb5535263e4d1a337b56942ba48b6dee2a9/modeling_dream.py",
+ "repo": "Dream-org/Dream-v0-Base-7B",
+ "revision": "6572adb5535263e4d1a337b56942ba48b6dee2a9",
+ "sha256": "3166e789f0d69beb1f4fbdee2317953d1c1c3b9bc21479b109afc5dd059de5b3"
+}
