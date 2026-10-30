@@ -1183,6 +1183,7 @@ def test_a_node_perturbation_estimate_holds_its_reverse_orders(edge):
     which an estimate from forwards alone has none of, row 2690's."""
     from flax import linen as nn
     from model_support import parameter_loss
+    from test_perturbation import squared
 
     from dew.inputs import Field, InputSpec
     from dew.objectives.base import Step
@@ -1196,9 +1197,6 @@ def test_a_node_perturbation_estimate_holds_its_reverse_orders(edge):
 
     class Perturbed(NodePerturbation, Supervised):
         """`Supervised` trained by node perturbation."""
-
-    def squared(outputs, batch):
-        return jnp.sum(jnp.square(outputs.astype(jnp.float32) - batch["y"]), -1)
 
     objective = Perturbed(Linear(), squared, inputs=InputSpec(Field("x", (3,))), draws=4)
     variables = objective.init(jax.random.key(0))
