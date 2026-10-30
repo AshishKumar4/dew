@@ -112,8 +112,8 @@ def called_with(model: nn.Module, variables: Mapping, run: Callable[[], object])
     def interceptor(next_fun, args, kwargs, context):
         module = context.module
         if (not calls and context.method_name == "__call__" and type(module) is type(model)
-                and jax_core.trace_ctx.trace is traced
-                and {id(leaf) for leaf in jax.tree.leaves(module.variables)} == weights):
+                and jax_core.trace_ctx.trace is traced and module.scope is not None
+                and {id(leaf) for leaf in jax.tree.leaves(module.scope.variables())} == weights):
             calls.append((args, kwargs))
         return next_fun(*args, **kwargs)
 
