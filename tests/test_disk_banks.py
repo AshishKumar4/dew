@@ -10,6 +10,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from reference_error import assert_as_exact, widened
 
 from dew.inference.banks import HeldBanks
 from dew.interop.hf_decoders import translate_config, translate_weights
@@ -29,60 +30,63 @@ def single_mesh():
     return MeshSpec().build([jax.devices()[0]])
 
 
-def decoder(config, bank_layers):
-    record = {**translate_config(config), "dtype": "float32", "attention_impl": "reference"}
+def decoder(config, bank_layers, dtype="float32"):
+    record = {**translate_config(config), "dtype": dtype, "attention_impl": "reference"}
     return models.build("causal_transformer", {**record, "scan_layers": True,
                                                "bank_layers": bank_layers})
+
+
+BANKED_SEEDS = 8
 
 
 @pytest.mark.parametrize("bank_layers", [None, 1])
 @pytest.mark.parametrize("read_ahead", [True, False])
 def test_disk_moe_logits_and_cached_decode_equal_resident(bank_layers, read_ahead):
+    """A decoder streamed from disk scores what the resident one does: bit for bit where a bank holds
+    each layer, so the two run one scan; as exact against float64 (check 1) where the banks hold the
+    stack whole, whose effectful one-trip scan XLA:CUDA cannot peel as it does the resident two-layer
+    one (ledger 2540). Loading and tracing read no weight, and a compiled program rereads each one."""
     from dew.inference.banks import SafetensorsBanks
 
     with SafetensorsBanks(FIXTURE, cache_bytes=0, param_dtype="float32", read_ahead=read_ahead) as source:
         model = decoder(source.config, bank_layers)
-        resident = HeldBanks(translate_weights(
-            read_weights(FIXTURE), translate_config(source.config), "mixtral"
-        )).place(model, mesh=single_mesh(), layout=DEVICE)
-        singleton = decoder(source.config, 1)
-        singleton_store = HeldBanks(translate_weights(
-            read_weights(FIXTURE), translate_config(source.config), "mixtral"
-        )).place(singleton, mesh=single_mesh(), layout=DEVICE)
+        weights = translate_weights(read_weights(FIXTURE), translate_config(source.config), "mixtral")
+        resident = HeldBanks(weights).place(model, mesh=single_mesh(), layout=DEVICE)
         streamed = source.stream(model, mesh=single_mesh(), layout=DEVICE)
         assert source.stats().misses == 0  # No decoder weight is read by loading or tracing.
         tokens = jax.device_put(np.load(FIXTURE / "input_ids.npy"), jax.devices()[0])
         score = jax.jit(model.apply)
         score.lower(streamed, tokens)
         assert source.stats().misses == 0
-        expected = score(resident, tokens)
         actual = score(streamed, tokens)
-        def equal_up_to_resident_fusion(actual, expected, inputs):
-            if bank_layers == 1 or jax.default_backend() == "cpu":
-                np.testing.assert_array_equal(actual, expected)
-                return
-            # An effectful one-trip scan cannot be peeled. XLA's resident
-            # two-layer scan can, and its RMSNorm tiles become [1,2,32]
-            # rather than [1,1,32]. Bound this case by the elementwise
-            # spread of the same resident model's two legitimate fusions,
-            # not by a chosen output tolerance.
-            alternate = jax.jit(singleton.apply)(singleton_store, inputs)
-            gap = np.abs(np.asarray(actual, np.float64) - np.asarray(expected, np.float64))
-            spread = np.abs(np.asarray(alternate, np.float64) - np.asarray(expected, np.float64))
-            assert np.all(gap <= spread), (float(gap.max()), float(spread.max()))
-
-        equal_up_to_resident_fusion(actual, expected, tokens)
         np.testing.assert_allclose(actual, np.load(FIXTURE / "logits.npy"), atol=1e-4, rtol=1e-4)
         before = source.stats().misses
-        equal_up_to_resident_fusion(score(streamed, tokens[:, ::-1]), score(resident, tokens[:, ::-1]),
-                                   tokens[:, ::-1])
+        if bank_layers == 1:
+            np.testing.assert_array_equal(actual, score(resident, tokens))
+            np.testing.assert_array_equal(score(streamed, tokens[:, ::-1]), score(resident, tokens[:, ::-1]))
+        else:
+            vocab = translate_config(source.config)["vocab_size"]
+            with jax.enable_x64(new_val=True):
+                wide = decoder(source.config, None, "float64")
+                wide_variables = widened(jax.device_get(resident))
+
+            def truth(drawn):
+                with jax.enable_x64(new_val=True):
+                    return wide.apply(wide_variables, jnp.asarray(drawn))
+
+            def draw(seed):
+                return (np.random.default_rng([2540, seed]).integers(0, vocab, tokens.shape, np.int32),)
+
+            assert_as_exact(lambda drawn: model.apply(streamed, drawn),
+                            lambda drawn: model.apply(resident, drawn), draw,
+                            "a disk-banked MoE decoder's logits", seeds=BANKED_SEEDS, truth_fn=truth)
         assert source.stats().misses > before  # A compiled executable rereads uncached rows.
 
-        def draw(variables):
+        def drawn(variables):
             return generate(model, variables, tokens[:1, :2], key=jax.random.key(1),
                             max_new_tokens=3, sampling=Sampling(temperature=0.0))
 
-        np.testing.assert_array_equal(draw(streamed).tokens, draw(resident).tokens)
+        np.testing.assert_array_equal(drawn(streamed).tokens, drawn(resident).tokens)
         assert source.stats().cache_bytes == 0
 
 
