@@ -190,29 +190,28 @@ def _decided[C](op: Op[C], case: C, named: str | None,
     """`select`'s kernel for `case`, the kernel preferred, the preferred one's refusal and the kernel that
     forced the choice (`named`, else `chosen`'s), None where nothing did."""
     insisted = named or forced(op.choice)
-    if insisted is None and preference:
-        refusal = None
-        for name in preference:
-            failed = op.kernel(name).failed(case, forced=name == preference[0])
-            if not failed:
-                return op.kernel(name), preference[0], refusal, None
-            refusal = refusal or failed[0]
-        raise ValueError(f"no {op.choice} kernel of {preference} takes this call ({refusal})")
-    old = None if insisted is not None else _old_route(op, case)
-    if old is not None:
-        return (*old, None)
-    preferred = insisted or _preferred(op, case)
-    first = op.kernel(preferred)
-    # An insisted kernel hands a call only its handoffs turn down, to the op's next kernels in turn; a
-    # generic one to the next generic ones.
-    handing = insisted is not None and not first.generic
-    rest = op.kernels[op.kernels.index(first) + 1:] if handing else op.kernels
-    candidates = [first, *(kernel for kernel in rest if kernel is not first
-                           and (insisted is None or not first.generic or kernel.generic))]
+    soft = insisted is None and bool(preference)
+    if soft:
+        # The call's own order, exactly: its first the call's pick, the rest its fallbacks in turn.
+        preferred = preference[0]
+        candidates = [op.kernel(name) for name in preference]
+        first = candidates[0]
+    else:
+        old = None if insisted is not None else _old_route(op, case)
+        if old is not None:
+            return (*old, None)
+        preferred = insisted or _preferred(op, case)
+        first = op.kernel(preferred)
+        # An insisted kernel hands a call only its handoffs turn down, to the op's next kernels in turn; a
+        # generic one to the next generic ones.
+        handing = insisted is not None and not first.generic
+        rest = op.kernels[op.kernels.index(first) + 1:] if handing else op.kernels
+        candidates = [first, *(kernel for kernel in rest if kernel is not first
+                               and (insisted is None or not first.generic or kernel.generic))]
     refusal = None
     for kernel in candidates:
-        # A kernel a call names passes what the targets measured of it, whether or not the call insists.
-        failed = kernel.failed(case, forced=insisted is not None or (kernel is first and named is not None))
+        # A kernel a call names or picks passes what the targets measured of it.
+        failed = kernel.failed(case, forced=insisted is not None or (soft and kernel is first))
         if not failed:
             return kernel, preferred, refusal, insisted
         if kernel is first:
