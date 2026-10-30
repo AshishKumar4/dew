@@ -56,12 +56,15 @@ class Startup:
 
 class DataObjective(Protocol):
     """What a fit's data reads of its objective: its steps over the data (`Objective.data`) and whether
-    it counts real tokens (`Objective.counts_tokens`)."""
+    it counts real tokens (`Objective.counts_tokens`), and what it hands it: the widths its data bound
+    (`Objective.bind_widths`)."""
 
     @property
     def counts_tokens(self) -> bool: ...
 
     def data(self) -> ObjectiveData: ...
+
+    def bind_widths(self, widths: Mapping[str, object]) -> None: ...
 
 
 def run_data(objective: DataObjective, dataset: Dataset | Loader | Handed,
@@ -76,6 +79,8 @@ def run_data(objective: DataObjective, dataset: Dataset | Loader | Handed,
     ready_process()
     with startup.phase("data", "preparing the data"):
         loader, validation = fitted(dataset, validation, objective=objective.data(), examples=examples)
+    # The widths the data bound, which a saved run of the objective records.
+    objective.bind_widths(loader.widths)
     # A schedule whose last stage ends its data bounds the run as tokens= does (`run_tokens`).
     tokens = run_tokens(loader, tokens, counts_tokens=objective.counts_tokens)
     with startup.phase("count", "counting the steps the run's examples take", when=examples is not None):

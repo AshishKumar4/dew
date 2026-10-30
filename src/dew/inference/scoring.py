@@ -3,7 +3,7 @@
 A scoring request reads no cache and draws nothing: a classifier's answer, a decision's, a reward or an
 embedding is a forward over its rows. `ScoringServer` queues such requests and runs one pass of the
 task's (`Scoring`) a `step`: the waiting rows oldest first, as many as the task says one pass holds
-(`Scoring.fits`), its compiled shapes bucketed so a compile is reused across passes. A request whose
+(`Scoring.planned`), its compiled shapes bucketed so a compile is reused across passes. A request whose
 rows outrun one pass carries its rows not yet scored to the next step, and is answered once its last
 row is. The task lays out each request as it is submitted, so a request it refuses is refused there,
 alone, and the server only batches what it admitted.
@@ -45,6 +45,15 @@ class Scored[Row, Payload]:
 
 
 @runtime_checkable
+class PassPlan[Row](Protocol):
+    """A pass a server grows a row at a time (`Scoring.planned`)."""
+
+    def add(self, row: Row) -> bool:
+        """Take `row` into the pass where it holds every row so far and it; False where not, which ends
+        the plan: it takes no row after."""
+        ...
+
+
 class Scoring[Request, Row, Payload, Output, Answer](Protocol):
     """A task served by forward passes over its requests' rows (`ScoringServer`). It holds no weights
     of its own: the server holds them resident, and hands them to every pass, so a task and the weights
@@ -55,9 +64,9 @@ class Scoring[Request, Row, Payload, Output, Answer](Protocol):
         refuses."""
         ...
 
-    def fits(self, rows: Sequence[Row]) -> bool:
-        """Whether `rows` are one pass of the task's: within its budget, and alike enough for one
-        compiled forward."""
+    def planned(self) -> PassPlan[Row]:
+        """An empty pass of the task's, which takes rows one at a time while they are one pass: within
+        its budget, and alike enough for one compiled forward."""
         ...
 
     def forward(self, variables: Variables, rows: Sequence[Row]) -> Sequence[Output]:
@@ -88,8 +97,9 @@ class _Request[Row, Payload, Output, Answer]:
 class ScoringServer[Request, Row, Payload, Output, Answer]:
     """Answers scoring requests through one task's passes, one pass a step.
 
-    A pass takes the waiting rows oldest first, as many as the task's `fits` allows, all laid out by
-    one task: a request admitted before a reload is scored by the task and weights that admitted it.
+    A pass takes the waiting rows oldest first, as many as the task's plan takes (`planned`), all
+    laid out by one task: a request admitted before a reload is scored by the task and weights that
+    admitted it.
     A step looks at most `rows` requests, cancelled ones among them. Build one with `from_task`.
     """
 
@@ -194,6 +204,7 @@ class ScoringServer[Request, Row, Payload, Output, Answer]:
         from requests of one pair, a request's rows in order; at most `rows` requests looked at, a
         cancelled one dropped as it is looked at."""
         chosen: list[tuple[_Request[Row, Payload, Output, Answer], int]] = []
+        plan: PassPlan[Row] | None = None
         now = time.perf_counter()
         # The bounded prefix alone: a turn looks at no more than `rows` requests of the queue.
         for request in list(itertools.islice(self._queue, self.rows)):
@@ -201,13 +212,18 @@ class ScoringServer[Request, Row, Payload, Output, Answer]:
                 break
             task = request.served[0]
             while request.taken < len(request.scored.rows):
-                rows = [kept.scored.rows[index] for kept, index in chosen]
-                if chosen and not task.fits([*rows, request.scored.rows[request.taken]]):
+                # The pass grows a row at a time, each placed once (`Scoring.planned`); its first row
+                # runs whatever the plan says of it, a pass of its own.
+                plan = task.planned() if plan is None else plan
+                if not plan.add(request.scored.rows[request.taken]) and chosen:
                     return chosen
-                # A request runs from its first row's pass on; one cancelled before it leaves the queue.
+                # A request runs from its first row's pass on; one cancelled before it leaves the queue,
+                # and a plan of its row alone with it, so the next request, perhaps another task's after
+                # a reload, starts a plan of its own.
                 if request.taken == 0:
                     if not request.future.set_running_or_notify_cancel():
                         self._queue.remove(request)
+                        plan = plan if chosen else None
                         break
                     request.future.admitted = now
                 chosen.append((request, request.taken))

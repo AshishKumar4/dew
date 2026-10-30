@@ -556,13 +556,14 @@ def test_each_triton_call_needs_a_launch_of_its_own():
     operand = jax.ShapeDtypeStruct((16, 128), jnp.float32)
     compiled = _compiled(support.KernelCase("probe", lambda: (program, (operand,))), "sm80", {})
     assert compiled is not None
-    thunks, programs = compiled
-    assert "shared" in triton_evidence(programs, thunks)
+    thunks, calls = compiled
+    assert calls == {"probe": 2, "probe_headroom": 1}
+    assert "shared" in triton_evidence(calls, thunks)
     for missing, said in ((" probe grid", "probe"), (" probe_headroom grid", "probe_headroom")):
         lines = "\n".join(thunks).splitlines()
         dropped = next(index for index, line in enumerate(lines) if missing in line)
         without = ["\n".join(lines[:dropped] + lines[dropped + 1:])]
-        assert triton_evidence(programs, without) == {
+        assert triton_evidence(calls, without) == {
             "error": f"no launch of its own states the shared bytes of {said}"}
 
 
