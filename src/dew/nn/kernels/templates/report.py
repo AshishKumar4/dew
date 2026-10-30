@@ -14,6 +14,7 @@ import dataclasses
 import hashlib
 import logging
 import os
+import pickle
 import re
 import tempfile
 import threading
@@ -23,6 +24,7 @@ from pathlib import Path
 import jax
 import tokamax
 
+from dew.files import write_atomically
 from dew.nn.kernels import generation
 
 DUMPS = {"MOSAIC_GPU_DUMP_PTXAS": "1", "MOSAIC_GPU_DUMP_RESOURCES": "1"}
@@ -252,7 +254,24 @@ def compiled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | 
     again, so every process derives the program this compile keeps; a relowering whose derivations find no
     config left (`Exhausted`) keeps the first program, its misses recorded as not stepped. Refusals commit
     only when a replacement compiles, so a later process derives the program kept here. A program loaded
-    from the persistent compilation cache runs no ptxas and reports nothing."""
+    from the persistent compilation cache runs no ptxas and reports nothing, so the refusals a step-down
+    made are kept beside that cache for the exact program that spilled (`_kept_refusals`): a process over
+    the cache that lowers it again relowers past them first, and compiles the stepped program, never the
+    cached one that spilled."""
+    kept = _kept_refusals(lowered)
+    if kept is not None and kept.exists():
+        remembered = pickle.loads(kept.read_bytes())
+        try:
+            with _proposing(remembered):
+                relowered = relower()
+                replacement, spilling = _compiled_reported(relowered, options)
+        except Exhausted as failed:
+            _log.warning("relowering past the refusals kept for this program found no config: %s", failed)
+        else:
+            for refusal, kernel in remembered:
+                _record(refusal, None, frozenset({kernel}))
+            _recorded(_misses_of(spilling), stepped=False)
+            return replacement
     executable, spilling = _compiled_reported(lowered, options)
     found = _misses_of(spilling)
     refusals = [(refusal, report.kernel) for refusal, report, _ in found if refusal is not None]
@@ -269,11 +288,25 @@ def compiled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | 
         return executable
     for refusal, kernel in refusals:
         _record(refusal, None, frozenset({kernel}))
+    if kept is not None:
+        kept.parent.mkdir(parents=True, exist_ok=True)
+        write_atomically(kept, pickle.dumps(refusals))
     _recorded(found, stepped=True)
     # The kept program's own spills are misses alone: refused, they would have every process seeded with
     # them derive a third program, not the one this compile keeps and runs.
     _recorded(_misses_of(spilling), stepped=False)
     return replacement
+
+
+def _kept_refusals(lowered: jax.stages.Lowered) -> Path | None:
+    """Where the refusals a step-down of `lowered`'s exact program made are kept, beside the persistent
+    compilation cache that holds its executable, by its text's digest; None where no cache persists one.
+    A program that spilled is a program its every launch derived alike, so its refusals hold for any process
+    that lowers it again, and for no other program (the cache's own key reads it whole too)."""
+    directory = jax.config.jax_compilation_cache_dir
+    if not directory:
+        return None
+    return Path(directory) / "dew-refusals" / f"{hashlib.sha256(lowered.as_text().encode()).hexdigest()}.pkl"
 
 
 def _misses_of(spilling: list["Report"]) -> list[tuple[tuple[str, Hashable] | None, "Report", Launch | None]]:
