@@ -43,7 +43,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from benchmark_cases import DIT_B, FORWARD, LM_DENSE, LM_HYBRID, LM_MOE
+from benchmark_cases import DIT_B, FINETUNE_1_7B, FINETUNE_4B, FORWARD, LM_DENSE, LM_HYBRID, LM_MOE
 from environments import CACHE, Unlocked, environment, machine_lock
 
 FLOOR = 0.02
@@ -74,6 +74,11 @@ STEP_CASES = {
                           "batch_size": 4, "image_size": 32, "channels": 128},
     "step wan 2x5x32px": {"architecture": "wan_transformer", "config": WAN, "dtype": "bfloat16",
                           "batch_size": 2, "image_size": 32, "channels": 16, "frames": 5},
+    "step finetune-4b 1x2048": {"architecture": "causal_transformer", "config": FINETUNE_4B,
+                                "dtype": "bfloat16", "batch_size": 1, "seq_len": 2048, "optimizer": "adamw"},
+    "step finetune-1.7b 1x2048": {"architecture": "causal_transformer", "config": FINETUNE_1_7B,
+                                  "dtype": "bfloat16", "batch_size": 1, "seq_len": 2048,
+                                  "optimizer": "adamw"},
 }
 SLOTS = (32, 128)
 """The serving rows' slot counts."""
@@ -217,13 +222,18 @@ def _qwen35_comparison(out: Path) -> tuple:
             if comparison is not None else {"error": record.get("error", "incomplete pair")},)
 
 
+STEP_HARDWARE = {"step finetune-4b 1x2048": "H100", "step finetune-1.7b 1x2048": "A100"}
+"""The device a step case is sized for (`Row.hardware`): a full fine-tune's, frozen once (batch, sequence,
+dtype, optimizer) and measured on its own kind alone."""
+
+
 PROBES = [
     # Each step's time, and the time its program took to compile in that process (`COMPILE_FLOOR`).
-    *[Probe((Row(name, "ms", "benchmark_step.py"),
+    *[Probe((Row(name, "ms", "benchmark_step.py", hardware=STEP_HARDWARE.get(name)),
              Row(f"compile {name.removeprefix('step ')}", "s", "benchmark_step.py", floor=COMPILE_FLOOR,
-                 first_round=True),
-             Row(f"peak {name}", "GiB", "benchmark_step.py"),
-             Row(f"mfu {name}", "% mfu", "benchmark_step.py")),
+                 first_round=True, hardware=STEP_HARDWARE.get(name)),
+             Row(f"peak {name}", "GiB", "benchmark_step.py", hardware=STEP_HARDWARE.get(name)),
+             Row(f"mfu {name}", "% mfu", "benchmark_step.py", hardware=STEP_HARDWARE.get(name))),
             lambda _, out, case=case: ["--cases", json.dumps([case]), "--warmup", "10", "--steps", "30",
                                        "--json-out", str(out)],
             lambda _, out: _stepped(out))

@@ -156,6 +156,33 @@ def test_a_step_reports_its_mfu_from_the_same_invocation_and_a_lower_one_regress
     assert gate.verdict(row, [None, None, None], [40.0, 40.0, 40.0])[0] == "not compared"
 
 
+def test_a_full_fine_tune_steps_adamw_on_the_device_it_is_sized_for_and_is_unmeasured_off_it(gate):
+    """The fine-tune rows time a 4B decoder's full AdamW step on an H100 and a 1.7B one's on an A100:
+    each case is one benchmark_step reads, on a declared field of the decoder, stepping the optimizer
+    it names, and off its device its four rows are not measured, never compared against another's."""
+    import dataclasses
+
+    import optax
+
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+
+    step, models = load("benchmark_step"), load("benchmark_models")
+    declared = {field.name for field in dataclasses.fields(CausalTransformer)}
+    h100, a100 = "NVIDIA H100 80GB HBM3", "NVIDIA A100-SXM4-40GB"
+    for name, device, other in (("step finetune-4b 1x2048", h100, a100),
+                                ("step finetune-1.7b 1x2048", a100, h100)):
+        [case] = step.cases_from_json(json.dumps([gate.STEP_CASES[name]]))
+        assert case.optimizer == "adamw" and set(case.config) <= declared
+        assert models.OPTIMIZERS[case.optimizer] is optax.adamw
+        rows = [row for row in gate.BATTERY if row.name.endswith(name.removeprefix("step "))]
+        assert len(rows) == 4
+        for row in rows:
+            assert gate.hardware_status(row, device) is None
+            unmeasured = gate.hardware_status(row, other)
+            assert unmeasured.startswith("not measured on this hardware")
+            assert gate.verdict(row, [unmeasured] * 3, [unmeasured] * 3)[0] == "not measured on this hardware"
+
+
 def standing_in_environments(gate, monkeypatch) -> tuple[list, list]:
     """Every tool of the battery stood in (`standing_in`), each environment's build too. Returns each
     environment the installer built, as (tree, its Python), and each row process, as (tree, command,

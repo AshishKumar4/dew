@@ -20,6 +20,16 @@ TEXT_FEATURES = 768
 # decoder_sparse_step 2.
 LM_DENSE: dict[str, object] = {"vocab_size": 50304, "emb_features": 1024, "num_layers": 24, "num_heads": 16,
                                "mlp_features": 2816, "max_seq_len": 1024}
+FINETUNE_4B: dict[str, object] = {
+    "vocab_size": 151936, "emb_features": 2560, "num_layers": 36, "num_heads": 32, "num_kv_heads": 8,
+    "head_dim": 128, "mlp_features": 9728, "max_seq_len": 2048, "rope_theta": 1000000.0}
+"""A 4B dense decoder at Qwen3-4B's shape: a full fine-tune's model on an 80 GB GPU, fp32 parameters and
+AdamW's two moments with remat (`perf_gate`'s fine-tune rows)."""
+FINETUNE_1_7B: dict[str, object] = {
+    "vocab_size": 151936, "emb_features": 2048, "num_layers": 28, "num_heads": 16, "num_kv_heads": 8,
+    "head_dim": 128, "mlp_features": 6144, "max_seq_len": 2048, "rope_theta": 1000000.0}
+"""A 1.7B dense decoder at Qwen3-1.7B's shape: the fine-tune that fits a 40 GB A100 (a 4B one's fp32
+parameters, gradients and two moments alone take 64 GB)."""
 LM_MOE: dict[str, object] = {
     "vocab_size": 50304, "emb_features": 768, "num_layers": 12, "num_heads": 12, "mlp_features": 2048,
     "max_seq_len": 1024,
@@ -56,6 +66,9 @@ class Case:
     Other measurements and rows retain their ordinary single-draw path."""
     batch_size: int = 8
     accumulation: int = 1
+    optimizer: str = "adam"
+    """The optimizer the case's trainer steps (`benchmark_models.OPTIMIZERS`): Adam, or AdamW a full
+    fine-tune's."""
     """Microbatches of `batch_size` rows the trainer pools into one optimizer
     step; a timed step is one microbatch."""
     mesh: dict[str, int] = field(default_factory=dict)
