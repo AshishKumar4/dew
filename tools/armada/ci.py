@@ -1739,6 +1739,16 @@ def releasing(args: argparse.Namespace) -> int:
     return release(args.python, args.tests.split(), args.requirement, args.out)
 
 
+def tier_arguments(choosing: argparse.ArgumentParser) -> None:
+    """`gpu-tier`'s arguments: the tier it names is the checkout's gpu-marked files (`gpu_tier`)."""
+    choosing.add_argument("--evidence", action="store_true",
+                          help="each file of the tier with its marked tests and its records' backend reads")
+    choosing.add_argument("--shards", type=int, default=1, help="how many GPUs share the tier")
+    choosing.add_argument("--marked", action="store_true",
+                          help="the gpu-marked files, which the tier is: kept for dew-ops' kernel lab "
+                               "verify, which still passes it (ledger 2714)")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="tools/armada/ci.py")
     operations = parser.add_subparsers(dest="operation", required=True)
@@ -1761,10 +1771,7 @@ def main() -> int:
     itemizing.add_argument("--timings", type=Path, required=True)
     reporting = stages.add_parser("report")
     reporting.add_argument("directory", type=Path)
-    choosing = operations.add_parser("gpu-tier")
-    choosing.add_argument("--evidence", action="store_true",
-                          help="each file of the tier with its marked tests and its records' backend reads")
-    choosing.add_argument("--shards", type=int, default=1, help="how many GPUs share the tier")
+    tier_arguments(operations.add_parser("gpu-tier"))
     lane = operations.add_parser("gpu-lane")
     lane.add_argument("--tests", help="the test files; with --network, every file holding a "
                                        "network-marked test by default (`network_files`)")
