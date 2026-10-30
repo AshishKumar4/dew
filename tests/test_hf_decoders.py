@@ -268,10 +268,12 @@ def test_a_biased_mlp_loads_and_exports_where_the_reference_reads_mlp_bias(name,
         np.testing.assert_array_equal(reloaded, ours.astype(np.float32))
 
 @pytest.mark.gpu(reason="TF32 is a GPU's: a CPU multiplies float32 operands in float32 at any precision")
-def test_a_float32_decoder_at_jax_s_highest_precision_is_as_exact_as_transformers_on_a_gpu():
-    """A float32 decoder that states no precision multiplies at JAX's configured precision (ledger
-    2500): at "highest" its logits on a GPU are as exact as transformers' float32 ones, both from
-    transformers' float64 ones; at JAX's own default it runs TF32 there, as JAX documents."""
+def test_a_float32_decoder_under_the_accurate_policy_is_as_exact_as_transformers_on_a_gpu():
+    """A float32 decoder under a run's ACCURATE precision policy (`generation.run_precision`, ledger
+    2500) multiplies every product that states no precision in IEEE float32: its logits on a GPU are as
+    exact as transformers' float32 ones, both from transformers' float64 ones, JAX's own default (TF32
+    there, as JAX documents) cleared first. The policy sets the products' precision; the decoder's
+    float32 dtype keeps their operands float32."""
     import contextlib
 
     import torch
@@ -282,7 +284,10 @@ def test_a_float32_decoder_at_jax_s_highest_precision_is_as_exact_as_transformer
     directory = FIXTURES / "qwen3-tiny"
     ids = np.load(directory / "input_ids.npy")
     loaded = Pretrained.load(str(directory), dtype="float32", attention_impl="xla")
-    with jax.default_matmul_precision("highest"):
+    from dew.nn.kernels import generation
+    from dew.nn.precision import ACCURATE
+
+    with jax.default_matmul_precision(None), generation.run_precision(ACCURATE):
         ours = np.asarray(jax.jit(loaded.model.apply)(loaded.variables, jnp.asarray(ids)), np.float64)
 
     def theirs(dtype):

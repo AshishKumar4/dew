@@ -27,9 +27,11 @@ scope and contracted with the taps as one 2D product (stride 1 train 3.9 times, 
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import functools
 import os
 from collections.abc import Callable, Sequence
+from typing import Literal
 
 import jax
 import jax.numpy as jnp
@@ -39,9 +41,13 @@ from jax.extend import core
 from jax.typing import DTypeLike
 
 __all__ = [
+    "ACCURATE",
+    "FAST",
     "FP32_SUMS",
     "L2NORM_EPS",
+    "PRECISION_PRESETS",
     "WIDE_CPU_ARITHMETIC",
+    "Numerics",
     "accumulated",
     "activation_and_slope",
     "added_to",
@@ -501,12 +507,55 @@ def float32_matmul(lhs, rhs, precision: jax.lax.PrecisionLike = None) -> jax.Arr
     return accumulated(functools.partial(jnp.matmul, precision=precision), lhs, rhs)
 
 
+@dataclasses.dataclass(frozen=True)
+class Numerics:
+    """A run's numerics, set once and recorded with it, which its model, optimizer and trainer read: the
+    dtype the model computes in (Flax's `dtype`) and stores its parameters in (`param_dtype`), the
+    optimizer state's (`dew.optim.OptimConfig.state_dtype`, int8 a quantized store), the precision every
+    product that states none multiplies at (JAX's `jax_default_matmul_precision`; DEFAULT leaves JAX's
+    configuration as it stands, TF32 for a float32 product on a GPU), and each op's form, its kernels'
+    fast or accurate arithmetic (`dew.nn.kernels.generation.run_precision`). A precision a call or a
+    model states still wins, and determinism is a setting of its own. Two presets name the usual ones:
+    `FAST` and `ACCURATE` (`PRECISION_PRESETS`)."""
+
+    compute: str = "bfloat16"
+    params: str = "float32"
+    optimizer_state: Literal["float32", "bfloat16", "int8"] = "float32"
+    matmul: jax.lax.Precision = jax.lax.Precision.DEFAULT
+    forms: Literal["fast", "accurate"] = "fast"
+
+    def __post_init__(self):
+        for name in ("compute", "params"):
+            if not jnp.issubdtype(jnp.dtype(getattr(self, name)), jnp.floating):
+                raise ValueError(f"a precision policy's {name} dtype is a floating one, "
+                                 f"not {getattr(self, name)!r}")
+        if self.optimizer_state not in ("float32", "bfloat16", "int8"):
+            raise ValueError(f"a precision policy's optimizer state is float32, bfloat16 or int8, not "
+                             f"{self.optimizer_state!r}")
+        if self.forms not in ("fast", "accurate"):
+            raise ValueError(f"a precision policy's forms are fast or accurate, not {self.forms!r}")
+
+
+FAST = Numerics()
+"""Speed: bf16 compute over float32 parameters and optimizer moments, JAX's default matmul precision
+(TF32 on a GPU, one bf16 pass on a TPU) and each op's fast form."""
+
+ACCURATE = Numerics(compute="float32", matmul=jax.lax.Precision.HIGHEST, forms="accurate")
+"""Accurate, scientific work at its cost: float32 compute, parameters and moments, every product that
+states no precision in IEEE float32 (`Precision.HIGHEST`) and each op's accurate form."""
+
+PRECISION_PRESETS = {"fast": FAST, "accurate": ACCURATE}
+"""The named precision policies."""
+
+
 def exact_float32(precision: jax.lax.PrecisionLike) -> jax.lax.PrecisionLike:
-    """The precision a float32 product whose rounding decides what follows takes, a vocabulary head's,
-    a router's, softcapped scores' or a recurrence's state's (each states its reason where it calls
-    this): the one the call states, else the one JAX's config states (`jax_default_matmul_precision`),
-    else IEEE float32 (`Precision.HIGHEST`), not JAX's default, which runs TF32 on a GPU and one bf16
-    pass on a TPU, where the references multiply IEEE float32 (torch's float32 matmul)."""
+    """The precision a float32 product whose rounding decides what follows takes, a numerically critical
+    one, a vocabulary head's (the loss's logits), a router's or a recurrence's state's, each stating its
+    reason where it calls this: the one the call states, else the one JAX's config states
+    (`jax_default_matmul_precision`, a run's "accurate" policy among them), else IEEE float32
+    (`Precision.HIGHEST`), not JAX's default, which runs TF32 on a GPU and one bf16 pass on a TPU, where
+    the references multiply IEEE float32 (torch's float32 matmul). Every other product follows JAX's
+    default and the run's precision policy (`dew.nn.kernels.generation.run_precision`)."""
     if precision is not None or jax.config.jax_default_matmul_precision is not None:
         return precision
     return jax.lax.Precision.HIGHEST

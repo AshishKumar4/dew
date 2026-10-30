@@ -18,9 +18,11 @@ from test_run_options import lm, scalars, trained
 
 from dew.checkpoints import Checkpoints
 from dew.cli.main import main
+from dew.config import RunConfig, earlier_run
 from dew.config.lm import LMRunConfig
 from dew.data import Loading, presets
 from dew.data.sources.tokens import TokenFiles
+from dew.nn.precision import ACCURATE
 from dew.optim import OneCycle, OptimConfig, ParamGroup
 from dew.registry import ModelConfig
 
@@ -156,17 +158,17 @@ def test_an_optax_factory_named_by_its_path_makes_its_own_updates_in_a_saved_run
 
 
 @pytest.mark.mesh(devices=8)
-def test_a_runs_recorded_attention_form_is_the_form_it_trains_in(tmp_path):
-    """`trainer.attention_form` is the form every attention of the run trains in (row 2245), passed to
-    the template's own choice (`generation.chosen`, whose arithmetic tests/test_attention_route.py holds
-    to each form): a step of the same run recorded "accurate" and recorded with none ends on other
-    weights, and `dew train` of each run's own record, under a new name, ends on that run's weights,
-    bit for bit."""
+def test_a_runs_recorded_precision_is_the_policy_it_trains_in(tmp_path):
+    """`trainer.precision` is the policy every program of the run traces under (rows 2245 and 2500),
+    the attention template's form among it (`generation.run_precision`, whose form
+    tests/test_attention_route.py holds to each policy's arithmetic): a step of the same run recorded
+    "accurate" and recorded with none ends on other weights, and `dew train` of each run's own record,
+    under a new name, ends on that run's weights, bit for bit."""
     run = lm(tmp_path, drawn=False)
     run = dataclasses.replace(run, model=ModelConfig("causal_transformer", {
         **run.model.fields, "attention_impl": "template"}))
     states = {name: trained(run, tmp_path, name, trainer=fields)[0]
-              for name, fields in (("accurate", {"attention_form": "accurate"}), ("default", {}))}
+              for name, fields in (("accurate", {"precision": ACCURATE}), ("default", {}))}
     assert any(not np.array_equal(np.asarray(mine), np.asarray(theirs)) for mine, theirs in zip(
         *(jax.tree.leaves(state.variables["params"]) for state in states.values()), strict=True))
     for name, state in states.items():
@@ -175,6 +177,29 @@ def test_a_runs_recorded_attention_form_is_the_form_it_trains_in(tmp_path):
                      "--set", "trainer.checkpoint_final=True"]) == 0
         again = Checkpoints(str(tmp_path / "runs" / f"{name}-again")).variables(step=1)
         assert_same_leaves(again["params"], state.variables["params"])
+
+
+def test_a_run_saved_with_its_attention_form_reads_as_the_precision_it_named(tmp_path):
+    """A run.json saved while the trainer recorded `attention_form` reads back with that form as its
+    precision policy's forms (`dew.config.earlier_run`, ledger 2500), so the run loads and resumes as it
+    trained, and a run under the other form is refused its resume; a configuration written today that
+    names it is refused."""
+    record = tmp_path / "record"
+    run = lm(tmp_path, drawn=False)
+    run.save(str(record))
+    written = json.loads((record / "run.json").read_text())
+    trainer = {name: value for name, value in written["fields"]["trainer"].items() if name != "precision"}
+    for form in ("fast", "accurate"):
+        written["fields"]["trainer"] = {**trainer, "attention_form": form}
+        (record / "run.json").write_text(json.dumps(written))
+        loaded = RunConfig.load(str(record))
+        assert loaded.trainer.precision.forms == form
+        # It resumes as the run it records, and a run under the other policy is refused its resume.
+        loaded.check_resume(earlier_run(written))
+    with pytest.raises(ValueError):
+        run.check_resume(earlier_run(written))
+    with pytest.raises(ValueError):
+        RunConfig.read(written)
 
 
 def test_a_run_recorded_before_its_stop_took_a_plateau_still_pauses(tmp_path):

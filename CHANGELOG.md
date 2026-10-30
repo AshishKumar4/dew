@@ -8,7 +8,13 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 - A float32 product with no stated precision follows JAX's configured precision
   (`jax_default_matmul_precision`), TF32 on recent GPUs as JAX documents, where Dew pinned it at
   `Precision.HIGHEST`; a model's `precision` field still sets its own. A float32 run on an A100 trained
-  2.8 times slower for the pin. `jax.default_matmul_precision("highest")` takes the IEEE products back.
+  2.8 times slower for the pin. A router's logits, a vocabulary head's (the loss's) and a recurrence's
+  state products keep IEEE float32 where nothing states a precision, each for its stated reason.
+- One run-level precision policy: `--trainer.precision fast` (the default, JAX's defaults and each op's
+  fast form) or `accurate` (every product that states no precision at "highest" and each op's accurate
+  form, the attention template's among them), recorded with the run. It replaces
+  `--trainer.attention-form`; a run saved with that field loads and resumes as the policy it named. It
+  sets how products multiply, not the dtype: a run in float32 throughout sets its model's dtype too.
 - DEX (arXiv 2505.16333): a learned differential on chosen heads' attention outputs, `O'_h = O_h -
   lambda(t) O_h W_D,h`, with lambda annealed from zero over the run's first updates
   (`dew.nn.dex.DifferentialExtension`). Attach it with `Pretrained.load(..., dex=...)` or

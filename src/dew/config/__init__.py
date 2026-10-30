@@ -59,7 +59,7 @@ from dew.files import write_atomically
 from dew.lora import LoRA
 from dew.nn.dex import DifferentialExtension
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import attention_route
+from dew.nn.precision import FAST, Numerics
 from dew.objectives.base import Effects, Loss, Metric, Objective
 from dew.optim import OptimConfig
 from dew.quantization import Quantization
@@ -497,10 +497,12 @@ class TrainerConfig:
     once per stage.
     """
     dynamic_scale: bool = False
-    attention_form: Literal["fast", "accurate"] = "fast"
-    """The form the attention template computes in (`dew.nn.kernels.templates.attention_route`):
-    "accurate" takes its accurate products, at their cost, for every attention the run traces, the
-    step and its evaluations, and a resumed run traces in the form it records."""
+    precision: Numerics = FAST
+    """The run's numerics, set once and recorded with it (`dew.nn.precision.Numerics`, the presets
+    `FAST` and `ACCURATE`): its products' precision and its ops' forms over every program it traces, the
+    step and its evaluations (`dew.nn.kernels.generation.run_precision`), and the dtypes its model and
+    optimizer take. A precision the model states still wins, and a resumed run traces under the policy
+    it records."""
     mesh: MeshSpec = dataclasses.field(default_factory=MeshSpec)
     microbatches: int | None = None
     """Microbatches a pipelined step feeds through the mesh's stages, a
@@ -612,9 +614,6 @@ class TrainerConfig:
             raise ValueError("--trainer.split reads each step's batch in that many microbatches, at least 1")
         if self.publish and (self.wandb is None or not self.checkpoint_final):
             raise ValueError("trainer.publish requires trainer.wandb and trainer.checkpoint_final")
-        if self.attention_form not in attention_route.FORMS:
-            raise ValueError(f"--trainer.attention-form is one of the template's forms "
-                             f"{attention_route.FORMS}, not {self.attention_form!r}")
         run_length(self.steps, self.epochs, self.tokens, self.examples, required=False)
         if isinstance(self.log_every, str) and not is_share(self.log_every):
             raise ValueError(f"--trainer.log-every is steps or a share such as 1%, not {self.log_every!r}")
@@ -861,6 +860,24 @@ def _unrecorded(value: Dataset | Mapping[str, Dataset] | None) -> list[str]:
         return [reason for split in value.values() for reason in _unrecorded(split)]
     encoded = records.encode(value)
     return [encoded.reason] if isinstance(encoded, records.Unrecorded) else []
+
+
+def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
+    """A saved run's record (its run.json, `{"class": ..., "fields": ...}`) with its fields in the shapes
+    Dew writes now, every earlier shape of a saved run read here and nowhere else (`RunConfig.load`,
+    `check_resume`): a trainer's `attention_form`, which its precision policy's `forms` hold now
+    (`dew.nn.precision.Numerics`, ledger 2500). A configuration written today that names
+    `attention_form` is refused by name, as any field a trainer does not declare. A record in today's
+    shapes passes as it is. Carried to 1.0, when it is deleted (ledger 1552)."""
+    fields = record.get("fields")
+    trainer = fields.get("trainer") if isinstance(fields, Mapping) else None
+    if not isinstance(fields, Mapping) or not isinstance(trainer, Mapping) or "attention_form" not in trainer:
+        return record
+    if "precision" in trainer:
+        raise ValueError("a saved run's trainer records attention_form beside precision, which holds it now")
+    held = {name: value for name, value in trainer.items() if name != "attention_form"}
+    policy = {"forms": trainer["attention_form"]}
+    return {**record, "fields": {**fields, "trainer": {**held, "precision": policy}}}
 
 
 def _read_chain(name: str, written: object) -> Dataset | dict[str, Dataset] | None:
@@ -1306,7 +1323,7 @@ class RunConfig:
         `trust` names the packages outside Dew the record may import."""
         path = epath.Path(directory)
         record = (path if str(directory).endswith(".json") else path / RUN_FILE).read_text()
-        return cls.read(json.loads(record), trust=trust)
+        return cls.read(earlier_run(json.loads(record)), trust=trust)
 
     @classmethod
     def read(cls, record: Mapping[str, object], *, trust: Sequence[str] = ()) -> Self:
@@ -1574,7 +1591,7 @@ class RunConfig:
                 (`Checkpoints.resumed`), on every rank, before the record is written over it."""
                 saved = epath.Path(checkpoints.directory) / RUN_FILE
                 if checkpoints.resumed(trainer.resume) is not None and saved.exists():
-                    self.check_resume(json.loads(saved.read_text()))
+                    self.check_resume(earlier_run(json.loads(saved.read_text())))
 
             def record_run() -> None:
                 """Write the run's record and name where it is tracked, on rank zero."""
@@ -1595,8 +1612,8 @@ class RunConfig:
             # profile, tune_kernels and any step compiled ahead; prepare_process read the process fields,
             # and the rest are fit's arguments or built the checkpoints and the tracker.
             ahead = None if trainer.ahead is None else AheadOfTime.load(trainer.ahead)
-            # Every attention the run traces takes its recorded form.
-            with generation.chosen(attention_form=trainer.attention_form):
+            # Every program the run traces takes its recorded precision policy.
+            with generation.run_precision(trainer.precision):
                 state = self.built(objective, trainer.mesh, rollout, checkpoints=checkpoints, tracker=tracker,
                                    profile=trainer.profile, lower_for=trainer.lower_for, ahead=ahead).fit(
                     dataset, steps=steps, tokens=trainer.tokens, log_every=trainer.log_every,
@@ -1632,7 +1649,7 @@ class RunConfig:
         target = self.trainer.compile_ahead
         assert target is not None
         mesh = self.trainer.mesh.build(compile_only_gpus(target.generation, target.devices, target.capacity))
-        with generation.chosen(attention_form=self.trainer.attention_form):
+        with generation.run_precision(self.trainer.precision):
             return target.compiled(self.built(objective, mesh, rollout, links=target.links), dataset, steps)
 
     def built[LossT, EffectsT](self, objective: Objective[LossT, EffectsT],
