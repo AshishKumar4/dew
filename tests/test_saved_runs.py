@@ -170,25 +170,28 @@ def test_a_run_an_earlier_main_saved_resumes_from_its_checkpoint(tmp_path, monke
 
 def test_a_requests_products_are_named_by_their_variable_scopes():
     """The products the saved-run evidence compares (`saved_run_products`) are named by the variable scope
-    of the module that runs them beneath its root's class, whichever method it runs them in: a helper
-    method's product is its owner's, a shared scope's its sharer's, two siblings' apart, two roots applied
-    apart in one request apart; and a projection whose dtype moves moves alone."""
+    of the module that runs them in the task's tree, whichever method or class runs them: a helper
+    method's product is its owner's, a shared scope's its sharer's, two siblings' apart, two roots of one
+    class applied over two branches of the tree apart, a renamed class's the same; and a projection whose
+    dtype moves moves alone. Two branches alike in every leaf, which no root's reading tells apart, are
+    refused."""
     import jax.numpy as jnp
     from flax import linen as nn
-    from saved_run_products import products, scoped
+    from saved_run_products import products, scoping
 
     class Pair(nn.Module):
         right: jnp.dtype
+        width: int = 4
 
         def setup(self):
-            self.left = nn.Dense(4, dtype=jnp.float32, param_dtype=jnp.float32)
-            self.right_ = nn.Dense(4, dtype=self.right, param_dtype=jnp.float32, name="right")
+            self.left = nn.Dense(self.width, dtype=jnp.float32, param_dtype=jnp.float32)
+            self.right_ = nn.Dense(self.width, dtype=self.right, param_dtype=jnp.float32, name="right")
 
         def project(self, x):
             return self.right_(x)
 
         def __call__(self, x):
-            return self.left(x) + self.project(x)
+            return self.left(x)[..., :4] + self.project(x)[..., :4]
 
     class Shared(nn.Module):
         """A `Pair` in this module's own scope (`nn.share_scope`), as a release's decoder shares its text
@@ -203,27 +206,26 @@ def test_a_requests_products_are_named_by_their_variable_scopes():
         def __call__(self, x):
             return self.inner(x)
 
-    def read(right, kind=Pair) -> dict[str, list[str]]:
-        model, x = kind(right), jnp.ones((2, 4), jnp.float32)
-        variables = model.init(jax.random.key(0), x)
-        with nn.intercept_methods(scoped):
-            lowered = jax.jit(model.apply).lower(variables, x)
+    class Renamed(Pair):
+        """`Pair` under another name, over the same variables."""
+
+    x = jnp.ones((2, 4), jnp.float32)
+
+    def read(roots: dict[str, nn.Module]) -> dict[str, list[str]]:
+        tree = {"params": {name: root.init(jax.random.key(0), x)["params"] for name, root in roots.items()}}
+
+        def request(tree, x):
+            return sum(root.apply({"params": tree["params"][name]}, x) for name, root in roots.items())
+
+        with nn.intercept_methods(scoping(tree)):
+            lowered = jax.jit(request).lower(tree, x)
         return products([lowered.as_text(debug_info=True)])
 
-    assert read(jnp.float32) == {"Pair/left": ["float32"], "Pair/right": ["float32"]}
-    assert read(jnp.bfloat16) == {"Pair/left": ["float32"], "Pair/right": ["bfloat16"]}
-    assert read(jnp.bfloat16, Shared) == {"Shared/left": ["float32"], "Shared/right": ["bfloat16"]}
-
-    # Two roots applied apart in one request, each over its own variables, keep their products apart.
-    first, second = Pair(jnp.float32), Shared(jnp.bfloat16)
-    x = jnp.ones((2, 4), jnp.float32)
-    variables = first.init(jax.random.key(0), x), second.init(jax.random.key(1), x)
-
-    def both(variables, x):
-        return first.apply(variables[0], x) + second.apply(variables[1], x)
-
-    with nn.intercept_methods(scoped):
-        lowered = jax.jit(both).lower(variables, x)
-    assert products([lowered.as_text(debug_info=True)]) == {
-        "Pair/left": ["float32"], "Pair/right": ["float32"], "Shared/left": ["float32"],
-        "Shared/right": ["bfloat16"]}
+    assert read({"pair": Pair(jnp.bfloat16)}) == {"pair/left": ["float32"], "pair/right": ["bfloat16"]}
+    assert read({"pair": Shared(jnp.bfloat16)}) == read({"pair": Pair(jnp.bfloat16)})
+    assert read({"pair": Renamed(jnp.bfloat16)}) == read({"pair": Pair(jnp.bfloat16)})
+    assert read({"first": Pair(jnp.float32), "second": Pair(jnp.bfloat16, width=8)}) == {
+        "first/left": ["float32"], "first/right": ["float32"], "second/left": ["float32"],
+        "second/right": ["bfloat16"]}
+    with pytest.raises(ValueError):
+        read({"first": Pair(jnp.float32), "second": Pair(jnp.bfloat16)})
