@@ -23,8 +23,9 @@ pytestmark = pytest.mark.kernel
 
 ON_A_GPU = pytest.mark.skipif(
     jax.default_backend() == "gpu",
-    reason="on a GPU the port's fp32 products are fla's TF32, held to float64 trained natively "
-           "(tests/test_gpu_recurrence.py); interpreted, they are exact")
+    reason="on a GPU the port's fp32 products are fla's TF32, held to fla's own distance from float64 "
+           "(test_fla_gdn.the_port_is_as_exact_as_fla, a cell of tests/test_gpu_recurrence.py); interpreted, "
+           "they are exact")
 
 
 def fla_math(q, k, v, g, beta, h0):
