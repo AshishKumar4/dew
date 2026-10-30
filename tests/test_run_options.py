@@ -872,14 +872,15 @@ def witnessed_by(run: RunConfig, root: Path, settings: type, flags, queued: dict
     return failed
 
 
-def witnessed_on(builder, objective: str, settings: type, root: Path
+def witnessed_on(builder, objective: str, settings: type, root: Path, elsewhere: frozenset[str] = frozenset()
                  ) -> tuple[dict[str, Option], dict[str, str], bool]:
     """The options of `settings` the run `builder` makes saves (`options_of`), and why each the run does not
     witness is not: one with no path its settings do not declare derived, or derived from data the run
     leaves unfilled; one set alone to each alternative in turn (`witnessed_by`) none of which trains, saves
     it and has its loaded task consume it: hold it where it held another before (`held`) and answer apart
     from the same task with what it held before in its place, the consumer's work, not its record
-    (`unread`), a released task's export too (`dew export`), where the run exports, which it says."""
+    (`unread`), a released task's export too (`dew export`), where the run exports, which it says. An
+    option another run witnessed already (`elsewhere`) is not set again here."""
     import dew
     from dew.objectives.base import ReleasedTask
 
@@ -907,7 +908,8 @@ def witnessed_on(builder, objective: str, settings: type, root: Path
     queued = {name: [value for value in (alternatives(found.annotation) if found.builds else option.values)
                      if found.makes(value) and not same(found.made(value), held_at(base, name))
                      and (name in BESIDE or accepted(base, name, found.made(value)))]
-              for name, option in options.items() if (found := option.found) is not None}
+              for name, option in options.items()
+              if (found := option.found) is not None and name not in elsewhere}
     reachable = {name: option.found for name, option in options.items() if option.found is not None}
     hints = typing.get_type_hints(type(run), include_extras=True)
 
@@ -1018,8 +1020,12 @@ def test_each_option_a_saved_task_is_built_with_reaches_it_from_the_command_line
     assert settings.__name__ in TASK_RUNS, f"no run here trains an objective whose task reads {settings}"
     from dew.objectives.base import ReleasedTask
 
-    witnessed = [witnessed_on(builder, objective, settings, tmp_path / builder.__name__)
-                 for builder, objective in TASK_RUNS[settings.__name__]]
+    # Each run witnesses the options no run before it did, each option set once on the runs that hold it.
+    witnessed, done = [], frozenset()
+    for builder, objective in TASK_RUNS[settings.__name__]:
+        witnessed.append(witnessed_on(builder, objective, settings, tmp_path / builder.__name__, done))
+        options, failures, _ = witnessed[-1]
+        done |= {name for name in options if name not in failures}
     found = [(options, failures) for options, failures, _ in witnessed]
     # An option is witnessed on a run that holds it, which a release's settings may not (a split's).
     missed = {name: [failures[name] for options, failures in found if name in options]
