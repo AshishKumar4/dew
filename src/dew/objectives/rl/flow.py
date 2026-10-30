@@ -41,7 +41,7 @@ from dew.objectives.diffusion.objective import DiffusionObjective
 from dew.rl.advantage import group_normalised
 from dew.rl.surrogate import clipped_surrogate_terms
 from dew.sampling.flow import FlowSDE, FlowTrajectory, GaussianTransition
-from dew.sampling.guidance import CFG, Walk
+from dew.sampling.guidance import CFG, Autoguidance, Walk
 from dew.sampling.solvers import Euler, Solver
 
 from .sessions import ADVANTAGES_KEY, OLD_LOG_PROBS_KEY
@@ -254,9 +254,11 @@ class FlowGRPOObjective(DiffusionObjective):
             # prediction hands the model there, whatever its guidance makes of them (a doubled batch, an
             # autoguidance's main call), read off that call (`called_with`).
             policy = self._policy(variables, batch)
-            # The policy's own weights, as every guidance binds them (an autoguidance's main model holds
-            # its weaker model's, `guide`, out).
-            own = {name: tree for name, tree in policy.params.items() if name != "guide"}
+            # The policy's weights as its guidance binds its model's call over them: an autoguidance's
+            # main model holds its weaker model's, `guide`, out (`Autoguidance.walk`); every other
+            # guidance binds the denoiser's whole tree (`Denoiser._raw`).
+            own = policy.params if not isinstance(self.guidance, Autoguidance) else {
+                name: tree for name, tree in policy.params.items() if name != "guide"}
             args, kwargs = called_with(policy.model, own,
                                        lambda: walk.at((), 0)(latents[:, 0], times[:, 0]))
             inspected = self.watched_forward(step, policy.model, own, *args, **kwargs)
