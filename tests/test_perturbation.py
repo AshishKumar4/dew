@@ -35,6 +35,7 @@ from dew.inputs import Field, InputSpec
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import REMAT_POLICIES
 from dew.nn.multimodal import MultimodalTransformer
+from dew.nn.progress import progress
 from dew.nn.vision import GemmaProjector, SiglipVision
 from dew.objectives.base import Objective, Ratio, Step
 from dew.objectives.lm import IndexerTraining, LMObjective
@@ -436,6 +437,38 @@ def test_a_run_trains_without_differentiating_its_model():
     state = Trainer(objective, optax.sgd(0.01), key=0, layout=LAYOUT).fit(batches, steps=40)
     for moved, held in zip(jax.tree.leaves(state.variables), jax.tree.leaves(start), strict=True):
         assert not np.array_equal(np.asarray(moved), np.asarray(held))
+
+
+class Progressing(nn.Module):
+    """A Dense layer whose output the run's progress scales (`dew.nn.progress`): by the updates the run
+    committed before the step, zero at its first step."""
+
+    @nn.compact
+    def __call__(self, x):
+        updates = progress().updates
+        return nn.Dense(2)(x) * (1.0 if updates is None else updates.astype(jnp.float32))
+
+
+def test_the_estimate_runs_the_model_at_the_progress_its_loss_read():
+    """The estimate runs the model again in the step's derivative, at the progress the step's loss read
+    (ledger 2477): a model the progress scales to zero at a run's first step is estimated zero there and
+    not at its third, and a run trains it, every step's derivative at its own step's progress."""
+    objective = Forward(Progressing(), squared, inputs=InputSpec(Field("x", (3,))))
+    variables = objective.init(jax.random.key(0))
+    batch = {name: jnp.asarray(value) for name, value in rows((3,)).items()}
+
+    def estimate(updates: int) -> list[jax.Array]:
+        step = Step(jnp.asarray(0), jax.random.key(1), None, committed=jnp.asarray(updates, jnp.int32))
+        derivative = jax.grad(parameter_loss(objective, variables, batch, step))
+        return jax.tree.leaves(derivative(variables["params"]))
+
+    for leaf in estimate(0):
+        np.testing.assert_array_equal(leaf, np.zeros_like(leaf))
+    assert all(np.any(np.asarray(leaf) != 0) for leaf in estimate(2))
+    data = rows((3,))
+    batches = Memory([{"x": x, "y": y} for x, y in zip(data["x"], data["y"], strict=True)]).repeat().batch(16)
+    state = Trainer(objective, optax.sgd(0.01), key=0, layout=LAYOUT).fit(batches, steps=3)
+    assert int(state.updates) == 3
 
 
 class Normed(nn.Module):

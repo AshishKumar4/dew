@@ -9,16 +9,27 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax.traverse_util import flatten_dict, unflatten_dict
+from model_support import TINY_DECODER
 from reference_error import as_given, assert_as_exact, widened
 
 from dew.batch import FROZEN, thaw
 from dew.interop import Pretrained, PretrainedDecoder
-from dew.nn.dex import DifferentialExtension, LayerDex, annealed, diff_lambda_init, differential
+from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.dex import (
+    DEX_COLLECTION,
+    DexStart,
+    DifferentialExtension,
+    LayerDex,
+    annealed,
+    diff_lambda_init,
+    differential,
+)
+from dew.nn.progress import Progress, stepping
 
 LLAMA = Path(__file__).parent / "fixtures" / "hf" / "llama-tiny"
 HEADS = (1, 3)
 SEEDS = {"dex differential": 256, "dex through the decoder": 8, "dex at the anneal's start": 8,
-         "dex gradients through the decoder": 256}
+         "dex gradients through the decoder": 256, "dex scanned": 8, "dex exported": 8}
 """Check 1's declared seeds for each site, sized paired by `seeds_for` on armada (IGDEXS, IGDEXS4)."""
 
 
@@ -77,17 +88,19 @@ def test_lambda_anneals_from_zero_to_its_learned_value():
     """Eq. 4: lambda(0) = 0, half way (1 - a) (t/T) lambda_init + a lambda_learn at a = 1/2, the learned
     value from T on, and the learned value outside training (no step); lambda_init by default the
     Differential Transformer's depth schedule."""
-    layer = LayerDex(HEADS, 0.6, 100)
+    layer, begins = LayerDex(len(HEADS), 100), jnp.asarray(0.6, jnp.float32)
     learned = jnp.asarray(0.25, jnp.float32)
-    assert float(annealed(jnp.asarray(0), layer, learned)) == 0.0
+    assert float(annealed(jnp.asarray(0), layer, begins, learned)) == 0.0
     # In float32, each operation as Eq. 4 orders it.
     a, start = np.float32(0.5), np.float32(0.5) * np.float32(0.6)
-    assert float(annealed(jnp.asarray(50), layer, learned)) == (1 - a) * start + a * np.float32(0.25)
+    assert float(annealed(jnp.asarray(50), layer, begins, learned)) == (1 - a) * start + a * np.float32(0.25)
     for updates in (100, 1000):
-        assert float(annealed(jnp.asarray(updates), layer, learned)) == np.float32(0.25)
-    assert annealed(None, layer, learned) is learned
-    chosen = DifferentialExtension(((1, (3, 1, 1)),), anneal_steps=10).layer(1)
-    assert chosen == LayerDex((1, 3), diff_lambda_init(2), 10)
+        assert float(annealed(jnp.asarray(updates), layer, begins, learned)) == np.float32(0.25)
+    assert annealed(None, layer, begins, learned) is learned
+    extension = DifferentialExtension(((1, (3, 1, 1)),), anneal_steps=10)
+    assert extension.layer(1) == LayerDex(2, 10)
+    assert extension.start(1) == DexStart((1, 3), diff_lambda_init(2))
+    assert extension.layer(0) is None and extension.start(0) is None
     assert diff_lambda_init(1) == 0.8 - 0.6
     for layers in ((), ((0, ()),), ((0, (1,)), (0, (2,)))):
         with pytest.raises(ValueError):
@@ -160,12 +173,43 @@ def test_a_loaded_source_takes_dex_by_the_papers_recipe():
     added = {key[-1] for key in flatten_dict(loaded.variables["params"])} - {
         key[-1] for key in flatten_dict(source.variables["params"])}
     assert added == {"dex_projection", "dex_lambda"}
-    # The source's format holds no extension: its export refuses it, where a run's checkpoint, which keeps
-    # it, reads back as a bundle of the decoder it extends.
-    with pytest.raises(ValueError):
-        loaded.export()
+    held = flatten_dict(loaded.variables[DEX_COLLECTION])
+    np.testing.assert_array_equal(held[("layers_0", "self_attn", "dex_heads")], HEADS)
+    assert float(held[("layers_0", "self_attn", "dex_lambda_init")]) == np.float32(diff_lambda_init(1))
+    # A run's checkpoint keeps the extension, and reads back as a bundle of the decoder it extends.
     rebuilt = PretrainedDecoder.from_model(loaded.model, loaded.variables)
     assert rebuilt.model.dex == loaded.model.dex
+
+
+def exported_site(directory: Path):
+    """Check 1's arms for an export of the extended decoder: the source loaded back from what `save`
+    writes of a draw's variables, the source's forward over the folded output projection (`folded`),
+    a draw of moved variables, and the folded route's float64 as truth."""
+    source, loaded = loads()
+
+    @as_given
+    def reloaded(variables, ids, _):
+        loaded.save(directory, variables=variables)
+        back = Pretrained.load(directory, dtype="float32", attention_impl="reference")
+        return np.asarray(back.model.apply(back.variables, ids))
+
+    wide = source.model.clone(dtype=jnp.float64)
+    return (reloaded, jax.jit(lambda variables, ids, _: source.model.apply(folded(variables), ids)),
+            moved_draw(loaded.variables, loaded.model.features_per_head),
+            jax.jit(lambda variables, ids, _: wide.apply(folded(traced_wide(variables)), ids)))
+
+
+def test_an_export_writes_dex_folded_into_its_output_projections(tmp_path):
+    """The source's format holds no extension, so an export writes each layer's differential at its
+    learned lambda folded into its output projection (ledger 2478): the source loaded back from it
+    computes what the extended decoder does outside a run, on par with the folded route through the
+    source's forward from its float64 (check 1). A layer whose output gate scales its heads' outputs
+    before the projection does not fold, and its export refuses."""
+    reloaded, through, draw, truth = exported_site(tmp_path)
+    assert_as_exact(reloaded, through, draw, "dex exported", seeds=SEEDS["dex exported"], truth_fn=truth)
+    assert every_layer(output_gate=True).dex_export_refusal() == (
+        "layer 0: its output gate scales its heads' outputs channel by channel")
+    assert every_layer().dex_export_refusal() is None
 
 
 def test_a_run_starts_from_its_source_and_its_learned_lambda_once_annealed():
@@ -173,8 +217,6 @@ def test_a_run_starts_from_its_source_and_its_learned_lambda_once_annealed():
     updates: at update 0 the extended decoder computes its source's logits whatever its extension holds,
     and from the anneal's end on, as outside a run, the source's forward over the folded output
     projection (`folded`), each on par from the float64 of what it is held to (check 1)."""
-    from dew.nn.progress import Progress, stepping
-
     source, loaded = loads()
     draw = moved_draw(loaded.variables, loaded.model.features_per_head)
 
@@ -232,6 +274,57 @@ def test_dex_trains_through_the_decoder_as_its_folded_output_projection():
                     seeds=SEEDS["dex gradients through the decoder"], truth_fn=wide_through)
     found = extended(*draw(0))
     assert all(np.any(np.asarray(leaf) != 0) for name, leaf in found.items() if "dex_" in name)
+
+
+EVERY_LAYER = DifferentialExtension(((0, (0, 1)), (1, (1, 3)), (2, (2, 0)), (3, (3, 2))), anneal_steps=10)
+"""DEX on each of four layers, each choosing two heads of its own, lambda_init the depth schedule's."""
+
+
+def every_layer(**fields) -> CausalTransformer:
+    return CausalTransformer(**{"vocab_size": 64, **TINY_DECODER, "num_layers": 4, "dtype": jnp.float32,
+                                "attention_impl": "reference", "dex": EVERY_LAYER, **fields})
+
+
+def mid_anneal(model):
+    """`model`'s logits within a run's step half way through the anneal (`dew.nn.progress`), compiled."""
+    @jax.jit
+    def run(variables, tokens):
+        with stepping(Progress(jnp.asarray(5, jnp.int32))):
+            return model.apply(variables, tokens)
+    return run
+
+
+def scanned_site():
+    """Check 1's arms for the scanned run of `every_layer`: the scanned and plain decoders mid-anneal, a
+    draw of their variables with each layer's lambda and projections moved off their start, and the
+    plain decoder's float64 as truth."""
+    plain = every_layer()
+    start = plain.init(jax.random.key(0), jnp.zeros((2, 7), jnp.int32))
+
+    def draw(seed):
+        rng = np.random.default_rng([0xD5, seed])
+        flat = flatten_dict(start["params"])
+        for key in flat:
+            if key[-1] in ("dex_lambda", "dex_projection"):
+                flat[key] = jnp.asarray(rng.uniform(-0.5, 0.5, flat[key].shape), jnp.float32)
+        tokens = jnp.asarray(rng.integers(0, 64, (2, 7)), jnp.int32)
+        return {**start, "params": unflatten_dict(flat)}, tokens
+
+    wide = mid_anneal(plain.clone(dtype=jnp.float64))
+    return (mid_anneal(every_layer(scan_layers=True)), mid_anneal(plain), draw,
+            jax.jit(lambda variables, tokens: wide(traced_wide(variables), tokens)))
+
+
+def test_layers_that_choose_their_own_heads_scan_and_pipeline_as_one_run():
+    """Each layer's chosen heads and lambda_init are its own variables, so layers that choose as many
+    heads share one spec (ledger 2476): the four scan as one run and split over two pipeline stages,
+    and the scanned run mid-anneal, each layer at its own heads and lambda_init, is on par with the
+    plain loop from its float64 (check 1)."""
+    assert every_layer().stage_split(2).count == 2
+    scanned, plain, draw, truth = scanned_site()
+    variables, _ = draw(0)
+    assert every_layer(scan_layers=True).apply(variables, method=lambda module: module.groups) == ((0, 4),)
+    assert_as_exact(scanned, plain, draw, "dex scanned", seeds=SEEDS["dex scanned"], truth_fn=truth)
 
 
 def test_a_run_names_dex_on_the_command_line_and_its_record_rebuilds_it():
