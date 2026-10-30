@@ -1288,11 +1288,13 @@ class CausalTransformer(nn.Module):
                                   self.precision)
         else:
             logits = self.lm_head(x)
-        logits = logits.astype(at_least_fp32(logits.dtype))
+        # The head's own dtype stands for the compute's where the model states none (a float64 truth's).
+        computed, logits = logits.dtype, logits.astype(at_least_fp32(logits.dtype))
         # Returned in the run's output dtype (`output_dtype`), past the fp32 gains, bias and cap.
         return capped_logits(scaled_logits(logits, self._token_gains(),
                                            self.head_bias_value if self.head_bias else None),
-                             self.final_logit_softcap).astype(output_dtype(self.dtype))
+                             self.final_logit_softcap).astype(
+            output_dtype(computed if self.dtype is None else self.dtype))
 
     def _token_gains(self) -> jax.Array | None:
         """nGPT's fp32 per-token gain on the logits, past the head's product; None without one."""
