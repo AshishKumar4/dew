@@ -75,8 +75,8 @@ def experts(mesh, nonce: float, ahead=None) -> Trainer:
 BATCH = {"x": np.zeros((ROWS, FEATURES), np.float32)}
 
 
-@pytest.fixture
-def nonce() -> float:
+@pytest.fixture(name="nonce")
+def fresh_compilation_nonce() -> float:
     """A value no earlier run's step was compiled with (`Experts.nonce`)."""
     return float(time.time_ns() % 10**9) / 10**12
 
