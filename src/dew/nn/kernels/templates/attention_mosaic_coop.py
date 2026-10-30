@@ -31,14 +31,16 @@ def _coop_allocations(family: mosaic.Family, config: BackwardTiles, width: int, 
                       ) -> tuple[list, dict]:
     """The shared-keys launch's allocations as `Family.scoped` takes them, in `_coop_launch`'s order: the
     program's resident keys and values; a tile's weights and score cotangents, every consumer's share of
-    the keys in whole tiles of their swizzle (64 bytes, a share of 32 keys); each consumer's fp32 stage
-    of its adds a chunk of its columns at a time (`mosaic.staged_columns`: width 256's two stages of its
-    64 x 256 slots fit beside it); the two loads' barriers and the consumers' two turns a step; and its
-    query and output-cotangent streams in `stages` slots (`Family.streams`)."""
+    the keys whole rows of their swizzle, the widest whose row divides it and the products' contractions
+    over the tile's queries and keys (`mosaic.swizzle_for`: 64 bytes at a share of 32); each consumer's
+    fp32 stage of its adds a chunk of its columns at a time (`mosaic.staged_columns`: width 256's two
+    stages of its 64 x 256 slots fit beside it); the two loads' barriers and the consumers' two turns a
+    step; and its query and output-cotangent streams in `stages` slots (`Family.streams`)."""
     consumers, block_q, block_k = config.consumers, config.block_q, config.block_k
     chunk = mosaic.staged_columns(width // consumers, (jnp.float32,))
+    swizzle = mosaic.swizzle_for(dtype, block_k // consumers, block_q, block_k)
     scoped = [plgpu.SMEM((block_k, width), dtype), plgpu.SMEM((block_k, width), dtype),
-              mosaic.staged((2, block_q, block_k), dtype, 64),
+              mosaic.staged((2, block_q, block_k), dtype, swizzle),
               plgpu.SMEM((consumers, max(block_q, block_k), chunk), jnp.float32),
               family.load_barriers(2), family.schedule(consumers), family.schedule(consumers)]
     blocks = {"queries": ((block_q, width), dtype), "douts": ((block_q, width), dtype)}

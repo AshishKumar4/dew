@@ -574,11 +574,12 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         dtype = ba.arguments["query"].dtype
         family = bundle_of(config, dtype)
         if config.shared_keys:
-            # Every consumer's share of the keys whole tiles of the exchange's swizzle (32 keys at 64 bytes)
-            # and its share of the columns whole swizzled rows (`attention_mosaic_coop`).
+            # Every consumer's share of the keys whole rows of a swizzle the exchange stages them at
+            # (`mosaic.swizzle_for`), its share of the columns whole swizzled rows (`attention_mosaic_coop`).
             share = _width(ba.arguments["query"].shape[-1], family, dtype) // config.consumers
+            narrowest = mosaic.NARROWEST_SWIZZLE_BYTES // jnp.dtype(dtype).itemsize
             return (config.fused and config.queries_first and config.consumers > 1 and config.columns == 1
-                    and (config.block_k // config.consumers) % 32 == 0
+                    and (config.block_k // config.consumers) % narrowest == 0
                     and share % family.column_unit(dtype) == 0)
         # A width split among programs adds its dQ once, in no fused launch, each share whole swizzled rows.
         shares = [_width(ba.arguments[name].shape[-1], family, dtype) / config.columns
