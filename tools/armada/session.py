@@ -48,8 +48,10 @@ def pytest_environment(environ: Mapping[str, str]) -> dict[str, str]:
     return {**os.environ, **environ, **CLOSED_HUB, "PYTHONPATH": path}
 
 
-MARKS = ("gpu", "kernel")
-"""The marks of tests a GPU runs otherwise: those only a GPU runs, and a kernel's, which a CPU interprets."""
+MARKS = ("gpu",)
+"""The marks of tests a GPU runs: its behavioural flows' (tests/test_gpu_*.py, the owner's rule of no unit
+tests on a GPU, ledger 2452), and the few gpu-marked tests not yet a flow's cells. A kernel's tests run on the
+CPU alone, interpreted; each kernel's native run is a flow's cell."""
 
 
 def starts(weights: list[int], capacity: int) -> list[int]:

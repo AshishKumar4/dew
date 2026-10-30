@@ -61,8 +61,9 @@ entries carry to their tasks (`--cache`), or without the Worker's URL and
 token, a task runs every file.
 
 A row's record also says where its tests read the backend and which are
-marked to run on a GPU, from which `gpu-tier` names the files that take
-another path on a GPU (all of them daily, the marked ones per batch). A GPU
+marked to run on a GPU (`gpu-tier --evidence` reports it); `gpu-tier` names the
+files marked to run on a GPU, a day's and a batch's alike: the behavioural flows
+(tests/test_gpu_*.py; no unit test runs on a GPU, ledger 2452). A GPU
 node runs them with `gpu-lane`, each as a task of a CUDA lane, whose rows are
 recorded and reused on the GPU's class as a CPU task's are on the CPU's. With `--network`, a GPU node that
 reaches the Hub runs every file's network-marked tests, which every other task sets aside, as one lane of
@@ -1677,8 +1678,10 @@ def main() -> int:
         print(f"{len(changed)} files refolded in {session.DURATIONS}: {' '.join(changed) or 'none'}")
         return 0
     if args.operation == "gpu-tier":
-        tier = ({name: [f"{count} marked"] for name, count in marked(PYTHONS[0]).items()} if args.marked
-                else gpu_tier(PYTHONS[0]))
+        # A GPU runs its marked files alone, a batch's and a day's alike (ledger 2452): the records' evidence
+        # (`gpu_tier`) is what --evidence reports, which a day's tier no longer chooses by.
+        tier = ({name: [f"{count} marked"] for name, count in marked(PYTHONS[0]).items()}
+                if args.marked or not args.evidence else gpu_tier(PYTHONS[0]))
         if args.evidence:
             for name, evidence in tier.items():
                 print(name, *evidence, sep="\t")
