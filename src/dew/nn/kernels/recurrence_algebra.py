@@ -333,10 +333,22 @@ def factor(a, issue: Issue = portable):
 
 def paired(name: str, left, right, decay, issue: Issue = portable):
     """`sum_d left[s, d] right[t, d] decay[s, t, d]` within each chunk, `[..., C, C]`: one decay channel
-    scales the product `name` after it, one per key dimension weighs each term of it."""
-    if decay.shape[-1] == 1:
-        return issue(name, left, jnp.swapaxes(right, -1, -2)) * decay[..., 0]
-    return float32_einsum('...sd,...td,...std->...st', left, right, decay)
+    scales the product `name` after it, one per key dimension weighs each term of it. Its depth is summed
+    in two halves added compensated (`compensated_add`): the chunk form's solve and readout cancel what
+    these sums carry where keys align, and one fp32 sum over the key width put the portable math's output
+    1.52 times the token recurrence's distance from float64 where fp32 products sum in fp32 (1.34 in
+    halves; ledger 2467)."""
+    half = left.shape[-1] // 2
+
+    def summed(depth):
+        lhs, rhs = left[..., depth], right[..., depth]
+        if decay.shape[-1] == 1:
+            return issue(name, lhs, jnp.swapaxes(rhs, -1, -2))
+        return float32_einsum('...sd,...td,...std->...st', lhs, rhs, decay[..., depth])
+
+    first, second = summed(slice(None, half)), summed(slice(half, None))
+    total = sum(compensated_add((first, jnp.zeros_like(first)), (second, jnp.zeros_like(second))))
+    return total * decay[..., 0] if decay.shape[-1] == 1 else total
 
 
 def intra(key, keyed, pairs, issue: Issue = portable):
