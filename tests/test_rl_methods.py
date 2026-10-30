@@ -422,23 +422,26 @@ def test_a_run_drawing_further_batches_resumes_after_the_last_it_drew(tmp_path):
     from dew.training import Layout
 
     sessions = {str(task): (agreeing if task == 0 else varying)(task) for task in range(5)}
-    batches = [[0, 1], [2, 3], [4, 1], [2, 3]]
+    # Eight tasks a batch, one a device: the step's batch admits two groups of the four it takes, and
+    # the batch it draws the other two.
+    batches = [[0, 0, 0, 0, 1, 1, 0, 0], [2, 3, 2, 3, 0, 0, 0, 0], [4, 1, 4, 1, 4, 1, 4, 1],
+               [2, 3, 2, 3, 2, 3, 2, 3]]
     objective, rollout = composed("dapo", TinyHead(vocab_size=VOCAB), 15)
 
     def fit(steps, checkpoints=None):
         collector = Scripted(sessions)
-        scheduler = RolloutScheduler(Synchronous(collector), groups=2, admit=2, generation_batches=3,
+        scheduler = RolloutScheduler(Synchronous(collector), groups=2, admit=4, generation_batches=3,
                                      **rollout)
         stream = Loader(train=replayed(lambda partition: ({"task_id": np.asarray(batch, np.int32)}
                                                           for batch in batches)),
-                        val=None, records=None, batch=2)
+                        val=None, records=None, batch=8)
         trainer = Trainer(objective, optax.sgd(0.1), key=jax.random.key(3), rollout=scheduler,
                           layout=Layout(min_shard=1, tolerance=1.0), checkpoints=checkpoints)
         trainer.fit(stream, steps=steps, log_every=steps, checkpoint_every=None if checkpoints is None else 1)
         return collector.collected
 
     whole = fit(2)
-    assert [tasks for tasks, _ in whole] == [[0, 1], [2, 3], [4, 1]]
+    assert [tasks for tasks, _ in whole] == batches[:3]
     checkpoints = str(tmp_path / "run")
     assert fit(1, Checkpoints(checkpoints)) + fit(2, Checkpoints(checkpoints)) == whole
 
