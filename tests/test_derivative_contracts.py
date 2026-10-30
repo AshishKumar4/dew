@@ -1228,10 +1228,11 @@ def test_the_lm_heads_hold_their_reverse_orders(head, edge):
     """The LM head's three custom VJPs (`chunked._whole_head`, `_bounded_head`, `_fused`): the head's
     per-token cross entropy and log partition of `hidden @ table.T`, whole, in tiles, or summed with its
     gradient taken in the forward. Their reverse orders, reverse over reverse among them, finite wherever
-    float64 is a normal float32 and the plain formula, the whole logits' log-softmax, is. JAX runs no
-    forward derivative through a custom VJP; a forward rule beside the hand-written backward is a custom
-    JVP whose tangent is a linear map transposing to it (`dew.nn.kernels.generation.linear_tangent`),
-    which the heads do not take yet (row 2690)."""
+    float64 is a normal float32 and the plain formula, the whole logits' log-softmax, is, and the whole
+    head's forward derivative of its gradient. JAX runs no forward derivative through a custom VJP; a
+    forward rule beside the hand-written backward is a custom JVP whose tangent is a linear map
+    transposing to it (`dew.nn.kernels.generation.linear_tangent`), which the heads do not take yet, nor
+    the tiled ones a gradient's forward derivative under remat (row 2690)."""
     scale = EDGES[edge]
     hidden, table = normal_draw(2704, (2, 4, 8), (11, 8), scale=scale)
     direction = normal_draw(2705, hidden.shape, table.shape, scale=scale)
@@ -1259,7 +1260,8 @@ def test_the_lm_heads_hold_their_reverse_orders(head, edge):
 
     (cotangent,) = normal_draw(2706, jax.eval_shape(plain, hidden, table).shape)
     assert_contract(heads, (hidden, table), direction, cotangent, f"the {head} LM head {edge}",
-                    truth_fn=plain, plain_fn=plain, without=FORWARD_ORDERS)
+                    truth_fn=plain, plain_fn=plain,
+                    without=OWN_FORWARD_ORDERS if head == "whole" else FORWARD_ORDERS)
 
 
 @pytest.mark.parametrize("edge", EDGES)
