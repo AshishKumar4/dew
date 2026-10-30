@@ -13,6 +13,7 @@ import contextlib
 import dataclasses
 import fnmatch
 from collections.abc import Callable, Iterator, Mapping
+from typing import Any
 
 import flax.linen as nn
 import jax
@@ -81,7 +82,7 @@ def flattened(inspected: Mapping) -> dict[str, jax.Array]:
     each of its entries by its index, `.../<module path>/<i>/<statistic>`, one index a stacking axis."""
     found: dict[str, jax.Array] = {}
     for path, leaf in jax.tree_util.tree_flatten_with_path(inspected)[0]:
-        keys = [str(getattr(entry, "key", entry)) for entry in path]
+        keys = [str(entry.key) if isinstance(entry, jax.tree_util.DictKey) else str(entry) for entry in path]
         statistic, module = keys[-1], [key for key in keys[:-1] if key != SOWN]
         for index in np.ndindex(*leaf.shape):
             found["/".join(["activations", *module, *map(str, index), statistic])] = leaf[index]
@@ -97,7 +98,7 @@ class Watched:
     histogram: bool = False
 
 
-def called_with(model: nn.Module, variables: Mapping, run: Callable[[], object]) -> tuple[tuple, dict]:
+def called_with(model: nn.Module, variables: Mapping, run: Callable[[], Any]) -> tuple[tuple, dict]:
     """The arguments `run` first calls `model` over `variables` with, as its caller made them: for a
     forward an objective runs inside a transform, the inputs `Objective.watched_forward` reruns it on.
     Only that call counts, identified by its weights (it binds the arrays of `variables` and no others,
