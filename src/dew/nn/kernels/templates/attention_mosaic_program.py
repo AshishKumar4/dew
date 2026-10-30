@@ -165,8 +165,9 @@ def _parts(accurate: bool, dtype) -> int:
     return len(jax.eval_shape(lambda c: algebra.cotangent_parts(c, dtype, accurate=accurate), tile))
 
 
-DROPPING = Refusal('dropout_places', "the Mosaic mainloop draws dropout at its own places; a sequence exchange "
-                  "slice draws at its global places, a table gather a tile (`DropPlaces`)", row='1521')
+DROPPING = Refusal('dropout_places',
+                  "the Mosaic mainloop draws dropout at its own places; a sequence exchange slice draws at "
+                  "its global places, a table gather a tile (`DropPlaces`)", row='1521')
 """Why this mainloop refuses a dropping call that draws at a slice's global places (`refused`)."""
 
 

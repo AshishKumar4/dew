@@ -232,7 +232,8 @@ def _old_route[C](op: Op[C], case: C) -> tuple[Kernel[C], str, Refusal | None] |
         return kernel, name, None
     return kernel, preferred, Refusal(
         'measured', f"{name} measured faster than {preferred} on this cell "
-                    f"({', '.join(part for part in cell if part)}): {receipt}", 'bible da64ae5', kind='measured')
+                    f"({', '.join(part for part in cell if part)}): {receipt}",
+        'bible da64ae5', kind='measured')
 
 
 def _preferred[C](op: Op[C], case: C) -> str:

@@ -44,7 +44,6 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import fuser
 from jax.extend import core as jax_core
 
-from dew.nn.kernels import generation
 from dew.nn.kernels.selection import Kernel, Op, Refusal, select
 from dew.nn.kernels.templates.gemm import template
 
