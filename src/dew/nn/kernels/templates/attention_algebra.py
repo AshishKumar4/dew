@@ -443,8 +443,13 @@ def walked_launches[O](spec: Forward, launch: Launch[O], kept: Callable[[jax.Arr
     def guarded_launch(form: Forward, outputs: O, over: jax.Array) -> O:
         if not form.headroom:
             return outputs
+        # The rows kept plain read again from the plain launch run again inside the rare branch, so the
+        # plain launch's own outputs reach one branch alone, whose result their buffer then is: read by
+        # both, XLA copied them in the common branch (ET-GUARDHLO-h100: `copy.7`, the whole output, 0.047
+        # ms of Qwen3-8B's 0.66 ms causal forward).
         return jax.lax.cond(jnp.max(over.astype(jnp.int32)) > 0,
-                            lambda: kept(over, launch(form, over)[0], outputs), lambda: outputs)
+                            lambda: kept(over, launch(form, over)[0], launch(form, None)[0]),
+                            lambda: outputs)
 
     outputs, maxima, over = launch(spec, None)
     if not spec.base2:
