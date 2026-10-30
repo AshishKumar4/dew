@@ -1117,18 +1117,18 @@ class CausalSelfAttention(nn.Module):
         groups = _Groups() if prefix is not None else self._key_groups(attention_metadata, history, decode, S)
         if self._reads_whole_blocks(attention_metadata, prefix, append, decode):
             causal, window, groups = False, None, groups._replace(block_groups=None)
-        # Over the keys the call reads, the cache's or the prefix's joined.
-        masked = self._mask_kernel(query, key, decode)
+        # Over the keys the call reads (the cache's or the prefix's joined), decided only where it is taken.
+        masked = functools.partial(self._mask_kernel, query, key, decode)
         cached = isinstance(documents, CrossDocuments)
         if (cached or groups != _Groups()) and self.ctx.attention_impl != 'auto':
-            implementation = masked  # a named kernel's handoff (`_mask_kernel`)
+            implementation = masked()  # a named kernel's handoff (`_mask_kernel`)
         valid = None
         if prefix is None and self._restricts_visibility(attention_metadata, decode, causal) and not cached:
             # A decode step's mask and a cache call's documents hold the rows' validity; an uncached
             # call's real keys reach the kernel beside the rest, its window counting real tokens.
             valid = None if decode or attention_metadata is None else attention_metadata.valid
             if decode or self.ctx.attention_impl != 'auto':
-                implementation = masked
+                implementation = masked()
         runs = None
         own, implementation = self._overridden(attention_metadata, rotary_positions, B, S, key.shape[-3],
                                                key_places, implementation, masked, decode)
@@ -1140,22 +1140,23 @@ class CausalSelfAttention(nn.Module):
                                     key.shape[-3], self.ctx.attention_chunk, block_groups=groups.block_groups,
                                     image_groups=groups.image_groups)
             causal, window, documents, groups, valid, runs = False, None, None, _Groups(), None, None
-            implementation = masked
+            implementation = masked()
         max_segments = (None if documents is None else 1 if isinstance(documents, CrossDocuments)
                         else coordinates_of(attention_metadata, B, S).max_segments)
         return _Masking(query, key, value, causal, window, mask, documents, max_segments, implementation,
                         cursor, starts, key_places, groups, valid, runs)
 
     def _overridden(self, metadata: AttentionMetadata | None, rotary_positions, B: int, S: int, keys: int,
-                    key_places, implementation: AttentionImpl, masked: AttentionImpl, decode: bool):
+                    key_places, implementation: AttentionImpl, masked: Callable[[], AttentionImpl],
+                    decode: bool):
         """A call's own visibility (`call_visibility`), None where it states none, and the kernel it takes:
-        a mask's the masked one (`masked`), as a cached call's or a named kernel's runs do; an uncached
+        a mask's the masked one (`masked()`), as a cached call's or a named kernel's runs do; an uncached
         call's runs the one the layer chooses ('auto')."""
         own = None if metadata is None else call_visibility(
             metadata, rotary_positions, batch=B, queries=S, keys=keys, key_places=key_places,
             sliding_window=self.ctx.sliding_window)
         if own is not None and (own.mask is not None or decode or self.ctx.attention_impl != 'auto'):
-            implementation = masked
+            implementation = masked()
         return own, implementation
 
     @property

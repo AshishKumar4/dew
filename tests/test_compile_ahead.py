@@ -7,6 +7,7 @@ under one placement, whichever backend compiles it. What it costs and its execut
 a GPU loads and runs the saved executable (TL-*-compile-ahead-881)."""
 
 import dataclasses
+import json
 
 import jax
 import jax.numpy as jnp
@@ -169,6 +170,7 @@ def test_a_step_compiled_ahead_is_one_program_and_a_run_of_another_refuses_it(tm
     to (`AheadOfTime.program`); a wider model's is another. A run handed another program's step
     refuses it before it trains, and refuses it again on its next fit, rather than compiling its own
     (row 1915)."""
+    from dew.nn.kernels.generation import assumed
     from dew.training.ahead import AheadOfTime, compile_ahead, compile_only_gpus
 
     batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
@@ -180,9 +182,11 @@ def test_a_step_compiled_ahead_is_one_program_and_a_run_of_another_refuses_it(tm
     assert first.program == again.program != wide.program
     wide.save(tmp_path / "wide.dew-aot")
     run = fine_tune(MeshSpec().build(jax.devices()[:1]), ahead=AheadOfTime.load(tmp_path / "wide.dew-aot"))
-    for _ in range(2):
-        with pytest.raises(ValueError):
-            run.fit(batch, steps=1, log_every=1)
+    # On the GPU it was compiled for, which a CPU is not, its program is what refuses it (train 332's review).
+    with assumed(wide.target):
+        for _ in range(2):
+            with pytest.raises(ValueError):
+                run.fit(batch, steps=1, log_every=1)
 
 
 def test_a_configured_run_compiles_its_step_ahead_for_gpus_it_lacks_and_trains_nothing(tmp_path):
@@ -209,6 +213,34 @@ def test_a_configured_run_compiles_its_step_ahead_for_gpus_it_lacks_and_trains_n
     saved = AheadOfTime.load(path)
     assert (saved.generation, saved.devices) == ("sm80", 1) and saved.peak_bytes > 0
     assert saved.capacity == 2**30 and saved.plan is not None
+    assert not runs.exists()
+
+
+def test_a_configured_run_compiles_its_step_ahead_for_a_tpu_topology_with_its_stated_links(tmp_path):
+    """`--trainer.compile-ahead.generation` names a TPU topology as well as a CUDA generation: the run
+    compiles its first step for that topology's compile-only devices here, through the plan a run takes,
+    and writes it as any step compiled ahead (ledger 2551). The links it compiles with are the run's own
+    (`trainer.links`), which the step records (ledger 2552)."""
+    from test_run_options import lm
+
+    from dew.config.lm import LMRunConfig
+    from dew.training.ahead import AheadOfTime, CompiledAhead
+
+    runs, path = tmp_path / "runs", tmp_path / "step.dew-aot"
+    default = lm(tmp_path, drawn=False)
+    assert isinstance(default, LMRunConfig)
+    links = {"tensor": {"bytes_per_second": 4.5e11, "flops_per_second": 9.9e14}}
+    run = LMRunConfig.cli(["--trainer.name", "ahead", "--trainer.checkpoint-dir", str(runs),
+                           "--trainer.steps", "2", "--trainer.compile-ahead.generation", "v5e:2x2",
+                           "--trainer.compile-ahead.devices", "4", "--trainer.compile-ahead.path", str(path),
+                           "--trainer.mesh.tensor", "2", "--set", f"trainer.links={json.dumps(links)}"],
+                          default=default)
+    with pytest.raises(CompiledAhead) as ended:
+        run.run()
+    assert ended.value.code == 0
+    saved = AheadOfTime.load(path)
+    assert (saved.generation, saved.devices) == ("v5e", 4) and saved.peak_bytes > 0
+    assert saved.links["tensor"].bytes_per_second == 4.5e11
     assert not runs.exists()
 
 
@@ -358,6 +390,46 @@ def test_a_run_handed_its_step_compiled_ahead_trains_from_it_on_its_gpu(tmp_path
                for new, old in zip(jax.tree.leaves(state.variables["params"]), initial, strict=True))
 
 
+@pytest.mark.tpu(reason="runs a step compiled ahead for this host's TPU topology as a run's first step")
+def test_a_run_handed_its_step_compiled_ahead_for_a_tpu_topology_trains_from_it(tmp_path):
+    """A step compiled ahead for this host's one-chip TPU topology (`compile_only_tpus`), saved and handed
+    to the run on the TPU itself, is the program the run lowers its first step to, and the run trains
+    from it, its plan's first compile the step compiled ahead: the TPU run row 2090 asks for."""
+    from dew.nn.kernels.generation import gpu_target
+    from dew.training.ahead import AheadOfTime, compile_ahead, compile_only_tpus
+
+    batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
+    chip = gpu_target(jax.devices()[0].device_kind).generation
+    compile_ahead(fine_tune(MeshSpec().build(compile_only_tpus(f"{chip}:1x1")), xla=True),
+                  batch).save(tmp_path / "step.dew-aot")
+    run = fine_tune(MeshSpec().build(jax.devices()[:1]), ahead=AheadOfTime.load(tmp_path / "step.dew-aot"),
+                    xla=True)
+    state = run.fit(batch, steps=2, log_every=1)
+    first, *_ = listed(record(run.plan, "plan")["probes"], "probes", read=record, what="probes")
+    assert int(state.step) == 2 and first["ahead"] is True
+
+
+def test_a_run_naming_its_input_alone_compiles_its_step_ahead(tmp_path):
+    """An objective that names its input field alone (`Supervised(inputs="x")`) compiles its step ahead
+    (`AheadTarget.compiled`) as `fit` would start it: its input declared at the shape the loader's first
+    batch gives (`Trainer._declare_input`) before the run is checked (train 325's review of ledger
+    2551)."""
+    from flax import linen as nn
+
+    from dew.data.dataset import Loader
+    from dew.objectives.supervised import Supervised
+    from dew.training.ahead import AheadTarget, compile_only_gpus
+
+    data = Loader(train=lambda partition: iter([{"x": np.ones((BATCH, 8), np.float32),
+                                                  "y": np.zeros((BATCH, 4), np.float32)}] * 4),
+                  val=None, batch=BATCH, records=None)
+    trainer = Trainer(Supervised(nn.Dense(4), lambda outputs, batch: (outputs - batch["y"]) ** 2, inputs="x"),
+                      optax.sgd(0.1), key=jax.random.key(0),
+                      mesh=MeshSpec().build(compile_only_gpus("sm90", 1)))
+    ended = AheadTarget("sm90", 1, str(tmp_path / "step.dew-aot")).compiled(trainer, data, steps=1)
+    assert ended.ahead.devices == 1 and trainer.objective.inputs is not None
+
+
 FAST = {"tensor": Link(1e18, 1e9)}
 """A tensor axis whose link moves a projection's bytes in no time beside its FLOPs: any projection
 spreads over it, as over a measured NVLink one may."""
@@ -390,11 +462,10 @@ def test_a_step_compiled_ahead_records_the_links_its_program_was_decided_by():
 
 
 def test_a_stated_link_is_the_one_a_step_compiled_ahead_records_and_a_handed_run_traces_with(caplog):
-    """A step compiled ahead over a link its trainer states, as `--trainer.compile-ahead.links` states
-    one, records that link whole, bandwidth and peak, and is the program a stated link spreads by; a run
+    """A step compiled ahead over a link its trainer states, as `trainer.links` states one, records
+    that link whole, bandwidth and peak, and is the program a stated link spreads by; a run
     handed it that states another traces with the step's, and says so once (train 300's review: the
     step recorded the bandwidth alone, so a run stating the same link traced with its own peak)."""
-    from dew.config.lm import LMRunConfig
     from dew.training.ahead import compile_ahead, compile_only_gpus
 
     batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
@@ -407,11 +478,6 @@ def test_a_stated_link_is_the_one_a_step_compiled_ahead_records_and_a_handed_run
     with caplog.at_level("WARNING", logger="dew.training.ahead"):
         assert stated.over(other) == stated.over(FAST) == stated.links
     assert len(caplog.records) == 1
-    parsed = LMRunConfig.cli(["trainer.compile-ahead:ahead", "--trainer.compile-ahead.generation", "sm90",
-                              "--trainer.compile-ahead.devices", "2", "--trainer.compile-ahead.path", "step",
-                              "--trainer.compile-ahead.links",
-                              '{"tensor": {"bytes_per_second": 1e18, "flops_per_second": 1e9}}'])
-    assert parsed.trainer.compile_ahead is not None and parsed.trainer.compile_ahead.links == FAST
 
 
 @pytest.mark.gpu(reason="loads a step compiled ahead over a tensor axis onto two GPUs")

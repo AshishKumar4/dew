@@ -93,7 +93,11 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
     each consumer's `block_k` keys of a query head resident, walked by the query tiles that see them,
     streamed with their output cotangents through a ring each, queries first (`_fused_step`), under the
     first pass's D and the forward's denominator, each tile's dQ added into dQ atomically
-    (`Family.added`). Returns dQ `[B, Qp, H, D]`, dK and dV `[B, Kp, H, D]`, fp32."""
+    (`Family.added`); where key heads are shared, each query head's dK and dV added into its key head's own
+    (FlashAttention 3's grouped epilogue, hopper/epilogue_bwd.hpp's CollectiveEpilogueBwdGQA: Qwen3-8B's step
+    1.7% the faster causal, 1.3% full, ET-GQA1-h100, where XLA summed fp32 copies a query head's), else
+    stored (their zeros cost an ungrouped D64 step 1.7%). Returns dQ `[B, Qp, H, D]`, dK and dV
+    `[B, Kp, KV, D]`, fp32."""
     batch, queries, heads, width = query.shape
     keys_padded, kv_heads = key.shape[1], key.shape[2]
     program, consumers = walk.program, walk.consumers
@@ -101,6 +105,7 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
     block_q, block_k = program.tiles.block_q, program.tiles.block_k
     pair = consumers * block_k
     q_steps = queries // block_q
+    grouped = heads != kv_heads
     leaves, treedef = jax.tree.flatten(spans)
 
     def body(*refs, streams):
@@ -108,6 +113,7 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
         spans_of, refs = treedef.unflatten(refs[:len(leaves)]), refs[len(leaves):]
         dq_ref, dk_ref, dv_ref, k_smem, v_smem, staged, out_smem, k_loaded, v_loaded = refs
         row, head = lax.axis_index("batch"), lax.axis_index("heads")
+        key_head = lax.div(head, heads // kv_heads)
         views = _views_of({"queries": q_ref, "douts": do_ref}, row, head)
         streams = family.opened(streams, views)
         pair_first = lax.axis_index("k_tiles") * pair
@@ -119,7 +125,7 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
 
         def consumer(index):
             k_first = pair_first + index * block_k
-            keys_view = (row, pl.ds(k_first, block_k), lax.div(head, heads // kv_heads))
+            keys_view = (row, pl.ds(k_first, block_k), key_head)
             family.loaded(((k_ref.at[keys_view], k_smem.at[index], k_loaded.at[index]),
                            (v_ref.at[keys_view], v_smem.at[index], v_loaded.at[index])))
             lo, hi, whole = program.readers(k_first, q_steps, spans_of, row)
@@ -150,9 +156,12 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
                 streams, views, (lo, hi), streamed, index,
                 lambda streams, lo, hi, counted: family.walk(streams, segments(lo, hi), (), shapes,
                                                              walk.interpret, first=counted))
-            out = (row, pl.ds(k_first, block_k), head)
-            family.stored((dk, dv), (dk_ref.at[out], dv_ref.at[out]),
-                          smem=out_smem.at[index, pl.ds(0, block_k)])
+            smem = out_smem.at[index, pl.ds(0, block_k)]
+            if grouped:
+                for value, ref in ((dk, dk_ref), (dv, dv_ref)):
+                    family.added(value, ref.at[keys_view], walk.interpret, smem=smem)
+            else:
+                family.stored((dk, dv), (dk_ref.at[keys_view], dv_ref.at[keys_view]), smem=smem)
 
         def producer():
             family.stream(streams, views, *streamed)
@@ -165,16 +174,22 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
     def entry(*refs):
         family.scoped(functools.partial(body, *refs), *scoped, streams=rings)
 
-    gradient = jax.ShapeDtypeStruct((batch, keys_padded, heads, width), jnp.float32)
+    gradient = jax.ShapeDtypeStruct((batch, keys_padded, kv_heads, width), jnp.float32)
     launch = family.kernel(
-        entry, out_type=(gradient, gradient), grid=(heads, keys_padded // pair, batch),
+        entry, out_type=() if grouped else (gradient, gradient), grid=(heads, keys_padded // pair, batch),
         grid_names=("heads", "k_tiles", "batch"), consumers=consumers, interpret=walk.interpret,
         approx_math=walk.approx_math, name="attention_dkv_fused",
         # The model's products this launch owns (`stated`): dQ's, dK's, dV's and dP's; its `S` recomputed.
         cost=stated(walk.spec, batch, heads, walk.spec.queries or queries, 4 * width, query, key, value,
                     dout))
-    # dQ added into zeros in place: one copy, or each consumer's own interpreted (`Family.added`).
+    # dQ added into zeros in place, and grouped dK and dV: one copy, or dQ each consumer's own interpreted
+    # (`Family.added`), a consumer's keys its own.
     copies = consumers if walk.interpret else 1
     dq = jax.new_ref(jnp.zeros((copies, batch, queries, heads, width), jnp.float32))
-    dk, dv = launch(query, key, value, dout, peak, total, anchor, delta, key_index, *leaves, dq)
-    return jax.freeze(dq).sum(axis=0), dk, dv
+    operands = (query, key, value, dout, peak, total, anchor, delta, key_index, *leaves, dq)
+    if not grouped:
+        dk, dv = launch(*operands)
+        return jax.freeze(dq).sum(axis=0), dk, dv
+    dk, dv = (jax.new_ref(jnp.zeros(gradient.shape, jnp.float32)) for _ in range(2))
+    launch(*operands, dk, dv)
+    return jax.freeze(dq).sum(axis=0), jax.freeze(dk), jax.freeze(dv)
