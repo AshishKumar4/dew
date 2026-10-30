@@ -204,7 +204,7 @@ def _configured(value) -> JSON:
         return _configuration(value)
     # A container holding an array, or a configuration that sets an added field, entry by entry, as the
     # repr of either would not hold it whole.
-    if _holds_arrays(value) or set_added(value):
+    if _holds_arrays(value) or (isinstance(value, (list, tuple, Mapping)) and set_added(value)):
         if isinstance(value, (list, tuple)):
             return [_configured(entry) for entry in value]
         if isinstance(value, Mapping):
