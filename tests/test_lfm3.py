@@ -82,16 +82,15 @@ def test_a_native_decoder_saves_as_lfm3_and_reloads_the_same_model(tmp_path, san
     np.testing.assert_array_equal(np.asarray(restored.model.apply(restored.variables, ids)), expected)
 
 
-@pytest.mark.parametrize("form", ["plain", "looped"])
-def test_a_decision_run_trains_an_lfm3_release_plain_and_with_a_looped_block(tmp_path, release_cache, form):
-    """A decision run from an LFM3 release (LiquidAI/LFM3-1.7B at da90f4c, whose config, code and weights
-    are 40ebe0a's, which Dew is held to; ledger 2011) trains at a rate of 5e-6, plain and with a block of
-    its layers looped twice (`--loop-layers`, `--loop-steps`), a short convolution and full and sliding
-    attention among them, its source its language model with no prediction depth and its full-attention
-    layers reading blocks both ways (`--source.text-only`, `--source.prediction-depths 0`, `--source.attention
-    full_attention block_bidirectional`): every weight it trains finite, each kind of layer's weights
-    moved, its short convolutions', its full attention's and its sliding attention's, and the run records
-    its loop."""
+@pytest.mark.parametrize("arm", ["plain", "looped"])
+def test_plain_and_looped_lfm3_train_through_a_decision_run(tmp_path, release_cache, arm):
+    """Plain and looped LFM3 (LiquidAI/LFM3-1.7B at da90f4c, whose config, code and weights are
+    40ebe0a's, which Dew is held to; ledger 2011): a decision run from an LFM3 release trains at a fixed
+    rate, plain and with a block of its layers looped twice (`--loop-layers`, `--loop-steps`), a short
+    convolution and full and sliding attention among them, under a text-only decision source (its
+    language model, no prediction depth, its full-attention layers reading blocks both ways): every
+    weight it trains finite, each kind of layer's weights moved, its short convolutions', its full
+    attention's and its sliding attention's, and the run records its loop."""
     import shutil
 
     from model_support import flat_tree
@@ -107,9 +106,9 @@ def test_a_decision_run_trains_an_lfm3_release_plain_and_with_a_looped_block(tmp
     PretrainedDecoder.from_model(model, variables).save(tmp_path / 'release')
     for name in ('tokenizer.json', 'tokenizer_config.json', 'chat_template.jinja'):
         shutil.copy(QWEN / name, tmp_path / 'release' / name)
-    looped = ["--loop-layers", "1", "5", "--loop-steps", "2"] if form == "looped" else []
+    looped = ["--loop-layers", "1", "5", "--loop-steps", "2"] if arm == "looped" else []
     config = DecisionRunConfig.cli([
-        "--pretrained", str(tmp_path / 'release'), "--trainer.name", form,
+        "--pretrained", str(tmp_path / 'release'), "--trainer.name", arm,
         "--trainer.checkpoint-dir", str(tmp_path / "runs"), "--trainer.steps", "2",
         "--trainer.eval-every", "None", "--trainer.checkpoint-every", "None", "--trainer.log-every", "1",
         "--trainer.multi-host", "False", "--trainer.compilation-cache-dir", "None",
@@ -127,7 +126,7 @@ def test_a_decision_run_trains_an_lfm3_release_plain_and_with_a_looped_block(tmp
         moved = [name for name in trained if any(name.startswith(layer) for layer in layers)
                  and not np.array_equal(trained[name], start[name])]
         assert moved, kind
-    recorded = DecisionRunConfig.load(str(tmp_path / "runs" / form))
+    recorded = DecisionRunConfig.load(str(tmp_path / "runs" / arm))
     assert (recorded.loop_layers, recorded.loop_steps) == (((1, 5), 2) if looped else (None, None))
 
 
