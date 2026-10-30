@@ -17,9 +17,10 @@ one row, each option a span of its own.
 
 import dataclasses
 import functools
+import itertools
 import json
 import weakref
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Hashable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, Protocol, TypeGuard, get_args
 
@@ -212,6 +213,9 @@ class Encoded:
     """Each token's block (`QuestionLayout.blocks`): 0 on the row before its question, 1 from the
     question to the row's end, which a backbone that reads blocks attends to whole within each
     (`AttentionMetadata.block_groups`); None for a row read in order."""
+    streams: tuple[int, ...] | None = None
+    """Each token's stream, its index in the layout's (`stream_names`), which its reads say what each
+    token attends to (`Reads`, `Layout.attention`); None for a row read in order."""
 
     @property
     def trimmed(self) -> bool:
@@ -473,6 +477,12 @@ class Layout:
         their spans the contexts' (`Encoded.spans_in_context`)."""
         return False
 
+    @property
+    def attention(self) -> "tuple[tuple[tuple[int, ...], ...], int] | None":
+        """What each of its rows' tokens reads as the model lowers it (`DecisionInputs.reads`,
+        `fragments`), where its rows stand in streams (`Reads`); None for rows read in order."""
+        return None
+
     def bounds(self, encoder: Tokenizer, specials: Specials, context_length: int | None = None,
                segments: int | None = None, context_window: int | None = None) -> Bounds:
         """The most rows, at most `segments`, questions and options a window of `max_len` tokens
@@ -674,6 +684,10 @@ class QuestionLayout(Layout):
     copy its share of the room); None takes the layout's own (`StateFirstLayout`'s state first,
     `MarkerLayout`'s question first). A row of its own `segments` states its own order."""
 
+    reads: "Reads | None" = dataclasses.field(default=None, repr=False, metadata={_records.ADDED: True})
+    """Which of the row's streams each reads (`Reads`), where its question's segments stand in a stream
+    of the row's own (`Instructions.stream`); None for a row read in order."""
+
     def __post_init__(self) -> None:
         super().__post_init__()
         if self.head_max_len is not None:
@@ -703,11 +717,6 @@ class QuestionLayout(Layout):
                              "none of")
         if self.blocks and self.parallel:
             raise ValueError("blocks and parallel options each say what a row's tokens read; a row takes one")
-        streams = {segment.stream for segment in self.written
-                   if isinstance(segment, (Instructions, OptionLines))}
-        if len(streams) > 1:
-            raise ValueError("a question's instructions and its option lines are read in one stream, the "
-                             "row's or its context's")
         if self.spans_in_context and (self.parallel or any(
                 isinstance(segment, OptionLines) and segment.marker != "none" for segment in self.written)):
             raise ValueError("options read at their positions or markers stand in the row's tokens, which a "
@@ -722,6 +731,10 @@ class QuestionLayout(Layout):
         if self.order is not None and self.segments is not None:
             raise ValueError("order= writes the layout's own row in an order; segments= write a row of their "
                              "own, in the order they are given")
+        if self.reads is not None and (self.parallel or self.blocks):
+            raise ValueError("a row's reads say what each of its tokens reads, as parallel options and "
+                             "blocks do; a row takes one")
+        _streamed(self.written, self.reads)
 
     @property
     def written(self) -> "tuple[QuestionSegment, ...]":
@@ -751,8 +764,13 @@ class QuestionLayout(Layout):
     @property
     def spans_in_context(self) -> bool:
         """Whether its row writes its question to its context (`Instructions.stream`)."""
-        return any(isinstance(segment, (Instructions, OptionLines)) and segment.stream == "context"
+        return any(isinstance(segment, Instructions) and segment.stream == "context"
                    for segment in self.written)
+
+    @property
+    def attention(self) -> "tuple[tuple[tuple[int, ...], ...], int] | None":
+        """Its rows' reads over their streams (`streamed_attention`)."""
+        return streamed_attention(self.reads, self.written)
 
     def rows(self, encoder: Tokenizer, specials: Specials, state: JSON, questions: Mapping[str, Question],
              *, orders: Mapping[str, Sequence[int]] | None = None, media: Sequence[int] = (),
@@ -871,11 +889,14 @@ class QuestionLayout(Layout):
                                    if self.parallel else (None, None))
         # A cut of a row encoded whole is its characters (`_cut`); of a row of pieces, its own tokens.
         retokenized = unit == "whole" and bool(copies)
+        streams = (token_streams(laid.points, len(row_tokens), self.written)
+                   if self.reads is not None else None)
         encoded = Encoded(row_tokens, (row,), positions, option_slots, whole, state_kept,
                           state_cut=0 if retokenized else sum(own - kept for own, kept in held),
                           state_characters_cut=characters, instructions_cut=instructions_cut,
                           options_cut=options_cut, options_alike=alike,
-                          context=asked.tokens if in_context else None, spans_in_context=in_context)
+                          context=asked.tokens if in_context else None, spans_in_context=in_context,
+                          streams=streams)
         if not self.blocks:
             return encoded
         # The prefix is the tokens that end at or before the suffix's first character (serve.patch
@@ -893,7 +914,11 @@ class QuestionLayout(Layout):
         option lines stand in the list they went to, and each line's label text (`_option_chunks`), the
         question's header opening at `opening`."""
         head_at, cue_at, line_at, labelled = None, None, [], []
+        current = "row"
         for segment in self.written:
+            # Where the row turns to another of its streams, its tokens are marked there (`Reads`).
+            current = (stream_point(chunks, segment_stream(segment, self.written), current) if self.reads
+                       else current)
             if isinstance(segment, Text):
                 chunks.append(Chunk(segment.text))
             elif isinstance(segment, Special):
@@ -908,13 +933,17 @@ class QuestionLayout(Layout):
                 head_at = _instruction_chunks(context if segment.stream == "context" else chunks, segment,
                                               question, specials, opening)
             elif isinstance(segment, OptionLines):
-                line_at, labelled = self._option_chunks(context if segment.stream == "context" else chunks,
+                lines_in = segment_stream(segment, self.written)
+                line_at, labelled = self._option_chunks(context if lines_in == "context" else chunks,
                                                         segment, question, described, slots, names, texts,
                                                         specials)
             elif isinstance(segment, AnswerCue):
                 template = segment.template if len(names) <= segment.at else segment.many
                 cue_at = len(chunks)
                 chunks.append(Chunk(template.format(labels=segment.join.join(names))))
+        if self.reads:
+            # What follows the segments, a conversation's close, is the row's own.
+            stream_point(chunks, "row", current)
         return head_at, cue_at, line_at, labelled
 
     @staticmethod
@@ -1450,6 +1479,137 @@ def _kept(ids: Sequence[int], count: int, keep: Literal["start", "end", "all", "
     return tuple(ids[:count] if keep != "end" else ids[len(ids) - count:])
 
 
+type How = Literal["whole", "causal"]
+"""How a stream reads another (`Reads`): all of its tokens, or those up to the reader's own."""
+
+HOWS: dict[str, int] = {"whole": 1, "causal": 2}
+"""Each `How` as the model reads it (`DecisionInputs.reads`); 0 is reading none."""
+
+
+@dataclass(frozen=True)
+class Reads:
+    """Which of a row's streams each stream's tokens attend to: its attention record (row 2319).
+
+    A row's tokens stand in streams: `"row"`, and each other stream a segment names (`Schema.stream`,
+    `Instructions.stream`, its option lines with it), every other segment in the row's own. `table`
+    holds `(reader, read, how)`: a token of `reader` reads the tokens of `read` (`"self"`, its own
+    stream), all of them (`"whole"`) or those up to itself (`"causal"`); a pair the table omits reads
+    none. Two streams in one pass where the state reads the schema and the schema itself alone:
+    `Reads((("row", "self", "causal"), ("row", "schema", "whole"), ("schema", "self", "causal")))`,
+    the schema in `Schema(stream="schema")`, wherever the row lays it. Each stream reads itself, so
+    no token reads nothing; positions run along the row as it lays its tokens."""
+
+    table: tuple[tuple[str, str, How], ...]
+
+    def __post_init__(self) -> None:
+        pairs = [(reader, read) for reader, read, _ in self.table]
+        if len(set(pairs)) != len(pairs):
+            raise ValueError("a stream reads another one way: each (reader, read) pair once")
+        if any(how not in HOWS for _, _, how in self.table):
+            raise ValueError(f"a stream reads another {' or '.join(map(repr, HOWS))}")
+        readers = {reader for reader, _ in pairs}
+        missing = sorted(readers - {reader for reader, read in pairs if read == "self"})
+        if missing:
+            raise ValueError(f"every stream reads itself, which {', '.join(missing)} does not")
+
+    def lowered(self, streams: Sequence[str]) -> tuple[tuple[int, ...], ...]:
+        """The record as the model reads it, over a row's `streams` in their order: each stream's
+        reading of itself, then of each stream (`HOWS`, 0 for none)."""
+        unknown = sorted({name for reader, read, _ in self.table for name in (reader, read)}
+                         - {*streams, "self"})
+        if unknown:
+            raise ValueError(f"the layout's reads name {', '.join(unknown)}, which no segment of its rows "
+                             f"streams; its streams are {', '.join(streams)}")
+        absent = sorted(set(streams) - {reader for reader, _, _ in self.table})
+        if absent:
+            raise ValueError(f"the stream {', '.join(absent)} reads nothing the layout's reads state")
+        how = {(reader, read): HOWS[way] for reader, read, way in self.table}
+        return tuple((how[stream, "self"], *(how.get((stream, other), 0) for other in streams))
+                     for stream in streams)
+
+
+def streamed_attention(reads: "Reads | None", segments: "Sequence[Segment | QuestionSegment]"
+                       ) -> "tuple[tuple[tuple[int, ...], ...], int] | None":
+    """What a row of `segments` reads (`Layout.attention`): its `reads` over its streams (`Reads.lowered`)
+    and the most runs of one stream it lays (`fragment_count`); None for a row read in order."""
+    if reads is None:
+        return None
+    return reads.lowered(stream_names(segments)), fragment_count(segments)
+
+
+def _streamed(segments: "Sequence[Segment | QuestionSegment]", reads: "Reads | None") -> None:
+    """Refuse a layout whose `segments` name a stream of the row's own that no `reads` says what reads it,
+    or whose reads name a stream its segments do not lay (`Reads.lowered`)."""
+    named = sorted(set(stream_names(segments)) - {"row"})
+    if reads is None and named:
+        raise ValueError(f"the stream {', '.join(named)} is a stream of the row's own, which the layout's "
+                         "reads say what it reads and what reads it; give reads=")
+    if reads is not None:
+        reads.lowered(stream_names(segments))
+
+
+def segment_stream(segment: "Segment | QuestionSegment",
+                   segments: "Sequence[Segment | QuestionSegment]") -> str:
+    """The stream a segment of a row's `segments` stands in (`Reads`): its own where it names one, a
+    question's option lines its instructions' (`Instructions.stream`), else the row's."""
+    if isinstance(segment, OptionLines):
+        return next((part.stream for part in segments if isinstance(part, Instructions)), "row")
+    return segment.stream if isinstance(segment, (Schema, Instructions)) else "row"
+
+
+def stream_names(segments: "Sequence[Segment | QuestionSegment]") -> tuple[str, ...]:
+    """A row's streams (`Reads`): the row's, then each other one its `segments` name in their order, the
+    context its cross-attention reads not among them."""
+    named = [segment_stream(segment, segments) for segment in segments]
+    return ("row", *dict.fromkeys(name for name in named if name not in ("row", "context")))
+
+
+def fragment_count(segments: "Sequence[Segment | QuestionSegment]") -> int:
+    """The most runs of one stream a row of `segments` lays (the layout's framing in the row's stream):
+    the spans the model lowers its reads over (`DecisionInputs.fragments`)."""
+    named = ["row", *(name for name in (segment_stream(segment, segments) for segment in segments)
+                      if name != "context"), "row"]
+    return sum(1 for index, name in enumerate(named) if index == 0 or name != named[index - 1])
+
+
+def stream_point(chunks: "list[Chunk] | list[Chunk | State]", stream: str, current: str) -> str:
+    """Append to `chunks` the boundary where a row's stream turns to `stream` from `current`, a chunk of no
+    ids at which its text is encoded apart (`dew.decision.renderer.render`), and return the stream now
+    written; none where it stays."""
+    if stream not in (current, "context"):
+        chunks.append(Chunk(ids=(), points=((("stream", len(chunks), stream), 0),)))
+        return stream
+    return current
+
+
+def streamed_chunks(chunks: Sequence[Chunk], streams: Sequence[str]) -> list[Chunk]:
+    """`chunks`, each in its stream of `streams`, with the boundaries where the row turns to another
+    (`stream_point`), the row's own again after them."""
+    marked: list[Chunk] = []
+    current = "row"
+    for chunk, stream in zip(chunks, streams, strict=True):
+        current = stream_point(marked, stream, current)
+        marked.append(chunk)
+    stream_point(marked, "row", current)
+    return marked
+
+
+def token_streams(points: Mapping[Hashable, int], length: int,
+                  segments: "Sequence[Segment | QuestionSegment]") -> tuple[int, ...]:
+    """Each of a row's `length` tokens' stream, as its index in its `segments`' (`stream_names`), from the
+    boundaries its rendering kept (`stream_point`): the row's own before the first. It lays at most the
+    runs of one stream its segments do (`fragment_count`), which the model numbers them by."""
+    streams = stream_names(segments)
+    turns = sorted((at, key[1], key[2]) for key, at in points.items()
+                   if isinstance(key, tuple) and len(key) == 3 and key[0] == "stream")
+    marked = [0] * length
+    for (at, _, name), following in zip(turns, [*turns[1:], (length, 0, "")], strict=True):
+        marked[at:following[0]] = [streams.index(name)] * (following[0] - at)
+    runs = 1 + sum(1 for before, after in itertools.pairwise(marked) if before != after)
+    assert runs <= fragment_count(segments), "a row lays the runs of one stream its segments do"
+    return tuple(marked)
+
+
 @dataclass(frozen=True)
 class Schema:
     """Every question of the request as a field of the schema, never cut: its id, type and
@@ -1460,9 +1620,10 @@ class Schema:
     `stream` is where the schema is read: in the row (`"row"`), or as the row's context
     (`"context"`), which the backbone reads in a pass of its own, with its own weights, and its
     cross-attention layers read beside the row (`DecisionModel.states`), the head pooling the
-    questions and options from that pass."""
+    questions and options from that pass; or as a stream of the row of its own name, which the
+    layout's `Reads` says what it reads and what reads it."""
 
-    stream: Literal["row", "context"] = "row"
+    stream: str = "row"
 
 
 type Segment = Text | Media | State | Schema
@@ -1486,13 +1647,13 @@ class Instructions:
     written as one piece (`span="header"`, the built-in rows' `"{kind} question: {instructions}"`).
     `stream` is where they are read: in the row (`"row"`), or as the row's context (`"context"`), which
     its cross-attention reads, the question's spans the context's (`Encoded.spans_in_context`), its
-    options' lines streaming with it."""
+    options' lines streaming with it; or as a stream of the row of its own name (`Reads`)."""
 
     headers: Mapping[str, str]
     render: Render = "question"
     defaults: Mapping[str, str] = dataclasses.field(default_factory=dict)
     span: Literal["instructions", "header"] = "instructions"
-    stream: Literal["row", "context"] = "row"
+    stream: str = "row"
 
 
 @dataclass(frozen=True)
@@ -1506,8 +1667,8 @@ class OptionLines:
 
     `marker` writes the layout's marker token before or after each line, where the option is read at
     its marker (Laya's markers before, a causal row's after) and its span is the marker's; `none` reads
-    the options under labels at the answer cue. `stream` is where they are read, as their question's
-    instructions are (`Instructions.stream`)."""
+    the options under labels at the answer cue. They are read where their question's instructions are
+    (`Instructions.stream`)."""
 
     line: str = "{label}. {name}: {text}"
     bare: str = "{label}. {name}"
@@ -1518,7 +1679,6 @@ class OptionLines:
     criteria: Mapping[str, str] = dataclasses.field(default_factory=dict)
     marker: Literal["none", "before", "after"] = "none"
     noul_first: Literal["true", "false"] = "true"
-    stream: Literal["row", "context"] = "row"
 
 
 @dataclass(frozen=True)
@@ -1591,6 +1751,9 @@ class JointLayout(Layout):
     max_state_tokens: int | None = None
     framing: Framing = Framing()
     segments: tuple[Segment, ...] = JOINT_SEGMENTS
+    reads: "Reads | None" = dataclasses.field(default=None, repr=False, metadata={_records.ADDED: True})
+    """Which of the row's streams each reads (`Reads`), where its schema stands in a stream of the row's
+    own (`Schema.stream`); None for a row read in order."""
     joint: ClassVar[bool] = True
 
     def __post_init__(self) -> None:
@@ -1608,16 +1771,17 @@ class JointLayout(Layout):
                              f"at most once each, not {[kind.__name__ for kind in kinds]}")
         if any(isinstance(segment, State) and segment.render != "compact" for segment in self.segments):
             raise ValueError("a joint row writes its state as sorted compact JSON (State(render='compact'))")
+        _streamed(self.segments, self.reads)
 
     @property
-    def schema_in_context(self) -> bool:
+    def spans_in_context(self) -> bool:
         """Whether the row's schema is its context (`Schema.stream`), its spans the context's."""
         return any(isinstance(segment, Schema) and segment.stream == "context" for segment in self.segments)
 
     @property
-    def spans_in_context(self) -> bool:
-        """Whether the row's schema is its context (`schema_in_context`)."""
-        return self.schema_in_context
+    def attention(self) -> "tuple[tuple[tuple[int, ...], ...], int] | None":
+        """Its rows' reads over their streams (`streamed_attention`)."""
+        return streamed_attention(self.reads, self.segments)
     images: ClassVar[bool] = True
 
     def state(self, encoder: Tokenizer, specials: Specials, state: JSON) -> tuple[int, ...]:
@@ -1648,7 +1812,7 @@ class JointLayout(Layout):
                 else:
                     laid_out.append((None, Chunk(text)))
                 continue
-            if isinstance(part, Schema) and not self.schema_in_context:
+            if isinstance(part, Schema) and not self.spans_in_context:
                 chunk = Chunk(ids=schema.tokens,
                               marks=tuple((key, *span) for key, span in schema.marks.items()))
             elif isinstance(part, Media) and media:
@@ -1669,8 +1833,12 @@ class JointLayout(Layout):
         # A row without a state segment keeps none of the state.
         kept_count = min((len(chunk.ids or ()) for (segment, _), chunk in zip(laid_out, chunks, strict=True)
                           if isinstance(segment, State)), default=0)
-        row = rendered_chunks(chunks, pieces, "pieces")
-        marks = schema.marks if self.schema_in_context else row.marks
+        # Where the row turns to another of its streams, its tokens are marked there (`Reads`).
+        streams = [segment_stream(segment, self.segments) if segment is not None else "row"
+                   for segment, _ in laid_out]
+        row = rendered_chunks(streamed_chunks(chunks, streams) if self.reads is not None else chunks,
+                              pieces, "pieces")
+        marks = schema.marks if self.spans_in_context else row.marks
         laid = tuple(Laid(name, kind_of(question), marks[(name, INSTRUCTIONS_MARK)],
                           tuple(marks[(name, number)] for number in range(len(slots))), tuple(slots))
                      for (name, question), slots in zip(questions.items(), self._slots(questions, orders),
@@ -1679,12 +1847,18 @@ class JointLayout(Layout):
                 if isinstance(segment, State)]
         # A row of no State segment holds none of the state: all of it is cut.
         state_cut = sum(whole - kept for kept in held) if held else whole
-        if self.schema_in_context:
+        tokens_streams = (token_streams(row.points, len(row.tokens), self.segments)
+                          if self.reads is not None else None)
+        if tokens_streams is not None and media:
+            raise ValueError("a row whose streams say what each token reads holds no images, whose tokens "
+                             "read each other whole; send the request without them")
+        if self.spans_in_context:
             # The schema is the row's context, its spans the context's own positions.
             return [Encoded(row.tokens, laid, None, None, whole, kept_count, row.marks.get(MEDIA_MARK),
-                            context=schema.tokens, spans_in_context=True, state_cut=state_cut)]
+                            context=schema.tokens, spans_in_context=True, state_cut=state_cut,
+                            streams=tokens_streams)]
         return [Encoded(row.tokens, laid, None, None, whole, kept_count, row.marks.get(MEDIA_MARK),
-                        state_cut=state_cut)]
+                        state_cut=state_cut, streams=tokens_streams)]
 
     def _slots(self, questions: Mapping[str, Question],
                orders: Mapping[str, Sequence[int]] | None) -> list[list[int]]:
@@ -1845,6 +2019,14 @@ class DecisionInputs:
     blocks: jnp.ndarray | None = None
     """`[B, L]` each token's block in its row (`Encoded.blocks`), -1 on the padding, or None for rows
     read in order."""
+    streams: jnp.ndarray | None = None
+    """`[B, L]` each token's stream in its row (`Encoded.streams`), -1 on the padding, or None for rows
+    read in order."""
+    reads: tuple[tuple[int, ...], ...] | None = struct.field(pytree_node=False, default=None)
+    """What each stream's tokens read, as the layout lowers its `Reads` (`Reads.lowered`), where the rows
+    stand in `streams`."""
+    fragments: int = struct.field(pytree_node=False, default=1)
+    """The most runs of one stream a row lays (`fragment_count`), which its tokens' key runs number."""
     max_segments: int = struct.field(pytree_node=False, default=1)
     spans_in_context: bool = struct.field(pytree_node=False, default=False)
     """Whether the questions' spans are positions in `context`, which holds the schema
@@ -1880,7 +2062,8 @@ class DecisionInputs:
     @classmethod
     def collate(cls, rows: Sequence[Encoded], pad: int, *, questions: int | None = None,
                 options: int | None = None, option_slots: int | None = None,
-                context_length: int | None = None) -> "DecisionInputs":
+                context_length: int | None = None,
+                attention: "tuple[tuple[tuple[int, ...], ...], int] | None" = None) -> "DecisionInputs":
         """Right-pad `rows` into one batch (`pad_token_rows`), one row a window, its question
         and option slots to the widest.
 
@@ -1889,7 +2072,8 @@ class DecisionInputs:
         a caller keeps fixed too (`compacted`); without it, the batch's most,
         rounded up to `OPTION_TILE`, where that is fewer than the grid's slots.
         With a `context_length`, each row's context (`Encoded.context`, none
-        where it holds none) is padded to that many tokens.
+        where it holds none) is padded to that many tokens. Rows in streams are read as their layout's
+        `attention` says (`Layout.attention`).
         """
         parallel = rows[0].positions is not None
         if any((row.positions is not None) != parallel for row in rows):
@@ -1904,6 +2088,11 @@ class DecisionInputs:
                    "slots": [row.slots or () for row in rows]} if parallel else {})
         if blocked:
             fields["blocks"] = [row.blocks or () for row in rows]
+        streamed = rows[0].streams is not None
+        if any((row.streams is not None) != streamed for row in rows) or streamed != (attention is not None):
+            raise ValueError("one batch reads its rows one way, in their layout's streams or in order")
+        if streamed:
+            fields["streams"] = [row.streams or () for row in rows]
         tokens, padded = pad_token_rows([row.tokens for row in rows], pad_id=pad, padding_side="right",
                                         fields=fields or None)
         valid = padded.get(VALIDITY_FIELD, np.ones(tokens.shape, bool))
@@ -1939,8 +2128,12 @@ class DecisionInputs:
                    slots=jnp.asarray(padded["slots"], jnp.int32) if parallel else None,
                    option_slots=slots_of, slotted=slotted,
                    context=context, context_lengths=lengths,
-                   # The padding is in no block.
+                   # The padding is in no block, and no stream.
                    blocks=jnp.asarray(np.where(valid, padded["blocks"], -1), jnp.int32) if blocked else None,
+                   streams=(jnp.asarray(np.where(valid, padded["streams"], -1), jnp.int32) if streamed
+                            else None),
+                   reads=None if attention is None else attention[0],
+                   fragments=1 if attention is None else attention[1],
                    spans_in_context=in_context)
 
 

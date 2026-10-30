@@ -91,7 +91,6 @@ from dew.data.pipeline import (
     Batched,
     BatchStage,
     Configured,
-    Consumed,
     Costly,
     Dataset,
     DeviceStep,
@@ -104,6 +103,7 @@ from dew.data.pipeline import (
     Map,
     MapBatch,
     MapWithIndex,
+    MarkConsumed,
     Mixture,
     Native,
     ObjectiveData,
@@ -239,7 +239,7 @@ class _Facts(View[Source]):
     facts and the rows a run materializes are one read's."""
     stated_label: str = ""
     """The source's name as it was written, before a read put another in its place (a Hub split's
-    Parquet files, `Consumed`), which the run's metrics go by."""
+    Parquet files, `dew.data.sources.base.Consumed`), which the run's metrics go by."""
 
     def label(self) -> str:
         return self.stated_label
@@ -394,19 +394,19 @@ def _windowed(pipeline: Pipeline, objective: ObjectiveData) -> Pipeline:
 
 
 def _native_after_bound(pipeline: Pipeline) -> bool:
-    """Whether `pipeline` counts the examples its rows consume (`Consumed`) and runs a native Grain step
+    """Whether `pipeline` counts the examples its rows consume (`MarkConsumed`) and runs a native Grain step
     after the bound that marks them."""
     stages = pipeline.stages
     at = next((index for index, stage in enumerate(stages)
-               if isinstance(stage, Map) and isinstance(stage.step, Consumed)), None)
+               if isinstance(stage, Map) and isinstance(stage.step, MarkConsumed)), None)
     return at is not None and any(isinstance(stage, Native) for stage in stages[at:])
 
 
 def _shuffles_windows(pipeline: Pipeline) -> bool:
-    """Whether `pipeline` counts the examples its rows consume (`Consumed`, a run bounded in examples) and
+    """Whether `pipeline` counts the examples its rows consume (`MarkConsumed`, a run bounded in examples) and
     shuffles in a window after a stage that packs or windows its rows."""
     stages = pipeline.stages
-    if not any(isinstance(stage, Map) and isinstance(stage.step, Consumed) for stage in stages):
+    if not any(isinstance(stage, Map) and isinstance(stage.step, MarkConsumed) for stage in stages):
         return False
     packed = next((index for index, stage in enumerate(stages) if isinstance(stage, (Pack, Windows))), None)
     return packed is not None and any(isinstance(stage, Shuffle) and bool(stage.window)
@@ -441,8 +441,8 @@ def _bounded(pipeline: Pipeline, examples: int) -> Pipeline:
             isinstance(stage, Repeat) for stage in pipeline.stages[at:]):
         raise ValueError(f"{_name(pipeline)} repeats with a count, or after the records it packs or batches, "
                          f"which a bound of {examples} examples would cut or repeat; leave the repeat out")
-    # Each example the bound reads is consumed by the last row a step makes of it (`Consumed`).
-    bound = (*(() if repeats else (Repeat(None),)), Limit(examples), Map(Consumed()))
+    # Each example the bound reads is consumed by the last row a step makes of it (`MarkConsumed`).
+    bound = (*(() if repeats else (Repeat(None),)), Limit(examples), Map(MarkConsumed()))
     batch = dataclasses.replace(pipeline.stages[batched], drop_remainder=False)
     return dataclasses.replace(pipeline, stages=(*pipeline.stages[:at], *bound, *pipeline.stages[at:batched],
                                                  batch, *pipeline.stages[batched + 1:]))
@@ -728,7 +728,7 @@ def _bound_ends(pipeline: Pipeline) -> bool:
     """Whether `pipeline`'s read, bounded in examples (`_bounded`), ends where its bound does: no limit or
     slice after the bound ends it first (`Loader.bound_ends`)."""
     at = next((index for index, stage in enumerate(pipeline.stages)
-               if isinstance(stage, Map) and isinstance(stage.step, Consumed)), len(pipeline.stages))
+               if isinstance(stage, Map) and isinstance(stage.step, MarkConsumed)), len(pipeline.stages))
     return not any(isinstance(stage, (Limit, Slice)) for stage in pipeline.stages[at + 1:])
 
 
