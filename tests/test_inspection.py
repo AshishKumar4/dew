@@ -10,7 +10,6 @@ import numpy as np
 import optax
 import pytest
 import test_run_budgets
-from reference_error import assert_as_exact_as_the_reference
 from test_run_options import KINDS, lm, scalars
 
 from dew.cli.main import main
@@ -23,6 +22,9 @@ BATCH, RATE = 8, 0.25
 FEATURES = test_run_budgets.FEATURES
 ROWS = np.random.default_rng(0).normal(size=(BATCH, FEATURES)).astype(np.float32)
 STATISTICS = ("mean", "rms", "abs_max")
+QUARTERS = (np.random.default_rng(0).integers(-8, 9, size=(BATCH, FEATURES)) / 4).astype(np.float32)
+"""Rows of quarters, over which every sum a summary of the step takes is exact in float32: no order of
+summation moves it, so the step's summaries are NumPy's, bit for bit."""
 
 
 class Pulled(test_run_budgets.Pulled):
@@ -47,18 +49,18 @@ class Kept:
         pass
 
 
-def stream():
+def stream(rows=ROWS):
     while True:
-        yield {"x": ROWS}
+        yield {"x": rows}
 
 
 def trainer(inspection, tracker=None):
     return Trainer(Pulled(), optax.sgd(RATE), key=jax.random.key(0), tracker=tracker, inspection=inspection)
 
 
-def trained(inspection, steps) -> dict[int, dict[str, float]]:
+def trained(inspection, steps, rows=ROWS) -> dict[int, dict[str, float]]:
     tracker = Kept()
-    trainer(inspection, tracker).fit(Loader(lambda partition: stream(), None, batch=BATCH, records=None),
+    trainer(inspection, tracker).fit(Loader(lambda partition: stream(rows), None, batch=BATCH, records=None),
                                      steps=steps, log_every=1, eval_every=None, checkpoint_every=None)
     return tracker.rows
 
@@ -70,34 +72,21 @@ def summary(values):
 
 def test_a_sampled_steps_summaries_are_its_commits_arrays():
     """A step sampled for `w` reports, for the parameters its update applies to, the gradient the
-    optimizer is handed, the update and the parameters' change, each statistic as exact as NumPy's in
-    float32 against float64's of the same arrays, its L2 norms and its update-to-weight ratio too, and
-    no non-finite or zero entries."""
-    logged = trained(Inspection(paths=("w",), every=1), 1)[1]
-
-    def arrays(dtype):
-        weight, rows = np.arange(1, FEATURES + 1).astype(dtype), ROWS.astype(dtype)
-        gradient = 2 * (weight - rows.mean(0)) / FEATURES
-        update = -dtype(RATE) * gradient
-        return {"params": weight, "grads": gradient, "updates": update, "deltas": (weight + update) - weight}
-
-    single, double = arrays(np.float32), arrays(np.float64)
-    names, dew, reference, truth = [], [], [], []
-    for target in single:
-        for statistic in STATISTICS:
-            names.append(f"inspect/{target}/w/{statistic}")
-            reference.append(summary(single[target])[statistic])
-            truth.append(summary(double[target])[statistic])
-        names.append(f"inspect/{target}/l2")
-        reference.append(np.linalg.norm(single[target]))
-        truth.append(np.linalg.norm(double[target]))
-        assert logged[f"inspect/{target}/w/non_finite"] == logged[f"inspect/{target}/w/zero_fraction"] == 0
-    names.append("inspect/update_to_weight")
-    reference.append(np.linalg.norm(single["updates"]) / np.linalg.norm(single["params"]))
-    truth.append(np.linalg.norm(double["updates"]) / np.linalg.norm(double["params"]))
-    dew = [logged[name] for name in names]
-    assert_as_exact_as_the_reference(np.asarray(dew, np.float32), np.asarray(reference, np.float32),
-                                     np.asarray(truth), "inspection summaries")
+    optimizer is handed, the update and the parameters' change, each statistic NumPy's in float32 of
+    the same arrays, bit for bit over rows whose every sum is exact (`QUARTERS`), its L2 norms and its
+    update-to-weight ratio too, and no non-finite or zero entries."""
+    logged = trained(Inspection(paths=("w",), every=1), 1, rows=QUARTERS)[1]
+    weight = np.arange(1, FEATURES + 1, dtype=np.float32)
+    gradient = 2 * (weight - QUARTERS.mean(0)) / FEATURES
+    update = -np.float32(RATE) * gradient
+    arrays = {"params": weight, "grads": gradient, "updates": update, "deltas": (weight + update) - weight}
+    expected = {"inspect/update_to_weight": np.linalg.norm(update) / np.linalg.norm(weight)}
+    for target, values in arrays.items():
+        expected.update({f"inspect/{target}/w/{name}": summary(values)[name] for name in STATISTICS})
+        expected.update({f"inspect/{target}/l2": np.linalg.norm(values),
+                         f"inspect/{target}/w/non_finite": 0, f"inspect/{target}/w/zero_fraction": 0})
+    assert {name: logged[name] for name in expected} == {
+        name: float(value) for name, value in expected.items()}
 
 
 def test_a_run_logs_each_sample_once_at_its_cadence():
@@ -149,23 +138,20 @@ def test_a_non_finite_parameter_shows_in_its_summary():
 
 def test_an_offline_view_builds_a_configured_optimizer():
     """`inspected` builds a trainer's `OptimConfig` over the run's `steps`, as `fit` does, and reports
-    the sampled step's update: Adam's first, as Optax's own Adam makes it of the same gradient."""
+    the sampled step's update: Adam's first as that config builds it over those steps (`OptimConfig.build`)
+    of the same gradient, its largest magnitude bit for bit, an elementwise result no order of summation
+    moves, where SGD's would be the gradient's quarter."""
     from dew.optim import OptimConfig
 
-    configured = Trainer(Pulled(), OptimConfig(optimizer="adam", learning_rate=RATE),
-                         key=jax.random.key(0), inspection=Inspection(paths=("w",), targets=("updates",)))
-    logged = inspected(configured, {"x": ROWS}, steps=4)
-
-    def update(dtype):
-        weight = np.arange(1, FEATURES + 1).astype(dtype)
-        gradient = 2 * (weight - ROWS.astype(dtype).mean(0)) / FEATURES
-        solver = optax.adam(RATE)
-        return np.linalg.norm(np.asarray(solver.update(gradient, solver.init(weight), weight)[0]))
-
-    with jax.enable_x64(new_val=True):
-        truth = update(np.float64)
-    assert_as_exact_as_the_reference(np.float32(logged["inspect/updates/l2"]), update(np.float32), truth,
-                                     "configured update")
+    config = OptimConfig(optimizer="adam", learning_rate=RATE)
+    configured = Trainer(Pulled(), config, key=jax.random.key(0),
+                         inspection=Inspection(paths=("w",), targets=("updates",)))
+    logged = inspected(configured, {"x": QUARTERS}, steps=4)
+    weight = jnp.arange(1, FEATURES + 1, dtype=jnp.float32)
+    gradient = 2 * (weight - jnp.asarray(QUARTERS).mean(0)) / FEATURES
+    solver = config.build(4)
+    update = solver.update({"w": gradient}, solver.init({"w": weight}), {"w": weight})[0]["w"]
+    assert logged["inspect/updates/w/abs_max"] == float(jnp.abs(update).max())
 
 
 def test_a_recorded_run_inspects_what_its_command_line_names(tmp_path):
