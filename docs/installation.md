@@ -99,7 +99,7 @@ A run applies it too: on a machine with an NVIDIA GPU, `prepare_process`, or the
 ### Dew's JAX build
 
 <!-- BEGIN JAX requirement (site/scripts/gen_install.py) -->
-Dew requires `jax>=0.12.0.1.post36,<0.12.1`.
+Dew requires `jax>=0.12.0.1.post37,<0.12.1`.
 <!-- END JAX requirement -->
 
 It is the JAX release that requirement names, with fixes no JAX release has yet, built from [AshishKumar4/jax](https://github.com/AshishKumar4/jax) and served by Dew's package index, the one every install above names, which serves jax alone. Every other package, jaxlib and its CUDA plugins included, comes from PyPI. The fixes:
@@ -128,6 +128,7 @@ It is the JAX release that requirement names, with fixes no JAX release has yet,
 - A persistent compilation cache entry is written aside and renamed into place, so a process reading the cache beside its writer, as packed jobs on one GPU do, sees the whole entry or none of it.
 - `JAX_EXPLAIN_CACHE_MISSES` explains, rather than fails, a Pallas Triton reduction, whose body's earlier traces are keyed by keyword.
 - Pallas's Mosaic GPU interpreter hands its own callbacks the host's NumPy arrays, with no transfer to the CPU device a call, which made each interpreted kernel check about twice as fast; `jax.experimental.io_callback` still hands its callback `jax.Array`s.
+- Pallas Mosaic GPU's snake traversal keeps a full power-of-two band as a shift and mask and selects its coordinates without branching, where a division by a runtime divisor had slowed every snake-ordered grid: a weight gradient's grouped GEMM ran 2.2x faster on an H100.
 
 Each fix goes from the build once a JAX release has it, and Dew then returns to that release.
 
