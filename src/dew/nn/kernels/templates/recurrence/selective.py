@@ -314,8 +314,7 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan):
                             return g_own, d_rates_own
 
                         g_own, d_own = lax.fori_loop(0, chunk, back, ([g[n] for n in own],
-                                                                     [d_rates[n] for n in own]),
-                                                     unroll=UNROLLED)
+                                                                     [d_rates[n] for n in own]))
                         for j, n in enumerate(own):
                             g[n], d_rates[n] = g_own[j], d_own[j]
                         family.rows_summed(summed_smem, db_ref.at[row, part, n_chunk, k])
