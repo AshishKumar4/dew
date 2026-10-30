@@ -201,9 +201,11 @@ def test_a_run_names_its_lettered_question_read_in_context_on_the_command_line(t
     2451). One without context layers is refused, and so is a question whose options are read at markers,
     which stand in the row's tokens the context leaves."""
     rows = Memory([{"example": example} for example in examples()]).read("memory").pipe(decisions).batch(4)
+    # A backbone with a tokenizer of its own, which the run lays its rows out with and names its letters by.
     config = DecisionRunConfig.cli(
-        ["--pretrained", str(LLAMA), "--segments", json.dumps(to_record(SEGMENTS, tuple[Segment, ...])),
-         "--context-layers", "0", "1", "head:letters", "--head.count", "4", "--trainer.name", "letters",
+        ["--pretrained", str(LLAMA.parent / "qwen38-dense-tiny"), "--segments",
+         json.dumps(to_record(SEGMENTS, tuple[Segment, ...])), "--context-layers", "0", "head:letters",
+         "--head.count", "4", "--trainer.name", "letters",
          "--trainer.checkpoint-dir", str(tmp_path / "runs"), "--trainer.steps", "1",
          "--trainer.checkpoint-every", "1", "--trainer.multi-host", "False",
          "--trainer.compilation-cache-dir", "None", "--model.dtype", "float32"],
