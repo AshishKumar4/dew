@@ -96,6 +96,7 @@ import json
 import math
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -121,6 +122,7 @@ child_groups = _beside("child_groups")
 session = _beside("session")
 r2 = _beside("r2")
 watched = _beside("watched")
+followed = _beside("followed")
 SETTLE = 30.0
 """Seconds a task's process group has, after SIGKILL, to be reaped and gone: inside armada's own timeout
 with the default deadline and grace (session.DEADLINE + session.GRACE + 30 + the reader's 10 < .armada.json's
@@ -173,7 +175,7 @@ HARNESS = "tools/armada/"
 """The harness's directory: the recorder, plugins and cache client every test process runs, beside this file."""
 SHARED = ("pyproject.toml", "constraints.txt", "tools/armada/session.py", "tools/armada/child_groups.py",
           "tools/armada/split.py", "tools/armada/executed.py", "tools/armada/followed.py",
-          "tools/armada/watched.py")
+          "tools/armada/lifetime.py", "tools/armada/watched.py")
 """The files every test file's key covers whole, beside every lock (a GPU node builds its environment
 from its CUDA lock), the environment's own inputs, which .armada.json names (`environment_files`),
 and .armada.json's parts a test process sees (`armada_seen`): what every test process runs or reads,
@@ -955,14 +957,17 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     if not tests:
         out.write_text(json.dumps({"rows": rows}))
         return 0
-    executed_report = out.with_name(f"{out.name}.executed.json")
+    # The recorder's log of the process's whole life (lifetime.py), its children's beside it, read once the
+    # group has exited (`record`).
+    log = out.with_name(f"{out.name}.lifetime.log")
     collection = out.with_name(f"{out.name}.collected.json")
     report = out.with_name(f"{out.name}.junit.xml")
-    for stale in (report, executed_report, collection):
+    for stale in (report, log, collection):
         stale.unlink(missing_ok=True)
+    shutil.rmtree(log.with_name(f"{log.name}.children"), ignore_errors=True)
     # coverage.py follows the Python processes the tests start (pyproject.toml's patch), each writing
     # its data where COVERAGE_FILE says.
-    measured = [] if coverage is None else ["-m", "coverage", "run"]
+    measured = [] if coverage is None else ["coverage", "run"]
     environ = environ if coverage is None else {**environ, "COVERAGE_FILE": str(coverage / ".coverage")}
     run = selected(session.pytest_run(python, report, *measured), network, whole, bool(release))
     command = pytest_command(run, tests, split, release)
@@ -970,7 +975,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     # streamed as it comes by a reader of its own, which nothing waits on past pytest's end: a test's
     # child holding the pipe open (a pool worker, a server) cannot keep the verdict from being written.
     lines: list[str] = []
-    environment = session.pytest_environment({**environ, "DEW_EXECUTED": str(executed_report),
+    environment = session.pytest_environment({**environ, "DEW_EXECUTED_LOG": str(log),
                                               "DEW_COLLECTED": str(collection)})
     if network:
         environment = {key: value for key, value in environment.items() if key not in session.CLOSED_HUB}
@@ -1007,6 +1012,10 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     # by the selection, as pytest reported it (executed.py); a run that wrote no report greens nothing.
     counts = json.loads(collection.read_text()) if collection.is_file() else {}
     ran = []
+    # A process that ended 1 though no case it reported failed (a late hook's os._exit): its tests ran in a
+    # process that failed, so no row it held is green.
+    late = done.returncode == 1 and cases and not any(
+        case.find(kind) is not None for case in cases for kind in ("failure", "error"))
     own_seconds = {name: sum(float(case.get("time") or 0) for case in cases if file_of(case) == name)
                    for name in tests}
     shares = apportioned(own_seconds, time.monotonic() - began, len(tests))
@@ -1025,7 +1034,8 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
         # among the task's included.
         counted = counts.get(name, {})
         deselected = bool(counted) and counted["collected"] == counted["deselected"]
-        exited = ([f"pytest exited {done.returncode}" + ("" if own else f" with no report of {name}")]
+        exited = (["the process ended 1 after its tests passed"] if late
+                  else [f"pytest exited {done.returncode}" + ("" if own else f" with no report of {name}")]
                   if done.returncode not in (0, 1, 5) or (not own and not deselected and done.returncode == 1)
                   else [])
         unaccounted = ([] if exited or (report.is_file() and (own or deselected))
@@ -1058,7 +1068,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     if coverage is None and not release:
         # A traced run's rows, timed under tracing, are no rows to reuse, nor a release check's, which runs
         # under its requirement's overlay and on the whole suite's run alone.
-        record(python, ran, executed_report, common, network, opened)
+        record(python, ran, log, common, network, opened)
     return 0
 
 
@@ -1074,7 +1084,7 @@ def native_inputs(opened: set[str], recorded: set[str]) -> set[str]:
             for parent in path.parents if parent == FIXTURES or FIXTURES in parent.parents}
 
 
-def record(python: str, rows: list[dict], executed_report: Path, common: str, network: bool = False,
+def record(python: str, rows: list[dict], log: Path, common: str, network: bool = False,
            opened: set[str] | None = None) -> None:
     """Keep each row a task ran with the files its tests executed and read, every data file the task's
     processes opened (`opened`, the task's watch: None where it was blind, and no row keeps a key), where
@@ -1084,8 +1094,8 @@ def record(python: str, rows: list[dict], executed_report: Path, common: str, ne
     token = os.environ.get("DEW_XLA_CACHE_TOKEN")
     if not token or "DEW_XLA_CACHE_URL" not in os.environ:
         return
-    # A run cut short, or whose collection failed, may have written no report, or none for a file.
-    executed = json.loads(executed_report.read_text()) if executed_report.is_file() else {}
+    # Each file's record in the process's log (followed.py's `recorded`): none for a file it never reached.
+    executed = followed.recorded(log)
     held = device_class(network)
     if opened is not None:
         recorded = {read for ran in executed.values() for read in ran["depends"] or ()}
