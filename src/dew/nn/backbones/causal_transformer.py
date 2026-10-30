@@ -2040,7 +2040,8 @@ class CausalTransformer(nn.Module):
         """The per-layer signal and routing replay the stack slices by layer."""
         embeddings = self.per_layer_inputs(tokens, x) if self.per_layer_input_dim else None
         # A mixer computing by its layer's place reads it as data (`MixerBase.reads_depth`).
-        reads = any(self.kind_of(kind).mixer.reads_depth for kind in set(self.per_layer_types))
+        mixers = (self.kind_of(kind).mixer for kind in set(self.per_layer_types))
+        reads = any(mixer is not None and mixer.reads_depth for mixer in mixers)
         depth = None if not reads else jnp.broadcast_to(jnp.arange(self.num_layers, dtype=jnp.int32),
                                                         (*tokens.shape, self.num_layers))
         if routed_experts is None:

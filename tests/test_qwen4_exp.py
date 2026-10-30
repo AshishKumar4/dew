@@ -41,8 +41,9 @@ def test_the_releases_ngram_lookups_hash_its_ids_as_transformers_does():
     np.testing.assert_array_equal(np.ravel(spec.primes[0]), recorded['vocab_sizes'])
 
 
-EXPORT_SEEDS = 8
-"""The export's declared draws of ids against transformers' read of it (check 1)."""
+EXPORT_SEEDS = 16
+"""The export's declared draws of ids against transformers' read of it (check 1), sized by `seeds_for`
+paired with Dew's logits on armada."""
 
 
 def test_an_export_opens_in_transformers_as_the_model_it_was(tmp_path):
@@ -66,7 +67,7 @@ def test_an_export_opens_in_transformers_as_the_model_it_was(tmp_path):
 
 
 WRAPPER_SEEDS = 8
-"""The wrapper's declared draws of ids against transformers' (check 1)."""
+"""The wrapper's declared draws of ids against transformers' (check 1), sized as `EXPORT_SEEDS`."""
 
 
 def test_the_release_wrapper_loads_whole_and_text_only_as_its_language_model(tmp_path):
