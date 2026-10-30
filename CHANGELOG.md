@@ -5,6 +5,15 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- The fit search's derived first candidate counts what its gradient program holds at its peak, as the
+  GPU's fusion keeps its values, and the GEMM workspace XLA gives that GPU (32 MiB from Hopper on, 4 MiB
+  before). Every compile's plan record carries `derived_headroom` beside its measured `headroom`, and a
+  compile the derivation judged otherwise logs a model miss.
+- An inspection's `every` counts windows of the run's accumulation steps; MeanFlow's and LADD's sampled
+  steps summarize the forward their loss trains, with no second forward. `dew inspect` views a run
+  whose objective names its input alone. `RunConfig.prepare()` returns a `Prepared` holding the run's
+  objective, data and what `train` takes beside them, with `train(name)` and `inspected(name)`.
+- A run on the examples clock resumed with a larger examples bound trains on to it.
 - A run's numerics are named where they are set: `--trainer.precision accurate` (or a Lightning dtype
   preset, "bf16-true", or a `Numerics` record's JSON), `"precision": "accurate"` in a run.json, and
   `Pretrained.load(precision=...)` and `dew.pipeline(source, precision=...)`, which load in their dtypes
