@@ -24,7 +24,7 @@ train, val = Hub("winglian/tiny-shakespeare").holdout(0.01)
 data = train.shuffle(0).repeat().pipe(presets.lm, "byte", seq_len=256, batch=64)
 held = val.pipe(presets.lm, "byte", seq_len=256, batch=64)
 model = CausalTransformer(vocab_size=256, emb_features=384, num_layers=6, num_heads=6,
-                          mlp_features=1024, max_seq_len=256, dropout_rate=0.2, dtype="bfloat16")
+                          mlp_features=1024, max_seq_len=256, dropout_rate=0.2)
 optimizer = OptimConfig(learning_rate=Cosine(peak_value=1e-3, warmup_steps=10, end_value=1e-4),
                         b2=0.99, weight_decay=0.1, clip_grads=1.0)
 trainer = Trainer(LMObjective(model, seq_len=256), optimizer, key=0)
