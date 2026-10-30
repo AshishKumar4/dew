@@ -1178,6 +1178,10 @@ def _same_bits(one, other) -> str | None:
         return "its structure"
     for (path, first), second in zip(jax.tree_util.tree_leaves_with_path(one), jax.tree.leaves(other),
                                      strict=True):
+        if isinstance(first, RecordedLeaf) or not (hasattr(first, "shape")
+                                                    or isinstance(first, (int, float, complex, bool))):
+            # A recording's evidence (`RecordedLeaf`), read from its seed's rows: no values of its own.
+            continue
         first, second = np.asarray(first), np.asarray(second)
         if first.shape != second.shape or first.dtype != second.dtype or first.tobytes() != second.tobytes():
             return jax.tree_util.keystr(path) or "its value"
