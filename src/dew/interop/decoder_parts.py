@@ -1461,11 +1461,16 @@ def decoder_tensors(family: "DecoderFamily", model: CausalTransformer, variables
     if model.layer_scalar == 'frozen' and isinstance(constants, Mapping):
         leaves.update({('params', *path): value for path, value in flatten_dict(dict(constants)).items()
                        if path[-1] == 'layer_scalar'})
+    # The stacked experts' leaves, each written one tensor an expert: the routed MLP's and the value
+    # experts' (`RoutedValues`).
+    stacked = {'mlp': None if model.mixture is None else model.mixture.experts,
+               'self_attn': None if model.value_experts is None else model.value_experts.experts}
+
     def names(path: tuple[str, ...]) -> str | tuple[str, ...] | None:
-        if (len(path) == 6 and path[2:4] == ('mlp', 'experts') and path[-1] == 'kernel'
-                and model.mixture is not None):
+        if (len(path) == 6 and path[3] == 'experts' and path[-1] == 'kernel'
+                and stacked.get(path[2]) is not None):
             named = tuple(family.tensor_name('.'.join(expert_path(path, expert)[1:]), config)
-                          for expert in range(model.mixture.experts))
+                          for expert in range(stacked[path[2]]))
             if any(name is None for name in named):
                 raise ValueError(f'{path} has no tensor name for each expert')
             return tuple(name for name in named if name is not None)

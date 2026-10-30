@@ -20,7 +20,7 @@ ROOT = Path(__file__).parent / 'fixtures' / 'hf'
 FIXTURES = {
     'phi-tiny': {}, 'gptj-tiny': {}, 'gpt-neo-tiny': {}, 'falcon-tiny': {}, 'falcon-mha-tiny': {},
     'gpt-bigcode-tiny': {}, 'gpt-bigcode-mha-tiny': {}, 'starcoder2-tiny': {}, 'mimo-v2-flash-tiny': {},
-    'mamba-tiny': {}, 'ouro-tiny': {}, 'k2-horizon-tiny': {},
+    'mamba-tiny': {}, 'ouro-tiny': {}, 'k2-horizon-tiny': {}, 'k2-horizon-mova-tiny': {},
     # BLOOM's ALiBi config states no context length.
     'bloom-tiny': {'max_seq_len': 32},
 }
@@ -30,10 +30,10 @@ SEEDS = 8
 """Each transformers family's declared draws of ids against transformers' padded and unpadded logits
 (check 1), sized by `seeds_for` paired with Dew's logits on the CPU."""
 
-RECORDED = ('k2-horizon-tiny', 'ouro-tiny')
+RECORDED = ('k2-horizon-tiny', 'k2-horizon-mova-tiny', 'ouro-tiny')
 """The fixtures whose reference is a release's remote code, which the test cannot run: each one's logits
-recorded over check 1's seeds in its recorded_logits.npz (`--recording` of tools/k2_horizon_reference.py
-and tools/ouro_reference.py), whose declared count it reads."""
+recorded over check 1's seeds in its recorded_logits.npz (`--recording` and `--mova` of
+tools/k2_horizon_reference.py, `--recording` of tools/ouro_reference.py), whose declared count it reads."""
 
 
 def load(name: str) -> Pretrained:

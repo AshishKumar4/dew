@@ -101,6 +101,7 @@ from ..precision import (
 from ..protocols import OutputTable, Projection, ProjectionGroup, QuantizesInputs, declared_groups
 from ..rope import LongRopeScaling, Scaling, rope_scaling_from_record
 from ..sharding import RESIDUAL, constrain, logical_axes, pipeline_stages
+from ..value_experts import ValueExperts
 from .decoder_block import (
     DECODER_REMAT,
     NORM_SITES,
@@ -279,6 +280,8 @@ class CausalTransformer(nn.Module):
     attention_sinks: bool = False
     attn_logit_softcap: float | None = None  # Gemma 2's attn_logit_softcapping
     output_gate: bool = False                 # Qwen3.5 gates the attention branch
+    output_gate_activation: str = 'sigmoid'   # the gate's activation (MixerContext.output_gate_activation)
+    value_experts: ValueExperts | None = None  # MoVA: the routed layers' values from routed experts
     embedding_scale: bool = False            # Gemma scales embeddings by sqrt(d)
     embedding_multiplier: float = 1.0
     """The factor that multiplies the token embeddings before the first layer:
@@ -644,7 +647,7 @@ class CausalTransformer(nn.Module):
         return self.vocab_size if self.per_layer_input_vocab is None else self.per_layer_input_vocab
 
     def mixer_context(self, kind: "ResolvedKind", layer_type: str,
-                      kv_shared: bool, dex: LayerDex | None = None) -> MixerContext:
+                      kv_shared: bool, dex: LayerDex | None = None, routed: bool = False) -> MixerContext:
         """Return one layer's mixer geometry as a `MixerContext` built from the resolved kind.
 
         `head_dim`, `rope_theta`, `window`, the rope scaling, the partial
@@ -663,7 +666,7 @@ class CausalTransformer(nn.Module):
             "kv_shared": kv_shared, "kv_store_key": layer_type,
             "partial_rotary_factor": kind.partial_rotary_factor, "attention_sinks": kind.sinks,
             "qk_norm": kind.qk_norm, "init_std": self.init_stds[0], "output_init_std": self.init_stds[1],
-            "precision": self.precision, "dex": dex}
+            "precision": self.precision, "dex": dex, "value_experts": self.value_experts if routed else None}
         return MixerContext(**resolved, **{field.name: getattr(self, field.name)
                                            for field in dataclasses.fields(MixerContext)
                                            if field.name not in resolved})
@@ -1060,7 +1063,7 @@ class CausalTransformer(nn.Module):
         spec = specs[index]
         return DecoderBlock(
             mixer=(spec.kind.mixer or mixer_spec).build(
-                self.mixer_context(spec.kind, spec.layer_type, spec.kv_shared, spec.dex)),
+                self.mixer_context(spec.kind, spec.layer_type, spec.kv_shared, spec.dex, spec.routed)),
             feedforward=(
                 functools.partial(routed, expert_bias=False, media_bias=False, hash_vocab=self.vocab_size)
                 if spec.hash_routed and routed is not None else
@@ -1112,8 +1115,8 @@ class CausalTransformer(nn.Module):
         """Layer `index`'s mixer, unbound, as its kind builds it over the layer's context."""
         types = self.per_layer_types
         spec = self._layer_specs(types, self.layer_kinds(types), self.layer_mixer)[index]
-        return (spec.kind.mixer or self.layer_mixer).build(
-            self.mixer_context(spec.kind, spec.layer_type, spec.kv_shared, spec.dex))(parent=None)
+        context = self.mixer_context(spec.kind, spec.layer_type, spec.kv_shared, spec.dex, spec.routed)
+        return (spec.kind.mixer or self.layer_mixer).build(context)(parent=None)
 
     @nn.nowrap
     def cross_flops(self, lengths, context_lengths) -> float:
@@ -2418,7 +2421,7 @@ class CausalTransformer(nn.Module):
         default = self.layer_mixer
         for index, spec in enumerate(self._layer_specs(types, self.layer_kinds(types), default)):
             refusal = (spec.kind.mixer or default).mixed_refusal(
-                self.mixer_context(spec.kind, spec.layer_type, spec.kv_shared, spec.dex))
+                self.mixer_context(spec.kind, spec.layer_type, spec.kv_shared, spec.dex, spec.routed))
             if refusal is not None:
                 return f"layer {index}: {refusal}"
         return None
