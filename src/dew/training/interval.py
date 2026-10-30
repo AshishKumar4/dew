@@ -586,24 +586,33 @@ def throughput(elapsed: float, steps: int, samples: int, flops: StepFlops | None
     dispatches steps ahead of the device, so a wait the device's queued
     work covers costs no device time; a wait near the step time is a
     stalled input.
+
+    The counts (tokens, work, compile and waits) are reported whatever the
+    interval's seconds; the rates only over seconds the steps took. A log
+    the writer reads no later than the one before it was done
+    (`Taken.read`) has none, and its steps still committed their tokens.
     """
-    stepping = elapsed - compiling
-    if stepping <= 0 or steps <= 0:
+    if steps <= 0:
         return {}
-    step_time = stepping / steps
-    scalars = {"train/step_time_ms": step_time * 1000,
-               "train/samples_per_sec": samples / stepping,
-               "train/data_wait_ms": waited / steps * 1000}
+    scalars = {"train/data_wait_ms": waited / steps * 1000}
     if compiling > 0:
         scalars["train/compile_s"] = compiling
     if tokens is not None:
         scalars["train/tokens"] = float(tokens) / steps
-        scalars["train/tokens_per_s"] = float(tokens) / stepping
     # A batch whose work could not be counted carries NaN (`_counted_batch`),
     # so an interval holding one, on any process, reports no train/flops or train/mfu.
-    if training_flops is not None and math.isfinite(training_flops):
-        scalars["train/flops"] = float(training_flops) / steps
-        per_device = float(training_flops) / devices
+    work = training_flops if training_flops is not None and math.isfinite(training_flops) else None
+    if work is not None:
+        scalars["train/flops"] = float(work) / steps
+    stepping = elapsed - compiling
+    if stepping <= 0:
+        return scalars
+    step_time = stepping / steps
+    scalars.update({"train/step_time_ms": step_time * 1000, "train/samples_per_sec": samples / stepping})
+    if tokens is not None:
+        scalars["train/tokens_per_s"] = float(tokens) / stepping
+    if work is not None:
+        per_device = float(work) / devices
         utilization = model_flops_utilization(per_device / steps, step_time)
         if utilization is not None:
             scalars["train/mfu"] = utilization
