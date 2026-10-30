@@ -899,8 +899,13 @@ def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
         policy["forms"] = trainer.pop("attention_form")
     trainer.pop("dynamic_scale", None)
     params = next(iter(stated.values()), None)
-    if params is not None:
-        policy["dtypes"] = {"params": params}
+    # The compute an earlier record trained in was its model's stated dtype, where it states one.
+    model = fields.get("model")
+    computed = model.get("fields", {}).get("dtype") if isinstance(model, Mapping) else None
+    dtypes = {**({"params": params} if params is not None else {}),
+              **({"compute": computed} if isinstance(computed, str) else {})}
+    if dtypes:
+        policy["dtypes"] = dtypes
     return {**record, "fields": {**fields, "trainer": {**trainer, "precision": policy}}}
 
 

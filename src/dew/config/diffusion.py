@@ -420,10 +420,12 @@ class DiffusionRunConfig(RunConfig):
         return variables["autoencoder"]
 
     @property
-    def _compute(self) -> DtypeName:
-        """The compute dtype the model's record names, which the text and audio
-        encoders and a pretrained pipeline compute in too."""
-        return dtype_name(resolve_dtype(self.compute_dtype()))
+    def _compute(self) -> DtypeName | None:
+        """The compute dtype the model's record names, which the text and audio encoders compute in
+        too; None where it names none, each encoder its own, as its data plan records it (its
+        tokenizer's identity holds its dtype)."""
+        held = self.model.fields.get("dtype")
+        return None if held is None else dtype_name(resolve_dtype(str(held)))
 
     def _source(self, variables: Variables | None):
         """The `pretrained` pipeline at the data's resolution: its own
@@ -437,7 +439,8 @@ class DiffusionRunConfig(RunConfig):
         # The pipeline reads its weights on a resume too, which binds the checkpoint over them.
         placement = self.source_keywords(frozen=self.lora is not None)
         return load_diffusion_source(
-            reference.name, revision=reference.revision, dtype=self._compute,
+            reference.name, revision=reference.revision,
+            dtype=dtype_name(resolve_dtype(self.compute_dtype())),
             param_dtype=self.trainer.precision.dtypes.params,
             attention_impl=self.source_attention(),
             size=self.sample_field().shape[:-1],
