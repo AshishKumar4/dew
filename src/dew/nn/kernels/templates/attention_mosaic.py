@@ -269,8 +269,11 @@ class MosaicForward(_Mainloop[Tiles]):
     def registers(self, ba: tokamax.BoundArguments, config: Tiles) -> int:
         family = bundle_of(config, ba.arguments["query"].dtype)
         query, value = ba.arguments["query"], ba.arguments["value"]
+        # The natural form's where the call keeps its logits natural (`algebra.Forward.base2`'s condition: a
+        # score hook reads them, or its scale times log2(e) reaches 1).
+        natural = self.natural or self.score_mod is not None or abs(self.scale) * algebra.LOG2E >= 1.0
         return _forward_registers(family, config, _width(value.shape[-1], family, query.dtype), query.dtype,
-                                  ba.arguments.get("residuals") is True)
+                                  ba.arguments.get("residuals") is True, natural=natural)
 
 
     def refusal(self, ba: tokamax.BoundArguments, family: mosaic.Family) -> str | None:
@@ -282,16 +285,20 @@ class MosaicForward(_Mainloop[Tiles]):
         return refused(query.dtype, query.shape[3], value.shape[3], hooks, backward=False, family=family)
 
 
-def _forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dtype, residuals: bool) -> int:
+def _forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dtype, residuals: bool, *,
+                       natural: bool = False) -> int:
     """The registers a forward consumer holds at `tiles` (`resources.live_registers`): its weighted values'
     sums `[bq, Dv]` fp32 carried, and a step's logits fp32 beside its weights in the operands' dtype. A
     training forward (`_trained`, at its anchor known) holds the other keys' weights beside them too, in the
     operands' dtype, and the key indices int32 its anchor test compares, a thread's one per column its
     fragment holds, which its fragment's two rows share (an MMA accumulator's layout: half the tile's words;
     TWOPASS5-h100: uncounted, 64 x 128 on two consumers derived and spilled, 6.6 ms against 64 x 64's 1.06);
-    its peak walk holds less."""
+    its peak walk holds less. The `natural` form holds a step's masked logits beside their exponentials
+    (`algebra.natural_exp`), one fp32 tile more (et-livehook2: its peak's selects and exp2 beside the logits;
+    et-fwdhooks2: every hooked forward, the natural form alone, spilled at the fold's count)."""
     block_q, block_k = tiles.block_q, tiles.block_k
-    step = [(block_q, block_k, jnp.float32)] + [(block_q, block_k, dtype)] * (2 if residuals else 1)
+    step = ([(block_q, block_k, jnp.float32)] * (2 if natural else 1)
+            + [(block_q, block_k, dtype)] * (2 if residuals else 1))
     if residuals:
         step.append((block_q // 2, block_k, jnp.int32))
     return resources.live_registers(family, [(block_q, value_width, jnp.float32)], step)
