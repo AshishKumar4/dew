@@ -1283,8 +1283,9 @@ class Objective(ABC, Generic[Loss, Effects]):
         The tile is `tile`, or the objective's own when that is None. The
         return value describes the new tile, or is None when there was nothing
         to move, as for an objective with no such head. This is the first rung
-        of the fit ladder (`dew.training.memory.recompute_more`), which logs
-        the description, and a resumed run moves to the same rung again.
+        of the fit ladder (`dew.training.memory.recompute_more`), whose climb
+        logs the description (`dew.training.planning.FitSearch.compiled_again`),
+        and a resumed run moves to the same rung again.
         """
         return None
 
