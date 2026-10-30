@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The recurrence template's Mosaic GPU forward (`chunk(..., mainloop='mosaic')`, the device's family's
+"""The recurrence template's Mosaic GPU forward (`chunk` with 'mosaic_gpu' named, the device's family's
 bundle) against the chunked op's port (fla's kernels, `generation.chosen(gated_delta_rule='fla')`) and the
 portable math in XLA (`generation.chosen`'s 'xla'), at the scoreboard's delta-rule shapes
 (`benchmark_recurrence.SHAPES`), on the same operands: device milliseconds by CUPTI (every kernel of a call
@@ -40,12 +40,9 @@ DELTA = ('qwen3.5-27b-gdn', 'qwen3-next-gdn', 'kimi-linear-kda')
 """The delta-rule shapes the template's forward takes: a decay a head (Qwen3.5-27B's and Qwen3-Next's
 gated delta nets) and a key dimension's (Kimi Linear's)."""
 
-ROUTES = {'mosaic': {'mainloop': 'mosaic'}, 'mosaic-recompute': {'mainloop': 'mosaic'}, 'port': {}, 'xla': {}}
-"""Each arm's route through the chunked op; the port's and the portable math's under
-`generation.chosen(gated_delta_rule=...)` (`NAMED`)."""
-
-NAMED = {'port': 'fla', 'xla': 'xla'}
-"""The kernel each arm names to the delta rule's selector."""
+NAMED = {'mosaic': 'mosaic_gpu', 'mosaic-recompute': 'mosaic_gpu', 'port': 'fla', 'xla': 'xla'}
+"""The kernel each arm names to the delta rule's selector (`generation.chosen(gated_delta_rule=...)`), the
+chunked op's one route."""
 
 
 KERNELS = 40
@@ -88,7 +85,7 @@ def compiled_arm(name: str, arm: str, dtype, training: bool = False):
     args = (*(given[key].astype(dtype) for key in ('q', 'k', 'v')), given['g'], given['beta'].astype(dtype))
 
     def forward(q, k, v, g, beta):
-        return chunk(hooks, Chunk(q, k, v, log_decay=g, beta=beta), chunk_size=shape.chunk, **ROUTES[arm])
+        return chunk(hooks, Chunk(q, k, v, log_decay=g, beta=beta), chunk_size=shape.chunk)
 
     def trained(*args):
         # The forward's results returned with the gradients, as a training step reads both: a pass
@@ -101,10 +98,8 @@ def compiled_arm(name: str, arm: str, dtype, training: bool = False):
 
     timed = trained if training else forward
     timed.__name__ = f"{'trained' if training else 'forward'}_{arm}"
-    if arm in NAMED:
-        with generation.chosen(gated_delta_rule=NAMED[arm]):
-            return jax.jit(timed).lower(*args).compile(), args
-    return jax.jit(timed).lower(*args).compile(), args
+    with generation.chosen(gated_delta_rule=NAMED[arm]):
+        return jax.jit(timed).lower(*args).compile(), args
 
 
 def rows(name: str, arm: str, dtype, warmup: int, repeats: int, training: bool = False,
@@ -165,7 +160,7 @@ def profiled(name: str, arms: list[str], dtype, warmup: int, repeats: int, train
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument('--arm', required=True, help=f"one of {tuple(ROUTES)}, or several comma-separated "
+    parser.add_argument('--arm', required=True, help=f"one of {tuple(NAMED)}, or several comma-separated "
                                                      "with --profile")
     parser.add_argument('--profile', help="capture the arms' kernels under this directory (kernel_stats)")
     parser.add_argument('--shape', default='all', help=f"one of {DELTA} or 'all'")
@@ -180,8 +175,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument('--out', help='append JSON lines here as well as printing them')
     args = parser.parse_args(argv)
     arms = args.arm.split(',')
-    if any(arm not in ROUTES for arm in arms) or (len(arms) > 1 and not args.profile):
-        parser.error(f"--arm takes one of {tuple(ROUTES)}, several only with --profile")
+    if any(arm not in NAMED for arm in arms) or (len(arms) > 1 and not args.profile):
+        parser.error(f"--arm takes one of {tuple(NAMED)}, several only with --profile")
     passes = args.training.split(',')
     if not set(passes) <= {'forward', 'training'} or passes != sorted(passes):
         parser.error("--pass takes forward, training, or forward,training")
