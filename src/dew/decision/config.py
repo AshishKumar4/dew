@@ -189,8 +189,9 @@ class DecisionRunConfig(DecoderRunConfig):
         or the mixture's rows, scored on the held-out ones, which calibrate the
         run after it trains. The checkpoint decides the backbone; the model
         flags choose only its compute dtype and attention kernel;
-        `trainer.precision.dtypes.params` chooses the loaded checkpoint's storage dtype. `remat`
-        chooses its layer recomputation before looping or attaching LoRA."""
+        `trainer.precision.dtypes.params` chooses the stored dtype of a checkpoint it trains
+        (`RunConfig.source_keywords`). `remat` chooses its layer recomputation before looping or
+        attaching LoRA."""
         from dew.interop import Pretrained
 
         self.sourced_model()
@@ -223,8 +224,7 @@ class DecisionRunConfig(DecoderRunConfig):
 
         frozen = self.lora is not None or (self.context_layers is not None and self.context_frozen)
         start = Pretrained.load(self.pretrained, subfolder=self.subfolder, revision=self.revision,
-                                dtype=dtype, param_dtype=self.trainer.precision.dtypes.params,
-                                attention_impl=attention_impl,
+                                dtype=dtype, attention_impl=attention_impl,
                                 **self.source_keywords(frozen=frozen))
         release = isinstance(start, PretrainedDecision)
         # Whether a fresh head's rows lie in blocks, as the loaded checkpoint and the run declare it.

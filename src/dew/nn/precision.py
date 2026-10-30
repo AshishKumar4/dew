@@ -513,7 +513,8 @@ def float32_matmul(lhs, rhs, precision: jax.lax.PrecisionLike = None) -> jax.Arr
 class Dtypes:
     """A run's dtypes, three as Flax casts them: the parameters' (its layers' `param_dtype`, and the
     optimizer's moments'), the compute's (their `dtype`) and the outputs' (the logits and losses a
-    model returns)."""
+    model returns). A source the run keeps frozen is stored as its checkpoint stores it, unless the
+    parameters' dtype is narrower (`dew.config.RunConfig.source_keywords`)."""
 
     params: str = "float32"
     compute: str = "bfloat16"
