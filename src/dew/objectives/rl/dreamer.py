@@ -52,11 +52,17 @@ if TYPE_CHECKING:
 
 
 def _init(scale: float = 1.0) -> nn.initializers.Initializer:
-    """The code's `trunc_normal_in`: a normal truncated to two deviations, times 1.1368 sqrt(1 / fan
-    in), times `scale` (nets.py:144-186)."""
+    """The code's `trunc_normal_in`: a standard normal truncated to two deviations, uncorrected, times
+    1.1368 sqrt(1 / fan in), times `scale` (nets.py:169-175), the fan in a kernel's second-to-last
+    axis (a block's own inputs for a block-diagonal kernel)."""
     if scale == 0:
         return nn.initializers.zeros
-    return nn.initializers.variance_scaling((1.1368 * scale) ** 2, "fan_in", "truncated_normal")
+
+    def init(key: jax.Array, shape: tuple[int, ...], dtype: jnp.dtype = jnp.float32) -> jax.Array:
+        deviation = 1.1368 * scale / math.sqrt(shape[-2])
+        return (deviation * jax.random.truncated_normal(key, -2, 2, shape)).astype(dtype)
+
+    return init
 
 
 class _Layers(nn.Module):
@@ -352,13 +358,15 @@ class DreamerV3Objective(Objective[Ratio]):
 
         def observed(latent, inputs):
             deter, stoch = latent
-            observation, previous, first = inputs
-            deter, stoch, posterior = self.observe(model, deter, stoch, observation, previous, first)
+            observation, previous, first, key = inputs
+            # Each step's posterior draws its own key, as the code's scan seeds each step's sample.
+            at = self.model.bind(variables, rngs={"latent": key})
+            deter, stoch, posterior = self.observe(at, deter, stoch, observation, previous, first)
             return (deter, stoch), (deter, stoch, posterior)
 
-        _, (deter, stoch, posterior) = jax.lax.scan(
-            observed, model.initial((rows,)),
-            tuple(jnp.swapaxes(x, 0, 1) for x in (observation, previous, first)))
+        steps_in = (*(jnp.swapaxes(x, 0, 1) for x in (observation, previous, first)),
+                    jax.random.split(world_key, length))
+        _, (deter, stoch, posterior) = jax.lax.scan(observed, model.initial((rows,)), steps_in)
         deter, stoch, posterior = (jnp.swapaxes(x, 0, 1) for x in (deter, stoch, posterior))
         prior = model.prior(deter)
         feature = WorldModel.feature(deter, stoch)

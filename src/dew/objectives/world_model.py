@@ -40,9 +40,10 @@ class _Block(nn.Module):
         h = nn.RMSNorm()(x)
         q, k, v = (nn.DenseGeneral((self.heads, head))(h) for _ in range(3))
         q, k = nn.RMSNorm()(q), nn.RMSNorm()(k)
-        logits = jnp.einsum("...qhd,...khd->...hqk", q, k) / math.sqrt(head)
-        logits = jnp.where(mask, logits, -1e9)
-        attended = jnp.einsum("...hqk,...khd->...qhd", jax.nn.softmax(logits, -1), v)
+        # JAX's attention over [batch, tokens, heads, head], any leading axes folded into the batch.
+        lead = q.shape[:-3]
+        attended = jax.nn.dot_product_attention(*(t.reshape(-1, *t.shape[-3:]) for t in (q, k, v)),
+                                                mask=mask[None, None]).reshape(*lead, *q.shape[-3:])
         x = x + nn.DenseGeneral(self.width, axis=(-2, -1))(attended)
         h = nn.RMSNorm()(x)
         gate, up = nn.Dense(4 * self.width)(h), nn.Dense(4 * self.width)(h)
@@ -196,8 +197,12 @@ class Dynamics(nn.Module):
                                     nn.Embed(self.k_max + 1, self.width // 2)(level_index)], -1)
         action = self.param("action_token", nn.initializers.normal(0.02), (self.width,))
         action = jnp.broadcast_to(action, (batch, frames, self.width))
-        if actions is not None and self.action_size:
-            action = action + nn.Dense(self.width)(actions)
+        if actions is not None:
+            # Actions projected and summed into the learned token; unlabeled video has the token alone.
+            if not self.action_size or actions.shape[-1] != self.action_size:
+                raise ValueError(f"a dynamics model of {self.action_size} actions a step read actions "
+                                 f"{actions.shape}")
+            action = action + nn.Dense(self.width, name="action_projection")(actions)
         tokens = jnp.concatenate([action[:, :, None], shortcut[:, :, None], spatial], 2)
         per_frame = tokens.shape[2]
         tokens = tokens + self.param("slots", nn.initializers.normal(0.02), (per_frame, self.width))
@@ -277,7 +282,10 @@ class WorldModelObjective(Objective[Ratio]):
 
     def fresh_variables(self, key: jax.Array, held: Variables | None) -> Variables:
         frames = jnp.zeros((1, 2, self.model.latents, self.model.bottleneck))
-        return self.model.init(key, frames, jnp.ones((1, 2)), jnp.ones((1, 2)))
+        # A labeled model's action projection drawn with the rest, so labeled and unlabeled batches
+        # read one tree.
+        actions = jnp.zeros((1, 2, self.model.action_size)) if self.model.action_size else None
+        return self.model.init(key, frames, jnp.ones((1, 2)), jnp.ones((1, 2)), actions)
 
     @property
     def validation_loss_refusal(self) -> str | None:

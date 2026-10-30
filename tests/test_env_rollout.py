@@ -106,10 +106,12 @@ def test_the_squashed_normals_log_density_is_the_change_of_variables():
     assert_computes_the_oracle(found, expected, "the squashed normal's log-density", roundings=roundings)
 
 
-def test_advantages_bootstrap_a_cut_episode_and_end_a_terminated_one():
-    """GAE over sequences: the TD error discounts the following value except after a terminal state,
-    and the recursion stops at either end of an episode, within float64 rounding of the recursion
-    run step by step in Python."""
+def test_advantages_are_brax_two_passes_over_each_sequence():
+    """The value targets are GAE's lambda-returns, the TD error discounting the following value
+    except after a terminal state and the recursion stopping at either end of an episode; the actor's
+    advantage is a TD step from each value through the next step's target, or the following value
+    where the episode ended (brax/training/agents/ppo/losses.py:59-98): within float64 rounding of
+    both passes run step by step in Python."""
     rng = np.random.default_rng(4)
     shape = (6, 9)
     values, following, rewards = (rng.normal(size=shape) for _ in range(3))
@@ -123,16 +125,19 @@ def test_advantages_bootstrap_a_cut_episode_and_end_a_terminated_one():
     with jax.enable_x64(new_val=True):
         advantages, targets = (np.asarray(found) for found in computed(values, following))
         roundings = chain_roundings(jax.make_jaxpr(computed)(values, following))
-    expected = np.zeros(shape)
+    ended = terminated | batch["truncated"]
+    expected_targets, expected = np.zeros(shape), np.zeros(shape)
     for row in range(shape[0]):
         running = 0.0
         for t in reversed(range(shape[1])):
-            end = terminated[row, t] or batch["truncated"][row, t]
             delta = 2 * rewards[row, t] + 0.97 * (not terminated[row, t]) * following[row, t] - values[row, t]
-            running = delta + 0.97 * 0.9 * (not end) * running
-            expected[row, t] = running
+            running = delta + 0.97 * 0.9 * (not ended[row, t]) * running
+            expected_targets[row, t] = running + values[row, t]
+        for t in range(shape[1]):
+            after = following[row, t] if ended[row, t] or t == shape[1] - 1 else expected_targets[row, t + 1]
+            expected[row, t] = 2 * rewards[row, t] + 0.97 * (not terminated[row, t]) * after - values[row, t]
+    assert_computes_the_oracle(targets, expected_targets, "value targets", roundings=roundings)
     assert_computes_the_oracle(advantages, expected, "advantages", roundings=roundings)
-    assert_computes_the_oracle(targets, expected + values, "value targets", roundings=roundings + 1)
 
 
 def test_ppo_raises_the_greedy_policys_return_on_the_walk():

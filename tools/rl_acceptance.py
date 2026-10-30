@@ -7,13 +7,14 @@
                                                  steps, against the 990 its paper reports at 500K
                                                  (arXiv 2301.04104v2, "Proprioceptive control scores").
     python tools/rl_acceptance.py nft OUT        DiffusionNFT against Flow-GRPO under matched
-                                                 conditions: one pretrained flow model, one reward,
-                                                 the same prompts, samples and updates.
+                                                 conditions: one flowers DiT, one reward model (CLIP),
+                                                 the same prompts, samples and 500 updates each.
     python tools/rl_acceptance.py dreamer4 OUT   Dreamer 4's world model at small scale: shortcut
                                                  forcing against diffusion forcing on bouncing-ball
                                                  video, open-loop prediction error at 4 and 64 steps.
 
-Each writes OUT/<run>.json. Playground's environments need the `playground` distribution.
+Each writes OUT/<run>.json. Playground's environments need the `playground` distribution, and the
+flowers study Oxford Flowers 102 prepared as TFDS ArrayRecords (examples/train_flowers_tpu.py).
 """
 
 from __future__ import annotations
@@ -128,10 +129,11 @@ def laprop(lr: float = 4e-5, warmup: int = 1000) -> optax.GradientTransformation
     schedule = optax.join_schedules(
         [optax.linear_schedule(0.0, lr, warmup), optax.constant_schedule(lr)], [warmup]
     )
+    # The RMS divides outside its root (opt.py:126-143); the momentum is an EMA, bias-corrected.
     return optax.chain(
         clip_by_agc(),
-        optax.scale_by_rms(0.999, eps=1e-20, bias_correction=True),
-        optax.trace(0.9),
+        optax.scale_by_rms(0.999, eps=1e-20, eps_in_sqrt=False, bias_correction=True),
+        optax.ema(0.9, debias=True),
         optax.scale_by_learning_rate(schedule),
     )
 
@@ -179,23 +181,37 @@ def dreamer(
     return report
 
 
-def _shapes(rows: int, size: int, seed: int) -> np.ndarray:
-    """`rows` images `[size, size, 1]` in [0, 255]: a bright rectangle at a random place and size on
-    a dark ground."""
-    rng = np.random.default_rng(seed)
-    images = np.zeros((rows, size, size, 1), np.uint8)
-    for image in images:
-        h, w = rng.integers(3, size // 2, 2)
-        y, x = rng.integers(0, size - h), rng.integers(0, size - w)
-        image[y : y + h, x : x + w] = rng.integers(128, 256)
-    return images
+def flowers(size: int, batch: int, data: str) -> Loader:
+    """Oxford Flowers 102's every image, at `size` pixels a side in batches of `batch`, prepared as
+    TFDS ArrayRecords under `data` (examples/train_flowers.py)."""
+    from dew.data import TFDS, presets
+
+    return (
+        TFDS("oxford_flowers102", split="all", path=data)
+        .shuffle(seed=0)
+        .repeat()
+        .pipe(presets.images, size, batch=batch, augment=True)
+    )
 
 
-def nft(out: Path, *, pretrain: int = 3000, updates: int = 300, groups: int = 8, prompts: int = 16) -> dict:
-    """One unconditional flow DiT pretrained on rectangles, then trained apart by Flow-GRPO and by
-    DiffusionNFT toward images whose mean is 0.5 in [-1, 1], each over the same 10-step sampler,
-    groups, prompts and updates at the same rate: the rewards each reached, update by update."""
+def nft(
+    out: Path,
+    *,
+    data: str = "~/.cache/dew/datasets/oxford_flowers102/2.1.1",
+    pretrain: int = 30_000,
+    updates: int = 500,
+    groups: int = 8,
+    prompts: int = 16,
+    caption: str = "a photo of a red flower",
+) -> dict:
+    """The roadmap's comparison (docs/roadmap.md, [533]) as its planned acceptance runs it: one
+    flowers DiT pretrained by flow matching, then fine-tuned apart by Flow-GRPO and by DiffusionNFT
+    against one reward model, CLIP's score of
+    each image against `caption`, `updates` steps each over the same 10-step sampler, prompts, groups
+    and rate: each reward curve, and the steps each needed to reach the highest reward both reached."""
+    from dew.artifacts import ImageGrid
     from dew.diffusion import presets
+    from dew.eval.images import CLIPScore
     from dew.inputs import Field, InputSpec
     from dew.nn.backbones.dit import SimpleDiT
     from dew.objectives.diffusion.objective import DiffusionObjective
@@ -203,28 +219,22 @@ def nft(out: Path, *, pretrain: int = 3000, updates: int = 300, groups: int = 8,
     from dew.objectives.rl.nft import DiffusionNFTObjective, NFTRollout
     from dew.training import Trainer
 
-    inputs = InputSpec(Field("image", (16, 16, 1)))
-    model = SimpleDiT(
-        output_channels=1, patch_size=2, emb_features=128, num_layers=4, num_heads=4, mlp_ratio=4
-    )
-    images = _shapes(4096, 16, 0)
-    data = Loader(
-        train=lambda partition: ({"image": images[i : i + 64]} for i in itertools.cycle(range(0, 4096, 64))),
-        val=None,
-        records=4096,
-        batch=64,
-    )
+    size = 64
+    inputs = InputSpec(Field("image", (size, size, 3)))
+    model = SimpleDiT(patch_size=4, emb_features=256, num_layers=8, num_heads=8, mlp_ratio=4)
     base = Trainer(
         DiffusionObjective(model, presets.Flow(), inputs, guidance=None),
-        optax.adam(3e-4),
+        optax.adam(2e-4),
         key=jax.random.key(0),
-    ).fit(data, steps=pretrain, log_every=pretrain)
+    ).fit(flowers(size, 64, str(Path(data).expanduser())), steps=pretrain, log_every=pretrain // 10)
     start = jax.device_get(base.variables)
+    metric = CLIPScore()
 
     def reward(images, context):
-        return -np.abs(images.mean(axis=(1, 2, 3)) - 0.5)
+        captions = {"captions": np.asarray([caption] * len(images), object)}
+        return np.asarray(metric.fn(ImageGrid(images), captions), np.float64)
 
-    source = {"image": np.zeros((prompts, 16, 16, 1), np.uint8)}
+    source = {"image": np.zeros((prompts, size, size, 3), np.uint8)}
     curves = {}
     for name in ("flow_grpo", "diffusion_nft"):
         if name == "flow_grpo":
@@ -236,7 +246,7 @@ def nft(out: Path, *, pretrain: int = 3000, updates: int = 300, groups: int = 8,
             objective = DiffusionNFTObjective(model, presets.Flow(), inputs, steps=10, variables=start)
             rollout = NFTRollout(objective, reward, groups=groups, steps=11)
         tracker = _Tracker()
-        Trainer(objective, optax.adam(1e-4), key=jax.random.key(1), rollout=rollout, tracker=tracker).fit(
+        Trainer(objective, optax.adam(3e-5), key=jax.random.key(1), rollout=rollout, tracker=tracker).fit(
             Loader(
                 train=lambda partition: itertools.repeat(source), val=None, records=prompts, batch=prompts
             ),
@@ -246,16 +256,23 @@ def nft(out: Path, *, pretrain: int = 3000, updates: int = 300, groups: int = 8,
         curves[name] = [
             (row["step"], row["seconds"], row["reward"]) for row in tracker.scalars if "reward" in row
         ]
+
+    def smoothed(curve):
+        return np.convolve(np.asarray([r for _, _, r in curve]), np.ones(10) / 10, mode="valid")
+
+    common = min(float(smoothed(curve).max()) for curve in curves.values())
+    reached = {name: int(np.argmax(smoothed(curve) >= common)) + 10 for name, curve in curves.items()}
     report = {
         "pretrain_steps": pretrain,
         "updates": updates,
         "groups": groups,
         "prompts": prompts,
-        "reward": "minus |image mean - 0.5|",
+        "reward": f"CLIP score against {caption!r}",
         "curves": curves,
-        "final_reward": {
-            name: float(np.mean([r for _, _, r in curve[-20:]])) for name, curve in curves.items()
-        },
+        "common_reward": common,
+        "steps_to_common_reward": reached,
+        "first_reward": {name: float(np.mean([r for _, _, r in c[:10]])) for name, c in curves.items()},
+        "final_reward": {name: float(np.mean([r for _, _, r in c[-20:]])) for name, c in curves.items()},
         "device": str(jax.devices()[0]),
     }
     (out / "nft.json").write_text(json.dumps(report, indent=1))

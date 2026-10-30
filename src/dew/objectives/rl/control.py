@@ -141,8 +141,11 @@ class ControlPPOObjective(Objective[Ratio]):
 
     def advantages(self, values: jax.Array, following: jax.Array,
                    batch: Batch) -> tuple[jax.Array, jax.Array]:
-        """GAE over each sequence `[B, T]` from the critic's `values` at the observations and at the
-        `following` ones: the advantages and the value targets, advantage plus value."""
+        """Brax's two passes over each sequence `[B, T]` (brax/training/agents/ppo/losses.py:59-98)
+        from the critic's `values` at the observations and at the `following` ones: the value targets,
+        GAE's lambda-returns, and the actor's advantages, a TD step from each value through the next
+        step's target, or through the following value where the episode ended (none after a
+        terminal state)."""
         rewards = jnp.asarray(batch["reward"], values.dtype) * self.reward_scaling
         terminated = jnp.asarray(batch["terminated"], values.dtype)
         ended = jnp.maximum(terminated, jnp.asarray(batch["truncated"], values.dtype))
@@ -153,10 +156,12 @@ class ControlPPOObjective(Objective[Ratio]):
             advantage = delta + self.discount * self.lam * (1 - end) * advantage
             return advantage, advantage
 
-        _, advantages = jax.lax.scan(back, jnp.zeros(values.shape[0], values.dtype), (deltas.T, ended.T),
-                                     reverse=True)
-        advantages = advantages.T
-        return advantages, advantages + values
+        _, returns = jax.lax.scan(back, jnp.zeros(values.shape[0], values.dtype), (deltas.T, ended.T),
+                                  reverse=True)
+        targets = returns.T + values
+        onward = jnp.concatenate([targets[:, 1:], following[:, -1:]], 1)
+        after = jnp.where(ended > 0, following, onward)
+        return rewards + self.discount * (1 - terminated) * after - values, targets
 
     def loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[Ratio, Aux]:
         observation, following = batch["observation"], batch["following"]

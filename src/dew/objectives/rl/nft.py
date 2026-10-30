@@ -38,14 +38,14 @@ from flax import linen as nn
 from dew.batch import Batch, Variables, dicts, merge
 from dew.diffusion.presets import Preset
 from dew.diffusion.process import Process
-from dew.diffusion.schedules import FlowMatchingScheduler, expand
+from dew.diffusion.schedules import FlowMatchingScheduler
 from dew.diffusion.schedules.source import SourceGrid
 from dew.diffusion.transforms import FlowMatchPredictionTransform
 from dew.inputs import InputSpec
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.precision import at_least_fp32
 from dew.objectives.base import OMITTED, TEACHER, Aux, Omitted, Ratio, Shown, Step
-from dew.objectives.diffusion.objective import DiffusionObjective, sampling_grid, teacher_weights
+from dew.objectives.diffusion.objective import DiffusionObjective, teacher_weights
 from dew.sampling.solvers import Solver
 from dew.sampling.solvers.dpm import DPMSolverMultistep
 from dew.sampling.walks import walk_and_decode
@@ -175,7 +175,9 @@ class DiffusionNFTObjective(DiffusionObjective):
 
         def at(_, values):
             t, eps = values
-            x_t = expand(1 - t, samples) * samples + expand(t, samples) * eps
+            # The training process's own forward map at t, a shifted schedule's noise level among them.
+            alpha, sigma = self.process.rates(t, like=samples)
+            x_t = alpha * samples + sigma * eps
             x0_live, eps_live = live(x_t, t)
             # Each implicit policy's clean-sample estimate, x_t - t v, is the same mix of the two
             # policies' estimates as its velocity is of theirs (train_nft_sd3.py:934-948).
@@ -232,7 +234,11 @@ class NFTRollout(GroupedRollout):
     def _generate_impl(self, params: Variables, batch: Batch, key: jax.Array):
         """One clean sample per row, unguided, over the rollout's grid, and its decoded image."""
         objective = self.objective
-        process, times = sampling_grid(objective.process, self.steps, objective.grid)
+        # The training process's grid, in the times its denoiser and forward map read, never a loaded
+        # pipeline's table coordinates.
+        process = objective.process
+        with jax.ensure_compile_time_eval():
+            times = process.times(self.steps)
         noise_key, sample_key = jax.random.split(key)
         count = _source(objective.inputs, batch).shape[0]
         x_T = process.noise(noise_key, (count, *objective.latent_shape))

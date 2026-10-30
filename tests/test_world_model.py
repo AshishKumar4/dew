@@ -76,3 +76,28 @@ def test_the_dynamics_reads_no_frame_after_its_own():
     apply = jax.jit(model.apply)
     later = apply(params, changed, tau.at[:, 4:].set(0.125), d.at[:, 4:].set(0.5))
     np.testing.assert_array_equal(apply(params, noisy, tau, d)[:, :4], later[:, :4])
+
+
+def test_a_labeled_model_trains_its_actions_into_its_predictions():
+    """A dynamics model of two actions a step draws its action projection with the rest of its tree, and
+    its loss over labeled video reaches that projection's weights: the actions move the predictions."""
+    from dew.objectives.base import Step
+    from dew.objectives.world_model import CausalTokenizer, WorldModelObjective
+
+    tokenizer = CausalTokenizer((8, 8, 1), patch=4, width=16, depth=1, heads=2, latents=4, bottleneck=4)
+    tokens = tokenizer.init(jax.random.key(4), jnp.zeros((1, 8, 8, 1)))
+    dynamics = Dynamics(latents=4, bottleneck=4, spatial=2, action_size=2, width=16, depth=1, heads=2,
+                        levels=3, frames=4)
+    objective = WorldModelObjective(dynamics, tokenizer, tokens)
+    variables = objective.fresh_variables(jax.random.key(5), None)
+    rng = np.random.default_rng(6)
+    batch = {"video": jnp.asarray(rng.uniform(-1, 1, (2, 4, 8, 8, 1)), jnp.float32),
+             "actions": jnp.asarray(rng.normal(size=(2, 4, 2)), jnp.float32)}
+
+    def loss(params):
+        step = Step(jnp.asarray(0), jax.random.key(7), None)
+        stats, _ = objective.loss({**variables, "params": params}, batch, step)
+        return stats.total / stats.mass
+
+    gradient = jax.grad(loss)(variables["params"])
+    assert np.any(np.asarray(gradient["action_projection"]["kernel"]))
