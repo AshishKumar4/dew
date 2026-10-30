@@ -874,12 +874,13 @@ def _key_block(call: _Call, held: Callable[[int], _Held], consumers: int = 1) ->
 
 def _intra_held(call: _Call, block: int) -> _Held:
     """`_intra`'s consumer thread at key block `block`: the sum of the pairs carried across the sub-chunks and
-    a sub-chunk's own, beside a key block's tiles: its prefix halves, a pair's decay's two terms (`between`:
-    the exp2 of the fractions' difference and the scale of the wholes'), the rows or keys it gates and the
-    gated product, their masks, and the product's operands; then the doubling's, as the solve's."""
+    a sub-chunk's own, beside a key block's tiles: its prefix halves and each row's own sub-chunk's first
+    token's, a decay's two terms (`between`: the exp2 of the fractions' difference and the scale of the
+    wholes'), the rows or keys it gates, the rows and keys gated down and up, which the sub-chunks' turns
+    carry, their masks, and the product's operands; then the doubling's, as the solve's."""
     pairing = _pairing_operand(call)
     return _Held(phases=(
-        [_f32(CHUNK, CHUNK)] * 2 + [_f32(CHUNK, block)] * 6 + _masks(CHUNK, block) * 2
+        [_f32(CHUNK, CHUNK)] * 2 + [_f32(CHUNK, block)] * 9 + _masks(CHUNK, block) * 2
         + _fragments(call, (pairing, CHUNK, block), (pairing, CHUNK, block)),
         [_f32(CHUNK, CHUNK)] * 4 + _masks(CHUNK, CHUNK) * 2))
 
