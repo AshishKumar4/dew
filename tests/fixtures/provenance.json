@@ -1927,7 +1927,7 @@
      "runs": "fla"
     }
    ],
-   "note": "The reference's own rounding draws: reference.npz's SGD step over 52 residual orders in MXFP4's groups of 32 (tools/rounding_orders.py draws them and writes the weights in each order through Dew's export; the recorder's `symmetric` checks they are a symmetry of the float64 truth); per order, the updated logits' RMS distance from float64. Dynamic remote import; fla kernels forced IEEE; compressed-tensors 0.17.1 supplies packed/decompressed weight inputs."
+   "note": "The reference's own rounding draws: reference.npz's SGD step over 52 residual orders in MXFP4's groups of 32 (tools/rounding_orders.py draws them and writes the weights in each order through Dew's export; `tools/rounding_orders.py symmetric` holds the float64 truth of orders 1 and 51, which the recorder's `truth DIR` writes, to the fixture's); per order, the updated logits' RMS distance from float64. Dynamic remote import; fla kernels forced IEEE; compressed-tensors 0.17.1 supplies packed/decompressed weight inputs."
   },
   "hf/kimi-k3-tiny/reference.npz": {
    "tool": "tools/kimi_k3_reference.py",
@@ -1979,7 +1979,7 @@
      "runs": "fla"
     }
    ],
-   "note": "The reference's own rounding draws: reference.npz's SGD step over 52 residual orders (tools/rounding_orders.py draws them and writes the weights in each order through Dew's export; the recorder's `symmetric` checks they are a symmetry of the float64 truth); per order, the updated logits' RMS distance from float64. Dynamic remote import; routing weights use unshifted scores (tools/kimi_linear_reference.py:33); fla kernels forced IEEE."
+   "note": "The reference's own rounding draws: reference.npz's SGD step over 52 residual orders (tools/rounding_orders.py draws them and writes the weights in each order through Dew's export; `tools/rounding_orders.py symmetric` holds the float64 truth of orders 1 and 51, which the recorder's `truth DIR` writes, to the fixture's); per order, the updated logits' RMS distance from float64. Dynamic remote import; routing weights use unshifted scores (tools/kimi_linear_reference.py:33); fla kernels forced IEEE."
   },
   "hf/kimi-linear-tiny/reference.npz": {
    "tool": "tools/kimi_linear_reference.py",
@@ -2743,17 +2743,12 @@
    "tool": "tools/indexer_reference.py",
    "sources": [
     {
-     "repo": "google/maxtext",
-     "version": "0.2.4 (538fe7a3f3376d94cf3f04e77741aa6d7e8efa45)",
-     "transcribed": true
-    },
-    {
      "repo": "AI-Hypercomputer/maxtext",
      "version": "538fe7a3f3376d94cf3f04e77741aa6d7e8efa45",
      "runs": "fetched"
     }
    ],
-   "note": "indexer_loss.npz: NumPy transcription documented at tools/indexer_reference.py:12; meta.json present. maxtext.npz: executes MLA.calculate_indexer_loss and Indexer.generate_mask fetched at 538fe7a3 (EPS and DEFAULT_MASK_VALUE from the same commit) under JAX behind Indexer.__call__'s masking and jax.lax.top_k, in float32 and float64."
+   "note": "indexer_loss.npz (`write_legacy`) and maxtext.npz (`write_published`): MLA.calculate_indexer_loss and Indexer.generate_mask fetched at 538fe7a3 (EPS and DEFAULT_MASK_VALUE from the same commit), run under JAX behind Indexer.__call__'s masking and jax.lax.top_k, each query's KL the published loss of that query alone; recorded_<case>.npz the same over check 1's seeds; meta.json the sizes."
   },
   "kda/recorded_rules.npz": {
    "note": "Torch 2.14.1+cpu executes the published chunk/recurrent KDA bodies and l2norm, with only optional hub-kernel decorators removed, over check 1's seeds in float32 and in float64 (its float32 casts widened). Ragged tokens, vector decay, nonzero initial state, outputs, final state and all six operand gradients; check 1's evidence of each, summarized.",

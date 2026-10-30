@@ -13,8 +13,8 @@ reference computes with the library's own decompression of them, so the
 packed file and the logits describe one model. `calculate_qparams` clamps
 the scale exponents and substitutes a finite scale for an all-zero group.
 
-Environment (~/.cache/dew/reference-venvs/kimi-k3): torch 2.8.0+cu128,
-transformers 4.56.2, fla-core 0.5.2, compressed-tensors 0.17.1.
+Environment: tools/kimi_k3_reference.requirements.txt (torch 2.8.0+cu128,
+transformers 4.56.2, fla-core 0.5.2, compressed-tensors 0.17.1).
 
 Three things change how the reference runs, neither what it computes:
 
@@ -49,8 +49,8 @@ tests/test_kimi_k3.py measures Dew and the reference from: the logits, the
 loss, the logits after one SGD step at the stored learning rate, and the
 greedy decode's step logits teacher-forced. It runs on a CPU, in the same
 environment with torch 2.8.0's CPU build and triton 3.4.0 (fla imports it).
-`symmetric DRAWN` checks that tools/rounding_orders.py's residual orders are
-a symmetry of that truth.
+`truth DIR` writes it for a residual order's directory that
+tools/rounding_orders.py drew, whose `symmetric` holds it to the fixture's.
 """
 
 import copy
@@ -73,6 +73,9 @@ ROOT = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "hf"
 SOURCE = ROOT / "kimi-k3-source"
 DESTINATION = ROOT / "kimi-k3-tiny"
 LEARNING_RATE = 1e-2
+PICKS = "autotune.json"
+"""Where a fixture keeps the configuration each of fla's autotuned kernels took at each shape its run
+called it with, and its GPU's multiprocessor count (`record_picks`)."""
 
 
 def tiny_config() -> dict:
@@ -220,8 +223,8 @@ def matmul_precision() -> str:
     from fla.ops.kda import chunk_intra
     from torch_precision import recorded_matmuls
 
-    return recorded_matmuls(**{"the intra-chunk solve": str(getattr(chunk_intra.SOLVE_TRIL_DOT_PRECISION, "value",
-                                                                    chunk_intra.SOLVE_TRIL_DOT_PRECISION))})
+    solve = chunk_intra.SOLVE_TRIL_DOT_PRECISION
+    return recorded_matmuls(**{"the intra-chunk solve": str(getattr(solve, "value", solve))})
 
 
 def load_weights(model: torch.nn.Module, tensors: dict[str, torch.Tensor]) -> None:
@@ -299,6 +302,7 @@ def main() -> None:
              generated=generated, step_logits=step_logits,
              situ_gate=gate.reshape(-1).numpy(), situ_up=up.reshape(-1).numpy(),
              situ=situ_out.reshape(-1).numpy(), precision=matmul_precision())
+    record_picks(DESTINATION)
     print("wrote", DESTINATION, "tensors", len(tensors))
 
 
@@ -371,29 +375,6 @@ def write_truth(directory: Path, truth: Callable[[Path], dict[str, np.ndarray]])
     np.savez(directory / "numerics.npz", **arrays, precision="ieee")
 
 
-def symmetric(fixture: Path, drawn: Path, truth: Callable[[Path], dict[str, np.ndarray]]) -> None:
-    """Hold the float64 truth under the second and the last residual order tools/rounding_orders.py wrote
-    under `drawn` (each order's directory as the fixture's: its config, weights and reference.npz) to the
-    fixture's own, within float64 rounding over the computation's longest chain of reductions (each layer's
-    hidden and token sums, then the head's): the orders are a symmetry of the reference's computation, not
-    only of Dew's."""
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
-    from reference_error import assert_computes_the_oracle
-
-    text = json.loads((fixture / "config.json").read_text())
-    text = text.get("text_config", text)
-    with np.load(fixture / "numerics.npz") as exact, np.load(fixture / "reference.npz") as stored:
-        valid = stored["attention_mask"].astype(bool)
-        roundings = text["num_hidden_layers"] * (text["hidden_size"] + valid.shape[1]) + text["hidden_size"]
-        count = len(np.load(drawn / "orders.npy"))
-        for k in (1, count - 1):
-            arrays = truth(drawn / str(k))
-            for key in ("logits_f64", "updated_logits_f64"):
-                assert_computes_the_oracle(arrays[key][valid], exact[key][valid],
-                                           f"{fixture.name} order {k} {key}", roundings=roundings)
-    print(fixture.name, "orders 1 and", count - 1, "hold the float64 truth")
-
-
 def orders(drawn: Path) -> None:
     """The reference's own rounding draws over the residual orders
     tools/rounding_orders.py wrote under `drawn`, in MXFP4's groups of 32
@@ -403,9 +384,65 @@ def orders(drawn: Path) -> None:
     model = modeling.KimiK3ForConditionalGeneration(
         configuration.KimiK3Config(**copy.deepcopy(config))).float()
     model.language_model.config._attn_implementation = "eager"
-    model = model.cuda().eval()
     record_orders(model, drawn, DESTINATION, load_weights, lambda name: name.startswith("language_model."),
                   matmul_precision())
+
+
+def autotuned() -> dict:
+    """Each autotuned Triton kernel of the fla modules this process has imported, by its function's
+    module and name, re-exports counted once."""
+    from triton.runtime.autotuner import Autotuner, Heuristics
+
+    kernels = {}
+    for module in [module for name, module in sys.modules.items() if name.startswith("fla.") and module]:
+        for kernel in vars(module).values():
+            while isinstance(kernel, Heuristics):
+                kernel = kernel.fn
+            if isinstance(kernel, Autotuner):
+                kernels[f"{kernel.base_fn.__module__}.{kernel.base_fn.__name__}"] = kernel
+    return kernels
+
+
+def picks() -> dict:
+    """What decides how this run's sums round beyond its inputs, as `PICKS` keeps it: the configuration
+    each of fla's autotuned kernels took at each shape it ran (its tiles, warps and stages, which a timing
+    chose), and the GPU's multiprocessor count, over which fla's gated norm backward splits its weight
+    gradient's partial sums (fused_norm_gate's `NS`)."""
+    from fla.utils import get_multiprocessor_count
+
+    kernels = {name: sorted([list(key), {"kwargs": config.kwargs, "num_warps": config.num_warps,
+                                         "num_stages": config.num_stages, "num_ctas": config.num_ctas}]
+                            for key, config in kernel.cache.items())
+               for name, kernel in sorted(autotuned().items()) if kernel.cache}
+    return {"multiprocessors": get_multiprocessor_count(0), "kernels": kernels}
+
+
+def record_picks(destination: Path) -> None:
+    """Write this run's `picks` beside the fixture in `destination`."""
+    (destination / PICKS).write_text(json.dumps(picks(), indent=1, sort_keys=True) + "\n")
+
+
+def restore_picks(destination: Path) -> None:
+    """Set each of fla's autotuned kernels to the configurations the fixture's run in `destination`
+    took (`record_picks`), so each shape it runs takes its recorded configuration without timing: a
+    later run on a GPU of as many multiprocessors reproduces the fixture's bits from a cold cache, where
+    timing could pick another tile (ledger 568: four A100 runs of the orders could not reproduce order
+    0). One of another count splits the norm's sums otherwise, and is refused."""
+    from fla.utils import get_multiprocessor_count
+    from triton import Config
+
+    recorded, kernels = json.loads((destination / PICKS).read_text()), autotuned()
+    here = get_multiprocessor_count(0)
+    if recorded["multiprocessors"] != here:
+        raise SystemExit(f"the fixture's run split its sums over {recorded['multiprocessors']} "
+                         f"multiprocessors, this GPU's {here}: record it again here")
+    if missing := sorted(set(recorded["kernels"]) - set(kernels)):
+        raise SystemExit(f"fla no longer autotunes {missing}, which the fixture's run did")
+    for name, taken in recorded["kernels"].items():
+        kernels[name].cache.update({tuple(key): Config(config["kwargs"], num_warps=config["num_warps"],
+                                                       num_stages=config["num_stages"],
+                                                       num_ctas=config["num_ctas"])
+                                    for key, config in taken})
 
 
 def record_orders(model: torch.nn.Module, drawn: Path, destination: Path,
@@ -415,11 +452,13 @@ def record_orders(model: torch.nn.Module, drawn: Path, destination: Path,
     order under `drawn`, each order's weights read in by `load`: its updated
     logits' RMS distance from float64 written to `destination`/orders.npz
     beside the orders (tests/reference_error.py's K-order rule). Order 0 is
-    the fixture's own run and must reproduce its updated logits bit for bit."""
+    the fixture's own run and must reproduce its updated logits bit for bit:
+    fla's kernels take the fixture's configurations (`restore_picks`), and no
+    shape is timed afresh."""
     from safetensors.torch import load_file
 
-    ids, mask = fixture_batch()
-    input_ids, attention_mask = torch.tensor(ids, device="cuda"), torch.tensor(mask, device="cuda")
+    restore_picks(destination)
+    model, _, mask, input_ids, attention_mask = fixture_on_gpu(model)
     valid = mask.astype(bool)
     with np.load(destination / "numerics.npz") as exact, np.load(destination / "reference.npz") as stored:
         truth, recorded = exact["updated_logits_f64"][valid], stored["updated_logits"]
@@ -432,6 +471,8 @@ def record_orders(model: torch.nn.Module, drawn: Path, destination: Path,
         if k == 0:
             assert np.array_equal(updated, recorded), "order 0 must reproduce the fixture's run"
         distances.append(np.sqrt(np.mean(np.square(updated[valid].astype(np.float64) - truth))))
+    assert picks() == json.loads((destination / PICKS).read_text()), \
+        "a kernel ran a shape the fixture's run did not"
     np.savez(destination / "orders.npz", orders=drawn_orders.astype(np.min_scalar_type(drawn_orders.max())),
              updated_logits=np.asarray(distances), precision=precision)
     print("orders", len(distances), "distances", np.round(np.asarray(distances) / distances[0], 2))
@@ -442,9 +483,7 @@ if __name__ == "__main__":
         orders(Path(sys.argv[2]))
     elif sys.argv[1:] == ["padding"]:
         record_released_padding()
-    elif sys.argv[1:] == ["truth"]:
-        write_truth(DESTINATION, truth)
-    elif sys.argv[1:2] == ["symmetric"]:
-        symmetric(DESTINATION, Path(sys.argv[2]), truth)
+    elif sys.argv[1:2] == ["truth"]:
+        write_truth(Path(sys.argv[2]) if len(sys.argv) > 2 else DESTINATION, truth)
     else:
         main()

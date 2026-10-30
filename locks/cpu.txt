@@ -929,8 +929,16 @@ numpy==2.5.4
     #   torchvision
     #   transformers
     #   treescope
+nvidia-cuda-crt==13.4.92 ; platform_machine == 'x86_64' and sys_platform == 'linux'
+    # via nvidia-cuda-nvcc
+nvidia-cuda-nvcc==13.4.92 ; platform_machine == 'x86_64' and sys_platform == 'linux'
+    # via dewml (pyproject.toml)
 nvidia-cuda-nvcc-cu12==12.9.86 ; platform_machine == 'x86_64' and sys_platform == 'linux'
     # via dewml (pyproject.toml)
+nvidia-cuda-runtime==13.4.92 ; platform_machine == 'x86_64' and sys_platform == 'linux'
+    # via nvidia-cuda-nvcc
+nvidia-nvvm==13.4.92 ; platform_machine == 'x86_64' and sys_platform == 'linux'
+    # via nvidia-cuda-nvcc
 oauthlib==4.0.0
     # via requests-oauthlib
 obstore==0.11.1
