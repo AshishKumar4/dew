@@ -56,12 +56,12 @@ class RoutedValues(nn.Module):
     projections to `features`, each through a SiLU, summed under the router's weights in fp32, run as
     the layer's routed MLP runs its own (`mixture`, `dew.nn.backbones.decoder_block.Mixture`): its
     kernel, its dispatch and its capacity, so an expert-parallel model places both sets of experts
-    alike; without one, the grouped matmul's own kernel over every expert's slots."""
+    alike."""
 
     spec: ValueExperts
     in_features: int
     features: int
-    mixture: Mixture | None = None
+    mixture: Mixture
     init_std: float | None = None
     dtype: Dtype | None = None
     precision: PrecisionLike = None
@@ -76,19 +76,17 @@ class RoutedValues(nn.Module):
                                        features=self.features, init_std=self.init_std, name='v_proj')
 
     def _project(self, tokens, sizes, _expert_ids, kernels, *, dtype):
-        implementation = 'auto' if self.mixture is None else self.mixture.implementation
-        projected = expert_projection(tokens, kernels[0], sizes, dtype, implementation, self.precision)
+        projected = expert_projection(tokens, kernels[0], sizes, dtype, self.mixture.implementation,
+                                      self.precision)
         return jax.nn.silu(checkpoint_name(jnp.asarray(projected), 'v_proj'))
 
     def __call__(self, x: jax.Array) -> jax.Array:
         weights, indices = self.router(x)
-        mixture = self.mixture
         kernel = self.projection.kernel
         compute = expert_compute_dtype(x, kernel, dtype=self.dtype)
         slots = expert_dispatch(functools.partial(self._project, dtype=compute), x, indices, (kernel,),
                                 (VALUE_EXPERT_AXES,), num_experts=self.spec.experts,
-                                dispatch='global' if mixture is None else mixture.dispatch,
-                                capacity_factor=None if mixture is None else mixture.capacity_factor,
+                                dispatch=self.mixture.dispatch, capacity_factor=self.mixture.capacity_factor,
                                 initializing=self.is_initializing(), output_dtype=compute)
         wide = at_least_fp32(slots.dtype)
         return float32_einsum('...ke,...k->...e', slots.astype(wide), weights.astype(wide),
