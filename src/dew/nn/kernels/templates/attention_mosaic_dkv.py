@@ -64,9 +64,13 @@ def _dkv_allocations(family: mosaic.Family, config: BackwardTiles, width: int, v
     blocks = {"queries": ((block_q, width), dtype), "douts": ((block_q, value_width), dtype)}
     if config.fused:
         # A fused launch's (`_dkv_step`'s `add_dq`): each consumer's score cotangents staged for dQ's
-        # product, their transpose its left operand, and its dQ tile's stage for the add.
+        # product, their transpose its left operand, and its dQ tile's stage for the add; shared
+        # (`BackwardTiles.shared_dq`), every consumer's read by each, its share of dQ's columns staged, and
+        # the exchange's barriers (`Family.exchange`).
+        share = width // consumers if config.shared_dq else width
         scoped += [plgpu.SMEM((consumers, block_k, rows), dtype),
-                   plgpu.SMEM((consumers, rows, width), jnp.float32)]
+                   plgpu.SMEM((consumers, rows, share), jnp.float32),
+                   *(family.exchange(consumers) if config.shared_dq else [])]
     if config.staged_logits:
         # One slot's queries taken by the power, which the first consumer stages for every consumer's share,
         # and the two turns that order its writes against their products' reads (`_staged_logits`).
@@ -144,13 +148,11 @@ def _dkv_step(walk: _Backward, resident: tuple, rows_of, coords_of, params_of, s
     else:
         # The fused launch's (the fast form's one part): dK's left operand from the registers, and staged,
         # its transpose dQ's (`algebra.cotangent_product`'s `a @ b`), the tile's dQ added into dQ, the
-        # query tile's other key blocks adding theirs; a consumer's share of a 128-query slot is 64 rows,
-        # warpgroup MMA's least (`MosaicBackward.legal`).
+        # query tile's other key blocks adding theirs (`_fused_adds`); a consumer's share of a 128-query
+        # slot is 64 rows, warpgroup MMA's least (`MosaicBackward.legal`).
         ((part_tile, _),) = algebra.cotangent_parts(logits * walk.grad_scale, q_slot.dtype, accurate=False)
         dk_acc = family.register_products(dk_acc, ((part_tile, None),), q_columns, walk.interpret)
-        staged_part, dq_stage = add_dq
-        family.staged(part_tile, staged_part)
-        dq_stage(q_first, family.product(staged_part.transpose((1, 0)), k_smem, (count, k_smem.shape[-1])))
+        add_dq(part_tile, q_first)
     if _grading(shares):
         store_tiles(q_first, [piece for kind, piece in zip(kinds, pieces, strict=True) if kind == Kind.TILE])
         key_pieces = [piece for kind, piece in zip(kinds, pieces, strict=True) if kind == Kind.KEY]
@@ -175,12 +177,52 @@ def _staged_logits(walk: _Backward, stage: tuple, q_slot, part: tuple):
     first, count = part
     return ref if count == ref.shape[0] else ref.at[pl.ds(first, count)]
 
-def _fused_adds(walk: _Backward, dq_ref, stages: list, place: tuple, index) -> tuple | None:
-    """A fused launch's consumer `index`'s dQ adds (`_dkv_step`'s `add_dq`): its score cotangents' stage and
-    its tiles' add into dQ at `place` (`_dq_added`); None where the launch adds none."""
+def _fused_adds(walk: _Backward, dq_ref, stages: list, place: tuple, index, k_smem, holder):
+    """A fused launch's consumer `index`'s dQ adds (`_dkv_step`'s `add_dq(score cotangents, first query)`),
+    None where the launch adds none: its score cotangents staged (`stages[0]`), their transpose times its
+    keys (`k_smem`, `[holders, bk, D]`, its `holder`'s), the tile's dQ added into dQ at `place`
+    (`_dq_added`); shared
+    (`BackwardTiles.shared_dq`), staged into its slot of the exchanged block (`mosaic.Exchange`), each
+    consumer's share of dQ's columns over every consumer's keys, at static columns (`mosaic.per_role`)."""
     if not walk.fused:
         return None
-    return stages[0].at[index], functools.partial(_dq_added, walk, dq_ref, stages[1], place, index)
+    family, consumers = walk.program.family, walk.consumers
+    staged, out_stage = stages[0], stages[1]
+
+    def own(part, q_first):
+        family.staged(part, staged.at[index])
+        held = k_smem.at[holder]
+        _dq_added(walk, dq_ref, out_stage, place, index, q_first,
+                  family.product(staged.at[index].transpose((1, 0)), held, (part.shape[1], held.shape[-1])))
+
+    if not walk.program.tiles.shared_dq:
+        return own
+    exchange = mosaic.Exchange(family, stages[2], stages[3], consumers)
+    exchange.open()
+
+    def shared(part, q_first):
+        exchange.claim()
+        family.staged(part, staged.at[index])
+        exchange.publish()
+        rows, columns = part.shape[1], out_stage.shape[-1]
+
+        def mine(role, index):
+            # Its columns over every consumer's keys, at static columns (`mosaic.per_role`).
+            share = pl.ds(role * columns, columns)
+
+            def issue(acc):
+                for other in range(consumers):
+                    keys = k_smem.at[other].at[:, share]
+                    acc = family.products(acc, staged.at[other].transpose((1, 0)), keys, walk.interpret)
+                return acc
+
+            dq = family.summed((rows, columns), issue, walk.interpret)
+            _dq_added(walk, dq_ref, out_stage, place, index, q_first, dq, columns=share)
+
+        mosaic.per_role(index, consumers, mine)
+        exchange.release()
+
+    return shared
 
 def _logits_stage(family: mosaic.Family, consumers: int, allocated: list, index) -> tuple | None:
     """Consumer `index`'s staged logits' queries (`_staged_logits`' `stage`) from their `allocated` ref and
@@ -379,7 +421,8 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
         q_ref, k_ref, v_ref, do_ref, *stat_refs = inputs
         k_smem, v_smem, out_smem, dv_smem, rows_smem, k_loaded, v_loaded, *rest = held
         tile_stage, rest = (rest[-1], rest[:-1]) if tiled else (None, rest)
-        fused_stages, logits_stages = (rest[:2], rest[2:]) if walk.fused else ([], rest)
+        fused = (4 if program.tiles.shared_dq else 2) if walk.fused else 0
+        fused_stages, logits_stages = rest[:fused], rest[fused:]
         row, head = lax.axis_index("batch"), lax.axis_index("heads")
 
         named = {"queries": q_ref, "douts": do_ref, **({} if l_ref is None else {"logits": l_ref})}
@@ -412,7 +455,7 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
             params_of = functools.partial(_score_params, family, score_refs, kinds, row, head,
                                           k_first=k_first, keys_first=True)
             resident = k_smem.at[holder], v_smem.at[holder]
-            adds = _fused_adds(walk, dq_ref, fused_stages, (row, head), index)
+            adds = _fused_adds(walk, dq_ref, fused_stages, (row, head), index, k_smem, holder)
             stage = _logits_stage(family, consumers, logits_stages, index)
             step = functools.partial(_dkv_step, walk, resident, rows_of, coords_of, params_of, store_tiles,
                                      shares, part, stage, adds)

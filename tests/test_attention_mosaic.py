@@ -66,14 +66,14 @@ HOOK_FORMS = {"bfloat16": (jnp.bfloat16, False), "float16": (jnp.float16, False)
 FED = {"dkv_family": "wgmma.fed", "dkv_consumers": 2}
 """The dK/dV launch on an H100's layout whose consumers feed their rings, its two consumers splitting each
 slot's queries (`attention_mosaic_scores.split_queries`), as the derivation takes it."""
-BACKWARD_FORMS = ("default", "fused", "fused-keys-first", "fused-shared-keys", "accurate")
+BACKWARD_FORMS = ("default", "fused", "fused-keys-first", "fused-shared-keys", "fused-shared-dq", "accurate")
 """The backward's forms (`_backward_form`): the fast in two launches and in one each way, and the
 accurate."""
 HOOKED_FORMS = ("default", "accurate")
 """The forms a hooked or dropping call takes: its fast form's one launch is a hookless call's alone."""
 
 
-FORM_WIDTHS = {"fused-keys-first": 64, "fused-shared-keys": 128}
+FORM_WIDTHS = {"fused-keys-first": 64, "fused-shared-keys": 128, "fused-shared-dq": 128}
 """The head width a backward form takes where the checks' own (128, a call form's 64) is not one it holds:
 the keys-first one launch holds width 64 alone (its dK, dV and dQ tiles past a consumer's registers at
 128), the shared keys' consumers 128 and wider (each its share of the columns whole swizzled rows)."""
@@ -85,12 +85,17 @@ def _backward_form(form: str) -> tuple[bool, attention_mosaic.BackwardTiles]:
     accurate form's sums in two column halves where it is `accurate-halves` (a width split's,
     `BackwardTiles.columns`); or the fast form's one launch (`fused`), queries first on the dQ launch's
     layout, or keys first on `FED`'s (`fused-keys-first`), each consumer 64 of a slot's 128 queries, or
-    queries first over keys its two consumers share on `FED`'s layout (`fused-shared-keys`)."""
+    queries first over keys its two consumers share on `FED`'s layout (`fused-shared-keys`), or keys first on
+    the dQ launch's layout, each of its two consumers its own keys, their score cotangents exchanged for a
+    shared dQ (`fused-shared-dq`, FlashAttention 3's width 128)."""
     if form == "fused":
         return False, attention_mosaic.BackwardTiles(64, 64, 2, 1, fused=True)
     if form == "fused-shared-keys":
         return False, attention_mosaic.BackwardTiles(64, 64, 2, 2, fused=True, family=FED["dkv_family"],
                                                      shared_keys=True)
+    if form == "fused-shared-dq":
+        return False, attention_mosaic.BackwardTiles(64, 64, 2, 1, fused=True, dkv_family="wgmma",
+                                                     dkv_consumers=2, shared_dq=True)
     if form == "fused-keys-first":
         return False, attention_mosaic.BackwardTiles(128, 64, 2, 1, fused=True, **FED)
     columns = 2 if form == "accurate-halves" else 1

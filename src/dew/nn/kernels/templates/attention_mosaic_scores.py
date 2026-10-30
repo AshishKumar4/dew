@@ -136,13 +136,14 @@ def _scores(walk: _Backward, coords: algebra.Coords, params: tuple, s, dp, peak,
                                      inverse_total, multiplier=multiplier)
     return exponentials, weights, cotangents, slopes, seen
 
-def _dq_added(walk: _Backward, dq_ref, out_smem, place: tuple, index, q_first, dq) -> None:
+def _dq_added(walk: _Backward, dq_ref, out_smem, place: tuple, index, q_first, dq, columns=None) -> None:
     """A fused dK/dV consumer's tile `dq` added into dQ at its queries from `q_first` (`place` its row and
-    head), through its output stage, free until its dK and dV are stored; interpreted, into a copy of the
-    consumer's own (`Family.added`)."""
+    head), its `columns` where it is a share of them (`pl.ds`), through its output stage, free until its dK
+    and dV are stored; interpreted, into a copy of the consumer's own (`Family.added`)."""
     row, head = place
     rows = dq.shape[0]
     view = dq_ref.at[index if walk.interpret else 0, row, pl.ds(q_first, rows), head]
+    view = view if columns is None else view.at[:, columns]
     walk.program.family.added(dq, view, walk.interpret, smem=out_smem.at[index, pl.ds(0, rows)])
 
 
