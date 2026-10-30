@@ -586,20 +586,11 @@ class _Program[T: (Tiles, BackwardTiles)]:
         whether tile `index` sees it whole (`whole(index)`): a full or causal call's from its places, from
         its diagonal and none for a block wholly past the keys; a spans call's from its block map, whole
         where the ids of both blocks agree too (`reach`)."""
-        block_q, block_k = self.tiles.block_q, self.tiles.block_k
         if spans is None:
-            # The first query tile that sees the block: every one, or those from its diagonal (a causal call
-            # of more keys than queries leaves its last keys unseen).
-            lo = jnp.minimum(lax.div(k_first, block_q), q_steps) if self.causal else jnp.int32(0)
-            lo = jnp.where(k_first >= self.keys, q_steps, lo)
-            # The tiles from which every query sees the block whole: past its diagonal, and none if it holds
-            # padding.
-            whole = jnp.minimum(pl.cdiv(k_first + block_k - 1, block_q), q_steps) if self.causal else lo
-            whole = jnp.where(k_first + block_k > self.keys, q_steps, jnp.maximum(whole, lo))
-            # A query tile holding padding rows sees no block whole (`reach`).
-            return lo, jnp.int32(q_steps), lambda index: (index >= whole) & jnp.logical_not(
-                self.padded(index * block_q))
-        block = lax.div(k_first, block_k)
+            start, end = self._whole_run(k_first, q_steps)
+            return self._first_reader(k_first, q_steps), jnp.int32(q_steps), lambda index: (
+                (index >= start) & (index < end))
+        block = lax.div(k_first, self.tiles.block_k)
 
         def seen_whole(index):
             inside = (block >= spans.full_lo[row, index]) & (block < spans.full_hi[row, index])
@@ -609,6 +600,30 @@ class _Program[T: (Tiles, BackwardTiles)]:
             return inside & (doc != 0) & (doc == spans.query_doc[row, index])
 
         return spans.q_lo[row, block], spans.q_hi[row, block], seen_whole
+
+    def whole_run(self, k_first, q_steps: int, spans: _Spans | None) -> tuple[jax.Array, jax.Array] | None:
+        """The query tiles `[a, b)` that see the key block from `k_first` whole (`readers`' `whole`), one run
+        of them: a causal call's, from its diagonal to its first tile holding padding rows; None for a spans
+        call, whose whole tiles need not run unbroken, and for a full call, whose every tile but a padded
+        edge's is whole (ET-SEGS-h100: the run its own segment, 2% slower a full launch at width 64, 7%
+        faster a causal one at Qwen3-8B's)."""
+        return None if spans is not None or not self.causal else self._whole_run(k_first, q_steps)
+
+    def _first_reader(self, k_first, q_steps: int) -> jax.Array:
+        """The first query tile that sees the key block from `k_first` in a full or causal call: every one,
+        or those from its diagonal (a causal call of more keys than queries leaves its last keys unseen)."""
+        lo = jnp.minimum(lax.div(k_first, self.tiles.block_q), q_steps) if self.causal else jnp.int32(0)
+        return jnp.where(k_first >= self.keys, q_steps, lo)
+
+    def _whole_run(self, k_first, q_steps: int) -> tuple[jax.Array, jax.Array]:
+        """`whole_run`'s of a full or causal call: from past the block's diagonal (none if the block holds
+        padding keys) to the first query tile holding padding rows, which sees no block whole (`reach`)."""
+        block_q, block_k = self.tiles.block_q, self.tiles.block_k
+        lo = self._first_reader(k_first, q_steps)
+        start = jnp.minimum(pl.cdiv(k_first + block_k - 1, block_q), q_steps) if self.causal else lo
+        start = jnp.where(k_first + block_k > self.keys, q_steps, jnp.maximum(start, lo))
+        end = jnp.int32(q_steps if self.queries is None else min(self.queries // block_q, q_steps))
+        return start, jnp.maximum(end, start)
 
 
 def _streamed(reaches: list) -> tuple[jax.Array, jax.Array]:
