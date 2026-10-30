@@ -141,33 +141,103 @@ POOLED = 3
 """The shares of the pools a bound in examples is dealt between, which the ten records' passes do not
 split evenly."""
 
+POOLED_SHARDS = 3
+"""The rows of each physical shard of the pools' streamed reads: 3, 3, 3 and a last of 1."""
 
-@pytest.mark.parametrize("examples", [7, 23])
-@pytest.mark.parametrize("deal", ["one order", "dealt records", "dealt shards"])
+
+def examples_read(loader: Loader, partition: DataPartition, *, expanded: bool) -> collections.Counter:
+    """The examples by id `partition`'s share of `loader` reads, each example's rows whole (an objective's
+    `id % 3 + 1` rows of each where `expanded`)."""
+    rows = collections.Counter(ids_read(loader, "id", partition))
+    made = {record: record % 3 + 1 if expanded else 1 for record in rows}
+    assert all(count % made[record] == 0 for record, count in rows.items()), rows
+    return collections.Counter({record: count // made[record] for record, count in rows.items()})
+
+
+def dealt_records(ids: np.ndarray, examples: int, index: int) -> collections.Counter:
+    """The oracle of a pool's bound over records each share reads its own of, dealt `index :: POOLED`: the
+    examples at each of the pool's first `examples` places, pass after pass, that fall to share `index`."""
+    places = [place % len(ids) for place in range(examples)]
+    return collections.Counter(int(ids[place]) for place in places if place % POOLED == index)
+
+
+def dealt_shards(ids: np.ndarray, examples: int, index: int, *, rewound: bool) -> collections.Counter:
+    """The oracle of a pool's bound over the stream's physical shards of POOLED_SHARDS rows, dealt place by
+    place (`index :: POOLED`) in the order the compile's seed (0) shuffles them: each pass its own order
+    where the stream repeats them itself; a pass replayed, each share its own places again, where a later
+    repeat replays the stream (`rewound`). The rows of each place the first `examples` rows reach that
+    falls to share `index`."""
+    shards = [ids[start:start + POOLED_SHARDS] for start in range(0, len(ids), POOLED_SHARDS)]
+    order = grain.MapDataset.range(len(shards)).shuffle(seed=0)
+    read: collections.Counter = collections.Counter()
+    if rewound:
+        passes, examples = divmod(examples, len(ids))
+        for place in range(len(shards)):
+            if place % POOLED == index:
+                read.update({int(record): passes for record in shards[order[place]]})
+        order = order.repeat(1)
+    else:
+        order = order.repeat()
+    place = 0
+    while examples > 0:
+        shard = shards[order[place]]
+        if place % POOLED == index:
+            read.update(int(record) for record in shard[:examples])
+        examples -= len(shard)
+        place += 1
+    return read
+
+
+@dataclasses.dataclass(frozen=True)
+class Untouched:
+    """A random step that leaves its record as it is, which keeps a stream's repeat where it is written,
+    after the shards each share reads."""
+
+    identity = "untouched@1"
+
+    def __call__(self, row, rng):
+        return row
+
+
+POOL_DEALS = {
+    # A global order, cut into shares after the bound.
+    "one order": lambda rows: rows.shuffle(3),
+    # Records each share reads its own of (`index :: count`), an objective making rows of each.
+    "dealt records": lambda rows: rows,
+    "dealt records in workers": lambda rows: rows.loading(Loading(workers=1, threads=1, read_buffer=1)),
+    # Physical shards each share reads its own of, the stream repeating them, one at a time or two.
+    "dealt shards": lambda rows: rows,
+    "dealt shards interleaved": lambda rows: rows.interleave(2),
+    # The stream repeated after a step, each share replaying its own shards.
+    "dealt shards rewound": lambda rows: rows.random_map(Untouched(), identity="untouched@1").repeat(),
+}
+
+
+@pytest.mark.parametrize("examples", [1, 7, 23])
+@pytest.mark.parametrize("deal", list(POOL_DEALS))
 def test_a_pools_shares_read_its_bound_once_however_its_read_deals_them(deal, examples):
-    """A pool of three shares bounded to `examples` reads them once between its shares, however its read
-    deals its source: one global order, cut into shares after the bound; records each share reads its own
-    of (`index :: count`), an objective making rows of each; and physical shards of 3, 3, 3 and 1 rows,
-    each share reading its own: every record is read once for each pass the bound reaches, as one
-    process reads them, so no share repeats a record while another's go unread, and a share dealt records
-    reads only its own."""
+    """A pool of three shares bounded to `examples` reads exactly its bound's examples between its shares,
+    each where its read deals it, however that is (`POOL_DEALS`): in one order, the examples one process
+    reads; dealt by record or by physical shard, each share the examples at its places among the pool's
+    first `examples` (`dealt_records`, `dealt_shards`), so no share repeats a record while another's go
+    unread, and a share dealt none reads none. A share's interleave reads its own places' rows alone, and
+    loading workers keep the count each share's records hold."""
     ids = np.arange(1, RECORDS + 1, dtype=np.int32)
-    read, shuffled = {"one order": ("memory", {"seed": 3}), "dealt records": ("memory", {"seed": 3}),
-                      "dealt shards": ("streamed", {"seed": 3, "window": RECORDS})}[deal]
-    objective = None if deal == "one order" else ObjectiveData(train=(Questioned(),))
-    loader = compile(Pipeline(Memory({"id": ids}, shard_rows=3)).shuffle(**shuffled).batch(2 * POOLED),
-                     read=read, objective=objective, examples=examples)
-    shares = [ids_read(loader, "id", DataPartition(index=index, count=POOLED)) for index in range(POOLED)]
-    # An objective's rows of an example are `id % 3 + 1`, each read whole.
-    rows = (lambda record: 1) if objective is None else (lambda record: record % 3 + 1)
-    counts = [{record: count // rows(record) for record, count in share.items()} for share in shares]
-    pooled = sum((collections.Counter(share) for share in counts), collections.Counter())
-    passes, rest = divmod(examples, RECORDS)
-    assert sum(pooled.values()) == examples
-    assert sorted(pooled.values()) == sorted([passes + 1] * rest + [passes] * (RECORDS - rest)
-                                             if passes else [1] * rest)
-    if deal == "dealt records":
-        assert all((record - 1) % POOLED == index for index, share in enumerate(counts) for record in share)
+    streamed = deal.startswith("dealt shards")
+    rows = POOL_DEALS[deal](Pipeline(Memory({"id": ids}, shard_rows=POOLED_SHARDS)))
+    expanded = deal != "one order"
+    loader = compile(rows.batch(2 * POOLED), read="streamed" if streamed else "memory",
+                     objective=ObjectiveData(train=(Questioned(),)) if expanded else None, examples=examples)
+    shares = [examples_read(loader, DataPartition(index=index, count=POOLED), expanded=expanded)
+              for index in range(POOLED)]
+    if deal == "one order":
+        assert sum(shares, collections.Counter()) == examples_read(loader, DataPartition(), expanded=expanded)
+    elif streamed:
+        assert shares == [dealt_shards(ids, examples, index, rewound=deal.endswith("rewound"))
+                          for index in range(POOLED)]
+    else:
+        assert shares == [dealt_records(ids, examples, index) for index in range(POOLED)]
+    assert sum(sum(share.values()) for share in shares) == examples
 
 
 @pytest.mark.parametrize("examples", [7, 23])
@@ -178,9 +248,10 @@ def test_a_pools_shares_whose_records_a_step_drops_before_the_bound_read_it_deal
     ids = np.arange(1, RECORDS + 1, dtype=np.int32)
     loader = compile(Pipeline(Memory({"id": ids})).filter_map(Evens()).shuffle(3).batch(2 * POOLED),
                      read="indexed", objective=ObjectiveData(train=(Questioned(),)), examples=examples)
-    shares = [ids_read(loader, "id", DataPartition(index=index, count=POOLED)) for index in range(POOLED)]
-    read = [sum(count // (record % 3 + 1) for record, count in share.items()) for share in shares]
-    assert read == [len(range(index, examples, POOLED)) for index in range(POOLED)]
+    shares = [examples_read(loader, DataPartition(index=index, count=POOLED), expanded=True)
+              for index in range(POOLED)]
+    assert [sum(share.values()) for share in shares] == [len(range(index, examples, POOLED))
+                                                          for index in range(POOLED)]
     assert all(record % 2 == 0 for share in shares for record in share)
 
 

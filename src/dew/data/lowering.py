@@ -1548,8 +1548,9 @@ class _Build:
                 stored = _Marked(stored)
             placed = _Placed(identifiers=identifiers, rows=len(stored))
             rows = stored.map_with_index(placed) if last >= 0 else stored
-            # A missing record held as a marker is dropped later, so a pass holds no count known ahead.
-            records = None if marked else len(stored)
+            # A store's missing record held as a marker is dropped later, so its pass holds no count known
+            # ahead; a memory source holds only the records it has (`_Present`).
+            records = None if present is None and marked else len(stored)
             return self.shared(rows, pipeline, partition), 0, self.dealt(partition, records)
         keyed = _keyed(source)
         if materialized(source) and keyed is not source:
@@ -1606,18 +1607,18 @@ class _Build:
         steps = _ShardSteps(shards.reader, local, cache is not None, _name(pipeline), _label(pipeline),
                             self.loading)
         shards = dataclasses.replace(shards, reader=steps)
-        rows = self.streamed(shards, pipeline, partition)
-        dropping = cache is not None or any(_drops(stage) for stage in local)
-        if not marked and dropping:
-            rows = Accepted(rows, _name(pipeline), _label(pipeline))
+        consumed = start if interleave is None else interleave + 1
         # A shard's stated rows are the examples it holds where the bound is only where nothing before
         # the bound drops any.
-        share = None if dropping or self.global_order or not self.training else functools.partial(
-            self.sharded_bound, shards, pipeline, partition)
-        return rows, start if interleave is None else interleave + 1, share
+        dropping = cache is not None or any(_drops(stage) for stage in local)
+        examples = None if dropping else self.dealt_examples(pipeline, partition, consumed)
+        rows = self.streamed(shards, pipeline, partition, examples)
+        if not marked and dropping:
+            rows = Accepted(rows, _name(pipeline), _label(pipeline))
+        share = None if examples is None else functools.partial(self.sharded_bound, shards, partition)
+        return rows, consumed, share
 
-    def sharded_bound(self, shards: ShardManifest, pipeline: Pipeline, partition: DataPartition,
-                      examples: int) -> int | None:
+    def sharded_bound(self, shards: ShardManifest, partition: DataPartition, examples: int) -> int | None:
         """This share's part of a bound of `examples` over a streamed read's shards (`shards.bounded`)."""
         return shards_bounded(shards, partition=partition, seed=self.seed, loading=self.loading,
                               epochs=self.lowering.epochs, examples=examples)
@@ -1630,15 +1631,23 @@ class _Build:
             return None
         return functools.partial(partition.bounded, records=records)
 
-    def bounded(self, stage: Limit, partition: DataPartition, share: Share) -> Limit:
-        """A run's bound in examples (`_bounds`) as this share reads it: whole in a read in one order,
-        which cuts its shares after it; in a read whose shares each read their own records, the share's
-        part of the pool's first examples, as its root deals them (`share`), or where no pass's count is
-        known ahead, the examples themselves dealt every count-th (`DataPartition.bounded`)."""
-        if self.global_order or not self.training:
-            return stage
-        held = None if share is None else share(stage.count)
-        return Limit(partition.bounded(stage.count) if held is None else held)
+    def bound_at(self, pipeline: Pipeline, partition: DataPartition) -> int | None:
+        """Where a per-share training read of several shares holds a run's bound in examples (`_bounds`),
+        which each share reads its part of (`DataPartition.bounded`); None for a read of one share or in
+        one order, which takes the bound whole before it cuts its shares."""
+        if self.global_order or not self.training or partition.count == 1:
+            return None
+        return next((at for at in range(len(pipeline.stages)) if _bounds(pipeline.stages, at)), None)
+
+    def dealt_examples(self, pipeline: Pipeline, partition: DataPartition, consumed: int) -> int | None:
+        """The bound's examples (`bound_at`) where the root deals them to the shares as it deals its source:
+        no stage between the root's `consumed` stages and the bound drops a record or changes the pass a
+        repeat reads (a slice or a take); None otherwise, where the examples themselves are dealt."""
+        at = self.bound_at(pipeline, partition)
+        if at is None or any(_drops(stage) or isinstance(stage, (Slice, Limit))
+                             for stage in pipeline.stages[consumed:at]):
+            return None
+        return pipeline.stages[at].count
 
     def shared(
         self, rows: pygrain.MapDataset, pipeline: Pipeline, partition: DataPartition
@@ -1654,7 +1663,7 @@ class _Build:
         return rows
 
     def streamed(
-        self, shards: ShardManifest, pipeline: Pipeline, partition: DataPartition
+        self, shards: ShardManifest, pipeline: Pipeline, partition: DataPartition, examples: int | None = None
     ) -> pygrain.IterDataset:
         interleave = None if self.lowering.interleave is None else pipeline.stages[self.lowering.interleave]
         return streamed(
@@ -1665,6 +1674,7 @@ class _Build:
             cycle_length=interleave.cycle_length if isinstance(interleave, Interleave) else 1,
             loading=self.loading,
             epochs=self.lowering.epochs if self.training else 1,
+            examples=examples,
         )
 
     def records(self, pipeline: Pipeline, partition: DataPartition) -> Rows:
@@ -1690,6 +1700,17 @@ class _Build:
         else:
             rows, consumed, share = self.indexed(pipeline, source, partition, last,
                                                  marked=pooled and not native)
+        # This share's part of a run's bound in examples: as the root deals it where it can
+        # (`dealt_examples`), else the examples themselves dealt every count-th. A share it deals none reads
+        # none, and its pool steps it emptied (`dew.training._fit.pooled_read`).
+        at, quota = self.bound_at(pipeline, partition), None
+        if at is not None:
+            examples = pipeline.stages[at].count
+            dealt = share if self.dealt_examples(pipeline, partition, consumed) is not None else None
+            held = None if dealt is None else dealt(examples)
+            quota = partition.bounded(examples) if held is None else held
+            if not quota:
+                return pygrain.MapDataset.source(()).to_iter_dataset()
         # A cache read as a stream of each input's outputs marks what it drops from the start, as do
         # the steps a streamed read runs inside each shard.
         marked = self.lowering.cache is not None and (self.read == "streamed" or not self.lowering.one_to_one)
@@ -1750,11 +1771,8 @@ class _Build:
                 endless = isinstance(stage, Repeat) and stage.epochs is None
                 if endless and isinstance(rows, pygrain.MapDataset):
                     passes = index, len(rows)
-                if _bounds(pipeline.stages, index):
-                    # What the root deals each share counts the examples at the bound only where no step
-                    # between them drops any.
-                    dropped = any(_drops(written) for written in pipeline.stages[consumed:index])
-                    stage = self.bounded(stage, partition, None if dropped else share)
+                if index == at and quota is not None:
+                    stage = Limit(quota)
                 rows = self.stage(rows, stage, pipeline, partition, index)
         if carried == len(pipeline.stages) and pool is not None:
             rows = self.handed(rows, pipeline, partition, pool,

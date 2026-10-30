@@ -885,9 +885,10 @@ class Dataset:
     ) -> Pipeline:
         """The records in an order drawn from `seed`: whole, within a `window` of records, or by blocks of
         `block_shards` physical shards. The seed is 0 where none is given, where Grain derives an unseeded
-        shuffle from its pipeline's seed (`ds.seed`), in Dew the run's (`compile(seed=)`): the order is the
-        chain's own, the one every run of the chain reads and its saved plan and resume name, so a run's
-        seed changes its random steps' draws and not which records it reads in what order."""
+        shuffle from its pipeline's seed (`ds.seed`), in Dew the run's (`compile(seed=)`): this stage's
+        order is the chain's own, the one every run of the chain reads and its saved plan names, so a run's
+        seed changes neither it nor what a resume reads by it. What the run's seed does draw are its random
+        steps and the order a streamed read deals its physical shards in (`dew.data.shards.streamed`)."""
         if window is not None and block_shards is not None:
             raise ValueError("shuffle uses a window or physical shard blocks, not both")
         if block_shards is not None and block_shards < 1:

@@ -6,6 +6,8 @@ dew is imported inside the modes, as `multiprocess_worker`'s are, so the pool st
 
 from __future__ import annotations
 
+import dataclasses
+
 import numpy as np
 from multiprocess_worker import BATCH, dump_params
 from process_support import serve_mode, worker_parser
@@ -26,13 +28,16 @@ def examples_clock(args) -> dict:
     there (`Pause`) and resumes it; `--cooldown` branches it to a cooldown of that many steps at 60% of its
     examples. Reports the step it ends at, the examples its state consumed, the examples each log read,
     each id's examples its steps trained on (each step's real rows by id over the rows each example
-    makes, the objective's aux, which the pool's first process logs) and the cooldown's validation loss,
-    its parameters beside the report."""
+    makes, the objective's aux, which the pool's first process logs), each id's examples the pool's shares
+    read apart (every share's stream of the run's data read on this process, `dealt`) and the cooldown's
+    validation loss, its parameters beside the report."""
     import jax
     import jax.numpy as jnp
 
     from dew.batch import VALID_ROWS
     from dew.data import Memory
+    from dew.data.compile import fitted
+    from dew.data.dataset import Closeable, DataPartition
     from dew.data.pipeline import ObjectiveData, Pipeline
     from dew.objectives.base import Aux, Objective
     from dew.optim import Linear, OptimConfig
@@ -92,12 +97,26 @@ def examples_clock(args) -> dict:
         trainer.fit(chain, stop=Pause(args.pause), **options)
     state = trainer.fit(chain, **options)
     dump_params(args.out.with_suffix(".npz"), state.variables)
+    # The examples each share's stream deals it, read as the run's loader reads them, apart from the run.
+    loader, _ = fitted(chain, None, objective=Pulled().data(), examples=args.examples)
+    pool = DataPartition.of(trainer.device_mesh)
+    dealt = dict.fromkeys(range(1, RECORDS + 1), 0.0)
+    for index in range(pool.count):
+        stream = loader.train(dataclasses.replace(pool, index=index))
+        try:
+            for batch in stream:
+                real = np.asarray(batch[VALID_ROWS], bool)
+                for record in np.asarray(batch["id"])[real].tolist():
+                    dealt[record] += 1 / (record % 3 + 1 if expands else 1)
+        finally:
+            if isinstance(stream, Closeable):
+                stream.close()
     trained = [scalars for scalars in tracker.scalars if "train/loss" in scalars]
     counts = {record: sum(scalars[f"train/id_{record}"] for scalars in trained)
               for record in range(1, RECORDS + 1)}
     cooled = [scalars["cooldown_val/loss"] for scalars in tracker.scalars if "cooldown_val/loss" in scalars]
-    return {"step": int(state.step), "consumed": int(state.consumed), "counts": counts, "cooled": cooled,
-            "logged": [scalars["train/examples_consumed"] for scalars in trained]}
+    return {"step": int(state.step), "consumed": int(state.consumed), "counts": counts, "dealt": dealt,
+            "cooled": cooled, "logged": [scalars["train/examples_consumed"] for scalars in trained]}
 
 
 MODES = {"examples_clock": examples_clock}

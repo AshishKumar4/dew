@@ -27,6 +27,8 @@ import numpy as np
 from jax.experimental import multihost_utils
 from jax.sharding import NamedSharding, PartitionSpec
 
+from dew._records import JSON
+
 if TYPE_CHECKING:
     from jax._src.distributed import State
 
@@ -217,19 +219,19 @@ def agreed_next[T](phase: str, stream: Iterator[T]) -> T | None:
     return read
 
 
-def agreed_shares[T](phase: str, stream: Iterator[T],
-                     counted: Callable[[T], int]) -> tuple[T | None, int, int]:
-    """`stream`'s next item on this rank, or None where it has run out, with how many ranks' streams have
-    run out and the sum of `counted` over what the others read, learned in one round: a pool's shares
-    that end apart, each reading on until every one has (a run on the examples clock). A rank that
-    fails stops every rank, as `agreed` does."""
+def agreed_reads[T](phase: str, stream: Iterator[T],
+                    said: Callable[[T], JSON]) -> tuple[T | None, list[JSON]]:
+    """`stream`'s next item on this rank, or None where it has run out, with what `said` gives of each rank's
+    item (None for a rank whose stream has run out), in rank order, learned in one round: a pool's shares
+    that end apart, each reading on until every one has (a run on the examples clock). A rank that fails
+    stops every rank, as `agreed` does."""
     held: tuple[T | None] | None = None
     error: BaseException | None = None
     try:
         held = (next(stream, None),)
     except BaseException as failure:
         error = failure
-    word = "-" if held is None or held[0] is None else str(counted(held[0]))
+    word = json.dumps(None if held is None or held[0] is None else said(held[0]))
     if jax.process_count() == 1:
         if error is not None:
             raise error
@@ -242,7 +244,7 @@ def agreed_shares[T](phase: str, stream: Iterator[T],
                 raise PeerFailure(str(failure)) from failure
             raise
     assert held is not None
-    return held[0], words.count("-"), sum(int(said) for said in words if said != "-")
+    return held[0], [json.loads(spoken) for spoken in words]
 
 
 def agreed_count[T](phase: str, operation: Callable[[], T], counted: Callable[[T], bool]) -> tuple[T, int]:

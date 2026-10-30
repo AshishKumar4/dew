@@ -68,6 +68,7 @@ from dew.distributed.batches import (
     batch_signature,
     placed_abstract,
     prefetched_bytes,
+    shard_batch,
     split_fields,
 )
 from dew.distributed.host import snapshot
@@ -121,6 +122,7 @@ from dew.telemetry.records import (
     StepCompiled,
 )
 from dew.training._fit import (
+    Emptied,
     FitPlan,
     FitRun,
     HandedSplits,
@@ -135,9 +137,9 @@ from dew.training._fit import (
     fit_policies,
     handed_splits,
     pooled,
+    pooled_first,
     pooled_read,
     refuse_unclocked,
-    share_template,
     stage_reached,
     unrecorded_parts,
     validation_read,
@@ -1719,8 +1721,8 @@ class Trainer(Generic[Loss, Effects]):
         self._marked = marked(run.partition, self._counted_batch)
         prepare = self._marked if self.rollout is None else None
         if run.pooled:
-            run.template = functools.partial(share_template, plan.dataset, run.partition, self.device_mesh,
-                                             self._marked, run.reads)
+            run.emptied = Emptied(functools.partial(pooled_first, plan.dataset, run.partition), self._marked,
+                                  functools.partial(shard_batch, self.device_mesh, reads=run.reads))
         return DevicePrefetchIterator(source, self.device_mesh, self._prefetch, source_state=position,
                                       reads=run.reads, prepare=prepare)
 
