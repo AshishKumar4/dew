@@ -32,6 +32,7 @@ from dew.decision.rows import ConfigureLayout, Fit, PackedRows, QuestionRows, _r
 from dew.decision.scoring import LogLoss, ScoringRule
 from dew.decision.task import Budget, Decide, DecideSettings, Weights, laid_out, whole_blocks_of
 from dew.inference.loading import RunProcessor
+from dew.inference.projections import unpacked
 from dew.inference.tasks import Processor as TaskProcessor
 from dew.inputs import Field, InputSpec
 from dew.interop.processors import Processor
@@ -240,7 +241,11 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         self.image_processor = None
         match backbone:
             case Decide():
-                model, held = backbone.model, backbone.variables
+                # A run trains the model's own tree: a loaded task's projections, packed to serve
+                # (`Decide._served`), split back (`unpacked`, ledger 2299).
+                model = backbone.model
+                held = joined({"backbone": unpacked(model.backbone, part(backbone.variables, "backbone")),
+                               "head": part(backbone.variables, "head")})
                 self.image_processor = backbone.processor
                 head = head or model.head
                 context_encoder = context_encoder or model.context_encoder

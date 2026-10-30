@@ -260,8 +260,9 @@ class DecisionRunConfig(DecoderRunConfig):
                 jax.random.key(self.trainer.key), 1), frozen=self.context_frozen)
         start = start if self.lora is None else start.adapt(self.lora, key=self.trainer.key)
         if isinstance(start, PretrainedDecision):
-            # A release lays its rows out as it states, its blocks where its overrides read them.
-            start = Decide.of(start)
+            # A release lays its rows out as it states, its blocks where its overrides read them; the run
+            # trains the model's own tree, its projections unpacked (`Decide.released`).
+            start = Decide.released(start)
             derived["layout"] = _budgeted(start.layout, budgets)
         else:
             derived.update(self._fresh_head(start, blocked, budgets))

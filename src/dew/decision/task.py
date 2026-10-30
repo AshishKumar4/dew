@@ -273,10 +273,17 @@ class Decide(SavedRunTask, InItsForm):
     def _of(cls, bundle: "PretrainedDecision", *, name: str | None, owned: bool) -> Self:
         """`of`, the bundle's weights packed as a task serves them (`_served`): in place where the
         caller gives them up (`owned`), else into a tree of the task's own."""
+        task = cls.released(bundle, name=name)
+        return replace(task, variables=_served(task.model, task.variables, owned=owned))
+
+    @classmethod
+    def released(cls, bundle: "PretrainedDecision", *, name: str | None = None) -> Self:
+        """The declared decision task over the bundle's own tree, its projections as the model holds
+        them: what a run trains from a release (`DecisionObjective`), where `of` packs them to serve."""
         model = DecisionModel(bundle.model, bundle.head)
         variables = joined({"backbone": bundle.variables, "head": bundle.head_variables})
-        return cls(model, _served(model, variables, owned=owned), bundle.layout, bundle.decision_tokenizer,
-                   bundle.specials, bundle.calibration, name=name or str(bundle.origin or bundle.source),
+        return cls(model, variables, bundle.layout, bundle.decision_tokenizer, bundle.specials,
+                   bundle.calibration, name=name or str(bundle.origin or bundle.source),
                    processor=bundle.processor)
 
     @classmethod
