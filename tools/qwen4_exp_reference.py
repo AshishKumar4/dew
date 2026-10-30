@@ -144,7 +144,10 @@ def write_native() -> None:
     model = Qwen4ExpForConditionalGeneration(config).float().eval()
     scatter_weights(model, 1234)
     model.save_pretrained(directory, safe_serialization=True)
-    qwen3_vl_processor(directory)
+    processor, _ = qwen3_vl_processor(directory)
+    # Frames kept at their 32 pixels a side, the test's draws, rather than grown to the processor's default.
+    processor.video_processor.size = {'shortest_edge': 32 * 32, 'longest_edge': 32 * 32}
+    processor.save_pretrained(directory)
     (directory / 'prompts.json').write_text(json.dumps({
         'image': 'token7 <start_of_image><image_soft_token><end_of_image> token9',
         'video': 'token4 <start_of_image><video><end_of_image> token6',

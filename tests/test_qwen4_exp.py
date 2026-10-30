@@ -140,7 +140,7 @@ def test_a_loaded_checkpoint_of_a_sharded_table_writes_back_and_reloads(tmp_path
 
 NATIVE = ROOT / 'qwen4-exp-native-tiny'
 
-MEDIA_SEEDS = 8
+MEDIA_SEEDS = 32
 """The media's declared draws (check 1), sized by `seeds_for` paired with Dew's logits on armada."""
 
 

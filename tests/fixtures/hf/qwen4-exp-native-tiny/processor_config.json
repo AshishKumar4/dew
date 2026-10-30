@@ -52,8 +52,8 @@
     "rescale_factor": 0.00392156862745098,
     "return_metadata": false,
     "size": {
-      "longest_edge": 786432,
-      "shortest_edge": 131072
+      "longest_edge": 1024,
+      "shortest_edge": 1024
     },
     "temporal_patch_size": 2,
     "video_processor_type": "Qwen3VLVideoProcessor"

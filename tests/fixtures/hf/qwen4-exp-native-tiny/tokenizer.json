@@ -2317,9 +2317,20 @@
       "special": true
     }
   ],
-  "normalizer": null,
+  "normalizer": {
+    "type": "Replace",
+    "pattern": {
+      "String": " "
+    },
+    "content": "▁"
+  },
   "pre_tokenizer": {
-    "type": "Whitespace"
+    "type": "Split",
+    "pattern": {
+      "String": " "
+    },
+    "behavior": "MergedWithPrevious",
+    "invert": false
   },
   "post_processor": {
     "type": "TemplateProcessing",
@@ -2347,9 +2358,33 @@
     ],
     "special_tokens": {}
   },
-  "decoder": null,
+  "decoder": {
+    "type": "Sequence",
+    "decoders": [
+      {
+        "type": "Replace",
+        "pattern": {
+          "String": "▁"
+        },
+        "content": " "
+      },
+      {
+        "type": "ByteFallback"
+      },
+      {
+        "type": "Fuse"
+      }
+    ]
+  },
   "model": {
-    "type": "WordLevel",
+    "type": "BPE",
+    "dropout": null,
+    "unk_token": "<unk>",
+    "continuing_subword_prefix": null,
+    "end_of_word_suffix": null,
+    "fuse_unk": true,
+    "byte_fallback": true,
+    "ignore_merges": false,
     "vocab": {
       "<pad>": 0,
       "<eos>": 1,
@@ -2608,6 +2643,6 @@
       "token254": 254,
       "token255": 255
     },
-    "unk_token": "<unk>"
+    "merges": []
   }
 }

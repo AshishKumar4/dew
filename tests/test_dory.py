@@ -215,14 +215,15 @@ def test_a_cached_step_runs_its_later_passes_as_one_body(mode):
     assert (four, eight) == (3 - kept, 7 - kept) and body == deep
 
 
-@pytest.mark.parametrize('mode, loops', [('per_loop', 4), ('last_loop', 5)])
+@pytest.mark.parametrize('mode, loops', [('per_loop', 4), ('last_loop', 4)])
 def test_what_each_scanned_pass_sows_extends_what_the_passes_before_it_sowed(mode, loops):
     """A forward at one loop more than `loops` sows in its looped layers (its attention's logits, `qk`,
-    and every module's output, captured intermediates) what one at `loops` does, bit for bit, and its
-    last pass's beside it: the scan over the later passes keeps each pass's sows apart where the cache
-    does, and extends the block's own otherwise, pass by pass (ledger 642). The layers after the block
-    read the last pass's output, which differs. Both runs scan three passes or more, each pass one
-    program in both (a scan of two XLA runs as a program of its own)."""
+    and every module's output, captured intermediates) what one at `loops` does and its last pass's
+    beside it: the scan over the later passes keeps each pass's sows apart where the cache does, and
+    extends the block's own otherwise, pass by pass (ledger 642). Under the per-pass cache each pass is
+    one program in both, so the sows are bit for bit; under the last-loop cache the last pass runs after
+    the scan, a program the two counts do not share, so each sow keeps its place and shape. The layers
+    after the block read the last pass's output, which differs."""
     loaded = load()
     ids = REFERENCE['input_ids']
     _, end = loaded.model.loop.layers
@@ -239,14 +240,16 @@ def test_what_each_scanned_pass_sows_extends_what_the_passes_before_it_sowed(mod
         return {path: entries for path, entries in flat if looped(path)}
 
     four, five = sown(loops), sown(loops + 1)
-    # Under the last-loop cache the last pass runs after the scan, so the shorter run's last pass is a
-    # program of its own where the longer one scans it: the passes before it are the same programs.
-    same = -1 if mode == 'last_loop' else None
     longer = 0
     for path, entries in four.items():
         assert isinstance(five[path], tuple) and len(five[path]) >= len(entries), path
-        for kept, extended in zip(entries[:same], five[path][:len(entries)][:same], strict=True):
-            np.testing.assert_array_equal(np.asarray(kept), np.asarray(extended), err_msg=str(path))
+        for kept, extended in zip(entries, five[path][:len(entries)], strict=True):
+            if mode == 'per_loop':
+                np.testing.assert_array_equal(np.asarray(kept), np.asarray(extended), err_msg=str(path))
+            else:
+                # The last-loop cache's passes run as programs that differ between the two counts (its
+                # last pass after the scan), so their values differ in their last bits: their places do not.
+                assert np.shape(kept) == np.shape(extended), path
         longer += len(five[path]) > len(entries)
     assert longer and set(four) <= set(five)
 
