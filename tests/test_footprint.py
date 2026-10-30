@@ -207,3 +207,35 @@ def test_a_product_too_small_for_cublas_takes_no_workspace():
         with_workspace = gradient_peak(product, shape, (rows,), platform="gpu", workspace=1 << 20)
         without = gradient_peak(product, shape, (rows,), platform="gpu", workspace=0)
         assert with_workspace - without == workspace
+
+
+def test_a_computed_value_read_in_two_orders_is_copied_for_the_second():
+    """XLA lays a computed value out once: a product returned flat both as it is and transposed holds the
+    product and a reordered copy, where its transpose alone would be the product laid out for it."""
+    from dew.training.footprint import peak_bytes
+
+    rows, weights = jax.ShapeDtypeStruct((8, 16), jnp.float32), jax.ShapeDtypeStruct((16, 32), jnp.float32)
+
+    def flattened(rows, weights):
+        product = rows @ weights
+        return product.reshape(-1), product.T.reshape(-1)
+
+    program = jax.make_jaxpr(flattened)(rows, weights).jaxpr
+    assert peak_bytes(program, "gpu", 0) == 2 * 8 * 32 * 4
+
+
+def test_an_inner_product_of_vectors_takes_no_workspace():
+    """XLA hands cuBLAS no product of two vectors (`IsCublasSupportedMatMul`: neither operand a matrix),
+    however long, so it takes no workspace, where a matrix times that vector does."""
+    vector, matrix = jax.ShapeDtypeStruct((64,), jnp.float32), jax.ShapeDtypeStruct((64, 64), jnp.float32)
+
+    def inner(params, other):
+        return params @ other, ()
+
+    def matrix_vector(params, other):
+        return jnp.sum(other @ params), ()
+
+    for loss, other, workspace in ((inner, vector, 0), (matrix_vector, matrix, 1 << 20)):
+        with_workspace = gradient_peak(loss, vector, (other,), platform="gpu", workspace=1 << 20)
+        without = gradient_peak(loss, vector, (other,), platform="gpu", workspace=0)
+        assert with_workspace - without == workspace
