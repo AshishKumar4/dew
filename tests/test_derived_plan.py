@@ -126,3 +126,9 @@ def test_a_run_that_sets_its_remat_is_told_the_lighter_rung_its_derivation_fits(
         assert derived and derived[0]["remat"] is None and all(entry["remat"] != remat for entry in derived)
         assert [entry["label"] for entry in derived][-1] == ("fits" if lighter else "refuses")
         assert {entry["label"] for entry in derived[:-1]} <= {"refuses"}
+    # A policy off the ladder, which no climb from no remat reaches, has no rung known below it.
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "off"))
+    free(monkeypatch, LIMIT)
+    off = deep(REMAT_POLICIES["save_qkv_proj"])
+    compiled(off)
+    assert off.plan["derived"] == [] and off.plan["remat"] == "save_qkv_proj"
