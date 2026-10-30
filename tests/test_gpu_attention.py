@@ -8,6 +8,8 @@ runs on a GPU alone, run in one process (`gpu_flow`), each cell its own file's p
 - The Mosaic mainloop's default form, and its backward in two launches, finite where the reference is at
   fp32's edges over every family it takes, on an H100 (test_attention_stability).
 - A dropping route call on a GPU runs finite (test_attention_dropout).
+- The template's training step with a bias every row shares, run again under the lane's deterministic ops,
+  gives every gradient bit for bit the same (`a_shared_bias_step_repeats_bit_for_bit`, ledger 2620).
 - A decode step's sinks take their gradient and tangent through the dispatch, plain and softcapped; the
   decode kernel's attention differentiates as the folded attention (test_decode_attention).
 - Fused routes, without XLA's deterministic ops, which Dew refuses them under: flash reads a cache call's
@@ -24,6 +26,9 @@ runs on a GPU alone, run in one process (`gpu_flow`), each cell its own file's p
 
 import functools
 
+import jax
+import jax.numpy as jnp
+import numpy as np
 import pytest
 import test_attention_dropout as dropout
 import test_attention_masked_rows as masked_rows
@@ -35,6 +40,8 @@ import test_decode_attention as decode
 import test_kernels as kernels
 import test_local_attention as local
 from gpu_flow import Cell, cells_of, run_cells
+
+from dew.nn.attention import scaled_dot_product_attention
 
 pytestmark = pytest.mark.gpu(reason="each route's GPU kernel: Triton, Mosaic, flash and the band")
 
@@ -48,6 +55,36 @@ def sweep(check, space) -> Cell:
     return Cell(f"{check.__name__.replace('_', ' ')}: {len(space)} configs by {len(CASES)} calls",
                 lambda: run_cells([Cell(f"{case} {config}", functools.partial(check, config, case))
                                    for case in CASES for config in space]))
+
+
+def a_shared_bias_step_repeats_bit_for_bit(bias_shape: tuple) -> None:
+    """A bf16 causal training step through the template at a sequence of 2048, its bias of `bias_shape`
+    shared by every batch row (a tile of each head's logits, or a key bias), the same compiled program on
+    the same inputs run six times under the lane's deterministic ops (tests/lane_environment.py): every
+    gradient, the bias's own included, the same bits as the first run's, as kernel-templates.md promises
+    a schedule's reproducibility (ledger 2620). Only a GPU's atomics reorder, so only a GPU can fail it."""
+    rng = np.random.default_rng(2620)
+    batch, length, heads, width = 4, 2048, 8, 64
+
+    def normal(*shape, scale=1.0):
+        return jnp.asarray(scale * rng.standard_normal(shape, dtype=np.float32), jnp.bfloat16)
+
+    shape = (batch, length, heads, width)
+    query, key, value, cotangent = normal(*shape), normal(*shape, scale=0.3), normal(*shape), normal(*shape)
+    bias = jnp.asarray(0.5 * rng.standard_normal((1, heads, *bias_shape), dtype=np.float32))
+
+    @jax.jit
+    def step(query, key, value, bias, cotangent):
+        _, pull = jax.vjp(lambda q, k, v, b: scaled_dot_product_attention(
+            q, k, v, bias=b, causal=True, implementation="template"), query, key, value, bias)
+        return pull(cotangent)
+
+    first = [np.asarray(gradient) for gradient in step(query, key, value, bias, cotangent)]
+    for run in range(5):
+        for name, one, again in zip(("query", "key", "value", "bias"), first,
+                                    step(query, key, value, bias, cotangent), strict=True):
+            np.testing.assert_array_equal(one.view(np.uint8), np.asarray(again).view(np.uint8),
+                                          err_msg=f"the {name}'s gradient on run {run + 2}")
 
 
 def test_the_attention_kernels_run_on_this_gpu():
@@ -65,6 +102,9 @@ def test_the_attention_kernels_run_on_this_gpu():
         *(Cell(f"the Mosaic backward in two launches is finite at fp32's edges: {family}",
                functools.partial(stability.default_is_finite, family, "mosaic two launches"), "sm90")
           for family in stability.HOOKLESS_FAMILIES),
+        *(Cell(f"a step with a bias every row shares repeats bit for bit: {name}",
+               functools.partial(a_shared_bias_step_repeats_bit_for_bit, shape))
+          for name, shape in (("a tile of the logits", (2048, 2048)), ("a key bias", (1, 2048)))),
         Cell("a dropping route call on a GPU runs finite",
              dropout.a_dropping_route_call_on_a_gpu_runs_finite),
         *(Cell(f"a decode step's sinks take their gradient and tangent through the dispatch: {name}",
