@@ -399,29 +399,23 @@ _LIMIT = re.compile(r"Limit\(count=(\d+)\)")
 
 def grown_limits(saved: JSON, current: JSON) -> frozenset[tuple[str, str]] | None:
     """The limits the order `current` sets higher than `saved` does, each its saved and its current
-    record, where `current` is `saved` but for them; None where it differs otherwise. A limit grows only
-    where nothing after it in its stages but a batch reads the records it holds, as the examples clock's
+    record, where `current` is `saved` but for them; None where it differs otherwise. Only the run's own
+    chain's limit grows (never a mixed corpus's or a phase's, which the mixture's own stages read after
+    it), and only where nothing after it but a batch reads the records it holds, as the examples clock's
     bound (`dew.data.compile._bounded`) of a chain that neither packs nor windows: its first records are
     the saved one's, read further, where a repeat, a shuffle, a split, a pack or windows after it would
     read them anew (row 2649)."""
-    if isinstance(saved, dict) and isinstance(current, dict):
-        if saved.keys() != current.keys():
-            return None
-        parts = [_grown_stages(saved[name], current[name]) if name == "stages"
-                 else grown_limits(saved[name], current[name]) for name in saved]
-    elif isinstance(saved, list) and isinstance(current, list):
-        if len(saved) != len(current):
-            return None
-        parts = [grown_limits(before, after) for before, after in zip(saved, current, strict=True)]
-    else:
+    if not (isinstance(saved, dict) and isinstance(current, dict)) or saved.keys() != current.keys():
         return frozenset() if saved == current else None
-    return None if any(part is None for part in parts) else frozenset().union(*(part or () for part in parts))
+    if any(saved[name] != current[name] for name in saved if name != "stages"):
+        return None
+    return _grown_stages(saved.get("stages"), current.get("stages"))
 
 
 def _grown_stages(saved: JSON, current: JSON) -> frozenset[tuple[str, str]] | None:
-    """`grown_limits` of one chain's stages (their records, in order)."""
+    """`grown_limits` of the run's chain's stages (their records, in order)."""
     if not (isinstance(saved, list) and isinstance(current, list)) or len(saved) != len(current):
-        return grown_limits(saved, current)
+        return frozenset() if saved == current else None
     found = set()
     for at, (before, after) in enumerate(zip(saved, current, strict=True)):
         if before == after:
