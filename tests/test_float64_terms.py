@@ -87,7 +87,7 @@ def test_a_named_sum_carries_its_terms_through_a_residual_add():
     (`checkpoint_name`) before the residual add. The name moves the sum, so
     the stream's terms are the projection's whatever the stream holds: an
     entry where the add cancels keeps the projection's terms, not its own
-    near-zero size (FrontDamselfly, MiMo's vision tower)."""
+    near-zero size (the Models lane, MiMo's vision tower)."""
     rng = np.random.default_rng(2)
     x, weight = rng.normal(size=(4, 8)), rng.normal(size=(8, 3))
 
