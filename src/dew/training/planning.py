@@ -257,6 +257,9 @@ class Probe:
     """Whether the executable is the step compiled ahead (`FitSearch.ahead`), not the search's own."""
     compile_seconds: float = 0.0
     """Time spent compiling or loading this program, apart from its shape trace and lowering."""
+    derived_headroom: int | None = None
+    """The headroom the derivation judged the candidate would leave (`derived_headroom`), None where it
+    judged none: beside `headroom`, which the compile measured, its error."""
 
     @classmethod
     def read(cls, split: int, candidate: Candidate, rung: Mapping[str, JSON], fit: bool,
@@ -271,7 +274,7 @@ class Probe:
         return {"split": self.split, "rows": self.rows, **self.rung, "fits": self.fits,
                 "headroom": self.headroom, "temp": self.temp, "argument": self.argument,
                 "derived": None if self.derived is None else self.derived.record(), "ahead": self.ahead,
-                "compile_seconds": self.compile_seconds}
+                "compile_seconds": self.compile_seconds, "derived_headroom": self.derived_headroom}
 
     def named(self) -> str:
         tile = ("" if self.rung["head_tile"] is None else ", the head tiled" if self.rung["head_fused"]
@@ -763,7 +766,16 @@ class FitSearch[LossT, EffectsT]:
             fit, headroom = step_fits(compiled, self.mesh, candidate.held, self.capacity, candidate.built)
         seconds = time.perf_counter() - began
         probe = Probe.read(split, candidate, self.current(), fit, headroom, executable)
-        probe = dataclasses.replace(probe, ahead=taken, compile_seconds=seconds)
+        judged = None if candidate.footprint is None else derived_headroom(
+            candidate.footprint, local_devices(self.mesh), self.capacity, candidate.built)
+        probe = dataclasses.replace(probe, ahead=taken, compile_seconds=seconds, derived_headroom=judged)
+        if judged is not None and (judged >= 0) != fit:
+            _log.warning("a model miss: the derivation judged %s %s with %d bytes to spare, and its "
+                         "compile %s with %s (derived terms %s); the compile decides, and the derivation "
+                         "is to fix",
+                         probe.named(), "fits" if judged >= 0 else "does not fit", judged,
+                         "fits" if fit else "does not fit", headroom,
+                         None if probe.derived is None else probe.derived.record())
         return options, candidate, executable, probe
 
     def fits_here(self, split: int) -> bool:

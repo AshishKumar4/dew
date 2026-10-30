@@ -49,15 +49,18 @@ class Footprint:
     gradients: int
     held: int
     resident: Mapping[str, int] = dataclasses.field(default_factory=dict)
+    peak: int | None = None
+    """The most bytes its loss's gradient program holds at once at one microbatch, in its traced order
+    (`peak_bytes`): the residuals still live, the backward's cotangents and the gradient as it is
+    built. None where `residuals` is."""
     """The prepared state's logical bytes by field and device, before buffer assignment aliases
     anything. These are not additional temporary bytes: the state's existing allocations already
     count against allocator headroom, and newly built copies and accumulators are in `held`."""
 
     def record(self) -> dict[str, JSON]:
-        """The terms traced so far, not an admission decision: workspace and scheduled liveness are
-        not known from the pullback alone. XLA's fit check remains authoritative."""
+        """The terms traced, not an admission decision: XLA's fit check remains authoritative."""
         return {"residuals": self.residuals, "gradients": self.gradients, "held": self.held,
-                "resident": dict(self.resident), "workspace": None, "admission": "unknown"}
+                "resident": dict(self.resident), "peak": self.peak}
 
 
 def device_bytes(tree) -> int:
@@ -67,43 +70,152 @@ def device_bytes(tree) -> int:
                          if jax.typeof(leaf).memory_space == jax.memory.Space.Device])
 
 
-def residual_bytes(loss: Callable, params, arguments: Sequence) -> int:
-    """The device bytes the pullback of `loss(params, *arguments)` in `params` keeps, a device's share:
-    each value its traced program (`jax.make_jaxpr` of `jax.vjp`'s pullback) closes over, once,
-    that is neither one of its inputs, which the state and the batch already hold, nor a literal,
-    and lives in device memory, an offloaded one on the host. Each residual uses its own traced
-    sharding; one whose trace states none counts whole. Matching an axis's size to the batch size
-    cannot identify its sharding: a weight or a scan's layer axis can have that size too."""
+CHEAP = frozenset({
+    "add", "and", "bitcast_convert_type", "broadcast_in_dim", "ceil", "clamp", "clz", "eq", "ne", "lt", "le",
+    "gt", "ge", "complex", "concatenate", "convert_element_type", "copy", "copy_p", "dynamic_slice",
+    "dynamic_update_slice", "floor", "imag", "iota", "is_finite", "max", "min", "mul", "neg", "not", "or",
+    "xor", "pad", "population_count", "real", "reduce_precision", "reshape", "squeeze", "expand_dims", "rev",
+    "round", "select_n", "shift_left", "shift_right_arithmetic", "shift_right_logical", "slice", "sub",
+    "transpose", "integer_pow", "square", "name"})
+"""The primitives XLA's CPU fusion takes for cheap, which it duplicates into each consumer rather than
+keep a buffer of (`InstructionFusion::IsExpensive`, xla/service/instruction_fusion.cc: every elementwise
+op but division, the transcendentals and their kin, and the layout ops), an integer power and a square
+lowering to its multiplies, and a checkpoint's name, which computes nothing."""
+
+REAL_CHEAP = frozenset({"abs", "sign", "sin", "cos", "tan", "sinh"})
+"""The primitives XLA's CPU fusion takes for cheap over real elements alone (`IsExpensive`)."""
+
+ELEMENTWISE = CHEAP | REAL_CHEAP | frozenset({
+    "div", "rem", "exp", "exp2", "log", "log1p", "expm1", "tanh", "logistic", "erf", "erfc", "erf_inv",
+    "pow", "sqrt", "rsqrt", "cbrt", "atan2", "asin", "acos", "atan", "cosh", "asinh", "acosh", "atanh"})
+"""The elementwise and layout primitives, every one of which XLA's GPU fusion recomputes in each consumer
+rather than keep a buffer of: its priority fusion fuses a producer into all its consumers where its cost
+model finds the memory traffic saved worth the recompute (xla/backends/gpu/transforms/priority_fusion.cc),
+an elementwise one's always on a memory-bound GPU, a transcendental's too (an attention's exponentials and
+probabilities, on an H100's compile, recomputed from its scores in the backward)."""
+
+
+def residual_bytes(loss: Callable, params, arguments: Sequence, *, platform: str) -> int:
+    """The device bytes the pullback of `loss(params, *arguments)` in `params` keeps, a device's share,
+    as XLA's fusion for `platform` keeps them: each value its traced program (`jax.make_jaxpr` of
+    `jax.vjp`'s pullback) closes over counts the values it is computed from without a buffer (`kept`),
+    once, but those the program reads, which the state and the batch already hold, and literals; a value
+    in pinned host memory counts none. A value the pullback closes over keeps its own traced sharding;
+    one whose trace states none, and every other value, count whole. Matching an axis's size to the
+    batch size cannot identify its sharding: a weight or a scan's layer axis can have that size too."""
     def pullback(params, *arguments):
         return jax.vjp(lambda trainable: loss(trainable, *arguments), params, has_aux=True)[1]
 
     closed, shapes = jax.make_jaxpr(pullback, return_shape=True)(params, *arguments)
     program = closed.jaxpr
-    seen = {*program.invars, *program.constvars}
-    # Flattening an operand for a dot is still retained input storage. Only a shape-only reshape
-    # carries this provenance: a transpose, slice or other operation can need separate storage.
-    aliases = {}
-    for equation in program.eqns:
-        if equation.primitive.name == "reshape" and equation.params.get("dimensions") is None:
-            source = equation.invars[0]
-            if not isinstance(source, jcore.Literal):
-                aliases[equation.outvars[0]] = aliases.get(source, source)
+    placed = {value: shape for value, shape in zip(program.outvars, jax.tree.leaves(shapes), strict=True)
+              if not isinstance(value, jcore.Literal)}
     total = 0
-    for value, shape in zip(program.outvars, jax.tree.leaves(shapes), strict=True):
-        if isinstance(value, jcore.Literal):
-            continue
-        storage = aliases.get(value, value)
-        if storage in seen:
-            continue
-        seen.add(storage)
+    for value in kept(program, platform):
         aval = value.aval
         if not isinstance(aval, ShapedArray):
             raise TypeError(f"a pullback keeps {aval}, which is no array")
         if aval.memory_space != jax.memory.Space.Device:
             continue
-        total += (math.prod(shape.shape) * shape.dtype.itemsize if shape.sharding is None
+        shape = placed.get(value)
+        total += (math.prod(aval.shape) * aval.dtype.itemsize if shape is None or shape.sharding is None
                   else placed_bytes(shape))
     return total
+
+
+def gradient_peak(loss: Callable, params, arguments: Sequence, *, platform: str) -> int:
+    """The most device bytes the gradient of `loss(params, *arguments)` in `params` holds at once, a
+    device's share, as XLA's fusion for `platform` keeps its values (`peak_bytes`): the program
+    `jax.vjp`'s pullback runs on a cotangent of ones, traced whole, forward and backward."""
+    def gradient(params, *arguments):
+        outputs, pullback, _ = jax.vjp(lambda trainable: loss(trainable, *arguments), params, has_aux=True)
+        return pullback(jax.tree.map(jax.numpy.ones_like, outputs))
+
+    return peak_bytes(jax.make_jaxpr(gradient)(params, *arguments).jaxpr, platform)
+
+
+def peak_bytes(program: jcore.Jaxpr, platform: str) -> int:
+    """The most bytes `program` holds at once beside its inputs, its equations run in their traced
+    order: each value XLA keeps a buffer of (`kept`'s rule, `recomputed`) from the equation that
+    computes it to the last that reads it, the outputs to the end, and a call's, a loop's or a
+    checkpoint's own peak beside what is live where it runs. A value in pinned host memory counts none.
+    No schedule XLA picks is modelled: a compile confirms."""
+    producers = {out: equation for equation in program.eqns for out in equation.outvars}
+    inputs = {*program.invars, *program.constvars}
+    reads: dict[jcore.Var, frozenset[jcore.Var]] = {}
+
+    def anchors(value) -> frozenset[jcore.Var]:
+        if isinstance(value, jcore.Literal) or value in inputs:
+            return frozenset()
+        if value not in reads:
+            equation = producers.get(value)
+            fused = equation is not None and recomputed(equation, platform)
+            reads[value] = frozenset().union(*map(anchors, equation.invars)) if fused else frozenset([value])
+        return reads[value]
+
+    last = {anchor: index for index, equation in enumerate(program.eqns)
+            for value in equation.invars for anchor in anchors(value)}
+    last.update({anchor: len(program.eqns) for value in program.outvars for anchor in anchors(value)})
+    live, held, most = 0, set(), 0
+    for index, equation in enumerate(program.eqns):
+        inner = 0
+        if not recomputed(equation, platform):
+            inner = max((peak_bytes(body, platform) for body in bodies(equation)), default=0)
+            for out in equation.outvars:
+                if out in last and out.aval.memory_space == jax.memory.Space.Device:
+                    held.add(out)
+                    live += math.prod(out.aval.shape) * out.aval.dtype.itemsize
+        most = max(most, live + inner)
+        for done in [value for value in held if last[value] == index]:
+            held.discard(done)
+            live -= math.prod(done.aval.shape) * done.aval.dtype.itemsize
+    return most
+
+
+def bodies(equation: jcore.JaxprEqn) -> list[jcore.Jaxpr]:
+    """The programs `equation` runs within it: a call's, a loop's, a branch's or a checkpoint's."""
+    found = []
+    for value in equation.params.values():
+        for each in value if isinstance(value, tuple | list) else (value,):
+            body = each.jaxpr if isinstance(each, jcore.ClosedJaxpr) else each
+            if isinstance(body, jcore.Jaxpr):
+                found.append(body)
+    return found
+
+
+def kept(program: jcore.Jaxpr, platform: str) -> set[jcore.Var]:
+    """The values `program`'s outputs are computed from that XLA keeps a buffer of on `platform`: each
+    output, but one a primitive XLA's fusion recomputes in its consumers computes (`recomputed`), whose
+    reads are kept in its place; neither the program's inputs nor its literals."""
+    producers = {out: equation for equation in program.eqns for out in equation.outvars}
+    inputs, found, seen = {*program.invars, *program.constvars}, set(), set()
+    pending = [value for value in program.outvars if not isinstance(value, jcore.Literal)]
+    while pending:
+        value = pending.pop()
+        if value in seen or value in inputs:
+            continue
+        seen.add(value)
+        equation = producers.get(value)
+        if equation is not None and recomputed(equation, platform):
+            pending.extend(read for read in equation.invars if not isinstance(read, jcore.Literal))
+        else:
+            found.add(value)
+    return found
+
+
+def recomputed(equation: jcore.JaxprEqn, platform: str) -> bool:
+    """Whether XLA's fusion on `platform` recomputes what `equation` computes in each consumer rather than
+    keep it: on a GPU every elementwise primitive (`ELEMENTWISE`), elsewhere the cheap ones (`CHEAP`, and
+    `REAL_CHEAP` over real values); a call, or a custom derivative's primal, of nothing else."""
+    name = equation.primitive.name
+    if name in ("pjit", "jit", "custom_jvp_call"):
+        inner = equation.params["jaxpr" if name != "custom_jvp_call" else "call_jaxpr"].jaxpr
+        return all(recomputed(each, platform) for each in inner.eqns)
+    if platform == "gpu":
+        return name in ELEMENTWISE
+    if name in REAL_CHEAP:
+        return not any(np.issubdtype(out.aval.dtype, np.complexfloating) for out in equation.outvars)
+    return name in CHEAP
 
 
 def traced_loss[LossT, EffectsT](objective: Objective[LossT, EffectsT], state: TrainState, window: int
@@ -139,7 +251,7 @@ def candidate_footprint[LossT, EffectsT](objective: Objective[LossT, EffectsT],
     # Data and fully sharded data parallelism split the rows alone; an expert axis splits the experts too.
     rows = set(row_axes(rows_of(micro), mesh=mesh)) & {DATA_AXIS, FSDP_AXIS} if split else set()
     if not split <= rows:
-        residuals = None
+        residuals = peak = None
     else:
         loss, (variables, *rest) = traced_loss(objective, prepared, window)
         variables = forward_variables(variables, prepared.compute)
@@ -159,8 +271,10 @@ def candidate_footprint[LossT, EffectsT](objective: Objective[LossT, EffectsT],
         with contextlib.nullcontext() if device is None else jax.set_mesh(jax.sharding.Mesh(
                 np.asarray([device]).reshape((1,) * len(mesh.axis_names)), mesh.axis_names,
                 axis_types=mesh.axis_types)):
-            residuals = residual_bytes(trained, arguments[0]["params"], arguments)
+            platform = jax.default_backend() if device is None else device.platform
+            residuals = residual_bytes(trained, arguments[0]["params"], arguments, platform=platform)
+            peak = gradient_peak(trained, arguments[0]["params"], arguments, platform=platform)
     resident = {name: device_bytes(value) for name, value in {
         "variables": prepared.variables, "optimizer": prepared.opt_state, "ema": prepared.ema,
         "accumulation": prepared.accumulation, "compute": prepared.compute}.items()}
-    return Footprint(residuals, device_bytes(prepared.variables["params"]), held, resident)
+    return Footprint(residuals, device_bytes(prepared.variables["params"]), held, resident, peak)
