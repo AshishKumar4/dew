@@ -77,37 +77,41 @@ def ran(order, label: str, name: str):
 
 def assert_contract(fn, primals, direction, cotangent, label: str, *, truth_fn=None, plain_fn=None,
                     held: tuple[str, ...] | None = None) -> None:
-    """Every order of `fn` runs at the draw (the orders `held` names, where given), and each leaf is finite
-    wherever the same order of its float64 run is a normal float32 and, given `plain_fn` (the plain float32
-    formula, JAX's own derivatives of it), the plain formula's is finite: no less finite than the plain
-    arithmetic (row 1768, a contraction Dew overflowed where the plain formula did not), where float32
-    itself overflows a partial sum the float64 run cancels. The float64 run is `fn`'s own, or `truth_fn`'s,
-    the plain float64 formula, where `fn` computes in a fixed precision whatever its inputs' (a declared dot
-    algorithm)."""
-    def taken(found):
-        return {name: order for name, order in found.items() if held is None or name in held}
-
-    narrow = taken(orders(fn, primals, direction, cotangent))
-    plain_orders = {} if plain_fn is None else taken(orders(plain_fn, primals, direction, cotangent))
+    """Every order of `fn` runs at the draw, and each leaf is finite wherever the same order of its float64
+    run is a normal float32 and, given `plain_fn` (the plain float32 formula, JAX's own derivatives of it),
+    the plain formula's is finite: no less finite than the plain arithmetic (row 1768, a contraction Dew
+    overflowed where the plain formula did not), where float32 itself overflows a partial sum the float64
+    run cancels. The float64 run is `fn`'s own, or `truth_fn`'s, the plain float64 formula, where `fn`
+    computes in a fixed precision whatever its inputs' (a declared dot algorithm). `held`, where given, names
+    the orders a decision its caller cites holds the call to: each order it drops must break, so the
+    exemption ends when the call holds it."""
+    narrow = orders(fn, primals, direction, cotangent)
+    plain_orders = {} if plain_fn is None else orders(plain_fn, primals, direction, cotangent)
     plain = {name: ran(order, f"{label}, plainly", name) for name, order in plain_orders.items()}
     with jax.enable_x64(new_val=True):
         wide_primals, wide_direction, wide_cotangent = widened((primals, direction, cotangent))
-        wide = taken(orders(truth_fn or fn, wide_primals, wide_direction, wide_cotangent))
+        wide = orders(truth_fn or fn, wide_primals, wide_direction, wide_cotangent)
         truths = {name: ran(order, f"{label} in float64", name) for name, order in wide.items()}
     for name, order in narrow.items():
         values = jax.tree.leaves(ran(order, label, name))
         plains = jax.tree.leaves(plain[name]) if plain else [None] * len(values)
+        broken = []
         for index, (value, truth, plainly) in enumerate(zip(values, jax.tree.leaves(truths[name]), plains,
                                                             strict=True)):
             if not np.issubdtype(value.dtype, np.inexact):
                 continue
-            held = normal_float32(truth) & np.isfinite(truth)
+            kept = normal_float32(truth) & np.isfinite(truth)
             if plainly is not None:
-                held &= np.isfinite(plainly)
-            broken = held & ~np.isfinite(value)
-            if broken.any():
-                raise LessFinite(f"{label}, {name}, leaf {index}: {int(broken.sum())} values not finite "
-                                 f"where float64's are normal float32s, e.g. {value[broken][:3]}")
+                kept &= np.isfinite(plainly)
+            lost = kept & ~np.isfinite(value)
+            if lost.any():
+                broken.append(f"{label}, {name}, leaf {index}: {int(lost.sum())} values not finite where "
+                              f"float64's are normal float32s, e.g. {value[lost][:3]}")
+        if held is not None and name not in held:
+            if not broken:
+                raise AssertionError(f"{label}, {name}: holds, so the exemption that drops it is over")
+        elif broken:
+            raise LessFinite(broken[0])
 
 
 EDGES = {"normal": 1.0, "near the largest": 2.0**63, "near the least normal": 2.0**-63}
@@ -122,7 +126,8 @@ token recurrence keeps finite, as fla's chunked form's do at the same entries (`
 H100: ledger 2470), which that edge compares it with in place of the recurrence."""
 
 FIRST_ORDERS = ("primal", "jvp", "vjp")
-"""The orders a packed row holds from 2^62 (`test_the_chunked_delta_rule_holds_every_order`)."""
+"""The orders a packed row of the chunked delta rule holds from 2^62, the owner's acceptance of its second
+orders there (`test_the_chunked_delta_rule_holds_every_order`, ledger 2470)."""
 
 
 def precedent_chunked(query, key, value, g, beta, *, chunk_size: int, starts=None):
@@ -208,9 +213,10 @@ def test_the_chunked_delta_rule_holds_every_order(packed, edge):
     direction = tuple(jax.random.normal(keys[6], x.shape) * (scale if at < 3 else 1.0)
                       for at, x in enumerate(primals))
     cotangent = jax.random.normal(keys[7], query.shape)
+    # A packed row's second orders from 2^62: the owner's accuracy-for-speed acceptance (ledger 2470, 10-30).
+    accepted = packed and scale >= 2.0**62
     assert_contract(rule, primals, direction, cotangent, f"the chunked delta rule {edge}",
-                    truth_fn=recurrence, plain_fn=plain,
-                    held=FIRST_ORDERS if packed and scale >= 2.0**62 else None)
+                    truth_fn=recurrence, plain_fn=plain, held=FIRST_ORDERS if accepted else None)
 
 
 def normal_draw(seed: int, *shapes, scale: float = 1.0) -> tuple:
