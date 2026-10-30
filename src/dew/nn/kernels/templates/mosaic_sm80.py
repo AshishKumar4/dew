@@ -27,10 +27,10 @@ def _staging(block: tuple, swizzle: int | None) -> tuple:
     return swizzled(shape, dtype) if swizzle is None else mosaic.swizzle_transforms(dtype, swizzle)
 
 
-def swizzled(shape: tuple[int, int], dtype) -> tuple:
+def swizzled(shape: tuple[int, ...], dtype) -> tuple:
     """A `[rows, columns]` shared-memory tile's transforms: 8-row tiles as wide as the swizzle its row
     bytes allow, swizzled (bank-conflict-free ldmatrix), as jax's Ampere examples stage their operands."""
-    return mosaic.swizzle_transforms(dtype, plgpu.find_swizzle(shape[1] * jnp.dtype(dtype).itemsize * 8))
+    return mosaic.swizzle_transforms(dtype, plgpu.find_swizzle(shape[-1] * jnp.dtype(dtype).itemsize * 8))
 
 
 class Slots:
@@ -131,6 +131,10 @@ class Mma(mosaic.Family):
         # `MMALayouts`' k), CUTLASS's warp-level k-iterations, sliced along the stage's rows, which its
         # 8-row tiles allow (a swizzled row takes no slice narrower than its tile).
         return min(depth, 8 * max(32 // (jnp.dtype(self.dtype).itemsize * 8), 1))
+
+    def rhs_fragment_depth(self, depth: int, *, transposed: bool = False) -> int:
+        # A transposed shared view cannot take the narrow row slices used by the ordinary RHS.
+        return depth if transposed else self.fragment_depth(depth)
     most_shared = 163 * 1024  # sm80's and sm87's opt-in block (sm86's and sm89's 99 KiB)
     copies_vectors = False  # cp.async spreads a copy over the warpgroup's threads, 128 elements at least
     reduction_scratch = plgpu.CompilerParams().reduction_scratch_bytes  # its kernels' default parameters
@@ -219,9 +223,18 @@ class Mma(mosaic.Family):
         consumer(0)
 
     def streams(self, blocks: dict, stages: int, consumers: int, multicast: tuple[str, ...] = (),
-                swizzles: dict[str, int] | None = None):
+                swizzles: dict[str, int] | None = None, column_streams: tuple[str, ...] = ()):
         _one(consumers, clustered=bool(multicast))
+        del column_streams  # Its one consumer owns every column of each stream.
         return Pipeline(blocks, stages, dict(swizzles or {}))
+
+    def column_shape(self, shape: tuple, consumers: int) -> tuple:
+        _one(consumers)
+        return shape
+
+    def column_part(self, ref, role):
+        del role
+        return ref
 
     def lifetimes(self, streams: Pipeline) -> tuple[tuple, tuple]:
         # `emit_pipeline` allocates a walk's slots in its own scope.
@@ -238,33 +251,38 @@ class Mma(mosaic.Family):
 
     def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, consumer: Callable, *,
                 consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0) -> None:
-        # Each tile's pipeline is its own (`emit_pipeline` fills and drains it), its step count static; an
-        # output is staged after it in a buffer scoped beside the pipeline (Mosaic reserves both at once:
-        # `grouped_matmul._Mosaic.staged_bytes`), and stored through registers (no TMA before Hopper).
+        # Each tile's pipeline fills and drains before its output copy. Synchronize at that lifetime
+        # boundary so the output's shared memory can reuse the pipeline's slots.
         _one(consumers)
         del in_flight
 
-        def tiled(*staging):
-            def store(output, value, ref, place):
-                smem = staging[output]
-                # Unoptimized, as `copied`'s transfers: JAX 0.12 takes an unflagged store as optimized-only,
-                # which its layout inference searched to exhaustion beside the ladder's copies (ns-gate3).
+        staging = self.output_staging(outputs, consumers)
+
+        def store(output, value, ref, place):
+            # Interpreted pipelines use barrier-tracked copies, not cp.async groups.
+            if not interpret:
+                plgpu.wait_gmem_to_smem(0)
+
+            def copied(smem):
+                # The row-copy ladder needs strided layouts, not optimized-only transfers.
                 plgpu.store(smem, value.astype(smem.dtype), optimized=False)
                 mosaic.store_rows(smem, ref, *place, copy=mosaic.copied,
                                   widest=resources.copied_rows(smem.shape[1], smem.dtype))
 
-            @plgpu.nd_loop(tiles, collective_axes=axis)
-            def _(loop: plgpu.NDLoopInfo):
-                active, steps, views, tile = schedule(loop.index)
+            pl.run_scoped(copied, staging[output])
+            if not interpret:
+                plgpu.wait_gmem_to_smem(0)
 
-                def walk(step, start, shapes, *, initial=None):
-                    return self.walk(self.opened(streams, views), ((step, 0, steps),), start, shapes,
-                                     interpret, initial=initial)
+        @plgpu.nd_loop(tiles, collective_axes=axis)
+        def _(loop: plgpu.NDLoopInfo):
+            active, steps, views, tile = schedule(loop.index)
 
-                pl.when(active)(lambda: consumer(0, tile, walk, store, active=True))
-                pl.when(~active)(lambda: consumer(0, tile, mosaic.unwalked(self), store, active=False))
+            def walk(step, start, shapes, *, initial=None):
+                return self.walk(self.opened(streams, views), ((step, 0, steps),), start, shapes,
+                                 interpret, initial=initial)
 
-        pl.run_scoped(tiled, *self.output_staging(outputs, consumers))
+            pl.when(active)(lambda: consumer(0, tile, walk, store, active=True))
+            pl.when(~active)(lambda: consumer(0, tile, mosaic.unwalked(self), store, active=False))
 
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
                 first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None
@@ -381,7 +399,8 @@ class Mma(mosaic.Family):
             return plgpu.mma(acc, left, plgpu.load(rhs, layout=self.rhs), m_warps=self.m_warps)
         transposed = isinstance(rhs, state_types.TransformedRef) and any(
             isinstance(transform, state_types.TransposeTransform) for transform in rhs.transforms)
-        right = plgpu.load(rhs, layout=self.rhs) if transposed else None
+        right = (plgpu.load(rhs, layout=self.rhs)
+                 if self.rhs_fragment_depth(rhs.shape[0], transposed=transposed) == rhs.shape[0] else None)
         for start in range(0, rhs.shape[0], depth):
             part = (right[start:start + depth] if right is not None
                     else plgpu.load(rhs.at[pl.ds(start, depth)], layout=self.rhs))
