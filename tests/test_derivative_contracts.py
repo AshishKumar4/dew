@@ -725,11 +725,36 @@ def int8_round_trip(values, kept: int):
     """`values` quantized to int8 and back as Qwix's absmax calibration has it: one scale per index of axis
     `kept` (an activation's example, a kernel's output feature), the absolute maximum over the rest over
     127.5, 1 where that is below the root of its dtype's least normal (Qwix's guard), the codes rounded and
-    clipped to int8's."""
+    clipped to int8's. The codes take no derivative and the scale its own, as Qwix computes them: neither
+    holds the scale from differentiation."""
     over = tuple(axis for axis in range(values.ndim) if axis != kept)
     scale = jnp.max(jnp.abs(values), axis=over, keepdims=True) / 127.5
     scale = jnp.where(scale < jnp.sqrt(jnp.finfo(scale.dtype).tiny), 1, scale)
-    return jnp.clip(jnp.round(values / scale), -128, 127) * scale
+    return jax.lax.stop_gradient(jnp.clip(jnp.round(values / scale), -128, 127)) * scale
+
+
+def convolved(x, kernel, groups: int):
+    """A 3x3 NHWC convolution with an HWIO kernel in `groups` feature groups, padded to its input's size."""
+    return jax.lax.conv_general_dilated(x, kernel, (1, 1), "SAME", dimension_numbers=("NHWC", "HWIO", "NHWC"),
+                                        feature_group_count=groups)
+
+
+@functools.partial(jax.custom_jvp, nondiff_argnums=(2,))
+def quantized_convolution(x, kernel, groups: int):
+    """The convolution of `x` and `kernel` quantized to int8 and back (`int8_round_trip`: each example's
+    scale, each output feature's), its tangent `conv(dx, Q(kernel)) + conv(Q(x), dkernel)`: the float
+    convolution's at the dequantized operands, so its reverse mode is the transpose there, and a derivative of
+    that goes through the operands' quantization, the scales' derivatives included, as the seam's backward
+    reads the quantized operands its forward made."""
+    return convolved(int8_round_trip(x, 0), int8_round_trip(kernel, 3), groups)
+
+
+@quantized_convolution.defjvp
+def _quantized_convolution_jvp(groups, primals, tangents):
+    (x, kernel), (along_x, along_kernel) = primals, tangents
+    held = (int8_round_trip(x, 0), int8_round_trip(kernel, 3))
+    return (convolved(*held, groups),
+            convolved(along_x, held[1], groups) + convolved(held[0], along_kernel, groups))
 
 
 def group_peaks(x, groups: int, features: int):
@@ -748,8 +773,9 @@ def test_a_quantized_convolution_holds_every_order_it_takes(groups, edge):
     convolution, a custom VJP whose backward is the float convolution's transpose at the dequantized
     operands): every order it takes finite wherever float64 is a normal float32 and the convolution of the
     operands quantized to int8 and back (each example's scale, each output feature's; a grouped input first
-    over each example's peak in each group, restored on that group's outputs) is, its derivatives taken
-    straight through the rounding at the dequantized operands, as the seam declares; it takes no
+    over each example's peak in each group, restored on that group's outputs) is, its reverse mode the float
+    convolution's transpose at the dequantized operands, as the seam declares, and a derivative of that
+    through the quantization, the scales' included (`quantized_convolution`); it takes no
     forward derivative of itself, nor a second (ledger 2658), every forward derivative of its gradient
     running."""
     from dew.nn.conv import Conv
@@ -764,11 +790,7 @@ def test_a_quantized_convolution_holds_every_order_it_takes(groups, edge):
     def plain(x, kernel):
         inward, outward = ((group_peaks(x, groups, width) for width in (x.shape[-1], kernel.shape[-1]))
                            if groups > 1 else (1, 1))
-        scaled = x / inward
-        held = (scaled + jax.lax.stop_gradient(int8_round_trip(scaled, 0) - scaled),
-                kernel + jax.lax.stop_gradient(int8_round_trip(kernel, 3) - kernel))
-        return jax.lax.conv_general_dilated(*held, (1, 1), "SAME", dimension_numbers=("NHWC", "HWIO", "NHWC"),
-                                            feature_group_count=groups) * outward
+        return quantized_convolution(x / inward, kernel, groups) * outward
 
     primals = normal_draw(1134, (1, 6, 6, 4), (3, 3, 4 // groups, 8), scale=EDGES[edge])
     direction = normal_draw(1135, (1, 6, 6, 4), (3, 3, 4 // groups, 8), scale=EDGES[edge])
