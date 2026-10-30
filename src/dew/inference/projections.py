@@ -31,9 +31,10 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 from flax.core import FrozenDict, freeze, unfreeze
+from flax.traverse_util import unflatten_dict
 from jax.sharding import SingleDeviceSharding
 
-from dew.batch import FROZEN, Variables, merge, select, thaw
+from dew.batch import FROZEN, PACKED_FROZEN, Variables, merge, select, thaw
 from dew.nn.protocols import ProjectionGroup, Serving
 from dew.quantization import QUANTIZATION, Quantization, QuantizedClass
 
@@ -276,7 +277,7 @@ def packed_owned(model: nn.Module, variables: Variables) -> Variables:
     whole = thaw(variables)
     groups = pending(model, whole)
     frozen, flags = _frozen_packed(_frozen_leaves(variables), whole, groups)
-    return _held_apart(_joined(whole, groups, _handed_over), frozen, flags)
+    return _held_apart(_joined(whole, groups, _handed_over), frozen, {**_flags(variables), **flags})
 
 
 def _held_packed(model: nn.Module, variables: Variables) -> tuple[ProjectionGroup, ...]:
@@ -347,8 +348,8 @@ def unpacked(model: nn.Module, variables: Variables) -> Variables:
     groups = tuple(group for group in _held_packed(model, whole) if splits(group))
     if not groups:
         return variables
-    split = _held_apart(_unflagged(_split(whole, groups, split_columns), groups),
-                        _frozen_split(variables, groups))
+    split = _held_apart(_split(whole, groups, split_columns), _frozen_split(variables, groups),
+                        _flags(variables, groups))
     return freeze(split) if isinstance(variables, FrozenDict) else split
 
 
@@ -358,7 +359,7 @@ def inference_projections(model: nn.Module, variables: Variables) -> Variables:
     whole = thaw(variables)
     groups = projection_groups(model, whole)
     frozen, flags = _frozen_packed(_frozen_leaves(variables), whole, groups)
-    return _held_apart(pack_projections(whole, groups), frozen, flags)
+    return _held_apart(pack_projections(whole, groups), frozen, {**_flags(variables), **flags})
 
 
 type _Path = tuple[str, ...]
@@ -385,13 +386,6 @@ def _frozen_leaves(variables: Variables) -> frozenset[_Path]:
 
 def _within(path: _Path, prefix: _Path) -> bool:
     return path[:len(prefix)] == prefix
-
-
-PACKED_FROZEN = "packed_frozen"
-"""The collection that flags, beside a group packed from a tree split for training (`dew.batch.freeze`)
-some of whose members train and some are frozen, which members were frozen: at each of its packed
-leaves' paths, one flag a member, in the group's order. Its split moves each member back into the
-collection it was in (`unpacked`)."""
 
 
 def _frozen_packed(frozen: frozenset[_Path], whole: Variables, groups: Sequence[ProjectionGroup]
@@ -447,25 +441,11 @@ def _frozen_split(variables: Variables, groups: Sequence[ProjectionGroup]) -> fr
     return frozen
 
 
-def _unflagged(variables: Variables, groups: Sequence[ProjectionGroup]) -> Variables:
-    """`variables` without the flags of `groups` (`PACKED_FROZEN`), which split."""
+def _flags(variables: Variables, groups: Sequence[ProjectionGroup] = ()) -> dict[_Path, np.ndarray]:
+    """The flags `variables` hold (`PACKED_FROZEN`) but those of `groups`, which split."""
     marks = [(PACKED_FROZEN, *group.path, group.packed) for group in groups]
-    kept = {path for path in _leaf_paths(variables, PACKED_FROZEN)
+    return {path: _leaf(variables, path) for path in _leaf_paths(variables, PACKED_FROZEN)
             if not any(_within(path, mark) for mark in marks)}
-    rest = {name: tree for name, tree in variables.items() if name != PACKED_FROZEN}
-    if not kept:
-        return rest
-    return {**rest, **select({PACKED_FROZEN: variables[PACKED_FROZEN]}, lambda path: path in kept)}
-
-
-def _nested(leaves: Mapping[_Path, np.ndarray]) -> Variables:
-    tree: dict = {}
-    for path, leaf in leaves.items():
-        node = tree
-        for name in path[:-1]:
-            node = node.setdefault(name, {})
-        node[path[-1]] = leaf
-    return tree
 
 
 def _held_apart(variables: Variables, frozen: frozenset[_Path],
@@ -474,7 +454,7 @@ def _held_apart(variables: Variables, frozen: frozenset[_Path],
     `flags` beside (`PACKED_FROZEN`): the split `dew.batch.freeze` made, over a tree whose groups packed
     or split since."""
     if flags:
-        variables = merge(variables, _nested(flags))
+        variables = merge(variables, unflatten_dict(flags))
     if not frozen:
         return variables
     rest = {name: tree for name, tree in variables.items() if name != "params"}
