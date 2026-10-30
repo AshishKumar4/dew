@@ -253,11 +253,13 @@ def annealing(**fields) -> GRPOObjective:
     return GRPOObjective(model, seq_len=7, behavior_importance=2.0, **fields)
 
 
-def asynchronously(objective: GRPOObjective, seen, steps: int = 6) -> None:
+def asynchronously(objective: GRPOObjective, seen, steps: int = 6, *, rewarded: bool = True,
+                   estimator: str = "group") -> None:
     """`steps` of `objective` at a rate of nothing, its rows collected asynchronously from a scripted
     source (`Asynchronous`, rescored under the trainer's weights, a row a task, as many as a host's
     devices hold), each step's packed rows and state handed to `seen`; the reward's reference penalty
-    paid against `objective`'s starting policy where it names one (`reward_kl`)."""
+    paid against `objective`'s starting policy where it names one (`reward_kl`); each sample rewarded
+    by its index, or all alike where not `rewarded`, under `estimator`."""
     import itertools
 
     import optax
@@ -269,11 +271,13 @@ def asynchronously(objective: GRPOObjective, seen, steps: int = 6) -> None:
 
     def drawn(task, sample, version):
         call = Call((1, 2), (3 + sample, 4), (-0.5, -0.25), "stop", version)
-        return Session(str(task.id), "", sample, 0, (call,), Status.COMPLETED, float(sample))
+        return Session(str(task.id), "", sample, 0, (call,), Status.COMPLETED,
+                       float(sample) if rewarded else 1.0)
 
     tasks = np.arange(1, 9, dtype=np.int32)
     scheduler = RolloutScheduler(Asynchronous(ScriptedSource(drawn), Published(), objective, width=8,
                                               rows=len(tasks), max_lag=1, ahead=0), groups=2,
+                                 estimator=estimator,
                                  reference=objective if objective.reward_kl > 0 else None)
 
     def rollout(state, batch, key):
@@ -315,14 +319,16 @@ def test_an_asynchronous_rescore_reads_the_policy_at_the_progress_its_loss_reads
 def test_a_reward_penalty_over_the_starting_weights_is_nil_half_way_through_an_anneal():
     """The reward's reference penalty (`GRPOObjective.reward_kl`) scores the reference at the progress the
     proximal column is read at (ledger 2666): half way through a DEX decoder's anneal, rows rescored at
-    the updates the run committed pay no penalty while the weights are the reference's, so their
-    advantages are a run's without the penalty, bit for bit."""
+    the updates the run committed pay no penalty while the weights are the reference's, so where every
+    sample earns one reward its leave-one-out advantages (`rloo`, which no deviation rescales) are
+    nothing, where a reference read at the run's end would charge each sample a penalty of its own."""
     advantages = {}
-    for weight in (0.0, 0.5):
-        def kept(state, packed, weight=weight):
-            advantages[weight, int(state.updates)] = np.asarray(packed[ADVANTAGES_KEY])
-        asynchronously(annealing(reward_kl=weight), kept)
-    np.testing.assert_array_equal(advantages[0.5, 5], advantages[0.0, 5])
+
+    def kept(state, packed):
+        advantages[int(state.updates)] = np.asarray(packed[ADVANTAGES_KEY])
+
+    asynchronously(annealing(reward_kl=0.5), kept, rewarded=False, estimator="rloo")
+    np.testing.assert_array_equal(advantages[5], 0)
 
 
 def test_a_run_names_a_method_that_builds_its_objective_and_its_rollout(tmp_path):
