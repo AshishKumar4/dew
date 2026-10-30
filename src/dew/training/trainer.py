@@ -1107,21 +1107,21 @@ class Trainer(Generic[Loss, Effects]):
             candidates, candidates.index(first) if isinstance(first, int) and first in candidates else 0)
         # Consume the artifact only after its program was accepted; a refusal leaves it pending.
         self._ahead = search.ahead
-        if runs := pgle_runs():
-            trials = Trials(state, batch, owned=False) if trials is None else trials
-            planned = planned.guided(trials.profiled(self._runner(planned, mesh), planned, mesh, runs), runs,
-                                     mesh)
-        # The state the chosen plan holds between steps, its accumulator and copies included; the
-        # plan's fit check counted them before any is built (`Candidate.held`).
-        self.validation = self._validation(planned.candidate.prepared)
         self.objective.substitute(list(planned.modules))
         self.objective.restore_head(planned.tile, fused=planned.fused)
         self._xla_defaults, self._narrow = planned.xla_defaults, planned.narrow
+        if runs := pgle_runs():
+            trials = Trials(state, batch, owned=False) if trials is None else trials
+            planned = planned.guided(trials.profiled(self._runner(planned, mesh), planned, mesh, runs), runs,
+                                     mesh, functools.partial(lower, planned.split, planned.narrow))
+        # The state the chosen plan holds between steps, its accumulator and copies included; the
+        # plan's fit check counted them before any is built (`Candidate.held`).
+        self.validation = self._validation(planned.candidate.prepared)
         chosen = {**self._rung(), 'split': planned.split}
         flops, counted = plan_flops(recorded, planned.executable)
         if record_path is not None:
             keep_rung(record_path, key, {**chosen, 'flops': counted, 'launches': planned.candidate.launches})
-        self.plan = settled(planned, probes, search.derived)
+        self.plan = settled(planned, probes, search)
         search.told(planned)
         if planned.split != candidates[0]:
             _log.info("the step fits the devices in the plan %s", self.plan)

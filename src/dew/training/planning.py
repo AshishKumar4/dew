@@ -16,7 +16,7 @@ import json
 import logging
 import tempfile
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Hashable, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -34,9 +34,11 @@ from dew.distributed.host import snapshot
 from dew.distributed.placement import Layout, MeshSpec, Placement, explicit_axes, placed_bytes
 from dew.mesh import LayoutRefused
 from dew.nn.kernels.options import compiler_options
+from dew.nn.kernels.templates import report
 from dew.objectives.base import RECORD, Objective
 from dew.state import TrainState, apart, together
 from dew.telemetry.profile import active_profile, capture_options
+from dew.training.ahead import handed
 from dew.training.distributed import batch_divisor
 from dew.training.footprint import Footprint
 from dew.training.memory import (
@@ -138,6 +140,24 @@ class Candidate:
         """The program, which a plan's search and its guided compile read before it is released."""
         assert self.program is not None, "a plan's program is released once the plan is admitted"
         return self.program
+
+
+class Relowered:
+    """What a compile lowered afresh where a kernel spilled (`report.compiled`'s `relower`): each
+    candidate `lower` gives, the last the one the executable compiled from, its lowering and kernel
+    report the executable's."""
+
+    def __init__(self, lower: Callable[[], Candidate]):
+        self.lower, self.last = lower, None
+
+    def __call__(self) -> jax.stages.Lowered:
+        self.last = self.lower()
+        return self.last.lowered
+
+    def candidate(self, compiled: Candidate) -> Candidate:
+        """The candidate the executable compiled from: `compiled`, the one first lowered, where the
+        compile lowered none afresh."""
+        return compiled if self.last is None else self.last
 
 
 @jax.jit
@@ -310,23 +330,28 @@ class Planned:
         """The microbatch index of each of the step's `split` calls, on every device of `mesh`."""
         return [jax.device_put(np.int32(part), NamedSharding(mesh, P())) for part in range(self.split)]
 
-    def guided(self, profile: bytes, runs: int, mesh: Mesh) -> Planned:
+    def guided(self, profile: bytes, runs: int, mesh: Mesh, relower: Callable[[], Candidate]) -> Planned:
         """This plan with its program compiled again under the options its executable compiled under,
         guided by `profile` of `runs` runs (`Trials.profiled`) as JAX's jit guides AutoPGLE's (XLA's
         feedback-directed `fdo_profile`, which JAX shares across a pool's processes under AutoPGLE), and
         held to the fit check the plan passed: a schedule the profile guides may keep more alive at once,
-        and one that no longer fits is refused. An empty profile, of a backend XLA profiles none of, leaves
-        the executable as it is. The plan given up holds the executable it replaces, which goes with it
-        and its program (`released`)."""
+        and one that no longer fits is refused. It compiles through the kernel templates' reports
+        (`report.compiled`), the plan's step lowered afresh where a kernel spills (`relower`, `Relowered`).
+        An empty profile, of a backend XLA profiles none of, leaves the executable as it is. The plan
+        given up holds the executable it replaces, which goes with it and its program (`released`)."""
         if not profile:
             return dataclasses.replace(self, profiled=(runs, 0))
-        executable = self.candidate.lowered.compile({**(self.options or {}), "fdo_profile": profile})
-        fit, headroom = step_fits(executable, mesh, self.candidate.held)
+        relowered = Relowered(relower)
+        executable = report.compiled(self.candidate.lowered, {**(self.options or {}), "fdo_profile": profile},
+                                     relower=relowered)
+        candidate = relowered.candidate(self.candidate)
+        fit, headroom = step_fits(executable, mesh, candidate.held)
         if not fit:
             raise RuntimeError(f"the step guided by its profile (jax_enable_pgle) needs {-(headroom or 0)} "
                                "bytes more than its tightest device has, where unguided it fits; train it "
                                "without AutoPGLE")
-        return dataclasses.replace(self, executable=executable, profiled=(runs, len(profile)))
+        return dataclasses.replace(self, candidate=candidate, executable=executable,
+                                   profiled=(runs, len(profile)))
 
     def released(self) -> Planned:
         """This plan as the run keeps it once admitted: its executable without the program it was lowered
@@ -454,13 +479,28 @@ class Forecast:
         return min(guesses, default=None)
 
 
-def settled(planned: Planned, probes: Sequence[Probe], derived: Sequence[JSON] = ()) -> dict[str, JSON]:
-    """The admitted plan, its kernel report, every compile needed to find it and each rung the
-    derivation read before them (`FitSearch.derived`). There is no alternative-policy timing or
-    selection in the run's admission record."""
+def settled(planned: Planned, probes: Sequence[Probe], search: FitSearch) -> dict[str, JSON]:
+    """The admitted plan, its kernel report, every compile needed to find it, each rung the derivation
+    read before them (`FitSearch.derived`), and the kernels those compiles found spilling and the launch
+    configs refused where it searched (`FitSearch.kernels`), which the run's telemetry reports with it
+    (`StepCompiled`). There is no alternative-policy timing or selection in the run's admission record."""
     _log.info("the step's %s", planned.candidate.kernels.summary())
     return {**planned.record(), "kernels": planned.candidate.kernels.record(),
-            "probes": [probe.record() for probe in probes], "derived": list(derived)}
+            "probes": [probe.record() for probe in probes], "derived": list(search.derived), **search.kernels}
+
+
+def refusal_record(identity: str, config: Hashable, names: frozenset[str]) -> dict[str, JSON]:
+    """A launch config refused for its kernels' spills (`report.refused_launches`), the config by its
+    text."""
+    kernels: list[JSON] = [*sorted(names)]
+    return {"launch": identity, "config": repr(config), "kernels": kernels}
+
+
+def spill_record(miss: report.Miss) -> dict[str, JSON]:
+    """A kernel a compile found spilling (`report.Miss`), its launch's config by its text."""
+    return {"kernel": miss.kernel, "op": miss.op,
+            "config": None if miss.config is None else repr(miss.config), "registers": miss.registers,
+            "spilled": miss.spilled, "stepped": miss.stepped}
 
 
 @dataclasses.dataclass
@@ -508,7 +548,8 @@ class FitSearch[LossT, EffectsT]:
     """The fitted plan's sampled step, which summarizes what the run inspects (`Candidate.sampled`)."""
     ahead: AheadOfTime | None = None
     """A step compiled ahead (`dew.training.ahead`), run in place of the search's first compile where it
-    is that program (`AheadOfTime.taken`)."""
+    is that program (`AheadOfTime.taken`), which the search searches within the launch configs its
+    compiles refused alone (`AheadOfTime.refusals`, `admitted`)."""
     capacity: int | None = None
     """The bytes a device that states none holds (`step_headroom`): a compile-only GPU's, as a step
     compiled ahead for it states them (`AheadTarget.capacity`)."""
@@ -518,6 +559,10 @@ class FitSearch[LossT, EffectsT]:
     for a run that starts from a plan, recorded, compiled ahead or resumed, which the search tries first."""
     derived: list[dict[str, JSON]] = dataclasses.field(default_factory=list)
     """Each rung the derivation read before the first compile: its rung, terms, headroom and label."""
+    kernels: dict[str, JSON] = dataclasses.field(default_factory=dict)
+    """What the templates' reports found where the search compiled (`admitted`): each kernel its compiles
+    found spilling (`report.misses`, `spill_record`) and each launch config refused in its registry
+    (`report.refused_launches`), a handed step's its own (`dew.training.ahead.handed`)."""
 
     def __post_init__(self):
         self.factor = temporaries_factor(self.mesh, self.capacity)
@@ -533,10 +578,16 @@ class FitSearch[LossT, EffectsT]:
         """The first fitting plan found by the split-and-rung search, and every compile it made, its
         first rung the one the derivation picks (`derived_start`). Once admission succeeds, no optional
         alternate policy is compiled."""
-        # A rung fits where its most microbatches do; the search then finds its split there.
-        self.derived_start(candidates[-1])
-        split = planned(candidates, first, self.fits, self.climb,
-                        lambda split: self.forecast.likely(self.rung(), split))
+        # A rung fits where its most microbatches do; the search then finds its split there. A step
+        # compiled ahead is searched within the launch configs its compiles refused alone (`handed`).
+        with handed(self.ahead):
+            self.derived_start(candidates[-1])
+            seen = len(report.misses())
+            split = planned(candidates, first, self.fits, self.climb,
+                            lambda split: self.forecast.likely(self.rung(), split))
+            spills: list[JSON] = [spill_record(miss) for miss in report.misses()[seen:]]
+            refused: list[JSON] = [refusal_record(*refusal) for refusal in report.refused_launches()]
+        self.kernels = {"spills": spills, "refused": refused}
         if split is None or self.fitted is None:
             raise PlanRefused(self.probes) from (self.refusals[-1] if self.refusals else None)
         return self.found(split), tuple(self.probes)
@@ -610,35 +661,45 @@ class FitSearch[LossT, EffectsT]:
         self.objective.substitute(held)
         return False
 
-    def measured(self, split: int, candidate: Candidate
-                 ) -> tuple[jax.stages.CompilerOptions | None, jax.stages.Compiled | None, Probe]:
+    def measured(self, split: int, candidate: Candidate) -> tuple[
+            jax.stages.CompilerOptions | None, Candidate, jax.stages.Compiled | None, Probe]:
         """`candidate`, the step at `split` at the objective's rung, compiled under the rung's options
         where it fits the devices, or for the search's first compile the step compiled ahead
-        (`ahead`), and the measure of its fit (`Probe`), the search's state else untouched. A run that
-        inspects compiles the candidate's sampled step too (`Candidate.sampled`), which must fit as the
-        step must, so a rung fits only where both do; it is `sampled` until the next measure."""
+        (`ahead`); the candidate its executable compiled from, lowered afresh where a kernel spilled
+        (`compiled_if_it_fits`, `Relowered`); and the measure of its fit (`Probe`), the search's state
+        else untouched. A run that inspects compiles the candidate's sampled step too
+        (`Candidate.sampled`), which must fit as the step must, so a rung fits only where both do; it is
+        `sampled` until the next measure."""
         options = self.required if self.xla_defaults else self.options(candidate)
         taken = self.ahead is not None
         began = time.perf_counter()
         if self.ahead is not None:
             executable, self.ahead = self.ahead.taken(candidate.lowered), None
         else:
-            executable = compiled_if_it_fits(candidate.lowered, options, self.refusals)
+            relowered = Relowered(lambda: self.lower(split, self.narrow))
+            executable = compiled_if_it_fits(candidate.lowered, options, self.refusals, relower=relowered)
+            candidate = relowered.candidate(candidate)
         fit, headroom = step_fits(executable, self.mesh, candidate.held, self.capacity, candidate.built)
         self.sampled = None
         if fit and candidate.sampled is not None:
-            self.sampled = compiled_if_it_fits(candidate.sampled(), options, self.refusals)
+            def resampled() -> jax.stages.Lowered:
+                """The sampled step lowered afresh, its launches derived past a spilled one's config."""
+                again = self.lower(split, self.narrow).sampled
+                assert again is not None
+                return again()
+            self.sampled = compiled_if_it_fits(candidate.sampled(), options, self.refusals, relower=resampled)
             fit, headroom = step_fits(self.sampled, self.mesh, candidate.held, self.capacity, candidate.built)
         seconds = time.perf_counter() - began
         probe = Probe.read(split, candidate, self.current(), fit, headroom, executable)
-        return options, executable, dataclasses.replace(probe, ahead=taken, compile_seconds=seconds)
+        probe = dataclasses.replace(probe, ahead=taken, compile_seconds=seconds)
+        return options, candidate, executable, probe
 
     def fits_here(self, split: int) -> bool:
         key = (split, self.rung())
         if key not in self.lowered:
             self.lowered[key] = self.lower(split, self.narrow)
-        candidate = self.lowered[key]
-        self.chosen, executable, probe = self.measured(split, candidate)
+        self.chosen, candidate, executable, probe = self.measured(split, self.lowered[key])
+        self.lowered[key] = candidate
         fit, headroom = probe.fits, probe.headroom
         self.probes.append(probe)
         self.forecast.read(self.rung(), split, executable, headroom, self.factor)
