@@ -71,7 +71,8 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 - A Gauss-Newton step (`Residuals(damping=...)`) takes every derivative order: its microbatch pullback and
   damped step are custom JVPs, so `jax.jvp`, `jax.linearize` and a Hessian-vector product run through it,
   and a parameter's step cotangent comes in the parameter's own dtype. The LM heads (whole, tiled and
-  fused) take a gradient of their gradient.
+  fused) take a gradient of their gradient and its forward derivative, a Hessian-vector product through
+  the loss, on JAX 0.12.0.1.post39, whose variadic reduce differentiates beside a constant operand.
 
 - A run's numerics are named where they are set: `--trainer.precision accurate` (or a Lightning dtype
   preset, "bf16-true", or a `Numerics` record's JSON), `"precision": "accurate"` in a run.json, and

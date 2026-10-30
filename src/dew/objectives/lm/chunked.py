@@ -38,7 +38,6 @@ from typing import NamedTuple, overload
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 from jax.sharding import PartitionSpec as P
 
 from dew.mesh import logical_spec, mesh_axes
@@ -212,7 +211,7 @@ def _tile_logits(states, matrix, precision: jax.lax.PrecisionLike):
                       precision=precision, preferred_element_type=at_least_fp32(states.dtype))
 
 
-def _row_terms_impl(logits, predict: bool, labels) -> tuple[
+def _row_terms(logits, predict: bool, labels) -> tuple[
         jax.Array, tuple[jax.Array, jax.Array] | None, tuple[jax.Array, jax.Array, jax.Array]]:
     """Each row's logsumexp, with `predict` its maximum and the first
     column that holds it, and its maximum, the sum of exponentials scaled to
@@ -255,32 +254,6 @@ def _row_terms_impl(logits, predict: bool, labels) -> tuple[
     terms = widened_reduction(reduced, *operands)
     maximum, total, rest = terms[:3]
     return maximum + jnp.log(total), ((maximum, terms[3]) if predict else None), (maximum, total, rest)
-
-
-def _row_terms_jvp(predict: bool, primals, tangents):
-    """`_row_terms`' forward derivative, its terms the one reduction's: the maximum's tangent as
-    `jnp.max`'s, and each sum's of the exponentials scaled to it, in jnp's own operations, since JAX's
-    derivative of a reduction with a combine of its own reshapes every operand's tangent and fails on a
-    symbolic zero, the count's and the mask's (jax 0.11.2, `lax._reduce_jvp`). A row whose every logit is
-    -inf (a tile of the excluded column alone) sums its exponentials scaled to its own maximum, as
-    `rescaled` takes them, so they do not move."""
-    logits, labels = primals
-    moved_logits = tangents[0]
-    terms = _row_terms(logits, predict, labels)
-    _, best, (maximum, total, _) = terms
-    moved_maximum = jax.jvp(lambda logits: jnp.max(logits, axis=-1), (logits,), (moved_logits,))[1]
-    shift = jnp.where(jnp.isfinite(maximum), maximum, 0)
-    moves = jnp.exp(logits - shift[..., None]) * (moved_logits - moved_maximum[..., None])
-    columns = jax.lax.broadcasted_iota(jnp.int32, logits.shape, logits.ndim - 1)
-    moved_total = jnp.sum(moves, axis=-1)
-    moved_rest = jnp.sum(jnp.where(columns != labels[..., None], moves, 0), axis=-1)
-    moved_best = None if best is None else (moved_maximum, np.zeros(best[1].shape, jax.dtypes.float0))
-    return terms, (moved_maximum + moved_total / total, moved_best, (moved_maximum, moved_total, moved_rest))
-
-
-# `jax.custom_jvp` is generic in its return type, which a `functools.partial` decorator loses.
-_row_terms = jax.custom_jvp(_row_terms_impl, nondiff_argnums=(1,))
-_row_terms.defjvp(_row_terms_jvp)
 
 
 class _ChunkTerms(NamedTuple):
