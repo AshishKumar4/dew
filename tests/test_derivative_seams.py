@@ -2,8 +2,7 @@
 custom_vjp, and each call of generation.linear_tangent, which builds three) named in `CONTRACTED` with the
 test of tests/test_derivative_contracts.py that holds it to its contract (`assert_contract`: every order
 finite wherever its float64 truth is a normal float32, at every exponent edge, beside an independent plain
-formula), or in `PENDING`, the seams row 2641 has yet to contract, which only shrinks. A new seam fails here
-until a contract or that row names it."""
+formula). A new seam fails here until a contract names it."""
 
 import ast
 from pathlib import Path
@@ -124,18 +123,13 @@ CONTRACTED = {
         "test_a_frozen_fp8_product_holds_every_order",
     "src/dew/quantization.py::_grouped_convolution_gradient.grouped_conv_qt":
         "test_a_quantized_convolution_holds_every_order_it_takes",
+    "src/dew/sampling/flow.py::_directional": "test_a_kls_forward_mode_holds_its_orders",
+    "src/dew/sampling/flow.py::_half_mahalanobis": "test_a_transitions_quadratic_term_holds_every_order",
+    "src/dew/sampling/flow.py::linear_tangent": "test_a_transitions_kl_holds_every_order",
+    "src/dew/sampling/guidance.py::_guided": "test_a_guided_prediction_holds_every_order",
 }
 """Each contracted seam, `path::qualified name`, and the test of tests/test_derivative_contracts.py that holds
 it."""
-
-PENDING = frozenset({
-    "src/dew/sampling/flow.py::_directional",
-    "src/dew/sampling/flow.py::_half_mahalanobis",
-    "src/dew/sampling/flow.py::linear_tangent",
-    "src/dew/sampling/guidance.py::_guided",
-})
-"""The seams row 2641 has yet to contract: each leaves this set for `CONTRACTED` with its contract, and no
-seam joins it."""
 
 
 def _named(node) -> str | None:
@@ -182,13 +176,12 @@ def seams() -> list[str]:
             for seam in seams_of(str(path.relative_to(root)), path.read_text())]
 
 
-def test_every_custom_derivative_is_under_a_contract_or_pending_its_row():
-    """Each seam is contracted (`CONTRACTED`, its test one of tests/test_derivative_contracts.py's) or pending
-    row 2641 (`PENDING`), never both; and each named seam exists, so neither list outlives its code."""
+def test_every_custom_derivative_is_under_a_contract():
+    """Each seam is contracted (`CONTRACTED`, its test one of tests/test_derivative_contracts.py's), and each
+    named seam exists, so the list never outlives its code."""
     found = set(seams())
-    assert not set(CONTRACTED) & PENDING
-    assert found - set(CONTRACTED) - PENDING == set(), "a seam with no contract and no row"
-    assert (set(CONTRACTED) | PENDING) - found == set(), "a named seam no longer in src/dew"
+    assert found - set(CONTRACTED) == set(), "a seam with no contract"
+    assert set(CONTRACTED) - found == set(), "a named seam no longer in src/dew"
     assert all(callable(getattr(test_derivative_contracts, test, None)) for test in CONTRACTED.values())
 
 
