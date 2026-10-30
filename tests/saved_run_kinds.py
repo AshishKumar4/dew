@@ -32,9 +32,9 @@ DIFFUSION_GEMMA = "tests/fixtures/hf/diffusion-gemma-sft"
 the repo."""
 
 
-def windows(path, pack: str | None = None):
-    """An LM run's windows of a token store, eight a batch, its documents packed as `pack` packs them."""
-    return read(TokenFiles(path).pipe(presets.lm, None, seq_len=SEQ, batch=None, pack=pack).batch(8))
+def windows(path):
+    """An LM run's windows of a token store, eight a batch."""
+    return read(TokenFiles(path).pipe(presets.lm, None, seq_len=SEQ, batch=None, pack=None).batch(8))
 
 
 def over(source: str, root: Path, drawn: bool) -> RunConfig:
@@ -81,11 +81,9 @@ def blockwise(root: Path, drawn: bool) -> RunConfig:
 
 def clocked(root: Path, drawn: bool) -> RunConfig:
     """An LM run on the examples clock (`--trainer.examples`), its progress the examples it consumed:
-    documents of seven tokens, packed into windows, some thirty a step."""
-    corpus = write_token_files(root / "clock-tokens", 40 * SEQ, 8 * SEQ, eos_id=1)
-    return dataclasses.replace(lm(root, drawn), data=windows(corpus.train, "first-fit"),
-                               validation=windows(corpus.val, "first-fit"),
-                               trainer=TrainerConfig(examples=64))
+    `lm`'s windows, unpacked, which its record reads back with no store to read (a packed chain checks
+    its store's document ends as it is built)."""
+    return dataclasses.replace(lm(root, drawn), trainer=TrainerConfig(examples=16))
 
 
 def fresh(root: Path, drawn: bool, precision: str = "bf16-mixed") -> RunConfig:

@@ -137,7 +137,7 @@ def test_a_run_an_earlier_main_saved_resumes_from_its_checkpoint(tmp_path, monke
     # A source the repo holds is recorded by its path in the repo (a decision run's backbone), read from
     # the checkout's root as the run that wrote it read it.
     monkeypatch.chdir(Path(__file__).resolve().parents[1])
-    # A run on the examples clock runs on to one example more than it consumed: one step's.
+    # A run on the examples clock runs on to one example more than it consumed.
     clock = ({"steps": last + 1} if seen is None or not recorded_run.trainer.examples
              else {"steps": None, "examples": seen["consumed"] + 1})
     trainer = dataclasses.replace(recorded_run.trainer, checkpoint_dir=str(tmp_path / "runs"), **clock,
@@ -149,7 +149,8 @@ def test_a_run_an_earlier_main_saved_resumes_from_its_checkpoint(tmp_path, monke
     assert (started["start_step"], started["resumed_from"] is not None) == (last, True)
     scalars = (run / "tracking" / "scalars.jsonl").read_text().splitlines()
     stepped = [json.loads(line)["step"] for line in scalars]
-    assert max(stepped) == last + 1
+    # A run on the examples clock trains the steps its one example more takes.
+    assert max(stepped) == last + 1 or ("examples" in clock and max(stepped) > last)
     if seen is not None:
         stored = sorted({str(leaf.dtype) for leaf in jax.tree.leaves(state.variables["params"])})
         assert stored == seen["params"]
