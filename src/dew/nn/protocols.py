@@ -681,6 +681,11 @@ class Differential(Protocol):
         its softmax attention layers, by index: what DEX extends and its recipe trains."""
         ...
 
+    def dex_exported(self, variables: Mapping[str, Mapping]) -> dict[str, Mapping]:
+        """`variables` as an export writes them, its DEX folded into its layers' output projections
+        (`dew.nn.dex.folded`); `ValueError` where a layer's does not fold."""
+        ...
+
 
 @runtime_checkable
 class ProjectsParameters(Protocol):
