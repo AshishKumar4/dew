@@ -494,6 +494,10 @@ def _register_evidence(record: dict) -> list[dict]:
         if found.spilled:
             rows.append({"case_id": f"{record['name']} {found.kernel}", "kind": "spill",
                          "spilled": found.spilled, "registers": found.registers})
+        if (launches := record.get("lowered", {}).get(found.kernel)) and found.kernel not in record.get(
+                "lowered_models", {}):
+            rows.append({"case_id": f"{record['name']} {found.kernel}", "kind": "unmodelled",
+                         "reason": "no declared family budget", "lowered": launches})
     return rows
 
 
