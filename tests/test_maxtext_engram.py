@@ -57,14 +57,14 @@ def dew_variables(inputs) -> dict:
         return inputs[f"param.{path}"]
 
     total = STREAMS * WIDTH
-    tree = {"shards/table": at("multi_head_embedding/embedding/embedding")[None],
+    tree = {"shards/embed/embedding": at("multi_head_embedding/embedding/embedding")[None],
             "key_proj/kernel": at("key_proj/kernel").reshape(-1, total),
             "key_proj/bias": at("key_proj/bias").reshape(total),
             "value_proj/kernel": at("value_proj/kernel"), "value_proj/bias": at("value_proj/bias"),
             "norm_key/scale": at("k_norm/scale").reshape(total) - 1,
             "norm_query/scale": at("q_norm/scale").reshape(total) - 1,
             "norm_conv/scale": at("short_conv/norm/scale").reshape(total) - 1,
-            "conv1d/weight": at("short_conv/conv/kernel")[:, 0, :].T}
+            "conv1d/weight": at("short_conv/conv/kernel")[:, 0, :].T[:, None, :]}
     return {"params": unflatten_dict({tuple(path.split("/")): value for path, value in tree.items()})}
 
 

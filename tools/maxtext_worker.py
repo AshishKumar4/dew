@@ -95,10 +95,17 @@ def engram(dtype: str):
     """`(apply(params, case), layout)`: MaxText's Engram layer over a case's `streams` `[B, S, G, D]` and
     each head's local bucket `ids` `[B, S, H_total]`, the caller's residual added (the layer leaves it
     to its caller, maxtext/layers/engram.py:621-695), and its parameter shapes."""
+    import types
+
     import jax.numpy as jnp
     from flax import nnx
+    from maxtext.layers import normalizations
     from maxtext.layers.engram import Engram
 
+    if dtype == "float64":
+        # MaxText's RMSNorm computes in float32 whatever its dtype (maxtext/layers/normalizations.py:96,
+        # 118); its float64 run carries that arithmetic in float64, the module's own float32 read as it.
+        normalizations.jnp = types.SimpleNamespace(**{**vars(jnp), "float32": jnp.float64})
     held = config(dtype, base_emb_dim=ENGRAM_WIDTH)
     module = Engram(config=held, mesh=mesh(held), rngs=nnx.Rngs(0), **ENGRAM)
     flat = nnx.to_flat_state(nnx.state(module, nnx.Param))

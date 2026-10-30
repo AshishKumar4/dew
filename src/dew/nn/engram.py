@@ -449,7 +449,10 @@ class PLELayer(nn.Module):
         key = key.reshape(batch, length, hc, width)
         value = dense(width, name='value_proj')(looked)
         query = norm(name='norm_query')(streams.reshape(batch, length, hc * width)).reshape(key.shape)
-        dot = jnp.sum(key * query, axis=-1) / np.sqrt(width).astype(np.float32)
+        dot = jnp.sum(key * query, axis=-1)
+        # Scaled in at least fp32 by the width's root at that precision, a float64 run's in float64.
+        wide = at_least_fp32(dot.dtype)
+        dot = dot.astype(wide) / jnp.sqrt(jnp.asarray(width, wide))
         gate = jnp.sign(dot) * jnp.sqrt(jnp.maximum(jnp.abs(dot), 1e-6))
         gated = (jax.nn.sigmoid(gate)[..., None] * value[:, :, None, :]).reshape(batch, length, hc * width)
         normed = norm(name='norm_conv')(gated)
