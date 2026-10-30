@@ -149,15 +149,17 @@ def round_to_bf16(state, key, value):
 
 def update(state, query, key, value, decay, write, *, delta: bool):
     """One token over a state `[..., Dk, Dv]` in its working dtype, `decay` per key dimension `[...,
-    Dk]` (`exp(g)`) and `write` the write gate, broadcast against the values `[..., Dv]`: its output
-    `[..., Dv]` and the updated state.
+    Dk]` (`exp(g)`) and `write` the write gate `[..., 1]`, a head's one: its output `[..., Dv]` and the
+    updated state.
     The output reads the updated state, `q^T S'`, as the recurrence states it, with the delta rule and
     without: the one-pass form `(q decay)^T S + (q . k) write (v - (k decay)^T S)` overflowed where
     `q^T S'` stays finite, its `q . k` past fp32's largest at keys and queries of 2^80 against a write of
-    2^-80 (rows 1859 and 1962)."""
+    2^-80 (rows 1859 and 1962). The write gate scales the key before the write's outer product (`beta k`,
+    as the chunk form and fla write it), so the write's transpose, `(beta k) . q` against the output's
+    cotangent, takes the gate before the sum: after it, `k . q` past fp32's largest at keys and queries of
+    2^63 put an infinite value gradient where the chunk form's was finite (ledger 2470)."""
     corrected = value - jnp.sum((key * decay)[..., :, None] * state, axis=-2) if delta else value
-    written = corrected * write
-    updated = state * decay[..., :, None] + key[..., :, None] * written[..., None, :]
+    updated = state * decay[..., :, None] + (key * write)[..., :, None] * corrected[..., None, :]
     return jnp.sum(query[..., :, None] * updated, axis=-2), updated
 
 
