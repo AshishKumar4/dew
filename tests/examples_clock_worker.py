@@ -20,6 +20,15 @@ SHARD_ROWS = 3
 """The rows of each physical shard a streamed read deals its shares, the last one short."""
 
 
+class Questioned:
+    """An objective's expansion of each record into `id % 3 + 1` rows, one a question, as a decision
+    layout of a question a row makes of an example (`dew.decision.rows.QuestionRows`)."""
+
+    def flat_map(self, element):
+        return tuple({"id": element["id"], "question": np.int32(question)}
+                     for question in range(int(element["id"]) % 3 + 1))
+
+
 def examples_clock(args) -> dict:
     """A run bounded to `--examples` of RECORDS records, read as `--deal` deals them to the pool's shares:
     `order`, one global order; `records`, each share its own, an objective making `id % 3 + 1` rows of
@@ -44,14 +53,6 @@ def examples_clock(args) -> dict:
     from dew.training import Checkpoints, Cooldowns, MeshSpec, Pause, Trainer
 
     expands = args.deal != "order"
-
-    class Questioned:
-        """Each record made `id % 3 + 1` rows, as a decision layout makes a row of each question, the
-        question it asks on each."""
-
-        def flat_map(self, element):
-            return tuple({"id": element["id"], "question": np.int32(question)}
-                         for question in range(int(element["id"]) % 3 + 1))
 
     class Pulled(Objective):
         """A weight pulled toward each real row's id, counting each id's examples among the rows it trains."""

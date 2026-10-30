@@ -782,18 +782,19 @@ class Loader:
         (`examples`), with every row the objective makes of each, its last batch short where they end
         inside one, in whole updates of `window` steps, where a global order's plan counts them ahead
         (`order_records`); None for one read in its own order, as a pack that runs as rows arrive makes,
-        or one an objective expands after the bound, which no pass reads ahead to count, and for any read
-        in a pool, whose shares can end steps apart (the last batch the bound ends inside split unevenly,
-        or each share's rows its own): its run keeps its progress in the examples its batches consume
-        (`dew.batch.EXAMPLES_CONSUMED`), every share reading on until each has run out
-        (`dew.training._fit.pooled_read`). Refused where the read is bounded to another count, and where
-        the last steps would make no whole update, so some examples would train nothing."""
+        or one an objective expands after the bound, which no pass reads ahead to count, such as a pool's
+        read whose shares each read records of their own and so end steps apart: its run keeps its
+        progress in the examples its batches consume (`dew.batch.EXAMPLES_CONSUMED`), a pool's every share
+        reading on until each has run out (`dew.training._fit.pooled_read`). A pool's read in one global
+        order plans as one process's does, every share ending at its steps. Refused where the read is
+        bounded to another count, and where the last steps would make no whole update, so some examples
+        would train nothing."""
         if self.examples != examples:
             held = "not bounded" if self.examples is None else f"bounded to {self.examples}"
             raise ValueError(f"examples={examples} reads a training chain bounded to that many records "
                              f"before packing, and this loader's is {held}; give fit the Dataset chain, "
                              "which it bounds and compiles")
-        if self.order_records is None or jax.process_count() > 1:
+        if self.order_records is None:
             return None
         steps = self._steps(self.order_records, window)
         if steps % window:

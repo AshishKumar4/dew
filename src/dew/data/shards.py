@@ -94,16 +94,17 @@ def _reached(root: grain.MapDataset, examples: int) -> Iterator[tuple[int, Shard
     of it they hold. Some shard of `root` holds a row."""
     place = 0
     while examples > 0:
-        shard: Shard = root[place]
+        shard = root[place]
+        assert shard is not None, "a stream's dealt places are its shards"
         rows = _rows(shard)
         yield place, shard, min(rows, examples)
         examples -= rows
         place += 1
 
 
-def _rows(shard: Shard) -> int:
-    """The rows `shard` states, which every shard a bound walks does (`bounded`)."""
-    assert shard.rows is not None, "every shard a bound walks states its rows"
+def _rows(shard: Shard | None) -> int:
+    """The rows a dealt place's `shard` states, which every shard a bound walks does (`bounded`)."""
+    assert shard is not None and shard.rows is not None, "every shard a bound walks states its rows"
     return shard.rows
 
 

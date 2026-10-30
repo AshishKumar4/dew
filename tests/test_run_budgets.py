@@ -8,6 +8,7 @@ import grain.python as grain
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from examples_clock_worker import Questioned
 from recording import RecordingTracker
 from reference_error import as_given, assert_as_exact
 
@@ -276,15 +277,6 @@ def test_an_examples_budget_counts_documents_before_they_are_packed():
     read = ids_read(loader, "text")
     reached = collections.Counter(1 + index % 5 for index in range(13))
     assert read == {token: count * token for token, count in reached.items()}
-
-
-class Questioned:
-    """An objective's expansion of each record into `id % 3 + 1` rows, one a question, as a decision
-    layout of a question a row makes of an example (`dew.decision.rows.QuestionRows`)."""
-
-    def flat_map(self, element):
-        return tuple({"id": element["id"], "question": np.int32(question)}
-                     for question in range(int(element["id"]) % 3 + 1))
 
 
 @pytest.mark.parametrize("configured", [False, True], ids=["step", "configured"])

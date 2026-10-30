@@ -499,13 +499,13 @@ def credited(column: jax.Array | np.ndarray, examples: int) -> jax.Array | np.nd
         return column + owed
 
     def credit(shard: jax.Shard) -> jax.Array:
-        data = shard.data
-        assert isinstance(data, jax.Array), "an addressable shard holds its data"
+        counts = shard.data
+        assert isinstance(counts, jax.Array), "an addressable shard holds its rows' counts"
         if shard.index and (shard.index[0].start or 0):
-            return data
-        owed = np.zeros(data.shape, np.int32)
+            return counts
+        owed = np.zeros(counts.shape, np.int32)
         owed[0] = examples
-        return data + jax.device_put(owed, shard.device)
+        return counts + jax.device_put(owed, shard.device)
 
     return jax.make_array_from_single_device_arrays(column.shape, column.sharding,
                                                     [credit(shard) for shard in column.addressable_shards])
