@@ -62,7 +62,7 @@ HOOK_FORMS = {"bfloat16": (jnp.bfloat16, False), "float16": (jnp.float16, False)
 """The hooked forward's dtypes and forms: the fold and natural logits over both 16-bit dtypes."""
 FED = {"dkv_family": "wgmma.fed", "dkv_consumers": 2}
 """The dK/dV launch on an H100's layout whose consumers feed their rings, its two consumers splitting each
-slot's queries (`attention_mosaic_backward.split_queries`), as the derivation takes it."""
+slot's queries (`attention_mosaic_scores.split_queries`), as the derivation takes it."""
 BACKWARD_FORMS = ("default", "fused", "fused-keys-first", "accurate")
 """The backward's forms (`_backward_form`): the fast in two launches and in one either way, and the
 accurate."""
@@ -521,7 +521,7 @@ def test_the_keys_first_backward_keeps_the_logits_the_forward_keeps_finite_inter
     """Queries of 2^120 over keys of 4, one of 8, 64 wide at the scale 1/8: the forward's logits, the
     queries taken by the scale's power before their products (`attention.prescale`), are 2^125 and 2^126,
     where the unscaled products pass fp32's largest. The two-launch backward takes its logits from the
-    queries taken by the power (`attention_mosaic_backward._dkv_step`), so its weights are the forward's,
+    queries taken by the power (`attention_mosaic_dkv._dkv_step`), so its weights are the forward's,
     one-hot on the key of 8, and every gradient is the float64 reference's to the bit: dV that key's the
     queries' summed cotangents, dQ and dK zero."""
     tokens, width = 64, 64
