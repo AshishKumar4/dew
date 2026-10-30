@@ -10,13 +10,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from model_support import parameter_loss
-from reference_error import (
-    FACTOR,
-    assert_as_exact_as_the_reference,
-    assert_as_exact_over_orders,
-    distance,
-    ieee_fixture,
-)
+from one_draw import assert_as_exact_as_the_reference
+from reference_error import FACTOR, assert_as_exact_over_orders, distance, ieee_fixture
 from residual_orders import permuted
 from scipy.special import log_softmax
 

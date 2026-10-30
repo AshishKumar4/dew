@@ -16,7 +16,7 @@ import optax
 import pytest
 from flax import linen as nn
 from learning_gate import assert_learns, within
-from reference_error import assert_as_exact_as_the_reference
+from one_draw import assert_as_exact_as_the_reference
 from scipy import stats
 
 from dew.diffusion import broadcast_rates, expand, presets

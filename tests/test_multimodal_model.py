@@ -19,8 +19,10 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from float64_terms import float64_forward
 from multimodal_families import FAMILIES
-from reference_error import GateFailure, assert_as_exact_as_the_reference, float64_forward
+from one_draw import assert_as_exact_as_the_reference
+from reference_error import GateFailure
 from safetensors.numpy import load_file
 
 from dew.batch import coordinates

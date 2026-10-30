@@ -15,7 +15,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from reference_error import assert_as_exact_as_the_reference
+from one_draw import assert_as_exact_as_the_reference
 
 from dew.nn.backbones.edm2 import EDM2UNet
 from dew.nn.dit import TextContext

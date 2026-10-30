@@ -167,13 +167,8 @@ def check(directory, case):
 
 if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
-    from reference_error import (
-        as_given,
-        assert_as_exact,
-        assert_as_exact_as_the_reference,
-        torch_with_gradients,
-        with_gradients,
-    )
+    from one_draw import assert_as_exact_as_the_reference
+    from reference_error import as_given, assert_as_exact, torch_with_gradients, with_gradients
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("directory")

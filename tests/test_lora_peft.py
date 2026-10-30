@@ -14,13 +14,8 @@ import numpy as np
 import optax
 import pytest
 from flax import linen as nn
-from reference_error import (
-    as_given,
-    assert_as_exact,
-    assert_as_exact_as_the_reference,
-    assert_as_exact_over_orders,
-    with_gradients,
-)
+from one_draw import assert_as_exact_as_the_reference
+from reference_error import as_given, assert_as_exact, assert_as_exact_over_orders, with_gradients
 from safetensors.numpy import load_file
 from sampling_gate import assert_draws_as_declared
 
