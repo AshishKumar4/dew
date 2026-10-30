@@ -723,21 +723,16 @@ class Decide(SavedRunTask, InItsForm):
     def logits(self, rows: Sequence[Encoded]) -> list[np.ndarray]:
         """Return each row's raw `[Q, K]` logits, one row per question laid out in it, in slot order.
 
-        The rows are scored shortest first, in passes that fit the budget.
+        The rows are scored shortest first, in the passes a server of this task runs and over its
+        programs (`RowScoring`, `dew.inference.scoring.ScoringServer`), one path for a call and a
+        server alike, every row looked at for each pass.
         """
+        server = scoring.ScoringServer(RowScoring(replace(self, variables={})), self.variables,
+                                       rows=max(1, len(rows)))
         order = sorted(range(len(rows)), key=lambda index: len(rows[index].tokens))
-        found: dict[int, np.ndarray] = {}
-        start = 0
-        while start < len(order):
-            plan = self.planned()
-            plan.add(rows[order[start]])
-            stop = start + 1
-            while stop < len(order) and plan.add(rows[order[stop]]):
-                stop += 1
-            chosen = order[start:stop]
-            found.update(zip(chosen, self.scored([rows[index] for index in chosen]), strict=True))
-            start = stop
-        return [found[index] for index in range(len(rows))]
+        futures = {index: server.submit(rows[index]) for index in order}
+        server.run()
+        return [futures[index].result() for index in range(len(rows))]
 
     def scored(self, rows: Sequence[Encoded], variables: Variables | None = None) -> list[np.ndarray]:
         """Each of `rows`' raw `[Q, K]` logits from one pass over them all, which `fits` allows, over
@@ -1172,17 +1167,54 @@ class _WirePlan:
 
 
 @dataclass(frozen=True)
-class WireScoring(scoring.Scoring[Mapping[str, object], _Row, _Admitted, np.ndarray, dict[str, JSON]]):
+class _DecideScoring[RequestT, PayloadT, AnswerT](
+        scoring.Scoring[RequestT, _Row, PayloadT, np.ndarray, AnswerT]):
+    """A `Decide` task's passes as a scoring task's (`dew.inference.scoring.Scoring`): a pass is one
+    within the task's budget (`Decide.fits`) over text rows, or one over rows of images as long as each
+    other and of alike images (`Images.joined`), which `forward` runs over the weights it is handed;
+    `decide` holds no weights. Every scoring of the task, a call's (`RowScoring`) and a server's of Jev
+    bodies (`WireScoring`), runs these passes over the same compiled programs."""
+
+    decide: Decide
+
+    def planned(self) -> "_WirePlan":
+        return _WirePlan(self.decide)
+
+    def forward(self, variables: Variables, rows: Sequence[_Row]) -> list[np.ndarray]:
+        # The server chose these rows as one pass (`planned`), so they run as one, over the weights it
+        # hands the pass; the task's compiled forwards are kept across passes.
+        if rows[0].media is None:
+            return self.decide.scored([row.encoded for row in rows], variables)
+        return self.decide._seen_pass([(row.encoded, row.media) for row in rows if row.media is not None],
+                                      variables)
+
+    def compile(self, variables: Variables) -> tuple[PassShape, ...]:
+        # The text passes' programs (`Decide.pass_shapes`); a pass of images compiles on its first.
+        return self.decide.compile_scoring(variables)
+
+
+@dataclass(frozen=True)
+class RowScoring(_DecideScoring[Encoded, None, np.ndarray]):
+    """A `Decide` task's laid-out text rows as a scoring task (`dew.inference.scoring.Scoring`): each
+    request one row (`Decide._encoded`), answered by its raw `[Q, K]` logits, the passes a server of
+    Jev bodies runs (`Decide.logits`)."""
+
+    def admit(self, request: Encoded) -> scoring.Scored[_Row, None]:
+        return scoring.Scored((_Row(request),), None)
+
+    def answer(self, payload: None, outputs: Sequence[np.ndarray]) -> np.ndarray:
+        return outputs[0]
+
+
+@dataclass(frozen=True)
+class WireScoring(_DecideScoring[Mapping[str, object], _Admitted, dict[str, JSON]]):
     """A `Decide` task as a scoring task of Jev request bodies (`dew.inference.scoring.Scoring`),
     answering each as `Decide.systemone` does under `details`, `strict` and `whole`.
 
     `admit` parses and lays out a body, refusing what Jev would refuse, a body the layout could
-    answer only by cutting it under `whole` included. A pass is `Decide.logits`' one pass within the
-    task's budget (`Decide.fits`) over text rows, or one over rows of images as long as each other and
-    of alike images (`Images.joined`); `forward` runs it over the weights it is handed, and `answer`
-    reads a body's answers off its rows' logits. `decide` holds no weights (`Decide.scoring`)."""
+    answer only by cutting it under `whole` included; `answer` reads a body's answers off its rows'
+    logits."""
 
-    decide: Decide
     details: bool = False
     strict: bool = False
     whole: bool = False
@@ -1212,21 +1244,6 @@ class WireScoring(scoring.Scoring[Mapping[str, object], _Row, _Admitted, np.ndar
                                  f"{decide.layout.max_len} tokens, without cutting its {cut}")
         self.counts.delivered({"_dew_truncated": usage.truncated, "_dew_cut": usage.cut})
         return scoring.Scored(rows, _Admitted(questions, tuple(row.encoded for row in rows)))
-
-    def planned(self) -> "_WirePlan":
-        return _WirePlan(self.decide)
-
-    def forward(self, variables: Variables, rows: Sequence[_Row]) -> list[np.ndarray]:
-        # The server chose these rows as one pass (`planned`), so they run as one, over the weights it
-        # hands the pass; the task's compiled forwards are kept across passes.
-        if rows[0].media is None:
-            return self.decide.scored([row.encoded for row in rows], variables)
-        return self.decide._seen_pass([(row.encoded, row.media) for row in rows if row.media is not None],
-                                      variables)
-
-    def compile(self, variables: Variables) -> tuple[PassShape, ...]:
-        # The text passes' programs (`Decide.pass_shapes`); a pass of images compiles on its first.
-        return self.decide.compile_scoring(variables)
 
     def answer(self, payload: _Admitted, outputs: Sequence[np.ndarray]) -> dict[str, JSON]:
         return self.decide._wire_response(payload.questions,

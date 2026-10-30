@@ -259,6 +259,39 @@ def test_a_scoring_server_compiles_its_passes_up_front_and_none_while_it_serves(
         assert not compiled_while_serving(server)
 
 
+def test_a_batch_scores_in_a_servers_passes_over_the_programs_it_compiled(decide, caplog):
+    """`Decide.batch` scores its requests in the passes a scoring server runs (`RowScoring`, one path for
+    a call and a server): over a task whose budget declares its widths, after its passes' programs
+    compile up front (`compile_scoring`), a batch of requests of every length, question and option count
+    compiles no forward, and answers each as it answers it alone, in the fields a padded pass cannot
+    move."""
+    import logging
+
+    from test_decision_batches import CASES
+
+    from dew.decision import Question
+    from dew.decision.task import Budget
+
+    declared = replace(decide, budget=Budget(options=16))
+    declared.compile_scoring()
+    requests = [(body["state"], {name: Question.from_wire(wire) for name, wire in body["questions"].items()})
+                for body in [*CASES.values(), REQUEST]]
+    with jax.log_compiles(), caplog.at_level(logging.WARNING):
+        caplog.clear()
+        together = declared.batch(requests)
+        compiled = [record.getMessage() for record in caplog.records
+                    if record.getMessage().startswith("Compiling jit(logits)")]
+    assert not compiled, compiled
+    def discrete(answers) -> dict:
+        # The fields a padded pass cannot move (tests/test_decision_batches.py's `DISCRETE`).
+        return {name: (answer.kind, int(np.argmax(answer.probabilities)), answer.abstained)
+                for name, answer in answers.items()}
+
+    for request, (answers, _) in zip(requests, together, strict=True):
+        ((alone, _),) = declared.batch([request])
+        assert discrete(answers) == discrete(alone)
+
+
 def test_a_reload_after_a_cancelled_request_plans_the_next_pass_with_the_new_task(decide):
     """A request cancelled while it waits leaves the queue as its pass is chosen, and with it any plan of its
     row, so the request after it, laid out by the task a reload put in place, is planned by that task: a
