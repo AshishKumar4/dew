@@ -338,7 +338,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_kv_cache.py": {
-   "comparisons": 3,
+   "comparisons": 2,
    "lane": "Models, Serving & RL"
   },
   "tests/test_layer_stack.py": {

@@ -27,8 +27,8 @@ class Named:
     def admit(self, request: str) -> Scored[str, str]:
         return Scored(tuple(request), self.name)
 
-    def fits(self, rows) -> bool:
-        return len(rows) <= self.width
+    def planned(self) -> "Counted":
+        return Counted(self.width)
 
     def forward(self, variables, rows):
         weight = float(variables["w"])
@@ -40,6 +40,17 @@ class Named:
 
     def answer(self, payload: str, outputs):
         return self.name, payload, "".join(row for row, _ in outputs), *(outputs[0][1:] if outputs else ())
+
+
+class Counted:
+    """A pass of at most `width` rows, taking them one at a time (`Scoring.planned`)."""
+
+    def __init__(self, width: int):
+        self.width, self.rows = width, 0
+
+    def add(self, row) -> bool:
+        self.rows += 1
+        return self.rows <= self.width
 
 
 def weights(value: float):
