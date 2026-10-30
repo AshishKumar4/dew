@@ -82,7 +82,6 @@ def forward(x, dt, b, c, parameters, state, resets, scan: Scan):
     `scan.packed`). Returns `y` `[R, T, D]` in `x`'s dtype, the final state `[R, N, D]` fp32 and, with
     `scan.entered`, each chunk's entering state `[R, chunks, N, D]` fp32 (None without)."""
     family, chunk, block, states = scan.family, scan.chunk, scan.block, scan.states
-    contiguous = _contiguous(family)
     blocks = {"x": ((chunk, block), x.dtype), "dt": ((chunk, block), dt.dtype),
               "b": ((chunk, states), b.dtype), "c": ((chunk, states), c.dtype)}
     if scan.packed:
@@ -103,13 +102,12 @@ def forward(x, dt, b, c, parameters, state, resets, scan: Scan):
         columns = pl.ds(part * block, block)
         # Each view the program's own columns, its steps down its rows (an sm80 pipeline's index map takes
         # no traced block index).
-        views = {"x": (_block(x_ref, row, columns, part, contiguous), _down),
-                 "dt": (_block(dt_ref, row, columns, part, contiguous), _down),
+        views = {"x": (x_ref.at[row, :, columns], _down), "dt": (dt_ref.at[row, :, columns], _down),
                  "b": (b_ref.at[row], _down), "c": (c_ref.at[row], _down)}
         if scan.packed:
             views["resets"] = (resets_ref.at[row], _down)
-        once_views = {"parameters": (_block(parameters_ref, None, columns, part, contiguous), _down),
-                      "entering": (_block(state_ref, row, columns, part, contiguous), _down)}
+        once_views = {"parameters": (parameters_ref.at[:, columns], _down),
+                      "entering": (state_ref.at[row, :, columns], _down)}
 
         def body(staged, *, streams):
             out_smem, state_smem = staged
@@ -171,8 +169,7 @@ def forward(x, dt, b, c, parameters, state, resets, scan: Scan):
     launched = family.kernel(entry, out_type=tuple(out_type), grid=(scan.rows, scan.blocks),
                              grid_names=("rows", "blocks"), consumers=1, interpret=scan.interpret,
                              name="selective_scan")
-    outs = launched(*_blocked(contiguous, block, x, dt), b, c,
-                    *_blocked(contiguous, block, parameters, state), resets)
+    outs = launched(x, dt, b, c, parameters, state, resets)
     return (*outs, None) if not scan.entered else tuple(outs)
 
 
@@ -194,7 +191,6 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan):
     sum_c dy_t h_t` through a shared tile summed across them, and the channel's own terms: the write's
     `dw_t = sum_n g_t B_t`, the decay's `g_t h_{t-1} a_t`."""
     family, chunk, block, states = scan.family, scan.chunk, scan.block, scan.states
-    contiguous = _contiguous(family)
     groups = states // GROUP
     blocks = {"x": ((chunk, block), x.dtype), "dt": ((chunk, block), dt.dtype),
               "b": ((chunk, states), b.dtype), "c": ((chunk, states), c.dtype),
@@ -223,15 +219,15 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan):
               dx_ref, ddt_ref, db_ref, dc_ref, da_ref, dd_ref, dstate_ref):
         row, part = lax.axis_index("rows"), lax.axis_index("blocks")
         columns = pl.ds(part * block, block)
-        views = {"x": (_block(x_ref, row, columns, part, contiguous), reversed_steps),
-                 "dt": (_block(dt_ref, row, columns, part, contiguous), reversed_steps),
+        views = {"x": (x_ref.at[row, :, columns], reversed_steps),
+                 "dt": (dt_ref.at[row, :, columns], reversed_steps),
                  "b": (b_ref.at[row], reversed_steps), "c": (c_ref.at[row], reversed_steps),
-                 "dy": (_block(dy_ref, row, columns, part, contiguous), reversed_steps),
-                 "entering": (_block(entered_ref, row, columns, part, contiguous), reversed_steps)}
+                 "dy": (dy_ref.at[row, :, columns], reversed_steps),
+                 "entering": (entered_ref.at[row, :, columns], reversed_steps)}
         if scan.packed:
             views["resets"] = (resets_ref.at[row], reversed_steps)
-        once_views = {"parameters": (_block(parameters_ref, None, columns, part, contiguous), _down),
-                      "leaving": (_block(dfinal_ref, row, columns, part, contiguous), _down)}
+        once_views = {"parameters": (parameters_ref.at[:, columns], _down),
+                      "leaving": (dfinal_ref.at[row, :, columns], _down)}
 
         def body(staged, *, streams):
             kept_smem, summed_smem, writes_smem, decays_smem, sums_smem, vector_smem = staged
@@ -358,32 +354,7 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan):
                              name="selective_scan_backward")
     # Each chunk's entering state a `[N, D]` block of a row's rows, as a stream steps them.
     laid = entered.reshape(scan.rows, chunks * states, scan.channels)
-    return launched(*_blocked(contiguous, block, x, dt), b, c,
-                    *_blocked(contiguous, block, parameters, laid), resets,
-                    *_blocked(contiguous, block, dy, dfinal))
-
-
-def _contiguous(family: mosaic.Family) -> bool:
-    """Whether a channel block's rows are packed contiguous before the launch: a pipelined family's untiled
-    copies (`cp.async` on an A100, the scan's unswizzled streams) read each row of a block's view at the
-    view's row length, not its stride (the JAX fork's launch_context CP_ASYNC untiled branch), so every row
-    past the first of a block of a wider row read the wrong channels (the backward's gradients 1.4 from
-    float64 on an A100, selective-a100-diag-echo-x-mapping); TMA's copies take the stride."""
-    return not isinstance(family, mosaic.RingFamily)
-
-
-def _blocked(contiguous: bool, block: int, *values):
-    """Each of `values` `[..., N, C]` as `[..., C // block, N, block]` where `contiguous`, else as it is."""
-    return tuple(jnp.swapaxes(value.reshape(*value.shape[:-1], value.shape[-1] // block, block), -3, -2)
-                 if contiguous else value for value in values)
-
-
-def _block(ref, row, columns, part, contiguous: bool):
-    """A stream's view of channel block `part` (`columns`) of `ref`'s row `row` (all rows where None), `[N,
-    block]`: of the contiguous layout where `contiguous` (`_blocked`), else of the row's own."""
-    if contiguous:
-        return ref.at[part] if row is None else ref.at[row, part]
-    return ref.at[:, columns] if row is None else ref.at[row, :, columns]
+    return launched(x, dt, b, c, parameters, laid, resets, dy, dfinal)
 
 
 def _summed_rows(tile, view, smem, family) -> None:
