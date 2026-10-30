@@ -37,7 +37,7 @@ import typing
 from collections.abc import Callable, Mapping, Sequence
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, ClassVar, Literal, Self, TypedDict, Union
+from typing import TYPE_CHECKING, Annotated, ClassVar, Literal, Required, Self, TypedDict, Union
 
 import jax
 import tyro
@@ -56,6 +56,7 @@ from dew.data.dataset import Loader, Ramp, Reader, ramped
 from dew.data.pipeline import Dataset, ObjectiveData
 from dew.distributed.placement import Layout, MeshSpec
 from dew.files import write_atomically
+from dew.interop.weights import AUTO
 from dew.lora import LoRA
 from dew.nn.dex import DifferentialExtension
 from dew.nn.kernels import generation
@@ -419,8 +420,11 @@ class SourceBuild(TypedDict, total=False):
 
 
 class SourceOptionsKeywords(SourcePlacement, SourceBuild, total=False):
-    """`Pretrained.load`'s keywords for a run's source: what it builds of it (`SourceOptions`) and
-    where it reads it (`SourcePlacement`, `RunConfig.source_keywords`)."""
+    """`Pretrained.load`'s keywords for a run's source: what it builds of it (`SourceOptions`), where
+    it reads it (`SourcePlacement`) and the dtype it stores its parameters in
+    (`RunConfig.source_keywords`)."""
+
+    param_dtype: Required[str]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1277,9 +1281,20 @@ class RunConfig:
 
     def source_keywords(self, *, frozen: bool) -> SourceOptionsKeywords:
         """`Pretrained.load`'s keywords for the source the run starts from: what it builds of it
-        (`source`) and where it reads it (`TrainerConfig.source_placement`, `frozen` where the run
-        keeps the source as it is). Every run kind that starts from a source loads it with these."""
-        return {**self.source.keywords(), **self.trainer.source_placement(frozen=frozen)}
+        (`source`), where it reads it (`TrainerConfig.source_placement`, `frozen` where the run
+        keeps the source as it is) and what it stores its parameters in. Every run kind that starts
+        from a source loads it with these.
+
+        A source the run trains is stored in its numerics' `dtypes.params`, the master weights its
+        updates land in. One it keeps frozen is stored as its checkpoint stores it
+        (`param_dtype='auto'`), since no update reaches it: a float32 copy of a bf16 checkpoint doubles
+        its memory and is cast back to bf16 every pass for nothing, while a cast to the compute dtype
+        would round the float32 tensors a bf16 checkpoint keeps (Mamba's `A_log`). A `dtypes.params`
+        narrower than float32 stores it so too."""
+        params = self.trainer.precision.dtypes.params
+        stored = AUTO if frozen and jax.numpy.dtype(params) == jax.numpy.float32 else params
+        return {**self.source.keywords(), **self.trainer.source_placement(frozen=frozen),
+                "param_dtype": stored}
 
     def source_attention(self) -> "AttentionImpl":
         """The attention implementation a run that starts from a source loads it with: its model's

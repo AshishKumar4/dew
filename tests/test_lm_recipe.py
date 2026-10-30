@@ -442,6 +442,35 @@ def test_a_pretrained_run_trains_a_lora_that_saves_from_the_run_alone(tmp_path):
         assert (tmp_path / "from-run" / name).read_bytes() == (tmp_path / "in-process" / name).read_bytes()
 
 
+@pytest.mark.parametrize("lora", [True, False], ids=["lora", "full"])
+def test_a_pretrained_run_stores_a_source_it_keeps_frozen_as_its_checkpoint_does(tmp_path, lora):
+    """A source a LoRA run keeps frozen is stored as its checkpoint stores it (`param_dtype='auto'`): no
+    update reaches it, so it holds no float32 master copy, and none of its tensors is rounded, a bf16
+    checkpoint's float32 tensors kept float32. A run that trains the source holds float32 master
+    weights (`dtypes.params`), as its factors do."""
+    from test_auto_storage import bf16_except
+
+    from dew.batch import FROZEN
+    from dew.interop import Pretrained
+
+    tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
+    checkpoint = tmp_path / "checkpoint"
+    bf16_except(export_tiny_decoder(tmp_path / "exported"), checkpoint, ("model.norm",))
+    adapter = ("--lora.rank", "4", "--lora.modules", "q_proj") if lora else ()
+    state = pretrained_config(tokens, checkpoint, "--trainer.steps", "1", "--max-new-tokens", "0",
+                              "--trainer.name", "stored", *adapter).run()
+    trained = jax.tree.leaves(state.variables["params"])
+    assert trained and all(leaf.dtype == jnp.float32 for leaf in trained)
+    if lora:
+        source = Pretrained.load(str(checkpoint), dtype="float32", param_dtype="auto",
+                                 attention_impl="reference")
+        stored = jax.tree.leaves(source.variables["params"])
+        assert {leaf.dtype for leaf in stored} == {jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float32)}
+        for before, after in zip(stored, jax.tree.leaves(state.variables[FROZEN]), strict=True):
+            assert after.dtype == before.dtype
+            np.testing.assert_array_equal(np.asarray(before), np.asarray(after))
+
+
 class Started(LMRunConfig):
     """A run that hands back the objective it would train, rather than training it."""
 

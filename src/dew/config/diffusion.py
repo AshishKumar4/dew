@@ -443,8 +443,7 @@ class DiffusionRunConfig(RunConfig):
         return load_diffusion_source(
             reference.name, revision=reference.revision,
             dtype=dtype_name(jax.numpy.dtype(self.compute_dtype())),
-            param_dtype=self.trainer.precision.dtypes.params,
-            attention_impl=self.source_attention(),
+            param_dtype=placement["param_dtype"], attention_impl=self.source_attention(),
             size=self.sample_field().shape[:-1],
             variables=variables, mesh=placement.get("mesh"), layout=placement.get("layout"),
             text_only=placement.get("text_only", False), prediction_depths=placement.get("prediction_depths"),

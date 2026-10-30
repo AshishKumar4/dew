@@ -353,9 +353,9 @@ class LMRunConfig(DecoderRunConfig):
             raise ValueError(f"--model.max_seq_len is {reach!r}; the context a checkpoint is reloaded at "
                              "is a number of tokens")
         reference = SourceReference.parse(self.pretrained)
-        # The checkpoint computes in the run's compute dtype and stores its parameters in its numerics'.
+        # The checkpoint computes in the run's compute dtype and stores its parameters as its source
+        # keywords say, by whether the run trains it.
         loaded = Pretrained.load(reference.name, dtype=jnp.dtype(self.compute_dtype()),
-                                 param_dtype=self.trainer.precision.dtypes.params,
                                  attention_impl=self.source_attention(),
                                  max_seq_len=reach, revision=reference.revision,
                                  # An adapter keeps its source as it is.
