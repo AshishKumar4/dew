@@ -210,9 +210,9 @@ def test_a_run_names_its_rows_streams_on_the_command_line_trains_and_serves_them
     rows = Memory([{"example": example} for example in examples(JOINT)[:8]]).read("memory").pipe(
         decisions).batch(8)
     flags = ["--pretrained", str(QWEN), "--segments",
-             json.dumps(to_record(JOINT.segments, tuple[Segment, ...])), "head:joint-shape", "--head.width", "16",
-             "--head.routing-layers", "1", "--head.layers", "1", "--head.heads", "2", "--head.feedforward",
-             "32", "--trainer.name", "streams",
+             json.dumps(to_record(JOINT.segments, tuple[Segment, ...])), "head:joint-shape",
+             "--head.width", "16", "--head.routing-layers", "1", "--head.layers", "1", "--head.heads", "2",
+             "--head.feedforward", "32", "--trainer.name", "streams",
              "--trainer.checkpoint-dir", str(tmp_path / "runs"), "--trainer.steps", "1",
              "--trainer.checkpoint-every", "1", "--trainer.eval-every", "None", "--trainer.multi-host",
              "False", "--trainer.compilation-cache-dir", "None", "--model.dtype", "float32"]
