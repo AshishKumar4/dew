@@ -850,3 +850,41 @@ def test_a_run_that_names_no_metrics_and_validates_nothing_trains(tmp_path):
                                  validation=None)
     assert config.val_metrics == ()
     assert int(config.run().step) == 2
+
+
+def test_a_packed_runs_record_loads_where_its_token_store_is_not(tmp_path):
+    """A run whose LM chain packs a token store (`presets.lm` with a pack and no tokenizer) loads from
+    its record where that store is not, as a run moved to a host whose data sits elsewhere does, and
+    trains there on the store its `--set` names: the store's document ends are read as its chain is,
+    not as its record is (row 2648)."""
+    tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=255)
+    packed = TokenFiles(tokens.train).pipe(presets.lm, None, seq_len=SEQ, batch=8)
+    LMRunConfig(data=packed).save(str(tmp_path / "saved"))
+    moved = tmp_path / "moved"
+    (tmp_path / "tokens").rename(moved)
+    saved = LMRunConfig.load(str(tmp_path / "saved"))
+    url = moved / Path(tokens.train).relative_to(tmp_path / "tokens")
+    config = LMRunConfig.cli(recipe_args(
+        tokens, "--set", f"data.source.url={url}", "--trainer.steps", "1",
+        "--trainer.name", "moved", "--max-new-tokens", "0",
+        model_config='{"emb_features": 16, "num_layers": 1, "num_heads": 2}'), default=saved)
+    assert int(config.run().step) == 1
+
+
+def test_packing_a_token_store_that_states_no_document_ends_refuses_as_it_is_read(tmp_path):
+    """A token store with neither a document index nor an EOS id reads as one document, whose pieces no
+    producer made, so its chain packed refuses as it is read, not as it is built: iterated, published
+    with its pack's plan, or packed by an objective (`ObjectiveData.pack`)."""
+    from dew.data.cache import Cache
+    from dew.data.compile import publish
+    from dew.data.pipeline import ObjectiveData, Pack
+
+    tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ)
+    store = TokenFiles(tokens.train)
+    packed = store.pipe(presets.lm, None, seq_len=SEQ, batch=8)
+    with pytest.raises(ValueError):
+        next(iter(packed))
+    with pytest.raises(ValueError):
+        publish(store.pipe(presets.lm, None, seq_len=SEQ, batch=None), Cache(str(tmp_path / "cache")))
+    with pytest.raises(ValueError):
+        compile(store.batch(8), objective=ObjectiveData(pack=Pack(SEQ + 1)))

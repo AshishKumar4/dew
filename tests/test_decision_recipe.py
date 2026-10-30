@@ -748,3 +748,42 @@ def test_a_lora_decision_runs_source_loads_onto_its_trainers_mesh():
     state = Trainer(objective, optax.sgd(0.1), key=jax.random.key(0), mesh=config.trainer.mesh,
                     layout=config.trainer.layout).place()[0]
     assert {id(leaf) for leaf in jax.tree.leaves(state.variables[FROZEN])} == {id(leaf) for leaf in base}
+
+
+def test_a_decision_run_that_ended_on_its_best_step_loads_there(tmp_path):
+    """A decision run that ends on the step it ranked best (`restore_best`), its best an earlier step than
+    its last (its validation loss, which it ranks by, lowest at its first step, a rate far past stable
+    driving it up after),
+    calibrates that
+    step, and `Decide.from_run` and `dew.pipeline` load the run there by default (`Decide.default_step`),
+    its calibration the step's own, answering a request; asked its latest, the run refuses a calibration
+    fitted on another step (row 2352)."""
+    from test_run_options import decision
+
+    import dew
+    from dew.checkpoints import Checkpoints
+    from dew.config import TrainerConfig
+    from dew.decision.questions import ChoiceAnswer
+    from dew.optim import OptimConfig
+
+    trainer = TrainerConfig(name="best", checkpoint_dir=str(tmp_path / "runs"), steps=3, log_every=1,
+                            eval_every=1, checkpoint_every=1, multi_host=False, compilation_cache_dir=None,
+                            restore_best=True)
+    optim = OptimConfig(learning_rate=10.0)
+    dataclasses.replace(decision(tmp_path, drawn=False), trainer=trainer, optim=optim).run()
+    directory = tmp_path / "runs" / "best"
+    with Checkpoints(str(directory)) as checkpoints:
+        best, latest = checkpoints.best, checkpoints.latest
+    assert best is not None and best < latest
+    question = {"team": Choice("which team", ["billing", "technical", "sales"])}
+    rows = [("the site is down", question)]
+    # The best step's answers: its weights and its calibration, as loading it by its number does.
+    expected = Decide.from_run(str(directory), step=best)(rows)[0]["team"]
+    assert Decide.default_step(str(directory)) == best
+    for task in (Decide.from_run(str(directory)), dew.pipeline(str(directory))):
+        assert isinstance(task, Decide)
+        answer = task(rows)[0]["team"]
+        assert isinstance(answer, ChoiceAnswer) and isinstance(expected, ChoiceAnswer)
+        assert np.array_equal(answer.probabilities, expected.probabilities)
+    with pytest.raises(ValueError):
+        Decide.from_run(str(directory), step=latest)

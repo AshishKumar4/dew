@@ -4,7 +4,8 @@
 # gate's container on armada carries its commit's history (.armada.json's history full) and is given BASE,
 # its commit's merge-base with main (the lanes' lint gate passes it), which origin/main then names. A
 # checkout that has origin/main is left as it is. One whose history lacks BASE fails, naming it: the
-# gates read no network, where a fetch of main failed lanes' lint (Main, 2026-10-28: curl 92 over HTTPS).
+# gates read no network, where a fetch of main failed lanes' lint (the maintainer, 2026-10-28: curl 92 over
+# HTTPS).
 set -e
 if git rev-parse -q --verify origin/main > /dev/null; then exit 0; fi
 base=${BASE:-origin/main}
