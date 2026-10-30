@@ -17,6 +17,7 @@ from dew.nn.backbones.decoder_block import REMAT_POLICIES
 from dew.objectives.lm import LMObjective
 from dew.telemetry.instrumentation import Compiles
 from dew.training import MeshSpec, Trainer
+from dew.training.planning import PlanRefused
 
 
 def deep(remat=None):
@@ -177,3 +178,30 @@ def test_a_run_over_a_tensor_axis_that_sets_its_remat_hears_its_derivation_canno
     assert compiles.count == 1 and trainer.plan["remat"] == "full"
     assert trainer.plan["derived"][-1]["label"] == "unknown"
     assert len([record for record in caplog.records if record.name == "dew.training.planning"]) == 1
+
+
+def test_a_compile_the_derivation_judged_otherwise_is_told_as_a_model_miss(monkeypatch, tmp_path, caplog):
+    """Every compile's plan record holds the headroom the derivation judged beside the one the compile
+    measured, and each compile whose fit the derivation judged otherwise is told as a model miss, the
+    compile deciding: with room between what the derivation and the compile say a step at full
+    recomputation needs, the run hears a miss for its first compile and one for each it judged so."""
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "sizing"))
+    free(monkeypatch, LIMIT)
+    sizing = deep(REMAT_POLICIES["full"])
+    compiled(sizing)
+    (measured,) = sizing.plan["probes"]
+    derived, compiled_need = LIMIT - measured["derived_headroom"], LIMIT - measured["headroom"]
+    assert derived != compiled_need
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "between"))
+    free(monkeypatch, (derived + compiled_need) // 2)
+    trainer = deep(REMAT_POLICIES["full"])
+    with caplog.at_level(logging.WARNING, logger="dew"), Compiles("step") as compiles:
+        if compiled_need > derived:
+            with pytest.raises(PlanRefused):
+                compiled(trainer)
+        else:
+            compiled(trainer)
+    missed = [record for record in caplog.records if "model miss" in record.getMessage()]
+    probes = (trainer.plan or {}).get("probes") or []
+    judged = [probe for probe in probes if (probe["derived_headroom"] >= 0) != probe["fits"]]
+    assert compiles.count >= 1 and missed and (not probes or len(missed) == len(judged))
