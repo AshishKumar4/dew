@@ -33,10 +33,10 @@ from pathlib import Path
 import numpy as np
 import torch
 from hf_reference import write_released_config
-from reference_source import config_lookups, hub_modules, padded_probe, record_padding
+from reference_source import config_lookups, hub_modules, record_padding, torch_generated, write_probes
 from torch_precision import float64_twin
 
-from dew.interop.verify import probe_ids, scatter_weights
+from dew.interop.verify import scatter_weights
 
 REPO, REVISION = 'IFM/K2-Horizon-0.9B', '383cb66347be'
 MOVA_REPO, MOVA_REVISION = 'IFM/K2-Horizon-MoVA-36B-A4B', 'cca48b6631d03c338a0e1d8beb0c392af8becbd3'
@@ -50,14 +50,6 @@ def remote(repo: str = REPO, revision: str = REVISION):
     _, modeling = hub_modules(f"k2_horizon_remote_{revision}", repo, revision,
                               ('configuration_k2_horizon.py', 'modeling_k2_horizon.py'))
     return modeling
-
-
-def logits(model, ids, mask=None, positions=None):
-    inputs = {'input_ids': torch.from_numpy(ids).long(), 'use_cache': False}
-    if mask is not None:
-        inputs.update(attention_mask=torch.from_numpy(mask), position_ids=torch.from_numpy(positions).long())
-    with torch.no_grad():
-        return model(**inputs).logits.numpy()
 
 
 MOVA = {'num_hidden_layers': 3, 'num_experts': 4, 'num_experts_per_tok': 2, 'moe_intermediate_size': 8,
@@ -86,16 +78,7 @@ def write_tiny(modeling, name: str = 'k2-horizon-tiny', fields=None) -> None:
     model = modeling.K2HorizonForCausalLM(config).float().eval()
     scatter_weights(model, 1234)
     model.save_pretrained(directory, safe_serialization=True)
-    ids = probe_ids(config.vocab_size)
-    mask, padded, positions = padded_probe(ids)
-    arrays = {'input_ids': ids, 'attention_mask': mask,
-              'logits': logits(model, ids), 'padded_logits': logits(model, padded, mask, positions)}
-    with torch.no_grad():
-        arrays['generated'] = model.generate(torch.from_numpy(ids[:, :4]).long(), do_sample=False,
-                                             max_new_tokens=6, eos_token_id=None, pad_token_id=0).numpy()
-    for name, array in arrays.items():
-        np.save(directory / f'{name}.npy', array)
-    print(f"{directory}: {sorted(path.name for path in directory.iterdir())}")
+    write_probes(directory, model, config.vocab_size, torch_generated)
 
 
 def write_recording(modeling, name: str = 'k2-horizon-tiny', flag: str = '--recording',

@@ -33,7 +33,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from huggingface_hub import hf_hub_download
-from reference_source import config_lookups, hub_modules, padded_probe, record_padding
+from reference_source import config_lookups, hub_modules, record_padding, torch_generated, write_probes
 from torch_precision import float64_twin
 
 REPO, REVISION = 'ByteDance/Ouro-1.4B', '574fa66cb8bf5abdc979642d01cf2b79b16bfab1'
@@ -65,7 +65,7 @@ def outputs(model, ids, mask=None, positions=None):
 
 
 def write_tiny(modeling) -> None:
-    from dew.interop.verify import probe_ids, scatter_weights
+    from dew.interop.verify import scatter_weights
 
     directory = FIXTURES / 'ouro-tiny'
     directory.mkdir(parents=True, exist_ok=True)
@@ -79,17 +79,7 @@ def write_tiny(modeling) -> None:
     scatter_weights(model, 1234)
     model = last_pass(model)
     model.save_pretrained(directory, safe_serialization=True)
-    ids = probe_ids(config.vocab_size)
-    mask, padded, positions = padded_probe(ids)
-    arrays = {'input_ids': ids, 'attention_mask': mask}
-    arrays['logits'], _ = outputs(model, ids)
-    arrays['padded_logits'], _ = outputs(model, padded, mask, positions)
-    with torch.no_grad():
-        arrays['generated'] = model.generate(torch.from_numpy(ids[:, :4]).long(), do_sample=False,
-                                             max_new_tokens=6, eos_token_id=None, pad_token_id=0).numpy()
-    for name, array in arrays.items():
-        np.save(directory / f'{name}.npy', array)
-    print(f"{directory}: {sorted(path.name for path in directory.iterdir())}")
+    write_probes(directory, model, config.vocab_size, torch_generated)
 
 
 def write_recording(modeling) -> None:
