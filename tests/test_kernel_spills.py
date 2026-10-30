@@ -152,6 +152,7 @@ none where it is empty."""
 
 SCOPED = """
 import json, sys
+from dew.nn.kernels.generation import assumed
 from dew.nn.kernels.templates import report
 from dew.training.ahead import AheadOfTime, handed
 
@@ -159,12 +160,13 @@ step = AheadOfTime.load(sys.argv[1])
 identity, config, names = step.refusals[0]
 foreign = (identity, config, frozenset({"another kernel"}))
 report.refuse([foreign])
-with handed(step):
+with assumed(step.target), handed(step):
     within = report.refused_launches()
 print(json.dumps({"within": sorted(map(repr, within)), "step": sorted(map(repr, step.refusals)),
                   "after": repr(foreign) in map(repr, report.refused_launches())}))
 """
-"""A process that refused a launch of another program, handed the step compiled ahead at argv[1]."""
+"""A process on the step's GPU (`AheadOfTime.target`) that refused a launch of another program, handed the
+step compiled ahead at argv[1]."""
 
 
 @lowers("sm90")
@@ -195,6 +197,44 @@ def pickle_load(path):
     return AheadOfTime.load(path).refusals
 """
 """What the scripts share: the refusals a saved step carries."""
+
+
+@pytest.mark.gpu(reason="hands a step compiled ahead for the canonical H100 to a run on this host's H100")
+@lowers("sm90")
+def test_a_run_handed_a_step_compiled_ahead_for_another_h100_takes_it(tmp_path, nonce):
+    """A run in a fresh process handed a step compiled ahead for the canonical H100, whose launch's first
+    tile spilled, on this host's H100, which may count other multiprocessors (an H100 PCIe's 114 against
+    132), lowers the saved program: it derives its launches for the target the step was compiled for
+    (`AheadOfTime.target`), within the step's refusals, and trains from it, its plan's first compile
+    the step compiled ahead (ledger 2453)."""
+    step = str(tmp_path / "step.dew-aot")
+    spilled(tmp_path, PRELUDE + AHEAD, str(nonce), step, "fresh")
+    handed = spilled(tmp_path, PRELUDE + HANDED, str(nonce), step)
+    assert handed["step"] == 1 and handed["ahead"] is True
+
+
+def test_a_handed_step_derives_for_its_target_on_a_gpu_that_runs_it_alone():
+    """While a step compiled ahead is reproduced (`handed`), its launches derive for the GPU it was
+    compiled for (`AheadOfTime.target`), where this process's GPU is of its generation and holds a
+    block's shared memory its launches take, however many multiprocessors it counts; outside, the
+    process's own facts. A GPU of another generation, or one holding less shared memory a block, is
+    refused (ledger 2453)."""
+    import dataclasses
+
+    from dew.nn.kernels.generation import assumed, gpu_target
+    from dew.training.ahead import AheadOfTime, handed
+
+    canonical = gpu_target("sm90")
+    step = AheadOfTime("sm90", 1, {}, "", b"", (), None, 0, 0, 0, 0, 0, {}, canonical)
+    pcie = dataclasses.replace(canonical, device_kind="NVIDIA H100 PCIe", multiprocessors=114)
+    with assumed(pcie):
+        with handed(step):
+            assert gpu_target() == canonical
+        assert gpu_target() == pcie
+    smaller = dataclasses.replace(pcie, shared_limit=canonical.shared_limit - 1)
+    for other in (gpu_target("sm80"), smaller):
+        with assumed(other), pytest.raises(ValueError), handed(step):
+            pass
 
 
 def test_a_program_runs_the_executable_its_calls_kernel_choice_traces():
