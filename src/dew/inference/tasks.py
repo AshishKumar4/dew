@@ -13,11 +13,12 @@ delete those buffers while the task is using them.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import functools
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, Self
+from typing import TYPE_CHECKING, ClassVar, Concatenate, Literal, Protocol, Self
 
 import jax
 import jax.numpy as jnp
@@ -37,6 +38,8 @@ from dew.inference.projections import packed_owned
 from dew.interop.sources import SourceReference
 from dew.interop.weights import decoding_storage
 from dew.nn.inputs import Media, ModelInputs, default_placement, mesh_of, request_key
+from dew.nn.kernels import generation
+from dew.nn.precision import Numerics
 from dew.nn.protocols import Bounded, CacheCapacity, TokenModel, refuse_prefix
 from dew.objectives.base import UNREAD, Objective
 from dew.sampling import decoding, vocabulary
@@ -288,6 +291,22 @@ class SavedRun:
     record: Mapping[str, object]
     step: int
 
+    @property
+    def precision(self) -> Numerics | None:
+        """The numerics the run's step trained in (`Objective.inference_record`,
+        `dew.nn.precision.Numerics`); None for a record written before it named them."""
+        from dew.registry import from_record
+
+        recorded = self.record.get("precision")
+        return None if recorded is None else from_record(Numerics, named_fields(recorded, "precision"))
+
+    def formed[TaskT](self, task: TaskT) -> TaskT:
+        """`task`, built from this run (`from_saved`), under the numerics its step trained in where it
+        traces under them (`InItsForm`); a task of another class reads `precision` itself."""
+        if not isinstance(task, InItsForm) or task.precision == self.precision:
+            return task
+        return replace(task, precision=self.precision)
+
     @classmethod
     def pinned(cls, directory: str, step: int | str | None = None, trust: Sequence[str] = ()) -> SavedRun:
         """The selected checkpoint of the run in `directory`, its latest or `step`. A task loaded
@@ -308,7 +327,7 @@ class SavedRun:
             raise ValueError(f"this run's checkpoints describe no model to load: {record['unrecorded']}")
         objective = objectives[named(record['objective'], 'objective')]
         declared = frozenset() if objective.settings is None else settings_fields(objective.settings)
-        stray = set(record) - {'objective', 'model', UNREAD, *declared}
+        stray = set(record) - {'objective', 'model', 'precision', UNREAD, *declared}
         if stray:
             raise ValueError(f"this {objective.__name__} run records fields its objective does not write: "
                              f"{sorted(stray)}")
@@ -344,10 +363,42 @@ class SavedRun:
         return objective.model_tree(variables)
 
 
+@dataclass(frozen=True, kw_only=True)
+class InItsForm:
+    """A task whose calls trace under the numerics its run trained in (`precision`, `traced`),
+    as Dew's saved tasks do: a task built from a run (`SavedRun.formed`) takes the form the run's record
+    names, and a task built otherwise, a preview's during its run's fit, traces in the form chosen
+    around it."""
+
+    precision: Numerics | None = None
+    """The run's numerics its calls trace under (`dew.nn.precision.Numerics`), as the loaded step was
+    trained under them (`Objective.inference_record`): its products' precision and its ops' forms;
+    None traces under the numerics in effect around the call."""
+
+    def traced(self) -> contextlib.AbstractContextManager[None]:
+        """The block a call of this task traces in: its run's numerics (`generation.run_precision`), which
+        JAX keys its trace and compile caches on, so another policy's task traces its own programs."""
+        if self.precision is None:
+            return contextlib.nullcontext()
+        return generation.run_precision(self.precision)
+
+
+def traced_in_its_form[TaskT: InItsForm, **P, R](
+        call: Callable[Concatenate[TaskT, P], R]) -> Callable[Concatenate[TaskT, P], R]:
+    """`call`, a method of a task or its helper, traced under its run's numerics (`InItsForm.traced`),
+    on whichever thread runs it."""
+    @functools.wraps(call)
+    def traced(task: TaskT, *arguments: P.args, **keywords: P.kwargs) -> R:
+        with task.traced():
+            return call(task, *arguments, **keywords)
+    return traced
+
+
 class SavedRunTask:
     """A task a saved run loads as (`dew.objectives.base.SavedTask`): `from_run` pins the run's checkpoint
     once (`SavedRun.pinned`) and builds the task from it with the class's `from_saved`, which
-    `dew.pipeline` and `dew export` call on the run they pinned themselves."""
+    `dew.pipeline` and `dew export` call on the run they pinned themselves, in the attention form its run
+    trained in where the task traces in one (`InItsForm`, `SavedRun.formed`)."""
 
     if TYPE_CHECKING:
         @classmethod
@@ -356,15 +407,25 @@ class SavedRunTask:
                        param_dtype: DTypeLike | None = None) -> Self: ...
 
     @classmethod
+    def default_step(cls, directory: str) -> int | None:
+        """The step this task loads of the run in `directory` where none is asked: its latest (None),
+        unless the task names one it was fitted on (`Decide`'s calibration, of a run that ended on its
+        best step)."""
+        del directory
+        return None
+
+    @classmethod
     def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
                  mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
                  dtype: DTypeLike | None = None, param_dtype: DTypeLike | None = None,
                  trust: Sequence[str] = ()) -> Self:
-        """Load the run in `directory` as this task (`from_saved`), at its latest checkpoint or at
-        `step`. `trust` names the packages outside Dew the run's record may import, as
-        `trust_remote_code` does in transformers."""
-        return cls.from_saved(SavedRun.pinned(directory, step, trust), ema=ema, mesh=mesh, layout=layout,
-                              dtype=dtype, param_dtype=param_dtype)
+        """Load the run in `directory` as this task (`from_saved`), at the step it loads by default
+        (`default_step`) or at `step`. `trust` names the packages outside Dew the run's record may
+        import, as `trust_remote_code` does in transformers."""
+        step = cls.default_step(directory) if step is None else step
+        run = SavedRun.pinned(directory, step, trust)
+        return run.formed(cls.from_saved(run, ema=ema, mesh=mesh, layout=layout, dtype=dtype,
+                                         param_dtype=param_dtype))
 
 
 _EARLIER_AUTOENCODERS = {
@@ -388,9 +449,10 @@ def earlier_shapes(record: Mapping[str, object]) -> Mapping[str, object]:
     and refused where it holds more than its name and fields (ledger 1239),
     a processor's source as its encoded string (ledger 1641), a Qwen or MiMo projector's earlier
     fields, a decoder's or kind's YaRN field beside its rope scaling and a decoder's cross-attention
-    by its fields alone (`_earlier_model`, ledgers 1622, 1898 and 2320), and a row of segments'
-    question budgets, which it ignored and an earlier record wrote at their defaults (row 2006). A
-    record in today's shapes passes as it is. Carried to 1.0, when it is deleted (ledger 1552)."""
+    by its fields alone (`earlier_model`, ledgers 1622, 1898 and 2320), and a row of segments'
+    question budgets, which it ignored and an earlier record wrote at their defaults (row 2006), and a
+    step's attention form, which its numerics' forms hold now (row 2500). A record in today's shapes
+    passes as it is. Carried to 1.0, when it is deleted (ledger 1552)."""
     current = dict(record)
     for key in ("head", "layout"):
         held = record.get(key)
@@ -431,8 +493,11 @@ def earlier_shapes(record: Mapping[str, object]) -> Mapping[str, object]:
         from dew.registry import to_record
 
         current["processor"] = to_record(SourceReference.parse(processor), SourceReference)
+    if "attention_form" in current:
+        # The form a step trained in, which its numerics' forms hold now (ledger 2500).
+        current["precision"] = {"forms": current.pop("attention_form")}
     if "model" in current:
-        current = _earlier_model(current)
+        current = earlier_model(current)
     return current
 
 
@@ -441,7 +506,7 @@ _DECODER = ("dew.nn.backbones.causal_transformer:CausalTransformer", "causal_tra
 """The decoder's import path and its registry alias, either of which a record names it by."""
 
 
-def _earlier_model(record: Mapping[str, object]) -> Mapping[str, object]:
+def earlier_model(record: Mapping[str, object]) -> Mapping[str, object]:
     """A record's model with each component in today's fields (`earlier_shapes`), wherever the model
     nests it through another recorded wrapper: a Qwen or MiMo projector's earlier fields (ledger 1622),
     and a decoder's and its layer kinds' YaRN field beside their rope scaling (`_one_scaling`, ledger
@@ -477,14 +542,18 @@ def _earlier_model(record: Mapping[str, object]) -> Mapping[str, object]:
 
 
 def _declared_decoders(name: str, fields: Mapping[str, object]) -> Mapping[str, object]:
-    """The fields of the component class `name` with each decoder its fields declare
-    (`dew.registry.declared_type`) and record as their fields alone translated (`_decoder_fields`)."""
+    """The fields of the component class `name`, by import path or by its alias of any kind (a mixer's
+    `attention`), with each decoder its fields declare (`dew.registry.declared_type`) and record as
+    their fields alone translated (`_decoder_fields`); unchanged where `name` names no one class."""
     from dew.nn.backbones.causal_transformer import CausalTransformer
-    from dew.registry import declared_type, imported, models
+    from dew.registry import KINDS, declared_type, imported
 
-    owner = models[name] if name in models.paths else imported(name)
-    if not isinstance(owner, type):
+    named = [imported(name)] if ":" in name else [imported(kind.paths[name]) for kind in KINDS
+                                                   if name in kind.paths]
+    classes = [member for member in named if isinstance(member, type)]
+    if len(classes) != 1:
         return fields
+    (owner,) = classes
     return {field: (_decoder_fields(value) if isinstance(value, Mapping) and "class" not in value
                     and declared_type(owner, field) is CausalTransformer else value)
             for field, value in fields.items()}
@@ -666,7 +735,7 @@ def held(variables: Variables) -> Variables:
                          if isinstance(leaf, (np.ndarray, np.generic)) else leaf, in_place=False)
 
 
-class _NativeTextTask(SavedRunTask):
+class _NativeTextTask(SavedRunTask, InItsForm):
     """The lifecycle Dew's three text tasks share, over their own `model`,
     `variables` and `processor`: frozen weights, rebinding, loading a run
     (`SavedRunTask`), and the row decoder their generations carry. Each task
@@ -861,6 +930,7 @@ class TextGeneration(_NativeTextTask):
         return cls(model, variables, processor, sampling=settings.sampling,
                    max_new_tokens=settings.max_new_tokens or None, prefix=settings.prefix)
 
+    @traced_in_its_form
     def __call__(self, request: Request, max_new_tokens: int | None = None, *,
                  key: int | jax.Array, n: int | None = None,
                  sampling: Sampling | None = None, images: Media | None = None,
@@ -945,6 +1015,7 @@ class BlockGeneration(_NativeTextTask):
 
 
 
+    @traced_in_its_form
     def __call__(self, request: Request, max_new_tokens: int | None = None, *,
                  key: int | jax.Array, n: int | None = None,
                  process: BlockProcess | None = None, images: Media | None = None) -> CanvasGeneration:
@@ -1035,6 +1106,7 @@ class MaskedGeneration(_NativeTextTask):
 
 
 
+    @traced_in_its_form
     def __call__(self, request: Request, max_new_tokens: int | None = None, *,
                  key: int | jax.Array, n: int | None = None,
                  steps: int | None = None, images: Media | None = None) -> CanvasGeneration:

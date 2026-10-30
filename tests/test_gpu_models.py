@@ -4,8 +4,8 @@ of its own, run through it in one process (`gpu_flow`), each cell its own file's
 - A causal transformer's cached prompt reads its cache as the uncached forward does, through
   FlashAttention; a layer naming cuDNN takes a packed batch as its document mask, decodes plain steps
   and prefills a padded batch through it (test_causal_transformer).
-- A float32 decoder multiplies float32 products at the GPU's own precision, TF32, as transformers does
-  (test_hf_decoders).
+- A float32 decoder under a run's accurate precision policy is as exact as transformers' float32 on a
+  GPU, JAX's TF32 default cleared (test_hf_decoders).
 - ModernBERT's states in bf16 on the kernels it selects, cuDNN on its global layers
   (test_hf_modernbert).
 - A weight push whose replica refuses its join aborts its NCCL group (test_rollout_servers).
@@ -44,8 +44,8 @@ def test_the_models_run_their_gpu_kernels(rng, without_deterministic_ops):
         Cell("a padded prefill attends through cuDNN",
              lambda: causal.a_padded_prefill_attends_through_cudnn_where_it_runs(
                  rng, without_deterministic_ops)),
-        Cell("a float32 decoder multiplies float32 products (TF32) as transformers does",
-             decoders.a_float32_decoder_multiplies_float32_products_on_a_gpu),
+        Cell("a float32 decoder under the accurate policy is as exact as transformers",
+             decoders.a_float32_decoder_under_the_accurate_policy_is_as_exact_as_transformers_on_a_gpu),
         Cell("ModernBERT's states in bf16 on its GPU kernels",
              lambda: modernbert.modernbert_states_in_bf16_on_the_gpu_kernels(without_deterministic_ops)),
         Cell("a push whose replica refuses its join aborts its NCCL group",

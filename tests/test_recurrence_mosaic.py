@@ -1,5 +1,5 @@
 """The recurrence template's Mosaic GPU mainloop (`dew.nn.kernels.templates.recurrence.mainloop`) through the
-chunked op's explicit route (`recurrence_chunk.chunk(..., mainloop='mosaic')`), compiled on a GPU of an
+chunked op with the template named to its selectors (`chunk_on('mosaic_gpu', ...)`), compiled on a GPU of an
 instruction family one of its bundles claims (mma.sync, wgmma): check 1 (`reference_error.assert_as_exact`) of
 its output and final memory against its reference's (the recurrence a token at a time,
 `test_recurrence_chunk.token_by_token`, in an fp32 call, the fla port in a 16-bit one), both from float64,
@@ -29,7 +29,8 @@ from test_recurrence_chunk import (
 )
 
 from dew.nn.kernels import generation, recurrence
-from dew.nn.kernels.recurrence_chunk import Chunk, chunk, mosaic_rule
+from dew.nn.kernels.recurrence_chunk import Chunk, mosaic_rule
+from dew.nn.kernels.selection import KernelRefused
 from dew.nn.kernels.templates import bundles, mosaic, product, report, resources
 from dew.nn.kernels.templates.base import Unfitted
 from dew.nn.kernels.templates.recurrence import mainloop, template
@@ -176,24 +177,25 @@ def taken(given: Chunk, hooks: recurrence.Hooks) -> bool:
     return template.MOSAIC.eligible(template_call(given, hooks), template.Mosaic.launched())
 
 
-REFUSED = (Unfitted, NotImplementedError)
-"""The template's refusals: no config whose launches the device holds, or a call its mainloop does not
-take (a decay a key dimension without a floor its sub-chunks factor under)."""
+REFUSED = (Unfitted, NotImplementedError, KernelRefused)
+"""The template's refusals: no config whose launches the device holds, a call its mainloop does not take
+(a decay a key dimension without a floor its sub-chunks factor under), or a requirement of its route's the
+named template fails (`selection.KernelRefused`)."""
 
 
 def on_the_mainloop(hooks: recurrence.Hooks, case: str, dtype):
     """The chunked op on the mainloop for `case`'s calls in `dtype`: through the template's route where it
-    takes them (`chunk(..., mainloop='mosaic')`, at its derived tiles); else, the route refusing them (a
-    launch's registers past a thread's), the mainloop's rule at its narrowest value block, one chunk in
-    flight (`mosaic_rule`), whose arithmetic is the same at any tiles. None where the mainloop's rule refuses
-    the call too (checked): an fp32 call's decay a key dimension (`mainloop.per_key_refusal`); and on a GPU
-    where its launches at those tiles pass the device's shared memory (an fp32 call's solve on an A100's
-    block), whose arithmetic the CPU interprets."""
+    takes them (`chunk_on('mosaic_gpu', ...)`, the template named to the selectors, at its derived tiles);
+    else, the route refusing them (a launch's registers past a thread's), the mainloop's rule at its narrowest
+    value block, one chunk in flight (`mosaic_rule`), whose arithmetic is the same at any tiles. None where
+    the mainloop's rule refuses the call too (checked): an fp32 call's decay a key dimension
+    (`mainloop.per_key_refusal`); and on a GPU where its launches at those tiles pass the device's shared
+    memory (an fp32 call's solve on an A100's block), whose arithmetic the CPU interprets."""
     (operands,) = draw(dtype, 0, **geometry(case))
     if taken(operands, hooks):
-        return functools.partial(chunk, hooks, mainloop='mosaic')
+        return functools.partial(chunk_on, 'mosaic_gpu', hooks)
     with pytest.raises(REFUSED):
-        jax.eval_shape(functools.partial(chunk, hooks, mainloop='mosaic'), operands)
+        jax.eval_shape(functools.partial(chunk_on, 'mosaic_gpu', hooks), operands)
     family = mainloop.family_of() or mainloop.INTERPRETED
     if SHAPES[case].get('per_key') and mainloop.per_key_refusal(dtype, hooks.floor):
         # The portable math's arm is test_recurrence_chunk's.
@@ -395,8 +397,8 @@ def test_a_16bit_delta_rule_whose_form_proves_no_range_takes_another_kernel():
 
     drawn = diverging()
     hooks = recurrence.Hooks(decay='scalar', scale=drawn.key.shape[-1] ** -0.5)
-    with pytest.raises(NotImplementedError):
-        jax.eval_shape(functools.partial(chunk, hooks, mainloop='mosaic'), drawn)
+    with pytest.raises(REFUSED):
+        jax.eval_shape(functools.partial(chunk_on, 'mosaic_gpu', hooks), drawn)
     operands = (drawn.query, drawn.key, drawn.value, drawn.log_decay, drawn.beta, drawn.state)
     with generation.assumed('sm90'):
         unproven = port_kernel(*operands, report=False)
@@ -431,7 +433,7 @@ def test_the_solve_holds_a_negative_eigenvalue_rules_inverse():
             return found[0] if isinstance(found, tuple) else found
         return run
 
-    assert_as_exact(output(functools.partial(chunk, hooks, mainloop='mosaic')),
+    assert_as_exact(output(functools.partial(chunk_on, 'mosaic_gpu', hooks)),
                     output(functools.partial(chunk_on, 'fla', hooks)), draw,
                     "the template's solve under write gates near two", seeds=SEEDS,
                     truth_fn=output(functools.partial(token_by_token, hooks)))
@@ -494,9 +496,9 @@ def every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_token_by_
     (sample,) = hooked_draw(hooks, packed, 0)
     if not taken(sample, hooks):
         with pytest.raises(REFUSED):
-            jax.eval_shape(functools.partial(chunk, hooks, mainloop='mosaic'), sample)
+            jax.eval_shape(functools.partial(chunk_on, 'mosaic_gpu', hooks), sample)
         return
-    dew = jax.jit(functools.partial(chunk, hooks, mainloop='mosaic'))
+    dew = jax.jit(functools.partial(chunk_on, 'mosaic_gpu', hooks))
     reference = jax.jit(functools.partial(token_by_token, hooks))
     assert_as_exact(dew, reference, functools.partial(hooked_draw, hooks, packed),
                     f'the mosaic forward, {hooks} packed={packed}', seeds=HOOK_SEEDS[hooks, packed])

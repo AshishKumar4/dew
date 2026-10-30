@@ -23,10 +23,11 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.attention import AttentionImpl
-from dew.nn.dex import LayerDex
+from dew.nn.dex import DexStart, LayerDex
 from dew.nn.kv_cache import KVCache
 from dew.nn.ngpt import NGPT
 from dew.nn.rope import Scaling
+from dew.nn.value_experts import ValueExperts
 
 QKV_RESIDUALS = ('q_proj', 'k_proj', 'v_proj', 'kv_proj')
 ATTENTION_RESIDUALS = (*QKV_RESIDUALS, 'o_proj')
@@ -138,13 +139,23 @@ class MixerContext:
     rotated query and key head, scales the query by its learned gain, scales the output gate's
     logits by theirs and unit-norms its gated output; None for none."""
     output_gate: bool = False
-    dex: LayerDex | None = None
-    """The layer's differential extension on its chosen heads' outputs (`dew.nn.dex`), or None."""
     """The attention's output gate (Qwen3.5's attn_output_gate), where the
     kind's projection doubles its query and a sigmoid of the second half
     gates the branch. The delta net's own gate activation is a field of its
     kind (qwen4_exp's output_gate_type), which is the only gate a reference
     varies."""
+    output_gate_activation: str = 'sigmoid'
+    """What the output gate passes its logits through: 'sigmoid' (Qwen3.5's), 'silu', or 'softplus2',
+    softplus at beta log 2, log2(1 + 2^x) (K2 Horizon's `attention_gate_func`)."""
+    value_experts: ValueExperts | None = None
+    """The layer's routed value experts in place of its value projection (`dew.nn.value_experts`, K2
+    Horizon's MoVA), or None."""
+    dex: LayerDex | None = None
+    """The layer's differential extension on its chosen heads' outputs (`dew.nn.dex`), or None."""
+    dex_start: DexStart | None = None
+    """What the layer's extension holds from its start, its heads and `lambda_init`, which its
+    variables keep (`dew.nn.dex.DEX_CONSTANTS`); None for a layer without one, or one built only to
+    run variables that hold them."""
     init_std: float | None = None
     """The normal std the mixer's projections draw from; None keeps each
     module's own initializer (`CausalTransformer.initializer_range`)."""
@@ -165,6 +176,8 @@ class MixerContext:
             "attention_dropout_rate": bool(self.attention_dropout_rate),
             "narrow_rotary_tables": self.narrow_rotary_tables,
             "ngpt": self.ngpt is not None,
+            "output_gate_activation": self.output_gate_activation != 'sigmoid',
+            "value_experts": self.value_experts is not None,
         }
 
     def refuse(self, kind: str, asked: Mapping[str, object], why: str) -> None:

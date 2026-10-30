@@ -58,7 +58,7 @@ class Walking(Protocol):
     None, as `dew.interop.PretrainedMaskedDecoder` does (`masked_recipe`)."""
 
     @property
-    def masked_recipe(self) -> tuple[Confident, int, int] | None: ...
+    def masked_recipe(self) -> tuple[Unmask | Confident, int, int | None] | None: ...
 
 
 class MaskedDiffusionObjective(HeadedObjective[Ratio | RoutedStatistics, Variables]):

@@ -177,7 +177,7 @@ def test_a_kinds_run_set_on_the_command_line_pools_logs_scores_and_keeps_as_set(
     runs = tmp_path / "runs"
     settings = {"trainer.name": "set", "trainer.checkpoint_dir": str(runs), "trainer.steps": "4",
                 "trainer.accumulation": "2", "trainer.log_every": "1", "trainer.eval_every": "1",
-                "trainer.checkpoint_every": "1", "trainer.keep": "4", "trainer.dynamic_scale": "True",
+                "trainer.checkpoint_every": "1", "trainer.keep": "4", "model.dtype": "float16",
                 "trainer.multi_host": "False", "trainer.compilation_cache_dir": "None",
                 "optim.learning_rate": str(RATE), "val_metrics": "[]",
                 "val_summaries": json.dumps([{"name": "board", "weights": {"val/loss": 1},
@@ -187,7 +187,12 @@ def test_a_kinds_run_set_on_the_command_line_pools_logs_scores_and_keeps_as_set(
     run = runs / "set"
     logged = scalars(run)
     assert {step for step, row in logged.items() if "train/loss" in row} == {1, 2, 3, 4}
-    assert sorted(step for step, row in logged.items() if "train/grad_norm" in row) == [2, 4]
+    committed = sorted(step for step, row in logged.items() if "train/grad_norm" in row)
+    # Its model computes in float16, which scales the loss (`DynamicScale`): a commit whose gradients
+    # overflow skips its update and lowers the scale, as a loaded backbone's first may.
+    assert set(committed) <= {2, 4} and 4 in committed
+    if 2 not in committed:
+        assert logged[2]["train/loss_scale"] < logged[1]["train/loss_scale"]
     for step in (1, 2, 3, 4):
         row = logged[step]
         # The optimizer holds its rate in float32, which the log reads back.
@@ -201,10 +206,12 @@ def test_a_kinds_run_set_on_the_command_line_pools_logs_scores_and_keeps_as_set(
 
 def trained(run: RunConfig, root: Path, name: str, **fields):
     """`run` trained one step from Python (`prepare().train`) over a mesh of four data shards by two
-    fsdp shards, its trainer the fields given: its state, and its step's scalars."""
-    trainer = TrainerConfig(checkpoint_dir=str(root / "runs"), steps=1, log_every=1, eval_every=None,
-                            checkpoint_every=None, checkpoint_final=False, multi_host=False,
-                            mesh=MeshSpec(fsdp=2), layout=Layout(min_shard=64), **fields.pop("trainer", {}))
+    fsdp shards, its trainer the fields given, over its defaults here: its state, and its step's
+    scalars."""
+    trainer = TrainerConfig(**{"checkpoint_dir": str(root / "runs"), "steps": 1, "log_every": 1,
+                               "eval_every": None, "checkpoint_every": None, "checkpoint_final": False,
+                               "multi_host": False, "mesh": MeshSpec(fsdp=2), "layout": Layout(min_shard=64),
+                               **fields.pop("trainer", {})})
     state = dataclasses.replace(run, trainer=trainer, **fields).prepare().train(name)
     return state, scalars(root / "runs" / name)[1]
 

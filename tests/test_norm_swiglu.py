@@ -813,3 +813,17 @@ def test_c53_gradients_are_as_close_to_float64_as_xla_and_measured_liger(operati
             actual, reference, truth, LIGER_RMS_ERRORS[operation], strict=True)):
         floor = 4 * np.finfo(np.float32).eps * np.sqrt(np.mean(np.square(want)))
         assert distance(mine, want) <= min(distance(theirs, want), measured) + floor, (operation, index)
+
+
+def test_a_context_choice_of_the_norm_forces_it_over_a_calls_own():
+    """A per-call implementation is the call's own preference: an explicit xla norm runs as ever, and a
+    context that chooses the Pallas norm (`generation.chosen`) forces it over the call's own, so where the
+    Pallas norm cannot take the call (a row past its 8192-feature register tile) it refuses the call rather
+    than running the call's xla in silence (row 959)."""
+    from dew.nn.kernels import generation, selection
+
+    x = jnp.ones((2, 16384), jnp.float32)
+    scale = jnp.ones((16384,), jnp.float32)
+    norm_swiglu.rms_kernel('xla', x, scale, jnp.float32, fp32_statistics=True)
+    with generation.chosen(rms_norm='pallas'), pytest.raises(selection.KernelRefused):
+        norm_swiglu.rms_kernel('xla', x, scale, jnp.float32, fp32_statistics=True)

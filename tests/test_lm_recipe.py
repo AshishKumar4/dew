@@ -393,22 +393,17 @@ def test_fresh_processes_train_a_runs_record_and_export_it(tmp_path):
 
 
 def test_a_pretrained_run_stores_its_parameters_in_the_dtype_it_names(tmp_path):
-    """`--pretrained-param-dtype bfloat16` loads the checkpoint's parameters
-    as bf16 and trains them so, and the run records it; with no
-    `--pretrained` the field is refused rather than ignored."""
+    """`--trainer.precision.dtypes.params bfloat16` loads the checkpoint's parameters as bf16 and
+    trains them so, and the run records it with its numerics."""
     tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
     checkpoint = export_tiny_decoder(tmp_path / "checkpoint")
     config = pretrained_config(tokens, checkpoint, "--trainer.steps", "1", "--max-new-tokens", "0",
-                               "--trainer.name", "bf16", "--pretrained-param-dtype", "bfloat16")
+                               "--trainer.name", "bf16", "--trainer.precision.dtypes.params", "bfloat16")
     state = config.run()
     params = jax.tree.leaves(state.variables["params"])
     floating = [leaf for leaf in params if jnp.issubdtype(leaf.dtype, jnp.floating)]
     assert floating and all(leaf.dtype == jnp.bfloat16 for leaf in floating)
-    record = json.loads((tmp_path / "runs" / "bf16" / "run.json").read_text())["fields"]
-    assert record["pretrained_param_dtype"] == "bfloat16"
-    with pytest.raises(ValueError):
-        LMRunConfig.cli(recipe_args(tokens, "--pretrained-param-dtype", "bfloat16"),
-                        default=LMRunConfig(data=windows(tokens)))
+    assert LMRunConfig.load(str(tmp_path / "runs" / "bf16")).trainer.precision.dtypes.params == "bfloat16"
 
 
 def test_a_pretrained_run_trains_a_lora_that_saves_from_the_run_alone(tmp_path):
@@ -445,6 +440,51 @@ def test_a_pretrained_run_trains_a_lora_that_saves_from_the_run_alone(tmp_path):
     run.adapter.save(run.variables, tmp_path / "from-run")
     for name in ("adapter_config.json", "adapter_model.safetensors"):
         assert (tmp_path / "from-run" / name).read_bytes() == (tmp_path / "in-process" / name).read_bytes()
+
+
+@pytest.mark.parametrize("lora", [True, False], ids=["lora", "full"])
+def test_a_pretrained_run_stores_a_source_it_keeps_frozen_as_its_checkpoint_does(tmp_path, lora):
+    """A source a LoRA run keeps frozen is stored as its checkpoint stores it (`param_dtype='auto'`): no
+    update reaches it, so it holds no float32 master copy, and none of its tensors is rounded, a bf16
+    checkpoint's float32 tensors kept float32. A run that trains the source holds float32 master
+    weights (`dtypes.params`), as its factors do."""
+    from test_auto_storage import bf16_except
+
+    from dew.batch import FROZEN
+    from dew.interop import Pretrained
+
+    tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
+    checkpoint = tmp_path / "checkpoint"
+    bf16_except(export_tiny_decoder(tmp_path / "exported"), checkpoint, ("model.norm",))
+    adapter = ("--lora.rank", "4", "--lora.modules", "q_proj") if lora else ()
+    state = pretrained_config(tokens, checkpoint, "--trainer.steps", "1", "--max-new-tokens", "0",
+                              "--trainer.name", "stored", *adapter).run()
+    trained = jax.tree.leaves(state.variables["params"])
+    assert trained and all(leaf.dtype == jnp.float32 for leaf in trained)
+    if lora:
+        source = Pretrained.load(str(checkpoint), dtype="float32", param_dtype="auto",
+                                 attention_impl="reference")
+        stored = jax.tree.leaves(source.variables["params"])
+        assert {leaf.dtype for leaf in stored} == {jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float32)}
+        for before, after in zip(stored, jax.tree.leaves(state.variables[FROZEN]), strict=True):
+            assert after.dtype == before.dtype
+            np.testing.assert_array_equal(np.asarray(before), np.asarray(after))
+
+
+def test_a_lora_run_under_bf16_parameters_keeps_its_factors_float32_and_its_base_bf16(tmp_path):
+    """Under parameters stored in bf16 (`dtypes.params`), a LoRA run stores its frozen base in that
+    narrower dtype and keeps its factors float32, as PEFT keeps an adapter over a bf16 base
+    (`dew.lora.FACTOR_DTYPE`) (review of ledger 2500)."""
+    from dew.batch import FROZEN
+
+    tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
+    checkpoint = export_tiny_decoder(tmp_path / "checkpoint")
+    state = pretrained_config(tokens, checkpoint, "--trainer.steps", "1", "--max-new-tokens", "0",
+                              "--trainer.name", "bf16", "--lora.rank", "4", "--lora.modules", "q_proj",
+                              "--trainer.precision.dtypes.params", "bfloat16").run()
+    for collection, dtype in (("params", jnp.float32), (FROZEN, jnp.bfloat16)):
+        stored = {leaf.dtype for leaf in jax.tree.leaves(state.variables[collection])}
+        assert stored == {jnp.dtype(dtype)}, collection
 
 
 class Started(LMRunConfig):

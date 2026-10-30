@@ -226,7 +226,8 @@ def _selected[C](op: Op[C], case: C, implementation: str) -> str:
     with its refusal; for 'auto', the one `chosen` names, else the target's preference."""
     if implementation not in IMPLEMENTATIONS:
         raise ValueError(f"implementation must be one of {IMPLEMENTATIONS}, got {implementation!r}")
-    return select(op, case, None if implementation == 'auto' else implementation, insist=False).kernel
+    preference = {'auto': (), 'xla': ('xla',)}.get(implementation, (implementation, 'xla'))
+    return select(op, case, preference=preference).kernel
 
 
 def _within_fp32(dtype) -> bool:
