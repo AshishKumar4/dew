@@ -54,6 +54,7 @@ from dew.interop.decoder_parts import context_lengths
 from dew.interop.generation_config import read_generation_config
 from dew.interop.pickles import host_dtype, host_view
 from dew.interop.pretrained import Placing, PretrainedFallback, source_processor
+from dew.interop.streaming import SourceLeaf
 from dew.interop.weights import AUTO, checkpoint_dtype
 from dew.mesh import LogicalAxes
 from dew.nn.attention import AttentionImpl
@@ -1422,7 +1423,7 @@ def load(source: sources.SourceReference, root: Path, *, dtype: str,
         directory = source.directory(source.weights(root))
     # Before transformers, whose reader fails on a malformed file without naming it.
     generation_config = read_generation_config(directory)
-    model, stored = _built(directory, param_dtype, weights)
+    model, by_name = _built(directory, param_dtype, weights)
     model.eval()
     jittable = JittableModule(model)
     head = model.get_output_embeddings()
@@ -1435,7 +1436,7 @@ def load(source: sources.SourceReference, root: Path, *, dtype: str,
     # The head's structure, which a forward shows: the loaded model's, or without its weights the
     # same class at the probe's sizes (`verify.shrink`), since a forward on the meta device reads no
     # values, which some forwards do.
-    if head_name is not None and not (_plain_head(model, head) if weights and stored is None
+    if head_name is not None and not (_plain_head(model, head) if weights and by_name is None
                                       else _shrunk_plain_head(config)):
         head_name = None
     # After the head's eager check: the functional parts and Dew's attention run only inside the traced
@@ -1449,11 +1450,14 @@ def load(source: sources.SourceReference, root: Path, *, dtype: str,
     def held(leaf, name):
         if not weights:
             return jax.ShapeDtypeStruct(tuple(leaf.shape), host_dtype(leaf, name))
-        if stored is not None and name in stored:
-            return stored[name]
+        if by_name is not None and name in by_name:
+            # Read a device shard at a time, cast to its storage as the placement reads it
+            # (`dew.interop.streaming.SourceLeaf`), as a native family's checkpoint streams.
+            tensor = by_name[name]
+            return SourceLeaf((tensor,), checkpoint_dtype(np.dtype(tensor.dtype), param_dtype))
         return host_view(leaf, name)
 
-    if stored is not None and (unread := sorted(set(jittable.params) - set(stored))):
+    if by_name is not None and (unread := sorted(set(jittable.params) - set(by_name))):
         raise ValueError(_unread(name_or_dir, unread))
 
     params = {name: held(leaf, name) for name, leaf in jittable.params.items()}
@@ -1490,30 +1494,12 @@ def load(source: sources.SourceReference, root: Path, *, dtype: str,
         "torch model on the host, at least 2x the checkpoint", TransformersTierWarning, stacklevel=3)
     built = {**config, "dtype": dtype, "fallback": "torchax", **versions}
     variables = {"params": params, "buffers": buffers}
-    kept = _in_storage(variables if placed is None else placed(variables, module), param_dtype)
+    landed = variables if placed is None else placed(variables, module)
+    # What no placement read (a load onto no mesh), read whole in its storage; torch's names are flat.
+    kept = {collection: {name: leaf.read() if isinstance(leaf, SourceLeaf) else leaf
+                         for name, leaf in tree.items()} for collection, tree in landed.items()}
     return PretrainedFallback(module, kept, processor, config, directory, built, generation_config,
                               export_adapter=graph.export, revision=revision)
-
-
-def _in_storage(variables: Variables, param_dtype: str) -> Variables:
-    """`variables` with each floating parameter in its storage (`weights.checkpoint_dtype`), cast a leaf
-    at a time where it lies and written over the leaf it casts, in its own dict (`host.stream` places a
-    tree's leaves so): on its devices where the load placed it, the leaf it replaces freed as its cast
-    lands, so neither the devices nor the host, which holds the checkpoint memory-mapped, hold the
-    parameters twice; else on the host, without a copy where it is stored so."""
-    def cast(node: dict) -> None:
-        for name, leaf in node.items():
-            if isinstance(leaf, dict):
-                cast(leaf)
-            elif isinstance(leaf, jax.Array | np.ndarray):
-                target = checkpoint_dtype(np.dtype(leaf.dtype), param_dtype)
-                if leaf.dtype != target:
-                    node[name] = leaf.astype(target)
-
-    params = variables["params"]
-    assert isinstance(params, dict)
-    cast(params)
-    return variables
 
 
 def _unread(source: str | Path, names: Sequence[str]) -> str:
@@ -1523,7 +1509,8 @@ def _unread(source: str | Path, names: Sequence[str]) -> str:
             "which its model's class names: a load would draw them, and the source is its checkpoint")
 
 
-def _shapes(leaves: Mapping[str, np.ndarray | jax.ShapeDtypeStruct]) -> dict[str, jax.ShapeDtypeStruct]:
+def _shapes(leaves: Mapping[str, np.ndarray | SourceLeaf | jax.ShapeDtypeStruct]
+            ) -> dict[str, jax.ShapeDtypeStruct]:
     """Each leaf's shape and dtype."""
     return {name: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype) for name, leaf in leaves.items()}
 
