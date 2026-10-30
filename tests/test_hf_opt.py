@@ -129,19 +129,22 @@ PROJECTED_TWIN_DRAWS = 3
 def test_a_projected_decoders_prediction_depth_and_table_context_read_the_stream_embedding():
     """A decoder whose embedding has a width of its own (`embedding_features`), with a prediction depth and
     a cross-attention layer reading a context by the table, pairs its depth with and encodes its context
-    by the token embedding at the stream's width (`stream_embeddings`, through `project_in`): its trunk's
-    and its depth's logits over a context, and their loss's gradient in its layers', depth's and
-    cross-attention's parameters, run in float64, compute those of its twin at the stream's width, whose
-    table is the projected one and whose untied head is `project_out` and the table together, in float64
-    (`assert_computes_the_oracle`, within the float64 rounding of the projected decoder's own
-    arithmetic)."""
+    by the token embedding at the stream's width (`stream_embeddings`, through `project_in`): an LM
+    objective's training step with a prediction depth (`mtp_weight`), over rows whose context the
+    cross-attention reads as `encode_context` encodes it by the table, gives a loss and a gradient in the
+    layers', depth's and cross-attention's parameters that, run in float64, compute those of its twin at
+    the stream's width, whose table is the projected one and whose untied head is `project_out` and the
+    table together, in float64 (`assert_computes_the_oracle`, within the float64 rounding of the
+    projected decoder's own arithmetic)."""
     import jax
     import jax.numpy as jnp
-    import optax
     from reference_error import assert_computes_the_oracle, chain_roundings
 
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.nn.cross_attention import CrossAttention, encode_context
+    from dew.nn.inputs import ModelInputs
+    from dew.objectives.base import Step
+    from dew.objectives.lm import LMObjective
 
     shape = {"vocab_size": 61, "emb_features": 16, "num_layers": 2, "num_heads": 2, "mlp_features": 32,
              "max_seq_len": 8, "attention_impl": "reference", "num_nextn_predict_layers": 1,
@@ -164,42 +167,37 @@ def test_a_projected_decoders_prediction_depth_and_table_context_read_the_stream
         params = jax.tree_util.tree_map_with_path(
             lambda path, leaf: (rng.uniform(-1, 1, leaf.shape).astype(np.float32)
                                 if path[-1].key.startswith("alpha_") else leaf), params)
-        return params, ids, rng.integers(0, 61, (2, 4)).astype(np.int32), rng.integers(0, 61, (2, 6))
+        return params, ids, rng.integers(0, 61, (2, 4)).astype(np.int32)
 
     def scored(model, convert):
-        def run(params, ids, context, targets):
+        objective = LMObjective(model, 5, mtp_weight=0.3)
+        step = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(0), ema=None)
+
+        def run(params, ids, context):
             whole = convert(params)
             shared = {name: value for name, value in whole.items() if name not in (*stream, "lm_head")}
 
-            def outputs(shared):
+            def loss(shared):
                 variables = {"params": {**whole, **shared}}
                 conditioning = encode_context(model, variables, context, jnp.full((2,), 4, jnp.int32),
                                               encoder="table")
-                hidden, prediction = model.apply(variables, ids, conditioning=conditioning,
-                                                 method="hidden_and_mtp_inputs")
-                (depth,) = model.apply(variables, prediction, ids, conditioning=conditioning,
-                                       method="mtp_logits")
-                return model.apply(variables, hidden, method="logits_from_hidden"), depth
-
-            def loss(shared):
-                logits, depth = outputs(shared)
-                # The depth scores one token fewer: each position's next but one.
-                return (jnp.sum(optax.softmax_cross_entropy_with_integer_labels(logits, targets))
-                        + jnp.sum(optax.softmax_cross_entropy_with_integer_labels(depth, targets[:, 1:])))
-            return outputs(shared), jax.grad(loss)(shared)
+                value, _ = objective.scalar_loss(
+                    variables, {"text": ModelInputs(ids, conditioning=conditioning)}, step)
+                return value
+            return jax.value_and_grad(loss)(shared)
 
         return run
 
     for seed in range(PROJECTED_TWIN_DRAWS):
-        params, ids, context, targets = draw(seed)
+        params, ids, context = draw(seed)
         with jax.enable_x64(new_val=True):
             wide = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), params)
             dew = scored(projected.clone(dtype=jnp.float64), lambda params: params)
-            found = jax.device_get(dew(wide, ids, context, targets))
+            found = jax.device_get(dew(wide, ids, context))
             oracle = scored(twin.clone(dtype=jnp.float64), twinned)
-            expected = jax.device_get(oracle(wide, ids, context, targets))
-            roundings = chain_roundings(jax.make_jaxpr(dew)(wide, ids, context, targets))
-        for (path, mine), theirs in zip(jax.tree_util.tree_leaves_with_path(found), jax.tree.leaves(expected),
+            expected = jax.device_get(oracle(wide, ids, context))
+            roundings = chain_roundings(jax.make_jaxpr(dew)(wide, ids, context))
+    for (path, mine), theirs in zip(jax.tree_util.tree_leaves_with_path(found), jax.tree.leaves(expected),
                                         strict=True):
             assert_computes_the_oracle(np.asarray(mine), np.asarray(theirs),
                                        f"draw {seed} {jax.tree_util.keystr(path)}", roundings=roundings)
