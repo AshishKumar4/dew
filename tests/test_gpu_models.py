@@ -9,12 +9,18 @@ of its own, run through it in one process (`gpu_flow`), each cell its own file's
 - ModernBERT's states in bf16 on the kernels it selects, cuDNN on its global layers
   (test_hf_modernbert).
 - A weight push whose replica refuses its join aborts its NCCL group (test_rollout_servers).
+- The paged BF16 decode kernel's value and derivatives are the gathered attention's, every width, window,
+  softcap and sink, and a softcapped model decodes a paged cache on par with its compact one, on sm80 or
+  later (test_kv_cache).
 """
+
+import functools
 
 import pytest
 import test_causal_transformer as causal
 import test_hf_decoders as decoders
 import test_hf_modernbert as modernbert
+import test_kv_cache as kv_cache
 import test_rollout_servers as rollout
 from gpu_flow import Cell, run_cells
 
@@ -44,4 +50,13 @@ def test_the_models_run_their_gpu_kernels(rng, without_deterministic_ops):
              lambda: modernbert.modernbert_states_in_bf16_on_the_gpu_kernels(without_deterministic_ops)),
         Cell("a push whose replica refuses its join aborts its NCCL group",
              rollout.a_push_whose_replica_refuses_its_join_aborts_its_group_rather_than_waiting),
+        *(Cell(f"the paged decode kernel's value and derivatives are the gathered attention's: width {width}"
+               f"{' window' if windowed else ''}{' softcap' if softcap else ''}{' sinks' if sunk else ''}",
+               functools.partial(kv_cache.native_gpu_paged_value_and_derivatives_are_the_gathered_attentions,
+                                 without_deterministic_ops, width, windowed, softcap, sunk), "sm80")
+          for width in (64, 256) for windowed in (False, True) for softcap in (None, 0.5)
+          for sunk in (False, True)),
+        Cell("a softcapped model decodes a paged cache on par with its compact cache",
+             functools.partial(kv_cache.a_softcapped_model_decodes_a_paged_cache_on_par_with_its_compact_cache,
+                               without_deterministic_ops), "sm80"),
     ])
