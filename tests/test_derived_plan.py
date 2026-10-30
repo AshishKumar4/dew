@@ -2,10 +2,13 @@
 derivation walks the ladder from the base rung before anything compiles, and the compile confirms it or
 climbs on as a correction. A run that starts from a plan, recorded or resumed, tries that plan first."""
 
+import logging
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+import pytest
 from objective_cases import jepa
 from test_plan import LIMIT, free, needs, one_device
 
@@ -13,7 +16,7 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import REMAT_POLICIES
 from dew.objectives.lm import LMObjective
 from dew.telemetry.instrumentation import Compiles
-from dew.training import Trainer
+from dew.training import MeshSpec, Trainer
 
 
 def deep(remat=None):
@@ -132,3 +135,26 @@ def test_a_run_that_sets_its_remat_is_told_the_lighter_rung_its_derivation_fits(
     off = deep(REMAT_POLICIES["save_qkv_proj"])
     compiled(off)
     assert off.plan["derived"] == [] and off.plan["remat"] == "save_qkv_proj"
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_run_over_two_devices_that_sets_its_remat_is_told_the_rung_its_derivation_fits(
+        monkeypatch, tmp_path, caplog):
+    """A run sharded over two devices (fsdp 2, as the two-GPU run that raised row 2536) that sets
+    full recomputation reads its derivation per device, each its share of the batch and the state
+    (`candidate_footprint`), and with room for every rung is told the base rung fits, where its search
+    compiles at its own alone; the derivation's climb compiles nothing, so it says it compiles nothing
+    (train 333's review: rows 2615, 2616)."""
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "two"))
+    free(monkeypatch, LIMIT)
+    model = CausalTransformer(vocab_size=64, emb_features=32, num_layers=8, num_heads=2, mlp_features=64,
+                              max_seq_len=256, remat=REMAT_POLICIES["full"])
+    trainer = Trainer(LMObjective(model, seq_len=256), optax.sgd(1e-2), key=jax.random.key(0), split=1,
+                      mesh=MeshSpec(fsdp=2).build(jax.devices()[:2]))
+    with caplog.at_level(logging.WARNING, logger="dew"), Compiles("step") as compiles:
+        compiled(trainer)
+    derived = trainer.plan["derived"]
+    assert compiles.count == 1 and trainer.plan["remat"] == "full"
+    assert derived and derived[0]["remat"] is None and derived[-1]["label"] == "fits"
+    assert not [record for record in caplog.records if "compiling it again" in record.getMessage()]
+    assert [record for record in caplog.records if "recomputes less" in record.getMessage()]
