@@ -511,27 +511,25 @@ def test_a_server_round_after_the_first_reuses_its_programs_and_reads_once_a_ste
         np.testing.assert_array_equal(mine.host().tokens, theirs.host().tokens)
 
 
-def test_a_servers_steps_after_its_first_run_their_executables_with_no_dispatch_key(monkeypatch):
-    """A server's decoding and admitting steps build their programs' dispatch key once, at their first
-    call, and run their executables after it (`dew.inference.serving_kernel.dispatched`): a step's Python
-    walks no tree of its weights and cache (train 329's review: about 1 ms a step)."""
-    from dew.nn.kernels.options import OuterProgram
+def test_a_servers_step_runs_one_executable_for_each_admission_size():
+    """A server's step (`dew.inference.serving_kernel.dispatched`) asks its program for the executable a
+    call takes once for each size of admission, and runs it with the dynamic arguments alone after: no
+    later step builds the program's dispatch key over the weights and cache (train 329's review: about 1
+    ms a step)."""
+    from dew.inference.serving_kernel import dispatched
 
-    server = Server.from_task(task(), slots=4, capacity=128, admission=2, decode_steps=4)
-    rows = [np.asarray(Digits().encode(prompt), np.int32) for prompt in PROMPTS]
-    keyed = []
-    original = OuterProgram._keyed
-    monkeypatch.setattr(OuterProgram, "_keyed",
-                        lambda self, *given: keyed.append(1) or original(self, *given))
-    for round in range(2):
-        tickets = [server.submit(prompt, budget, key=jax.random.key(10 * round + index))
-                   for index, (prompt, budget) in enumerate(zip(rows, BUDGETS, strict=True))]
-        server.run()
-        for ticket in tickets:
-            ticket.result()
-        if round == 0:
-            first = len(keyed)
-    assert len(keyed) == first <= 2
+    asked: list[int | None] = []
+
+    class Program:
+        def executable(self, model, params, pad_id, placement, steps, resident, carried, admission, *rest):
+            asked.append(None if admission is None else len(admission["slots"]))
+            return lambda *dynamic: dynamic[3]
+
+    step = dispatched(Program())
+    sizes = [None, {"slots": np.zeros(2)}, None, {"slots": np.zeros(2)}, {"slots": np.zeros(4)}, None]
+    ran = [step("model", {}, 0, "placement", 1, "resident", "carried", admission, (), (), None)
+           for admission in sizes]
+    assert asked == [None, 2, 4] and ran == sizes
 
 
 @pytest.mark.parametrize("decode_steps", [1, 4])
