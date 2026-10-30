@@ -906,7 +906,16 @@ addresses.
 
 The alternative, waiting on the device every step, costs 45%. The same
 simple_dit loop with `block_until_ready` after each step runs at 10.3 ms
-against 7.1, so the trainer's loop does not wait between logging ticks.
+against 7.1, so the trainer's loop does not wait between logging ticks. Nor at them: a log's numbers are copied to the host as the
+loop takes the log, and a writer thread reads and reports them while the loop
+steps on, so a tracker or the display holds no step back (row 2313). On one
+H100 PCIe, a quarter-depth Dory 1.0 4B at 2 x 2048 under full remat ran
+1957.4, 1945.2 and 1941.7 ms a step logging every step, every 100 and never
+when the loop read each log itself, and 1910.0, 1940.1 and 1941.7 ms with the
+writer, the same job and GPU for both: logging every step cost 15.7 ms a step
+and now costs nothing past the run's noise. The two host reads a log adds,
+the allocator's peak (`peak_memory_gib`) and the compilation cache counts,
+take 4.0 and 2.7 us a call, now on the writer's thread.
 Running ahead does not raise the peak allocation (0.823 GiB at 27 steps
 ahead against 0.819 in lockstep, and 3.499 against 3.495 GiB for
 hierarchical_mmdit).

@@ -291,7 +291,7 @@ def test_a_training_step_updates_the_clamped_altup_coefficients_as_the_reference
 
     @jax.jit
     def updated(rows, gradient):
-        committed, _, _ = transaction.commit(state, gradient, (), None)
+        committed, _, _, _ = transaction.commit(state, gradient, (), None)
         return committed.variables["params"]
 
     @as_given
