@@ -299,8 +299,12 @@ GRAIN_KILL_SECONDS = 25
 no setting or reading of: 25 s in grain 0.2.18 (process_prefetch.py), the release tested."""
 
 
-WORKER_BUFFER = 2
-"""The batches each worker process reads ahead where none is asked for (`Loading`, `Pipeline.workers`)."""
+WORKER_BUFFER = 1
+"""The batches each worker process reads ahead where none is asked for (`Loading`, `Pipeline.workers`):
+Grain's own (`per_worker_buffer_size`). Two read no faster on a CPU and hold a second batch in each worker
+(row 2508: two workers over a record step of a few milliseconds, eight draws each, two against one at
+1.03 times the samples a second, 0.66 to 1.35, with the consumer waiting on none; 0.98 times with it
+taking 5 ms a batch; 1.00 times at 20 ms)."""
 
 
 WORKER_PROCESS_BYTES = 219 * 2**20
