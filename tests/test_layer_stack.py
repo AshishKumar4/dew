@@ -451,6 +451,47 @@ def test_a_decode_step_scans_a_periodic_stack_as_one_body_and_decodes_as_the_loo
                     truth_fn=truth)
 
 
+SOURCE_SCAN_SEEDS = 8
+"""A loaded source's scanned decode's check-1 seeds, sized by `seeds_for` on armada."""
+
+
+def test_a_loaded_source_scans_its_periodic_stack_where_its_load_asks(tmp_path):
+    """`Pretrained.load(..., scan_layers=True)`, a run's and a pipeline's `--source.scan-layers`
+    (`SourceOptions`), scans a loaded source's periodic stack in its decode step (ledger 642): qwen35-tiny's
+    period of three delta nets and an attention layer, twice in its transformers checkpoint, decodes as
+    one scan of the period's two repeats, its steps as exactly as the plain load's, both from its own
+    float64 steps (check 1)."""
+    import torch
+    from transformers import Qwen3_5ForCausalLM, Qwen3_5TextConfig
+
+    config = json.loads((FIXTURES / "qwen35-tiny" / "config.json").read_text())
+    config.update(num_hidden_layers=8, layer_types=config["layer_types"] * 2)
+    torch.manual_seed(0)
+    Qwen3_5ForCausalLM(Qwen3_5TextConfig(**config)).to(torch.float32).save_pretrained(tmp_path)
+    plain, scanned = (Pretrained.load(tmp_path, dtype="float32", attention_impl="reference", scan_layers=scan)
+                      for scan in (False, True))
+    ids = np.zeros((2, 1), np.int32)
+    cache = scanned.model.init(jax.random.key(0), ids, decode=True)["cache"]
+    graph = jax.make_jaxpr(lambda variables, cache: scanned.model.apply(
+        {**variables, "cache": cache}, ids, decode=True, mutable=["cache"]))(scanned.variables, cache)
+    assert [equation.params["length"] for equation in graph.jaxpr.eqns
+            if equation.primitive.name == "scan"] == [2]
+
+    def draw(seed):
+        drawn = np.random.default_rng([0x642, seed]).integers(0, config["vocab_size"], (2, 10))
+        return (drawn.astype(np.int32),)
+
+    def truth(ids):
+        with jax.enable_x64(new_val=True):
+            return np.asarray(decoded(plain.model.clone(dtype=jnp.float64), widened(plain.variables), ids)[0])
+
+    def steps(source):
+        return lambda ids: decoded(source.model, source.variables, ids)[0]
+
+    assert_as_exact(steps(scanned), steps(plain), draw, "a loaded source's scanned decode",
+                    seeds=SOURCE_SCAN_SEEDS, truth_fn=truth)
+
+
 def bf16(**overrides):
     return models.build("causal_transformer", {**TINY, **overrides}, dtype="bfloat16", attention_impl="xla")
 

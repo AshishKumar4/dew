@@ -372,7 +372,8 @@ class Pretrained:
              fallback: str | None = None, weights: bool = True, on_host: bool = False,
              modeling_overrides: Mapping[str, object] | None = None,
              trust_remote_code: bool = False, text_only: bool = False,
-             prediction_depths: int | None = None, dex: DifferentialExtension | None = None) -> Self:
+             prediction_depths: int | None = None, dex: DifferentialExtension | None = None,
+             scan_layers: bool = False) -> Self:
         """Load a source as a native Flax model with explicit parameter trees, as the kind of source it is.
 
         `name_or_dir` is a local HF directory or a Hub model ID. Decoder, tower and
@@ -448,6 +449,9 @@ class Pretrained:
         (`AttentionMixer.bidirectional_blocks`, a call's `block_groups`) on any decoder or wrapper this
         loads natively, and "causal" turns a release's back off. A saved model states it in its own
         config. `dex` attaches DEX (`with_dex`) drawn from key 0, one extension for each run naming it.
+        `scan_layers` runs the decoder's like layers, and those repeating one period, under flax's scan
+        (`CausalTransformer.scan_layers`, a wrapper's language model's), its variables stored as loaded:
+        a decode step's program then grows with the period, not the depth.
         """
         selected = _selected_payload(fallback, gguf_file=gguf_file, single_file=single_file,
                                      dduf_file=dduf_file)
@@ -480,8 +484,9 @@ class Pretrained:
         if not isinstance(loaded, cls):
             raise TypeError(f"{name_or_dir} is a {type(loaded).__name__} source, not a {cls.__name__}; "
                             f"load it with {type(loaded).__name__}.load or Pretrained.load")
-        extended = _extended(_published(loaded, name_or_dir, selected=bool(selected)
-                                        or reference.subfolder is not None or extracted), dex, placed)
+        published = _published(loaded, name_or_dir, selected=bool(selected)
+                                or reference.subfolder is not None or extracted)
+        extended = _scanned(_extended(published, dex, placed), scan_layers)
         return _resident(extended, weights=weights, streaming=streaming, on_host=on_host)
 
     @property
@@ -1685,6 +1690,23 @@ def _extended[Loaded: Pretrained](loaded: Loaded, dex: DifferentialExtension | N
     """`loaded` with DEX attached where a load names it (`Pretrained.with_dex`), drawn from key 0, its
     parameters placed as the load places the source's (`placed`), before the load's residency."""
     return loaded if dex is None else loaded.with_dex(dex, key=0).map_variables(placed)
+
+
+def _scanned[Loaded: Pretrained](loaded: Loaded, scan: bool) -> Loaded:
+    """`loaded` with its decoder, or a wrapper's language model, scanning its runs where `scan` says
+    (`CausalTransformer.scan_layers`): a field of how the model runs, its stored tree unchanged, as its
+    stack reads the layers through its view (`StackView`)."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.multimodal import MultimodalTransformer
+
+    model = loaded.model
+    if not scan:
+        return loaded
+    if isinstance(model, CausalTransformer):
+        return replace(loaded, model=model.clone(scan_layers=True))
+    if isinstance(model, MultimodalTransformer):
+        return replace(loaded, model=model.clone(language_model=model.language_model.clone(scan_layers=True)))
+    raise TypeError(f"scan_layers scans a decoder's layers, and a {type(model).__name__} has none")
 
 
 def _within(name: str, layers: frozenset[int]) -> bool:

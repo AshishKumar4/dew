@@ -384,6 +384,9 @@ class SourceOptions:
     """DEX's differential on chosen heads (`dew.nn.dex`, `Pretrained.load`'s `dex`), its record as
     JSON: `--source.dex '{"layers": [[0, [1, 3]], [5, [0, 2]]], "anneal_steps": 1000}'`, its
     `trains` the paper's recipe unless "all"; None for none."""
+    scan_layers: bool = False
+    """The decoder's runs of like layers, and of layers repeating one period, under flax's scan
+    (`Pretrained.load`'s `scan_layers`): a decode step's program grows with the period, not the depth."""
 
     def overrides(self) -> Mapping[str, object] | None:
         """The `modeling_overrides` these options state, None where they state none."""
@@ -396,7 +399,7 @@ class SourceOptions:
         PyTorch pickles alone, whose shapes no header states, is read whole): a check that a base
         loads under a run's options, on a disk too small for its weights."""
         return {"text_only": self.text_only, "prediction_depths": self.prediction_depths,
-                "modeling_overrides": self.overrides(), "dex": self.dex}
+                "modeling_overrides": self.overrides(), "dex": self.dex, "scan_layers": self.scan_layers}
 
 
 class SourcePlacement(TypedDict, total=False):
@@ -416,6 +419,7 @@ class SourceBuild(TypedDict, total=False):
     prediction_depths: int | None
     modeling_overrides: Mapping[str, object] | None
     dex: DifferentialExtension | None
+    scan_layers: bool
 
 
 class SourceOptionsKeywords(SourcePlacement, SourceBuild, total=False):
