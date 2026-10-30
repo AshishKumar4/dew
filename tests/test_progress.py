@@ -122,3 +122,27 @@ def test_a_step_that_is_no_training_step_passes_the_run_s_end_and_keeps_its_cloc
     assert objective().progress(trained).updates is committed
     assert objective().progress(validated) == END
     assert validated.committed is committed
+
+
+def test_an_evaluation_reads_the_run_s_end_whatever_it_reports():
+    """An evaluation's step is no training step (`Evaluation.run`), so a model that reads the run's
+    progress reads its end in every pass, a metrics-only one as one beside the loss (review of ledger
+    2537): a DEX decoder's perplexity half way through its anneal is its perplexity at the anneal's start,
+    both the run's end, where a metrics-only pass read the anneal's middle."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.dex import DifferentialExtension
+    from dew.objectives.lm import LMObjective, Perplexity
+    from dew.training.evaluation import Evaluation
+
+    model = CausalTransformer(vocab_size=16, emb_features=8, num_layers=1, num_heads=2, mlp_features=16,
+                              max_seq_len=8, qk_norm=False,
+                              dex=DifferentialExtension(((0, (0, 1)),), anneal_steps=10))
+    objective = LMObjective(model, 8, ema_decay=None)
+    variables = objective.init(jax.random.key(0))
+    rows = {"text": np.tile(np.arange(1, 9, dtype=np.int32), (8, 1))}
+
+    def perplexity(updates: int) -> float:
+        return Evaluation.run(objective, variables, lambda partition: iter((rows,)), key=0,
+                              metrics=(Perplexity(),), updates=updates).scores["val/perplexity"]
+
+    assert perplexity(5) == perplexity(0)

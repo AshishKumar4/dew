@@ -1358,11 +1358,12 @@ class Objective(ABC, Generic[Loss, Effects]):
         `variables` are the weights `evaluate` takes; the loss reads their
         `evaluation_variables`. Where both are asked for and the objective
         scores them together (`_validation_scores`), the batch is scored once.
+        `step` is the evaluation's, no training step (`Step.training`).
         """
         weights = self.evaluation_variables(variables, step)
         if loss and evaluate and self._validation_scores is not None:
             report = self.program('report', self._validation_scores)
-            return report(weights, batch, replace(step, training=False))
+            return report(weights, batch, step)
         statistics = self._validation_loss(weights, batch, step) if loss else None
         return statistics, self.evaluate(variables, batch, step) if evaluate else None
 
