@@ -272,7 +272,7 @@ class HyperHead(nn.Module):
 class GatedResidual(nn.Module):
     """One Qwen4-Exp site over the streams `[B, S, H, D]` (the module doc):
     the sublayer's read `[B, S, D]` and, where it `injects`, the streams'
-    write weights `[B, S, H]`; the model's head injects none. Its weights are
+    write weights `[B, S, H]`, else None, as the model's head. Its weights are
     the release's `hc_norm`, `input_mix_weight_down`, `input_mix_weight_up`
     and `block_inject_weight`."""
 
@@ -310,7 +310,7 @@ class GatedResidual(nn.Module):
         weights = nn.sigmoid(dense(hc * width, name='input_mix_weight_up')(nn.silu(down / hc)))
         read = jnp.mean(weights.reshape(streams.shape) * normed.reshape(streams.shape), axis=2)
         if not self.injects:
-            return read
+            return read, None
         return read, 2 * nn.sigmoid(dense(hc, name='block_inject_weight')(normed) / hc)
 
 
@@ -336,4 +336,6 @@ def collapse_streams(streams, head: HyperHead | GatedResidual | None):
     """
     if head is None:
         return jnp.mean(streams, axis=2)
-    return head(streams)
+    collapsed = head(streams)
+    # Qwen4-Exp's gated head returns its read beside the inject it does not take.
+    return collapsed[0] if isinstance(collapsed, tuple) else collapsed

@@ -141,7 +141,8 @@ def run_loop(model, x, *, train: bool, decode: bool, **inputs):
         entering = None if shared is None else (shared.entering if shared.entering is not None
                                                else model.variables.get('cache') or None)
 
-        def later(module, x, stop, injected, inputs, entering):
+        def later(module, x, stop):
+            # The block's input, its per-layer inputs and the entering cache close over the scan.
             x, logit = _preamble(module, loop, x, stop, injected)
             if entering is None:
                 return run_block(module, x, **inputs), logit
@@ -154,11 +155,11 @@ def run_loop(model, x, *, train: bool, decode: bool, **inputs):
         scan = nn.scan(later, variable_axes=dict.fromkeys(stacked, 0),
                        variable_carry='cache' if shared is not None else False,
                        variable_broadcast=DenyList(WRITTEN), split_rngs={'params': False, 'dropout': True},
-                       in_axes=(0, nn.broadcast, nn.broadcast, nn.broadcast), length=len(scanned))
+                       length=len(scanned))
         run = nn.map_variables(scan, mapped_collections=WRITTEN, trans_in_fn=view.inside,
                                trans_out_fn=view.outside, mutable=True)
         stops = jnp.asarray([step == cut for step in scanned])
-        x, logits = run(model, x, stops, injected, inputs, entering)
+        x, logits = run(model, x, stops)
         if logits is not None and not model.is_initializing():
             for logit in logits:
                 model.sow('exits', 'logits', logit)
@@ -170,5 +171,3 @@ def run_loop(model, x, *, train: bool, decode: bool, **inputs):
         x = model.stack(x, span=(end, model.num_layers), train=train, decode=decode, **inputs)
     return x
 
-
-__all__ = ['PassStack', 'run_loop']

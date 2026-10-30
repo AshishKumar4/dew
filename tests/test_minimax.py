@@ -11,6 +11,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from interop_support import token_draw
+from model_support import stepped_decode
 from reference_error import assert_as_exact, widened
 
 from dew.interop import Pretrained, PretrainedDecoder
@@ -57,25 +59,15 @@ def test_a_scanned_minimax_decodes_as_its_plain_loop():
                       for scan in (False, True))
     variables = plain.init(jax.random.key(0), jnp.zeros((2, 4), jnp.int32))
 
-    def decoded(model, variables, ids):
-        def step(cache, column):
-            logits, state = model.apply({**variables, 'cache': cache}, column[:, None], decode=True,
-                                        mutable=['cache'])
-            return state['cache'], logits[:, 0]
-
-        cache = model.init(jax.random.key(0), ids[:, :1], decode=True)['cache']
-        return jnp.moveaxis(jax.lax.scan(step, cache, jnp.moveaxis(ids, 1, 0))[1], 0, 1)
-
     def truth(ids):
         with jax.enable_x64(new_val=True):
-            return np.asarray(decoded(plain.clone(dtype=jnp.float64), widened(variables), jnp.asarray(ids)))
+            return np.asarray(stepped_decode(plain.clone(dtype=jnp.float64), widened(variables), ids)[0])
 
-    def draw(seed):
-        drawn = np.random.default_rng([0x2564, seed]).integers(0, config['vocab_size'], (2, 10))
-        return (drawn.astype(np.int32),)
+    def steps(model):
+        return lambda ids: stepped_decode(model, variables, ids)[0]
 
-    assert_as_exact(lambda ids: decoded(scanned, variables, ids), lambda ids: decoded(plain, variables, ids),
-                    draw, 'scanned MiniMax decode', seeds=SCAN_SEEDS, truth_fn=truth)
+    assert_as_exact(steps(scanned), steps(plain), token_draw(0x2564, config['vocab_size'], (2, 10)),
+                    'scanned MiniMax decode', seeds=SCAN_SEEDS, truth_fn=truth)
 
 
 def test_a_minimax_model_writes_no_checkpoint_another_runtime_would_misread(tmp_path):

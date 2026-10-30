@@ -32,7 +32,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from hf_reference import write_released_config
-from reference_source import padded_probe
+from reference_source import padded_probe, torch_greedy, torch_logits
 from transformers.models.qwen4_exp import modeling_qwen4_exp
 from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpTextConfig
 from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpForCausalLM
@@ -59,22 +59,6 @@ TINY = {
 """qwen4-exp-tiny's Qwen4ExpTextConfig."""
 
 
-def logits(model, ids, mask=None, positions=None):
-    inputs = {'input_ids': torch.from_numpy(ids).long(), 'use_cache': False}
-    if mask is not None:
-        inputs.update(attention_mask=torch.from_numpy(mask).long(),
-                      position_ids=torch.from_numpy(positions).long())
-    with torch.no_grad():
-        return model(**inputs).logits.numpy()
-
-
-def greedy(model, ids, tokens: int):
-    """`ids` continued `tokens` tokens by the argmax of a full forward each."""
-    for _ in range(tokens):
-        ids = np.concatenate([ids, logits(model, ids)[:, -1].argmax(-1)[:, None].astype(ids.dtype)], axis=1)
-    return ids
-
-
 def write_tiny() -> None:
     directory = FIXTURES / 'qwen4-exp-tiny'
     directory.mkdir(parents=True, exist_ok=True)
@@ -84,9 +68,9 @@ def write_tiny() -> None:
     model.save_pretrained(directory, safe_serialization=True)
     ids = probe_ids(TINY['vocab_size'])
     mask, padded, positions = padded_probe(ids)
-    arrays = {'input_ids': ids, 'attention_mask': mask, 'logits': logits(model, ids),
-              'padded_logits': logits(model, padded, mask, positions),
-              'generated': greedy(model, ids[:, :4], 6)}
+    arrays = {'input_ids': ids, 'attention_mask': mask, 'logits': torch_logits(model, ids),
+              'padded_logits': torch_logits(model, padded, mask, positions),
+              'generated': torch_greedy(model, ids[:, :4], 6)}
     for name, array in arrays.items():
         np.save(directory / f'{name}.npy', array)
     print(f"{directory}: {sorted(path.name for path in directory.iterdir())}")

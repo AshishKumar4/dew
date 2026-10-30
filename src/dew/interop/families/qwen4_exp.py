@@ -24,7 +24,7 @@ import jax
 import numpy as np
 
 from dew import _records
-from dew.interop.config_records import native_fields
+from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.decoder_parts import (
     LINEAR_FIELDS,
     DecoderFamily,
@@ -45,6 +45,7 @@ from dew.nn.engram import Engram
 from dew.nn.hyper_connections import HyperConnections
 from dew.nn.mixers.attention import QSAAttentionMixer
 from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
+from dew.registry import from_record
 
 _QSA_FIELDS = ('indexer_n_heads', 'indexer_head_dim', 'indexer_budget', 'indexer_compress_ratio')
 
@@ -81,7 +82,7 @@ _SHARD = re.compile(r'^(?P<stem>.*\.ple\.ple_embedding\.ngram_embedding)\.shard_
 _BUFFERS = ('layer_multipliers', 'ngram_heads_vocab_sizes', 'ngram_heads_offsets')
 
 
-def _engram(hf: Mapping[str, object], used: set[str], layers: int) -> dict[str, object] | None:
+def _engram(hf: Mapping[str, object], used: set[str], layers: int) -> NativeFields[Engram] | None:
     """The n-gram lookups `ple_layer_ids` names, as `Engram` fields, or None for none."""
     used.update(('ple_layer_ids', 'ple_embed_dim', 'ple_conv_kernel_size', 'ngram_size', 'heads_per_ngram',
                  'ngram_vocab_size_base', 'make_ngram_vocab_size_divisible_by', 'seed', 'split_ngram_parts'))
@@ -126,7 +127,7 @@ def _qwen4_exp_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields
     config = _qwen_hybrid_config(spelled, used, mixer={'output_gate_type': gate})
     stated = [hf.get(name) for name in (*_QSA_FIELDS, 'indexer_kv_heads')]
     used.update((*_QSA_FIELDS, 'indexer_kv_heads'))
-    if 'full_attention' in config['layer_types']:
+    if 'full_attention' in _records.strings(config['layer_types'], 'layer_types'):
         if None in stated or stated[-1] != 1:
             refuse('indexer_*', 'every Qwen4-Exp attention layer runs QSA, its indexer one key head wide')
         kinds = dict(kinds_of(config))
@@ -161,7 +162,7 @@ def _qwen4_exp_prepare(tensors: Mapping[str, Stored], config: Mapping[str, objec
     left out (the module doc)."""
     prepared: dict[str, Stored] = {}
     shards: dict[str, dict[int, Stored]] = {}
-    spec = None if config is None or config.get('engram') is None else Engram(**config['engram'])
+    spec = None if config is None or config.get('engram') is None else from_record(Engram, config['engram'])
     for name, tensor in tensors.items():
         found = _SHARD.match(name)
         if found is not None:

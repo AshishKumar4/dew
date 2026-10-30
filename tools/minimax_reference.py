@@ -40,7 +40,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from hf_reference import write_released_config
-from reference_source import hub_modules, padded_probe
+from reference_source import hub_modules, padded_probe, torch_greedy, torch_logits
 from torch_precision import float64_twin
 
 from dew.interop.verify import probe_ids, scatter_weights
@@ -105,23 +105,6 @@ def remote():
     return configuration, modeling
 
 
-def logits(model, ids, mask=None, positions=None):
-    inputs = {'input_ids': torch.from_numpy(ids).long(), 'use_cache': False}
-    if mask is not None:
-        inputs.update(attention_mask=torch.from_numpy(mask).long(),
-                      position_ids=torch.from_numpy(positions).long())
-    with torch.no_grad():
-        return model(**inputs).logits.numpy()
-
-
-def greedy(model, ids, tokens: int):
-    """`ids` continued `tokens` tokens by the argmax of a full forward each, the continuation the
-    remote code's cached generation computes, which transformers 5's generate no longer drives."""
-    for _ in range(tokens):
-        ids = np.concatenate([ids, logits(model, ids)[:, -1].argmax(-1)[:, None].astype(ids.dtype)], axis=1)
-    return ids
-
-
 def write_tiny(configuration, modeling) -> None:
     directory = FIXTURES / 'minimax-tiny'
     directory.mkdir(parents=True, exist_ok=True)
@@ -135,9 +118,9 @@ def write_tiny(configuration, modeling) -> None:
     (directory / 'config.json').write_text(json.dumps(written, indent=2) + '\n')
     ids = probe_ids(config.vocab_size)
     mask, padded, positions = padded_probe(ids)
-    arrays = {'input_ids': ids, 'attention_mask': mask, 'logits': logits(model, ids),
-              'padded_logits': logits(model, padded, mask, positions),
-              'generated': greedy(model, ids[:, :4], 6)}
+    arrays = {'input_ids': ids, 'attention_mask': mask, 'logits': torch_logits(model, ids),
+              'padded_logits': torch_logits(model, padded, mask, positions),
+              'generated': torch_greedy(model, ids[:, :4], 6)}
     for name, array in arrays.items():
         np.save(directory / f'{name}.npy', array)
     print(f"{directory}: {sorted(path.name for path in directory.iterdir())}")

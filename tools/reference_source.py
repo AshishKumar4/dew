@@ -325,3 +325,25 @@ def defined_in(text: str, names: Iterable[str], scope: dict, *, within: str | No
 def definitions(url: str, names: Iterable[str], scope: dict, *, within: str | None = None) -> dict:
     """`defined_in` over the file at `url`."""
     return defined_in(fetched(url), names, scope, within=within, filename=url)
+
+
+def torch_logits(model, ids, mask=None, positions=None):
+    """A torch causal LM's fp32 logits of `ids`, uncached, its left-padded rows by `mask` and `positions`."""
+    import torch
+
+    inputs = {'input_ids': torch.from_numpy(ids).long(), 'use_cache': False}
+    if mask is not None:
+        inputs.update(attention_mask=torch.from_numpy(mask).long(),
+                      position_ids=torch.from_numpy(positions).long())
+    with torch.no_grad():
+        return model(**inputs).logits.numpy()
+
+
+def torch_greedy(model, ids, tokens: int):
+    """`ids` continued `tokens` tokens by the argmax of a full forward each (`torch_logits`)."""
+    import numpy as np
+
+    for _ in range(tokens):
+        ids = np.concatenate([ids, torch_logits(model, ids)[:, -1].argmax(-1)[:, None].astype(ids.dtype)],
+                             axis=1)
+    return ids

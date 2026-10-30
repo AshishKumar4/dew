@@ -289,6 +289,10 @@ class MultimodalTransformer(DecoderWrapper):
         return self._over(self.language_model.with_dex(extension))
 
     @nn.nowrap
+    def with_scanned_layers(self) -> Self:
+        return self._over(self.language_model.with_scanned_layers())
+
+    @nn.nowrap
     def dex_sites(self) -> tuple[tuple[str, ...], frozenset[int]]:
         held, attention = self.language_model.dex_sites()
         return ("language_model", *held), attention

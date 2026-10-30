@@ -13,12 +13,13 @@ import functools
 import json
 from pathlib import Path
 
+import interop_support
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 import selection_margins
-from model_support import largest_difference
+from model_support import largest_difference, stepped_decode
 from reference_error import (
     FEWEST_SEEDS,
     GateFailure,
@@ -400,16 +401,9 @@ def hybrid(periods: int, **overrides):
 
 
 def decoded(model, variables, ids):
-    """Single-token steps through the cache one token's call allocates, one program a step under a
-    scan: the steps' logits, and the cache's paths."""
-    def step(cache, column):
-        logits, state = model.apply({**variables, "cache": cache}, column[:, None], decode=True,
-                                    mutable=["cache"])
-        return state["cache"], logits[:, 0]
-
-    cache = model.init(jax.random.key(0), ids[:, :1], decode=True)["cache"]
-    cache, steps = jax.lax.scan(step, cache, jnp.moveaxis(jnp.asarray(ids), 1, 0))
-    return jnp.moveaxis(steps, 0, 1), paths(cache)
+    """Single-token steps through the cache (`stepped_decode`): the steps' logits, and the cache's paths."""
+    steps, cache = stepped_decode(model, variables, ids)
+    return steps, paths(cache)
 
 
 def test_a_decode_step_scans_a_periodic_stack_as_one_body_and_decodes_as_the_loop():
@@ -477,9 +471,7 @@ def test_a_loaded_source_scans_its_periodic_stack_where_its_load_asks(tmp_path):
     assert [equation.params["length"] for equation in graph.jaxpr.eqns
             if equation.primitive.name == "scan"] == [2]
 
-    def draw(seed):
-        drawn = np.random.default_rng([0x642, seed]).integers(0, config["vocab_size"], (2, 10))
-        return (drawn.astype(np.int32),)
+    draw = interop_support.token_draw(0x642, config["vocab_size"], (2, 10))
 
     def truth(ids):
         with jax.enable_x64(new_val=True):

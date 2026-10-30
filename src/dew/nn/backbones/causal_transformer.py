@@ -2263,6 +2263,11 @@ class CausalTransformer(nn.Module):
         return self.clone(dex=extension)
 
     @nn.nowrap
+    def with_scanned_layers(self) -> Self:
+        """This decoder running its like and periodic runs under the scan (`scan_layers`)."""
+        return self.clone(scan_layers=True)
+
+    @nn.nowrap
     def dex_sites(self) -> tuple[tuple[str, ...], frozenset[int]]:
         """Its parameters at the root of `params`, and its softmax attention layers (`Differential`)."""
         return (), softmax_attention_layers(self)

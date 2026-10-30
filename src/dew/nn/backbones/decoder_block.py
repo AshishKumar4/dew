@@ -8,7 +8,7 @@ import dataclasses
 import functools
 import math
 from collections.abc import Callable, Mapping, Sequence
-from typing import Literal, NamedTuple, Protocol, overload, runtime_checkable
+from typing import Literal, NamedTuple, Protocol, cast, overload, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -23,7 +23,6 @@ from dew.nn.dropout import Dropout
 from ..activations import GatedActivation, gated_product
 from ..attention_residuals import DepthAttention, ResidualSite, sources
 from ..cross_attention import NAME as CROSS_ATTENTION, AttendsContext, LayerReads
-from ..engram import PLELayer
 from ..flops import MissingFlopsCount, counted_flops, parameter_flops, projection_flops
 from ..gemma3n import AltUp, AltUpLayer, LaurelBlock
 from ..gemma4_moe import Gemma4Experts
@@ -39,7 +38,7 @@ from ..hyper_connections import (
     gated_write,
     mix_streams,
 )
-from ..inputs import LayerInputs, MixerCall, PredictionPhase, coordinates_of, routing_blocks
+from ..inputs import LayerInputs, MixerCall, PredictionPhase, routing_blocks
 from ..kernels.recurrence_chunk import recomputing
 from ..mixer_base import ATTENTION_RESIDUALS, MLP_RESIDUALS, QKV_RESIDUALS, RESIDUALS
 from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, SparseMLP
@@ -1001,18 +1000,10 @@ class DecoderBlock(nn.Module):
                 if attention_metadata is None or attention_metadata.engram_ids is None:
                     raise ValueError("an engram layer reads the bucket ids the model hashes into "
                                      "attention_metadata.engram_ids")
-                ids = attention_metadata.engram_ids[:, :, self.engram_index]
-                if isinstance(self.engram_layer, PLELayer):
-                    # Qwen4-Exp's lookup adds nothing at a padded slot, its conv stepping over it
-                    # (modeling_qwen4_exp.py:1176-1190), each packed document's alone.
-                    tokens = coordinates_of(attention_metadata, *streams.shape[:2])
-                    streams = self.engram_layer(streams, ids, tokens.valid, segments=tokens.segments,
-                                                decode=decode)
-                else:
-                    # A media position takes no engram contribution (V4.1 model.py:351-365), and
-                    # the lookup lands before anything reads the streams (:1261-1263).
-                    streams = self.engram_layer(
-                        streams, ids, None if attention_metadata.media is None else ~attention_metadata.media)
+                # The lookup lands before anything reads the streams (V4.1 model.py:1261-1263), each
+                # layer reading the call's rows as it masks them (`EngramLayer`, `PLELayer`).
+                streams = self.engram_layer(streams, attention_metadata.engram_ids[:, :, self.engram_index],
+                                            attention_metadata, decode=decode)
             if self.prediction_site == 'input':
                 # V4.1's DSpark reads each target layer's attention input,
                 # after its engram (V4.1 inference/model.py:1264-1266).
@@ -1035,10 +1026,11 @@ class DecoderBlock(nn.Module):
         if isinstance(state, _Streams):
             spec = self.hyper_connections
             assert spec is not None
+            module = self.attn_hc if site == "attention" else self.ffn_hc
             if spec.gated:
-                read, injection = (self.attn_hc if site == "attention" else self.ffn_hc)(state.streams)
+                read, injection = cast("tuple[jax.Array, jax.Array]", module(state.streams))
                 return state, read, injection
-            pre, post, comb = (self.attn_hc if site == "attention" else self.ffn_hc).mapping(state.streams)
+            pre, post, comb = module.mapping(state.streams)
             # Under Single-Pass, a site collapses by the `pre` the site before
             # it computed and hands its own on (V4.1 inference/model.py:968-994).
             by = state.pre if spec.single_pass else pre

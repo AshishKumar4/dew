@@ -1170,6 +1170,7 @@ class CausalSelfAttention(nn.Module):
             cos, sin = self._rotary_angles(jnp.take_along_axis(key_places, at, axis=1), blocks)
             return rotate(blocks, cos, sin)
 
+        assert self.qsa is not None
         selected = qsa_selection(self.qsa, query, keys, visible, turn, self.indexer)
         kernel = self._mask_kernel(masking.query, masking.key, decode)
         return masking._replace(mask=selected[:, None], causal=False, window=None, documents=None,
