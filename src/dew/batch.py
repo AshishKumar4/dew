@@ -55,6 +55,12 @@ leaves that `freeze` keeps in `params` are the ones that train. The frozen
 leaves stay in this collection as part of the state, and `thaw` merges the
 two before the model reads them."""
 
+PACKED_FROZEN = "packed_frozen"
+"""The collection that flags, beside a projection group packed from a tree split for training whose
+members are some trained and some frozen (`dew.inference.projections`), which members were frozen: at
+each of its packed leaves' paths, one flag a member, in the group's order. With `FROZEN` it is the
+training split, which a split of the group restores and `thaw` drops: the model reads neither."""
+
 
 VALID_ROWS = "valid_rows"
 """The field every evaluation batch holds: one bool per row, True for a real record and False for a repeat.
@@ -646,12 +652,14 @@ def freeze(variables: Variables, trainable: PathFilter) -> Variables:
 def thaw(variables: Variables) -> Variables:
     """Undo `freeze`, merging the frozen leaves back into one `params` collection.
 
-    Variables without a `FROZEN` collection are returned unchanged.
+    The flags of a packed group's frozen members (`PACKED_FROZEN`) go with the split they describe.
+    Variables without either collection are returned unchanged, and a part that trains nothing (`part`
+    of a frozen module) holds its frozen leaves alone.
     """
-    if FROZEN not in variables:
+    if FROZEN not in variables and PACKED_FROZEN not in variables:
         return variables
-    rest = {name: value for name, value in variables.items() if name != FROZEN}
-    return {**rest, "params": merge(variables[FROZEN], variables["params"])}
+    rest = {name: value for name, value in variables.items() if name not in (FROZEN, PACKED_FROZEN)}
+    return {**rest, "params": merge(variables.get(FROZEN, {}), variables.get("params", {}))}
 
 
 def dicts[Tree](tree: Tree) -> Tree:

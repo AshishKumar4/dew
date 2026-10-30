@@ -18,7 +18,6 @@ reference.
 import argparse
 import itertools
 import json
-from concurrent.futures import Future
 from pathlib import Path
 
 import numpy as np
@@ -47,6 +46,7 @@ def main() -> None:
     import jax.numpy as jnp
     import optax
     from jax.experimental import multihost_utils
+    from rl_support import Published, ScriptedSource
 
     from dew.data.dataset import DataPartition, Loader
     from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -63,33 +63,16 @@ def main() -> None:
                               mixture=mixture)
     params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
 
-    class Scripted:
-        def submit(self, task, samples, *, version, key):
-            futures = []
-            for sample in range(samples):
-                draw = int(task.id) * 10 + sample + (process if args.vary else 0)
-                sampled = (3 + draw % 4, 4 + sample)
-                recorded = {"routed_experts": np.asarray([[[draw % 4, (draw + 1) % 4]]] * 3, np.uint8),
-                            "support": tuple((token, 11) for token in sampled)} if args.records else {}
-                call = Call((1 + int(task.id) % 7, 2 + int(task.id) % 5), sampled,
-                            (-0.5 - 0.01 * sample, -0.25), "stop", version, **recorded)
-                status = (Status.TRUNCATED if args.records and int(task.id) > TASKS // 2
-                          else Status.COMPLETED)
-                future = Future()
-                reward = float(sample) * (int(task.id) if args.estimator == "global" else 1)
-                future.set_result(Session(str(task.id), "", 0, 0, (call,), status, reward, {}, ""))
-                futures.append(future)
-            return futures
-
-        def cancel(self, futures):
-            for future in futures:
-                future.cancel()
-
-    class Publisher:
-        version = 0
-
-        def load(self, variables, version):
-            self.version = version
+    def drawn(task, sample, version):
+        draw = int(task.id) * 10 + sample + (process if args.vary else 0)
+        sampled = (3 + draw % 4, 4 + sample)
+        recorded = {"routed_experts": np.asarray([[[draw % 4, (draw + 1) % 4]]] * 3, np.uint8),
+                    "support": tuple((token, 11) for token in sampled)} if args.records else {}
+        call = Call((1 + int(task.id) % 7, 2 + int(task.id) % 5), sampled,
+                    (-0.5 - 0.01 * sample, -0.25), "stop", version, **recorded)
+        status = Status.TRUNCATED if args.records and int(task.id) > TASKS // 2 else Status.COMPLETED
+        reward = float(sample) * (int(task.id) if args.estimator == "global" else 1)
+        return Session(str(task.id), "", 0, 0, (call,), status, reward, {}, "")
 
     def share(partition):
         rows = partition.rows(TASKS)
@@ -115,8 +98,8 @@ def main() -> None:
     partition = DataPartition.of(trainer.device_mesh)
     # Two samples a task, two chains of four ids a row of eight.
     scheduler = RolloutScheduler(
-        Asynchronous(Scripted(), Publisher(), objective, width=8, rows=partition.rows(TASKS), max_lag=1,
-                     ahead=1),
+        Asynchronous(ScriptedSource(drawn), Published(), objective, width=8, rows=partition.rows(TASKS),
+                     max_lag=1, ahead=1),
         groups=2, support_capacity=16 if args.records else None, estimator=args.estimator)
     data = scheduler.tasks(Loader(train=share, val=None, records=TASKS, batch=TASKS))
     final = trainer.fit(data, steps=1, log_every=1, checkpoint_every=None)
