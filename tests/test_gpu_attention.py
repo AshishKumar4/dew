@@ -20,8 +20,8 @@ runs on a GPU alone, run in one process (`gpu_flow`), each cell its own file's p
   nothing on the fused kernels (test_attention_masked_rows).
 - The Mosaic template on an H100, each test its own cells: forward, training forward, natural forward
   and backward over every call form, head width, hook and run (test_attention_mosaic); an fp16 call
-  through the route, a long sequence on par with the reference path, and an accurate call the template
-  refuses on the reference path's IEEE products (test_attention_route).
+  through the route, a long sequence on par with the reference path, and the fast form's default route
+  not on par with IEEE fp32, the accurate form's control (test_attention_route).
 """
 
 import functools
@@ -183,6 +183,6 @@ def test_the_mosaic_template_holds_on_an_h100():
         *(cell for check in MOSAIC_CELLS for cell in cells_of(check, "sm90")),
         *cells_of(route.an_fp16_call_on_an_h100_is_on_par, "sm90"),
         *cells_of(route.a_long_sequence_is_on_par_with_the_reference_path),
-        *cells_of(route.an_accurate_call_the_template_refuses_runs_the_reference_path_on_ieee_products),
+        *cells_of(route.the_fast_form_on_a_gpus_default_route_is_not_on_par_with_ieee_fp32),
     ])
 

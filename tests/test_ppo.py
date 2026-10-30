@@ -37,7 +37,7 @@ FIXTURE = Path(__file__).parent / "fixtures/rl/ppo.npz"
 
 class TokenFeatures(nn.Module):
     @nn.compact
-    def hidden_states(self, tokens, train=False, *, segment_ids=None, positions=None):
+    def hidden_states(self, tokens, train=False, *, coordinates=None):
         scale = self.param("scale", nn.initializers.ones, (VOCAB,))
         return jax.nn.one_hot(tokens, VOCAB) * scale
 
@@ -503,3 +503,24 @@ def test_rejected_actor_tokens_leave_only_the_weighted_critic_support(coefficien
     changed = any(not np.array_equal(start, end) for start, end in zip(
         jax.tree.leaves(before["critic"]), jax.tree.leaves(state.variables["params"]["critic"]), strict=True))
     assert changed == (coefficient > 0)
+
+
+def test_a_value_head_takes_packed_rows_as_flat_fields_or_coordinates():
+    """`ValueHead`'s call is a public boundary (ledger 1122): packed rows' `segment_ids` and
+    `positions` lay out as their coordinates do, the same values bit for bit, and both together are
+    refused rather than one silently winning."""
+    from model_support import TINY_DECODER
+
+    from dew.batch import coordinates
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+
+    head = ValueHead(CausalTransformer(vocab_size=VOCAB, **TINY_DECODER))
+    tokens = jnp.asarray([[1, 2, 3, 4, 5, 6]], jnp.int32)
+    segments = jnp.asarray([[1, 1, 1, 2, 2, 2]], jnp.int32)
+    positions = jnp.asarray([[0, 1, 2, 0, 1, 2]], jnp.int32)
+    laid = coordinates(tokens.shape, segments=segments, positions=positions, max_segments=2)
+    variables = head.init(jax.random.key(0), tokens, coordinates=laid)
+    np.testing.assert_array_equal(head.apply(variables, tokens, segment_ids=segments, positions=positions),
+                                  head.apply(variables, tokens, coordinates=laid))
+    with pytest.raises(ValueError):
+        head.apply(variables, tokens, segment_ids=segments, coordinates=laid)

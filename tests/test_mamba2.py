@@ -27,7 +27,7 @@ from sequence_split_support import SPLIT_ROWS, assert_split_as_whole
 from ssd_support import mamba2_draw, mamba2_run
 
 from dew.accuracy import distance
-from dew.batch import coordinates
+from dew.batch import coordinates, field_coordinates
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import AttentionMetadata, MixerCall, ModelInputs
 from dew.nn.mixers.mamba2 import Mamba2, chunk_ssd, recurrent_ssd
@@ -389,7 +389,9 @@ def test_padded_packed_rows_reset_at_each_document():
     params = model.init(jax.random.key(0), ids)
 
     def hidden(tokens, model=model, params=params, **fields):
-        return model.apply(params, tokens, method=CausalTransformer.hidden_and_mtp_inputs, **fields)[0]
+        # The flat fields laid out once (`field_coordinates`), the layout the trunk reads.
+        return model.apply(params, tokens, method=CausalTransformer.hidden_and_mtp_inputs,
+                           coordinates=field_coordinates(fields, tokens.shape))[0]
 
     closed = hidden(closed_ids, segment_ids=closed_segments)[0]
     padded = hidden(ids, attention_mask=valid, segment_ids=segments)[0]

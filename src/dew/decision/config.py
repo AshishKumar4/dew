@@ -35,7 +35,6 @@ from dew.decision.layout import (
     Instructions,
     Labels,
     Layout,
-    OptionLines,
     QuestionLayout,
     RowOrder,
     RowSegment,
@@ -193,8 +192,8 @@ class DecisionRunConfig(DecoderRunConfig):
         """Refuse each context option a run without context layers would read nothing of: a schema read
         as the row's context, its encoder, its frozen backbone and its block's form."""
         # A schema, or a question's instructions and options, read as the row's context.
-        in_context = any(isinstance(segment, (Schema, Instructions, OptionLines))
-                         and segment.stream == "context" for segment in self.segments or ())
+        in_context = any(isinstance(segment, (Schema, Instructions)) and segment.stream == "context"
+                         for segment in self.segments or ())
         if in_context and self.context_layers is None:
             raise ValueError("a row whose questions are read as its context is read by context layers; set "
                              "--context-layers")

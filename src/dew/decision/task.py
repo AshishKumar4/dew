@@ -192,11 +192,11 @@ class DecideSettings:
     context_encoder: ContextEncoder = "table"
     """How the model encodes a row's context (`DecisionModel.context_encoder`); a run recorded before
     the choice existed embedded it by its token table."""
-    questions: int | None = None
+    questions: int | None = field(default=None, metadata={"derived": "data"})
     """The most questions a row of the run's data holds (`Layout.row_questions`), as the run recorded
     it; a pass's question slots are its windows' (`Decide.pass_shapes`), so no task reads it. None where
     the run recorded none, as before it did."""
-    options: int | None = None
+    options: int | None = field(default=None, metadata={"derived": "data"})
     """The most options a question of the run's data lays out, a "none of the above" it adds included,
     which a pass of its task pads each question to (`Budget.options`); None as `questions`."""
 
@@ -284,7 +284,7 @@ class Decide(SavedRunTask, InItsForm):
         variables = joined({"backbone": bundle.variables, "head": bundle.head_variables})
         return cls(model, variables, bundle.layout, bundle.decision_tokenizer, bundle.specials,
                    bundle.calibration, name=name or str(bundle.origin or bundle.source),
-                   processor=bundle.processor)
+                   processor=bundle.processor, precision=bundle.numerics)
 
     @classmethod
     def _recorded(cls, directory: str, record: Mapping[str, object], backbone, variables: Variables,
@@ -375,7 +375,8 @@ class Decide(SavedRunTask, InItsForm):
     def averaged(cls, runs: Sequence[str], *, step: int | str | None = None, ema: bool | None = None,
                  calibrate_on: "Iterable[Example | Mapping[str, object]] | Reader | None" = None) -> Self:
         """The task over `runs`' weights as any runs average (`dew.checkpoints.averaged`: their fp32
-        mean, each run's at `step`, its latest where None, and `ema` as `from_run` reads them, a LoRA
+        mean, each run's at `step`, its latest where None, `SavedRun.at`, and `ema` as `from_run`
+        reads them, a LoRA
         backbone's factors merged first), its calibration the identity, or refit on `calibrate_on`'s
         held-out answers (`calibrated`): temperatures are fitted to one set of weights.
 
@@ -389,7 +390,7 @@ class Decide(SavedRunTask, InItsForm):
         from dew.checkpoints import averaged_pinned
         from dew.inference.tasks import saved_settings
 
-        pinned = [SavedRun.pinned(directory, step) for directory in runs]
+        pinned = [SavedRun.at(directory, step) for directory in runs]
         recorded = [run.record for run in pinned]
         settings = [saved_settings(saved, DecideSettings) for saved in recorded]
         padded = ("questions", "options")
@@ -513,7 +514,6 @@ class Decide(SavedRunTask, InItsForm):
             checkpoints.save(self.weights.step, state, artifact=record)
             checkpoints.wait()
 
-    @traced_in_its_form
     @overload
     def __call__(self, state: JSON, questions: Mapping[str, Question], *,
                  images: Sequence[Image.Image] = (), context: JSON | None = None) -> dict[str, Answer]: ...
@@ -522,6 +522,7 @@ class Decide(SavedRunTask, InItsForm):
     def __call__(self, state: Sequence[tuple[JSON, Mapping[str, Question]]], questions: None = None, *,
                  contexts: Sequence[JSON | None] | None = None) -> list[dict[str, Answer]]: ...
 
+    @traced_in_its_form
     def __call__(self, state, questions=None, *, images=(), context=None, contexts=None):
         """Return one answer per question in `questions`, about `state` and any `images`; or, given a
         sequence of `(state, questions)` requests and no `questions`, each request's answers in order.
@@ -613,6 +614,12 @@ class Decide(SavedRunTask, InItsForm):
                        bins=shape.rows)
 
     @functools.cached_property
+    def _row_scoring(self) -> "RowScoring":
+        """The task's rows as a scoring task over no weights, held once so its passes' plans and
+        compiled programs are built once (`logits`)."""
+        return RowScoring(replace(self, variables={}))
+
+    @functools.cached_property
     def _bounds(self) -> dict[int, Bounds]:
         """Each pass length's window bounds, as a run's windows of that length hold them
         (`DecisionObjective.bounds`): the layout's window and its halvings, none shorter than the
@@ -696,7 +703,8 @@ class Decide(SavedRunTask, InItsForm):
         `Images.joined` takes them (`seen_together`)."""
         assert self.processor is not None, "a row of images was laid out with the processor"
         encoded = [row for row, _ in rows]
-        inputs = DecisionInputs.collate(encoded, self.specials.pad, context_length=self.context_length)
+        inputs = DecisionInputs.collate(encoded, self.specials.pad, context_length=self.context_length,
+                                        attention=self.layout.attention)
         held = self.variables if variables is None else variables
         scores = np.asarray(self._forward(held, inputs, media=Images.joined(self.processor, rows)))
         return [scores[index, :len(row.questions)] for index, row in enumerate(encoded)]
@@ -741,7 +749,7 @@ class Decide(SavedRunTask, InItsForm):
         programs (`RowScoring`, `dew.inference.scoring.ScoringServer`), one path for a call and a
         server alike.
         """
-        server = scoring.ScoringServer(RowScoring(replace(self, variables={})), self.variables)
+        server = scoring.ScoringServer(self._row_scoring, self.variables)
         order = sorted(range(len(rows)), key=lambda index: len(rows[index].tokens))
         futures = {index: server.submit(rows[index]) for index in order}
         server.run()
@@ -782,7 +790,7 @@ class Decide(SavedRunTask, InItsForm):
         laid = [read.map(window) for window, _ in windows]
         batch = {name: np.stack([window[name] for window in laid]) for name in laid[0]}
         inputs = laid_out(batch, bounds.segments, spans_in_context=in_context,
-                          whole_blocks=whole_blocks_of(self.layout))
+                          whole_blocks=whole_blocks_of(self.layout), attention=self.layout.attention)
         padded = RowPlan(None, len(windows), shape.rows, 0, 1).pad(inputs)
         held = self.variables if variables is None else variables
         plan = RowPlan.over(mesh_of(held), shape.rows)
@@ -915,7 +923,8 @@ class Decide(SavedRunTask, InItsForm):
         segments = self.layout.bounds(self.tokenizer, self.specials, self.context_length).segments
         for batch in reader(DataPartition()):
             inputs = laid_out(batch, segments, spans_in_context=self.layout.spans_in_context,
-                              whole_blocks=whole_blocks_of(self.layout))
+                              whole_blocks=whole_blocks_of(self.layout),
+                              attention=self.layout.attention)
             logits = np.asarray(self._forward(self.variables, inputs))
             answered = (np.asarray(batch["scored"])
                         & (np.asarray(Objective.row_weights(batch, len(logits))) > 0)[:, None])
@@ -1342,11 +1351,13 @@ def _ordered(laid: Laid, logits: np.ndarray) -> np.ndarray:
 
 
 def laid_out(batch: Mapping[str, object], max_segments: int, *, spans_in_context: bool = False,
-             whole_blocks: bool = False) -> DecisionInputs:
+             whole_blocks: bool = False,
+             attention: tuple[tuple[tuple[int, ...], ...], int] | None = None) -> DecisionInputs:
     """The `DecisionInputs` of a batch of packed windows (`PackedRows`), each
     holding at most `max_segments` rows, the questions' spans in each row's context where
-    `spans_in_context` (`JointLayout.schema_in_context`), each row's block the whole row where
-    `whole_blocks` (`whole_blocks_of`)."""
+    `spans_in_context` (`JointLayout.spans_in_context`), each row's block the whole row where
+    `whole_blocks` (`whole_blocks_of`), its rows read in their streams as their layout's `attention`
+    says (`Layout.attention`)."""
     def array(name: str) -> jax.Array:
         return jnp.asarray(batch[name])
 
@@ -1360,7 +1371,9 @@ def laid_out(batch: Mapping[str, object], max_segments: int, *, spans_in_context
                           option_slots=given("option_slots"), slotted=given("slotted"),
                           context=given("context"), context_lengths=given("context_lengths"),
                           context_segments=given("context_segments"), question_rows=given("question_rows"),
-                          blocks=given("blocks"), max_segments=max_segments,
+                          blocks=given("blocks"), streams=given("streams"),
+                          reads=None if attention is None else attention[0],
+                          fragments=1 if attention is None else attention[1], max_segments=max_segments,
                           spans_in_context=spans_in_context, whole_blocks=whole_blocks and "blocks" in batch)
 
 

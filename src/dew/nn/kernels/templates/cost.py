@@ -147,15 +147,3 @@ def waiting_seconds(cost: Cost, latency: float, clock: float) -> float:
     law, the module's docstring)."""
     ahead = cost.stages - 1 - cost.in_flight
     return cost.steps * latency / max(min(ahead, math.ceil(cost.steps)), 1) / clock
-
-
-def resident(target: generation.GpuTarget, staged: int, threads: int, registers: int) -> int:
-    """How many programs, each staging `staged` bytes of shared memory and running `threads` threads of
-    `registers` registers each, one multiprocessor of `target` holds at once: at least one, the launch
-    fitted to a block (`Template.fitting`)."""
-    facts = target
-    shared = generation.shared_budget(facts) + RESERVED_SHARED
-    by_shared = shared // (staged + RESERVED_SHARED)
-    by_registers = REGISTERS // (threads * min(registers, THREAD_REGISTERS))
-    return max(1, min(by_shared, by_registers))
-

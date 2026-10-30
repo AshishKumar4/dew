@@ -15,7 +15,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 
-from dew.batch import Variables
+from dew.batch import Variables, coordinates
 from dew.diffusion.process import DenoisingCondition
 from dew.inputs.condition import ConditionEncoder, ConditionWork
 from dew.nn.blocks import torch_nearest_resize
@@ -576,8 +576,9 @@ class HiddenStatesConditioner(_LanguageText):
                              "are no layer's output")
         states = _layer_states(self.tower, {"params": params["text_encoder"]["params"]}, ids,
                                [layer - 1 for layer in self.layers],
-                               attention_mask=jnp.asarray(tokens["attention_mask"], bool),
-                               positions=jnp.broadcast_to(jnp.arange(ids.shape[1]), ids.shape))
+                               coordinates=coordinates(
+                                   ids.shape, valid=jnp.asarray(tokens["attention_mask"], bool),
+                                   positions=jnp.broadcast_to(jnp.arange(ids.shape[1]), ids.shape)))
         guidance = None if self.guidance is None else jnp.asarray(tokens["guidance"], jnp.float32)
         return DenoisingCondition(jnp.concatenate(states, axis=-1),
                                   mask=jnp.asarray(tokens["attention_mask"], bool), guidance=guidance)

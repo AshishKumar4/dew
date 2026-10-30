@@ -55,6 +55,16 @@ from dew.nn.precision import (
 )
 
 
+def folds(scale: float, prescale: float, *, natural: bool, score_mod) -> bool:
+    """Whether a call folds log2(e) into its logits' scale for exp2 (`Forward.base2`, which says why), from
+    the scale left past its queries' power of two (`attention.prescale`) and that power: the factor as the
+    kernel multiplies the call's own products by it, rounded to fp32, below 1 in magnitude, the call not
+    keeping its logits `natural` and no score hook reading them. The one owner of the choice, which a
+    mainloop's derivation reads too (`attention_mosaic.MosaicForward`, row 2583)."""
+    factor = abs(float(np.float32(scale * prescale * LOG2E)))
+    return not natural and score_mod is None and factor < 1.0
+
+
 @dataclasses.dataclass(frozen=True)
 class Forward:
     """What the forward's functions specialize on, all static: the spans' `form` ('full', 'causal' or
@@ -109,10 +119,7 @@ class Forward:
         under a query of 1 at scale 0.5 weigh 1 and 0 in the reference and 0.5 each folded, and a
         cotangent of 2**125 then overflows its backward (docs/design/kernel-templates.md, §3, the
         exponent's forms). On drawn inputs both forms pass check 1."""
-        # The factor as the kernel would multiply the call's own products by it, rounded to fp32: the call's
-        # scale, its products' power of two (`prescale`) times the scale left after it.
-        factor = abs(float(np.float32(self.scale * self.prescale * LOG2E)))
-        return not self.natural and self.score_mod is None and factor < 1.0
+        return folds(self.scale, self.prescale, natural=self.natural, score_mod=self.score_mod)
 
     @property
     def factor(self) -> float:
@@ -452,6 +459,10 @@ def walked_launches[O](spec: Forward, launch: Launch[O], kept: Callable[[jax.Arr
     return jax.lax.cond(reach >= FOLD_REACH, unfolded_launch, lambda: guarded_launch(spec, outputs, over))
 
 
+NATURAL_EXPONENT_REACH = 150.0
+"""The largest `|k|` `natural_exp` hands `power2`: its reduced exponent's integral part, its argument held to
+[-150, 128] (every fp32 exponential outside is zero or infinite), rounded up by at most one."""
+
 POWER2_REACH = 381.0
 """The largest `|k|` `power2` takes apart: past it every fp32 `x * 2^k` is zero or infinite (`2^-381` of
 fp32's largest flushes, `2^381` of its least overflows), so `k` is held there."""
@@ -467,13 +478,23 @@ def exact_power2(k: jax.Array) -> jax.Array:
     return jax.lax.bitcast_convert_type(bits, jnp.float32)
 
 
-def power2(x: jax.Array, k: jax.Array) -> jax.Array:
+def power2(x: jax.Array, k: jax.Array, reach: float = POWER2_REACH) -> jax.Array:
     """`x * 2^k` for an integral `k` of any size, exactly wherever the result is a normal fp32: three exact
     factors each within 2^±127 (`exact_power2`), of `k`'s sign, so each partial product lies between `x`
-    and the result; `k` held within `POWER2_REACH`, past which the result is zero or infinite. `k` is
-    carried as the integer its contract makes it, so its thirds and halves are integer divisions, exact,
-    floored, which keeps each part of `k`'s sign, and no factor converts it again."""
-    k = jnp.clip(jnp.asarray(k, jnp.float32), -POWER2_REACH, POWER2_REACH).astype(jnp.int32)
+    and the result; `k` held within `reach` (`POWER2_REACH`, past which the result is zero or infinite, by
+    default). `k` is carried as the integer its contract makes it, so its thirds and halves are integer
+    divisions, exact, floored, which keeps each part of `k`'s sign, and no factor converts it again. A caller
+    whose `k` stays within twice 127 states its `reach` and takes two factors, each built as its product
+    takes it: one integer tile live, not two (et-livehook1: power2's factor tiles 66 of the natural forward's
+    281 registers at its peak)."""
+    k = jnp.clip(jnp.asarray(k, jnp.float32), -reach, reach)
+    if reach <= 2 * 127:
+        # The half truncated from an exact multiply, `k` an integer only at each factor's bias: an int32 `k`
+        # halved (a shift or a floored division alike) spilled an A100's recurrence query_key launch 32
+        # bytes at the 27B gated delta net's training tiles, the float half none (gate_one, ledger 2519).
+        half = jnp.trunc(k * np.float32(0.5))
+        return x * exact_power2(half.astype(jnp.int32)) * exact_power2((k - half).astype(jnp.int32))
+    k = k.astype(jnp.int32)
     first = k // 3
     second = (k - first) // 2
     return x * exact_power2(first) * exact_power2(second) * exact_power2(k - first - second)
@@ -508,7 +529,8 @@ def natural_exp(x: jax.Array, scale: float = 1.0) -> jax.Array:
     exponent += (bounded - exponent >= 0.5).astype(x.dtype)
     live = (jnp.abs(x) < jnp.inf) & (hi >= -150.0) & (hi <= 128.0)
     lo = jnp.where(live, lo, 0.0)
-    return power2(jnp.exp2((bounded - exponent) + lo), exponent)
+    # The exponent within [-150, 129]: two factors take it (`power2`'s `reach`).
+    return power2(jnp.exp2((bounded - exponent) + lo), exponent, reach=NATURAL_EXPONENT_REACH)
 
 
 def headroom(dtype) -> bool:

@@ -501,9 +501,9 @@ def test_a_training_call_that_drops_attention_reads_each_documents_real_tokens(t
 
     @jax.jit
     def trained(ids, segments, valid):
-        logits = loaded.model.apply(loaded.variables, ids, train=True, segment_ids=segments,
-                                    attention_mask=valid, method="logits",
-                                    rngs={"dropout": jax.random.key(5)})
+        logits = loaded.model.apply(loaded.variables, ids, train=True,
+                                    coordinates=coordinates(ids.shape, segments=segments, valid=valid),
+                                    method="logits", rngs={"dropout": jax.random.key(5)})
         return {"logits": jnp.where(valid[..., None], logits, 0)}
 
     def ours(ids, segments, valid, _):
@@ -861,7 +861,8 @@ def test_a_tier_3_models_final_states_and_head_are_transformers(case, tmp_path):
         keys = {"attention_key_positions": positions} if keyed else {}
         stated = ({"attention_key_runs": key_runs(slots, jnp.ones_like(slots), 3, causal=True)} if runs
                   else {"attention_pairwise_mask": visible})
-        hidden = loaded.model.apply(variables, tokens, positions=positions, method="hidden_states", **stated,
+        laid = coordinates(tokens.shape, positions=positions)
+        hidden = loaded.model.apply(variables, tokens, coordinates=laid, method="hidden_states", **stated,
                                     **keys)
         return hidden, loaded.model.apply(variables, hidden, method="logits_from_hidden")
 
