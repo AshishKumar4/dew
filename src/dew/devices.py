@@ -189,7 +189,11 @@ def preallocate_gpu_pool() -> None:
     of temporaries, and recomputed under 'minimal'; with 95% preallocated it
     ran without, 351 ms a step against 403 (an A100-40 at 4 x 3072, 389
     against 444 ms; gdn-one-path e3c90a968, runs/SwiftHeron/parity-*-gdn).
-    JAX's default 75% holds less than that step's 71.8 GiB peak."""
+    JAX's default 75% holds less than that step's 71.8 GiB peak.
+
+    It is a training process's (`dew.training.prepare_process`, `dew train`), which owns its GPUs; a
+    Trainer fit in a process Dew did not prepare (a notebook, another program's) keeps JAX's 75%,
+    which its backend has already taken, and shares its GPU as that program chose."""
     if backend_open():
         return
     named = ("XLA_PYTHON_CLIENT_MEM_FRACTION", "XLA_PYTHON_CLIENT_PREALLOCATE", "XLA_PYTHON_CLIENT_ALLOCATOR")
