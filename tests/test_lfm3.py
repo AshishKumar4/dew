@@ -82,6 +82,45 @@ def test_a_native_decoder_saves_as_lfm3_and_reloads_the_same_model(tmp_path, san
     np.testing.assert_array_equal(np.asarray(restored.model.apply(restored.variables, ids)), expected)
 
 
+@pytest.mark.parametrize("arm", ["plain", "looped"])
+def test_plain_and_looped_lfm3_train_through_a_decision_run(tmp_path, release_cache, arm):
+    """Plain and looped LFM3 (LiquidAI/LFM3-1.7B at da90f4c, whose config, code and weights are
+    40ebe0a's, which Dew is held to; ledger 2011): a decision run from an LFM3 release trains at a fixed
+    rate, plain and with a block of its layers looped twice (`--loop-layers`, `--loop-steps`), a short
+    convolution and full and sliding attention among them: every weight it trains finite and moved,
+    and the run records its loop."""
+    import shutil
+
+    from model_support import flat_tree
+    from test_decision_recipe import QWEN, TICKETS
+
+    from dew.decision.config import DecisionRunConfig
+    from dew.interop import PretrainedDecoder
+
+    # The tiny release at the vocabulary of a tokenizer a decision layout reads its specials from.
+    model = Pretrained.load(TINY, dtype='float32', attention_impl='reference').model.clone(vocab_size=289)
+    variables = model.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32))
+    PretrainedDecoder.from_model(model, variables).save(tmp_path / 'release')
+    for name in ('tokenizer.json', 'tokenizer_config.json', 'chat_template.jinja'):
+        shutil.copy(QWEN / name, tmp_path / 'release' / name)
+    looped = ["--loop-layers", "1", "5", "--loop-steps", "2"] if arm == "looped" else []
+    config = DecisionRunConfig.cli([
+        "--pretrained", str(tmp_path / 'release'), "--trainer.name", arm,
+        "--trainer.checkpoint-dir", str(tmp_path / "runs"), "--trainer.steps", "2",
+        "--trainer.eval-every", "None", "--trainer.checkpoint-every", "None", "--trainer.log-every", "1",
+        "--trainer.multi-host", "False", "--trainer.compilation-cache-dir", "None",
+        "--model.dtype", "float32", "--optim.learning-rate", "5e-06", *looped],
+        default=DecisionRunConfig(data=TICKETS))
+    state = config.run()
+    trained = flat_tree(jax.device_get(state.variables["params"]["backbone"]))
+    start = flat_tree(variables["params"])
+    assert set(trained) == set(start)
+    assert all(np.isfinite(trained[name]).all() for name in trained)
+    assert any(not np.array_equal(trained[name], start[name]) for name in trained)
+    recorded = DecisionRunConfig.load(str(tmp_path / "runs" / arm))
+    assert (recorded.loop_layers, recorded.loop_steps) == (((1, 5), 2) if looped else (None, None))
+
+
 def test_a_config_that_omits_its_pattern_and_rotary_reads_lfm3s_own():
     """A config that states no layer_types, rope_parameters or norm_eps reads Lfm3Config's: full
     attention at every fourth layer from the third, sliding from the fifth, convolutions between; the
