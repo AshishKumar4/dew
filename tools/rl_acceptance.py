@@ -39,13 +39,9 @@ class _Tracker:
         self.began, self.scalars = time.perf_counter(), []
 
     def log(self, scalars, step) -> None:
-        self.scalars.append(
-            {
-                "step": int(step),
-                "seconds": time.perf_counter() - self.began,
-                **{name: float(value) for name, value in scalars.items()},
-            }
-        )
+        """The training scalars by their own names, `train/` dropped."""
+        named = {name.removeprefix("train/"): float(value) for name, value in scalars.items()}
+        self.scalars.append({"step": int(step), "seconds": time.perf_counter() - self.began, **named})
 
     def artifact(self, value, step) -> None:
         del value, step
