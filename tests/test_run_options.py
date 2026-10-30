@@ -369,7 +369,11 @@ def alternatives(annotation, base=None) -> list[object]:
         members = typing.get_args(annotation)
         found = []
         for member in members:
-            values = [None] if member is type(None) else [1] if member is int else alternatives(member, base)
+            # A count's witnesses: one, and one past the saved count, which a budget that one would cut
+            # to nothing takes (a layout's option tokens).
+            counts = [1, *([base + 1] if type(base) is int else [])]
+            values = ([None] if member is type(None) else counts if member is int
+                      else alternatives(member, base))
             if dataclasses.is_dataclass(member) and not isinstance(base, member):
                 values = [*members_built(member), *values]
             found += [value for value in values if value not in found]
