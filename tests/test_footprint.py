@@ -97,7 +97,8 @@ def test_a_gpu_pullback_counts_a_transcendental_chain_as_the_product_it_is_recom
 def test_a_gradients_peak_holds_the_gradient_beside_the_cotangent_each_residual_freed_after_its_read():
     """The most a gradient program holds at once, in its traced order: through two products, the second
     weight's gradient and the first layer's cotangent, then the first weight's gradient beside them, each
-    residual (the first layer's output, the second's) freed after its last read, which comes before."""
+    residual (the first layer's output, the second's) freed after its last read, which comes before; and
+    beside each matrix product the workspace the device gives its GEMMs, one at a time."""
     rows = jax.ShapeDtypeStruct((8, 16), jnp.float32)
     params = {"first": jax.ShapeDtypeStruct((16, 64), jnp.float32),
               "second": jax.ShapeDtypeStruct((64, 16), jnp.float32)}
@@ -106,22 +107,60 @@ def test_a_gradients_peak_holds_the_gradient_beside_the_cotangent_each_residual_
         return jnp.sum(jnp.exp((rows @ params["first"]) @ params["second"])), ()
 
     # Both gradients, 64 x 16 floats each, and the first layer's cotangent, 8 x 64.
-    assert gradient_peak(loss, params, (rows,), platform="gpu") == (2 * 64 * 16 + 8 * 64) * 4
+    held = (2 * 64 * 16 + 8 * 64) * 4
+    assert gradient_peak(loss, params, (rows,), platform="gpu", workspace=0) == held
+    assert gradient_peak(loss, params, (rows,), platform="gpu", workspace=1 << 20) == held + (1 << 20)
+
+
+def test_a_fused_value_a_product_reads_is_held_while_it_multiplies():
+    """A value XLA's fusion would recompute is held where a matrix product reads it, which takes its
+    operands from memory: the exponentials of the rows, a product's operand, and the cotangent of the
+    product's hyperbolic tangent, the weight's gradient's operand, are both held beside that gradient as
+    it is computed, with the product the cotangent is recomputed from."""
+    rows, weights = jax.ShapeDtypeStruct((8, 16), jnp.float32), jax.ShapeDtypeStruct((16, 32), jnp.float32)
+
+    def loss(weights, rows):
+        return jnp.sum(jnp.tanh(jnp.exp(rows) @ weights)), ()
+
+    # The gradient (16 x 32), the exponentials (8 x 16), the cotangent and the product (8 x 32 each).
+    assert gradient_peak(loss, weights, (rows,), platform="gpu", workspace=0) == (
+        16 * 32 + 8 * 16 + 2 * 8 * 32) * 4
+
+
+def test_a_gradient_a_fused_chain_computes_is_held():
+    """A gradient the program returns is held whatever computes it: a sine's, its cosine, which no product
+    reads, is the program's output."""
+    shape = jax.ShapeDtypeStruct((8, 16), jnp.float32)
+
+    def sine(params):
+        return jnp.sin(params).sum(), ()
+
+    for platform in ("gpu", "cpu"):
+        assert gradient_peak(sine, shape, (), platform=platform, workspace=0) == 8 * 16 * 4
+
+
+def test_a_called_program_holds_what_it_would_inline():
+    """A program called within the gradient (a jitted function's) holds at its peak what it would hold
+    inlined: its results once, as the caller's."""
+    rows, weights = jax.ShapeDtypeStruct((8, 16), jnp.float32), jax.ShapeDtypeStruct((16, 32), jnp.float32)
+
+    def inline(weights, rows):
+        return jnp.sum(jnp.tanh(rows @ weights)), ()
+
+    def called(weights, rows):
+        return jnp.sum(jnp.tanh(jax.jit(jnp.matmul)(rows, weights))), ()
+
+    assert gradient_peak(called, weights, (rows,), platform="gpu", workspace=0) == gradient_peak(
+        inline, weights, (rows,), platform="gpu", workspace=0)
 
 
 @pytest.mark.parametrize(("generation", "workspace"), [("sm80", 4 << 20), ("sm90", 32 << 20)])
-def test_a_derived_step_holds_the_gemm_workspace_xla_gives_its_gpu(generation, workspace):
-    """A derived step on a CUDA GPU holds beside its gradient program's peak the workspace XLA hands each
-    cuBLAS matmul (gemm_rewriter's `GemmWorkspaceRewriteVisitor`): 32 MiB from Hopper on, 4 MiB before
-    (`GemmConfig::kHopperWorkspace`, `kDefaultWorkspace`); a CPU's matmuls take none."""
+def test_a_gpu_gives_each_gemm_the_workspace_xla_hands_it(generation, workspace):
+    """XLA hands each cuBLAS matmul a workspace (gemm_rewriter's `GemmWorkspaceRewriteVisitor`): 32 MiB from
+    Hopper on, 4 MiB before (`GemmConfig::kHopperWorkspace`, `kDefaultWorkspace`); a CPU's take none."""
     from dew.training.ahead import compile_only_gpus
-    from dew.training.footprint import Footprint
-    from dew.training.memory import derived_headroom
+    from dew.training.footprint import gemm_workspace
 
-    capacity = 1 << 30
-    step = Footprint(residuals=1 << 20, gradients=1 << 20, held=0, peak=2 << 20)
-    (gpu,) = compile_only_gpus(generation, 1, capacity)
-    empty = Footprint(residuals=0, gradients=0, held=0, peak=0)
-    # The workspace is one buffer beside every step, whatever its peak.
-    assert derived_headroom(empty, [gpu], capacity) == capacity - workspace
-    assert derived_headroom(step, [gpu], capacity) == capacity - workspace - (2 << 20)
+    (gpu,) = compile_only_gpus(generation, 1, 1 << 30)
+    assert gemm_workspace(gpu) == workspace
+    assert gemm_workspace(jax.devices("cpu")[0]) == 0
