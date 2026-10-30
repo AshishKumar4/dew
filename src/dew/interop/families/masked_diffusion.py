@@ -23,6 +23,7 @@ from dew.interop.decoder_parts import (
     Renames,
     Ropes,
     RopeSpelling,
+    SourceCode,
     base_config,
     decoder_tensors,
     plain_partial_rope,
@@ -317,7 +318,8 @@ def _llada_moe_v2_config(hf_config: Mapping[str, object], used: set[str]) -> Dec
     return _llada_moe_config(hf_config, used, v2=True)
 
 
-def _llada2_walk(config: Mapping[str, object]) -> MaskedWalk | None:
+def _llada2_walk(config: Mapping[str, object], generation: Mapping[str, object],
+                 code: SourceCode | None) -> MaskedWalk | None:
     """LLaDA2's own generation, where Dew runs it: 2.0's `generate` walks blocks of 32 over 32 steps
     each at temperature 0, revealing past 0.95 (modeling_llada2_moe.py:1233-1247 at dad945c). 2.1's
     configs read as 2.0's and take the same walk, without the release's editing of revealed tokens,
@@ -327,7 +329,56 @@ def _llada2_walk(config: Mapping[str, object]) -> MaskedWalk | None:
     if any(config.get(field) is not None
            for field in ("delete_token_id", "split_token_id", "block_size", "expert_capacity")):
         return None
-    return MaskedWalk(block=32, steps=32, threshold=0.95, temperature=0.0)
+    from dew.diffusion.discrete import Confident
+
+    return MaskedWalk(Confident(threshold=0.95, temperature=0.0), steps=32, block=32)
+
+
+DREAM_SAMPLING = {'7f8ad01484898946b3c9c9d5ebc85e5ac726061d0fa7b4a522c4b8110c13a921': None,
+                  '99318e7261e858be87e0aa5c7cccfbb2912d166c2b4218f0f81a07f922b5cf55': 1e-12}
+"""The Dream releases' generation code Dew walks as they sample, by the sha256 of their
+`generation_utils.py`, each with the time its grid runs to: Dream-v0's (Dream-org/Dream-v0-Base-7B at
+6572adb, Dream-v0-Instruct-7B the same file) reads `eps` from the generation config (None here);
+DiffuCoder's (apple/DiffuCoder-7B-Base at a2c33054, its Instruct and cpGRPO the same file) fixes 1e-12
+whatever the config states. Dream-Coder's adds an end-token penalty to its logits, a walk Dew does not
+run."""
+
+DREAM_GENERATION = {'alg': 'origin', 'alg_temp': None, 'eps': 1e-3, 'steps': 512, 'temperature': 0.0,
+                    'top_p': None, 'top_k': None}
+"""DreamGenerationConfig's defaults for the controls its `_sample` reads (generation_utils.py:96-110)."""
+
+
+def _dream_walk(config: Mapping[str, object], generation: Mapping[str, object],
+                code: SourceCode | None) -> MaskedWalk | None:
+    """Dream's own generation, where Dew runs it: `diffusion_generate`'s `alg='origin'`
+    (generation_utils.py `_sample`), each of `steps` revealing every masked position with chance
+    `1 - s/t` over `linspace(1, eps, steps + 1)`, all at the last, each revealed position taking its
+    token at `temperature` (its best at 0), which is `Unmask` on that grid (`DiscreteProcess.endpoint`).
+    The grid's end is the release's code's (`DREAM_SAMPLING`, by its `generation_utils.py`), the other
+    controls the generation config's, DreamGenerationConfig's defaults where it states none. None for
+    a source whose code Dew does not know, or that asks what `origin` does not take (another `alg`, a
+    `top_p` or `top_k`), which the task then refuses by name (`audit_masked`)."""
+    import hashlib
+
+    from dew.diffusion.discrete import Unmask
+    from dew.interop.sources import code_file
+
+    # The modeling code imports its sampling from the file beside it (`from .generation_utils import`).
+    sampling = None if code is None else code_file(code, 'generation_utils.py')
+    if sampling is None:
+        return None
+    digest = hashlib.sha256(sampling.read_bytes()).hexdigest()
+    if digest not in DREAM_SAMPLING:
+        return None
+    stated = {**DREAM_GENERATION,
+              **{name: generation[name] for name in DREAM_GENERATION if name in generation}}
+    if stated['alg'] != 'origin' or stated['top_k'] is not None or stated['top_p'] not in (None, 1, 1.0):
+        return None
+    endpoint = DREAM_SAMPLING[digest]
+    return MaskedWalk(
+        Unmask(temperature=float(_records.number(stated['temperature'], 'temperature'))),
+        steps=_records.integer(stated['steps'], 'steps'),
+        endpoint=float(_records.number(stated['eps'], 'eps')) if endpoint is None else endpoint)
 
 
 def _llada2_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
@@ -588,6 +639,7 @@ DREAM = DecoderFamily(
     # DreamConfig default is 151643.
     defaults={'pad_token_id': 151643},
     padding_idx=True,
+    masked_walk=_dream_walk,
 )
 
 LLADA = DecoderFamily(

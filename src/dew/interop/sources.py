@@ -209,6 +209,23 @@ def remote_code(name_or_dir: str | Path, directory: Path) -> Path:
     return directory
 
 
+def code_file(code: SourceCode, name: str) -> Path | None:
+    """The file `name` beside a source's own code (`SourceCode`): a directory's own, or the Hub repo's at
+    the code's commit, fetched through the hub's cache, which a cached commit's file is read from without
+    the network; None where the source holds no such file."""
+    if os.path.isdir(code.source):
+        path = Path(code.source) / name
+        return path if path.is_file() else None
+    from huggingface_hub import hf_hub_download
+    from huggingface_hub.errors import EntryNotFoundError
+
+    try:
+        return Path(hf_hub_download(str(code.source), f"{code.folder}/{name}" if code.folder else name,
+                                    revision=code.revision))
+    except EntryNotFoundError:
+        return None
+
+
 def code_modules(code: SourceCode) -> dict[str, Path]:
     """A source's own modules (`SourceCode`), by their path in the source: those its config's `auto_map`
     names, and every module they import relatively, as transformers resolves a remote module's imports

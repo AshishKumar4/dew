@@ -161,7 +161,7 @@ def test_a_run_over_llada2_saves_and_serves_its_walk(tmp_path):
     exported = {**json.loads((FIXTURES / "llada22-tiny" / "config.json").read_text())}
     for field in ("delete_token_id", "split_token_id"):
         exported.pop(field)
-    assert family_entry("llada2_moe").masked_walk(exported) is None
+    assert family_entry("llada2_moe").masked_walk(exported, {}, None) is None
     assert isinstance(pipeline(str(FIXTURES / "llada2-tiny")).solver, Confident)
     objective = MaskedDiffusionObjective(source, MDLM(mask_id=source.model.mask_token_id)(), 8,
                                          ema_decay=None, processor=RunProcessor(ByteTokenizer()))

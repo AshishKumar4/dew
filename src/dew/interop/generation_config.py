@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import functools
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -270,14 +270,18 @@ def _active(config: Mapping[str, object], generation_config: Mapping[str, object
     return None if _neutral(value, neutral) else value
 
 
-def audit_masked(config: Mapping[str, object], generation_config: Mapping[str, object]) -> None:
+def audit_masked(config: Mapping[str, object], generation_config: Mapping[str, object],
+                 walked: Collection[str] = ()) -> None:
     """Refuse the active source controls a masked model cannot honour.
 
     Native MDLM has no AR policy chain and no KV cache, so only the controls a
-    task owns are left standing.
+    task owns are left standing, and those the release's own walk reads
+    (`walked`, its family's `masked_walk`, as Dream's `alg`, `steps` and `eps`).
     """
     refused = []
     for name in sorted(_CONTROLS.keys() | generation_config.keys()):
+        if name in walked:
+            continue
         rule = _CONTROLS.get(name)
         if rule is not None and rule.owner in ("task", "metadata", "inapplicable"):
             continue

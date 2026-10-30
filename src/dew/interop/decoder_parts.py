@@ -1899,15 +1899,16 @@ class SourceCode:
 
 @dataclass(frozen=True)
 class MaskedWalk:
-    """How a masked diffusion release generates, its own recipe: a response walked `block` places at a
-    time over `steps` each, drawing at `temperature` and revealing the draws past `threshold` of their
-    distribution, else a quota's most confident (`dew.diffusion.discrete.Confident`), as LLaDA2.0's
-    `generate` defaults do (modeling_llada2_moe.py's block_length, steps, threshold and temperature)."""
+    """How a masked diffusion release generates, its own recipe: its `solver`
+    (`dew.diffusion.discrete`'s `Confident` for LLaDA2.0's reveal, `Unmask` for Dream's `origin`),
+    `steps` a walk, a block's where the response is walked `block` places at a time (LLaDA2.0's
+    `generate`), and the time its grid runs to (`DiscreteProcess.endpoint`, Dream's `eps`), None for
+    MDLM's."""
 
-    block: int
+    solver: object
     steps: int
-    threshold: float
-    temperature: float
+    block: int | None = None
+    endpoint: float | None = None
 
 
 @dataclass(frozen=True)
@@ -2002,10 +2003,12 @@ class DecoderFamily:
     """Config fields whose explicit null disables a component. Other null export fields remove
     a generic field the family does not read; these survive as JSON null instead of taking the
     source config class's default."""
-    masked_walk: Callable[[Mapping[str, object]], MaskedWalk | None] | None = None
-    """The release's own generation recipe for a masked diffusion source that walks in blocks, by its
-    config (`MaskedWalk`), which its task runs (`PretrainedMaskedDecoder.masked_recipe`); None, or a
-    config it maps to None, unmasks the whole response with Dew's MDLM."""
+    masked_walk: Callable[[Mapping[str, object], Mapping[str, object], SourceCode | None],
+                          MaskedWalk | None] | None = None
+    """The release's own generation recipe for a masked diffusion source, by its config, its
+    generation config and its own code (`MaskedWalk`), which its task runs
+    (`PretrainedMaskedDecoder.masked_walk`); None, or a source it maps to None, unmasks the whole
+    response with Dew's MDLM."""
     padding_idx: bool = False
     """Whether the source builds its token embeddings with padding_idx=config.pad_token_id
     (nn.Embedding's, or Gemma's scaled word embedding over it), so the pad row takes no gradient
