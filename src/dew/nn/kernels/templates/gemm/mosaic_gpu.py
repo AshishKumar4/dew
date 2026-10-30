@@ -346,7 +346,7 @@ class Allocations:
             slots = tiles.stages if steps is None else min(tiles.stages, steps)
             walk = tuple(plgpu.SMEM((slots, *shape), dtype) for shape, dtype in self.blocks.values())
             return resources.Scope(program=(self.staged,), walks=(walk,),
-                                   after=tuple((item.shape, item.dtype) for item in staging))
+                                   after=tuple((buffer.shape, buffer.dtype) for buffer in staging))
         multicast = ('matrix',) if tiles.cluster > 1 and 'matrix' in self.blocks else ()
         streams = family.streams(self.blocks, tiles.stages, consumers, multicast=multicast)
         return resources.Scope(program=(streams, self.staged, staging))
