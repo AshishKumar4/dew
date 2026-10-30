@@ -12,6 +12,7 @@ after a rejection is the state the accepted prefix would have left.
 
 
 import dataclasses
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -64,12 +65,42 @@ def longrope_predictor(kind="attention"):
                                                         original_max_position_embeddings=6))
 
 
-@pytest.mark.parametrize("kind", ["attention", "recurrent"])
+DSPARK = Path(__file__).parent / "fixtures" / "hf" / "deepseek-v4-dspark-tiny"
+
+
+def longrope_drafter():
+    """The tiny DeepSeek V4-Flash-0731 (`DSPARK`) with its DSpark block drafter over a trunk of plain
+    attention whose rotary switches tables past its sixth position (LongRoPE), the drafter's own sliding
+    V4 kind keeping the release's YaRN, which V4's attention takes."""
+    from dew.interop import Pretrained
+    from dew.nn.backbones.layer_plan import LayerKind
+    from dew.nn.mixers.attention import AttentionMixer
+    from dew.nn.rope import LongRopeScaling
+
+    model = Pretrained.load(DSPARK, weights=False, dtype="float32", attention_impl="reference").model
+    drafter = model.dspark.layer_type
+    head = model.head_dim or model.emb_features // model.num_heads
+    pairs = int(head * (model.partial_rotary_factor or 1.0)) // 2
+    return model.clone(
+        layer_types=("trunk",) * model.num_layers,
+        kinds={"trunk": LayerKind(mixer=AttentionMixer()),
+               drafter: dataclasses.replace(model.kinds[drafter], rope_scaling=model.rope_scaling)},
+        rope_scaling=LongRopeScaling(short_factor=(1.0,) * pairs,
+                                     long_factor=tuple(2.0 + pair for pair in range(pairs)),
+                                     original_max_position_embeddings=6))
+
+
+LONGROPE_DRAFTING = {"depth": (longrope_predictor, 1), "drafter": (longrope_drafter, 0)}
+"""The decoders that draft across a LongRoPE change, each with the prediction depths a drafting
+decode runs (`decode_ops`): a prediction depth's, and a block drafter's, which runs none."""
+
+
+@pytest.mark.parametrize("kind", ["attention", "recurrent", "dspark"])
 def test_speculation_across_a_longrope_rebuild_reproduces_the_greedy_walk(kind):
-    """A LongRoPE crossing rebuilds every cache the decode keeps (`decode_ops`), the prediction depth's
-    with the trunk's, so speculating across it at zero temperature emits the greedy walk, each row's
-    crossing inside a block."""
-    model = longrope_predictor(kind)
+    """A LongRoPE crossing rebuilds every cache the decode keeps (`decode_ops`), a prediction depth's or
+    a block drafter's with the trunk's, so speculating across it at zero temperature emits the greedy
+    walk, each row's crossing inside a block."""
+    model = longrope_drafter() if kind == "dspark" else longrope_predictor(kind)
     prompts = jnp.asarray([[1, 2, 3], [7, 8, 9]], jnp.int32)
     params = model.init(jax.random.key(0), prompts)
     walked, speculated = (generate(model, params, prompts, 6, key=jax.random.key(1),
@@ -79,24 +110,80 @@ def test_speculation_across_a_longrope_rebuild_reproduces_the_greedy_walk(kind):
     np.testing.assert_array_equal(np.asarray(speculated.lengths), 6)
 
 
-RESEED_SEEDS = 8
-"""The reseed's declared draws of prompts and stretches (check 1), sized by `seeds_for` paired with the
-crossed state on armada."""
+CROSSING_SEEDS = {"depth": 8, "drafter": 8}
+"""The crossing checks' declared draws of prompts and stretches (check 1), each decoder's the most
+either check took, sized by `seeds_for` paired on armada."""
 
 
-def test_a_longrope_crossing_reseeds_the_prediction_depth_as_a_prefill_of_its_history_does():
+@pytest.mark.parametrize("drafting", LONGROPE_DRAFTING)
+def test_a_block_across_a_longrope_change_answers_each_token_as_the_walk_does(drafting):
+    """A stretch verified from before LongRoPE's change to past it answers each of its tokens as the
+    walk a token at a time does (`decode_ops`): the one that reaches the change at the short table over
+    the cache as it stands, those past it from the history rebuilt at the long, each token's logits as
+    near the walk's float64 run as the walk's own (check 1, over drawn prompts and stretches)."""
+    from reference_error import as_given, assert_as_exact, widened
+
+    from dew.nn.inputs import ModelInputs
+    from dew.sampling.text import decode_ops, prefill_state
+
+    build, depths = LONGROPE_DRAFTING[drafting]
+    model = build()
+    params = model.init(jax.random.key(0), jnp.ones((2, 5), jnp.int32))
+
+    def walk(model, params):
+        """The prompt's prefill, then the stretch a token at a time, each token's logits."""
+        ops = decode_ops(model, params, 0, depths)
+
+        @jax.jit
+        def walked(prompts, stretch):
+            state, _ = prefill_state(model, params, ModelInputs(prompts), ops)
+            logits = []
+            for at in range(stretch.shape[1]):
+                state = ops.advance(state, stretch[:, at], jnp.ones(stretch.shape[0], bool))
+                logits.append(state.logits)
+            return jnp.stack(logits, axis=1)
+
+        return lambda prompts, stretch: np.asarray(walked(jnp.asarray(prompts), jnp.asarray(stretch)))
+
+    ops = decode_ops(model, params, 0, depths)
+
+    @jax.jit
+    def verified(prompts, stretch):
+        state, _ = prefill_state(model, params, ModelInputs(prompts), ops)
+        return ops.verify(state, stretch, jnp.ones(stretch.shape, bool))[1]
+
+    with jax.enable_x64(new_val=True):
+        wide = walk(model.clone(dtype=jnp.float64), widened(params))
+
+    def truth(prompts, stretch):
+        with jax.enable_x64(new_val=True):
+            return wide(prompts, stretch)
+
+    def draw(seed):
+        # Five prompt tokens, so the stretch's first reaches the change at the sixth and the rest pass it.
+        rng = np.random.default_rng([0x1899, 1, seed])
+        return tuple(rng.integers(1, model.vocab_size, (2, width)).astype(np.int32) for width in (5, 3))
+
+    assert_as_exact(as_given(lambda prompts, stretch: np.asarray(verified(prompts, stretch))),
+                    as_given(walk(model, params)), draw, f"a {drafting}'s block across a LongRoPE change",
+                    seeds=CROSSING_SEEDS[drafting], truth_fn=truth)
+
+
+@pytest.mark.parametrize("drafting", LONGROPE_DRAFTING)
+def test_a_longrope_crossing_reseeds_the_drafter_as_a_prefill_of_its_history_does(drafting):
     """A verified stretch that crosses the table change leaves the decoder state a prefill of the whole
-    history leaves: the trunk's cache rebuilt at the long factors, the prediction depth's cache
-    reseeded over the history, and the last state and logits, each as near the prefill's float64 run as
-    the prefill's own (check 1, over drawn prompts and stretches: the two compile apart, so their
-    roundings differ), its rows marked rebuilt."""
+    history leaves: the trunk's cache rebuilt at the long factors, the prediction depth's cache or the
+    block drafter's windows reseeded over the history, and the last state and logits, each as near the
+    prefill's float64 run as the prefill's own (check 1, over drawn prompts and stretches: the two
+    compile apart, so their roundings differ), its rows marked rebuilt."""
     from reference_error import as_given, assert_as_exact, widened
 
     from dew.nn.inputs import ModelInputs
     from dew.sampling.strategies import DecoderState
     from dew.sampling.text import decode_ops, prefill_state
 
-    model = longrope_predictor()
+    build, depths = LONGROPE_DRAFTING[drafting]
+    model = build()
     params = model.init(jax.random.key(0), jnp.ones((2, 3), jnp.int32))
     width = model.max_seq_len
 
@@ -107,7 +194,7 @@ def test_a_longrope_crossing_reseeds_the_prediction_depth_as_a_prefill_of_its_hi
 
     def prefill(model, params):
         """The prefill of a prompt and its stretch as one history, compiled once."""
-        ops = decode_ops(model, params, 0, 1)
+        ops = decode_ops(model, params, 0, depths)
 
         @jax.jit
         def run(prompts, stretch):
@@ -117,7 +204,7 @@ def test_a_longrope_crossing_reseeds_the_prediction_depth_as_a_prefill_of_its_hi
 
         return lambda prompts, stretch: floats(run(jnp.asarray(prompts), jnp.asarray(stretch)))
 
-    ops = decode_ops(model, params, 0, 1)
+    ops = decode_ops(model, params, 0, depths)
 
     @jax.jit
     def verified(prompts, stretch):
@@ -139,10 +226,10 @@ def test_a_longrope_crossing_reseeds_the_prediction_depth_as_a_prefill_of_its_hi
 
     def draw(seed):
         rng = np.random.default_rng([0x1899, seed])
-        return tuple(rng.integers(1, VOCAB, (2, width)).astype(np.int32) for width in (3, 4))
+        return tuple(rng.integers(1, model.vocab_size, (2, width)).astype(np.int32) for width in (3, 4))
 
-    assert_as_exact(crossed, as_given(prefill(model, params)), draw, "a LongRoPE crossing's reseed",
-                    seeds=RESEED_SEEDS, truth_fn=truth)
+    assert_as_exact(crossed, as_given(prefill(model, params)), draw,
+                    f"a LongRoPE crossing's {drafting} reseed", seeds=CROSSING_SEEDS[drafting], truth_fn=truth)
 
 
 def test_an_eos_inside_a_block_ends_the_row_on_the_token_that_drew_it():

@@ -519,9 +519,11 @@ def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | N
     A LongRoPE crossing costs one full-prefix forward over the whole batch
     to keep static shapes; it happens once per request. It rebuilds every
     cache the decode keeps: the trunk's over the history, and the prediction
-    depths' reseeded from it as `prefill_state` seeds them, the crossing rows
-    marked (`DecoderState.rebuilt`). A block drafter's model takes no
-    LongRoPE: its V4 attention refuses it.
+    depths' and a block drafter's reseeded from it as `prefill_state` seeds
+    them, the crossing rows marked (`DecoderState.rebuilt`). A call whose
+    tokens cross answers each as the walk a token at a time does: those up
+    to the change at the short table, over the cache as it stands, and those
+    past it from the rebuilt history.
     """
     exposed = isinstance(model, Exposing)
     blocks = (_block_drafting(model, params)
@@ -532,11 +534,11 @@ def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | N
     def run(state: DecoderState, tokens: jax.Array, valid: jax.Array
             ) -> tuple[DecoderState, jax.Array, jax.Array | None]:
         width = tokens.shape[1]
-        # The step's tokens laid out once (`Coordinates`): the real ones, at the places the rows reach.
-        laid = laid_out(tokens.shape, valid=valid, positions=None if state.positions is None else
-                        state.positions[:, None] + jnp.arange(width)[None, :])
 
-        def append():
+        def append(valid):
+            # The step's tokens laid out once (`Coordinates`): the real ones, at the places the rows reach.
+            laid = laid_out(tokens.shape, valid=valid, positions=None if state.positions is None else
+                            state.positions[:, None] + jnp.arange(width)[None, :])
             return model.apply(
                 {**params, "cache": state.cache}, jnp.where(valid, tokens, pad_id),
                 decode=True, coordinates=laid, mutable=["cache", *recorded], rngs=None,
@@ -549,7 +551,10 @@ def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | N
             history = write_cache(history, tokens, jnp.where(valid, slots, -1))
             following = lengths + jnp.sum(valid, axis=1, dtype=jnp.int32)
             crossing = (lengths <= original) & (following > original)
-            answer, updated = append()
+            # A crossing row's tokens up to the change, which the walk answers at the short table
+            # (its rotary reads a row's last real place); the rest come from the rebuilt history.
+            before = slots < original
+            answer, updated = append(valid & (before | ~crossing[:, None]))
             ordinary = (answer, updated["cache"], drafts,
                         None if blocks is None else _context(model, params, updated))
 
@@ -568,14 +573,16 @@ def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | N
                     _empty_cache(model, params, tokens.shape[0], depths, blocks is not None), state.cache)
                 answer, updated = model.apply(
                     {**params, 'cache': empty}, history, coordinates=laid_out(history.shape, valid=real),
-                    decode=True, mutable=['cache', *(['embeddings'] if depths else [])],
+                    decode=True, mutable=['cache', *(['embeddings'] if depths else []), *recorded],
                     method='states_and_logits' if exposed else None)
-                # The same answer `append` gives: states beside the logits where the model exposes them.
-                picked = jax.tree.map(lambda leaf: leaf[rows, slots], answer)
                 states = answer[0] if exposed else None
                 reseeded = dataclasses.replace(state, cache=updated['cache'])
-                # A block drafter attends through V4's attention, which takes no LongRoPE.
-                assert blocks is None, "a block drafter's model takes no LongRoPE"
+                context = None
+                if blocks is not None:
+                    # The drafter's windows over the history's context, as a prefill records them.
+                    context = _context(model, params, updated)
+                    reseeded = blocks[0](reseeded, context, real)
+                    context = context[rows, slots]
                 if depths and states is not None:
                     # The depths' caches and predecessors over the history, as a prefill seeds them.
                     reseeded = dataclasses.replace(reseeded, drafts=(states[rows[:, 0], following - 1],)
@@ -583,7 +590,16 @@ def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | N
                     embedded = jax.tree.leaves(updated['embeddings'])[0]
                     reseeded = _seeded_depths(made, reseeded, states, embedded, real, None, tokens.shape[0],
                                               width)
-                fresh = (picked, reseeded.cache, reseeded.drafts, None)
+
+                def answered(fresh, held):
+                    # The same answer `append` gives, states beside the logits where the model exposes
+                    # them: each token up to the change the short table's, past it the rebuilt one's.
+                    return jnp.where(before.reshape(*before.shape, *(1,) * (held.ndim - 2)), held,
+                                     fresh[rows, slots])
+
+                fresh = (jax.tree.map(answered, answer, ordinary[0]), reseeded.cache, reseeded.drafts,
+                         None if context is None else jnp.where(
+                             before.reshape(*before.shape, *(1,) * (context.ndim - 2)), ordinary[3], context))
 
                 def replaced(fresh, held):
                     selected = crossing.reshape(-1, *(1,) * (fresh.ndim - 1))
@@ -594,7 +610,7 @@ def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | N
             answer, cache, drafts, context = jax.lax.cond(jnp.any(crossing), rebuild, lambda: ordinary)
             lengths, rebuilt = following, crossing
         else:
-            answer, updated = append()
+            answer, updated = append(valid)
             cache, context = updated["cache"], None if blocks is None else _context(model, params, updated)
         states, logits = answer if exposed else (None, answer)
         if blocks is not None:
