@@ -667,20 +667,24 @@ class FitSearch[LossT, EffectsT]:
         (`ahead`); the candidate its executable compiled from, lowered afresh where a kernel spilled
         (`compiled_if_it_fits`, `Relowered`); and the measure of its fit (`Probe`), the search's state
         else untouched. A run that inspects compiles the candidate's sampled step too
-        (`Candidate.sampled`), which must fit as the step must, so a rung fits only where both do; it is
-        `sampled` until the next measure."""
+        (`Candidate.sampled`), or takes the one compiled ahead with the step (`AheadOfTime.sampled`), which
+        must fit as the step must, so a rung fits only where both do; it is `sampled` until the next
+        measure."""
         options = self.required if self.xla_defaults else self.options(candidate)
-        taken = self.ahead is not None
+        taken, ahead = self.ahead is not None, self.ahead
         began = time.perf_counter()
-        if self.ahead is not None:
-            executable, self.ahead = self.ahead.taken(candidate.lowered), None
+        if ahead is not None:
+            executable, self.ahead = ahead.taken(candidate.lowered), None
         else:
             relowered = Relowered(lambda: self.lower(split, self.narrow))
             executable = compiled_if_it_fits(candidate.lowered, options, self.refusals, relower=relowered)
             candidate = relowered.candidate(candidate)
         fit, headroom = step_fits(executable, self.mesh, candidate.held, self.capacity, candidate.built)
         self.sampled = None
-        if fit and candidate.sampled is not None:
+        if fit and candidate.sampled is not None and ahead is not None and ahead.sampled is not None:
+            # The sampled step compiled ahead with the step, which its target compiles none of.
+            self.sampled = ahead.sampled.taken(candidate.sampled(), jax.devices())
+        elif fit and candidate.sampled is not None:
             def resampled() -> jax.stages.Lowered:
                 """The sampled step lowered afresh, its launches derived past a spilled one's config."""
                 again = self.lower(split, self.narrow).sampled
