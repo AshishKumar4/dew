@@ -482,17 +482,17 @@ def assert_trains(objective, batch: Mapping, directory: Path, *, evaluated: Mapp
     checkpoints = Checkpoints(str(directory))
     trainer = Trainer(objective, optax.adam(1e-3), key=0, checkpoints=checkpoints, tracker=tracker,
                       rollout=rollout)
-    # The state fit places, which a run that never stopped starts from too.
-    initial, _, _ = trainer.place()
-    started = jax.device_get(initial.variables["params"])
     if data is None:
         data = Loader(replayed(lambda partition: itertools.repeat(batch)), None, batch=ROWS, records=None)
-    state = trainer.fit(data, steps=2, log_every=1, checkpoint_every=1, state=initial)
+    # A fresh fit, its own batch-aware startup the one a run that never stopped takes.
+    state = trainer.fit(data, steps=2, log_every=1, checkpoint_every=1)
     checkpoints.wait()
     losses = [scalars["train/loss"] for _, scalars in tracker.scalars if "train/loss" in scalars]
     assert len(losses) == 2 and np.all(np.isfinite(losses)), losses
     variables = jax.device_get(state.variables)
     assert finite(variables), "a trained leaf is not finite"
+    # The second step's update, from the first's checkpoint: Adam moves a leaf where its gradient is nonzero.
+    started = Checkpoints(str(directory)).variables(step=1)["params"]
     moved = [not np.array_equal(before, after) for before, after in
              zip(jax.tree.leaves(started), jax.tree.leaves(variables["params"]), strict=True)]
     assert any(moved), "the step moved no trained leaf: no gradient reached them"
