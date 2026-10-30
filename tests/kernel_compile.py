@@ -25,10 +25,10 @@ import jax
 import jax.experimental.topologies as topologies
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
-from kernel_liveness import Compiler, LoweredRegisters, lowered_registers
 
 from dew.nn.kernels.generation import assumed, capability, gpu_mesh, gpu_target
 from dew.nn.kernels.templates import report, resources
+from dew.nn.kernels.templates.liveness import Compiler, LoweredRegisters, lowered_registers
 from dew.training._lowering import kernel_calls, triton_kernels
 from dew.training.ahead import compile_only_gpus
 
