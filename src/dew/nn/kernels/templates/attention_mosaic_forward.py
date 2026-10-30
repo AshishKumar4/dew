@@ -146,7 +146,7 @@ def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
     call, spec, (q, k, v), (spans_of, hooked) = _prepared(query, key, value, spans, hooks, scale=scale,
                                                           natural=natural, tiles=tiles, family=family)
 
-    def launch(form: algebra.Forward, live: jax.Array | None):
+    def launch(form: algebra.Forward, live: jax.Array | None) -> tuple[tuple, jax.Array, jax.Array]:
         if live is None:
             status, out, *finished = _launch(q, k, v, spans_of, hooked, None, spec=form, hooks=hooks,
                                              tiles=tiles, family=family, training=False, interpret=interpret,
@@ -175,8 +175,9 @@ def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
         out = jnp.concatenate(blocks, axis=-1)
         if hooked_blocks:
             out = jnp.swapaxes(_output_hooked(jnp.swapaxes(out, 1, 2), hooks, hooked), 1, 2).astype(q.dtype)
-        # Its maxima and overflows `walked_launches` reads of the plain launch alone, as `kept` its rows.
-        return (out, *([None] if rows else [])), jnp.zeros(live.shape, jnp.float32), jnp.zeros_like(live)
+        # Its output alone: `walked_launches` reads the plain launch's maxima and overflows, and `kept` its
+        # finished rows.
+        return (out,), jnp.zeros(live.shape, jnp.float32), jnp.zeros_like(live)
 
     def kept(live: jax.Array, guarded: tuple, plain: tuple) -> tuple:
         return (jnp.where(jnp.swapaxes(live, 1, 2)[..., None], guarded[0], plain[0]), *plain[1:])
