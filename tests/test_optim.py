@@ -162,7 +162,7 @@ def test_muon_takes_optaxs_coefficients_and_preconditioning(opts):
     triples and a spectral preconditioning, each update on par with optax's Muon under the same options
     (check 1)."""
     assert_updates_as(muon_solver(optimizer_opts=opts), optax.contrib.muon(LR, **opts), decoder_params(),
-                      [('params', 'layers_0', 'self_attn', 'q_proj', 'kernel')], f"the Muon group with {opts}")
+                      [('params', 'layers_0', 'self_attn', 'q_proj', 'kernel')], f"Muon with {opts}")
 
 
 def test_muon_steps_a_complex_matrix_as_optax_does():
