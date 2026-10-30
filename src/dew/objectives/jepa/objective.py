@@ -35,6 +35,7 @@ from flax import linen as nn
 from dew.artifacts import Representations
 from dew.batch import Variables, dicts, part, thaw, under
 from dew.inputs import Field, InputSpec, unit_range
+from dew.nn.inspection import INSPECTED
 from dew.nn.precision import accumulated, at_least_fp32
 from dew.nn.sharding import explicit_spec, whole_spec
 from dew.objectives.base import (
@@ -207,10 +208,14 @@ class JepaObjective(Objective[Ratio]):
     def encode(self, encoder_variables, samples, token_idx=None, train=False, rngs=None) -> jax.Array:
         """The encoder over `encoder_variables`, its own tree in every collection,
         a frozen split merged back."""
-        features = self.encoder.apply(thaw(encoder_variables), samples, token_idx, train=train, rngs=rngs)
-        # `mutable` is unset, so apply returns the output alone, not a pair.
-        assert not isinstance(features, tuple)
-        return features
+        return self.encoded(encoder_variables, samples, token_idx, train=train, rngs=rngs)[0]
+
+    def encoded(self, encoder_variables, samples, token_idx=None, *, train=False, rngs=None,
+                opened: Sequence[str] = ()) -> tuple[jax.Array, Variables]:
+        """The encoder's features (`encode`), and what its pass sowed into the `opened` collections."""
+        features, sown = self.encoder.apply(thaw(encoder_variables), samples, token_idx, train=train,
+                                            rngs=rngs, mutable=list(opened))
+        return features, sown
 
     def _target_variables(self, step: Step):
         """The target encoder's variables: the EMA copy of the context
@@ -242,29 +247,29 @@ class JepaObjective(Objective[Ratio]):
         targets = jax.lax.stop_gradient(
             jnp.take_along_axis(full[:, None], gather_idx, axis=-2))
 
-        context = self.encode(
+        context, encoder = self.encoded(
             part(variables, CONTEXT_ENCODER), samples, context_idx,
-            train=step.training, rngs=model_rngs(dropout_key, training=step.training))
+            train=step.training, rngs=model_rngs(dropout_key, training=step.training), opened=step.sown())
 
         # Each target block is predicted from the same context. Fold the block
         # axis into the batch so one predictor call covers all M of them
         repeated = jnp.repeat(context, num_targets, axis=0, out_sharding=explicit_spec(context))
-        predictions = self.predictor.apply(
+        predictions, predictor = self.predictor.apply(
             thaw(part(variables, PREDICTOR)),
             repeated,
             jnp.repeat(context_idx, num_targets, axis=0, out_sharding=explicit_spec(context_idx)),
             target_idx.reshape(batch_size * num_targets, -1),
-            train=step.training, rngs=model_rngs(dropout_key, training=step.training),
+            train=step.training, rngs=model_rngs(dropout_key, training=step.training), mutable=step.sown(),
         )
-        # `mutable` is unset, so apply returns the output alone, not a pair.
-        assert not isinstance(predictions, tuple)
         predictions = predictions.reshape(targets.shape)
 
         wide = at_least_fp32(jnp.result_type(predictions, targets))
         squared = (predictions.astype(wide) - targets.astype(wide)) ** 2
         loss = self.row_mean(squared, batch)
         pooled = jnp.mean(full, axis=tuple(range(1, full.ndim - 1)))
-        return loss, Aux(representation_health(pooled))
+        inspected = None if step.watched is None else {"encoder": encoder.get(INSPECTED, {}),
+                                                       "predictor": predictor.get(INSPECTED, {})}
+        return loss, Aux(representation_health(pooled), inspected=inspected)
 
     def evaluate(self, params, batch, step: Step):
         """Return the pooled embeddings of the target encoder, the EMA copy, with the batch labels."""

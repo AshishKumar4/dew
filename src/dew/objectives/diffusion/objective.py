@@ -41,6 +41,7 @@ from dew.lora import unadapted
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.autoencoders.kl import posterior_latent
 from dew.nn.flops import MissingFlopsCount
+from dew.nn.inspection import INSPECTED
 from dew.nn.kernels.options import Held
 from dew.nn.mp import Uncertainty
 from dew.nn.protocols import (
@@ -792,8 +793,8 @@ class DiffusionObjective(Objective[Ratio]):
         # The representation's features of the clean images, which both alignments read.
         targets = (None if self.alignment is None
                    else self.alignment.targets(variables[REPRESENTATION], images))
-        losses, aligned = self._denoised(variables, self.model_variables(variables), samples, t, noise, call,
-                                         targets, batch, step)
+        losses, aligned, inspected = self._denoised(variables, self.model_variables(variables), samples, t,
+                                                    noise, call, targets, batch, step)
         weighted = losses * expand(step.boundary("loss weights", self.process.weight(t)), losses)
         if self.uncertainty is not None:
             head = {collection: variables[collection][UNCERTAINTY] for collection in ("params", "constants")}
@@ -808,7 +809,7 @@ class DiffusionObjective(Objective[Ratio]):
             metrics["alignment"] = aligned
             total = total + self.alignment.weight / 2 * aligned * mass
         if self.end_to_end is None or end_to_end is None:
-            return Ratio(total, mass), Aux(metrics=metrics)
+            return Ratio(total, mass), Aux(metrics=metrics, inspected=inspected)
         # The autoencoder's update: its regularizer and the alignment of its
         # latent, read through the frozen model and projector in evaluation
         # mode (the batch norm on its running statistics, no condition
@@ -817,7 +818,7 @@ class DiffusionObjective(Objective[Ratio]):
         # target are its own, so its step marks no boundary a tape replaces.
         latents = self.end_to_end.normalized(end_to_end.raw, variables[LATENT_STATS])
         frozen = jax.lax.stop_gradient(variables)
-        _, through = self._denoised(frozen, self.model_variables(frozen), latents, t, noise,
+        _, through, _ = self._denoised(frozen, self.model_variables(frozen), latents, t, noise,
                                     {**given, "train": False}, targets, batch,
                                     Step(step.step, step.key, None))
         assert through is not None
@@ -825,13 +826,13 @@ class DiffusionObjective(Objective[Ratio]):
         autoencoder = end_to_end.regularizer + self.end_to_end.align_weight * through
         total = total + (autoencoder + end_to_end.hinge) * mass
         updates = {LATENT_STATS: end_to_end.statistics} if step.training else None
-        return Ratio(total, mass), Aux(metrics=metrics, variables=updates)
+        return Ratio(total, mass), Aux(metrics=metrics, variables=updates, inspected=inspected)
 
     def _denoised(self, params, variables, samples, t, noise, call, targets, batch: Batch, step: Step):
-        """The per-element denoising loss at `(t, noise)` and, under
-        `alignment`, the REPA loss of the model's hidden tokens against the
-        representation's `targets`. The noised input and the target are where
-        the model's computation starts (`Step.boundary`)."""
+        """The per-element denoising loss at `(t, noise)`; under `alignment`, the REPA loss of the
+        model's hidden tokens against the representation's `targets`; and what the watched modules sowed
+        where the step watches (`Step.watched`, else None). The noised input and the target are where the
+        model's computation starts (`Step.boundary`)."""
         schedule = self.process.schedule
         noisy, _, target = self.process.prediction.forward_diffusion(
             samples, noise, broadcast_rates(schedule, t, samples))
@@ -847,15 +848,15 @@ class DiffusionObjective(Objective[Ratio]):
         c_in = self.process.prediction.get_input_scale(rates)
         inputs = (variables, noisy * c_in, schedule.model_time(t))
         aligned = None
-        if self.alignment is None:
-            preds = self.model.apply(*inputs, **call)
-        else:
-            preds, captured = self.model.apply(*inputs, **call, mutable=["intermediates"],
-                                               capture_intermediates=self.alignment.captures)
+        opened = step.sown(*(["intermediates"] if self.alignment is not None else []))
+        preds, captured = self.model.apply(*inputs, **call, mutable=opened, capture_intermediates=(
+            False if self.alignment is None else self.alignment.captures))
+        if self.alignment is not None:
             aligned = self.alignment.loss({"params": params["params"][ALIGNMENT]}, self._captured(captured),
                                           targets, batch)
+        inspected = captured.get(INSPECTED, {}) if step.watched is not None else None
         preds = self.process.prediction.pred_transform(noisy, preds, rates, t)
-        return optax.l2_loss(preds, target), aligned
+        return optax.l2_loss(preds, target), aligned, inspected
 
     def _end_to_end_latents(self, params, images, key, step: Step, batch: Batch) -> TunedLatents:
         """The trained autoencoder's posterior draw of `images` and what the

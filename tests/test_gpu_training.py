@@ -4,7 +4,8 @@ directory, rung records and data cache of its own:
 
 - A step compiled ahead for this GPU's generation, saved and loaded, runs in the run's place; a run handed it
   trains from it, refusing another program's; a run on two GPUs traces with the links it was compiled with;
-  a live run takes the saved offline split before it loads the executable (test_compile_ahead).
+  a live run takes the saved offline split before it loads the executable; a watched run handed its step and
+  sampled step compiles neither (test_compile_ahead).
 - A recorded plan settles its kernel launches without lowering the step for them; a step guided by its
   profile is the step the run takes, as exact; a split that misses tries the half rung before the batch
   splits further (test_plan).
@@ -32,11 +33,12 @@ def test_a_runs_training_reads_this_gpu(tmp_path_factory):
     (`gpu_flow.isolated`), each one's failure kept and all raised together."""
     in_own = isolated(tmp_path_factory)
 
-    saved, handed, links, split = (
+    saved, handed, links, split, watched = (
         compile_ahead.a_step_compiled_ahead_and_saved_runs_on_its_gpu_in_the_run_s_place,
         compile_ahead.a_run_handed_its_step_compiled_ahead_trains_from_it_on_its_gpu,
         compile_ahead.a_run_handed_a_step_compiled_ahead_traces_with_the_links_it_was_compiled_with,
-        compile_ahead.a_run_takes_the_saved_offline_split_before_loading_its_executable)
+        compile_ahead.a_run_takes_the_saved_offline_split_before_loading_its_executable,
+        compile_ahead.a_watched_run_handed_its_steps_compiled_ahead_compiles_neither)
     settled, guided, half = (
         plan.a_recorded_plan_settles_its_kernel_launches_without_lowering_the_step_for_them,
         plan.a_step_guided_by_its_profile_is_the_step_the_run_takes_and_trains_as_exactly,
@@ -49,6 +51,7 @@ def test_a_runs_training_reads_this_gpu(tmp_path_factory):
         Cell("a run handed a step compiled ahead traces with the links it was compiled with",
              in_own(links, "links", devices=2)),
         Cell("a run takes the saved offline split before loading its executable", in_own(split, "split")),
+        Cell("a watched run handed its steps compiled ahead compiles neither", in_own(watched, "watched")),
         Cell("a recorded plan settles its kernel launches without lowering the step for them",
              in_own(settled, "settled")),
         Cell("a step guided by its profile is the step the run takes and trains as exactly",

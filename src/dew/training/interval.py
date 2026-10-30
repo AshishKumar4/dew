@@ -9,11 +9,15 @@ the counters each cadence owns.
 
 from __future__ import annotations
 
+import collections
 import dataclasses
 import math
+import queue
+import threading
 import time
-from collections.abc import Mapping
-from typing import NamedTuple, Protocol, runtime_checkable
+from collections.abc import Callable, Mapping
+from concurrent.futures import Future
+from typing import Any, NamedTuple, Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -23,8 +27,14 @@ from dew.batch import CONSUMED_COUNT, Batch, ConsumedCount
 from dew.data.dataset import rows_of
 from dew.nn.precision import at_least_fp32
 from dew.state import Accumulation
-from dew.telemetry.instrumentation import NO_FLOPS, StepFlops, model_flops_utilization
+from dew.telemetry.instrumentation import (
+    NO_FLOPS,
+    StepFlops,
+    compilation_cache_counts,
+    model_flops_utilization,
+)
 from dew.training.display import EXAMPLES_CONSUMED_SCALAR, TrainingDisplay
+from dew.training.inspection import logged
 from dew.training.model_flops import TOKENS, TRAINING_FLOPS, _TokenCount
 from dew.training.transaction import Committed
 
@@ -146,6 +156,8 @@ class Interval:
     waited: float = 0.0
     compiling: float = 0.0
     compiles: int = 0
+    inspected: tuple[jax.Array, Mapping[str, jax.Array]] | None = None
+    """The latest sampled commit's count and summaries since the last log (`Committed.inspected`)."""
     consumed: int = 0
     """The examples the run's dispatched batches consumed, the runs before this fit's included, as the host
     counted each batch (`dew.batch.ConsumedCount`): what its cadences and pause of examples read, the
@@ -174,6 +186,16 @@ class Interval:
         # A run's tokens are its committed updates' (`Committed.tokens`); a step of one's own
         # (`Trainer(step=)`), which reports no commit, is its own update.
         tokens = aux.get(TOKENS, self.fresh.tokens) if committed is None else committed.tokens
+        if committed is not None and committed.inspected:
+            # The latest sample that committed: a sampled step whose window did not commit holds zeros,
+            # which keep the one before, chosen on the device.
+            if self.inspected is None:
+                self.inspected = (committed.count, committed.inspected)
+            else:
+                fresh = committed.count > 0
+                count, held = self.inspected
+                self.inspected = (jnp.where(fresh, committed.count, count), jax.tree.map(
+                    lambda new, old: jnp.where(fresh, new, old), dict(committed.inspected), dict(held)))
         self.book = bookkeep(self.book, loss, finite, committed,
                              aux.get(TRAINING_FLOPS, self.fresh.training), tokens)
 
@@ -244,7 +266,12 @@ class Interval:
         reading = Reading(loss, aux, accepted, streak, rate, scale, rollout,
                           None if book is None else (book.norms, book.commits),
                           book.training if self.model_counted and book is not None else None,
-                          book.tokens if self.tokens_counted and book is not None else None, statistics)
+                          book.tokens if self.tokens_counted and book is not None else None, statistics,
+                          self.inspected)
+        # The copies to the host begin now, so the log's read waits on nothing but the step itself.
+        for leaf in jax.tree.leaves(reading):
+            if isinstance(leaf, jax.Array):
+                leaf.copy_to_host_async()
         taken = Taken(step, self, dataclasses.replace(self), reading,
                       time.time() if isinstance(loss, _Settled) and loss.is_ready() else None)
         if self.tokens_counted and book is not None:
@@ -253,6 +280,7 @@ class Interval:
         self.since_log, self.samples = 0, 0
         self.flops, self.rollout_seconds, self.waited, self.compiling = NO_FLOPS, 0.0, 0.0, 0.0
         self.model_counted = self.tokens_counted = False
+        self.inspected = None
         if book is not None and self.fresh is not None:
             self.book = book._replace(training=self.fresh.training, tokens=self.fresh.tokens,
                                       norms=self.fresh.norms, commits=self.fresh.commits)
@@ -349,24 +377,29 @@ class Reading(NamedTuple):
     training: Number | None
     tokens: Number | None
     statistics: Mapping[str, float]
+    inspected: tuple[Number, Mapping[str, Number]] | None = None
+    """The latest sampled commit since the last log, its commit count and summaries, or None."""
 
 
 class Taken(NamedTuple):
     """One logging interval, taken at its last step, `step`, and read on the
-    host once the step after it is dispatched.
+    host by the run's log writer (`LogWriter`), off the step loop.
 
     Reading a step's numbers waits for that step, and read before the next
     step was dispatched, the wait left the devices idle while the host
     logged, read its next batch and dispatched: 22 ms of each 652 ms step of
-    Qwen3.5-0.8B on an A100 at log_every=1 (docs/performance.md). So the
-    loop reads a log one step late, as MaxText's metric logger writes its
-    metrics, and at once where the run waits on the devices anyway or ends:
-    before a compile, an evaluation or a checkpoint, and at the run's end.
+    Qwen3.5-0.8B on an A100 at log_every=1 (docs/performance.md). Read one
+    step late on the loop, as MaxText's metric logger writes its metrics, the
+    host still waited on the step before it. So the copies to the host begin
+    at the take and a writer thread reads and reports the log while the loop
+    steps on, never waiting (row 2313); the loop waits for the writer only
+    where it waits on the devices anyway or ends: before a compile, an
+    evaluation or a checkpoint, and at the run's end.
 
     `counts` is the live `interval` as it stood at the take. `done` is when
     the host first saw the step finished: at the take if it already was,
     else at the read, which waits for it. The read ends the interval's clock
-    there and starts the next one's.
+    there, and the next interval's clock starts there (`LogWriter.since`).
     """
 
     step: int
@@ -379,15 +412,131 @@ class Taken(NamedTuple):
         """Whether the read would not wait on the devices."""
         return all(leaf.is_ready() for leaf in jax.tree.leaves(self.reading) if isinstance(leaf, _Settled))
 
-    def read(self, display: TrainingDisplay) -> tuple[Reading, float]:
-        """The reading on the host, its losses' streak checked
-        (`checked_streak`) at the step it read, and the interval's seconds."""
+    def read(self, display: TrainingDisplay, since: float | None) -> tuple[Reading, float, float]:
+        """The reading on the host, its losses' streak checked (`checked_streak`) at the step it read, the
+        interval's seconds since `since`, the previous log's `done` (the interval's own start for the first),
+        and its `done`."""
         read = on_host(self.reading, self.step)
-        done = time.time() if self.done is None else self.done
-        self.interval.last_log_time = done
+        # A log read late is done no earlier than the one read before it.
+        done = max(time.time() if self.done is None else self.done, since or 0.0)
         if read.streak is not None:
             checked_streak(int(read.streak), self.step, display)
-        return read, done - self.counts.last_log_time
+        return read, done - (self.counts.last_log_time if since is None else since), done
+
+
+def logged_scalars(read: Reading, counts: Interval, elapsed: float, devices: int, *,
+                   rollout: bool) -> dict[str, float]:
+    """One logging interval's scalars, as a run logs them, from its reading on the host.
+
+    Loss and objective aux metrics are the logged step's values. train/grad_norm is instead the mean
+    over admitted optimizer commits since the last log: bookkeep sums each window's native gradient
+    norm and its commit count on device, independently of the checkpoint loss sum. A tick with no
+    commit omits it. train/compiles counts this fit's StepCompiled records; persistent-cache counts
+    span all jitted programs in this process, as compilation_cache_counts describes. The optimizer
+    state supplies the last applied update's rate (`learning_rate`): a rejected attempt leaves it, and
+    an accumulation window moves it only when its update commits. The latest sampled commit's
+    summaries go under `inspect/` (`dew.training.inspection`), where one committed."""
+    from dew.training.memory import peak_memory_gib
+
+    # A work count a process refused (`_counted_batch`) is NaN here, and train/mfu absent.
+    work = None if read.training is None else float(read.training)
+    scalars = {"train/loss": float(read.loss), **{f"train/{k}": float(v) for k, v in read.aux.items()},
+               **throughput(elapsed, counts.since_log, counts.samples, counts.flops, devices,
+                            waited=counts.waited, compiling=counts.compiling, training_flops=work,
+                            tokens=None if read.tokens is None else _TokenCount.host(read.tokens))}
+    scalars["train/accepted"] = float(read.accepted)
+    if read.committed is not None:
+        norms, commits = read.committed
+        if commits:
+            scalars['train/grad_norm'] = float(norms / commits)
+    scalars['train/compiles'] = float(counts.compiles)
+    scalars.update(compilation_cache_counts())
+    peak = peak_memory_gib()
+    if peak is not None:
+        scalars['train/peak_memory_gib'] = peak
+    if read.rate is not None:
+        scalars["train/learning_rate"] = float(read.rate)
+    if read.scale is not None:
+        scalars["train/loss_scale"] = float(read.scale)
+    if rollout:
+        scalars["train/rollout_seconds"] = counts.rollout_seconds
+        scalars.update({f"rollout/{name}": float(value) for name, value in read.rollout.items()})
+    if read.inspected is not None and int(read.inspected[0]):
+        scalars.update(logged(read.inspected[1]))
+    scalars.update(read.statistics)
+    return scalars
+
+
+class LogWriter:
+    """A fit's logs written off its step loop (row 2313): each one the loop takes (`Taken`) is read on the
+    host by one daemon thread and reported by another, in the order taken, while the loop steps on; the
+    copies to the host began at the take (`Interval.take`). The reader only waits on the devices, so a
+    log's clock (`since`, the last read's `done`) is the devices', whatever a slow tracker holds of the
+    reporter. A write's failure, a tracker's or a losses' streak, is kept for the loop to raise at a
+    point every process reaches alike (`raise_failure`), where it agrees on it, never on these threads."""
+
+    def __init__(self) -> None:
+        self._reads: queue.SimpleQueue[tuple[Callable[[], Any], Callable[[Any], None], Future] | None]
+        self._reads = queue.SimpleQueue()
+        self._reports: queue.SimpleQueue[tuple[Any, Callable[[Any], None], Future] | None]
+        self._reports = queue.SimpleQueue()
+        self._threads: tuple[threading.Thread, ...] = ()
+        self._writes: collections.deque[tuple[Future, Callable[[], bool]]] = collections.deque()
+        self.unchecked = 0
+        """Writes handed over since the loop last waited on every one: alike on every process."""
+        self.since: float | None = None
+
+    def submit[ValueT](self, read: Callable[[], ValueT], report: Callable[[ValueT], None],
+                       ready: Callable[[], bool]) -> None:
+        """Hand `read`, then `report` of what it read, to the threads; `ready` says whether the read
+        waits on no device."""
+        if not self._threads:
+            self._threads = (threading.Thread(target=self._read, name="dew-log-reader", daemon=True),
+                             threading.Thread(target=self._report, name="dew-log-reporter", daemon=True))
+            for thread in self._threads:
+                thread.start()
+        written: Future = Future()
+        self._reads.put((read, report, written))
+        self._writes.append((written, ready))
+        self.unchecked += 1
+
+    def _read(self) -> None:
+        while (handed := self._reads.get()) is not None:
+            read, report, written = handed
+            try:
+                self._reports.put((read(), report, written))
+            except BaseException as error:
+                written.set_exception(error)
+        self._reports.put(None)
+
+    def _report(self) -> None:
+        while (handed := self._reports.get()) is not None:
+            value, report, written = handed
+            try:
+                written.set_result(report(value))
+            except BaseException as error:
+                written.set_exception(error)
+
+    def raise_failure(self, *, wait: bool, ready_only: bool = False) -> None:
+        """Raise the first failed write's error among those done, or, where `wait`, among every write,
+        waiting for each; `ready_only` waits only for writes that wait on no device (a failed run's
+        cleanup, whose devices or peers may never finish a step)."""
+        while self._writes and (self._writes[0][0].done() or (wait and (
+                not ready_only or self._writes[0][1]()))):
+            self._writes.popleft()[0].result()
+        if wait:
+            self.unchecked = 0
+
+    def close(self) -> None:
+        """Stop the threads once they have written what they hold, and wait for them: a thread still in
+        JAX's runtime as the interpreter exits aborts the process. A failed run whose writes wait on a
+        step that never ends (its peers gone) leaves the threads, daemons, rather than wait on them."""
+        if not self._threads:
+            return
+        self._reads.put(None)
+        if all(written.done() or ready() for written, ready in self._writes):
+            for thread in self._threads:
+                thread.join()
 
 
 def on_host[TreeT](counters: TreeT, step: int) -> TreeT:
@@ -442,24 +591,33 @@ def throughput(elapsed: float, steps: int, samples: int, flops: StepFlops | None
     dispatches steps ahead of the device, so a wait the device's queued
     work covers costs no device time; a wait near the step time is a
     stalled input.
+
+    The counts (tokens, work, compile and waits) are reported whatever the
+    interval's seconds; the rates only over seconds the steps took. A log
+    the writer reads no later than the one before it was done
+    (`Taken.read`) has none, and its steps still committed their tokens.
     """
-    stepping = elapsed - compiling
-    if stepping <= 0 or steps <= 0:
+    if steps <= 0:
         return {}
-    step_time = stepping / steps
-    scalars = {"train/step_time_ms": step_time * 1000,
-               "train/samples_per_sec": samples / stepping,
-               "train/data_wait_ms": waited / steps * 1000}
+    scalars = {"train/data_wait_ms": waited / steps * 1000}
     if compiling > 0:
         scalars["train/compile_s"] = compiling
     if tokens is not None:
         scalars["train/tokens"] = float(tokens) / steps
-        scalars["train/tokens_per_s"] = float(tokens) / stepping
     # A batch whose work could not be counted carries NaN (`_counted_batch`),
     # so an interval holding one, on any process, reports no train/flops or train/mfu.
-    if training_flops is not None and math.isfinite(training_flops):
-        scalars["train/flops"] = float(training_flops) / steps
-        per_device = float(training_flops) / devices
+    work = training_flops if training_flops is not None and math.isfinite(training_flops) else None
+    if work is not None:
+        scalars["train/flops"] = float(work) / steps
+    stepping = elapsed - compiling
+    if stepping <= 0:
+        return scalars
+    step_time = stepping / steps
+    scalars.update({"train/step_time_ms": step_time * 1000, "train/samples_per_sec": samples / stepping})
+    if tokens is not None:
+        scalars["train/tokens_per_s"] = float(tokens) / stepping
+    if work is not None:
+        per_device = float(work) / devices
         utilization = model_flops_utilization(per_device / steps, step_time)
         if utilization is not None:
             scalars["train/mfu"] = utilization
