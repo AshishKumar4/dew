@@ -34,7 +34,7 @@ from dew.telemetry.instrumentation import (
     model_flops_utilization,
 )
 from dew.training.display import EXAMPLES_CONSUMED_SCALAR, TrainingDisplay
-from dew.training.inspection import logged
+from dew.training.inspection import Summaries, logged
 from dew.training.model_flops import TOKENS, TRAINING_FLOPS, _TokenCount
 from dew.training.transaction import Committed
 
@@ -156,7 +156,7 @@ class Interval:
     waited: float = 0.0
     compiling: float = 0.0
     compiles: int = 0
-    inspected: tuple[jax.Array, Mapping[str, jax.Array]] | None = None
+    inspected: tuple[jax.Array, Summaries] | None = None
     """The latest sampled commit's count and summaries since the last log (`Committed.inspected`)."""
     consumed: int = 0
     """The examples the run's dispatched batches consumed, the runs before this fit's included, as the host
@@ -186,16 +186,16 @@ class Interval:
         # A run's tokens are its committed updates' (`Committed.tokens`); a step of one's own
         # (`Trainer(step=)`), which reports no commit, is its own update.
         tokens = aux.get(TOKENS, self.fresh.tokens) if committed is None else committed.tokens
-        if committed is not None and committed.inspected:
+        if committed is not None and committed.inspected is not None:
             # The latest sample that committed: a sampled step whose window did not commit holds zeros,
-            # which keep the one before, chosen on the device.
+            # which keep the one before, chosen on the device, the whole vector at once.
             if self.inspected is None:
                 self.inspected = (committed.count, committed.inspected)
             else:
                 fresh = committed.count > 0
                 count, held = self.inspected
                 self.inspected = (jnp.where(fresh, committed.count, count), jax.tree.map(
-                    lambda new, old: jnp.where(fresh, new, old), dict(committed.inspected), dict(held)))
+                    lambda new, old: jnp.where(fresh, new, old), committed.inspected, held))
         self.book = bookkeep(self.book, loss, finite, committed,
                              aux.get(TRAINING_FLOPS, self.fresh.training), tokens)
 
@@ -377,7 +377,7 @@ class Reading(NamedTuple):
     training: Number | None
     tokens: Number | None
     statistics: Mapping[str, float]
-    inspected: tuple[Number, Mapping[str, Number]] | None = None
+    inspected: tuple[Number, Summaries] | None = None
     """The latest sampled commit since the last log, its commit count and summaries, or None."""
 
 

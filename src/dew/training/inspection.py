@@ -13,11 +13,13 @@ from __future__ import annotations
 import dataclasses
 import fnmatch
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Literal, SupportsFloat
+from typing import TYPE_CHECKING, Literal
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
+from flax import struct
 
 from dew.nn.inspection import Watched, statistics
 from dew.optim import parameter_name
@@ -99,9 +101,30 @@ def summaries(inspection: Inspection, params, grads, updates, stepped) -> dict[s
     return found
 
 
-def logged(inspected: Mapping[str, SupportsFloat]) -> dict[str, float]:
-    """A sample's scalars as a run logs them, under `inspect/`."""
-    return {f"inspect/{name}": float(value) for name, value in inspected.items()}
+@struct.dataclass
+class Summaries:
+    """A sampled commit's scalars (`summaries`, `dew.training.transaction.watched_activations`) as one
+    float32 vector, `values`, beside their names, `names`, which its step fixes as it traces: a sample
+    crosses the step loop and reaches the host as one array, named off it by the log's reader
+    (`logged`), not one scalar each (row 2723)."""
+
+    values: jax.Array
+    names: tuple[str, ...] = struct.field(pytree_node=False)
+
+
+def stacked(scalars: Mapping[str, jax.Array]) -> Summaries | None:
+    """`scalars` as one vector (`Summaries`) in their order, None where there are none, a step that samples
+    nothing."""
+    if not scalars:
+        return None
+    names = tuple(scalars)
+    return Summaries(jnp.stack([jnp.asarray(scalars[name], jnp.float32) for name in names]), names)
+
+
+def logged(inspected: Summaries) -> dict[str, float]:
+    """A sample's scalars as a run logs them, under `inspect/`, each by its name."""
+    return {f"inspect/{name}": float(value)
+            for name, value in zip(inspected.names, np.asarray(inspected.values), strict=True)}
 
 
 def inspected[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch, *,
@@ -125,7 +148,7 @@ def inspected[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch, 
     committed = None
     for _ in range(-(-(window - int(state.microstep) % window) // split)):
         state, *_, committed = step(state, batch, sampled=True)
-    if committed is None or not int(committed.count):
+    if committed is None or committed.inspected is None or not int(committed.count):
         raise ValueError("the sampled window did not commit over this batch (a part of it rejected, its "
                          "loss not finite); inspect a batch whose window commits")
     return logged(jax.device_get(committed.inspected))
