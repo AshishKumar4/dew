@@ -47,7 +47,7 @@ from etils import epath
 import dew.io
 from dew import registry, training
 from dew._coordination import agree_process_phase, agreed, agreed_same
-from dew._records import JSON, duration, is_share, recorded_duration
+from dew._records import JSON, duration, earlier_segments, is_share, recorded_duration
 from dew.cache import dew_cache_dir
 from dew.checkpoints import RUN_FILE, Checkpoints, Keep, Resume
 from dew.config.sweep import RandomSearch, Search, Space, read_ledger, write_ledger
@@ -969,6 +969,11 @@ def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
     does not declare. A record in today's shapes passes as it is. Carried to 1.0, when it is deleted
     (ledger 1552)."""
     fields = record.get("fields")
+    segments = fields.get("segments") if isinstance(fields, Mapping) else None
+    if isinstance(fields, Mapping) and isinstance(segments, list):
+        # A decision run's row of segments, in today's fields (`earlier_segments`).
+        fields = {**fields, "segments": earlier_segments(segments)}
+        record = {**record, "fields": fields}
     if not isinstance(fields, Mapping) or not isinstance(fields.get("trainer"), Mapping):
         return record
     trainer, fields = dict(fields["trainer"]), dict(fields)

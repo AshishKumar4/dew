@@ -33,7 +33,7 @@ from dew.telemetry.instrumentation import (
     compilation_cache_counts,
     model_flops_utilization,
 )
-from dew.training.display import TrainingDisplay
+from dew.training.display import EXAMPLES_CONSUMED_SCALAR, TrainingDisplay
 from dew.training.inspection import logged
 from dew.training.model_flops import TOKENS, TRAINING_FLOPS, _TokenCount
 from dew.training.transaction import Committed
@@ -228,7 +228,7 @@ class Interval:
     def consumption(self, examples: int | None) -> dict[str, float]:
         """The examples a run on the examples clock (bounded to `examples`) has consumed, as its log
         reports them beside its committed tokens (`train/examples_consumed`); none for another run."""
-        return {} if examples is None else {"train/examples_consumed": float(self.consumed)}
+        return {} if examples is None else {EXAMPLES_CONSUMED_SCALAR: float(self.consumed)}
 
     @property
     def token_control(self) -> dict[str, int]:
