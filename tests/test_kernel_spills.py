@@ -21,6 +21,7 @@ from dew.inputs import Field, InputSpec
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.kernels import generation, grouped_matmul
 from dew.nn.kernels.options import program
+from dew.nn.precision import Numerics
 from dew.objectives.supervised import Supervised
 from dew.telemetry.instrumentation import Compiles
 from dew.training import Trainer
@@ -247,8 +248,9 @@ def test_a_handed_step_derives_for_its_target_on_a_gpu_that_runs_it_alone():
 
 def test_a_program_runs_the_executable_its_calls_kernel_choice_traces():
     """A program (`dew.nn.kernels.options.program`) compiled through the reports keys its executables
-    as jit does: called under the fast attention form and the accurate one in turn, it compiles each
-    form once and each call computes what jit computes under that form."""
+    as jit does: called under a run's fast attention forms and its accurate ones in turn
+    (`generation.run_precision`), it compiles each form once and each call computes what jit computes
+    under that form."""
     query = jax.random.normal(jax.random.key(0), (1, 16, 2, 8))
 
     def attend(query):
@@ -258,11 +260,11 @@ def test_a_program_runs_the_executable_its_calls_kernel_choice_traces():
     ran: dict[str, list[jax.Array]] = {"fast": [], "accurate": []}
     with Compiles("attend") as compiles:
         for form in ("fast", "accurate", "fast", "accurate"):
-            with generation.chosen(attention_form=form):
+            with generation.run_precision(Numerics(forms=form)):
                 ran[form].append(run(query))
     assert sum(found.kind == "compiled" for found in compiles.programs) == 2
     for form, outputs in ran.items():
-        with generation.chosen(attention_form=form):
+        with generation.run_precision(Numerics(forms=form)):
             expected = jax.jit(attend)(query)
         for output in outputs:
             np.testing.assert_array_equal(output, expected)
