@@ -185,18 +185,11 @@ def the_template_is_as_exact_as_mamba_ssm():
     draw, reference, truth = indexed_recording(
         stored, case, seeds, inputs_of=lambda seed: mamba_ssd_draw(seed, shape, dtype, documents),
         truth_fn=jax.jit(lambda inputs: mamba_ssd_xla(inputs, chunk)))
-    names = ("x", "dt", "A", "B", "C", "D", "h0")
 
     def run(index, arrays):
         del index
-        inputs = tuple(jnp.asarray(arrays[name], dtype if name in ("x", "B", "C") else jnp.float32)
-                       for name in names)
-        seq = arrays.get("seq")
-        starts = (None if seq is None else
-                  jnp.concatenate([seq[:, :1] > 0, seq[:, 1:] > seq[:, :-1]], axis=1))
         with generation.chosen(ssd="mosaic_gpu"):
-            return ssd_value_and_grad(lambda *values: chunk_ssd(*values, chunk_size=chunk, starts=starts),
-                                      inputs, jnp.asarray(arrays["dy"], dtype), jnp.asarray(arrays["dfinal"]))
+            return mamba_ssd_xla(arrays, chunk, dtype)
 
     assert_as_exact(jax.jit(run), as_given(reference), draw, f"the template against mamba_ssm, {case}",
                     seeds=seeds, truth_fn=as_given(truth))

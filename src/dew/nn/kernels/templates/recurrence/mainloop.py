@@ -1736,7 +1736,8 @@ def _prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles
         a = inverse
         if kept is None:
             w, u = _weighted(k, v, a, hi, lo, beta, taken, call)
-    if kept is not None and delta and not per_key:
+    if kept is not None and not per_key:
+        # The forward's saved states, with the delta rule's weights or without them (`w` None).
         (w, h, corrected), final = kept, None
     else:
         h, corrected, final = _states(keys, w, u, hi, lo, beta, h0.reshape(-1, columns), sequences, taken,
