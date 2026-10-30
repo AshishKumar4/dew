@@ -28,8 +28,8 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
 from dew.nn.kernels.generation import assumed, capability, gpu_mesh, gpu_target
 from dew.nn.kernels.templates import report, resources
-from dew.training._lowering import kernel_calls, triton_kernels
 from dew.nn.kernels.templates.liveness import Compiler
+from dew.training._lowering import kernel_calls, triton_kernels
 from dew.training.ahead import compile_only_gpus
 
 REFUSED = re.compile(r"Shared memory size limit exceeded: requested (\d+)")
@@ -123,7 +123,8 @@ def _compiled(case, generation: str, record: dict) -> tuple[list[str], dict[str,
         return None
     if "models" in record:
         record["lowered"] = {
-            call.name: [dataclasses.asdict(launch) for launch in resources.lowered_registers(call.ir, _compiler())]
+            call.name: [dataclasses.asdict(launch)
+                        for launch in resources.lowered_registers(call.ir, _compiler())]
             for call in kernel_calls(lowered) if call.kind == "mosaic_gpu"}
     # A process whose persistent compilation cache is on keeps it on here (JAX settles that once a
     # process): a compile-only device's entry reads back as unloadable, with a warning, and compiles.
@@ -415,7 +416,8 @@ def _lowered_models(record: dict, kernels: list[dict], generation: str) -> dict[
         if len(launches) != 1:
             raise ValueError(f"{kernel['kernel']} has {len(launches)} launches but one compiled report")
         launch = resources.LoweredRegisters(**launches[0])
-        models[kernel["kernel"]] = launch.model(target, _compiler(), shared=kernel["shared"], tmem=kernel["tmem"])
+        models[kernel["kernel"]] = launch.model(target, _compiler(), shared=kernel["shared"],
+                                                tmem=kernel["tmem"])
     record["lowered_models"] = {name: dataclasses.asdict(model) for name, model in models.items()}
     return models
 
@@ -464,8 +466,8 @@ def decisions(registers: int | dict | None, model: resources.RegisterModel,
         return registers["admitted"], registers["programs"]
     if registers is None or registers > model.budget:
         return False, 0
-    return True, min(model.most, REGISTER_FILE // _program_registers(model, -(-registers // model.step)
-                                                                     * model.step, honored))
+    allocated = _program_registers(model, -(-registers // model.step) * model.step, honored)
+    return True, min(model.most, REGISTER_FILE // allocated) if allocated else model.most
 
 
 def mosaic_failures(found: list[dict]) -> list[str]:
@@ -493,7 +495,8 @@ def mosaic_failures(found: list[dict]) -> list[str]:
 
 
 def _report(kernel: dict) -> report.Report:
-    stated = {field.name: kernel[field.name] for field in dataclasses.fields(report.Report) if field.name in kernel}
+    stated = {field.name: kernel[field.name] for field in dataclasses.fields(report.Report)
+              if field.name in kernel}
     return report.Report(**{**stated, "unread": tuple(kernel["unread"])})
 
 

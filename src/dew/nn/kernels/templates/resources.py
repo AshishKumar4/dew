@@ -214,7 +214,8 @@ def raised_registers(consumers: int) -> int:
     CTA launch", NVIDIA forums 302068): four consumers' 640 threads launch at 96 a thread, so they hold 104,
     where the multiprocessor's share would ask 112 and wait for registers no warp gives back."""
     pool = entry_registers(consumers + 1) * (consumers + 1) * THREADS
-    return min(256, (pool - PRODUCER_REGISTERS * THREADS) // (consumers * THREADS) // cost.REGISTER_STEP * cost.REGISTER_STEP)
+    share = (pool - PRODUCER_REGISTERS * THREADS) // (consumers * THREADS)
+    return min(256, share // cost.REGISTER_STEP * cost.REGISTER_STEP)
 
 
 def consumer_registers(consumers: int) -> int:

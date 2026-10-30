@@ -133,8 +133,8 @@ def test_the_compiler_input_accounts_for_a_transcendental_chain_kept_as_a_vector
         }
       }
     """
-    vectorized = analyzed(body, Compiler((12, 9), True))
-    streamed = analyzed(body, Compiler((13, 4), True))
+    vectorized = analyzed(body, Compiler((12, 9), relocatable=True))
+    streamed = analyzed(body, Compiler((13, 4), relocatable=True))
     assert vectorized.total > streamed.total
 
 
@@ -163,7 +163,7 @@ def test_each_lowered_launch_has_its_own_budget_and_residency():
         }
       }
     """
-    compiler = Compiler((13, 4), True)
+    compiler = Compiler((13, 4), relocatable=True)
     small, large = resources.lowered_registers(serialized(body), compiler)
     target = gpu_target("sm100")
     first = small.model(target, compiler, shared=0, tmem=0)

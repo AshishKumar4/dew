@@ -72,7 +72,7 @@ class Atoms:
 
     def __init__(self):
         self.of = {}
-        self.data = []
+        self.floating = []
         self.origin = []
         self.making = "arg"
 
@@ -81,18 +81,18 @@ class Atoms:
         the op that makes it has no packed form (`unpacked`), a register per part."""
         parts = _elements(type_)
         if unpacked and parts is not None:
-            parts = [(32 if size else 0, data) for size, data in parts]
+            parts = [(32 if size else 0, floating) for size, floating in parts]
         if parts is None:
             return []
         atoms, bits = [], 32
-        for size, data in parts:
+        for size, floating in parts:
             for _ in range(max(1, -(-size // 32)) if size else 0):
-                atoms.append(len(self.data))
-                self.data.append(data)
+                atoms.append(len(self.floating))
+                self.floating.append(floating)
                 self.origin.append(self.making)
             if size and size < 32:  # sub-word parts pack into the previous register while they fit
                 if bits + size <= 32 and len(atoms) > 1:
-                    self.data.pop()
+                    self.floating.pop()
                     self.origin.pop()
                     atoms.pop()
                     bits += size
@@ -204,18 +204,18 @@ class Peak:
         self.raised = 0
         self.producer = 0
 
-    def see(self, live: set, data: list, where: str, region: str = ""):
+    def see(self, live: set, floating: list, where: str, region: str = ""):
         if len(live) > self.regions.get(region, (0,))[0]:
-            fragments = sum(1 for atom in live if data[atom])
+            fragments = sum(1 for atom in live if floating[atom])
             self.regions[region] = (len(live), fragments, where)
         if len(live) > self.total:
-            fragments = sum(1 for atom in live if data[atom])
+            fragments = sum(1 for atom in live if floating[atom])
             self.total, self.fragments = len(live), fragments
             self.scalars, self.where = len(live) - fragments, where
             self.live = tuple(live)
 
     def breakdown(self, atoms) -> list:
-        return collections.Counter((atoms.origin[a], "F" if atoms.data[a] else "S") for a in self.live
+        return collections.Counter((atoms.origin[a], "F" if atoms.floating[a] else "S") for a in self.live
                                    ).most_common(14)
 
 
@@ -236,9 +236,9 @@ def divergent_values(module) -> set:
         name = op.name.removeprefix(PREFIX)
         tainted = DIVERGENT.match(name) or any(o in divergent for o in op.operands)
         if tainted:
-            for result in op.results:
-                if result not in divergent:
-                    divergent.add(result)
+            for value in op.results:
+                if value not in divergent:
+                    divergent.add(value)
                     changed = True
         for nested_region in op.regions:
             for block in nested_region.blocks:
@@ -274,7 +274,7 @@ def _general_register(value) -> bool:
         op = use.owner.operation
         name = op.name.removeprefix(PREFIX)
         if name in ("llvm.getelementptr", "llvm.bitcast", "llvm.ptrtoint", "llvm.inttoptr"):
-            if any(_general_register(result) for result in op.results):
+            if any(_general_register(value) for value in op.results):
                 return True
         if name in ("llvm.load", "llvm.store", "nvvm.cp.async.shared.global"):
             return True
@@ -368,129 +368,130 @@ class _Pass:
         if name == "llvm.inline_asm" and "asm_string" in op.attributes:
             assembly = ir.StringAttr(op.attributes["asm_string"]).value
             if "wgmma.mma_async" in assembly:
-                words = sum(-(-size // 32) for result in op.results
-                            for size, _ in _elements(result.type) or [])
+                words = sum(-(-size // 32) for value in op.results
+                            for size, _ in _elements(value.type) or [])
                 self.mma_words = max(self.mma_words, words)
         self.atoms.making = f"{name}:{str(op.results[0].type)[:28]}" if len(op.results) else name
-        results = list(op.results)
+        produced = list(op.results)
         if name in FREE or self._rematerialized(op, name):
-            for result in results:
-                self.atoms.of[result] = []
-                self.free.add(result)
+            for value in produced:
+                self.atoms.of[value] = []
+                self.free.add(value)
             return
-        if name == "llvm.extractelement" and len(results) == 1:
+        if name == "llvm.extractelement" and len(produced) == 1:
             index = _constant(op.operands[1])
             parts = _elements(op.operands[0].type)
             if index is not None and parts is not None and index < len(parts):
-                self.atoms.of[results[0]] = self.atoms.element_atoms(op.operands[0], index)
+                self.atoms.of[produced[0]] = self.atoms.element_atoms(op.operands[0], index)
                 return
         if self._streamed(op, name):
             # An elementwise result whose uses are elementwise in its block (or stores): the compiler
             # computes it an element at a time beside its consumers, so its operands stay live in its place.
-            self.atoms.of[results[0]] = [a for o in op.operands for a in self.atoms.of.get(o, ())
+            self.atoms.of[produced[0]] = [a for o in op.operands for a in self.atoms.of.get(o, ())
                                        if a is not None]
             return
-        if name == "llvm.insertelement" and len(results) == 1:
+        if name == "llvm.insertelement" and len(produced) == 1:
             index = _constant(op.operands[2])
-            parts = _elements(results[0].type)
+            parts = _elements(produced[0].type)
             if index is not None and parts is not None and index < len(parts):
-                base = list(self.atoms.of.get(op.operands[0], [])) or self._lanes(results[0].type)
+                base = list(self.atoms.of.get(op.operands[0], [])) or self._lanes(produced[0].type)
                 first = sum(size for size, _ in parts[:index]) // 32
                 new = self.atoms.of.get(op.operands[1], [])
                 base[first:first + len(new)] = new
-                self.atoms.of[results[0]] = base
+                self.atoms.of[produced[0]] = base
                 return
-        if self._regrouped(op, name, results):
+        if self._regrouped(op, name, produced):
             return
         unpacked = bool(UNPACKED.match(name))
-        for result in results:
-            parts = _elements(result.type) or []
-            uniform = (self.divergent is not None and result not in self.divergent
-                       and not any(data for _, data in parts) and not isinstance(result.type, ir.VectorType)
-                       and not _general_register(result))
-            self.atoms.of[result] = [] if uniform else self.atoms.fresh(result.type, unpacked=unpacked)
+        for value in produced:
+            parts = _elements(value.type) or []
+            uniform = (self.divergent is not None and value not in self.divergent
+                       and not any(floating for _, floating in parts)
+                       and not isinstance(value.type, ir.VectorType)
+                       and not _general_register(value))
+            self.atoms.of[value] = [] if uniform else self.atoms.fresh(value.type, unpacked=unpacked)
 
-    def _regrouped(self, op, name: str, results) -> bool:
+    def _regrouped(self, op, name: str, produced) -> bool:
         """Whether this operation only names existing registers in another grouping or order."""
         operand_atoms = [self.atoms.of.get(operand, []) for operand in op.operands]
         if name in ("builtin.unrealized_conversion_cast", "vector.bitcast", "llvm.bitcast"):
             flat = [a for atoms in operand_atoms for a in atoms]
-            if len(results) == 1:
-                self.atoms.of[results[0]] = flat
+            if len(produced) == 1:
+                self.atoms.of[produced[0]] = flat
                 return True
-            share = len(flat) // max(1, len(results))
-            for i, result in enumerate(results):
-                self.atoms.of[result] = flat[i * share:(i + 1) * share]
+            share = len(flat) // max(1, len(produced))
+            for i, value in enumerate(produced):
+                self.atoms.of[value] = flat[i * share:(i + 1) * share]
             return True
-        if name in ("vector.extract", "llvm.extractvalue", "vector.extractelement") and len(results) == 1:
+        if name in ("vector.extract", "llvm.extractvalue", "vector.extractelement") and len(produced) == 1:
             index = _position(op, op.operands[0])
             parts = _elements(op.operands[0].type)
             if index is not None and parts is not None and index < len(parts):
-                self.atoms.of[results[0]] = self.atoms.element_atoms(op.operands[0], index)
+                self.atoms.of[produced[0]] = self.atoms.element_atoms(op.operands[0], index)
                 return True
-        if name in ("vector.insert", "llvm.insertvalue", "vector.insertelement") and len(results) == 1:
-            parts = _elements(results[0].type)
-            containers = [o for o in op.operands if o.type == results[0].type]
+        if name in ("vector.insert", "llvm.insertvalue", "vector.insertelement") and len(produced) == 1:
+            parts = _elements(produced[0].type)
+            containers = [o for o in op.operands if o.type == produced[0].type]
             index = _position(op, containers[0]) if containers else None
             if index is not None and parts is not None and index < len(parts):
                 container = containers[0]
                 element = next(o for o in op.operands
                                if o != container and not isinstance(o.type, ir.IndexType))
-                base = list(self.atoms.of.get(container, [])) or self._lanes(results[0].type)
+                base = list(self.atoms.of.get(container, [])) or self._lanes(produced[0].type)
                 first = sum(size for size, _ in parts[:index]) // 32
                 new = self.atoms.of.get(element, [])
                 base[first:first + len(new)] = new
-                self.atoms.of[results[0]] = base
+                self.atoms.of[produced[0]] = base
                 return True
-        if name in ("vector.from_elements", "vector.interleave") and len(results) == 1:
+        if name in ("vector.from_elements", "vector.interleave") and len(produced) == 1:
             # A vector assembled from its operands' registers (in order, or interleaved lane by lane).
             if name == "vector.interleave" and len(operand_atoms) == 2:
                 first, second = operand_atoms
-                self.atoms.of[results[0]] = [a for pair in zip(first, second, strict=False) for a in pair] + \
-                    first[len(second):] + second[len(first):]
+                self.atoms.of[produced[0]] = ([a for pair in zip(first, second, strict=False) for a in pair]
+                                             + first[len(second):] + second[len(first):])
             else:
-                self.atoms.of[results[0]] = [a for atoms in operand_atoms for a in atoms]
+                self.atoms.of[produced[0]] = [a for atoms in operand_atoms for a in atoms]
             return True
-        if name == "vector.extract_strided_slice" and len(results) == 1 and operand_atoms:
+        if name == "vector.extract_strided_slice" and len(produced) == 1 and operand_atoms:
             # A 1-D slice of a vector's registers (`offsets`, `sizes`, `strides` by element).
             positions = [ir.ArrayAttr(op.attributes[key]) for key in ("offsets", "sizes", "strides")]
             parts = _elements(op.operands[0].type)
             one_dimension = all(len(position) == 1 for position in positions)
             if one_dimension and parts and all(bits == 32 for bits, _ in parts):
                 offset, size, stride = (ir.IntegerAttr(position[0]).value for position in positions)
-                self.atoms.of[results[0]] = operand_atoms[0][offset:offset + size * stride:stride]
+                self.atoms.of[produced[0]] = operand_atoms[0][offset:offset + size * stride:stride]
                 return True
-        if name == "vector.deinterleave" and len(results) == 2 and operand_atoms:
+        if name == "vector.deinterleave" and len(produced) == 2 and operand_atoms:
             whole = operand_atoms[0]
-            self.atoms.of[results[0]], self.atoms.of[results[1]] = whole[0::2], whole[1::2]
+            self.atoms.of[produced[0]], self.atoms.of[produced[1]] = whole[0::2], whole[1::2]
             return True
-        if name == "llvm.getelementptr" and len(results) == 1 and operand_atoms and all(
+        if name == "llvm.getelementptr" and len(produced) == 1 and operand_atoms and all(
                 _constant(o) is not None or o.owner.operation.name.removeprefix(PREFIX) in FREE
                 for o in list(op.operands)[1:] if not isinstance(o.owner, ir.Block)) and all(
                 not isinstance(o.owner, ir.Block) for o in list(op.operands)[1:]):
             # A constant offset from a held base folds into the access's address field (LDS, STS, LDSM,
             # STSM and LDG take a register plus an immediate): the base's registers.
-            self.atoms.of[results[0]] = list(operand_atoms[0])
+            self.atoms.of[produced[0]] = list(operand_atoms[0])
             return True
-        if name in ("vector.broadcast", "vector.splat") and len(results) == 1:
-            self.atoms.of[results[0]] = list(operand_atoms[0]) if operand_atoms else []
+        if name in ("vector.broadcast", "vector.splat") and len(produced) == 1:
+            self.atoms.of[produced[0]] = list(operand_atoms[0]) if operand_atoms else []
             return True
         if name == "llvm.inline_asm":
             tied = _tied(op)
-            if tied is not None and len(results) == 1:
-                self.atoms.of[results[0]] = [a for operand in tied for a in self.atoms.of.get(operand, [])]
+            if tied is not None and len(produced) == 1:
+                self.atoms.of[produced[0]] = [a for operand in tied for a in self.atoms.of.get(operand, [])]
                 return True
             accumulated = self._accumulated(op)
             if accumulated is not None:
-                self.atoms.of[results[0]] = accumulated
+                self.atoms.of[produced[0]] = accumulated
                 return True
         return False
 
     def uses(self, op, into: set):
         extracts = ("vector.extract", "vector.extractelement", "llvm.extractvalue", "llvm.extractelement",
                     "vector.extract_strided_slice")
-        if op.name.removeprefix(PREFIX) in extracts and all(result in self.atoms.of for result in op.results):
-            extracted = {a for result in op.results for a in self.atoms.of[result] if a is not None}
+        if op.name.removeprefix(PREFIX) in extracts and all(value in self.atoms.of for value in op.results):
+            extracted = {a for value in op.results for a in self.atoms.of[value] if a is not None}
             inputs = {a for operand in op.operands for a in self.atoms.of.get(operand, ()) if a is not None}
             if extracted <= inputs:
                 # A static extraction reads only its part. Reading the whole source here extends
@@ -512,7 +513,7 @@ class _Pass:
         for argument in block.arguments:
             uniform = (self.divergent is not None and argument not in self.divergent
                        and not isinstance(argument.type, ir.VectorType)
-                       and not any(data for _, data in _elements(argument.type) or [])
+                       and not any(floating for _, floating in _elements(argument.type) or [])
                        and not _general_register(argument))
             self.atoms.of[argument] = [] if uniform else self.atoms.fresh(argument.type)
         ops = [op.operation for op in block.operations]
@@ -542,7 +543,7 @@ class _Pass:
                 # rescaled in place before the product that accumulates into it).
                 spent = sorted(a for a in used_by[index] & local if last[a] == index and a not in outer)
                 live -= set(spent[:len(made)])
-            peak.see(live, self.atoms.data, f"{depth}:{op.name.removeprefix(PREFIX)}", region)
+            peak.see(live, self.atoms.floating, f"{depth}:{op.name.removeprefix(PREFIX)}", region)
             if op.regions:
                 # Live through the regions: what lives past the op and what its regions read (C1: a loop's
                 # initial carries are copied into its iteration arguments, so they die at the loop unless
@@ -572,7 +573,8 @@ class _Pass:
         def registers(inner):
             if "asm_string" in inner.attributes:
                 assembly = ir.StringAttr(inner.attributes["asm_string"]).value
-                for direction, amount in re.findall(r"setmaxnreg\.(inc|dec)\.sync\.aligned\.u32 (\d+)", assembly):
+                changes = re.findall(r"setmaxnreg\.(inc|dec)\.sync\.aligned\.u32 (\d+)", assembly)
+                for direction, amount in changes:
                     if direction == "inc":
                         peak.raised = max(peak.raised, int(amount))
                     else:
