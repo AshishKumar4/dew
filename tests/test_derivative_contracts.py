@@ -136,8 +136,10 @@ token recurrence keeps finite, as fla's chunked form's do at the same entries (`
 H100: ledger 2470), which that edge compares it with in place of the recurrence."""
 
 PACKED_OVERFLOW_ORDERS = ("primal", "jvp", "vjp", "second jvp", "second jvp, remat")
-"""The orders a packed row of the chunked delta rule holds from 2^62: all but forward over reverse, which the
-owner accepted there (`test_the_chunked_delta_rule_holds_every_order`, ledger 2470)."""
+"""The orders a packed row of the chunked delta rule holds from 2^62: all but the second orders through its
+gradient, forward over reverse and reverse over reverse, which the owner's 10-30 decision accepts there (one
+cause, documents sharing chunks, an overflow-only difference: ledger 2470, Main 10-30 on reverse over
+reverse; `test_the_chunked_delta_rule_holds_every_order`)."""
 
 
 def precedent_chunked(query, key, value, g, beta, *, chunk_size: int, starts=None):
@@ -223,8 +225,8 @@ def test_the_chunked_delta_rule_holds_every_order(packed, edge):
     direction = tuple(jax.random.normal(keys[6], x.shape) * (scale if at < 3 else 1.0)
                       for at, x in enumerate(primals))
     cotangent = jax.random.normal(keys[7], query.shape)
-    # A packed row's forward over reverse from 2^62: the owner's accuracy-for-speed acceptance (ledger 2470,
-    # 10-30).
+    # A packed row's second orders through its gradient from 2^62: the owner's accuracy-for-speed acceptance
+    # (ledger 2470, 10-30).
     accepted = packed and scale >= 2.0**62
     assert_contract(rule, primals, direction, cotangent, f"the chunked delta rule {edge}",
                     truth_fn=recurrence, plain_fn=plain, held=PACKED_OVERFLOW_ORDERS if accepted else None)
