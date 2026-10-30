@@ -19,7 +19,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from kimi_support import assert_forward_as_exact, assert_greedy_as_exact, exported, kimi_source
-from reference_error import assert_as_exact_as_the_reference, ieee_fixture
+from one_draw import assert_as_exact_as_the_reference
+from reference_error import ieee_fixture
 
 from dew.interop import Pretrained
 from dew.interop.codecs import decode_e2m1, quantize_packed_mxfp4

@@ -20,13 +20,8 @@ import numpy as np
 import pytest
 from attention_oracle import attention_and_grads, attention_terms, exact_attention, kept, qkv, value_and_grads
 from flax import linen as nn
-from reference_error import (
-    as_given,
-    assert_as_exact,
-    assert_as_exact_as_the_reference,
-    distance,
-    with_gradients,
-)
+from one_draw import assert_as_exact_as_the_reference
+from reference_error import as_given, assert_as_exact, distance, with_gradients
 
 from dew.nn import kernels
 from dew.nn.attention import scaled_dot_product_attention, weighted_values

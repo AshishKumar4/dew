@@ -16,7 +16,8 @@ import numpy as np
 import pytest
 from jax.sharding import NamedSharding, PartitionSpec as P
 from moe_support import assert_exchange_across_processes, objective, routing_case
-from reference_error import assert_as_exact_as_the_reference, assert_computes_the_oracle
+from one_draw import assert_as_exact_as_the_reference
+from reference_error import assert_computes_the_oracle
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture

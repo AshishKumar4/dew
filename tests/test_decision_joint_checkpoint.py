@@ -14,9 +14,11 @@ import numpy as np
 import optax
 import pytest
 from decision_support import decision_rows
+from float64_terms import float64_forward
 from interop_support import allocated_bytes, written_tensors
+from one_draw import assert_as_exact_as_the_reference
 from PIL import Image
-from reference_error import assert_as_exact_as_the_reference, float64_forward, ieee_fixture
+from reference_error import ieee_fixture
 from safetensors.numpy import load_file
 
 from dew.checkpoints import Checkpoints
