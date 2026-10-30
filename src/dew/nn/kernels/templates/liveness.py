@@ -19,6 +19,7 @@ from jaxlib.mlir import passmanager
 from jaxlib.mlir.dialects import gpu, llvm
 from jaxlib.mosaic.python import mosaic_gpu as mosaic_gpu_dialect
 
+
 @dataclasses.dataclass(frozen=True)
 class Compiler:
     """The assembler whose scheduling the estimate describes. Relocatable assembly ignores register
@@ -273,18 +274,18 @@ def _general_register(value) -> bool:
     for use in value.uses:
         op = use.owner.operation
         name = op.name.removeprefix(PREFIX)
-        if name in ("llvm.getelementptr", "llvm.bitcast", "llvm.ptrtoint", "llvm.inttoptr"):
-            if any(_general_register(value) for value in op.results):
-                return True
+        if (name in ("llvm.getelementptr", "llvm.bitcast", "llvm.ptrtoint", "llvm.inttoptr")
+                and any(_general_register(value) for value in op.results)):
+            return True
         if name in ("llvm.load", "llvm.store", "nvvm.cp.async.shared.global"):
             return True
         if name == "llvm.inline_asm" and "constraints" in op.attributes:
             constraints = [c.strip() for c in ir.StringAttr(op.attributes["constraints"]).value.split(",")
                            if c.strip() and not c.startswith(("=", "~"))]
-            if len(constraints) == len(op.operands):
-                if any(operand == value and constraint in ("r", "l", "f", "d")
-                       for operand, constraint in zip(op.operands, constraints, strict=True)):
-                    return True
+            if (len(constraints) == len(op.operands)
+                    and any(operand == value and constraint in ("r", "l", "f", "d")
+                            for operand, constraint in zip(op.operands, constraints, strict=True))):
+                return True
     return False
 
 
