@@ -9,6 +9,7 @@ The compile gate compares this pass with the family rules and ptxas. This module
 or chooses a live run's configuration. Its estimate describes the lowered program; the compiler's
 allocation and scheduling constraints are checked separately."""
 import collections
+import dataclasses
 import math
 import re
 
@@ -18,12 +19,17 @@ from jaxlib.mlir import passmanager
 from jaxlib.mlir.dialects import gpu, llvm
 from jaxlib.mosaic.python import mosaic_gpu as mosaic_gpu_dialect
 
+@dataclasses.dataclass(frozen=True)
+class Compiler:
+    """The assembler whose scheduling the estimate describes. Relocatable assembly ignores register
+    raises; CUDA 13 streams transcendental chains that CUDA 12 keeps as vectors."""
+    version: tuple[int, int]
+    relocatable: bool
+
+
 FREE = {"arith.constant", "llvm.mlir.constant", "llvm.mlir.undef", "llvm.mlir.poison", "llvm.mlir.zero",
         "gpu.thread_id", "gpu.block_id", "gpu.block_dim", "gpu.grid_dim"}
-"""Ops whose results take no register a thread keeps: immediates and special registers. (A1, holding a
-thread's id and the arithmetic over it, PAIRS15: sm80's forward 199 against SASS's 193 and its kernel
-gradient 171 against 202, but sm90's kernel gradient 112 against 102: open, the per-thread addresses ptxas
-keeps on a family without TMA against those it recomputes.)"""
+"""Immediates and special registers, which take no retained general register."""
 
 PREFIX = "stable_mosaic_gpu."
 
@@ -195,6 +201,8 @@ class Peak:
         self.regions = {}
         self.threads: int | None = None
         self.mma_words = 0
+        self.raised = 0
+        self.producer = 0
 
     def see(self, live: set, data: list, where: str, region: str = ""):
         if len(live) > self.regions.get(region, (0,))[0]:
@@ -259,16 +267,37 @@ def divergent_values(module) -> set:
     return divergent
 
 
+def _general_register(value) -> bool:
+    """Uniform addresses still occupy GPRs when a memory instruction requires them. cp.async has no
+    payload registers, but its source/destination constraints are l/r, not uniform-register operands."""
+    for use in value.uses:
+        op = use.owner.operation
+        name = op.name.removeprefix(PREFIX)
+        if name in ("llvm.getelementptr", "llvm.bitcast", "llvm.ptrtoint", "llvm.inttoptr"):
+            if any(_general_register(result) for result in op.results):
+                return True
+        if name in ("llvm.load", "llvm.store", "nvvm.cp.async.shared.global"):
+            return True
+        if name == "llvm.inline_asm" and "constraints" in op.attributes:
+            constraints = [c.strip() for c in ir.StringAttr(op.attributes["constraints"]).value.split(",")
+                           if c.strip() and not c.startswith(("=", "~"))]
+            if len(constraints) == len(op.operands):
+                if any(operand == value and constraint in ("r", "l", "f", "d")
+                       for operand, constraint in zip(op.operands, constraints, strict=True)):
+                    return True
+    return False
+
+
 class _Pass:
-    def __init__(self, divergent: set | None = None):
+    def __init__(self, divergent: set | None = None, compiler: Compiler | None = None):
         self.atoms = Atoms()
         self.free = set()
         self.divergent = divergent
-        self.launch_threads: set[int] = set()
+        self.compiler = compiler
+        self.launches: list[Peak] = []
         self.mma_words = 0
 
-    @staticmethod
-    def _streamed(op, name: str) -> bool:
+    def _streamed(self, op, name: str) -> bool:
         if not ELEMENTWISE.match(name) or len(op.results) != 1:
             return False
         if name == "llvm.inline_asm" and (_tied(op) is not None or "has_side_effects" in op.attributes
@@ -276,6 +305,11 @@ class _Pass:
                                                               str(op.results[0].type))):
             # Only a pure one-result float assembly is an elementwise math op (ex2.approx, rcp.approx).
             return False
+        if self.compiler is not None and self.compiler.version < (13, 0):
+            assembly = (ir.StringAttr(op.attributes["asm_string"]).value
+                        if "asm_string" in op.attributes else "")
+            if name.startswith(("math.exp", "math.tanh")) or re.search(r"\b(ex2|tanh)\.", assembly):
+                return False
         parent = op.parent
         for use in op.results[0].uses:
             user = use.owner.operation
@@ -337,13 +371,6 @@ class _Pass:
                 words = sum(-(-size // 32) for result in op.results
                             for size, _ in _elements(result.type) or [])
                 self.mma_words = max(self.mma_words, words)
-        if isinstance(op.opview, gpu.LaunchOp):
-            launch = op.opview
-            dimensions = tuple(_constant(size) for size in (launch.blockSizeX, launch.blockSizeY,
-                                                             launch.blockSizeZ))
-            if any(size is None for size in dimensions):
-                raise ValueError("a Mosaic kernel's thread dimensions are not static")
-            self.launch_threads.add(math.prod(size for size in dimensions if size is not None))
         self.atoms.making = f"{name}:{str(op.results[0].type)[:28]}" if len(op.results) else name
         results = list(op.results)
         if name in FREE or self._rematerialized(op, name):
@@ -379,7 +406,8 @@ class _Pass:
         for result in results:
             parts = _elements(result.type) or []
             uniform = (self.divergent is not None and result not in self.divergent
-                       and not any(data for _, data in parts) and not isinstance(result.type, ir.VectorType))
+                       and not any(data for _, data in parts) and not isinstance(result.type, ir.VectorType)
+                       and not _general_register(result))
             self.atoms.of[result] = [] if uniform else self.atoms.fresh(result.type, unpacked=unpacked)
 
     def _regrouped(self, op, name: str, results) -> bool:
@@ -484,7 +512,8 @@ class _Pass:
         for argument in block.arguments:
             uniform = (self.divergent is not None and argument not in self.divergent
                        and not isinstance(argument.type, ir.VectorType)
-                       and not any(data for _, data in _elements(argument.type) or []))
+                       and not any(data for _, data in _elements(argument.type) or [])
+                       and not _general_register(argument))
             self.atoms.of[argument] = [] if uniform else self.atoms.fresh(argument.type)
         ops = [op.operation for op in block.operations]
         # Define every result first (regions' results included), so uses map to atoms.
@@ -519,16 +548,40 @@ class _Pass:
                 # initial carries are copied into its iteration arguments, so they die at the loop unless
                 # its body or a later op reads them).
                 survives = outer | {a for a in local if last[a] > index}
+                nested_peak = self._launch(op) if isinstance(op.opview, gpu.LaunchOp) else peak
                 for region_index, nested_region in enumerate(op.regions):
                     for inner in nested_region.blocks:
                         captured = set()
                         for nested in inner.operations:
                             self.uses(nested.operation, captured)
                         across = survives | (captured & local)
-                        self.block(inner, across, peak, depth + 1,
+                        self.block(inner, across, nested_peak, depth + 1,
                                    f"{region}/{index}:{region_index}", preserved=survives)
             local |= {a for a in made if a in last}
             local = {a for a in local if last[a] > index}
+
+    def _launch(self, op) -> Peak:
+        launch = op.opview
+        dimensions = tuple(_constant(size) for size in (launch.blockSizeX, launch.blockSizeY,
+                                                        launch.blockSizeZ))
+        if any(size is None for size in dimensions):
+            raise ValueError("a Mosaic kernel's thread dimensions are not static")
+        peak = Peak()
+        peak.threads = math.prod(size for size in dimensions if size is not None)
+
+        def registers(inner):
+            if "asm_string" in inner.attributes:
+                assembly = ir.StringAttr(inner.attributes["asm_string"]).value
+                for direction, amount in re.findall(r"setmaxnreg\.(inc|dec)\.sync\.aligned\.u32 (\d+)", assembly):
+                    if direction == "inc":
+                        peak.raised = max(peak.raised, int(amount))
+                    else:
+                        peak.producer = max(peak.producer, int(amount))
+            return ir.WalkResult.ADVANCE
+
+        op.walk(registers)
+        self.launches.append(peak)
+        return peak
 
     def _define_all(self, op):
         if op.results and op.results[0] in self.atoms.of:
@@ -552,7 +605,7 @@ def canonical(module_bytes: bytes, context: ir.Context) -> ir.Module:
     return module
 
 
-def kernel_peaks(module_bytes: bytes) -> list[tuple[str, Peak, tuple]]:
+def kernel_peaks(module_bytes: bytes, compiler: Compiler | None = None) -> list[tuple[str, Peak, tuple]]:
     """Each function's peak in a lowered module (its kernel's body among them), the module canonicalized
     first (`canonical`)."""
     found = []
@@ -562,15 +615,14 @@ def kernel_peaks(module_bytes: bytes) -> list[tuple[str, Peak, tuple]]:
         for op in module.body.operations:
             if not op.operation.regions:
                 continue
-            peak, run = Peak(), _Pass(divergent)
+            peak, run = Peak(), _Pass(divergent, compiler)
             for nested_region in op.operation.regions:
                 for block in nested_region.blocks:
                     run.block(block, set(), peak, 0)
-            if len(run.launch_threads) == 1:
-                peak.threads = next(iter(run.launch_threads))
-            peak.mma_words = run.mma_words
             name = (ir.StringAttr(op.operation.attributes["sym_name"]).value
                     if "sym_name" in op.operation.attributes else op.operation.name)
-            regions = sorted(peak.regions.items(), key=lambda kv: -kv[1][0])[:8]
-            found.append((str(name), peak, (peak.breakdown(run.atoms), regions)))
+            for launch in run.launches or [peak]:
+                launch.mma_words = run.mma_words
+                regions = sorted(launch.regions.items(), key=lambda kv: -kv[1][0])[:8]
+                found.append((str(name), launch, (launch.breakdown(run.atoms), regions)))
     return found

@@ -8,10 +8,11 @@ from jax._src.interpreters import mlir as jax_mlir
 from jax.extend.mlir import ir
 from jaxlib.mlir import passmanager
 from jaxlib.mosaic.python import mosaic_gpu as mosaic_gpu_dialect
-from kernel_liveness import kernel_peaks
+
+from dew.nn.kernels.templates.liveness import Compiler, kernel_peaks
 
 
-def analyzed(body: str):
+def serialized(body: str):
     """Serialize through Mosaic's actual versioned format, then read it through the liveness pass."""
     with jax_mlir.make_ir_context() as context:
         mosaic_gpu_dialect.register_dialect(context)
@@ -20,7 +21,11 @@ def analyzed(body: str):
         passmanager.PassManager.parse("builtin.module(mosaic_gpu-serde{serialize=true})").run(module.operation)
         bytecode = io.BytesIO()
         module.operation.write_bytecode(bytecode)
-    return {name: peak for name, peak, _ in kernel_peaks(bytecode.getvalue())}["kernel"]
+    return bytecode.getvalue()
+
+
+def analyzed(body: str, compiler=None):
+    return {name: peak for name, peak, _ in kernel_peaks(serialized(body), compiler)}["kernel"]
 
 
 @pytest.mark.parametrize("width", [1, 2, 4])
@@ -101,3 +106,69 @@ def test_a_branch_does_not_hold_the_other_branchs_captures():
       }
     """)
     assert peak.total == 2
+
+
+def test_a_uniform_address_still_occupies_the_loads_general_registers():
+    peak = analyzed("""
+      module {
+        func.func @kernel(%address: !llvm.ptr) -> f32 {
+          %value = "llvm.inline_asm"(%address) {asm_string = "ld.global.f32 $0, [$1];", constraints = "=f,l"}
+            : (!llvm.ptr) -> f32
+          return %value : f32
+        }
+      }
+    """)
+    assert peak.total >= 2
+
+
+def test_the_compiler_input_accounts_for_a_transcendental_chain_kept_as_a_vector():
+    body = """
+      module {
+        func.func @kernel(%x: vector<4xf32>) -> f32 {
+          %exp = math.exp %x : vector<4xf32>
+          %sum = vector.reduction <add>, %exp : vector<4xf32> into f32
+          %old = vector.reduction <add>, %x : vector<4xf32> into f32
+          %result = arith.addf %sum, %old : f32
+          return %result : f32
+        }
+      }
+    """
+    vectorized = analyzed(body, Compiler((12, 9), True))
+    streamed = analyzed(body, Compiler((13, 4), True))
+    assert vectorized.total > streamed.total
+
+
+def test_each_lowered_launch_has_its_own_budget_and_residency():
+    from dew.nn.kernels.generation import gpu_target
+    from dew.nn.kernels.templates import resources
+
+    body = """
+      module {
+        func.func private @effect(f32) -> f32
+        func.func @kernel(%x: f32) {
+          %one = arith.constant 1 : index
+          %small = arith.constant 128 : index
+          %large = arith.constant 384 : index
+          gpu.launch blocks(%bx, %by, %bz) in (%gx = %one, %gy = %one, %gz = %one)
+            threads(%tx, %ty, %tz) in (%sx = %small, %sy = %one, %sz = %one) {
+              %v = func.call @effect(%x) : (f32) -> f32
+              gpu.terminator
+            }
+          gpu.launch blocks(%bx, %by, %bz) in (%gx = %one, %gy = %one, %gz = %one)
+            threads(%tx, %ty, %tz) in (%sx = %large, %sy = %one, %sz = %one) {
+              %v = func.call @effect(%x) : (f32) -> f32
+              gpu.terminator
+            }
+          return
+        }
+      }
+    """
+    compiler = Compiler((13, 4), True)
+    small, large = resources.lowered_registers(serialized(body), compiler)
+    target = gpu_target("sm100")
+    first = small.model(target, compiler, shared=0, tmem=0)
+    second = large.model(target, compiler, shared=0, tmem=0)
+    assert first.budget > second.budget
+    assert first.most > second.most
+    assert small.model(target, compiler, shared=target.shared_limit, tmem=0).most == 1
+    assert small.model(target, compiler, shared=0, tmem=target.tmem_columns).most == 1
