@@ -203,7 +203,8 @@ class AttendsContext(Protocol):
     projects keys and values of its own to read one with, the key heads' count and the widths of a
     key and a value head, its query heads over the layer's input, its key and value heads over a
     context, its attention of the one over the other through its output projection, and that read's
-    work (`dew.nn.mixers.attention.CausalSelfAttention`)."""
+    work: `dew.nn.mixers.attention.CausalSelfAttention`'s, `dew.nn.mla.MultiHeadLatentAttention`'s (and
+    so k-pool's) and `dew.nn.deepseek_v4.DeepseekV4Attention`'s."""
 
     @property
     def reads_context(self) -> bool: ...
@@ -388,8 +389,9 @@ class SharedCrossAttention:
         mixer = decoder.mixer_of(index)
         if not isinstance(mixer, AttendsContext):
             raise ValueError(f"layer {index}'s mixer ({type(mixer).__name__}) reads no context through its "
-                             "own attention (AttendsContext, which CausalSelfAttention implements); name "
-                             "layers of standard attention, or read the context with CrossAttention's block")
+                             "own attention (AttendsContext, which standard, latent (MLA, k-pool) and "
+                             "DeepSeek V4 attention implement); name layers of those, or read the context "
+                             "with CrossAttention's block")
         if not mixer.reads_context:
             raise ValueError(f"layer {index} shares its keys and values with an earlier layer, so it "
                              "projects none of its own to read a context with")
