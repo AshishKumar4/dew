@@ -140,6 +140,12 @@ class BackwardTiles:
     """Whether the keys-first dK/dV launch stages its logits' queries (the call's taken by its power) a
     step from the call's own in its consumers' shared memory, where a stream of them beside the call's
     passes the block (width 256's)."""
+    shared_dq: bool = False
+    """Whether the keys-first fused launch's consumers, each its own keys, exchange their score cotangents
+    for a cooperative dQ: each forms its half of dQ's columns over every key and adds it, one tile's dQ added
+    once a program (FlashAttention 3's width 128, run_mha_bwd_hdim128: AtomLayoutMdQ 1 over two MMA
+    warpgroups; each consumer adding a whole tile over its own keys adds twice, the measured bound,
+    ET-DQBOUND-h100)."""
     shared_keys: bool = False
     """Whether the fused launch's consumers share one key block (`attention_mosaic_coop._coop_launch`):
     each forms the logits of its share of the keys and holds its share of the head's columns of dK, dV and

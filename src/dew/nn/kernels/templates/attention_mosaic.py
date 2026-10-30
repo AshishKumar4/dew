@@ -510,7 +510,9 @@ def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int
     # The keys-first step's statistics in its tiles' column layout (`Family.column_registers`); a fused
     # launch's dQ tile of its share `[queries, D]` fp32 beside its score cotangents.
     statistics = DKV_STATISTICS * family.column_registers(queries, jnp.float32)
-    added = [[step[0], (queries, width, jnp.float32)]] if config.fused else []
+    # A shared dQ (`BackwardTiles.shared_dq`) its share of the columns.
+    dq_width = width // config.consumers if config.shared_dq else width
+    added = [[step[0], (queries, dq_width, jnp.float32)]] if config.fused else []
     return resources.live_registers(family, carried, step, *added) + statistics
 
 
@@ -573,6 +575,14 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
             return False
         dtype = ba.arguments["query"].dtype
         family = bundle_of(config, dtype)
+        if config.shared_dq:
+            # Keys first, each consumer its own keys (no layout whose consumers feed their rings), each its
+            # share of dQ's columns whole swizzled rows (`_fused_adds`).
+            dkv = config.dkv
+            share = _width(ba.arguments["query"].shape[-1], family, dtype) // dkv.consumers
+            return (config.fused and not config.queries_first and dkv.consumers > 1 and config.columns == 1
+                    and not split_queries(bundle_of(dkv, dtype))
+                    and share % family.column_unit(dtype) == 0)
         if config.shared_keys:
             # Every consumer's share of the keys whole rows of a swizzle the exchange stages them at
             # (`mosaic.swizzle_for`), its share of the columns whole swizzled rows (`attention_mosaic_coop`).
