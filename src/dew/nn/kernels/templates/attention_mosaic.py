@@ -8,7 +8,7 @@ set (`legal`): no table, no sweep, no space ranked. A GPU nobody measured of a f
 
 import dataclasses
 import functools
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Hashable, Sequence
 from typing import ClassVar, Literal, overload
 
 import jax
@@ -219,13 +219,6 @@ class MosaicForward(_Mainloop[Tiles]):
         if reason := refused(query.dtype, query.shape[3], value.shape[3], hooks, backward=False,
                              family=bundle_of(config, query.dtype)):
             raise NotImplementedError(reason)
-        if not (config.natural_form or self._natural(query)) and config.relaunch_k is None:
-            # A config naming no rewalk tiles (a pin's) rewalks at the ones derived for it (row 2621).
-            ba = self.bind(query, key, value, start, end, query_ids, key_ids, score_params, output_params,
-                           initial, drop, residuals=residuals, interpret=interpret)
-            relaunched = self._relaunched(ba, config, generation.gpu_target())
-            assert relaunched is not None, config
-            config = relaunched
         spans = self.spans(start, end, query_ids, key_ids)
         form = {"scale": self.scale, "natural": self.natural, "tiles": config, "interpret": interpret}
         match residuals:
@@ -236,17 +229,24 @@ class MosaicForward(_Mainloop[Tiles]):
                 return _plain_forward(query, key, value, spans, hooks, rows=residuals is Kept.OUTPUT,
                                       **form), None
 
+    def completed(self, ba: tokamax.BoundArguments, config: Hashable) -> Hashable:
+        """A pin's or an explicit config's natural rewalk derived once where it names none (`_relaunched`,
+        rows 2621, 2647); the config as it is where it names its rewalk's tiles or none derives (a config of
+        another type, which `pinnable` refuses)."""
+        if (not isinstance(config, Tiles) or config.natural_form
+                or (config.relaunch_k, config.relaunch_consumers) != (None, None)):
+            return config
+        return self._relaunched(ba, config, generation.gpu_target()) or config
+
     def legal(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> bool:
-        """Its launch's (`_launch_legal`), and a fold's natural rewalk: at the tiles the config names (the
-        derivation's and a tuning neighbour's, `Tiles.relaunch`), their key tile dividing the config's and
-        their consumers at most its, holding too (row 2584); a config that names none (a pin's) at the tiles
-        derived for it, which its launch takes (`_relaunched`, row 2621)."""
+        """Its launch's (`_launch_legal`), and a fold's natural rewalk at the tiles the config names (the
+        derivation's, a tuning neighbour's, a pin's completed one, `completed`), their key tile dividing the
+        config's and their consumers at most its, holding too (row 2584); a fold's config that names none
+        rewalks at its own tiles, which must hold (rows 2621, 2647)."""
         if not self._launch_legal(ba, config, target):
             return False
         if config.natural_form or self._natural(ba.arguments["query"]):
             return True
-        if (config.relaunch_k, config.relaunch_consumers) == (None, None):
-            return self._relaunched(ba, config, target) is not None
         relaunch = config.relaunch
         return (config.block_k % relaunch.block_k == 0 and relaunch.consumers <= config.consumers
                 and self._launch_legal(ba, relaunch, target))
