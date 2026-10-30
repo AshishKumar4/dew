@@ -43,7 +43,7 @@ import jax.numpy as jnp
 from dew.nn.kernels.generation import linear_map
 from dew.nn.kernels.templates.attention_algebra import power2
 from dew.nn.kernels.templates.product import Exact, Transposed
-from dew.nn.precision import compensated_add, float32_einsum, float32_matmul
+from dew.nn.precision import compensated_add, exact_float32, float32_einsum, float32_matmul
 
 from . import recurrence
 
@@ -87,14 +87,15 @@ decay's bound keeps exact, or as the weighed sum."""
 
 
 def portable(name: str, left, right):
-    """XLA's product, the portable math's issuer: `left @ right`, float32 products in float32 on a GPU, as
-    torch's are, not TF32, summed as Dew sums a CPU's float32 products (`dew.nn.precision.float32_matmul`,
-    which `accumulated`); the portable math takes its operands in at least float32
+    """XLA's product, the portable math's issuer: `left @ right` in IEEE float32 where nothing states a
+    precision (`dew.nn.precision.exact_float32`), since a chunk's products carry the recurrent state,
+    whose rounding every later chunk reads compounded, summed as Dew sums a CPU's float32 products
+    (`float32_matmul`, which `accumulated`); the portable math takes its operands in at least float32
     (`recurrence_chunk.chunked`), a `Transposed` one transposed."""
     del name
     left, right = (jnp.swapaxes(x.value, -1, -2) if isinstance(x, Transposed) else
                    x.value if isinstance(x, Exact) else x for x in (left, right))
-    return float32_matmul(left, right)
+    return float32_matmul(left, right, exact_float32(None))
 
 
 def _cumulated(g, documents=None):
@@ -336,7 +337,7 @@ def paired(name: str, left, right, decay, issue: Issue = portable):
     scales the product `name` after it, one per key dimension weighs each term of it."""
     if decay.shape[-1] == 1:
         return issue(name, left, jnp.swapaxes(right, -1, -2)) * decay[..., 0]
-    return float32_einsum('...sd,...td,...std->...st', left, right, decay)
+    return float32_einsum('...sd,...td,...std->...st', left, right, decay, precision=exact_float32(None))
 
 
 def intra(key, keyed, pairs, issue: Issue = portable):

@@ -302,9 +302,12 @@ the ones the checkpoint holds, 0 none, `n` the first `n`; a DSpark drafter, whos
 one with its heads on the last, is kept whole or at 0 not at all. The load reads the source as the checkpoint of those depths alone, its config's counts cut
 before routing and the others' tensors dropped before any is read, and saves as that checkpoint,
 with or without `text_only`. A run passes both through `--source.text-only` and
-`--source.prediction-depths` (`RunConfig.source`), whatever kind of run it is, and the load's
-`modeling_overrides` through `--source.attention`, each layer kind causal or block_bidirectional;
-a diffusion pipeline, which no override reaches, refuses them.
+`--source.prediction-depths` (`RunConfig.source`), whatever kind of run it is, the load's
+`modeling_overrides` through `--source.attention`, each layer kind causal or block_bidirectional,
+and its differential extension through `--source.dex`, the `DifferentialExtension`'s record as JSON
+(`dew.nn.dex`); a diffusion pipeline, which no override reaches, refuses them. `dew.pipeline` takes
+the same choices for a source as `options=SourceOptions(...)`, and refuses them for a run directory,
+whose record holds its own.
 
 Serving is one engine of kinds (`dew.inference.Engine`). A kind (`Kind`) admits waiting requests
 within its own bounds, runs them with one bounded device call a `step`, and settles each request's

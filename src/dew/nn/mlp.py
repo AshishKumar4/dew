@@ -120,6 +120,8 @@ class GatedMLP(nn.Module):
     out_features: int
     activation: GatedActivation | Activation = 'swiglu'
     use_bias: bool = False
+    """Whether its projections add a bias: none by default, as Llama's and most published gated
+    feed-forwards (`mlp_bias: false`), where Flax's Dense adds one."""
     activation_sparsity: float = 0.0
     swiglu_limit: float | None = None
     init_std: float | None = None  # gate/up normal std; None: lecun normal

@@ -17,20 +17,28 @@ Outside training (no step, `dew.nn.progress`) a layer reads `lambda_learn`, the 
 
 The heads are chosen per layer (`heads`), as the paper picks the half of each layer's heads of least
 importance or most attention entropy; a run picks them from a model's own statistics before it attaches
-the extension. The paper's recipe trains the attention's key, value and output projections with the
-extension and freezes the rest (`dew.optim.ParamGroup`).
+the extension. A layer holds its chosen heads and its `lambda_init` as variables of its own
+(`DEX_CONSTANTS`, `DexStart`), so layers that choose as many heads share one spec (`LayerDex`) and a
+scanned run or a pipeline stage holds them as it holds any layer's weights. The paper's recipe trains
+the attention's key, value and output projections with the extension and freezes the rest
+(`dew.optim.ParamGroup`).
 """
 
 import dataclasses
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Literal, Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
+import numpy as np
+from flax.traverse_util import unflatten_dict
+from jax.typing import DTypeLike
 
-__all__ = ["DEX_PARAMETERS", "DifferentialExtension", "HeadOutputs", "LayerDex", "annealed",
-           "diff_lambda_init", "differential"]
+from dew.batch import leaves_by_path
+
+__all__ = ["DEX_COLLECTION", "DEX_CONSTANTS", "DEX_PARAMETERS", "DexStart", "DifferentialExtension",
+           "HeadOutputs", "LayerDex", "annealed", "diff_lambda_init", "differential", "folded"]
 
 TRAINED_PROJECTIONS = ("k_proj", "v_proj", "o_proj")
 """The attention projections the paper's recipe trains beside the extension, the feed-forward and the
@@ -39,6 +47,13 @@ rest frozen."""
 DEX_PARAMETERS = ("dex_projection", "dex_lambda")
 """The parameters an attention layer adds for DEX, by name: its chosen heads' projections and its learned
 lambda (`dew.nn.mixers.attention.CausalSelfAttention`)."""
+
+DEX_COLLECTION = "constants"
+"""The collection an attention layer holds DEX's start in (`DEX_CONSTANTS`), which never trains."""
+
+DEX_CONSTANTS = ("dex_heads", "dex_lambda_init")
+"""The variables an attention layer holds for DEX under `DEX_COLLECTION`, by name: the heads it acts on and
+its `lambda_init` (`DexStart`)."""
 
 
 @runtime_checkable
@@ -50,6 +65,11 @@ class HeadOutputs(Protocol):
         """Its heads' count and the width of each one's output."""
         ...
 
+    def dex_fold_refusal(self) -> str | None:
+        """Why DEX on its heads does not fold into its output projection (`folded`): what its heads'
+        outputs pass through between the two; None where nothing does."""
+        ...
+
 
 def diff_lambda_init(depth: int) -> float:
     """Differential Transformer's `lambda_init` for a layer of 1-based `depth`:
@@ -59,12 +79,21 @@ def diff_lambda_init(depth: int) -> float:
 
 @dataclasses.dataclass(frozen=True)
 class LayerDex:
-    """One layer's differential extension: the heads it acts on, ascending, its `lambda_init` and the
-    updates its lambda anneals over (`DifferentialExtension`)."""
+    """One layer's differential extension as every layer that chooses as many heads shares it: how many
+    of its heads it acts on and the updates its lambda anneals over (`DifferentialExtension`). Which
+    heads, and lambda's start, are the layer's own variables (`DexStart`)."""
+
+    count: int
+    anneal_steps: int
+
+
+@dataclasses.dataclass(frozen=True)
+class DexStart:
+    """The values one layer's extension holds from its start (`DEX_CONSTANTS`): the heads it acts on,
+    ascending, and its `lambda_init`."""
 
     heads: tuple[int, ...]
     lambda_init: float
-    anneal_steps: int
 
 
 @dataclasses.dataclass(frozen=True)
@@ -107,30 +136,67 @@ class DifferentialExtension:
                 and path[depth + 1] == "self_attn" and path[depth + 2] in TRAINED_PROJECTIONS)
 
     def layer(self, index: int) -> LayerDex | None:
-        """Layer `index`'s extension, or None where it carries none."""
+        """Layer `index`'s extension as its spec holds it, or None where it carries none."""
+        heads = dict(self.layers).get(index)
+        return None if heads is None else LayerDex(len(heads), self.anneal_steps)
+
+    def start(self, index: int) -> DexStart | None:
+        """The values layer `index`'s extension starts from, or None where it carries none."""
         heads = dict(self.layers).get(index)
         if heads is None:
             return None
-        start = diff_lambda_init(index + 1) if self.lambda_init is None else self.lambda_init
-        return LayerDex(heads, start, self.anneal_steps)
+        return DexStart(heads, diff_lambda_init(index + 1) if self.lambda_init is None else self.lambda_init)
 
 
-def annealed(updates: jax.Array | None, layer: LayerDex, learned: jax.Array) -> jax.Array:
-    """`lambda(t)` after `updates` optimizer updates (this module's Eq. 4); `learned` past the anneal,
-    and outside training (`updates` None)."""
+def annealed(updates: jax.Array | None, layer: LayerDex, start: jax.Array, learned: jax.Array) -> jax.Array:
+    """`lambda(t)` after `updates` optimizer updates (this module's Eq. 4), from the layer's
+    `lambda_init` `start`; `learned` past the anneal, and outside training (`updates` None)."""
     if updates is None:
         return learned
     fraction = jnp.minimum(jnp.asarray(updates, jnp.float32) / layer.anneal_steps, 1.0)
-    start = fraction * layer.lambda_init
-    return (1 - fraction) * start.astype(learned.dtype) + fraction.astype(learned.dtype) * learned
+    began = fraction * jnp.asarray(start, jnp.float32)
+    return (1 - fraction) * began.astype(learned.dtype) + fraction.astype(learned.dtype) * learned
 
 
-def differential(attention: jax.Array, heads: tuple[int, ...], projection: jax.Array,
+def differential(attention: jax.Array, heads: jax.Array | tuple[int, ...], projection: jax.Array,
                  strength: jax.Array, precision=None) -> jax.Array:
     """The heads' outputs `attention` `[B, S, H, Dv]` with each of `heads` less `strength` times its own
     projection of itself (`projection` `[len(heads), Dv, Dv]`, in `heads`' order), the other heads as
     they are: one product over the chosen heads, scattered back."""
-    chosen = jnp.asarray(heads)
+    chosen = jnp.asarray(heads, jnp.int32)
     taken = attention[:, :, chosen]
     moved = jnp.einsum("bshd,hde->bshe", taken, projection.astype(attention.dtype), precision=precision)
     return attention.at[:, :, chosen].add(-(strength.astype(attention.dtype) * moved))
+
+
+def folded(variables: Mapping[str, Mapping], compute: DTypeLike | None) -> dict[str, Mapping]:
+    """`variables` with each DEX layer's differential at its learned lambda folded into its output
+    projection, the extension's parameters and constants dropped: a layer's `o_proj` kernel
+    `[H Dv, D]` has each chosen head `h`'s rows `K_h` made `(I - lambda_learn W_h) K_h`, in float64
+    and rounded once to the kernel's dtype, so the source's own layer computes what the extended one
+    does outside a run (`annealed`), `O'_h K_h = O_h (I - lambda W_h) K_h`. Lambda and `W_h` are the
+    ones the layer multiplies by, rounded to its `compute` dtype as `differential` rounds them (None for
+    its parameters' own). A layer whose heads' outputs pass through more before `o_proj` does not fold
+    (`HeadOutputs.dex_fold_refusal`)."""
+
+    def multiplied(value) -> np.ndarray:
+        held = np.asarray(value)
+        return np.asarray(held if compute is None else held.astype(jnp.dtype(compute)), np.float64)
+
+    params: dict[tuple[str, ...], jax.Array | np.ndarray] = dict(leaves_by_path(variables["params"]))
+    held = leaves_by_path(variables.get(DEX_COLLECTION, {}))
+    for prefix in [key[:-1] for key in params if key[-1] == "dex_projection"]:
+        projection = multiplied(params.pop((*prefix, "dex_projection")))
+        strength = multiplied(params.pop((*prefix, "dex_lambda")))
+        heads = np.asarray(held.pop((*prefix, "dex_heads")))
+        del held[(*prefix, "dex_lambda_init")]
+        kernel = params[(*prefix, "o_proj", "kernel")]
+        wide = np.array(kernel, np.float64)
+        width = projection.shape[-1]
+        for slot, head in enumerate(heads):
+            rows = slice(int(head) * width, (int(head) + 1) * width)
+            wide[rows] -= strength * projection[slot] @ wide[rows]
+        params[(*prefix, "o_proj", "kernel")] = wide.astype(np.asarray(kernel).dtype)
+    rest = {name: tree for name, tree in variables.items() if name not in ("params", DEX_COLLECTION)}
+    kept = {DEX_COLLECTION: unflatten_dict(held)} if held else {}
+    return {**rest, "params": unflatten_dict(params), **kept}

@@ -19,6 +19,7 @@ from dew.config import RunConfig, TrainerConfig
 from dew.config.diffusion import DiffusionRunConfig
 from dew.data.dataset import Loader, Ramp
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.precision import Dtypes, Numerics
 from dew.nn.vision import GemmaProjector, SiglipVision
 from dew.optim import OptimConfig
 from dew.registry import Aliases, ModelConfig, projectors, towers
@@ -382,7 +383,8 @@ def test_train_runs_the_trainer_its_config_describes(tmp_path):
     trace = tmp_path / "trace"
     config = TrainerConfig(
         name="built", checkpoint_dir=str(tmp_path / "runs"), steps=3, accumulation=2,
-        dynamic_scale=True, mesh=MeshSpec(fsdp=2), layout=Layout(min_shard=1, tolerance=1.0),
+        precision=Numerics(Dtypes(compute="float16")), mesh=MeshSpec(fsdp=2),
+        layout=Layout(min_shard=1, tolerance=1.0),
         profile=ProfileWindow(str(trace), steps=1, warmup=1), eval_every=None, checkpoint_every=None)
 
     state = RunConfig(trainer=config).train(Regression(), Loader(lambda partition: batches(), None, None, 8),
@@ -640,6 +642,8 @@ def test_every_run_kind_reads_its_source_options_from_the_command_line(kind):
                                        attention={"full_attention": "block_bidirectional"})
     keywords = run.source_keywords(frozen=False)
     assert keywords["text_only"] is True and keywords["prediction_depths"] == 0 and keywords["on_host"]
+    # A source the run trains is stored in its master weights' dtype, one it keeps frozen as stored.
+    assert keywords["param_dtype"] == "float32" and run.source_keywords(frozen=True)["param_dtype"] == "auto"
     assert keywords["modeling_overrides"] == {"attention": {"full_attention": "block_bidirectional"}}
     assert type(run).from_dict(run.to_dict()).source == run.source
 

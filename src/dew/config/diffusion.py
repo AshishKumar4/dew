@@ -78,7 +78,6 @@ ATTENTION = {"heads": 8}
 DEFAULT_MODEL_CONFIG = {
     "attention_configs": [None, ATTENTION, ATTENTION, ATTENTION],
     "precision": "default",
-    "dtype": "bfloat16",
 }
 
 
@@ -170,8 +169,6 @@ class DiffusionRunConfig(RunConfig):
     `--model` holds only the precision settings and `text` and `autoencoder` stay
     unset.
     """
-    pretrained_param_dtype: DtypeName = "float32"
-    """The dtype `pretrained`'s parameters are stored and trained in."""
     teacher_run: str | None = None
     """The run directory a distillation's teacher trained in. Its published weights are the frozen
     teacher's (`teacher_variables=`), unless the starting tree holds the teacher; guidance distillation
@@ -194,9 +191,6 @@ class DiffusionRunConfig(RunConfig):
         if not flow and self.rollout is not None:
             raise ValueError(f"--rollout configures a Flow-GRPO run's rollout, and --objective "
                              f"{self.objective.name} trains on its data")
-        if self.pretrained is None and self.pretrained_param_dtype != "float32":
-            raise ValueError("--pretrained-param-dtype stores a --pretrained pipeline's parameters; "
-                             "this run loads none")
 
         if self.pretrained is not None:
             # The pipeline's own denoiser trains; the model flags it reads are
@@ -257,7 +251,7 @@ class DiffusionRunConfig(RunConfig):
         differentiates in time, turns a `TimeScaled` model's time features at
         `SMOOTH_TIME_SCALE` unless `model.fields` names a scale.
         """
-        fields: dict[str, Configured] = {}
+        fields: dict[str, Configured] = dict(self.numerics_fields())
         if "output_channels" in {field.name for field in dataclasses.fields(models[self.model.name])}:
             fields["output_channels"] = (self.sample_field().shape[-1] if autoencoder is None
                                          else autoencoder.latent_channels)
@@ -429,8 +423,9 @@ class DiffusionRunConfig(RunConfig):
 
     @property
     def _compute(self) -> DtypeName | None:
-        """The compute dtype the model's record names, which the text and audio
-        encoders and a pretrained pipeline compute in too."""
+        """The compute dtype the model's record names, which the text and audio encoders compute in
+        too; None where it names none, each encoder its own, as its data plan records it (its
+        tokenizer's identity holds its dtype)."""
         held = self.model.fields.get("dtype")
         return None if held is None else dtype_name(resolve_dtype(str(held)))
 
@@ -446,9 +441,9 @@ class DiffusionRunConfig(RunConfig):
         # The pipeline reads its weights on a resume too, which binds the checkpoint over them.
         placement = self.source_keywords(frozen=self.lora is not None)
         return load_diffusion_source(
-            reference.name, revision=reference.revision, dtype=self._compute or "bfloat16",
-            param_dtype=self.pretrained_param_dtype,
-            attention_impl=self.source_attention(),
+            reference.name, revision=reference.revision,
+            dtype=dtype_name(jax.numpy.dtype(self.compute_dtype())),
+            param_dtype=placement["param_dtype"], attention_impl=self.source_attention(),
             size=self.sample_field().shape[:-1],
             variables=variables, mesh=placement.get("mesh"), layout=placement.get("layout"),
             text_only=placement.get("text_only", False), prediction_depths=placement.get("prediction_depths"),
