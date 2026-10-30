@@ -16,12 +16,16 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _coords,
     _rows,
     _Spans,
-    _streamed,
-    _views_of,
     reducing,
     stated,
 )
-from dew.nn.kernels.templates.attention_mosaic_scores import _Backward, _score_params, _scores
+from dew.nn.kernels.templates.attention_mosaic_scores import (
+    _Backward,
+    _query_program,
+    _query_tile_loaded,
+    _score_params,
+    _scores,
+)
 
 
 def _dq_allocations(family: mosaic.Family, config: BackwardTiles, width: int, value_width: int, dtype,
@@ -137,18 +141,14 @@ def _dq_columns(query, key, value, dout, peak, prior, anchor, delta, key_index, 
         dq_ref, refs = refs[0], refs[1:]
         keyed_ref, refs = (refs[0], refs[1:]) if walk.accurate else (None, refs)
         rows_ref, (q_smem, do_smem, out_smem, row_smem, q_loaded, do_loaded) = refs[0], refs[1:]
-        row, head = lax.axis_index("batch"), lax.axis_index("heads")
-        views = _views_of({"keys": k_ref, "values": v_ref}, row, lax.div(head, heads // kv_heads))
-        streams = family.opened(streams, views)
-        pair_first = program.query_tile(queries // pair) * pair
-        streamed = _streamed([program.reach(pair_first + index * block_q, spans_of, row)[:2]
-                              for index in range(consumers)])
+        row, head, views, streams, pair_first, streamed = _query_program(
+            program, streams, k_ref, v_ref, spans_of, heads=heads, kv_heads=kv_heads, queries=queries,
+            consumers=consumers)
 
         def consumer(index):
             first = pair_first + index * block_q
-            rows = (row, pl.ds(first, block_q), head)
-            family.loaded(((q_ref.at[rows], q_smem.at[index], q_loaded.at[index]),
-                           (do_ref.at[rows], do_smem.at[index], do_loaded.at[index])))
+            _query_tile_loaded(family, (q_ref, do_ref), (q_smem, do_smem), (q_loaded, do_loaded), (row, head),
+                               first, index)
             stats = tuple(_rows(family, ref, row, head, first, block_q)
                           for ref in (peak_ref, prior_ref, anchor_ref, delta_ref, index_ref))
             lo, hi, whole = program.reach(first, spans_of, row)
