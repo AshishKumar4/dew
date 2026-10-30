@@ -1013,11 +1013,11 @@ RELEASE_RUNS = load_tool('dory_vllm_reference').RUNS
 """The release recorder's runs: (loop count, cache mode, dtype)."""
 
 
-@pytest.mark.network
-@pytest.mark.gpu(reason='the 4B release, held to vLLM running it on a GPU')
-@pytest.mark.parametrize('run', RELEASE_RUNS, ids=['-'.join(map(str, run)) for run in RELEASE_RUNS])
-def test_the_release_computes_vllms_log_probabilities_through_each_cache_and_loop_count(run):
-    """NVIDIA-Nemotron-Labs-Dory1.0-4B at source.json's revision against vLLM's own engine running it
+def the_release_computes_vllms_log_probabilities_through_each_cache_and_loop_count(run):
+    """The release's receipt run (tools/dory_release_receipt.py, a GPU job: at about three minutes a
+    recorded seed it outgrows a suite test, whose run holds the same gate on the tiny model,
+    `test_the_release_qualification_holds_dew_to_a_reference_kept_as_row_distances`):
+    NVIDIA-Nemotron-Labs-Dory1.0-4B at source.json's revision against vLLM's own engine running it
     (tools/dory_vllm_reference.py; its recording tests/fixtures/hf/dory-1.0-4b/recording.npz, its
     provenance inside), in bf16 at one, two and four loops and in fp32 at two, through each cache: the
     log-probabilities of a sentence's prompt and of the 256 tokens vLLM drew greedily after it, each
