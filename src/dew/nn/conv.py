@@ -49,7 +49,7 @@ from jax.typing import DTypeLike
 from dew.mesh import SEQUENCE_AXIS, STAGE_AXIS, logical_spec, mesh_axes
 
 from .flops import conv_flops
-from .precision import biased, float32_products, products_dtype
+from .precision import biased
 from .sharding import auto_part, in_pipeline_stage
 
 # A linear boundary must survive in tangents and cotangents too: dropping it
@@ -212,7 +212,7 @@ def _conv_general_dilated(
         return jax.lax.conv_general_dilated(
             x, w, window_strides, padding, lhs_dilation=lhs_dilation, rhs_dilation=rhs_dilation,
             dimension_numbers=dimension_numbers, feature_group_count=feature_group_count,
-            batch_group_count=batch_group_count, precision=float32_products(products_dtype(x, w), precision),
+            batch_group_count=batch_group_count, precision=precision,
             preferred_element_type=preferred_element_type, out_sharding=out_sharding)
 
     dilation = (1, 1) if rhs_dilation is None else tuple(rhs_dilation)

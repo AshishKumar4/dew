@@ -1,6 +1,7 @@
 """The training step's position, which a module whose computation changes over a run reads
-(`dew.nn.progress`, ledger 2455): a run's loss supplies it, in training and validation; outside a run
-it is the run's end; a training step that supplies none refuses a module that reads it."""
+(`dew.nn.progress`, ledgers 2455 and 2479): a run's training loss supplies it; outside the training
+step, a validation's among them, it is the run's end; a training step that supplies none refuses a
+module that reads it."""
 
 import flax.linen as nn
 import jax
@@ -36,9 +37,10 @@ def objective() -> Supervised:
                       inputs=InputSpec(Field("x", (2,))))
 
 
-def data() -> Loader:
-    return Loader(train=lambda partition: Replaying(lambda step: {"x": np.zeros((8, 2), np.float32)}),
-                  val=None, batch=8, records=None)
+def data(val: bool = False) -> Loader:
+    zeros = {"x": np.zeros((8, 2), np.float32)}
+    return Loader(train=lambda partition: Replaying(lambda step: zeros),
+                  val=(lambda partition: iter((zeros,))) if val else None, batch=8, records=None)
 
 
 def test_a_run_s_loss_reads_the_updates_committed_before_each_step_and_its_end_outside_it():
@@ -52,6 +54,19 @@ def test_a_run_s_loss_reads_the_updates_committed_before_each_step_and_its_end_o
     np.testing.assert_array_equal(losses, [0.0, 1.0, 2.0])
     applied = Annealed().apply(jax.device_get(state.variables), jnp.zeros((1, 2)))
     np.testing.assert_array_equal(applied, [[-1.0]])
+
+
+def test_a_run_s_validation_scores_the_model_at_the_run_s_end():
+    """A validation within a run scores the model the run would hand on, its schedules ended, as an
+    evaluation after it does: the offset alone on zero inputs, -1, at each pass, while the training loss
+    reads the updates committed before each step."""
+    tracker = RecordingTracker()
+    Trainer(objective(), optax.sgd(0.0), key=0, tracker=tracker).fit(data(val=True), steps=4, log_every=1,
+                                                                    eval_every=2)
+    validated = [scalars["val/loss"] for _, scalars in tracker.scalars if "val/loss" in scalars]
+    np.testing.assert_array_equal(validated, [-1.0, -1.0])
+    losses = [scalars["train/loss"] for _, scalars in tracker.scalars if "train/loss" in scalars]
+    np.testing.assert_array_equal(losses, [0.0, 1.0, 2.0, 3.0])
 
 
 def test_a_custom_training_step_refuses_a_module_that_reads_the_progress_it_does_not_supply():
