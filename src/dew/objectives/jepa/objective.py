@@ -264,7 +264,17 @@ class JepaObjective(Objective[Ratio]):
         squared = (predictions.astype(wide) - targets.astype(wide)) ** 2
         loss = self.row_mean(squared, batch)
         pooled = jnp.mean(full, axis=tuple(range(1, full.ndim - 1)))
-        return loss, Aux(representation_health(pooled))
+        # The trained encoder's and predictor's forwards at the step's own inputs, for their summaries.
+        encoder = self.watched_forward(step, self.encoder, thaw(part(variables, CONTEXT_ENCODER)), samples,
+                                       context_idx, train=step.training,
+                                       rngs=model_rngs(dropout_key, training=step.training))
+        predictor = self.watched_forward(
+            step, self.predictor, thaw(part(variables, PREDICTOR)), repeated,
+            jnp.repeat(context_idx, num_targets, axis=0, out_sharding=explicit_spec(context_idx)),
+            target_idx.reshape(batch_size * num_targets, -1), train=step.training,
+            rngs=model_rngs(dropout_key, training=step.training))
+        inspected = None if step.watched is None else {"encoder": encoder, "predictor": predictor}
+        return loss, Aux(representation_health(pooled), inspected=inspected)
 
     def evaluate(self, params, batch, step: Step):
         """Return the pooled embeddings of the target encoder, the EMA copy, with the batch labels."""

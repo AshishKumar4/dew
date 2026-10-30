@@ -1181,6 +1181,18 @@ class Objective(ABC, Generic[Loss, Effects]):
             aux = replace(aux, record=witness.report(marked, places))
         return stats, aux
 
+    @staticmethod
+    def watched_forward(step: Step, model: nn.Module, variables: Variables, *args,
+                        **kwargs) -> Variables | None:
+        """What the watched modules sow in one forward of `model` at these arguments where the step
+        watches (`Step.watched`), else None: for an objective whose training forward runs inside a
+        transform (a `jax.jvp`, a sampler's loop), which returns none of its collections, the forward at
+        the step's own inputs, run apart for its summaries alone, its weights held out of the backward."""
+        if step.watched is None:
+            return None
+        _, sown = model.apply(jax.lax.stop_gradient(variables), *args, mutable=[INSPECTED], **kwargs)
+        return sown.get(INSPECTED, {})
+
     def reduce_loss(self, stats: Loss) -> tuple[jax.Array, jax.Array]:
         """Return the objective value of summed statistics and whether they have any mass.
 

@@ -414,7 +414,15 @@ class ConsistencyDistillationObjective(FlowDistillationObjective):
             return critic_loss(generated, fake, t)
 
         losses = jax.lax.cond(student_phase, student_losses, critic_losses, variables)
-        return self.row_mean(losses, batch), Aux(metrics={})
+        # The student's forward at the step's consistency point, as `trig_prediction` feeds it, for its
+        # summaries: the student's every phase runs it on these weights.
+        t = self._times(draws.consistency_time, self.student_times)
+        x = expand(jnp.cos(t), samples) * samples + expand(jnp.sin(t), samples) * draws.consistency_noise
+        rf = jnp.sin(t) / (jnp.cos(t) + jnp.sin(t))
+        inspected = self.watched_forward(step, self.model, self.model_variables(variables),
+                                         x / expand(jnp.cos(t) + jnp.sin(t), x),
+                                         self.process.schedule.model_time(rf), **given)
+        return self.row_mean(losses, batch), Aux(metrics={}, inspected=inspected)
 
     def _distribution_matching(self, params, student_params, given, blank, draws: _Draws, iteration):
         generated = self._generated(student_params, given, draws, iteration)

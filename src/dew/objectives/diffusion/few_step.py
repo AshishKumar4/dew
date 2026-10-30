@@ -247,7 +247,12 @@ class MeanFlowObjective(DiffusionObjective):
         guided = jnp.where(expand(dropped, v), v, guided)
         u, target = mean_flow_target(velocity(conditions, train=step.training), z, t, r, guided)
         losses = adaptive_loss(u, target, self.norm_p, self.norm_eps)
-        return self.row_mean(losses, batch), Aux(metrics={})
+        # The student's forward the target's JVP runs, at the step's own interval, for its summaries.
+        inspected = self.watched_forward(
+            step, self.model, self.model_variables(variables), z, schedule.model_time(t), **conditions,
+            duration=schedule.model_time(t) - schedule.model_time(r), train=step.training,
+            rngs=model_rngs(dropout_key, training=step.training))
+        return self.row_mean(losses, batch), Aux(metrics={}, inspected=inspected)
 
 
 # The noise a shortcut model's path keeps at the data end, the reference's
@@ -334,7 +339,11 @@ class ShortcutObjective(DiffusionObjective):
         u = velocity(self.model_variables(variables), conditions, train=step.training)(
             x, sigma, sigma - step_size)
         losses = jnp.square(u - target)
-        return self.row_mean(losses, batch), Aux(metrics={})
+        inspected = self.watched_forward(
+            step, self.model, self.model_variables(variables), x, schedule.model_time(sigma), **conditions,
+            duration=schedule.model_time(sigma) - schedule.model_time(sigma - step_size), train=step.training,
+            rngs=model_rngs(dropout_key, training=step.training))
+        return self.row_mean(losses, batch), Aux(metrics={}, inspected=inspected)
 
     @staticmethod
     def _bootstrapped(taught, given, bootstrap, rows, count, total, x, sigma, step_size) -> jax.Array:

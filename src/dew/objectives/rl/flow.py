@@ -29,8 +29,9 @@ from dew._coordination import agreed, agreed_same, broadcast_from_process_zero, 
 from dew.batch import Batch, Variables
 from dew.data.dataset import rows_of
 from dew.diffusion.presets import Preset
-from dew.diffusion.process import Process
+from dew.diffusion.process import Denoiser, Process
 from dew.diffusion.schedules.source import SourceGrid
+from dew.diffusion.transforms import broadcast_rates
 from dew.distributed.batches import row_origins, shared_host_fields, split_fields, with_host
 from dew.inputs import InputSpec
 from dew.nn.autoencoders import AutoEncoder
@@ -131,17 +132,19 @@ class FlowGRPOObjective(DiffusionObjective):
         return ("Flow-GRPO has no source-batch validation loss; rank checkpoints by a reward metric "
                 "with an explicit Best, or pass no validation data")
 
-    def _walk(self, params: Variables, batch: Batch) -> Walk:
-        """The walk of the denoiser this batch's conditions select, guided as
-        the rollout's walk was: over its `rollout_steps` points, a
-        transition's column being its step's index."""
+    def _policy(self, params: Variables, batch: Batch) -> Denoiser:
+        """The denoiser this batch's conditions select."""
         given = self.encoded_conditions(params, batch)
         # An inpainting model's masked-image inputs, as the rollout encoded them (`FlowRollout`).
         spatial = batch.get("spatial", {})
-        denoise = self.denoiser(params, {**given, **spatial},
-                                {**self.blank_conditions(params, given), **spatial})
+        return self.denoiser(params, {**given, **spatial},
+                             {**self.blank_conditions(params, given), **spatial})
+
+    def _walk(self, params: Variables, batch: Batch) -> Walk:
+        """The walk of the denoiser this batch's conditions select (`_policy`), guided as the rollout's
+        walk was: over its `rollout_steps` points, a transition's column being its step's index."""
         points = jnp.asarray(batch["rollout_steps"], jnp.int32)
-        return Walk.over(denoise, self.guidance, points[0] - 1)
+        return Walk.over(self._policy(params, batch), self.guidance, points[0] - 1)
 
     def _transition(self, predict: Predictor, x: jax.Array,
                     t: jax.Array, following: jax.Array) -> GaussianTransition:
@@ -245,7 +248,15 @@ class FlowGRPOObjective(DiffusionObjective):
             metrics["transition_kl"] = kl / denominator
         if REWARDS_KEY in batch:
             metrics["reward"] = jnp.asarray(batch[REWARDS_KEY], jnp.float32).mean()
-        return Ratio(pg + self.beta * kl, mass), Aux(metrics)
+        inspected = None
+        if step.watched is not None:
+            # The policy's forward at each trajectory's first transition (`Denoiser._raw`), for its
+            # summaries: every transition's runs these weights.
+            policy, x, t = self._policy(variables, batch), latents[:, 0], times[:, 0]
+            c_in = self.process.prediction.get_input_scale(broadcast_rates(policy.schedule, t, x))
+            inspected = self.watched_forward(step, policy.model, policy.params, x * c_in,
+                                             policy.schedule.model_time(t), **policy.conditions)
+        return Ratio(pg + self.beta * kl, mass), Aux(metrics, inspected=inspected)
 
     def _rows(self, batch: Batch) -> int:
         """One sample per source row, which a prompt-only batch has too."""
