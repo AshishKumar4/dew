@@ -68,7 +68,7 @@ def answered(task) -> None:
         assert len(task.decode(task("ab", max_new_tokens=1, key=0))) == 1
     elif isinstance(task, Decide):
         question = {"team": Choice("which team", ["billing", "technical", "sales"])}
-        ((answers, _),) = task.batch([({"text": "the site is down"}, question)])
+        [answers] = task([({"text": "the site is down"}, question)])
         assert answers["team"].choice in ("billing", "technical", "sales")
     elif isinstance(task, TextToImage):
         assert len(task(["a cat"], steps=1, key=0).pil()) == 1

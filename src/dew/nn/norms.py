@@ -225,6 +225,8 @@ class RMSNorm(nn.Module):
     `K2HorizonRMSNorm` does (modeling_k2_horizon.py:613-636).
     """
     epsilon: float = 1e-5
+    """Llama 2's and 3's and Mistral's published `rms_norm_eps`, the decoders Dew's defaults follow
+    (`CausalTransformer.norm_eps`), where Flax's RMSNorm takes 1e-6, Qwen's, which its configs set."""
     scale_offset: bool = False
     scale_after_cast: bool = False
     with_scale: bool = True

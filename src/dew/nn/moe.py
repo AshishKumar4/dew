@@ -40,7 +40,7 @@ from .blocks import normal_kernel
 from .flops import MissingFlopsCount, counted_flops, projection_flops
 from .kernels import generation
 from .kernels.templates.gemm import template
-from .precision import at_least_fp32, float32_dot_general, float32_einsum, float32_products, rounded_operand
+from .precision import at_least_fp32, exact_float32, float32_dot_general, float32_einsum, rounded_operand
 from .protocols import ProjectionGroup, Routes, declared_groups
 from .sharding import logical_axes
 
@@ -366,9 +366,11 @@ class Router(nn.Module):
 
     def logits(self, x):
         """Each token's gate logit for every expert, in fp32 (`at_least_fp32`):
-        `[..., num_experts]`."""
+        `[..., num_experts]`. They multiply in IEEE float32 where nothing states a precision
+        (`exact_float32`): a top-k choice flips between experts whose logits TF32's rounding moves
+        past each other, where the references' float32 routers multiply in IEEE float32."""
         return float32_einsum('...d,de->...e', x.astype(at_least_fp32(x.dtype)), self.kernel,
-                          precision=self.precision)
+                              precision=exact_float32(self.precision))
 
     def _activated(self, logits):
         if self.score_function == 'softmax':
@@ -470,7 +472,7 @@ def expert_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
     if implementation not in GROUPED_MATMULS:
         raise ValueError(f"implementation must be one of {list(GROUPED_MATMULS)}, got {implementation!r}")
     compute = canonicalize_dtype(x, kernel, dtype=dtype)
-    resolved = float32_products(compute, precision)
+    resolved = precision
     xla = implementation == 'xla'
     with generation.chosen(grouped_matmul='xla') if xla else contextlib.nullcontext():
         return template.gemm(x, kernel, group_sizes, compute=compute, out_dtype=compute, precision=resolved)
