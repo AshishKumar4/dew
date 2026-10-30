@@ -13,8 +13,11 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+import torch
 from flax import linen as nn
+from peft import LoraConfig, inject_adapter_in_model
 from reference_error import (
+    GateFailure,
     as_given,
     assert_as_exact,
     assert_as_exact_as_the_reference,
@@ -227,6 +230,17 @@ class Host(nn.Module):
         return nn.DenseGeneral((5, 6), axis=(-1, -2), name="proj")(x)
 
 
+class Flattened(torch.nn.Module):
+    """`Host`'s target as PEFT adapts it: one Linear of its flattened (48, 30) kernel, `proj`."""
+
+    def __init__(self):
+        super().__init__()
+        self.proj = torch.nn.Linear(48, 30)
+
+    def forward(self, x):
+        return self.proj(x)
+
+
 MULTI_AXIS_SEEDS = 16
 """Check 1's declared seeds for the multi-axis branch, sized by `seeds_for` (2026-10-21, on armada)."""
 
@@ -236,10 +250,11 @@ def test_a_multi_axis_target_steps_as_its_flattened_matrix_does():
     output ones is the matrix LoRA of the flattened kernel: with x as
     [batch, 48] in the kernel's sorted axis order, A as [48, r] and B as
     [r, 30], the output is x K + bias + s x A B, and a fixed cotangent G
-    gives A's gradient s x^T G B^T and B's s (x A)^T G. The float64 oracle
-    computes that flattened form; numpy in float32 is the reference Dew's
-    forward and gradients are on par with (check 1), over drawn inputs,
-    weights, factors and cotangents."""
+    gives A's gradient s x^T G B^T and B's s (x A)^T G. The float64 truth
+    computes that flattened form; PEFT's LoRA of that Linear in torch, float32,
+    is the reference Dew's forward and gradients are on par with (check 1),
+    over drawn inputs, weights, factors and cotangents. The branch at twice
+    its scale fails the site."""
     model = Host()
     target = Target(rank=4, alpha=3.0)
 
@@ -256,18 +271,36 @@ def test_a_multi_axis_target_steps_as_its_flattened_matrix_does():
     assert tree["params"]["proj"]["kernel"].shape == (6, 8, 5, 6)
     scale = adapter.scale(target)
 
-    @jax.jit
-    def dew(x, kernel, bias, a, b, cotangent):
-        def output(factors):
-            node = {"kernel": kernel, "bias": bias, **factors}
-            return adapter.model.apply({"params": {"proj": node}}, x)
+    def adapted(adapter: Adapter):
+        @jax.jit
+        def dew(x, kernel, bias, a, b, cotangent):
+            def output(factors):
+                node = {"kernel": kernel, "bias": bias, **factors}
+                return adapter.model.apply({"params": {"proj": node}}, x)
 
-        forward, gradient = with_gradients(output)({"lora_A": a, "lora_B": b}, cotangent)
-        return {"the output": forward, "lora_A's gradient": gradient["lora_A"],
-                "lora_B's gradient": gradient["lora_B"]}
+            forward, gradient = with_gradients(output)({"lora_A": a, "lora_B": b}, cotangent)
+            return {"the output": forward, "lora_A's gradient": gradient["lora_A"],
+                    "lora_B's gradient": gradient["lora_B"]}
+        return dew
 
     @as_given
-    def oracle(x, kernel, bias, a, b, cotangent):
+    def peft(x, kernel, bias, a, b, cotangent):
+        dtype = torch.float64 if x.dtype == np.float64 else torch.float32
+        config = LoraConfig(r=target.rank, lora_alpha=target.alpha, target_modules=["proj"])
+        layer = inject_adapter_in_model(config, Flattened()).to(dtype).proj
+        with torch.no_grad():
+            layer.base_layer.weight.copy_(torch.tensor(kernel.reshape(48, 30).T))
+            layer.base_layer.bias.copy_(torch.tensor(bias.reshape(30)))
+            layer.lora_A["default"].weight.copy_(torch.tensor(a.reshape(48, 4).T))
+            layer.lora_B["default"].weight.copy_(torch.tensor(b.reshape(4, 30).T))
+        out = layer(torch.tensor(x.reshape(16, 48)))
+        out.backward(torch.tensor(cotangent.reshape(16, 30)))
+        return {"the output": out.detach().numpy().reshape(16, 5, 6),
+                "lora_A's gradient": layer.lora_A["default"].weight.grad.numpy().T.reshape(6, 8, 4),
+                "lora_B's gradient": layer.lora_B["default"].weight.grad.numpy().T.reshape(4, 5, 6)}
+
+    @as_given
+    def flattened(x, kernel, bias, a, b, cotangent):
         dtype = x.dtype.type
         rows, seed = x.reshape(16, 48), cotangent.reshape(16, 30)
         down, up = a.reshape(48, 4), b.reshape(4, 30)
@@ -277,4 +310,10 @@ def test_a_multi_axis_target_steps_as_its_flattened_matrix_does():
                 "lora_A's gradient": (s * (rows.T @ (seed @ up.T))).reshape(6, 8, 4),
                 "lora_B's gradient": (s * ((rows @ down).T @ seed)).reshape(4, 5, 6)}
 
-    assert_as_exact(dew, oracle, draw, "multi-axis LoRA", seeds=MULTI_AXIS_SEEDS)
+    assert_as_exact(adapted(adapter), peft, draw, "multi-axis LoRA", seeds=MULTI_AXIS_SEEDS,
+                    truth_fn=flattened)
+    doubled = Target(rank=4, alpha=6.0)
+    faulted = Adapter.bound(model, tree, {("params", "proj"): doubled}, rslora=False, dropout=0.0, layouts={})
+    with pytest.raises(GateFailure):
+        assert_as_exact(adapted(faulted), peft, draw, "multi-axis LoRA at twice its scale",
+                        seeds=MULTI_AXIS_SEEDS, truth_fn=flattened)

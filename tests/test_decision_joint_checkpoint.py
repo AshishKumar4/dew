@@ -347,6 +347,26 @@ def test_a_decision_release_exports_every_tensor_it_saves(tmp_path, kind):
             np.testing.assert_array_equal(alone[name], np.asarray(tensor), err_msg=name, strict=True)
 
 
+def test_a_run_trains_a_loaded_tasks_own_tree_and_a_release_trains_unpacked(tmp_path):
+    """A loaded task holds its backbone's projections packed to serve (`Decide._served`, ledger 2299); a
+    run trained from it reads the model's own tree, the projections split back (`unpacked`), as a run
+    from the release does (`Decide.released`), so the run's checkpoint is the tree its resume builds."""
+    release = tmp_path / "release"
+    release.mkdir()
+    for source in [*BACKBONE.iterdir(), TINY / "joint_head_config.json", TINY / "joint_head.safetensors"]:
+        (release / source.name).symlink_to(source.resolve())
+
+    def backbone(variables):
+        return jax.tree.structure(variables["params"]["backbone"])
+
+    bundle = Pretrained.load(release, dtype="float32", attention_impl="xla")
+    own = backbone(Decide.released(bundle).variables)
+    task = Decide.from_pretrained(release, attention_impl="xla")
+    assert backbone(task.variables) != own
+    trained = DecisionObjective(task, layout=JointLayout(max_len=1024)).init(jax.random.key(0))
+    assert backbone(trained) == own
+
+
 def test_a_joint_release_fine_tunes_averages_and_reloads_from_its_runs(tmp_path):
     """A joint-head release is a whole task to fine-tune: its Qwen 3.5 backbone, joint head and layout
     train together on rows of several questions, and the saved run loads back as a task with identical
