@@ -15,18 +15,21 @@ plan records each term beside what the compile measured.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import math
 from collections.abc import Callable, Mapping, Sequence
 
 import jax
 import jax.extend.core as jcore
+import numpy as np
 from jax.core import ShapedArray
 
 from dew._records import JSON
 from dew.batch import Batch
 from dew.data.dataset import rows_of
 from dew.distributed.placement import placed_bytes
+from dew.mesh import row_axes
 from dew.objectives.base import Objective, Step
 from dew.optim import clips_qk
 from dew.state import TrainState
@@ -125,20 +128,36 @@ def candidate_footprint[LossT, EffectsT](objective: Objective[LossT, EffectsT],
                                           held: int) -> Footprint:
     """What a step over microbatches of `micro`'s shapes, its state `prepared` as placed, takes of a
     device beside that state (`Footprint`): its loss's residuals at one microbatch, its trained
-    parameters' gradient, laid out as they are, and `held`. Over several devices the residuals are one
-    device's: the loss traced over that device's share of the microbatch (each leaf's shard,
-    `shard_shape`) with its parameters whole, as data and fully sharded data parallelism hold its
-    activations; tensor or sequence sharding, which splits them further, it counts whole, a derivation
-    that refuses where a compile could fit."""
-    loss, (variables, *rest) = traced_loss(objective, prepared, window)
-    variables = forward_variables(variables, prepared.compute)
+    parameters' gradient, laid out as they are, and `held`. Over several devices that split the
+    microbatch's rows alone (data and fully sharded data parallelism, `row_axes`) the residuals are one
+    device's: the loss traced as one device's step, over a mesh of the run's axes each of one device,
+    at that device's share of the microbatch (each leaf's shard, `shard_shape`), its parameters whole as
+    those layouts gather them. A layout that splits more than the rows (stages, tensor, sequence)
+    derives no residuals, which its compile judges."""
+    mesh = jax.sharding.get_abstract_mesh()
+    split = set() if mesh.empty else {name for name, size in mesh.shape.items() if size > 1}
+    if not split <= set(row_axes(rows_of(micro), mesh=mesh) if split else ()):
+        residuals = None
+    else:
+        loss, (variables, *rest) = traced_loss(objective, prepared, window)
+        variables = forward_variables(variables, prepared.compute)
 
-    def trained(params, variables, batch, *rest):
-        return loss({**variables, "params": params}, batch, *rest)
+        def trained(params, variables, batch, *rest):
+            return loss({**variables, "params": params}, batch, *rest)
 
-    share = jax.tree.map(lambda leaf: leaf if getattr(leaf, "sharding", None) is None
-                         else jax.ShapeDtypeStruct(leaf.sharding.shard_shape(leaf.shape), leaf.dtype), micro)
-    residuals = residual_bytes(trained, variables["params"], (variables, share, *rest))
+        share = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(
+            leaf.shape if getattr(leaf, "sharding", None) is None else leaf.sharding.shard_shape(leaf.shape),
+            leaf.dtype), micro)
+        # The arguments' shapes alone, as one device holds them: no sharding of the run's mesh.
+        arguments = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype),
+                                 (variables, share, *rest))
+        # The run's own first device, which a kernel's choice reads as the run's do.
+        placed = jax.sharding.get_mesh()
+        device = None if mesh.empty or placed.empty else placed.devices.flat[0]
+        with contextlib.nullcontext() if device is None else jax.set_mesh(jax.sharding.Mesh(
+                np.asarray([device]).reshape((1,) * len(mesh.axis_names)), mesh.axis_names,
+                axis_types=mesh.axis_types)):
+            residuals = residual_bytes(trained, arguments[0]["params"], arguments)
     resident = {name: device_bytes(value) for name, value in {
         "variables": prepared.variables, "optimizer": prepared.opt_state, "ema": prepared.ema,
         "accumulation": prepared.accumulation, "compute": prepared.compute}.items()}
