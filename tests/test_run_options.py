@@ -379,9 +379,10 @@ def alternatives(annotation, base=None) -> list[object]:
         members = typing.get_args(annotation)
         found = []
         for member in members:
-            # A count's witnesses: one, and one past the saved count, which a budget that one would cut
-            # to nothing takes (a layout's option tokens); a number's, a half and twice the saved one.
-            counts = [1, *([base + 1] if type(base) is int else [])]
+            # A count's witnesses: one, two, where one is a block no wider than causal reading (a prefix
+            # of one token), and one past the saved count, which a budget that one would cut to nothing
+            # takes (a layout's option tokens); a number's, a half and twice the saved one.
+            counts = [1, 2, *([base + 1] if type(base) is int else [])]
             numbers = [0.5, *([base * 2] if type(base) is float else [])]
             values = ([None] if member is type(None) else counts if member is int
                       else numbers if member is float else alternatives(member, base))
@@ -884,9 +885,16 @@ def unread(task, before: dict[str, object], option) -> str | None:
     if not places:
         return "the task loaded holds none set"
     drawn = drawn_afresh(task)
+    # Swapped wherever a dataclass holds it, which rebuilds what the task derives from it; a copy an
+    # object of another kind holds goes with the dataclass that made it.
     swapped = drawn
     for path in places:
-        swapped = replaced(swapped, path, before[path])
+        try:
+            swapped = replaced(swapped, path, before[path])
+        except TypeError:
+            continue
+    if swapped is drawn:
+        return "the task loaded holds it nowhere a swap reaches"
     answered = answers(drawn)
     assert answered_alike(answered, answers(drawn)), "a request of one task answers apart twice"
     if answered_alike(answered, answers(swapped)):
