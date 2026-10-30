@@ -13,6 +13,8 @@ import json
 import logging
 import os
 import shlex
+import subprocess
+import sys
 import tempfile
 import threading
 from collections.abc import Mapping, Sequence
@@ -410,10 +412,15 @@ class Profiler:
             raise
         return self
 
-    def stop(self) -> None:
-        self._stop("completed")
+    def stop(self, *, wait: bool = True) -> None:
+        """Stop the capture and export its reports and manifest: at once, or where not `wait`, in a process
+        of its own beside the caller's work (`dew.telemetry.export`), the capture already stopped, which
+        `exported` waits for. A training run's window stops so, since converting a capture takes far longer
+        than the steps it traced (row 2017: minutes for a 3-step window). A stop that failed exports at
+        once, so its manifest records why, as it raises."""
+        self._stop("completed", wait=wait)
 
-    def _stop(self, body: str) -> None:
+    def _stop(self, body: str, *, wait: bool = True) -> None:
         global _active
         failures: list[BaseException] = []
         with _lifecycle:
@@ -440,18 +447,20 @@ class Profiler:
         assert capture is not None and converter is not None
         self._captures.append(capture)
         metadata["body_status"] = body
-        reasons = [] if failures else held_back(capture, metadata)
-        metadata["capture_status"] = "failed" if failures else "partial" if reasons else "completed"
-        metadata["capture_errors"] = [str(error) for error in failures]
-        metadata["capture_reasons"] = [*reasons]
-        try:
-            _reports(capture, converter, metadata)
-        except BaseException as error:
-            failures.append(error)
         if self._temporary:
             _logger.info("Profile saved under %s", self._directory)
-        if failures:
-            raise BaseExceptionGroup("Profile cleanup or export failed", failures)
+        if wait or failures:
+            _export(capture, converter, metadata, failures)
+            return
+        # A fresh interpreter of the exporter alone, never the caller's program again: the conversion reads
+        # and writes on its own, and holds no lock the caller's steps take (the converter's native calls
+        # may hold the GIL throughout). It reads files alone, so its JAX opens no accelerator, whose
+        # memory the run holds; and it imports the Dew this process runs, first on its path.
+        source = str(Path(__file__).resolve().parents[2])
+        path = os.pathsep.join([source, *filter(None, [os.environ.get("PYTHONPATH")])])
+        _exporting[capture] = subprocess.Popen(
+            [sys.executable, "-m", "dew.telemetry.export", str(capture), json.dumps(metadata)],
+            env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": path})
 
     def __enter__(self) -> Self:
         return self.start()
@@ -465,6 +474,49 @@ class Profiler:
                 if exc is None:
                     raise
                 exc.add_note(f"Profile cleanup/report failure: {error}")
+
+
+_exporting: dict[Path, subprocess.Popen[bytes]] = {}
+"""The captures a stop left exporting in a process of their own (`Profiler.stop`), until `exported`."""
+
+
+def exported(directory: Path | None = None) -> None:
+    """Wait for the exports `Profiler.stop` left running in processes of their own, of every capture or of
+    those under `directory`, refusing any that failed: what reads a capture's reports and manifest reads
+    them after this (`dew.training.profiling.ProfileReport`)."""
+    root = None if directory is None else Path(directory).expanduser().resolve()
+    waited = [capture for capture in _exporting if root is None or capture.is_relative_to(root)]
+    failed = []
+    for capture in waited:
+        code = _exporting.pop(capture).wait()
+        if code:
+            failed.append(f"{capture} (exit {code}; its manifest records why)")
+    if failed:
+        raise RuntimeError("Profile export failed for " + ", ".join(failed))
+
+
+def _export(capture: Path, converter: _Converter, metadata: dict[str, JSON],
+            failures: list[BaseException]) -> None:
+    """Export a stopped `capture`: its status from what it holds (`held_back`), its native reports and its
+    manifest (`_reports`), raising every failure of the stop (`failures`) and of the export together."""
+    reasons = [] if failures else held_back(capture, metadata)
+    # The process that made the reports: the stopping one's own, or one beside it (`Profiler.stop`).
+    metadata["exported_by"] = os.getpid()
+    metadata["capture_status"] = "failed" if failures else "partial" if reasons else "completed"
+    metadata["capture_errors"] = [str(error) for error in failures]
+    metadata["capture_reasons"] = [*reasons]
+    try:
+        _reports(capture, converter, metadata)
+    except BaseException as error:
+        failures.append(error)
+    if failures:
+        raise BaseExceptionGroup("Profile cleanup or export failed", failures)
+
+
+def exporting(capture: str, metadata: dict[str, JSON]) -> None:
+    """`_export` in an export's own process (`Profiler.stop`, `dew.telemetry.export`), whose exit code says
+    whether it failed."""
+    _export(Path(capture), require_profile_support(), metadata, [])
 
 
 def region(name: str) -> AbstractContextManager[None]:
