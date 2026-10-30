@@ -874,11 +874,12 @@ def _key_block(call: _Call, held: Callable[[int], _Held], consumers: int = 1) ->
 
 def _intra_held(call: _Call, block: int) -> _Held:
     """`_intra`'s consumer thread at key block `block`: the sum of the pairs carried across the sub-chunks and
-    a sub-chunk's own, beside a sub-chunk's and key block's prefix halves, exponent, gated rows and keys,
-    their masks and the product's operands; then the doubling's, as the solve's."""
+    a sub-chunk's own, beside a key block's tiles: its prefix halves, a pair's decay's two terms (`between`:
+    the exp2 of the fractions' difference and the scale of the wholes'), the rows or keys it gates and the
+    gated product, their masks, and the product's operands; then the doubling's, as the solve's."""
     pairing = _pairing_operand(call)
     return _Held(phases=(
-        [_f32(CHUNK, CHUNK)] * 2 + [_f32(CHUNK, block)] * 4 + _masks(CHUNK, block) * 2
+        [_f32(CHUNK, CHUNK)] * 2 + [_f32(CHUNK, block)] * 6 + _masks(CHUNK, block) * 2
         + _fragments(call, (pairing, CHUNK, block), (pairing, CHUNK, block)),
         [_f32(CHUNK, CHUNK)] * 4 + _masks(CHUNK, CHUNK) * 2))
 
@@ -981,12 +982,12 @@ def _pairing(call: _Call, block: int) -> list:
 
 def _weighted_held(call: _Call, block: int) -> _Held:
     """`_weighted`'s consumer thread at key block `block`: the inverse beside a value block's product, its
-    decay and its keys or values; under a decay a key dimension the key block's prefix halves and its
-    decayed write too."""
+    decay and its keys or values; under a decay a key dimension the key block's prefix halves, its range
+    decay's two terms (`algebra.range_decay`, as `between`'s) and its decayed write too."""
     held = dataclasses.replace(call.held, rows=call.rows)
     return _Held(phases=(
         _held(held, CHUNK, CHUNK) + [_f32(CHUNK, call.block)] * 2 + _held(call.given, CHUNK, call.block)
-        + [_f32(CHUNK, block)] * 3 * call.per_key
+        + [_f32(CHUNK, block)] * 5 * call.per_key
         + _fragments(call, (held, CHUNK, CHUNK), (call.given, CHUNK, call.block)),))
 
 
