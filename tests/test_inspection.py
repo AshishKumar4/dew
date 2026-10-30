@@ -308,9 +308,9 @@ def test_a_watched_module_with_a_child_named_output_is_summarized():
     assert "inspect/activations/abs_max" in logged
 
 
-def accumulating(inspection, tracker=None):
+def accumulating(inspection, tracker=None, checkpoints=None):
     return Trainer(Pulled(), optax.sgd(RATE), key=jax.random.key(0), tracker=tracker, inspection=inspection,
-                   accumulation=2)
+                   accumulation=2, checkpoints=checkpoints)
 
 
 def test_a_log_at_a_step_that_commits_nothing_keeps_the_sample_before():
@@ -328,3 +328,19 @@ def test_an_accumulating_trainers_offline_view_steps_its_whole_window():
     that commits, its parameters' norm nonzero, not an uncommitted step's zeros."""
     logged = inspected(accumulating(Inspection(paths=("w",), targets=("params",))), {"x": ROWS})
     assert logged["inspect/params/l2"] > 0
+
+
+def test_an_offline_view_restored_mid_window_steps_to_its_commit(tmp_path):
+    """The offline view of a run restored with part of its window stepped steps the rest and reports the
+    update that commits, not the next window's first, uncommitted step."""
+    from dew.checkpoints import Checkpoints
+
+    watched = Inspection(paths=("w",), targets=("params",))
+    with Checkpoints(str(tmp_path / "runs")) as checkpoints:
+        accumulating(watched, checkpoints=checkpoints).fit(
+            Loader(lambda partition: stream(), None, batch=BATCH, records=None), steps=1, log_every=1,
+            eval_every=None, checkpoint_every=1)
+    with Checkpoints(str(tmp_path / "runs")) as checkpoints:
+        restored = accumulating(watched, checkpoints=checkpoints)
+        assert int(restored.place()[0].microstep) % 2 == 1
+        assert inspected(restored, {"x": ROWS})["inspect/params/l2"] > 0
