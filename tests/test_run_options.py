@@ -301,33 +301,58 @@ def masked(root: Path, drawn: bool) -> RunConfig:
                                max_new_tokens=0)
 
 
-def registered_alternatives(annotation: type) -> list[object]:
-    """The members of the registry `dew.registry` declares for `annotation` (`solvers` for `Solver`), each
-    built with its defaults where it has them."""
-    for name, declared in registry.__annotations__.items():
-        built = str(declared).partition(", ")[2].partition("[")[0].rstrip("]")
-        if declared.startswith("Aliases[") and built == annotation.__name__:
-            table = getattr(registry, name)
-            members = []
-            for alias in table:
-                try:
-                    members.append(table[alias]())
-                except TypeError:  # A member with required fields has no default to witness.
-                    continue
-            return members
-    return []
+def members_of(annotation: type, base=None) -> list[object]:
+    """The values of Dew's classes that are `annotation`s: every member of a registry kind
+    (`registry.KINDS`) and every class its package exports (`dew.sampling`'s CFG, APG, ...) that derives
+    from `annotation`, or, for a protocol, holds each method it declares, each built from its defaults,
+    its required fields `base`'s of those names, the value a run saved, which one without them lacks."""
+    import importlib
+
+    package = importlib.import_module(".".join(annotation.__module__.split(".")[:2]))
+    found = [registry.imported(path) for kind in registry.KINDS for path in kind.paths.values()]
+    found += [getattr(package, name) for name in getattr(package, "__all__", ())]
+    declared = {name for name in vars(annotation) if not name.startswith("_")}
+    protocol = registry.is_protocol(annotation)
+    values = []
+    for member in dict.fromkeys(found):
+        if not isinstance(member, type):
+            continue
+        fits = member is not annotation and (
+            all(callable(getattr(member, name, None)) for name in declared) if protocol
+            else issubclass(member, annotation))
+        if not fits:
+            continue
+        required = [field.name for field in dataclasses.fields(member) if field.init and field.default
+                    is dataclasses.MISSING and field.default_factory is dataclasses.MISSING] if (
+            dataclasses.is_dataclass(member)) else []
+        if not all(hasattr(base, name) for name in required):
+            continue
+        try:
+            values.append(member(**{name: getattr(base, name) for name in required}))
+        except (TypeError, ValueError):
+            continue
+    return values
 
 
-def alternatives(annotation) -> list[object]:
+def members_built(member: type) -> list[object]:
+    """`member` built from its defaults, where it has them."""
+    try:
+        return [member()]
+    except (TypeError, ValueError):
+        return []
+
+
+def alternatives(annotation, base=None) -> list[object]:
     """The values `annotation` declares as alternatives, in its order: a literal's values, a flag's two, an
-    optional's None and its member's, a registered type's members (`registered_alternatives`), and a
-    dataclass's instances over its own fields' alternatives. A plain number or text declares none, nor a
-    record (a union holding a mapping or a list), whose values are its writer's."""
+    optional's None and its member's, Dew's classes that are one (`members_of`), and a dataclass's
+    instances: `base`, the value a run saved, with one of its fields changed to each of that field's
+    alternatives, or, with no base, built over its fields' alternatives. A plain number or text declares
+    none, nor a record (a union holding a mapping or a list), whose values are its writer's."""
     if isinstance(annotation, typing.TypeAliasType):
-        return alternatives(annotation.__value__)
+        return alternatives(annotation.__value__, base)
     origin = typing.get_origin(annotation)
     if origin is typing.Annotated:
-        return alternatives(typing.get_args(annotation)[0])
+        return alternatives(typing.get_args(annotation)[0], base)
     if origin is typing.Literal:
         return list(typing.get_args(annotation))
     if annotation is bool:
@@ -339,22 +364,34 @@ def alternatives(annotation) -> list[object]:
             return []
         found = []
         for member in members:
-            values = [None] if member is type(None) else [1] if member is int else alternatives(member)
+            values = [None] if member is type(None) else [1] if member is int else alternatives(member, base)
+            if dataclasses.is_dataclass(member) and not isinstance(base, member):
+                values = [*members_built(member), *values]
             found += [value for value in values if value not in found]
         return found
     if dataclasses.is_dataclass(annotation) and isinstance(annotation, type):
         hints = typing.get_type_hints(annotation)
-        declared = {field.name: alternatives(hints[field.name]) for field in dataclasses.fields(annotation)
-                    if field.init}
+        fields = [field.name for field in dataclasses.fields(annotation) if field.init]
+        if isinstance(base, annotation):
+            # The saved value with one field changed, each field's alternatives in turn.
+            changed = []
+            for name in fields:
+                for value in alternatives(hints[name], getattr(base, name)):
+                    try:
+                        changed.append(dataclasses.replace(base, **{name: value}))
+                    except (TypeError, ValueError):
+                        continue
+            return [base, *(value for value in changed if value != base)]
+        declared = {name: alternatives(hints[name]) for name in fields}
         declared = {name: values for name, values in declared.items() if len(values) > 1}
         try:
             built = [annotation(**{name: values[index] for name, values in declared.items()})
                      for index in (0, 1)]
         except (TypeError, ValueError):
-            return []
-        return built if declared and built[0] != built[1] else []
+            return members_of(annotation, base)
+        return list(built) if declared and built[0] != built[1] else []
     if isinstance(annotation, type) and annotation.__module__.startswith("dew."):
-        return registered_alternatives(annotation)
+        return members_of(annotation, base)
     return []
 
 
@@ -371,24 +408,55 @@ def bare(annotation):
     return annotation
 
 
-def reach(run: RunConfig, objective: str, name: str, annotation) -> str | None:
-    """The path `dew train` sets a saved task's option `name` of `annotation` through: a field of the run,
-    or of a section it holds, declared of that type (a number or a text's of that name), else its
-    objective's argument of that name; None where it has neither."""
+@dataclasses.dataclass(frozen=True)
+class Reach:
+    """Where `dew train` sets an option (`reach`): the run's field `path`, of type `annotation`, whose value
+    is the option, or, where `builds`, a builder whose call makes it (a preset its process)."""
+
+    path: str
+    annotation: object
+    builds: bool = False
+
+    def made(self, value):
+        """The option a value of this field gives the task, None where its builder refuses its numbers."""
+        if not self.builds or value is None:
+            return value
+        try:
+            return value()
+        except ValueError:
+            return None
+
+
+def builds(annotation, option) -> bool:
+    """Whether a value of `annotation` is a builder whose call returns an `option` (a preset its process)."""
+    members = [member for member in typing.get_args(bare(annotation)) or (bare(annotation),)
+               if member is not type(None)]
+    def made(member) -> set:
+        returned = typing.get_type_hints(member.__call__).get("return") if callable(member) else None
+        return set(typing.get_args(returned) or (returned,))
+    return any(isinstance(member, type) and bare(option) in made(member) for member in members)
+
+
+def reach(run: RunConfig, objective: str, name: str, annotation) -> Reach | None:
+    """Where `dew train` sets a saved task's option `name` of `annotation`: a field of the run, or of a
+    section it holds, declared of that type (a number or a text's of that name) or a builder of it
+    (`builds`), else its objective's argument of that name; None where it has none."""
     # A number's or a text's field is the option's by its name; any other type's, by its type.
     named = bare(annotation) in (int, float, str, bool)
 
     def paths(config, prefix: str):
         hints = typing.get_type_hints(type(config), include_extras=True)
         for field in dataclasses.fields(config):
-            value = getattr(config, field.name)
-            if field.name == name if named else bare(hints[field.name]) == bare(annotation):
-                yield prefix + field.name
+            value, hint = getattr(config, field.name), hints[field.name]
+            if field.name == name if named else bare(hint) == bare(annotation):
+                yield Reach(prefix + field.name, hint)
+            elif not named and builds(hint, annotation):
+                yield Reach(prefix + field.name, hint, builds=True)
             elif dataclasses.is_dataclass(value) and type(value).__module__.startswith("dew.config"):
                 yield from paths(value, f"{prefix}{field.name}.")
     found = next(paths(run, ""), None)
     if found is None and name in inspect.signature(objectives[objective]).parameters:
-        return f"objective.{name}"
+        return Reach(f"objective.{name}", annotation)
     return found
 
 
@@ -421,10 +489,12 @@ TASK_RUNS = {"TextSettings": (prefixed, "lm"), "MaskedSettings": (masked, "maske
 """A run here of an objective that records each saved task's settings, and the objective's name."""
 
 
-def witnessed(settings: type) -> dict[str, list[object]]:
-    """Each field of `settings` that declares alternatives (`alternatives`), with them."""
+def witnessed(settings: type, base=None) -> dict[str, list[object]]:
+    """Each field of `settings` that declares alternatives (`alternatives`), with them: about `base`'s
+    value of it, the settings a run saved, where given."""
     hints = typing.get_type_hints(settings)
-    declared = {field.name: alternatives(hints[field.name]) for field in dataclasses.fields(settings)}
+    declared = {field.name: alternatives(hints[field.name], getattr(base, field.name, None))
+                for field in dataclasses.fields(settings)}
     return {name: values for name, values in declared.items() if len(values) > 1}
 
 
@@ -468,11 +538,20 @@ def saved_with(run: RunConfig, root: Path, name: str, settings: type, assigned: 
             held(dew.pipeline(str(runs / name))))
 
 
+def same(first, second) -> bool:
+    """Whether two values are one option: of one type and one record (`registry.to_record`), as a run
+    saves and reads them, where a schedule compares by its numbers, not its identity."""
+    if type(first) is not type(second):
+        return False
+    try:
+        return registry.to_record(first, type(first)) == registry.to_record(second, type(second))
+    except (TypeError, ValueError):
+        return bool(first == second)
+
+
 def consumed(before: dict[str, object], after: dict[str, object], value) -> bool:
     """Whether a task holds `value` where the task before it held another (`held`): the option reached
     what the task reads, not its record alone."""
-    def same(first, second) -> bool:
-        return type(first) is type(second) and bool(first == second)
     return any(same(inner, value) and not same(before.get(path), inner) for path, inner in after.items())
 
 
@@ -506,8 +585,8 @@ def reached_by(run: RunConfig, root: Path, settings: type, flags, queued: dict[s
 @pytest.mark.parametrize("settings", SETTINGS, ids=lambda settings: settings.__name__)
 def test_each_option_a_saved_task_is_built_with_reaches_it_from_the_command_line(settings, tmp_path):
     """Every option a saved task is built with that its settings' types declare alternatives for
-    (`alternatives`: a literal's values, an optional's, a flag's, a registered type's members, a
-    dataclass's instances over its own) reaches the task `dew train` saves from its path (`reach`): beside
+    (`alternatives`: a literal's values, an optional's, a flag's, Dew's classes that are one, a saved
+    dataclass with one field changed) reaches the task `dew train` saves from its path (`reach`): beside
     a run that sets none, a run sets each alone to an alternative its settings accept other than the one
     saved (the next where a run refuses it, `reached_by`), and the task saves it and, loaded, holds it
     where the first held another (`consumed`). An option with no path is row 1061's blockwise walk,
@@ -517,19 +596,25 @@ def test_each_option_a_saved_task_is_built_with_reaches_it_from_the_command_line
     builder, objective = TASK_RUNS[settings.__name__]
     hints = typing.get_type_hints(settings)
     fields = {field.name: field for field in dataclasses.fields(settings)}
-    run, options = builder(tmp_path, drawn=False), witnessed(settings)
-    paths = {name: reach(run, objective, name, hints[name]) for name in options}
+    run = builder(tmp_path, drawn=False)
     base, before = saved_with(run, tmp_path, "unset", settings, {})
+    options = witnessed(settings, base)
+    paths = {name: reach(run, objective, name, hints[name]) for name in options}
     for name in (name for name in options if paths[name] is None):
         assert "derived" in fields[name].metadata, f"{settings.__name__}.{name} has no path"
         assert getattr(base, name) != fields[name].default, f"the run fills no {settings.__name__}.{name}"
-    queued = {name: [value for value in values
-                     if value != getattr(base, name) and accepted(base, name, value)]
-              for name, values in options.items() if paths[name] is not None}
+    # A builder's path is witnessed by its own alternatives, each the option its call makes.
+    queued = {name: [value for value in (alternatives(found.annotation) if found.builds else values)
+                     if found.made(value) is not None and not same(found.made(value), getattr(base, name))
+                     and accepted(base, name, found.made(value))]
+              for name, values in options.items() if (found := paths[name]) is not None}
+    reachable = {name: found for name, found in paths.items() if found is not None}
     reached = reached_by(run, tmp_path, settings, lambda assigned: {
-        paths[name]: flag(value, hints[name]) for name, value in assigned.items()}, queued)
+        reachable[name].path: flag(value, reachable[name].annotation) for name, value in assigned.items()},
+        queued)
     for name in queued:
         assert name in reached, f"no alternative of {settings.__name__}.{name} trains: {queued[name]}"
         saved, after, value = reached[name]
-        assert getattr(saved, name) == value, (name, value)
-        assert consumed(before, after, value), f"the task loaded holds no {settings.__name__}.{name} set"
+        option = paths[name].made(value)
+        assert same(getattr(saved, name), option), (name, option)
+        assert consumed(before, after, option), f"the task loaded holds no {settings.__name__}.{name} set"
