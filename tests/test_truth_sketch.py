@@ -29,3 +29,23 @@ def test_a_truths_sketch_is_its_signed_block_sums_summed_exactly(size):
     stacked = np.concatenate(blocks)
     defined = np.asarray([math.fsum(stacked[:, index].tolist()) for index in range(SKETCH)])
     np.testing.assert_array_equal(truth_sketch(truth, 5), defined)
+
+
+def test_a_devices_block_sums_are_the_hosts_within_a_blocks_rounding():
+    """The blocks' sums a GPU takes (`_device_partials`, here on the CPU's device) are the host's
+    (`_host_partials`) within gamma(SKETCH_BLOCK) of each block's magnitudes on either side, across a
+    device chunk's edge and a last block padded with zeros, with signed zeros and subnormals among the
+    entries: their exact sums are a sketch the host takes within `sketch_rounding`."""
+    from reference_error import DEVICE_CHUNK, SKETCH_BLOCK, _device_partials, _host_partials, _sign_bits
+
+    size = DEVICE_CHUNK + (1 << 16) + 70
+    truth = np.random.default_rng(size).normal(size=size)
+    truth[::7] = -0.0
+    truth[1::11] = 2.0 ** -1060
+    bits = _sign_bits(size, 5)
+    host, device = _host_partials(truth, bits), _device_partials(truth, bits)
+    magnitudes = np.abs(np.pad(truth, (0, -size % SKETCH_BLOCK))).reshape(-1, SKETCH_BLOCK).sum(axis=1)
+    eps = float(np.finfo(np.float64).eps)
+    gamma = SKETCH_BLOCK * eps / 2 / (1 - SKETCH_BLOCK * eps / 2)
+    assert device.shape == host.shape
+    assert np.all(np.abs(device - host) <= 2 * gamma * magnitudes[:, None])
