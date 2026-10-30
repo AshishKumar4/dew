@@ -387,6 +387,25 @@ def test_a_run_handed_its_step_compiled_ahead_trains_from_it_on_its_gpu(tmp_path
                for new, old in zip(jax.tree.leaves(state.variables["params"]), initial, strict=True))
 
 
+@pytest.mark.tpu(reason="runs a step compiled ahead for this host's TPU topology as a run's first step")
+def test_a_run_handed_its_step_compiled_ahead_for_a_tpu_topology_trains_from_it(tmp_path):
+    """A step compiled ahead for this host's one-chip TPU topology (`compile_only_tpus`), saved and handed
+    to the run on the TPU itself, is the program the run lowers its first step to, and the run trains
+    from it, its plan's first compile the step compiled ahead: the TPU run row 2090 asks for."""
+    from dew.nn.kernels.generation import gpu_target
+    from dew.training.ahead import AheadOfTime, compile_ahead, compile_only_tpus
+
+    batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
+    chip = gpu_target(jax.devices()[0].device_kind).generation
+    compile_ahead(fine_tune(MeshSpec().build(compile_only_tpus(f"{chip}:1x1")), xla=True),
+                  batch).save(tmp_path / "step.dew-aot")
+    run = fine_tune(MeshSpec().build(jax.devices()[:1]), ahead=AheadOfTime.load(tmp_path / "step.dew-aot"),
+                    xla=True)
+    state = run.fit(batch, steps=2, log_every=1)
+    first, *_ = listed(record(run.plan, "plan")["probes"], "probes", read=record, what="probes")
+    assert int(state.step) == 2 and first["ahead"] is True
+
+
 FAST = {"tensor": Link(1e18, 1e9)}
 """A tensor axis whose link moves a projection's bytes in no time beside its FLOPs: any projection
 spreads over it, as over a measured NVLink one may."""
