@@ -635,3 +635,25 @@ def test_a_call_no_triton_config_fits_lowers_on_another_mainloop(generation_name
     with generation.assumed(generation_name), jax.sharding.use_abstract_mesh(mesh):
         traced = jax.jit(jax.grad(loss, argnums=(0, 1, 2))).trace(query, query, query)
         traced.lower(lowering_platforms=("cuda",))
+
+
+def test_a_pass_the_mosaic_mainloop_declines_reports_its_reason_under_its_row():
+    """A pass the Mosaic mainloop declines on a GPU runs the next mainloop that takes it, and its route
+    reports Mosaic's own reason (the analysis's code and detail) under the row that tracks lifting it, so
+    the kernel-route audit reads a gap and not an undeclared refusal (row 2545); a Triton refusal is its
+    inherent limit."""
+    from dew.nn.kernels import selection
+
+    declined = selection.Refusal("registers", "no tile holds the walk's registers")
+    spans = selection.Refusal("dropout", "the Triton mainloop drops no probabilities")
+    route = selection.select(attention_route.MAINLOOP,
+                             attention_route._Pass(on_gpu=True, mosaic=declined, triton=None))
+    assert (route.kernel, route.refusal.code, route.refusal.detail) == ("triton", "registers",
+                                                                         declined.detail)
+    assert route.refusal.row == "roadmap: the Mosaic template takes every call"
+    route = selection.select(attention_route.MAINLOOP,
+                             attention_route._Pass(on_gpu=True, mosaic=declined, triton=spans))
+    assert route.kernel == "portable"
+    [refused] = attention_route.MAINLOOP.kernel("triton").failed(
+        attention_route._Pass(on_gpu=True, mosaic=None, triton=spans))
+    assert (refused.code, refused.row) == ("dropout", generation.INHERENT)
