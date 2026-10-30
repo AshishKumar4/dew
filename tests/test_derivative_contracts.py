@@ -125,9 +125,9 @@ DELTA_RULE_EDGES = {"normal": 1.0, "the largest its chunk holds": 2.0**62, "near
 token recurrence keeps finite, as fla's chunked form's do at the same entries (`precedent_chunked`, on an
 H100: ledger 2470), which that edge compares it with in place of the recurrence."""
 
-FIRST_ORDERS = ("primal", "jvp", "vjp")
-"""The orders a packed row of the chunked delta rule holds from 2^62, the owner's acceptance of its second
-orders there (`test_the_chunked_delta_rule_holds_every_order`, ledger 2470)."""
+PACKED_OVERFLOW_ORDERS = ("primal", "jvp", "vjp", "second jvp", "second jvp, remat")
+"""The orders a packed row of the chunked delta rule holds from 2^62: all but forward over reverse, which the
+owner accepted there (`test_the_chunked_delta_rule_holds_every_order`, ledger 2470)."""
 
 
 def precedent_chunked(query, key, value, g, beta, *, chunk_size: int, starts=None):
@@ -188,8 +188,8 @@ def test_the_chunked_delta_rule_holds_every_order(packed, edge):
     the chunk weighs zero once multiplied its overflowed tangent by zero, the queries' second derivative NaN
     from 2^48 (ledger 2470).
 
-    A packed row's documents share chunks, so from 2^62 one document's overflow reaches another's second
-    derivatives (ledger 2608); its first orders hold. The owner accepted that under the accuracy-for-speed
+    A packed row's documents share chunks, so from 2^62 one document's overflow reaches another's forward
+    over reverse (ledger 2608); its other orders hold. The owner accepted that under the accuracy-for-speed
     rule (ledger 2470, 10-30): documents in chunks of their own held every order and cost the portable
     packed gradient 25% (JS-cost2470d-h100-80113cc1c) for a difference at overflow alone, where the
     parameters' gradient is NaN either way."""
@@ -213,10 +213,11 @@ def test_the_chunked_delta_rule_holds_every_order(packed, edge):
     direction = tuple(jax.random.normal(keys[6], x.shape) * (scale if at < 3 else 1.0)
                       for at, x in enumerate(primals))
     cotangent = jax.random.normal(keys[7], query.shape)
-    # A packed row's second orders from 2^62: the owner's accuracy-for-speed acceptance (ledger 2470, 10-30).
+    # A packed row's forward over reverse from 2^62: the owner's accuracy-for-speed acceptance (ledger 2470,
+    # 10-30).
     accepted = packed and scale >= 2.0**62
     assert_contract(rule, primals, direction, cotangent, f"the chunked delta rule {edge}",
-                    truth_fn=recurrence, plain_fn=plain, held=FIRST_ORDERS if accepted else None)
+                    truth_fn=recurrence, plain_fn=plain, held=PACKED_OVERFLOW_ORDERS if accepted else None)
 
 
 def normal_draw(seed: int, *shapes, scale: float = 1.0) -> tuple:
