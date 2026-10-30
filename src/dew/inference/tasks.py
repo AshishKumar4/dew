@@ -39,7 +39,7 @@ from dew.interop.sources import SourceReference
 from dew.interop.weights import decoding_storage
 from dew.nn.inputs import Media, ModelInputs, default_placement, mesh_of, request_key
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import attention_route
+from dew.nn.precision import Numerics
 from dew.nn.protocols import Bounded, CacheCapacity, TokenModel, refuse_prefix
 from dew.objectives.base import UNREAD, Objective
 from dew.sampling import decoding, vocabulary
@@ -292,20 +292,20 @@ class SavedRun:
     step: int
 
     @property
-    def attention_form(self) -> str | None:
-        """The attention form the run's step trained in (`Objective.inference_record`); None for a record
-        written before it named one."""
-        form = self.record.get("attention_form")
-        if form is not None and form not in attention_route.FORMS:
-            raise ValueError(f"this run records attention_form={form!r}, none of {attention_route.FORMS}")
-        return form
+    def precision(self) -> Numerics | None:
+        """The numerics the run's step trained in (`Objective.inference_record`,
+        `dew.nn.precision.Numerics`); None for a record written before it named them."""
+        from dew.registry import from_record
+
+        recorded = self.record.get("precision")
+        return None if recorded is None else from_record(Numerics, named_fields(recorded, "precision"))
 
     def formed[TaskT](self, task: TaskT) -> TaskT:
-        """`task`, built from this run (`from_saved`), in the attention form its step trained in where it
-        traces in one (`InItsForm`); a task of another class reads `attention_form` itself."""
-        if not isinstance(task, InItsForm) or task.attention_form == self.attention_form:
+        """`task`, built from this run (`from_saved`), under the numerics its step trained in where it
+        traces under them (`InItsForm`); a task of another class reads `precision` itself."""
+        if not isinstance(task, InItsForm) or task.precision == self.precision:
             return task
-        return replace(task, attention_form=self.attention_form)
+        return replace(task, precision=self.precision)
 
     @classmethod
     def pinned(cls, directory: str, step: int | str | None = None, trust: Sequence[str] = ()) -> SavedRun:
@@ -327,7 +327,7 @@ class SavedRun:
             raise ValueError(f"this run's checkpoints describe no model to load: {record['unrecorded']}")
         objective = objectives[named(record['objective'], 'objective')]
         declared = frozenset() if objective.settings is None else settings_fields(objective.settings)
-        stray = set(record) - {'objective', 'model', 'attention_form', UNREAD, *declared}
+        stray = set(record) - {'objective', 'model', 'precision', UNREAD, *declared}
         if stray:
             raise ValueError(f"this {objective.__name__} run records fields its objective does not write: "
                              f"{sorted(stray)}")
@@ -365,21 +365,22 @@ class SavedRun:
 
 @dataclass(frozen=True, kw_only=True)
 class InItsForm:
-    """A task whose calls trace in the attention form its run trained in (`attention_form`, `traced`),
+    """A task whose calls trace under the numerics its run trained in (`precision`, `traced`),
     as Dew's saved tasks do: a task built from a run (`SavedRun.formed`) takes the form the run's record
     names, and a task built otherwise, a preview's during its run's fit, traces in the form chosen
     around it."""
 
-    attention_form: str | None = None
-    """The form the template's attention computes in (`attention_route.FORMS`), as the loaded step was
-    trained in it (`Objective.inference_record`); None traces in the form chosen around the call."""
+    precision: Numerics | None = None
+    """The run's numerics its calls trace under (`dew.nn.precision.Numerics`), as the loaded step was
+    trained under them (`Objective.inference_record`): its products' precision and its ops' forms;
+    None traces under the numerics in effect around the call."""
 
     def traced(self) -> contextlib.AbstractContextManager[None]:
-        """The block a call of this task traces in: its run's attention form (`generation.chosen`), which
-        JAX keys its trace and compile caches on, so another form's task traces its own programs."""
-        if self.attention_form is None:
+        """The block a call of this task traces in: its run's numerics (`generation.run_precision`), which
+        JAX keys its trace and compile caches on, so another policy's task traces its own programs."""
+        if self.precision is None:
             return contextlib.nullcontext()
-        return generation.chosen(attention_form=self.attention_form)
+        return generation.run_precision(self.precision)
 
 
 def traced_in_its_form[TaskT: InItsForm, **P, R](
@@ -449,8 +450,9 @@ def earlier_shapes(record: Mapping[str, object]) -> Mapping[str, object]:
     a processor's source as its encoded string (ledger 1641), a Qwen or MiMo projector's earlier
     fields, a decoder's or kind's YaRN field beside its rope scaling and a decoder's cross-attention
     by its fields alone (`earlier_model`, ledgers 1622, 1898 and 2320), and a row of segments'
-    question budgets, which it ignored and an earlier record wrote at their defaults (row 2006). A
-    record in today's shapes passes as it is. Carried to 1.0, when it is deleted (ledger 1552)."""
+    question budgets, which it ignored and an earlier record wrote at their defaults (row 2006), and a
+    step's attention form, which its numerics' forms hold now (row 2500). A record in today's shapes
+    passes as it is. Carried to 1.0, when it is deleted (ledger 1552)."""
     current = dict(record)
     for key in ("head", "layout"):
         held = record.get(key)
@@ -491,6 +493,9 @@ def earlier_shapes(record: Mapping[str, object]) -> Mapping[str, object]:
         from dew.registry import to_record
 
         current["processor"] = to_record(SourceReference.parse(processor), SourceReference)
+    if "attention_form" in current:
+        # The form a step trained in, which its numerics' forms hold now (ledger 2500).
+        current["precision"] = {"forms": current.pop("attention_form")}
     if "model" in current:
         current = earlier_model(current)
     return current

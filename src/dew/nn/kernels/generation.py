@@ -99,6 +99,17 @@ def chosen(**kernels: str) -> Iterator[None]:
         yield
 
 
+_NUMERICS: contextvars.ContextVar[Numerics | None] = contextvars.ContextVar("dew_numerics", default=None)
+
+
+def numerics() -> Numerics:
+    """The run's numerics in effect (`run_precision`), the defaults outside any."""
+    from dew.nn.precision import Numerics
+
+    held = _NUMERICS.get()
+    return Numerics() if held is None else held
+
+
 @contextlib.contextmanager
 def run_precision(policy: Numerics) -> Iterator[None]:
     """Within the block, programs trace under a run's numerics' products and forms
@@ -112,8 +123,12 @@ def run_precision(policy: Numerics) -> Iterator[None]:
     matmul = policy.matmul if isinstance(policy.matmul, str) else policy.matmul.name
     stated = contextlib.nullcontext() if matmul == "default" else jax.default_matmul_precision(matmul)
     forms = chosen(attention_form="accurate") if policy.forms == "accurate" else contextlib.nullcontext()
-    with stated, forms:
-        yield
+    token = _NUMERICS.set(policy)
+    try:
+        with stated, forms:
+            yield
+    finally:
+        _NUMERICS.reset(token)
 
 
 PALLAS_CHOICES = frozenset({'pallas', 'fla'})

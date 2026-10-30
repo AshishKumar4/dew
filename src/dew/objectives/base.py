@@ -47,7 +47,7 @@ from dew.artifacts import Artifact, Artifacts, TokenScores
 from dew.batch import EXAMPLE_ROWS, FROZEN, VALID_ROWS, Batch, PathFilter, Variables, dicts, everything, part
 from dew.nn import categorical
 from dew.nn.kernels.options import Held, Option, compiler_options
-from dew.nn.precision import accumulated, at_least_fp32, compensated_sum, weighted_total
+from dew.nn.precision import Numerics, accumulated, at_least_fp32, compensated_sum, weighted_total
 from dew.nn.progress import Progress, stepping
 from dew.nn.protocols import HiddenStates, ProjectsParameters
 from dew.nn.sharding import rows_taken
@@ -1423,9 +1423,9 @@ class Objective(ABC, Generic[Loss, Effects]):
         """Return the model and task settings that let a saved step be rebuilt.
 
         It records the objective's import path, its `recorded_model`'s record,
-        `task_settings`, field by field, and the attention form the step trained in
-        (`generation.chosen(attention_form=...)`), which a loaded task's calls trace in
-        (`dew.inference.tasks.SavedRunTask.traced`). An objective that declares no task
+        `task_settings`, field by field, and the numerics the step trained under
+        (`generation.run_precision`), which a loaded task's calls trace under
+        (`dew.inference.tasks.InItsForm.traced`). An objective that declares no task
         settings returns None; a custom research method can still restore its
         raw state.
         """
@@ -1438,7 +1438,7 @@ class Objective(ABC, Generic[Loss, Effects]):
         return {'objective': import_path(type(self)),
                 'model': to_record(ModelConfig.from_model(self.recorded_model()), ModelConfig),
                 **record_fields(settings, type(settings)),
-                'attention_form': generation.chosen_kernel('attention_form', 'fast')}
+                'precision': to_record(generation.numerics(), Numerics)}
 
     def build_task(self, variables: Variables, *,
                    processor: Processor | None | Omitted = OMITTED) -> Task | SavedTask:
