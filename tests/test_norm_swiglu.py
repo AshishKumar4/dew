@@ -24,16 +24,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from float64_terms import float64_terms
 from jax.sharding import Mesh
-from reference_error import (
-    assert_as_exact,
-    assert_as_exact_as_the_reference,
-    distance,
-    equations,
-    float64_terms,
-    widened,
-    with_gradients,
-)
+from one_draw import assert_as_exact_as_the_reference
+from reference_error import assert_as_exact, distance, equations, widened, with_gradients
 from tuned import each_config
 
 from dew.nn import attention, norms

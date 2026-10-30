@@ -27,8 +27,9 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from float64_terms import float64_forward
 from model_support import flat_tree
-from reference_error import assert_as_exact_as_the_reference, float64_forward
+from one_draw import assert_as_exact_as_the_reference
 
 from dew.interop import Pretrained
 from dew.objectives.base import Step

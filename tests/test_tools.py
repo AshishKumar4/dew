@@ -22,7 +22,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact, assert_as_exact_as_the_reference, chain_roundings
+from one_draw import assert_as_exact_as_the_reference
+from reference_error import assert_as_exact, chain_roundings
 from test_chunked_cross_entropy import EXERCISED, eighths
 from test_moe import OUTPUT_TOLERANCE, ROUTER_TOLERANCE
 from test_text_encoders import transformers_clip

@@ -14,7 +14,9 @@ import pytest
 from diffusion_stubs import batch_for
 from diffusion_support import TanhLayer, images_of, saved_after_one_step
 from flax import linen as nn
-from reference_error import assert_as_exact_as_the_reference, float64_terms, widened
+from float64_terms import float64_terms
+from one_draw import assert_as_exact_as_the_reference
+from reference_error import widened
 
 import dew
 from dew.config import ObjectiveConfig, TrainerConfig
