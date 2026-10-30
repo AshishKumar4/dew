@@ -6,13 +6,18 @@ transformers' own Qwen4-Exp (models/qwen4_exp, transformers 5.16.1), on the envi
 
 tests/fixtures/hf/qwen4-exp-tiny/ is a random Qwen4ExpForCausalLM of four layers over a width of 64: three
 gated delta nets with the release's sigmoid output gate, then a QSA attention layer (four query heads of 32
-over two key/value heads, a quarter of each turned, its indexer's two heads of 16 pooling blocks of two keys
-and keeping the best two, so the selection parts from dense attention from six visible keys on), every
+over two key/value heads, a quarter of each turned, its indexer's sixteen heads of 16 pooling blocks of two
+keys and keeping the best two, so the selection parts from dense attention from six visible keys on), every
 layer's MLP four routed experts two a token beside a gated shared one, the residual four streams under the
 gated read and write with a rank of 8, and the n-gram PLE at layer 2 (one-indexed) hashing bigrams and
 trigrams over two heads each; with fp32 logits, left-padded logits and the greedy continuation, and the
 transformers class run in the test as the reference. qwen3.8-flash-next/ pins the release's config
 (Qwen/Qwen3.8-Flash-Next).
+
+A block scores zero where every indexer head's agreement is negative, and the blocks a tie of zeros picks
+among are an order torch's `topk` leaves unspecified, which Dew's (`top_k_selection`) breaks by the lower
+index: at two heads a block scores zero one time in four, which on drawn ids decided a query's selection
+in three draws of twelve; at sixteen, once in 65536.
 
 The release hashes into primes past 2**24 (20000003 on), which the tiny's table cannot hold, so
 release_ple_ids.npz there records the release's own n-gram ids, from transformers' NGramEmbedding at the
@@ -49,7 +54,7 @@ TINY = {
     'shared_expert_intermediate_size': 32, 'hc_count': 4, 'hc_lowrank': 8, 'ple_layer_ids': [2],
     'ple_embed_dim': 64, 'ple_conv_kernel_size': 4, 'ngram_size': 3, 'heads_per_ngram': 2,
     'ngram_vocab_size_base': 200, 'make_ngram_vocab_size_divisible_by': 8,
-    'split_ngram_parts': 4, 'indexer_n_heads': 2, 'indexer_kv_heads': 1, 'indexer_head_dim': 16,
+    'split_ngram_parts': 4, 'indexer_n_heads': 16, 'indexer_kv_heads': 1, 'indexer_head_dim': 16,
     'indexer_budget': 4, 'indexer_compress_ratio': 2, 'max_position_embeddings': 128, 'rms_norm_eps': 1e-6,
     'eos_token_id': 2, 'bos_token_id': 2, 'pad_token_id': 0, 'tie_word_embeddings': False}
 """qwen4-exp-tiny's Qwen4ExpTextConfig."""

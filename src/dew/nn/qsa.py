@@ -13,6 +13,9 @@ the keys its attention reads among those it sees:
    seeing up to `indexer_budget` keys reads them all; the keys past its last complete block, fewer than
    a block, it reads whatever their score.
 
+A block scores zero where its every head's agreement is negative; which of several such blocks a query
+keeps is the lower one's (`top_k_selection`), an order transformers' `topk` leaves unspecified.
+
 The attention is Qwen3.5's gated attention under that selection, in place of the keys it sees
 (`CausalSelfAttention.qsa`). The blocks of a key are the same for every query that sees it, a causal
 layer's visibility running in order over each document's real keys, so each block pools once
