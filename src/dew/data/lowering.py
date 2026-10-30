@@ -1549,8 +1549,8 @@ class _Build:
             placed = _Placed(identifiers=identifiers, rows=len(stored))
             rows = stored.map_with_index(placed) if last >= 0 else stored
             # A store's missing record held as a marker is dropped later, so its pass holds no count known
-            # ahead; a memory source holds only the records it has (`_Present`).
-            records = None if present is None and marked else len(stored)
+            # ahead; a memory source's root is the records it holds (`_Present`), every one of them.
+            records = len(stored) if _in_memory(source) or not marked else None
             return self.shared(rows, pipeline, partition), 0, self.dealt(partition, records)
         keyed = _keyed(source)
         if materialized(source) and keyed is not source:

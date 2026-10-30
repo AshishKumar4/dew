@@ -246,7 +246,7 @@ def test_a_pools_shares_whose_records_a_step_drops_before_the_bound_read_it_deal
     ids), so no share knows ahead how many of its records reach it: the bound's examples are dealt to the
     shares every count-th, each share reading its part of them, kept records alone, the pool the bound."""
     ids = np.arange(1, RECORDS + 1, dtype=np.int32)
-    loader = compile(Pipeline(Memory({"id": ids})).filter_map(Evens()).shuffle(3).batch(2 * POOLED),
+    loader = compile(Pipeline(Memory({"id": ids})).shuffle(3).filter_map(Evens()).batch(2 * POOLED),
                      read="indexed", objective=ObjectiveData(train=(Questioned(),)), examples=examples)
     shares = [examples_read(loader, DataPartition(index=index, count=POOLED), expanded=True)
               for index in range(POOLED)]

@@ -105,7 +105,7 @@ def examples_clock(args) -> dict:
         stream = loader.train(dataclasses.replace(pool, index=index))
         try:
             for batch in stream:
-                real = np.asarray(batch[VALID_ROWS], bool)
+                real = np.asarray(batch.get(VALID_ROWS, np.ones(len(batch["id"]), bool)), bool)
                 for record in np.asarray(batch["id"])[real].tolist():
                     dealt[record] += 1 / (record % 3 + 1 if expands else 1)
         finally:
