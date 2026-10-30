@@ -369,9 +369,11 @@ def _spread_orthogonalized(updates, *, numbers, coeffs: jax.Array, steps: int, e
     for members in shapes.values():
         joined = jnp.concatenate([stacks[index][0] for index in members])
         padded = jnp.pad(joined, ((0, -joined.shape[0] % devices), (0, 0), (0, 0)))
-        # bfloat16's operands, else float32's (complex64's for a complex update), each product stated.
-        work = (jnp.complex64 if jnp.iscomplexobj(padded) else jnp.bfloat16 if precision == "bfloat16"
-                else jnp.float32)
+        # bfloat16's operands, else float32's (complex64's for a complex update), each product stated. A
+        # spectral preconditioning's norm is an SVD, which takes float32 operands: its products are still
+        # bfloat16's at that precision (`jax.default_matmul_precision`).
+        work = (jnp.complex64 if jnp.iscomplexobj(padded) else jnp.bfloat16
+                if precision == "bfloat16" and preconditioning != "spectral" else jnp.float32)
         with jax.default_matmul_precision(precision):
             orthogonal = _orthogonalized(split(padded).astype(work), steps,
                                          optax.contrib.MuonDimensionNumbers((1,), (2,)), coeffs=coeffs,
