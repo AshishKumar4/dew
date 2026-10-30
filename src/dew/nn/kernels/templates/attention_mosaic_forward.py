@@ -23,6 +23,7 @@ fold's reach, and its overflowed rows again shifting under headroom). Its legali
 
 import dataclasses
 import functools
+import inspect
 from collections.abc import Callable
 from typing import Any, NamedTuple
 
@@ -589,8 +590,8 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
     (`peaks`) reads the keys alone and gives each row's keys' largest logit `[B, H, Qp]` fp32 in the walk's
     units and its anchor key `[B, H, Qp]` int32 (`_peak_consumer`). With `finishes`, the output's launch also
     gives its rows' finished maxima and denominators `[2, B, H, Qp]` fp32 (`Output`, `algebra.finish`).
-    Its kernel is built once for every call of its static facts (`_kernel_of`): a model's layers alike
-    lower one.
+    Its kernel is built once for every call of its static facts (`_kernel_of`) where its hooks hold no
+    array (`_holdable`): a model's layers alike lower one.
     """
     # The arrays the programs read beside the operands.
     leaves, treedef = jax.tree.flatten((spans, hooked, guard, anchors))
@@ -602,7 +603,28 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
                      _described(hooks), spec, tiles, family, training, interpret, peaks,
                      None if out_dtype is None else jnp.dtype(out_dtype), counted, finishes,
                      generation.gpu_target(), name, report.named(name))
-    return _kernel_of(launch)(query, key, value, *leaves)
+    built = _kernel_of if all(map(_holdable, (hooks.score_mod, hooks.output_mod))) else _kernel_of.__wrapped__
+    return built(launch)(query, key, value, *leaves)
+
+
+def _holdable(hook: Callable | None) -> bool:
+    """Whether the kernel cache may hold `hook` (`_kernel_of`) without holding an array through it: none, a
+    function of no closure, or a partial of one over values of no array (a softcap's `functools.partial`
+    of `capped`). A closure or a bound method may reach an array a call made (a hook reading an operand's
+    shape), which a cached kernel would keep alive: its launches build their kernel each call."""
+    if hook is None:
+        return True
+    if isinstance(hook, functools.partial):
+        return _holdable(hook.func) and all(map(_scalar, (*hook.args, *hook.keywords.values())))
+    return (inspect.isfunction(hook) and hook.__closure__ is None
+            and all(map(_scalar, hook.__defaults__ or ())))
+
+
+def _scalar(value) -> bool:
+    """Whether `value` is a Python scalar, a string or None, or a tuple of them: a value of no array."""
+    if isinstance(value, tuple):
+        return all(map(_scalar, value))
+    return value is None or isinstance(value, (bool, int, float, complex, str))
 
 
 @dataclasses.dataclass(frozen=True)

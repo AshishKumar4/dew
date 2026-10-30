@@ -29,6 +29,7 @@ from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import (
     attention as template,
     attention_mosaic,
+    attention_mosaic_forward,
     attention_mosaic_program,
     attention_portable,
     attention_triton,
@@ -973,13 +974,16 @@ def test_the_backward_is_on_par_under_every_score_hook_interpreted(hooks, form):
 
 
 @INTERPRETS
-def test_a_forward_kernel_built_for_its_facts_runs_each_calls_own_interpreted():
+def test_a_forward_kernel_built_for_its_facts_runs_each_calls_own_interpreted(monkeypatch):
     """The forward's kernel is built once for every call of its static facts (`_kernel_of`, row 2440): calls
-    alike but for their scale each run their own (a kernel of the first call's scale would give the second
-    the first's logits), each on par (check 1) with the reference's at its scale from float64."""
+    alike but for their scale, past their queries' power of two (0.2 and 0.3, which leave different scales
+    in their launches' form), each run their own though their kernels' names agree (the launch report's
+    name, which would tell them apart, held to its base), each on par (check 1) with the reference's at its
+    scale from float64."""
+    monkeypatch.setattr(attention_mosaic_forward.report, "named", lambda name: name)
     shape = SHAPES["interpreted"]
     spans = template.spans(shape[1], shape[1], shape[0], causal=True)
-    for scale in (0.125, 0.5):
+    for scale in (0.2, 0.3):
         def ours(query, key, value, dout, scale=scale):
             del dout
             with _device(interpret=True):
@@ -994,20 +998,31 @@ def test_a_forward_kernel_built_for_its_facts_runs_each_calls_own_interpreted():
 
 
 @INTERPRETS
-def test_a_forward_kernel_built_for_its_facts_holds_no_calls_arrays_interpreted():
+@pytest.mark.parametrize("hooked", ["initial", "shape-reading"])
+def test_a_forward_kernel_built_for_its_facts_holds_no_calls_arrays_interpreted(hooked):
     """The forward's kernel, built once for every call of its static facts (`_kernel_of`, row 2440), holds
-    none of a call's arrays, its operands' nor its hooks' (an initial state's sums): each is released once
+    none of a call's arrays: its operands, its hooks' arrays (an initial state's sums) and an array its
+    score hook closes over (one reading its shape, which no cached kernel may keep) are each released once
     the call is."""
     shape = SHAPES["interpreted"]
     spans = template.spans(shape[1], shape[1], shape[0], causal=True)
     query, key, value, _ = _drawn(shape, jnp.bfloat16)(0)
-    hooks = template.Hooks(initial=template.sinks(jnp.linspace(-1.0, 1.0, shape[2]), shape[0], shape[1], 128))
-    held = [weakref.ref(array) for array in (query, key, value, hooks.initial.m, hooks.initial.acc)]
+    held = [query, key, value]
+    if hooked == "initial":
+        hooks = template.Hooks(initial=template.sinks(jnp.linspace(-1.0, 1.0, shape[2]), shape[0], shape[1],
+                                                      128))
+        held += [hooks.initial.m, hooks.initial.acc]
+    else:
+        operand = jnp.ones((shape[1],))
+        hooks = template.Hooks(score_mod=lambda s, q_pos, k_pos: s / operand.shape[-1])
+        held.append(operand)
+        del operand
+    refs = [weakref.ref(array) for array in held]
     with _device(interpret=True):
         jax.block_until_ready(attention_mosaic.forward(query, key, value, spans, hooks, interpret=True))
-    del query, key, value, hooks
+    del query, key, value, hooks, held
     gc.collect()
-    assert [ref() is None for ref in held] == [True] * len(held)
+    assert [ref() is None for ref in refs] == [True] * len(refs)
 
 
 @INTERPRETS
