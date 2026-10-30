@@ -129,7 +129,8 @@ class AttentionCase:
     bias_hook: bool
     """Whether the call's bias is one the template reads as a score hook in fp32 (`attention.
     template_attention`): 4-D, one term a key `[B or 1, H or 1, 1, K]` (ALiBi's) or dense `[B or 1, H or 1,
-    Q, K]`, of at most fp32's width."""
+    Q, K]`, its rows and heads the call's or one for them all (a key head's `[B, Hk, Q, K]` broadcasts to
+    none of them, row 2578), of at most fp32's width."""
     row_bias: bool
     """Whether the call's bias varies by query and by batch row (`[B, H or 1, Q, K]`), which the template
     reads a tile at a time a row (`template.biased`); a table every row shares (T5's `[1, H, Q, K]`) it
@@ -406,8 +407,9 @@ TEMPLATE_SUPPORTS = (
           "the call has an arbitrary mask, which the template reads as spans and never as a mask",
           row=INHERENT),
     _Need('bias', lambda case: not case.bias or case.bias_hook,
-          "the call's bias is not 4-D one term a key or a query's every key, or is wider than fp32, which "
-          "the template's score hook reads it in", row=INHERENT),
+          "the call's bias is not 4-D one term a key or a query's every key, its rows and heads the call's "
+          "or one for them all, or is wider than fp32, which the template's score hook reads it in",
+          row=INHERENT),
     _Need('row_bias', lambda case: not case.row_bias,
           "the call's bias varies by query and by batch row, which the xla kernel runs 7% faster (named, it "
           "runs, in less memory); a table every row shares the template runs a third faster in half the "

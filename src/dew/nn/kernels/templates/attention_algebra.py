@@ -55,6 +55,16 @@ from dew.nn.precision import (
 )
 
 
+def folds(scale: float, prescale: float, *, natural: bool, score_mod) -> bool:
+    """Whether a call folds log2(e) into its logits' scale for exp2 (`Forward.base2`, which says why), from
+    the scale left past its queries' power of two (`attention.prescale`) and that power: the factor as the
+    kernel multiplies the call's own products by it, rounded to fp32, below 1 in magnitude, the call not
+    keeping its logits `natural` and no score hook reading them. The one owner of the choice, which a
+    mainloop's derivation reads too (`attention_mosaic.MosaicForward`, row 2583)."""
+    factor = abs(float(np.float32(scale * prescale * LOG2E)))
+    return not natural and score_mod is None and factor < 1.0
+
+
 @dataclasses.dataclass(frozen=True)
 class Forward:
     """What the forward's functions specialize on, all static: the spans' `form` ('full', 'causal' or
@@ -109,10 +119,7 @@ class Forward:
         under a query of 1 at scale 0.5 weigh 1 and 0 in the reference and 0.5 each folded, and a
         cotangent of 2**125 then overflows its backward (docs/design/kernel-templates.md, §3, the
         exponent's forms). On drawn inputs both forms pass check 1."""
-        # The factor as the kernel would multiply the call's own products by it, rounded to fp32: the call's
-        # scale, its products' power of two (`prescale`) times the scale left after it.
-        factor = abs(float(np.float32(self.scale * self.prescale * LOG2E)))
-        return not self.natural and self.score_mod is None and factor < 1.0
+        return folds(self.scale, self.prescale, natural=self.natural, score_mod=self.score_mod)
 
     @property
     def factor(self) -> float:

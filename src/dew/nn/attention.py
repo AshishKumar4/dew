@@ -913,6 +913,7 @@ def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_sof
                     or (places is not None and sliding_window is not None)),
         mask=mask is not None, bias=bias is not None,
         bias_hook=(bias is not None and jnp.ndim(bias) == 4 and jnp.shape(bias)[-2] in (1, query.shape[1])
+                   and jnp.shape(bias)[0] in (1, query.shape[0]) and jnp.shape(bias)[1] in (1, query.shape[2])
                    and jnp.dtype(bias.dtype).itemsize <= 4),
         row_bias=(bias is not None and jnp.ndim(bias) == 4 and jnp.shape(bias)[-2] > 1
                   and jnp.shape(bias)[0] > 1),
