@@ -41,6 +41,7 @@ from dew.batch import (
     with_validity,
 )
 from dew.mesh import SEQUENCE_AXIS, STAGE_AXIS
+from dew.nn.progress import Progress
 from dew.nn.scatter import gather_positions
 from dew.nn.sharding import explicit_spec, rows_like
 
@@ -62,7 +63,7 @@ type InputTree = (ModelInputs | jax.Array | np.ndarray
 # A keyword a model call takes past its tokens: a token field array, the tokens'
 # layout (`Coordinates`), the conditioning mapping (`ModelInputs.kwargs`), a
 # flag, or None for an absent input.
-type ModelKwarg = jax.Array | Mapping[str, jax.Array] | Coordinates | bool | None
+type ModelKwarg = jax.Array | Mapping[str, jax.Array] | Coordinates | Progress | bool | None
 
 # A token field's `[B, W, ...]` response values from its `[B, S, ...]` prompt
 # values, the prompt's `[B, S]` real slots and the width (`ModelInputs.extended`).
@@ -560,8 +561,9 @@ class AttentionMetadata:
     routing blocks of `routing_block` places for a block router
     (`numbered_blocks`), which the model computes once for its layers.
     `context` is the sequence its cross-attention layers read (`CrossContext`).
-    `progress` is the updates the run committed before a training step, its declared input
-    (`dew.nn.progress`), None at the run's end; a layer whose computation changes over a run reads it.
+    `progress` `[B]` is the updates the run committed before a training step, its declared input
+    (`dew.nn.progress`), one row's apiece, None at the run's end; a layer whose computation changes over
+    a run reads it.
     `pairwise_mask` `[B, S, keys]`, or `key_runs` `[B, S, R, 2]`, each query's
     key intervals whose union it reads, replaces a call's visibility, a
     windowed layer windowing it over `key_positions` `[B, keys]`.

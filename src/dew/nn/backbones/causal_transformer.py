@@ -1742,7 +1742,11 @@ class CausalTransformer(nn.Module):
             key_runs=key_runs, token_ids=tokens if self.hash_layers else None, engram_ids=engram_ids,
             media=media_mask,
             admitted=admitted, blocks=blocks, context=context,
-            progress=None if progress is None else progress.updates, routing_block=block,
+            # One row's progress apiece, as the metadata's other inputs are held by row, which a
+            # pipeline's microbatches slice (`run_pipeline`).
+            progress=None if progress is None or progress.updates is None else jnp.broadcast_to(
+                jnp.asarray(progress.updates, jnp.int32), tokens.shape[:1]),
+            routing_block=block,
             whole_blocks=whole_blocks and block_groups is not None)
 
     def looped(self, x, **stack):

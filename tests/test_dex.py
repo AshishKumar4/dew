@@ -30,8 +30,8 @@ from dew.nn.progress import END, Progress
 LLAMA = Path(__file__).parent / "fixtures" / "hf" / "llama-tiny"
 HEADS = (1, 3)
 SEEDS = {"dex differential": 256, "dex through the decoder": 8, "dex at the anneal's start": 8,
-         "dex gradients through the decoder": 256, "dex scanned": 8, "dex exported in float32": 8,
-         "dex exported in bfloat16": 8}
+         "dex gradients through the decoder": 256, "dex scanned": 8, "dex pipelined": 8,
+         "dex exported in float32": 8, "dex exported in bfloat16": 8}
 """Check 1's declared seeds for each site, sized paired by `seeds_for` on armada (IGDEXS, IGDEXS4)."""
 
 
@@ -350,6 +350,32 @@ def test_layers_that_choose_their_own_heads_scan_and_pipeline_as_one_run():
     variables, _ = draw(0)
     assert every_layer(scan_layers=True).apply(variables, method=lambda module: module.groups) == ((0, 4),)
     assert_as_exact(scanned, plain, draw, "dex scanned", seeds=SEEDS["dex scanned"], truth_fn=truth)
+
+
+@pytest.mark.mesh
+def test_a_pipelined_run_reads_its_rows_progress():
+    """A run's progress rides the call's metadata one row's apiece (`AttentionMetadata.progress`), which
+    a pipeline's microbatches slice as they slice its other row inputs (review of ledger 2537): the four
+    layers over two stages of two microbatches each, mid-anneal, are on par with the plain loop from its
+    float64 (check 1), where a scalar progress could not be cut into microbatches."""
+    from dew.distributed.batches import shard_batch
+    from dew.distributed.placement import Layout, MeshSpec
+    from dew.nn.sharding import pipeline_microbatches
+
+    _, plain, draw, truth = scanned_site()
+    mesh = MeshSpec(fsdp=2, stage=2).build()
+
+    def rows(seed):
+        variables, tokens = draw(seed)
+        return variables, jnp.tile(tokens, (4, 1))
+
+    @as_given
+    def staged(variables, tokens):
+        with jax.set_mesh(mesh), pipeline_microbatches(2):
+            laid = jax.device_put(variables, Layout(min_shard=16).shardings(mesh, variables))
+            return jax.device_get(mid_anneal(every_layer())(laid, shard_batch(mesh, tokens)))
+
+    assert_as_exact(staged, plain, rows, "dex pipelined", seeds=SEEDS["dex pipelined"], truth_fn=truth)
 
 
 def test_a_run_names_dex_on_the_command_line_and_its_record_rebuilds_it():

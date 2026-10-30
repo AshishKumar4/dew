@@ -290,10 +290,6 @@ class MultimodalTransformer(DecoderWrapper):
         return self._over(self.language_model.with_dex(extension))
 
     @nn.nowrap
-    def reads_progress(self) -> bool:
-        return self.language_model.reads_progress()
-
-    @nn.nowrap
     def dex_exported(self, variables: Mapping[str, Mapping]) -> dict[str, Mapping]:
         return self.language_model.dex_exported(variables)
 

@@ -48,7 +48,7 @@ from dew.batch import EXAMPLE_ROWS, FROZEN, VALID_ROWS, Batch, PathFilter, Varia
 from dew.nn import categorical
 from dew.nn.kernels.options import Held, Option, compiler_options
 from dew.nn.precision import Numerics, accumulated, at_least_fp32, compensated_sum, weighted_total
-from dew.nn.progress import Progress, ReadsProgress
+from dew.nn.progress import END, Progress, ReadsProgress
 from dew.nn.protocols import HiddenStates, ProjectionGroup, ProjectsParameters
 from dew.nn.sharding import rows_taken
 
@@ -1165,18 +1165,10 @@ class Objective(ABC, Generic[Loss, Effects]):
             batch = {name: value for name, value in batch.items() if name != EXAMPLE_ROWS}
         witness = Witness() if step.record and not validation else None
         step = step if witness is None else replace(step, witness=witness)
-        model = self.recorded_model()
-        reads = isinstance(model, ReadsProgress) and model.reads_progress()
-        if reads and not (self.passes_progress or validation):
-            raise ValueError(f"{type(self).__name__} passes its model no run's progress, which a "
-                             f"{type(model).__name__} reads (dew.nn.progress): it would train at the run's "
-                             f"end")
-        if validation:
-            # A validation scores the model the run would hand on, its schedules ended (`dew.nn.progress`):
-            # its step carries no progress (`progress`).
-            loss = self.validation_loss(variables, batch, replace(step, committed=None))
-        else:
-            loss = self.loss(variables, batch, step)
+        if not (self.passes_progress or validation):
+            self._refuse_unpassed_progress()
+        # A validation's step is no training step, so its model reads the run's end (`progress`).
+        loss = (self.validation_loss if validation else self.loss)(variables, batch, step)
         if _has_aux(loss):
             stats, aux = loss
         else:
@@ -1436,9 +1428,21 @@ class Objective(ABC, Generic[Loss, Effects]):
 
     def progress(self, step: Step) -> Progress:
         """The run's progress this step's loss passes a model that reads it (`dew.nn.progress`): the
-        updates the run committed before it (`Step.committed`), the run's end in a validation's step,
-        whose loss `_loss` hands none."""
-        return Progress(step.committed)
+        updates the run committed before a training step (`Step.committed`), and the run's end in any
+        other, a validation's and its report's alike (`Step.training`), whose update clock stays as it
+        is for what else reads it."""
+        return Progress(step.committed) if step.training else END
+
+    def _refuse_unpassed_progress(self) -> None:
+        """Refuse a trained module whose computation changes over a run (`ReadsProgress`) under an
+        objective whose loss passes it no progress (`passes_progress`): it would train at the run's
+        end. The modules are those its programs run (`program_key`), whatever the objective holds."""
+        for entry in self.program_key():
+            module = entry.module
+            if entry.trained and isinstance(module, ReadsProgress) and module.reads_progress():
+                raise ValueError(f"{type(self).__name__} passes its model no run's progress, which a "
+                                 f"{type(module).__name__} reads (dew.nn.progress): it would train at the "
+                                 f"run's end")
 
     def recorded_model(self) -> nn.Module:
         """The model a saved step's record names (`inference_record`): the objective's own."""

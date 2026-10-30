@@ -108,3 +108,17 @@ def test_an_objective_that_passes_no_progress_refuses_a_model_that_reads_it():
                                                                                     log_every=1)
     losses = [scalars["train/loss"] for _, scalars in tracker.scalars if "train/loss" in scalars]
     np.testing.assert_array_equal(losses, [0.0, 1.0])
+
+
+def test_a_step_that_is_no_training_step_passes_the_run_s_end_and_keeps_its_clock():
+    """An objective passes a training step's committed updates (`Objective.progress`) and the run's end
+    for any other step, a validation's and its report's alike, whose update clock stays as it is for
+    what else reads it (review of ledger 2537)."""
+    from dew.objectives.base import Step
+
+    committed = jnp.asarray(3, jnp.int32)
+    trained = Step(jnp.asarray(5), jax.random.key(0), None, committed=committed)
+    validated = Step(jnp.asarray(5), jax.random.key(0), None, training=False, committed=committed)
+    assert objective().progress(trained).updates is committed
+    assert objective().progress(validated) == END
+    assert validated.committed is committed

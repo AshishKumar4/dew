@@ -1413,8 +1413,10 @@ class CausalSelfAttention(nn.Module):
         the layer does and the call has one (None for a read of another sequence), gate the attended
         values where it gates, then project them."""
         if self.ctx.dex is not None:
-            # Lambda annealed over the run's updates (`dew.nn.progress`), its learned value outside a run.
-            strength = annealed(progress, self.ctx.dex, self.dex_lambda_init, self.dex_lambda)
+            # Lambda annealed over the run's updates, one row's apiece (`dew.nn.progress`), its learned value
+            # outside a run.
+            updates = None if progress is None else progress.reshape(-1, 1, 1, 1)
+            strength = annealed(updates, self.ctx.dex, self.dex_lambda_init, self.dex_lambda)
             attention = differential(attention, self.dex_heads, self.dex_projection, strength,
                                      self.ctx.precision)
         if self.exclusive_self_attention and own_value is not None:
