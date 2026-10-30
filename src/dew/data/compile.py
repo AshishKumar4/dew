@@ -337,13 +337,15 @@ def _measured(pipeline: Pipeline, above: tuple[Measuring, ...] = ()) -> dict[int
     return found
 
 
-def _documented_packs(pipelines: Sequence[Pipeline]) -> None:
+def _documented_packs(pipelines: Sequence[Pipeline], objective: ObjectiveData | None = None) -> None:
     """Refuse to pack token documents from a store that states no document ends (neither an index of
-    them nor an EOS token), wherever it sits under the pack: its tokens would read as one document,
-    whose pieces no producer made. Checked as the chain is read, not as it is built, so a record names
-    a store it never opens (a run loaded where its data is not, to be pointed at it)."""
+    them nor an EOS token), wherever it sits under the pack, its chain's own or the objective's, which
+    packs every branch (`_windowed`): its tokens would read as one document, whose pieces no producer
+    made. Checked as the chain is read, not as it is built, so a record names a store it never opens
+    (a run loaded where its data is not, to be pointed at it)."""
+    packs = objective is not None and objective.pack is not None
     packed = (chain for pipeline in pipelines for chain in chains(pipeline)
-              if any(isinstance(stage, Pack) for stage in chain.stages))
+              if (packs and chain is pipeline) or any(isinstance(stage, Pack) for stage in chain.stages))
     for source in (store for chain in packed for _, leaf in _leaves(chain) for store in _stores(leaf)):
         if isinstance(source, TokenFiles) and not source.documented:
             raise ValueError(f"packed text needs producer document boundaries or EOS: {source.describe()}")
@@ -654,7 +656,7 @@ def _measure(
     for branch, scored in zip(branches, held, strict=True):
         _analyzed(branch, read, validation=scored)
     _capabilities(branches, read, provision)
-    _documented_packs(branches)
+    _documented_packs(branches, objective)
     branches = _pin_sources(branches, read)
     _tokenizer_contract(branches)
     branches = tuple(_automatic(branch, read, automatic) for branch in branches)
@@ -1713,6 +1715,8 @@ def publish(
         if not isinstance(packing, Pack) or planned != len(pipeline.stages) - 1:
             raise ValueError("publication accepts one terminal packing stage after the cached prefix")
         builder = PackingPlan(packing)
+        # The pack's stores are checked with it, which the prefix published without it is not.
+        _documented_packs((pipeline,))
         pipeline = dataclasses.replace(pipeline, stages=pipeline.stages[:planned])
     (pipeline,) = _prepared((pipeline,), read, provision=provision)
     source = pipeline.source
