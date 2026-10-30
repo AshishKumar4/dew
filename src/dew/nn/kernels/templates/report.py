@@ -45,6 +45,9 @@ DUMP_NAME = re.compile(r'mosaic_gpu\.dump_basename = "[^"]*"')
 
 LAUNCH_SUFFIX = re.compile(r"__l([0-9a-f]{10})$")
 """The suffix a kernel's name carries for the launch that traced it (`named`): the digest of its launch."""
+MOSAIC_CALL = re.compile(r"custom_call @mosaic_gpu")
+"""A Mosaic GPU kernel in a lowered program's text, the custom call JAX lowers one to
+(`jax.experimental.mosaic.gpu.core`'s `mosaic_gpu_v2`): a program holding none runs no ptxas to judge."""
 
 _log = logging.getLogger("dew.kernels")
 
@@ -254,43 +257,41 @@ def compiled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | 
     again, so every process derives the program this compile keeps; a relowering whose derivations find no
     config left (`Exhausted`) keeps the first program, its misses recorded as not stepped. Refusals commit
     only when a replacement compiles, so a later process derives the program kept here. A program loaded
-    from the persistent compilation cache runs no ptxas and reports nothing, so the refusals a step-down
-    made are kept beside that cache for the exact program that spilled (`_kept_refusals`): a process over
-    the cache that lowers it again relowers past them first, and compiles the stepped program, never the
-    cached one that spilled."""
-    kept = _kept_refusals(lowered)
-    if kept is not None and kept.exists():
-        remembered = pickle.loads(kept.read_bytes())
-        try:
-            with _proposing(remembered):
-                relowered = relower()
-                replacement, spilling = _compiled_reported(relowered, options)
-        except Exhausted as failed:
-            _log.warning("relowering past the refusals kept for this program found no config: %s", failed)
-        else:
-            for refusal, kernel in remembered:
-                _record(refusal, None, frozenset({kernel}))
-            _recorded(_misses_of(spilling), stepped=False)
-            return replacement
-    executable, spilling = _compiled_reported(lowered, options)
+    from the persistent compilation cache runs no ptxas and reports nothing, so each program with a
+    template's launch that compiles is judged beside the cache, under the key the cache holds its executable
+    by (`Cached`): a process the cache serves it to relowers past the refusals its verdict holds, runs it
+    where it holds none, and compiles it again apart from the cache where no compile judged it."""
+    executable, spilling, cached = _compiled_reported(lowered, options)
+    # Only a program with a Mosaic kernel runs ptxas, so only its artifacts carry a verdict.
+    cached = cached if cached is not None and MOSAIC_CALL.search(lowered.as_text()) else None
+    if cached is not None and cached.hit:
+        # An executable the cache held ran no ptxas: its verdict, written when it compiled, decides it.
+        verdict = cached.verdict()
+        if verdict is None:  # An artifact no compile here judged: compiled again, apart from the cache.
+            from dew.cache import uncached
+
+            with uncached():
+                executable, spilling, _ = _compiled_reported(lowered, options)
+            cached = dataclasses.replace(cached, hit=False)
+        elif verdict:
+            return _past(verdict, relower, options)
     found = _misses_of(spilling)
     refusals = [(refusal, report.kernel) for refusal, report, _ in found if refusal is not None]
     if not refusals:
         _recorded(found, stepped=False)
+        _judged(cached, [])
         return executable
     try:
         with _proposing(refusals):
             relowered = relower()
-            replacement, spilling = _compiled_reported(relowered, options)
+            replacement, spilling, _ = _compiled_reported(relowered, options)
     except Exhausted as failed:
         _log.warning("relowering after a spill found no config: %s; the first program runs", failed)
         _recorded(found, stepped=False)
         return executable
     for refusal, kernel in refusals:
         _record(refusal, None, frozenset({kernel}))
-    if kept is not None:
-        kept.parent.mkdir(parents=True, exist_ok=True)
-        write_atomically(kept, pickle.dumps(refusals))
+    _judged(cached, refusals)
     _recorded(found, stepped=True)
     # The kept program's own spills are misses alone: refused, they would have every process seeded with
     # them derive a third program, not the one this compile keeps and runs.
@@ -298,15 +299,61 @@ def compiled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | 
     return replacement
 
 
-def _kept_refusals(lowered: jax.stages.Lowered) -> Path | None:
-    """Where the refusals a step-down of `lowered`'s exact program made are kept, beside the persistent
-    compilation cache that holds its executable, by its text's digest; None where no cache persists one.
-    A program that spilled is a program its every launch derived alike, so its refusals hold for any process
-    that lowers it again, and for no other program (the cache's own key reads it whole too)."""
+@dataclasses.dataclass(frozen=True)
+class Cached:
+    """The key JAX's persistent compilation cache holds a compile's executable by (`cache_key.get`: the
+    program, devices, compile options, backend, flags and the jaxlib and plugin versions), the artifact's
+    own identity, and whether the cache held it (`hit`)."""
+    key: str
+    hit: bool
+
+    def verdict(self) -> list | None:
+        """The refusals the compile that wrote this artifact's verdict made, none where it was clean; None
+        where none was written (`_judged`)."""
+        written = _verdict_path(self.key)
+        return None if written is None or not written.exists() else pickle.loads(written.read_bytes())
+
+
+def _verdict_path(key: str) -> Path | None:
     directory = jax.config.jax_compilation_cache_dir
-    if not directory:
-        return None
-    return Path(directory) / "dew-refusals" / f"{hashlib.sha256(lowered.as_text().encode()).hexdigest()}.pkl"
+    return None if not directory else Path(directory) / "dew-verdicts" / key
+
+
+def _judged(cached: Cached | None, refusals: list) -> None:
+    """Write what a compile of `cached`'s artifact found, which ran ptxas (not a cache hit), beside the
+    cache: the refusals its step-down made, none where it was clean."""
+    written = None if cached is None or cached.hit else _verdict_path(cached.key)
+    if written is not None:
+        written.parent.mkdir(parents=True, exist_ok=True)
+        write_atomically(written, pickle.dumps(refusals))
+
+
+def _past(refusals: list, relower: Callable[[], jax.stages.Lowered],
+          options: jax.stages.CompilerOptions | None) -> jax.stages.Compiled:
+    """The program relowered past `refusals`, an artifact's verdict, and compiled, the refusals committed
+    as the compile that found them committed them."""
+    with _proposing(refusals):
+        relowered = relower()
+        replacement, spilling, _ = _compiled_reported(relowered, options)
+    for refusal, kernel in refusals:
+        _record(refusal, None, frozenset({kernel}))
+    _recorded(_misses_of(spilling), stepped=False)
+    return replacement
+
+
+class _CacheKeys(logging.Handler):
+    """The cache key and hit JAX logs for each compile that uses its persistent cache
+    (`jax._src.compiler.log_persistent_cache_hit` and `_miss`, the key their record's second argument)."""
+
+    def __init__(self):
+        super().__init__(logging.DEBUG)
+        self.found: Cached | None = None
+
+    def emit(self, record: logging.LogRecord) -> None:
+        given = record.args
+        if record.funcName in ("log_persistent_cache_hit", "log_persistent_cache_miss") and isinstance(
+                given, tuple) and len(given) == 2:
+            self.found = Cached(str(given[1]), record.funcName == "log_persistent_cache_hit")
 
 
 def _misses_of(spilling: list["Report"]) -> list[tuple[tuple[str, Hashable] | None, "Report", Launch | None]]:
@@ -333,11 +380,21 @@ def _recorded(found: list, *, stepped: bool) -> None:
 
 
 def _compiled_reported(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None
-                       ) -> tuple[jax.stages.Compiled, list["Report"]]:
+                       ) -> tuple[jax.stages.Compiled, list["Report"], Cached | None]:
+    """`lowered` compiled with Mosaic's reports on, its spilling kernels' reports, and the artifact the
+    persistent cache keys it by, None where no cache was used (`Cached`)."""
+    compiler, keys = logging.getLogger("jax._src.compiler"), _CacheKeys()
     with tempfile.TemporaryDirectory() as directory:
         with reported(directory):
-            executable = lowered.compile(options)
-        return executable, [found for found in reports(directory) if found.spilled]
+            level = compiler.level
+            compiler.addHandler(keys)
+            compiler.setLevel(logging.DEBUG)
+            try:
+                executable = lowered.compile(options)
+            finally:
+                compiler.setLevel(level)
+                compiler.removeHandler(keys)
+        return executable, [found for found in reports(directory) if found.spilled], keys.found
 
 
 @dataclasses.dataclass(frozen=True)
