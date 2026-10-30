@@ -278,17 +278,22 @@ def cublas_product(equation: jcore.JaxprEqn) -> bool:
     if equation.primitive.name != "dot_general":
         return False
     (left_contracting, right_contracting), (left_batch, right_batch) = equation.params["dimension_numbers"]
-    left, right = (operand.aval.shape if isinstance(operand.aval, ShapedArray) else ()
-                   for operand in equation.invars)
+    left, right = dimensions(equation.invars[0]), dimensions(equation.invars[1])
     if not left_contracting or not right_contracting:
         return False
-    contracting = math.prod(left[axis] for axis in left_contracting)
-    kept_left = math.prod(size for axis, size in enumerate(left)
-                          if axis not in (*left_contracting, *left_batch))
-    kept_right = math.prod(size for axis, size in enumerate(right)
-                           if axis not in (*right_contracting, *right_batch))
+    contracting = int(math.prod(left[axis] for axis in left_contracting))
+    kept_left = int(math.prod(size for axis, size in enumerate(left)
+                              if axis not in (*left_contracting, *left_batch)))
+    kept_right = int(math.prod(size for axis, size in enumerate(right)
+                               if axis not in (*right_contracting, *right_batch)))
     threshold = int(xla_flag("xla_gpu_gemm_rewrite_size_threshold") or GEMM_REWRITE_SIZE)
     return (kept_left + kept_right) * contracting >= threshold
+
+
+def dimensions(value) -> tuple[int, ...]:
+    """`value`'s shape, none where it is no array."""
+    aval = value.aval
+    return tuple(int(size) for size in aval.shape) if isinstance(aval, ShapedArray) else ()
 
 
 def bodies(equation: jcore.JaxprEqn) -> list[jcore.Jaxpr]:
