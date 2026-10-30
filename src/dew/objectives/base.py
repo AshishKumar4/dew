@@ -1201,22 +1201,6 @@ class Objective(ABC, Generic[Loss, Effects]):
             aux = replace(aux, record=witness.report(marked, places))
         return stats, aux
 
-    @staticmethod
-    def watched_forward(step: Step, model: nn.Module, variables: Variables, *args,
-                        **kwargs) -> Variables | None:
-        """What the watched modules sow in one forward of `model` at these arguments where the step
-        watches (`Step.watched`), else None: for an objective whose training forward runs inside a
-        transform that returns none of its collections (a `jax.jvp`, a `lax.cond`), the forward at the
-        step's own inputs, its weights held out of the backward. The same computation as the trained
-        forward's at those inputs, in the same computation (a `jax.jvp`'s primal is), XLA computes it
-        once with it: a sampled step runs the unsampled's matmuls alone. A forward inside a scan or a
-        `lax.cond` branch, which XLA does not merge with one outside it, returns its own collections
-        through it instead (Flow-GRPO's, `dew.sampling.guidance.Guidance`; rCM's phases)."""
-        if step.watched is None:
-            return None
-        _, sown = model.apply(jax.lax.stop_gradient(variables), *args, mutable=[INSPECTED], **kwargs)
-        return sown.get(INSPECTED, {})
-
     def reduce_loss(self, stats: Loss) -> tuple[jax.Array, jax.Array]:
         """Return the objective value of summed statistics and whether they have any mass.
 
