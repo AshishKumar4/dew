@@ -12,16 +12,16 @@ its evaluation alike, as the model the run would hand on, and evaluation, infere
 
 from __future__ import annotations
 
-import dataclasses
 from typing import Protocol, TypedDict, runtime_checkable
 
 import jax
-from flax import linen as nn
+from flax import linen as nn, struct
 
 
-@dataclasses.dataclass(frozen=True)
+@struct.dataclass
 class Progress:
-    """Where a run's training stands at a step."""
+    """Where a run's training stands at a step: a pytree, its updates a leaf a compiled call takes as an
+    input and keys on, the run's end (no updates) a tree of its own."""
 
     updates: jax.Array | None
     """The updates the run committed before the step, an int32 scalar the step traces; None past the
