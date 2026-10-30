@@ -393,12 +393,13 @@ def test_fresh_processes_train_a_runs_record_and_export_it(tmp_path):
 
 
 def test_a_pretrained_run_stores_its_parameters_in_the_dtype_it_names(tmp_path):
-    """`--trainer.precision.dtypes.params bfloat16` loads the checkpoint's parameters as bf16 and
-    trains them so, and the run records it with its numerics."""
+    """`--trainer.precision '{"dtypes": {"params": "bfloat16"}}'` loads the checkpoint's parameters as
+    bf16 and trains them so, and the run records it with its numerics."""
     tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
     checkpoint = export_tiny_decoder(tmp_path / "checkpoint")
     config = pretrained_config(tokens, checkpoint, "--trainer.steps", "1", "--max-new-tokens", "0",
-                               "--trainer.name", "bf16", "--trainer.precision.dtypes.params", "bfloat16")
+                               "--trainer.name", "bf16", "--trainer.precision",
+                               '{"dtypes": {"params": "bfloat16"}}')
     state = config.run()
     params = jax.tree.leaves(state.variables["params"])
     floating = [leaf for leaf in params if jnp.issubdtype(leaf.dtype, jnp.floating)]
@@ -481,7 +482,7 @@ def test_a_lora_run_under_bf16_parameters_keeps_its_factors_float32_and_its_base
     checkpoint = export_tiny_decoder(tmp_path / "checkpoint")
     state = pretrained_config(tokens, checkpoint, "--trainer.steps", "1", "--max-new-tokens", "0",
                               "--trainer.name", "bf16", "--lora.rank", "4", "--lora.modules", "q_proj",
-                              "--trainer.precision.dtypes.params", "bfloat16").run()
+                              "--trainer.precision", '{"dtypes": {"params": "bfloat16"}}').run()
     for collection, dtype in (("params", jnp.float32), (FROZEN, jnp.bfloat16)):
         stored = {leaf.dtype for leaf in jax.tree.leaves(state.variables[collection])}
         assert stored == {jnp.dtype(dtype)}, collection
