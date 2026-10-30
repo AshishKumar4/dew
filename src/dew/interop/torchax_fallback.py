@@ -1539,8 +1539,10 @@ def _stored_tensors(model: PreTrainedModel, directory: Path, storage: np.dtype |
     """The checkpoint's tensors in `directory` by the names `model` holds them under, memory-mapped
     (`sources.load_shards`): each key named as transformers' load names it, by the model's conversion
     mapping's renamings (`rename_source_key`), a key the model holds nothing under left out, each
-    floating tensor in `storage` (its stored dtype where None). None where a key takes one of the
-    mapping's tensor conversions (a fused expert's merge), which transformers' own load applies."""
+    floating tensor in `storage` (its stored dtype where None), and a tied parameter (an output table
+    that is its input table) under each of its names from the one the checkpoint stores it under. None
+    where a key takes one of the mapping's tensor conversions (a fused expert's merge), which
+    transformers' own load applies."""
     from transformers.conversion_mapping import get_model_conversion_mapping
     from transformers.core_model_loading import WeightConverter, WeightRenaming, rename_source_key
 
@@ -1556,6 +1558,13 @@ def _stored_tensors(model: PreTrainedModel, directory: Path, storage: np.dtype |
         if name in held:
             floating = np.issubdtype(tensor.dtype, np.floating) or tensor.dtype == jnp.bfloat16
             named[name] = tensor.astype(storage) if storage is not None and floating else tensor
+    tied: dict[int, list[str]] = {}
+    for name, parameter in model.named_parameters(remove_duplicate=False):
+        tied.setdefault(id(parameter), []).append(name)
+    for names in tied.values():
+        for stored in [name for name in names if name in named][:1]:
+            for name in names:
+                named.setdefault(name, named[stored])
     return named
 
 
