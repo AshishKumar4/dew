@@ -165,8 +165,8 @@ def test_an_agent_learns_its_world_from_its_replay():
 
 def test_each_replayed_step_draws_its_posterior_from_its_own_key():
     """The replayed windows' posterior pass draws each step's categoricals from its own key, split
-    from the pass's key, as stepping the posterior a step at a time with those keys does, bit for bit;
-    a pass that reused one key would repeat its draws."""
+    from the pass's key: the classes drawn are those stepping the posterior a step at a time with those
+    keys draws; a pass that reused one key would repeat its draws."""
     model = tiny()
     objective = DreamerV3Objective(model)
     variables = objective.init(jax.random.key(11))
@@ -187,4 +187,5 @@ def test_each_replayed_step_draws_its_posterior_from_its_own_key():
             draws.append(drawn)
         return jnp.stack(draws, 1)
 
-    np.testing.assert_array_equal(stoch, stepped(variables))
+    # The draws, not the straight-through values around them, which the two programs round apart.
+    np.testing.assert_array_equal(np.argmax(stoch, -1), np.argmax(stepped(variables), -1))

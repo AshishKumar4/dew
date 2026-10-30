@@ -73,14 +73,14 @@ def test_optimality_is_the_clipped_advantage_mapped_onto_the_unit_interval():
     assert_computes_the_oracle(found, expected, "optimality", roundings=4)
 
 
-def objective(**options):
+def objective(dtype=jnp.float32, **options):
     from dew.nn.backbones.dit import SimpleDiT
 
     process = Process(FlowMatchingScheduler(shift=2), FlowMatchPredictionTransform())
     inputs = InputSpec(Field("image", (4, 4, 1)), {
         "textcontext": Condition(CharTable.from_pretrained(tokens=3, features=4))})
     model = SimpleDiT(output_channels=1, patch_size=2, emb_features=8, num_layers=1, num_heads=2,
-                      mlp_ratio=2)
+                      mlp_ratio=2, dtype=dtype)
     return DiffusionNFTObjective(model, process, inputs, steps=5, **{"kl": 0.0, **options})
 
 
@@ -139,18 +139,28 @@ def test_a_rollout_samples_the_old_policy_and_normalizes_by_the_batchs_spread():
                                   rollout(old_weights, prompts, jax.random.key(23))["latents"])
 
 
-def test_the_old_policy_follows_the_trained_one_at_the_released_decay():
-    """At an update the old policy keeps min(0.001 s, 0.5) of itself, s the gradient steps taken once
-    it is made, and takes the rest from the trained weights (train_nft_sd3.py:169-189 and 1033-1038,
-    decay_type 1): the EMA slot's update at the released schedule, bit for bit, the base model's
-    velocity weighed in at the release's kl."""
+def test_the_released_decay_is_its_trainers_schedule():
+    """The old policy's decay at the update after s completed ones is min(0.001 (s + 1), 0.5), the
+    released trainer's decay_type 1 at the gradient steps taken (train_nft_sd3.py:169-189 and
+    1033-1038), within float64 rounding of that schedule over the first 2000 updates."""
+    updates = np.arange(2000, dtype=np.float64)
+    with jax.enable_x64(new_val=True):
+        found = np.asarray(released_old_decay(updates))
+    expected = np.minimum(0.001 * (updates + 1), 0.5)
+    assert_computes_the_oracle(found, expected, "the old policy's decay", roundings=3)
+
+
+def test_the_old_policy_follows_the_trained_one_at_its_decay():
+    """At an update the old policy, the EMA slot, keeps its decay's share of itself and takes the rest
+    from the trained weights, bit for bit at a decay of one half, whose arithmetic rounds once however
+    it fuses."""
     from dew.averaging import ema_update
 
-    nft = objective(variables=nudged(objective().init(jax.random.key(20)), jax.random.key(22)), kl=1e-4)
+    nft = objective(variables=nudged(objective().init(jax.random.key(20)), jax.random.key(22)),
+                    old_decay=optax.constant_schedule(0.5))
     _, initial, final = fitted(nft, lambda images, context: images.mean(axis=(1, 2, 3)),
                                nft.inputs.tokenize(PROMPTS), groups=2, steps=5, train_steps=2)
-    expected = ema_update(initial.ema, final.variables, released_old_decay(initial.updates))
-    jax.tree.map(np.testing.assert_array_equal, final.ema, expected)
+    jax.tree.map(np.testing.assert_array_equal, final.ema, ema_update(initial.ema, final.variables, 0.5))
 
 
 @pytest.mark.parametrize("asked", [{"beta": 0.0}, {"adv_clip_max": 0.0}, {"kl": -1.0}, {"kl": 1e-4}],
@@ -170,8 +180,9 @@ def test_the_loss_corrupts_by_its_process_own_noise_levels():
     the step draws."""
     from dew.objectives.base import Step
 
-    nft = objective(beta=0.5)
-    variables = nft.init(jax.random.key(30))
+    nft = objective(jnp.float64, beta=0.5)
+    with jax.enable_x64(new_val=True):
+        variables = nft.init(jax.random.key(30))
     rng = np.random.default_rng(31)
     samples = rng.normal(size=(8, 4, 4, 1))
     times = np.broadcast_to(np.asarray([1.0, 0.75, 0.5]), (8, 3))

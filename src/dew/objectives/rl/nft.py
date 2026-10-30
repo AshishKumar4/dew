@@ -62,7 +62,8 @@ def released_old_decay(updates: jax.typing.ArrayLike) -> jax.Array:
     min(0.001 s, 0.5) with s the gradient steps taken once it is made (train_nft_sd3.py:169-189 and
     1033-1038, decay_type 1, one gradient step an epoch): 0.001 at the first update, a half from the
     500th."""
-    return jnp.minimum(0.001 * (jnp.asarray(updates, jnp.float32) + 1), 0.5)
+    updates = jnp.asarray(updates)
+    return jnp.minimum(0.001 * (updates.astype(at_least_fp32(updates.dtype)) + 1), 0.5)
 
 
 _WEIGHT_FLOOR = 1e-5
