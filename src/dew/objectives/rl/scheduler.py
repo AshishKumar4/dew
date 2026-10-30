@@ -145,6 +145,7 @@ from dew.cleanup import attempted
 from dew.data.dataset import DataPartition, Loader, tapped
 from dew.distributed.batches import first_reader_batch, shard_batch
 from dew.nn.inputs import local_rows, mesh_of
+from dew.nn.progress import END, Progress
 from dew.objectives.base import Shown
 from dew.sampling.text import Sampling
 from dew.state import TrainState
@@ -502,22 +503,27 @@ class Asynchronous:
     def stale(self, sample: _Sample, updates: int) -> bool:
         return updates - sample.submitted > self.lag
 
-    def rescore(self, variables: Variables, packed: Mapping[str, np.ndarray]) -> np.ndarray:
-        """The packed ids' proximal log-probabilities under `variables`, the trainer's weights.
+    def rescore(self, variables: Variables, packed: Mapping[str, np.ndarray], progress: Progress = END
+                ) -> np.ndarray:
+        """The packed ids' proximal log-probabilities under `variables`, the trainer's weights, at the
+        run's `progress` the step's loss reads (`GRPOObjective.loss`), so the two policies agree where
+        their weights do.
 
         Over a mesh the rows are placed as the step places the batch, every
         process's rows together, so the rescoring runs once over the pool's
         batch and each process reads its own rows back."""
-        return scored_rows(self.objective, variables, packed)
+        return scored_rows(self.objective, variables, packed, progress)
 
 
-def scored_rows(objective: GRPOObjective, variables: Variables,
-                packed: Mapping[str, np.ndarray]) -> np.ndarray:
-    """This process's packed rows' sampled ids' log-probabilities under `variables` (`packed_log_probs`),
-    over a mesh scored once over the pool's rows, placed as the step places the batch."""
+def scored_rows(objective: GRPOObjective, variables: Variables, packed: Mapping[str, np.ndarray],
+                progress: Progress = END) -> np.ndarray:
+    """This process's packed rows' sampled ids' log-probabilities under `variables` (`packed_log_probs`)
+    at the run's `progress`, over a mesh scored once over the pool's rows, placed as the step places the
+    batch."""
     mesh = mesh_of(variables)
     rescore = objective.program("packed log probs", objective.packed_log_probs)
-    scored = rescore(variables, packed if mesh is None else shard_batch(mesh, dict(packed)))
+    placed = packed if mesh is None else shard_batch(mesh, dict(packed))
+    scored = rescore(variables, placed, progress=progress)
     return local_rows(scored).astype(np.float32) * packed[RESPONSE_MASK_KEY]
 
 
@@ -809,7 +815,9 @@ class RolloutScheduler:
         if mesh is not None:
             packed = first_reader_batch(mesh, agreed_records(packed, self.support_capacity))
         if self.acquisition.rescore is not None:
-            packed[OLD_LOG_PROBS_KEY] = self.acquisition.rescore(state.variables, packed)
+            # At the updates the step's loss reads its policy at (`Objective.progress`).
+            packed[OLD_LOG_PROBS_KEY] = self.acquisition.rescore(state.variables, packed,
+                                                                 Progress(state.updates))
         if self.reference is not None:
             packed = self._penalized(state, mesh, entries[0], mine if sampling else None, packed)
         if sampling:
