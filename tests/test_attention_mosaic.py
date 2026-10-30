@@ -134,14 +134,18 @@ def _pinned(forward: attention_mosaic.Tiles | None = None,
 def _check_forward(call: str, dtype, shape, *, natural: bool, interpret: bool, width: int = 128,
                    value_width: int = 128, tiles: attention_mosaic.Tiles | None = None,
                    training: template.Kept = template.Kept.NONE, target: generation.GpuTarget | None = None,
-                   drop: bool = False, query_scale: float = 1.0):
+                   drop: bool = False, query_scale: float = 1.0, sinks: bool = False):
     """The forward, or with `training` (what it keeps, `template.Kept`) the training forward's output, over
     the call form `call` of `shape`,
     its query and key heads `width` wide and its value heads `value_width`, at `tiles` (the default when
-    None), with `drop` under probability dropout at `DROP_RATE` (`_dropping`), its queries drawn times
-    `query_scale` (a power of two, exact)."""
+    None), with `drop` under probability dropout at `DROP_RATE` (`_dropping`), with `sinks` a sink a query
+    head (`template.sinks`, the initial state), its queries drawn times `query_scale` (a power of two,
+    exact)."""
     spans = template.spans(shape[1], shape[1], shape[0], **CALLS[call])
     hooks = _dropping(shape) if drop else None
+    if sinks:
+        hooks = template.Hooks(initial=template.sinks(jnp.linspace(-1.0, 1.0, shape[2]), shape[0], shape[1],
+                                                      value_width))
     unscaled = _drawn(shape, dtype, width=width, value_width=value_width)
 
     def draw(seed):
@@ -971,14 +975,16 @@ def test_the_backward_is_on_par_under_every_score_hook_interpreted(hooks, form):
 
 
 @INTERPRETS
+@pytest.mark.parametrize("sinks", [False, True], ids=["plain", "sinks"])
 @pytest.mark.parametrize("call", ["causal", "full"])
-def test_a_training_forward_256_wide_past_the_folds_reach_is_on_par_interpreted(call):
+def test_a_training_forward_256_wide_past_the_folds_reach_is_on_par_interpreted(call, sinks):
     """An anchored training forward 256 wide whose logits pass the fold's reach (`algebra.FOLD_REACH`, its
     queries drawn 2^16 times larger) walks again in the natural form, whose launches take a block of the
-    value columns each (`Tiles.relaunch_columns`, row 2526: no tile holds its whole sums), its output on
-    par (check 1) with the reference's from float64, under the interpreter."""
+    value columns each (`Tiles.relaunch_columns`, row 2526: no tile holds its whole sums), with attention
+    sinks each block from its own columns of the initial state's sums (row 2671), its output on par
+    (check 1) with the reference's from float64, under the interpreter."""
     _check_forward(call, jnp.bfloat16, SHAPES["interpreted"], natural=False, interpret=True, width=256,
-                   value_width=256, training=template.Kept.SPLIT, query_scale=2.0 ** 16)
+                   value_width=256, training=template.Kept.SPLIT, query_scale=2.0 ** 16, sinks=sinks)
 
 
 @INTERPRETS
