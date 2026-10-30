@@ -740,9 +740,15 @@ def witnessed_on(builder, objective: str, settings: type, root: Path
     witness is not: one with no path its settings do not declare derived, or derived from data the run
     leaves unfilled; one set alone to each alternative (`reached_by`) that no run trains with, whose
     loaded task holds it nowhere it held another before (`held`), or which a request of that task reads
-    nowhere it holds it (`reading`), a consumer's own read, not its record's."""
+    nowhere it holds it (`reading`), a consumer's own read, not its record's (`unread`): a released
+    task's, its export's too (`dew export`)."""
+    import dew
+    from dew.objectives.base import ReleasedTask
+
     root.mkdir(parents=True)
     run = builder(root, drawn=False)
+    saved_task = objectives[objective].saved_task
+    released = saved_task is not None and issubclass(saved_task, ReleasedTask)
     base, unset = saved_with(run, root, "unset", settings, {})
     before = held(unset)
     options = {option.name: option for option in options_of(run, objective, settings, base)}
@@ -777,20 +783,41 @@ def witnessed_on(builder, objective: str, settings: type, root: Path
             continue
         task, value = reached[name]
         option = reachable[name].made(value)
-        after = held_by(task)
-        # Where the loaded task holds the option it held another before, a request reads it there.
-        places = [after[path] for path, inner in held(task).items()
-                  if same(inner, option) and not same(before.get(path), inner)]
-        holders: dict[type, set[str]] = {}
-        for holder, attribute in places:
-            holders.setdefault(type(holder), set()).add(attribute)
-        with reading(holders) as reads:
-            requested(task)
-        if not places:
-            failures[name] = "the task loaded holds none set"
-        elif not any(same(found, option) for _, found in reads):
-            failures[name] = "a request of the loaded task reads none it holds"
+        missed = unread(task, before, option)
+        if missed is None and released:
+            # A released task's export (`dew export`), reloaded as its users load one, holds it too.
+            exported = root / "exported" / name
+            assert main(["export", str(root / "runs" / f"{name}{queued[name].index(value)}"),
+                         str(exported)]) == 0
+            missed = unread(dew.pipeline(str(exported)), before, option)
+            missed = None if missed is None else f"its export: {missed}"
+        if missed is not None:
+            failures[name] = missed
     return options, failures
+
+
+def unread(task, before: dict[str, object], option) -> str | None:
+    """Why the loaded `task` does not consume `option`, None where it does: it holds it nowhere it held
+    another before (`held`), or a request of it reads it nowhere it holds it (`reading`), a consumer's own
+    read, not its record's."""
+    after = held_by(task)
+    places = [after[path] for path, inner in held(task).items()
+              if same(inner, option) and not same(before.get(path), inner)]
+    if not places:
+        return "the task loaded holds none set"
+    reads = requested_reads(task, places)
+    return None if any(same(found, option) for _, found in reads) else "a request of it reads none it holds"
+
+
+def requested_reads(task, places: list[tuple[object, str]]) -> list[tuple[str, object]]:
+    """What a request of `task` (`requested`) reads of the attributes `places` name, on objects of their
+    holders' classes, and the values read (`reading`)."""
+    holders: dict[type, set[str]] = {}
+    for holder, attribute in places:
+        holders.setdefault(type(holder), set()).add(attribute)
+    with reading(holders) as reads:
+        requested(task)
+    return reads
 
 
 @pytest.mark.mesh(devices=8)
@@ -823,12 +850,7 @@ def read_where_held(task, declared: dict[str, object]) -> list[str]:
     """The options of `declared`, by their path in `task` (`held`), that a request of `task` reads nowhere
     it holds them (`reading`)."""
     places = held_by(task)
-    holders: dict[type, set[str]] = {}
-    for path in declared:
-        holder, attribute = places[path]
-        holders.setdefault(type(holder), set()).add(attribute)
-    with reading(holders) as reads:
-        requested(task)
+    reads = requested_reads(task, [places[path] for path in declared])
     return [path for path, option in declared.items()
             if not any(name == places[path][1] and same(found, option) for name, found in reads)]
 
