@@ -174,8 +174,8 @@ class LayerSpec:
     """The layer's differential extension on its attention's chosen heads (`dew.nn.dex`), or None."""
 
 
-def scan_groups(specs: Sequence[Hashable],
-                bank_layers: int | None = None) -> tuple[tuple[int, int], ...]:
+def scan_groups(specs: Sequence[Hashable], bank_layers: int | None = None, *,
+                periodic: bool = False) -> tuple[tuple[int, int], ...]:
     """The stack as runs of layers, `(first, count)` each, in order.
 
     Consecutive layers with equal specs form one run, which a scan runs as
@@ -185,6 +185,13 @@ def scan_groups(specs: Sequence[Hashable],
     `LayerSpec`, or that with what else one body has to share, as the
     structure of the layer's variables (`CausalTransformer.scan_keys`).
 
+    `periodic` lets a run repeat a period of several layers, which a scan runs
+    as iterations of one body of the period's layers (`run_period` reads the
+    period back): from each layer, the run is the longest stretch some period
+    repeats at least twice, the shortest such period on a tie, so a hybrid's
+    `[linear, linear, linear, full]` x 6 is one run of 24 and like layers stay
+    a run of period one. What no period repeats stays unrolled.
+
     `bank_layers` caps how many layers one run holds, which is how many a
     parameter bank stacks: a longer run splits into consecutive runs of at
     most that many layers. A host-resident bank is built and read one bank
@@ -193,13 +200,30 @@ def scan_groups(specs: Sequence[Hashable],
     if bank_layers is not None and bank_layers < 1:
         raise ValueError(f"bank_layers counts the layers one run holds, got {bank_layers}")
     groups: list[tuple[int, int]] = []
-    for index, spec in enumerate(specs):
-        if groups and specs[groups[-1][0]] == spec and groups[-1][1] != bank_layers:
-            first, count = groups[-1]
-            groups[-1] = (first, count + 1)
-        else:
-            groups.append((index, 1))
+    first = 0
+    while first < len(specs):
+        covered = 1
+        for period in range(1, (len(specs) - first) // 2 + 1 if periodic else 2):
+            body = specs[first:first + period]
+            repeats = 1
+            while (first + (repeats + 1) * period <= len(specs)
+                   and specs[first + repeats * period:first + (repeats + 1) * period] == body):
+                repeats += 1
+            if bank_layers is not None:
+                repeats = min(repeats, bank_layers // period)
+            if (repeats >= 2 or period == 1) and repeats * period > covered:
+                covered = repeats * period
+        groups.append((first, covered))
+        first += covered
     return tuple(groups)
+
+
+def run_period(specs: Sequence[Hashable], first: int, count: int) -> int:
+    """The shortest period whose repeats are the run of `count` layers from `first`: one for a run
+    of like layers, the period `scan_groups(periodic=True)` found for a periodic one."""
+    run = specs[first:first + count]
+    return next(period for period in range(1, count + 1)
+                if not count % period and all(spec == run[index % period] for index, spec in enumerate(run)))
 
 
 def group_name(first: int, count: int) -> str:
