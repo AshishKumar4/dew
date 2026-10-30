@@ -1377,7 +1377,8 @@ def test_a_pool_trains_a_hybrid_split_over_the_sequence(tmp_path):
     reports = run_pool("sequence_hybrid", tmp_path / "pool", 2, script=worker_script, devices=1, fsdp_size=1,
                        timeout=180)
     assert [report["sequence_processes"] for report in reports] == [[[0, 1]]] * 2
-    assert [report["placed_fields"] for report in reports] == [["attention_mask"]] * 2
+    # Each rank's validity laid out as its rows' coordinates, one layout (ledger 1122).
+    assert [report["placed_fields"] for report in reports] == [["coordinates"]] * 2
     assert reports[0]["loss"] == reports[1]["loss"], "the processes disagreed with each other"
     assert np.isfinite(reports[0]["loss"]) and np.isfinite(reports[0]["update_scale"])
     assert reports[0]["update_scale"] > 0
