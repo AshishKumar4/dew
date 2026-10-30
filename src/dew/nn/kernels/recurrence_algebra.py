@@ -868,11 +868,14 @@ def reverse_carried(grad: list, keys: TileLoad, weights: TileLoad, queries: Tile
     dv = dv * range_decay(last, last_low, gate, low)[:, None] + local
     read = out_grad.astype(jnp.float32) * raised(gate, low)[:, None]
     kept = raised(last, last_low)[:, None]
-    entered = [part * kept + issue("reads", queries(i).T, read) * scale for i, part in enumerate(grad)]
-    if weights is not None:
-        entered = [part - issue("weights_dv", weights(i).T, dv.astype(dtype))
-                   for i, part in enumerate(entered)]
-    return entered, dv
+    def slice_entered(i, part):
+        # A slice's terms in one expression, so each slice's products are live alone (formed slice by slice
+        # into a list first, every slice's partial sum stayed live past the products: 128 bytes spilled in
+        # an H100's reverse walk of Qwen3.5-27B's gated delta net).
+        entered = part * kept + issue("reads", queries(i).T, read) * scale
+        return entered if weights is None else entered - issue("weights_dv", weights(i).T, dv.astype(dtype))
+
+    return [slice_entered(i, part) for i, part in enumerate(grad)], dv
 
 
 def scores_gradient(queries: TileLoad, keys: TileLoad, columns: int, values: TileLoad, out_grads: TileLoad,
