@@ -358,10 +358,9 @@ def alternatives(annotation, base=None) -> list[object]:
     if annotation is bool:
         return [False, True]
     if origin in (types.UnionType, typing.Union):
-        members = typing.get_args(annotation)
-        if any(typing.get_origin(member) in (dict, list, typing.Mapping) or member in (dict, list)
-               for member in members):
+        if record(annotation):
             return []
+        members = typing.get_args(annotation)
         found = []
         for member in members:
             values = [None] if member is type(None) else [1] if member is int else alternatives(member, base)
@@ -370,18 +369,21 @@ def alternatives(annotation, base=None) -> list[object]:
             found += [value for value in values if value not in found]
         return found
     if dataclasses.is_dataclass(annotation) and isinstance(annotation, type):
-        hints = typing.get_type_hints(annotation)
-        fields = [field.name for field in dataclasses.fields(annotation) if field.init]
         if isinstance(base, annotation):
-            # The saved value with one field changed, each field's alternatives in turn.
+            # The saved value with one field changed, each field's alternatives in turn: the fields of
+            # its own class, a subclass's beside the annotation's.
+            saved = type(base)
+            hints = typing.get_type_hints(saved)
             changed = []
-            for name in fields:
+            for name in (field.name for field in dataclasses.fields(saved) if field.init):
                 for value in alternatives(hints[name], getattr(base, name)):
                     try:
                         changed.append(dataclasses.replace(base, **{name: value}))
                     except (TypeError, ValueError):
                         continue
             return [base, *(value for value in changed if value != base)]
+        hints = typing.get_type_hints(annotation)
+        fields = [field.name for field in dataclasses.fields(annotation) if field.init]
         declared = {name: alternatives(hints[name]) for name in fields}
         declared = {name: values for name, values in declared.items() if len(values) > 1}
         try:
@@ -393,6 +395,24 @@ def alternatives(annotation, base=None) -> list[object]:
     if isinstance(annotation, type) and annotation.__module__.startswith("dew."):
         return members_of(annotation, base)
     return []
+
+
+def record(annotation) -> bool:
+    """Whether `annotation` is a record's: a union holding a mapping or a list, whose values its writer's
+    are."""
+    if isinstance(annotation, typing.TypeAliasType):
+        return record(annotation.__value__)
+    if typing.get_origin(annotation) is typing.Annotated:
+        return record(typing.get_args(annotation)[0])
+    return typing.get_origin(annotation) in (types.UnionType, typing.Union) and any(
+        typing.get_origin(member) in (dict, list, typing.Mapping) or member in (dict, list)
+        for member in typing.get_args(annotation))
+
+
+def dews(annotation) -> bool:
+    """Whether `annotation` names one of Dew's types, alone or in a union (`bare`)."""
+    members = typing.get_args(bare(annotation)) or (bare(annotation),)
+    return any(isinstance(member, type) and member.__module__.startswith("dew.") for member in members)
 
 
 def bare(annotation):
@@ -602,6 +622,11 @@ def test_each_option_a_saved_task_is_built_with_reaches_it_from_the_command_line
     run = builder(tmp_path, drawn=False)
     base, before = saved_with(run, tmp_path, "unset", settings, {})
     options = witnessed(settings, base)
+    # A field of Dew's types declares its alternatives: one with fewer than two is witnessed by none,
+    # unless its settings declare it derived from the run's data, or it is a record, its writer's.
+    for name in (name for name, field in fields.items() if name not in options and dews(hints[name])):
+        assert "derived" in fields[name].metadata or record(hints[name]), \
+            f"{settings.__name__}.{name} declares no alternative to witness it by"
     paths = {name: reach(run, objective, name, hints[name]) for name in options}
     for name in (name for name in options if paths[name] is None):
         assert "derived" in fields[name].metadata, f"{settings.__name__}.{name} has no path"
