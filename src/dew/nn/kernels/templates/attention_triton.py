@@ -100,7 +100,7 @@ def refused(spans: KeySpans, hooks: Hooks | None = None) -> Refusal | None:
                        "Mosaic or the plain-JAX mainloop")
     if hooks is not None and hooks.drop is not None:
         return Refusal('dropout', "the Triton mainloop is frozen and takes no probability dropout (the route "
-                       "runs a dropping call on the reference path, ledger row 1521)", row='1521')
+                       "runs a dropping call on the reference path, ledger row 1521)")
     return None
 
 
