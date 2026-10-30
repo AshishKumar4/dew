@@ -397,19 +397,52 @@ _LIMIT = re.compile(r"Limit\(count=(\d+)\)")
 """A limit's record in an order's stages (`Limit`'s repr)."""
 
 
-def reads_on(saved: JSON, current: JSON) -> bool:
-    """Whether the order `current` reads `saved`'s and maybe further: the same record, but where a limit
-    stands no lower, its first records the saved one's, as a run on the examples clock resumed with a
-    larger bound reads on past it (row 2649). A limit that stands lower reads less than the run read."""
+def grown_limits(saved: JSON, current: JSON) -> frozenset[tuple[str, str]] | None:
+    """The limits the order `current` sets higher than `saved` does, each its saved and its current
+    record, where `current` is `saved` but for them; None where it differs otherwise. A limit grows only
+    where nothing after it in its stages but a batch reads the records it holds, as the examples clock's
+    bound (`dew.data.compile._bounded`) of a chain that neither packs nor windows: its first records are
+    the saved one's, read further, where a repeat, a shuffle, a split, a pack or windows after it would
+    read them anew (row 2649)."""
     if isinstance(saved, dict) and isinstance(current, dict):
-        return saved.keys() == current.keys() and all(reads_on(saved[name], current[name]) for name in saved)
-    if isinstance(saved, list) and isinstance(current, list):
-        return len(saved) == len(current) and all(map(reads_on, saved, current))
-    if isinstance(saved, str) and isinstance(current, str):
-        before, after = _LIMIT.fullmatch(saved), _LIMIT.fullmatch(current)
-        if before is not None and after is not None:
-            return int(after.group(1)) >= int(before.group(1))
-    return saved == current
+        if saved.keys() != current.keys():
+            return None
+        parts = [_grown_stages(saved[name], current[name]) if name == "stages"
+                 else grown_limits(saved[name], current[name]) for name in saved]
+    elif isinstance(saved, list) and isinstance(current, list):
+        if len(saved) != len(current):
+            return None
+        parts = [grown_limits(before, after) for before, after in zip(saved, current, strict=True)]
+    else:
+        return frozenset() if saved == current else None
+    return None if any(part is None for part in parts) else frozenset().union(*(part or () for part in parts))
+
+
+def _grown_stages(saved: JSON, current: JSON) -> frozenset[tuple[str, str]] | None:
+    """`grown_limits` of one chain's stages (their records, in order)."""
+    if not (isinstance(saved, list) and isinstance(current, list)) or len(saved) != len(current):
+        return grown_limits(saved, current)
+    found = set()
+    for at, (before, after) in enumerate(zip(saved, current, strict=True)):
+        if before == after:
+            continue
+        held, now = _LIMIT.fullmatch(str(before)), _LIMIT.fullmatch(str(after))
+        if (held is None or now is None or int(now.group(1)) < int(held.group(1))
+                or not all(str(stage).startswith("BatchStage(") for stage in saved[at + 1:])):
+            return None
+        found.add((str(before), str(after)))
+    return frozenset(found)
+
+
+def _steps_grown(saved: JSON, current: JSON, grown: frozenset[tuple[str, str]]) -> bool:
+    """Whether a manifest's steps `current` are `saved`'s but for the limits the order grew (`grown`)."""
+    if not (isinstance(saved, list) and isinstance(current, list)) or len(saved) != len(current):
+        return False
+    return all(before == after or (
+        isinstance(before, dict) and isinstance(after, dict) and before.keys() == after.keys()
+        and (str(before.get("config")), str(after.get("config"))) in grown
+        and all(before[key] == after[key] for key in before if key != "config"))
+        for before, after in zip(saved, current, strict=True))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -502,10 +535,11 @@ class Plan:
         for name in ("lowering", "rejections", "cache", "volatile"):
             if name not in member_scoped and current[name] != saved.get(name):
                 raise ValueError(f"saved data plan {name} changed: {saved.get(name)!r} -> {current[name]!r}")
-        # An order is the same wherever its sources are mounted (`same_order`), and reads on where a limit
-        # grows (`reads_on`).
+        # An order is the same wherever its sources are mounted (`same_order`), or reads on past a bound
+        # it grows (`grown_limits`).
         saved_order = unplaced(json_value(saved.get("order"), "saved order"))
-        if edited is None and not reads_on(saved_order, unplaced(current["order"])):
+        grown = grown_limits(saved_order, unplaced(current["order"])) if edited is None else frozenset()
+        if grown is None:
             raise ValueError(f"saved data plan order changed: {saved.get('order')!r} -> {current['order']!r}")
         previous = record(saved.get("derived", {}), "saved derived order")
         for name in sorted(set(previous) | set(self.derived)) if edited is None else ():
@@ -524,9 +558,10 @@ class Plan:
                 raise ValueError(f"saved per-share data plan topology changed (shares, workers or cycle "
                                  f"length): {PER_SHARE}")
         manifest, semantic = record(saved.get("manifest"), "saved data manifest"), self.manifest.semantic()
-        # A grown limit's step reads on as its order does (`reads_on`).
+        # A bound the order grew is its steps' limit too.
         changed = tuple(name for name in _changed(manifest, semantic)
-                        if not reads_on(manifest.get(name), semantic.get(name)))
+                        if not (name == "steps" and _steps_grown(json_value(manifest[name], "saved steps"),
+                                                                 semantic[name], grown)))
         if edited is not None:
             changed = tuple(name for name in changed if name not in ("source", "steps", "tokenizer"))
         if changed:

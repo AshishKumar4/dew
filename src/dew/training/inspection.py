@@ -1,7 +1,7 @@
 """Live inspection of a run's parameters, gradients and updates (row 2317).
 
 A run names what it watches (`Inspection`): parameter paths by glob, the trees whose leaves at those paths
-it summarizes, and every how many optimizer updates. The summaries are reduced inside the jitted step,
+it summarizes, and every how many windows of steps. The summaries are reduced inside the jitted step,
 over the global arrays (each process's share reduced in the one SPMD program, replicas counted once), so
 only scalars leave the devices; they ride the step's commit telemetry (`dew.training.transaction.Committed`)
 and are read one log late off the step loop (`dew.training.interval.LogWriter`). A run with no inspection
@@ -44,9 +44,10 @@ class Inspection:
     selects is summarized on its own, for each target: its mean, standard deviation, root mean square,
     largest magnitude, non-finite share and zero fraction. Every sampled step also reports each
     target's global L2 norm, over every parameter, and the update-to-weight ratio,
-    ||update|| / ||params||. `every` is the optimizer updates between samples, however many steps an
-    update pools (`Trainer.accumulation`, `samples`); the run's logs carry the latest sample, so a cadence
-    of the logs' or a multiple of it reports each sample once."""
+    ||update|| / ||params||. `every` is the windows of the run's accumulation steps between samples
+    (`samples`): the update that commits in each, every `every`-th update of a run no step of which is
+    rejected; the run's logs carry the latest sample, so a cadence of the logs' or a multiple of it reports
+    each sample once."""
 
     paths: tuple[str, ...] = ()
     targets: tuple[Target, ...] = ("params", "grads", "updates", "deltas")
@@ -66,7 +67,7 @@ class Inspection:
 
     def __post_init__(self):
         if self.every < 1:
-            raise ValueError(f"an inspection samples every positive number of updates, not {self.every}")
+            raise ValueError(f"an inspection samples every positive number of windows, not {self.every}")
         unknown = {str(target) for target in self.targets} - {"params", "grads", "updates", "deltas"}
         if unknown:
             raise ValueError(f"an inspection's targets are params, grads, updates and deltas, not "
@@ -74,9 +75,11 @@ class Inspection:
 
     def samples(self, step: int, accumulation: int) -> bool:
         """Whether the step that ends at `step` is sampled: each step of every `every`-th window of
-        `accumulation` steps, so the update that commits inside it is sampled wherever it commits, at
-        the window's end, early where a run on the examples clock closes its last window short, or a
-        rejected step's window later (a dynamic loss scale's), each window of steps holding one commit."""
+        `accumulation` steps, the loop's count of the steps it attempts, so the update that commits in it
+        is sampled at the window's end or early, where a run on the examples clock closes its last window
+        short. A rejected step (a non-finite loss under a dynamic loss scale) drops its window and shifts
+        the commits after it, which the loop sees only on the devices: a sampled window that then holds
+        no commit skips its sample, as often as rejections so fall."""
         return -(-step // accumulation) % self.every == 0
 
 
