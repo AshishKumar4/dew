@@ -450,7 +450,7 @@ def reusable(python: str, names: list[str], common: str) -> dict[str, str]:
     """The files of `names` whose whole row ran green on exactly these inputs (`common`, and each file's
     own, `fresh`) on any class the tasks run on (`pinned_classes`), which a task of theirs could land on,
     read at plan time with the cache's read token (`READ_TOKEN`): a task of their own would only look each
-    up and exit. Each with where its green run is kept (`green_key`'s class and key, `KEPT`'s token), which
+    up and exit. Each with where its green run is kept (`green_key`'s class and key, `KEPT_AT`'s token), which
     the plan hands the task that holds it, so no run of another commit replacing a file's last record
     between plan and task can hide it (2026-10-30: a kept task found 23 of its 259 files and ran the rest).
     None where the plan has no token or no class (Main, 2026-10-28: a lane run with most files unchanged
@@ -471,17 +471,17 @@ def reusable(python: str, names: list[str], common: str) -> dict[str, str]:
         return {name: found for name, found in zip(names, pool.map(hit, names), strict=True) if found}
 
 
-KEPT = "@"
+KEPT_AT = "@"
 """What joins a kept file's name to where its green run is kept in a plan entry's tests (`reusable`):
 `tests/test_a.py@<class>:<key>`, which the task reads (`kept_of`)."""
 
 
 def kept_of(tests: list[str]) -> tuple[list[str], dict[str, tuple[str, str]]]:
-    """A task's `tests`, each a file's name, or a kept one's with where its green run is kept (`KEPT`): the
+    """A task's `tests`, each a file's name, or a kept one's with where its green run is kept (`KEPT_AT`): the
     names, and each kept one's class and key."""
     names, kept = [], {}
     for test in tests:
-        name, _, at = test.partition(KEPT)
+        name, _, at = test.partition(KEPT_AT)
         names.append(name)
         if at:
             held, _, key = at.partition(":")
@@ -768,7 +768,7 @@ def plan(target: float, timings: dict) -> list[dict]:
                                                                   count) if names]
         for index, (names, group, weight) in enumerate(tasks, start=1):
             entries.append({"name": f"{python}-{index}", "python": python,
-                            "tests": " ".join(f"{name}{KEPT}{found[name]}" if name in found else name
+                            "tests": " ".join(f"{name}{KEPT_AT}{found[name]}" if name in found else name
                                               for name in names),
                             "split": group, "rows": [row(python, name, group) for name in names],
                             "weight": weight + (COLD_SECONDS if cache == "off" else 0.0), "cache": cache,
