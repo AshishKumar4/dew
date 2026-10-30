@@ -71,13 +71,15 @@ DSPARK = Path(__file__).parent / "fixtures" / "hf" / "deepseek-v4-dspark-tiny"
 def longrope_drafter():
     """The tiny DeepSeek V4-Flash-0731 (`DSPARK`) with its DSpark block drafter over a trunk of plain
     attention whose rotary switches tables past its sixth position (LongRoPE), the drafter's own sliding
-    V4 kind rotating under YaRN, which V4's attention takes where it refuses LongRoPE."""
+    V4 kind rotating under YaRN, which V4's attention takes where it refuses LongRoPE; its like layers
+    scanned, so each compiles once."""
     from dew.interop import Pretrained
     from dew.nn.backbones.layer_plan import LayerKind
     from dew.nn.mixers.attention import AttentionMixer
     from dew.nn.rope import LongRopeScaling, YarnScaling
 
     model = Pretrained.load(DSPARK, weights=False, dtype="float32", attention_impl="reference").model
+    model = model.clone(scan_layers=True)
     drafter = model.dspark.layer_type
     head = model.head_dim or model.emb_features // model.num_heads
     pairs = int(head * (model.partial_rotary_factor or 1.0)) // 2
