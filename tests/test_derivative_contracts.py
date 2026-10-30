@@ -724,23 +724,34 @@ def test_a_frozen_fp8_product_holds_every_order(edge):
 def int8_round_trip(values, kept: int):
     """`values` quantized to int8 and back as Qwix's absmax calibration has it: one scale per index of axis
     `kept` (an activation's example, a kernel's output feature), the absolute maximum over the rest over
-    127.5, the codes rounded and clipped to int8's."""
+    127.5, 1 where that is below the root of its dtype's least normal (Qwix's guard), the codes rounded and
+    clipped to int8's."""
     over = tuple(axis for axis in range(values.ndim) if axis != kept)
     scale = jnp.max(jnp.abs(values), axis=over, keepdims=True) / 127.5
-    scale = jnp.where(scale > 0, scale, 1)
+    scale = jnp.where(scale < jnp.sqrt(jnp.finfo(scale.dtype).tiny), 1, scale)
     return jnp.clip(jnp.round(values / scale), -128, 127) * scale
 
 
-@pytest.mark.parametrize(("groups", "edge"), [case for case in itertools.product((1, 2), EDGES)
-                                              if case != (2, "near the largest")])
+def group_peaks(x, groups: int, features: int):
+    """Each example's absolute maximum in each of `groups` feature groups of an NHWC input, 1 for an all-zero
+    group, repeated over each group's share of `features` and held from differentiation: the scale a grouped
+    quantized convolution divides its input by before it quantizes and multiplies its output by after."""
+    grouped = x.reshape(*x.shape[:-1], groups, x.shape[-1] // groups)
+    peak = jnp.max(jnp.abs(grouped), axis=(1, 2, 4))
+    peak = jnp.where(peak > 0, peak, 1)
+    return jax.lax.stop_gradient(jnp.repeat(peak, features // groups, axis=-1))[:, None, None, :]
+
+
+@pytest.mark.parametrize(("groups", "edge"), list(itertools.product((1, 2), EDGES)))
 def test_a_quantized_convolution_holds_every_order_it_takes(groups, edge):
     """A quantized convolution under Qwix's quantized training, one group and two (`quantization`'s grouped
     convolution, a custom VJP whose backward is the float convolution's transpose at the dequantized
     operands): every order it takes finite wherever float64 is a normal float32 and the convolution of the
-    operands quantized to int8 and back (each example's scale, each output feature's) is, its derivatives
-    taken straight through the rounding at the dequantized operands, as the seam declares; it takes no
+    operands quantized to int8 and back (each example's scale, each output feature's; a grouped input first
+    over each example's peak in each group, restored on that group's outputs) is, its derivatives taken
+    straight through the rounding at the dequantized operands, as the seam declares; it takes no
     forward derivative of itself, nor a second (ledger 2658), every forward derivative of its gradient
-    running. Two groups' input gradient is NaN near the largest (ledger 2717), that row's head adds it."""
+    running."""
     from dew.nn.conv import Conv
     from dew.quantization import Quantization
 
@@ -751,10 +762,13 @@ def test_a_quantized_convolution_holds_every_order_it_takes(groups, edge):
         return quantized.apply({"params": {"kernel": kernel}}, x)
 
     def plain(x, kernel):
-        held = (x + jax.lax.stop_gradient(int8_round_trip(x, 0) - x),
+        inward, outward = ((group_peaks(x, groups, width) for width in (x.shape[-1], kernel.shape[-1]))
+                           if groups > 1 else (1, 1))
+        scaled = x / inward
+        held = (scaled + jax.lax.stop_gradient(int8_round_trip(scaled, 0) - scaled),
                 kernel + jax.lax.stop_gradient(int8_round_trip(kernel, 3) - kernel))
         return jax.lax.conv_general_dilated(*held, (1, 1), "SAME", dimension_numbers=("NHWC", "HWIO", "NHWC"),
-                                            feature_group_count=groups)
+                                            feature_group_count=groups) * outward
 
     primals = normal_draw(1134, (1, 6, 6, 4), (3, 3, 4 // groups, 8), scale=EDGES[edge])
     direction = normal_draw(1135, (1, 6, 6, 4), (3, 3, 4 // groups, 8), scale=EDGES[edge])
