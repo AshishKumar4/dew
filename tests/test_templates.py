@@ -16,6 +16,19 @@ from dew.nn.kernels.templates.base import Call, Template, Unfitted, call
 from dew.nn.kernels.tuning import Unpinnable
 
 
+def test_a_tensor_memory_launch_refuses_an_automatic_mesh_axis():
+    from dew.nn.kernels.templates.mosaic_sm100 import TCGEN05
+
+    mesh = jax.sharding.AbstractMesh((2,), ("data",), axis_types=(jax.sharding.AxisType.Auto,))
+
+    def copy(source, output):
+        output[...] = source[...]
+
+    with jax.sharding.use_abstract_mesh(mesh), pytest.raises(ValueError):
+        TCGEN05.kernel(copy, out_type=jax.ShapeDtypeStruct((128,), jnp.float32), grid=(1,),
+                       grid_names=("programs",), scratch=(), interpret=True)
+
+
 @dataclasses.dataclass(frozen=True, order=True)
 class Block:
     rows: int

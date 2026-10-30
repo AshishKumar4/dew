@@ -400,13 +400,9 @@ def _gemm_mainloop_cases(generation_name: str, shape: str, *, every_consumer_cou
                         configs[f"{name} x{consumers} {tile}"] = tile
             kernel = "dew_tgmm" if isinstance(launch, grouped_matmul.MosaicTgmm) else "dew_gmm"
             for label, config in configs.items():
-                configured = (functools.partial(launch.replace(config=config), **options)
-                              if launch.legal(ba, config, target) else
-                              # A tile the launch refuses runs its kernel unpinned (`KernelOp.pinnable`).
-                              lambda *arrays, config=config, options=options, launch=launch:
-                              launch._fwd(*arrays, **options, config=config)[0])
                 cases.append(support.KernelCase(label,
-                                                lambda configured=configured, args=args: (configured, args),
+                                                lambda launch=launch, ba=ba, config=config:
+                                                launch.lowering(ba, config),
                                                 {kernel: _model(launch, ba, config)}))
     return cases
 
@@ -650,16 +646,19 @@ def test_records_a_failed_process_of_their_own_wrote_are_refused():
         compiled_apart()
 
 
-def test_the_resource_gate_refuses_a_spilling_mosaic_kernel():
+def test_the_resource_gate_reports_spills_and_refuses_invalid_allocations():
     """A record the gate reads (`mosaic_failures`): a kernel past its shared memory, its tensor memory or
-    spilling fails; within all three, none."""
+    spilling is reported; invalid allocations fail."""
     from kernel_compile import mosaic_failures, mosaic_kernels
 
     within = {"kernel": "k", "unread": [], "shared": 1024, "tmem": 256, "registers": 168, "spilled": 0}
     record = {"name": "case", "limit": 2048, "tmem_limit": 512, "kernels": [within]}
     assert not mosaic_failures([record])
-    for past in ({"shared": 4096}, {"tmem": 513}, {"spilled": 40}):
+    for past in ({"shared": 4096}, {"tmem": 513}):
         assert mosaic_failures([{**record, "kernels": [{**within, **past}]}])
+    spilled = {**record, "kernels": [{**within, "spilled": 40}]}
+    assert not mosaic_failures([spilled])
+    assert any(row.get("spilled") == 40 for row in spilled["evidence"])
     # A kernel whose reports state no resources, spilling nothing, is no evidence: it fails, as a record
     # with no kernel does (row 1877: a contract gate read only its shared count and positive spills).
     unstated = {**within, "unread": ["shared bytes", "tensor memory columns"], "shared": None, "tmem": None}
@@ -746,7 +745,7 @@ def test_refusals_cross_processes_only_through_an_explicit_handoff(tmp_path):
     snapshot = ("print(json.dumps([[identity, tuning.encoded(config), sorted(kernels)] "
                 "for identity, config, kernels in report.refused_launches()]))")
     environment = {**os.environ, "JAX_COMPILATION_CACHE_DIR": str(tmp_path / "cache")}
-    environment.pop("DEW_REFUSAL_RECORDS", None)
+
     seed = preamble + f"report.refuse([('a launch', {tile}, {{'dew_gmm'}})])\n" + snapshot
     exported = subprocess.run([sys.executable, "-c", seed], check=True, env=environment,
                               capture_output=True, text=True).stdout

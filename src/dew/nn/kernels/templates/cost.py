@@ -61,6 +61,10 @@ EXPONENTIALS_PER_CLOCK = 16
 """Base-2 exponentials a multiprocessor's special-function units return per clock (CUDA C++ Programming
 Guide, "Arithmetic Instructions" throughput table, compute capabilities 5.x to 12.x)."""
 
+REGISTER_STEP = 8
+"""Registers a thread in one allocation unit (256 registers a warp)."""
+
+
 THREAD_REGISTERS = 255
 """32-bit registers one thread may hold, compute capabilities 5.0 to 12.x (CUDA C++ Programming Guide,
 "Technical Specifications per Compute Capability"); what a kernel needs past them it spills to memory."""

@@ -26,7 +26,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import resources
+from dew.nn.kernels.templates import mosaic, resources
 from dew.nn.kernels.templates.mosaic import SWIZZLE, TILING, Ref
 
 ISSUE, READ = 0, 1
@@ -71,11 +71,9 @@ class Tcgen05:
     def kernel(entry: Callable, *, out_type, grid: tuple, grid_names: tuple, scratch: tuple,
                interpret, name: str | None = None) -> Callable:
         """`entry` as a program of `WARPGROUPS` warpgroups (axis 'wg'), its kernel named `name`."""
-        return plgpu.kernel(
-            entry, out_type=out_type, grid=grid, grid_names=grid_names, num_threads=WARPGROUPS,
-            thread_name="wg", scratch_types=scratch,
-            compiler_params=plgpu.CompilerParams(lowering_semantics=plgpu.LoweringSemantics.Warpgroup),
-            interpret=interpret, kernel_name=name)
+        return mosaic.kernel(entry, out_type=out_type, grid=grid, grid_names=grid_names,
+                             warpgroups=WARPGROUPS, family=Tcgen05.name, scratch=scratch,
+                             interpret=interpret, name=name)
 
     @staticmethod
     def roles(load: Callable[[], None], products: Callable[[], None], read: Callable[[], None]) -> None:
