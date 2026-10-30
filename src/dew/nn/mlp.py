@@ -250,8 +250,8 @@ class GatedMLP(nn.Module):
         dtype (dory.py:188-194)."""
         factor = ngpt.hidden(self.out_features)
         wide = at_least_fp32(jnp.result_type(gate, up))
-        gate = (gate.astype(wide) * gain(self.suv_gate, factor)).astype(gate.dtype)
-        up = (up.astype(wide) * gain(self.suv_up, factor)).astype(up.dtype)
+        gate = (gate.astype(wide) * gain(self.suv_gate, factor, wide)).astype(gate.dtype)
+        up = (up.astype(wide) * gain(self.suv_up, factor, wide)).astype(up.dtype)
         hidden = gated_product(activation, axes=self._axes(gate))(gate.astype(wide), up.astype(wide))
         return l2norm(hidden.astype(gate.dtype))
 

@@ -875,15 +875,15 @@ def assert_decodes_as_recorded(stored, site: str, model: CausalTransformer, weig
         return jax.tree.map(np.asarray, rows(programs, jax.device_put(symmetric(weights, config, order))))
 
     # The float64 arm on the default device, a GPU's float64 units where one runs the test, its kernels
-    # chosen as a CPU's, the portable math: its weights kept on the host and placed for a call alone, so
-    # the device never holds them beside an order's.
+    # chosen as a CPU's, the portable math: its weights kept on the host as stored and placed for a call
+    # alone, so the device never holds them beside an order's, each widened exactly where a product
+    # reads it, so the 4B's float64 run fits a 40 GB A100 beside its cache.
     with jax.enable_x64(new_val=True), generation.assumed('cpu'):
         wide_programs = decoding(model.clone(dtype=jnp.float64))
-    held = widened(weights)
 
     def truth(order):
         with jax.enable_x64(new_val=True), generation.assumed('cpu'):
-            return rows(wide_programs, jax.device_put(held))
+            return rows(wide_programs, jax.device_put(weights))
 
     truth.dew_programs = True
     seeds = int(stored[f'{site}.seeds'])

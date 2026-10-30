@@ -13,6 +13,7 @@ import math
 
 import jax
 import jax.numpy as jnp
+from jax.typing import DTypeLike
 
 from dew.nn.precision import at_least_fp32, l2norm
 
@@ -81,7 +82,10 @@ def stepped(residual: jax.Array, branch: jax.Array, alpha: jax.Array, scale: flo
     return l2norm(start + rate * (end - start)).astype(residual.dtype)
 
 
-def gain(scale: jax.Array, factor: float) -> jax.Array:
+def gain(scale: jax.Array, factor: float, dtype: DTypeLike | None) -> jax.Array:
     """A learned per-feature gain stored at the initializer's scale, as the multiplier it stands for in
-    at least fp32: `scale * factor` (nGPT's s_qk, s_u, s_v and s_z, and Dory's output-gate scale)."""
-    return scale.astype(at_least_fp32(scale.dtype)) * factor
+    at least fp32 of its own dtype and the computation's `dtype`: `scale * factor` (nGPT's s_qk, s_u,
+    s_v and s_z, and Dory's output-gate scale), so a float64 run over a narrower stored gain takes its
+    product in float64."""
+    wide = scale.dtype if dtype is None else jnp.promote_types(scale.dtype, dtype)
+    return scale.astype(at_least_fp32(wide)) * factor

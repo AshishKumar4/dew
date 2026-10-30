@@ -1314,7 +1314,7 @@ class CausalTransformer(nn.Module):
 
     def _token_gains(self) -> jax.Array | None:
         """nGPT's fp32 per-token gain on the logits, past the head's product; None without one."""
-        return None if self.ngpt is None else gain(self.logit_scale, self.ngpt.logits)
+        return None if self.ngpt is None else gain(self.logit_scale, self.ngpt.logits, self.dtype)
 
     def mtp_hidden_states(self, hidden, tokens, train: bool = False, input_embeddings=None,
                           image_groups=None, block_groups=None, rotary_positions=None,

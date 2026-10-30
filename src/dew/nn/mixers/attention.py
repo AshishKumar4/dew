@@ -436,7 +436,7 @@ class CausalSelfAttention(nn.Module):
     def _ngpt_rotated(self, ngpt: NGPT, query, key):
         """The rotated query and key heads on the unit sphere, the query times the square of its
         learned gain, in at least fp32 and back to its dtype (dory.py:139-149)."""
-        heads = gain(self.sqk, ngpt.query(self.ctx.head_dim))
+        heads = gain(self.sqk, ngpt.query(self.ctx.head_dim), query.dtype)
         heads = heads.reshape(self.ctx.num_heads, self.ctx.head_dim)
         query = (jnp.square(heads) * l2norm(query).astype(at_least_fp32(query.dtype))).astype(query.dtype)
         return query, l2norm(key)
@@ -1415,7 +1415,7 @@ class CausalSelfAttention(nn.Module):
             # nGPT scales the gate's logits by the square of their learned gain, gates in at least
             # fp32 and unit-norms the gated heads together (dory.py:154-157).
             wide = at_least_fp32(jnp.result_type(gate, attention))
-            scale = gain(self.s_gate, self.ctx.ngpt.gate(self.ctx.emb_features))
+            scale = gain(self.s_gate, self.ctx.ngpt.gate(self.ctx.emb_features), wide)
             logits = gate.astype(wide) * jnp.square(scale).reshape(self.ctx.num_heads, self.ctx.head_dim)
             attention = (attention.astype(wide) * jax.nn.sigmoid(logits)).astype(attention.dtype)
         elif gate is not None:
