@@ -44,6 +44,7 @@ from flax import linen as nn, struct
 from dew.diffusion.process import Denoiser
 from dew.diffusion.schedules import expand
 from dew.nn.precision import compensated_add, two_product
+from dew.sampling.solvers.common import given
 
 Predict = Callable[[jax.Array, jax.Array], tuple[jax.Array, jax.Array]]
 # A step's index in its walk: traced inside the walk's scan, a Python int at
@@ -241,7 +242,7 @@ class CFGPlusPlus:
     interval: tuple[float, float] = struct.field(pytree_node=False, default=(0.0, 1.0))
 
     def __post_init__(self):
-        if not isinstance(self.scale, jax.Array) and not 0.0 <= self.scale <= 1.0:
+        if given(self.scale) and not 0.0 <= self.scale <= 1.0:
             raise ValueError(f"CFG++ interpolates with a scale in [0, 1], got {self.scale}")
         object.__setattr__(self, "interval", _interval(self.interval))
 
