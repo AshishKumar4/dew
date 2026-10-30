@@ -44,6 +44,7 @@ from dew.decision.layout import (
 )
 from dew.decision.model import DecisionModel
 from dew.decision.objective import DecisionObjective
+from dew.decision.renderer import Unit
 from dew.decision.scoring import default_metrics
 from dew.decision.task import Decide
 from dew.nn.backbones.decoder_block import remat_policy
@@ -144,6 +145,13 @@ class DecisionRunConfig(DecoderRunConfig):
     """Which of the row's streams each reads (`Reads`), where its `segments` name a stream of the row's
     own (`Schema(stream=...)`, `Instructions(stream=...)`): two streams in one pass, the state reading
     the schema and the schema itself alone, are its table. None reads the row in order."""
+    parallel: bool | None = None
+    """Whether a question row reads its options in parallel, each at positions of its own after the
+    question (`QuestionLayout.parallel`), which a head that reads option slots needs. None keeps the
+    layout's own."""
+    unit: Unit | None = None
+    """How a question row's `segments` encode their text, piece by piece or whole
+    (`QuestionLayout.unit`). None keeps the layout's own, piece by piece."""
     order: RowOrder | None = None
     """The order a question row's own text writes its parts in (`QuestionLayout.order`): the state
     first, the question first, or the state, the question and the state again (`re_read`), each part as
@@ -230,7 +238,7 @@ class DecisionRunConfig(DecoderRunConfig):
         budgets = {"max_len": self.max_len, "head_max_len": self.head_max_len,
                    "option_tokens": self.option_tokens, "max_state_tokens": self.max_state_tokens,
                    "framing": self.framing, "segments": self.segments, "reads": self.reads,
-                   "order": self.order, "split": self.split}
+                   "parallel": self.parallel, "unit": self.unit, "order": self.order, "split": self.split}
         self._refuse_unread_context()
         derived = {}
         if self.context_layers is not None:
