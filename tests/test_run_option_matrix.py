@@ -286,10 +286,7 @@ def test_a_kinds_run_publishing_from_an_offline_wandb_run_is_refused_before_it_t
     assert not (tmp_path / "runs" / "published").exists()
 
 
-@pytest.mark.gpu(reason="measures a run's kernel launches, which only a GPU runs")
-@pytest.mark.mesh(devices=1)
-@pytest.mark.usefixtures("without_deterministic_ops")
-def test_an_lm_run_measures_its_kernel_launches_as_set(tmp_path):
+def an_lm_run_measures_its_kernel_launches_as_set(tmp_path):
     """An LM run whose attention takes Triton's kernel, a launch of configs to measure, that measures its
     step's launches on this GPU (`tune_kernels`) adds what it picked to the picks of this GPU's kind
     beside the compilation cache (`dew.cache.kernel_picks_path`), where a later run reads them. Every

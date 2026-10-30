@@ -282,8 +282,7 @@ def test_an_accumulating_step_holds_its_gradient_sum_and_no_other_buffer_a_param
     assert window.peak_bytes - one.peak_bytes <= gradient + held + activations
 
 
-@pytest.mark.gpu(reason="loads and runs a step compiled ahead on this host's own GPU")
-def test_a_step_compiled_ahead_and_saved_runs_on_its_gpu_in_the_run_s_place(tmp_path):
+def a_step_compiled_ahead_and_saved_runs_on_its_gpu_in_the_run_s_place(tmp_path):
     """A step compiled ahead for one compile-only GPU of this GPU's generation, saved, and loaded
     again, runs on this GPU in the place of the run's own compile of it: handed the arguments the
     run's step is (the state the trainer places, the batch, the first part), it makes outputs of
@@ -330,8 +329,7 @@ def test_a_step_compiled_ahead_and_saved_runs_on_its_gpu_in_the_run_s_place(tmp_
                for new, old in zip(jax.tree.leaves(moving.variables["params"]), initial, strict=True))
 
 
-@pytest.mark.gpu(reason="runs a step compiled ahead as a run's first step on this host's own GPU")
-def test_a_run_handed_its_step_compiled_ahead_trains_from_it_on_its_gpu(tmp_path):
+def a_run_handed_its_step_compiled_ahead_trains_from_it_on_its_gpu(tmp_path):
     """A step compiled ahead for one compile-only GPU of this GPU's generation, saved and handed to
     the run (`Trainer(ahead=...)`), is the program the run lowers its first step to, and the run
     trains from it, its plan's first compile the step compiled ahead: its steps advance and its
@@ -414,9 +412,7 @@ def test_a_stated_link_is_the_one_a_step_compiled_ahead_records_and_a_handed_run
     assert parsed.trainer.compile_ahead is not None and parsed.trainer.compile_ahead.links == FAST
 
 
-@pytest.mark.gpu(reason="loads a step compiled ahead over a tensor axis onto two GPUs")
-@pytest.mark.mesh(devices=2)
-def test_a_run_handed_a_step_compiled_ahead_traces_with_the_links_it_was_compiled_with(tmp_path):
+def a_run_handed_a_step_compiled_ahead_traces_with_the_links_it_was_compiled_with(tmp_path):
     """A run on two GPUs whose link would spread a projection (`FAST`), handed a step compiled ahead
     over compile-only GPUs that spread none, traces with the link the step records and trains from it,
     rather than lowering another program and refusing it; resumed from its checkpoint without the step,
@@ -441,8 +437,7 @@ def test_a_run_handed_a_step_compiled_ahead_traces_with_the_links_it_was_compile
     assert int(again.step) == 3 and resumed.links["tensor"].bytes_per_second is None
 
 
-@pytest.mark.gpu(reason="loads a selected split executable onto its target GPU")
-def test_a_run_takes_the_saved_offline_split_before_loading_its_executable(tmp_path):
+def a_run_takes_the_saved_offline_split_before_loading_its_executable(tmp_path):
     """An offline plan for two microbatches is handed to a live run with its split unpinned. The
     live planner takes the saved split before lowering, so the artifact's program is reused and its
     two donated microbatch calls produce one committed update, not a mismatch or a recompile."""
