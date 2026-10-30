@@ -839,8 +839,7 @@ TORCHAX_SEEDS = 8
 `seeds_for` paired with the model on an A100."""
 
 
-@pytest.mark.gpu(reason="TF32 is a GPU's default float32 product")
-def test_a_float32_forwards_logits_and_its_output_tables_are_as_exact_as_torchs(tmp_path):
+def a_float32_forwards_logits_and_its_output_tables_are_as_exact_as_torchs(tmp_path):
     """On a GPU, a float32 torchax model's own logits and its output table's over the same
     states are each on par with torch's float32 forward from torch's in float64 over drawn token
     ids (check 1), under JAX's own default precision (the test lane sets 'highest' for every

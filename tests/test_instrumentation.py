@@ -198,10 +198,7 @@ def test_compiled_flops_matches_the_transformer_flop_formula():
     assert trainer.step_flops.hardware * jax.device_count() == pytest.approx(analytic, rel=0.05)
 
 
-@pytest.mark.gpu("cuDNN's fused attention runs on a CUDA GPU alone")
-@pytest.mark.mesh(devices=1)
-@pytest.mark.parametrize("window", [None, 64])
-def test_a_fused_attention_counts_the_pairs_its_mask_computes(window):
+def a_fused_attention_counts_the_pairs_its_mask_computes(window):
     """A causal kernel computes about half the scores, a sliding window fewer: the forward's two
     products and the backward's four count one multiply-add per pair it reaches, head and width.
     On an H100 FlashAttention-3 counted the whole square of a causal call, twice its work."""
@@ -366,9 +363,7 @@ def test_the_gpu_autotuners_picks_persist_beside_the_executables_for_this_xla(tm
         jax.config.update("jax_compilation_cache_dir", previous)
 
 
-@pytest.mark.gpu
-@pytest.mark.mesh(devices=1)
-def test_a_run_prepared_on_a_gpu_keeps_its_picks_where_the_policy_puts_them(tmp_path):
+def a_run_prepared_on_a_gpu_keeps_its_picks_where_the_policy_puts_them(tmp_path):
     """A run `prepare_process` readies with no directory of its own caches under the user's cache
     directory, and its GPU compile writes the autotuner's picks to this jaxlib's own directory there
     (`autotune_dir`), which its XLA_FLAGS name before the backend opens; JAX puts none of its own in

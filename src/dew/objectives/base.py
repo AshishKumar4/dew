@@ -13,6 +13,7 @@ reports. These values are JAX pytrees.
 
 from __future__ import annotations
 
+import contextlib
 import enum
 import functools
 import math
@@ -47,6 +48,7 @@ from dew.artifacts import Artifact, Artifacts, TokenScores
 from dew.batch import EXAMPLE_ROWS, FROZEN, VALID_ROWS, Batch, PathFilter, Variables, dicts, everything, part
 from dew.distributed.placement import Layout, RefinesLayout
 from dew.nn import categorical
+from dew.nn.inspection import INSPECTED, Watched, watching
 from dew.nn.kernels.options import Held, Option, compiler_options
 from dew.nn.precision import Numerics, accumulated, at_least_fp32, compensated_sum, weighted_total
 from dew.nn.progress import END, Progress, ReadsProgress
@@ -299,6 +301,18 @@ class Step:
     """Whether the run's optimizer reads the step's attention logit maxima (`dew.optim.clips_qk`, its
     QK-Clip): the objective opens the `qk` collection in the model calls it trains through and returns
     what they sowed (`Aux.qk_stats`). Static, as opening a collection changes the program."""
+    watched: Watched | None = struct.field(pytree_node=False, default=None)
+    """The activations a sampled step watches (`dew.nn.inspection.watching`): the objective opens the
+    `inspected` collection in the model call it trains through and returns what it sowed
+    (`Aux.inspected`). None on every other step; static, as `qk_stats` is."""
+
+    def sown(self, *collections: str) -> list[str]:
+        """The collections a model call the objective trains through opens: `collections`, the ones its
+        objective reads, and those the step asks for, `qk` where the optimizer clips by it and
+        `inspected` where the step watches activations. A call opening none returns an empty mapping
+        beside its output."""
+        return [*collections, *(["qk"] if self.qk_stats else []),
+                *([INSPECTED] if self.watched is not None else [])]
 
     def places(self, rows: int) -> tuple[jax.Array, int]:
         """The places among the update's examples of a batch's `rows` rows (`examples`) and how many
@@ -431,6 +445,9 @@ class Aux(Generic[Effects]):
     clips by it refuses a step that returns None."""
     effects: Effects | None = None
     """Additive observations that `Objective.apply_effects` applies once per optimizer commit."""
+    inspected: Variables | None = None
+    """What the watched modules of the model call the objective trains through sowed
+    (`dew.nn.inspection.INSPECTED`), where the step watches (`Step.watched`); None otherwise."""
     record: Evaluated | Recorded | None = None
     """What a recording evaluation's `Step.sample` and `Step.boundary` calls produced (`Step.record`),
     which `Objective._loss` fills (`Evaluated`) and a transaction stacks with its replays' (`Recorded`);
@@ -1176,8 +1193,14 @@ class Objective(ABC, Generic[Loss, Effects]):
         step = step if witness is None else replace(step, witness=witness)
         if not (self.passes_progress or validation):
             self._refuse_unpassed_progress()
-        # A validation's step is no training step, so its model reads the run's end (`progress`).
-        loss = (self.validation_loss if validation else self.loss)(variables, batch, step)
+        if validation:
+            # A validation's step is no training step, so its model reads the run's end (`progress`).
+            loss = self.validation_loss(variables, batch, step)
+        else:
+            watched = step.watched
+            with (watching(watched.kinds, histogram=watched.histogram) if watched
+                  else contextlib.nullcontext()):
+                loss = self.loss(variables, batch, step)
         if _has_aux(loss):
             stats, aux = loss
         else:
@@ -1187,6 +1210,22 @@ class Objective(ABC, Generic[Loss, Effects]):
             places = jnp.zeros((0,), jnp.int32) if step.example_index is None else step.example_index
             aux = replace(aux, record=witness.report(marked, places))
         return stats, aux
+
+    @staticmethod
+    def watched_forward(step: Step, model: nn.Module, variables: Variables, *args,
+                        **kwargs) -> Variables | None:
+        """What the watched modules sow in one forward of `model` at these arguments where the step
+        watches (`Step.watched`), else None: for an objective whose training forward runs inside a
+        transform that returns none of its collections (a `jax.jvp`, a `lax.cond`), the forward at the
+        step's own inputs, its weights held out of the backward. The same computation as the trained
+        forward's at those inputs, in the same computation (a `jax.jvp`'s primal is), XLA computes it
+        once with it: a sampled step runs the unsampled's matmuls alone. A forward inside a scan or a
+        `lax.cond` branch, which XLA does not merge with one outside it, returns its own collections
+        through it instead (Flow-GRPO's, `dew.sampling.guidance.Guidance`; rCM's phases)."""
+        if step.watched is None:
+            return None
+        _, sown = model.apply(jax.lax.stop_gradient(variables), *args, mutable=[INSPECTED], **kwargs)
+        return sown.get(INSPECTED, {})
 
     def reduce_loss(self, stats: Loss) -> tuple[jax.Array, jax.Array]:
         """Return the objective value of summed statistics and whether they have any mass.
