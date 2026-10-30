@@ -2,64 +2,64 @@
  "step": 2,
  "compute": "float32",
  "products": {
-  "": [
+  "DiffusionGemma": [
    "float64"
   ],
-  "self_conditioning/down_proj": [
+  "DiffusionGemma/self_conditioning/down_proj": [
    "float64"
   ],
-  "self_conditioning/gate_proj": [
+  "DiffusionGemma/self_conditioning/gate_proj": [
    "float64"
   ],
-  "self_conditioning/up_proj": [
+  "DiffusionGemma/self_conditioning/up_proj": [
    "float64"
   ],
-  "text": [
+  "DiffusionGemma/text": [
    "float64"
   ],
-  "text/layers_0/mlp/down_proj": [
+  "DiffusionGemma/text/layers_0/mlp/down_proj": [
    "float64"
   ],
-  "text/layers_0/mlp/gate_proj": [
+  "DiffusionGemma/text/layers_0/mlp/gate_proj": [
    "float64"
   ],
-  "text/layers_0/mlp/up_proj": [
+  "DiffusionGemma/text/layers_0/mlp/up_proj": [
    "float64"
   ],
-  "text/layers_0/self_attn": [
+  "DiffusionGemma/text/layers_0/self_attn": [
    "float64"
   ],
-  "text/layers_0/self_attn/k_proj": [
+  "DiffusionGemma/text/layers_0/self_attn/k_proj": [
    "float64"
   ],
-  "text/layers_0/self_attn/o_proj": [
+  "DiffusionGemma/text/layers_0/self_attn/o_proj": [
    "float64"
   ],
-  "text/layers_0/self_attn/q_proj": [
+  "DiffusionGemma/text/layers_0/self_attn/q_proj": [
    "float64"
   ],
-  "text/layers_0/self_attn/v_proj": [
+  "DiffusionGemma/text/layers_0/self_attn/v_proj": [
    "float64"
   ],
-  "text/layers_1/mlp/down_proj": [
+  "DiffusionGemma/text/layers_1/mlp/down_proj": [
    "float64"
   ],
-  "text/layers_1/mlp/gate_proj": [
+  "DiffusionGemma/text/layers_1/mlp/gate_proj": [
    "float64"
   ],
-  "text/layers_1/mlp/up_proj": [
+  "DiffusionGemma/text/layers_1/mlp/up_proj": [
    "float64"
   ],
-  "text/layers_1/self_attn": [
+  "DiffusionGemma/text/layers_1/self_attn": [
    "float64"
   ],
-  "text/layers_1/self_attn/k_proj": [
+  "DiffusionGemma/text/layers_1/self_attn/k_proj": [
    "float64"
   ],
-  "text/layers_1/self_attn/o_proj": [
+  "DiffusionGemma/text/layers_1/self_attn/o_proj": [
    "float64"
   ],
-  "text/layers_1/self_attn/q_proj": [
+  "DiffusionGemma/text/layers_1/self_attn/q_proj": [
    "float64"
   ]
  },

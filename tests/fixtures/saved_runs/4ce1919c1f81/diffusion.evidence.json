@@ -2,57 +2,57 @@
  "step": 2,
  "compute": "bfloat16",
  "products": {
-  "conditioning/text_context_proj": [
+  "SimpleDiT/conditioning/text_context_proj": [
    "bfloat16",
    "float64"
   ],
-  "conditioning/time_embed/layers_1/DenseGeneral_0": [
+  "SimpleDiT/conditioning/time_embed/layers_1/DenseGeneral_0": [
    "bfloat16",
    "float64"
   ],
-  "conditioning/time_embed/layers_1/DenseGeneral_1": [
+  "SimpleDiT/conditioning/time_embed/layers_1/DenseGeneral_1": [
    "bfloat16",
    "float64"
   ],
-  "conditioning/time_embed/layers_2": [
+  "SimpleDiT/conditioning/time_embed/layers_2": [
    "bfloat16",
    "float64"
   ],
-  "dit_block_0/ada_params_module/ada_proj": [
+  "SimpleDiT/dit_block_0/ada_params_module/ada_proj": [
    "bfloat16",
    "float64"
   ],
-  "dit_block_0/attention": [
+  "SimpleDiT/dit_block_0/attention": [
    "bfloat16"
   ],
-  "dit_block_0/attention/to_k": [
+  "SimpleDiT/dit_block_0/attention/to_k": [
    "bfloat16",
    "float64"
   ],
-  "dit_block_0/attention/to_out_0": [
+  "SimpleDiT/dit_block_0/attention/to_out_0": [
    "bfloat16",
    "float64"
   ],
-  "dit_block_0/attention/to_q": [
+  "SimpleDiT/dit_block_0/attention/to_q": [
    "bfloat16",
    "float64"
   ],
-  "dit_block_0/attention/to_v": [
+  "SimpleDiT/dit_block_0/attention/to_v": [
    "bfloat16",
    "float64"
   ],
-  "dit_block_0/mlp/down_proj": [
+  "SimpleDiT/dit_block_0/mlp/down_proj": [
    "bfloat16",
    "float64"
   ],
-  "dit_block_0/mlp/up_proj": [
+  "SimpleDiT/dit_block_0/mlp/up_proj": [
    "bfloat16",
    "float64"
   ],
-  "embed/patch_embed/Conv_0": [
+  "SimpleDiT/embed/patch_embed/Conv_0": [
    "float64"
   ],
-  "output/final_proj": [
+  "SimpleDiT/output/final_proj": [
    "bfloat16",
    "float64"
   ]

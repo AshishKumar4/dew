@@ -6,7 +6,8 @@ The task loads at the step named, else its run's default, and answers one reques
 JAX writing the StableHLO of each program it lowers (`jax_dump_ir_to`): a fresh process holds no
 program another task compiled, so every one lowers. Each Flax module method the request runs is
 intercepted (`flax.linen.intercept_methods`) to name its scope in the name stack (`SCOPE`): the path
-of the variables it reads, a shared scope's its owner's, whatever its class or method. Each module is
+of the variables it reads, a shared scope's its owner's, whatever its class or method, beneath the
+class of the root it was applied from. Each module is
 parsed into MLIR objects, and each `stablehlo.dot_general` read for its operands' element types and
 the innermost scope its location names."""
 
@@ -36,9 +37,14 @@ DTYPES = {"bf16": "bfloat16", "f16": "float16", "f32": "float32", "f64": "float6
 
 
 def scoped(next_fun, args, kwargs, context):
-    """A module method run under a name naming its variable scope's path (`SCOPE`)."""
-    scope = context.module.scope
-    with jax.named_scope(SCOPE + "|".join(() if scope is None else scope.path)):
+    """A module method run under a name naming its variable scope's path (`SCOPE`), beneath its root's
+    class: a request may apply several roots, each over its own tree of variables (a decision model's
+    backbone and head), whose scopes' paths alone would read alike."""
+    module, scope = context.module, context.module.scope
+    while isinstance(module.parent, nn.Module):
+        module = module.parent
+    path = (type(module).__name__, *(() if scope is None else scope.path))
+    with jax.named_scope(SCOPE + "|".join(path)):
         return next_fun(*args, **kwargs)
 
 

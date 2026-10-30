@@ -5,91 +5,91 @@
   "": [
    "float64"
   ],
-  "layers_0/mlp/down_proj": [
+  "CausalTransformer/layers_0/mlp/down_proj": [
    "float64"
   ],
-  "layers_0/mlp/gate_up_proj": [
+  "CausalTransformer/layers_0/mlp/gate_up_proj": [
    "float64"
   ],
-  "layers_0/self_attn": [
+  "CausalTransformer/layers_0/self_attn": [
    "float64"
   ],
-  "layers_0/self_attn/in_proj_a": [
+  "CausalTransformer/layers_0/self_attn/in_proj_a": [
    "float64"
   ],
-  "layers_0/self_attn/in_proj_b": [
+  "CausalTransformer/layers_0/self_attn/in_proj_b": [
    "float64"
   ],
-  "layers_0/self_attn/in_proj_qkv": [
+  "CausalTransformer/layers_0/self_attn/in_proj_qkv": [
    "float64"
   ],
-  "layers_0/self_attn/in_proj_z": [
+  "CausalTransformer/layers_0/self_attn/in_proj_z": [
    "float64"
   ],
-  "layers_0/self_attn/out_proj": [
+  "CausalTransformer/layers_0/self_attn/out_proj": [
    "float64"
   ],
-  "layers_1/mlp/down_proj": [
+  "CausalTransformer/layers_1/mlp/down_proj": [
    "float64"
   ],
-  "layers_1/mlp/gate_up_proj": [
+  "CausalTransformer/layers_1/mlp/gate_up_proj": [
    "float64"
   ],
-  "layers_1/self_attn": [
+  "CausalTransformer/layers_1/self_attn": [
    "float64"
   ],
-  "layers_1/self_attn/in_proj_a": [
+  "CausalTransformer/layers_1/self_attn/in_proj_a": [
    "float64"
   ],
-  "layers_1/self_attn/in_proj_b": [
+  "CausalTransformer/layers_1/self_attn/in_proj_b": [
    "float64"
   ],
-  "layers_1/self_attn/in_proj_qkv": [
+  "CausalTransformer/layers_1/self_attn/in_proj_qkv": [
    "float64"
   ],
-  "layers_1/self_attn/in_proj_z": [
+  "CausalTransformer/layers_1/self_attn/in_proj_z": [
    "float64"
   ],
-  "layers_1/self_attn/out_proj": [
+  "CausalTransformer/layers_1/self_attn/out_proj": [
    "float64"
   ],
-  "layers_2/mlp/down_proj": [
+  "CausalTransformer/layers_2/mlp/down_proj": [
    "float64"
   ],
-  "layers_2/mlp/gate_up_proj": [
+  "CausalTransformer/layers_2/mlp/gate_up_proj": [
    "float64"
   ],
-  "layers_2/self_attn": [
+  "CausalTransformer/layers_2/self_attn": [
    "float64"
   ],
-  "layers_2/self_attn/in_proj_a": [
+  "CausalTransformer/layers_2/self_attn/in_proj_a": [
    "float64"
   ],
-  "layers_2/self_attn/in_proj_b": [
+  "CausalTransformer/layers_2/self_attn/in_proj_b": [
    "float64"
   ],
-  "layers_2/self_attn/in_proj_qkv": [
+  "CausalTransformer/layers_2/self_attn/in_proj_qkv": [
    "float64"
   ],
-  "layers_2/self_attn/in_proj_z": [
+  "CausalTransformer/layers_2/self_attn/in_proj_z": [
    "float64"
   ],
-  "layers_2/self_attn/out_proj": [
+  "CausalTransformer/layers_2/self_attn/out_proj": [
    "float64"
   ],
-  "layers_3/mlp/down_proj": [
+  "CausalTransformer/layers_3/mlp/down_proj": [
    "float64"
   ],
-  "layers_3/mlp/gate_up_proj": [
+  "CausalTransformer/layers_3/mlp/gate_up_proj": [
    "float64"
   ],
-  "layers_3/self_attn": [
+  "CausalTransformer/layers_3/self_attn": [
    "float64"
   ],
-  "layers_3/self_attn/o_proj": [
+  "CausalTransformer/layers_3/self_attn/o_proj": [
    "float64"
   ],
-  "layers_3/self_attn/qkv_proj": [
+  "CausalTransformer/layers_3/self_attn/qkv_proj": [
    "float64"
   ]
  },
