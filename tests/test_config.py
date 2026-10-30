@@ -642,6 +642,8 @@ def test_every_run_kind_reads_its_source_options_from_the_command_line(kind):
                                        attention={"full_attention": "block_bidirectional"})
     keywords = run.source_keywords(frozen=False)
     assert keywords["text_only"] is True and keywords["prediction_depths"] == 0 and keywords["on_host"]
+    # A source the run trains is stored in its master weights' dtype, one it keeps frozen as stored.
+    assert keywords["param_dtype"] == "float32" and run.source_keywords(frozen=True)["param_dtype"] == "auto"
     assert keywords["modeling_overrides"] == {"attention": {"full_attention": "block_bidirectional"}}
     assert type(run).from_dict(run.to_dict()).source == run.source
 
