@@ -272,7 +272,7 @@ def _coefficients(ns_coeffs, ns_steps: int) -> jax.Array:
     """The Newton-Schulz coefficients optax's Muon iterates by for `ns_coeffs`, a preset's name (`"dion"`,
     or Dew's `"polar_express"`, `polar_express`) or one triple or a schedule of them, as the state it
     builds holds them: its last `ns_steps` triples of a schedule."""
-    if ns_coeffs == "polar_express":
+    if isinstance(ns_coeffs, str) and ns_coeffs == "polar_express":
         ns_coeffs = polar_express(ns_steps)
     template = {"matrix": jnp.zeros((1, 1))}
     state = optax.contrib.muon(0.0, ns_coeffs=ns_coeffs, ns_steps=ns_steps).init(template)
@@ -341,13 +341,15 @@ def scale_by_neuron_norm(beta2: float = 0.95, eps: float = 1e-10, per_head: Mapp
         moments = jax.tree.leaves(state)
         normed, kept = [], []
         for (matrices, back), moment, width in zip(stacks(updates), moments, widths, strict=True):
-            neuron = beta2 * moment + (1 - beta2) * jnp.mean(jnp.square(matrices.astype(jnp.float32)), axis=1)
-            divided = matrices / (jnp.sqrt(neuron)[:, None, :] + eps).astype(matrices.dtype)
-            blocks, blocked = headed(matrices, width), headed(divided, width)
+            # In float32 at least, so a neuron's guard and a block's squared sums hold in a half dtype.
+            working = matrices.astype(jnp.promote_types(matrices.dtype, jnp.float32))
+            neuron = beta2 * moment + (1 - beta2) * jnp.mean(jnp.square(working), axis=1)
+            divided = working / (jnp.sqrt(neuron)[:, None, :] + eps)
+            blocks, blocked = headed(working, width), headed(divided, width)
             norm = (jnp.linalg.norm(blocks[0], axis=(1, 2), keepdims=True)
                     / (jnp.linalg.norm(blocked[0], axis=(1, 2), keepdims=True) + eps))
-            normed.append(back(blocked[1](blocked[0] * norm.astype(matrices.dtype))))
-            kept.append(neuron)
+            normed.append(back(blocked[1](blocked[0] * norm)).astype(matrices.dtype))
+            kept.append(neuron.astype(jnp.float32))
         return jax.tree.unflatten(structure, normed), jax.tree.unflatten(jax.tree.structure(state), kept)
     return optax.GradientTransformation(init_fn, update_fn)
 
