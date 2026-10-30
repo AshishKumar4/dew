@@ -178,8 +178,8 @@ def _minimax_export(model: CausalTransformer) -> Mapping[str, object]:
                          "states one")
     mixture = model.mixture
     return {
-        'layer_types': ['linear_attention' if isinstance(model.mixer_of(index), LightningAttentionMixer)
-                        else 'full_attention' for index in range(model.num_layers)],
+        'layer_types': ['linear_attention' if isinstance(model.kind_of(kind).mixer, LightningAttentionMixer)
+                        else 'full_attention' for kind in model.per_layer_types],
         'postnorm': model.normed_residual,
         **dict.fromkeys(_FACTORS['alpha'], model.stream_multiplier),
         **dict.fromkeys(_FACTORS['beta'], model.residual_multiplier),
