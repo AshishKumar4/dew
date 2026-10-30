@@ -48,7 +48,7 @@ from flax.typing import Dtype, PrecisionLike
 from dew.batch import prefix_sum, real_places, valid_order
 from dew.nn.dense import Dense
 
-from .inputs import coordinates_of
+from .inputs import PLAIN_CALL, MixerCall, coordinates_of
 from .linear import DepthwiseConv1d, held_conv1d
 from .norms import RMSNorm
 from .precision import at_least_fp32, float32_dot_general, rms_statistics
@@ -314,7 +314,7 @@ class EngramLayer(nn.Module):
     `embed` `[rows, head_dim]` is the release's `engram.embed.weight`; `wkv`
     projects a position's looked-up rows to `hc_mult` keys and one value; `q_weight`
     and `k_weight` `[hc_mult, D]` only ever act as their product. A media position of
-    the call (`metadata.media`) takes no contribution (model.py:351-365).
+    the call (`call.metadata.media`) takes no contribution (model.py:351-365).
     """
 
     rows: int
@@ -326,8 +326,9 @@ class EngramLayer(nn.Module):
     precision: PrecisionLike = None
 
     @nn.compact
-    def __call__(self, streams, hash_ids, metadata=None, *, decode: bool = False):
-        token_mask = None if metadata is None or metadata.media is None else ~metadata.media
+    def __call__(self, streams, hash_ids, call: MixerCall = PLAIN_CALL):
+        media = None if call.metadata is None else call.metadata.media
+        token_mask = None if media is None else ~media
         # The rows are gathered from the table in its storage dtype and cast
         # after, so the table itself is never cast whole.
         table = nn.Embed(self.rows, self.head_dim, embedding_init=nn.initializers.normal(1.0), name='embed')
@@ -366,9 +367,9 @@ class PLELayer(nn.Module):
     again, run through a causal depthwise conv of `kernel_size` taps
     `dilation` apart and a SiLU, which the gated values themselves join. The
     three norms take each stream's own statistics under one `(1 + w)` weight
-    (`RMSNorm(groups=hc_mult)`). The call's padded slots (`metadata`) add
+    (`RMSNorm(groups=hc_mult)`). The call's padded slots (`call.metadata`) add
     nothing and the conv steps over them and across no document's start
-    (modeling_qwen4_exp.py:1176-1190); under `decode` the conv's last
+    (modeling_qwen4_exp.py:1176-1190); under `call.decode` the conv's last
     `(kernel_size - 1) * dilation` inputs wait in the `cache` collection's
     `conv_state`, which the first decode call only allocates.
     """
@@ -384,9 +385,9 @@ class PLELayer(nn.Module):
     precision: PrecisionLike = None
 
     @nn.compact
-    def __call__(self, streams, hash_ids, metadata=None, *, decode: bool = False):
+    def __call__(self, streams, hash_ids, call: MixerCall = PLAIN_CALL):
         batch, length, hc, width = streams.shape
-        tokens = coordinates_of(metadata, batch, length)
+        tokens = coordinates_of(call.metadata, batch, length)
         token_mask, segments = tokens.valid, tokens.segments
         table = nn.Embed(self.rows, self.head_dim, embedding_init=nn.initializers.normal(1.0), name='embed')
         dtype = streams.dtype if self.dtype is None else self.dtype
@@ -410,7 +411,7 @@ class PLELayer(nn.Module):
         span = (self.kernel_size - 1) * self.dilation + 1
         dilated = jnp.zeros((hc * width, span), taps.dtype).at[:, ::self.dilation].set(taps)
         held = None
-        if decode:
+        if call.decode:
             allocated = self.has_variable('cache', 'conv_state')
             held = self.variable('cache', 'conv_state', jnp.zeros, (batch, span - 1, hc * width),
                                  normed.dtype)

@@ -40,10 +40,10 @@ from pathlib import Path
 import numpy as np
 import torch
 from hf_reference import write_released_config
-from reference_source import hub_modules, padded_probe, torch_greedy, torch_logits
+from reference_source import hub_modules, write_probes
 from torch_precision import float64_twin
 
-from dew.interop.verify import probe_ids, scatter_weights
+from dew.interop.verify import scatter_weights
 
 REPO, REVISION = 'MiniMaxAI/MiniMax-Text-01', 'a7351bf2bee0e1253919d349f1ad304e6dac13e9'
 RELEASES = {'minimax-text-01': (REPO, REVISION),
@@ -116,14 +116,7 @@ def write_tiny(configuration, modeling) -> None:
     written = json.loads((directory / 'config.json').read_text())
     written['model_type'] = 'minimax_text_01'
     (directory / 'config.json').write_text(json.dumps(written, indent=2) + '\n')
-    ids = probe_ids(config.vocab_size)
-    mask, padded, positions = padded_probe(ids)
-    arrays = {'input_ids': ids, 'attention_mask': mask, 'logits': torch_logits(model, ids),
-              'padded_logits': torch_logits(model, padded, mask, positions),
-              'generated': torch_greedy(model, ids[:, :4], 6)}
-    for name, array in arrays.items():
-        np.save(directory / f'{name}.npy', array)
-    print(f"{directory}: {sorted(path.name for path in directory.iterdir())}")
+    write_probes(directory, model, config.vocab_size)
 
 
 def integer_mask(model):

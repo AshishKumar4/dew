@@ -339,6 +339,24 @@ def torch_logits(model, ids, mask=None, positions=None):
         return model(**inputs).logits.numpy()
 
 
+def write_probes(directory: Path, model, vocab: int) -> None:
+    """A torch causal LM's probe arrays into `directory`, as tests/test_hf_reference_decoders.py reads
+    them: `verify.probe_ids`' ids, their left-padded rows (`padded_probe`) and mask, the logits of both,
+    and the greedy continuation of the first four ids by six."""
+    import numpy as np
+
+    from dew.interop.verify import probe_ids
+
+    ids = probe_ids(vocab)
+    mask, padded, positions = padded_probe(ids)
+    arrays = {'input_ids': ids, 'attention_mask': mask, 'logits': torch_logits(model, ids),
+              'padded_logits': torch_logits(model, padded, mask, positions),
+              'generated': torch_greedy(model, ids[:, :4], 6)}
+    for name, array in arrays.items():
+        np.save(directory / f'{name}.npy', array)
+    print(f"{directory}: {sorted(path.name for path in directory.iterdir())}")
+
+
 def torch_greedy(model, ids, tokens: int):
     """`ids` continued `tokens` tokens by the argmax of a full forward each (`torch_logits`)."""
     import numpy as np

@@ -8,7 +8,7 @@ import dataclasses
 import functools
 import math
 from collections.abc import Callable, Mapping, Sequence
-from typing import Literal, NamedTuple, Protocol, cast, overload, runtime_checkable
+from typing import Literal, NamedTuple, Protocol, overload, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -690,6 +690,27 @@ class DecoderBlock(nn.Module):
                 lengths, self.residual_sources)
         return count
 
+    @nn.nowrap
+    def _stream_sites(self, spec: HyperConnections):
+        """The attention's and the MLP's sites over the streams, set up under `attn_hc` and `ffn_hc`:
+        mHC's (`HyperConnection`), or Qwen4-Exp's gated ones (`GatedResidual`)."""
+        if (self.wiring.pre_norms == spec.gated or self.wiring.output_norms or self.wiring.layer_scalar
+                or self.parallel is not None or self.altup is not None
+                or self.laurel_rank is not None or self.per_layer_input_dim
+                or self.residual_multiplier != 1.0):
+            raise ValueError(
+                "hyper_connections runs the mHC block, a plain pre-norm block whose "
+                "residual is the stream stack, or Qwen4-Exp's gated one, which norms in its read "
+                "and takes no pre norms: no output norms, layer scalar, parallel branch, altup, "
+                "laurel, per-layer inputs or residual multiplier")
+        sites = {'spec': spec, 'emb_features': self.emb_features, 'norm_eps': self.norm_eps}
+        if spec.gated:
+            gated = functools.partial(GatedResidual, **sites, dtype=self.dtype, precision=self.precision)
+            self.attn_gated, self.ffn_gated = gated(name='attn_hc'), gated(name='ffn_hc')
+        else:
+            self.attn_hc = HyperConnection(**sites, name='attn_hc')
+            self.ffn_hc = HyperConnection(**sites, name='ffn_hc')
+
     def setup(self):
         projections = self.projections()
         norm = decoder_norm(
@@ -763,22 +784,7 @@ class DecoderBlock(nn.Module):
                 norm_eps=self.norm_eps, dtype=self.dtype, precision=self.precision,
                 name='laurel')
         if self.hyper_connections is not None:
-            gated = self.hyper_connections.gated
-            if (self.wiring.pre_norms == gated or self.wiring.output_norms or self.wiring.layer_scalar
-                    or self.parallel is not None or self.altup is not None
-                    or self.laurel_rank is not None or self.per_layer_input_dim
-                    or self.residual_multiplier != 1.0):
-                raise ValueError(
-                    "hyper_connections runs the mHC block, a plain pre-norm block whose "
-                    "residual is the stream stack, or Qwen4-Exp's gated one, which norms in its read "
-                    "and takes no pre norms: no output norms, layer scalar, parallel branch, altup, "
-                    "laurel, per-layer inputs or residual multiplier")
-            site = (functools.partial(GatedResidual, dtype=self.dtype, precision=self.precision) if gated
-                    else HyperConnection)
-            site = functools.partial(site, spec=self.hyper_connections, emb_features=self.emb_features,
-                                     norm_eps=self.norm_eps)
-            self.attn_hc = site(name='attn_hc')
-            self.ffn_hc = site(name='ffn_hc')
+            self._stream_sites(self.hyper_connections)
         if self.residual_site is not None:
             if (not self.wiring.pre_norms or self.wiring.output_norms or self.wiring.layer_scalar
                     or self.parallel is not None or self.altup is not None
@@ -1003,7 +1009,7 @@ class DecoderBlock(nn.Module):
                 # The lookup lands before anything reads the streams (V4.1 model.py:1261-1263), each
                 # layer reading the call's rows as it masks them (`EngramLayer`, `PLELayer`).
                 streams = self.engram_layer(streams, attention_metadata.engram_ids[:, :, self.engram_index],
-                                            attention_metadata, decode=decode)
+                                            MixerCall(attention_metadata, decode))
             if self.prediction_site == 'input':
                 # V4.1's DSpark reads each target layer's attention input,
                 # after its engram (V4.1 inference/model.py:1264-1266).
@@ -1026,11 +1032,10 @@ class DecoderBlock(nn.Module):
         if isinstance(state, _Streams):
             spec = self.hyper_connections
             assert spec is not None
-            module = self.attn_hc if site == "attention" else self.ffn_hc
             if spec.gated:
-                read, injection = cast("tuple[jax.Array, jax.Array]", module(state.streams))
+                read, injection = (self.attn_gated if site == "attention" else self.ffn_gated)(state.streams)
                 return state, read, injection
-            pre, post, comb = module.mapping(state.streams)
+            pre, post, comb = (self.attn_hc if site == "attention" else self.ffn_hc).mapping(state.streams)
             # Under Single-Pass, a site collapses by the `pre` the site before
             # it computed and hands its own on (V4.1 inference/model.py:968-994).
             by = state.pre if spec.single_pass else pre

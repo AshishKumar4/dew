@@ -18,7 +18,6 @@ from reference_error import assert_as_exact, widened
 from dew.interop import Pretrained, PretrainedDecoder
 from dew.interop.hf_decoders import translate_config
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.backbones.layer_plan import run_period, scan_groups
 from dew.registry import from_record
 
 ROOT = Path(__file__).parent / 'fixtures' / 'hf'
@@ -40,8 +39,19 @@ def test_a_releases_own_config_and_its_transformers_config_read_as_one_model():
     lightning layers one kind, each one's rates data its place in the stack hands it."""
     own, hf = (translate_config(released(name)) for name in ('minimax-text-01', 'minimax-text-01-hf'))
     assert own == hf
-    keys = from_record(CausalTransformer, own).scan_keys
-    assert scan_groups(keys, periodic=True) == ((0, 80),) and run_period(keys, 0, 80) == 8
+    # The release's pattern and blocks at a width a trace holds.
+    narrow = {'hidden_size': 16, 'num_attention_heads': 2, 'num_key_value_heads': 1, 'head_dim': 8,
+              'rotary_dim': 4, 'intermediate_size': 16, 'num_local_experts': 2, 'num_experts_per_tok': 1,
+              'vocab_size': 32, 'max_position_embeddings': 64}
+    model = from_record(CausalTransformer, {**translate_config({**released('minimax-text-01'), **narrow}),
+                                            'scan_layers': True, 'attention_impl': 'reference'})
+    ids = jnp.zeros((1, 1), jnp.int32)
+    variables = jax.eval_shape(lambda: model.init(jax.random.key(0), ids))
+    cache = jax.eval_shape(lambda: model.init(jax.random.key(0), ids, decode=True))['cache']
+    graph = jax.make_jaxpr(lambda variables, cache: model.apply(
+        {**variables, 'cache': cache}, ids, decode=True, mutable=['cache']))(variables, cache)
+    assert [equation.params['length'] for equation in graph.jaxpr.eqns
+            if equation.primitive.name == 'scan'] == [10]
 
 
 SCAN_SEEDS = 8

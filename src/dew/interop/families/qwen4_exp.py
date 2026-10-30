@@ -162,7 +162,8 @@ def _qwen4_exp_prepare(tensors: Mapping[str, Stored], config: Mapping[str, objec
     left out (the module doc)."""
     prepared: dict[str, Stored] = {}
     shards: dict[str, dict[int, Stored]] = {}
-    spec = None if config is None or config.get('engram') is None else from_record(Engram, config['engram'])
+    spec = (None if config is None or config.get('engram') is None
+            else from_record(Engram, _records.record(config['engram'], 'engram')))
     for name, tensor in tensors.items():
         found = _SHARD.match(name)
         if found is not None:

@@ -32,12 +32,12 @@ from pathlib import Path
 import numpy as np
 import torch
 from hf_reference import write_released_config
-from reference_source import padded_probe, torch_greedy, torch_logits
+from reference_source import write_probes
 from transformers.models.qwen4_exp import modeling_qwen4_exp
 from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpTextConfig
 from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpForCausalLM
 
-from dew.interop.verify import probe_ids, scatter_weights
+from dew.interop.verify import scatter_weights
 
 FIXTURES = Path(__file__).resolve().parents[1] / 'tests' / 'fixtures' / 'hf'
 RELEASE = ('Qwen/Qwen3.8-Flash-Next', 'de4b8e4d43b917e7706784d8bb445c9af86a3540')
@@ -66,14 +66,7 @@ def write_tiny() -> None:
     model = Qwen4ExpForCausalLM(Qwen4ExpTextConfig(**TINY)).float().eval()
     scatter_weights(model, 1234)
     model.save_pretrained(directory, safe_serialization=True)
-    ids = probe_ids(TINY['vocab_size'])
-    mask, padded, positions = padded_probe(ids)
-    arrays = {'input_ids': ids, 'attention_mask': mask, 'logits': torch_logits(model, ids),
-              'padded_logits': torch_logits(model, padded, mask, positions),
-              'generated': torch_greedy(model, ids[:, :4], 6)}
-    for name, array in arrays.items():
-        np.save(directory / f'{name}.npy', array)
-    print(f"{directory}: {sorted(path.name for path in directory.iterdir())}")
+    write_probes(directory, model, TINY['vocab_size'])
 
 
 class _Unallocated(torch.nn.Module):
