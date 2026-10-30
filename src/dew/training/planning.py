@@ -472,13 +472,21 @@ class Forecast:
         return min(guesses, default=None)
 
 
-def settled(planned: Planned, probes: Sequence[Probe], derived: Sequence[JSON] = ()) -> dict[str, JSON]:
-    """The admitted plan, its kernel report, every compile needed to find it and each rung the
-    derivation read before them (`FitSearch.derived`). There is no alternative-policy timing or
-    selection in the run's admission record."""
+def settled(planned: Planned, probes: Sequence[Probe], search: FitSearch) -> dict[str, JSON]:
+    """The admitted plan, its kernel report, every compile needed to find it, each rung the derivation
+    read before them (`FitSearch.derived`), and the kernels those compiles found spilling and the launch
+    configs refused where it searched (`FitSearch.kernels`), which the run's telemetry reports with it
+    (`StepCompiled`). There is no alternative-policy timing or selection in the run's admission record."""
     _log.info("the step's %s", planned.candidate.kernels.summary())
     return {**planned.record(), "kernels": planned.candidate.kernels.record(),
-            "probes": [probe.record() for probe in probes], "derived": list(derived)}
+            "probes": [probe.record() for probe in probes], "derived": list(search.derived), **search.kernels}
+
+
+def spill_record(miss: report.Miss) -> dict[str, JSON]:
+    """A kernel a compile found spilling (`report.Miss`), its launch's config by its text."""
+    return {"kernel": miss.kernel, "op": miss.op,
+            "config": None if miss.config is None else repr(miss.config), "registers": miss.registers,
+            "spilled": miss.spilled, "stepped": miss.stepped}
 
 
 @dataclasses.dataclass
@@ -533,6 +541,10 @@ class FitSearch[LossT, EffectsT]:
     for a run that starts from a plan, recorded, compiled ahead or resumed, which the search tries first."""
     derived: list[dict[str, JSON]] = dataclasses.field(default_factory=list)
     """Each rung the derivation read before the first compile: its rung, terms, headroom and label."""
+    kernels: dict[str, JSON] = dataclasses.field(default_factory=dict)
+    """What the templates' reports found where the search compiled (`admitted`): each kernel its compiles
+    found spilling (`report.misses`, `spill_record`) and each launch config refused in its registry
+    (`report.refused_launches`), a handed step's its own (`dew.training.ahead.handed`)."""
 
     def __post_init__(self):
         self.factor = temporaries_factor(self.mesh, self.capacity)
@@ -550,8 +562,12 @@ class FitSearch[LossT, EffectsT]:
         alternate policy is compiled."""
         # A rung fits where its most microbatches do; the search then finds its split there.
         self.derived_start(candidates[-1])
+        seen = len(report.misses())
         split = planned(candidates, first, self.fits, self.climb,
                         lambda split: self.forecast.likely(self.rung(), split))
+        self.kernels = {"spills": [spill_record(miss) for miss in report.misses()[seen:]],
+                        "refused": [{"launch": identity, "config": repr(config), "kernels": sorted(names)}
+                                    for identity, config, names in report.refused_launches()]}
         if split is None or self.fitted is None:
             raise PlanRefused(self.probes) from (self.refusals[-1] if self.refusals else None)
         return self.found(split), tuple(self.probes)
