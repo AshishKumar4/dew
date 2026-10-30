@@ -171,6 +171,29 @@ def test_a_recorded_run_inspects_what_its_command_line_names(tmp_path):
     assert any("q_proj" in name and name.endswith("/rms") for name in logged[2])
 
 
+def test_a_saved_runs_view_from_the_command_line_is_what_it_logs(tmp_path, capsys):
+    """`dew inspect` over a run.json views one sampled update over the run's first batch, from its
+    checkpoints' latest where it has them, else its start (`RunConfig.inspected`): before the run trains, the
+    view its first step logs, bit for bit; it trains nothing and writes nothing (2317's offline view from
+    the command line, train 332's review)."""
+    record, runs = tmp_path / "record", tmp_path / "runs"
+    lm(tmp_path, drawn=False).save(str(record))
+    inspection = {"class": "dew.training.inspection:Inspection",
+                  "fields": {"paths": ["*q_proj*"], "every": 1}}
+    settings = {"trainer.name": "viewed", "trainer.checkpoint_dir": str(runs), "trainer.steps": "1",
+                "trainer.log_every": "1", "trainer.eval_every": "None", "trainer.checkpoint_every": "None",
+                "trainer.inspection": json.dumps(inspection), "trainer.multi_host": "False",
+                "trainer.compilation_cache_dir": "None"}
+    flags = [flag for path, value in settings.items() for flag in ("--set", f"{path}={value}")]
+    capsys.readouterr()
+    assert main(["inspect", str(record / "run.json"), *flags]) == 0
+    offline = json.loads(capsys.readouterr().out.splitlines()[-1])
+    assert not runs.exists()
+    assert main(["train", str(record / "run.json"), *flags]) == 0
+    live = {name: value for name, value in scalars(runs / "viewed")[1].items() if name.startswith("inspect/")}
+    assert live and offline == live
+
+
 class Block(nn.Module):
     """A residual tanh layer, whose output a run watches by its kind."""
 
