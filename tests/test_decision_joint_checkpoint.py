@@ -401,16 +401,18 @@ def test_a_run_that_held_weights_frozen_serves_as_its_weights_unsplit_do(tmp_pat
     checkpoints.wait()
     assert FROZEN in state.variables
 
-    # The run's weights in one collection, as its export holds them, packed as a load packs them.
+    # The run's weights in one collection, as its export holds them, packed as a load packs them and
+    # placed where the loaded task holds each.
     trained = thaw(jax.device_get(state.variables))
     loaded = Decide.from_run(str(run))
-    unsplit = replace(loaded, variables=joined({
-        "backbone": inference_projections(loaded.model.backbone, part(trained, "backbone")),
-        "head": part(trained, "head")}))
-    held = thaw(jax.device_get(loaded.variables))["params"]
-    assert jax.tree.structure(held) == jax.tree.structure(unsplit.variables["params"])
-    for leaf, alike in zip(jax.tree.leaves(held), jax.tree.leaves(unsplit.variables["params"]), strict=True):
-        np.testing.assert_array_equal(np.asarray(leaf), np.asarray(alike))
+    held = thaw(loaded.variables)["params"]
+    weights = joined({"backbone": inference_projections(loaded.model.backbone, part(trained, "backbone")),
+                      "head": part(trained, "head")})["params"]
+    assert jax.tree.structure(held) == jax.tree.structure(weights)
+    for leaf, alike in zip(jax.tree.leaves(held), jax.tree.leaves(weights), strict=True):
+        np.testing.assert_array_equal(np.asarray(leaf), np.asarray(alike), strict=True)
+    unsplit = replace(loaded, variables={"params": jax.tree.map(
+        lambda leaf, alike: jax.device_put(alike, leaf.sharding), held, weights)})
     for state_text in ("charged twice!", "is the site down?"):
         found, expected = loaded(state_text, {"team": team}), unsplit(state_text, {"team": team})
         np.testing.assert_array_equal(found["team"].probabilities, expected["team"].probabilities)
