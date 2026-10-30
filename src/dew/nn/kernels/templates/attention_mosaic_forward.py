@@ -40,10 +40,11 @@ from dew.nn.kernels.templates.attention import (
     KeySpans,
     Param,
     Split,
+    by_power,
     output_hooked,
     output_split,
     padded_call,
-    prescaled,
+    prescale,
 )
 from dew.nn.kernels.templates.attention_mosaic_program import (
     Tiles,
@@ -143,10 +144,11 @@ def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
     rows, which a row its guards rewalk keeps too (its weighted values overflowed, not its maximum or
     denominator), no anchor key and the output as the split sums (`output_split`)."""
     family = bundle_of(tiles, query.dtype)
-    call, spec, (q, k, v), (spans_of, hooked) = _prepared(query, key, value, spans, hooks, scale=scale,
-                                                          natural=natural, tiles=tiles, family=family)
+    call, spec, (raw, k, v), (spans_of, hooked), taken = _prepared(
+        query, key, value, spans, hooks, scale=scale, natural=natural, tiles=tiles, family=family)
 
     def launch(form: algebra.Forward, live: jax.Array | None) -> tuple[tuple, jax.Array, jax.Array]:
+        q, form = _rewalked(spec, form, raw, taken)
         # The natural form's rewalk at its own tiles (`Tiles.relaunch`), its spans' block map of them.
         at, at_spans = _form_tiles(spec, call, form, tiles, spans_of)
         if live is None:
@@ -265,11 +267,12 @@ def _trained_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
     values overflowed take the plain-JAX mainloop's guarded training walk (its normalized split sums, shift
     -1, `algebra.split_residuals`), which this kernel's single pass does not take."""
     family = bundle_of(tiles, query.dtype)
-    call, spec, (q, k, v), (spans_of, hooked) = _prepared(query, key, value, spans, hooks, scale=scale,
-                                                          natural=natural, tiles=tiles, family=family)
+    call, spec, (raw, k, v), (spans_of, hooked), taken = _prepared(
+        query, key, value, spans, hooks, scale=scale, natural=natural, tiles=tiles, family=family)
     value_width = value.shape[3]
 
     def launch(form: algebra.Forward, live: jax.Array | None):
+        q, form = _rewalked(spec, form, raw, taken)
         if live is None:
             counted = form.natural == spec.natural
             # The natural form's rewalk at its own tiles (`Tiles.relaunch`), its spans' block map of them.
@@ -303,7 +306,8 @@ def _trained_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
         # The overflowed rows' guarded training walk, the plain-JAX mainloop's over this call's padding in
         # this launch's form (the rewalk's units kept, `algebra.unfolded`); its maxima and overflows
         # `walked_launches` does not read.
-        out, rows = attention_portable.padded_walk(form, call, hooks, block_q=tiles.block_q,
+        walked = call if q is raw else dataclasses.replace(call, query=by_power(call.query, taken))
+        out, rows = attention_portable.padded_walk(form, walked, hooks, block_q=tiles.block_q,
                                                    block_k=tiles.block_k, residuals=True)
         maximum, total, anchors, split = rows
         widened = (_widened(out, v.shape[-1]), maximum, total, anchors,
@@ -347,22 +351,39 @@ def _prepared(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     """A call as this mainloop takes it at `tiles`: padded to the program's blocks (`padded_call`, `_block`)
     and its heads to whole swizzled rows (`_columns`), with its `algebra.Forward` (every form guarding its
     sums where its values can overflow them, the fold its logits' reach, `algebra.walked_launches`) and the
-    arrays its programs read beside the operands (`_Spans`, `_Hooked`). A call it takes none of is refused
-    (`refused`, which the op's eligibility reads too)."""
+    arrays its programs read beside the operands (`_Spans`, `_Hooked`), and the power of two its plain
+    launch took into its scale (1 where none, `_rewalked`). A call it takes none of is refused (`refused`,
+    which the op's eligibility reads too)."""
     if reason := refused(query.dtype, query.shape[3], value.shape[3], hooks, backward=False, family=family):
         raise NotImplementedError(reason)
-    # The query taken by its scale's power of two before its products (`prescale`).
-    query, scale, power = prescaled(query, scale)
-    call = padded_call(query, key, value, spans, hooks, _block(tiles))
-    spec = algebra.Forward(spans.form, spans.keys, ids=spans.query_ids is not None, scale=scale,
+    # The query's power of two before its products (`prescale`). A folding call's launch takes it into its
+    # scale (`Forward.factor`: the products' factor 2^p times the prescaled query's, so every logit bit for
+    # bit the prescaled query's where its products stay in fp32's normal range), no pass of XLA's over the
+    # queries before it (0.046 ms of Qwen3-8B's 0.66 ms causal forward, ET-GQA1-h100); a logit past the
+    # fold's reach walks again natural on the query taken by the power (`_rewalked`).
+    power, scale = prescale(query.dtype, query.shape[3], scale)
+    taken = power if algebra.folds(scale, power, natural=natural, score_mod=hooks.score_mod) else 1.0
+    call = padded_call(by_power(query, power / taken), key, value, spans, hooks, _block(tiles))
+    spec = algebra.Forward(spans.form, spans.keys, ids=spans.query_ids is not None, scale=scale * taken,
                            score_mod=hooks.score_mod, natural=natural, headroom=algebra.headroom(value.dtype),
                            initial=hooks.initial is not None,
                            queries=call.queries if call.query.shape[1] > call.queries else None,
-                           prescale=power)
+                           prescale=power / taken)
     unit = family.column_unit(query.dtype)
     operands = tuple(_columns(array, unit) for array in (call.query, call.key, call.value))
     read = (_spans_of(spec, call, tiles.block_q, tiles.block_k), _hooked_of(hooks, call, unit))
-    return call, spec, operands, read
+    return call, spec, operands, read, taken
+
+
+def _rewalked(spec: algebra.Forward, form: algebra.Forward, query: jax.Array, taken: float
+              ) -> tuple[jax.Array, algebra.Forward]:
+    """A launch's query operand and form: the fold's natural rewalk (`algebra.unfolded`) of a call whose
+    plain launch took its power of two into its scale (`taken`, `_prepared`) the query taken by the power
+    and the scale left after it, its products finite where the reference's are; every other launch the
+    call's own."""
+    if taken == 1.0 or form.natural == spec.natural:
+        return query, form
+    return by_power(query, taken), dataclasses.replace(form, scale=form.scale / taken, prescale=taken)
 
 
 class _Residuals(NamedTuple):
