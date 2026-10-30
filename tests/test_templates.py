@@ -8,12 +8,49 @@ from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.selection import Kernel, KernelRefused, Op, Refusal, Requirement, select
 from dew.nn.kernels.templates.base import Call, Template, Unfitted, call
 from dew.nn.kernels.tuning import Unpinnable
+
+
+def test_a_dependent_named_choice_holds_unless_the_child_names_its_own():
+    operation = Op("delta_decode", (
+        Kernel("wide", ()),
+        Kernel("narrow", (Requirement("width", lambda width: width <= 4,
+                                       "the narrow launch holds four columns", row=generation.INHERENT),))),
+        preferred=lambda _: "wide", named_from={("gated_delta_rule", "xla"): "narrow"})
+    select(operation, 5)
+    with generation.chosen(gated_delta_rule="xla"):
+        with pytest.raises(KernelRefused):
+            select(operation, 5)
+        with generation.chosen(delta_decode="wide"):
+            select(operation, 5)
+    select(operation, 5)
+
+
+def test_a_gemm_pullback_keeps_its_named_choice_and_restores_the_callers_scope():
+    from dew.nn.kernels.templates.gemm import template
+
+    with jax.enable_x64(new_val=True):
+        x = jnp.arange(8, dtype=jnp.float64).reshape(2, 4) / 8
+        weight = jnp.arange(12, dtype=jnp.float64).reshape(4, 3) / 16
+
+        def projected(x, weight):
+            return template.gemm(x, weight, None, out_dtype=jnp.float64)
+
+        with generation.chosen(grouped_matmul="xla"):
+            value, pullback = jax.vjp(projected, x, weight)
+        with generation.chosen(grouped_matmul="mosaic_gpu"):
+            dx, dw = pullback(jnp.ones_like(value))
+            # The bound call's XLA scope must not leak into this new call. Mosaic cannot take fp64.
+            with pytest.raises(KernelRefused):
+                projected(x, weight)
+        np.testing.assert_array_equal(dx, np.broadcast_to(np.asarray(weight).sum(axis=1), x.shape))
+        np.testing.assert_array_equal(dw, np.broadcast_to(np.asarray(x).sum(axis=0)[:, None], weight.shape))
 
 
 def test_a_templates_refusal_reaches_the_forced_call_without_reconstruction():

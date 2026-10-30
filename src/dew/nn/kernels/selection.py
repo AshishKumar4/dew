@@ -20,6 +20,7 @@ operation to the program, and outside `generation.routes()` it records nothing
 from __future__ import annotations
 
 import dataclasses
+import functools
 from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
@@ -145,6 +146,10 @@ class Op[C]:
     hosted: Callable[[str], str] = lambda kernel: kernel
     declared: Mapping[tuple[str | None, str], tuple[str, str]] = dataclasses.field(
         default_factory=dict, compare=False, hash=False)
+    named_from: Mapping[tuple[str, str], str] = dataclasses.field(
+        default_factory=dict, compare=False, hash=False)
+    """Another op's named choice that names this one's kernel, unless this call or op names its own.
+    Entries are ordered, as the op's requirements and candidates are."""
 
     def kernel(self, name: str) -> Kernel[C]:
         for kernel in self.kernels:
@@ -152,6 +157,22 @@ class Op[C]:
                 return kernel
         raise ValueError(f"{self.choice} has no kernel {name!r}; its kernels are "
                          f"{', '.join(kernel.name for kernel in self.kernels)}")
+
+    def bound[**P, R](self, call: Callable[P, R]) -> Callable[P, R]:
+        """Keep this op's named choice when `call` runs later, such as a pullback outside its forward's
+        scope. With no named choice, the later call keeps deciding in the scope where it runs."""
+        requested = _named(self, None)
+        if requested is None:
+            return call
+
+        @functools.wraps(call)
+        def scoped(*args: P.args, **kwargs: P.kwargs) -> R:
+            from . import generation
+
+            with generation.chosen(**{self.choice: requested}):
+                return call(*args, **kwargs)
+
+        return scoped
 
 
 class KernelRefused(ValueError):
@@ -171,6 +192,13 @@ def forced(choice: str) -> str | None:
     return dict(cache.KERNEL_CHOICES.value).get(choice)
 
 
+def _named(op: Op, named: str | None) -> str | None:
+    if (requested := named or forced(op.choice)) is not None:
+        return requested
+    return next((kernel for (parent, choice), kernel in op.named_from.items() if forced(parent) == choice),
+                None)
+
+
 def select[C](op: Op[C], case: C, named: str | None = None, *, preference: tuple[str, ...] = ()) -> Route:
     """The kernel `op` runs for `case` on the target, reported as its route: `named` (or the kernel
     `chosen` names) where it takes the case, else the op's preference (`preferred`, or the first of its
@@ -180,7 +208,8 @@ def select[C](op: Op[C], case: C, named: str | None = None, *, preference: tuple
     ones). A call's soft `preference`, where neither `named` nor `chosen` forces a kernel, is its own order
     of the op's kernels: the first of them that takes the case, the first passing what the targets measured
     of it as a named kernel does, and its refusal reported (a norm's per-call implementation, an explicit
-    xla's decode step). The route states what forced it (`Route.forced`)."""
+    xla's decode step). `Op.named_from` declares a named dependency where neither the call nor this op
+    names its own kernel. The route states what forced it (`Route.forced`)."""
     from . import generation
 
     kernel, preferred, refusal, insisted = _decided(op, case, named, preference)
@@ -199,8 +228,8 @@ def selected[C](op: Op[C], case: C, named: str | None = None, *, preference: tup
 def _decided[C](op: Op[C], case: C, named: str | None,
                 preference: tuple[str, ...]) -> tuple[Kernel[C], str, Refusal | None, str | None]:
     """`select`'s kernel for `case`, the kernel preferred, the preferred one's refusal and the kernel that
-    forced the choice (`named`, else `chosen`'s), None where nothing did."""
-    insisted = named or forced(op.choice)
+    forced the choice (the call, its own `chosen`, then `named_from`), None where nothing did."""
+    insisted = _named(op, named)
     soft = insisted is None and bool(preference)
     if soft:
         # The call's own order, exactly: its first the call's pick, the rest its fallbacks in turn.

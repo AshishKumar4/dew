@@ -99,16 +99,8 @@ def gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *
     def forward(*operands):
         return value(*operands), ()
 
-    # A kernel the call names (`generation.chosen`, MoE's implementation='xla') runs its derivative's products
-    # too, wherever the pullback runs: a reverse pass traced outside the call's block would otherwise select
-    # them afresh.
-    named = selection.forced(grouped_matmul.GROUPED.choice)
-
     def backward(saved, operands, cotangent, live):
-        if named is None:
-            return _pulled(operands, cotangent, live)
-        with generation.chosen(**{grouped_matmul.GROUPED.choice: named}):
-            return _pulled(operands, cotangent, live)
+        return _pulled(operands, cotangent, live)
 
     def _pulled(operands, cotangent, live):
         lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays, paired = operands
@@ -143,7 +135,8 @@ def gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *
                   *gradients[1:]]
         return tuple(leaves[index] for index in live)
 
-    differentiable = generation.linear_tangent(forward, backward, portable, live_cotangents=True)
+    differentiable = generation.linear_tangent(forward, grouped_matmul.GROUPED.bound(backward), portable,
+                                                live_cotangents=True)
     return differentiable(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays, paired)
 
 
