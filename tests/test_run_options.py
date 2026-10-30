@@ -650,20 +650,22 @@ def accepted(saved, name: str, value) -> bool:
     return True
 
 
-def reached_by(run: RunConfig, root: Path, settings: type, flags, queued: dict[str, list[object]]):
+def reached_by(run: RunConfig, root: Path, settings: type, flags, queued: dict[str, list[object]], holds):
     """Each option of `queued` set alone through `dew train` (`flags` writes its `--set`s), so what its
     task holds differs from the run that sets none by it alone: at its first alternative, or its next where
-    a reader refuses one. The settings each saves, what its task holds and the value it was set to, for each
-    that trains."""
+    a reader refuses one or the saved settings do not hold it (`holds`: a run's None that keeps the
+    layout's own). The settings each saves, what its task holds and the value it was set to, for each
+    that trains so."""
     reached = {}
     for name, values in queued.items():
         for index, value in enumerate(values):
             try:
                 saved, after = saved_with(run, root, f"{name}{index}", settings, flags({name: value}))
-                reached[name] = (saved, after, value)
-                break
             except ValueError:  # A reader refused it, which names what refused it: the next.
                 continue
+            if holds(saved, name, value):
+                reached[name] = (saved, after, value)
+                break
     return reached
 
 
@@ -700,10 +702,9 @@ def test_each_option_a_saved_task_is_built_with_reaches_it_from_the_command_line
     reachable = {name: option.found for name, option in options.items() if option.found is not None}
     reached = reached_by(run, tmp_path, settings, lambda assigned: {
         reachable[name].path: flag(value, reachable[name].annotation) for name, value in assigned.items()},
-        queued)
+        queued, lambda saved, name, value: same(held_at(saved, name), reachable[name].made(value)))
     for name in queued:
         assert name in reached, f"no alternative of {settings.__name__}.{name} trains: {queued[name]}"
-        saved, after, value = reached[name]
+        _, after, value = reached[name]
         option = reachable[name].made(value)
-        assert same(held_at(saved, name), option), (name, option)
         assert consumed(before, after, option), f"the task loaded holds no {settings.__name__}.{name} set"
