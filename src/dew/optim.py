@@ -85,14 +85,13 @@ def _matrix_sides(axes: LogicalAxes) -> tuple[tuple[int, ...], tuple[int, ...]] 
     return tuple(sides[0]), tuple(sides[1])
 
 
-FRESH_LEARNING_RATE = 1e-3
+FRESH_LEARNING_RATE = 2e-4
 """The peak rate a module drawn fresh beside a loaded base trains at where a run names no groups
 (`OptimConfig.fresh_groups`), on the run's own schedule's shape: a base fine-tunes at a rate a fresh
-module barely moves at. On a toy whose answer is in a context only cross-attention reads (a four-layer
-decoder, blocks before layers 1 and 3, AdamW, 1000 steps), the blocks learned nothing at a base's 1e-5
-(held loss 4.50 against the no-context control's 4.51), little with only their gates at 100 times
-(4.47), and as at 1e-3 throughout with every weight of theirs at 1e-3 (2.72). Ledger 2419's runs over
-a loaded Qwen3.5, under AdamW with decay and the Muon hybrid, adjust it."""
+module barely moves at. On a context-only task over a loaded Qwen3.5 slice held frozen, an IDEFICS block
+at a base rate of 5e-6 learned on every seed from 5e-5 to 5e-4 under AdamW with decay and from 5e-5 to
+5e-3 under the Muon hybrid; at 5e-6 the Muon hybrid learned nothing, and at 1e-3 one AdamW seed in three
+did not learn (ledger 2419). This is the middle of the rates both held on every seed."""
 
 
 def weight_decay_mask(params):
