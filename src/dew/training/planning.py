@@ -16,7 +16,7 @@ import json
 import logging
 import tempfile
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Hashable, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -482,6 +482,13 @@ def settled(planned: Planned, probes: Sequence[Probe], search: FitSearch) -> dic
             "probes": [probe.record() for probe in probes], "derived": list(search.derived), **search.kernels}
 
 
+def refusal_record(identity: str, config: Hashable, names: frozenset[str]) -> dict[str, JSON]:
+    """A launch config refused for its kernels' spills (`report.refused_launches`), the config by its
+    text."""
+    kernels: list[JSON] = [*sorted(names)]
+    return {"launch": identity, "config": repr(config), "kernels": kernels}
+
+
 def spill_record(miss: report.Miss) -> dict[str, JSON]:
     """A kernel a compile found spilling (`report.Miss`), its launch's config by its text."""
     return {"kernel": miss.kernel, "op": miss.op,
@@ -565,9 +572,9 @@ class FitSearch[LossT, EffectsT]:
         seen = len(report.misses())
         split = planned(candidates, first, self.fits, self.climb,
                         lambda split: self.forecast.likely(self.rung(), split))
-        self.kernels = {"spills": [spill_record(miss) for miss in report.misses()[seen:]],
-                        "refused": [{"launch": identity, "config": repr(config), "kernels": sorted(names)}
-                                    for identity, config, names in report.refused_launches()]}
+        spills: list[JSON] = [spill_record(miss) for miss in report.misses()[seen:]]
+        refused: list[JSON] = [refusal_record(*refusal) for refusal in report.refused_launches()]
+        self.kernels = {"spills": spills, "refused": refused}
         if split is None or self.fitted is None:
             raise PlanRefused(self.probes) from (self.refusals[-1] if self.refusals else None)
         return self.found(split), tuple(self.probes)
