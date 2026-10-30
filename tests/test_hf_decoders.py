@@ -1691,6 +1691,16 @@ def test_a_qwen_configs_layers_are_its_transformers_class_layers_without_importi
                 assert read == tuple(expected), (windowed, window, first)
 
 
+@pytest.mark.parametrize("name", ["tie_word_embeddings", "attention_bias", "use_sliding_window"])
+def test_a_qwen_config_stating_a_flag_as_a_string_is_refused(name):
+    """A Qwen3 config's flags are booleans, as its class types them: one stated as the string "false"
+    is refused, where reading its truth would take it as true (review of ledger 2746)."""
+    config = json.loads((FIXTURES / "qwen3-tiny" / "config.json").read_text())
+    stated = {key: value for key, value in config.items() if key != "layer_types"}
+    with pytest.raises(ValueError):
+        translate_config({**stated, name: "false"})
+
+
 def test_an_export_of_a_qwen_model_imports_no_transformers(tmp_path):
     """`PretrainedDecoder.from_model` writes a Dew Qwen model's config from Dew's own rules, so an export
     imports no transformers, whose import alone takes most of the call's time (ledger 2746)."""

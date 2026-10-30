@@ -626,6 +626,14 @@ def specified_layer_types(hf_config: Mapping[str, object], used: set[str],
     return tuple(cycle[index % len(cycle)] for index in range(count))
 
 
+def config_flag(hf_config: Mapping[str, object], name: str, *, default: bool) -> bool:
+    """The config's boolean `name`, its class's `default` where it states none or null: a value of
+    another type is refused, as the config's typed class refuses it, where truthiness would read the
+    string "false" as true (review of ledger 2746)."""
+    value = hf_config.get(name)
+    return default if value is None else _records.boolean(value, name)
+
+
 QWEN_WINDOW_DEFAULTS = {'qwen2': (4096, 28), 'qwen3': (4096, 28)}
 """The window and the first windowed layer (`max_window_layers`) Qwen2's and Qwen3's config classes take
 where a config states neither (configuration_qwen2.py:75-76, configuration_qwen3.py:78-79)."""
@@ -642,7 +650,7 @@ def native_layer_types(hf_config: Mapping[str, object], used: set[str], conventi
         return specified_layer_types(hf_config, used)
     used.update(('use_sliding_window', 'sliding_window', 'max_window_layers'))
     window, first = QWEN_WINDOW_DEFAULTS[convention]
-    windowed = _records.boolean(hf_config.get('use_sliding_window', False), 'use_sliding_window')
+    windowed = config_flag(hf_config, 'use_sliding_window', default=False)
     stated = hf_config.get('sliding_window', window)
     if stated is not None:
         stated = _records.integer(stated, 'sliding_window')
@@ -861,13 +869,12 @@ def base_config(hf_config: Mapping[str, object], used: set[str], *,
         # modeling_gemma4.py:197-215, modeling_qwen3_5.py:732-737).
         scale_after_cast=scale_after_cast,
         qk_norm=qk_norm,
-        attention_bias='attention_bias' in reads and bool(hf_config.get('attention_bias', False)),
-        mlp_bias='mlp_bias' in reads and bool(hf_config.get('mlp_bias', False)),
+        attention_bias='attention_bias' in reads and config_flag(hf_config, 'attention_bias', default=False),
+        mlp_bias='mlp_bias' in reads and config_flag(hf_config, 'mlp_bias', default=False),
         # Gemma3TextConfig ties by default, and so does Gemma4TextConfig; the
         # others do not, so a config that omits the field (gemma-3-1b-pt
         # does) takes its family's default.
-        tie_embeddings=bool(hf_config.get(
-            'tie_word_embeddings', tie_embeddings)),
+        tie_embeddings=config_flag(hf_config, 'tie_word_embeddings', default=tie_embeddings),
     )
     config['kinds'] = kinds
     used.update(('vocab_size', 'intermediate_size', 'max_position_embeddings',
