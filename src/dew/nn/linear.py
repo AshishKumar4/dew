@@ -59,7 +59,7 @@ from .kernels.recurrence_chunk import (
     kernel_routed,
     recurrent_delta_rule,
 )
-from .kernels.selection import Kernel, Op, Requirement, forced, select
+from .kernels.selection import Kernel, Op, Requirement, select
 from .norms import gated_rms_normalized
 from .precision import L2NORM_EPS, asks_default_precision, at_least_fp32, float32_dot_general, l2norm
 from .sharding import (
@@ -606,7 +606,8 @@ DELTA_DECODE: Op[DecodeCase] = Op('delta_decode', (
                                            "to take; its token runs the step alone", row=INHERENT,
                                            kind='handoff'))),
     Kernel('step', _LAUNCH),
-    Kernel('xla', (), generic=True)), lambda case: 'xla' if forced('gated_delta_rule') == 'xla' else 'step')
+    Kernel('xla', (), generic=True)), lambda case: 'step',
+    named_from={('gated_delta_rule', 'xla'): 'xla'})
 """The decode selector of both recurrence callers (a gated delta net's layer, `decode_step`'s), by what each
 kernel takes (no table of GPUs): the step (`recurrence.step` alone, `decode_gated_delta_rule`) between a
 caller's own conv and norm on any GPU Dew's Triton kernels run on, its preference (the fused step won at
