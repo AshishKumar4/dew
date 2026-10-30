@@ -66,26 +66,35 @@ CONTRACTED = {
         "test_a_fused_attention_kernel_holds_its_reverse_orders",
     "src/dew/nn/kv_cache.py::gpu_paged.linear_tangent":
         "test_the_paged_decode_kernel_holds_every_order",
+    "src/dew/nn/kernels/fla_gdn.py::chunk_gated_delta_rule":
+        "test_the_delta_rule_ports_hold_their_orders",
+    "src/dew/nn/kernels/fla_kda.py::chunk_kda":
+        "test_the_delta_rule_ports_hold_their_orders",
+    "src/dew/nn/kernels/mamba_ssd.py::ssd_scan":
+        "test_the_ssd_port_holds_its_orders",
+    "src/dew/nn/kernels/ssd.py::ssd_chunk_scan":
+        "test_the_tpu_ssd_scan_holds_its_orders",
+    "src/dew/nn/kernels/recurrence.py::linear_tangent":
+        "test_the_decode_step_holds_every_order",
+    "src/dew/nn/kernels/recurrence.py::step.linear_tangent":
+        "test_the_decode_step_holds_every_order",
+    "src/dew/nn/kernels/recurrence_chunk.py::_per_product.linear_tangent":
+        "test_the_chunked_op_holds_every_order",
+    "src/dew/nn/kernels/recurrence_chunk.py::mosaic_rule.rule":
+        "test_the_template_rule_holds_its_orders",
+    "src/dew/nn/kernels/short_conv.py::conv.linear_tangent":
+        "test_the_short_conv_holds_every_order",
 }
 """Each contracted seam, `path::qualified name`, and the test of tests/test_derivative_contracts.py that holds
 it."""
 
 PENDING = frozenset({
-    "src/dew/nn/kernels/fla_gdn.py::chunk_gated_delta_rule",
-    "src/dew/nn/kernels/fla_kda.py::chunk_kda",
     "src/dew/nn/kernels/grouped_matmul.py::portable_projection",
-    "src/dew/nn/kernels/mamba_ssd.py::ssd_scan",
     "src/dew/nn/kernels/norm_swiglu.py::stream_rms_norm.linear_tangent",
     "src/dew/nn/kernels/norm_swiglu.py::rms_norm.linear_tangent",
     "src/dew/nn/kernels/norm_swiglu.py::gated_rms_norm.linear_tangent",
     "src/dew/nn/kernels/norm_swiglu.py::swiglu.linear_tangent",
     "src/dew/nn/kernels/norm_swiglu.py::packed_swiglu.linear_tangent",
-    "src/dew/nn/kernels/recurrence.py::linear_tangent",
-    "src/dew/nn/kernels/recurrence.py::step.linear_tangent",
-    "src/dew/nn/kernels/recurrence_chunk.py::_per_product.linear_tangent",
-    "src/dew/nn/kernels/recurrence_chunk.py::mosaic_rule.rule",
-    "src/dew/nn/kernels/short_conv.py::conv.linear_tangent",
-    "src/dew/nn/kernels/ssd.py::ssd_chunk_scan",
     "src/dew/nn/kernels/templates/gemm/template.py::_prologued.prologued",
     "src/dew/nn/kernels/templates/layout.py::_custom.held",
     "src/dew/nn/moe.py::_stored_primal",
