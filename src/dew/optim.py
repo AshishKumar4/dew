@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import dataclasses
 import fnmatch
+import glob
 import inspect
 import json
 import math
@@ -82,6 +83,16 @@ def _matrix_sides(axes: LogicalAxes) -> tuple[tuple[int, ...], tuple[int, ...]] 
     if len(sides) != 2:
         return None
     return tuple(sides[0]), tuple(sides[1])
+
+
+FRESH_LEARNING_RATE = 1e-3
+"""The peak rate a module drawn fresh beside a loaded base trains at where a run names no groups
+(`OptimConfig.fresh_groups`), on the run's own schedule's shape: a base fine-tunes at a rate a fresh
+module barely moves at. On a toy whose answer is in a context only cross-attention reads (a four-layer
+decoder, blocks before layers 1 and 3, AdamW, 1000 steps), the blocks learned nothing at a base's 1e-5
+(held loss 4.50 against the no-context control's 4.51), little with only their gates at 100 times
+(4.47), and as at 1e-3 throughout with every weight of theirs at 1e-3 (2.72). Ledger 2419's runs over
+a loaded Qwen3.5, under AdamW with decay and the Muon hybrid, adjust it."""
 
 
 def weight_decay_mask(params):
@@ -195,6 +206,12 @@ def _dict_names(path: jax.tree_util.KeyPath) -> tuple[str, ...]:
     view never produces on a parameter tree."""
     return tuple(entry.key for entry in path
                  if isinstance(entry, jax.tree_util.DictKey))
+
+
+def parameter_name(path: jax.tree_util.KeyPath) -> str:
+    """A parameter's path under `params` as a pattern matches it: its dict keys joined by '/'
+    (`layers_0/attn/q_proj/kernel`), as a `ParamGroup`'s and an inspection's patterns read it."""
+    return "/".join(_dict_names(path))
 
 
 def _sown(node, name: str):
@@ -1286,16 +1303,23 @@ class ParamGroup:
     """
 
     name: str
-    patterns: tuple[str, ...]
+    patterns: tuple[str, ...] = ()
     learning_rate_multiplier: float = 1.0
     weight_decay: float | None = None
+    spared: bool = False
+    """Whether the group's decay spares its biases and vectors as an ungrouped optimizer's does
+    (`weight_decay_mask`); False decays every parameter the group claims."""
     schedule: ScheduleBase | None = None
     b1: ScheduleBase | None = None
     bounds: tuple[float, float] | None = None
+    fresh: bool = False
+    """Whether the group claims the modules its run draws fresh beside a loaded base, ahead of its own
+    `patterns` (`Objective.fresh_modules`): what `OptimConfig.with_fresh` names before a run records
+    the group."""
 
     def __post_init__(self):
         object.__setattr__(self, "patterns", tuple(self.patterns))
-        if not self.patterns:
+        if not self.patterns and not self.fresh:
             raise ValueError(f"param group {self.name!r} matches no pattern")
         if self.learning_rate_multiplier <= 0:
             raise ValueError(
@@ -1369,7 +1393,7 @@ def param_labels(groups: Sequence[ParamGroup]):
     # 45b6b57b.
     def labels(params):
         def label(path: jax.tree_util.KeyPath, _) -> str:
-            name = "/".join(_dict_names(path))
+            name = parameter_name(path)
             for group in groups:
                 if any(fnmatch.fnmatchcase(name, pattern) for pattern in group.patterns):
                     return group.name
@@ -1521,6 +1545,11 @@ class ScheduleBase:
         one factor, a param group's multiplier."""
         raise NotImplementedError
 
+    def peak(self) -> float:
+        """The highest value the schedule takes: its largest rate-valued field, a warmup's or decay's
+        ends, where its formula reaches no higher."""
+        return max(self.rates().values(), default=1.0)
+
 
 @dataclasses.dataclass(frozen=True)
 class Cosine(ScheduleBase):
@@ -1588,6 +1617,10 @@ class Power(ScheduleBase):
 
     def warmup(self, steps: int | None) -> int:
         return self._warmup(self.warmup_steps, steps, None if self.tail is None else self.tail.steps)
+
+    def peak(self) -> float:
+        """`peak_value`, the cap the power law climbs to."""
+        return self.peak_value
 
     def values(self, steps: int | None, rates: Rates | None = None
                ) -> optax.Schedule:
@@ -1716,6 +1749,10 @@ class Exponential(ScheduleBase):
     end_value: float = dataclasses.field(metadata={'rate': True})
     decay_steps: int | None = None
     offset: float = dataclasses.field(default=0.0, metadata={'rate': True})
+
+    def peak(self) -> float:
+        """Its higher end, `offset` added."""
+        return self.offset + max(self.init_value, self.end_value)
 
     def values(self, steps: int | None, rates: Rates | None = None
                ) -> optax.Schedule:
@@ -1886,14 +1923,19 @@ class OptimConfig:
             names = [group.name for group in self.param_groups]
             if len(set(names)) != len(names):
                 raise ValueError(f"param group names repeat: {names}")
+            claiming = [group.name for group in self.param_groups if group.fresh]
+            if claiming:
+                raise ValueError(f"param groups {claiming} claim the modules a run draws fresh, which the "
+                                 f"run names (`OptimConfig.with_fresh`) before it builds their optimizer")
             solvers = {}
             for group in self.param_groups:
                 decay = {} if group.weight_decay is None else {'weight_decay': group.weight_decay}
-                solvers[group.name] = group.solver(make, self.learning_rate, steps, {**opts, **decay})
+                grouped = {**opts, **decay}
+                spared = {'mask': weight_decay_mask} if group.spared and self._spares(make) else {}
+                solvers[group.name] = group.solver(make, self.learning_rate, steps, {**grouped, **spared})
             solver = optax.multi_transform(solvers, param_labels(self.param_groups))
         else:
-            # A factory that takes a decay mask takes the split; Muon decays every parameter it updates.
-            if self.optimizer not in ('muon', 'muonclip') and 'mask' in inspect.signature(make).parameters:
+            if self._spares(make):
                 opts['mask'] = weight_decay_mask
             solver = scheduled_solver(make, self.learning_rate, steps, opts)
 
@@ -1906,6 +1948,39 @@ class OptimConfig:
         if self.ema_profiles:
             solver = power_profiles(solver, self.ema_profiles)
         return solver
+
+    def _spares(self, make: Callable[..., optax.GradientTransformation]) -> bool:
+        """Whether the optimizer's decay takes timm's split (`weight_decay_mask`): a factory that takes a
+        decay mask, and never Muon, which decays every parameter it updates as Moonlight does."""
+        return self.optimizer not in ('muon', 'muonclip') and 'mask' in inspect.signature(make).parameters
+
+    def fresh_groups(self) -> tuple[ParamGroup, ...]:
+        """The groups a run takes where it names none and draws modules fresh beside a loaded base: those
+        modules at `FRESH_LEARNING_RATE` at the peak of this config's schedule, on its shape (its rate
+        times their quotient), or at its own where that is higher, and every other parameter at its own,
+        each sparing what the ungrouped decay spares (`ParamGroup.spared`)."""
+        rate = self.learning_rate
+        peak = rate.peak() if isinstance(rate, ScheduleBase) else rate
+        multiplier = max(1.0, FRESH_LEARNING_RATE / peak) if peak > 0 else 1.0
+        return (ParamGroup("fresh", fresh=True, learning_rate_multiplier=multiplier, spared=True),
+                ParamGroup("base", ("*",), spared=True))
+
+    def with_fresh(self, modules: Sequence[str]) -> OptimConfig:
+        """This config with each group that claims the fresh modules (`ParamGroup.fresh`) matching the
+        parameters of `modules`, each a module's path under `params` as a parameter's name begins
+        (`parameter_name`), ahead of its own patterns: the groups a run records and trains in, its
+        modules drawn fresh beside a loaded base (`Objective.fresh_modules`). Refused where such a group
+        then matches nothing, in a run that draws nothing fresh."""
+        claimed = tuple(f"{glob.escape(module)}/*" for module in modules)
+        groups = []
+        for group in self.param_groups:
+            if group.fresh:
+                if not claimed and not group.patterns:
+                    raise ValueError(f"param group {group.name!r} claims the modules its run draws fresh "
+                                     f"beside a loaded base, and it draws none")
+                group = dataclasses.replace(group, patterns=(*claimed, *group.patterns), fresh=False)
+            groups.append(group)
+        return dataclasses.replace(self, param_groups=tuple(groups))
 
     def rates(self) -> dict[str | None, dict[str, float]]:
         """The rate fields each of `build`'s solvers holds in its state

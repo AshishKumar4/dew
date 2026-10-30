@@ -45,7 +45,7 @@ from etils import epath
 
 import dew.io
 from dew import registry, training
-from dew._coordination import agree_process_phase, agreed
+from dew._coordination import agree_process_phase, agreed, agreed_same
 from dew._records import JSON, duration, is_share, recorded_duration
 from dew.cache import dew_cache_dir
 from dew.checkpoints import RUN_FILE, Checkpoints, Keep, Resume
@@ -61,7 +61,7 @@ from dew.nn.dex import DifferentialExtension
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import attention_route
 from dew.objectives.base import Effects, Loss, Metric, Objective
-from dew.optim import OptimConfig
+from dew.optim import OptimConfig, ParamGroup
 from dew.quantization import Quantization
 from dew.registry import (
     Annotation,
@@ -254,6 +254,31 @@ _JSON_FLAG = tyro.constructors.PrimitiveConstructorSpec(
 def _flag_json(text: str) -> JSON:
     """A JSON flag's value: its JSON, or None for `None`, as every optional flag spells it."""
     return None if text == "None" else json.loads(text)
+
+
+def recorded_param_groups(saved: epath.Path) -> tuple[ParamGroup, ...] | None:
+    """The param groups the run whose record is `saved` trained in, read alone: the rest of the record,
+    a data chain only its Python holds among it, may not rebuild here. () for a record written before
+    runs took groups; None where the record holds no optimizer, a run defined in Python without one."""
+    fields = json.loads(saved.read_text()).get("fields")
+    optim = fields.get("optim") if isinstance(fields, Mapping) else None
+    if not isinstance(optim, Mapping):
+        return None
+    held = optim.get("fields", optim)
+    groups = held.get("param_groups", []) if isinstance(held, Mapping) else []
+    return from_record(tuple[ParamGroup, ...], groups)
+
+
+def trained_modules(objective: Objective[Loss, Effects], modules: Sequence[str]) -> tuple[str, ...]:
+    """Those of `modules`, paths under `params`, that hold a parameter `objective` trains, as its tree
+    is drawn (`Objective.init`, its shapes alone): a tied readout is drawn with none."""
+    if not modules:
+        return ()
+    from dew.optim import parameter_name
+
+    trained = jax.eval_shape(lambda: objective.init(jax.random.key(0)))["params"]
+    names = [parameter_name(path) for path, _ in jax.tree_util.tree_leaves_with_path(trained)]
+    return tuple(module for module in modules if any(name.startswith(f"{module}/") for name in names))
 
 
 def _best_argument():
@@ -1568,6 +1593,7 @@ class RunConfig:
         # The record names the run's directory, so its run.json trains the same run again.
         self = dataclasses.replace(self.recorded(objective),
                                    trainer=dataclasses.replace(self.trainer, name=name))
+        self = dataclasses.replace(self, optim=self.grouped(objective, name))
         trainer = self.trainer
         if dataset.plan is not None:
             summary = {**(summary or {}), "data_plan": dataset.plan.record()}
@@ -1649,6 +1675,33 @@ class RunConfig:
         mesh = self.trainer.mesh.build(compile_only_gpus(target.generation, target.devices, target.capacity))
         with generation.chosen(attention_form=self.trainer.attention_form):
             return target.compiled(self.built(objective, mesh, rollout, links=target.links), dataset, steps)
+
+    def grouped(self, objective: Objective[Loss, Effects], name: str) -> OptimConfig:
+        """The run's optimizer as it trains under `name`: each group it names that claims the modules its
+        objective draws fresh beside a loaded base matching those that hold a parameter
+        (`ParamGroup.fresh`, `trained_modules`). Where it names none, a resumed run trains in the groups
+        its record names, as its optimizer state holds them (none for a record written before runs took
+        them), and a new run that draws such modules in their default groups (`OptimConfig.fresh_groups`).
+        Every process agrees on the groups before any records them."""
+        def resolved() -> JSON:
+            named = self.optim.param_groups
+            if not named:
+                checkpoints = self.trainer.checkpoints(name)
+                saved = epath.Path(checkpoints.directory) / RUN_FILE
+                recorded = recorded_param_groups(saved) if checkpoints.resumed(
+                    self.trainer.resume) is not None and saved.exists() else None
+                if recorded is not None:
+                    return to_record(recorded, tuple[ParamGroup, ...])
+            groups = named or self.optim.fresh_groups()
+            modules = trained_modules(objective, objective.fresh_modules()) if any(
+                group.fresh for group in groups) else ()
+            if not named and not modules:
+                return to_record((), tuple[ParamGroup, ...])
+            claimed = dataclasses.replace(self.optim, param_groups=groups).with_fresh(modules)
+            return to_record(claimed.param_groups, tuple[ParamGroup, ...])
+        groups = from_record(tuple[ParamGroup, ...], agreed_same("run param groups", resolved))
+        return self.optim if groups == self.optim.param_groups else dataclasses.replace(
+            self.optim, param_groups=groups)
 
     def built[LossT, EffectsT](self, objective: Objective[LossT, EffectsT],
                                mesh: MeshSpec | jax.sharding.Mesh, rollout: Rollout | None,
