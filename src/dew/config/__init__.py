@@ -1238,6 +1238,8 @@ class RunConfig:
                          if name not in self.RESUMABLE and now.get(name) != before.get(name))
         if recorded.trainer.quantization != self.trainer.quantization:
             changed.append("trainer.quantization")
+        if recorded.trainer.precision != self.trainer.precision:
+            changed.append("trainer.precision")
         if changed:
             raise ValueError(f"the run to resume trained other {', '.join(changed)}; resume it as it "
                              "recorded them, or train under another name")
@@ -1626,8 +1628,8 @@ class RunConfig:
                     # A run that names no metrics and validates no split has no suite to score.
                     validation=validation if suites is None else suites or None,
                     summaries=self.val_summaries)
-            if after is not None:
-                after(state, checkpoints.directory)
+                if after is not None:
+                    after(state, checkpoints.directory)
             def publish_checkpoint() -> None:
                 """Upload the checkpoint the run ended on, where a tracker takes one."""
                 if trainer.publish and wandb_tracker is not None:

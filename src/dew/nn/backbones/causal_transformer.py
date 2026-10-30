@@ -57,7 +57,7 @@ from ..attention_residuals import AttentionResiduals, DepthAttention
 from ..blocks import TokenEmbedding, normal_kernel
 from ..cross_attention import CrossBlocks, crossed_flops
 from ..deepseek_v4 import DeepseekV4Mixer
-from ..dex import DexStart, DifferentialExtension, HeadOutputs, LayerDex
+from ..dex import DexStart, DifferentialExtension, HeadOutputs, LayerDex, folded
 from ..dsa_kpool import KPoolSparseAttentionMixer
 from ..dspark import DSpark, DSparkStage, draft as dspark_draft
 from ..engram import Engram, EngramHashes, EngramLayer
@@ -2219,15 +2219,18 @@ class CausalTransformer(nn.Module):
         return self.clone(dex=extension)
 
     @nn.nowrap
-    def dex_export_refusal(self) -> str | None:
-        """Why its DEX does not fold into its layers' output projections for an export
-        (`dew.nn.dex.folded`), by layer; None where every DEX layer folds, or none carries it."""
+    def dex_exported(self, variables: Mapping[str, Mapping]) -> dict[str, Mapping]:
+        """`variables` as an export writes them, each DEX layer's differential folded into its output
+        projection at the operands its layers multiply in (`dew.nn.dex.folded`); `ValueError` names a
+        layer whose heads' outputs pass through more before it, which does not fold."""
         for index, _ in () if self.dex is None else self.dex.layers:
             mixer = self.mixer_of(index)
             refusal = mixer.dex_fold_refusal() if isinstance(mixer, HeadOutputs) else None
             if refusal is not None:
-                return f"layer {index}: {refusal}"
-        return None
+                raise ValueError(f"the source's format holds no differential extension (DEX), and layer "
+                                 f"{index}'s does not fold into its output projection: {refusal}; a run's "
+                                 f"checkpoint keeps this model")
+        return folded(variables, self.dtype)
 
     @nn.nowrap
     def dex_sites(self) -> tuple[tuple[str, ...], frozenset[int]]:

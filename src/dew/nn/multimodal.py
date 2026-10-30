@@ -289,8 +289,8 @@ class MultimodalTransformer(DecoderWrapper):
         return self._over(self.language_model.with_dex(extension))
 
     @nn.nowrap
-    def dex_export_refusal(self) -> str | None:
-        return self.language_model.dex_export_refusal()
+    def dex_exported(self, variables: Mapping[str, Mapping]) -> dict[str, Mapping]:
+        return self.language_model.dex_exported(variables)
 
     @nn.nowrap
     def dex_sites(self) -> tuple[tuple[str, ...], frozenset[int]]:

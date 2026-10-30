@@ -609,23 +609,16 @@ class Pretrained:
         """
         from dew.batch import thaw
         from dew.inference.projections import unpacked
-        from dew.nn.dex import folded
         from dew.nn.protocols import CrossAttending, Differential
 
         if isinstance(self.model, CrossAttending) and self.model.cross_attention is not None:
             raise ValueError("the source's format holds no cross-attention layers; a run's checkpoint "
                              "keeps this model")
-        differential = isinstance(self.model, Differential) and self.model.dex is not None
-        refusal = self.model.dex_export_refusal() if isinstance(self.model, Differential) else None
-        if refusal is not None:
-            raise ValueError(f"the source's format holds no differential extension (DEX), and this one "
-                             f"does not fold into its output projections ({refusal}); a run's checkpoint "
-                             f"keeps this model")
         values = unpacked(self.model, self.variables if variables is None else variables)
         if self.adapter is not None:
             values = self.adapter.merge(values)
-        if differential:
-            values = folded(thaw(values))
+        if isinstance(self.model, Differential) and self.model.dex is not None:
+            values = self.model.dex_exported(thaw(values))
         quantization = self._quantization()
         # Their values, each read as it is written: a load without its weights holds none (`PayloadUnread`).
         retained = LazyTensors(tensor_specs(self.retained_tensors),

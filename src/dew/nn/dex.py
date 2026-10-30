@@ -33,6 +33,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax.traverse_util import unflatten_dict
+from jax.typing import DTypeLike
 
 from dew.batch import leaves_by_path
 
@@ -168,18 +169,25 @@ def differential(attention: jax.Array, heads: jax.Array | tuple[int, ...], proje
     return attention.at[:, :, chosen].add(-(strength.astype(attention.dtype) * moved))
 
 
-def folded(variables: Mapping[str, Mapping]) -> dict[str, Mapping]:
+def folded(variables: Mapping[str, Mapping], compute: DTypeLike | None) -> dict[str, Mapping]:
     """`variables` with each DEX layer's differential at its learned lambda folded into its output
     projection, the extension's parameters and constants dropped: a layer's `o_proj` kernel
     `[H Dv, D]` has each chosen head `h`'s rows `K_h` made `(I - lambda_learn W_h) K_h`, in float64
     and rounded once to the kernel's dtype, so the source's own layer computes what the extended one
-    does outside a run (`annealed`), `O'_h K_h = O_h (I - lambda W_h) K_h`. A layer whose heads'
-    outputs pass through more before `o_proj` does not fold (`HeadOutputs.dex_fold_refusal`)."""
+    does outside a run (`annealed`), `O'_h K_h = O_h (I - lambda W_h) K_h`. Lambda and `W_h` are the
+    ones the layer multiplies by, rounded to its `compute` dtype as `differential` rounds them (None for
+    its parameters' own). A layer whose heads' outputs pass through more before `o_proj` does not fold
+    (`HeadOutputs.dex_fold_refusal`)."""
+
+    def multiplied(value) -> np.ndarray:
+        held = np.asarray(value)
+        return np.asarray(held if compute is None else held.astype(jnp.dtype(compute)), np.float64)
+
     params: dict[tuple[str, ...], jax.Array | np.ndarray] = dict(leaves_by_path(variables["params"]))
     held = leaves_by_path(variables.get(DEX_COLLECTION, {}))
     for prefix in [key[:-1] for key in params if key[-1] == "dex_projection"]:
-        projection = np.asarray(params.pop((*prefix, "dex_projection")), np.float64)
-        strength = np.asarray(params.pop((*prefix, "dex_lambda")), np.float64)
+        projection = multiplied(params.pop((*prefix, "dex_projection")))
+        strength = multiplied(params.pop((*prefix, "dex_lambda")))
         heads = np.asarray(held.pop((*prefix, "dex_heads")))
         del held[(*prefix, "dex_lambda_init")]
         kernel = params[(*prefix, "o_proj", "kernel")]

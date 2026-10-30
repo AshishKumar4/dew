@@ -134,12 +134,8 @@ def matrix_usage(decoder: CausalTransformer, path: tuple[str, ...], lengths, *, 
     head = relative[0] in ('lm_head', 'head_dense', 'continuum', 'project_out')
     if head != logits or relative[0].startswith(('mtp_', 'dspark_')):
         return np.zeros(np.shape(lengths), np.int64)
-    passes = 1
-    if decoder.loop is not None and relative[0].startswith('layers_'):
-        layer = int(relative[0].removeprefix('layers_'))
-        first, end = (0, decoder.num_layers) if decoder.loop.layers is None else decoder.loop.layers
-        if first <= layer < end:
-            passes = decoder.loop.steps
+    passes = layer_passes(decoder, int(relative[0].removeprefix('layers_'))) if relative[0].startswith(
+        'layers_') else 1
     if decoder.altup is not None and relative[-1] == 'modality_router':
         site = AltUpLayer(decoder.altup, decoder.emb_features, parent=None)
         passes *= site.projection_uses()['modality_router']

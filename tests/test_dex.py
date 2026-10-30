@@ -12,6 +12,7 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 from model_support import TINY_DECODER
 from reference_error import as_given, assert_as_exact, widened
 
+import dew.nn.dex
 from dew.batch import FROZEN, thaw
 from dew.interop import Pretrained, PretrainedDecoder
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -207,9 +208,29 @@ def test_an_export_writes_dex_folded_into_its_output_projections(tmp_path):
     before the projection does not fold, and its export refuses."""
     reloaded, through, draw, truth = exported_site(tmp_path)
     assert_as_exact(reloaded, through, draw, "dex exported", seeds=SEEDS["dex exported"], truth_fn=truth)
-    assert every_layer(output_gate=True).dex_export_refusal() == (
-        "layer 0: its output gate scales its heads' outputs channel by channel")
-    assert every_layer().dex_export_refusal() is None
+    gated = every_layer(output_gate=True)
+    with pytest.raises(ValueError):
+        gated.dex_exported(gated.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32)))
+
+
+def test_an_export_folds_the_operands_a_layer_multiplies_in():
+    """A layer computing in bf16 multiplies its chosen heads by lambda and `W_h` rounded to bf16
+    (`differential`), so its export folds those (`dew.nn.dex.folded`): `W = (1 + 2^-9) I` at lambda 1
+    rounds to `I` and folds the head's rows of `o_proj` to zero, where the float32 masters would leave
+    `-2^-9 K_h` (review of ledger 2478)."""
+    width, heads = 8, 2
+    kernel = np.arange(1, heads * width * 4 + 1, dtype=np.float32).reshape(heads * width, 4)
+    layer = {"o_proj": {"kernel": kernel}, "dex_lambda": np.float32(1.0),
+             "dex_projection": np.eye(width, dtype=np.float32)[None] * np.float32(1 + 2 ** -9)}
+    variables = {"params": {"self_attn": layer},
+                 DEX_COLLECTION: {"self_attn": {"dex_heads": np.asarray([1], np.int32),
+                                                "dex_lambda_init": np.float32(0.2)}}}
+    rows = slice(width, 2 * width)
+    in_bf16 = dew.nn.dex.folded(variables, jnp.bfloat16)["params"]["self_attn"]["o_proj"]["kernel"]
+    np.testing.assert_array_equal(in_bf16[rows], np.zeros((width, 4), np.float32))
+    np.testing.assert_array_equal(in_bf16[:width], kernel[:width])
+    in_float32 = dew.nn.dex.folded(variables, None)["params"]["self_attn"]["o_proj"]["kernel"]
+    np.testing.assert_array_equal(in_float32[rows], (-(2 ** -9) * kernel[rows]).astype(np.float32))
 
 
 def test_a_run_starts_from_its_source_and_its_learned_lambda_once_annealed():

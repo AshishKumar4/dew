@@ -22,7 +22,7 @@ from dew.config import RunConfig, earlier_run
 from dew.config.lm import LMRunConfig
 from dew.data import Loading, presets
 from dew.data.sources.tokens import TokenFiles
-from dew.nn.precision import ACCURATE
+from dew.nn.precision import ACCURATE, DTYPE_PRESETS, MATMUL_PRECISIONS, Numerics
 from dew.optim import OneCycle, OptimConfig, ParamGroup
 from dew.registry import ModelConfig
 
@@ -200,6 +200,17 @@ def test_a_run_saved_with_its_attention_form_reads_as_the_precision_it_named(tmp
         run.check_resume(earlier_run(written))
     with pytest.raises(ValueError):
         RunConfig.read(written)
+
+
+def test_a_runs_numerics_read_back_from_its_record(tmp_path):
+    """A run's numerics read back from the record it writes whole, its dtypes, its forms and every
+    matmul precision they take, JAX's levels and each dot algorithm preset, which a record holds by its
+    name (review of ledger 2500)."""
+    run = lm(tmp_path, drawn=False)
+    for matmul in (*MATMUL_PRECISIONS, *jax.lax.DotAlgorithmPreset):
+        numerics = Numerics(DTYPE_PRESETS["bf16-true"], matmul=matmul, forms="accurate")
+        written = dataclasses.replace(run, trainer=dataclasses.replace(run.trainer, precision=numerics))
+        assert RunConfig.read(json.loads(json.dumps(written.record()))).trainer.precision == numerics
 
 
 def test_a_run_recorded_before_its_stop_took_a_plateau_still_pauses(tmp_path):
