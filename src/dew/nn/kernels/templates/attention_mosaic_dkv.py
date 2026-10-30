@@ -11,6 +11,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
+from dew.devices import deterministic_ops_requested
 from dew.nn.kernels.templates import attention_algebra as algebra, mosaic
 from dew.nn.kernels.templates.attention import DKV_GRADS, Dropout, Kind, by_power, shared_place
 from dew.nn.kernels.templates.attention_mosaic_program import (
@@ -454,16 +455,21 @@ def _dkv_launched(walk: _Backward, launch, operands: tuple, graded: list[Kind], 
     """The dK/dV launch `launch` over `operands`: dK, dV and the hook's key and tile gradients in kind order,
     each parameter's (of `shapes`, its own batch rows and heads, `[B or 1, H or 1, ...]`) added into zeros in
     place by every program that reads it, the tiles' keys first `[., ., Kp, Qp]` (row 2577: a bias every row
-    shares summed in the program, not written a row at a time); a fused one's dQ before them, added into
-    zeros too, one copy, or each consumer's own interpreted (`Family.added`)."""
-    queries = operands[0].shape[1]
+    shares summed in the program, not written a row at a time); in deterministic mode each program's own
+    place, the call's `[B, H, ...]`, written once, the shared rows summed in a fixed order after
+    (`template.shared_sum`; row 2620: the adds of the programs sharing one place land in no fixed order); a
+    fused one's dQ before them, added into zeros too, one copy, or each consumer's own interpreted
+    (`Family.added`)."""
+    batch, queries, heads, _ = operands[0].shape
+    if deterministic_ops_requested():
+        shapes = [(batch, heads)] * len(shapes)
     grads = [jax.new_ref(jnp.zeros((*shape[:2], keys_padded) if kind == Kind.KEY
                                    else (*shape[:2], keys_padded, queries), jnp.float32))
              for shape, kind in zip(shapes, graded, strict=True)]
     if not walk.fused:
         dk, dv = launch(*operands, *grads)
         return dk, dv, *_keys_last([jax.freeze(grad) for grad in grads], graded)
-    batch, queries, heads, width = operands[0].shape
+    width = operands[0].shape[3]
     copies = walk.consumers if walk.interpret else 1
     dq = jax.new_ref(jnp.zeros((copies, batch, queries, heads, width), jnp.float32))
     dk, dv = launch(*operands, dq, *grads)
