@@ -205,3 +205,58 @@ def test_a_compile_the_derivation_judged_otherwise_is_told_as_a_model_miss(monke
     probes = (trainer.plan or {}).get("probes") or []
     judged = [probe for probe in probes if (probe["derived_headroom"] >= 0) != probe["fits"]]
     assert compiles.count >= 1 and missed and (not probes or len(missed) == len(judged))
+
+
+GATE_LAYERS = {
+    "decoder": {},
+    "hybrid": {"layer_types": ("mamba", "attention") * 2, "kinds": {"mamba": {"mixer": {
+        "class": "mamba2", "fields": {"num_heads": 4, "head_dim": 16, "state_size": 8, "n_groups": 1,
+                                      "chunk_size": 32}}}, "attention": {}}},
+    "moe": {"mixture": {"experts": 4, "top_k": 2, "layers": (1, 3)}},
+}
+"""The gate's decoders (row 2113): dense, hybrid of Mamba-2 and attention layers, and mixture of experts."""
+
+
+def gated(layers: str, generation: str, remat: str, capacity: int):
+    """A gate case's step compiled ahead for one compile-only GPU of `generation` stating `capacity`
+    bytes: its first compile's probe."""
+    from dew.registry import models
+    from dew.training.ahead import compile_ahead, compile_only_gpus
+
+    model = models.build("causal_transformer", vocab_size=128, emb_features=64, num_layers=4, num_heads=4,
+                         num_kv_heads=2, mlp_features=128, max_seq_len=128,
+                         remat=None if remat == "none" else REMAT_POLICIES[remat], **GATE_LAYERS[layers])
+    trainer = Trainer(LMObjective(model, seq_len=128), optax.adamw(1e-3), key=jax.random.key(0), split=1,
+                      mesh=MeshSpec().build(compile_only_gpus(generation, 1)))
+    tokens = ((np.arange(4 * 129).reshape(4, 129) * 7) % 128).astype(np.int32)
+    compile_ahead(trainer, {"text": tokens}, capacity=capacity)
+    return trainer.plan["probes"][0]
+
+
+@pytest.mark.parametrize("remat", ["none", "full"])
+@pytest.mark.parametrize("generation", ["sm80", "sm90"])
+@pytest.mark.parametrize("layers", list(GATE_LAYERS))
+def test_the_derivation_decides_a_steps_fit_as_its_compile_does(layers, generation, remat, monkeypatch,
+                                                                   tmp_path):
+    """The derived footprint admits a step on a GPU of 1.6 times what its compile needs and refuses it on
+    0.6 times, as the compile does, over decoders dense, hybrid and of experts, Ampere and Hopper, no
+    recomputation and full (row 2113's gate, in the kernel gate's evidence shape, `compile_evidence`).
+    Both needs are read off one compile at a roomy GPU, the bytes beyond what each leaves free there:
+    the headroom either reads grows byte for byte with the GPU's (`derived_headroom`, `step_headroom`),
+    and XLA's own rematerialization, which a tight GPU's compile runs, cuts too little to move a
+    decision at these margins."""
+    from compile_evidence import Evidence, Facts, Measurement, Prediction
+
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path))
+    roomy = 1 << 34
+    probe = gated(layers, generation, remat, roomy)
+    need, derived = roomy - probe["headroom"], roomy - probe["derived_headroom"]
+    terms = probe["derived"]
+    for margin, admits in ((1.6, True), (0.6, False)):
+        budget = int(need * margin)
+        evidence = Evidence(
+            f"{layers} {generation} remat {remat} at {margin} of its need", "",
+            Facts((layers, remat), generation),
+            Prediction({"peak": terms["peak"]}, derived, budget, derived <= budget, "bytes"),
+            Measurement({"temp": probe["temp"]}, need <= budget, "xla", jax.__version__))
+        assert evidence.compiled.admits == admits and evidence.agrees, evidence.describe()
