@@ -315,7 +315,8 @@ def an_lm_run_measures_its_kernel_launches_as_set(tmp_path):
         picks = Path(kernel_picks_path(jax.devices()[0].device_kind))
     finally:
         jax.config.update("jax_compilation_cache_dir", cached)
-    environment = {**os.environ, "JAX_COMPILATION_CACHE_DIR": str(compiled), "PYTHONPATH": str(REPO_ROOT / "src"),
+    environment = {**os.environ, "JAX_COMPILATION_CACHE_DIR": str(compiled),
+                   "PYTHONPATH": str(REPO_ROOT / "src"),
                    "XLA_FLAGS": without_deterministic_ops(os.environ.get("XLA_FLAGS", ""))}
     dew_train(tmp_path, environment, *train_arguments("lm", tmp_path, "tuned", **{
         "trainer.steps": 1, "trainer.tune_kernels": "True", "trainer.mesh": {},
