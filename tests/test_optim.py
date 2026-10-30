@@ -283,7 +283,9 @@ def test_a_stated_dot_algorithm_is_muons_products_or_its_platforms_refusal(algor
     products = [line for line in lowered.as_text().splitlines()
                 if "dot_general" in line and "batching_dims" in line]
     # The algorithm itself, its operands' and accumulation's types and its one primitive product.
-    stated = (f"algorithm = <lhs_precision_type = {operand}, rhs_precision_type = {operand}, "
+    # The algorithm's own precision type (TF32's tf32), apart from its operands' f32 storage.
+    precision = algorithm.split("_")[0].lower()
+    stated = (f"algorithm = <lhs_precision_type = {precision}, rhs_precision_type = {precision}, "
               "accumulation_type = f32, lhs_component_count = 1, rhs_component_count = 1, "
               "num_primitive_operations = 1,")
     assert products and all(f"x{operand}>" in line and stated in line for line in products)
