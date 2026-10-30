@@ -1533,12 +1533,13 @@ def _residuals(shape) -> tuple:
 
 def _backward_models(op, ba, config) -> dict:
     """Each backward launch's register model by its kernel's name (`attention_dq`, `attention_dkv`, a width
-    share's `_columnsN`, the one launch's `attention_dkv_fused`), at its own layout and consumers
-    (`BackwardTiles.dkv`)."""
+    share's `_columnsN`, the one launch's `attention_dkv_fused`, or `attention_dkv_shared` over shared
+    keys), at its own layout and consumers (`BackwardTiles.dkv`)."""
     dq, dkv = op._launch_registers(ba, config)
     if config.fused:
         family = attention_mosaic_program.bundle_of(config, jnp.bfloat16)
-        return {"attention_dkv_fused": resources.register_model(family, config.consumers, dkv)}
+        name = "attention_dkv_shared" if config.shared_keys else "attention_dkv_fused"
+        return {name: resources.register_model(family, config.consumers, dkv)}
     models = {}
     for kind, tiles, registers in (("dq", config, dq), ("dkv", config.dkv, dkv)):
         family = attention_mosaic_program.bundle_of(tiles, jnp.bfloat16)

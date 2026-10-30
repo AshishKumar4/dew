@@ -10,8 +10,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels.templates import attention_algebra as algebra, mosaic
-from dew.nn.kernels.templates.attention import by_power
+from dew.nn.kernels.templates import mosaic
 from dew.nn.kernels.templates.attention_mosaic_program import (
     BackwardTiles,
     _coords,
@@ -21,7 +20,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _views_of,
     stated,
 )
-from dew.nn.kernels.templates.attention_mosaic_scores import _Backward, _dq_added, _scores
+from dew.nn.kernels.templates.attention_mosaic_scores import _Backward, _dq_added, _tile_scores
 
 
 def _fused_allocations(family: mosaic.Family, config: BackwardTiles, width: int, dtype, stages: int
@@ -49,34 +48,14 @@ def _fused_step(walk: _Backward, resident: tuple, rows_of, staged, coords_of, wh
     weights and score cotangents staged in `staged`, whose transposes are dV's and dK's left operands
     (`algebra.value_operands`, `cotangent_product`'s `aᵀ @ b`) issued into `accumulators` in place, and the
     cotangents times the resident keys the tile's dQ, added into dQ (`add_dq(first query, dQ)`)."""
-    k_smem, v_smem = resident
+    k_smem = resident[0]
     family, tiles = walk.program.family, walk.program.tiles
     shape = (tiles.block_q, tiles.block_k)
     dk_acc, dv_acc = accumulators
     q_slot, do_slot = slots["queries"], slots["douts"]
     q_first = index * tiles.block_q
-    # The tile's queries' statistics read before its products, which their loads run under (ET-A05AB5/6-h100:
-    # read past them, 2.32 ms the launch at Qwen3-8B causal; before them, 2.05 against base's 2.09).
-    rows = rows_of(q_first)
-    # The logits from the query taken by its power in registers (`_Backward.scaled`), dK from the call's own.
-    keys = k_smem.transpose((1, 0))
-    s = (family.registers_product(by_power(family.tile_of(q_slot), walk.spec.prescale), keys, walk.interpret)
-         if walk.scaled else family.product(q_slot, keys, shape))
-    dp = family.product(do_slot, v_smem.transpose((1, 0)), shape)
-
-    def scores(*, masked: bool):
-        # A tile every query sees whole (`masked` False) takes no mask (`_dq_step`'s choice).
-        exponentials, weights, cotangents, _, _ = _scores(walk, coords_of(q_first), (), s, dp, *rows,
-                                                          masked=masked)
-        return exponentials, weights, cotangents
-
-    if masked is None:
-        exponentials, weights, cotangents = lax.cond(whole(index), functools.partial(scores, masked=False),
-                                                     functools.partial(scores, masked=True))
-    else:
-        exponentials, weights, cotangents = scores(masked=masked)
-    ((part, _),) = algebra.cotangent_parts(cotangents * walk.grad_scale, q_slot.dtype, accurate=False)
-    narrowed = algebra.value_weights(exponentials, weights, do_slot.dtype)
+    narrowed, part = _tile_scores(walk, (q_slot, do_slot), resident, rows_of(q_first), coords_of(q_first),
+                                  whole(index), shape, masked=masked)
     family.staged(narrowed, staged.at[0])
     dv_acc = family.products(dv_acc, staged.at[0].transpose((1, 0)), do_slot, walk.interpret)
     cotangents_staged = staged.at[1]

@@ -13,8 +13,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels.templates import attention_algebra as algebra, mosaic
-from dew.nn.kernels.templates.attention import by_power
+from dew.nn.kernels.templates import mosaic
 from dew.nn.kernels.templates.attention_mosaic_program import (
     BackwardTiles,
     _coords,
@@ -24,7 +23,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _views_of,
     stated,
 )
-from dew.nn.kernels.templates.attention_mosaic_scores import _Backward, _scores
+from dew.nn.kernels.templates.attention_mosaic_scores import _Backward, _tile_scores
 
 
 def _coop_allocations(family: mosaic.Family, config: BackwardTiles, width: int, dtype, stages: int
@@ -63,27 +62,11 @@ def _coop_step(walk: _Backward, share: int, resident: tuple, exchanged, rows_of,
     dk_acc, dv_acc = accumulators
     q_slot, do_slot = slots["queries"], slots["douts"]
     q_first = index * tiles.block_q
-    rows = rows_of(q_first)
     own = pl.ds(share * keys, keys)
-    # The logits from the query taken by its power in registers (`_Backward.scaled`), dK from the call's own.
-    held = k_smem.at[own].transpose((1, 0))
-    s = (family.registers_product(by_power(family.tile_of(q_slot), walk.spec.prescale), held, walk.interpret)
-         if walk.scaled else family.product(q_slot, held, (tiles.block_q, keys)))
-    dp = family.product(do_slot, v_smem.at[own].transpose((1, 0)), (tiles.block_q, keys))
-
-    def scores(*, masked: bool):
-        exponentials, weights, cotangents, _, _ = _scores(walk, coords_of(q_first), (), s, dp, *rows,
-                                                          masked=masked)
-        return exponentials, weights, cotangents
-
-    if masked is None:
-        exponentials, weights, cotangents = lax.cond(whole(index), functools.partial(scores, masked=False),
-                                                     functools.partial(scores, masked=True))
-    else:
-        exponentials, weights, cotangents = scores(masked=masked)
-    ((part, _),) = algebra.cotangent_parts(cotangents * walk.grad_scale, q_slot.dtype, accurate=False)
+    narrowed, part = _tile_scores(walk, (q_slot, do_slot), (k_smem.at[own], v_smem.at[own]), rows_of(q_first),
+                                  coords_of(q_first), whole(index), (tiles.block_q, keys), masked=masked)
     weights_ref, cotangents_ref = exchanged.at[0], exchanged.at[1]
-    family.staged(algebra.value_weights(exponentials, weights, do_slot.dtype), weights_ref.at[:, own])
+    family.staged(narrowed, weights_ref.at[:, own])
     family.staged(part, cotangents_ref.at[:, own])
     family.turn(turns[0], consumers)
     mine = pl.ds(share * columns, columns)
