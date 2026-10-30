@@ -53,8 +53,9 @@ from dew.batch import prefix_sum, real_places, valid_order
 from dew.mesh import LogicalAxes
 from dew.nn.attention import reference_attention
 from dew.nn.attention_masks import causal_attention_mask, visibility_mask
+from dew.nn.cross_attention import context_mask
 from dew.nn.dense import Dense, DenseGeneral
-from dew.nn.documents import CrossDocuments, document_mask
+from dew.nn.documents import document_mask
 from dew.nn.fake_quant import FakeQuantizing
 from dew.nn.flops import cross_attention_flops, projection_flops
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of, counted_places
@@ -865,9 +866,7 @@ class DeepseekV4Attention(FakeQuantizing):
         read its block leaves out) and, where given, each query reading its own document's keys alone
         (`queries` `[B, S]`, `segments` `[B, C]`): its logits in float32 after the product, its per-head
         sink beside them, unmasked by causality, then its grouped output projection (`_output`)."""
-        documents = None if queries is None or segments is None else CrossDocuments(queries, segments)
-        seen = visibility_mask(query.shape[1], key.shape[1], causal=False, sliding_window=None,
-                               segment_ids=documents, key_value_seq_lengths=jnp.maximum(lengths, 1))
+        seen = context_mask(query, key, jnp.maximum(lengths, 1), queries, segments)
         context = reference_attention(query, key, value, mask=seen, sinks=self.sinks,
                                       precision=self.precision, wide_logits=True)
         return self._output(checkpoint_name(context, 'context'))
