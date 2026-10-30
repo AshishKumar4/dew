@@ -413,11 +413,13 @@ TEMPLATE_SUPPORTS = (
           "or one for them all, or is wider than fp32, which the template's score hook reads it in",
           row=INHERENT),
     _Need('dense_bias',
-          lambda case: not case.dense_bias or (not case.row_bias and device_generation() == 'sm90'),
+          lambda case: not case.dense_bias or (not case.row_bias
+                                               and generation.gpu_target().architecture.wgmma),
           "the call's bias varies by query: by batch row too, which the xla kernel runs 7% faster on an "
-          "H100, or a table every row shares off an H100, where the template's frozen Triton mainloop reads "
-          "it spread to every row, unmeasured; a shared table the H100's Mosaic mainloop runs a third "
-          "faster in half the memory (ET-DBIAS-h100; named, it runs)", row='2577', kind='measured'),
+          "H100, or a table every row shares on a GPU without warpgroup MMA, where the template's frozen "
+          "Triton mainloop reads it spread to every row, unmeasured; a shared table the warpgroup-MMA "
+          "Mosaic mainloop runs a third faster in half the memory (ET-DBIAS-h100; named, it runs)",
+          row='2577', kind='measured'),
     _Need('shards', lambda case: case.shards == 1,
           "an automatic sequence axis gathers the keys, and a pallas call would gather the queries back",
           row=INHERENT),
