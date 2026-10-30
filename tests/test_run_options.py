@@ -43,6 +43,7 @@ from dew.data.pipeline import Rejected
 from dew.data.sources.tokens import TokenFiles
 from dew.decision import decisions
 from dew.decision.config import DecisionRunConfig
+from dew.decision.layout import Reads
 from dew.diffusion.presets import Flow
 from dew.inputs import TextCondition
 from dew.lora import LoRA
@@ -334,12 +335,17 @@ def members_of(annotation: type, base=None) -> list[object]:
     return values
 
 
+WITNESSES = {Reads: (Reads((("row", "self", "whole"),)),)}
+"""Values of Dew's classes that build from no defaults, each one a run here trains with: a row's reads of
+its streams (`Reads`), here its one stream reading its whole document both ways."""
+
+
 def members_built(member: type) -> list[object]:
-    """`member` built from its defaults, where it has them."""
+    """`member` built from its defaults, where it has them, else its `WITNESSES`."""
     try:
         return [member()]
     except (TypeError, ValueError):
-        return []
+        return list(WITNESSES.get(member, ()))
 
 
 def alternatives(annotation, base=None) -> list[object]:

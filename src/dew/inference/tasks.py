@@ -663,12 +663,12 @@ class TextSettings(TaskSettings):
 
 @dataclass(frozen=True, kw_only=True)
 class MaskedSettings(TaskSettings):
-    """A masked-diffusion run's settings (`MaskedGeneration.from_settings`): the masking process,
-    the unmasking solver (`Unmask`, or `Confident` for a release's blockwise walk) and its step
+    """A masked-diffusion run's settings (`MaskedGeneration.from_settings`): the masking process, the
+    run's over its model's mask id, the unmasking solver (`Unmask`, or `Confident` for a release's blockwise walk) and its step
     count, the places a blockwise walk unmasks together (`block`; None walks the whole response),
     and the end-of-sequence ids a response stops at, beside the common ones."""
 
-    process: DiscreteProcess
+    process: DiscreteProcess = dataclasses.field(metadata={"derived": "model"})
     solver: Solver
     sampling_steps: int
     eos_token_ids: tuple[int, ...] = ()
