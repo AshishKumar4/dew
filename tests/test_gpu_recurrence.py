@@ -10,11 +10,18 @@ cases the CPU does not interpret, run in one process (`gpu_flow`), each cell its
 - The portable backward as a GPU compiles it, and the SSD port's forward and gradient, finite and on par
   under every regime (test_recurrence_stability).
 - The short conv's kernels as exact as XLA's conv at the training shapes (test_short_conv).
+- Each recurrence layer trained on its port's kernels, natively (`PORT_KERNELS`): a gated delta net on the
+  FLA GDN kernels and a Kimi delta attention layer on FLA KDA's chunk_kda, packed rows, forward and every
+  gradient on par from float64 with the portable rule's; their training step the same bit for bit each
+  run, on the port and on the template; and a gated delta net's decode token on its decode kernels (the
+  fused step and the step alone) on par with the portable step's.
 """
 
 import functools
 
+import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 import test_recurrence_mosaic as forward
 import test_recurrence_mosaic_gradient as gradient
@@ -22,8 +29,15 @@ import test_recurrence_stability as stability
 import test_recurrence_template_stability as template_stability
 import test_short_conv as short_conv
 from gpu_flow import Cell, run_cells
+from reference_error import FEWEST_SEEDS, assert_as_exact, with_gradients
+from test_linear_attention import fused_case
 
+from dew.batch import coordinates
+from dew.nn.inputs import MixerCall
+from dew.nn.kda import KimiDeltaAttention
+from dew.nn.kernels import generation
 from dew.nn.kernels.templates.recurrence import mainloop
+from dew.nn.linear import GatedDeltaNet
 
 pytestmark = pytest.mark.gpu(reason="each recurrence route's native kernel: the Mosaic mainloop, the ports")
 
@@ -35,6 +49,93 @@ def on_its_family(check):
             pytest.skip("the mainloop's bundles run compiled on a GPU of the family each claims")
         check()
     return run
+
+
+PORT_KERNELS = {
+    "fla": ("fla_gdn: kkt_solve, recompute_w_u, chunk_fwd_h, chunk_fwd_o, chunk_bwd_dv_local, chunk_bwd_dhu, "
+            "chunk_bwd_dqkwg, prepare_wy_repr_bwd"),
+    "kda": ("fla_kda: intra_rows, intra_solve, recompute_w_u, chunk_fwd_o, bwd_dav, bwd_wy_dqkg, bwd_intra; "
+            "fla_gdn: chunk_fwd_h, chunk_bwd_dhu"),
+}
+"""The port kernels each layer's training cell runs natively, by the layer's port (`trains_on_its_port`)."""
+
+ROWS, TOKENS, WIDTH = 2, 256, 256
+"""A layer cell's rows, their tokens (four 64-token chunks) and the layers' model width."""
+
+
+def gated_delta_net():
+    return GatedDeltaNet(emb_features=WIDTH, num_k_heads=2, num_v_heads=4, head_k_dim=128, head_v_dim=128,
+                         dtype=jnp.bfloat16)
+
+
+def kimi_delta_attention():
+    return KimiDeltaAttention(emb_features=WIDTH, num_heads=2, head_dim=128, dtype=jnp.bfloat16)
+
+
+def named(fn, **kernels: str):
+    """`fn` with the recurrence's selectors named to `kernels` (`generation.chosen`)."""
+    def run(*args):
+        with generation.chosen(**kernels):
+            return fn(*args)
+    return run
+
+
+def trains_on_its_port(make):
+    """A layer over two rows of two packed documents each, its forward and the gradients of its input and
+    every parameter under a drawn cotangent on its port (`PORT_KERNELS`, named), on par from float64 with
+    the portable rule's (check 1, the layer in float64 the truth)."""
+    layer = make()
+    tokens = coordinates(segments=jnp.asarray([[1] * 150 + [2] * 106, [1] * 90 + [2] * 166]), max_segments=2)
+
+    def apply(params, x):
+        return layer.apply(params, x, MixerCall(tokens=tokens))
+
+    def draw(seed):
+        x = jax.random.normal(jax.random.key(seed), (ROWS, TOKENS, WIDTH)).astype(jnp.bfloat16)
+        params = named(layer.init, gated_delta_rule="xla")(jax.random.key(1000 + seed), x)
+        cotangent = jax.random.normal(jax.random.key(2000 + seed), x.shape).astype(jnp.bfloat16)
+        return params, x, cotangent
+
+    def truth(params, x, cotangent):
+        wide = layer.clone(dtype=jnp.float64)
+        return with_gradients(lambda params, x: wide.apply(params, x, MixerCall(tokens=tokens)))(
+            params, x, cotangent)
+
+    assert_as_exact(named(with_gradients(apply), gated_delta_rule="fla"),
+                    named(with_gradients(apply), gated_delta_rule="xla"), draw,
+                    f"{type(layer).__name__} trained on its port", seeds=FEWEST_SEEDS, truth_fn=truth)
+
+
+def repeats_bit_for_bit(make, kernel: str):
+    """A layer's training step on `kernel`, the same compiled program on the same inputs, run twice: every
+    gradient the same bit for bit (the kernels sum in a fixed order)."""
+    layer = make()
+    x = jax.random.normal(jax.random.key(5), (ROWS, TOKENS, WIDTH)).astype(jnp.bfloat16)
+    params = named(layer.init, gated_delta_rule="xla")(jax.random.key(6), x)
+    step = jax.jit(named(jax.grad(lambda params, x: jnp.sum(layer.apply(params, x).astype(jnp.float32) ** 2),
+                                  argnums=(0, 1)), gated_delta_rule=kernel))
+    first, again = (jax.tree.map(np.asarray, step(params, x)) for _ in range(2))
+    for (path, one), other in zip(jax.tree_util.tree_leaves_with_path(first), jax.tree.leaves(again),
+                                  strict=True):
+        np.testing.assert_array_equal(one.view(np.uint8), other.view(np.uint8),
+                                      err_msg=jax.tree_util.keystr(path))
+
+
+def decodes_on_its_kernel(kernel: str):
+    """A gated delta net's decode token on `kernel` (`linear.DELTA_DECODE`: 'fused' or 'step'), its output
+    and its updated state on par from float64 with the portable step's (check 1)."""
+    layer = fused_case(4, 128, 3, jnp.bfloat16, jnp.float32)[0]
+
+    def decode(variables, cache, token):
+        out, after = layer.apply({**variables, "cache": cache}, token, MixerCall(decode=True),
+                                 mutable=["cache"])
+        return out, after["cache"]["recurrent_state"]
+
+    def draw(seed):
+        return fused_case(4, 128, 3, jnp.bfloat16, jnp.float32, seed)[1:]
+
+    assert_as_exact(named(decode, delta_decode=kernel), named(decode, delta_decode="xla"), draw,
+                    f"a gated delta net decoding on its {kernel} kernel", seeds=FEWEST_SEEDS)
 
 
 def test_the_recurrences_run_on_this_gpu():
@@ -79,4 +180,13 @@ def test_the_recurrences_run_on_this_gpu():
                                  model, dtype, packed))
           for model in sorted(short_conv.CONV_SHAPES) for dtype in (jnp.bfloat16, jnp.float32)
           for packed in (False, True)),
+        Cell(f"a gated delta net trains on its port on par with the portable rule ({PORT_KERNELS['fla']})",
+             functools.partial(trains_on_its_port, gated_delta_net)),
+        Cell(f"a Kimi delta attention layer trains on its port on par with the portable rule "
+             f"({PORT_KERNELS['kda']})", functools.partial(trains_on_its_port, kimi_delta_attention)),
+        *(Cell(f"a {make.__name__} training step on {kernel} repeats bit for bit",
+               functools.partial(repeats_bit_for_bit, make, kernel))
+          for make in (gated_delta_net, kimi_delta_attention) for kernel in ("fla", "mosaic_gpu")),
+        *(Cell(f"a gated delta net decodes on its {kernel} kernel on par with the portable step",
+               functools.partial(decodes_on_its_kernel, kernel)) for kernel in ("fused", "step")),
     ])
