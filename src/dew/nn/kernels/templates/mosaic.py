@@ -507,6 +507,13 @@ class Slots:
         past it (`Family.walk`'s `in_flight`) gives its slots back a step later (`released`)."""
         if self._released:
             raise ValueError("a step whose products run past it gives back no slot early")
+        self.acquire_all()
+
+    def acquire_all(self) -> None:
+        """Every slot the step has not read acquired in the step's own trace: a slot first acquired inside a
+        loop's body (a rolled `lax.fori_loop`) is kept by its first read, which would carry that body's slot
+        index past it, a scalar the kernel then takes as an input (the Mosaic GPU lowering fails on it); a
+        step that reads its slots in a loop acquires them before it."""
         for name in self._rings:
             self[name]
 
