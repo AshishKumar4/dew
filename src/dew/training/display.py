@@ -70,6 +70,10 @@ PLAIN = Shown()
 # The panel's width on a wide terminal; a narrower one gets all of its own.
 WIDEST = 120
 
+EXAMPLES_CONSUMED_SCALAR = "train/examples_consumed"
+"""The scalar a run on the examples clock logs its consumed examples under (`dew.training.interval.
+Interval.consumption`), which the display reads."""
+
 
 def redraws(console: Console) -> bool:
     """Whether the panel can redraw on `console`: a terminal or a notebook. rich
@@ -447,7 +451,7 @@ class TrainingDisplay:
         if not self.shown_here:
             return
         self.corpus_counts = {name: value for name, value in scalars.items() if name.startswith("data/")}
-        self.consumed = scalars.get("train/examples_consumed", self.consumed)
+        self.consumed = scalars.get(EXAMPLES_CONSUMED_SCALAR, self.consumed)
         for name, value in scalars.items():
             if name in self.corpus_counts:
                 continue

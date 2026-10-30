@@ -6,8 +6,8 @@ Built so far: the joint row's user turn as segments (`JointLayout.segments`: `Te
 `Schema`); layouts and heads recorded by import path; and the schema's stream (`Schema.stream`): the
 schema read as the row's context, in a backbone pass of its own over the same weights, which the
 cross-attention reads and the head pools its questions and options from (§2, §3); and a lettered
-question row's question as its context (`Instructions.stream`, `OptionLines.stream`, both "context"
-together): the row holds the state and the answer cue, whose state reads the letters
+question row's question as its context (`Instructions.stream`, "context", its option lines following
+it): the row holds the state and the answer cue, whose state reads the letters
 (`Labels`), the context the question and its lettered options, which the cross-attention reads and a
 head that pools option lines (`SlotReadout`) pools from; a label readout (`LabelReadout`) pools nothing.
 A question longer than the context its backbone reads is counted unfit, and a "none of the above" a
