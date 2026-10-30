@@ -632,6 +632,9 @@ class MixerCall:
     kv_store: dict | None = None
     """Each name a layer publishes under to the run's later layers: attention's
     keys, values and positions, an index selection, a draft's context."""
+    depth: jax.Array | None = None
+    """The layer's index in its stack `[B, S]`, where its mixer reads it (`MixerBase.reads_depth`):
+    data a scan of like layers hands each one (`LayerInputs.depth`)."""
 
     def unread(self, reads: frozenset[str]) -> tuple[str, ...]:
         """The `MIXING` fields this call sets that a mixer reading `reads` does not read."""
@@ -677,11 +680,14 @@ class LayerInputs:
     is Gemma 3n/4's per-layer input signal. `experts` and `routed` are a
     routing replay's `[..., top_k]` expert ids and coverage
     (`dew.nn.protocols.Routes`), with `routed` broadcast over the layer axis.
+    `depth` is each layer's index in the stack, for a mixer that computes by
+    it (`MixerBase.reads_depth`, MiniMax's lightning rates).
     """
 
     embeddings: jax.Array | None = None
     experts: jax.Array | None = None
     routed: jax.Array | None = None
+    depth: jax.Array | None = None
 
     def span(self, first: int, count: int) -> LayerInputs:
         """Return layers `first` through `first + count - 1`, keeping the layer axis."""

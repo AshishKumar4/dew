@@ -881,7 +881,7 @@ class DecoderBlock(nn.Module):
         routes = self._routes(per_layer_input)
         mixed = self._mix(
             normed, decode, kv_store, attention_metadata, prediction_phase, train,
-            routes if self._mixer_routes else {})
+            routes if self._mixer_routes else {}, None if per_layer_input is None else per_layer_input.depth)
         if self.wiring.output_norms:
             mixed = self.attention_output_norm(mixed)
         attention_branch = self._branch(mixed, train, "attention")
@@ -1150,14 +1150,14 @@ class DecoderBlock(nn.Module):
                      reduce_fn=lambda _, value: value, init_fn=lambda: mean)
 
     def _mix(self, x, decode: bool, kv_store, attention_metadata, prediction_phase: PredictionPhase,
-             train: bool, routes: dict):
+             train: bool, routes: dict, depth=None):
         """The token mixer over `x`, called with one `MixerCall`. It is never
         called with a `MIXING` field set that it does not read (`ReadsMixing`),
         which it would compute as if unset. The train flag, a prediction phase
         other than ordinary and the layer's replayed experts reach it only
         when the call carries them, since a mixer with no use for one does not
         take it."""
-        call = MixerCall(attention_metadata, decode, kv_store)
+        call = MixerCall(attention_metadata, decode, kv_store, depth)
         unread = call.unread(self.self_attn.reads if isinstance(self.self_attn, ReadsMixing) else frozenset())
         if unread:
             raise ValueError(f"{type(self.self_attn).__name__} does not read the call's {', '.join(unread)}, "

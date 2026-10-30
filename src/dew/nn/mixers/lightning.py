@@ -8,7 +8,9 @@ a7351bf2, :210-339):
 
 with `q`, `k` and `v` one projection under the model's activation, split per head in that order
 (:261-264), and `r` the head's rate: ALiBi's slope for the head (`_build_slope_tensor`, :1234-1256)
-times `1 - layer / (layers - 1) + 1e-5` (:1348), so the first layer forgets fastest. The output is
+times `1 - layer / (layers - 1) + 1e-5` (:1348), so the first layer forgets fastest, each factor in
+fp32 as the reference multiplies its fp32 slopes by it; the layer is data the stack hands each
+(`MixerCall.depth`), so the lightning layers are one kind and scan as one. The output is
 RMS-normed over every head at once (`MiniMaxText01RMSNorm`, eps 1e-6), gated by a sigmoid of the
 layer's input through `output_gate`, and projected back by `out_proj` (:328-334). The reference
 computes it in blocks of 256 tokens (:281-313), the recurrence's chunked form, which is
@@ -25,6 +27,7 @@ import math
 from typing import ClassVar
 
 import jax.numpy as jnp
+import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
@@ -47,12 +50,9 @@ ACTIVATIONS = {'silu': nn.silu}
 """The activations the projection takes, by the config's `hidden_act`: every release's SiLU."""
 
 
-def lightning_rates(heads: int, layer: int, layers: int) -> tuple[float, ...]:
-    """Each head's rate at `layer` of `layers`: ALiBi's slopes (`get_slopes`, :1237-1251) times the
-    layer's factor (:1348), in double precision as the reference's Python computes them."""
-    if layers < 2:
-        raise ValueError(f"a lightning layer's rate falls from the first of its stack's layers to the last, "
-                         f"so the stack holds two or more, not {layers}")
+def lightning_slopes(heads: int) -> tuple[float, ...]:
+    """Each head's slope, ALiBi's (`get_slopes`, :1237-1251), in double precision as the reference's
+    Python computes them before it stores them in fp32."""
 
     def power_of_two(n: int) -> list[float]:
         start = 2 ** (-(2 ** -(math.log2(n) - 3)))
@@ -64,8 +64,7 @@ def lightning_rates(heads: int, layer: int, layers: int) -> tuple[float, ...]:
         closest = 2 ** math.floor(math.log2(n))
         return power_of_two(closest) + slopes(2 * closest)[0::2][:n - closest]
 
-    factor = 1 - layer / (layers - 1) + 1e-5
-    return tuple(slope * factor for slope in slopes(heads))
+    return tuple(slopes(heads))
 
 
 @logical_axes({
@@ -76,8 +75,9 @@ def lightning_rates(heads: int, layer: int, layers: int) -> tuple[float, ...]:
 class LightningAttention(nn.Module):
     """The token mixer of a MiniMax `linear_attention` layer. Parameter names are the release's:
     `qkv_proj` (each head's query, key and value side by side), `output_gate`, `norm/scale` over
-    every head's channels, `out_proj`. `rates` are its heads' (`lightning_rates`). The decode state is
-    `recurrent_state` `[B, H, D, D]` in at least fp32, which the first decode call only allocates."""
+    every head's channels, `out_proj`. `slopes` are its heads' (`lightning_slopes`), scaled by its
+    place among `layers` (`MixerCall.depth`). The decode state is `recurrent_state` `[B, H, D, D]` in
+    at least fp32, which the first decode call only allocates."""
 
     reads: ClassVar[frozenset[str]] = frozenset()
     """None of the call's `MIXING` fields (`dew.nn.inputs.MixerCall`): a recurrence reads every earlier token
@@ -86,7 +86,8 @@ class LightningAttention(nn.Module):
     emb_features: int
     num_heads: int
     head_dim: int
-    rates: tuple[float, ...]
+    slopes: tuple[float, ...]
+    layers: int
     activation: str = 'silu'
     chunk_size: int = CHUNK_SIZE
     norm_eps: float = 1e-6
@@ -111,9 +112,12 @@ class LightningAttention(nn.Module):
         return self.model_flops(lengths) - ssd_flops(lengths, self.num_heads, self.head_dim, self.head_dim)
 
     def setup(self):
-        if len(self.rates) != self.num_heads:
-            raise ValueError(f"a lightning layer holds one rate a head: {len(self.rates)} rates for "
+        if len(self.slopes) != self.num_heads:
+            raise ValueError(f"a lightning layer holds one slope a head: {len(self.slopes)} slopes for "
                              f"{self.num_heads} heads")
+        if self.layers < 2:
+            raise ValueError(f"a lightning layer's rate falls from the first of its stack's layers to the "
+                             f"last, so the stack holds two or more, not {self.layers}")
         if self.activation not in ACTIVATIONS:
             raise ValueError(f"the projection's activation is one of {sorted(ACTIVATIONS)}, got "
                              f"{self.activation!r}")
@@ -136,7 +140,13 @@ class LightningAttention(nn.Module):
         heads = qkv.reshape(batch, length, self.num_heads, 3 * self.head_dim)
         query, key, value = jnp.split(heads, 3, axis=-1)
         wide = at_least_fp32(qkv.dtype)
-        log_decay = jnp.broadcast_to(-jnp.asarray(self.rates, wide), (batch, length, self.num_heads))
+        if call.depth is None:
+            raise ValueError("a lightning layer's rates follow its place in the stack, which a decoder's "
+                             "stack hands it (MixerCall.depth)")
+        # The release's fp32 slopes times its fp32 factor for the layer (:1348), in the state's dtype.
+        factors = 1 - np.arange(self.layers) / (self.layers - 1) + 1e-5
+        rates = jnp.asarray(self.slopes, wide) * jnp.asarray(factors, wide)[jnp.asarray(call.depth)[0, 0]]
+        log_decay = jnp.broadcast_to(-rates, (batch, length, self.num_heads))
         if tokens.valid is not None:
             # exp(0) keeps the memory and a zero value writes nothing.
             log_decay = jnp.where(tokens.valid[:, :, None], log_decay, 0.0)
@@ -169,16 +179,15 @@ class LightningAttention(nn.Module):
 
 @dataclasses.dataclass(frozen=True)
 class LightningAttentionMixer(MixerBase):
-    """The `lightning_attention` kind: MiniMax's linear-attention layer at its place in the stack,
-    `layer_idx` of `num_hidden_layers`, which sets its heads' rates (`lightning_rates`), by the
-    reference's names (`get_slope_rate`); `hidden_act` the projection's activation and `block_size`
-    the chunk the recurrence runs in, which changes no value but its rounding. The heads and their
-    width are the context's: the layer's attention geometry, without its key/value heads, rotary or
-    window."""
+    """The `lightning_attention` kind: MiniMax's linear-attention layer in a stack of
+    `num_hidden_layers`, whose place in it sets its heads' rates (`LightningAttention`), by the
+    reference's names; `hidden_act` the projection's activation and `block_size` the chunk the
+    recurrence runs in, which changes no value but its rounding. The heads and their width are the
+    context's: the layer's attention geometry, without its key/value heads, rotary or window."""
 
     residuals = ('context', 'scan')
+    reads_depth = True
 
-    layer_idx: int = 0
     num_hidden_layers: int = 2
     hidden_act: str = 'silu'
     block_size: int = CHUNK_SIZE
@@ -192,7 +201,8 @@ class LightningAttentionMixer(MixerBase):
             emb_features=ctx.emb_features,
             num_heads=ctx.num_heads,
             head_dim=ctx.head_dim,
-            rates=lightning_rates(ctx.num_heads, self.layer_idx, self.num_hidden_layers),
+            slopes=lightning_slopes(ctx.num_heads),
+            layers=self.num_hidden_layers,
             activation=self.hidden_act,
             chunk_size=self.block_size,
             dtype=ctx.dtype,

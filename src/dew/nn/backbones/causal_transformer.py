@@ -2039,10 +2039,15 @@ class CausalTransformer(nn.Module):
     def _layer_inputs(self, tokens, x, routed_experts, routed) -> LayerInputs | None:
         """The per-layer signal and routing replay the stack slices by layer."""
         embeddings = self.per_layer_inputs(tokens, x) if self.per_layer_input_dim else None
+        # A mixer computing by its layer's place reads it as data (`MixerBase.reads_depth`).
+        reads = any(self.kind_of(kind).mixer.reads_depth for kind in set(self.per_layer_types))
+        depth = None if not reads else jnp.broadcast_to(jnp.arange(self.num_layers, dtype=jnp.int32),
+                                                        (*tokens.shape, self.num_layers))
         if routed_experts is None:
             if routed is not None:
                 raise ValueError("routed marks the tokens a routing record covers; pass routed_experts")
-            return None if embeddings is None else LayerInputs(embeddings=embeddings)
+            return None if embeddings is None and depth is None else LayerInputs(embeddings=embeddings,
+                                                                                 depth=depth)
         routed_experts = jnp.asarray(routed_experts)
         if routed_experts.ndim != 4 or routed_experts.shape[:3] != (*tokens.shape, self.num_layers):
             raise ValueError(
@@ -2050,7 +2055,7 @@ class CausalTransformer(nn.Module):
                 f"leading for this model; got {routed_experts.shape}")
         coverage = None if routed is None else jnp.broadcast_to(
             jnp.asarray(routed, bool)[:, :, None], routed_experts.shape[:3])
-        return LayerInputs(embeddings=embeddings, experts=routed_experts, routed=coverage)
+        return LayerInputs(embeddings=embeddings, experts=routed_experts, routed=coverage, depth=depth)
 
     def per_layer_inputs(self, tokens, inputs_embeds):
         """Return every layer's input signal `[B, S, L, P]` (Gemma 3n/4 PLE).

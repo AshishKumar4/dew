@@ -32,7 +32,7 @@ from ..mla import INDEXER_COLLECTION
 from ..moe import ROUTER_COLLECTION
 from ..sharding import microbatched, microbatches, pipeline_stage, pipeline_stages
 from .decoder_block import DecoderBlock
-from .layer_plan import LayerSpec, group_layers, group_name
+from .layer_plan import LayerSpec, group_layers, group_name, run_period
 
 Block = Callable[[int, str], DecoderBlock]
 """Layer `index`'s block under a module name: what the stack and its stages
@@ -249,51 +249,35 @@ def _by_repeat(period: int, leaf):
     return leaf.reshape(*leaf.shape[:2], leaf.shape[2] // period, period, *leaf.shape[3:])
 
 
-class PeriodBlock(nn.Module):
-    """One period of a periodic run (`layer_plan.scan_groups(periodic=True)`): its layers in order,
-    each built as the stack builds layer `positions[offset]` and named `offset`, which a scan runs as
-    one body over the period's repeats. No layer of it leaves what a later one reads (a provider), so
-    it threads no store."""
-    block: Block
-    positions: tuple[int, ...]
-
-    def setup(self):
-        self.layers = [self.block(index, str(offset)) for offset, index in enumerate(self.positions)]
-
-    def __call__(self, x, *, train: bool, decode: bool, kv_store, per_layer_input, attention_metadata):
-        assert kv_store is None, "a periodic run's layers leave nothing a later layer reads"
-        for offset, layer in enumerate(self.layers):
-            x = layer(x, train=train, decode=decode, kv_store=None,
-                      per_layer_input=None if per_layer_input is None else per_layer_input.layer(offset),
-                      attention_metadata=attention_metadata)
-        return x
-
-
-def _run_module(block: Block, first: int, count: int, period: int) -> DecoderBlock | PeriodBlock:
+def _run_module(block: Block, specs: Sequence[LayerSpec], first: int, count: int,
+                period: int) -> DecoderBlock | 'PipelineStage':
     """The module a scanned run of `count` layers from `first` repeats: one layer for like layers,
-    a `PeriodBlock` of its `period` layers for a periodic run, named for the run's range."""
+    for a periodic run its `period` layers as a pipeline's stage holds its own (`PipelineStage`), each
+    run alone, named for the run's range. No layer of a period leaves what a later one reads (a
+    provider), so it threads no store."""
     if period == 1:
         return block(first, group_name(first, count))
-    return PeriodBlock(block=block, positions=tuple(range(first, first + period)),
-                       name=group_name(first, count))
+    return PipelineStage(block=block, specs=tuple(specs[first:first + period]),
+                         groups=tuple((index, 1) for index in range(period)), offset=first,
+                         name=group_name(first, count))
 
 
 def _scanned_runs(runs, groups: Sequence[tuple[int, int]], specs: Sequence[LayerSpec], x, *, fetching: bool,
                   train: bool, decode: bool, kv_store, per_layer_input, attention_metadata):
     """`run_stack` without the inference prefetch: each run of one layer
     called as the plain loop calls it, and each longer run under flax's
-    scan, a periodic run's (`PeriodBlock`) over its repeats. Training, or a
+    scan, a periodic run's (a `PipelineStage` of its period) over its repeats. Training, or a
     forward that keeps intermediates, through host-resident banks scans with
     the fetch mapped onto each row under remat (`run_stack`)."""
     for run, (first, count) in zip(runs, groups, strict=True):
         inputs = None if per_layer_input is None else per_layer_input.span(first, count)
-        periodic = isinstance(run, PeriodBlock)
+        periodic = isinstance(run, PipelineStage)
         store = kv_store if count == 1 or specs[first].kv_shared else None
         if periodic:
             store = None
             if inputs is not None:
                 # The layer axis, split into repeats of the period, scans over the repeats.
-                inputs = jax.tree.map(functools.partial(_by_repeat, len(run.positions)), inputs)
+                inputs = jax.tree.map(functools.partial(_by_repeat, len(run.specs)), inputs)
 
         def step(layer, carry, per_layer_input, store):
             # A provider writes its keys and values into the store it is given; inside a lifted
@@ -324,7 +308,7 @@ def _scanned_runs(runs, groups: Sequence[tuple[int, int]], specs: Sequence[Layer
             def scanned(layer, carry, per_layer_input, *, store=store, step=step):
                 return step(layer, carry, per_layer_input, store)[0], None
 
-            repeats = count // len(run.positions) if periodic else count
+            repeats = count // len(run.specs) if periodic else count
             x, _ = nn.scan(scanned, variable_axes={True: 0}, split_rngs={True: True},
                            in_axes=2, length=repeats)(run, x, inputs)
     return x
@@ -356,11 +340,11 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
     enclosing call's intermediate-capture policy active.
 
     `periods` is each run's period (`StackView.periods`): a run of a longer
-    one repeats a `PeriodBlock` of its period's layers under the scan, which
+    one repeats its period's layers under the scan (`_run_module`), which
     the stack runs over resident weights alone (`CausalTransformer.stack`).
     """
     if any(period > 1 for period in periods):
-        periodic = [layers[first] if count == 1 else _run_module(block, first, count, period)
+        periodic = [layers[first] if count == 1 else _run_module(block, specs, first, count, period)
                     for (first, count), period in zip(groups, periods, strict=True)]
         return _scanned_runs(periodic, groups, specs, x, fetching=False, train=train, decode=decode,
                              kv_store=kv_store, per_layer_input=per_layer_input,
@@ -550,9 +534,9 @@ def split_stages(specs: Sequence[LayerSpec], stages: int) -> StageSplit:
         count = (layers - outside) // stages
         for suffix in range(outside + 1):
             prefix = outside - suffix
-            run = specs[prefix:layers - suffix]
-            if all(pipelined[prefix:layers - suffix]) and all(
-                    spec == run[index % count] for index, spec in enumerate(run)):
+            # The stages repeat one program where the run's period divides a stage's length.
+            if all(pipelined[prefix:layers - suffix]) and not count % run_period(specs, prefix,
+                                                                                  layers - outside):
                 return StageSplit(prefix, count, suffix)
     raise LayoutRefused(
         f"no run of {stages} or more of the {layers} layers splits into {stages} stages that repeat "
@@ -561,7 +545,7 @@ def split_stages(specs: Sequence[LayerSpec], stages: int) -> StageSplit:
 
 
 class PipelineStage(nn.Module):
-    """Runs the layers of one pipeline stage over one microbatch.
+    """Runs the layers of one pipeline stage over one microbatch, or of one period of a periodic run.
 
     The pipeline vmaps this module over the stage axis, so each stage runs it
     on its own slice of the stacked layer weights. Its variables therefore have
@@ -569,7 +553,9 @@ class PipelineStage(nn.Module):
     Layer `j` of a stage is `layers_j` here and `layers_{offset + stage * count + j}`
     in the stored tree, where `offset` is the first layer the stages run and
     `count` is the number of layers per stage. `specs` and `groups` describe
-    stage 0, and every stage repeats them.
+    stage 0, and every stage repeats them. A periodic run's scan repeats it as
+    the body of the period's layers (`_run_module`), its repeats in place of
+    the stages, the stride the period's.
     """
     block: Block
     specs: tuple[LayerSpec, ...]
@@ -586,10 +572,13 @@ class PipelineStage(nn.Module):
         self.layers = [self._block(index, f'layers_{index}') for index in range(len(self.specs))]
 
     @nn.compact
-    def __call__(self, x, per_layer_input=None, attention_metadata=None):
+    def __call__(self, x, per_layer_input=None, attention_metadata=None, *, train: bool | None = None,
+                 decode: bool = False, kv_store=None):
+        # A period's scan calls it as it calls a layer, which leaves nothing a later layer reads.
+        assert kv_store is None, "a stage's or a period's layers leave nothing a later layer reads"
         # Singleton layers and scanned runs alike are built from this stage's own indices.
         return run_stack(self.layers, self._block, self.specs, self.groups, x,
-                         train=self.train, decode=False, kv_store=None,
+                         train=self.train if train is None else train, decode=decode, kv_store=None,
                          per_layer_input=per_layer_input, attention_metadata=attention_metadata)
 
 
@@ -673,18 +662,24 @@ class StackView:
     and after its stages stay as they are stored."""
     periods: tuple[int, ...] = ()
     """Each run's period (`layer_plan.run_period`), one per group; empty for runs of like layers. A
-    periodic run's leaves are stacked per position of its period, `layers_3_10/0` holding layers 3,
-    5, 7 and 9 of a period of two, as its scanned body reads them (`PeriodBlock`)."""
+    periodic run's leaves are stacked per position of its period, `layers_3_10/layers_0` holding
+    layers 3, 5, 7 and 9 of a period of two, as its scanned body reads them (`_run_module`)."""
 
     def _period(self, first: int, count: int) -> int:
         """The period of the run of `count` layers from `first`, one for a run of like layers."""
         return dict(zip(self.groups, self.periods, strict=True)).get((first, count), 1) if self.periods else 1
 
     @staticmethod
-    def _positions(first: int, count: int, period: int, prefix: str = 'layers_') -> list[list[str]]:
+    def _strided(base: int, stride: int, majors: int, minors: int, prefix: str) -> list[list[str]]:
+        """Stored names `{prefix}{base + major * stride + minor}`, a list of minors a major: a pipeline's
+        layers a stage, and transposed, a period's repeats a position."""
+        return [[f'{prefix}{base + major * stride + minor}' for minor in range(minors)]
+                for major in range(majors)]
+
+    def _positions(self, first: int, count: int, period: int, prefix: str = 'layers_') -> list[list[str]]:
         """A periodic run's stored names per position of its period, each in repeat order."""
-        return [[f'{prefix}{first + repeat * period + offset}' for repeat in range(count // period)]
-                for offset in range(period)]
+        return [list(names) for names in zip(*self._strided(first, period, count // period, period, prefix),
+                                              strict=True)]
 
     @property
     def per_stage(self) -> int:
@@ -698,9 +693,22 @@ class StackView:
 
     def _outside_names(self, first: int, count: int, prefix: str = 'layers_') -> list[list[str]]:
         """The stored names of a run's layers, one list per stage."""
-        return [[f'{prefix}{self.offset + stage * self.per_stage + first + offset}'
-                 for offset in range(count)]
-                for stage in range(self.stages)]
+        return self._strided(self.offset + first, self.per_stage, self.stages, count, prefix)
+
+    @staticmethod
+    def _stacked(collection: str, tree: dict, names: list[list[str]]) -> list | None:
+        """The entries `names` holds in `tree`, popped and stacked a list of them each (a single one as
+        it is), or None where `tree` holds none of them; it holds every one or none."""
+        held = [layer in tree for group in names for layer in group]
+        if not any(held):
+            return None
+        every = [layer for group in names for layer in group]
+        if not all(held):
+            raise ValueError(f"collection {collection!r} holds some of the layers {sorted(every)} and not "
+                             "the others; a run reads every one of its layers or none")
+        _refuse_unlike(collection, [tree[layer] for layer in every], every)
+        return [stack_layers(*[tree.pop(layer) for layer in group]) if len(group) > 1 else tree.pop(group[0])
+                for group in names]
 
     def _runs(self) -> list[tuple[int, int, str]]:
         """Every run, `(first, count, prefix)`, once for each of `prefixes`."""
@@ -747,35 +755,18 @@ class StackView:
                 if name is None:
                     continue
                 if (period := self._period(first, count)) > 1:
-                    # Each position of the period stacks its repeats; a position whose layers keep
-                    # nothing in the collection (a layer with no cache) is left out of it.
-                    stacked = {}
-                    for offset, layers in enumerate(self._positions(first, count, period, prefix)):
-                        held = [layer in tree for layer in layers]
-                        if not any(held):
-                            continue
-                        if not all(held):
-                            raise ValueError(
-                                f"collection {collection!r} holds some of the layers {layers} and not the "
-                                "others; each repeat of a period's position keeps what the others keep")
-                        _refuse_unlike(collection, [tree[layer] for layer in layers], layers)
-                        stacked[str(offset)] = stack_layers(*[tree.pop(layer) for layer in layers])
+                    # Each position of the period stacks its repeats, under the name the period's
+                    # stage gives its layer; a position whose layers keep nothing in the collection (a
+                    # layer with no cache) is left out of it.
+                    stacked = {f'{prefix}{offset}': position[0]
+                               for offset, layers in enumerate(self._positions(first, count, period, prefix))
+                               if (position := self._stacked(collection, tree, [layers])) is not None}
                     if stacked:
                         tree[name] = stacked
                     continue
-                names = self._outside_names(first, count, prefix)
-                held = [layer in tree for stage in names for layer in stage]
-                if not any(held):
+                runs = self._stacked(collection, tree, self._outside_names(first, count, prefix))
+                if runs is None:
                     continue
-                if not all(held):
-                    raise ValueError(
-                        f"collection {collection!r} holds some of the layers "
-                        f"{sorted(layer for stage in names for layer in stage)} and not "
-                        "the others; a run reads every one of its layers or none")
-                _refuse_unlike(collection, [tree[layer] for stage in names for layer in stage],
-                               [layer for stage in names for layer in stage])
-                runs = [stack_layers(*[tree.pop(layer) for layer in stage]) if count > 1
-                        else tree.pop(stage[0]) for stage in names]
                 if self.stages == 1:
                     # A bank already stored under the run's name holds the
                     # leaves its rows lack (`banked_collections`); the rows
@@ -809,12 +800,12 @@ class StackView:
                 view = stages.pop(name)
                 if (period := self._period(first, count)) > 1:
                     for offset, layers in enumerate(self._positions(first, count, period, prefix)):
-                        if str(offset) not in view:
+                        if f'{prefix}{offset}' not in view:
                             continue
                         for repeat, layer in enumerate(layers):
                             # One repeat's leaf, taken with `index_in_dim` as `_leaf` takes a layer's.
                             row = functools.partial(jax.lax.index_in_dim, index=repeat, keepdims=False)
-                            tree[layer] = jax.tree.map(row, view[str(offset)])
+                            tree[layer] = jax.tree.map(row, view[f'{prefix}{offset}'])
                     continue
                 for stage, names in enumerate(self._outside_names(first, count, prefix)):
                     for offset, layer in enumerate(names):
