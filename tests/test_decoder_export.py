@@ -92,16 +92,16 @@ import jax
 import ml_dtypes
 import numpy as np
 import pytest
+from float64_terms import float64_forward
 from interop_support import assert_restores, assert_same_stored_tensors, written_tensors
 from model_support import cached_round_trips, flat_tree, streamed_export
+from one_draw import assert_as_exact_as_the_reference
 from reference_error import (
     FACTOR,
     ORDERS,
-    assert_as_exact_as_the_reference,
     assert_as_exact_over_orders,
     assert_computes_the_oracle,
     distance,
-    float64_forward,
     within,
 )
 from residual_orders import orders, permuted, residual_width

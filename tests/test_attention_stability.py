@@ -31,7 +31,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from attention_oracle import exact_attention
-from reference_error import as_given, assert_as_exact, assert_as_exact_as_the_reference, with_gradients
+from one_draw import assert_as_exact_as_the_reference
+from reference_error import as_given, assert_as_exact, with_gradients
 from whole_suite import timed
 
 from dew.nn.documents import CrossDocuments

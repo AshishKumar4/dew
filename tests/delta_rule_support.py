@@ -16,7 +16,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import float64_terms, widened, with_gradients
+from float64_terms import float64_terms
+from reference_error import widened, with_gradients
 
 from dew.nn.kernels import fla_gdn, recurrence_algebra, recurrence_chunk
 
