@@ -345,22 +345,17 @@ def write_classic_tiny(name: str, model: PreTrainedModel) -> None:
     generate drops the prefix at that crossing (transformers issue #49334),
     so that output is recorded separately from the intended continuation.
     """
-    from reference_source import padded_probe
+    from reference_source import padded_probe, torch_generated, torch_greedy
 
     write_tiny(name, model)
     directory = FIXTURES / name
     ids = np.load(directory / 'input_ids.npy')
     np.save(directory / 'attention_mask.npy', padded_probe(ids)[0])
     model.eval()
-    with torch.no_grad():
-        generated = model.generate(torch.from_numpy(ids[:, :4]).long(), do_sample=False,
-                                   max_new_tokens=6, eos_token_id=None, pad_token_id=0).numpy()
-        if model.config.model_type == 'phi3':
-            np.save(directory / 'transformers_generated.npy', generated)
-            generated = ids[:, :4].copy()
-            for _ in range(6):
-                score = model(torch.from_numpy(generated).long(), use_cache=False).logits[:, -1].numpy()
-                generated = np.concatenate((generated, score.argmax(-1)[:, None]), axis=1)
+    generated = torch_generated(model, ids[:, :4], 6)
+    if model.config.model_type == 'phi3':
+        np.save(directory / 'transformers_generated.npy', generated)
+        generated = torch_greedy(model, ids[:, :4], 6)
     np.save(directory / 'generated.npy', generated)
 
 

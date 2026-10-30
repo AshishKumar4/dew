@@ -676,8 +676,9 @@ class CausalTransformer(nn.Module):
             "kv_shared": kv_shared, "kv_store_key": layer_type,
             "partial_rotary_factor": kind.partial_rotary_factor, "attention_sinks": kind.sinks,
             "qk_norm": kind.qk_norm, "init_std": self.init_stds[0], "output_init_std": self.init_stds[1],
-            "precision": self.precision, "dex": dex, "dex_start": dex_start, "value_experts": None
-            if not routed or self.value_experts is None else self.value_experts.under(self.mixture)}
+            "precision": self.precision, "dex": dex, "dex_start": dex_start,
+            "value_experts": self.value_experts if routed else None,
+            "mixture": self.mixture if routed else None}
         return MixerContext(**resolved, **{field.name: getattr(self, field.name)
                                            for field in dataclasses.fields(MixerContext)
                                            if field.name not in resolved})
