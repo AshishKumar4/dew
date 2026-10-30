@@ -30,6 +30,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation
+from dew.nn.kernels.selection import Refusal
 from dew.nn.kernels.templates import attention_algebra as algebra, attention_portable, mosaic, mosaic_sm100
 from dew.nn.kernels.templates.attention import NATURAL, Hooks, KeySpans, padded_call, prescaled
 from dew.nn.kernels.templates.mosaic_sm100 import ROW, STORED, TCGEN05, TMEM
@@ -59,15 +60,15 @@ TILES = Tiles()
 """The tiles a call takes where it names none."""
 
 
-def refused(query: jax.Array, spans: KeySpans, hooks: Hooks | None) -> str | None:
+def refused(query: jax.Array, spans: KeySpans, hooks: Hooks | None) -> Refusal | None:
     """Why this rung takes no call of `query`'s operands over `spans` under `hooks`, or None: it takes full
     and causal calls of 16-bit operands with no hook."""
     if hooks is not None and hooks != Hooks():
-        return "the sm100 mainloop takes no hooks yet"
+        return Refusal('hooks', "the sm100 mainloop takes no hooks yet")
     if spans.form not in ("full", "causal"):
-        return f"the sm100 mainloop takes full and causal calls, not {spans.form!r} ones"
+        return Refusal('spans', f"the sm100 mainloop takes full and causal calls, not {spans.form!r} ones")
     if jnp.dtype(query.dtype) not in (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16)):
-        return f"the sm100 mainloop takes 16-bit operands, not {jnp.dtype(query.dtype)}"
+        return Refusal('dtype', f"the sm100 mainloop takes 16-bit operands, not {jnp.dtype(query.dtype)}")
     return None
 
 
