@@ -41,6 +41,7 @@ from dew.batch import (
 from dew.inference.tasks import BlockGeneration, BlockSettings, recorded_processor, recorded_tokenizer
 from dew.inputs import Field, InputSpec
 from dew.nn.inputs import ModelInputs
+from dew.nn.inspection import INSPECTED
 from dew.nn.precision import at_least_fp32, weighted_total
 from dew.nn.progress import progressed
 from dew.nn.protocols import BlockDenoiser, CacheCapacity, Lacks, LayerScalars
@@ -304,9 +305,9 @@ class BlockDiffusionObjective(HeadedObjective[BlockSFTStatistics]):
         return self.model.init(key, jnp.zeros((1, self.canvas_size), jnp.int32))
 
     def loss(self, variables: Variables, batch: Batch, step: Step):
-        stats, _, qk = self._scored(variables, batch, step, train=step.training)
+        stats, _, (qk, inspected) = self._scored(variables, batch, step, train=step.training)
         return stats, Aux(metrics={"canvas_ce": stats.canvas.mean()[0],
-                                  "encoder_ce": stats.encoder.mean()[0]}, qk_stats=qk)
+                                  "encoder_ce": stats.encoder.mean()[0]}, qk_stats=qk, inspected=inspected)
 
     def _evaluation_scores(self, params: Variables, batch: Batch, step: Step) -> TokenScores:
         """Return the denoiser's cross entropy on every canvas target of the batch.
@@ -325,10 +326,11 @@ class BlockDiffusionObjective(HeadedObjective[BlockSFTStatistics]):
         return stats, scores
 
     def _scored(self, params: Variables, batch: Batch, step: Step, *, train: bool
-                ) -> tuple[BlockSFTStatistics, TokenScores | None, Variables | None]:
+                ) -> tuple[BlockSFTStatistics, TokenScores | None, tuple[Variables | None, Variables | None]]:
         """The SFT statistics, out of training the canvas targets' scores, and the attention logit maxima
-        the step asks for (`Step.qk_stats`, else None), from one scoring of the batch."""
-        canvas_losses, target_mask, encoder_losses, encoder_target_mask, correct, qk = self._token_losses(
+        and watched activations the step asks for (`Step.qk_stats`, `Step.watched`, else None), from one
+        scoring of the batch."""
+        canvas_losses, target_mask, encoder_losses, encoder_target_mask, correct, sown = self._token_losses(
             params, batch, step, train=train)
         support = (
             self.decoder_loss_weight * self.row_mean(target_mask, batch).total
@@ -337,7 +339,7 @@ class BlockDiffusionObjective(HeadedObjective[BlockSFTStatistics]):
         stats = BlockSFTStatistics(_row_losses(canvas_losses, target_mask, batch),
                                    _row_losses(encoder_losses, encoder_target_mask, batch), support)
         return stats, None if correct is None else TokenScores(
-            canvas_losses, target_mask.astype(canvas_losses.dtype), correct), qk
+            canvas_losses, target_mask.astype(canvas_losses.dtype), correct), sown
 
     def _row(self, batch: Batch):
         """Read one batch's rows and the masks every later phase reads.
@@ -438,7 +440,7 @@ class BlockDiffusionObjective(HeadedObjective[BlockSFTStatistics]):
 
     def _token_losses(self, params: Variables, batch: Batch, step: Step, *, train: bool
                       ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array | None,
-                                 Variables | None]:
+                                 tuple[Variables | None, Variables | None]]:
         """Score both SFT passes over one batch.
 
         Returns the denoiser's per-token cross entropies over the response
@@ -457,7 +459,7 @@ class BlockDiffusionObjective(HeadedObjective[BlockSFTStatistics]):
             token_positions(fields), None if groups is None else jnp.asarray(groups))
         model = self.training_model
         rngs = model_rngs(step.key, training=train)
-        observed = ["qk"] if step.qk_stats else []
+        observed = step.sown()
         cache = model.apply(params, tokens.shape[0], method=model.init_cache, mutable=["cache"])[1]["cache"]
         # The encoder's row laid out once (`Coordinates`): its documents as given, at the bound its layout
         # declares (`max_segments`), every slot of the full row real and placed as the cache's geometry
@@ -502,6 +504,9 @@ class BlockDiffusionObjective(HeadedObjective[BlockSFTStatistics]):
         qk = None
         if step.qk_stats:
             qk = _observed_maxima(mutated["qk"], first_sown["qk"], second_sown["qk"])
+        # The encoder's pass and the denoiser's that carries the gradient, as the step watches them.
+        inspected = None if step.watched is None else {
+            "encoder": mutated.get(INSPECTED, {}), "denoiser": second_sown.get(INSPECTED, {})}
         chosen = jnp.arange(response.shape[1])[None, :] // self.canvas_size == selected[:, None]
         target_mask = canvas_mask & chosen
         if text_slots is not None:
@@ -512,7 +517,7 @@ class BlockDiffusionObjective(HeadedObjective[BlockSFTStatistics]):
                                                              at_least_fp32(encoder_states.dtype))
         encoder_losses, _, _ = self.head_terms(model, params, encoder_states, shifted, predict=False)
         correct = None if predicted is None else predicted == response
-        return canvas_losses, target_mask, encoder_losses, encoder_target_mask, correct, qk
+        return canvas_losses, target_mask, encoder_losses, encoder_target_mask, correct, (qk, inspected)
 
     def reduce_loss(self, stats: BlockSFTStatistics):
         canvas, _ = stats.canvas.mean()

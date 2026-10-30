@@ -41,12 +41,26 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn, struct
 
+from dew.batch import Variables
 from dew.diffusion.process import Denoiser
 from dew.diffusion.schedules import expand
 from dew.nn.precision import compensated_add, two_product
 from dew.sampling.solvers.common import given
 
-Predict = Callable[[jax.Array, jax.Array], tuple[jax.Array, jax.Array]]
+Pair = tuple[jax.Array, jax.Array]
+Prediction = Pair | tuple[Pair, Variables | None]
+"""A walk's prediction at `(x, t)`: its `(x_0, epsilon)`, or, over an opened denoiser, that pair and what
+its policy's call opened (`Denoiser.observed`)."""
+Predict = Callable[[jax.Array, jax.Array], Prediction]
+def pair_of(prediction: Prediction) -> Pair:
+    """A prediction's `(x_0, epsilon)`, over a denoiser that opens nothing (a sampler's, a reference's):
+    one that carries an observation reached a reader that reads none, which is refused."""
+    first, second = prediction
+    if isinstance(first, tuple) or not isinstance(second, jax.Array):
+        raise TypeError("an opened denoiser's prediction reached a walk that reads no observation")
+    return first, second
+
+
 # A step's index in its walk: traced inside the walk's scan, a Python int at
 # its closing denoise.
 Index = jax.Array | int
@@ -65,7 +79,7 @@ class Walk:
     """
 
     init: Callable[[jax.Array], Any]
-    step: Callable[[jax.Array, jax.Array, Index, Any], tuple[tuple[jax.Array, jax.Array], Any]]
+    step: Callable[[jax.Array, jax.Array, Index, Any], tuple[Prediction, Any]]
     at: Callable[[Any, Index], Predict]
 
     @classmethod
@@ -86,7 +100,7 @@ class Walk:
         with the masked diffusion LM.
         """
         if guidance is None:
-            return cls.stateless(lambda index: denoise)
+            return cls.stateless(lambda index: denoise.predict if isinstance(denoise, Denoiser) else denoise)
         if not isinstance(denoise, Denoiser):
             raise TypeError("guidance needs a continuous Denoiser; the masked diffusion LM takes none")
         return guidance.walk(denoise, steps)
@@ -206,7 +220,7 @@ class CFG:
 
     def _guided(self, denoise: Denoiser, scale: jax.Array) -> Predict:
         def guided(x, t):
-            output, unconditional = denoise.raw_both(x, t)
+            (output, unconditional), sown = denoise.raw_both_observed(x, t)
             combined = guide(output, unconditional, scale)
             if self.rescale:
                 axes = tuple(range(1, combined.ndim))
@@ -214,7 +228,7 @@ class CFG:
                 guided_deviation = jnp.std(combined, axis=axes, keepdims=True, ddof=1)
                 rescaled = combined * (deviation / guided_deviation)
                 combined = self.rescale * rescaled + (1.0 - self.rescale) * combined
-            return denoise.convert(x, t, combined)
+            return denoise.observed(denoise.convert(x, t, combined), sown)
 
         return guided
 
@@ -250,11 +264,11 @@ class CFGPlusPlus:
         """The guided pair on a step that guides, and the conditional denoiser's own pair on one
         outside the interval, where the unconditional noise would still steer the walk."""
         def guided(x, t):
-            output, unconditional = denoise.raw_both(x, t)
+            (output, unconditional), sown = denoise.raw_both_observed(x, t)
             renoising = jnp.where(active, unconditional, output)
             clean, _ = denoise.convert(x, t, guide(output, renoising, self.scale))
             _, noise = denoise.convert(x, t, renoising)
-            return clean, noise
+            return denoise.observed((clean, noise), sown)
 
         return guided
 
@@ -336,7 +350,7 @@ class APG:
         object.__setattr__(self, "interval", _interval(self.interval))
 
     def _guided(self, denoise: Denoiser, scale: jax.Array, x, t, average):
-        output, unconditional = denoise.raw_both(x, t)
+        (output, unconditional), sown = denoise.raw_both_observed(x, t)
         direction = output - unconditional + self.momentum * average
         axes = tuple(range(1, direction.ndim))
         if self.norm_threshold > 0:
@@ -347,7 +361,7 @@ class APG:
         off = scale == 1.0
         combined = jnp.where(off, output, unconditional + scale * update)
         running = jnp.where(off, average, output - unconditional + self.momentum * average)
-        return denoise.convert(x, t, combined), running
+        return denoise.observed(denoise.convert(x, t, combined), sown), running
 
     def walk(self, denoise: Denoiser, steps: int | jax.Array) -> Walk:
         scales = _scales(self.scale, self.interval, steps)
@@ -394,13 +408,15 @@ class Autoguidance:
                              "denoiser's variables")
         main = replace(denoise, unconditional=None,
                        params={name: tree for name, tree in denoise.params.items() if name != "guide"})
-        weaker = replace(denoise, model=self.model, params=denoise.params["guide"], unconditional=None)
+        # The guide's calls are no policy's: they open nothing (`Denoiser.opened`).
+        weaker = replace(denoise, model=self.model, params=denoise.params["guide"], unconditional=None,
+                         opened=())
         scales = _scales(self.scale, self.interval, steps)
 
         def guided(scale):
             def predict(x, t):
-                output, weak = main.raw(x, t), weaker.raw(x, t)
-                return denoise.convert(x, t, guide(output, weak, scale))
+                (output, sown), weak = main.raw_observed(x, t), weaker.raw(x, t)
+                return denoise.observed(denoise.convert(x, t, guide(output, weak, scale)), sown)
 
             return predict
 
@@ -410,7 +426,13 @@ class Autoguidance:
 @runtime_checkable
 class Guidance(Protocol):
     """What `sample` guides with: a walk over the steps for one denoiser.
-    CFG, CFG++, APG and autoguidance are four; a run records any by class."""
+    CFG, CFG++, APG and autoguidance are four; a run records any by class.
+
+    A walk's prediction over an opened denoiser (`Denoiser.opened`, a watched training step's) reads
+    its model through `raw_observed` or `raw_both_observed` and returns `denoise.observed(pair, sown)`:
+    the pair and what its policy's call opened, carried out of any transform the guidance runs its
+    call in (a `lax.cond`, a `jit`) by its own outputs. A prediction that returns a bare pair over an
+    opened denoiser is refused by name where it is read."""
 
     def walk(self, denoise: Denoiser, steps: int | jax.Array) -> Walk: ...
 

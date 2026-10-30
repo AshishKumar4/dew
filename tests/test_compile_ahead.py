@@ -29,12 +29,13 @@ VOCAB, SEQ_LEN, BATCH = 96, 16, 8
 TINY_SHARD = 256
 
 
-def fine_tune(mesh, *, ahead=None, width: int | None = None, xla: bool = False, split=1, remat=None):
+def fine_tune(mesh, *, ahead=None, width: int | None = None, xla: bool = False, split=1, remat=None,
+              inspection=None):
     fields = {**TINY_DECODER, **({} if width is None else {"emb_features": width}),
               **({"attention_impl": "xla"} if xla else {}), **({} if remat is None else {"remat": remat})}
     model = models.build("causal_transformer", vocab_size=VOCAB, **fields, num_kv_heads=2)
     return Trainer(LMObjective(model, SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0), mesh=mesh,
-                   layout=Layout(min_shard=TINY_SHARD), split=split, ahead=ahead)
+                   layout=Layout(min_shard=TINY_SHARD), split=split, ahead=ahead, inspection=inspection)
 
 
 def test_compiling_ahead_plans_once_and_saves_the_selected_program(tmp_path, monkeypatch):
@@ -417,6 +418,43 @@ def a_run_handed_its_step_compiled_ahead_trains_from_it_on_its_gpu(tmp_path):
     assert int(state.step) == 2 and first["ahead"] is True
     assert any(not np.array_equal(np.asarray(new), np.asarray(old))
                for new, old in zip(jax.tree.leaves(state.variables["params"]), initial, strict=True))
+
+
+def test_a_watched_runs_step_compiled_ahead_carries_its_sampled_step():
+    """A run that inspects compiles its sampled step beside its step (`Candidate.sampled`), and a step
+    compiled ahead for it carries both (`AheadOfTime.sampled`), each its own program, so the run handed it
+    compiles neither on its target (train 332's review)."""
+    from dew.training import Inspection
+    from dew.training.ahead import compile_ahead, compile_only_gpus
+
+    batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
+    devices = compile_only_gpus("sm90", 1)
+    watched = compile_ahead(fine_tune(MeshSpec().build(devices), inspection=Inspection(every=1)), batch)
+    plain = compile_ahead(fine_tune(MeshSpec().build(devices)), batch)
+    assert watched.sampled is not None and plain.sampled is None
+    assert watched.sampled.program != watched.program and watched.program == plain.program
+
+
+def a_watched_run_handed_its_steps_compiled_ahead_compiles_neither(tmp_path):
+    """A GPU flow's cell (tests/test_gpu_training.py): a run that inspects, handed its step and sampled step
+    compiled ahead for this host's own GPU, takes both (`taken`) and compiles no step program on its GPU
+    (`Compiles`): its first plan's compile is the step compiled ahead, and it trains from it (train 332's
+    review)."""
+    from dew.nn.kernels.generation import chosen, device_generation
+    from dew.telemetry.instrumentation import Compiles
+    from dew.training import Inspection
+    from dew.training.ahead import AheadOfTime, compile_ahead, compile_only_gpus
+
+    batch, watched = token_rows(VOCAB, BATCH, SEQ_LEN + 1), Inspection(every=1)
+    with chosen(narrow_copies="off"):
+        compile_ahead(fine_tune(MeshSpec().build(compile_only_gpus(device_generation(), 1)), xla=True,
+                                inspection=watched), batch).save(tmp_path / "step.dew-aot")
+        run = fine_tune(MeshSpec().build(jax.devices()[:1]), xla=True, inspection=watched,
+                        ahead=AheadOfTime.load(tmp_path / "step.dew-aot"))
+        with Compiles("step") as compiles:
+            state = run.fit(batch, steps=1, log_every=1)
+    first, *_ = listed(record(run.plan, "plan")["probes"], "probes", read=record, what="probes")
+    assert int(state.step) == 1 and first["ahead"] is True and compiles.count == 0
 
 
 @pytest.mark.tpu(reason="runs a step compiled ahead for this host's TPU topology as a run's first step")
