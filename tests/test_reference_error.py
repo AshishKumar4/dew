@@ -1126,6 +1126,44 @@ def test_a_recording_made_in_shards_is_the_recording_one_run_makes():
                                                                             range(cut - 1))])
 
 
+def test_a_recording_kept_as_row_distances_judges_as_the_live_reference_does():
+    """A reference recorded as each row's RMS distance from its float64 truth alone (`record_distances`,
+    for a recorder whose outputs over the seeds are too large to keep): check 1 over that recording
+    passes Dew's same sum in another order and fails Dew's sum with a term lost, as it does against the
+    live reference."""
+    from tool_support import load
+
+    recorder = load("recorded_references")
+
+    def draw(seed):
+        x, w = _draw(seed)
+        return {"x": x, "w": w}
+
+    def as_inputs(fn):
+        return lambda inputs: fn(inputs["x"], inputs["w"])
+
+    with jax.enable_x64(new_val=True):
+        def truth_of(seed):
+            return jax.tree.map(np.asarray, _product(*(np.asarray(part, np.float64) for part in _draw(seed))))
+
+        def distances(seed):
+            found = np.asarray(_product(*_draw(seed))["y"], np.float64)
+            return np.sqrt(np.mean(np.square(found - truth_of(seed)["y"]), axis=1))
+
+        kept = {"y": np.stack([distances(seed) for seed in range(160)])}
+        recorded = recorder.record_distances("site", draw, kept, truth_of, {"y": "float32"})
+    seeds = int(recorded["site.seeds"])
+    assert_as_exact(_reordered, _product, _draw, "live", seeds=seeds)
+    drawn, reference, truth = indexed_recording(recorded, "site", seeds, inputs_of=draw,
+                                                truth_fn=as_inputs(_product))
+    assert_as_exact(lambda index, inputs: as_inputs(_reordered)(inputs), reference, drawn, "reordered",
+                    seeds=seeds, truth_fn=truth)
+    with pytest.raises(AssertionError) as raised:
+        assert_as_exact(lambda index, inputs: as_inputs(_lost_term)(inputs), reference, drawn, "lost term",
+                        seeds=seeds, truth_fn=truth)
+    assert raised.type is GateFailure
+
+
 def test_a_recording_with_pilot_shards_sizes_paired_on_them_as_the_live_draws_do():
     """A summarized recording made in shards with a run of pilots from SIZING_FROM (`merge_shards`) keeps
     them apart from its verdict's seeds, and its reference carries them: a paired sizing of it takes those
@@ -1812,3 +1850,24 @@ def test_a_summarized_recording_reads_back_as_its_reference_reads_live():
                     [getattr(read, field) for field in fields]), (seed, name)
                 zero_rows += len(kept.zero_rows)
     assert zero_rows
+
+
+def test_a_leaf_read_from_its_rows_distances_is_the_leaf_read_whole():
+    """A leaf recorded as each row's RMS distance from its float64 truth (`rows_summary`) reads as the leaf
+    whole does (`leaf_summary`): its worst row, the rows its truth sizes zero, their errors and own sizes,
+    its finiteness and dtype; and a leaf of no rows is exact, as `leaf_summary` reads one."""
+    from reference_error import _rows_rms, leaf_summary, rows_summary
+
+    rng = np.random.default_rng(1848)
+    truth = rng.standard_normal((6, 8))
+    truth[2] = 0.0  # a row the truth sizes zero
+    reference = (truth + rng.standard_normal((6, 8)) * 1e-6).astype(np.float32)
+    whole = leaf_summary(reference, truth)
+    read = rows_summary(_rows_rms(reference.astype(np.float64) - truth, 8), truth, finite=True,
+                        dtype="float32", mse=whole.mse)
+    for field in ("mse", "worst", "zero_rows", "zero_errors", "finite", "dtype", "zero_sizes", "worst_log"):
+        np.testing.assert_array_equal(getattr(read, field), getattr(whole, field), err_msg=field)
+    empty, exact = (rows_summary(np.zeros(0), np.zeros((0, 4)), finite=True, dtype="float32"),
+                    leaf_summary(np.zeros((0, 4), np.float32), np.zeros((0, 4))))
+    for field in ("mse", "worst", "zero_rows", "finite"):
+        np.testing.assert_array_equal(getattr(empty, field), getattr(exact, field), err_msg=field)
