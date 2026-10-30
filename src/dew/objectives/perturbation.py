@@ -64,7 +64,6 @@ from dew._distributions import counter_key
 from dew.batch import Batch, Variables, leaves_by_path
 from dew.data.dataset import rows_of
 from dew.nn.precision import at_least_fp32, float32_einsum
-from dew.nn.progress import Progress, stepping
 from dew.nn.protocols import OutputTable, RematChoosing, head_table
 from dew.objectives.base import Aux, Objective, Step, _has_aux, stream
 
@@ -207,9 +206,9 @@ class NodePerturbation[LossT, EffectsT](Objective[LossT, EffectsT]):
             params, rest = saved
             others, held_batch, held_step = rest
             stats, _ = cotangent
-            # The estimate runs the model again, at the step's progress as the loss read it (`_loss`).
-            with stepping(Progress(held_step.committed)):
-                estimated = self.estimate(params, others, held_batch, held_step, stats)
+            # The estimate runs the model again through the objective's loss over the held step, which
+            # passes the model the step's progress as the loss did (`Objective.progress`).
+            estimated = self.estimate(params, others, held_batch, held_step, stats)
             # None: the variables held, the batch and the step take no cotangent.
             return estimated, None
 

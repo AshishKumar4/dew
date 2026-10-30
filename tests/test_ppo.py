@@ -18,6 +18,7 @@ from tool_policy import GROUPS, PROMPT, RESPONSE, TURNS, VOCAB, ToolPolicy
 
 from dew.batch import part
 from dew.data.dataset import Loader
+from dew.nn.progress import END, Progress
 from dew.objectives.base import Step
 from dew.objectives.rl import EpisodeCollector, EpisodeStatus, PPOObjective, PPORollout, ValueHead
 from dew.objectives.rl.ppo import OLD_VALUES_KEY, RETURNS_KEY
@@ -285,6 +286,55 @@ def test_ppo_trains_policy_and_critic_with_a_frozen_policy_reference():
         (np.asarray(rollout.objective.values(final.variables, fixed))[keep] - fixed[RETURNS_KEY][keep]) ** 2
     )
     assert new_error < old_error
+
+
+class OffsetFeatures(nn.Module):
+    """Token features offset by `offset`, or, where it states none, by the updates the run committed
+    before the step and -1 at the run's end: a critic's backbone whose computation changes over a run
+    (`dew.nn.progress`)."""
+
+    offset: float | None = None
+
+    @nn.nowrap
+    def reads_progress(self) -> bool:
+        return self.offset is None
+
+    def hidden_states(self, tokens, train=False, *, coordinates=None, progress: Progress = END):
+        offset = self.offset if self.offset is not None else (
+            -1.0 if progress.updates is None else progress.updates.astype(jnp.float32))
+        return jax.nn.one_hot(tokens, VOCAB) + offset
+
+
+def test_ppos_critic_reads_the_progress_its_step_passes():
+    """PPO's critic over a backbone that reads the run's progress is passed the step's
+    (`PPOObjective.passes_progress`, `ValueHead`; review of ledger 2537): its loss at a step three updates
+    came before is the loss of the critic offset by 3, and at a step that is no training step, the run's
+    end's, over the same weights."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+
+    policy = CausalTransformer(vocab_size=VOCAB, emb_features=8, num_layers=1, num_heads=2, mlp_features=16,
+                               max_seq_len=8, qk_norm=False)
+
+    def objective(offset=None) -> PPOObjective:
+        return PPOObjective(policy, 5, critic=ValueHead(OffsetFeatures(offset)))
+
+    variables = Trainer(objective(), optax.sgd(0.), key=jax.random.key(0)).initial_state().variables
+    ids = jnp.tile(jnp.arange(6, dtype=jnp.int32), (jax.device_count(), 1))
+    mask = jnp.broadcast_to(jnp.arange(6) >= 3, ids.shape).astype(jnp.float32)
+    batch = {"input_ids": ids, "text_segment_ids": jnp.ones_like(ids),
+             "text_positions": jnp.broadcast_to(jnp.arange(6), ids.shape),
+             "response_mask": mask, "advantages": mask, "behavior_log_probs": jnp.full(ids.shape, -3.),
+             OLD_VALUES_KEY: jnp.zeros_like(mask), RETURNS_KEY: mask}
+
+    def critic_loss(objective: PPOObjective, step: Step) -> np.ndarray:
+        return np.asarray(objective.loss(variables, batch, step)[1].metrics["critic/loss"])
+
+    trained = Step(jnp.asarray(0), jax.random.key(1), None, committed=jnp.asarray(3, jnp.int32))
+    validated = replace(trained, training=False)
+    np.testing.assert_array_equal(critic_loss(objective(), trained), critic_loss(objective(3.0), trained))
+    np.testing.assert_array_equal(critic_loss(objective(), validated),
+                                  critic_loss(objective(-1.0), validated))
+    assert critic_loss(objective(), trained) != critic_loss(objective(), validated)
 
 
 def test_muonclip_steps_both_the_actor_and_a_transformer_critic():

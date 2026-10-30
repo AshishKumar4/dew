@@ -272,6 +272,23 @@ def test_loss_weights_apply_after_independent_row_normalization(source):
     assert abs(float(loss) - wrong) > 1e-3
 
 
+def test_a_block_step_passes_a_decoder_that_reads_the_runs_progress_the_steps(source):
+    """A block diffusion step passes a DiffusionGemma whose decoder reads the run's progress the step's,
+    at the encoder's pass and each denoising pass (`BlockDiffusionObjective.passes_progress`; review of
+    ledger 2537): a DEX decoder trains through its anneal, its loss half way through it no longer its loss
+    at the start, where the step refused it."""
+    from dew.nn.dex import DifferentialExtension
+
+    loaded, batch, step, _ = source
+    extension = DifferentialExtension(((0, (0, 1)),), anneal_steps=10)
+    obj = BlockDiffusionObjective(loaded.model.clone(text=loaded.model.text.with_dex(extension)),
+                                  prompt_length=4, num_canvases=2)
+    variables = obj.init(jax.random.key(0))
+    started, halfway = (float(obj.scalar_loss(variables, batch, replace(
+        step, committed=jnp.asarray(updates, jnp.int32)))[0]) for updates in (0, 5))
+    assert started != halfway
+
+
 def test_scoring_reports_the_denoiser_cross_entropy_of_every_canvas_target(source):
     """A validation pass scores each row's selected canvas under the same draw
     training makes from the key, so the weights are the reference's selected
