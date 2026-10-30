@@ -1275,6 +1275,22 @@ def test_a_transitions_kl_and_its_derivatives_hold_at_each_reviewed_input(case):
 
 
 
+def test_a_transitions_kl_has_the_plain_formulas_hessian():
+    """The KL's second derivatives in the mean run as JAX forms them, forward over reverse mapped over a
+    basis (`jax.hessian`) and reverse over forward, where its own seam once refused forward over reverse
+    (row 2383), and are the plain formula's: at unit variance, the identity."""
+    from dew.sampling.flow import GaussianTransition
+
+    reference, variance = jnp.zeros((1, 3), jnp.float32), jnp.ones((1,), jnp.float32)
+
+    def kl(mean):
+        return GaussianTransition(mean, variance).kl(reference).sum()
+
+    for second in (jax.hessian(kl), jax.jacrev(jax.jacfwd(kl))):
+        np.testing.assert_array_equal(np.asarray(second(jnp.ones((1, 3), jnp.float32))).reshape(3, 3),
+                                      np.eye(3))
+
+
 def test_a_transitions_density_keeps_a_residual_whose_square_overflows():
     """A residual of 2**64 under a variance of 2**126: its square passes float32's largest, its square
     over the variance is 4, and the density is finite as the reference's is, the half-Mahalanobis term
