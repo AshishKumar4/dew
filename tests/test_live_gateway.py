@@ -136,7 +136,6 @@ def test_a_kernel_whose_restarts_failed_leaves_no_connection_file(tmp_path):
                     if str(connection).encode() in path.read_bytes()]
         os.kill(int(process), signal.SIGKILL)
         deadline = time.monotonic() + 60
-        while kernel(port, identifier) is not None:
-            assert time.monotonic() < deadline, "the dead kernel stayed in the gateway"
+        while kernel(port, identifier) is not None or connection.exists():
+            assert time.monotonic() < deadline, f"the dead kernel's connection file stayed: {connection}"
             time.sleep(0.2)
-        assert not connection.exists()

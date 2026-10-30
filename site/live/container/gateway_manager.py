@@ -5,6 +5,7 @@ small private tmpfs scratch mounts. Models and compiled programs belong to the
 separate serving uid and are never loaded into these kernel processes.
 """
 
+import asyncio
 import json
 import os
 import queue
@@ -18,7 +19,7 @@ from kernel_gateway.services.kernels.manager import (
     KernelGatewayIOLoopKernelManager,
     SeedingMappingKernelManager,
 )
-from traitlets import default
+from traitlets import Set, default
 
 _uids = queue.SimpleQueue()
 for _uid in GUEST_UIDS:
@@ -159,6 +160,9 @@ class LimitedMappingKernelManager(SeedingMappingKernelManager):
 
     A kernel whose restarts failed leaves the map with its resources released (`_handle_kernel_died`)."""
 
+    _releasing = Set()
+    """The releases of dead kernels' resources under way (`_handle_kernel_died`)."""
+
     @default("kernel_manager_class")
     def _kernel_manager_class_default(self):
         return "gateway_manager.LimitedKernelManager"
@@ -177,7 +181,8 @@ class LimitedMappingKernelManager(SeedingMappingKernelManager):
         releasing none (2.21.1's `_handle_kernel_died`), so its connection file outlived its page's close,
         no delete reaching a kernel the gateway no longer holds (ledger 843: "contexts left open after their
         pages closed")."""
-        try:
-            self.get_kernel(kernel_id).cleanup_resources(restart=False)
-        finally:
-            super()._handle_kernel_died(kernel_id)
+        # The gateway's kernel managers are asynchronous: the release runs on its loop, held till it ends.
+        released = asyncio.ensure_future(self.get_kernel(kernel_id).cleanup_resources(restart=False))
+        self._releasing.add(released)
+        released.add_done_callback(self._releasing.discard)
+        super()._handle_kernel_died(kernel_id)
