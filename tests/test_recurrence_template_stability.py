@@ -31,7 +31,7 @@ from reference_error import (
     with_gradients,
 )
 from test_recurrence_chunk import chunk_on, token_by_token
-from test_recurrence_mosaic import NATIVE, REFUSED, taken, template_call
+from test_recurrence_mosaic import NATIVE, REFUSED, refuses_its_gradient, taken, template_call
 from test_recurrence_stability import GRADIENT_SEEDS, REGIMES, SEEDS, SITES, cotangents, restarting, stressed
 
 from dew.nn.kernels import generation
@@ -106,8 +106,7 @@ def runs(fn, hooks, operands: Chunk, drawn, product: str) -> bool:
             jax.eval_shape(fn, *drawn)
         return False
     if product == 'gradient' and not template_trains(operands, hooks):
-        with pytest.raises(NotImplementedError):
-            jax.eval_shape(fn, *drawn)
+        refuses_its_gradient(fn, *drawn)
         return False
     return True
 
@@ -191,8 +190,7 @@ def test_the_fast_backward_decay_gradient_holds_under_decays_near_zero_interpret
     drawn = (bf16(operands, HOOKS), (out.astype(jnp.bfloat16), final))
     template = with_gradients(functools.partial(chunk_on, 'mosaic_gpu', HOOKS))
     if not fast_backward(restarting(lambda given: given, regime)(drawn[0])):
-        with pytest.raises(NotImplementedError):
-            jax.eval_shape(template, *drawn)
+        refuses_its_gradient(template, *drawn)
         return
     port = with_gradients(functools.partial(chunk_on, 'fla', HOOKS))
     with jax.enable_x64(new_val=True):

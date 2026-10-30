@@ -169,6 +169,17 @@ def template_call(given: Chunk, hooks: recurrence.Hooks):
                                 floor=hooks.floor, bound=hooks.inverse_bound)
 
 
+def refuses_its_gradient(fn, *drawn) -> None:
+    """`fn`'s gradient, traced over `drawn` where the template's fast backward does not take it (an fp32 call,
+    a decay a key dimension's, launches the device does not hold): refused, by the template named to the
+    selectors as its route's 'backward' requirement (`recurrence_chunk.MOSAIC_SUPPORTS`, `KernelRefused`), by
+    the mainloop called directly (`mosaic_rule`) as not implemented."""
+    with pytest.raises((KernelRefused, NotImplementedError)) as refused:
+        jax.eval_shape(fn, *drawn)
+    if isinstance(refused.value, KernelRefused):
+        assert 'backward' in {refusal.code for refusal in refused.value.refusals}
+
+
 def taken(given: Chunk, hooks: recurrence.Hooks) -> bool:
     """Whether the template takes a call over `given`'s operands under `hooks` on the device its launches run
     for (`Mosaic.eligible`: every launch's shared memory and registers within a block's and a thread's, a
