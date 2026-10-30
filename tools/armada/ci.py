@@ -420,7 +420,7 @@ def cache_key(common: str, name: str, split: str, depends: list[str]) -> str:
     (executed.py): its `inputs`' contents, its directories' entries, `common`, and for a group of a split
     file, the group and the tests split.py cuts into it from the durations record (`members`), the record's
     only part a run's outcome depends on: not their seconds, which each train's fold of main's durations
-    moves (Main, 2026-10-28: every train re-keyed its split files and reran them cold, row 2000)."""
+    moves (the maintainer, 2026-10-28: every train re-keyed its split files and reran them cold, row 2000)."""
     digest = hashlib.sha256(common.encode())
     # A module's units read from one reading of its text.
     read: dict[str, dict[str, bytes] | bytes] = {}
@@ -448,8 +448,8 @@ def inputs(name: str, depends: list[str]) -> list[str]:
     tools/ itself is among them, as a test puts it, or a directory under it, on sys.path and imports a tool
     by its name, which a package added there shadows; src/'s own entries every key covers (`shared`). The
     harness's own modules (tools/armada/, which runs every test process and records it, `SHARED`) are no
-    import of a test's, so their directories are none of its inputs (Main, 2026-10-29: tools/'s entries
-    keyed every row, and train 296's one added tool reran 1,794 of 1,795)."""
+    import of a test's, so their directories are none of its inputs (the maintainer, 2026-10-29: tools/'s
+    entries keyed every row, and train 296's one added tool reran 1,794 of 1,795)."""
     files = (each.partition(followed.CODE)[0] for each in depends)
     packages = {str(parent) for path in files
                 if path.startswith(("src/", "tools/")) and path.endswith(".py") and not path.startswith(HARNESS)
@@ -580,8 +580,8 @@ def reusable(python: str, names: list[str], common: str) -> dict[str, str]:
     up and exit. Each with where its green run is kept (`green_key`'s class and key, `KEPT_AT`'s token), which
     the plan hands the task that holds it, so no run of another commit replacing a file's last record
     between plan and task can hide it (2026-10-30: a kept task found 23 of its 259 files and ran the rest).
-    None where the plan has no token or no class (Main, 2026-10-28: a lane run with most files unchanged
-    booted a container a task; 2026-10-29: the suite pinned to 25/17 and 26/17)."""
+    None where the plan has no token or no class (the maintainer, 2026-10-28: a lane run with most files
+    unchanged booted a container a task; 2026-10-29: the suite pinned to 25/17 and 26/17)."""
     token, held = os.environ.get(READ_TOKEN), pinned_classes()
     if not token or not held or "DEW_XLA_CACHE_URL" not in os.environ:
         return {}
@@ -800,7 +800,8 @@ PLACED = ("src/", "tests/", "tools/", "examples/", "recipes/", "docs/", "tutoria
 """Where a changed file is placed by the records (executed.py): a Python file a test ran, a page, a
 notebook or a workflow it read (followed.py's `HIDDEN_INPUTS`), a fixture its openers read. A change
 elsewhere is placed by none, and runs the whole suite (`policy`): a workflow change reran every file while
-no record placed it (Main, 2026-10-28: 5 of 10 trains ran with the cache off, 0.75% of rows reused)."""
+no record placed it (the maintainer, 2026-10-28: 5 of 10 trains ran with the cache off, 0.75% of rows
+reused)."""
 PLACED_FILES = ("README.md", "CONTRIBUTING.md", "AGENTS.md", "LICENSE", "CHANGELOG.md")
 """The checkout's own files at its root that tests read as a page is read, and the changelog, which
 no test reads (test_changelog_merge writes its own) and most heads add an entry to: placed by none,
@@ -1347,10 +1348,11 @@ def selected(command: list[str], network: bool, whole: bool = False, release: bo
     """CI's pytest `command` (`session.pytest_run`), or with `network` the same selecting the network-marked
     tests alone, every one the rest of CI sets aside. It sets aside the tests marked whole_suite too, but on
     the whole suite's own run (`whole`: DEW_WHOLE_SUITE, every fifth publish's ci/full-whole-*), whatever
-    the cache's policy: a policy-off train runs every file, never a whole-suite cell (Main, 2026-10-28:
-    train 250's policy-off suite ran G03's GRPO cells, 826-1,430 s each, to its deadline). The release checks
-    run in their own tasks alone (`release`), every one whatever else marks it, under a requirement the
-    suite's environment lacks (`release_plan`), and on no other run, the network lane's among them."""
+    the cache's policy: a policy-off train runs every file, never a whole-suite cell (the maintainer,
+    2026-10-28: train 250's policy-off suite ran G03's GRPO cells, 826-1,430 s each, to its deadline). The
+    release checks run in their own tasks alone (`release`), every one whatever else marks it, under a
+    requirement the suite's environment lacks (`release_plan`), and on no other run, the network lane's among
+    them."""
     at = command.index(session.SELECTION[1])
     if release:
         chosen = "release_env"
@@ -1440,7 +1442,7 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
     own (`tested`), and write their verdict rows to `out`. With `network`, the network lane: each file's
     network-marked tests alone, which every other task deselects (`session.SELECTION`), run with the Hub
     open on a node that reaches it, their records on a class of their own (`device_class`), so the test
-    cache reruns only those whose inputs changed (Main, 2026-10-25: no CI run reached the published
+    cache reruns only those whose inputs changed (the maintainer, 2026-10-25: no CI run reached the published
     checkpoints' parity tests).
 
     A file's process is given the share its last run on this GPU's class measured, green or red,
