@@ -231,6 +231,19 @@ With it, `r2://bucket/path` reads and publishes through s3fs with those options.
 
 Each record's key comes from Grain's data seed and position. Changing reader threads or batch placement changes no augmentation draw. A backend change changes the transform and cannot be substituted silently on resume. Validation keeps the host's deterministic resize.
 
+### Which augmentation helps, measured
+
+On fixed data each of `augment=True`'s three steps adds to a classifier's accuracy. [tools/benchmark_augmentation.py](https://github.com/AshishKumar4/dew/blob/main/tools/benchmark_augmentation.py) trains a small residual network (2.8M parameters) on Oxford Flowers 102's 1,020 training images at 64 pixels for 3,000 steps at batch 64, once per policy and seed, and scores it on the 6,149 test images, resized and never augmented. The seed draws the weights and the data's order and augmentation alike, so the spread across seeds is the noise a policy's difference is read against. Measured on 2026-10-29 on one H100 (jax 0.12.0.1.post35), three seeds each:
+
+| Policy (`images.DeviceAugment`) | Test top-1 |
+|---|---|
+| none | 38.5% ± 1.3 |
+| `flip=True` | 40.1% ± 0.8 |
+| `flip=True, crop_scale=(0.35, 1.0)`, staged at 80 px | 43.7% ± 1.1 |
+| the same with `jitter=True` (`augment=True`'s three) | 45.3% ± 0.4 |
+
+The random crop does most of the work, 3.6 points over the flip alone; colour jitter adds 1.6 more and narrows the spread. Every policy fits the training split (its final loss near 0.02), so on data this small augmentation trades that fit for what carries to the test images. `python tools/benchmark_augmentation.py --output augmentation.json` runs the study again; `--policies`, `--seeds` and `--steps` narrow it.
+
 The following measurements predate the chain. They compare decoder and augmentation implementations on the stated machine, not startup or remote-storage performance of the new compiler.
 
 Measured on 2026-10-01 with an RTX 4080 (16 GB) and an i9-12900K, JAX
