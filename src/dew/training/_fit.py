@@ -411,7 +411,7 @@ class FitRun:
         last = self.ends_here(interval)
         if self.ran_out:
             batch = drained(batch, interval.consumed, examples)
-        return {**batch, CLOSES_WINDOW: np.bool_(last)}, position
+        return closes_window(batch, examples, last=last), position
 
     def held(self) -> contextlib.AbstractContextManager[None]:
         """The training stream's placements held for a block of device work beside the steps
@@ -546,6 +546,14 @@ def waited_read(run: FitRun, interval: Interval, *, agree: bool, peek: bool = Fa
     if batch is None and not run.current:
         raise ValueError("the training data holds no batch to train on")
     return batch
+
+
+def closes_window(batch: Batch, examples: int | None, *, last: bool = False) -> Batch:
+    """`batch` as a run on the examples clock (bounded to `examples`) hands its step: marked whether it is
+    the run's `last`, closing its update window (`CLOSES_WINDOW`), every batch of such a run marked, so
+    every step it compiles is one program, fit's, one compiled ahead (`dew.training.ahead.step_batch`)
+    and a cooldown's; a run on another clock's batch as it is."""
+    return batch if examples is None else {**batch, CLOSES_WINDOW: np.bool_(last)}
 
 
 def pooled(examples: int | None) -> bool:

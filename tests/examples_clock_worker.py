@@ -54,7 +54,8 @@ def examples_clock(args) -> dict:
 
     ids = np.arange(args.records, dtype=np.int32)
     x = np.repeat(ids[:, None].astype(np.float32), FEATURES, axis=1)
-    chain = Pipeline(Memory({"x": x, "id": ids})).read("memory").batch(BATCH)
+    # A global order, which the pool's processes read disjoint shares of.
+    chain = Pipeline(Memory({"x": x, "id": ids})).shuffle(0).read("memory").batch(BATCH)
     from dew.batch import EXAMPLES_CONSUMED
     from dew.data.compile import fitted
     from dew.data.dataset import DataPartition

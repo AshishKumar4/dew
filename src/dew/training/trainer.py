@@ -129,6 +129,7 @@ from dew.training._fit import (
     Start,
     afresh,
     clocked,
+    closes_window,
     consumption_counted,
     declarations,
     first_batch,
@@ -1200,8 +1201,7 @@ class Trainer(Generic[Loss, Effects]):
     def _narrow_copies(self, state: TrainState, batch: Batch) -> dict:
         """The parameters the step reads through narrow copies
         (`dew.training.narrow`), by path under `params`: on every GPU unless
-        `chosen` turns them off, for a step this trainer composes, without a
-        loss scale."""
+        `chosen` turns them off, for a step this trainer composes, without a loss scale."""
         if (chosen_kernel('narrow_copies', 'on' if backend() == 'gpu' else 'off') == 'off'
                 or self.step is not None or self.dynamic_scale or FROZEN in state.variables):
             return {}
@@ -1910,7 +1910,7 @@ class Trainer(Generic[Loss, Effects]):
                         break
                     batch = rolled_out(self.rollout, cooled, batch, self.device_mesh, self._marked, counted,
                                        branched)
-                    device, _ = split_fields(batch)
+                    device = closes_window(split_fields(batch)[0], self._examples)
                     step, _, cooled = self._compiled_for(run.compiled, cooled, device, branched,
                                                          reported=run.current)
                     factor = decay(shape, done // self.accumulation, steps // self.accumulation)
