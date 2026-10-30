@@ -626,24 +626,30 @@ def specified_layer_types(hf_config: Mapping[str, object], used: set[str],
     return tuple(cycle[index % len(cycle)] for index in range(count))
 
 
+QWEN_WINDOW_DEFAULTS = {'qwen2': (4096, 28), 'qwen3': (4096, 28)}
+"""The window and the first windowed layer (`max_window_layers`) Qwen2's and Qwen3's config classes take
+where a config states neither (configuration_qwen2.py:75-76, configuration_qwen3.py:78-79)."""
+
+
 def native_layer_types(hf_config: Mapping[str, object], used: set[str], convention: str) -> tuple[str, ...]:
-    """The config's `layer_types`, else the ones the `convention` the family reads it by derives from it
-    through its transformers class (`AutoConfig.for_model`), as transformers builds the model: Qwen2's
-    and Qwen3's window from `max_window_layers` on under `use_sliding_window`, at the class's own
-    default of that bound. A config of another type is read by that convention's rule, which tier 2
-    then checks against the type's own class; one the class refuses is not that convention's."""
+    """The config's `layer_types`, else the ones the `convention` the family reads it by derives from it,
+    as its transformers class builds them (Qwen2Config's and Qwen3Config's `__post_init__`): a window
+    from `max_window_layers` on under `use_sliding_window` and a window it states or the class's default
+    (`QWEN_WINDOW_DEFAULTS`), full attention elsewhere. Read here, with no transformers import: an export
+    of a Dew model reads its own config so (ledger 2746). A config of another type is read by that
+    convention's rule, which tier 2 then checks against the type's own class."""
     if hf_config.get('layer_types') is not None:
         return specified_layer_types(hf_config, used)
-    from huggingface_hub.errors import StrictDataclassError
-    from transformers import AutoConfig
-
     used.update(('use_sliding_window', 'sliding_window', 'max_window_layers'))
-    fields = {name: value for name, value in hf_config.items() if name != 'model_type'}
-    try:
-        resolved = AutoConfig.for_model(convention, **fields)
-    except StrictDataclassError as error:
-        refuse(f"its fields under {convention}'s config class", str(error))
-    return _records.strings(resolved.layer_types, 'layer_types')
+    window, first = QWEN_WINDOW_DEFAULTS[convention]
+    windowed = _records.boolean(hf_config.get('use_sliding_window', False), 'use_sliding_window')
+    stated = hf_config.get('sliding_window', window)
+    if stated is not None:
+        stated = _records.integer(stated, 'sliding_window')
+    first = _records.integer(hf_config.get('max_window_layers', first), 'max_window_layers')
+    count = _records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
+    return tuple('sliding_attention' if windowed and stated is not None and index >= first
+                 else 'full_attention' for index in range(count))
 
 
 def decoder_kinds(layer_types: tuple[str, ...], window: int | None,
