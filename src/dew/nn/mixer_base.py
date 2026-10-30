@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Callable, Mapping
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
@@ -28,6 +28,9 @@ from dew.nn.kv_cache import KVCache
 from dew.nn.ngpt import NGPT
 from dew.nn.rope import Scaling
 from dew.nn.value_experts import ValueExperts
+
+if TYPE_CHECKING:
+    from dew.nn.backbones.decoder_block import Mixture
 
 QKV_RESIDUALS = ('q_proj', 'k_proj', 'v_proj', 'kv_proj')
 ATTENTION_RESIDUALS = (*QKV_RESIDUALS, 'o_proj')
@@ -150,6 +153,9 @@ class MixerContext:
     value_experts: ValueExperts | None = None
     """The layer's routed value experts in place of its value projection (`dew.nn.value_experts`, K2
     Horizon's MoVA), or None."""
+    mixture: Mixture | None = None
+    """The layer's routed MLP (`dew.nn.backbones.decoder_block.Mixture`), whose kernel, dispatch and
+    capacity its routed value experts run under; None for a layer that routes none."""
     dex: LayerDex | None = None
     """The layer's differential extension on its chosen heads' outputs (`dew.nn.dex`), or None."""
     dex_start: DexStart | None = None
