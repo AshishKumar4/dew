@@ -983,8 +983,8 @@ def mask_kernel(implementation: AttentionImpl, query, key, *, as_bias: bool, dty
     `AttentionCase.mask_as_bias`: a window's band, a forward-only cache call over several queries) and the
     call chooses ('auto') or names cudnn, the attention selector's pick of cuDNN where it takes the call,
     then xla: a kernel a run's context forces (`generation.chosen`) taken as forced, a call cuDNN cannot
-    honour (sinks, a dtype or a width it refuses, a GPU this process does not place it on) on xla;
-    elsewhere xla (`kernel_for_materialized_mask`)."""
+    honour (sinks, a dtype or a width it refuses, a GPU this process does not place it on) on xla, or the
+    reference path where xla hands it on; elsewhere xla (`kernel_for_materialized_mask`)."""
     if not (as_bias and implementation in ('auto', 'cudnn')):
         return kernel_for_materialized_mask(implementation, query, key, dtype=dtype, precision=precision,
                                             force_fp32_for_softmax=force_fp32_for_softmax)
@@ -994,4 +994,6 @@ def mask_kernel(implementation: AttentionImpl, query, key, *, as_bias: bool, dty
                        sinks=True if sinks else None, named=implementation),
         mask=True, mask_as_bias=True, folds=False)
     named = None if implementation == 'auto' else implementation
-    return attention_implementation(select(ATTENTION, case, named, preference=('cudnn', 'xla')).ran)
+    # xla hands a call its requirements turn down to the reference path (`attention_kernels.XLA_SUPPORTS`).
+    return attention_implementation(select(ATTENTION, case, named,
+                                           preference=('cudnn', 'xla', 'reference')).ran)
