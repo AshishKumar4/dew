@@ -10,8 +10,9 @@ pass starts from the cache as the step entered it and only the last pass's write
 entering cache in place of the one the pass before left, and the carry is dropped; the last runs after
 the scan, as the first does. What a pass sows, a router's or attention's statistics or captured
 intermediates, extends the step's sows pass by pass, as the unrolled passes' did. The passes before
-the last `backprop_steps` pass no gradient back, a cut each scanned pass's input takes where its index
-says so.
+the last `backprop_steps` pass no gradient back: the cut is static, the passes before it scanned, the
+pass it cuts traced on its own and those after it scanned, so no pass before it keeps residuals or runs
+a backward.
 """
 
 from __future__ import annotations
@@ -27,15 +28,14 @@ from flax.core.scope import DenyList
 from .decoder_stack import WRITTEN, Loop, PassView, SharedPassView
 
 
-def _preamble(model, loop: Loop, x, stop, injected):
+def _preamble(model, loop: Loop, x, injected, *, stop: bool):
     """A later pass's input from the state the pass before left: normed under `step_norm`, cut from the
     gradient where `stop` says, the block's input added back under `reinject`; and the exit gate's logit
     for the normed state (None without the gate)."""
     normed = model.norm(x)
     logit = model.early_exit_gate(normed) if loop.exit_gate else None
     x = normed if loop.step_norm else x
-    x = jnp.where(stop, jax.lax.stop_gradient(x), x) if isinstance(stop, jax.Array) else (
-        jax.lax.stop_gradient(x) if stop else x)
+    x = jax.lax.stop_gradient(x) if stop else x
     if loop.reinject:
         x = model.norm(x + injected)
     return x, logit
@@ -146,22 +146,22 @@ def run_loop(model, x, *, train: bool, decode: bool, **inputs):
 
     def unrolled(x, step: int, view):
         """One later pass traced on its own, over the collections as `view` shows them."""
-        x, logit = _preamble(model, loop, x, step == cut, injected)
+        x, logit = _preamble(model, loop, x, injected, stop=step == cut)
         if logit is not None and not model.is_initializing():
             model.sow('exits', 'logits', logit)
         run = nn.map_variables(run_block, mapped_collections=WRITTEN, trans_in_fn=view.inside,
                                trans_out_fn=view.outside, mutable=True)
         return run(model, x, **inputs)
 
-    # Under a shared cache the last pass keeps its writes and runs as the first does, after the scan.
-    scanned = range(1, loop.steps - 1 if shared is not None else loop.steps)
-    if len(scanned) == 1:
-        # One pass is its own program: a scan of one would only stack and unstack its collections.
-        (step,) = scanned
-        x = unrolled(x, step, shared or PassView(model.num_layers, first, end - first))
-    elif len(scanned) > 1:
+    def later_passes(x, steps: range):
+        """The later passes `steps` in order, none of them cut: one traced on its own, more under one scan."""
+        if len(steps) == 1:
+            # One pass is its own program: a scan of one would only stack and unstack its collections.
+            (step,) = steps
+            return unrolled(x, step, shared or PassView(model.num_layers + (step - 1) * (end - first), first,
+                                                        end - first))
         views = [PassView(model.num_layers + (step - 1) * (end - first), first, end - first)
-                 for step in scanned]
+                 for step in steps]
         # The collections a pass sows into beside those a stack writes, which an unrolled pass appended
         # to: those the first pass made, and captured intermediates, which a capture of a module only the
         # later passes call first makes inside the scan (the final norm `_preamble` reads by).
@@ -174,9 +174,9 @@ def run_loop(model, x, *, train: bool, decode: bool, **inputs):
         entering = None if shared is None else (shared.entering if shared.entering is not None
                                                else model.variables.get('cache') or None)
 
-        def later(module, x, stop):
+        def later(module, x):
             # The block's input, its per-layer inputs and the entering cache close over the scan.
-            x, logit = _preamble(module, loop, x, stop, injected)
+            x, logit = _preamble(module, loop, x, injected, stop=False)
             if entering is None:
                 return run_block(module, x, **inputs), logit
             reading = nn.map_variables(run_block, mapped_collections='cache',
@@ -188,14 +188,23 @@ def run_loop(model, x, *, train: bool, decode: bool, **inputs):
         scan = nn.scan(later, variable_axes={stacked: 0},
                        variable_carry='cache' if shared is not None else False,
                        variable_broadcast=DenyList(mapped), split_rngs={'params': False, 'dropout': True},
-                       length=len(scanned))
+                       length=len(steps))
         run = nn.map_variables(scan, mapped_collections=mapped, trans_in_fn=view.inside,
                                trans_out_fn=view.outside, mutable=True)
-        stops = jnp.asarray([step == cut for step in scanned])
-        x, logits = run(model, x, stops)
+        x, logits = run(model, x)
         if logits is not None and not model.is_initializing():
             for logit in logits:
                 model.sow('exits', 'logits', logit)
+        return x
+
+    # Under a shared cache the last pass keeps its writes and runs as the first does, after the scan.
+    scanned = range(1, loop.steps - 1 if shared is not None else loop.steps)
+    # The cut is static: the passes before it, the one it cuts, alone, and those after it.
+    segments = ((scanned,) if cut is None or cut not in scanned else
+                (range(scanned.start, cut), range(cut, cut + 1), range(cut + 1, scanned.stop)))
+    for steps in segments:
+        if steps:
+            x = later_passes(x, steps)
     if shared is not None and loop.steps > 1:
         x = unrolled(x, loop.steps - 1, shared)
     if loop.reinject:

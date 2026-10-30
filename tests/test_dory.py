@@ -471,6 +471,25 @@ def test_a_cut_loop_trains_the_layers_before_it_through_the_input_every_pass_rea
                               uncut['layers_1']['self_attn']['down_proj']['kernel'])
 
 
+def test_a_cut_loop_keeps_no_residual_of_the_passes_before_its_cut():
+    """The cut is static: at six passes with the last one's gradient alone, the gradient's compiled
+    program keeps none of the five passes' residuals before it, so it holds fewer temporary bytes than
+    the uncut loop's, whose every pass runs its backward."""
+    loaded = load()
+    ids, cotangent = REFERENCE['input_ids'], REFERENCE['cotangent']
+
+    def temporaries(backprop_steps):
+        model = loaded.model.with_passes(6, backprop_steps=backprop_steps)
+
+        def loss(params):
+            return jnp.sum(model.apply({**loaded.variables, 'params': params}, ids) * cotangent)
+
+        compiled = jax.jit(jax.grad(loss)).lower(loaded.variables['params']).compile()
+        return compiled.memory_analysis().temp_size_in_bytes
+
+    assert temporaries(1) < temporaries(None)
+
+
 PROJECTIONS = ('q_proj', 'k_proj', 'v_proj', 'o_proj', 'g_proj', 'gate_proj', 'up_proj', 'down_proj')
 """Every projection of a Dory layer by its checkpoint name: an attention's four and its output
 gate's (`g_proj`), and a feed-forward's three."""
