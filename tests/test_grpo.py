@@ -282,7 +282,8 @@ def test_an_asynchronous_rescore_reads_the_policy_at_the_progress_its_loss_reads
     model = CausalTransformer(vocab_size=VOCAB, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
                               max_seq_len=12, dtype="float32", attention_impl="xla",
                               dex=DifferentialExtension(((0, (0, 1)),), anneal_steps=10))
-    objective = GRPOObjective(model, seq_len=7)
+    # A stale rollout's off-policy correction, which an asynchronous collection takes.
+    objective = GRPOObjective(model, seq_len=7, behavior_importance=2.0)
     start = Trainer(objective, optax.sgd(0.0), key=0).initial_state()
     state = start.replace(updates=jnp.asarray(5, start.updates.dtype))
     scheduler = RolloutScheduler(Asynchronous(Scripted(), Publisher(), objective, width=8, rows=2, max_lag=1,
