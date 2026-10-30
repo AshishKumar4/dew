@@ -31,6 +31,7 @@ from typing import Any, Literal
 import jax
 import jax.numpy as jnp
 import numpy as np
+from flax import linen as nn
 from jax.sharding import Mesh
 from lm_eval import utils
 from lm_eval.api.instance import Instance
@@ -57,16 +58,19 @@ TokenRequest = tuple[tuple[str, str] | None, list[int], list[int]]
 """One `_loglikelihood_tokens` request: the strings, context ids, continuation ids."""
 
 
-def _scored(scorer: TokenScorer, variables, rows: ModelInputs) -> tuple[jax.Array, jax.Array]:
+def _scored(model: nn.Module, variables, rows: ModelInputs) -> tuple[jax.Array, jax.Array]:
     """Return the per-target log-probability and whether the target was the argmax, as the scorer
     the language-model losses share scores them (`TokenScorer.token_scores`), through its tiled
     head, which holds a tile of the vocabulary at a time rather than every row's whole logits;
-    compiled with the model's XLA options (`program`).
+    compiled with the model's XLA options (`program`), one program for each model and row width,
+    whichever harness asks: the model is its static argument, hashed by its fields, as a decode step
+    takes it (`dew.inference.serving_kernel`), so harnesses over a run's checkpoints share it.
 
     `rows` is `[B, T]` of token ids, with their fields (`_scoring_inputs`); both results are
     `[B, T - 1]`, entry `i` belonging to `rows[:, i + 1]`. Rows are right-padded by the caller, which
     a causal model cannot read backwards, so a short row's own slots hold what they would hold alone.
     """
+    scorer: TokenScorer = LMObjective(model, rows.tokens.shape[1] - 1, head_tile="tiled")
     scores = scorer.token_scores(variables, rows, predict=True)
     return -scores.losses, scores.correct == 1
 
@@ -121,7 +125,6 @@ class DewLM(TemplateLM):
         self.task = task
         self._processor = processor
         self.batch_size = batch_size
-        self._scorers: dict[int, TokenScorer] = {}
 
     @classmethod
     def from_run(cls, run: str, *, batch_size: int = 1, ema: bool | None = None,
@@ -295,7 +298,9 @@ class DewLM(TemplateLM):
                                      [len(rows[index]) - len(requests[index][2]) for index in batch],
                                      self.task.prefix)
             scoring = program(_scored, self.task.model, static_argnums=(0,))
-            probabilities, argmax = scoring(self._scorer(inputs.tokens.shape[1]), self.task.variables, inputs)
+            # Scored in the attention form the run trained in, as its generation is (`SavedRunTask.traced`).
+            with self.task.traced():
+                probabilities, argmax = scoring(self.task.model, self.task.variables, inputs)
             values, matched = np.asarray(probabilities), np.asarray(argmax)
             for offset, index in enumerate(batch):
                 end = len(rows[index]) - 1
@@ -303,14 +308,6 @@ class DewLM(TemplateLM):
                 answers.append((float(values[offset, start:end].sum()),
                                 bool(matched[offset, start:end].all())))
         return answers
-
-    def _scorer(self, width: int) -> TokenScorer:
-        """The task's model scored over rows of `width` ids as a language model's loss scores them
-        (`LMObjective`), every target counted and its head tiled (`_scored`), one for each width a
-        batch pads to."""
-        if width not in self._scorers:
-            self._scorers[width] = LMObjective(self.task.model, width - 1, head_tile="tiled")
-        return self._scorers[width]
 
     def loglikelihood_rolling(self, requests: list[Instance],
                               disable_tqdm: bool = False) -> list[float]:

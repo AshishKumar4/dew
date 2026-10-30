@@ -727,7 +727,8 @@ def test_an_lm_run_over_a_sources_own_processor_reloads_that_processor(tmp_path,
 
 def test_a_run_record_holding_a_field_its_objective_does_not_write_is_refused(tmp_path):
     """An LM run records its decoder's task settings (`TextSettings`) and nothing else beside
-    its objective and model, and they read back as the objective's own; a record holding
+    its objective, its model and the attention form it trained in (row 2255), and they read back as
+    the objective's own; a record holding
     another field, as a sampling temperature no LM run writes, is refused rather than loaded
     with the field ignored."""
     from dew.inference.tasks import TextSettings, saved_settings, settings_fields
@@ -736,7 +737,7 @@ def test_a_run_record_holding_a_field_its_objective_does_not_write_is_refused(tm
     checkpoints = Checkpoints(str(tmp_path), keep=2)
     record = checkpoints.artifact()
     assert isinstance(record, dict)
-    assert set(record) == {"objective", "model", *settings_fields(TextSettings)}
+    assert set(record) == {"objective", "model", "attention_form", *settings_fields(TextSettings)}
     assert saved_settings(record, TextSettings) == objective.task_settings()
     dew.pipeline(str(tmp_path))
     checkpoints.save(int(state.step) + 1, state, artifact={**record, "temperature": 0.5})
