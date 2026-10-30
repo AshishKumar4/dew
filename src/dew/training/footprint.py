@@ -180,10 +180,19 @@ def peak_bytes(program: jcore.Jaxpr, platform: str, workspace: int) -> int:
     last = {kept: index for index, equation in enumerate(program.eqns)
             for kept in frontier.reading(equation.invars)}
     last.update({kept: len(program.eqns) for kept in frontier.reading(program.outvars)})
+    # A ragged operand's dense expansion, one per operand and group sizes however many ragged products
+    # read it (XLA's common-subexpression elimination), from the first that reads it to the last.
+    dense = {key: index for index, equation in enumerate(program.eqns)
+             for key in (expansions(equation) if platform == "gpu" else {})}
     live, held, most = 0, set(), 0
+    expanded: set[tuple[jcore.Var, jcore.Var]] = set()
     for index, equation in enumerate(program.eqns):
         made = [out for out in equation.outvars if out in last and frontier.buffered(out)]
         made_bytes = sum(map(device_share, made))
+        for key, size in (expansions(equation) if platform == "gpu" else {}).items():
+            if key not in expanded:
+                expanded.add(key)
+                live += size
         if made or not frontier.fusing(equation):
             inner = max((peak_bytes(body, platform, workspace) for body in bodies(equation)), default=0)
             operands = 0 if frontier.fusing(equation) else sum(
@@ -199,6 +208,9 @@ def peak_bytes(program: jcore.Jaxpr, platform: str, workspace: int) -> int:
         for done in [value for value in held if last[value] == index]:
             held.discard(done)
             live -= device_share(done)
+        for key, size in (expansions(equation) if platform == "gpu" else {}).items():
+            if dense[key] == index:
+                live -= size
     return most
 
 
@@ -314,6 +326,33 @@ def cublas_product(equation: jcore.JaxprEqn) -> bool:
     threshold = int(xla_flag("xla_gpu_gemm_rewrite_size_threshold") or GEMM_REWRITE_SIZE)
     classical = produced in ("float16", "float32", "bfloat16") and emitted_algorithm(equation)
     return (kept_left + kept_right) * contracting >= threshold or not classical
+
+
+def expansions(equation: jcore.JaxprEqn) -> dict[tuple[jcore.Var, jcore.Var], int]:
+    """The dense expansions a GPU's ragged product reads, each keyed by its operand and group sizes, with
+    its bytes: XLA expands a ragged product no grouped kernel takes into a product over its groups
+    (`RaggedDotRewriter::RunImpl`, xla/hlo/transforms/expanders/ragged_dot_rewriter.cc: cuDNN's fusion
+    takes only float16 or bfloat16, behind `xla_gpu_experimental_use_ragged_dot_fusion`, off by default;
+    hipBLASLt's grouped GEMM only on ROCm), each operand it makes dense (`RaggedToDense`) masked once a
+    group, in both its layouts and with its mask: the ragged rows of one ragged in a non-contracting
+    dimension, both operands of one ragged in its contracting dimension, none of one ragged in a batch
+    dimension (`RaggedToGeneral`)."""
+    if equation.primitive.name != "ragged_dot_general":
+        return {}
+    numbers = equation.params["ragged_dot_dimension_numbers"]
+    (contracting, _), (batch, _) = numbers.dot_dimension_numbers
+    (ragged,) = numbers.lhs_ragged_dimensions
+    sizes = equation.invars[2]
+    if ragged in batch or not computed(sizes):
+        return {}
+    groups = dimensions(sizes)[-1]
+    dense = equation.invars[:2] if ragged in contracting else equation.invars[:1]
+    # The operand masked into its groups (a select of its broadcast) as `RaggedToDense` lays it out, the
+    # group beside its ragged dimension, that laid out groups first (`TransposeIndexToFront`), and the
+    # mask, a byte an element: an Ampere's step at highest precision holds all three
+    # (f32[1024,4,128], f32[4,1024,128] and pred[4,1024,128] in its buffer assignment, row 2750).
+    return {(operand, sizes): groups * (2 * device_share(operand) + int(math.prod(dimensions(operand))))
+            for operand in dense if computed(operand)}
 
 
 def emitted_algorithm(equation: jcore.JaxprEqn) -> bool:

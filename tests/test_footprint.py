@@ -245,13 +245,14 @@ def test_a_ragged_product_holds_its_ragged_operand_once_a_group_on_a_gpu():
     """XLA's GPU compiler expands a ragged product its grouped kernels do not take, every float32 one, into
     a product over its groups (`RaggedDotRewriter`, xla/hlo/transforms/expanders/ragged_dot_rewriter.cc):
     one of rows ragged in their non-contracting dimension holds those rows masked once a group while it
-    multiplies; its gradient in the weights, ragged in its contracting dimension, holds both operands so."""
+    multiplies, as the select lays them out and groups first, with the mask, a byte an element; its
+    gradient in the weights, ragged in its contracting dimension, holds both operands so."""
     from dew.training.footprint import peak_bytes
 
     rows, sizes = jax.ShapeDtypeStruct((64, 16), jnp.float32), jax.ShapeDtypeStruct((4,), jnp.int32)
     weights = jax.ShapeDtypeStruct((4, 16, 32), jnp.float32)
     program = jax.make_jaxpr(lambda rows, weights, sizes: jax.lax.ragged_dot(rows, weights, sizes))(
         rows, weights, sizes).jaxpr
-    # The output (64 x 32) beside the rows masked once for each of the 4 groups.
-    assert peak_bytes(program, "gpu", 0) == (64 * 32 + 4 * 64 * 16) * 4
+    # The output (64 x 32) beside the rows masked once for each of the 4 groups, twice, and the mask.
+    assert peak_bytes(program, "gpu", 0) == (64 * 32 + 2 * 4 * 64 * 16) * 4 + 4 * 64 * 16
     assert peak_bytes(program, "cpu", 0) == 64 * 32 * 4
