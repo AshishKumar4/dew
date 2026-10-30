@@ -660,7 +660,8 @@ class FitSearch[LossT, EffectsT]:
         chooses its remat (`RematChoosing`) is read from no remat up to the run's own, which the walk
         never reads, and the run's own modules and head are put back. A run whose remat the ladder's climb
         from none never reaches (a policy off `DECODER_REMAT`, or a rung the climb passes over) is told
-        nothing, and traces nothing for it: no rung below its own is known."""
+        nothing, and traces nothing for it: no rung below its own is known. A layout the derivation cannot
+        judge (`walked`'s "unknown") is told so."""
         entries = self.objective.program_key()
         if not any(entry.trained and isinstance(entry.module, RematChoosing) for entry in entries):
             return
@@ -686,6 +687,11 @@ class FitSearch[LossT, EffectsT]:
             _log.warning("the run sets remat %s, and the derivation says the step fits from remat %s, which "
                          "recomputes less: leave the remat unset and the run compiles there first", own,
                          found)
+        elif label == "unknown":
+            # The derivation reads per-device residuals only where each split axis is data or fsdp (row 2615).
+            _log.warning("the run sets remat %s, and the derivation cannot judge its layout's footprint (a "
+                         "tensor, sequence, stage or expert axis), so it says nothing of a rung that "
+                         "recomputes less", own)
 
     def current(self) -> dict[str, JSON]:
         return rung_record(self.objective, self.xla_defaults, narrow=self.narrow)
