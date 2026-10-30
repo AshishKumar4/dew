@@ -488,6 +488,20 @@ def builds(annotation, option) -> bool:
     return any(isinstance(member, type) and bare(option) in made(member) for member in members)
 
 
+def holds(field, option) -> bool:
+    """Whether a run's field of type `field` takes an option of type `option`: the same type, or a tuple
+    whose items' kinds hold the option's items' (a run's row segments a question layout's)."""
+    if field == option:
+        return True
+    if typing.get_origin(field) is not tuple or typing.get_origin(option) is not tuple:
+        return False
+    def kinds(annotation) -> set:
+        item = typing.get_args(annotation)[0]
+        item = item.__value__ if isinstance(item, typing.TypeAliasType) else item
+        return set(typing.get_args(item) or (item,))
+    return kinds(option) <= kinds(field)
+
+
 def reach(run: RunConfig, objective: str, name: str, annotation, argument: bool = True) -> Reach | None:
     """Where `dew train` sets a saved task's option `name` of `annotation`: a field of the run, or of a
     section it holds, declared of that type (a number or a text's of that name) or a builder of it
@@ -499,7 +513,7 @@ def reach(run: RunConfig, objective: str, name: str, annotation, argument: bool 
         hints = typing.get_type_hints(type(config), include_extras=True)
         for field in dataclasses.fields(config):
             value, hint = getattr(config, field.name), hints[field.name]
-            if field.name == name if named else bare(hint) == bare(annotation):
+            if field.name == name if named else holds(bare(hint), bare(annotation)):
                 yield Reach(prefix + field.name, hint)
             elif not named and builds(hint, annotation):
                 yield Reach(prefix + field.name, hint, builds=True)
@@ -545,7 +559,9 @@ def options_of(run: RunConfig, objective: str, kind: type, base, prefix: str = "
     found = []
     for name, values in declared.items():
         derived = "derived" in fields[name].metadata
-        path = reach(run, objective, name, hints[name], argument=not derived)
+        # An objective's argument of the name is the settings' own option, not a field of a value the run
+        # builds (a decision objective's segments count, a layout's segments).
+        path = reach(run, objective, name, hints[name], argument=not derived and not prefix)
         value = getattr(base, name)
         if path is None and derived and dataclasses.is_dataclass(value) and not isinstance(value, type):
             found += options_of(run, objective, type(value), value, f"{prefix}{name}.")
