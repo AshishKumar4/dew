@@ -74,10 +74,10 @@ EVIDENCE = 1
 
 def evidence(run, state, directory: Path) -> dict:
     """What a saved run serialized, as a later main's load and resume read it back
-    (tests/test_saved_runs.py): its parameters' dtypes, its compute's as its run states it and as the
-    task loaded from it computes (`computed`), its dynamic loss scale and the finite steps it counted,
-    the examples it consumed, its last step, and the rung its step compiled at, the remat and the plan
-    it was admitted under (`StepCompiled`) but the plan's probes and kernels."""
+    (tests/test_saved_runs.py): its parameters' dtypes, its compute's as its run states it, the dtypes
+    one request of the task loaded from it multiplies in (`computed`), its dynamic loss scale and the
+    finite steps it counted, the examples it consumed, its last step, and the rung its step compiled at,
+    the remat and the plan it was admitted under (`StepCompiled`) but the plan's probes and kernels."""
     import jax
     from saved_run_kinds import computed
 
@@ -90,7 +90,7 @@ def evidence(run, state, directory: Path) -> dict:
     plan = compiled["plan"] or {}
     task = None if objectives[run.objective.name].saved_task is None else dew.pipeline(str(directory))
     return {"step": int(state.step), "compute": run.compute_dtype(),
-            "task_compute": None if task is None else computed(task.model),
+            "products": None if task is None else computed(task),
             "params": sorted({str(leaf.dtype) for leaf in jax.tree.leaves(state.variables["params"])}),
             "scale": None if state.scale is None else float(state.scale.scale),
             "finite_steps": None if state.scale is None else int(state.scale.fin_steps),
