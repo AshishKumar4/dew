@@ -5,11 +5,11 @@ its checkpoint, the two runs alike bit for bit.
     python tools/image_lifecycle.py compare --output lifecycle
 
 examples/train_flowers.py's diffusion model and objective on Oxford Flowers 102 (the Hub's copy at a pinned
-commit) at 256 pixels, batch 16, under XLA's deterministic GPU ops, each run in a fresh `output`: one trains
-`steps` straight; the other trains half of them and ends, and a new process resumes it from its checkpoint to
-`steps` (`train`, a process each). Each saves 8 samples (samples.png). It prints whether the two runs'
-states at `steps` (their checkpoints, every leaf bit for bit), their samples (samples.png's bytes) and the
-losses they printed are equal.
+commit) at 256 pixels, batch 16, under XLA's deterministic GPU ops (`--no-deterministic` without them), each
+run in a fresh `output`: one trains `steps` straight; the other trains half of them and ends, and a new
+process resumes it from its checkpoint to `steps` (`train`, a process each). Each saves 8 samples
+(samples.png). It prints whether the two runs' states at `steps` (their checkpoints, every leaf bit for bit),
+their samples (samples.png's bytes) and the losses they printed are equal.
 """
 
 import dataclasses
@@ -40,6 +40,8 @@ class Compare:
 
     output: Path
     steps: int = 400
+    deterministic: bool = True
+    """Under XLA's deterministic GPU ops; without them a GPU's reductions may take another order each run."""
 
 
 def train(args: Train) -> None:
@@ -54,9 +56,11 @@ def train(args: Train) -> None:
     train_flowers.main(config, data)
 
 
-def trained(output: Path, steps: int) -> list[tuple[str, str]]:
-    """Each step and loss a fresh process logs training the model in `output` to `steps` (`train`)."""
-    env = {**os.environ, "XLA_FLAGS": f"{os.environ.get('XLA_FLAGS', '')} --xla_gpu_deterministic_ops=true"}
+def trained(output: Path, steps: int, deterministic: bool) -> list[tuple[str, str]]:
+    """Each step and loss a fresh process logs training the model in `output` to `steps` (`train`), under
+    XLA's deterministic GPU ops where `deterministic`."""
+    flags = f"{os.environ.get('XLA_FLAGS', '')}{' --xla_gpu_deterministic_ops=true' if deterministic else ''}"
+    env = {**os.environ, "XLA_FLAGS": flags.strip()}
     log = subprocess.run([sys.executable, __file__, "train", "--output", str(output), "--steps", str(steps)],
                          env=env, capture_output=True, text=True, check=True).stdout
     return re.findall(r"^step (\d+)/\d+\s+loss (\S+)", log, re.MULTILINE)
@@ -80,8 +84,9 @@ def compare(args: Compare) -> None:
         raise SystemExit(f"{', '.join(taken)} exists: compare trains each run afresh; name a new --output")
     for run in runs:
         run.mkdir(parents=True)
-    straight = trained(runs[0], args.steps)
-    resumed = trained(runs[1], args.steps // 2) + trained(runs[1], args.steps)
+    straight = trained(runs[0], args.steps, args.deterministic)
+    resumed = [*trained(runs[1], args.steps // 2, args.deterministic),
+               *trained(runs[1], args.steps, args.deterministic)]
     first, second = (weights(run, args.steps) for run in runs)
     same = first.keys() == second.keys() and all(
         first[name].dtype == second[name].dtype and np.array_equal(first[name], second[name])
