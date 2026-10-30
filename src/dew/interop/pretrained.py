@@ -233,6 +233,10 @@ class Pretrained:
     ran them (`trust_remote_code`) or, mapped natively, kept them unexecuted, so a save opens through the
     source's own transformers loader as the source does; read from the source's snapshot, which a
     weights conversion may not be, when the save writes it."""
+    fresh: tuple[str, ...] = ()
+    """The modules of `model` drawn fresh beside the loaded weights, by their paths under `params`
+    (`layers_1/cross_attention`): what `with_cross_attention` adds, which a run trains in a fresh group
+    (`Objective.fresh_modules`, `dew.optim.OptimConfig.fresh_groups`)."""
     names_tokenizer: ClassVar[bool] = True
     """Whether generation_config.json may record the tokenizer's name.
 
@@ -530,9 +534,10 @@ class Pretrained:
         checkpoint keeps it.
         """
         from dew.batch import freeze, merge, select, thaw
-        from dew.nn.cross_attention import crossing
+        from dew.nn.cross_attention import NAME, crossing
         from dew.nn.inputs import request_key
         from dew.nn.protocols import CrossAttending, Predicting
+        from dew.optim import parameter_name
 
         if not isinstance(self.model, CrossAttending):
             raise TypeError(f"a {type(self.model).__name__} takes no cross-attention layers")
@@ -547,8 +552,13 @@ class Pretrained:
             return select(thaw(model.init(draw, jnp.zeros((1, length), jnp.int32))),
                           lambda path: path[0] == "params" and crossing(path))
 
-        variables = merge(self.variables, jax.jit(drawn)(request_key(key)))
-        return replace(self, model=model, variables=freeze(variables, crossing) if frozen else variables)
+        blocks = jax.jit(drawn)(request_key(key))
+        variables = merge(self.variables, blocks)
+        # Each block's module, its path under `params` to and with the block's own name.
+        added = {"/".join(keys[1:keys.index(NAME) + 1]) for keys in (
+            parameter_name(path).split("/") for path, _ in jax.tree_util.tree_leaves_with_path(blocks))}
+        return replace(self, model=model, variables=freeze(variables, crossing) if frozen else variables,
+                       fresh=tuple(sorted({*self.fresh, *added})))
 
     def with_dex(self, extension: DifferentialExtension, *, key: int | jax.Array) -> Self:
         """Return this source with DEX's differential on `extension`'s chosen heads (`dew.nn.dex`), its

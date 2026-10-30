@@ -27,6 +27,7 @@ from rl_support import clipped_surrogate, prompt_inputs
 from test_mixers import KIND_FIELDS, tiny
 
 from dew.data.dataset import Loader
+from dew.distributed.batches import split_fields
 from dew.inference import TextGeneration
 from dew.nn.inputs import ModelInputs
 from dew.objectives.base import Step
@@ -475,7 +476,8 @@ def test_real_trainer_update_matches_raw_policy_ratio_with_behavior_recorded():
     """The trainer's one SGD step from a rollout is on par with the step of the raw policy ratio's
     clipped surrogate taken by hand over the same rollout, from its float64 evaluation over drawn
     keys (check 1); the rollout records a top-k behavior apart from the raw policy, and the step
-    moves the parameters."""
+    moves the parameters. The run's own first step, its rollout drawn inside `fit`, is the compiled
+    step's over the drawn rollout, bit for bit."""
     model = decoder()
     params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
     objective = GRPOObjective(model, seq_len=7, variables=params)
@@ -497,13 +499,23 @@ def test_real_trainer_update_matches_raw_policy_ratio_with_behavior_recorded():
         key = np.asarray(jax.random.key_data(jax.random.fold_in(jax.random.key(5), seed)))
         return key, rolled_from(jax.random.wrap_key_data(key))
 
-    @as_given
-    def trained(key, rolled):
+    def fitted(key):
+        """The trainer's first step as a run takes it, its rollout its own, drawn from `key`."""
         data = Loader(train=lambda partition: iter([batch]), val=None, records=rows, batch=rows)
         trainer = Trainer(objective, optax.sgd(0.01), key=jax.random.wrap_key_data(key), rollout=rollout)
         state = trainer.fit(data, steps=1, log_every=1, checkpoint_every=None)
         assert int(state.step) == 1
         return state.variables
+
+    # The trainer's step, compiled once for a rollout's batch, which each draw's rollout steps from a
+    # fresh state the step consumes: one program for every draw (ledger 2157), the run's own first
+    # step the same to the bit (below).
+    stepper = Trainer(objective, optax.sgd(0.01), key=jax.random.key(0), rollout=rollout)
+    step = stepper.compile(stepper.place()[0], split_fields(rolled_from(jax.random.key(5)))[0])
+
+    @as_given
+    def trained(key, rolled):
+        return step(stepper.place()[0], split_fields(rolled)[0])[0].variables
 
     def by_hand(dtype=None):
         if dtype is None:
@@ -534,7 +546,10 @@ def test_real_trainer_update_matches_raw_policy_ratio_with_behavior_recorded():
     assert not np.array_equal(rolled["old_log_probs"], rolled["behavior_log_probs"])
     assert_as_exact(trained, by_hand(), draw, "trainer update", seeds=SEEDS['trainer update'],
                     truth_fn=by_hand("float64"))
-    moved = trained(*draw(0))
+    key, first = draw(0)
+    moved = fitted(key)
+    assert all(np.array_equal(run, compiled) for run, compiled in zip(
+        jax.tree.leaves(moved), jax.tree.leaves(trained(key, first)), strict=True))
     assert any(not np.array_equal(old, new)
                for old, new in zip(jax.tree.leaves(params), jax.tree.leaves(moved), strict=True))
 

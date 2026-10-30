@@ -114,13 +114,8 @@ import numpy as np
 import pytest
 from interop_support import fixture_ids, respelled, transformers_arms, transformers_model
 from model_support import flat_tree, llada_draw, llada_fields, prediction_logits
-from reference_error import (
-    as_given,
-    assert_as_exact,
-    assert_as_exact_as_the_reference,
-    declared_seeds,
-    recording,
-)
+from one_draw import assert_as_exact_as_the_reference
+from reference_error import as_given, assert_as_exact, declared_seeds, recording
 
 from dew.interop import Pretrained, PretrainedDecoder
 from dew.interop.hf_decoders import translate_config, translate_weights
