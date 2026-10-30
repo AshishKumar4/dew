@@ -49,6 +49,7 @@ from dew.training.memory import (
     recompute_more,
     recompute_record,
     remat_half,
+    remat_more,
     rung_record,
     step_fits,
     temporaries_factor,
@@ -588,18 +589,29 @@ class FitSearch[LossT, EffectsT]:
         """Tell a run that sets its remat, before it compiles there alone (row 2111), the least-recompute
         rung its derivation finds fits where that recomputes less (row 2536): each trained module that
         chooses its remat (`RematChoosing`) is read from no remat up to the run's own, which the walk
-        never reads, and the run's own modules and head are put back. A run whose remat no rung of the
-        ladder reaches (one off `DECODER_REMAT`) is told nothing: no rung below it is known."""
+        never reads, and the run's own modules and head are put back. A run the derivation cannot judge,
+        a step over several devices (`candidate_footprint`), and one whose remat the ladder's climb from
+        none never reaches (a policy off `DECODER_REMAT`, or a rung the climb passes over) are told
+        nothing, and trace nothing for it: no rung below theirs is known."""
         entries = self.objective.program_key()
-        if not any(entry.trained and isinstance(entry.module, RematChoosing) for entry in entries):
+        if self.mesh.devices.size > 1 or not any(
+                entry.trained and isinstance(entry.module, RematChoosing) for entry in entries):
             return
         held, own = [entry.module for entry in entries], self.remat_rung()
         tile, fused = head_tile_of(self.objective), head_fused_of(self.objective)
-        self.objective.substitute([entry.module.with_remat(None) if entry.trained and isinstance(
-            entry.module, RematChoosing) else entry.module for entry in entries])
+        lightest = [entry.module.with_remat(None) if entry.trained and isinstance(entry.module, RematChoosing)
+                    else entry.module for entry in entries]
+        label = found = None
         try:
-            label, _ = self.walked(split, until=own)
-            found = self.remat_rung()
+            # The rungs the climb takes, read off the modules alone, which trace nothing.
+            self.objective.substitute(lightest)
+            climbed = [self.remat_rung()]
+            while remat_more(self.objective):
+                climbed.append(self.remat_rung())
+            if own in climbed:
+                self.objective.substitute(lightest)
+                label, _ = self.walked(split, until=own)
+                found = self.remat_rung()
         finally:
             self.objective.substitute(held)
             self.objective.restore_head(tile, fused=fused)
