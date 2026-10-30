@@ -85,14 +85,18 @@ def selection(source, meta):
     return given, null, process, times
 
 
-def trajectory(source, prepared, given, null, process, times, key):
-    """The single solver walk from the public `prepare`'s start, the one
-    path every caller starts from, and the conditions it walks under: the
-    text ones and the spatial ones `prepare` built. Its real rows: on a mesh
-    the rows pad to fill the devices."""
+def walked(prepared, given, null):
+    """The conditions a walk from the public `prepare`'s start walks under: the text ones and the
+    spatial ones `prepare` built, its real rows alone: on a mesh the rows pad to fill the devices."""
     spatial = {name: prepared.conditions[name][:prepared.rows] for name in ("mask", "masked_image")
                if name in prepared.conditions}
-    given, null = {**given, **spatial}, {**null, **spatial}
+    return {**given, **spatial}, {**null, **spatial}
+
+
+def trajectory(source, prepared, given, null, process, times, key):
+    """The single solver walk from the public `prepare`'s start, the one
+    path every caller starts from, and the conditions it walks under (`walked`)."""
+    given, null = walked(prepared, given, null)
     denoise = process.denoiser(source.model, source.variables, given, null)
     latents = sample(denoise, prepared.noise[:prepared.rows], solver=source.schedule.solver, guidance=CFG(3.0),
                      key=key, times=times, final_denoise=False)
@@ -217,23 +221,34 @@ def train_and_reload(source, reference, key, given, noise):
     return {"loss_before": float(value), "loss_after": float(after), "diffusers_ratio": ratio}
 
 
-def check_pipeline(directory, streamed: bool = False):
-    """The saved pipeline's trajectory, update, reload and export against the source. With
-    `streamed`, the pipeline streamed onto a mesh a leaf at a time loads the same tree, placed on the
-    mesh, its trajectory's images are held to the source as the whole load's are, and it is the
-    pipeline the update, reload and export run on (`streamed_parity`)."""
+PARTS = ("walk", "update")
+"""What a pipeline's check holds, each part in a process of its own (`check_pipeline`)."""
+
+
+def check_pipeline(directory, part: str, streamed: bool = False):
+    """The saved pipeline against the source: its trajectory (`part` 'walk') or its update, reload and
+    export ('update'). With `streamed`, the pipeline streamed onto a mesh a leaf at a time loads the
+    same tree, placed on the mesh, its trajectory's images are held to the source as the whole load's
+    are (`streamed_parity`), and it is the pipeline the update, reload and export run on, under the
+    conditions its public `prepare` builds."""
     directory = Path(directory)
-    source = bundle(directory)
     reference = np.load(directory / "reference.npz")
     meta = json.loads((directory / "reference.json").read_text()) if (directory / "reference.json").exists() else {}
     errors, key = {}, jax.random.PRNGKey(17)
+    if part == "walk":
+        source = bundle(directory)
+        given, null, process, times = selection(source, meta)
+        qualified(errors, directory.name, source, reference, meta, key, given, null, process, times)
+        if streamed:
+            streamed_parity(errors, directory, source, reference, meta, key)
+        print(json.dumps({"directory": str(directory), "errors": errors}))
+        return
+    source = bundle(directory, streamed=streamed)
     given, null, process, times = selection(source, meta)
-    _, given = qualified(errors, directory.name, source, reference, meta, key, given, null, process, times)
-    if streamed:
-        source, given = streamed_parity(errors, directory, source, reference, meta, key)
+    prepared = public_start(source.text_to_image(), source, reference, meta, key, given, null, process, times)
+    given, _ = walked(prepared, given, null)
     training = train_and_reload(source, reference, key, given, jnp.asarray(reference["noise"]))
-    errors["reload"] = 0.0
-    print(json.dumps({"directory": str(directory), "errors": errors, "training": training}))
+    print(json.dumps({"directory": str(directory), "reload": 0.0, "training": training}))
 
 
 def qualified(errors, name, source, reference, meta, key, given, null, process, times, label=""):
@@ -497,6 +512,7 @@ if __name__ == "__main__":
     parser.add_argument("--case")
     parser.add_argument("--model", action="store_true")
     parser.add_argument("--streamed", action="store_true", help="load the pipeline streamed onto a mesh")
+    parser.add_argument("--part", choices=PARTS, default="walk", help="the pipeline check's part")
     args = parser.parse_args()
     if args.model:
         check_model(args.directory)
@@ -505,4 +521,4 @@ if __name__ == "__main__":
     elif args.case:
         regress(args.directory, args.case)
     else:
-        check_pipeline(args.directory, args.streamed)
+        check_pipeline(args.directory, args.part, args.streamed)
