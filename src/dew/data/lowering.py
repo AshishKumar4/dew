@@ -2056,6 +2056,8 @@ class _Build:
         batches = rows.batch(size, drop_remainder=drop, batch_fn=_Batched(batch_stage.batch_fn))
         if not drop and fill:
             batches = batches.map(FilledBatch(size, real=real))
+            if self.training and partition.count > 1 and not self.lowering.records_unending and len(whole):
+                batches = _evened(batches, whole, -(-len(whole) // batch_stage.size), size, batch_stage)
         batches = self.placed(batches, pipeline, partition, after)
         batches = batches[offset // batch_stage.size :]
         # A count of records that ends inside a batch, as a batch ramp saves, resumes past the
@@ -2216,6 +2218,20 @@ def _order_length(train: Pipeline, build: _Build) -> int | None:
     order = dataclasses.replace(train, stages=train.stages[:_until(train.stages, (BatchStage, TokenBudget))])
     with _closing(build.records(order, DataPartition())) as rows:
         return len(rows) if isinstance(rows, pygrain.MapDataset) else None
+
+
+def _evened(batches: pygrain.MapDataset, whole: pygrain.MapDataset, count: int, size: int,
+            stage: BatchStage) -> pygrain.MapDataset:
+    """A share's `batches` of a pool's global order of `count` batches, as many as every share steps: a
+    share whose rows the order's last batch ends before reads on with batches of no real row (a row of
+    the order's repeated, `FilledBatch` with no real rows), so the pool's shares end at one step and its
+    steps are planned as one process's are (`Loader.example_steps`), each share's batch of the pool's
+    tree, none consuming an example or counting a token."""
+    missing = count - len(batches)
+    if missing <= 0:
+        return batches
+    empty = whole[:1].batch(1, batch_fn=_Batched(stage.batch_fn)).map(FilledBatch(size, real=False))
+    return pygrain.MapDataset.concatenate([batches, empty.repeat(missing)])
 
 
 def _order_records(train: Pipeline, build: _Build) -> int | None:

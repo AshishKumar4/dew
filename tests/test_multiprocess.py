@@ -230,7 +230,8 @@ def test_a_pools_cooldown_across_its_uneven_tail_reads_its_shares_as_its_run_doe
     assert len(reports[0]["cooled"]) == 1 and np.isfinite(reports[0]["cooled"]).all()
     planned = clocked_pool(tmp_path / "planned", 2, deal="order", cooldown=1)
     alone = clocked_pool(tmp_path / "alone", 1, devices=2, deal="order", cooldown=1)
-    np.testing.assert_allclose(planned[0]["cooled"], alone[0]["cooled"], **PARITY)
+    # The same programs over the same rows, a sum of two devices' parts in either order: to the bit.
+    assert planned[0]["cooled"] == alone[0]["cooled"]
 
 
 @pytest.mark.distributed

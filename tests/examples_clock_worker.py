@@ -22,7 +22,10 @@ SHARD_ROWS = 3
 
 class Questioned:
     """An objective's expansion of each record into `id % 3 + 1` rows, one a question, as a decision
-    layout of a question a row makes of an example (`dew.decision.rows.QuestionRows`)."""
+    layout of a question a row makes of an example (`dew.decision.rows.QuestionRows`), its identity
+    stable, so a resumed run knows it for the step it saved."""
+
+    identity = "questioned@1"
 
     def flat_map(self, element):
         return tuple({"id": element["id"], "question": np.int32(question)}

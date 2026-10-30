@@ -786,7 +786,8 @@ class Loader:
         read whose shares each read records of their own and so end steps apart: its run keeps its
         progress in the examples its batches consume (`dew.batch.EXAMPLES_CONSUMED`), a pool's every share
         reading on until each has run out (`dew.training._fit.pooled_read`). A pool's read in one global
-        order plans as one process's does, every share ending at its steps. Refused where the read is
+        order plans as one process's does, every share ending at its steps, a share the order's last batch
+        ends before stepping batches of no real row (`dew.data.lowering._evened`). Refused where the read is
         bounded to another count, and where the last steps would make no whole update, so some examples
         would train nothing."""
         if self.examples != examples:
