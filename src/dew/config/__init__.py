@@ -955,7 +955,8 @@ def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
     (ledger 1552)."""
     if isinstance(record.get("fields"), Mapping):
         # Each component in today's fields, those its class lost since left out (`earlier_fields`).
-        record = {**record, "fields": earlier_fields(json_value(record["fields"]))}
+        cleaned: Mapping[str, object] = {**record, "fields": earlier_fields(json_value(record["fields"]))}
+        record = cleaned
     fields = record.get("fields")
     if not isinstance(fields, Mapping) or not isinstance(fields.get("trainer"), Mapping):
         return record

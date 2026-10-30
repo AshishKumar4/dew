@@ -219,7 +219,8 @@ def earlier_fields(value: JSON) -> JSON:
     if not isinstance(value, dict):
         return value
     held = {key: earlier_fields(part) for key, part in value.items()}
-    removed = REMOVED_FIELDS.get(held["class"]) if isinstance(held.get("class"), str) else None
+    named = held.get("class")
+    removed = REMOVED_FIELDS.get(named) if isinstance(named, str) else None
     fields = held.get("fields")
     if removed and isinstance(fields, dict):
         held["fields"] = {name: field for name, field in fields.items() if name not in removed}
