@@ -247,9 +247,12 @@ def test_an_asynchronous_rescore_reads_the_policy_at_the_progress_its_loss_reads
     (`Progress(state.updates)`; ledger 2635): over a DEX decoder half way through its anneal its
     likelihoods are those its loss scores at those updates, not the run's end's, so a ratio over
     unchanged weights is 1."""
+    import itertools
     from concurrent.futures import Future
 
     import optax
+
+    from dew.data.dataset import Loader
 
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.nn.dex import DifferentialExtension
@@ -284,15 +287,27 @@ def test_an_asynchronous_rescore_reads_the_policy_at_the_progress_its_loss_reads
                               dex=DifferentialExtension(((0, (0, 1)),), anneal_steps=10))
     # A stale rollout's off-policy correction, which an asynchronous collection takes.
     objective = GRPOObjective(model, seq_len=7, behavior_importance=2.0)
-    start = Trainer(objective, optax.sgd(0.0), key=0).initial_state()
-    state = start.replace(updates=jnp.asarray(5, start.updates.dtype))
     scheduler = RolloutScheduler(Asynchronous(Scripted(), Publisher(), objective, width=8, rows=2, max_lag=1,
                                               ahead=0), groups=2)
-    packed = scheduler(state, {"task_id": np.asarray([1, 2], np.int32)}, jax.random.key(0))
-    rescored = np.asarray(packed[OLD_LOG_PROBS_KEY])
-    np.testing.assert_array_equal(rescored,
-                                  scored_rows(objective, state.variables, packed, Progress(state.updates)))
-    assert not np.array_equal(rescored, scored_rows(objective, state.variables, packed, END))
+    seen = []
+
+    def rollout(state, batch, key):
+        # Each step's rescored rows beside the same rows scored at the step's updates and at the run's end.
+        packed = scheduler(state, batch, key)
+        seen.append((int(state.updates), np.asarray(packed[OLD_LOG_PROBS_KEY]),
+                     scored_rows(objective, state.variables, packed, Progress(state.updates)),
+                     scored_rows(objective, state.variables, packed, END)))
+        return packed
+
+    tasks = np.asarray([1, 2], np.int32)
+    data = scheduler.tasks(Loader(train=lambda partition: itertools.repeat({"task_id": tasks}), val=None,
+                                  records=2, batch=2))
+    Trainer(objective, optax.sgd(0.0), key=0, rollout=rollout).fit(data, steps=6, log_every=100,
+                                                                   checkpoint_every=None)
+    updates, rescored, stepped, ended = seen[-1]
+    assert updates == 5
+    np.testing.assert_array_equal(rescored, stepped)
+    assert not np.array_equal(rescored, ended)
 
 
 def test_a_run_names_a_method_that_builds_its_objective_and_its_rollout(tmp_path):
