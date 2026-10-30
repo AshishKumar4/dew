@@ -238,10 +238,13 @@ def test_what_each_scanned_pass_sows_extends_what_the_passes_before_it_sowed(mod
         return {path: entries for path, entries in flat if looped(path)}
 
     four, five = sown(4), sown(5)
+    # Under the last-loop cache the last pass runs after the scan, so four loops' fourth pass is a program
+    # of its own where five loops scan it: the passes before it are the same programs.
+    same = -1 if mode == 'last_loop' else None
     longer = 0
     for path, entries in four.items():
         assert isinstance(five[path], tuple) and len(five[path]) >= len(entries), path
-        for kept, extended in zip(entries, five[path][:len(entries)], strict=True):
+        for kept, extended in zip(entries[:same], five[path][:len(entries)][:same], strict=True):
             np.testing.assert_array_equal(np.asarray(kept), np.asarray(extended), err_msg=str(path))
         longer += len(five[path]) > len(entries)
     assert longer and set(four) <= set(five)

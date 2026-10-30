@@ -1,6 +1,0 @@
-{
-  "transformers": "5.16.1",
-  "torch": "2.14.1+cpu",
-  "attention": "eager",
-  "command": "PYTHONPATH=src:tools python tools/qwen4_exp_reference.py --native"
-}

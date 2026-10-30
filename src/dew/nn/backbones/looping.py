@@ -101,7 +101,7 @@ def _appended(held, sown):
     """`held` with `sown` appended at each leaf: a sown tuple extends the held one, a mapping merges
     key by key, and any other value replaces the held one, as a sow's reduction does."""
     if isinstance(sown, Mapping):
-        merged = dict(held or {})
+        merged: dict[str, object] = dict(held or {})
         for name, value in sown.items():
             merged[name] = _appended(merged.get(name), value)
         return merged

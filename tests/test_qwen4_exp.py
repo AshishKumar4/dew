@@ -9,7 +9,6 @@ from pathlib import Path
 import jax
 import numpy as np
 from interop_support import assert_reloads, fixture_ids, token_draw, transformers_arms, transformers_model
-from one_draw import assert_as_exact_as_the_reference
 from reference_error import assert_as_exact
 
 from dew.interop import Pretrained, PretrainedDecoder
@@ -141,25 +140,48 @@ def test_a_loaded_checkpoint_of_a_sharded_table_writes_back_and_reloads(tmp_path
 
 NATIVE = ROOT / 'qwen4-exp-native-tiny'
 
+MEDIA_SEEDS = 8
+"""The media's declared draws (check 1), sized by `seeds_for` paired with Dew's logits on armada."""
+
 
 def test_images_and_a_video_read_through_the_processor_as_transformers_reads_them():
     """qwen4-exp-native-tiny (tools/qwen4_exp_reference.py --native) through its own Qwen3-VL processor:
-    two prompts over three images and one over a video of two frames, their tower Qwen 3.5's, their
+    a prompt over a drawn image and one over a drawn video of two frames, their tower Qwen 3.5's, their
     positions M-RoPE's over the media's grids, and the n-gram lookups hashing the placeholders the
-    media fill, compute the conditional reference's logits as exactly as its fp32 run does, from its
-    float64 run (check 1 against the recording)."""
+    media fill, compute the logits transformers' Qwen4ExpForConditionalGeneration computes through the
+    same processor, from its float64 twin (check 1)."""
+    import torch
+    import transformers
+
     loaded = Pretrained.load(NATIVE, dtype='float32', attention_impl='reference')
     assert loaded.processor is not None
-    recorded = np.load(NATIVE / 'reference.npz')
     prompts = json.loads((NATIVE / 'prompts.json').read_text())
-    images = recorded['images']
-    inputs = loaded.processor(prompts['images'], images=[[images[0]], [images[1], images[2]]])
-    valid = np.asarray(inputs.token_fields['attention_mask']).astype(bool)
-    logits = np.asarray(loaded.model.apply(loaded.variables, inputs.tokens, **inputs.kwargs()))
-    assert_as_exact_as_the_reference(logits[valid], recorded['logits'][valid],
-                                     recorded['logits_f64'][valid], 'Qwen4-Exp image logits')
-    clip = loaded.processor([prompts['video']], videos=[recorded['video']],
-                            video_metadata=[prompts['video_metadata']])
-    logits = np.asarray(loaded.model.apply(loaded.variables, clip.tokens, **clip.kwargs()))
-    assert_as_exact_as_the_reference(logits, recorded['video_logits'], recorded['video_logits_f64'],
-                                     'Qwen4-Exp video logits')
+    processor = transformers.AutoProcessor.from_pretrained(NATIVE, local_files_only=True)
+    metadata = [prompts['video_metadata']]
+
+    def dew(image, video):
+        pictured = loaded.processor([prompts['image']], images=[[np.asarray(image)]])
+        clip = loaded.processor([prompts['video']], videos=[np.asarray(video)], video_metadata=metadata)
+        return {name: loaded.model.apply(loaded.variables, inputs.tokens, **inputs.kwargs())
+                for name, inputs in (('image', pictured), ('video', clip))}
+
+    def run(network, image, video):
+        dtype = next(network.parameters()).dtype
+        encoded = {'image': processor(text=[prompts['image']], images=[[image.numpy().astype(np.uint8)]],
+                                      return_tensors='pt'),
+                   'video': processor(text=[prompts['video']], videos=[video.numpy().astype(np.uint8)],
+                                      video_metadata=metadata, return_tensors='pt')}
+        return {name: network(**{key: value.to(dtype) if value.is_floating_point() else value
+                                 for key, value in inputs.items()}, use_cache=False).logits
+                for name, inputs in encoded.items()}
+
+    model = transformers.AutoModelForImageTextToText.from_pretrained(
+        NATIVE, dtype=torch.float32, attn_implementation='eager', experts_implementation='eager').eval()
+    reference, truth = transformers_arms(model, run)
+
+    def draw(seed):
+        rng = np.random.default_rng([0x4E5, seed])
+        return (rng.integers(0, 256, (32, 32, 3), dtype=np.uint8),
+                rng.integers(0, 256, (2, 32, 32, 3), dtype=np.uint8))
+
+    assert_as_exact(dew, reference, draw, 'Qwen4-Exp media logits', seeds=MEDIA_SEEDS, truth_fn=truth)
