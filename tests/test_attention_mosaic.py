@@ -134,14 +134,19 @@ def _pinned(forward: attention_mosaic.Tiles | None = None,
 def _check_forward(call: str, dtype, shape, *, natural: bool, interpret: bool, width: int = 128,
                    value_width: int = 128, tiles: attention_mosaic.Tiles | None = None,
                    training: template.Kept = template.Kept.NONE, target: generation.GpuTarget | None = None,
-                   drop: bool = False):
+                   drop: bool = False, query_scale: float = 1.0):
     """The forward, or with `training` (what it keeps, `template.Kept`) the training forward's output, over
     the call form `call` of `shape`,
     its query and key heads `width` wide and its value heads `value_width`, at `tiles` (the default when
-    None), with `drop` under probability dropout at `DROP_RATE` (`_dropping`)."""
+    None), with `drop` under probability dropout at `DROP_RATE` (`_dropping`), its queries drawn times
+    `query_scale` (a power of two, exact)."""
     spans = template.spans(shape[1], shape[1], shape[0], **CALLS[call])
     hooks = _dropping(shape) if drop else None
-    draw = _drawn(shape, dtype, width=width, value_width=value_width)
+    unscaled = _drawn(shape, dtype, width=width, value_width=value_width)
+
+    def draw(seed):
+        query, *rest = unscaled(seed)
+        return (query * jnp.asarray(query_scale, query.dtype), *rest)
 
     def ours(query, key, value, dout):
         del dout
@@ -439,14 +444,13 @@ def test_the_backward_at_a_width_of_256_is_on_par_under_bidirectional_blocks_int
     """The derived backward of heads 256 wide (dK's and dV's widths split among programs,
     `BackwardTiles.columns`, where one program's sums pass a consumer's registers) over a packed row's two
     documents read causally, each document one block read both ways (row 2110's `--split whole`), under the
-    interpreter, from the training forward that keeps its output (`template.Kept.OUTPUT`, the route's at this
-    width: the anchored one's natural rewalk holds no tile, row 2526)."""
+    interpreter."""
     rows, queries = SHAPES["interpreted"][:2]
     documents = jnp.asarray([[1] * (queries // 2 - 10) + [2] * (queries // 2 + 10)] * rows, jnp.int32)
     spans = template.spans(queries, queries, rows, causal=True, segment_ids=documents,
                            block_groups=documents)
     _check_backward("causal", SHAPES["interpreted"], form=None, interpret=True, width=256, value_width=256,
-                    spans=spans, kept=template.Kept.OUTPUT)
+                    spans=spans)
 
 
 @INTERPRETS
@@ -703,16 +707,12 @@ def test_the_derived_tiles_stage_within_a_hoppers_block(width, value_width, resi
     """On an H100 the forward's tiles derived from the facts (`MosaicForward.derived`) stage within its
     block (`generation.shared_budget`) and a consumer's registers (`register_budget`), whatever the widths,
     the training forward's too (its anchored walk keeps no value row): no table's tile, which at heads 256
-    wide staged 320 KiB against its 227 (ledger 1582). The anchored training forward of values 256 wide
-    derives none: no tile holds its natural rewalk's registers (et-fsweep256: 255 and 224 B spilled at
-    64 x 64 on one consumer), so the route takes those calls elsewhere."""
+    wide staged 320 KiB against its 227 (ledger 1582); the anchored training forward of values 256 wide
+    rewalks a block of its value columns a launch (`Tiles.relaunch_columns`, row 2526)."""
     with generation.assumed("sm90"):
         target = generation.gpu_target()
         op, ba = _forward_call((2, 4096, 32, 8), width, value_width, residuals)
         derived = op.derived(ba, target)
-        if residuals is template.Kept.SPLIT and value_width == 256:
-            assert derived is None
-            return
         assert derived is not None
         assert op.legal(ba, derived, target)
         assert op.staged_bytes(ba, derived, target) <= generation.shared_budget(target)
@@ -967,6 +967,17 @@ def test_the_backward_is_on_par_under_every_score_hook_interpreted(hooks, form):
     the interpreter: the gradients of the queries, keys and values, of each hook parameter and of the initial
     state."""
     _check_hooked_backward(hooks, form=form, interpret=True)
+
+
+@INTERPRETS
+@pytest.mark.parametrize("call", ["causal", "full"])
+def test_a_training_forward_256_wide_past_the_folds_reach_is_on_par_interpreted(call):
+    """An anchored training forward 256 wide whose logits pass the fold's reach (`algebra.FOLD_REACH`, its
+    queries drawn 2^16 times larger) walks again in the natural form, whose launches take a block of the
+    value columns each (`Tiles.relaunch_columns`, row 2526: no tile holds its whole sums), its output on
+    par (check 1) with the reference's from float64, under the interpreter."""
+    _check_forward(call, jnp.bfloat16, SHAPES["interpreted"], natural=False, interpret=True, width=256,
+                   value_width=256, training=template.Kept.SPLIT, query_scale=2.0 ** 16)
 
 
 @INTERPRETS
@@ -1366,14 +1377,13 @@ def test_an_a100_derives_no_mosaic_backward(accurate):
 
 
 FORWARD_GATE = [(width, training, "none") for width in (64, 128, 256)
-                for training in (template.Kept.NONE, template.Kept.SPLIT)
-                if (width, training) != (256, template.Kept.SPLIT)]
+                for training in (template.Kept.NONE, template.Kept.SPLIT)]
 FORWARD_GATE += [(width, training, hooks) for width in (64, 128)
                  for training in (template.Kept.NONE, template.Kept.SPLIT)
                  for hooks in BACKWARD_HOOKS if hooks != "none"]
 """The forward resource gate's cases on an H100: a causal call's head widths, the inference and the training
 forward, hookless, and each score hook at the widths a hooked call's derivation takes (row 2281: its live
-set beside the walk's); the anchored training forward 256 wide derives none (row 2526)."""
+set beside the walk's)."""
 
 
 def _forward_kernels(op, ba, config) -> dict:

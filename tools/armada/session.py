@@ -28,16 +28,24 @@ GRACE = 60.0
 """Seconds an interrupted task's tests have to end before their process group is killed."""
 
 
+BOOT = "import lifetime; lifetime.boot()"
+"""How a task's Python starts (`pytest_run`): with no site (-S), the test cache's recorder first
+(lifetime.py), which then makes the site and runs pytest, so it records the process's whole life."""
+
+
 def pytest_run(python: str, report: Path, *measured: str) -> list[str]:
-    """CI's pytest under `python`, as every task runs it: CI's `SELECTION`, failures and errors summarized
-    with short tracebacks, a file that does not collect beside those that do, unbuffered (-u) so the output
-    holds every test that finished when a run is cut short, and pytest's JUnit report written to `report`.
+    """CI's pytest under `python`, as every task runs it: the recorder booted before the interpreter's site
+    (`BOOT`), CI's `SELECTION`, failures and errors summarized with short tracebacks, a file that does not
+    collect beside those that do, unbuffered (-u) so the output holds every test that finished when a run is
+    cut short, and pytest's JUnit report written to `report`; `measured`, a module and its arguments that run
+    pytest in turn (coverage's `run`).
     No timed dump of every thread's stack runs beside the tests, as walking threads that run killed the
     process mid-dump (exit 245, a SIGSEGV, in 3 of 5 runs of a multithreaded interpreted kernel's test, Main
     2026-10-25): a caller's deadline ends a hang (ci.py's `tested`: SIGINT, whose report pytest prints where
     it can handle it, then the group killed past the grace), and a fatal signal still prints the stacks
     (pytest's faulthandler)."""
-    return [f".venv-{python}/bin/python", "-u", *measured, "-m", "pytest", "-q", *SELECTION, "-rfE",
+    runner = [*measured, "-m", "pytest"] if measured else ["pytest"]
+    return [f".venv-{python}/bin/python", "-S", "-u", "-c", BOOT, *runner, "-q", *SELECTION, "-rfE",
             "--tb=short", "--continue-on-collection-errors", f"--junitxml={report}"]
 
 

@@ -601,8 +601,9 @@ class PortCase:
     instruction family of the device it runs on (`family`, `generation.family`; None off a GPU), and the
     product it is selected for (`product`: 'forward' where no gradient is taken, 'training' where one is,
     `_per_product`), and the recurrence's form: whether it is the delta rule (`delta`) and decays
-    (`decayed`), and the largest entry of its chunk inverse the form proves (`bound`,
-    `recurrence.Hooks.inverse_bound`; None where it proves none)."""
+    (`decayed`), the largest entry of its chunk inverse the form proves (`bound`,
+    `recurrence.Hooks.inverse_bound`; None where it proves none), and whether its decay is a key dimension's
+    (`per_key`)."""
 
     varying: bool
     dtype: np.dtype
@@ -613,12 +614,13 @@ class PortCase:
     delta: bool = True
     decayed: bool = True
     bound: float | None = None
+    per_key: bool = False
 
     @property
     def cell(self) -> tuple[str | None, str]:
         """The call's cell, its device's instruction family and its product (`selection.Celled`,
-        `PORT_CELLS`)."""
-        return self.family, self.product
+        `PORT_CELLS`), a decay a key dimension's (`per_key`, Kimi delta attention's) named in it."""
+        return self.family, f"{self.product}, a decay a key dimension" if self.per_key else self.product
 
     @property
     def widest(self) -> int:
@@ -656,18 +658,26 @@ stores the memories by where they pass, as many as the tokens' chunks, a row's a
 (`chunked_launch.Sequences`)."""
 
 PORT_CELLS: dict[tuple[str | None, str], tuple[str, str]] = {
-    ('mma.sync', 'forward'): ('fla', "on an A100 SXM4 40GB, 16-bit, the port's forward 0.892 ms against the "
-                                     "template's 1.213 on Qwen3.5-27B's gated delta net and 0.690 against "
-                                     "0.942 on Qwen3-Next's (SE-family-a100-1a31d279a)"),
+    ('wgmma', 'forward, a decay a key dimension'): (
+        'fla', "on an H100 PCIe, 16-bit, the port's forward 2.03 ms against the template's 3.24 on Kimi "
+               "Linear's delta attention, the template's intra launch 1.95 ms against the port's intra rows "
+               "and solve's 1.03 (JS-kdacells-h100-a928ea2b4)"),
 }
 """The cells, each an instruction family and a product (`PortCase.cell`), where a receipt shows the fla
 port faster than the recurrence template, each its old route's kernel and that receipt: the delta rule's
 selector runs the port on them where it takes the call (`Op.declared`, owner, bible da64ae5); the list
-shrinks as the template wins its cells, and no cell is picked or ranked at run time. Training is the
-template's, its keys launch a key block a program and its query/key launch's memory sum a product: its
-forward and gradient on an H100 2.46 ms against the port's 3.12 on Qwen3.5-27B's gated delta net and 1.92
-against 2.44 on Qwen3-Next's (JS-train80-h100-db2c4aca0), and on an A100 SXM4 40GB 4.56 against 4.83 and
-3.44 against 4.69 (JS-train80-a100-db2c4aca0).
+shrinks as the template wins its cells, and no cell is picked or ranked at run time. A gated delta net's
+cells are all the template's. An A100's forward of Kimi delta attention is the template's, 5.06 ms against
+the port's 8.81 (JS-kdacells-a100-a928ea2b4); its training is the port's by the template's refusal (the fast
+backward takes no decay a key dimension), not a cell. A gated delta net's training is the template's, its
+keys launch a key block a program and its query/key launch's memory sum a product: its forward and gradient
+on an H100 2.46 ms against the port's 3.12
+on Qwen3.5-27B's gated delta net and 1.92 against 2.44 on Qwen3-Next's (JS-train80-h100-db2c4aca0), and on an
+A100 SXM4 40GB 3.46 against 4.21 and 2.50 against 3.24 (JS-2075cellsd-a100-863706e94).
+An A100's forward is the template's, its walks' 16-bit stores coalesced (`mosaic.coalesced`): 0.931 ms
+against the port's 0.981 on Qwen3.5-27B's gated delta net and 0.692 against 0.759 on Qwen3-Next's, each in a
+process of its own, three rounds (JS-2075cellsd-a100-863706e94; the port's Qwen3-Next forward took 0.650 in
+two runs that followed a training run in one process, JS-2075cells-a100-491c05798).
 An H100's forward is the template's, its solve launch two programs a multiprocessor on warpgroup MMA's layout
 without a producer (`mainloop._solving`): on an H100 80GB HBM3 0.364 ms against the port's 0.514 on
 Qwen3.5-27B's gated delta net and 0.279 against 0.327 on Qwen3-Next's (JS-solvefed-h100-92eacee68; on an
@@ -768,7 +778,7 @@ def port_kernel(query, key, value, g, beta, state=None, starts=None, *, max_segm
     family = generation.family(generation.device_generation()) if generation.backend() == 'gpu' else None
     case = PortCase(bound=bound, varying=bool(jax.typeof(value).mat.varying),
                     dtype=jnp.dtype(jnp.result_type(query, key, value)), key_width=key.shape[-1], call=call,
-                    family=family, product=product, delta=delta, decayed=decayed)
+                    family=family, product=product, delta=delta, decayed=decayed, per_key=g.ndim == 4)
     return select(GATED_DELTA, case).kernel if report else selected(GATED_DELTA, case).name
 
 

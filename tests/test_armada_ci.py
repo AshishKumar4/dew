@@ -14,6 +14,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 import pytest
+from armada_support import cached, interpreter, loaded, written
 from tool_support import git, load
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -21,32 +22,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 @pytest.fixture
 def ci(tmp_path, monkeypatch):
-    module = load("ci", "tools/armada")
-    monkeypatch.chdir(tmp_path)
-    # CI's own environment names the shared test cache; these runs of the tools must not read or write it.
-    for name in ("DEW_XLA_CACHE_URL", "DEW_XLA_CACHE_TOKEN", "DEW_XLA_CACHE_READ_TOKEN", "DEW_TEST_CACHE"):
-        monkeypatch.delenv(name, raising=False)
-    (tmp_path / "tests").mkdir()
-    return module
-
-
-def interpreter(root: Path, version: str) -> None:
-    """The checkout's `.venv-<version>` python, as the CI image has it: here, this interpreter."""
-    venv = root / f".venv-{version}/bin"
-    venv.mkdir(parents=True)
-    (venv / "python").write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
-    (venv / "python").chmod(0o755)
-
-
-def written(root: Path, files: dict[str, str]) -> None:
-    for name, source in files.items():
-        (root / "tests" / name).write_text(source)
-
-
-def cached(monkeypatch, url: str) -> None:
-    """The shared test cache at `url`, as CI's environment names it."""
-    monkeypatch.setenv("DEW_XLA_CACHE_URL", url)
-    monkeypatch.setenv("DEW_XLA_CACHE_TOKEN", "token")
+    return loaded(tmp_path, monkeypatch)
 
 
 def gpu_driver(root: Path, monkeypatch) -> None:
@@ -393,56 +369,6 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
         assert capsys.readouterr().out.split() == ["tests/test_marked.py", "tests/test_plain.py"]
 
 
-def test_a_python_child_joins_its_files_record(ci, tmp_path, monkeypatch, cache_worker):
-    """A Python child a test file starts with its environment records itself
-    (tools/armada/followed.py), once and silently though its site-packages are
-    processed again: its reads of the backend join the file's evidence, and
-    the files it executed and the pages it read the file's key, which holds
-    until one changes. A child given an environment of its own, or killed
-    before it wrote its record, leaves its file without a key."""
-    url, _, _ = cache_worker
-    cached(monkeypatch, url)
-    started = "import os, subprocess, sys\ndef test_child():\n    "
-    files = {
-        "devices.py": "class Device:\n    platform = 'gpu'\ndef placed(device): return device.platform\n",
-        "plain.py": "def helper(): return 1\n",
-        "child.py": "import site, sysconfig\n"
-                    "site.addsitedir(sysconfig.get_paths()['purelib'])\n"
-                    "import devices, plain\n"
-                    "assert devices.placed(devices.Device()) == 'gpu' and plain.helper()\n"
-                    "assert open('notes/page.md').read()\n",
-        "test_child.py": started + "done = subprocess.run([sys.executable, 'tests/child.py'], check=True,\n"
-                                   "                      capture_output=True, text=True)\n"
-                                   "    assert not done.stderr, done.stderr\n",
-        "test_quiet.py": started + "subprocess.run([sys.executable, '-c', 'pass'], check=True)\n",
-        "test_killed.py": started + "child = subprocess.Popen([sys.executable, '-c', 'input()'], stdin=-1)\n"
-                                    "    child.kill()\n    child.wait()\n",
-        "test_own_environment.py": started + "subprocess.run([sys.executable, '-c', 'pass'], check=True,\n"
-                                             "                   env={'PATH': os.environ['PATH']})\n",
-    }
-    written(tmp_path, files)
-    (tmp_path / "notes").mkdir()
-    (tmp_path / "notes/page.md").write_text("page\n")
-    interpreter(tmp_path, "3.12")
-    tests = [f"tests/{name}" for name in files if name.startswith("test_")]
-    ci.task("3.12", tests, "", tmp_path / "verdict.json", 600.0)
-
-    def reused() -> list[bool]:
-        common = ci.shared("3.12")
-        return [ci.reused("3.12", name, "", common) is not None for name in tests]
-
-    assert reused() == [True, True, False, False]
-    (tmp_path / "notes/page.md").write_text("page again\n")
-    assert reused() == [False, True, False, False]
-    (tmp_path / "notes/page.md").write_text("page\n")
-    assert reused() == [True, True, False, False]
-    (tmp_path / "tests/plain.py").write_text("def helper(): return 2 - 1\n")
-    assert reused() == [False, True, False, False]
-    assert ci.gpu_tier("3.12") == {"tests/test_child.py": ["tests/devices.py:placed"],
-                                   "tests/test_killed.py": ["changed"],
-                                   "tests/test_own_environment.py": ["changed"]}
-
-
 def fetcher(root: Path, *, due: bool = False) -> Path:
     """A stand-in tools/fetched_fixtures.py under `root`: its fetch records that it ran, and with `due`
     refuses as the real one does a pin whose upload is due."""
@@ -718,37 +644,6 @@ def test_a_first_gpu_lane_on_a_class_borrows_another_classs_measured_shares(
     assert ci.gpu_lane("3.12", ["tests/test_tight.py"], out, cache="off", processes=4, deadline=600.0) == 0
     assert [share for share, *_ in ran("test_tight")][-1] != borrowed
     assert "interference" not in json.loads(out.read_text())["rows"][0]
-
-
-def test_a_files_children_hold_what_they_held_at_once_and_each_start_must_leave_its_record(tmp_path):
-    """The children's records join the file that started them (`followed.gathered`): their files,
-    and the GPU they held, the most a child that took the parent's fraction used, those children as
-    shares and the bytes of those that named their own, counted only while they lived at once. A
-    file is followed only where every start it and its children saw left a record naming it and none
-    started a process it did not follow; one whose child marked its start and left no record, killed
-    before it wrote, is not."""
-    followed = load("followed", "tools/armada")
-    gib = 2 ** 30
-
-    def child(index, file, began, ended, pool=None, inherited=True, expected=0, unfollowed=False, peak=None):
-        (tmp_path / f"{index}.started").write_text(file)
-        (tmp_path / f"{index}.json").write_text(json.dumps({
-            "file": file, "files": [f"src/{index}.py"], "reads": [], "expected": expected, "peak": peak,
-            "unfollowed": unfollowed, "began": began, "ended": ended, "pool": pool, "inherited": inherited}))
-
-    child(1, "tests/a.py", 0, 10, pool=6 * gib, peak=5 * gib)
-    child(2, "tests/a.py", 5, 15, pool=6 * gib, expected=1, peak=gib)
-    child(3, "tests/a.py", 20, 30, pool=3 * gib, inherited=False)
-    child(4, "tests/a.py", 25, 35, pool=2 * gib, inherited=False)
-    child(5, "tests/a.py", 40, 41)
-    child(6, "tests/b.py", 0, 1)
-    child(7, "tests/c.py", 0, 1)
-    (tmp_path / "8.started").write_text("tests/c.py")
-    child(9, "tests/d.py", 0, 1, unfollowed=True)
-    found = followed.gathered(tmp_path, {"tests/a.py": 4, "tests/b.py": 2, "tests/c.py": 2, "tests/d.py": 1})
-    assert found["tests/a.py"] == {"files": {f"src/{index}.py" for index in range(1, 6)}, "reads": set(),
-                                   "followed": True, "peak": 5 * gib, "shares": 2, "pools": 5 * gib}
-    assert [found[name]["followed"] for name in ("tests/b.py", "tests/c.py", "tests/d.py")] == [False] * 3
 
 
 def test_coverage_combines_each_tasks_branches_into_one_report_a_module_a_line(ci, tmp_path):
@@ -2259,6 +2154,24 @@ def test_a_test_past_the_group_target_is_flagged_and_a_new_one_fails(ci, tmp_pat
     assert slow() == (0, {"test_new": False, "test_old": False, "test_sized[1]": False, "test_cell": True,
                           "test_named": True, "TestHeld::test_inside": True, "test_sized[big]": True})
     assert slow("--new", str(base)) == (1, {"test_new": False, "test_sized[big]": True})
+
+
+def test_a_train_runs_row_names_the_whole_suite_cells_it_set_aside(ci, tmp_path, monkeypatch):
+    """A train's run sets a file's whole_suite cells aside, yet its row names them, as pytest marks them: main
+    then holds them though its train CI never times one, so a lane's whole-suite run of a cell main has is no
+    new slow test (verdict.sh), while one main has not stays new (2026-10-30: row 2116's two cells failed
+    every whole-suite run)."""
+    interpreter(tmp_path, "3.12")
+    written(tmp_path, {"test_cells.py": "import pytest\ncell = pytest.mark.whole_suite\n"
+                       "def test_plain(): pass\n"
+                       "@cell\ndef test_cell(): pass\n"
+                       "@pytest.mark.parametrize('n', [1, pytest.param(2, marks=cell, id='big')])\n"
+                       "def test_sized(n): pass\n"})
+    (tmp_path / ".verdict").mkdir()
+    rows = armada_task(ci, monkeypatch, tmp_path / ".verdict/verdict.json", "off")
+    assert [(sorted(row["tests"]), row.get("whole_suite")) for row in rows] == [
+        (["tests/test_cells.py::test_plain", "tests/test_cells.py::test_sized[1]"],
+         ["tests/test_cells.py::test_cell", "tests/test_cells.py::test_sized[big]"])]
 
 
 def a_wheel(root: Path, name: str, version: str) -> Path:

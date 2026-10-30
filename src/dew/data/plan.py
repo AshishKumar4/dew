@@ -184,7 +184,7 @@ def _configuration(step: DataclassInstance) -> dict[str, JSON]:
     configured: dict[str, JSON] = {"class": f"{type(step).__module__}.{type(step).__qualname__}"}
     for field in dataclasses.fields(step):
         value = getattr(step, field.name)
-        # A field added after runs were saved is recorded where it is set (`added_field`).
+        # A field added after runs were saved is recorded where it is set (`dew._records.ADDED`).
         if not field.repr and not (field.metadata.get(ADDED) and value != field.default):
             continue
         if isinstance(value, _Dependencies):
