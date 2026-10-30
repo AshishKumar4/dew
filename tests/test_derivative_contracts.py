@@ -657,8 +657,10 @@ def delta_rule_draw(seed: int, scale: float, *, key_heads: int, value_heads: int
     return primals, direction, cotangent
 
 
-# The ports near float32's largest: their reverse derivatives are NaN at entries the recurrence keeps finite,
-# the gated delta rule's where fla's own chunked form keeps them too (ledger 2656).
+# The ports near float32's largest: fla 0.5.2's own kernels leave the same entries of the reverse derivative
+# non-finite where the recurrence keeps them finite (chunk_gated_delta_rule dq's and dv's 128, chunk_kda dv's
+# 128, every one the port's, on an H100: upstream-ports-2656-h100-ac947aa73), upstream's range as 2470's edge
+# is (ledger 2656).
 @pytest.mark.parametrize("per_key", [False, True], ids=["fla_gdn", "fla_kda"])
 @pytest.mark.parametrize("edge", [edge for edge in EDGES if edge != "near the largest"])
 def test_the_delta_rule_ports_hold_their_orders(per_key, edge):
