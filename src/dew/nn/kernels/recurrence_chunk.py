@@ -1336,14 +1336,22 @@ SCAN_CELLS: dict[tuple[str | None, str], tuple[str, str]] = {
                   "and its fp32 output's skip and cast 0.045 past them; on Nemotron-H 4B's (chunk 256) the "
                   "template's 0.575 against 0.606, each the same `chunk(SSD, ...)` call under the fast forms "
                   "(ssd-rounded-h100-fdab2424c)"),
+    ('wgmma', 'training'): (
+        'pallas', "on an H100 80GB HBM3, the port's forward and gradient 1.593 ms against the template's 1.840 "
+                  "on Nemotron-H 4B's SSD and 0.663 against 1.018 on 30B's, its query/key launch 0.499 and "
+                  "0.277 of them (ssd-train-h100-fdab2424c)"),
+    ('mma.sync', 'training'): (
+        'pallas', "on an A100 SXM4 40GB, the port's forward and gradient 3.954 ms against the template's "
+                  "4.217 on Nemotron-H 4B's SSD and 1.584 against 2.200 on 30B's (ssd-train-a100-fdab2424c)"),
 }
 """The cells, each an instruction family and a product (`ScanCase.cell`), where a receipt timing the same
 product (`chunk(SSD, ...)` with its skip, output width, chunk and geometry, row 1964) shows the port of
 mamba_ssm's kernels faster than the recurrence template, each its old route's kernel and that receipt: the
 scan's selector runs the port on them where it takes the call (`Op.declared`); the list shrinks as the
 template wins its cells. An A100's forward is the template's: 1.418 ms against the port's 1.506 on
-Nemotron-H 4B's and 0.510 against 0.541 on 30B's (ssd-rounded-a100-fdab2424c). Training is the port's by
-the template's refusal (it trains no rated scan, row 1926), not a cell."""
+Nemotron-H 4B's and 0.510 against 0.541 on 30B's (ssd-rounded-a100-fdab2424c). The template trains the
+rated scan under the fast forms (`mainloop.fast_backward_form`); under the accurate ones its training is the
+port's by the template's refusal, not a cell."""
 
 SCAN: Op[ScanCase] = Op('ssd', (Kernel('mosaic_gpu', (*SSD_SUPPORTS[:3], *TEMPLATE_SUPPORTS)),
                                Kernel('pallas', SSD_SUPPORTS), Kernel('tpu', TPU_SCAN_SUPPORTS),
