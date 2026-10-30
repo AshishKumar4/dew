@@ -57,17 +57,19 @@ def test_a_runs_training_reads_this_gpu(tmp_path_factory):
                 check(**{name: value for name, value in fixtures.items() if name in taken}, **given)
         return run
 
-    saved, handed, links, split = (
+    saved, handed, links, split, clocked = (
         compile_ahead.a_step_compiled_ahead_and_saved_runs_on_its_gpu_in_the_run_s_place,
         compile_ahead.a_run_handed_its_step_compiled_ahead_trains_from_it_on_its_gpu,
         compile_ahead.a_run_handed_a_step_compiled_ahead_traces_with_the_links_it_was_compiled_with,
-        compile_ahead.a_run_takes_the_saved_offline_split_before_loading_its_executable)
+        compile_ahead.a_run_takes_the_saved_offline_split_before_loading_its_executable,
+        compile_ahead.a_clocked_run_with_a_cooldown_trains_from_its_step_compiled_ahead_compiling_no_other)
     settled, guided, half = (
         plan.a_recorded_plan_settles_its_kernel_launches_without_lowering_the_step_for_them,
         plan.a_step_guided_by_its_profile_is_the_step_the_run_takes_and_trains_as_exactly,
         plan.a_split_that_misses_tries_the_half_rung_before_the_batch_splits_further)
-    repeats, conv = (trainer.a_cuda_lm_repeats_and_resumes_bit_exactly_with_deterministic_ops,
-                     trainer.a_conv_model_trains_to_the_bit_again_after_another_run_measured_kernels_into_its_cache)
+    repeats, conv = (
+        trainer.a_cuda_lm_repeats_and_resumes_bit_exactly_with_deterministic_ops,
+        trainer.a_conv_model_trains_to_the_bit_again_after_another_run_measured_kernels_into_its_cache)
     run_cells([
         Cell("a step compiled ahead and saved runs on its GPU in the run's place", in_own(saved, "saved")),
         Cell("a run handed its step compiled ahead trains from it on its GPU", in_own(handed, "handed")),
@@ -90,8 +92,7 @@ def test_a_runs_training_reads_this_gpu(tmp_path_factory):
              in_own(run_option_matrix.an_lm_run_measures_its_kernel_launches_as_set, "launches",
                     cuda_flags=False)),
         Cell("a clocked run with a cooldown trains from its step compiled ahead, compiling no other",
-             in_own(compile_ahead.a_clocked_run_with_a_cooldown_trains_from_its_step_compiled_ahead_compiling_no_other,
-                    "clocked")),
+             in_own(clocked, "clocked")),
         # A fast form is a fast kernel on sm90 alone: on sm80 the default route computes IEEE fp32.
         Cell("the attention forms a run names reach its step",
              in_own(run_options.the_attention_forms_a_run_names_reach_its_step, "forms"), generation="sm90"),

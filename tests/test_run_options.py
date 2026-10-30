@@ -705,6 +705,9 @@ def answers(task) -> list[object]:
                     for leaf in leaves(getattr(value, field.name))]
         if isinstance(value, list | tuple):
             return [leaf for item in value for leaf in leaves(item)]
+        # A generation's decoder, a callback each request builds anew, is how it reads, not what it answers.
+        if callable(value):
+            return []
         return [np.asarray(value) if isinstance(value, jax.Array | np.ndarray) else value]
     return leaves(requested(task))
 
@@ -879,9 +882,48 @@ def unread(task, before: dict[str, object], option) -> str | None:
     swapped = task
     for path in places:
         swapped = replaced(swapped, path, before[path])
-    if answered_alike(answers(task), answers(swapped)):
+    answered = answers(task)
+    assert answered_alike(answered, answers(task)), "a request of one task answers apart twice"
+    if answered_alike(answered, answers(swapped)):
         return f"a request of it answers as with {[before[path] for path in places]} in its place"
     return None
+
+
+@pytest.mark.mesh(devices=8)
+@pytest.mark.parametrize("settings", SETTINGS, ids=lambda settings: settings.__name__)
+def test_each_option_a_saved_task_is_built_with_reaches_it_from_the_command_line(settings, tmp_path):
+    """Every option a saved task is built with that its settings' types declare alternatives for
+    (`alternatives`: a literal's values, an optional's, a flag's, Dew's classes that are one, a saved
+    dataclass with one field changed) reaches the task `dew train` saves from its path (`reach`): beside
+    a run that sets none, a run sets each alone to an alternative its settings accept other than the one
+    saved (the next where a run refuses it, `reached_by`), and the task saves it and, loaded, holds it
+    where the first held another, and a request of it answers apart from the same task holding there
+    what it held before (`unread`), the consumer's work, not its record. An option with no path is row
+    1061's blockwise walk,
+    unless its settings declare it derived from the run (`metadata={"derived": ...}`): from its data,
+    which the run fills, or a value the run builds of fields of its own (a decision run's layout), whose
+    fields are its options (`options_of`). A field of Dew's types that declares fewer than two
+    alternatives fails, unless derived or a record (`unwitnessed`). Every settings type an objective
+    saves (`SETTINGS`) has a run here (`TASK_RUNS`), and each option is witnessed on one of them that
+    holds it (`witnessed_on`).
+
+    A request of a loaded task answers alike twice (`answered_alike`), so an answer apart is the
+    option's alone."""
+    assert settings.__name__ in TASK_RUNS, f"no run here trains an objective whose task reads {settings}"
+    from dew.objectives.base import ReleasedTask
+
+    witnessed = [witnessed_on(builder, objective, settings, tmp_path / builder.__name__)
+                 for builder, objective in TASK_RUNS[settings.__name__]]
+    found = [(options, failures) for options, failures, _ in witnessed]
+    # An option is witnessed on a run that holds it, which a release's settings may not (a split's).
+    missed = {name: [failures[name] for options, failures in found if name in options]
+              for name in {name for options, _ in found for name in options}
+              if all(name not in options or name in failures for options, failures in found)}
+    assert not missed, f"{settings.__name__}'s options no run here witnesses: {missed}"
+    # A released task's options reach an export on one of its runs at least.
+    saved_task = objectives[TASK_RUNS[settings.__name__][0][1]].saved_task
+    assert not (saved_task is not None and issubclass(saved_task, ReleasedTask)) or any(
+        exports for _, _, exports in witnessed), f"no run of {settings.__name__}'s exports"
 
 
 @pytest.mark.parametrize("release", ["dream", "diffucoder"])
