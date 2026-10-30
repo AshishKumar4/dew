@@ -15,12 +15,17 @@ JSON. The `JSON` alias both directions speak is declared here, once.
 
 from __future__ import annotations
 
+import dataclasses
 import datetime
 import functools
 import math
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from numbers import Real
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from _typeshed import DataclassInstance
 
 type JSON = None | bool | int | float | str | list['JSON'] | dict[str, 'JSON']
 
@@ -173,3 +178,21 @@ def json_value(value: object, key: str) -> JSON:
         return {text(name, f"{key} record key"): json_value(entry, key)
                 for name, entry in value.items()}
     raise ValueError(f"{key}={value!r}: this field is not a value a JSON config carries")
+
+
+ADDED = "added"
+"""The metadata key of a configuration field added after runs were saved with it: declared
+`dataclasses.field(default=..., repr=False, metadata={ADDED: True})`, so a run that leaves it at its
+default records the configuration it always did (a data step's identity, `dew.data.plan.StepIdentity`)
+and resumes under this Dew, and one that sets it records it (`set_added`)."""
+
+
+def set_added(value: DataclassInstance | Sequence[DataclassInstance] | JSON) -> bool:
+    """Whether `value`, a configuration, or one it holds, sets a field added after runs were saved (`ADDED`)
+    off its default."""
+    if isinstance(value, (list, tuple)):
+        return any(map(set_added, value))
+    if not dataclasses.is_dataclass(value) or isinstance(value, type):
+        return False
+    return any((field.metadata.get(ADDED) and getattr(value, field.name) != field.default)
+               or set_added(getattr(value, field.name)) for field in dataclasses.fields(value))

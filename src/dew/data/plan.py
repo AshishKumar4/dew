@@ -20,7 +20,7 @@ import numpy as np
 
 from dew import _checkout
 from dew._hashing import array_header
-from dew._records import JSON, json_value, record
+from dew._records import ADDED, JSON, json_value, record, set_added
 from dew.data.compilation import checkout_now
 from dew.data.sources.codec import content_fingerprint
 from dew.position import PER_SHARE
@@ -133,7 +133,7 @@ class StepIdentity:
             else {}
         )
         if dataclasses.is_dataclass(step) and not isinstance(step, type) and (
-                dependencies or _holds_arrays(step)):
+                dependencies or _holds_arrays(step) or set_added(step)):
             config = json.dumps(_configuration(step), sort_keys=True)
         named = cls(name, config, exact, modules, declared, dependencies)
         if cache and not named.keyable(function=inspect.isfunction(step), external=external):
@@ -183,9 +183,10 @@ def _dependencies(step: DataclassInstance) -> Mapping[str, object]:
 def _configuration(step: DataclassInstance) -> dict[str, JSON]:
     configured: dict[str, JSON] = {"class": f"{type(step).__module__}.{type(step).__qualname__}"}
     for field in dataclasses.fields(step):
-        if not field.repr:
-            continue
         value = getattr(step, field.name)
+        # A field added after runs were saved is recorded where it is set (`added_field`).
+        if not field.repr and not (field.metadata.get(ADDED) and value != field.default):
+            continue
         if isinstance(value, _Dependencies):
             configured[field.name] = json_value(value.dependencies(), field.name)
         else:

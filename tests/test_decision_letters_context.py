@@ -200,7 +200,8 @@ def test_a_run_names_its_lettered_question_read_in_context_on_the_command_line(t
     task, and the task loaded from the run answers at its cue with one of the question's options (row
     2451). One without context layers is refused, and so is a question whose options are read at markers,
     which stand in the row's tokens the context leaves."""
-    rows = Memory([{"example": example} for example in examples()]).read("memory").pipe(decisions).batch(4)
+    # A batch of as many rows as the test mesh has shards, one an example.
+    rows = Memory([{"example": example} for example in examples()]).read("memory").pipe(decisions).batch(8)
     # A backbone with a tokenizer of its own, which the run lays its rows out with and names its letters by.
     config = DecisionRunConfig.cli(
         ["--pretrained", str(LLAMA.parent / "qwen38-dense-tiny"), "--segments",

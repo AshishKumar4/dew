@@ -684,7 +684,7 @@ class QuestionLayout(Layout):
     copy its share of the room); None takes the layout's own (`StateFirstLayout`'s state first,
     `MarkerLayout`'s question first). A row of its own `segments` states its own order."""
 
-    reads: "Reads | None" = None
+    reads: "Reads | None" = dataclasses.field(default=None, repr=False, metadata={_records.ADDED: True})
     """Which of the row's streams each reads (`Reads`), where its question's segments stand in a stream
     of the row's own (`Instructions.stream`); None for a row read in order."""
 
@@ -769,10 +769,8 @@ class QuestionLayout(Layout):
 
     @property
     def attention(self) -> "tuple[tuple[tuple[int, ...], ...], int] | None":
-        """Its rows' reads (`Reads`) over their streams, and the most runs of one stream a row lays."""
-        if self.reads is None:
-            return None
-        return self.reads.lowered(stream_names(self.written)), fragment_count(self.written)
+        """Its rows' reads over their streams (`streamed_attention`)."""
+        return streamed_attention(self.reads, self.written)
 
     def rows(self, encoder: Tokenizer, specials: Specials, state: JSON, questions: Mapping[str, Question],
              *, orders: Mapping[str, Sequence[int]] | None = None, media: Sequence[int] = (),
@@ -1530,6 +1528,15 @@ class Reads:
                      for stream in streams)
 
 
+def streamed_attention(reads: "Reads | None", segments: "Sequence[Segment | QuestionSegment]"
+                       ) -> "tuple[tuple[tuple[int, ...], ...], int] | None":
+    """What a row of `segments` reads (`Layout.attention`): its `reads` over its streams (`Reads.lowered`)
+    and the most runs of one stream it lays (`fragment_count`); None for a row read in order."""
+    if reads is None:
+        return None
+    return reads.lowered(stream_names(segments)), fragment_count(segments)
+
+
 def _streamed(segments: "Sequence[Segment | QuestionSegment]", reads: "Reads | None") -> None:
     """Refuse a layout whose `segments` name a stream of the row's own that no `reads` says what reads it,
     or whose reads name a stream its segments do not lay (`Reads.lowered`)."""
@@ -1565,7 +1572,7 @@ def fragment_count(segments: "Sequence[Segment | QuestionSegment]") -> int:
     return sum(1 for index, name in enumerate(named) if index == 0 or name != named[index - 1])
 
 
-def stream_point(chunks: "list[Chunk | State]", stream: str, current: str) -> str:
+def stream_point(chunks: "list[Chunk] | list[Chunk | State]", stream: str, current: str) -> str:
     """Append to `chunks` the boundary where a row's stream turns to `stream` from `current`, a chunk of no
     ids at which its text is encoded apart (`dew.decision.renderer.render`), and return the stream now
     written; none where it stays."""
@@ -1744,7 +1751,7 @@ class JointLayout(Layout):
     max_state_tokens: int | None = None
     framing: Framing = Framing()
     segments: tuple[Segment, ...] = JOINT_SEGMENTS
-    reads: "Reads | None" = None
+    reads: "Reads | None" = dataclasses.field(default=None, repr=False, metadata={_records.ADDED: True})
     """Which of the row's streams each reads (`Reads`), where its schema stands in a stream of the row's
     own (`Schema.stream`); None for a row read in order."""
     joint: ClassVar[bool] = True
@@ -1773,10 +1780,8 @@ class JointLayout(Layout):
 
     @property
     def attention(self) -> "tuple[tuple[tuple[int, ...], ...], int] | None":
-        """Its rows' reads (`Reads`) over their streams, and the most runs of one stream a row lays."""
-        if self.reads is None:
-            return None
-        return self.reads.lowered(stream_names(self.segments)), fragment_count(self.segments)
+        """Its rows' reads over their streams (`streamed_attention`)."""
+        return streamed_attention(self.reads, self.segments)
     images: ClassVar[bool] = True
 
     def state(self, encoder: Tokenizer, specials: Specials, state: JSON) -> tuple[int, ...]:
