@@ -7,6 +7,7 @@ under one placement, whichever backend compiles it. What it costs and its execut
 a GPU loads and runs the saved executable (TL-*-compile-ahead-881)."""
 
 import dataclasses
+import json
 
 import jax
 import jax.numpy as jnp
@@ -212,6 +213,34 @@ def test_a_configured_run_compiles_its_step_ahead_for_gpus_it_lacks_and_trains_n
     assert not runs.exists()
 
 
+def test_a_configured_run_compiles_its_step_ahead_for_a_tpu_topology_with_its_stated_links(tmp_path):
+    """`--trainer.compile-ahead.generation` names a TPU topology as well as a CUDA generation: the run
+    compiles its first step for that topology's compile-only devices here, through the plan a run takes,
+    and writes it as any step compiled ahead (ledger 2551). The links it compiles with are the run's own
+    (`trainer.links`), which the step records (ledger 2552)."""
+    from test_run_options import lm
+
+    from dew.config.lm import LMRunConfig
+    from dew.training.ahead import AheadOfTime, CompiledAhead
+
+    runs, path = tmp_path / "runs", tmp_path / "step.dew-aot"
+    default = lm(tmp_path, drawn=False)
+    assert isinstance(default, LMRunConfig)
+    links = {"tensor": {"bytes_per_second": 4.5e11, "flops_per_second": 9.9e14}}
+    run = LMRunConfig.cli(["--trainer.name", "ahead", "--trainer.checkpoint-dir", str(runs),
+                           "--trainer.steps", "2", "--trainer.compile-ahead.generation", "v5e:2x2",
+                           "--trainer.compile-ahead.devices", "4", "--trainer.compile-ahead.path", str(path),
+                           "--trainer.mesh.tensor", "2", "--set", f"trainer.links={json.dumps(links)}"],
+                          default=default)
+    with pytest.raises(CompiledAhead) as ended:
+        run.run()
+    assert ended.value.code == 0
+    saved = AheadOfTime.load(path)
+    assert (saved.generation, saved.devices) == ("v5e", 4) and saved.peak_bytes > 0
+    assert saved.links["tensor"].bytes_per_second == 4.5e11
+    assert not runs.exists()
+
+
 def test_a_run_on_the_examples_clock_compiles_its_step_ahead_reading_its_progress(tmp_path):
     """A decision run bounded in examples, which its objective expands after its bound so no pass counts
     its steps, keeps its progress on the examples clock: compiled ahead for a GPU it lacks, its step reads
@@ -390,11 +419,10 @@ def test_a_step_compiled_ahead_records_the_links_its_program_was_decided_by():
 
 
 def test_a_stated_link_is_the_one_a_step_compiled_ahead_records_and_a_handed_run_traces_with(caplog):
-    """A step compiled ahead over a link its trainer states, as `--trainer.compile-ahead.links` states
-    one, records that link whole, bandwidth and peak, and is the program a stated link spreads by; a run
+    """A step compiled ahead over a link its trainer states, as `trainer.links` states one, records
+    that link whole, bandwidth and peak, and is the program a stated link spreads by; a run
     handed it that states another traces with the step's, and says so once (train 300's review: the
     step recorded the bandwidth alone, so a run stating the same link traced with its own peak)."""
-    from dew.config.lm import LMRunConfig
     from dew.training.ahead import compile_ahead, compile_only_gpus
 
     batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
@@ -407,11 +435,6 @@ def test_a_stated_link_is_the_one_a_step_compiled_ahead_records_and_a_handed_run
     with caplog.at_level("WARNING", logger="dew.training.ahead"):
         assert stated.over(other) == stated.over(FAST) == stated.links
     assert len(caplog.records) == 1
-    parsed = LMRunConfig.cli(["trainer.compile-ahead:ahead", "--trainer.compile-ahead.generation", "sm90",
-                              "--trainer.compile-ahead.devices", "2", "--trainer.compile-ahead.path", "step",
-                              "--trainer.compile-ahead.links",
-                              '{"tensor": {"bytes_per_second": 1e18, "flops_per_second": 1e9}}'])
-    assert parsed.trainer.compile_ahead is not None and parsed.trainer.compile_ahead.links == FAST
 
 
 @pytest.mark.gpu(reason="loads a step compiled ahead over a tensor axis onto two GPUs")
