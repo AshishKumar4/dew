@@ -372,18 +372,25 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
     assert [ci.reused("3.12", f"tests/{name}", "", common) is not None
             for name in ("test_machine.py", "test_tool.py", "test_spawn.py", "test_forkserver.py",
                          "test_fork.py", "test_shell.py")] == [True, True, False, False, False, False]
+    # A day's tier is the checkout's gpu-marked files, whatever the records say a file reads (ledger 2452):
+    # the evidence is --evidence's report alone.
     monkeypatch.setattr(sys, "argv", ["ci.py", "gpu-tier", "--shards=2"])
     capsys.readouterr()
     assert ci.main() == 0
-    shards = [line.split() for line in capsys.readouterr().out.splitlines()]
-    assert len(shards) == 2 and all(shards)
-    assert sorted(name for names in shards for name in names) == sorted(ci.gpu_tier("3.12"))
-    # A file gains a kernel's test after its record: per batch the checkout's marks choose, not records.
-    (tmp_path / "tests/test_plain.py").write_text(
-        "import pytest\n@pytest.mark.kernel\ndef test_lowers(): pass\n")
-    monkeypatch.setattr(sys, "argv", ["ci.py", "gpu-tier", "--marked"])
+    assert capsys.readouterr().out.split() == ["tests/test_marked.py"]
+    monkeypatch.setattr(sys, "argv", ["ci.py", "gpu-tier", "--evidence"])
     assert ci.main() == 0
-    assert capsys.readouterr().out.split() == ["tests/test_marked.py", "tests/test_plain.py"]
+    assert {line.split("\t")[0] for line in capsys.readouterr().out.splitlines()} == set(ci.gpu_tier("3.12"))
+    # A file gains a GPU test after its record: the checkout's marks choose, not records; a kernel's test is
+    # the CPU's, interpreted.
+    (tmp_path / "tests/test_plain.py").write_text(
+        "import pytest\n@pytest.mark.gpu\ndef test_lowers(): pass\n")
+    (tmp_path / "tests/test_new.py").write_text(
+        "import pytest\n@pytest.mark.kernel\ndef test_interpreted(): pass\n")
+    for marked in ([], ["--marked"]):
+        monkeypatch.setattr(sys, "argv", ["ci.py", "gpu-tier", *marked])
+        assert ci.main() == 0
+        assert capsys.readouterr().out.split() == ["tests/test_marked.py", "tests/test_plain.py"]
 
 
 def test_a_python_child_joins_its_files_record(ci, tmp_path, monkeypatch, cache_worker):
@@ -1042,6 +1049,31 @@ def test_every_row_carries_the_sites_its_cases_moved_onto_ynnpacks_fusions_and_a
 
     expected = {"3.12:tests/test_moved.py": [{"node": "tests/test_moved.py::test_moved", **sites[0]}],
                 "3.12:tests/test_unmoved.py": []}
+    assert fields() == expected
+    assert fields() == expected
+    assert (tmp_path / "runs").read_text() == "x", "the second task reused the rows"
+
+
+def test_every_row_carries_its_flows_cell_counts_and_a_reused_row_keeps_them(ci, tmp_path, monkeypatch,
+                                                                             cache_worker):
+    """Each row a task runs carries `cells`, its file's GPU flows' counts by case (the JUnit property
+    tests/conftest.py writes from tests/gpu_flow.py), an empty object where it runs no flow; a green row a
+    later task reuses keeps them, so the train's native gate reads a cached flow's counts (ledger 2643)."""
+    counts = {"passed": 2, "failed": 0, "skipped": 1, "device": "cpu"}
+    written(tmp_path, {
+        "test_gpu_band.py": "import json\n"
+                            "from pathlib import Path\n"
+                            "def test_the_band_runs(record_property):\n"
+                            "    with Path('runs').open('a') as runs: runs.write('x')\n"
+                            f"    record_property('cells', json.dumps({counts!r}))\n",
+        "test_plain.py": "def test_plain(): pass\n"})
+    out = cached_checkout(ci, tmp_path, monkeypatch, cache_worker)
+
+    def fields() -> dict[str, dict]:
+        return {row["name"]: row["cells"] for row in armada_task(ci, monkeypatch, out)}
+
+    expected = {"3.12:tests/test_gpu_band.py": {"tests/test_gpu_band.py::test_the_band_runs": counts},
+                "3.12:tests/test_plain.py": {}}
     assert fields() == expected
     assert fields() == expected
     assert (tmp_path / "runs").read_text() == "x", "the second task reused the rows"

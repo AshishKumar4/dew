@@ -61,8 +61,9 @@ entries carry to their tasks (`--cache`), or without the Worker's URL and
 token, a task runs every file.
 
 A row's record also says where its tests read the backend and which are
-marked to run on a GPU, from which `gpu-tier` names the files that take
-another path on a GPU (all of them daily, the marked ones per batch). A GPU
+marked to run on a GPU (`gpu-tier --evidence` reports it); `gpu-tier` names the
+files marked to run on a GPU, a day's and a batch's alike: the behavioural flows
+(tests/test_gpu_*.py; no unit test runs on a GPU, ledger 2452). A GPU
 node runs them with `gpu-lane`, each as a task of a CUDA lane, whose rows are
 recorded and reused on the GPU's class as a CPU task's are on the CPU's. With `--network`, a GPU node that
 reaches the Hub runs every file's network-marked tests, which every other task sets aside, as one lane of
@@ -864,7 +865,7 @@ def collect(python: str, tests: list[str], out: Path, deadline: float) -> int:
     seconds = (time.monotonic() - began) / len(tests)
     # A collection runs no test, so it moved no site onto YNNPACK's fusions: counted, not unknown.
     rows = [{"name": row(python, name, COLLECT), "exitCode": 1 if name in errors else 0, "seconds": seconds,
-             "output": errors.get(name, ""), "ynn_switched": [],
+             "output": errors.get(name, ""), "ynn_switched": [], "cells": {},
              **(red_as(COLLECT, []) if name in errors else {})}
             for name in tests]
     out.write_text(json.dumps({"rows": rows}))
@@ -878,6 +879,15 @@ def targeted(python: str, arguments: list[str], report: Path) -> int:
     return subprocess.run([*session.pytest_run(python, report), *arguments],
                           env=session.pytest_environment({}),
                           check=False).returncode
+
+
+def flow_cells(cases) -> dict[str, dict]:
+    """A GPU flow's counts by its cases (each case's JUnit property `cells`, tests/conftest.py from
+    tests/gpu_flow.py: passed, failed, skipped and the device), as every row a task runs carries them, an empty
+    object where its file runs no flow: the train's native gate reads a flow none of whose cells ran as
+    unqualified, and a reused row keeps its counts (ledger 2643)."""
+    return {node_of(case): json.loads(item.get("value") or "null") for case in cases
+            for item in case.iter("property") if item.get("name") == "cells"}
 
 
 def ynn_switched(cases) -> list[dict]:
@@ -1052,7 +1062,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
                      "tests": {node_of(case): float(case.get("time") or 0) for case in own},
                      # Its tests pytest marks whole_suite (executed.py), which `slow` never flags.
                      **{key: cells for key, cells in counts.get(name, {}).items() if key in MARKED},
-                     "ynn_switched": ynn_switched(own),
+                     "ynn_switched": ynn_switched(own), "cells": flow_cells(own),
                      "timings": {row(python, name, ""): seconds}, **cause})
     out.write_text(json.dumps({"rows": rows + ran}))
     if coverage is None and not release:
@@ -1677,8 +1687,10 @@ def main() -> int:
         print(f"{len(changed)} files refolded in {session.DURATIONS}: {' '.join(changed) or 'none'}")
         return 0
     if args.operation == "gpu-tier":
-        tier = ({name: [f"{count} marked"] for name, count in marked(PYTHONS[0]).items()} if args.marked
-                else gpu_tier(PYTHONS[0]))
+        # A GPU runs its marked files alone, a batch's and a day's alike (ledger 2452): the records' evidence
+        # (`gpu_tier`) is what --evidence reports, which a day's tier no longer chooses by.
+        tier = ({name: [f"{count} marked"] for name, count in marked(PYTHONS[0]).items()}
+                if args.marked or not args.evidence else gpu_tier(PYTHONS[0]))
         if args.evidence:
             for name, evidence in tier.items():
                 print(name, *evidence, sep="\t")

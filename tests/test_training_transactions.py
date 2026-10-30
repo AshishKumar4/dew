@@ -423,8 +423,7 @@ def test_every_microbatch_of_an_accumulated_update_reads_the_updates_committed_b
                                                                 (2, 5)]
 
 
-@pytest.mark.gpu("XLA:GPU's simplifier speculates the branch; XLA:CPU's pipeline kept it a branch")
-def test_an_accumulating_step_updates_the_optimizer_in_its_commit_alone():
+def an_accumulating_step_updates_the_optimizer_in_its_commit_alone():
     """A window's microbatches before its last only accumulate: nothing in the
     step outside the commit's branch reads an Adam moment. XLA's conditional
     simplifier runs a branch of elementwise ops and reductions, as a clipped

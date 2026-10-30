@@ -330,8 +330,7 @@ def test_a_later_run_starts_its_search_at_the_plan_an_earlier_one_recorded(monke
     assert counted == [] and again.step_flops == first.step_flops
 
 
-@pytest.mark.gpu("a step's Pallas launches are read from a lowering of their own on a CUDA GPU alone")
-def test_a_recorded_plan_settles_its_kernel_launches_without_lowering_the_step_for_them():
+def a_recorded_plan_settles_its_kernel_launches_without_lowering_the_step_for_them():
     """A step's lowering records its kernel launches as it traces them (`tune`), with its plan,
     so each run lowers its step once: the first again only where settling the launches changed
     a config its trace read, and a later run, which settles them from the record first, never."""
@@ -536,8 +535,7 @@ def regression_rows(seed: int) -> tuple[np.ndarray]:
     return (np.random.default_rng(seed).normal(size=(32, FEATURES)).astype(np.float32),)
 
 
-@pytest.mark.gpu(reason="XLA profiles the instructions of an NVIDIA GPU's programs alone")
-def test_a_step_guided_by_its_profile_is_the_step_the_run_takes_and_trains_as_exactly():
+def a_step_guided_by_its_profile_is_the_step_the_run_takes_and_trains_as_exactly():
     """On an NVIDIA GPU the profile of the admitted step's runs holds its instructions' times, its
     program compiles again guided by it, and the run steps the guided executable alone: the one the plan
     was admitted with is freed and the backend holds no more executables than with it alive, as it would
@@ -760,9 +758,7 @@ DELTA = {"mixer": mixers.build("gated_delta_net", linear_num_key_heads=2, linear
 """A decoder of one gated delta net layer, whose ladder holds the half rung 'all_but_delta_memory'."""
 
 
-@pytest.mark.gpu("the GPU kernel's delta rule recomputes its memory alone; on the CPU the half rung "
-                 "needs what no recomputation does")
-def test_a_split_that_misses_tries_the_half_rung_before_the_batch_splits_further(monkeypatch):
+def a_split_that_misses_tries_the_half_rung_before_the_batch_splits_further(monkeypatch):
     """With room for four microbatches when a delta rule recomputes its memory alone, which no
     recomputation needs more than, the plan is four at that half rung: no plan splits the batch further
     at a rung where the half rung fits it, and the search asks each split there after it misses. The

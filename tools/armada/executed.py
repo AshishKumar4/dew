@@ -20,8 +20,8 @@ runs code no event sees, so its record says so, and the cache never skips it; bu
 tools Dew and its tests ask about the host (`followed.TOOLS`), which run none of the checkout's code.
 
 It also records where each test file's run read the backend (`reads_backend`) and which of its tests
-are marked to run on a GPU (`MARKS`): a file with either takes another path on a GPU, so the H100 tier
-runs it (`ci.py gpu-tier`), each file in a process of its own, which records its peak memory on the
+are marked to run on a GPU (`MARKS`), which `ci.py gpu-tier --evidence` reports; the H100 tier runs the
+marked files alone (`ci.py gpu-tier`), each file in a process of its own, which records its peak memory on the
 GPU (`gpu_peak`) and its children's pools. A read is the test file's being collected or run. As with
 the files they execute, what session-scoped fixtures read is every file's, and what runs under a
 module's body, which runs once, as it is imported, is its own test file's too, and every file's

@@ -10,7 +10,6 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
-import pytest
 from reference_error import as_given, assert_as_exact, widened
 
 from dew.diffusion import presets
@@ -166,8 +165,7 @@ def agrees_with_xla(kernel: str) -> None:
                     seeds=MEANFLOW_SEEDS, truth_fn=stepped(wide, held))
 
 
-@pytest.mark.gpu(reason="a fused attention kernel runs on a cuda device")
-def test_meanflow_trains_through_a_fused_attention_kernel():
+def meanflow_trains_through_a_fused_attention_kernel():
     """A fused attention kernel defines only its reverse-mode derivative, so MeanFlow's target JVP
     traces for forward mode (`forward_mode_attention`): a step through Triton's kernel, which runs
     under the cuda lane's --xla_gpu_deterministic_ops, agrees with the xla kernel's

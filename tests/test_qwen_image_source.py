@@ -120,8 +120,7 @@ def test_a_padded_row_is_its_own_prompt_alone(source, arrays, record):
     assert relative_gap(unmasked[1], nhwc(arrays["padded.output"], rows, columns)[1]) > 1e-3
 
 
-@pytest.mark.gpu(reason="needs a cuda device")
-def test_cudnn_attends_a_padded_batch_as_xla_does(without_deterministic_ops):
+def cudnn_attends_a_padded_batch_as_xla_does(without_deterministic_ops):
     """The fused kernel runs both of the block's attention calls over a
     padded prompt, forward and backward, and computes what xla computes.
 
