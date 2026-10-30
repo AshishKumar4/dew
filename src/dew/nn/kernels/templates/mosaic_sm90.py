@@ -4,6 +4,8 @@ warpgroup MMA reads its right operand from shared memory and its left from share
 accumulates in a warpgroup's registers in the WGMMA layout, and runs asynchronously until waited for."""
 
 
+from collections.abc import Callable
+
 import jax
 import jax.numpy as jnp
 from jax import lax
@@ -64,6 +66,15 @@ class Wgmma(mosaic.RingFamily):
             return acc_ref[...]
 
         return pl.run_scoped(scores, plgpu.WGMMAAccumulatorRef(shape, jnp.float32))
+
+    def overlapped[R](self, lhs, rhs, shape: tuple[int, int], during: Callable[[], R]) -> tuple[jax.Array, R]:
+        # The product issued, `during` run while it is in flight, then one wait for every product issued.
+        def run(acc_ref):
+            plgpu.wgmma(acc_ref, lhs, rhs)
+            found = during()
+            return acc_ref[...], found
+
+        return pl.run_scoped(run, plgpu.WGMMAAccumulatorRef(shape, jnp.float32))
 
     def registers_product(self, lhs: jax.Array, rhs, interpret: bool) -> jax.Array:
         if interpret:

@@ -776,6 +776,12 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
         """`lhs @ rhs` into a fresh fp32 accumulator of `shape`, its value, with `then` issued while the
         product runs."""
 
+    def overlapped[R](self, lhs, rhs, shape: tuple[int, int], during: Callable[[], R]) -> tuple[jax.Array, R]:
+        """`lhs @ rhs` into a fresh fp32 accumulator of `shape`, both operands in shared memory, with
+        `during()` run while the product runs (work that does not read it, which may issue products of its
+        own): the product's value and `during`'s. A family whose products run in turn runs them in turn."""
+        return self.product(lhs, rhs, shape), during()
+
     @abc.abstractmethod
     def registers_product(self, lhs: jax.Array, rhs, interpret: bool) -> jax.Array:
         """`lhs @ rhs` into a fresh fp32 accumulator, `lhs` in registers (16-bit), its value."""

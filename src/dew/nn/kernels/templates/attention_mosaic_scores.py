@@ -84,6 +84,14 @@ def _scores(walk: _Backward, coords: algebra.Coords, params: tuple, s, dp, peak,
     """A backward tile's weights unnormalized and over `total`, its score cotangents (`algebra.grad_scores`)
     and the score hook's slopes (`algebra.tile_logits`), from its products `s` and `dp`, its coordinates, its
     hook parameters `params`, its mask (`algebra.seen` where `masked`) and its queries' statistics."""
+    weighed = _weights(walk, coords, params, s, peak, total, masked=masked)
+    exponentials, weights, slopes, seen, _ = weighed
+    return exponentials, weights, _cotangents(walk, coords, weighed, dp, anchor, delta, chosen), slopes, seen
+
+
+def _weights(walk: _Backward, coords: algebra.Coords, params: tuple, s, peak, total, *, masked: bool):
+    """`_scores`' part of a tile that its logits `s` alone give: the weights unnormalized and over
+    `total`, the hook's slopes, the mask, and each query's inverse denominator, what `_cotangents` takes."""
     seen = algebra.seen(walk.spec, coords, s) if masked else None
     how = walk.how
     logits, slopes = algebra.tile_logits(coords.hooked(walk.spec.score_mod), s, seen, coords.q_pos,
@@ -97,11 +105,22 @@ def _scores(walk: _Backward, coords: algebra.Coords, params: tuple, s, dp, peak,
 
     inverse_total = per_query(algebra.inverse(total))
     exponentials, weights = algebra.normalized(logits, per_query(peak), inverse_total, how)
+    return exponentials, weights, slopes, seen, inverse_total
+
+
+def _cotangents(walk: _Backward, coords: algebra.Coords, weighed: tuple, dp, anchor, delta, chosen):
+    """`_scores`' score cotangents from a tile's `_weights` (`weighed`) and its products with the output
+    cotangent `dp` (`algebra.grad_scores`), about each query's anchor key `chosen`."""
+    del walk
+    exponentials, _, _, seen, inverse_total = weighed
+
+    def per_query(x):
+        return coords.queries(x, dp) if coords.keys_first else x
+
     at_anchor = coords.k_pos == coords.queries(chosen, coords.k_pos)
     multiplier = algebra.drawn(coords, coords.q_pos, coords.k_pos)
-    cotangents = algebra.grad_scores(exponentials, dp, per_query(anchor), per_query(delta), seen, at_anchor,
-                                     inverse_total, multiplier=multiplier)
-    return exponentials, weights, cotangents, slopes, seen
+    return algebra.grad_scores(exponentials, dp, per_query(anchor), per_query(delta), seen, at_anchor,
+                               inverse_total, multiplier=multiplier)
 
 def _dq_added(walk: _Backward, dq_ref, out_smem, place: tuple, index, q_first, dq) -> None:
     """A fused dK/dV consumer's tile `dq` added into dQ at its queries from `q_first` (`place` its row and

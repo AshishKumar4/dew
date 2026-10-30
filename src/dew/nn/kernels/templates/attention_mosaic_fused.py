@@ -21,7 +21,13 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _views_of,
     stated,
 )
-from dew.nn.kernels.templates.attention_mosaic_scores import _Backward, _dq_added, _scores
+from dew.nn.kernels.templates.attention_mosaic_scores import (
+    _Backward,
+    _cotangents,
+    _dq_added,
+    _scores,
+    _weights,
+)
 
 
 def _fused_allocations(family: mosaic.Family, config: BackwardTiles, width: int, dtype, stages: int
@@ -62,23 +68,38 @@ def _fused_step(walk: _Backward, resident: tuple, rows_of, staged, coords_of, wh
     keys = k_smem.transpose((1, 0))
     s = (family.registers_product(by_power(family.tile_of(q_slot), walk.spec.prescale), keys, walk.interpret)
          if walk.scaled else family.product(q_slot, keys, shape))
-    dp = family.product(do_slot, v_smem.transpose((1, 0)), shape)
-
-    def scores(*, masked: bool):
-        # A tile every query sees whole (`masked` False) takes no mask (`_dq_step`'s choice).
-        exponentials, weights, cotangents, _, _ = _scores(walk, coords_of(q_first), (), s, dp, *rows,
-                                                          masked=masked)
-        return exponentials, weights, cotangents
-
+    peak, total, anchor, delta, chosen = rows
     if masked is None:
+        # A tile chosen whole or masked at run time (a call whose whole tiles run in no one segment): both
+        # products first, then the step (`_scores`).
+        dp = family.product(do_slot, v_smem.transpose((1, 0)), shape)
+
+        def scores(*, masked: bool):
+            # A tile every query sees whole (`masked` False) takes no mask (`_dq_step`'s choice).
+            exponentials, weights, cotangents, _, _ = _scores(walk, coords_of(q_first), (), s, dp, *rows,
+                                                              masked=masked)
+            return exponentials, weights, cotangents
+
         exponentials, weights, cotangents = lax.cond(whole(index), functools.partial(scores, masked=False),
                                                      functools.partial(scores, masked=True))
+        narrowed = algebra.value_weights(exponentials, weights, do_slot.dtype)
+        family.staged(narrowed, staged.at[0])
+        dv_acc = family.products(dv_acc, staged.at[0].transpose((1, 0)), do_slot, walk.interpret)
     else:
-        exponentials, weights, cotangents = scores(masked=masked)
+        coords = coords_of(q_first)
+
+        def weighed_and_dv():
+            # While dP's product runs (`Family.overlapped`): the weights from the logits alone, staged, and
+            # dV's product issued (FlashAttention 3's order; ET-CONFLICTS-h100: the step's waits on its own
+            # products 12% of its warps' stalls).
+            weighed = _weights(walk, coords, (), s, peak, total, masked=masked)
+            narrowed = algebra.value_weights(weighed[0], weighed[1], do_slot.dtype)
+            family.staged(narrowed, staged.at[0])
+            return weighed, family.products(dv_acc, staged.at[0].transpose((1, 0)), do_slot, walk.interpret)
+
+        dp, (weighed, dv_acc) = family.overlapped(do_slot, v_smem.transpose((1, 0)), shape, weighed_and_dv)
+        cotangents = _cotangents(walk, coords, weighed, dp, anchor, delta, chosen)
     ((part, _),) = algebra.cotangent_parts(cotangents * walk.grad_scale, q_slot.dtype, accurate=False)
-    narrowed = algebra.value_weights(exponentials, weights, do_slot.dtype)
-    family.staged(narrowed, staged.at[0])
-    dv_acc = family.products(dv_acc, staged.at[0].transpose((1, 0)), do_slot, walk.interpret)
     cotangents_staged = staged.at[1]
     family.staged(part, cotangents_staged)
     dk_acc = family.products(dk_acc, cotangents_staged.transpose((1, 0)), q_slot, walk.interpret)
