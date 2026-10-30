@@ -63,7 +63,7 @@ from dew.interop.pipeline_assembly import (
 )
 from dew.interop.processors import Processor, hosts
 from dew.interop.safetensors_io import MAX_SHARD_SIZE, LazyTensors, tensor_specs
-from dew.interop.saved_sources import released_run
+from dew.interop.saved_sources import is_saved_run, released_run
 from dew.interop.streaming import WeightLayout
 from dew.interop.weights import AUTO, checkpoint_dtype, declared_dtype
 from dew.nn.autoencoders import AutoEncoder
@@ -304,7 +304,8 @@ class Pretrained:
         return cls.from_saved(SavedRun.pinned(str(directory), step, trust), ema=ema)
 
     @classmethod
-    def from_saved(cls, run: SavedRun, *, ema: bool | None = None) -> Self:
+    def from_saved(cls, run: SavedRun, *, ema: bool | None = None, mesh: MeshSpec | Mesh | None = None,
+                   layout: Layout | None = None) -> Self:
         """Return the pinned checkpoint `run` (`SavedRun.pinned`), rebuilt from the run's own inference
         record, in the layout of the architecture the record names."""
         from dew.inference.tasks import (
@@ -319,7 +320,8 @@ class Pretrained:
 
         model_config = saved_model(run.record, None)
         model = model_config.build()
-        variables = run.variables(ema=ema)
+        # Restored where `mesh` and `layout` place them, sharded as a run's own load is.
+        variables = run.variables(ema=ema, mesh=mesh, layout=layout)
         # The run's task as its loader reads it (`saved_settings`): its policy, budget, pad and
         # end-of-sequence ids and process, which the export writes in the format its readers read.
         held = None if run.objective.settings is None else saved_settings(run.record, run.objective.settings)
@@ -466,7 +468,8 @@ class Pretrained:
         config. `dex` attaches DEX (`with_dex`) from key 0; `scan_layers` scans like layers (`Scanning`).
         A saved Dew run loads as `dew export` writes it, at `step` with `ema` (`released_run`).
         """
-        name_or_dir = released_run(name_or_dir, step=step, ema=ema)
+        name_or_dir = released_run(name_or_dir, step=step, ema=ema, weights=weights, mesh=mesh,
+                                   layout=layout)
         selected = _selected_payload(fallback, gguf_file=gguf_file, single_file=single_file,
                                      dduf_file=dduf_file)
         streaming, placed = _placement(mesh, layout, on_host=on_host, weights=weights)
@@ -1023,10 +1026,13 @@ def load_diffusion_source(checkpoint: str, *, dtype: str = "bfloat16", param_dty
     `text_only`, `prediction_depths` and `modeling_overrides` read as
     `Pretrained.load`'s do: a pipeline has no wrapper's language model for
     `text_only` to take, its components hold no prediction depths, so any
-    count keeps them all, and none reads overrides, which are refused. A saved Dew run loads as
-    `Pretrained.load` loads it, at its `step` and `ema` (`released_run`).
+    count keeps them all, and none reads overrides, which are refused. A saved Dew run, which Dew
+    writes no diffusion release of, is refused, as a step or EMA choice beside a release is.
     """
-    checkpoint = str(released_run(checkpoint, step=step, ema=ema))
+    if is_saved_run(checkpoint) or step is not None or ema is not None:
+        raise ValueError(f"{checkpoint}: a diffusion run starts from a published pipeline; Dew writes no "
+                         "diffusion release of a saved run to start from, so resume the run under its "
+                         "name (--trainer.resume) or serve it (TextToImage.from_run)")
     _unread_overrides(modeling_overrides, "a diffusion pipeline")
     if text_only:
         _no_language_model(checkpoint, "diffusion pipeline")

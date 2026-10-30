@@ -11,23 +11,31 @@ any release, and its first weights are the export's.
 from __future__ import annotations
 
 import hashlib
-import os
-import shutil
-import tempfile
+import json
 from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from etils import epath
+from jax.sharding import Mesh
+
+from dew._coordination import agreed_same, from_every_process
 from dew.cache import dew_cache_dir
-from dew.checkpoints import RUN_FILE, Checkpoints
+from dew.checkpoints import RUN_FILE
+from dew.files import staged
 
 if TYPE_CHECKING:
+    from dew.distributed.placement import Layout, MeshSpec
     from dew.inference.tasks import SavedRun
 
 
-def export_run(run: SavedRun, destination: str | Path, *, ema: bool | None = None) -> None:
+def export_run(run: SavedRun, destination: str | Path, *, ema: bool | None = None,
+               mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None) -> None:
     """Write `run`'s pinned checkpoint (`SavedRun.pinned`) to `destination` as its release, its EMA
-    weights where `ema`: a task's own released layout, or the model in its family's source layout."""
+    weights where `ema`, restored where `mesh` and `layout` place them: a task's own released layout
+    (`ReleasedTask`), or the model in its family's source layout (`Pretrained.from_saved`). A task
+    that releases no layout of its own and whose model no family writes (a diffusion pipeline) is
+    refused, naming its own loader."""
     from dew.interop.pretrained import Pretrained
     from dew.objectives.base import ReleasedTask
 
@@ -35,21 +43,46 @@ def export_run(run: SavedRun, destination: str | Path, *, ema: bool | None = Non
     if task is not None and issubclass(task, ReleasedTask):
         task.from_saved(run, ema=ema).save_pretrained(str(destination))
     else:
-        Pretrained.from_saved(run, ema=ema).save(destination)
+        Pretrained.from_saved(run, ema=ema, mesh=mesh, layout=layout).save(destination)
 
 
 def is_saved_run(name_or_dir: str | Path) -> bool:
-    """Whether `name_or_dir` is a saved Dew run's directory: one holding its run record (`RUN_FILE`)."""
-    return Path(name_or_dir).is_dir() and (Path(name_or_dir) / RUN_FILE).is_file()
+    """Whether `name_or_dir` is a saved Dew run's directory, on this host or remote storage
+    (`etils.epath`): one holding its run record (`RUN_FILE`)."""
+    path = epath.Path(name_or_dir)
+    return path.is_dir() and (path / RUN_FILE).is_file()
+
+
+def _fingerprint(run: SavedRun, ema: bool | None) -> str:
+    """What an export of `run`'s pinned step with `ema` is a function of: the run's location, its step,
+    the EMA choice, the contents of the run's own records beside its checkpoints (its run record and a
+    task's assets, a decision task's calibration among them), and the step's metadata files, by size and
+    write time, which a new save of the step rewrites."""
+    root = epath.Path(run.directory)
+    digest = hashlib.sha256(json.dumps([str(root), run.step, ema]).encode())
+    for path in sorted((path for path in root.iterdir() if path.is_file()), key=str):
+        digest.update(f"{path.name}\0".encode() + path.read_bytes())
+    for path in sorted((root / str(run.step)).iterdir(), key=str):
+        if path.is_file():
+            stat = path.stat()
+            digest.update(f"{path.name}\0{stat.length}\0{stat.mtime}\0".encode())
+    return digest.hexdigest()[:24]
 
 
 def released_run(name_or_dir: str | Path, *, step: int | str | None = None, ema: bool | None = None,
-                 trust: Sequence[str] = ()) -> str | Path:
+                 trust: Sequence[str] = (), weights: bool = True, mesh: MeshSpec | Mesh | None = None,
+                 layout: Layout | None = None) -> str | Path:
     """`name_or_dir` as a loader reads it: itself, or where it is a saved Dew run (`is_saved_run`), the
-    release its checkpoint at `step` (`SavedRun.pinned`: a step, `best`, `best:<metric>`, or the one its
-    task loads by default) with `ema` exports to (`export_run`), written once under Dew's cache by the
-    run, its step's checkpoint and the EMA choice, and read again by every later load of them. A step or
-    EMA choice beside a source that is no saved run is refused: it selects nothing."""
+    release its checkpoint at `step` (`SavedRun.pinned`: a step, `latest`, `best`, `best:<metric>`, or
+    the one its task loads by default) with `ema` exports to (`export_run`), written once under Dew's
+    cache by what the export reads (`_fingerprint`) and read again by every later load of it.
+
+    Every process of a pool agrees on the step and on whether any of them lacks the release, and then
+    all of them export it, each writing its own cache, as a restore is collective; the export restores
+    where the load would place it (`mesh`, `layout`), so it holds no more of the weights on a device
+    than the load does. A load `weights=False` (a resume's, which its restore fills) exports none: it
+    reads the release's records alone where they are written, else the run's own at that step. A step
+    or EMA choice beside a source that is no saved run is refused: it selects nothing."""
     from dew.inference.tasks import SavedRun
 
     if not is_saved_run(name_or_dir):
@@ -57,21 +90,19 @@ def released_run(name_or_dir: str | Path, *, step: int | str | None = None, ema:
             raise ValueError(f"{name_or_dir} is no saved Dew run (no {RUN_FILE}), so a step or an EMA choice "
                              "selects nothing of it; name a run's directory, or drop them")
         return name_or_dir
-    directory = os.path.realpath(name_or_dir)
-    run = SavedRun.pinned(directory, step, trust)
-    with Checkpoints(directory) as checkpoints:
-        written = os.stat(checkpoints.path(run.step)).st_mtime_ns
-    key = hashlib.sha256(f"{directory}\0{run.step}\0{ema}\0{written}".encode()).hexdigest()[:24]
-    release = Path(dew_cache_dir()) / "saved_runs" / key
-    if not release.is_dir():
-        release.parent.mkdir(parents=True, exist_ok=True)
-        staged = Path(tempfile.mkdtemp(prefix=f".{key}-", dir=release.parent))
-        export_run(run, staged, ema=ema)
-        try:
-            staged.rename(release)
-        except OSError:
-            if not release.is_dir():
-                raise
-            # Another process wrote the same release first.
-            shutil.rmtree(staged)
+    run = SavedRun.pinned(str(name_or_dir), agreed_same("saved run step",
+                                                      lambda: SavedRun.pinned(str(name_or_dir), step,
+                                                                              trust).step), trust)
+    release = Path(dew_cache_dir()) / "saved_runs" / _fingerprint(run, ema)
+    lacking = any(from_every_process(not release.is_dir()))
+    if not lacking:
+        return release
+    if not weights:
+        raise ValueError(f"{name_or_dir} at step {run.step} has no release written under Dew's cache, and a "
+                         "load without weights (a resume's) restores none to write one; load it with its "
+                         "weights once, or start the run from its export (dew export)")
+    # Every process restores, a collective; one that holds the release already, or that another process
+    # of a shared cache published first, keeps it (`staged`).
+    with staged(release) as destination:
+        export_run(run, destination, ema=ema, mesh=mesh, layout=layout)
     return release
