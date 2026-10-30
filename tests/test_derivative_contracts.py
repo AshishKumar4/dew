@@ -504,6 +504,12 @@ def test_the_paged_decode_kernel_holds_every_order(edge):
                     truth_fn=plain, plain_fn=plain)
 
 
+def joined(seam):
+    """`seam`'s two outputs, the stream and its norm, side by side along the features: one output a contract
+    pulls back."""
+    return lambda *inputs: jnp.concatenate(seam(*inputs), axis=-1)
+
+
 def plain_rms(x, epsilon: float = 1e-6):
     """x over its root mean square, the RMS norm as written."""
     return x / jnp.sqrt(jnp.mean(jnp.square(x), axis=-1, keepdims=True) + epsilon)
@@ -522,9 +528,10 @@ def test_the_fused_norms_and_products_hold_every_order(edge):
     (dscale,) = normal_draw(2664, (16,))
     (cotangent,) = normal_draw(2665, (3, 16))
     sites = {
-        "a pre-norm seam": (norms.fused_seam(1e-6, jnp.float32, offset=False, after_cast=False),
-                            lambda x, branch, scale: (x + branch, plain_rms(x + branch) * scale),
-                            (x, branch, scale), (dx, dbranch, dscale), (cotangent, cotangent)),
+        "a pre-norm seam": (joined(norms.fused_seam(1e-6, jnp.float32, offset=False, after_cast=False)),
+                            joined(lambda x, branch, scale: (x + branch, plain_rms(x + branch) * scale)),
+                            (x, branch, scale), (dx, dbranch, dscale),
+                            jnp.concatenate([cotangent, cotangent], axis=-1)),
         "an unweighted RMS norm": (norms.fused_unweighted(1e-6), plain_rms, (x,), (dx,), cotangent),
         "a gated RMS norm": (norms.fused_gated(1e-6, jnp.float32, "silu"),
                              lambda x, gate, scale: plain_rms(x) * scale * jax.nn.silu(gate),
