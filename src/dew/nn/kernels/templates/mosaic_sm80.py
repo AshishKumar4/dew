@@ -11,6 +11,7 @@ from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
+from jax._src.pallas.mosaic_gpu import core as plgpu_core
 from jax._src.state import types as state_types
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
@@ -28,9 +29,23 @@ def _staging(block: tuple, swizzle: int | None) -> tuple:
 
 
 def swizzled(shape: tuple[int, ...], dtype) -> tuple:
-    """A `[rows, columns]` shared-memory tile's transforms: 8-row tiles as wide as the swizzle its row
-    bytes allow, swizzled (bank-conflict-free ldmatrix), as jax's Ampere examples stage their operands."""
-    return mosaic.swizzle_transforms(dtype, plgpu.find_swizzle(shape[-1] * jnp.dtype(dtype).itemsize * 8))
+    """A shared-memory operand's transforms: 8-row tiles at the narrowest legal swizzle, so a depth
+    fragment loads without retaining the rest of its pipeline stage."""
+    del shape
+    return mosaic.swizzle_transforms(dtype, mosaic.NARROWEST_SWIZZLE_BYTES)
+
+
+def _depth_granule(ref, axis: int, instruction: int) -> int:
+    """The depth slice a ref's staging allows: one MMA, or a whole swizzle along its tiled columns."""
+    if not isinstance(ref, state_types.TransformedRef):
+        return instruction
+    transposed = sum(isinstance(transform, state_types.TransposeTransform)
+                     and transform.permutation == (1, 0) for transform in ref.transforms) % 2
+    if axis != (0 if transposed else 1):
+        return instruction
+    swizzle = max((transform.swizzle for transform in ref.transforms
+                   if isinstance(transform, plgpu_core.UnswizzleRef)), default=0)
+    return max(instruction, swizzle // jnp.dtype(ref.dtype).itemsize)
 
 
 class Slots:
@@ -133,8 +148,11 @@ class Mma(mosaic.Family):
         return min(depth, 8 * max(32 // (jnp.dtype(self.dtype).itemsize * 8), 1))
 
     def rhs_fragment_depth(self, depth: int, *, transposed: bool = False) -> int:
-        # A transposed shared view cannot take the narrow row slices used by the ordinary RHS.
-        return depth if transposed else self.fragment_depth(depth)
+        del transposed
+        return self.fragment_depth(depth)
+
+    def lhs_fragment_depth(self, depth: int) -> int:
+        return self.fragment_depth(depth)
     most_shared = 163 * 1024  # sm80's and sm87's opt-in block (sm86's and sm89's 99 KiB)
     copies_vectors = False  # cp.async spreads a copy over the warpgroup's threads, 128 elements at least
     reduction_scratch = plgpu.CompilerParams().reduction_scratch_bytes  # its kernels' default parameters
@@ -371,7 +389,8 @@ class Mma(mosaic.Family):
         pass
 
     def held(self, ref):
-        return plgpu.load(ref, layout=self.lhs, optimized=False)
+        # A resident operand stays in shared memory between products, not beside every loop carry.
+        return ref
 
     def _left(self, lhs):
         """A product's left operand in the MMA's layout: a shared-memory tile read, or a register value's
@@ -390,22 +409,18 @@ class Mma(mosaic.Family):
         if interpret:
             # mma has no rule on a CPU: its sum, in fp32.
             return acc + jnp.dot(lhs[...], rhs[...], preferred_element_type=jnp.float32)
-        # The left operand a step deep, sliced in registers along the depth at its layout's tiles; the
-        # right one a sub-step at a time from the stage (`fragment_depth`), along its rows' 8-row tiles,
-        # or, a transposed view (whose rows are a swizzled tile's columns, no narrower slice of which
-        # lowers), a step deep and sliced in registers too.
-        left, depth = self._left(lhs), self.fragment_depth(rhs.shape[0])
-        if depth == rhs.shape[0]:
-            return plgpu.mma(acc, left, plgpu.load(rhs, layout=self.rhs), m_warps=self.m_warps)
-        transposed = isinstance(rhs, state_types.TransformedRef) and any(
-            isinstance(transform, state_types.TransposeTransform) for transform in rhs.transforms)
-        right = (plgpu.load(rhs, layout=self.rhs)
-                 if self.rhs_fragment_depth(int(rhs.shape[0]), transposed=transposed) == rhs.shape[0]
-                 else None)
-        for start in range(0, rhs.shape[0], depth):
-            part = (right[start:start + depth] if right is not None
-                    else plgpu.load(rhs.at[pl.ds(start, depth)], layout=self.rhs))
-            acc = plgpu.mma(acc, left[:, start:start + depth], part, m_warps=self.m_warps)
+        # Each operand loads only the fragments a group of instructions consumes, a whole swizzle tile of
+        # its staging at least; a register operand (an accumulator's value) is cast once and sliced.
+        instruction = self.fragment_depth(int(rhs.shape[0]))
+        chunk = max(_depth_granule(lhs, 1, instruction), _depth_granule(rhs, 0, instruction))
+        held = self._left(lhs) if isinstance(lhs, jax.Array) else None
+        for start in range(0, rhs.shape[0], chunk):
+            left = (held[:, start:start + chunk] if held is not None
+                    else self._left(lhs.at[:, pl.ds(start, chunk)]))
+            right = plgpu.load(rhs.at[pl.ds(start, chunk)], layout=self.rhs)
+            for offset in range(0, chunk, instruction):
+                acc = plgpu.mma(acc, left[:, offset:offset + instruction],
+                                right[offset:offset + instruction], m_warps=self.m_warps)
         return acc
 
     def registers_product(self, lhs: jax.Array, rhs, interpret: bool) -> jax.Array:
