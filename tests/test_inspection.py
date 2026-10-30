@@ -323,12 +323,13 @@ def test_a_watched_module_with_a_child_named_output_is_summarized():
     assert "inspect/activations/abs_max" in logged
 
 
-def accumulating(inspection, tracker=None, checkpoints=None, split=1):
-    """A trainer of two `split`-microbatch steps an update, over four data shards, whose rows split in two."""
+def accumulating(inspection, tracker=None, checkpoints=None, split=1, accumulation=2):
+    """A trainer of `accumulation` `split`-microbatch steps an update, over four data shards, whose rows
+    split in two."""
     from dew.training import MeshSpec
 
     return Trainer(Pulled(), optax.sgd(RATE), key=jax.random.key(0), tracker=tracker, inspection=inspection,
-                   accumulation=2, checkpoints=checkpoints, split=split,
+                   accumulation=accumulation, checkpoints=checkpoints, split=split,
                    mesh=MeshSpec().build(jax.devices()[:4]))
 
 
@@ -340,6 +341,19 @@ def test_a_log_at_a_step_that_commits_nothing_keeps_the_sample_before():
         Loader(lambda partition: stream(), None, batch=BATCH, records=None), steps=3, log_every=3,
         eval_every=None, checkpoint_every=None)
     assert tracker.rows[3]["inspect/params/l2"] > 0
+
+
+@pytest.mark.parametrize("every", [2, 3])
+def test_an_inspection_samples_every_nth_update_of_an_accumulating_run(every):
+    """`every` counts optimizer updates (row 2720): with three steps an update, logged at each update,
+    no log carries a sample before the `every`-th update's commit, which carries one, whether or not
+    `every` divides the steps an update takes."""
+    tracker = Kept()
+    accumulating(Inspection(paths=("w",), targets=("params",), every=every), tracker, accumulation=3).fit(
+        Loader(lambda partition: stream(), None, batch=BATCH, records=None), steps=3 * every, log_every=3,
+        eval_every=None, checkpoint_every=None)
+    sampled = [step for step, row in sorted(tracker.rows.items()) if "inspect/params/l2" in row]
+    assert sampled == [3 * every]
 
 
 def test_an_accumulating_trainers_offline_view_steps_its_whole_window():
