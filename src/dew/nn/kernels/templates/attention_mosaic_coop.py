@@ -33,31 +33,30 @@ def _coop_allocations(family: mosaic.Family, config: BackwardTiles, width: int, 
     the keys whole rows of their swizzle, the widest whose row divides it and the products' contractions
     over the tile's queries and keys (`mosaic.swizzle_for`: 64 bytes at a share of 32); each consumer's
     fp32 stage of its adds a chunk of its columns at a time (`mosaic.staged_columns`: width 256's two
-    stages of its 64 x 256 slots fit beside it); the two loads' barriers and the consumers' two turns a
-    step; and its query and output-cotangent streams in `stages` slots (`Family.streams`)."""
+    stages of its 64 x 256 slots fit beside it); the two loads' barriers and the exchange's
+    (`Family.exchange`); and its query and output-cotangent streams in `stages` slots (`Family.streams`)."""
     consumers, block_q, block_k = config.consumers, config.block_q, config.block_k
     chunk = mosaic.staged_columns(width // consumers, (jnp.float32,))
     swizzle = mosaic.swizzle_for(dtype, block_k // consumers, block_q, block_k)
     scoped = [plgpu.SMEM((block_k, width), dtype), plgpu.SMEM((block_k, width), dtype),
               mosaic.staged((2, block_q, block_k), dtype, swizzle),
               plgpu.SMEM((consumers, max(block_q, block_k), chunk), jnp.float32),
-              family.load_barriers(2), family.schedule(consumers), family.schedule(consumers)]
+              family.load_barriers(2), *family.exchange(consumers)]
     blocks = {"queries": ((block_q, width), dtype), "douts": ((block_q, width), dtype)}
     return scoped, family.streams(blocks, stages, consumers)
 
 
 def _coop_step(walk: _Backward, share: int, resident: tuple, exchanged, rows_of, coords_of, whole, add_dq,
-               turns: tuple, index, slots, carry, accumulators, *, masked: bool | None = None):
+               exchange: mosaic.Exchange, index, slots, carry, accumulators, *, masked: bool | None = None):
     """Consumer `share`'s query tile `index` over the program's resident keys and values (`resident`):
     its share of the keys' logits and score cotangents (`_scores`, `[bq, bk / consumers]`) from the query
     and output-cotangent slots, under the tile's queries' statistics (`rows_of`) and coordinates
     (`coords_of`), a tile every query sees whole (`whole(index)`) unmasked, or each tile `masked` or not
-    where the walk's segment says; its weights and score cotangents staged into the exchange (`exchanged`)
-    at its share of the keys once every consumer read the last tile's (`turns[1]`, awaited only now, past
-    this tile's products and softmax, its arrival the last step's), then, once every consumer's are staged
-    (`turns[0]`), its share of the head's columns of dV, dK and dQ over every key of the block
-    (`aᵀ @ b`, `a @ b`), dQ added into dQ (`add_dq`), and its reads of the exchange done (`turns[1]`'s
-    arrival)."""
+    where the walk's segment says; its weights and score cotangents staged into the exchanged block
+    (`exchanged`) at its share of the keys once it claims the block (`mosaic.Exchange`: every consumer's
+    reads of the last tile's done, awaited only past this tile's products and softmax), then, once every
+    consumer's are published, its share of the head's columns of dV, dK and dQ over every key of the block
+    (`aᵀ @ b`, `a @ b`), dQ added into dQ (`add_dq`), and the block released."""
     k_smem, v_smem = resident
     family, tiles, consumers = walk.program.family, walk.program.tiles, walk.consumers
     keys, columns = tiles.block_k // consumers, k_smem.shape[-1] // consumers
@@ -68,15 +67,15 @@ def _coop_step(walk: _Backward, share: int, resident: tuple, exchanged, rows_of,
     narrowed, part = _tile_scores(walk, (q_slot, do_slot), (k_smem.at[own], v_smem.at[own]), rows_of(q_first),
                                   coords_of(q_first), whole(index), (tiles.block_q, keys), masked=masked)
     weights_ref, cotangents_ref = exchanged.at[0], exchanged.at[1]
-    family.turn(turns[1], consumers, arrive=False)
+    exchange.claim()
     family.staged(narrowed, weights_ref.at[:, own])
     family.staged(part, cotangents_ref.at[:, own])
-    family.turn(turns[0], consumers)
+    exchange.publish()
     mine = pl.ds(share * columns, columns)
     dv_acc = family.products(dv_acc, weights_ref.transpose((1, 0)), do_slot.at[:, mine], walk.interpret)
     dk_acc = family.products(dk_acc, cotangents_ref.transpose((1, 0)), q_slot.at[:, mine], walk.interpret)
     add_dq(q_first, family.product(cotangents_ref, k_smem.at[:, mine], (tiles.block_q, columns)))
-    family.turn(turns[1], consumers, wait=False)
+    exchange.release()
     return carry, (dk_acc, dv_acc)
 
 
@@ -101,6 +100,7 @@ def _coop_launch(query, key, value, dout, peak, total, anchor, delta, key_index,
         (q_ref, k_ref, v_ref, do_ref, *stat_refs), refs = refs[:9], refs[9:]
         spans_of, refs = treedef.unflatten(refs[:len(leaves)]), refs[len(leaves):]
         dq_ref, dk_ref, dv_ref, k_smem, v_smem, exchanged, out_smem, loads, staged_turn, read_turn = refs
+        exchange = mosaic.Exchange(family, staged_turn, read_turn, consumers)
         row, head = lax.axis_index("batch"), lax.axis_index("heads")
         key_head = lax.div(head, heads // kv_heads)
         views = _views_of({"queries": q_ref, "douts": do_ref}, row, head)
@@ -128,13 +128,12 @@ def _coop_launch(query, key, value, dout, peak, total, anchor, delta, key_index,
                              smem=smem.at[pl.ds(0, block_q)])
 
             step = functools.partial(_coop_step, walk, share, (k_smem, v_smem), exchanged, rows_of, coords_of,
-                                     whole, add_dq, (staged_turn, read_turn))
+                                     whole, add_dq, exchange)
 
             segments = functools.partial(program.segmented, step, run)
 
             shapes = ((block_k, columns), (block_k, columns))
-            # The exchange free before the first tile: its reads' turn arrived at once (`_coop_step`).
-            family.turn(read_turn, consumers, wait=False)
+            exchange.open()
             _, (dk, dv) = family.walk_own(
                 streams, views, (lo, hi), streamed, index,
                 lambda streams, lo, hi, counted: family.walk(streams, segments(lo, hi), (), shapes,

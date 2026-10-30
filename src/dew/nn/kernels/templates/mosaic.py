@@ -145,6 +145,33 @@ def checked(built: Callable, kernel: str) -> Callable:
     return launch
 
 
+@dataclasses.dataclass(frozen=True)
+class Exchange:
+    """A shared-memory block each of a program's consumers stages its share of and every consumer then
+    reads whole, a step at a time (FlashAttention 3's P and dS between its two MMA warpgroups at width 256):
+    its barriers (`Family.exchange`), `staged` arrived by each consumer once its share is staged, `read`
+    once its reads of the block are done. A step `claim`s the block (every consumer's reads of the last
+    step's done) only before it stages its share, past its own products, then `publish`es it and reads
+    the whole once every share is staged, then `release`s it; `open` frees the block before the first step."""
+
+    family: "Family"
+    staged: object
+    read: object
+    consumers: int
+
+    def open(self) -> None:
+        self.family.turn(self.read, self.consumers, wait=False)
+
+    def claim(self) -> None:
+        self.family.turn(self.read, self.consumers, arrive=False)
+
+    def publish(self) -> None:
+        self.family.turn(self.staged, self.consumers)
+
+    def release(self) -> None:
+        self.family.turn(self.read, self.consumers, wait=False)
+
+
 def per_role(index, roles: int, run: Callable[[int, jax.Array], None]) -> None:
     """`run(role, index)` for the role `index` names among `roles`, each role's built at its own static
     index: Mosaic GPU slices a swizzled tile only at static columns (a role's share of a block's, ET's
@@ -800,6 +827,11 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
             plgpu.barrier_arrive(schedule)
         if consumers > 1 and wait:
             plgpu.barrier_wait(schedule)
+
+    def exchange(self, consumers: int) -> list:
+        """An exchange's allocations (`Exchange`): its two barriers of `consumers` arrivals each, its staged
+        tiles' and its reads' (`schedule`)."""
+        return [self.schedule(consumers), self.schedule(consumers)]
 
     def output_staging(self, outputs: tuple, consumers: int) -> list:
         """The shared memory `persist` stages each of `outputs` (`(shape, dtype)`, a tile's) in, which a
