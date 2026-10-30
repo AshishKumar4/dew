@@ -38,6 +38,7 @@ from dew.nn.kernels.templates.attention import (
     prescale,
 )
 from dew.nn.kernels.templates.attention_mosaic_backward import _launch_backward
+from dew.nn.kernels.templates.attention_mosaic_coop import _coop_allocations
 from dew.nn.kernels.templates.attention_mosaic_dkv import _dkv_allocations
 from dew.nn.kernels.templates.attention_mosaic_dq import _dq_allocations
 from dew.nn.kernels.templates.attention_mosaic_forward import (
@@ -485,6 +486,16 @@ def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int
         # (DQROWPROOF64/128: seven rows, D64 at 128 queries past the budget).
         rows = DQ_ROWS * family.row_registers(block_q, jnp.float32)
         return resources.live_registers(family, carried, products, cotangents) + rows
+    if config.shared_keys:
+        # Shared keys (`attention_mosaic_coop`): a consumer's share of the head's columns of dK and dV
+        # carried, beside a step's two products over its share of the keys and its share of the dQ tile,
+        # its statistics row vectors.
+        share = config.consumers
+        carried = [(block_k, width // share, jnp.float32), (block_k, value_width // share, jnp.float32)]
+        products = [(block_q, block_k // share, jnp.float32)] * 2 + [(block_q, block_k // share, jnp.int8)]
+        statistics = DKV_STATISTICS * family.row_registers(block_q, jnp.float32)
+        return resources.live_registers(family, carried, products, [(block_q, width // share, jnp.float32)]
+                                        ) + statistics
     carried = [(block_k, width // config.columns, jnp.float32), (block_k, value_width // config.columns,
                                                                  jnp.float32)]
     if config.fused and not split:
@@ -559,9 +570,16 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
             return False
         if (config.fused and (self.accurate or hooked)) or not super().legal(ba, config, target):
             return False
-        # A width split among programs adds its dQ once, in no fused launch, each share whole swizzled rows.
         dtype = ba.arguments["query"].dtype
         family = bundle_of(config, dtype)
+        if config.shared_keys:
+            # Every consumer's share of the keys whole tiles of the exchange's swizzle (32 keys at 64 bytes)
+            # and its share of the columns whole swizzled rows (`attention_mosaic_coop`).
+            share = _width(ba.arguments["query"].shape[-1], family, dtype) // config.consumers
+            return (config.fused and config.queries_first and config.consumers > 1 and config.columns == 1
+                    and (config.block_k // config.consumers) % 32 == 0
+                    and share % family.column_unit(dtype) == 0)
+        # A width split among programs adds its dQ once, in no fused launch, each share whole swizzled rows.
         shares = [_width(ba.arguments[name].shape[-1], family, dtype) / config.columns
                   for name in ("query", "value")]
         return config.columns == 1 or (not config.fused and all(
@@ -619,6 +637,18 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
                 # width 64: 64 x 64 on two consumers 0.47 ms against 128 x 64 on one, 0.59).
                 return max(found, key=lambda config: (config.block_q * config.block_k * config.consumers,
                                                       config.consumers))
+            # Where no consumer's registers hold its own keys' whole dK and dV sums, the consumers share
+            # one key block, each its share of the columns (FlashAttention 3's width 256: ET-COOP1-h100,
+            # 0.68 ms against the two launches' 1.30 at Qwen3-8B's heads 256 wide, causal; where the sums
+            # fit, sharing cost 9% at width 128 and 46% at 64, ET-COOP2-h100).
+            for layout in fed:
+                def sharing(rows: int, walked: int, consumers: int, layout=layout) -> BackwardTiles:
+                    return BackwardTiles(walked, rows, 2, consumers, fused=True, family=layout.name,
+                                         shared_keys=True)
+
+                if config := _derived(layout, query.dtype, key.shape[1], query.shape[1], sharing, fits,
+                                      overlapped=True):
+                    return config
         # The fewest dK/dV programs a key block's widths split among whose share of the sums its consumer's
         # registers hold (`BackwardTiles.columns`: a width of 256's whole dK and dV sums pass them).
         # Its logits' queries a stream of their own, else where that passes the block staged a step
@@ -648,7 +678,8 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         dkv_family = bundle_of(config.dkv, dtype)
         q_stages = min(config.stages, padded_q // config.block_q)
         if config.queries_first:
-            launches = [(family, config, _fused_allocations(family, config, width, dtype, q_stages))]
+            allocations = _coop_allocations if config.shared_keys else _fused_allocations
+            launches = [(family, config, allocations(family, config, width, dtype, q_stages))]
         else:
             launches = [(dkv_family, config.dkv, _dkv_allocations(
                 dkv_family, config.dkv, width, value_width, dtype, stages=q_stages, columns=config.columns,

@@ -63,16 +63,17 @@ HOOK_FORMS = {"bfloat16": (jnp.bfloat16, False), "float16": (jnp.float16, False)
 FED = {"dkv_family": "wgmma.fed", "dkv_consumers": 2}
 """The dK/dV launch on an H100's layout whose consumers feed their rings, its two consumers splitting each
 slot's queries (`attention_mosaic_scores.split_queries`), as the derivation takes it."""
-BACKWARD_FORMS = ("default", "fused", "fused-keys-first", "accurate")
-"""The backward's forms (`_backward_form`): the fast in two launches and in one either way, and the
+BACKWARD_FORMS = ("default", "fused", "fused-keys-first", "fused-shared-keys", "accurate")
+"""The backward's forms (`_backward_form`): the fast in two launches and in one each way, and the
 accurate."""
 HOOKED_FORMS = ("default", "accurate")
 """The forms a hooked or dropping call takes: its fast form's one launch is a hookless call's alone."""
 
 
-FORM_WIDTHS = {"fused-keys-first": 64}
-"""The head width a backward form takes where its derivation's is narrower than the checks' 128: the
-keys-first one launch holds width 64 alone (its dK, dV and dQ tiles past a consumer's registers at 128)."""
+FORM_WIDTHS = {"fused-keys-first": 64, "fused-shared-keys": 128}
+"""The head width a backward form takes where the checks' own (128, a call form's 64) is not one it holds:
+the keys-first one launch holds width 64 alone (its dK, dV and dQ tiles past a consumer's registers at
+128), the shared keys' consumers 128 and wider (each its share of the columns whole swizzled rows)."""
 
 
 def _backward_form(form: str) -> tuple[bool, attention_mosaic.BackwardTiles]:
@@ -80,9 +81,13 @@ def _backward_form(form: str) -> tuple[bool, attention_mosaic.BackwardTiles]:
     beside a producer and the keys-first dK/dV launch two consumers sharing a key block (`FED`), the
     accurate form's sums in two column halves where it is `accurate-halves` (a width split's,
     `BackwardTiles.columns`); or the fast form's one launch (`fused`), queries first on the dQ launch's
-    layout, or keys first on `FED`'s (`fused-keys-first`), each consumer 64 of a slot's 128 queries."""
+    layout, or keys first on `FED`'s (`fused-keys-first`), each consumer 64 of a slot's 128 queries, or
+    queries first over keys its two consumers share on `FED`'s layout (`fused-shared-keys`)."""
     if form == "fused":
         return False, attention_mosaic.BackwardTiles(64, 64, 2, 1, fused=True)
+    if form == "fused-shared-keys":
+        return False, attention_mosaic.BackwardTiles(64, 64, 2, 2, fused=True, family=FED["dkv_family"],
+                                                     shared_keys=True)
     if form == "fused-keys-first":
         return False, attention_mosaic.BackwardTiles(128, 64, 2, 1, fused=True, **FED)
     columns = 2 if form == "accurate-halves" else 1
@@ -299,7 +304,8 @@ def _check_call_form(case: str, *, interpret: bool, backward: bool = False, form
     queries, keys = core_geometry(call)
     spans = template.spans(queries, keys, ROWS, **arguments(call))
     heads = (2, 1) if interpret else (4, 2)
-    _check_spans(case, spans, (ROWS, queries, *heads), interpret=interpret, backward=backward, form=form)
+    _check_spans(case, spans, (ROWS, queries, *heads), interpret=interpret, backward=backward, form=form,
+                 width=FORM_WIDTHS.get(form, 64))
 
 
 def _check_backward(call: str, shape, *, form: str | None, interpret: bool, keys: int | None = None,
@@ -968,6 +974,19 @@ def test_the_backward_is_on_par_under_every_score_hook_interpreted(hooks, form):
     the interpreter: the gradients of the queries, keys and values, of each hook parameter and of the initial
     state."""
     _check_hooked_backward(hooks, form=form, interpret=True)
+
+
+@INTERPRETS
+@pytest.mark.parametrize("call", ["causal", "full"])
+def test_a_backward_256_wide_shares_its_keys_and_is_on_par_interpreted(call):
+    """The fast backward 256 wide, whose consumers' own keys' whole dK and dV sums pass their registers, at
+    its derived tiles: one launch whose two consumers share a key block, each its share of the columns
+    (`BackwardTiles.shared_keys`), every gradient on par (check 1) with the reference's, under the
+    interpreter."""
+    with generation.assumed("sm90"):
+        op, ba = _backward_call((1, 160, 2, 1), 256, accurate=False)
+        assert op.derived(ba, generation.gpu_target()).shared_keys
+    _check_backward(call, SHAPES["interpreted"], form=None, interpret=True, width=256)
 
 
 @INTERPRETS

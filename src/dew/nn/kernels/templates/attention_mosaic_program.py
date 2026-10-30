@@ -131,6 +131,10 @@ class BackwardTiles:
     """Whether the keys-first dK/dV launch stages its logits' queries (the call's taken by its power) a
     step from the call's own in its consumers' shared memory, where a stream of them beside the call's
     passes the block (width 256's)."""
+    shared_keys: bool = False
+    """Whether the fused launch's consumers share one key block (`attention_mosaic_coop._coop_launch`):
+    each forms the logits of its share of the keys and holds its share of the head's columns of dK, dV and
+    dQ, where a consumer's own keys' whole dK and dV sums pass its registers (width 256's)."""
 
     @property
     def dkv(self) -> "BackwardTiles":
