@@ -7,6 +7,7 @@ speed against fla's kernels are the GPU session's (c53 onwards).
 
 import contextlib
 import functools
+import os
 
 import fla_gdn_support as support
 import jax
@@ -17,6 +18,7 @@ from delta_rule_support import NAMES, checkpointed, fla_side, math as portable, 
 from gdn_cases import CASES
 from reference_error import (
     FEWEST_SEEDS,
+    as_given,
     assert_as_exact,
     assert_computes_the_oracle,
     chain_roundings,
@@ -455,8 +457,9 @@ def test_dews_fla_rule_follows_the_recurrence_for_any_heads_widths_and_length(
 
 
 @pytest.mark.parametrize("per_key", [False, pytest.param(True, marks=pytest.mark.skipif(
-    not INTERPRETED, reason="on a GPU Kimi delta attention's fp32 products are fla's TF32, held to fla's own "
-                            "distance by the_port_is_as_exact_as_fla (tests/test_gpu_recurrence.py)"))])
+    not INTERPRETED, reason="on a GPU Kimi delta attention's fp32 products are the port's BF16x6 (fla's own "
+                            "one TF32), held to fla's own distance by the_port_is_as_exact_as_fla "
+                            "(tests/test_gpu_recurrence.py)"))])
 @pytest.mark.parametrize("begun", [False, True])
 def test_dews_fla_rule_runs_packed_documents_as_their_own_sequences(per_key, begun):
     """Packed documents (`starts`, each a sequence of its own, fla's varlen), with a
@@ -848,7 +851,8 @@ wide (Qwen3.5's gated delta net's head)."""
 
 FLA_DTYPES = {"float32": (jnp.float32,) * 3, "mixed dtypes": (jnp.bfloat16, jnp.float32, jnp.bfloat16)}
 """The queries', keys' and values' dtypes of the port's cells against fla's own: fp32, whose products the port
-takes in TF32x3 and fla in one TF32, and mixed, which each runs in their common dtype."""
+takes in BF16x6 (six bf16 products, `fla_gdn`'s BF16_BF16_F32_X6) and fla in one TF32, and mixed, which each
+runs in their common dtype."""
 
 
 def the_port_is_as_exact_as_fla(per_key: bool, dtypes: str):
@@ -856,7 +860,10 @@ def the_port_is_as_exact_as_fla(per_key: bool, dtypes: str):
     (fla_kda), its queries, keys and values in `FLA_DTYPES[dtypes]` (beta in the values'): its output, final
     memory and every operand's gradient on par from float64 with fla 0.5.2's own on the same operands
     (`fla_side`, in its own interpreter, in their common dtype), check 1, the float64 token recurrence the
-    truth, at `FLA_SHAPE`. A GPU cell (tests/test_gpu_recurrence.py)."""
+    truth, at `FLA_SHAPE`. A GPU cell (tests/test_gpu_recurrence.py), skipped where its session names no fla
+    (`DEW_FLA_PYTHON`)."""
+    if not os.environ.get("DEW_FLA_PYTHON"):
+        pytest.skip("DEW_FLA_PYTHON names no interpreter with fla 0.5.2 and torch, the cell's reference")
     batch, length, key_heads, value_heads, width = FLA_SHAPE
     kinds = FLA_DTYPES[dtypes]
     common = jnp.result_type(*kinds)
@@ -870,14 +877,12 @@ def the_port_is_as_exact_as_fla(per_key: bool, dtypes: str):
     def port(q, k, v, g, beta, h0, do, dht):
         return through(fla_rule, do, dht)(q, k, v, g, beta, h0)
 
+    @as_given
     def fla(*inputs):
+        # fla's own run on the host, each result in the port's result dtype.
         shapes = jax.eval_shape(port, *inputs)
-
-        def run(*arrays):
-            return tuple(np.asarray(x, s.dtype) for x, s in zip(fla_side(arrays, None, common), shapes,
-                                                                   strict=True))
-
-        return jax.pure_callback(run, shapes, *inputs)
+        return tuple(np.asarray(x, s.dtype)
+                     for x, s in zip(fla_side(inputs, None, common), shapes, strict=True))
 
     def truth(q, k, v, g, beta, h0, do, dht):
         return through(recurrence, do, dht)(q, k, v, g, beta, h0)

@@ -126,26 +126,32 @@ DECODED = 4
 def decodes_on_its_kernel(kernel: str, held):
     """A gated delta net's decode tokens on `kernel` (`linear.DELTA_DECODE`: 'fused' or 'step'), `DECODED`
     in turn after a prefill, its recurrent state held in `held`: each token's output, and the conv history
-    and recurrent state it leaves, on par from float64 with the portable step's (check 1)."""
+    and recurrent state it leaves, on par with the portable step's (check 1) from the layer in float64 (the
+    truth: a bf16 layer on widened arguments fixes its projections and norm in bf16 and casts its state
+    back, so only the stored state's rounding is the contract's)."""
     layer = fused_case(4, 128, 3, jnp.bfloat16, held)[0]
 
-    def decode(variables, cache, tokens):
-        outs = []
-        for at in range(DECODED):
-            out, after = layer.apply({**variables, "cache": cache}, tokens[:, at:at + 1],
-                                     MixerCall(decode=True), mutable=["cache"])
-            outs.append(out)
-            cache = after["cache"]
-        return jnp.concatenate(outs, axis=1), cache["conv_state"], cache["recurrent_state"]
+    def decoded(module):
+        def decode(variables, cache, tokens):
+            outs = []
+            for at in range(DECODED):
+                out, after = module.apply({**variables, "cache": cache}, tokens[:, at:at + 1],
+                                          MixerCall(decode=True), mutable=["cache"])
+                outs.append(out)
+                cache = after["cache"]
+            return jnp.concatenate(outs, axis=1), cache["conv_state"], cache["recurrent_state"]
+        return decode
 
     def draw(seed):
         _, variables, cache, token = fused_case(4, 128, 3, jnp.bfloat16, held, seed)
         later = jax.random.normal(jax.random.key(3000 + seed), (token.shape[0], DECODED - 1, token.shape[-1]))
         return variables, cache, jnp.concatenate([token, later.astype(token.dtype)], axis=1)
 
-    assert_as_exact(named(decode, delta_decode=kernel), named(decode, delta_decode="xla"), draw,
+    assert_as_exact(named(decoded(layer), delta_decode=kernel), named(decoded(layer), delta_decode="xla"),
+                    draw,
                     f"a gated delta net decoding {DECODED} tokens on its {kernel} kernel, its state held in "
-                    f"{jnp.dtype(held).name}", seeds=FEWEST_SEEDS)
+                    f"{jnp.dtype(held).name}", seeds=FEWEST_SEEDS,
+                    truth_fn=named(decoded(layer.clone(dtype=jnp.float64)), delta_decode="xla"))
 
 
 def test_the_recurrences_run_on_this_gpu():
