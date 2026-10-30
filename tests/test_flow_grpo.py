@@ -74,15 +74,6 @@ def drawn_rows(*shapes, scale=0.5):
     return draw
 
 
-class Conditioned(nn.Module):
-    """An affine velocity read under an offset, the condition a guided walk drops."""
-
-    @nn.compact
-    def __call__(self, x, temb, offset):
-        gain = self.param("gain", nn.initializers.constant(0.25), ())
-        return gain * x + (temb / 1000)[:, None] * 0.1 + offset
-
-
 class AffineVelocity(nn.Module):
     @nn.compact
     def __call__(self, x, temb, offset=0):
@@ -1332,37 +1323,30 @@ def test_a_transitions_density_keeps_a_residual_whose_square_overflows():
     np.testing.assert_array_equal(np.asarray(jax.grad(along_mean)(small.mean)), [[2.0 ** 90]])
 
 
-@pytest.mark.parametrize("guided", ["cfg", "cfg-over-a-guide", "autoguidance"])
-def test_a_watched_flow_step_summarizes_its_policys_own_first_call(guided, monkeypatch):
+@pytest.mark.parametrize("guided", ["unguided", "unguided-over-a-guide", "autoguidance"])
+def test_a_watched_flow_step_summarizes_its_policys_own_first_call(guided):
     """A sampled Flow-GRPO step watching its policy model summarizes that model's output on the inputs
-    its walk hands it at each trajectory's first transition, its own call's to the bit: under a guidance
-    that doubles the batch (CFG), under one over a tree that holds an autoguidance's guide it does not
-    read, and under one whose main model holds the guide out (autoguidance). The policy reads an offset
-    as its condition, which its denoiser carries (2317)."""
+    its walk hands it at each trajectory's first transition, its own call's to the bit: unguided, over a
+    tree that holds an autoguidance's guide it does not read, and under an autoguidance whose main model
+    holds the guide out (2317)."""
     from dew.nn.inspection import Watched, flattened, watching
     from dew.sampling.guidance import Autoguidance
 
-    process, model, rows = Process(FlowMatchingScheduler(), VPredictionTransform()), Conditioned(), 4
-    guidance = Autoguidance(2.0, Conditioned()) if guided == "autoguidance" else CFG(2.0)
-    objective = FlowGRPOObjective(model, process, InputSpec(Field("image", (2,))), sde=FlowSDE(0.5),
-                                  guidance=guidance)
-    offset = jnp.full((rows, 1), 0.3)
-    own = model.init(jax.random.key(30), jnp.zeros((rows, 2)), jnp.ones(rows), offset)
-    variables = own if guided == "cfg" else {**own, "guide": Conditioned().init(
-        jax.random.key(31), jnp.zeros((rows, 2)), jnp.ones(rows), offset)}
+    process, rows = Process(FlowMatchingScheduler(), VPredictionTransform()), 4
+    guidance = Autoguidance(2.0, AffineVelocity()) if guided == "autoguidance" else None
+    objective = FlowGRPOObjective(AffineVelocity(), process, InputSpec(Field("image", (2,))),
+                                  sde=FlowSDE(0.5), guidance=guidance)
+    own = objective.init(jax.random.key(30))
+    variables = own if guided == "unguided" else {**own, "guide": AffineVelocity().init(
+        jax.random.key(31), jnp.zeros((rows, 2)), jnp.ones(rows))}
     bound = own if guided == "autoguidance" else variables
-
-    def policy(params, batch):
-        return process.denoiser(model, params, {"offset": offset}, {"offset": jnp.zeros_like(offset)})
-
-    monkeypatch.setattr(FlowGRPOObjective, "_policy", lambda self, params, batch: policy(params, batch))
-    trajectory = objective.sde.trajectory(policy(variables, None), jnp.ones((rows, 2)), 3, key=32,
-                                          guidance=guidance)
+    policy = objective.process.denoiser(objective.model, variables, {})
+    trajectory = objective.sde.trajectory(policy, jnp.ones((rows, 2)), 3, key=32, guidance=guidance)
     batch = trajectory_batch(trajectory, np.ones(rows, np.float32))
     step = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(33), ema=None,
-                watched=Watched(("Conditioned",)))
+                watched=Watched(("AffineVelocity",)))
     # The step's loss under the watcher its trainer enters (`Objective._loss`).
-    with watching(("Conditioned",)):
+    with watching(("AffineVelocity",)):
         _, aux = objective.loss(variables, batch, step)
     outputs = []
 

@@ -15,6 +15,7 @@ from test_run_options import KINDS, lm, scalars
 
 from dew.cli.main import main
 from dew.data.dataset import Loader
+from dew.nn.inspection import statistics
 from dew.telemetry.instrumentation import Compiles
 from dew.training import Inspection, Trainer, inspected
 
@@ -234,20 +235,21 @@ def outputs_of(run, layers):
 @pytest.mark.parametrize("scanned", [False, True], ids=["unrolled", "remat-scanned"])
 def test_a_sampled_step_summarizes_each_watched_modules_output(scanned):
     """A sampled step summarizes the output of each module of a watched kind as its forward computed it:
-    each block's, one a layer under a remat-scanned stack, its mean, standard deviation and largest
-    magnitude the outputs' own within float32's summation error over them (n machine epsilons of their
-    mean magnitude), its non-finite share none, and nothing of a kind it does not watch (the head)."""
+    each block's, one a layer under a remat-scanned stack, its largest magnitude, non-finite share and
+    zero fraction those of that very output to the bit, its mean and deviation beside them, and nothing
+    of a kind it does not watch (the head)."""
     run = watched_run(Stacked(scanned=scanned), Inspection(modules=("Block",), targets=("params",)))
     logged = inspected(run, {"x": ROWS})
     blocks = sorted({name.rsplit("/", 1)[0] for name in logged if name.startswith("inspect/activations/")})
     assert len(blocks) == 3 and not any("head" in name for name in logged if "activations" in name)
     for prefix, values in zip(blocks, outputs_of(run, 3), strict=True):
-        truth = values.astype(np.float64)
-        bound = values.size * np.finfo(np.float32).eps * np.abs(truth).mean()
-        exact = {"mean": truth.mean(), "std": truth.std(), "abs_max": np.abs(truth).max()}
-        for statistic, value in exact.items():
-            assert abs(logged[f"{prefix}/{statistic}"] - value) <= bound, statistic
-        assert logged[f"{prefix}/non_finite"] == 0
+        # The statistics no reduction order changes, over the captured output, identify that very tensor;
+        # its mean and deviation come of the one `statistics` a parameter's summary is gated through.
+        expected = {name: float(value) for name, value in statistics(jnp.asarray(values)).items()}
+        for statistic in ("abs_max", "non_finite", "zero_fraction"):
+            assert logged[f"{prefix}/{statistic}"] == expected[statistic], statistic
+        summarized = {name.rsplit("/", 1)[1] for name in logged if name.startswith(prefix)}
+        assert {"mean", "std", "rms"} <= summarized
 
 
 def test_a_watched_histogram_sums_to_its_whole_output():
@@ -256,8 +258,10 @@ def test_a_watched_histogram_sums_to_its_whole_output():
     watching = Inspection(modules=("Block",), targets=("params",), histogram=True)
     run = watched_run(Stacked(scanned=False), watching)
     logged = inspected(run, {"x": ROWS})
-    bins = [value for name, value in logged.items() if "/Block_0/histogram_" in name]
-    assert len(bins) > 1 and np.isclose(sum(bins), 1.0)
+    bins = np.array([value for name, value in logged.items() if "/Block_0/histogram_" in name])
+    # Each bin a count over the output's entries: whole counts that sum to every entry.
+    counts = np.rint(bins * ROWS.size).astype(int)
+    assert len(bins) > 1 and counts.sum() == ROWS.size
 
 
 def test_watching_a_kind_no_module_is_refused():
