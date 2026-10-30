@@ -763,7 +763,15 @@ def _continued_layout(value: Coordinates, valid: jax.Array, width: int,
                       rules: Mapping[str, FieldExtension]) -> Coordinates:
     """A request's `Coordinates` continued over its response's `width` slots: each field by the rule
     its flat field continues by (`rules`, `LAID_FIELDS`), no document starting in the response, and
-    its real tokens no longer all first, since the response follows the prompt's padding."""
+    its real tokens no longer all first, since the response follows the prompt's padding. A prompt
+    padded as document 0 holds that padding invalid first, its starts counted over its real tokens
+    alone (`document_starts`), so the padding neither starts nor feeds the document the response
+    continues, as a prompt whose validity marks it does."""
+    if value.segments is not None:
+        real = (jnp.ones(value.segments.shape, bool) if value.valid is None else value.valid) & (
+            value.segments != 0)
+        value = replace(value, valid=real, starts=document_starts(value.segments, real))
+
     def continued(name: str):
         field = getattr(value, name)
         return None if field is None else jnp.concatenate(

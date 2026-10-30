@@ -339,3 +339,26 @@ def test_a_field_dict_refuses_anything_but_coordinates_under_their_key():
         laid_coordinates(held)
     with pytest.raises(TypeError):
         field_coordinates(held, (1, 4))
+
+
+def test_a_prompt_padded_as_document_zero_extends_as_one_its_validity_pads():
+    """A response continues its prompt's last document whether the prompt's padding is marked as
+    document 0 or by its validity (`ModelInputs.extended`, review of ledger 1122): the two extended
+    layouts hold the same validity and starts, the padding neither a start nor real, so a recurrence
+    neither resets at it nor reads it before the response."""
+    import jax.numpy as jnp
+
+    from dew.batch import COORDINATES_FIELD
+    from dew.nn.inputs import ModelInputs
+
+    tokens = jnp.asarray([[3, 5, 0, 0]], jnp.int32)
+    segments = jnp.asarray([[1, 1, 0, 0]], jnp.int32)
+    by_documents = ModelInputs.from_value(ModelInputs(tokens, {"segment_ids": segments}))
+    by_validity = ModelInputs.from_value(ModelInputs(tokens, {"segment_ids": segments,
+                                                              "attention_mask": segments != 0}))
+    response = jnp.asarray([[7]], jnp.int32)
+    laid = [inputs.extended(response).token_fields[COORDINATES_FIELD]
+            for inputs in (by_documents, by_validity)]
+    np.testing.assert_array_equal(laid[0].valid, laid[1].valid)
+    np.testing.assert_array_equal(laid[0].starts, laid[1].starts)
+    np.testing.assert_array_equal(laid[0].valid, [[True, True, False, False, True]])
