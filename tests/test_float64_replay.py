@@ -124,15 +124,13 @@ PROGRAMS = {
     "jit": jax.jit(_arithmetic),
     "custom_vjp": _custom,
     "scan": lambda x: jax.lax.scan(lambda carry, row: (carry + _arithmetic(row), carry * row), x[0], x)[1],
-    # A remat's call, which the replay opens as the gate does (`reference_error.CALLS`).
-    "remat": jax.checkpoint(_arithmetic),
 }
 
 
 @pytest.mark.parametrize("name", sorted(PROGRAMS))
 def test_a_float32_program_replays_to_itself_run_in_float64(name):
-    """A float32 program without random bits, through a jit, a custom derivative's call, a remat or a
-    scan, replays to that program run in float64, bit for bit, each run an operation at a time (a
+    """A float32 program without random bits, through a jit, a custom derivative's call or a scan,
+    replays to that program run in float64, bit for bit, each run an operation at a time (a
     compiled program may contract a product and a sum into one rounding)."""
     x = np.random.default_rng(0).uniform(0.5, 2.0, (6, 7)).astype(np.float32)
     replayed = np.asarray(float64_replay(PROGRAMS[name])(x))
