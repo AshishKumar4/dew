@@ -238,7 +238,7 @@ def loaded(copies, issued: jax.Array | bool = True) -> None:
         plgpu.barrier_wait(barrier)
 
 
-def chunked(value: jax.Array, view, smem) -> list[tuple[jax.Array, object]]:
+def chunked(value: jax.Array, view, smem) -> list[tuple[jax.Array, Ref]]:
     """`value` and its `view` a chunk of `smem`'s columns at a time, the whole where `smem` holds every one:
     a stage narrower than the tile it moves (CUTLASS's sub-tiled epilogue, `staged_columns`)."""
     width = smem.shape[-1]
@@ -867,7 +867,7 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     def column_staging(self, shape: tuple, dtype, consumers: int) -> dict:
         """A resident block's per-role column tiles and their load completions."""
         block = self.column_shape(shape, consumers)
-        return {'parts': staged(block, dtype, self.swizzle_for(block[-1], dtype)),
+        return {'parts': staged(block, dtype),
                 'barriers': self.load_barriers(consumers)}
 
     def column_shape(self, shape: tuple, consumers: int) -> tuple:
