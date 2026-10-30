@@ -24,6 +24,14 @@ from dew.diffusion.schedules import GeneralizedNoiseScheduler
 StateT = TypeVar("StateT", covariant=True, default=object)
 
 
+def given(value: float | int | jax.Array | jax.stages.ArgInfo) -> bool:
+    """Whether a struct's data leaf `value` was given as a value its `__post_init__` checks, not handed it by
+    a transformation: jit's tracer, an array, or the description a lowered program's arguments hold
+    (`jax.stages.ArgInfo`), which `jax.jit(...).lower` builds the struct over and Dew's programs lower
+    (`dew.nn.kernels.options.program`)."""
+    return not isinstance(value, jax.Array | jax.stages.ArgInfo)
+
+
 class Solver(Protocol[StateT]):
     """The interface for one diffusion solver step and the state it keeps between steps.
 
