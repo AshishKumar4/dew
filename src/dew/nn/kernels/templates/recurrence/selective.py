@@ -350,7 +350,9 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan):
     launched = family.kernel(entry, out_type=out_type, grid=(scan.rows, scan.blocks),
                              grid_names=("rows", "blocks"), consumers=1, interpret=scan.interpret,
                              name="selective_scan_backward")
-    return launched(x, dt, b, c, parameters, entered, resets, dy, dfinal)
+    # Each chunk's entering state a `[N, D]` block of a row's rows, as a stream steps them.
+    laid = entered.reshape(scan.rows, chunks * states, scan.channels)
+    return launched(x, dt, b, c, parameters, laid, resets, dy, dfinal)
 
 
 def _summed_rows(tile, view, smem, family) -> None:
