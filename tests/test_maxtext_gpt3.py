@@ -6,11 +6,10 @@ embedding. MaxText's run over drawn weights and tokens is recorded (tools/maxtex
 
 from pathlib import Path
 
-import jax
 import jax.numpy as jnp
 import numpy as np
 from flax.traverse_util import unflatten_dict
-from reference_error import assert_as_exact, indexed_recording, recording
+from maxtext_recordings import assert_as_exact_as_maxtext
 
 FIXTURE = Path(__file__).parent / "fixtures" / "maxtext" / "gpt3.npz"
 SHAPE = {"emb": 16, "heads": 2, "head_dim": 8, "mlp": 64, "layers": 2, "vocab": 64, "positions": 64,
@@ -109,8 +108,5 @@ def test_dews_gpt3_computes_maxtexts_logits():
     float64 run (check 1 over the recorded seeds), Dew's float64 run held to that run's recorded
     sketch: positions, offset norms, fused attention, the GELU MLP and the tied logits all as MaxText
     computes them."""
-    drawn, reference, truth = indexed_recording(recording(FIXTURE), "gpt3", GPT3_SEEDS, inputs_of=draw,
-                                                truth_fn=lambda inputs: logits(decoder(jnp.float64), inputs))
-    compiled = jax.jit(lambda inputs: logits(decoder(), inputs))
-    assert_as_exact(lambda index, inputs: compiled(inputs), reference, drawn, "MaxText's GPT-3 logits",
-                    seeds=GPT3_SEEDS, truth_fn=truth)
+    assert_as_exact_as_maxtext(FIXTURE, "gpt3", GPT3_SEEDS, draw,
+                               lambda dtype, inputs: logits(decoder(dtype), inputs), "MaxText's GPT-3 logits")

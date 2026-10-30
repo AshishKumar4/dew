@@ -621,8 +621,9 @@ def _decoder_fields(fields: Mapping[str, object]) -> Mapping[str, object]:
 def _without_dispatch(values: Mapping[str, object]) -> Mapping[str, object]:
     """Value experts' record without the layer dispatch an earlier one wrote (`_LAYER_DISPATCH`), in its
     class record's fields where it has one."""
-    if "class" in values and isinstance(values.get("fields"), Mapping):
-        return {**values, "fields": _without_dispatch(values["fields"])}
+    held = values.get("fields")
+    if "class" in values and isinstance(held, Mapping):
+        return {**values, "fields": _without_dispatch(held)}
     return {name: value for name, value in values.items() if name not in _LAYER_DISPATCH}
 
 

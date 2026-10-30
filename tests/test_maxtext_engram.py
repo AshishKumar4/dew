@@ -9,12 +9,11 @@ the streams. MaxText's layer over drawn weights, streams and buckets is recorded
 
 from pathlib import Path
 
-import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax.traverse_util import unflatten_dict
-from reference_error import assert_as_exact, indexed_recording, recording
+from maxtext_recordings import assert_as_exact_as_maxtext
 
 FIXTURE = Path(__file__).parent / "fixtures" / "maxtext" / "engram.npz"
 VOCAB_SIZES = (11, 13, 17, 19)
@@ -85,11 +84,8 @@ def test_the_ple_layer_computes_maxtexts_engram():
     """Dew's float32 streams after its PLE layer under MaxText's Engram weights are as exact as
     MaxText's own float32 layer against its float64 run (check 1 over the recorded seeds), Dew's float64
     run held to that run's recorded sketch."""
-    drawn, reference, truth = indexed_recording(recording(FIXTURE), "engram", ENGRAM_SEEDS, inputs_of=draw,
-                                                truth_fn=lambda inputs: output(layer(jnp.float64), inputs))
-    compiled = jax.jit(lambda inputs: output(layer(), inputs))
-    assert_as_exact(lambda index, inputs: compiled(inputs), reference, drawn, "MaxText's Engram",
-                    seeds=ENGRAM_SEEDS, truth_fn=truth)
+    assert_as_exact_as_maxtext(FIXTURE, "engram", ENGRAM_SEEDS, draw,
+                               lambda dtype, inputs: output(layer(dtype), inputs), "MaxText's Engram")
 
 
 def test_a_bias_for_v41s_engram_layer_is_refused():
