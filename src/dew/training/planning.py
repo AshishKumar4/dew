@@ -43,6 +43,7 @@ from dew.training.ahead import handed
 from dew.training.distributed import batch_divisor
 from dew.training.footprint import Footprint
 from dew.training.memory import (
+    climbed,
     compiled_if_it_fits,
     derived_headroom,
     head_fused_of,
@@ -649,13 +650,11 @@ class FitSearch[LossT, EffectsT]:
         """Tell a run that sets its remat, before it compiles there alone (row 2111), the least-recompute
         rung its derivation finds fits where that recomputes less (row 2536): each trained module that
         chooses its remat (`RematChoosing`) is read from no remat up to the run's own, which the walk
-        never reads, and the run's own modules and head are put back. A run the derivation cannot judge,
-        a step over several devices (`candidate_footprint`), and one whose remat the ladder's climb from
-        none never reaches (a policy off `DECODER_REMAT`, or a rung the climb passes over) are told
-        nothing, and trace nothing for it: no rung below theirs is known."""
+        never reads, and the run's own modules and head are put back. A run whose remat the ladder's climb
+        from none never reaches (a policy off `DECODER_REMAT`, or a rung the climb passes over) is told
+        nothing, and traces nothing for it: no rung below its own is known."""
         entries = self.objective.program_key()
-        if self.mesh.devices.size > 1 or not any(
-                entry.trained and isinstance(entry.module, RematChoosing) for entry in entries):
+        if not any(entry.trained and isinstance(entry.module, RematChoosing) for entry in entries):
             return
         held, own = [entry.module for entry in entries], self.remat_rung()
         tile, fused = head_tile_of(self.objective), head_fused_of(self.objective)
@@ -788,7 +787,15 @@ class FitSearch[LossT, EffectsT]:
             return True
         self.xla_defaults = False
         self.lowered.clear()
-        return self.onward(lambda: recompute_more(self.objective, self.base))
+        return self.onward(self.compiled_again)
+
+    def compiled_again(self) -> bool:
+        """Climb the objective one rung, as `recompute_more` does, saying it compiles the step again
+        there."""
+        moved = climbed(self.objective, self.base)
+        if moved is not None:
+            _log.warning("the step does not fit the devices %s", moved)
+        return moved is not None
 
     def found(self, split: int) -> Planned:
         assert self.fitted is not None

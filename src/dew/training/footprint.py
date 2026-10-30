@@ -124,19 +124,21 @@ def candidate_footprint[LossT, EffectsT](objective: Objective[LossT, EffectsT],
                                           micro: Batch, window: int, prepared: TrainState,
                                           held: int) -> Footprint:
     """What a step over microbatches of `micro`'s shapes, its state `prepared` as placed, takes of a
-    device beside that state (`Footprint`): its loss's residuals at one microbatch on a step over
-    one device, its trained parameters' gradient, laid out as they are, and `held`."""
-    spans = max((len(leaf.sharding.device_set) for leaf in jax.tree.leaves(prepared)
-                 if leaf.sharding is not None), default=1)
-    residuals = None
-    if spans == 1:
-        loss, (variables, *rest) = traced_loss(objective, prepared, window)
-        variables = forward_variables(variables, prepared.compute)
+    device beside that state (`Footprint`): its loss's residuals at one microbatch, its trained
+    parameters' gradient, laid out as they are, and `held`. Over several devices the residuals are one
+    device's: the loss traced over that device's share of the microbatch (each leaf's shard,
+    `shard_shape`) with its parameters whole, as data and fully sharded data parallelism hold its
+    activations; tensor or sequence sharding, which splits them further, it counts whole, a derivation
+    that refuses where a compile could fit."""
+    loss, (variables, *rest) = traced_loss(objective, prepared, window)
+    variables = forward_variables(variables, prepared.compute)
 
-        def trained(params, variables, batch, *rest):
-            return loss({**variables, "params": params}, batch, *rest)
+    def trained(params, variables, batch, *rest):
+        return loss({**variables, "params": params}, batch, *rest)
 
-        residuals = residual_bytes(trained, variables["params"], (variables, micro, *rest))
+    share = jax.tree.map(lambda leaf: leaf if getattr(leaf, "sharding", None) is None
+                         else jax.ShapeDtypeStruct(leaf.sharding.shard_shape(leaf.shape), leaf.dtype), micro)
+    residuals = residual_bytes(trained, variables["params"], (variables, share, *rest))
     resident = {name: device_bytes(value) for name, value in {
         "variables": prepared.variables, "optimizer": prepared.opt_state, "ema": prepared.ema,
         "accumulation": prepared.accumulation, "compute": prepared.compute}.items()}
