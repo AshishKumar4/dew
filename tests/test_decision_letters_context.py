@@ -12,6 +12,7 @@ import pytest
 from test_decision_context import assert_packed_as_alone, opened, windows_of
 
 from dew.batch import thaw
+from dew.config import earlier_run
 from dew.data import Memory
 from dew.data.pipeline import Rejected
 from dew.data.text import ByteTokenizer
@@ -23,6 +24,7 @@ from dew.decision.layout import (
     Instructions,
     Labels,
     OptionLines,
+    RowSegment,
     Segment,
     Specials,
     State,
@@ -32,12 +34,16 @@ from dew.decision.layout import (
 from dew.decision.model import DecisionModel
 from dew.decision.objective import DecisionObjective
 from dew.decision.rows import Encoding, Fit
+from dew.decision.task import DecideSettings
+from dew.inference.tasks import earlier_shapes, saved_settings
 from dew.interop import Pretrained
 from dew.nn.cross_attention import CrossAttention
-from dew.registry import to_record
+from dew.registry import from_record, to_record
 
 pytestmark = pytest.mark.mesh
 
+SAVED_RECORDS = Path(__file__).parent / "fixtures" / "saved_records"
+SAVED_RECORDS = Path(__file__).parent / "fixtures" / "saved_records"
 LLAMA = Path(__file__).parent / "fixtures" / "hf" / "llama-tiny"
 SPECIALS = Specials(begin=None, separator=10, marker=0, marker_text="\x00", pad=255)
 TOKENIZER = ByteTokenizer()
@@ -228,3 +234,18 @@ def test_a_run_names_its_lettered_question_read_in_context_on_the_command_line(t
     marked = (*SEGMENTS[:3], dataclasses.replace(SEGMENTS[3], marker="after"), SEGMENTS[4])
     with pytest.raises(ValueError):
         StateFirstLayout(segments=marked)
+
+
+def test_a_lettered_run_saved_when_its_option_lines_named_a_stream_loads():
+    """A lettered run saved at a main whose option lines named their stream (0b4eb412b, between rows 2008
+    and 2450) loads: its run record (`earlier_run`) and its checkpoint's task record (`SavedRun`,
+    `earlier_shapes`) read their option lines without it, which follow their instructions now, so their
+    question still stands in the context (row 2627)."""
+    saved = SAVED_RECORDS / "0b4eb412b"
+    # The run's record as a resume reads it (`RunConfig.check_resume`): its segments in today's fields.
+    fields = earlier_run(json.loads((saved / "lettered-run.json").read_text()))["fields"]
+    segments = from_record(tuple[RowSegment, ...], fields["segments"])
+    assert any(isinstance(segment, OptionLines) for segment in segments)
+    record = earlier_shapes(json.loads((saved / "lettered-task.json").read_text()))
+    layout = saved_settings(record, DecideSettings).layout
+    assert isinstance(layout, StateFirstLayout) and layout.spans_in_context
