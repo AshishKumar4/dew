@@ -40,7 +40,7 @@ from .blocks import normal_kernel
 from .flops import MissingFlopsCount, counted_flops, projection_flops
 from .kernels import generation
 from .kernels.templates.gemm import template
-from .precision import at_least_fp32, float32_dot_general, float32_einsum, rounded_operand
+from .precision import at_least_fp32, exact_float32, float32_dot_general, float32_einsum, rounded_operand
 from .protocols import ProjectionGroup, Routes, declared_groups
 from .sharding import logical_axes
 
@@ -366,9 +366,11 @@ class Router(nn.Module):
 
     def logits(self, x):
         """Each token's gate logit for every expert, in fp32 (`at_least_fp32`):
-        `[..., num_experts]`."""
+        `[..., num_experts]`. They multiply in IEEE float32 where nothing states a precision
+        (`exact_float32`): a top-k choice flips between experts whose logits TF32's rounding moves
+        past each other, where the references' float32 routers multiply in IEEE float32."""
         return float32_einsum('...d,de->...e', x.astype(at_least_fp32(x.dtype)), self.kernel,
-                          precision=self.precision)
+                              precision=exact_float32(self.precision))
 
     def _activated(self, logits):
         if self.score_function == 'softmax':

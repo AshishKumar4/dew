@@ -33,6 +33,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.typing import DTypeLike
 
+from ..precision import exact_float32
 from . import generation
 
 MIN_WIDTH = 8
@@ -131,10 +132,11 @@ def _last_row(matrix):
 
 
 def _mm(lhs, rhs):
-    """`lhs @ rhs` at JAX's configured precision (`jax_default_matmul_precision`), which a Pallas
-    matmul reads as a plain one does: on a TPU its default takes one bf16 pass of the chunk's fp32
-    operands, and "highest" multiplies them in fp32."""
-    return jnp.matmul(lhs, rhs)
+    """`lhs @ rhs`, the chunk's fp32 operands multiplied in fp32 where nothing states a precision
+    (`precision.exact_float32`), where a TPU's Pallas matmul at JAX's default takes one bf16 pass, since a
+    chunk's products carry the recurrent state, whose rounding every later chunk reads compounded
+    (template numerics review 2026-10-26 follow-up, P1-1: every Mamba-2 layer's scan on a TPU)."""
+    return jnp.matmul(lhs, rhs, precision=exact_float32(None))
 
 
 def _chunk_forward(x, b, c, a, state):

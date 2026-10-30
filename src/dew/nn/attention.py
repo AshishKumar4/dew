@@ -59,6 +59,7 @@ from .precision import (
     asks_default_precision,
     at_least_fp32,
     capped_logits,
+    exact_float32,
     float32_einsum,
     wide_cpu_arithmetic,
 )
@@ -381,17 +382,21 @@ def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, 
         scaled_query, scoring = query.astype(at_least_fp32(dtype)), key.astype(at_least_fp32(dtype))
     else:
         scaled_query, scoring = query / jnp.sqrt(width).astype(dtype), key
+    # Softcapped logits (Gemma 2's) multiply in IEEE float32 where nothing states a precision
+    # (`exact_float32`): the cap squashes logits tens wide, which TF32's rounding moves by a part in a
+    # thousand, where the reference's float32 eager attention multiplies in IEEE float32.
+    scores = precision if softcap is None else exact_float32(precision)
     if sinks is None:
         scoring, value = repeat_kv_heads(scoring, heads), repeat_kv_heads(value, heads)
-        logits = float32_einsum('...qhd,...khd->...hqk', scaled_query, scoring, precision=precision)
+        logits = float32_einsum('...qhd,...khd->...hqk', scaled_query, scoring, precision=scores)
     elif kv_heads == 1:
         # One key/value head (DeepSeek V4's): the query heads are a free dim beside the rows, and no
         # size-one head axis rides as a batch dim, which had XLA transpose the fp32 query for the
         # product (a V4 layer's training step on an H100, batch 4 by 2048: 2 GiB more and 5% slower).
-        logits = float32_einsum('...tgd,...sd->...gts', scaled_query, scoring[..., 0, :], precision=precision)
+        logits = float32_einsum('...tgd,...sd->...gts', scaled_query, scoring[..., 0, :], precision=scores)
     else:
         grouped = scaled_query.reshape(*rows, length, kv_heads, heads // kv_heads, width)
-        logits = float32_einsum('...tkgd,...skd->...kgts', grouped, scoring, precision=precision).reshape(
+        logits = float32_einsum('...tkgd,...skd->...kgts', grouped, scoring, precision=scores).reshape(
             *rows, heads, length, keys)
     if wide_logits:
         logits = logits * width ** -0.5

@@ -63,6 +63,7 @@ __all__ = [
     "configured_precision",
     "correctly_rounded_divide",
     "divided",
+    "exact_float32",
     "float32_dot_general",
     "float32_einsum",
     "float32_matmul",
@@ -494,9 +495,21 @@ def _held(product: jax.Array, preferred_element_type: DTypeLike | None, *operand
     return product.astype(held)
 
 
-def float32_matmul(lhs, rhs) -> jax.Array:
-    """`lhs @ rhs` at JAX's configured precision, accumulated as `float32_dot_general` is."""
-    return accumulated(jnp.matmul, lhs, rhs)
+def float32_matmul(lhs, rhs, precision: jax.lax.PrecisionLike = None) -> jax.Array:
+    """`lhs @ rhs` at `precision`, JAX's configured one where unstated, accumulated as
+    `float32_dot_general` is."""
+    return accumulated(functools.partial(jnp.matmul, precision=precision), lhs, rhs)
+
+
+def exact_float32(precision: jax.lax.PrecisionLike) -> jax.lax.PrecisionLike:
+    """The precision a float32 product whose rounding decides what follows takes, a vocabulary head's,
+    a router's, softcapped scores' or a recurrence's state's (each states its reason where it calls
+    this): the one the call states, else the one JAX's config states (`jax_default_matmul_precision`),
+    else IEEE float32 (`Precision.HIGHEST`), not JAX's default, which runs TF32 on a GPU and one bf16
+    pass on a TPU, where the references multiply IEEE float32 (torch's float32 matmul)."""
+    if precision is not None or jax.config.jax_default_matmul_precision is not None:
+        return precision
+    return jax.lax.Precision.HIGHEST
 
 
 def configurable_precision(precision: jax.lax.PrecisionLike) -> bool:
@@ -897,7 +910,9 @@ def head_dot_general(dtype: Dtype | None, precision: PrecisionLike = None):
     promotes the states to at least fp32. Under bf16 compute at the default
     precision both operands multiply as bf16 and the logits are bf16 values
     (`head_product`); otherwise the product is the layer's own, in the
-    operands' dtype, at the precision stated, JAX's configured one where none is.
+    operands' dtype, at the precision stated, IEEE float32 where none is (`exact_float32`): its
+    logits feed the loss's logsumexp and the sampler, logits tens wide that TF32's part in a thousand
+    moves.
     """
     resolved = operand_precision(dtype, precision)
     rounds = rounds_to_bf16(dtype, precision)
@@ -910,7 +925,7 @@ def head_dot_general(dtype: Dtype | None, precision: PrecisionLike = None):
             return bf16_logits(bf16_dot_general(lhs, rhs, dimension_numbers))
         return accumulated(functools.partial(
             jax.lax.dot_general, dimension_numbers=dimension_numbers,
-            precision=resolved),
+            precision=exact_float32(resolved)),
             lhs, rhs, preferred_element_type=at_least_fp32(lhs.dtype))
 
     return dot_general
@@ -952,7 +967,8 @@ def head_product(subscripts: str, hidden: jax.Array, head: jax.Array,
     if rounds_to_bf16(hidden.dtype if compute is None else compute, precision):
         return bf16_product(subscripts, hidden, head)
     wide = at_least_fp32(hidden.dtype)
-    return float32_einsum(subscripts, hidden.astype(wide), head, precision=precision,
+    # The logits feed the loss's logsumexp and the sampler (`exact_float32`, as `head_dot_general`'s).
+    return float32_einsum(subscripts, hidden.astype(wide), head, precision=exact_float32(precision),
                           preferred_element_type=wide)
 
 
