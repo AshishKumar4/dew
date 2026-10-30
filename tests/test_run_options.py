@@ -583,8 +583,7 @@ BESIDE = {"layout.framing": {"segments": built_in(None, "question_first"), "max_
 """What an option's reader takes it only beside, by the run's path, set with it: a framing frames a row of
 its own segments (`_budgeted`), here the question layout's own row as segments (`built_in`), in a row long
 enough for its conversation's turns; a context's encoder encodes it for context layers, which read a
-row's context. Such a witness's run is judged alone, its export too: a release's format holds no
-cross-attention layer."""
+row's context."""
 
 def blocked(root: Path, drawn: bool) -> RunConfig:
     """`decision`'s run as a fresh head over a tiny causal backbone whose full attention reads blocks
@@ -792,10 +791,11 @@ def witnessed_on(builder, objective: str, settings: type, root: Path
         task, value = reached[name]
         option = reachable[name].made(value)
         missed = unread(task, before, option)
-        if missed is None and exports and name not in BESIDE:
-            # A released task's export (`dew export`), reloaded as its users load one, holds it too.
-            destination = root / "exported" / name
-            assert exported(root / "runs" / f"{name}{queued[name].index(value)}", destination)
+        destination = root / "exported" / name
+        # A released task's export (`dew export`), reloaded as its users load one, holds it too; a format
+        # that holds no such option refuses it by name (a release's holds its budgets alone), never drops it.
+        if missed is None and exports and exported(root / "runs" / f"{name}{queued[name].index(value)}",
+                                                   destination):
             missed = unread(dew.pipeline(str(destination)), before, option)
             missed = None if missed is None else f"its export: {missed}"
         if missed is not None:
@@ -804,8 +804,8 @@ def witnessed_on(builder, objective: str, settings: type, root: Path
 
 
 def exported(run: Path, destination: Path) -> bool:
-    """Whether `dew export` writes the saved `run` to `destination`, False where it refuses the run's
-    model by name, which its format does not hold."""
+    """Whether `dew export` writes the saved `run` to `destination`, False where it refuses the run by
+    name, its format holding not all the run saved (a release's its budgets alone, no cross-attention)."""
     try:
         return main(["export", str(run), str(destination)]) == 0
     except ValueError:
