@@ -44,6 +44,7 @@ from dew.nn.kv_cache import KVCache
 from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
 from dew.nn.mixers.mlp import MLPMixer
 from dew.nn.ngpt import stepped
+from dew.nn.precision import L2NORM_EPS
 from dew.objectives.lm import LMObjective
 from dew.registry import models
 from dew.sampling import Sampling
@@ -423,7 +424,8 @@ def test_a_step_computes_in_the_widest_of_its_operands():
                                jnp.asarray(alpha, jnp.float64))).dtype == np.float32
 
     def unit(x):
-        return x / np.sqrt(np.sum(np.square(x), axis=-1, keepdims=True))
+        # nGPT's justnorm: its eps under the root (`dew.nn.precision.l2norm`).
+        return x / np.sqrt(np.sum(np.square(x), axis=-1, keepdims=True) + L2NORM_EPS)
 
     start, end = unit(residual), unit(branch)
     oracle = unit(start + np.abs(alpha.astype(np.float64) * 0.3) * (end - start))
