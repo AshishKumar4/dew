@@ -100,8 +100,9 @@ class Watched:
 def called_with(model: nn.Module, variables: Mapping, run: Callable[[], object]) -> tuple[tuple, dict]:
     """The arguments `run` first calls `model` over `variables` with, as its caller made them: for a
     forward an objective runs inside a transform, the inputs `Objective.watched_forward` reruns it on.
-    Only that call counts, identified by its weights (the arrays of `variables` it binds, which a call over
-    other weights, another module's or a guide's of the same architecture, does not), made in this
+    Only that call counts, identified by its weights (it binds the arrays of `variables` and no others,
+    which a call over other weights does not, another module's or a guide's of the same architecture,
+    even one sharing some of them), made in this
     trace, so its arguments are this trace's values, never a transform's inside `run` (a `cond`, a
     `jit`); refused where `run` makes none. `run`'s outputs are unused, so a compiled step keeps only
     what computes them."""
@@ -112,7 +113,7 @@ def called_with(model: nn.Module, variables: Mapping, run: Callable[[], object])
         module = context.module
         if (not calls and context.method_name == "__call__" and type(module) is type(model)
                 and jax_core.trace_ctx.trace is traced
-                and any(id(leaf) in weights for leaf in jax.tree.leaves(module.variables))):
+                and {id(leaf) for leaf in jax.tree.leaves(module.variables)} == weights):
             calls.append((args, kwargs))
         return next_fun(*args, **kwargs)
 
