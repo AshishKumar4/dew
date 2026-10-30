@@ -211,7 +211,7 @@ def _tile_logits(states, matrix, precision: jax.lax.PrecisionLike):
                       precision=precision, preferred_element_type=at_least_fp32(states.dtype))
 
 
-def _row_terms(logits, predict: bool, labels) -> tuple[
+def _row_terms_impl(logits, predict: bool, labels) -> tuple[
         jax.Array, tuple[jax.Array, jax.Array] | None, tuple[jax.Array, jax.Array, jax.Array]]:
     """Each row's logsumexp, with `predict` its maximum and the first
     column that holds it, and its maximum, the sum of exponentials scaled to
@@ -254,6 +254,31 @@ def _row_terms(logits, predict: bool, labels) -> tuple[
     terms = widened_reduction(reduced, *operands)
     maximum, total, rest = terms[:3]
     return maximum + jnp.log(total), ((maximum, terms[3]) if predict else None), (maximum, total, rest)
+
+
+def _row_terms_jvp(predict: bool, primals, tangents):
+    """`_row_terms`' forward derivative, through the same terms as jnp's maximum, sums and first argmax
+    take them, a pass each: JAX's derivative of a reduction with a combine of its own reshapes every
+    operand's tangent and fails on a symbolic zero, the count's and the mask's (jax 0.11.2,
+    `lax._reduce_jvp`). The terms a derivative runs through are this formula's, their every order
+    JAX's own; a run that differentiates nothing reads the row once."""
+    logits, labels = primals
+
+    def terms(logits):
+        maximum = jnp.max(logits, axis=-1)
+        shares = jnp.exp(logits - maximum[..., None])
+        columns = jax.lax.broadcasted_iota(jnp.int32, logits.shape, logits.ndim - 1)
+        total = jnp.sum(shares, axis=-1)
+        rest = jnp.sum(jnp.where(columns != labels[..., None], shares, 0), axis=-1)
+        best = (maximum, jnp.argmax(logits, axis=-1).astype(jnp.int32)) if predict else None
+        return maximum + jnp.log(total), best, (maximum, total, rest)
+
+    return jax.jvp(terms, (logits,), (tangents[0],))
+
+
+# `jax.custom_jvp` is generic in its return type, which a `functools.partial` decorator loses.
+_row_terms = jax.custom_jvp(_row_terms_impl, nondiff_argnums=(1,))
+_row_terms.defjvp(_row_terms_jvp)
 
 
 class _ChunkTerms(NamedTuple):
