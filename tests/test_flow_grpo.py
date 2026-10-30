@@ -1346,11 +1346,9 @@ def test_a_watched_flow_step_summarizes_its_policys_own_first_call(guided):
     its walk hands it at each trajectory's first transition, its own call's to the bit: unguided, over a
     tree that holds an autoguidance's guide it does not read, under an autoguidance whose main model
     holds the guide out (2317), and under a custom guidance that calls its policy inside a `lax.cond` of
-    its own (2511). The summary is the trained call's, returned out of the step's scan: the watched loss
-    and gradient run the unwatched's matmuls alone (`step_flops`, 2512)."""
+    its own (2511)."""
     from dew.nn.inspection import Watched, flattened, watching
     from dew.sampling.guidance import Autoguidance
-    from dew.telemetry.instrumentation import step_flops
 
     process, rows = Process(FlowMatchingScheduler(), VPredictionTransform()), 4
     guidance = {"autoguidance": Autoguidance(2.0, AffineVelocity()), "branched": Branched()}.get(guided)
@@ -1385,13 +1383,42 @@ def test_a_watched_flow_step_summarizes_its_policys_own_first_call(guided):
     assert logged["activations/abs_max"] == np.abs(expected).max()
     assert logged["activations/mean"] == expected.mean(dtype=np.float32)
 
-    def work(watching_step: Step) -> float:
+
+class DenseVelocity(nn.Module):
+    """A velocity through one dense layer, whose matmuls a step's work counts."""
+
+    @nn.compact
+    def __call__(self, x, temb):
+        return nn.Dense(x.shape[-1])(x) + (temb / 1000)[:, None] * 0.1
+
+
+@pytest.mark.parametrize("guided", ["unguided", "branched"])
+def test_a_watched_flow_step_runs_its_unwatched_steps_matmuls(guided):
+    """A sampled Flow-GRPO step summarizes its policy's trained call, returned out of its scan, and runs
+    the unwatched step's matmuls alone (`step_flops`): no forward more at the first transition's inputs
+    (2512), under a custom guidance that calls its policy inside a `lax.cond` of its own too (2511)."""
+    from dew.nn.inspection import Watched, watching
+    from dew.telemetry.instrumentation import step_flops
+
+    process, rows = Process(FlowMatchingScheduler(), VPredictionTransform()), 4
+    guidance = Branched() if guided == "branched" else None
+    objective = FlowGRPOObjective(DenseVelocity(), process, InputSpec(Field("image", (2,))), sde=FlowSDE(0.5),
+                                  guidance=guidance)
+    variables = objective.init(jax.random.key(30))
+    policy = objective.process.denoiser(objective.model, variables, {})
+    trajectory = objective.sde.trajectory(policy, jnp.ones((rows, 2)), 3, key=32, guidance=guidance)
+    batch = trajectory_batch(trajectory, np.ones(rows, np.float32))
+    step = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(33), ema=None,
+                watched=Watched(("DenseVelocity",)))
+
+    def work(watched: bool) -> float:
         def loss(params):
-            with watching(("AffineVelocity",)) if watching_step.watched else contextlib.nullcontext():
-                stats, _ = objective.loss({**variables, "params": params}, batch, watching_step)
-            return objective.reduce_loss(stats)[0]
-        flops = step_flops(jax.jit(jax.grad(loss)).lower(variables["params"]).compile())
+            with watching(("DenseVelocity",)) if watched else contextlib.nullcontext():
+                stats, aux = objective.loss({**variables, "params": params}, batch,
+                                            step if watched else dataclasses.replace(step, watched=None))
+            return objective.reduce_loss(stats)[0], aux.inspected
+        flops = step_flops(jax.jit(jax.grad(loss, has_aux=True)).lower(variables["params"]).compile())
         assert flops is not None
         return flops.hardware
 
-    assert work(step) == work(dataclasses.replace(step, watched=None))
+    assert work(watched=True) == work(watched=False)
