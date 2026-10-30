@@ -89,7 +89,8 @@ def test_plain_and_looped_lfm3_train_through_a_decision_run(tmp_path, release_ca
     rate, plain and with a block of its layers looped twice (`--loop-layers`, `--loop-steps`), a short
     convolution and full and sliding attention among them, under a text-only decision source (its
     language model, no prediction depth, its full-attention layers reading blocks both ways): every
-    weight it trains finite and moved, and the run records its loop."""
+    weight it trains finite, each kind of layer's weights moved, its short convolutions', its full
+    attention's and its sliding attention's, and the run records its loop."""
     import shutil
 
     from model_support import flat_tree
@@ -119,7 +120,12 @@ def test_plain_and_looped_lfm3_train_through_a_decision_run(tmp_path, release_ca
     start = flat_tree(variables["params"])
     assert set(trained) == set(start)
     assert all(np.isfinite(trained[name]).all() for name in trained)
-    assert any(not np.array_equal(trained[name], start[name]) for name in trained)
+    kinds = json.loads((TINY / 'config.json').read_text())['layer_types']
+    for kind in set(kinds):
+        layers = {f"layers_{index}." for index, layer in enumerate(kinds) if layer == kind}
+        moved = [name for name in trained if any(name.startswith(layer) for layer in layers)
+                 and not np.array_equal(trained[name], start[name])]
+        assert moved, kind
     recorded = DecisionRunConfig.load(str(tmp_path / "runs" / arm))
     assert (recorded.loop_layers, recorded.loop_steps) == (((1, 5), 2) if looped else (None, None))
 

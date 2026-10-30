@@ -474,21 +474,10 @@ class MultiHeadLatentAttention(nn.Module):
         """The latent and expanded projections plus training's QK and AV."""
         if self.indexed or self.index_shared:
             raise MissingFlopsCount("MultiHeadLatentAttention needs indexer selection geometry for train/mfu")
-        query = self.num_heads * (self.qk_nope_head_dim + self.qk_rope_head_dim)
-        if self.q_lora_rank is None:
-            count = projection_flops(lengths, self.emb_features, query)
-        else:
-            count = (projection_flops(lengths, self.emb_features, self.q_lora_rank)
-                     + projection_flops(lengths, self.q_lora_rank, query))
-        count += projection_flops(lengths, self.emb_features, self.kv_lora_rank + self.qk_rope_head_dim)
-        count += projection_flops(lengths, self.kv_lora_rank,
-                                   self.num_heads * (self.qk_nope_head_dim + self.v_head_dim))
-        count += projection_flops(lengths, self.num_heads * self.v_head_dim, self.emb_features)
-        if self.output_gate:
-            count += projection_flops(lengths, self.emb_features, self.num_heads * self.v_head_dim)
-        return count + attention_flops(lengths, self.num_heads,
-                                       self.qk_nope_head_dim + self.qk_rope_head_dim,
-                                       self.v_head_dim, causal=self.causal)
+        # Its projections are its read of a context's, over its own sequence (`context_projection_flops`).
+        return self.context_projection_flops(lengths, lengths) + attention_flops(
+            lengths, self.num_heads, self.qk_nope_head_dim + self.qk_rope_head_dim, self.v_head_dim,
+            causal=self.causal)
 
     def _select(self, index_scores, keep, kv_store):
         """The keys each query attends among `keep`, as `top_k_selection`
@@ -637,7 +626,8 @@ class MultiHeadLatentAttention(nn.Module):
     def context_projection_flops(self, lengths, context_lengths) -> float:
         """The part of its read of a context done by its own matrices: the query latent's, the output
         gate's and the output projection's over the rows of `lengths` tokens, the key latent's and its
-        expansion's over the context's `context_lengths`."""
+        expansion's over the context's `context_lengths`; its own call's over its sequence alike
+        (`model_flops`)."""
         query = self.num_heads * (self.qk_nope_head_dim + self.qk_rope_head_dim)
         rows = (projection_flops(lengths, self.emb_features, query) if self.q_lora_rank is None else
                 projection_flops(lengths, self.emb_features, self.q_lora_rank)
