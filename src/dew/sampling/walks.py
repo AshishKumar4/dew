@@ -13,7 +13,7 @@ from jax.typing import ArrayLike
 from dew.diffusion.discrete import DiscreteDenoiser
 from dew.diffusion.process import Denoiser
 from dew.nn.autoencoders import AutoEncoder
-from dew.sampling.guidance import Guidance, Walk, guidance_modules
+from dew.sampling.guidance import Guidance, Walk, guidance_modules, pair_of
 from dew.sampling.solvers import RowKeys, RowSolver, Solver
 
 
@@ -135,7 +135,7 @@ def sample[StateT, RecordT](
     if times.shape[0] == 1:
         if record is not None:
             raise ValueError("a record reads the steps, and a grid of one point takes none")
-        return walk.at(guided, count)(x_T, jnp.full((batch,), times[0]))[0] if final_denoise else x_T
+        return pair_of(walk.at(guided, count)(x_T, jnp.full((batch,), times[0])))[0] if final_denoise else x_T
 
     if initial is None:
         with jax.ensure_compile_time_eval():
@@ -149,7 +149,8 @@ def sample[StateT, RecordT](
             t = jnp.full((batch,), t)
             t_next = jnp.full((batch,), t_next)
             stepping = walk if spanned is None else Walk.over(spanned.spanning(t, t_next), guidance, count)
-            (denoised, eps), guided = stepping.step(x, t, index, guided)
+            predicted, guided = stepping.step(x, t, index, guided)
+            denoised, eps = pair_of(predicted)
             x, state = _stepped(solver, key, index)(x, t, t_next, denoised, eps, state,
                                                     process=process, denoise=stepping.at(guided, index))
             return (x, state, guided), read(x, state, denoised)
@@ -158,7 +159,7 @@ def sample[StateT, RecordT](
             body, (x_T, initial, guided),
             (times[:-1], times[1:], jnp.arange(times.shape[0] - 1)))
         if final_denoise:
-            x = walk.at(walked, count)(x, jnp.full((batch,), times[-1]))[0]
+            x = pair_of(walk.at(walked, count)(x, jnp.full((batch,), times[-1])))[0]
         return x, readings
 
     if record is None:

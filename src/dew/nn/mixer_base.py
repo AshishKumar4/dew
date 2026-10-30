@@ -223,6 +223,9 @@ class MixerBase:
     decoder skips a remat rung that keeps nothing more of its layers' names
     than the next (`CausalTransformer.recompute_more`). The class's default,
     which every reader takes through `marks`."""
+    reads_depth: ClassVar[bool] = False
+    """Whether the mixer computes by its layer's index in the stack (`MixerCall.depth`), which the
+    model then hands every layer as data (`LayerInputs.depth`), so like layers still scan as one."""
 
     keeps_cache = True
     """Whether the mixer this kind builds keeps a decode cache, which a loop's

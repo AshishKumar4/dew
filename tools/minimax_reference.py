@@ -34,17 +34,16 @@ MiniMax masks its softmax layers (modeling_minimax.py:660-690). The config class
 
 import json
 import math
-import shutil
 import sys
 from pathlib import Path
 
 import numpy as np
 import torch
-from huggingface_hub import hf_hub_download
-from reference_source import hub_modules, padded_probe
+from hf_reference import write_released_config
+from reference_source import hub_modules, write_probes
 from torch_precision import float64_twin
 
-from dew.interop.verify import probe_ids, scatter_weights
+from dew.interop.verify import scatter_weights
 
 REPO, REVISION = 'MiniMaxAI/MiniMax-Text-01', 'a7351bf2bee0e1253919d349f1ad304e6dac13e9'
 RELEASES = {'minimax-text-01': (REPO, REVISION),
@@ -106,23 +105,6 @@ def remote():
     return configuration, modeling
 
 
-def logits(model, ids, mask=None, positions=None):
-    inputs = {'input_ids': torch.from_numpy(ids).long(), 'use_cache': False}
-    if mask is not None:
-        inputs.update(attention_mask=torch.from_numpy(mask).long(),
-                      position_ids=torch.from_numpy(positions).long())
-    with torch.no_grad():
-        return model(**inputs).logits.numpy()
-
-
-def greedy(model, ids, tokens: int):
-    """`ids` continued `tokens` tokens by the argmax of a full forward each, the continuation the
-    remote code's cached generation computes, which transformers 5's generate no longer drives."""
-    for _ in range(tokens):
-        ids = np.concatenate([ids, logits(model, ids)[:, -1].argmax(-1)[:, None].astype(ids.dtype)], axis=1)
-    return ids
-
-
 def write_tiny(configuration, modeling) -> None:
     directory = FIXTURES / 'minimax-tiny'
     directory.mkdir(parents=True, exist_ok=True)
@@ -134,14 +116,7 @@ def write_tiny(configuration, modeling) -> None:
     written = json.loads((directory / 'config.json').read_text())
     written['model_type'] = 'minimax_text_01'
     (directory / 'config.json').write_text(json.dumps(written, indent=2) + '\n')
-    ids = probe_ids(config.vocab_size)
-    mask, padded, positions = padded_probe(ids)
-    arrays = {'input_ids': ids, 'attention_mask': mask, 'logits': logits(model, ids),
-              'padded_logits': logits(model, padded, mask, positions),
-              'generated': greedy(model, ids[:, :4], 6)}
-    for name, array in arrays.items():
-        np.save(directory / f'{name}.npy', array)
-    print(f"{directory}: {sorted(path.name for path in directory.iterdir())}")
+    write_probes(directory, model, config.vocab_size)
 
 
 def integer_mask(model):
@@ -177,10 +152,7 @@ def write_recording(configuration, modeling) -> None:
 
 def write_released() -> None:
     for name, (repo, revision) in RELEASES.items():
-        directory = FIXTURES / name
-        directory.mkdir(parents=True, exist_ok=True)
-        shutil.copy(hf_hub_download(repo, 'config.json', revision=revision), directory / 'config.json')
-        (directory / 'source.json').write_text(f'{{"repo": "{repo}", "revision": "{revision}"}}\n')
+        write_released_config(name, repo, revision)
 
 
 if __name__ == '__main__':

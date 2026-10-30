@@ -62,17 +62,17 @@ from ..deepseek_v4 import DeepseekV4Mixer
 from ..dex import DexStart, DifferentialExtension, HeadOutputs, LayerDex, folded
 from ..dsa_kpool import KPoolSparseAttentionMixer
 from ..dspark import DSpark, DSparkStage, draft as dspark_draft
-from ..engram import Engram, EngramHashes, EngramLayer
+from ..engram import Engram, EngramHashes, EngramLayer, PLELayer
 from ..flops import counted_flops, parameter_flops
 from ..gemma3n import AltUp, clamped_predictions, rescale_to
 from ..hyper_connections import (
     Carried,
     HyperConnections,
-    HyperHead,
     collapse_by,
     collapse_streams,
     expand_streams,
     first_stream,
+    stream_head,
 )
 from ..inputs import (
     AttentionMetadata,
@@ -122,12 +122,9 @@ from .decoder_block import (
 )
 from .decoder_fields import refuse_unbuildable, softmax_attention_layers
 from .decoder_stack import (
-    WRITTEN,
     DecoderBank,
     Loop,
-    PassView,
     PipelineStage,
-    SharedPassView,
     StackView,
     StageSplit,
     banked_collections,
@@ -138,6 +135,7 @@ from .decoder_stack import (
     split_stages,
 )
 from .layer_plan import LayerKind, LayerSpec, ResolvedKind, layer_index, run_period, scan_groups
+from .looping import run_loop
 
 _INTERMEDIATES = "intermediates"
 """The collection flax's `capture_intermediates` fills."""
@@ -406,12 +404,8 @@ class CausalTransformer(nn.Module):
     over finished blocks of layers that replaces the running residual. None
     disables them."""
     engram: Engram | None = None
-    """DeepSeek-V4.1's n-gram lookups (`dew.nn.engram`). Each layer it names
-    gates its table rows into the residual streams before its attention. The
-    tokenizer's compressed vocabulary is stored as `engram_hashes/token_map` in
-    the `constants` collection. A loaded checkpoint derives it from its
-    tokenizer, and a fresh model fills it with each id modulo the compressed
-    vocabulary's size."""
+    """DeepSeek-V4.1's n-gram lookups or Qwen4-Exp's per-layer embedding (`dew.nn.engram`) before each named
+    layer's attention, over the compressed vocabulary `constants` holds (`engram_hashes/token_map`)."""
     dex: DifferentialExtension | None = None
     """The chosen heads whose attention outputs take a learned differential (`dew.nn.dex`), or None."""
     cross_attention: CrossBlocks | None = None
@@ -682,8 +676,8 @@ class CausalTransformer(nn.Module):
             "kv_shared": kv_shared, "kv_store_key": layer_type,
             "partial_rotary_factor": kind.partial_rotary_factor, "attention_sinks": kind.sinks,
             "qk_norm": kind.qk_norm, "init_std": self.init_stds[0], "output_init_std": self.init_stds[1],
-            "precision": self.precision, "dex": dex, "dex_start": dex_start,
-            "value_experts": self.value_experts if routed else None}
+            "precision": self.precision, "dex": dex, "dex_start": dex_start, "value_experts": None
+            if not routed or self.value_experts is None else self.value_experts.under(self.mixture)}
         return MixerContext(**resolved, **{field.name: getattr(self, field.name)
                                            for field in dataclasses.fields(MixerContext)
                                            if field.name not in resolved})
@@ -917,9 +911,9 @@ class CausalTransformer(nn.Module):
                 projection(projections[f'altup_unembed_projections_{index}'][1],
                            name=f'altup_unembed_projections_{index}')
                 for index in range(self.altup.num_inputs - 1)]
-        if self.hyper_connections is not None and self.hyper_connections.head == 'weighted':
-            self.hc_head = HyperHead(spec=self.hyper_connections, emb_features=self.emb_features,
-                                     norm_eps=self.norm_eps, name='hc_head')
+        if self.hyper_connections is not None and self.hyper_connections.head in ('weighted', 'gated'):
+            self.hc_head = stream_head(self.hyper_connections, self.emb_features, self.norm_eps,
+                                       name='hc_head')
         if self.attention_residuals is not None:
             self.output_res = DepthAttention(emb_features=self.emb_features, norm_eps=self.norm_eps,
                                              name='output_res')
@@ -1019,7 +1013,10 @@ class CausalTransformer(nn.Module):
             media_routed=(spec.routed and not spec.hash_routed
                           and self.mixture is not None and self.mixture.media_bias),
             engram=None if spec.engram is None or self.engram is None else functools.partial(
-                EngramLayer, rows=self.engram.num_embeddings[spec.engram], head_dim=self.engram.head_dim,
+                EngramLayer if self.engram.ple_conv_kernel_size is None else functools.partial(
+                    PLELayer, kernel_size=self.engram.ple_conv_kernel_size,
+                    dilation=self.engram.max_ngram_size, parts=self.engram.table_parts),
+                rows=self.engram.num_embeddings[spec.engram], head_dim=self.engram.head_dim,
                 hc_mult=self.hyper_connections.hc_mult if self.hyper_connections else 1,
                 emb_features=self.emb_features, norm_eps=self.norm_eps,
                 dtype=self.dtype, precision=self.precision),
@@ -1189,7 +1186,7 @@ class CausalTransformer(nn.Module):
             x = collapse_by(x.pre, x.streams)
         elif hc is not None:
             x = collapse_streams(x.streams if isinstance(x, Carried) else x,
-                                 self.hc_head if hc.head == 'weighted' else None)
+                                 self.hc_head if hc.head in ('weighted', 'gated') else None)
         if self.attention_residuals is not None:
             # Every block is finished after the last layer, so the whole state,
             # the blocks and the last partial, is what the output site mixes
@@ -1750,50 +1747,9 @@ class CausalTransformer(nn.Module):
             whole_blocks=whole_blocks and block_groups is not None)
 
     def looped(self, x, **stack):
-        """Run the layer stack over `x` once, or as `loop` says: the layers before
-        its block once, the block `steps` times, each pass after the first
-        reading the last one's output, normed under `step_norm`, and the layers
-        after it once; the passes before the last `backprop_steps` pass no
-        gradient back. `remat` checkpoints each block pass outside decode,
-        leaving its span and the train/decode choices static in the closure;
-        the per-pass collection view stays outside that checkpoint."""
-        loop = self.loop
-        if loop is None:
-            return self.stack(x, **stack)
-        first, end = loop.layers or (0, self.num_layers)
-        block = None if loop.layers is None else (first, end)
-        train, decode = stack['train'], stack['decode']
-        dynamic = {name: value for name, value in stack.items() if name not in ('train', 'decode')}
-
-        def pass_block(module, x, **inputs):
-            return module.stack(x, span=block, train=train, decode=decode, **inputs)
-
-        run_block = nn.remat(pass_block) if loop.remat and not decode else pass_block
-        if first:
-            x = self.stack(x, span=(0, first), **stack)
-        injected = x
-        shared = SharedPassView() if loop.shared_cache else None
-        first_pass = run_block if shared is None else nn.map_variables(
-            run_block, mapped_collections=WRITTEN, trans_in_fn=shared.first, trans_out_fn=shared.outside,
-            mutable=True)
-        x = first_pass(self, self.norm(x + injected) if loop.reinject else x, **dynamic)
-        for step in range(1, loop.steps):
-            normed = self.norm(x)
-            self._gate_exit(normed)
-            x = normed if loop.step_norm else x
-            if loop.backprop_steps is not None and step == loop.steps - loop.backprop_steps:
-                x = jax.lax.stop_gradient(x)
-            if loop.reinject:
-                x = self.norm(x + injected)
-            view = shared or PassView(self.num_layers + (step - 1) * (end - first), first, end - first)
-            run = nn.map_variables(run_block, mapped_collections=WRITTEN, trans_in_fn=view.inside,
-                                   trans_out_fn=view.outside, mutable=True)
-            x = run(self, x, **dynamic)
-        if loop.reinject:
-            x = self.norm(x)
-        if end < self.num_layers:
-            x = self.stack(x, span=(end, self.num_layers), **stack)
-        return x
+        """Run the layer stack over `x` once, or as `loop` says (`looping.run_loop`): its block's later
+        passes under one scan, so a step's program holds two passes whatever the loop's count."""
+        return run_loop(self, x, **stack)
 
     def _gate_exit(self, normed):
         """Sow the exit gate's logit for a pass's normed states into `exits`."""
@@ -2033,10 +1989,16 @@ class CausalTransformer(nn.Module):
     def _layer_inputs(self, tokens, x, routed_experts, routed) -> LayerInputs | None:
         """The per-layer signal and routing replay the stack slices by layer."""
         embeddings = self.per_layer_inputs(tokens, x) if self.per_layer_input_dim else None
+        # A mixer computing by its layer's place reads it as data (`MixerBase.reads_depth`).
+        mixers = {self.kind_of(kind).mixer or self.layer_mixer for kind in set(self.per_layer_types)}
+        reads = any(mixer.reads_depth for mixer in mixers)
+        depth = None if not reads else jnp.broadcast_to(jnp.arange(self.num_layers, dtype=jnp.int32),
+                                                        (*tokens.shape, self.num_layers))
         if routed_experts is None:
             if routed is not None:
                 raise ValueError("routed marks the tokens a routing record covers; pass routed_experts")
-            return None if embeddings is None else LayerInputs(embeddings=embeddings)
+            return None if embeddings is None and depth is None else LayerInputs(embeddings=embeddings,
+                                                                                 depth=depth)
         routed_experts = jnp.asarray(routed_experts)
         if routed_experts.ndim != 4 or routed_experts.shape[:3] != (*tokens.shape, self.num_layers):
             raise ValueError(
@@ -2044,7 +2006,7 @@ class CausalTransformer(nn.Module):
                 f"leading for this model; got {routed_experts.shape}")
         coverage = None if routed is None else jnp.broadcast_to(
             jnp.asarray(routed, bool)[:, :, None], routed_experts.shape[:3])
-        return LayerInputs(embeddings=embeddings, experts=routed_experts, routed=coverage)
+        return LayerInputs(embeddings=embeddings, experts=routed_experts, routed=coverage, depth=depth)
 
     def per_layer_inputs(self, tokens, inputs_embeds):
         """Return every layer's input signal `[B, S, L, P]` (Gemma 3n/4 PLE).
@@ -2249,6 +2211,11 @@ class CausalTransformer(nn.Module):
     def with_dex(self, extension: DifferentialExtension | None) -> Self:
         """This decoder with `extension`'s differential on its chosen heads (`dew.nn.dex`), None for none."""
         return self.clone(dex=extension)
+
+    @nn.nowrap
+    def with_scanned_layers(self) -> Self:
+        """This decoder running its like and periodic runs under the scan (`scan_layers`)."""
+        return self.clone(scan_layers=True)
 
     @nn.nowrap
     def reads_progress(self) -> bool:

@@ -354,8 +354,7 @@ print(json.dumps([path, stamp, tuning.settled(launches), len(lowerings)]))
 """
 
 
-@pytest.mark.gpu
-def test_only_an_explicit_pass_on_a_gpu_to_itself_measures_and_it_measures_each_launch_once(tmp_path):
+def only_an_explicit_pass_on_a_gpu_to_itself_measures_and_it_measures_each_launch_once(tmp_path):
     """A language model's step compiled by the Trainer measures nothing. An
     explicit pass (`tune(..., measure=True)`) on a GPU it has to itself
     measures each launch over every variant (`KernelOp.variants`), stores every time
@@ -399,8 +398,7 @@ class KernelBug(Exception):
     """A kernel's own failure, which no GPU limit explains."""
 
 
-@pytest.mark.gpu(reason="the tuner measures on CUDA")
-def test_a_config_failing_for_more_than_its_shared_memory_stops_the_measurement():
+def a_config_failing_for_more_than_its_shared_memory_stops_the_measurement():
     """A launch one of whose configs raises as it lowers, a kernel's bug and not its GPU's shared
     memory: measuring the launch propagates the error, where the tuner had counted it one more
     failed config and kept the others' fastest."""
@@ -425,8 +423,7 @@ def test_a_config_failing_for_more_than_its_shared_memory_stops_the_measurement(
         tuning._measured(broken.op, broken)
 
 
-@pytest.mark.gpu(reason="the tuner measures on CUDA")
-def test_a_launch_measured_beside_a_profile_capture_keeps_its_heuristic(tmp_path):
+def a_launch_measured_beside_a_profile_capture_keeps_its_heuristic(tmp_path):
     """A profile capture holds CUPTI, which takes one subscriber: measuring a launch beside it times
     no config, returns each as failed, so the launch keeps its heuristic, and leaves CUPTI to the
     capture without raising; once the capture ends, the same launch measures every config."""
