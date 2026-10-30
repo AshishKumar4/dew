@@ -122,6 +122,8 @@ class Mamba(nn.Module):
     time_step_rank: int = 48
     conv_kernel: int = 4
     use_bias: bool = False
+    """Whether its in and out projections add a bias: none by default, as Mamba's published `use_bias:
+    false`, where Flax's Dense adds one; its conv's is `use_conv_bias`, true as published."""
     use_conv_bias: bool = True
     chunk_size: int = CHUNK_SIZE
     init_std: float | None = None
@@ -277,6 +279,8 @@ class MambaMixer(MixerBase):
     time_step_rank: int = 48
     conv_kernel: int = 4
     use_bias: bool = False
+    """Whether its in and out projections add a bias: none by default, as Mamba's published `use_bias:
+    false`, where Flax's Dense adds one; its conv's is `use_conv_bias`, true as published."""
     use_conv_bias: bool = True
     chunk_size: int = CHUNK_SIZE
 

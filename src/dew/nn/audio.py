@@ -68,6 +68,9 @@ class Gemma3nAudio(TowerBase):
     sscp_conv_kernel_size: tuple[tuple[int, int], tuple[int, int]] = ((3, 3), (3, 3))
     sscp_conv_stride_size: tuple[tuple[int, int], tuple[int, int]] = ((2, 2), (2, 2))
     initializer_range: float = 0.02
+    """The normal std its projections draw from: the published audio configs' `initializer_range`
+    (Gemma 3n's and Gemma 4's, transformers' `Gemma3nAudioConfig`), which their training drew from,
+    in place of Flax's lecun normal."""
 
     def build(self) -> nn.Module:
         return Gemma3nAudioEncoder(self)
@@ -95,6 +98,8 @@ class Gemma4Audio(TowerBase):
     gradient_clipping: float = 1e10
     output_proj_dims: int = 1536
     initializer_range: float = 0.02
+    """The normal std its projections draw from: Gemma 4's published audio config's
+    `initializer_range`, as Gemma 3n's (`Gemma3nAudio.initializer_range`)."""
 
     def build(self) -> nn.Module:
         return Gemma4AudioEncoder(self)
@@ -200,6 +205,7 @@ class AudioSubsampleLayer(nn.Module):
     dtype: Dtype | None = None
     precision: PrecisionLike = None
     initializer_range: float = 0.02
+    """The normal std its projections draw from, its tower's (`Gemma3nAudio.initializer_range`)."""
 
     @nn.compact
     def __call__(self, x, mask):
@@ -418,6 +424,7 @@ class AudioLightConv(nn.Module):
     dtype: Dtype | None = None
     precision: PrecisionLike = None
     initializer_range: float = 0.02
+    """The normal std its projections draw from, its tower's (`Gemma3nAudio.initializer_range`)."""
 
     @nn.compact
     def __call__(self, x):

@@ -203,8 +203,9 @@ class CausalTransformer(nn.Module):
     MiMo-V2-Flash attends 192-wide queries and keys over 128-wide values."""
     mlp: GatedActivation = "swiglu"  # 'swiglu' | 'geglu' | 'geglu_exact' | 'swigluoai', or Kimi K3's Situ
     mlp_bias: bool = False
-    """Whether both feed-forward projections have a bias. The `mlp` activations gelu,
-    gelu_exact and relu give an ungated feed-forward."""
+    """Whether both feed-forward projections have a bias: none by default, as Llama's published
+    `mlp_bias: false`, where Flax's Dense adds one. The `mlp` activations gelu, gelu_exact and relu
+    give an ungated feed-forward."""
     mlp_features: int | tuple[int, ...] | None = None
     """The dense feed-forward width. None means four times `emb_features`, a
     tuple gives one width per layer (Gemma 3n), and 0 means no feed-forward
@@ -236,6 +237,7 @@ class CausalTransformer(nn.Module):
     layer_types: tuple[str, ...] | None = None  # the pattern, one kind per layer
     kinds: Mapping[str, LayerKind] | None = None  # what each named kind does
     norm_eps: float = 1e-5
+    """Llama 2's and 3's and Mistral's published `rms_norm_eps`, where Flax's RMSNorm takes 1e-6."""
     norm_type: Literal['rms', 'layer'] = 'rms'
     norm_bias: bool = False
     norms: Mapping[str, NormSpec] | None = None
@@ -271,7 +273,9 @@ class CausalTransformer(nn.Module):
     v_norm: bool = False                     # Gemma 4's scale-free values norm
     attention_k_eq_v: bool = False           # Gemma 4's global layers read their values off the keys
     layer_scalar: Literal["frozen", "trainable"] | None = None
-    attention_bias: bool = False             # q/k/v biases, and o_proj unless o_proj_bias says
+    attention_bias: bool = False
+    """q/k/v biases, and o_proj's unless `o_proj_bias` says: none by default, as Llama's published
+    `attention_bias: false`, where Flax's Dense adds one."""
     o_proj_bias: bool | None = None       # Qwen2 biases q/k/v while o_proj stays bias-free
     attention_scale: float | None = None  # None: head_dim ** -0.5
     value_scale: float | None = None
