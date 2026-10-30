@@ -58,7 +58,7 @@ def test_per_head_muonclip_clips_each_head_after_its_own_update():
         gamma = clip_scale(s_max, 100.0, guard=0.0)
         return {'layers_0': {'self_attn': {projection: {'kernel': clip_qk_kernel(
             params['layers_0']['self_attn'][projection]['kernel']
-            + updates['layers_0']['self_attn'][projection]['kernel'], gamma, 4)}
+            + at(updates, ('layers_0', 'self_attn', projection, 'kernel')), gamma, 4)}
             for projection in ('q_proj', 'k_proj')}}}
 
     assert_as_exact(applied, paper, lambda seed: qk_tree(seed=seed), "MuonClip per head", seeds=CLIP_SEEDS,
@@ -213,9 +213,9 @@ def test_normuon_normalizes_a_half_precision_update_in_float32():
     norm = scale_by_neuron_norm(0.95)
     zero = {"w": jnp.zeros((64, 32), jnp.float16)}
     updated, _ = norm.update(zero, norm.init(zero))
-    assert not np.any(np.asarray(updated["w"]))
+    assert not np.any(np.asarray(at(updated, ("w",))))
     large = {"w": jnp.full((512, 512), 100.0, jnp.float16)}
     updated, _ = norm.update(large, norm.init(large))
-    assert np.all(np.isfinite(np.asarray(updated["w"], np.float32)))
-    assert np.linalg.norm(np.asarray(updated["w"], np.float64)) == np.linalg.norm(
+    assert np.all(np.isfinite(np.asarray(at(updated, ("w",)), np.float32)))
+    assert np.linalg.norm(np.asarray(at(updated, ("w",)), np.float64)) == np.linalg.norm(
         np.asarray(large["w"], np.float64))
