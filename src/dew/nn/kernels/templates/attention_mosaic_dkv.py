@@ -20,6 +20,8 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _Spans,
     _streamed,
     _views_of,
+    described,
+    kernel_of,
     reducing,
     stated,
 )
@@ -295,7 +297,8 @@ def _keys_last(arrays, kinds) -> tuple[jax.Array, ...]:
     return tuple(jnp.swapaxes(array, -1, -2) if kind == Kind.TILE else array
                  for array, kind in zip(arrays, kinds, strict=True))
 
-def _dkv_kernel(walk: _Backward, entry, graded: list[Kind], query, key, value, dout, shares: tuple):
+def _dkv_kernel(walk: _Backward, entry, query, key, value, dout, shares: tuple, *, name: str,
+                kernel_name: str | None):
     """The dK/dV program `entry`'s launch (`Family.kernel`) over `query` `[B, Qp, H, D]` and `key` and
     `value` `[B, Kp, Hk, D]`: dK and dV `[B, Kp, H, D]` fp32 out, each its share's columns (`shares`), the
     hook's key and tile gradients added into refs of their own (`_dkv_launched`); a program a query head's
@@ -303,15 +306,13 @@ def _dkv_kernel(walk: _Backward, entry, graded: list[Kind], query, key, value, d
     batch, queries, heads, width = query.shape
     keys_padded, value_width = key.shape[1], value.shape[-1]
     family, consumers = walk.program.family, walk.consumers
-    del graded
     dk, dv = (jax.ShapeDtypeStruct((batch, keys_padded, heads, share), jnp.float32) for _, share in shares)
     return family.kernel(
         entry, out_type=(dk, dv),
         grid=(heads, keys_padded // (_holders(family, consumers) * walk.program.tiles.block_k), batch),
         grid_names=("heads", "k_tiles", "batch"), consumers=consumers, interpret=walk.interpret,
         approx_math=walk.approx_math,
-        name=("attention_dkv_fused" if walk.fused else "attention_dkv")
-        + ("" if shares[0][1] == width else f"_columns{shares[0][0] // shares[0][1]}"),
+        name=name, kernel_name=kernel_name,
         reducing_warpgroups=reducing(family, consumers, walk.spec.score_mod),
         # The model's products this launch owns (`stated`): its shares of dK's and dV's, dP's in the first
         # share's and dQ's where it adds it; its `S` (and a later share's dP) recomputed.
@@ -348,6 +349,28 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
     written keys first). A key or tile gradient is written by the one program that holds its keys; the
     tiles its walk does not read are zeros. Its dK and dV are its `shares` of their columns (`(first, count)`
     each); a later share's program writes no hook gradient."""
+    kinds, width = walk.kinds, query.shape[-1]
+    graded = [kind for kind in kinds if kind in DKV_GRADS] if _grading(shares) else []
+    # A tile parameter's entries keys first, as the program's tiles hold them (`_param`).
+    leaves, treedef = jax.tree.flatten((spans, _keys_last(score_params, kinds), drop,
+                                        None if walk.program.tiles.staged_logits else scaled))
+    name = (("attention_dkv_fused" if walk.fused else "attention_dkv")
+            + ("" if shares[0][1] == width else f"_columns{shares[0][0] // shares[0][1]}"))
+    launch = kernel_of(_dkv_built, name, walk, described((query, key, value, dout)), treedef, shares,
+                       tuple(graded), hooks=(walk.spec.score_mod,))
+    operands = (query, key, value, dout, peak, total, anchor, delta, key_index, *leaves)
+    graded_params = [param for param, kind in zip(score_params, kinds, strict=True) if kind in graded]
+    return _dkv_launched(walk, launch, operands, graded, [param.shape for param in graded_params],
+                         key.shape[1])
+
+
+def _dkv_built(walk: _Backward, operands: tuple, treedef, shares: tuple, grades: tuple[Kind, ...], *,
+               name: str, kernel_name: str | None):
+    """`_dkv_columns`' kernel for its static facts (`kernel_of`): the walk, its operands' shapes and dtypes,
+    the structure of the arrays its programs read beside them, its shares of the columns and the hook
+    gradients it writes (`grades`)."""
+    query, key, value, dout = operands
+    graded = list(grades)
     _, queries, heads, width = query.shape
     kv_heads, value_width = key.shape[2], value.shape[-1]
     program, consumers, kinds = walk.program, walk.consumers, walk.kinds
@@ -358,17 +381,13 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
     pair, count = (block_k, block_q // consumers) if split else (consumers * block_k, block_q)
     q_steps = queries // block_q
     stages = min(program.tiles.stages, q_steps)
-    graded = [kind for kind in kinds if kind in DKV_GRADS] if _grading(shares) else []
-    # A tile parameter's entries keys first, as the program's tiles hold them (`_param`).
-    staged_logits = program.tiles.staged_logits
-    leaves, treedef = jax.tree.flatten((spans, _keys_last(score_params, kinds), drop,
-                                        None if staged_logits else scaled))
 
     tiled = Kind.TILE in graded
 
     def body(*refs, streams):
         inputs, unflattened, outputs, held, (key_refs, tile_refs) = _dkv_refs(
-            refs, treedef, len(leaves), graded, widths=value_width == width, split=split, fused=walk.fused)
+            refs, treedef, treedef.num_leaves, graded, widths=value_width == width, split=split,
+            fused=walk.fused)
         (spans_of, score_refs, drop_of, l_ref), (dq_ref, dk_ref, dv_ref) = unflattened, outputs
         q_ref, k_ref, v_ref, do_ref, *stat_refs = inputs
         k_smem, v_smem, out_smem, dv_smem, rows_smem, k_loaded, v_loaded, *rest = held
@@ -441,17 +460,13 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
     def entry(*refs):
         summed = family.scoped(functools.partial(body, *refs), *scoped, streams=rings)
         if summed is not None:
-            first = 9 + len(leaves) + walk.fused
+            first = 9 + treedef.num_leaves + walk.fused
             grads = refs[first:first + len(graded)]
             outputs = refs[first + len(graded):first + len(graded) + 2]
             _summed_stored(family, summed, _shared_views(outputs, grads, graded, block_k), consumers,
                            walk.interpret)
 
-    launch = _dkv_kernel(walk, entry, graded, query, key, value, dout, shares)
-    operands = (query, key, value, dout, peak, total, anchor, delta, key_index, *leaves)
-    graded_params = [param for param, kind in zip(score_params, kinds, strict=True) if kind in graded]
-    return _dkv_launched(walk, launch, operands, graded, [param.shape for param in graded_params],
-                         key.shape[1])
+    return _dkv_kernel(walk, entry, query, key, value, dout, shares, name=name, kernel_name=kernel_name)
 
 def _dkv_launched(walk: _Backward, launch, operands: tuple, graded: list[Kind], shapes: list,
                   keys_padded: int) -> tuple[jax.Array, ...]:

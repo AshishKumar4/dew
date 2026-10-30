@@ -1019,7 +1019,7 @@ def test_a_folded_forward_whose_products_pass_fp32_below_zero_rewalks_natural_in
 
 @INTERPRETS
 def test_a_forward_kernel_built_for_its_facts_runs_each_calls_own_interpreted():
-    """The forward's kernel is built once for every call of its static facts (`_kernel_of`, row 2440): calls
+    """The forward's kernel is built once for every call of its static facts (`kernel_of`, row 2440): calls
     alike but for their scale, past their queries' one power of two (0.2 and 0.24, both 2^-3 times a scale
     left of 1.6 and 1.92), each run their own though their kernels' names agree (launched outside an
     op's report, which names them by its launch, `report.named`), each on par (check 1) with the reference's
@@ -1044,10 +1044,10 @@ def test_a_forward_kernel_built_for_its_facts_runs_each_calls_own_interpreted():
 
 @INTERPRETS
 def test_a_forward_kernel_built_for_its_facts_holds_no_calls_arrays_interpreted():
-    """The forward's kernel, built once for every call of its static facts (`_kernel_of`, row 2440), holds
+    """The forward's kernel, built once for every call of its static facts (`kernel_of`, row 2440), holds
     none of a call's arrays, its operands' nor its hooks' (an initial state's sums, which its key describes
-    by shape and dtype, `_described`): each is released once the call is. (A hook closing over an array is
-    built for its call alone, `_holdable`: JAX's own trace caches hold such a closure as they did before.)"""
+    by shape and dtype, `described`): each is released once the call is. (A hook closing over an array is
+    built for its call alone, `holdable`: JAX's own trace caches hold such a closure as they did before.)"""
     shape = SHAPES["interpreted"]
     spans = template.spans(shape[1], shape[1], shape[0], causal=True)
     query, key, value, _ = _drawn(shape, jnp.bfloat16)(0)

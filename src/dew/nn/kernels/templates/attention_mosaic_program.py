@@ -6,6 +6,7 @@ and each tile's coordinates (`_Program`, `_Spans`, `_coords`), its hooks' parame
 
 import dataclasses
 import functools
+import inspect
 import math
 from collections.abc import Callable
 from typing import NamedTuple
@@ -18,7 +19,14 @@ from jax.experimental import pallas as pl
 
 from dew.nn.kernels import generation
 from dew.nn.kernels.selection import Refusal
-from dew.nn.kernels.templates import attention_algebra as algebra, bundles, layout, mosaic, mosaic_sm90
+from dew.nn.kernels.templates import (
+    attention_algebra as algebra,
+    bundles,
+    layout,
+    mosaic,
+    mosaic_sm90,
+    report,
+)
 from dew.nn.kernels.templates.attention import (
     Draw,
     Dropout,
@@ -700,3 +708,46 @@ def _views_of(refs: dict, row, head) -> dict:
     """The streams' views by name (`Family.opened`, `Family.stream`, `mosaic.viewed`): each `[B, S, H, D]`
     operand's `[S, D]` at batch row `row` and head `head`, step `j` its `j`-th block of rows."""
     return {name: (ref.at[row, :, head], lambda j: (j, 0)) for name, ref in refs.items()}
+
+
+def kernel_of(build: Callable[..., Callable], name: str, *facts, hooks: tuple = ()) -> Callable:
+    """A launch's kernel, `build(*facts, name=, kernel_name=)`, built once for every call of its static
+    `facts` (hashable and holding no array: its operands' and hooks' shapes and dtypes, `described`; its
+    treedefs, form and tiles), the target they are derived for and its name as the launch tracing it
+    resolves it (`report.named`): a model's layers alike lower one kernel (row 2440). A launch whose hook
+    functions (`hooks`) may hold an array (`holdable`) builds its kernel for its call alone. A bound of
+    256 kernels keeps a process's memory bounded (the hook programs' own cache's, `hook_program`)."""
+    key = (build, name, report.named(name), generation.gpu_target(), facts)
+    return (_kernel if all(map(holdable, hooks)) else _kernel.__wrapped__)(key)
+
+
+@functools.lru_cache(maxsize=256)
+def _kernel(key: tuple) -> Callable:
+    build, name, kernel_name, _, facts = key
+    return build(*facts, name=name, kernel_name=kernel_name)
+
+
+def described(tree):
+    """`tree` with each array's shape and dtype in its place (`jax.ShapeDtypeStruct`): what a kernel built
+    for many calls reads of it, no array held (`kernel_of`)."""
+    return jax.tree.map(lambda array: jax.ShapeDtypeStruct(jnp.shape(array), jnp.result_type(array)), tree)
+
+
+def holdable(hook: Callable | None) -> bool:
+    """Whether the kernel cache may hold `hook` (`kernel_of`) without holding an array through it: none, a
+    function of no closure, or a partial of one over values of no array (a softcap's `functools.partial`
+    of `capped`). A closure or a bound method may reach an array a call made (a hook reading an operand's
+    shape), which a cached kernel would keep alive: its launches build their kernel each call."""
+    if hook is None:
+        return True
+    if isinstance(hook, functools.partial):
+        return holdable(hook.func) and all(map(_scalar, (*hook.args, *hook.keywords.values())))
+    return (inspect.isfunction(hook) and hook.__closure__ is None
+            and all(map(_scalar, hook.__defaults__ or ())))
+
+
+def _scalar(value) -> bool:
+    """Whether `value` is a Python scalar, a string or None, or a tuple of them: a value of no array."""
+    if isinstance(value, tuple):
+        return all(map(_scalar, value))
+    return value is None or isinstance(value, (bool, int, float, complex, str))

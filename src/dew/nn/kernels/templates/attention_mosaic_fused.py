@@ -18,6 +18,8 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _Spans,
     _streamed,
     _views_of,
+    described,
+    kernel_of,
     stated,
 )
 from dew.nn.kernels.templates.attention_mosaic_scores import _Backward, _dq_added, _tile_scores
@@ -79,17 +81,41 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
     `[B, Kp, KV, D]`, fp32."""
     batch, queries, heads, width = query.shape
     keys_padded, kv_heads = key.shape[1], key.shape[2]
+    leaves, treedef = jax.tree.flatten(spans)
+    operands = described((query, key, value, dout))
+    launch = kernel_of(_fused_kernel, "attention_dkv_fused", walk, operands, treedef,
+                       hooks=(walk.spec.score_mod,))
+    gradient = jax.ShapeDtypeStruct((batch, keys_padded, kv_heads, width), jnp.float32)
+    grouped = heads != kv_heads
+    # dQ added into zeros in place, and grouped dK and dV: one copy, or dQ each consumer's own interpreted
+    # (`Family.added`), a consumer's keys its own.
+    copies = walk.consumers if walk.interpret else 1
+    dq = jax.new_ref(jnp.zeros((copies, batch, queries, heads, width), jnp.float32))
+    operands = (query, key, value, dout, peak, total, anchor, delta, key_index, *leaves, dq)
+    if not grouped:
+        dk, dv = launch(*operands)
+        return jax.freeze(dq).sum(axis=0), dk, dv
+    dk, dv = (jax.new_ref(jnp.zeros(gradient.shape, jnp.float32)) for _ in range(2))
+    launch(*operands, dk, dv)
+    return jax.freeze(dq).sum(axis=0), jax.freeze(dk), jax.freeze(dv)
+
+
+def _fused_kernel(walk: _Backward, operands: tuple, treedef, *, name: str, kernel_name: str | None):
+    """`_fused_launch`'s kernel for its static facts (`kernel_of`): the walk, its operands' shapes and dtypes
+    and the structure of its spans' arrays."""
+    query, key, value, dout = operands
+    batch, queries, heads, width = query.shape
+    keys_padded, kv_heads = key.shape[1], key.shape[2]
     program, consumers = walk.program, walk.consumers
     family = program.family
     block_q, block_k = program.tiles.block_q, program.tiles.block_k
     pair = consumers * block_k
     q_steps = queries // block_q
     grouped = heads != kv_heads
-    leaves, treedef = jax.tree.flatten(spans)
 
     def body(*refs, streams):
         (q_ref, k_ref, v_ref, do_ref, *stat_refs), refs = refs[:9], refs[9:]
-        spans_of, refs = treedef.unflatten(refs[:len(leaves)]), refs[len(leaves):]
+        spans_of, refs = treedef.unflatten(refs[:treedef.num_leaves]), refs[treedef.num_leaves:]
         dq_ref, dk_ref, dv_ref, k_smem, v_smem, staged, out_smem, k_loaded, v_loaded = refs
         row, head = lax.axis_index("batch"), lax.axis_index("heads")
         key_head = lax.div(head, heads // kv_heads)
@@ -145,21 +171,10 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
         family.scoped(functools.partial(body, *refs), *scoped, streams=rings)
 
     gradient = jax.ShapeDtypeStruct((batch, keys_padded, kv_heads, width), jnp.float32)
-    launch = family.kernel(
+    return family.kernel(
         entry, out_type=() if grouped else (gradient, gradient), grid=(heads, keys_padded // pair, batch),
         grid_names=("heads", "k_tiles", "batch"), consumers=consumers, interpret=walk.interpret,
-        approx_math=walk.approx_math, name="attention_dkv_fused",
+        approx_math=walk.approx_math, name=name, kernel_name=kernel_name,
         # The model's products this launch owns (`stated`): dQ's, dK's, dV's and dP's; its `S` recomputed.
         cost=stated(walk.spec, batch, heads, walk.spec.queries or queries, 4 * width, query, key, value,
                     dout))
-    # dQ added into zeros in place, and grouped dK and dV: one copy, or dQ each consumer's own interpreted
-    # (`Family.added`), a consumer's keys its own.
-    copies = consumers if walk.interpret else 1
-    dq = jax.new_ref(jnp.zeros((copies, batch, queries, heads, width), jnp.float32))
-    operands = (query, key, value, dout, peak, total, anchor, delta, key_index, *leaves, dq)
-    if not grouped:
-        dk, dv = launch(*operands)
-        return jax.freeze(dq).sum(axis=0), dk, dv
-    dk, dv = (jax.new_ref(jnp.zeros(gradient.shape, jnp.float32)) for _ in range(2))
-    launch(*operands, dk, dv)
-    return jax.freeze(dq).sum(axis=0), jax.freeze(dk), jax.freeze(dv)

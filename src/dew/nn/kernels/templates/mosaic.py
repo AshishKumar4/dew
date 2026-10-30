@@ -21,6 +21,7 @@ import dataclasses
 import functools
 import math
 from collections.abc import Callable
+from typing import Any
 
 import jax
 from jax import lax, numpy as jnp
@@ -238,7 +239,7 @@ def loaded(copies, issued: jax.Array | bool = True) -> None:
         plgpu.barrier_wait(barrier)
 
 
-def chunked(value: jax.Array, view, smem) -> list[tuple[jax.Array, object]]:
+def chunked(value: jax.Array, view, smem) -> list[tuple[jax.Array, Any]]:
     """`value` and its `view` a chunk of `smem`'s columns at a time, the whole where `smem` holds every one:
     a stage narrower than the tile it moves (CUTLASS's sub-tiled epilogue, `staged_columns`)."""
     width = smem.shape[-1]

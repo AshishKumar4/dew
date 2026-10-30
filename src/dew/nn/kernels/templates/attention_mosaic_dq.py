@@ -16,6 +16,8 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _coords,
     _rows,
     _Spans,
+    described,
+    kernel_of,
     reducing,
     stated,
 )
@@ -124,6 +126,21 @@ def _dq_columns(query, key, value, dout, peak, prior, anchor, delta, key_index, 
     `dq_finish` takes past the launch. Each query block of a pair is a consumer's, the key and value tiles
     streamed through a ring each. Its sums are its `share` of their columns (`(first, count)`). Returns dQ,
     the keyed sums (None in the fast form) and the rows."""
+    width = query.shape[-1]
+    leaves, treedef = jax.tree.flatten((spans, score_params, drop))
+    name = "attention_dq" + ("" if share[1] == width else f"_columns{share[0] // share[1]}")
+    out = kernel_of(_dq_kernel, name, walk, described((query, key, value, dout)), treedef, share,
+                    hooks=(walk.spec.score_mod,))(query, key, value, dout, peak, prior, anchor, delta,
+                                                   key_index, *leaves)
+    dq, keyed, rows = out if walk.accurate else (out[0], None, out[1])
+    return dq, keyed, rows
+
+
+def _dq_kernel(walk: _Backward, operands: tuple, treedef, share: tuple[int, int], *, name: str,
+               kernel_name: str | None):
+    """`_dq_columns`' kernel for its static facts (`kernel_of`): the walk, its operands' shapes and dtypes,
+    the structure of its spans', score parameters' and dropout's arrays, and its share of the columns."""
+    query, key, value, dout = operands
     batch, queries, heads, width = query.shape
     kv_heads, value_width = key.shape[2], value.shape[-1]
     program, consumers, kinds = walk.program, walk.consumers, walk.kinds
@@ -132,12 +149,12 @@ def _dq_columns(query, key, value, dout, peak, prior, anchor, delta, key_index, 
     pair = consumers * block_q
     summed = walk.summed
     rows_count = 4 + 2 * sum(summed)
-    leaves, treedef = jax.tree.flatten((spans, score_params, drop))
 
     def body(*refs, streams):
         (q_ref, k_ref, v_ref, do_ref, peak_ref, prior_ref, anchor_ref, delta_ref, index_ref), refs = (
             refs[:9], refs[9:])
-        (spans_of, score_refs, drop_of), refs = treedef.unflatten(refs[:len(leaves)]), refs[len(leaves):]
+        read, refs = refs[:treedef.num_leaves], refs[treedef.num_leaves:]
+        spans_of, score_refs, drop_of = treedef.unflatten(read)
         dq_ref, refs = refs[0], refs[1:]
         keyed_ref, refs = (refs[0], refs[1:]) if walk.accurate else (None, refs)
         rows_ref, (q_smem, do_smem, out_smem, row_smem, q_loaded, do_loaded) = refs[0], refs[1:]
@@ -195,15 +212,12 @@ def _dq_columns(query, key, value, dout, peak, prior, anchor, delta, key_index, 
 
     sums = jax.ShapeDtypeStruct((batch, queries, heads, share[1]), jnp.float32)
     stats_shape = jax.ShapeDtypeStruct((rows_count, batch, heads, queries), jnp.float32)
-    out = family.kernel(
+    return family.kernel(
         entry, out_type=(sums, sums, stats_shape) if walk.accurate else (sums, stats_shape),
         grid=(heads, queries // pair, batch), grid_names=("heads", "q_tiles", "batch"), consumers=consumers,
         interpret=walk.interpret, approx_math=walk.approx_math,
-        name="attention_dq" + ("" if share[1] == width else f"_columns{share[0] // share[1]}"),
+        name=name, kernel_name=kernel_name,
         reducing_warpgroups=reducing(family, consumers, walk.spec.score_mod),
         # Its share of dQ's product, the model's this launch owns (`stated`): its `S` and `dP` recomputed.
         cost=stated(walk.spec, batch, heads, walk.spec.queries or queries, share[1], query, key, value,
-                    dout))(
-            query, key, value, dout, peak, prior, anchor, delta, key_index, *leaves)
-    dq, keyed, rows = out if walk.accurate else (out[0], None, out[1])
-    return dq, keyed, rows
+                    dout))
