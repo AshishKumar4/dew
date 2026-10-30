@@ -400,16 +400,16 @@ def hybrid(periods: int, **overrides):
 
 
 def decoded(model, variables, ids):
-    """A prefill of one token and single-token steps through the cache: the steps' logits, and the
-    cache's paths."""
+    """Single-token steps through the cache one token's call allocates, one program a step under a
+    scan: the steps' logits, and the cache's paths."""
+    def step(cache, column):
+        logits, state = model.apply({**variables, "cache": cache}, column[:, None], decode=True,
+                                    mutable=["cache"])
+        return state["cache"], logits[:, 0]
+
     cache = model.init(jax.random.key(0), ids[:, :1], decode=True)["cache"]
-    steps = []
-    for position in range(ids.shape[1]):
-        step, state = model.apply({**variables, "cache": cache}, ids[:, position:position + 1],
-                                  decode=True, mutable=["cache"])
-        cache = state["cache"]
-        steps.append(step)
-    return jnp.concatenate(steps, axis=1), paths(cache)
+    cache, steps = jax.lax.scan(step, cache, jnp.moveaxis(jnp.asarray(ids), 1, 0))
+    return jnp.moveaxis(steps, 0, 1), paths(cache)
 
 
 def test_a_decode_step_scans_a_periodic_stack_as_one_body_and_decodes_as_the_loop():
@@ -440,15 +440,15 @@ def test_a_decode_step_scans_a_periodic_stack_as_one_body_and_decodes_as_the_loo
     def draw(seed):
         return (np.random.default_rng([0x9E, seed]).integers(0, VOCAB, (2, 10)).astype(np.int32),)
 
-    def steps(model, ids):
-        return np.asarray(decoded(model, variables, jnp.asarray(ids))[0], np.float64)
-
     def truth(ids):
         with jax.enable_x64(new_val=True):
-            return np.asarray(decoded(hybrid(6, dtype=jnp.float64), widened(variables), jnp.asarray(ids))[0])
+            return np.asarray(decoded(hybrid(6, dtype=jnp.float64), widened(variables), ids)[0])
 
-    assert_as_exact(lambda ids: steps(deep, ids), lambda ids: steps(plain, ids), draw,
-                    "periodic decode steps", seeds=PERIODIC_SEEDS, truth_fn=truth)
+    def steps(model):
+        return lambda ids: decoded(model, variables, ids)[0]
+
+    assert_as_exact(steps(deep), steps(plain), draw, "periodic decode steps", seeds=PERIODIC_SEEDS,
+                    truth_fn=truth)
 
 
 def bf16(**overrides):
