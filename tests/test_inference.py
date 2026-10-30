@@ -472,6 +472,31 @@ def test_an_earlier_yarn_record_reloads_its_saved_decoder(tmp_path):
                                   model.apply(inference_projections(model, state.variables), tokens))
 
 
+def test_an_earlier_mova_record_reloads_its_saved_decoder(tmp_path):
+    """A MoVA run saved when its value experts recorded the layer dispatch they ran under, at its
+    defaults, reloads (ledger 2751): the experts read their layer's routed MLP today, and the restored
+    task computes, bit for bit, what the trained model does over its weights packed as a task packs
+    them (`inference_projections`)."""
+    from dew.interop import Pretrained
+    from dew.objectives.lm import LMObjective
+
+    mova = Path(__file__).parent / "fixtures" / "hf" / "k2-horizon-mova-tiny"
+    model = Pretrained.load(mova, weights=False, dtype="float32", attention_impl="reference").model
+    objective = LMObjective(model, 4, ema_decay=None)
+    state = Trainer(objective, optax.sgd(0.01), key=3).initial_state()
+    record = objective.inference_record()
+    values = record["model"]["fields"]["value_experts"]
+    held = values["fields"] if "class" in values else values
+    held.update(implementation="auto", dispatch="global", capacity_factor=None)
+    with Checkpoints(str(tmp_path), keep=1) as checkpoints:
+        checkpoints.save(0, state, artifact=record)
+        checkpoints.wait()
+    restored = TextGeneration.from_run(str(tmp_path), step=0)
+    tokens = jnp.asarray(np.load(mova / "input_ids.npy"))
+    np.testing.assert_array_equal(restored.model.apply(restored.variables, tokens),
+                                  model.apply(inference_projections(model, state.variables), tokens))
+
+
 @pytest.mark.parametrize("scaled", [False, True], ids=["unscaled", "yarn"])
 def test_an_earlier_multimodal_record_reloads_its_saved_decoder(tmp_path, scaled):
     """A multimodal run saved when its nested decoder, which the wrapper records as its fields alone

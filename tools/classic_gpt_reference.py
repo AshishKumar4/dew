@@ -45,15 +45,16 @@ def check_checkpoint(checkpoint, output, revision):
     """`checkpoint`'s fp32 logits and greedy continuation at its pinned `revision` through the loader
     against transformers'. The reference runs on the CPU whatever JAX's platform, so a CPU-only Torch
     build supplies it beside a GPU and no TF32 enters it."""
+    # The tests import this module as tools.classic_gpt_reference, where reference_source is not on the
+    # path; the check runs as a script beside it.
+    from reference_source import torch_generated, torch_logits
+
     config = AutoConfig.from_pretrained(checkpoint, revision=revision)
     reference = AutoModelForCausalLM.from_pretrained(checkpoint, dtype=torch.float32,
                                                     attn_implementation='eager', revision=revision).eval()
     tokenizer = AutoTokenizer.from_pretrained(checkpoint, revision=revision)
     ids = tokenizer('The capital of France is', return_tensors='np')['input_ids'].astype(np.int32)
-    with torch.no_grad():
-        expected = reference(torch.from_numpy(ids).long(), use_cache=False).logits.numpy()
-        generated = reference.generate(torch.from_numpy(ids).long(), do_sample=False, max_new_tokens=6,
-                                       eos_token_id=None, pad_token_id=0).numpy()
+    expected, generated = torch_logits(reference, ids), torch_generated(reference, ids, 6)
     del reference
     loaded = Pretrained.load(checkpoint, dtype='float32', attention_impl='reference', max_seq_len=64,
                              revision=revision)
