@@ -707,6 +707,26 @@ def test_a_resume_refuses_a_limit_grown_before_a_repeat(tmp_path):
         fit(10, 4)
 
 
+def test_a_resume_refuses_a_mixed_corpus_limit_grown_beneath_the_mixtures_repeat(tmp_path):
+    """A mixed corpus's limit, grown on resume, holds records its mixture's own shuffle and repeat read
+    after it (`mix([member.take(5)]).shuffle(window=2).take(100).repeat()`), so the resume is refused: only
+    the run's own chain's bound grows (row 2649)."""
+    from dew.data.pipeline import mix
+
+    (x,) = clocked_records(0)
+
+    def fit(count: int, steps: int):
+        member = Pipeline(Memory({"x": x})).take(count)
+        chain = mix([member]).read("streamed").shuffle(window=2).take(100).repeat().batch(BATCH)
+        trainer = Trainer(Pulled(), OptimConfig(learning_rate=PEAK), key=0,
+                          checkpoints=Checkpoints(str(tmp_path)))
+        return trainer.fit(chain, steps=steps, log_every=1)
+
+    fit(5, 2)
+    with pytest.raises(ValueError):
+        fit(10, 4)
+
+
 def test_a_paused_run_resumed_trains_on_as_one_that_never_paused(tmp_path):
     """A run paused halfway through its budget and resumed without the pause lands where the whole
     run does, step for step and in its weight (check 1): the budget, not the pause, sized its
