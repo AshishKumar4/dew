@@ -17,12 +17,14 @@ Each option a saved task is built with (its objective's `settings`) is derived f
 through `dew train` to the task the run saves (row 2285, which would have caught row 1061's blockwise
 walk, an option with no public path)."""
 
+import contextlib
 import csv
 import dataclasses
 import inspect
 import json
 import types
 import typing
+from collections.abc import Iterator
 from pathlib import Path
 
 import jax
@@ -350,10 +352,11 @@ def members_built(member: type) -> list[object]:
 
 def alternatives(annotation, base=None) -> list[object]:
     """The values `annotation` declares as alternatives, in its order: a literal's values, a flag's two, an
-    optional's None and its member's, Dew's classes that are one (`members_of`), and a dataclass's
-    instances: `base`, the value a run saved, with one of its fields changed to each of that field's
-    alternatives, or, with no base, built over its fields' alternatives. A plain number or text declares
-    none, nor a record (a union holding a mapping or a list), whose values are its writer's."""
+    optional's None and its member's (an optional number's beside the saved one), Dew's classes that are
+    one (`members_of`), and a dataclass's instances: `base`, the value a run saved, with one of its fields
+    changed to each of that field's alternatives, or, with no base, built over its fields' alternatives. A
+    plain number or text declares none, nor a record (a union holding a mapping or a list), whose values
+    are its writer's."""
     if isinstance(annotation, typing.TypeAliasType):
         return alternatives(annotation.__value__, base)
     origin = typing.get_origin(annotation)
@@ -370,10 +373,11 @@ def alternatives(annotation, base=None) -> list[object]:
         found = []
         for member in members:
             # A count's witnesses: one, and one past the saved count, which a budget that one would cut
-            # to nothing takes (a layout's option tokens).
+            # to nothing takes (a layout's option tokens); a number's, a half and twice the saved one.
             counts = [1, *([base + 1] if type(base) is int else [])]
+            numbers = [0.5, *([base * 2] if type(base) is float else [])]
             values = ([None] if member is type(None) else counts if member is int
-                      else alternatives(member, base))
+                      else numbers if member is float else alternatives(member, base))
             if dataclasses.is_dataclass(member) and not isinstance(base, member):
                 values = [*members_built(member), *values]
             found += [value for value in values if value not in found]
@@ -598,9 +602,10 @@ SETTINGS = sorted({cls.settings for cls in (objectives[name] for name in objecti
                   key=lambda settings: settings.__name__)
 
 
-def held(task, depth: int = 3) -> dict[str, object]:
-    """What the loaded `task` holds, by path: its attributes, and theirs where they are Dew's objects or
-    dataclasses (its model's fields), `depth` deep."""
+def held_by(task, depth: int = 3) -> dict[str, tuple[object, str]]:
+    """Where the loaded `task` holds each of its values, by path: the object and its attribute's name, for
+    its attributes, and theirs where they are Dew's objects or dataclasses (its model's fields), `depth`
+    deep."""
     found, frontier = {}, [("", task)]
     for _ in range(depth):
         following = []
@@ -609,16 +614,56 @@ def held(task, depth: int = 3) -> dict[str, object]:
                      else list(vars(value)) if type(value).__module__.startswith("dew.") else [])
             for name in names:
                 inner = getattr(value, name, None)
-                found[prefix + name] = inner
+                found[prefix + name] = (value, name)
                 if dataclasses.is_dataclass(inner) or type(inner).__module__.startswith("dew."):
                     following.append((f"{prefix}{name}.", inner))
         frontier = following
     return found
 
 
+def held(task) -> dict[str, object]:
+    """What the loaded `task` holds, by path (`held_by`)."""
+    return {path: getattr(holder, name, None) for path, (holder, name) in held_by(task).items()}
+
+
+def requested(task) -> None:
+    """One request of a loaded task, as its kind's users make it, at the task's own defaults but a
+    generation's budget of two tokens, which a run that previews nothing records as none."""
+    from dew.decision import Choice
+    from dew.decision.task import Decide
+    from dew.inference.images import TextToImage
+    from dew.inference.tasks import MaskedGeneration, TextGeneration
+
+    if isinstance(task, TextGeneration | MaskedGeneration):
+        task("ab", max_new_tokens=2, key=0)
+    elif isinstance(task, Decide):
+        question = {"team": Choice("which team", ["billing", "technical", "sales"])}
+        task([({"text": "the site is down"}, question)])
+    elif isinstance(task, TextToImage):
+        task(["a cat"], key=0)
+    else:
+        raise AssertionError(f"no request is written for a loaded {type(task).__name__}")
+
+
+@contextlib.contextmanager
+def reading(holders: dict[type, set[str]]) -> Iterator[list[tuple[str, object]]]:
+    """Within the block, each read of an attribute `holders` names on an object of its class, and the value
+    read: what a request reads where its task holds an option, a copy's too."""
+    reads: list[tuple[str, object]] = []
+    with pytest.MonkeyPatch.context() as patch:
+        for kind, names in holders.items():
+            def spy(self, attribute, original=kind.__getattribute__, names=frozenset(names)):
+                found = original(self, attribute)
+                if attribute in names:
+                    reads.append((attribute, found))
+                return found
+            patch.setattr(kind, "__getattribute__", spy)
+        yield reads
+
+
 def saved_with(run: RunConfig, root: Path, name: str, settings: type, assigned: dict[str, str]):
     """The `settings` the task of `run` saves after one step of `dew train` with each `path=value` of
-    `assigned` set, and what the task loaded from them holds (`dew.pipeline`, `held`)."""
+    `assigned` set, and the task loaded from them (`dew.pipeline`)."""
     import dew
     from dew.inference.tasks import SavedRun, saved_settings
 
@@ -629,8 +674,7 @@ def saved_with(run: RunConfig, root: Path, name: str, settings: type, assigned: 
              "trainer.multi_host": "False", "trainer.compilation_cache_dir": "None", **assigned}
     assert main(["train", str(record / "run.json"),
                  *(part for path, value in given.items() for part in ("--set", f"{path}={value}"))]) == 0
-    return (saved_settings(SavedRun.pinned(str(runs / name)).record, settings),
-            held(dew.pipeline(str(runs / name))))
+    return saved_settings(SavedRun.pinned(str(runs / name)).record, settings), dew.pipeline(str(runs / name))
 
 
 def same(first, second) -> bool:
@@ -642,12 +686,6 @@ def same(first, second) -> bool:
         return registry.to_record(first, type(first)) == registry.to_record(second, type(second))
     except (TypeError, ValueError):
         return bool(first == second)
-
-
-def consumed(before: dict[str, object], after: dict[str, object], value) -> bool:
-    """Whether a task holds `value` where the task before it held another (`held`): the option reached
-    what the task reads, not its record alone."""
-    return any(same(inner, value) and not same(before.get(path), inner) for path, inner in after.items())
 
 
 def accepted(saved, name: str, value) -> bool:
@@ -663,18 +701,18 @@ def reached_by(run: RunConfig, root: Path, settings: type, flags, queued: dict[s
     """Each option of `queued` set alone through `dew train` (`flags` writes its `--set`s), so what its
     task holds differs from the run that sets none by it alone: at its first alternative, or its next where
     a reader refuses one or the saved settings do not hold it (`holds`: a run's None that keeps the
-    layout's own). The settings each saves, what its task holds and the value it was set to, for each
-    that trains so, and why each other alternative did not."""
+    layout's own). The task each loads and the value it was set to, for each that trains so, and why
+    each other alternative did not."""
     reached, refused = {}, {}
     for name, values in queued.items():
         for index, value in enumerate(values):
             try:
-                saved, after = saved_with(run, root, f"{name}{index}", settings, flags({name: value}))
+                saved, task = saved_with(run, root, f"{name}{index}", settings, flags({name: value}))
             except ValueError as error:  # A reader refused it, which names what refused it: the next.
                 refused.setdefault(name, []).append(f"{value!r}: {error}")
                 continue
             if holds(saved, name, value):
-                reached[name] = (saved, after, value)
+                reached[name] = (task, value)
                 break
             refused.setdefault(name, []).append(f"{value!r}: saved {held_at(saved, name)!r}")
     return reached, refused
@@ -688,7 +726,8 @@ def test_each_option_a_saved_task_is_built_with_reaches_it_from_the_command_line
     dataclass with one field changed) reaches the task `dew train` saves from its path (`reach`): beside
     a run that sets none, a run sets each alone to an alternative its settings accept other than the one
     saved (the next where a run refuses it, `reached_by`), and the task saves it and, loaded, holds it
-    where the first held another (`consumed`). An option with no path is row 1061's blockwise walk,
+    where the first held another, and a request of it reads it there (`reading`), a consumer's own read,
+    not its record's. An option with no path is row 1061's blockwise walk,
     unless its settings declare it derived from the run (`metadata={"derived": ...}`): from its data,
     which the run fills, or a value the run builds of fields of its own (a decision run's layout), whose
     fields are its options (`options_of`). A field of Dew's types that declares fewer than two
@@ -697,7 +736,8 @@ def test_each_option_a_saved_task_is_built_with_reaches_it_from_the_command_line
     assert settings.__name__ in TASK_RUNS, f"no run here trains an objective whose task reads {settings}"
     builder, objective = TASK_RUNS[settings.__name__]
     run = builder(tmp_path, drawn=False)
-    base, before = saved_with(run, tmp_path, "unset", settings, {})
+    base, unset = saved_with(run, tmp_path, "unset", settings, {})
+    before = held(unset)
     options = {option.name: option for option in options_of(run, objective, settings, base)}
     for option in (option for option in options.values() if option.found is None):
         assert "derived" in option.field.metadata, f"{settings.__name__}.{option.name} has no path"
@@ -723,6 +763,17 @@ def test_each_option_a_saved_task_is_built_with_reaches_it_from_the_command_line
         held_at(saved, name), reachable[name].made(value)))
     for name in queued:
         assert name in reached, f"no alternative of {settings.__name__}.{name} trains: {refused.get(name)}"
-        _, after, value = reached[name]
+        task, value = reached[name]
         option = reachable[name].made(value)
-        assert consumed(before, after, option), f"the task loaded holds no {settings.__name__}.{name} set"
+        after = held_by(task)
+        # Where the loaded task holds the option it held another before, a request reads it there.
+        places = [after[path] for path, inner in held(task).items()
+                  if same(inner, option) and not same(before.get(path), inner)]
+        assert places, f"the task loaded holds no {settings.__name__}.{name} set"
+        holders: dict[type, set[str]] = {}
+        for holder, attribute in places:
+            holders.setdefault(type(holder), set()).add(attribute)
+        with reading(holders) as reads:
+            requested(task)
+        assert any(same(found, option) for _, found in reads), \
+            f"a request of the loaded task reads no {settings.__name__}.{name} it holds"
