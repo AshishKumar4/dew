@@ -46,7 +46,7 @@ from dew.data.pipeline import Rejected
 from dew.data.sources.tokens import TokenFiles
 from dew.decision import decisions
 from dew.decision.config import DecisionRunConfig, Letters
-from dew.decision.layout import Labels, OptionLines, QuestionSegment, Reads, built_in
+from dew.decision.layout import Labels, QuestionSegment, Reads, built_in
 from dew.diffusion.presets import Flow
 from dew.inputs import TextCondition
 from dew.lora import LoRA
@@ -60,7 +60,6 @@ pytestmark = pytest.mark.mesh
 TINY_LAYA = Path(__file__).parent / "fixtures" / "laya" / "tiny"
 QWEN_TINY = Path(__file__).parent / "fixtures" / "hf" / "qwen38-dense-tiny"
 DIFFUSION_GEMMA = Path(__file__).parent / "fixtures" / "hf" / "diffusion-gemma-sft"
-DEEPSEEK_TINY = Path(__file__).parent / "fixtures" / "hf" / "deepseek-v41-tiny"
 RATE = 0.0123
 """A learning rate no kind takes by default, which the run's optimizer logs as it steps."""
 
@@ -629,17 +628,22 @@ def prefixed(root: Path, drawn: bool) -> RunConfig:
         **run.model.fields, "num_layers": 2, "layer_types": ["blocks", "blocks"], "kinds": record}))
 
 
+def state_then_question() -> tuple[QuestionSegment, ...]:
+    """The built-in question row's segments (`built_in`) with the state first and the question's header
+    straight after it, no separator between, so a state's last word and the header's first abut: a row
+    whose unit (`QuestionLayout.unit`) its tokens show."""
+    begin, header, separator, lines, _, state, end = built_in(None, "question_first")
+    return begin, state, header, separator, lines, end
+
+
 BESIDE = {"layout.framing": {"segments": built_in(None, "question_first"), "max_len": 256},
-          "layout.unit": {"segments": tuple(dataclasses.replace(segment, line="r{option}e", bare="r{option}e")
-                                            if isinstance(segment, OptionLines) else segment
-                                            for segment in built_in(None, "question_first")),
-                          "max_len": 256},
+          "layout.unit": {"segments": state_then_question(), "max_len": 256},
           "context_encoder": {"context_layers": (0,), "context_length": 64}}
 """What an option's reader takes it only beside, by the run's path, set with it: a framing frames a row of
 its own segments (`_budgeted`), here the question layout's own row as segments (`built_in`), in a row long
 enough for its conversation's turns; a unit encodes a row of segments, the built-in row piece by piece,
-here one whose option lines abut where a tokenizer merges "e" and "r" (`merged`'s), so a row encoded whole
-reads them as other tokens;
+here one whose state's text abuts its question's (`state_then_question`), where a tokenizer that merges
+"n" and "c" (`merged`'s) reads a row encoded whole as other tokens;
 a context's encoder encodes it for context layers, which read a row's context."""
 
 
@@ -653,11 +657,27 @@ def lettered(root: Path, drawn: bool) -> RunConfig:
 
 
 def merged(root: Path, drawn: bool) -> RunConfig:
-    """A decision run of a fresh head over a tiny causal source whose tokenizer merges pairs of characters
-    (DeepSeek V4.1's, "e" and "r" among them), where a row encoded whole and one encoded piece by piece
-    are other tokens, which a byte-level tokenizer never makes them."""
-    return dataclasses.replace(decision(root, drawn), pretrained=str(DEEPSEEK_TINY),
+    """A decision run of a fresh head over the tiny causal source with a tokenizer that merges "n" and "c"
+    (`merging_source`), where a row encoded whole and one encoded piece by piece are other tokens, which
+    its byte-level tokenizer alone never makes them."""
+    return dataclasses.replace(decision(root, drawn), pretrained=str(merging_source(root)),
                                source=SourceOptions(text_only=True))
+
+
+def merging_source(root: Path) -> Path:
+    """The tiny Qwen source under `root`, its byte-level tokenizer given one merge, "n" and "c", in place of
+    the last byte's token (U+0143, byte 0xff), which no text here holds: a vocabulary of the model's size
+    in which a state's last word ("down") and a header's first ("choice") read whole as other tokens."""
+    import shutil
+
+    source = Path(shutil.copytree(QWEN_TINY, root / "merging-qwen", ignore=shutil.ignore_patterns(
+        "*.npy", "*.npz", "video*", "images*", "preprocessor_config.json")))
+    tokenizer = json.loads((source / "tokenizer.json").read_text())
+    vocabulary = tokenizer["model"]["vocab"]
+    vocabulary["nc"] = vocabulary.pop("Ń")
+    tokenizer["model"]["merges"] = [["n", "c"]]
+    (source / "tokenizer.json").write_text(json.dumps(tokenizer))
+    return source
 
 
 def blockwise(root: Path, drawn: bool) -> RunConfig:
@@ -749,7 +769,8 @@ def requested(task) -> object:
         question = {"team": Choice("which team", ["billing", "technical", "sales"])}
         # A context beside the state where the backbone's cross-attention reads one (`context_length`).
         context = None if task.context_length is None else {"plan": "enterprise"}
-        return task([({"text": "the site is down"}, question)], contexts=[context])
+        # A state of plain text, which a row lays as written, its last word "down".
+        return task([("the site is down", question)], contexts=[context])
     if isinstance(task, TextToImage):
         return task(["a cat"], key=0)
     raise AssertionError(f"no request is written for a loaded {type(task).__name__}")
