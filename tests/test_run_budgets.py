@@ -402,8 +402,8 @@ def clocked_descent(accumulation: int):
 
 
 def clocked_fit(x, accumulation: int, *, directory=None, stop: Pause | None = None, log_every=1,
-                learning_rate=None):
-    """A run bounded to CLOCKED_RECORDS examples of `x`, read in order as a stream, whose objective makes
+                learning_rate=None, examples: int = CLOCKED_RECORDS):
+    """A run bounded to `examples` examples of `x`, read in order as a stream, whose objective makes
     `id % 3 + 1` rows of each, under `Linear` from PEAK to CLOCKED_END, updating every `accumulation`
     batches of BATCH rows, checkpointed to `directory` where given: its final state and its tracker."""
     tracker = RecordingTracker()
@@ -413,7 +413,7 @@ def clocked_fit(x, accumulation: int, *, directory=None, stop: Pause | None = No
                                                                                 end_value=CLOCKED_END))
     trainer = Trainer(Echoed(), optim, key=0, tracker=tracker, accumulation=accumulation,
                       checkpoints=None if directory is None else Checkpoints(str(directory)))
-    return trainer.fit(chain.batch(BATCH), examples=CLOCKED_RECORDS, log_every=log_every, stop=stop), tracker
+    return trainer.fit(chain.batch(BATCH), examples=examples, log_every=log_every, stop=stop), tracker
 
 
 def clocked_run(accumulation: int, directory=None, stops: tuple[Pause | None, ...] = (None,)):
@@ -674,6 +674,17 @@ def test_a_run_no_pass_counts_ahead_reads_its_schedule_off_the_examples_it_consu
     two batches, the window its stream ends inside commits over its own rows."""
     assert_as_exact(clocked_run(accumulation), clocked_descent(accumulation), clocked_records,
                     f"clocked run of {accumulation}", seeds=EXAMPLES_SEEDS)
+
+
+def test_a_clocked_run_resumed_with_a_larger_bound_trains_on_to_it(tmp_path):
+    """A run bounded in examples, trained to its bound and resumed with a larger one, trains on from the
+    examples it consumed to the new bound, as a run on the steps clock resumed with more steps does: the
+    larger bound's first examples are the smaller one's, its order read further (row 2649)."""
+    (x,) = clocked_records(0)
+    first, _ = clocked_fit(x, 1, directory=tmp_path, examples=CLOCKED_RECORDS // 2)
+    assert int(first.consumed) == CLOCKED_RECORDS // 2
+    resumed, _ = clocked_fit(x, 1, directory=tmp_path)
+    assert int(resumed.consumed) == CLOCKED_RECORDS and int(resumed.step) > int(first.step)
 
 
 def test_a_paused_run_resumed_trains_on_as_one_that_never_paused(tmp_path):
