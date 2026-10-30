@@ -7,6 +7,7 @@ and each tile's coordinates (`_Program`, `_Spans`, `_coords`), its hooks' parame
 import dataclasses
 import functools
 import math
+from collections.abc import Callable
 from typing import NamedTuple
 
 import jax
@@ -611,6 +612,18 @@ class _Program[T: (Tiles, BackwardTiles)]:
             return inside & (doc != 0) & (doc == spans.query_doc[row, index])
 
         return spans.q_lo[row, block], spans.q_hi[row, block], seen_whole
+
+    def segmented(self, step: Callable, run: tuple[jax.Array, jax.Array] | None, lo, hi) -> tuple:
+        """A key block's walk of query tiles `[lo, hi)` as `Family.walk`'s segments, `step` each: where its
+        whole tiles run unbroken (`run`, `whole_run`), those one segment of their own, unmasked, and the
+        tiles around them masked, so no step chooses at run time, whose two branches' registers join
+        (FlashAttention 3's masked and unmasked iterations); else one segment choosing a tile at a time."""
+        if run is None:
+            return ((step, lo, hi),)
+        start, end = (jnp.clip(bound, lo, hi) for bound in run)
+        return ((functools.partial(step, masked=True), lo, start),
+                (functools.partial(step, masked=False), start, end),
+                (functools.partial(step, masked=True), end, hi))
 
     def whole_run(self, k_first, q_steps: int, spans: _Spans | None) -> tuple[jax.Array, jax.Array] | None:
         """The query tiles `[a, b)` that see the key block from `k_first` whole (`readers`' `whole`), one run

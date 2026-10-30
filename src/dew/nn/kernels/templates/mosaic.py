@@ -130,6 +130,14 @@ def kernel(entry, *, out_type, grid: tuple, grid_names: tuple, warpgroups: int,
                         cost_estimate=cost, **clustered)
 
 
+def per_role(index, roles: int, run: Callable[[int, jax.Array], None]) -> None:
+    """`run(role, index)` for the role `index` names among `roles`, each role's built at its own static
+    index: Mosaic GPU slices a swizzled tile only at static columns (a role's share of a block's, ET's
+    shared keys at width 256: offsets from the traced index spilled 20 bytes, a static role's none)."""
+    for role in range(roles):
+        pl.when(index == role)(functools.partial(run, role, index))
+
+
 def unwalked(family: "Family") -> Callable:
     """A walk of no steps (`Family.persist`'s, where a tile streams nothing): its carry and accumulators as
     they start."""
