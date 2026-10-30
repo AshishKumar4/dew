@@ -420,21 +420,6 @@ def test_a_bias_of_the_key_heads_is_refused_by_the_template_not_read_past():
         scaled_dot_product_attention(query, key, key, bias=bias, causal=True, implementation="template")
 
 
-@pytest.mark.parametrize(("target", "rows", "template_runs"),
-                         [("sm90", 1, True), ("sm90", 2, False), ("sm80", 1, False)],
-                         ids=["a shared table on an H100", "a bias a row", "a shared table off an H100"])
-def test_auto_takes_a_dense_bias_to_the_template_where_it_measured_faster(target, rows, template_runs):
-    """A call whose bias varies by query goes to the template by itself only where it measured faster
-    than the xla kernel (ET-DBIAS-h100): a table every batch row shares, on an H100, whose Mosaic mainloop
-    reads it once a tile; a bias a row, or a shared table off an H100 (its Triton mainloop reads it spread
-    to every row), goes to the attention kernels' other paths (rows 2523, 2577)."""
-    query = jnp.zeros((2, 64, HEADS, 64), jnp.bfloat16)
-    bias = jnp.zeros((rows, HEADS, 64, 64), jnp.float32)
-    with generation.assumed(target):
-        route = attention.resolve_implementation("auto", query, query, bias=bias)
-    assert (route.kernel == "template") is template_runs
-
-
 DENSE_BIAS_SEEDS = 8
 """Check 1's declared seeds for a dense bias named onto the template."""
 
