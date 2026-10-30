@@ -914,8 +914,8 @@ def certified(fn, *arguments) -> tuple:
 
 
 def _run(jaxpr, consts, arguments, findings, where: str = "") -> list:
+    from float64_terms import _body
     from jax.extend import core
-    from reference_error import _body
 
     env = {}
 
