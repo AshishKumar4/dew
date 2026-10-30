@@ -30,6 +30,7 @@ from reference_error import (
     without_ynn,
 )
 
+from dew.batch import coordinates
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.hyper_connections import HyperConnections
@@ -1476,9 +1477,10 @@ def test_right_padded_rows_attend_causally_with_no_mask(rng, causal):
     model = tiny(causal=causal)
     valid = jnp.arange(SEQ)[None, :] < jnp.asarray([[7], [SEQ]])
 
-    def states(model, **declared):
+    def states(model, right_padded: bool = False):
+        laid = coordinates(valid.shape, valid=valid, right_padded=right_padded)
         return jax.jit(lambda params, ids: jnp.where(valid[..., None], model.apply(
-            params, ids, attention_mask=valid, method=CausalTransformer.hidden_states, **declared), 0))
+            params, ids, coordinates=laid, method=CausalTransformer.hidden_states), 0))
 
     assert_as_exact(states(model, right_padded=True), states(model), drawn(model), f"{causal} right padded",
                     seeds=SEEDS['right padded'], truth_fn=states(model.clone(dtype=jnp.float64)))

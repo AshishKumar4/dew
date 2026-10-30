@@ -32,7 +32,7 @@ class TinyHead(nn.Module):
         """A placeholder cache: incremental decoding keeps no state, but `generate` threads one."""
         self.variable("cache", "index", lambda: jnp.zeros((batch_size,), jnp.int32))
 
-    def __call__(self, tokens, train: bool = False, decode: bool = False, attention_mask=None):
+    def __call__(self, tokens, train: bool = False, decode: bool = False, coordinates=None):
         return self.lm_head(
             self.hidden_states(tokens, train=train)).astype(jnp.float32)
 

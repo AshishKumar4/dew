@@ -60,7 +60,7 @@ from dew.interop.weights import AUTO
 from dew.lora import LoRA
 from dew.nn.dex import DifferentialExtension
 from dew.nn.kernels import generation
-from dew.nn.precision import Numerics
+from dew.nn.precision import Numerics, numerics_of
 from dew.nn.sharding import Link
 from dew.objectives.base import Effects, Loss, Metric, Objective
 from dew.optim import OptimConfig, ParamGroup
@@ -329,6 +329,19 @@ def _record_argument[T](kind: type[T]):
     )
 
 
+def _numerics_argument():
+    """A run's numerics on the command line: a preset's name ("accurate", "default"), the usual dtypes'
+    Lightning name ("bf16-true"), or a `Numerics` record's JSON (`dew.nn.precision.numerics_of`)."""
+    return tyro.constructors.PrimitiveConstructorSpec(
+        nargs=1,
+        metavar="NAME|JSON",
+        instance_from_str=lambda given: (from_record(Numerics, json.loads(given[0]))
+                                         if given[0].startswith("{") else numerics_of(given[0])),
+        is_instance=lambda value: isinstance(value, Numerics),
+        str_from_instance=lambda value: [json.dumps(to_record(value, Numerics))],
+    )
+
+
 def _keep_argument():
     return tyro.constructors.PrimitiveConstructorSpec(
         nargs=1,
@@ -385,6 +398,11 @@ class SourceOptions:
     """DEX's differential on chosen heads (`dew.nn.dex`, `Pretrained.load`'s `dex`), its record as
     JSON: `--source.dex '{"layers": [[0, [1, 3]], [5, [0, 2]]], "anneal_steps": 1000}'`, its
     `trains` the paper's recipe unless "all"; None for none."""
+    param_dtype: str | None = None
+    """The dtype the source's parameters are stored in, its checkpoint's own as 'auto'; None stores a
+    source the run trains in its numerics' `dtypes.params` and one it keeps frozen as its checkpoint
+    does (`RunConfig.source_keywords`). A frozen bfloat16 base beside a float32 head and adapter is
+    `--source.param-dtype bfloat16`."""
 
     def overrides(self) -> Mapping[str, object] | None:
         """The `modeling_overrides` these options state, None where they state none."""
@@ -526,7 +544,11 @@ class TrainerConfig:
     way there is one optimizer update a step, and the compiled step is traced
     once per stage.
     """
-    precision: Numerics = dataclasses.field(default_factory=Numerics)
+    dynamic_scale: bool | None = None
+    """Whether the run scales its loss dynamically (`flax.training.dynamic_scale.DynamicScale`): None
+    for a float16 compute's alone, which needs it (`RunConfig.built`); a run states True or False to
+    choose, as a run saved before its numerics records the one it trained under."""
+    precision: Annotated[Numerics, _numerics_argument()] = dataclasses.field(default_factory=Numerics)
     """The run's numerics, set once and recorded with it (`dew.nn.precision.Numerics`; `ACCURATE` for
     scientific runs): its dtypes by Lightning's names, its products' precision by JAX's levels and its
     ops' forms, over every program it traces, the step and its evaluations
@@ -654,6 +676,8 @@ class TrainerConfig:
         return dataclasses.replace(self, accumulation=accumulation)
 
     def __post_init__(self):
+        # A record names its numerics as a preset's name or by their fields (`numerics_of`).
+        object.__setattr__(self, "precision", numerics_of(self.precision))
         if self.update_tokens is not None and self.update_tokens < 1:
             raise ValueError("--trainer.update-tokens must be positive")
         if self.update_tokens is not None and self.batch_ramp is not None:
@@ -921,37 +945,56 @@ def takes_dtype(model: ModelConfig) -> bool:
 def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
     """A saved run's record (its run.json, `{"class": ..., "fields": ...}`) with its fields in the shapes
     Dew writes now, every earlier shape of a saved run read here and nowhere else (`RunConfig.load`,
-    `check_resume`): a trainer's `attention_form`, which its precision policy's `forms` hold now; a
-    loaded checkpoint's `pretrained_param_dtype` and a decision's `param_dtype`, which its `dtypes.params`
-    hold; and a trainer's `dynamic_scale`, which a float16 compute derives (`dew.nn.precision.Numerics`,
-    ledger 2500).
-    A configuration written today that names any of them is refused by name, as any field its class does
-    not declare. A record in today's shapes passes as it is. Carried to 1.0, when it is deleted (ledger
-    1552)."""
+    `check_resume`). A record written before its trainer held a precision policy (`dew.nn.precision.
+    Numerics`, ledger 2500) reads as its main trained it (train 328's review): its trainer's
+    `attention_form` as the policy's `forms`; a loaded checkpoint's `pretrained_param_dtype`, and a
+    decision's `param_dtype`, as the storage of the source alone (`SourceOptions.param_dtype`), the head
+    and adapter it drew fresh kept in float32; its compute as its main's (`earlier_compute`); and its
+    `dynamic_scale` as it trained under it.
+    A configuration written today that names the earlier knobs is refused by name, as any field its class
+    does not declare. A record in today's shapes passes as it is. Carried to 1.0, when it is deleted
+    (ledger 1552)."""
     fields = record.get("fields")
     if not isinstance(fields, Mapping) or not isinstance(fields.get("trainer"), Mapping):
         return record
     trainer, fields = dict(fields["trainer"]), dict(fields)
     stated = {name: fields.pop(name) for name in ("pretrained_param_dtype", "param_dtype") if name in fields}
-    earlier = {name for name in ("attention_form", "dynamic_scale") if name in trainer} | set(stated)
-    if not earlier:
-        return record
     if "precision" in trainer:
-        raise ValueError(f"a saved run records {sorted(earlier)} beside its trainer's precision, which "
-                         f"holds them now")
-    policy: dict[str, object] = {}
+        if "attention_form" in trainer or stated:
+            raise ValueError(f"a saved run records {sorted({'attention_form'} & set(trainer) | set(stated))} "
+                             "beside its trainer's precision, which holds them now")
+        return record
+    if "attention_form" not in trainer and "dynamic_scale" not in trainer and not stated:
+        return record
+    policy: dict[str, object] = {"dtypes": {"compute": earlier_compute(record)}}
     if "attention_form" in trainer:
         policy["forms"] = trainer.pop("attention_form")
-    trainer.pop("dynamic_scale", None)
-    params = next(iter(stated.values()), None)
-    # The compute an earlier record trained in was its model's stated dtype, where it states one.
-    model = fields.get("model")
-    computed = model.get("fields", {}).get("dtype") if isinstance(model, Mapping) else None
-    dtypes = {**({"params": params} if params is not None else {}),
-              **({"compute": computed} if isinstance(computed, str) else {})}
-    if dtypes:
-        policy["dtypes"] = dtypes
+    stored = next(iter(stated.values()), None)
+    # The storage named a loaded checkpoint's alone, which a run that loads none never read.
+    if stored is not None and fields.get("pretrained") is not None:
+        source = fields.get("source")
+        fields["source"] = {**(source if isinstance(source, Mapping) else {}), "param_dtype": stored}
     return {**record, "fields": {**fields, "trainer": {**trainer, "precision": policy}}}
+
+
+def earlier_compute(record: Mapping[str, object]) -> str:
+    """The dtype a run saved before its numerics computed in: its model's stated dtype, where it states
+    one; else bfloat16 where it loaded a language model or a diffusion pipeline, as those mains loaded
+    them; else float32, Flax's own for a model drawn fresh and a decision run's backbone."""
+    from dew.config.diffusion import DiffusionRunConfig
+    from dew.config.lm import LMRunConfig
+
+    fields = record.get("fields")
+    assert isinstance(fields, Mapping)
+    model = fields.get("model")
+    stated = model.get("fields", {}).get("dtype") if isinstance(model, Mapping) else None
+    if isinstance(stated, str):
+        return stated
+    named = record.get("class")
+    kind = registry.runs[named] if isinstance(named, str) else None
+    loads = fields.get("pretrained") is not None and isinstance(kind, type) and issubclass(
+        kind, LMRunConfig | DiffusionRunConfig)
+    return "bfloat16" if loads else "float32"
 
 
 
@@ -1290,9 +1333,11 @@ class RunConfig:
         (`param_dtype='auto'`), since no update reaches it: a float32 copy of a bf16 checkpoint doubles
         its memory and is cast back to bf16 every pass for nothing, while a cast to the compute dtype
         would round the float32 tensors a bf16 checkpoint keeps (Mamba's `A_log`). A `dtypes.params`
-        narrower than float32 stores it so too."""
+        narrower than float32 stores it so too. A storage the run's source options state wins
+        (`SourceOptions.param_dtype`)."""
         params = self.trainer.precision.dtypes.params
-        stored = AUTO if frozen and jax.numpy.dtype(params) == jax.numpy.float32 else params
+        stored = (self.source.param_dtype if self.source.param_dtype is not None
+                  else AUTO if frozen and jax.numpy.dtype(params) == jax.numpy.float32 else params)
         return {**self.source.keywords(), **self.trainer.source_placement(frozen=frozen),
                 "param_dtype": stored}
 
@@ -1799,7 +1844,8 @@ class RunConfig:
         return training.Trainer(
             objective, self.optim, key=trainer.key, mesh=mesh, microbatches=trainer.microbatches,
             layout=trainer.layout, accumulation=trainer.accumulation, split=trainer.split,
-            dynamic_scale=self.compute_dtype() == "float16", rollout=rollout,
+            dynamic_scale=(self.compute_dtype() == "float16" if trainer.dynamic_scale is None
+                           else trainer.dynamic_scale), rollout=rollout,
             tune_kernels=trainer.tune_kernels, param_dtype=self.drawn_dtype(),
             **{"links": trainer.links, **resources})
 

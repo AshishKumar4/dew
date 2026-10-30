@@ -9,6 +9,7 @@ from interop_support import fixture_ids, transformers_arms, transformers_model
 from one_draw import assert_as_exact_as_the_reference
 from reference_error import assert_as_exact
 
+from dew.batch import field_coordinates
 from dew.interop import Pretrained
 from dew.nn.backbones.causal_transformer import CausalTransformer
 
@@ -58,7 +59,9 @@ def test_modernbert_states_match_the_encoder_through_every_window_path(implement
 
     def ours(ids):
         def states(ids, **kwargs):
-            return loaded.model.apply(loaded.variables, ids, method=CausalTransformer.hidden_states, **kwargs)
+            # The flat fields laid out once (`field_coordinates`), the layout `hidden_states` reads.
+            return loaded.model.apply(loaded.variables, ids, method=CausalTransformer.hidden_states,
+                                      coordinates=field_coordinates(kwargs, ids.shape))
         return {'states': states(ids),
                 'padded': states(jnp.where(mask, ids, 0), attention_mask=mask)[mask],
                 'packed': states(ids, segment_ids=documents, positions=positions)}

@@ -45,6 +45,7 @@ from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.inputs import counted_places
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import attention as template, attention_route
+from dew.nn.precision import Numerics
 
 HEADS, KV_HEADS, WIDTH = 4, 2, 32
 MESH_TENSOR, MESH_HEADS = 4, 8
@@ -514,11 +515,12 @@ def test_a_long_sequence_is_on_par_with_the_reference_path(length, dtype):
 
 
 def test_the_accurate_form_is_one_option_away():
-    """`generation.chosen(attention_form='accurate')` runs every template call in the accurate form (natural
-    logits and the accurate products, `attention_route.FORMS`), its forward and gradients bitwise a call's
-    that names that form, and 'fast' runs the default, a call's that names none; the two forms differ; a
-    form the template does not have is refused. Bit for bit by construction: the choice resolves to the
-    named form's arguments before the call traces, so the two calls trace one program."""
+    """A run's numerics in the accurate forms (`generation.run_precision`, `Numerics.forms`) run every
+    template call in the accurate form (natural logits and the accurate products, `attention_route.FORMS`),
+    its forward and gradients bitwise a call's that names that form, and the fast forms run the default, a
+    call's that names none; the two forms differ; a form the template does not have is refused. Bit for bit
+    by construction: the forms resolve to the named form's arguments before the call traces, so the two
+    calls trace one program."""
     spans = template.spans(QUERIES, KEYS, ROWS, causal=True)
     query, key, value, _, dout = drawing(QUERIES, KEYS, jnp.float32, sinks=False)(0)
 
@@ -528,14 +530,14 @@ def test_the_accurate_form_is_one_option_away():
 
     found = {}
     for form, named in (("accurate", {"natural": True, "accurate": True}), ("fast", {})):
-        with generation.chosen(attention_form=form):
+        with generation.run_precision(Numerics(forms=form)):
             found[form] = jax.tree.leaves(jax.jit(routed)(query, key, value))
         want = jax.tree.leaves(jax.jit(functools.partial(routed, **named))(query, key, value))
         for mine, theirs in zip(found[form], want, strict=True):
             np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs), err_msg=form)
     assert any(not np.array_equal(accurate, fast) for accurate, fast in zip(*found.values(), strict=True))
-    with generation.chosen(attention_form="exact"), pytest.raises(ValueError):
-        attention_route.attend(query, key, value, spans)
+    with pytest.raises(ValueError):
+        Numerics(forms="exact")
 
 
 def test_narrowed_operands_hand_back_their_gradients_unrounded():
@@ -713,13 +715,14 @@ def test_a_pass_the_mosaic_mainloop_declines_reports_its_reason_under_its_row():
 
 
 def routed_call(form: str):
-    """A causal call on the default route ('auto') under `form` (`generation.chosen`), at JAX's own default
-    matmul precision, as a run's default numerics multiply (the suite's environment states 'highest'), as
-    a function of `(query, key, value, sinks, dout)`: its output, then its gradients (`with_gradients`)."""
-    from dew.nn.kernels.generation import chosen
+    """A causal call on the default route ('auto') under a run's numerics of `form`
+    (`generation.run_precision`), at JAX's own default matmul precision, as a run's default numerics
+    multiply (the suite's environment states 'highest'), as a function of `(query, key, value, sinks,
+    dout)`: its output, then its gradients (`with_gradients`)."""
+    from dew.nn.kernels.generation import run_precision
 
     def call(query, key, value, sinks):
-        with chosen(attention_form=form), jax.default_matmul_precision("default"):
+        with run_precision(Numerics(forms=form)), jax.default_matmul_precision("default"):
             return scaled_dot_product_attention(query, key, value, causal=True, sinks=sinks)
 
     return with_gradients(call)
@@ -747,11 +750,11 @@ def accurate_draws():
 @pytest.mark.kernel
 @pytest.mark.parametrize("case", ["float32", "bfloat16", "products past the largest float"])
 def test_an_accurate_call_on_the_default_route_is_on_par_with_ieee_fp32(case):
-    """Under `generation.chosen(attention_form='accurate')`, a call on the default route ('auto'), whichever
-    kernel it takes, is on par with the reference path's IEEE float32 products forward and backward,
-    measured from float64 (check 1; row 2350: an accurate run's calls ran fast on FlashAttention, cuDNN,
-    xla and splash), over inputs a fast kernel fails on (`accurate_draws`); the kernel lab's GPU tier runs
-    it on each target GPU."""
+    """Under a run's accurate numerics (`generation.run_precision`), a call on the default route ('auto'),
+    whichever kernel it takes, is on par with the reference path's IEEE float32 products forward and
+    backward, measured from float64 (check 1; row 2350: an accurate run's calls ran fast on FlashAttention,
+    cuDNN, xla and splash), over inputs a fast kernel fails on (`accurate_draws`); the kernel lab's GPU
+    tier runs it on each target GPU."""
     assert_as_exact(jax.jit(routed_call("accurate")), jax.jit(ieee_reference), accurate_draws()[case],
                     f"the accurate form on the default route, {case}", seeds=SEEDS)
 
