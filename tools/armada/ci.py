@@ -131,6 +131,12 @@ with the default deadline and grace (session.DEADLINE + session.GRACE + 30 + the
 1800)."""
 
 REPO = Path(__file__).resolve().parents[2]
+HASHED_BY = "3.13"
+"""The Python this file runs under wherever it runs, the plan's and every task's alike (`pinned`), so a key
+the plan computes is the one a task recorded: a module's units are what this Python's parser and compiler
+make of its text (`digested`), which each release changes (2026-10-30: plans under the PC's 3.14 and a GitHub
+runner's 3.12 found none of the 3.13 tasks' records fresh, and every file took a task of its own). It is the
+Python the tasks' image runs this file under, so a task runs it as it is."""
 _CLASSIFIERS = tomllib.loads((REPO / "pyproject.toml").read_text())["project"]["classifiers"]
 _PREFIX = "Programming Language :: Python :: "
 PYTHONS = tuple(sorted((classifier.removeprefix(_PREFIX) for classifier in _CLASSIFIERS
@@ -1863,5 +1869,17 @@ def main() -> int:
                 coverage=args.coverage, whole=args.whole == "1")
 
 
+def pinned(argv: list[str]) -> None:
+    """This file run again under HASHED_BY, as uv finds or fetches it, with `argv`, where another Python
+    runs it: on a planner's machine, a GitHub runner or a GPU node. Not `coverage report`, which keys nothing
+    and reads coverage.py's data under the interpreter its caller installed coverage.py in
+    (`coverage_report`)."""
+    running = f"{sys.version_info.major}.{sys.version_info.minor}"
+    if argv[:2] != ["coverage", "report"] and running != HASHED_BY:
+        os.execvp("uv", ["uv", "run", "--no-project", "--python", HASHED_BY, "python",
+                         str(Path(__file__).resolve()), *argv])
+
+
 if __name__ == "__main__":
+    pinned(sys.argv[1:])
     raise SystemExit(main())
