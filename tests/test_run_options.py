@@ -606,7 +606,7 @@ def prefixed(root: Path, drawn: bool) -> RunConfig:
     kinds = {"blocks": LayerKind(mixer=AttentionMixer(bidirectional_blocks=True))}
     record = registry.to_record(kinds, typing.get_type_hints(CausalTransformer)["kinds"])
     return dataclasses.replace(run, model=ModelConfig("causal_transformer", {
-        **run.model.fields, "layer_types": ["blocks", "blocks"], "kinds": record}))
+        **run.model.fields, "num_layers": 2, "layer_types": ["blocks", "blocks"], "kinds": record}))
 
 
 BESIDE = {"layout.framing": {"segments": built_in(None, "question_first"), "max_len": 256},
