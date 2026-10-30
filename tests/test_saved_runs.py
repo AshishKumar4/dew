@@ -166,3 +166,50 @@ def test_a_run_an_earlier_main_saved_resumes_from_its_checkpoint(tmp_path, monke
         compiled = [row["value"] for row in records[resumed:] if row["type"] == "StepCompiled"][-1]
         assert compiled["remat"] == seen["remat"]
         assert {name: (compiled["plan"] or {}).get(name) for name in seen["plan"]} == seen["plan"]
+
+
+def test_a_requests_products_are_named_by_their_variable_scopes():
+    """The products the saved-run evidence compares (`saved_run_products`) are named by the variable scope
+    of the module that runs them, whichever method it runs them in and whichever class it is: a helper
+    method's product is its owner's, a shared scope's its sharer's, two siblings' apart; and a projection
+    whose dtype moves moves alone."""
+    import jax.numpy as jnp
+    from flax import linen as nn
+    from saved_run_products import products, scoped
+
+    class Pair(nn.Module):
+        right: jnp.dtype
+
+        def setup(self):
+            self.left = nn.Dense(4, dtype=jnp.float32, param_dtype=jnp.float32)
+            self.right_ = nn.Dense(4, dtype=self.right, param_dtype=jnp.float32, name="right")
+
+        def project(self, x):
+            return self.right_(x)
+
+        def __call__(self, x):
+            return self.left(x) + self.project(x)
+
+    class Shared(nn.Module):
+        """A `Pair` in this module's own scope (`nn.share_scope`), as a release's decoder shares its text
+        model's."""
+
+        right: jnp.dtype
+
+        def setup(self):
+            self.inner = Pair(self.right)
+            nn.share_scope(self, self.inner)
+
+        def __call__(self, x):
+            return self.inner(x)
+
+    def read(right, kind=Pair) -> dict[str, list[str]]:
+        model, x = kind(right), jnp.ones((2, 4), jnp.float32)
+        variables = model.init(jax.random.key(0), x)
+        with nn.intercept_methods(scoped):
+            lowered = jax.jit(model.apply).lower(variables, x)
+        return products([lowered.as_text(debug_info=True)])
+
+    assert read(jnp.float32) == {"left": ["float32"], "right": ["float32"]}
+    assert read(jnp.bfloat16) == {"left": ["float32"], "right": ["bfloat16"]}
+    assert read(jnp.bfloat16, Shared) == read(jnp.bfloat16)
