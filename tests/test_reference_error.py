@@ -85,11 +85,11 @@ def test_a_check_whose_program_xla_cpu_compiles_only_with_ynnpacks_fusions_runs_
         tmp_path, monkeypatch):
     """XLA:CPU refuses jax.nn's XLA attention's backward over a single key without YNNPACK's fusions, at
     every matmul precision; check 1 decides, once before its draws, that both arms of that site take the
-    fusions (`_ynn_decided`), the two still of one kind, logs that decision once beside its stages
-    (STAGES_LOG), and judges them."""
+    fusions (`_ynn_decided`), the two still of one kind, names that decision in its stage's line
+    (STAGES_LOG) and in the report CI reads (`SWITCHED`), and judges them."""
     import json
 
-    from reference_error import STAGES_LOG, without_ynn
+    from reference_error import STAGES_LOG, SWITCHED, without_ynn
 
     with pytest.raises(jax.errors.JaxRuntimeError):
         without_ynn(pulled_by_itself(xla_attention))(*one_key_draw(0))
@@ -97,9 +97,26 @@ def test_a_check_whose_program_xla_cpu_compiles_only_with_ynnpacks_fusions_runs_
     monkeypatch.setenv(STAGES_LOG, str(log))
     assert_as_exact(pulled_by_itself(xla_attention), pulled_by_itself(written_attention), one_key_draw,
                     "attention over one key", seeds=16)
-    decided = [entry for entry in map(json.loads, log.read_text().splitlines()) if "ynn" in entry]
-    assert [(entry["label"], entry["ynn"]) for entry in decided] == [("attention over one key",
-                                                                       "with YNNPACK's fusions")]
+    lines = [json.loads(line) for line in log.read_text().splitlines()]
+    assert [entry["label"] for entry in lines] == ["attention over one key"]
+    assert "contracting dimensions" in lines[0]["ynn"]
+    assert [entry["label"] for entry in SWITCHED] == ["attention over one key"]
+    SWITCHED.clear()
+
+
+@pytest.mark.skipif(jax.default_backend() != "cpu", reason="WITHOUT_YNN is XLA:CPU's")
+def test_a_process_whose_xla_refuses_the_ynn_options_moves_no_site_onto_the_fusions(monkeypatch):
+    """Where XLA:CPU refuses WITHOUT_YNN's options themselves, the gate raises before deciding any site
+    (`_ynn_option_held`), so no paired site moves onto the fusions and passes."""
+    import reference_error
+
+    reference_error._ynn_option_held.cache_clear()
+    monkeypatch.setattr(reference_error, "WITHOUT_YNN", {"xla_cpu_no_such_option": "none"})
+    try:
+        with pytest.raises(RuntimeError, match="no check may move its arms"):
+            reference_error._ynn_option_held()
+    finally:
+        reference_error._ynn_option_held.cache_clear()
 
 
 @pytest.mark.skipif(jax.default_backend() != "cpu", reason="WITHOUT_YNN is XLA:CPU's")
