@@ -1857,6 +1857,19 @@ def test_a_row_run_green_on_these_inputs_is_reused_though_another_commits_run_of
     assert [len((tmp_path / f"runs-{name}").read_text()) for name in "abc"] == [1, 1, 2]
 
 
+def test_a_helper_added_under_tests_reruns_only_the_runs_that_imported_a_module_of_its_name(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A helper module added under tests/ reruns no file whose run imported no module of its name, as it
+    shadows nothing they import; one named as a module they imported, which tests/ leading sys.path would
+    shadow, reruns each of them (owner, 2026-10-29: train 315's one new helper reran all 2490 tasks)."""
+    verdict, planned = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
+    armada_task(ci, monkeypatch, verdict)
+    (tmp_path / "tests/quantized_basis.py").write_text("BASIS = 1\n")
+    assert planned() == ["tests/test_a.py tests/test_b.py tests/test_c.py"]
+    (tmp_path / "tests/pathlib.py").write_text("")
+    assert planned() == ["tests/test_a.py", "tests/test_b.py", "tests/test_c.py"]
+
+
 def test_a_task_on_another_pinned_class_reuses_the_rows_its_plan_kept(
         ci, tmp_path, monkeypatch, cache_worker):
     """The files a plan keeps for reuse, their rows green on any class the tasks are pinned to, are reused by
