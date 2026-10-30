@@ -43,7 +43,7 @@ from jax.experimental import serialize_executable
 
 from dew._records import JSON, record
 from dew.batch import Batch
-from dew.nn.kernels.generation import assumed, capability, gpu_target
+from dew.nn.kernels.generation import GpuTarget, assumed, capability, gpu_target
 from dew.nn.kernels.templates import report
 from dew.nn.sharding import Link
 from dew.registry import record_argument
@@ -137,6 +137,10 @@ class AheadOfTime:
     step traces with these in place of its own (`Trainer`'s `ahead`), which could spread a projection
     the step does not and lower another program, and its checkpoints record their bandwidths
     (`link_figures`)."""
+    target: GpuTarget
+    """The facts of the GPU its kernels' launches were derived for (`gpu_target` within `assumed`), which a
+    run handed the step reproduces it under (`handed`, `derived_for`): another SKU of the generation, its
+    multiprocessors other, derives other launches, and lowers another program."""
     plan: JSON = None
     """The plan the run's own fit search makes on those
     GPUs (`Trainer.plan`): every program it compiled, each with the footprint derived for it beside
@@ -196,6 +200,20 @@ class AheadOfTime:
                                                          backend=found[0].client)
 
 
+    def derived_for(self, device: GpuTarget) -> GpuTarget:
+        """The facts a run on a GPU of `device`'s facts derives its launches for while it reproduces this
+        program (`handed`): the target it was compiled for (`target`), which the GPU runs where it is of
+        its generation and holds at least the shared memory a block of its launches takes. Refused for
+        any other, on which the program's launches would not run."""
+        held = device.shared_limit is None or self.target.shared_limit is None or (
+            device.shared_limit >= self.target.shared_limit)
+        if device.generation != self.target.generation or not held:
+            raise ValueError(f"the step was compiled ahead for {self.target.device_kind} "
+                             f"({self.target.generation}, {self.target.shared_limit} bytes of shared memory "
+                             f"a block), whose launches this {device.device_kind} ({device.generation}, "
+                             f"{device.shared_limit} bytes) does not run; compile it ahead for this GPU")
+        return self.target
+
     def taken(self, lowered: jax.stages.Lowered) -> jax.stages.Compiled:
         """The executable, loaded (`loaded`), for a run whose step lowered as `lowered`: refused where
         that is another program than the one compiled ahead, a config, a data shape, a rung or a Dew
@@ -210,14 +228,15 @@ class AheadOfTime:
 
 @contextlib.contextmanager
 def handed(ahead: AheadOfTime | None) -> Iterator[None]:
-    """Within the block, the kernel launch configs refused are `ahead`'s alone, its compiles' refusals
-    (`AheadOfTime.refusals`), in a scope of their own (`report.refusals`): a run handed a step compiled
-    ahead lowers it as its compile did, whatever this process or its cache refused of other programs.
-    Without one, the process's own."""
+    """Within the block, a run reproduces the step compiled ahead (`ahead`) as its compile made it: the
+    kernel launch configs refused are its compiles' alone (`AheadOfTime.refusals`), in a scope of their
+    own (`report.refusals`), whatever this process or its cache refused of other programs, and each
+    launch derives for the GPU it was compiled for (`AheadOfTime.derived_for`), whatever this GPU's own
+    facts. Without one, the process's own refusals and facts."""
     if ahead is None:
         yield
         return
-    with report.refusals():
+    with report.refusals(), assumed(ahead.derived_for(gpu_target())):
         report.refuse(ahead.refusals)
         yield
 
@@ -330,6 +349,7 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
     began = time.perf_counter()
     start = trainer._started()
     with assumed(generation):
+        target = gpu_target()
         planned = trainer._compiled_plan(start.abstract, step_batch(trainer, batch), None, capacity)
     seconds = time.perf_counter() - began
     lowered, compiled = planned.candidate.lowered, planned.executable
@@ -344,4 +364,4 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
         argument_bytes=memory.argument_size_in_bytes, output_bytes=memory.output_size_in_bytes,
         alias_bytes=memory.alias_size_in_bytes, temp_bytes=memory.temp_size_in_bytes,
         code_bytes=memory.generated_code_size_in_bytes, plan=trainer.plan, planned_seconds=seconds,
-        capacity=capacity, links=dict(trainer.links), refusals=report.refused_launches())
+        capacity=capacity, links=dict(trainer.links), target=target, refusals=report.refused_launches())
