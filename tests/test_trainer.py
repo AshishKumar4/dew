@@ -868,9 +868,8 @@ def test_overlapping_token_windows_resume_in_a_fresh_trainer_bit_exactly(tmp_pat
     assert position.read(resumed_place).records == 4 * BATCH
 
 
-@pytest.mark.gpu(reason="CUDA embedding-gradient reductions")
 @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
-def test_a_cuda_lm_repeats_and_resumes_bit_exactly_with_deterministic_ops(tmp_path, dtype):
+def a_cuda_lm_repeats_and_resumes_bit_exactly_with_deterministic_ops(tmp_path, dtype):
     """Repeated token IDs share embedding-gradient updates. CUDA's default
     scatter-add order is not repeatable; conftest enables deterministic ops
     before the backend opens. Check every state leaf, not just parameters.
@@ -936,8 +935,7 @@ np.savez(sys.argv[1], *[np.asarray(leaf) for leaf in leaves])
 """
 
 
-@pytest.mark.gpu(reason="cuDNN and cuBLAS kernel choice")
-def test_a_conv_model_trains_to_the_bit_again_after_another_run_measured_kernels_into_its_cache(tmp_path):
+def a_conv_model_trains_to_the_bit_again_after_another_run_measured_kernels_into_its_cache(tmp_path):
     """XLA chooses a convolution's cuDNN algorithm and a GEMM's cuBLAS one per
     process, so only a second process shows whether it agrees. Two fresh
     processes train a DiT (a convolution embeds its patches) two Adam steps

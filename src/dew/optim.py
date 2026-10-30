@@ -706,14 +706,16 @@ class M3State(NamedTuple):
 
 
 def scale_by_m3(*, beta1: float, beta2: float, beta3: float, alpha: float, eps: float, frequency: int,
-                ns_steps: int = 5, weight_dimension_numbers=None) -> optax.GradientTransformation:
+                ns_steps: int = 5, weight_dimension_numbers=None,
+                ns_precision: NsPrecision = MUON_NS_PRECISION) -> optax.GradientTransformation:
     """Multi-scale Momentum Muon, M3 (Behrouz et al., Nested Learning, arXiv 2512.24695, Algorithm 1):
     the direction `(O1 + alpha O2) / sqrt(V + eps)`, which `optax.scale_by_learning_rate` steps by.
 
     Each update adds `beta1 g` to the fast momentum `M1` and `beta2 g**2` to the second moment `V`, the
     algorithm's sums, neither decaying, and orthogonalizes `M1` by `ns_steps` Newton-Schulz iterations,
-    Muon's (`_orthogonalized`, each leaf shaped by its `weight_dimension_numbers`, a tree or a function of
-    the updates as Muon's are; a leaf with none is one matrix, its rows the reduction). Its state is
+    Muon's at `ns_precision`, each matrix whole on one device and the matrices spread over the mesh
+    (`orthogonalized`), each leaf shaped by its `weight_dimension_numbers`, a tree or a function of the
+    updates as Muon's are; a leaf with none is one matrix, its rows the reduction. Its state is
     kept in float32 at least (`at_least_fp32`), so a bfloat16 matrix's momenta and gradients sum without
     rounding to its width, and the directions come back in that dtype. Once every
     `frequency` updates the slow momentum `M2` adds `beta3` times the chunk's gradients and is
@@ -725,13 +727,14 @@ def scale_by_m3(*, beta1: float, beta2: float, beta3: float, alpha: float, eps: 
     if frequency < 1:
         raise ValueError(f"M3 updates its slow momentum once every `frequency` updates, got {frequency}")
 
-    def orthogonalized(moment):
-        if weight_dimension_numbers is None:
-            return jax.tree.map(lambda leaf: _orthogonalized(leaf, ns_steps, None), moment)
-        numbers = (weight_dimension_numbers(moment) if callable(weight_dimension_numbers)
+    def orthogonal(moment):
+        numbers = (jax.tree.map(lambda _: None, moment) if weight_dimension_numbers is None
+                   else weight_dimension_numbers(moment) if callable(weight_dimension_numbers)
                    else weight_dimension_numbers)
-        return jax.tree.map(lambda leaf, shape: _orthogonalized(leaf, ns_steps, shape), moment, numbers,
-                            is_leaf=lambda node: node is None)
+        # A leaf with none is one matrix, its rows the reduction: MuonDimensionNumbers' own default.
+        numbers = jax.tree.map(lambda shape: optax.contrib.MuonDimensionNumbers() if shape is None else shape,
+                               numbers, is_leaf=_muon_leaf)
+        return orthogonalized(moment, numbers, jnp.asarray(NEWTON_SCHULZ), ns_steps, 1e-8, ns_precision)
 
     def init_fn(params) -> M3State:
         zeros = jax.tree.map(lambda param: jnp.zeros(param.shape, at_least_fp32(param.dtype)), params)
@@ -745,12 +748,12 @@ def scale_by_m3(*, beta1: float, beta2: float, beta3: float, alpha: float, eps: 
         second = jax.tree.map(lambda moment, gradient: moment + beta2 * jnp.square(gradient), state.second,
                               updates)
         direction = jax.tree.map(lambda fast, slow, second: (fast + alpha * slow) / jnp.sqrt(second + eps),
-                                 orthogonalized(fast), state.slow_direction, second)
+                                 orthogonal(fast), state.slow_direction, second)
         chunk = jax.tree.map(jnp.add, state.chunk, updates)
 
         def closed(chunk):
             slow = jax.tree.map(lambda moment, summed: moment + beta3 * summed, state.slow, chunk)
-            return slow, optax.tree.zeros_like(chunk), orthogonalized(slow)
+            return slow, optax.tree.zeros_like(chunk), orthogonal(slow)
 
         # The slow momentum and its orthogonalization run once a chunk, not every update.
         slow, chunk, slow_direction = jax.lax.cond(

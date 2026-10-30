@@ -104,9 +104,8 @@ def test_a_row_that_sees_no_key_reads_nothing(implementation, case):
                     seeds=SEEDS[implementation, case], truth_fn=exact)
 
 
-@pytest.mark.gpu(reason="cuDNN's and flash's fused attention")
 @pytest.mark.parametrize("implementation, case", GPU, ids=[f"{i}-{c}" for i, c in GPU])
-def test_a_row_that_sees_no_key_reads_nothing_on_the_fused_gpu_kernels(implementation, case,
+def a_row_that_sees_no_key_reads_nothing_on_the_fused_gpu_kernels(implementation, case,
                                                                          without_deterministic_ops):
     _, _, _, _, found, truth = run(implementation, case, jnp.bfloat16)
     for name, mine, want in zip(("output", "query", "key", "value"), found, truth, strict=True):

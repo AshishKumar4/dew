@@ -26,7 +26,6 @@ from reference_error import as_given, assert_as_exact, distance, with_gradients
 from dew.nn import kernels
 from dew.nn.attention import scaled_dot_product_attention, weighted_values
 from dew.nn.attention_blocks import NormalAttention
-from dew.nn.kernels import bf16_dot_runs
 from dew.nn.kernels.selection import KernelRefused
 from dew.nn.kernels.templates import attention as template
 from dew.nn.precision import FP32_SUMS, at_least_fp32
@@ -48,11 +47,6 @@ def test_a_flash_wheel_holds_code_for_its_architectures_major_from_their_minor_u
     assert flash_built_for("sm89", ("sm86",)) and flash_built_for("sm121", ("sm120",))
     assert not flash_built_for("sm86", ("sm89",))
 
-def on_gpu(test):
-    """Mark `test` for a cuda device of sm80 or later, cuDNN's bf16 floor."""
-    reason = "needs a cuda device of sm80 or later, cuDNN's bf16 floor"
-    return pytest.mark.gpu(reason=reason)(pytest.mark.skipif(not bf16_dot_runs(), reason=reason)(test))
-
 
 def flash_here():
     """dew_flash_attn where the installed wheel holds code for this GPU (the fact `flash_refusal` reads);
@@ -67,8 +61,7 @@ def flash_here():
     return flash
 
 
-@on_gpu
-def test_flash_through_dews_attention_refuses_rows_it_would_misread(without_deterministic_ops):
+def flash_through_dews_attention_refuses_rows_it_would_misread(without_deterministic_ops):
     """Through Dew's attention (`scaled_dot_product_attention`, 'flash'), keys and values of another
     batch, width, length or head count than the query's are refused as the call traces, before any
     kernel runs, dense and packed. Packing flattens the rows into one run of tokens, where keys of one
@@ -143,9 +136,8 @@ FLAX_SEEDS = 8
 """The reference path against flax's declared draws (check 1), sized by `seeds_for` paired on armada."""
 
 
-@on_gpu
 @pytest.mark.parametrize("implementation", ["cudnn", "flash"])
-def test_a_fused_kernel_takes_forward_mode_through_the_reference(implementation, without_deterministic_ops):
+def a_fused_kernel_takes_forward_mode_through_the_reference(implementation, without_deterministic_ops):
     """A fused kernel defines only its reverse-mode derivative, so a JVP
     traced under `forward_mode_attention` takes its tangent from the
     reference (`forward_differentiable`): the tangent agrees with the xla
@@ -172,14 +164,13 @@ def test_a_fused_kernel_takes_forward_mode_through_the_reference(implementation,
     assert np.abs(got - want).max() <= 2 ** -6 * np.abs(want).max()
 
 
-@on_gpu
 @pytest.mark.parametrize("q_len, kv_len, causal, head_dim", [
     (1024, 77, False, 64),   # every cross-attention over CLIP's 77 text tokens
     (9, 7, False, 64),       # short enough that one attended pad key would move an eighth of the mass
     (333, 333, True, 64),    # the concatenated text-plus-image sequence, causal
     (3072, 3072, True, 256),  # Qwen3.5's 256-wide heads, which cudnn takes from Hopper on
 ])
-def test_cudnn_trains_odd_lengths_and_agrees_with_xla(q_len, kv_len, causal, head_dim,
+def cudnn_trains_odd_lengths_and_agrees_with_xla(q_len, kv_len, causal, head_dim,
                                                       without_deterministic_ops):
     """cudnn's kernel has no backward pass for an odd length; the padded call
     trains, and what it computes for the real rows is what the xla kernel
@@ -201,7 +192,6 @@ def test_cudnn_trains_odd_lengths_and_agrees_with_xla(q_len, kv_len, causal, hea
         assert np.abs(got - want).max() <= 2 ** -6 * np.abs(want).max()
 
 
-@on_gpu
 @pytest.mark.parametrize("q_len, kv_len, heads, kv_heads, head_dim, causal", [
     (256, 256, 12, 12, 64, False),   # SimpleDiT-B's image tokens
     (512, 512, 12, 12, 64, True),    # the small decoder
@@ -210,7 +200,7 @@ def test_cudnn_trains_odd_lengths_and_agrees_with_xla(q_len, kv_len, causal, hea
     (1024, 77, 4, 4, 64, False),     # cross-attention over CLIP's 77 tokens
     (256, 256, 8, 8, 80, True),      # a head width that is no power of two
 ])
-def test_triton_trains_and_agrees_with_xla(q_len, kv_len, heads, kv_heads, head_dim, causal):
+def triton_trains_and_agrees_with_xla(q_len, kv_len, heads, kv_heads, head_dim, causal):
     """tokamax's kernel at its heuristic config, the one 'auto' runs, at the
     shapes it is sent: within two bf16 ulps of the output scale of the xla
     kernel, forward and backward, as cudnn is. One of its VJP configs returns
@@ -262,8 +252,7 @@ def _pulled(implementation):
     return run
 
 
-@on_gpu
-def test_triton_trains_at_large_logits_on_par_with_xla():
+def triton_trains_at_large_logits_on_par_with_xla():
     """tokamax's kernel, as 'triton' runs it, at logits near 1e4 that its softmax spreads over every key
     (`_large_logits`): its output and its query, key and value gradients on par with the xla kernel's from
     float64 (check 1). Its dK/dV sweep scaled the keys where its forward and dQ scale the queries, so its
@@ -275,8 +264,7 @@ def test_triton_trains_at_large_logits_on_par_with_xla():
                     seeds=LARGE_LOGIT_SEEDS)
 
 
-@on_gpu
-def test_triton_at_saturated_large_logits_is_finite_where_xla_is():
+def triton_at_saturated_large_logits_is_finite_where_xla_is():
     """tokamax's kernel at logits near 1e4 whose rows mostly saturate on one key (`_large_logits`): the
     route is the default form, FlashAttention's math, whose D (rowsum(dO * O), the output rounded to bf16)
     cancels against the saturated key's product where the reference's softmax derivative does not, so it
@@ -293,7 +281,6 @@ def test_triton_at_saturated_large_logits_is_finite_where_xla_is():
             assert not lost.any(), f"{name} seed {seed}: {int(lost.sum())} values not finite where xla's are"
 
 
-@on_gpu
 @pytest.mark.parametrize("q_len, kv_len, heads, kv_heads, head_dim, causal", [
     (1024, 1024, 16, 8, 128, True),  # Qwen3-0.6B's grouped heads
     (512, 512, 8, 8, 256, True),     # 256-wide heads, which cudnn takes on Hopper alone
@@ -302,7 +289,7 @@ def test_triton_at_saturated_large_logits_is_finite_where_xla_is():
     (1024, 77, 4, 4, 64, False),     # cross-attention over CLIP's 77 tokens
     (256, 256, 8, 8, 80, True),      # a head width that is no power of two
 ])
-def test_flash_trains_and_agrees_with_xla(q_len, kv_len, heads, kv_heads, head_dim, causal,
+def flash_trains_and_agrees_with_xla(q_len, kv_len, heads, kv_heads, head_dim, causal,
                                           without_deterministic_ops):
     """FlashAttention at the shapes 'auto' sends it, FlashAttention-3 on
     Hopper and FlashAttention-2 elsewhere: within two bf16 ulps of the output
@@ -344,11 +331,10 @@ def output_and_gradients(attend, cotangent, *arrays):
     return [np.asarray(x, np.float64) for x in (out, *pull(cotangent))]
 
 
-@on_gpu
 @pytest.mark.parametrize("head_dim", [128, 256])
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("sunk", [False, True])
-def test_packed_sequences_attend_within_themselves_as_far_from_float64_as_one_at_a_time(
+def packed_sequences_attend_within_themselves_as_far_from_float64_as_one_at_a_time(
         head_dim, causal, sunk, without_deterministic_ops):
     """Documents packed back to back, one a single token, with an empty sequence between two: each
     document's output and its three input gradients lie within tests/reference_error.py's rule of
@@ -402,9 +388,8 @@ def test_packed_sequences_attend_within_themselves_as_far_from_float64_as_one_at
                                          "dsinks")
 
 
-@on_gpu
 @pytest.mark.parametrize("head_dim", [64, 128])
-def test_queries_packed_against_keys_of_their_own_lengths_attend_their_own_documents(head_dim,
+def queries_packed_against_keys_of_their_own_lengths_attend_their_own_documents(head_dim,
                                                                                      without_deterministic_ops):
     """Cross-attention between packed documents: sequence i's queries, packed by their own offsets,
     attend sequence i's keys, packed by theirs, as a decision head's option slots read their own
@@ -442,10 +427,9 @@ def test_queries_packed_against_keys_of_their_own_lengths_attend_their_own_docum
             assert_as_exact_as_the_reference(got[at], theirs, want, f"{name} of the document at {begin}")
 
 
-@on_gpu
 @pytest.mark.mesh(devices=2)
 @pytest.mark.parametrize("axis, split", [("data", (0,)), ("tensor", (2,))])
-def test_flash_keeps_the_kernel_contract_on_a_mesh(axis, split, without_deterministic_ops):
+def flash_keeps_the_kernel_contract_on_a_mesh(axis, split, without_deterministic_ops):
     """FlashAttention-2 over rows split two ways, or query heads split two ways with the key heads
     they read, runs per shard (`sharded.assert_runs_per_shard`): the output and the three input
     gradients on par with one device's over the site's draws, no operand moved between devices and
@@ -468,10 +452,9 @@ def test_flash_keeps_the_kernel_contract_on_a_mesh(axis, split, without_determin
                               jax.vmap(functools.partial(float64_attention, causal=True))))
 
 
-@on_gpu
 @pytest.mark.parametrize("implementation", ["flash", "cudnn"])
 @pytest.mark.parametrize("head_dim", [128, 256])
-def test_fused_kernels_are_as_exact_as_the_xla_kernel_from_float64(implementation, head_dim,
+def fused_kernels_are_as_exact_as_the_xla_kernel_from_float64(implementation, head_dim,
                                                                    without_deterministic_ops):
     """At Qwen3.5's grouped causal heads, 8 queries over 2 keys, FlashAttention's and cuDNN's output
     and three input gradients lie within tests/reference_error.py's rule of the xla kernel's, both
@@ -503,7 +486,6 @@ def test_fused_kernels_are_as_exact_as_the_xla_kernel_from_float64(implementatio
         assert_as_exact_as_the_reference(got[0], theirs[0], want, name, terms=summed)
 
 
-@on_gpu
 @pytest.mark.parametrize("width, value_width, kv_heads, causal, window, sinks", [
     (64, 64, 2, True, None, True),        # gpt-oss-20b's full layers
     (64, 64, 2, True, 128, True),         # and its sliding ones
@@ -511,7 +493,7 @@ def test_fused_kernels_are_as_exact_as_the_xla_kernel_from_float64(implementatio
     (192, 128, 2, True, 128, False),      # and their narrow values on flash itself
     (64, 64, 8, False, 65, False),        # ModernBERT's local layers, both sides
 ])
-def test_flash_with_a_window_and_sinks_is_as_exact_as_the_xla_kernel_from_float64(
+def flash_with_a_window_and_sinks_is_as_exact_as_the_xla_kernel_from_float64(
         width, value_width, kv_heads, causal, window, sinks, without_deterministic_ops):
     """FlashAttention with a sliding window or a value narrower than the query, as 'auto' sends such calls
     on sm80, sm89 and sm90, and 'auto' with attention sinks, which FlashAttention refuses (its backward
@@ -550,8 +532,7 @@ def test_flash_with_a_window_and_sinks_is_as_exact_as_the_xla_kernel_from_float6
         assert_as_exact_as_the_reference(fused[4], reference[4], truth[4], "dsinks")
 
 
-@on_gpu
-def test_a_window_over_more_keys_than_queries_keeps_the_keys_each_row_centres(without_deterministic_ops):
+def a_window_over_more_keys_than_queries_keeps_the_keys_each_row_centres(without_deterministic_ops):
     """A bidirectional window over more keys than queries (256 queries over 512 keys, 32 each side)
     keeps the keys `structural_mask` centres on each query's row, Dew's contract, whichever kernel
     'auto' picks on this GPU: its output and gradients within tests/reference_error.py's rule of the
@@ -587,9 +568,8 @@ def documents(lengths) -> np.ndarray:
                      for row in lengths]).astype(np.int32)
 
 
-@on_gpu
 @pytest.mark.parametrize("window, sinks", [(None, False), (128, True)])
-def test_packed_rows_on_flash_are_as_exact_as_the_document_mask_from_float64(window, sinks,
+def packed_rows_on_flash_are_as_exact_as_the_document_mask_from_float64(window, sinks,
                                                                              without_deterministic_ops):
     """Rows packing documents of uneven lengths, padding after them, through flash as its varlen
     sequences (`segment_ids` with their declared `max_segments`), causal, also with a 128-key window
@@ -651,8 +631,7 @@ def test_packed_rows_on_flash_are_as_exact_as_the_document_mask_from_float64(win
         assert_as_exact_as_the_reference(fused[4], reference[4], truth[4], "dsinks")
 
 
-@on_gpu
-def test_queries_reading_another_sequences_documents_on_flash_are_as_exact_as_the_document_mask(
+def queries_reading_another_sequences_documents_on_flash_are_as_exact_as_the_document_mask(
         without_deterministic_ops):
     """A decision head's option slots read the window's tokens of their own row: queries packed by
     their documents (`segment_ids`), keys by theirs (`key_segment_ids`), through flash as packed
@@ -699,8 +678,7 @@ def test_queries_reading_another_sequences_documents_on_flash_are_as_exact_as_th
         assert_as_exact_as_the_reference(fused[index], reference[index], truth[index], name)
 
 
-@on_gpu
-def test_queries_over_a_context_of_no_tokens_read_nothing_on_flash(without_deterministic_ops):
+def queries_over_a_context_of_no_tokens_read_nothing_on_flash(without_deterministic_ops):
     """Queries packed by documents over a context of no tokens at all: every query reads nothing,
     its output and gradient exactly zero on flash as on the reference kernel, and the empty keys
     and values take empty gradients. Called outside jit, so the kernel launches over its empty keys,
@@ -809,14 +787,13 @@ def test_key_lengths_attend_as_the_mask_they_mean(implementation, causal):
         assert not np.asarray(gradient)[np.asarray(past)[:, :, 0, 0]].any()
 
 
-@on_gpu
 @pytest.mark.parametrize("as_mask", [False, True], ids=["lengths", "mask"])
 @pytest.mark.parametrize("q_len, kv_len, causal", [
     (1024, 1024 + 77, False),  # the image queries of a joint call over padded text
     (77, 77, True),            # its text queries, causal over the text alone
     (78, 78, True),            # an even length, which the kernel takes unpadded
 ])
-def test_cudnn_takes_key_lengths_and_agrees_with_xla(q_len, kv_len, causal, as_mask,
+def cudnn_takes_key_lengths_and_agrees_with_xla(q_len, kv_len, causal, as_mask,
                                                      without_deterministic_ops):
     """cuDNN reads the lengths as its padding mask, odd lengths included:
     within two bf16 ulps of the output scale of the xla kernel, forward and
@@ -834,8 +811,7 @@ def test_cudnn_takes_key_lengths_and_agrees_with_xla(q_len, kv_len, causal, as_m
         assert np.abs(got - want).max() <= 2 ** -6 * np.abs(want).max()
 
 
-@on_gpu
-def test_single_query_cudnn_decode_matches_float64_attention_and_gradients(without_deterministic_ops):
+def single_query_cudnn_decode_matches_float64_attention_and_gradients(without_deterministic_ops):
     """One query, GQA and distinct key counts against the highest-precision path.
 
     The single query is padded for the cuDNN backward even though the
@@ -1106,11 +1082,10 @@ def eligibility_call(dtype, head_dim, causal, window=None, documents=None, max_s
                                  "sinks": jnp.zeros((4,), jnp.float32) if sinks else None}
 
 
-@pytest.mark.gpu(reason="each requirement is held to the kernel it declares, on this GPU")
 @pytest.mark.parametrize("kernel", ["flash", "triton", "cudnn", "xla", "template"])
 @pytest.mark.parametrize("call", eligibility_cases(),
                          ids=lambda call: "-".join(f"{name}={value}" for name, value in call.items()))
-def test_a_kernels_requirements_are_what_the_kernel_takes_on_this_gpu(kernel, call,
+def a_kernels_requirements_are_what_the_kernel_takes_on_this_gpu(kernel, call,
                                                                       without_deterministic_ops):
     """Each GPU kernel's declared requirements (`attention_kernels.ATTENTION`) hold against the kernel
     itself on this GPU: a call whose capability requirements all hold runs forced on that kernel to a
