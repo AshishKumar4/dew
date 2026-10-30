@@ -493,13 +493,14 @@ class TrainingScalars[Statistics, Additions]:
 class Prediction:
     """What a token objective scored a batch with, for comparison with a teacher.
 
-    - `logits`: the `[B, S, vocab]` fp32 scores from the model's forward pass.
+    - `logits`: the `[B, S, vocab]` fp32 scores from the model's forward pass, None where the caller
+      asked for none (`predict`'s `logits`): its loss scored them a tile at a time and held none.
     - `losses`: the `[B, S]` per-position loss the objective sums.
     - `weights`: the `[B, S]` weight the objective gives each position.
     - `hidden`: the `[B, S, D]` states of the layers the caller asked for,
       in the order asked.
     """
-    logits: jax.Array
+    logits: jax.Array | None
     losses: jax.Array
     weights: jax.Array
     hidden: tuple[jax.Array, ...]
@@ -1292,11 +1293,11 @@ class Objective(ABC, Generic[Loss, Effects]):
         raise TypeError("deferred effects require Objective.apply_effects")
 
     def predict(self, params: Variables, batch: Batch, step: Step, *, train: bool,
-                layers: Sequence[int] = ()) -> tuple[Ratio, Aux[Effects], Prediction]:
+                layers: Sequence[int] = (), logits: bool = True) -> tuple[Ratio, Aux[Effects], Prediction]:
         """Return the loss over `batch` as `loss` computes it, together with the prediction behind it.
 
         The result holds the statistics, the `Aux` reports and a `Prediction`
-        with the token logits, the weight of every position and the hidden
+        with the token logits (none unless `logits`), the weight of every position and the hidden
         states of `layers`. The statistics are one `Ratio` over the positions
         the weights count, so a distillation can mix in terms over the same
         mass. `train` turns dropout on, as `loss` has it; a frozen teacher

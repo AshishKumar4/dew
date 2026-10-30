@@ -25,7 +25,7 @@ import jax
 import numpy as np
 
 from dew import _records
-from dew.cache import hub_answer, hub_commit, hub_ref, recorded_hub_answer
+from dew.cache import hub_answer, hub_commit, hub_storage, recorded_hub_answer
 from dew.interop import pickles
 from dew.interop.safetensors_io import (
     LazyTensors,
@@ -93,30 +93,21 @@ class SourceReference:
         return snapshot(self.name, self.revision, weights=False) / (self.subfolder or "")
 
     def pinned(self) -> SourceReference:
-        """This source at the commit its revision resolves to now, as a run records it (`hub_commit`):
-        online the Hub's answer; offline the Hub cache's ref (`hub_ref`) over a recorded answer, since a
-        model's files offline are the cache's snapshot of the ref, whichever tool moved it. A local
-        directory, or a source named at a commit, is as it is."""
+        """This source at the commit its revision resolves to now, as a run records it (`hub_commit`). A
+        local directory, or a source named at a commit, is as it is."""
         from huggingface_hub.file_download import REGEX_COMMIT_HASH
 
         named = self.revision is not None and REGEX_COMMIT_HASH.fullmatch(self.revision)
         if os.path.isdir(self.name) or named:
             return self
-        answer = hub_commit(self.name, self.revision)
-        ref = hub_ref(self.name, self.revision)
-        commit = ref.read_text().strip() if answer.recorded and ref.is_file() else answer.value
-        return replace(self, revision=commit)
+        return replace(self, revision=hub_commit(self.name, self.revision).value)
 
     def cached(self) -> Path:
         """The cache's snapshot folder of this source's commit (`pinned` first), where its files land as
         they are fetched (`file`), with none fetched here."""
-        from huggingface_hub import constants
-        from huggingface_hub.file_download import repo_folder_name
-
         if os.path.isdir(self.name):
             return Path(self.name)
-        folder = Path(constants.HF_HUB_CACHE) / repo_folder_name(repo_id=self.name, repo_type="model")
-        return folder / "snapshots" / str(self.pinned().revision)
+        return hub_storage(self.name) / "snapshots" / str(self.pinned().revision)
 
     def spelled(self) -> str:
         """The `repo@revision` spelling `parse` reads back, or the name alone."""

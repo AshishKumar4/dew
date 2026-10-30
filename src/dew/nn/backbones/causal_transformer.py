@@ -2131,10 +2131,9 @@ class CausalTransformer(nn.Module):
         """Each vocabulary token's `[features]` row of the head (`OutputTable.rows`) where no exact
         table is: past a `head_transform` the matrix's, with an adapter on the head as it updates them
         (`applied_kernel`), and past an embedding's own width in the stream's, through `project_out`."""
-        rows = self._head_table().rows()
-        if self.embedding_features is None:
-            return rows
-        return rows @ self.applied_kernel("project_out").T.astype(rows.dtype)
+        table = self._head_table()
+        rows = table.rows()
+        return rows if table.projection is None else rows @ table.projection.kernel.T.astype(rows.dtype)
 
     def _quantizer(self, layer: nn.Module):
         """A checkpoint's quantizer of `layer`'s input, None where the model computes under none."""

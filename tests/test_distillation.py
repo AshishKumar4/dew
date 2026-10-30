@@ -503,7 +503,9 @@ def test_selected_distillation_weights_each_sampled_tokens_score_by_its_reverse_
     """On-policy distillation at the tokens the batch holds (`divergence='selected'`, alpha 1): its
     gradient is the score function of each sampled token weighted by its log-ratio
     log pi_s(y) - log pi_t(y), the teacher frozen, as the hand formula over the two models' own
-    log-likelihoods gives it, bit for bit; the reported estimate is that log-ratio's mean."""
+    log-likelihoods gives it, bit for bit, each scored as its loss scores it with no whole logits held
+    (`predict`'s `logits`); the reported estimate is that log-ratio's mean. A temperature, and a teacher
+    of another vocabulary size, are refused."""
     arrays = fixture()
     objective, params = fixture_objective(arrays, alpha=1.0, temperature=1.0, beta=0.0, features=[],
                                           divergence="selected")
@@ -512,8 +514,9 @@ def test_selected_distillation_weights_each_sampled_tokens_score_by_its_reverse_
 
     def by_hand(student_params):
         _, _, own = student.predict(objective.student_variables({**params, "params": student_params}), batch,
-                                    step_at(), train=False)
-        _, _, held = teacher.predict(params[TEACHER], batch, step_at(), train=False)
+                                    step_at(), train=False, logits=False)
+        _, _, held = teacher.predict(params[TEACHER], batch, step_at(), train=False, logits=False)
+        assert own.logits is None and held.logits is None
         ratio = jax.lax.stop_gradient(held.losses - own.losses)
         weights = own.weights.astype(jnp.float32)
         return jnp.sum(ratio * -own.losses * weights) / jnp.sum(weights)
@@ -525,6 +528,10 @@ def test_selected_distillation_weights_each_sampled_tokens_score_by_its_reverse_
                  objective.student_variables({"params": expected})["params"])
     with pytest.raises(ValueError):
         DistillationObjective(student, teacher, divergence="selected", temperature=2.0)
+    # A teacher scoring another vocabulary's ids: the selected term, holding no logits, reads the sizes.
+    wider = LMObjective(teacher.model.clone(vocab_size=teacher.model.vocab_size + 1), SEQ, ema_decay=None)
+    with pytest.raises(ValueError):
+        DistillationObjective(student, wider, divergence="selected")
 
 
 @pytest.mark.parametrize("scores", [True, False], ids=["scores and states", "states alone"])

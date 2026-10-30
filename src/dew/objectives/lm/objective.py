@@ -1344,16 +1344,18 @@ class LMObjective(TokenScorer):
                                                   summed=step.training)
         return statistics, aux
 
-    def predict(self, params, batch, step: Step, *, train: bool,
-                layers: Sequence[int] = ()) -> tuple[Ratio, Aux[Variables], Prediction]:
+    def predict(self, params, batch, step: Step, *, train: bool, layers: Sequence[int] = (),
+                logits: bool = True) -> tuple[Ratio, Aux[Variables], Prediction]:
         """Return the loss with the logits, target weights and `layers` outputs behind it.
 
         A teacher compares these (`Objective.predict`). The logits are the whole
         `[B, seq_len, vocab]` fp32 tensor that the chunked loss never holds, because a
-        distillation's KL reads every column. The balance loss's and the router z-loss's terms
-        normalize per router, so they cannot share a distillation's token mass and are refused;
-        a `balance_rate` alone balances without a loss term. The indexer warm-up
-        scores no tokens, so it has nothing to distill.
+        distillation's KL reads every column; without `logits` the loss is scored as `loss` scores
+        it, its head a tile at a time where its policy tiles it, and the prediction holds none (a
+        distillation reading the sampled ids' likelihoods alone). The balance loss's and the router
+        z-loss's terms normalize per router, so they cannot share a distillation's token mass and are
+        refused; a `balance_rate` alone balances without a loss term. The indexer warm-up scores no
+        tokens, so it has nothing to distill.
         """
         if self._warmup:
             raise ValueError("the indexer warm-up scores no token, so it has no prediction")
@@ -1364,10 +1366,10 @@ class LMObjective(TokenScorer):
                 "distillation mixes terms over the counted tokens; balance the "
                 "student's routers with balance_rate instead")
         statistics, aux, scores, _ = self._scored_loss(params, batch, step, train=train, layers=layers,
-                                                       logits=True)
-        assert isinstance(statistics, Ratio) and scores.logits is not None
-        logits = constrain(scores.logits, LOGITS)
-        return statistics, aux, Prediction(logits, scores.losses, scores.weights, scores.layers)
+                                                       logits=logits)
+        assert isinstance(statistics, Ratio) and (scores.logits is not None or not logits)
+        whole = None if scores.logits is None else constrain(scores.logits, LOGITS)
+        return statistics, aux, Prediction(whole, scores.losses, scores.weights, scores.layers)
 
     def _scored_loss(self, params, batch, step: Step, *, train: bool, layers: Sequence[int] = (),
                      summed: bool = False, logits: bool = False, predict: bool | None = None) -> _Scored:
