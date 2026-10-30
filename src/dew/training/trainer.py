@@ -1575,8 +1575,7 @@ class Trainer(Generic[Loss, Effects]):
         under "never" into a directory that holds no run either. An objective that names its input field
         alone declares it first (`_declare_input`)."""
         checkpoints = self.checkpoints
-        if self.objective.named_inputs is not None and self.objective.inputs is None:
-            self._declare_input(self.objective.named_inputs, dataset)
+        self._declare_input(lambda: first_batch(dataset, self.device_mesh))
         if resume == "require" and (checkpoints is None or initial is not None):
             raise ValueError("resume='require' continues the checkpointer's latest checkpoint, which a "
                              "trainer with no checkpointer, or a run given its state=, starts without")
@@ -1602,15 +1601,18 @@ class Trainer(Generic[Loss, Effects]):
         return (start.resume, checkpoints.position(start.resume, DataPartition.of(self.device_mesh)),
                 lambda: self._placed(start, positioned=False)[:2], start.abstract)
 
-    def _declare_input(self, named: str, dataset: Loader) -> None:
-        """Declare the objective's input `named` (`Objective.named_inputs`) at the per-example shape its
-        model reads (`Field.of`): of `dataset`'s first batch, placed as the run places it and through the
-        loader's device steps (`_model_shapes`), which may crop or resize it, agreed across the pool
-        before anything initializes."""
+    def _declare_input(self, first: Callable[[], Batch]) -> None:
+        """Declare the objective's input where it names its field alone (`Objective.named_inputs`), at the
+        per-example shape its model reads (`Field.of`) of the run's first batch, `first`'s, placed as the
+        run places it and through the loader's device steps (`_model_shapes`), which may crop or resize
+        it, agreed across the pool before anything initializes."""
+        named = self.objective.named_inputs
+        if named is None or self.objective.inputs is not None:
+            return
         mesh = self.device_mesh
-        first = agreed("training input batch", lambda: first_batch(dataset, mesh))
+        batch = agreed("training input batch", first)
         with jax.set_mesh(mesh):
-            device, _ = split_fields(placed_abstract(mesh, first))
+            device, _ = split_fields(placed_abstract(mesh, batch))
             shape = Field.of(named, self._model_shapes(device)).shape
         held = agreed_same("training input shape", lambda: list(shape))
         self.objective.inputs = InputSpec(Field(named, tuple(held)))

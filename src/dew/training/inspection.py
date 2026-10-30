@@ -114,6 +114,8 @@ def inspected[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch, 
     `steps`, the run's length, as `fit(steps=...)` builds it. The stepped state is discarded."""
     if trainer.inspection is None:
         raise ValueError("the trainer names no inspection (Trainer(inspection=...)) to report")
+    # An objective that names its input field alone reads its shape off the batch, as `fit` does.
+    trainer._declare_input(lambda: batch)
     trainer.scheduled(None if steps is None else steps // trainer.accumulation)
     state, _, _ = trainer.place()
     step, window = trainer.compile(state, batch), int(state.window_size)
