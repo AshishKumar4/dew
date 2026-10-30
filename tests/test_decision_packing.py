@@ -361,8 +361,10 @@ def assert_rows_decided_alone(objective, wide_modules, seeds: int, count: int = 
     # A logit sums within its row's window; a parameter's gradient over every window's tokens, in
     # another order than the rows alone.
     initialized = jax.jit(objective.init)
+    # A leaf whose float64 truth cancels, an algebraic zero's, is sized by the terms its sums add
+    # (`terms`), so each arm's rounding of them is on par, on every backend.
     assert_as_exact(packed, alone, lambda seed: (initialized(jax.random.key(seed)),), "packed window",
-                    seeds=seeds, truth_fn=truth)
+                    seeds=seeds, truth_fn=truth, terms=True)
 
 
 def test_a_decision_run_steps_one_program_over_rows_of_every_length():

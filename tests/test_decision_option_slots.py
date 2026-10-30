@@ -244,7 +244,7 @@ def test_a_ragged_batch_trains_on_compacted_options_as_on_the_grid():
     on_grid = scored(objective, grid)
     # The truth of the algebraic zeros is exactly zero, which each of their rows is held to.
     assert_as_exact(scored(objective, compact), on_grid, draw, "compacted options logits and gradients",
-                    seeds=OPTION_SEEDS, truth_fn=lambda *inputs: zeroed(on_grid(*inputs)))
+                    seeds=OPTION_SEEDS, truth_fn=lambda *inputs: zeroed(on_grid(*inputs)), terms=True)
 
     step = Step(jnp.asarray(0), jax.random.key(0), None)
 
