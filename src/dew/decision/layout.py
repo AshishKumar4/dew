@@ -717,11 +717,6 @@ class QuestionLayout(Layout):
                              "none of")
         if self.blocks and self.parallel:
             raise ValueError("blocks and parallel options each say what a row's tokens read; a row takes one")
-        streams = {segment.stream for segment in self.written
-                   if isinstance(segment, (Instructions, OptionLines))}
-        if len(streams) > 1:
-            raise ValueError("a question's instructions and its option lines are read in one stream, the "
-                             "row's or its context's")
         if self.spans_in_context and (self.parallel or any(
                 isinstance(segment, OptionLines) and segment.marker != "none" for segment in self.written)):
             raise ValueError("options read at their positions or markers stand in the row's tokens, which a "
@@ -769,7 +764,7 @@ class QuestionLayout(Layout):
     @property
     def spans_in_context(self) -> bool:
         """Whether its row writes its question to its context (`Instructions.stream`)."""
-        return any(isinstance(segment, (Instructions, OptionLines)) and segment.stream == "context"
+        return any(isinstance(segment, Instructions) and segment.stream == "context"
                    for segment in self.written)
 
     @property
@@ -924,7 +919,8 @@ class QuestionLayout(Layout):
         current = "row"
         for segment in self.written:
             # Where the row turns to another of its streams, its tokens are marked there (`Reads`).
-            current = stream_point(chunks, segment_stream(segment), current) if self.reads else current
+            current = (stream_point(chunks, segment_stream(segment, self.written), current) if self.reads
+                       else current)
             if isinstance(segment, Text):
                 chunks.append(Chunk(segment.text))
             elif isinstance(segment, Special):
@@ -939,7 +935,8 @@ class QuestionLayout(Layout):
                 head_at = _instruction_chunks(context if segment.stream == "context" else chunks, segment,
                                               question, specials, opening)
             elif isinstance(segment, OptionLines):
-                line_at, labelled = self._option_chunks(context if segment.stream == "context" else chunks,
+                lines_in = segment_stream(segment, self.written)
+                line_at, labelled = self._option_chunks(context if lines_in == "context" else chunks,
                                                         segment, question, described, slots, names, texts,
                                                         specials)
             elif isinstance(segment, AnswerCue):
@@ -1496,7 +1493,7 @@ class Reads:
     """Which of a row's streams each stream's tokens attend to: its attention record (row 2319).
 
     A row's tokens stand in streams: `"row"`, and each other stream a segment names (`Schema.stream`,
-    `Instructions.stream`, `OptionLines.stream`), every other segment in the row's own. `table`
+    `Instructions.stream`, its option lines with it), every other segment in the row's own. `table`
     holds `(reader, read, how)`: a token of `reader` reads the tokens of `read` (`"self"`, its own
     stream), all of them (`"whole"`) or those up to itself (`"causal"`); a pair the table omits reads
     none. Two streams in one pass where the state reads the schema and the schema itself alone:
@@ -1544,22 +1541,27 @@ def _streamed(segments: "Sequence[Segment | QuestionSegment]", reads: "Reads | N
         reads.lowered(stream_names(segments))
 
 
-def segment_stream(segment: "Segment | QuestionSegment") -> str:
-    """The stream a segment's tokens stand in (`Reads`): its own where it names one, else the row's."""
-    return segment.stream if isinstance(segment, (Schema, Instructions, OptionLines)) else "row"
+def segment_stream(segment: "Segment | QuestionSegment",
+                   segments: "Sequence[Segment | QuestionSegment]") -> str:
+    """The stream a segment of a row's `segments` stands in (`Reads`): its own where it names one, a
+    question's option lines its instructions' (`Instructions.stream`), else the row's."""
+    if isinstance(segment, OptionLines):
+        return next((part.stream for part in segments if isinstance(part, Instructions)), "row")
+    return segment.stream if isinstance(segment, (Schema, Instructions)) else "row"
 
 
 def stream_names(segments: "Sequence[Segment | QuestionSegment]") -> tuple[str, ...]:
     """A row's streams (`Reads`): the row's, then each other one its `segments` name in their order, the
     context its cross-attention reads not among them."""
-    named = [segment_stream(segment) for segment in segments]
+    named = [segment_stream(segment, segments) for segment in segments]
     return ("row", *dict.fromkeys(name for name in named if name not in ("row", "context")))
 
 
 def fragment_count(segments: "Sequence[Segment | QuestionSegment]") -> int:
     """The most runs of one stream a row of `segments` lays (the layout's framing in the row's stream):
     the spans the model lowers its reads over (`DecisionInputs.fragments`)."""
-    named = ["row", *(name for name in map(segment_stream, segments) if name != "context"), "row"]
+    named = ["row", *(name for name in (segment_stream(segment, segments) for segment in segments)
+                      if name != "context"), "row"]
     return sum(1 for index, name in enumerate(named) if index == 0 or name != named[index - 1])
 
 
@@ -1658,8 +1660,8 @@ class OptionLines:
 
     `marker` writes the layout's marker token before or after each line, where the option is read at
     its marker (Laya's markers before, a causal row's after) and its span is the marker's; `none` reads
-    the options under labels at the answer cue. `stream` is where they are read, as their question's
-    instructions are (`Instructions.stream`)."""
+    the options under labels at the answer cue. They are read where their question's instructions are
+    (`Instructions.stream`)."""
 
     line: str = "{label}. {name}: {text}"
     bare: str = "{label}. {name}"
@@ -1670,7 +1672,6 @@ class OptionLines:
     criteria: Mapping[str, str] = dataclasses.field(default_factory=dict)
     marker: Literal["none", "before", "after"] = "none"
     noul_first: Literal["true", "false"] = "true"
-    stream: str = "row"
 
 
 @dataclass(frozen=True)
@@ -1766,14 +1767,9 @@ class JointLayout(Layout):
         _streamed(self.segments, self.reads)
 
     @property
-    def schema_in_context(self) -> bool:
+    def spans_in_context(self) -> bool:
         """Whether the row's schema is its context (`Schema.stream`), its spans the context's."""
         return any(isinstance(segment, Schema) and segment.stream == "context" for segment in self.segments)
-
-    @property
-    def spans_in_context(self) -> bool:
-        """Whether the row's schema is its context (`schema_in_context`)."""
-        return self.schema_in_context
 
     @property
     def attention(self) -> "tuple[tuple[tuple[int, ...], ...], int] | None":
@@ -1811,7 +1807,7 @@ class JointLayout(Layout):
                 else:
                     laid_out.append((None, Chunk(text)))
                 continue
-            if isinstance(part, Schema) and not self.schema_in_context:
+            if isinstance(part, Schema) and not self.spans_in_context:
                 chunk = Chunk(ids=schema.tokens,
                               marks=tuple((key, *span) for key, span in schema.marks.items()))
             elif isinstance(part, Media) and media:
@@ -1833,10 +1829,11 @@ class JointLayout(Layout):
         kept_count = min((len(chunk.ids or ()) for (segment, _), chunk in zip(laid_out, chunks, strict=True)
                           if isinstance(segment, State)), default=0)
         # Where the row turns to another of its streams, its tokens are marked there (`Reads`).
-        streams = [segment_stream(segment) if segment is not None else "row" for segment, _ in laid_out]
+        streams = [segment_stream(segment, self.segments) if segment is not None else "row"
+                   for segment, _ in laid_out]
         row = rendered_chunks(streamed_chunks(chunks, streams) if self.reads is not None else chunks,
                               pieces, "pieces")
-        marks = schema.marks if self.schema_in_context else row.marks
+        marks = schema.marks if self.spans_in_context else row.marks
         laid = tuple(Laid(name, kind_of(question), marks[(name, INSTRUCTIONS_MARK)],
                           tuple(marks[(name, number)] for number in range(len(slots))), tuple(slots))
                      for (name, question), slots in zip(questions.items(), self._slots(questions, orders),
@@ -1850,7 +1847,7 @@ class JointLayout(Layout):
         if tokens_streams is not None and media:
             raise ValueError("a row whose streams say what each token reads holds no images, whose tokens "
                              "read each other whole; send the request without them")
-        if self.schema_in_context:
+        if self.spans_in_context:
             # The schema is the row's context, its spans the context's own positions.
             return [Encoded(row.tokens, laid, None, None, whole, kept_count, row.marks.get(MEDIA_MARK),
                             context=schema.tokens, spans_in_context=True, state_cut=state_cut,

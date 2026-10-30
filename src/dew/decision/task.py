@@ -1269,7 +1269,7 @@ def laid_out(batch: Mapping[str, object], max_segments: int, *, spans_in_context
              attention: tuple[tuple[tuple[int, ...], ...], int] | None = None) -> DecisionInputs:
     """The `DecisionInputs` of a batch of packed windows (`PackedRows`), each
     holding at most `max_segments` rows, the questions' spans in each row's context where
-    `spans_in_context` (`JointLayout.schema_in_context`), each row's block the whole row where
+    `spans_in_context` (`JointLayout.spans_in_context`), each row's block the whole row where
     `whole_blocks` (`whole_blocks_of`), its rows read in their streams as their layout's `attention`
     says (`Layout.attention`)."""
     def array(name: str) -> jax.Array:

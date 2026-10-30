@@ -45,8 +45,8 @@ schema follows the state, the schema's tokens the schema's before them alone."""
 LETTERED = StateFirstLayout(
     labels=LABELS, max_len=256,
     segments=(Text("STATE:\n"), State(), Instructions({"choice": "{}"}, stream="question"),
-              OptionLines(line="\n{label}. {option}", bare="\n{label}. {option}", join="", noul_first="false",
-                          stream="question"),
+              OptionLines(line="\n{label}. {option}", bare="\n{label}. {option}", join="",
+                          noul_first="false"),
               AnswerCue(template="\nAnswer:", many="\nAnswer:")),
     reads=Reads((("row", "self", "causal"), ("row", "question", "whole"), ("question", "self", "causal"))))
 """A lettered row's two streams (row 2008 in one pass): the state and the cue read the whole question,

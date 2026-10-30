@@ -136,7 +136,7 @@ class DecisionObjective(Objective[Ratio | Weighted]):
 
     def real_lengths(self, batch: Batch) -> np.ndarray:
         """Each packed row's own length, not its window's."""
-        return _rows(batch, self.schema_in_context)[0]
+        return _rows(batch, self.spans_in_context)[0]
 
     def model_flops(self, model, batch: Batch) -> float:
         """One backbone pass, its cross-attention over each row's context where rows carry one
@@ -149,9 +149,9 @@ class DecisionObjective(Objective[Ratio | Weighted]):
 
     def _context_lengths(self, batch: Batch) -> np.ndarray | None:
         """Each window row's context length where the backbone reads the context in a pass of its own,
-        as it reads a schema in context (`schema_in_context`) or encodes every context
+        as it reads a schema in context (`spans_in_context`) or encodes every context
         (`DecisionModel.context_encoder`); None where it reads none."""
-        passes = self.schema_in_context or self.model.context_encoder == "backbone"
+        passes = self.spans_in_context or self.model.context_encoder == "backbone"
         if not passes or "context_lengths" not in batch:
             return None
         return self._row_contexts(batch)
@@ -188,11 +188,11 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         if isinstance(tokens, ModelInputs) and tokens.conditioning:
             raise MissingFlopsCount("DecisionObjective needs its image tower's multi-sequence geometry")
         # Spans in the context pool over its tokens, not the row's, where the head pools them.
-        pools = self.schema_in_context and model.head.pools_spans
+        pools = self.spans_in_context and model.head.pools_spans
         if not isinstance(model.head, CountedDecisions):
             raise MissingFlopsCount(f"{type(model.head).__name__} has no declared decision_flops")
         pooled = self._context_lengths(batch) if pools else None
-        return model.head.decision_flops(*_rows(batch, self.schema_in_context),
+        return model.head.decision_flops(*_rows(batch, self.spans_in_context),
                                          **({} if pooled is None else {"pooled": pooled}))
 
     def training_flops(self, model, batch: Batch) -> float:
@@ -349,7 +349,7 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         return self.model.context_length
 
     @property
-    def schema_in_context(self) -> bool:
+    def spans_in_context(self) -> bool:
         """Whether a row's questions are its context (`Layout.spans_in_context`): a joint row's schema, or
         a question row's question."""
         return self.layout.spans_in_context
@@ -363,7 +363,7 @@ class DecisionObjective(Objective[Ratio | Weighted]):
                                   self.context_window)
 
     def loss(self, variables: Variables, batch: Batch, step: Step):
-        inputs = laid_out(batch, self.bounds.segments, spans_in_context=self.schema_in_context,
+        inputs = laid_out(batch, self.bounds.segments, spans_in_context=self.spans_in_context,
                           whole_blocks=whole_blocks_of(self.layout),
                           attention=self.layout.attention)
         logits = self.model.logits(
@@ -397,14 +397,14 @@ class DecisionObjective(Objective[Ratio | Weighted]):
                 Aux(metrics={"accuracy": accuracy, "consistency": term.mean()[0]}))
 
     def evaluate(self, params: Variables, batch: Batch, step: Step) -> Decisions:
-        inputs = laid_out(batch, self.bounds.segments, spans_in_context=self.schema_in_context,
+        inputs = laid_out(batch, self.bounds.segments, spans_in_context=self.spans_in_context,
                           whole_blocks=whole_blocks_of(self.layout),
                           attention=self.layout.attention)
         return self._decisions(self._logits(self.evaluation_variables(params, step), inputs), inputs, batch)
 
     def _validation_scores(self, params: Variables, batch: Batch, step: Step
                            ) -> tuple[Ratio | Weighted, Decisions]:
-        inputs = laid_out(batch, self.bounds.segments, spans_in_context=self.schema_in_context,
+        inputs = laid_out(batch, self.bounds.segments, spans_in_context=self.spans_in_context,
                           whole_blocks=whole_blocks_of(self.layout),
                           attention=self.layout.attention)
         logits = self.model.logits(params, inputs)
@@ -466,7 +466,7 @@ class DecisionObjective(Objective[Ratio | Weighted]):
             train=(fit, *expand, Configured(training, needs=("slots",), scope="run", random=True)),
             evaluate=(held, *expand, Configured(evaluating, needs=("slots",), scope="run")),
             pack=packing(self.layout, self.bounds, self.context_window, grouped),
-            packed=(PackedRows(self.layout.max_len, compact, self.schema_in_context),),
+            packed=(PackedRows(self.layout.max_len, compact, self.spans_in_context),),
         )
 
     def bind_widths(self, widths: Mapping[str, object]) -> None:

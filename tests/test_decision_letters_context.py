@@ -12,9 +12,10 @@ import pytest
 from test_decision_context import assert_packed_as_alone, opened, windows_of
 
 from dew.batch import thaw
+from dew.data import Memory
 from dew.data.pipeline import Rejected
 from dew.data.text import ByteTokenizer
-from dew.decision import Choice, Decide, Example
+from dew.decision import Choice, Decide, Example, decisions
 from dew.decision.config import DecisionRunConfig, Letters
 from dew.decision.head import LabelReadout, SlotReadout
 from dew.decision.layout import (
@@ -42,8 +43,7 @@ SPECIALS = Specials(begin=None, separator=10, marker=0, marker_text="\x00", pad=
 TOKENIZER = ByteTokenizer()
 LABELS = Labels(names=("A", "B", "C", "D"), variants=("{}",), cue="\nAnswer:")
 SEGMENTS = (Text("STATE:\n"), State(), Instructions({"choice": "{}"}, stream="context"),
-            OptionLines(line="\n{label}. {option}", bare="\n{label}. {option}", join="", noul_first="false",
-                        stream="context"),
+            OptionLines(line="\n{label}. {option}", bare="\n{label}. {option}", join="", noul_first="false"),
             AnswerCue(template="\nAnswer:", many="\nAnswer:"))
 """A lettered row with its question read through cross-attention: the state and the cue in the
 row, the question and its lettered options in the context."""
@@ -194,19 +194,27 @@ def test_lettered_rows_whose_question_is_their_context_pack_several_a_window_eac
 
 
 
-def test_a_run_names_its_lettered_question_read_in_context_on_the_command_line():
-    """A lettered run on the command line: its segments are one flag, its question read as the row's context
-    among them, with the context layers that read it; one without them is refused, and so is a question
-    whose instructions and option lines stream apart, or whose options are read at markers."""
-    config = DecisionRunConfig.cli(["--pretrained", str(LLAMA), "--segments",
-                                    json.dumps(to_record(SEGMENTS, tuple[Segment, ...])),
-                                    "--context-layers", "0", "1", "head:letters", "--head.count", "4"])
+def test_a_run_names_its_lettered_question_read_in_context_on_the_command_line(tmp_path):
+    """A lettered run on the command line: its segments are one flag, its question read as the row's
+    context among them, with the context layers that read it; the parsed run trains a step, saves its
+    task, and the task loaded from the run answers at its cue with one of the question's options (row
+    2451). One without context layers is refused, and so is a question whose options are read at markers,
+    which stand in the row's tokens the context leaves."""
+    rows = Memory([{"example": example} for example in examples()]).read("memory").pipe(decisions).batch(4)
+    config = DecisionRunConfig.cli(
+        ["--pretrained", str(LLAMA), "--segments", json.dumps(to_record(SEGMENTS, tuple[Segment, ...])),
+         "--context-layers", "0", "1", "head:letters", "--head.count", "4", "--trainer.name", "letters",
+         "--trainer.checkpoint-dir", str(tmp_path / "runs"), "--trainer.steps", "1",
+         "--trainer.checkpoint-every", "1", "--trainer.multi-host", "False",
+         "--trainer.compilation-cache-dir", "None", "--model.dtype", "float32"],
+        default=DecisionRunConfig(data=rows))
     assert config.segments == SEGMENTS and isinstance(config.head, Letters)
     with pytest.raises(ValueError):
         dataclasses.replace(config, context_layers=None).prepare()
-    apart = (*SEGMENTS[:3], dataclasses.replace(SEGMENTS[3], stream="row"), SEGMENTS[4])
-    with pytest.raises(ValueError):
-        StateFirstLayout(labels=LABELS, segments=apart)
+    config.run()
+    decide = Decide.from_run(str(tmp_path / "runs" / "letters"))
+    asked = QUESTIONS[0]
+    assert decide("my card is lost", {"q": asked})["q"].choice in asked.options
     marked = (*SEGMENTS[:3], dataclasses.replace(SEGMENTS[3], marker="after"), SEGMENTS[4])
     with pytest.raises(ValueError):
         StateFirstLayout(segments=marked)
