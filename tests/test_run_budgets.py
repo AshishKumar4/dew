@@ -679,12 +679,15 @@ def test_a_run_no_pass_counts_ahead_reads_its_schedule_off_the_examples_it_consu
 def test_a_clocked_run_resumed_with_a_larger_bound_trains_on_to_it(tmp_path):
     """A run bounded in examples, trained to its bound and resumed with a larger one, trains on from the
     examples it consumed to the new bound, as a run on the steps clock resumed with more steps does: the
-    larger bound's first examples are the smaller one's, its order read further (row 2649)."""
+    larger bound's first examples are the smaller one's, its order read further (row 2649). Resumed with a
+    bound below what it consumed, it is refused: that order reads less than the run read."""
     (x,) = clocked_records(0)
     first, _ = clocked_fit(x, 1, directory=tmp_path, examples=CLOCKED_RECORDS // 2)
     assert int(first.consumed) == CLOCKED_RECORDS // 2
     resumed, _ = clocked_fit(x, 1, directory=tmp_path)
     assert int(resumed.consumed) == CLOCKED_RECORDS and int(resumed.step) > int(first.step)
+    with pytest.raises(ValueError):
+        clocked_fit(x, 1, directory=tmp_path, examples=CLOCKED_RECORDS // 2)
 
 
 def test_a_paused_run_resumed_trains_on_as_one_that_never_paused(tmp_path):
