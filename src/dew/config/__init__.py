@@ -988,7 +988,8 @@ algorithms."""
 def earlier_newton_schulz(record: Mapping[str, object]) -> Mapping[str, object]:
     """A saved run's record whose optimizer's options name Muon's Newton-Schulz precision by an earlier
     level's name (`EARLIER_NS_PRECISIONS`), with it named as a dot algorithm, or dropped where it was the
-    numerics' own. Carried to 1.0 (ledger 1552)."""
+    numerics' own: bfloat16 is the fast forms' own, and stated as `BF16_BF16_F32` where the run's forms
+    are accurate (`saved_forms`), whose own is float32 (row 2753). Carried to 1.0 (ledger 1552)."""
     fields = record.get("fields")
     optim = fields.get("optim") if isinstance(fields, Mapping) else None
     inner = optim.get("fields", optim) if isinstance(optim, Mapping) else None
@@ -997,12 +998,26 @@ def earlier_newton_schulz(record: Mapping[str, object]) -> Mapping[str, object]:
     if not isinstance(fields, Mapping) or not isinstance(optim, Mapping) or not isinstance(inner, Mapping) \
             or not isinstance(opts, Mapping) or named not in EARLIER_NS_PRECISIONS:
         return record
-    algorithm = EARLIER_NS_PRECISIONS[named]
+    trainer = fields.get("trainer")
+    accurate = isinstance(trainer, Mapping) and saved_forms(trainer) == "accurate"
+    algorithm = "BF16_BF16_F32" if named == "bfloat16" and accurate else EARLIER_NS_PRECISIONS[named]
     opts = {name: value for name, value in opts.items() if name != "ns_precision"}
     opts = opts if algorithm is None else {**opts, "ns_precision": algorithm}
     inner = {**inner, "optimizer_opts": opts}
     optim = {**optim, "fields": inner} if "fields" in optim else inner
     return {**record, "fields": {**fields, "optim": optim}}
+
+
+def saved_forms(trainer: Mapping[str, object]) -> str:
+    """The forms a saved trainer's numerics name: its precision's, a preset's name or a `Numerics`
+    record, or before it held one its `attention_form`; the fast ones where it names none."""
+    precision = trainer.get("precision")
+    if isinstance(precision, str):
+        return numerics_of(precision).forms
+    if isinstance(precision, Mapping):
+        return from_record(Numerics, precision).forms
+    form = trainer.get("attention_form")
+    return form if isinstance(form, str) else "fast"
 
 
 def earlier_compute(record: Mapping[str, object]) -> str:
