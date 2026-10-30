@@ -61,8 +61,9 @@ entries carry to their tasks (`--cache`), or without the Worker's URL and
 token, a task runs every file.
 
 A row's record also says where its tests read the backend and which are
-marked to run on a GPU, from which `gpu-tier` names the files that take
-another path on a GPU (all of them daily, the marked ones per batch). A GPU
+marked to run on a GPU (`gpu-tier --evidence` reports it); `gpu-tier` names the
+files marked to run on a GPU, a day's and a batch's alike: the behavioural flows
+(tests/test_gpu_*.py; no unit test runs on a GPU, ledger 2452). A GPU
 node runs them with `gpu-lane`, each as a task of a CUDA lane, whose rows are
 recorded and reused on the GPU's class as a CPU task's are on the CPU's. With `--network`, a GPU node that
 reaches the Hub runs every file's network-marked tests, which every other task sets aside, as one lane of
@@ -87,6 +88,7 @@ refused (`report`), its coverage partial. A target well under CI's keeps tasks s
 
 import argparse
 import ast
+import collections
 import concurrent.futures
 import functools
 import hashlib
@@ -96,6 +98,7 @@ import json
 import math
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -121,6 +124,7 @@ child_groups = _beside("child_groups")
 session = _beside("session")
 r2 = _beside("r2")
 watched = _beside("watched")
+followed = _beside("followed")
 SETTLE = 30.0
 """Seconds a task's process group has, after SIGKILL, to be reaped and gone: inside armada's own timeout
 with the default deadline and grace (session.DEADLINE + session.GRACE + 30 + the reader's 10 < .armada.json's
@@ -173,7 +177,7 @@ HARNESS = "tools/armada/"
 """The harness's directory: the recorder, plugins and cache client every test process runs, beside this file."""
 SHARED = ("pyproject.toml", "constraints.txt", "tools/armada/session.py", "tools/armada/child_groups.py",
           "tools/armada/split.py", "tools/armada/executed.py", "tools/armada/followed.py",
-          "tools/armada/watched.py")
+          "tools/armada/lifetime.py", "tools/armada/watched.py")
 """The files every test file's key covers whole, beside every lock (a GPU node builds its environment
 from its CUDA lock), the environment's own inputs, which .armada.json names (`environment_files`),
 and .armada.json's parts a test process sees (`armada_seen`): what every test process runs or reads,
@@ -290,6 +294,9 @@ def contents(name: str) -> bytes:
     if name.startswith("probe:"):
         probed = name.removeprefix("probe:")
         return b"directory" if Path(probed).is_dir() else contents(probed)
+    if followed.CODE in name:
+        path, _, executed = name.partition(followed.CODE)
+        return unit(path, executed) if Path(path).is_file() else b"missing"
     if name.startswith("import:"):
         # A top-level module a run imported (followed.py's `IMPORTED`): whether a helper under tests/, which
         # leads sys.path, would shadow it, a module or a package of that name.
@@ -309,6 +316,99 @@ def contents(name: str) -> bytes:
     return b"missing"
 
 
+def unit(path: str, name: str) -> bytes:
+    """The digest of unit `name` of code module `path`, which a run executed (followed.py's `code_unit`):
+    a function outside any function, by its qualified name (a method's by its class's), its text whole, the
+    functions and classes nested in it among it; or the module's top level (`followed.TOP`), its text with
+    every such function's body left out but what a function value shows without running it (its docstring,
+    whether it is a generator): its imports, its constants, its classes' bodies, and its functions'
+    signatures, defaults and decorators, which run as it is imported. Two functions of one name (a
+    property's getter and setter, a definition under each branch) are one unit. Positions are none of it, so
+    moving code reruns nothing; a run that reads a module's text (a traceback, inspect) reads its file
+    whole, which keys it whole, and one that takes a function's code (`__code__`) records its unit; a test
+    asserting a source position it never read is out of contract (the owner's test rules ban pinning source
+    text or positions). A module that does not compile is its text in every unit, and a unit it no longer
+    holds is b"missing"."""
+    found = units(path)
+    return found.get(name, b"missing") if isinstance(found, dict) else found
+
+
+UNITS: dict[bytes, dict[str, bytes] | bytes] = {}
+"""Each module text's units' digests (`digested`), by the text's digest: a plan keys a module's units for
+many files, and reads and hashes its text once a key (`cache_key`'s `read`)."""
+
+
+def units(path: str) -> dict[str, bytes] | bytes:
+    """Module `path`'s units' digests (`digested`): its text's digest where it does not compile."""
+    data = Path(path).read_bytes()
+    digest = hashlib.sha256(data).digest()
+    if digest not in UNITS:
+        UNITS[digest] = digested(data, path)
+    found = UNITS[digest]
+    return digest if found is None else found
+
+
+def digested(source: bytes, path: str) -> dict[str, bytes] | None:
+    """The digest of each unit of module text `source` (`unit`), or None where it does not compile
+    (`compiled`): a body left out would hide what fails it. The top level holds, beside its text with each
+    outermost function's body left out but its docstring, what compiling a body makes of the code around it
+    (`shapes`): whether a function is a generator or a coroutine, and the cells a class body makes for its
+    methods (super())."""
+    code = compiled(source, path)
+    if isinstance(code, str):
+        return None
+    tree = ast.parse(source)
+    found: dict[str, list[str]] = collections.defaultdict(list)
+
+    class Hollow(ast.NodeTransformer):
+        """The module's top level: each outermost function's text kept under its name, its body left out but
+        its docstring, which the function value shows without running."""
+
+        def __init__(self) -> None:
+            self.scope: list[str] = []
+
+        def visit_ClassDef(self, node):
+            self.scope.append(node.name)
+            self.generic_visit(node)
+            self.scope.pop()
+            return node
+
+        def visit_FunctionDef(self, node):
+            found[".".join([*self.scope, node.name])].append(ast.dump(node))
+            documented = ast.get_docstring(node, clean=False) is not None
+            node.body = [*node.body[:1 if documented else 0], ast.Pass()]
+            return node
+
+        visit_AsyncFunctionDef = visit_FunctionDef
+
+    top = ast.dump(Hollow().visit(tree)) + json.dumps(shapes(code))
+    digests = {name: hashlib.sha256("\n".join(dumps).encode()).digest() for name, dumps in found.items()}
+    return {**digests, followed.TOP: hashlib.sha256(top.encode()).digest()}
+
+
+def compiled(source: bytes, path: str) -> types.CodeType | str:
+    """Module text `source` compiled, or why it does not compile, as Python says."""
+    try:
+        return compile(source, path, "exec", dont_inherit=True)
+    except SyntaxError as error:
+        return str(error)
+
+
+def shapes(module: types.CodeType) -> list[list]:
+    """What compiling each function body outside any function makes of the code around it, shown without
+    running it: each such function's flags (a generator's, a coroutine's), and each class body's cells for
+    its methods (super(), __class__), by qualified name."""
+    found, pending = [], [module]
+    while pending:
+        code = pending.pop()
+        for const in code.co_consts:
+            if isinstance(const, types.CodeType) and ".<locals>" not in const.co_qualname:
+                outer = bool(const.co_flags & followed.OPTIMIZED)
+                found.append([const.co_qualname, const.co_flags if outer else list(const.co_cellvars)])
+                pending.append(const)
+    return sorted(found, key=json.dumps)
+
+
 def cache_key(common: str, name: str, split: str, depends: list[str]) -> str:
     """The key of test file `name`'s row in `split`'s group whose run executed or read `depends`
     (executed.py): its `inputs`' contents, its directories' entries, `common`, and for a group of a split
@@ -316,8 +416,18 @@ def cache_key(common: str, name: str, split: str, depends: list[str]) -> str:
     only part a run's outcome depends on: not their seconds, which each train's fold of main's durations
     moves (Main, 2026-10-28: every train re-keyed its split files and reran them cold, row 2000)."""
     digest = hashlib.sha256(common.encode())
+    # A module's units read from one reading of its text.
+    read: dict[str, dict[str, bytes] | bytes] = {}
     for path in inputs(name, depends):
-        digest.update(path.encode() + contents(path))
+        module, _, executed = path.partition(followed.CODE)
+        if executed and Path(module).is_file():
+            if module not in read:
+                read[module] = units(module)
+            found = read[module]
+            part = found.get(executed, b"missing") if isinstance(found, dict) else found
+        else:
+            part = contents(path)
+        digest.update(path.encode() + part)
     if split and split != COLLECT:
         digest.update(split.encode() + json.dumps(members(name, split)).encode())
     return digest.hexdigest()
@@ -334,13 +444,15 @@ def inputs(name: str, depends: list[str]) -> list[str]:
     harness's own modules (tools/armada/, which runs every test process and records it, `SHARED`) are no
     import of a test's, so their directories are none of its inputs (Main, 2026-10-29: tools/'s entries
     keyed every row, and train 296's one added tool reran 1,794 of 1,795)."""
-    packages = {str(parent) for path in depends
+    files = (each.partition(followed.CODE)[0] for each in depends)
+    packages = {str(parent) for path in files
                 if path.startswith(("src/", "tools/")) and path.endswith(".py") and not path.startswith(HARNESS)
                 for parent in Path(path).parents
                 if parent.parts[:1] in (("src",), ("tools",)) and parent != Path("src")}
     # A build's output (an editable install's metadata, bytecode) is the environment's, which the locks key
     # (`shared`): a planner's checkout has none (train 300's plan reused none of 501 files).
-    kept = (path for path in depends if not built(Path(path.removeprefix("probe:"))))
+    kept = (path for path in depends
+            if not built(Path(path.removeprefix("probe:").partition(followed.CODE)[0])))
     return sorted({name, *kept, *packages})
 
 
@@ -864,7 +976,7 @@ def collect(python: str, tests: list[str], out: Path, deadline: float) -> int:
     seconds = (time.monotonic() - began) / len(tests)
     # A collection runs no test, so it moved no site onto YNNPACK's fusions: counted, not unknown.
     rows = [{"name": row(python, name, COLLECT), "exitCode": 1 if name in errors else 0, "seconds": seconds,
-             "output": errors.get(name, ""), "ynn_switched": [],
+             "output": errors.get(name, ""), "ynn_switched": [], "cells": {},
              **(red_as(COLLECT, []) if name in errors else {})}
             for name in tests]
     out.write_text(json.dumps({"rows": rows}))
@@ -878,6 +990,15 @@ def targeted(python: str, arguments: list[str], report: Path) -> int:
     return subprocess.run([*session.pytest_run(python, report), *arguments],
                           env=session.pytest_environment({}),
                           check=False).returncode
+
+
+def flow_cells(cases) -> dict[str, dict]:
+    """A GPU flow's counts by its cases (each case's JUnit property `cells`, tests/conftest.py from
+    tests/gpu_flow.py: passed, failed, skipped and the device), as every row a task runs carries them, an empty
+    object where its file runs no flow: the train's native gate reads a flow none of whose cells ran as
+    unqualified, and a reused row keeps its counts (ledger 2643)."""
+    return {node_of(case): json.loads(item.get("value") or "null") for case in cases
+            for item in case.iter("property") if item.get("name") == "cells"}
 
 
 def ynn_switched(cases) -> list[dict]:
@@ -941,6 +1062,22 @@ def reused_rows(python: str, tests: list[str], group: str, common: str, network:
     return rows
 
 
+def exit_red(code: int, cases: list[ET.Element], own: list[ET.Element], deselected: bool,
+             name: str) -> list[str]:
+    """Why pytest's exit `code` reddens file `name`'s row, whose own cases are `own` among the process's
+    `cases`, and every one of whose tests the selection set aside where `deselected`. pytest exits 1 for
+    failed tests and 5 for none collected; any other exit (a crash, a signal, an internal error) leaves even
+    a written report untrustworthy, so every row it holds is red, as does an exit 1 no failed case explains
+    (a late hook's os._exit): its tests ran in a process that failed. A file whose every test the selection
+    set aside has no report however pytest exits, another file's failure among the task's included."""
+    failed = any(case.find(kind) is not None for case in cases for kind in ("failure", "error"))
+    if code == 1 and cases and not failed:
+        return ["the process ended 1 after its tests passed"]
+    if code not in (0, 1, 5) or (not own and not deselected and code == 1):
+        return [f"pytest exited {code}" + ("" if own else f" with no report of {name}")]
+    return []
+
+
 def tested(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: str, grace: float,
            common: str, environ: Mapping[str, str], coverage: Path | None = None,
            network: bool = False, whole: bool = False, release: str = "",
@@ -955,14 +1092,17 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     if not tests:
         out.write_text(json.dumps({"rows": rows}))
         return 0
-    executed_report = out.with_name(f"{out.name}.executed.json")
+    # The recorder's log of the process's whole life (lifetime.py), its children's beside it, read once the
+    # group has exited (`record`).
+    log = out.with_name(f"{out.name}.lifetime.log")
     collection = out.with_name(f"{out.name}.collected.json")
     report = out.with_name(f"{out.name}.junit.xml")
-    for stale in (report, executed_report, collection):
+    for stale in (report, log, collection):
         stale.unlink(missing_ok=True)
+    shutil.rmtree(log.with_name(f"{log.name}.children"), ignore_errors=True)
     # coverage.py follows the Python processes the tests start (pyproject.toml's patch), each writing
     # its data where COVERAGE_FILE says.
-    measured = [] if coverage is None else ["-m", "coverage", "run"]
+    measured = [] if coverage is None else ["coverage", "run"]
     environ = environ if coverage is None else {**environ, "COVERAGE_FILE": str(coverage / ".coverage")}
     run = selected(session.pytest_run(python, report, *measured), network, whole, bool(release))
     command = pytest_command(run, tests, split, release)
@@ -970,7 +1110,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     # streamed as it comes by a reader of its own, which nothing waits on past pytest's end: a test's
     # child holding the pipe open (a pool worker, a server) cannot keep the verdict from being written.
     lines: list[str] = []
-    environment = session.pytest_environment({**environ, "DEW_EXECUTED": str(executed_report),
+    environment = session.pytest_environment({**environ, "DEW_EXECUTED_LOG": str(log),
                                               "DEW_COLLECTED": str(collection)})
     if network:
         environment = {key: value for key, value in environment.items() if key not in session.CLOSED_HUB}
@@ -1019,15 +1159,9 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
         skipped = [f"SKIPPED on a missing import {case.get('classname')}::{case.get('name')}: "
                    f"{node.get('message')}" for case in own for node in case.iter("skipped")
                    if "could not import" in f"{node.get('message')} {node.text}"]
-        # pytest exits 1 for failed tests and 5 for none collected; any other exit (a crash, a signal,
-        # an internal error) leaves even a written report untrustworthy, so every row it holds is red. A file
-        # whose every test the selection set aside has no report however pytest exits, another file's failure
-        # among the task's included.
         counted = counts.get(name, {})
         deselected = bool(counted) and counted["collected"] == counted["deselected"]
-        exited = ([f"pytest exited {done.returncode}" + ("" if own else f" with no report of {name}")]
-                  if done.returncode not in (0, 1, 5) or (not own and not deselected and done.returncode == 1)
-                  else [])
+        exited = exit_red(done.returncode, cases, own, deselected, name)
         unaccounted = ([] if exited or (report.is_file() and (own or deselected))
                        else [f"no evidence {name} ran: " + ("pytest wrote no report" if not report.is_file()
                                                             else "pytest reported none of its tests, and its "
@@ -1050,15 +1184,15 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
                      # `exhausted` reads.
                      **({"first_failure": failed[0][2].get("message") or ""} if failed else {}),
                      "tests": {node_of(case): float(case.get("time") or 0) for case in own},
-                     # Its tests pytest marks whole_suite (executed.py), which `slow` never flags.
+                     # Its whole_suite cells, every one collected, run or set aside (executed.py).
                      **{key: cells for key, cells in counts.get(name, {}).items() if key in MARKED},
-                     "ynn_switched": ynn_switched(own),
+                     "ynn_switched": ynn_switched(own), "cells": flow_cells(own),
                      "timings": {row(python, name, ""): seconds}, **cause})
     out.write_text(json.dumps({"rows": rows + ran}))
     if coverage is None and not release:
         # A traced run's rows, timed under tracing, are no rows to reuse, nor a release check's, which runs
         # under its requirement's overlay and on the whole suite's run alone.
-        record(python, ran, executed_report, common, network, opened)
+        record(python, ran, log, common, network, opened)
     return 0
 
 
@@ -1074,7 +1208,7 @@ def native_inputs(opened: set[str], recorded: set[str]) -> set[str]:
             for parent in path.parents if parent == FIXTURES or FIXTURES in parent.parents}
 
 
-def record(python: str, rows: list[dict], executed_report: Path, common: str, network: bool = False,
+def record(python: str, rows: list[dict], log: Path, common: str, network: bool = False,
            opened: set[str] | None = None) -> None:
     """Keep each row a task ran with the files its tests executed and read, every data file the task's
     processes opened (`opened`, the task's watch: None where it was blind, and no row keeps a key), where
@@ -1084,8 +1218,8 @@ def record(python: str, rows: list[dict], executed_report: Path, common: str, ne
     token = os.environ.get("DEW_XLA_CACHE_TOKEN")
     if not token or "DEW_XLA_CACHE_URL" not in os.environ:
         return
-    # A run cut short, or whose collection failed, may have written no report, or none for a file.
-    executed = json.loads(executed_report.read_text()) if executed_report.is_file() else {}
+    # Each file's record in the process's log (followed.py's `recorded`): none for a file it never reached.
+    executed = followed.recorded(log)
     held = device_class(network)
     if opened is not None:
         recorded = {read for ran in executed.values() for read in ran["depends"] or ()}
@@ -1677,8 +1811,10 @@ def main() -> int:
         print(f"{len(changed)} files refolded in {session.DURATIONS}: {' '.join(changed) or 'none'}")
         return 0
     if args.operation == "gpu-tier":
-        tier = ({name: [f"{count} marked"] for name, count in marked(PYTHONS[0]).items()} if args.marked
-                else gpu_tier(PYTHONS[0]))
+        # A GPU runs its marked files alone, a batch's and a day's alike (ledger 2452): the records' evidence
+        # (`gpu_tier`) is what --evidence reports, which a day's tier no longer chooses by.
+        tier = ({name: [f"{count} marked"] for name, count in marked(PYTHONS[0]).items()}
+                if args.marked or not args.evidence else gpu_tier(PYTHONS[0]))
         if args.evidence:
             for name, evidence in tier.items():
                 print(name, *evidence, sep="\t")

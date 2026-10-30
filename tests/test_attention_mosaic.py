@@ -134,14 +134,19 @@ def _pinned(forward: attention_mosaic.Tiles | None = None,
 def _check_forward(call: str, dtype, shape, *, natural: bool, interpret: bool, width: int = 128,
                    value_width: int = 128, tiles: attention_mosaic.Tiles | None = None,
                    training: template.Kept = template.Kept.NONE, target: generation.GpuTarget | None = None,
-                   drop: bool = False):
+                   drop: bool = False, query_scale: float = 1.0):
     """The forward, or with `training` (what it keeps, `template.Kept`) the training forward's output, over
     the call form `call` of `shape`,
     its query and key heads `width` wide and its value heads `value_width`, at `tiles` (the default when
-    None), with `drop` under probability dropout at `DROP_RATE` (`_dropping`)."""
+    None), with `drop` under probability dropout at `DROP_RATE` (`_dropping`), its queries drawn times
+    `query_scale` (a power of two, exact)."""
     spans = template.spans(shape[1], shape[1], shape[0], **CALLS[call])
     hooks = _dropping(shape) if drop else None
-    draw = _drawn(shape, dtype, width=width, value_width=value_width)
+    unscaled = _drawn(shape, dtype, width=width, value_width=value_width)
+
+    def draw(seed):
+        query, *rest = unscaled(seed)
+        return (query * jnp.asarray(query_scale, query.dtype), *rest)
 
     def ours(query, key, value, dout):
         del dout
@@ -402,9 +407,8 @@ def test_the_training_forward_is_on_par_interpreted(call, natural):
 
 
 @ON_HOPPER
-@pytest.mark.gpu(reason="runs the sm90 mainloop compiled, on an H100")
 @pytest.mark.parametrize("call", CALLS)
-def test_the_training_forward_is_on_par_on_an_h100(call):
+def the_training_forward_is_on_par_on_an_h100(call):
     """The training forward's output, bf16, compiled on an H100."""
     _check_forward(call, jnp.bfloat16, SHAPES["compiled"], natural=False, interpret=False,
                    training=template.Kept.SPLIT)
@@ -440,14 +444,13 @@ def test_the_backward_at_a_width_of_256_is_on_par_under_bidirectional_blocks_int
     """The derived backward of heads 256 wide (dK's and dV's widths split among programs,
     `BackwardTiles.columns`, where one program's sums pass a consumer's registers) over a packed row's two
     documents read causally, each document one block read both ways (row 2110's `--split whole`), under the
-    interpreter, from the training forward that keeps its output (`template.Kept.OUTPUT`, the route's at this
-    width: the anchored one's natural rewalk holds no tile, row 2526)."""
+    interpreter."""
     rows, queries = SHAPES["interpreted"][:2]
     documents = jnp.asarray([[1] * (queries // 2 - 10) + [2] * (queries // 2 + 10)] * rows, jnp.int32)
     spans = template.spans(queries, queries, rows, causal=True, segment_ids=documents,
                            block_groups=documents)
     _check_backward("causal", SHAPES["interpreted"], form=None, interpret=True, width=256, value_width=256,
-                    spans=spans, kept=template.Kept.OUTPUT)
+                    spans=spans)
 
 
 @INTERPRETS
@@ -704,16 +707,12 @@ def test_the_derived_tiles_stage_within_a_hoppers_block(width, value_width, resi
     """On an H100 the forward's tiles derived from the facts (`MosaicForward.derived`) stage within its
     block (`generation.shared_budget`) and a consumer's registers (`register_budget`), whatever the widths,
     the training forward's too (its anchored walk keeps no value row): no table's tile, which at heads 256
-    wide staged 320 KiB against its 227 (ledger 1582). The anchored training forward of values 256 wide
-    derives none: no tile holds its natural rewalk's registers (et-fsweep256: 255 and 224 B spilled at
-    64 x 64 on one consumer), so the route takes those calls elsewhere."""
+    wide staged 320 KiB against its 227 (ledger 1582); the anchored training forward of values 256 wide
+    rewalks a block of its value columns a launch (`Tiles.relaunch_columns`, row 2526)."""
     with generation.assumed("sm90"):
         target = generation.gpu_target()
         op, ba = _forward_call((2, 4096, 32, 8), width, value_width, residuals)
         derived = op.derived(ba, target)
-        if residuals is template.Kept.SPLIT and value_width == 256:
-            assert derived is None
-            return
         assert derived is not None
         assert op.legal(ba, derived, target)
         assert op.staged_bytes(ba, derived, target) <= generation.shared_budget(target)
@@ -971,6 +970,17 @@ def test_the_backward_is_on_par_under_every_score_hook_interpreted(hooks, form):
 
 
 @INTERPRETS
+@pytest.mark.parametrize("call", ["causal", "full"])
+def test_a_training_forward_256_wide_past_the_folds_reach_is_on_par_interpreted(call):
+    """An anchored training forward 256 wide whose logits pass the fold's reach (`algebra.FOLD_REACH`, its
+    queries drawn 2^16 times larger) walks again in the natural form, whose launches take a block of the
+    value columns each (`Tiles.relaunch_columns`, row 2526: no tile holds its whole sums), its output on
+    par (check 1) with the reference's from float64, under the interpreter."""
+    _check_forward(call, jnp.bfloat16, SHAPES["interpreted"], natural=False, interpret=True, width=256,
+                   value_width=256, training=template.Kept.SPLIT, query_scale=2.0 ** 16)
+
+
+@INTERPRETS
 @pytest.mark.parametrize("hooks", ["key-bias", "tile-bias"])
 def test_a_parameter_every_row_shares_takes_each_rows_gradient_interpreted(hooks):
     """A key's or a tile's parameter one for every batch row (`[1, H, ...]`, T5's shared bias): the dK/dV
@@ -1148,35 +1158,31 @@ def test_the_backward_under_every_score_hook_lowers_for_an_h100(hooks, accurate)
 
 
 @ON_HOPPER
-@pytest.mark.gpu(reason="runs the sm90 mainloop compiled, on an H100")
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16], ids=["bfloat16", "float16"])
 @pytest.mark.parametrize("call", CALLS)
-def test_the_forward_is_on_par_on_an_h100(call, dtype):
+def the_forward_is_on_par_on_an_h100(call, dtype):
     """The forward, the base-2 fold, compiled on an H100."""
     _check_forward(call, dtype, SHAPES["compiled"], natural=False, interpret=False)
 
 
 @ON_HOPPER
-@pytest.mark.gpu(reason="runs the sm90 mainloop compiled, on an H100")
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16], ids=["bfloat16", "float16"])
 @pytest.mark.parametrize("call", CALLS)
-def test_the_natural_forward_is_on_par_on_an_h100(call, dtype):
+def the_natural_forward_is_on_par_on_an_h100(call, dtype):
     """The forward with natural logits compiled on an H100."""
     _check_forward(call, dtype, SHAPES["compiled"], natural=True, interpret=False)
 
 
 @ON_HOPPER
-@pytest.mark.gpu(reason="runs the sm90 mainloop compiled, on an H100")
 @pytest.mark.parametrize("form", CASES)
-def test_the_forward_is_on_par_over_every_call_form_on_an_h100(form):
+def the_forward_is_on_par_over_every_call_form_on_an_h100(form):
     """The forward over each of the template core's call forms compiled on an H100."""
     _check_call_form(form, interpret=False)
 
 
 @ON_HOPPER
-@pytest.mark.gpu(reason="runs the sm90 mainloop compiled, on an H100")
 @pytest.mark.parametrize(("width", "value_width"), HEAD_WIDTHS)
-def test_the_forward_is_on_par_at_head_widths_on_an_h100(width, value_width):
+def the_forward_is_on_par_at_head_widths_on_an_h100(width, value_width):
     """The forward of query heads `width` wide and value heads `value_width` over a causal call at
     `FORM_TILES`, compiled on an H100."""
     _check_forward("causal", jnp.bfloat16, SHAPES["compiled"], natural=False, interpret=False, width=width,
@@ -1184,9 +1190,8 @@ def test_the_forward_is_on_par_at_head_widths_on_an_h100(width, value_width):
 
 
 @ON_HOPPER
-@pytest.mark.gpu(reason="runs the sm90 mainloop compiled, on an H100")
 @pytest.mark.parametrize(("width", "value_width"), HEAD_WIDTHS)
-def test_the_backward_is_on_par_at_head_widths_on_an_h100(width, value_width):
+def the_backward_is_on_par_at_head_widths_on_an_h100(width, value_width):
     """The backward in its derived form of query heads `width` wide and value heads `value_width` over a
     causal call, compiled on an H100."""
     _check_backward("causal", SHAPES["compiled"], form=None, interpret=False, width=width,
@@ -1194,55 +1199,49 @@ def test_the_backward_is_on_par_at_head_widths_on_an_h100(width, value_width):
 
 
 @ON_HOPPER
-@pytest.mark.gpu(reason="runs the sm90 mainloop compiled, on an H100")
 @pytest.mark.parametrize(("dtype", "natural"), HOOK_FORMS.values(), ids=HOOK_FORMS)
 @pytest.mark.parametrize("hooks", FORWARD_HOOKS)
-def test_the_forward_is_on_par_under_every_hook_on_an_h100(hooks, dtype, natural):
+def the_forward_is_on_par_under_every_hook_on_an_h100(hooks, dtype, natural):
     """The forward under each hook compiled on an H100."""
     _check_hooks(hooks, dtype, natural, interpret=False)
 
 
 @ON_HOPPER
-@pytest.mark.gpu(reason="runs the sm90 mainloop compiled, on an H100")
 @pytest.mark.parametrize("form", BACKWARD_FORMS)
 @pytest.mark.parametrize("case", CASES)
-def test_the_backward_is_on_par_over_every_call_form_on_an_h100(case, form):
+def the_backward_is_on_par_over_every_call_form_on_an_h100(case, form):
     """The backward in both forms over each of the template core's call forms compiled on an H100."""
     _check_call_form(case, interpret=False, backward=True, form=form)
 
 
 @ON_HOPPER
-@pytest.mark.gpu(reason="runs the sm90 mainloop compiled, on an H100")
 @pytest.mark.parametrize("form", ["forward", *BACKWARD_FORMS])
 @pytest.mark.parametrize("case", RUN_CASES)
-def test_a_call_over_runs_is_on_par_on_an_h100(case, form):
+def a_call_over_runs_is_on_par_on_an_h100(case, form):
     """A decision row's runs compiled on an H100, the forward and the backward in each form."""
     backward = form != "forward"
     _check_call_form(case, interpret=False, backward=backward, form=form if backward else "default")
 
 
 @ON_HOPPER
-@pytest.mark.gpu(reason="runs the sm90 mainloop compiled, on an H100")
-def test_a_causal_backward_of_more_keys_than_queries_is_on_par_on_an_h100():
+def a_causal_backward_of_more_keys_than_queries_is_on_par_on_an_h100():
     """A causal call of 64 queries over 256 keys compiled on an H100, where a consumer waiting for a load
     the producer never issues hangs (the interpreted test's case)."""
     _check_backward("causal", (2, 64, 4, 2), form="default", interpret=False, keys=256)
 
 
 @ON_HOPPER
-@pytest.mark.gpu(reason="runs the sm90 mainloop compiled, on an H100")
 @pytest.mark.parametrize("form", BACKWARD_FORMS)
 @pytest.mark.parametrize("call", CALLS)
-def test_the_backward_is_on_par_on_an_h100(call, form):
+def the_backward_is_on_par_on_an_h100(call, form):
     """The backward in both forms compiled on an H100."""
     _check_backward(call, SHAPES["compiled"], form=form, interpret=False, width=FORM_WIDTHS.get(form, 128))
 
 
 @ON_HOPPER
-@pytest.mark.gpu(reason="runs the sm90 mainloop compiled, on an H100")
 @pytest.mark.parametrize("form", ["default", "accurate"])
 @pytest.mark.parametrize("hooks", BACKWARD_HOOKS)
-def test_the_backward_is_on_par_under_every_score_hook_on_an_h100(hooks, form):
+def the_backward_is_on_par_under_every_score_hook_on_an_h100(hooks, form):
     """The backward in both forms under each score hook compiled on an H100."""
     _check_hooked_backward(hooks, form=form, interpret=False)
 
@@ -1378,14 +1377,13 @@ def test_an_a100_derives_no_mosaic_backward(accurate):
 
 
 FORWARD_GATE = [(width, training, "none") for width in (64, 128, 256)
-                for training in (template.Kept.NONE, template.Kept.SPLIT)
-                if (width, training) != (256, template.Kept.SPLIT)]
+                for training in (template.Kept.NONE, template.Kept.SPLIT)]
 FORWARD_GATE += [(width, training, hooks) for width in (64, 128)
                  for training in (template.Kept.NONE, template.Kept.SPLIT)
                  for hooks in BACKWARD_HOOKS if hooks != "none"]
 """The forward resource gate's cases on an H100: a causal call's head widths, the inference and the training
 forward, hookless, and each score hook at the widths a hooked call's derivation takes (row 2281: its live
-set beside the walk's); the anchored training forward 256 wide derives none (row 2526)."""
+set beside the walk's)."""
 
 
 def _forward_kernels(op, ba, config) -> dict:

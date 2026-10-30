@@ -424,15 +424,21 @@ DENSE_BIAS_SEEDS = 8
 """Check 1's declared seeds for a dense bias named onto the template."""
 
 
+@pytest.mark.parametrize("deterministic", [True, False], ids=["deterministic", "fast"])
 @pytest.mark.parametrize("rows, heads", [(2, HEADS), (1, HEADS), (1, 1)],
                          ids=["a bias a row", "one bias every row", "one bias every row and head"])
-def test_a_dense_bias_named_onto_the_template_is_on_par_with_the_reference_path(rows, heads):
+def test_a_dense_bias_named_onto_the_template_is_on_par_with_the_reference_path(rows, heads, deterministic,
+                                                                                request):
     """A causal bf16 call whose bias varies by query, `[B or 1, H or 1, Q, K]` (a learned relative
     position's, T5's one table for every row), named onto the template: its score hook reads the bias a
     tile at a time where it is shared, never broadcast (`template.biased`, a `Kind.TILE` parameter at
     `template.shared_place`), on par (check 1) with the reference path's dense bias from float64, its
     output and the query's, key's, value's and bias's gradients, the bias's in its own shape (rows 2081,
-    2523)."""
+    2523). In both of the Mosaic backward's schedules for a shared bias: deterministic mode's, each program
+    its own place summed after, and the default's, the programs' adds into one place (`deterministic`
+    False drops the lane's --xla_gpu_deterministic_ops, `without_deterministic_ops`; row 2645)."""
+    if not deterministic:
+        request.getfixturevalue("without_deterministic_ops")
     queries = 40
 
     def drawn(seed):
@@ -479,9 +485,8 @@ def test_a_biased_query_of_one_key_has_nonzero_gradient_terms_where_its_gradient
 
 @pytest.mark.skipif(generation.device_generation() != "sm90",
                     reason="composes the route's mainloops, on an H100")
-@pytest.mark.gpu(reason="composes the route's Mosaic forward and Triton backward, on an H100")
 @pytest.mark.parametrize("case", ["causal", "packed-documents", "sinks-softcap"])
-def test_an_fp16_call_on_an_h100_is_on_par(case):
+def an_fp16_call_on_an_h100_is_on_par(case):
     """fp16 on an H100, whose Mosaic backward takes bf16 alone (`attention_mosaic.refused`), so its forward
     and backward compose two mainloops: on par with the reference path (check 1) whatever they run. A call
     without sinks is judged a term at a time (`attention_terms`): a query that keeps one key has a dQ of
@@ -510,10 +515,9 @@ def _terms(case: dict, queries: int, keys: int):
     return terms
 
 
-@pytest.mark.gpu(reason="walks a sequence of thousands of keys, on a GPU")
 @pytest.mark.parametrize("dtype", DTYPES, ids=lambda dtype: jnp.dtype(dtype).name)
 @pytest.mark.parametrize("length", [4096, 8192])
-def test_a_long_sequence_is_on_par_with_the_reference_path(length, dtype):
+def a_long_sequence_is_on_par_with_the_reference_path(length, dtype):
     """A causal call of `length` tokens, two query heads over one key head (`WIDTH` wide), through the
     template on whichever mainloop the GPU runs it, on par with the reference path (check 1): D, the
     refinement and the denominator are sums the mainloops run in sequence over its key tiles where the

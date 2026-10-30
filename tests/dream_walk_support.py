@@ -31,6 +31,11 @@ RELEASES = {
 `eps`, DiffuCoder's at 1e-12 whatever its config states."""
 
 
+CODE = ("configuration_dream.py", "modeling_dream.py", "generation_utils.py")
+"""A release's own code: the modules its config's `auto_map` names, and the sampling its model imports
+(`from .generation_utils import`), which a load finds through them (`dew.interop.sources.code_modules`)."""
+
+
 def uniforms(prompt: int, width: int) -> list[np.ndarray]:
     """The `STEPS` arrays of `width` float32 uniforms a walk of prompt `prompt` reads, one a step, one a
     canvas position: a step reveals a masked position whose uniform falls below its reveal chance."""

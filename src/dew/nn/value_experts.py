@@ -34,6 +34,20 @@ class ValueExperts:
     norm_topk_prob: bool = True
     scaling: float = 1.0
     bias: bool = False
+    implementation: str = 'auto'
+    """The grouped matmul's kernel, the routed MLP's (`under`)."""
+    dispatch: str = 'global'
+    """Where the experts' slots run (`dew.nn.moe.expert_dispatch`), the routed MLP's (`under`)."""
+    capacity_factor: float | None = None
+    """The slots an expert keeps (`expert_dispatch`), the routed MLP's (`under`)."""
+
+    def under(self, mixture) -> "ValueExperts":
+        """These experts run as the layer's routed MLP runs its own (`Mixture`): its kernel, its dispatch and
+        its capacity, so an expert-parallel model places both sets of experts alike."""
+        if mixture is None:
+            return self
+        return dataclasses.replace(self, implementation=mixture.implementation, dispatch=mixture.dispatch,
+                                   capacity_factor=mixture.capacity_factor)
 
     def __post_init__(self):
         if not 0 < self.top_k <= self.experts:
@@ -52,7 +66,6 @@ class RoutedValues(nn.Module):
     spec: ValueExperts
     in_features: int
     features: int
-    implementation: str = 'auto'
     init_std: float | None = None
     dtype: Dtype | None = None
     precision: PrecisionLike = None
@@ -67,7 +80,8 @@ class RoutedValues(nn.Module):
                                        features=self.features, init_std=self.init_std, name='v_proj')
 
     def _project(self, tokens, sizes, _expert_ids, kernels, *, dtype):
-        projected = expert_projection(tokens, kernels[0], sizes, dtype, self.implementation, self.precision)
+        projected = expert_projection(tokens, kernels[0], sizes, dtype, self.spec.implementation,
+                                      self.precision)
         return jax.nn.silu(checkpoint_name(jnp.asarray(projected), 'v_proj'))
 
     def __call__(self, x: jax.Array) -> jax.Array:
@@ -75,7 +89,8 @@ class RoutedValues(nn.Module):
         kernel = self.projection.kernel
         compute = expert_compute_dtype(x, kernel, dtype=self.dtype)
         slots = expert_dispatch(functools.partial(self._project, dtype=compute), x, indices, (kernel,),
-                                (VALUE_EXPERT_AXES,), num_experts=self.spec.experts, dispatch='global',
+                                (VALUE_EXPERT_AXES,), num_experts=self.spec.experts,
+                                dispatch=self.spec.dispatch, capacity_factor=self.spec.capacity_factor,
                                 initializing=self.is_initializing(), output_dtype=compute)
         wide = at_least_fp32(slots.dtype)
         return float32_einsum('...ke,...k->...e', slots.astype(wide), weights.astype(wide),

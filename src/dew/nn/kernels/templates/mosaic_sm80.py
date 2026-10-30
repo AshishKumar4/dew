@@ -48,6 +48,9 @@ class Slots:
     def release(self, name: str) -> None:
         del name
 
+    def held(self) -> None:
+        """Every slot acquired: `emit_pipeline` hands the step its tiles whole."""
+
 
 @dataclasses.dataclass(frozen=True)
 class Pipeline:
@@ -332,7 +335,7 @@ class Mma(mosaic.Family):
                 continue
             plgpu.store(smem, part.astype(smem.dtype), optimized=False)
             rows = smem.shape[0]
-            mosaic.store_rows(smem, view, 0, 0, jnp.int32(rows), 0, rows, copy=mosaic.copied,
+            mosaic.store_rows(smem, view, 0, 0, jnp.int32(rows), 0, rows, copy=mosaic.coalesced,
                               widest=resources.copied_rows(smem.shape[1], smem.dtype))
 
     def added(self, value: jax.Array, view, interpret: bool, *, smem) -> None:

@@ -10,14 +10,12 @@ import functools
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 import pytest
 from generation_support import runs
 from reference_error import assert_as_exact, with_gradients
 from test_recurrence_chunk import chunk_on, token_by_token
 from test_recurrence_mosaic import (
     DTYPES,
-    NATIVE,
     PACKED_DOCUMENTS,
     SEEDS,
     SHAPES,
@@ -55,6 +53,9 @@ REMATS = {'kept': ((), None), 'recomputed': (('delta_memory',), None), 'saved': 
 checkpoint saves (`decoder_block.RematPolicy.save`, None for no checkpoint): the forward's memories kept,
 recomputed in the backward, or kept by their names under a checkpoint saving the delta rule's (row 2023)."""
 
+GRADIENT_GRID = [(case, dtype, remat) for remat in REMATS for dtype in DTYPES for case in GRADIENT_CASES]
+"""The gradient's cases, the CPU's (`INTERPRETED_GRADIENT`) and the GPU flow's."""
+
 
 def drawn(dtype, seed: int, **shape) -> tuple[Chunk, tuple[jax.Array, jax.Array]]:
     """A draw's operands (`draw`), its documents' starts taken out (`restarted` puts them back: they are not
@@ -80,8 +81,7 @@ ledger 2127), which the whole suite runs (`timed`)."""
 
 
 @pytest.mark.parametrize(('case', 'dtype', 'remat'), timed(PAST_TARGET, "interpreted", interpreted(
-    [(case, dtype, remat) for remat in REMATS for dtype in DTYPES for case in GRADIENT_CASES],
-    INTERPRETED_GRADIENT)))
+    GRADIENT_GRID, INTERPRETED_GRADIENT)))
 def test_the_mosaic_gradient_is_as_exact_as_its_reference(case, dtype, remat):
     """The gradient of the mainloop's rule on par from float64 with its reference's over the case's draws
     (check 1, truth the recurrence a token at a time's in float64): in a 16-bit call the mainloop's fast
@@ -124,25 +124,10 @@ def test_the_mosaic_gradient_is_as_exact_as_its_reference(case, dtype, remat):
                     f'the mosaic gradient, {case} in {jnp.dtype(dtype).name}', seeds=SEEDS, truth_fn=truth)
 
 
-@NATIVE
-def test_the_fast_backward_is_bitwise_the_same_each_run():
-    """The template's fast backward gives the same bits each run over packed documents (row 1298): each
-    queries' and keys' gradient tile has one program, which stores its key head's first value head's and
-    adds the rest's in order, a step's adds done before the next (`_gradient_stored`); no add's order varies
-    between runs."""
-    case = 'packed documents'
-    hooks = recurrence.Hooks(decay='scalar', scale=SHAPES[case]['key_width'] ** -0.5, write_bound=1.0)
-    fn = on_the_mainloop(hooks, case, jnp.bfloat16)
-    run = jax.jit(with_gradients(restarted(fn, case)))
-    operands, cotangent = drawn(jnp.bfloat16, 0, **geometry(case))
-    first, second = (jax.tree.leaves(run(operands, cotangent)) for _ in range(2))
-    for ours, again in zip(first, second, strict=True):
-        np.testing.assert_array_equal(np.asarray(ours), np.asarray(again))
-
-
-WALKS = interpreted([('one sequence', 'forward'), ('one sequence', 'training')],
-                    {('one sequence', 'forward')})
-"""A two-role walk's products: the forward interpreted off a GPU, its fast backward the GPU tier's."""
+WALK_GRID = [('one sequence', 'forward'), ('one sequence', 'training')]
+INTERPRETED_WALKS = {('one sequence', 'forward')}
+"""A two-role walk's products: the forward interpreted off a GPU, its fast backward the GPU flow's."""
+WALKS = interpreted(WALK_GRID, INTERPRETED_WALKS)
 
 
 @runs('sm90')

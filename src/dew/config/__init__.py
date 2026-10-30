@@ -46,7 +46,7 @@ from etils import epath
 import dew.io
 from dew import registry, training
 from dew._coordination import agree_process_phase, agreed, agreed_same
-from dew._records import JSON, duration, is_share, recorded_duration
+from dew._records import JSON, duration, earlier_segments, is_share, recorded_duration
 from dew.cache import dew_cache_dir
 from dew.checkpoints import RUN_FILE, Checkpoints, Keep, Resume
 from dew.config.sweep import RandomSearch, Search, Space, read_ledger, write_ledger
@@ -398,6 +398,9 @@ class SourceOptions:
     """DEX's differential on chosen heads (`dew.nn.dex`, `Pretrained.load`'s `dex`), its record as
     JSON: `--source.dex '{"layers": [[0, [1, 3]], [5, [0, 2]]], "anneal_steps": 1000}'`, its
     `trains` the paper's recipe unless "all"; None for none."""
+    scan_layers: bool = False
+    """The decoder's runs of like layers, and of layers repeating one period, under flax's scan
+    (`Pretrained.load`'s `scan_layers`): a decode step's program grows with the period, not the depth."""
     param_dtype: str | None = None
     """The dtype the source's parameters are stored in, its checkpoint's own as 'auto'; None stores a
     source the run trains in its numerics' `dtypes.params` and one it keeps frozen as its checkpoint
@@ -415,7 +418,7 @@ class SourceOptions:
         PyTorch pickles alone, whose shapes no header states, is read whole): a check that a base
         loads under a run's options, on a disk too small for its weights."""
         return {"text_only": self.text_only, "prediction_depths": self.prediction_depths,
-                "modeling_overrides": self.overrides(), "dex": self.dex}
+                "modeling_overrides": self.overrides(), "dex": self.dex, "scan_layers": self.scan_layers}
 
 
 class SourcePlacement(TypedDict, total=False):
@@ -435,6 +438,7 @@ class SourceBuild(TypedDict, total=False):
     prediction_depths: int | None
     modeling_overrides: Mapping[str, object] | None
     dex: DifferentialExtension | None
+    scan_layers: bool
 
 
 class SourceOptionsKeywords(SourcePlacement, SourceBuild, total=False):
@@ -950,6 +954,11 @@ def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
     does not declare. A record in today's shapes passes as it is. Carried to 1.0, when it is deleted
     (ledger 1552)."""
     fields = record.get("fields")
+    segments = fields.get("segments") if isinstance(fields, Mapping) else None
+    if isinstance(fields, Mapping) and isinstance(segments, list):
+        # A decision run's row of segments, in today's fields (`earlier_segments`).
+        fields = {**fields, "segments": earlier_segments(segments)}
+        record = {**record, "fields": fields}
     if not isinstance(fields, Mapping) or not isinstance(fields.get("trainer"), Mapping):
         return record
     trainer, fields = dict(fields["trainer"]), dict(fields)

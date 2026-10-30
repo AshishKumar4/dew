@@ -1603,7 +1603,8 @@ def token_streams(points: Mapping[Hashable, int], length: int,
     turns = sorted((at, key[1], key[2]) for key, at in points.items()
                    if isinstance(key, tuple) and len(key) == 3 and key[0] == "stream")
     marked = [0] * length
-    for (at, _, name), following in zip(turns, [*turns[1:], (length, 0, "")], strict=True):
+    # Each turn's stream runs to the next turn, the last to the row's end; a row of no turns is the row's.
+    for (at, _, name), following in zip(turns, [*turns[1:], (length, 0, "")][:len(turns)], strict=True):
         marked[at:following[0]] = [streams.index(name)] * (following[0] - at)
     runs = 1 + sum(1 for before, after in itertools.pairwise(marked) if before != after)
     assert runs <= fragment_count(segments), "a row lays the runs of one stream its segments do"
