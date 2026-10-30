@@ -73,6 +73,7 @@ from dew.data.dataset import (
     take_batch,
 )
 from dew.data.facts import merge_facts
+from dew.data.holdout import selecting
 from dew.data.lowering import (
     _as_iter,
     _Build,
@@ -122,6 +123,7 @@ from dew.data.pipeline import (
     TokenGeometry,
     Windows,
     Workers,
+    chains,
     children,
     record_stage,
     runs,
@@ -140,6 +142,8 @@ from dew.data.sources.base import (
     materialized,
     tokenizer_contract,
 )
+from dew.data.sources.concatenate import Concatenate
+from dew.data.sources.tokens import TokenFiles
 from dew.data.steps.generic import Coordinated
 
 _DEFAULT_LOADING = Loading()
@@ -331,6 +335,29 @@ def _measured(pipeline: Pipeline, above: tuple[Measuring, ...] = ()) -> dict[int
         for key, child_measuring in _measured(child, measuring).items():
             found[key] = (*found.get(key, ()), *child_measuring)
     return found
+
+
+def _documented_packs(pipelines: Sequence[Pipeline]) -> None:
+    """Refuse to pack token documents from a store that states no document ends (neither an index of
+    them nor an EOS token), wherever it sits under the pack: its tokens would read as one document,
+    whose pieces no producer made. Checked as the chain is read, not as it is built, so a record names
+    a store it never opens (a run loaded where its data is not, to be pointed at it)."""
+    packed = (chain for pipeline in pipelines for chain in chains(pipeline)
+              if any(isinstance(stage, Pack) for stage in chain.stages))
+    for source in (store for chain in packed for _, leaf in _leaves(chain) for store in _stores(leaf)):
+        if isinstance(source, TokenFiles) and not source.documented:
+            raise ValueError(f"packed text needs producer document boundaries or EOS: {source.describe()}")
+
+
+def _stores(source: Source) -> Iterator[Source]:
+    """Every store `source` reads: a concatenation's parts, and the store each holdout selection
+    selects from."""
+    for _, selected in selecting(source):
+        if isinstance(selected, Concatenate):
+            for part in selected.sources:
+                yield from _stores(part)
+        else:
+            yield selected
 
 
 def _tokenizer_contract(pipelines: Sequence[Pipeline]) -> None:
@@ -627,6 +654,7 @@ def _measure(
     for branch, scored in zip(branches, held, strict=True):
         _analyzed(branch, read, validation=scored)
     _capabilities(branches, read, provision)
+    _documented_packs(branches)
     branches = _pin_sources(branches, read)
     _tokenizer_contract(branches)
     branches = tuple(_automatic(branch, read, automatic) for branch in branches)
