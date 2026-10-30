@@ -229,11 +229,14 @@ class MosaicForward(_Mainloop[Tiles]):
                                       **form), None
 
     def legal(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> bool:
-        """Its launch's (`_launch_legal`), and a fold's natural rewalk at its own tiles (`Tiles.relaunch`),
-        their key tile dividing the config's and their consumers at most its, holding too (row 2584)."""
+        """Its launch's (`_launch_legal`), and a fold's natural rewalk where the config names its own tiles
+        (`Tiles.relaunch`: the derivation's and a tuning neighbour's, `_relaunched`), their key tile dividing
+        the config's and their consumers at most its, holding too (row 2584); a config that names none (a
+        pin's) rewalks at its own tiles, as a launch takes it."""
         if not self._launch_legal(ba, config, target):
             return False
-        if config.natural_form or self._natural(ba):
+        if (config.natural_form or self._natural(ba)
+                or (config.relaunch_k, config.relaunch_consumers) == (None, None)):
             return True
         relaunch = config.relaunch
         return (config.block_k % relaunch.block_k == 0 and relaunch.consumers <= config.consumers
