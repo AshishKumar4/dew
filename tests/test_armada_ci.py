@@ -1047,6 +1047,31 @@ def test_every_row_carries_the_sites_its_cases_moved_onto_ynnpacks_fusions_and_a
     assert (tmp_path / "runs").read_text() == "x", "the second task reused the rows"
 
 
+def test_every_row_carries_its_flows_cell_counts_and_a_reused_row_keeps_them(ci, tmp_path, monkeypatch,
+                                                                             cache_worker):
+    """Each row a task runs carries `cells`, its file's GPU flows' counts by case (the JUnit property
+    tests/conftest.py writes from tests/gpu_flow.py), an empty object where it runs no flow; a green row a
+    later task reuses keeps them, so the train's native gate reads a cached flow's counts (ledger 2643)."""
+    counts = {"passed": 2, "failed": 0, "skipped": 1, "device": "cpu"}
+    written(tmp_path, {
+        "test_gpu_band.py": "import json\n"
+                            "from pathlib import Path\n"
+                            "def test_the_band_runs(record_property):\n"
+                            "    with Path('runs').open('a') as runs: runs.write('x')\n"
+                            f"    record_property('cells', json.dumps({counts!r}))\n",
+        "test_plain.py": "def test_plain(): pass\n"})
+    out = cached_checkout(ci, tmp_path, monkeypatch, cache_worker)
+
+    def fields() -> dict[str, dict]:
+        return {row["name"]: row["cells"] for row in armada_task(ci, monkeypatch, out)}
+
+    expected = {"3.12:tests/test_gpu_band.py": {"tests/test_gpu_band.py::test_the_band_runs": counts},
+                "3.12:tests/test_plain.py": {}}
+    assert fields() == expected
+    assert fields() == expected
+    assert (tmp_path / "runs").read_text() == "x", "the second task reused the rows"
+
+
 def cached_checkout(ci, root: Path, monkeypatch, cache_worker) -> Path:
     """Checkout `root` run by 3.12 tasks on one CPU class against the shared test cache, and where their
     verdict is written: beside the checkout's entries, not among them (the checkout's own directory is an
