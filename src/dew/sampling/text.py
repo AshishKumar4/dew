@@ -55,6 +55,7 @@ from dew.nn.kv_cache import (
     with_rounding_keys_of,
     write_cache,
 )
+from dew.nn.progress import END, Progress, progressed
 from dew.nn.protocols import (
     BlockDenoiser,
     BlockDrafting,
@@ -372,8 +373,8 @@ def rounding_keys(keys: jax.Array) -> jax.Array:
 
 
 def prefill_state(model: nn.Module, params: Variables, inputs: ModelInputs, ops: DecodeOps,
-                  cache: Variables | None = None, rounding: jax.Array | None = None
-                  ) -> tuple[DecoderState, jax.Array]:
+                  cache: Variables | None = None, rounding: jax.Array | None = None,
+                  progress: Progress = END) -> tuple[DecoderState, jax.Array]:
     """The state after the prompt, and which rows hold a real token.
 
     A `Selective` decoder skips the prompt-wide head, the largest array a
@@ -404,6 +405,7 @@ def prefill_state(model: nn.Module, params: Variables, inputs: ModelInputs, ops:
         method=("states_and_logits_at" if selective else "states_and_logits" if exposed else None),
         capture_intermediates=False,
         **inputs.kwargs(),
+        **progressed(model, progress),
     )
     states, logits = answer if exposed or selective else (None, answer)
     if ops.record is not None:
@@ -507,7 +509,8 @@ def _refuse_generation(model: nn.Module) -> None:
         raise ValueError(refusal)
 
 
-def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | None) -> DecodeOps:
+def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | None,
+               progress: Progress = END) -> DecodeOps:
     """The model operations a strategy may run, bound to these weights.
 
     `depths` is the prediction depths a drafting strategy runs, beside the
@@ -522,6 +525,9 @@ def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | N
     to keep static shapes; it happens once per request.
     """
     exposed = isinstance(model, Exposing)
+    # The target's forwards read the run's progress where it reads one; a drafter's proposals, which the
+    # target verifies, read none.
+    at = progressed(model, progress)
     blocks = (_block_drafting(model, params)
               if depths is not None and isinstance(model, BlockDrafting) and model.dspark else None)
     depths = depths or 0
@@ -538,7 +544,7 @@ def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | N
             return model.apply(
                 {**params, "cache": state.cache}, jnp.where(valid, tokens, pad_id),
                 decode=True, coordinates=laid, mutable=["cache", *recorded], rngs=None,
-                method="states_and_logits" if exposed else None, capture_intermediates=False)
+                method="states_and_logits" if exposed else None, capture_intermediates=False, **at)
 
         history, lengths = state.tokens, state.lengths
         original = rebuild_position(model)
@@ -565,7 +571,7 @@ def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | N
                     {**params, 'cache': empty}, history,
                     coordinates=laid_out(history.shape, valid=jnp.arange(history.shape[1])[None, :]
                                          < following[:, None]),
-                    decode=True, mutable=['cache'], method='states_and_logits' if exposed else None)
+                    decode=True, mutable=['cache'], method='states_and_logits' if exposed else None, **at)
                 rows = jnp.arange(tokens.shape[0])[:, None]
                 # The same answer `append` gives: states beside the logits where the model exposes them.
                 picked = jax.tree.map(lambda leaf: leaf[rows, slots], answer)
@@ -656,7 +662,7 @@ def _block_drafting(model: nn.Module, params: Variables):
 def _generate(model: nn.Module, params: Variables, inputs: ModelInputs, keys: jax.Array,
               trips: int, budget: jax.Array, pad_id: int, n: int,
               transforms: tuple[LogitsTransform, ...], stopping: decoding.Finishing,
-              strategy: Strategy) -> Generation:
+              strategy: Strategy, progress: Progress = END) -> Generation:
     """One fixed compiled loop of `trips` draws; finished rows do not mutate
     their cache state. `budget` is the tokens the request may draw, at most
     `trips`, which the steps read (`StepState.budget`).
@@ -672,8 +678,8 @@ def _generate(model: nn.Module, params: Variables, inputs: ModelInputs, keys: ja
         return Generation(prompt, jnp.zeros(batch * n, jnp.int32),
                           jnp.zeros(batch * n, bool), empty, empty)
     drafting = isinstance(strategy, Speculative)
-    ops = decode_ops(model, params, pad_id, prediction_depths(model) if drafting else None)
-    state, real = prefill_state(model, params, inputs, ops, rounding=rounding_keys(keys))
+    ops = decode_ops(model, params, pad_id, prediction_depths(model) if drafting else None, progress)
+    state, real = prefill_state(model, params, inputs, ops, rounding=rounding_keys(keys), progress=progress)
     start = StepState(
         tokens=jnp.concatenate([inputs.tokens, jnp.zeros((batch, trips), jnp.int32)], axis=1),
         valid=jnp.concatenate([real_slots(inputs.token_fields, (batch, width)),
@@ -880,7 +886,7 @@ def _check(model: nn.Module, params: Variables, inputs: ModelInputs, max_new_tok
 def _checked(model: nn.Module, params: Variables, inputs: ModelInputs, keys: jax.Array,
              budget: jax.Array, trips: int, pad_id: int, n: int,
              transforms: tuple[LogitsTransform, ...], stopping: decoding.Finishing,
-             strategy: Strategy,
+             strategy: Strategy, progress: Progress,
              packing: tuple[ProjectionGroup, ...] = ()) -> tuple[checkify.Error, Generation]:
     """`_generate` with its device checks discharged into a returned error.
 
@@ -893,13 +899,13 @@ def _checked(model: nn.Module, params: Variables, inputs: ModelInputs, keys: jax
     # dew.inference imports this module, so its packing is imported here.
     from dew.inference.projections import packed_in_call
 
-    def run(params, inputs, keys, budget, transforms, stopping, strategy):
+    def run(params, inputs, keys, budget, transforms, stopping, strategy, progress):
         # The groups a borrowed tree holds unpacked pack here, once a call (`packed_in_call`).
         return _generate(model, packed_in_call(params, packing), inputs, keys, trips, budget, pad_id, n,
-                         transforms, stopping, strategy)
+                         transforms, stopping, strategy, progress)
 
     return checkify.checkify(run, errors=checkify.user_checks)(
-        params, inputs, keys, budget, transforms, stopping, strategy)
+        params, inputs, keys, budget, transforms, stopping, strategy, progress)
 
 
 
@@ -912,7 +918,8 @@ def generate(model: nn.Module, params: Variables,
              *, key: int | jax.Array,
              sampling: Sampling = _DEFAULT_SAMPLING, n: int = 1, logits: Transforms | None = None,
              stopping: Criteria | None = None, strategy: Strategy | None = None,
-             trips: int | None = None, prefix: int | Literal["prompt"] | None = None) -> Generation:
+             trips: int | None = None, prefix: int | Literal["prompt"] | None = None,
+             progress: Progress = END) -> Generation:
     """Generate continuations from model inputs, or from token ids for a text-only prompt.
 
     ``params`` is the full variables dict, ``{'params': ...}``.
@@ -953,6 +960,11 @@ def generate(model: nn.Module, params: Variables,
     transform or a search reads it (``ForcedEOS``, ``Beam``), and the
     columns past it come back for the caller to cut.
 
+    ``progress`` is the run's progress a model that reads one draws at
+    (``dew.nn.progress``): its prefill's and every step's forward read it, an
+    input of the compiled loop like the weights, so a run's collection draws
+    from its policy at the updates it committed; ``END``, a finished run's.
+
     ``prefix`` serves a prefix run (``LMObjective``'s): each prompt that
     carries no blocks of its own reads its first ``prefix`` real tokens, or
     with ``"prompt"`` all of them, as one block (``served_blocks``). They are
@@ -977,12 +989,12 @@ def generate(model: nn.Module, params: Variables,
     from dew.inference.projections import pending
 
     compiled = program(_checked, model, static_argnames=("model", "trips", "pad_id", "n", "packing"),
-                       in_shardings=(None, plan.sharding, plan.sharding, None, None, None, None),
+                       in_shardings=(None, plan.sharding, plan.sharding, None, None, None, None, None),
                        out_shardings=(None, plan.sharding))
     # A tree a loader owns arrives packed; one borrowed from a live objective packs in the call.
     failure, output = compiled(model, decoding_storage(model, params), plan.place(request.padded()),
                                plan.keys(request.key), jnp.int32(max_new_tokens), scanned, sampling.pad, n,
-                               *components, pending(model, params))
+                               *components, progress, pending(model, params))
     # The error's flags are the one read a request waits on.
     jax.device_get(failure).throw()
     return replace(output, rows=plan.rows * n)

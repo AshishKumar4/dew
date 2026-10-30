@@ -717,8 +717,11 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
             return sampling
         return dataclasses.replace(sampling, eos_token_ids=self.eos_token_ids)
 
-    def policy(self, params: Variables, sampling: Sampling = _DEFAULT_SAMPLING) -> TextGeneration:
-        """Return the model over this training tree as a generation task, under `sampling` (`sampled`).
+    def policy(self, params: Variables, sampling: Sampling = _DEFAULT_SAMPLING, progress: Progress = END
+               ) -> TextGeneration:
+        """Return the model over this training tree as a generation task, under `sampling` (`sampled`), at
+        the run's `progress` (`dew.nn.progress`), the updates a collection's step committed, so it draws
+        from the policy its loss reads at that step.
 
         A rollout uses one snapshot of the policy and draws every completion from it;
         the result records the actual and raw-policy likelihoods that the objective's
@@ -729,7 +732,8 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         if self.adaptation is not None:
             raise ValueError("an objective that steps its continuum level in context scores what no "
                              "generation draws yet: a generation reads the level it starts with")
-        return TextGeneration(self.model, params, sampling=self.sampled(sampling), prefix=self.prefix)
+        return TextGeneration(self.model, params, sampling=self.sampled(sampling), prefix=self.prefix,
+                              progress=progress)
 
     def task_settings(self) -> TextSettings | None:
         """The decoder's row length, preview budget, sampling policy (`sampled`), and tokenizer or

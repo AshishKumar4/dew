@@ -30,6 +30,7 @@ from dew.data.dataset import Loader
 from dew.distributed.batches import split_fields
 from dew.inference import TextGeneration
 from dew.nn.inputs import ModelInputs
+from dew.nn.progress import END, Progress, progressed
 from dew.objectives.base import Step
 from dew.objectives.rl import GRPOObjective, RolloutScheduler
 from dew.objectives.rl.episodes import EpisodeStatus, Observation
@@ -44,6 +45,7 @@ MARGIN = 1e-4
 and the first outside it, or the two largest under greedy decoding: past it a float64 forward keeps
 the tokens the float32 policy kept."""
 SEEDS = {'attention cache capacity': 32, 'attention cached scores raw': 8,
+         'dex mid-anneal scores raw': 16, 'dex mid-anneal scores policy': 16,
          'attention cached scores policy': 16, 'attention perplexity': 16, 'attention positions': 16,
          'attention rescored generation': 8, 'greedy padded generation': 32, 'mla cache capacity': 8,
          'mla cached scores raw': 8, 'mla cached scores policy': 64, 'mla positions': 8,
@@ -93,7 +95,7 @@ def forward(model):
     return jax.jit(model.apply)
 
 
-def _right_padded(model, params, contexts, width: int, positions=None):
+def _right_padded(model, params, contexts, width: int, positions=None, progress: Progress = END):
     """One full forward over `contexts`, a row each, right-padded to `width`, at `positions` where given
     (a row each, continued past the row's end): a causal model reads no padding at a real position."""
     rows = np.zeros((len(contexts), width), np.int32)
@@ -106,16 +108,17 @@ def _right_padded(model, params, contexts, width: int, positions=None):
             np.concatenate([placed[row, :len(context)],
                             placed[row, len(context) - 1] + np.arange(1, width - len(context) + 1)])
             for row, context in enumerate(contexts)]))
-    return forward(model)(params, jnp.asarray(rows), **extra)
+    return forward(model)(params, jnp.asarray(rows), **extra, **progressed(model, progress))
 
 
-def row_logits(model, params, prompt, lengths, tokens, positions=None):
+def row_logits(model, params, prompt, lengths, tokens, positions=None, progress: Progress = END):
     """Each row's logits for its drawn `tokens`, from full forwards over every row's unpadded tokens,
     right-padded as a learner scores a batch of rollouts, at `positions` where given (a row each, the
     prompt's and the tokens', continued past the row's end). The first token's are a forward over the
     prompts alone at the prompt batch's width, the shapes the cached prefill computes them at, so a GPU
     picks each product's kernel as it does there; the later tokens' are one forward over each prompt and
-    the tokens drawn before it, at its longest row. A cached decode step projects one token a row, ROWS
+    the tokens drawn before it, at its longest row, each at the run's `progress`. A cached decode step
+    projects one token a row, ROWS
     of them, where that forward projects every token of a row, ROWS x (prompt + step), so the later
     steps' ratio holds what a GPU's kernel for each shape rounds apart too: on an A100, kpool's at 1.35 and
     1.26 (row 1543, a float32 dot's error by the rows cuBLAS's kernel takes, 1.5e-7 to 4.1e-7 at K=512).
@@ -123,17 +126,19 @@ def row_logits(model, params, prompt, lengths, tokens, positions=None):
     width, lengths = prompt.shape[1], np.asarray(lengths)
     prompts = [prompt[row, width - length:] for row, length in enumerate(lengths)]
     contexts = [np.concatenate([alone, tokens[row, :-1]]) for row, alone in enumerate(prompts)]
-    first = _right_padded(model, params, prompts, width, positions)
-    later = _right_padded(model, params, contexts, max(len(context) for context in contexts), positions)
+    first = _right_padded(model, params, prompts, width, positions, progress)
+    later = _right_padded(model, params, contexts, max(len(context) for context in contexts), positions,
+                          progress)
     return [jnp.concatenate([first[row, length - 1:length], later[row, length:length - 1 + tokens.shape[1]]])
             for row, length in enumerate(lengths)]
 
 
-def policy_scores(model, params, prompt, lengths, tokens, sampling, positions=None) -> dict:
+def policy_scores(model, params, prompt, lengths, tokens, sampling, positions=None,
+                  progress: Progress = END) -> dict:
     """Each drawn token's log probability under the raw model (`raw`) and, for a sampled policy, under
     the policy that drew it, its temperature and top-k (`behavior`), from `row_logits`."""
     found = {"raw": []} | ({"behavior": []} if sampling.temperature else {})
-    for logits, picked in zip(row_logits(model, params, prompt, lengths, tokens, positions),
+    for logits, picked in zip(row_logits(model, params, prompt, lengths, tokens, positions, progress),
                               jnp.asarray(tokens)[..., None], strict=True):
         found["raw"].append(jnp.take_along_axis(jax.nn.log_softmax(logits), picked, -1)[:, 0])
         if sampling.temperature:
@@ -144,22 +149,26 @@ def policy_scores(model, params, prompt, lengths, tokens, sampling, positions=No
     return {name: jnp.stack(values) for name, values in found.items()}
 
 
-def cutoff_gaps(model, params, prompt, lengths, tokens, sampling, positions=None) -> np.ndarray:
+def cutoff_gaps(model, params, prompt, lengths, tokens, sampling, positions=None,
+                progress: Progress = END) -> np.ndarray:
     """Each drawn step's gap between the scores either side of its policy's cutoff, `[rows, steps]`."""
     kept = sampling.top_k if sampling.temperature else 1
     gaps = []
-    for logits in row_logits(model, params, prompt, lengths, tokens, positions):
+    for logits in row_logits(model, params, prompt, lengths, tokens, positions, progress):
         scores = np.sort(np.asarray(logits / (sampling.temperature or 1)), -1)[:, ::-1]
         gaps.append(scores[:, kept - 1] - scores[:, kept])
     return np.stack(gaps)
 
 
-def clears_margin(model, params, prompt, lengths, tokens, sampling, positions=None) -> bool:
+def clears_margin(model, params, prompt, lengths, tokens, sampling, positions=None,
+                  progress: Progress = END) -> bool:
     """Whether every drawn step's scores clear MARGIN at its policy's cutoff."""
-    return bool(np.min(cutoff_gaps(model, params, prompt, lengths, tokens, sampling, positions)) > MARGIN)
+    gaps = cutoff_gaps(model, params, prompt, lengths, tokens, sampling, positions, progress)
+    return bool(np.min(gaps) > MARGIN)
 
 
-def generation_draw(model, params, sampling, steps: int, *, margin: bool, **prompt_shape):
+def generation_draw(model, params, sampling, steps: int, *, margin: bool, progress: Progress = END,
+                    **prompt_shape):
     """Check 1's draw of drawn prompts, a key and the tokens `generate` draws from them: with `margin`,
     the first of the seed's attempts whose steps clear MARGIN."""
     def draw(seed):
@@ -167,9 +176,10 @@ def generation_draw(model, params, sampling, steps: int, *, margin: bool, **prom
             prompt, lengths = drawn_prompts(seed, attempt, int(model.vocab_size), **prompt_shape)
             key = jax.random.key_data(jax.random.fold_in(jax.random.key(seed), attempt))
             result = generate(model, params, prompt_inputs({"prompt": prompt, "prompt_length": lengths}),
-                              steps, key=jax.random.wrap_key_data(key), sampling=sampling)
+                              steps, key=jax.random.wrap_key_data(key), sampling=sampling, progress=progress)
             tokens = np.asarray(result.tokens)[:, prompt.shape[1]:]
-            if not margin or clears_margin(model, params, prompt, lengths, tokens, sampling):
+            if not margin or clears_margin(model, params, prompt, lengths, tokens, sampling,
+                                           progress=progress):
                 return prompt, lengths, np.asarray(key), tokens
         raise AssertionError(f"no draw of seed {seed} clears MARGIN")
     return draw
@@ -180,11 +190,11 @@ def only(name: str, run):
     return as_given(lambda *draw: {name: run(*draw)[name]})
 
 
-def generated(model, params, sampling, steps: int):
+def generated(model, params, sampling, steps: int, progress: Progress = END):
     """The generation's own recorded likelihoods of a draw, its tokens the draw's, bit for bit."""
     def run(prompt, lengths, key, tokens):
         result = generate(model, params, prompt_inputs({"prompt": prompt, "prompt_length": lengths}), steps,
-                          key=jax.random.wrap_key_data(key), sampling=sampling)
+                          key=jax.random.wrap_key_data(key), sampling=sampling, progress=progress)
         np.testing.assert_array_equal(np.asarray(result.tokens)[:, prompt.shape[1]:], tokens)
         np.testing.assert_array_equal(result.lengths, np.full(len(prompt), steps))
         np.testing.assert_array_equal(result.terminated, np.zeros(len(prompt), bool))
@@ -196,7 +206,7 @@ def generated(model, params, sampling, steps: int):
     return run
 
 
-def scored(model, params, sampling, dtype=None):
+def scored(model, params, sampling, dtype=None, progress: Progress = END):
     """`policy_scores` of a draw's tokens, the model computing at `dtype` where given, on its
     parameters widened to it under x64: a draw's reference, and at float64 its truth. The model and its
     parameters are fixed once, so only the draw goes through."""
@@ -206,26 +216,28 @@ def scored(model, params, sampling, dtype=None):
 
     def run(prompt, lengths, key, tokens):
         with jax.enable_x64(new_val=True) if dtype is not None else nullcontext():
-            return policy_scores(model, params, prompt, lengths, tokens, sampling)
+            return policy_scores(model, params, prompt, lengths, tokens, sampling, progress=progress)
     return run
 
 
 def assert_generation_scores_as_full_forwards(model, label: str, *, params=None, seeds=SEEDS,
-                                              steps: int = 3) -> None:
+                                              steps: int = 3, progress: Progress = END) -> None:
     """Check 1: a left-padded batch drawn through the cache scores each drawn token, under the raw
     model over every draw (`{label} raw`) and under the top-k policy that drew it over draws whose
     steps clear MARGIN (`{label} policy`), on par with a fresh full forward over that row's unpadded
     tokens, from its float64 twin's evaluation (`float64_twin`), over drawn prompts and keys: over
-    `params`, a fresh initialization where none are given, at the `seeds` declared for each label."""
+    `params`, a fresh initialization where none are given, at the `seeds` declared for each label, the
+    generation and the forwards at the run's `progress`."""
     if params is None:
         params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
     sampling = Sampling(temperature=0.7, top_k=5)
     for leaf, margin in (("raw", False), ("behavior", True)):
         name = f"{label} {'raw' if leaf == 'raw' else 'policy'}"
-        assert_as_exact(only(leaf, generated(model, params, sampling, steps)),
-                        only(leaf, scored(model, params, sampling)),
-                        generation_draw(model, params, sampling, steps, margin=margin), name,
-                        seeds=seeds[name], truth_fn=only(leaf, scored(model, params, sampling, "float64")))
+        assert_as_exact(only(leaf, generated(model, params, sampling, steps, progress)),
+                        only(leaf, scored(model, params, sampling, progress=progress)),
+                        generation_draw(model, params, sampling, steps, margin=margin, progress=progress),
+                        name, seeds=seeds[name],
+                        truth_fn=only(leaf, scored(model, params, sampling, "float64", progress)))
 
 
 @pytest.mark.parametrize("kind", ["attention", "mla", "recurrent"])
@@ -254,6 +266,26 @@ def test_padding_and_cached_likelihoods_match_unpadded_full_forwards(kind):
                     generation_draw(model, params, sampling, 3, margin=False), label, seeds=SEEDS[label],
                     truth_fn=only("raw", scored(model, params, sampling, "float64")))
     assert not np.array_equal(result.raw_log_probs, result.behavior_log_probs)
+
+
+def test_a_generation_draws_at_the_runs_progress_its_full_forwards_score_there():
+    """A decoder that reads the run's progress, a DEX decoder half way through its anneal, its strengths
+    and projections off their start, draws at the progress a generation names (`generate(progress=)`,
+    ledger 2667): every step of its prefill and its cache reads it, so each drawn token's likelihoods
+    are on par with a full forward's over its row at that progress
+    (`assert_generation_scores_as_full_forwards`), where at the run's end they are another policy's."""
+    from test_dex import moved_draw
+
+    from dew.nn.dex import DifferentialExtension
+
+    model = decoder().with_dex(DifferentialExtension(((0, (0, 1)),), anneal_steps=10))
+    params = moved_draw(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)), 8)(0)[0]
+    halfway = Progress(jnp.asarray(5, jnp.int32))
+    assert_generation_scores_as_full_forwards(model, "dex mid-anneal scores", params=params, progress=halfway)
+    inputs = prompt_inputs(prompts())
+    at, ended = (generate(model, params, inputs, 3, key=jax.random.key(1), sampling=Sampling(temperature=0),
+                          progress=progress) for progress in (halfway, END))
+    assert not np.array_equal(at.raw_log_probs, ended.raw_log_probs)
 
 
 @pytest.mark.parametrize("kind", sorted(mixers.paths))
@@ -419,6 +451,24 @@ def test_eos_counts_as_action_and_reward_excludes_eos_and_padding():
     for index in (0, 1):
         actions = result["input_ids"][(result["session_index"] == index) & (result["response_mask"] != 0)]
         np.testing.assert_array_equal(actions, [eos])
+
+
+def test_a_synchronous_collection_draws_from_the_policy_at_the_runs_updates():
+    """A synchronous collection (`RolloutScheduler.sampled`'s `PolicyCollector`) draws from the policy its
+    step's loss reads, at the updates the run committed (`Progress`, ledger 2667): over a DEX decoder its
+    proximal likelihoods half way through the anneal are another policy's than at its start, where a
+    collection at the run's end drew from one; the generation at a progress draws as its forwards score
+    there (`test_a_generation_draws_at_the_runs_progress_its_full_forwards_score_there`)."""
+    from dew.nn.dex import DifferentialExtension
+
+    model = decoder().with_dex(DifferentialExtension(((0, (0, 1)),), anneal_steps=10))
+    objective = GRPOObjective(model, seq_len=7)
+    params = objective.init(jax.random.key(0))
+    rollout = RolloutScheduler.sampled(objective, lambda text, record: 1.0, groups=1, max_new_tokens=3,
+                                       sampling=Sampling(temperature=0))
+    held = {updates: rollout(SimpleNamespace(variables=params, step=0, updates=updates), prompts(),
+                             jax.random.key(1)) for updates in (0, 5)}
+    assert not np.array_equal(held[0]["old_log_probs"], held[5]["old_log_probs"])
 
 
 @pytest.mark.parametrize("kind", ["attention", "recurrent"])

@@ -32,6 +32,7 @@ from dew.batch import Variables, token_id
 from dew.data.dataset import DataPartition
 from dew.inference.rollouts import Draw
 from dew.nn.inputs import ModelInputs, mesh_of, pad_token_rows
+from dew.nn.progress import END, Progress
 from dew.sampling.text import Generation, Sampling
 
 from .sessions import Call, Session, Snapshot, Status, Task, Transcript, finite_reward, json_objects
@@ -180,11 +181,11 @@ EpisodeRecorder = Callable[[Episode], None]
 class EpisodeInference(Protocol):
     """Draws actions from a bound policy and returns the actual sampling likelihoods.
 
-    `bind(variables)` returns an inference that generates from that one
-    weight snapshot.
+    `bind(variables, progress)` returns an inference that generates from that one
+    weight snapshot, at the run's `progress` a model that reads one draws at (`dew.nn.progress`).
     """
 
-    def bind(self, variables: Variables, /) -> EpisodeInference: ...
+    def bind(self, variables: Variables, /, progress: Progress = END) -> EpisodeInference: ...
 
     def __call__(self, inputs: ModelInputs | Sequence[Sequence[int]], max_new_tokens: int, /,
                  *, key: jax.Array, sampling: Sampling) -> Generation: ...
@@ -650,7 +651,8 @@ class EpisodeCollector:
             if not all(task.id.removeprefix("-").isdigit() for task in tasks):
                 raise ValueError("an episode collection's tasks are integer task ids (`task_ids`)")
             ids = np.asarray([int(task.id) for task in tasks], np.int64)
-            policy = self.policy.bind(snapshot.variables)
+            # The policy the step's loss reads, at the updates the run committed (`Objective.progress`).
+            policy = self.policy.bind(snapshot.variables, Progress(jnp.asarray(snapshot.updates, jnp.int32)))
             key_words = tuple(np.asarray(jax.random.key_data(snapshot.key)).tolist())
             signature = (ids.size, samples, self.max_turns, self.max_prompt_tokens, self.max_new_tokens,
                          self.sampling, snapshot.step, snapshot.updates, key_words, self.journal is not None)
