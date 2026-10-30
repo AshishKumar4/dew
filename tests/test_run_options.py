@@ -811,3 +811,61 @@ def test_each_option_a_saved_task_is_built_with_reaches_it_from_the_command_line
               for name in {name for options, _ in found for name in options}
               if all(name not in options or name in failures for options, failures in found)}
     assert not missed, f"{settings.__name__}'s options no run here witnesses: {missed}"
+
+
+def read_where_held(task, declared: dict[str, object]) -> list[str]:
+    """The options of `declared`, by their path in `task` (`held`), that a request of `task` reads nowhere
+    it holds them (`reading`)."""
+    places = held_by(task)
+    holders: dict[type, set[str]] = {}
+    for path in declared:
+        holder, attribute = places[path]
+        holders.setdefault(type(holder), set()).add(attribute)
+    with reading(holders) as reads:
+        requested(task)
+    return [path for path, option in declared.items()
+            if not any(name == places[path][1] and same(found, option) for name, found in reads)]
+
+
+@pytest.mark.parametrize("release", ["dream", "diffucoder"])
+def test_a_masked_run_over_a_release_saves_and_reads_the_walk_the_release_declares(release, tmp_path):
+    """A masked-diffusion run over a Dream release (dream-tiny as the release ships it, its generation
+    config and its own sampling code, `test_dream_walk.snapshot`), setting nothing of its task, saves the
+    walk the release's own task declares (`Pretrained.text_generation`): its process, the grid's endpoint
+    among it (ledger 2563), its solver, its steps and its blocks; and a request of the run's loaded task
+    reads each where it holds it, a loaded source's default reaching its consumer."""
+    from test_dream_walk import snapshot
+    from token_support import write_token_corpus
+
+    from dew.inference.tasks import MaskedSettings
+    from dew.interop import Pretrained
+
+    source = snapshot(release, tmp_path)
+    declared = Pretrained.load(source, dtype="float32", attention_impl="reference").text_generation()
+    corpus = write_token_corpus(tmp_path / "tokens", np.random.RandomState(0).randint(4, 100, 400),
+                                vocab_size=128, eos_id=1)
+    data = TokenFiles(corpus.train).pipe(presets.lm, None, seq_len=11, batch=8, pack=None).loading(
+        Loading(workers=0))
+    model = ModelConfig("causal_transformer", {"dtype": "float32", "attention_impl": "reference"})
+    run = LMRunConfig(data=data, pretrained=str(source), objective=ObjectiveConfig("masked_diffusion"),
+                      tokenizer="byte", max_new_tokens=0, model=model)
+    _, task = saved_with(run, tmp_path, "over", MaskedSettings, {})
+    options = {name: getattr(declared, name) for name in ("process", "solver", "steps", "block")}
+    assert {name: same(getattr(task, name), option) for name, option in options.items()} == dict.fromkeys(
+        options, True)
+    assert read_where_held(task, options) == []
+
+
+def test_a_decision_run_over_a_release_saves_and_reads_the_task_the_release_declares(tmp_path):
+    """A decision run over a release (tiny Laya), setting nothing of its task, saves the task the
+    release's own declares (`Decide.from_pretrained`): its layout, its special tokens and its confidence,
+    its budget the run's data's (`DecideSettings.questions`); and a request of the run's loaded task reads
+    each where it holds it."""
+    from dew.decision.task import Decide, DecideSettings
+
+    declared = Decide.from_pretrained(TINY_LAYA)
+    _, task = saved_with(decision(tmp_path, drawn=False), tmp_path, "over", DecideSettings, {})
+    options = {name: getattr(declared, name) for name in ("layout", "specials", "confidence")}
+    assert {name: same(getattr(task, name), option) for name, option in options.items()} == dict.fromkeys(
+        options, True)
+    assert read_where_held(task, options) == []
