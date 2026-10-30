@@ -370,6 +370,10 @@ class BlockWiring:
         if self.normed_residual and (not self.pre_norms or self.parallel_residual or self.ngpt is not None):
             raise ValueError("normed_residual joins each sublayer's output to its normed input: it needs pre "
                              "norms, and takes no parallel residual or nGPT step")
+        if self.stream_multiplier != 1.0 and (self.residual_norms or self.parallel_residual
+                                              or self.ngpt is not None):
+            raise ValueError("stream_multiplier scales the stream each sublayer joins: a post-LN block's, a "
+                             "parallel residual's and an nGPT step's joins take no factor")
 
 
 @dataclasses.dataclass(frozen=True)

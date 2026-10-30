@@ -108,6 +108,18 @@ def test_llada2s_task_walks_as_its_release_and_generates_the_recorded_prompts():
     assert (rebuilt.solver, rebuilt.block, rebuilt.steps) == (walked.solver, walked.block, walked.steps)
 
 
+@pytest.mark.parametrize("asked", [{"steps": 64}, {"temperature": 0.7}])
+def test_a_llada2_generation_config_asking_what_its_walk_does_not_read_is_refused(asked, tmp_path):
+    """LLaDA2's walk reads none of the generation config's controls (32 steps a block at temperature 0
+    whatever it states), so a config asking for other steps or another temperature builds no task."""
+    import shutil
+
+    source = Path(shutil.copytree(FIXTURES / "llada2-tiny", tmp_path / "llada2"))
+    (source / "generation_config.json").write_text(json.dumps(asked))
+    with pytest.raises(ValueError):
+        Pretrained.load(source, dtype="float32", attention_impl="reference").text_generation()
+
+
 def test_llada2s_task_continues_stops_and_takes_a_zero_budget():
     """LLaDA2's blockwise task over padded rows: its greedy reveal draws every continuation of a prompt
     alike (`n`); an end token it draws stops a row there, the rest padding; and a zero budget returns

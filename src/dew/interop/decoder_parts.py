@@ -1906,13 +1906,15 @@ class MaskedWalk:
     """How a masked diffusion release generates, its own recipe: its `solver`
     (`dew.diffusion.discrete`'s `Confident` for LLaDA2.0's reveal, `Unmask` for Dream's `origin`),
     `steps` a walk, a block's where the response is walked `block` places at a time (LLaDA2.0's
-    `generate`), and the time its grid runs to (`DiscreteProcess.endpoint`, Dream's `eps`), None for
-    MDLM's."""
+    `generate`), the time its grid runs to (`DiscreteProcess.endpoint`, Dream's `eps`), None for
+    MDLM's, and the generation config's controls it reads (`reads`, Dream's `alg`, `steps`, `eps` and
+    the rest), which a task built from it takes as its own and refuses no more (`audit_masked`)."""
 
     solver: "Unmask | Confident"
     steps: int
     block: int | None = None
     endpoint: float | None = None
+    reads: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)

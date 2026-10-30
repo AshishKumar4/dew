@@ -806,9 +806,7 @@ class PretrainedMaskedDecoder(Pretrained):
         walk = self.masked_walk
         # The release's own walk reads its controls (Dream's `alg`, `steps` and `eps`), which a task
         # without it refuses as MDLM cannot honour them.
-        from dew.interop.families.masked_diffusion import DREAM_GENERATION
-
-        audit_masked(config, generation, () if walk is None else DREAM_GENERATION.keys(), mask_id)
+        audit_masked(config, generation, () if walk is None else walk.reads, mask_id)
         walked = {} if walk is None else {"solver": walk.solver, "steps": walk.steps, "block": walk.block}
         return MaskedGeneration(self.model, self.variables,
                                 MDLM(mask_id=mask_id, endpoint=None if walk is None else walk.endpoint)(),

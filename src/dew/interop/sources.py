@@ -210,22 +210,10 @@ def remote_code(name_or_dir: str | Path, directory: Path) -> Path:
 
 
 def code_file(code: SourceCode, name: str) -> Path | None:
-    """The file `name` beside a source's own code (`SourceCode`): a directory's own, or the Hub repo's at
-    the code's commit, read from the hub's cache where it holds the file, else fetched; None where the
-    directory, or the Hub at that commit, proves it holds no such file. An offline lookup of a file the
-    cache lacks raises rather than reading it as absent, as `HubSnapshot.optional_file` does."""
-    if os.path.isdir(code.source):
-        path = Path(code.source) / name
-        return path if path.is_file() else None
-    from huggingface_hub import file_exists, hf_hub_download, try_to_load_from_cache
-
-    remote = f"{code.folder}/{name}" if code.folder else name
-    cached = try_to_load_from_cache(str(code.source), remote, revision=code.revision)
-    if isinstance(cached, str):
-        return Path(cached)
-    if not file_exists(str(code.source), remote, revision=code.revision):
-        return None
-    return Path(hf_hub_download(str(code.source), remote, revision=code.revision))
+    """The file `name` beside a source's own code (`SourceCode`), as the source resolves an optional
+    file of its own (`SourceReference.optional_file`): None where it proves it holds none."""
+    reference = SourceReference(str(code.source), code.revision, code.folder)
+    return reference.optional_file(reference.cached(), name)
 
 
 def code_modules(code: SourceCode) -> dict[str, Path]:

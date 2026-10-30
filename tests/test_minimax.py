@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 from interop_support import assert_reloads, assert_same_stored_tensors
 
-from dew.interop import Pretrained, PretrainedDecoder
+from dew.interop import Pretrained, PretrainedDecoder, release_pins
 from dew.interop.hf_decoders import translate_config
 from dew.interop.sources import load_shards
 
@@ -37,21 +37,39 @@ def test_a_releases_own_config_and_its_transformers_config_read_as_one_model():
     assert len(set(lightning)) == len(lightning) == 70
 
 
-def test_the_checkpoint_writes_back_under_the_releases_names_and_reloads(tmp_path):
-    """minimax-tiny writes back as a `minimax` config with its pattern, factors and rotary, every tensor
-    bit for bit under the release's names (`block_sparse_moe`, `qkv_proj`, `output_gate`), and reloads
-    to the same logits."""
+CODE = ('configuration_minimax_text_01.py', 'modeling_minimax_text_01.py')
+"""The release's own code, which an export writes beside it."""
+
+
+def test_the_checkpoint_writes_back_as_the_release_beside_its_own_code(tmp_path, monkeypatch):
+    """minimax-tiny writes back as the release's own config (`minimax_text_01`: its pattern as
+    `attn_type_list`, its factors as `layernorm_*`, its rotary's width) beside the release's own code,
+    which computes the partial rotary transformers' MiniMax drops, every tensor bit for bit under the
+    release's names (`block_sparse_moe`, `qkv_proj`, `output_gate`), and reloads to the same logits.
+    The code is read from the hub's cache, seeded at the release's commit from its pinned copies
+    (tools/minimax_reference.py --vendor)."""
+    import huggingface_hub.constants
+    from tool_support import load as tool
+
+    repo, revision, auto_map = release_pins.MINIMAX_TEXT_01
+    snapshot = tmp_path / 'hub' / f"models--{repo.replace('/', '--')}" / 'snapshots' / revision
+    snapshot.mkdir(parents=True)
+    code = {file: tool('fetched_fixtures').local(ROOT / 'minimax-text-01' / 'release' / file).read_bytes()
+            for file in CODE}
+    for file, data in code.items():
+        (snapshot / file).write_bytes(data)
+    monkeypatch.setattr(huggingface_hub.constants, 'HF_HUB_CACHE', str(tmp_path / 'hub'))
     loaded = load()
-    PretrainedDecoder.from_model(loaded.model, loaded.variables).save(tmp_path)
-    config = json.loads((tmp_path / 'config.json').read_text())
-    tiny = released('minimax-tiny')
-    assert config['model_type'] == 'minimax'
-    kinds = ('linear_attention', 'full_attention')
-    assert config['layer_types'] == [kinds[kind] for kind in tiny['attn_type_list']]
-    assert config['mlp_alpha_factor'] == tiny['layernorm_mlp_alpha']
-    assert config['rotary_dim'] == tiny['rotary_dim']
-    assert_same_stored_tensors(load_shards(tmp_path), load_shards(TINY))
-    assert_reloads(loaded, tmp_path, np.load(TINY / 'input_ids.npy'))
+    export = tmp_path / 'export'
+    PretrainedDecoder.from_model(loaded.model, loaded.variables).save(export)
+    config, tiny = json.loads((export / 'config.json').read_text()), released('minimax-tiny')
+    assert (config['model_type'], config['auto_map']) == ('minimax_text_01', auto_map)
+    for field in ('attn_type_list', 'postnorm', 'rotary_dim', 'layernorm_full_attention_alpha',
+                  'layernorm_linear_attention_beta', 'layernorm_mlp_alpha', 'num_local_experts'):
+        assert config[field] == tiny[field], field
+    assert {file: (export / file).read_bytes() for file in CODE} == code
+    assert_same_stored_tensors(load_shards(export), load_shards(TINY))
+    assert_reloads(loaded, export, np.load(TINY / 'input_ids.npy'))
 
 
 @pytest.mark.parametrize('field, value', [('mlp_alpha_factor', 2.0), ('shared_intermediate_size', 8),

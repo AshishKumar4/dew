@@ -378,7 +378,8 @@ def _dream_walk(config: Mapping[str, object], generation: Mapping[str, object],
     return MaskedWalk(
         Unmask(temperature=float(_records.number(stated['temperature'], 'temperature'))),
         steps=_records.integer(stated['steps'], 'steps'),
-        endpoint=float(_records.number(stated['eps'], 'eps')) if endpoint is None else endpoint)
+        endpoint=float(_records.number(stated['eps'], 'eps')) if endpoint is None else endpoint,
+        reads=frozenset(DREAM_GENERATION))
 
 
 def _llada2_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:

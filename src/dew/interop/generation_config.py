@@ -159,6 +159,10 @@ _CONTROLS = {
     "force_words_ids": _Control("unsupported", refusal="constrained beam search is not implemented"),
     "forced_bos_token_id": _Control("transform"),
     "forced_eos_token_id": _Control("transform"),
+    # Dream's `diffusion_generate` (generation_utils.py at Dream-org/Dream-v0-Base-7B 6572adb): the keyword
+    # arguments it hands its model, and whether it returns each step's canvas (`output_history`).
+    "generation_kwargs": _Control("unsupported", neutral=({},),
+                                  refusal="no native walk hands its model extra keyword arguments"),
     "guidance_scale": _Control(
         "transform",
         neutral=(1.0,),
@@ -199,6 +203,8 @@ _CONTROLS = {
     "output_hidden_states": _Control(
         "unsupported", neutral=(False,), refusal="generation does not return hidden states"
     ),
+    "output_history": _Control("unsupported", neutral=(False,),
+                               refusal="a native walk returns its final canvas, not each step's"),
     "output_logits": _Control(
         "unsupported", neutral=(False,), refusal="generation does not return per-step logits"
     ),

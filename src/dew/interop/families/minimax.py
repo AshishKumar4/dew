@@ -8,7 +8,9 @@ MiniMaxAI/MiniMax-Text-01 a7351bf2, :1024-1058; `BlockWiring.normed_residual`). 
 rotate the first `rotary_dim` of each head (:482-489, :430-437); transformers 5.16.1's MiniMax, which
 reads the `minimax` spelling of the same releases, turns every dimension of a head instead
 (`MiniMaxRotaryEmbedding`, modeling_minimax.py:266-310), and Dew reads the releases as their own code
-computes them. A lightning layer's rates follow its place in the stack (`lightning_rates`), so each
+computes them, and write a model back as the release's own config beside its own code
+(`DecoderFamily.release_code`), which reads it so: a `minimax` config would open in transformers as
+another model. A lightning layer's rates follow its place in the stack (`lightning_rates`), so each
 is a kind of its own, `linear_attention_{index}`.
 
 The `minimax` configs spell the layer pattern as `layer_types` and the factors as
@@ -22,12 +24,14 @@ from collections.abc import Mapping
 from functools import partial
 
 from dew import _records
+from dew.interop import release_pins
 from dew.interop.config_records import native_fields
 from dew.interop.decoder_parts import (
     MOE_NAMES,
     DecoderFamily,
     DecoderFields,
     RopeSpelling,
+    SourceCode,
     base_config,
     decoder_tensors,
     kind_mixers,
@@ -173,8 +177,8 @@ def _lightning(model: CausalTransformer) -> list[LightningAttentionMixer]:
 
 
 def _minimax_export(model: CausalTransformer) -> Mapping[str, object]:
-    """The `minimax` config of a model of this family: its layers' attention by kind, the factors, the
-    rotary's width and the lightning layers' chunk."""
+    """The release's own config of a model of this family (`MiniMaxText01Config`): its layers' attention
+    by kind, the factors, the rotary's width and the lightning layers' chunk."""
     mixers = _lightning(model)
     chunks = {mixer.block_size for mixer in mixers}
     if len(chunks) > 1:
@@ -182,11 +186,13 @@ def _minimax_export(model: CausalTransformer) -> Mapping[str, object]:
                          "states one")
     mixture = model.mixture
     return {
-        'layer_types': ['linear_attention' if isinstance(model.kind_of(kind).mixer, LightningAttentionMixer)
-                        else 'full_attention' for kind in model.per_layer_types],
+        # The release's spelling of the pattern, in place of the layer kinds' names.
+        'layer_types': None,
+        'attn_type_list': [0 if isinstance(model.kind_of(kind).mixer, LightningAttentionMixer) else 1
+                           for kind in model.per_layer_types],
         'postnorm': model.normed_residual,
-        **dict.fromkeys(_FACTORS['alpha'], model.stream_multiplier),
-        **dict.fromkeys(_FACTORS['beta'], model.residual_multiplier),
+        **{_OWN_FACTORS[name]: model.stream_multiplier for name in _FACTORS['alpha']},
+        **{_OWN_FACTORS[name]: model.residual_multiplier for name in _FACTORS['beta']},
         'rotary_dim': int(model.features_per_head * (model.partial_rotary_factor or 1.0)),
         'block_size': chunks.pop() if chunks else _BLOCK,
         'num_local_experts': None if mixture is None else mixture.experts,
@@ -199,8 +205,8 @@ MINIMAX = DecoderFamily(
     ('minimax', *_OWN),
     _minimax_config,
     lambda fields: bool(_lightning(fields) or fields.normed_residual or fields.stream_multiplier != 1.0),
-    'minimax',
-    'MiniMaxForCausalLM',
+    'minimax_text_01',
+    'MiniMaxText01ForCausalLM',
     _minimax_export,
     weight_path=partial(renamed_path, MOE_NAMES, layer_leaves=_LIGHTNING_LEAVES),
     export_path=partial(renamed_name, MOE_NAMES, layer_leaves=_LIGHTNING_LEAVES),
@@ -208,6 +214,7 @@ MINIMAX = DecoderFamily(
     export_weights=decoder_tensors,
     preserve_source_layout=False,
     padding_idx=True,
+    release_code=SourceCode(*release_pins.MINIMAX_TEXT_01),
     # MiniMaxConfig's defaults (configuration_minimax.py), the releases' own class's too.
     defaults={'num_experts_per_tok': 2, 'num_local_experts': 8, 'rms_norm_eps': 1e-5,
               'num_key_value_heads': 8, 'max_position_embeddings': 131072},
