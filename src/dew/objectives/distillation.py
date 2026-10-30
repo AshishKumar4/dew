@@ -44,6 +44,7 @@ from dew.batch import Batch, Variables, without
 from dew.nn import categorical
 from dew.nn.kernels.options import Held
 from dew.nn.precision import accumulated
+from dew.nn.protocols import Bounded
 from dew.objectives.base import (
     OMITTED,
     TEACHER,
@@ -155,11 +156,14 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
             raise ValueError("selected distillation scores the sampled tokens at temperature 1")
         if tokenizers is not None:
             _refuse_other_tokenizers(*tokenizers)
-        # The selected term holds no logits whose widths the step compares, so the models' own sizes are.
-        sizes = {getattr(objective.model, "vocab_size", None) for objective in (student, teacher)}
-        if divergence == "selected" and None not in sizes and len(sizes) > 1:
+        # The selected term holds no logits whose widths the step compares, so the models' declared
+        # vocabularies are (`Bounded`).
+        models = (student.model, teacher.model)
+        if divergence == "selected" and all(isinstance(model, Bounded) for model in models) and (
+                models[0].vocab_size != models[1].vocab_size):
             raise ValueError(f"the selected term reads one id's likelihood on both sides, so the teacher and "
-                             f"the student share a vocabulary; they score {sorted(sizes)} ids")
+                             f"the student share a vocabulary; the student scores {models[0].vocab_size} ids "
+                             f"and the teacher {models[1].vocab_size}")
         for name, value, ok in (("alpha", alpha, lambda v: 0 <= v <= 1),
                                 ("temperature", temperature, lambda v: v > 0),
                                 ("beta", beta, lambda v: v >= 0)):
