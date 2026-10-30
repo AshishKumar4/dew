@@ -316,9 +316,9 @@ def drawn_steps(case: Case, tmp_path, mesh: MeshSpec, devices, initial, steps: i
     """`steps` steps of a layout over the batch a draw gives, from `initial` in the residual order
     it gives (`reordered`), every step on the same rows, as `run_case`'s `fit` takes them, the step
     compiled once for every draw at the plan fit admits, without timing alternatives:
-    a function of the raw batch and the order returning
-    the stepped state's variables, optimizer state and EMA taken back to the identity order
-    (`in_identity_order`). `exact` runs one device in float64 from the state widened, the batch's
+    a function of the raw batch and the order returning, for each step, the state it leaves (its
+    variables, optimizer state and EMA) taken back to the identity order (`in_identity_order`), keyed
+    by the step's number. `exact` runs one device in float64 from the state widened, the batch's
     samples widened (`wide`), built at its first call, so under the caller's float64."""
     built = []
 
@@ -336,10 +336,12 @@ def drawn_steps(case: Case, tmp_path, mesh: MeshSpec, devices, initial, steps: i
             trainer.objective, wide(case, raw) if exact else raw, count_model=False))
         if len(built) == 1:
             built.append(trainer.compile(state, batch))
-        for _ in range(steps):
+        stepped = {}
+        for step in range(1, steps + 1):
             state, *_ = built[1](state, batch)
-        return in_identity_order(
-            jax.device_get({name: getattr(state, name) for name in ("variables", "opt_state", "ema")}), order)
+            stepped[str(step)] = in_identity_order(jax.device_get(
+                {name: getattr(state, name) for name in ("variables", "opt_state", "ema")}), order)
+        return stepped
 
     return stepped
 
@@ -376,39 +378,35 @@ def test_a_residual_order_is_the_same_decoder(case):
 LAYOUTS = {"8x1 data": MeshSpec(), "2x4 fsdp": MeshSpec(fsdp=4), "2x2x2 stage": MeshSpec(fsdp=2, stage=2)}
 """Each layout a cell trains on over every device, the rows over the axes it leaves to data."""
 
-LAYOUT_STEPS = (((1, "8x1 data"), (2, "2x4 fsdp")), ((1, "2x4 fsdp"), (2, "8x1 data")))
-"""The pairs of step count and layout a case trains, alternating by case: each case meets each step
-count and each layout, and each step count meets each layout over the cases, as testing.md's
-settings pairwise asks."""
+STEPS = 2
+"""The steps every layout trains, each judged: the first's state, which the second's run leaves on its
+way (`drawn_steps`), and the second's."""
 
-PIPELINED = {"simple_dit": 1, "jepa_encoder": 2}
-"""The cases whose stack of like blocks splits into two stages (`decoder_stack.pipelines`), each with
-the steps it trains over them: the DiT's two blocks, the JEPA encoder's two beside its predictor's one,
-which runs whole on every stage."""
-
-LAYOUT_CELLS = [*((case, steps, layout) for index, case in enumerate(CASES)
-                  for steps, layout in LAYOUT_STEPS[index % 2]),
-                *((case, PIPELINED[case.name], "2x2x2 stage") for case in CASES if case.name in PIPELINED)]
+PIPELINED = {"simple_dit", "jepa_encoder"}
+"""The cases whose stack of like blocks splits into two stages (`decoder_stack.pipelines`), which train
+on 2x2x2 stage too: the DiT's two blocks, the JEPA encoder's two beside its predictor's one, which runs
+whole on every stage."""
 
 
-@pytest.mark.parametrize(("case", "steps", "layout"), LAYOUT_CELLS,
-                         ids=[f"{case.name}-{steps}-step{'s' * (steps > 1)}-{layout.split()[1]}"
-                              for case, steps, layout in LAYOUT_CELLS])
-def test_architecture_trains_on_every_layout_as_on_one_device(case, steps, layout, tmp_path):
-    """One device and a layout, 8x1 data parallelism (every parameter
+def case_layouts(case: Case) -> tuple[str, ...]:
+    """The layouts a case trains on: 8x1 data and 2x4 fsdp, and 2x2x2 stage where it pipelines."""
+    return ("8x1 data", "2x4 fsdp", *(("2x2x2 stage",) if case.name in PIPELINED else ()))
+
+
+@pytest.mark.parametrize("case", CASES, ids=[case.name for case in CASES])
+def test_architecture_trains_on_every_layout_as_on_one_device(case, tmp_path):
+    """One device and each layout, 8x1 data parallelism (every parameter
     replicated, the batch split across every device), 2x4 fsdp (the
     parameter tree split four ways, the optimizer's state and the EMA with
-    it) or, for a model whose blocks pipeline, 2x2x2 stage (the blocks over
-    two stages beside two fsdp shards), train the same steps from the same state: after `steps` steps (one,
-    or two, each case training each layout once and each step count once,
-    `LAYOUT_STEPS`), the layout's variables, momentum and EMA are as near a
-    float64 run as one device's are, over the cell's declared batches (check
-    1, `assert_as_exact`), so
-    their summing a batch's rows and positions in other orders is the only
-    difference, where a layout that dropped or repeated a row would fail by
-    orders of magnitude. The steps check 1 draws are `fit`'s own on the
-    run's batch, bit for bit, each compiled once for every draw. Adam's two
-    moments and its count follow the parameters' placement too."""
+    it) and, for a model whose blocks pipeline, 2x2x2 stage (the blocks over
+    two stages beside two fsdp shards), train the same `STEPS` steps from the same state: after each
+    step, each layout's variables, momentum and EMA are as near a float64 run as one device's are,
+    over the case's declared batches (check 1, `assert_as_exact`, every layout and step judged in one
+    verdict against one reference and one truth a draw), so their summing a batch's rows and positions
+    in other orders is the only difference, where a layout that dropped or repeated a row would fail
+    by orders of magnitude. The steps check 1 draws are `fit`'s own on the run's batch, bit for bit,
+    each compiled once for every draw. Adam's two moments and its count follow the parameters'
+    placement too."""
     trainer, encoder = make_trainer(case, tmp_path / "initial", MeshSpec(), devices=1)
     initial = trainer.initial_state()
 
@@ -417,11 +415,11 @@ def test_architecture_trains_on_every_layout_as_on_one_device(case, steps, layou
         return jax.tree.map(jnp.copy, initial)
 
     width = residual_width(initial.variables) if case.is_lm else 0
-    one_step = drawn_steps(case, tmp_path, MeshSpec(), 1, initial, 1)
+    reference = drawn_steps(case, tmp_path, MeshSpec(), 1, initial, STEPS)
 
     def keyed(key):
         """A batch drawn from the key and, independently, an order of the residual stream's units
-        (`reordered`), the cell's own batch and the identity at key 0: the fresh batch varies the
+        (`reordered`), the case's own batch and the identity at key 0: the fresh batch varies the
         values, the order every contraction's summation, and the reference and each layout start
         from the same reordered state, so all are judged in its coordinates. A model with no
         token embedding has no residual stream to permute, and draws batches alone."""
@@ -432,35 +430,53 @@ def test_architecture_trains_on_every_layout_as_on_one_device(case, steps, layou
         # The selections of each step's forward clear the margin: the first step's from the initial
         # state, the second's from the state the first makes.
         return clears(case, inputs[0], initial.variables,
-                      lambda batch: one_step(batch, np.arange(width))["variables"])
+                      lambda batch: reference(batch, np.arange(width))["1"]["variables"])
 
     # A model that selects discontinuously takes the seed's first batch whose selections clear
     # `selection_margins.MARGIN` (`selection_margins.clearing`).
     draw = selection_margins.clearing(keyed, cleared) if selects(case) else keyed
 
     seeds = LAYOUT_SEEDS[case.name]
-    mesh = LAYOUTS[layout]
-    _, alone, _ = run_case(case, tmp_path, MeshSpec(), devices=1, state=copied(), steps=steps)
-    _, state, _ = run_case(case, tmp_path, mesh, state=copied(), steps=steps)
-    drawn = {"one device": drawn_steps(case, tmp_path, MeshSpec(), 1, initial, steps),
-             layout: drawn_steps(case, tmp_path, mesh, None, initial, steps)}
+    layouts = case_layouts(case)
+    _, alone, _ = run_case(case, tmp_path, MeshSpec(), devices=1, state=copied(), steps=STEPS)
+    fitted = {layout: run_case(case, tmp_path, LAYOUTS[layout], state=copied(), steps=STEPS)[1]
+              for layout in layouts}
+    drawn = {layout: drawn_steps(case, tmp_path, LAYOUTS[layout], None, initial, STEPS) for layout in layouts}
     # The drawn steps are fit's own on its batch, bit for bit, so what check 1 judges is the run's:
-    # the cell's own batch in its own order, whatever selection margin a draw then asks.
+    # the case's own batch in its own order, whatever selection margin a draw then asks.
     own = (next(batches(case, encoder)()), np.arange(width))
-    for fitted, stepped in zip((alone, state), drawn.values(), strict=True):
-        ours = stepped(*own)
+    for state, stepped in ((alone, reference), *((fitted[layout], drawn[layout]) for layout in layouts)):
+        ours = stepped(*own)[str(STEPS)]
         for name, tree in ours.items():
-            held = jax.device_get(getattr(fitted, name))
+            held = jax.device_get(getattr(state, name))
             assert jax.tree.structure(tree) == jax.tree.structure(held), name
             for mine, theirs in zip(jax.tree.leaves(tree), jax.tree.leaves(held), strict=True):
                 mine, theirs = np.asarray(mine), np.asarray(theirs)
                 assert mine.dtype == theirs.dtype and mine.shape == theirs.shape, name
                 assert np.array_equal(mine.view(np.uint8), theirs.view(np.uint8)), name
-    truth = drawn_steps(case, tmp_path, MeshSpec(), 1, initial, steps, exact=True)
+    truth = drawn_steps(case, tmp_path, MeshSpec(), 1, initial, STEPS, exact=True)
     # A mixture's rows are judged over each draw's orbit of residual orders (`ORBIT`).
     orders = orbit(width) if case.is_lm and selection_margins.routes(case.config) else None
-    assert_as_exact(drawn[layout], drawn["one device"], draw, f"{case.name} {layout}, {steps} step(s)",
-                    seeds=seeds, truth_fn=truth, orders=orders)
+
+    @as_given
+    def layouts_stepped(raw, order):
+        return {layout: drawn[layout](raw, order) for layout in layouts}
+
+    def every(arm):
+        # One device's run, or the truth's, once a draw, against every layout.
+        return as_given(lambda raw, order: dict.fromkeys(layouts, arm(raw, order)))
+
+    assert_as_exact(layouts_stepped, every(reference), draw, f"{case.name} on {', '.join(layouts)}",
+                    seeds=seeds, truth_fn=every(truth), orders=orders)
+    for layout in layouts:
+        placement(case, tmp_path, LAYOUTS[layout], fitted[layout])
+
+
+def placement(case: Case, tmp_path, mesh: MeshSpec, state) -> None:
+    """A layout's state placed as its mesh asks: nothing on a 1-wide fsdp axis; on a wider one each
+    sharded parameter its part of the global one, and the optimizer's state, Adam's moments and the
+    EMA following the parameters they track, without the optimizer or the model describing a
+    layout."""
     if mesh.fsdp == 1:
         assert not fsdp_leaves(state.variables), "nothing may shard on a 1-wide fsdp axis"
         return
@@ -474,7 +490,8 @@ def test_architecture_trains_on_every_layout_as_on_one_device(case, steps, layou
     param_specs = [leaf.sharding.spec for leaf in jax.tree.leaves(state.variables["params"])]
     assert param_specs == [leaf.sharding.spec for leaf in jax.tree.leaves(state.opt_state[0].trace)]
     assert {leaf.sharding.spec for leaf in jax.tree.leaves(state.ema)} <= set(param_specs)
-    adam = make_trainer(case, tmp_path / "adam", mesh, optimizer=optax.adam(1e-3))[0].place()[0].opt_state[0]
+    adam = make_trainer(case, tmp_path / f"adam-{mesh.fsdp}-{mesh.stage}", mesh,
+                        optimizer=optax.adam(1e-3))[0].place()[0].opt_state[0]
     for moment in (adam.mu, adam.nu):
         assert param_specs == [leaf.sharding.spec for leaf in jax.tree.leaves(moment)]
 
