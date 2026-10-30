@@ -25,9 +25,9 @@ from dew.nn.kernels.templates import attention_mosaic, attention_portable, atten
 from dew.nn.kernels.templates.attention import (
     ACCURATE,
     NATURAL,
-    OUTPUT,
     Gradients,
     Hooks,
+    Kept,
     KeySpans,
     Kind,
     Split,
@@ -192,8 +192,12 @@ def _forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     backward's D where the call takes that (`takes_output_residuals`), whichever mainloop runs the backward
     (the residuals are every mainloop's, `output_split`)."""
     form = {"scale": config.scale, "natural": config.natural}
-    kept = (OUTPUT if residuals and takes_output_residuals(hooks, query.dtype, accurate=config.accurate)
-            else residuals)
+    if not residuals:
+        kept = Kept.NONE
+    elif takes_output_residuals(hooks, query.dtype, accurate=config.accurate):
+        kept = Kept.OUTPUT
+    else:
+        kept = Kept.SPLIT
     declined = attention_mosaic.forward_declined(query, key, value, spans, hooks, residuals=kept,
                                                  **form) if _on_gpu() else None
     mainloop = _mainloop(declined, spans, hooks, functools.partial(

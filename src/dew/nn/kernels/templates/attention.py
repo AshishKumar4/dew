@@ -1142,9 +1142,14 @@ class Split(NamedTuple):
     shift: jax.Array
 
 
-OUTPUT = "output"
-"""The residuals a Mosaic training forward names where it keeps its output for the backward's D
-(`takes_output_residuals`, `output_split`), beside `True`, the anchor's split sums."""
+class Kept(enum.Enum):
+    """What a Mosaic forward keeps for a backward (`attention_mosaic.forward`'s `residuals`): nothing, the
+    inference forward's output alone; its anchor's split sums (`Split`, the training forward); or its output
+    for the backward's D, its rows beside it (`takes_output_residuals`, `output_split`)."""
+
+    NONE = enum.auto()
+    SPLIT = enum.auto()
+    OUTPUT = enum.auto()
 
 
 def output_split(out: jax.Array) -> Split:
