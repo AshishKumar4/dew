@@ -1705,12 +1705,13 @@ def test_a_run_plans_only_the_files_whose_inputs_changed_and_its_verdict_names_e
     assert [len((tmp_path / f"runs-{name}").read_text()) for name in ("a", "b", "c")] == [1, 1, 2]
 
 
-def test_a_plan_run_by_another_python_than_its_tasks_keeps_the_files_they_ran_green(ci, tmp_path, cache_worker):
+def test_a_plan_run_by_another_python_than_its_tasks_keeps_the_files_they_ran_green(
+        ci, tmp_path, cache_worker):
     """The plan and a task each run tools/armada/ci.py as a script under whatever Python runs it where it runs
     (a planner's machine, a GitHub runner, a task's image), and key a file's run alike: the files a task ran
-    green under one Python, a plan run by another keeps, in one task (2026-10-30: plans under 3.14 and 3.12 found
-    none of the 3.13 tasks' records fresh, as each Python compiles a module's units to its own digests, and
-    every file took a task of its own)."""
+    green under one Python, a plan run by another keeps, in one task (2026-10-30: plans under 3.14 and 3.12
+    found none of the 3.13 tasks' records fresh, as each Python compiles a module's units to its own digests,
+    and every file took a task of its own)."""
     interpreter(tmp_path, "3.12")
     held = ci.cpu_class().split("-")
     config = json.loads((ROOT / ".armada.json").read_text())
@@ -1718,15 +1719,17 @@ def test_a_plan_run_by_another_python_than_its_tasks_keeps_the_files_they_ran_gr
     (tmp_path / ".armada.json").write_text(json.dumps(config))
     # A module whose units each Python compiles to its own digests: a documented, annotated function.
     (tmp_path / "src").mkdir()
-    (tmp_path / "src/shapes.py").write_text('def area(width: int, height: int = 1) -> int:\n    """An area."""\n'
-                                            "    return width * height\n")
+    (tmp_path / "src/shapes.py").write_text(
+        'def area(width: int, height: int = 1) -> int:\n    """An area."""\n    return width * height\n')
     written(tmp_path, {f"test_{name}.py": "import sys\nsys.path.insert(0, 'src')\nfrom shapes import area\n"
-                                          f"def test_{name}():\n    assert area(2) == 2\n" for name in ("a", "b")})
+                                          f"def test_{name}():\n    assert area(2) == 2\n"
+                       for name in ("a", "b")})
     (tmp_path / "tests/test_durations.json").write_text(json.dumps(
         {f"tests/test_{name}.py::test_{name}": 250.0 for name in ("a", "b")}))
     (tmp_path / ".verdict").mkdir()
     url, _, _ = cache_worker
-    env = {**os.environ, "DEW_XLA_CACHE_URL": url, "DEW_XLA_CACHE_TOKEN": "token", "DEW_XLA_CACHE_READ_TOKEN": "token"}
+    env = {**os.environ, "DEW_XLA_CACHE_URL": url, "DEW_XLA_CACHE_TOKEN": "token",
+           "DEW_XLA_CACHE_READ_TOKEN": "token"}
     script = str(ROOT / "tools/armada/ci.py")
 
     def version(python: str) -> str:
@@ -1738,15 +1741,15 @@ def test_a_plan_run_by_another_python_than_its_tasks_keeps_the_files_they_ran_gr
     other = next(python for python in (*(str(ROOT / f".venv-{each}/bin/python") for each in ci.PYTHONS),
                                        shutil.which("python3") or "")
                  if Path(python).is_file() and version(python) != version(sys.executable))
+    verdict = tmp_path / ".verdict/verdict.json"
     subprocess.run([sys.executable, script, "task", "--python=3.12", "--tests=tests/test_a.py tests/test_b.py",
-                    f"--out={tmp_path / '.verdict/verdict.json'}", "--cache=on"], cwd=tmp_path, env=env, check=True)
-    rows = json.loads((tmp_path / ".verdict/verdict.json").read_text())["rows"]
-    assert [row["exitCode"] for row in rows] == [0, 0]
+                    f"--out={verdict}", "--cache=on"], cwd=tmp_path, env=env, check=True)
+    assert [row["exitCode"] for row in json.loads(verdict.read_text())["rows"]] == [0, 0]
     planned = subprocess.run([other, script, "plan", "--target=300", f"--timings={tmp_path / 'timings.json'}"],
                              cwd=tmp_path, env=env, capture_output=True, text=True, check=True).stdout
     entries = [entry for entry in json.loads(planned)["include"] if entry["python"] == "3.12"]
-    assert [sorted(ci.kept_of(entry["tests"].split())[1]) for entry in entries] == [["tests/test_a.py",
-                                                                                     "tests/test_b.py"]]
+    assert [sorted(ci.kept_of(entry["tests"].split())[1]) for entry in entries] == [
+        ["tests/test_a.py", "tests/test_b.py"]]
 
 
 def test_a_plan_without_build_output_or_fetched_payloads_finds_what_a_task_recorded_with_them(
