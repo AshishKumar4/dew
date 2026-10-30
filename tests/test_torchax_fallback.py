@@ -127,6 +127,27 @@ def loss_and_gradients(loaded, model, params):
 
     return dew_fn
 
+def test_a_load_reads_each_tensor_by_name_from_its_checkpoint(source, loaded, tmp_path):
+    """A tier-3 load reads its checkpoint's tensors by name, memory-mapped, into a model built on the
+    meta device (ledger 1493): every parameter is the source's own, bit for bit, and a parameter the
+    checkpoint lacks is refused, named, where a draw would stand in for the source's."""
+    from safetensors.numpy import load_file, save_file
+
+    directory, model = source
+    params = loaded.variables["params"]
+    held = {name: value for name, value in model.state_dict().items() if name in params}
+    assert set(held) == set(params)
+    for name, value in held.items():
+        np.testing.assert_array_equal(np.asarray(params[name]), value.numpy(), err_msg=name, strict=True)
+    lacking = tmp_path / "lacking"
+    shutil.copytree(directory, lacking)
+    tensors = load_file(lacking / "model.safetensors")
+    del tensors["gpt_neox.layers.0.mlp.dense_h_to_4h.weight"]
+    save_file(tensors, lacking / "model.safetensors", metadata={"format": "pt"})
+    with pytest.raises(ValueError, match="dense_h_to_4h"):
+        Pretrained.load(lacking, fallback="torchax", dtype="float32")
+
+
 def test_the_logits_and_the_objective_loss_are_transformers(source, loaded, tokens):
     """`apply` is the torch forward, and LMObjective's chunked loss over the
     captured head input and the head weight is transformers' own loss."""

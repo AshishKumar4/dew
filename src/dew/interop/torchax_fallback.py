@@ -1403,24 +1403,13 @@ def load(source: sources.SourceReference, root: Path, *, dtype: str,
     try:
         import torch
         from torchax.interop import JittableModule, extract_all_buffers
-        from transformers import AutoModelForCausalLM
     except ImportError as error:
         raise ImportError(f"fallback='torchax' needs torch, torchax and transformers: {INSTALL}") from error
     if weights:
         directory = source.directory(source.weights(root))
     # Before transformers, whose reader fails on a malformed file without naming it.
     generation_config = read_generation_config(directory)
-    storage = "auto" if param_dtype == AUTO else getattr(torch, param_dtype)
-    if weights:
-        model = AutoModelForCausalLM.from_pretrained(str(directory), dtype=storage, local_files_only=True,
-                                                     experts_implementation=EXPERTS)
-    else:
-        from transformers import AutoConfig
-
-        stated = AutoConfig.from_pretrained(str(directory), local_files_only=True)
-        with torch.device("meta"):
-            model = AutoModelForCausalLM.from_config(
-                stated, dtype=stated.dtype if storage == "auto" else storage, experts_implementation=EXPERTS)
+    model, stored = _built(directory, param_dtype, weights)
     model.eval()
     jittable = JittableModule(model)
     head = model.get_output_embeddings()
@@ -1433,7 +1422,8 @@ def load(source: sources.SourceReference, root: Path, *, dtype: str,
     # The head's structure, which a forward shows: the loaded model's, or without its weights the
     # same class at the probe's sizes (`verify.shrink`), since a forward on the meta device reads no
     # values, which some forwards do.
-    if head_name is not None and not (_plain_head(model, head) if weights else _shrunk_plain_head(config)):
+    if head_name is not None and not (_plain_head(model, head) if weights and stored is None
+                                      else _shrunk_plain_head(config)):
         head_name = None
     # After the head's eager check: the functional parts and Dew's attention run only inside the traced
     # forward. The parts keep their parameters, which the jittable module holds already.
@@ -1444,9 +1434,16 @@ def load(source: sources.SourceReference, root: Path, *, dtype: str,
     # Host views of torch's storage: nothing reaches a device before the
     # caller's placement. Without the weights, their shapes and dtypes.
     def held(leaf, name):
-        if weights:
-            return host_view(leaf, name)
-        return jax.ShapeDtypeStruct(tuple(leaf.shape), host_dtype(leaf, name))
+        if not weights:
+            return jax.ShapeDtypeStruct(tuple(leaf.shape), host_dtype(leaf, name))
+        if stored is not None and name in stored:
+            return stored[name]
+        return host_view(leaf, name)
+
+    if stored is not None and (unread := sorted(set(jittable.params) - set(stored))):
+        raise ValueError(f"{name_or_dir}'s checkpoint holds no {', '.join(unread[:4])}"
+                         f"{' and more' if len(unread) > 4 else ''}, which its model's class names: a load "
+                         "would draw them, and the source is its checkpoint")
 
     params = {name: held(leaf, name) for name, leaf in jittable.params.items()}
     buffers = {name: held(leaf, name) for name, leaf in extract_all_buffers(model)[1].items()}
@@ -1502,6 +1499,64 @@ def _shrunk_plain_head(config: Mapping[str, object]) -> bool:
     stated = AutoConfig.for_model(str(config["model_type"]), **fields)
     model = AutoModelForCausalLM.from_config(stated, dtype=torch.float32, experts_implementation=EXPERTS)
     return _plain_head(model.eval(), model.get_output_embeddings())
+
+
+def _built(directory: Path, param_dtype: str, weights: bool
+           ) -> tuple[PreTrainedModel, dict[str, np.ndarray] | None]:
+    """The causal LM `directory`'s config describes, and with `weights` its tensors by name
+    (`_stored_tensors`): its parameters on torch's meta device, its buffers computed as its modules
+    compute them, each tensor read from the checkpoint memory-mapped, which the load's placement streams
+    onto the mesh a leaf at a time, no copy of the model held on the host. A checkpoint a tensor
+    operation of transformers' converts (a fused expert's merge) loads through transformers' own load,
+    which alone applies them, and its tensors are the model's (None). Without `weights`, the model on
+    the meta device alone."""
+    import torch
+    from transformers import AutoConfig, AutoModelForCausalLM
+
+    try:
+        from accelerate import init_empty_weights
+    except ImportError as error:
+        raise ImportError(f"fallback='torchax' builds its model's parameters on the meta device with "
+                          f"accelerate: {INSTALL}") from error
+    storage = "auto" if param_dtype == AUTO else getattr(torch, param_dtype)
+    stated = AutoConfig.from_pretrained(str(directory), local_files_only=True)
+    built_as = stated.dtype if storage == "auto" else storage
+    if not weights:
+        with torch.device("meta"):
+            built = AutoModelForCausalLM.from_config(stated, dtype=built_as, experts_implementation=EXPERTS)
+        return built, None
+    with init_empty_weights(include_buffers=False):
+        model = AutoModelForCausalLM.from_config(stated, dtype=built_as, experts_implementation=EXPERTS)
+    stored = _stored_tensors(model, directory, None if param_dtype == AUTO else jnp.dtype(param_dtype))
+    if stored is None:
+        return AutoModelForCausalLM.from_pretrained(str(directory), dtype=storage, local_files_only=True,
+                                                    experts_implementation=EXPERTS), None
+    return model, stored
+
+
+def _stored_tensors(model: PreTrainedModel, directory: Path, storage: np.dtype | None
+                    ) -> dict[str, np.ndarray] | None:
+    """The checkpoint's tensors in `directory` by the names `model` holds them under, memory-mapped
+    (`sources.load_shards`): each key named as transformers' load names it, by the model's conversion
+    mapping's renamings (`rename_source_key`), a key the model holds nothing under left out, each
+    floating tensor in `storage` (its stored dtype where None). None where a key takes one of the
+    mapping's tensor conversions (a fused expert's merge), which transformers' own load applies."""
+    from transformers.conversion_mapping import get_model_conversion_mapping
+    from transformers.core_model_loading import WeightConverter, WeightRenaming, rename_source_key
+
+    transforms = get_model_conversion_mapping(model)
+    renamings = [transform for transform in transforms if isinstance(transform, WeightRenaming)]
+    converters = [transform for transform in transforms if isinstance(transform, WeightConverter)]
+    held = model.state_dict()
+    named: dict[str, np.ndarray] = {}
+    for key, tensor in sources.load_shards(directory).items():
+        name, converted = rename_source_key(key, renamings, converters, model.base_model_prefix, held)
+        if converted is not None:
+            return None
+        if name in held:
+            floating = np.issubdtype(tensor.dtype, np.floating) or tensor.dtype == jnp.bfloat16
+            named[name] = tensor.astype(storage) if storage is not None and floating else tensor
+    return named
 
 
 def _plain_head(model: PreTrainedModel, head: torch.nn.Module) -> bool:
