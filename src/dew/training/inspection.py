@@ -44,9 +44,9 @@ class Inspection:
     selects is summarized on its own, for each target: its mean, standard deviation, root mean square,
     largest magnitude, non-finite share and zero fraction. Every sampled step also reports each
     target's global L2 norm, over every parameter, and the update-to-weight ratio,
-    ||update|| / ||params||. `every` is the optimizer updates between samples, each the step that commits
-    its update, however many steps an update pools (`Trainer.accumulation`); the run's logs carry the
-    latest sample, so a cadence of the logs' or a multiple of it reports each sample once."""
+    ||update|| / ||params||. `every` is the optimizer updates between samples, however many steps an
+    update pools (`Trainer.accumulation`, `samples`); the run's logs carry the latest sample, so a cadence
+    of the logs' or a multiple of it reports each sample once."""
 
     paths: tuple[str, ...] = ()
     targets: tuple[Target, ...] = ("params", "grads", "updates", "deltas")
@@ -73,9 +73,11 @@ class Inspection:
                              f"{sorted(unknown)}")
 
     def samples(self, step: int, accumulation: int) -> bool:
-        """Whether the step that ends at `step` is sampled: the one that commits every `every`-th update,
-        `accumulation` steps an update, since a step that commits nothing reports nothing."""
-        return step % accumulation == 0 and (step // accumulation) % self.every == 0
+        """Whether the step that ends at `step` is sampled: each step of every `every`-th window of
+        `accumulation` steps, so the update that commits inside it is sampled wherever it commits, at
+        the window's end, early where a run on the examples clock closes its last window short, or a
+        rejected step's window later (a dynamic loss scale's), each window of steps holding one commit."""
+        return -(-step // accumulation) % self.every == 0
 
 
 def summaries(inspection: Inspection, params, grads, updates, stepped) -> dict[str, jax.Array]:

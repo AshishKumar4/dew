@@ -37,7 +37,7 @@ import typing
 from collections.abc import Callable, Mapping, Sequence
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Any, ClassVar, Literal, Required, Self, TypedDict, Union
+from typing import TYPE_CHECKING, Annotated, ClassVar, Literal, Required, Self, TypedDict, Union
 
 import jax
 import tyro
@@ -861,7 +861,7 @@ def _artifact_name(name: str) -> str:
 
 
 @dataclasses.dataclass(frozen=True)
-class Prepared:
+class Prepared[LossT, EffectsT]:
     """What a run trains, as its class builds it (`RunConfig.prepare`).
 
     `run` is the run as it records itself, with what building resolved (a
@@ -872,7 +872,7 @@ class Prepared:
     """
 
     run: "RunConfig"
-    objective: Objective[Any, Any]
+    objective: Objective[LossT, EffectsT]
     dataset: Dataset | Loader
     metrics: Sequence[Metric] = ()
     rollout: Rollout | None = None
