@@ -626,9 +626,9 @@ def test_every_kind_of_run_scores_its_own_metrics_unless_it_names_each_splits():
 
 @pytest.mark.parametrize("kind", ["lm", "decision", "diffusion"])
 def test_every_run_kind_reads_its_source_options_from_the_command_line(kind):
-    """`--source.text-only`, `--source.prediction-depths` and `--source.attention` are every run kind's,
-    and its source's load reads them beside where it reads the source (`RunConfig.source_keywords`):
-    the attention as the load's `modeling_overrides`."""
+    """`--source.text-only`, `--source.prediction-depths`, `--source.attention` and
+    `--source.scan-layers` are every run kind's, and its source's load reads them beside where it reads
+    the source (`RunConfig.source_keywords`): the attention as the load's `modeling_overrides`."""
     from dew.config import SourceOptions
     from dew.config.diffusion import DiffusionRunConfig
     from dew.config.lm import LMRunConfig
@@ -637,11 +637,12 @@ def test_every_run_kind_reads_its_source_options_from_the_command_line(kind):
     kinds = {"lm": LMRunConfig, "decision": DecisionRunConfig, "diffusion": DiffusionRunConfig}
     run = kinds[kind].cli(["--source.text-only", "--source.prediction-depths", "0",
                            "--source.attention", "full_attention", "block_bidirectional",
-                           "--trainer.multi-host", "False"])
+                           "--source.scan-layers", "--trainer.multi-host", "False"])
     assert run.source == SourceOptions(text_only=True, prediction_depths=0,
-                                       attention={"full_attention": "block_bidirectional"})
+                                       attention={"full_attention": "block_bidirectional"}, scan_layers=True)
     keywords = run.source_keywords(frozen=False)
     assert keywords["text_only"] is True and keywords["prediction_depths"] == 0 and keywords["on_host"]
+    assert keywords["scan_layers"] is True
     # A source the run trains is stored in its master weights' dtype, one it keeps frozen as stored.
     assert keywords["param_dtype"] == "float32" and run.source_keywords(frozen=True)["param_dtype"] == "auto"
     assert keywords["modeling_overrides"] == {"attention": {"full_attention": "block_bidirectional"}}

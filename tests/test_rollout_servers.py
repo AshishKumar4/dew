@@ -726,12 +726,9 @@ class EmulatedWorker:
             self.fabric.abort(self.group)
 
 
-def transport(kind, tmp_path, monkeypatch):
-    """The library path a push loads and the maker of a replica's worker on device `ordinal`: NCCL's
-    own on a GPU, else the `Fabric` emulating it on the host's devices, which the push's library
-    then is."""
-    if kind == "nccl":
-        return str(nccl_library()), lambda ordinal: Worker(nccl_library(), ordinal)
+def emulated(tmp_path, monkeypatch):
+    """The library path a push loads and the maker of a replica's worker, over a `Fabric` emulating
+    NCCL on the host's devices, which the push's library then is."""
     from dew.inference import nccl
 
     fabric = Fabric()
@@ -739,12 +736,6 @@ def transport(kind, tmp_path, monkeypatch):
     library = tmp_path / "libnccl.so.2"
     library.write_bytes(b"")
     return str(library), lambda ordinal: EmulatedWorker(fabric)
-
-
-TRANSPORTS = [pytest.param("nccl", marks=pytest.mark.gpu(reason="an NCCL group joins cuda devices")),
-              "emulated"]
-"""A push's transports: NCCL itself on GPUs, and its rendezvous and collectives emulated over host
-memory (`Fabric`), which every CPU run holds the push's protocol, ordering and delivery to."""
 
 
 def nccl_library():
@@ -822,21 +813,33 @@ def test_an_fp8_sources_push_has_a_collective_for_every_tensor_it_publishes():
     assert "float8_e4m3fn" in dtypes and dtypes <= _DTYPES.keys(), dtypes
 
 
+def an_nccl_push_delivers_every_tensor_to_each_replica_on_another_gpu(fixture):
+    """`a_push_delivers_every_tensor_to_each_replica_on_another_device` over real NCCL groups from the
+    trainer's GPU to replicas on a second GPU."""
+    a_push_delivers_every_tensor_to_each_replica_on_another_device(
+        fixture, str(nccl_library()), lambda ordinal: Worker(nccl_library(), ordinal))
+
+
 @pytest.mark.mesh(devices=2)
-@pytest.mark.parametrize("kind", TRANSPORTS)
 @pytest.mark.parametrize("fixture", [FIXTURE, FP8], ids=["bfloat16", "fp8"])
-def test_an_nccl_push_delivers_every_tensor_to_each_replica_on_another_device(fixture, kind, tmp_path,
-                                                                                 monkeypatch):
-    """A push over NCCL groups (`TRANSPORTS`) from the trainer's device to two one-worker replicas on
-    a second, each standing in for vLLM's weight-transfer endpoints with a worker that receives as
-    vLLM's does, in a group of its own. Each replica is asked its world size and joins its group
-    once, then pauses, starts the update, takes the listing of every tensor, finishes the update
-    under the version, resets its prefix cache and resumes. Each group opens with the sender at
-    rank 0 of two. The tensors go one after another to both groups, in chunks smaller than the
-    policy and than its largest tensor: every replica receives the whole listing after every replica
-    started the update and before any finished it, and each worker holds every listed tensor, the
-    trainer's export of the pushed policy, an FP8 source's E4M3 weights among them."""
-    library, worker = transport(kind, tmp_path, monkeypatch)
+def test_an_emulated_push_delivers_every_tensor_to_each_replica_on_another_device(fixture, tmp_path,
+                                                                                  monkeypatch):
+    """`a_push_delivers_every_tensor_to_each_replica_on_another_device` on the host's devices over NCCL's
+    rendezvous and collectives emulated in host memory (`Fabric`), the protocol, ordering and delivery
+    every CPU run holds, beside the GPU flow's NCCL."""
+    a_push_delivers_every_tensor_to_each_replica_on_another_device(fixture, *emulated(tmp_path, monkeypatch))
+
+
+def a_push_delivers_every_tensor_to_each_replica_on_another_device(fixture, library, worker):
+    """A push from the trainer's device to two one-worker replicas on a second, each standing in for
+    vLLM's weight-transfer endpoints with a worker (`worker(ordinal)`) that receives as vLLM's does,
+    in a group of its own. Each replica is asked its world size and joins its group once, then
+    pauses, starts the update, takes the listing of every tensor, finishes the update under the
+    version, resets its prefix cache and resumes. Each group opens with the sender at rank 0 of two.
+    The tensors go one after another to both groups, in chunks smaller than the policy and than its
+    largest tensor: every replica receives the whole listing after every replica started the update
+    and before any finished it, and each worker holds every listed tensor, the trainer's export of
+    the pushed policy, an FP8 source's E4M3 weights among them."""
     engines = nccl_replicas(worker, jax.devices()[1].local_hardware_id, 2)
     source = Pretrained.load(fixture, dtype="float32")
     changed = doubled(source)
@@ -879,21 +882,29 @@ def test_a_push_naming_a_replica_twice_or_no_library_is_refused_as_it_is_made(tm
     any group opens or any replica is asked."""
     library = tmp_path / "libnccl.so.2"
     library.write_bytes(b"")
-    engines = ("http://127.0.0.1:9", "http://127.0.0.1:9") if asked == "a replica twice" else ("http://127.0.0.1:9",)
+    engines = ("http://127.0.0.1:9",) * (2 if asked == "a replica twice" else 1)
     with pytest.raises(ValueError):
         NCCLPush(None, engines, str(library if asked == "a replica twice" else tmp_path / "absent.so.2"))
 
 
-@pytest.mark.parametrize("kind", TRANSPORTS)
-def test_a_push_whose_replica_refuses_its_join_aborts_its_group_rather_than_waiting(kind, tmp_path,
-                                                                                    monkeypatch):
+def a_push_whose_replica_refuses_its_join_aborts_its_group_rather_than_waiting():
+    """`a_push_whose_replica_refusal_aborts_its_group` over a real NCCL group on the trainer's GPU."""
+    a_push_whose_replica_refusal_aborts_its_group(str(nccl_library()),
+                                                   lambda ordinal: Worker(nccl_library(), ordinal))
+
+
+def test_an_emulated_push_whose_replica_refuses_its_join_aborts_its_group(tmp_path, monkeypatch):
+    """`a_push_whose_replica_refusal_aborts_its_group` over NCCL emulated in host memory (`Fabric`)."""
+    a_push_whose_replica_refusal_aborts_its_group(*emulated(tmp_path, monkeypatch))
+
+
+def a_push_whose_replica_refusal_aborts_its_group(library, worker):
     """The sender opens its NCCL group while the replica's HTTP join runs. A replica that refuses
     the join never enters the rendezvous, so the push aborts the group and raises the refusal
     within seconds, where a blocking open waited on that peer for ever. The aborted group is not
     kept: a second push asks the replica to join a new one."""
     from dew.inference.rollouts import InfrastructureError
 
-    library, worker = transport(kind, tmp_path, monkeypatch)
     [server] = nccl_replicas(worker, jax.devices()[0].local_hardware_id, 1,
                              refuses=("/init_weight_transfer_engine",))
     source = Pretrained.load(FIXTURE, dtype="float32")

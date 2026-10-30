@@ -219,7 +219,7 @@ def opening(recorded: Callable[[str], None], root: str) -> None:
     such an open, once it has opened to read, is passed to `recorded` as what the descriptor it
     opened names (`placed`). Each existence or size probe (`PROBES`) is passed to `recorded` as the path it
     asks after (`probed`), there or not, which the record then keys (ci.py's `contents`): a fixture's
-    arrival reruns its probers, and no other file (Main, 2026-10-29)."""
+    arrival reruns its probers, and no other file (the maintainer, 2026-10-29)."""
     for owner, names in PROBES:
         for name in names:
             setattr(owner, name, probed(getattr(owner, name), recorded, root))
@@ -349,9 +349,9 @@ def installed() -> None:
 
 def closed_imports(seen: set[str], root: str):
     """The import system's first finder once a process's log closed: a module of the checkout at `root` that
-    `seen` does not name is not imported, so no code the record misses changes what the process did (Main,
-    2026-10-30: a finalizer that execs a checkout file by hand past the audit hooks' clearing is out of
-    contract)."""
+    `seen` does not name is not imported, so no code the record misses changes what the process did (the
+    maintainer, 2026-10-30: a finalizer that execs a checkout file by hand past the audit hooks' clearing is
+    out of contract)."""
 
     class Closed:
         @staticmethod

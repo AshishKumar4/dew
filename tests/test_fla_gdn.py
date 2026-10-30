@@ -13,20 +13,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from delta_rule_support import (
-    NAMES,
-    checkpointed,
-    fla_decay_terms,
-    fla_side,
-    float64_truth,
-    math as portable,
-    recurrence,
-    rule_math,
-    through,
-)
-from float64_terms import float64_terms
+from delta_rule_support import NAMES, checkpointed, math as portable, recurrence, rule_math, through
 from gdn_cases import CASES
-from one_draw import assert_as_exact_as_the_reference
 from reference_error import (
     assert_as_exact,
     assert_computes_the_oracle,
@@ -34,7 +22,7 @@ from reference_error import (
     widened,
     with_gradients,
 )
-from sharded import assert_runs_per_shard, boundary_copies
+from sharded import assert_runs_per_shard
 
 from dew.nn.kda import KimiDeltaAttention
 from dew.nn.kernels import chunked_launch, fla_gdn, fla_kda, generation, recurrence_algebra, recurrence_chunk
@@ -340,30 +328,6 @@ def test_the_wy_backward_kernel_is_the_gradient_of_flas_wy_representation(dtype,
         assert relative(mine, theirs) < bound, name
 
 
-@pytest.mark.gpu(reason="the compiled kernel's own repeatability on this GPU")
-def test_the_wy_backward_gives_the_same_gradients_on_every_call_at_qwen35_08b_shape():
-    """One compiled WY backward, called again on the same operands at Qwen3.5-0.8B's shape (8 x
-    3072, 16 heads of 128, bf16), gives bitwise the same gradients: with its key loop's k k^T taken
-    after the dk store, sm90's pipelined loop gave a different dg on each call (20,000 elements, up
-    to 0.069)."""
-    batch, length, heads, width = 8, 3072, 16, 128
-    keys = jax.random.split(jax.random.key(83), 7)
-    k = l2norm(jax.random.normal(keys[0], (batch, length, heads, width))).astype(jnp.bfloat16)
-    v = jax.random.normal(keys[1], (batch, length, heads, width)).astype(jnp.bfloat16)
-    beta = jax.nn.sigmoid(jax.random.normal(keys[2], (batch, length, heads))).astype(jnp.bfloat16)
-    g = cumulated(-jnp.exp(jax.random.normal(keys[3], (batch, length, heads)) - 3.0),
-                                   scale=fla_gdn.RCP_LN2)
-    whole, fraction = separated_prefix(g)
-    a = fla_gdn.kkt_solve(k, whole, beta, g_lo=fraction)
-    dw, du, dk = (jax.random.normal(key, k.shape).astype(jnp.bfloat16) for key in keys[4:])
-    backward = jax.jit(functools.partial(fla_gdn.prepare_wy_repr_bwd, terms=no_terms(g), g_lo=fraction))
-    first = [np.asarray(x) for x in backward(k, v, beta, whole, a, dw, du, dk)]
-    for _ in range(4):
-        found = backward(k, v, beta, whole, a, dw, du, dk)
-        for name, again, was in zip(("dk", "dv", "db", "dg"), found, first, strict=True):
-            np.testing.assert_array_equal(np.asarray(again), was, err_msg=name)
-
-
 @pytest.mark.parametrize("value_heads", [2, 4])
 def test_the_wy_backward_adds_the_keys_gradient_so_far_once_per_key_head(value_heads):
     """Given the query-side kernel's key gradient, the WY backward returns its own plus that one,
@@ -460,46 +424,6 @@ def test_a_sequences_first_decay_gradient_is_exactly_zero_from_no_memory(per_key
     assert np.all(dg[80] != 0)
 
 
-@pytest.mark.gpu(reason="float64 distances against fla's own on this GPU")
-@pytest.mark.parametrize("per_key", [False, True])
-def test_a_range_late_in_a_long_decayed_chunk_is_as_exact_as_fla(per_key):
-    """A key at token 48 and a query at 63, after a first token that decays by e^-200: `fla_rule`'s output,
-    final memory and gradients, through every kernel and the custom VJP, as near the float64
-    recurrence as fla 0.5.2's own on the same operands, each sized by the portable math's float64
-    terms and Kimi's decay gradient by those of the parts its port sums too. Both take each range as the
-    difference of two fp32 prefixes near -289 in base 2, which round each running sum by up to 1.5e-5.
-    A decay per key dimension (Kimi's delta attention) is the same in each, the pair in one 16-token
-    sub-chunk, its diagonal block."""
-    length, width, key_at, query_at = 64, 64, 48, 63
-    keys = jax.random.split(jax.random.key(29), 6)
-    decay = (-jnp.exp(jax.random.normal(keys[0], (1, length, 1)) - 3.0)).at[:, 0].set(-200.0)
-    g = jnp.repeat(decay[..., None], width, axis=-1) if per_key else decay
-
-    def alone(key, at):
-        row = l2norm(jax.random.normal(key, (width,)))
-        return jnp.zeros((1, length, 1, width)).at[0, at, 0].set(row)
-
-    v = jax.random.normal(keys[3], (1, length, 1, width))
-    beta = jax.nn.sigmoid(jax.random.normal(keys[4], (1, length, 1)))
-    inputs = (alone(keys[1], query_at), alone(keys[2], key_at), v, g, beta, jnp.zeros((1, 1, width, width)))
-    do, dht = jax.random.normal(keys[5], (1, length, 1, width)), jnp.zeros((1, 1, width, width))
-    got = [np.asarray(x, np.float64) for x in through(fla_rule, do, dht)(*inputs)]
-    theirs = fla_side((*inputs, do, dht), None, jnp.float32)
-
-    def math(q, k, v, g, beta, h0):
-        return recurrence_chunk.chunk_delta_rule(q, k, v, g if per_key else g[..., None], beta, h0)
-
-    with jax.enable_x64(new_val=True):
-        operands = widened((*inputs, do, dht))
-        truth = widened(through(recurrence, *operands[6:])(*operands[:6]))
-        _, terms = float64_terms(through(math, *operands[6:]), *operands[:6])
-        if per_key:
-            # Kimi's port sums its decay's gradient from parts the math's pairs never add.
-            terms = (*terms[:5], np.maximum(terms[5], fla_decay_terms(*operands)), *terms[6:])
-    for name, dew, fla, value, summed in zip(NAMES, got, theirs, truth, terms, strict=True):
-        assert_as_exact_as_the_reference(dew, fla, np.asarray(value), name, terms=np.asarray(summed))
-
-
 @pytest.mark.parametrize("key_heads, value_heads, width, columns, length", [
     (1, 2, 64, 64, 100),    # grouped heads and a length off the chunk grid
     (1, 3, 64, 64, 64),     # three value heads a key head, no power of two
@@ -526,29 +450,6 @@ def test_dews_fla_rule_follows_the_recurrence_for_any_heads_widths_and_length(
     for name, mine, theirs in zip(names, port, truth, strict=True):
         assert mine.shape == theirs.shape, name
         assert relative(mine, theirs) < 1e-4, name
-
-
-@pytest.mark.gpu(reason="float64 distances against fla's own on this GPU")
-@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
-def test_packed_documents_on_the_port_are_as_exact_as_flas_own_sequences(dtype):
-    """Packed documents through `fla_rule`, a decay per head, each document a sequence of its own:
-    each output and gradient as near the float64 recurrence run document by document as fla 0.5.2's
-    own varlen sequences on the same operands (`fla_side`), each sized by its float64 terms
-    (`float64_truth`). Documents start on and off the chunk grid, one shorter than a
-    chunk, in fp32 too, whose products the port takes in TF32x3 and fla in one TF32. test_fla_kda's
-    packed case holds Kimi's decay per key dimension alike."""
-    length, key_heads, value_heads, width, cuts = 4096, 8, 8, 128, (0, 1000, 1037, 2500)
-    q, k, v, g, beta, h0, do, dht = support.delta_operands(61, 1, length, key_heads, value_heads, width,
-                                                           width, dtype, decay_shift=2.0)
-    starts = np.zeros((1, length), bool)
-    starts[0, list(cuts[1:])] = True
-    packed = functools.partial(fla_rule, starts=jnp.asarray(starts), max_segments=len(cuts))
-    mine = [np.asarray(x, np.float64)
-            for x in jax.jit(through(packed, do.astype(jnp.float32), dht))(q, k, v, g, beta, h0)]
-    inputs = (q, k, v, g, beta, h0, do, dht)
-    theirs = fla_side(inputs, cuts, dtype)
-    for name, dew, fla, value, summed in zip(NAMES, mine, theirs, *float64_truth(inputs, cuts), strict=True):
-        assert_as_exact_as_the_reference(dew, fla, value, name, terms=summed)
 
 
 @pytest.mark.parametrize("per_key", [False, pytest.param(True, marks=pytest.mark.skipif(
@@ -751,8 +652,8 @@ def test_the_rule_runs_at_every_geometry(label):
     """The rule a layer calls (`recurrence_chunk.chunk_gated_delta_rule`), its output, final memory and every
     operand's gradient (its tangents under `jax.jvp`), at each geometry the port takes and each it
     refuses (`recurrence_chunk.PORT_SUPPORTS`), under an A100's row naming the port or not: finite. What
-    runs is held to its reference elsewhere, the port to fla's own runs
-    (`test_where_the_rule_takes_the_port_it_is_as_exact_as_fla` here), the recurrence template by
+    runs is held to its reference elsewhere, the port trained natively to float64
+    (tests/test_gpu_recurrence.py's "a gated delta net trains on its port"), the recurrence template by
     tests/test_recurrence_mosaic.py and the portable math to `torch_chunk_gated_delta_rule`'s
     (tests/test_linear_attention.py)."""
     dtypes, width, heads, mode, names_port, ported = ROUTES[label]
@@ -789,26 +690,6 @@ def test_both_routes_return_the_operands_common_dtype(label):
     for rule in (fla_rule, portable) if width <= widest else (portable,):
         found = [jnp.dtype(x.dtype) for x in through(rule, *cotangents)(*operands)]
         assert found == want, (rule.__name__, found, want)
-
-
-@pytest.mark.gpu(reason="float64 distances against fla's own on this GPU")
-@pytest.mark.parametrize("label", sorted(label for label, route in ROUTES.items()
-                                         if route[5] and route[3] == "reverse"))
-def test_where_the_rule_takes_the_port_it_is_as_exact_as_fla(label):
-    """The rule a layer calls (`chunk_gated_delta_rule`) at each geometry the port takes, mixed
-    dtypes and the widest bf16 keys: its output, final memory and every operand's gradient as near the
-    float64 recurrence as fla 0.5.2's own run on the same operands in their common dtype (`fla_side`),
-    each sized by its float64 terms (`float64_truth`)."""
-    dtypes, width, heads, _, _, _ = ROUTES[label]
-    operands = routed_operands(dtypes, width, heads)
-    do, dht = route_cotangents("reverse", operands)
-    with row_names_port():
-        rule = recurrence_chunk.chunk_gated_delta_rule
-        mine = [np.asarray(x, np.float64) for x in through(rule, do, dht)(*operands)]
-    inputs = (*operands, do, dht)
-    theirs = fla_side(inputs, None, jnp.result_type(*dtypes))
-    for name, dew, fla, value, summed in zip(NAMES, mine, theirs, *float64_truth(inputs, None), strict=True):
-        assert_as_exact_as_the_reference(dew, fla, value, f"{label} {name}", terms=summed)
 
 
 @generation.assumed("sm80")
@@ -957,27 +838,6 @@ def test_the_port_keeps_the_kernel_contract_on_a_mesh(axis, split, per_key):
     assert_runs_per_shard(through(fla_rule, do, every), draw, [spec] * 5, mesh,
                           f"fla rule split over {axis}, {'per key' if per_key else 'per head'}",
                           seeds=SHARDED_SEEDS[per_key], truth_fn=exact)
-
-
-@pytest.mark.gpu(reason="the port's kernels lower to Triton calls only on a GPU")
-@pytest.mark.parametrize("build", [
-    lambda: GatedDeltaNet(emb_features=1024, num_k_heads=16, num_v_heads=16, head_k_dim=128, head_v_dim=128,
-                          dtype=jnp.bfloat16),
-    lambda: KimiDeltaAttention(emb_features=1024, num_heads=8, head_dim=128, dtype=jnp.bfloat16),
-], ids=["gated delta net at the 0.8B's heads", "kimi delta attention at Kimi Linear's heads"])
-def test_a_bf16_delta_rule_layer_trains_with_no_copy_at_the_ports_edges(build):
-    """A bf16 layer on either port, forward and backward, compiled for this GPU: no copy or transpose
-    feeds one of the port's Triton calls or reads one of its results (`sharded.boundary_copies`), so
-    every operand reaches the kernels in the layout they read."""
-    layer = build()
-    x = jax.random.normal(jax.random.key(47), (2, 512, 1024), jnp.bfloat16)
-    params = layer.init(jax.random.key(53), x)
-
-    def loss(params, x):
-        return jnp.sum(layer.apply(params, x).astype(jnp.float32) ** 2)
-
-    lowered = jax.jit(jax.grad(loss, argnums=(0, 1))).lower(params, x)
-    assert boundary_copies(lowered.compile().as_text()) == []
 
 
 def _lowered_dot(product, default: str) -> list:

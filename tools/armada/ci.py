@@ -61,8 +61,9 @@ entries carry to their tasks (`--cache`), or without the Worker's URL and
 token, a task runs every file.
 
 A row's record also says where its tests read the backend and which are
-marked to run on a GPU, from which `gpu-tier` names the files that take
-another path on a GPU (all of them daily, the marked ones per batch). A GPU
+marked to run on a GPU (`gpu-tier --evidence` reports it); `gpu-tier` names the
+files marked to run on a GPU, a day's and a batch's alike: the behavioural flows
+(tests/test_gpu_*.py; no unit test runs on a GPU, ledger 2452). A GPU
 node runs them with `gpu-lane`, each as a task of a CUDA lane, whose rows are
 recorded and reused on the GPU's class as a CPU task's are on the CPU's. With `--network`, a GPU node that
 reaches the Hub runs every file's network-marked tests, which every other task sets aside, as one lane of
@@ -413,7 +414,7 @@ def cache_key(common: str, name: str, split: str, depends: list[str]) -> str:
     (executed.py): its `inputs`' contents, its directories' entries, `common`, and for a group of a split
     file, the group and the tests split.py cuts into it from the durations record (`members`), the record's
     only part a run's outcome depends on: not their seconds, which each train's fold of main's durations
-    moves (Main, 2026-10-28: every train re-keyed its split files and reran them cold, row 2000)."""
+    moves (the maintainer, 2026-10-28: every train re-keyed its split files and reran them cold, row 2000)."""
     digest = hashlib.sha256(common.encode())
     # A module's units read from one reading of its text.
     read: dict[str, dict[str, bytes] | bytes] = {}
@@ -441,8 +442,8 @@ def inputs(name: str, depends: list[str]) -> list[str]:
     tools/ itself is among them, as a test puts it, or a directory under it, on sys.path and imports a tool
     by its name, which a package added there shadows; src/'s own entries every key covers (`shared`). The
     harness's own modules (tools/armada/, which runs every test process and records it, `SHARED`) are no
-    import of a test's, so their directories are none of its inputs (Main, 2026-10-29: tools/'s entries
-    keyed every row, and train 296's one added tool reran 1,794 of 1,795)."""
+    import of a test's, so their directories are none of its inputs (the maintainer, 2026-10-29: tools/'s
+    entries keyed every row, and train 296's one added tool reran 1,794 of 1,795)."""
     files = (each.partition(followed.CODE)[0] for each in depends)
     packages = {str(parent) for path in files
                 if path.startswith(("src/", "tools/")) and path.endswith(".py") and not path.startswith(HARNESS)
@@ -573,8 +574,8 @@ def reusable(python: str, names: list[str], common: str) -> dict[str, str]:
     up and exit. Each with where its green run is kept (`green_key`'s class and key, `KEPT_AT`'s token), which
     the plan hands the task that holds it, so no run of another commit replacing a file's last record
     between plan and task can hide it (2026-10-30: a kept task found 23 of its 259 files and ran the rest).
-    None where the plan has no token or no class (Main, 2026-10-28: a lane run with most files unchanged
-    booted a container a task; 2026-10-29: the suite pinned to 25/17 and 26/17)."""
+    None where the plan has no token or no class (the maintainer, 2026-10-28: a lane run with most files
+    unchanged booted a container a task; 2026-10-29: the suite pinned to 25/17 and 26/17)."""
     token, held = os.environ.get(READ_TOKEN), pinned_classes()
     if not token or not held or "DEW_XLA_CACHE_URL" not in os.environ:
         return {}
@@ -793,7 +794,8 @@ PLACED = ("src/", "tests/", "tools/", "examples/", "recipes/", "docs/", "tutoria
 """Where a changed file is placed by the records (executed.py): a Python file a test ran, a page, a
 notebook or a workflow it read (followed.py's `HIDDEN_INPUTS`), a fixture its openers read. A change
 elsewhere is placed by none, and runs the whole suite (`policy`): a workflow change reran every file while
-no record placed it (Main, 2026-10-28: 5 of 10 trains ran with the cache off, 0.75% of rows reused)."""
+no record placed it (the maintainer, 2026-10-28: 5 of 10 trains ran with the cache off, 0.75% of rows
+reused)."""
 PLACED_FILES = ("README.md", "CONTRIBUTING.md", "AGENTS.md", "LICENSE", "CHANGELOG.md")
 """The checkout's own files at its root that tests read as a page is read, and the changelog, which
 no test reads (test_changelog_merge writes its own) and most heads add an entry to: placed by none,
@@ -975,7 +977,7 @@ def collect(python: str, tests: list[str], out: Path, deadline: float) -> int:
     seconds = (time.monotonic() - began) / len(tests)
     # A collection runs no test, so it moved no site onto YNNPACK's fusions: counted, not unknown.
     rows = [{"name": row(python, name, COLLECT), "exitCode": 1 if name in errors else 0, "seconds": seconds,
-             "output": errors.get(name, ""), "ynn_switched": [],
+             "output": errors.get(name, ""), "ynn_switched": [], "cells": {},
              **(red_as(COLLECT, []) if name in errors else {})}
             for name in tests]
     out.write_text(json.dumps({"rows": rows}))
@@ -989,6 +991,15 @@ def targeted(python: str, arguments: list[str], report: Path) -> int:
     return subprocess.run([*session.pytest_run(python, report), *arguments],
                           env=session.pytest_environment({}),
                           check=False).returncode
+
+
+def flow_cells(cases) -> dict[str, dict]:
+    """A GPU flow's counts by its cases (each case's JUnit property `cells`, tests/conftest.py from
+    tests/gpu_flow.py: passed, failed, skipped and the device), as every row a task runs carries them, an empty
+    object where its file runs no flow: the train's native gate reads a flow none of whose cells ran as
+    unqualified, and a reused row keeps its counts (ledger 2643)."""
+    return {node_of(case): json.loads(item.get("value") or "null") for case in cases
+            for item in case.iter("property") if item.get("name") == "cells"}
 
 
 def ynn_switched(cases) -> list[dict]:
@@ -1176,7 +1187,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
                      "tests": {node_of(case): float(case.get("time") or 0) for case in own},
                      # Its whole_suite cells, every one collected, run or set aside (executed.py).
                      **{key: cells for key, cells in counts.get(name, {}).items() if key in MARKED},
-                     "ynn_switched": ynn_switched(own),
+                     "ynn_switched": ynn_switched(own), "cells": flow_cells(own),
                      "timings": {row(python, name, ""): seconds}, **cause})
     out.write_text(json.dumps({"rows": rows + ran}))
     if coverage is None and not release:
@@ -1331,10 +1342,11 @@ def selected(command: list[str], network: bool, whole: bool = False, release: bo
     """CI's pytest `command` (`session.pytest_run`), or with `network` the same selecting the network-marked
     tests alone, every one the rest of CI sets aside. It sets aside the tests marked whole_suite too, but on
     the whole suite's own run (`whole`: DEW_WHOLE_SUITE, every fifth publish's ci/full-whole-*), whatever
-    the cache's policy: a policy-off train runs every file, never a whole-suite cell (Main, 2026-10-28:
-    train 250's policy-off suite ran G03's GRPO cells, 826-1,430 s each, to its deadline). The release checks
-    run in their own tasks alone (`release`), every one whatever else marks it, under a requirement the
-    suite's environment lacks (`release_plan`), and on no other run, the network lane's among them."""
+    the cache's policy: a policy-off train runs every file, never a whole-suite cell (the maintainer,
+    2026-10-28: train 250's policy-off suite ran G03's GRPO cells, 826-1,430 s each, to its deadline). The
+    release checks run in their own tasks alone (`release`), every one whatever else marks it, under a
+    requirement the suite's environment lacks (`release_plan`), and on no other run, the network lane's among
+    them."""
     at = command.index(session.SELECTION[1])
     if release:
         chosen = "release_env"
@@ -1424,7 +1436,7 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
     own (`tested`), and write their verdict rows to `out`. With `network`, the network lane: each file's
     network-marked tests alone, which every other task deselects (`session.SELECTION`), run with the Hub
     open on a node that reaches it, their records on a class of their own (`device_class`), so the test
-    cache reruns only those whose inputs changed (Main, 2026-10-25: no CI run reached the published
+    cache reruns only those whose inputs changed (the maintainer, 2026-10-25: no CI run reached the published
     checkpoints' parity tests).
 
     A file's process is given the share its last run on this GPU's class measured, green or red,
@@ -1801,8 +1813,10 @@ def main() -> int:
         print(f"{len(changed)} files refolded in {session.DURATIONS}: {' '.join(changed) or 'none'}")
         return 0
     if args.operation == "gpu-tier":
-        tier = ({name: [f"{count} marked"] for name, count in marked(PYTHONS[0]).items()} if args.marked
-                else gpu_tier(PYTHONS[0]))
+        # A GPU runs its marked files alone, a batch's and a day's alike (ledger 2452): the records' evidence
+        # (`gpu_tier`) is what --evidence reports, which a day's tier no longer chooses by.
+        tier = ({name: [f"{count} marked"] for name, count in marked(PYTHONS[0]).items()}
+                if args.marked or not args.evidence else gpu_tier(PYTHONS[0]))
         if args.evidence:
             for name, evidence in tier.items():
                 print(name, *evidence, sep="\t")
