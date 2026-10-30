@@ -103,10 +103,13 @@ def test_a_run_an_earlier_main_saved_loads_and_answers(tmp_path, recorded, kind)
 
 @pytest.mark.parametrize(("recorded", "kind"), SAVED, ids=IDS)
 def test_a_run_an_earlier_main_saved_resumes_from_its_checkpoint(tmp_path, monkeypatch, recorded, kind):
-    """A kind's run saved at an earlier main resumes from its last checkpoint for one step more: the fit
-    starts at that step, from that checkpoint, and trains the one step past it."""
+    """A kind's run saved at an earlier main resumes from its last checkpoint for one step more, in the
+    compute it trained in (every corpus run's model draws fresh or loads a decision backbone, in float32
+    unless its model names a dtype; train 328's review of ledger 2500): the fit starts at that step, from
+    that checkpoint, and trains the one step past it."""
     run = extracted(tmp_path, recorded, kind)
     recorded_run = RunConfig.load(str(run))
+    assert recorded_run.compute_dtype() == recorded_run.model.fields.get("dtype", "float32")
     with Checkpoints(str(run)) as checkpoints:
         last = checkpoints.latest
     here = SAVED_KINDS[kind](tmp_path, drawn=False)
