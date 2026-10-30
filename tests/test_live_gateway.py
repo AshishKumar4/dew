@@ -34,7 +34,8 @@ from gateway_manager import LimitedMappingKernelManager
 
 class Relaunching(KernelGatewayIOLoopKernelManager):
     """A plain kernel whose restart says it began (RELAUNCHED) and then, as DEW_TEST_RELAUNCH says, takes
-    three seconds in its shutdown (`slow-stop`) or its relaunch (`slow`), or its relaunch raises (`fail`)."""
+    three seconds in its shutdown (`slow-stop`) or its relaunch (`slow`), or its relaunch raises (`fail`) or
+    never ends (`hang`)."""
 
     launches = 0
 
@@ -50,7 +51,7 @@ class Relaunching(KernelGatewayIOLoopKernelManager):
             Path(os.environ["RELAUNCHED"]).touch()
             if os.environ["DEW_TEST_RELAUNCH"] == "fail":
                 raise RuntimeError("the relaunch failed")
-            await asyncio.sleep(3)
+            await asyncio.sleep(3600 if os.environ["DEW_TEST_RELAUNCH"] == "hang" else 3)
         return await super()._async_launch_kernel(kernel_cmd, **kwargs)
 
 
@@ -186,14 +187,15 @@ def test_a_kernel_whose_restarts_failed_leaves_no_connection_file(tmp_path):
             time.sleep(0.2)
 
 
-@pytest.mark.parametrize("relaunch", ["slow-stop", "slow", "fail"])
+@pytest.mark.parametrize("relaunch", ["slow-stop", "slow", "fail", "hang"])
 def test_a_kernel_deleted_while_it_restarts_or_after_its_relaunch_failed_leaves_no_connection_file(
         tmp_path, relaunch):
     """A kernel deleted while it restarts, in the restart's shutdown or its relaunch, as the bridge deletes a
     context it hears restarting, ends once the restart settles, where the delete had failed and kept it; one
-    whose relaunch raised, which no restarter ends, is released by its delete. Either way no connection file
-    is left (ledger 2516)."""
-    options = ("--KernelRestarter.time_to_dead=0.5",)
+    whose relaunch raised, which no restarter ends, is released by its delete, and one whose relaunch hangs
+    is released once the server's bound on a start passes (`kernel_info_timeout`). Either way no connection
+    file is left (ledger 2516)."""
+    options = ("--KernelRestarter.time_to_dead=0.5", "--MappingKernelManager.kernel_info_timeout=5")
     with gateway(tmp_path, 300, *options, relaunch=relaunch) as port:
         identifier = created(port)
         connection = tmp_path / f"kernel-{identifier}.json"

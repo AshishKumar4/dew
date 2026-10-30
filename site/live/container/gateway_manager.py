@@ -189,9 +189,22 @@ class LimitedMappingKernelManager(SeedingMappingKernelManager):
         (ledger 2516). Then jupyter-server's own shutdown: its activity, buffers and count."""
         kernel = self.get_kernel(kernel_id)
         # A restart replaces `ready` for each of its phases, its shutdown's then its start's: each is waited
-        # for, its end read below (`asyncio.wait` neither raises it nor cancels the phase).
-        while not kernel.ready.done():
-            await asyncio.wait([kernel.ready])
+        # for, its end read below (`asyncio.wait` neither raises it nor cancels the phase), within the
+        # server's own bound on a kernel's start (`kernel_info_timeout`).
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.kernel_info_timeout
+        while not kernel.ready.done() and loop.time() < deadline:
+            await asyncio.wait([kernel.ready], timeout=deadline - loop.time())
+        if not kernel.ready.done():
+            # A restart hung past that bound: its process stopped and its resources released, and it is
+            # dropped, as no shutdown can read a `ready` that never settles.
+            if kernel.provisioner is not None:
+                await kernel.provisioner.kill(restart=False)
+            await kernel.cleanup_resources(restart=False)
+            self.stop_watching_activity(kernel_id)
+            self.stop_buffering(kernel_id)
+            self.remove_kernel(kernel_id)
+            return None
         # Its restart failed: its relaunch raised, or it never answered.
         if not kernel.ready.cancelled() and kernel.ready.exception() is not None:
             await kernel.cleanup_resources(restart=False)
