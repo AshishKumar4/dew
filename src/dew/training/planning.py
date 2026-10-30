@@ -682,8 +682,11 @@ class FitSearch[LossT, EffectsT]:
         fit, headroom = step_fits(executable, self.mesh, candidate.held, self.capacity, candidate.built)
         self.sampled = None
         if fit and candidate.sampled is not None and ahead is not None and ahead.sampled is not None:
-            # The sampled step compiled ahead with the step, which its target compiles none of.
-            self.sampled = ahead.sampled.taken(candidate.sampled(), jax.devices())
+            # The sampled step compiled ahead with the step, lowered as its compile lowered it (`handed`),
+            # which its target compiles none of.
+            with handed(ahead):
+                sampled = candidate.sampled()
+            self.sampled = ahead.sampled.taken(sampled, jax.devices())
         elif fit and candidate.sampled is not None:
             def resampled() -> jax.stages.Lowered:
                 """The sampled step lowered afresh, its launches derived past a spilled one's config."""
