@@ -29,7 +29,7 @@ from dew._records import JSON
 from dew.batch import Batch
 from dew.data.dataset import rows_of
 from dew.distributed.placement import placed_bytes
-from dew.mesh import row_axes
+from dew.mesh import DATA_AXIS, FSDP_AXIS, row_axes
 from dew.objectives.base import Objective, Step
 from dew.optim import clips_qk
 from dew.state import TrainState
@@ -136,7 +136,9 @@ def candidate_footprint[LossT, EffectsT](objective: Objective[LossT, EffectsT],
     derives no residuals, which its compile judges."""
     mesh = jax.sharding.get_abstract_mesh()
     split = set() if mesh.empty else {name for name, size in mesh.shape.items() if size > 1}
-    if not split <= set(row_axes(rows_of(micro), mesh=mesh) if split else ()):
+    # Data and fully sharded data parallelism split the rows alone; an expert axis splits the experts too.
+    rows = set(row_axes(rows_of(micro), mesh=mesh)) & {DATA_AXIS, FSDP_AXIS} if split else set()
+    if not split <= rows:
         residuals = None
     else:
         loss, (variables, *rest) = traced_loss(objective, prepared, window)
