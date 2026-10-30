@@ -27,13 +27,12 @@ logits over check 1's seeds (recorded_logits.npz).
 """
 
 import json
-import shutil
 import sys
 from pathlib import Path
 
 import numpy as np
 import torch
-from huggingface_hub import hf_hub_download
+from hf_reference import write_released_config
 from reference_source import config_lookups, hub_modules, padded_probe, record_padding
 from torch_precision import float64_twin
 
@@ -120,10 +119,7 @@ def write_recording(modeling, name: str = 'k2-horizon-tiny', flag: str = '--reco
 
 def write_released() -> None:
     for size, (repo, revision) in RELEASES.items():
-        directory = FIXTURES / f'k2-horizon-{size}'
-        directory.mkdir(parents=True, exist_ok=True)
-        shutil.copy(hf_hub_download(repo, 'config.json', revision=revision), directory / 'config.json')
-        (directory / 'source.json').write_text(f'{{"repo": "{repo}", "revision": "{revision}"}}\n')
+        write_released_config(f'k2-horizon-{size}', repo, revision)
 
 
 if __name__ == '__main__':

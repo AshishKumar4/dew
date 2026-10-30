@@ -12,7 +12,7 @@ import numpy as np
 from ..attention_residuals import DepthAttention
 from ..flops import MissingFlopsCount, counted_flops, parameter_flops, projection_flops
 from ..gemma3n import AltUpLayer
-from ..hyper_connections import HyperHead
+from ..hyper_connections import stream_head
 
 if TYPE_CHECKING:
     import flax.linen as nn
@@ -40,8 +40,9 @@ def _root_flops(decoder: CausalTransformer, lengths, depth_counter) -> float:
     maps = decoder.projections()
     count = sum(projection_flops(lengths, *shape) for name, shape in maps.items()
                 if name.startswith(('altup_projections_', 'altup_unembed_projections_', 'project_in')))
-    if decoder.hyper_connections is not None and decoder.hyper_connections.head == 'weighted':
-        count += HyperHead(decoder.hyper_connections, decoder.emb_features, parent=None).model_flops(lengths)
+    if decoder.hyper_connections is not None and decoder.hyper_connections.head in ('weighted', 'gated'):
+        count += stream_head(decoder.hyper_connections, decoder.emb_features, decoder.norm_eps,
+                             parent=None).model_flops(lengths)
     if decoder.attention_residuals is not None:
         sources = decoder.attention_residuals.blocks(decoder.num_layers) + 1
         count += depth_counter(DepthAttention(decoder.emb_features, parent=None), lengths, sources)
