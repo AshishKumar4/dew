@@ -155,18 +155,15 @@ class _Pass:
     it takes it) and why the Triton one refuses its spans (`attention_triton.refused`)."""
 
     on_gpu: bool
-    mosaic: str | None
-    triton: str | None
+    mosaic: selection.Refusal | None
+    triton: selection.Refusal | None
 
 
 _ON_GPU = selection.Requirement[_Pass]('off_gpu', lambda case: case.on_gpu, "the call runs off a GPU",
                                        generation.INHERENT)
 MAINLOOP = selection.Op[_Pass]('attention_mainloop', (
-    selection.Kernel[_Pass]('mosaic', (_ON_GPU, selection.Requirement[_Pass](
-        'declined', lambda case: case.mosaic is None, lambda case: str(case.mosaic),
-        'roadmap: the Mosaic template takes every call'))),
-    selection.Kernel[_Pass]('triton', (_ON_GPU, selection.Requirement[_Pass](
-        'spans', lambda case: case.triton is None, lambda case: str(case.triton), generation.INHERENT))),
+    selection.Kernel[_Pass]('mosaic', (_ON_GPU, lambda case: case.mosaic)),
+    selection.Kernel[_Pass]('triton', (_ON_GPU, lambda case: case.triton)),
     selection.Kernel[_Pass]('portable', (), generic=True),
 ), preferred=lambda case: 'mosaic' if case.on_gpu else 'portable')
 """The template's mainloops, the first that takes a pass: Mosaic GPU's, which a GPU prefers, the frozen
@@ -176,7 +173,7 @@ route, so the kernel-route audit sees a call on a GPU that leaves the Mosaic tem
 reason."""
 
 
-def _mainloop(declined: str | None, spans: KeySpans, hooks: Hooks, unfitted) -> str:
+def _mainloop(declined: selection.Refusal | None, spans: KeySpans, hooks: Hooks, unfitted) -> str:
     """The mainloop a pass runs, reported (`MAINLOOP`), from Mosaic's reason it `declined` the pass and the
     Triton mainloop's refusal of its spans and hooks (`attention_triton.refused`: a dropping call's) or of
     the call, no config of whose launch fits the GPU (`unfitted()`, its own fitting)."""

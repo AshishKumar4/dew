@@ -517,7 +517,7 @@ class Chunk(recurrence.Gated):
 
 
 def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_SIZE,
-          max_segments: int | None = None, dtype=None, mainloop: str | None = None):
+          max_segments: int | None = None, dtype=None):
     """`(output [B, S, Hv, Dv], final memory [B, Hv, Dk, Dv])` of a sequence through the recurrence of
     `hooks` (`recurrence.Hooks`, the decode step's form), the output in `dtype` (the queries', keys'
     and values' common dtype where None) and the memory in at least fp32.
@@ -534,8 +534,8 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
     Packed documents (`starts`, at most `max_segments` a row) each compute as they would alone. A conv
     runs before the op: it takes the conv's output. The operands the hooks read are checked as the
     decode step's (`recurrence.read`), and a rated decay is taken on its declared domain, a contraction.
-    `mainloop` 'mosaic' runs the rule on the recurrence template's Mosaic GPU mainloop (`mosaic_rule`),
-    every decay with or without the delta rule."""
+    A call names a kernel through `generation.chosen` alone, the recurrence template's 'mosaic_gpu' among
+    them (row 959: the selectors decide every call)."""
     if hooks.conv is not None:
         raise ValueError("the chunked op takes the conv's output: its queries, keys and values")
     given = recurrence.read(hooks, operands, optional=('state',))
@@ -557,15 +557,7 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
     beta = jnp.ones(value.shape[:3], work) if beta is None else beta
     state, starts, firsts = operands.state, operands.starts, operands.firsts
     epilogue = hooks.skip or hooks.output is not None
-    if mainloop is not None:
-        if mainloop != 'mosaic':
-            raise ValueError(f"no {mainloop!r} mainloop: the recurrence template's is 'mosaic'")
-        # Unrounded where an epilogue follows, as on the portable math.
-        out, final = template_rule(query, key, value, g, beta, state, starts, firsts,
-                                   max_segments=max_segments, scale=scale, delta=hooks.delta, wide=epilogue,
-                                   floor=hooks.floor, bound=hooks.inverse_bound)
-        out = recurrence.skipped(hooks, out, value, given, work)
-    elif hooks.rated and not hooks.delta and not hooks.l2norm and hooks.scale is None:
+    if hooks.rated and not hooks.delta and not hooks.l2norm and hooks.scale is None:
         # Each of its routes adds the skip, the port in its kernels.
         out, final = _rated_scan(hooks, query, key, value, g, beta, given, state, starts, firsts, chunk_size,
                                  work, max_segments=max_segments)
