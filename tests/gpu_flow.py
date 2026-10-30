@@ -61,13 +61,16 @@ def run_cells(cells: Iterable[Cell]) -> list[str]:
     labels returned; an outermost flow's counts reported (`REPORTED`)."""
     global _depth
     _depth += 1
+    failed, skipped, passed = [], [], [0]
     try:
-        failed, skipped, passed = _ran(cells)
+        _ran(cells, failed, skipped, passed)
     finally:
+        # Counted however the flow ends, so a flow stopped early still reports what it ran.
         _depth -= 1
-    if not _depth:
-        REPORTED.append({"passed": passed, "failed": len(failed), "skipped": len(skipped),
-                         "device": _device()})
+        if not _depth:
+            REPORTED.append({"passed": passed[0], "failed": len(failed), "skipped": len(skipped),
+                             "device": _device()})
+    passed = passed[0]
     print(f"cells: {passed} passed, {len(failed)} failed, {len(skipped)} skipped on this device", flush=True)
     if failed:
         raise CellsFailed(failed)
@@ -76,10 +79,10 @@ def run_cells(cells: Iterable[Cell]) -> list[str]:
     return skipped
 
 
-def _ran(cells: Iterable[Cell]) -> tuple[list[tuple[str, str]], list[str], int]:
-    """Each cell run (`run_cells`): the failed ones by label and report, the skipped ones' labels, and how
-    many passed."""
-    failed, skipped, passed = [], [], 0
+def _ran(cells: Iterable[Cell], failed: list[tuple[str, str]], skipped: list[str], passed: list[int]) -> None:
+    """Each cell run (`run_cells`), into `failed` (by label and report), `skipped` (labels) and `passed` (its
+    one count): a cell's failure is any exception, pytest's own failures among them (`pytest.fail`, and a
+    `pytest.raises` that saw nothing), which derive from BaseException and would otherwise end the flow."""
     for cell in cells:
         if cell.generation is not None and not runnable(cell.generation):
             skipped.append(cell.label)
@@ -90,12 +93,11 @@ def _ran(cells: Iterable[Cell]) -> tuple[list[tuple[str, str]], list[str], int]:
         except pytest.skip.Exception as skip:
             print(f"cell skipped: {cell.label}: {skip.msg}", flush=True)
             skipped.append(cell.label)
-        except Exception as error:
+        except (Exception, pytest.fail.Exception) as error:
             # Kept with its label, and raised with every other cell's after the last.
             failed.append((cell.label, "".join(traceback.format_exception_only(error)).strip()))
         else:
-            passed += 1
-    return failed, skipped, passed
+            passed[0] += 1
 
 
 def _skipped(marks, reason_of: str) -> Callable[[], None] | None:
@@ -154,4 +156,58 @@ def cells_of(check, generation: str | None = None, **fixtures) -> list[Cell]:
         run = _skipped(own, name) or functools.partial(check, **arguments)
         cells.append(Cell(f"{name}: {'-'.join(labels)}" if labels else name, run, generation))
     return cells
+
+
+def when(holds: bool, reason: str, check: Callable[[], None]) -> Callable[[], None]:
+    """`check` where `holds`, else skipped for `reason`: a cell gated on a capability (`bf16_dot_runs`, a
+    package) rather than on a generation's launch sizes (`Cell.generation`)."""
+    def run():
+        if not holds:
+            pytest.skip(reason)
+        check()
+    return run
+
+
+def isolated(tmp_path_factory) -> Callable[..., Callable[[], None]]:
+    """A flow's `in_own(check, name, *, devices=1, **given)`: `check` run as the suite runs a test, in a
+    directory of its own (`tmp_path`) with tests/conftest.py's per-test settings, its own rung records, data
+    cache, Hub answers and Hub cache, and a `monkeypatch` undone after it, each passed where it takes them;
+    skipped where this process holds fewer than `devices` devices."""
+    def in_own(check, name: str, *, devices: int = 1, **given) -> Callable[[], None]:
+        def run():
+            import jax
+            from huggingface_hub import constants
+
+            if jax.device_count() < devices:
+                pytest.skip(f"needs {devices} devices; this process has {jax.device_count()}")
+            directory = tmp_path_factory.mktemp(name)
+            with pytest.MonkeyPatch.context() as patch:
+                patch.setenv("DEW_RUNG_RECORDS", str(directory / "rungs"))
+                patch.setenv("DEW_DATA_CACHE", str(directory / "data-cache"))
+                patch.setenv("DEW_HUB_ANSWERS", str(directory / "hub-answers"))
+                patch.setattr(constants, "HF_HUB_CACHE", str(directory / "hub-cache"))
+                fixtures = {"tmp_path": directory, "monkeypatch": patch}
+                taken = inspect.signature(check).parameters
+                check(**{key: value for key, value in fixtures.items() if key in taken}, **given)
+        return run
+    return in_own
+
+
+def repeats_bit_for_bit(step: Callable, *inputs, runs: int = 2, names: Iterable[str] | None = None) -> None:
+    """`step(*inputs)` run `runs` times, the second compiled afresh (`jax.clear_caches`): every leaf of every
+    run's output the first run's bits, so a schedule the compiler picks repeats as well as one it is handed
+    (kernel-templates.md's reproducibility); each leaf named by `names` where given, else by its path."""
+    import jax
+    import numpy as np
+
+    first = jax.tree.map(np.asarray, step(*inputs))
+    paths = [jax.tree_util.keystr(path) for path, _ in jax.tree_util.tree_leaves_with_path(first)]
+    labels = list(names) if names is not None else paths
+    for run in range(1, runs):
+        if run == 1:
+            jax.clear_caches()
+        again = jax.tree.leaves(jax.tree.map(np.asarray, step(*inputs)))
+        for label, one, other in zip(labels, jax.tree.leaves(first), again, strict=True):
+            np.testing.assert_array_equal(one.view(np.uint8), other.view(np.uint8),
+                                          err_msg=f"{label} on run {run + 1}")
 

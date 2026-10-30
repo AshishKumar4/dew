@@ -436,7 +436,7 @@ def test_a_stopped_pool_ends_its_ranks_without_aborts():
     SIGKILLed after the grace. Rank 0's process holds the pool's coordination
     service: killed first, it left the others to abort in XLA's error
     polling, with "Check failure" stack traces that read as crashes of their
-    own (the sequence-parallel lane's land7 run, stopped by its timeout). Stopped last, it
+    own (a sequence-parallel distribution run, stopped by its timeout). Stopped last, it
     leaves no rank to abort."""
     program = ("import os, time\n"
                "from dew.training.runtime import prepare_process\n"

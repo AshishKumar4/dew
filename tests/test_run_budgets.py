@@ -8,6 +8,7 @@ import grain.python as grain
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from examples_clock_worker import Questioned
 from recording import RecordingTracker
 from reference_error import as_given, assert_as_exact
 
@@ -16,7 +17,7 @@ from dew.config import RunConfig, TrainerConfig
 from dew.data import Memory
 from dew.data.compile import compile, fitted
 from dew.data.dataset import Closeable, DataPartition, Loader, Loading
-from dew.data.pipeline import Pipeline
+from dew.data.pipeline import ObjectiveData, Pipeline
 from dew.distributed.batches import batch_signature
 from dew.objectives import Aux, Objective
 from dew.optim import Cosine, Linear, OneCycle, OptimConfig
@@ -106,9 +107,10 @@ def trained(x, directory=None, stops: tuple[Pause | None, ...] = (None,)):
     return {"w": np.asarray(state.variables["params"]["w"]), "loss": np.asarray(stepped)}
 
 
-def ids_read(loader: Loader, field: str) -> collections.Counter:
-    """The real values of `field` in every training batch of `loader`, whose read ends at its bound."""
-    stream = loader.train(DataPartition())
+def ids_read(loader: Loader, field: str, partition: DataPartition | None = None) -> collections.Counter:
+    """The real values of `field` in every training batch `partition`'s share of `loader` reads (a single
+    reader's where None), whose read ends at its bound."""
+    stream = loader.train(DataPartition() if partition is None else partition)
     read: collections.Counter = collections.Counter()
     try:
         for batch in stream:
@@ -136,6 +138,136 @@ def test_an_examples_budget_reads_each_record_once_and_its_read_ends_there(examp
         {passes + 1: rest, passes: RECORDS - rest} if passes else {1: rest})
 
 
+POOLED = 3
+"""The shares of the pools a bound in examples is dealt between, which the ten records' passes do not
+split evenly."""
+
+POOLED_SHARDS = 3
+"""The rows of each physical shard of the pools' streamed reads: 3, 3, 3 and a last of 1."""
+
+
+def examples_read(loader: Loader, partition: DataPartition, *, expanded: bool) -> collections.Counter:
+    """The examples by id `partition`'s share of `loader` reads, each example's rows whole (an objective's
+    `id % 3 + 1` rows of each where `expanded`)."""
+    rows = collections.Counter(ids_read(loader, "id", partition))
+    made = {record: record % 3 + 1 if expanded else 1 for record in rows}
+    assert all(count % made[record] == 0 for record, count in rows.items()), rows
+    return collections.Counter({record: count // made[record] for record, count in rows.items()})
+
+
+def dealt_records(ids: np.ndarray, examples: int, index: int) -> collections.Counter:
+    """The oracle of a pool's bound over records each share reads its own of, dealt `index :: POOLED`: the
+    examples at each of the pool's first `examples` places, pass after pass, that fall to share `index`."""
+    places = [place % len(ids) for place in range(examples)]
+    return collections.Counter(int(ids[place]) for place in places if place % POOLED == index)
+
+
+def dealt_shards(ids: np.ndarray, examples: int, index: int, *, rewound: bool) -> collections.Counter:
+    """The oracle of a pool's bound over the stream's physical shards of POOLED_SHARDS rows, dealt place by
+    place (`index :: POOLED`) in the order the compile's seed (0) shuffles them: each pass its own order
+    where the stream repeats them itself; a pass replayed, each share its own places again, where a later
+    repeat replays the stream (`rewound`). The rows of each place the first `examples` rows reach that
+    falls to share `index`."""
+    shards = [ids[start:start + POOLED_SHARDS] for start in range(0, len(ids), POOLED_SHARDS)]
+    order = grain.MapDataset.range(len(shards)).shuffle(seed=0)
+    read: collections.Counter = collections.Counter()
+    if rewound:
+        passes, examples = divmod(examples, len(ids))
+        for place in range(len(shards)):
+            if place % POOLED == index:
+                read.update({int(record): passes for record in shards[order[place]]})
+        order = order.repeat(1)
+    else:
+        order = order.repeat()
+    place = 0
+    while examples > 0:
+        shard = shards[order[place]]
+        if place % POOLED == index:
+            read.update(int(record) for record in shard[:examples])
+        examples -= len(shard)
+        place += 1
+    return read
+
+
+@dataclasses.dataclass(frozen=True)
+class Untouched:
+    """A random step that leaves its record as it is, which keeps a stream's repeat where it is written,
+    after the shards each share reads."""
+
+    identity = "untouched@1"
+
+    def __call__(self, row, rng):
+        return row
+
+
+POOL_DEALS = {
+    # A global order, cut into shares after the bound.
+    "one order": lambda rows: rows.shuffle(3),
+    # Records each share reads its own of (`index :: count`), an objective making rows of each.
+    "dealt records": lambda rows: rows,
+    "dealt records in workers": lambda rows: rows.loading(Loading(workers=1, threads=1, read_buffer=1)),
+    # Physical shards each share reads its own of, the stream repeating them, one at a time or two.
+    "dealt shards": lambda rows: rows,
+    "dealt shards interleaved": lambda rows: rows.interleave(2),
+    # The stream repeated after a step, each share replaying its own shards, one at a time or two.
+    "dealt shards rewound": lambda rows: rows.random_map(Untouched(), identity="untouched@1").repeat(),
+    "dealt shards rewound interleaved": lambda rows: rows.interleave(2).random_map(
+        Untouched(), identity="untouched@1").repeat(),
+}
+
+
+@pytest.mark.parametrize("examples", [1, 7, 23])
+@pytest.mark.parametrize("deal", list(POOL_DEALS))
+def test_a_pools_shares_read_its_bound_once_however_its_read_deals_them(deal, examples):
+    """A pool of three shares bounded to `examples` reads exactly its bound's examples between its shares,
+    each where its read deals it, however that is (`POOL_DEALS`): in one order, the examples one process
+    reads; dealt by record or by physical shard, each share the examples at its places among the pool's
+    first `examples` (`dealt_records`, `dealt_shards`), so no share repeats a record while another's go
+    unread, and a share dealt none reads none. A share's interleave reads its own places' rows alone, and
+    loading workers keep the count each share's records hold."""
+    ids = np.arange(1, RECORDS + 1, dtype=np.int32)
+    streamed = deal.startswith("dealt shards")
+    rows = POOL_DEALS[deal](Pipeline(Memory({"id": ids}, shard_rows=POOLED_SHARDS)))
+    expanded = deal != "one order"
+    loader = compile(rows.batch(2 * POOLED), read="streamed" if streamed else "memory",
+                     objective=ObjectiveData(train=(Questioned(),)) if expanded else None, examples=examples)
+    shares = [examples_read(loader, DataPartition(index=index, count=POOLED), expanded=expanded)
+              for index in range(POOLED)]
+    if deal == "one order":
+        assert sum(shares, collections.Counter()) == examples_read(loader, DataPartition(), expanded=expanded)
+    elif deal.endswith("rewound interleaved"):
+        # A pass a later repeat replays is read whole before the next, so a share's interleave crosses no
+        # pass: the share reads its own shards' part of each pass the bound reaches, in its own order.
+        dealt = [dealt_shards(ids, examples, index, rewound=True) for index in range(POOLED)]
+        whole = [dealt_shards(ids, (examples // RECORDS + 1) * RECORDS, index, rewound=True)
+                 for index in range(POOLED)]
+        assert [sum(share.values()) for share in shares] == [sum(share.values()) for share in dealt]
+        assert all(set(share) <= set(own) for share, own in zip(shares, whole, strict=True))
+        passes = examples // RECORDS
+        assert all(count in (passes, passes + 1) for share in shares for count in share.values())
+    elif streamed:
+        assert shares == [dealt_shards(ids, examples, index, rewound=deal.endswith("rewound"))
+                          for index in range(POOLED)]
+    else:
+        assert shares == [dealt_records(ids, examples, index) for index in range(POOLED)]
+    assert sum(sum(share.values()) for share in shares) == examples
+
+
+@pytest.mark.parametrize("examples", [7, 23])
+def test_a_pools_shares_whose_records_a_step_drops_before_the_bound_read_it_dealt_by_example(examples):
+    """A pool of three shares whose read drops records before the bound (a filter that keeps the even
+    ids), so no share knows ahead how many of its records reach it: the bound's examples are dealt to the
+    shares every count-th, each share reading its part of them, kept records alone, the pool the bound."""
+    ids = np.arange(1, RECORDS + 1, dtype=np.int32)
+    loader = compile(Pipeline(Memory({"id": ids})).shuffle(3).filter_map(Evens()).batch(2 * POOLED),
+                     read="indexed", objective=ObjectiveData(train=(Questioned(),)), examples=examples)
+    shares = [examples_read(loader, DataPartition(index=index, count=POOLED), expanded=True)
+              for index in range(POOLED)]
+    assert [sum(share.values()) for share in shares] == [len(range(index, examples, POOLED))
+                                                          for index in range(POOLED)]
+    assert all(record % 2 == 0 for share in shares for record in share)
+
+
 def test_an_examples_budget_counts_documents_before_they_are_packed():
     """Documents packed into windows as they arrive are counted before the pack: the read bounded to 13
     of 5 documents of 1 to 5 tokens holds each document's tokens once for each time the bound reaches
@@ -145,15 +277,6 @@ def test_an_examples_budget_counts_documents_before_they_are_packed():
     read = ids_read(loader, "text")
     reached = collections.Counter(1 + index % 5 for index in range(13))
     assert read == {token: count * token for token, count in reached.items()}
-
-
-class Questioned:
-    """An objective's expansion of each record into `id % 3 + 1` rows, one a question, as a decision
-    layout of a question a row makes of an example (`dew.decision.rows.QuestionRows`)."""
-
-    def flat_map(self, element):
-        return tuple({"id": element["id"], "question": np.int32(question)}
-                     for question in range(int(element["id"]) % 3 + 1))
 
 
 @pytest.mark.parametrize("configured", [False, True], ids=["step", "configured"])
