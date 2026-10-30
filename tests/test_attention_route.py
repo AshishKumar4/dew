@@ -17,6 +17,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from attention_oracle import attention_terms, kept
 from flax import linen as nn
 from jax.sharding import Mesh, PartitionSpec
 from reference_error import assert_as_exact, with_gradients
@@ -471,12 +472,31 @@ def test_a_dense_bias_named_onto_the_template_is_on_par_with_the_reference_path(
 @pytest.mark.parametrize("case", ["causal", "packed-documents", "sinks-softcap"])
 def test_an_fp16_call_on_an_h100_is_on_par(case):
     """fp16 on an H100, whose Mosaic backward takes bf16 alone (`attention_mosaic.refused`), so its forward
-    and backward compose two mainloops: on par with the reference path (check 1) whatever they run."""
+    and backward compose two mainloops: on par with the reference path (check 1) whatever they run. A call
+    without sinks is judged a term at a time (`attention_terms`): a query that keeps one key has a dQ of
+    zero in float64, which a D formed from the rounded output rounds to its own size (G14's H100 flow,
+    gate-g14f-h100)."""
     queries, keys = geometry(CASES[case])
     draw = drawing(queries, keys, jnp.float16, sinks=bool(CASES[case].get("sinks")))
     template_pass = jax.jit(pulled("template", CASES[case]))
     assert_as_exact(template_pass, jax.jit(pulled("reference", CASES[case])), draw,
-                    f"fp16 Mosaic forward, Triton backward, {case}", seeds=SEEDS)
+                    f"fp16 Mosaic forward, Triton backward, {case}", seeds=SEEDS,
+                    terms=False if CASES[case].get("sinks") else _terms(CASES[case], queries, keys))
+
+
+def _terms(case: dict, queries: int, keys: int):
+    """The float64 terms of `case`'s output and gradients (`attention_terms`) over the keys it keeps, a
+    function of a draw `(query, key, value, sinks, dout)`."""
+    names = keywords(case)
+    keep = kept(queries, keys, causal=case.get("causal", False), sliding_window=case.get("sliding_window"),
+                segment_ids=names.get("segment_ids"))
+
+    def terms(query, key, value, sinks, dout):
+        del sinks
+        # The sinks' gradient, which a call without sinks holds as None.
+        return (*attention_terms(query, key, value, dout, keep), None)
+
+    return terms
 
 
 @pytest.mark.gpu(reason="walks a sequence of thousands of keys, on a GPU")

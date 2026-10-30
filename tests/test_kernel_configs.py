@@ -661,7 +661,7 @@ def test_the_resource_gate_refuses_spills_and_invalid_allocations():
     for past in ({"shared": 4096}, {"tmem": 513}, {"spilled": 40}):
         assert mosaic_failures([{**record, "kernels": [{**within, **past}]}])
     overestimated = resources.RegisterModel(200, 168, 2, 1, 8, 168, shared=1024)
-    disagreement = {**record, "models": {"k": dataclasses.asdict(overestimated)},
+    disagreement = {**record, "models": {"k": overestimated.record()},
                     "kernels": [{**within, "need": 160}]}
     assert not mosaic_failures([disagreement])
     assert any(not row["agrees"] for row in disagreement["evidence"])

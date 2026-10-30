@@ -344,7 +344,7 @@ def cap_decisions(assemble, model: resources.RegisterModel, *, raising: bool, ho
     programs = 0
     refusal_programs = 0
     for count in range(model.most, 0, -1):
-        cap = min(budget, _residency_cap(model, count, step, honored))
+        cap = min(budget, model.cap(count, honored=honored))
         if admitted and not programs and holds(cap):
             programs = count
         if refusal_holds and not refusal_programs and holds(cap - step):
@@ -391,12 +391,12 @@ def _compiled_here(cases, generation: str) -> list[dict]:
         models = dict(case.models or {})
         record: dict = {"name": case.name, "generation": generation,
                         "limit": gpu_target(generation).shared_limit,
-                        "models": {name: dataclasses.asdict(model) for name, model in models.items()}}
+                        "models": {name: model.record() for name, model in models.items()}}
         with (tempfile.TemporaryDirectory(prefix="dew-mosaic-") as directory,
               report.reported(directory, ptx=True)):
             _compiled(case, generation, record)
-            lowered_models = _lowered_models(record, mosaic_kernels(directory), generation)
-            needs = _needs(directory, generation, lowered_models or models)
+            lowered_models = _lowered_models(record, mosaic_kernels(directory), generation, models)
+            needs = _needs(directory, generation, {**models, **lowered_models})
             compiled = _compiled_reports(directory, generation)
             record["kernels"] = [needed(inherited({**kernel, **compiled.get(kernel["kernel"], {})}), needs)
                                  for kernel in mosaic_kernels(directory)]
@@ -406,7 +406,8 @@ def _compiled_here(cases, generation: str) -> list[dict]:
     return found
 
 
-def _lowered_models(record: dict, kernels: list[dict], generation: str) -> dict[str, resources.RegisterModel]:
+def _lowered_models(record: dict, kernels: list[dict], generation: str,
+                    declared: dict[str, resources.RegisterModel]) -> dict[str, resources.RegisterModel]:
     target = gpu_target(generation)
     models = {}
     for kernel in kernels:
@@ -415,32 +416,13 @@ def _lowered_models(record: dict, kernels: list[dict], generation: str) -> dict[
             continue
         if len(launches) != 1:
             raise ValueError(f"{kernel['kernel']} has {len(launches)} launches but one compiled report")
+        stated = declared.get(kernel["kernel"])
+        if stated is None or stated.family is None:
+            continue
         launch = LoweredRegisters(**launches[0])
-        models[kernel["kernel"]] = launch.model(target, _compiler(), shared=kernel["shared"],
-                                                tmem=kernel["tmem"])
-    record["lowered_models"] = {name: dataclasses.asdict(model) for name, model in models.items()}
+        models[kernel["kernel"]] = launch.model(stated, target, shared=kernel["shared"], tmem=kernel["tmem"])
+    record["lowered_models"] = {name: model.record() for name, model in models.items()}
     return models
-
-
-REGISTER_FILE = 64 * 1024
-"""A multiprocessor's 32-bit registers (every CUDA generation the templates claim)."""
-
-
-def _program_registers(model: resources.RegisterModel, registers: int, honored: bool) -> int:
-    """A program's registers where each consumer thread holds `registers`: its consumers' and its
-    producer's (`model.producer`, none without one), which holds its own lowered registers where the
-    compile honors raises and a consumer's where it ignores them (every warpgroup at its entry's)."""
-    producer = model.producer if honored or not model.producer else registers
-    return (model.consumers * registers + producer) * 128
-
-
-def _residency_cap(model: resources.RegisterModel, count: int, step: int, honored: bool) -> int:
-    """The most registers a consumer thread holds with `count` programs a multiprocessor
-    (`_program_registers` within its register file), in the family's allocation steps."""
-    share = REGISTER_FILE // (128 * count)
-    if honored or not model.producer:
-        return (share - model.producer) // model.consumers // step * step
-    return share // (model.consumers + 1) // step * step
 
 
 def decisions(registers: int | dict | None, model: resources.RegisterModel,
@@ -466,8 +448,7 @@ def decisions(registers: int | dict | None, model: resources.RegisterModel,
         return registers["admitted"], registers["programs"]
     if registers is None or registers > model.budget:
         return False, 0
-    allocated = _program_registers(model, -(-registers // model.step) * model.step, honored)
-    return True, min(model.most, REGISTER_FILE // allocated) if allocated else model.most
+    return True, model.resident(registers, honored=honored)
 
 
 def mosaic_failures(found: list[dict]) -> list[str]:
@@ -513,6 +494,10 @@ def _register_evidence(record: dict) -> list[dict]:
         if found.spilled:
             rows.append({"case_id": f"{record['name']} {found.kernel}", "kind": "spill",
                          "spilled": found.spilled, "registers": found.registers})
+        if (launches := record.get("lowered", {}).get(found.kernel)) and found.kernel not in record.get(
+                "lowered_models", {}):
+            rows.append({"case_id": f"{record['name']} {found.kernel}", "kind": "unmodelled",
+                         "reason": "no declared family budget", "lowered": launches})
     return rows
 
 
@@ -559,7 +544,7 @@ def _compiler() -> Compiler:
     matched = re.search(r"V(\d+)\.(\d+)", version)
     if matched is None:
         raise ValueError(f"ptxas states no compiler version: {version}")
-    return Compiler((int(matched[1]), int(matched[2])), RELOCATABLE)
+    return Compiler((int(matched[1]), int(matched[2])))
 
 
 TPU_TOPOLOGIES = {"v5e": "v5e:2x2", "v6e": "v6e:2x2"}
