@@ -29,6 +29,7 @@ from jax.core import ShapedArray
 from dew._records import JSON
 from dew.batch import Batch
 from dew.data.dataset import rows_of
+from dew.devices import xla_flag
 from dew.distributed.placement import placed_bytes
 from dew.mesh import DATA_AXIS, FSDP_AXIS, row_axes
 from dew.nn.kernels.generation import _compute_capability
@@ -97,9 +98,22 @@ an elementwise one's always on a memory-bound GPU, a transcendental's too (an at
 probabilities, on an H100's compile, recomputed from its scores in the backward)."""
 
 
-VIEWS = frozenset({"transpose", "reshape", "squeeze", "expand_dims"})
-"""The layout primitives, whose result XLA's layout assignment gives its operand's storage, laid out as
-its reader needs it (a matrix product's transposed operand, a returned gradient's)."""
+VIEWS = frozenset({"reshape", "squeeze", "expand_dims"})
+"""The shape primitives, whose result is its operand's storage, its elements in the same order (a
+bitcast, in XLA's default row-major layout)."""
+
+TRANSPOSES = frozenset({"transpose"})
+"""The layout primitive XLA's layout assignment folds into the storage of a value the program computes,
+laying it out as its reader needs (a returned gradient's), not into an input's, whose layout is fixed."""
+
+LOOPS = frozenset({"scan", "while"})
+"""The primitives that run their body turn after turn, their results held across the turns."""
+
+GEMM_REWRITE_SIZE = 100
+"""The least a product's non-contracting sizes summed times its contracting size is for XLA to hand it to
+cuBLAS (`xla_gpu_gemm_rewrite_size_threshold`, `kDefaultMinGemmRewriteSize` in
+xla/debug_options_flags.cc); below it XLA's own emitters compute it (`IsMatrixMultiplicationTooSmall
+ForRewriting`, xla/service/gpu/matmul_utils.cc)."""
 
 
 def residual_bytes(loss: Callable, params, arguments: Sequence, *, platform: str) -> int:
@@ -165,8 +179,11 @@ def peak_bytes(program: jcore.Jaxpr, platform: str, workspace: int) -> int:
             operands = 0 if frontier.fusing(equation) else sum(
                 device_share(value) for value in {value for value in equation.invars if computed(value)}
                 if frontier.made_for(value))
-            products = workspace if equation.primitive.name == "dot_general" else 0
-            most = max(most, live + max(inner, made_bytes) + operands + products)
+            products = workspace if cublas_product(equation) else 0
+            # A loop's results (its stacked outputs, its carry) are held beside each turn's own; a call's
+            # results are what its body returns.
+            running = made_bytes + inner if equation.primitive.name in LOOPS else max(inner, made_bytes)
+            most = max(most, live + running + operands + products)
         held.update(made)
         live += made_bytes
         for done in [value for value in held if last[value] == index]:
@@ -190,9 +207,16 @@ class Frontier:
         self.reads: dict[jcore.Var, frozenset[jcore.Var]] = {}
 
     def view(self, value) -> bool:
-        """Whether `value` is a layout primitive's view of another value's storage."""
+        """Whether `value` is another value's storage: a shape primitive's of a value held or read
+        (`VIEWS`), or a transpose's of a value the program computes into a buffer (`TRANSPOSES`)."""
         equation = self.producers.get(value)
-        return equation is not None and equation.primitive.name in VIEWS
+        if equation is None or not equation.invars or not computed(equation.invars[0]):
+            return False
+        operand = equation.invars[0]
+        if equation.primitive.name in VIEWS:
+            return operand in self.inputs or not self.fused(operand) or self.view(operand)
+        return equation.primitive.name in TRANSPOSES and operand not in self.inputs and (
+            not self.fused(operand) or self.view(operand))
 
     def fused(self, value) -> bool:
         """Whether `value` holds no buffer of its own: recomputed where it is read, or a view."""
@@ -209,12 +233,8 @@ class Frontier:
 
     def made_for(self, value) -> bool:
         """Whether reading `value` from memory, as a matrix product or a call does, makes a buffer of it
-        for the read: a fused value's, but a view of one held (`view`)."""
-        if not self.fused(value):
-            return False
-        if self.view(value):
-            return self.made_for(self.producers[value].invars[0])
-        return True
+        for the read: a fused value's, but a view of storage (`view`)."""
+        return self.fused(value) and not self.view(value)
 
     def fusing(self, equation: jcore.JaxprEqn) -> bool:
         """Whether `equation` computes its result within a fusion that recomputes its operands' fused
@@ -246,6 +266,29 @@ def device_share(value: jcore.Var) -> int:
     if not isinstance(aval, ShapedArray) or aval.memory_space != jax.memory.Space.Device:
         return 0
     return math.prod(aval.shape) * aval.dtype.itemsize
+
+
+def cublas_product(equation: jcore.JaxprEqn) -> bool:
+    """Whether XLA hands `equation`, a matrix product, to cuBLAS, which takes a workspace: one each of
+    whose operands contracts a dimension (`IsCublasSupportedMatMul`, xla/service/gpu/ir_emission_utils.cc)
+    and that is not too small for it (`GEMM_REWRITE_SIZE`, or the run's
+    `--xla_gpu_gemm_rewrite_size_threshold`), as the GEMM rewriter asks
+    (xla/backends/gpu/transforms/gemm_rewriter.cc's `HandleDot`). A product XLA's Triton GEMM fusions
+    take instead takes none, which the derivation does not tell apart: it holds the workspace."""
+    if equation.primitive.name != "dot_general":
+        return False
+    (left_contracting, right_contracting), (left_batch, right_batch) = equation.params["dimension_numbers"]
+    left, right = (operand.aval.shape if isinstance(operand.aval, ShapedArray) else ()
+                   for operand in equation.invars)
+    if not left_contracting or not right_contracting:
+        return False
+    contracting = math.prod(left[axis] for axis in left_contracting)
+    kept_left = math.prod(size for axis, size in enumerate(left)
+                          if axis not in (*left_contracting, *left_batch))
+    kept_right = math.prod(size for axis, size in enumerate(right)
+                           if axis not in (*right_contracting, *right_batch))
+    threshold = int(xla_flag("xla_gpu_gemm_rewrite_size_threshold") or GEMM_REWRITE_SIZE)
+    return (kept_left + kept_right) * contracting >= threshold
 
 
 def bodies(equation: jcore.JaxprEqn) -> list[jcore.Jaxpr]:
