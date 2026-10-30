@@ -1,4 +1,4 @@
-"""What `reference_error.float64_terms` takes for a leaf's terms: the root sum
+"""What `float64_terms.float64_terms` takes for a leaf's terms: the root sum
 of squares of the terms its final sums add, carried into it, and nothing behind them;
 and the attention oracle's float64 truth held to an exact evaluation."""
 
@@ -8,9 +8,9 @@ import mpmath
 import numpy as np
 import pytest
 from attention_oracle import anchored_softmax
+from float64_terms import float64_terms
 from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import Mesh, PartitionSpec as P
-from reference_error import float64_terms
 
 from dew.accuracy import reduction_bound, within
 

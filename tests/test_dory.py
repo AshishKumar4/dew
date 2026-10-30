@@ -14,15 +14,15 @@ import numpy as np
 import optax
 import pytest
 from decision_support import decision_rows
+from float64_terms import float64_forward
 from interop_support import assert_reloads, assert_same_stored_tensors
+from one_draw import assert_as_exact_as_the_reference
 from reference_error import (
     as_given,
     assert_as_exact,
-    assert_as_exact_as_the_reference,
     assert_computes_the_oracle,
     assert_rounds_where_the_reference_does,
     chain_roundings,
-    float64_forward,
     indexed_recording,
     recording,
     seeds_for,

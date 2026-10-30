@@ -1242,8 +1242,7 @@ class ConsumerFed[Accumulator](RingFamily[Accumulator]):
         threads at them, no producer beside them, within the multiprocessor's 64 warps: a one-warpgroup
         program's 255 (256 allocated) hold two a multiprocessor, 168 three, where a producer's layout holds
         one (the recurrence's solve launch on an H100, two at a time: 0.356 -> 0.235 ms, JS-fed5)."""
-        allocated = -(-self.registers(consumers) // self.register_step) * self.register_step
-        held = cost.REGISTERS // (consumers * resources.THREADS * allocated)
+        held = cost.register_programs(consumers * resources.THREADS, self.registers(consumers))
         return max(1, min(held, 64 * 32 // (consumers * resources.THREADS)))
 
     def warpgroups(self, consumers: int) -> int:

@@ -19,6 +19,9 @@ from jaxlib.mlir import passmanager
 from jaxlib.mlir.dialects import gpu, llvm
 from jaxlib.mosaic.python import mosaic_gpu as mosaic_gpu_dialect
 
+from dew.nn.kernels.generation import GpuTarget
+from dew.nn.kernels.templates import cost, resources
+
 
 @dataclasses.dataclass(frozen=True)
 class Compiler:
@@ -628,4 +631,43 @@ def kernel_peaks(module_bytes: bytes, compiler: Compiler | None = None) -> list[
                 launch.mma_words = run.mma_words
                 regions = sorted(launch.regions.items(), key=lambda kv: -kv[1][0])[:8]
                 found.append((str(name), launch, (launch.breakdown(run.atoms), regions)))
+    return found
+
+
+@dataclasses.dataclass(frozen=True)
+class LoweredRegisters:
+    """One launch's live register set, before the assembler schedules and allocates it."""
+    name: str
+    registers: int
+    fragments: int
+    scalars: int
+    threads: int
+    producer: int
+    raised: int
+    where: str
+
+    def model(self, target: GpuTarget, compiler: Compiler, *, shared: int, tmem: int
+              ) -> resources.RegisterModel:
+        """Its launch budget and residency, from this launch's geometry and resource allocations."""
+        groups = self.threads // resources.THREADS
+        consumers = groups - bool(self.producer)
+        entry = resources.entry_registers(groups)
+        budget = self.raised if self.raised and not compiler.relocatable else entry
+        most = cost.resident(target, shared, self.threads, entry, tmem=tmem)
+        producer = (self.producer if not compiler.relocatable else budget) if self.producer else 0
+        return resources.RegisterModel(self.registers, budget, consumers, most, cost.REGISTER_STEP,
+                                       producer, shared)
+
+
+def lowered_registers(module: bytes, compiler: Compiler) -> list[LoweredRegisters]:
+    """Analyze the module an existing Mosaic custom call carries, without tracing or compiling it again.
+    The compiler version and assembly mode are inputs, never read from a process-global installation."""
+    found = []
+    for name, peak, _ in kernel_peaks(module, compiler):
+        if peak.threads is None:
+            continue
+        if peak.threads % resources.THREADS or peak.threads < resources.THREADS:
+            raise ValueError(f"Mosaic launch has {peak.threads} threads, not whole warpgroups")
+        found.append(LoweredRegisters(name, peak.total, peak.fragments, peak.scalars, peak.threads,
+                                       peak.producer, peak.raised, peak.where))
     return found

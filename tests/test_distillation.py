@@ -25,7 +25,8 @@ import numpy as np
 import optax
 import pytest
 from flax.traverse_util import unflatten_dict
-from reference_error import as_given, assert_as_exact, assert_as_exact_as_the_reference, widened
+from one_draw import assert_as_exact_as_the_reference
+from reference_error import as_given, assert_as_exact, widened
 
 from dew.batch import TEXT_KEY
 from dew.data.dataset import DataPartition, Loader, replayed
