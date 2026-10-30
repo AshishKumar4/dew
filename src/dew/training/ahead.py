@@ -34,7 +34,7 @@ import pickle
 import time
 from collections.abc import Iterator, Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated
+from typing import TYPE_CHECKING
 
 import jax
 import jax.experimental.topologies as topologies
@@ -43,10 +43,10 @@ from jax.experimental import serialize_executable
 
 from dew._records import JSON, record
 from dew.batch import Batch
-from dew.nn.kernels.generation import GpuTarget, assumed, capability, gpu_target
+from dew.cache import uncached
+from dew.nn.kernels.generation import GpuTarget, assumed, capability, gpu_target, tpu
 from dew.nn.kernels.templates import report
 from dew.nn.sharding import Link
-from dew.registry import record_argument
 from dew.telemetry.instrumentation import StepFlops, step_flops
 from dew.training.profiling import pgle_runs
 
@@ -95,6 +95,13 @@ device_description_str: "{target.device_kind}"
 
 
 @functools.cache
+def compile_only_tpus(topology: str) -> tuple:
+    """The devices of the TPU `topology` ('v5e:4x4', as `jax.experimental.topologies` names one), none
+    attached: libtpu compiles a program over them on any host that holds it, as MaxText's train_compile
+    does, a mesh's collectives included, as for that topology's TPUs."""
+    return tuple(topologies.get_topology_desc(topology, "tpu").devices)
+
+
 def compile_only_gpus(generation: str, count: int = 1, capacity: int | None = None) -> tuple:
     """`count` compile-only devices of the CUDA `generation`, none attached: XLA's CUDA backend compiles a
     program over them, a mesh's collectives included, as for that many of the generation's GPUs.
@@ -108,7 +115,8 @@ def compile_only_gpus(generation: str, count: int = 1, capacity: int | None = No
 
 @dataclasses.dataclass(frozen=True)
 class AheadOfTime:
-    """A training step compiled for `devices` GPUs of `generation` (`compile_ahead`): the executable,
+    """A training step compiled for `devices` devices of `generation` (`compile_ahead`), compile-only
+    GPUs of a CUDA generation or a TPU topology's of its chip ('v5e'): the executable,
     serialized, the program it was compiled from (`program`, `program_of`), and what it costs.
     `flops` are its matmuls' and convolutions' on one device, read off its optimized program as a
     run's are (`dew.telemetry.instrumentation.step_flops`, which
@@ -188,12 +196,12 @@ class AheadOfTime:
         return loaded
 
     def loaded(self) -> jax.stages.Compiled:
-        """The executable, loaded onto this process's devices, which must be `devices` GPUs of
+        """The executable, loaded onto this process's devices, which must be `devices` GPUs or TPUs of
         `generation`: called with the state and batch the step was compiled for, it runs the step."""
         found = jax.devices()
         generations = {gpu_target(device.device_kind).generation for device in found}
         if len(found) != self.devices or generations != {self.generation}:
-            raise ValueError(f"this step was compiled for {self.devices} {self.generation} GPUs; this "
+            raise ValueError(f"this step was compiled for {self.devices} {self.generation} devices; this "
                              f"process has {len(found)} of {sorted(generations)}")
         in_tree, out_tree = self.trees
         return serialize_executable.deserialize_and_load(self.executable, in_tree, out_tree,
@@ -201,12 +209,12 @@ class AheadOfTime:
 
 
     def derived_for(self, device: GpuTarget) -> GpuTarget:
-        """The facts a run on a GPU of `device`'s facts derives its launches for while it reproduces this
-        program (`handed`): the target it was compiled for (`target`), which the GPU runs where it is of
-        its generation and holds at least the shared memory a block of its launches takes, both known.
-        Refused for any other, on which the program's launches are not known to run."""
-        held = device.shared_limit is not None and self.target.shared_limit is not None and (
-            device.shared_limit >= self.target.shared_limit)
+        """The facts a run on a device of `device`'s facts derives its launches for while it reproduces
+        this program (`handed`): the target it was compiled for (`target`), which the device runs where
+        it is of its generation and, a GPU, holds at least the shared memory a block of its launches
+        takes, both known. Refused for any other, on which the program's launches are not known to run."""
+        held = tpu(self.target) or (device.shared_limit is not None and self.target.shared_limit is not None
+                                    and device.shared_limit >= self.target.shared_limit)
         if device.generation != self.target.generation or not held:
             raise ValueError(f"the step was compiled ahead for {self.target.device_kind} "
                              f"({self.target.generation}, {self.target.shared_limit} bytes of shared memory "
@@ -250,26 +258,34 @@ def program_of(lowered: jax.stages.Lowered) -> str:
 class AheadTarget:
     """Where a configured run compiles its first step ahead and saves it, then exits, training nothing
     (`TrainerConfig.compile_ahead`): for `devices` GPUs of the CUDA `generation` (`compile_only_gpus`),
-    which this host need not have, written to `path` (`AheadOfTime.save`). Where `capacity_gib` states
-    each GPU's memory, the run's own plan there is made and reported with it (`compile_ahead`): the
-    offline answer to what fits, a run with its remat set told of no rung but its own."""
+    or the `devices` TPUs of the TPU topology it names ('v5e:4x4', `compile_only_tpus`), which this host
+    need not have, written to `path` (`AheadOfTime.save`). Where `capacity_gib` states each GPU's memory,
+    the run's own plan there is made and reported with it (`compile_ahead`): the offline answer to what
+    fits, a run with its remat set told of no rung but its own; a TPU states its own. The links it
+    compiles with are the run's (`TrainerConfig.links`), which no compile-only device measures."""
 
     generation: str
     devices: int
     path: str
     capacity_gib: float | None = None
-    links: Annotated[Mapping[str, Link], record_argument(Mapping[str, Link])] = dataclasses.field(
-        default_factory=dict)
-    """The links of the split axes the step is compiled over, by axis name (`Trainer`'s `links`), which
-    no compile-only GPU measures: an axis it names spreads a projection as that link would, and the run
-    handed the step traces with it (`AheadOfTime.links`), `--trainer.compile-ahead.links
-    '{"tensor": {"bytes_per_second": 4.5e11, "flops_per_second": 9.9e14}}'`. Unnamed, an axis spreads
-    nothing."""
 
     @property
     def capacity(self) -> int | None:
         """The stated bytes per GPU, read both when building its topology and when planning."""
         return None if self.capacity_gib is None else int(self.capacity_gib * 2**30)
+
+    def compile_only(self) -> tuple:
+        """The compile-only devices the run's mesh is built over: the TPU topology's, which must hold
+        `devices`, or `devices` GPUs of the generation at the stated capacity."""
+        if ":" not in self.generation:
+            return compile_only_gpus(self.generation, self.devices, self.capacity)
+        if self.capacity_gib is not None:
+            raise ValueError(f"a TPU topology ({self.generation}) states its own memory; set no capacity")
+        devices = compile_only_tpus(self.generation)
+        if len(devices) != self.devices:
+            raise ValueError(f"the TPU topology {self.generation} holds {len(devices)} devices, not "
+                             f"{self.devices}")
+        return devices
 
     def compiled[LossT, EffectsT](self, trainer: Trainer[LossT, EffectsT], loader: Loader,
                                   steps: int | None, examples: int | None = None) -> CompiledAhead:
@@ -321,8 +337,9 @@ def step_batch[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch)
 
 def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch,
                                    capacity: int | None = None) -> AheadOfTime:
-    """`trainer`'s first step over a batch of `batch`'s shapes, compiled for the compile-only GPUs its
-    mesh is built over (`compile_only_gpus`) and never run. The planner `Trainer.compile` uses
+    """`trainer`'s first step over a batch of `batch`'s shapes, compiled for the compile-only devices its
+    mesh is built over, GPUs of one CUDA generation (`compile_only_gpus`) or a TPU topology's
+    (`compile_only_tpus`), and never run. The planner `Trainer.compile` uses
     (`Trainer._compiled_plan`) selects and compiles the step once; that executable is serialized, not compiled
     again. Its batch is what `fit` hands to its step (`step_batch`), its fresh state abstract, and
     tracing reads the target's kernel choices (`assumed`). The plan reports every compile and the
@@ -336,11 +353,17 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
         raise ValueError("compile-ahead cannot run kernel tuning or AutoPGLE on absent GPUs")
     devices = list(trainer.device_mesh.devices.flat)
     generations = {gpu_target(device.device_kind).generation for device in devices}
-    if {device.platform for device in devices} != {"gpu"} or len(generations) != 1:
-        raise ValueError("compile_ahead compiles for the compile-only GPUs of one generation a trainer's "
-                         "mesh is built over (MeshSpec.build(compile_only_gpus(generation, count))); this "
-                         f"mesh holds {sorted({device.device_kind for device in devices})}")
+    platforms = {device.platform for device in devices}
+    if platforms not in ({"gpu"}, {"tpu"}) or len(generations) != 1:
+        raise ValueError("compile_ahead compiles for the compile-only devices of one generation a trainer's "
+                         "mesh is built over (MeshSpec.build(compile_only_gpus(generation, count)), or a TPU "
+                         f"topology's, compile_only_tpus(topology)); this mesh holds "
+                         f"{sorted({device.device_kind for device in devices})}")
     (generation,) = generations
+    on_tpus = platforms == {"tpu"}
+    if capacity is not None and on_tpus:
+        raise ValueError(f"a TPU topology states its own memory; compile it ahead for {generation} with no "
+                         "capacity")
     if capacity is not None:
         mesh = trainer.device_mesh
         devices = compile_only_gpus(generation, len(devices), capacity)
@@ -348,7 +371,9 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
             np.asarray(devices).reshape(mesh.devices.shape), mesh.axis_names, axis_types=mesh.axis_types)
     began = time.perf_counter()
     start = trainer._started()
-    with assumed(generation):
+    # A TPU topology's executable loads onto no client here: the persistent cache neither reads an entry
+    # for it nor writes one (`dew.cache.uncached`).
+    with assumed(generation), uncached() if on_tpus else contextlib.nullcontext():
         target = gpu_target()
         planned = trainer._compiled_plan(start.abstract, step_batch(trainer, batch), None, capacity)
     seconds = time.perf_counter() - began
