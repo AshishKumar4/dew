@@ -1,12 +1,14 @@
 """The products one request of a saved run's task multiplies, in a fresh interpreter of its own, for
 tests/saved_run_kinds.py's `computed`: `python tests/saved_run_products.py <run directory> [<step>]`
-prints, as JSON, each module path's dtypes (`products`).
+prints, as JSON, each module's dtypes by its variable scope's path (`products`).
 
 The task loads at the step named, else its run's default, and answers one request (`answered`) with
 JAX writing the StableHLO of each program it lowers (`jax_dump_ir_to`): a fresh process holds no
-program another task compiled, so every one lowers. Each module is parsed into MLIR objects, and each
-`stablehlo.dot_general` read for its operands' element types and the module path its location's name
-stack states."""
+program another task compiled, so every one lowers. Each Flax module method the request runs is
+intercepted (`flax.linen.intercept_methods`) to name its scope in the name stack (`SCOPE`): the path
+of the variables it reads, a shared scope's its owner's, whatever its class or method. Each module is
+parsed into MLIR objects, and each `stablehlo.dot_general` read for its operands' element types and
+the innermost scope its location names."""
 
 import json
 import re
@@ -15,6 +17,7 @@ import tempfile
 from pathlib import Path
 
 import jax
+from flax import linen as nn
 from jax.extend.mlir import ir
 from jax.interpreters import mlir
 from saved_run_kinds import answered
@@ -25,21 +28,27 @@ from dew.registry import objectives
 NAMED = re.compile(r'loc\("([^"]*)"')
 """A location's name stack, which an operation's printed location leads with."""
 
-CONTROL = re.compile(r"while|body|cond|scan|eval_jaxpr|checkpoint|remat|rematted_computation|branch_\d+_fun")
-"""The name stack's segments JAX's own control flow and transforms push, no module's."""
+SCOPE = "scope|"
+"""What a module's name-stack segment begins with: its variable scope's path follows, joined by `|`."""
 
 DTYPES = {"bf16": "bfloat16", "f16": "float16", "f32": "float32", "f64": "float64"}
 """The dtype each MLIR element type names."""
 
 
+def scoped(next_fun, args, kwargs, context):
+    """A module method run under a name naming its variable scope's path (`SCOPE`)."""
+    scope = context.module.scope
+    with jax.named_scope(SCOPE + "|".join(() if scope is None else scope.path)):
+        return next_fun(*args, **kwargs)
+
+
 def module_path(location: ir.Location) -> str:
-    """The module path a product's location names: its name stack's module scopes, each an identifier
-    that is neither a method's (`module._method`), a transform's (`jit(...)`, an einsum's subscripts) nor
-    JAX's control flow (`CONTROL`), its primitive's last segment dropped."""
+    """The variable scope of the innermost module a product's location names (`scoped`), its path
+    joined by `/`; empty where it runs in none."""
     named = NAMED.match(str(location))
-    segments = [] if named is None else named.group(1).split("/")[:-1]
-    return "/".join(segment for segment in segments
-                    if segment.isidentifier() and CONTROL.fullmatch(segment) is None)
+    segments = [] if named is None else named.group(1).split("/")
+    scopes = [segment.removeprefix(SCOPE) for segment in segments if segment.startswith(SCOPE)]
+    return scopes[-1].replace("|", "/") if scopes else ""
 
 
 def products(modules: list[str]) -> dict[str, list[str]]:
@@ -69,7 +78,8 @@ def main(directory: str, step: int | None) -> None:
     loaded = task.from_run(directory) if step is None else task.from_run(directory, step=step)
     with tempfile.TemporaryDirectory() as dump:
         jax.config.update("jax_dump_ir_to", dump)
-        answered(loaded)
+        with nn.intercept_methods(scoped):
+            answered(loaded)
         jax.config.update("jax_dump_ir_to", "")
         print(json.dumps(products([path.read_text() for path in sorted(Path(dump).glob("*.mlir"))])))
 

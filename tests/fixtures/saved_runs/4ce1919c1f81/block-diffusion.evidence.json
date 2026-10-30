@@ -2,64 +2,19 @@
  "step": 2,
  "compute": "float32",
  "products": {
-  "DiffusionGemma": [
+  "": [
    "float64"
   ],
-  "DiffusionGemma/decoder": [
+  "self_conditioning/down_proj": [
    "float64"
   ],
-  "DiffusionGemma/decoder/layers_0/mlp/down_proj": [
+  "self_conditioning/gate_proj": [
    "float64"
   ],
-  "DiffusionGemma/decoder/layers_0/mlp/gate_proj": [
+  "self_conditioning/up_proj": [
    "float64"
   ],
-  "DiffusionGemma/decoder/layers_0/mlp/up_proj": [
-   "float64"
-  ],
-  "DiffusionGemma/decoder/layers_0/self_attn": [
-   "float64"
-  ],
-  "DiffusionGemma/decoder/layers_0/self_attn/k_proj": [
-   "float64"
-  ],
-  "DiffusionGemma/decoder/layers_0/self_attn/o_proj": [
-   "float64"
-  ],
-  "DiffusionGemma/decoder/layers_0/self_attn/q_proj": [
-   "float64"
-  ],
-  "DiffusionGemma/decoder/layers_0/self_attn/v_proj": [
-   "float64"
-  ],
-  "DiffusionGemma/decoder/layers_1/mlp/down_proj": [
-   "float64"
-  ],
-  "DiffusionGemma/decoder/layers_1/mlp/gate_proj": [
-   "float64"
-  ],
-  "DiffusionGemma/decoder/layers_1/mlp/up_proj": [
-   "float64"
-  ],
-  "DiffusionGemma/decoder/layers_1/self_attn": [
-   "float64"
-  ],
-  "DiffusionGemma/decoder/layers_1/self_attn/k_proj": [
-   "float64"
-  ],
-  "DiffusionGemma/decoder/layers_1/self_attn/o_proj": [
-   "float64"
-  ],
-  "DiffusionGemma/decoder/layers_1/self_attn/q_proj": [
-   "float64"
-  ],
-  "DiffusionGemma/self_conditioning/feed_forward/down_proj": [
-   "float64"
-  ],
-  "DiffusionGemma/self_conditioning/feed_forward/gate_proj": [
-   "float64"
-  ],
-  "DiffusionGemma/self_conditioning/feed_forward/up_proj": [
+  "text": [
    "float64"
   ],
   "text/layers_0/mlp/down_proj": [
@@ -86,7 +41,25 @@
   "text/layers_0/self_attn/v_proj": [
    "float64"
   ],
+  "text/layers_1/mlp/down_proj": [
+   "float64"
+  ],
+  "text/layers_1/mlp/gate_proj": [
+   "float64"
+  ],
+  "text/layers_1/mlp/up_proj": [
+   "float64"
+  ],
+  "text/layers_1/self_attn": [
+   "float64"
+  ],
   "text/layers_1/self_attn/k_proj": [
+   "float64"
+  ],
+  "text/layers_1/self_attn/o_proj": [
+   "float64"
+  ],
+  "text/layers_1/self_attn/q_proj": [
    "float64"
   ]
  },

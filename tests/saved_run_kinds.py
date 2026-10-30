@@ -109,14 +109,14 @@ def stored(root: Path, drawn: bool) -> RunConfig:
 
 
 def computed(directory: Path | str, step: int | None = None) -> dict[str, list[str]]:
-    """Each module path's dtypes that one request of the task a saved run at `directory` loads, at `step`
-    or else its default, multiplies in: its products' operands' (`saved_run_products`), read in a fresh
-    interpreter, where every program the request runs lowers, as the corpus's writer reads them. A model
-    whose outer module states bfloat16 while one projection of its decoder computes in float32 states
-    float32 at that projection's path. The products are the suite's CPU's, in the suite's environment,
-    whose wide arithmetic multiplies a product summed in float32 in float64
-    (`dew.nn.precision.accumulated`); an accelerator lowers its own (bible §7 runs these files on the
-    CPU)."""
+    """Each module's dtypes, by its variable scope's path, that one request of the task a saved run at
+    `directory` loads, at `step` or else its default, multiplies in: its products' operands'
+    (`saved_run_products`), read in a fresh interpreter, where every program the request runs lowers, as
+    the corpus's writer reads them. A model whose outer module states bfloat16 while one projection of
+    its decoder computes in float32 states float32 at that projection's scope. The products are the
+    suite's CPU's, in the suite's environment, whose wide arithmetic multiplies a product summed in
+    float32 in float64 (`dew.nn.precision.accumulated`); an accelerator lowers its own (bible §7 runs
+    these files on the CPU)."""
     root = Path(__file__).resolve().parents[1]
     environment = {**os.environ, "PYTHONPATH": os.pathsep.join(
         [str(root / "src"), *filter(None, [os.environ.get("PYTHONPATH")])])}
