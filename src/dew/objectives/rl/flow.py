@@ -41,7 +41,7 @@ from dew.objectives.diffusion.objective import DiffusionObjective
 from dew.rl.advantage import group_normalised
 from dew.rl.surrogate import clipped_surrogate_terms
 from dew.sampling.flow import FlowSDE, FlowTrajectory, GaussianTransition
-from dew.sampling.guidance import CFG, Guidance, Walk, pair_of
+from dew.sampling.guidance import CFG, Guidance, Pair, Prediction, Walk, pair_of
 from dew.sampling.solvers import Euler, Solver
 
 from .sessions import ADVANTAGES_KEY, OLD_LOG_PROBS_KEY
@@ -260,15 +260,15 @@ class FlowGRPOObjective(DiffusionObjective):
         return _source(self.inputs, batch).shape[0]
 
 
-def observed(predicted, opened: tuple[str, ...], guidance: Guidance | None
-             ) -> tuple[tuple[jax.Array, jax.Array], Variables | None]:
+def observed(predicted: Prediction, opened: tuple[str, ...], guidance: Guidance | None
+             ) -> tuple[Pair, Variables | None]:
     """A walk's prediction as its pair and what its policy's call opened (`Denoiser.observed`), None where
     the walk's denoiser opens nothing; refused by name where a guidance returns a bare pair over an opened
     denoiser, which the `Guidance` protocol asks it not to."""
     if not opened:
-        return predicted, None
+        return pair_of(predicted), None
     pair, sown = predicted
-    if not isinstance(sown, Mapping):
+    if not isinstance(pair, tuple) or not isinstance(sown, Mapping):
         raise TypeError(f"{type(guidance).__name__}'s prediction over an opened denoiser returns no "
                         "observation: read the model through raw_observed or raw_both_observed and return "
                         "denoise.observed(pair, sown) (dew.sampling.guidance.Guidance)")
