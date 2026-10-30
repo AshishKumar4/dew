@@ -91,6 +91,10 @@ final step: 10 latest: 10
 
 `steps` is the step to finish at, not a number of steps to add, so the second `fit(..., steps=10)` starts at step five and runs five more. `place()` returns the restored `TrainState`, its placement and the saved iterator position. Prefetching may read batches ahead of the loop, but the saved position is the last batch the loop consumed. The example writes into a temporary directory. For a run you want to keep, give it a directory of its own and pass that directory again on later calls.
 
+### A resume at image scale
+
+A run stopped and resumed from its checkpoint trains on exactly as an uninterrupted one does, at the scale an image model trains at. [tools/image_lifecycle.py](https://github.com/AshishKumar4/dew/blob/main/tools/image_lifecycle.py) trains examples/train_flowers.py's diffusion model on Oxford Flowers 102 at 256 pixels, batch 16, twice: 400 steps straight, and 200 steps, stopped, then resumed by a new process to 400; each samples 8 images at the end. Under XLA's deterministic GPU ops (`--xla_gpu_deterministic_ops=true`), on 2026-10-30 on one H100 (jax 0.12.0.1.post37), all 20 losses the two runs logged were equal, and their samples identical byte for byte. Without that flag the two runs agree to about 1e-4 in the loss, before the stop as after it: XLA's GPU reductions do not fix their order, so two runs of the same steps differ that much.
+
 ## Checkpoints
 
 `Checkpoints(directory, *, keep=2, local_directory=None, local_every=None)`:
