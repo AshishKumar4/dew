@@ -147,10 +147,27 @@ with report.refusals():
     state = run.fit(BATCH, steps=1, log_every=1)
     first, *_ = listed(record(run.plan, "plan")["probes"], "probes", read=record, what="probes")
     print(json.dumps({"step": int(state.step), "ahead": first["ahead"],
-                      "stepped": [miss.stepped for miss in report.misses()]}))
+                      "stepped": [miss.stepped for miss in report.misses()],
+                      "native_artifact": run.executable._executable_digest().hex()}))
 """
 """A run on this host's GPU, in a registry of its own, handed the step compiled ahead at argv[2], or
 none where it is empty."""
+
+
+def a_cached_spilling_run_trains_its_stepped_program(tmp_path, nonce):
+    """A restart over the same cache runs the stepped-down artifact, not the previously refused one.
+    Different compiler flags compile and judge their own native artifact, without inherited refusals.
+    """
+    shared, flags = tmp_path / "cache", os.environ.get("XLA_FLAGS", "")
+    first = fresh(PRELUDE + HANDED, str(nonce), "", cache_dir=shared, flags=flags)
+    again = fresh(PRELUDE + HANDED, str(nonce), "", cache_dir=shared, flags=flags)
+    assert first["step"] == again["step"] == 1
+    assert first["stepped"][:1] == again["stepped"][:1] == [True]
+    assert again["native_artifact"] == first["native_artifact"]
+    other = fresh(PRELUDE + HANDED, str(nonce), "", cache_dir=shared,
+                  flags=f"{flags} --xla_gpu_enable_latency_hiding_scheduler=true")
+    assert other["step"] == 1 and other["stepped"][:1] == [True]
+    assert other["native_artifact"] != first["native_artifact"]
 
 
 SCOPED = """
