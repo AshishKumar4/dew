@@ -346,14 +346,14 @@ def _ynn_decided(label: str, arms, inputs) -> None:
     one, which only YNNPACK's fusion runs: attention's XLA backward over a single key), every paired arm
     of the site takes the fusions, logged (`_logged_mode`) and named in its findings
     (`_with_mode`). One the fusions refuse too raises. An arm running Dew's own programs through Dew's
-    seam (`dew_programs`) compiles at its call, without them."""
-    paired = _paired_arms(arms)
-    pairings = {arm.pairing for arm in paired}
+    seam (`dew_programs`) compiles at its call, without them, as does a window loop's arm, whose program
+    takes each window's slices and not the draw (`over_windows`)."""
+    pairings = {arm.pairing for arm in _paired_arms(arms)}
     if not pairings or all(pairing.decided for pairing in pairings):
         return
     refused = None
-    for arm in paired:
-        if not hasattr(arm.without, "lower"):
+    for arm in arms:
+        if not isinstance(arm, _Paired) or not hasattr(arm.without, "lower"):
             continue
         try:
             arm.without.lower(*inputs).compile()
