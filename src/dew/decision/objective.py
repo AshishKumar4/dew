@@ -32,7 +32,7 @@ from dew.decision.rows import ConfigureLayout, Fit, PackedRows, QuestionRows, _r
 from dew.decision.scoring import LogLoss, ScoringRule
 from dew.decision.task import Budget, Decide, DecideSettings, Weights, laid_out, trained_tree, whole_blocks_of
 from dew.inference.loading import RunProcessor
-from dew.inference.projections import projection_groups
+from dew.inference.projections import declared_groups
 from dew.inference.tasks import Processor as TaskProcessor
 from dew.inputs import Field, InputSpec
 from dew.interop.processors import Processor
@@ -521,7 +521,7 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         (`dew.checkpoints`). Carried to 1.0, when it is deleted (ledger 1552)."""
         backbone = part(thaw(variables), "backbone")
         return tuple(dataclasses.replace(group, path=("backbone", *group.path))
-                     for group in projection_groups(self.model.backbone, backbone))
+                     for group in declared_groups(self.model.backbone, backbone))
 
     def recorded_model(self) -> nn.Module:
         """The backbone; the head is a task setting of its own."""

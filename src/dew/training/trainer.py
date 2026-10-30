@@ -630,8 +630,7 @@ class Trainer(Generic[Loss, Effects]):
     def place(self) -> tuple[TrainState, Placement[TrainState], bytes | None]:
         """Put the state on the mesh, fresh or restored, once `validate`'s checks pass.
 
-        It returns the state with its shardings and the data position a resume
-        continues from.
+        It returns the state with its shardings and the data position a resume continues from.
         """
         return self._placed(self._started(), positioned=True)
 
@@ -678,7 +677,8 @@ class Trainer(Generic[Loss, Effects]):
                     self.objective, abstract.variables,
                     lambda rows, path: jax.ShapeDtypeStruct((len(rows), *rows[0].shape), rows[0].dtype))})
         share = DataPartition.of(self.device_mesh) if positioned else None
-        state, position = checkpoints.restore(placed_shapes(abstract, shardings), resume, share=share)
+        state, position = checkpoints.restore(placed_shapes(abstract, shardings), resume, share=share,
+                                              served=self.objective.served_groups(abstract.variables))
         refuse_unclocked(state, resume, self._examples)
         if self._config is not None:
             # The rate this run configures, not the one its checkpoint holds.
