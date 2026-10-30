@@ -22,6 +22,7 @@ too (`ModelConfig.defaults`), so a default changed since leaves the record
 building what it built.
 """
 
+import contextvars
 import copy
 import dataclasses
 import datetime
@@ -83,7 +84,7 @@ from dew.registry import (
 )
 from dew.state import TrainState
 from dew.telemetry.records import RunRecord, TrialFinished, json_value, packages_installed
-from dew.training.ahead import AheadOfTime, AheadTarget, CompiledAhead, compile_only_gpus
+from dew.training.ahead import AheadOfTime, AheadTarget, CompiledAhead
 from dew.training.budget import Pause, Plateau, budget_tokens, run_length, run_steps
 from dew.training.cooldown import Cooldowns
 from dew.training.display import TrainingDisplay
@@ -589,15 +590,8 @@ class TrainerConfig:
     each of its Pallas kernels to Triton. A kernel that would fail the GPU's
     first compile there fails here, in seconds and without the GPU; XLA's
     compile of the whole step still needs one. The program exits with status
-    0 once the step lowers, and opens no W&B run.
-
-    A TPU topology, `--trainer.lower-for v5e:4x4` (as
-    `jax.experimental.topologies` names one), builds the run's mesh over that
-    topology's devices and compiles its first step for them on any host that
-    holds libtpu, as MaxText's train_compile does: the run saves the executable
-    in its checkpoint directory, `compiled-v5e-4x4`, with each device's memory
-    and work beside it (`compiled-v5e-4x4.json`, `dew.training._lowering.Lowered`),
-    and exits.
+    0 once the step lowers, and opens no W&B run. A TPU topology's step compiles ahead
+    (`compile_ahead`).
     """
     compile_ahead: Annotated[AheadTarget, tyro.conf.subcommand("ahead")] | None = None
     """Compile the run's first step for GPUs this host lacks, save it, then exit without training.
@@ -607,7 +601,9 @@ class TrainerConfig:
     H100s (`dew.training.ahead`), compiles its first step there with XLA's CUDA compiler, which needs
     the CUDA plugin and no GPU, and writes it with what it costs: each device's peak bytes and the
     step's FLOPs, read before booking the GPUs. The program exits with status 0, and writes no
-    checkpoint or tracking.
+    checkpoint or tracking. A TPU topology compiles the same way on any host that holds libtpu, as
+    MaxText's train_compile does: `--trainer.compile-ahead.generation v5e:4x4
+    --trainer.compile-ahead.devices 16`, the step loading on a host of that topology alone.
 
     `--trainer.compile-ahead.capacity-gib 80` states each GPU's memory, and the run's own fit search
     then plans the step there as a run would, its log and the saved step naming every program it
@@ -632,8 +628,8 @@ class TrainerConfig:
     """The links of the run's split axes, by axis name (`Trainer`'s `links`), stated where no process
     measures them as they are or should not: a step spreads an axis's projections as its stated link
     would, `--set trainer.links='{"tensor": {"bytes_per_second": 4.5e11, "flops_per_second": 9.9e14}}'`.
-    Unnamed, an axis's link is measured on its devices. A step compiled ahead states its target's own
-    (`AheadTarget.links`)."""
+    Unnamed, an axis's link is measured on its devices, and on compile-only ones none is: a step
+    compiled ahead compiles with these and records them (`AheadOfTime.links`)."""
     tune_kernels: bool = False
     """Measure each Pallas launch of the step that has no config measured on this GPU.
 
@@ -835,6 +831,19 @@ def _artifact_name(name: str) -> str:
     entry and a tracker artifact id take neither.
     """
     return re.sub(r"[^\w.-]", "-", name)
+
+
+_VIEWING: contextvars.ContextVar[bool] = contextvars.ContextVar("viewing", default=False)
+"""Set while a run is viewed offline (`RunConfig.inspected`): its `train` views one sampled update and
+ends there, training nothing (`_Viewed`)."""
+
+
+class _Viewed(Exception):
+    """What ends a run's `train` under `RunConfig.inspected`: the view it took (`RunConfig.viewed`)."""
+
+    def __init__(self, scalars: dict[str, float]):
+        super().__init__()
+        self.scalars = scalars
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1683,8 +1692,8 @@ class RunConfig:
         trainer = self.trainer
         if dataset.plan is not None:
             summary = {**(summary or {}), "data_plan": dataset.plan.record()}
-        if trainer.compile_ahead is not None:
-            raise self.compiled_ahead(objective, dataset, steps, rollout)
+        if trainer.compile_ahead is not None or _VIEWING.get():
+            raise self.ended(objective, dataset, steps, rollout, name)
         tracker = checkpoints = None
         try:
             wandb_tracker = None
@@ -1754,16 +1763,64 @@ class RunConfig:
             _closed(tracker, checkpoints, sys.exception())
 
     def compiled_ahead[LossT, EffectsT](self, objective: Objective[LossT, EffectsT], dataset: Loader,
-                                         steps: int | None, rollout: Rollout | None) -> CompiledAhead:
+                                         steps: int | None, rollout: Rollout | None,
+                                         name: str) -> CompiledAhead:
         """The run's first step compiled for its `compile_ahead` target and saved
-        (`AheadTarget.compiled`), its trainer built as `train` builds it, over that target's
-        compile-only GPUs, with no checkpoints or tracker: what ends a run that compiles ahead."""
+        (`AheadTarget.compiled`), its trainer built as `train` builds it, its links the run's own, over
+        that target's compile-only devices (`AheadTarget.compile_only`), with no tracker: what ends a run
+        that compiles ahead. A run `name` whose directory holds its checkpoints reads them, and compiles the
+        step its resume takes; one that has none writes none."""
         target = self.trainer.compile_ahead
         assert target is not None
-        mesh = self.trainer.mesh.build(compile_only_gpus(target.generation, target.devices, target.capacity))
+        mesh = self.trainer.mesh.build(target.compile_only())
+        held = epath.Path(self.trainer.checkpoint_dir, name).is_dir()
+        trainer = self.built(objective, mesh, rollout,
+                             checkpoints=self.trainer.checkpoints(name) if held else None)
         with generation.run_precision(self.trainer.precision):
-            return target.compiled(self.built(objective, mesh, rollout, links=target.links), dataset, steps,
-                                   self.trainer.examples if steps is None else None)
+            return target.compiled(trainer, dataset, steps, self.trainer.examples if steps is None else None)
+
+    def ended[LossT, EffectsT](self, objective: Objective[LossT, EffectsT], dataset: Loader,
+                                steps: int | None, rollout: Rollout | None,
+                                name: str) -> CompiledAhead | _Viewed:
+        """What ends a run before it trains: its first step compiled ahead (`compiled_ahead`), or, viewed
+        offline, its view (`viewed`, `inspected`)."""
+        if self.trainer.compile_ahead is not None:
+            return self.compiled_ahead(objective, dataset, steps, rollout, name)
+        return _Viewed(self.viewed(objective, dataset, steps, rollout, name))
+
+    def viewed[LossT, EffectsT](self, objective: Objective[LossT, EffectsT], dataset: Loader,
+                                 steps: int | None, rollout: Rollout | None, name: str) -> dict[str, float]:
+        """The run's inspection of one sampled update over its training data's first batch
+        (`dew.training.inspected`), its trainer built as `train` builds it, from the checkpoints its
+        directory `name` holds, their latest, else its start, with no tracker: what `inspected` returns."""
+        from dew.training import inspected
+        from dew.training._fit import first_batch
+
+        held = epath.Path(self.trainer.checkpoint_dir, name).is_dir()
+        trainer = self.built(objective, self.trainer.mesh, rollout,
+                             checkpoints=self.trainer.checkpoints(name) if held else None)
+        with generation.run_precision(self.trainer.precision):
+            trainer.reading(dataset, examples=self.trainer.examples if steps is None else None, steps=steps)
+            return inspected(trainer, first_batch(dataset, trainer.device_mesh), steps=steps)
+
+    def inspected(self) -> dict[str, float]:
+        """What the run's inspection (`TrainerConfig.inspection`) logs of one sampled update over its training
+        data's first batch, from its checkpoints' latest, else its start, offline (`viewed`): the view its
+        training logs, for a saved run, which this trains and writes nothing of (`dew inspect`)."""
+        from dew.training import prepare_process
+
+        trainer = self.trainer
+        if trainer.inspection is None:
+            raise ValueError("the run names no inspection to view; name one, as --set trainer.inspection=...")
+        prepare_process(None, trainer.multi_host, trainer.xla_flags, trainer.compilation_cache_dir)
+        token = _VIEWING.set(True)
+        try:
+            self.prepare().train(trainer.name or "inspected")
+        except _Viewed as view:
+            return view.scalars
+        finally:
+            _VIEWING.reset(token)
+        raise RuntimeError(f"{type(self).__name__} trained without its RunConfig.train, which views the run")
 
     def grouped(self, objective: Objective[Loss, Effects], name: str) -> OptimConfig:
         """The run's optimizer as it trains under `name`: each group it names that claims the modules its

@@ -103,7 +103,8 @@ def logged(inspected: Mapping[str, SupportsFloat]) -> dict[str, float]:
     return {f"inspect/{name}": float(value) for name, value in inspected.items()}
 
 
-def inspected(trainer: Trainer, batch: Batch, *, steps: int | None = None) -> dict[str, float]:
+def inspected[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch, *,
+                                steps: int | None = None) -> dict[str, float]:
     """The scalars `trainer`'s inspection logs, of one sampled update over `batch` from the state the
     trainer places, its checkpoints' latest where it has them, else its start: the view a live run
     logs, for a loaded run on one batch offline. A trainer that accumulates steps to the end of its window,
