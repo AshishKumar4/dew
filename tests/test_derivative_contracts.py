@@ -1233,8 +1233,8 @@ def half_squared_over(value, mean, variance):
 def test_a_transitions_quadratic_term_holds_every_order(edge):
     """`flow._half_mahalanobis` (a custom JVP whose tangent is the plain formula's, scaled to range): every
     order finite wherever float64 is a normal float32, past where the plain formula overflows, at values,
-    means and variances near float32's ends. A value equal to its mean, whose second forward derivative is NaN,
-    is ledger 2383's, whose head adds it."""
+    means and variances near float32's ends. A value equal to its mean, whose second forward derivative is
+    NaN, is ledger 2383's, whose head adds it."""
     from dew.sampling import flow
 
     value, mean = normal_draw(2283, (3, 4), (3, 4), scale=EDGES[edge])
