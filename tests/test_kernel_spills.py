@@ -117,7 +117,7 @@ def test_a_step_whose_launch_spills_is_compiled_ahead_at_its_next_config(tmp_pat
     ptxas, is refused that tile and lowered once more at the next, the miss recorded (`report.misses`)
     and its plan holding the spill and the refusal, as its telemetry reports them; the step it saves
     carries the refusal (`AheadOfTime.refusals`), and another process that starts from it derives past the
-    refused tile, which it never compiles."""
+    refused tile, which it never compiles, its plan recording its own refusals alone (train 329's review)."""
     step = str(tmp_path / "step.dew-aot")
     first = spilled(tmp_path, PRELUDE + AHEAD, str(nonce), step, "fresh")
     assert first["refusals"] and first["stepped"][:1] == [True]
@@ -125,7 +125,9 @@ def test_a_step_whose_launch_spills_is_compiled_ahead_at_its_next_config(tmp_pat
     assert [spill["config"] for spill in spills] == first["missed"] and spills[0]["stepped"]
     assert len(refused) == first["refusals"] and refused[0]["config"] == first["missed"][0]
     again = spilled(tmp_path, PRELUDE + AHEAD, str(nonce), step, "refused")
+    # Its plan records the refusals its own compiles made, not those it was seeded with.
     assert first["missed"][0] not in again["missed"]
+    assert first["missed"][0] not in [refusal["config"] for refusal in again["planned"]["refused"]]
 
 
 HANDED = """
@@ -152,6 +154,7 @@ none where it is empty."""
 
 SCOPED = """
 import json, sys
+from dew.nn.kernels.generation import assumed
 from dew.nn.kernels.templates import report
 from dew.training.ahead import AheadOfTime, handed
 
@@ -159,12 +162,13 @@ step = AheadOfTime.load(sys.argv[1])
 identity, config, names = step.refusals[0]
 foreign = (identity, config, frozenset({"another kernel"}))
 report.refuse([foreign])
-with handed(step):
+with assumed(step.target), handed(step):
     within = report.refused_launches()
 print(json.dumps({"within": sorted(map(repr, within)), "step": sorted(map(repr, step.refusals)),
                   "after": repr(foreign) in map(repr, report.refused_launches())}))
 """
-"""A process that refused a launch of another program, handed the step compiled ahead at argv[1]."""
+"""A process on the step's GPU (`AheadOfTime.target`) that refused a launch of another program, handed the
+step compiled ahead at argv[1]."""
 
 
 @lowers("sm90")
@@ -197,6 +201,50 @@ def pickle_load(path):
 """What the scripts share: the refusals a saved step carries."""
 
 
+@pytest.mark.gpu(reason="hands a step compiled ahead for the canonical H100 to a run on this host's H100")
+@lowers("sm90")
+def test_a_run_handed_a_step_compiled_ahead_for_another_h100_takes_it(tmp_path, nonce):
+    """A run in a fresh process handed a step compiled ahead for the canonical H100, whose launch's first
+    tile spilled, on this host's H100, which may count other multiprocessors (an H100 PCIe's 114 against
+    132), lowers the saved program: it derives its launches for the target the step was compiled for
+    (`AheadOfTime.target`), within the step's refusals, and trains from it, its plan's first compile
+    the step compiled ahead (ledger 2453)."""
+    step = str(tmp_path / "step.dew-aot")
+    spilled(tmp_path, PRELUDE + AHEAD, str(nonce), step, "fresh")
+    handed = spilled(tmp_path, PRELUDE + HANDED, str(nonce), step)
+    assert handed["step"] == 1 and handed["ahead"] is True
+
+
+def test_a_handed_step_derives_for_its_target_on_a_gpu_that_runs_it_alone():
+    """While a step compiled ahead is reproduced (`handed`), its launches derive for the GPU it was
+    compiled for (`AheadOfTime.target`), where this process's GPU is of its generation and holds a
+    block's shared memory its launches take, however many multiprocessors it counts; outside, the
+    process's own facts. A GPU of another generation, one holding less shared memory a block, or one
+    whose shared memory is unknown, is refused (ledger 2453)."""
+    import dataclasses
+
+    from dew.nn.kernels.generation import assumed, gpu_target
+    from dew.training.ahead import AheadOfTime, handed
+
+    canonical = gpu_target("sm90")
+    step = AheadOfTime("sm90", 1, {}, "", b"", (), None, 0, 0, 0, 0, 0, {}, canonical)
+    pcie = dataclasses.replace(canonical, device_kind="NVIDIA H100 PCIe", multiprocessors=114)
+    with assumed(pcie):
+        with handed(step):
+            assert gpu_target() == canonical
+        assert gpu_target() == pcie
+    # A step compiled ahead before steps recorded their GPU, unpickled with no target, is refused so too.
+    earlier = AheadOfTime("sm90", 1, {}, "", b"", (), None, 0, 0, 0, 0, 0, {})
+    vars(earlier).pop("target")
+    with assumed(pcie), pytest.raises(ValueError), handed(earlier):
+        pass
+    smaller = dataclasses.replace(pcie, shared_limit=canonical.shared_limit - 1)
+    unknown = dataclasses.replace(pcie, shared_limit=None)
+    for other in (gpu_target("sm80"), smaller, unknown):
+        with assumed(other), pytest.raises(ValueError), handed(step):
+            pass
+
+
 def test_a_program_runs_the_executable_its_calls_kernel_choice_traces():
     """A program (`dew.nn.kernels.options.program`) compiled through the reports keys its executables
     as jit does: called under the fast attention form and the accurate one in turn, it compiles each
@@ -218,6 +266,25 @@ def test_a_program_runs_the_executable_its_calls_kernel_choice_traces():
             expected = jax.jit(attend)(query)
         for output in outputs:
             np.testing.assert_array_equal(output, expected)
+
+
+def test_a_programs_calls_of_two_shapes_compile_at_once_from_two_threads():
+    """Two threads calling one program at two shapes each lower their own executable while the other
+    does, as jit's calls do: each tracing waits for the other's, which a call that held the program for
+    its whole compile would never reach (train 329's review: `Decide.compile_scoring`'s threads)."""
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    met = threading.Barrier(2, timeout=30)
+
+    def doubled(x):
+        met.wait()
+        return x * 2
+
+    run = program(doubled)
+    with ThreadPoolExecutor(2) as pool:
+        outputs = list(pool.map(run, (jnp.ones(2), jnp.ones(3))))
+    np.testing.assert_array_equal(outputs[1], jnp.full(3, 2.0))
 
 
 def test_a_program_is_its_jit_within_another_trace_and_keys_its_statics_as_jit_does():

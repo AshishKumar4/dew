@@ -96,6 +96,7 @@ from dew.inference.serving_kernel import (
     Paged,
     Placement,
     decode_programs,
+    dispatched,
     joined,
     mixed_refusal,
     opened,
@@ -596,7 +597,8 @@ class Server:
             formats, chosen = resident_formats(
                 model, self.variables, self.pad_id, rows.placement, decode_steps, shapes,
                 state_shardings(self.mesh, shapes), self._admitted, transforms, stopping, grammar)
-            self._step, self._admitting = decode_programs(formats, self._admitted, compiler_options(model))
+            self._step, self._admitting = map(dispatched, decode_programs(formats, self._admitted,
+                                                                          compiler_options(model)))
             if chosen is not None:
                 # The compile that chose the layout is the decoding step: compiling it again at the
                 # formats would repeat the server's largest compile (`resident_formats`).

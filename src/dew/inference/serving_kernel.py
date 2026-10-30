@@ -11,7 +11,7 @@ scheduler in `serving` only feeds and reads them.
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Hashable, Mapping
 
 import jax
 import jax.numpy as jnp
@@ -617,6 +617,25 @@ fresh buffers every call, so a command buffer is updated before it can
 replay, and the device waited out the update: on an RTX 4080 serving
 Qwen3-0.6B at 64 slots, about 5 ms before 9 of a run's 16 admitting steps
 (docs/performance.md). Only a GPU backend is handed them."""
+
+
+def dispatched(program: OuterProgram) -> Step:
+    """`program`, a server's step, as a `Step` that runs its executables (`OuterProgram.executable`), one
+    for each size of admission its bucketing pads to, called with the dynamic arguments alone: a server's
+    weights, cache and policies keep their shapes and placements from call to call, so no step's Python
+    walks them to build jit's dispatch key."""
+    executables: dict[Hashable, jax.stages.Compiled] = {}
+
+    def step(model, params, pad_id, placement, steps, resident, carried, admission, transforms, stopping,
+             grammar):
+        size = None if admission is None else tuple(jnp.shape(leaf) for leaf in jax.tree.leaves(admission))
+        executable = executables.get(size)
+        if executable is None:
+            executable = executables[size] = program.executable(
+                model, params, pad_id, placement, steps, resident, carried, admission, transforms, stopping,
+                grammar)
+        return executable(params, resident, carried, admission, transforms, stopping, grammar)
+    return step
 
 
 def decode_programs(formats: Formats, rows: NamedSharding | None, options: dict[str, Option]
