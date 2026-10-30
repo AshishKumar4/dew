@@ -9,7 +9,7 @@ from pathlib import Path
 import jax
 import numpy as np
 from interop_support import assert_reloads, fixture_ids, token_draw, transformers_arms, transformers_model
-from reference_error import assert_as_exact
+from reference_error import as_given, assert_as_exact
 
 from dew.interop import Pretrained, PretrainedDecoder
 from dew.interop.hf_decoders import translate_config
@@ -184,4 +184,5 @@ def test_images_and_a_video_read_through_the_processor_as_transformers_reads_the
         return (rng.integers(0, 256, (32, 32, 3), dtype=np.uint8),
                 rng.integers(0, 256, (2, 32, 32, 3), dtype=np.uint8))
 
-    assert_as_exact(dew, reference, draw, 'Qwen4-Exp media logits', seeds=MEDIA_SEEDS, truth_fn=truth)
+    assert_as_exact(as_given(dew), reference, draw, 'Qwen4-Exp media logits', seeds=MEDIA_SEEDS,
+                    truth_fn=truth)

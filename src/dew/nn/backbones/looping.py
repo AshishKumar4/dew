@@ -93,8 +93,13 @@ class PassStack:
                         {view._moved(name, view.offset - view.first): value
                          for name, value in entries.items() if _is_layer(name)})
                     entries = {name: value for name, value in entries.items() if not _is_layer(name)}
-                out[collection] = _appended(out.get(collection, {}), entries)
+                out[collection] = _merged(out.get(collection, {}), entries)
         return out
+
+
+def _merged(held: Mapping, sown: Mapping) -> dict:
+    """A collection's `held` entries with a pass's `sown` ones appended (`_appended`)."""
+    return {**held, **{name: _appended(held.get(name), value) for name, value in sown.items()}}
 
 
 def _appended(held, sown):
