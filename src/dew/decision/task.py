@@ -218,8 +218,9 @@ class Decide(SavedRunTask, InItsForm):
     """Answers typed questions about a state, with one forward pass per batch.
 
     `decide(state, questions)` returns one answer per question, with its
-    probabilities over exactly the question's options. `batch` answers many
-    requests together within the `budget`, `tournament` splits a choice too large
+    probabilities over exactly the question's options, and `decide(requests)`
+    each of many requests' answers, scored together within the `budget` in a
+    scoring server's passes (`RowScoring`), `tournament` splits a choice too large
     for one pass into rounds, `calibrated` fits the calibration to held-out
     examples, and `systemone` takes and returns TypeSafe Jev's wire format. The
     logits are divided by `calibration`'s temperatures, and each answer reports
@@ -496,38 +497,40 @@ class Decide(SavedRunTask, InItsForm):
             checkpoints.wait()
 
     @traced_in_its_form
+    @overload
     def __call__(self, state: JSON, questions: Mapping[str, Question], *,
-                 images: Sequence[Image.Image] = (), context: JSON | None = None) -> dict[str, Answer]:
-        """Return one answer per question in `questions`, about `state` and any `images`.
+                 images: Sequence[Image.Image] = (), context: JSON | None = None) -> dict[str, Answer]: ...
 
-        Images need a layout with a place for them (`Layout.images`) and the
-        backbone's processor, as a joint-head release brings. `context` is a
-        sequence the decision reads beside the state through the backbone's
-        cross-attention (`Example.context`).
+    @overload
+    def __call__(self, state: Sequence[tuple[JSON, Mapping[str, Question]]], questions: None = None, *,
+                 contexts: Sequence[JSON | None] | None = None) -> list[dict[str, Answer]]: ...
+
+    def __call__(self, state, questions=None, *, images=(), context=None, contexts=None):
+        """Return one answer per question in `questions`, about `state` and any `images`; or, given a
+        sequence of `(state, questions)` requests and no `questions`, each request's answers in order.
+
+        A call's rows are scored together within the budget, shortest first, in the passes a scoring
+        server runs and over its programs (`logits`), one path for a call and a server alike. Images
+        need a layout with a place for them (`Layout.images`) and the backbone's processor, as a
+        joint-head release brings. `context` is a sequence the decision reads beside the state through
+        the backbone's cross-attention (`Example.context`), and `contexts` each request's, in order.
         """
+        if questions is None:
+            return [answers for answers, _ in self._answered(self.rows(state, contexts=contexts),
+                                                             [asked for _, asked in state])]
         if images:
             return self._seen(state, questions, images, context)[0]
-        return self.batch([(state, questions)], contexts=[context])[0][0]
+        return self._answered(self.rows([(state, questions)], contexts=[context]), [questions])[0][0]
 
     def rows(self, requests: Sequence[tuple[JSON, Mapping[str, Question]]], *,
              contexts: Sequence[JSON | None] | None = None) -> list[list[Encoded]]:
-        """Each request's rows as `batch` scores them: its state and questions laid out, with its
+        """Each request's rows as a call scores them: its state and questions laid out, with its
         context (`contexts`, in order, or None for none) beside them."""
         contexts = [None] * len(requests) if contexts is None else list(contexts)
         if len(contexts) != len(requests):
             raise ValueError(f"{len(contexts)} contexts for {len(requests)} requests")
         return [self._encoded(state, questions, context=context)
                 for (state, questions), context in zip(requests, contexts, strict=True)]
-
-    def batch(self, requests: Sequence[tuple[JSON, Mapping[str, Question]]], *,
-              contexts: Sequence[JSON | None] | None = None) -> list[tuple[dict[str, Answer], Usage]]:
-        """Return each request's answers and usage.
-
-        The rows of every request are scored together within the budget. `contexts`
-        holds each request's context, in order (`__call__`), or None for none.
-        """
-        return self._answered(self.rows(requests, contexts=contexts),
-                              [questions for _, questions in requests])
 
     def _answered(self, encoded: Sequence[Sequence[Encoded]], asked: Sequence[Mapping[str, Question]]
                 ) -> list[tuple[dict[str, Answer], Usage]]:
@@ -543,12 +546,6 @@ class Decide(SavedRunTask, InItsForm):
         answers = {laid.name: self._answer(questions[laid.name], _ordered(laid, own[slot]))
                    for row, own in zip(rows, scores, strict=True) for slot, laid in enumerate(row.questions)}
         return {name: answers[name] for name in questions}, usage_of(rows)
-
-    def fits(self, rows: Sequence[Encoded]) -> bool:
-        """Whether `rows` are one of `logits`' passes: packed first-fit into the windows of a shape
-        (`pass_shapes`), as a run's windows pack them (`packing`)."""
-        plan = self.planned()
-        return all(plan.add(row) for row in rows)
 
     def planned(self) -> "PassPlan":
         """An empty pass, which takes rows one at a time while they fit (`PassPlan`): what a server
@@ -573,7 +570,7 @@ class Decide(SavedRunTask, InItsForm):
     def _shape(self, rows: Sequence[Encoded]) -> PassShape:
         """The shape of the pass over `rows` (`pass_shapes`): of the shortest length whose windows hold
         them all, the fewest such windows declared; else the most windows of the longest length, which
-        `fits` refuses. First-fit opens a window only where those before it have no room, so the
+        a plan refuses (`planned`). First-fit opens a window only where those before it have no room, so the
         windows it uses at a length are the same however many it may: one placement over the most a
         length declares gives the fewest that hold them."""
         plan = self.planned()
@@ -734,8 +731,8 @@ class Decide(SavedRunTask, InItsForm):
         return [futures[index].result() for index in range(len(rows))]
 
     def scored(self, rows: Sequence[Encoded], variables: Variables | None = None) -> list[np.ndarray]:
-        """Each of `rows`' raw `[Q, K]` logits from one pass over them all, which `fits` allows, over
-        `variables` (the task's own by default)."""
+        """Each of `rows`' raw `[Q, K]` logits from one pass over them all, which a plan takes
+        (`planned`), over `variables` (the task's own by default)."""
         return self._pass(rows, self.variables if variables is None else variables)
 
     def _pass(self, rows: Sequence[Encoded], variables: Variables | None = None,
@@ -756,8 +753,8 @@ class Decide(SavedRunTask, InItsForm):
         windows = first_fit_windows([model_row(row, options, self.context_length) for row in rows], pack)
         if len(windows) > shape.rows:
             raise ValueError(f"{len(rows)} rows pack into {len(windows)} windows of {shape.length} "
-                             f"tokens, more than the {shape.rows} the pass holds; `fits` says which rows "
-                             "a pass holds")
+                             f"tokens, more than the {shape.rows} the pass holds; a plan says which rows "
+                             "a pass holds (`planned`)")
         bounds = self._bounds[shape.length]
         in_context = self.layout.spans_in_context
         # A joint layout's windows hold their real options in as many slots as its bounds allow, as a
@@ -1169,7 +1166,7 @@ class _WirePlan:
 class _DecideScoring[RequestT, PayloadT, AnswerT](
         scoring.Scoring[RequestT, _Row, PayloadT, np.ndarray, AnswerT]):
     """A `Decide` task's passes as a scoring task's (`dew.inference.scoring.Scoring`): a pass is one
-    within the task's budget (`Decide.fits`) over text rows, or one over rows of images as long as each
+    within the task's budget (`Decide.planned`) over text rows, or one over rows of images as long as each
     other and of alike images (`Images.joined`), which `forward` runs over the weights it is handed;
     `decide` holds no weights. Every scoring of the task, a call's (`RowScoring`) and a server's of Jev
     bodies (`WireScoring`), runs these passes over the same compiled programs."""

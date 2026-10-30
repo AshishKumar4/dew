@@ -241,8 +241,8 @@ def attention_forms(call) -> set[str]:
 
 @pytest.mark.mesh(devices=8)
 def test_a_saved_decision_and_image_run_trace_their_helpers_in_their_form(tmp_path):
-    """A decision run recorded "accurate" scores a batch of requests in the accurate attention form
-    (`Decide.batch`, which its call does not run through), and an image run's prepared denoising inputs
+    """A decision run recorded "accurate" scores a call's requests in the accurate attention form
+    (`Decide`'s call over a sequence of requests), and an image run's prepared denoising inputs
     encode their conditions in it (`TextToImage.prepare`), each through a numerical helper its call
     shares (row 2255's review), as their routes say (`attention_forms`)."""
     from dew.decision import Choice
@@ -255,7 +255,7 @@ def test_a_saved_decision_and_image_run_trace_their_helpers_in_their_form(tmp_pa
                 trainer={"precision": ACCURATE_FORMS, "checkpoint_final": True})
     decide = Decide.from_run(str(tmp_path / "runs" / "decision"))
     question = {"team": Choice("which team", ["billing", "technical", "sales"])}
-    assert attention_forms(lambda: decide.batch([({"text": "the site is down"}, question)])) == {"accurate"}
+    assert attention_forms(lambda: decide([({"text": "the site is down"}, question)])) == {"accurate"}
     images = TextToImage.from_run(str(tmp_path / "runs" / "diffusion"))
     assert attention_forms(lambda: images.prepare(["a cat"], steps=2, key=5)) <= {"accurate"}
 

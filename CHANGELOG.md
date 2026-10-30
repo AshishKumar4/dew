@@ -5,6 +5,12 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- One entry point and one path for scoring decisions: `decide(state, questions)` answers a request and
+  `decide([(state, questions), ...], contexts=...)` many, their rows packed into the passes a scoring
+  server runs and over its compiled programs. `Decide.batch` and `Decide.fits` are gone; call the task
+  with the sequence. A scoring server's pass now looks at every waiting request while its plan takes
+  their rows (`ScoringServer(rows=None)`, the default), where it looked at 64 at most and left larger
+  shapes' windows part empty.
 - A float32 product with no stated precision follows JAX's configured precision
   (`jax_default_matmul_precision`), TF32 on recent GPUs as JAX documents, where Dew pinned it at
   `Precision.HIGHEST`; a model's `precision` field still sets its own. A float32 run on an A100 trained

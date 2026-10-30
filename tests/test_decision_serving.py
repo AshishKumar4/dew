@@ -259,12 +259,12 @@ def test_a_scoring_server_compiles_its_passes_up_front_and_none_while_it_serves(
         assert not compiled_while_serving(server)
 
 
-def test_a_batch_scores_in_a_servers_passes_over_the_programs_it_compiled(decide, caplog):
-    """`Decide.batch` scores its requests in the passes a scoring server runs (`RowScoring`, one path for
-    a call and a server): over a task whose budget declares its widths, after its passes' programs
-    compile up front (`compile_scoring`), a batch of requests of every length, question and option count
-    compiles no forward, and answers each as it answers it alone, in the fields a padded pass cannot
-    move."""
+def test_a_call_over_requests_scores_in_a_servers_passes_over_its_programs(decide, caplog):
+    """`Decide`'s call over requests scores them in the passes a scoring server runs (`RowScoring`, one
+    path for a call and a server, ledger 2514): over a task whose budget declares its widths, after its
+    passes' programs compile up front (`compile_scoring`), requests of every length, question and option
+    count compile no forward, and each is answered as its lone call answers it, in the fields a padded
+    pass cannot move."""
     import logging
 
     from test_decision_batches import CASES
@@ -278,7 +278,7 @@ def test_a_batch_scores_in_a_servers_passes_over_the_programs_it_compiled(decide
                 for body in [*CASES.values(), REQUEST]]
     with jax.log_compiles(), caplog.at_level(logging.WARNING):
         caplog.clear()
-        together = declared.batch(requests)
+        together = declared(requests)
         compiled = [record.getMessage() for record in caplog.records
                     if record.getMessage().startswith("Compiling jit(logits)")]
     assert not compiled, compiled
@@ -287,9 +287,8 @@ def test_a_batch_scores_in_a_servers_passes_over_the_programs_it_compiled(decide
         return {name: (answer.kind, int(np.argmax(answer.probabilities)), answer.abstained)
                 for name, answer in answers.items()}
 
-    for request, (answers, _) in zip(requests, together, strict=True):
-        ((alone, _),) = declared.batch([request])
-        assert discrete(answers) == discrete(alone)
+    for (state, questions), answers in zip(requests, together, strict=True):
+        assert discrete(answers) == discrete(declared(state, questions))
 
 
 def test_a_scoring_pass_looks_at_every_waiting_request(decide):
@@ -300,7 +299,8 @@ def test_a_scoring_pass_looks_at_every_waiting_request(decide):
 
     single = {**REQUEST, "questions": dict(list(REQUEST["questions"].items())[:1])}
     questions = {name: Question.from_wire(wire) for name, wire in single["questions"].items()}
-    assert decide.fits([row for _ in range(100) for row in decide._encoded(single["state"], questions)])
+    plan = decide.planned()
+    assert all(plan.add(row) for _ in range(100) for row in decide._encoded(single["state"], questions))
     server = ScoringServer(*decide.scoring())
     futures = [server.submit(single) for _ in range(100)]
     server.step()
