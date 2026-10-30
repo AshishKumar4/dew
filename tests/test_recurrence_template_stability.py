@@ -7,8 +7,10 @@ decay's bound, aligned keys with the write gate near one, resets on chunks' edge
 long and fading memories, steep then mild decays), held as test_recurrence_stability holds the portable math:
 
 - finite wherever the recurrence a token at a time in float64 is;
-- check 1 (`assert_as_exact`): on par from float64 with its reference arm, the fla port where it runs the
-  form (the delta rule with a decay), else the portable math, in the call's 16-bit dtype.
+- check 1 (`assert_as_exact`): on par from float64 with its reference arm, in the call's 16-bit dtype: the fla
+  port where it runs the form (the delta rule with a decay), the port of mamba_ssm's kernels for Mamba2's
+  rated decay under the run's fast forms, whose numbers are mamba_ssm's (`mainloop._prepared`), else the
+  portable math.
 
 Natively on a GPU of a family the mainloop claims (`NATIVE`: interpreted, one case's check 1 outran the CPU
 tier's hour); off one, the CPU interprets each form's forward on the regimes that grow its tiles most for
@@ -81,9 +83,13 @@ def assert_finite(fn, truth, operands, regime: str) -> None:
 
 
 def reference_arm(hooks):
-    """The arm the template is held against for a form: the fla port where it runs it (the delta rule with a
-    decay), else the portable math, each in the call's dtype."""
-    return functools.partial(chunk_on, 'fla' if hooks.delta and hooks.decay != 'none' else 'xla', hooks)
+    """The arm the template is held against for a form, each in the call's dtype: the fla port where it runs
+    it (the delta rule with a decay), the port of mamba_ssm's kernels for the rated scan under the run's fast
+    forms (the template's 16-bit numbers then mamba_ssm's), else the portable math."""
+    if hooks.delta and hooks.decay != 'none':
+        return functools.partial(chunk_on, 'fla', hooks)
+    fast = hooks.rated and generation.numerics().forms == 'fast'
+    return functools.partial(chunk_on, 'pallas' if fast else 'xla', hooks)
 
 
 def template_trains(operands: Chunk, hooks) -> bool:
@@ -136,17 +142,21 @@ def test_the_template_stays_finite_and_on_par_where_chunked_forms_break(name, re
                     seeds=seeds, truth_fn=truth)
 
 
-def test_a_ragged_chunks_last_real_write_holds_the_final_memory_interpreted():
-    """The rated scan's 16-bit forward through the template under the decay bound, interpreted off a GPU, on
-    par with the portable math from float64 over check 1's fewest draws: its rows end in a ragged chunk (70
-    tokens), and its last real token's write, which weighs most under a steep decay, is held outside the
-    product as the portable math peels it; the padded last slot's put the final memory 2.0 times the
-    portable math's distance, interpreted and on an H100."""
+@pytest.mark.parametrize('forms', ['fast', 'accurate'])
+def test_a_ragged_chunks_last_real_write_holds_the_final_memory_interpreted(forms):
+    """The rated scan's 16-bit forward through the template under the decay bound, interpreted off a GPU,
+    under the run's `forms`, on par from float64 over check 1's fewest draws with its reference arm
+    (`reference_arm`): the port of mamba_ssm's kernels under the fast forms, whose numbers the template's
+    then are, the portable math under the accurate ones, which hold them in fp32. Its rows end in a ragged
+    chunk (70 tokens), and its last real token's write, which weighs most under a steep decay, is held
+    outside the product as the portable math peels it; the padded last slot's put the final memory 2.0
+    times the portable math's distance, interpreted and on an H100."""
     hooks = SITES['rated']
-    assert_as_exact(functools.partial(chunk_on, 'mosaic_gpu', hooks), reference_arm(hooks),
-                    lambda seed: (bf16(stressed(hooks, 'the decay bound', seed)[0], hooks),),
-                    'the template, rated under the decay bound, its forward', seeds=FEWEST_SEEDS,
-                    truth_fn=functools.partial(token_by_token, hooks))
+    with generation.run_precision(dataclasses.replace(generation.numerics(), forms=forms)):
+        assert_as_exact(functools.partial(chunk_on, 'mosaic_gpu', hooks), reference_arm(hooks),
+                        lambda seed: (bf16(stressed(hooks, 'the decay bound', seed)[0], hooks),),
+                        f'the template, rated under the decay bound, its forward ({forms} forms)',
+                        seeds=FEWEST_SEEDS, truth_fn=functools.partial(token_by_token, hooks))
 
 
 @pytest.mark.parametrize('name', SITES)

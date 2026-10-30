@@ -1582,7 +1582,8 @@ def _layout(batch: int, length: int, starts, max_segments: int | None, firsts=No
 def forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts=None,
             max_segments: int | None = None,
             scale: float | None = None, delta: bool = True, wide: bool = False,
-            family: mosaic.Family | None = None, interpret: bool = False, floor: float | None = None):
+            family: mosaic.Family | None = None, interpret: bool = False, floor: float | None = None,
+            rounded: bool = False):
     """The chunked rule's forward on this mainloop: `(o [B, T, HV, Dv], final [B, HV, Dk, Dv])` for `q`, `k`
     `[B, T, H, Dk]`, `v` `[B, T, HV, Dv]`, the natural log decay `g`, a head's `[B, T, HV]` (the gated delta
     rule) or a key dimension's `[B, T, HV, Dk]` (Kimi delta attention), the write gate `beta` `[B, T, HV]` and
@@ -1598,10 +1599,13 @@ def forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts=None
     registers a launch). Its states and output launches take `tiles` (the template's config,
     `templates.recurrence.template`), and its launches issue by `family`'s bundle (the device's, `family_of`,
     where None), interpreted where `interpret`. A decay a key dimension takes the layer's declared `floor`
-    (`per_key_refusal`)."""
+    (`per_key_refusal`). A `rounded` call without the delta rule (Mamba2's SSD, whose 16-bit numbers are
+    mamba_ssm's) passes its values between launches in the operands' dtype under the run's fast forms
+    (`_prepared`)."""
     out, final, _ = kept_forward(q, k, v, g, beta, h0, starts=starts, firsts=firsts,
                                  max_segments=max_segments, scale=scale, delta=delta, tiles=tiles, wide=wide,
-                                 family=family, interpret=interpret, floor=floor, keeps=False)
+                                 family=family, interpret=interpret, floor=floor, keeps=False,
+                                 rounded=rounded)
     return out, final
 
 
@@ -1609,14 +1613,16 @@ def kept_forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts
                  max_segments: int | None = None,
                  scale: float | None = None, delta: bool = True, wide: bool = False,
                  family: mosaic.Family | None = None, interpret: bool = False,
-                 floor: float | None = None, keeps: bool = True) -> tuple[jax.Array, jax.Array, tuple]:
+                 floor: float | None = None, keeps: bool = True,
+                 rounded: bool = False) -> tuple[jax.Array, jax.Array, tuple]:
     """`forward`'s `(o, final)` and what the fast backward takes rather than compute again (`gradients`'
     `inverse` and `kept`): each chunk's inverse under a decay a head (`_solved`'s, None otherwise or where
     the call `keeps` none, `forward`'s), as fla's backward keeps its `A`, and the launches' weighted keys,
     memories and corrected values, `(w, h, corrected)`, which the port keeps unless a remat rung recomputes
     them (`recurrence_chunk.RECOMPUTED`), the caller's choice."""
     run = _prepared(q, k, v, g, beta, h0, starts=starts, max_segments=max_segments, scale=scale, delta=delta,
-                    tiles=tiles, family=family, interpret=interpret, floor=floor, keeps=keeps, firsts=firsts)
+                    tiles=tiles, family=family, interpret=interpret, floor=floor, keeps=keeps, firsts=firsts,
+                    rounded=rounded)
     call, tiles = run.call, run.tiles
     o = _output(run.q, run.k, run.h, run.corrected, run.hi, run.lo, run.taken, call, tiles, scale=run.scale,
                 out_dtype=jnp.float32 if wide else run.dtype, scores=run.scores)
@@ -1657,7 +1663,8 @@ class _Run:
 
 def _prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles, family, interpret,
               firsts=None,
-              inverse=None, kept=None, floor: float | None = None, keeps: bool = True) -> _Run:
+              inverse=None, kept=None, floor: float | None = None, keeps: bool = True,
+              rounded: bool = False) -> _Run:
     """`forward`'s operands checked, padded and laid, and its launches before the output run: under a decay a
     head the solve's but where its `inverse` is given, and the weighted and states launches' but where their
     `kept` values, `(w, h, corrected)`, are (`kept_forward`'s; its final memory then None). The solve stores
@@ -1691,12 +1698,16 @@ def _prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles
     chunks, taken, sequences, laid, unlaid = _layout(batch, length, starts, max_segments, firsts)
     rows = chunks * CHUNK
     given = _Operand(rows, _parts(dtype), dtype)
-    # What the launches pass between them: the delta rule's in the operands' dtype, as fla's rounds it
-    # (the port is its reference); without the delta rule fp32, its three parts, as the portable math and
-    # mamba_ssm hold their scores, written values and memories (a 16-bit call's rounded to bf16 put the
-    # template's output 1.7 times and its final memory up to 540 times the portable math's distance from
-    # float64, on an H100 and interpreted).
-    held = given if delta else _Operand(rows, PARTS, jnp.dtype(jnp.float32))
+    # What the launches pass between them: the delta rule's in the operands' dtype, as fla's rounds it (the
+    # port is its reference). Without it, a `rounded` call's (the SSD's) under the run's fast forms
+    # (`generation.numerics`) in the operands' dtype too, as mamba_ssm rounds its scores and entered memories
+    # for its products (`_chunk_scan_fwd`'s `cb` and `prev_states`), its memory summed and passed in fp32: on
+    # an H100 Nemotron-H 4B's SSD forward took 0.581 ms against fp32's three parts' 2.031 and the port's
+    # 0.606, 30B's 0.249 against 0.593 and 0.229 (ssd-held-h100-fdab2424c). Else, and under the accurate
+    # forms, fp32's three parts, as the portable math holds them (a 16-bit call's rounded put the output 1.7
+    # times and the final memory up to 540 times the portable math's distance from float64).
+    fast = rounded and generation.numerics().forms == "fast"
+    held = given if delta or fast else _Operand(rows, PARTS, jnp.dtype(jnp.float32))
     call = _Call(heads, heads // k.shape[2], width, columns, rows, given, held, per_key, delta, family,
                  interpret, generation.gpu_target())
     hi, lo = prefix(laid(g).reshape(chunks, CHUNK, -1))
@@ -1732,7 +1743,8 @@ def _prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles
 
 def planned(q, k, v, g, beta, h0=None, *, tiles: Tiles, family: mosaic.Family, starts=None,
             max_segments: int | None = None, delta: bool = True, backward: bool = False,
-            floor: float | None = None, target: generation.GpuTarget | None = None) -> tuple[Launch, ...]:
+            floor: float | None = None, target: generation.GpuTarget | None = None,
+            rounded: bool = False) -> tuple[Launch, ...]:
     """The launches a call over operands of these shapes (`jax.ShapeDtypeStruct`s, `forward`'s) runs at
     `tiles` by `family`'s bundle on `target` (the device's, or the assumed one's, where None), in order, as
     planned (`Launch`): its arrays abstract (`jax.eval_shape`), its kernels declared and not built
@@ -1744,7 +1756,7 @@ def planned(q, k, v, g, beta, h0=None, *, tiles: Tiles, family: mosaic.Family, s
         try:
             out, final, (inverse, kept) = kept_forward(q, k, v, g, beta, h0, tiles=tiles, starts=starts,
                                                        max_segments=max_segments, delta=delta, family=family,
-                                                       floor=floor)
+                                                       floor=floor, rounded=rounded)
             if backward:
                 gradients(q, k, v, g, beta, h0, out, final, tiles=tiles, starts=starts,
                           max_segments=max_segments, family=family, inverse=inverse, kept=kept)
