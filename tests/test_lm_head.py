@@ -223,6 +223,7 @@ def test_a_batch_that_marks_its_real_rows_keeps_the_fused_head_and_counts_each_r
 
         def scalar(params, ids):
             # The second row a filled copy of the first.
+            ids = jnp.asarray(ids)
             stats, _ = objective.loss(params, {TEXT_KEY: ids.at[1].set(ids[0]), VALID_ROWS: real}, step)
             return objective.reduce_loss(stats)[0]
         return scalar
