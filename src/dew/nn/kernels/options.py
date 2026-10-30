@@ -15,6 +15,7 @@ import dataclasses
 import functools
 import threading
 from collections.abc import Callable, Hashable, Iterator, Mapping
+from concurrent.futures import Future
 from typing import TYPE_CHECKING, ClassVar, NamedTuple, Protocol, TypedDict, Unpack, runtime_checkable
 
 import jax
@@ -174,7 +175,8 @@ class OuterProgram:
             numbers, names = api_util.infer_argnums_and_argnames(signature, numbers, names)
         self.numbers = () if numbers is None else (numbers,) if isinstance(numbers, int) else tuple(numbers)
         self.names = frozenset(() if names is None else (names,) if isinstance(names, str) else names)
-        self._executables: collections.OrderedDict[Hashable, jax.stages.Compiled] = collections.OrderedDict()
+        self._executables: collections.OrderedDict[Hashable, Future[jax.stages.Compiled]] = (
+            collections.OrderedDict())
         self._compiling = threading.Lock()
 
     def _jitted(self) -> jax.stages.Wrapped:
@@ -190,14 +192,33 @@ class OuterProgram:
         if not jax_core.trace_state_clean() or jax_config.disable_jit.value:
             return self.jitted(*args, **kwargs)
         key, dynamic, named = self._keyed(args, kwargs)
+        return self._kept(key, args, kwargs)(*dynamic, **named)
+
+    def executable(self, *args, **kwargs) -> jax.stages.Compiled:
+        """The executable a call with these arguments runs, compiled at the first: called with the dynamic
+        arguments alone, as a caller that calls it every step does, building no dispatch key."""
+        key, _, _ = self._keyed(args, kwargs)
+        return self._kept(key, args, kwargs)
+
+    def _kept(self, key: Hashable, args: tuple, kwargs: dict) -> jax.stages.Compiled:
+        """The executable kept under `key`, compiled where none is (`compiled`): the map alone is held,
+        each key's compile a future its first caller sets, so calls of other keys compile at once."""
         with self._compiling:
-            executable = self._executables.get(key)
-            if executable is None:
-                executable = self._executables[key] = self.compiled(*args, **kwargs)
+            pending = self._executables.get(key)
+            owner = pending is None
+            if owner:
+                pending = self._executables[key] = Future()
                 if len(self._executables) > self.CACHED:
                     self._executables.popitem(last=False)
             self._executables.move_to_end(key)
-        return executable(*dynamic, **named)
+        if owner:
+            try:
+                pending.set_result(self.compiled(*args, **kwargs))
+            except BaseException as error:
+                with self._compiling:
+                    self._executables.pop(key, None)
+                pending.set_exception(error)
+        return pending.result()
 
     def compiled(self, *args, **kwargs) -> jax.stages.Compiled:
         """The program over these arguments compiled through the kernel templates' reports, lowered
