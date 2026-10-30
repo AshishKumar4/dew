@@ -45,6 +45,7 @@ from dew.objectives.base import Step
 from dew.objectives.rl.flow import FlowGRPOObjective, FlowRollout
 from dew.sampling import CFG, sample
 from dew.sampling.flow import FlowSDE, flow_transition
+from dew.sampling.guidance import Walk
 from dew.telemetry.records import RECORD_TYPES
 from dew.training import Trainer
 from tools.parity_flow_grpo import RECORDED, dew_transition, transition_inputs
@@ -1321,3 +1322,40 @@ def test_a_transitions_density_keeps_a_residual_whose_square_overflows():
     _, moved = jax.jvp(along_mean, (small.mean,), (jnp.ones((1, 1), jnp.float32),))
     np.testing.assert_array_equal(np.asarray(moved), 2.0 ** 90)
     np.testing.assert_array_equal(np.asarray(jax.grad(along_mean)(small.mean)), [[2.0 ** 90]])
+
+
+@pytest.mark.parametrize("guided", ["cfg", "autoguidance"])
+def test_a_watched_flow_step_reads_its_policys_own_first_call(guided):
+    """The inputs a watched Flow-GRPO step reruns its policy on are those its walk hands the policy model
+    at each trajectory's first transition, under a guidance that doubles the batch (CFG, conditional
+    and unconditional halves) and one whose main model holds its guide's weights out (autoguidance):
+    rerun on them, the model returns that call's own output, bit for bit (2317)."""
+    from dew.nn.inspection import called_with
+    from dew.sampling.guidance import Autoguidance
+
+    process = Process(FlowMatchingScheduler(), VPredictionTransform())
+    model, x, t = AffineVelocity(), jnp.ones((4, 2)), jnp.full((4,), 0.7)
+    offset = {"offset": jnp.full((4, 1), 0.3)}
+    own = model.init(jax.random.key(30), x, jnp.ones(4), **offset)
+    if guided == "cfg":
+        guidance, variables = CFG(2.0), own
+        policy = process.denoiser(model, variables, offset, {"offset": jnp.zeros((4, 1))})
+    else:
+        guidance = Autoguidance(2.0, AffineVelocity())
+        variables = {**own, "guide": AffineVelocity().init(jax.random.key(31), x, jnp.ones(4), **offset)}
+        policy = process.denoiser(model, variables, offset)
+    walk = Walk.over(policy, guidance, 4)
+    outputs = []
+
+    def kept(next_fun, args, kwargs, context):
+        output = next_fun(*args, **kwargs)
+        if not outputs and context.method_name == "__call__" and jax.tree.leaves(
+                context.module.scope.variables()) == jax.tree.leaves(own):
+            outputs.append(output)
+        return output
+
+    with nn.intercept_methods(kept):
+        walk.at((), 0)(x, t)
+    args, kwargs = called_with(model, own, lambda: walk.at((), 0)(x, t))
+    np.testing.assert_array_equal(model.apply(own, *args, **kwargs), outputs[0])
+    assert args[0].shape[0] == (8 if guided == "cfg" else 4)
