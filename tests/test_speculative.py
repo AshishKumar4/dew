@@ -79,27 +79,59 @@ def test_speculation_across_a_longrope_rebuild_reproduces_the_greedy_walk(kind):
     np.testing.assert_array_equal(np.asarray(speculated.lengths), 6)
 
 
+RESEED_SEEDS = 8
+"""The reseed's declared draws of prompts and stretches (check 1), sized by `seeds_for` paired with the
+crossed state on armada."""
+
+
 def test_a_longrope_crossing_reseeds_the_prediction_depth_as_a_prefill_of_its_history_does():
     """A verified stretch that crosses the table change leaves the decoder state a prefill of the whole
-    history leaves, bit for bit: the trunk's cache rebuilt at the long factors, the prediction depth's
-    cache reseeded over the history, and the last state and logits; the rows are marked rebuilt."""
+    history leaves: the trunk's cache rebuilt at the long factors, the prediction depth's cache
+    reseeded over the history, and the last state and logits, each as near the prefill's float64 run as
+    the prefill's own (check 1, over drawn prompts and stretches: the two compile apart, so their
+    roundings differ), its rows marked rebuilt."""
+    from reference_error import as_given, assert_as_exact, widened
+
     from dew.nn.inputs import ModelInputs
+    from dew.sampling.strategies import DecoderState
     from dew.sampling.text import decode_ops, prefill_state
 
     model = longrope_predictor()
-    prompts = jnp.asarray([[1, 2, 3], [7, 8, 9]], jnp.int32)
-    params = model.init(jax.random.key(0), prompts)
-    ops = decode_ops(model, params, 0, 1)
-    state, _ = prefill_state(model, params, ModelInputs(prompts), ops)
-    stretch = jnp.asarray([[4, 5, 6, 2], [3, 1, 2, 5]], jnp.int32)
-    crossed, _, _ = ops.verify(state, stretch, jnp.ones(stretch.shape, bool))
-    assert np.asarray(crossed.rebuilt).all()
-    history = jnp.zeros((2, model.max_seq_len), jnp.int32).at[:, :7].set(
-        jnp.concatenate([prompts, stretch], axis=1))
-    real = jnp.broadcast_to(jnp.arange(model.max_seq_len)[None, :] < 7, history.shape)
-    fresh, _ = prefill_state(model, params, ModelInputs(history, {"attention_mask": real}), ops)
-    jax.tree.map(np.testing.assert_array_equal, dataclasses.replace(crossed, rebuilt=None),
-                 dataclasses.replace(fresh, rebuilt=None))
+    params = model.init(jax.random.key(0), jnp.ones((2, 3), jnp.int32))
+    width = model.max_seq_len
+
+    def floats(state: DecoderState):
+        leaves = jax.tree_util.tree_leaves_with_path(dataclasses.replace(state, rebuilt=None))
+        return {jax.tree_util.keystr(path): np.asarray(leaf) for path, leaf in leaves
+                if jnp.issubdtype(leaf.dtype, jnp.floating)}
+
+    def prefilled(model, params, prompts, stretch):
+        joined = jnp.concatenate([prompts, stretch], axis=1)
+        history = jnp.zeros((2, width), jnp.int32).at[:, :7].set(joined)
+        real = jnp.broadcast_to(jnp.arange(width)[None, :] < 7, history.shape)
+        ops = decode_ops(model, params, 0, 1)
+        return floats(prefill_state(model, params, ModelInputs(history, {"attention_mask": real}), ops)[0])
+
+    @as_given
+    def crossed(prompts, stretch):
+        ops = decode_ops(model, params, 0, 1)
+        state, _ = prefill_state(model, params, ModelInputs(jnp.asarray(prompts)), ops)
+        after, _, _ = ops.verify(state, jnp.asarray(stretch), jnp.ones(stretch.shape, bool))
+        assert np.asarray(after.rebuilt).all()
+        return floats(after)
+
+    def truth(prompts, stretch):
+        with jax.enable_x64(new_val=True):
+            return prefilled(model.clone(dtype=jnp.float64), widened(params), jnp.asarray(prompts),
+                             jnp.asarray(stretch))
+
+    def draw(seed):
+        rng = np.random.default_rng([0x1899, seed])
+        return tuple(rng.integers(1, VOCAB, (2, width)).astype(np.int32) for width in (3, 4))
+
+    assert_as_exact(crossed, as_given(lambda prompts, stretch: prefilled(
+        model, params, jnp.asarray(prompts), jnp.asarray(stretch))), draw, "a LongRoPE crossing's reseed",
+        seeds=RESEED_SEEDS, truth_fn=truth)
 
 
 def test_an_eos_inside_a_block_ends_the_row_on_the_token_that_drew_it():
