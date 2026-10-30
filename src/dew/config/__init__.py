@@ -37,7 +37,7 @@ import typing
 from collections.abc import Callable, Mapping, Sequence
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, ClassVar, Literal, Self, TypedDict, Union
+from typing import TYPE_CHECKING, Annotated, ClassVar, Literal, Required, Self, TypedDict, Union
 
 import jax
 import tyro
@@ -45,7 +45,7 @@ from etils import epath
 
 import dew.io
 from dew import registry, training
-from dew._coordination import agree_process_phase, agreed
+from dew._coordination import agree_process_phase, agreed, agreed_same
 from dew._records import JSON, duration, is_share, recorded_duration
 from dew.cache import dew_cache_dir
 from dew.checkpoints import RUN_FILE, Checkpoints, Keep, Resume
@@ -56,12 +56,14 @@ from dew.data.dataset import Loader, Ramp, Reader, ramped
 from dew.data.pipeline import Dataset, ObjectiveData
 from dew.distributed.placement import Layout, MeshSpec
 from dew.files import write_atomically
+from dew.interop.weights import AUTO
 from dew.lora import LoRA
 from dew.nn.dex import DifferentialExtension
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import attention_route
+from dew.nn.precision import Numerics
+from dew.nn.sharding import Link
 from dew.objectives.base import Effects, Loss, Metric, Objective
-from dew.optim import OptimConfig
+from dew.optim import OptimConfig, ParamGroup
 from dew.quantization import Quantization
 from dew.registry import (
     Annotation,
@@ -256,6 +258,31 @@ def _flag_json(text: str) -> JSON:
     return None if text == "None" else json.loads(text)
 
 
+def recorded_param_groups(saved: epath.Path) -> tuple[ParamGroup, ...] | None:
+    """The param groups the run whose record is `saved` trained in, read alone: the rest of the record,
+    a data chain only its Python holds among it, may not rebuild here. () for a record written before
+    runs took groups; None where the record holds no optimizer, a run defined in Python without one."""
+    fields = json.loads(saved.read_text()).get("fields")
+    optim = fields.get("optim") if isinstance(fields, Mapping) else None
+    if not isinstance(optim, Mapping):
+        return None
+    held = optim.get("fields", optim)
+    groups = held.get("param_groups", []) if isinstance(held, Mapping) else []
+    return from_record(tuple[ParamGroup, ...], groups)
+
+
+def trained_modules(objective: Objective[Loss, Effects], modules: Sequence[str]) -> tuple[str, ...]:
+    """Those of `modules`, paths under `params`, that hold a parameter `objective` trains, as its tree
+    is drawn (`Objective.init`, its shapes alone): a tied readout is drawn with none."""
+    if not modules:
+        return ()
+    from dew.optim import parameter_name
+
+    trained = jax.eval_shape(lambda: objective.init(jax.random.key(0)))["params"]
+    names = [parameter_name(path) for path, _ in jax.tree_util.tree_leaves_with_path(trained)]
+    return tuple(module for module in modules if any(name.startswith(f"{module}/") for name in names))
+
+
 def _best_argument():
     """A metric name or JSON policies through one CLI argument."""
     def read(given):
@@ -393,8 +420,11 @@ class SourceBuild(TypedDict, total=False):
 
 
 class SourceOptionsKeywords(SourcePlacement, SourceBuild, total=False):
-    """`Pretrained.load`'s keywords for a run's source: what it builds of it (`SourceOptions`) and
-    where it reads it (`SourcePlacement`, `RunConfig.source_keywords`)."""
+    """`Pretrained.load`'s keywords for a run's source: what it builds of it (`SourceOptions`), where
+    it reads it (`SourcePlacement`) and the dtype it stores its parameters in
+    (`RunConfig.source_keywords`)."""
+
+    param_dtype: Required[str]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -496,11 +526,16 @@ class TrainerConfig:
     way there is one optimizer update a step, and the compiled step is traced
     once per stage.
     """
-    dynamic_scale: bool = False
-    attention_form: Literal["fast", "accurate"] = "fast"
-    """The form the attention template computes in (`dew.nn.kernels.templates.attention_route`):
-    "accurate" takes its accurate products, at their cost, for every attention the run traces, the
-    step and its evaluations, and a resumed run traces in the form it records."""
+    precision: Numerics = dataclasses.field(default_factory=Numerics)
+    """The run's numerics, set once and recorded with it (`dew.nn.precision.Numerics`; `ACCURATE` for
+    scientific runs): its dtypes by Lightning's names, its products' precision by JAX's levels and its
+    ops' forms, over every program it traces, the step and its evaluations
+    (`dew.nn.kernels.generation.run_precision`). Its compute dtype is the model's where the model's
+    record states none (`RunConfig.numerics_fields`), its parameters' a loaded checkpoint's storage, and
+    a float16 compute scales the loss (`RunConfig.built`). The optimizer's moments are a storage format
+    of their own (`OptimConfig.state_dtype`: float32 under any weights, bfloat16 stochastically rounded,
+    int8 blockwise). A dtype or precision the model states still wins, and a resumed run traces under
+    the numerics it records."""
     mesh: MeshSpec = dataclasses.field(default_factory=MeshSpec)
     microbatches: int | None = None
     """Microbatches a pipelined step feeds through the mesh's stages, a
@@ -524,7 +559,7 @@ class TrainerConfig:
     Scalars, records and objective previews are tracked; checkpoints are not uploaded.
     """
     publish: bool = False
-    """Publish the final checkpoint to W&B; requires `wandb` and `checkpoint_final`."""
+    """Publish the final checkpoint to W&B; requires `wandb`, online, and `checkpoint_final`."""
     multi_host: bool | None = None
     """Whether to join the JAX process pool.
 
@@ -554,6 +589,14 @@ class TrainerConfig:
     first compile there fails here, in seconds and without the GPU; XLA's
     compile of the whole step still needs one. The program exits with status
     0 once the step lowers, and opens no W&B run.
+
+    A TPU topology, `--trainer.lower-for v5e:4x4` (as
+    `jax.experimental.topologies` names one), builds the run's mesh over that
+    topology's devices and compiles its first step for them on any host that
+    holds libtpu, as MaxText's train_compile does: the run saves the executable
+    in its checkpoint directory, `compiled-v5e-4x4`, with each device's memory
+    and work beside it (`compiled-v5e-4x4.json`, `dew.training._lowering.Lowered`),
+    and exits.
     """
     compile_ahead: Annotated[AheadTarget, tyro.conf.subcommand("ahead")] | None = None
     """Compile the run's first step for GPUs this host lacks, save it, then exit without training.
@@ -579,6 +622,13 @@ class TrainerConfig:
     program, on a host of the topology it was compiled for; another program, from another config,
     data shape, Dew or a plan recorded for another rung, is refused before the run trains.
     """
+    links: Annotated[Mapping[str, Link], record_argument(Mapping[str, Link])] = dataclasses.field(
+        default_factory=dict)
+    """The links of the run's split axes, by axis name (`Trainer`'s `links`), stated where no process
+    measures them as they are or should not: a step spreads an axis's projections as its stated link
+    would, `--set trainer.links='{"tensor": {"bytes_per_second": 4.5e11, "flops_per_second": 9.9e14}}'`.
+    Unnamed, an axis's link is measured on its devices. A step compiled ahead states its target's own
+    (`AheadTarget.links`)."""
     tune_kernels: bool = False
     """Measure each Pallas launch of the step that has no config measured on this GPU.
 
@@ -612,9 +662,9 @@ class TrainerConfig:
             raise ValueError("--trainer.split reads each step's batch in that many microbatches, at least 1")
         if self.publish and (self.wandb is None or not self.checkpoint_final):
             raise ValueError("trainer.publish requires trainer.wandb and trainer.checkpoint_final")
-        if self.attention_form not in attention_route.FORMS:
-            raise ValueError(f"--trainer.attention-form is one of the template's forms "
-                             f"{attention_route.FORMS}, not {self.attention_form!r}")
+        if self.publish and self.wandb is not None and self.wandb.offline:
+            raise ValueError("trainer.publish links the final checkpoint into W&B's registry, which an "
+                             "offline W&B run cannot reach; track online to publish")
         run_length(self.steps, self.epochs, self.tokens, self.examples, required=False)
         if isinstance(self.log_every, str) and not is_share(self.log_every):
             raise ValueError(f"--trainer.log-every is steps or a share such as 1%, not {self.log_every!r}")
@@ -626,9 +676,6 @@ class TrainerConfig:
             object.__setattr__(self, 'checkpoint_every', duration(self.checkpoint_every))
         if isinstance(self.keep, Mapping):
             object.__setattr__(self, 'keep', from_record(Keep, self.keep, dtypes=False))
-        if isinstance(self.stop, Mapping) and "class" not in self.stop:
-            # A record written while `stop` held a Pause alone names no class: its fields are a Pause's.
-            object.__setattr__(self, 'stop', from_record(Pause, self.stop, dtypes=False))
         if isinstance(self.keep, Keep) and self.keep.where is not None:
             raise TypeError("Keep.where is code-only; a recorded retention policy contains no callable")
         if self.best is not None:
@@ -861,6 +908,51 @@ def _unrecorded(value: Dataset | Mapping[str, Dataset] | None) -> list[str]:
         return [reason for split in value.values() for reason in _unrecorded(split)]
     encoded = records.encode(value)
     return [encoded.reason] if isinstance(encoded, records.Unrecorded) else []
+
+
+def takes_dtype(model: ModelConfig) -> bool:
+    """Whether `model`'s class takes a compute `dtype`, as a Flax module does."""
+    from dew.registry import imported, member_fields, models
+
+    owner = models[model.name] if model.name in models.paths else imported(model.name)
+    return isinstance(owner, type) and any(name == "dtype" for name, _, _ in member_fields(owner))
+
+
+def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
+    """A saved run's record (its run.json, `{"class": ..., "fields": ...}`) with its fields in the shapes
+    Dew writes now, every earlier shape of a saved run read here and nowhere else (`RunConfig.load`,
+    `check_resume`): a trainer's `attention_form`, which its precision policy's `forms` hold now; a
+    loaded checkpoint's `pretrained_param_dtype` and a decision's `param_dtype`, which its `dtypes.params`
+    hold; and a trainer's `dynamic_scale`, which a float16 compute derives (`dew.nn.precision.Numerics`,
+    ledger 2500).
+    A configuration written today that names any of them is refused by name, as any field its class does
+    not declare. A record in today's shapes passes as it is. Carried to 1.0, when it is deleted (ledger
+    1552)."""
+    fields = record.get("fields")
+    if not isinstance(fields, Mapping) or not isinstance(fields.get("trainer"), Mapping):
+        return record
+    trainer, fields = dict(fields["trainer"]), dict(fields)
+    stated = {name: fields.pop(name) for name in ("pretrained_param_dtype", "param_dtype") if name in fields}
+    earlier = {name for name in ("attention_form", "dynamic_scale") if name in trainer} | set(stated)
+    if not earlier:
+        return record
+    if "precision" in trainer:
+        raise ValueError(f"a saved run records {sorted(earlier)} beside its trainer's precision, which "
+                         f"holds them now")
+    policy: dict[str, object] = {}
+    if "attention_form" in trainer:
+        policy["forms"] = trainer.pop("attention_form")
+    trainer.pop("dynamic_scale", None)
+    params = next(iter(stated.values()), None)
+    # The compute an earlier record trained in was its model's stated dtype, where it states one.
+    model = fields.get("model")
+    computed = model.get("fields", {}).get("dtype") if isinstance(model, Mapping) else None
+    dtypes = {**({"params": params} if params is not None else {}),
+              **({"compute": computed} if isinstance(computed, str) else {})}
+    if dtypes:
+        policy["dtypes"] = dtypes
+    return {**record, "fields": {**fields, "trainer": {**trainer, "precision": policy}}}
+
 
 
 def _read_chain(name: str, written: object) -> Dataset | dict[str, Dataset] | None:
@@ -1103,8 +1195,23 @@ class RunConfig:
         """Read back what `to_dict` wrote, for subclasses too. A field the
         record lacks takes its default; an unknown field raises. A chain
         recorded as unrecorded, or a recipe's record written before runs
-        recorded chains, is refused by name."""
+        recorded chains, is refused by name. A model recorded with an earlier
+        main's fields reads as its checkpoint's record does."""
+        from dew.inference.tasks import earlier_model
+
         rest = {name: value for name, value in values.items() if name not in _CHAINS}
+        trainer = rest.get("trainer")
+        fields = trainer.get("fields", trainer) if isinstance(trainer, Mapping) else {}
+        stop = fields.get("stop")
+        if isinstance(trainer, Mapping) and isinstance(stop, Mapping) and "class" not in stop:
+            # A record written while `stop` held a Pause alone names no class: its fields are a Pause's.
+            # Carried until 1.0 (ledger 1552).
+            fields = {**fields, "stop": {"class": f"{Pause.__module__}:Pause", "fields": stop}}
+            rest = {**rest, "trainer": {**trainer, "fields": fields} if "class" in trainer else fields}
+        # A model recorded before its components' fields changed reads as today's, as its checkpoint's
+        # record does (`earlier_model`, ledger 2423).
+        if isinstance(rest.get("model"), Mapping):
+            rest["model"] = earlier_model({"model": rest["model"]})["model"]
         chains = {name: _read_chain(name, values[name]) for name in _CHAINS if name in values}
         return dataclasses.replace(from_record(cls, rest, dtypes=False), **chains)
 
@@ -1174,9 +1281,20 @@ class RunConfig:
 
     def source_keywords(self, *, frozen: bool) -> SourceOptionsKeywords:
         """`Pretrained.load`'s keywords for the source the run starts from: what it builds of it
-        (`source`) and where it reads it (`TrainerConfig.source_placement`, `frozen` where the run
-        keeps the source as it is). Every run kind that starts from a source loads it with these."""
-        return {**self.source.keywords(), **self.trainer.source_placement(frozen=frozen)}
+        (`source`), where it reads it (`TrainerConfig.source_placement`, `frozen` where the run
+        keeps the source as it is) and what it stores its parameters in. Every run kind that starts
+        from a source loads it with these.
+
+        A source the run trains is stored in its numerics' `dtypes.params`, the master weights its
+        updates land in. One it keeps frozen is stored as its checkpoint stores it
+        (`param_dtype='auto'`), since no update reaches it: a float32 copy of a bf16 checkpoint doubles
+        its memory and is cast back to bf16 every pass for nothing, while a cast to the compute dtype
+        would round the float32 tensors a bf16 checkpoint keeps (Mamba's `A_log`). A `dtypes.params`
+        narrower than float32 stores it so too."""
+        params = self.trainer.precision.dtypes.params
+        stored = AUTO if frozen and jax.numpy.dtype(params) == jax.numpy.float32 else params
+        return {**self.source.keywords(), **self.trainer.source_placement(frozen=frozen),
+                "param_dtype": stored}
 
     def source_attention(self) -> "AttentionImpl":
         """The attention implementation a run that starts from a source loads it with: its model's
@@ -1221,6 +1339,8 @@ class RunConfig:
                          if name not in self.RESUMABLE and now.get(name) != before.get(name))
         if recorded.trainer.quantization != self.trainer.quantization:
             changed.append("trainer.quantization")
+        if recorded.trainer.precision != self.trainer.precision:
+            changed.append("trainer.precision")
         if changed:
             raise ValueError(f"the run to resume trained other {', '.join(changed)}; resume it as it "
                              "recorded them, or train under another name")
@@ -1306,7 +1426,7 @@ class RunConfig:
         `trust` names the packages outside Dew the record may import."""
         path = epath.Path(directory)
         record = (path if str(directory).endswith(".json") else path / RUN_FILE).read_text()
-        return cls.read(json.loads(record), trust=trust)
+        return cls.read(earlier_run(json.loads(record)), trust=trust)
 
     @classmethod
     def read(cls, record: Mapping[str, object], *, trust: Sequence[str] = ()) -> Self:
@@ -1342,7 +1462,7 @@ class RunConfig:
             raise ValueError(f"{type(self).__name__} builds the objective it names around its whole model; "
                              "name an objective, and train an adapter as a kind of run that attaches one")
         self.built_fresh()
-        objective = self.objective.build(model=self.model.build())
+        objective = self.objective.build(model=self.model.build(**self.numerics_fields()))
         scored = self.validation_metrics(validates=self.validation is not None)
         return Prepared(self, lambda name: self.train(objective, self.chain(), name=name, metrics=scored,
                                                       validation=self.validation))
@@ -1553,6 +1673,7 @@ class RunConfig:
         # The record names the run's directory, so its run.json trains the same run again.
         self = dataclasses.replace(self.recorded(objective),
                                    trainer=dataclasses.replace(self.trainer, name=name))
+        self = dataclasses.replace(self, optim=self.grouped(objective, name))
         trainer = self.trainer
         if dataset.plan is not None:
             summary = {**(summary or {}), "data_plan": dataset.plan.record()}
@@ -1574,7 +1695,7 @@ class RunConfig:
                 (`Checkpoints.resumed`), on every rank, before the record is written over it."""
                 saved = epath.Path(checkpoints.directory) / RUN_FILE
                 if checkpoints.resumed(trainer.resume) is not None and saved.exists():
-                    self.check_resume(json.loads(saved.read_text()))
+                    self.check_resume(earlier_run(json.loads(saved.read_text())))
 
             def record_run() -> None:
                 """Write the run's record and name where it is tracked, on rank zero."""
@@ -1595,8 +1716,8 @@ class RunConfig:
             # profile, tune_kernels and any step compiled ahead; prepare_process read the process fields,
             # and the rest are fit's arguments or built the checkpoints and the tracker.
             ahead = None if trainer.ahead is None else AheadOfTime.load(trainer.ahead)
-            # Every attention the run traces takes its recorded form.
-            with generation.chosen(attention_form=trainer.attention_form):
+            # Every program the run traces takes its recorded precision policy.
+            with generation.run_precision(trainer.precision):
                 state = self.built(objective, trainer.mesh, rollout, checkpoints=checkpoints, tracker=tracker,
                                    profile=trainer.profile, lower_for=trainer.lower_for, ahead=ahead).fit(
                     # A run bounded in examples that counts no steps ahead keeps its clock (`Trainer.fit`).
@@ -1611,8 +1732,8 @@ class RunConfig:
                     # A run that names no metrics and validates no split has no suite to score.
                     validation=validation if suites is None else suites or None,
                     summaries=self.val_summaries)
-            if after is not None:
-                after(state, checkpoints.directory)
+                if after is not None:
+                    after(state, checkpoints.directory)
             def publish_checkpoint() -> None:
                 """Upload the checkpoint the run ended on, where a tracker takes one."""
                 if trainer.publish and wandb_tracker is not None:
@@ -1634,9 +1755,36 @@ class RunConfig:
         target = self.trainer.compile_ahead
         assert target is not None
         mesh = self.trainer.mesh.build(compile_only_gpus(target.generation, target.devices, target.capacity))
-        with generation.chosen(attention_form=self.trainer.attention_form):
+        with generation.run_precision(self.trainer.precision):
             return target.compiled(self.built(objective, mesh, rollout, links=target.links), dataset, steps,
                                    self.trainer.examples if steps is None else None)
+
+    def grouped(self, objective: Objective[Loss, Effects], name: str) -> OptimConfig:
+        """The run's optimizer as it trains under `name`: each group it names that claims the modules its
+        objective draws fresh beside a loaded base matching those that hold a parameter
+        (`ParamGroup.fresh`, `trained_modules`). Where it names none, a resumed run trains in the groups
+        its record names, as its optimizer state holds them (none for a record written before runs took
+        them), and a new run that draws such modules in their default groups (`OptimConfig.fresh_groups`).
+        Every process agrees on the groups before any records them."""
+        def resolved() -> JSON:
+            named = self.optim.param_groups
+            if not named:
+                checkpoints = self.trainer.checkpoints(name)
+                saved = epath.Path(checkpoints.directory) / RUN_FILE
+                recorded = recorded_param_groups(saved) if checkpoints.resumed(
+                    self.trainer.resume) is not None and saved.exists() else None
+                if recorded is not None:
+                    return to_record(recorded, tuple[ParamGroup, ...])
+            groups = named or self.optim.fresh_groups()
+            modules = trained_modules(objective, objective.fresh_modules()) if any(
+                group.fresh for group in groups) else ()
+            if not named and not modules:
+                return to_record((), tuple[ParamGroup, ...])
+            claimed = dataclasses.replace(self.optim, param_groups=groups).with_fresh(modules)
+            return to_record(claimed.param_groups, tuple[ParamGroup, ...])
+        groups = from_record(tuple[ParamGroup, ...], agreed_same("run param groups", resolved))
+        return self.optim if groups == self.optim.param_groups else dataclasses.replace(
+            self.optim, param_groups=groups)
 
     def built[LossT, EffectsT](self, objective: Objective[LossT, EffectsT],
                                mesh: MeshSpec | jax.sharding.Mesh, rollout: Rollout | None,
@@ -1651,8 +1799,30 @@ class RunConfig:
         return training.Trainer(
             objective, self.optim, key=trainer.key, mesh=mesh, microbatches=trainer.microbatches,
             layout=trainer.layout, accumulation=trainer.accumulation, split=trainer.split,
-            dynamic_scale=trainer.dynamic_scale, rollout=rollout, tune_kernels=trainer.tune_kernels,
-            **resources)
+            dynamic_scale=self.compute_dtype() == "float16", rollout=rollout,
+            tune_kernels=trainer.tune_kernels, param_dtype=self.drawn_dtype(),
+            **{"links": trainer.links, **resources})
+
+    def compute_dtype(self) -> str:
+        """The dtype the run's model computes in: the one its record states, else its numerics'
+        (`TrainerConfig.precision`)."""
+        stated = self.model.fields.get("dtype")
+        return str(stated) if stated is not None else self.trainer.precision.dtypes.compute
+
+    def drawn_dtype(self) -> str | None:
+        """The dtype the run stores the parameters it draws fresh in (`Trainer`'s `param_dtype`): its
+        numerics' `dtypes.params` where that is not Flax's own float32 and its model's record states
+        none; None leaves each module's own."""
+        params = self.trainer.precision.dtypes.params
+        return None if "param_dtype" in self.model.fields or jax.numpy.dtype(params) == jax.numpy.float32 \
+            else params
+
+    def numerics_fields(self) -> dict[str, str]:
+        """The fields the run's numerics derive for its model (`ModelConfig.build`): its compute dtype,
+        where the model takes one and its record states none."""
+        if "dtype" in self.model.fields or not takes_dtype(self.model):
+            return {}
+        return {"dtype": self.trainer.precision.dtypes.compute}
 
     def sweep(self, space: Space, *, train: Callable[[Self], float], trials: int, ledger: str | Path,
               tracker: Tracker, search: Search = _RANDOM_SEARCH) -> list[TrialFinished]:

@@ -72,7 +72,7 @@ import math
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -127,8 +127,10 @@ from dew.nn.inputs import (
     mesh_of,
     request_key,
 )
+from dew.nn.kernels import generation
 from dew.nn.kernels.options import compiler_options
 from dew.nn.kv_cache import GROUPS, ROUNDING_KEYS, KVCache, is_paged, leaf_name
+from dew.nn.precision import Numerics
 from dew.nn.protocols import CrossAttending, Layered, ProjectionGroup, Serving
 from dew.nn.scatter import DROPPED
 from dew.nn.visibility import with_served_blocks
@@ -499,7 +501,7 @@ class Server:
                  sampling: Sampling, transforms: tuple[LogitsTransform, ...], stopping: Finishing,
                  grammar: Grammar | None, rows: Rows, slots: int, capacity: int, admission: int,
                  default_budget: int | None, max_length: int | None, decode_steps: int,
-                 prefix: int | Literal["prompt"] | None = None) -> None:
+                 prefix: int | Literal["prompt"] | None = None, precision: Numerics | None = None) -> None:
         if type(slots) is not int or slots < 1:
             raise ValueError("slots must be a positive number of resident rows")
         if type(admission) is not int or not 1 <= admission <= slots:
@@ -538,6 +540,9 @@ class Server:
         self.default_budget = default_budget
         self.max_length = max_length
         self.prefix: int | Literal["prompt"] | None = prefix
+        # The numerics its task's run trained in (`InItsForm`), which every step traces under; None,
+        # those in effect around it.
+        self.precision = precision
         self.decode_steps = decode_steps
         self.steps = 0
         self._queue: deque[_Row] = deque()
@@ -621,9 +626,14 @@ class Server:
             self._states = states
             self._restored, self._captured = state_programs(formats, states)
 
-    def _context(self) -> contextlib.AbstractContextManager[None]:
-        """The mesh the model traces under, so a layer that reads it, such as an expert exchange, finds it."""
-        return contextlib.nullcontext() if self.mesh is None else jax.set_mesh(self.mesh)
+    @contextlib.contextmanager
+    def _context(self) -> Iterator[None]:
+        """The mesh the model traces under, so a layer that reads it, such as an expert exchange, finds it,
+        under the numerics its task's run trained in."""
+        with (contextlib.nullcontext() if self.mesh is None else jax.set_mesh(self.mesh),
+              contextlib.nullcontext() if self.precision is None
+              else generation.run_precision(self.precision)):
+            yield
 
     @classmethod
     def from_task(cls, task: TextGeneration, *, slots: int, capacity: int,
@@ -743,7 +753,7 @@ class Server:
             ),
             default_budget=task.max_new_tokens,
             max_length=task.max_length,
-            decode_steps=decode_steps, prefix=task.prefix,
+            decode_steps=decode_steps, prefix=task.prefix, precision=task.precision,
         )
 
     @property

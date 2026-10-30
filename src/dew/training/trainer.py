@@ -84,7 +84,7 @@ from dew.inputs import Field, InputSpec
 from dew.mesh import SEQUENCE_AXIS, STAGE_AXIS, TENSOR_AXIS, LayoutRefused, LogicalAxes
 from dew.nn.flops import MissingFlopsCount
 from dew.nn.kernels import tuning
-from dew.nn.kernels.generation import assumed, backend, chosen_kernel, gpu_mesh, gpu_target
+from dew.nn.kernels.generation import assumed, gpu_mesh, gpu_target
 from dew.nn.kernels.options import compiler_options
 from dew.nn.precision import at_least_fp32
 from dew.nn.progress import training
@@ -104,12 +104,11 @@ from dew.objectives.base import (
     Objective,
     Ratio,
     Recorded,
-    Step,
     TrainingScalar,
     taken_record,
 )
-from dew.optim import clips_qk, held_rates, learning_rate, scaled_rates, settable_rates, with_rates
-from dew.state import MODEL_STATE, Accumulation, TrainState, apart, kept_window, together
+from dew.optim import held_rates, learning_rate, scaled_rates, settable_rates, with_rates
+from dew.state import MODEL_STATE, Accumulation, TrainState, apart, drawn_in, kept_window, together
 from dew.telemetry import profile as telemetry_profile
 from dew.telemetry.instrumentation import StepFlops, compilation_cache_counts
 from dew.telemetry.profile import region
@@ -128,6 +127,7 @@ from dew.training._fit import (
     HandedSplits,
     Start,
     afresh,
+    check_inputs,
     clocked,
     consumption_counted,
     declarations,
@@ -140,7 +140,17 @@ from dew.training._fit import (
     validation_read,
     waited_read,
 )
-from dew.training._lowering import KernelReport, Lowered, Routed, routed
+from dew.training._lowering import (
+    KernelReport,
+    Lowered,
+    Routed,
+    compile_opened,
+    compiled_name,
+    generation_of,
+    routed,
+    topology_devices,
+    uncompiled,
+)
 from dew.training.budget import Pause, Plateau
 from dew.training.cooldown import Cooldowns, Pending, check_branches, decay, resolved, schedule_ended
 from dew.training.display import TRAINER_SHOWN, TrainingDisplay, goodput
@@ -185,7 +195,7 @@ from dew.training.model_flops import (
     prepare_counts,
     uncounted,
 )
-from dew.training.narrow import narrowed, narrowed_paths
+from dew.training.narrow import narrow_copies, narrowed
 from dew.training.observe import Observe
 from dew.training.planning import (
     Candidate,
@@ -267,45 +277,44 @@ class Trainer(Generic[Loss, Effects]):
         tune_kernels: bool = False,
         record: bool = False,
         links: Mapping[str, Link] | None = None,
+        param_dtype: str | None = None,
     ):
         """Hold everything a run needs, without opening any of it.
 
-        The mesh, the compiled step and the capabilities' resources come into
-        being in `fit`, so constructing a Trainer allocates nothing.
+        The mesh, the compiled step and the capabilities' resources come into being in `fit`, so constructing
+        a Trainer allocates nothing.
 
-        `accumulation` is how many steps pool into one optimizer commit, and `split` how many
-        microbatches each step's batch is read in, its rows split evenly; None plans it, the
-        fewest that fit the devices before any recomputation (`compile`). `optimizer`
-        is an optax transformation, or an `OptimConfig` each `fit` builds over its `steps //
-        accumulation` updates; the run steps the objective's (`Objective.optimizer`), made from
-        it. `step` replaces the built-in transaction. A custom step then owns the clocks, the
-        scaler, the EMA and the mutable writes, and the compiled wrapper owns only the
-        attempted-step counter. `rollout` runs once per batch read, before the step and outside
-        replay. `layout` and `mesh` say where the state lives: `mesh` a `MeshSpec` or a native
-        `jax.sharding.Mesh` of any axes, which `layout`'s rules name (`Layout.data_axes` its rows').
-        `microbatches` is how many a pipelined step feeds through the mesh's stage axis, a
-        multiple of its size; None feeds one a stage. `lower_for`, a CUDA generation, lowers
-        the first step for it in place of compiling it (`dew.training._lowering.Lowered`); `ahead`, a
-        step compiled ahead (`dew.training.ahead`), runs as the first step where it is that program.
-        `tune_kernels` opts in to the tuner (`dew.nn.kernels.tuning.tune`), else each launch takes its
-        derived config. `record` makes each step return in its metrics what each evaluation, replays
-        too, sampled or passed as a boundary (`taken_record`).
-        `links` states an axis's `Link` by name in place of measuring it (`_links`).
+        `accumulation` is how many steps pool into one optimizer commit, and `split` how many microbatches
+        each step's batch is read in, its rows split evenly; None plans it, the fewest that fit the devices
+        before any recomputation (`compile`). `optimizer` is an optax transformation, or an `OptimConfig` each
+        `fit` builds over its `steps // accumulation` updates; the run steps the objective's
+        (`Objective.optimizer`), made from it. `step` replaces the built-in transaction. A custom step then
+        owns the clocks, the scaler, the EMA and the mutable writes, and the compiled wrapper owns only the
+        attempted-step counter. `rollout` runs once per batch read, before the step and outside replay.
+        `layout` and `mesh` say where the state lives: `mesh` a `MeshSpec` or a native `jax.sharding.Mesh` of
+        any axes, which `layout`'s rules name (`Layout.data_axes` its rows'). `microbatches` is how many a
+        pipelined step feeds through the mesh's stage axis, a multiple of its size; None feeds one a stage.
+        `lower_for`, a CUDA generation, lowers the first step for it in place of compiling it
+        (`dew.training._lowering.Lowered`); `ahead`, a step compiled ahead (`dew.training.ahead`), runs as the
+        first step where it is that program. `tune_kernels` opts in to the tuner
+        (`dew.nn.kernels.tuning.tune`), else each launch takes its derived config. `record` makes each step
+        return in its metrics what each evaluation, replays too, sampled or passed as a boundary
+        (`taken_record`). `links` states an axis's `Link` by name in place of measuring it (`_links`).
+        `param_dtype`, a dtype's name, stores the parameters the run draws fresh, as Flax's `param_dtype`
+        (`dew.state.drawn_in`); None keeps each module's own.
         """
         whole = read_whole(accumulation, split, step, layout, rollout, mesh)
         self.objective = objective
         built = isinstance(optimizer, optax.GradientTransformation)
-        self._config = None if built else optimizer
-        self._optimizer = objective.optimizer(optimizer) if built else None
+        self._config, self._optimizer = (None, objective.optimizer(optimizer)) if built else (optimizer, None)
         from dew.nn.inputs import seed_of
         # A seed's key is made when first read, after `fit` readies the process (`key`).
         self.seed, self._given_key, self._key = seed_of(key), key, None
         self.mesh = mesh
         self.layout = layout
-        self._microbatches = microbatches
         self.accumulation = accumulation
         self.split = split
-        self._loss_scale = loss_scale(dynamic_scale)
+        self._microbatches, self._loss_scale = microbatches, loss_scale(dynamic_scale)
         self.dynamic_scale = self._loss_scale is not None
         self.checkpoints = checkpoints
         self.tracker, self.step, self.rollout = tracker, step, rollout
@@ -316,6 +325,7 @@ class Trainer(Generic[Loss, Effects]):
         self.records: list[Recorded] = []
         self.profile = profile
         self.lower_for, self._ahead, self.tune_kernels = lower_for, ahead, tune_kernels
+        self.param_dtype = param_dtype
         # Set by `compile`, for the batch shape it was called with. A ramped run has one value per stage;
         # `fit` keeps them beside each step. The executable is the step as compiled, whose memory analysis a
         # benchmark reads; the program it was lowered from is released with its plan (`Planned.released`).
@@ -379,14 +389,12 @@ class Trainer(Generic[Loss, Effects]):
                       key: int | jax.Array | None = None) -> TrainState:
         """Build the state a fresh run starts from.
 
-        It is pure, so `fit` traces it once for its shapes and once, sharded, for its
-        values.
+        It is pure, so `fit` traces it once for its shapes and once, sharded, for its values.
 
-        Both inputs default to the run's own, and `place` passes them explicitly so
-        that what it compiles takes them as arguments. A held checkpoint then reaches
-        the device as an argument instead of a constant embedded in the executable.
-        Passing None means "use the configured input", which is what a call without
-        arguments does. This is the only implementation of the state, so a subclass
+        Both inputs default to the run's own, and `place` passes them explicitly so that what it compiles
+        takes them as arguments. A held checkpoint then reaches the device as an argument instead of a
+        constant embedded in the executable. Passing None means "use the configured input", which is what
+        a call without arguments does. This is the only implementation of the state, so a subclass
         overrides it here and every path sees the override.
         """
         initializer = self.objective.initializer if initializer is None else initializer
@@ -401,7 +409,7 @@ class Trainer(Generic[Loss, Effects]):
         # The state holds its trees as dicts of its own, whichever Flax container (a FrozenDict, under a
         # mapping or a list) the objective's tree came in, so its placement, its updates, the
         # collections a step writes back (`write_back`) and its restores share one structure.
-        params = owned_dicts(nn.unbox(initialized))
+        params = drawn_in(owned_dicts(nn.unbox(initialized)), self.param_dtype, self.objective)
         # A held tree's initializer returns the objective's own arrays (`Objective.held_variables`),
         # which the step's donation would free: the moving state takes buffers of its own, as a
         # placed one does (`distributed.placed_held`). The frozen tree no step donates (`apart`), so
@@ -458,7 +466,12 @@ class Trainer(Generic[Loss, Effects]):
     @functools.cached_property
     def device_mesh(self) -> Mesh:
         """The device mesh (`device_mesh`), built on first use."""
-        return device_mesh(self.mesh)
+        return device_mesh(self.mesh, self.topology)
+
+    @functools.cached_property
+    def topology(self) -> list | None:
+        """The devices of the TPU topology `lower_for` names, which the run compiles for, or None."""
+        return topology_devices(self.lower_for)
 
     @property
     def microbatches(self) -> int:
@@ -615,8 +628,7 @@ class Trainer(Generic[Loss, Effects]):
     def place(self) -> tuple[TrainState, Placement[TrainState], bytes | None]:
         """Put the state on the mesh, fresh or restored, once `validate`'s checks pass.
 
-        It returns the state with its shardings and the data position a resume
-        continues from.
+        It returns the state with its shardings and the data position a resume continues from.
         """
         return self._placed(self._started(), positioned=True)
 
@@ -663,7 +675,8 @@ class Trainer(Generic[Loss, Effects]):
                     self.objective, abstract.variables,
                     lambda rows, path: jax.ShapeDtypeStruct((len(rows), *rows[0].shape), rows[0].dtype))})
         share = DataPartition.of(self.device_mesh) if positioned else None
-        state, position = checkpoints.restore(placed_shapes(abstract, shardings), resume, share=share)
+        state, position = checkpoints.restore(placed_shapes(abstract, shardings), resume, share=share,
+                                              served=self.objective.served_groups(abstract.variables))
         refuse_unclocked(state, resume, self._examples)
         if self._config is not None:
             # The rate this run configures, not the one its checkpoint holds.
@@ -699,8 +712,7 @@ class Trainer(Generic[Loss, Effects]):
         """The fit ladder's rung this trainer's step compiles at: the
         objective's head tile, its trained modules' remat (`recompute_record`) and whether
         the step keeps XLA's default options, the half rung `compile` climbs
-        to before the next. A checkpoint records it, since each decides the
-        program a step runs."""
+        to before the next. A checkpoint records it, since each decides the program a step runs."""
         return rung_record(self.objective, self._xla_defaults, narrow=self._narrow)
 
     def _checkpoint_rung(self) -> JSON:
@@ -775,11 +787,9 @@ class Trainer(Generic[Loss, Effects]):
     def _frozen_shardings(self, state: TrainState, frozen):
         """Return where the frozen collection sits for a CPU-owned run.
 
-        Before placement the layout names each row's shards, and `resident`
-        moves the stack's rows to bank memory, a scanned run's shared rows as
-        one bank. Once placed, the collection holds those banks, whose
-        leading layer axis the layout's rules do not name, and its arrays say
-        where they sit.
+        Before placement the layout names each row's shards, and `resident` moves the stack's rows to bank
+        memory, a scanned run's shared rows as one bank. Once placed, the collection holds those banks,
+        whose leading layer axis the layout's rules do not name, and its arrays say where they sit.
         """
         leaves = jax.tree.leaves(frozen)
         if leaves and all(isinstance(leaf, jax.Array) for leaf in leaves):
@@ -948,7 +958,12 @@ class Trainer(Generic[Loss, Effects]):
         """
         if (target := self.lower_for) is not None:
             # Shapes are all a lowering reads, so the state may be abstract (`jax.eval_shape`).
-            raise Lowered(target, *routed(lambda: self._lowered_for(state, batch, target)))
+            compiled = self.topology is not None
+            lowered = Lowered(target, *routed(lambda: self._lowered_for(state, batch, target)),
+                              compiled=compiled)
+            if compiled and self.checkpoints is not None:  # The run's own record of its target's compile.
+                lowered.save(f"{self.checkpoints.directory}/{compiled_name(target)}")
+            raise lowered
         split, unaligned = divmod(int(state.window_size), self.accumulation)
         if unaligned or (state.accumulation is not None and self._split not in (None, split)):
             raise ValueError(f"the state pools windows of {int(state.window_size)} microbatches, and this "
@@ -1141,7 +1156,9 @@ class Trainer(Generic[Loss, Effects]):
         if shapes is not None:
             self._refuse_unpipelined(schedule)
         prepared = self._initialize_accumulation(state, batch, shapes, window=window, shape_only=True)
-        copies = self._narrow_copies(state, batch) if (self._narrow if narrow is None else narrow) else {}
+        composed = self.step is None and not self.dynamic_scale
+        copies = (narrow_copies(self.objective, state, batch, self._model_batch, composed=composed)
+                  if (self._narrow if narrow is None else narrow) else {})
         prepared = dataclasses.replace(prepared, compute=jax.eval_shape(
             lambda variables: narrowed(variables, copies), prepared.variables) if copies else None)
         return shapes, copies, prepared
@@ -1179,46 +1196,25 @@ class Trainer(Generic[Loss, Effects]):
                        donate_argnums=0)
 
     def _lowered_for(self, state: TrainState, batch: Batch, generation: str) -> jax.stages.Lowered:
-        """The step `compile` builds first, traced as on a GPU of the CUDA `generation` and lowered for
-        one (`dew.training._lowering`) on this process's devices. It traces on an abstract mesh of
-        that GPU's devices, from which JAX's Pallas lowering reads the GPU,
-        at the base rung and the plan's first split: a run that does not fit splits its batch or
-        recomputes more, no other kernel. A CPU-owned state's step realizes its parameters on the host
-        as it runs, and is not lowered."""
+        """The step `compile` builds first, traced as on a GPU of the CUDA `generation` and lowered for one
+        (`dew.training._lowering`) on this process's devices. It traces on an abstract mesh of that GPU's
+        devices, from which JAX's Pallas lowering reads the GPU, at the base rung and the plan's first split:
+        a run that does not fit splits its batch or recomputes more, no other kernel. A CPU-owned state's step
+        realizes its parameters on the host as it runs, and is not lowered."""
         if self.host_master:
             raise ValueError("lower_for lowers a step whose state the devices hold; this layout keeps "
                              "the variables on the host")
-        mesh = gpu_mesh(self.device_mesh, generation)
+        # A TPU topology's mesh holds its own devices, which libtpu lowers and compiles for.
+        chip = generation_of(generation)
+        topology = self.topology is not None
+        mesh = self.device_mesh if topology else gpu_mesh(self.device_mesh, generation)
         self._at_base_rung(batch)
-        with assumed(generation), self._traced_on(mesh) as schedule:
+        with assumed(chip), self._traced_on(mesh) as schedule:
             state, batch = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), (state, batch))
             split = splits(self._rows, batch, mesh, self.microbatches, self._split)[0]
             placement, replicated = batch_shardings(mesh, batch), NamedSharding(mesh, P())
             return self._candidate(state, batch, schedule, placement, replicated, split, None, None,
-                                   mesh=mesh, platforms=('cuda',)).lowered
-
-    def _narrow_copies(self, state: TrainState, batch: Batch) -> dict:
-        """The parameters the step reads through narrow copies
-        (`dew.training.narrow`), by path under `params`: on every GPU unless
-        `chosen` turns them off, for a step this trainer composes, without a
-        loss scale."""
-        if (chosen_kernel('narrow_copies', 'on' if backend() == 'gpu' else 'off') == 'off'
-                or self.step is not None or self.dynamic_scale or FROZEN in state.variables):
-            return {}
-        variables = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), state.variables)
-
-        def loss(params, rest, batch, microstep, key, step, ema):
-            # As `_loss_shape` traces it, the averaged weights the step hands
-            # the objective included: a parameter read there is used twice.
-            variables = {**rest, "params": params}
-            return self.objective._loss(
-                variables, self._model_batch(batch),
-                Step(microstep, jax.random.fold_in(key, step), with_ema(variables, ema),
-                     qk_stats=clips_qk(state.opt_state)))
-
-        rest = {name: tree for name, tree in variables.items() if name != "params"}
-        return narrowed_paths(loss, variables["params"], rest, batch, state.microstep, state.key, state.step,
-                              state.ema)
+                                   mesh=mesh, platforms=('tpu' if topology else 'cuda',)).lowered
 
     def _refuse_unpipelined(self, schedule: Schedule) -> None:
         """Refuse a stage axis under a model whose traced step ran no pipeline."""
@@ -1461,15 +1457,10 @@ class Trainer(Generic[Loss, Effects]):
                 batch, ahead = run.closing(interval, batch, self._examples)
                 batch = rolled_out(self.rollout, state, batch, self.device_mesh, self._marked, interval, run)
                 device, _ = split_fields(batch)
-                inputs = self.objective.inputs
-                if batch_signature(device) not in compiled and self.rollout is None and inputs is not None:
-                    # Each batch of a shape the run has not stepped is checked against what the
-                    # objective declares, a later ramp's or schedule's stage as the first.
-                    # A rollout writes the batch its loss reads, from prompts it reads itself.
-                    # The objective reads the batch its device steps make (`_model_batch`).
-                    with jax.set_mesh(self.device_mesh):
-                        checked = self._model_shapes(device) if self._device else device
-                    agreed("training input declaration", functools.partial(inputs.check, checked))
+                if batch_signature(device) not in compiled and self.rollout is None:
+                    # Each batch of a shape the run has not stepped is checked against what the objective
+                    # declares, a later ramp's or schedule's stage as the first; a rollout writes its own.
+                    check_inputs(self, device)
                 known, began = len(compiled), time.perf_counter()
                 with self._startup.phase("compile", "compiling the step", when=not known):
                     train_step, measured_flops, state = self._compiled_for(compiled, state, device, run)
@@ -1532,8 +1523,7 @@ class Trainer(Generic[Loss, Effects]):
         the run itself raised none.
 
         Each teardown step runs even when an earlier one failed, and a later
-        failure becomes a note on the first, so one broken sink cannot hide
-        the error that ended the run."""
+        failure becomes a note on the first, so one broken sink cannot hide the error that ended the run."""
         paused = time.perf_counter()
         profile, checkpoints = self.profile, self.checkpoints
         if run.notice is not None:
@@ -1591,6 +1581,8 @@ class Trainer(Generic[Loss, Effects]):
                 initial = afresh(initial, jax.eval_shape(self.optimizer.init, initial.variables["params"]),
                                  self._examples)
             shardings, _ = self._validated(initial)
+            if self.topology is not None:  # Compiled from its shapes (`_opened`), placed on nothing.
+                return int(initial.step), None, lambda: (initial, shardings), jax.eval_shape(lambda: initial)
             supplied = jax.device_put(initial, shardings)
             return int(supplied.step), None, lambda: (supplied, shardings), None
         start = self._started(resume)
@@ -1672,6 +1664,10 @@ class Trainer(Generic[Loss, Effects]):
                     # a compile refuses it, before the state it would check is traced from that batch.
                     agreed_same("training batch layout", lambda: batch_layout(split_fields(placed_first)[0]))
                     self._fitting(abstract, placed_first)
+                    if self.topology is not None:  # Its step compiles from these shapes (`compile`).
+                        compile_opened(self, abstract, placed_first, current, resumed=resumed)
+        if self.topology is not None:
+            raise uncompiled(self, current, complete)
         state, shardings = placed()
         if int(state.step) != current:
             raise ValueError(f"the checkpoint of step {current} holds a state at step {int(state.step)}")

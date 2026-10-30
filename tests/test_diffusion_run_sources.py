@@ -30,6 +30,7 @@ from dew.diffusion.process import Process
 from dew.diffusion.schedules.source import SourceSchedule
 from dew.inference import TextToImage
 from dew.inputs import TextCondition
+from dew.nn.precision import Dtypes, Numerics
 from dew.objectives import Step
 from dew.objectives.diffusion import Alignment, DiffusionObjective
 from dew.objectives.diffusion.end_to_end import AUTOENCODER, LATENT_STATS, TUNED_WEIGHTS, EndToEnd
@@ -541,11 +542,12 @@ def test_the_resolution_shift_and_the_noise_levels_it_maps_to_are_diffusers(cons
 
 
 def test_a_pretrained_run_stores_its_pipelines_weights_in_the_dtype_it_names(pipelines):
-    """`pretrained_param_dtype` is the storage the pipeline's denoiser loads
-    and trains in; with no pipeline it is refused rather than ignored."""
+    """The run's parameter dtype (`trainer.precision.dtypes.params`) is the storage the pipeline's
+    denoiser loads and trains in."""
     objective = ObjectiveConfig("diffusion", {"guidance": None, "ema_decay": None})
     configured = DiffusionRunConfig(pretrained=str(pipelines / "flux" / "pipeline"), preset=None,
-                                    model=precision(), pretrained_param_dtype="bfloat16",
+                                    model=precision(),
+                                    trainer=TrainerConfig(precision=Numerics(Dtypes(params="bfloat16"))),
                                     data=images_of("tfds://oxford_flowers102", 16),
                                         val_metrics=(),
                                     objective=objective).build()
@@ -553,8 +555,6 @@ def test_a_pretrained_run_stores_its_pipelines_weights_in_the_dtype_it_names(pip
     floating = [leaf for leaf in jax.tree.leaves(state.variables["params"])
                 if jnp.issubdtype(leaf.dtype, jnp.floating)]
     assert floating and all(leaf.dtype == jnp.bfloat16 for leaf in floating)
-    with pytest.raises(ValueError):
-        DiffusionRunConfig(pretrained_param_dtype="bfloat16")
 
 
 def test_a_pretrained_run_refuses_a_model_of_its_own():

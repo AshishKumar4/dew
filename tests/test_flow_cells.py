@@ -42,8 +42,11 @@ ran_with = []
 TOO_WIDE = True
 
 
+FORMS = {"p": ("plain", 1.0), "s": ("scaled", 2.0)}
+
+
 @pytest.mark.parametrize("width", [64, pytest.param(128, marks=pytest.mark.skipif(TOO_WIDE, reason="wide"))])
-@pytest.mark.parametrize(("form", "scale"), [("plain", 1.0), ("scaled", 2.0)], ids=["p", "s"])
+@pytest.mark.parametrize(("form", "scale"), FORMS.values(), ids=FORMS)
 def gridded(form, scale, width, fixture):
     """A cell function whose test kept its grid in its own marks."""
     ran_with.append((form, scale, width, fixture))

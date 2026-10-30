@@ -10,7 +10,6 @@ import functools
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 import pytest
 from generation_support import runs
 from reference_error import assert_as_exact, with_gradients
@@ -123,21 +122,6 @@ def test_the_mosaic_gradient_is_as_exact_as_its_reference(case, dtype, remat):
         return
     assert_as_exact(compiled(on), compiled(functools.partial(chunk_on, 'fla', hooks)), draws,
                     f'the mosaic gradient, {case} in {jnp.dtype(dtype).name}', seeds=SEEDS, truth_fn=truth)
-
-
-def the_fast_backward_is_bitwise_the_same_each_run():
-    """The template's fast backward gives the same bits each run over packed documents (row 1298): each
-    queries' and keys' gradient tile has one program, which stores its key head's first value head's and
-    adds the rest's in order, a step's adds done before the next (`_gradient_stored`); no add's order varies
-    between runs."""
-    case = 'packed documents'
-    hooks = recurrence.Hooks(decay='scalar', scale=SHAPES[case]['key_width'] ** -0.5, write_bound=1.0)
-    fn = on_the_mainloop(hooks, case, jnp.bfloat16)
-    run = jax.jit(with_gradients(restarted(fn, case)))
-    operands, cotangent = drawn(jnp.bfloat16, 0, **geometry(case))
-    first, second = (jax.tree.leaves(run(operands, cotangent)) for _ in range(2))
-    for ours, again in zip(first, second, strict=True):
-        np.testing.assert_array_equal(np.asarray(ours), np.asarray(again))
 
 
 WALK_GRID = [('one sequence', 'forward'), ('one sequence', 'training')]

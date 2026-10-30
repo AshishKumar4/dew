@@ -91,19 +91,18 @@ class ToyVelocityMLP(nn.Module):
         return nn.Dense(3)(h).reshape(x.shape)
 
 
-MIXTURE_RUNS = 64
+MIXTURE_RUNS = 80
 """The mixture site's declared training runs (the learning gate's), each its own initialization, data
-and noise: `learning_gate.units_for` over twenty pilots of 168 to 192 runs declared 47 to 58, and the
-site declares more than any of them, since trained together 64 runs cost what 56 did (this file, 95 s
-on armada against 93 s). Each mode's mean
-sat 0.011 to 0.012 inside its center on average, against a margin of 0.04, and moved 0.017 from run to
-run, so one run missed the margin on an axis about one time in twenty-five."""
+and noise, trained 1000 steps (`mixture_runs`): `learning_gate.units_for` over pilots of 192 runs
+declared 62 to 67 at 1000 steps, 78 to 105 at 750 and 48 at 1500 (ledger 2159, 10-29), runs times
+steps about constant below 1000; the site declares more than any pilot at 1000, which costs three
+quarters of 64 runs of 1500 steps."""
 
 
 @jax.jit
 def mixture_runs(runs: jax.Array) -> tuple[jax.Array, jax.Array]:
     """The toy's runs numbered `runs`, trained together: each a velocity network trained by flow matching
-    on the mixture for 1500 steps from keys of its number's own, and 2048 samples of its 64-step Euler
+    on the mixture for 1000 steps from keys of its number's own, and 2048 samples of its 64-step Euler
     walk; with each run's last step's loss."""
     process = presets.Flow()()
     schedule, transform = process.schedule, process.prediction
@@ -132,7 +131,7 @@ def mixture_runs(runs: jax.Array) -> tuple[jax.Array, jax.Array]:
         params = model.init(jax.random.fold_in(key, 0), jnp.zeros((1, 1, 1, 3)), jnp.zeros((1,)))
         carry = (params, optimizer.init(params), jnp.zeros((), jnp.float32))
         run_key = jax.random.fold_in(key, 1)
-        params, _, loss = jax.lax.fori_loop(0, 1500, lambda step, carry: train_step(step, carry, run_key),
+        params, _, loss = jax.lax.fori_loop(0, 1000, lambda step, carry: train_step(step, carry, run_key),
                                             carry)
         denoise = process.denoiser(model, params, {})
         x_T = process.noise(jax.random.fold_in(key, 2), (2048, 1, 1, 3))

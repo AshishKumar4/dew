@@ -1022,53 +1022,56 @@ def test_the_tied_head_rounds_its_bf16_product_to_bf16_logits_under_bf16_compute
     the fp32 sum of the rounded operands rounded to bf16 once, from that sum
     in float64, over drawn weights and tokens (check 1). At "highest" the head
     multiplies the fp32 table, and its logits are on par with that fp32
-    product. The truth of each takes the head's own states as exact input."""
-    model = tiny(dtype=jnp.bfloat16)
-    ids = tokens(rng)
-    params = model.init(rng, ids)
-    logits = model.apply(params, ids)
-    np.testing.assert_array_equal(
-        np.asarray(logits), np.asarray(logits.astype(jnp.bfloat16).astype(jnp.float32))
-    )
+    product. The truth of each takes the head's own states as exact input.
+    Under JAX's default precision, as a run's default numerics multiply."""
+    with jax.default_matmul_precision(None):
+        model = tiny(dtype=jnp.bfloat16)
+        ids = tokens(rng)
+        params = model.init(rng, ids)
+        logits = model.apply(params, ids)
+        np.testing.assert_array_equal(
+            np.asarray(logits), np.asarray(logits.astype(jnp.bfloat16).astype(jnp.float32))
+        )
 
-    def head(model, dtype, finish, *, rounded):
-        # The states as the compiled model computes them: on a GPU an uncompiled bf16 stack fuses
-        # otherwise, and the head's input is the compiled one's.
-        states = jax.jit(lambda params, ids: model.apply(params, ids, method=CausalTransformer.hidden_states))
+        def head(model, dtype, finish, *, rounded):
+            # The states as the compiled model computes them: on a GPU an uncompiled bf16 stack fuses
+            # otherwise, and the head's input is the compiled one's.
+            states = jax.jit(lambda params, ids: model.apply(params, ids,
+                                                             method=CausalTransformer.hidden_states))
 
-        @as_given
-        def run(params, ids):
-            narrow = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float32), params)
-            with jax.enable_x64(new_val=False):
-                hidden = states(narrow, ids)
-            hidden = np.asarray(hidden, np.float32)
-            table = np.asarray(params["params"]["embed_tokens"]["embedding"], np.float32)
-            if rounded:
-                table = np.asarray(jnp.asarray(table, jnp.bfloat16), np.float32)
-            return finish(jnp.einsum("...d,vd->...v", jnp.asarray(hidden, dtype), jnp.asarray(table, dtype),
-                                     precision=jax.lax.Precision.HIGHEST))
-        return run
+            @as_given
+            def run(params, ids):
+                narrow = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float32), params)
+                with jax.enable_x64(new_val=False):
+                    hidden = states(narrow, ids)
+                hidden = np.asarray(hidden, np.float32)
+                table = np.asarray(params["params"]["embed_tokens"]["embedding"], np.float32)
+                if rounded:
+                    table = np.asarray(jnp.asarray(table, jnp.bfloat16), np.float32)
+                return finish(jnp.einsum("...d,vd->...v", jnp.asarray(hidden, dtype),
+                                         jnp.asarray(table, dtype), precision=jax.lax.Precision.HIGHEST))
+            return run
 
-    def to_bf16(product):
-        return product.astype(jnp.bfloat16).astype(jnp.float32)
+        def to_bf16(product):
+            return product.astype(jnp.bfloat16).astype(jnp.float32)
 
-    def unrounded(product):
-        return product
+        def unrounded(product):
+            return product
 
-    assert_as_exact(applied(model), head(model, jnp.float32, to_bf16, rounded=True), drawn(model),
-                    "bf16 head", seeds=SEEDS['bf16 head'],
-                    truth_fn=head(model, jnp.float64, unrounded, rounded=True))
-    hidden = model.apply(params, ids, method=CausalTransformer.hidden_states)
-    table = params["params"]["embed_tokens"]["embedding"]
-    exact = jnp.einsum("...d,vd->...v", hidden.astype(jnp.float32),
-                       table.astype(jnp.bfloat16).astype(jnp.float32),
-                       precision=jax.lax.Precision.HIGHEST)
-    assert not np.array_equal(np.asarray(logits), np.asarray(exact))
+        assert_as_exact(applied(model), head(model, jnp.float32, to_bf16, rounded=True), drawn(model),
+                        "bf16 head", seeds=SEEDS['bf16 head'],
+                        truth_fn=head(model, jnp.float64, unrounded, rounded=True))
+        hidden = model.apply(params, ids, method=CausalTransformer.hidden_states)
+        table = params["params"]["embed_tokens"]["embedding"]
+        exact = jnp.einsum("...d,vd->...v", hidden.astype(jnp.float32),
+                           table.astype(jnp.bfloat16).astype(jnp.float32),
+                           precision=jax.lax.Precision.HIGHEST)
+        assert not np.array_equal(np.asarray(logits), np.asarray(exact))
 
-    strict = tiny(dtype=jnp.bfloat16, precision="highest")
-    assert_as_exact(applied(strict), head(strict, jnp.float32, unrounded, rounded=False), drawn(strict),
-                    "strict head", seeds=SEEDS['strict head'],
-                    truth_fn=head(strict, jnp.float64, unrounded, rounded=False))
+        strict = tiny(dtype=jnp.bfloat16, precision="highest")
+        assert_as_exact(applied(strict), head(strict, jnp.float32, unrounded, rounded=False), drawn(strict),
+                        "strict head", seeds=SEEDS['strict head'],
+                        truth_fn=head(strict, jnp.float64, unrounded, rounded=False))
 
 
 def test_the_rmsnorm_cast_order_is_a_field_that_bf16_tells_apart(rng):

@@ -259,6 +259,54 @@ def test_a_scoring_server_compiles_its_passes_up_front_and_none_while_it_serves(
         assert not compiled_while_serving(server)
 
 
+def test_a_call_over_requests_scores_in_a_servers_passes_over_its_programs(decide, caplog):
+    """`Decide`'s call over requests scores them in the passes a scoring server runs (`RowScoring`, one
+    path for a call and a server, ledger 2514): over a task whose budget declares its widths, after its
+    passes' programs compile up front (`compile_scoring`), requests of every length, question and option
+    count compile no forward, and each is answered as its lone call answers it, in the fields a padded
+    pass cannot move."""
+    import logging
+
+    from test_decision_batches import CASES
+
+    from dew.decision import Question
+    from dew.decision.task import Budget
+
+    declared = replace(decide, budget=Budget(options=16))
+    declared.compile_scoring()
+    requests = [(body["state"], {name: Question.from_wire(wire) for name, wire in body["questions"].items()})
+                for body in [*CASES.values(), REQUEST]]
+    with jax.log_compiles(), caplog.at_level(logging.WARNING):
+        caplog.clear()
+        together = declared(requests)
+        compiled = [record.getMessage() for record in caplog.records
+                    if record.getMessage().startswith("Compiling jit(logits)")]
+    assert not compiled, compiled
+    def discrete(answers) -> dict:
+        # The fields a padded pass cannot move (tests/test_decision_batches.py's `DISCRETE`).
+        return {name: (answer.kind, int(np.argmax(answer.probabilities)), answer.abstained)
+                for name, answer in answers.items()}
+
+    for (state, questions), answers in zip(requests, together, strict=True):
+        assert discrete(answers) == discrete(declared(state, questions))
+
+
+def test_a_scoring_pass_looks_at_every_waiting_request(decide):
+    """A pass takes rows from every waiting request while its plan takes them, not from a bounded few: a
+    hundred short requests one pass's windows hold are answered in one step, where a pass of 64 requests
+    at most left the rest to a second, its windows part empty (ledger 2514)."""
+    from dew.decision import Question
+
+    single = {**REQUEST, "questions": dict(list(REQUEST["questions"].items())[:1])}
+    questions = {name: Question.from_wire(wire) for name, wire in single["questions"].items()}
+    plan = decide.planned()
+    assert all(plan.add(row) for _ in range(100) for row in decide._encoded(single["state"], questions))
+    server = ScoringServer(*decide.scoring())
+    futures = [server.submit(single) for _ in range(100)]
+    server.step()
+    assert all(future.done() for future in futures)
+
+
 def test_a_reload_after_a_cancelled_request_plans_the_next_pass_with_the_new_task(decide):
     """A request cancelled while it waits leaves the queue as its pass is chosen, and with it any plan of its
     row, so the request after it, laid out by the task a reload put in place, is planned by that task: a

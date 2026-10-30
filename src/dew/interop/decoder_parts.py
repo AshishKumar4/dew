@@ -13,7 +13,7 @@ import dataclasses
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import NamedTuple, NoReturn, NotRequired, Protocol, TypedDict
+from typing import TYPE_CHECKING, NamedTuple, NoReturn, NotRequired, Protocol, TypedDict
 
 import jax
 import jax.numpy as jnp
@@ -35,6 +35,9 @@ from dew.nn.hyper_connections import HyperConnections
 from dew.nn.mixers import AttentionMixer, MixerBase
 from dew.nn.rope import RopeScaling, YarnScaling
 from dew.registry import from_record, to_record
+
+if TYPE_CHECKING:
+    from dew.diffusion.discrete import Confident, Unmask
 
 # The KV cache is allocated at the full decode length, so a 128k-context
 # checkpoint would allocate one of those whether the caller asked or not.
@@ -1461,11 +1464,17 @@ def decoder_tensors(family: "DecoderFamily", model: CausalTransformer, variables
     if model.layer_scalar == 'frozen' and isinstance(constants, Mapping):
         leaves.update({('params', *path): value for path, value in flatten_dict(dict(constants)).items()
                        if path[-1] == 'layer_scalar'})
+    # The stacked experts' leaves, each written one tensor an expert: the routed MLP's projections and the
+    # value experts' (`RoutedValues`), whose router sits beside them unstacked.
+    stacked = {'mlp': None if model.mixture is None else model.mixture.experts,
+               'self_attn': None if model.value_experts is None else model.value_experts.experts}
+
     def names(path: tuple[str, ...]) -> str | tuple[str, ...] | None:
-        if (len(path) == 6 and path[2:4] == ('mlp', 'experts') and path[-1] == 'kernel'
-                and model.mixture is not None):
+        count = stacked.get(path[2]) if len(path) == 6 else None
+        if (count is not None and path[3] == 'experts' and path[-1] == 'kernel'
+                and (path[2] == 'mlp' or path[4] == 'v_proj')):
             named = tuple(family.tensor_name('.'.join(expert_path(path, expert)[1:]), config)
-                          for expert in range(model.mixture.experts))
+                          for expert in range(count))
             if any(name is None for name in named):
                 raise ValueError(f'{path} has no tensor name for each expert')
             return tuple(name for name in named if name is not None)
@@ -1894,15 +1903,18 @@ class SourceCode:
 
 @dataclass(frozen=True)
 class MaskedWalk:
-    """How a masked diffusion release generates, its own recipe: a response walked `block` places at a
-    time over `steps` each, drawing at `temperature` and revealing the draws past `threshold` of their
-    distribution, else a quota's most confident (`dew.diffusion.discrete.Confident`), as LLaDA2.0's
-    `generate` defaults do (modeling_llada2_moe.py's block_length, steps, threshold and temperature)."""
+    """How a masked diffusion release generates, its own recipe: its `solver`
+    (`dew.diffusion.discrete`'s `Confident` for LLaDA2.0's reveal, `Unmask` for Dream's `origin`),
+    `steps` a walk, a block's where the response is walked `block` places at a time (LLaDA2.0's
+    `generate`), the time its grid runs to (`DiscreteProcess.endpoint`, Dream's `eps`), None for
+    MDLM's, and the generation config's controls it reads (`reads`, Dream's `alg`, `steps`, `eps` and
+    the rest), which a task built from it takes as its own and refuses no more (`audit_masked`)."""
 
-    block: int
+    solver: "Unmask | Confident"
     steps: int
-    threshold: float
-    temperature: float
+    block: int | None = None
+    endpoint: float | None = None
+    reads: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -1997,10 +2009,12 @@ class DecoderFamily:
     """Config fields whose explicit null disables a component. Other null export fields remove
     a generic field the family does not read; these survive as JSON null instead of taking the
     source config class's default."""
-    masked_walk: Callable[[Mapping[str, object]], MaskedWalk | None] | None = None
-    """The release's own generation recipe for a masked diffusion source that walks in blocks, by its
-    config (`MaskedWalk`), which its task runs (`PretrainedMaskedDecoder.masked_recipe`); None, or a
-    config it maps to None, unmasks the whole response with Dew's MDLM."""
+    masked_walk: Callable[[Mapping[str, object], Mapping[str, object], SourceCode | None],
+                          MaskedWalk | None] | None = None
+    """The release's own generation recipe for a masked diffusion source, by its config, its
+    generation config and its own code (`MaskedWalk`), which its task runs
+    (`PretrainedMaskedDecoder.masked_walk`); None, or a source it maps to None, unmasks the whole
+    response with Dew's MDLM."""
     padding_idx: bool = False
     """Whether the source builds its token embeddings with padding_idx=config.pad_token_id
     (nn.Embedding's, or Gemma's scaled word embedding over it), so the pad row takes no gradient

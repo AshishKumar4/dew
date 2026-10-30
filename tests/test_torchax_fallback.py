@@ -696,16 +696,18 @@ def test_the_output_table_scores_as_the_bf16_forward_whatever_dtype_the_states_a
     rounds the logits to bf16. The output table carries that compute dtype,
     so states handed to it in fp32, as a loss may hold them, score as the
     forward's own logits do: bf16 values, each within one bf16 step of the
-    forward's, which sums the same products in another order."""
-    loaded = Pretrained.load(source[0], fallback="torchax", dtype="bfloat16")
-    table = loaded.model.apply(loaded.variables, method="output_table")
-    hidden = loaded.model.apply(loaded.variables, jnp.asarray(tokens), method="hidden_states")
-    logits = np.asarray(loaded.model.apply(loaded.variables, jnp.asarray(tokens)))
-    scored = np.asarray(table.logits(hidden.astype(jnp.float32)), np.float32)
-    np.testing.assert_array_equal(scored, np.asarray(jnp.asarray(scored, jnp.bfloat16), np.float32))
-    # A bf16 value is an fp32 one's upper 16 bits, so neighbours differ by one there.
-    apart = (scored.view(np.int32) >> 16) - (logits.astype(np.float32).view(np.int32) >> 16)
-    assert np.abs(apart).max() <= 1
+    forward's, which sums the same products in another order.
+    Under JAX's default precision, as a run's default numerics multiply."""
+    with jax.default_matmul_precision(None):
+        loaded = Pretrained.load(source[0], fallback="torchax", dtype="bfloat16")
+        table = loaded.model.apply(loaded.variables, method="output_table")
+        hidden = loaded.model.apply(loaded.variables, jnp.asarray(tokens), method="hidden_states")
+        logits = np.asarray(loaded.model.apply(loaded.variables, jnp.asarray(tokens)))
+        scored = np.asarray(table.logits(hidden.astype(jnp.float32)), np.float32)
+        np.testing.assert_array_equal(scored, np.asarray(jnp.asarray(scored, jnp.bfloat16), np.float32))
+        # A bf16 value is an fp32 one's upper 16 bits, so neighbours differ by one there.
+        apart = (scored.view(np.int32) >> 16) - (logits.astype(np.float32).view(np.int32) >> 16)
+        assert np.abs(apart).max() <= 1
 
 
 def tied_float32(tmp_path):
@@ -717,22 +719,25 @@ def tied_float32(tmp_path):
     return loaded
 
 
-def test_a_float32_forward_and_its_output_table_multiply_float32_products(tokens, tmp_path):
-    """A float32 torchax model multiplies every product of its forward, torch's operators that
-    state no precision among them, at HIGHEST, as its output table does, under JAX's own default
-    precision: the two reads of the same logits take the same arithmetic, where the forward ran
-    TF32 on a GPU and the table float32 products."""
+def test_a_float32_forward_and_its_output_table_multiply_in_ieee_float32(tokens, tmp_path):
+    """A float32 torchax model that states no precision multiplies every product of its forward in IEEE
+    float32, as the torch code it runs does (torch's float32 matmul, TF32 off), and its output table's
+    head alike (`dew.nn.precision.exact_float32`, ledger 2500), under JAX's own default precision: the
+    two reads of the same logits take the same arithmetic."""
     loaded = tied_float32(tmp_path)
     ids = jnp.asarray(tokens[:, :SEQ])
     highest = (jax.lax.Precision.HIGHEST, jax.lax.Precision.HIGHEST)
+    vocab = loaded.model.apply(loaded.variables, method="output_table").matrix.shape[0]
     for read in (lambda variables: loaded.model.apply(variables, ids),
                  lambda variables: loaded.model.apply(variables, method="output_table").logits(
                      loaded.model.apply(variables, ids, method="hidden_states"))):
         with jax.default_matmul_precision(None):
             graph = jax.make_jaxpr(read)(loaded.variables)
-        products = [equation.params["precision"] for equation in equations(graph)
-                    if equation.primitive.name == "dot_general"]
-        assert products and all(precision == highest for precision in products), products
+        products = [(equation.params["precision"],
+                     any(vocab in variable.aval.shape for variable in equation.invars))
+                    for equation in equations(graph) if equation.primitive.name == "dot_general"]
+        assert any(head for _, head in products), products
+        assert all(precision == highest for precision, _ in products), products
 
 
 def test_a_float64_forwards_logits_are_as_wide_as_its_output_tables(tokens, tmp_path):

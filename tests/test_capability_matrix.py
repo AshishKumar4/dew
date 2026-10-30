@@ -460,12 +460,12 @@ def assert_trains(objective, batch: Mapping, directory: Path, *, evaluated: Mapp
     or variable, does not. The trainer builds the tree, and its step on the batch logs a finite
     loss and leaves every trained leaf finite, some of them moved: Adam's
     first update moves a leaf exactly where its gradient is nonzero, and a
-    gradient that is not finite would leave the leaf so. The run checkpoints
-    its step, and evaluation scores `evaluated` (the batch by default) to
+    gradient that is not finite would leave the leaf so. The run trains two
+    steps, checkpointing each, and evaluation scores `evaluated` (the batch by default) to
     finite artifacts, or, for an objective that scores no tokens (`scores`
     False), to none; a second evaluation runs the programs the first
-    compiled, tracing nothing. The run resumes from its checkpoint onto the
-    run that never stopped (`assert_resumes`). `data` replaces the batch stream
+    compiled, tracing nothing. A run resumed from its first checkpoint ends on
+    this run, which never stopped (`assert_resumes`). `data` replaces the batch stream
     with the method's own; a method that trains on what its `rollout` samples
     from the batch, not on the batch (`sampled` False), has no sample field to
     check.
@@ -482,44 +482,44 @@ def assert_trains(objective, batch: Mapping, directory: Path, *, evaluated: Mapp
     checkpoints = Checkpoints(str(directory))
     trainer = Trainer(objective, optax.adam(1e-3), key=0, checkpoints=checkpoints, tracker=tracker,
                       rollout=rollout)
-    # The state fit places, which a run that never stopped starts from too.
-    initial, _, _ = trainer.place()
-    started = jax.device_get(initial.variables["params"])
     if data is None:
         data = Loader(replayed(lambda partition: itertools.repeat(batch)), None, batch=ROWS, records=None)
-    state = trainer.fit(data, steps=1, log_every=1, state=initial)
+    # A fresh fit, its own batch-aware startup the one a run that never stopped takes.
+    state = trainer.fit(data, steps=2, log_every=1, checkpoint_every=1)
     checkpoints.wait()
     losses = [scalars["train/loss"] for _, scalars in tracker.scalars if "train/loss" in scalars]
-    assert len(losses) == 1 and np.isfinite(losses[0]), losses
+    assert len(losses) == 2 and np.all(np.isfinite(losses)), losses
     variables = jax.device_get(state.variables)
     assert finite(variables), "a trained leaf is not finite"
+    # The second step's update, from the first's checkpoint: Adam moves a leaf where its gradient is nonzero.
+    started = Checkpoints(str(directory)).variables(step=1)["params"]
     moved = [not np.array_equal(before, after) for before, after in
              zip(jax.tree.leaves(started), jax.tree.leaves(variables["params"]), strict=True)]
     assert any(moved), "the step moved no trained leaf: no gradient reached them"
-    assert Checkpoints(str(directory)).latest == 1
+    assert Checkpoints(str(directory)).latest == 2
     trained = Trained(directory, state, variables)
     artifact = objective.evaluate(variables, batch if evaluated is None else evaluated, trained.step)
     # An objective that scores no tokens evaluates to nothing (`Objective.evaluate`).
     assert (artifact is not None and finite(artifact)) if scores else artifact is None, artifact
     with steady_state(allow=("host_to_device", "device_to_host")):
         objective.evaluate(variables, batch if evaluated is None else evaluated, trained.step)
-    assert_resumes(objective, data, directory, rollout)
+    assert_resumes(objective, data, directory, rollout, trainer, state)
     return trained
 
 
-def assert_resumes(objective, data, directory: Path, rollout) -> None:
+def assert_resumes(objective, data, directory: Path, rollout, whole: Trainer, uninterrupted) -> None:
     """A new trainer resumed from the run's first checkpoint ends its second step on every leaf of
-    a run of two steps that never stopped, bit for bit, keys as their raw bits, and its step reads
-    the restored state as that run's read its fresh one: the same avals, shardings and formats, so
-    it runs the program the persistent cache holds for the step. It resumes from a copy of the
-    checkpoint's directory, so the checkpoint the cell reloads stays the first step's."""
+    the run's own two steps (`whole`'s, ending at `uninterrupted`), which never stopped, bit for bit,
+    keys as their raw bits, and its step reads the restored state as that run's read its fresh one:
+    the same avals, shardings and formats, so it runs the program the persistent cache holds for the
+    step. It resumes from a copy of the run's directory holding its first step alone, so the
+    checkpoint the cell reloads stays the run's last."""
     copied = directory.with_name(f"{directory.name}-resumed")
     shutil.copytree(directory, copied)
+    shutil.rmtree(Checkpoints(str(copied)).path(2))
     resumed = Trainer(objective, optax.adam(1e-3), key=0, checkpoints=Checkpoints(str(copied)),
                       rollout=rollout)
     after = resumed.fit(data, steps=2, log_every=1, checkpoint_final=False)
-    whole = Trainer(objective, optax.adam(1e-3), key=0, rollout=rollout)
-    uninterrupted = whole.fit(data, steps=2, log_every=1)
     assert int(after.step) == int(uninterrupted.step) == 2
 
     def bits(tree):

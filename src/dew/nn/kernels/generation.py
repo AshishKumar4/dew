@@ -21,6 +21,10 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from jax.sharding import AbstractMesh, Mesh
 
+    from dew.nn.precision import Numerics
+
+    from .selection import Refusal
+
 _log = logging.getLogger(__name__)
 
 ASSUMED: contextvars.ContextVar[str | None] = contextvars.ContextVar("assumed_generation", default=None)
@@ -95,6 +99,38 @@ def chosen(**kernels: str) -> Iterator[None]:
     _named(kernels)
     with cache.KERNEL_CHOICES(tuple(sorted({**dict(cache.KERNEL_CHOICES.value), **kernels}.items()))):
         yield
+
+
+_NUMERICS: contextvars.ContextVar[Numerics | None] = contextvars.ContextVar("dew_numerics", default=None)
+
+
+def numerics() -> Numerics:
+    """The run's numerics in effect (`run_precision`), the defaults outside any."""
+    from dew.nn.precision import Numerics
+
+    held = _NUMERICS.get()
+    return Numerics() if held is None else held
+
+
+@contextlib.contextmanager
+def run_precision(policy: Numerics) -> Iterator[None]:
+    """Within the block, programs trace under a run's numerics' products and forms
+    (`dew.nn.precision.Numerics`): every product that states no precision at `policy.matmul`
+    (`jax.default_matmul_precision`; "default" leaves JAX's configuration as it stands), and each op's
+    accurate form where its forms are "accurate", the attention template's (`attention_form`) among
+    them. The dtypes are the model's and the optimizer's own fields, which the run sets from the
+    numerics: a bf16 operand has lost its bits before any product reads it, whatever its precision."""
+    import jax
+
+    matmul = policy.matmul if isinstance(policy.matmul, str) else policy.matmul.name
+    stated = contextlib.nullcontext() if matmul == "default" else jax.default_matmul_precision(matmul)
+    forms = chosen(attention_form="accurate") if policy.forms == "accurate" else contextlib.nullcontext()
+    token = _NUMERICS.set(policy)
+    try:
+        with stated, forms:
+            yield
+    finally:
+        _NUMERICS.reset(token)
 
 
 PALLAS_CHOICES = frozenset({'pallas', 'fla'})
@@ -621,22 +657,6 @@ def chosen_kernel(choice: str, default: str) -> str:
     return dict(cache.KERNEL_CHOICES.value).get(choice, default)
 
 
-@dataclasses.dataclass(frozen=True)
-class Refusal:
-    """Why the kernel a target prefers does not take a call, from the call's own facts on that
-    target (its shapes, dtypes, mask): a stable `code`, which a kernel's `SUPPORTS` keys its declared
-    limits on, and the `detail` a log names. What the host cannot run is no refusal (`Route.ran`)."""
-
-    code: str
-    detail: str
-    row: str | None = None
-    """The roadmap or ledger row that tracks lifting the limit (`dew.nn.kernels.selection.Requirement`),
-    `INHERENT` where no implementation of the kernel lifts it, None for a refusal no requirement gives
-    (an analysis's own, which its op's requirements read)."""
-
-    def __str__(self) -> str:
-        return self.detail
-
 
 INHERENT = 'inherent'
 """The row of a limit no implementation of the kernel lifts (`Refusal.row`)."""
@@ -649,7 +669,8 @@ class Route:
     runs for `choice` at `site` (module:function), `preferred` what it runs where nothing refuses (`chosen`,
     or its selector's preference), `refusal` why `preferred` did not take the
     call, and `ran` what this host executed, `kernel` but where the host cannot run it (cuDNN within
-    `assumed` on a CPU). A route is generic exactly where `kernel != preferred`."""
+    `assumed` on a CPU), and `forced` the kernel the call named or `chosen` named, which forced the choice
+    (None where the selector chose). A route is generic exactly where `kernel != preferred`."""
 
     choice: str
     kernel: str
@@ -658,6 +679,7 @@ class Route:
     ran: str
     target: str
     site: str
+    forced: str | None = None
 
 
 class _Routes:
@@ -694,7 +716,7 @@ _logged: set[tuple[str, str, str]] = set()
 
 
 def route(choice: str, *, kernel: str, preferred: str | None = None, refusal: Refusal | None = None,
-          ran: str | None = None) -> Route:
+          ran: str | None = None, forced: str | None = None) -> Route:
     """Report the dispatch of `choice` to `kernel`, the one call every dispatch site makes once it has
     decided (`dew.nn.kernels.selection.select`): `preferred` defaults to the kernel `chosen` names, else
     `kernel`; `ran` is what this host executes, `kernel` by default. Every `routes` block open records it.
@@ -705,7 +727,7 @@ def route(choice: str, *, kernel: str, preferred: str | None = None, refusal: Re
     _named((choice,))
     generation = device_generation()
     preferred = preferred or dict(cache.KERNEL_CHOICES.value).get(choice) or kernel
-    found = Route(choice, kernel, preferred, refusal, ran or kernel, generation, _site())
+    found = Route(choice, kernel, preferred, refusal, ran or kernel, generation, _site(), forced)
     for collected in cache.KERNEL_ROUTES.value:
         collected.found.append(found)
     detail = '' if refusal is None else refusal.detail

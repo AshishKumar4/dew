@@ -19,6 +19,7 @@ from dew.config import RunConfig, TrainerConfig
 from dew.config.diffusion import DiffusionRunConfig
 from dew.data.dataset import Loader, Ramp
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.precision import Dtypes, Numerics
 from dew.nn.vision import GemmaProjector, SiglipVision
 from dew.optim import OptimConfig
 from dew.registry import Aliases, ModelConfig, projectors, towers
@@ -382,7 +383,8 @@ def test_train_runs_the_trainer_its_config_describes(tmp_path):
     trace = tmp_path / "trace"
     config = TrainerConfig(
         name="built", checkpoint_dir=str(tmp_path / "runs"), steps=3, accumulation=2,
-        dynamic_scale=True, mesh=MeshSpec(fsdp=2), layout=Layout(min_shard=1, tolerance=1.0),
+        precision=Numerics(Dtypes(compute="float16")), mesh=MeshSpec(fsdp=2),
+        layout=Layout(min_shard=1, tolerance=1.0),
         profile=ProfileWindow(str(trace), steps=1, warmup=1), eval_every=None, checkpoint_every=None)
 
     state = RunConfig(trainer=config).train(Regression(), Loader(lambda partition: batches(), None, None, 8),
@@ -640,6 +642,8 @@ def test_every_run_kind_reads_its_source_options_from_the_command_line(kind):
                                        attention={"full_attention": "block_bidirectional"})
     keywords = run.source_keywords(frozen=False)
     assert keywords["text_only"] is True and keywords["prediction_depths"] == 0 and keywords["on_host"]
+    # A source the run trains is stored in its master weights' dtype, one it keeps frozen as stored.
+    assert keywords["param_dtype"] == "float32" and run.source_keywords(frozen=True)["param_dtype"] == "auto"
     assert keywords["modeling_overrides"] == {"attention": {"full_attention": "block_bidirectional"}}
     assert type(run).from_dict(run.to_dict()).source == run.source
 
@@ -704,3 +708,17 @@ def test_a_run_branches_into_the_cooldowns_its_command_line_names():
     assert run.trainer.cooldowns == Cooldowns(at=("20%", "40%"), length="10%", shape="linear")
     assert LMRunConfig.from_dict(run.to_dict()).trainer.cooldowns == run.trainer.cooldowns
     assert LMRunConfig.cli(["--trainer.multi-host", "False"]).trainer.cooldowns is None
+
+
+def test_a_run_whose_model_names_a_component_by_its_alias_reads_back_and_takes_an_override():
+    """A run whose model names a component by an alias of another kind (a mixer's `attention`) reads
+    back from its record as it was written, and takes an override, through the translation a record of
+    an earlier main's fields reads through (`dew.inference.tasks.earlier_model`, ledger 2423)."""
+    from dew.config.lm import LMRunConfig
+    from dew.registry import ModelConfig
+
+    fields = {"emb_features": 16, "num_layers": 1, "num_heads": 2,
+              "mixer": {"class": "attention", "fields": {}}}
+    run = LMRunConfig(model=ModelConfig("causal_transformer", fields), trainer=TrainerConfig(steps=1))
+    assert LMRunConfig.from_dict(json.loads(json.dumps(run.to_dict()))).model == run.model
+    assert run.override({"trainer.steps": 3}).model == run.model

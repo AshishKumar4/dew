@@ -94,6 +94,13 @@ def pytest_runtest_makereport(item, call):
         # report reads a test's properties from where only one phase fails.
         outcome.get_result().user_properties.append(found)
         item.user_properties.append(found)
+    # The gate's sites this test moved onto YNNPACK's fusions (`reference_error.SWITCHED`), the JUnit property
+    # `ynn_switched`, so CI counts them where it reads a test's rows.
+    if call.when == "call" and gate is not None and gate.SWITCHED:
+        switched = ("ynn_switched", json.dumps(gate.SWITCHED))
+        gate.SWITCHED.clear()
+        outcome.get_result().user_properties.append(switched)
+        item.user_properties.append(switched)
 
 
 def pytest_sessionfinish(session, exitstatus):

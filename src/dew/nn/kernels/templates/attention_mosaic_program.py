@@ -16,6 +16,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 
 from dew.nn.kernels import generation
+from dew.nn.kernels.selection import Refusal
 from dew.nn.kernels.templates import attention_algebra as algebra, bundles, layout, mosaic, mosaic_sm90
 from dew.nn.kernels.templates.attention import (
     Draw,
@@ -164,8 +165,9 @@ def _parts(accurate: bool, dtype) -> int:
     return len(jax.eval_shape(lambda c: algebra.cotangent_parts(c, dtype, accurate=accurate), tile))
 
 
-DROPPING = ("the Mosaic mainloop draws dropout at its own places; a sequence exchange's slice draws at its "
-            "global places, a table gather a tile (`DropPlaces`)")
+DROPPING = Refusal('dropout_places',
+                  "the Mosaic mainloop draws dropout at its own places; a sequence exchange slice draws at "
+                  "its global places, a table gather a tile (`DropPlaces`)", row='1521')
 """Why this mainloop refuses a dropping call that draws at a slice's global places (`refused`)."""
 
 
@@ -191,7 +193,7 @@ def whole_tiles(family: mosaic.Family, tiles: "Tiles | BackwardTiles") -> bool:
 
 
 def refused(dtype, width: int, value_width: int, hooks: Hooks | None, *, backward: bool,
-            family: mosaic.Family) -> str | None:
+            family: mosaic.Family) -> Refusal | None:
     """Why this mainloop takes no call of `dtype` operands, head widths `width` and `value_width` and `hooks`
     (its forward, or with `backward` its backward) on `family`'s bundle, or None: its legality rule, which
     the ops' eligibility (`MosaicForward.eligible`, `MosaicBackward.eligible`), the route and the stability
@@ -203,18 +205,19 @@ def refused(dtype, width: int, value_width: int, hooks: Hooks | None, *, backwar
     if hooks.drop is not None and jnp.dtype(dtype) == jnp.dtype(jnp.float16):
         # fp16's dropped weights take scaled parts (`algebra.weights_parts`), which the mainloop's register
         # products do not take back (`mosaic.unscaled_part`).
-        return "the Mosaic mainloop's dropping walk takes bf16 operands, not float16"
+        return Refusal('dropout_dtype', "the Mosaic dropping walk takes bf16 operands, not float16",
+                       row='1521')
     if backward and jnp.dtype(dtype) != jnp.dtype(jnp.bfloat16):
-        return f"the Mosaic backward takes bf16 operands, not {jnp.dtype(dtype)}"
+        return Refusal('dtype', f"the Mosaic backward takes bf16 operands, not {jnp.dtype(dtype)}")
     if jnp.dtype(dtype) not in sixteen:
-        return f"the Mosaic mainloop takes 16-bit operands, not {jnp.dtype(dtype)}"
+        return Refusal('dtype', f"the Mosaic mainloop takes 16-bit operands, not {jnp.dtype(dtype)}")
     if backward and not transposable(hooks):
-        return ("the Mosaic backward holds its tiles keys first, and its score hook takes an axis of them by "
-                "an operation no layout rule takes (`layout.RULES`)")
+        return Refusal('hook_layout', "the Mosaic backward holds its tiles keys first, and its score hook "
+                       "takes an axis of them by an operation no layout rule takes (`layout.RULES`)")
     widest = max(_width(width, family, dtype), _width(value_width, family, dtype))
     if family.copy_extent is not None and widest > family.copy_extent:
-        return (f"the Mosaic mainloop loads a head {widest} wide in one copy, past the "
-                f"{family.copy_extent} one moves (`Family.copy_extent`)")
+        return Refusal('copy_extent', f"the Mosaic mainloop loads a head {widest} wide in one copy, past the "
+                       f"{family.copy_extent} one moves (`Family.copy_extent`)")
     return None
 
 

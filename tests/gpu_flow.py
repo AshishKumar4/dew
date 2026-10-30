@@ -83,8 +83,10 @@ def _parameter_sets(mark) -> list[tuple[str, dict, list]]:
     names = mark.args[0]
     names = [name.strip() for name in names.split(",")] if isinstance(names, str) else list(names)
     ids = mark.kwargs.get("ids")
+    if ids is not None and not callable(ids):
+        ids = list(ids)  # a mapping's ids are its keys, as pytest reads them
     sets = []
-    for at, value in enumerate(mark.args[1]):
+    for at, value in enumerate(list(mark.args[1])):
         given = value if isinstance(value, type(pytest.param(None))) else None
         values = given.values if given else (value,) if len(names) == 1 else tuple(value)
         if given and given.id is not None:
