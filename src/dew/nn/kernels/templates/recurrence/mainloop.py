@@ -1849,9 +1849,12 @@ def gradients(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None, fi
         after_w = after_w.reshape(heads, chunks, CHUNK)
     else:
         # The values gated, `u = v beta`: their gradient through the gate, elementwise, in fp32.
+        # The write gate's sum over the value columns, the rows' minor axis, in the rows' own layout: as the
+        # heads' `[HV, R]` it fused with the decay gradient's transpose into a 0.137 ms reduction on an H100
+        # (Nemotron-H 30B's SSD, ssd-hlo-h100-fdab2424c).
         du = dv2.astype(jnp.float32).reshape(rows, heads, columns)
         dv = (du * run.beta.T[:, :, None]).reshape(rows, heads * columns)
-        dbeta = jnp.sum(du * run.v.astype(jnp.float32).reshape(rows, heads, columns), -1).T
+        dbeta = jnp.sum(du * run.v.astype(jnp.float32).reshape(rows, heads, columns), -1)
         dk_w, after_w, decay_w = None, 0.0, 0.0
     # Each token's decay's gradient, the launches' (`algebra.summed_back` is linear in its terms) and the
     # memory's decay across each chunk: its gradient `sum(S dS)` through the decay `exp(g_last)` from the
@@ -1870,7 +1873,7 @@ def gradients(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None, fi
     ranges = jnp.flip(jnp.cumsum(jnp.flip(after, -1), -1), -1) + before
     dg = ((decay_pairs + decay_w).reshape(heads, chunks, CHUNK) + ranges
           + (memory * jnp.exp2(ending))[..., None])
-    dg, dbeta = dg.reshape(heads, rows).T, dbeta.T
+    dg, dbeta = dg.reshape(heads, rows).T, dbeta.T if delta else dbeta
 
     def headed(x, size):
         """`[R, HV * size]` laid back as `[B, T, HV, size]`."""
