@@ -805,7 +805,8 @@ def key_decayed_pairs(rows: Callable[[int], jax.Array], keys: Callable[[int], ja
             # static rows, their addresses were hoisted to the kernel's start and held through it (260 of an
             # H100's 475 registers at the peak).
             halves = separated(*reference(s, c))
-            return tuple(jnp.where(index >= s * sub, half[None, :], under) for half, under in zip(halves, below))
+            return tuple(jnp.where(index >= s * sub, half[None, :], under)
+                         for half, under in zip(halves, below, strict=True))
 
         start = jax.lax.fori_loop(0, chunk // sub, laid, (jnp.zeros(index.shape, jnp.float32),) * 2)
         down = rows(c) * between(prefix, start)
