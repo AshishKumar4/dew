@@ -142,10 +142,13 @@ def enable_compilation_cache(path: str):
     # in the cache directory would name one directory for every jaxlib and write picks from a
     # process this policy keeps to reading (`jax._src.compiler.get_compile_options`).
     jax.config.update('jax_persistent_cache_enable_xla_caches', 'none')
-    # Defaults skip small/fast compilations; a training step is neither, and
-    # caching everything keeps startup predictable.
-    jax.config.update('jax_persistent_cache_min_entry_size_bytes', -1)
-    jax.config.update('jax_persistent_cache_min_compile_time_secs', 0.0)
+    # JAX's defaults skip small and fast compilations; a run's many small programs (its schedule, its
+    # metrics, its data's transforms) each compile again on every restart without them, so every
+    # program is cached, unless the user named a threshold (JAX_PERSISTENT_CACHE_MIN_*), which is theirs.
+    if 'JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES' not in os.environ:
+        jax.config.update('jax_persistent_cache_min_entry_size_bytes', -1)
+    if 'JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS' not in os.environ:
+        jax.config.update('jax_persistent_cache_min_compile_time_secs', 0.0)
     flags = os.environ.get('XLA_FLAGS', '')
     if '--xla_gpu_per_fusion_autotune_cache_dir' not in flags:
         picks = autotune_dir(path) if keeps_picks() else ''

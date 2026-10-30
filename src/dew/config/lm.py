@@ -138,8 +138,13 @@ class LMRunConfig(DecoderRunConfig):
     `processor`. A step whose optimizer clips by the attention logit maxima
     (`muonclip`) asks the objective for them (`Step.qk_stats`), whichever
     objective it is."""
+    # bf16 compute over float32 parameters: half the activations' memory and the matmuls on a GPU's or
+    # TPU's tensor cores, the precision mixed-precision training keeps (the parameters and the
+    # optimizer float32); a float32 run names "dtype": "float32".
     model: ModelConfig = dataclasses.field(
         default_factory=lambda: ModelConfig("causal_transformer", {"dtype": "bfloat16"}))
+    # GPT-3 Small's (Brown et al. 2020, table 2.1 and appendix B): peak rate 6e-4, weight decay 0.1,
+    # the gradient's global norm clipped at 1.0, as nanoGPT trains its 124M model.
     optim: OptimConfig = dataclasses.field(
         default_factory=lambda: OptimConfig(
             learning_rate=6e-4,

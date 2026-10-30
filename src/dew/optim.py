@@ -1377,9 +1377,9 @@ class ParamGroup:
     patterns: tuple[str, ...] = ()
     learning_rate_multiplier: float = 1.0
     weight_decay: float | None = None
-    spared: bool = False
-    """Whether the group's decay spares its biases and vectors as an ungrouped optimizer's does
-    (`weight_decay_mask`); False decays every parameter the group claims."""
+    spared: bool | None = None
+    """Whether the group's decay spares its biases and vectors (`weight_decay_mask`); None as its
+    config's does (`OptimConfig.spared`), False decaying every parameter the group claims."""
     schedule: ScheduleBase | None = None
     b1: ScheduleBase | None = None
     bounds: tuple[float, float] | None = None
@@ -1684,8 +1684,9 @@ class Cosine(ScheduleBase):
     """
 
     peak_value: float = dataclasses.field(metadata={'rate': True})
-    warmup_steps: int | str = 10000
-    """Its warmup in its own steps, or a share of the run such as `5%` (`ScheduleBase._warmup`)."""
+    warmup_steps: int | str
+    """Its warmup in its own steps, or a share of the run such as `5%` (`ScheduleBase._warmup`): stated,
+    as `optax.warmup_cosine_decay_schedule` takes it, which has no default either."""
     end_value: float = dataclasses.field(default=0.0, metadata={'rate': True})
     init_value: float = dataclasses.field(default=0.0, metadata={'rate': True})
     decay_steps: int | None = None
@@ -2075,6 +2076,11 @@ class OptimConfig:
     given one (`dew.optim.weight_decay_mask`, its `mask`); Muon decays them as Moonlight does, and
     `param_groups` replace the split. Records written before this change decayed every
     parameter; ParamGroup('all', ('*',)) restores that."""
+    spared: bool = True
+    """Whether the decay spares biases and vectors such as a norm's scale (`weight_decay_mask`), where the
+    optimizer takes a mask: nanoGPT's, Megatron Core's and timm's split, since decaying a norm's scale or
+    a bias toward zero regularizes nothing a matrix's decay does and shifts what the layer computes.
+    Optax decays every parameter (`mask=None`), which False restores; a group's own `spared` overrides it."""
     b1: float | None = None
     """Adam's first-moment decay, for adam, adamw and lamb; None keeps the optimizer's."""
     b2: float | None = None
@@ -2187,12 +2193,13 @@ class OptimConfig:
             for group in self.param_groups:
                 decay = {} if group.weight_decay is None else {'weight_decay': group.weight_decay}
                 grouped = {**opts, **decay}
-                spared = {'mask': weight_decay_mask} if group.spared and self._spares(make) else {}
+                spares = self.spared if group.spared is None else group.spared
+                spared = {'mask': weight_decay_mask} if spares and self._spares(make) else {}
                 solvers[group.name] = group.solver(make, self.learning_rate, steps, {**grouped, **spared},
                                                    clocked=clocked)
             solver = optax.multi_transform(solvers, param_labels(self.param_groups))
         else:
-            if self._spares(make):
+            if self.spared and self._spares(make):
                 opts['mask'] = weight_decay_mask
             solver = scheduled_solver(make, self.learning_rate, steps, opts, clocked=clocked)
 
@@ -2219,8 +2226,8 @@ class OptimConfig:
         rate = self.learning_rate
         peak = rate.peak() if isinstance(rate, ScheduleBase) else rate
         multiplier = max(1.0, FRESH_LEARNING_RATE / peak) if peak > 0 else 1.0
-        return (ParamGroup("fresh", fresh=True, learning_rate_multiplier=multiplier, spared=True),
-                ParamGroup("base", ("*",), spared=True))
+        return (ParamGroup("fresh", fresh=True, learning_rate_multiplier=multiplier),
+                ParamGroup("base", ("*",)))
 
     def with_fresh(self, modules: Sequence[str]) -> OptimConfig:
         """This config with each group that claims the fresh modules (`ParamGroup.fresh`) matching the
