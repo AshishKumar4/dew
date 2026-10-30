@@ -61,8 +61,8 @@ LETTERED = StateFirstLayout(
                           noul_first="false"),
               AnswerCue(template="\nAnswer:", many="\nAnswer:")),
     reads=Reads((("row", "self", "causal"), ("row", "question", "whole"), ("question", "self", "causal"))))
-"""A lettered row's two streams (row 2008 in one pass): the state and the cue read the whole question,
-the question and its lettered options themselves alone."""
+"""A lettered row's two streams, its question in one pass with it: the state and the cue read the whole
+question, the question and its lettered options themselves alone."""
 JOINT_QUESTIONS = {"pick": Choice("Which one?", ["a", "b", "c"]), "close": Choice("Closest?", ["x", "y"])}
 ROWS = ["one two three", "four five", "six seven eight nine", "ten eleven", "twelve", "thirteen fourteen"]
 

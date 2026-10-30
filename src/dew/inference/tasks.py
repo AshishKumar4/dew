@@ -29,7 +29,7 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 from jax.typing import ArrayLike, DTypeLike
 
 from dew._coordination import agreed
-from dew._records import earlier_segments, integer, record as named_fields, strings, text as named
+from dew._records import earlier_fields, integer, record as named_fields, strings, text as named
 from dew.batch import (
     COORDINATES_FIELD,
     PARAMETER_ROOTS,
@@ -525,12 +525,8 @@ def earlier_shapes(record: Mapping[str, object]) -> Mapping[str, object]:
         from dew.registry import to_record
 
         current["processor"] = to_record(SourceReference.parse(processor), SourceReference)
-    laid = current.get("layout")
-    if isinstance(laid, Mapping) and isinstance(laid.get("fields"), Mapping):
-        fields = laid["fields"]
-        segments = fields.get("segments")
-        if isinstance(segments, list | tuple):
-            current["layout"] = {**laid, "fields": {**fields, "segments": earlier_segments(segments)}}
+    # Each component in today's fields, those its class lost since left out (`earlier_fields`).
+    current = {key: earlier_fields(value) for key, value in current.items()}
     if "attention_form" in current:
         # The form a step trained in, which its numerics' forms hold now (ledger 2500).
         current["precision"] = {"forms": current.pop("attention_form")}
