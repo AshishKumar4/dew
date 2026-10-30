@@ -399,8 +399,9 @@ def test_the_precision_seams_hold_every_order(edge):
     numerator, denominator = normal_draw(2648, (5, 4), (5, 4), scale=EDGES[edge])
     numerator_direction, denominator_direction = normal_draw(2649, (5, 4), (5, 4), scale=EDGES[edge])
     (cotangent,) = normal_draw(2650, (5, 4))
-    # Denominators away from zero, so the quotient is a normal float32 wherever float64's is.
-    denominator = jnp.where(jnp.abs(denominator) < 0.25 * EDGES[edge], 0.25 * EDGES[edge], denominator)
+    # Denominators a quarter of the scale or more from zero, so the quotient is a normal float32 wherever
+    # float64's is.
+    denominator = jnp.copysign(jnp.abs(denominator) + 0.25 * EDGES[edge], denominator)
     assert_contract(precision.correctly_rounded_divide, (numerator, denominator),
                     (numerator_direction, denominator_direction), cotangent,
                     f"a correctly rounded division {edge}", truth_fn=jnp.divide, plain_fn=jnp.divide)
