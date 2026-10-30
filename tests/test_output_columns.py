@@ -57,17 +57,19 @@ def test_a_tables_columns_are_its_logits_restricted_to_them(dtype, vocab_major):
 
 def test_exact_columns_compute_in_fp32_whatever_the_tables_compute():
     """A bf16 table's exact columns are the columns of the same table held in fp32 and computed in it
-    at fp32 precision, bit for bit: the product is not rounded to bf16 as its logits' is."""
-    rng = np.random.default_rng(0)
-    head = table(rng, jnp.bfloat16, vocab_major=True)
-    hidden = jnp.asarray(rng.standard_normal((4, FEATURES)), jnp.bfloat16)
-    wide = OutputTable(jnp.asarray(head.matrix, jnp.float32), vocab_major=True, bias=head.bias,
-                       softcap=head.softcap, precision=jax.lax.Precision.HIGHEST, compute=jnp.float32,
-                       scale=head.scale)
-    np.testing.assert_array_equal(np.asarray(head.columns(hidden, IDS, exact=True)),
-                                  np.asarray(wide.columns(jnp.asarray(hidden, jnp.float32), IDS)))
-    assert not np.array_equal(np.asarray(head.columns(hidden, IDS)), np.asarray(wide.columns(
-        jnp.asarray(hidden, jnp.float32), IDS)))
+    at fp32 precision, bit for bit: the product is not rounded to bf16 as its logits' is.
+    Under JAX's default precision, as a run's default numerics multiply."""
+    with jax.default_matmul_precision(None):
+        rng = np.random.default_rng(0)
+        head = table(rng, jnp.bfloat16, vocab_major=True)
+        hidden = jnp.asarray(rng.standard_normal((4, FEATURES)), jnp.bfloat16)
+        wide = OutputTable(jnp.asarray(head.matrix, jnp.float32), vocab_major=True, bias=head.bias,
+                           softcap=head.softcap, precision=jax.lax.Precision.HIGHEST, compute=jnp.float32,
+                           scale=head.scale)
+        np.testing.assert_array_equal(np.asarray(head.columns(hidden, IDS, exact=True)),
+                                      np.asarray(wide.columns(jnp.asarray(hidden, jnp.float32), IDS)))
+        assert not np.array_equal(np.asarray(head.columns(hidden, IDS)), np.asarray(wide.columns(
+            jnp.asarray(hidden, jnp.float32), IDS)))
 
 
 def test_columns_outside_the_vocabulary_are_refused():
