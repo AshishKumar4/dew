@@ -39,7 +39,8 @@ import pytest
 from delta_rule_support import fused_step, recurrence, through
 from flax import linen as nn
 from model_support import decode_through
-from reference_error import as_given, assert_as_exact, assert_as_exact_as_the_reference, widened
+from one_draw import assert_as_exact_as_the_reference
+from reference_error import as_given, assert_as_exact, widened
 
 from dew.batch import coordinates
 from dew.nn.inputs import AttentionMetadata, MixerCall

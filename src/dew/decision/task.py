@@ -70,7 +70,14 @@ from dew.decision.questions import (
 )
 from dew.files import write_atomically
 from dew.inference import scoring
-from dew.inference.tasks import SavedRun, SavedRunTask, length_ladder, shape_bucket
+from dew.inference.tasks import (
+    InItsForm,
+    SavedRun,
+    SavedRunTask,
+    length_ladder,
+    shape_bucket,
+    traced_in_its_form,
+)
 from dew.interop.processors import Processor
 from dew.interop.safetensors_io import MAX_SHARD_SIZE
 from dew.interop.sources import SourceReference
@@ -194,8 +201,20 @@ class DecideSettings:
     which a pass of its task pads each question to (`Budget.options`); None as `questions`."""
 
 
+def _calibrated(directory: str) -> tuple[Mapping[str, object], Weights] | None:
+    """The calibration `Decide.save` wrote into the run in `directory` (`TASK_FILE`) and the weights it
+    was fitted on; None where it wrote none."""
+    from dew.registry import from_record
+
+    saved = epath.Path(directory) / TASK_FILE
+    if not saved.exists():
+        return None
+    settings = _records.record(json.loads(saved.read_text()), TASK_FILE)
+    return settings, from_record(Weights, _records.json_value(settings["weights"], "weights"))
+
+
 @dataclass(frozen=True)
-class Decide(SavedRunTask):
+class Decide(SavedRunTask, InItsForm):
     """Answers typed questions about a state, with one forward pass per batch.
 
     `decide(state, questions)` returns one answer per question, with its
@@ -284,6 +303,18 @@ class Decide(SavedRunTask):
                    name=str(epath.Path(directory).name), weights=weights, processor=processor, budget=budget)
 
     @classmethod
+    def default_step(cls, directory: str) -> int | None:
+        """The step the run's calibration (`TASK_FILE`) was fitted on where that is the step the run
+        ranked best: a run that ended on its best step (`restore_best`) calibrates that step and loads
+        it. Else its latest, which refuses a calibration fitted on another (`calibration`)."""
+        saved = _calibrated(directory)
+        if saved is None:
+            return None
+        with Checkpoints(directory) as checkpoints:
+            best = checkpoints.best
+        return saved[1].step if saved[1].step == best else None
+
+    @classmethod
     def from_saved(cls, run: SavedRun, *, ema: bool | None = None, mesh: "MeshSpec | Mesh | None" = None,
                    layout: "Placement | None" = None, dtype: DTypeLike | None = None,
                    param_dtype: DTypeLike | None = None) -> Self:
@@ -309,11 +340,10 @@ class Decide(SavedRunTask):
         backbone = saved_model(record, dtype).build()
         task = cls._recorded(directory, record, backbone, variables, Weights(step, averaged), dtype)
         task = replace(task, variables=_served(task.model, task.variables))
-        saved = epath.Path(directory) / TASK_FILE
-        if not saved.exists():
+        saved = _calibrated(directory)
+        if saved is None:
             return task
-        settings = _records.record(json.loads(saved.read_text()), TASK_FILE)
-        fitted = from_record(Weights, _records.json_value(settings["weights"], "weights"))
+        settings, fitted = saved
         # An average's own directory names the runs it averages beside the step it holds (`save`).
         if (fitted.step, fitted.ema) != (step, averaged):
             raise ValueError(
@@ -465,6 +495,7 @@ class Decide(SavedRunTask):
             checkpoints.save(self.weights.step, state, artifact=DecisionObjective(self).inference_record())
             checkpoints.wait()
 
+    @traced_in_its_form
     def __call__(self, state: JSON, questions: Mapping[str, Question], *,
                  images: Sequence[Image.Image] = (), context: JSON | None = None) -> dict[str, Answer]:
         """Return one answer per question in `questions`, about `state` and any `images`.
@@ -756,6 +787,7 @@ class Decide(SavedRunTask):
                 found[index] = logits[window, np.flatnonzero(owners == order)]
         return found
 
+    @traced_in_its_form
     def _forward(self, variables: Variables, inputs: DecisionInputs, *,
                  media: ModelInputs | None = None) -> jax.Array:
         """`model.logits`, compiled with the XLA options its backbone and head take where they run

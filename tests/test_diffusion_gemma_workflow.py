@@ -119,7 +119,7 @@ def assert_transformers_reads(export, model, variables, reference):
     prompt and canvas, in fp32 and float64, hold Dew's (`model` on
     `variables`) to tests/reference_error.py's rule. Returns its fp32 model."""
     import torch
-    from reference_error import assert_as_exact_as_the_reference
+    from one_draw import assert_as_exact_as_the_reference
     from test_block_diffusion import prefill
     from transformers.models.diffusion_gemma.modeling_diffusion_gemma import DiffusionGemmaForBlockDiffusion
 

@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import dataclasses
 import fnmatch
-import functools
+import glob
 import inspect
 import json
 import math
@@ -38,7 +38,7 @@ from dew._records import share
 from dew.mesh import LogicalAxes
 from dew.nn.precision import at_least_fp32, stochastic_bf16
 from dew.nn.sharding import declarations, declared_axes
-from dew.registry import JsonDict, from_record, imported, record_argument, schedules, to_record
+from dew.registry import Aliases, JsonDict, from_record, record_argument, schedules, to_record
 
 # Attention stores its projections either as one matrix over the flattened
 # head space or as a dimension per head. The head dimensions count as one
@@ -83,6 +83,15 @@ def _matrix_sides(axes: LogicalAxes) -> tuple[tuple[int, ...], tuple[int, ...]] 
     if len(sides) != 2:
         return None
     return tuple(sides[0]), tuple(sides[1])
+
+
+FRESH_LEARNING_RATE = 2e-4
+"""The peak rate a module drawn fresh beside a loaded base trains at where a run names no groups
+(`OptimConfig.fresh_groups`), on the run's own schedule's shape: a base fine-tunes at a rate a fresh
+module barely moves at. On a context-only task over a loaded Qwen3.5 slice held frozen, an IDEFICS block
+at a base rate of 5e-6 learned on every seed from 5e-5 to 5e-4 under AdamW with decay and from 5e-5 to
+5e-3 under the Muon hybrid; at 5e-6 the Muon hybrid learned nothing, and at 1e-3 one AdamW seed in three
+did not learn (ledger 2419). This is the middle of the rates both held on every seed."""
 
 
 def weight_decay_mask(params):
@@ -172,7 +181,8 @@ def _placement(path: jax.tree_util.KeyPath, param, decays: bool,
     return optax.contrib.MuonDimensionNumbers(), "muon"
 
 
-def _muon_groups(learning_rate, weight_decay=0.0, adam_weight_decay=None, **opts):
+def _muon_groups(learning_rate, weight_decay=0.0, adam_weight_decay=None,
+                 **opts) -> optax.GradientTransformation:
     """Run Muon over the matrices and AdamW over the rest, on one schedule. The AdamW group decays
     its norms and biases too, at `adam_weight_decay` or else `weight_decay`: Moonlight shares the
     decay among matrix and non-matrix parameters, RMSNorm's included (arXiv 2502.16982, 2.2)."""
@@ -195,6 +205,12 @@ def _dict_names(path: jax.tree_util.KeyPath) -> tuple[str, ...]:
     view never produces on a parameter tree."""
     return tuple(entry.key for entry in path
                  if isinstance(entry, jax.tree_util.DictKey))
+
+
+def parameter_name(path: jax.tree_util.KeyPath) -> str:
+    """A parameter's path under `params` as a pattern matches it: its dict keys joined by '/'
+    (`layers_0/attn/q_proj/kernel`), as a `ParamGroup`'s and an inspection's patterns read it."""
+    return "/".join(_dict_names(path))
 
 
 def _sown(node, name: str):
@@ -461,7 +477,7 @@ def stepped(params, updates, before, after):
     return jax.tree_util.tree_unflatten(jax.tree_util.tree_structure(moved), list(held.values()))
 
 
-def _muonclip_groups(learning_rate, qk_clip_threshold: float = 100.0, **opts):
+def _muonclip_groups(learning_rate, qk_clip_threshold: float = 100.0, **opts) -> optax.GradientTransformation:
     """Chain `_muon_groups` with the QK-Clip that follows the update."""
     return optax.chain(
         _muon_groups(learning_rate, **opts),
@@ -932,14 +948,14 @@ def _adam_chain(moments: optax.GradientTransformation, learning_rate, weight_dec
 
 
 def _adam(learning_rate, b1=0.9, b2=0.999, eps=1e-8, eps_root=0.0, mu_dtype=None, weight_decay=0.0,
-          mask=None, *, nesterov: bool = False, nu_dtype=None):
+          mask=None, *, nesterov: bool = False, nu_dtype=None) -> optax.GradientTransformation:
     """optax.adam over `scale_by_adam`, with torch's coupled weight decay."""
     return _adam_chain(scale_by_adam(b1, b2, eps, eps_root, mu_dtype, nesterov=nesterov, nu_dtype=nu_dtype),
                        learning_rate, weight_decay, mask, coupled=True)
 
 
 def _adamw(learning_rate, b1=0.9, b2=0.999, eps=1e-8, eps_root=0.0, mu_dtype=None, weight_decay=1e-4,
-           mask=None, *, nesterov: bool = False, nu_dtype=None):
+           mask=None, *, nesterov: bool = False, nu_dtype=None) -> optax.GradientTransformation:
     """optax.adamw over `scale_by_adam`."""
     return _adam_chain(scale_by_adam(b1, b2, eps, eps_root, mu_dtype, nesterov=nesterov, nu_dtype=nu_dtype),
                        learning_rate, weight_decay, mask, coupled=False)
@@ -1027,6 +1043,13 @@ OPTIMIZER_MAP: dict[Optimizer, Callable[..., optax.GradientTransformation]] = {
     'muon': _muon_groups,
     'muonclip': _muonclip_groups,
 }
+
+optimizers: Aliases[Callable[..., optax.GradientTransformation], optax.GradientTransformation] = Aliases(
+    "optimizer", {name: f"{make.__module__}:{make.__qualname__}" for name, make in OPTIMIZER_MAP.items()},
+    base="optax:GradientTransformation")
+"""What `OptimConfig.optimizer` names: Dew's optimizers by name (`OPTIMIZER_MAP`), or an Optax factory
+by its import path, which must be declared to return a gradient transformation before it is called,
+as every import path a record names is (`dew.registry.Aliases`)."""
 
 
 class RateState(NamedTuple):
@@ -1351,16 +1374,25 @@ class ParamGroup:
     """
 
     name: str
-    patterns: tuple[str, ...]
+    patterns: tuple[str, ...] = ()
     learning_rate_multiplier: float = 1.0
     weight_decay: float | None = None
+    spared: bool = False
+    """Whether the group's decay spares its biases and vectors (`weight_decay_mask`). A group decays
+    every parameter it claims unless it does, as a torch optimizer's parameter group does, so a run's
+    groups mirror the reference's own groups (lm_engine's, a torch recipe's); the split an ungrouped
+    optimizer takes (`OptimConfig.spared`) is the groups' only where they say so."""
     schedule: ScheduleBase | None = None
     b1: ScheduleBase | None = None
     bounds: tuple[float, float] | None = None
+    fresh: bool = False
+    """Whether the group claims the modules its run draws fresh beside a loaded base, ahead of its own
+    `patterns` (`Objective.fresh_modules`): what `OptimConfig.with_fresh` names before a run records
+    the group."""
 
     def __post_init__(self):
         object.__setattr__(self, "patterns", tuple(self.patterns))
-        if not self.patterns:
+        if not self.patterns and not self.fresh:
             raise ValueError(f"param group {self.name!r} matches no pattern")
         if self.learning_rate_multiplier <= 0:
             raise ValueError(
@@ -1434,7 +1466,7 @@ def param_labels(groups: Sequence[ParamGroup]):
     # 45b6b57b.
     def labels(params):
         def label(path: jax.tree_util.KeyPath, _) -> str:
-            name = "/".join(_dict_names(path))
+            name = parameter_name(path)
             for group in groups:
                 if any(fnmatch.fnmatchcase(name, pattern) for pattern in group.patterns):
                     return group.name
@@ -1610,6 +1642,11 @@ class ScheduleBase:
         one factor, a param group's multiplier."""
         raise NotImplementedError
 
+    def peak(self) -> float:
+        """The highest value the schedule takes: its largest rate-valued field, a warmup's or decay's
+        ends, where its formula reaches no higher."""
+        return max(self.rates().values(), default=1.0)
+
     def run_relative(self) -> bool:
         """Whether its horizon is the run's, so a run that counts no updates ahead (one bounded in
         examples) reads it over the run's progress (`progressed`); a schedule whose every horizon is its
@@ -1668,8 +1705,9 @@ class Cosine(ScheduleBase):
     """
 
     peak_value: float = dataclasses.field(metadata={'rate': True})
-    warmup_steps: int | str = 10000
-    """Its warmup in its own steps, or a share of the run such as `5%` (`ScheduleBase._warmup`)."""
+    warmup_steps: int | str
+    """Its warmup in its own steps, or a share of the run such as `5%` (`ScheduleBase._warmup`): stated,
+    as `optax.warmup_cosine_decay_schedule` takes it, which has no default either."""
     end_value: float = dataclasses.field(default=0.0, metadata={'rate': True})
     init_value: float = dataclasses.field(default=0.0, metadata={'rate': True})
     decay_steps: int | None = None
@@ -1746,6 +1784,10 @@ class Power(ScheduleBase):
 
     def warmup(self, steps: int | None) -> int:
         return self._warmup(self.warmup_steps, steps, None if self.tail is None else self.tail.steps)
+
+    def peak(self) -> float:
+        """`peak_value`, the cap the power law climbs to."""
+        return self.peak_value
 
     def run_relative(self) -> bool:
         return isinstance(self.warmup_steps, str) or (self.tail is not None and self.tail.steps is None)
@@ -1949,6 +1991,10 @@ class Exponential(ScheduleBase):
     decay_steps: int | None = None
     offset: float = dataclasses.field(default=0.0, metadata={'rate': True})
 
+    def peak(self) -> float:
+        """Its higher end, `offset` added."""
+        return self.offset + max(self.init_value, self.end_value)
+
     def run_relative(self) -> bool:
         return self.decay_steps is None
 
@@ -2015,9 +2061,10 @@ class OptimConfig:
 
     optimizer: Optimizer | str = "adamw"
     """One of Dew's optimizers (`OPTIMIZER_MAP`), or any Optax optimizer factory by its import path,
-    `optax:sgd` or `optax:adafactor` (`dew.registry.imported`), built as `factory(learning_rate,
+    `optax:sgd` or `optax:adafactor` (`optimizers`), built as `factory(learning_rate,
     **optimizer_opts)` with `b1`, `b2` and `weight_decay` where the config sets them, so an experiment
-    on an Optax transformation records the same optimizer it ran."""
+    on an Optax transformation records the same optimizer it ran. The decay spares biases and norm
+    scales for a factory that takes a `mask`."""
     optimizer_opts: JsonDict = dataclasses.field(default_factory=dict)
     learning_rate: Annotated[float | ScheduleSpec, _rate_argument()] = 2.7e-4
     """The learning rate: a constant, or a schedule as one typed record per kind (`dew.optim`).
@@ -2033,9 +2080,14 @@ class OptimConfig:
     0); for 'adam' it is torch's coupled L2 penalty, added to the gradient before the moments
     read it, for 'adamw' the decoupled decay. Either decay, the default included, spares biases
     and vectors such as a norm's scale, timm's split for every optimizer and for an Optax factory
-    given one (`dew.optim.weight_decay_mask`, its `mask`); Muon decays them as Moonlight does, and
-    `param_groups` replace the split. Records written before this change decayed every
-    parameter; ParamGroup('all', ('*',)) restores that."""
+    given one (`dew.optim.weight_decay_mask`, its `mask`), unless `spared` is off; Muon decays them as
+    Moonlight does, and a param group decays all it claims unless it says (`ParamGroup.spared`)."""
+    spared: bool = True
+    """Whether the decay spares biases and vectors such as a norm's scale (`weight_decay_mask`), where the
+    optimizer takes a mask: nanoGPT's, Megatron Core's and timm's split, since decaying a norm's scale or
+    a bias toward zero regularizes nothing a matrix's decay does and shifts what the layer computes.
+    Optax decays every parameter (`mask=None`), which False restores. A param group decays all it claims
+    unless its own `spared` says otherwise (`ParamGroup.spared`); a run's default groups follow this."""
     b1: float | None = None
     """Adam's first-moment decay, for adam, adamw and lamb; None keeps the optimizer's."""
     b2: float | None = None
@@ -2125,7 +2177,7 @@ class OptimConfig:
             raise ValueError("b1 and b2 are fields of OptimConfig, not optimizer_opts")
         given = {'b1': self.b1, 'b2': self.b2, 'weight_decay': self.weight_decay}
         opts.update({name: value for name, value in given.items() if value is not None})
-        make = self.factory()
+        make = optimizers[self.optimizer]
         if self.state_dtype != 'float32':
             if self.optimizer not in STATE_OPTIMIZERS[self.state_dtype]:
                 raise ValueError(
@@ -2140,16 +2192,20 @@ class OptimConfig:
             names = [group.name for group in self.param_groups]
             if len(set(names)) != len(names):
                 raise ValueError(f"param group names repeat: {names}")
+            claiming = [group.name for group in self.param_groups if group.fresh]
+            if claiming:
+                raise ValueError(f"param groups {claiming} claim the modules a run draws fresh, which the "
+                                 f"run names (`OptimConfig.with_fresh`) before it builds their optimizer")
             solvers = {}
             for group in self.param_groups:
                 decay = {} if group.weight_decay is None else {'weight_decay': group.weight_decay}
-                solvers[group.name] = group.solver(make, self.learning_rate, steps, {**opts, **decay},
+                grouped = {**opts, **decay}
+                spared = {'mask': weight_decay_mask} if group.spared and self._spares(make) else {}
+                solvers[group.name] = group.solver(make, self.learning_rate, steps, {**grouped, **spared},
                                                    clocked=clocked)
             solver = optax.multi_transform(solvers, param_labels(self.param_groups))
         else:
-            # An Optax factory takes the split with a decay it is given; Dew's own take it always.
-            if self.optimizer not in ('muon', 'muonclip') and (self.optimizer in OPTIMIZER_MAP
-                                                                 or 'weight_decay' in opts):
+            if self.spared and self._spares(make):
                 opts['mask'] = weight_decay_mask
             solver = scheduled_solver(make, self.learning_rate, steps, opts, clocked=clocked)
 
@@ -2163,26 +2219,39 @@ class OptimConfig:
             solver = power_profiles(solver, self.ema_profiles)
         return solver
 
-    def factory(self) -> Callable[..., optax.GradientTransformation]:
-        """The factory `optimizer` names: Dew's own (`OPTIMIZER_MAP`) by name, else the one its import
-        path names, whose every build is witnessed an Optax transformation."""
-        if self.optimizer in OPTIMIZER_MAP:
-            return OPTIMIZER_MAP[self.optimizer]
-        if ':' not in self.optimizer:
-            raise ValueError(f"optimizer {self.optimizer!r} is none of Dew's {sorted(OPTIMIZER_MAP)} and no "
-                             f"import path; name an Optax factory as optax:sgd")
-        named, factory = self.optimizer, imported(self.optimizer)
+    def _spares(self, make: Callable[..., optax.GradientTransformation]) -> bool:
+        """Whether the optimizer's decay takes timm's split (`weight_decay_mask`): a factory that takes a
+        decay mask, and never Muon, which decays every parameter it updates as Moonlight does."""
+        return self.optimizer not in ('muon', 'muonclip') and 'mask' in inspect.signature(make).parameters
 
-        # The factory's own signature, which a group's `b1` schedule is checked against (`ParamGroup.solver`).
-        @functools.wraps(factory)
-        def built(learning_rate, **opts) -> optax.GradientTransformation:
-            transformation = factory(learning_rate, **opts)
-            if not isinstance(transformation, optax.GradientTransformation):
-                raise ValueError(f"optimizer {named!r} builds {type(transformation).__name__}, not an Optax "
-                                 f"gradient transformation")
-            return transformation
+    def fresh_groups(self) -> tuple[ParamGroup, ...]:
+        """The groups a run takes where it names none and draws modules fresh beside a loaded base: those
+        modules at `FRESH_LEARNING_RATE` at the peak of this config's schedule, on its shape (its rate
+        times their quotient), or at its own where that is higher, and every other parameter at its own,
+        each sparing what the ungrouped decay spares (`ParamGroup.spared`)."""
+        rate = self.learning_rate
+        peak = rate.peak() if isinstance(rate, ScheduleBase) else rate
+        multiplier = max(1.0, FRESH_LEARNING_RATE / peak) if peak > 0 else 1.0
+        # The groups a run takes in place of none decay as its ungrouped optimizer would.
+        return (ParamGroup("fresh", fresh=True, learning_rate_multiplier=multiplier, spared=self.spared),
+                ParamGroup("base", ("*",), spared=self.spared))
 
-        return built
+    def with_fresh(self, modules: Sequence[str]) -> OptimConfig:
+        """This config with each group that claims the fresh modules (`ParamGroup.fresh`) matching the
+        parameters of `modules`, each a module's path under `params` as a parameter's name begins
+        (`parameter_name`), ahead of its own patterns: the groups a run records and trains in, its
+        modules drawn fresh beside a loaded base (`Objective.fresh_modules`). Refused where such a group
+        then matches nothing, in a run that draws nothing fresh."""
+        claimed = tuple(f"{glob.escape(module)}/*" for module in modules)
+        groups = []
+        for group in self.param_groups:
+            if group.fresh:
+                if not claimed and not group.patterns:
+                    raise ValueError(f"param group {group.name!r} claims the modules its run draws fresh "
+                                     f"beside a loaded base, and it draws none")
+                group = dataclasses.replace(group, patterns=(*claimed, *group.patterns), fresh=False)
+            groups.append(group)
+        return dataclasses.replace(self, param_groups=tuple(groups))
 
     def rates(self) -> dict[str | None, dict[str, float]]:
         """The rate fields each of `build`'s solvers holds in its state

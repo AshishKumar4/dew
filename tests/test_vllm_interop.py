@@ -48,7 +48,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact_as_the_reference, float64_forward
+from float64_terms import float64_forward
+from one_draw import assert_as_exact_as_the_reference
 
 from dew.inference import OpenAICompletion
 from dew.interop import Pretrained

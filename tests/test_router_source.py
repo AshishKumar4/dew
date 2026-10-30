@@ -20,7 +20,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from interop_support import fixture_with_meta
-from reference_error import assert_as_exact_as_the_reference
+from one_draw import assert_as_exact_as_the_reference
 
 from dew.nn.moe import Router
 
