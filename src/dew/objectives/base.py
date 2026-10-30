@@ -13,6 +13,7 @@ reports. These values are JAX pytrees.
 
 from __future__ import annotations
 
+import contextlib
 import enum
 import functools
 import math
@@ -46,6 +47,7 @@ from dew._records import JSON
 from dew.artifacts import Artifact, Artifacts, TokenScores
 from dew.batch import EXAMPLE_ROWS, FROZEN, VALID_ROWS, Batch, PathFilter, Variables, dicts, everything, part
 from dew.nn import categorical
+from dew.nn.inspection import INSPECTED, Watched, watching
 from dew.nn.kernels.options import Held, Option, compiler_options
 from dew.nn.precision import accumulated, at_least_fp32, compensated_sum, weighted_total
 from dew.nn.protocols import HiddenStates, ProjectsParameters
@@ -297,6 +299,18 @@ class Step:
     """Whether the run's optimizer reads the step's attention logit maxima (`dew.optim.clips_qk`, its
     QK-Clip): the objective opens the `qk` collection in the model calls it trains through and returns
     what they sowed (`Aux.qk_stats`). Static, as opening a collection changes the program."""
+    watched: Watched | None = struct.field(pytree_node=False, default=None)
+    """The activations a sampled step watches (`dew.nn.inspection.watching`): the objective opens the
+    `inspected` collection in the model call it trains through and returns what it sowed
+    (`Aux.inspected`). None on every other step; static, as `qk_stats` is."""
+
+    def sown(self, *collections: str) -> list[str]:
+        """The collections a model call the objective trains through opens: `collections`, the ones its
+        objective reads, and those the step asks for, `qk` where the optimizer clips by it and
+        `inspected` where the step watches activations. A call opening none returns an empty mapping
+        beside its output."""
+        return [*collections, *(["qk"] if self.qk_stats else []),
+                *([INSPECTED] if self.watched is not None else [])]
 
     def places(self, rows: int) -> tuple[jax.Array, int]:
         """The places among the update's examples of a batch's `rows` rows (`examples`) and how many
@@ -429,6 +443,9 @@ class Aux(Generic[Effects]):
     clips by it refuses a step that returns None."""
     effects: Effects | None = None
     """Additive observations that `Objective.apply_effects` applies once per optimizer commit."""
+    inspected: Variables | None = None
+    """What the watched modules of the model call the objective trains through sowed
+    (`dew.nn.inspection.INSPECTED`), where the step watches (`Step.watched`); None otherwise."""
     record: Evaluated | Recorded | None = None
     """What a recording evaluation's `Step.sample` and `Step.boundary` calls produced (`Step.record`),
     which `Objective._loss` fills (`Evaluated`) and a transaction stacks with its replays' (`Recorded`);
@@ -1151,7 +1168,9 @@ class Objective(ABC, Generic[Loss, Effects]):
             batch = {name: value for name, value in batch.items() if name != EXAMPLE_ROWS}
         witness = Witness() if step.record and not validation else None
         step = step if witness is None else replace(step, witness=witness)
-        loss = (self.validation_loss if validation else self.loss)(variables, batch, step)
+        watched = step.watched if not validation else None
+        with watching(watched.kinds, histogram=watched.histogram) if watched else contextlib.nullcontext():
+            loss = (self.validation_loss if validation else self.loss)(variables, batch, step)
         if _has_aux(loss):
             stats, aux = loss
         else:

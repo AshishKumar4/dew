@@ -36,6 +36,7 @@ from dew.batch import TEXT_KEY, Batch, Variables, real_slots, thaw
 from dew.diffusion.discrete import MDLM_STEPS, REVEALED_UNDEFINED, Confident, DiscreteProcess, Unmask, aligned
 from dew.inference.tasks import MaskedGeneration, MaskedSettings, recorded_processor, recorded_tokenizer
 from dew.inputs import Field, InputSpec
+from dew.nn.inspection import INSPECTED
 from dew.nn.moe import ROUTER_COLLECTION
 from dew.nn.precision import at_least_fp32
 from dew.nn.protocols import Lacks, TokenModel
@@ -220,8 +221,9 @@ class MaskedDiffusionObjective(HeadedObjective[Ratio | RoutedStatistics, Variabl
                 params, prediction, routing, batch, queries, fields)
             reported.update(metrics)
         qk = sown.get("qk", {}) if step.qk_stats else None
-        return statistics, Aux(metrics=reported, qk_stats=qk, effects=effects), TokenScores(
-            losses * weights, real.astype(losses.dtype), correct)
+        inspected = sown.get(INSPECTED, {}) if step.watched is not None else None
+        aux = Aux(metrics=reported, qk_stats=qk, effects=effects, inspected=inspected)
+        return statistics, aux, TokenScores(losses * weights, real.astype(losses.dtype), correct)
 
     def _token_losses(self, params, batch, step: Step, *, train: bool):
         """Corrupt the batch once, each row's noise level and mask its example's own (`Step.sample`),
@@ -268,7 +270,7 @@ class MaskedDiffusionObjective(HeadedObjective[Ratio | RoutedStatistics, Variabl
         masked = jnp.where(is_masked, self.process.mask_id, tokens)
 
         # Each position's prediction, as the checkpoint's logits line up with its inputs.
-        opened = (["qk"] if step.qk_stats else []) + ([ROUTER_COLLECTION] if self.balance is not None else [])
+        opened = step.sown(*([ROUTER_COLLECTION] if self.balance is not None else []))
         observed = final_read(self.model, params, masked, train=train,
                               rngs=model_rngs(dropout_key, training=train),
                               mutable=opened or False, capture_intermediates=False,

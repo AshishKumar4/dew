@@ -29,6 +29,7 @@ from typing_extensions import TypeVar
 from dew.averaging import ema_update
 from dew.batch import EXAMPLE_ROWS, Batch, Variables, dicts, merge
 from dew.data.dataset import rows_of
+from dew.nn.inspection import Watched, flattened
 from dew.nn.kernels.options import compiler_options
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import rows_spec
@@ -132,6 +133,21 @@ def outcome(current: TrainState, advanced: TrainState, loss: jax.Array, aux: Aux
     clock = None if current.consumed is None else (current.consumed + consumed).astype(current.consumed.dtype)
     return (dataclasses.replace(advanced, step=current.step + stepped, consumed=clock), loss, metrics,
             jnp.isfinite(loss), advanced.microstep > current.microstep, committed)
+
+
+def watched_activations(watched: Watched, aux: Aux) -> dict[str, jax.Array]:
+    """The activation summaries a sampled step's latest microbatch sowed (`Aux.inspected`), by their
+    logged names (`dew.nn.inspection.flattened`). Refused where the objective's model call opened no
+    `inspected` collection (`Step.sown`), or where no module of a watched kind ran in it, either of which
+    would log nothing a run asked for."""
+    if aux.inspected is None:
+        raise ValueError("the run watches activations (Inspection.modules), which its objective's model "
+                         "calls do not return: they open Step.sown() and return what it sowed "
+                         "(Aux.inspected)")
+    if not jax.tree.leaves(aux.inspected):
+        raise ValueError(f"no module of the watched kinds {list(watched.kinds)} runs in the objective's "
+                         f"model; name them by class (`*Attention`, `MLP`)")
+    return flattened(aux.inspected)
 
 
 def evaluation_of(aux: Aux) -> Evaluated | None:
@@ -359,6 +375,7 @@ class Transaction:
         self.record = record
         # What a sampled step summarizes at its commit (`Committed.inspected`); None in every other step.
         self.inspection = inspection
+        self.watched = None if inspection is None else inspection.watched
         self.bound = examples
         self.objective = objective
         self.optimizer = optimizer
@@ -504,7 +521,7 @@ class Transaction:
         # The part its input ran as, which an attempt counts (`step` times `split` plus its part).
         step_info = Step(accepted // self.split, jax.random.fold_in(state.key, attempt),
                          with_ema(variables, self.fetched(state).ema), committed=state.updates,
-                         record=self.record, qk_stats=clips_qk(state.opt_state),
+                         record=self.record, qk_stats=clips_qk(state.opt_state), watched=self.watched,
                          **self.examples(state, index, batch, part=attempt % self.split,
                                          rejected=attempt - accepted))
         return self.read(variables, state.compute), batch, step_info
@@ -658,6 +675,8 @@ class Transaction:
                 due, recopied, lambda x: (x, uncommitted, jnp.asarray(a=True), zero),
                 dataclasses.replace(numerical, accumulation=None))
             numerical = dataclasses.replace(numerical, accumulation=previous)
+        if self.watched is not None:
+            inspected = {**inspected, **watched_activations(self.watched, aux)}
         finite = finite & native_finite
         if scale is not None:
             accepted = finite & _all_finite((numerical.variables, numerical.opt_state, numerical.ema))
@@ -738,7 +757,7 @@ class Transaction:
             rejected = attempt - state.microstep
             step_info = Step(state.microstep // self.split, jax.random.fold_in(state.key, attempt),
                              with_ema(state.variables, self.fetched(state).ema), committed=state.updates,
-                             record=self.record, qk_stats=clips_qk(state.opt_state),
+                             record=self.record, qk_stats=clips_qk(state.opt_state), watched=self.watched,
                              **self.examples(state, state.microstep % self.size, batch, part, rejected))
             factor = jnp.asarray(1., jnp.float32) if state.scale is None else state.scale.scale
             realized = realize(self.read(state.variables, state.compute), batch, step_info)
