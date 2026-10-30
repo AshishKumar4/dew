@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 import pytest
-from process_support import ProcessGroup, run_pool, start_process
+from process_support import ProcessGroup, run_pool, start_process, terminate
 
 
 def test_pool_reports_follow_rank_order_and_workers_own_sessions(tmp_path):
@@ -166,3 +166,23 @@ def gone_within(pid: int, seconds: float) -> bool:
         return bool(select.select([ended], [], [], seconds)[0])
     finally:
         os.close(ended)
+
+
+def test_groups_started_and_stopped_from_many_threads_at_once_each_end_as_their_own(tmp_path):
+    """Groups started and stopped from many threads at once (CI's gpu-lane runs its tests in a pool of
+    threads), some ending by themselves meanwhile, each run to their own end: none is killed by another's
+    lifeline, and no start or stop fails on a pipe another thread closed."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    def ran(index: int) -> int:
+        process = start_process([sys.executable, "-c", f"import time; time.sleep({index % 3} / 100)"],
+                                devices=1)
+        if index % 2:
+            # Ends by itself, its lifeline let go by a later start in any thread.
+            return process.wait(timeout=60)
+        process.wait(timeout=60)
+        terminate(process)
+        return process.returncode
+
+    with ThreadPoolExecutor(16) as pool:
+        assert list(pool.map(ran, range(400))) == [0] * 400

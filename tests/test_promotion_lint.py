@@ -3,13 +3,7 @@ constructor computed rounded to float32 (ledger 1601); a truth's twin is built i
 tools/torch_precision.py's `float64` (ledger 1619)."""
 
 import pytest
-from tool_support import lint_codes, load
-
-
-@pytest.fixture(scope="module")
-def lint():
-    return load("lint_slop")
-
+from tool_support import lint_codes
 
 LINEAR = "import torch\nmodel = torch.nn.Linear(4, 4)\n"
 

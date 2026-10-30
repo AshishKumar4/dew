@@ -6,13 +6,7 @@ arithmetic with one, or a parameter annotated as one. A Python number, or a name
 finding."""
 
 import pytest
-from tool_support import lint_codes, load
-
-
-@pytest.fixture(scope="module")
-def lint():
-    return load("lint_slop")
-
+from tool_support import lint_codes
 
 DIVISIONS = {
     "a jax.numpy call's result": ("import jax.numpy as jnp\ndef f(x):\n    return jnp.mean(x) / 3.0", 1),
@@ -26,6 +20,9 @@ DIVISIONS = {
     "an annotated parameter divided in place": ("from jax import Array\ndef f(x: Array):\n    x /= 3\n"
                                                 "    return x", 1),
     "a negative literal": ("import jax.numpy as jnp\ndef f(x):\n    return jnp.abs(x) / -3.0", 1),
+    "an import in one function alone": ("def f(x):\n    import jax.numpy as jnp\n"
+                                        "    return jnp.mean(x) / 3.0\n"
+                                        "def g(jnp, x):\n    return jnp.mean(x) / 3.0", 1),
     "a power of two": ("import jax.numpy as jnp\ndef f(x):\n    return jnp.mean(x) / 4.0 + jnp.sum(x) / 0.5",
                        0),
     "a Python number": ("def f(seconds: float):\n    return seconds / 60 + float(seconds) / 3 + 1 / 3", 0),

@@ -38,6 +38,7 @@ from dew.batch import (
     POSITIONS_FIELD,
     VALIDITY_FIELD,
     Variables,
+    coordinates as token_layout,
     prefix_sum,
     real_slots,
     token_positions,
@@ -614,15 +615,16 @@ def _drafting(model: nn.Module, params: Variables, pad_id: int):
                 embeds: jax.Array | None, valid: jax.Array, positions: jax.Array,
                 depth: int, prediction_phase: PredictionPhase) -> tuple[DecoderState, jax.Array, jax.Array]:
         ids = jnp.zeros(valid.shape, jnp.int32) if tokens is None else jnp.where(valid, tokens, pad_id)
-        # Multi-axis rotary metadata is not a scalar position, and a depth
-        # takes it under its own name.
-        placed = ({"rotary_positions": positions} if positions.ndim == 3
-                  else {POSITIONS_FIELD: positions})
+        # The step's tokens laid out once (`Coordinates`); multi-axis rotary metadata is not a scalar
+        # position, and a depth takes it under its own name.
+        rotary = positions.ndim == 3
+        rows, width = valid.shape
+        laid = token_layout((rows, width), valid=valid, positions=None if rotary else positions)
         (logits, states), updated = model.apply(
-            {**params, "cache": state.cache}, hidden, ids, depth=depth, attention_mask=valid,
-            input_embeddings=embeds, decode=True, mutable=["cache"], rngs=None,
-            prediction_phase=prediction_phase,
-            method="mtp_step", capture_intermediates=False, **placed)
+            {**params, "cache": state.cache}, hidden, ids, depth=depth, coordinates=laid,
+            rotary_positions=positions if rotary else None, input_embeddings=embeds, decode=True,
+            mutable=["cache"], rngs=None, prediction_phase=prediction_phase,
+            method="mtp_step", capture_intermediates=False)
         return dataclasses.replace(state, cache=updated["cache"]), logits, states
 
     def embed(tokens: jax.Array) -> jax.Array:

@@ -680,45 +680,23 @@ ARRAY_TYPES = {"jax.Array", "jax.numpy.ndarray"}
 """The annotations that make a parameter an array."""
 
 
-def _modules_bound(tree: ast.Module) -> dict[str, str]:
-    """Each name a module binds by import to a module or a member, with what it names (`jnp` -> jax.numpy,
-    `Array` -> jax.Array)."""
-    bound = {}
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                bound[alias.asname or alias.name.split(".")[0]] = alias.name if alias.asname else \
-                    alias.name.split(".")[0]
-        elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
-            for alias in node.names:
-                bound[alias.asname or alias.name] = f"{node.module}.{alias.name}"
-    return bound
-
-
-def _resolved(node: ast.expr, bound: dict[str, str]) -> str:
-    """The dotted name `node` spells, its first part read through the module's imports (`_modules_bound`)."""
-    named = _named(node)
-    head, _, rest = named.partition(".")
-    return f"{bound.get(head, head)}.{rest}" if rest else bound.get(head, head)
-
-
-def _array(node: ast.expr, bound: dict[str, str], arrays: set[str]) -> bool:
-    """Whether SLOP024 proves `node` a JAX array: a call of a function of `ARRAY_MODULES` but its facts, a
-    method or subscript of an array, arithmetic with one, or a name in `arrays` (a parameter annotated as
-    one)."""
+def _array(node: ast.expr, table: Mapping[str, str], arrays: set[str]) -> bool:
+    """Whether SLOP024 proves `node` a JAX array, its names read as the imports `table` gives them
+    (`lint_scopes.scoped`): a call of a function of `ARRAY_MODULES` but its facts, a method or subscript of an
+    array, arithmetic with one, or a name in `arrays` (a parameter annotated as one)."""
     if isinstance(node, ast.Call):
-        called = _resolved(node.func, bound)
+        called = scopes.resolved(node.func, table)
         module, _, function = called.rpartition(".")
         if module in ARRAY_MODULES or any(module.startswith(f"{each}.") for each in ARRAY_MODULES):
             return function not in ARRAY_FACTS
         return (isinstance(node.func, ast.Attribute) and node.func.attr not in ("item", "tolist")
-                and _array(node.func.value, bound, arrays))
+                and _array(node.func.value, table, arrays))
     if isinstance(node, ast.Subscript):
-        return _array(node.value, bound, arrays)
+        return _array(node.value, table, arrays)
     if isinstance(node, ast.BinOp):
-        return _array(node.left, bound, arrays) or _array(node.right, bound, arrays)
+        return _array(node.left, table, arrays) or _array(node.right, table, arrays)
     if isinstance(node, ast.UnaryOp):
-        return _array(node.operand, bound, arrays)
+        return _array(node.operand, table, arrays)
     return isinstance(node, ast.Name) and node.id in arrays
 
 
@@ -735,21 +713,18 @@ def _rounded_divisor(node: ast.expr) -> float | None:
 
 
 def divisions(module: Module) -> Iterator[Finding]:
-    """SLOP024: a JAX array (`_array`) divided by a literal no power of two (`_rounded_divisor`), a
-    parameter annotated as an array read as one within its function."""
-    bound = _modules_bound(module.tree)
-    scope: dict[ast.AST, ast.AST] = {}
-    for node in ast.walk(module.tree):
-        for child in ast.iter_child_nodes(node):
-            scope[child] = node if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) else \
-                scope.get(node, module.tree)
-    arrays: dict[ast.AST, set[str]] = {module.tree: set()}
+    """SLOP024: a JAX array (`_array`) divided by a literal no power of two (`_rounded_divisor`), each name
+    read in its own scope (`lint_scopes.scoped`), a parameter annotated as an array read as one within its
+    function."""
+    scoped = list(scopes.scoped(module.tree.body, {}, _parent(module)))
+    tables = {id(node): table for node, table in scoped}
+    arrays: dict[int, set[str]] = {}
     for function in ast.walk(module.tree):
         if isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            parameters = function.args.posonlyargs + function.args.args + function.args.kwonlyargs
-            arrays[function] = {parameter.arg for parameter in parameters if parameter.annotation is not None
-                                and _resolved(parameter.annotation, bound) in ARRAY_TYPES}
-    for node in ast.walk(module.tree):
+            annotated = {name for name, annotation in scopes.annotations(function)
+                         if scopes.resolved(annotation, tables.get(id(function), {})) in ARRAY_TYPES}
+            arrays.update({id(node): annotated for node in scopes.own(function)})
+    for node, table in scoped:
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
             numerator, divisor = node.left, node.right
         elif isinstance(node, ast.AugAssign) and isinstance(node.op, ast.Div):
@@ -757,7 +732,7 @@ def divisions(module: Module) -> Iterator[Finding]:
         else:
             continue
         value = _rounded_divisor(divisor)
-        if value is not None and _array(numerator, bound, arrays[scope.get(node, module.tree)]):
+        if value is not None and _array(numerator, table, arrays.get(id(node), set())):
             yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP024",
                           f"divides a JAX array by {value!r}, which XLA computes as a product with its "
                           "rounded reciprocal, not correctly rounded; divide with precision.divided")
