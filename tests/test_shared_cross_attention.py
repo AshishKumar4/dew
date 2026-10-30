@@ -28,6 +28,7 @@ from dew.batch import FROZEN
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.cross_attention import CrossAttention, SharedCrossAttention, crossing
+from dew.nn.deepseek_v4 import DeepseekV4Mixer
 from dew.nn.dsa_kpool import KPoolSparseAttentionMixer
 from dew.nn.inputs import CONTEXT, CONTEXT_LENGTHS
 from dew.nn.mixer_base import MixerContext
@@ -45,7 +46,8 @@ feed-forward's gate zero (`tied`)."""
 UNNORMED = MODEL.clone(qk_norm=False)
 
 SHARED_SEEDS = {"shared fresh": 8, "shared idefics": 8, "shared decode": 8, "shared scan": 8,
-                "alternating scan": 8, "latent read mla": 8, "latent read kpool": 8}
+                "alternating scan": 8, "context read mla": 8, "context read kpool": 8,
+                "context read v4": 8}
 """Check 1's declared seeds for each site of the file, sized paired by `seeds_for` on armada at
 edf94b090 (job IGXSIZE) and, for the IDEFICS read and the alternating scan, at db0cc076a (IGXSIZE3)."""
 
@@ -357,19 +359,22 @@ LATENT_KINDS = {
     "mla": MLAMixer(q_lora_rank=8, kv_lora_rank=8, qk_nope_head_dim=4, qk_rope_head_dim=4, v_head_dim=8),
     "kpool": KPoolSparseAttentionMixer(q_lora_rank=8, kv_lora_rank=8, qk_nope_head_dim=8, v_head_dim=8,
                                        index_n_heads=2, index_head_dim=8, index_topk=4, index_kpool=2,
-                                       index_kpool_always_select_tail=True)}
-"""The latent attentions a layer reads a context through (`AttendsContext`, ledger 2418): DeepSeek V3's
-MLA and GLM's k-pool sparse attention, which reads a context densely, as its latent attention does."""
-LATENT_WIDTH = 16
+                                       index_kpool_always_select_tail=True),
+    "v4": DeepseekV4Mixer(q_lora_rank=8, o_groups=2, o_lora_rank=8, rope_head_dim=4)}
+"""The attentions of their own a layer reads a context through beside the standard one (`AttendsContext`,
+ledger 2418): DeepSeek V3's MLA, GLM's k-pool sparse attention, which reads a context densely as its
+latent attention does, and DeepSeek V4's attention of one shared key and value head."""
+CONTEXT_WIDTH = 16
 
 
-def latent_layer(kind: str):
-    """A latent attention layer of `kind` at `LATENT_WIDTH`, unbound."""
-    return LATENT_KINDS[kind].build(MixerContext(emb_features=LATENT_WIDTH, num_heads=2, num_kv_heads=2,
-                                                 head_dim=8, max_seq_len=16, norm_eps=1e-5))(name="self_attn")
+def context_layer(kind: str):
+    """A layer of `kind`'s attention at `CONTEXT_WIDTH`, unbound."""
+    return LATENT_KINDS[kind].build(MixerContext(emb_features=CONTEXT_WIDTH, num_heads=2, num_kv_heads=2,
+                                                 head_dim=8, max_seq_len=16, norm_eps=1e-5,
+                                                 sliding_window=4))(name="self_attn")
 
 
-def latent_read(layer):
+def context_read(layer):
     """`layer`'s read of a context through its own projections (`context_query`, `context_keys`,
     `attend_context`), with its pullback into the layer's parameters, its input and the context, as
     `(variables, x, context, lengths, cotangent)`, compiled."""
@@ -386,23 +391,33 @@ def latent_read(layer):
     return run
 
 
+def normed(h, eps, scale=1.0):
+    return h * jax.lax.rsqrt(jnp.mean(h * h, -1, keepdims=True) + eps) * scale
+
+
+def pulled(read):
+    """`read(params, x, context, lengths)` with its pullback, as `context_read` gives them."""
+    def run(variables, x, context, lengths, cotangent):
+        out, pull = jax.vjp(lambda params, x, context: read(params, x, context, lengths),
+                            variables["params"], x, context)
+        return out, *pull(cotangent)
+    return run
+
+
 def latent_reference(layer):
-    """The same read from the layer's parameters, written out: the query through its latent and norm,
-    the context's latent normed and expanded beside its rope head unrotated, a softmax over each row's
-    real keys (its first one where it has none) at the heads' scale, the values through the output
+    """A latent attention's read from its parameters, written out: the query through its latent and
+    norm, the context's latent normed and expanded beside its rope head unrotated, a softmax over each
+    row's real keys (its first one where it has none) at the heads' scale, the values through the output
     projection; and its pullback."""
     heads, nope, rope = layer.num_heads, layer.qk_nope_head_dim, layer.qk_rope_head_dim
     width, rank, eps = layer.v_head_dim, layer.kv_lora_rank, layer.norm_eps
 
-    def normed(h, scale):
-        return h * jax.lax.rsqrt(jnp.mean(h * h, -1, keepdims=True) + eps) * scale
-
     def read(params, x, context, lengths):
         batch, length, keys = x.shape[0], x.shape[1], context.shape[1]
-        query = (normed(x @ params["q_a_proj"]["kernel"], params["q_a_layernorm"]["scale"])
+        query = (normed(x @ params["q_a_proj"]["kernel"], eps, params["q_a_layernorm"]["scale"])
                  @ params["q_b_proj"]["kernel"]).reshape(batch, length, heads, nope + rope)
         latent, rot = jnp.split(context @ params["kv_a_proj_with_mqa"]["kernel"], [rank], axis=-1)
-        kv = (normed(latent, params["kv_a_layernorm"]["scale"]) @ params["kv_b_proj"]["kernel"]).reshape(
+        kv = (normed(latent, eps, params["kv_a_layernorm"]["scale"]) @ params["kv_b_proj"]["kernel"]).reshape(
             batch, keys, heads, nope + width)
         key = jnp.concatenate([kv[..., :nope], jnp.broadcast_to(rot[:, :, None], (batch, keys, heads, rope))],
                               axis=-1)
@@ -411,46 +426,75 @@ def latent_reference(layer):
         probs = jax.nn.softmax(jnp.where(real[:, None, None], logits, -jnp.inf), axis=-1)
         attended = jnp.einsum("bhsc,bchd->bshd", probs, kv[..., nope:]).reshape(batch, length, heads * width)
         return attended @ params["o_proj"]["kernel"]
-
-    def run(variables, x, context, lengths, cotangent):
-        out, pull = jax.vjp(lambda params, x, context: read(params, x, context, lengths),
-                            variables["params"], x, context)
-        return out, *pull(cotangent)
-    return run
+    return pulled(read)
 
 
-def latent_draw(layer):
-    """Check 1's draw for `layer`'s read: its variables, an input, a context, each row's real context
-    tokens (a row of none among them) and a cotangent."""
+def shared_head_reference(layer):
+    """DeepSeek V4's read from its parameters, written out: the query through its latent and norm, normed
+    per head without a weight where the release does, the context's one key head normed, unrotated and
+    its values too, a softmax over each row's real keys (its first one where it has none) and each head's
+    sink, the sink then dropped, the heads through each group's block of the output projection and the
+    last; and its pullback."""
+    heads, width, groups, eps = layer.num_heads, layer.head_dim, layer.o_groups, layer.norm_eps
+
+    def read(params, x, context, lengths):
+        batch, length, keys = x.shape[0], x.shape[1], context.shape[1]
+        query = (normed(x @ params["q_a_proj"]["kernel"], eps, params["q_a_norm"]["scale"])
+                 @ params["q_b_proj"]["kernel"]).reshape(batch, length, heads, width)
+        if layer.query_norm:
+            query = normed(query, eps)
+        key = normed(context @ params["kv_proj"]["kernel"], eps, params["kv_norm"]["scale"])
+        logits = jnp.einsum("bshd,bcd->bhsc", query, key) / math.sqrt(width)
+        real = jnp.arange(keys) < jnp.maximum(lengths, 1)[:, None]
+        sinks = jnp.broadcast_to(params["sinks"][None, :, None, None], (batch, heads, length, 1))
+        probs = jax.nn.softmax(jnp.concatenate([jnp.where(real[:, None, None], logits, -jnp.inf), sinks], -1),
+                               axis=-1)[..., :-1]
+        attended = jnp.einsum("bhsc,bcd->bshd", probs, key).reshape(batch, length, groups, -1)
+        mixed = jnp.einsum("bsgi,gir->bsgr", attended, params["o_a_proj"]["kernel"])
+        return mixed.reshape(batch, length, -1) @ params["o_b_proj"]["kernel"]
+    return pulled(read)
+
+
+REFERENCES = {"mla": latent_reference, "kpool": latent_reference, "v4": shared_head_reference}
+
+
+def context_draw(layer):
+    """Check 1's draw for `layer`'s read: its variables, its sinks drawn away from zero where it has
+    them, an input, a context, each row's real context tokens (a row of none among them) and a
+    cotangent."""
     init = jax.jit(layer.init)
 
     def draw(seed):
         rng = np.random.default_rng(seed)
-        x = rng.standard_normal((B, SEQ, LATENT_WIDTH)).astype(np.float32)
-        context = rng.standard_normal((B, 6, LATENT_WIDTH)).astype(np.float32)
+        x = rng.standard_normal((B, SEQ, CONTEXT_WIDTH)).astype(np.float32)
+        context = rng.standard_normal((B, 6, CONTEXT_WIDTH)).astype(np.float32)
         lengths = rng.integers(0, 7, B).astype(np.int32)
         lengths[0] = 0
-        cotangent = rng.standard_normal((B, SEQ, LATENT_WIDTH)).astype(np.float32)
-        return init(jax.random.key(seed), jnp.asarray(x)), x, context, lengths, cotangent
+        cotangent = rng.standard_normal((B, SEQ, CONTEXT_WIDTH)).astype(np.float32)
+        drawn = init(jax.random.key(seed), jnp.asarray(x))
+        variables = jax.tree_util.tree_map_with_path(
+            lambda path, leaf: (rng.standard_normal(leaf.shape).astype(np.float32)
+                                if path[-1].key == "sinks" else leaf), drawn)
+        return variables, x, context, lengths, cotangent
     return draw
 
 
 @pytest.mark.parametrize("kind", sorted(LATENT_KINDS))
-def test_a_latent_attention_reads_a_context_through_its_own_projections(kind):
-    """A latent attention reads a context through its own projections (`AttendsContext`, ledger 2418):
-    its query through its query latent, the context's keys and values through its key latent and its
-    expansion beside its rope head, unrotated and uncausal, each row's real context tokens, then its
-    output projection; on par with that read written out from its parameters, forward and back, from
-    its float64 (check 1). A decoder of such layers takes the shared form, its gates training."""
-    layer = latent_layer(kind)
+def test_an_attention_of_its_own_reads_a_context_through_its_own_projections(kind):
+    """A layer reads a context through its own attention where that attention is MLA's, k-pool's or V4's
+    (`AttendsContext`, ledger 2418): its query as its own call projects it, the context's keys and values
+    through its own projections, unrotated and uncausal, each row's real context tokens, then its output
+    projection; on par with that read written out from its parameters, forward and back, from its
+    float64 (check 1). A decoder of such layers takes the shared form, its gates training."""
+    layer = context_layer(kind)
     assert layer.reads_context
-    assert_as_exact(latent_read(layer), latent_reference(layer), latent_draw(layer), f"latent read {kind}",
-                    seeds=SHARED_SEEDS[f"latent read {kind}"])
-    model = CausalTransformer(vocab_size=VOCAB, emb_features=LATENT_WIDTH, num_layers=2, num_heads=2,
-                              head_dim=8, mlp_features=32, max_seq_len=16, mixer=LATENT_KINDS[kind],
-                              cross_attention=SharedCrossAttention((0, 1), 6))
+    assert_as_exact(context_read(layer), REFERENCES[kind](layer), context_draw(layer), f"context read {kind}",
+                    seeds=SHARED_SEEDS[f"context read {kind}"])
+    model = CausalTransformer(vocab_size=VOCAB, emb_features=CONTEXT_WIDTH, num_layers=2, num_heads=2,
+                              head_dim=8, mlp_features=32, max_seq_len=16, sliding_window=4, qk_norm=False,
+                              mixer=LATENT_KINDS[kind], cross_attention=SharedCrossAttention((0, 1), 6))
     ids = jnp.ones((B, SEQ), jnp.int32)
-    conditioning = {CONTEXT: jnp.ones((B, 6, LATENT_WIDTH)), CONTEXT_LENGTHS: jnp.full((B,), 6, jnp.int32)}
+    conditioning = {CONTEXT: jnp.ones((B, 6, CONTEXT_WIDTH)), CONTEXT_LENGTHS: jnp.full((B,), 6, jnp.int32)}
     variables = model.init(jax.random.key(0), ids, conditioning=conditioning)
     gradients = jax.grad(lambda params: jnp.sum(model.apply(
         {**variables, "params": params}, ids, conditioning=conditioning)))(variables["params"])
