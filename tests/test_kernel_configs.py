@@ -403,7 +403,8 @@ def _gemm_mainloop_cases(generation_name: str, shape: str, *, every_consumer_cou
                 cases.append(support.KernelCase(label,
                                                 lambda launch=launch, ba=ba, config=config:
                                                 launch.lowering(ba, config),
-                                                {kernel: _model(launch, ba, config)}))
+                                                {kernel: _model(launch, ba, config)},
+                                                required=launch.legal(ba, config, target)))
     return cases
 
 
@@ -505,14 +506,17 @@ def test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources(gen
     """Every distinct GEMM Mosaic GPU kernel a generation runs at a real projection (`_gate_cases`), at the
     tile its launch derives from the generation's facts and at each tile the derivation refused for its
     registers, compiled by Mosaic for a compile-only device of the generation on this CPU through ptxas, in
-    `GATE_PARTS` parts: within the block's shared memory, spilling nothing, and its register model deciding
-    as ptxas does (`kernel_compile.mosaic_failures`)."""
+    `GATE_PARTS` parts. Required launches must spill nothing. Rejected configurations supply model evidence;
+    their spills are refusals, never qualified launches. Compiler errors and missing reports fail either."""
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
     cases = _gate_cases(generation_name)[part::GATE_PARTS]
     found = compile_mosaic_kernels(cases, generation_name)
-    failed = mosaic_failures(found)
-    assert len(found) == len(cases) and not failed, "\n".join(failed)
+    failed = failures(found)
+    failed += mosaic_failures([record for case, record in zip(cases, found, strict=True) if case.required])
+    assert not failed, "\n".join(failed)
+    assert all(record["kernels"] and all(not kernel["unread"] for kernel in record["kernels"])
+               for record in found)
 
 
 FAMILY_PARTS = 3
@@ -646,19 +650,21 @@ def test_records_a_failed_process_of_their_own_wrote_are_refused():
         compiled_apart()
 
 
-def test_the_resource_gate_reports_spills_and_refuses_invalid_allocations():
+def test_the_resource_gate_refuses_spills_and_invalid_allocations():
     """A record the gate reads (`mosaic_failures`): a kernel past its shared memory, its tensor memory or
-    spilling is reported; invalid allocations fail."""
+    spilling fails; a spill-free model disagreement is reported."""
     from kernel_compile import mosaic_failures, mosaic_kernels
 
     within = {"kernel": "k", "unread": [], "shared": 1024, "tmem": 256, "registers": 168, "spilled": 0}
     record = {"name": "case", "limit": 2048, "tmem_limit": 512, "kernels": [within]}
     assert not mosaic_failures([record])
-    for past in ({"shared": 4096}, {"tmem": 513}):
+    for past in ({"shared": 4096}, {"tmem": 513}, {"spilled": 40}):
         assert mosaic_failures([{**record, "kernels": [{**within, **past}]}])
-    spilled = {**record, "kernels": [{**within, "spilled": 40}]}
-    assert not mosaic_failures([spilled])
-    assert any(row.get("spilled") == 40 for row in spilled["evidence"])
+    overestimated = resources.RegisterModel(200, 168, 2, 1, 8, 168, shared=1024)
+    disagreement = {**record, "models": {"k": overestimated.record()},
+                    "kernels": [{**within, "need": 160}]}
+    assert not mosaic_failures([disagreement])
+    assert any(not row["agrees"] for row in disagreement["evidence"])
     # A kernel whose reports state no resources, spilling nothing, is no evidence: it fails, as a record
     # with no kernel does (row 1877: a contract gate read only its shared count and positive spills).
     unstated = {**within, "unread": ["shared bytes", "tensor memory columns"], "shared": None, "tmem": None}

@@ -129,7 +129,14 @@ class AttentionCase:
     bias_hook: bool
     """Whether the call's bias is one the template reads as a score hook in fp32 (`attention.
     template_attention`): 4-D, one term a key `[B or 1, H or 1, 1, K]` (ALiBi's) or dense `[B or 1, H or 1,
-    Q, K]`, of at most fp32's width."""
+    Q, K]`, its rows and heads the call's or one for them all (a key head's `[B, Hk, Q, K]` broadcasts to
+    none of them, row 2578), of at most fp32's width."""
+    dense_bias: bool
+    """Whether the call's bias varies by query (`[B or 1, H or 1, Q, K]`), which the template reads a tile at
+    a time (`template.biased`)."""
+    row_bias: bool
+    """Whether that dense bias varies by batch row too (`[B, H or 1, Q, K]`); a table every row shares (T5's
+    `[1, H, Q, K]`) the Mosaic mainloop reads once a tile (`template.shared_place`)."""
     sinks: bool
     softcap: float | None
     arithmetic: bool
@@ -402,8 +409,17 @@ TEMPLATE_SUPPORTS = (
           "the call has an arbitrary mask, which the template reads as spans and never as a mask",
           row=INHERENT),
     _Need('bias', lambda case: not case.bias or case.bias_hook,
-          "the call's bias is not 4-D one term a key or a query's every key, or is wider than fp32, which "
-          "the template's score hook reads it in", row=INHERENT),
+          "the call's bias is not 4-D one term a key or a query's every key, its rows and heads the call's "
+          "or one for them all, or is wider than fp32, which the template's score hook reads it in",
+          row=INHERENT),
+    _Need('dense_bias',
+          lambda case: not case.dense_bias or (not case.row_bias
+                                               and generation.gpu_target().architecture.wgmma),
+          "the call's bias varies by query: by batch row too, which the xla kernel runs 7% faster on an "
+          "H100, or a table every row shares on a GPU without warpgroup MMA, where the template's frozen "
+          "Triton mainloop reads it spread to every row, unmeasured; a shared table the warpgroup-MMA "
+          "Mosaic mainloop runs a third faster in half the memory (ET-DBIAS-h100; named, it runs)",
+          row='2577', kind='measured'),
     _Need('shards', lambda case: case.shards == 1,
           "an automatic sequence axis gathers the keys, and a pallas call would gather the queries back",
           row=INHERENT),

@@ -17,6 +17,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from attention_oracle import attention_terms, kept
 from flax import linen as nn
 from jax.sharding import Mesh, PartitionSpec
 from reference_error import assert_as_exact, with_gradients
@@ -404,16 +405,49 @@ def test_a_bf16_attention_with_a_side_of_one_is_on_par_with_float64(sides):
                     f"bf16 attention of {queries} queries over {keys} keys", seeds=SIDE_OF_ONE_SEEDS)
 
 
+def test_a_bias_of_the_key_heads_is_refused_by_the_template_not_read_past():
+    """A bias of the key heads `[B, Hk, Q, K]` (Hk neither 1 nor the query heads) broadcasts to no call's
+    heads: the template refuses it by name, as the reference path's broadcast does, and reads no head past
+    the bias (row 2578)."""
+    from dew.nn.kernels import selection
+
+    queries = 40
+    rng = np.random.default_rng(0)
+    query = jnp.asarray(rng.standard_normal((2, queries, HEADS, WIDTH)), jnp.bfloat16)
+    key = jnp.asarray(rng.standard_normal((2, queries, KV_HEADS, WIDTH)), jnp.bfloat16)
+    bias = jnp.zeros((2, KV_HEADS, queries, queries), jnp.float32)
+    with pytest.raises(selection.KernelRefused):
+        scaled_dot_product_attention(query, key, key, bias=bias, causal=True, implementation="template")
+
+
+@pytest.mark.parametrize(("target", "rows", "template_runs"),
+                         [("sm90", 1, True), ("sm90", 2, False), ("sm80", 1, False)],
+                         ids=["a shared table on an H100", "a bias a row", "a shared table off an H100"])
+def test_auto_takes_a_dense_bias_to_the_template_where_it_measured_faster(target, rows, template_runs):
+    """A call whose bias varies by query goes to the template by itself only where it measured faster
+    than the xla kernel (ET-DBIAS-h100): a table every batch row shares, on an H100, whose Mosaic mainloop
+    reads it once a tile; a bias a row, or a shared table off an H100 (its Triton mainloop reads it spread
+    to every row), goes to the attention kernels' other paths (rows 2523, 2577)."""
+    query = jnp.zeros((2, 64, HEADS, 64), jnp.bfloat16)
+    bias = jnp.zeros((rows, HEADS, 64, 64), jnp.float32)
+    with generation.assumed(target):
+        route = attention.resolve_implementation("auto", query, query, bias=bias)
+    assert (route.kernel == "template") is template_runs
+
+
 DENSE_BIAS_SEEDS = 8
 """Check 1's declared seeds for a dense bias named onto the template."""
 
 
-@pytest.mark.parametrize("rows", [2, 1], ids=["a bias a row", "one bias every row"])
-def test_a_dense_bias_named_onto_the_template_is_on_par_with_the_reference_path(rows):
-    """A causal bf16 call whose bias varies by query, `[B or 1, H, Q, K]` (a learned relative position's),
-    named onto the template: its score hook reads the bias a tile at a time (`template.biased`, a
-    `Kind.TILE` parameter), on par (check 1) with the reference path's dense bias from float64, its output
-    and the query's, key's, value's and bias's gradients (row 2081)."""
+@pytest.mark.parametrize("rows, heads", [(2, HEADS), (1, HEADS), (1, 1)],
+                         ids=["a bias a row", "one bias every row", "one bias every row and head"])
+def test_a_dense_bias_named_onto_the_template_is_on_par_with_the_reference_path(rows, heads):
+    """A causal bf16 call whose bias varies by query, `[B or 1, H or 1, Q, K]` (a learned relative
+    position's, T5's one table for every row), named onto the template: its score hook reads the bias a
+    tile at a time where it is shared, never broadcast (`template.biased`, a `Kind.TILE` parameter at
+    `template.shared_place`), on par (check 1) with the reference path's dense bias from float64, its
+    output and the query's, key's, value's and bias's gradients, the bias's in its own shape (rows 2081,
+    2523)."""
     queries = 40
 
     def drawn(seed):
@@ -422,7 +456,7 @@ def test_a_dense_bias_named_onto_the_template_is_on_par_with_the_reference_path(
             jnp.asarray(rng.standard_normal(shape), jnp.bfloat16) for shape in (
                 (2, queries, HEADS, WIDTH), (2, queries, KV_HEADS, WIDTH), (2, queries, KV_HEADS, WIDTH),
                 (2, queries, HEADS, WIDTH)))
-        bias = jnp.asarray(0.5 * rng.standard_normal((rows, HEADS, queries, queries)), jnp.float32)
+        bias = jnp.asarray(0.5 * rng.standard_normal((rows, heads, queries, queries)), jnp.float32)
         return query, key, value, bias, cotangent
 
     def attended(implementation):
@@ -430,7 +464,7 @@ def test_a_dense_bias_named_onto_the_template_is_on_par_with_the_reference_path(
             query, key, value, bias=bias, causal=True, implementation=implementation))
 
     assert_as_exact(jax.jit(attended("template")), jax.jit(attended("reference")), drawn,
-                    f"a dense bias of {rows} rows on the template", seeds=DENSE_BIAS_SEEDS)
+                    f"a dense bias of {rows} rows and {heads} heads on the template", seeds=DENSE_BIAS_SEEDS)
 
 
 @pytest.mark.skipif(generation.device_generation() != "sm90",
@@ -439,12 +473,31 @@ def test_a_dense_bias_named_onto_the_template_is_on_par_with_the_reference_path(
 @pytest.mark.parametrize("case", ["causal", "packed-documents", "sinks-softcap"])
 def test_an_fp16_call_on_an_h100_is_on_par(case):
     """fp16 on an H100, whose Mosaic backward takes bf16 alone (`attention_mosaic.refused`), so its forward
-    and backward compose two mainloops: on par with the reference path (check 1) whatever they run."""
+    and backward compose two mainloops: on par with the reference path (check 1) whatever they run. A call
+    without sinks is judged a term at a time (`attention_terms`): a query that keeps one key has a dQ of
+    zero in float64, which a D formed from the rounded output rounds to its own size (G14's H100 flow,
+    gate-g14f-h100)."""
     queries, keys = geometry(CASES[case])
     draw = drawing(queries, keys, jnp.float16, sinks=bool(CASES[case].get("sinks")))
     template_pass = jax.jit(pulled("template", CASES[case]))
     assert_as_exact(template_pass, jax.jit(pulled("reference", CASES[case])), draw,
-                    f"fp16 Mosaic forward, Triton backward, {case}", seeds=SEEDS)
+                    f"fp16 Mosaic forward, Triton backward, {case}", seeds=SEEDS,
+                    terms=False if CASES[case].get("sinks") else _terms(CASES[case], queries, keys))
+
+
+def _terms(case: dict, queries: int, keys: int):
+    """The float64 terms of `case`'s output and gradients (`attention_terms`) over the keys it keeps, a
+    function of a draw `(query, key, value, sinks, dout)`."""
+    names = keywords(case)
+    keep = kept(queries, keys, causal=case.get("causal", False), sliding_window=case.get("sliding_window"),
+                segment_ids=names.get("segment_ids"))
+
+    def terms(query, key, value, sinks, dout):
+        del sinks
+        # The sinks' gradient, which a call without sinks holds as None.
+        return (*attention_terms(query, key, value, dout, keep), None)
+
+    return terms
 
 
 @pytest.mark.gpu(reason="walks a sequence of thousands of keys, on a GPU")
@@ -637,6 +690,28 @@ def test_a_call_no_triton_config_fits_lowers_on_another_mainloop(generation_name
     with generation.assumed(generation_name), jax.sharding.use_abstract_mesh(mesh):
         traced = jax.jit(jax.grad(loss, argnums=(0, 1, 2))).trace(query, query, query)
         traced.lower(lowering_platforms=("cuda",))
+
+
+def test_a_pass_the_mosaic_mainloop_declines_reports_its_reason_under_its_row():
+    """A pass the Mosaic mainloop declines on a GPU runs the next mainloop that takes it, and its route
+    reports Mosaic's own reason (the analysis's code and detail) under the row that tracks lifting it, so
+    the kernel-route audit reads a gap and not an undeclared refusal (row 2545); a Triton refusal is its
+    inherent limit."""
+    from dew.nn.kernels import selection
+
+    declined = selection.Refusal("registers", "no tile holds the walk's registers")
+    spans = selection.Refusal("dropout", "the Triton mainloop drops no probabilities")
+    route = selection.select(attention_route.MAINLOOP,
+                             attention_route._Pass(on_gpu=True, mosaic=declined, triton=None))
+    assert (route.kernel, route.refusal.code, route.refusal.detail) == ("triton", "registers",
+                                                                         declined.detail)
+    assert route.refusal.row == "roadmap: the Mosaic template takes every call"
+    route = selection.select(attention_route.MAINLOOP,
+                             attention_route._Pass(on_gpu=True, mosaic=declined, triton=spans))
+    assert route.kernel == "portable"
+    [refused] = attention_route.MAINLOOP.kernel("triton").failed(
+        attention_route._Pass(on_gpu=True, mosaic=None, triton=spans))
+    assert (refused.code, refused.row) == ("dropout", generation.INHERENT)
 
 
 def routed_call(form: str):

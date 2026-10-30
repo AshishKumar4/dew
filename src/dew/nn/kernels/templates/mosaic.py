@@ -527,8 +527,7 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
         consumer roles: one where the family's roles split the register file between them (warpgroup
         MMA's consumers beside its producer, `resources.consumer_registers`). Each stages its share of the
         multiprocessor's shared memory (`resources.program_shared`), which may hold no tile at that many."""
-        del consumers
-        return 1
+        return resources.register_programs(self, consumers)
 
     @abc.abstractmethod
     def registers(self, consumers: int) -> int:
@@ -1236,15 +1235,6 @@ class ConsumerFed[Accumulator](RingFamily[Accumulator]):
     def registers(self, consumers: int) -> int:
         return resources.entry_registers(consumers)
 
-    def programs(self, consumers: int) -> int:
-        """`Family.programs`: as many as the register file holds at the program's entry registers in the
-        allocator's unit (`registers` rounded up to `register_step`), each of its `consumers` warpgroups'
-        threads at them, no producer beside them, within the multiprocessor's 64 warps: a one-warpgroup
-        program's 255 (256 allocated) hold two a multiprocessor, 168 three, where a producer's layout holds
-        one (the recurrence's solve launch on an H100, two at a time: 0.356 -> 0.235 ms, JS-fed5)."""
-        allocated = -(-self.registers(consumers) // self.register_step) * self.register_step
-        held = cost.REGISTERS // (consumers * resources.THREADS * allocated)
-        return max(1, min(held, 64 * 32 // (consumers * resources.THREADS)))
 
     def warpgroups(self, consumers: int) -> int:
         return consumers

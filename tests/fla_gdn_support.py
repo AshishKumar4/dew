@@ -30,6 +30,8 @@ class KernelCase(NamedTuple):
     """Each of its Mosaic GPU kernels' register decision by its template's model, by kernel name
     (`resources.RegisterModel`), which the compile gate decides on as it decides on ptxas's need
     (`kernel_compile.mosaic_failures`)."""
+    required: bool = True
+    """A launch the runtime admits. False marks a rejected configuration compiled only for model evidence."""
 
 
 def _pinned(launch, tiles, *args, compensated: bool = False, terms: bool = False, **kwargs):
