@@ -97,23 +97,29 @@ class Watched:
     histogram: bool = False
 
 
-def called_with(model: nn.Module, run: Callable[[], object]) -> tuple[tuple, dict]:
-    """The arguments `run` first calls `model` with, as its caller made them: for a forward an objective
-    runs inside a transform, the inputs `Objective.watched_forward` reruns it on. Only a call of `model`
-    itself (another module's, a guidance's own, is passed over) made in this trace counts, so its arguments
-    are this trace's values, never a transform's inside `run` (a `cond`, a `jit`); refused where `run`
-    makes none. `run`'s outputs are unused, so a compiled step keeps only what computes the arguments."""
+def called_with(model: nn.Module, variables: Mapping, run: Callable[[], object]) -> tuple[tuple, dict]:
+    """The arguments `run` first calls `model` over `variables` with, as its caller made them: for a
+    forward an objective runs inside a transform, the inputs `Objective.watched_forward` reruns it on.
+    Only that call counts, identified by its weights (the arrays of `variables` it binds, which a call over
+    other weights, another module's or a guide's of the same architecture, does not), made in this
+    trace, so its arguments are this trace's values, never a transform's inside `run` (a `cond`, a
+    `jit`); refused where `run` makes none. `run`'s outputs are unused, so a compiled step keeps only
+    what computes them."""
     traced, calls = jax_core.trace_ctx.trace, []
+    weights = {id(leaf) for leaf in jax.tree.leaves(variables)}
 
     def interceptor(next_fun, args, kwargs, context):
-        if (not calls and context.method_name == "__call__" and type(context.module) is type(model)
-                and jax_core.trace_ctx.trace is traced):
+        module = context.module
+        if (not calls and context.method_name == "__call__" and type(module) is type(model)
+                and jax_core.trace_ctx.trace is traced
+                and any(id(leaf) in weights for leaf in jax.tree.leaves(module.variables))):
             calls.append((args, kwargs))
         return next_fun(*args, **kwargs)
 
     with nn.intercept_methods(interceptor):
         run()
     if not calls:
-        raise ValueError(f"the forward calls no {type(model).__name__} outside a transform of its own, whose "
-                         f"inputs a watched step would read; its activations cannot be watched")
+        raise ValueError(f"the forward calls no {type(model).__name__} over its weights outside a transform "
+                         f"of its own, whose inputs a watched step would read; its activations cannot be "
+                         f"watched")
     return calls[0]
