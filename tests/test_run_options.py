@@ -418,13 +418,16 @@ class Reach:
     builds: bool = False
 
     def made(self, value):
-        """The option a value of this field gives the task, None where its builder refuses its numbers."""
-        if not self.builds or value is None:
-            return value
+        """The option a value of this field gives the task."""
+        return value() if self.builds and value is not None else value
+
+    def makes(self, value) -> bool:
+        """Whether a value of this field gives the task an option: a builder may refuse its own numbers."""
         try:
-            return value()
+            self.made(value)
         except ValueError:
-            return None
+            return False
+        return True
 
 
 def builds(annotation, option) -> bool:
@@ -605,7 +608,7 @@ def test_each_option_a_saved_task_is_built_with_reaches_it_from_the_command_line
         assert getattr(base, name) != fields[name].default, f"the run fills no {settings.__name__}.{name}"
     # A builder's path is witnessed by its own alternatives, each the option its call makes.
     queued = {name: [value for value in (alternatives(found.annotation) if found.builds else values)
-                     if found.made(value) is not None and not same(found.made(value), getattr(base, name))
+                     if found.makes(value) and not same(found.made(value), getattr(base, name))
                      and accepted(base, name, found.made(value))]
               for name, values in options.items() if (found := paths[name]) is not None}
     reachable = {name: found for name, found in paths.items() if found is not None}
