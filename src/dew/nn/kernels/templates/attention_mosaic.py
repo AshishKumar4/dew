@@ -146,10 +146,11 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
         registers `Template.legal` holds it to. A pinned or stored config is held to it as a derived one."""
         found = {family.name: family for family in layouts(target.generation, ba.arguments["query"].dtype)}
         family = found.get(config.family)
-        # A dQ launch's layout streams through a producer (`Family.stream`); a layout whose consumers feed
-        # their own rings (`split_queries`) runs the forward and the dK/dV launches, the keys-first one and
-        # the fused one, each consumer its own queries or keys over the stream they walk whole.
-        walks_whole = isinstance(config, Tiles) or config.queries_first
+        # A forward's and a dQ launch's layout streams through a producer (`Family.stream`); a layout whose
+        # consumers feed their own rings (`split_queries`) runs the dK/dV launches alone, the keys-first one
+        # and the fused one, each consumer its own keys over the stream they walk whole. The forward on it
+        # has no use the producer's layout does not serve, and deadlocked (row 2599): it is no config.
+        walks_whole = not isinstance(config, Tiles) and config.queries_first
         return (family is not None and (walks_whole or not split_queries(family))
                 and whole_tiles(family, config) and self.refusal(ba, family) is None
                 and super().legal(ba, config, target))
