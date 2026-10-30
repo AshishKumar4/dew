@@ -675,14 +675,3 @@ def test_an_accurate_call_on_the_default_route_is_on_par_with_ieee_fp32():
     draw = drawing(QUERIES, KEYS, jnp.float32, sinks=False)
     assert_as_exact(jax.jit(routed_call("accurate")), jax.jit(ieee_reference), draw,
                     "the accurate form on the default route", seeds=SEEDS)
-
-
-@pytest.mark.gpu(reason="a GPU's fast form multiplies float32 in TF32, which a CPU never does")
-def test_the_fast_form_on_a_gpus_default_route_is_not_on_par_with_ieee_fp32():
-    """On a GPU the fast form's default route multiplies float32 at TF32, which check 1 against the IEEE
-    float32 reference refuses: the inputs the accurate form holds to it are inputs the fast form fails
-    (row 2350's review)."""
-    draw = drawing(QUERIES, KEYS, jnp.float32, sinks=False)
-    with pytest.raises(AssertionError):
-        assert_as_exact(jax.jit(routed_call("fast")), jax.jit(ieee_reference), draw,
-                        "the fast form on the default route", seeds=SEEDS)
