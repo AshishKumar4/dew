@@ -19,17 +19,13 @@ import tarfile
 from pathlib import Path
 
 import jax
-import numpy as np
 import pytest
 from reference_error import recording
-from saved_run_kinds import SAVED_KINDS, computed
+from saved_run_kinds import SAVED_KINDS, answered, computed
 
 from dew.checkpoints import Checkpoints
 from dew.config import RunConfig
-from dew.decision import Choice
-from dew.decision.task import Decide
-from dew.inference.images import TextToImage
-from dew.inference.tasks import BlockGeneration, SavedRun, TextGeneration
+from dew.inference.tasks import SavedRun
 from dew.registry import objectives
 
 CORPUS = Path(__file__).with_name("fixtures") / "saved_runs"
@@ -73,26 +69,6 @@ def test_a_saved_run_names_no_owner_time_or_place_of_the_machine_that_wrote_it(r
                 assert found is not None and not ABSOLUTE.search(found.read()), member.name
 
 
-def answered(task) -> None:
-    """One request of a loaded task, as its kind's users make it, and its answer: a language model
-    continues a prompt by one token through the tokenizer its run recorded, a decision answers a
-    question about a state, and a text-to-image run draws an image in one step."""
-    if isinstance(task, TextGeneration):
-        assert len(task.decode(task("ab", max_new_tokens=1, key=0))) == 1
-    elif isinstance(task, BlockGeneration):
-        # A response of at least one token past the prompt, its decoder having stepped.
-        generated = task([[4, 5, 6, 7]], 4, key=0).host()
-        assert (np.asarray(generated.lengths) > 0).all() and (np.asarray(generated.decoder_steps) > 0).all()
-    elif isinstance(task, Decide):
-        question = {"team": Choice("which team", ["billing", "technical", "sales"])}
-        [answers] = task([({"text": "the site is down"}, question)])
-        assert answers["team"].choice in ("billing", "technical", "sales")
-    elif isinstance(task, TextToImage):
-        assert len(task(["a cat"], steps=1, key=0).pil()) == 1
-    else:
-        raise AssertionError(f"no request is written for a saved {type(task).__name__}")
-
-
 def extracted(tmp_path: Path, recorded: str, kind: str) -> Path:
     """The run directory of `kind`'s saved run, unpacked under `tmp_path`."""
     with archived(recorded, kind) as packed:
@@ -113,8 +89,9 @@ def test_a_run_an_earlier_main_saved_loads_and_answers(tmp_path, recorded, kind)
     if seen is not None:
         assert recorded_run.compute_dtype() == seen["compute"]
         if task is not None:
-            # The task loaded computes as the one the run saved did, its model built so.
-            assert computed(task.from_run(str(run)).model) == seen["task_compute"]
+            # The task loaded multiplies as the one the run saved did: one request's products in the
+            # dtypes they multiplied in then.
+            assert computed(task.from_run(str(run))) == seen["products"]
     with Checkpoints(str(run)) as checkpoints:
         last = checkpoints.latest
         declared = checkpoints.artifact(last) is not None
@@ -176,7 +153,7 @@ def test_a_run_an_earlier_main_saved_resumes_from_its_checkpoint(tmp_path, monke
         # The model the resumed fit trained computes as the saved one did: the task its new step saves.
         task = objectives[recorded_run.objective.name].saved_task
         if task is not None:
-            assert computed(task.from_run(str(run), step=int(state.step)).model) == seen["task_compute"]
+            assert computed(task.from_run(str(run), step=int(state.step))) == seen["products"]
         # The step the resumed fit compiled, at the rung it was admitted at.
         compiled = [row["value"] for row in records[resumed:] if row["type"] == "StepCompiled"][-1]
         assert compiled["remat"] == seen["remat"]
