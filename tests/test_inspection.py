@@ -392,16 +392,18 @@ def test_a_sampled_step_summarizes_its_trained_forward_at_no_forward_more(name):
     kinds = ("*Block*", "*Attention*", "*Mlp*", "*MLP*")
 
     def work(*, watched: bool) -> tuple[float, object]:
-        def loss(params, numeric):
-            step = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(1), ema=None,
+        # The step's count is an argument, so a branch on it (rCM's phases) stays a branch.
+        def loss(params, numeric, count):
+            step = Step(step=count, key=jax.random.key(1), ema=None,
                         watched=Watched(kinds) if watched else None)
             with watching(kinds) if watched else contextlib.nullcontext():
                 stats, aux = objective.loss({**variables, "params": params}, {**numeric, **held}, step)
             return objective.reduce_loss(stats)[0], aux.inspected
         stepped = jax.value_and_grad(loss, has_aux=True)
-        flops = step_flops(jax.jit(stepped).lower(variables["params"], numeric).compile())
+        count = jnp.zeros((), jnp.int32)
+        flops = step_flops(jax.jit(stepped).lower(variables["params"], numeric, count).compile())
         assert flops is not None
-        return flops.hardware, jax.eval_shape(stepped, variables["params"], numeric)[0][1]
+        return flops.hardware, jax.eval_shape(stepped, variables["params"], numeric, count)[0][1]
 
     plain, _ = work(watched=False)
     sampled, inspected = work(watched=True)

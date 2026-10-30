@@ -37,6 +37,7 @@ from dew.diffusion.schedules import FlowMatchingScheduler, expand
 from dew.diffusion.schedules.flow import static_shift
 from dew.inputs import InputSpec
 from dew.nn.attention import forward_mode_attention
+from dew.nn.inspection import INSPECTED
 from dew.objectives.base import TEACHER, Aux, EMASpec, ProgramModule, Step
 from dew.sampling.guidance import guide
 
@@ -76,6 +77,7 @@ def consistency_loss(
     teacher_F,
     warmup: float | jax.Array,
     scale: float,
+    trained: Callable[[jax.Array, jax.Array], jax.Array] | None = None,
 ) -> jax.Array:
     """Return sCM's per-row loss times `scale` (rCM's `_student_scm_step`).
 
@@ -86,7 +88,9 @@ def consistency_loss(
         g = -cos t sqrt(1 - r^2 sin^2 t) (F_sg - F_teacher) - (r cos t sin t x + dF/dt)
 
     normalized by its norm plus 0.1, and the loss is ||F - F_sg - g||^2.
-    `student(x, t)` returns the student's F. The noised sample and its time, built from float32 draws,
+    `student(x, t)` returns the student's F; `trained`, where given, is the student whose F the loss
+    trains, the JVP's apart (one that records what its call sows). The noised sample and its time, built
+    from float32 draws,
     are widened to the teacher's dtype, exactly, so a float64 twin takes its JVP in float64, its
     tangents in the primals' dtypes as `jax.jvp` asks.
     """
@@ -96,7 +100,7 @@ def consistency_loss(
     with forward_mode_attention():
         _, derivative = jax.jvp(student, (x, t), (cos * sin * teacher_F, jnp.cos(t) * jnp.sin(t)))
     derivative = jax.lax.stop_gradient(derivative)
-    F = student(x, t)
+    F = (student if trained is None else trained)(x, t)
     held = jax.lax.stop_gradient(F)
     g = (-cos * jnp.sqrt(1 - warmup ** 2 * sin ** 2) * (held - teacher_F)
          - (warmup * cos * sin * x + derivative))
@@ -309,11 +313,19 @@ class ConsistencyDistillationObjective(FlowDistillationObjective):
         return {collection: {FAKE_SCORE: jax.tree.map(jnp.copy, held)}
                 for collection, held in state[TEACHER].items()}
 
-    def _network(self, model: nn.Module, variables: Variables, conditions) -> Velocity:
+    def _network(self, model: nn.Module, variables: Variables, conditions,
+                 recorded: list[Variables] | None = None) -> Velocity:
+        """`model` at `variables` as a velocity of TrigFlow's rf; where `recorded` is given and empty, its
+        first call records what the watched modules sow (`INSPECTED`), in the trace that calls it."""
         schedule = self.process.schedule
 
         def velocity(x, rf):
-            output = model.apply(variables, x, schedule.model_time(rf), **conditions)
+            arguments = (x, schedule.model_time(rf))
+            if recorded is not None and not recorded:
+                output, sown = model.apply(variables, *arguments, **conditions, mutable=[INSPECTED])
+                recorded.append(dict(sown).get(INSPECTED, {}))
+            else:
+                output = model.apply(variables, *arguments, **conditions)
             assert isinstance(output, jax.Array)
             return output
         return velocity
@@ -354,42 +366,19 @@ class ConsistencyDistillationObjective(FlowDistillationObjective):
             critic_time=normal("critic time"),
             critic_noise=normal("critic noise", *row))
 
-    def _generated(self, student_params, given, draws: _Draws, iteration) -> jax.Array:
+    def _generated(self, student_params, given, draws: _Draws, iteration,
+                   recorded: list[Variables] | None = None) -> jax.Array:
         """The student's DMD2 sample: `max_simulation_steps` noisings drawn,
-        the first `steps - 1` walked, where steps cycles with `iteration`."""
+        the first `steps - 1` walked, where steps cycles with `iteration`; its first call records what it
+        sows into `recorded` (`_network`)."""
         steps = iteration % self.max_simulation_steps + 1
         times = self._times(draws.simulation_times, self.critic_times)
         # Steps past the drawn count leave the time where it is: from t = 0
         # nothing is noised again.
         live = jnp.arange(self.max_simulation_steps - 1) < steps - 1
-        network = self._network(self.model, student_params, given)
+        network = self._network(self.model, student_params, given, recorded)
         return backward_simulation(lambda x, t: trig_prediction(network, x, t)[0], draws.start, times,
                                    draws.simulation_noises, live)
-
-    def _watched_point(self, samples: jax.Array, draws: _Draws, student_phase: jax.Array
-                       ) -> tuple[jax.Array, jax.Array]:
-        """The TrigFlow `(x, t)` at which the step's loss first runs the student: in a critic phase, or for
-        distribution matching alone, the simulation's start from noise at t = pi/2 (`backward_simulation`,
-        `_generated`); else sCM's continuous point or rCM's discrete one, the first of its shifted grid
-        (`discrete_consistency_loss`)."""
-        start = (draws.start, jnp.full(draws.start.shape[:1], math.pi / 2, jnp.float32))
-        if self.consistency_weight == 0:
-            return start
-        x, t = self._consistency_point(samples, draws)
-        return (jnp.where(student_phase, x, start[0]),
-                jnp.where(student_phase, t, start[1]).astype(t.dtype))
-
-    def _consistency_point(self, samples: jax.Array, draws: _Draws) -> tuple[jax.Array, jax.Array]:
-        """The consistency loss's student point: rCM's discrete grid's first, or sCM's continuous one."""
-        if self.consistency == "discrete":
-            u = draws.consistency_time * (1 - self.discrete_skip / self.discrete_steps)
-            rf = static_shift(self.discrete_shift, 1.0 - u)
-            rf = jnp.clip(rf, 0.0, 1.0 - jnp.finfo(rf.dtype).eps)
-            t = jnp.arctan(rf / (1 - rf))
-        else:
-            t = self._times(draws.consistency_time, self.student_times)
-        noise = draws.consistency_noise
-        return expand(jnp.cos(t), samples) * samples + expand(jnp.sin(t), samples) * noise, t
 
     def loss(self, variables, batch, step: Step):
         encode_key, drop_key = jax.random.split(jax.random.fold_in(step.key, 1))
@@ -405,8 +394,11 @@ class ConsistencyDistillationObjective(FlowDistillationObjective):
         def student_losses(params):
             student_params = self.model_variables(params)
             total = jnp.zeros((count,), jnp.float32)
+            # The student's first trained call records what it sows (`_network`): the consistency loss's,
+            # or, for distribution matching alone, its simulation's.
+            recorded: list[Variables] | None = [] if step.watched is not None else None
             if self.consistency_weight > 0 and self.consistency == "discrete":
-                network = self._network(self.model, student_params, given)
+                network = self._network(self.model, student_params, given, recorded)
                 u = draws.consistency_time * (1 - self.discrete_skip / self.discrete_steps)
                 total = total + discrete_consistency_loss(
                     lambda x, t: trig_prediction(network, x, t)[0],
@@ -421,35 +413,34 @@ class ConsistencyDistillationObjective(FlowDistillationObjective):
                 warmup = self.tangent_warmup
                 ratio = 1.0 if warmup == 0 else jnp.minimum(1.0, iteration / warmup)
                 network = self._network(self.model, student_params, given)
+                observed = self._network(self.model, student_params, given, recorded)
                 total = total + consistency_loss(lambda x, t: trig_prediction(network, x, t)[1], x, t,
-                                                 teacher_F, ratio, self.consistency_weight)
+                                                 teacher_F, ratio, self.consistency_weight,
+                                                 trained=lambda x, t: trig_prediction(observed, x, t)[1])
             if self.dmd_weight > 0:
                 distribution = self._distribution_matching(params, student_params, given, blank, draws,
-                                                           effective)
+                                                           effective, recorded)
                 total = total + jnp.where(warm, 0.0, distribution)
-            return total
+            return total, recorded[0] if recorded else None
 
         def critic_losses(params):
+            # The student's first call in a critic phase, its simulation's start, records what it sows.
+            recorded: list[Variables] | None = [] if step.watched is not None else None
             generated = jax.lax.stop_gradient(self._generated(
-                self.model_variables(params), given, draws, iteration - effective - 1))
+                self.model_variables(params), given, draws, iteration - effective - 1, recorded))
             t = self._times(draws.critic_time, self.critic_times)
             noise = draws.critic_noise
             x = expand(jnp.cos(t), generated) * generated + expand(jnp.sin(t), generated) * noise
             fake, _ = trig_prediction(self._network(self.fake_score, part(params, FAKE_SCORE), given), x, t)
-            return critic_loss(generated, fake, t)
+            return critic_loss(generated, fake, t), recorded[0] if recorded else None
 
-        losses = jax.lax.cond(student_phase, student_losses, critic_losses, variables)
-        # The student's forward at the point its loss first runs it, as `trig_prediction` feeds it, for its
-        # summaries (`_watched_point`).
-        x, t = self._watched_point(samples, draws, student_phase)
-        rf = jnp.sin(t) / (jnp.cos(t) + jnp.sin(t))
-        inspected = self.watched_forward(step, self.model, self.model_variables(variables),
-                                         x / expand(jnp.cos(t) + jnp.sin(t), x),
-                                         self.process.schedule.model_time(rf), **given)
+        # Each phase's summaries are its own first call's, returned through the branch that runs it.
+        losses, inspected = jax.lax.cond(student_phase, student_losses, critic_losses, variables)
         return self.row_mean(losses, batch), Aux(metrics={}, inspected=inspected)
 
-    def _distribution_matching(self, params, student_params, given, blank, draws: _Draws, iteration):
-        generated = self._generated(student_params, given, draws, iteration)
+    def _distribution_matching(self, params, student_params, given, blank, draws: _Draws, iteration,
+                               recorded: list[Variables] | None = None):
+        generated = self._generated(student_params, given, draws, iteration, recorded)
         t = self._times(draws.critic_time, self.critic_times)
         noise = draws.critic_noise
         x = expand(jnp.cos(t), generated) * generated + expand(jnp.sin(t), generated) * noise

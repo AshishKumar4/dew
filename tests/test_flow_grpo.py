@@ -1333,10 +1333,7 @@ class Branched:
         from dew.sampling.guidance import Walk
 
         def predict(x, t):
-            def called(x):
-                output, sown = denoise.raw_observed(x, t)
-                return denoise.observed(denoise.convert(x, t, output), sown)
-            return jax.lax.cond(jnp.asarray(1) > 0, called, called, x)
+            return jax.lax.cond(jnp.asarray(1) > 0, denoise.predict, denoise.predict, x, t)
         return Walk.stateless(lambda index: predict)
 
 
@@ -1347,7 +1344,7 @@ def test_a_watched_flow_step_summarizes_its_policys_own_first_call(guided):
     tree that holds an autoguidance's guide it does not read, under an autoguidance whose main model
     holds the guide out (2317), and under a custom guidance that calls its policy inside a `lax.cond` of
     its own (2511)."""
-    from dew.nn.inspection import Watched, flattened, watching
+    from dew.nn.inspection import Watched, flattened, statistics, watching
     from dew.sampling.guidance import Autoguidance
 
     process, rows = Process(FlowMatchingScheduler(), VPredictionTransform()), 4
@@ -1378,10 +1375,11 @@ def test_a_watched_flow_step_summarizes_its_policys_own_first_call(guided):
     # The policy's own call, run eagerly through any transform its guidance wraps it in.
     with nn.intercept_methods(kept), jax.disable_jit():
         objective._walk(variables, batch).at((), 0)(batch["latents"][:, 0], batch["timesteps"][:, 0])
-    expected = np.asarray(outputs[0], np.float32)
+    # Its summary as XLA reduces it, in the order the step's own reductions take on this machine.
+    expected = jax.jit(statistics)(outputs[0])
     logged = flattened(aux.inspected)
-    assert logged["activations/abs_max"] == np.abs(expected).max()
-    assert logged["activations/mean"] == expected.mean(dtype=np.float32)
+    assert logged["activations/abs_max"] == expected["abs_max"]
+    assert logged["activations/mean"] == expected["mean"]
 
 
 class DenseVelocity(nn.Module):
