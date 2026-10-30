@@ -61,6 +61,15 @@ def _down(i):
     return i, 0
 
 
+UNROLLED = 8
+"""The tokens a chunk's loop takes a turn: each token's step has too little independent work to hide its
+latencies alone. Forward at chunk 32, 16 states, against mamba_ssm's selective_scan_fn in the same job
+(8x2048x5120, 2x4096x8192): on an H100 80GB HBM3 0.742 and 0.806 ms against 1.311 and 1.054 (rolled 0.784
+and 0.927, JS-selbar2-h100-894dfdf30); on an A100 SXM4 1.389 and 1.998 against 2.970 and 2.132
+(JS-selbar-a100-894dfdf30). 2 and 16 tokens a turn took longer, and the whole chunk longer still
+(JS-selunroll-h100-894dfdf30)."""
+
+
 PARAMETER_ROWS = 8
 """The rows a program's parameter tile takes past its rates: the skip's, padded to the 8-row tiles a stream's
 rows come in."""
@@ -136,7 +145,7 @@ def forward(x, dt, b, c, parameters, state, resets, scan: Scan):
                         out_smem[t, :] = (read + skip * value).astype(out_smem.dtype)
                         return h
 
-                    h = lax.fori_loop(0, chunk, token, h)
+                    h = lax.fori_loop(0, chunk, token, h, unroll=UNROLLED)
                     family.stored([out_smem[...]], [y_ref.at[row, pl.ds(index * chunk, chunk), columns]],
                                   smem=out_smem)
                     return h, accumulators
@@ -164,7 +173,7 @@ def forward(x, dt, b, c, parameters, state, resets, scan: Scan):
     return (*outs, None) if not scan.entered else tuple(outs)
 
 
-def selective_scan(x, dt, A, B, C, D, state=None, starts=None, *, family: mosaic.Family, chunk: int = 64,
+def selective_scan(x, dt, A, B, C, D, state=None, starts=None, *, family: mosaic.Family, chunk: int = 32,
                    block: int = 128, interpret: bool = False):
     """`dew.nn.mixers.mamba.selective_scan` on the template: `x`, `dt` `[B, S, D]` (after the softplus),
     `A` `[D, N]`, `B`, `C` `[B, S, N]`, `D` `[D]`, `state` `[B, D, N]` or None, `starts` `[B, S]` or None.
