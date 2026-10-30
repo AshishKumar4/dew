@@ -203,9 +203,9 @@ class AheadOfTime:
     def derived_for(self, device: GpuTarget) -> GpuTarget:
         """The facts a run on a GPU of `device`'s facts derives its launches for while it reproduces this
         program (`handed`): the target it was compiled for (`target`), which the GPU runs where it is of
-        its generation and holds at least the shared memory a block of its launches takes. Refused for
-        any other, on which the program's launches would not run."""
-        held = device.shared_limit is None or self.target.shared_limit is None or (
+        its generation and holds at least the shared memory a block of its launches takes, both known.
+        Refused for any other, on which the program's launches are not known to run."""
+        held = device.shared_limit is not None and self.target.shared_limit is not None and (
             device.shared_limit >= self.target.shared_limit)
         if device.generation != self.target.generation or not held:
             raise ValueError(f"the step was compiled ahead for {self.target.device_kind} "
