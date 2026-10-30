@@ -45,6 +45,7 @@ from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.decoder_families import ENTRIES
 from dew.interop.decoder_parts import (
     NO_AUDIO,
+    SLICED,
     AudioFields,
     DecoderFamily,
     DecoderFields,
@@ -879,7 +880,8 @@ def read_wrapper(
 
 
 def _stack_experts(params: LazyTree) -> None:
-    """Stack per-expert `experts/K/projection` dicts into `[E, ...]` leaves.
+    """Stack per-expert `experts/K/projection` dicts, and a table's `shards/K/table` row shards, into
+    `[E, ...]` leaves (`decoder_parts.expert_slot`).
 
     A checkpoint names one tensor per expert while the tree keeps one leaf
     per projection stacked on an expert dimension, so after the flat map
@@ -893,10 +895,10 @@ def _stack_experts(params: LazyTree) -> None:
         nested = block.get('block') if isinstance(block, dict) else None
         if depth.startswith(('mtp_', 'dspark_')) and isinstance(nested, dict):
             blocks.append((depth, nested))
-    slots = [(f'{layer}.{name}', slot) for layer, block in blocks for name, slot in block.items()
-             if name in ('mlp', 'self_attn') and isinstance(slot, dict)]
-    for layer, mlp in slots:
-        experts = mlp.get('experts')
+    slots = [(f'{layer}.{name}', slot, sliced) for layer, block in blocks for name, slot in block.items()
+             if name in ('mlp', 'self_attn', 'engram') and isinstance(slot, dict) for sliced in SLICED]
+    for layer, mlp, sliced in slots:
+        experts = mlp.get(sliced)
         if not isinstance(experts, dict):
             continue
         if not any(index.isdigit() for index in experts):
@@ -911,17 +913,18 @@ def _stack_experts(params: LazyTree) -> None:
         first = experts[indices[0]]
         if not isinstance(first, dict):
             raise ValueError(f"{layer} expert {indices[0]} is a tensor, not projections")
+        kind = 'kernel' if sliced == 'experts' else 'embedding'
         for projection in first:
             leaves = []
             for index in indices:
                 expert = experts[index]
                 node = expert.get(projection) if isinstance(expert, dict) else None
-                leaf = node.get('kernel') if isinstance(node, dict) else None
+                leaf = node.get(kind) if isinstance(node, dict) else None
                 if not isinstance(leaf, SourceLeaf):
-                    raise ValueError(f"{layer} expert {index} has no {projection} kernel")
+                    raise ValueError(f"{layer} {sliced} {index} has no {projection} {kind}")
                 leaves.append(leaf)
-            stacked[projection] = {'kernel': SourceLeaf.stack(leaves, f"{layer} experts' {projection}")}
-        mlp['experts'] = {**{name: node for name, node in experts.items() if not name.isdigit()}, **stacked}
+            stacked[projection] = {kind: SourceLeaf.stack(leaves, f"{layer} {sliced}' {projection}")}
+        mlp[sliced] = {**{name: node for name, node in experts.items() if not name.isdigit()}, **stacked}
 
 
 def held_depths(fields: dict, params: Mapping[str, object]) -> None:

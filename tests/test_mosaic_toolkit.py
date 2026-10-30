@@ -118,14 +118,7 @@ def test_the_ring_lowers_for_an_h100(consumers):
             lowering_platforms=("cuda",))
 
 
-ON_HOPPER = pytest.mark.skipif(generation.device_generation() != "sm90",
-                               reason="runs the toolkit's kernels compiled, on an H100")
-
-
-@ON_HOPPER
-@pytest.mark.gpu(reason="runs the toolkit's kernels compiled, on an H100")
-@pytest.mark.parametrize("consumers", [1, 2])
-def test_a_ring_streams_tiles_of_their_own_trip_counts_on_an_h100(consumers):
+def a_ring_streams_tiles_of_their_own_trip_counts_on_an_h100(consumers):
     """The ring's kernel compiled and run on an H100, where the interpreter's no-op waits are real."""
     x = _stream()
     summed = jax.jit(functools.partial(_ring_sums, interpret=False, consumers=consumers))(x)
@@ -221,10 +214,7 @@ def test_the_fed_walk_lowers_for_an_h100(consumers):
             lowering_platforms=("cuda",))
 
 
-@ON_HOPPER
-@pytest.mark.gpu(reason="runs the toolkit's kernels compiled, on an H100")
-@pytest.mark.parametrize(("consumers", "lo"), [(1, 0), (2, 0), (2, 3)])
-def test_consumers_feeding_their_own_ring_split_a_step_on_an_h100(consumers, lo):
+def consumers_feeding_their_own_ring_split_a_step_on_an_h100(consumers, lo):
     """The fed walk compiled and run on an H100, where the interpreter's no-op waits are real."""
     p, x = _fed_operands()
     got = jax.jit(functools.partial(_fed_products, interpret=False, consumers=consumers, lo=lo))(p, x)

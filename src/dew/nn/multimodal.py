@@ -290,6 +290,10 @@ class MultimodalTransformer(DecoderWrapper):
         return self._over(self.language_model.with_dex(extension))
 
     @nn.nowrap
+    def with_scanned_layers(self) -> Self:
+        return self._over(self.language_model.with_scanned_layers())
+
+    @nn.nowrap
     def dex_exported(self, variables: Mapping[str, Mapping]) -> dict[str, Mapping]:
         return self.language_model.dex_exported(variables)
 
@@ -390,6 +394,11 @@ class MultimodalTransformer(DecoderWrapper):
             if self.audio_projection is None:
                 raise ValueError("audio_indices require an audio projector")
             embeddings = _place(embeddings, self.audio_conditioner(conditioning), audio_indices)
+        # A decoder hashing n-grams of its prompt's own ids reads the placeholders media fill, as
+        # Qwen4-Exp's per-layer embedding does (`ple_input_ids`, modeling_qwen4_exp.py:2269-2275).
+        engram = self.language_model.engram
+        if engram is not None and not engram.media_stops:
+            decoder_tokens = jnp.where(media, tokens, decoder_tokens)
         return Fusion(decoder_tokens, embeddings, media)
 
     def mtp_hidden_states(self, hidden, tokens, train: bool = False, image_indices=None, conditioning=None,

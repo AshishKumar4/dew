@@ -1,4 +1,5 @@
-"""Sharded cuDNN attention compiles once across processes. jax partitions its cuDNN call through
+"""A cell of the two-GPU flow (tests/test_gpu_mesh.py): sharded cuDNN attention compiles once across
+processes. jax partitions its cuDNN call through
 `custom_partitioning`, whose lowering on several devices names the partitioner by a process address
 (`str(id(...))` in the custom call's backend config), which the persistent cache key keeps; Dew runs
 the kernel per shard (`dew.nn.attention_parallel.on_attention_shards`), where jax lowers no partitioner."""
@@ -9,7 +10,6 @@ import subprocess
 import sys
 
 import numpy as np
-import pytest
 
 PROGRAM = """
 import json, sys
@@ -43,9 +43,7 @@ print(json.dumps({**compilation_cache_counts(), "partitioner": partitioner,
 """
 
 
-@pytest.mark.mesh(devices=2)
-@pytest.mark.gpu(reason="jax's cuDNN attention runs on a CUDA GPU alone")
-def test_a_sharded_cudnn_attention_compiles_once_across_processes(tmp_path, without_deterministic_ops):
+def a_sharded_cudnn_attention_compiles_once_across_processes(tmp_path, without_deterministic_ops):
     """Two fresh processes train one causal cuDNN attention with its rows over two GPUs against one
     persistent cache: the program holds no partitioner, the second process compiles nothing, both
     take the same gradients, and those match the attention run whole, bit for bit, since every row

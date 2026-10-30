@@ -25,7 +25,7 @@ from tuned import each_config, taken
 from dew.nn.activations import exact_gelu
 from dew.nn.gpt_oss import GptOssExperts
 from dew.nn.kernels import generation, grouped_matmul, tuning
-from dew.nn.kernels.generation import chosen as kernel_choices, gpu_target, triton_runs
+from dew.nn.kernels.generation import chosen as kernel_choices
 from dew.nn.moe import ExpertMLP, expert_dispatch, expert_projection
 from dew.training import MeshSpec
 from tools import grouped_oracle as oracle
@@ -173,17 +173,9 @@ def test_the_pallas_kernels_hold_the_contract_on_one_device(sizes, input_dtype):
                                rtol=TOLERANCE)
 
 
-HOPPER = pytest.mark.skipif(not (triton_runs() and gpu_target().wgmma),
-                            reason="Mosaic GPU's grouped launches need Hopper's warpgroup MMA")
 
 
-@pytest.mark.gpu(reason="the tuner's space is a GPU's")
-@pytest.mark.skipif(not triton_runs(), reason="needs a GPU the Pallas kernels compile for")
-@pytest.mark.parametrize("kernel,width,features", [
-    (grouped_matmul.Gmm, 192, 320), (grouped_matmul.Tgmm, 192, 320),
-    pytest.param(grouped_matmul.MosaicGmm, 768, 768, marks=HOPPER),
-    pytest.param(grouped_matmul.MosaicTgmm, 768, 768, marks=HOPPER)])
-def test_every_tile_of_the_grouped_kernels_holds_the_float64_gate(kernel, width, features):
+def every_tile_of_the_grouped_kernels_holds_the_float64_gate(kernel, width, features):
     """Each config a launch may take (`each_config`: the tile it derives and
     the variants an opt-in tuning run times), of the implementation the
     launch is forced to, over groups ragged against every tile size, one
@@ -267,10 +259,7 @@ TILE_SEEDS = 8
 """The tile gate's declared draws (`reference_error.seeds_for` of XLA's ragged dot on them)."""
 
 
-@pytest.mark.gpu(reason="needs a GPU the Pallas kernels compile for")
-@pytest.mark.skipif(not triton_runs(), reason="needs a GPU the Pallas kernels compile for")
-@pytest.mark.parametrize('implementation', ['auto', 'pallas'])
-def test_a_projection_on_the_cpu_of_a_gpu_host_runs_without_the_triton_kernels(implementation):
+def a_projection_on_the_cpu_of_a_gpu_host_runs_without_the_triton_kernels(implementation):
     """The kernels are chosen where the call lowers, not by the process's
     default backend. On a GPU host, a projection placed on the CPU runs
     XLA's program ('auto' and 'pallas' alike), and its forward is the float64

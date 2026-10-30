@@ -256,7 +256,25 @@ class Profile:
         return 0
 
 
-COMMANDS = {"export": Export, "launch": Launch, "profile": Profile, "train": Train}
+@dataclasses.dataclass(frozen=True)
+class Inspect:
+    """Inspect a run offline: one sampled update over its training data's first batch, from its checkpoints'
+    latest, else its start, printed as the scalars its training logs under `inspect/`
+    (`RunConfig.inspected`). It trains and writes nothing."""
+
+    run: Positional[str]
+    """A Python file whose `run` is a run config or a function returning one, or a `run.json`."""
+    set: Annotated[tuple[str, ...], tyro.conf.UseAppendAction] = ()
+    """`path=value`, once a field, as `dew train` reads it: what to watch is `trainer.inspection`."""
+    trust: tuple[str, ...] = ()
+    """Packages outside Dew whose modules a `run.json` may import."""
+
+    def run_command(self) -> int:
+        emit(json.dumps(run_named(self.run, self.trust).assigned(self.set).inspected(), sort_keys=True))
+        return 0
+
+
+COMMANDS = {"export": Export, "inspect": Inspect, "launch": Launch, "profile": Profile, "train": Train}
 DATA_COMMANDS = {"export": DataExport, "provision": DataProvision, "publish": DataPublish}
 
 

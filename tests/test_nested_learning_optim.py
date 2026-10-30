@@ -12,10 +12,12 @@ from reference_error import as_given, assert_as_exact, seeds_for
 
 from dew.optim import NEWTON_SCHULZ, delta_gradient_descent, scale_by_m3
 
-M3_FACTORS = {"beta1": 0.9, "beta2": 0.99, "beta3": 0.5, "alpha": 0.3, "eps": 1e-2, "frequency": 3}
+M3_FACTORS = {"beta1": 0.9, "beta2": 0.99, "beta3": 0.5, "alpha": 0.3, "eps": 1e-2, "frequency": 3,
+              "ns_precision": "float32"}
 """M3's factors in the proofs below: three updates a chunk, so seven updates close two chunks. An `eps`
 of 1e-2 keeps an entry whose early gradients are near zero from dividing its direction by a near-zero
-root, which would let one entry's rounding stand for a draw's whole error."""
+root, which would let one entry's rounding stand for a draw's whole error. Its Newton-Schulz in float32,
+which the paper's float32 reference iterates in; bfloat16's, Muon's default, Muon's own tests hold."""
 NESTED_SEEDS = 8
 """Check 1's declared seeds for delta gradient descent's step."""
 
@@ -148,6 +150,30 @@ def delta_minimizer(kernel: np.ndarray, x: np.ndarray, output_gradient: np.ndarr
     rate = np.asarray(ETA, kernel.dtype)
     normal = np.outer(x, x) + np.eye(len(x), dtype=kernel.dtype) / rate
     return np.linalg.solve(normal, np.outer(x, -output_gradient) + kernel / rate)
+
+
+@pytest.mark.mesh(devices=8)
+def test_m3_iterates_each_matrix_whole_over_a_mesh():
+    """Over four data shards by two fsdp shards, a decoder's matrices split as fully sharded data parallelism
+    splits them (`test_optim.Placed`), M3 orthogonalizes each momentum whole on one device, as Muon does
+    (`orthogonalized`): its compiled update's collectives the same at one Newton-Schulz iteration as at
+    five, where a matrix iterated split would sum its products' partial sums at each (row 2686)."""
+    from optim_support import decoder_params
+    from sharded import collectives
+    from test_optim import Placed, fixed_gradients
+
+    from dew.training import MeshSpec
+
+    mesh = MeshSpec(fsdp=2).build(jax.devices()[:8])
+    # The decoder's matrices, each M3's one matrix.
+    params = {f"matrix{index}": leaf for index, leaf in enumerate(jax.tree.leaves(decoder_params()))
+              if leaf.ndim == 2}
+    moved = {}
+    for steps in (1, 5):
+        placed = Placed(scale_by_m3(**M3_FACTORS, ns_steps=steps), mesh)
+        text = placed.compiled(fixed_gradients(params), placed.init(params), params)
+        moved[steps] = sorted((kind, sorted(map(tuple, shapes))) for kind, shapes in collectives(text))
+    assert moved[1] == moved[5]
 
 
 def test_delta_gradient_descent_steps_to_eq_56s_minimizer():
