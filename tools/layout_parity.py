@@ -335,6 +335,12 @@ def _image_zoo() -> dict[str, Any]:
         "edm2": Case("edm2_unet", {"model_channels": 32, "channel_mult": [1, 2], "num_blocks": 1,
                                    "attn_resolutions": [8], "channels_per_head": 16, "output_channels": 4},
                      image_size=16, **images),
+        # EDM2's every kind of layer at one resolution, its attention among them, which a train's run
+        # splits over tensor layouts within its target where the two-level model's compile does not.
+        "edm2_level": Case("edm2_unet", {"model_channels": 64, "channel_mult": [1], "num_blocks": 1,
+                                         "attn_resolutions": [8], "channels_per_head": 16,
+                                         "output_channels": 4},
+                           image_size=8, **images),
         "mmdit": Case("sd3_transformer", {"in_channels": 4, "out_channels": 4, "num_layers": 2, "heads": 4,
                                           "head_dim": 8, "joint_attention_dim": 16,
                                           "caption_projection_dim": 32, "pooled_projection_dim": 32,
