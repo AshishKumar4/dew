@@ -306,15 +306,16 @@ def _recorded(found: list, *, stepped: bool) -> None:
 
 def _compiled_reported(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None
                        ) -> tuple[jax.stages.Compiled, list["Report"]]:
+    from dew.training._lowering import kernel_calls
+
+    if not any(call.kind == "mosaic_gpu" for call in kernel_calls(lowered)):
+        return lowered.compile(options), []
     with tempfile.TemporaryDirectory() as directory:
         with reported(directory):
             executable = lowered.compile(options)
         spilling = [found for found in reports(directory) if found.spilled]
     if jax.config.jax_compilation_cache_dir:
-        from dew.training._lowering import kernel_calls
-
-        if spilling or any(call.kind == "mosaic_gpu" for call in kernel_calls(lowered)):
-            spilling = _artifact_spills(executable, spilling)
+        spilling = _artifact_spills(executable, spilling)
     return executable, spilling
 
 
