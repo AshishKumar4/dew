@@ -315,6 +315,14 @@ def test_a_run_saved_with_a_newton_schulz_level_loads_with_its_dot_algorithm(rec
     loaded.optim.build(10)
 
 
+def stacked_draw(seed):
+    """A wide stack of three 24 x 40 matrices and a tall stack of two 40 x 24, drawn at `seed`: the
+    orthogonalizations' inputs (`test_muon_variants`)."""
+    keys = jax.random.split(jax.random.key(seed))
+    return (np.asarray(jax.random.normal(keys[0], (3, 24, 40))),
+            np.asarray(jax.random.normal(keys[1], (2, 40, 24))))
+
+
 def test_muons_bfloat16_newton_schulz_is_as_exact_as_jordans():
     """Dew's orthogonalization in the default numerics' fast forms, bfloat16 (`ns_operands`,
     `orthogonalized`: each shape's matrices stacked, cast, iterated by optax and handed back) over a wide and
@@ -322,11 +330,6 @@ def test_muons_bfloat16_newton_schulz_is_as_exact_as_jordans():
     `zeropower_via_newtonschulz5`, which Moonlight runs too) (check 1)."""
     numbers = {"wide": optax.contrib.MuonDimensionNumbers((1,), (2,)),
                "tall": optax.contrib.MuonDimensionNumbers((1,), (2,))}
-
-    def draw(seed):
-        keys = jax.random.split(jax.random.key(seed))
-        return (np.asarray(jax.random.normal(keys[0], (3, 24, 40))),
-                np.asarray(jax.random.normal(keys[1], (2, 40, 24))))
 
     def dew(wide, tall):
         done = orthogonalized({"wide": wide, "tall": tall}, numbers, jnp.asarray(NEWTON_SCHULZ), 5, 1e-8)
@@ -339,7 +342,8 @@ def test_muons_bfloat16_newton_schulz_is_as_exact_as_jordans():
         return [np.stack([newton_schulz_reference(np.asarray(matrix, np.float64)) for matrix in stack])
                 for stack in (wide, tall)]
 
-    assert_as_exact(dew, jordan, draw, "Muon's Newton-Schulz in bfloat16", seeds=UPDATE_SEEDS, truth_fn=truth)
+    assert_as_exact(dew, jordan, stacked_draw, "Muon's Newton-Schulz in bfloat16", seeds=UPDATE_SEEDS,
+                    truth_fn=truth)
 
 
 class Placed:

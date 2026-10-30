@@ -9,7 +9,7 @@ import optax
 import pytest
 from optim_support import LR, decoder_params, drawn_tree
 from reference_error import as_given, assert_as_exact
-from test_optim import UPDATE_SEEDS, assert_updates_as, at, muon_solver
+from test_optim import UPDATE_SEEDS, assert_updates_as, at, muon_solver, stacked_draw
 
 from dew.newton_schulz import NEWTON_SCHULZ, POLAR_EXPRESS_TABLE, orthogonalized, polar_express
 
@@ -128,11 +128,6 @@ def test_polar_express_orthogonalizes_as_its_paper_does(steps):
     numbers = {"wide": optax.contrib.MuonDimensionNumbers((1,), (2,)),
                "tall": optax.contrib.MuonDimensionNumbers((1,), (2,))}
 
-    def draw(seed):
-        keys = jax.random.split(jax.random.key(seed))
-        return (np.asarray(jax.random.normal(keys[0], (3, 24, 40))),
-                np.asarray(jax.random.normal(keys[1], (2, 40, 24))))
-
     def dew(wide, tall):
         # The stacks in the tree's own order, "tall" before "wide".
         return jax.tree.leaves(orthogonalized({"wide": wide, "tall": tall}, numbers,
@@ -145,8 +140,8 @@ def test_polar_express_orthogonalizes_as_its_paper_does(steps):
                     for stack in (tall, wide)]
         return run
 
-    assert_as_exact(dew, paper(jnp.bfloat16), draw, f"Polar Express, {steps} steps", seeds=UPDATE_SEEDS,
-                    truth_fn=paper(np.float64))
+    assert_as_exact(dew, paper(jnp.bfloat16), stacked_draw, f"Polar Express, {steps} steps",
+                    seeds=UPDATE_SEEDS, truth_fn=paper(np.float64))
 
 
 @pytest.mark.parametrize("steps", [3, 5])
