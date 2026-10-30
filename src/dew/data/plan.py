@@ -393,6 +393,25 @@ def unplaced(order: dict[str, JSON] | list[JSON] | str | int | float | bool | No
     return order
 
 
+_LIMIT = re.compile(r"Limit\(count=(\d+)\)")
+"""A limit's record in an order's stages (`Limit`'s repr)."""
+
+
+def reads_on(saved: JSON, current: JSON) -> bool:
+    """Whether the order `current` reads `saved`'s and maybe further: the same record, but where a limit
+    stands no lower, its first records the saved one's, as a run on the examples clock resumed with a
+    larger bound reads on past it (row 2649). A limit that stands lower reads less than the run read."""
+    if isinstance(saved, dict) and isinstance(current, dict):
+        return saved.keys() == current.keys() and all(reads_on(saved[name], current[name]) for name in saved)
+    if isinstance(saved, list) and isinstance(current, list):
+        return len(saved) == len(current) and all(map(reads_on, saved, current))
+    if isinstance(saved, str) and isinstance(current, str):
+        before, after = _LIMIT.fullmatch(saved), _LIMIT.fullmatch(current)
+        if before is not None and after is not None:
+            return int(after.group(1)) >= int(before.group(1))
+    return saved == current
+
+
 @dataclasses.dataclass(frozen=True)
 class Plan:
     """Order-defining fields checked before a restored iterator opens readers.
@@ -483,9 +502,10 @@ class Plan:
         for name in ("lowering", "rejections", "cache", "volatile"):
             if name not in member_scoped and current[name] != saved.get(name):
                 raise ValueError(f"saved data plan {name} changed: {saved.get(name)!r} -> {current[name]!r}")
-        # An order is the same wherever its sources are mounted (`same_order`).
+        # An order is the same wherever its sources are mounted (`same_order`), and reads on where a limit
+        # grows (`reads_on`).
         saved_order = unplaced(json_value(saved.get("order"), "saved order"))
-        if edited is None and saved_order != unplaced(current["order"]):
+        if edited is None and not reads_on(saved_order, unplaced(current["order"])):
             raise ValueError(f"saved data plan order changed: {saved.get('order')!r} -> {current['order']!r}")
         previous = record(saved.get("derived", {}), "saved derived order")
         for name in sorted(set(previous) | set(self.derived)) if edited is None else ():
@@ -503,7 +523,10 @@ class Plan:
                     or any(pools.get(name) != saved_pools.get(name) for name in compared)):
                 raise ValueError(f"saved per-share data plan topology changed (shares, workers or cycle "
                                  f"length): {PER_SHARE}")
-        changed = _changed(record(saved.get("manifest"), "saved data manifest"), self.manifest.semantic())
+        manifest, semantic = record(saved.get("manifest"), "saved data manifest"), self.manifest.semantic()
+        # A grown limit's step reads on as its order does (`reads_on`).
+        changed = tuple(name for name in _changed(manifest, semantic)
+                        if not reads_on(manifest.get(name), semantic.get(name)))
         if edited is not None:
             changed = tuple(name for name in changed if name not in ("source", "steps", "tokenizer"))
         if changed:
