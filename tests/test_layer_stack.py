@@ -414,20 +414,25 @@ def decoded(model, variables, ids):
 
 def test_a_decode_step_scans_a_periodic_stack_as_one_body_and_decodes_as_the_loop():
     """Under `scan_layers` a decode step over resident weights scans a stack whose layers repeat one
-    period as one body of the period's layers (`scan_groups(periodic=True)`): the step's program is
-    the same for two periods as for six, its cache in the plain loop's layout, and its steps decode
-    as exactly as the plain loop's, both from the loop's own float64 steps (check 1)."""
+    period as one body of the period's layers (`scan_groups(periodic=True)`): the step is one scan
+    over the period's repeats, its body the same for two periods as for six, its cache in the plain
+    loop's layout, and its steps decode as exactly as the plain loop's, both from the loop's own
+    float64 steps (check 1)."""
     ids = jax.random.randint(jax.random.key(1), (2, 10), 0, VOCAB)
 
     def program(model, variables):
+        """The step's one scan: its length and its body's operations."""
         cache = model.init(jax.random.key(0), ids[:, :1], decode=True)["cache"]
         graph = jax.make_jaxpr(lambda variables, cache: model.apply(
             {**variables, "cache": cache}, ids[:, :1], decode=True, mutable=["cache"]))(variables, cache)
-        return sorted(str(equation.primitive) for equation in equations(graph))
+        (scan,) = (equation for equation in graph.jaxpr.eqns if equation.primitive.name == "scan")
+        body = sorted(str(equation.primitive) for equation in equations(scan.params["jaxpr"]))
+        return scan.params["length"], body
 
     short, deep = hybrid(2, scan_layers=True), hybrid(6, scan_layers=True)
-    shallow = program(short, short.init(jax.random.key(0), ids))
-    assert shallow == program(deep, deep.init(jax.random.key(0), ids))
+    (two, shallow), (six, body) = (program(model, model.init(jax.random.key(0), ids))
+                                   for model in (short, deep))
+    assert (two, six) == (2, 6) and shallow == body
     plain = hybrid(6)
     variables = plain.init(jax.random.key(0), ids)
     assert decoded(deep, variables, ids)[1] == decoded(plain, variables, ids)[1]
