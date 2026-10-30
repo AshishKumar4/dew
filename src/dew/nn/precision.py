@@ -622,11 +622,16 @@ def operand_precision(dtype: Dtype | None, precision: jax.lax.PrecisionLike = No
     """The precision a product of `dtype` operands takes: the one stated, JAX's configured one where
     none is, and for bf16 operands at the default precision the algorithm that keeps a bf16 dot bf16
     in both directions. A caller that asked for more than the default keeps what it asked for, and so
-    does a run whose configured precision asks for more where the call states none (a run's
+    does a run whose configured level asks for more where the call states none (a run's
     `Numerics.matmul`, `generation.run_precision`), and a GPU older than sm80, which rejects the
-    algorithm at run time (`dew.nn.kernels.generation.BF16_GPU`)."""
-    if (dtype is None or jnp.dtype(dtype) != jnp.bfloat16
-            or not asks_default_precision(precision, configured=True)):
+    algorithm at run time (`dew.nn.kernels.generation.BF16_GPU`). A configured dot algorithm preset is
+    no level a run picks but how dots that state none sum (check 1's arms state F32_F32_F32), which the
+    algorithm's fp32 sums already are, so it keeps the algorithm."""
+    configured = jax.config.jax_default_matmul_precision
+    presets = set(jax.lax.DotAlgorithmPreset.__members__)
+    level = None if configured is None or precision_names(configured) & presets else configured
+    asked = precision if precision_names(precision) else level
+    if dtype is None or jnp.dtype(dtype) != jnp.bfloat16 or not asks_default_precision(asked):
         return precision
     # Imported here: dew.nn.kernels imports this module.
     from .kernels.generation import bf16_dot_runs
