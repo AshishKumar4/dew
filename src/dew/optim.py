@@ -1377,9 +1377,11 @@ class ParamGroup:
     patterns: tuple[str, ...] = ()
     learning_rate_multiplier: float = 1.0
     weight_decay: float | None = None
-    spared: bool | None = None
-    """Whether the group's decay spares its biases and vectors (`weight_decay_mask`); None as its
-    config's does (`OptimConfig.spared`), False decaying every parameter the group claims."""
+    spared: bool = False
+    """Whether the group's decay spares its biases and vectors (`weight_decay_mask`). A group decays
+    every parameter it claims unless it does, as a torch optimizer's parameter group does, so a run's
+    groups mirror the reference's own groups (lm_engine's, a torch recipe's); the split an ungrouped
+    optimizer takes (`OptimConfig.spared`) is the groups' only where they say so."""
     schedule: ScheduleBase | None = None
     b1: ScheduleBase | None = None
     bounds: tuple[float, float] | None = None
@@ -2074,12 +2076,13 @@ class OptimConfig:
     read it, for 'adamw' the decoupled decay. Either decay, the default included, spares biases
     and vectors such as a norm's scale, timm's split for every optimizer and for an Optax factory
     given one (`dew.optim.weight_decay_mask`, its `mask`), unless `spared` is off; Muon decays them as
-    Moonlight does, and a param group follows the split unless it says (`ParamGroup.spared`)."""
+    Moonlight does, and a param group decays all it claims unless it says (`ParamGroup.spared`)."""
     spared: bool = True
     """Whether the decay spares biases and vectors such as a norm's scale (`weight_decay_mask`), where the
     optimizer takes a mask: nanoGPT's, Megatron Core's and timm's split, since decaying a norm's scale or
     a bias toward zero regularizes nothing a matrix's decay does and shifts what the layer computes.
-    Optax decays every parameter (`mask=None`), which False restores; a group's own `spared` overrides it."""
+    Optax decays every parameter (`mask=None`), which False restores. A param group decays all it claims
+    unless its own `spared` says otherwise (`ParamGroup.spared`); a run's default groups follow this."""
     b1: float | None = None
     """Adam's first-moment decay, for adam, adamw and lamb; None keeps the optimizer's."""
     b2: float | None = None
@@ -2192,8 +2195,7 @@ class OptimConfig:
             for group in self.param_groups:
                 decay = {} if group.weight_decay is None else {'weight_decay': group.weight_decay}
                 grouped = {**opts, **decay}
-                spares = self.spared if group.spared is None else group.spared
-                spared = {'mask': weight_decay_mask} if spares and self._spares(make) else {}
+                spared = {'mask': weight_decay_mask} if group.spared and self._spares(make) else {}
                 solvers[group.name] = group.solver(make, self.learning_rate, steps, {**grouped, **spared},
                                                    clocked=clocked)
             solver = optax.multi_transform(solvers, param_labels(self.param_groups))
@@ -2225,8 +2227,9 @@ class OptimConfig:
         rate = self.learning_rate
         peak = rate.peak() if isinstance(rate, ScheduleBase) else rate
         multiplier = max(1.0, FRESH_LEARNING_RATE / peak) if peak > 0 else 1.0
-        return (ParamGroup("fresh", fresh=True, learning_rate_multiplier=multiplier),
-                ParamGroup("base", ("*",)))
+        # The groups a run takes in place of none decay as its ungrouped optimizer would.
+        return (ParamGroup("fresh", fresh=True, learning_rate_multiplier=multiplier, spared=self.spared),
+                ParamGroup("base", ("*",), spared=self.spared))
 
     def with_fresh(self, modules: Sequence[str]) -> OptimConfig:
         """This config with each group that claims the fresh modules (`ParamGroup.fresh`) matching the
