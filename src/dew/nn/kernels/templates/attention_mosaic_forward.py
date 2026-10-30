@@ -151,13 +151,19 @@ def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
         at, at_spans = _form_tiles(spec, call, form, tiles, spans_of)
         if live is None:
             # A launch a block of the value columns where its tiles walk a block (`Tiles.columns`), the
-            # blocks' outputs side by side, their rows' statistics alike.
-            launched = [_launch(q, k, values, at_spans, hooked, None, spec=form, hooks=hooks, tiles=at,
+            # blocks' outputs side by side, their rows' statistics alike; an output hook of a row's whole
+            # output in XLA past them, as the guarded launch's.
+            blocks = _column_blocks(v, hooked, at.columns)
+            split = len(blocks) > 1 and hooks.output_mod is not None
+            launched = [_launch(q, k, values, at_spans, held._replace(output=()) if split else held, None,
+                                spec=form, hooks=_unhooked(hooks) if split else hooks, tiles=at,
                                 family=family, training=False, interpret=interpret,
-                                counted=form.natural == spec.natural, finishes=rows, columns=first)
-                        for first, values in _value_blocks(v, at)]
+                                counted=form.natural == spec.natural, finishes=rows, columns=first,
+                                out_dtype=jnp.float32 if split else None)
+                        for first, values, held in blocks]
             status, _, *finished = launched[0]
-            out = jnp.concatenate([block[1] for block in launched], axis=-1)
+            out = _output_whole(jnp.concatenate([block[1] for block in launched], axis=-1), hooks, hooked,
+                                q.dtype, split)
             overflowed = functools.reduce(jnp.logical_or, [block[0][1] > 0 for block in launched])
             return (out, *finished), status[0], overflowed
         unit = guarded_columns(family, v.shape[-1], v.dtype)
@@ -168,21 +174,15 @@ def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
         # A spans call's block map counts blocks of the launch's own key tile.
         guarded_spans = _spans_of(spec, call, guarded.block_q, guarded.block_k)
         blocks = []
-        for first in range(0, v.shape[-1], unit):
-            # The guarded launch reads its live rows and its values' largest magnitudes (`algebra.room`), and
-            # the initial state's sums of its own columns.
-            columns = v[..., first:first + unit]
+        # The guarded launch reads its live rows and its values' largest magnitudes (`algebra.room`), and
+        # the initial state's sums of its own columns (`_column_blocks`), a block a launch at any width.
+        for first, columns, held in _column_blocks(v, hooked, unit, whole=False):
             guard = _Guard(live.astype(jnp.int32), jnp.swapaxes(algebra.magnitudes(columns), 1, 2))
-            initial = hooked.initial
-            held = hooked._replace(output=()) if initial is None else hooked._replace(
-                output=(), initial=(*initial[:2], initial[2][..., first:first + unit]))
-            blocks.append(_launch(q, k, columns, guarded_spans, held, guard, spec=form,
-                                  hooks=dataclasses.replace(hooks, output_mod=None, output_params=()),
-                                  tiles=guarded, family=family, training=False, interpret=interpret,
-                                  columns=first, out_dtype=jnp.float32 if hooked_blocks else None)[1])
-        out = jnp.concatenate(blocks, axis=-1)
-        if hooked_blocks:
-            out = jnp.swapaxes(_output_hooked(jnp.swapaxes(out, 1, 2), hooks, hooked), 1, 2).astype(q.dtype)
+            blocks.append(_launch(q, k, columns, guarded_spans, held._replace(output=()), guard, spec=form,
+                                  hooks=_unhooked(hooks), tiles=guarded, family=family, training=False,
+                                  interpret=interpret, columns=first,
+                                  out_dtype=jnp.float32 if hooked_blocks else None)[1])
+        out = _output_whole(jnp.concatenate(blocks, axis=-1), hooks, hooked, q.dtype, hooked_blocks)
         # Its output alone: `walked_launches` reads the plain launch's maxima and overflows, and `kept` its
         # finished rows.
         return (out,), jnp.zeros(live.shape, jnp.float32), jnp.zeros_like(live)
@@ -198,13 +198,36 @@ def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
     return out, maximum, total, jnp.full(maximum.shape, -1, jnp.int32), output_split(out)
 
 
-def _value_blocks(value: jax.Array, tiles: Tiles) -> list[tuple[int | None, jax.Array]]:
-    """The blocks of `value`'s columns a launch at `tiles` walks, each its first column and its slice: the
-    whole, first None, where its tiles walk every column (`Tiles.columns` None)."""
-    if tiles.columns is None or tiles.columns >= value.shape[-1]:
-        return [(None, value)]
-    return [(first, value[..., first:first + tiles.columns])
-            for first in range(0, value.shape[-1], tiles.columns)]
+def _column_blocks(value: jax.Array, hooked: _Hooked, columns: int | None, *, whole: bool = True
+                   ) -> list[tuple[int | None, jax.Array, _Hooked]]:
+    """The blocks of `value`'s columns a launch walks `columns` at a time, each its first column, its slice
+    and `hooked` with the initial state's sums of its own columns (`_Hooked.initial`, its maximum and
+    denominator the rows'): where `whole`, the whole, first None, where a block holds every column
+    (`Tiles.columns` None)."""
+    if whole and (columns is None or columns >= value.shape[-1]):
+        return [(None, value, hooked)]
+    width = value.shape[-1] if columns is None else columns
+
+    def held(first: int) -> _Hooked:
+        initial = hooked.initial
+        return hooked if initial is None else hooked._replace(
+            initial=(*initial[:2], initial[2][..., first:first + width]))
+
+    return [(first, value[..., first:first + width], held(first))
+            for first in range(0, value.shape[-1], width)]
+
+
+def _unhooked(hooks: Hooks) -> Hooks:
+    """`hooks` without the output hook, which a launch of a block of the value columns leaves to XLA."""
+    return dataclasses.replace(hooks, output_mod=None, output_params=())
+
+
+def _output_whole(out: jax.Array, hooks: Hooks, hooked: _Hooked, dtype, hooked_blocks: bool) -> jax.Array:
+    """The blocks' output `out` side by side, the output hook run in XLA over each row's whole output where
+    the blocks' launches left it (`hooked_blocks`), in `dtype`."""
+    if not hooked_blocks:
+        return out
+    return jnp.swapaxes(_output_hooked(jnp.swapaxes(out, 1, 2), hooks, hooked), 1, 2).astype(dtype)
 
 
 def _form_tiles(spec: algebra.Forward, call, form: algebra.Forward, tiles: Tiles, spans_of):
@@ -255,10 +278,10 @@ def _trained_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
                             family=family, training=False, interpret=interpret, peaks=True, counted=counted)
             # A training launch a block of the value columns where its tiles walk a block (`Tiles.columns`,
             # row 2526), each block's split sums side by side, their rows alike.
-            launched = [_launch(q, k, values, at_spans, hooked, None, spec=form, hooks=hooks, tiles=at,
+            launched = [_launch(q, k, values, at_spans, held, None, spec=form, hooks=hooks, tiles=at,
                                 family=family, training=True, interpret=interpret, anchors=found,
                                 counted=counted, columns=first)
-                        for first, values in _value_blocks(v, at)]
+                        for first, values, held in _column_blocks(v, hooked, at.columns)]
             status, rows, anchors, _ = launched[0]
             others = jnp.concatenate([block[3] for block in launched], axis=-1)
             status = status.at[1].set(functools.reduce(jnp.maximum, [block[0][1] for block in launched]))

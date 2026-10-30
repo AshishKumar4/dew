@@ -207,6 +207,15 @@ def without_deterministic_ops(monkeypatch):
 
 
 @pytest.fixture
+def with_deterministic_ops(monkeypatch):
+    """--xla_gpu_deterministic_ops set for the test, whatever the lane's flags: a test of a kernel's
+    deterministic schedule, which Dew's kernels choose from the flag as they trace (on a CPU lane too,
+    which sets no flag of its own)."""
+    flags = lane_environment.without_deterministic_ops(os.environ.get("XLA_FLAGS", ""))
+    monkeypatch.setenv("XLA_FLAGS", f"{flags} {lane_environment.DETERMINISTIC_OPS}".strip())
+
+
+@pytest.fixture
 def caplog(caplog):
     """Capture Dew's logger as well as the application's root logger. Dew's records reach the
     capture once, through a handler of their own that does not pass them on to the root, whether
