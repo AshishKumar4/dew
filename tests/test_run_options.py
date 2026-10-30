@@ -46,7 +46,7 @@ from dew.data.pipeline import Rejected
 from dew.data.sources.tokens import TokenFiles
 from dew.decision import decisions
 from dew.decision.config import DecisionRunConfig, Letters
-from dew.decision.layout import Labels, QuestionSegment, Reads, built_in
+from dew.decision.layout import Labels, OptionLines, QuestionSegment, Reads, built_in
 from dew.diffusion.presets import Flow
 from dew.inputs import TextCondition
 from dew.lora import LoRA
@@ -629,11 +629,15 @@ def prefixed(root: Path, drawn: bool) -> RunConfig:
 
 
 BESIDE = {"layout.framing": {"segments": built_in(None, "question_first"), "max_len": 256},
-          "layout.unit": {"segments": built_in(None, "question_first"), "max_len": 256},
+          "layout.unit": {"segments": tuple(dataclasses.replace(segment, line="{option}", bare="{option}")
+                                            if isinstance(segment, OptionLines) else segment
+                                            for segment in built_in(None, "question_first")),
+                          "max_len": 256},
           "context_encoder": {"context_layers": (0,), "context_length": 64}}
 """What an option's reader takes it only beside, by the run's path, set with it: a framing frames a row of
 its own segments (`_budgeted`), here the question layout's own row as segments (`built_in`), in a row long
-enough for its conversation's turns; a unit encodes a row of segments, the built-in row piece by piece;
+enough for its conversation's turns; a unit encodes a row of segments, the built-in row piece by piece,
+here one whose option lines abut, which a row encoded whole reads as one text;
 a context's encoder encodes it for context layers, which read a row's context."""
 
 
