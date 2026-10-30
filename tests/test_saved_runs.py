@@ -170,9 +170,9 @@ def test_a_run_an_earlier_main_saved_resumes_from_its_checkpoint(tmp_path, monke
 
 def test_a_requests_products_are_named_by_their_variable_scopes():
     """The products the saved-run evidence compares (`saved_run_products`) are named by the variable scope
-    of the module that runs them, whichever method it runs them in and whichever class it is: a helper
-    method's product is its owner's, a shared scope's its sharer's, two siblings' apart; and a projection
-    whose dtype moves moves alone."""
+    of the module that runs them beneath its root's class, whichever method it runs them in: a helper
+    method's product is its owner's, a shared scope's its sharer's, two siblings' apart, two roots applied
+    apart in one request apart; and a projection whose dtype moves moves alone."""
     import jax.numpy as jnp
     from flax import linen as nn
     from saved_run_products import products, scoped
@@ -210,6 +210,20 @@ def test_a_requests_products_are_named_by_their_variable_scopes():
             lowered = jax.jit(model.apply).lower(variables, x)
         return products([lowered.as_text(debug_info=True)])
 
-    assert read(jnp.float32) == {"left": ["float32"], "right": ["float32"]}
-    assert read(jnp.bfloat16) == {"left": ["float32"], "right": ["bfloat16"]}
-    assert read(jnp.bfloat16, Shared) == read(jnp.bfloat16)
+    assert read(jnp.float32) == {"Pair/left": ["float32"], "Pair/right": ["float32"]}
+    assert read(jnp.bfloat16) == {"Pair/left": ["float32"], "Pair/right": ["bfloat16"]}
+    assert read(jnp.bfloat16, Shared) == {"Shared/left": ["float32"], "Shared/right": ["bfloat16"]}
+
+    # Two roots applied apart in one request, each over its own variables, keep their products apart.
+    first, second = Pair(jnp.float32), Shared(jnp.bfloat16)
+    x = jnp.ones((2, 4), jnp.float32)
+    variables = first.init(jax.random.key(0), x), second.init(jax.random.key(1), x)
+
+    def both(variables, x):
+        return first.apply(variables[0], x) + second.apply(variables[1], x)
+
+    with nn.intercept_methods(scoped):
+        lowered = jax.jit(both).lower(variables, x)
+    assert products([lowered.as_text(debug_info=True)]) == {
+        "Pair/left": ["float32"], "Pair/right": ["float32"], "Shared/left": ["float32"],
+        "Shared/right": ["bfloat16"]}
