@@ -945,10 +945,12 @@ def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
     `attention_form` as the policy's `forms`; a loaded checkpoint's `pretrained_param_dtype`, and a
     decision's `param_dtype`, as the storage of the source alone (`SourceOptions.param_dtype`), the head
     and adapter it drew fresh kept in float32; its compute as its main's (`earlier_compute`); and its
-    `dynamic_scale` as it trained under it.
+    `dynamic_scale` as it trained under it; a Muon run's Newton-Schulz precision as a dot algorithm
+    (`earlier_newton_schulz`).
     A configuration written today that names the earlier knobs is refused by name, as any field its class
     does not declare. A record in today's shapes passes as it is. Carried to 1.0, when it is deleted
     (ledger 1552)."""
+    record = earlier_newton_schulz(record)
     fields = record.get("fields")
     segments = fields.get("segments") if isinstance(fields, Mapping) else None
     if isinstance(fields, Mapping) and isinstance(segments, list):
@@ -975,6 +977,32 @@ def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
         source = fields.get("source")
         fields["source"] = {**(source if isinstance(source, Mapping) else {}), "param_dtype": stored}
     return {**record, "fields": {**fields, "trainer": {**trainer, "precision": policy}}}
+
+
+EARLIER_NS_PRECISIONS = {"bfloat16": None, "tensorfloat32": "TF32_TF32_F32", "float32": "F32_F32_F32"}
+"""A Muon or M3 run's `ns_precision` as it was recorded while it named a matmul precision level (ledger
+2637), by the dot algorithm it names now: bfloat16 the run's numerics' own (None), the others their
+algorithms."""
+
+
+def earlier_newton_schulz(record: Mapping[str, object]) -> Mapping[str, object]:
+    """A saved run's record whose optimizer's options name Muon's Newton-Schulz precision by an earlier
+    level's name (`EARLIER_NS_PRECISIONS`), with it named as a dot algorithm, or dropped where it was the
+    numerics' own. Carried to 1.0 (ledger 1552)."""
+    fields = record.get("fields")
+    optim = fields.get("optim") if isinstance(fields, Mapping) else None
+    inner = optim.get("fields", optim) if isinstance(optim, Mapping) else None
+    opts = inner.get("optimizer_opts") if isinstance(inner, Mapping) else None
+    named = opts.get("ns_precision") if isinstance(opts, Mapping) else None
+    if not isinstance(fields, Mapping) or not isinstance(optim, Mapping) or not isinstance(inner, Mapping) \
+            or not isinstance(opts, Mapping) or named not in EARLIER_NS_PRECISIONS:
+        return record
+    algorithm = EARLIER_NS_PRECISIONS[named]
+    opts = {name: value for name, value in opts.items() if name != "ns_precision"}
+    opts = opts if algorithm is None else {**opts, "ns_precision": algorithm}
+    inner = {**inner, "optimizer_opts": opts}
+    optim = {**optim, "fields": inner} if "fields" in optim else inner
+    return {**record, "fields": {**fields, "optim": optim}}
 
 
 def earlier_compute(record: Mapping[str, object]) -> str:
