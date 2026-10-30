@@ -286,32 +286,31 @@ def test_a_kinds_run_publishing_from_an_offline_wandb_run_is_refused_before_it_t
     assert not (tmp_path / "runs" / "published").exists()
 
 
-def an_lm_run_measures_its_kernel_launches_as_set(tmp_path, monkeypatch):
+def an_lm_run_measures_its_kernel_launches_as_set(tmp_path):
     """An LM run whose attention takes Triton's kernel, a launch of configs to measure, that measures its
     step's launches on this GPU (`tune_kernels`) adds what it picked to the picks of this GPU's kind
     beside the compilation cache (`dew.cache.kernel_picks_path`), where a later run reads them. Every
     kind's trainer is built through the one `RunConfig.built`, which hands it the option; the other
     kinds' tiny models launch nothing Triton takes (a decision backbone's sliding window, heads narrower
     than its kernel computes). The suite's GPUs run deterministic ops, under which no process keeps
-    picks (`dew.cache.keeps_picks`); the run here does not. Its picks go to a cache of its own, which a
-    run before it on the machine has measured nothing into."""
+    picks (`dew.cache.keeps_picks`); the run here does not. Its picks go beside a compilation cache of its
+    own, JAX's configured one (`dew.cache.default_compilation_cache_dir`), which a run before it on the
+    machine has measured nothing into."""
     import jax
 
-    from dew import cache
     from dew.cache import kernel_picks_path
 
-    compiled = str(tmp_path / "compiled")
-    monkeypatch.setattr(cache, "default_compilation_cache_dir", lambda: compiled)
-
-    picks = Path(kernel_picks_path(jax.devices()[0].device_kind))
-
-    def stored() -> list:
-        return json.loads(picks.read_text())["data"] if picks.exists() else []
-    before = stored()
-    trained("lm", tmp_path, "tuned", **{"trainer.steps": 1, "trainer.tune_kernels": "True",
-                                          "trainer.mesh": {}, "model.attention_impl": "triton",
-                                          "model.head_dim": 16})
-    assert [pick for pick in stored() if pick not in before]
+    cached = jax.config.jax_compilation_cache_dir
+    jax.config.update("jax_compilation_cache_dir", str(tmp_path / "compiled"))
+    try:
+        picks = Path(kernel_picks_path(jax.devices()[0].device_kind))
+        assert not picks.exists()
+        trained("lm", tmp_path, "tuned", **{"trainer.steps": 1, "trainer.tune_kernels": "True",
+                                              "trainer.mesh": {}, "model.attention_impl": "triton",
+                                              "model.head_dim": 16})
+        assert json.loads(picks.read_text())["data"]
+    finally:
+        jax.config.update("jax_compilation_cache_dir", cached)
 
 
 @pytest.mark.parametrize("kind", list(KINDS))
