@@ -229,9 +229,23 @@ class MosaicForward(_Mainloop[Tiles]):
                                       **form), None
 
     def legal(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> bool:
-        """`_Mainloop.legal`'s, and on a plain launch whose sums can pass fp32's largest (`algebra.headroom`),
-        a guarded key tile its consumers' registers hold beside it (`guarded_tiles`), which the launch walks
-        where the plain one overflowed."""
+        """Its launch's (`_launch_legal`), and a fold's natural rewalk where the config names its own tiles
+        (`Tiles.relaunch`: the derivation's and a tuning neighbour's, `_relaunched`), their key tile dividing
+        the config's and their consumers at most its, holding too (row 2584); a config that names none (a
+        pin's) rewalks at its own tiles, as a launch takes it."""
+        if not self._launch_legal(ba, config, target):
+            return False
+        if (config.natural_form or self._natural(ba)
+                or (config.relaunch_k, config.relaunch_consumers) == (None, None)):
+            return True
+        relaunch = config.relaunch
+        return (config.block_k % relaunch.block_k == 0 and relaunch.consumers <= config.consumers
+                and self._launch_legal(ba, relaunch, target))
+
+    def _launch_legal(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> bool:
+        """`_Mainloop.legal`'s for one launch at `config`, and on a plain launch whose sums can pass fp32's
+        largest (`algebra.headroom`), a guarded key tile its consumers' registers hold beside it
+        (`guarded_tiles`), which the launch walks where the plain one overflowed."""
         if not super().legal(ba, config, target):
             return False
         query, value = ba.arguments["query"], ba.arguments["value"]
@@ -256,19 +270,34 @@ class MosaicForward(_Mainloop[Tiles]):
             return Tiles(rows, walked, 2, consumers, family.name)
 
         config = _derived(family, query.dtype, query.shape[1], key.shape[1], tiles,
-                          lambda config: self.legal(ba, config, target), overlapped=True)
-        if config is None or self._natural(ba):
+                          lambda config: self._launch_legal(ba, config, target), overlapped=True)
+        return None if config is None else self._relaunched(ba, config, target)
+
+    def _relaunched(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget
+                    ) -> Tiles | None:
+        """`config` with its natural rewalk's tiles, a fold's (`Tiles.relaunch`): the largest key tile and the
+        most consumers that hold its own registers, each dividing the config's (et-fwdhooks3: at the fold's
+        tiles it spilled 2 KB at width 64); a call that keeps its logits natural rewalks nothing. None where
+        no tile holds the rewalk."""
+        config = dataclasses.replace(config, relaunch_k=None, relaunch_consumers=None)
+        if self._natural(ba):
             return config
-        # The natural form's rewalk at the largest tile and the most consumers that hold its own registers,
-        # each dividing the config's (et-fwdhooks3: at the fold's tiles it spilled 2 KB at width 64).
+        family = bundle_of(config, ba.arguments["query"].dtype)
         relaunches = (dataclasses.replace(config, block_k=block, consumers=consumers, natural_form=True)
                       for consumers in range(config.consumers, 0, -1)
-                      for block in extents(family, query.dtype, config.block_k)
+                      for block in extents(family, ba.arguments["query"].dtype, config.block_k)
                       if config.block_k % block == 0)
-        relaunch = next((tiles for tiles in relaunches if self.legal(ba, tiles, target)), None)
+        relaunch = next((tiles for tiles in relaunches if self._launch_legal(ba, tiles, target)), None)
         if relaunch is None:
             return None
         return dataclasses.replace(config, relaunch_k=relaunch.block_k, relaunch_consumers=relaunch.consumers)
+
+    def neighbours(self, ba: tokamax.BoundArguments, config: Tiles) -> Sequence[Tiles]:
+        """`_Mainloop.neighbours`', each with its own natural rewalk's tiles (`_relaunched`), not the
+        derived config's, which need not divide it (row 2584)."""
+        target = generation.gpu_target()
+        found = (self._relaunched(ba, neighbour, target) for neighbour in super().neighbours(ba, config))
+        return tuple(neighbour for neighbour in found if neighbour is not None)
 
     def _natural(self, ba: tokamax.BoundArguments) -> bool:
         """Whether the call keeps its logits natural, as its launch decides (`algebra.folds`, at the scale
