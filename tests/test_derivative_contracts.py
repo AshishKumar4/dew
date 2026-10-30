@@ -107,18 +107,16 @@ EDGES = {"normal": 1.0, "near the largest": 2.0**63, "near the least normal": 2.
 pairs) reach float32's largest or its least normal."""
 
 
-DELTA_RULE_EDGES = [edge for edge in EDGES if edge != "near the largest"]
-"""The chunked delta rule's edges: near float32's largest its derivative gives inf where float64 is a
-normal float32, ledger 2470's, whose red test rides its fix."""
-
-
-@pytest.mark.parametrize("edge", DELTA_RULE_EDGES)
+@pytest.mark.parametrize("edge", EDGES)
 @pytest.mark.parametrize("packed", [False, True], ids=["one sequence", "packed"])
 def test_the_chunked_delta_rule_holds_every_order(packed, edge):
     """`recurrence_chunk.chunk_delta_rule` (the portable rule's custom derivative through
     `generation.linear_tangent`, rows 1861 and 1862): every order runs, its boolean document starts a
-    residual with no tangent space, and each is finite wherever float64 is a normal float32, at queries,
-    keys and values whose products near float32's ends; the decays and gates as drawn."""
+    residual with no tangent space, and each is finite wherever float64 is a normal float32 and JAX's own
+    derivatives of the same chunked arithmetic are (`_chunk_delta_rule`, the rule without its custom
+    derivative), at queries, keys and values whose products near float32's ends, the decays and gates as
+    drawn: near the largest the chunk form's WY transitions overflow float32 in every order, the custom
+    derivative no more than JAX's own (ledger 2470)."""
     keys = jax.random.split(jax.random.key(1861), 8)
     rows, length, heads, width = 1, 37, 2, 8
     query, key, value = (jax.random.normal(k, (rows, length, heads, width)) * EDGES[edge] for k in keys[:3])
@@ -129,11 +127,17 @@ def test_the_chunked_delta_rule_holds_every_order(packed, edge):
     def rule(query, key, value, g, beta):
         return recurrence_chunk.chunk_delta_rule(query, key, value, g, beta, chunk_size=16, starts=starts)[0]
 
+    def plain(query, key, value, g, beta):
+        state = jnp.zeros((rows, heads, width, width), jnp.float32)
+        return recurrence_chunk._chunk_delta_rule(query, key, value, g, beta, state, chunk_size=16,
+                                                  starts=starts, delta=True, scale=width ** -0.5,
+                                                  dtype=jnp.float32)[0]
+
     primals = (query, key, value, g, beta)
     direction = tuple(jax.random.normal(keys[6], x.shape) * (EDGES[edge] if at < 3 else 1.0)
                       for at, x in enumerate(primals))
     cotangent = jax.random.normal(keys[7], query.shape)
-    assert_contract(rule, primals, direction, cotangent, f"the chunked delta rule {edge}")
+    assert_contract(rule, primals, direction, cotangent, f"the chunked delta rule {edge}", plain_fn=plain)
 
 
 def normal_draw(seed: int, *shapes, scale: float = 1.0) -> tuple:
