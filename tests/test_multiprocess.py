@@ -179,6 +179,7 @@ def test_a_pool_on_the_examples_clock_trains_its_bound_once_however_its_read_dea
     reports = clocked_pool(tmp_path / "pool", 2, deal=deal)
     assert_trained_once(reports)
     if deal == "order":
+        # One process plans its steps ahead in one order, and keeps no clock.
         alone = clocked_pool(tmp_path / "alone", 1, devices=2, deal=deal)
         assert reports[0]["counts"] == alone[0]["counts"]
         for index in range(2):
@@ -220,7 +221,8 @@ def test_a_pools_cooldown_across_its_uneven_tail_scores_as_one_process_does(tmp_
     alone = clocked_pool(tmp_path / "alone", 1, devices=2, deal="order", cooldown=1)
     assert_trained_once(reports)
     assert len(reports[0]["cooled"]) == 1
-    np.testing.assert_allclose(reports[0]["cooled"], alone[0]["cooled"], **PARITY)
+    # The same global batches, each reduced over the same two rows' shares: the same score, to the bit.
+    assert reports[0]["cooled"] == alone[0]["cooled"]
 
 
 @pytest.mark.distributed
