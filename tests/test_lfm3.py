@@ -87,13 +87,15 @@ def test_plain_and_looped_lfm3_train_through_a_decision_run(tmp_path, release_ca
     """Plain and looped LFM3 (LiquidAI/LFM3-1.7B at da90f4c, whose config, code and weights are
     40ebe0a's, which Dew is held to; ledger 2011): a decision run from an LFM3 release trains at a fixed
     rate, plain and with a block of its layers looped twice (`--loop-layers`, `--loop-steps`), a short
-    convolution and full and sliding attention among them: every weight it trains finite and moved,
-    and the run records its loop."""
+    convolution and full and sliding attention among them, under a text-only decision source (its
+    language model, no prediction depth, its full-attention layers reading blocks both ways): every
+    weight it trains finite and moved, and the run records its loop."""
     import shutil
 
     from model_support import flat_tree
     from test_decision_recipe import QWEN, TICKETS
 
+    from dew.config import SourceOptions
     from dew.decision.config import DecisionRunConfig
     from dew.interop import PretrainedDecoder
 
@@ -110,7 +112,8 @@ def test_plain_and_looped_lfm3_train_through_a_decision_run(tmp_path, release_ca
         "--trainer.eval-every", "None", "--trainer.checkpoint-every", "None", "--trainer.log-every", "1",
         "--trainer.multi-host", "False", "--trainer.compilation-cache-dir", "None",
         "--model.dtype", "float32", "--optim.learning-rate", "5e-06", *looped],
-        default=DecisionRunConfig(data=TICKETS))
+        default=DecisionRunConfig(data=TICKETS, source=SourceOptions(
+            text_only=True, prediction_depths=0, attention={"full_attention": "block_bidirectional"})))
     state = config.run()
     trained = flat_tree(jax.device_get(state.variables["params"]["backbone"]))
     start = flat_tree(variables["params"])
