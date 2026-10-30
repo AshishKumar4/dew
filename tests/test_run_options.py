@@ -556,9 +556,13 @@ def replaced(value, name: str, option):
 
 
 def flag(value, annotation) -> str:
-    """`value` as `--set` writes it for a field of `annotation`: a record's JSON, or its text."""
+    """`value` as `--set` writes it for a field of `annotation`: a record's JSON, a tuple's values, or its
+    text."""
     if value is None or isinstance(value, bool | int | str):
         return str(value)
+    # A tuple of numbers or texts as its values in turn, as the command line reads one.
+    if isinstance(value, tuple) and all(isinstance(item, bool | int | str) for item in value):
+        return " ".join(map(str, value))
     return json.dumps(registry.to_record(value, bare(annotation)))
 
 
