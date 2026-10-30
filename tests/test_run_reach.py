@@ -154,9 +154,10 @@ ACCURATE_FORMS = Numerics(forms="accurate")
 
 @pytest.mark.mesh(devices=8)
 def test_a_runs_recorded_forms_are_the_forms_it_trains_in(tmp_path):
-    """`trainer.precision`'s forms are the form every attention of the run trains in (rows 2245 and 2500,
-    `generation.run_precision`), on the default route ('auto'): lowered for an H100, a 16-bit run recorded "accurate" routes each attention
-    to the template or the reference path, which compute the form, where the same run recorded with
+    """`trainer.precision`'s forms are the form every attention of the run trains in (rows 2245 and
+    2500, `generation.run_precision`), on the default route ('auto'): lowered for an H100, a 16-bit run
+    recorded "accurate" routes each attention to the template or the reference path, which compute the
+    form, where the same run recorded with
     none routes it to an old route (row 2350), and `dew train` of an accurate run's own record, under a
     new name, runs its attention on the kernels it ran."""
     run = lm(tmp_path, drawn=False)
