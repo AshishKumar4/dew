@@ -50,11 +50,10 @@ from dew.data.pipeline import (
     Workers,
 )
 from dew.data.prompts import PROMPT_LONG, PROMPT_PAD
-from dew.data.sources.base import Source
 from dew.data.text import SavedTokenizer
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    pass
 
 
 def images(dataset: Dataset, size: int, *, batch: int | None,
@@ -172,8 +171,6 @@ def lm(dataset: Dataset, tokenizer: str | SavedTokenizer | None, *, seq_len: int
     if pack is None:
         windows = _cached(documents, cache).windows(seq_len, stride=stride)
     else:
-        if tokenizer is None:
-            _documented(dataset)
         windows = _next_token_windows(documents, Pack(seq_len + 1, bins=bins, policy=pack), cache=cache)
     return _finished(windows, batch=batch, records=records, host=host)
 
@@ -222,32 +219,6 @@ def sft(dataset: Dataset, tokenizer: str | SavedTokenizer, *, seq_len: int, batc
     packing = Pack(seq_len + 1, _CHAT_FIELDS, bins=bins, policy=pack)
     windows = _conversation_windows(rendered, packing, long=long, cache=cache)
     return _finished(windows, batch=batch, records=records, host=host)
-
-
-def _documented(dataset: Dataset) -> None:
-    """Refuse to pack token documents from a store that states no document ends (neither an index
-    of them nor an EOS token), wherever it sits in the chain's sources: its tokens would read as
-    one document, whose pieces no producer made."""
-    from dew.data.analysis import _leaves
-    from dew.data.sources.tokens import TokenFiles
-
-    for source in (store for _, leaf in _leaves(dataset._chain()) for store in _stores(leaf)):
-        if isinstance(source, TokenFiles) and not source.documented:
-            raise ValueError(f"packed text needs producer document boundaries or EOS: {source.describe()}")
-
-
-def _stores(source: Source) -> Iterator[Source]:
-    """Every store `source` reads: a concatenation's parts, and the store each holdout selection
-    selects from."""
-    from dew.data.holdout import selecting
-    from dew.data.sources.concatenate import Concatenate
-
-    for _, selected in selecting(source):
-        if isinstance(selected, Concatenate):
-            for part in selected.sources:
-                yield from _stores(part)
-        else:
-            yield selected
 
 
 _CHAT_FIELDS = ("text", chat.ROLES_KEY)
