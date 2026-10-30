@@ -1061,30 +1061,23 @@ _accumulated.defvjp(_accumulated_forward, _accumulated_backward)
 def _forward(model: PreTrainedModel, tokens: torch.Tensor, positions: torch.Tensor | None = None,
              head_input: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
     """Run `model` over `tokens` at `positions` (each token's index where None), keeping what its
-    output head reads, or, given `head_input`, reading that into its head in place of its states. A
-    float32 head multiplies in IEEE float32 where nothing states a precision, as its output table's
-    product does (`dew.nn.precision.exact_float32`, `head_product`)."""
+    output head reads, or, given `head_input`, reading that into its head in place of its states."""
     import torch
 
     states: list[torch.Tensor] = []
     head = model.get_output_embeddings()
     if not isinstance(head, torch.nn.Module):
         raise ValueError(f"{type(model).__name__} has no output embeddings for a causal LM's logits")
-    heading = contextlib.ExitStack()
 
     def read(_, inputs):
         states.append(inputs[0])
-        if inputs[0].dtype == torch.float32:
-            heading.enter_context(configured_precision(exact_float32(None)))
         return None if head_input is None else (head_input, *inputs[1:])
 
-    hooks = (head.register_forward_pre_hook(read), head.register_forward_hook(lambda *_: heading.close()))
+    hook = head.register_forward_pre_hook(read)
     try:
         logits = model(input_ids=tokens, position_ids=positions, use_cache=False).logits
     finally:
-        heading.close()
-        for hook in hooks:
-            hook.remove()
+        hook.remove()
     return logits, states[0]
 
 
@@ -1237,8 +1230,8 @@ class TorchCausalLM(nn.Module):
         return logits.astype(at_least_fp32(logits.dtype))
 
     def _step(self, variables, tokens, held, slots, filled, places, reach=None):
-        params, buffers = self._operands(variables)
-        precision = self.precision
+        params, buffers, compute = self._operands(variables)
+        precision = self._products(compute)
         return self.graph.step(params, buffers, tokens, cache=held, slots=slots, filled=filled,
                                positions=places, reach=reach, precision=precision)
 
@@ -1317,17 +1310,27 @@ class TorchCausalLM(nn.Module):
 
     def _over(self, held, tokens, laid, visible, key_places, head_input, *,
               train: bool) -> tuple[jax.Array, jax.Array]:
-        params, buffers = self._operands(held)
+        params, buffers, compute = self._operands(held)
         key = self.make_rng("dropout") if train and self.has_rng("dropout") else None
         return self.graph(params, buffers, jnp.asarray(tokens), train=train, key=key,
-                          precision=self.precision, laid=laid, visible=visible,
+                          precision=self._products(compute), laid=laid, visible=visible,
                           key_places=key_places, head_input=head_input)
 
-    def _operands(self, held) -> tuple[dict[str, jax.Array], dict[str, jax.Array]]:
-        """The forward's parameters at `dtype`, and its buffers."""
+    def _operands(self, held) -> tuple[dict[str, jax.Array], dict[str, jax.Array], Dtype]:
+        """The forward's parameters at `dtype`, its buffers, and the dtype its products take: `dtype`, or
+        the dtype its floating parameters hold."""
         params = {name: self._compute(leaf) for name, leaf in held["params"].items()}
         buffers = {name: jnp.asarray(leaf) for name, leaf in held.get("buffers", {}).items()}
-        return params, buffers
+        compute = self.dtype or jnp.result_type(*[leaf for leaf in params.values()
+                                                  if jnp.issubdtype(leaf.dtype, jnp.floating)])
+        return params, buffers, compute
+
+    def _products(self, compute: Dtype) -> jax.lax.PrecisionLike:
+        """The precision the forward's products take: the one stated, else, for float32 operands, IEEE
+        float32 (`exact_float32`), since this forward is transformers' torch code, whose float32 matmuls
+        torch multiplies in IEEE float32 (TF32 off by default), and its output table's head alike; other
+        operands' at JAX's configured precision."""
+        return exact_float32(self.precision) if jnp.dtype(compute) == jnp.float32 else self.precision
 
     def _compute(self, leaf) -> jax.Array:
         value = jnp.asarray(leaf)

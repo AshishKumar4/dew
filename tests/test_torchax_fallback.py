@@ -717,12 +717,11 @@ def tied_float32(tmp_path):
     return loaded
 
 
-def test_a_float32_forward_and_its_output_table_multiply_at_jax_s_configured_precision(tokens, tmp_path):
-    """A float32 torchax model that states no precision leaves every product of its forward, torch's
-    operators among them, to JAX's configured precision (`jax_default_matmul_precision`, ledger
-    2500), but its head's, which multiplies in IEEE float32 (`dew.nn.precision.exact_float32`), as
-    its output table's product does: the two reads of the same logits take the same arithmetic. Each
-    product was pinned at HIGHEST, which JAX's default runs on a GPU 2.8 times slower."""
+def test_a_float32_forward_and_its_output_table_multiply_in_ieee_float32(tokens, tmp_path):
+    """A float32 torchax model that states no precision multiplies every product of its forward in IEEE
+    float32, as the torch code it runs does (torch's float32 matmul, TF32 off), and its output table's
+    head alike (`dew.nn.precision.exact_float32`, ledger 2500), under JAX's own default precision: the
+    two reads of the same logits take the same arithmetic."""
     loaded = tied_float32(tmp_path)
     ids = jnp.asarray(tokens[:, :SEQ])
     highest = (jax.lax.Precision.HIGHEST, jax.lax.Precision.HIGHEST)
@@ -736,7 +735,7 @@ def test_a_float32_forward_and_its_output_table_multiply_at_jax_s_configured_pre
                      any(vocab in variable.aval.shape for variable in equation.invars))
                     for equation in equations(graph) if equation.primitive.name == "dot_general"]
         assert any(head for _, head in products), products
-        assert all(precision == (highest if head else None) for precision, head in products), products
+        assert all(precision == highest for precision, _ in products), products
 
 
 def test_a_float64_forwards_logits_are_as_wide_as_its_output_tables(tokens, tmp_path):
