@@ -250,7 +250,7 @@ def _by_repeat(period: int, leaf):
 
 
 def _run_module(block: Block, specs: Sequence[LayerSpec], first: int, count: int,
-                period: int) -> DecoderBlock | 'PipelineStage':
+                period: int) -> "DecoderBlock | PipelineStage":
     """The module a scanned run of `count` layers from `first` repeats: one layer for like layers,
     for a periodic run its `period` layers as a pipeline's stage holds its own (`PipelineStage`), each
     run alone, named for the run's range. No layer of a period leaves what a later one reads (a
