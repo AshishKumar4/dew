@@ -406,9 +406,9 @@ def test_a_watched_runs_step_compiled_ahead_carries_its_sampled_step():
     assert watched.sampled.program != watched.program and watched.program == plain.program
 
 
-@pytest.mark.gpu(reason="runs a watched run's step and sampled step compiled ahead on this host's own GPU")
-def test_a_watched_run_handed_its_steps_compiled_ahead_compiles_neither(tmp_path):
-    """A run that inspects, handed its step and sampled step compiled ahead, takes both (`taken`) and
+def a_watched_run_handed_its_steps_compiled_ahead_compiles_neither(tmp_path):
+    """A GPU flow's cell (tests/test_gpu_training.py): a run that inspects, handed its step and sampled step
+    compiled ahead for this host's own GPU, takes both (`taken`) and
     compiles no step program on its GPU (`Compiles`): its first plan's compile is the step compiled
     ahead, and it trains from it (train 332's review)."""
     from dew.nn.kernels.generation import chosen, device_generation
