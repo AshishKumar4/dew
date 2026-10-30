@@ -3,8 +3,11 @@ each method's loss term, its reference penalty in the loss included, and its gra
 log-probability, over drawn sessions packed two to a row, run in float64 computing the paper's form in
 float64 (`assert_computes_the_oracle`), and its gradient in float32 on par with the paper's form's by
 check 1 (tests/reference_error.py). Through a scheduler's call over scripted sessions, the returns the
-estimators compare: DAPO's overlong punishment and dynamic sampling, RLOO's reference penalty in the
-reward, and the global estimator's whitening over a batch split into data shares."""
+estimators compare: DAPO's overlong punishment and dynamic sampling, within a batch and across the
+batches it draws further, RLOO's reference penalty in the reward, and the global estimator's whitening
+over a batch split into data shares."""
+
+import dataclasses
 
 import jax
 import jax.numpy as jnp
@@ -256,8 +259,9 @@ TOOL = 23
 
 
 class Scripted:
-    """A collector that answers each task with its scripted sessions, whatever the policy, recording
-    each collection's tasks and the key it was drawn under."""
+    """A collector that answers each task with its scripted sessions, whatever the policy, each call
+    stamped with the version it was drawn at, recording each collection's tasks and the key it was
+    drawn under."""
 
     width = 16
 
@@ -271,7 +275,9 @@ class Scripted:
     def collect(self, snapshot, tasks, samples):
         self.collected.append(([int(task.id) for task in tasks],
                                np.asarray(jax.random.key_data(snapshot.key)).tolist()))
-        return [self.sessions[task.id] for task in tasks]
+        return [[dataclasses.replace(session, calls=tuple(dataclasses.replace(call, version=snapshot.updates)
+                                                          for call in session.calls))
+                 for session in self.sessions[task.id]] for task in tasks]
 
 
 def session(task, sample, reward, lengths, *, paid=(), status=Status.COMPLETED, raw=-0.5):
