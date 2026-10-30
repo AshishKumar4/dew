@@ -173,6 +173,10 @@ def test_a_run_an_earlier_main_saved_resumes_from_its_checkpoint(tmp_path, monke
         assert (consumed is None) == (seen["consumed"] is None)
         assert consumed is None or consumed > seen["consumed"]
         assert not clocked or consumed == recorded_run.trainer.examples
+        # The model the resumed fit trained computes as the saved one did: the task its new step saves.
+        task = objectives[recorded_run.objective.name].saved_task
+        if task is not None:
+            assert computed(task.from_run(str(run), step=int(state.step)).model) == seen["task_compute"]
         # The step the resumed fit compiled, at the rung it was admitted at.
         compiled = [row["value"] for row in records[resumed:] if row["type"] == "StepCompiled"][-1]
         assert compiled["remat"] == seen["remat"]
