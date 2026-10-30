@@ -27,9 +27,9 @@ from dew._records import JSON
 from dew.batch import CLOSES_WINDOW, CONSUMED_COUNT, EXAMPLES_CONSUMED, VALID_ROWS, Batch, ConsumedCount
 from dew.checkpoints import Checkpoints
 from dew.data.compile import Handed, native
-from dew.data.dataset import Closeable, DataPartition, Loader, PhasedStream, Reader
+from dew.data.dataset import Checkpointable, Closeable, DataPartition, Loader, PhasedStream, Reader
 from dew.data.pipeline import Dataset
-from dew.distributed.batches import DevicePrefetchIterator, Signature
+from dew.distributed.batches import DevicePrefetchIterator, Signature, restore_position
 from dew.distributed.placement import MeshSpec, Placement
 from dew.objectives.base import Initializer, Metric, Objective, TrainingScalar
 from dew.optim import OptimConfig, reclocked
@@ -608,12 +608,17 @@ def fit_policies[LossT, EffectsT](objective: Objective[LossT, EffectsT], best, s
     return selection, plateau, pause
 
 
-def first_batch(loader: Loader, mesh: Mesh) -> Batch:
-    """The first batch `loader`'s training stream gives this process's share of `mesh`, the stream then
-    closed: what an objective that names its input alone reads the shape off (`Trainer._declare_input`), once,
-    before the run opens its stream where it starts."""
+def first_batch(loader: Loader, mesh: Mesh, position: bytes | None = None) -> Batch:
+    """The first batch `loader`'s training stream gives this process's share of `mesh`, from the saved
+    `position` a resume continues at where given, the stream then closed: what an objective that names
+    its input alone reads the shape off (`Trainer._declare_input`), once, before the run opens its stream
+    where it starts, and the batch a step compiled ahead is compiled over (`AheadTarget.compiled`)."""
     stream = loader.train(DataPartition.of(mesh))
     try:
+        if position is not None:
+            if not isinstance(stream, Checkpointable):
+                raise TypeError("the training stream keeps no position a resume reads its batch from")
+            restore_position(stream, position)
         batch = next(iter(stream), None)
     finally:
         if isinstance(stream, Closeable):

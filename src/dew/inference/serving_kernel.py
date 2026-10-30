@@ -11,7 +11,7 @@ scheduler in `serving` only feeds and reads them.
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Hashable, Mapping
 
 import jax
 import jax.numpy as jnp
@@ -26,7 +26,7 @@ from dew.mesh import logical_spec
 from dew.nn.attention_blocks import CROSS_KEY, CROSS_VALUE
 from dew.nn.cross_attention import CROSS_CACHE
 from dew.nn.inputs import Admitted, ModelInputs, default_placement
-from dew.nn.kernels.options import Option, compiler_options
+from dew.nn.kernels.options import Option, OuterProgram, compiler_options
 from dew.nn.kernels.tuning import tune
 from dew.nn.kv_cache import (
     POOLED,
@@ -479,7 +479,7 @@ def state_shardings(mesh: Mesh | None, state: Slots) -> Slots:
 
 
 def _compiled(resident: Formats, carried: Formats, rows: NamedSharding | None,
-              options: Mapping[str, Option] | None = None) -> jax.stages.Wrapped:
+              options: Mapping[str, Option] | None = None) -> OuterProgram:
     """Compile the step program over a state split into resident and carried halves.
 
     The matrix half is donated so XLA updates the cache in place instead of
@@ -490,7 +490,7 @@ def _compiled(resident: Formats, carried: Formats, rows: NamedSharding | None,
     change the backend's defaults. See docs/performance.md for
     the measurements.
     """
-    return jax.jit(_stepped, static_argnums=(0, 2, 3, 4), donate_argnums=(5,),
+    return OuterProgram(_stepped, static_argnums=(0, 2, 3, 4), donate_argnums=(5,),
                    in_shardings=(None, resident, carried, rows, None, None, None),
                    out_shardings=(None, (resident, carried, None)),
                    compiler_options=None if options is None else dict(options))
@@ -524,7 +524,7 @@ def resident_formats(model: nn.Module, params: Variables, pad_id: int, placement
     arguments = (model, params, pad_id, placement, steps, resident, carried, None, transforms, stopping,
                  grammar)
     tune(lambda: program.lower(*arguments))
-    compiled = program.lower(*arguments).compile()
+    compiled = program.compiled(*arguments)
     formats = joined(*compiled.output_formats[1][:2])
     return formats, _reusable(compiled, formats)
 
@@ -610,7 +610,7 @@ def opened_in(formats: Formats) -> jax.stages.Wrapped:
 
 
 _PROGRAMS: dict[tuple[tuple[Format, ...], str, NamedSharding | None, tuple[tuple[str, Option], ...]],
-                tuple[jax.stages.Wrapped, jax.stages.Wrapped]] = {}
+                tuple[OuterProgram, OuterProgram]] = {}
 """One pair of step programs per resident layout; see `decode_programs`."""
 
 ADMISSION_OPTIONS = {"xla_gpu_enable_command_buffer": ""}
@@ -621,8 +621,27 @@ Qwen3-0.6B at 64 slots, about 5 ms before 9 of a run's 16 admitting steps
 (docs/performance.md). Only a GPU backend is handed them."""
 
 
+def dispatched(program: OuterProgram) -> Step:
+    """`program`, a server's step, as a `Step` that runs its executables (`OuterProgram.executable`), one
+    for each size of admission its bucketing pads to, called with the dynamic arguments alone: a server's
+    weights, cache and policies keep their shapes and placements from call to call, so no step's Python
+    walks them to build jit's dispatch key."""
+    executables: dict[Hashable, jax.stages.Compiled] = {}
+
+    def step(model, params, pad_id, placement, steps, resident, carried, admission, transforms, stopping,
+             grammar):
+        size = None if admission is None else tuple(jnp.shape(leaf) for leaf in jax.tree.leaves(admission))
+        executable = executables.get(size)
+        if executable is None:
+            executable = executables[size] = program.executable(
+                model, params, pad_id, placement, steps, resident, carried, admission, transforms, stopping,
+                grammar)
+        return executable(params, resident, carried, admission, transforms, stopping, grammar)
+    return step
+
+
 def decode_programs(formats: Formats, rows: NamedSharding | None, options: dict[str, Option]
-                    ) -> tuple[jax.stages.Wrapped, jax.stages.Wrapped]:
+                    ) -> tuple[OuterProgram, OuterProgram]:
     """`_compiled` over `formats`, once per layout and model `options`
     (`dew.nn.kernels.options.compiler_options`), for the decoding step and
     the admitting one (`ADMISSION_OPTIONS`): one compile per (model,
@@ -631,9 +650,10 @@ def decode_programs(formats: Formats, rows: NamedSharding | None, options: dict[
     it leaves it runs that compile as its decoding step instead
     (`resident_formats`). The formats tree holds the cache mapping and is
     not hashable itself, so its leaves and its structure's text key the
-    programs. They stay apart from `dew.nn.kernels.options.program`, the
-    seam every other outer program shares: they donate the cache they step
-    and take its formats as placements, neither of which that seam's
+    programs. Each compiles through the kernel templates' reports as every
+    outer program does (`dew.nn.kernels.options.OuterProgram`), but they stay
+    apart from `dew.nn.kernels.options.program`: they donate the cache they
+    step and take its formats as placements, neither of which that seam's
     arguments carry."""
     leaves, structure = jax.tree_util.tree_flatten(formats)
     key = (tuple(leaves), str(structure), rows, tuple(sorted(options.items())))
