@@ -16,11 +16,11 @@ import pytest
 import torch
 from flax import linen as nn
 from peft import LoraConfig, inject_adapter_in_model
+from one_draw import assert_as_exact_as_the_reference
 from reference_error import (
     GateFailure,
     as_given,
     assert_as_exact,
-    assert_as_exact_as_the_reference,
     assert_as_exact_over_orders,
     with_gradients,
 )
