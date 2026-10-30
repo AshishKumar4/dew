@@ -45,7 +45,6 @@ from dew.objectives.base import Step
 from dew.objectives.rl.flow import FlowGRPOObjective, FlowRollout
 from dew.sampling import CFG, sample
 from dew.sampling.flow import FlowSDE, flow_transition
-from dew.sampling.guidance import Walk
 from dew.telemetry.records import RECORD_TYPES
 from dew.training import Trainer
 from tools.parity_flow_grpo import RECORDED, dew_transition, transition_inputs
@@ -73,6 +72,15 @@ def drawn_rows(*shapes, scale=0.5):
         return tuple(scale * jax.random.normal(key, (ROWS, *shape))
                      for key, shape in zip(keys, shapes, strict=True))
     return draw
+
+
+class Conditioned(nn.Module):
+    """An affine velocity read under an offset, the condition a guided walk drops."""
+
+    @nn.compact
+    def __call__(self, x, temb, offset):
+        gain = self.param("gain", nn.initializers.constant(0.25), ())
+        return gain * x + (temb / 1000)[:, None] * 0.1 + offset
 
 
 class AffineVelocity(nn.Module):
@@ -1324,38 +1332,50 @@ def test_a_transitions_density_keeps_a_residual_whose_square_overflows():
     np.testing.assert_array_equal(np.asarray(jax.grad(along_mean)(small.mean)), [[2.0 ** 90]])
 
 
-@pytest.mark.parametrize("guided", ["cfg", "autoguidance"])
-def test_a_watched_flow_step_reads_its_policys_own_first_call(guided):
-    """The inputs a watched Flow-GRPO step reruns its policy on are those its walk hands the policy model
-    at each trajectory's first transition, under a guidance that doubles the batch (CFG, conditional
-    and unconditional halves) and one whose main model holds its guide's weights out (autoguidance):
-    rerun on them, the model returns that call's own output, bit for bit (2317)."""
-    from dew.nn.inspection import called_with
+@pytest.mark.parametrize("guided", ["cfg", "cfg-over-a-guide", "autoguidance"])
+def test_a_watched_flow_step_summarizes_its_policys_own_first_call(guided, monkeypatch):
+    """A sampled Flow-GRPO step watching its policy model summarizes that model's output on the inputs
+    its walk hands it at each trajectory's first transition, its own call's to the bit: under a guidance
+    that doubles the batch (CFG), under one over a tree that holds an autoguidance's guide it does not
+    read, and under one whose main model holds the guide out (autoguidance). The policy reads an offset
+    as its condition, which its denoiser carries (2317)."""
+    from dew.nn.inspection import Watched, flattened, watching
     from dew.sampling.guidance import Autoguidance
 
-    process = Process(FlowMatchingScheduler(), VPredictionTransform())
-    model, x, t = AffineVelocity(), jnp.ones((4, 2)), jnp.full((4,), 0.7)
-    offset = {"offset": jnp.full((4, 1), 0.3)}
-    own = model.init(jax.random.key(30), x, jnp.ones(4), **offset)
-    if guided == "cfg":
-        guidance, variables = CFG(2.0), own
-        policy = process.denoiser(model, variables, offset, {"offset": jnp.zeros((4, 1))})
-    else:
-        guidance = Autoguidance(2.0, AffineVelocity())
-        variables = {**own, "guide": AffineVelocity().init(jax.random.key(31), x, jnp.ones(4), **offset)}
-        policy = process.denoiser(model, variables, offset)
-    walk = Walk.over(policy, guidance, 4)
+    process, model, rows = Process(FlowMatchingScheduler(), VPredictionTransform()), Conditioned(), 4
+    guidance = Autoguidance(2.0, Conditioned()) if guided == "autoguidance" else CFG(2.0)
+    objective = FlowGRPOObjective(model, process, InputSpec(Field("image", (2,))), sde=FlowSDE(0.5),
+                                  guidance=guidance)
+    offset = jnp.full((rows, 1), 0.3)
+    own = model.init(jax.random.key(30), jnp.zeros((rows, 2)), jnp.ones(rows), offset)
+    variables = own if guided == "cfg" else {**own, "guide": Conditioned().init(
+        jax.random.key(31), jnp.zeros((rows, 2)), jnp.ones(rows), offset)}
+    bound = own if guided == "autoguidance" else variables
+
+    def policy(params, batch):
+        return process.denoiser(model, params, {"offset": offset}, {"offset": jnp.zeros_like(offset)})
+
+    monkeypatch.setattr(FlowGRPOObjective, "_policy", lambda self, params, batch: policy(params, batch))
+    trajectory = objective.sde.trajectory(policy(variables, None), jnp.ones((rows, 2)), 3, key=32,
+                                          guidance=guidance)
+    batch = trajectory_batch(trajectory, np.ones(rows, np.float32))
+    step = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(33), ema=None,
+                watched=Watched(("Conditioned",)))
+    # The step's loss under the watcher its trainer enters (`Objective._loss`).
+    with watching(("Conditioned",)):
+        _, aux = objective.loss(variables, batch, step)
     outputs = []
 
     def kept(next_fun, args, kwargs, context):
         output = next_fun(*args, **kwargs)
-        if not outputs and context.method_name == "__call__" and jax.tree.leaves(
-                context.module.scope.variables()) == jax.tree.leaves(own):
+        if not outputs and context.method_name == "__call__" and {id(leaf) for leaf in jax.tree.leaves(
+                context.module.scope.variables())} == {id(leaf) for leaf in jax.tree.leaves(bound)}:
             outputs.append(output)
         return output
 
     with nn.intercept_methods(kept):
-        walk.at((), 0)(x, t)
-    args, kwargs = called_with(model, own, lambda: walk.at((), 0)(x, t))
-    np.testing.assert_array_equal(model.apply(own, *args, **kwargs), outputs[0])
-    assert args[0].shape[0] == (8 if guided == "cfg" else 4)
+        objective._walk(variables, batch).at((), 0)(batch["latents"][:, 0], batch["timesteps"][:, 0])
+    expected = np.asarray(outputs[0], np.float32)
+    logged = flattened(aux.inspected)
+    assert logged["activations/abs_max"] == np.abs(expected).max()
+    assert logged["activations/mean"] == expected.mean(dtype=np.float32)
