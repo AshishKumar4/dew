@@ -3,9 +3,9 @@
 Host tests interpret the kernels through the port's entry, `fla_rule` with a decay per key dimension:
 its output, final memory and every gradient against the float64 token recurrence the GDN port's tests
 share, at shapes that pad to the kernels' blocks, with value heads sharing a key head, and on a mesh;
-its packed documents are test_fla_gdn's packed test. The GPU tier runs them on the GPU, the layer on
-the GPU's own target row, and the float64 distances against fla's own, run in its own interpreter, at
-the training shape, with grouped value heads, padded and packed.
+its packed documents are test_fla_gdn's packed test. These run interpreted on a CPU; a GPU's native runs
+are tests/test_gpu_recurrence.py's: a Kimi delta attention layer trained on its port, held to float64,
+and its step repeated bit for bit.
 """
 
 

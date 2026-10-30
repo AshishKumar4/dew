@@ -435,7 +435,8 @@ def test_dews_fla_rule_follows_the_recurrence_for_any_heads_widths_and_length(
     """`fla_rule`, the port as a GPU runs it, for calls its blocks do not fit as they come: padded to
     them and cut back, through the custom VJP, its output, final memory and gradients within fp32
     rounding of the token recurrence in float64. The padding is exact, so this checks the shaping;
-    the port's distance against fla's own at the training shapes is the GPU tier's float64 gate.
+    the port trained natively at a training shape is held to float64 on a GPU by
+    tests/test_gpu_recurrence.py's port cells.
     (Its decay gradient, fla's base-2 sum, sits 2.0x the portable IEEE math's distance here, so the
     math is no budget for it.)"""
     q, k, v, g, beta, h0, do, dht = support.delta_operands(17, 1, length, key_heads, value_heads, width,
@@ -584,8 +585,8 @@ def test_a_gated_delta_net_on_fla_matches_it_on_xla(dtype, bound):
 def test_dews_fla_rule_takes_wide_keys_up_to_fla_s_256_in_bf16(width):
     """192- and 256-wide bf16 keys on the port, the 192 padded to 256, a width every key block of
     the configs divides: the output and final memory of the token recurrence in float64, within
-    bf16 storage's rounding. A coverage check of the shapes; the port's accuracy against fla's own
-    is the GPU tier's float64 gate (the kernel lab's verify)."""
+    bf16 storage's rounding. A coverage check of the shapes; the port trained natively is held to
+    float64 on a GPU by tests/test_gpu_recurrence.py's port cells."""
     keys = jax.random.split(jax.random.key(59), 5)
     q = l2norm(jax.random.normal(keys[0], (1, 64, 1, width))).astype(jnp.bfloat16)
     k = l2norm(jax.random.normal(keys[1], q.shape)).astype(jnp.bfloat16)

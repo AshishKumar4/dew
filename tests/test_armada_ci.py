@@ -372,25 +372,25 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
     assert [ci.reused("3.12", f"tests/{name}", "", common) is not None
             for name in ("test_machine.py", "test_tool.py", "test_spawn.py", "test_forkserver.py",
                          "test_fork.py", "test_shell.py")] == [True, True, False, False, False, False]
-    # A day's tier is the checkout's gpu-marked files, whatever the records say a file reads (ledger 2452):
-    # the evidence is --evidence's report alone.
+    # A day's tier is the checkout's gpu-marked files, whatever the records say a file reads (ledger 2452);
+    # --evidence prints that tier, each file beside its records' reads.
     monkeypatch.setattr(sys, "argv", ["ci.py", "gpu-tier", "--shards=2"])
     capsys.readouterr()
     assert ci.main() == 0
     assert capsys.readouterr().out.split() == ["tests/test_marked.py"]
     monkeypatch.setattr(sys, "argv", ["ci.py", "gpu-tier", "--evidence"])
     assert ci.main() == 0
-    assert {line.split("\t")[0] for line in capsys.readouterr().out.splitlines()} == set(ci.gpu_tier("3.12"))
+    assert [line.split("\t")[:2] for line in capsys.readouterr().out.splitlines()] == [
+        ["tests/test_marked.py", "1 marked"]]
     # A file gains a GPU test after its record: the checkout's marks choose, not records; a kernel's test is
     # the CPU's, interpreted.
     (tmp_path / "tests/test_plain.py").write_text(
         "import pytest\n@pytest.mark.gpu\ndef test_lowers(): pass\n")
     (tmp_path / "tests/test_new.py").write_text(
         "import pytest\n@pytest.mark.kernel\ndef test_interpreted(): pass\n")
-    for marked in ([], ["--marked"]):
-        monkeypatch.setattr(sys, "argv", ["ci.py", "gpu-tier", *marked])
-        assert ci.main() == 0
-        assert capsys.readouterr().out.split() == ["tests/test_marked.py", "tests/test_plain.py"]
+    monkeypatch.setattr(sys, "argv", ["ci.py", "gpu-tier"])
+    assert ci.main() == 0
+    assert capsys.readouterr().out.split() == ["tests/test_marked.py", "tests/test_plain.py"]
 
 
 def test_a_python_child_joins_its_files_record(ci, tmp_path, monkeypatch, cache_worker):

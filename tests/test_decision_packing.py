@@ -229,9 +229,9 @@ def test_a_packed_window_decides_each_row_as_the_row_alone(arm):
     fp32, bf16 and fp16).
 
     The reference runs the same kernels at the same shapes as the window (`rows_alone`), so this
-    holds what packing does; on a GPU the delta rule runs on its port in both, and its algorithm's
-    parity with fla is held at the layer, against fla's own packed sequences (test_fla_gdn,
-    test_fla_kda)."""
+    holds what packing does; on a GPU the delta rule runs on its port in both, and its algorithm is held
+    at the layer: against the token recurrence in float64 on packed documents (test_fla_gdn), and trained
+    natively on a GPU (tests/test_gpu_recurrence.py's port cells)."""
     objective = objective_for(arm)
     assert_rows_decided_alone(objective, (objective.model.backbone.clone(dtype=jnp.float64,
                                                                          attention_impl="reference"),

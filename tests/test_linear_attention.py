@@ -258,8 +258,9 @@ def test_the_port_takes_each_packed_tokens_output_and_gradients_as_its_document_
     value or gradient carries another document's, the decay's rounding included. The same program
     on the same shapes, so any difference is information crossing a document boundary. Documents of
     40, 60, 1, 49, 40, 10 and 56 tokens, one of a single token, resets two apart in a chunk, and on
-    and off the chunk grid. The port's arithmetic is held against fla's own packed sequences (test_fla_gdn,
-    test_fla_kda); a row of 32 two-token documents once lost the decays of its later ones to an fp32
+    and off the chunk grid. The port's arithmetic is held against the token recurrence in float64 on its
+    packed documents (test_fla_gdn), and trained natively on a GPU (tests/test_gpu_recurrence.py's port
+    cells); a row of 32 two-token documents once lost the decays of its later ones to an fp32
     prefix that every earlier document's reset had shifted."""
     length, heads, width = 256, 2, 64
     begins = (0, 40, 100, 101, 150, 190, 200, length)
@@ -808,10 +809,6 @@ def test_the_chunked_rule_holds_with_aligned_keys():
     np.testing.assert_allclose(state, want_state, atol=2e-4)
 
 
-DECODE_SEEDS = {("small", jnp.float32): 64, ("small", jnp.bfloat16): 64, ("0.8b-3", jnp.float32): 8,
-                ("0.8b-3", jnp.bfloat16): 8, ("0.8b-32", jnp.float32): 8, ("0.8b-32", jnp.bfloat16): 8}
-"""Each decode kernel case's declared draws against the recurrence (check 1), by its geometry's id and
-the dtype its state is held in: sized by `seeds_for` paired with the kernel on an A100."""
 @pytest.mark.mesh(devices=2)
 @pytest.mark.parametrize("axis, split", [("data", 0), ("tensor", 2)])
 def test_the_decode_kernel_keeps_the_kernel_contract_on_a_mesh(axis, split):
