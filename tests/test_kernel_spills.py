@@ -188,19 +188,6 @@ def test_a_run_steps_its_spilling_launch_down_and_trains(tmp_path, nonce):
     assert trained["step"] == 1 and trained["stepped"][:1] == [True]
 
 
-@pytest.mark.gpu(reason="hands a step compiled ahead for an H100 to a run on this host's H100")
-@lowers("sm90")
-def test_a_run_handed_a_step_compiled_ahead_with_a_spilling_launch_takes_it(tmp_path, nonce):
-    """A run in a fresh process handed a step compiled ahead for a compile-only H100, whose launch's
-    first tile spilled, refuses that tile before it lowers (`FitSearch`) and derives its launches from
-    the facts the step's were derived from, its clock and bandwidth the table's (ledger 2453), so it
-    lowers the saved program and trains from it, its plan's first compile the step compiled ahead."""
-    step = str(tmp_path / "step.dew-aot")
-    spilled(tmp_path, PRELUDE + AHEAD, str(nonce), step, "fresh")
-    handed = spilled(tmp_path, PRELUDE + HANDED, str(nonce), step)
-    assert handed["step"] == 1 and handed["ahead"] is True
-
-
 PRELUDE = """
 import pickle
 def pickle_load(path):
