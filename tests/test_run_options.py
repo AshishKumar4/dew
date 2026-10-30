@@ -27,6 +27,7 @@ from collections.abc import Mapping
 from pathlib import Path
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
 from objective_data import IMAGES
@@ -765,35 +766,37 @@ def accepted(saved, name: str, value) -> bool:
     return True
 
 
-def reached_by(run: RunConfig, root: Path, settings: type, flags, queued: dict[str, list[object]], holds):
+def witnessed_by(run: RunConfig, root: Path, settings: type, flags, queued: dict[str, list[object]],
+                 consumed) -> dict[str, list[str]]:
     """Each option of `queued` set alone through `dew train` (`flags` writes its `--set`s), so what its
-    task holds differs from the run that sets none by it alone: at its first alternative, or its next where
-    a reader refuses one or the saved settings do not hold it (`holds`: a run's None that keeps the
-    layout's own). The task each loads and the value it was set to, for each that trains so, and why
-    each other alternative did not."""
-    reached, refused = {}, {}
+    task holds differs from the run that sets none by it alone, at each alternative in turn until one is
+    consumed (`consumed`: why the saved settings and the loaded task do not witness it, or None). Why
+    each alternative failed, for each option none witnesses."""
+    failed: dict[str, list[str]] = {}
     for name, values in queued.items():
         for index, value in enumerate(values):
             try:
                 saved, task = saved_with(run, root, f"{name}{index}", settings, flags({name: value}))
             except ValueError as error:  # A reader refused it, which names what refused it: the next.
-                refused.setdefault(name, []).append(f"{value!r}: {error}")
+                failed.setdefault(name, []).append(f"{value!r}: {error}")
                 continue
-            if holds(saved, name, value):
-                reached[name] = (task, value)
+            if (why := consumed(saved, name, value, task, index)) is None:
+                failed.pop(name, None)
                 break
-            refused.setdefault(name, []).append(f"{value!r}: saved {held_at(saved, name)!r}")
-    return reached, refused
+            failed.setdefault(name, []).append(f"{value!r}: {why}")
+        else:
+            failed.setdefault(name, ["no alternative to set"])
+    return failed
 
 
 def witnessed_on(builder, objective: str, settings: type, root: Path
                  ) -> tuple[dict[str, Option], dict[str, str], bool]:
     """The options of `settings` the run `builder` makes saves (`options_of`), and why each the run does not
     witness is not: one with no path its settings do not declare derived, or derived from data the run
-    leaves unfilled; one set alone to each alternative (`reached_by`) that no run trains with, whose
-    loaded task holds it nowhere it held another before (`held`), or whose request answers as the same
-    task does with what it held before in its place, the consumer's work, not its record (`unread`): a
-    released task's, its export's too (`dew export`), where the run exports, which it says."""
+    leaves unfilled; one set alone to each alternative in turn (`witnessed_by`) none of which trains, saves
+    it and has its loaded task consume it: hold it where it held another before (`held`) and answer apart
+    from the same task with what it held before in its place, the consumer's work, not its record
+    (`unread`), a released task's export too (`dew export`), where the run exports, which it says."""
     import dew
     from dew.objectives.base import ReleasedTask
 
@@ -831,24 +834,22 @@ def witnessed_on(builder, objective: str, settings: type, root: Path
                   for name in assigned for path, value in BESIDE.get(name, {}).items()}
         return {**beside, **{reachable[name].path: flag(value, reachable[name].annotation)
                              for name, value in assigned.items()}}
-    reached, refused = reached_by(run, root, settings, flags, queued, lambda saved, name, value: same(
-        held_at(saved, name), reachable[name].made(value)))
-    for name in queued:
-        if name not in reached:
-            failures[name] = f"no alternative trains: {refused.get(name)}"
-            continue
-        task, value = reached[name]
+    def consumed(saved, name: str, value, task, index: int) -> str | None:
+        """Why the task a run saved with `name` set to `value` does not witness it, None where it does: it
+        saved another (`held_at`), or its loaded task, or a released task's export (`dew export`) reloaded
+        as its users load one, does not consume it (`unread`). A format that holds no such option refuses
+        it by name (a release's holds its budgets alone), never drops it."""
         option = reachable[name].made(value)
+        if not same(held_at(saved, name), option):
+            return f"saved {held_at(saved, name)!r}"
         missed = unread(task, before, option)
-        destination = root / "exported" / name
-        # A released task's export (`dew export`), reloaded as its users load one, holds it too; a format
-        # that holds no such option refuses it by name (a release's holds its budgets alone), never drops it.
-        if missed is None and exports and exported(root / "runs" / f"{name}{queued[name].index(value)}",
-                                                   destination):
+        destination = root / "exported" / f"{name}{index}"
+        if missed is None and exports and exported(root / "runs" / f"{name}{index}", destination):
             missed = unread(dew.pipeline(str(destination)), before, option)
-            missed = None if missed is None else f"its export: {missed}"
-        if missed is not None:
-            failures[name] = missed
+            return None if missed is None else f"its export: {missed}"
+        return missed
+    witnessing = witnessed_by(run, root, settings, flags, queued, consumed)
+    failures.update({name: f"no alternative witnesses it: {why}" for name, why in witnessing.items()})
     return options, failures, exports
 
 
@@ -873,20 +874,34 @@ def exported(run: Path, destination: Path) -> bool:
 def unread(task, before: dict[str, object], option) -> str | None:
     """Why the loaded `task` does not consume `option`, None where it does: it holds it nowhere it held
     another before (`held`), or a request of it answers as the same task does holding there what it held
-    before (`answers`): the same weights, the option alone apart, so what differs is the consumer's
-    work with it, not its record."""
+    before (`answers`): the same weights, drawn afresh so every part of the model answers its input
+    (`drawn_afresh`), the option alone apart, so what differs is the consumer's work with it, not its
+    record. A request of one task answers alike twice, so an answer apart is the option's alone."""
     places = [path for path, inner in held(task).items()
               if same(inner, option) and path in before and not same(before[path], inner)]
     if not places:
         return "the task loaded holds none set"
-    swapped = task
+    drawn = drawn_afresh(task)
+    swapped = drawn
     for path in places:
         swapped = replaced(swapped, path, before[path])
-    answered = answers(task)
-    assert answered_alike(answered, answers(task)), "a request of one task answers apart twice"
+    answered = answers(drawn)
+    assert answered_alike(answered, answers(drawn)), "a request of one task answers apart twice"
     if answered_alike(answered, answers(swapped)):
         return f"a request of it answers as with {[before[path] for path in places]} in its place"
     return None
+
+
+def drawn_afresh(task):
+    """`task` with each of its floating weights moved by a seeded normal draw, so no part of its model
+    answers every input alike as an untrained one may (a zero-initialized output layer, a run whose first
+    step its warmup leaves unstepped)."""
+    leaves, structure = jax.tree.flatten(task.variables)
+    keys = jax.random.split(jax.random.key(2639), len(leaves))
+    moved = [leaf + jax.random.normal(key, leaf.shape, leaf.dtype) * 0.1
+             if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf
+             for leaf, key in zip(leaves, keys, strict=True)]
+    return dataclasses.replace(task, variables=jax.tree.unflatten(structure, moved))
 
 
 @pytest.mark.mesh(devices=8)
@@ -896,9 +911,9 @@ def test_each_option_a_saved_task_is_built_with_reaches_it_from_the_command_line
     (`alternatives`: a literal's values, an optional's, a flag's, Dew's classes that are one, a saved
     dataclass with one field changed) reaches the task `dew train` saves from its path (`reach`): beside
     a run that sets none, a run sets each alone to an alternative its settings accept other than the one
-    saved (the next where a run refuses it, `reached_by`), and the task saves it and, loaded, holds it
-    where the first held another, and a request of it answers apart from the same task holding there
-    what it held before (`unread`), the consumer's work, not its record. An option with no path is row
+    saved (the next where one does not witness it, `witnessed_by`), and the task saves it and, loaded,
+    holds it where the first held another, and a request of it answers apart from the same task holding
+    there what it held before (`unread`), the consumer's work, not its record. An option with no path is row
     1061's blockwise walk,
     unless its settings declare it derived from the run (`metadata={"derived": ...}`): from its data,
     which the run fills, or a value the run builds of fields of its own (a decision run's layout), whose
