@@ -29,6 +29,7 @@ from dew.interop.decoder_parts import (
     DecoderFields,
     RopeSpelling,
     base_config,
+    decoder_tensors,
     kind_mixers,
     kinds_of,
     read_partial_rope,
@@ -200,6 +201,8 @@ MINIMAX = DecoderFamily(
     _minimax_export,
     weight_path=partial(renamed_path, MOE_NAMES, layer_leaves=_LIGHTNING_LEAVES),
     export_path=partial(renamed_name, MOE_NAMES, layer_leaves=_LIGHTNING_LEAVES),
+    # Every leaf under its name, the lightning layers' among them (the dense encoder writes attention alone).
+    export_weights=decoder_tensors,
     preserve_source_layout=False,
     padding_idx=True,
     # MiniMaxConfig's defaults (configuration_minimax.py), the releases' own class's too.
