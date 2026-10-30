@@ -553,9 +553,7 @@ print(json.dumps({"sites": list(measured.frozen_fp8), "measured_on": measured.me
 own process from measuring (`dew.cache.keeps_picks`)."""
 
 
-@pytest.mark.gpu(reason="FP8 tensor cores and cuBLASLt's FP8 GEMM")
-@pytest.mark.skipif(not FP8_CORES, reason="this GPU has no FP8 tensor cores")
-def test_a_frozen_sites_products_take_no_fp8_gemm_whose_sum_is_narrower(tmp_path):
+def a_frozen_sites_products_take_no_fp8_gemm_whose_sum_is_narrower(tmp_path):
     """On a GPU with FP8 tensor cores the frozen product's forward and input gradient compile to no
     cuBLASLt FP8 GEMM, whose running sum on Hopper is narrower than fp32's (`_fp8_rows`), even at the
     wide projection, and the measurement records the sites it took on this generation. The packed

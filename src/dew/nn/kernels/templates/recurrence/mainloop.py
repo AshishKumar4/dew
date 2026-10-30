@@ -59,6 +59,7 @@ from dew.nn.inputs import cu_seqlens
 from dew.nn.kernels import chunked_launch, generation, recurrence_algebra as algebra
 from dew.nn.kernels.templates import bundles, mosaic, mosaic_sm80, mosaic_sm90, product, resources
 from dew.nn.kernels.templates.gemm import cost
+from dew.nn.kernels.templates.recurrence.issuing import Issuer, Parts
 
 INTERPRETED = mosaic_sm90.WGMMA
 """The bundle Mosaic GPU's interpreter runs the mainloop by off a GPU of a family it claims (a CPU): wgmma's,
@@ -131,95 +132,6 @@ def per_key_refusal(dtype, floor: float | None) -> str | None:
 def _parts(dtype) -> int:
     """The parts a product takes an operand of `dtype` as: three for fp32, one for 16 bits."""
     return PARTS if jnp.dtype(dtype) == jnp.float32 else 1
-
-
-class _Parts:
-    """A tile in shared memory as the 16-bit parts its products take (one, or an fp32 tile's three,
-    `product.formed`), each a view of a stream's slot, and `dtype` the tile's own."""
-
-    def __init__(self, refs, dtype):
-        self.refs, self.dtype = tuple(refs), jnp.dtype(dtype)
-
-    @property
-    def shape(self) -> tuple:
-        return self.refs[0].shape
-
-    @property
-    def T(self) -> "_Parts":
-        return _Parts((ref.T for ref in self.refs), self.dtype)
-
-    def astype(self, dtype) -> "_Parts":
-        """The tile as `dtype`'s, which a product takes it as: its own dtype alone."""
-        if jnp.dtype(dtype) != self.dtype:
-            raise TypeError(f"a {self.dtype} tile in shared memory taken as {jnp.dtype(dtype)}")
-        return self
-
-    def value(self) -> jax.Array:
-        """The tile in registers, in its dtype: its parts summed in fp32, exactly."""
-        if len(self.refs) == 1:
-            return self.refs[0][...]
-        return functools.reduce(jnp.add, (ref[...].astype(jnp.float32) for ref in self.refs))
-
-
-class _Issuer:
-    """The algebra's products (`algebra.Issue`) on the call's family: an operand a `_Parts` tile in shared
-    memory, or a register value the family stages first (`staged`) into its product's `buffers` (by product
-    name, a tile a part), an fp32 one as its parts, as many as its buffers (one, a cast to theirs). A product
-    whose buffers are a list of such sets keeps each value it stages there for the products after it that
-    take the same value, staging a new one into the set its last product read longest ago. Operands of three
-    parts issue the products whose parts' orders sum under three, smallest first; of two, under two."""
-
-    def __init__(self, call: "_Call", buffers: dict | None = None):
-        self.call, self.buffers = call, buffers or {}
-        # By product name: each set's value (held, so its identity stays its own) and its last use.
-        self.held: dict = {}
-
-    def _operand(self, x, name: str, other=None) -> tuple:
-        if isinstance(x, _Parts):
-            return x.refs
-        if isinstance(x, product.Exact):
-            # One part, in the product's own tile for exact operands (`{name}.exact`).
-            (buffer,) = self.buffers[f"{name}.exact"]
-            return (self.call.family.staged(x.value, buffer),)
-        if isinstance(x, product.Transposed):
-            # Staged as it is and read transposed (`product.Transposed`).
-            return tuple(ref.T for ref in self._operand(x.value, name, other))
-        buffers = self.buffers[name]
-        if isinstance(buffers, list):
-            held = self.held.setdefault(name, [[None, -1] for _ in buffers])
-            uses = max(use for _, use in held) + 1
-            for place, (value, _) in enumerate(held):
-                if value is x:
-                    held[place][1] = uses
-                    return buffers[place]
-            free = [place for place in range(len(buffers)) if held[place][0] is not other]
-            place = min(free, key=lambda place: held[place][1])
-            held[place] = [x, uses]
-            buffers = buffers[place]
-        values = product.formed(x, len(buffers)) if len(buffers) > 1 else (x,)
-        family = self.call.family
-        return tuple(family.staged(value, buffer) for value, buffer in zip(values, buffers, strict=True))
-
-    def summed(self, products: list) -> jax.Array:
-        """The sum of `products`, each `(name, lhs, rhs)` as `__call__` takes it, issued into one fp32
-        accumulator in place (`Family.issued`): one accumulator held where each its own held two (Kimi delta
-        attention's output, `algebra.key_decayed_output`)."""
-        operands = [(self._operand(lhs, name, rhs), self._operand(rhs, name, lhs))
-                    for name, lhs, rhs in products]
-        shape = (products[0][1].shape[0], products[0][2].shape[1])
-        family, interpret = self.call.family, self.call.interpret
-
-        def issued(acc):
-            for left, right in operands:
-                acc = family.issued(acc, left, right, interpret)
-            return acc
-
-        return family.summed(shape, issued, interpret)
-
-    def __call__(self, name: str, lhs, rhs) -> jax.Array:
-        left = self._operand(lhs, name, rhs)
-        right = self._operand(rhs, name, lhs)
-        return self.call.family.apart((lhs.shape[0], rhs.shape[1]), left, right, self.call.interpret)
 
 
 def _diagonal(size: int, family: mosaic.Family) -> jax.Array:
@@ -321,15 +233,15 @@ def _streamed(**blocks) -> dict:
             for p in range(operand.parts)}
 
 
-def _tile(slots, name: str, operand: _Operand, rows=None, columns=None) -> _Parts:
-    """Stream `name`'s slot (its parts `name0`, `name1`, ...) as a `_Parts`, at a block of `rows` or `columns`
+def _tile(slots, name: str, operand: _Operand, rows=None, columns=None) -> Parts:
+    """Stream `name`'s slot (its parts `name0`, `name1`, ...) as a `Parts`, at a block of `rows` or `columns`
     (`pl.ds`) where given."""
     def view(ref):
         if rows is not None:
             ref = ref.at[rows, :]
         return ref if columns is None else ref.at[:, columns]
 
-    return _Parts((view(slots[f"{name}{p}"]) for p in range(operand.parts)), operand.dtype)
+    return Parts((view(slots[f"{name}{p}"]) for p in range(operand.parts)), operand.dtype)
 
 
 def _views(index_map=None, /, **parted) -> dict:
@@ -436,12 +348,12 @@ def _columns(call: _Call, reserved: tuple):
 def _summed(staging: tuple, call: _Call) -> tuple:
     """`algebra.summed_back`'s issuer and column sums on `_summing`'s staging."""
     parts, exact, scratch = staging
-    return _Issuer(call, {"summed": parts, "summed.exact": exact}), _columns(call, scratch)
+    return Issuer(call, {"summed": parts, "summed.exact": exact}), _columns(call, scratch)
 
 
-def _merging(staging, call: _Call) -> _Issuer:
+def _merging(staging, call: _Call) -> Issuer:
     """The inverse's products on `_merges`' staging tiles."""
-    return _Issuer(call, {"merge": list(staging)})
+    return Issuer(call, {"merge": list(staging)})
 
 
 def _taken(index: int):
@@ -606,7 +518,7 @@ def _inverse_flops() -> float:
 
 
 def _products(parts: int) -> int:
-    """The products an fp32 call's issue takes for one of its operands' (`_Issuer`): its parts' pairs whose
+    """The products an fp32 call's issue takes for one of its operands' (`Issuer`): its parts' pairs whose
     orders sum under `parts`."""
     return sum(1 for i in range(parts) for j in range(parts) if i + j < parts)
 
@@ -683,7 +595,7 @@ def _stated(work: Work, tiles: int, arrays, out_type) -> pl.CostEstimate:
 def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, stages: int, live,
             work: Work, held: _Held, staging: tuple = (), once: dict | None = None,
             landing: dict | None = None, persistent: bool = False, reduces: bool = True,
-            after: tuple = (), consumers: int = 1):
+            after: tuple = (), consumers: int = 1, swizzles: dict[str, int] | None = None):
     """`program(*refs, streams, staging, landing)` as a kernel over `grid`, run where `live(refs)` holds (a
     laid call's chunks and sequences are as many as its worst case, most of them empty): its streams'
     allocations (of `blocks`, `stages` deep, and of `once`'s blocks, loaded once, one deep; `Family.opened`
@@ -708,7 +620,7 @@ def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, s
     def allocations(depth: int) -> dict:
         # The walked streams and those loaded once, each its own allocation (a pipelined family's stages are
         # its allocation's), which a program opens with their views by name ('walked', 'once').
-        opened = {"walked": family.streams(blocks, depth, consumers)}
+        opened = {"walked": family.streams(blocks, depth, consumers, swizzles=swizzles)}
         if once:
             opened["once"] = family.streams(once, 1, consumers)
         return opened
@@ -885,7 +797,7 @@ def _solved(k, v, hi, lo, beta, taken, call: _Call, *, keeps: bool = True):
             def block(name, c):
                 return _tile(slots, name, call.given, columns=pl.ds(c * call.block, call.block))
 
-            product = functools.reduce(jnp.add, (_Issuer(call)("intra", key, key.T)
+            product = functools.reduce(jnp.add, (Issuer(call)("intra", key, key.T)
                                                  for key in map(functools.partial(block, "keys"),
                                                                 range(width // call.block))))
             system = algebra.keyed(product, gate, low, betas, *columns)
@@ -895,9 +807,9 @@ def _solved(k, v, hi, lo, beta, taken, call: _Call, *, keeps: bool = True):
             if keeps:
                 held.store(a_ref, lower, row, CHUNK, h * CHUNK, CHUNK, family=family, smem=landing["square"])
             # The inverse staged once (the first set) for every block's product, a block staged in the
-            # second: `_Issuer` keeps a staged value for the products after it that take it.
+            # second: `Issuer` keeps a staged value for the products after it that take it.
             sets = [lower_tile, scaled_tile]
-            issue = _Issuer(call, {"apply_u": sets, "apply_w": sets})
+            issue = Issuer(call, {"apply_u": sets, "apply_w": sets})
             for c in range(value_width // call.block):
                 u = algebra.weighted("apply_u", lower, block("values", c).value().astype(held.dtype), betas,
                                      issue)
@@ -947,6 +859,13 @@ def _solved(k, v, hi, lo, beta, taken, call: _Call, *, keeps: bool = True):
     return solved if keeps else (None, *solved)
 
 
+INTRA_KEYS = 16
+"""The key block the intra launch's factored pairs take (`algebra.key_decayed_pairs`): each sub-chunk's and
+block's prefix halves, gated rows and keys `[C, 16]` fp32. At the mainloop's 64 columns its lowered peak was
+519 registers on an H100 and 1170 on an A100 (Kimi Linear, Tiles(32, 1)); at 16, 196 and 270, every forward
+launch spill-free under ptxas on both."""
+
+
 @_lowered_once
 def _intra(q, k, hi, lo, beta, taken, call: _Call, *, scale: float):
     """`((I + A)^-1, Aqk)` of each chunk and value head under a decay a key dimension, `[R, HV * C]` each as
@@ -969,9 +888,13 @@ def _intra(q, k, hi, lo, beta, taken, call: _Call, *, scale: float):
 
         def step(index, slots, carry, accumulators):
             del index
+            # Every slot acquired in the step's own trace: the rolled sub-chunks read them, and a slot first
+            # acquired in a loop's body kept that body's slot index past it (`Slots`' cache), a scalar the
+            # kernel then took as an input.
+            slots.held()
 
             def block(name, operand, c):
-                return _tile(slots, name, operand, columns=pl.ds(c * call.block, call.block)).value()
+                return _tile(slots, name, operand, columns=pl.ds(c * INTRA_KEYS, INTRA_KEYS)).value()
 
             def operand(name):
                 return lambda c: block(name, call.given, c).astype(jnp.float32)
@@ -980,15 +903,15 @@ def _intra(q, k, hi, lo, beta, taken, call: _Call, *, scale: float):
                 """The sub-chunk's first token's prefix halves on key block `c`, a column's vectors, from
                 global memory (a step's tiles carry their bundle's transforms, which a traced row does not
                 commute through)."""
-                columns = pl.ds(h * width + c * call.block, call.block)
+                columns = pl.ds(h * width + c * INTRA_KEYS, INTRA_KEYS)
                 return tuple(family.columns_of(ref.at[row + sub * algebra.SUB, columns])
                              for ref in (hi_ref, lo_ref))
 
             def gated(c):
                 return block("gates", gates, c), block("lows", gates, c)
 
-            pairs = functools.partial(algebra.key_decayed_pairs, columns=width // call.block, gates=gated,
-                                      reference=reference, issue=_Issuer(call, {"pairs": pairing}),
+            pairs = functools.partial(algebra.key_decayed_pairs, columns=width // INTRA_KEYS, gates=gated,
+                                      reference=reference, summed=Issuer(call, {"pairs": pairing}).summed,
                                       chunk=CHUNK)
             scores = pairs(operand("queries"), operand("keys"), strict=False) * scale
             held.store(outs[-1], scores, row, CHUNK, h * CHUNK, CHUNK, family=family, smem=landing["square"])
@@ -1011,18 +934,22 @@ def _intra(q, k, hi, lo, beta, taken, call: _Call, *, scale: float):
     pairs = (CHUNK // algebra.SUB) * (1 + call.delta)
     work = Work(pairs * 2 * CHUNK * CHUNK * width + (_inverse_flops() if call.delta else 0),
                 exponentials=pairs * 2 * CHUNK * width)
-    # The sum of the pairs, beside a sub-chunk's and key block's prefix halves, exponent, gated rows and
-    # keys; then the doubling's, as the solve's.
+    # The sum of the pairs carried across the sub-chunks and a sub-chunk's own, beside a sub-chunk's and key
+    # block's prefix halves, exponent, gated rows and keys; then the doubling's, as the solve's.
     held_tiles = _Held(phases=(
-        [_f32(CHUNK, CHUNK)] + [_f32(CHUNK, call.block)] * 4 + _masks(CHUNK, call.block) * 2
-        + _fragments(call, (_pairing_operand(call), CHUNK, call.block), (_pairing_operand(call), CHUNK,
-                                                                              call.block)),
+        [_f32(CHUNK, CHUNK)] * 2 + [_f32(CHUNK, INTRA_KEYS)] * 4 + _masks(CHUNK, INTRA_KEYS) * 2
+        + _fragments(call, (_pairing_operand(call), CHUNK, INTRA_KEYS), (_pairing_operand(call), CHUNK,
+                                                                              INTRA_KEYS)),
         [_f32(CHUNK, CHUNK)] * 4 + _masks(CHUNK, CHUNK) * 2))
     staging = (_pairing(call), *(_merges(call) if call.delta else ()))
     return _kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
                    grid_names=("chunks", "heads"), blocks=blocks, stages=1, live=_taken(5), work=work,
                    held=held_tiles, staging=staging, landing={"square": held.landing(CHUNK, CHUNK)},
-                   persistent=True)(q, k, hi, lo, beta, taken)
+                   persistent=True,
+                   # Each stream staged at its key block's row: a tile slices only whole swizzle rows.
+                   swizzles={name: INTRA_KEYS * jnp.dtype(dtype).itemsize
+                             for name, (_, dtype) in blocks.items()})(
+        q, k, hi, lo, beta, taken)
 
 
 def _pairing_operand(call: _Call) -> _Operand:
@@ -1036,9 +963,15 @@ def _pairing_operand(call: _Call) -> _Operand:
 
 
 def _pairing(call: _Call) -> list:
-    """The factored pairs' staging (`_Issuer`'s 'pairs'): two sets, the gated rows' and the gated keys',
+    """The factored pairs' staging (`Issuer`'s 'pairs'): two sets, the gated rows' and the gated keys',
     each a `[C, block]` tile a part (`_pairing_operand`)."""
-    return [_staging(_pairing_operand(call), (CHUNK, call.block))[0] for _ in range(2)]
+    return [_staging(_pairing_operand(call), (CHUNK, INTRA_KEYS))[0] for _ in range(2)]
+
+
+WEIGHTED_KEYS = 32
+"""The key block the weighted launch takes under a decay a key dimension: its prefix halves, decays and
+written keys `[C, 32]` fp32 a block. At 64 columns its lowered peak was 344 registers on an H100 and an A100
+(Kimi Linear, Tiles(32, 1)); at 32, 248 and 175."""
 
 
 @_lowered_once
@@ -1049,6 +982,9 @@ def _weighted(k, v, a, hi, lo, beta, taken, call: _Call):
     and those alone without the delta rule (`a` None)."""
     width, value_width, gates, family = call.width, call.value_width, call.gates, call.family
     held = dataclasses.replace(call.held, rows=call.rows)
+    # Under a decay a key dimension, a key block of its own: its prefix halves, decays and written keys
+    # held a block at a time.
+    keyed = WEIGHTED_KEYS if call.per_key else call.block
 
     def program(k_ref, v_ref, a_ref, hi_ref, lo_ref, beta_ref, taken_ref, *outs, streams, staging, landing):
         n, h = _axis("chunks"), _axis("heads")
@@ -1084,8 +1020,8 @@ def _weighted(k, v, a, hi, lo, beta, taken, call: _Call):
             # of this launch always takes (`_prepared`).
             applied, decay = None, None
             if call.delta:
-                (scaled,) = staging
-                issue = _Issuer(call, {"apply_u": scaled, "apply_w": scaled})
+                # A key block's own staging where it is narrower than a value block's.
+                issue = Issuer(call, {"apply_u": staging[0], "apply_w": staging[-1]})
                 inverse = _tile(slots, "inverse", held)
                 applied = inverse, betas, issue
                 for c in range(value_width // call.block):
@@ -1095,25 +1031,25 @@ def _weighted(k, v, a, hi, lo, beta, taken, call: _Call):
                     held.store(outs[1], u, row, CHUNK, h * value_width + c * call.block, call.block,
                                family=family, smem=landing["block"])
             if prefix is not None:
-                decay = lax.broadcast_in_dim(algebra.raised(*prefix), (CHUNK, call.block), (0,))
-            for c in range(width // call.block):
-                block = pl.ds(c * call.block, call.block)
+                decay = lax.broadcast_in_dim(algebra.raised(*prefix), (CHUNK, keyed), (0,))
+            for c in range(width // keyed):
+                block = pl.ds(c * keyed, keyed)
                 tile = _tile(slots, "keys", call.given, columns=block).value()
                 if call.per_key:
                     gate, low = (_tile(slots, name, gates, columns=block).value()
                                  for name in ("gates", "lows"))
                     decay = algebra.raised(gate, low)
-                    ends = pl.ds(h * width + c * call.block, call.block)
+                    ends = pl.ds(h * width + c * keyed, keyed)
                     last, last_low = (family.columns_of(ref.at[row + CHUNK - 1, ends])
                                       for ref in (hi_ref, lo_ref))
                     written = algebra.key_decayed_write(tile, gate, low, last, last_low)
-                    held.store(outs[-1], written, row, CHUNK, h * width + c * call.block, call.block,
-                               family=family, smem=landing["block"])
+                    held.store(outs[-1], written, row, CHUNK, h * width + c * keyed, keyed,
+                               family=family, smem=landing["keyed"])
                 if applied is not None:
                     inverse, betas, issue = applied
                     w = algebra.weighted("apply_w", inverse, tile.astype(held.dtype), betas, issue, decay)
-                    held.store(outs[0], w, row, CHUNK, h * width + c * call.block, call.block, family=family,
-                               smem=landing["block"])
+                    held.store(outs[0], w, row, CHUNK, h * width + c * keyed, keyed, family=family,
+                               smem=landing["keyed"])
             return carry, accumulators
 
         _walk(streams, views, step, call, prologue=None if streamed else lambda: read(None))
@@ -1132,7 +1068,7 @@ def _weighted(k, v, a, hi, lo, beta, taken, call: _Call):
     # the block's prefix halves and its decayed write too.
     held_tiles = _Held(phases=(
         _held(held, CHUNK, CHUNK) + [_f32(CHUNK, call.block)] * 2 + _held(call.given, CHUNK, call.block)
-        + [_f32(CHUNK, call.block)] * 3 * call.per_key
+        + [_f32(CHUNK, keyed)] * 3 * call.per_key
         + _fragments(call, (held, CHUNK, CHUNK), (call.given, CHUNK, call.block)),))
     return _kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
                    grid_names=("chunks", "heads"),
@@ -1140,8 +1076,14 @@ def _weighted(k, v, a, hi, lo, beta, taken, call: _Call):
                                                               *(() if call.per_key else ("gate", "low"))),
                    stages=1, live=_taken(6),
                    work=work, held=held_tiles,
-                   staging=_staging(held, (CHUNK, call.block)) if call.delta else (),
-                   landing={"block": held.landing(CHUNK, call.block)}, persistent=True)(
+                   staging=_staging(held, *dict.fromkeys(((CHUNK, call.block), (CHUNK, keyed)))) if call.delta
+                   else (),
+                   landing={"block": held.landing(CHUNK, call.block), "keyed": held.landing(CHUNK, keyed)},
+                   persistent=True,
+                   # A key block's streams staged at its row: a tile slices only whole swizzle rows.
+                   swizzles={f"{name}{p}": keyed * jnp.dtype(operand.stored).itemsize
+                             for name, (_, operand) in given.items() if name in ("keys", "gates", "lows")
+                             for p in range(operand.parts)})(
         k, v, k if a is None else a, hi, lo, beta, taken)
 
 
@@ -1347,7 +1289,7 @@ def _states(k, w, u, hi, lo, beta, h0, sequences, taken, call: _Call, tiles: Til
 
         def step(role):
             (staged, scratch), lands = roled(role)
-            issue = _Issuer(call, {"corrected": staged, "write": staged})
+            issue = Issuer(call, {"corrected": staged, "write": staged})
             column = walked + role * bv
             return functools.partial(_states_step, lands, issue, scratch, column, role)
 
@@ -1447,7 +1389,7 @@ def _output_held(call: _Call, bv: int) -> _Held:
     products = _widest(_product(call, (given, CHUNK, call.block), (memories, call.block, bv)),
                        _product(call, (held, CHUNK, CHUNK), (held, CHUNK, bv)))
     if call.per_key:
-        # One accumulator for every product (`_Issuer.summed`) beside the values, the intra launch's scores
+        # One accumulator for every product (`Issuer.summed`) beside the values, the intra launch's scores
         # in fp32 and their masked narrow form; apart from it, at the first step, the key blocks' gated
         # queries, staged before any product (an A100's held 64- and 128-wide value blocks at 247 registers,
         # an H100's 128-wide at 248).
@@ -1522,9 +1464,9 @@ def _output(q, k, h, corrected, hi, lo, taken, call: _Call, tiles: Tiles, *, sca
                         family.staged(algebra.key_gated(queries[c].value(), decays, scale), tile[0])
 
                 out = algebra.key_decayed_output(
-                    lambda c: _Parts(gated[c], call.given.dtype), entered, width // call.block,
+                    lambda c: Parts(gated[c], call.given.dtype), entered, width // call.block,
                     _tile(slots, "scores", held).value().astype(jnp.float32), value,
-                    _Issuer(call, {"local": local}).summed)
+                    Issuer(call, {"local": local}).summed)
             else:
                 assert loaded is not None, "a decay a head's prefix loads in the prologue"
                 (gate, low), laid = loaded
@@ -1536,14 +1478,14 @@ def _output(q, k, h, corrected, hi, lo, taken, call: _Call, tiles: Tiles, *, sca
                 def _():
                     scored = algebra.chunk_scores(
                         queries.__getitem__, keys.__getitem__, width // call.block, gate, low, held.dtype,
-                        _Issuer(call), laid=laid)
+                        Issuer(call), laid=laid)
                     pieces = (product.formed(scored.astype(jnp.float32), held.parts) if held.parts > 1
                               else (scored,))
                     for piece, buffer in zip(pieces, staged, strict=True):
                         family.staged(piece, buffer)
 
                 out = algebra.chunk_output(queries.__getitem__, entered, width // call.block, gate, low,
-                                           _Parts(staged, held.dtype), value, scale, _Issuer(call))
+                                           Parts(staged, held.dtype), value, scale, Issuer(call))
             view = o_ref.at[span, pl.ds(h * value_width + index * bv, bv)]
             family.stored([out.astype(o_ref.dtype)], [view], smem=landing["out"])
             return carry, accumulators
@@ -1952,7 +1894,7 @@ def _local_back(q, k, do, hi, lo, taken, call: _Call, *, scale: float):
             # The local scores once, against the output's gradient's whole row.
             dv = algebra.local_gradient(
                 functools.partial(block, "keys"), functools.partial(block, "queries"), width // call.block,
-                gate, low, _tile(slots, "out", given), scale, _Issuer(call, {"local_dv": local}), laid=laid)
+                gate, low, _tile(slots, "out", given), scale, Issuer(call, {"local_dv": local}), laid=laid)
             held.store(dv_ref, dv, row, CHUNK, h * value_width, value_width, family=family,
                        smem=landing["row"])
             return carry, accumulators
@@ -2028,7 +1970,7 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, call: _Call, tiles: Til
             # its significand's bits): one part put the initial memory's gradient 5 to 7 times the port's
             # distance from float64. Its first part reuses the memory products' tile, each consumed before
             # the next stages.
-            issue = _Issuer(call, {**dict.fromkeys(("values_dv", "weights_dv"), staged),
+            issue = Issuer(call, {**dict.fromkeys(("values_dv", "weights_dv"), staged),
                                    "reads": (*staged, second)})
             return functools.partial(_reverse_step, lands, issue, walked + role * bv, pl.ds(role * bv, bv))
 
@@ -2138,7 +2080,7 @@ def _gradient_stored(call: _Call, kind: str, block: int, grad, *, weights: Seque
         family.added(grad, sums[kind], call.interpret, smem=landing["sums"])
 
 
-def _memory_sum(call: _Call, issue: _Issuer, entered: _Parts, leaving: _Parts) -> jax.Array:
+def _memory_sum(call: _Call, issue: Issuer, entered: Parts, leaving: Parts) -> jax.Array:
     """`sum(S dS)` over the value columns of a block of the memories entered and left, `[rows]`: the
     diagonal of their product `S^T dS` where the family's products read registers, else their elementwise
     product's rows (`_query_key`)."""
@@ -2212,7 +2154,7 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, call: _Call, *
                       "dk": dk_ref.at[span, pl.ds(key_columns, call.block)]},
                 first=first_head, landing=landing)
 
-            issue = _Issuer(call)
+            issue = Issuer(call)
             after, leaving = algebra.memory_gradients(
                 functools.partial(whole, "queries", given), functools.partial(whole, "keys", given), 1,
                 functools.partial(column, "values", held), functools.partial(column, "out", given),
@@ -2298,7 +2240,7 @@ def _scores_back(q, k, corrected, do, hi, lo, taken, call: _Call, *, scale: floa
             ds, pairs = algebra.scores_gradient(
                 functools.partial(column, "queries", given), functools.partial(column, "keys", given),
                 width // call.block, functools.partial(column, "values", held),
-                functools.partial(column, "out", given), blocks, gate, low, scale, held.dtype, _Issuer(call),
+                functools.partial(column, "out", given), blocks, gate, low, scale, held.dtype, Issuer(call),
                 laid=laid)
             held.store(ds_ref, ds, row, CHUNK, h * CHUNK, CHUNK, family=family, smem=landing["square"])
             decay_ref.at[h, span][...] = algebra.summed_pairs(pairs, summed, columns)
@@ -2355,7 +2297,7 @@ def _system_back(a, k, v, dw, du, hi, lo, beta, taken, call: _Call):
                 _tile(slots, "lower", held), functools.partial(column, "keys", given), width // call.block,
                 functools.partial(column, "values", given), value_width // call.block,
                 functools.partial(column, "w_grads", held), functools.partial(column, "u_grads", held), beta,
-                gate, low, held.dtype, _Issuer(call, dict.fromkeys(("inverse_t", "inverse_dx", "inverse_l"),
+                gate, low, held.dtype, Issuer(call, dict.fromkeys(("inverse_t", "inverse_dx", "inverse_l"),
                                                                    staged)),
                 laid=(family.columns_of(column_hi_ref.at[h, span]),
                       family.columns_of(column_lo_ref.at[h, span])))
@@ -2408,7 +2350,7 @@ def _values_back(a, v, du, beta, taken, call: _Call):
             dbeta_ref.at[h, span][...] = algebra.values_gradient(
                 _tile(slots, "lower", held), functools.partial(column, "values", given),
                 value_width // call.block, functools.partial(column, "u_grads", held),
-                family.rows_of(beta_ref.at[h, span]), held.dtype, _Issuer(call, {"inverse_t": staged}),
+                family.rows_of(beta_ref.at[h, span]), held.dtype, Issuer(call, {"inverse_t": staged}),
                 emit=stored)
             return carry, accumulators
 
@@ -2467,7 +2409,7 @@ def _keys_back(a, k, dw, dl, hi, lo, beta, taken, call: _Call):
             d_beta, after, pairs = algebra.keys_gradient(
                 _tile(slots, "lower", held), functools.partial(whole, "keys", given), 1,
                 functools.partial(whole, "w_grads", held), _tile(slots, "system", held), beta, gate, low,
-                held.dtype, _Issuer(call, dict.fromkeys(("inverse_t", "keys_dl", "keys_dlt"), staged)),
+                held.dtype, Issuer(call, dict.fromkeys(("inverse_t", "keys_dl", "keys_dlt"), staged)),
                 emit=stored)
             summed, columns = _summed(tuple(summing), call)
             decay_ref.at[c, h, span][...] = algebra.summed_pairs(pairs, summed, columns)

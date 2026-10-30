@@ -62,6 +62,7 @@ from dew.nn.ngpt import NGPT, gain
 from dew.nn.norms import RMSNorm
 from dew.nn.precision import at_least_fp32, float32_dot_general, l2norm, rounded_to, scaled
 from dew.nn.protocols import ProjectionGroup
+from dew.nn.qsa import QSA, QSAIndexer, qsa_selection
 from dew.nn.rope import LongRopeScaling, axis_halves, axis_tables, rotary_freqs, rotate
 from dew.nn.sharding import HEADS, KV_HEADS, constrain, logical_axes
 from dew.nn.value_experts import RoutedValues
@@ -346,11 +347,26 @@ class CausalSelfAttention(nn.Module):
     exclusive_self_attention: bool = False
     """XSA (arXiv 2603.09078): each head's output loses its component along
     the token's own value vector before the output projection."""
+    qsa: QSA | None = None
+    """Qwen4-Exp's QSA (`dew.nn.qsa`): the keys each query reads are those its `indexer` picks among the
+    ones it sees; None reads them all."""
 
     def setup(self):
         if self.rotary_per_axis and self.rotary_axes is None:
             raise ValueError('rotary_per_axis turns each of the rotary_axes in its own halves, '
                              'so it needs rotary_axes')
+        if self.qsa is not None:
+            if self.ctx.kv_shared or not self.ctx.causal or self.ctx.kv_cache != KVCache():
+                raise ValueError("QSA's indexer keeps its keys beside a causal layer's own dense cache: "
+                                 "no KV sharing, bidirectional reading or other cache layout")
+            # Its blocks pool each key once, where every query that sees it counts it at one rank
+            # (`qsa_selection`): a query sees its document's real keys from the first on.
+            if self.ctx.sliding_window or self.ctx.attention_chunk or self._group_fields():
+                raise ValueError("QSA pools each key into one block for every query that sees it, so a "
+                                 "query sees its document's keys from the first: no sliding window, "
+                                 "chunks or groups read whole")
+            self.indexer = QSAIndexer(self.qsa, norm_eps=self.ctx.norm_eps, dtype=self.ctx.dtype,
+                                      precision=self.ctx.precision, name='indexer')
         if self.exclusive_self_attention and self.ctx.kv_shared:
             raise ValueError(
                 "exclusive self attention subtracts the token's own value, and a "
@@ -828,6 +844,8 @@ class CausalSelfAttention(nn.Module):
             return self._output(attention, gate, B, S, own_value, progress)
         masking = self._masking(query, key, value, positions, counted, held, rotary_positions, append,
                                 prefix, kv_len, kv_store, segment_ids, attention_metadata, decode)
+        if self.qsa is not None:
+            masking = self._selected(masking, x, rotary_positions, counted, append, decode)
         bias = None
         if self.alibi:
             bias = alibi_bias(masking.key_places, self.ctx.num_heads, dtype=query.dtype)
@@ -1145,6 +1163,46 @@ class CausalSelfAttention(nn.Module):
                         else coordinates_of(attention_metadata, B, S).max_segments)
         return _Masking(query, key, value, causal, window, mask, documents, max_segments, implementation,
                         cursor, starts, key_places, groups, valid, runs)
+
+    def _selected(self, masking: _Masking, x, rotary_positions, places, append, decode: bool) -> _Masking:
+        """`masking` reading each query's keys QSA picks among those it sees (`dew.nn.qsa`), as one mask.
+        A cached call keeps the indexer's raw keys and their rotary places at its keys' slots."""
+        B, S = x.shape[:2]
+        query, raw = self.indexer(x)
+        cos, sin = self._rotary_angles(rotary_positions, query)
+        query = rotate(query, cos, sin)
+        # A token's rotary place, or under M-RoPE its place on each axis `[B, S, 3]`.
+        rotary = jnp.asarray(rotary_positions, jnp.int32)
+        rotary = jnp.broadcast_to(rotary, (B, S, *rotary.shape[2:]) if rotary.ndim == 3 else (B, S))
+        keys, key_places = raw, rotary
+        if append is not None:
+            total = masking.key.shape[-3]
+            held = self.variable("cache", "index_keys", jnp.zeros, (B, total, raw.shape[-1]), raw.dtype)
+            held_places = self.variable("cache", "index_places", jnp.zeros, (B, total, *rotary.shape[2:]),
+                                        jnp.int32)
+            if append.allocated:
+                rows = jnp.arange(B)[:, None]
+                slots = jnp.where(append.positions >= 0, append.positions, total)
+                held.value = held.value.at[rows, slots].set(raw, mode='drop')
+                held_places.value = held_places.value.at[rows, slots].set(rotary, mode='drop')
+            keys, key_places = held.value, held_places.value
+        groups = masking.groups
+        visible = dense_visibility(masking.mask, masking.documents, masking.causal, masking.window,
+                                   masking.valid, masking.runs, places, masking.key_places, S, keys.shape[1],
+                                   None, block_groups=groups.block_groups, image_groups=groups.image_groups)
+        visible = jnp.broadcast_to(visible, (B, 1, S, keys.shape[1]))[:, 0]
+
+        def turn(blocks, first):
+            at = first.reshape(*first.shape, *(1,) * (key_places.ndim - 2))
+            cos, sin = self._rotary_angles(jnp.take_along_axis(key_places, at, axis=1), blocks)
+            return rotate(blocks, cos, sin)
+
+        assert self.qsa is not None
+        selected = qsa_selection(self.qsa, query, keys, visible, turn, self.indexer)
+        kernel = self._mask_kernel(masking.query, masking.key, decode)
+        return masking._replace(mask=selected[:, None], causal=False, window=None, documents=None,
+                                max_segments=None, valid=None, runs=None, groups=_Groups(), cursor=None,
+                                starts=None, implementation=kernel)
 
     def _overridden(self, metadata: AttentionMetadata | None, rotary_positions, B: int, S: int, keys: int,
                     key_places, implementation: AttentionImpl, masked: AttentionImpl, decode: bool):
@@ -1496,3 +1554,31 @@ class AttentionMixer(MixerBase):
         kind = {field.name: getattr(self, field.name) for field in dataclasses.fields(self)}
         return functools.partial(CausalSelfAttention, ctx=ctx, **kind)
 
+
+
+class QSASelfAttention(CausalSelfAttention):
+    """`CausalSelfAttention` under QSA (`qsa`), which reads no pairwise mask or key runs: either may hide a
+    key from one query that sees it from another, where QSA pools each key once (`qsa_selection`)."""
+
+    reads: ClassVar[frozenset[str]] = CausalSelfAttention.reads - {"pairwise_mask", "key_runs"}
+
+
+@dataclasses.dataclass(frozen=True)
+class QSAAttentionMixer(AttentionMixer):
+    """Qwen4-Exp's `qwen_sparse_attention` layer: the attention reading the keys its QSA indexer picks
+    (`dew.nn.qsa`), the indexer's geometry by the release's config names."""
+
+    indexer_n_heads: int = 4
+    indexer_head_dim: int = 128
+    indexer_budget: int = 2048
+    indexer_compress_ratio: int = 4
+
+    def mixed_refusal(self, ctx: MixerContext) -> str | None:
+        return "QSA reads each query's picked keys through a mask, which a mixed serving step builds none of"
+
+    def build(self, ctx: MixerContext) -> Callable[..., nn.Module]:
+        own = {field.name for field in dataclasses.fields(QSA)}
+        kind = {field.name: getattr(self, field.name) for field in dataclasses.fields(self)
+                if field.name not in own}
+        qsa = QSA(**{name: getattr(self, name) for name in own})
+        return functools.partial(QSASelfAttention, ctx=ctx, qsa=qsa, **kind)

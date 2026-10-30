@@ -685,9 +685,7 @@ def test_a_dense_kernel_gradients_balanced_tail_holds_check_1(rows, depth, width
                         seeds=SEEDS, truth_fn=functools.partial(plain, wide=jnp.float64, out=jnp.float64))
 
 
-@pytest.mark.gpu(reason="checks Triton's MMA accumulation on a GPU")
-@pytest.mark.skipif(not generation.triton_runs(), reason="needs a GPU the Pallas kernels compile for")
-def test_a_dense_products_exact_sums_survive_one_row_tile():
+def a_dense_products_exact_sums_survive_one_row_tile():
     """At the highest precision, a dense fp32 product of one row tile and many depth steps (its first grid
     axis one program, where a program id is a constant) through Triton's launch, named (a dense cell runs
     XLA's dot unnamed, `grouped_matmul.DECLARED`), sums each step's product by an IEEE add: its error

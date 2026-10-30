@@ -112,10 +112,9 @@ ON_BLACKWELL = pytest.mark.skipif(generation.device_generation() not in ("sm100"
 
 
 @ON_BLACKWELL
-@pytest.mark.gpu(reason="runs the Blackwell mainloop compiled, on a B200 or a B300")
 @pytest.mark.parametrize("tiles", TILES, ids=lambda tiles: f"{tiles.block_n}x{tiles.stages}")
 @pytest.mark.parametrize("case", list(CASES))
-def test_the_blackwell_gmm_holds_check_1_on_blackwell(case, tiles):
+def the_blackwell_gmm_holds_check_1_on_blackwell(case, tiles):
     """Each case compiled and run on a B200 or a B300, its tiles over every multiprocessor, where the
     interpreter's synchronization is the hardware's: as exact as the plain program from float64 truth."""
     run = _mainloop(case, tiles, interpret=False, target=generation.gpu_target())

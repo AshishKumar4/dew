@@ -195,18 +195,23 @@ def test_bf16_keys_rotate_and_normalize_where_vllm_rounds():
     assert_as_the_transcription(dew, transcribed, drawn_ids(10), 'bf16 keys', seeds=DORY_SEEDS['keys'])
 
 
+@pytest.mark.parametrize('loops', [None, 4])
 @pytest.mark.parametrize('mode', ['per_loop', 'last_loop'])
-def test_a_cached_greedy_continuation_reads_each_cache_as_vllm_keeps_it(mode):
+def test_a_cached_greedy_continuation_reads_each_cache_as_vllm_keeps_it(mode, loops):
     """Greedy decoding over the cache vLLM keeps: one entry a recurrent layer and pass
     ('per_loop'), or one a recurrent layer that each pass overwrites ('last_loop', a pass reading
-    its own keys for the step's tokens and the last pass's for the earlier ones). The tokens are
-    the reference's and each step's logits within the rule of its fp32 decode against float64.
+    its own keys for the step's tokens and the last pass's for the earlier ones), at the tiny's own
+    two loops and at four, whose later passes a step runs under one scan (`looping.run_loop`). The
+    tokens are the reference's, and each step's logits over drawn prompts and continuations are as
+    exact as the live transcription's decoding under the same cache (check 1).
     A per-pass cache is exact, the full forward's: the uncached logits of the whole continuation
-    hold to the same rule at the positions each step decoded, and the cached steps to the rule of
-    those uncached logits. A last-loop cache is the model's own approximation, held to the
-    reference's decoding under it."""
+    hold to the transcription the same way, and the cached steps to those uncached logits. A
+    last-loop cache is the model's own approximation, held to the transcription's decoding under it."""
     loaded = load()
-    model, variables, tensors = with_cache(loaded.model, mode), loaded.variables, exported(loaded)
+    model = with_cache(loaded.model if loops is None else loaded.model.with_passes(loops), mode)
+    variables, tensors = loaded.variables, exported(loaded)
+    tag = mode if loops is None else f'{mode}_{loops}'
+    passes = {} if loops is None else {'loops': loops}
 
     empty = model.apply(variables, 1, method=CausalTransformer.init_cache, mutable=['cache'])[1]['cache']
 
@@ -225,7 +230,7 @@ def test_a_cached_greedy_continuation_reads_each_cache_as_vllm_keeps_it(mode):
             steps.append(logits)
         return np.asarray(jnp.stack(steps))
 
-    expected = REFERENCE[f'generated_{mode}']
+    expected = REFERENCE[f'generated_{tag}']
     np.testing.assert_array_equal(decoded(expected[:6], expected[6:]).argmax(-1), expected[6:])
 
     def whole(prompt, tokens):
@@ -233,14 +238,14 @@ def test_a_cached_greedy_continuation_reads_each_cache_as_vllm_keeps_it(mode):
         return model.apply(variables, joined)[0, len(prompt) - 1:]
 
     def transcribed(dtype, prompt, tokens):
-        return TOOL.DoryReference(loaded.config, tensors, dtype, mode=mode).forced(
+        return TOOL.DoryReference(loaded.config, tensors, dtype, mode=mode, **passes).forced(
             np.asarray(prompt), np.asarray(tokens), prompt_rows=False)
 
     def draw(seed):
         rng = np.random.default_rng([0x596, 20, seed])
         return tuple(rng.integers(12, loaded.config['vocab_size'], width, dtype=np.int32) for width in (6, 8))
 
-    assert_as_the_transcription(as_given(decoded), transcribed, draw, f"Dory's {mode} decoding",
+    assert_as_the_transcription(as_given(decoded), transcribed, draw, f"Dory's {tag} decoding",
                                 seeds=DORY_SEEDS[mode])
     if mode == 'per_loop':
         assert_as_the_transcription(whole, transcribed, draw, "Dory's forward over its continuation",
@@ -250,6 +255,68 @@ def test_a_cached_greedy_continuation_reads_each_cache_as_vllm_keeps_it(mode):
 
         assert_as_exact(as_given(decoded), whole, draw, "Dory's per-pass cache against its forward",
                         seeds=DORY_SEEDS['cache'], truth_fn=truth)
+
+
+@pytest.mark.parametrize('mode', ['per_loop', 'last_loop'])
+def test_a_cached_step_runs_its_later_passes_as_one_body(mode):
+    """A decode step runs its block's later passes as one scan over them (`looping.run_loop`, ledger
+    642): at four loops and at eight, one scan of three and seven passes with the same body; under the
+    last-loop cache, whose last pass keeps its writes, of two and six, the last after it. So a step's
+    program holds the first pass, one later pass and, under that cache, the last, whatever the count."""
+    loaded = load()
+    ids = jnp.asarray(REFERENCE['input_ids'][:, :1])
+
+    def program(loops):
+        model = with_cache(loaded.model.with_passes(loops), mode)
+        cache = model.init(jax.random.key(0), ids, decode=True)['cache']
+        graph = jax.make_jaxpr(lambda variables, cache: model.apply(
+            {**variables, 'cache': cache}, ids, decode=True, mutable=['cache']))(loaded.variables, cache)
+        (scan,) = (equation for equation in graph.jaxpr.eqns if equation.primitive.name == 'scan')
+        body = sorted(str(equation.primitive) for equation in scan.params['jaxpr'].eqns)
+        return scan.params['length'], body
+
+    (four, body), (eight, deep) = program(4), program(8)
+    kept = mode == 'last_loop'
+    assert (four, eight) == (3 - kept, 7 - kept) and body == deep
+
+
+@pytest.mark.parametrize('mode, loops', [('per_loop', 4), ('last_loop', 4)])
+def test_what_each_scanned_pass_sows_extends_what_the_passes_before_it_sowed(mode, loops):
+    """A forward at one loop more than `loops` sows in its looped layers (its attention's logits, `qk`,
+    and every module's output, captured intermediates) what one at `loops` does and its last pass's
+    beside it: the scan over the later passes keeps each pass's sows apart where the cache does, and
+    extends the block's own otherwise, pass by pass (ledger 642). Under the per-pass cache each pass is
+    one program in both, so the sows are bit for bit; under the last-loop cache the last pass runs after
+    the scan, a program the two counts do not share, so each sow keeps its place and shape. The layers
+    after the block read the last pass's output, which differs."""
+    loaded = load()
+    ids = REFERENCE['input_ids']
+    _, end = loaded.model.loop.layers
+
+    def looped(path) -> bool:
+        layer = getattr(path[1], 'key', '')
+        return layer.startswith('layers_') and not end <= int(layer.split('_')[1]) < loaded.model.num_layers
+
+    def sown(loops):
+        model = with_cache(loaded.model.with_passes(loops), mode)
+        _, state = model.apply(loaded.variables, ids, mutable=['qk', 'intermediates'],
+                               capture_intermediates=True)
+        flat, _ = jax.tree_util.tree_flatten_with_path(state, is_leaf=lambda node: isinstance(node, tuple))
+        return {path: entries for path, entries in flat if looped(path)}
+
+    four, five = sown(loops), sown(loops + 1)
+    longer = 0
+    for path, entries in four.items():
+        assert isinstance(five[path], tuple) and len(five[path]) >= len(entries), path
+        for kept, extended in zip(entries, five[path][:len(entries)], strict=True):
+            if mode == 'per_loop':
+                np.testing.assert_array_equal(np.asarray(kept), np.asarray(extended), err_msg=str(path))
+            else:
+                # The last-loop cache's passes run as programs that differ between the two counts (its
+                # last pass after the scan), so their values differ in their last bits: their places do not.
+                assert np.shape(kept) == np.shape(extended), path
+        longer += len(five[path]) > len(entries)
+    assert longer and set(four) <= set(five)
 
 
 @pytest.mark.parametrize('attention_impl', ['xla', 'reference'])

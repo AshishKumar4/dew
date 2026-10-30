@@ -209,13 +209,6 @@ def remote_code(name_or_dir: str | Path, directory: Path) -> Path:
     return directory
 
 
-def code_file(code: SourceCode, name: str) -> Path | None:
-    """The file `name` beside a source's own code (`SourceCode`), as the source resolves an optional
-    file of its own (`SourceReference.optional_file`): None where it proves it holds none."""
-    reference = SourceReference(str(code.source), code.revision, code.folder)
-    return reference.optional_file(reference.cached(), name)
-
-
 def code_modules(code: SourceCode) -> dict[str, Path]:
     """A source's own modules (`SourceCode`), by their path in the source: those its config's `auto_map`
     names, and every module they import relatively, as transformers resolves a remote module's imports

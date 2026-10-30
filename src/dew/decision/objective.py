@@ -3,6 +3,7 @@
 import dataclasses
 import functools
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import jax
@@ -41,6 +42,7 @@ from dew.nn import categorical
 from dew.nn.cross_attention import ContextEncoder, crosses_alone
 from dew.nn.flops import MissingFlopsCount, counted_flops, frozen_training_flops, parameter_flops
 from dew.nn.inputs import ModelInputs
+from dew.nn.inspection import INSPECTED
 from dew.nn.protocols import CountedDecisions, CountedTraining, CrossAttending, ProjectionGroup, TokenModel
 from dew.objectives.base import (
     OMITTED,
@@ -387,10 +389,11 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         inputs = laid_out(batch, self.bounds.segments, spans_in_context=self.spans_in_context,
                           whole_blocks=whole_blocks_of(self.layout),
                           attention=self.layout.attention)
-        logits = self.model.logits(
+        logits, sown = self.model.observed_logits(
             variables, inputs, train=step.training, rngs=model_rngs(step.key, training=step.training),
-            progress=self.progress(step))
-        return self._charged(logits, inputs, batch)
+            progress=self.progress(step), opened=step.sown())
+        loss, aux = self._charged(logits, inputs, batch)
+        return loss, replace(aux, inspected=sown.get(INSPECTED, {}) if step.watched is not None else None)
 
     def _charged(self, logits: jax.Array, inputs: DecisionInputs, batch: Batch
                  ) -> tuple[Ratio | Weighted, Aux]:

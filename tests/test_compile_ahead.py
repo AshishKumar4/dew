@@ -29,12 +29,13 @@ VOCAB, SEQ_LEN, BATCH = 96, 16, 8
 TINY_SHARD = 256
 
 
-def fine_tune(mesh, *, ahead=None, width: int | None = None, xla: bool = False, split=1, remat=None):
+def fine_tune(mesh, *, ahead=None, width: int | None = None, xla: bool = False, split=1, remat=None,
+              inspection=None):
     fields = {**TINY_DECODER, **({} if width is None else {"emb_features": width}),
               **({"attention_impl": "xla"} if xla else {}), **({} if remat is None else {"remat": remat})}
     model = models.build("causal_transformer", vocab_size=VOCAB, **fields, num_kv_heads=2)
     return Trainer(LMObjective(model, SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0), mesh=mesh,
-                   layout=Layout(min_shard=TINY_SHARD), split=split, ahead=ahead)
+                   layout=Layout(min_shard=TINY_SHARD), split=split, ahead=ahead, inspection=inspection)
 
 
 def test_compiling_ahead_plans_once_and_saves_the_selected_program(tmp_path, monkeypatch):
@@ -314,8 +315,7 @@ def test_an_accumulating_step_holds_its_gradient_sum_and_no_other_buffer_a_param
     assert window.peak_bytes - one.peak_bytes <= gradient + held + activations
 
 
-@pytest.mark.gpu(reason="loads and runs a step compiled ahead on this host's own GPU")
-def test_a_step_compiled_ahead_and_saved_runs_on_its_gpu_in_the_run_s_place(tmp_path):
+def a_step_compiled_ahead_and_saved_runs_on_its_gpu_in_the_run_s_place(tmp_path):
     """A step compiled ahead for one compile-only GPU of this GPU's generation, saved, and loaded
     again, runs on this GPU in the place of the run's own compile of it: handed the arguments the
     run's step is (the state the trainer places, the batch, the first part), it makes outputs of
@@ -362,8 +362,7 @@ def test_a_step_compiled_ahead_and_saved_runs_on_its_gpu_in_the_run_s_place(tmp_
                for new, old in zip(jax.tree.leaves(moving.variables["params"]), initial, strict=True))
 
 
-@pytest.mark.gpu(reason="runs a step compiled ahead as a run's first step on this host's own GPU")
-def test_a_run_handed_its_step_compiled_ahead_trains_from_it_on_its_gpu(tmp_path):
+def a_run_handed_its_step_compiled_ahead_trains_from_it_on_its_gpu(tmp_path):
     """A step compiled ahead for one compile-only GPU of this GPU's generation, saved and handed to
     the run (`Trainer(ahead=...)`), is the program the run lowers its first step to, and the run
     trains from it, its plan's first compile the step compiled ahead: its steps advance and its
@@ -388,6 +387,43 @@ def test_a_run_handed_its_step_compiled_ahead_trains_from_it_on_its_gpu(tmp_path
     assert int(state.step) == 2 and first["ahead"] is True
     assert any(not np.array_equal(np.asarray(new), np.asarray(old))
                for new, old in zip(jax.tree.leaves(state.variables["params"]), initial, strict=True))
+
+
+def test_a_watched_runs_step_compiled_ahead_carries_its_sampled_step():
+    """A run that inspects compiles its sampled step beside its step (`Candidate.sampled`), and a step
+    compiled ahead for it carries both (`AheadOfTime.sampled`), each its own program, so the run handed it
+    compiles neither on its target (train 332's review)."""
+    from dew.training import Inspection
+    from dew.training.ahead import compile_ahead, compile_only_gpus
+
+    batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
+    devices = compile_only_gpus("sm90", 1)
+    watched = compile_ahead(fine_tune(MeshSpec().build(devices), inspection=Inspection(every=1)), batch)
+    plain = compile_ahead(fine_tune(MeshSpec().build(devices)), batch)
+    assert watched.sampled is not None and plain.sampled is None
+    assert watched.sampled.program != watched.program and watched.program == plain.program
+
+
+def a_watched_run_handed_its_steps_compiled_ahead_compiles_neither(tmp_path):
+    """A GPU flow's cell (tests/test_gpu_training.py): a run that inspects, handed its step and sampled step
+    compiled ahead for this host's own GPU, takes both (`taken`) and compiles no step program on its GPU
+    (`Compiles`): its first plan's compile is the step compiled ahead, and it trains from it (train 332's
+    review)."""
+    from dew.nn.kernels.generation import chosen, device_generation
+    from dew.telemetry.instrumentation import Compiles
+    from dew.training import Inspection
+    from dew.training.ahead import AheadOfTime, compile_ahead, compile_only_gpus
+
+    batch, watched = token_rows(VOCAB, BATCH, SEQ_LEN + 1), Inspection(every=1)
+    with chosen(narrow_copies="off"):
+        compile_ahead(fine_tune(MeshSpec().build(compile_only_gpus(device_generation(), 1)), xla=True,
+                                inspection=watched), batch).save(tmp_path / "step.dew-aot")
+        run = fine_tune(MeshSpec().build(jax.devices()[:1]), xla=True, inspection=watched,
+                        ahead=AheadOfTime.load(tmp_path / "step.dew-aot"))
+        with Compiles("step") as compiles:
+            state = run.fit(batch, steps=1, log_every=1)
+    first, *_ = listed(record(run.plan, "plan")["probes"], "probes", read=record, what="probes")
+    assert int(state.step) == 1 and first["ahead"] is True and compiles.count == 0
 
 
 @pytest.mark.tpu(reason="runs a step compiled ahead for this host's TPU topology as a run's first step")
@@ -480,9 +516,7 @@ def test_a_stated_link_is_the_one_a_step_compiled_ahead_records_and_a_handed_run
     assert len(caplog.records) == 1
 
 
-@pytest.mark.gpu(reason="loads a step compiled ahead over a tensor axis onto two GPUs")
-@pytest.mark.mesh(devices=2)
-def test_a_run_handed_a_step_compiled_ahead_traces_with_the_links_it_was_compiled_with(tmp_path):
+def a_run_handed_a_step_compiled_ahead_traces_with_the_links_it_was_compiled_with(tmp_path):
     """A run on two GPUs whose link would spread a projection (`FAST`), handed a step compiled ahead
     over compile-only GPUs that spread none, traces with the link the step records and trains from it,
     rather than lowering another program and refusing it; resumed from its checkpoint without the step,
@@ -507,8 +541,7 @@ def test_a_run_handed_a_step_compiled_ahead_traces_with_the_links_it_was_compile
     assert int(again.step) == 3 and resumed.links["tensor"].bytes_per_second is None
 
 
-@pytest.mark.gpu(reason="loads a selected split executable onto its target GPU")
-def test_a_run_takes_the_saved_offline_split_before_loading_its_executable(tmp_path):
+def a_run_takes_the_saved_offline_split_before_loading_its_executable(tmp_path):
     """An offline plan for two microbatches is handed to a live run with its split unpinned. The
     live planner takes the saved split before lowering, so the artifact's program is reused and its
     two donated microbatch calls produce one committed update, not a mismatch or a recompile."""
