@@ -1800,13 +1800,22 @@ class RunConfig:
             objective, self.optim, key=trainer.key, mesh=mesh, microbatches=trainer.microbatches,
             layout=trainer.layout, accumulation=trainer.accumulation, split=trainer.split,
             dynamic_scale=self.compute_dtype() == "float16", rollout=rollout,
-            tune_kernels=trainer.tune_kernels, **{"links": trainer.links, **resources})
+            tune_kernels=trainer.tune_kernels, param_dtype=self.drawn_dtype(),
+            **{"links": trainer.links, **resources})
 
     def compute_dtype(self) -> str:
         """The dtype the run's model computes in: the one its record states, else its numerics'
         (`TrainerConfig.precision`)."""
         stated = self.model.fields.get("dtype")
         return str(stated) if stated is not None else self.trainer.precision.dtypes.compute
+
+    def drawn_dtype(self) -> str | None:
+        """The dtype the run stores the parameters it draws fresh in (`Trainer`'s `param_dtype`): its
+        numerics' `dtypes.params` where that is not Flax's own float32 and its model's record states
+        none; None leaves each module's own."""
+        params = self.trainer.precision.dtypes.params
+        return None if "param_dtype" in self.model.fields or jax.numpy.dtype(params) == jax.numpy.float32 \
+            else params
 
     def numerics_fields(self) -> dict[str, str]:
         """The fields the run's numerics derive for its model (`ModelConfig.build`): its compute dtype,

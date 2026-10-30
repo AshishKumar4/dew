@@ -108,7 +108,7 @@ from dew.objectives.base import (
     taken_record,
 )
 from dew.optim import held_rates, learning_rate, scaled_rates, settable_rates, with_rates
-from dew.state import MODEL_STATE, Accumulation, TrainState, apart, kept_window, together
+from dew.state import MODEL_STATE, Accumulation, TrainState, apart, drawn_in, kept_window, together
 from dew.telemetry import profile as telemetry_profile
 from dew.telemetry.instrumentation import StepFlops, compilation_cache_counts
 from dew.telemetry.profile import region
@@ -277,6 +277,7 @@ class Trainer(Generic[Loss, Effects]):
         tune_kernels: bool = False,
         record: bool = False,
         links: Mapping[str, Link] | None = None,
+        param_dtype: str | None = None,
     ):
         """Hold everything a run needs, without opening any of it.
 
@@ -300,7 +301,9 @@ class Trainer(Generic[Loss, Effects]):
         `tune_kernels` opts in to the tuner (`dew.nn.kernels.tuning.tune`), else each launch takes its
         derived config. `record` makes each step return in its metrics what each evaluation, replays
         too, sampled or passed as a boundary (`taken_record`).
-        `links` states an axis's `Link` by name in place of measuring it (`_links`).
+        `links` states an axis's `Link` by name in place of measuring it (`_links`). `param_dtype`, a dtype's
+        name, stores the parameters the run draws fresh, as Flax's `param_dtype` (`dew.state.drawn_in`);
+        None keeps each module's own.
         """
         whole = read_whole(accumulation, split, step, layout, rollout, mesh)
         self.objective = objective
@@ -326,6 +329,7 @@ class Trainer(Generic[Loss, Effects]):
         self.records: list[Recorded] = []
         self.profile = profile
         self.lower_for, self._ahead, self.tune_kernels = lower_for, ahead, tune_kernels
+        self.param_dtype = param_dtype
         # Set by `compile`, for the batch shape it was called with. A ramped run has one value per stage;
         # `fit` keeps them beside each step. The executable is the step as compiled, whose memory analysis a
         # benchmark reads; the program it was lowered from is released with its plan (`Planned.released`).
@@ -389,14 +393,12 @@ class Trainer(Generic[Loss, Effects]):
                       key: int | jax.Array | None = None) -> TrainState:
         """Build the state a fresh run starts from.
 
-        It is pure, so `fit` traces it once for its shapes and once, sharded, for its
-        values.
+        It is pure, so `fit` traces it once for its shapes and once, sharded, for its values.
 
-        Both inputs default to the run's own, and `place` passes them explicitly so
-        that what it compiles takes them as arguments. A held checkpoint then reaches
-        the device as an argument instead of a constant embedded in the executable.
-        Passing None means "use the configured input", which is what a call without
-        arguments does. This is the only implementation of the state, so a subclass
+        Both inputs default to the run's own, and `place` passes them explicitly so that what it compiles
+        takes them as arguments. A held checkpoint then reaches the device as an argument instead of a
+        constant embedded in the executable. Passing None means "use the configured input", which is what
+        a call without arguments does. This is the only implementation of the state, so a subclass
         overrides it here and every path sees the override.
         """
         initializer = self.objective.initializer if initializer is None else initializer
@@ -411,7 +413,7 @@ class Trainer(Generic[Loss, Effects]):
         # The state holds its trees as dicts of its own, whichever Flax container (a FrozenDict, under a
         # mapping or a list) the objective's tree came in, so its placement, its updates, the
         # collections a step writes back (`write_back`) and its restores share one structure.
-        params = owned_dicts(nn.unbox(initialized))
+        params = drawn_in(owned_dicts(nn.unbox(initialized)), self.param_dtype, self.objective)
         # A held tree's initializer returns the objective's own arrays (`Objective.held_variables`),
         # which the step's donation would free: the moving state takes buffers of its own, as a
         # placed one does (`distributed.placed_held`). The frozen tree no step donates (`apart`), so
@@ -630,8 +632,7 @@ class Trainer(Generic[Loss, Effects]):
     def place(self) -> tuple[TrainState, Placement[TrainState], bytes | None]:
         """Put the state on the mesh, fresh or restored, once `validate`'s checks pass.
 
-        It returns the state with its shardings and the data position a resume
-        continues from.
+        It returns the state with its shardings and the data position a resume continues from.
         """
         return self._placed(self._started(), positioned=True)
 
@@ -789,11 +790,9 @@ class Trainer(Generic[Loss, Effects]):
     def _frozen_shardings(self, state: TrainState, frozen):
         """Return where the frozen collection sits for a CPU-owned run.
 
-        Before placement the layout names each row's shards, and `resident`
-        moves the stack's rows to bank memory, a scanned run's shared rows as
-        one bank. Once placed, the collection holds those banks, whose
-        leading layer axis the layout's rules do not name, and its arrays say
-        where they sit.
+        Before placement the layout names each row's shards, and `resident` moves the stack's rows to bank
+        memory, a scanned run's shared rows as one bank. Once placed, the collection holds those banks,
+        whose leading layer axis the layout's rules do not name, and its arrays say where they sit.
         """
         leaves = jax.tree.leaves(frozen)
         if leaves and all(isinstance(leaf, jax.Array) for leaf in leaves):
