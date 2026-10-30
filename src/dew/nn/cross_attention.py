@@ -115,7 +115,8 @@ def encode_context(model: nn.Module, variables: Mapping, tokens: jax.Array, leng
     (`CONTEXT_SEGMENTS`), which the backbone pass reads each of alone and the call's own tokens of each
     document read alone.
 
-    `table` gives each token's row of the model's own table (`token_embeddings`); `backbone` the
+    `table` gives each token's row of the model's own table at its stream's width (`stream_embeddings`);
+    `backbone` the
     model's final states over each context alone (`HiddenStates`), its real tokens one document, with
     the weights of the model's own pass, an adapter's included. Where the model trains nothing but its
     cross-attention blocks (`crosses_alone`), which a pass without a context runs none of, that pass
@@ -132,7 +133,7 @@ def encode_context(model: nn.Module, variables: Mapping, tokens: jax.Array, leng
                         "does not have")
     whole = thaw(dict(variables))
     if encoder == "table":
-        states = model.apply(whole, tokens, method="token_embeddings")
+        states = model.apply(whole, tokens, method="stream_embeddings")
     elif encoder == "backbone":
         if not isinstance(model, HiddenStates):
             raise TypeError(f"a context's own pass reads final states, which a {type(model).__name__} "
