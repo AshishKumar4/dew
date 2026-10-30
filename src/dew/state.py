@@ -3,13 +3,20 @@
 from __future__ import annotations
 
 import dataclasses
+from typing import TYPE_CHECKING
 
 import jax
+import jax.numpy as jnp
 import optax
 from flax import struct
 from flax.training.dynamic_scale import DynamicScale
+from jax.typing import DTypeLike
 
 from dew.batch import FROZEN, Batch, Variables, merge
+from dew.optim import parameter_name
+
+if TYPE_CHECKING:
+    from dew.objectives.base import Objective
 
 __all__ = ["CHECKPOINTED", "MODEL_STATE", "Accumulation", "TrainState"]
 
@@ -139,6 +146,25 @@ VARIABLE_FIELDS = tuple(field.name for field in dataclasses.fields(TrainState)
 """The train-state fields that each hold a variables tree, keyed by collection (`params`,
 `FROZEN`, ...), as their declarations mark them; the optimizer's state mirrors the trained
 parameters' paths instead."""
+
+
+def drawn_in[LossT, EffectsT](variables: Variables, dtype: DTypeLike | None,
+                               objective: Objective[LossT, EffectsT]) -> Variables:
+    """`variables` with each floating parameter the run draws fresh stored in `dtype`, as Flax's
+    `param_dtype` would draw it: every leaf of `params` its objective holds no loaded tree for, and
+    each module drawn beside a loaded base (`Objective.fresh_modules`). What the base loaded stays as its
+    source stored it (`dew.config.RunConfig.source_keywords`), and an adapter's factors as they are
+    stored (`dew.lora.FACTOR_DTYPE`). None leaves every leaf as drawn."""
+    if dtype is None:
+        return variables
+    held = objective.held_variables() or {}
+    kept = {path for path, _ in jax.tree_util.tree_leaves_with_path(held.get("params", {}))}
+    fresh = tuple(f"{module}/" for module in objective.fresh_modules())
+
+    def stored(path, leaf):
+        drawn = path not in kept or f"{parameter_name(path)}/".startswith(fresh)
+        return leaf.astype(dtype) if drawn and jnp.issubdtype(leaf.dtype, jnp.floating) else leaf
+    return {**variables, "params": jax.tree_util.tree_map_with_path(stored, variables["params"])}
 
 
 def apart[State: TrainState](state: State) -> tuple[State, Variables | None]:

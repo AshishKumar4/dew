@@ -30,7 +30,7 @@ from dew.config import DecoderRunConfig, MetricConfig, ObjectiveConfig, Prepared
 from dew.data.text import HFTokenizer, tokenizer_for
 from dew.objectives.lm.objective import Samples
 from dew.optim import OptimConfig
-from dew.registry import DtypeName, ModelConfig, objectives, resolve_dtype
+from dew.registry import ModelConfig, objectives
 from dew.sampling.text import Sampling
 
 if TYPE_CHECKING:
@@ -155,11 +155,8 @@ class LMRunConfig(DecoderRunConfig):
     `processor`. A step whose optimizer clips by the attention logit maxima
     (`muonclip`) asks the objective for them (`Step.qk_stats`), whichever
     objective it is."""
-    # bf16 compute over float32 parameters: half the activations' memory and the matmuls on a GPU's or
-    # TPU's tensor cores, the precision mixed-precision training keeps (the parameters and the
-    # optimizer float32); a float32 run names "dtype": "float32".
-    model: ModelConfig = dataclasses.field(
-        default_factory=lambda: ModelConfig("causal_transformer", {"dtype": "bfloat16"}))
+    # Its compute dtype is the run's numerics' (`TrainerConfig.precision`) unless its record states one.
+    model: ModelConfig = dataclasses.field(default_factory=lambda: ModelConfig("causal_transformer", {}))
     # GPT-3 Small's (Brown et al. 2020, table 2.1 and appendix B): peak rate 6e-4, weight decay 0.1,
     # the gradient's global norm clipped at 1.0, as nanoGPT trains its 124M model.
     optim: OptimConfig = dataclasses.field(
@@ -181,8 +178,6 @@ class LMRunConfig(DecoderRunConfig):
     layout. A run records a hub repo as `repo@commit`, with the commit it
     resolved to. The checkpoint sets the architecture, so of its fields
     --model.max-seq-len alone may be set."""
-    pretrained_param_dtype: DtypeName = "float32"
-    """The dtype `pretrained`'s parameters are stored and trained in."""
     rollout: Annotated[PromptRollout, tyro.conf.subcommand("rollout")] | None = None
     """The rollout a GRPO run trains on (`--rollout.reward`), over its chain's prompts
     (`dew.data.presets.prompts`): GRPO needs one, and another objective takes none. The model's
@@ -190,9 +185,6 @@ class LMRunConfig(DecoderRunConfig):
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        if self.pretrained is None and self.pretrained_param_dtype != "float32":
-            raise ValueError("--pretrained-param-dtype stores a --pretrained checkpoint's parameters; "
-                             "this run loads none")
         if self.pretrained is None and self.loops:
             raise ValueError("--loop-* run a --pretrained checkpoint's block in passes; a fresh decoder "
                              "states its loop in --model")
@@ -240,7 +232,7 @@ class LMRunConfig(DecoderRunConfig):
             mask = self.model.arguments.get("mask_token_id")
             table = max(vocab_size, mask + 1) if isinstance(mask, int) else vocab_size
             fields = {**self.model.fields, "max_seq_len": context, "vocab_size": table}
-            model = self.model.build(max_seq_len=context, vocab_size=table)
+            model = self.model.build(max_seq_len=context, vocab_size=table, **self.numerics_fields())
         else:
             source = self.pretrained_source(written, vocab_size, context)
             source = self.looped(source)
@@ -361,9 +353,9 @@ class LMRunConfig(DecoderRunConfig):
             raise ValueError(f"--model.max_seq_len is {reach!r}; the context a checkpoint is reloaded at "
                              "is a number of tokens")
         reference = SourceReference.parse(self.pretrained)
-        dtype = resolve_dtype(self.model.fields.get("dtype"))
-        loaded = Pretrained.load(reference.name, dtype=jnp.bfloat16 if dtype is None else dtype,
-                                 param_dtype=self.pretrained_param_dtype,
+        # The checkpoint computes in the run's compute dtype and stores its parameters as its source
+        # keywords say, by whether the run trains it.
+        loaded = Pretrained.load(reference.name, dtype=jnp.dtype(self.compute_dtype()),
                                  attention_impl=self.source_attention(),
                                  max_seq_len=reach, revision=reference.revision,
                                  # An adapter keeps its source as it is.
