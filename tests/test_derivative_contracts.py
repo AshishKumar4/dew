@@ -45,7 +45,9 @@ def pulled(fn, primals, cotangent):
 def orders(fn, primals, direction, cotangent):
     """`fn` at each order the contract holds, by name: the primal, a forward and a reverse derivative, a
     forward derivative of the gradient of the output's sum against `cotangent` and a second forward
-    derivative, the last two again with `fn` rematerialized."""
+    derivative, the last two again with `fn` rematerialized; and the gradient's forward derivative traced
+    as programs nest it (ledger 2641): under a jit within a jit, within a scan's body, and a reverse
+    derivative of the gradient along `direction` (reverse over reverse)."""
     def scalar(f):
         return lambda *x: jnp.sum(f(*x) * cotangent)
 
@@ -64,6 +66,14 @@ def orders(fn, primals, direction, cotangent):
         "second jvp": lambda: jax.jvp(forward(fn), primals, direction)[1],
         "jvp of grad, remat": lambda: jax.jvp(gradient(remat), primals, direction)[1],
         "second jvp, remat": lambda: jax.jvp(forward(remat), primals, direction)[1],
+        "jvp of grad, nested jit": lambda: jax.jit(
+            lambda *x: jax.jvp(jax.jit(gradient(fn)), x, direction)[1])(*primals),
+        "jvp of grad, scanned": lambda: jax.lax.scan(
+            lambda carry, _: (carry, jax.jvp(gradient(fn), primals, direction)[1]), 0, None, length=1)[1],
+        "grad of grad": lambda: jax.grad(
+            lambda *x: sum(jnp.sum(jnp.asarray(along, part.dtype) * part)
+                           for along, part in zip(direction, gradient(fn)(*x), strict=True)),
+            argnums=tuple(range(len(primals))))(*primals),
     }
 
 
