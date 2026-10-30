@@ -387,13 +387,14 @@ def test_a_fetch_from_a_server_that_trickles_its_response_ends_at_its_timeout(tr
     serving.start()
     try:
         fetched = Fetch(timeout=1.0)({"url": f"http://127.0.0.1:{server.server_port}/"})
-        unsent = total - len(sent)
+        sent_by_then = len(sent)
     finally:
         server.shutdown()
         server.server_close()
     assert isinstance(fetched, Rejected) and not fetched.permanent
-    # The response, six seconds long, had not ended when the fetch gave it up.
-    assert unsent > 0
+    # A byte every tenth of a second: a fetch held to its one-second timeout leaves the server about ten
+    # sent, and twice that at most, not the sixty of a response read to its end (row 2447).
+    assert sent_by_then <= 2 * 10
 
 
 def test_shard_root_is_disjoint_across_real_workers_and_shares():
