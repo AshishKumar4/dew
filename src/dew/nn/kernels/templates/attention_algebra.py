@@ -403,7 +403,7 @@ def walked[C: (Partial, tuple), O](spec: Forward, walk: Callable[[Forward, jax.A
         return finished(spec, guarded_walk(spec, functools.partial(walked_plain, spec)))
     carry = walk(spec, None)
     state = carry if isinstance(carry, Partial) else carry[0]
-    reach = reach_of(state.m)
+    reach = reach_of(state.m, unseen=spec.form == "spans")
     natural = unfolded(spec)
 
     def folded() -> C:
@@ -416,13 +416,15 @@ def walked[C: (Partial, tuple), O](spec: Forward, walk: Callable[[Forward, jax.A
                         lambda: finished(spec, guarded_walk(spec, folded)))
 
 
-def reach_of(maxima: jax.Array) -> jax.Array:
+def reach_of(maxima: jax.Array, *, unseen: bool) -> jax.Array:
     """How far a folded walk's row `maxima` reach (`walked`, against `FOLD_REACH`): their largest magnitude,
-    a row that saw no key (-inf) none, and one whose maximum the fold took past fp32's largest, or to no
-    number, past every reach, so the call walks again natural, where its logits are finite (a product near
-    fp32's largest before a small scale, times log2(e))."""
+    and one whose maximum the fold took past fp32's largest, or to no number, past every reach, so the call
+    walks again natural, where its logits are finite (a product near fp32's largest before a small scale,
+    times log2(e)). A -inf maximum is a row that saw no key, none, where a row may see none (`unseen`, a
+    'spans' call); elsewhere every row sees a key, so it is a row whose products all passed fp32 below zero,
+    past every reach (`attention_mosaic_forward._prepared`'s raw products)."""
     reached = jnp.where(jnp.isnan(maxima), jnp.inf, jnp.abs(maxima))
-    return jnp.max(jnp.where(maxima == -jnp.inf, 0.0, reached))
+    return jnp.max(jnp.where(maxima == -jnp.inf, 0.0, reached) if unseen else reached)
 
 
 type Launch[O] = Callable[[Forward, jax.Array | None], tuple[O, jax.Array, jax.Array]]
@@ -454,7 +456,7 @@ def walked_launches[O](spec: Forward, launch: Launch[O], kept: Callable[[jax.Arr
     outputs, maxima, over = launch(spec, None)
     if not spec.base2:
         return guarded_launch(spec, outputs, over)
-    reach = reach_of(maxima)
+    reach = reach_of(maxima, unseen=spec.form == "spans")
     natural = unfolded(spec)
 
     def unfolded_launch() -> O:

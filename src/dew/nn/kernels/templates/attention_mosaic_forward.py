@@ -364,13 +364,16 @@ def _prepared(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     which the op's eligibility reads too)."""
     if reason := refused(query.dtype, query.shape[3], value.shape[3], hooks, backward=False, family=family):
         raise NotImplementedError(reason)
-    # The query's power of two before its products (`prescale`). A folding call's launch takes it into its
-    # scale (`Forward.factor`: the products' factor 2^p times the prescaled query's, so every logit bit for
-    # bit the prescaled query's where its products stay in fp32's normal range), no pass of XLA's over the
-    # queries before it (0.046 ms of Qwen3-8B's 0.66 ms causal forward, ET-GQA1-h100); a logit past the
-    # fold's reach walks again natural on the query taken by the power (`_rewalked`).
+    # The query's power of two before its products (`prescale`). A folding call every row of which sees a
+    # key ('full', 'causal') takes it into its launch's scale (`Forward.factor`: the products' factor 2^p
+    # times the prescaled query's, so every logit bit for bit the prescaled query's where its products stay
+    # in fp32's normal range), no pass of XLA's over the queries before it (0.046 ms of Qwen3-8B's 0.66 ms
+    # causal forward, ET-GQA1-h100). Its raw products can pass fp32 where the prescaled query's do not: a
+    # row of them all past it below zero reads as a -inf maximum, which such a call's rows take as past the
+    # fold's reach (`reach_of`), so it walks again natural on the query taken by the power (`_rewalked`).
     power, scale = prescale(query.dtype, query.shape[3], scale)
-    taken = power if algebra.folds(scale, power, natural=natural, score_mod=hooks.score_mod) else 1.0
+    folding = algebra.folds(scale, power, natural=natural, score_mod=hooks.score_mod)
+    taken = power if folding and spans.form != "spans" else 1.0
     call = padded_call(by_power(query, power / taken), key, value, spans, hooks, _block(tiles))
     spec = algebra.Forward(spans.form, spans.keys, ids=spans.query_ids is not None, scale=scale * taken,
                            score_mod=hooks.score_mod, natural=natural, headroom=algebra.headroom(value.dtype),
