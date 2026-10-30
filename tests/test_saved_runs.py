@@ -7,7 +7,9 @@ This main reads each as a user's process would: the record rebuilds its run (`Ru
 checkpoint's inference declaration pins (`SavedRun.pinned`) where its objective declares a saved task,
 which loads it (`from_run`) and answers one request, and the run resumes from its checkpoint for one step
 more. Its data is the kind's own, written here, since a record names its data where the run that wrote it
-read them."""
+read them. What a run serialized, recorded beside it where its main recorded it (`evidence`: its
+parameters' and compute dtypes, its loss scale, the examples it consumed and its step's rung), is what
+this main reads back: the record's compute, and the resumed run's parameters, scale, clock and rung."""
 
 import dataclasses
 import io
@@ -16,6 +18,7 @@ import re
 import tarfile
 from pathlib import Path
 
+import jax
 import pytest
 from reference_error import recording
 from saved_run_kinds import SAVED_KINDS
@@ -25,7 +28,7 @@ from dew.config import RunConfig
 from dew.decision import Choice
 from dew.decision.task import Decide
 from dew.inference.images import TextToImage
-from dew.inference.tasks import SavedRun, TextGeneration
+from dew.inference.tasks import BlockGeneration, SavedRun, TextGeneration
 from dew.registry import objectives
 
 CORPUS = Path(__file__).with_name("fixtures") / "saved_runs"
@@ -37,6 +40,13 @@ IDS = [f"{recorded}-{kind}" for recorded, kind in SAVED]
 
 ABSOLUTE = re.compile(rb"/(?:home|Users|root|tmp|mnt|private|var)/")
 """An absolute place of the machine that wrote a file: a home, a scratch or a mounted directory."""
+
+
+def evidence(recorded: str, kind: str) -> dict | None:
+    """What `kind`'s run the main `recorded` saved serialized (`saved_runs_reference.evidence`), None where
+    that main recorded none."""
+    path = CORPUS / recorded / f"{kind}.evidence.json"
+    return json.loads(path.read_text()) if path.exists() else None
 
 
 def archived(recorded: str, kind: str) -> tarfile.TarFile:
@@ -66,6 +76,8 @@ def answered(task) -> None:
     question about a state, and a text-to-image run draws an image in one step."""
     if isinstance(task, TextGeneration):
         assert len(task.decode(task("ab", max_new_tokens=1, key=0))) == 1
+    elif isinstance(task, BlockGeneration):
+        assert task([[4, 5, 6, 7]], 4, key=0).host().tokens.shape[-1] >= 4
     elif isinstance(task, Decide):
         question = {"team": Choice("which team", ["billing", "technical", "sales"])}
         [answers] = task([({"text": "the site is down"}, question)])
@@ -85,11 +97,15 @@ def extracted(tmp_path: Path, recorded: str, kind: str) -> Path:
 
 @pytest.mark.parametrize(("recorded", "kind"), SAVED, ids=IDS)
 def test_a_run_an_earlier_main_saved_loads_and_answers(tmp_path, recorded, kind):
-    """A kind's run saved at an earlier main rebuilds from its record, and, where its objective declares
-    a saved task, pins its last checkpoint and loads as that task, which answers a request; an objective
-    that declares none (a JEPA encoder's) records no inference declaration."""
+    """A kind's run saved at an earlier main rebuilds from its record, in the compute it recorded, and,
+    where its objective declares a saved task, pins its last checkpoint and loads as that task, which
+    answers a request; an objective that declares none (a JEPA encoder's) records no inference
+    declaration."""
     run = extracted(tmp_path, recorded, kind)
     recorded_run = RunConfig.load(str(run))
+    seen = evidence(recorded, kind)
+    if seen is not None:
+        assert recorded_run.compute_dtype() == seen["compute"]
     task = objectives[recorded_run.objective.name].saved_task
     with Checkpoints(str(run)) as checkpoints:
         last = checkpoints.latest
@@ -104,25 +120,44 @@ def test_a_run_an_earlier_main_saved_loads_and_answers(tmp_path, recorded, kind)
 @pytest.mark.parametrize(("recorded", "kind"), SAVED, ids=IDS)
 def test_a_run_an_earlier_main_saved_resumes_from_its_checkpoint(tmp_path, monkeypatch, recorded, kind):
     """A kind's run saved at an earlier main resumes from its last checkpoint for one step more, in the
-    compute it trained in (every corpus run's model draws fresh or loads a decision backbone, in float32
-    unless its model names a dtype; train 328's review of ledger 2500): the fit starts at that step, from
-    that checkpoint, and trains the one step past it."""
+    compute it trained in (a main that recorded no evidence: every corpus run's model draws fresh or loads
+    a decision backbone, in float32 unless its model names a dtype; train 328's review of ledger 2500):
+    the fit starts at that step, from that checkpoint, and trains the one step past it. Where its main
+    recorded what it serialized (`evidence`), the resumed run holds its parameters in the dtypes it
+    stored them in, scales its loss as it did, counts on from the examples it consumed, and compiles its
+    step at the rung it was admitted at."""
     run = extracted(tmp_path, recorded, kind)
     recorded_run = RunConfig.load(str(run))
-    assert recorded_run.compute_dtype() == recorded_run.model.fields.get("dtype", "float32")
+    seen = evidence(recorded, kind)
+    compute = recorded_run.model.fields.get("dtype", "float32") if seen is None else seen["compute"]
+    assert recorded_run.compute_dtype() == compute
     with Checkpoints(str(run)) as checkpoints:
         last = checkpoints.latest
     here = SAVED_KINDS[kind](tmp_path, drawn=False)
     # A source the repo holds is recorded by its path in the repo (a decision run's backbone), read from
     # the checkout's root as the run that wrote it read it.
     monkeypatch.chdir(Path(__file__).resolve().parents[1])
-    trainer = dataclasses.replace(recorded_run.trainer, checkpoint_dir=str(tmp_path / "runs"), steps=last + 1,
+    # A run on the examples clock runs on to one example more than it consumed: one step's.
+    clock = ({"steps": last + 1} if seen is None or not recorded_run.trainer.examples
+             else {"steps": None, "examples": seen["consumed"] + 1})
+    trainer = dataclasses.replace(recorded_run.trainer, checkpoint_dir=str(tmp_path / "runs"), **clock,
                                   resume="require", compilation_cache_dir=None, multi_host=False)
     sources = {"data": here.data, "validation": here.validation}
-    dataclasses.replace(recorded_run, trainer=trainer, **sources).prepare().train(kind)
+    state = dataclasses.replace(recorded_run, trainer=trainer, **sources).prepare().train(kind)
     records = [json.loads(line) for line in (run / "tracking" / "records.jsonl").read_text().splitlines()]
     started = [row["value"] for row in records if row["type"] == "FitStarted"][-1]
     assert (started["start_step"], started["resumed_from"] is not None) == (last, True)
     scalars = (run / "tracking" / "scalars.jsonl").read_text().splitlines()
     stepped = [json.loads(line)["step"] for line in scalars]
     assert max(stepped) == last + 1
+    if seen is not None:
+        stored = sorted({str(leaf.dtype) for leaf in jax.tree.leaves(state.variables["params"])})
+        assert stored == seen["params"]
+        assert (None if state.scale is None else float(state.scale.scale)) == seen["scale"]
+        # The examples it consumed count on from the recorded ones, not from none.
+        consumed = None if state.consumed is None else int(state.consumed)
+        assert (consumed is None) == (seen["consumed"] is None)
+        assert consumed is None or consumed > seen["consumed"]
+        compiled = [row["value"] for row in records if row["type"] == "StepCompiled"][-1]
+        assert compiled["remat"] == seen["remat"]
+        assert {name: (compiled["plan"] or {}).get(name) for name in seen["plan"]} == seen["plan"]
