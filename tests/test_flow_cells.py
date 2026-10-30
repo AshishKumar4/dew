@@ -2,6 +2,7 @@
 failure is kept and raised together, a cell's own skip is reported and the cells after it still run,
 and a flow of no cell that runs is skipped, never passed."""
 
+import gpu_flow
 import pytest
 from gpu_flow import Cell, CellsFailed, cells_of, run_cells
 
@@ -62,4 +63,18 @@ def test_a_cell_function_gives_a_cell_a_parameter_set_and_skips_where_its_set_do
     skipped = run_cells(cells)
     assert sorted(ran_with) == [("plain", 1.0, 64, "given"), ("scaled", 2.0, 64, "given")]
     assert sorted(skipped) == ["gridded: 128-p", "gridded: 128-s"]
+
+
+def test_a_flow_reports_its_counts_once_however_its_cells_nest():
+    """A flow's counts (`gpu_flow.REPORTED`, the JUnit property `cells` CI reads): an outermost flow's alone,
+    a sweep's inner flow counted within its cell, and a flow none of whose cells ran reported with none
+    passed before it skips, so it reads as unqualified rather than green."""
+    gpu_flow.REPORTED.clear()
+    run_cells([Cell("a sweep", lambda: run_cells([Cell("one", lambda: None), Cell("two", lambda: None)])),
+               Cell("absent", lambda: pytest.skip("not here"))])
+    with pytest.raises(pytest.skip.Exception):
+        run_cells([Cell("absent", lambda: pytest.skip("not here"))])
+    assert [{key: run[key] for key in ("passed", "failed", "skipped")} for run in gpu_flow.REPORTED] == [
+        {"passed": 1, "failed": 0, "skipped": 1}, {"passed": 0, "failed": 0, "skipped": 1}]
+    gpu_flow.REPORTED.clear()
 

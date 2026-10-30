@@ -59,8 +59,9 @@ def sweep(check, space) -> Cell:
 
 def a_shared_bias_step_repeats_bit_for_bit(bias_shape: tuple) -> None:
     """A bf16 causal training step through the template at a sequence of 2048, its bias of `bias_shape`
-    shared by every batch row (a tile of each head's logits, or a key bias), the same compiled program on
-    the same inputs run six times under the lane's deterministic ops (tests/lane_environment.py): every
+    shared by every batch row (a tile of each head's logits, or a key bias), the same program on the same
+    inputs run six times under the lane's deterministic ops (tests/lane_environment.py), the second compiled
+    afresh: every
     gradient, the bias's own included, the same bits as the first run's, as kernel-templates.md promises
     a schedule's reproducibility (ledger 2620). Only a GPU's atomics reorder, so only a GPU can fail it."""
     rng = np.random.default_rng(2620)
@@ -81,6 +82,8 @@ def a_shared_bias_step_repeats_bit_for_bit(bias_shape: tuple) -> None:
 
     first = [np.asarray(gradient) for gradient in step(query, key, value, bias, cotangent)]
     for run in range(5):
+        if run == 0:
+            jax.clear_caches()  # the second run compiled afresh: a schedule its compiler picks repeats too
         for name, one, again in zip(("query", "key", "value", "bias"), first,
                                     step(query, key, value, bias, cotangent), strict=True):
             np.testing.assert_array_equal(one.view(np.uint8), np.asarray(again).view(np.uint8),

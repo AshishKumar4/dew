@@ -106,14 +106,16 @@ def trains_on_its_port(make):
 
 
 def repeats_bit_for_bit(make, kernel: str):
-    """A layer's training step on `kernel`, the same compiled program on the same inputs, run twice: every
-    gradient the same bit for bit (the kernels sum in a fixed order)."""
+    """A layer's training step on `kernel`, the same program on the same inputs, run twice, compiled afresh
+    the second time: every gradient the same bit for bit (the kernels sum in a fixed order)."""
     layer = make()
     x = jax.random.normal(jax.random.key(5), (ROWS, TOKENS, WIDTH)).astype(jnp.bfloat16)
     params = named(layer.init, gated_delta_rule="xla")(jax.random.key(6), x)
     step = jax.jit(named(jax.grad(lambda params, x: jnp.sum(layer.apply(params, x).astype(jnp.float32) ** 2),
                                   argnums=(0, 1)), gated_delta_rule=kernel))
-    first, again = (jax.tree.map(np.asarray, step(params, x)) for _ in range(2))
+    first = jax.tree.map(np.asarray, step(params, x))
+    jax.clear_caches()  # compiled afresh: a schedule its compiler picks must repeat too
+    again = jax.tree.map(np.asarray, step(params, x))
     for (path, one), other in zip(jax.tree_util.tree_leaves_with_path(first), jax.tree.leaves(again),
                                   strict=True):
         np.testing.assert_array_equal(one.view(np.uint8), other.view(np.uint8),

@@ -38,10 +38,47 @@ class CellsFailed(AssertionError):
         self.labels = [label for label, _ in failed]
 
 
+REPORTED: list[dict] = []
+"""The counts of each outermost flow run since the last test's report took them (`run_cells`), which
+tests/conftest.py reports as the test's JUnit property `cells`: a flow none of whose cells ran is
+unqualified on the GPU it was run for, never green (ledger 2643)."""
+
+_depth = 0
+"""How many flows enclose the one running: a sweep's inner flow (`run_cells` within a cell) counts within
+its cell, not apart."""
+
+
+def _device() -> str:
+    """The device a flow runs on, as its counts name it."""
+    import jax
+
+    return jax.devices()[0].device_kind
+
+
 def run_cells(cells: Iterable[Cell]) -> list[str]:
     """Run every cell in order (`Cell`): each label printed first; every failure kept and raised together
     after the last; the cells this device cannot run, or that skip themselves, reported skipped, their
-    labels returned."""
+    labels returned; an outermost flow's counts reported (`REPORTED`)."""
+    global _depth
+    _depth += 1
+    try:
+        failed, skipped, passed = _ran(cells)
+    finally:
+        _depth -= 1
+    if not _depth:
+        REPORTED.append({"passed": passed, "failed": len(failed), "skipped": len(skipped),
+                         "device": _device()})
+    print(f"cells: {passed} passed, {len(failed)} failed, {len(skipped)} skipped on this device", flush=True)
+    if failed:
+        raise CellsFailed(failed)
+    if not passed:
+        pytest.skip(f"no cell runs on this device ({len(skipped)} skipped)")
+    return skipped
+
+
+def _ran(cells: Iterable[Cell]) -> tuple[list[tuple[str, str]], list[str], int]:
+    """Each cell run (`run_cells`): the failed ones by label and report, the skipped ones' labels, and how
+    many passed."""
     failed, skipped, passed = [], [], 0
     for cell in cells:
         if cell.generation is not None and not runnable(cell.generation):
@@ -58,12 +95,7 @@ def run_cells(cells: Iterable[Cell]) -> list[str]:
             failed.append((cell.label, "".join(traceback.format_exception_only(error)).strip()))
         else:
             passed += 1
-    print(f"cells: {passed} passed, {len(failed)} failed, {len(skipped)} skipped on this device", flush=True)
-    if failed:
-        raise CellsFailed(failed)
-    if not passed:
-        pytest.skip(f"no cell runs on this device ({len(skipped)} skipped)")
-    return skipped
+    return failed, skipped, passed
 
 
 def _skipped(marks, reason_of: str) -> Callable[[], None] | None:
