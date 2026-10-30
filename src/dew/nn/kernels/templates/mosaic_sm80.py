@@ -21,9 +21,10 @@ from dew.nn.sharding import per_shard
 
 def _staging(block: tuple, swizzle: int | None) -> tuple:
     """A stream's tile's transforms: a tile's swizzled (its own, `swizzle` where a stream names one); a side
-    vector's none, in whole 16-byte cp.async chunks."""
+    vector's none, in whole 16-byte cp.async chunks, and a tile's none where it is read a row at a time
+    (`mosaic.UNSWIZZLED`)."""
     shape, dtype = block
-    if len(shape) == 1:
+    if len(shape) == 1 or swizzle == mosaic.UNSWIZZLED:
         return ()
     return swizzled(shape, dtype) if swizzle is None else mosaic.swizzle_transforms(dtype, swizzle)
 

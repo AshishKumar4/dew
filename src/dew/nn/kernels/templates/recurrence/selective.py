@@ -72,7 +72,8 @@ def forward(x, dt, rates, b, c, skip, state, resets, scan: Scan):
               "b": ((chunk, states), b.dtype), "c": ((chunk, states), c.dtype)}
     if scan.packed:
         blocks["resets"] = ((chunk, RESET_WIDTH), jnp.int8)
-    streams = family.streams(blocks, 2, 1)
+    # Each tile read a token's row at a time, at a traced row: staged plain (`mosaic.UNSWIZZLED`).
+    streams = family.streams(blocks, 2, 1, swizzles=dict.fromkeys(blocks, mosaic.UNSWIZZLED))
     out_type = [jax.ShapeDtypeStruct(x.shape, x.dtype),
                 jax.ShapeDtypeStruct((scan.rows, states, scan.channels), jnp.float32)]
     if scan.entered:

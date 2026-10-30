@@ -327,6 +327,10 @@ SWIZZLE_BYTES = 128
 NARROWEST_SWIZZLE_BYTES = 32
 """The narrowest swizzle Mosaic GPU stages a block's rows at (`plgpu.find_swizzle`'s least)."""
 
+UNSWIZZLED = 0
+"""A stream's swizzle (`Family.streams`' `swizzles`) where a step reads its tile a row at a time, at a traced
+row (a scan's tokens): staged plain, no tiling or swizzle, which Mosaic GPU indexes at any row."""
+
 
 def swizzle_for(dtype, *contractions: int) -> int:
     """The widest swizzle, in bytes, a shared-memory block of `dtype` takes whose group of elements (the
@@ -357,8 +361,9 @@ def staged(shape: tuple, dtype, swizzle: int | None = None):
     """A shared-memory block of `shape` whose rows are staged at `swizzle` bytes: as layout inference stages
     them where unstated (the widest that fits); otherwise in 8-row tiles of the swizzle's row, explicitly,
     which inference does not take for a block whose products contract over fewer elements than the widest
-    swizzle's row (K32SWZ5: a register operand at a 32-row contraction lowered only so)."""
-    if swizzle is None:
+    swizzle's row (K32SWZ5: a register operand at a 32-row contraction lowered only so); plain where
+    `UNSWIZZLED`."""
+    if swizzle is None or swizzle == UNSWIZZLED:
         return plgpu.SMEM(shape, dtype)
     return plgpu.SMEM(shape, dtype, transforms=swizzle_transforms(dtype, swizzle))
 
