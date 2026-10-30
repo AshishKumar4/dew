@@ -189,6 +189,9 @@ def augment_batch(images: ArrayLike, raw_keys: ArrayLike, *, size: int, flip: bo
                   crop_scale: tuple[float, float]) -> jax.Array:
     """Augment a dense uint8 batch on its device, one Threefry key per record."""
     images = jnp.asarray(images)
+    # Each record's key is two words its own generator drew (`AugmentationKey`), Threefry's key data, so a
+    # record draws the same augmentation at any split, pool or resume; read as `jax_default_prng_impl`'s,
+    # the words would be another implementation's key, of another shape where it is not Threefry.
     keys = jax.random.wrap_key_data(jnp.asarray(raw_keys, jnp.uint32), impl="threefry2x32")
 
     def one(image, key):
