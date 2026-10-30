@@ -3,8 +3,11 @@ each method's loss term, its reference penalty in the loss included, and its gra
 log-probability, over drawn sessions packed two to a row, run in float64 computing the paper's form in
 float64 (`assert_computes_the_oracle`), and its gradient in float32 on par with the paper's form's by
 check 1 (tests/reference_error.py). Through a scheduler's call over scripted sessions, the returns the
-estimators compare: DAPO's overlong punishment and dynamic sampling, RLOO's reference penalty in the
-reward, and the global estimator's whitening over a batch split into data shares."""
+estimators compare: DAPO's overlong punishment and dynamic sampling, within a batch and across the
+batches it draws further, RLOO's reference penalty in the reward, and the global estimator's whitening
+over a batch split into data shares."""
+
+import dataclasses
 
 import jax
 import jax.numpy as jnp
@@ -256,18 +259,25 @@ TOOL = 23
 
 
 class Scripted:
-    """A collector that answers each task with its scripted sessions, whatever the policy."""
+    """A collector that answers each task with its scripted sessions, whatever the policy, each call
+    stamped with the version it was drawn at, recording each collection's tasks and the key it was
+    drawn under."""
 
     width = 16
 
     def __init__(self, sessions):
         self.sessions = sessions
+        self.collected = []
 
     def rows(self, tasks, samples):
         return tasks * samples
 
     def collect(self, snapshot, tasks, samples):
-        return [self.sessions[task.id] for task in tasks]
+        self.collected.append(([int(task.id) for task in tasks],
+                               np.asarray(jax.random.key_data(snapshot.key)).tolist()))
+        return [[dataclasses.replace(session, calls=tuple(dataclasses.replace(call, version=snapshot.updates)
+                                                          for call in session.calls))
+                 for session in self.sessions[task.id]] for task in tasks]
 
 
 def session(task, sample, reward, lengths, *, paid=(), status=Status.COMPLETED, raw=-0.5):
@@ -290,13 +300,16 @@ def token(task, sample):
     return 3 + 4 * task + sample
 
 
-def scheduled(sessions, tasks, objective, **settings):
+def scheduled(sessions, tasks, objective, further=None, **settings):
     """One synchronous call over `sessions` of `tasks` (`Scripted`), at the starting state of
-    `objective`'s trainer, its packed batch, the scheduler and that state."""
+    `objective`'s trainer, handed `further` where it draws further batches, its packed batch, the
+    scheduler and that state."""
     trainer = Trainer(objective, optax.sgd(0.1), key=jax.random.key(3))
     state = trainer.initial_state()
     scheduler = RolloutScheduler(Synchronous(Scripted(sessions)), **settings)
-    return scheduler(state, {"task_id": np.asarray(tasks, np.int32)}, jax.random.key(0)), scheduler, state
+    drawing = {} if further is None else {"further": further}
+    return (scheduler(state, {"task_id": np.asarray(tasks, np.int32)}, jax.random.key(0), **drawing),
+            scheduler, state)
 
 
 def per_session(packed, values):
@@ -354,6 +367,89 @@ def test_dapo_refuses_a_batch_none_of_whose_groups_vary():
     objective, rollout = composed("dapo", TinyHead(vocab_size=VOCAB), 15)
     with pytest.raises(RuntimeError):
         scheduled(sessions, [0], objective, groups=2, **rollout)
+
+
+def agreeing(task):
+    """Task `task`'s two sessions, one return between them: a group dynamic sampling leaves out."""
+    return [session(task, 0, 1.0, (2,)), session(task, 1, 1.0, (2,))]
+
+
+def varying(task):
+    """Task `task`'s two sessions, returns 0 and 1: a group dynamic sampling admits."""
+    return [session(task, 0, 0.0, (2,)), session(task, 1, 1.0, (2,))]
+
+
+def test_dapo_draws_further_batches_until_its_step_holds_its_groups():
+    """DAPO's dynamic sampling across data batches (arXiv:2503.14476 Algorithm 1; verl's
+    `max_num_gen_batches`): a step short of its `admit` groups once its own batch's agreeing groups are
+    left out draws the stream's next batch (`further`) and admits from it, its groups packed into the
+    step's rows with their own advantages, each further batch sampled under the step's key folded by
+    its place, and draws none once the step is full or `generation_batches` are drawn."""
+    sessions = {str(task): (agreeing if task in (0, 2, 4) else varying)(task) for task in range(5)}
+    objective, rollout = composed("dapo", TinyHead(vocab_size=VOCAB), 15)
+    ahead = iter([[2, 3], [4, 1]])
+    drawn = []
+
+    def further():
+        batch = {"task_id": np.asarray(next(ahead), np.int32)}
+        drawn.append(batch["task_id"].tolist())
+        return batch
+
+    packed, scheduler, _ = scheduled(sessions, [0, 1], objective, further, groups=2, admit=2,
+                                     generation_batches=3, **rollout)
+    assert drawn == [[2, 3]]
+    expected = {}
+    for task in (1, 3):
+        found = np.asarray(group_advantage(jnp.asarray([0.0, 1.0], jnp.float32), 2))
+        expected.update({token(task, sample): float(value) for sample, value in enumerate(found)})
+    mask = np.asarray(packed[RESPONSE_MASK_KEY]) > 0
+    np.testing.assert_array_equal(np.asarray(packed[ADVANTAGES_KEY]) * mask, per_session(packed, expected))
+    assert set(np.asarray(packed[IDS_KEY])[mask].tolist()) == set(expected)
+    collected = scheduler.acquisition.collector.collected
+    key = jax.random.key(0)
+    assert collected == [([0, 1], np.asarray(jax.random.key_data(key)).tolist()),
+                         ([2, 3], np.asarray(jax.random.key_data(jax.random.fold_in(key, 1))).tolist())]
+    assert (scheduler.metrics["groups"], scheduler.metrics["generation_batches"]) == (2.0, 2.0)
+    # Two batches at most: the second's agreeing group leaves the step one group short.
+    ahead = iter([[2, 4], [3, 1]])
+    drawn.clear()
+    _, capped, _ = scheduled(sessions, [0, 1], objective, further, groups=2, admit=2, generation_batches=2,
+                             **rollout)
+    assert drawn == [[2, 4]] and capped.metrics["groups"] == 1.0
+
+
+def test_a_run_drawing_further_batches_resumes_after_the_last_it_drew(tmp_path):
+    """A run whose step draws the stream's next batch to fill its groups (`generation_batches`) reads it
+    through the trainer's stream (`FitRun.further`), whose position its checkpoint saves: its next
+    step reads the batch after the one drawn, and a run resumed from that checkpoint collects what the
+    run that went on collected, the same tasks under the same keys."""
+    from dew.checkpoints import Checkpoints
+    from dew.data.dataset import Loader, replayed
+    from dew.training import Layout
+
+    sessions = {str(task): (agreeing if task == 0 else varying)(task) for task in range(5)}
+    # Eight tasks a batch, one a device: the step's batch admits two groups of the four it takes, and
+    # the batch it draws the other two.
+    batches = [[0, 0, 0, 0, 1, 1, 0, 0], [2, 3, 2, 3, 0, 0, 0, 0], [4, 1, 4, 1, 4, 1, 4, 1],
+               [2, 3, 2, 3, 2, 3, 2, 3]]
+    objective, rollout = composed("dapo", TinyHead(vocab_size=VOCAB), 15)
+
+    def fit(steps, checkpoints=None):
+        collector = Scripted(sessions)
+        scheduler = RolloutScheduler(Synchronous(collector), groups=2, admit=4, generation_batches=3,
+                                     **rollout)
+        stream = Loader(train=replayed(lambda partition: ({"task_id": np.asarray(batch, np.int32)}
+                                                          for batch in batches)),
+                        val=None, records=None, batch=8)
+        trainer = Trainer(objective, optax.sgd(0.1), key=jax.random.key(3), rollout=scheduler,
+                          layout=Layout(min_shard=1, tolerance=1.0), checkpoints=checkpoints)
+        trainer.fit(stream, steps=steps, log_every=steps, checkpoint_every=None if checkpoints is None else 1)
+        return collector.collected
+
+    whole = fit(2)
+    assert [tasks for tasks, _ in whole] == batches[:3]
+    checkpoints = str(tmp_path / "run")
+    assert fit(1, Checkpoints(checkpoints)) + fit(2, Checkpoints(checkpoints)) == whole
 
 
 def test_rloo_pays_its_reference_penalty_in_the_reward_before_the_baseline():

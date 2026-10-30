@@ -309,3 +309,16 @@ def prediction_logits(model, variables, tokens):
     from its hidden states (`CausalTransformer.mtp_logits`)."""
     hidden = model.apply(variables, tokens, method=CausalTransformer.hidden_states)
     return model.apply(variables, hidden, tokens, method=CausalTransformer.mtp_logits)[0]
+
+
+def stepped_decode(model, variables, ids):
+    """`ids` decoded a token a call through the cache one token's call allocates, the calls one program
+    under a scan: the steps' logits `[B, S, V]` and the cache they leave."""
+    def step(cache, column):
+        logits, state = model.apply({**variables, "cache": cache}, column[:, None], decode=True,
+                                    mutable=["cache"])
+        return state["cache"], logits[:, 0]
+
+    cache = model.init(jax.random.key(0), ids[:, :1], decode=True)["cache"]
+    cache, steps = jax.lax.scan(step, cache, jnp.moveaxis(jnp.asarray(ids), 1, 0))
+    return jnp.moveaxis(steps, 0, 1), cache

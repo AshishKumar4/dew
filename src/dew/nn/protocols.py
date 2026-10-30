@@ -668,6 +668,14 @@ class CrossAttending(Protocol):
 
 
 @runtime_checkable
+class Scanning(Protocol):
+    """A decoder whose like layers, and those repeating one period, can run under flax's scan
+    (`CausalTransformer.scan_layers`): CausalTransformer, and a wrapper over one."""
+
+    def with_scanned_layers(self) -> Self: ...
+
+
+@runtime_checkable
 class Differential(Protocol):
     """A decoder whose softmax layers can take DEX's differential on chosen heads (`dew.nn.dex`):
     CausalTransformer, and a wrapper over one."""

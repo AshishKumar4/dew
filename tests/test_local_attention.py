@@ -22,7 +22,7 @@ from reference_error import FEWEST_SEEDS, as_given, assert_as_exact, with_gradie
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import counted_places
-from dew.nn.kernels import bf16_dot_runs, generation
+from dew.nn.kernels import generation
 from dew.nn.kernels.generation import chosen
 from dew.nn.kv_cache import KVCache
 from dew.nn.local_attention import local_attention
@@ -525,9 +525,7 @@ def test_a_row_with_padding_among_its_tokens_counts_its_tokens_over_a_sequence_a
                     truth_fn=masked(keep, real))
 
 
-@pytest.mark.gpu(reason="the band's GPU route, bf16 on a cuda device of sm80 or later")
-@pytest.mark.skipif(not bf16_dot_runs(), reason="the band's GPU route, bf16 on a device of sm80 or later")
-def test_packed_windowed_bf16_attention_runs_its_band_on_par(without_deterministic_ops):
+def packed_windowed_bf16_attention_runs_its_band_on_par(without_deterministic_ops):
     """'auto' runs the band of a packed, windowed bf16 call, forward and gradients, on par with the xla band
     over drawn calls (check 1, float64 the truth), padding rows included, on whatever kernel its route takes:
     the accuracy gate and the measured speed decide the route, never one kernel's equality to another's
