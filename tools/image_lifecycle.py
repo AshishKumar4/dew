@@ -59,8 +59,11 @@ def train(args: Train) -> None:
 def trained(output: Path, steps: int, deterministic: bool) -> list[tuple[str, str]]:
     """Each step and loss a fresh process logs training the model in `output` to `steps` (`train`), under
     XLA's deterministic GPU ops where `deterministic`."""
-    flags = f"{os.environ.get('XLA_FLAGS', '')}{' --xla_gpu_deterministic_ops=true' if deterministic else ''}"
-    env = {**os.environ, "XLA_FLAGS": flags.strip()}
+    # The flag set either way, over any the environment holds.
+    inherited = [flag for flag in os.environ.get("XLA_FLAGS", "").split()
+                 if not flag.startswith("--xla_gpu_deterministic_ops")]
+    flags = [*inherited, f"--xla_gpu_deterministic_ops={'true' if deterministic else 'false'}"]
+    env = {**os.environ, "XLA_FLAGS": " ".join(flags)}
     log = subprocess.run([sys.executable, __file__, "train", "--output", str(output), "--steps", str(steps)],
                          env=env, capture_output=True, text=True, check=True).stdout
     return re.findall(r"^step (\d+)/\d+\s+loss (\S+)", log, re.MULTILINE)
@@ -88,9 +91,10 @@ def compare(args: Compare) -> None:
     resumed = [*trained(runs[1], args.steps // 2, args.deterministic),
                *trained(runs[1], args.steps, args.deterministic)]
     first, second = (weights(run, args.steps) for run in runs)
+    # Bit for bit: their bytes, so -0.0 is not 0.0 and a NaN equals its own bits.
     same = first.keys() == second.keys() and all(
-        first[name].dtype == second[name].dtype and np.array_equal(first[name], second[name])
-        for name in first)
+        (first[name].dtype, first[name].shape, first[name].tobytes())
+        == (second[name].dtype, second[name].shape, second[name].tobytes()) for name in first)
     print(f"states at step {args.steps}: {'equal' if same else 'NOT equal'} ({len(first)} leaves)")
     samples = [hashlib.sha256((run / "samples.png").read_bytes()).hexdigest() for run in runs]
     print(f"samples: {'equal' if samples[0] == samples[1] else 'NOT equal'} ({samples[0]})")
