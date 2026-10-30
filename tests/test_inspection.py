@@ -354,14 +354,19 @@ def test_an_offline_view_restored_mid_window_steps_to_its_commit(tmp_path, split
 
 def test_called_with_reads_the_models_own_call_in_this_trace_alone():
     """The inputs a forward hands a model over its weights are read off that call, past a call another
-    module makes first and past one the same architecture makes over other weights (a guide's), and only
+    module makes first and past one the same architecture makes over other weights, even a guide sharing
+    some of them, and only
     in the caller's own trace: a forward that calls it inside a transform of its own (a `cond`) is refused,
     its inputs that transform's."""
     from dew.nn.inspection import called_with
 
     block, head = Block(), Headed()
     x = jnp.asarray(ROWS)
-    weights, guide = block.init(jax.random.key(0), x), block.init(jax.random.key(2), x)
+    weights = block.init(jax.random.key(0), x)
+    # A guide of the same architecture sharing the policy's bias, its kernel its own.
+    guide = jax.tree_util.tree_map_with_path(
+        lambda path, leaf, own: own if "bias" in jax.tree_util.keystr(path) else leaf,
+        block.init(jax.random.key(2), x), weights)
     head_variables = head.init(jax.random.key(1), x)
 
     def forward(rows):
