@@ -34,6 +34,7 @@ from dew.batch import coordinates
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.hyper_connections import HyperConnections
+from dew.nn.kernels.generation import chosen
 from dew.nn.kernels.selection import KernelRefused
 from dew.nn.kernels.templates.attention import dropout_keep, dropout_seed
 from dew.nn.mixers import AttentionMixer
@@ -353,6 +354,23 @@ def test_a_cached_prompt_reads_its_cache_as_the_uncached_forward(without_determi
     assert_as_exact(lambda params, prompt: step(params, made(params, prompt.shape[0]), prompt)[0],
                     applied(model.clone(attention_impl='xla')), drawn(model, length=6), "cached prefill",
                     seeds=SEEDS['cached prefill'], truth_fn=applied(float64(model)))
+
+
+def test_a_cached_prompt_reads_its_cache_under_a_chosen_template():
+    """A prompt prefilled into the cache under `chosen(attention='template')` builds no mask, so the mask's
+    kernel is never decided and the template takes the call (row 2662: decided eagerly, the template's
+    refusal of a mask raised): its logits on par with the xla kernel's uncached forward from the float64
+    forward over drawn weights and prompts (check 1)."""
+    model = tiny()
+    made, step = decode_steps(model)
+
+    def prefilled(params, prompt):
+        with chosen(attention='template'):
+            return step(params, made(params, prompt.shape[0]), prompt)[0]
+
+    assert_as_exact(prefilled, applied(model.clone(attention_impl='xla')), drawn(model, length=6),
+                    "cached prefill on a chosen template", seeds=SEEDS['cached prefill'],
+                    truth_fn=applied(float64(model)))
 
 
 def test_reference_and_xla_kernels_agree_when_causal():
