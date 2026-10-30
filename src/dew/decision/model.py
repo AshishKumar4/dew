@@ -141,7 +141,7 @@ class DecisionModel(HeadedModel):
             runs = stream_runs(inputs.streams, inputs.segments, inputs.reads, inputs.fragments)
             states, sown = applied(inputs.tokens, train=train, coordinates=laid, attention_key_runs=runs,
                                    attention_key_positions=inputs.positions, method="hidden_states",
-                                   conditioning=conditioning, rngs=rngs)
+                                   conditioning=conditioning, rngs=rngs, **stepped)
             return _array(states), spanned, sown
         if inputs.slots is None:
             def read(module, tokens):
