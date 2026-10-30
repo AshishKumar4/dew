@@ -2,7 +2,9 @@
 the same graph computed in float64, the truth its test measures both arms from.
 
 The committed exports were recorded at 42ddfc14, before the dropout change.
-Run this generator with PYTHONPATH naming that checkout's src directory.
+Run this generator with PYTHONPATH naming that checkout's src directory. The
+exports hold no source locations (`jax_traceback_in_locations_limit` 0), so
+no path of the checkout or the environment that wrote them is in the file.
 """
 import argparse
 import hashlib
@@ -36,6 +38,9 @@ def main():
     parser.add_argument("--dtype", choices=("float32", "float64"), default="float32")
     dtype = parser.parse_args().dtype
     jax.config.update("jax_enable_x64", dtype == "float64")
+    # The graph alone: no traceback frame's file, which would name the machine that wrote it.
+    jax.config.update("jax_traceback_in_locations_limit", 0)
+    jax.config.update("jax_include_full_tracebacks_in_locations", val=False)
     model = CausalTransformer(vocab_size=17, emb_features=8, num_layers=1, num_heads=2,
                              mlp_features=16, max_seq_len=8, attention_impl="reference",
                              precision=jax.lax.Precision.HIGHEST,
