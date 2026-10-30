@@ -1,7 +1,8 @@
 """The one-draw rule (`assert_as_exact_as_the_reference`, `assert_leaves_as_exact`, `assert_no_less_exact`): a
 site's one recorded or drawn comparison, held by its distance from float64 and its rows against the
 reference's (`rows_over`), which G02 moves to check 1 site by site (`reference_error.assert_as_exact`). Its
-rows' sizes and errors, and the gate's findings, are reference_error's, which re-exports these names."""
+rows' sizes and errors, and the gate's findings, are reference_error's; its sites import it from here.
+"""
 
 import math
 
@@ -25,14 +26,14 @@ def rows_over(dew, reference, truth, terms=None, floor: float = 0.0) -> list[tup
     over = []
     if sized.any():
         # Compared by their logs, so a row's error over its size orders where the quotient overflows.
-        row = float(np.max(gate._log_over(mine[sized], sizes[sized])))
-        their_row = float(np.max(gate._log_over(theirs[sized], sizes[sized])))
-        allowed = max(their_row, float(gate._log_over(floor, 1.0)))
+        row = float(np.max(gate.log_over(mine[sized], sizes[sized])))
+        their_row = float(np.max(gate.log_over(theirs[sized], sizes[sized])))
+        allowed = max(their_row, float(gate.log_over(floor, 1.0)))
         if not row <= math.log(gate.ROW_FACTOR) + allowed:
             over.append(("row", row - allowed,
-                         f"the worst row is {gate._shown(row)} from float64 over its size, the reference's "
-                         f"{gate._shown(their_row)}, allowed "
-                         f"{gate._shown(math.log(gate.ROW_FACTOR) + allowed)}"))
+                         f"the worst row is {gate.shown(row)} from float64 over its size, the reference's "
+                         f"{gate.shown(their_row)}, allowed "
+                         f"{gate.shown(math.log(gate.ROW_FACTOR) + allowed)}"))
     zero = ~sized & ~(mine <= gate.ROW_FACTOR * theirs)
     if zero.any():
         at = int(np.flatnonzero(zero)[0])
