@@ -158,3 +158,23 @@ def test_a_run_over_two_devices_that_sets_its_remat_is_told_the_rung_its_derivat
     assert derived and derived[0]["remat"] is None and derived[-1]["label"] == "fits"
     assert not [record for record in caplog.records if "compiling it again" in record.getMessage()]
     assert [record for record in caplog.records if "recomputes less" in record.getMessage()]
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_run_over_a_tensor_axis_that_sets_its_remat_hears_its_derivation_cannot_judge_it(
+        monkeypatch, tmp_path, caplog):
+    """A run over a tensor axis of two that sets full recomputation, whose footprint the derivation reads
+    per device only over data and fsdp axes, hears once that its derivation cannot judge its layout,
+    rather than nothing, and compiles at its own rung alone (row 2721; 2615 stays open for such layouts)."""
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "tensor"))
+    free(monkeypatch, LIMIT)
+    model = CausalTransformer(vocab_size=64, emb_features=32, num_layers=8, num_heads=2, mlp_features=64,
+                              max_seq_len=256, remat=REMAT_POLICIES["full"])
+    trainer = Trainer(LMObjective(model, seq_len=256), optax.sgd(1e-2), key=jax.random.key(0), split=1,
+                      mesh=MeshSpec(tensor=2).build(jax.devices()[:2]))
+    with caplog.at_level(logging.WARNING, logger="dew"), Compiles("step") as compiles:
+        compiled(trainer)
+    assert compiles.count == 1 and trainer.plan["remat"] == "full"
+    assert trainer.plan["derived"][-1]["label"] == "unknown"
+    assert len([record for record in caplog.records if record.name == "dew.training.planning"]) == 1
+
