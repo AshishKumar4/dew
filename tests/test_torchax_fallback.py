@@ -1122,7 +1122,8 @@ def test_a_tier_3_source_generates_through_the_pipeline_loader_as_its_bundle_doe
 def test_a_tier_3_model_decodes_through_dews_cache_as_transformers_runs_each_prefix(family, stated, tmp_path):
     """A tier-3 model on Dew's attention decodes through Dew's cache: a padded prompt fills its row's
     slots and each next token one more, and every decoded step's logits hold check 1 against
-    transformers' full forward of that row's prefix (its float64 twin's the truth), Cohere 2's window
+    transformers' full forward of that row's prefix, each step's its own at the width it reads (ledger
+    1543; its float64 twin's one forward the truth), Cohere 2's window
     included, the padding stated by a validity mask or as the document 0 of the row's segments; its
     greedy generation's tokens are the full forward's argmax at each step."""
     from dew.inference import TextGeneration
@@ -1170,20 +1171,25 @@ def test_a_tier_3_model_decodes_through_dews_cache_as_transformers_runs_each_pre
     def ours(prompt, valid, continued):
         return np.asarray(decoded(loaded.variables, prompt, valid, continued), np.float64)
 
-    def theirs(source, precision=contextlib.nullcontext):
+    def theirs(source, precision=contextlib.nullcontext, *, stepped: bool = True):
+        def forward(ids):
+            with precision(), torch.no_grad():
+                return source(torch.from_numpy(ids[None]).long()).logits[0].double().numpy()
+
         def run(prompt, valid, continued):
             rows = []
             for row in range(2):
                 ids = np.concatenate([prompt[row][valid[row]], continued[row]])
-                with precision(), torch.no_grad():
-                    logits = source(torch.from_numpy(ids[None]).long()).logits[0].double().numpy()
                 real = int(valid[row].sum())
-                rows.append(logits[real - 1:real + steps])
+                if stepped:
+                    rows.append(np.stack([forward(ids[:real + step])[-1] for step in range(steps + 1)]))
+                else:
+                    rows.append(forward(ids)[real - 1:real + steps])
             return np.stack(rows)
         return as_given(run)
 
     assert_as_exact(ours, theirs(reference), draw, f"{family} cached logits ({stated})",
-                    seeds=DECODE_SEEDS[family], truth_fn=theirs(wide, float64))
+                    seeds=DECODE_SEEDS[family], truth_fn=theirs(wide, float64, stepped=False))
 
     # The rows' coordinates state the same validity and positions as their separate fields.
     prompt, valid, _ = draw(0)
