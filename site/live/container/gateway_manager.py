@@ -5,6 +5,7 @@ small private tmpfs scratch mounts. Models and compiled programs belong to the
 separate serving uid and are never loaded into these kernel processes.
 """
 
+import asyncio
 import json
 import os
 import queue
@@ -18,7 +19,7 @@ from kernel_gateway.services.kernels.manager import (
     KernelGatewayIOLoopKernelManager,
     SeedingMappingKernelManager,
 )
-from traitlets import default
+from traitlets import Set, default
 
 _uids = queue.SimpleQueue()
 for _uid in GUEST_UIDS:
@@ -154,9 +155,13 @@ class LimitedMappingKernelManager(SeedingMappingKernelManager):
     """The gateway's kernels, each launched isolated (`LimitedKernelManager`), and culled by jupyter-server's
     own culler once no connection holds one and it has been idle for the live contract's idle time
     (`guests.idle_seconds`), looked for every tenth of it: a kernel whose create the bridge gave up on while
-    the gateway went on making it, which no context, close or cleanup knows (ledger 843). A page's kernels
-    hold the bridge's channels, and an IPC client's (benchmark_gateway.py) is active while its requests
-    run."""
+    the gateway went on making it, which no context, close or cleanup knows. A page's kernels hold the
+    bridge's channels, and an IPC client's (benchmark_gateway.py) is active while its requests run.
+
+    A kernel whose restarts failed leaves the map with its resources released (`_handle_kernel_died`)."""
+
+    _releasing = Set()
+    """The releases of dead kernels' resources under way (`_handle_kernel_died`)."""
 
     @default("kernel_manager_class")
     def _kernel_manager_class_default(self):
@@ -169,3 +174,15 @@ class LimitedMappingKernelManager(SeedingMappingKernelManager):
     @default("cull_interval")
     def _cull_interval_default(self):
         return max(1, idle_seconds() // 10)
+
+    def _handle_kernel_died(self, kernel_id):
+        """A kernel whose restarts failed, as the guests' OOM killer leaves one under memory pressure, its
+        connection file, ports and isolation released before it leaves the map: jupyter-server drops it
+        releasing none (2.21.1's `_handle_kernel_died`), so its connection file outlived its page's close,
+        no delete reaching a kernel the gateway no longer holds (ledger 843: "contexts left open after their
+        pages closed")."""
+        # The gateway's kernel managers are asynchronous: the release runs on its loop, held till it ends.
+        released = asyncio.ensure_future(self.get_kernel(kernel_id).cleanup_resources(restart=False))
+        self._releasing.add(released)
+        released.add_done_callback(self._releasing.discard)
+        super()._handle_kernel_died(kernel_id)

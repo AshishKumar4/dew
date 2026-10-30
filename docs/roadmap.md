@@ -116,7 +116,7 @@ The kernel direction (owner, 2026-10-21; [design](design/kernel-templates.md)): 
 - Record reconstructible library stages and importable user functions in `run.json`. [213]
 - Qualify deterministic online shard coverage and replay on multiple physical hosts. [227]
 - Add native writers and a Spark handoff through the shared sink interface. [232]
-- Compare augmentation policies on fixed data and measure worker scaling when a corpus has one physical shard. [234, 573]
+- Measure worker scaling when a corpus has one physical shard. [573]
 - Remove duplicated worker-shutdown policy by using Grain's lifecycle interface. [DAT-10]
 - Qualify URL-caption fetching through `images.fetch` and `video.fetch` against the previous online flow on CC3M and WebVid. [155]
 - Cache automatically where a chain's leading steps expand records or reject them in a read by index, and in streamed reads: today a cache there is read back as a stream, slower than the steps it stands for, so only memory and indexed reads of one-for-one maps cache on their own. Key an image decode by the content of an image a record names by path, so decodes cache on their own too. [803]

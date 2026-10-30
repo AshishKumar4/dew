@@ -69,6 +69,14 @@ def _product(layer: nn.Dense | nn.DenseGeneral):
     return template.dot_general(product) if plain and not intercepted() else product
 
 
+def plain_product():
+    """The product a plain `Dense` multiplies by (`_product` of a layer naming no product of its own):
+    the GEMM template's where a launch takes it, else lax's with its fp32 sum taken in float64 on a CPU
+    under Dew's tests, and lax's alone where a wrapper owns the products (`intercepted`). A product read
+    apart from its layer, as a vocabulary head's table reads `project_out` (`Projection`), takes it."""
+    return _accumulated_dot_general if intercepted() else template.dot_general(_accumulated_dot_general)
+
+
 def _accumulated_dot_general(lhs, rhs, dimension_numbers, precision=None, preferred_element_type=None,
                              **kwargs) -> jax.Array:
     """`jax.lax.dot_general` as stated, its fp32 sum taken in float64 on a CPU under Dew's tests

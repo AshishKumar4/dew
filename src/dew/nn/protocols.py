@@ -37,7 +37,6 @@ callers add flags and absent values.
 from __future__ import annotations
 
 import dataclasses
-import functools
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Literal, Protocol, Self, runtime_checkable
 
@@ -49,7 +48,7 @@ from flax.typing import PrecisionLike, VariableDict
 from jax.typing import DTypeLike
 
 from dew.nn.inputs import ModelKwarg
-from dew.nn.precision import accumulated, capped_logits, head_product, scaled_logits
+from dew.nn.precision import capped_logits, head_product, scaled_logits
 
 if TYPE_CHECKING:
     from dew._records import JSON
@@ -155,8 +154,8 @@ class Projection:
     (`OutputTable.projection`): an embedding of its own width's `project_out` (OPT-350m's), its
     `kernel` `[features, width]` as the layer multiplies by it (an adapter's update included), after a
     checkpoint's quantizer of the layer's input, its operands promoted to `compute` as the layer
-    promotes them and multiplied at `precision`, the fp32 sum taken in float64 on a CPU under Dew's tests
-    (`accumulated`), as the layer's plain product takes it."""
+    promotes them and multiplied at `precision` by the layer's own plain product (`dense.plain_product`:
+    the GEMM template's route, the fp32 sum taken in float64 on a CPU under Dew's tests)."""
 
     kernel: jax.Array
     precision: PrecisionLike = struct.field(pytree_node=False, default=None)
@@ -165,11 +164,12 @@ class Projection:
 
     def __call__(self, hidden: jax.Array) -> jax.Array:
         """`hidden` `[..., features]` projected to `[..., width]`."""
+        from dew.nn.dense import plain_product
+
         hidden = hidden if self.input_quantizer is None else self.input_quantizer.qdq(hidden)
         dtype = jnp.result_type(hidden, self.kernel) if self.compute is None else self.compute
-        product = functools.partial(jax.lax.dot_general, precision=self.precision,
-                                    dimension_numbers=(((jnp.ndim(hidden) - 1,), (0,)), ((), ())))
-        return accumulated(product, hidden.astype(dtype), self.kernel.astype(dtype))
+        return plain_product()(hidden.astype(dtype), self.kernel.astype(dtype),
+                               (((jnp.ndim(hidden) - 1,), (0,)), ((), ())), precision=self.precision)
 
 
 @struct.dataclass

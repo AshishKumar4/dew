@@ -1870,6 +1870,23 @@ def test_a_helper_added_under_tests_reruns_only_the_runs_that_imported_a_module_
     assert planned() == ["tests/test_a.py", "tests/test_b.py", "tests/test_c.py"]
 
 
+def test_a_helper_named_as_a_module_only_a_child_process_imported_reruns_its_file(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A module only a test's child process imports (a tool run as a script) is that file's input as one its
+    own process imports is: a helper of its name added under tests/ reruns the file (row 2502: the recorder
+    named the pytest process's imports alone, so such a helper kept the file's green key)."""
+    verdict, planned = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
+    written(tmp_path, {"test_c.py": "import subprocess, sys\nfrom pathlib import Path\n"
+                                    "def test_c():\n"
+                                    "    with Path('runs-c').open('a') as runs: runs.write('x')\n"
+                                    "    subprocess.run([sys.executable, '-c', 'import wave'],\n"
+                                    "                   check=True)\n"})
+    armada_task(ci, monkeypatch, verdict)
+    assert planned() == ["tests/test_a.py tests/test_b.py tests/test_c.py"]
+    (tmp_path / "tests/wave.py").write_text("")
+    assert planned() == ["tests/test_a.py tests/test_b.py", "tests/test_c.py"]
+
+
 def test_a_task_on_another_pinned_class_reuses_the_rows_its_plan_kept(
         ci, tmp_path, monkeypatch, cache_worker):
     """The files a plan keeps for reuse, their rows green on any class the tasks are pinned to, are reused by

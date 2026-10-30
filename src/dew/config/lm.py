@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Mapping
-from typing import Annotated, ClassVar, NamedTuple
+from typing import TYPE_CHECKING, Annotated, ClassVar, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -32,6 +32,9 @@ from dew.objectives.lm.objective import Samples
 from dew.optim import OptimConfig
 from dew.registry import ModelConfig, objectives
 from dew.sampling.text import Sampling
+
+if TYPE_CHECKING:
+    from dew.objectives.rl.methods import RolloutSettings
 
 
 class Tokens(NamedTuple):
@@ -53,7 +56,8 @@ class PromptRollout:
     `method` names a composition (`dew.objectives.rl.methods`: grpo, dapo, dr_grpo, gspo, cispo, gmpo,
     reinforce_pp, rloo), which fixes the objective's settings it names, stated `--objective.*`
     arguments refused, and the rollout's estimator, dynamic sampling and overlong punishment over
-    `max_new_tokens`; `estimator` is then the method's.
+    `max_new_tokens`, ramping over its last `overlong_cache` tokens (a quarter of it where None);
+    `estimator` is then the method's.
 
     `reward` names it by its import path: a function of a completion's text and its prompt's record
     (`dew.objectives.rl.Reward`), or a class whose instance at its defaults is one
@@ -68,6 +72,7 @@ class PromptRollout:
     sampling: Sampling = dataclasses.field(default_factory=lambda: Sampling(temperature=1.0))
     method: str | None = None
     admit: int | None = None
+    overlong_cache: int | None = None
 
     def __post_init__(self) -> None:
         from dew.objectives.rl.methods import method
@@ -89,6 +94,12 @@ class PromptRollout:
         check_truncation(self.truncation)
         if self.admit is not None and (type(self.admit) is not int or self.admit < 1):
             raise ValueError("admit is a positive number of each batch's prompts' groups, or None for all")
+        if self.overlong_cache is not None and (
+                self.method is None or not method(self.method).overlong
+                or type(self.overlong_cache) is not int
+                or not 0 < self.overlong_cache <= self.max_new_tokens):
+            raise ValueError("overlong_cache is the last tokens of the budget a method's overlong punishment "
+                             "ramps over (dapo's): positive, within max_new_tokens")
 
     def objective_settings(self) -> Mapping[str, object]:
         """The objective settings `method` fixes, which the run derives (`ObjectiveConfig.build`)."""
@@ -96,13 +107,21 @@ class PromptRollout:
 
         return {} if self.method is None else method(self.method).settings(self.max_new_tokens)
 
+    def scheduler_settings(self) -> RolloutSettings:
+        """The scheduler's settings: `method`'s (`Method.rollout`, its overlong window `overlong_cache`'s),
+        else the estimator's, `group` by default."""
+        from dew.objectives.rl.methods import RolloutSettings, method
+
+        if self.method is None:
+            return RolloutSettings(estimator=self.estimator or "group")
+        return method(self.method).rollout(self.max_new_tokens, self.overlong_cache)
+
     def build(self, objective, decode):
         """The scheduler drawing over `objective`'s policy, decoding completions with `decode`."""
         from numbers import Real
 
         from dew.data.prompts import PromptRecord
         from dew.objectives.rl import RolloutScheduler
-        from dew.objectives.rl.methods import Rollout, method
         from dew.registry import imported
 
         # An import path names a function or a class, which an instance of at its defaults is a reward.
@@ -114,12 +133,10 @@ class PromptRollout:
             if not isinstance(score, Real):
                 raise ValueError(f"the reward {self.reward} scored {type(score).__name__}, not a number")
             return float(score)
-        settings = (Rollout(estimator=self.estimator or "group") if self.method is None
-                    else method(self.method).rollout(self.max_new_tokens))
         return RolloutScheduler.sampled(objective, reward,
                                         decode=decode, groups=self.groups, max_new_tokens=self.max_new_tokens,
                                         truncation=self.truncation, sampling=self.sampling, admit=self.admit,
-                                        **settings)
+                                        **self.scheduler_settings())
 
 
 @dataclasses.dataclass(frozen=True)
