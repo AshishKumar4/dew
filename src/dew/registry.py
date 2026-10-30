@@ -171,8 +171,7 @@ def module_from_file(path: str | os.PathLike[str], name: str, *, beside: bool = 
     to this one. A name that is another module's, imported or importable (the standard library's
     `json` for a `json.py`), or a package's module (a dotted name), is refused rather than shadowed
     or read in its place, the process as it was. `beside` puts the file's directory first on the path
-    once the file is accepted, as `python -m` runs one beside its siblings, so it imports them; a file
-    that fails as it runs leaves the path as it was."""
+    once the file is accepted, as `python -m` runs one beside its siblings, so it imports them."""
     location = Path(path).resolve()
     if "." in name:
         raise ValueError(f"{location} would import as {name}, a module of the package "
@@ -190,17 +189,13 @@ def module_from_file(path: str | os.PathLike[str], name: str, *, beside: bool = 
     if spec is None or spec.loader is None:
         raise ValueError(f"{location} is not a Python file")
     module = importlib.util.module_from_spec(spec)
-    directory = str(location.parent)
-    placed = beside and directory not in sys.path
-    if placed:
-        sys.path.insert(0, directory)
+    if beside and str(location.parent) not in sys.path:
+        sys.path.insert(0, str(location.parent))
     sys.modules[name], _FILES[name] = module, location
     try:
         spec.loader.exec_module(module)
     except BaseException:
         del sys.modules[name], _FILES[name]
-        if placed:
-            sys.path.remove(directory)
         raise
     return module
 
