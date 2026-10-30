@@ -10,7 +10,8 @@ import optax
 import pytest
 from reference_error import as_given, assert_as_exact, seeds_for
 
-from dew.optim import NEWTON_SCHULZ, delta_gradient_descent, scale_by_m3
+from dew.newton_schulz import NEWTON_SCHULZ
+from dew.optim import delta_gradient_descent, scale_by_m3
 
 M3_FACTORS = {"beta1": 0.9, "beta2": 0.99, "beta3": 0.5, "alpha": 0.3, "eps": 1e-2, "frequency": 3}
 """M3's factors in the proofs below: three updates a chunk, so seven updates close two chunks. An `eps`

@@ -25,12 +25,12 @@ from sharded import collectives
 from test_nested_learning_optim import muon_orthogonalized, newton_schulz_reference
 
 from dew.batch import coordinates
+from dew.newton_schulz import NEWTON_SCHULZ, orthogonalized
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.dit import SimpleDiT
 from dew.nn.kernels.generation import run_precision
 from dew.nn.precision import ACCURATE, Numerics
 from dew.optim import (
-    NEWTON_SCHULZ,
     OPTIMIZER_MAP,
     Cosine,
     Exponential,
@@ -46,7 +46,6 @@ from dew.optim import (
     learning_rate,
     muon_partition,
     muon_weight_dimension_numbers,
-    orthogonalized,
     rates_of,
     scale_by_qk_clip,
     stepped,
