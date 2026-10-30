@@ -712,54 +712,55 @@ def test_a_pass_the_mosaic_mainloop_declines_reports_its_reason_under_its_row():
     assert (refused.code, refused.row) == ("dropout", generation.INHERENT)
 
 
-@pytest.mark.parametrize("target", [None, "sm80", "sm90"], ids=["cpu", "a100", "h100"])
-@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
-def test_an_accurate_call_on_the_default_route_runs_the_template_or_the_reference_path(target, dtype):
-    """Under `generation.chosen(attention_form='accurate')`, the default route ('auto') runs a call on the
-    template or the reference path, which compute the form, never on an old route, whose arithmetic is
-    its own (row 2350: FlashAttention, cuDNN, xla and splash ran an accurate run's calls fast); the fast
-    form keeps its kernels as before."""
-    import contextlib
-
-    from dew.nn.attention import attention_case
-    from dew.nn.attention_kernels import ATTENTION
-    from dew.nn.kernels.generation import assumed, chosen
-    from dew.nn.kernels.selection import select
-
-    query = jnp.zeros((2, 64, 4, 32), dtype)
-    placed = contextlib.nullcontext() if target is None else assumed(target)
-    with placed:
-        with chosen(attention_form="accurate"):
-            accurate = select(ATTENTION, attention_case(query, query, causal=True)).kernel
-        fast = select(ATTENTION, attention_case(query, query, causal=True)).kernel
-    assert accurate in ("template", "reference"), accurate
-    # On a GPU the fast form takes an old route (FlashAttention's, xla's), which the accurate one refuses;
-    # a CPU runs both on the reference path.
-    if target is not None:
-        assert fast not in ("template", "reference"), fast
-    else:
-        assert fast == accurate
-
-
-@pytest.mark.gpu(reason="a GPU's fp32 products default to TF32, which a CPU's never do")
-def test_an_accurate_call_the_template_refuses_runs_the_reference_path_on_ieee_products():
-    """An accurate call the template does not take on a GPU, one with an arbitrary mask, runs the
-    reference path, whose fp32 products the accurate form holds to IEEE fp32 (`Precision.HIGHEST`),
-    never TF32, forward and backward, so a run recorded accurate computes in its form (row 2350's
-    review, Attention)."""
-    import re
-
+def routed_call(form: str):
+    """A causal call on the default route ('auto') under `form` (`generation.chosen`), at JAX's own default
+    matmul precision, as a run's default numerics multiply (the suite's environment states 'highest'), as
+    a function of `(query, key, value, sinks, dout)`: its output, then its gradients (`with_gradients`)."""
     from dew.nn.kernels.generation import chosen
 
-    query = jnp.ones((1, 64, 4, 32), jnp.float32)
-    mask = jnp.tril(jnp.ones((64, 64), bool))[None, None]
+    def call(query, key, value, sinks):
+        with chosen(attention_form=form), jax.default_matmul_precision("default"):
+            return scaled_dot_product_attention(query, key, value, causal=True, sinks=sinks)
 
-    def attend(query):
-        # A caller's explicit default precision, which the float32 products keep where it is named.
-        return attention.scaled_dot_product_attention(query, query, query, mask=mask,
-                                                      precision=jax.lax.Precision.DEFAULT)
+    return with_gradients(call)
 
-    with chosen(attention_form="accurate"):
-        lowered = jax.jit(jax.grad(lambda query: attend(query).sum())).lower(query).as_text()
-    dots = [line for line in lowered.splitlines() if "dot_general" in line and "f32" in line]
-    assert dots and all(re.search(r"precision = \[HIGHEST, HIGHEST\]", line) for line in dots), dots
+
+ieee_reference = with_gradients(functools.partial(scaled_dot_product_attention, causal=True,
+                                                  implementation="reference",
+                                                  precision=jax.lax.Precision.HIGHEST))
+"""The causal call on the reference path at IEEE float32 products (`Precision.HIGHEST`), the arithmetic
+an accurate run's form states: its output and its gradients (`with_gradients`)."""
+
+
+def accurate_draws():
+    """The inputs that tell an accurate call from a fast one, each a check-1 draw: float32 rows; bfloat16
+    rows, whose fast kernels keep less than IEEE fp32 products (on an H100 the fast form's error is 8
+    times the reference's); and float32 products past the largest float before the scale, which a fast
+    path multiplying first overflows (`test_attention_stability`)."""
+    from test_attention_stability import _product_past_largest
+
+    return {"float32": drawing(QUERIES, KEYS, jnp.float32, sinks=False),
+            "bfloat16": drawing(QUERIES, KEYS, jnp.bfloat16, sinks=False),
+            "products past the largest float": _product_past_largest}
+
+
+@pytest.mark.kernel
+@pytest.mark.parametrize("case", ["float32", "bfloat16", "products past the largest float"])
+def test_an_accurate_call_on_the_default_route_is_on_par_with_ieee_fp32(case):
+    """Under `generation.chosen(attention_form='accurate')`, a call on the default route ('auto'), whichever
+    kernel it takes, is on par with the reference path's IEEE float32 products forward and backward,
+    measured from float64 (check 1; row 2350: an accurate run's calls ran fast on FlashAttention, cuDNN,
+    xla and splash), over inputs a fast kernel fails on (`accurate_draws`); the kernel lab's GPU tier runs
+    it on each target GPU."""
+    assert_as_exact(jax.jit(routed_call("accurate")), jax.jit(ieee_reference), accurate_draws()[case],
+                    f"the accurate form on the default route, {case}", seeds=SEEDS)
+
+
+@pytest.mark.gpu(reason="a GPU's default route takes fast kernels for the fast form, which a CPU never does")
+@pytest.mark.parametrize("case", ["bfloat16", "products past the largest float"])
+def test_the_fast_form_on_a_gpus_default_route_is_not_on_par_with_ieee_fp32(case):
+    """On a GPU the fast form's default route fails check 1 against IEEE fp32 products where the accurate
+    form passes it (`accurate_draws`): the accurate test's inputs tell the two routes apart (row 2556)."""
+    with pytest.raises(AssertionError):
+        assert_as_exact(jax.jit(routed_call("fast")), jax.jit(ieee_reference), accurate_draws()[case],
+                        f"the fast form on the default route, {case}", seeds=SEEDS)

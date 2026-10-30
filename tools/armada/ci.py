@@ -878,6 +878,16 @@ def targeted(python: str, arguments: list[str], report: Path) -> int:
                           check=False).returncode
 
 
+def ynn_switched(cases) -> list[dict]:
+    """The accuracy gate's sites a file's cases moved onto YNNPACK's fusions (each case's JUnit property
+    `ynn_switched`, tests/conftest.py), green cases included: each its test node, label and XLA:CPU's
+    refusal, as every row a task runs carries them for the train report to count, an empty list where
+    nothing moved, so a row without the field is one recorded before it, uncounted."""
+    return [{"node": node_of(case), **site} for case in cases
+            for item in case.iter("property") if item.get("name") == "ynn_switched"
+            for site in json.loads(item.get("value") or "[]")]
+
+
 def apportioned(own_seconds: Mapping[str, float], wall: float, rows: int) -> dict[str, float]:
     """Each file's share of a task's `wall` time, in proportion to its tests' own times (`task`), or an
     even split over the task's `rows` (a file named twice is two) where no test recorded a time."""
@@ -1040,6 +1050,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
                      "tests": {node_of(case): float(case.get("time") or 0) for case in own},
                      # Its tests pytest marks whole_suite (executed.py), which `slow` never flags.
                      **{key: cells for key, cells in counts.get(name, {}).items() if key in MARKED},
+                     "ynn_switched": ynn_switched(own),
                      "timings": {row(python, name, ""): seconds}, **cause})
     out.write_text(json.dumps({"rows": rows + ran}))
     if coverage is None and not release:
