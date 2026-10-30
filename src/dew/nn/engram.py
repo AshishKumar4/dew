@@ -95,6 +95,9 @@ class Engram:
     ple_conv_kernel_size: int | None = None
     """Qwen4-Exp's per-layer embedding: each lookup a `PLELayer`, its conv of this many taps
     `max_ngram_size` apart; None for V4.1's `EngramLayer`."""
+    ple_bias: bool = False
+    """Whether a `PLELayer`'s key and value projections add biases: DeepSeek's demo Engram's and
+    MaxText's (maxtext/layers/engram.py), whose layer the PLE layer computes; Qwen4-Exp's add none."""
     table_parts: int = 1
     """The equal row shards each table is stored in (Qwen4-Exp's `split_ngram_parts`), a PLE layer's
     table one leaf of them stacked (`PLELayer`), each written back as stored."""
@@ -111,6 +114,9 @@ class Engram:
                 f"{len(self.num_embeddings)} for layers {self.layer_ids}")
         if self.max_ngram_size < 2 or self.n_heads < 1 or self.head_dim < 1 or self.row_multiple < 1:
             raise ValueError("an engram hashes n-grams of two tokens or more over one head or more")
+        if self.ple_bias and self.ple_conv_kernel_size is None:
+            raise ValueError("ple_bias biases a PLE layer's projections, which V4.1's engram layer has "
+                             "none of")
         if not 0 < self.compressed_vocab_size < 2 ** 24:
             raise ValueError(
                 f"compressed ids are hashed exactly below 2**24, got a compressed "
@@ -399,7 +405,8 @@ class Embedded(nn.Module):
 
 class PLELayer(nn.Module):
     """Qwen4-Exp's n-gram per-layer embedding, added to the residual streams
-    (`Qwen4ExpTextPLELayer`, modeling_qwen4_exp.py:1117-1190).
+    (`Qwen4ExpTextPLELayer`, modeling_qwen4_exp.py:1117-1190), which is DeepSeek's demo Engram as
+    MaxText computes it (maxtext/layers/engram.py:496-695), its projections biased there (`use_bias`).
 
     The looked-up rows of `shards` (`ShardedTable`) project to one key per
     stream (`key_proj`) and one shared value (`value_proj`). Each stream's
@@ -423,6 +430,7 @@ class PLELayer(nn.Module):
     kernel_size: int
     dilation: int
     parts: int = 1
+    use_bias: bool = False
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
@@ -434,7 +442,7 @@ class PLELayer(nn.Module):
         table = ShardedTable(self.parts, self.rows, self.head_dim, name='shards')
         dtype = streams.dtype if self.dtype is None else self.dtype
         looked = table(hash_ids).astype(dtype).reshape(batch, length, -1)
-        dense = functools.partial(Dense, use_bias=False, dtype=self.dtype, precision=self.precision,
+        dense = functools.partial(Dense, use_bias=self.use_bias, dtype=self.dtype, precision=self.precision,
                                   dot_general=float32_dot_general)
         norm = functools.partial(RMSNorm, epsilon=self.norm_eps, scale_offset=True, groups=hc, dtype=dtype)
         key = norm(name='norm_key')(dense(hc * width, name='key_proj')(looked))

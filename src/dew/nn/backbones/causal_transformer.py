@@ -1015,7 +1015,8 @@ class CausalTransformer(nn.Module):
             engram=None if spec.engram is None or self.engram is None else functools.partial(
                 EngramLayer if self.engram.ple_conv_kernel_size is None else functools.partial(
                     PLELayer, kernel_size=self.engram.ple_conv_kernel_size,
-                    dilation=self.engram.max_ngram_size, parts=self.engram.table_parts),
+                    dilation=self.engram.max_ngram_size, parts=self.engram.table_parts,
+                    use_bias=self.engram.ple_bias),
                 rows=self.engram.num_embeddings[spec.engram], head_dim=self.engram.head_dim,
                 hc_mult=self.hyper_connections.hc_mult if self.hyper_connections else 1,
                 emb_features=self.emb_features, norm_eps=self.norm_eps,

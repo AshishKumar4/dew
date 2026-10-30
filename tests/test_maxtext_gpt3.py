@@ -1,7 +1,7 @@
 """MaxText's GPT-3 (maxtext 0.2.5, maxtext/models/gpt3.py) in Dew's decoder: learned positions added to
 the tied token embedding, LayerNorms whose weight is stored as its offset from one (`OffsetLayerNorm`)
 with biases, fused-projection attention with biases, a tanh-GELU MLP with biases, and logits by the
-embedding. MaxText's run over drawn weights and tokens is recorded (tools/gpt3_maxtext_reference.py,
+embedding. MaxText's run over drawn weights and tokens is recorded (tools/maxtext_reference.py gpt3,
 `maxtext/` fixtures); Dew's float32 logits are as exact as MaxText's against float64 (check 1)."""
 
 from pathlib import Path
@@ -15,7 +15,7 @@ from reference_error import assert_as_exact, indexed_recording, recording
 FIXTURE = Path(__file__).parent / "fixtures" / "maxtext" / "gpt3.npz"
 SHAPE = {"emb": 16, "heads": 2, "head_dim": 8, "mlp": 64, "layers": 2, "vocab": 64, "positions": 64,
          "tokens": 8}
-"""gpt3-52k's shape at two layers and a vocabulary and position table of 64 (tools/maxtext_gpt3_worker.py)."""
+"""gpt3-52k's shape at two layers and a vocabulary and position table of 64 (tools/maxtext_worker.py)."""
 GPT3_SEEDS = 8
 """The declared seeds, sized by `seeds_for` paired as the recording confirmed them."""
 
@@ -41,10 +41,15 @@ def maxtext_layout() -> dict[str, tuple[int, ...]]:
 def draw(seed: int) -> dict[str, np.ndarray]:
     """A seed's MaxText weights and tokens: kernels and tables at a deviation of 0.1, the norms' offsets
     and every bias at 0.5, so none sits at its initialization (MaxText's own GPT-3 test draws its
-    norms and biases off zero, tests/unit/gpt3_test.py), and eight tokens."""
+    norms and biases off zero, tests/unit/gpt3_test.py), and eight tokens. The token table is drawn
+    exact in bfloat16: MaxText 0.2.5 reads the tied table in bfloat16 for the logits whatever its
+    dtype (maxtext/layers/embeddings.py:199-204, `attend_on_embedding`), a rounding of its own, which a
+    bfloat16-exact table makes the identity, so both compute the architecture's logits."""
     rng = np.random.default_rng([878, seed])
     drawn = {f"param.{path}": (rng.normal(0, 0.5 if path.endswith(("scale", "bias")) else 0.1, shape)
                                .astype(np.float32)) for path, shape in maxtext_layout().items()}
+    table = "param.token_embedder/embedding"
+    drawn[table] = np.asarray(jnp.asarray(drawn[table], jnp.bfloat16), np.float32)
     return {**drawn, "ids": rng.integers(0, SHAPE["vocab"], (1, SHAPE["tokens"])).astype(np.int32)}
 
 
