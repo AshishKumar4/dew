@@ -11,8 +11,9 @@ The loss is the released trainer's form (NVlabs/DiffusionNFT at cbb14f84, script
 x0 = x_t - t v, against the sample, its squared error over the sample's coordinates divided by the
 detached mean absolute error (floored at 1e-5), the two mixed by r, divided by beta and scaled by the
 advantage clip; plus `kl` (the release's train.beta, 1e-4) times the mean squared difference of the
-live velocity from the base model's (:962-967). An advantage is the reward less its prompt group's mean over the global standard
-deviation of the batch's rewards plus 1e-4 (flow_grpo/stat_tracking.py:14-30, `global_std`); r is
+live velocity from the base model's (:962-967). An advantage is the reward less its prompt group's
+mean over the global standard deviation of the batch's rewards plus 1e-4 (flow_grpo/stat_tracking.py
+:14-30, `global_std`); r is
 that advantage clipped to the clip and mapped to [0, 1] (train_nft_sd3.py:910-929). The old policy
 is the EMA slot, which follows the trained weights at `old_decay` once an update
 (train_nft_sd3.py:1033-1038, the release's decay_type 1), and samples every rollout (:640-660); the
