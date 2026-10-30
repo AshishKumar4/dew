@@ -64,7 +64,9 @@ def test_an_accurate_call_on_the_default_route_is_on_par_with_ieee_fp32(case):
 @pytest.mark.parametrize("case", ["bfloat16", "products past the largest float"])
 def the_fast_form_on_a_gpus_default_route_is_not_on_par_with_ieee_fp32(case):
     """On a GPU the fast form's default route fails check 1 against IEEE fp32 products where the accurate
-    form passes it (`accurate_draws`): the accurate test's inputs tell the two routes apart (row 2556)."""
+    form passes it (`accurate_draws`): the accurate test's inputs tell the two routes apart (row 2556). An
+    H100's cell alone (tests/test_gpu_attention.py): on an A100 the default route takes no fast kernel for
+    these draws and computes them at IEEE fp32, so the control has nothing to show there."""
     with pytest.raises(AssertionError):
         assert_as_exact(jax.jit(routed_call("fast")), jax.jit(ieee_reference), accurate_draws()[case],
                         f"the fast form on the default route, {case}", seeds=SEEDS)
