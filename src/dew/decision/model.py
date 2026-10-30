@@ -11,6 +11,7 @@ from dew.decision.head import Head
 from dew.decision.layout import DecisionInputs
 from dew.nn.cross_attention import ContextEncoder, encode_context
 from dew.nn.inputs import CONTEXT, ModelInputs
+from dew.nn.progress import END, Progress, ReadsProgress, progressed
 from dew.nn.protocols import TokenModel, VocabularyRows
 from dew.nn.scatter import gather_positions
 from dew.nn.visibility import block_ends, block_starts
@@ -33,6 +34,10 @@ class DecisionModel(HeadedModel):
     """How a row's context becomes the states its cross-attention reads (`encode_context`): `table`, its
     tokens through the backbone's own embedding table, or `backbone`, the backbone's final states over
     it in a pass of its own, as a schema read in context always is."""
+
+    def reads_progress(self) -> bool:
+        """Whether its backbone's computation changes over a run (`dew.nn.progress.ReadsProgress`)."""
+        return isinstance(self.backbone, ReadsProgress) and self.backbone.reads_progress()
 
     def initialize_head(self, key: jax.Array, backbone: Variables, tokens: jax.Array) -> Variables:
         """Draw the head over a held backbone, at `tokens`' shape, without running the backbone.
@@ -65,7 +70,8 @@ class DecisionModel(HeadedModel):
         return head.init(key, states, inputs, table)
 
     def states(self, variables: Variables, inputs: DecisionInputs, *, media: ModelInputs | None = None,
-               train: bool = False, rngs: dict[str, jax.Array] | None = None) -> jax.Array:
+               train: bool = False, rngs: dict[str, jax.Array] | None = None,
+               progress: Progress = END) -> jax.Array:
         """Return the backbone's `[B, L, features]` final states, each packed
         row read apart from the others in its window.
 
@@ -74,16 +80,19 @@ class DecisionModel(HeadedModel):
         context (`DecisionInputs.context`) hand the backbone's cross-attention
         each row's context, embedded by the backbone's own table (`stream_embeddings`),
         or, where the context holds the schema (`DecisionInputs.spans_in_context`),
-        the backbone's own final states over it (`encode_context`).
+        the backbone's own final states over it (`encode_context`). The backbone reads the run's
+        `progress` where it reads it (`dew.nn.progress`), the run's end by default.
         """
-        return self._read(variables, inputs, media=media, train=train, rngs=rngs)[0]
+        return self._read(variables, inputs, media=media, train=train, rngs=rngs, progress=progress)[0]
 
     def _read(self, variables: Variables, inputs: DecisionInputs, *, media: ModelInputs | None,
-              train: bool, rngs: dict[str, jax.Array] | None, opened: Sequence[str] = ()
-              ) -> tuple[jax.Array, jax.Array | None, Variables]:
+              train: bool, rngs: dict[str, jax.Array] | None, progress: Progress,
+              opened: Sequence[str] = ()) -> tuple[jax.Array, jax.Array | None, Variables]:
         """The row's final states (`states`), the context's where the questions' spans are in it, and
         what the row's pass sowed into the `opened` collections."""
         backbone = thaw(part(variables, "backbone"))
+        # The run's progress, the declared input of a backbone that reads it (`dew.nn.progress`).
+        stepped = progressed(self.backbone, progress)
 
         def applied(*args, **kwargs) -> tuple[jax.Array, Variables]:
             out = self.backbone.apply(backbone, *args, mutable=list(opened) or False, **kwargs)
@@ -106,7 +115,8 @@ class DecisionModel(HeadedModel):
             conditioning = encode_context(
                 self.backbone, part(variables, "backbone"), inputs.context, inputs.context_lengths,
                 encoder="backbone" if inputs.spans_in_context else self.context_encoder, train=train,
-                rngs=rngs, segments=inputs.context_segments, max_segments=inputs.max_segments)
+                rngs=rngs, segments=inputs.context_segments, max_segments=inputs.max_segments,
+                progress=progress)
             spanned = conditioning[CONTEXT] if inputs.spans_in_context else None
         if media is not None:
             if inputs.slots is not None or inputs.streams is not None:
@@ -119,7 +129,8 @@ class DecisionModel(HeadedModel):
                     held = kwargs.get("conditioning", {})
                     assert isinstance(held, Mapping)
                     kwargs["conditioning"] = {**held, **conditioning}
-                return module.hidden_states(rows.tokens, train=train, coordinates=laid, **kwargs, **blocked)
+                return module.hidden_states(rows.tokens, train=train, coordinates=laid, **kwargs, **blocked,
+                                            **stepped)
             states, sown = applied(inputs, media, rngs=rngs, method=read_media)
             return _array(states), spanned, sown
         if inputs.streams is not None:
@@ -135,7 +146,7 @@ class DecisionModel(HeadedModel):
         if inputs.slots is None:
             def read(module, tokens):
                 return module.hidden_states(tokens, train=train, coordinates=laid, conditioning=conditioning,
-                                            **blocked)
+                                            **blocked, **stepped)
             states, sown = applied(inputs.tokens, rngs=rngs, method=read)
             return _array(states), spanned, sown
         if blocked:
@@ -146,22 +157,25 @@ class DecisionModel(HeadedModel):
         runs = key_runs(inputs.slots, inputs.segments, inputs.options.shape[-1], causal=causal)
         states, sown = applied(inputs.tokens, train=train, coordinates=laid, attention_key_runs=runs,
                                attention_key_positions=inputs.positions, method="hidden_states",
-                               conditioning=conditioning, rngs=rngs)
+                               conditioning=conditioning, rngs=rngs, **stepped)
         return _array(states), spanned, sown
 
     def logits(self, variables: Variables, inputs: DecisionInputs, *, media: ModelInputs | None = None,
-               train: bool = False, rngs: dict[str, jax.Array] | None = None) -> jax.Array:
-        """Return the `[B, Q, K]` fp32 option logits, with -inf past each question's options."""
-        return self.observed_logits(variables, inputs, media=media, train=train, rngs=rngs)[0]
+               train: bool = False, rngs: dict[str, jax.Array] | None = None,
+               progress: Progress = END) -> jax.Array:
+        """Return the `[B, Q, K]` fp32 option logits, with -inf past each question's options, the
+        backbone at the run's `progress` (`states`)."""
+        return self.observed_logits(variables, inputs, media=media, train=train, rngs=rngs,
+                                    progress=progress)[0]
 
     def observed_logits(self, variables: Variables, inputs: DecisionInputs, *,
                         media: ModelInputs | None = None, train: bool = False,
-                        rngs: dict[str, jax.Array] | None = None,
+                        rngs: dict[str, jax.Array] | None = None, progress: Progress = END,
                         opened: Sequence[str] = ()) -> tuple[jax.Array, Variables]:
         """The option logits (`logits`), and what the row's pass sowed into the `opened` collections
         (`dew.objectives.base.Step.sown`)."""
         states, spanned, sown = self._read(variables, inputs, media=media, train=train, rngs=rngs,
-                                           opened=opened)
+                                           progress=progress, opened=opened)
         head = thaw(part(variables, "head"))
         # The questions' spans are pooled from the pass that holds them: the context's, where it holds
         # them. A head that pools none reads a question in its context through the cross-attention alone.

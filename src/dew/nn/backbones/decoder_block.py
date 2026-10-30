@@ -36,7 +36,7 @@ from ..hyper_connections import (
     collapse_streams,
     mix_streams,
 )
-from ..inputs import LayerInputs, MixerCall, PredictionPhase, routing_blocks
+from ..inputs import AttentionMetadata, LayerInputs, MixerCall, PredictionPhase, routing_blocks
 from ..kernels.recurrence_chunk import recomputing
 from ..mixer_base import ATTENTION_RESIDUALS, MLP_RESIDUALS, QKV_RESIDUALS, RESIDUALS
 from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, SparseMLP
@@ -859,8 +859,8 @@ class DecoderBlock(nn.Module):
         """
         state = self._enter(x, train, attention_metadata)
         if self.cross is not None:
-            state = self._crossed(state, None if attention_metadata is None else attention_metadata.context,
-                                  decode, train)
+            held = AttentionMetadata() if attention_metadata is None else attention_metadata
+            state = self._crossed(state, held.context, decode, train, held.progress)
         state, read, site = self._read(state, "attention")
         if not (self.wiring.pre_norms and self.attention_norm):
             normed = read
@@ -914,7 +914,8 @@ class DecoderBlock(nn.Module):
             state = self._write(state, "mlp", mlp_branch, site)
         return self._leave(state, train, per_layer_input)
 
-    def _crossed(self, state: _BlockState, context, decode: bool, train: bool) -> _BlockState:
+    def _crossed(self, state: _BlockState, context, decode: bool, train: bool,
+                 progress: jax.Array | None) -> _BlockState:
         """The state after the cross-attention block joins it: the plain stream (AltUp's active
         copy among them, nGPT's unit one), mHC's streams through their mean, or the depth
         state's partial block through the mixture the attention reads."""
@@ -925,7 +926,7 @@ class DecoderBlock(nn.Module):
             if not isinstance(self.self_attn, AttendsContext):
                 raise ValueError(f"this layer's mixer ({type(self.self_attn).__name__}) has no attention of "
                                  "its own for its cross-attention block to read a context through")
-            layer = {"layer": LayerReads(self._attention_input, self.self_attn)}
+            layer = {"layer": LayerReads(self._attention_input, self.self_attn, progress)}
         cross = functools.partial(self.cross_attention, decode=decode, train=train, **layer)
         if isinstance(state, _Plain):
             return state._replace(x=constrain(cross(state.x, context), RESIDUAL))

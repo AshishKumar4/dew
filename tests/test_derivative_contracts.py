@@ -7,6 +7,9 @@ wrong length), and each of its leaves is finite wherever the same order's float6
 (row 1768, a contraction that overflowed before its division). Behaviour alone: no route, structure or bits
 are read, and each seam is its public call."""
 
+import functools
+import itertools
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -72,13 +75,16 @@ def ran(order, label: str, name: str):
         raise AssertionError(f"{label}: its {name} does not run: {type(error).__name__}: {error}") from error
 
 
-def assert_contract(fn, primals, direction, cotangent, label: str, *, truth_fn=None, plain_fn=None) -> None:
+def assert_contract(fn, primals, direction, cotangent, label: str, *, truth_fn=None, plain_fn=None,
+                    held: tuple[str, ...] | None = None) -> None:
     """Every order of `fn` runs at the draw, and each leaf is finite wherever the same order of its float64
     run is a normal float32 and, given `plain_fn` (the plain float32 formula, JAX's own derivatives of it),
     the plain formula's is finite: no less finite than the plain arithmetic (row 1768, a contraction Dew
     overflowed where the plain formula did not), where float32 itself overflows a partial sum the float64
     run cancels. The float64 run is `fn`'s own, or `truth_fn`'s, the plain float64 formula, where `fn`
-    computes in a fixed precision whatever its inputs' (a declared dot algorithm)."""
+    computes in a fixed precision whatever its inputs' (a declared dot algorithm). `held`, where given, names
+    the orders a decision its caller cites holds the call to: each order it drops must break, so the
+    exemption ends when the call holds it."""
     narrow = orders(fn, primals, direction, cotangent)
     plain_orders = {} if plain_fn is None else orders(plain_fn, primals, direction, cotangent)
     plain = {name: ran(order, f"{label}, plainly", name) for name, order in plain_orders.items()}
@@ -89,17 +95,23 @@ def assert_contract(fn, primals, direction, cotangent, label: str, *, truth_fn=N
     for name, order in narrow.items():
         values = jax.tree.leaves(ran(order, label, name))
         plains = jax.tree.leaves(plain[name]) if plain else [None] * len(values)
+        broken = []
         for index, (value, truth, plainly) in enumerate(zip(values, jax.tree.leaves(truths[name]), plains,
                                                             strict=True)):
             if not np.issubdtype(value.dtype, np.inexact):
                 continue
-            held = normal_float32(truth) & np.isfinite(truth)
+            kept = normal_float32(truth) & np.isfinite(truth)
             if plainly is not None:
-                held &= np.isfinite(plainly)
-            broken = held & ~np.isfinite(value)
-            if broken.any():
-                raise LessFinite(f"{label}, {name}, leaf {index}: {int(broken.sum())} values not finite "
-                                 f"where float64's are normal float32s, e.g. {value[broken][:3]}")
+                kept &= np.isfinite(plainly)
+            lost = kept & ~np.isfinite(value)
+            if lost.any():
+                broken.append(f"{label}, {name}, leaf {index}: {int(lost.sum())} values not finite where "
+                              f"float64's are normal float32s, e.g. {value[lost][:3]}")
+        if held is not None and name not in held:
+            if not broken:
+                raise AssertionError(f"{label}, {name}: holds, so the exemption that drops it is over")
+        elif broken:
+            raise LessFinite(broken[0])
 
 
 EDGES = {"normal": 1.0, "near the largest": 2.0**63, "near the least normal": 2.0**-63}
@@ -107,23 +119,84 @@ EDGES = {"normal": 1.0, "near the largest": 2.0**63, "near the least normal": 2.
 pairs) reach float32's largest or its least normal."""
 
 
-DELTA_RULE_EDGES = [edge for edge in EDGES if edge != "near the largest"]
-"""The chunked delta rule's edges: near float32's largest its forward over reverse is NaN where the token
-recurrence's is finite (ledger 2470, 2574), its red test kept for that row's fix."""
+DELTA_RULE_EDGES = {"normal": 1.0, "the largest its chunk holds": 2.0**62, "near the largest": 2.0**63,
+                    "near the least normal": 2.0**-63}
+"""The chunked delta rule's edges. Near float32's largest its chunk's own products overflow at entries the
+token recurrence keeps finite, as fla's chunked form's do at the same entries (`precedent_chunked`, on an
+H100: ledger 2470), which that edge compares it with in place of the recurrence."""
+
+PACKED_OVERFLOW_ORDERS = ("primal", "jvp", "vjp", "second jvp", "second jvp, remat")
+"""The orders a packed row of the chunked delta rule holds from 2^62: all but forward over reverse, which the
+owner accepted there (`test_the_chunked_delta_rule_holds_every_order`, ledger 2470)."""
 
 
-@pytest.mark.parametrize("edge", DELTA_RULE_EDGES)
-@pytest.mark.parametrize("packed", [False, True], ids=["one sequence", "packed"])
+def precedent_chunked(query, key, value, g, beta, *, chunk_size: int, starts=None):
+    """fla's upstream chunked gated delta rule as it is written (`naive_chunk_gated_delta_rule`,
+    fla/ops/gated_delta_rule/naive.py), in JAX for its derivatives, over each packed document alone as fla
+    runs a varlen batch's sequences: the precedent the chunked rule's largest edge compares with. Its row
+    correction one row at a time and its masks filled after their products, as fla's are; `g` `[B, S, H, 1]`,
+    from a zero memory."""
+    if starts is not None:
+        begun = np.flatnonzero(np.asarray(starts)[0])
+        cuts = [0, *begun[begun > 0].tolist(), query.shape[1]]
+        pieces = [precedent_chunked(*(x[:, a:b] for x in (query, key, value, g, beta)), chunk_size=chunk_size)
+                  for a, b in itertools.pairwise(cuts) if b > a]
+        return jnp.concatenate(pieces, axis=1)
+    batch, length, heads, width = query.shape
+    pad = (-length) % chunk_size
+    q, k, v = (jnp.pad(jnp.moveaxis(x, 1, 2), [(0, 0), (0, 0), (0, pad), (0, 0)])
+               for x in (query, key, value))
+    beta, g = (jnp.pad(jnp.moveaxis(x, 1, 2), [(0, 0), (0, 0), (0, pad)]) for x in (beta, g[..., 0]))
+    q, v, keyed = q * width ** -0.5, v * beta[..., None], k * beta[..., None]
+    chunks = (length + pad) // chunk_size
+    q, k, v, keyed = (x.reshape(batch, heads, chunks, chunk_size, -1) for x in (q, k, v, keyed))
+    decay = jnp.cumsum(g.reshape(batch, heads, chunks, chunk_size), axis=-1)
+    upper = jnp.triu(jnp.ones((chunk_size, chunk_size), bool))
+    weights = jnp.tril(jnp.exp(jnp.tril(decay[..., :, None] - decay[..., None, :])))
+    system = -jnp.where(upper, 0.0, (keyed @ jnp.swapaxes(k, -1, -2)) * weights)
+    for row in range(1, chunk_size):
+        system = system.at[..., row, :row].set(
+            system[..., row, :row] + jnp.sum(system[..., row, :row, None] * system[..., :row, :row], axis=-2))
+    system = system + jnp.eye(chunk_size)
+    v, written = system @ v, system @ (keyed * jnp.exp(decay)[..., None])
+    memory = jnp.zeros((batch, heads, width, v.shape[-1]))
+    strict = jnp.triu(jnp.ones((chunk_size, chunk_size), bool), 1)
+    outputs = []
+    for index in range(chunks):
+        scores = jnp.where(strict, 0.0, (q[:, :, index] @ jnp.swapaxes(k[:, :, index], -1, -2))
+                           * weights[:, :, index])
+        corrected = v[:, :, index] - written[:, :, index] @ memory
+        read = (q[:, :, index] * jnp.exp(decay[:, :, index, :, None])) @ memory
+        outputs.append(read + scores @ corrected)
+        last = decay[:, :, index, -1]
+        memory = memory * jnp.exp(last)[..., None, None] + jnp.swapaxes(
+            k[:, :, index] * jnp.exp(last[..., None] - decay[:, :, index])[..., None], -1, -2) @ corrected
+    out = jnp.stack(outputs, axis=2).reshape(batch, heads, chunks * chunk_size, -1)[:, :, :length]
+    return jnp.moveaxis(out, 1, 2)
+
+
+@pytest.mark.parametrize(("packed", "edge"), list(itertools.product((False, True), DELTA_RULE_EDGES)),
+                         ids=lambda value: {False: "one sequence", True: "packed"}.get(value, value))
 def test_the_chunked_delta_rule_holds_every_order(packed, edge):
     """`recurrence_chunk.chunk_delta_rule` (the portable rule's custom derivative through
     `generation.linear_tangent`, rows 1861 and 1862): every order runs, its boolean document starts a
     residual with no tangent space, and each is finite wherever float64 is a normal float32 and JAX's own
     derivatives of the token recurrence are (`recurrent_delta_rule`, an independent formula of the same
-    rule), at queries, keys and values whose products near float32's ends, the decays and gates as drawn
-    (`DELTA_RULE_EDGES`)."""
+    rule, in float64 the truth too: the chunk's own float64 run excused its float32 NaNs wherever it was NaN
+    itself), near float32's largest of fla's own chunked form (`precedent_chunked`), at queries, keys and
+    values whose products near float32's ends, the decays and gates as drawn (`DELTA_RULE_EDGES`). A pair
+    the chunk weighs zero once multiplied its overflowed tangent by zero, the queries' second derivative NaN
+    from 2^48 (ledger 2470).
+
+    A packed row's documents share chunks, so from 2^62 one document's overflow reaches another's forward
+    over reverse (ledger 2608); its other orders hold. The owner accepted that under the accuracy-for-speed
+    rule (ledger 2470, 10-30): documents in chunks of their own held every order and cost the portable
+    packed gradient 25% (JS-cost2470d-h100-80113cc1c) for a difference at overflow alone, where the
+    parameters' gradient is NaN either way."""
     keys = jax.random.split(jax.random.key(1861), 8)
     rows, length, heads, width = 1, 37, 2, 8
-    query, key, value = (jax.random.normal(k, (rows, length, heads, width)) * EDGES[edge] for k in keys[:3])
+    scale = DELTA_RULE_EDGES[edge]
+    query, key, value = (jax.random.normal(k, (rows, length, heads, width)) * scale for k in keys[:3])
     g = -jax.nn.softplus(jax.random.normal(keys[3], (rows, length, heads, 1)))
     beta = jax.nn.sigmoid(jax.random.normal(keys[4], (rows, length, heads)))
     starts = jax.random.bernoulli(keys[5], 0.1, (rows, length)) if packed else None
@@ -131,14 +204,20 @@ def test_the_chunked_delta_rule_holds_every_order(packed, edge):
     def rule(query, key, value, g, beta):
         return recurrence_chunk.chunk_delta_rule(query, key, value, g, beta, chunk_size=16, starts=starts)[0]
 
-    def plain(query, key, value, g, beta):
+    def recurrence(query, key, value, g, beta):
         return recurrence_chunk.recurrent_delta_rule(query, key, value, g, beta, starts=starts)[0]
 
+    plain = (functools.partial(precedent_chunked, chunk_size=16, starts=starts) if edge == "near the largest"
+             else recurrence)
     primals = (query, key, value, g, beta)
-    direction = tuple(jax.random.normal(keys[6], x.shape) * (EDGES[edge] if at < 3 else 1.0)
+    direction = tuple(jax.random.normal(keys[6], x.shape) * (scale if at < 3 else 1.0)
                       for at, x in enumerate(primals))
     cotangent = jax.random.normal(keys[7], query.shape)
-    assert_contract(rule, primals, direction, cotangent, f"the chunked delta rule {edge}", plain_fn=plain)
+    # A packed row's forward over reverse from 2^62: the owner's accuracy-for-speed acceptance (ledger 2470,
+    # 10-30).
+    accepted = packed and scale >= 2.0**62
+    assert_contract(rule, primals, direction, cotangent, f"the chunked delta rule {edge}",
+                    truth_fn=recurrence, plain_fn=plain, held=PACKED_OVERFLOW_ORDERS if accepted else None)
 
 
 def normal_draw(seed: int, *shapes, scale: float = 1.0) -> tuple:
