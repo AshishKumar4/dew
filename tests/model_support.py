@@ -95,6 +95,25 @@ def decode_through(module: nn.Module, variables, hidden, prefill: int):
     return jnp.concatenate(outputs, axis=1), allocated["cache"], cache["cache"]
 
 
+def stepped_outputs(forward: Callable[[int], jax.Array], length: int, prefill: int) -> jax.Array:
+    """A sequence's outputs `[B, length, ...]` at the shapes a cached decode computes them, `forward(n)`
+    a forward over its first `n` positions: the first `prefill` positions from one forward over them, as
+    the prefill computes them, and each later position from a forward of its own over the sequence up to
+    it, at the width the step that computes it reads (ledger 1543, the gate's ruling: a step's reference
+    at the shapes the step computes, where one forward over the whole sequence would compute every step's
+    products at one row count, which a GPU's kernel rounds apart by row count). Joined along the
+    sequence, as one forward over it would be; a float64 truth, whose products round alike at every
+    shape, reads that one forward instead."""
+    later = [forward(position + 1)[:, -1:] for position in range(prefill, length)]
+    return jnp.concatenate([forward(prefill), *later], axis=1)
+
+
+def as_stepped(forward: Callable[[jax.Array], jax.Array], sequence: jax.Array, prefill: int) -> jax.Array:
+    """`forward`'s outputs over `sequence` `[B, S, ...]` at the shapes a cached decode computes them
+    (`stepped_outputs`)."""
+    return stepped_outputs(lambda length: forward(sequence[:, :length]), sequence.shape[1], prefill)
+
+
 def float64_twin(model: nn.Module) -> nn.Module:
     """`model` computing in float64, its own `dtype` and every module it
     holds: the truth a float32 run's rounding is measured from."""

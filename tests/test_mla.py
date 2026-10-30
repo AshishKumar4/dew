@@ -37,7 +37,7 @@ import pytest
 import torch
 from interop_support import fixture_arrays, fixture_ids, transformers_arms, transformers_model
 from jax.sharding import PartitionSpec as P
-from model_support import decode_through
+from model_support import as_stepped, decode_through
 from quantized_basis import dequantized_in_own_basis
 from recording import RecordingTracker
 from reference_error import as_given, assert_as_exact, torch_with_gradients, widened, with_gradients
@@ -311,12 +311,13 @@ SETTINGS = {"mla_v3": "v3", "mla_v3n": "v3n", "mla_v32": "v32"}
 
 @pytest.mark.parametrize("name", ["mla_v3", "mla_v3n", "mla_v32"])
 def test_decode_matches_prefill(name):
-    """Prefill plus one-token steps on par with the block's parallel pass from that pass in float64
-    (check 1), over drawn hidden states."""
+    """Prefill plus one-token steps on par with the block's parallel passes, each step's at the width it
+    reads (`as_stepped`), from them in float64 (check 1), over drawn hidden states."""
     settings = CONFIG[SETTINGS[name]]
     module = mla_module(settings)
     variables = block_variables(fixture(name))
-    full = jax.jit(lambda variables, hidden: module.apply(variables, hidden))
+    full = jax.jit(lambda variables, hidden: as_stepped(lambda held: module.apply(variables, held), hidden,
+                                                        1))
 
     decoded = jax.jit(lambda variables, hidden: decode_loop(module, variables, hidden))
 
@@ -972,13 +973,13 @@ def test_dense_mla_reads_a_padded_row_under_a_window_as_its_unpadded_twin():
 
 
 def test_a_windowed_dense_mla_decodes_as_it_prefills():
-    """A windowed block's one-token decode steps compute what its whole-sequence pass computes,
-    on par with that pass from it in float64 (check 1): the decode mask keeps the window's keys
-    by their cache slots."""
+    """A windowed block's one-token decode steps compute what its passes compute, each step's at the
+    width it reads (`as_stepped`), on par with them from them in float64 (check 1): the decode mask keeps
+    the window's keys by their cache slots."""
     windowed = visibility_module(sliding_window=3)
     variables = visibility_variables()
     decoded = jax.jit(lambda v, h: decode_loop(windowed, v, h))
-    full = jax.jit(lambda v, h: windowed.apply(v, h))
+    full = jax.jit(lambda v, h: as_stepped(lambda held: windowed.apply(v, held), h, 1))
     assert_as_exact(decoded, full, visibility_draw(variables), "mla windowed decode",
                     seeds=SEEDS["visibility"])
 
