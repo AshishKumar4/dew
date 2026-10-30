@@ -78,8 +78,9 @@ class RowEquations:
 def _pulled(params: Variables, pulled: jax.Array, share: float) -> jax.Array:
     """`pulled`, a microbatch's J_i^T r_i, whose derivative takes the parameters' move to its `share`,
     raveled, and leaves `pulled`'s own: a reverse derivative takes the step's cotangent c to the
-    parameters' `share` c, in their tree, the microbatch's rows' share of the update's, so the shares of a
-    whole update sum to its step."""
+    parameters' `share` c, in their tree and each in its own dtype, as JAX hands every parameter its
+    cotangent, the microbatch's rows' share of the update's, so the shares of a whole update sum to its
+    step."""
     return pulled
 
 
