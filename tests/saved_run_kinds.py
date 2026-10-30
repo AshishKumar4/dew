@@ -64,9 +64,8 @@ def lettered(root: Path, drawn: bool) -> RunConfig:
 
 def blockwise(root: Path, drawn: bool) -> RunConfig:
     """`test_run_options.blockwise`'s block-diffusion run over a release whose text decoder its model nests,
-    its release and tokenizer by their path in the repo."""
-    return dataclasses.replace(run_options.blockwise(root, drawn), pretrained=DIFFUSION_GEMMA,
-                               tokenizer=DIFFUSION_GEMMA)
+    its release and tokenizer, its token files' too, by their path in the repo."""
+    return run_options.blockwise(root, drawn, release=DIFFUSION_GEMMA)
 
 
 def clocked(root: Path, drawn: bool) -> RunConfig:
