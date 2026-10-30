@@ -239,6 +239,37 @@ def test_a_run_on_the_examples_clock_compiles_its_step_ahead_reading_its_progres
     assert AheadOfTime.load(path).peak_bytes > 0
 
 
+@pytest.mark.gpu(reason="trains a clocked run from the step it compiled ahead on this host's own GPU")
+def test_a_clocked_run_with_a_cooldown_trains_from_its_step_compiled_ahead_compiling_no_other(tmp_path):
+    """A decision run on the examples clock under a schedule over the run, with a cooldown, compiled
+    ahead through its command line for this GPU's generation (`--trainer.compile-ahead`) and then handed
+    the step it saved (`--trainer.ahead`), trains from that step through its cooldown's branch, its last
+    window's too, and compiles no step program of its own: each batch it steps closes its window as the
+    one it compiled ahead over did (ledgers 2434, 2527)."""
+    from test_run_options import decision
+
+    from dew.decision.config import DecisionRunConfig
+    from dew.nn.kernels.generation import device_generation
+    from dew.training.ahead import CompiledAhead
+
+    runs, path = tmp_path / "runs", tmp_path / "step.dew-aot"
+    default = decision(tmp_path, drawn=False)
+    stated = ["--trainer.checkpoint-dir", str(runs), "--trainer.examples", "48",
+              "--trainer.multi-host", "False", "--trainer.compilation-cache-dir", "None",
+              "--trainer.cooldowns.at", "50%", "--trainer.cooldowns.length", "25%",
+              "--optim.learning-rate", '{"class": "linear", "fields": {"peak_value": 0.001}}']
+    ahead = ["--trainer.compile-ahead.generation", device_generation(),
+             "--trainer.compile-ahead.devices", "1", "--trainer.compile-ahead.path", str(path)]
+    compiling = DecisionRunConfig.cli(["--trainer.name", "ahead", *stated, *ahead], default=default)
+    with pytest.raises(CompiledAhead):
+        compiling.run()
+    handed = DecisionRunConfig.cli(["--trainer.name", "handed", *stated, "--trainer.ahead", str(path)],
+                                   default=default)
+    with Compiles("step") as compiles:
+        state = handed.run()
+    assert compiles.count == 0 and int(state.updates) > 0
+
+
 ACCUMULATION_CELLS = [("sm80", "bfloat16"), ("sm90", "float32")]
 """Each generation and each compute dtype once (testing.md's pairwise settings): a bfloat16 step reads
 its parameters through narrow copies on a GPU (`dew.training.narrow`), a float32 step reads them whole."""
