@@ -37,7 +37,7 @@ pytestmark = pytest.mark.mesh
 LLAMA = Path(__file__).parent / "fixtures" / "hf" / "llama-tiny"
 SPECIALS = Specials(begin=None, separator=10, marker=0, marker_text="\x00", pad=255)
 TOKENIZER = ByteTokenizer()
-JOINT = JointLayout(max_len=768, segments=(Text("STATE:\n"), State(), Schema(stream="schema"), Text("\n")),
+JOINT = JointLayout(max_len=1024, segments=(Text("STATE:\n"), State(), Schema(stream="schema"), Text("\n")),
                     reads=Reads((("row", "self", "causal"), ("row", "schema", "whole"),
                                  ("schema", "self", "causal"))))
 """A joint row's two streams: its own tokens read the row's before them and the whole schema, though the
@@ -158,9 +158,10 @@ def test_the_state_reads_the_other_stream_after_it_and_that_stream_reads_no_stat
         {"pick": Choice("Which one?", ["d", "e", "f"]), "close": Choice("Closest?", ["v", "w"])}
         if layout is JOINT else {"q": Choice("Which team handles it?", ["bards", "boans", "bra"])})
     moved, moved_streams = states_of(objective, variables, "one two three", moved_questions)
-    state = np.arange(len(streams)) < np.argmax(read)
-    assert np.array_equal(moved_streams[state], streams[state])
-    assert not np.array_equal(first[state], moved[state])
+    # The row's own tokens before the other stream, the same in both rows.
+    before = int(np.argmax(read))
+    assert np.array_equal(moved_streams[:before], streams[:before])
+    assert not np.array_equal(first[:before], moved[:before])
 
 
 STREAM_SEEDS = {"joint": 8, "lettered": 8}

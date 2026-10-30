@@ -54,7 +54,7 @@ def examples_clock(args) -> dict:
 
     ids = np.arange(args.records, dtype=np.int32)
     x = np.repeat(ids[:, None].astype(np.float32), FEATURES, axis=1)
-    chain = Pipeline(Memory({"x": x, "id": ids})).read("streamed").batch(BATCH)
+    chain = Pipeline(Memory({"x": x, "id": ids})).read("memory").batch(BATCH)
     tracker = Logged()
     optim = OptimConfig(optimizer="optax:sgd", learning_rate=Linear(peak_value=1e-2, end_value=0.0))
     trainer = Trainer(Pulled(), optim, key=jax.random.key(0), mesh=MeshSpec(), tracker=tracker)
