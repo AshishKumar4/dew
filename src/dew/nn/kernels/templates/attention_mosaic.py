@@ -231,10 +231,11 @@ class MosaicForward(_Mainloop[Tiles]):
 
     def completed(self, ba: tokamax.BoundArguments, config: Hashable) -> Hashable:
         """A pin's or an explicit config's natural rewalk derived once where it names none (`_relaunched`,
-        rows 2621, 2647); the config as it is where it names its rewalk's tiles or none derives (a config of
-        another type, which `pinnable` refuses)."""
+        rows 2621, 2647); the config as it is where it names any of its rewalk's tiles (its key tile, its
+        consumers, its value columns: row 2675) or none derives (a config of another type, which `pinnable`
+        refuses)."""
         if (not isinstance(config, Tiles) or config.natural_form
-                or (config.relaunch_k, config.relaunch_consumers) != (None, None)):
+                or (config.relaunch_k, config.relaunch_consumers, config.relaunch_columns) != (None,) * 3):
             return config
         return self._relaunched(ba, config, generation.gpu_target()) or config
 

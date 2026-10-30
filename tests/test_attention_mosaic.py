@@ -724,6 +724,21 @@ def test_the_derived_tiles_stage_within_a_hoppers_block(width, value_width, resi
         assert op.registers(ba, derived) <= op.register_budget(derived)
 
 
+@pytest.mark.parametrize("named", [{"relaunch_k": 64}, {"relaunch_columns": 64}], ids=["key-tile", "columns"])
+def test_a_pinned_rewalk_runs_whichever_of_its_tiles_the_pin_names(named):
+    """A pin naming any of its natural rewalk's tiles (its key tile, its value columns) runs that rewalk, the
+    op deriving none over it (`MosaicForward.completed`, rows 2647, 2675); a pin naming none takes the
+    derived one."""
+    with generation.assumed("sm90"):
+        op, ba = _forward_call((2, 4096, 32, 8), 256, 256, template.Kept.SPLIT)
+        derived = op.derived(ba, generation.gpu_target())
+        unnamed = dataclasses.replace(derived, relaunch_k=None, relaunch_consumers=None,
+                                      relaunch_columns=None)
+        pinned = dataclasses.replace(unnamed, **named)
+        assert op.completed(ba, unnamed) == derived
+        assert op.completed(ba, pinned) == pinned
+
+
 def _backward_call(shape, width: int, accurate: bool):
     """A causal backward's op and bound arguments over `shape`'s operands, its heads `width` wide, with a
     training forward's residuals."""
