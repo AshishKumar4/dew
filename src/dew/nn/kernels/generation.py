@@ -18,6 +18,8 @@ import logging
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from typing import TYPE_CHECKING
 
+from .selection import Refusal
+
 if TYPE_CHECKING:
     from jax.sharding import AbstractMesh, Mesh
 
@@ -620,22 +622,6 @@ def chosen_kernel(choice: str, default: str) -> str:
     _named((choice,))
     return dict(cache.KERNEL_CHOICES.value).get(choice, default)
 
-
-@dataclasses.dataclass(frozen=True)
-class Refusal:
-    """Why the kernel a target prefers does not take a call, from the call's own facts on that
-    target (its shapes, dtypes, mask): a stable `code`, which a kernel's `SUPPORTS` keys its declared
-    limits on, and the `detail` a log names. What the host cannot run is no refusal (`Route.ran`)."""
-
-    code: str
-    detail: str
-    row: str | None = None
-    """The roadmap or ledger row that tracks lifting the limit (`dew.nn.kernels.selection.Requirement`),
-    `INHERENT` where no implementation of the kernel lifts it, None for a refusal no requirement gives
-    (an analysis's own, which its op's requirements read)."""
-
-    def __str__(self) -> str:
-        return self.detail
 
 
 INHERENT = 'inherent'

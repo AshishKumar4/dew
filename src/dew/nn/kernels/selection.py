@@ -17,12 +17,34 @@ operation to the program, and outside `generation.routes()` it records nothing
 (`dew.cache.KERNEL_ROUTES` stays `()`), so a run's trace keys are those of a run that never selects.
 """
 
+from __future__ import annotations
+
 import dataclasses
 from collections.abc import Callable, Mapping
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
-from . import generation
-from .generation import Refusal, Route
+if TYPE_CHECKING:
+    from .generation import Route
+
+
+@dataclasses.dataclass(frozen=True)
+class Refusal:
+    """Why the kernel a target prefers does not take a call, from the call's own facts on that
+    target (its shapes, dtypes, mask): a stable `code`, which a kernel's `SUPPORTS` keys its declared
+    limits on, and the `detail` a log names. What the host cannot run is no refusal (`Route.ran`)."""
+
+    code: str
+    detail: str
+    row: str | None = None
+    """The roadmap or ledger row that tracks lifting the limit (`dew.nn.kernels.selection.Requirement`),
+    `INHERENT` where no implementation of the kernel lifts it, None for a refusal no requirement gives
+    (an analysis's own, which its op's requirements read)."""
+
+    kind: str = 'capability'
+    """A capability, measured preference, or structural handoff, as the selector treats it."""
+
+    def __str__(self) -> str:
+        return self.detail
 
 
 @dataclasses.dataclass(frozen=True)
@@ -51,9 +73,12 @@ class Requirement[C]:
             raise ValueError(f"requirement {self.code!r} is of kind {self.kind!r}, not capability, measured "
                              "or handoff")
 
-    def refusal(self, case: C) -> Refusal:
-        """This requirement's refusal of `case`, carrying the row that tracks it or `INHERENT`."""
-        return Refusal(self.code, self.detail(case) if callable(self.detail) else self.detail, self.row)
+    def check(self, case: C) -> Refusal | None:
+        """The failed requirement's data, or None when it holds."""
+        if self.holds(case):
+            return None
+        return Refusal(self.code, self.detail(case) if callable(self.detail) else self.detail,
+                       self.row, self.kind)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -62,13 +87,22 @@ class Kernel[C]:
     whether it is `generic`, a path that takes what the others turn down."""
 
     name: str
-    supports: tuple[Requirement[C], ...]
+    supports: tuple[Requirement[C] | Callable[[C], Refusal | None], ...]
     generic: bool = False
 
-    def failed(self, case: C, forced: bool = False) -> list[Requirement[C]]:
-        """The requirements `case` fails, in order; a `forced` kernel's measured ones hold."""
-        return [requirement for requirement in self.supports
-                if not (forced and requirement.kind == 'measured') and not requirement.holds(case)]
+    def failed(self, case: C, forced: bool = False) -> list[Refusal]:
+        """The requirements `case` fails, evaluated once, in order; forcing overrides measured preferences."""
+        failures = []
+        for requirement in self.supports:
+            if isinstance(requirement, Requirement):
+                if forced and requirement.kind == 'measured':
+                    continue
+                refusal = requirement.check(case)
+            else:
+                refusal = requirement(case)
+            if refusal is not None and not (forced and refusal.kind == 'measured'):
+                failures.append(refusal)
+        return failures
 
 
 @runtime_checkable
@@ -135,6 +169,8 @@ def select[C](op: Op[C], case: C, named: str | None = None, *, insist: bool = Tr
     ones). Without `insist`, `named` is the call's own preference, before `chosen`'s, and one that does not
     take the case hands it to the op's other kernels, its refusal reported (a norm's or a SiLU product's
     per-call implementation)."""
+    from . import generation
+
     kernel, preferred, refusal = _decided(op, case, named, insist)
     return generation.route(op.choice, kernel=kernel.name, preferred=preferred, refusal=refusal,
                             ran=op.hosted(kernel.name))
@@ -172,10 +208,9 @@ def _decided[C](op: Op[C], case: C, named: str | None,
         if not failed:
             return kernel, preferred, refusal
         if kernel is first:
-            refusal = failed[0].refusal(case)
+            refusal = failed[0]
             if insisted is not None and any(requirement.kind != 'handoff' for requirement in failed):
-                raise KernelRefused(op.choice, kernel.name,
-                                    [requirement.refusal(case) for requirement in failed])
+                raise KernelRefused(op.choice, kernel.name, failed)
     raise ValueError(f"no {op.choice} kernel takes this call ({refusal})")
 
 
@@ -197,7 +232,7 @@ def _old_route[C](op: Op[C], case: C) -> tuple[Kernel[C], str, Refusal | None] |
         return kernel, name, None
     return kernel, preferred, Refusal(
         'measured', f"{name} measured faster than {preferred} on this cell "
-                    f"({', '.join(part for part in cell if part)}): {receipt}", 'bible da64ae5')
+                    f"({', '.join(part for part in cell if part)}): {receipt}", 'bible da64ae5', kind='measured')
 
 
 def _preferred[C](op: Op[C], case: C) -> str:
