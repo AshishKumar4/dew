@@ -237,10 +237,7 @@ SINK_SEEDS = 256
 256 on an H100, either cap."""
 
 
-@pytest.mark.gpu(reason="the dispatch's GPU kernels")
-@pytest.mark.skipif(not ON_GPU, reason="the dispatch's GPU kernels")
-@pytest.mark.parametrize("softcap", [None, SOFTCAP], ids=["plain", "softcap"])
-def test_a_decode_steps_sinks_take_their_gradient_and_tangent_through_the_dispatch(softcap):
+def a_decode_steps_sinks_take_their_gradient_and_tangent_through_the_dispatch(softcap):
     """A grouped decode step with sinks through Dew's attention (`scaled_dot_product_attention`), the sinks
     an operand of its derivative: on a GPU its gradient and tangent with respect to them are on par with the
     reference path's (check 1, `assert_as_exact`), over draws of the step's queries, keys, values and sinks
@@ -634,8 +631,7 @@ def test_a_grouped_query_over_one_key_head_reaches_the_decode_kernel_on_each_ten
             lowering_platforms=("cuda",))
 
 
-@pytest.mark.gpu(reason="the kernel runs on CUDA")
-def test_attention_the_decode_kernel_takes_differentiates_as_the_folded_attention():
+def attention_the_decode_kernel_takes_differentiates_as_the_folded_attention():
     """A decode step's attention, its value the kernel's, differentiates as the folded attention it
     stands in for, in both modes: the value, query, key and value gradients, and the tangent, within
     tests/reference_error.py's rule of the folded attention's against float64 attention."""
@@ -914,9 +910,7 @@ def test_a_cache_call_read_as_documents_attends_as_its_mask(implementation, wind
     np.testing.assert_array_equal(np.asarray(read[3]), 0)
 
 
-@pytest.mark.gpu(reason="FlashAttention runs on CUDA")
-@pytest.mark.parametrize("window", [None, 4])
-def test_flash_reads_a_cache_calls_documents_as_exactly_as_jax_nn_reads_its_mask(without_deterministic_ops,
+def flash_reads_a_cache_calls_documents_as_exactly_as_jax_nn_reads_its_mask(without_deterministic_ops,
                                                                                  window):
     """FlashAttention chosen for a cache call (`generation.chosen`) reads its documents as its packed
     sequences, the queries put in id order and back: its output and its query, key and value

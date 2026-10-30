@@ -114,8 +114,8 @@ def test_timed_out_pool_reports_every_rank_and_reaps_them(tmp_path):
 
 def test_a_worker_ends_with_its_owner_however_the_owner_dies(tmp_path):
     """A worker in a session of its own, and what it started, end when the harness that owns them dies, by
-    SIGKILL from outside as by any signal that unwinds nothing: their ownership outlives no owner (Main,
-    2026-10-28: a worker outlived its killed owner 43 hours at 195% CPU on the VM; armada job
+    SIGKILL from outside as by any signal that unwinds nothing: their ownership outlives no owner (the
+    maintainer, 2026-10-28: a worker outlived its killed owner 43 hours at 195% CPU on the VM; armada job
     20261028061537-7e66486a)."""
     owner = (
         "import sys, time\n"

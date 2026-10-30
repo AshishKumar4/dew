@@ -53,6 +53,7 @@ from dew.interop.families.qwen import (
     QWEN3_MOE,
     QWEN3_NEXT,
 )
+from dew.interop.families.qwen4_exp import QWEN4_EXP_TEXT
 from dew.interop.families.starcoder2 import STARCODER2
 from dew.nn.mixers.mamba2 import Mamba2Mixer
 
@@ -99,6 +100,8 @@ ENTRIES = (
     KIMI_K3,
     DEEPSEEK_V3,
     MUSE_GLIMMER_TEXT,
+    # Its gated delta nets and gated attention would read as Qwen3-Next's or Qwen3.5's.
+    QWEN4_EXP_TEXT,
     # Its grouped norms and value experts are its own; its gated, routed layers would read as Qwen3.5's.
     K2_HORIZON,
     QWEN3_NEXT,

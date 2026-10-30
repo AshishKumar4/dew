@@ -51,7 +51,9 @@ class PromptRollout:
     completions of each prompt the policy draws under `sampling`, each at most `max_new_tokens`, each
     scored by `reward` against its prompt's record, their advantages by `estimator` (`group` by
     default), a completion that runs out of its budget trained as `truncation` says, and `admit` of a
-    batch's prompts' groups trained on (every one by default).
+    batch's prompts' groups trained on (every one by default). A step short of its groups after dynamic
+    sampling (dapo's) draws the run's next prompt batches too, `generation_batches` in all at most
+    (`RolloutScheduler.generation_batches`).
 
     `method` names a composition (`dew.objectives.rl.methods`: grpo, dapo, dr_grpo, gspo, cispo, gmpo,
     reinforce_pp, rloo), which fixes the objective's settings it names, stated `--objective.*`
@@ -73,6 +75,7 @@ class PromptRollout:
     method: str | None = None
     admit: int | None = None
     overlong_cache: int | None = None
+    generation_batches: int = 1
 
     def __post_init__(self) -> None:
         from dew.objectives.rl.methods import method
@@ -94,6 +97,8 @@ class PromptRollout:
         check_truncation(self.truncation)
         if self.admit is not None and (type(self.admit) is not int or self.admit < 1):
             raise ValueError("admit is a positive number of each batch's prompts' groups, or None for all")
+        if type(self.generation_batches) is not int or self.generation_batches < 1:
+            raise ValueError("generation_batches is the most prompt batches a step draws, at least its own")
         if self.overlong_cache is not None and (
                 self.method is None or not method(self.method).overlong
                 or type(self.overlong_cache) is not int
@@ -136,6 +141,7 @@ class PromptRollout:
         return RolloutScheduler.sampled(objective, reward,
                                         decode=decode, groups=self.groups, max_new_tokens=self.max_new_tokens,
                                         truncation=self.truncation, sampling=self.sampling, admit=self.admit,
+                                        generation_batches=self.generation_batches,
                                         **self.scheduler_settings())
 
 

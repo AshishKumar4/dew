@@ -1152,7 +1152,7 @@ def test_a_262144_vocabulary_computes_in_float64_and_picks_optaxs_top1_on_cpu(so
     forward or its backward, so it is the float64 truth the gate's other heads are measured from,
     and its top-1 columns are Optax's full-vocabulary logits'. The losses and gradients of the same
     boundary targets are held to the whole logits' in fp32 on a Gemma-sized head (check 1,
-    `test_a_gemma_sized_vocabulary_is_as_exact_as_the_whole_logits`)."""
+    `a_gemma_sized_vocabulary_is_as_exact_as_the_whole_logits`, a cell of tests/test_gpu_numerics.py)."""
     rng = np.random.default_rng(713)
     with jax.enable_x64(), jax.default_device(jax.devices("cpu")[0]):
         hidden = jnp.asarray(rng.normal(size=(7, 5)), jnp.float64)
@@ -1178,10 +1178,7 @@ TILE = (1024, 8192)
 
 # A Gemma-sized vocabulary's float64 truth over the seeds its softcapped cases need is numeric work at
 # model size, a GPU's: on a CPU each case takes about eleven minutes.
-@pytest.mark.gpu(reason="a Gemma-sized vocabulary's float64 truth at the seeds it needs")
-@pytest.mark.parametrize("softcap", [None, 30.0], ids=["plain", "softcap-30"])
-@pytest.mark.parametrize("chunks", [4, 16], ids=["4-chunks", "16-chunks"])
-def test_a_gemma_sized_vocabulary_is_as_exact_as_the_whole_logits(chunks, softcap):
+def a_gemma_sized_vocabulary_is_as_exact_as_the_whole_logits(chunks, softcap):
     """Losses, log partitions and the gradients of both the states and the head of a weighted loss,
     chunked, on par with the full-vocabulary pass's from float64 over drawn heads and targets, the
     first seven on the chunks' boundaries (check 1). The head's logits have a standard deviation of

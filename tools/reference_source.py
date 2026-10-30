@@ -325,3 +325,54 @@ def defined_in(text: str, names: Iterable[str], scope: dict, *, within: str | No
 def definitions(url: str, names: Iterable[str], scope: dict, *, within: str | None = None) -> dict:
     """`defined_in` over the file at `url`."""
     return defined_in(fetched(url), names, scope, within=within, filename=url)
+
+
+def torch_logits(model, ids, mask=None, positions=None):
+    """A torch causal LM's fp32 logits of `ids`, uncached, its left-padded rows by `mask` and `positions`."""
+    import torch
+
+    inputs = {'input_ids': torch.from_numpy(ids).long(), 'use_cache': False}
+    if mask is not None:
+        inputs.update(attention_mask=torch.from_numpy(mask).long(),
+                      position_ids=torch.from_numpy(positions).long())
+    with torch.no_grad():
+        return model(**inputs).logits.numpy()
+
+
+def write_probes(directory: Path, model, vocab: int, continued=None) -> None:
+    """A torch causal LM's probe arrays into `directory`, as tests/test_hf_reference_decoders.py reads
+    them: `verify.probe_ids`' ids, their left-padded rows (`padded_probe`) and mask, the logits of both,
+    and the greedy continuation of the first four ids by six, `continued(model, ids, tokens)` where the
+    release's own cached decoding is the reference (`torch_generated`), else a full forward a token
+    (`torch_greedy`)."""
+    import numpy as np
+
+    from dew.interop.verify import probe_ids
+
+    ids = probe_ids(vocab)
+    mask, padded, positions = padded_probe(ids)
+    arrays = {'input_ids': ids, 'attention_mask': mask, 'logits': torch_logits(model, ids),
+              'padded_logits': torch_logits(model, padded, mask, positions),
+              'generated': (continued or torch_greedy)(model, ids[:, :4], 6)}
+    for name, array in arrays.items():
+        np.save(directory / f'{name}.npy', array)
+    print(f"{directory}: {sorted(path.name for path in directory.iterdir())}")
+
+
+def torch_generated(model, ids, tokens: int):
+    """`ids` continued `tokens` tokens greedily by the model's own cached `generate`, no stop token."""
+    import torch
+
+    with torch.no_grad():
+        return model.generate(torch.from_numpy(ids).long(), do_sample=False, max_new_tokens=tokens,
+                              eos_token_id=None, pad_token_id=0).numpy()
+
+
+def torch_greedy(model, ids, tokens: int):
+    """`ids` continued `tokens` tokens by the argmax of a full forward each (`torch_logits`)."""
+    import numpy as np
+
+    for _ in range(tokens):
+        ids = np.concatenate([ids, torch_logits(model, ids)[:, -1].argmax(-1)[:, None].astype(ids.dtype)],
+                             axis=1)
+    return ids

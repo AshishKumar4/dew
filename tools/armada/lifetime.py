@@ -63,8 +63,8 @@ def write(name: str, item: str) -> None:
         return
     if not item.startswith(STARTED):
         logged.add((name, item))
-    if not item.startswith(EVIDENCE) and checkout_file(item):
-        seen.add(item)
+    if not item.startswith(EVIDENCE) and checkout_file(path := item.partition(followed.CODE)[0]):
+        seen.add(path)
     log.write(f"{name}\t{item}\n")
 
 
@@ -117,7 +117,7 @@ def started(code, offset):
     name = code.co_filename
     if not followed.checkout(name, root):
         return sys.monitoring.DISABLE
-    write(owner(), name[len(root):])
+    write(owner(), followed.code_unit(code, root))
     if Path(name).name == "conftest.py":
         return sys.monitoring.DISABLE
     if code.co_name == "<module>":
@@ -145,6 +145,9 @@ def audited(event, args):
     """A read the audit names, kept as the run's input; a process start, kept as how its owner's child ran."""
     if event in followed.READS:
         kept(followed.read(event, args, root))
+        return
+    if (taken := followed.coded(event, args, root)) is not None:
+        write(owner(), taken)
         return
     kind = followed.start(event, args, children)
     if kind is not None:

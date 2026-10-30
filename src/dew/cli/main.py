@@ -67,14 +67,12 @@ class Export:
 
 def user_module(path: Path) -> types.ModuleType:
     """The user's Python file at `path`, that file and no other, imported as the module its name names
-    (`dew.registry.module_from_file`), with its directory first on the path, as `python -m` runs one
-    beside its siblings, so it imports them."""
+    (`dew.registry.module_from_file`), with its directory first on the path once it is accepted, as
+    `python -m` runs one beside its siblings, so it imports them; a file refused leaves the path as it
+    was."""
     from dew.registry import module_from_file
 
-    directory = str(path.resolve().parent)
-    if directory not in sys.path:
-        sys.path.insert(0, directory)
-    return module_from_file(path, path.stem)
+    return module_from_file(path, path.stem, beside=True)
 
 
 def chain_of(named: str, branch: Literal["train", "validation"], trust: tuple[str, ...] = ()):
@@ -256,7 +254,25 @@ class Profile:
         return 0
 
 
-COMMANDS = {"export": Export, "launch": Launch, "profile": Profile, "train": Train}
+@dataclasses.dataclass(frozen=True)
+class Inspect:
+    """Inspect a run offline: one sampled update over its training data's first batch, from its checkpoints'
+    latest, else its start, printed as the scalars its training logs under `inspect/`
+    (`RunConfig.inspected`). It trains and writes nothing."""
+
+    run: Positional[str]
+    """A Python file whose `run` is a run config or a function returning one, or a `run.json`."""
+    set: Annotated[tuple[str, ...], tyro.conf.UseAppendAction] = ()
+    """`path=value`, once a field, as `dew train` reads it: what to watch is `trainer.inspection`."""
+    trust: tuple[str, ...] = ()
+    """Packages outside Dew whose modules a `run.json` may import."""
+
+    def run_command(self) -> int:
+        emit(json.dumps(run_named(self.run, self.trust).assigned(self.set).inspected(), sort_keys=True))
+        return 0
+
+
+COMMANDS = {"export": Export, "inspect": Inspect, "launch": Launch, "profile": Profile, "train": Train}
 DATA_COMMANDS = {"export": DataExport, "provision": DataProvision, "publish": DataPublish}
 
 

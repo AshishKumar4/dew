@@ -23,7 +23,7 @@ import time
 import types
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from itertools import accumulate, pairwise
-from typing import TYPE_CHECKING, Generic
+from typing import TYPE_CHECKING, Generic, Protocol
 
 import jax
 import jax.numpy as jnp
@@ -109,7 +109,7 @@ from dew.objectives.base import (
 from dew.optim import held_rates, learning_rate, scaled_rates, settable_rates, with_rates
 from dew.state import MODEL_STATE, Accumulation, TrainState, apart, drawn_in, kept_window, together
 from dew.telemetry import profile as telemetry_profile
-from dew.telemetry.instrumentation import StepFlops, compilation_cache_counts
+from dew.telemetry.instrumentation import StepFlops
 from dew.telemetry.profile import region
 from dew.telemetry.records import (
     AxisLink,
@@ -161,14 +161,14 @@ from dew.training.distributed import (
 )
 from dew.training.evaluation import EvalSuite, Evaluation, Summary, admit_split
 from dew.training.footprint import candidate_footprint, traced_loss
-from dew.training.interval import Interval, TokenClock, held, throughput
+from dew.training.inspection import Inspection
+from dew.training.interval import Interval, Reading, Taken, TokenClock, held, logged_scalars
 from dew.training.memory import (
     climb_to,
     first_run,
     head_tile_of,
     local_devices,
     memory_record,
-    peak_memory_gib,
     recompute_record,
     refuse_wide_floats,
     rung_record,
@@ -178,7 +178,6 @@ from dew.training.memory import (
 from dew.training.model_flops import (
     TOKENS,
     TRAINING_FLOPS,
-    _TokenCount,
     batch_consumed,
     batch_tokens,
     model_batch,
@@ -227,12 +226,14 @@ StepFn = Callable[[TrainState, Batch], tuple[TrainState, jax.Array, Aux]]
 """A compiled step's body: the state and the global batch in, the new state,
 the loss and the objective's report out."""
 
-CompiledStep = Callable[
-    [TrainState, Batch],
-    tuple[TrainState, jax.Array, dict[str, jax.Array], jax.Array, jax.Array, Committed | None]]
-"""A call returns the stepped state, the scalar loss, the objective's whole
-report (`Aux.metrics`), whether that loss was finite, and whether the
-step's microbatches were accepted, and the transaction's commit telemetry (None for a custom step)."""
+class CompiledStep(Protocol):
+    """A call returns the stepped state, the scalar loss, the objective's whole
+    report (`Aux.metrics`), whether that loss was finite, and whether the
+    step's microbatches were accepted, and the transaction's commit telemetry (None for a custom step);
+    `sampled`, the commit telemetry also summarizes what the run inspects (`Committed.inspected`)."""
+
+    def __call__(self, state: TrainState, batch: Batch, /, sampled: bool = False) -> tuple[
+            TrainState, jax.Array, dict[str, jax.Array], jax.Array, jax.Array, Committed | None]: ...
 
 Loss = DefaultTypeVar("Loss", default=Ratio | jax.Array | float)
 Effects = DefaultTypeVar("Effects", default=None)
@@ -268,6 +269,7 @@ class Trainer(Generic[Loss, Effects]):
         tune_kernels: bool = False,
         record: bool = False,
         links: Mapping[str, Link] | None = None,
+        inspection: Inspection | None = None,
         param_dtype: str | None = None,
     ):
         """Hold everything a run needs, without opening any of it.
@@ -293,6 +295,7 @@ class Trainer(Generic[Loss, Effects]):
         passed as a boundary (`taken_record`). `links` states an axis's `Link` by name in place of measuring
         it (`_links`). `param_dtype`, a dtype's name, stores the parameters the run draws fresh, as Flax's
         `param_dtype` (`dew.state.drawn_in`); None keeps each module's own.
+        `inspection` names what the run watches at its sampled steps (`dew.training.inspection`).
         """
         whole = read_whole(accumulation, split, step, layout, rollout, mesh)
         self.objective = objective
@@ -312,10 +315,14 @@ class Trainer(Generic[Loss, Effects]):
         if record and step is not None:
             raise ValueError("a custom step builds its own Steps, which Trainer(record=True) cannot reach: "
                              "build them with Step(record=True)")
+        if inspection is not None and step is not None:
+            raise ValueError("a custom step commits no update an inspection reads (Trainer(inspection=...)); "
+                             "summarize its arrays in the step's own report")
         self.record = record
         self.records: list[Recorded] = []
         self.profile = profile
         self.lower_for, self._ahead, self.tune_kernels = lower_for, ahead, tune_kernels
+        self.inspection = inspection
         self.param_dtype = param_dtype
         # Set by `compile`, for the batch shape it was called with. A ramped run has one value per stage;
         # `fit` keeps them beside each step. The executable is the step as compiled, whose memory analysis a
@@ -334,6 +341,22 @@ class Trainer(Generic[Loss, Effects]):
         # The links the last compiled step decided its projections by, which say whether one spread over
         # each axis (`dew.nn.sharding.Link`), and each mesh axis's measured bandwidth.
         self.links: dict[str, Link] = {}
+        self._fresh_compile_state(links)
+        # The microbatches a step's batch is read in, once decided (`split`,
+        # 1 where `whole`, a pooling state's window, or the first plan), which
+        # cut every batch the run reads (`_rows`, read off `fit`'s data).
+        self._split: int | None = 1 if whole is not None else split
+        self._rows: tuple[int, ...] | None = None
+        # The stages of the batch ramp `fit` reads, which change the batch's shape; none without one.
+        self._ramp: tuple[Stage, ...] = ()
+        self._stage_starts: frozenset[int] = frozenset()
+        # The training batch's device steps, which the compiled step runs (`Loader.device`).
+        self._device: tuple[DeviceStep, ...] = ()
+        self._prefetch = PREFETCH_DEPTH
+
+    def _fresh_compile_state(self, links: Mapping[str, Link] | None) -> None:
+        """The private state a trainer's compiles and reports start from: the links `links` states, none
+        measured, no rung taken or resumed, and its display."""
         self._stated_links = dict(links or {})
         self._bandwidths: dict[tuple[Mesh, str], float | None] = {}
         self._display = TrainingDisplay()
@@ -355,17 +378,6 @@ class Trainer(Generic[Loss, Effects]):
         self._shape_rungs: dict[str, JSON] = {}
         self._resumed_shapes: dict[str, JSON] = {}
         self._resumed_links: dict[str, float | None] = {}
-        # The microbatches a step's batch is read in, once decided (`split`,
-        # 1 where `whole`, a pooling state's window, or the first plan), which
-        # cut every batch the run reads (`_rows`, read off `fit`'s data).
-        self._split: int | None = 1 if whole is not None else split
-        self._rows: tuple[int, ...] | None = None
-        # The stages of the batch ramp `fit` reads, which change the batch's shape; none without one.
-        self._ramp: tuple[Stage, ...] = ()
-        self._stage_starts: frozenset[int] = frozenset()
-        # The training batch's device steps, which the compiled step runs (`Loader.device`).
-        self._device: tuple[DeviceStep, ...] = ()
-        self._prefetch = PREFETCH_DEPTH
 
     @property
     def optimizer(self) -> optax.GradientTransformation:
@@ -573,7 +585,7 @@ class Trainer(Generic[Loss, Effects]):
         device's memory or a layout that replicates too much of the model, and ValueError for
         rules that name an axis the mesh lacks.
         """
-        self._schedule(None if steps is None else steps // self.accumulation)
+        self.scheduled(None if steps is None else steps // self.accumulation)
         state = jax.eval_shape(self.initial_state)
         if batch is None:
             return self._validated(state, capacity)[1]
@@ -907,13 +919,16 @@ class Trainer(Generic[Loss, Effects]):
               nn.logical_axis_rules(self.layout.axis_rules), measured_links({} if links is None else links)):
             yield schedule
 
-    def _step_body(self, shapes, copies, split: int, fetch: Callable[[TrainState], TrainState] | None = None):
+    def _step_body(self, shapes, copies, split: int, fetch: Callable[[TrainState], TrainState] | None = None,
+                   sampled: bool = False):
         """The objective transaction over a step's batch read in `split` microbatches, which brings the
-        state's fields `fetch` brings to the device only once its gradient is ready, or a custom step
-        with no invented commit telemetry, which reads it whole."""
+        state's fields `fetch` brings to the device only once its gradient is ready, and, `sampled`,
+        summarizes what the run inspects at its commit; or a custom step with no invented commit
+        telemetry, which reads it whole."""
         if self.step is None:
             return Transaction(self.objective, self.optimizer, split * self.accumulation, shapes, copies,
-                               split=split, record=self.record, fetch=fetch, examples=self._examples).step()
+                               split=split, record=self.record, fetch=fetch, examples=self._examples,
+                               inspection=self.inspection if sampled else None).step()
         if not isinstance(self.step, PassesProgress):
             # A custom step need not run the objective's loss, which refuses a model it passes no progress.
             self.objective._refuse_unpassed_progress()
@@ -956,9 +971,9 @@ class Trainer(Generic[Loss, Effects]):
         if (state.scale is not None) != self.dynamic_scale:
             raise ValueError("checkpoint dynamic-scaler configuration differs from this trainer")
         if self.host_master:
-            if self._ahead is not None:
-                raise ValueError("a step compiled ahead runs where the devices hold the state; this "
-                                 "layout keeps the variables on the host")
+            if self._ahead is not None or self.inspection is not None:
+                raise ValueError("a step compiled ahead or inspected runs where the devices hold the state; "
+                                 "this layout keeps the variables on the host")
             return self._compile_host(state, batch)
         planned = self._compiled_plan(state, batch, trials, capacity)
         return self._runner(planned.released(), self.device_mesh)
@@ -999,11 +1014,14 @@ class Trainer(Generic[Loss, Effects]):
         """The step `planned` compiled, which reads a batch in its microbatches."""
         # The program compiled above, not the jit: a call through the jit traces and compiles its own,
         # without the step's compiler options, which was 25 s of an A100's cold start.
-        split, candidate, executable = planned.split, planned.candidate, planned.executable
+        split, candidate = planned.split, planned.candidate
         parts = planned.parts(mesh)
         window = split * self.accumulation
 
-        def run(current, batch):
+        def run(current, batch, sampled: bool = False):
+            # A sampled step summarizes what the run inspects (`Planned.sampled`); every other, the plan's.
+            executable = planned.sampled.executable if sampled and planned.sampled is not None else (
+                planned.executable)
             with self._traced_on(mesh):
                 # Each shape plans its copies (`_at_base_rung`), and a step reads the state with its own.
                 if not candidate.copies:
@@ -1117,9 +1135,10 @@ class Trainer(Generic[Loss, Effects]):
         held = 0 if mesh is not None else prefetched_bytes(batch, placement, self._prefetch) + built
         jitted = self._jitted(shapes, copies, shardings, placement, replicated, split)
         part = jax.ShapeDtypeStruct((), jnp.int32, sharding=replicated)
+        given = placed_shapes(batch, placement) if mesh is not None else batch
         lower = Routed(functools.partial(
             lambda *arguments: jitted.trace(*arguments).lower(lowering_platforms=platforms),
-            *apart(prepared), placed_shapes(batch, placement) if mesh is not None else batch, part))
+            *apart(prepared), given, part))
         if self.tune_kernels and lowering and platforms is None:
             lowered, launches = tuning.tune(lower, measure=True)
         else:
@@ -1127,8 +1146,14 @@ class Trainer(Generic[Loss, Effects]):
             lowered, launches = lower() if lowering else None, launches or "[]"
         footprint = None if self.step is not None or mesh is not None else candidate_footprint(
             self.objective, self._model_shapes(micro), split * self.accumulation, prepared, held)
+        # The sampled step lowers as the step does, over the same arguments, for the same platforms.
+        watched = None if self.inspection is None else self._jitted(shapes, copies, shardings, placement,
+                                                                    replicated, split, sampled=True)
+        sampled = None if watched is None else functools.partial(
+            lambda *arguments: watched.trace(*arguments).lower(lowering_platforms=platforms),
+            *apart(prepared), given, part)
         return Candidate(micro, shapes, copies, shardings, prepared, held, built, lowered, launches,
-                         lower.report() if lowering else KernelReport((), ()), footprint)
+                         lower.report() if lowering else KernelReport((), ()), footprint, sampled)
 
     def _prepared(self, state: TrainState, batch: Batch, schedule: Schedule, window: int,
                   narrow: bool | None = None):
@@ -1147,7 +1172,7 @@ class Trainer(Generic[Loss, Effects]):
         return shapes, copies, prepared
 
     def _jitted(self, shapes, copies: dict, shardings: Placement[TrainState], placement,
-                replicated: NamedSharding, split: int):
+                replicated: NamedSharding, split: int, sampled: bool = False):
         """The step over one of the `split` microbatches of a batch
         (`microbatch`), which counts the step at its last microbatch. It takes the state apart
         (`apart`): the moving state, which it donates and returns advanced, and the frozen tree, which
@@ -1158,7 +1183,7 @@ class Trainer(Generic[Loss, Effects]):
         # from its start.
         late = () if self.step is not None else tuple(set(COMMIT_FIELDS) & set(self.layout.host))
         body = self._step_body(shapes, copies, split, (lambda state: self._fetched(state, shardings, late))
-                               if late else None)
+                               if late else None, sampled)
         moving, frozen = apart(shardings)
 
         def step(current, held, batch, part):
@@ -1223,7 +1248,8 @@ class Trainer(Generic[Loss, Effects]):
                                       record=self.record, examples=self._examples)
             body = transaction.step(realize=execution.realize, host=True)
 
-        def run(current, batch):
+        def run(current, batch, sampled: bool = False):
+            # A host-master run inspects nothing (`compile` refuses it), so no step of it is sampled.
             with self._traced_on(cpu):
                 batch = transfer(batch, batch_shardings(cpu, batch))
                 if self.accumulation > 1 and (current.accumulation is None or (
@@ -1321,7 +1347,7 @@ class Trainer(Generic[Loss, Effects]):
             self.objective, dataset, handed_splits(validation), steps=steps, epochs=epochs, tokens=tokens,
             examples=examples, accumulation=self.accumulation, startup=self._startup)
         self.reading(loader, device_prefetch, examples=examples, steps=steps)
-        self._schedule(None if steps is None else steps // self.accumulation)
+        self.scheduled(None if steps is None else steps // self.accumulation)
         plan = self._plan(loader, held, dataset, steps=steps, tokens=tokens,
                           written=(log_every, eval_every, checkpoint_every),
                           checkpoint_final=checkpoint_final, metrics=metrics, preview=preview,
@@ -1383,8 +1409,10 @@ class Trainer(Generic[Loss, Effects]):
                                                                      self._examples),
         )
 
-    def _schedule(self, updates: int | None) -> None:
-        """The configured optimizer, built for `updates` updates; its state holds the rate it logs."""
+    def scheduled(self, updates: int | None) -> None:
+        """Build the configured optimizer (an `OptimConfig`) for `updates` updates, as `fit` and
+        `validate` do for their run's length; its state holds the rate it logs. A trainer given an Optax
+        transformation keeps it."""
         if self._config is None:
             return
         built = self._config.build(updates, clocked=self._examples is not None)
@@ -1460,9 +1488,11 @@ class Trainer(Generic[Loss, Effects]):
                     # reports that time apart from its steps'.
                     interval.compiling += time.perf_counter() - began
                 with region("train.step"):
-                    state, loss, aux, finite, accepted, committed = train_step(state, device)
-                # Read with this step queued behind the one it describes, so the devices go on meanwhile.
-                self._read_taken(run)
+                    state, loss, aux, finite, accepted, committed = train_step(
+                        state, device, sampled=self.inspection is not None and self.inspection.samples(
+                            run.current + 1))
+                # Written off the loop, which never waits on it (row 2313).
+                self._read_taken(run, wait=False)
                 if self._unproven:
                     # A step's failure on the devices surfaces at the next program that reads its
                     # outputs, the loss counters, so a newly compiled step's first run is awaited here,
@@ -1516,10 +1546,11 @@ class Trainer(Generic[Loss, Effects]):
             assert profiler is not None
             stop_trace = functools.partial(self._stop_trace, run, profile, profiler)
         error = primary
-        # A failed run's peers may be gone: its last log is read only where no read waits on them.
-        unread = (None if run.taken is None or not run.taken.ready()
-                  else functools.partial(self._read_taken, run, agree=False))
-        cleanups = (("Training log", unread), ("Training iterator", close), ("Profiler", stop_trace),
+        # A run's last log is written at its cleanup, a failed run's only where no write waits on a step
+        # its peers may never finish (`LogWriter.raise_failure`).
+        unread = functools.partial(self._read_taken, run, agree=False)
+        cleanups = (("Training log", unread), ("Log writer", run.writer.close), ("Training iterator", close),
+                    ("Profiler", stop_trace),
                     ("Checkpoint wait", None if checkpoints is None else checkpoints.wait),
                     ("Display", self._display.close))
         try:
@@ -2271,74 +2302,46 @@ class Trainer(Generic[Loss, Effects]):
         self._display.status("")
         return time.perf_counter() - paused
 
-    def _read_taken(self, run: FitRun, *, agree: bool = True) -> None:
-        """Read the log the loop took (`Taken`), check its losses and report
-        one logging interval, its clock ending when its step was done.
+    def _read_taken(self, run: FitRun, *, agree: bool = True, wait: bool = True) -> None:
+        """Hand the log the loop took (`Taken`) to the run's writer, which reads it on the host and reports
+        one logging interval off the step loop (`LogWriter`, `_written`), and raise a write's failure: of
+        every write, waiting for each, where `wait`, as before a compile, an evaluation, a save or the end,
+        which read the run's state anyway; else of those done, as each logging tick does, which never waits.
 
-        Rank zero builds the row; every other rank has nothing to report.
-        The report is agreed, so a tracker that failed on rank zero stops its
-        peers here rather than at their next collective; a failed run's
-        cleanup reads without agreeing, since its peers may never agree.
-
-        Loss and objective aux metrics are the logged step's values.
-        train/grad_norm is instead the mean over admitted optimizer commits
-        since the last log: bookkeep sums each window's native gradient norm
-        and its commit count on device, independently of the checkpoint loss
-        sum. A tick with no commit omits it. train/compiles counts this fit's
-        StepCompiled records; persistent-cache counts span all jitted programs
-        in this process, as compilation_cache_counts describes.
-
-        The optimizer state supplies the last applied update's rate
-        (`learning_rate`): a rejected attempt leaves it, and an accumulation
-        window moves it only when its update commits. It joins the same host
-        read as the other interval metrics.
-        """
+        The failures are agreed here, on the loop, at a point every process reaches alike, so a tracker that
+        failed on rank zero, or a losses' streak, stops its peers here rather than at their next collective;
+        a failed run's cleanup raises without agreeing, waiting only on writes that wait on no device, since
+        its peers may never agree and its steps never end."""
         taken, run.taken = run.taken, None
-        if taken is None:
+        if taken is not None:
+            run.writer.submit(functools.partial(self._read_log, run, taken),
+                              functools.partial(self._written, taken), taken.ready)
+        elif not (wait and run.writer.unchecked):
             return
-        counts = taken.counts
-
-        def report() -> None:
-            if jax.process_index() != 0:
-                return
-            # A work count a process refused (`_counted_batch`) is NaN here, and train/mfu absent.
-            work = None if read.training is None else float(read.training)
-            scalars = {"train/loss": float(read.loss),
-                       **{f"train/{k}": float(v) for k, v in read.aux.items()},
-                       **throughput(elapsed, counts.since_log, counts.samples, counts.flops,
-                                    self.device_mesh.devices.size, waited=counts.waited,
-                                    compiling=counts.compiling, training_flops=work,
-                                    tokens=None if read.tokens is None else _TokenCount.host(read.tokens))}
-            scalars["train/accepted"] = float(read.accepted)
-            if read.committed is not None:
-                norms, commits = read.committed
-                if commits:
-                    scalars['train/grad_norm'] = float(norms / commits)
-            scalars['train/compiles'] = float(counts.compiles)
-            scalars.update(compilation_cache_counts())
-            peak = peak_memory_gib()
-            if peak is not None:
-                scalars['train/peak_memory_gib'] = peak
-            if read.rate is not None:
-                scalars["train/learning_rate"] = float(read.rate)
-            if read.scale is not None:
-                scalars["train/loss_scale"] = float(read.scale)
-            if self.rollout is not None:
-                scalars["train/rollout_seconds"] = counts.rollout_seconds
-                scalars.update({f"rollout/{name}": float(value) for name, value in read.rollout.items()})
-            scalars.update(read.statistics)
-            scalars.update(self._startup.scalars())
-            self._display.interval(taken.step, scalars)
-            if self.tracker is not None:
-                self.tracker.log(scalars, taken.step)
-
+        check = functools.partial(run.writer.raise_failure, wait=wait, ready_only=not agree)
         with region("log"):
-            # One read for every number, since each float() of a device array is a copy of its own.
-            read, elapsed = taken.read(self._display)
             if agree:
-                agreed("training reporting", report)
+                agreed("training reporting", check)
             else:
-                report()
+                check()
+
+    def _read_log(self, run: FitRun, taken: Taken) -> tuple[Reading, float]:
+        """`taken` on the host, its losses checked, and its interval's seconds, on the writer's reader
+        thread (`LogWriter`), whose clock it moves."""
+        read, elapsed, run.writer.since = taken.read(self._display, run.writer.since)
+        return read, elapsed
+
+    def _written(self, taken: Taken, reading: tuple[Reading, float]) -> None:
+        """Report `taken`'s interval's scalars (`logged_scalars`) on rank zero, on the writer's reporter
+        thread (`_read_taken`); every other rank has nothing to report."""
+        if jax.process_index() != 0:
+            return
+        read, elapsed = reading
+        scalars = {**logged_scalars(read, taken.counts, elapsed, self.device_mesh.devices.size,
+                                    rollout=self.rollout is not None), **self._startup.scalars()}
+        self._display.interval(taken.step, scalars)
+        if self.tracker is not None:
+            self.tracker.log(scalars, taken.step)
 
     def _reported_outcome(self, error: BaseException | None, run: FitRun) -> BaseException | None:
         """Agree the run's cleanup, report its goodput and its outcome.

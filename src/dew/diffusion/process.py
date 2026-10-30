@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 
 import jax
@@ -139,18 +139,20 @@ class Process:
 
     def denoiser(self, model, params, conditions: Mapping[str, Conditioning],
                  unconditional: Mapping[str, Conditioning] | None = None, *,
-                 schedule: NoiseScheduler | None = None) -> Denoiser:
+                 schedule: NoiseScheduler | None = None, opened: Sequence[str] = ()) -> Denoiser:
         """Return the denoiser of `model` under `params` with the given conditions.
 
         The denoiser maps `(x_t, t)` to `(x_0, epsilon)` with `t` on
         `schedule`, the sampling schedule unless a training objective passes
         its training schedule for the `t` it drew. `unconditional` has the
         same keys with the unconditional values, and classifier-free guidance
-        interpolates against it.
+        interpolates against it. `opened` names the collections its model's
+        calls return beside their outputs (`Denoiser.opened`), a watched
+        step's (`dew.objectives.base.Step.sown`).
         """
         return Denoiser(self, model, params, dict(conditions),
                         None if unconditional is None else dict(unconditional),
-                        self.sampler_schedule if schedule is None else schedule)
+                        self.sampler_schedule if schedule is None else schedule, tuple(opened))
 
 
 @dataclass(frozen=True)
@@ -176,16 +178,25 @@ class Denoiser:
     schedule: NoiseScheduler
     """The schedule `t` is on: the process's sampling schedule for a solver's
     grid, its training schedule for a training objective's draw."""
+    opened: tuple[str, ...] = ()
+    """The collections its model's calls open and return beside their outputs:
+    what a watched step reads of the forward that trains (`raw_observed`). A
+    guidance's prediction on an opened denoiser returns its pair and these
+    (`observed`), through any transform of its own, as the `Guidance` protocol
+    asks; none leaves every call's output alone."""
 
-    def _raw(self, x_t, t, conditions) -> jax.Array:
+    def _raw(self, x_t, t, conditions) -> tuple[jax.Array, Variables | None]:
         """The model's own output at `(x_t, t)`, on the input scale and model
-        time the process's parameterization asks for."""
+        time the process's parameterization asks for, and the collections the
+        call opened (`opened`), None where it opens none."""
         rates = broadcast_rates(self.schedule, t, x_t)
         c_in = self.process.prediction.get_input_scale(rates)
-        output = self.model.apply(self.params, x_t * c_in, self.schedule.model_time(t), **conditions)
+        arguments = (x_t * c_in, self.schedule.model_time(t))
+        output, sown = (self.model.apply(self.params, *arguments, **conditions, mutable=list(self.opened))
+                        if self.opened else (self.model.apply(self.params, *arguments, **conditions), None))
         if not isinstance(output, jax.Array):
             raise TypeError("A diffusion model must return one prediction array")
-        return output
+        return output, None if sown is None else dict(sown)
 
     def convert(self, x_t, t, output) -> tuple[jax.Array, jax.Array]:
         """Return `(x_0, epsilon)` recovered from a raw model output at `(x_t, t)`."""
@@ -196,6 +207,19 @@ class Denoiser:
 
     def __call__(self, x_t, t) -> tuple[jax.Array, jax.Array]:
         return self.convert(x_t, t, self.raw(x_t, t))
+
+    def predict(self, x_t, t
+                ) -> tuple[jax.Array, jax.Array] | tuple[tuple[jax.Array, jax.Array], Variables | None]:
+        """`(x_0, epsilon)` at `(x_t, t)` as an unguided walk predicts it, observed where the denoiser is
+        opened (`observed`)."""
+        output, sown = self.raw_observed(x_t, t)
+        return self.observed(self.convert(x_t, t, output), sown)
+
+    def observed(self, pair: tuple[jax.Array, jax.Array], sown: Variables | None
+                 ) -> tuple[jax.Array, jax.Array] | tuple[tuple[jax.Array, jax.Array], Variables | None]:
+        """A prediction's return: `pair`, and beside it what its model's calls opened (`opened`), where
+        the denoiser opens any; the shape every guidance's prediction returns."""
+        return pair if not self.opened else (pair, sown)
 
     def spanning(self, t, t_next) -> Denoiser:
         """Return this denoiser over the interval from `t` to `t_next`.
@@ -213,10 +237,19 @@ class Denoiser:
 
     def raw(self, x_t, t) -> jax.Array:
         """Return the model's raw output at `(x_t, t)` under the conditions."""
+        return self.raw_observed(x_t, t)[0]
+
+    def raw_observed(self, x_t, t) -> tuple[jax.Array, Variables | None]:
+        """The model's raw output at `(x_t, t)` under the conditions, and what the call opened
+        (`opened`), None where it opens none."""
         return self._raw(x_t, t, self.conditions)
 
     def raw_both(self, x_t, t) -> tuple[jax.Array, jax.Array]:
-        """Return the conditional and the unconditional raw outputs.
+        """Return the conditional and the unconditional raw outputs."""
+        return self.raw_both_observed(x_t, t)[0]
+
+    def raw_both_observed(self, x_t, t) -> tuple[tuple[jax.Array, jax.Array], Variables | None]:
+        """Return the conditional and the unconditional raw outputs, and what their call opened.
 
         Both come from one model call over the doubled batch. Raises
         `ValueError` when the denoiser has no unconditional conditions.
@@ -229,9 +262,9 @@ class Denoiser:
             lambda given, null: jnp.concatenate(
                 [given, jnp.broadcast_to(null, given.shape)], axis=0),
             self.conditions, aligned_conditions(self.conditions, self.unconditional))
-        output = self._raw(
+        output, sown = self._raw(
             jnp.concatenate([x_t, x_t], axis=0), jnp.concatenate([t, t], axis=0), doubled)
-        return output[:batch], output[batch:]
+        return (output[:batch], output[batch:]), sown
 
 
 __all__ = ["Denoiser", "DenoisingCondition", "Process", "aligned_conditions"]
