@@ -12,6 +12,7 @@ import pytest
 from steady_state import guarded
 
 import dew
+from dew.telemetry import profile
 from dew.telemetry.profile import active_profile, program_kernels
 
 
@@ -79,6 +80,26 @@ def test_manual_context_and_restart_preserve_each_native_capture(tmp_path, nativ
                     if artifact.suffix == ".json":
                         json.loads(artifact.read_bytes())
     assert result.is_ready()
+
+
+def test_a_stop_that_does_not_wait_exports_its_capture_in_a_process_of_its_own(tmp_path, native_reports,
+                                                                             monkeypatch):
+    """A capture stopped without waiting (`Profiler.stop(wait=False)`, a training window's) is stopped at
+    once and its reports and manifest made in a process of their own, never by the caller's, whole once
+    `exported` returns (row 2017)."""
+    def unconverted(*arguments):
+        raise AssertionError("the caller converted its capture itself")
+
+    monkeypatch.setattr(profile, "_reports", unconverted)
+    profiler = dew.Profiler(tmp_path).start()
+    work().block_until_ready()
+    profiler.stop(wait=False)
+    assert not profiler.running and active_profile() is None
+    profile.exported(tmp_path)
+    (capture,) = captures(tmp_path)
+    record = manifest(capture)
+    assert record["capture_status"] == record["export_status"] == "completed"
+    assert any(report["status"] == "completed" for report in record["reports"])
 
 
 def test_body_failure_keeps_trace_and_releases_for_next_capture(tmp_path, native_reports):

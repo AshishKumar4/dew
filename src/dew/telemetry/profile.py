@@ -11,6 +11,8 @@ from __future__ import annotations
 import importlib
 import json
 import logging
+import multiprocessing
+import multiprocessing.process
 import os
 import shlex
 import tempfile
@@ -410,10 +412,14 @@ class Profiler:
             raise
         return self
 
-    def stop(self) -> None:
-        self._stop("completed")
+    def stop(self, *, wait: bool = True) -> None:
+        """Stop the capture and export its reports and manifest: at once, or where not `wait`, in a process
+        of its own beside the caller's work, the capture already stopped, which `exported` completes and
+        the program's exit waits for. A training run's window stops so, since converting a capture takes
+        far longer than the steps it traced (row 2017: minutes for a 3-step window)."""
+        self._stop("completed", wait=wait)
 
-    def _stop(self, body: str) -> None:
+    def _stop(self, body: str, *, wait: bool = True) -> None:
         global _active
         failures: list[BaseException] = []
         with _lifecycle:
@@ -440,18 +446,19 @@ class Profiler:
         assert capture is not None and converter is not None
         self._captures.append(capture)
         metadata["body_status"] = body
-        reasons = [] if failures else held_back(capture, metadata)
-        metadata["capture_status"] = "failed" if failures else "partial" if reasons else "completed"
-        metadata["capture_errors"] = [str(error) for error in failures]
-        metadata["capture_reasons"] = [*reasons]
-        try:
-            _reports(capture, converter, metadata)
-        except BaseException as error:
-            failures.append(error)
         if self._temporary:
             _logger.info("Profile saved under %s", self._directory)
+        if wait:
+            _export(capture, converter, metadata, failures)
+            return
         if failures:
-            raise BaseExceptionGroup("Profile cleanup or export failed", failures)
+            raise BaseExceptionGroup("Profile cleanup failed", failures)
+        # A fresh interpreter's: the conversion reads and writes on its own, and holds no lock the caller's
+        # steps take (the converter's native calls may hold the GIL throughout).
+        exporting = multiprocessing.get_context("spawn").Process(
+            target=_exported, args=(str(capture), metadata), name=f"dew-profile-export-{capture.name}")
+        exporting.start()
+        _exporting[capture] = exporting
 
     def __enter__(self) -> Self:
         return self.start()
@@ -465,6 +472,47 @@ class Profiler:
                 if exc is None:
                     raise
                 exc.add_note(f"Profile cleanup/report failure: {error}")
+
+
+_exporting: dict[Path, multiprocessing.process.BaseProcess] = {}
+"""The captures a stop left exporting in a process of their own (`Profiler.stop`), until `exported`."""
+
+
+def exported(directory: Path | None = None) -> None:
+    """Wait for the exports `Profiler.stop` left running in processes of their own, of every capture or of
+    those under `directory`, refusing any that failed: what reads a capture's reports and manifest reads
+    them after this (`dew.training.profiling.ProfileReport`)."""
+    root = None if directory is None else Path(directory).expanduser().resolve()
+    waited = [capture for capture in _exporting if root is None or capture.is_relative_to(root)]
+    failed = []
+    for capture in waited:
+        process = _exporting.pop(capture)
+        process.join()
+        if process.exitcode:
+            failed.append(f"{capture} (exit {process.exitcode}; its manifest records why)")
+    if failed:
+        raise RuntimeError("Profile export failed for " + ", ".join(failed))
+
+
+def _export(capture: Path, converter: _Converter, metadata: dict[str, JSON],
+            failures: list[BaseException]) -> None:
+    """Export a stopped `capture`: its status from what it holds (`held_back`), its native reports and its
+    manifest (`_reports`), raising every failure of the stop (`failures`) and of the export together."""
+    reasons = [] if failures else held_back(capture, metadata)
+    metadata["capture_status"] = "failed" if failures else "partial" if reasons else "completed"
+    metadata["capture_errors"] = [str(error) for error in failures]
+    metadata["capture_reasons"] = [*reasons]
+    try:
+        _reports(capture, converter, metadata)
+    except BaseException as error:
+        failures.append(error)
+    if failures:
+        raise BaseExceptionGroup("Profile cleanup or export failed", failures)
+
+
+def _exported(capture: str, metadata: dict[str, JSON]) -> None:
+    """`_export` in an export's own process (`Profiler.stop`), whose exit code says whether it failed."""
+    _export(Path(capture), require_profile_support(), metadata, [])
 
 
 def region(name: str) -> AbstractContextManager[None]:

@@ -9,6 +9,7 @@ import contextlib
 import dataclasses
 import functools
 import gc
+import json
 import struct
 import weakref
 from collections.abc import Callable, Iterator
@@ -40,6 +41,7 @@ from dew.objectives.lm import LMObjective
 from dew.objectives.lm.chunked import chunked_tile
 from dew.registry import mixers
 from dew.state import TrainState, apart
+from dew.telemetry import profile as telemetry_profile
 from dew.telemetry.instrumentation import Compiles
 from dew.training import Trainer
 from dew.training.distributed import microbatch
@@ -444,9 +446,12 @@ def test_the_executable_a_profile_replaces_goes_with_its_program():
     assert live_executables() == trials.live and int(state.step) == 3
 
 
-def test_a_profile_window_traces_steps_past_the_first_compile_and_is_refused_under_autopgle(tmp_path):
+def test_a_profile_window_traces_steps_past_the_first_compile_and_is_refused_under_autopgle(tmp_path,
+                                                                                            monkeypatch):
     """A fit's window opens once its warmup steps have run and its first step has compiled, so a window of
-    no warmup traces the three steps after the first, never the compile. Under JAX's AutoPGLE, which
+    no warmup traces the three steps after the first, never the compile; its reports are exported in a
+    process of their own while the run trains on, never by the run's (row 2017), and are whole once
+    `exported` returns. Under JAX's AutoPGLE, which
     profiles each program's first runs in a profiling session of its own where a process holds one at a
     time, a fit with a window is refused before it trains, naming JAX's way to capture guided programs
     (`PGLE_CAPTURE`): JAX's sessions would fail inside the window, as the trainer's would."""
@@ -469,10 +474,16 @@ def test_a_profile_window_traces_steps_past_the_first_compile_and_is_refused_und
         rows = Replaying(lambda position: {"text": np.asarray(BATCH["text"])})
         trainer.fit(Loader(lambda partition: rows, None, None, ROWS), steps=5, log_every=1)
 
+    def unconverted(*arguments):
+        raise AssertionError("the run converted its capture itself")
+
+    monkeypatch.setattr(telemetry_profile, "_reports", unconverted)
     fit(tmp_path / "window")
+    telemetry_profile.exported(tmp_path / "window")
     (window,) = [value for _, value in tracker.artifacts if type(value).__name__ == "ProfileWindow"]
     (capture,) = (tmp_path / "window").glob("capture-*")
     assert window.steps == 3 and traced_steps(capture) == (1, 2, 3)
+    assert json.loads((capture / "manifest.json").read_text())["export_status"] == "completed"
     with autopgle(2), pytest.raises(ValueError):
         fit(tmp_path / "pgle")
     assert not (tmp_path / "pgle").exists()
