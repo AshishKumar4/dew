@@ -291,6 +291,36 @@ def test_a_call_over_requests_scores_in_a_servers_passes_over_its_programs(decid
         assert discrete(answers) == discrete(declared(state, questions))
 
 
+def test_a_tasks_scoring_plan_is_built_by_its_first_call_and_held_by_the_rest(decide):
+    """A task's calls score over its one scoring plan (`RowScoring`: its passes' shapes, each pass
+    length's window bounds and its packs), which its first call builds and the rest read, where a plan
+    rebuilt each call laid its probe rows out and bounded every ladder length again (ledger 2590)."""
+    import dataclasses
+
+    from dew.decision import Question
+
+    bounded: list[int] = []
+
+    class Counted(type(decide.layout)):
+        """The task's own layout, counting the window bounds it is asked for."""
+
+        def bounds(self, *args, **kwargs):
+            bounded.append(self.max_len)
+            return super().bounds(*args, **kwargs)
+
+    stated = {field.name: getattr(decide.layout, field.name) for field in dataclasses.fields(decide.layout)
+              if field.init}
+    task = replace(decide, layout=Counted(**stated))
+    questions = {name: Question.from_wire(wire) for name, wire in REQUEST["questions"].items()}
+    first = task(REQUEST["state"], questions)
+    assert bounded, "the first call bounds its passes' windows"
+    bounded.clear()
+    again = task(REQUEST["state"], questions)
+    assert not bounded, bounded
+    for name, answer in again.items():
+        np.testing.assert_array_equal(answer.probabilities, first[name].probabilities)
+
+
 def test_a_scoring_pass_looks_at_every_waiting_request(decide):
     """A pass takes rows from every waiting request while its plan takes them, not from a bounded few: a
     hundred short requests one pass's windows hold are answered in one step, where a pass of 64 requests

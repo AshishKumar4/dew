@@ -21,7 +21,6 @@ from dew.nn.kernels.templates import cost
 
 if TYPE_CHECKING:
     from dew.nn.kernels.generation import GpuTarget
-    from dew.nn.kernels.templates.liveness import Compiler
     from dew.nn.kernels.templates.mosaic import Family
 
 
@@ -72,27 +71,6 @@ def allocated(*sizes: int) -> int:
     return sum(-(-size // SMEM_ALIGNMENT) * SMEM_ALIGNMENT for size in sizes)
 
 
-@dataclasses.dataclass(frozen=True)
-class RegisterAccount:
-    """A consumer's held workspace, charged once alongside its tile registers. Capacity derivations use
-    the inverse charge, and a separate phase contributes only its excess over that workspace."""
-    held: int
-
-    def total(self, live: int) -> int:
-        return self.held + live
-
-    def available(self, budget: int) -> int:
-        return budget - self.held
-
-    def extra(self, phase: int) -> int:
-        return max(0, self.available(phase))
-
-
-def register_account(family: "Family") -> RegisterAccount:
-    """The accounting for this family's held set; its current estimate has one reader here."""
-    return RegisterAccount(family.held_registers)
-
-
 def live_registers(family: "Family", carried, *phases) -> int:
     """The registers a consumer thread of `family` holds over a live set: the tiles it carries across its
     walk (`carried`, each `(rows, columns, dtype)`: its accumulators, a running statistic) and the largest
@@ -104,7 +82,7 @@ def live_registers(family: "Family", carried, *phases) -> int:
         return sum(rows * columns * jnp.dtype(dtype).itemsize / 4 for rows, columns, dtype in tiles)
 
     phase = max((words(tiles) for tiles in phases), default=0.0)
-    return register_account(family).total(int(-(-(words(carried) + phase) // THREADS)))
+    return family.held_registers + int(-(-(words(carried) + phase) // THREADS))
 
 
 def operand_fragments(family: "Family", rows: int, depth: int, columns: int, lhs, rhs, *, lhs_parts: int = 1,
@@ -153,7 +131,7 @@ def program_shared(block: int, programs: int) -> int:
 def held_area(family: "Family", consumers: int) -> int:
     """The fp32 accumulator elements `consumers` consumers of `family` hold beside what they hold besides
     (`Family.held_registers`): a derived tile's rows times columns at most (`held_rows` at any columns)."""
-    return register_account(family).available(family.registers(consumers)) * THREADS * consumers
+    return (family.registers(consumers) - family.held_registers) * THREADS * consumers
 
 
 def held_rows(family: "Family", consumers: int, columns: int) -> int:
@@ -312,6 +290,19 @@ class LaunchPlan:
     shared: int
 
 
+def _register_allocation(registers: int, consumers: int, producer: int, step: int) -> int:
+    consumed = -(-registers // step) * step
+    produced = -(-producer // step) * step
+    return (consumers * consumed + produced) * THREADS
+
+
+def register_programs(family: "Family", consumers: int) -> int:
+    """Programs held by the family's role allocations, including the producer where it has one."""
+    producer = producer_registers(consumers) if family.warpgroups(consumers) > consumers else 0
+    allocated = _register_allocation(family.registers(consumers), consumers, producer, family.register_step)
+    return cost.REGISTERS // allocated
+
+
 @dataclasses.dataclass(frozen=True)
 class RegisterModel:
     """A launch's register decision as its template's model states it, which the compile gate holds the
@@ -327,57 +318,45 @@ class RegisterModel:
     step: int
     producer: int
     shared: int | None = None
+    family: "Family | None" = dataclasses.field(default=None, compare=False, repr=False)
 
+    def resident(self, registers: int, *, honored: bool = RAISES_HONORED) -> int:
+        """Residency at this consumer allocation, bounded by the launch's other resources."""
+        producer = self.producer if honored or not self.producer else registers
+        allocated = _register_allocation(registers, self.consumers, producer, self.step)
+        return min(self.most, cost.REGISTERS // allocated) if allocated else self.most
 
-@dataclasses.dataclass(frozen=True)
-class LoweredRegisters:
-    """One launch's live register set, before the assembler schedules and allocates it."""
-    name: str
-    registers: int
-    fragments: int
-    scalars: int
-    threads: int
-    producer: int
-    raised: int
-    where: str
+    def cap(self, programs: int, *, honored: bool = RAISES_HONORED) -> int:
+        """The consumer cap that leaves room for `programs` copies of this launch."""
+        share = cost.REGISTERS // (THREADS * programs)
+        if honored or not self.producer:
+            return (share - self.producer) // self.consumers // self.step * self.step
+        return share // (self.consumers + 1) // self.step * self.step
 
-    def model(self, target: "GpuTarget", compiler: "Compiler", *, shared: int, tmem: int) -> RegisterModel:
-        """Its launch budget and residency, from this launch's geometry and resource allocations."""
-        groups = self.threads // THREADS
-        consumers = groups - bool(self.producer)
-        budget = (self.raised if self.raised and not compiler.relocatable else entry_registers(groups))
-        most = target.architecture.resident_threads // self.threads
-        if target.shared_limit is not None:
-            most = min(most, (target.shared_limit + cost.RESERVED_SHARED) // (shared + cost.RESERVED_SHARED))
-        if tmem:
-            most = min(most, (target.tmem_columns or 0) // tmem)
-        producer = (self.producer if not compiler.relocatable else budget) if self.producer else 0
-        return RegisterModel(self.registers, budget, consumers, most, cost.REGISTER_STEP, producer, shared)
-
-
-def lowered_registers(module: bytes, compiler: "Compiler") -> list[LoweredRegisters]:
-    """Analyze the module an existing Mosaic custom call carries, without tracing or compiling it again.
-    The compiler version and assembly mode are inputs, never read from a process-global installation."""
-    from dew.nn.kernels.templates.liveness import kernel_peaks
-
-    found = []
-    for name, peak, _ in kernel_peaks(module, compiler):
-        if peak.threads is None:
-            continue
-        if peak.threads % THREADS or peak.threads < THREADS:
-            raise ValueError(f"Mosaic launch has {peak.threads} threads, not whole warpgroups")
-        found.append(LoweredRegisters(name, peak.total, peak.fragments, peak.scalars, peak.threads,
-                                       peak.producer, peak.raised, peak.where))
-    return found
+    def record(self) -> dict:
+        """The model's numeric facts; its live family supplies rules, not serialized state."""
+        return {field.name: getattr(self, field.name) for field in dataclasses.fields(self)
+                if field.name != "family"}
 
 
 def register_model(family: "Family", consumers: int, registers: int | None, *,
-                   shared: int | None = None) -> RegisterModel:
+                   shared: int | None = None, target: "GpuTarget | None" = None,
+                   tmem: int = 0) -> RegisterModel:
     """`family`'s register decision for a launch of `consumers` whose consumer thread holds `registers`
     (`RegisterModel`): its producer's registers where its layout has one (`Family.warpgroups`)."""
-    producer = family.warpgroups(consumers) > consumers
-    return RegisterModel(registers, family.registers(consumers), consumers, family.programs(consumers),
-                         family.register_step, producer_registers(consumers) if producer else 0, shared)
+    warpgroups = family.warpgroups(consumers)
+    most = register_programs(family, consumers)
+    if target is not None:
+        from dew.nn.kernels import generation
+
+        most = min(most, target.architecture.resident_threads // (warpgroups * THREADS))
+        if shared is not None:
+            block = generation.shared_budget(target)
+            most = next((count for count in range(most, 0, -1) if shared <= program_shared(block, count)), 0)
+        if tmem:
+            most = min(most, (target.tmem_columns or 0) // tmem)
+    return RegisterModel(registers, family.registers(consumers), consumers, most, family.register_step,
+                         producer_registers(consumers) if warpgroups > consumers else 0, shared, family)
 
 
 @dataclasses.dataclass(frozen=True)

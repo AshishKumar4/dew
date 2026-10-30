@@ -20,6 +20,7 @@ operation to the program, and outside `generation.routes()` it records nothing
 from __future__ import annotations
 
 import dataclasses
+import functools
 from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
@@ -47,38 +48,63 @@ class Refusal:
         return self.detail
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, init=False)
 class Requirement[C]:
-    """One fact a kernel needs of a case `C`, the description its op's selector reads: `code` names
-    it in a refusal, `holds(case)` tests it on the target (`generation`'s facts, honouring
-    `assumed`), and `detail` (text, or a function of the case) says why a call fails it. A limit
-    the code could lift names the `row` of the roadmap or ledger that tracks lifting it; one no
-    implementation of the kernel lifts names `INHERENT`. Its
-    `kind` is 'capability', what the kernel cannot compute; 'measured', where the target measured
-    another kernel faster or never qualified this one, which a forced choice overrides; or
-    'handoff', a call structurally outside what the kernel applies to, which it hands to the op's next
-    kernel even when forced (a generic kernel's to the next generic one, a join's projections run apart, a
-    decode token with nothing to fuse runs the step alone)."""
+    """One fact a kernel needs of a case `C`, the description its op's selector reads: its `analysis` of a
+    case, the refusal a call that fails it gets (its `code` and the detail a log names), or None where the
+    case holds it (`generation`'s facts, honouring `assumed`). A limit the code could lift names the `row`
+    of the roadmap or ledger that tracks lifting it; one no implementation of the kernel lifts names
+    `INHERENT`; every refusal the requirement reports carries them (`check`). Its `kind` is 'capability',
+    what the kernel cannot compute; 'measured', where the target measured another kernel faster or never
+    qualified this one, which a forced choice overrides; or 'handoff', a call structurally outside what the
+    kernel applies to, which it hands to the op's next kernel even when forced (a generic kernel's to the
+    next generic one, a join's projections run apart, a decode token with nothing to fuse runs the step
+    alone).
+
+    Built from a predicate, `Requirement(code, holds, detail, row, kind)`: it holds where `holds(case)` does,
+    its refusal `code` with `detail` (text, or a function of the case); or from an analysis that finds its
+    own refusal (`analysed`)."""
 
     code: str
-    holds: Callable[[C], bool]
-    detail: str | Callable[[C], str]
+    analysis: Callable[[C], Refusal | None]
     row: str
-    kind: str = 'capability'
+    kind: str
 
-    def __post_init__(self) -> None:
-        if not self.row:
-            raise ValueError(f"requirement {self.code!r} names the row that tracks lifting it, or INHERENT")
-        if self.kind not in ('capability', 'measured', 'handoff'):
-            raise ValueError(f"requirement {self.code!r} is of kind {self.kind!r}, not capability, measured "
-                             "or handoff")
+    def __init__(self, code: str, holds: Callable[[C], bool] | None = None,
+                 detail: str | Callable[[C], str] = "", row: str = "", kind: str = 'capability', *,
+                 analysis: Callable[[C], Refusal | None] | None = None) -> None:
+        if not row:
+            raise ValueError(f"requirement {code!r} names the row that tracks lifting it, or INHERENT")
+        if kind not in ('capability', 'measured', 'handoff'):
+            raise ValueError(f"requirement {code!r} is of kind {kind!r}, not capability, measured or handoff")
+        if holds is not None and analysis is None:
+            def predicate(case: C, holds: Callable[[C], bool] = holds) -> Refusal | None:
+                return None if holds(case) else Refusal(code, detail(case) if callable(detail) else detail)
+
+            analysis = predicate
+        elif (holds is None) == (analysis is None):
+            raise ValueError(f"requirement {code!r} is a predicate `holds` or an `analysis`, one of them")
+        for name, value in (("code", code), ("analysis", analysis), ("row", row), ("kind", kind)):
+            object.__setattr__(self, name, value)
+
+    def holds(self, case: C) -> bool:
+        """Whether `case` meets the requirement."""
+        return self.analysis(case) is None
 
     def check(self, case: C) -> Refusal | None:
-        """The failed requirement's data, or None when it holds."""
-        if self.holds(case):
-            return None
-        return Refusal(self.code, self.detail(case) if callable(self.detail) else self.detail,
-                       self.row, self.kind)
+        """The refusal `case` gets, under the requirement's row and kind, or None when it holds."""
+        found = self.analysis(case)
+        return None if found is None else dataclasses.replace(found, row=self.row, kind=self.kind)
+
+
+def analysed[C](code: str, analysis: Callable[[C], Refusal | None], row: str,
+                kind: str = 'capability') -> Requirement[C]:
+    """The requirement an analysis decides (a mainloop's reason it declines a pass,
+    `attention_route.MAINLOOP`): it reports the analysis's own refusal, its code and detail, under its row
+    and kind. A function, not a method of `Requirement`: its case in a return position would make the
+    requirement's case invariant, and a requirement of a protocol's case (`recurrence_chunk.Templated`)
+    would no longer serve its ops'."""
+    return Requirement(code, row=row, kind=kind, analysis=analysis)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -87,20 +113,17 @@ class Kernel[C]:
     whether it is `generic`, a path that takes what the others turn down."""
 
     name: str
-    supports: tuple[Requirement[C] | Callable[[C], Refusal | None], ...]
+    supports: tuple[Requirement[C], ...]
     generic: bool = False
 
     def failed(self, case: C, forced: bool = False) -> list[Refusal]:
         """The requirements `case` fails, evaluated once, in order; forcing overrides measured preferences."""
         failures = []
         for requirement in self.supports:
-            if isinstance(requirement, Requirement):
-                if forced and requirement.kind == 'measured':
-                    continue
-                refusal = requirement.check(case)
-            else:
-                refusal = requirement(case)
-            if refusal is not None and not (forced and refusal.kind == 'measured'):
+            if forced and requirement.kind == 'measured':
+                continue
+            refusal = requirement.check(case)
+            if refusal is not None:
                 failures.append(refusal)
         return failures
 
@@ -134,6 +157,10 @@ class Op[C]:
     hosted: Callable[[str], str] = lambda kernel: kernel
     declared: Mapping[tuple[str | None, str], tuple[str, str]] = dataclasses.field(
         default_factory=dict, compare=False, hash=False)
+    named_from: Mapping[tuple[str, str], str] = dataclasses.field(
+        default_factory=dict, compare=False, hash=False)
+    """Another op's named choice that names this one's kernel, unless this call or op names its own.
+    Entries are ordered, as the op's requirements and candidates are."""
 
     def kernel(self, name: str) -> Kernel[C]:
         for kernel in self.kernels:
@@ -141,6 +168,22 @@ class Op[C]:
                 return kernel
         raise ValueError(f"{self.choice} has no kernel {name!r}; its kernels are "
                          f"{', '.join(kernel.name for kernel in self.kernels)}")
+
+    def bound[**P, R](self, call: Callable[P, R]) -> Callable[P, R]:
+        """Keep this op's named choice when `call` runs later, such as a pullback outside its forward's
+        scope. With no named choice, the later call keeps deciding in the scope where it runs."""
+        requested = _named(self, None)
+        if requested is None:
+            return call
+
+        @functools.wraps(call)
+        def scoped(*args: P.args, **kwargs: P.kwargs) -> R:
+            from . import generation
+
+            with generation.chosen(**{self.choice: requested}):
+                return call(*args, **kwargs)
+
+        return scoped
 
 
 class KernelRefused(ValueError):
@@ -160,6 +203,13 @@ def forced(choice: str) -> str | None:
     return dict(cache.KERNEL_CHOICES.value).get(choice)
 
 
+def _named(op: Op, named: str | None) -> str | None:
+    if (requested := named or forced(op.choice)) is not None:
+        return requested
+    return next((kernel for (parent, choice), kernel in op.named_from.items() if forced(parent) == choice),
+                None)
+
+
 def select[C](op: Op[C], case: C, named: str | None = None, *, preference: tuple[str, ...] = ()) -> Route:
     """The kernel `op` runs for `case` on the target, reported as its route: `named` (or the kernel
     `chosen` names) where it takes the case, else the op's preference (`preferred`, or the first of its
@@ -169,7 +219,8 @@ def select[C](op: Op[C], case: C, named: str | None = None, *, preference: tuple
     ones). A call's soft `preference`, where neither `named` nor `chosen` forces a kernel, is its own order
     of the op's kernels: the first of them that takes the case, the first passing what the targets measured
     of it as a named kernel does, and its refusal reported (a norm's per-call implementation, an explicit
-    xla's decode step). The route states what forced it (`Route.forced`)."""
+    xla's decode step). `Op.named_from` declares a named dependency where neither the call nor this op
+    names its own kernel. The route states what forced it (`Route.forced`)."""
     from . import generation
 
     kernel, preferred, refusal, insisted = _decided(op, case, named, preference)
@@ -188,8 +239,8 @@ def selected[C](op: Op[C], case: C, named: str | None = None, *, preference: tup
 def _decided[C](op: Op[C], case: C, named: str | None,
                 preference: tuple[str, ...]) -> tuple[Kernel[C], str, Refusal | None, str | None]:
     """`select`'s kernel for `case`, the kernel preferred, the preferred one's refusal and the kernel that
-    forced the choice (`named`, else `chosen`'s), None where nothing did."""
-    insisted = named or forced(op.choice)
+    forced the choice (the call, its own `chosen`, then `named_from`), None where nothing did."""
+    insisted = _named(op, named)
     soft = insisted is None and bool(preference)
     if soft:
         # The call's own order, exactly: its first the call's pick, the rest its fallbacks in turn.

@@ -48,17 +48,7 @@ from flax.core.scope import Variable
 from flax.typing import Dtype, PrecisionLike
 from jax.extend.core import Literal, primitives
 
-from dew.batch import (
-    COORDINATES_FIELD,
-    POSITIONS_FIELD,
-    SEGMENTS_FIELD,
-    TOKEN_LAYOUT_FIELDS,
-    VALIDITY_FIELD,
-    Coordinates,
-    Variables,
-    real_slots,
-    token_coordinates,
-)
+from dew.batch import COORDINATES_FIELD, Coordinates, Variables, real_slots, token_coordinates
 from dew.distributed.placement import Layout
 from dew.interop import sources, verify
 from dew.interop.decoder_parts import context_lengths
@@ -1146,23 +1136,26 @@ class TorchCausalLM(nn.Module):
 
     @nn.compact
     def __call__(self, tokens, train: bool = False, decode: bool = False, attention_mask=None,
-                 positions=None, **packing) -> jax.Array:
+                 positions=None, segment_ids=None, coordinates: Coordinates | None = None,
+                 **packing) -> jax.Array:
         """The logits of `tokens`, in at least float32: of whole rows laid as `logits` lays them, or
         with `decode` of a decoding call into the cache `init_cache` opened, `attention_mask` `[B, S]`
         the tokens that write and `positions` `[B, S]` their places in their rows (their slots where
-        None), or the rows' `coordinates` stating both; a decoding row holds one document."""
-        fields = {name: value for name, value in ((VALIDITY_FIELD, attention_mask),
-                                                  (POSITIONS_FIELD, positions)) if value is not None}
+        None), or the rows' `coordinates` stating both, converted once (`token_coordinates`); a
+        decoding row holds one document."""
+        laid = token_coordinates(jnp.shape(tokens)[:2], coordinates, segments=segment_ids,
+                                 valid=attention_mask, positions=positions)
+        given = {} if laid is None else {COORDINATES_FIELD: laid}
         if not decode:
-            return self.logits(tokens, train=train, **fields, **packing)
+            return self.logits(tokens, train=train, **given, **packing)
         if self.graph.attention_impl is None:
             raise Lacks("cache", "this model runs transformers' own attention, and a decode cache is the one "
                                  "Dew's attention writes")
-        laid = self._laid(tokens, {**fields, **packing})
+        laid = self._laid({**given, **packing})
         if laid is not None and laid.max_segments > 1:
             raise ValueError("a decoding row continues one document, and these rows hold several")
         # The tokens that write: those the validity marks less the padding a row numbers 0 in its documents.
-        real = real_slots({**fields, **packing}, jnp.shape(tokens)[:2])
+        real = real_slots(given, jnp.shape(tokens)[:2])
         return self._decoded(tokens, real, None if laid is None else laid.positions)
 
     @property
@@ -1238,7 +1231,7 @@ class TorchCausalLM(nn.Module):
     def logits(self, tokens, *, train: bool = False, **packing) -> jax.Array:
         """The logits of the whole rows, as `__call__` returns them: in at least float32
         (`at_least_fp32`), so a float64 model's are float64, as its output table's are."""
-        logits, _ = self._run(tokens, train, self._laid(tokens, packing))
+        logits, _ = self._run(tokens, train, self._laid(packing))
         return logits.astype(at_least_fp32(logits.dtype))
 
     def hidden_states(self, tokens, train: bool = False, *, conditioning: Mapping[str, object] | None = None,
@@ -1253,7 +1246,7 @@ class TorchCausalLM(nn.Module):
         A tier-3 model reads no context: `conditioning` stays empty."""
         if conditioning:
             raise TypeError("a tier-3 model has no cross-attention to read a context with")
-        laid = self._laid(tokens, packing)
+        laid = self._laid(packing)
         if attention_key_runs is not None:
             from dew.nn.attention_masks import visibility_mask
 
@@ -1278,24 +1271,19 @@ class TorchCausalLM(nn.Module):
         logits, _ = self._run(tokens, train=False, head_input=hidden)
         return logits.astype(at_least_fp32(logits.dtype))
 
-    def _laid(self, tokens, packing: Mapping[str, object]) -> Coordinates | None:
-        """The rows' `Coordinates` from their packing fields, None for none: a model on Dew's attention
-        reads `coordinates`, else `segment_ids`, `positions` and the validity field; one on
-        transformers' own refuses them (`_refuse_packing`)."""
+    def _laid(self, packing: Mapping[str, object]) -> Coordinates | None:
+        """The rows' `Coordinates`, their layout past `__call__` (ledger 1122), None for none: a model on
+        Dew's attention reads them, one on transformers' own refuses them (`_refuse_packing`); any
+        other field is refused."""
         if self.graph.attention_impl is None:
             _refuse_packing(packing)
             return None
-        unknown = sorted(set(packing) - {COORDINATES_FIELD, *TOKEN_LAYOUT_FIELDS})
-        if unknown:
-            raise Lacks("packing", f"a tier-3 model reads its rows' documents, positions and validity, "
-                                   f"not {unknown}")
-        if not packing:
-            return None
         laid = packing.get(COORDINATES_FIELD)
-        batch, length = jnp.shape(tokens)[:2]
-        return token_coordinates((batch, length), laid if isinstance(laid, Coordinates) else None,
-                                 segments=packing.get(SEGMENTS_FIELD), valid=packing.get(VALIDITY_FIELD),
-                                 positions=packing.get(POSITIONS_FIELD))
+        unknown = sorted(set(packing) - {COORDINATES_FIELD})
+        if unknown or (laid is not None and not isinstance(laid, Coordinates)):
+            raise Lacks("packing", f"a tier-3 model reads its rows' layout as their coordinates, not "
+                                   f"{unknown or [COORDINATES_FIELD]}")
+        return laid
 
     def _run(self, tokens, train: bool, laid: Coordinates | None = None, *, visible=None, key_places=None,
              head_input=None) -> tuple[jax.Array, jax.Array]:

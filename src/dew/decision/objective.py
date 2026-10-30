@@ -113,7 +113,9 @@ class DecisionObjective(Objective[Ratio | Weighted]):
     to hold, where a window full of the shortest rows would declare tens. A
     mix of rows shorter than `max_len / segments` tokens fills its windows
     less under it and takes a larger one; None lets a window hold as many as
-    the layout's shortest row fits. The loss is the mean over the batch's
+    the layout's shortest row fits. A backbone that reads one document a row
+    (it lacks packing, `dew.nn.protocols.Lacks`) trains and answers at
+    `segments=1`, one row a window. The loss is the mean over the batch's
     scored questions. With `consistency` w > 0 it adds w times the mean over
     the batch's consistency groups (`Example.groups`) of the generalized
     Jensen-Shannon divergence of their members' answers over the group's

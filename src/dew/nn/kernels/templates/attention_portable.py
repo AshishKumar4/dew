@@ -30,6 +30,7 @@ from dew.nn.kernels.templates.attention import (
     padded_call,
     prescaled,
     ranges_walk,
+    shared_place,
     within,
 )
 
@@ -38,6 +39,8 @@ def _tile_param(value: jax.Array, kind: Kind, row, head, rows: jax.Array, keys: 
     """A score hook parameter's values for a tile of query rows `rows` and keys `keys` (index arrays) of
     batch row `row` and query head `head`, as `kind` lays them out: `_tile_param` in the Triton
     mainloop."""
+    if kind in (Kind.QUERY, Kind.KEY, Kind.TILE):
+        row, head = shared_place(value.shape, row, head)
     match kind:
         case Kind.HEAD:
             return value[head]

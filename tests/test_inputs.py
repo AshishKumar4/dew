@@ -180,7 +180,7 @@ def test_a_packed_request_reads_alike_as_coordinates_and_as_its_fields():
     import jax
     import jax.numpy as jnp
 
-    from dew.batch import COORDINATES_FIELD, coordinates
+    from dew.batch import COORDINATES_FIELD, coordinates, real_slots
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.nn.inputs import ModelInputs
 
@@ -203,7 +203,7 @@ def test_a_packed_request_reads_alike_as_coordinates_and_as_its_fields():
         fields, laid = (step(ModelInputs.from_value(form)) for form in forms)
         expected, actual = (model.apply(params, inputs.tokens, **inputs.kwargs())
                             for inputs in (fields, laid))
-        real = np.asarray(jnp.asarray(fields.token_fields["attention_mask"]))
+        real = np.asarray(real_slots(fields.token_fields, fields.tokens.shape))
         np.testing.assert_array_equal(np.asarray(actual)[real], np.asarray(expected)[real])
 
 
@@ -327,3 +327,38 @@ def test_a_traced_packed_batch_holds_its_documents_apart_from_its_tokens():
     np.testing.assert_array_equal(sliced_firsts, [[0, 3, 6], [0, 5, 6]])
     # The first row rotated left a slot: its second document from slot 2.
     np.testing.assert_array_equal(rotated_firsts, [[0, 2, 8], [0, 5, 8]])
+
+
+def test_a_field_dict_refuses_anything_but_coordinates_under_their_key():
+    """The reserved `coordinates` token field holds `Coordinates` alone: an array there is refused where
+    the layout is read, never dropped for the flat fields beside it (review of ledger 1122)."""
+    from dew.batch import COORDINATES_FIELD, field_coordinates, laid_coordinates
+
+    held = {COORDINATES_FIELD: np.zeros((1, 4), np.int32), "attention_mask": np.ones((1, 4), bool)}
+    with pytest.raises(TypeError):
+        laid_coordinates(held)
+    with pytest.raises(TypeError):
+        field_coordinates(held, (1, 4))
+
+
+def test_a_prompt_padded_as_document_zero_extends_as_one_its_validity_pads():
+    """A response continues its prompt's last document whether the prompt's padding is marked as
+    document 0 or by its validity (`ModelInputs.extended`, review of ledger 1122): the two extended
+    layouts hold the same validity and starts, the padding neither a start nor real, so a recurrence
+    neither resets at it nor reads it before the response."""
+    import jax.numpy as jnp
+
+    from dew.batch import COORDINATES_FIELD
+    from dew.nn.inputs import ModelInputs
+
+    tokens = jnp.asarray([[3, 5, 0, 0]], jnp.int32)
+    segments = jnp.asarray([[1, 1, 0, 0]], jnp.int32)
+    by_documents = ModelInputs.from_value(ModelInputs(tokens, {"segment_ids": segments}))
+    by_validity = ModelInputs.from_value(ModelInputs(tokens, {"segment_ids": segments,
+                                                              "attention_mask": segments != 0}))
+    response = jnp.asarray([[7]], jnp.int32)
+    laid = [inputs.extended(response).token_fields[COORDINATES_FIELD]
+            for inputs in (by_documents, by_validity)]
+    np.testing.assert_array_equal(laid[0].valid, laid[1].valid)
+    np.testing.assert_array_equal(laid[0].starts, laid[1].starts)
+    np.testing.assert_array_equal(laid[0].valid, [[True, True, False, False, True]])

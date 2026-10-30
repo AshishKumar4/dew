@@ -247,21 +247,24 @@ def packed_row():
     return jnp.asarray(ids), jnp.asarray(segments), jnp.asarray(positions)
 
 
-def test_the_depths_read_a_packed_rows_coordinates_as_its_fields():
-    """The prediction depths' logits (`mtp_logits`) take the rows' layout as `Coordinates` as they take
-    it as flat fields, the same logits bit for bit: the call converts its fields once
-    (`token_coordinates`) and the depths read the coordinates alone (ledger 1122)."""
+def test_the_depths_read_a_packed_rows_layout_as_its_coordinates_alone():
+    """The prediction depths (`mtp_logits`) read the rows' layout as `Coordinates` alone (ledger 1122):
+    a request's flat fields laid out once by its `ModelInputs` (`kwargs`) give the same logits bit for
+    bit as the coordinates built from them, and flat fields handed to the depths are refused."""
     model = tiny(num_nextn_predict_layers=2)
     ids, segments, positions = packed_row()
     variables = model.init(jax.random.key(0), ids)
     hidden = jax.random.normal(jax.random.key(1), (*ids.shape, model.emb_features))
     laid = coordinates(segments=segments, positions=positions)
-    by_fields = model.apply(variables, hidden, ids, segment_ids=segments, positions=positions,
-                            method=CausalTransformer.mtp_logits)
+    flat = ModelInputs(jnp.asarray(ids), {"segment_ids": jnp.asarray(segments),
+                                          "positions": jnp.asarray(positions)})
+    by_fields = model.apply(variables, hidden, ids, **flat.kwargs(), method=CausalTransformer.mtp_logits)
     by_coordinates = model.apply(variables, hidden, ids, coordinates=laid,
                                  method=CausalTransformer.mtp_logits)
     for ours, reference in zip(by_coordinates, by_fields, strict=True):
         np.testing.assert_array_equal(ours, reference)
+    with pytest.raises(TypeError):
+        model.apply(variables, hidden, ids, segment_ids=segments, method=CausalTransformer.mtp_logits)
 
 
 @pytest.mark.parametrize("depths", [1, 2])
@@ -283,7 +286,8 @@ def test_packing_carried_by_the_model_inputs_scores_the_depths_the_same(depths):
     assert float(by_inputs.metrics["mtp_ce"]) == float(by_columns.metrics["mtp_ce"])
     options = {"train": True, "depths": True, "rngs": {"dropout": step_at().key}}
     supplied = objective.token_scores(params, carried[TEXT_KEY], **options)
-    explicit = objective.token_scores(params, ids, segment_ids=segments, positions=positions, **options)
+    laid = coordinates(segments=segments, positions=positions)
+    explicit = objective.token_scores(params, ids, coordinates=laid, **options)
     for ours, reference in zip((supplied.losses, supplied.weights, *supplied.depths),
                               (explicit.losses, explicit.weights, *explicit.depths), strict=True):
         for left, right in zip(jax.tree.leaves(ours), jax.tree.leaves(reference), strict=True):

@@ -43,7 +43,8 @@ class Export:
     always, False never."""
     step: int | str | None = None
     """Which checkpoint to read: a step, `best` for the one the run ranked best, or `best:<metric>` for
-    the best by one of its rankings (`Checkpoints.resolve`); unset takes the latest."""
+    the best by one of its rankings (`Checkpoints.resolve`); unset takes the one its task loads by
+    default (`SavedRun.pinned`): its latest, or the step a run that ended on its best calibrated."""
     trust: tuple[str, ...] = ()
     """Packages outside Dew whose modules the run's record may import."""
 

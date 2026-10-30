@@ -70,6 +70,7 @@ import numpy as np
 from flax import core, linen as nn
 from flax.traverse_util import flatten_dict, unflatten_dict
 
+from dew.batch import Coordinates
 from dew.cache import INTERCEPTED, QUANTIZED_TRACE
 from dew.nn.dense import _contractions, _linear_site
 from dew.nn.kernels.generation import backend, linear_map
@@ -1602,7 +1603,7 @@ def _serving_parameters(parameters: Variables, abstract: Variables) -> Variables
 
 
 def quantize_for_serving(model: nn.Module, variables: Variables, spec: Quantization,
-                         *args: Conditioning, **kwargs: Conditioning | Mapping[str, jax.Array]
+                         *args: Conditioning, **kwargs: Conditioning | Mapping[str, jax.Array] | Coordinates
                          ) -> tuple[nn.Module, Variables]:
     """`model` and `variables` with the weights `spec` names stored quantized.
 

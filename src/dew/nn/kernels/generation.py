@@ -73,7 +73,7 @@ def _facts(value):
     return value
 
 
-CHOICES = frozenset({'attention', 'attention_form', 'attention_mainloop', 'decode', 'delta_decode',
+CHOICES = frozenset({'attention', 'attention_mainloop', 'decode', 'delta_decode',
                       'delta_gates', 'gate_up', 'gated_delta_rule', 'gemm_epilogue', 'gemm_prologue',
                       'grouped_matmul', 'local_attention', 'mla', 'narrow_copies', 'paged_decode', 'rms_norm',
                       'short_conv', 'ssd', 'ssd_decode', 'swiglu'})
@@ -101,14 +101,14 @@ def chosen(**kernels: str) -> Iterator[None]:
         yield
 
 
-_NUMERICS: contextvars.ContextVar[Numerics | None] = contextvars.ContextVar("dew_numerics", default=None)
-
-
 def numerics() -> Numerics:
-    """The run's numerics in effect (`run_precision`), the defaults outside any."""
+    """The run's numerics in effect (`run_precision`), the defaults outside any: JAX keys its trace and
+    compile caches on them (`dew.cache.NUMERICS`), so a function jitted under one run's traces again
+    under another's."""
+    from dew import cache
     from dew.nn.precision import Numerics
 
-    held = _NUMERICS.get()
+    held = cache.NUMERICS.value
     return Numerics() if held is None else held
 
 
@@ -116,21 +116,16 @@ def numerics() -> Numerics:
 def run_precision(policy: Numerics) -> Iterator[None]:
     """Within the block, programs trace under a run's numerics' products and forms
     (`dew.nn.precision.Numerics`): every product that states no precision at `policy.matmul`
-    (`jax.default_matmul_precision`; "default" leaves JAX's configuration as it stands), and each op's
-    accurate form where its forms are "accurate", the attention template's (`attention_form`) among
-    them. The dtypes are the model's and the optimizer's own fields, which the run sets from the
-    numerics: a bf16 operand has lost its bits before any product reads it, whatever its precision."""
-    import jax
+    (`jax.default_matmul_precision` through `configured_precision`; "default" leaves JAX's configuration
+    as it stands), and each op's accurate form where its forms are "accurate", the attention template's
+    among them, which reads them here (`numerics`, the one seam of a run's forms). The dtypes are the
+    model's and the optimizer's own fields, which the run sets from the numerics: a bf16 operand has
+    lost its bits before any product reads it, whatever its precision."""
+    from dew import cache
+    from dew.nn.precision import configured_precision
 
-    matmul = policy.matmul if isinstance(policy.matmul, str) else policy.matmul.name
-    stated = contextlib.nullcontext() if matmul == "default" else jax.default_matmul_precision(matmul)
-    forms = chosen(attention_form="accurate") if policy.forms == "accurate" else contextlib.nullcontext()
-    token = _NUMERICS.set(policy)
-    try:
-        with stated, forms:
-            yield
-    finally:
-        _NUMERICS.reset(token)
+    with configured_precision(policy.matmul), cache.NUMERICS(policy):
+        yield
 
 
 PALLAS_CHOICES = frozenset({'pallas', 'fla'})
