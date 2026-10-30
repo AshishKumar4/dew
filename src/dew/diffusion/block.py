@@ -22,7 +22,7 @@ from flax import linen as nn, struct
 from typing_extensions import TypeVar, get_protocol_members
 
 from dew._distributions import draw, wellformed
-from dew.batch import Variables, real_slots, token_id, token_ids
+from dew.batch import Variables, coordinates, real_slots, token_id, token_ids
 from dew.interop.weights import decoding_storage
 from dew.nn import categorical
 from dew.nn.inputs import (
@@ -400,7 +400,9 @@ def _advance(model: nn.Module, variables: Variables, state: CanvasDecodeState,
     cache = jax.lax.cond(
         index + 1 < blocks,
         lambda old: model.apply({**variables, "cache": old}, clean, method=model.encode,
-                                positions=positions, mutable=["cache"])[1]["cache"],
+                                coordinates=None if positions is None else coordinates(
+                                    clean.shape, positions=positions),
+                                mutable=["cache"])[1]["cache"],
         lambda old: old, cache)
     return CanvasDecodeState(cache, generation, index + 1,
                              None if state.positions is None else state.positions + length, undefined)

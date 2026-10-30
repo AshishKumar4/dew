@@ -45,6 +45,7 @@ from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.inputs import counted_places
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import attention as template, attention_route
+from dew.nn.precision import Numerics
 
 HEADS, KV_HEADS, WIDTH = 4, 2, 32
 MESH_TENSOR, MESH_HEADS = 4, 8
@@ -514,11 +515,12 @@ def test_a_long_sequence_is_on_par_with_the_reference_path(length, dtype):
 
 
 def test_the_accurate_form_is_one_option_away():
-    """`generation.chosen(attention_form='accurate')` runs every template call in the accurate form (natural
-    logits and the accurate products, `attention_route.FORMS`), its forward and gradients bitwise a call's
-    that names that form, and 'fast' runs the default, a call's that names none; the two forms differ; a
-    form the template does not have is refused. Bit for bit by construction: the choice resolves to the
-    named form's arguments before the call traces, so the two calls trace one program."""
+    """A run's numerics in the accurate forms (`generation.run_precision`, `Numerics.forms`) run every
+    template call in the accurate form (natural logits and the accurate products, `attention_route.FORMS`),
+    its forward and gradients bitwise a call's that names that form, and the fast forms run the default, a
+    call's that names none; the two forms differ; a form the template does not have is refused. Bit for bit
+    by construction: the forms resolve to the named form's arguments before the call traces, so the two
+    calls trace one program."""
     spans = template.spans(QUERIES, KEYS, ROWS, causal=True)
     query, key, value, _, dout = drawing(QUERIES, KEYS, jnp.float32, sinks=False)(0)
 
@@ -528,14 +530,14 @@ def test_the_accurate_form_is_one_option_away():
 
     found = {}
     for form, named in (("accurate", {"natural": True, "accurate": True}), ("fast", {})):
-        with generation.chosen(attention_form=form):
+        with generation.run_precision(Numerics(forms=form)):
             found[form] = jax.tree.leaves(jax.jit(routed)(query, key, value))
         want = jax.tree.leaves(jax.jit(functools.partial(routed, **named))(query, key, value))
         for mine, theirs in zip(found[form], want, strict=True):
             np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs), err_msg=form)
     assert any(not np.array_equal(accurate, fast) for accurate, fast in zip(*found.values(), strict=True))
-    with generation.chosen(attention_form="exact"), pytest.raises(ValueError):
-        attention_route.attend(query, key, value, spans)
+    with pytest.raises(ValueError):
+        Numerics(forms="exact")
 
 
 def test_narrowed_operands_hand_back_their_gradients_unrounded():

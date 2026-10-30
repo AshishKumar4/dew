@@ -47,8 +47,8 @@ Residuals = tuple[jax.Array, jax.Array, jax.Array, Split]
 FORMS = ("fast", "accurate")
 """The template's forms (kernel-templates.md §1, testing.md): the default, fast (the base-2 fold and
 FlashAttention's arithmetic, `NATURAL`, `ACCURATE`), and the accurate form one option away (natural logits and
-the accurate products), which `generation.chosen(attention_form='accurate')` names for every template call in
-its block."""
+the accurate products), which a run's numerics name for every template call in their block
+(`generation.run_precision`, `Numerics.forms`)."""
 
 
 def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
@@ -62,20 +62,17 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
     default. An output hook is refused: a differentiated call applies `output_mod` to the output past the
     kernel, where its own derivative runs, so the caller applies it.
 
-    `natural` and `accurate` name its form, each where None the one `generation.chosen(attention_form=...)`
-    names (`FORMS`; 'accurate' takes both), else the default's. `operand_dtype`, where the key and value
-    arrive wider than the mainloops compute them (a sharding wrapper's, so its partial gradients sum wide),
-    narrows the operands to it and hands back the key's and value's gradients unrounded, in their own dtype:
-    the wrapper sums them and rounds once.
+    `natural` and `accurate` name its form, each where None the one the run's numerics name
+    (`generation.numerics().forms`, `FORMS`; 'accurate' takes both), else the default's.
+    `operand_dtype`, where the key and value arrive wider than the mainloops compute them (a sharding
+    wrapper's, so its partial gradients sum wide), narrows the operands to it and hands back the key's
+    and value's gradients unrounded, in their own dtype: the wrapper sums them and rounds once.
     """
     hooks = Hooks() if hooks is None else hooks
     if hooks.output_mod is not None:
         raise ValueError("the attention route takes score hooks and the initial state; its backward takes "
                          "the output before an output hook, so the caller applies `output_mod` to the result")
-    form = generation.chosen_kernel('attention_form', 'fast')
-    if form not in FORMS:
-        raise ValueError(f"attention_form {form!r}: the template's forms are {', '.join(FORMS)}")
-    wide = form == 'accurate'
+    wide = generation.numerics().forms == 'accurate'
     config = _Config(scale, NATURAL or wide if natural is None else natural,
                      ACCURATE or wide if accurate is None else accurate,
                      None if operand_dtype is None else jnp.dtype(operand_dtype).name)

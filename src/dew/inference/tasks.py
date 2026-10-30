@@ -30,7 +30,17 @@ from jax.typing import ArrayLike, DTypeLike
 
 from dew._coordination import agreed
 from dew._records import integer, record as named_fields, strings, text as named
-from dew.batch import PARAMETER_ROOTS, POSITIONS_FIELD, VALIDITY_FIELD, Variables, thaw
+from dew.batch import (
+    COORDINATES_FIELD,
+    PARAMETER_ROOTS,
+    POSITIONS_FIELD,
+    VALIDITY_FIELD,
+    Variables,
+    laid_coordinates,
+    thaw,
+    token_positions,
+    token_validity,
+)
 from dew.cache import persist_compilations
 from dew.diffusion.block import BlockProcess, CanvasGeneration, refuse_non_denoiser
 from dew.diffusion.discrete import MDLM_STEPS, Confident, DiscreteProcess, Unmask, refuse_causal
@@ -216,8 +226,11 @@ def _bucketed(inputs: ModelInputs, budget: int, ceiling: int | None
     """
     if ceiling is None or budget < 1:
         return inputs, budget, None
-    positions = inputs.token_fields.get(POSITIONS_FIELD)
-    if (set(inputs.token_fields) - {VALIDITY_FIELD, POSITIONS_FIELD} or inputs.conditioning
+    # The rows' layout, their coordinates or their flat fields (`laid_coordinates`): one document a row.
+    laid = laid_coordinates(inputs.token_fields)
+    positions = token_positions(inputs.token_fields)
+    if (set(inputs.token_fields) - {VALIDITY_FIELD, POSITIONS_FIELD, COORDINATES_FIELD} or inputs.conditioning
+            or (laid is not None and laid.segments is not None)
             or (positions is not None and positions.shape != inputs.tokens.shape)):
         return inputs, budget, None
     width = shape_bucket(inputs.tokens.shape[1], 64)
@@ -229,17 +242,19 @@ def _bucketed(inputs: ModelInputs, budget: int, ceiling: int | None
 
 
 def _padded(inputs: ModelInputs, width: int) -> ModelInputs:
-    """Return `inputs` left-padded to `width` slots, with the filler marked invalid."""
+    """Return `inputs` left-padded to `width` slots, with the filler marked invalid, laid out again
+    (`ModelInputs.laid`)."""
     extra = width - inputs.tokens.shape[1]
     if extra < 1:
         return inputs
-    valid = inputs.token_fields.get(VALIDITY_FIELD)
+    valid = token_validity(inputs.token_fields)
     if valid is None:
         valid = jnp.ones(inputs.tokens.shape, bool)
+    positions = token_positions(inputs.token_fields)
     left = ((0, 0), (extra, 0))
-    fields = {name: jnp.pad(value, left) for name, value in inputs.token_fields.items()}
-    return replace(inputs, tokens=jnp.pad(inputs.tokens, left),
-                   token_fields={**fields, VALIDITY_FIELD: jnp.pad(valid, left)})
+    fields = {VALIDITY_FIELD: jnp.pad(valid, left),
+              **({} if positions is None else {POSITIONS_FIELD: jnp.pad(positions, left)})}
+    return replace(inputs, tokens=jnp.pad(inputs.tokens, left), token_fields=fields).laid()
 
 
 @functools.cache

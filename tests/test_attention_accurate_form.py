@@ -13,16 +13,18 @@ from test_attention_route import drawing
 from test_attention_template import KEYS, QUERIES, SEEDS
 
 from dew.nn.attention import scaled_dot_product_attention
+from dew.nn.precision import Numerics
 
 
 def routed_call(form: str):
-    """A causal call on the default route ('auto') under `form` (`generation.chosen`), at JAX's own default
-    matmul precision, as a run's default numerics multiply (the suite's environment states 'highest'), as
-    a function of `(query, key, value, sinks, dout)`: its output, then its gradients (`with_gradients`)."""
-    from dew.nn.kernels.generation import chosen
+    """A causal call on the default route ('auto') under a run's numerics of `form`
+    (`generation.run_precision`), at JAX's own default matmul precision, as a run's default numerics
+    multiply (the suite's environment states 'highest'), as a function of `(query, key, value, sinks,
+    dout)`: its output, then its gradients (`with_gradients`)."""
+    from dew.nn.kernels.generation import run_precision
 
     def call(query, key, value, sinks):
-        with chosen(attention_form=form), jax.default_matmul_precision("default"):
+        with run_precision(Numerics(forms=form)), jax.default_matmul_precision("default"):
             return scaled_dot_product_attention(query, key, value, causal=True, sinks=sinks)
 
     return with_gradients(call)
@@ -50,11 +52,11 @@ def accurate_draws():
 @pytest.mark.kernel
 @pytest.mark.parametrize("case", ["float32", "bfloat16", "products past the largest float"])
 def test_an_accurate_call_on_the_default_route_is_on_par_with_ieee_fp32(case):
-    """Under `generation.chosen(attention_form='accurate')`, a call on the default route ('auto'), whichever
-    kernel it takes, is on par with the reference path's IEEE float32 products forward and backward,
-    measured from float64 (check 1; row 2350: an accurate run's calls ran fast on FlashAttention, cuDNN,
-    xla and splash), over inputs a fast kernel fails on (`accurate_draws`); the kernel lab's GPU tier runs
-    it on each target GPU."""
+    """Under a run's accurate numerics (`generation.run_precision`), a call on the default route ('auto'),
+    whichever kernel it takes, is on par with the reference path's IEEE float32 products forward and
+    backward, measured from float64 (check 1; row 2350: an accurate run's calls ran fast on FlashAttention,
+    cuDNN, xla and splash), over inputs a fast kernel fails on (`accurate_draws`); the kernel lab's GPU
+    tier runs it on each target GPU."""
     assert_as_exact(jax.jit(routed_call("accurate")), jax.jit(ieee_reference), accurate_draws()[case],
                     f"the accurate form on the default route, {case}", seeds=SEEDS)
 

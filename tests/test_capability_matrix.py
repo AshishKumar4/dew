@@ -678,7 +678,10 @@ def decision(family: Family, directory: Path) -> None:
     tokenizer, specials = vocabulary(held)
     layout = (StateFirstLayout if CAUSAL in family.facts else MarkerLayout)(
         max_len=48, head_max_len=32, option_tokens=4)
-    objective = DecisionObjective(held.given, tokenizer=tokenizer, specials=specials, layout=layout)
+    # A backbone that reads one document a row (no packing) holds one row a window (`segments`).
+    windows = {} if PACKING in family.facts else {"segments": 1}
+    objective = DecisionObjective(held.given, tokenizer=tokenizer, specials=specials, layout=layout,
+                                  **windows)
     data = decision_rows(EXAMPLES, ROWS, EXAMPLES, objective=objective.data())
     batch = next(iter(data.train(DataPartition())))
     trained = assert_trains(objective, batch, directory, data=data)

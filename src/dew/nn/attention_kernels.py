@@ -147,7 +147,7 @@ class AttentionCase:
     shards: int
     form: str = "fast"
     """The form the template computes in where it runs the call (`attention_route.FORMS`), as the
-    run chose it (`generation.chosen(attention_form=...)`): the old routes compute their own arithmetic
+    run's numerics name it (`generation.numerics().forms`): the old routes compute their own arithmetic
     and take only 'fast', so an accurate call runs the template, or the reference path where the
     template does not take it."""
 

@@ -30,7 +30,7 @@ Any Flax module trains. The objective calls the module's forward through Flax's 
 
 ```python
 class MyLM(nn.Module):
-    def __call__(self, tokens, *, positions=None, segment_ids=None): ...
+    def __call__(self, tokens, *, coordinates=None): ...
 
 LMObjective(MyLM(...), seq_len=2048)
 ```

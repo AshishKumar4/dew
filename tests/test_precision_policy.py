@@ -500,7 +500,7 @@ def test_a_runs_precision_policy_sets_every_product_that_states_none(policy):
 
     precisions = dot_precisions(traced, variables, tokens)
     with generation.run_precision(NUMERICS[policy]):
-        form = generation.chosen_kernel("attention_form", "fast")
+        form = generation.numerics().forms
     if policy == "accurate":
         assert precisions and all(precision == HIGHEST for precision, _, _ in precisions), precisions
         assert form == "accurate"
