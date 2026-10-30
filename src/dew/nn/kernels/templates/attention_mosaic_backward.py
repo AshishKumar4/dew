@@ -525,11 +525,12 @@ def _unread_tiles(family: mosaic.Family, store_tiles, count: int, shape: tuple[i
 
 
 def _fused_step(walk: _Backward, resident: tuple, rows_of, staged, coords_of, whole, add_dq, index, slots,
-                carry, accumulators):
+                carry, accumulators, *, masked: bool | None = None):
     """A fused dK/dV consumer's query tile `index`, queries first (`[bq, bk]`, the hookless fast form's
     one launch): its scores and score cotangents from the query and output cotangent slots (`slots`) and its
     resident keys and values (`resident`), under the tile's queries' statistics (`rows_of(first query)`) and
-    coordinates (`coords_of(first query)`), a tile every query sees whole (`whole(index)`) unmasked. Its
+    coordinates (`coords_of(first query)`), a tile every query sees whole (`whole(index)`) unmasked, or
+    each tile `masked` or not where the walk's segment says (a run of whole tiles, `whole_run`). Its
     weights and score cotangents staged in `staged`, whose transposes are dV's and dK's left operands
     (`algebra.value_operands`, `cotangent_product`'s `aᵀ @ b`) issued into `accumulators` in place, and the
     cotangents times the resident keys the tile's dQ, added into dQ (`add_dq(first query, dQ)`)."""
@@ -554,8 +555,11 @@ def _fused_step(walk: _Backward, resident: tuple, rows_of, staged, coords_of, wh
                                                           masked=masked)
         return exponentials, weights, cotangents
 
-    exponentials, weights, cotangents = lax.cond(whole(index), functools.partial(scores, masked=False),
-                                                 functools.partial(scores, masked=True))
+    if masked is None:
+        exponentials, weights, cotangents = lax.cond(whole(index), functools.partial(scores, masked=False),
+                                                     functools.partial(scores, masked=True))
+    else:
+        exponentials, weights, cotangents = scores(masked=masked)
     ((part, _),) = algebra.cotangent_parts(cotangents * walk.grad_scale, q_slot.dtype, accurate=False)
     narrowed = algebra.value_weights(exponentials, weights, do_slot.dtype)
     family.staged(narrowed, staged.at[0])
@@ -611,13 +615,26 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
             step = functools.partial(_fused_step, walk, (k_smem.at[index], v_smem.at[index]), rows_of,
                                      staged.at[index], coords_of, whole, adds)
             shapes = ((block_k, width), (block_k, width))
+            run = program.whole_run(k_first, q_steps, spans_of)
+
+            def segments(lo, hi):
+                if run is None:
+                    return ((step, lo, hi),)
+                # Its whole tiles one segment of their own, unmasked, and the tiles around them masked: no
+                # step chooses at run time, whose two branches' registers join (FlashAttention 3's masked
+                # and unmasked iterations).
+                start, end = (jnp.clip(bound, lo, hi) for bound in run)
+                return ((functools.partial(step, masked=True), lo, start),
+                        (functools.partial(step, masked=False), start, end),
+                        (functools.partial(step, masked=True), end, hi))
+
             # The tiles its partner reads around its own (`Family.walk_own`); on a layout whose consumers
             # feed their rings, every tile any of the program's keys' readers reads, a tile none of a
             # consumer's own keys sees masked whole, its weights and its dQ zero (FlashAttention 3's two
             # warpgroups a CTA, each its own keys over one query stream).
             _, (dk, dv) = family.walk_own(
                 streams, views, (lo, hi), streamed, index,
-                lambda streams, lo, hi, counted: family.walk(streams, ((step, lo, hi),), (), shapes,
+                lambda streams, lo, hi, counted: family.walk(streams, segments(lo, hi), (), shapes,
                                                              walk.interpret, first=counted))
             out = (row, pl.ds(k_first, block_k), head)
             family.stored((dk, dv), (dk_ref.at[out], dv_ref.at[out]),
