@@ -627,7 +627,7 @@ def prefixed(root: Path, drawn: bool) -> RunConfig:
 
 
 BESIDE = {"layout.framing": {"segments": built_in(None, "question_first"), "max_len": 256},
-          "context_encoder": {"context_layers": (0,), "context_length": 16}}
+          "context_encoder": {"context_layers": (0,), "context_length": 64}}
 """What an option's reader takes it only beside, by the run's path, set with it: a framing frames a row of
 its own segments (`_budgeted`), here the question layout's own row as segments (`built_in`), in a row long
 enough for its conversation's turns; a context's encoder encodes it for context layers, which read a
