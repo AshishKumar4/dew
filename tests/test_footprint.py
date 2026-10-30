@@ -3,6 +3,7 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from dew.training.footprint import device_bytes, residual_bytes
@@ -59,8 +60,9 @@ def test_a_custom_pullback_counts_one_buffer_shared_by_two_residual_slots():
         return jnp.sin(params).sum()
 
     def forward(params):
-        cosine = jnp.cos(params)
-        return summed(params), (cosine, cosine, params)
+        # An exponential, which XLA keeps (a cosine of real values it would recompute from the input).
+        exponential = jnp.exp(params)
+        return summed(params), (exponential, exponential, params)
 
     def backward(saved, cotangent):
         first, second, inputs = saved
@@ -73,3 +75,21 @@ def test_a_custom_pullback_counts_one_buffer_shared_by_two_residual_slots():
 
     shape = jax.ShapeDtypeStruct((8, 16), jnp.float32)
     assert residual_bytes(loss, shape, ()) == 8 * 16 * 4
+
+
+@pytest.mark.parametrize(("generation", "workspace"), [("sm80", 4 << 20), ("sm90", 32 << 20)])
+def test_a_derived_step_holds_the_gemm_workspace_xla_gives_its_gpu(generation, workspace):
+    """A derived step on a CUDA GPU holds beside its residuals and gradient the workspace XLA hands each
+    cuBLAS matmul (gemm_rewriter's `GemmWorkspaceRewriteVisitor`): 32 MiB from Hopper on, 4 MiB before
+    (`GemmConfig::kHopperWorkspace`, `kDefaultWorkspace`); a CPU's matmuls take none."""
+    from dew.training.ahead import compile_only_gpus
+    from dew.training.footprint import Footprint
+    from dew.training.memory import derived_headroom
+
+    capacity = 1 << 30
+    step = Footprint(residuals=1 << 20, gradients=1 << 20, held=0)
+    (gpu,) = compile_only_gpus(generation, 1, capacity)
+    empty = Footprint(residuals=0, gradients=0, held=0)
+    # The workspace is one buffer beside every step, whatever its residuals and gradient.
+    assert derived_headroom(empty, [gpu], capacity) == capacity - workspace
+    assert derived_headroom(step, [gpu], capacity) == capacity - workspace - (2 << 20)
