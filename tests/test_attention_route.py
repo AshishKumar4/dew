@@ -640,31 +640,21 @@ def test_a_call_no_triton_config_fits_lowers_on_another_mainloop(generation_name
 def routed_call(form: str):
     """A causal call on the default route ('auto') under `form` (`generation.chosen`), at JAX's own default
     matmul precision, as a run's default numerics multiply (the suite's environment states 'highest'), as
-    a function of `(query, key, value, sinks, dout)`: its output, then its gradients of the query, key and
-    value."""
+    a function of `(query, key, value, sinks, dout)`: its output, then its gradients (`with_gradients`)."""
     from dew.nn.kernels.generation import chosen
 
-    def run(query, key, value, sinks, dout):
-        del sinks
+    def call(query, key, value, sinks):
         with chosen(attention_form=form), jax.default_matmul_precision("default"):
-            out, pull = jax.vjp(lambda q, k, v: scaled_dot_product_attention(q, k, v, causal=True),
-                                query, key, value)
-        return (out, *pull(dout))
+            return scaled_dot_product_attention(query, key, value, causal=True, sinks=sinks)
 
-    return run
+    return with_gradients(call)
 
 
-def ieee_reference(query, key, value, sinks, dout):
-    """The causal call on the reference path at IEEE float32 products (`Precision.HIGHEST`), the
-    arithmetic an accurate run's form states: its output and its gradients of the query, key and value."""
-    del sinks
-
-    def call(q, k, v):
-        return scaled_dot_product_attention(q, k, v, causal=True, implementation="reference",
-                                            precision=jax.lax.Precision.HIGHEST)
-
-    out, pull = jax.vjp(call, query, key, value)
-    return (out, *pull(dout))
+ieee_reference = with_gradients(functools.partial(scaled_dot_product_attention, causal=True,
+                                                  implementation="reference",
+                                                  precision=jax.lax.Precision.HIGHEST))
+"""The causal call on the reference path at IEEE float32 products (`Precision.HIGHEST`), the arithmetic
+an accurate run's form states: its output and its gradients (`with_gradients`)."""
 
 
 def accurate_draws():
