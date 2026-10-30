@@ -78,8 +78,7 @@ def changed(directory: Path, change: dict) -> Path:
     return directory
 
 
-DORY_SEEDS = {'logits': 8, 'table': 8, 'packed': 8, 'keys': 8, 'per_loop': 8, 'last_loop': 8,
-              'cache': 8, 'rows': 8, 'variant': 8}
+DORY_SEEDS = {'logits': 8, 'packed': 8, 'keys': 8, 'per_loop': 8, 'last_loop': 8, 'cache': 8, 'variant': 8}
 """Declared seeds for check 1 against the live transcription (`assert_as_the_transcription`), each
 site's the most its cases took, sized by `seeds_for` paired on armada."""
 
@@ -151,20 +150,22 @@ def test_the_release_tests_symmetries_keep_dorys_function_and_redraw_its_sums():
 @pytest.mark.parametrize('loops', [1, 2, 4])
 def test_the_looped_stack_and_its_output_table_compute_vllms_logits_at_each_loop_count(loops):
     """The tiny Dory's logits with its recurrent block run once, twice (its own count) and four
-    times, as vLLM's forward computes them, within tests/reference_error.py's rule of its fp32 run
-    against float64; the same of its final states contracted with its output table, the head's
-    matrix and its per-token gain past the product, as a tiled loss scores them."""
+    times, as vLLM's forward computes them (check 1 against the live transcription); the same of its
+    final states contracted with its output table, the head's matrix and its per-token gain past the
+    product, as a tiled loss scores them, and with the table's rows (`OutputTable.rows`, the head's
+    matrix rows times each token's logit gain), which a joint decision head's lexical prior gathers."""
     loaded = load()
     model, tensors = loaded.model.with_passes(loops), exported(loaded)
 
     def dew(ids):
         table = model.apply(loaded.variables, method='output_table')
         hidden = model.apply(loaded.variables, ids, method='hidden_states')
-        return {'logits': model.apply(loaded.variables, ids), 'table': table.logits(hidden)}
+        return {'logits': model.apply(loaded.variables, ids), 'table': table.logits(hidden),
+                'rows': hidden @ table.rows().T}
 
     def transcribed(dtype, ids):
         logits = TOOL.DoryReference(loaded.config, tensors, dtype, loops=loops).forward(np.asarray(ids))
-        return {'logits': logits, 'table': logits}
+        return {'logits': logits, 'table': logits, 'rows': logits}
 
     assert_as_the_transcription(dew, transcribed, drawn_ids(loops), f'Dory logits at {loops} loops',
                                 seeds=DORY_SEEDS['logits'])
@@ -207,16 +208,21 @@ def test_a_cached_greedy_continuation_reads_each_cache_as_vllm_keeps_it(mode):
     loaded = load()
     model, variables, tensors = with_cache(loaded.model, mode), loaded.variables, exported(loaded)
 
+    empty = model.apply(variables, 1, method=CausalTransformer.init_cache, mutable=['cache'])[1]['cache']
+
+    @jax.jit
+    def stepped(cache, tokens):
+        logits, mutated = model.apply({**variables, 'cache': cache}, tokens[None], decode=True,
+                                      mutable=['cache'])
+        return logits[0, -1], mutated['cache']
+
     def decoded(prompt, tokens):
         """Each step's logits: the prompt's last position, then a token at a time but the last."""
-        cache = model.apply(variables, 1, method=CausalTransformer.init_cache, mutable=['cache'])[1]['cache']
-        logits, mutated = model.apply({**variables, 'cache': cache}, jnp.asarray(prompt)[None], decode=True,
-                                      mutable=['cache'])
-        steps = [logits[0, -1]]
+        logits, cache = stepped(empty, jnp.asarray(prompt))
+        steps = [logits]
         for token in np.asarray(tokens)[:-1]:
-            logits, mutated = model.apply({**variables, 'cache': mutated['cache']}, jnp.asarray([[token]]),
-                                          decode=True, mutable=['cache'])
-            steps.append(logits[0, -1])
+            logits, cache = stepped(cache, jnp.asarray([token]))
+            steps.append(logits)
         return np.asarray(jnp.stack(steps))
 
     expected = REFERENCE[f'generated_{mode}']
@@ -630,22 +636,10 @@ EXAMPLES = [Example(state, {'team': INTENT}, {'team': label})
 
 
 def test_a_joint_decision_head_reads_dorys_vocabulary_rows_and_trains(tmp_path):
-    """The joint schema head's lexical prior gathers the output table's rows: the head's matrix
-    rows times each token's logit gain, which contracted with the final states give Dory's logits.
-    Over the release's own tokenizer it trains a step that moves the head and the backbone, and
+    """The joint schema head's lexical prior gathers the output table's rows, which contracted with the
+    final states give Dory's logits (the looped stack's check). Over the release's own tokenizer it trains a step that moves the head and the backbone, and
     the saved run answers as the live one does."""
     loaded = load(max_seq_len=1024)
-    tensors = exported(loaded)
-
-    def rows(ids):
-        table = loaded.model.apply(loaded.variables, method='output_table')
-        return loaded.model.apply(loaded.variables, ids, method='hidden_states') @ table.rows().T
-
-    def transcribed(dtype, ids):
-        return TOOL.DoryReference(loaded.config, tensors, dtype).forward(np.asarray(ids))
-
-    assert_as_the_transcription(rows, transcribed, drawn_ids(40), "Dory's vocabulary rows",
-                                seeds=DORY_SEEDS['rows'])
     head = JointSchemaHead(32, width=16, routing_layers=1, layers=1, heads=2, feedforward=32)
     objective = DecisionObjective(loaded, layout=JointLayout(max_len=1024), head=head)
     data = decision_rows(EXAMPLES, 8, EXAMPLES, objective=objective.data())
