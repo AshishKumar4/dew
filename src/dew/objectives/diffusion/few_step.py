@@ -31,6 +31,7 @@ from dew.diffusion.schedules import FlowMatchingScheduler, expand
 from dew.diffusion.transforms import FlowMatchPredictionTransform, broadcast_rates
 from dew.inputs import InputSpec
 from dew.nn.attention import forward_mode_attention
+from dew.nn.inspection import INSPECTED
 from dew.nn.protocols import IntervalModel, Lacks
 from dew.nn.sharding import explicit_spec, rows_taken
 from dew.objectives.base import Aux, Step, model_rngs
@@ -336,13 +337,13 @@ class ShortcutObjective(DiffusionObjective):
         # take by different paths (`_bootstrapped`), so each example's is a boundary of its own.
         target = step.boundary("shortcut targets", jnp.where(expand(bootstrap, v), self._bootstrapped(
             taught, given, bootstrap, rows, count, total, x, sigma, step_size), v))
-        u = velocity(self.model_variables(variables), conditions, train=step.training)(
-            x, sigma, sigma - step_size)
-        losses = jnp.square(u - target)
-        inspected = self.watched_forward(
-            step, self.model, self.model_variables(variables), x, schedule.model_time(sigma), **conditions,
+        # The student's own call, as its velocity makes it (`_model_velocity`), opening what the step sows.
+        u, sown = self.model.apply(
+            self.model_variables(variables), x, schedule.model_time(sigma), **conditions,
             duration=schedule.model_time(sigma) - schedule.model_time(sigma - step_size), train=step.training,
-            rngs=model_rngs(dropout_key, training=step.training))
+            rngs=model_rngs(dropout_key, training=step.training), mutable=step.sown())
+        losses = jnp.square(u - target)
+        inspected = sown.get(INSPECTED, {}) if step.watched is not None else None
         return self.row_mean(losses, batch), Aux(metrics={}, inspected=inspected)
 
     @staticmethod

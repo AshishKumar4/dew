@@ -187,7 +187,15 @@ class Interval:
         # (`Trainer(step=)`), which reports no commit, is its own update.
         tokens = aux.get(TOKENS, self.fresh.tokens) if committed is None else committed.tokens
         if committed is not None and committed.inspected:
-            self.inspected = (committed.count, committed.inspected)
+            # The latest sample that committed: a sampled step whose window did not commit holds zeros,
+            # which keep the one before, chosen on the device.
+            if self.inspected is None:
+                self.inspected = (committed.count, committed.inspected)
+            else:
+                fresh = committed.count > 0
+                count, held = self.inspected
+                self.inspected = (jnp.where(fresh, committed.count, count), jax.tree.map(
+                    lambda new, old: jnp.where(fresh, new, old), dict(committed.inspected), dict(held)))
         self.book = bookkeep(self.book, loss, finite, committed,
                              aux.get(TRAINING_FLOPS, self.fresh.training), tokens)
 

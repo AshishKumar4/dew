@@ -1137,9 +1137,11 @@ class Trainer(Generic[Loss, Effects]):
             lowered, launches = lower(), launches or "[]"
         footprint = None if self.step is not None else candidate_footprint(
             self.objective, self._model_shapes(micro), split * self.accumulation, prepared, held)
+        # The batch's shapes and placements alone, which the lowering reads: the thunk holds no batch.
         sampled = None if self.inspection is None else functools.partial(
             self._jitted(shapes, copies, shardings, placement, replicated, split, sampled=True).lower,
-            *apart(prepared), batch, part)
+            *apart(prepared), jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(
+                leaf.shape, leaf.dtype, sharding=getattr(leaf, "sharding", None)), batch), part)
         return Candidate(micro, shapes, copies, shardings, prepared, held, built, lowered, launches,
                          lower.report(), footprint, sampled)
 

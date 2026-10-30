@@ -366,6 +366,22 @@ class ConsistencyDistillationObjective(FlowDistillationObjective):
         return backward_simulation(lambda x, t: trig_prediction(network, x, t)[0], draws.start, times,
                                    draws.simulation_noises, live)
 
+    def _watched_point(self, samples: jax.Array, draws: _Draws) -> tuple[jax.Array, jax.Array]:
+        """The TrigFlow `(x, t)` at which the loss first runs the student: sCM's continuous point; rCM's
+        discrete one, the first of its shifted grid (`discrete_consistency_loss`); or, for distribution
+        matching alone, the simulation's start from noise at t = pi/2 (`backward_simulation`)."""
+        if self.consistency_weight > 0 and self.consistency == "discrete":
+            u = draws.consistency_time * (1 - self.discrete_skip / self.discrete_steps)
+            rf = static_shift(self.discrete_shift, 1.0 - u)
+            rf = jnp.clip(rf, 0.0, 1.0 - jnp.finfo(rf.dtype).eps)
+            t = jnp.arctan(rf / (1 - rf))
+        elif self.consistency_weight > 0:
+            t = self._times(draws.consistency_time, self.student_times)
+        else:
+            return draws.start, jnp.full(draws.start.shape[:1], math.pi / 2, jnp.float32)
+        noise = draws.consistency_noise
+        return expand(jnp.cos(t), samples) * samples + expand(jnp.sin(t), samples) * noise, t
+
     def loss(self, variables, batch, step: Step):
         encode_key, drop_key = jax.random.split(jax.random.fold_in(step.key, 1))
         samples = self.clean_samples(variables, batch, encode_key, step)
@@ -414,10 +430,9 @@ class ConsistencyDistillationObjective(FlowDistillationObjective):
             return critic_loss(generated, fake, t)
 
         losses = jax.lax.cond(student_phase, student_losses, critic_losses, variables)
-        # The student's forward at the step's consistency point, as `trig_prediction` feeds it, for its
-        # summaries: the student's every phase runs it on these weights.
-        t = self._times(draws.consistency_time, self.student_times)
-        x = expand(jnp.cos(t), samples) * samples + expand(jnp.sin(t), samples) * draws.consistency_noise
+        # The student's forward at the point its loss first runs it, as `trig_prediction` feeds it, for its
+        # summaries (`_watched_point`).
+        x, t = self._watched_point(samples, draws)
         rf = jnp.sin(t) / (jnp.cos(t) + jnp.sin(t))
         inspected = self.watched_forward(step, self.model, self.model_variables(variables),
                                          x / expand(jnp.cos(t) + jnp.sin(t), x),

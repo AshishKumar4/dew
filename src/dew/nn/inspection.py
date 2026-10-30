@@ -17,6 +17,7 @@ from collections.abc import Iterator, Mapping
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 INSPECTED = "inspected"
 """The collection watched modules sow their outputs' summaries into."""
@@ -28,25 +29,31 @@ first, above 1e4 in the last, one bin a decade between."""
 
 def statistics(values: jax.Array, *, histogram: bool = False) -> dict[str, jax.Array]:
     """A tensor's summary in float32 over its global array: mean, standard deviation, root mean square,
-    largest magnitude and the share of its entries that are not finite, which makes the others
-    non-finite as they are of the values; with `histogram`, the share of its magnitudes in each decade
-    (`HISTOGRAM_EDGES`)."""
+    largest magnitude, the share of its entries that are not finite, which makes the others non-finite as
+    they are of the values, and the share that is exactly zero; with `histogram`, the share of its
+    magnitudes in each decade (`HISTOGRAM_EDGES`), one scalar a bin, `histogram_<bin>`."""
     values = values.astype(jnp.float32)
     found = {"mean": values.mean(), "std": values.std(), "rms": jnp.sqrt(jnp.square(values).mean()),
-             "abs_max": jnp.abs(values).max(), "non_finite": (~jnp.isfinite(values)).mean()}
+             "abs_max": jnp.abs(values).max(), "non_finite": (~jnp.isfinite(values)).mean(),
+             "zero_fraction": (values == 0).mean()}
     if histogram:
         exponents = jnp.log10(jnp.maximum(jnp.abs(values), 1e-30)).reshape(-1)
         bins = jnp.searchsorted(jnp.asarray(HISTOGRAM_EDGES, jnp.float32), exponents)
-        counts = jnp.zeros(len(HISTOGRAM_EDGES) + 1, jnp.float32).at[bins].add(1.0)
-        found["histogram"] = counts / exponents.size
+        counts = jnp.zeros(len(HISTOGRAM_EDGES) + 1, jnp.float32).at[bins].add(1.0) / exponents.size
+        found.update({f"histogram_{index}": counts[index] for index in range(counts.shape[0])})
     return found
+
+
+SOWN = "__summary__"
+"""The name a watched module's summary is sown under, one no module of Dew's names a child or a
+variable, so it never collides with a module's own (a DiT's `output` head)."""
 
 
 @contextlib.contextmanager
 def watching(kinds: tuple[str, ...], *, histogram: bool = False) -> Iterator[None]:
     """Within the block, each module whose class name a glob of `kinds` matches (`*Attention`, `MLP`)
-    sows its output's summary (`statistics`) into `INSPECTED` where its apply opened it, under the name
-    `output`, the latest call's where a module runs more than once. A module whose output is no single
+    sows its output's summary (`statistics`) into `INSPECTED` where its apply opened it, under `SOWN`,
+    the latest call's where a module runs more than once. A module whose output is no single
     array (a tuple, a cache) sows its first array's. Nothing is sown where the apply opened no such
     collection, as a module sows nothing into a collection it cannot write."""
     def interceptor(next_fun, args, kwargs, context):
@@ -59,7 +66,7 @@ def watching(kinds: tuple[str, ...], *, histogram: bool = False) -> Iterator[Non
             return output
         arrays = [leaf for leaf in jax.tree.leaves(output) if isinstance(leaf, jax.Array)]
         if arrays:
-            module.sow(INSPECTED, "output", statistics(arrays[0], histogram=histogram),
+            module.sow(INSPECTED, SOWN, statistics(arrays[0], histogram=histogram),
                        init_fn=dict, reduce_fn=lambda previous, latest: latest)
         return output
 
@@ -68,23 +75,15 @@ def watching(kinds: tuple[str, ...], *, histogram: bool = False) -> Iterator[Non
 
 
 def flattened(inspected: Mapping) -> dict[str, jax.Array]:
-    """A sown `INSPECTED` collection's scalars by name, `activations/<module path>/<statistic>`: a
-    scanned stack's summaries one a layer, `.../layer_<i>/<statistic>`, and a histogram's bins
-    `.../histogram/<bin>`."""
+    """A sown `INSPECTED` collection's scalars by name, `activations/<module path>/<statistic>`. A summary
+    a lifted transform stacked (a scanned stack's, one a layer; a pipeline's, one a microbatch) names
+    each of its entries by its index, `.../<module path>/<i>/<statistic>`, one index a stacking axis."""
     found: dict[str, jax.Array] = {}
     for path, leaf in jax.tree_util.tree_flatten_with_path(inspected)[0]:
         keys = [str(getattr(entry, "key", entry)) for entry in path]
-        statistic, module = keys[-1], [key for key in keys[:-1] if key != "output"]
-        # A scanned stack stacks one summary a layer on a first axis; a histogram ends in its bins.
-        layered = leaf.ndim > (1 if statistic == "histogram" else 0)
-        for layer in range(leaf.shape[0]) if layered else [None]:
-            value = leaf[layer] if layer is not None else leaf
-            name = "/".join(["activations", *module, *([f"layer_{layer}"] if layer is not None else []),
-                             statistic])
-            if statistic == "histogram":
-                found.update({f"{name}/{index}": value[index] for index in range(value.shape[0])})
-            else:
-                found[name] = value
+        statistic, module = keys[-1], [key for key in keys[:-1] if key != SOWN]
+        for index in np.ndindex(*leaf.shape):
+            found["/".join(["activations", *module, *map(str, index), statistic])] = leaf[index]
     return found
 
 

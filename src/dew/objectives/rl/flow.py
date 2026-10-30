@@ -29,7 +29,7 @@ from dew._coordination import agreed, agreed_same, broadcast_from_process_zero, 
 from dew.batch import Batch, Variables
 from dew.data.dataset import rows_of
 from dew.diffusion.presets import Preset
-from dew.diffusion.process import Denoiser, Process
+from dew.diffusion.process import Denoiser, Process, aligned_conditions
 from dew.diffusion.schedules.source import SourceGrid
 from dew.diffusion.transforms import broadcast_rates
 from dew.distributed.batches import row_origins, shared_host_fields, split_fields, with_host
@@ -250,12 +250,20 @@ class FlowGRPOObjective(DiffusionObjective):
             metrics["reward"] = jnp.asarray(batch[REWARDS_KEY], jnp.float32).mean()
         inspected = None
         if step.watched is not None:
-            # The policy's forward at each trajectory's first transition (`Denoiser._raw`), for its
-            # summaries: every transition's runs these weights.
+            # The policy's forward at each trajectory's first transition, as its walk calls it: over the
+            # conditional and unconditional halves where it is guided (`Denoiser.raw_both`), else the
+            # conditional alone (`Denoiser._raw`); every transition's runs these weights.
             policy, x, t = self._policy(variables, batch), latents[:, 0], times[:, 0]
+            conditions = policy.conditions
+            if self.guidance is not None:
+                assert policy.unconditional is not None, "a guided policy holds its unconditional conditions"
+                conditions = jax.tree.map(lambda given, null: jnp.concatenate(
+                    [given, jnp.broadcast_to(null, given.shape)], axis=0),
+                    conditions, aligned_conditions(conditions, policy.unconditional))
+                x, t = jnp.concatenate([x, x], axis=0), jnp.concatenate([t, t], axis=0)
             c_in = self.process.prediction.get_input_scale(broadcast_rates(policy.schedule, t, x))
             inspected = self.watched_forward(step, policy.model, policy.params, x * c_in,
-                                             policy.schedule.model_time(t), **policy.conditions)
+                                             policy.schedule.model_time(t), **conditions)
         return Ratio(pg + self.beta * kl, mass), Aux(metrics, inspected=inspected)
 
     def _rows(self, batch: Batch) -> int:

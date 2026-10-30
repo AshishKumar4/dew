@@ -75,16 +75,6 @@ class Inspection:
         return step % self.every == 0
 
 
-def _leaf_statistics(leaf: jax.Array, *, histogram: bool) -> dict[str, jax.Array]:
-    """A leaf's summary over its global array, as a watched activation's is
-    (`dew.nn.inspection.statistics`), and the fraction of it that is exactly zero; a histogram's bins
-    one scalar each, `histogram/<bin>`."""
-    found = {**statistics(leaf, histogram=histogram), "zero_fraction": (leaf == 0).mean()}
-    bins = found.pop("histogram", None)
-    return found if bins is None else {**found, **{f"histogram/{index}": bins[index]
-                                                   for index in range(bins.shape[0])}}
-
-
 def summaries(inspection: Inspection, params, grads, updates, stepped) -> dict[str, jax.Array]:
     """The scalars a sampled commit reports, by name: `<target>/<path>/<statistic>` for each leaf a path
     glob selects, `<target>/l2` for each target, and `update_to_weight`. `stepped` is the parameters after
@@ -100,7 +90,7 @@ def summaries(inspection: Inspection, params, grads, updates, stepped) -> dict[s
             name = parameter_name(path)
             if any(fnmatch.fnmatchcase(name, pattern) for pattern in inspection.paths):
                 found.update({f"{target}/{name}/{statistic}": value
-                              for statistic, value in _leaf_statistics(
+                              for statistic, value in statistics(
                                   leaf, histogram=inspection.histogram).items()})
     weights = optax.global_norm(jax.tree.map(lambda leaf: leaf.astype(jnp.float32), params))
     found["update_to_weight"] = optax.global_norm(
@@ -114,14 +104,17 @@ def logged(inspected: Mapping[str, SupportsFloat]) -> dict[str, float]:
 
 
 def inspected(trainer: Trainer, batch: Batch, *, steps: int | None = None) -> dict[str, float]:
-    """The scalars `trainer`'s inspection logs, of one sampled step over `batch` from the state the
+    """The scalars `trainer`'s inspection logs, of one sampled update over `batch` from the state the
     trainer places, its checkpoints' latest where it has them, else its start: the view a live run
-    logs, for a loaded run on one batch offline. An `OptimConfig` is built over `steps`, the run's
-    length, as `fit(steps=...)` builds it. The stepped state is discarded."""
+    logs, for a loaded run on one batch offline. A trainer that accumulates steps its whole window,
+    `batch` each of its microbatches, and reports the step that commits. An `OptimConfig` is built over
+    `steps`, the run's length, as `fit(steps=...)` builds it. The stepped state is discarded."""
     if trainer.inspection is None:
         raise ValueError("the trainer names no inspection (Trainer(inspection=...)) to report")
     trainer.scheduled(None if steps is None else steps // trainer.accumulation)
     state, _, _ = trainer.place()
-    *_, committed = trainer.compile(state, batch)(state, batch, sampled=True)
+    step = trainer.compile(state, batch)
+    for _ in range(trainer.accumulation):
+        state, *_, committed = step(state, batch, sampled=True)
     assert committed is not None, "a trainer that inspects runs its own transaction, which commits"
     return logged(jax.device_get(committed.inspected))
