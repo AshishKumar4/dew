@@ -971,3 +971,42 @@ def _pipelined(module, view, x, stage, rows):
     """`run_pipeline` over `module`'s variables as `view` stacks them: compact, so the
     stages it builds are `module`'s own (`pipelined_blocks`)."""
     return run_pipeline(module, view, x, lambda _: stage(), rows=rows)
+
+
+def banked_collections(groups: Sequence[tuple[int, int]],
+                       variables: Mapping[str, Mapping]) -> tuple[str, ...]:
+    """The collections of `variables` whose layer subtrees the store holds as banks, over the stack's
+    scanned `groups` (`(first, count)` runs; `CausalTransformer.banked_collections`)."""
+    runs = {group_name(first, count): [f'layers_{index}' for index in range(first, first + count)]
+            for first, count in groups if count > 1}
+    banked = []
+    for collection, tree in variables.items():
+        banks = set(tree) & set(runs)
+        if not banks:
+            continue
+        mixed = False
+        for bank, layers in runs.items():
+            rows = [layer for layer in layers if layer in tree]
+            if not rows:
+                continue
+            mixed = True
+            if bank not in tree:
+                continue
+            shared = {tuple(entry.key for entry in path)
+                      for path, _ in jax.tree_util.tree_leaves_with_path(tree[bank])}
+            for layer in rows:
+                overlap = shared & {tuple(entry.key for entry in path)
+                                    for path, _ in jax.tree_util.tree_leaves_with_path(tree[layer])}
+                if overlap:
+                    raise ValueError(
+                        f"collection {collection!r} holds {'/'.join(overlap.pop())} both in "
+                        f"the bank {bank} and in its layer {layer}; a leaf is read from one")
+        if mixed:
+            continue
+        if banks != set(runs):
+            raise ValueError(
+                f"collection {collection!r} holds the banks {sorted(banks)} "
+                f"of the runs {sorted(runs)} and not the others; a store holds every "
+                f"run's bank or every layer's own subtree")
+        banked.append(collection)
+    return tuple(banked)

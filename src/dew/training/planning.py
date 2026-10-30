@@ -41,8 +41,10 @@ from dew.training.distributed import batch_divisor
 from dew.training.footprint import Footprint
 from dew.training.memory import (
     compiled_if_it_fits,
+    derived_headroom,
     head_fused_of,
     head_tile_of,
+    local_devices,
     recompute_more,
     recompute_record,
     remat_half,
@@ -446,12 +448,13 @@ class Forecast:
         return min(guesses, default=None)
 
 
-def settled(planned: Planned, probes: Sequence[Probe]) -> dict[str, JSON]:
-    """The admitted plan, its kernel report and every compile needed to find it. There is no
-    alternative-policy timing or selection in the run's admission record."""
+def settled(planned: Planned, probes: Sequence[Probe], derived: Sequence[JSON] = ()) -> dict[str, JSON]:
+    """The admitted plan, its kernel report, every compile needed to find it and each rung the
+    derivation read before them (`FitSearch.derived`). There is no alternative-policy timing or
+    selection in the run's admission record."""
     _log.info("the step's %s", planned.candidate.kernels.summary())
     return {**planned.record(), "kernels": planned.candidate.kernels.record(),
-            "probes": [probe.record() for probe in probes]}
+            "probes": [probe.record() for probe in probes], "derived": list(derived)}
 
 
 @dataclasses.dataclass
@@ -474,7 +477,7 @@ class FitSearch[LossT, EffectsT]:
     step's peak (a decoder's step on an A100 peaked at 8.427 GB either way, node receipt
     TL-a100-offload-1338-c); a run keeps them there by its layout (`Layout.host`) alone. A remat policy
     that keeps its residuals in pinned host memory ('minimal_offloaded') keeps as many on the device as
-    'full' does (`test_model_protocols`' `_saved`: a decoder's 107,720 bytes both, 'save_dot_except_mlp'
+    'full' does (`tests/test_remat_rungs.py`' `_saved`: a decoder's 107,720 bytes both, 'save_dot_except_mlp'
     132,296), so it fits nowhere 'full' does not, and a run takes it by its own remat."""
     lower: Callable[[int, bool], Candidate]
     options: Callable[[Candidate], jax.stages.CompilerOptions | None]
@@ -499,21 +502,74 @@ class FitSearch[LossT, EffectsT]:
     capacity: int | None = None
     """The bytes a device that states none holds (`step_headroom`): a compile-only GPU's, as a step
     compiled ahead for it states them (`AheadTarget.capacity`)."""
+    derive: Callable[[int, bool], Candidate] | None = None
+    """The step at a split, at the objective's rung and `narrow`, traced and not lowered, for its derived
+    footprint (`dew.training.footprint`), which picks the search's first rung (`derived_start`); None
+    for a run that starts from a plan, recorded, compiled ahead or resumed, which the search tries first."""
+    derived: list[dict[str, JSON]] = dataclasses.field(default_factory=list)
+    """Each rung the derivation read before the first compile: its rung, terms, headroom and label."""
 
     def __post_init__(self):
         self.factor = temporaries_factor(self.mesh, self.capacity)
         self.started = self.remat_rung()
+        record = recompute_record(self.objective)
+        # Whether any module the run trains sets its own remat, which it compiles at alone.
+        self.remat_set = any(entry is not None for entry in (record if isinstance(record, list)
+                                                             else [record]))
         # Every rung keeps, XLA's defaults' included, the options the modules need to compute right.
         self.required = compiler_options(*self.objective.towers()) or None
 
     def admitted(self, candidates: Sequence[int], first: int) -> tuple[Planned, tuple[Probe, ...]]:
-        """The first fitting plan found by the split-and-rung search, and every compile it made.
-        Once admission succeeds, no optional alternate policy is compiled."""
+        """The first fitting plan found by the split-and-rung search, and every compile it made, its
+        first rung the one the derivation picks (`derived_start`). Once admission succeeds, no optional
+        alternate policy is compiled."""
+        # A rung fits where its most microbatches do; the search then finds its split there.
+        self.derived_start(candidates[-1])
         split = planned(candidates, first, self.fits, self.climb,
                         lambda split: self.forecast.likely(self.rung(), split))
         if split is None or self.fitted is None:
             raise PlanRefused(self.probes) from (self.refusals[-1] if self.refusals else None)
         return self.found(split), tuple(self.probes)
+
+    def derived_start(self, split: int) -> None:
+        """Move the objective to the least-recompute rung whose derived footprint at `split`, the run's
+        most microbatches, fits the devices (`derived_headroom`, labelled 'fits'), before anything
+        compiles, so the search's first compile confirms it and a miss climbs on as a correction; the
+        rungs read are `derived`. A rung the derivation cannot judge ('unknown': residuals over several
+        devices, devices stating no memory) ends the walk where it started, at the base rung, as does a
+        ladder no rung of which fits; so does a run that sets its remat, which compiles at it alone.
+        The derivation names no XLA workspace, so a 'fits' is a first guess and the compile the
+        decision."""
+        if self.derive is None or self.resumed is not None or self.remat_set:
+            return
+        base = (tuple(entry.module for entry in self.objective.program_key()), head_tile_of(self.objective),
+                head_fused_of(self.objective))
+        narrow = self.narrow
+        while True:
+            candidate = self.derive(split, narrow)
+            footprint = candidate.footprint
+            headroom = None if footprint is None else derived_headroom(
+                footprint, local_devices(self.mesh), self.capacity, candidate.built)
+            label = "unknown" if headroom is None else "fits" if headroom >= 0 else "refuses"
+            self.derived.append({**self.current(), "narrow": narrow, "split": split, "headroom": headroom,
+                                 "label": label, "terms": None if footprint is None else footprint.record()})
+            if label != "refuses":
+                break
+            # The search's own climb drops the narrow copies first, at the same head and remat.
+            if narrow and candidate.copies:
+                narrow = False
+                continue
+            narrow = False
+            if not self.onward(lambda: recompute_more(self.objective, self.base)):
+                break
+        if label != "fits":
+            self.objective.substitute(list(base[0]))
+            self.objective.restore_head(base[1], fused=base[2])
+            narrow = self.narrow
+        elif self.remat_rung() != self.started:
+            _log.info("the derivation says the step fits from remat %s; compiling there first",
+                      self.remat_rung())
+        self.narrow = narrow
 
     def current(self) -> dict[str, JSON]:
         return rung_record(self.objective, self.xla_defaults, narrow=self.narrow)
