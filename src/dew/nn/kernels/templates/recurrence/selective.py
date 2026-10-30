@@ -362,7 +362,7 @@ def _summed_rows(tile, view, smem, family) -> None:
     `view` `[rows]`: the tile loaded in the family's accumulator layout, whose rows' sums its row layout
     holds (as the mainloop's range terms leave)."""
     del smem
-    view[...] = jnp.sum(plgpu.load(tile, (), layout=family.layout, optimized=False), axis=1)
+    view[...] = jnp.sum(plgpu.load(tile, layout=family.layout, optimized=False), axis=1)
 
 
 def selective_scan(x, dt, A, B, C, D, state=None, starts=None, *, family: mosaic.Family, chunk: int = 32,
