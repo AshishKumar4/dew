@@ -345,7 +345,8 @@ class Router(nn.Module):
         if self.hash_vocab is not None:
             if tokens is None:
                 raise ValueError("hash routing selects by the token ids, which the caller passes")
-            return self.tid2eid.value[jnp.asarray(tokens)]
+            # The table as it is held, a host array among them, indexed by traced ids.
+            return jnp.asarray(self.tid2eid.value)[jnp.asarray(tokens)]
         if tokens is not None:
             raise ValueError("only a hash router reads the token ids")
         selection = self.selection(scores, media, blocks)
