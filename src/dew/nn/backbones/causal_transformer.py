@@ -397,9 +397,8 @@ class CausalTransformer(nn.Module):
     over finished blocks of layers that replaces the running residual. None
     disables them."""
     engram: Engram | None = None
-    """DeepSeek-V4.1's n-gram lookups, or Qwen4-Exp's per-layer embedding (`dew.nn.engram`), each layer it
-    names adding its table rows to the streams before its attention. The compressed vocabulary,
-    `engram_hashes/token_map` in `constants`, is a loaded tokenizer's, else each id modulo its size."""
+    """DeepSeek-V4.1's n-gram lookups or Qwen4-Exp's per-layer embedding (`dew.nn.engram`) before each named
+    layer's attention, over the compressed vocabulary `constants` holds (`engram_hashes/token_map`)."""
     dex: DifferentialExtension | None = None
     """The chosen heads whose attention outputs take a learned differential (`dew.nn.dex`), or None."""
     cross_attention: CrossBlocks | None = None
@@ -669,7 +668,8 @@ class CausalTransformer(nn.Module):
             "kv_shared": kv_shared, "kv_store_key": layer_type,
             "partial_rotary_factor": kind.partial_rotary_factor, "attention_sinks": kind.sinks,
             "qk_norm": kind.qk_norm, "init_std": self.init_stds[0], "output_init_std": self.init_stds[1],
-            "precision": self.precision, "dex": dex, "value_experts": self.value_experts if routed else None}
+            "precision": self.precision, "dex": dex, "value_experts": None if not routed or self.value_experts
+            is None else self.value_experts.under(self.mixture)}
         return MixerContext(**resolved, **{field.name: getattr(self, field.name)
                                            for field in dataclasses.fields(MixerContext)
                                            if field.name not in resolved})
