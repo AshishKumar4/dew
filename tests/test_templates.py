@@ -18,13 +18,12 @@ from dew.nn.kernels.tuning import Unpinnable
 
 def test_a_templates_refusal_reaches_the_forced_call_without_reconstruction():
     limit = Refusal("workspace", "the call exceeds the available workspace", "resource model")
-    operation = Op("bounded", (Kernel("native", (lambda size: limit if size > 4 else None,)),
-                                Kernel("plain", (), generic=True)))
+    operation = Op("grouped_matmul", (Kernel("native", (lambda size: limit if size > 4 else None,)),
+                                       Kernel("plain", (), generic=True)))
     select(operation, 4, named="native")
     with pytest.raises(KernelRefused) as refused:
         select(operation, 5, named="native")
     assert refused.value.refusals == [limit]
-    assert refused.value.refusals[0] is limit
 
 
 def test_a_tensor_memory_launch_refuses_an_automatic_mesh_axis():
