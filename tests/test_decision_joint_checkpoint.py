@@ -376,9 +376,9 @@ def test_a_run_that_held_weights_frozen_serves_as_its_weights_unsplit_do(tmp_pat
     same weights in one collection, does (`dew.inference.projections`, ledger 2439): one layout, so the
     two loads compute one program and answer alike. A run trained from the frozen trunk's task holds
     the trunk frozen as its run stored it (`trained_tree`)."""
-    import dataclasses
-
     from dew.batch import FROZEN, freeze, part, thaw
+    from dew.inference.projections import inference_projections
+    from dew.objectives.base import joined
 
     release = tmp_path / "release"
     release.mkdir()
@@ -401,11 +401,16 @@ def test_a_run_that_held_weights_frozen_serves_as_its_weights_unsplit_do(tmp_pat
     checkpoints.wait()
     assert FROZEN in state.variables
 
+    # The run's weights in one collection, as its export holds them, packed as a load packs them.
     trained = thaw(jax.device_get(state.variables))
     loaded = Decide.from_run(str(run))
-    unsplit = Decide.of(dataclasses.replace(bundle, variables=part(trained, "backbone"),
-                                            head_variables=part(trained, "head")))
-    assert jax.tree.structure(thaw(loaded.variables)) == jax.tree.structure(unsplit.variables)
+    unsplit = replace(loaded, variables=joined({
+        "backbone": inference_projections(loaded.model.backbone, part(trained, "backbone")),
+        "head": part(trained, "head")}))
+    held = thaw(jax.device_get(loaded.variables))
+    assert jax.tree.structure(held) == jax.tree.structure(unsplit.variables)
+    for leaf, alike in zip(jax.tree.leaves(held), jax.tree.leaves(unsplit.variables), strict=True):
+        np.testing.assert_array_equal(np.asarray(leaf), np.asarray(alike))
     for state_text in ("charged twice!", "is the site down?"):
         found, expected = loaded(state_text, {"team": team}), unsplit(state_text, {"team": team})
         np.testing.assert_array_equal(found["team"].probabilities, expected["team"].probabilities)
