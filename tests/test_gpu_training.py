@@ -12,6 +12,8 @@ directory, rung records and data cache of its own:
   again after another run measured kernels into its cache (test_trainer).
 - An accumulating step updates the optimizer in its commit alone (test_training_transactions).
 - An LM run measures its kernel launches as set (test_run_option_matrix).
+- A clocked run with a cooldown trains from its step compiled ahead, compiling no other (test_compile_ahead);
+  the attention forms a run names on its command line reach its step (test_run_options, ledger 2639).
 """
 
 import dataclasses
@@ -24,6 +26,7 @@ import pytest
 import test_compile_ahead as compile_ahead
 import test_plan as plan
 import test_run_option_matrix as run_option_matrix
+import test_run_options as run_options
 import test_trainer as trainer
 import test_training_transactions as transactions
 from gpu_flow import Cell, cells_of, run_cells
@@ -86,4 +89,10 @@ def test_a_runs_training_reads_this_gpu(tmp_path_factory):
         Cell("an LM run measures its kernel launches as set",
              in_own(run_option_matrix.an_lm_run_measures_its_kernel_launches_as_set, "launches",
                     cuda_flags=False)),
+        Cell("a clocked run with a cooldown trains from its step compiled ahead, compiling no other",
+             in_own(compile_ahead.a_clocked_run_with_a_cooldown_trains_from_its_step_compiled_ahead_compiling_no_other,
+                    "clocked")),
+        # A fast form is a fast kernel on sm90 alone: on sm80 the default route computes IEEE fp32.
+        Cell("the attention forms a run names reach its step",
+             in_own(run_options.the_attention_forms_a_run_names_reach_its_step, "forms"), generation="sm90"),
     ])
