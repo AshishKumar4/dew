@@ -30,6 +30,7 @@ from dew.batch import FROZEN, Batch, Variables
 from dew.inputs import InputSpec
 from dew.nn import categorical
 from dew.nn.precision import at_least_fp32
+from dew.nn.progress import progressed
 from dew.nn.protocols import Lacks
 from dew.objectives.base import Aux, Objective, Ratio, Source, Step, model_rngs
 
@@ -66,6 +67,8 @@ class Supervised(Objective[Ratio]):
     counts the model's own (`Objective.training_flops`), which a module Dew holds no count for leaves
     unknown, never estimated from the compiled program.
     """
+
+    passes_progress = True
 
     def __init__(self, model: nn.Module | Source[nn.Module], loss: Criterion,
                  metrics: Sequence[Criterion] = (), *, inputs: InputSpec | str, mode: str | None = None,
@@ -118,7 +121,8 @@ class Supervised(Objective[Ratio]):
         mode = {} if self.mode is None else {self.mode: step.training}
         outputs, updates = self.model.apply(variables, batch[self.field],
                                             rngs=model_rngs(step.key, training=step.training),
-                                            mutable=held, method="__call__", **mode)
+                                            mutable=held, method="__call__", **mode,
+                                            **progressed(self.model, self.progress(step)))
         losses = self.criterion(outputs, batch)
         if jnp.ndim(losses) == 0:
             raise ValueError("the loss returns one loss per example, not their mean; Supervised "
