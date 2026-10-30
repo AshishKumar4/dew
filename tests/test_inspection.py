@@ -353,21 +353,23 @@ def test_an_offline_view_restored_mid_window_steps_to_its_commit(tmp_path, split
 
 
 def test_called_with_reads_the_models_own_call_in_this_trace_alone():
-    """The inputs a forward hands a model are read off that model's own call, past a call another module
-    makes first, and only in the caller's own trace: a forward that calls it inside a transform of its
-    own (a `cond`) is refused, its inputs that transform's."""
+    """The inputs a forward hands a model over its weights are read off that call, past a call another
+    module makes first and past one the same architecture makes over other weights (a guide's), and only
+    in the caller's own trace: a forward that calls it inside a transform of its own (a `cond`) is refused,
+    its inputs that transform's."""
     from dew.nn.inspection import called_with
 
     block, head = Block(), Headed()
     x = jnp.asarray(ROWS)
-    block_variables = block.init(jax.random.key(0), x)
+    weights, guide = block.init(jax.random.key(0), x), block.init(jax.random.key(2), x)
     head_variables = head.init(jax.random.key(1), x)
 
     def forward(rows):
         head.apply(head_variables, rows)
-        return block.apply(block_variables, rows * 2)
+        block.apply(guide, rows * 3)
+        return block.apply(weights, rows * 2)
 
-    args, _ = called_with(block, lambda: forward(x))
+    args, _ = called_with(block, weights, lambda: forward(x))
     np.testing.assert_array_equal(args[0], x * 2)
     with pytest.raises(ValueError):
-        called_with(block, lambda: jax.lax.cond(jnp.asarray(1) > 0, forward, forward, x))
+        called_with(block, weights, lambda: jax.lax.cond(jnp.asarray(1) > 0, forward, forward, x))
