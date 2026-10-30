@@ -148,6 +148,43 @@ def test_a_load_reads_each_tensor_by_name_from_its_checkpoint(source, loaded, tm
         Pretrained.load(lacking, fallback="torchax", dtype="float32")
 
 
+def test_a_checkpoint_transformers_converts_is_refused_where_it_lacks_a_parameter(tmp_path):
+    """A tier-3 checkpoint in a layout transformers' load converts (OLMoE's experts a tensor each, which it
+    fuses) loads through that load, and is refused where it lacks a parameter its model's class names,
+    which that load would draw, as a checkpoint read by name is (ledger 1493)."""
+    from safetensors.numpy import load_file, save_file
+
+    config = transformers.OlmoeConfig(vocab_size=256, hidden_size=32, intermediate_size=32,
+                                      num_hidden_layers=1, num_attention_heads=2, num_key_value_heads=2,
+                                      num_experts=2, num_experts_per_tok=1, max_position_embeddings=64)
+    transformers.OlmoeForCausalLM(config).eval().save_pretrained(tmp_path)
+    tensors = load_file(tmp_path / "model.safetensors")
+    assert any(".mlp.experts.0." in name for name in tensors)
+    with pytest.warns(TransformersTierWarning):
+        Pretrained.load(tmp_path, fallback="torchax", dtype="float32")
+    del tensors["model.layers.0.self_attn.q_proj.weight"]
+    save_file(tensors, tmp_path / "model.safetensors", metadata={"format": "pt"})
+    with pytest.raises(ValueError):
+        Pretrained.load(tmp_path, fallback="torchax", dtype="float32")
+
+
+def test_two_tier_3_models_place_their_names_side_by_side(loaded, tmp_path):
+    """A run of two tier-3 models (a distillation's student and teacher) places each one's torch names by
+    its own plan, the second refining the layout the first refined (`TorchCausalLM.placement`), and one
+    name two models would place differently is refused, which one layout cannot place both by."""
+    ctrl = transformers.CTRLConfig(n_positions=32, n_embd=64, n_layer=2, n_head=4, dff=128, vocab_size=256)
+    transformers.CTRLLMHeadModel(ctrl).eval().save_pretrained(tmp_path)
+    with pytest.warns(TransformersTierWarning):
+        other = Pretrained.load(tmp_path, dtype="float32", fallback="torchax")
+    both = other.model.placement(loaded.model.placement(Layout()))
+    assert isinstance(both, TorchLayout)
+    assert both.axes("gpt_neox.layers.0.attention.query_key_value.weight", 2) == ("mlp", "embed")
+    assert both.axes("transformer.w.weight", 2) == ("vocab", "embed")
+    assert loaded.model.placement(both) == both
+    with pytest.raises(ValueError):
+        loaded.model.placement(TorchLayout(names=(("gpt_neox.embed_in.weight", ("embed", "vocab")),)))
+
+
 def test_the_logits_and_the_objective_loss_are_transformers(source, loaded, tokens):
     """`apply` is the torch forward, and LMObjective's chunked loss over the
     captured head input and the head weight is transformers' own loss."""
