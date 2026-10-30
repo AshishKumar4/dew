@@ -17,6 +17,8 @@ import jax
 
 from dew.devices import deterministic_ops_requested, xla_flag
 
+__all__ = ["enable_compilation_cache"]
+
 
 def dew_cache_dir() -> str:
     """Dew's cache directory: `$XDG_CACHE_HOME/dew`, else ~/.cache/dew."""

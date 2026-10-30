@@ -91,7 +91,7 @@ DEW_GROUPS: list[tuple[str, list[str]]] = [
                                    "dew.eval.harness"]),
     ("Configuration", ["dew.config", "dew.config.lm", "dew.config.jepa", "dew.config.diffusion",
                        "dew.config.sweep"]),
-    ("Utilities", ["dew.rl", "dew.artifacts", "dew.distributed", "dew.telemetry.profile",
+    ("Utilities", ["dew.rl", "dew.artifacts", "dew.distributed", "dew.cache", "dew.telemetry.profile",
                    "dew.telemetry.benchmark", "dew.figures"]),
 ]
 # Places that show users Dew code; every Dew name they use must resolve to the
