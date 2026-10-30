@@ -96,7 +96,7 @@ def test_a_longrope_crossing_reseeds_the_prediction_depth_as_a_prefill_of_its_hi
     assert np.asarray(crossed.rebuilt).all()
     history = jnp.zeros((2, model.max_seq_len), jnp.int32).at[:, :7].set(
         jnp.concatenate([prompts, stretch], axis=1))
-    real = jnp.arange(model.max_seq_len)[None, :] < 7
+    real = jnp.broadcast_to(jnp.arange(model.max_seq_len)[None, :] < 7, history.shape)
     fresh, _ = prefill_state(model, params, ModelInputs(history, {"attention_mask": real}), ops)
     jax.tree.map(np.testing.assert_array_equal, dataclasses.replace(crossed, rebuilt=None),
                  dataclasses.replace(fresh, rebuilt=None))
