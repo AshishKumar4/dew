@@ -22,7 +22,12 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     kernel_of,
     stated,
 )
-from dew.nn.kernels.templates.attention_mosaic_scores import _Backward, _dq_added, _tile_scores
+from dew.nn.kernels.templates.attention_mosaic_scores import (
+    _Backward,
+    _dq_added,
+    _launch_extents,
+    _tile_scores,
+)
 
 
 def _fused_allocations(family: mosaic.Family, config: BackwardTiles, width: int, dtype, stages: int
@@ -103,12 +108,8 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
 def _fused_kernel(walk: _Backward, operands: tuple, treedef, *, name: str, kernel_name: str | None):
     """`_fused_launch`'s kernel for its static facts (`kernel_of`): the walk, its operands' shapes and dtypes
     and the structure of its spans' arrays."""
-    query, key, value, dout = operands
-    batch, queries, heads, width = query.shape
-    keys_padded, kv_heads = key.shape[1], key.shape[2]
-    program, consumers = walk.program, walk.consumers
-    family = program.family
-    block_q, block_k = program.tiles.block_q, program.tiles.block_k
+    (query, key, value, dout, (batch, queries, heads, width), (keys_padded, kv_heads), program, consumers,
+     family, (block_q, block_k)) = _launch_extents(walk, operands)
     pair = consumers * block_k
     q_steps = queries // block_q
     grouped = heads != kv_heads

@@ -81,6 +81,16 @@ def _score_params(family: mosaic.Family, refs, kinds: tuple[Kind, ...], row, hea
     return tuple(_param(family, ref, kind, row, head, first, like, k_first, keys_first=keys_first)
                  for ref, kind in zip(refs, kinds, strict=True))
 
+def _launch_extents(walk: _Backward, operands: tuple) -> tuple:
+    """A queries-first launch's operands (`[B, Qp, H, D]` queries and output cotangents, `[B, Kp, Hk, D]`
+    keys and values) and what its kernel derives from them and its walk: its batch, query count, heads and
+    width, its padded key count and key heads, its program and consumers, its family and its tile."""
+    query, key, value, dout = operands
+    program = walk.program
+    return (query, key, value, dout, query.shape, key.shape[1:3], program, walk.consumers, program.family,
+            (program.tiles.block_q, program.tiles.block_k))
+
+
 def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple, coords: algebra.Coords, whole,
                  shape: tuple[int, int], *, masked: bool | None) -> tuple[jax.Array, jax.Array]:
     """A queries-first step's tile of a hookless fast-form call (`_fused_step`'s, `_coop_step`'s): its
