@@ -214,18 +214,6 @@ def _tiles_added(family: mosaic.Family, refs, stage, place: tuple, k_first, inde
         family.added(piece, view, interpret, smem=stage.at[index])
 
 
-def _walk_settled(family: mosaic.Family, stage, consumers: int, *, added: bool) -> None:
-    """A dK/dV consumer's walk settled before its stores: the read turn's last phase, past the walk's last
-    product, observed (`_logits_stage`'s, where it has one); and where it `added` tile gradients, their last
-    adds' reads of their stage done before the scope's shared memory goes on to the key block's summing
-    (`mosaic.summing`) or the next program (row 2630, ET-DETDIAG-h100: the last query tile's gradient read
-    from a stage already reused, in no fixed order)."""
-    if stage is not None:
-        family.turn(stage[2], consumers, arrive=False)
-    if added:
-        family.store_wait(0)
-
-
 def _dkv_stored(family: mosaic.Family, sums: tuple, views: tuple, stages: tuple, index, interpret: bool
                 ) -> None:
     """A dK/dV consumer's dK and dV of its own keys to their `views`, and its key gradients' sums added into
@@ -272,7 +260,10 @@ def _summed_stored(family: mosaic.Family, sums: tuple, views: tuple, consumers: 
     """The sums of the `consumers` sharing a key block (each over its share of the queries) added in a fixed
     order and stored once to their `views` (`mosaic.summed_across`), dK's and dV's, the key gradients' added
     into theirs (`Family.added`: a parameter the batch rows or heads share takes each program's), each in a
-    scope after the walk's, whose shared memory it reuses (`mosaic.summing`)."""
+    scope after the walk's, whose shared memory it reuses (`mosaic.summing`): the walk's last adds' reads of
+    their stage (`Family.added`, its tile gradients') done first (row 2633, ET-DETDIAG-h100: the last query
+    tile's gradient read from a stage this scope had written)."""
+    family.store_wait(0)
     for place, (value, view) in enumerate(zip(sums, views, strict=True)):
         def written(summed, stage, view=view, place=place):
             if place < 2:
@@ -426,7 +417,9 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
                 lambda streams, lo, hi, counted: family.walk(
                     streams, ((step, lo, hi),), tuple(family.zeros((block_k,)) for _ in key_refs),
                     tuple((block_k, share) for _, share in shares), walk.interpret, first=counted))
-            _walk_settled(family, stage, consumers, added=bool(tile_refs))
+            if stage is not None:
+                # The read turn's last phase, past the walk's last product, observed.
+                family.turn(stage[2], consumers, arrive=False)
             if split:
                 # The consumers' sums, added in a scope after the walk's (`_summed_stored`).
                 return dk, dv, *key_sums
