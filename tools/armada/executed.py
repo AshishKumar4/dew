@@ -2,10 +2,10 @@
 is: a test file's while its tests run, every file's (`lifetime.SHARED`) while collection, conftests and a
 session- or package-scoped fixture's making and ending run, and from the session's end on; and where each test
 file's run read the backend (`followed.reads_backend`) and which of its tests are marked to run on a GPU
-(`MARKS`): a file with either takes another path on a GPU, so the H100 tier runs it (`ci.py gpu-tier`). A read
-is the test file's being collected or run; what a session-scoped fixture reads is every file's, and what runs
-under a module's body, which runs once, as it is imported, is its own test file's too, and every file's before
-collection.
+(`MARKS`), which `ci.py gpu-tier --evidence` reports; the H100 tier runs the marked files alone (`ci.py
+gpu-tier`). A read is the test file's being collected or run; what a session-scoped fixture reads is every
+file's, and what runs under a module's body, which runs once, as it is imported, is its own test file's too,
+and every file's before collection.
 
 What the recorder logs is everything the process executed, read, imported and started, as it happened
 (lifetime.py), which the supervisor reads once the process has exited: this plugin decides no record. It

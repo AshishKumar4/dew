@@ -5,7 +5,7 @@ draws, whose float32 bits a float64 run would draw otherwise)."""
 import jax
 import jax.numpy as jnp
 import numpy as np
-from float64_terms import scan_groups
+from float64_terms import _body, scan_groups
 from reference_error import _floating, as_given, equations
 
 REPLAYED = frozenset({
@@ -148,12 +148,11 @@ def _replayed_equation(equation, values, used):
               if hasattr(variable.aval, "dtype")]
     if any(jnp.issubdtype(dtype, jnp.complexfloating) for dtype in dtypes):
         raise NotImplementedError(f"float64_replay has no float64 rule for complex {name}")
-    if name == "jit":
-        return _replayed(params["jaxpr"].jaxpr, params["jaxpr"].consts, values, used)
-    if name in ("custom_jvp_call", "custom_vjp_call"):
-        return _replayed(params["call_jaxpr"].jaxpr, params["call_jaxpr"].consts, values, used)
-    if name in ("checkpoint", "remat2"):
-        return _replayed(params["jaxpr"], (), values, used)
+    body = _body(equation)
+    if body is not None:
+        # A call the gate opens (`float64_terms.CALLS`: a jit, a remat, a custom rule's primal), replayed
+        # inside as the gate evaluates it.
+        return _replayed(*body, values, used)
     if name == "reduce":
         # The combining body, replayed in float64 over the widened operands' pairs.
         body, count = params["jaxpr"], len(values) // 2

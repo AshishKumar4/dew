@@ -225,11 +225,13 @@ def _climbs_and_restores(name: str, model, variables, inputs, **apply) -> None:
 
 
 PAST_TARGET = {"rungs": {"deepseek-v4-tiny": 130, "deepseek-v41-tiny": 126, "qwen35-tiny": 182,
-                         "glm5-next-tiny": 162, "kimi-k3-tiny": 128, "kimi-linear-tiny": 127}}
+                         "glm5-next-tiny": 162, "kimi-k3-tiny": 128, "kimi-linear-tiny": 127,
+                         "qwen4-exp-native-tiny": 121}}
 """The checkpoints whose rungs take past a group's 120 s to step (`timed`), each its seconds on armada:
 DeepSeek V4's and V4.1's at 727e70cb1 and d00c68f8f, Kimi K3's and Kimi Linear's at 4b732a903, Qwen 3.5's
-and GLM-5 Next's in the durations record. Every train steps every other checkpoint's rungs, and the
-architectures' rungs cover each mixer these hold."""
+and GLM-5 Next's in the durations record, Qwen4-Exp's native checkpoint at 09fab1340. Every train steps
+every other checkpoint's rungs, and the architectures' rungs cover each mixer these hold; Qwen4-Exp's
+transformers checkpoint (qwen4-exp-tiny, 111 s) steps the native one's decoder."""
 
 
 @pytest.mark.parametrize("name", timed(PAST_TARGET, "rungs", PATHS))

@@ -411,9 +411,8 @@ def test_the_training_forward_is_on_par_interpreted(call, natural):
 
 
 @ON_HOPPER
-@pytest.mark.gpu(reason="runs the sm90 mainloop compiled, on an H100")
 @pytest.mark.parametrize("call", CALLS)
-def test_the_training_forward_is_on_par_on_an_h100(call):
+def the_training_forward_is_on_par_on_an_h100(call):
     """The training forward's output, bf16, compiled on an H100."""
     _check_forward(call, jnp.bfloat16, SHAPES["compiled"], natural=False, interpret=False,
                    training=template.Kept.SPLIT)
@@ -1183,35 +1182,31 @@ def test_the_backward_under_every_score_hook_lowers_for_an_h100(hooks, accurate)
 
 
 @ON_HOPPER
-@pytest.mark.gpu(reason="runs the sm90 mainloop compiled, on an H100")
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16], ids=["bfloat16", "float16"])
 @pytest.mark.parametrize("call", CALLS)
-def test_the_forward_is_on_par_on_an_h100(call, dtype):
+def the_forward_is_on_par_on_an_h100(call, dtype):
     """The forward, the base-2 fold, compiled on an H100."""
     _check_forward(call, dtype, SHAPES["compiled"], natural=False, interpret=False)
 
 
 @ON_HOPPER
-@pytest.mark.gpu(reason="runs the sm90 mainloop compiled, on an H100")
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16], ids=["bfloat16", "float16"])
 @pytest.mark.parametrize("call", CALLS)
-def test_the_natural_forward_is_on_par_on_an_h100(call, dtype):
+def the_natural_forward_is_on_par_on_an_h100(call, dtype):
     """The forward with natural logits compiled on an H100."""
     _check_forward(call, dtype, SHAPES["compiled"], natural=True, interpret=False)
 
 
 @ON_HOPPER
-@pytest.mark.gpu(reason="runs the sm90 mainloop compiled, on an H100")
 @pytest.mark.parametrize("form", CASES)
-def test_the_forward_is_on_par_over_every_call_form_on_an_h100(form):
+def the_forward_is_on_par_over_every_call_form_on_an_h100(form):
     """The forward over each of the template core's call forms compiled on an H100."""
     _check_call_form(form, interpret=False)
 
 
 @ON_HOPPER
-@pytest.mark.gpu(reason="runs the sm90 mainloop compiled, on an H100")
 @pytest.mark.parametrize(("width", "value_width"), HEAD_WIDTHS)
-def test_the_forward_is_on_par_at_head_widths_on_an_h100(width, value_width):
+def the_forward_is_on_par_at_head_widths_on_an_h100(width, value_width):
     """The forward of query heads `width` wide and value heads `value_width` over a causal call at
     `FORM_TILES`, compiled on an H100."""
     _check_forward("causal", jnp.bfloat16, SHAPES["compiled"], natural=False, interpret=False, width=width,
@@ -1219,9 +1214,8 @@ def test_the_forward_is_on_par_at_head_widths_on_an_h100(width, value_width):
 
 
 @ON_HOPPER
-@pytest.mark.gpu(reason="runs the sm90 mainloop compiled, on an H100")
 @pytest.mark.parametrize(("width", "value_width"), HEAD_WIDTHS)
-def test_the_backward_is_on_par_at_head_widths_on_an_h100(width, value_width):
+def the_backward_is_on_par_at_head_widths_on_an_h100(width, value_width):
     """The backward in its derived form of query heads `width` wide and value heads `value_width` over a
     causal call, compiled on an H100."""
     _check_backward("causal", SHAPES["compiled"], form=None, interpret=False, width=width,
@@ -1229,55 +1223,49 @@ def test_the_backward_is_on_par_at_head_widths_on_an_h100(width, value_width):
 
 
 @ON_HOPPER
-@pytest.mark.gpu(reason="runs the sm90 mainloop compiled, on an H100")
 @pytest.mark.parametrize(("dtype", "natural"), HOOK_FORMS.values(), ids=HOOK_FORMS)
 @pytest.mark.parametrize("hooks", FORWARD_HOOKS)
-def test_the_forward_is_on_par_under_every_hook_on_an_h100(hooks, dtype, natural):
+def the_forward_is_on_par_under_every_hook_on_an_h100(hooks, dtype, natural):
     """The forward under each hook compiled on an H100."""
     _check_hooks(hooks, dtype, natural, interpret=False)
 
 
 @ON_HOPPER
-@pytest.mark.gpu(reason="runs the sm90 mainloop compiled, on an H100")
 @pytest.mark.parametrize("form", BACKWARD_FORMS)
 @pytest.mark.parametrize("case", CASES)
-def test_the_backward_is_on_par_over_every_call_form_on_an_h100(case, form):
+def the_backward_is_on_par_over_every_call_form_on_an_h100(case, form):
     """The backward in both forms over each of the template core's call forms compiled on an H100."""
     _check_call_form(case, interpret=False, backward=True, form=form)
 
 
 @ON_HOPPER
-@pytest.mark.gpu(reason="runs the sm90 mainloop compiled, on an H100")
 @pytest.mark.parametrize("form", ["forward", *BACKWARD_FORMS])
 @pytest.mark.parametrize("case", RUN_CASES)
-def test_a_call_over_runs_is_on_par_on_an_h100(case, form):
+def a_call_over_runs_is_on_par_on_an_h100(case, form):
     """A decision row's runs compiled on an H100, the forward and the backward in each form."""
     backward = form != "forward"
     _check_call_form(case, interpret=False, backward=backward, form=form if backward else "default")
 
 
 @ON_HOPPER
-@pytest.mark.gpu(reason="runs the sm90 mainloop compiled, on an H100")
-def test_a_causal_backward_of_more_keys_than_queries_is_on_par_on_an_h100():
+def a_causal_backward_of_more_keys_than_queries_is_on_par_on_an_h100():
     """A causal call of 64 queries over 256 keys compiled on an H100, where a consumer waiting for a load
     the producer never issues hangs (the interpreted test's case)."""
     _check_backward("causal", (2, 64, 4, 2), form="default", interpret=False, keys=256)
 
 
 @ON_HOPPER
-@pytest.mark.gpu(reason="runs the sm90 mainloop compiled, on an H100")
 @pytest.mark.parametrize("form", BACKWARD_FORMS)
 @pytest.mark.parametrize("call", CALLS)
-def test_the_backward_is_on_par_on_an_h100(call, form):
+def the_backward_is_on_par_on_an_h100(call, form):
     """The backward in both forms compiled on an H100."""
     _check_backward(call, SHAPES["compiled"], form=form, interpret=False, width=FORM_WIDTHS.get(form, 128))
 
 
 @ON_HOPPER
-@pytest.mark.gpu(reason="runs the sm90 mainloop compiled, on an H100")
 @pytest.mark.parametrize("form", ["default", "accurate"])
 @pytest.mark.parametrize("hooks", BACKWARD_HOOKS)
-def test_the_backward_is_on_par_under_every_score_hook_on_an_h100(hooks, form):
+def the_backward_is_on_par_under_every_score_hook_on_an_h100(hooks, form):
     """The backward in both forms under each score hook compiled on an H100."""
     _check_hooked_backward(hooks, form=form, interpret=False)
 

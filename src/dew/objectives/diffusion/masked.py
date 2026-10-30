@@ -25,6 +25,7 @@ compilation rather than a constant embedded in the executable.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import replace
 from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
 import jax
@@ -36,6 +37,7 @@ from dew.batch import TEXT_KEY, Batch, Variables, flat_field, real_slots, thaw
 from dew.diffusion.discrete import MDLM_STEPS, REVEALED_UNDEFINED, Confident, DiscreteProcess, Unmask, aligned
 from dew.inference.tasks import MaskedGeneration, MaskedSettings, recorded_processor, recorded_tokenizer
 from dew.inputs import Field, InputSpec
+from dew.nn.inspection import INSPECTED
 from dew.nn.moe import ROUTER_COLLECTION
 from dew.nn.precision import at_least_fp32
 from dew.nn.progress import progressed
@@ -49,17 +51,18 @@ from dew.sampling.walks import sample
 
 if TYPE_CHECKING:
     from dew.inference.tasks import Processor
+    from dew.interop.decoder_parts import MaskedWalk
 
 _DEFAULT_SOLVER = Unmask()
 
 
 @runtime_checkable
 class Walking(Protocol):
-    """A loaded source that names the walk its release generates by, its solver, steps and block, or
-    None, as `dew.interop.PretrainedMaskedDecoder` does (`masked_recipe`)."""
+    """A loaded source that names the walk its release generates by, its solver, steps, block and the time
+    its grid runs to, or None, as `dew.interop.PretrainedMaskedDecoder` does (`masked_walk`)."""
 
     @property
-    def masked_recipe(self) -> tuple[Unmask | Confident, int, int | None] | None: ...
+    def masked_walk(self) -> MaskedWalk | None: ...
 
 
 class MaskedDiffusionObjective(HeadedObjective[Ratio | RoutedStatistics, Variables]):
@@ -106,9 +109,12 @@ class MaskedDiffusionObjective(HeadedObjective[Ratio | RoutedStatistics, Variabl
         set how generation unmasks in the task `pipeline` returns, and `solver`
         and `steps` how the preview does, which walks whole rows; None for
         `solver` or `steps` takes a loaded source's own walk where its family
-        declares one (`masked_recipe`, LLaDA2.0's blocks), else `Unmask` over
-        MDLM's steps, and an omitted `block` the source's walk's where the
-        solver is omitted too, else the whole response.
+        declares one (`masked_walk`, LLaDA2.0's blocks, Dream's grid), else
+        `Unmask` over MDLM's steps, and an omitted `block` the source's walk's
+        where the solver is omitted too, else the whole response. Taking the
+        source's walk takes the time its grid runs to into `process` where
+        `process` states none (`DiscreteProcess.endpoint`), so the run's task,
+        saved and served, walks the release's grid.
         `samples` is how many rows the preview draws. `decode` turns a row of ids into the text the artifact
         shows;
         with None, the artifact shows the ids alone.
@@ -119,8 +125,11 @@ class MaskedDiffusionObjective(HeadedObjective[Ratio | RoutedStatistics, Variabl
         responses stop at, overrides the source's (`ended`)."""
         self.eos_token_ids = ended(model, eos_token_ids)
         # The source's own walk, where its family declares one, for what the caller omits.
-        recipe = model.masked_recipe if isinstance(model, Walking) else None
-        own_solver, own_steps, own_block = (_DEFAULT_SOLVER, MDLM_STEPS, None) if recipe is None else recipe
+        walk = model.masked_walk if isinstance(model, Walking) else None
+        own_solver, own_steps, own_block = ((_DEFAULT_SOLVER, MDLM_STEPS, None) if walk is None
+                                            else (walk.solver, walk.steps, walk.block))
+        if walk is not None and solver is None and walk.endpoint is not None and process.endpoint is None:
+            process = replace(process, endpoint=walk.endpoint)
         # A walk the caller names (its solver) keeps the block it names, none where it names none.
         block = (own_block if solver is None else None) if block is OMITTED else block
         solver = own_solver if solver is None else solver
@@ -222,8 +231,9 @@ class MaskedDiffusionObjective(HeadedObjective[Ratio | RoutedStatistics, Variabl
                 params, prediction, routing, batch, queries, fields)
             reported.update(metrics)
         qk = sown.get("qk", {}) if step.qk_stats else None
-        return statistics, Aux(metrics=reported, qk_stats=qk, effects=effects), TokenScores(
-            losses * weights, real.astype(losses.dtype), correct)
+        inspected = sown.get(INSPECTED, {}) if step.watched is not None else None
+        aux = Aux(metrics=reported, qk_stats=qk, effects=effects, inspected=inspected)
+        return statistics, aux, TokenScores(losses * weights, real.astype(losses.dtype), correct)
 
     def _token_losses(self, params, batch, step: Step, *, train: bool):
         """Corrupt the batch once, each row's noise level and mask its example's own (`Step.sample`),
@@ -271,7 +281,7 @@ class MaskedDiffusionObjective(HeadedObjective[Ratio | RoutedStatistics, Variabl
         masked = jnp.where(is_masked, self.process.mask_id, tokens)
 
         # Each position's prediction, as the checkpoint's logits line up with its inputs.
-        opened = (["qk"] if step.qk_stats else []) + ([ROUTER_COLLECTION] if self.balance is not None else [])
+        opened = step.sown(*([ROUTER_COLLECTION] if self.balance is not None else []))
         observed = final_read(self.model, params, masked, train=train,
                               rngs=model_rngs(dropout_key, training=train),
                               mutable=opened or False, capture_intermediates=False,

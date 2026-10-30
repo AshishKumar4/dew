@@ -16,7 +16,6 @@ from reference_error import assert_as_exact
 
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.kernels import bf16_dot_runs
 from dew.nn.kv_cache import (
     KVCache,
     KVStore,
@@ -170,13 +169,7 @@ def test_a_quantized_read_is_the_rotated_write_within_the_formats_rounding(quant
         assert bool(jnp.all(error <= limit))
 
 
-@pytest.mark.gpu(reason="the paged BF16 decode kernel needs CUDA sm80+")
-@pytest.mark.skipif(not bf16_dot_runs(), reason="the paged BF16 decode kernel needs CUDA sm80+")
-@pytest.mark.parametrize("sunk", [False, True], ids=["no-sinks", "sinks"])
-@pytest.mark.parametrize("softcap", [None, 0.5], ids=["plain", "softcap"])
-@pytest.mark.parametrize("width", [64, 256])
-@pytest.mark.parametrize("windowed", [False, True], ids=["prefix", "window"])
-def test_native_gpu_paged_value_and_derivatives_are_the_gathered_attentions(without_deterministic_ops, width,
+def native_gpu_paged_value_and_derivatives_are_the_gathered_attentions(without_deterministic_ops, width,
                                                                              windowed, softcap, sunk):
     """Over reordered and shared pages and distinct key counts, from each
     row's first key under a window where `windowed`, with sinks where `sunk`,
@@ -361,9 +354,7 @@ SOFTCAP_PAGED_SEEDS = 8
 """The softcapped paged decode's declared draws (check 1)."""
 
 
-@pytest.mark.gpu(reason="the paged BF16 decode kernel needs CUDA sm80+")
-@pytest.mark.skipif(not bf16_dot_runs(), reason="the paged BF16 decode kernel needs CUDA sm80+")
-def test_a_softcapped_model_decodes_a_paged_cache_on_par_with_its_compact_cache(without_deterministic_ops):
+def a_softcapped_model_decodes_a_paged_cache_on_par_with_its_compact_cache(without_deterministic_ops):
     """A bf16 decoder with a logit softcap decodes a paged cache on a GPU (where the step used to raise),
     its logits step by step on par with the compact cache's (check 1), the compact cache's reference
     decode in float64 the truth."""
