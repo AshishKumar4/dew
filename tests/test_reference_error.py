@@ -370,6 +370,42 @@ def mixed_terms(x, w):
     return {"rows": np.sqrt(np.square(sizes) @ np.square(MIX.astype(np.float64)))}
 
 
+def a_product_draw(seed):
+    """A [16, 64] by [64, 8] fp32 product's operands."""
+    rng = np.random.default_rng([2641, seed])
+    return (jnp.asarray(rng.standard_normal((16, 64)), jnp.float32),
+            jnp.asarray(rng.standard_normal((64, 8)), jnp.float32))
+
+
+def test_check_1_refuses_a_draw_its_seed_does_not_fix_and_an_arm_of_more_than_its_inputs():
+    """Planted controls (ledger 2641): a draw from a generator its seed does not fix, and an arm drawing a
+    noise of its own, each compare draws no seed pairs, and check 1 refuses both before judging them
+    (`UnpairedDraw`); a planted non-finite entry in Dew's arm fails it."""
+    from reference_error import UnpairedDraw
+
+    unseeded = np.random.default_rng()
+
+    def unfixed_draw(seed):
+        x, w = a_product_draw(seed)
+        return x + jnp.asarray(unseeded.standard_normal(x.shape) * 1e-3, jnp.float32), w
+
+    with pytest.raises(UnpairedDraw):
+        assert_as_exact(jnp.matmul, jnp.matmul, unfixed_draw, "a draw its seed does not fix", seeds=16)
+    noise = iter(range(10**6))
+
+    def noisy(x, w):
+        return x @ w + 1e-6 * jax.random.normal(jax.random.key(next(noise)), (16, 8))
+
+    with pytest.raises(UnpairedDraw):
+        assert_as_exact(as_given(noisy), jnp.matmul, a_product_draw, "an arm of its own noise", seeds=16)
+
+    def planted(x, w):
+        return (x @ w).at[3, 5].set(jnp.nan)
+
+    with pytest.raises(GateFailure):
+        assert_as_exact(planted, jnp.matmul, a_product_draw, "a planted non-finite entry", seeds=16)
+
+
 def test_check_1_sizes_rows_by_their_terms_beside_an_output_held_as_none():
     """Term sizing reads a truth's terms by the truth's own structure (`_term_leaves`): an output held as
     None (a gradient of an input given as None, as `with_gradients` returns one) takes no leaf of the
@@ -433,7 +469,9 @@ def test_further_references_judge_one_dew_arm_each_by_its_own_check_once_a_draw(
     dew = arm(1.0, "mine", "dew")
     assert_as_exact(dew, arm(1.0, "theirs"), draw, "two references", seeds=16, truth_fn=truth,
                     also={"another": arm(1.0, "other")})
-    assert calls == {"dew": 16, "truth": 16}, calls
+    # Dew's arm once a draw, and once more on the first, the check that it depends on its inputs alone
+    # (`_of_its_inputs`).
+    assert calls == {"dew": 17, "truth": 16}, calls
     with pytest.raises(GateFailure) as failed:
         assert_as_exact(arm(3.0, "mine"), arm(3.0, "theirs"), draw, "one far", seeds=16, truth_fn=truth,
                         also={"another": arm(1.0, "other")})
@@ -1605,7 +1643,10 @@ def test_null_runs_judge_the_reference_against_itself_on_draws_no_other_run_take
         assert_as_exact(residue, exact, one_truth, "orbit", seeds=8, truth_fn=truth)
     [(verdict, _, _)] = null_runs(exact, one_truth, "orbit", seeds=8, runs=1, truth_fn=truth, dew_fn=residue)
     assert verdict == "over"
-    assert len(taken) == len(set(taken))
+    # Each run draws its first seed again, the check that its seed fixes it (`_of_its_seed`); its draws are
+    # otherwise its own.
+    drawn = [seed for at, seed in enumerate(taken) if not at or taken[at - 1] != seed]
+    assert len(drawn) == len(set(drawn)) and len(taken) - len(drawn) == 3
     assert null_rate_bound(0, 1400) == pytest.approx(1 - 0.001 ** (1 / 1400), rel=1e-9)
     assert null_rate_bound(0, 200) > 0.03
     assert null_rate_bound(3, 3) == 1.0
