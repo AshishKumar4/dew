@@ -1583,13 +1583,14 @@ def test_a_cooldown_of_a_run_without_a_token_schedule_reads_nothing_from_the_dev
 def test_a_cooldown_resolves_its_points_and_lengths_as_shares_of_the_run():
     """A cooldown's point is a step or a share of the run, resolved as a cadence's is, and its length a
     step count or a share of the steps the run has taken; it decays as 1 - sqrt(u / U), or linearly."""
-    from dew.training.cadence import Tokens
+    from dew.training.cadence import Counted
     from dew.training.cooldown import Cooldowns, resolved
 
     cooldowns = Cooldowns(at=("25%", 6), length="50%")
     assert [branch.at for branch in cooldowns.branches(16, None, 1)] == [4, 6]
     (shared,) = Cooldowns(at=("25%",)).branches(None, 96, 1)
-    assert shared.at == Tokens(24) and shared.due(3, 30, 20) and not shared.due(4, 50, 30)
+    assert shared.at == Counted(24, "tokens") and shared.due(3, {"tokens": (30, 20)})
+    assert not shared.due(4, {"tokens": (50, 30)})
     assert cooldowns.steps(4, 1) == 2 and cooldowns.steps(12, 2) == 6
     assert [cooldowns.factor(update, 4) for update in range(4)] == [1.0, 0.5, 1.0 - math.sqrt(0.5),
                                                                     1.0 - math.sqrt(0.75)]

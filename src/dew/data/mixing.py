@@ -20,7 +20,7 @@ import numpy as np
 from dew._records import boolean, integer, record, text
 from dew.batch import Batch
 from dew.data.dataset import LONG_RUN, logged_run
-from dew.data.pipeline import Record, Rejected
+from dew.data.pipeline import CONSUMED, Record, Rejected
 
 _log = logging.getLogger(__name__)
 
@@ -156,11 +156,15 @@ class _KeepAccepted:
         self.counts, self.tokens, self.certain_after = counts, tokens, certain_after
         self.consecutive = 0
         self.warned = False
+        self.consumed = 0
+        """The source examples the rows it rejected since the last it kept were the last of (`CONSUMED`),
+        which that next row carries on (`_AcceptedIterator`)."""
 
     def __call__(self, element: Batch | Rejected) -> TypeGuard[Batch]:
         self.counts.attempted += 1
         if isinstance(element, Rejected):
             reason = element.reason
+            self.consumed += element.consumed
         else:
             count = None if self.tokens is None else self.tokens(element)
             if count is not None and count < 0:
@@ -170,6 +174,7 @@ class _KeepAccepted:
                 self.consecutive = 0
                 return True
             reason = "zero_targets"
+            self.consumed += integer(element.get(CONSUMED, 0), "a row's consumed examples")
         self.counts.rejected[reason] += 1
         self.consecutive += 1
         if not self.warned and sum(self.counts.rejected.values()) / self.counts.attempted > _WARN_OVER:
@@ -244,14 +249,67 @@ class _AcceptedIterator(_CountedIterator[Batch]):
         super().__init__(parent, predicate.counts)
         self._predicate = predicate
 
+    def __next__(self) -> Batch:
+        kept = next(self._read)
+        consumed, self._predicate.consumed = self._predicate.consumed, 0
+        if not consumed:
+            return kept
+        # The examples the rows rejected before it were the last of are consumed where this row is.
+        return {**kept, CONSUMED: consumed + integer(kept.get(CONSUMED, 0), "a row's consumed examples")}
+
     def _counted(self) -> Mapping[str, object]:
         return {**super()._counted(), "consecutive": self._predicate.consecutive,
-                "warned": self._predicate.warned}
+                "warned": self._predicate.warned, "consumed": self._predicate.consumed}
 
     def _restore(self, counted: Mapping[str, object]) -> None:
         super()._restore(counted)
         self._predicate.consecutive = integer(counted["consecutive"], "consecutive")
         self._predicate.warned = boolean(counted["warned"], "warned")
+        # A position saved before rows carried their consumed examples holds none pending.
+        self._predicate.consumed = integer(counted.get("consumed", 0), "consumed examples pending")
+
+
+class Carried(pygrain.IterDataset[Batch]):
+    """`parent`'s rows, each marker's source examples (`Rejected.consumed`) carried on to the next row and
+    the markers dropped, counting nothing: the carrier after a step whose markers no corpus's count
+    follows, a batched map's group it makes no rows of (`dew.data.lowering._Groups`). The examples it
+    owes are checkpointed with its parent's position; those the stream ends owing are its end's
+    (`dew.training._fit.drained`)."""
+
+    def __init__(self, parent: pygrain.IterDataset[Batch | Rejected]):
+        super().__init__(parent)
+        self._records = parent
+
+    def __iter__(self) -> pygrain.DatasetIterator[Batch]:
+        return _CarriedIterator(iter(self._records))
+
+
+class _CarriedIterator(pygrain.DatasetIterator[Batch]):
+    def __init__(self, parent: pygrain.DatasetIterator):
+        super().__init__(parent)
+        self._read, self._owed = parent, 0
+
+    def __next__(self) -> Batch:
+        while True:
+            element = next(self._read)
+            if isinstance(element, Rejected):
+                self._owed += element.consumed
+                continue
+            owed, self._owed = self._owed, 0
+            if not owed:
+                return element
+            held = integer(element.get(CONSUMED, 0), "a row's consumed examples")
+            return {**element, CONSUMED: owed + held}
+
+    def get_state(self) -> Mapping[str, object]:
+        return {"parent": self._read.get_state(), "owed": self._owed}
+
+    def set_state(self, state: Mapping[str, object]) -> None:
+        self._read.set_state(record(state["parent"], "carried parent"))
+        self._owed = integer(state["owed"], "examples owed")
+
+    def close(self) -> None:
+        self._read.close()
 
 
 class Accepted(pygrain.IterDataset[Batch]):
