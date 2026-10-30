@@ -462,7 +462,7 @@ def exact_power2(k: jax.Array) -> jax.Array:
     which XLA computes as `exp(k ln 2)`, inexactly, and whose products it fuses into one `exp` of their
     sum (its algebraic simplifier's `exp(a) exp(b) -> exp(a + b)`), past fp32's range where each factor
     is in it."""
-    biased = jnp.asarray(k, jnp.float32).astype(jnp.int32) + jnp.int32(127)
+    biased = jnp.asarray(k).astype(jnp.int32) + jnp.int32(127)
     bits = jax.lax.shift_left(biased, jnp.full_like(biased, 23))
     return jax.lax.bitcast_convert_type(bits, jnp.float32)
 
@@ -470,14 +470,12 @@ def exact_power2(k: jax.Array) -> jax.Array:
 def power2(x: jax.Array, k: jax.Array) -> jax.Array:
     """`x * 2^k` for an integral `k` of any size, exactly wherever the result is a normal fp32: three exact
     factors each within 2^±127 (`exact_power2`), of `k`'s sign, so each partial product lies between `x`
-    and the result; `k` held within `POWER2_REACH`, past which the result is zero or infinite."""
-    k = jnp.clip(jnp.asarray(k, jnp.float32), -POWER2_REACH, POWER2_REACH)
-    # k's third by its product with fp32's 1/3, the integer quotient for every integral |k| the clip leaves
-    # (POWER2_REACH): k * fl(1/3) exceeds k / 3 by under |k| * 2^-25, far below the 1/3 by which a
-    # non-multiple of 3 falls short of the next integer, so the truncation lands where the division's would.
-    # An integer division costs the Mosaic mainloops registers they don't have (sm80's GDN training spilled).
-    first = jnp.trunc(k * np.float32(1 / 3))
-    second = jnp.trunc((k - first) / 2)
+    and the result; `k` held within `POWER2_REACH`, past which the result is zero or infinite. `k` is
+    carried as the integer its contract makes it, so its thirds and halves are integer divisions, exact,
+    floored, which keeps each part of `k`'s sign, and no factor converts it again."""
+    k = jnp.clip(jnp.asarray(k, jnp.float32), -POWER2_REACH, POWER2_REACH).astype(jnp.int32)
+    first = k // 3
+    second = (k - first) // 2
     return x * exact_power2(first) * exact_power2(second) * exact_power2(k - first - second)
 
 
