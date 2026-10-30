@@ -44,9 +44,8 @@ import contextvars
 import dataclasses
 import functools
 import inspect
-import itertools
 import math
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -60,6 +59,7 @@ from dew.nn.inputs import cu_seqlens
 from dew.nn.kernels import chunked_launch, generation, recurrence_algebra as algebra
 from dew.nn.kernels.templates import bundles, mosaic, mosaic_sm80, mosaic_sm90, product, resources
 from dew.nn.kernels.templates.gemm import cost
+from dew.nn.kernels.templates.recurrence.issuing import Issuer, Parts
 
 INTERPRETED = mosaic_sm90.WGMMA
 """The bundle Mosaic GPU's interpreter runs the mainloop by off a GPU of a family it claims (a CPU): wgmma's,
@@ -132,116 +132,6 @@ def per_key_refusal(dtype, floor: float | None) -> str | None:
 def _parts(dtype) -> int:
     """The parts a product takes an operand of `dtype` as: three for fp32, one for 16 bits."""
     return PARTS if jnp.dtype(dtype) == jnp.float32 else 1
-
-
-class _Parts:
-    """A tile in shared memory as the 16-bit parts its products take (one, or an fp32 tile's three,
-    `product.formed`), each a view of a stream's slot, and `dtype` the tile's own."""
-
-    def __init__(self, refs, dtype):
-        self.refs, self.dtype = tuple(refs), jnp.dtype(dtype)
-
-    @property
-    def shape(self) -> tuple:
-        return self.refs[0].shape
-
-    @property
-    def T(self) -> "_Parts":
-        return _Parts((ref.T for ref in self.refs), self.dtype)
-
-    def astype(self, dtype) -> "_Parts":
-        """The tile as `dtype`'s, which a product takes it as: its own dtype alone."""
-        if jnp.dtype(dtype) != self.dtype:
-            raise TypeError(f"a {self.dtype} tile in shared memory taken as {jnp.dtype(dtype)}")
-        return self
-
-    def value(self) -> jax.Array:
-        """The tile in registers, in its dtype: its parts summed in fp32, exactly."""
-        if len(self.refs) == 1:
-            return self.refs[0][...]
-        return functools.reduce(jnp.add, (ref[...].astype(jnp.float32) for ref in self.refs))
-
-
-class _Issuer:
-    """The algebra's products (`algebra.Issue`) on the call's family: an operand a `_Parts` tile in shared
-    memory, or a register value the family stages first (`staged`) into its product's `buffers` (by product
-    name, a tile a part), an fp32 one as its parts, as many as its buffers (one, a cast to theirs). A product
-    whose buffers are a list of such sets keeps each value it stages there for the products after it that
-    take the same value, staging a new one into the set its last product read longest ago. Operands of three
-    parts issue the products whose parts' orders sum under three, smallest first; of two, under two."""
-
-    def __init__(self, call: "_Call", buffers: dict | None = None):
-        self.call, self.buffers = call, buffers or {}
-        # By product name: each set's value (held, so its identity stays its own) and its last use.
-        self.held: dict = {}
-
-    def _operand(self, x, name: str, other=None, read: list | None = None) -> tuple:
-        """`x`'s parts' shared-memory tiles, staged into its product's buffers where it is a register value;
-        `read` the tiles products issued before it may still read (`summed`'s), waited for where it would
-        stage into one of them."""
-        if callable(x):
-            # An operand formed when its product stages it (`summed`'s).
-            x = x()
-        if isinstance(x, _Parts):
-            return x.refs
-        if isinstance(x, product.Exact):
-            # One part, in the product's own tile for exact operands (`{name}.exact`).
-            (buffer,) = self.buffers[f"{name}.exact"]
-            return (self._staged(x.value, buffer, read),)
-        if isinstance(x, product.Transposed):
-            # Staged as it is and read transposed (`product.Transposed`).
-            return tuple(ref.T for ref in self._operand(x.value, name, other, read))
-        buffers = self.buffers[name]
-        if isinstance(buffers, list):
-            held = self.held.setdefault(name, [[None, -1] for _ in buffers])
-            uses = max(use for _, use in held) + 1
-            for place, (value, _) in enumerate(held):
-                if value is x:
-                    held[place][1] = uses
-                    return buffers[place]
-            free = [place for place in range(len(buffers)) if held[place][0] is not other]
-            place = min(free, key=lambda place: held[place][1])
-            held[place] = [x, uses]
-            buffers = buffers[place]
-        values = product.formed(x, len(buffers)) if len(buffers) > 1 else (x,)
-        return tuple(self._staged(value, buffer, read) for value, buffer in zip(values, buffers, strict=True))
-
-    def _staged(self, value, buffer, read: list | None):
-        """`value` staged into `buffer` (`Family.staged`), the products in flight done first where one may
-        read it (`read`, then emptied), and `buffer` added to `read` for the products after it."""
-        if read is not None:
-            if any(buffer is tile for tile in read):
-                self.call.family.settled(0)
-                read.clear()
-            read.append(buffer)
-        return self.call.family.staged(value, buffer)
-
-    def summed(self, products: Iterable, shape: tuple[int, int] | None = None) -> jax.Array:
-        """The sum of `products`, each `(name, lhs, rhs)` as `__call__` takes it, issued into one fp32
-        accumulator in place (`Family.issued`): one accumulator held where each its own held two (Kimi delta
-        attention's output, `algebra.key_decayed_output`). Each product's operands are staged as it is
-        issued, so `products` may form them one at a time (`algebra.key_decayed_pairs`), a staging into a
-        tile an issued product may still read waiting for the products in flight first
-        (`Family.settled`). An operand may be a callable forming it then, where `shape`, the sum's, is
-        given."""
-        products = iter(products)
-        first = next(products)
-        family, interpret = self.call.family, self.call.interpret
-
-        def issued(acc):
-            read: list = []
-            for name, lhs, rhs in itertools.chain([first], products):
-                left, right = self._operand(lhs, name, rhs, read), self._operand(rhs, name, lhs, read)
-                acc = family.issued(acc, left, right, interpret)
-            return acc
-
-        shape = (first[1].shape[0], first[2].shape[1]) if shape is None else shape
-        return family.summed(shape, issued, interpret)
-
-    def __call__(self, name: str, lhs, rhs) -> jax.Array:
-        left = self._operand(lhs, name, rhs)
-        right = self._operand(rhs, name, lhs)
-        return self.call.family.apart((lhs.shape[0], rhs.shape[1]), left, right, self.call.interpret)
 
 
 def _diagonal(size: int, family: mosaic.Family) -> jax.Array:
@@ -343,15 +233,15 @@ def _streamed(**blocks) -> dict:
             for p in range(operand.parts)}
 
 
-def _tile(slots, name: str, operand: _Operand, rows=None, columns=None) -> _Parts:
-    """Stream `name`'s slot (its parts `name0`, `name1`, ...) as a `_Parts`, at a block of `rows` or `columns`
+def _tile(slots, name: str, operand: _Operand, rows=None, columns=None) -> Parts:
+    """Stream `name`'s slot (its parts `name0`, `name1`, ...) as a `Parts`, at a block of `rows` or `columns`
     (`pl.ds`) where given."""
     def view(ref):
         if rows is not None:
             ref = ref.at[rows, :]
         return ref if columns is None else ref.at[:, columns]
 
-    return _Parts((view(slots[f"{name}{p}"]) for p in range(operand.parts)), operand.dtype)
+    return Parts((view(slots[f"{name}{p}"]) for p in range(operand.parts)), operand.dtype)
 
 
 def _views(index_map=None, /, **parted) -> dict:
@@ -458,12 +348,12 @@ def _columns(call: _Call, reserved: tuple):
 def _summed(staging: tuple, call: _Call) -> tuple:
     """`algebra.summed_back`'s issuer and column sums on `_summing`'s staging."""
     parts, exact, scratch = staging
-    return _Issuer(call, {"summed": parts, "summed.exact": exact}), _columns(call, scratch)
+    return Issuer(call, {"summed": parts, "summed.exact": exact}), _columns(call, scratch)
 
 
-def _merging(staging, call: _Call) -> _Issuer:
+def _merging(staging, call: _Call) -> Issuer:
     """The inverse's products on `_merges`' staging tiles."""
-    return _Issuer(call, {"merge": list(staging)})
+    return Issuer(call, {"merge": list(staging)})
 
 
 def _taken(index: int):
@@ -628,7 +518,7 @@ def _inverse_flops() -> float:
 
 
 def _products(parts: int) -> int:
-    """The products an fp32 call's issue takes for one of its operands' (`_Issuer`): its parts' pairs whose
+    """The products an fp32 call's issue takes for one of its operands' (`Issuer`): its parts' pairs whose
     orders sum under `parts`."""
     return sum(1 for i in range(parts) for j in range(parts) if i + j < parts)
 
@@ -907,7 +797,7 @@ def _solved(k, v, hi, lo, beta, taken, call: _Call, *, keeps: bool = True):
             def block(name, c):
                 return _tile(slots, name, call.given, columns=pl.ds(c * call.block, call.block))
 
-            product = functools.reduce(jnp.add, (_Issuer(call)("intra", key, key.T)
+            product = functools.reduce(jnp.add, (Issuer(call)("intra", key, key.T)
                                                  for key in map(functools.partial(block, "keys"),
                                                                 range(width // call.block))))
             system = algebra.keyed(product, gate, low, betas, *columns)
@@ -917,9 +807,9 @@ def _solved(k, v, hi, lo, beta, taken, call: _Call, *, keeps: bool = True):
             if keeps:
                 held.store(a_ref, lower, row, CHUNK, h * CHUNK, CHUNK, family=family, smem=landing["square"])
             # The inverse staged once (the first set) for every block's product, a block staged in the
-            # second: `_Issuer` keeps a staged value for the products after it that take it.
+            # second: `Issuer` keeps a staged value for the products after it that take it.
             sets = [lower_tile, scaled_tile]
-            issue = _Issuer(call, {"apply_u": sets, "apply_w": sets})
+            issue = Issuer(call, {"apply_u": sets, "apply_w": sets})
             for c in range(value_width // call.block):
                 u = algebra.weighted("apply_u", lower, block("values", c).value().astype(held.dtype), betas,
                                      issue)
@@ -1021,7 +911,7 @@ def _intra(q, k, hi, lo, beta, taken, call: _Call, *, scale: float):
                 return block("gates", gates, c), block("lows", gates, c)
 
             pairs = functools.partial(algebra.key_decayed_pairs, columns=width // INTRA_KEYS, gates=gated,
-                                      reference=reference, summed=_Issuer(call, {"pairs": pairing}).summed,
+                                      reference=reference, summed=Issuer(call, {"pairs": pairing}).summed,
                                       chunk=CHUNK)
             scores = pairs(operand("queries"), operand("keys"), strict=False) * scale
             held.store(outs[-1], scores, row, CHUNK, h * CHUNK, CHUNK, family=family, smem=landing["square"])
@@ -1073,7 +963,7 @@ def _pairing_operand(call: _Call) -> _Operand:
 
 
 def _pairing(call: _Call) -> list:
-    """The factored pairs' staging (`_Issuer`'s 'pairs'): two sets, the gated rows' and the gated keys',
+    """The factored pairs' staging (`Issuer`'s 'pairs'): two sets, the gated rows' and the gated keys',
     each a `[C, block]` tile a part (`_pairing_operand`)."""
     return [_staging(_pairing_operand(call), (CHUNK, INTRA_KEYS))[0] for _ in range(2)]
 
@@ -1131,7 +1021,7 @@ def _weighted(k, v, a, hi, lo, beta, taken, call: _Call):
             applied, decay = None, None
             if call.delta:
                 # A key block's own staging where it is narrower than a value block's.
-                issue = _Issuer(call, {"apply_u": staging[0], "apply_w": staging[-1]})
+                issue = Issuer(call, {"apply_u": staging[0], "apply_w": staging[-1]})
                 inverse = _tile(slots, "inverse", held)
                 applied = inverse, betas, issue
                 for c in range(value_width // call.block):
@@ -1399,7 +1289,7 @@ def _states(k, w, u, hi, lo, beta, h0, sequences, taken, call: _Call, tiles: Til
 
         def step(role):
             (staged, scratch), lands = roled(role)
-            issue = _Issuer(call, {"corrected": staged, "write": staged})
+            issue = Issuer(call, {"corrected": staged, "write": staged})
             column = walked + role * bv
             return functools.partial(_states_step, lands, issue, scratch, column, role)
 
@@ -1499,7 +1389,7 @@ def _output_held(call: _Call, bv: int) -> _Held:
     products = _widest(_product(call, (given, CHUNK, call.block), (memories, call.block, bv)),
                        _product(call, (held, CHUNK, CHUNK), (held, CHUNK, bv)))
     if call.per_key:
-        # One accumulator for every product (`_Issuer.summed`) beside the values, the intra launch's scores
+        # One accumulator for every product (`Issuer.summed`) beside the values, the intra launch's scores
         # in fp32 and their masked narrow form; apart from it, at the first step, the key blocks' gated
         # queries, staged before any product (an A100's held 64- and 128-wide value blocks at 247 registers,
         # an H100's 128-wide at 248).
@@ -1574,9 +1464,9 @@ def _output(q, k, h, corrected, hi, lo, taken, call: _Call, tiles: Tiles, *, sca
                         family.staged(algebra.key_gated(queries[c].value(), decays, scale), tile[0])
 
                 out = algebra.key_decayed_output(
-                    lambda c: _Parts(gated[c], call.given.dtype), entered, width // call.block,
+                    lambda c: Parts(gated[c], call.given.dtype), entered, width // call.block,
                     _tile(slots, "scores", held).value().astype(jnp.float32), value,
-                    _Issuer(call, {"local": local}).summed)
+                    Issuer(call, {"local": local}).summed)
             else:
                 assert loaded is not None, "a decay a head's prefix loads in the prologue"
                 (gate, low), laid = loaded
@@ -1588,14 +1478,14 @@ def _output(q, k, h, corrected, hi, lo, taken, call: _Call, tiles: Tiles, *, sca
                 def _():
                     scored = algebra.chunk_scores(
                         queries.__getitem__, keys.__getitem__, width // call.block, gate, low, held.dtype,
-                        _Issuer(call), laid=laid)
+                        Issuer(call), laid=laid)
                     pieces = (product.formed(scored.astype(jnp.float32), held.parts) if held.parts > 1
                               else (scored,))
                     for piece, buffer in zip(pieces, staged, strict=True):
                         family.staged(piece, buffer)
 
                 out = algebra.chunk_output(queries.__getitem__, entered, width // call.block, gate, low,
-                                           _Parts(staged, held.dtype), value, scale, _Issuer(call))
+                                           Parts(staged, held.dtype), value, scale, Issuer(call))
             view = o_ref.at[span, pl.ds(h * value_width + index * bv, bv)]
             family.stored([out.astype(o_ref.dtype)], [view], smem=landing["out"])
             return carry, accumulators
@@ -2004,7 +1894,7 @@ def _local_back(q, k, do, hi, lo, taken, call: _Call, *, scale: float):
             # The local scores once, against the output's gradient's whole row.
             dv = algebra.local_gradient(
                 functools.partial(block, "keys"), functools.partial(block, "queries"), width // call.block,
-                gate, low, _tile(slots, "out", given), scale, _Issuer(call, {"local_dv": local}), laid=laid)
+                gate, low, _tile(slots, "out", given), scale, Issuer(call, {"local_dv": local}), laid=laid)
             held.store(dv_ref, dv, row, CHUNK, h * value_width, value_width, family=family,
                        smem=landing["row"])
             return carry, accumulators
@@ -2080,7 +1970,7 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, call: _Call, tiles: Til
             # its significand's bits): one part put the initial memory's gradient 5 to 7 times the port's
             # distance from float64. Its first part reuses the memory products' tile, each consumed before
             # the next stages.
-            issue = _Issuer(call, {**dict.fromkeys(("values_dv", "weights_dv"), staged),
+            issue = Issuer(call, {**dict.fromkeys(("values_dv", "weights_dv"), staged),
                                    "reads": (*staged, second)})
             return functools.partial(_reverse_step, lands, issue, walked + role * bv, pl.ds(role * bv, bv))
 
@@ -2190,7 +2080,7 @@ def _gradient_stored(call: _Call, kind: str, block: int, grad, *, weights: Seque
         family.added(grad, sums[kind], call.interpret, smem=landing["sums"])
 
 
-def _memory_sum(call: _Call, issue: _Issuer, entered: _Parts, leaving: _Parts) -> jax.Array:
+def _memory_sum(call: _Call, issue: Issuer, entered: Parts, leaving: Parts) -> jax.Array:
     """`sum(S dS)` over the value columns of a block of the memories entered and left, `[rows]`: the
     diagonal of their product `S^T dS` where the family's products read registers, else their elementwise
     product's rows (`_query_key`)."""
@@ -2264,7 +2154,7 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, call: _Call, *
                       "dk": dk_ref.at[span, pl.ds(key_columns, call.block)]},
                 first=first_head, landing=landing)
 
-            issue = _Issuer(call)
+            issue = Issuer(call)
             after, leaving = algebra.memory_gradients(
                 functools.partial(whole, "queries", given), functools.partial(whole, "keys", given), 1,
                 functools.partial(column, "values", held), functools.partial(column, "out", given),
@@ -2350,7 +2240,7 @@ def _scores_back(q, k, corrected, do, hi, lo, taken, call: _Call, *, scale: floa
             ds, pairs = algebra.scores_gradient(
                 functools.partial(column, "queries", given), functools.partial(column, "keys", given),
                 width // call.block, functools.partial(column, "values", held),
-                functools.partial(column, "out", given), blocks, gate, low, scale, held.dtype, _Issuer(call),
+                functools.partial(column, "out", given), blocks, gate, low, scale, held.dtype, Issuer(call),
                 laid=laid)
             held.store(ds_ref, ds, row, CHUNK, h * CHUNK, CHUNK, family=family, smem=landing["square"])
             decay_ref.at[h, span][...] = algebra.summed_pairs(pairs, summed, columns)
@@ -2407,7 +2297,7 @@ def _system_back(a, k, v, dw, du, hi, lo, beta, taken, call: _Call):
                 _tile(slots, "lower", held), functools.partial(column, "keys", given), width // call.block,
                 functools.partial(column, "values", given), value_width // call.block,
                 functools.partial(column, "w_grads", held), functools.partial(column, "u_grads", held), beta,
-                gate, low, held.dtype, _Issuer(call, dict.fromkeys(("inverse_t", "inverse_dx", "inverse_l"),
+                gate, low, held.dtype, Issuer(call, dict.fromkeys(("inverse_t", "inverse_dx", "inverse_l"),
                                                                    staged)),
                 laid=(family.columns_of(column_hi_ref.at[h, span]),
                       family.columns_of(column_lo_ref.at[h, span])))
@@ -2460,7 +2350,7 @@ def _values_back(a, v, du, beta, taken, call: _Call):
             dbeta_ref.at[h, span][...] = algebra.values_gradient(
                 _tile(slots, "lower", held), functools.partial(column, "values", given),
                 value_width // call.block, functools.partial(column, "u_grads", held),
-                family.rows_of(beta_ref.at[h, span]), held.dtype, _Issuer(call, {"inverse_t": staged}),
+                family.rows_of(beta_ref.at[h, span]), held.dtype, Issuer(call, {"inverse_t": staged}),
                 emit=stored)
             return carry, accumulators
 
@@ -2519,7 +2409,7 @@ def _keys_back(a, k, dw, dl, hi, lo, beta, taken, call: _Call):
             d_beta, after, pairs = algebra.keys_gradient(
                 _tile(slots, "lower", held), functools.partial(whole, "keys", given), 1,
                 functools.partial(whole, "w_grads", held), _tile(slots, "system", held), beta, gate, low,
-                held.dtype, _Issuer(call, dict.fromkeys(("inverse_t", "keys_dl", "keys_dlt"), staged)),
+                held.dtype, Issuer(call, dict.fromkeys(("inverse_t", "keys_dl", "keys_dlt"), staged)),
                 emit=stored)
             summed, columns = _summed(tuple(summing), call)
             decay_ref.at[c, h, span][...] = algebra.summed_pairs(pairs, summed, columns)
