@@ -102,7 +102,7 @@ class ValueHead(nn.Module):
 class _Policy:
     task: EpisodeInference
 
-    def bind(self, variables: Variables, /, progress: Progress = END) -> EpisodeInference:
+    def bind(self, variables: Variables, /, progress: Progress | None = None) -> EpisodeInference:
         return self.task.bind(part(variables, "policy"), progress)
 
     def __call__(self, inputs: ModelInputs | Sequence[Sequence[int]], max_new_tokens: int, /,

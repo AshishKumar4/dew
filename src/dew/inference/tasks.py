@@ -907,10 +907,11 @@ class TextGeneration(_NativeTextTask):
         return (decoding.stop_strings(self.processor, strings,
                                       self.model.vocab_size if isinstance(self.model, Bounded) else None),)
 
-    def bind(self, variables: Variables, progress: Progress = END) -> Self:
-        """This task over `variables` (`_NativeTextTask.bind`), drawing at the run's `progress`, a
-        collection's step's (`EpisodeInference.bind`)."""
-        return dataclasses.replace(super().bind(variables), progress=progress)
+    def bind(self, variables: Variables, progress: Progress | None = None) -> Self:
+        """This task over `variables` (`_NativeTextTask.bind`), drawing at the run's `progress` where one
+        is given, a collection's step's (`EpisodeInference.bind`), else at its own."""
+        bound = super().bind(variables)
+        return bound if progress is None else dataclasses.replace(bound, progress=progress)
 
     def _controls(self, sampling: Sampling | None, logits: Transforms | None, stopping: Criteria | None
                   ) -> tuple[Sampling, Transforms | None, tuple[Stopping, ...]]:

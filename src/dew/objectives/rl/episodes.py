@@ -32,7 +32,7 @@ from dew.batch import Variables, token_id
 from dew.data.dataset import DataPartition
 from dew.inference.rollouts import Draw
 from dew.nn.inputs import ModelInputs, mesh_of, pad_token_rows
-from dew.nn.progress import END, Progress
+from dew.nn.progress import Progress
 from dew.sampling.text import Generation, Sampling
 
 from .sessions import Call, Session, Snapshot, Status, Task, Transcript, finite_reward, json_objects
@@ -182,10 +182,11 @@ class EpisodeInference(Protocol):
     """Draws actions from a bound policy and returns the actual sampling likelihoods.
 
     `bind(variables, progress)` returns an inference that generates from that one
-    weight snapshot, at the run's `progress` a model that reads one draws at (`dew.nn.progress`).
+    weight snapshot, at the run's `progress` a model that reads one draws at (`dew.nn.progress`), or at
+    its own where none is given.
     """
 
-    def bind(self, variables: Variables, /, progress: Progress = END) -> EpisodeInference: ...
+    def bind(self, variables: Variables, /, progress: Progress | None = None) -> EpisodeInference: ...
 
     def __call__(self, inputs: ModelInputs | Sequence[Sequence[int]], max_new_tokens: int, /,
                  *, key: jax.Array, sampling: Sampling) -> Generation: ...

@@ -483,6 +483,32 @@ def _refuse_unserved_modes(model: nn.Module, *, paged: bool = False, chunked: bo
                          'serving; use whole-prompt dense admission')
 
 
+def _served_mesh(task: TextGeneration) -> Mesh | None:
+    """The mesh `task`'s weights lie on, which a server serves on, refused where a server cannot: a
+    stage or sequence axis, or one over several processes; and a task that draws at a run's progress
+    (`TextGeneration.progress`, a collection's), where a server draws at the run's end."""
+    if task.progress.updates is not None:
+        raise ValueError("a server draws a model that reads the run's progress at the run's end, and "
+                         "this task draws at a run's progress; generate through the task itself")
+    mesh = mesh_of(task.variables)
+    if mesh is None:
+        return None
+    if mesh.shape.get(STAGE_AXIS, 1) > 1:
+        raise ValueError(
+            "a server decodes through the whole layer stack every step; the stage axis "
+            "runs the stack as the training pipeline, which the decoder refuses to decode "
+            "through (one token a step leaves no microbatches to pipeline). Serve on a "
+            "mesh with stage=1"
+        )
+    if mesh.shape.get(SEQUENCE_AXIS, 1) > 1:
+        raise ValueError("a server keeps each row's cached keys whole on the devices of its group, "
+                         "and a decoder refuses to decode under a sequence axis, which splits a "
+                         "sequence's positions. Serve on a mesh with sequence=1")
+    if not NamedSharding(mesh, P()).is_fully_addressable:
+        raise ValueError("a server schedules its rows from one process; a mesh over several "
+                         "processes would need them to agree on every step's admission")
+    return mesh
+
 class Server:
     """Serves text requests with continuous batching over one resident KV cache.
 
@@ -692,23 +718,11 @@ class Server:
         slots only two iterations gained, by under 1%. A call seats requests
         only before its first iteration, so the slots take more iterations
         to fill (docs/performance.md).
+
+        A server draws at the run's end (`dew.nn.progress.END`); a task that draws at a run's progress
+        (`TextGeneration.progress`, a collection's) generates through the task itself.
         """
-        mesh = mesh_of(task.variables)
-        if mesh is not None:
-            if mesh.shape.get(STAGE_AXIS, 1) > 1:
-                raise ValueError(
-                    "a server decodes through the whole layer stack every step; the stage axis "
-                    "runs the stack as the training pipeline, which the decoder refuses to decode "
-                    "through (one token a step leaves no microbatches to pipeline). Serve on a "
-                    "mesh with stage=1"
-                )
-            if mesh.shape.get(SEQUENCE_AXIS, 1) > 1:
-                raise ValueError("a server keeps each row's cached keys whole on the devices of its group, "
-                                 "and a decoder refuses to decode under a sequence axis, which splits a "
-                                 "sequence's positions. Serve on a mesh with sequence=1")
-            if not NamedSharding(mesh, P()).is_fully_addressable:
-                raise ValueError("a server schedules its rows from one process; a mesh over several "
-                                 "processes would need them to agree on every step's admission")
+        mesh = _served_mesh(task)
         if task.n != 1:
             raise ValueError("a served request draws one continuation; submit a prompt once per draw")
         policy, chain, criteria = task._controls(None, None, None)
