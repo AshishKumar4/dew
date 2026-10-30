@@ -609,9 +609,9 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
 class _Launch:
     """A forward launch's static facts, all its kernel is built from (`_kernel_of`): its operands' shapes
     and dtypes, the structure of the arrays its programs read beside them (`treedef`), its hooks with their
-    arrays' shapes and dtypes in place of the arrays (`_described`), its form, tiles and family, what it gives, the target
-    it is derived for, and its name (its form, guard and value columns) as the launch tracing it resolves
-    it (`report.named`)."""
+    arrays' shapes and dtypes in place of the arrays (`_described`), its form, tiles and family, what it
+    gives, the target it is derived for, and its name (its form, guard and value columns) as the launch
+    tracing it resolves it (`report.named`)."""
 
     operands: tuple
     treedef: Any
