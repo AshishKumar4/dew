@@ -18,13 +18,16 @@ layers, attentions and MLPs alternating as the release's do, over a width
 of 32 with a window of 5, its middle four layers looped, a tokenizer of the
 release's kind, fp32 and float64 logits at one, two and four loops and of
 the variant configs, both caches' greedy continuations with each step's
-logits, packed documents, prompts of two lengths, and the cotangent of a
+logits at two and four loops, packed documents, prompts of two lengths, and the cotangent of a
 loss over the logits, whose gradients the tests take from this reference
-live.
+live. The four-loop continuations were added under torch 2.14, whose fp32
+and float64 sums differ in their last bits from those that wrote the rest,
+which a rewrite takes as they come.
 """
 
 from __future__ import annotations
 
+import itertools
 import json
 import math
 from pathlib import Path
@@ -389,11 +392,15 @@ def write_tiny() -> None:
         both(f'logits_{loops}', lambda reference: reference.forward(ids), loops=loops)
     both('keys', lambda reference: reference.first_keys(ids))
     arrays['keys_bf16'] = DoryReference(CONFIG, tensors, torch.bfloat16).first_keys(ids)
-    for mode in ('per_loop', 'last_loop'):
-        tokens, steps = DoryReference(CONFIG, tensors, torch.float64, mode=mode).decode(ids[0, :6], 8)
-        arrays[f'generated_{mode}'], arrays[f'step_logits_{mode}_f64'] = tokens, steps
-        _, steps32 = DoryReference(CONFIG, tensors, torch.float32, mode=mode).decode(ids[0, :6], 8)
-        arrays[f'step_logits_{mode}'] = steps32
+    for mode, loops in itertools.product(('per_loop', 'last_loop'), (None, 4)):
+        # The tiny's own two loops, and four, whose cached passes a decode step scans.
+        tag = mode if loops is None else f'{mode}_{loops}'
+        tokens, steps = DoryReference(CONFIG, tensors, torch.float64, mode=mode,
+                                      loops=loops).decode(ids[0, :6], 8)
+        arrays[f'generated_{tag}'], arrays[f'step_logits_{tag}_f64'] = tokens, steps
+        _, steps32 = DoryReference(CONFIG, tensors, torch.float32, mode=mode,
+                                   loops=loops).decode(ids[0, :6], 8)
+        arrays[f'step_logits_{tag}'] = steps32
     for name, change in VARIANTS.items():
         both(f'logits_{name}', lambda reference: reference.forward(ids), {**CONFIG, **change})
 

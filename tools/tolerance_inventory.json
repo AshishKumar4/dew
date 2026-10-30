@@ -202,7 +202,7 @@
    "lane": "Training"
   },
   "tests/test_disk_banks.py": {
-   "comparisons": 2,
+   "comparisons": 1,
    "lane": "Models, Serving & RL"
   },
   "tests/test_distillation.py": {
