@@ -19,13 +19,14 @@ import optax
 import pytest
 from affine_run import FEATURES, TimingRegression as Regression, batches
 from PIL import Image
+from recording import RecordingTracker
 
 from dew.artifacts import Decisions, ImageGrid, Representations, TextSamples, TokenScores, VideoGrid
 from dew.data import Memory
 from dew.data.dataset import Loader
 from dew.data.pipeline import Pipeline
 from dew.pool import PREEMPTED_EXIT
-from dew.telemetry.records import FitEnded
+from dew.telemetry.records import FitEnded, FitStarted
 from dew.training import Checkpoints, LocalTracker, Trackers, Trainer
 
 
@@ -398,14 +399,25 @@ def test_a_run_on_the_examples_clock_shows_its_progress_in_examples_and_estimate
     assert counted.steps_total() == (40, "40")
 
 
-def test_a_clocked_fit_announces_its_bound_and_logs_its_estimated_steps(capsys):
-    """A clocked fit printed without a live panel names its length as the examples it is bounded to, not
-    a token count it has none of, and each logged step its estimated total (row 2528)."""
+def test_a_clocked_fit_starts_its_display_on_its_bound_and_estimates_its_steps():
+    """A clocked fit's start record carries its bound and no step or token count, and the display it
+    starts reads its length as that bound, its steps estimated from the examples the run consumed, where
+    it once read a token count it had none of (row 2528)."""
+
+    from dew.training.display import TrainingDisplay
+
     x = np.random.default_rng(0).normal(size=(24, FEATURES)).astype(np.float32)
-    Trainer(Regression(), optax.sgd(0.01), key=jax.random.key(0)).fit(
+    tracker = RecordingTracker()
+    Trainer(Regression(), optax.sgd(0.01), key=jax.random.key(0), tracker=tracker).fit(
         Pipeline(Memory({"x": x, "y": 2 * x[:, :2]})).read("streamed").batch(8), examples=24, log_every=1)
-    printed = capsys.readouterr().out
-    assert "for 24 examples" in printed and "None" not in printed and "step 3/≈3" in printed
+    started = next(value for _, value in tracker.artifacts if isinstance(value, FitStarted))
+    assert (started.examples, started.tokens, started.target_steps) == (24, None, None)
+    display = TrainingDisplay()
+    display.start(started, model="affine", batch=8, precision="float32", shown={}, averaged=False)
+    assert (display.examples, display.total) == (24, None)
+    display.current = 1
+    display.interval(1, {"train/loss": 1.0, "train/examples_consumed": 8.0})
+    assert display.steps_total() == (3, "≈3")
 
 
 def test_the_panel_names_a_lower_bound_utilization_and_its_uncounted_kernels_within_its_name_column():
