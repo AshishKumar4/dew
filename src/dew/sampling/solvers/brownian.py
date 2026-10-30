@@ -138,8 +138,9 @@ class DPMSolverSDE:
         if type(self.depth) is not int or not 1 <= self.depth <= MAX_BROWNIAN_DEPTH:
             raise ValueError(f"the Brownian bridge takes 1 to {MAX_BROWNIAN_DEPTH} levels, "
                              f"the mantissa of a float32 position, not {self.depth}")
-        # A seed is data a compiled walk takes (a traced int32 under jit), so it fits 31 bits.
-        if (self.seed is not None and not isinstance(self.seed, jax.Array)
+        # A seed is data a compiled walk takes (a traced int32 under jit, its description in a lowered
+        # program's arguments, `jax.stages.ArgInfo`), so a given one fits 31 bits.
+        if (self.seed is not None and not isinstance(self.seed, (jax.Array, jax.stages.ArgInfo))
                 and (type(self.seed) is not int or not 0 <= self.seed < 2 ** 31)):
             raise ValueError(f"the noise sampler's seed is an integer in [0, 2**31), not {self.seed}")
 
