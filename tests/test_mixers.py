@@ -248,7 +248,8 @@ per-key pairwise decays alone take 134 MB a chunk in KDA's portable math."""
 REFUSED = {"kpool_sparse_attention"}
 """Kinds that refuse packed rows."""
 
-SEEDS = {"attention": 64, "deepseek_v4": 256, "gated_delta_net": 512, "kimi_delta_attention": 512,
+SEEDS = {"attention": 64, "deepseek_v4": 256, "deepseek_v4 csa": 256, "deepseek_v4 csa2": 256,
+         "deepseek_v4 hca": 256, "gated_delta_net": 512, "kimi_delta_attention": 512,
          "lightning_attention": 64, "llama4": 128, "mamba": 32, "mamba2": 256, "memory": 256, "mla": 64,
          "mlp": 64, "short_conv": 64}
 """Each kind's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for`: the fewest for which
@@ -295,6 +296,41 @@ def test_a_packed_row_computes_what_its_documents_compute_alone(kind):
         with pytest.raises(ValueError):
             packed_and_alone(model, variables, tokens, cotangent)
         return
+    assert_packed_as_alone(model, variables, f"packed {kind}", SEEDS[kind])
+
+
+COMPRESSED = {"hca": {"compressor": "hca", "compress_rate": 4},
+              "csa": {"compressor": "csa", "compress_rate": 4, "index_topk": 2, "index_n_heads": 2,
+                      "index_head_dim": 16},
+              "csa2": {"compressor": "csa2", "compress_rate": 4, "index_topk": 2, "index_n_heads": 2,
+                       "index_head_dim": 16}}
+"""DeepSeek V4's compressed windows, a layer of each compressor at a rate of 4, so the documents' windows
+straddle each other's boundaries packed: the first's one window and its partial second, the second's
+seventeen, the third's one."""
+
+
+@pytest.mark.parametrize("compressor", sorted(COMPRESSED))
+def test_a_packed_row_pools_each_documents_compressed_windows_as_it_alone_does(compressor):
+    """DeepSeek V4's compressed windows over a packed row (`document_windows`, ledger 2679): each
+    document's windows pool its own real tokens from its first, rotate at its own places and are read by
+    its own queries alone, an indexer selecting among them alone, so a row packing documents gives each
+    document's logits and the parameters' gradients its documents give run one at a time, from float64
+    (check 1), as `test_a_packed_row_computes_what_its_documents_compute_alone` holds every mixer."""
+    fields, overrides = KIND_FIELDS["deepseek_v4"]
+    total = sum(DOCUMENTS)
+    model = tiny(mixer=mixers.build("deepseek_v4", **fields, **COMPRESSED[compressor]),
+                 max_seq_len=max(128, total + PADDING), **overrides)
+    variables = model.init(jax.random.key(4), jax.random.randint(jax.random.key(3), (1, total), 0, VOCAB))
+    assert_packed_as_alone(model, variables, f"packed deepseek_v4 {compressor}",
+                           SEEDS[f"deepseek_v4 {compressor}"])
+
+
+def assert_packed_as_alone(model, variables, what: str, seeds: int):
+    """Check 1 of `model`'s packed row of `DOCUMENTS` against each document run alone, logits and
+    parameter gradients, each draw fresh tokens, parameters and cotangents with the residual channels
+    consistently permuted (`residual_orders`), the float64 truth each document alone."""
+    documents = DOCUMENTS
+    total = sum(documents)
     initialize = jax.jit(model.init)
     width = residual_width(variables)
 
@@ -315,7 +351,7 @@ def test_a_packed_row_computes_what_its_documents_compute_alone(kind):
     dew = jax.jit(functools.partial(evaluated, model, packed=True))
     reference = jax.jit(functools.partial(evaluated, model, packed=False))
     truth = jax.jit(functools.partial(evaluated, model.clone(dtype=jnp.float64), packed=False))
-    assert_as_exact(dew, reference, draw, f"packed {kind}", seeds=SEEDS[kind], truth_fn=truth)
+    assert_as_exact(dew, reference, draw, what, seeds=seeds, truth_fn=truth)
 
 
 def embedded(module, tokens):

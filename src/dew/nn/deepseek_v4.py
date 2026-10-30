@@ -41,7 +41,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 from collections.abc import Callable
-from typing import ClassVar
+from typing import ClassVar, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -106,7 +106,75 @@ def gated_sum(kv, gate, axis: int):
     return jnp.sum(kv * weights, axis=axis)
 
 
-def pool_windows(kv, gate, position_bias, rate: int, overlap: bool):
+class DocumentWindows(NamedTuple):
+    """A packed row's compressed windows document by document (`document_windows`): each document's
+    complete windows of `rate` of its real tokens from its first, as the document alone pools them,
+    one entry after another, `S // rate` entries a row whatever its documents hold."""
+
+    sources: jax.Array
+    """`[B, T, rate]`: the row's index of each entry's tokens."""
+    first: jax.Array
+    """`[B, T]`: the entry is its document's first window, which overlaps no earlier one."""
+    live: jax.Array
+    """`[B, T]`: the entry is a document's complete window, not a slot past the row's last."""
+    document: jax.Array
+    """`[B, T]`: the entry's document."""
+    window: jax.Array
+    """`[B, T]`: the entry's index among its document's windows."""
+    query_document: jax.Array
+    """`[B, S]`: each token's document."""
+    query_rank: jax.Array
+    """`[B, S]`: each token's rank among its document's real tokens."""
+
+    def gathered(self, x):
+        """`x` `[B, S, F]` at each entry's tokens, `[B, T, rate, F]`."""
+        batch, entries, rate = self.sources.shape
+        return gather_positions(x, self.sources.reshape(batch, entries * rate)).reshape(
+            batch, entries, rate, x.shape[-1])
+
+    def origins(self, places):
+        """Each entry's rotary origin `[B, T]`: its window's first token's place (`Coordinates.places`),
+        where its document's queries that read it rotate."""
+        held = jnp.broadcast_to(jnp.asarray(places), self.query_rank.shape)
+        return jnp.take_along_axis(held, self.sources[:, :, 0], axis=1)
+
+    def visible(self, rate: int):
+        """Which entries each query may attend, `[B, S, T]`: its own document's whose window closed at
+        or before it, by its rank there, as `entries_visible` reads a document alone."""
+        closed = self.window[:, None, :] < (self.query_rank[:, :, None] + 1) // rate
+        return self.live[:, None, :] & (self.document[:, None, :] == self.query_document[:, :, None]) & closed
+
+
+def document_windows(segments, valid, rate: int) -> DocumentWindows:
+    """The compressed windows of a row of `segments` `[B, S]`, its real tokens where `valid` marks them,
+    each document's pooled from its own first real token on (`DocumentWindows`): the row's real tokens
+    in document order, each document's in its own, each window opening at a multiple of `rate` among
+    its document's and closed by a real token of it `rate - 1` later; a document's partial last window
+    pools nothing, as the stateless path drops a row's."""
+    segments = jnp.asarray(segments)
+    batch, length = segments.shape
+    real = jnp.ones(segments.shape, bool) if valid is None else jnp.asarray(valid, bool)
+    held = jnp.where(real, segments, jnp.iinfo(segments.dtype).max)
+    order = jnp.argsort(held, axis=1, stable=True)
+    held, kept = (jnp.take_along_axis(field, order, axis=1) for field in (held, real))
+    slots = jnp.arange(length)
+    previous = jnp.concatenate([jnp.full((batch, 1), -1, held.dtype), held[:, :-1]], axis=1)
+    rank = slots - jax.lax.cummax(jnp.where(kept & (held != previous), slots, 0), axis=1)
+    last = jnp.minimum(slots + rate - 1, length - 1)
+    closes = (slots + rate - 1 < length) & kept[:, last] & (held[:, last] == held)
+    opens = kept & (rank % rate == 0) & closes
+    # The row's openings in order, an entry each; slots past its last are no window (`live`).
+    picked = jnp.argsort(~opens, axis=1, stable=True)[:, :length // rate]
+    spans = jnp.minimum(picked[:, :, None] + jnp.arange(rate), length - 1)
+    sources = jnp.take_along_axis(order, spans.reshape(batch, -1), axis=1).reshape(spans.shape)
+    opened = jnp.take_along_axis(rank, picked, axis=1)
+    # Each token's rank back at its place in the row.
+    ranks = jnp.zeros_like(rank).at[jnp.arange(batch)[:, None], order].set(rank)
+    return DocumentWindows(sources, opened == 0, jnp.take_along_axis(opens, picked, axis=1),
+                           jnp.take_along_axis(held, picked, axis=1), opened // rate, segments, ranks)
+
+
+def pool_windows(kv, gate, position_bias, rate: int, overlap: bool, windows: DocumentWindows | None = None):
     """The compressor's entries: one softmax-gated sum per window of `rate` tokens.
 
     `kv` and `gate` are `[B, S, W]` with `W` the entry width, or `[B, S, 2W]`
@@ -118,12 +186,16 @@ def pool_windows(kv, gate, position_bias, rate: int, overlap: bool):
     With `overlap`, entry `w` combines window `w - 1`'s first series (Ca)
     with window `w`'s second series (Cb) over `2 * rate` slots, and window
     0's Ca slots hold zero keys under a `-inf` gate, so they weigh nothing
-    (:641-660).
+    (:641-660). `windows` pools a packed row's documents each as it alone
+    pools (`document_windows`), a document's first window overlapping none.
     """
     batch, length, features = kv.shape
-    windows = length // rate
-    kv = kv[:, :windows * rate].reshape(batch, windows, rate, features)
-    gate = gate[:, :windows * rate].reshape(batch, windows, rate, features)
+    if windows is None:
+        count = length // rate
+        kv = kv[:, :count * rate].reshape(batch, count, rate, features)
+        gate = gate[:, :count * rate].reshape(batch, count, rate, features)
+    else:
+        kv, gate = windows.gathered(kv), windows.gathered(gate)
     if position_bias is not None:
         gate = gate + position_bias
     if overlap:
@@ -132,6 +204,10 @@ def pool_windows(kv, gate, position_bias, rate: int, overlap: bool):
             [jnp.zeros_like(kv[:, :1, :, :width]), kv[:, :-1, :, :width]], axis=1)
         previous_gate = jnp.concatenate(
             [jnp.full_like(gate[:, :1, :, :width], -jnp.inf), gate[:, :-1, :, :width]], axis=1)
+        if windows is not None:
+            alone = windows.first[:, :, None, None]
+            previous_kv = jnp.where(alone, 0, previous_kv)
+            previous_gate = jnp.where(alone, -jnp.inf, previous_gate)
         kv = jnp.concatenate([previous_kv, kv[..., width:]], axis=2)
         gate = jnp.concatenate([previous_gate, gate[..., width:]], axis=2)
     return gated_sum(kv, gate, axis=2)
@@ -289,14 +365,15 @@ class CompressedEntries(FakeQuantizing):
         first where the pooling ran in its own (v41:485)."""
         return self.kv_norm(pooled if self.pool_dtype is None else pooled.astype(dtype))
 
-    def latents(self, x, valid=None):
+    def latents(self, x, valid=None, windows: DocumentWindows | None = None):
         """The normed entries before RoPE `[B, T, width]`, `T = S // rate`, over each row's real
-        tokens alone where `valid` marks them (`real_first`)."""
-        kv, gate = self._projections(real_first(x, valid))
+        tokens alone where `valid` marks them (`real_first`), each document's alone where `windows`
+        lays a packed row's (`document_windows`)."""
+        kv, gate = self._projections(real_first(x, valid) if windows is None else x)
         if gate is None:
-            return self.kv_norm(kv)
+            return self.kv_norm(kv if windows is None else windows.gathered(kv)[:, :, 0])
         bias = self.bias.astype(x.dtype) if self.position_bias else None
-        return self._normed(pool_windows(kv, gate, bias, self.rate, self.overlap), x.dtype)
+        return self._normed(pool_windows(kv, gate, bias, self.rate, self.overlap, windows), x.dtype)
 
     def rotate(self, latents, origins):
         """Rotate each entry at its window's origin, its first token's place (`window_origins`)."""
@@ -304,15 +381,17 @@ class CompressedEntries(FakeQuantizing):
                                 dtype=at_least_fp32(latents.dtype))
         return _rotate_rope(latents, cos, sin)
 
-    def entries(self, x, valid=None, places=None):
+    def entries(self, x, valid=None, places=None, windows: DocumentWindows | None = None):
         """The rotated entries `[B, T, width]`, `T = S // rate`, each at its window's first place
-        among `places` (`window_origins`)."""
-        return self.entries_and_latents(x, valid, places)[0]
+        among `places` (`window_origins`, `DocumentWindows.origins`)."""
+        return self.entries_and_latents(x, valid, places, windows)[0]
 
-    def entries_and_latents(self, x, valid=None, places=None):
-        """The entries, the latents they rotate and each window's origin (`window_origins`)."""
-        latents = self.latents(x, valid)
-        origins = window_origins(places, valid, latents.shape[1], self.rate)
+    def entries_and_latents(self, x, valid=None, places=None, windows: DocumentWindows | None = None):
+        """The entries, the latents they rotate and each window's origin (`window_origins`), each
+        document's alone where `windows` lays a packed row's."""
+        latents = self.latents(x, valid, windows)
+        origins = (window_origins(places, valid, latents.shape[1], self.rate) if windows is None
+                   else windows.origins(jnp.arange(x.shape[1]) if places is None else places))
         return self._stored(latents, origins), latents, origins
 
     def _stored(self, latents, origins):
@@ -403,9 +482,10 @@ class LightningIndexer(CompressedEntries):
         self.scorer = IndexScorer(n_heads=self.n_heads, dtype=self.dtype, precision=self.precision,
                                   name='scorer')
 
-    def select(self, x, q_resid, positions, places, cos, sin, cache=None, valid=None):
+    def select(self, x, q_resid, positions, places, cos, sin, cache=None, valid=None,
+               windows: DocumentWindows | None = None):
         """The entries each query attends: `[B, S, T]`, bool. Uncached, `valid` leaves the
-        padding out of the entries (`real_first`).
+        padding out of the entries (`real_first`), and `windows` reads each document's alone.
 
         The top-k among the entries whose window closed before the query
         (:568-575: later entries score `-inf`, and a pick past the causal
@@ -415,12 +495,14 @@ class LightningIndexer(CompressedEntries):
         x = jax.lax.stop_gradient(x)
         q_resid = jax.lax.stop_gradient(q_resid)
         batch, length, _ = x.shape
-        keys = (self.entries(x, valid, places) if cache is None
+        keys = (self.entries(x, valid, places, windows) if cache is None
                 else self.cached_entries(x, *cache, places=places)[0])
         query = _rotate_rope(
             self.q_b_proj(q_resid).reshape(batch, length, self.n_heads, self.width), cos, sin)
         scores = self.scorer(query, keys, x)
-        return top_k_keys(scores, entries_visible(positions, keys.shape[1], self.rate), self.top_k)
+        seen = (entries_visible(positions, keys.shape[1], self.rate) if windows is None
+                else windows.visible(self.rate))
+        return top_k_keys(scores, seen, self.top_k)
 
 
 class Compressor(CompressedEntries):
@@ -442,16 +524,19 @@ class Compressor(CompressedEntries):
                 n_heads=self.index_n_heads, top_k=self.index_topk,
                 dtype=self.dtype, precision=self.precision, name='indexer')
 
-    def __call__(self, x, q_resid, positions, places, cos, sin, cache=None, valid=None):
+    def __call__(self, x, q_resid, positions, places, cos, sin, cache=None, valid=None,
+                 windows: DocumentWindows | None = None):
         """The entries `[B, T, width]` and which of them each query attends `[B, S, T]`, by its
         `positions` among the windows' tokens (`entries_visible`), each entry rotated at its window's
         first token's place among `places`; uncached, over each row's real tokens where `valid` marks
-        them (`real_first`)."""
-        entries = (self.entries(x, valid, places) if cache is None
+        them (`real_first`), each document's alone where `windows` lays a packed row's."""
+        entries = (self.entries(x, valid, places, windows) if cache is None
                    else self.cached_entries(x, *cache, places=places)[0])
         if self.index_topk is not None:
-            return entries, self.indexer.select(x, q_resid, positions, places, cos, sin, cache, valid)
-        seen = entries_visible(positions, entries.shape[1], self.rate)
+            return entries, self.indexer.select(x, q_resid, positions, places, cos, sin, cache, valid,
+                                                windows)
+        seen = (entries_visible(positions, entries.shape[1], self.rate) if windows is None
+                else windows.visible(self.rate))
         return entries, jnp.broadcast_to(seen, (x.shape[0], *seen.shape[1:]))
 
 
@@ -657,7 +742,8 @@ class DeepseekV4Attention(FakeQuantizing):
         assert rate is not None and index[0] is not None and index[1] is not None and index[2] is not None
         return rate, (index[0], index[1], index[2])
 
-    def _csa2(self, x, q_resid, positions, places, cos, sin, cache, kv_store, valid):
+    def _csa2(self, x, q_resid, positions, places, cos, sin, cache, kv_store, valid,
+              by_document: DocumentWindows | None):
         """CSA2's entries `[B, T, head_dim]` and the ones each query attends
         `[B, S, T]`, by the layer's mode (section 2.3.1, v41:722-763).
 
@@ -674,7 +760,7 @@ class DeepseekV4Attention(FakeQuantizing):
             entries = _published(kv_store, _CSA2_ENTRIES, 'Reindex')
             keys = _published(kv_store, _CSA2_INDEX_KEYS, 'Reindex')
         elif cache is None:
-            entries, latents, origins = self.compress.entries_and_latents(x, valid, places)
+            entries, latents, origins = self.compress.entries_and_latents(x, valid, places, by_document)
             keys = self.indexer.keys(latents, *rotary_freqs(origins, self.rope_dim, self.rope_theta,
                                                             rope_scaling=self.rope_scaling,
                                                             dtype=at_least_fp32(latents.dtype)))
@@ -690,7 +776,8 @@ class DeepseekV4Attention(FakeQuantizing):
             if allocated:
                 held.value = write_cache(held.value, fresh, windows)
             keys = held.value
-        seen = entries_visible(positions, entries.shape[1], rate)
+        seen = (entries_visible(positions, entries.shape[1], rate) if by_document is None
+                else by_document.visible(rate))
         seen = jnp.broadcast_to(seen, (x.shape[0], *seen.shape[1:]))
         if self.candidates == 'restrict':
             # A Reindex layer scores the pool's entries alone, their keys
@@ -722,8 +809,14 @@ class DeepseekV4Attention(FakeQuantizing):
         tokens = coordinates_of(attention_metadata, *x.shape[:2])
         # Each token's logical place (`Coordinates.places`); a cached call's default is its slot.
         positions, segment_ids = tokens.positions if decode else tokens.places(), tokens.segments
-        if segment_ids is not None and self.compressor is not None:
-            raise ValueError("segment_ids are not supported by deepseek_v4 compressed windows")
+        # A packed row's documents each pool their own windows (`document_windows`), uncached; a cached
+        # row is one document, its windows its slots', and a candidate pool blocks a row's entries by
+        # their index, which its documents would share.
+        documents = segment_ids is not None and self.compressor is not None and tokens.max_segments != 1
+        if documents and (decode or self.candidates is not None):
+            raise ValueError("a deepseek_v4 compressed window reads a packed row's documents uncached and "
+                             "without a candidate pool; give a cached call or a candidate-pool layer one "
+                             "document a row")
         if attention_metadata is not None and attention_metadata.rotary_positions is not None:
             raise ValueError("the deepseek_v4 mixer does not implement multi-axis rotary positions")
         valid = (None if attention_metadata is None or attention_metadata.valid is None
@@ -780,10 +873,15 @@ class DeepseekV4Attention(FakeQuantizing):
             ranks = jnp.arange(length) if valid is None else real_places(valid)
             if cache is not None:
                 ranks = cache[0]
+            assert self.compress_rate is not None
+            windows = (document_windows(segment_ids, valid, self.compress_rate)
+                       if documents and segment_ids is not None else None)
             if self.compressor == 'csa2':
-                entries, selected = self._csa2(x, q_resid, ranks, positions, cos, sin, cache, kv_store, valid)
+                entries, selected = self._csa2(x, q_resid, ranks, positions, cos, sin, cache, kv_store, valid,
+                                               windows)
             else:
-                entries, selected = self.compress(x, q_resid, ranks, positions, cos, sin, cache, valid)
+                entries, selected = self.compress(x, q_resid, ranks, positions, cos, sin, cache, valid,
+                                                  windows)
             if entries.shape[1]:
                 keys = jnp.concatenate([keys, entries], axis=1)
                 values = jnp.concatenate([values, entries], axis=1)
