@@ -65,6 +65,17 @@ class Requirement[C]:
     detail: str | Callable[[C], str]
     row: str
     kind: str = 'capability'
+    analysis: Callable[[C], Refusal | None] | None = None
+    """An analysis whose own refusal the requirement reports (`analysed`), stamped with its row and kind."""
+
+    @classmethod
+    def analysed(cls, code: str, analysis: Callable[[C], Refusal | None], row: str,
+                 kind: str = 'capability') -> Requirement[C]:
+        """The requirement an analysis decides (a mainloop's reason it declines a pass,
+        `attention_route.MAINLOOP`): it holds where the analysis finds no refusal, and reports the
+        analysis's own refusal, its code and detail, under this requirement's row and kind."""
+        return cls(code, lambda case: analysis(case) is None,
+                   lambda case: str(analysis(case)), row, kind, analysis)
 
     def __post_init__(self) -> None:
         if not self.row:
@@ -75,6 +86,9 @@ class Requirement[C]:
 
     def check(self, case: C) -> Refusal | None:
         """The failed requirement's data, or None when it holds."""
+        if self.analysis is not None:
+            found = self.analysis(case)
+            return None if found is None else dataclasses.replace(found, row=self.row, kind=self.kind)
         if self.holds(case):
             return None
         return Refusal(self.code, self.detail(case) if callable(self.detail) else self.detail,
@@ -87,20 +101,17 @@ class Kernel[C]:
     whether it is `generic`, a path that takes what the others turn down."""
 
     name: str
-    supports: tuple[Requirement[C] | Callable[[C], Refusal | None], ...]
+    supports: tuple[Requirement[C], ...]
     generic: bool = False
 
     def failed(self, case: C, forced: bool = False) -> list[Refusal]:
         """The requirements `case` fails, evaluated once, in order; forcing overrides measured preferences."""
         failures = []
         for requirement in self.supports:
-            if isinstance(requirement, Requirement):
-                if forced and requirement.kind == 'measured':
-                    continue
-                refusal = requirement.check(case)
-            else:
-                refusal = requirement(case)
-            if refusal is not None and not (forced and refusal.kind == 'measured'):
+            if forced and requirement.kind == 'measured':
+                continue
+            refusal = requirement.check(case)
+            if refusal is not None:
                 failures.append(refusal)
         return failures
 
