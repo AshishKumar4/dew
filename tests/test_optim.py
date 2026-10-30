@@ -21,11 +21,13 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 from model_support import largest_difference
 from optim_support import LR, decoder_params, drawn_tree
 from reference_error import as_given, assert_as_exact, assert_computes_the_oracle, chain_roundings, equations
+from test_nested_learning_optim import muon_orthogonalized, newton_schulz_reference
 
 from dew.batch import coordinates
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.dit import SimpleDiT
 from dew.optim import (
+    NEWTON_SCHULZ,
     OPTIMIZER_MAP,
     Cosine,
     Exponential,
@@ -41,6 +43,7 @@ from dew.optim import (
     learning_rate,
     muon_partition,
     muon_weight_dimension_numbers,
+    newton_schulz,
     rates_of,
     scale_by_qk_clip,
     stepped,
@@ -72,8 +75,11 @@ def dit_params():
     return model.init(jax.random.key(0), jnp.ones((1, 8, 8, 3)), jnp.ones((1,)))
 
 
-def muon_solver(**kwargs):
-    return OptimConfig(optimizer='muon', learning_rate=LR, **kwargs).build(10)
+def muon_solver(ns_dtype: str = "float32", **kwargs):
+    """Dew's Muon over the run's own build, its Newton-Schulz in `ns_dtype`: float32 where it is held to
+    optax's Muon, which iterates in its momentum's float32."""
+    opts = {"ns_dtype": ns_dtype, **kwargs.pop("optimizer_opts", {})}
+    return OptimConfig(optimizer='muon', learning_rate=LR, optimizer_opts=opts, **kwargs).build(10)
 
 
 def fixed_gradients(params):
@@ -103,10 +109,12 @@ UPDATE_SEEDS = 8
 (`seeds_for`)."""
 
 
-def assert_updates_as(solver, reference, params, paths, label, *, flatten=None, seeds=UPDATE_SEEDS):
+def assert_updates_as(solver, reference, params, paths, label, *, flatten=None, seeds=UPDATE_SEEDS,
+                      given=False):
     """Check 1: `solver`'s update of drawn parameters under drawn gradients, at each of `paths`, on par with
     `reference`'s update of each parameter alone, both from `reference`'s float64 run. `flatten` reshapes a
-    path's gradient to the matrix the reference steps, and the update back."""
+    path's gradient to the matrix the reference steps, and the update back. `given` runs `solver`'s arm as
+    it is (`as_given`), for a solver that places and compiles its own step over a mesh."""
     shape = flatten or (lambda path, value: value)
 
     def dew(params, grads):
@@ -120,7 +128,7 @@ def assert_updates_as(solver, reference, params, paths, label, *, flatten=None, 
             steps.append(reference.update(grad, reference.init(param), param)[0])
         return steps
 
-    assert_as_exact(dew, alone, lambda seed: drawn_tree(params, seed), label,
+    assert_as_exact(as_given(dew) if given else dew, alone, lambda seed: drawn_tree(params, seed), label,
                     seeds=seeds, truth_fn=alone)
 
 
@@ -143,6 +151,86 @@ def test_the_projections_and_the_mlp_take_the_muon_update():
                       [('params', 'layers_0', 'self_attn', 'q_proj', 'kernel'),
                        ('params', 'layers_0', 'self_attn', 'o_proj', 'kernel'),
                        ('params', 'layers_1', 'mlp', 'down_proj', 'kernel')], "the Muon group")
+
+
+def test_muons_state_is_optaxs_tree_and_steps_its_moments_bit_for_bit():
+    """Dew's Muon is optax.contrib.muon's composition: its state is optax's tree, and over a decoder's
+    parameters and two steps of fixed gradients its moments, AdamW's and Muon's momentum, are optax's bit
+    for bit, which no Newton-Schulz reads back, so a run saved under optax's Muon resumes under Dew's. Its
+    updates are held to optax's by the groups' tests above."""
+    params = decoder_params()
+    dew = OPTIMIZER_MAP["muon"](LR, mu_dtype="float32")
+    reference = optax.contrib.muon(LR, weight_decay=0.0, adam_weight_decay=0.0, mu_dtype="float32",
+                                   muon_weight_dimension_numbers=muon_weight_dimension_numbers)
+    state, expected = dew.init(params), reference.init(params)
+    assert jax.tree.structure(state) == jax.tree.structure(expected)
+    grads = fixed_gradients(params)
+    for _ in range(2):
+        state = jax.jit(dew.update)(grads, state, params)[1]
+        expected = jax.jit(reference.update)(grads, expected, params)[1]
+    assert largest_difference(state, expected) == 0.0
+
+
+def test_muons_bfloat16_newton_schulz_is_as_exact_as_jordans():
+    """Dew's Newton-Schulz in bfloat16 (`MUON_NS_DTYPE`, `newton_schulz`) over a stack of wide and of tall
+    matrices, on par from float64 with Jordan's own iteration in bfloat16 (modded-nanogpt's
+    `zeropower_via_newtonschulz5`, which Moonlight runs too: optax's frobenius iteration over the matrix
+    cast to bfloat16) (check 1)."""
+    coeffs = jnp.asarray(NEWTON_SCHULZ)
+
+    def draw(seed):
+        keys = jax.random.split(jax.random.key(seed))
+        return (np.asarray(jax.random.normal(keys[0], (3, 24, 40))),
+                np.asarray(jax.random.normal(keys[1], (2, 40, 24))))
+
+    def dew(wide, tall):
+        return [newton_schulz(jnp.asarray(stack, jnp.bfloat16), coeffs, 5, 1e-8) for stack in (wide, tall)]
+
+    def jordan(wide, tall):
+        return [jax.vmap(muon_orthogonalized)(jnp.asarray(stack, jnp.bfloat16)) for stack in (wide, tall)]
+
+    def truth(wide, tall):
+        return [np.stack([newton_schulz_reference(np.asarray(matrix, np.float64)) for matrix in stack])
+                for stack in (wide, tall)]
+
+    assert_as_exact(dew, jordan, draw, "Muon's Newton-Schulz in bfloat16", seeds=UPDATE_SEEDS, truth_fn=truth)
+
+
+class Placed:
+    """`solver` stepped over `mesh`, its parameters and gradients placed as fully sharded data parallelism
+    places them, each matrix's largest even side over fsdp, its step compiled there."""
+
+    def __init__(self, solver, mesh):
+        self.solver, self.mesh = solver, mesh
+
+    def placed(self, tree):
+        def split(leaf):
+            sides = [axis for axis in np.argsort(leaf.shape)[::-1] if leaf.shape[axis] % 2 == 0]
+            spec = [None] * leaf.ndim
+            if sides:
+                spec[sides[0]] = "fsdp"
+            return jax.device_put(leaf, NamedSharding(self.mesh, P(*spec)))
+        return jax.tree.map(split, tree)
+
+    def init(self, params):
+        return self.solver.init(self.placed(params))
+
+    def update(self, grads, state, params):
+        with jax.set_mesh(self.mesh):
+            return jax.jit(self.solver.update)(self.placed(grads), state, self.placed(params))
+
+
+@pytest.mark.mesh(devices=8)
+def test_a_meshs_muon_iterates_each_matrix_whole_on_par_with_optaxs_muon_of_it():
+    """Over a mesh of four data shards by two fsdp shards, the decoder's matrices split as fully sharded
+    data parallelism splits them (`Placed`), Dew's Muon gathers each matrix whole onto one device, its
+    matrices spread over all eight (`orthogonalized`): each update on par with optax's Muon of that matrix
+    alone (check 1), so spreading the iteration moves the matrices and changes none of its arithmetic."""
+    mesh = MeshSpec(fsdp=2).build(jax.devices()[:8])
+    assert_updates_as(Placed(muon_solver(), mesh), optax.contrib.muon(LR), decoder_params(),
+                      [('params', 'layers_0', 'self_attn', 'q_proj', 'kernel'),
+                       ('params', 'layers_1', 'mlp', 'down_proj', 'kernel')], "the Muon group over a mesh",
+                      given=True)
 
 
 def test_a_head_expanded_projection_orthogonalizes_its_flattened_head_side():
@@ -395,8 +483,10 @@ QK_FIXTURE = Path(__file__).resolve().parent / "fixtures" / "muonclip" / "maxtex
 MEGATRON = np.load(QK_FIXTURE.parent / "megatron.npz")
 
 
-def muonclip_solver(**kwargs):
-    return OptimConfig(optimizer='muonclip', learning_rate=LR, **kwargs).build(10)
+def muonclip_solver(ns_dtype: str = "float32", **kwargs):
+    """Dew's MuonClip over the run's own build, its Newton-Schulz in `ns_dtype` as `muon_solver`'s."""
+    opts = {"ns_dtype": ns_dtype, **kwargs.pop("optimizer_opts", {})}
+    return OptimConfig(optimizer='muonclip', learning_rate=LR, optimizer_opts=opts, **kwargs).build(10)
 
 
 def qk_tree(layers=1, heads=4, kv_heads=4, dim=8, seed=0):
