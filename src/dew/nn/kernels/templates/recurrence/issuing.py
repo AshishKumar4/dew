@@ -16,8 +16,11 @@ from dew.nn.kernels.templates import mosaic, product
 class Issuing(Protocol):
     """What an `Issuer` reads of its call: the bundle its products issue by and whether they interpret."""
 
-    family: mosaic.Family
-    interpret: bool
+    @property
+    def family(self) -> mosaic.Family: ...
+
+    @property
+    def interpret(self) -> bool: ...
 
 
 class Parts:
