@@ -305,8 +305,8 @@ def derived_headroom(footprint: Footprint, devices: Sequence, capacity: int | No
                      built: int = 0) -> int | None:
     """The bytes a step whose derived footprint is `footprint` would leave free on its tightest device, as
     `step_headroom` reads a compiled step's: its temporaries the derivation names, the most its gradient
-    program holds at once (`Footprint.peak`) and the device's GEMM workspace (`gemm_workspace`), in one
-    block beside what it holds (`Footprint.held`), twice where the allocator strands them; None where
+    program holds at once (`Footprint.peak`), its GEMMs' workspace among them, in one block beside what
+    it holds (`Footprint.held`), twice where the allocator strands them; None where
     the derivation names no peak or a device states no memory. The resident state is in use already,
     or, on a stated device, its arguments but the `built` bytes its first call builds, which `held`
     counts. What else XLA's buffer assignment and scheduling make of the program is no term of it
@@ -317,19 +317,9 @@ def derived_headroom(footprint: Footprint, devices: Sequence, capacity: int | No
     if not all('bytes_limit' in m and 'bytes_in_use' in m for m in memory):
         return None
     return min(placeable(m, unclaimed(d, m)) - footprint.held
-               - (footprint.peak + gemm_workspace(d)) * (2 if strands_temporaries(d.platform, m) else 1)
+               - footprint.peak * (2 if strands_temporaries(d.platform, m) else 1)
                for d, m in zip(devices, memory, strict=True))
 
-
-def gemm_workspace(device) -> int:
-    """The workspace XLA hands each cuBLAS matmul a step on `device` runs, one buffer at a time: from
-    Hopper on 32 MiB, before it 4 MiB (xla/backends/gpu/transforms/gemm_rewriter.cc's
-    `GemmWorkspaceRewriteVisitor`; `GemmConfig::kHopperWorkspace`, `kDefaultWorkspace`,
-    xla/service/gpu/matmul_utils.h); none where the device is no CUDA GPU, whose matmuls take none."""
-    capability = getattr(device, 'compute_capability', None)
-    if device.platform != 'gpu' or not capability:
-        return 0
-    return (32 if int(str(capability).split('.')[0]) >= 9 else 4) << 20
 
 
 def device_memory(device, capacity: int | None = None, arguments: int = 0) -> Mapping[str, int]:

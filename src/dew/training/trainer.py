@@ -1147,7 +1147,7 @@ class Trainer(Generic[Loss, Effects]):
         # Derived for the run's own devices, whose compiler's fusion it models.
         footprint = None if self.step is not None or mesh is not None else candidate_footprint(
             self.objective, self._model_shapes(micro), split * self.accumulation, prepared, held,
-            self.device_mesh.devices.flat[0].platform)
+            self.device_mesh.devices.flat[0])
         # The sampled step lowers as the step does, over the same arguments, for the same platforms.
         watched = None if self.inspection is None else self._jitted(shapes, copies, shardings, placement,
                                                                     replicated, split, sampled=True)
