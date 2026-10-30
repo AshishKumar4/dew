@@ -526,10 +526,13 @@ def report(args: argparse.Namespace) -> int:
     """The verdict table of a run's results, 1 when the head failed a row. With `--calibration`, each row's
     band is at least its null noise, how far one tree's median moved against itself; a row whose noise
     passes its floor cannot see a change of the floor's size and says so (insensitive), never widened in
-    silence. With `--verdicts`, each row's state and numbers as JSON, for a runner to act on."""
+    silence. With `--verdicts`, each row's state and numbers as JSON, for a runner to act on; with
+    `--anchors` too, each row's head against its anchor (a run's samples the runner keeps,
+    `{"rows": {row: samples}}`), judged as against the base."""
     results = json.loads(Path(args.results).read_text())
     calibrated = (json.loads(Path(args.calibration).read_text())["noise"]
                   if getattr(args, "calibration", None) else {})
+    anchors = json.loads(Path(args.anchors).read_text())["rows"] if getattr(args, "anchors", None) else {}
     base, head = results["base"], results["head"]
     # A round a run never reached counts as unmeasured, so an interrupted run is partial.
     rounds = results.get("rounds", max(map(len, results["samples"].values())))
@@ -550,6 +553,10 @@ def report(args: argparse.Namespace) -> int:
                                  [s.get(row.name) for s in samples[head][:taken]], noise)
         verdicts[row.name] = {"state": state, "unit": row.unit, "gated": row.gated,
                               "insensitive": noise > row.floor, **numbers}
+        if row.name in anchors:
+            drift, moved = verdict(row, anchors[row.name][:taken],
+                                   [s.get(row.name) for s in samples[head][:taken]], noise)
+            verdicts[row.name]["anchor"] = {"state": drift, **moved}
         if (state in ("broken", "incomplete", "partial", "failed") or (state == "regressed" and row.gated)
                 or (claiming and claimed(row) and state in
                     ("not measured on this hardware", "not compared"))):
@@ -620,6 +627,8 @@ def main() -> int:
                            help='JSON {"noise": {row: fraction}}: each row\'s null noise, the least band it '
                                 "is judged by")
     reporting.add_argument("--verdicts", help="where each row's state and numbers are written as JSON")
+    reporting.add_argument("--anchors", help='JSON {"rows": {row: samples}}: each row\'s anchor, which its '
+                                             "head is judged against too, in --verdicts")
     args = parser.parse_args()
     with contextlib.suppress(BrokenPipeError):
         return run(args) if args.operation == "run" else report(args)

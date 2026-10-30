@@ -288,7 +288,8 @@ on any of them. `report --calibration <file>` takes each row's null noise, how f
 moved against itself (`{"noise": {row: fraction}}`), as the least band the row is judged by; a row whose
 noise passes its floor is marked *insensitive*, since it cannot see a change of its floor's size, and a
 change past its noise still regresses it. `report --verdicts <file>` writes each row's state and numbers
-as JSON. The battery runs once for each release candidate on a Colab
+as JSON, and with `--anchors <file>` (`{"rows": {row: samples}}`, a run's samples kept as the row's anchor)
+each row's head judged against its anchor too, by the same rule. The battery runs once for each release candidate on a Colab
 A100, and as an A/B, base against head, for a deliberate change to a hot path
 (a kernel, the trainer's step, the input pipeline); a promotion to main does
 not run it. Each table is kept in

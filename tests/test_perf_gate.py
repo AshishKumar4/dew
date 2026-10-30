@@ -42,7 +42,7 @@ def test_a_row_is_judged_by_its_calibrated_noise_and_a_row_noisier_than_its_floo
     """With a calibration, a row's band is at least its null noise (one tree against itself): a 4% slower
     head regresses a row whose noise is 1%, and on a row whose noise is 6% it is level, the row named
     insensitive since a change of its 2% floor is beneath its noise. A 10% slower head still regresses that
-    row: insensitive widens the band, never drops the row."""
+    row: insensitive widens the band, never drops the row. A row given an anchor is judged against it too."""
     rows = [gate.Row("quiet", "ms", "").__dict__, gate.Row("loud", "ms", "").__dict__]
 
     def judged(slower: float) -> tuple[int, str]:
@@ -52,9 +52,11 @@ def test_a_row_is_judged_by_its_calibrated_noise_and_a_row_noisier_than_its_floo
                                "head": [{"quiet": 10.0 * slower, "loud": 10.0 * slower}] * 3}}
         (tmp_path / "gate.json").write_text(json.dumps(results))
         (tmp_path / "noise.json").write_text(json.dumps({"noise": {"quiet": 0.01, "loud": 0.06}}))
+        (tmp_path / "anchors.json").write_text(json.dumps({"rows": {"quiet": [9.0, 9.01, 9.0]}}))
         monkeypatch.setattr(sys, "argv", ["perf_gate.py", "report", str(tmp_path / "gate.json"),
                                           "--calibration", str(tmp_path / "noise.json"),
-                                          "--verdicts", str(tmp_path / "verdicts.json")])
+                                          "--verdicts", str(tmp_path / "verdicts.json"),
+                                          "--anchors", str(tmp_path / "anchors.json")])
         code = gate.main()
         return code, capsys.readouterr().out
 
@@ -65,6 +67,9 @@ def test_a_row_is_judged_by_its_calibrated_noise_and_a_row_noisier_than_its_floo
     assert {name: (row["state"], row["unit"], row["insensitive"], row["band"])
             for name, row in verdicts["rows"].items()} == {"quiet": ("regressed", "ms", False, 0.02),
                                                            "loud": ("level", "ms", True, 0.06)}
+    # Against its anchor, a run's samples the runner kept, the head is judged as against the base.
+    assert verdicts["rows"]["quiet"]["anchor"]["state"] == "regressed"
+    assert "anchor" not in verdicts["rows"]["loud"]
     [loud] = [line for line in table.splitlines() if line.startswith("| loud |")]
     assert loud.endswith("| level, insensitive (null noise 6.0% over its 2% floor) |"), loud
     assert "| 6.0% |" in loud
