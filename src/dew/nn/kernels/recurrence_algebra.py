@@ -769,7 +769,8 @@ def factored_range(floor: float, sub: int = SUB) -> bool:
 
 def key_decayed_pairs(rows: Callable[[int], jax.Array], keys: Callable[[int], jax.Array], columns: int,
                       gates: Callable[[int], tuple],
-                      reference: Callable[[int, int], tuple], summed: Callable[..., jax.Array], *,
+                      reference: Callable[[int, int], tuple], summed: Callable[..., jax.Array],
+                      kept: Callable[[str, jax.Array], Callable[[], jax.Array]], *,
                       chunk: int, strict: bool, sub: int = SUB):
     """A chunk's pairs' products under a decay a key dimension `[C, C]` fp32, `sum_k r_ik k_jk exp2(g_ik -
     g_jk)` for `j <= i` (`j < i` where `strict`), zero elsewhere: the rows `rows(c)` (the queries, or the
@@ -780,26 +781,19 @@ def key_decayed_pairs(rows: Callable[[int], jax.Array], keys: Callable[[int], ja
     sub-chunk and key block ('pairs'): fla_kda's sub-chunk factoring, its diagonal sub-chunks' too, which a
     declared floor bounds (`factored_range`). Each factor is of the separated prefix (`between`), its exponent
     within a sub-chunk's range of zero down the rows (and up the keys); past it every pair's value is zero.
-    The products accumulate in one sum as fla_kda's into its `b_A` (`summed`, an iterable of `(name, lhs,
-    rhs)` taken a product at a time): each its own sum, added after, they were live together (Kimi delta
+    Every row and key is gated once, to its own sub-chunk's first token, and kept in shared memory (`kept`,
+    a loader of it back): a key of an earlier sub-chunk is lifted to `s`'s by the decay between their first
+    tokens, `exp2(g_ref_s - g_ref_own)`, at most one, a vector a sub-chunk. Gated for every sub-chunk, every
+    key's exponentials were most of the intra launch (on an H100 1.51 ms, 0.53 without them); carried in
+    registers across the sub-chunks' rolled turns, the gated tiles halved its key block (1.84 ms). The
+    products accumulate in one sum as fla_kda's into its `b_A` (`summed`, an iterable of `(name, lhs, rhs)`
+    taken a product at a time): each its own sum, added after, they were live together (Kimi delta
     attention's intra launch, 1170 registers a thread on an A100, 519 on an H100)."""
-    def products(s, c, prefix, down):
-        place = s * sub
-        start_whole, start_fraction = separated(*reference(s, c))
-        start = start_whole[None, :], start_fraction[None, :]
-        index, _ = _grid(prefix[0].shape)
-        # Each operand formed as its product stages it (`summed` calls it), so one is live at a time.
-        yield ("pairs", lambda: jnp.where((index >= place) & (index < place + sub), down, 0.0),
-               lambda: Transposed(jnp.where(index < place + sub, keys(c) * between(start, prefix), 0.0)))
-
     total = jnp.zeros((chunk, chunk), jnp.float32)
     for c in range(columns):
-        # A key block's prefix read once, before its sub-chunks' turns, which are rolled: each one's addresses
-        # live within its own turn. Its rows gated down at once, each to its own sub-chunk's first token:
-        # gated a sub-chunk at a time, every row was gated for each, and the exponentials were two thirds of
-        # the launch (the intra launch 1.51 ms on an H100, 0.53 without them).
         prefix = separated(*gates(c))
         index, _ = _grid(prefix[0].shape)
+
         def laid(s, below, c=c, index=index):
             # Each sub-chunk's reference laid over its rows from its own on, read in a rolled turn: read at
             # static rows, their addresses were hoisted to the kernel's start and held through it (260 of an
@@ -808,10 +802,27 @@ def key_decayed_pairs(rows: Callable[[int], jax.Array], keys: Callable[[int], ja
             return tuple(jnp.where(index >= s * sub, half[None, :], under)
                          for half, under in zip(halves, below, strict=True))
 
-        start = jax.lax.fori_loop(0, chunk // sub, laid, (jnp.zeros(index.shape, jnp.float32),) * 2)
-        down = rows(c) * between(prefix, start)
-        total = jax.lax.fori_loop(0, chunk // sub, lambda s, total, c=c, prefix=prefix, down=down: (
-            total + summed(products(s, c, prefix, down), shape=(chunk, chunk))), total)
+        own = jax.lax.fori_loop(0, chunk // sub, laid, (jnp.zeros(index.shape, jnp.float32),) * 2)
+        down = kept("down", rows(c) * between(prefix, own))
+        up = kept("up", keys(c) * between(own, prefix))
+
+        def turn(s, total, c=c, down=down, up=up, index=index):
+            place = s * sub
+            start = separated(*reference(s, c))
+
+            def lifted(earlier, below):
+                # A key's lift from its own sub-chunk's first token to this one's (`between` of their
+                # references, a vector, at most one: this one's is later), laid over the earlier's keys.
+                lift = between(start, separated(*reference(earlier, c)))
+                return jnp.where(index >= earlier * sub, lift[None, :], below)
+
+            lift = jax.lax.fori_loop(0, s + 1, lifted, jnp.zeros(index.shape, jnp.float32))
+            rows_of = (index >= place) & (index < place + sub)
+            return total + summed([("pairs", lambda: jnp.where(rows_of, down(), 0.0),
+                                    lambda: Transposed(jnp.where(index < place + sub, up() * lift, 0.0)))],
+                                  shape=(chunk, chunk))
+
+        total = jax.lax.fori_loop(0, chunk // sub, turn, total)
     lag = _lags(total.shape)
     return jnp.where(lag > 0 if strict else lag >= 0, total, 0.0)
 

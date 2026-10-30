@@ -903,7 +903,7 @@ def _intra(q, k, hi, lo, beta, taken, call: _Call, *, scale: float):
                        keys=call.given.views(k_ref, row, CHUNK, keyed, width),
                        gates=gates.views(hi_ref, row, CHUNK, h * width, width),
                        lows=gates.views(lo_ref, row, CHUNK, h * width, width))
-        pairing, referenced, *merges = staging
+        pairing, referenced, gated_tiles, *merges = staging
 
         def step(index, slots, carry, accumulators):
             del index
@@ -933,9 +933,15 @@ def _intra(q, k, hi, lo, beta, taken, call: _Call, *, scale: float):
             def gated(c):
                 return block("gates", gates, c), block("lows", gates, c)
 
+            def kept(name, value):
+                # A key block's gated rows or keys kept in shared memory for its sub-chunks' turns.
+                tile = gated_tiles.at[0 if name == "down" else 1]
+                tile[...] = value
+                return lambda: tile[...]
+
             pairs = functools.partial(algebra.key_decayed_pairs, columns=width // keys, gates=gated,
                                       reference=reference, summed=Issuer(call, {"pairs": pairing}).summed,
-                                      chunk=CHUNK)
+                                      kept=kept, chunk=CHUNK)
             scores = pairs(operand("queries"), operand("keys"), strict=False) * scale
             held.store(outs[-1], scores, row, CHUNK, h * CHUNK, CHUNK, family=family, smem=landing["square"])
             if call.delta:
@@ -959,7 +965,7 @@ def _intra(q, k, hi, lo, beta, taken, call: _Call, *, scale: float):
     work = Work(pairs * 2 * CHUNK * CHUNK * width + (_inverse_flops() if call.delta else 0),
                 exponentials=(CHUNK // algebra.SUB + 1) * (1 + call.delta) * CHUNK * width)
     staging = (_pairing(call, keys), plgpu.SMEM((2, CHUNK // algebra.SUB, width), jnp.float32),
-               *(_merges(call) if call.delta else ()))
+               plgpu.SMEM((2, CHUNK, keys), jnp.float32), *(_merges(call) if call.delta else ()))
     return _kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
                    grid_names=("chunks", "heads"), blocks=blocks, stages=1, live=_taken(5), work=work,
                    held=_intra_held(call, keys), staging=staging,
