@@ -800,12 +800,12 @@ def key_decayed_pairs(rows: Callable[[int], jax.Array], keys: Callable[[int], ja
         # the launch (the intra launch 1.51 ms on an H100, 0.53 without them).
         prefix = separated(*gates(c))
         index, _ = _grid(prefix[0].shape)
-        starts = [separated(*reference(s, c)) for s in range(chunk // sub)]
-        start = tuple(functools.reduce(lambda below, s, half=half: jnp.where(index >= s * sub,
-                                                                            starts[s][half][None, :], below),
-                                       range(1, chunk // sub), jnp.broadcast_to(starts[0][half][None, :],
-                                                                                index.shape))
-                      for half in (0, 1))
+        start = None
+        for s in range(chunk // sub):
+            # Each sub-chunk's reference laid over its rows as it is read, one held at a time.
+            halves = tuple(half[None, :] for half in separated(*reference(s, c)))
+            start = (tuple(jnp.broadcast_to(half, index.shape) for half in halves) if start is None else
+                     tuple(jnp.where(index >= s * sub, half, below) for half, below in zip(halves, start)))
         down = rows(c) * between(prefix, start)
         total = jax.lax.fori_loop(0, chunk // sub, lambda s, total, c=c, prefix=prefix, down=down: (
             total + summed(products(s, c, prefix, down), shape=(chunk, chunk))), total)
