@@ -998,6 +998,23 @@ def test_the_backward_is_on_par_under_every_score_hook_interpreted(hooks, form):
 
 
 @INTERPRETS
+def test_a_folded_forward_whose_products_pass_fp32_below_zero_rewalks_natural_interpreted():
+    """A full call whose raw products pass fp32's range below zero (a query 2^126 against keys -8, scale 1/4)
+    takes its query by the scale's power of two first, so its products stay finite (-2^127): its rows'
+    maxima pass the fold's reach, they walk again natural, and every equal logit weighs its values alike,
+    the output the values' mean, 1 (a power taken into the scale instead overflowed to -inf, which reads as
+    a row that saw no key: review of the FA3-gap batch's F3)."""
+    shape = (1, 64, 1, 16)
+    query = jnp.zeros(shape, jnp.bfloat16).at[..., 0].set(2.0 ** 126)
+    key = jnp.zeros(shape, jnp.bfloat16).at[..., 0].set(-8.0)
+    value = jnp.ones(shape, jnp.bfloat16)
+    spans = template.spans(shape[1], shape[1], shape[0])
+    with _device(interpret=True):
+        out = attention_mosaic.forward(query, key, value, spans, scale=0.25, interpret=True)
+    assert np.array_equal(np.asarray(out, np.float32), np.ones(shape, np.float32))
+
+
+@INTERPRETS
 def test_a_forward_kernel_built_for_its_facts_runs_each_calls_own_interpreted():
     """The forward's kernel is built once for every call of its static facts (`_kernel_of`, row 2440): calls
     alike but for their scale, past their queries' one power of two (0.2 and 0.24, both 2^-3 times a scale
