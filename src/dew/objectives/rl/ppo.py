@@ -78,12 +78,12 @@ class ValueHead(nn.Module):
         as they are."""
         return projected_parts(params, {"backbone": self.backbone}, updated=updated)
 
-    @nn.compact
     @nn.nowrap
     def reads_progress(self) -> bool:
         """Whether its backbone's computation changes over a run (`dew.nn.progress.ReadsProgress`)."""
         return isinstance(self.backbone, ReadsProgress) and self.backbone.reads_progress()
 
+    @nn.compact
     def __call__(self, tokens: jax.Array, *, segment_ids: jax.Array | None = None,
                  positions: jax.Array | None = None, coordinates: Coordinates | None = None,
                  progress: Progress = END) -> jax.Array:
