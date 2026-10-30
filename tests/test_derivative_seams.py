@@ -98,17 +98,22 @@ CONTRACTED = {
         "test_the_residual_pullbacks_hold_their_reverse_orders",
     "src/dew/objectives/residuals.py::_stepped":
         "test_the_residual_pullbacks_hold_their_reverse_orders",
+    "src/dew/nn/kernels/norm_swiglu.py::stream_rms_norm.linear_tangent":
+        "test_the_fused_norms_and_products_hold_every_order",
+    "src/dew/nn/kernels/norm_swiglu.py::rms_norm.linear_tangent":
+        "test_the_fused_norms_and_products_hold_every_order",
+    "src/dew/nn/kernels/norm_swiglu.py::gated_rms_norm.linear_tangent":
+        "test_the_fused_norms_and_products_hold_every_order",
+    "src/dew/nn/kernels/norm_swiglu.py::swiglu.linear_tangent":
+        "test_the_fused_norms_and_products_hold_every_order",
+    "src/dew/nn/kernels/norm_swiglu.py::packed_swiglu.linear_tangent":
+        "test_the_fused_norms_and_products_hold_every_order",
 }
 """Each contracted seam, `path::qualified name`, and the test of tests/test_derivative_contracts.py that holds
 it."""
 
 PENDING = frozenset({
     "src/dew/nn/kernels/grouped_matmul.py::portable_projection",
-    "src/dew/nn/kernels/norm_swiglu.py::stream_rms_norm.linear_tangent",
-    "src/dew/nn/kernels/norm_swiglu.py::rms_norm.linear_tangent",
-    "src/dew/nn/kernels/norm_swiglu.py::gated_rms_norm.linear_tangent",
-    "src/dew/nn/kernels/norm_swiglu.py::swiglu.linear_tangent",
-    "src/dew/nn/kernels/norm_swiglu.py::packed_swiglu.linear_tangent",
     "src/dew/nn/kernels/templates/gemm/template.py::_prologued.prologued",
     "src/dew/nn/kernels/templates/layout.py::_custom.held",
     "src/dew/nn/moe.py::_stored_primal",

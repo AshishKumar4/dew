@@ -504,6 +504,42 @@ def test_the_paged_decode_kernel_holds_every_order(edge):
                     truth_fn=plain, plain_fn=plain)
 
 
+def plain_rms(x, epsilon: float = 1e-6):
+    """x over its root mean square, the RMS norm as written."""
+    return x / jnp.sqrt(jnp.mean(jnp.square(x), axis=-1, keepdims=True) + epsilon)
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_the_fused_norms_and_products_hold_every_order(edge):
+    """`norm_swiglu`'s fused pre-norm seam, RMS norm, gated norm, SiLU product and packed SiLU product (each
+    through `generation.linear_tangent`), interpreted on a CPU as the norm tests call them: every order finite
+    wherever float64 is a normal float32 and the plain formula, the norm and the product as written, is."""
+    import test_norm_swiglu as norms
+
+    x, branch, gate, up = normal_draw(2661, (3, 16), (3, 16), (3, 16), (3, 16), scale=EDGES[edge])
+    (scale,) = normal_draw(2662, (16,))
+    dx, dbranch, dgate, dup = normal_draw(2663, (3, 16), (3, 16), (3, 16), (3, 16), scale=EDGES[edge])
+    (dscale,) = normal_draw(2664, (16,))
+    (cotangent,) = normal_draw(2665, (3, 16))
+    sites = {
+        "a pre-norm seam": (norms.fused_seam(1e-6, jnp.float32, offset=False, after_cast=False),
+                            lambda x, branch, scale: (x + branch, plain_rms(x + branch) * scale),
+                            (x, branch, scale), (dx, dbranch, dscale), (cotangent, cotangent)),
+        "an unweighted RMS norm": (norms.fused_unweighted(1e-6), plain_rms, (x,), (dx,), cotangent),
+        "a gated RMS norm": (norms.fused_gated(1e-6, jnp.float32, "silu"),
+                             lambda x, gate, scale: plain_rms(x) * scale * jax.nn.silu(gate),
+                             (x, gate, scale), (dx, dgate, dscale), cotangent),
+        "a SiLU product": (norms.fused_swiglu(), lambda gate, up: jax.nn.silu(gate) * up, (gate, up),
+                           (dgate, dup), cotangent),
+        "a packed SiLU product": (norms.fused_packed(),
+                                  lambda gate_up: jax.nn.silu(gate_up[..., 0, :]) * gate_up[..., 1, :],
+                                  (jnp.stack([gate, up], axis=-2),), (jnp.stack([dgate, dup], axis=-2),),
+                                  cotangent),
+    }
+    for name, (fn, plain, primals, direction, pulled_back) in sites.items():
+        assert_contract(fn, primals, direction, pulled_back, f"{name} {edge}", truth_fn=plain, plain_fn=plain)
+
+
 def test_the_contract_refuses_a_formula_less_finite_than_the_plain_one():
     """The rule's validation: a formula overflowing where the plain one does not (|x| as the root of its
     square, past 2**64) is refused, at its primal and its derivatives; the plain formula against itself
