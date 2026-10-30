@@ -32,7 +32,6 @@ import functools
 import importlib.metadata
 import json
 import math
-import re
 import warnings
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, fields
@@ -706,7 +705,7 @@ its bias whole."""
 def planned_axes(model: PreTrainedModel) -> tuple[tuple[str, LogicalAxes], ...]:
     """The logical axes of `model`'s parameters by their torch names, from its tensor-parallel plan
     (`model.tp_plan`: its config's `base_model_tp_plan` beside its head's), each parameter's style found
-    as transformers finds it, its module's name with its layer indices read as `*`: a column-split
+    by its module's name with its layer indices read as `*`: a column-split
     projection's output width `mlp` over its input `embed`, a row-split one's the other way, and the input
     and output tables `vocab` over `embed`. Dew's rules then place them as a native model's (`mlp` on the
     tensor axis, `embed` on fsdp). A parameter no style splits so (the plan's expert, router, local and
@@ -719,7 +718,8 @@ def planned_axes(model: PreTrainedModel) -> tuple[tuple[str, LogicalAxes], ...]:
     axes: list[tuple[str, LogicalAxes]] = []
     for name, parameter in model.named_parameters():
         module, _, kind = name.rpartition(".")
-        style = plan.get(re.sub(r"\d+", "*", module))
+        # A layer's index, a name of digits alone, reads as the plan's `*` (`dense_h_to_4h` keeps its 4).
+        style = plan.get(".".join("*" if part.isdigit() else part for part in module.split(".")))
         if parameter.ndim == 2 and any(parameter is table for table in tables):
             axes.append((name, ("vocab", "embed")))
         elif style in COLUMN_STYLES and parameter.ndim in (1, 2):
