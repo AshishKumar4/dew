@@ -24,7 +24,7 @@ from jax.sharding import Mesh
 from dew import position
 from dew._coordination import agreed, agreed_next
 from dew._records import JSON
-from dew.batch import CLOSES_WINDOW, CONSUMED_COUNT, EXAMPLES_CONSUMED, Batch, ConsumedCount
+from dew.batch import CLOSES_WINDOW, CONSUMED_COUNT, EXAMPLES_CONSUMED, VALID_ROWS, Batch, ConsumedCount
 from dew.checkpoints import Checkpoints
 from dew.data.compile import Handed, native
 from dew.data.dataset import Closeable, DataPartition, Loader, PhasedStream, Reader
@@ -405,7 +405,7 @@ class FitRun:
         last = self.ends_here(interval)
         if self.ran_out:
             batch = drained(batch, interval.consumed, examples)
-        return {**batch, CLOSES_WINDOW: np.bool_(last)}, position
+        return closes_window(batch, examples, last=last), position
 
     def held(self) -> contextlib.AbstractContextManager[None]:
         """The training stream's placements held for a block of device work beside the steps
@@ -501,8 +501,8 @@ def validation_read(name: str, suite: EvalSuite, *, read: bool, previewed: bool)
 def consumption_counted(batch: Batch, *, clocked: bool) -> Batch:
     """A clocked run's `batch` with the examples it consumes counted on the host (`ConsumedCount`) as it is
     prepared; one a step after the bound rebuilt without its count is refused, as the run would stay at
-    its start. A run on another clock, one bounded in examples whose plan counts its steps ahead, keeps
-    no count: none rides to its step."""
+    its start, and each marks its real rows (`VALID_ROWS`). A run on another clock, one
+    bounded in examples whose plan counts its steps ahead, keeps no count: none rides to its step."""
     if not clocked:
         return batch if EXAMPLES_CONSUMED not in batch else {
             name: value for name, value in batch.items() if name != EXAMPLES_CONSUMED}
@@ -510,7 +510,12 @@ def consumption_counted(batch: Batch, *, clocked: bool) -> Batch:
         raise ValueError("a step after the examples bound dropped the batch's count of the examples it "
                          f"consumes ({EXAMPLES_CONSUMED!r}), which this run's progress reads: a native Grain "
                          "step that rebuilds its records keeps no count")
-    return {**batch, CONSUMED_COUNT: ConsumedCount(int(np.sum(batch[EXAMPLES_CONSUMED])))}
+    counted_batch = {**batch, CONSUMED_COUNT: ConsumedCount(int(np.sum(batch[EXAMPLES_CONSUMED])))}
+    if VALID_ROWS not in batch:
+        # A clocked read ends at its bound, in a short batch filled and marked: each of its batches marks
+        # its real rows, so every one is the same tree, the run's one program.
+        counted_batch[VALID_ROWS] = np.ones(len(np.asarray(batch[EXAMPLES_CONSUMED])), bool)
+    return counted_batch
 
 
 def waited_read(run: FitRun, interval: Interval, *, agree: bool, peek: bool = False) -> Batch | None:
@@ -534,6 +539,14 @@ def waited_read(run: FitRun, interval: Interval, *, agree: bool, peek: bool = Fa
     if batch is None and not run.current:
         raise ValueError("the training data holds no batch to train on")
     return batch
+
+
+def closes_window(batch: Batch, examples: int | None, *, last: bool = False) -> Batch:
+    """`batch` as a run on the examples clock (bounded to `examples`) hands its step: marked whether it is
+    the run's `last`, closing its update window (`CLOSES_WINDOW`), every batch of such a run marked, so
+    every step it compiles is one program, fit's, one compiled ahead (`dew.training.ahead.step_batch`)
+    and a cooldown's; a run on another clock's batch as it is."""
+    return batch if examples is None else {**batch, CLOSES_WINDOW: np.bool_(last)}
 
 
 def fit_policies[LossT, EffectsT](objective: Objective[LossT, EffectsT], best, stop, scored,

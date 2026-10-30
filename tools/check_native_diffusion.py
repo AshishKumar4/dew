@@ -257,8 +257,7 @@ def qualified(errors, name, source, reference, meta, key, given, null, process, 
     """`source`'s components and walk held to the source, as one load or the other loads them: the
     conditioning (hidden, pooled), the autoencoder's encode and decode, the final latents, the
     trajectory's images, the safety checker's pixels and features, and the public task call walking
-    to the same images. `label` prefixes each measurement's name, so two loads report apart.
-    Returns the images and the walk's conditions."""
+    to the same images. `label` prefixes each measurement's name, so two loads report apart."""
     # The start the public `prepare` makes from what the reference pipeline was handed.
     task = source.text_to_image()
     prepared = public_start(task, source, reference, meta, key, given, null, process, times)
@@ -292,15 +291,12 @@ def qualified(errors, name, source, reference, meta, key, given, null, process, 
     # The same walk through the task facade: the same images.
     output = task(prepared, steps=meta.get("steps", 2), guidance=3.0, key=key)
     np.testing.assert_array_equal(output.host().images, images)
-    return images, given
 
 
 def streamed_parity(errors, directory, whole, reference, meta, key):
     """The pipeline streamed onto a mesh a leaf at a time: every leaf the whole load holds, bit for
     bit, each placed on the mesh, and every component and its walk held to the source as the whole
-    load's are (`qualified`): another program than the whole load's, which XLA need not round alike.
-    Returns the streamed pipeline and its walk's conditions, for the update, reload and export to
-    run on."""
+    load's are (`qualified`): another program than the whole load's, which XLA need not round alike."""
     streamed = bundle(directory, streamed=True)
     assert jax.tree.structure(streamed.variables) == jax.tree.structure(whole.variables)
     for path, leaf in jax.tree_util.tree_leaves_with_path(streamed.variables):
@@ -309,9 +305,8 @@ def streamed_parity(errors, directory, whole, reference, meta, key):
                            strict=True):
         np.testing.assert_array_equal(np.asarray(left), np.asarray(right))
     given, null, process, times = selection(streamed, meta)
-    _, given = qualified(errors, directory.name, streamed, reference, meta, key, given, null, process, times,
-                         label="streamed_")
-    return streamed, given
+    qualified(errors, directory.name, streamed, reference, meta, key, given, null, process, times,
+              label="streamed_")
 
 
 def check_grids(directory, grids, case=None):
@@ -516,7 +511,7 @@ if __name__ == "__main__":
     parser.add_argument("--case")
     parser.add_argument("--model", action="store_true")
     parser.add_argument("--streamed", action="store_true", help="load the pipeline streamed onto a mesh")
-    parser.add_argument("--part", choices=PARTS, default="walk", help="the pipeline check's part")
+    parser.add_argument("--part", choices=PARTS, help="the pipeline check's part; both where none is named")
     args = parser.parse_args()
     if args.model:
         check_model(args.directory)
@@ -525,4 +520,5 @@ if __name__ == "__main__":
     elif args.case:
         regress(args.directory, args.case)
     else:
-        check_pipeline(args.directory, args.part, args.streamed)
+        for part in PARTS if args.part is None else (args.part,):
+            check_pipeline(args.directory, part, args.streamed)

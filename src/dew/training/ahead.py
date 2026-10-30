@@ -271,13 +271,15 @@ class CompiledAhead(SystemExit):
 def step_batch[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch) -> Batch:
     """`batch`, a global batch as a loader gives it, as `fit` hands it to its step: its work counted
     (`Trainer._counted_batch`), each row marked with its place among the step's records
-    (`dew.training.distributed.marked`), and its host fields set apart (`split_fields`)."""
+    (`dew.training.distributed.marked`), its host fields set apart (`split_fields`), and on the examples
+    clock whether it closes its update window (`closes_window`)."""
     from dew.data.dataset import DataPartition
     from dew.distributed.batches import split_fields
+    from dew.training._fit import closes_window
     from dew.training.distributed import marked
 
     device, _ = split_fields(marked(DataPartition.of(trainer.device_mesh), trainer._counted_batch)(batch))
-    return device
+    return closes_window(device, trainer._examples)
 
 
 def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch,
