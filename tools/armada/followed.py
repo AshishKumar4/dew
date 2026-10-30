@@ -522,7 +522,8 @@ def recorded(path: Path) -> dict[str, dict]:
                              and item.startswith(READ)} | child["reads"] | shared_child["reads"]),
             "peak": max(held) if len(files) == 1 and whole and held else None,
             # The shared children may run beside the file's own: their counts together bound both.
-            "shares": child["shares"] + shared_child["shares"], "pools": child["pools"] + shared_child["pools"]}
+            "shares": child["shares"] + shared_child["shares"],
+            "pools": child["pools"] + shared_child["pools"]}
     return out
 
 
