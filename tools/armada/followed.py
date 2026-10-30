@@ -329,7 +329,9 @@ def follow() -> None:
             record["unfollowed"] = True
 
     def written() -> None:
-        ended = {**record, "files": sorted(record["files"]), "reads": sorted(record["reads"]),
+        # The top-level modules it imported: inputs of its file, as its pytest process's are (`IMPORTED`).
+        imported = {f"{IMPORTED}{module.partition('.')[0]}" for module in list(sys.modules)}
+        ended = {**record, "files": sorted(record["files"] | imported), "reads": sorted(record["reads"]),
                  "ended": time.time()}
         # Whole or not at all, beside the mark, which stays: the parent may read either as this child ends.
         partial = directory / f"{os.getpid()}.partial"
