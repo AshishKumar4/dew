@@ -29,7 +29,7 @@ from dew.decision import (
 )
 from dew.decision.calibration import softmax
 from dew.decision.metrics import Answered
-from dew.decision.task import decoded_images
+from dew.decision.task import decoded_images, trained_tree
 
 FIXTURES = Path(__file__).parent / "fixtures" / "laya"
 TINY = FIXTURES / "tiny"
@@ -791,7 +791,10 @@ def test_runs_that_share_a_head_average_as_the_checkpoints_average_them_and_refi
     runs = trained_runs(decide, tmp_path, 2)
     tasks = [Decide.from_run(run) for run in runs]
     two = Decide.averaged(runs)
-    trees = (two.variables, averaged(runs).variables, tasks[0].variables, tasks[1].variables)
+    # Each task's weights in the model's own tree, its served packing split back (`trained_tree`), as
+    # the runs' checkpoints hold them.
+    trees = (trained_tree(two.model, two.variables), averaged(runs).variables,
+             *(trained_tree(task.model, task.variables) for task in tasks))
     for leaf, general, one, other in zip(*(jax.tree.leaves(tree) for tree in trees), strict=True):
         assert np.array_equal(np.asarray(leaf), np.asarray(general))
         if np.issubdtype(np.asarray(leaf).dtype, np.floating):

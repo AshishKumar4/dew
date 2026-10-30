@@ -610,9 +610,11 @@ def operand_precision(dtype: Dtype | None, precision: jax.lax.PrecisionLike = No
     """The precision a product of `dtype` operands takes: the one stated, JAX's configured one where
     none is, and for bf16 operands at the default precision the algorithm that keeps a bf16 dot bf16
     in both directions. A caller that asked for more than the default keeps what it asked for, and so
-    does a GPU older than sm80, which rejects the algorithm at run time
-    (`dew.nn.kernels.generation.BF16_GPU`)."""
-    if dtype is None or jnp.dtype(dtype) != jnp.bfloat16 or not asks_default_precision(precision):
+    does a run whose configured precision asks for more where the call states none (a run's
+    `Numerics.matmul`, `generation.run_precision`), and a GPU older than sm80, which rejects the
+    algorithm at run time (`dew.nn.kernels.generation.BF16_GPU`)."""
+    if (dtype is None or jnp.dtype(dtype) != jnp.bfloat16
+            or not asks_default_precision(precision, configured=True)):
         return precision
     # Imported here: dew.nn.kernels imports this module.
     from .kernels.generation import bf16_dot_runs

@@ -12,7 +12,7 @@ from flax import linen as nn
 
 from dew._records import integer, record
 from dew.artifacts import Decisions
-from dew.batch import FROZEN, Batch, Variables, dicts, part
+from dew.batch import FROZEN, Batch, Variables, dicts, part, thaw
 from dew.data.pipeline import Configured, ObjectiveData
 from dew.data.text import HFTokenizer, Tokenizer
 from dew.decision.calibration import Temperatures
@@ -30,9 +30,9 @@ from dew.decision.model import DecisionModel
 from dew.decision.questions import KINDS, Score
 from dew.decision.rows import ConfigureLayout, Fit, PackedRows, QuestionRows, _rows, option_width, packing
 from dew.decision.scoring import LogLoss, ScoringRule
-from dew.decision.task import Budget, Decide, DecideSettings, Weights, laid_out, whole_blocks_of
+from dew.decision.task import Budget, Decide, DecideSettings, Weights, laid_out, trained_tree, whole_blocks_of
 from dew.inference.loading import RunProcessor
-from dew.inference.projections import unpacked
+from dew.inference.projections import projection_groups
 from dew.inference.tasks import Processor as TaskProcessor
 from dew.inputs import Field, InputSpec
 from dew.interop.processors import Processor
@@ -41,7 +41,7 @@ from dew.nn import categorical
 from dew.nn.cross_attention import ContextEncoder, crosses_alone
 from dew.nn.flops import MissingFlopsCount, counted_flops, frozen_training_flops, parameter_flops
 from dew.nn.inputs import ModelInputs
-from dew.nn.protocols import CountedDecisions, CountedTraining, CrossAttending, TokenModel
+from dew.nn.protocols import CountedDecisions, CountedTraining, CrossAttending, ProjectionGroup, TokenModel
 from dew.objectives.base import (
     OMITTED,
     Aux,
@@ -241,11 +241,10 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         self.image_processor = None
         match backbone:
             case Decide():
-                # A run trains the model's own tree: a loaded task's projections, packed to serve
-                # (`Decide._served`), split back (`unpacked`, ledger 2299).
+                # A run trains the model's own tree, a loaded task's projections split back
+                # (`trained_tree`, ledger 2299).
                 model = backbone.model
-                held = joined({"backbone": unpacked(model.backbone, part(backbone.variables, "backbone")),
-                               "head": part(backbone.variables, "head")})
+                held = trained_tree(model, backbone.variables)
                 self.image_processor = backbone.processor
                 head = head or model.head
                 context_encoder = context_encoder or model.context_encoder
@@ -514,6 +513,15 @@ class DecisionObjective(Objective[Ratio | Weighted]):
             else self.image_processor.source,
             self.model.context_encoder,
             *(self.widths or (None, None)))
+
+    def served_groups(self, variables: Variables) -> tuple[ProjectionGroup, ...]:
+        """The backbone's projection groups a served task packs (`Decide._served`), their paths from
+        the `params` root: what a checkpoint holds packed where its run trained a loaded task's packed
+        tree (mains 1385b203c up to ledger 2299's fix), which a resume splits back
+        (`dew.checkpoints`). Carried to 1.0, when it is deleted (ledger 1552)."""
+        backbone = part(thaw(variables), "backbone")
+        return tuple(dataclasses.replace(group, path=("backbone", *group.path))
+                     for group in projection_groups(self.model.backbone, backbone))
 
     def recorded_model(self) -> nn.Module:
         """The backbone; the head is a task setting of its own."""

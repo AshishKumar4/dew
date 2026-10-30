@@ -385,7 +385,7 @@ class InItsForm:
 
 def traced_in_its_form[TaskT: InItsForm, **P, R](
         call: Callable[Concatenate[TaskT, P], R]) -> Callable[Concatenate[TaskT, P], R]:
-    """`call`, a method of a task or its helper, traced in its run's attention form (`InItsForm.traced`),
+    """`call`, a method of a task or its helper, traced under its run's numerics (`InItsForm.traced`),
     on whichever thread runs it."""
     @functools.wraps(call)
     def traced(task: TaskT, *arguments: P.args, **keywords: P.kwargs) -> R:

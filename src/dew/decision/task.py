@@ -399,10 +399,17 @@ class Decide(SavedRunTask, InItsForm):
             if differing:
                 raise ValueError(f"the run in {directory} differs from {runs[0]} in its "
                                  f"{', '.join(differing)}, so their weights are not one task's to average")
+        # One task's numerics, which every run trained under (`SavedRun.precision`), carried onto the
+        # average (`SavedRun.formed`).
+        for run in pinned[1:]:
+            if run.precision != pinned[0].precision:
+                raise ValueError(f"the run in {run.directory} trained under other numerics than {runs[0]} "
+                                 f"({run.precision} against {pinned[0].precision}), so their weights are "
+                                 f"not one task's to average")
         average = averaged_pinned(pinned, ema=ema)
         task = cls._recorded(runs[0], recorded[0], average.model.build(), average.variables,
                              Weights(average.runs[0][1], ema=False, averaged=average.runs), None)
-        task = replace(task, variables=_served(task.model, task.variables))
+        task = pinned[0].formed(replace(task, variables=_served(task.model, task.variables)))
         # A pass's question slots are its windows' (`pass_shapes`); the runs' widest options pad its
         # questions.
         widest = max((own.options for own in settings if own.options is not None), default=None)
@@ -500,7 +507,10 @@ class Decide(SavedRunTask, InItsForm):
                                opt_state=optax.EmptyState(), ema=None,
                                key=jax.device_put(jax.random.key(0), replicated), scale=None,
                                window_size=jax.device_put(jnp.asarray(1, jnp.int32), replicated))
-            checkpoints.save(self.weights.step, state, artifact=DecisionObjective(self).inference_record())
+            # The record names the numerics the average answers under (`traced`).
+            with self.traced():
+                record = DecisionObjective(self).inference_record()
+            checkpoints.save(self.weights.step, state, artifact=record)
             checkpoints.wait()
 
     @traced_in_its_form
@@ -859,8 +869,10 @@ class Decide(SavedRunTask, InItsForm):
         from dew.training.evaluation import Evaluation
 
         chosen = list(metrics) or default_metrics()
-        evaluation = Evaluation.run(self._scoring, self.variables, self._held(examples, self._mesh),
-                                    key=0, metrics=chosen, mesh=self._mesh)
+        # Scored under the numerics the task answers under (`traced`), as its calls are.
+        with self.traced():
+            evaluation = Evaluation.run(self._scoring, self.variables, self._held(examples, self._mesh),
+                                        key=0, metrics=chosen, mesh=self._mesh)
         return {metric.name: evaluation.scores[f"val/{metric.name}"] for metric in chosen}
 
     @property
@@ -1268,6 +1280,20 @@ def _served(model: DecisionModel, variables: Variables, *, owned: bool = True) -
     pack = packed_owned if owned else inference_projections
     return joined({"backbone": pack(model.backbone, part(variables, "backbone")),
                    "head": part(variables, "head")})
+
+
+def trained_tree(model: DecisionModel, variables: Variables) -> Variables:
+    """A task's weights as a run trains them, the model's own tree: the backbone's projections, packed
+    to serve (`_served`), split back (`unpacked`, ledger 2299), so a run trains, and its resume builds,
+    one tree wherever it runs. A trunk held frozen keeps the layout it was stored in, as `_served`
+    leaves it (ledger 2439)."""
+    from dew.batch import FROZEN, part
+    from dew.inference.projections import unpacked
+
+    backbone = part(variables, "backbone")
+    if FROZEN in backbone:
+        return variables
+    return joined({"backbone": unpacked(model.backbone, backbone), "head": part(variables, "head")})
 
 
 def decoded_images(images: object) -> list[Image.Image]:

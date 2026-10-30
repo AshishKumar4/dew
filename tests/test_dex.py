@@ -30,7 +30,8 @@ from dew.nn.progress import Progress, stepping
 LLAMA = Path(__file__).parent / "fixtures" / "hf" / "llama-tiny"
 HEADS = (1, 3)
 SEEDS = {"dex differential": 256, "dex through the decoder": 8, "dex at the anneal's start": 8,
-         "dex gradients through the decoder": 256, "dex scanned": 8, "dex exported": 8}
+         "dex gradients through the decoder": 256, "dex scanned": 8, "dex exported in float32": 8,
+         "dex exported in bfloat16": 8}
 """Check 1's declared seeds for each site, sized paired by `seeds_for` on armada (IGDEXS, IGDEXS4)."""
 
 
@@ -135,11 +136,12 @@ def traced_wide(tree):
                         else leaf, tree)
 
 
-def loads(trains: str = "all"):
-    """The source and the source with DEX on layer 0's heads 1 and 3 (`HEADS`), each loaded in float32."""
+def loads(trains: str = "all", dtype: str = "float32"):
+    """The source and the source with DEX on layer 0's heads 1 and 3 (`HEADS`), each loaded computing
+    and storing in `dtype`."""
     extension = DifferentialExtension(((0, HEADS),), anneal_steps=10, trains=trains)
-    return (Pretrained.load(LLAMA, dtype="float32", attention_impl="reference"),
-            Pretrained.load(LLAMA, dtype="float32", attention_impl="reference", dex=extension))
+    return (Pretrained.load(LLAMA, dtype=dtype, param_dtype=dtype, attention_impl="reference"),
+            Pretrained.load(LLAMA, dtype=dtype, param_dtype=dtype, attention_impl="reference", dex=extension))
 
 
 def moved_draw(variables, value_dim: int):
@@ -150,10 +152,10 @@ def moved_draw(variables, value_dim: int):
         flat = flatten_dict(variables["params"])
         for key in flat:
             if key[-1] == "dex_lambda":
-                flat[key] = jnp.asarray(rng.uniform(0.2, 0.8), jnp.float32)
+                flat[key] = jnp.asarray(rng.uniform(0.2, 0.8), flat[key].dtype)
             elif key[-1] == "dex_projection":
                 drawn = rng.standard_normal(flat[key].shape) / np.sqrt(value_dim)
-                flat[key] = jnp.asarray(drawn, jnp.float32)
+                flat[key] = jnp.asarray(drawn, flat[key].dtype)
         ids = jnp.asarray(rng.integers(0, 256, (2, 7)), jnp.int32)
         cotangent = jnp.asarray(rng.standard_normal((2, 7, 256)), jnp.float32)
         return {**variables, "params": unflatten_dict(flat)}, ids, cotangent
@@ -182,32 +184,37 @@ def test_a_loaded_source_takes_dex_by_the_papers_recipe():
     assert rebuilt.model.dex == loaded.model.dex
 
 
-def exported_site(directory: Path):
-    """Check 1's arms for an export of the extended decoder: the source loaded back from what `save`
-    writes of a draw's variables, the source's forward over the folded output projection (`folded`),
-    a draw of moved variables, and the folded route's float64 as truth."""
-    source, loaded = loads()
+def exported_site(directory: Path, dtype: str):
+    """Check 1's arms for an export of the extended decoder computing and storing in `dtype`: the
+    source loaded back from what `save` writes of a draw's variables, the extended decoder's own
+    unfused forward outside a run (its learned lambda), a draw of moved variables, and that forward's
+    float64 as truth."""
+    _, loaded = loads(dtype=dtype)
 
     @as_given
     def reloaded(variables, ids, _):
         loaded.save(directory, variables=variables)
-        back = Pretrained.load(directory, dtype="float32", attention_impl="reference")
-        return np.asarray(back.model.apply(back.variables, ids))
+        back = Pretrained.load(directory, dtype=dtype, param_dtype=dtype, attention_impl="reference")
+        return np.asarray(back.model.apply(back.variables, ids), np.float32)
 
-    wide = source.model.clone(dtype=jnp.float64)
-    return (reloaded, jax.jit(lambda variables, ids, _: source.model.apply(folded(variables), ids)),
+    wide = loaded.model.clone(dtype=jnp.float64)
+    live = jax.jit(lambda variables, ids, _: loaded.model.apply(variables, ids).astype(jnp.float32))
+    return (reloaded, live,
             moved_draw(loaded.variables, loaded.model.features_per_head),
-            jax.jit(lambda variables, ids, _: wide.apply(folded(traced_wide(variables)), ids)))
+            jax.jit(lambda variables, ids, _: wide.apply(traced_wide(variables), ids)))
 
 
-def test_an_export_writes_dex_folded_into_its_output_projections(tmp_path):
+@pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
+def test_an_export_writes_dex_folded_into_its_output_projections(tmp_path, dtype):
     """The source's format holds no extension, so an export writes each layer's differential at its
     learned lambda folded into its output projection (ledger 2478): the source loaded back from it
-    computes what the extended decoder does outside a run, on par with the folded route through the
-    source's forward from its float64 (check 1). A layer whose output gate scales its heads' outputs
-    before the projection does not fold, and its export refuses."""
-    reloaded, through, draw, truth = exported_site(tmp_path)
-    assert_as_exact(reloaded, through, draw, "dex exported", seeds=SEEDS["dex exported"], truth_fn=truth)
+    computes what the extended decoder's own unfused forward does outside a run, on par with it from
+    its float64 (check 1), in float32 and computing and storing in bf16, where the fold rounds where the
+    unfused layer does not. A layer whose output gate scales its heads' outputs before the projection
+    does not fold, and its export refuses."""
+    reloaded, live, draw, truth = exported_site(tmp_path, dtype)
+    assert_as_exact(reloaded, live, draw, f"dex exported in {dtype}", seeds=SEEDS[f"dex exported in {dtype}"],
+                    truth_fn=truth)
     gated = every_layer(output_gate=True)
     with pytest.raises(ValueError):
         gated.dex_exported(gated.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32)))

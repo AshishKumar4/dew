@@ -19,7 +19,6 @@ from PIL import Image
 from reference_error import assert_as_exact_as_the_reference, float64_forward, ieee_fixture
 from safetensors.numpy import load_file
 
-from dew.batch import leaves_by_path
 from dew.checkpoints import Checkpoints
 from dew.data.text import HFTokenizer
 from dew.decision import (
@@ -357,18 +356,15 @@ def test_a_run_trains_a_loaded_tasks_own_tree_and_a_release_trains_unpacked(tmp_
     for source in [*BACKBONE.iterdir(), TINY / "joint_head_config.json", TINY / "joint_head.safetensors"]:
         (release / source.name).symlink_to(source.resolve())
 
-    def packed(variables) -> list[tuple[str, ...]]:
-        return [path for path in leaves_by_path(variables["params"])
-                if "qkv_proj" in path or "gate_up_proj" in path]
+    def backbone(variables):
+        return jax.tree.structure(variables["params"]["backbone"])
 
-    task = Decide.from_pretrained(release, attention_impl="xla")
-    assert packed(task.variables)
-    trained = DecisionObjective(task, layout=JointLayout(max_len=1024)).init(jax.random.key(0))
-    assert not packed(trained)
     bundle = Pretrained.load(release, dtype="float32", attention_impl="xla")
-    assert not packed(Decide.released(bundle).variables)
-    assert jax.tree.structure(trained["params"]["backbone"]) == jax.tree.structure(
-        Decide.released(bundle).variables["params"]["backbone"])
+    own = backbone(Decide.released(bundle).variables)
+    task = Decide.from_pretrained(release, attention_impl="xla")
+    assert backbone(task.variables) != own
+    trained = DecisionObjective(task, layout=JointLayout(max_len=1024)).init(jax.random.key(0))
+    assert backbone(trained) == own
 
 
 def test_a_joint_release_fine_tunes_averages_and_reloads_from_its_runs(tmp_path):
