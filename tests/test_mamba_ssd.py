@@ -186,7 +186,8 @@ def the_template_is_as_exact_as_mamba_ssm():
     draw, reference, truth = indexed_recording(
         stored, case, seeds, inputs_of=lambda seed: mamba_ssd_draw(seed, shape, dtype, documents),
         truth_fn=jax.jit(lambda inputs: {name: value for name, value in mamba_ssd_xla(inputs, chunk).items()
-                                         if name in forward}), leaves=forward)
+                                         if name in forward}),
+        leaves=forward)
 
     def run(index, arrays):
         del index
@@ -200,7 +201,8 @@ def the_template_is_as_exact_as_mamba_ssm():
         return {"y": out, "final": final}
 
     assert_as_exact(jax.jit(run), as_given(reference), draw,
-                    f"the template's forward against mamba_ssm, {case}", seeds=seeds, truth_fn=as_given(truth))
+                    f"the template's forward against mamba_ssm, {case}", seeds=seeds,
+                    truth_fn=as_given(truth))
 
 
 def test_the_port_takes_widths_padded_to_powers_of_two():
