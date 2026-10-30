@@ -108,7 +108,7 @@ from dew.objectives.base import (
     taken_record,
 )
 from dew.optim import held_rates, learning_rate, scaled_rates, settable_rates, with_rates
-from dew.state import MODEL_STATE, Accumulation, TrainState, apart, kept_window, together
+from dew.state import MODEL_STATE, Accumulation, TrainState, apart, drawn_in, kept_window, together
 from dew.telemetry import profile as telemetry_profile
 from dew.telemetry.instrumentation import StepFlops, compilation_cache_counts
 from dew.telemetry.profile import region
@@ -277,45 +277,44 @@ class Trainer(Generic[Loss, Effects]):
         tune_kernels: bool = False,
         record: bool = False,
         links: Mapping[str, Link] | None = None,
+        param_dtype: str | None = None,
     ):
         """Hold everything a run needs, without opening any of it.
 
-        The mesh, the compiled step and the capabilities' resources come into
-        being in `fit`, so constructing a Trainer allocates nothing.
+        The mesh, the compiled step and the capabilities' resources come into being in `fit`, so constructing
+        a Trainer allocates nothing.
 
-        `accumulation` is how many steps pool into one optimizer commit, and `split` how many
-        microbatches each step's batch is read in, its rows split evenly; None plans it, the
-        fewest that fit the devices before any recomputation (`compile`). `optimizer`
-        is an optax transformation, or an `OptimConfig` each `fit` builds over its `steps //
-        accumulation` updates; the run steps the objective's (`Objective.optimizer`), made from
-        it. `step` replaces the built-in transaction. A custom step then owns the clocks, the
-        scaler, the EMA and the mutable writes, and the compiled wrapper owns only the
-        attempted-step counter. `rollout` runs once per batch read, before the step and outside
-        replay. `layout` and `mesh` say where the state lives: `mesh` a `MeshSpec` or a native
-        `jax.sharding.Mesh` of any axes, which `layout`'s rules name (`Layout.data_axes` its rows').
-        `microbatches` is how many a pipelined step feeds through the mesh's stage axis, a
-        multiple of its size; None feeds one a stage. `lower_for`, a CUDA generation, lowers
-        the first step for it in place of compiling it (`dew.training._lowering.Lowered`); `ahead`, a
-        step compiled ahead (`dew.training.ahead`), runs as the first step where it is that program.
-        `tune_kernels` opts in to the tuner (`dew.nn.kernels.tuning.tune`), else each launch takes its
-        derived config. `record` makes each step return in its metrics what each evaluation, replays
-        too, sampled or passed as a boundary (`taken_record`).
-        `links` states an axis's `Link` by name in place of measuring it (`_links`).
+        `accumulation` is how many steps pool into one optimizer commit, and `split` how many microbatches
+        each step's batch is read in, its rows split evenly; None plans it, the fewest that fit the devices
+        before any recomputation (`compile`). `optimizer` is an optax transformation, or an `OptimConfig` each
+        `fit` builds over its `steps // accumulation` updates; the run steps the objective's
+        (`Objective.optimizer`), made from it. `step` replaces the built-in transaction. A custom step then
+        owns the clocks, the scaler, the EMA and the mutable writes, and the compiled wrapper owns only the
+        attempted-step counter. `rollout` runs once per batch read, before the step and outside replay.
+        `layout` and `mesh` say where the state lives: `mesh` a `MeshSpec` or a native `jax.sharding.Mesh` of
+        any axes, which `layout`'s rules name (`Layout.data_axes` its rows'). `microbatches` is how many a
+        pipelined step feeds through the mesh's stage axis, a multiple of its size; None feeds one a stage.
+        `lower_for`, a CUDA generation, lowers the first step for it in place of compiling it
+        (`dew.training._lowering.Lowered`); `ahead`, a step compiled ahead (`dew.training.ahead`), runs as the
+        first step where it is that program. `tune_kernels` opts in to the tuner
+        (`dew.nn.kernels.tuning.tune`), else each launch takes its derived config. `record` makes each step
+        return in its metrics what each evaluation, replays too, sampled or passed as a boundary
+        (`taken_record`). `links` states an axis's `Link` by name in place of measuring it (`_links`).
+        `param_dtype`, a dtype's name, stores the parameters the run draws fresh, as Flax's `param_dtype`
+        (`dew.state.drawn_in`); None keeps each module's own.
         """
         whole = read_whole(accumulation, split, step, layout, rollout, mesh)
         self.objective = objective
         built = isinstance(optimizer, optax.GradientTransformation)
-        self._config = None if built else optimizer
-        self._optimizer = objective.optimizer(optimizer) if built else None
+        self._config, self._optimizer = (None, objective.optimizer(optimizer)) if built else (optimizer, None)
         from dew.nn.inputs import seed_of
         # A seed's key is made when first read, after `fit` readies the process (`key`).
         self.seed, self._given_key, self._key = seed_of(key), key, None
         self.mesh = mesh
         self.layout = layout
-        self._microbatches = microbatches
         self.accumulation = accumulation
         self.split = split
-        self._loss_scale = loss_scale(dynamic_scale)
+        self._microbatches, self._loss_scale = microbatches, loss_scale(dynamic_scale)
         self.dynamic_scale = self._loss_scale is not None
         self.checkpoints = checkpoints
         self.tracker, self.step, self.rollout = tracker, step, rollout
@@ -326,6 +325,7 @@ class Trainer(Generic[Loss, Effects]):
         self.records: list[Recorded] = []
         self.profile = profile
         self.lower_for, self._ahead, self.tune_kernels = lower_for, ahead, tune_kernels
+        self.param_dtype = param_dtype
         # Set by `compile`, for the batch shape it was called with. A ramped run has one value per stage;
         # `fit` keeps them beside each step. The executable is the step as compiled, whose memory analysis a
         # benchmark reads; the program it was lowered from is released with its plan (`Planned.released`).
@@ -389,14 +389,12 @@ class Trainer(Generic[Loss, Effects]):
                       key: int | jax.Array | None = None) -> TrainState:
         """Build the state a fresh run starts from.
 
-        It is pure, so `fit` traces it once for its shapes and once, sharded, for its
-        values.
+        It is pure, so `fit` traces it once for its shapes and once, sharded, for its values.
 
-        Both inputs default to the run's own, and `place` passes them explicitly so
-        that what it compiles takes them as arguments. A held checkpoint then reaches
-        the device as an argument instead of a constant embedded in the executable.
-        Passing None means "use the configured input", which is what a call without
-        arguments does. This is the only implementation of the state, so a subclass
+        Both inputs default to the run's own, and `place` passes them explicitly so that what it compiles
+        takes them as arguments. A held checkpoint then reaches the device as an argument instead of a
+        constant embedded in the executable. Passing None means "use the configured input", which is what
+        a call without arguments does. This is the only implementation of the state, so a subclass
         overrides it here and every path sees the override.
         """
         initializer = self.objective.initializer if initializer is None else initializer
@@ -411,7 +409,7 @@ class Trainer(Generic[Loss, Effects]):
         # The state holds its trees as dicts of its own, whichever Flax container (a FrozenDict, under a
         # mapping or a list) the objective's tree came in, so its placement, its updates, the
         # collections a step writes back (`write_back`) and its restores share one structure.
-        params = owned_dicts(nn.unbox(initialized))
+        params = drawn_in(owned_dicts(nn.unbox(initialized)), self.param_dtype, self.objective)
         # A held tree's initializer returns the objective's own arrays (`Objective.held_variables`),
         # which the step's donation would free: the moving state takes buffers of its own, as a
         # placed one does (`distributed.placed_held`). The frozen tree no step donates (`apart`), so
@@ -630,8 +628,7 @@ class Trainer(Generic[Loss, Effects]):
     def place(self) -> tuple[TrainState, Placement[TrainState], bytes | None]:
         """Put the state on the mesh, fresh or restored, once `validate`'s checks pass.
 
-        It returns the state with its shardings and the data position a resume
-        continues from.
+        It returns the state with its shardings and the data position a resume continues from.
         """
         return self._placed(self._started(), positioned=True)
 
@@ -678,7 +675,8 @@ class Trainer(Generic[Loss, Effects]):
                     self.objective, abstract.variables,
                     lambda rows, path: jax.ShapeDtypeStruct((len(rows), *rows[0].shape), rows[0].dtype))})
         share = DataPartition.of(self.device_mesh) if positioned else None
-        state, position = checkpoints.restore(placed_shapes(abstract, shardings), resume, share=share)
+        state, position = checkpoints.restore(placed_shapes(abstract, shardings), resume, share=share,
+                                              served=self.objective.served_groups(abstract.variables))
         refuse_unclocked(state, resume, self._examples)
         if self._config is not None:
             # The rate this run configures, not the one its checkpoint holds.
@@ -789,11 +787,9 @@ class Trainer(Generic[Loss, Effects]):
     def _frozen_shardings(self, state: TrainState, frozen):
         """Return where the frozen collection sits for a CPU-owned run.
 
-        Before placement the layout names each row's shards, and `resident`
-        moves the stack's rows to bank memory, a scanned run's shared rows as
-        one bank. Once placed, the collection holds those banks, whose
-        leading layer axis the layout's rules do not name, and its arrays say
-        where they sit.
+        Before placement the layout names each row's shards, and `resident` moves the stack's rows to bank
+        memory, a scanned run's shared rows as one bank. Once placed, the collection holds those banks,
+        whose leading layer axis the layout's rules do not name, and its arrays say where they sit.
         """
         leaves = jax.tree.leaves(frozen)
         if leaves and all(isinstance(leaf, jax.Array) for leaf in leaves):

@@ -47,7 +47,7 @@ A run that draws modules fresh over a loaded base, a decision's cross-attention 
 
 - **Packing.** Rows that carry a context pack as any rows do, several to a window. Each row's context lies end to end along the window's context in the order its rows stand, numbered as its row (`context_segments`, 0 for padding), so each row reads its own context and no other row's. A window counts its rows, questions and context tokens as distinct units (`DecisionObjective.bounds`).
 - **Work.** `train/flops` counts the blocks' work over each row's real context tokens (`CrossAttending.cross_flops`): a frozen source's training work, plus three passes of the blocks and the head.
-- **Serving.** `Decide(state, questions, context=...)` and `Decide.batch(requests, contexts=...)` read a request's context as training did, its images too.
+- **Serving.** `decide(state, questions, context=...)` and `decide(requests, contexts=...)` read a request's context as training did, its images too.
 - **No blocks attached.** Training over a source without cross-attention leaves `Example.context` unread: the rows carry no context, as a table with no context column trains. Serving refuses a context such a task cannot read (ValueError), and a model refuses rows that carry one (TypeError), so no answer silently ignores a context it was given.
 
 ### Consistency groups

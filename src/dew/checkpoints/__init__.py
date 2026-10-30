@@ -85,6 +85,7 @@ from dew._coordination import broadcast_from_process_zero, from_every_process, s
 from dew._hashing import fmix32
 from dew._records import JSON, duration, json_value, record, share
 from dew.batch import PARAMETER_ROOTS, Variables
+from dew.checkpoints.served import unpacked
 from dew.cleanup import attempted
 from dew.files import write_atomically
 from dew.mesh import LogicalAxes, mesh_axes
@@ -98,6 +99,7 @@ if TYPE_CHECKING:
 
     from dew.data.dataset import DataPartition
     from dew.inference.tasks import SavedRun
+    from dew.nn.protocols import ProjectionGroup
     from dew.registry import ModelConfig
     from dew.state import Accumulation, TrainState
 
@@ -2040,14 +2042,16 @@ class Checkpoints:
 
     @overload
     def restore[StateT](self, template: StateT, step: int | str | None = None, *,
-                        share: DataPartition | None = None) -> tuple[StateT, bytes | None]: ...
+                        share: DataPartition | None = None,
+                        served: Sequence[ProjectionGroup] = ()) -> tuple[StateT, bytes | None]: ...
 
     @overload
     def restore(self, template: None = None, step: int | str | None = None, *,
-                share: DataPartition | None = None) -> tuple[Variables, bytes | None]: ...
+                share: DataPartition | None = None,
+                served: Sequence[ProjectionGroup] = ()) -> tuple[Variables, bytes | None]: ...
 
     def restore(self, template=None, step: int | str | None = None, *,
-                share: DataPartition | None = None):
+                share: DataPartition | None = None, served: Sequence[ProjectionGroup] = ()):
         """Restore the state at `step` and the data position of `share`.
 
         `template` is a pytree of `jax.ShapeDtypeStruct` naming the state
@@ -2063,6 +2067,12 @@ class Checkpoints:
         returned as the bytes the reader of `share` resumes from (see
         `read_position`). Without a share, as for a caller that reads weights
         and no data, it is None.
+
+        `served` names the projection groups a step may hold packed where the
+        template holds their members (`Objective.served_groups`): each such
+        leaf, in any of the state's trees, is read packed and split back into
+        its members (`dew.checkpoints.served.unpacked`). Carried to 1.0, when it is deleted (ledger
+        1552).
         """
         step = self.pinned(step)
         from_local = step == self._local_latest()
@@ -2136,6 +2146,7 @@ class Checkpoints:
                     f"and the gradient accumulation it was written with. Resume it "
                     f"with those, or start a fresh run in a directory of its own."
                 ) from mismatch
+            restored = unpacked(checkpointer, step, metadata, dict(restored), served)
             _refuse_lacking({jax.tree_util.keystr(path) for path, leaf
                              in jax.tree_util.tree_flatten_with_path(dict(restored))[0]
                              if isinstance(leaf, jax.ShapeDtypeStruct)}, where)

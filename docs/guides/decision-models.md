@@ -27,7 +27,7 @@ answers["churn_risk"].noul          # P(yes)
 answers["department"].probabilities # one probability per option, in the question's order
 ```
 
-Each question and the state form one row. Laya's layout puts the question first, then a marker token before each option, then the state, and the model reads each option's score at its marker. To answer many requests together, use `decide.batch(...)`, which packs question rows, shortest first, into passes under a token budget. A choice with more options than one row holds comfortably, such as a 77-way intent question, can be decided in rounds with `decide.tournament(state, questions)`: the options are split into groups of 16, and each group's winner goes to a final.
+Each question and the state form one row. Laya's layout puts the question first, then a marker token before each option, then the state, and the model reads each option's score at its marker. To answer many requests together, call `decide([(state, questions), ...])`: their question rows are packed, shortest first, into passes under a token budget, the passes and compiled programs a scoring server runs, so a call and a server share one path. A choice with more options than one row holds comfortably, such as a 77-way intent question, can be decided in rounds with `decide.tournament(state, questions)`: the options are split into groups of 16, and each group's winner goes to a final.
 
 `systemone` takes and returns Jev's wire format, so a client written for Jev talks to a `Decide` task unchanged:
 

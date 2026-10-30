@@ -9,6 +9,8 @@ makes, the placement a harness loads into, and the form a run's attention trains
 import dataclasses
 import json
 
+import jax
+import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
@@ -20,9 +22,11 @@ from test_run_options import decision, diffusion, lm, scalars, trained
 
 from dew.checkpoints import Checkpoints
 from dew.cli.main import main
+from dew.config import RunConfig, earlier_run
 from dew.config.lm import LMRunConfig
 from dew.data import Loading, presets
 from dew.data.sources.tokens import TokenFiles
+from dew.nn.precision import DTYPE_PRESETS, MATMUL_PRECISIONS, Numerics
 from dew.optim import OneCycle, OptimConfig, ParamGroup, optimizers
 from dew.registry import ModelConfig
 from dew.training._lowering import Lowered
@@ -145,11 +149,16 @@ def test_an_optax_factory_named_by_its_path_makes_its_own_updates_in_a_saved_run
                if "train/learning_rate" in row)
 
 
+ACCURATE_FORMS = Numerics(forms="accurate")
+"""A run's numerics at their defaults but its ops' forms, accurate."""
+
+
 @pytest.mark.mesh(devices=8)
-def test_a_runs_recorded_attention_form_is_the_form_it_trains_in(tmp_path):
-    """`trainer.attention_form` is the form every attention of the run trains in (row 2245), on the
-    default route ('auto'): lowered for an H100, a 16-bit run recorded "accurate" routes each attention
-    to the template or the reference path, which compute the form, where the same run recorded with
+def test_a_runs_recorded_forms_are_the_forms_it_trains_in(tmp_path):
+    """`trainer.precision`'s forms are the form every attention of the run trains in (rows 2245 and
+    2500, `generation.run_precision`), on the default route ('auto'): lowered for an H100, a 16-bit run
+    recorded "accurate" routes each attention to the template or the reference path, which compute the
+    form, where the same run recorded with
     none routes it to an old route (row 2350), and `dew train` of an accurate run's own record, under a
     new name, runs its attention on the kernels it ran."""
     run = lm(tmp_path, drawn=False)
@@ -170,10 +179,10 @@ def test_a_runs_recorded_attention_form_is_the_form_it_trains_in(tmp_path):
         return {route["kernel"] for route in raised.value.kernels.record()["routes"]
                 if route["choice"] == "attention"}
 
-    accurate = lowered("accurate", {"attention_form": "accurate"})
+    accurate = lowered("accurate", {"precision": ACCURATE_FORMS})
     assert accurate and accurate <= {"template", "reference"}
     assert not lowered("fast", {}) & {"template", "reference"}
-    trained(run, tmp_path, "cpu", trainer={"attention_form": "accurate"})
+    trained(run, tmp_path, "cpu", trainer={"precision": ACCURATE_FORMS})
     recorded_run = tmp_path / "runs" / "cpu" / "run.json"
     assert main(["train", str(recorded_run), "--set", "trainer.name=again"]) == 0
     assert kernels("again") == kernels("cpu")
@@ -195,7 +204,7 @@ def test_a_saved_run_is_served_scored_and_loaded_in_the_form_it_trained_in(tmp_p
     from dew.nn.kernels import generation
 
     run = lm(tmp_path, drawn=False)
-    trained(run, tmp_path, "accurate", trainer={"attention_form": "accurate", "checkpoint_final": True})
+    trained(run, tmp_path, "accurate", trainer={"precision": ACCURATE_FORMS, "checkpoint_final": True})
     trained(run, tmp_path, "fast", trainer={"checkpoint_final": True})
     accurate, fast = (str(tmp_path / "runs" / name) for name in ("accurate", "fast"))
     loaded = TextGeneration.from_run(accurate)
@@ -233,8 +242,8 @@ def attention_forms(call) -> set[str]:
 
 @pytest.mark.mesh(devices=8)
 def test_a_saved_decision_and_image_run_trace_their_helpers_in_their_form(tmp_path):
-    """A decision run recorded "accurate" scores a batch of requests in the accurate attention form
-    (`Decide.batch`, which its call does not run through), and an image run's prepared denoising inputs
+    """A decision run recorded "accurate" scores a call's requests in the accurate attention form
+    (`Decide`'s call over a sequence of requests), and an image run's prepared denoising inputs
     encode their conditions in it (`TextToImage.prepare`), each through a numerical helper its call
     shares (row 2255's review), as their routes say (`attention_forms`)."""
     from dew.decision import Choice
@@ -244,10 +253,10 @@ def test_a_saved_decision_and_image_run_trace_their_helpers_in_their_form(tmp_pa
     for kind, build in (("decision", decision), ("diffusion", diffusion)):
         (tmp_path / kind).mkdir()
         trained(build(tmp_path / kind, drawn=False), tmp_path, kind,
-                trainer={"attention_form": "accurate", "checkpoint_final": True})
+                trainer={"precision": ACCURATE_FORMS, "checkpoint_final": True})
     decide = Decide.from_run(str(tmp_path / "runs" / "decision"))
     question = {"team": Choice("which team", ["billing", "technical", "sales"])}
-    assert attention_forms(lambda: decide.batch([({"text": "the site is down"}, question)])) == {"accurate"}
+    assert attention_forms(lambda: decide([({"text": "the site is down"}, question)])) == {"accurate"}
     images = TextToImage.from_run(str(tmp_path / "runs" / "diffusion"))
     assert attention_forms(lambda: images.prepare(["a cat"], steps=2, key=5)) <= {"accurate"}
 
@@ -295,6 +304,93 @@ def test_a_decision_run_that_ends_on_its_best_loads_at_its_calibrated_step(tmp_p
     assert [step for _, step, _ in averaged([runs / "ended"] * 2).runs] == [checkpoints.latest] * 2
 
 
+def test_a_run_saved_with_its_attention_form_reads_as_the_precision_it_named(tmp_path):
+    """A run.json saved while the trainer recorded `attention_form` reads back with that form as its
+    precision policy's forms (`dew.config.earlier_run`, ledger 2500), so the run loads and resumes as it
+    trained, and a run under the other form is refused its resume; a configuration written today that
+    names it is refused."""
+    record = tmp_path / "record"
+    run = lm(tmp_path, drawn=False)
+    run.save(str(record))
+    written = json.loads((record / "run.json").read_text())
+    trainer = {name: value for name, value in written["fields"]["trainer"].items() if name != "precision"}
+    for form in ("fast", "accurate"):
+        written["fields"]["trainer"] = {**trainer, "attention_form": form}
+        (record / "run.json").write_text(json.dumps(written))
+        loaded = RunConfig.load(str(record))
+        assert loaded.trainer.precision.forms == form
+        # It resumes as the run it records, and a run under the other policy is refused its resume.
+        loaded.check_resume(earlier_run(written))
+    with pytest.raises(ValueError):
+        run.check_resume(earlier_run(written))
+    with pytest.raises(ValueError):
+        RunConfig.read(written)
+
+
+def test_a_runs_numerics_read_back_from_its_record(tmp_path):
+    """A run's numerics read back from the record it writes whole, its dtypes, its forms and every
+    matmul precision they take, JAX's levels and each dot algorithm preset, which a record holds by its
+    name (review of ledger 2500)."""
+    run = lm(tmp_path, drawn=False)
+    for matmul in (*MATMUL_PRECISIONS, *jax.lax.DotAlgorithmPreset):
+        numerics = Numerics(DTYPE_PRESETS["bf16-true"], matmul=matmul, forms="accurate")
+        written = dataclasses.replace(run, trainer=dataclasses.replace(run.trainer, precision=numerics))
+        assert RunConfig.read(json.loads(json.dumps(written.record()))).trainer.precision == numerics
+
+
+@pytest.mark.mesh(devices=8)
+def test_a_run_draws_and_trains_its_fresh_parameters_in_its_numerics(tmp_path):
+    """A run whose numerics store parameters in bf16 (`bf16-true`) draws its fresh model's in bf16 and
+    trains them so; under the default's float32 they are float32 (review of ledger 2500)."""
+    run = lm(tmp_path, drawn=False)
+    for name, numerics in (("bf16", Numerics(DTYPE_PRESETS["bf16-true"])), ("f32", Numerics())):
+        state, _ = trained(run, tmp_path, name, trainer={"precision": numerics})
+        stored = {leaf.dtype for leaf in jax.tree.leaves(state.variables["params"])}
+        assert stored == {jnp.dtype(numerics.dtypes.params)}
+
+
+@pytest.mark.mesh(devices=8)
+def test_a_decision_run_draws_its_context_blocks_beside_its_source_in_its_numerics(tmp_path):
+    """A decision run whose numerics store parameters in bf16 draws the context blocks it trains beside
+    its loaded backbone in bf16 (`Objective.fresh_modules`), its frozen backbone in that narrower dtype
+    too (review of ledger 2500)."""
+    from test_decision_recipe import QWEN
+
+    from dew.batch import FROZEN
+
+    run = dataclasses.replace(decision(tmp_path, drawn=False), pretrained=str(QWEN), context_layers=(0,),
+                              context_length=16)
+    state, _ = trained(run, tmp_path, "context", trainer={"precision": Numerics(DTYPE_PRESETS["bf16-true"])})
+    drawn = jax.tree_util.tree_leaves_with_path(state.variables["params"])
+    assert any("cross_attention" in jax.tree_util.keystr(path) for path, _ in drawn)
+    for collection in ("params", FROZEN):
+        stored = {leaf.dtype for leaf in jax.tree.leaves(state.variables[collection])
+                  if jnp.issubdtype(leaf.dtype, jnp.floating)}
+        assert stored == {jnp.dtype(jnp.bfloat16)}, collection
+
+
+def test_a_decoder_returns_its_logits_in_its_runs_output_dtype():
+    """A decoder's logits leave it in the run's output dtype (`dtypes.output`, `run_precision`): bf16
+    under `bf16-true`, float32 under the default's numerics and outside any run, and never narrower
+    than its compute dtype (review of ledger 2500)."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.kernels.generation import run_precision
+
+    tokens = jnp.ones((1, 4), jnp.int32)
+    returned = {}
+    for compute in ("bfloat16", "float32"):
+        model = CausalTransformer(vocab_size=32, emb_features=16, num_layers=1, num_heads=2, max_seq_len=8,
+                                  dtype=compute)
+        variables = model.init(jax.random.key(0), tokens)
+        returned[compute, None] = model.apply(variables, tokens).dtype
+        for preset in ("bf16-true", "bf16-mixed"):
+            with run_precision(Numerics(DTYPE_PRESETS[preset])):
+                returned[compute, preset] = model.apply(variables, tokens).dtype
+    assert returned == {("bfloat16", None): jnp.float32, ("bfloat16", "bf16-true"): jnp.bfloat16,
+                        ("bfloat16", "bf16-mixed"): jnp.float32, ("float32", None): jnp.float32,
+                        ("float32", "bf16-true"): jnp.float32, ("float32", "bf16-mixed"): jnp.float32}
+
+
 def test_a_run_recorded_before_its_stop_took_a_plateau_still_pauses(tmp_path):
     """A run.json written while `trainer.stop` held a Pause alone records the pause by its fields, with no
     class; `dew train` of it pauses where it says (row 2239's review): half of four steps."""
@@ -309,3 +405,25 @@ def test_a_run_recorded_before_its_stop_took_a_plateau_still_pauses(tmp_path):
     assert main(["train", str(record / "run.json"),
                  *(flag for path, value in settings.items() for flag in ("--set", f"{path}={value}"))]) == 0
     assert max(scalars(runs / "paused")) == 2
+
+
+def test_a_run_saved_with_its_earlier_dtype_knobs_reads_as_the_numerics_they_named(tmp_path):
+    """A run.json saved while its config named a loaded checkpoint's storage dtype
+    (`pretrained_param_dtype`) and the trainer a loss scale (`dynamic_scale`) reads back with that storage
+    as its numerics' parameter dtype, the loss scale derived from its compute dtype (`dew.config.
+    earlier_run`, ledger 2500); a configuration written today that names either is refused."""
+    from dew.config.lm import LMRunConfig
+
+    record = tmp_path / "record"
+    run = lm(tmp_path, drawn=False)
+    run.save(str(record))
+    written = json.loads((record / "run.json").read_text())
+    trainer = {name: value for name, value in written["fields"]["trainer"].items() if name != "precision"}
+    written["fields"] = {**written["fields"], "pretrained_param_dtype": "bfloat16",
+                         "trainer": {**trainer, "dynamic_scale": True}}
+    (record / "run.json").write_text(json.dumps(written))
+    loaded = RunConfig.load(str(record))
+    assert loaded.trainer.precision.dtypes.params == "bfloat16"
+    assert not hasattr(loaded.trainer, "dynamic_scale")
+    with pytest.raises(ValueError):
+        LMRunConfig.read(written)
