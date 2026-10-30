@@ -209,7 +209,7 @@ def test_a_run_names_its_lettered_question_read_in_context_on_the_command_line(t
          "--head.labels.variants", *LABELS.variants, "--head.labels.cue", LABELS.cue,
          "--trainer.name", "letters",
          "--trainer.checkpoint-dir", str(tmp_path / "runs"), "--trainer.steps", "1",
-         "--trainer.checkpoint-every", "1", "--trainer.multi-host", "False",
+         "--trainer.checkpoint-every", "1", "--trainer.eval-every", "None", "--trainer.multi-host", "False",
          "--trainer.compilation-cache-dir", "None", "--model.dtype", "float32"],
         default=DecisionRunConfig(data=rows))
     # The run's own labels, each a single token of the backbone's byte-level vocabulary.
