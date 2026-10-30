@@ -1748,7 +1748,7 @@ def planned_checkout(ci, root: Path, monkeypatch, cache_worker,
     monkeypatch.setenv("DEW_XLA_CACHE_READ_TOKEN", "token")
 
     def planned() -> list[str]:
-        return sorted(" ".join(sorted(entry["tests"].split())) for entry in ci.plan(300.0, {})
+        return sorted(" ".join(sorted(ci.kept_of(entry["tests"].split())[0])) for entry in ci.plan(300.0, {})
                       if entry["python"] == "3.12")
 
     return verdict, planned
