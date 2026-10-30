@@ -13,7 +13,8 @@ from pathlib import Path
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import as_given, assert_as_exact, assert_as_exact_as_the_reference
+from one_draw import assert_as_exact_as_the_reference
+from reference_error import as_given, assert_as_exact
 from safetensors.numpy import load_file, save_file
 
 from dew.interop.mamba2 import config_from_hf

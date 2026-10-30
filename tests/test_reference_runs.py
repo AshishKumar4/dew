@@ -31,7 +31,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from reference_error import assert_as_exact_as_the_reference
+from one_draw import assert_as_exact_as_the_reference
 from tool_support import REPO_ROOT, load
 
 from dew.batch import TEXT_KEY

@@ -13,10 +13,10 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from diffusion_support import SourceOracle, relative_gap, source_final, walk
+from one_draw import assert_as_exact_as_the_reference
 from reference_error import (
     as_given,
     assert_as_exact,
-    assert_as_exact_as_the_reference,
     assert_as_exact_over_orders,
     declared_seeds,
     distance,

@@ -22,13 +22,8 @@ import optax
 import pytest
 from flax import linen as nn
 from flax.core import FrozenDict
-from reference_error import (
-    as_given,
-    assert_as_exact,
-    assert_as_exact_as_the_reference,
-    assert_fp32_reduction_bound,
-    with_gradients,
-)
+from one_draw import assert_as_exact_as_the_reference
+from reference_error import as_given, assert_as_exact, assert_fp32_reduction_bound, with_gradients
 from token_support import token_rows
 
 from dew.config import ObjectiveConfig

@@ -255,7 +255,7 @@ def assert_published_checkpoint(measured, name: str) -> None:
     reference logit clears the next by the gate's selection margin (`selection_margins.MARGIN`), so that
     float32 rounding cannot pick another token. A continuation with a step nearer a tie decides
     nothing, and is not compared."""
-    from reference_error import assert_as_exact_as_the_reference
+    from one_draw import assert_as_exact_as_the_reference
     from selection_margins import MARGIN, top_margin
 
     for row in measured:

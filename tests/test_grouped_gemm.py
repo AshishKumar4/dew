@@ -13,7 +13,8 @@ import numpy as np
 import pytest
 from generation_support import INTERPRETS, interpreted_projection, lowers, runs
 from jax.sharding import Mesh
-from reference_error import assert_as_exact, assert_as_exact_as_the_reference, with_gradients
+from one_draw import assert_as_exact_as_the_reference
+from reference_error import assert_as_exact, with_gradients
 
 from dew.nn.kernels import generation, grouped_matmul, tuning
 from dew.nn.kernels.templates.gemm import mosaic_gpu, template

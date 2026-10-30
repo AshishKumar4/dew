@@ -76,7 +76,7 @@ def _fetched_layer(tree, index):
                                                     jax.memory.Space.Device), (0,)), tree)
 
 
-def _on_host(tree) -> bool:
+def on_host(tree) -> bool:
     """Whether any leaf of `tree` sits in host memory."""
     return any(jax.typeof(leaf).memory_space is jax.memory.Space.Host
                for leaf in jax.tree.leaves(tree))
@@ -244,16 +244,56 @@ class PassView:
         return out
 
 
+def _by_repeat(period: int, leaf):
+    """A per-layer input's `[B, S, L, ...]` leaf as `[B, S, L / period, period, ...]`."""
+    return leaf.reshape(*leaf.shape[:2], leaf.shape[2] // period, period, *leaf.shape[3:])
+
+
+class PeriodBlock(nn.Module):
+    """One period of a periodic run (`layer_plan.scan_groups(periodic=True)`): its layers in order,
+    each built as the stack builds layer `positions[offset]` and named `offset`, which a scan runs as
+    one body over the period's repeats. No layer of it leaves what a later one reads (a provider), so
+    it threads no store."""
+    block: Block
+    positions: tuple[int, ...]
+
+    def setup(self):
+        self.layers = [self.block(index, str(offset)) for offset, index in enumerate(self.positions)]
+
+    def __call__(self, x, *, train: bool, decode: bool, kv_store, per_layer_input, attention_metadata):
+        assert kv_store is None, "a periodic run's layers leave nothing a later layer reads"
+        for offset, layer in enumerate(self.layers):
+            x = layer(x, train=train, decode=decode, kv_store=None,
+                      per_layer_input=None if per_layer_input is None else per_layer_input.layer(offset),
+                      attention_metadata=attention_metadata)
+        return x
+
+
+def _run_module(block: Block, first: int, count: int, period: int) -> DecoderBlock | PeriodBlock:
+    """The module a scanned run of `count` layers from `first` repeats: one layer for like layers,
+    a `PeriodBlock` of its `period` layers for a periodic run, named for the run's range."""
+    if period == 1:
+        return block(first, group_name(first, count))
+    return PeriodBlock(block=block, positions=tuple(range(first, first + period)),
+                       name=group_name(first, count))
+
+
 def _scanned_runs(runs, groups: Sequence[tuple[int, int]], specs: Sequence[LayerSpec], x, *, fetching: bool,
                   train: bool, decode: bool, kv_store, per_layer_input, attention_metadata):
     """`run_stack` without the inference prefetch: each run of one layer
     called as the plain loop calls it, and each longer run under flax's
-    scan. Training, or a forward that keeps intermediates, through
-    host-resident banks scans with the fetch mapped onto each row under remat
-    (`run_stack`)."""
+    scan, a periodic run's (`PeriodBlock`) over its repeats. Training, or a
+    forward that keeps intermediates, through host-resident banks scans with
+    the fetch mapped onto each row under remat (`run_stack`)."""
     for run, (first, count) in zip(runs, groups, strict=True):
         inputs = None if per_layer_input is None else per_layer_input.span(first, count)
+        periodic = isinstance(run, PeriodBlock)
         store = kv_store if count == 1 or specs[first].kv_shared else None
+        if periodic:
+            store = None
+            if inputs is not None:
+                # The layer axis, split into repeats of the period, scans over the repeats.
+                inputs = jax.tree.map(functools.partial(_by_repeat, len(run.positions)), inputs)
 
         def step(layer, carry, per_layer_input, store):
             # A provider writes its keys and values into the store it is given; inside a lifted
@@ -284,14 +324,16 @@ def _scanned_runs(runs, groups: Sequence[tuple[int, int]], specs: Sequence[Layer
             def scanned(layer, carry, per_layer_input, *, store=store, step=step):
                 return step(layer, carry, per_layer_input, store)[0], None
 
+            repeats = count // len(run.positions) if periodic else count
             x, _ = nn.scan(scanned, variable_axes={True: 0}, split_rngs={True: True},
-                           in_axes=2, length=count)(run, x, inputs)
+                           in_axes=2, length=repeats)(run, x, inputs)
     return x
 
 
 def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[LayerSpec],
               groups: Sequence[tuple[int, int]], x, *, train: bool, decode: bool,
-              kv_store, per_layer_input, attention_metadata=None, banked: bool = False):
+              kv_store, per_layer_input, attention_metadata=None, banked: bool = False,
+              periods: Sequence[int] = ()):
     """Run the layers over `x`, one run at a time as `groups` says.
 
     A run of one is `layers[first]`; a longer run is one block named for its
@@ -312,17 +354,28 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
     refetches the pinned bank rather than keeping a device copy. Each fetched
     layer binds its variables through Linen's `Module.bind`, which keeps the
     enclosing call's intermediate-capture policy active.
+
+    `periods` is each run's period (`StackView.periods`): a run of a longer
+    one repeats a `PeriodBlock` of its period's layers under the scan, which
+    the stack runs over resident weights alone (`CausalTransformer.stack`).
     """
+    if any(period > 1 for period in periods):
+        periodic = [layers[first] if count == 1 else _run_module(block, first, count, period)
+                    for (first, count), period in zip(groups, periods, strict=True)]
+        return _scanned_runs(periodic, groups, specs, x, fetching=False, train=train, decode=decode,
+                             kv_store=kv_store, per_layer_input=per_layer_input,
+                             attention_metadata=attention_metadata)
     runs = [layers[first] if count == 1 else block(first, group_name(first, count))
             for first, count in groups]
     streaming = any('streaming' in run.variables for run in runs)
     if streaming and train:
         raise ValueError("disk streaming is inference-only")
-    fetching = streaming or banked or any(_on_host(run.variables.get('params', {})) for run in runs)
+    fetching = streaming or banked or any(on_host(run.variables.get('params', {})) for run in runs)
     if not fetching or train:
         return _scanned_runs(runs, groups, specs, x, fetching=fetching, train=train, decode=decode,
                              kv_store=kv_store, per_layer_input=per_layer_input,
                              attention_metadata=attention_metadata)
+
 
     def read_only(run: DecoderBlock) -> list[str]:
         """List the collections a run reads and does not write.
@@ -618,6 +671,20 @@ class StackView:
     offset: int = 0
     """The first stored layer a pipeline's stages run (`StageSplit.prefix`); the layers before it
     and after its stages stay as they are stored."""
+    periods: tuple[int, ...] = ()
+    """Each run's period (`layer_plan.run_period`), one per group; empty for runs of like layers. A
+    periodic run's leaves are stacked per position of its period, `layers_3_10/0` holding layers 3,
+    5, 7 and 9 of a period of two, as its scanned body reads them (`PeriodBlock`)."""
+
+    def _period(self, first: int, count: int) -> int:
+        """The period of the run of `count` layers from `first`, one for a run of like layers."""
+        return dict(zip(self.groups, self.periods, strict=True)).get((first, count), 1) if self.periods else 1
+
+    @staticmethod
+    def _positions(first: int, count: int, period: int, prefix: str = 'layers_') -> list[list[str]]:
+        """A periodic run's stored names per position of its period, each in repeat order."""
+        return [[f'{prefix}{first + repeat * period + offset}' for repeat in range(count // period)]
+                for offset in range(period)]
 
     @property
     def per_stage(self) -> int:
@@ -679,6 +746,23 @@ class StackView:
                 name = self._inside_name(first, count, prefix)
                 if name is None:
                     continue
+                if (period := self._period(first, count)) > 1:
+                    # Each position of the period stacks its repeats; a position whose layers keep
+                    # nothing in the collection (a layer with no cache) is left out of it.
+                    stacked = {}
+                    for offset, layers in enumerate(self._positions(first, count, period, prefix)):
+                        held = [layer in tree for layer in layers]
+                        if not any(held):
+                            continue
+                        if not all(held):
+                            raise ValueError(
+                                f"collection {collection!r} holds some of the layers {layers} and not the "
+                                "others; each repeat of a period's position keeps what the others keep")
+                        _refuse_unlike(collection, [tree[layer] for layer in layers], layers)
+                        stacked[str(offset)] = stack_layers(*[tree.pop(layer) for layer in layers])
+                    if stacked:
+                        tree[name] = stacked
+                    continue
                 names = self._outside_names(first, count, prefix)
                 held = [layer in tree for stage in names for layer in stage]
                 if not any(held):
@@ -723,6 +807,15 @@ class StackView:
                 if name is None or name not in stages:
                     continue
                 view = stages.pop(name)
+                if (period := self._period(first, count)) > 1:
+                    for offset, layers in enumerate(self._positions(first, count, period, prefix)):
+                        if str(offset) not in view:
+                            continue
+                        for repeat, layer in enumerate(layers):
+                            # One repeat's leaf, taken with `index_in_dim` as `_leaf` takes a layer's.
+                            row = functools.partial(jax.lax.index_in_dim, index=repeat, keepdims=False)
+                            tree[layer] = jax.tree.map(row, view[str(offset)])
+                    continue
                 for stage, names in enumerate(self._outside_names(first, count, prefix)):
                     for offset, layer in enumerate(names):
                         tree[layer] = jax.tree_util.tree_map_with_path(

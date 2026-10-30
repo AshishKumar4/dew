@@ -12,13 +12,8 @@ from xml.etree import ElementTree
 
 import numpy as np
 import pytest
-from reference_error import (
-    GateFailure,
-    as_given,
-    assert_as_exact,
-    assert_as_exact_as_the_reference,
-    row_errors,
-)
+from one_draw import assert_as_exact_as_the_reference
+from reference_error import GateFailure, as_given, assert_as_exact, row_errors
 
 
 def test_the_one_draw_rule_measures_its_worst_zero_row_and_names_a_value_not_finite():
@@ -211,7 +206,8 @@ def test_a_measure_is_finite_where_the_evidence_is_finite_even_past_float64s_lar
     finite evidence (an error of 1e154 over a row of 1e-160), and the promotion matcher refuses a
     non-finite measure. Each now comes from logs or a scaled sum: the measure is finite, and the row still
     fails."""
-    from reference_error import pooled_zero_rows, rows_over
+    from one_draw import rows_over
+    from reference_error import pooled_zero_rows
 
     truth = np.asarray([[1e-160, 1e-160], [1.0, 1.0]])
     reference = np.asarray([[0.0, 0.0], [1.0, 1.0]])
@@ -224,10 +220,10 @@ def test_a_measure_is_finite_where_the_evidence_is_finite_even_past_float64s_lar
 
 
 def test_a_worse_row_past_float64s_largest_quotient_measures_larger():
-    """A row's error over its size is judged and measured by its log (`_log_over`), so two quotients
+    """A row's error over its size is judged and measured by its log (`log_over`), so two quotients
     past float64's largest, 1e310 and 1e311, keep their order: a candidate ten times worse is not
     matched to its parent's failure."""
-    from reference_error import rows_over
+    from one_draw import rows_over
 
     truth = np.asarray([[1e-160, 1e-160], [1e-148, 1e-148]])
     reference = truth + np.asarray([[1e140, 1e140], [1e152, 1e152]])
