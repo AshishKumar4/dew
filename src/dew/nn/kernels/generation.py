@@ -18,10 +18,10 @@ import logging
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from typing import TYPE_CHECKING
 
-from .selection import Refusal
-
 if TYPE_CHECKING:
     from jax.sharding import AbstractMesh, Mesh
+
+    from .selection import Refusal
 
 _log = logging.getLogger(__name__)
 
