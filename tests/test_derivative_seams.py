@@ -110,18 +110,25 @@ CONTRACTED = {
         "test_the_fused_norms_and_products_hold_every_order",
     "src/dew/objectives/perturbation.py::NodePerturbation.loss.estimated":
         "test_a_node_perturbation_estimate_holds_its_reverse_orders",
+    "src/dew/nn/kernels/grouped_matmul.py::portable_projection":
+        "test_a_portable_grouped_projection_holds_every_order",
+    "src/dew/nn/kernels/templates/gemm/template.py::_prologued.prologued":
+        "test_a_gemm_prologue_holds_every_order",
+    "src/dew/nn/kernels/templates/layout.py::_custom.held":
+        "test_a_transposed_hooks_custom_derivative_holds_every_order_it_takes",
+    "src/dew/nn/moe.py::_stored_primal":
+        "test_a_stored_expert_primal_holds_every_order",
+    "src/dew/nn/precision.py::at_default_precision.run":
+        "test_a_default_precision_call_holds_every_order_it_takes",
+    "src/dew/quantization.py::frozen_fp8_product":
+        "test_a_frozen_fp8_product_holds_every_order",
+    "src/dew/quantization.py::_grouped_convolution_gradient.grouped_conv_qt":
+        "test_a_quantized_convolution_holds_every_order_it_takes",
 }
 """Each contracted seam, `path::qualified name`, and the test of tests/test_derivative_contracts.py that holds
 it."""
 
 PENDING = frozenset({
-    "src/dew/nn/kernels/grouped_matmul.py::portable_projection",
-    "src/dew/nn/kernels/templates/gemm/template.py::_prologued.prologued",
-    "src/dew/nn/kernels/templates/layout.py::_custom.held",
-    "src/dew/nn/moe.py::_stored_primal",
-    "src/dew/nn/precision.py::at_default_precision.run",
-    "src/dew/quantization.py::frozen_fp8_product",
-    "src/dew/quantization.py::_grouped_convolution_gradient.grouped_conv_qt",
     "src/dew/sampling/flow.py::_directional",
     "src/dew/sampling/flow.py::_half_mahalanobis",
     "src/dew/sampling/flow.py::linear_tangent",

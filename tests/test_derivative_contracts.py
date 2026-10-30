@@ -49,6 +49,12 @@ def pulled(fn, primals, cotangent):
     return pull(jax.tree.map(lambda given, made: jnp.asarray(given, made.dtype), cotangent, out))
 
 
+FORWARD_ORDERS = ("jvp", "second jvp", "jvp of grad", "jvp of grad, remat", "second jvp, remat",
+                  "jvp of grad, nested jit", "jvp of grad, scanned")
+"""The orders a forward derivative takes part in: those a custom VJP, which has no forward mode, does not
+take (a row names each such seam's gap)."""
+
+
 def orders(fn, primals, direction, cotangent):
     """`fn` at each order the contract holds, by name: the primal, a forward and a reverse derivative, a
     forward derivative of the gradient of the output's sum against `cotangent` and a second forward
@@ -549,6 +555,174 @@ def test_the_fused_norms_and_products_hold_every_order(edge):
         del sites["a gated RMS norm"]
     for name, (fn, plain, primals, direction, pulled_back) in sites.items():
         assert_contract(fn, primals, direction, pulled_back, f"{name} {edge}", truth_fn=plain, plain_fn=plain)
+
+
+GROUPS = jnp.asarray([3, 0, 5], jnp.int32)
+"""A grouped product's sizes: eight rows, an empty middle expert."""
+
+
+def masked_grouped_product(rows, matrices):
+    """Each row's product with its group's matrix (`GROUPS`), by a mask: the grouped product as written."""
+    groups = jnp.repeat(jnp.arange(3), GROUPS, total_repeat_length=8)
+    return jnp.einsum("rg,rk,gkn->rn", jax.nn.one_hot(groups, 3, dtype=rows.dtype), rows, matrices)
+
+
+@pytest.mark.parametrize("edge", [edge for edge in EDGES if edge != "near the largest"])
+def test_a_portable_grouped_projection_holds_every_order(edge):
+    """`grouped_matmul.portable_projection` (its custom derivative, the rounded operands' products): every
+    order finite wherever float64 is a normal float32 and the masked grouped product as written is. Near the
+    largest its primal overflows a partial sum the masked product does not (ledger 2711), that row's head
+    adds the edge; it takes no reverse over reverse (XLA's ragged product, ledger 2650)."""
+    from dew.nn.kernels import grouped_matmul
+
+    primals = normal_draw(1564, (8, 16), (3, 16, 4), scale=EDGES[edge])
+    direction = normal_draw(1565, (8, 16), (3, 16, 4), scale=EDGES[edge])
+    (cotangent,) = normal_draw(1566, (8, 4))
+    def projected(rows, matrices):
+        return grouped_matmul.portable_projection(rows, matrices, GROUPS, None, None)
+
+    assert_contract(projected, primals, direction, cotangent, f"a portable grouped projection {edge}",
+                    truth_fn=masked_grouped_product, plain_fn=masked_grouped_product,
+                    without=("grad of grad",))
+
+
+def rms_producer(lhs, scale):
+    """An RMS norm as a GEMM's producer writes it: the operand over its root mean square, times its scale."""
+    return lhs * jax.lax.rsqrt(jnp.mean(jnp.square(lhs), axis=-1, keepdims=True) + 1e-6) * scale
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_a_gemm_prologue_holds_every_order(edge):
+    """The GEMM template's prologue (`template._prologued`, a custom JVP whose tangent is the producer's own,
+    as the fused GEMM hands it, `fused._whole_jvp`): every order finite wherever float64 is a normal float32
+    and the producer as written is."""
+    from dew.nn.kernels.templates.gemm.template import _prologued
+
+    prologued = _prologued(rms_producer, lambda *primals: lambda *tangents: jax.jvp(
+        rms_producer, primals, tangents)[1])
+    primals = normal_draw(394, (6, 16), (16,), scale=EDGES[edge])
+    direction = normal_draw(395, (6, 16), (16,), scale=EDGES[edge])
+    (cotangent,) = normal_draw(396, (6, 16))
+    assert_contract(prologued, primals, direction, cotangent, f"a GEMM prologue {edge}",
+                    truth_fn=rms_producer, plain_fn=rms_producer)
+
+
+def softly_rectified(scores):
+    """A score hook through a custom derivative entry by entry (jnp.logaddexp's)."""
+    return jnp.logaddexp(scores, 0.5 * scores)
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_a_transposed_hooks_custom_derivative_holds_every_order_it_takes(edge):
+    """A custom derivative within a hook a mainloop runs on transposed tiles (`layout.transposed`, its rule
+    held entry by entry, `_custom.held`): every order it takes finite wherever float64 is a normal float32
+    and the hook on the tile as its caller holds it is; it takes no forward mode (ledger 2658)."""
+    from dew.nn.kernels.templates import layout
+
+    (tile,) = normal_draw(105, (6, 4), scale=EDGES[edge])
+    (direction,) = normal_draw(106, (6, 4), scale=EDGES[edge])
+    (cotangent,) = normal_draw(107, (6, 4))
+
+    def plain(tile):
+        return softly_rectified(tile.T).T
+
+    assert_contract(layout.transposed(softly_rectified), (tile,), (direction,), cotangent,
+                    f"a transposed hook's custom derivative {edge}", truth_fn=plain, plain_fn=plain,
+                    without=FORWARD_ORDERS)
+
+
+@pytest.mark.parametrize("edge", [edge for edge in EDGES if edge != "near the largest"])
+def test_a_stored_expert_primal_holds_every_order(edge):
+    """An expert layer's primal over its parameters as stored (`moe._stored_primal`, differentiated over them
+    widened): every order finite wherever float64 is a normal float32 and the run itself is. Near the
+    largest its kernel gradient sums its products in an order that overflows where the run's own does not
+    (ledger 2711), that row's head adds the edge."""
+    from dew.nn import moe
+
+    indices = jnp.zeros((6,), jnp.int32)
+
+    def run(x, indices, parameters, weights):
+        return (x @ parameters["kernel"]) * weights[:, None]
+
+    def stored(x, kernel, weights):
+        return moe._stored_primal(run, x, indices, {"kernel": kernel}, weights)
+
+    def plain(x, kernel, weights):
+        return run(x, indices, {"kernel": kernel}, weights)
+
+    primals = normal_draw(597, (6, 16), (16, 4), (6,), scale=EDGES[edge])
+    direction = normal_draw(598, (6, 16), (16, 4), (6,), scale=EDGES[edge])
+    (cotangent,) = normal_draw(599, (6, 4))
+    assert_contract(stored, primals, direction, cotangent, f"a stored expert primal {edge}", truth_fn=plain,
+                    plain_fn=plain)
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_a_default_precision_call_holds_every_order_it_takes(edge):
+    """A function traced at the default matmul precision (`precision.at_default_precision`, a custom VJP):
+    every order it takes finite wherever float64 is a normal float32 and the product as written is; it takes
+    no forward mode (ledger 2658)."""
+    def product(x, y):
+        return x @ y
+
+    primals = normal_draw(1208, (5, 16), (16, 3), scale=EDGES[edge])
+    direction = normal_draw(1209, (5, 16), (16, 3), scale=EDGES[edge])
+    (cotangent,) = normal_draw(1210, (5, 3))
+    assert_contract(precision.at_default_precision(product), primals, direction, cotangent,
+                    f"a default-precision call {edge}", truth_fn=product, plain_fn=product,
+                    without=FORWARD_ORDERS)
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_a_frozen_fp8_product_holds_every_order(edge):
+    """A frozen FP8 kernel's product (`quantization.frozen_fp8_product`, its tangent the decoded kernel's):
+    every order in the input finite wherever float64 is a normal float32 and the product with the decoded
+    kernel as written is."""
+    from dew.quantization import FROZEN_FP8, frozen_fp8_kernel, frozen_fp8_leaves
+
+    (kernel,) = normal_draw(475, (16, 8))
+    leaves = frozen_fp8_leaves(kernel)
+    decoded = frozen_fp8_kernel(leaves)
+
+    def frozen(x):
+        from dew.quantization import frozen_fp8_product
+
+        return frozen_fp8_product(x, *(leaves[name] for name in FROZEN_FP8))
+
+    def plain(x):
+        return x @ decoded.astype(x.dtype)
+
+    (x,) = normal_draw(476, (5, 16), scale=EDGES[edge])
+    (direction,) = normal_draw(477, (5, 16), scale=EDGES[edge])
+    (cotangent,) = normal_draw(478, (5, 8))
+    assert_contract(frozen, (x,), (direction,), cotangent, f"a frozen FP8 product {edge}", truth_fn=plain,
+                    plain_fn=plain)
+
+
+@pytest.mark.parametrize("edge", EDGES)
+def test_a_quantized_convolution_holds_every_order_it_takes(edge):
+    """A quantized convolution under Qwix's quantized training (`quantization`'s grouped convolution, a
+    custom VJP whose backward is the float convolution's transpose at the dequantized operands): every order
+    it takes finite wherever float64 is a normal float32 and the float convolution is; it takes no forward
+    mode (ledger 2658)."""
+    pytest.importorskip("qwix")
+    from dew.nn.conv import Conv
+    from dew.quantization import Quantization
+
+    conv = Conv(features=8, kernel_size=(3, 3), padding="SAME", use_bias=False)
+    quantized = Quantization().apply(conv)
+
+    def convolved(x, kernel):
+        return quantized.apply({"params": {"kernel": kernel}}, x)
+
+    def plain(x, kernel):
+        return conv.clone(dtype=x.dtype).apply({"params": {"kernel": kernel}}, x)
+
+    primals = normal_draw(1134, (1, 6, 6, 4), (3, 3, 4, 8), scale=EDGES[edge])
+    direction = normal_draw(1135, (1, 6, 6, 4), (3, 3, 4, 8), scale=EDGES[edge])
+    (cotangent,) = normal_draw(1136, (1, 6, 6, 8))
+    assert_contract(convolved, primals, direction, cotangent, f"a quantized convolution {edge}",
+                    truth_fn=plain, plain_fn=plain, without=FORWARD_ORDERS)
 
 
 def test_the_contract_refuses_a_formula_less_finite_than_the_plain_one():
