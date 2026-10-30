@@ -260,8 +260,7 @@ def test_a_biased_mlp_loads_and_exports_where_the_reference_reads_mlp_bias(name,
         reloaded = np.asarray(again.model.apply(again.variables, ids))
         np.testing.assert_array_equal(reloaded, ours)
 
-@pytest.mark.gpu(reason="TF32 is a GPU's: a CPU multiplies float32 operands in float32 at any precision")
-def test_a_float32_decoder_under_the_accurate_policy_is_as_exact_as_transformers_on_a_gpu():
+def a_float32_decoder_under_the_accurate_policy_is_as_exact_as_transformers_on_a_gpu():
     """A float32 decoder under a run's ACCURATE precision policy (`generation.run_precision`, ledger
     2500) multiplies every product that states no precision in IEEE float32: its logits on a GPU are as
     exact as transformers' float32 ones, both from transformers' float64 ones, JAX's own default (TF32

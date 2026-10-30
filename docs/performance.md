@@ -2403,8 +2403,8 @@ bf16 near-tie. Teacher-forced through the fp32 model, the two chosen tokens'
 logits are a median 0.64 bf16 spacings apart at their magnitude and at most
 2.78; 77% are under one spacing and 98% under two. The fp32 argmax is the
 xla prefill's choice in 31 rows and cuDNN's in 23.
-`tests/test_causal_transformer.py::test_a_padded_prefill_attends_through_cudnn_where_it_runs`
-checks the routing. The distances apply `tests/reference_error.py`'s
+`a_padded_prefill_attends_through_cudnn_where_it_runs` in `tests/test_causal_transformer.py`, a cell of
+`tests/test_gpu_models.py`, checks the routing. The distances apply `tests/reference_error.py`'s
 `distance` to the cache prefill and to `dew.pipeline(..., dtype="float32")`
 under `jax.default_matmul_precision("highest")` over the same tokens.
 
