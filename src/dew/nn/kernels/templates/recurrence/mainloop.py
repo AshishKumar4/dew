@@ -955,8 +955,9 @@ def _intra(q, k, hi, lo, beta, taken, call: _Call, *, scale: float):
     # Each sub-chunk's and key block's gated rows and keys and their product, for the scores and the system,
     # then the inverse's doubling.
     pairs = (CHUNK // algebra.SUB) * (1 + call.delta)
+    # The exponentials: a key block's rows gated down once, its keys up a sub-chunk at a time.
     work = Work(pairs * 2 * CHUNK * CHUNK * width + (_inverse_flops() if call.delta else 0),
-                exponentials=pairs * 2 * CHUNK * width)
+                exponentials=(CHUNK // algebra.SUB + 1) * (1 + call.delta) * CHUNK * width)
     staging = (_pairing(call, keys), plgpu.SMEM((2, CHUNK // algebra.SUB, width), jnp.float32),
                *(_merges(call) if call.delta else ()))
     return _kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
