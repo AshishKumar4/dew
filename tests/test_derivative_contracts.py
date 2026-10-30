@@ -135,7 +135,7 @@ DELTA_RULE_EDGES = {"normal": 1.0, "the largest its chunk holds": 2.0**62, "near
 token recurrence keeps finite, as fla's chunked form's do at the same entries (`precedent_chunked`, on an
 H100: ledger 2470), which that edge compares it with in place of the recurrence."""
 
-PACKED_OVERFLOW_ORDERS = ("primal", "jvp", "vjp", "second jvp", "second jvp, remat")
+PACKED_OVERFLOW_ORDERS = ("primal", "jvp", "vjp", "second jvp", "second jvp, remat", "grad of grad")
 """The orders a packed row of the chunked delta rule holds from 2^62: all but forward over reverse, which the
 owner accepted there (`test_the_chunked_delta_rule_holds_every_order`, ledger 2470)."""
 
@@ -291,9 +291,11 @@ def test_a_wide_cpu_sum_of_products_holds_every_order(monkeypatch, edge):
 def test_a_grouped_gemm_holds_every_order(edge):
     """The GEMM template's grouped product (`template.gemm`, its custom derivative through
     `generation.linear_tangent`): every order runs in the rows and the matrices, the group sizes not
-    differentiable, finite wherever float64 is a normal float32 and wherever XLA's ragged product is, at
-    values whose products near float32's ends."""
+    differentiable, finite wherever float64 is a normal float32 and wherever the plain grouped product is
+    (each row's product with its group's matrix, by a mask: XLA's ragged product takes no reverse over
+    reverse), at values whose products near float32's ends."""
     sizes = jnp.asarray([3, 0, 5], jnp.int32)
+    groups = jnp.repeat(jnp.arange(3), sizes, total_repeat_length=8)
     primals = normal_draw(146, (8, 16), (3, 16, 4), scale=EDGES[edge])
     direction = normal_draw(147, (8, 16), (3, 16, 4), scale=EDGES[edge])
     (cotangent,) = normal_draw(148, (8, 4))
@@ -302,7 +304,7 @@ def test_a_grouped_gemm_holds_every_order(edge):
         return template.gemm(rows, matrices, sizes, out_dtype=rows.dtype)
 
     def plain(rows, matrices):
-        return jax.lax.ragged_dot(rows, matrices, sizes)
+        return jnp.einsum("rg,rk,gkn->rn", jax.nn.one_hot(groups, 3, dtype=rows.dtype), rows, matrices)
 
     assert_contract(grouped, primals, direction, cotangent, f"a grouped GEMM {edge}", plain_fn=plain)
 
