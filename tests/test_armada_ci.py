@@ -1857,6 +1857,40 @@ def test_a_row_run_green_on_these_inputs_is_reused_though_another_commits_run_of
     assert [len((tmp_path / f"runs-{name}").read_text()) for name in "abc"] == [1, 1, 2]
 
 
+def test_a_kept_task_reuses_its_rows_after_another_commit_changes_the_recorded_dependencies(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A plan's kept task reuses the green rows the plan found though another commit's run, of other inputs
+    (a file importing a helper this commit's never did), replaced their files' last records before the task
+    started: the plan hands the task what it found, never a record another run may move (2026-10-30: a
+    verdict's kept task found 23 of its 259 files, ran the rest itself and timed out)."""
+    verdict, planned = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
+    (tmp_path / "tests/later_dependency.py").write_text("VALUE = 1\n")
+    monkeypatch.setenv("PYTEST_ADDOPTS", "-p no:cacheprovider")
+    armada_task(ci, monkeypatch, verdict)
+    common = ci.shared("3.12")
+    at = ci.record_key("3.12", "3.12:tests/test_a.py", "GenuineIntel-6-143", common)
+    before = ci.recorded(at, "token")
+    assert planned() == ["tests/test_a.py tests/test_b.py tests/test_c.py"]
+    entries = [entry for entry in ci.plan(300.0, {}) if entry["python"] == "3.12"]
+    assert len(entries) == 1
+    test_a = tmp_path / "tests/test_a.py"
+    original = test_a.read_text()
+    # Another commit runs between this plan and its task, importing a helper this commit never
+    # imported. It shares the common hash, so its run replaces the slot this plan read.
+    test_a.write_text("import later_dependency\n" + original)
+    armada_task(ci, monkeypatch, verdict)
+    test_a.write_text(original)
+    assert ci.recorded(at, "token")["key"] != before["key"]
+    command = json.loads((ROOT / ".armada.json").read_text())["task"]["command"]
+    values = {**entries[0], "out": verdict}
+    filled = [re.sub(r"\{(\w+)\}", lambda field: str(values[field[1]]), word) for word in command]
+    monkeypatch.setattr(sys, "argv", ["ci.py", *filled[2:]])
+    assert ci.main() == 0
+    rows = json.loads(verdict.read_text())["rows"]
+    assert len(rows) == 3 and all(row["exitCode"] == 0 for row in rows)
+    assert [len((tmp_path / f"runs-{name}").read_text()) for name in "abc"] == [2, 1, 1]
+
+
 def test_a_helper_added_under_tests_reruns_only_the_runs_that_imported_a_module_of_its_name(
         ci, tmp_path, monkeypatch, cache_worker):
     """A helper module added under tests/ reruns no file whose run imported no module of its name, as it
