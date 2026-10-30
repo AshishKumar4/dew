@@ -443,9 +443,10 @@ def test_a_joint_release_fine_tunes_averages_and_reloads_from_its_runs(tmp_path)
     examples = [Example(state, {"team": team, "urgent": urgent}, {"team": label, "urgent": hurry})
                 for state, label, hurry in answered * 2]
     # Training pads every row to the layout's max_len, here past the longest row of these examples (the
-    # release's instructions make the shortest 310 tokens); the release serves up to 16384.
+    # release's instructions make a row of no question 310 tokens, these over 384); the release serves up
+    # to 16384.
     objective = DecisionObjective(Decide.from_pretrained(release, attention_impl="xla"),
-                                  layout=JointLayout(max_len=384))
+                                  layout=JointLayout(max_len=512))
     data = decision_rows(examples, 8, examples, objective=objective.data())
     start = jax.jit(objective.init)(jax.random.key(0))
     runs, states = [], []
