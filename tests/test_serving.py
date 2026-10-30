@@ -743,8 +743,9 @@ def test_a_hybrid_stack_reads_a_shared_prefix_with_the_state_its_prompt_left(req
     next round's repeat of it reads; two repeats seated together each restore their state, past the
     one prompt piece a call admits. Each request draws what it draws alone and scores it as a full
     forward does (check 1)."""
-    # A vocabulary of 64 and eight draws a request, so each request's scores spread enough to measure.
-    model = hybrid_model(vocab_size=64)
+    # A vocabulary of 256 and eight draws a request, so each request's scores spread enough to measure:
+    # at 64, fp32 sums as users' are (ledger 2468) leave the ratio unresolved within 512 seeds.
+    model = hybrid_model(vocab_size=256)
     task = TextGeneration(model, model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)),
                           sampling=Sampling(temperature=0, pad_token_id=0))
     assert_served_as_exact(task, requests, f"hybrid shared prefix {hits}",

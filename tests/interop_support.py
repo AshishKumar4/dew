@@ -82,11 +82,11 @@ def float64_logits(loaded):
     return lambda inputs: {"logits": model.apply(variables, jnp.asarray(inputs["input_ids"]))}
 
 
-def fixture_ids(directory: Path, mask=None):
+def fixture_ids(directory: Path, mask=None, shape=None):
     """Check 1's draw over the tiny checkpoint at `directory`: a seed's ids uniform over its config's
-    vocabulary in the shape of its `input_ids.npy`, 0 where `mask` is false (the pad its recorder wrote
-    into padded rows), the same on every run."""
-    shape = np.load(directory / "input_ids.npy").shape
+    vocabulary in the shape of its `input_ids.npy` (or `shape`), 0 where `mask` is false (the pad its
+    recorder wrote into padded rows), the same on every run."""
+    shape = np.load(directory / "input_ids.npy").shape if shape is None else shape
     vocabulary = json.loads((directory / "config.json").read_text())["vocab_size"]
 
     def draw(seed):
@@ -96,23 +96,26 @@ def fixture_ids(directory: Path, mask=None):
     return draw
 
 
-def transformers_model(directory: Path, *, masked: bool = False):
+def transformers_model(directory: Path, *, masked: bool = False, dtype: str = "float32", **options):
     """transformers' own class for the checkpoint at `directory`, as its config names it, the masked LM
-    where `masked` and else the causal LM, in float32 on eager attention and eager experts, in eval mode:
-    the reference a tiny checkpoint's recorder ran (tools/hf_reference.py), run in the test."""
+    where `masked` and else the causal LM, in `dtype` (float32 unless a narrower run is the reference)
+    on eager attention and eager experts, in eval mode, `options` given to `from_pretrained` too: the
+    reference a tiny checkpoint's recorder ran (tools/hf_reference.py), run in the test."""
     import torch
     import transformers
 
     auto = transformers.AutoModelForMaskedLM if masked else transformers.AutoModelForCausalLM
-    return auto.from_pretrained(directory, dtype=torch.float32, attn_implementation="eager",
-                                experts_implementation="eager").eval()
+    return auto.from_pretrained(directory, dtype=getattr(torch, dtype), attn_implementation="eager",
+                                experts_implementation="eager", **options).eval()
 
 
-def transformers_arms(model, run):
+def transformers_arms(model, run, *, source=None, twin=None):
     """Check 1's reference and truth over the transformers `model`: `run(model, *inputs)` under
-    `torch.no_grad` on a draw's inputs as torch tensors (integers as int64), by `model` and by its float64
-    twin (`tools.torch_precision.float64_twin`) inside `float64`, each run `as_given`, its tensors returned
-    as NumPy arrays."""
+    `torch.no_grad` on a draw's inputs as torch tensors (integers as int64), by `model` and by the float64
+    twin (`tools.torch_precision.float64_twin`) of `source`, by default `model`, inside `float64`, each
+    run `as_given`, its tensors returned as NumPy arrays, a bfloat16 one as the float32 it holds exactly.
+    A narrower `model` (bfloat16) is measured from its stored weights' truth: `source`, the float32
+    load. `twin` is the twin itself where the reference builds its own (a PEFT model's)."""
     import torch
 
     from tools.torch_precision import float64, float64_twin
@@ -125,10 +128,34 @@ def transformers_arms(model, run):
         @as_given
         def given(*inputs):
             with precision(), torch.no_grad():
-                return jax.tree.map(lambda out: out.numpy(), run(network, *map(tensor, inputs)))
+                return jax.tree.map(lambda out: (out.float() if out.dtype == torch.bfloat16 else out).numpy(),
+                                    run(network, *map(tensor, inputs)))
         return given
 
-    return arm(model, contextlib.nullcontext), arm(float64_twin(model), float64)
+    if twin is None:
+        twin = float64_twin(model if source is None else source)
+    return arm(model, contextlib.nullcontext), arm(twin, float64)
+
+
+def peft_twin(model):
+    """A PEFT model's float64 twin (`tools.torch_precision.float64_twin`): the same base and adapter
+    built inside `float64` by transformers' and PEFT's own builders, so every value their constructors
+    compute is float64's (the rotary tables' among them), loaded with `model`'s weights, to run inside
+    `float64` (`transformers_arms`' `twin`)."""
+    import copy
+
+    import torch
+    from peft import get_peft_model
+    from transformers import AutoModelForCausalLM
+
+    from tools.torch_precision import float64_twin
+
+    def build():
+        config = copy.deepcopy(model.get_base_model().config)
+        base = AutoModelForCausalLM.from_config(config, dtype=torch.float64)
+        return get_peft_model(base, copy.deepcopy(model.peft_config["default"]))
+
+    return float64_twin(model, build)
 
 
 def next_token_losses(model, ids):
@@ -518,3 +545,14 @@ def token_draw(salt: int, vocab: int, shape: tuple[int, ...]):
     def draw(seed):
         return (np.random.default_rng([salt, seed]).integers(0, vocab, shape).astype(np.int32),)
     return draw
+
+
+def reference_read(case, directory, *, wide: bool):
+    """transformers' read of an export (`decoder_export_reference.reference_forward`) in fp32 or, `wide`, in
+    float64, run as given on a draw's ids."""
+    from reference_error import as_given
+
+    from tools.decoder_export_reference import reference_forward
+
+    forward = reference_forward(case, directory, wide=wide)
+    return as_given(lambda ids: forward(np.asarray(ids)))

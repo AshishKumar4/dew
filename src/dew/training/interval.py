@@ -225,6 +225,11 @@ class Interval:
                    resumable=last_saved, consumed=consumed, consumed_before=consumed,
                    consumed_committed=committed)
 
+    def consumption(self, examples: int | None) -> dict[str, float]:
+        """The examples a run on the examples clock (bounded to `examples`) has consumed, as its log
+        reports them beside its committed tokens (`train/examples_consumed`); none for another run."""
+        return {} if examples is None else {"train/examples_consumed": float(self.consumed)}
+
     @property
     def token_control(self) -> dict[str, int]:
         """The clocks a checkpoint keeps (`Checkpoints.control`): the committed updates' real tokens, and

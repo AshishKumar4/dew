@@ -39,7 +39,7 @@ from dew.distributed.batches import (
 )
 from dew.distributed.placement import MeshSpec
 from dew.objectives.base import Effects, Loss, Metric, Objective, Shown, Step, TrainingScalar
-from dew.training.cadence import Examples, Tokens
+from dew.training.cadence import Counted
 from dew.training.tracker import write_artifact
 
 
@@ -54,7 +54,7 @@ class EvalSuite:
 
     data: Reader
     metrics: Sequence[Metric] = ()
-    every: int | str | Tokens | Examples | None = None
+    every: int | str | Counted | None = None
 
 
 @dataclass(frozen=True)

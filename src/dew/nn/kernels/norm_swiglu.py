@@ -84,6 +84,7 @@ from ..precision import (
     at_least_fp32,
     compensated_add,
     compensated_total,
+    rms_statistics,
     rms_weighted,
     rounded_to,
     two_product,
@@ -94,7 +95,7 @@ from .generation import INHERENT, device_generation
 from .selection import Kernel, Op, Requirement, select
 
 IMPLEMENTATIONS = ('auto', 'xla', 'pallas')
-DTYPES = (jnp.dtype(jnp.float32), jnp.dtype(jnp.bfloat16))
+DTYPES = (jnp.dtype(jnp.float32), jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16))
 ROW_ELEMENTS = 2048
 """The heuristic forward's and reverse's register tile, in elements a program holds of a step's rows."""
 ROW_BLOCKS = 12
@@ -228,10 +229,6 @@ def _selected[C](op: Op[C], case: C, implementation: str) -> str:
     return select(op, case, None if implementation == 'auto' else implementation, insist=False).kernel
 
 
-QUALIFY_FP16 = 'ledger 823'
-"""The row that tracks qualifying the fused norm and SwiGLU kernels on fp16 operands."""
-
-
 def _within_fp32(dtype) -> bool:
     """Whether a dtype's accuracy is no finer than fp32's, which the kernels compute in; a dtype that
     is no float falls to the `dtype` requirement."""
@@ -247,16 +244,14 @@ class _Typed(Protocol):
 
 def _dtype_requirements[C: _Typed](name: str, case_type: type[C]) -> tuple[Requirement[C], ...]:
     """What the norm and SwiGLU kernels need of every dtype a call of `case_type` reads and writes (its
-    `dtypes`): none wider than fp32, whose accuracy the kernels compute at; none fp16, which they are
-    not yet qualified on (ledger 823); and none but fp32, bf16 and fp16, the floats they compute."""
+    `dtypes`): none wider than fp32, whose accuracy the kernels compute at, and none but fp32, bf16 and
+    fp16, the floats they compute (widening each load to fp32 and rounding each store)."""
     return (
         Requirement[C]('precision', lambda case: all(_within_fp32(dtype) for dtype in case.dtypes),
                     lambda case: f"{name} reads or writes {', '.join(map(str, case.dtypes))}; the kernel "
                                  "computes in fp32, which a wider dtype's accuracy needs more than",
                     row=INHERENT),
-        Requirement[C]('fp16', lambda case: jnp.float16 not in case.dtypes,
-                    f"{name}'s kernel is not yet qualified on float16 operands", row=QUALIFY_FP16),
-        Requirement[C]('dtype', lambda case: all(dtype in (*DTYPES, jnp.float16) for dtype in case.dtypes),
+        Requirement[C]('dtype', lambda case: all(dtype in DTYPES for dtype in case.dtypes),
                     lambda case: f"{name} reads or writes {', '.join(map(str, case.dtypes))}; the kernel "
                                  "computes float32, bfloat16 and float16 alone", row=INHERENT),
     )
@@ -372,13 +367,21 @@ FUSED_FASTER = ("this module's table (469e47b1f): Qwen3.5-0.8B's 4 x 3072 rows o
                 "and an H100 SXM")
 """The receipt behind the fused norm's and SiLU product's declared cells (`NORM`, `SWIGLU`)."""
 
+FP16_NORM_FASTER = ("FSNORM16 (base/kernels 3b6c752c8, CUPTI, arms rotated): Qwen3.5-0.8B's 4 x 3072 rows "
+                    "of 1024 in fp16, the fused norm's forward and reverse against XLA's on an H100 SXM "
+                    "(17.7 and 58.3 us against 33.0 and 105.3) and an A100-SXM4-40GB (40.0 and 133.7 against "
+                    "74.5 and 227.8)")
+"""The receipt behind the fused norm's fp16 cells."""
+
 NORM: Op[NormCase] = Op('rms_norm', (Kernel('pallas', NORM_SUPPORTS), Kernel('xla', (), generic=True)),
                         lambda case: 'xla',
-                        declared={(device, 'bfloat16'): ('pallas', FUSED_FASTER)
-                                  for device in ('sm80', 'sm90')})
+                        declared={**{(device, 'bfloat16'): ('pallas', FUSED_FASTER)
+                                     for device in ('sm80', 'sm90')},
+                                  **{(device, 'float16'): ('pallas', FP16_NORM_FASTER)
+                                     for device in ('sm80', 'sm90')}})
 """The norm selector: XLA's arithmetic, but the fused kernel where it measured faster (bf16 rows on an
 A100 and an H100: the seam 76/187 against 103/200 us and 36/81 against 44/89, the gated norm's 118;224
-against 123;343 and 52;101 against 59;149) and its requirements hold."""
+against 123;343 and 52;101 against 59;149; fp16 rows, `FP16_NORM_FASTER`) and its requirements hold."""
 
 
 def rms_kernel(implementation: str, x, scale, dtype, fp32_statistics: bool, *,
@@ -489,16 +492,16 @@ def _rms_forward(x_ref, branch_ref, scale_ref, gate_ref, y_ref, stream_ref, mean
         branch = plgpu.load(branch_ref.at[at], mask=mask, other=0)
         x = _round(x + branch.astype(jnp.float32), stream_ref.dtype, interpret)
         plgpu.store(stream_ref.at[at], x.astype(stream_ref.dtype), mask=mask)
-    # XLA's mean multiplies by the fp32 reciprocal, not an fp32 division.
-    mean_square = jnp.sum(x * x, axis=1) * (1.0 / width) + epsilon
-    inverse = jax.lax.rsqrt(mean_square)
+    mean, inverse = rms_statistics(x, epsilon, axis=1, keepdims=False, count=width)
+    mean_square = mean + epsilon
     weight = (None if scale_ref is None
               else _weight(scale_ref, columns, width, offset, stored, interpret)[None, :])
     gate = None if gate_ref is None else plgpu.load(gate_ref.at[at], mask=mask, other=0).astype(jnp.float32)
     # The gate multiplies the weighted norm in fp32, before the one cast.
     y = rms_weighted(x, _rounded_inverse(inverse, inverse_rounded, y_ref.dtype, interpret)[:, None],
                      weight=weight, gate=gate, activation=activation,
-                     rounded=functools.partial(_round, dtype=y_ref.dtype, interpret=interpret) if after_cast
+                     rounded=functools.partial(_round, dtype=y_ref.dtype, interpret=interpret)
+                     if after_cast and weight is not None
                      else None)
     plgpu.store(y_ref.at[at], y.astype(y_ref.dtype), mask=mask)
     plgpu.store(mean_square_ref.at[row], mean_square, mask=row < rows)

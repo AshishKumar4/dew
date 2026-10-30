@@ -50,6 +50,7 @@ from dew.nn import categorical
 from dew.nn.inspection import INSPECTED, Watched, watching
 from dew.nn.kernels.options import Held, Option, compiler_options
 from dew.nn.precision import accumulated, at_least_fp32, compensated_sum, weighted_total
+from dew.nn.progress import Progress, stepping
 from dew.nn.protocols import HiddenStates, ProjectsParameters
 from dew.nn.sharding import rows_taken
 
@@ -509,13 +510,14 @@ class TrainingScalars[Statistics, Additions]:
 class Prediction:
     """What a token objective scored a batch with, for comparison with a teacher.
 
-    - `logits`: the `[B, S, vocab]` fp32 scores from the model's forward pass.
+    - `logits`: the `[B, S, vocab]` fp32 scores from the model's forward pass, None where the caller
+      asked for none (`predict`'s `logits`): its loss scored them a tile at a time and held none.
     - `losses`: the `[B, S]` per-position loss the objective sums.
     - `weights`: the `[B, S]` weight the objective gives each position.
     - `hidden`: the `[B, S, D]` states of the layers the caller asked for,
       in the order asked.
     """
-    logits: jax.Array
+    logits: jax.Array | None
     losses: jax.Array
     weights: jax.Array
     hidden: tuple[jax.Array, ...]
@@ -1169,7 +1171,8 @@ class Objective(ABC, Generic[Loss, Effects]):
         witness = Witness() if step.record and not validation else None
         step = step if witness is None else replace(step, witness=witness)
         watched = step.watched if not validation else None
-        with watching(watched.kinds, histogram=watched.histogram) if watched else contextlib.nullcontext():
+        with stepping(Progress(step.committed)), (watching(watched.kinds, histogram=watched.histogram)
+                                                  if watched else contextlib.nullcontext()):
             loss = (self.validation_loss if validation else self.loss)(variables, batch, step)
         if _has_aux(loss):
             stats, aux = loss
@@ -1324,11 +1327,11 @@ class Objective(ABC, Generic[Loss, Effects]):
         raise TypeError("deferred effects require Objective.apply_effects")
 
     def predict(self, params: Variables, batch: Batch, step: Step, *, train: bool,
-                layers: Sequence[int] = ()) -> tuple[Ratio, Aux[Effects], Prediction]:
+                layers: Sequence[int] = (), logits: bool = True) -> tuple[Ratio, Aux[Effects], Prediction]:
         """Return the loss over `batch` as `loss` computes it, together with the prediction behind it.
 
         The result holds the statistics, the `Aux` reports and a `Prediction`
-        with the token logits, the weight of every position and the hidden
+        with the token logits (none unless `logits`), the weight of every position and the hidden
         states of `layers`. The statistics are one `Ratio` over the positions
         the weights count, so a distillation can mix in terms over the same
         mass. `train` turns dropout on, as `loss` has it; a frozen teacher
@@ -1374,7 +1377,15 @@ class Objective(ABC, Generic[Loss, Effects]):
         """
         weights = self.evaluation_variables(variables, step)
         if loss and evaluate and self._validation_scores is not None:
-            report = self.program('report', self._validation_scores)
+            scores = self._validation_scores
+
+            def progressed(weights: Variables, batch: Batch, step: Step):
+                # The loss reads the run's progress as `_loss`'s does, so a metric scored beside it
+                # leaves it as it is.
+                with stepping(Progress(step.committed)):
+                    return scores(weights, batch, step)
+
+            report = self.program('report', progressed)
             return report(weights, batch, replace(step, training=False))
         statistics = self._validation_loss(weights, batch, step) if loss else None
         return statistics, self.evaluate(variables, batch, step) if evaluate else None
@@ -1414,6 +1425,12 @@ class Objective(ABC, Generic[Loss, Effects]):
         nests the model beside other networks or frozen ones.
         """
         return self.model_tree(variables)
+
+    def bind_widths(self, widths: Mapping[str, object]) -> None:
+        """Take the run's static widths, the facts its data's run-scoped steps bound (`Loader.widths`,
+        such as a decision's `slots`), before the run records its task (`task_settings`). An objective
+        whose task pads to none keeps none."""
+        del widths
 
     def task_settings(self) -> DataclassInstance | None:
         """Return the task settings a saved step records beside its model, an

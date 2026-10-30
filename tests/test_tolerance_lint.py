@@ -3,16 +3,9 @@ the inventory of files that still compare floats within a tolerance only shrinks
 
 import json
 import subprocess
-import textwrap
 
 import pytest
-from tool_support import load
-
-
-@pytest.fixture(scope="module")
-def lint():
-    return load("lint_slop")
-
+from tool_support import lint_module
 
 COMPARISONS = {
     "numpy's tolerance": ("import numpy as np\nnp.testing.assert_allclose(a, b, rtol=1e-5)", 1),
@@ -173,18 +166,23 @@ COMPARISONS = {
     "a method that happens to be named within or approx": ("assert method.within(family)\n"
                                                            "assert rows.approx(3)", 0),
     "an ordering of two values, no error taken": ("assert loss < first_loss", 0),
+    # The gate's one-draw rules, each call a comparison until it judges through check 1 (row 2089).
+    "the one-draw rule": ("from reference_error import assert_as_exact_as_the_reference\n"
+                          "assert_as_exact_as_the_reference(mine, theirs, truth, 'a site')", 1),
+    "the one-draw rule over leaves": (
+        "import reference_error\n"
+        "reference_error.assert_leaves_as_exact(mine, theirs, truth)\n"
+        "reference_error.assert_no_less_exact(mine, theirs, truth, 'a site')", 2),
+    "check 1 over drawn seeds": ("from reference_error import assert_as_exact\n"
+                                 "assert_as_exact(dew, reference, draw, 'a site', seeds=8)", 0),
 }
 
 
 def _module(lint, tmp_path, relative, body, inventory=None):
-    path = tmp_path / relative
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(textwrap.dedent(body))
     if inventory is not None:
         (tmp_path / "tools").mkdir(exist_ok=True)
         (tmp_path / lint.INVENTORY).write_text(json.dumps(inventory))
-    [module] = list(lint.collect([relative], tmp_path, "dew"))
-    return module
+    return lint_module(lint, tmp_path, tuple(relative.split("/")), body)
 
 
 @pytest.mark.parametrize("case", list(COMPARISONS))

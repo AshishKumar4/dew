@@ -52,6 +52,11 @@ Scope is per rule, because the rules are not all about the same thing:
   construction, which keeps what its constructor computed in float32; its
   twin is built inside tools/torch_precision.py's `float64`
   (`lint_promotions`).
+- SLOP024 is about `src/<package>`: a JAX array is never divided by a literal
+  that is no power of two, which XLA computes as a product with the literal's
+  rounded reciprocal, not correctly rounded (rows 1402, 1403); `precision.
+  divided` divides as IEEE does. It reports only an operand it proves is an
+  array (`_array`), so a Python number or a name it cannot prove passes.
 
 Every rule fails the gate, and none has a per-finding suppression.
 
@@ -88,6 +93,7 @@ import functools
 import hashlib
 import io
 import json
+import math
 import re
 import subprocess
 import sys
@@ -663,6 +669,73 @@ def jax_private(module: Module) -> Iterator[Finding]:
         if isinstance(node, ast.Attribute) and node.attr in JAX_PRIVATE:
             yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP021",
                           f"reads JAX's private {node.attr}; {JAX_PRIVATE[node.attr]}")
+
+
+ARRAY_MODULES = ("jax.numpy", "jax.lax", "jax.nn", "jax.random", "jax.scipy")
+"""The modules whose functions return JAX arrays (but `ARRAY_FACTS`), which SLOP024 proves an operand by."""
+ARRAY_FACTS = {"dtype", "finfo", "iinfo", "issubdtype", "result_type", "promote_types", "can_cast", "shape",
+               "ndim", "size", "isdtype"}
+"""The functions of `ARRAY_MODULES` that return no array: a dtype, its facts, a shape or a count."""
+ARRAY_TYPES = {"jax.Array", "jax.numpy.ndarray"}
+"""The annotations that make a parameter an array."""
+
+
+def _array(node: ast.expr, table: Mapping[str, str], arrays: set[str]) -> bool:
+    """Whether SLOP024 proves `node` a JAX array, its names read as the imports `table` gives them
+    (`lint_scopes.scoped`): a call of a function of `ARRAY_MODULES` but its facts, a method or subscript of an
+    array, arithmetic with one, or a name in `arrays` (a parameter annotated as one)."""
+    if isinstance(node, ast.Call):
+        called = scopes.resolved(node.func, table)
+        module, _, function = called.rpartition(".")
+        if module in ARRAY_MODULES or any(module.startswith(f"{each}.") for each in ARRAY_MODULES):
+            return function not in ARRAY_FACTS
+        return (isinstance(node.func, ast.Attribute) and node.func.attr not in ("item", "tolist")
+                and _array(node.func.value, table, arrays))
+    if isinstance(node, ast.Subscript):
+        return _array(node.value, table, arrays)
+    if isinstance(node, ast.BinOp):
+        return _array(node.left, table, arrays) or _array(node.right, table, arrays)
+    if isinstance(node, ast.UnaryOp):
+        return _array(node.operand, table, arrays)
+    return isinstance(node, ast.Name) and node.id in arrays
+
+
+def _rounded_divisor(node: ast.expr) -> float | None:
+    """The literal `node` is, where it is a number no power of two divides exactly by (its reciprocal is
+    no float), else None."""
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+        value = _rounded_divisor(node.operand)
+        return None if value is None else -value
+    if (isinstance(node, ast.Constant) and isinstance(node.value, (int, float))
+            and not isinstance(node.value, bool) and node.value and math.frexp(node.value)[0] != 0.5):
+        return node.value
+    return None
+
+
+def divisions(module: Module) -> Iterator[Finding]:
+    """SLOP024: a JAX array (`_array`) divided by a literal no power of two (`_rounded_divisor`), each name
+    read in its own scope (`lint_scopes.scoped`), a parameter annotated as an array read as one within its
+    function."""
+    scoped = list(scopes.scoped(module.tree.body, {}, _parent(module)))
+    tables = {id(node): table for node, table in scoped}
+    arrays: dict[int, set[str]] = {}
+    for function in ast.walk(module.tree):
+        if isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            annotated = {name for name, annotation in scopes.annotations(function)
+                         if scopes.resolved(annotation, tables.get(id(function), {})) in ARRAY_TYPES}
+            arrays.update({id(node): annotated for node in scopes.own(function)})
+    for node, table in scoped:
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
+            numerator, divisor = node.left, node.right
+        elif isinstance(node, ast.AugAssign) and isinstance(node.op, ast.Div):
+            numerator, divisor = node.target, node.value
+        else:
+            continue
+        value = _rounded_divisor(divisor)
+        if value is not None and _array(numerator, table, arrays.get(id(node), set())):
+            yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP024",
+                          f"divides a JAX array by {value!r}, which XLA computes as a product with its "
+                          "rounded reciprocal, not correctly rounded; divide with precision.divided")
 
 
 def size(module: Module) -> Iterator[Finding]:
@@ -1829,7 +1902,8 @@ GATE = frozenset({"tests/reference_error.py", "tests/op_certificates.py", "tests
                   "tests/test_reference_orders.py", "tests/test_reference_graph.py",
                   "tests/test_gate_calibration.py", "tests/test_float64_terms.py",
                   "tests/sampling_gate.py", "tests/test_sampling_gate.py",
-                  "tests/learning_gate.py", "tests/test_learning_gate.py"})
+                  "tests/learning_gate.py", "tests/test_learning_gate.py", "tests/one_draw.py",
+                  "tests/float64_terms.py"})
 """The gate's modules and the tests of the gate itself, the one place a float is compared within a
 bound: every other comparison goes through its assertion; the sampling gate (tests/sampling_gate.py)
 compares a statistic's rarity with its level, and the learning gate (tests/learning_gate.py) a claim's t
@@ -2111,7 +2185,7 @@ def check(module: Module, models: ModelIndex | None = None) -> Iterator[Finding]
     `models`, the package's index, or this file's own without one."""
     rules = (*CONTRACT_RULES, *UNIVERSAL_RULES) if module.is_source else UNIVERSAL_RULES
     rules = (*rules, mocks, wording, skips) if module.relative.startswith("tests/") else (*rules, patches)
-    rules = (*rules, tolerances) if module.is_source else (*rules, tolerances, promotions)
+    rules = (*rules, tolerances, divisions) if module.is_source else (*rules, tolerances, promotions)
     findings = [finding for rule in rules for finding in rule(module)]
     if module.is_source:
         findings += boundaries(module, models or ModelIndex.build([module]))

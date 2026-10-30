@@ -337,21 +337,20 @@ def tiny_phi3() -> Phi3ForCausalLM:
 
 
 def write_classic_tiny(name: str, model: PreTrainedModel) -> None:
-    """Same-weight fp32/float64 logits, the left-padding mask the tests pad drawn ids under, and the
-    greedy continuation; the tests run transformers over drawn ids themselves (check 1).
+    """Same-weight fp32 logits, the left-padding mask the tests pad drawn ids under, and the greedy
+    continuation; the tests run transformers over drawn ids themselves (check 1), its float64 twin
+    their truth.
 
     Phi-3's crossing oracle is its uncached full-prefix forward. Its pinned
     generate drops the prefix at that crossing (transformers issue #49334),
     so that output is recorded separately from the intended continuation.
     """
-    from torch_precision import float64, float64_twin
+    from reference_source import padded_probe
 
     write_tiny(name, model)
     directory = FIXTURES / name
     ids = np.load(directory / 'input_ids.npy')
-    mask = np.ones_like(ids, bool)
-    mask[1, :3] = False
-    np.save(directory / 'attention_mask.npy', mask)
+    np.save(directory / 'attention_mask.npy', padded_probe(ids)[0])
     model.eval()
     with torch.no_grad():
         generated = model.generate(torch.from_numpy(ids[:, :4]).long(), do_sample=False,
@@ -363,13 +362,6 @@ def write_classic_tiny(name: str, model: PreTrainedModel) -> None:
                 score = model(torch.from_numpy(generated).long(), use_cache=False).logits[:, -1].numpy()
                 generated = np.concatenate((generated, score.argmax(-1)[:, None]), axis=1)
     np.save(directory / 'generated.npy', generated)
-    # Its float64 twin (`float64_twin`): frequency and sinusoidal buffers built in float64 rather than
-    # widened from a rounded fp32 table, the checkpoint's values loaded into it.
-    truth_model = float64_twin(model, lambda: AutoModelForCausalLM.from_config(
-        model.config, dtype=torch.float64, attn_implementation='eager'))
-    with float64(), torch.no_grad():
-        truth = truth_model(torch.from_numpy(ids).long(), use_cache=False).logits.double().numpy()
-    np.save(directory / 'logits_f64.npy', truth)
 
 
 MINIMAX_M2_CONFIGS = (
@@ -492,7 +484,7 @@ def write_qwen2_moe() -> None:
         max_position_embeddings=64, rope_theta=1000000.0, tie_word_embeddings=False))
     model.set_experts_implementation('eager')
     write_tiny('qwen2-moe-tiny', model, padded=True)
-    directory = write_float64_logits('qwen2-moe-tiny', model)
+    directory = FIXTURES / 'qwen2-moe-tiny'
     (directory / 'model.safetensors').chmod(0o644)
     write_released_config('qwen1.5-moe-a2.7b', 'Qwen/Qwen1.5-MoE-A2.7B',
                           '1a758c50ecb6350748b9ce0a99d2352fd9fc11c9')
@@ -512,7 +504,7 @@ def write_granitemoe() -> None:
         attention_multiplier=0.015625, tie_word_embeddings=True, bos_token_id=0, eos_token_id=0))
     model.set_experts_implementation('eager')
     write_tiny('granitemoe-tiny', model, padded=True)
-    directory = write_float64_logits('granitemoe-tiny', model)
+    directory = FIXTURES / 'granitemoe-tiny'
     weights = {}
     for name, value in model.float().state_dict().items():
         name = name.replace('.block_sparse_moe.experts.gate_up_proj', '.block_sparse_moe.input_linear.weight')
@@ -535,8 +527,7 @@ MODERNBERT_CONFIGS = (
 
 
 def write_modernbert_tiny(name: str = 'modernbert-tiny') -> None:
-    """ModernBertForMaskedLM's logits, fp32 and float64, and ModernBertModel's states in bf16 and
-    float64, which the GPU's bf16 kernels are held to.
+    """ModernBertModel's states in bf16 and float64, which the GPU's bf16 kernels are held to.
 
     Four layers give the global, local, local, global pattern, and a local
     span of 6 (three keys either side) is shorter than the 12-token probe, so
@@ -555,7 +546,7 @@ def write_modernbert_tiny(name: str = 'modernbert-tiny') -> None:
         global_rope_theta=160000.0, local_rope_theta=10000.0, norm_eps=3e-5,
         max_position_embeddings=64, pad_token_id=0, bos_token_id=1, eos_token_id=2,
         cls_token_id=1, sep_token_id=2))
-    write_tiny(name, model)
+    write_tiny(name, model, logits=False)
     directory = FIXTURES / name
     ids = np.load(directory / 'input_ids.npy')
     mask = np.ones_like(ids, bool)
@@ -570,14 +561,12 @@ def write_modernbert_tiny(name: str = 'modernbert-tiny') -> None:
     import copy
 
     with torch.no_grad():
-        np.save(directory / 'logits.npy', model(tokens).logits.numpy())
         narrow = copy.deepcopy(model).to(torch.bfloat16)
         np.save(directory / 'hidden_bf16.npy', narrow.model(tokens).last_hidden_state.float().numpy())
     # Its float64 twin (`float64_twin`), whose inverse frequencies are built in float64.
     wide = float64_twin(model)
     with float64(), torch.no_grad():
         np.save(directory / 'hidden_f64.npy', wide.model(tokens).last_hidden_state.double().numpy())
-        np.save(directory / 'logits_f64.npy', wide(tokens).logits.double().numpy())
 
 
 def tiny_qwen3() -> Qwen3ForCausalLM:
@@ -620,7 +609,7 @@ def write_nemotron_h(*, moe: bool = False, latent: bool = False) -> None:
         config._experts_implementation = "eager"
     model = NemotronHForCausalLM(config)
     write_tiny(name, model, seed=2024)
-    directory = write_float64_logits(name, model)
+    directory = FIXTURES / name
     write_provenance(directory, seed=2024)
     (directory / "model.safetensors").chmod(0o644)
 
@@ -1497,21 +1486,8 @@ def write_diffusion_window_tiny() -> None:
         np.save(directory / "logits_f64.npy", logits(twin).double().numpy())
 
 
-def write_float64_logits(name: str, model: PreTrainedModel) -> Path:
-    """The fixture `name`'s float64 logits, `logits_f64.npy`: `model`'s float64 truth (`float64_twin`) on
-    the fixture's ids, run inside `torch_precision.float64`. Returns the fixture's directory."""
-    from torch_precision import float64, float64_twin
-
-    directory = FIXTURES / name
-    ids = torch.from_numpy(np.load(directory / 'input_ids.npy')).long()
-    with float64(), torch.no_grad():
-        truth = float64_twin(model)(input_ids=ids, use_cache=False).logits.numpy()
-    np.save(directory / 'logits_f64.npy', truth)
-    return directory
-
-
 def write_tiny(name: str, model: PreTrainedModel, seed: int = 1234, *, padded: bool = False,
-               device: str = "cpu") -> None:
+               device: str = "cpu", logits: bool = True) -> None:
     directory = FIXTURES / name
     directory.mkdir(parents=True, exist_ok=True)
     scatter_weights(model, seed)
@@ -1520,23 +1496,14 @@ def write_tiny(name: str, model: PreTrainedModel, seed: int = 1234, *, padded: b
 
     ids = probe_ids(model.config.vocab_size)
     np.save(directory / "input_ids.npy", ids)
-    np.save(directory / "logits.npy", reference_logits(model, ids))
+    if logits:
+        np.save(directory / "logits.npy", reference_logits(model, ids))
     if padded:
-        from torch_precision import float64, float64_twin
-
-        tokens = torch.from_numpy(ids.astype(np.int64))
-        valid = torch.ones_like(tokens)
-        tokens[1, :4] = 0
-        valid[1, :4] = 0
-        positions = (valid.cumsum(-1) - 1).clamp(min=0)
-        inputs = {'input_ids': tokens, 'attention_mask': valid, 'position_ids': positions, 'use_cache': False}
-        with torch.no_grad():
-            reference = model(**inputs).logits.numpy()
-        with float64(), torch.no_grad():
-            truth = float64_twin(model)(**inputs).logits.numpy()
-        np.savez(directory / 'padded.npz', input_ids=tokens.numpy().astype(np.int32),
-                 attention_mask=valid.numpy().astype(bool), position_ids=positions.numpy().astype(np.int32),
-                 logits=reference, logits_f64=truth)
+        # The left-padding the routed decoders' tests pad drawn ids under: their mask and positions.
+        valid = np.ones(ids.shape, bool)
+        valid[1, :4] = False
+        np.savez(directory / 'padded.npz', attention_mask=valid,
+                 position_ids=np.maximum(np.cumsum(valid, -1) - 1, 0).astype(np.int32))
     size = sum(path.stat().st_size for path in directory.iterdir())
     print(f"{directory}: {size / 1e3:.0f} kB, {sorted(p.name for p in directory.iterdir())}")
 
@@ -1761,6 +1728,7 @@ def main() -> None:
     write_tiny("llama-tiny", tiny_llama())
     write_tiny("llama31-tiny", tiny_llama31())
     write_released_config("llama-3.1-8b", "unsloth/Llama-3.1-8B")
+    write_released_config("minicpm5-2b", "openbmb/MiniCPM5-2B", "f97400052a43d642bbc6e9975e2397e3ae6a6b52")
     write_tiny("mistral-tiny", tiny_mistral())
     write_tiny("mixtral-tiny", tiny_mixtral())
     write_tiny("qwen2-tiny", tiny_qwen2())
@@ -1790,6 +1758,9 @@ def main() -> None:
     write_released_config("diffusiongemma-26b", "google/diffusiongemma-26B-A4B-it")
     write_released_config("llada-8b", "GSAI-ML/LLaDA-8B-Base")
     write_released_config("dream-7b", "Dream-org/Dream-v0-Base-7B")
+    # Its configuration_dream.py and modeling_dream.py are Dream-v0's at 6572adb5 byte for byte.
+    write_released_config("diffucoder-7b", "apple/DiffuCoder-7B-Base",
+                          "a2c33054cbe99b9ab7af074f09b1d13943157ff1")
 
     real = FIXTURES / "qwen3-0.6b"
     real.mkdir(parents=True, exist_ok=True)

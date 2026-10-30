@@ -85,6 +85,37 @@ def kernel_conv(x, weights, activation, shift, *, valid, segments, parts, dtype)
                            interpret=jax.default_backend() != "gpu")
 
 
+@pytest.mark.parametrize("staged", ["jit", "remat"])
+def test_the_kernels_take_forward_mode_however_a_caller_stages_them(staged):
+    """`jax.jvp` of the conv on the kernels (interpreted off a GPU), a normalised piece among its pieces,
+    staged by a jit or by a remat as a layer's `nn.remat` stages it: its tangent XLA's conv's
+    (`short_conv.conv`'s `generation.linear_tangent`), on par with XLA's from float64. Its selector once
+    routed by whether it saw a JVP tracer, which a remat hides, and there the kernels' custom VJP raised
+    (row 2395)."""
+    parts = ((64, 32), (64, None))
+    x, weights, shift, _ = operands(1, 40, parts, dtype=jnp.float32, bias=True)
+    tangents = tuple(jnp.asarray(np.random.default_rng(3 + index).normal(size=t.shape), t.dtype)
+                     for index, t in enumerate((x, weights, shift)))
+
+    def kernels(x, weights, shift):
+        return kernel_conv(x, weights, activation=True, shift=shift, valid=None, segments=None, parts=parts,
+                           dtype=x.dtype)
+
+    def xla(x, weights, shift):
+        return xla_conv1d(x, weights, activation=True, bias=shift, parts=parts, dtype=x.dtype)
+
+    def tangent(pieces, *primals_and_tangents):
+        rule = jax.jit(pieces) if staged == "jit" else jax.checkpoint(pieces)
+        return jax.jvp(rule, primals_and_tangents[:3], primals_and_tangents[3:])[1]
+
+    mine = tangent(kernels, x, weights, shift, *tangents)
+    theirs = tangent(xla, x, weights, shift, *tangents)
+    with jax.enable_x64(new_val=True):
+        exact = tangent(xla, *widened((x, weights, shift, *tangents)))
+    for index, (found, reference, value) in enumerate(zip(mine, theirs, exact, strict=True)):
+        assert_as_exact_as_the_reference(found, reference, value, f"{staged} piece {index}")
+
+
 def truth(x, weights, shift, valid, parts, grads, activation=True, segments=None):
     """The float64 conv and its gradients, the same cotangents widened."""
     with jax.enable_x64(new_val=True):
@@ -212,37 +243,46 @@ def test_a_conv_the_kernels_do_not_take_runs(dtype, out, parts, taps):
                         seeds=REFUSED_SEEDS, truth_fn=loss(xla_conv1d, out=jnp.float64))
 
 
+TRAINING_SEEDS = {(model, dtype, packed): 8 for model in CONV_SHAPES for dtype in ("bfloat16", "float32")
+                  for packed in (False, True)}
+"""The training shapes' declared draws against XLA's conv (check 1), by model, dtype and packing: sized by
+`seeds_for` paired with the kernels on a GPU."""
+
+
 @pytest.mark.gpu(reason="the training shapes' float64 distances are a GPU's")
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
 @pytest.mark.parametrize("model", sorted(CONV_SHAPES))
 def test_the_kernels_are_as_exact_as_xla_at_the_training_shapes(model, dtype, packed):
     """A delta net's conv at its training width and length, bf16 projections into the bf16 operands
-    fla's rule takes, and fp32 into fp32, whole rows and packed ones: each piece and gradient as exact as
-    XLA's own conv (`assert_as_exact_as_the_reference`), at each launch's config at that model's shapes.
-    Two rows: a row's tokens are the distances' terms, and the 0.8b's eight held 28 GiB of an H100 at
-    the float64 truth, two 7."""
+    fla's rule takes, and fp32 into fp32, whole rows and packed ones: each piece and the gradients of the
+    projection and the taps on par (check 1) with XLA's own conv from float64, at each launch's config at
+    that model's shapes, over drawn rows, taps and cotangents. Two rows: a row's tokens are the distances'
+    terms, and the 0.8b's eight held 28 GiB of an H100 at the float64 truth, two 7."""
     (_, length), parts = CONV_SHAPES[model]
-    x, weights, _, _ = operands(2, length, parts, dtype=dtype)
     segments = documents(2, length) if packed else None
-    grads = cotangents(x, parts, dtype)
 
-    def kernels(x, weights):
-        return run(kernel_conv, x, weights, None, None, parts, dtype, grads, segments=segments)
+    def draw(seed):
+        x, weights, _, _ = operands(2, length, parts, dtype=dtype, seed=[1724, seed])
+        return x, weights, cotangents(x, parts, dtype, seed=[1725, seed])
 
-    # The reference's and the truth's leaves on the host as each is computed, and the truth a row at a time
-    # (`row_truth`): the 9b's packed rows peaked at 9.2 GiB of an A100, past a packed job's 8.9 GiB share
-    # where main's GPU tier ran them (row 1724, SE-conv1724-a100-fd8508b5a), 8.85 with the arrays on the
-    # host alone (SE-conv1724-a100-9419b90c1).
-    want, want_grads = jax.device_get(run(xla_conv1d, x, weights, None, None, parts, dtype, grads,
-                                          segments=segments))
-    exact, exact_grads = row_truth(x, weights, parts, grads, segments)
-    got, got_grads = kernels(x, weights)
-    labels = ("q", "k", "v", "dx", "dtaps")
-    # The gradients of the projection and the taps; there is no bias.
-    for label, mine, theirs, value in zip(labels, (*got, *got_grads[:2]), (*want, *want_grads[:2]),
-                                          (*exact, *exact_grads[:2]), strict=True):
-        assert_as_exact_as_the_reference(mine, theirs, value, f"{model} {label}")
+    def conv(fn):
+        def pieces_and_gradients(x, weights, grads):
+            # The gradients of the projection and the taps; there is no bias.
+            out, found = run(fn, x, weights, None, None, parts, dtype, grads, segments=segments)
+            return out, found[:2]
+        return pieces_and_gradients
+
+    def exact(x, weights, grads):
+        # A row at a time on the host (`row_truth`): the 9b's packed rows peaked at 9.2 GiB of an A100, past
+        # a packed job's 8.9 GiB share where main's GPU tier ran them (row 1724,
+        # SE-conv1724-a100-fd8508b5a), 8.85 with the arrays on the host alone (SE-conv1724-a100-9419b90c1).
+        pieces, gradients = row_truth(x, weights, parts, grads, segments)
+        return pieces, gradients[:2]
+
+    assert_as_exact(conv(kernel_conv), conv(xla_conv1d), draw,
+                    f"{model} {jnp.dtype(dtype).name}{' packed' if packed else ''}",
+                    seeds=TRAINING_SEEDS[model, jnp.dtype(dtype).name, packed], truth_fn=exact)
 
 
 @pytest.mark.mesh(devices=2)

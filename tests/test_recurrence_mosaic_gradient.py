@@ -27,6 +27,7 @@ from test_recurrence_mosaic import (
     on_the_mainloop,
     template_call,
 )
+from whole_suite import timed
 
 from dew.nn.backbones.decoder_block import RematPolicy
 from dew.nn.kernels import recurrence
@@ -71,17 +72,15 @@ def restarted(fn, case: str):
     return lambda drawn: fn(dataclasses.replace(drawn, starts=operands.starts))
 
 
-WHOLE_SUITE_INTERPRETED = {('packed documents', 'bf16', 'kept'): 225,
-                           ('a ragged length', 'bf16', 'kept'): 161, ('one sequence', 'bf16', 'kept'): 122}
-"""The interpreted gradient's cases past a group's two minutes (seconds, train 270's CI on f58abb8a3, ledger
-2127), which the whole suite runs."""
+PAST_TARGET = {"interpreted": {'packed documents-bf16-kept': 225, 'a ragged length-bf16-kept': 161,
+                               'one sequence-bf16-kept': 122}}
+"""The interpreted gradient's cases past a group's two minutes, by id (seconds, train 270's CI on f58abb8a3,
+ledger 2127), which the whole suite runs (`timed`)."""
 
 
-@pytest.mark.parametrize(('case', 'dtype', 'remat'), [
-    pytest.param(*case.values, id=case.id, marks=(*case.marks, pytest.mark.whole_suite))
-    if case.id in {'-'.join(each) for each in WHOLE_SUITE_INTERPRETED} else case
-    for case in interpreted([(case, dtype, remat) for remat in REMATS for dtype in DTYPES
-                             for case in GRADIENT_CASES], INTERPRETED_GRADIENT)])
+@pytest.mark.parametrize(('case', 'dtype', 'remat'), timed(PAST_TARGET, "interpreted", interpreted(
+    [(case, dtype, remat) for remat in REMATS for dtype in DTYPES for case in GRADIENT_CASES],
+    INTERPRETED_GRADIENT)))
 def test_the_mosaic_gradient_is_as_exact_as_its_reference(case, dtype, remat):
     """The gradient of the mainloop's rule on par from float64 with its reference's over the case's draws
     (check 1, truth the recurrence a token at a time's in float64): in a 16-bit call the mainloop's fast
@@ -93,7 +92,7 @@ def test_the_mosaic_gradient_is_as_exact_as_its_reference(case, dtype, remat):
     (`Mosaic.trains`), the rule refuses as it is traced: the delta rule's selector gives it the port or the
     portable math, whose check 1 test_recurrence_chunk holds (row 1926: no kernel falls back inside
     itself)."""
-    hooks = recurrence.Hooks(decay='scalar', scale=SHAPES[case]['key_width'] ** -0.5)
+    hooks = recurrence.Hooks(decay='scalar', scale=SHAPES[case]['key_width'] ** -0.5, write_bound=1.0)
 
     # Packed documents bounded as a layer bounds them (`PACKED_DOCUMENTS`).
     bound = {'max_segments': PACKED_DOCUMENTS} if SHAPES[case].get('packed') else {}
@@ -132,7 +131,7 @@ def test_the_fast_backward_is_bitwise_the_same_each_run():
     adds the rest's in order, a step's adds done before the next (`_gradient_stored`); no add's order varies
     between runs."""
     case = 'packed documents'
-    hooks = recurrence.Hooks(decay='scalar', scale=SHAPES[case]['key_width'] ** -0.5)
+    hooks = recurrence.Hooks(decay='scalar', scale=SHAPES[case]['key_width'] ** -0.5, write_bound=1.0)
     fn = on_the_mainloop(hooks, case, jnp.bfloat16)
     run = jax.jit(with_gradients(restarted(fn, case)))
     operands, cotangent = drawn(jnp.bfloat16, 0, **geometry(case))
@@ -154,13 +153,14 @@ def test_a_walk_of_two_roles_is_as_exact_as_its_reference(case, product):
     fill more than a wave), on par from float64 with the fla port's forward, or forward and gradient, over
     the case's draws (check 1, truth the recurrence a token at a time's): each role's columns, staging and
     stores its own. Off a GPU interpreted; a GPU that runs no Hopper kernels (an A100) skips it."""
-    hooks = recurrence.Hooks(decay='scalar', scale=SHAPES[case]['key_width'] ** -0.5)
+    hooks = recurrence.Hooks(decay='scalar', scale=SHAPES[case]['key_width'] ** -0.5, write_bound=1.0)
     shape = {**geometry(case), 'value_width': 64}
     tiles = mainloop.Tiles(32, 1, walkers=2)
 
     def walked(given: Chunk):
         return mosaic_rule(given.query, given.key, given.value, given.log_decay, given.beta, given.state,
-                           tiles=tiles, scale=hooks.scale, family=bundles.of('sm90', jnp.bfloat16))
+                           tiles=tiles, scale=hooks.scale, bound=hooks.inverse_bound,
+                           family=bundles.of('sm90', jnp.bfloat16))
 
     reference = functools.partial(chunk_on, 'fla', hooks)
     truth = functools.partial(token_by_token, hooks)

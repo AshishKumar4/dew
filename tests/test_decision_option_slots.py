@@ -16,7 +16,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from decision_support import decision_rows
+from decision_support import decision_rows, zeroed
 from flax import linen as nn
 from reference_error import assert_as_exact, widened, with_gradients
 from safetensors.numpy import load_file
@@ -131,10 +131,6 @@ so their upstream rounding is shared. The head's scalar parameters, the prior's 
 take their gradient's error from one sum over every option, whose ratio to the reference's varies widely
 from draw to draw. The site took 190.1 s at it."""
 
-ALGEBRAIC_ZEROS = ("to_k",)
-"""The head's modules whose bias gradient is zero by algebra: a key's bias shifts every key's logit of a
-query alike, which the attention's softmax does not move with (its float64 value is residue)."""
-
 SCORER_MARGIN = 1e-4
 """The least gap a draw admits between the two sides of the scorer's `abs(repeated - options)` feature at
 a real option (`scorer_gap`), in float64: a hundred times the float32 rounding of the difference, so
@@ -199,14 +195,6 @@ def scorer_gap(features, options, *drawn) -> float:
     return float(np.min(np.abs(difference[real])))
 
 
-def zeroed(tree):
-    """`tree` with the algebraic zeros' bias gradients (`ALGEBRAIC_ZEROS`) exactly zero."""
-    def exact(path, leaf):
-        names = [getattr(entry, "key", None) for entry in path]
-        return leaf * 0 if names[-1:] == ["bias"] and any(name in ALGEBRAIC_ZEROS for name in names) else leaf
-    return jax.tree_util.tree_map_with_path(exact, tree)
-
-
 def test_a_ragged_batch_trains_on_compacted_options_as_on_the_grid():
     """Rows of `CLAUSES` and `HYPOTHESES` x 3 real options, ragged, packed into two windows of a grid as
     many questions deep as a window holds, which the packing compacts into the slots its bounds allow.
@@ -235,9 +223,10 @@ def test_a_ragged_batch_trains_on_compacted_options_as_on_the_grid():
     assert compact.option_slots.shape == (len(options), capacity) and capacity < bounds.questions * CLAUSES
     batch = {name: value for name, value in slotted.items() if name not in ("option_slots", "slotted")}
     grid = laid_out(batch, bounds.segments)
-    variables = objective.init(jax.random.key(0))
+    # One program each, not the model's every operation compiled apart.
+    variables = jax.jit(objective.init)(jax.random.key(0))
     head = thaw(part(variables, "head"))
-    table = objective.model.table(variables)
+    table = jax.jit(objective.model.table)(variables)
     states_shape = (*np.shape(slotted["tokens"]), objective.model.head.hidden_size)
     features = scorer_features(objective, grid)
 

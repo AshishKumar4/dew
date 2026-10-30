@@ -19,6 +19,7 @@ from dew.data.dataset import Closeable, DataPartition, Loader, Loading
 from dew.data.pipeline import Pipeline
 from dew.objectives import Aux, Objective
 from dew.optim import Cosine, Linear, OneCycle, OptimConfig
+from dew.telemetry.records import FitStarted
 from dew.training import Best, Checkpoints, Pause, Trainer
 from dew.training.interval import CONSUMED_COMMITTED, CONSUMED_EXAMPLES
 
@@ -553,15 +554,19 @@ def test_only_a_run_on_the_examples_clock_carries_its_count_to_the_step(tmp_path
 
 def test_a_clocked_run_whose_split_is_planned_compiles_one_step():
     """Every batch of a clocked run carries whether it closes its window, so a run whose first compile
-    plans its split keeps one step program: one compile over its batches of one shape, its short last
-    batch filled to it."""
+    plans its split keeps one step program: nothing compiles after its first step over batches of one
+    shape, its last among them (16 records, two whole batches)."""
     (x,) = clocked_records(0)
     tracker = RecordingTracker()
     optim = OptimConfig(optimizer="adam", learning_rate=Linear(peak_value=PEAK, end_value=CLOCKED_END))
-    Trainer(Echoed(), optim, key=0, tracker=tracker).fit(clocked_chain(x), examples=CLOCKED_RECORDS,
-                                                         log_every=1)
-    assert len(tracker.scalars) > 1
-    assert sum("train/compile_s" in scalars for _, scalars in tracker.scalars) == 1
+    whole = 2 * BATCH
+    chain = Pipeline(Memory({"x": x[:whole], "id": np.arange(1, whole + 1, dtype=np.int32)})
+                     ).read("streamed").batch(BATCH)
+    Trainer(Echoed(), optim, key=0, tracker=tracker).fit(chain, examples=whole, log_every=1)
+    # `train/compiles` counts the step's compiles over the whole fit (`Interval.compiles`): the first
+    # step's planning and its program, and none after.
+    logged = [scalars for _, scalars in tracker.scalars if "train/loss" in scalars]
+    assert len(logged) > 1 and logged[0]["train/compiles"] == logged[-1]["train/compiles"] > 0
 
 
 def test_a_batched_step_that_makes_no_rows_of_a_group_carries_its_examples_on():
@@ -813,13 +818,16 @@ def test_asking_a_streamed_runs_steps_reads_none_of_its_data():
 def test_a_clocked_run_of_a_warmup_as_a_share_trains_and_records_it_as_written(schedule):
     """A run bounded in examples that counts no steps ahead trains under a schedule whose warmup is a share
     of the run, which it records at its start as written (`OptimConfig.warmups`), there being no updates
-    ahead to count it in."""
+    ahead to count it in; its start records its length, its bound, and each step's log the examples it
+    has consumed, ending at the bound (row 2436)."""
     state, tracker = clocked_fit(*clocked_records(0), 1, learning_rate=schedule)
     assert state is not None and int(state.consumed) == CLOCKED_RECORDS
-    from dew.telemetry.records import FitStarted
-
     started = next(value for _, value in tracker.artifacts if isinstance(value, FitStarted))
     assert started.cadences["warmup_steps.learning_rate"] == "25%"
+    assert started.target_steps is None and started.examples == CLOCKED_RECORDS
+    consumed = [scalars["train/examples_consumed"] for _, scalars in tracker.scalars
+                if "train/loss" in scalars]
+    assert consumed == sorted(consumed) and consumed[-1] == CLOCKED_RECORDS
 
 
 def test_a_causal_windows_last_target_is_consumed_by_the_window_that_holds_it():

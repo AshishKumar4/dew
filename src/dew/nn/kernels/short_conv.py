@@ -79,14 +79,12 @@ def _fits(width: int, head: int | None) -> bool:
 
 @dataclasses.dataclass(frozen=True)
 class ConvCase:
-    """A conv as the conv selector reads it (`CONV`): whether the kernels run here (`placed`), whether
-    the call is reverse mode's (`reverse`: a caller differentiating forward sets `FORWARD_MODE`, and the
-    kernels implement a VJP), whether no mesh axis splits its operand (`whole`), the operand's `shape`
+    """A conv as the conv selector reads it (`CONV`): whether the kernels run here (`placed`), whether no
+    mesh axis splits its operand (`whole`), the operand's `shape`
     and `dtype`, the dtype it is written in (`out`), its `taps` and its pieces (`parts`, `(width, head)`
     each)."""
 
     placed: bool
-    reverse: bool
     whole: bool
     shape: tuple[int, ...]
     dtype: np.dtype
@@ -98,8 +96,6 @@ class ConvCase:
 SUPPORTS: tuple[Requirement[ConvCase], ...] = (
     Requirement('capability', lambda case: case.placed, "the kernels need a GPU of sm80 or later",
                 row=INHERENT),
-    Requirement('forward_mode', lambda case: case.reverse,
-                "a JVP trace needs forward-mode derivatives; the kernels implement a VJP", row=INHERENT),
     Requirement('placement', lambda case: case.whole,
                 "a mesh axis splits the conv's operands, and the kernels see whole arrays",
                 row='ledger 1306'),
@@ -351,12 +347,13 @@ class Walk:
 TILE = Tile(rows=16, warps=4)
 """The forward's launch: 16 tokens a tile, each window loaded at once."""
 
-WALK = Walk(segments=8, steps=64, warps=4)
+WALK = Walk(segments=8, steps=32, warps=4)
 """The backward's launch, its runs no longer than a row's share: eight runs a tile, with a 128-channel
-block 1024 elements, eight an fp32 register of each of four warps' threads, and 64 tokens a run, whose
-K-1 extra tokens are 5% of it at the K of 4 every mixer uses. A run sums its taps' products token by
+block 1024 elements, eight an fp32 register of each of four warps' threads, and 32 tokens a run, whose
+K-1 extra tokens are 9% of it at the K of 4 every mixer uses. A run sums its taps' products token by
 token, so its rounding grows with its steps: runs of 128 put the 0.8B's bf16 tap gradients 2.06 times
-as far from float64 as XLA's on an A100, past the gate."""
+as far from float64 as XLA's on an A100, and runs of 64 1.57 times at the 0.8B's and 9B's training
+shapes on an H100 (row 2411), past the gate."""
 
 
 def _inputs(x, w, bias, valid, documents):
@@ -507,22 +504,32 @@ def _backward(x, taps, bias, valid, documents, cotangents, parts, activation: bo
     return dx, dw, None if bias is None else jnp.concatenate(db).astype(bias.dtype)
 
 
-def _conv_fwd(x, taps, bias, valid, documents, parts, activation, eps, dtype, interpret):
-    out = _forward(x, taps, bias, valid, documents, parts, activation, eps, dtype, interpret)
-    return out, (x, taps, bias, valid, documents)
+def conv(x, taps, bias, valid, documents, parts, *, activation: bool, eps: float, dtype, interpret: bool):
+    """`linear.causal_conv1d` on the kernels: `x` `[B, T, C]` convolved causally by `taps` `[C, K]` behind
+    K-1 zero tokens, plus `bias` `[C]` or None, silu'd where `activation`, as the `parts` pieces
+    `((width, head), ...)` of its channels in order, each `[B, T, width]` in `dtype`, a piece with a `head`
+    l2-normalised (`eps`) over each `head` channels. `valid` `[B, T]` int8 or None zeroes padding tokens'
+    outputs; `documents` `[B, T]` int32 or None numbers packed documents, a tap reading a token only in
+    its output token's. Differentiated at every order through XLA's conv (`linear.xla_conv1d`, the same
+    arithmetic; `generation.linear_tangent`): reverse mode runs the backward kernels, and forward mode takes
+    XLA's tangent however a jit, a scan or a remat staged the call (row 2395)."""
+    from dew.nn.linear import xla_conv1d
 
+    def forward(x, taps, bias, valid, documents):
+        return _forward(x, taps, bias, valid, documents, parts, activation, eps, dtype, interpret), ()
 
-def _conv_bwd(parts, activation, eps, dtype, interpret, residual, cotangents):
-    x, taps, bias, valid, documents = residual
-    dx, dw, db = _backward(x, taps, bias, valid, documents, cotangents, parts, activation, eps, interpret)
-    return dx, dw, db, None, None
+    def backward(saved, operands, cotangents):
+        del saved
+        x, taps, bias, valid, documents = operands
+        dx, dw, db = _backward(x, taps, bias, valid, documents, cotangents, parts, activation, eps, interpret)
+        # The masks have no tangent space: float0's zero, as JAX takes it of them.
+        masks = (None if mask is None else np.zeros(mask.shape, jax.dtypes.float0)
+                 for mask in (valid, documents))
+        return dx, dw, db, *masks
 
+    def portable(x, taps, bias, valid, documents):
+        return xla_conv1d(x, taps, activation, bias, valid=valid, segments=documents, parts=parts,
+                          dtype=dtype)
 
-conv = jax.custom_vjp(_forward, nondiff_argnums=(5, 6, 7, 8, 9))
-"""`linear.causal_conv1d` on the kernels: `x` `[B, T, C]` convolved causally by `taps` `[C, K]` behind
-K-1 zero tokens, plus `bias` `[C]` or None, silu'd where `activation`, as the `parts` pieces
-`((width, head), ...)` of its channels in order, each `[B, T, width]` in `dtype`, a piece with a `head`
-l2-normalised (`eps`) over each `head` channels. `valid` `[B, T]` int8 or None zeroes padding tokens'
-outputs; `documents` `[B, T]` int32 or None numbers packed documents, a tap reading a token only in
-its output token's. Gradients for `x`, `taps` and `bias`."""
-conv.defvjp(_conv_fwd, _conv_bwd)
+    return generation.linear_tangent(forward, backward, portable)(x, taps, bias, valid, documents)
+

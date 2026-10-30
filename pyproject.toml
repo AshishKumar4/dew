@@ -18,13 +18,13 @@ dependencies = [
     "flax>=0.12.10,<0.13",
     # Dew's JAX build: 0.12.0.1 with the fixes no release has yet (constraints.txt
     # names them), which only Dew's package index serves, pypi.dewml.dev. The
-    # first build with every fix is post35; a release sorts below it, so an
+    # first build with every fix is post37; a release sorts below it, so an
     # install from PyPI alone stops at resolving jax rather than running on a
     # jax without them (docs/installation.md). The accelerator builds the
     # cuda12, cuda13 and tpu extras name are 0.12.0.1's. A bump runs the GPU
     # checks docs/installation.md lists under "Bumping JAX" first: CI is
     # CPU-only.
-    "jax>=0.12.0.1.post35,<0.12.1",
+    "jax>=0.12.0.1.post37,<0.12.1",
     "optax>=0.2.2",
     "orbax-checkpoint>=0.12.4",
     "numpy",
@@ -252,6 +252,7 @@ torchax = ["torch>=2.14,<2.15", "torchax==0.0.14.dev20260922"]
 kernel-compile = ["jax-cuda12-plugin==0.12.0.1; sys_platform == 'linux' and platform_machine == 'x86_64'",
                   "jax-cuda12-pjrt==0.12.0.1; sys_platform == 'linux' and platform_machine == 'x86_64'",
                   "nvidia-cuda-nvcc-cu12~=12.9; sys_platform == 'linux' and platform_machine == 'x86_64'",
+                  "nvidia-cuda-nvcc==13.4.92; sys_platform == 'linux' and platform_machine == 'x86_64'",
                   "libtpu==0.0.50.*; sys_platform == 'linux' and platform_machine == 'x86_64'"]
 # The test suite's one environment: every package a test file imports, so no test skips for want
 # of one. CI's jobs, armada's (tools/armada/install.sh), the GPU nodes' and dew-ops' GPU jobs install

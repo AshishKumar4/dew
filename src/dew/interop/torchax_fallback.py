@@ -1151,8 +1151,8 @@ class TorchCausalLM(nn.Module):
         with `decode` of a decoding call into the cache `init_cache` opened, `attention_mask` `[B, S]`
         the tokens that write and `positions` `[B, S]` their places in their rows (their slots where
         None), or the rows' `coordinates` stating both; a decoding row holds one document."""
-        fields = {name: value for name, value in ((VALIDITY_FIELD, attention_mask), ("positions", positions))
-                  if value is not None}
+        fields = {name: value for name, value in ((VALIDITY_FIELD, attention_mask),
+                                                  (POSITIONS_FIELD, positions)) if value is not None}
         if not decode:
             return self.logits(tokens, train=train, **fields, **packing)
         if self.graph.attention_impl is None:

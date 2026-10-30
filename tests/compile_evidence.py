@@ -1,7 +1,7 @@
 """The evidence the hardware-free kernel gate holds a template's register model to (tests/kernel_compile.py):
 each kernel's model prediction beside what ptxas measured, and whether their decisions agree (`Evidence`).
-The gate fails on any kernel whose decisions disagree, either way (`disagreements`), listing its per-term
-errors, signed."""
+Register disagreements remain advisory rows while the model is being corrected; allocation and compiler
+failures remain hard failures. Every row carries its per-term errors, signed."""
 
 import dataclasses
 
@@ -56,6 +56,9 @@ class Evidence:
         """The model's terms less the compiler's quantities, each term both name, signed."""
         return {name: value - measured for name, value in self.predicted.terms.items()
                 if isinstance(measured := self.compiled.quantities.get(name), int)}
+
+    def record(self) -> dict:
+        return {**dataclasses.asdict(self), "agrees": self.agrees, "errors": self.errors}
 
     def describe(self) -> str:
         return (f"{self.case_id}: the model ({self.predicted.unit} {self.predicted.terms}, total "

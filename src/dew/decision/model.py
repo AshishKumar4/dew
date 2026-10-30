@@ -72,7 +72,7 @@ class DecisionModel(HeadedModel):
         `media` are the backbone's own inputs for images a request's one row
         holds (`Images.inputs`), with which it reads them. Rows that carry a
         context (`DecisionInputs.context`) hand the backbone's cross-attention
-        each row's context, embedded by the backbone's own table (`token_embeddings`),
+        each row's context, embedded by the backbone's own table (`stream_embeddings`),
         or, where the context holds the schema (`DecisionInputs.spans_in_context`),
         the backbone's own final states over it (`encode_context`).
         """
@@ -91,7 +91,9 @@ class DecisionModel(HeadedModel):
         laid = inputs.coordinates()
         # A row in blocks is read by the backbone's attention whole within each block, on the kinds
         # that read blocks (`AttentionMetadata.block_groups`); a row in order passes none.
-        blocked: dict[str, jax.Array] = {} if inputs.blocks is None else {"block_groups": inputs.blocks}
+        blocked: dict[str, object] = {} if inputs.blocks is None else {"block_groups": inputs.blocks}
+        if inputs.whole_blocks:
+            blocked["whole_blocks"] = True
         spanned = conditioning = None
         if inputs.context is not None:
             if self.context_length is None:
@@ -153,21 +155,25 @@ class DecisionModel(HeadedModel):
         states, spanned, sown = self._read(variables, inputs, media=media, train=train, rngs=rngs,
                                            opened=opened)
         head = thaw(part(variables, "head"))
+        # The questions' spans are pooled from the pass that holds them: the context's, where it holds
+        # them. A head that pools none reads a question in its context through the cross-attention alone.
+        spans = spanned if self.head.pools_spans else None
         if self.head.reads_labels:
-            if spanned is not None:
-                raise TypeError("a readout of labels reads its questions in the row, not in its context")
+            # A readout of labels reads its answer cue in the row.
             labels = self.head.tied_labels()
             tied = None if labels is None else self.readout_logits(variables, states, inputs, labels)
             # A head drawn from the vocabulary rows reads no table after its draw.
             table = None if self.head.draws_from_rows else self.output_table(variables)
-            logits = _array(self.head.apply(head, states, inputs, table, train=train, tied=tied, rngs=rngs))
+            logits = _array(
+                self.head.apply(head, states, inputs, table, tied=tied, train=train, rngs=rngs)
+                if spans is None else
+                self.head.apply(head, states, inputs, table, tied=tied, spanned=spans, train=train,
+                                rngs=rngs))
         else:
             table = self.table(variables) if self.head.reads_table else None
-            # The questions' spans are pooled from the pass that holds them: the context's, where it
-            # holds the schema.
-            logits = _array(self.head.apply(head, states, inputs, table, train=train, rngs=rngs)
-                            if spanned is None else
-                            self.head.apply(head, states, inputs, table, train, spanned, rngs=rngs))
+            logits = _array(
+                self.head.apply(head, states, inputs, table, train=train, rngs=rngs) if spans is None
+                else self.head.apply(head, states, inputs, table, spanned=spans, train=train, rngs=rngs))
         return jnp.where(inputs.options, logits, -jnp.inf), sown
 
     def readout_logits(self, variables: Variables, states: jax.Array, inputs: DecisionInputs,

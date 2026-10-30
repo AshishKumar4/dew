@@ -701,6 +701,10 @@ class Loader:
     device: tuple[DeviceStep, ...] = ()
     """The training batch's steps the compiled training step runs, on the
     accelerator, after the reader delivers it (`DeviceStep`)."""
+    widths: Mapping[str, object] = dataclasses.field(default_factory=dict)
+    """The run's static widths its steps bound (`run_widths`): the facts its objective's run-scoped
+    steps read (`Configured.scope`), such as a decision's `slots`, which a saved run of the objective
+    records (`Objective.bind_widths`); empty where they read none."""
     tail: Tail = "dropped"
     """What becomes of the records an epoch leaves short of a whole batch: read, carried into the
     next epoch by an order that reads on or kept and filled by one that keeps them, so an epoch's

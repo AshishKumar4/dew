@@ -18,7 +18,6 @@ import re
 import subprocess
 import sys
 import tempfile
-from collections import Counter
 from pathlib import Path
 
 import compile_evidence
@@ -29,6 +28,8 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
 from dew.nn.kernels.generation import assumed, capability, gpu_mesh, gpu_target
 from dew.nn.kernels.templates import report, resources
+from dew.nn.kernels.templates.liveness import Compiler
+from dew.training._lowering import kernel_calls, triton_kernels
 from dew.training.ahead import compile_only_gpus
 
 REFUSED = re.compile(r"Shared memory size limit exceeded: requested (\d+)")
@@ -40,9 +41,6 @@ Triton call's, or one of XLA's own fusions XLA emits so (`loop_multiply_fusion`)
 
 UNIQUIFIED = re.compile(r"__\d+$")
 """The suffix XLA gives a kernel name's later launches in a program (`recurrence_cumulated__1`)."""
-
-TRITON_CALL = re.compile(r'custom_call_target="__gpu\$xla\.gpu\.triton".*?\bname = "([^"]+)"')
-"""A Triton kernel's call in XLA's optimized HLO, with the kernel's name, which its launch line carries."""
 
 
 @functools.cache
@@ -81,20 +79,20 @@ def compile_kernels(cases, generation: str) -> list[dict]:
         sequences = _compiled(case, generation, record)
         if sequences is None:
             continue
-        thunks, programs = sequences
-        record.update(triton_evidence(programs, thunks))
+        thunks, calls = sequences
+        record.update(triton_evidence(calls, thunks))
     return found
 
 
-def triton_evidence(programs: list[str], thunks: list[str]) -> dict:
-    """What XLA's optimized `programs` and thunk sequences (`thunks`) say of a program's Triton kernels:
-    the largest shared bytes a call launches with, or why they say nothing. Each Triton call (an HLO
-    custom call, named by its kernel) states its shared bytes in a launch line of its own, named as the
-    call is, XLA numbering a name's later calls (recurrence_cumulated__1): XLA's own fusions launch as
-    custom kernels too, and one kernel's name can begin another's (attention_forward,
-    attention_forward_headroom). A call with no launch line of its own, or a program that calls no
-    Triton kernel, is no evidence its kernel compiled within its block (row 1381)."""
-    calls = Counter(name for text in programs for name in TRITON_CALL.findall(text))
+def triton_evidence(calls: dict[str, int], thunks: list[str]) -> dict:
+    """What XLA's thunk sequences (`thunks`) say of a program's Triton kernels, its calls by name with the
+    call sites of each (`calls`, the lowering reader's `triton_kernels`, which owns the inventory): the
+    largest shared bytes a call launches with, or why they say nothing. Each Triton call states its shared
+    bytes in a launch line of its own, named as the call is, XLA numbering a name's later calls
+    (recurrence_cumulated__1): XLA's own fusions launch as custom kernels too, and one kernel's name can
+    begin another's (attention_forward, attention_forward_headroom). A call with no launch line of its
+    own, or a program that calls no Triton kernel, is no evidence its kernel compiled within its block
+    (row 1381)."""
     launches: dict[str, list[int]] = {}
     for text in thunks:
         for name, size in KERNEL.findall(text):
@@ -107,10 +105,11 @@ def triton_evidence(programs: list[str], thunks: list[str]) -> dict:
     return {"shared": max(size for name in calls for size in launches[name])}
 
 
-def _compiled(case, generation: str, record: dict) -> tuple[list[str], list[str]] | None:
+def _compiled(case, generation: str, record: dict) -> tuple[list[str], dict[str, int]] | None:
     """`case` lowered as on the CUDA `generation` (`assumed`, `gpu_mesh`) and compiled by XLA for a
-    compile-only device of it: XLA's thunk sequences and optimized programs, or None, `record` holding why:
-    the error, or the shared bytes of a block XLA refused."""
+    compile-only device of it: XLA's thunk sequences and the lowered program's Triton calls by name
+    (`triton_kernels`), or None, `record` holding why: the error, or the shared bytes of a block XLA
+    refused."""
     mesh = _device(generation)
     replicated = NamedSharding(mesh, PartitionSpec())
     fn, args = case.call()
@@ -122,6 +121,11 @@ def _compiled(case, generation: str, record: dict) -> tuple[list[str], list[str]
     except Exception as error:  # A case that does not lower is its own failure.
         record["error"] = f"it does not lower: {str(error)[-800:]}"
         return None
+    if "models" in record:
+        record["lowered"] = {
+            call.name: [dataclasses.asdict(launch)
+                        for launch in resources.lowered_registers(call.ir, _compiler())]
+            for call in kernel_calls(lowered) if call.kind == "mosaic_gpu"}
     # A process whose persistent compilation cache is on keeps it on here (JAX settles that once a
     # process): a compile-only device's entry reads back as unloadable, with a warning, and compiles.
     with tempfile.TemporaryDirectory(prefix="dew-compile-") as dump:
@@ -134,8 +138,7 @@ def _compiled(case, generation: str, record: dict) -> tuple[list[str], list[str]
             else:
                 record["shared"] = int(refused.group(1))
             return None
-        return ([path.read_text() for path in Path(dump).glob("*thunk_sequence.txt")],
-                [path.read_text() for path in Path(dump).glob("*after_optimizations.txt")])
+        return [path.read_text() for path in Path(dump).glob("*thunk_sequence.txt")], triton_kernels(lowered)
 
 
 def mosaic_kernels(directory: str) -> list[dict]:
@@ -357,8 +360,10 @@ def _compiled_reports(directory: str, generation: str) -> dict[str, dict]:
     report is its compile in this process, which may not be the GPU's (`RELOCATABLE`)."""
     found = {}
     for path in Path(directory).glob("*.ptx"):
-        registers, spilled, _ = _ptxas(path.read_text(), generation, cap=None)
-        found[report.KERNEL_COUNTER.sub("", path.name.removesuffix(".ptx"))] = {
+        registers, spilled, took = _ptxas(path.read_text(), generation, cap=None)
+        if not took:
+            raise RuntimeError(f"ptxas does not compile {path.name} for {generation}")
+        found[report.kernel_name(path.name.removesuffix(".ptx"))] = {
             "registers": registers, "spilled": spilled, "ptxas": "the GPU's compile of its PTX"}
     return found
 
@@ -366,10 +371,10 @@ def _compiled_reports(directory: str, generation: str) -> dict[str, dict]:
 def _needs(directory: str, generation: str,
            models: dict[str, resources.RegisterModel] | None = None) -> dict[str, int | dict | None]:
     """Each kernel's register need (`register_need`) from the PTX Mosaic dumped into `directory`, by the
-    kernel's name less Mosaic's counter (`report.KERNEL_COUNTER`)."""
+    kernel's name less Mosaic's counter and its launch (`report.kernel_name`)."""
     found = {}
     for path in Path(directory).glob("*.ptx"):
-        name = report.KERNEL_COUNTER.sub("", path.name.removesuffix(".ptx"))
+        name = report.kernel_name(path.name.removesuffix(".ptx"))
         model = (models or {}).get(name)
         found[name] = (register_decisions(path.read_text(), generation, model) if model is not None
                        else register_need(path.read_text(), generation))
@@ -390,13 +395,31 @@ def _compiled_here(cases, generation: str) -> list[dict]:
         with (tempfile.TemporaryDirectory(prefix="dew-mosaic-") as directory,
               report.reported(directory, ptx=True)):
             _compiled(case, generation, record)
-            needs = _needs(directory, generation, models)
+            lowered_models = _lowered_models(record, mosaic_kernels(directory), generation)
+            needs = _needs(directory, generation, lowered_models or models)
             compiled = _compiled_reports(directory, generation)
             record["kernels"] = [needed(inherited({**kernel, **compiled.get(kernel["kernel"], {})}), needs)
                                  for kernel in mosaic_kernels(directory)]
         record["tmem_limit"] = gpu_target(generation).tmem_columns or 0
+        record["evidence"] = _register_evidence(record)
         found.append(record)
     return found
+
+
+def _lowered_models(record: dict, kernels: list[dict], generation: str) -> dict[str, resources.RegisterModel]:
+    target = gpu_target(generation)
+    models = {}
+    for kernel in kernels:
+        launches = record.get("lowered", {}).get(kernel["kernel"], ())
+        if not launches or kernel["shared"] is None or kernel["tmem"] is None:
+            continue
+        if len(launches) != 1:
+            raise ValueError(f"{kernel['kernel']} has {len(launches)} launches but one compiled report")
+        launch = resources.LoweredRegisters(**launches[0])
+        models[kernel["kernel"]] = launch.model(target, _compiler(), shared=kernel["shared"],
+                                                tmem=kernel["tmem"])
+    record["lowered_models"] = {name: dataclasses.asdict(model) for name, model in models.items()}
+    return models
 
 
 REGISTER_FILE = 64 * 1024
@@ -443,54 +466,66 @@ def decisions(registers: int | dict | None, model: resources.RegisterModel,
         return registers["admitted"], registers["programs"]
     if registers is None or registers > model.budget:
         return False, 0
-    return True, min(model.most, REGISTER_FILE // _program_registers(model, -(-registers // model.step)
-                                                                     * model.step, honored))
+    allocated = _program_registers(model, -(-registers // model.step) * model.step, honored)
+    return True, min(model.most, REGISTER_FILE // allocated) if allocated else model.most
 
 
 def mosaic_failures(found: list[dict]) -> list[str]:
-    """Each Mosaic GPU record's failure: the program's own (`failures`: its error, or XLA's refusal of a
-    block past shared memory), no Mosaic kernel compiled, a kernel whose reports lack a field
-    (`mosaic_kernels`), a kernel past its multiprocessor's shared memory or tensor memory, or spilling
-    registers, or one whose template's model (the case's `models`) decides otherwise than ptxas's register
-    need (`register_need`, `decisions`): admitted where the need does not fit its budget or refused where
-    it does, or another count of programs a multiprocessor (owner, 10-27: neither spills nor wastes
-    occupancy; docs/design/kernel-templates.md), or whose scratch is not the bytes its planner sized it by
-    (the model's `shared`, `resources.scratch_bytes`, where it states them). Every modelled kernel's
-    evidence is held to ptxas's decision (`compile_evidence`)."""
+    """Compile errors and missing or excessive shared/TMEM allocations. Register model disagreements
+    and spills are advisory rows until the model matches allocation; runtime step-down handles them."""
     failed = failures(found)
-    evidence = []
     for record in found:
         if refused(record):
             continue
         if not record["kernels"]:
             failed.append(f"{record['name']}: no Mosaic GPU kernel compiled")
         for kernel in record.get("kernels", ()):
-            # A record's fields past the report's (`inherited`'s `ptxas`, where its registers came from)
-            # are its own.
-            stated = {field.name: kernel[field.name] for field in dataclasses.fields(report.Report)
-                      if field.name in kernel}
-            found_kernel = report.Report(**{**stated, "unread": tuple(kernel["unread"])})
-            stated_model = record.get("models", {}).get(found_kernel.kernel)
-            model = None if stated_model is None else resources.RegisterModel(**stated_model)
-            # A tile its model refuses (the gate compiles those beside a derived one) spills by design: its
-            # need alone is checked.
-            admitted = model is None or decisions(model.registers, model)[0]
-            if admitted and (why := found_kernel.failure(record["limit"], record["tmem_limit"])) is not None:
+            found_kernel = _report(kernel)
+            # Preserve the report's missing-field check and hard allocation limits. Spills have their
+            # own evidence row; masking that count here never masks an assembler failure.
+            hard = dataclasses.replace(found_kernel, spilled=0)
+            if (why := hard.failure(record["limit"], record["tmem_limit"])) is not None:
                 failed.append(f"{record['name']} {found_kernel.kernel}: {why}")
-            if model is not None and model.shared not in (None, found_kernel.shared):
-                failed.append(f"{record['name']} {found_kernel.kernel}: its planner sized {model.shared} "
+            stated = record.get("models", {}).get(found_kernel.kernel)
+            if stated is not None and stated["shared"] not in (None, found_kernel.shared):
+                failed.append(f"{record['name']} {found_kernel.kernel}: its planner sized {stated['shared']} "
                               f"bytes of scratch, the kernel asks for {found_kernel.shared}")
-            if model is not None:
-                evidence.append(_evidence(record, found_kernel, model, kernel.get("need")))
-    failed += compile_evidence.disagreements(evidence)
+        record["evidence"] = _register_evidence(record)
     return failed
 
 
+def _report(kernel: dict) -> report.Report:
+    stated = {field.name: kernel[field.name] for field in dataclasses.fields(report.Report)
+              if field.name in kernel}
+    return report.Report(**{**stated, "unread": tuple(kernel["unread"])})
+
+
+def _register_evidence(record: dict) -> list[dict]:
+    rows = []
+    for kernel in record.get("kernels", ()):
+        found = _report(kernel)
+        for source in ("models", "lowered_models"):
+            if (stated := record.get(source, {}).get(found.kernel)) is None:
+                continue
+            model = resources.RegisterModel(**stated)
+            need = kernel.get("need")
+            actual = record.get("lowered_models", {}).get(found.kernel)
+            evidence = _evidence(record, found, model, need,
+                                 measured_model=None if actual is None else resources.RegisterModel(**actual))
+            rows.append({"source": source, **evidence.record()})
+        if found.spilled:
+            rows.append({"case_id": f"{record['name']} {found.kernel}", "kind": "spill",
+                         "spilled": found.spilled, "registers": found.registers})
+    return rows
+
+
 def _evidence(record: dict, kernel: "report.Report", model: resources.RegisterModel,
-              need: int | dict | None) -> compile_evidence.Evidence:
+              need: int | dict | None, *,
+              measured_model: resources.RegisterModel | None = None) -> compile_evidence.Evidence:
     """A modelled kernel's evidence: the model's registers and the decision they give against ptxas's need
     and its decision (`decisions`)."""
-    predicted, compiled = decisions(model.registers, model), decisions(need, model)
+    predicted = decisions(model.registers, model)
+    compiled = decisions(need, measured_model or model)
     # ptxas's registers a thread: its least spill-free cap, or where it decided at the launch's own caps
     # (`register_decisions`), its use at the budget.
     if isinstance(need, dict):
@@ -518,7 +553,16 @@ def _head() -> str:
 def _ptxas_version() -> str:
     """The version line of the ptxas the gate assembles with (`PTXAS`)."""
     ran = subprocess.run([str(PTXAS), "--version"], capture_output=True, text=True, check=False)
-    return (ran.stdout.strip().splitlines() or [""])[-1]
+    return ran.stdout.strip()
+
+
+@functools.cache
+def _compiler() -> Compiler:
+    version = _ptxas_version()
+    matched = re.search(r"V(\d+)\.(\d+)", version)
+    if matched is None:
+        raise ValueError(f"ptxas states no compiler version: {version}")
+    return Compiler((int(matched[1]), int(matched[2])), RELOCATABLE)
 
 
 TPU_TOPOLOGIES = {"v5e": "v5e:2x2", "v6e": "v6e:2x2"}

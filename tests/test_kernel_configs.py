@@ -17,6 +17,7 @@ import numpy as np
 import pytest
 from fla_gdn_support import CONV_SHAPES, conv_training_cases, kda_training_cases
 from generation_support import COMPILES_FOR_TPU, generations, lowers
+from jax.sharding import PartitionSpec
 from kernel_compile import compile_kernels, failures
 
 from dew.nn.kernels import chunked_launch, fla_gdn, fla_kda, generation, grouped_matmul, recurrence, tuning
@@ -205,6 +206,75 @@ def test_the_cooperative_grouped_matmul_compiles_for_hopper_within_its_resources
     assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
 
 
+class _Uncounted(grouped_matmul.MosaicGmm):
+    """The grouped forward with a register model that counts nothing, so its derivation takes a tile its
+    registers do not hold: a launch whose model misses."""
+
+    def registers(self, ba, config):
+        return 0
+
+
+class _OnlyTile(_Uncounted):
+    """A launch with one tile shape, so refusing that shape exhausts its derivation."""
+
+    def candidate(self, ba, config, target):
+        return (config.block_m == 128 and config.block_n == 128 and config.warpgroups == 2
+                and super().candidate(ba, config, target))
+
+
+@lowers("sm90")
+@pytest.mark.parametrize("exhausted", [False, True])
+def test_a_spilling_launch_is_refused_and_its_derivation_steps_down_once(exhausted):
+    """A compile that finds a template launch's kernel spilling (`report.compiled`, owner 10-29) refuses that
+    launch's config and lowers once more, where the derivation takes its next tile by its own rule; a
+    kernel spilling again is recorded and not stepped again. A paired SwiGLU forward whose model counts no
+    registers, compiled for a compile-only H100 on this CPU through ptxas. A derivation with no replacement
+    keeps its first program; the refusals saved with that program must derive it again."""
+    from dew.nn.kernels.templates import report
+    from dew.training.ahead import compile_only_gpus
+
+    launch = _OnlyTile() if exhausted else _Uncounted()
+    devices = jax.sharding.Mesh(np.array(compile_only_gpus("sm90")), ("data",))
+    placed = jax.sharding.NamedSharding(devices, PartitionSpec())
+    shapes = [jax.ShapeDtypeStruct(shape, dtype, sharding=placed)
+              for shape, dtype in (((4096, 2048), jnp.bfloat16), ((8, 2048, 4096), jnp.bfloat16),
+                                   ((8, 2048, 4096), jnp.bfloat16), ((8,), jnp.int32))]
+    traced = []
+
+    def lowered():
+        def forward(x, gate, up, sizes):
+            return launch(x, gate, sizes, paired=up, hooks=grouped_matmul.Hooks(
+                epilogue=lambda g, u: jax.nn.silu(g) * u), out_dtype="bfloat16", trans_rhs=False,
+                          interpret=False)
+        with tuning.seen() as seen:
+            program = jax.jit(forward).trace(*shapes).lower()
+        traced.append(seen.taken[0][0])
+        return program
+
+    with (report.refusals(), generation.assumed("sm90"),
+          jax.sharding.use_abstract_mesh(generation.gpu_mesh(devices, "sm90"))):
+        report.compiled(lowered(), relower=lowered)
+        misses, refused = report.misses(), report.refused_launches()
+    first = traced[0]
+    if exhausted:
+        assert len(traced) == 1
+        assert [(miss.config, miss.stepped) for miss in misses] == [(first, False)]
+        assert not refused
+        kept = first
+    else:
+        first, kept = traced
+        assert kept != first
+        assert [(miss.config, miss.stepped) for miss in misses][:1] == [(first, True)]
+        assert all(miss.config == kept and not miss.stepped for miss in misses[1:])
+        assert [config for _, config, _ in refused] == [first]
+    # Another process seeded with the run's refusals (its plan's) derives the tile this compile kept.
+    with (report.refusals(), generation.assumed("sm90"),
+          jax.sharding.use_abstract_mesh(generation.gpu_mesh(devices, "sm90"))):
+        report.refuse(refused)
+        lowered()
+    assert traced[-1] == kept
+
+
 GEMM_SHAPES = {"qwen3 gate": (4096, 2048, 768, 128), "mixtral up": (4096, 4096, 14336, 8),
                "mixtral down": (4096, 14336, 4096, 8), "deepseek-v3 up": (4096, 7168, 2048, 256),
                "llama up": (4096, 4096, 14336, 1), "qwen3.5-4b up": (24576, 2560, 9216, 1),
@@ -330,13 +400,9 @@ def _gemm_mainloop_cases(generation_name: str, shape: str, *, every_consumer_cou
                         configs[f"{name} x{consumers} {tile}"] = tile
             kernel = "dew_tgmm" if isinstance(launch, grouped_matmul.MosaicTgmm) else "dew_gmm"
             for label, config in configs.items():
-                configured = (functools.partial(launch.replace(config=config), **options)
-                              if launch.legal(ba, config, target) else
-                              # A tile the launch refuses runs its kernel unpinned (`KernelOp.pinnable`).
-                              lambda *arrays, config=config, options=options, launch=launch:
-                              launch._fwd(*arrays, **options, config=config)[0])
                 cases.append(support.KernelCase(label,
-                                                lambda configured=configured, args=args: (configured, args),
+                                                lambda launch=launch, ba=ba, config=config:
+                                                launch.lowering(ba, config),
                                                 {kernel: _model(launch, ba, config)}))
     return cases
 
@@ -556,13 +622,14 @@ def test_each_triton_call_needs_a_launch_of_its_own():
     operand = jax.ShapeDtypeStruct((16, 128), jnp.float32)
     compiled = _compiled(support.KernelCase("probe", lambda: (program, (operand,))), "sm80", {})
     assert compiled is not None
-    thunks, programs = compiled
-    assert "shared" in triton_evidence(programs, thunks)
+    thunks, calls = compiled
+    assert calls == {"probe": 2, "probe_headroom": 1}
+    assert "shared" in triton_evidence(calls, thunks)
     for missing, said in ((" probe grid", "probe"), (" probe_headroom grid", "probe_headroom")):
         lines = "\n".join(thunks).splitlines()
         dropped = next(index for index, line in enumerate(lines) if missing in line)
         without = ["\n".join(lines[:dropped] + lines[dropped + 1:])]
-        assert triton_evidence(programs, without) == {
+        assert triton_evidence(calls, without) == {
             "error": f"no launch of its own states the shared bytes of {said}"}
 
 
@@ -579,16 +646,19 @@ def test_records_a_failed_process_of_their_own_wrote_are_refused():
         compiled_apart()
 
 
-def test_the_resource_gate_refuses_a_spilling_mosaic_kernel():
+def test_the_resource_gate_reports_spills_and_refuses_invalid_allocations():
     """A record the gate reads (`mosaic_failures`): a kernel past its shared memory, its tensor memory or
-    spilling fails; within all three, none."""
+    spilling is reported; invalid allocations fail."""
     from kernel_compile import mosaic_failures, mosaic_kernels
 
     within = {"kernel": "k", "unread": [], "shared": 1024, "tmem": 256, "registers": 168, "spilled": 0}
     record = {"name": "case", "limit": 2048, "tmem_limit": 512, "kernels": [within]}
     assert not mosaic_failures([record])
-    for past in ({"shared": 4096}, {"tmem": 513}, {"spilled": 40}):
+    for past in ({"shared": 4096}, {"tmem": 513}):
         assert mosaic_failures([{**record, "kernels": [{**within, **past}]}])
+    spilled = {**record, "kernels": [{**within, "spilled": 40}]}
+    assert not mosaic_failures([spilled])
+    assert any(row.get("spilled") == 40 for row in spilled["evidence"])
     # A kernel whose reports state no resources, spilling nothing, is no evidence: it fails, as a record
     # with no kernel does (row 1877: a contract gate read only its shared count and positive spills).
     unstated = {**within, "unread": ["shared bytes", "tensor memory columns"], "shared": None, "tmem": None}
@@ -633,3 +703,58 @@ def test_splash_compiles_for_a_v5e_with_libtpu():
 
     found = compile_tpu_kernels([support.KernelCase("splash fp32", call)], "v5e")
     assert not [record for record in found if "error" in record], found
+
+
+def test_a_refusal_applies_only_to_the_target_capacities_that_generated_its_kernel():
+    """The same operand shapes and tile can lower for different device capacities in one process. A
+    refusal belongs to the target that generated it; rate-only differences do not change that tile's code."""
+    import dataclasses
+
+    from dew.nn.kernels.templates import report
+
+    launch = grouped_matmul.MosaicGmm()
+    x = jax.ShapeDtypeStruct((4096, 2048), jnp.bfloat16)
+    weights = jax.ShapeDtypeStruct((8, 2048, 4096), jnp.bfloat16)
+    sizes = jax.ShapeDtypeStruct((8,), jnp.int32)
+    arguments = launch.bind(x, weights, sizes, out_dtype="bfloat16", trans_rhs=False, interpret=False)
+    target = generation.TARGETS["sm90"]
+    with report.refusals(), generation.assumed(target):
+        tile = launch.derived(arguments, target)
+        report.refuse([(report._identity(launch, arguments), tile, {"dew_gmm"})])
+        assert report.refused(launch, arguments, tile)
+        with generation.assumed(dataclasses.replace(target, clock_hz=1.98e9)):
+            assert report.refused(launch, arguments, tile)
+        with generation.assumed(dataclasses.replace(target, multiprocessors=64)):
+            assert not report.refused(launch, arguments, tile)
+        with generation.assumed(dataclasses.replace(target, shared_limit=128 * 1024)):
+            assert not report.refused(launch, arguments, tile)
+
+
+def test_refusals_cross_processes_only_through_an_explicit_handoff(tmp_path):
+    """A shared compilation cache is not a shared derivation registry. A fresh process sees no foreign
+    refusals; a handed plan can seed exactly the refusals it exported."""
+    import json
+    import subprocess
+    import sys
+
+    tile = "mosaic_gpu.Tiles(128, 256, 64, 4, 8, warpgroups=2)"
+    preamble = ("import json, sys\n"
+                "from dew.nn.kernels import tuning\n"
+                "from dew.nn.kernels.templates import report\n"
+                "from dew.nn.kernels.templates.gemm import mosaic_gpu\n")
+    snapshot = ("print(json.dumps([[identity, tuning.encoded(config), sorted(kernels)] "
+                "for identity, config, kernels in report.refused_launches()]))")
+    environment = {**os.environ, "JAX_COMPILATION_CACHE_DIR": str(tmp_path / "cache")}
+
+    seed = preamble + f"report.refuse([('a launch', {tile}, {{'dew_gmm'}})])\n" + snapshot
+    exported = subprocess.run([sys.executable, "-c", seed], check=True, env=environment,
+                              capture_output=True, text=True).stdout
+    assert len(json.loads(exported)) == 1
+    fresh = subprocess.run([sys.executable, "-c", preamble + snapshot], check=True, env=environment,
+                           capture_output=True, text=True)
+    assert json.loads(fresh.stdout) == []
+    handoff = (preamble + "report.refuse((identity, tuning.decoded(config), kernels) "
+               "for identity, config, kernels in json.load(sys.stdin))\n" + snapshot)
+    handed = subprocess.run([sys.executable, "-c", handoff], check=True, env=environment,
+                            input=exported, capture_output=True, text=True)
+    assert json.loads(handed.stdout) == json.loads(exported)

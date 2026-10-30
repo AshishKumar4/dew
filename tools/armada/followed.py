@@ -139,6 +139,9 @@ PROBED = "probe:"
 """What a probed path's name is recorded under: a probe's answer is whether the path is there and of
 what kind, and a file's size, so ci.py's `contents` keys a probed directory by its kind, not by the
 entries a listing of it reads."""
+IMPORTED = "import:"
+"""What a top-level module a run imported is recorded under (executed.py): a helper of that name under
+tests/, which leads sys.path, would shadow it, so ci.py's `contents` keys whether tests/ holds one."""
 
 
 def opening(recorded: Callable[[str], None], root: str) -> None:
@@ -326,7 +329,9 @@ def follow() -> None:
             record["unfollowed"] = True
 
     def written() -> None:
-        ended = {**record, "files": sorted(record["files"]), "reads": sorted(record["reads"]),
+        # The top-level modules it imported: inputs of its file, as its pytest process's are (`IMPORTED`).
+        imported = {f"{IMPORTED}{module.partition('.')[0]}" for module in list(sys.modules)}
+        ended = {**record, "files": sorted(record["files"] | imported), "reads": sorted(record["reads"]),
                  "ended": time.time()}
         # Whole or not at all, beside the mark, which stays: the parent may read either as this child ends.
         partial = directory / f"{os.getpid()}.partial"

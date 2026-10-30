@@ -212,6 +212,33 @@ def test_a_configured_run_compiles_its_step_ahead_for_gpus_it_lacks_and_trains_n
     assert not runs.exists()
 
 
+def test_a_run_on_the_examples_clock_compiles_its_step_ahead_reading_its_progress(tmp_path):
+    """A decision run bounded in examples, which its objective expands after its bound so no pass counts
+    its steps, keeps its progress on the examples clock: compiled ahead for a GPU it lacks, its step reads
+    that progress as fit's does (`Trainer.reading`), under a schedule over the run (`Linear`), and the run
+    ends with the step saved, where it was compiled over no clock and refused the schedule (row 2434)."""
+    from test_run_options import decision
+
+    from dew.decision.config import DecisionRunConfig
+    from dew.training.ahead import AheadOfTime, CompiledAhead
+
+    runs, path = tmp_path / "runs", tmp_path / "step.dew-aot"
+    default = decision(tmp_path, drawn=False)
+    assert isinstance(default, DecisionRunConfig)
+    run = DecisionRunConfig.cli(["--trainer.name", "ahead", "--trainer.checkpoint-dir", str(runs),
+                                 "--trainer.examples", "16", "--optim.learning-rate",
+                                 '{"class": "linear", "fields": {"peak_value": 0.001}}',
+                                 "--trainer.compile-ahead.generation", "sm80",
+                                 "--trainer.compile-ahead.devices", "1",
+                                 "--trainer.compile-ahead.path", str(path),
+                                 "--trainer.compile-ahead.capacity-gib", "4"],
+                                default=default)
+    with pytest.raises(CompiledAhead) as ended:
+        run.run()
+    assert ended.value.code == 0
+    assert AheadOfTime.load(path).peak_bytes > 0
+
+
 ACCUMULATION_CELLS = [("sm80", "bfloat16"), ("sm90", "float32")]
 """Each generation and each compute dtype once (testing.md's pairwise settings): a bfloat16 step reads
 its parameters through narrow copies on a GPU (`dew.training.narrow`), a float32 step reads them whole."""
@@ -358,8 +385,33 @@ def test_a_step_compiled_ahead_records_the_links_its_program_was_decided_by():
     batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
     target = MeshSpec(tensor=2).build(compile_only_gpus("sm90", 2))
     saved = compile_ahead(latent(target), batch)
-    assert saved.links == {"tensor": None}
+    assert saved.links["tensor"].bytes_per_second is None
     assert compile_ahead(latent(target, links=FAST), batch).program != saved.program
+
+
+def test_a_stated_link_is_the_one_a_step_compiled_ahead_records_and_a_handed_run_traces_with(caplog):
+    """A step compiled ahead over a link its trainer states, as `--trainer.compile-ahead.links` states
+    one, records that link whole, bandwidth and peak, and is the program a stated link spreads by; a run
+    handed it that states another traces with the step's, and says so once (train 300's review: the
+    step recorded the bandwidth alone, so a run stating the same link traced with its own peak)."""
+    from dew.config.lm import LMRunConfig
+    from dew.training.ahead import compile_ahead, compile_only_gpus
+
+    batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
+    target = MeshSpec(tensor=2).build(compile_only_gpus("sm90", 2))
+    stated = compile_ahead(latent(target, links=FAST), batch)
+    (recorded,) = stated.links.values()
+    assert (recorded.bytes_per_second, recorded.flops_per_second, recorded.spread) == (1e18, 1e9, True)
+    assert stated.program != compile_ahead(latent(target), batch).program
+    other = {"tensor": Link(1.0, 1.0)}
+    with caplog.at_level("WARNING", logger="dew.training.ahead"):
+        assert stated.over(other) == stated.over(FAST) == stated.links
+    assert len(caplog.records) == 1
+    parsed = LMRunConfig.cli(["trainer.compile-ahead:ahead", "--trainer.compile-ahead.generation", "sm90",
+                              "--trainer.compile-ahead.devices", "2", "--trainer.compile-ahead.path", "step",
+                              "--trainer.compile-ahead.links",
+                              '{"tensor": {"bytes_per_second": 1e18, "flops_per_second": 1e9}}'])
+    assert parsed.trainer.compile_ahead is not None and parsed.trainer.compile_ahead.links == FAST
 
 
 @pytest.mark.gpu(reason="loads a step compiled ahead over a tensor axis onto two GPUs")
