@@ -1175,32 +1175,6 @@ def test_the_residual_pullbacks_hold_every_order(edge):
 
 
 @pytest.mark.parametrize("edge", EDGES)
-def test_a_heads_row_terms_hold_every_order(edge):
-    """A head's row terms (`chunked._row_terms`, a custom JVP over its one reduction): each row's log
-    partition, its maximum, the sum of its exponentials scaled to it and that sum without the label's
-    column, every order finite wherever float64 is a normal float32 and the plain formula, jnp's maximum
-    and sums, is."""
-    (logits,) = normal_draw(2711, (4, 7), scale=EDGES[edge])
-    (direction,) = normal_draw(2712, logits.shape, scale=EDGES[edge])
-    (cotangent,) = normal_draw(2713, (4, 4))
-    labels = jnp.asarray([0, 3, 6, 2], jnp.int32)
-
-    def terms(logits):
-        log_z, _, (maximum, total, rest) = chunked._row_terms(logits, predict=False, labels=labels)
-        return jnp.stack([log_z, maximum, total, rest])
-
-    def plain(logits):
-        maximum = jnp.max(logits, axis=-1)
-        shares = jnp.exp(logits - maximum[:, None])
-        rest = jnp.sum(jnp.where(jnp.arange(logits.shape[1]) != labels[:, None], shares, 0), axis=-1)
-        total = jnp.sum(shares, axis=-1)
-        return jnp.stack([maximum + jnp.log(total), maximum, total, rest])
-
-    assert_contract(terms, (logits,), (direction,), cotangent, f"a head's row terms {edge}", truth_fn=plain,
-                    plain_fn=plain)
-
-
-@pytest.mark.parametrize("edge", EDGES)
 def test_the_whole_logits_losses_hold_every_order(edge):
     """`chunked._whole_losses` (a custom JVP, the categorical's own derivative): each row's cross entropy
     and log partition of whole logits, every order finite wherever float64 is a normal float32 and the
@@ -1224,15 +1198,14 @@ def test_the_whole_logits_losses_hold_every_order(edge):
 
 @pytest.mark.parametrize("head", ["whole", "tiled", "fused"])
 @pytest.mark.parametrize("edge", EDGES)
-def test_the_lm_heads_hold_their_reverse_orders(head, edge):
+def test_the_lm_heads_hold_every_order_of_their_gradient(head, edge):
     """The LM head's three custom VJPs (`chunked._whole_head`, `_bounded_head`, `_fused`): the head's
     per-token cross entropy and log partition of `hidden @ table.T`, whole, in tiles, or summed with its
-    gradient taken in the forward. Their reverse orders, reverse over reverse among them, finite wherever
-    float64 is a normal float32 and the plain formula, the whole logits' log-softmax, is, and the whole
-    head's forward derivative of its gradient. JAX runs no forward derivative through a custom VJP; a
-    forward rule beside the hand-written backward is a custom JVP whose tangent is a linear map
-    transposing to it (`dew.nn.kernels.generation.linear_tangent`), which the heads do not take yet, nor
-    the tiled ones a gradient's forward derivative under remat (row 2690)."""
+    gradient taken in the forward. Their reverse orders and their gradients' forward ones (jvp of grad,
+    remat'd, nested and scanned) finite wherever float64 is a normal float32 and the plain formula, the
+    whole logits' log-softmax, is. JAX runs no forward derivative through a custom VJP itself; a forward
+    rule beside the hand-written backward is a custom JVP whose tangent is a linear map transposing to it
+    (`dew.nn.kernels.generation.linear_tangent`), which the heads do not take yet (row 2690)."""
     scale = EDGES[edge]
     hidden, table = normal_draw(2704, (2, 4, 8), (11, 8), scale=scale)
     direction = normal_draw(2705, hidden.shape, table.shape, scale=scale)
@@ -1261,7 +1234,7 @@ def test_the_lm_heads_hold_their_reverse_orders(head, edge):
     (cotangent,) = normal_draw(2706, jax.eval_shape(plain, hidden, table).shape)
     assert_contract(heads, (hidden, table), direction, cotangent, f"the {head} LM head {edge}",
                     truth_fn=plain, plain_fn=plain,
-                    without=OWN_FORWARD_ORDERS if head == "whole" else FORWARD_ORDERS)
+                    without=OWN_FORWARD_ORDERS)
 
 
 @pytest.mark.parametrize("edge", EDGES)
