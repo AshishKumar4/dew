@@ -375,7 +375,7 @@ class Decide(SavedRunTask, InItsForm):
     def averaged(cls, runs: Sequence[str], *, step: int | str | None = None, ema: bool | None = None,
                  calibrate_on: "Iterable[Example | Mapping[str, object]] | Reader | None" = None) -> Self:
         """The task over `runs`' weights as any runs average (`dew.checkpoints.averaged`: their fp32
-        mean, each run's at `step`, its latest where None, `averaged_runs`, and `ema` as `from_run`
+        mean, each run's at `step`, its latest where None, `SavedRun.at`, and `ema` as `from_run`
         reads them, a LoRA
         backbone's factors merged first), its calibration the identity, or refit on `calibrate_on`'s
         held-out answers (`calibrated`): temperatures are fitted to one set of weights.
@@ -387,10 +387,10 @@ class Decide(SavedRunTask, InItsForm):
         record each run's directory, step and whether its average was read, so it is no one run's:
         `save` writes it to a directory of its own as a run, which `from_run` and `dew.pipeline` then
         load, whatever its layout."""
-        from dew.checkpoints import averaged_pinned, averaged_runs
+        from dew.checkpoints import averaged_pinned
         from dew.inference.tasks import saved_settings
 
-        pinned = averaged_runs(runs, step)
+        pinned = [SavedRun.at(directory, step) for directory in runs]
         recorded = [run.record for run in pinned]
         settings = [saved_settings(saved, DecideSettings) for saved in recorded]
         padded = ("questions", "options")

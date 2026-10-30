@@ -314,21 +314,22 @@ class SavedRun:
         every reader of a run (a task, `dew.pipeline`, `dew export`) pins the one step. A task loaded
         from it compiles into the persistent cache (`persist_compilations`). `trust` names the
         packages outside Dew whose modules the record may import (`dew.registry.imported`)."""
-        run = cls._at(directory, step, trust)
+        run = cls.at(directory, step, trust)
         task = run.objective.saved_task
         chosen = (task.default_step(directory) if step is None and task is not None
                   and issubclass(task, SavedRunTask) else None)
         if chosen is None:
             return run
-        again = cls._at(directory, chosen, trust)
+        again = cls.at(directory, chosen, trust)
         if again.objective.saved_task is not task:
             raise ValueError(f"step {chosen} of {directory}, which its task loads by default, was written by "
                              f"{again.objective.__name__}, whose task is another; load a step with `step`")
         return again
 
     @classmethod
-    def _at(cls, directory: str, step: int | str | None, trust: Sequence[str]) -> SavedRun:
-        """The checkpoint of the run in `directory` at `step`, its latest where None (`pinned`)."""
+    def at(cls, directory: str, step: int | str | None = None, trust: Sequence[str] = ()) -> SavedRun:
+        """The checkpoint of the run in `directory` at `step`, its latest where None, whatever step its task
+        loads by default (`pinned`): the step an average of runs reads (`dew.checkpoints.averaged`)."""
         from dew.checkpoints import Checkpoints
         from dew.registry import import_trusted, objectives
         persist_compilations()
