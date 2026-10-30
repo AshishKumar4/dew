@@ -955,10 +955,11 @@ def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
     does not declare. A record in today's shapes passes as it is. Carried to 1.0, when it is deleted
     (ledger 1552)."""
     fields = record.get("fields")
-    if isinstance(fields, Mapping) and isinstance(fields.get("segments"), list | tuple):
+    segments = fields.get("segments") if isinstance(fields, Mapping) else None
+    if isinstance(fields, Mapping) and isinstance(segments, list):
         # A decision run's row of segments, in today's fields (`earlier_segments`).
-        record = {**record, "fields": {**fields, "segments": earlier_segments(fields["segments"])}}
-        fields = record["fields"]
+        fields = {**fields, "segments": earlier_segments(segments)}
+        record = {**record, "fields": fields}
     if not isinstance(fields, Mapping) or not isinstance(fields.get("trainer"), Mapping):
         return record
     trainer, fields = dict(fields["trainer"]), dict(fields)
