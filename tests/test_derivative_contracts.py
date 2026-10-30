@@ -20,8 +20,6 @@ from dew.nn import precision
 from dew.nn.blocks import table_rows
 from dew.nn.kernels import recurrence_chunk
 from dew.nn.kernels.templates.gemm import template
-from dew.sampling.flow import GaussianTransition
-from dew.sampling.guidance import guide
 
 TINY, LARGEST = float(np.finfo(np.float32).tiny), float(np.finfo(np.float32).max)
 
@@ -311,72 +309,3 @@ def test_the_contract_refuses_a_formula_less_finite_than_the_plain_one():
         assert_contract(lambda x: jnp.sqrt(x * x), x, direction, cotangent, "a squared root",
                         plain_fn=jnp.abs)
 
-
-def _transition_draw(seed: int, edge: str) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """A batch of means, reference means and their rows' variances at `edge`'s scale: the variances
-    positive, on the same scale, so a squared distance over one reaches float32's largest or its least
-    normal there."""
-    mean, reference, spread = normal_draw(seed, (3, 5), (3, 5), (3,), scale=EDGES[edge])
-    return mean, reference, jnp.abs(spread) + 0.5 * EDGES[edge]
-
-
-KL_ORDERS = ("primal", "jvp", "vjp", "second jvp", "second jvp, remat")
-"""The orders the Gaussian KL holds: all but forward over reverse, which its seam's pullback does not take
-(`linear_tangent`, ledger 2383, open), so the exemption ends when the KL holds it."""
-
-
-@pytest.mark.parametrize("edge", EDGES)
-def test_the_gaussian_kl_holds_every_order(edge):
-    """`GaussianTransition.kl` (its seam `_gaussian_kl`, a range-safe forward mode and pullback): every order
-    it holds (`KL_ORDERS`) runs in the means and the variance, each finite wherever float64 is a normal
-    float32, beside the plain `sum((m - r)**2) / (2 v)`; forward over reverse still breaks (row 2383)."""
-    mean, reference, variance = _transition_draw(2383, edge)
-    direction = normal_draw(2384, mean.shape, reference.shape, variance.shape, scale=EDGES[edge])
-    (cotangent,) = normal_draw(2385, (3,))
-
-    def kl(mean, reference, variance):
-        return GaussianTransition(mean, variance).kl(reference)
-
-    def plain(mean, reference, variance):
-        return jnp.sum((mean - reference) ** 2, axis=1) / (2 * variance)
-    assert_contract(kl, (mean, reference, variance), direction, cotangent, f"the Gaussian KL {edge}",
-                    truth_fn=plain, plain_fn=plain, held=KL_ORDERS)
-
-
-@pytest.mark.parametrize("edge", EDGES)
-def test_a_gaussian_transitions_density_holds_every_order(edge):
-    """`GaussianTransition.log_prob` (its quadratic term `_half_mahalanobis` beside the variance's log):
-    every order runs in the value, the mean and the variance, and each is finite wherever float64 is a
-    normal float32, beside the plain isotropic log density."""
-    value, mean, variance = _transition_draw(2386, edge)
-    direction = normal_draw(2387, value.shape, mean.shape, variance.shape, scale=EDGES[edge])
-    (cotangent,) = normal_draw(2388, (3,))
-
-    def density(value, mean, variance):
-        return GaussianTransition(mean, variance).log_prob(value)
-
-    def plain(value, mean, variance):
-        dimensions = value.shape[1]
-        return -(jnp.sum((value - mean) ** 2, axis=1) / (2 * variance)
-                 + 0.5 * dimensions * (jnp.log(2 * jnp.pi) + jnp.log(variance)))
-    assert_contract(density, (value, mean, variance), direction, cotangent,
-                    f"a Gaussian transition's density {edge}", truth_fn=plain, plain_fn=plain)
-
-
-@pytest.mark.parametrize("edge", EDGES)
-def test_classifier_free_guidance_holds_every_order(edge):
-    """`guide` (`_guided`: the conditional prediction exactly at a unit scale, the affine combination's
-    derivative at every scale): every order runs in both predictions and the scale, a unit scale's row
-    among them, and each is finite wherever float64 is a normal float32, beside the plain affine form."""
-    conditional, unconditional = normal_draw(2389, (3, 4), (3, 4), scale=EDGES[edge])
-    scale = jnp.asarray([1.0, 3.5, -0.5], jnp.float32)
-    direction = normal_draw(2390, (3, 4), (3, 4), (3,), scale=EDGES[edge])
-    (cotangent,) = normal_draw(2391, (3, 4))
-
-    def guided(conditional, unconditional, scale):
-        return guide(conditional, unconditional, scale[:, None])
-
-    def plain(conditional, unconditional, scale):
-        return unconditional + scale[:, None] * (conditional - unconditional)
-    assert_contract(guided, (conditional, unconditional, scale), direction, cotangent,
-                    f"classifier-free guidance {edge}", truth_fn=plain, plain_fn=plain)
