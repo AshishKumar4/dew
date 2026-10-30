@@ -473,7 +473,7 @@ def test_a_biased_query_of_one_key_has_nonzero_gradient_terms_where_its_gradient
         _, pull = jax.vjp(lambda q, k, v, b: scaled_dot_product_attention(
             q, k, v, bias=b, causal=True, implementation="reference"), query, key, value, bias)
         dq = np.asarray(pull(dout)[0])
-    assert np.all(np.abs(dq[:, 0]) < 1e-12) and np.all(dq_terms[:, 0] > 0)
+    assert np.all(dq[:, 0] == 0) and np.all(dq_terms[:, 0] > 0)
     assert bias_terms.shape == bias.shape
 
 
