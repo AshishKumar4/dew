@@ -24,9 +24,9 @@ from dew.nn.kernels.templates import mosaic
 LOG2E = math.log2(math.e)
 """`exp(z) = exp2(z log2(e))`: the scan's decays are exp2 of the rate scaled by it."""
 
-RESET_WIDTH = 16
-"""The columns a row's resets take in their stream: the narrowest an int8 tile's TMA box takes (16 bytes),
-every column the token's flag."""
+RESET_WIDTH = 32
+"""The columns a row's resets take in their stream, every column the token's flag: the narrowest an int8 tile
+both families stage (an sm80 stage swizzles 32 bytes at least, a TMA box takes 16)."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -56,6 +56,11 @@ class Scan:
         return self.channels // self.block
 
 
+def _down(i):
+    """A stream's step `i`: its view's `i`-th block of rows, the whole width."""
+    return i, 0
+
+
 def forward(x, dt, rates, b, c, skip, state, resets, scan: Scan):
     """The scan's outputs from padded operands: `x`, `dt` `[R, T, D]`, `rates` `[N, D]` fp32 (`A log2(e)`),
     `b`, `c` `[R, T, N]`, `skip` `[D]` fp32, `state` `[R, N, D]` fp32 and `resets` `[R, T, RESET_WIDTH]` int8
@@ -77,19 +82,22 @@ def forward(x, dt, rates, b, c, skip, state, resets, scan: Scan):
               *entered_ref):
         row, part = lax.axis_index("rows"), lax.axis_index("blocks")
         columns = pl.ds(part * block, block)
-        views = {"x": (x_ref.at[row], lambda i: (i, part)), "dt": (dt_ref.at[row], lambda i: (i, part)),
-                 "b": (b_ref.at[row], lambda i: (i, 0)), "c": (c_ref.at[row], lambda i: (i, 0))}
+        # Each view the program's own columns, its steps down its rows (an sm80 pipeline's index map takes
+        # no traced block index).
+        views = {"x": (x_ref.at[row, :, columns], _down), "dt": (dt_ref.at[row, :, columns], _down),
+                 "b": (b_ref.at[row], _down), "c": (c_ref.at[row], _down)}
         if scan.packed:
-            views["resets"] = (resets_ref.at[row], lambda i: (i, 0))
+            views["resets"] = (resets_ref.at[row], _down)
 
         def body(staged, *, streams):
             rates_smem, skip_smem, state_smem, out_smem, loads = staged
-            family.loaded([(rates_ref.at[:, columns], rates_smem, loads.at[0]),
-                           (skip_ref.at[columns], skip_smem, loads.at[1]),
-                           (state_ref.at[row, :, columns], state_smem, loads.at[2])])
             opened = family.opened(streams, views)
 
             def consumer(wg):
+                # The consumer's own loads: a producer role takes none of them.
+                family.loaded([(rates_ref.at[:, columns], rates_smem, loads.at[0]),
+                               (skip_ref.at[columns], skip_smem, loads.at[1]),
+                               (state_ref.at[row, :, columns], state_smem, loads.at[2])])
                 rates = [rates_smem[n, :] for n in range(states)]
                 skip = skip_smem[...]
 
