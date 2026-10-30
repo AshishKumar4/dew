@@ -6,7 +6,6 @@ import dataclasses
 
 import jax
 import jax.numpy as jnp
-import pytest
 
 from dew.optim import OptimConfig, ParamGroup
 
@@ -20,18 +19,21 @@ def decayed(config: OptimConfig) -> dict[str, bool]:
     return {name: bool(jnp.any(leaf != 0)) for name, leaf in updates["dense"].items()}
 
 
-@pytest.mark.parametrize("groups", [(), (ParamGroup("all", ("*",)),)], ids=["ungrouped", "grouped"])
-def test_a_decay_spares_biases_unless_told_not_to_and_a_group_follows_its_config(groups):
-    """The decay spares a bias, as nanoGPT's, Megatron Core's and timm's split does (`OptimConfig.spared`),
-    and decays it where the config says not to spare, as Optax does; a group that says nothing follows
-    its config, grouped or not, and one that says spares as it says."""
-    config = OptimConfig(optimizer="adamw", learning_rate=1e-2, weight_decay=0.1, param_groups=groups)
+def test_a_decay_spares_biases_unless_told_not_to_and_a_group_decays_what_it_claims():
+    """The ungrouped decay spares a bias, as nanoGPT's, Megatron Core's and timm's split does
+    (`OptimConfig.spared`), and decays it where the config says not to spare, as Optax does. A param
+    group decays every parameter it claims, as a torch parameter group does, unless it spares; a run's
+    default fresh groups decay as its ungrouped optimizer would (`OptimConfig.fresh_groups`)."""
+    config = OptimConfig(optimizer="adamw", learning_rate=1e-2, weight_decay=0.1)
     assert decayed(config) == {"kernel": True, "bias": False}
     assert decayed(dataclasses.replace(config, spared=False)) == {"kernel": True, "bias": True}
-    if groups:
-        sparing = dataclasses.replace(config, spared=False,
-                                      param_groups=(ParamGroup("all", ("*",), spared=True),))
-        assert decayed(sparing) == {"kernel": True, "bias": False}
+    claimed = dataclasses.replace(config, param_groups=(ParamGroup("all", ("*",)),))
+    assert decayed(claimed) == {"kernel": True, "bias": True}
+    sparing = dataclasses.replace(config, param_groups=(ParamGroup("all", ("*",), spared=True),))
+    assert decayed(sparing) == {"kernel": True, "bias": False}
+    for switch in (True, False):
+        assert all(group.spared is switch
+                   for group in dataclasses.replace(config, spared=switch).fresh_groups())
 
 
 def test_a_users_persistent_cache_thresholds_stay_theirs(tmp_path, monkeypatch):
