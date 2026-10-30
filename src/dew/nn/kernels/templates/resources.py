@@ -20,6 +20,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from dew.nn.kernels.templates import cost
 
 if TYPE_CHECKING:
+    from dew.nn.kernels.generation import GpuTarget
     from dew.nn.kernels.templates.mosaic import Family
 
 
@@ -289,6 +290,19 @@ class LaunchPlan:
     shared: int
 
 
+def _register_allocation(registers: int, consumers: int, producer: int, step: int) -> int:
+    consumed = -(-registers // step) * step
+    produced = -(-producer // step) * step
+    return (consumers * consumed + produced) * THREADS
+
+
+def register_programs(family: "Family", consumers: int) -> int:
+    """Programs held by the family's role allocations, including the producer where it has one."""
+    producer = producer_registers(consumers) if family.warpgroups(consumers) > consumers else 0
+    allocated = _register_allocation(family.registers(consumers), consumers, producer, family.register_step)
+    return cost.REGISTERS // allocated
+
+
 @dataclasses.dataclass(frozen=True)
 class RegisterModel:
     """A launch's register decision as its template's model states it, which the compile gate holds the
@@ -304,15 +318,45 @@ class RegisterModel:
     step: int
     producer: int
     shared: int | None = None
+    family: "Family | None" = dataclasses.field(default=None, compare=False, repr=False)
+
+    def resident(self, registers: int, *, honored: bool = RAISES_HONORED) -> int:
+        """Residency at this consumer allocation, bounded by the launch's other resources."""
+        producer = self.producer if honored or not self.producer else registers
+        allocated = _register_allocation(registers, self.consumers, producer, self.step)
+        return min(self.most, cost.REGISTERS // allocated) if allocated else self.most
+
+    def cap(self, programs: int, *, honored: bool = RAISES_HONORED) -> int:
+        """The consumer cap that leaves room for `programs` copies of this launch."""
+        share = cost.REGISTERS // (THREADS * programs)
+        if honored or not self.producer:
+            return (share - self.producer) // self.consumers // self.step * self.step
+        return share // (self.consumers + 1) // self.step * self.step
+
+    def record(self) -> dict:
+        """The model's numeric facts; its live family supplies rules, not serialized state."""
+        return {field.name: getattr(self, field.name) for field in dataclasses.fields(self)
+                if field.name != "family"}
 
 
 def register_model(family: "Family", consumers: int, registers: int | None, *,
-                   shared: int | None = None) -> RegisterModel:
+                   shared: int | None = None, target: "GpuTarget | None" = None,
+                   tmem: int = 0) -> RegisterModel:
     """`family`'s register decision for a launch of `consumers` whose consumer thread holds `registers`
     (`RegisterModel`): its producer's registers where its layout has one (`Family.warpgroups`)."""
-    producer = family.warpgroups(consumers) > consumers
-    return RegisterModel(registers, family.registers(consumers), consumers, family.programs(consumers),
-                         family.register_step, producer_registers(consumers) if producer else 0, shared)
+    warpgroups = family.warpgroups(consumers)
+    most = register_programs(family, consumers)
+    if target is not None:
+        from dew.nn.kernels import generation
+
+        most = min(most, target.architecture.resident_threads // (warpgroups * THREADS))
+        if shared is not None:
+            block = generation.shared_budget(target)
+            most = next((count for count in range(most, 0, -1) if shared <= program_shared(block, count)), 0)
+        if tmem:
+            most = min(most, (target.tmem_columns or 0) // tmem)
+    return RegisterModel(registers, family.registers(consumers), consumers, most, family.register_step,
+                         producer_registers(consumers) if warpgroups > consumers else 0, shared, family)
 
 
 @dataclasses.dataclass(frozen=True)

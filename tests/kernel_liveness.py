@@ -20,15 +20,14 @@ from jaxlib.mlir.dialects import gpu, llvm
 from jaxlib.mosaic.python import mosaic_gpu as mosaic_gpu_dialect
 
 from dew.nn.kernels.generation import GpuTarget
-from dew.nn.kernels.templates import cost, resources
+from dew.nn.kernels.templates import resources
 
 
 @dataclasses.dataclass(frozen=True)
 class Compiler:
-    """The assembler whose scheduling the estimate describes. Relocatable assembly ignores register
-    raises; CUDA 13 streams transcendental chains that CUDA 12 keeps as vectors."""
+    """The assembler whose scheduling the estimate describes: CUDA 13 streams transcendental chains
+    that CUDA 12 keeps as vectors."""
     version: tuple[int, int]
-    relocatable: bool
 
 
 FREE = {"arith.constant", "llvm.mlir.constant", "llvm.mlir.undef", "llvm.mlir.poison", "llvm.mlir.zero",
@@ -646,22 +645,23 @@ class LoweredRegisters:
     raised: int
     where: str
 
-    def model(self, target: GpuTarget, compiler: Compiler, *, shared: int, tmem: int
-              ) -> resources.RegisterModel:
-        """Its launch budget and residency, from this launch's geometry and resource allocations."""
-        groups = self.threads // resources.THREADS
-        consumers = groups - bool(self.producer)
-        entry = resources.entry_registers(groups)
-        budget = self.raised if self.raised and not compiler.relocatable else entry
-        most = cost.resident(target, shared, self.threads, entry, tmem=tmem)
-        producer = (self.producer if not compiler.relocatable else budget) if self.producer else 0
-        return resources.RegisterModel(self.registers, budget, consumers, most, cost.REGISTER_STEP,
-                                       producer, shared)
+    def model(self, stated: resources.RegisterModel, target: GpuTarget, *, shared: int,
+              tmem: int) -> resources.RegisterModel:
+        """Apply the launch's family rules to its observed geometry and estimated live registers."""
+        family = stated.family
+        if family is None:
+            raise ValueError("lowered register evidence needs the launch's declared family")
+        producers = family.warpgroups(stated.consumers) - stated.consumers
+        consumers = self.threads // resources.THREADS - producers
+        if consumers < 1:
+            raise ValueError("the launch geometry does not hold its family's consumer roles")
+        return resources.register_model(family, consumers, self.registers, shared=shared, target=target,
+                                        tmem=tmem)
 
 
 def lowered_registers(module: bytes, compiler: Compiler) -> list[LoweredRegisters]:
     """Analyze the module an existing Mosaic custom call carries, without tracing or compiling it again.
-    The compiler version and assembly mode are inputs, never read from a process-global installation."""
+    The compiler version is an input, never read from a process-global installation."""
     found = []
     for name, peak, _ in kernel_peaks(module, compiler):
         if peak.threads is None:
