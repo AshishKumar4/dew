@@ -74,12 +74,18 @@ def rolled_out(rollout: Rollout | None, state: TrainState, batch: Batch, mesh: M
         return batch
     began = time.perf_counter()
     key = jax.random.fold_in(jax.random.fold_in(state.key, state.step), 1)
-    # A rollout drawing past its step's batch is any callable, so the trainer reads it at this boundary.
-    further = {"further": run.further(interval)} if getattr(rollout, "draws_further", False) else {}
+    further = {"further": run.further(interval)} if _draws_further(rollout) else {}
     with run.held():
         batch = shard_batch(mesh, marked(rollout(state, batch, key, **further)))
     interval.rollout_seconds += time.perf_counter() - began
     return batch
+
+
+def _draws_further(rollout: Rollout) -> bool:
+    """Whether the rollout reads data batches past its step's (`Rollout`'s `draws_further`), which a
+    rollout is any callable and a plain function declares none of, so the trainer reads it at this
+    boundary."""
+    return getattr(rollout, "draws_further", False)
 
 
 def _branched(rollout: Rollout | None, name: str) -> contextlib.AbstractContextManager:

@@ -559,53 +559,12 @@ def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | N
                         None if blocks is None else _context(model, params, updated))
 
             def rebuild():
-                """Recompute the prefix at its new table, Phi-3's intended policy, every cache with it.
-
-                Transformers 5.16.1 slices to one token before clearing KV:
-                at the tiny fixture's position 8 its hook sees [[32], [59]],
-                no cache, and predicts 2 where its full-prefix forward predicts
-                32. Rebuilding the prefix retains the prompt's information.
-                https://github.com/huggingface/transformers/issues/49334
-                """
-                width, rows = history.shape[1], jnp.arange(tokens.shape[0])[:, None]
-                real = jnp.arange(width)[None, :] < following[:, None]
-                empty = with_rounding_keys_of(
-                    _empty_cache(model, params, tokens.shape[0], depths, blocks is not None), state.cache)
-                answer, updated = model.apply(
-                    {**params, 'cache': empty}, history, coordinates=laid_out(history.shape, valid=real),
-                    decode=True, mutable=['cache', *(['embeddings'] if depths else []), *recorded],
-                    method='states_and_logits' if exposed else None)
-                states = answer[0] if exposed else None
-                reseeded = dataclasses.replace(state, cache=updated['cache'])
-                context = None
-                if blocks is not None:
-                    # The drafter's windows over the history's context, as a prefill records them.
-                    context = _context(model, params, updated)
-                    reseeded = blocks[0](reseeded, context, real)
-                    context = context[rows, slots]
-                if depths and states is not None:
-                    # The depths' caches and predecessors over the history, as a prefill seeds them.
-                    reseeded = dataclasses.replace(reseeded, drafts=(states[rows[:, 0], following - 1],)
-                                                   * (depths - 1))
-                    embedded = jax.tree.leaves(updated['embeddings'])[0]
-                    reseeded = _seeded_depths(made, reseeded, states, embedded, real, None, tokens.shape[0],
-                                              width)
-
-                def answered(fresh, held):
-                    # The same answer `append` gives, states beside the logits where the model exposes
-                    # them: each token up to the change the short table's, past it the rebuilt one's.
-                    return jnp.where(before.reshape(*before.shape, *(1,) * (held.ndim - 2)), held,
-                                     fresh[rows, slots])
-
-                fresh = (jax.tree.map(answered, answer, ordinary[0]), reseeded.cache, reseeded.drafts,
-                         None if context is None else jnp.where(
-                             before.reshape(*before.shape, *(1,) * (context.ndim - 2)), ordinary[3], context))
-
-                def replaced(fresh, held):
-                    selected = crossing.reshape(-1, *(1,) * (fresh.ndim - 1))
-                    return jnp.where(selected, fresh, held)
-
-                return jax.tree.map(replaced, fresh, ordinary)
+                fresh = _rebuilt(model, params, made, state, history, following, slots)
+                # A crossing row's tokens up to the change answer at the short table, the rest rebuilt.
+                answer, context = jax.tree.map(lambda fresh, held: _chosen(before, held, fresh),
+                                               (fresh[0], fresh[3]), (ordinary[0], ordinary[3]))
+                return jax.tree.map(lambda fresh, held: _chosen(crossing, fresh, held),
+                                    (answer, fresh[1], fresh[2], context), ordinary)
 
             answer, cache, drafts, context = jax.lax.cond(jnp.any(crossing), rebuild, lambda: ordinary)
             lengths, rebuilt = following, crossing
@@ -641,6 +600,55 @@ def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | N
     else:
         made = DecodeOps(advance, reindex, run, *_drafting(model, params, pad_id), depths)
     return made
+
+
+type _Answer = jax.Array | tuple[jax.Array, jax.Array]
+"""A decode call's answer: its logits, or its states beside them where the model exposes them."""
+
+
+def _rebuilt(model: nn.Module, params: Variables, ops: DecodeOps, state: DecoderState, history: jax.Array,
+             following: jax.Array, slots: jax.Array
+             ) -> tuple[_Answer, Variables, tuple[jax.Array, ...], jax.Array | None]:
+    """Recompute the prefix at its new table, Phi-3's intended policy, every cache with it: the answer
+    at each of a call's `slots` from the `history` of `following` tokens a row, the trunk's cache over it,
+    the prediction depths' and a block drafter's reseeded from it as `prefill_state` seeds them, and
+    the drafter's context at the slots, None without one.
+
+    Transformers 5.16.1 slices to one token before clearing KV:
+    at the tiny fixture's position 8 its hook sees [[32], [59]],
+    no cache, and predicts 2 where its full-prefix forward predicts
+    32. Rebuilding the prefix retains the prompt's information.
+    https://github.com/huggingface/transformers/issues/49334
+    """
+    exposed, drafter = isinstance(model, Exposing), ops.record is not None
+    (batch, width), rows = history.shape, jnp.arange(history.shape[0])[:, None]
+    real = jnp.arange(width)[None, :] < following[:, None]
+    empty = with_rounding_keys_of(_empty_cache(model, params, batch, ops.depths, drafter), state.cache)
+    answer, updated = model.apply(
+        {**params, 'cache': empty}, history, coordinates=laid_out(history.shape, valid=real), decode=True,
+        mutable=['cache', *(['embeddings'] if ops.depths else []),
+                 *(['prediction_inputs'] if drafter else [])],
+        method='states_and_logits' if exposed else None)
+    states = answer[0] if exposed else None
+    reseeded = dataclasses.replace(state, cache=updated['cache'])
+    context = None
+    if ops.record is not None:
+        # The drafter's windows over the history's context, as a prefill records them.
+        context = _context(model, params, updated)
+        reseeded = ops.record(reseeded, context, real)
+        context = context[rows, slots]
+    if ops.depths and states is not None:
+        # The depths' caches and predecessors over the history, as a prefill seeds them.
+        reseeded = dataclasses.replace(reseeded,
+                                       drafts=(states[rows[:, 0], following - 1],) * (ops.depths - 1))
+        embedded = jax.tree.leaves(updated['embeddings'])[0]
+        reseeded = _seeded_depths(ops, reseeded, states, embedded, real, None, batch, width)
+    return jax.tree.map(lambda leaf: leaf[rows, slots], answer), reseeded.cache, reseeded.drafts, context
+
+
+def _chosen(where: jax.Array, chosen: jax.Array, otherwise: jax.Array) -> jax.Array:
+    """`chosen` where `where` holds over its leading axes, else `otherwise`."""
+    return jnp.where(where.reshape(*where.shape, *(1,) * (chosen.ndim - where.ndim)), chosen, otherwise)
 
 
 def _drafting(model: nn.Module, params: Variables, pad_id: int):

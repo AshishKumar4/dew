@@ -111,6 +111,22 @@ def test_speculation_across_a_longrope_rebuild_reproduces_the_greedy_walk(kind):
     np.testing.assert_array_equal(np.asarray(speculated.lengths), 6)
 
 
+def stretch_verified(model, params, depths):
+    """The state and logits a stretch verified from a prompt's prefill leaves (`DecodeOps.verify`), the
+    decode running `depths` prediction depths, compiled once."""
+    from dew.nn.inputs import ModelInputs
+    from dew.sampling.text import decode_ops, prefill_state
+
+    ops = decode_ops(model, params, 0, depths)
+
+    @jax.jit
+    def verified(prompts, stretch):
+        state, _ = prefill_state(model, params, ModelInputs(prompts), ops)
+        return ops.verify(state, stretch, jnp.ones(stretch.shape, bool))[:2]
+
+    return verified
+
+
 CROSSING_SEEDS = {"depth": 8, "drafter": 8}
 """The crossing checks' declared draws of prompts and stretches (check 1), each decoder's the most
 either check took, sized by `seeds_for` paired on armada."""
@@ -146,12 +162,7 @@ def test_a_block_across_a_longrope_change_answers_each_token_as_the_walk_does(dr
 
         return lambda prompts, stretch: np.asarray(walked(jnp.asarray(prompts), jnp.asarray(stretch)))
 
-    ops = decode_ops(model, params, 0, depths)
-
-    @jax.jit
-    def verified(prompts, stretch):
-        state, _ = prefill_state(model, params, ModelInputs(prompts), ops)
-        return ops.verify(state, stretch, jnp.ones(stretch.shape, bool))[1]
+    verified = stretch_verified(model, params, depths)
 
     with jax.enable_x64(new_val=True):
         wide = walk(model.clone(dtype=jnp.float64), widened(params))
@@ -165,7 +176,7 @@ def test_a_block_across_a_longrope_change_answers_each_token_as_the_walk_does(dr
         rng = np.random.default_rng([0x1899, 1, seed])
         return tuple(rng.integers(1, model.vocab_size, (2, width)).astype(np.int32) for width in (5, 3))
 
-    assert_as_exact(as_given(lambda prompts, stretch: np.asarray(verified(prompts, stretch))),
+    assert_as_exact(as_given(lambda prompts, stretch: np.asarray(verified(prompts, stretch)[1])),
                     as_given(walk(model, params)), draw, f"a {drafting}'s block across a LongRoPE change",
                     seeds=CROSSING_SEEDS[drafting], truth_fn=truth)
 
@@ -205,16 +216,11 @@ def test_a_longrope_crossing_reseeds_the_drafter_as_a_prefill_of_its_history_doe
 
         return lambda prompts, stretch: floats(run(jnp.asarray(prompts), jnp.asarray(stretch)))
 
-    ops = decode_ops(model, params, 0, depths)
-
-    @jax.jit
-    def verified(prompts, stretch):
-        state, _ = prefill_state(model, params, ModelInputs(prompts), ops)
-        return ops.verify(state, stretch, jnp.ones(stretch.shape, bool))[0]
+    verified = stretch_verified(model, params, depths)
 
     @as_given
     def crossed(prompts, stretch):
-        after = verified(jnp.asarray(prompts), jnp.asarray(stretch))
+        after = verified(jnp.asarray(prompts), jnp.asarray(stretch))[0]
         assert np.asarray(after.rebuilt).all()
         return floats(after)
 
