@@ -409,21 +409,20 @@ def rows_alone(decide, batch):
     return np.concatenate([logits[place] for place in every]), grads
 
 
-PACKING_SEEDS = {"joint": 256, "marker": 64, "parallel": 256, "flash": 8, "readout": 8}
+PACKING_SEEDS = {"joint": 256, "marker": 8, "parallel": 8, "flash": 8, "readout": 8}
 """Check 1's declared seeds for each arm's packed window: the most paired sizing (`seeds_for` with the
-packed window as `dew_fn`) gives on any platform the site runs on. An H100 took 256 for the joint arm
-and 128 for the parallel arm (node receipts TL-h100-packing-size-*-3), an A100 128 for the joint arm
-and 256 for the parallel arm (SF-a100-packing-seeds), armada 16 and 8 (run-tests
-sf-packing-cpu-sizing-898ec4ac6). The marker arm's one window a draw (`PACKING_WINDOWS`) took 64 on an
-H100, 32 on an A100 (node receipts TL-h100-sizing-1851-679, TL-a100-sizing-1851-679) and 8 on armada
-(run-tests rows-memory-probe12-8ce8072b5), each with its confirming block, the largest declared as
-docs/design/testing.md's check 1 rules (d28b1c318);
-the flash arm's is an A100's, and the readout arm's 8 is an A100's
-(SF-readout-sizing), an H100's and armada's. The A100's are the head's gradients whose float64
-truth is zero by symmetry, which both arms err at by 0 to 3 fp32 ulps: the marker and parallel arms'
-scorer_out bias, shared by a question's options, and the joint arm's attention key biases (ledger
-1548). Twice the rows a draw took the same counts on an A100 (node receipts SF-packing-scale2-sizing),
-each draw twice the work."""
+packed window as `dew_fn`) gives on any platform the site runs on, each with its confirming block, the
+largest declared as docs/design/testing.md's check 1 rules (d28b1c318). The joint arm and the flash head
+run on GPUs alone, in the models' GPU flow (tests/test_gpu_models.py): an H100 took 256 for the joint arm
+(node receipts TL-h100-packing-size-*-3) and an A100 128 (SF-a100-packing-seeds); the flash arm's is an
+A100's. The marker and parallel arms run on armada's CPU alone (bible §7, no GPU unit tests), where
+both took 8 (run-tests sf-pack-sizing at 519299480, as sf-packing-cpu-sizing-898ec4ac6 and
+rows-memory-probe12-8ce8072b5 before it; on GPUs, where they no longer run, they took 64 to 256). The
+readout arm's 8 is an A100's (SF-readout-sizing), an H100's and armada's. The GPUs' larger counts are
+the head's gradients whose float64 truth is zero by symmetry, which both arms err at by 0 to 3 fp32
+ulps: the marker and parallel arms' scorer_out bias, shared by a question's options, and the joint arm's
+attention key biases (ledger 1548). Twice the rows a draw took the same counts on an A100 (node receipts
+SF-packing-scale2-sizing), each draw twice the work."""
 
 
 PACKING_WINDOWS = {"marker": 1}
