@@ -107,23 +107,30 @@ EDGES = {"normal": 1.0, "near the largest": 2.0**63, "near the least normal": 2.
 pairs) reach float32's largest or its least normal."""
 
 
-DELTA_RULE_EDGES = [edge for edge in EDGES if edge != "near the largest"]
-"""The chunked delta rule's edges: near float32's largest its forward over reverse is NaN where the token
-recurrence's is finite (ledger 2470, 2574), its red test kept for that row's fix."""
+DELTA_RULE_EDGES = {"normal": 1.0, "the largest its chunk holds": 2.0**62, "near the least normal": 2.0**-63}
+"""The chunked delta rule's edges: past 2^62 its chunk's inverse and products hold structural zeros against
+overflowed values (`0 * inf`), within a sequence and across packed documents (ledger 2608), whose head
+brings the edges it holds."""
 
 
-@pytest.mark.parametrize("edge", DELTA_RULE_EDGES)
-@pytest.mark.parametrize("packed", [False, True], ids=["one sequence", "packed"])
+@pytest.mark.parametrize(("packed", "edge"), [
+    *((False, edge) for edge in DELTA_RULE_EDGES),
+    # Packed documents in one chunk are not yet held apart against another's overflow (ledger 2608).
+    (True, "normal"), (True, "near the least normal")],
+    ids=lambda value: {False: "one sequence", True: "packed"}.get(value, value))
 def test_the_chunked_delta_rule_holds_every_order(packed, edge):
     """`recurrence_chunk.chunk_delta_rule` (the portable rule's custom derivative through
     `generation.linear_tangent`, rows 1861 and 1862): every order runs, its boolean document starts a
     residual with no tangent space, and each is finite wherever float64 is a normal float32 and JAX's own
     derivatives of the token recurrence are (`recurrent_delta_rule`, an independent formula of the same
-    rule), at queries, keys and values whose products near float32's ends, the decays and gates as drawn
-    (`DELTA_RULE_EDGES`)."""
+    rule, in float64 the truth too: the chunk's own float64 run excused its float32 NaNs wherever it was NaN
+    itself), at queries, keys and values whose products near float32's ends, the decays and gates as drawn
+    (`DELTA_RULE_EDGES`). A pair the chunk weighs zero once multiplied its overflowed tangent by zero, the
+    queries' second derivative NaN from 2^48 (ledger 2470)."""
     keys = jax.random.split(jax.random.key(1861), 8)
     rows, length, heads, width = 1, 37, 2, 8
-    query, key, value = (jax.random.normal(k, (rows, length, heads, width)) * EDGES[edge] for k in keys[:3])
+    scale = DELTA_RULE_EDGES[edge]
+    query, key, value = (jax.random.normal(k, (rows, length, heads, width)) * scale for k in keys[:3])
     g = -jax.nn.softplus(jax.random.normal(keys[3], (rows, length, heads, 1)))
     beta = jax.nn.sigmoid(jax.random.normal(keys[4], (rows, length, heads)))
     starts = jax.random.bernoulli(keys[5], 0.1, (rows, length)) if packed else None
@@ -135,10 +142,11 @@ def test_the_chunked_delta_rule_holds_every_order(packed, edge):
         return recurrence_chunk.recurrent_delta_rule(query, key, value, g, beta, starts=starts)[0]
 
     primals = (query, key, value, g, beta)
-    direction = tuple(jax.random.normal(keys[6], x.shape) * (EDGES[edge] if at < 3 else 1.0)
+    direction = tuple(jax.random.normal(keys[6], x.shape) * (scale if at < 3 else 1.0)
                       for at, x in enumerate(primals))
     cotangent = jax.random.normal(keys[7], query.shape)
-    assert_contract(rule, primals, direction, cotangent, f"the chunked delta rule {edge}", plain_fn=plain)
+    assert_contract(rule, primals, direction, cotangent, f"the chunked delta rule {edge}", truth_fn=plain,
+                    plain_fn=plain)
 
 
 def normal_draw(seed: int, *shapes, scale: float = 1.0) -> tuple:
