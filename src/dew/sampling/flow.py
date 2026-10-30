@@ -22,7 +22,7 @@ from jax.typing import ArrayLike
 
 from dew.diffusion.process import Denoiser, Process
 from dew.diffusion.schedules import RectifiedFlow, expand
-from dew.nn.kernels.generation import linear_map
+from dew.nn.kernels.generation import linear_tangent
 from dew.nn.precision import at_least_fp32, divided
 
 from .guidance import Guidance, Walk
@@ -220,39 +220,36 @@ def _divergence(mean: jax.Array, reference: jax.Array, variance: jax.Array) -> j
 
 
 @jax.custom_jvp
-def _gaussian_kl(mean: jax.Array, reference: jax.Array, variance: jax.Array) -> jax.Array:
-    """`_divergence`, the KL, whose derivative is one linear map (`linear_map`): its forward mode
-    `_directional`'s and its reverse mode `_pullback`'s, each formed from operands scaled to range, so a
-    tangent or a cotangent finite in float64 is finite here however far its terms pass float32's range
-    (two terms of 2**128 whose sum is 2**105); a higher order differentiates the two through XLA."""
+def _directional(mean: jax.Array, reference: jax.Array, variance: jax.Array) -> jax.Array:
+    """`_divergence`, whose forward mode is the plain `sum(d * (t_mean - t_reference)) / v - KL * t_v /
+    v` formed as the KL is: the tangents' difference (`_differences`), its sum of products against the
+    difference (`_summed_products`), each quotient as its significands' (`_quotient`), and the two terms
+    joined (`_sum`), each taken down only by what keeps it in range. Its tangent reads the tangents'
+    exponents, so it is forward mode alone: reverse mode is `_kl_pullback`'s (`linear_tangent`), and a
+    derivative of the reverse mode in forward mode is not defined."""
     return _divergence(mean, reference, variance)
 
 
-@_gaussian_kl.defjvp
-def _gaussian_kl_jvp(primals, tangents):
-    return _gaussian_kl(*primals), linear_map(_directional, _pullback, primals, tangents)
-
-
-def _directional(primals: tuple[jax.Array, ...], tangents: tuple[jax.Array, ...]) -> jax.Array:
-    """The KL's forward mode, the plain `sum(d * (t_mean - t_reference)) / v - KL * t_v / v` formed as the
-    KL is: the tangents' difference (`_differences`), its sum of products against the difference
-    (`_summed_products`), each quotient as its significands' (`_quotient`), and the two terms joined
-    (`_sum`), each taken down only by what keeps it in range."""
+@_directional.defjvp
+def _directional_jvp(primals, tangents):
+    """`_directional`'s tangent, the plain formula's, each step taken down only where it would overflow."""
     mean_tangent, reference_tangent, variance_tangent = tangents
     difference, shift, (quotient, power) = _divergence_parts(*primals)
     along, excess = _summed_products(difference, shift, *_differences(mean_tangent, reference_tangent))
     stretch, stretch_power = _split(variance_tangent)
     variance_term = _quotient(-(quotient * stretch), power + stretch_power, primals[2])
-    return _sum(_quotient(along, excess, primals[2]), variance_term)
+    moved = _sum(_quotient(along, excess, primals[2]), variance_term)
+    return _scaled(quotient, power), moved
 
 
-def _pullback(primals: tuple[jax.Array, ...], cotangent: jax.Array) -> tuple[jax.Array, ...]:
+def _kl_pullback(saved, operands, cotangent):
     """The KL's reverse mode, the plain formula's: each element's `cotangent * (mean - reference) /
     variance`, the reference's its negation, and the variance's `-cotangent * KL / variance`, each product
     of significands (`_split`) with its exponents added, each quotient as its significands' (`_quotient`),
     and each power restored once (`_scaled`)."""
-    difference, shift, (quotient, power) = _divergence_parts(*primals)
-    variance = primals[2]
+    del saved
+    difference, shift, (quotient, power) = _divergence_parts(*operands)
+    variance = operands[2]
     (scale, scale_power), (part, part_power) = _split(cotangent), _split(difference)
     level, spread = _split(variance)
     # The plain order, the product then the division, and the division IEEE's (`divided`), where
@@ -261,6 +258,11 @@ def _pullback(primals: tuple[jax.Array, ...], cotangent: jax.Array) -> tuple[jax
                      expand(scale_power - spread, part) + part_power + shift)
     to_variance = _quotient(-(scale * quotient), scale_power + power, variance)
     return pulled, -pulled, _scaled(*to_variance)
+
+
+def _measured(mean: jax.Array, reference: jax.Array, variance: jax.Array) -> tuple[jax.Array, tuple]:
+    """`_divergence`, with nothing its reverse mode keeps (`linear_tangent`'s `forward`)."""
+    return _divergence(mean, reference, variance), ()
 
 
 @jax.custom_jvp
@@ -302,6 +304,12 @@ def _half_mahalanobis_jvp(primals, tangents):
 def _half(power: jax.Array) -> jax.Array:
     """Half an integer power of two's exponent, rounded toward zero, the rest restored apart."""
     return (power.astype(jnp.float32) * 0.5).astype(jnp.int32)
+
+
+_gaussian_kl = linear_tangent(_measured, _kl_pullback, _directional)
+"""`_divergence` differentiated through Dew's seam (`dew.nn.kernels.generation.linear_tangent`): its
+forward mode `_directional`'s, its reverse mode `_kl_pullback`'s, each forming every difference,
+product and quotient from operands scaled to range."""
 
 
 def flow_transition(x: ArrayLike, velocity: ArrayLike, sigma: ArrayLike,
