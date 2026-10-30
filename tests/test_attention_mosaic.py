@@ -11,6 +11,8 @@ the device's, a site pinning one where it names a schedule (`tuning.pinned`)."""
 import contextlib
 import dataclasses
 import functools
+import gc
+import weakref
 
 import jax
 import jax.numpy as jnp
@@ -968,6 +970,44 @@ def test_the_backward_is_on_par_under_every_score_hook_interpreted(hooks, form):
     the interpreter: the gradients of the queries, keys and values, of each hook parameter and of the initial
     state."""
     _check_hooked_backward(hooks, form=form, interpret=True)
+
+
+@INTERPRETS
+def test_a_forward_kernel_built_for_its_facts_runs_each_calls_own_interpreted():
+    """The forward's kernel is built once for every call of its static facts (`_kernel_of`, row 2440): calls
+    alike but for their scale each run their own (a kernel of the first call's scale would give the second
+    the first's logits), each on par (check 1) with the reference's at its scale from float64."""
+    shape = SHAPES["interpreted"]
+    spans = template.spans(shape[1], shape[1], shape[0], causal=True)
+    for scale in (0.125, 0.5):
+        def ours(query, key, value, dout, scale=scale):
+            del dout
+            with _device(interpret=True):
+                return attention_mosaic.forward(query, key, value, spans, scale=scale, interpret=True)
+
+        def reference(query, key, value, dout, scale=scale):
+            del dout
+            return template.reference(query, key, value, spans, scale=scale)
+
+        assert_as_exact(jax.jit(ours), jax.jit(reference), _drawn(shape, jnp.bfloat16),
+                        f"mosaic forward at scale {scale}", seeds=SEEDS)
+
+
+@INTERPRETS
+def test_a_forward_kernel_built_for_its_facts_holds_no_calls_arrays_interpreted():
+    """The forward's kernel, built once for every call of its static facts (`_kernel_of`, row 2440), holds
+    none of a call's arrays, its operands' nor its hooks' (an initial state's sums): each is released once
+    the call is."""
+    shape = SHAPES["interpreted"]
+    spans = template.spans(shape[1], shape[1], shape[0], causal=True)
+    query, key, value, _ = _drawn(shape, jnp.bfloat16)(0)
+    hooks = template.Hooks(initial=template.sinks(jnp.linspace(-1.0, 1.0, shape[2]), shape[0], shape[1], 128))
+    held = [weakref.ref(array) for array in (query, key, value, hooks.initial.m, hooks.initial.acc)]
+    with _device(interpret=True):
+        jax.block_until_ready(attention_mosaic.forward(query, key, value, spans, hooks, interpret=True))
+    del query, key, value, hooks
+    gc.collect()
+    assert [ref() is None for ref in held] == [True] * len(held)
 
 
 @INTERPRETS
