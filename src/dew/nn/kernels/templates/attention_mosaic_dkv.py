@@ -199,6 +199,20 @@ KEY_ROWS = MappingProxyType({Kind.KEY: lambda entries: entries.sum(axis=-1)})
 program writes no head's or query's gradient (`DKV_GRADS`)."""
 
 
+def _tiles_added(family: mosaic.Family, refs, stage, place: tuple, k_first, index, interpret: bool, first,
+                 pieces) -> None:
+    """Each tile gradient of `pieces` (`[bk, its queries]`, queries from `first`) added into its place in the
+    keys-first `[B or 1, H or 1, Kp, Qp]` refs (`refs`), the one a parameter the batch rows or heads share
+    holds for the program's row and head (`place`, `shared_place`, row 2577), through consumer `index`'s
+    `stage`."""
+    row, head = place
+    for ref, piece in zip(refs, pieces, strict=True):
+        assert stage is not None
+        view = ref.at[*shared_place(ref.shape, row, head), pl.ds(k_first, piece.shape[0]),
+                      pl.ds(first, piece.shape[1])]
+        family.added(piece, view, interpret, smem=stage.at[index])
+
+
 def _dkv_stored(family: mosaic.Family, sums: tuple, views: tuple, stages: tuple, index, interpret: bool
                 ) -> None:
     """A dK/dV consumer's dK and dV of its own keys to their `views`, and its key gradients' sums added into
@@ -381,16 +395,8 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
             lo, hi, _ = program.readers(k_first, q_steps, spans_of, row)
             part = (index * count, count) if split else (0, block_q)
 
-            def store_tiles(first, pieces):
-                # Each tile's gradient entries added into their place in the keys-first `[B or 1, H or 1,
-                # Kp, Qp]` refs, the one a parameter the batch rows or heads share holds for each program's
-                # (`shared_place`, row 2577).
-                for ref, piece in zip(tile_refs, pieces, strict=True):
-                    assert tile_stage is not None
-                    view = ref.at[*shared_place(ref.shape, row, head), pl.ds(k_first, block_k),
-                                  pl.ds(first, piece.shape[1])]
-                    family.added(piece, view, walk.interpret, smem=tile_stage.at[index])
-
+            store_tiles = functools.partial(_tiles_added, family, tile_refs, tile_stage, (row, head), k_first,
+                                            index, walk.interpret)
             coords_of = functools.partial(_coords, family, spans_of, row, k_first=k_first, keys_first=True,
                                           draw=None if drop_of is None else drop_of.draw(row, head))
             params_of = functools.partial(_score_params, family, score_refs, kinds, row, head,
