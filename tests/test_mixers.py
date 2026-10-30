@@ -233,6 +233,7 @@ def packed_and_alone(model, variables, tokens, cotangent):
 KIND_FIELDS = {"mlp": ({"intermediate_size": 64}, {}), "llama4": ({}, {"qk_norm": False}),
                "deepseek_v4": ({"rope_head_dim": 8}, {"kinds": {"full_attention": LayerKind(window=8)}}),
                "kimi_delta_attention": ({"linear_num_heads": 2, "linear_head_dim": 32}, {}),
+               "lightning_attention": ({"block_size": 64}, {"num_heads": 8, "head_dim": 16}),
                "mamba2": ({"num_heads": 8, "head_dim": 32, "state_size": 32, "n_groups": 4,
                            "chunk_size": 64}, {}),
                "gated_delta_net": ({"linear_num_key_heads": 2, "linear_num_value_heads": 4,
@@ -248,7 +249,7 @@ REFUSED = {"kpool_sparse_attention"}
 """Kinds that refuse packed rows."""
 
 SEEDS = {"attention": 64, "deepseek_v4": 256, "gated_delta_net": 512, "kimi_delta_attention": 512,
-         "lightning_attention": 256, "llama4": 128, "mamba": 32, "mamba2": 256, "memory": 256, "mla": 64,
+         "lightning_attention": 64, "llama4": 128, "mamba": 32, "mamba2": 256, "memory": 256, "mla": 64,
          "mlp": 64, "short_conv": 64}
 """Each kind's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for`: the fewest for which
 documents run alone compared with themselves resolve PARITY in every logit and parameter gradient (on
@@ -261,7 +262,9 @@ and the port pads every key width below 64 to 64 (`recurrence_chunk._blocked_rul
 tests/test_fla_gdn.py's any-width site holds at 32. The packed row no longer runs a 16-wide Kimi layer or
 Mamba2's defaults (128 heads of 64 over a state of 128 in 256-token chunks, where these documents sit in
 one chunk); the scan's packed resets within a chunk stay held by tests/test_mamba2.py and
-tests/test_mamba_ssd.py at their own geometries."""
+tests/test_mamba_ssd.py at their own geometries. Lightning attention runs 8 heads of 16 in 64-token chunks
+(`KIND_FIELDS`): at the model's 4 heads, of 8, 16 or 32 channels, the reference compared with itself did
+not resolve within 512 seeds (2048 at 8); at 8 or 16 heads of 16, or 4 of 64, it resolves at 64."""
 
 
 PAST_TARGET = {"packed": {"memory": 122}}
