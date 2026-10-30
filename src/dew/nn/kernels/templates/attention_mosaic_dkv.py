@@ -385,8 +385,8 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
                 # Each tile's gradient entries added into their place in the keys-first `[B or 1, H or 1,
                 # Kp, Qp]` refs, the one a parameter the batch rows or heads share holds for each program's
                 # (`shared_place`, row 2577).
-                assert tile_stage is not None
                 for ref, piece in zip(tile_refs, pieces, strict=True):
+                    assert tile_stage is not None
                     view = ref.at[*shared_place(ref.shape, row, head), pl.ds(k_first, block_k),
                                   pl.ds(first, piece.shape[1])]
                     family.added(piece, view, walk.interpret, smem=tile_stage.at[index])
