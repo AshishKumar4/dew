@@ -36,6 +36,7 @@ from dew.nn.attention_masks import (
 )
 from dew.nn.blocks import normal_kernel
 from dew.nn.dense import Dense
+from dew.nn.dex import annealed, differential
 from dew.nn.documents import CrossDocuments
 from dew.nn.flops import attention_flops, cross_attention_flops, projection_flops
 from dew.nn.inputs import (
@@ -66,6 +67,7 @@ from dew.nn.mixer_base import QKV_RESIDUALS, MixerBase, MixerContext
 from dew.nn.ngpt import NGPT, gain
 from dew.nn.norms import RMSNorm
 from dew.nn.precision import at_least_fp32, float32_dot_general, l2norm, rounded_to, scaled
+from dew.nn.progress import progress
 from dew.nn.protocols import ProjectionGroup
 from dew.nn.rope import LongRopeScaling, axis_halves, axis_tables, rotary_freqs, rotate
 from dew.nn.sharding import HEADS, KV_HEADS, constrain, logical_axes
@@ -263,6 +265,10 @@ CONTEXT_LOGITS = "context_max_logits"
     # like the query's; the longer suffix outranks the MLP's `gate_proj`.
     ("self_attn", "gate_proj"): ("embed", "heads"),
     ("o_proj",): ("attention", "embed"),
+    # DEX's projections of a chosen subset of heads, which no head split divides, and its lambda: whole on
+    # every device (`dew.nn.dex`).
+    ("dex_projection",): (None, None, None),
+    ("dex_lambda",): (),
 })
 class CausalSelfAttention(nn.Module):
     """Causal self-attention with grouped-query heads, rotary positions, qk
@@ -388,6 +394,15 @@ class CausalSelfAttention(nn.Module):
                 self.k_norm = norm(name='k_norm')
         if self.ctx.ngpt is not None:
             self._ngpt_gains(self.ctx.ngpt)
+        if self.ctx.dex is not None:
+            # DEX's per-head projections of the chosen heads' outputs and its learned lambda, zero at the
+            # start as the paper's lambda_learn (`dew.nn.dex`).
+            if self.ctx.dex.heads[-1] >= self.ctx.num_heads:
+                raise ValueError(f"DEX names heads {self.ctx.dex.heads} of a layer of {self.ctx.num_heads}")
+            self.dex_projection = self.param(
+                'dex_projection', nn.initializers.lecun_normal(in_axis=-2, out_axis=-1, batch_axis=(0,)),
+                (len(self.ctx.dex.heads), self.value_dim, self.value_dim), jnp.float32)
+            self.dex_lambda = self.param('dex_lambda', nn.initializers.zeros, (), jnp.float32)
         # A head's learned logit beside its keys', which a read of the layer's own sequence and one of
         # a context (`attend_context`) both take.
         self.sinks = (self.param('sinks', nn.initializers.zeros, (self.ctx.num_heads,))
@@ -440,9 +455,10 @@ class CausalSelfAttention(nn.Module):
 
     @nn.nowrap
     def model_flops(self, lengths) -> float:
-        """Query/output maps and unshared K/V maps, plus QK and AV."""
+        """Query/output maps, unshared K/V maps and DEX's maps of its chosen heads, plus QK and AV."""
         window = self.ctx.sliding_window if self.ctx.causal or self.ctx.bidirectional_window else None
         return (sum(projection_flops(lengths, *shape) for shape in self.projections().values())
+                + self._dex_flops(lengths)
                 + attention_flops(lengths, self.ctx.num_heads, self.ctx.head_dim, self.value_dim,
                                   causal=self.ctx.causal, window=window, chunk=self.ctx.attention_chunk))
 
@@ -453,6 +469,19 @@ class CausalSelfAttention(nn.Module):
         products = attention_flops(lengths, self.ctx.num_heads, self.ctx.head_dim, self.value_dim,
                                    causal=self.ctx.causal, window=window, chunk=self.ctx.attention_chunk)
         return self.model_flops(lengths) - products
+
+    @nn.nowrap
+    def head_outputs(self) -> tuple[int, int]:
+        """Its heads' count and each one's output width, which DEX extends (`dew.nn.dex.HeadOutputs`)."""
+        return self.ctx.num_heads, self.value_dim
+
+    @nn.nowrap
+    def _dex_flops(self, lengths) -> float:
+        """DEX's work on each token's chosen heads (`dew.nn.dex`): a `[Dv, Dv]` map of each, none
+        without it."""
+        if self.ctx.dex is None:
+            return 0.0
+        return projection_flops(lengths, len(self.ctx.dex.heads) * self.value_dim, self.value_dim)
 
     @nn.nowrap
     def projections(self) -> dict[str, tuple[int, int]]:
@@ -861,15 +890,21 @@ class CausalSelfAttention(nn.Module):
     @nn.nowrap
     def context_flops(self, lengths, context_lengths) -> float:
         """Its read of a context's work over rows of `lengths` tokens reading `context_lengths`
-        (`attend_context`): the query, gate and output projections over the rows, the key and value
-        projections over the context, and the attention between them."""
+        (`attend_context`): its projections' (`context_projection_flops`) and the attention between
+        them."""
+        return self.context_projection_flops(lengths, context_lengths) + cross_attention_flops(
+            lengths, context_lengths, self.ctx.num_heads, self.ctx.head_dim, self.value_dim)
+
+    @nn.nowrap
+    def context_projection_flops(self, lengths, context_lengths) -> float:
+        """The part of its read of a context done by its own matrices: the query, gate and output
+        projections over the rows of `lengths` tokens, the key and value projections over the context's
+        `context_lengths`."""
         maps = self.projections()
-        rows = sum(projection_flops(lengths, *maps[name]) for name in ('q_proj', 'gate_proj', 'o_proj')
-                   if name in maps)
-        context = sum(projection_flops(context_lengths, *maps[name]) for name in ('k_proj', 'v_proj')
-                      if name in maps)
-        return rows + context + cross_attention_flops(lengths, context_lengths, self.ctx.num_heads,
-                                                      self.ctx.head_dim, self.value_dim)
+        rows = self._dex_flops(lengths) + sum(projection_flops(lengths, *maps[name])
+                                              for name in ('q_proj', 'gate_proj', 'o_proj') if name in maps)
+        return rows + sum(projection_flops(context_lengths, *maps[name]) for name in ('k_proj', 'v_proj')
+                          if name in maps)
 
     def _turned(self, heads):
         """Query or key heads in the layout their rotation reads: with
@@ -1314,8 +1349,14 @@ class CausalSelfAttention(nn.Module):
             and all(getattr(metadata, name) is None for name in self._group_fields()))
 
     def _output(self, attention, gate, batch: int, length: int, own_value):
-        """Exclude the own value where the layer does and the call has one (None for a read of
-        another sequence), gate the attended values where it gates, then project them."""
+        """Take the differential on the chosen heads where the layer carries DEX (`dew.nn.dex`), exclude
+        the own value where the layer does and the call has one (None for a read of another sequence),
+        gate the attended values where it gates, then project them."""
+        if self.ctx.dex is not None:
+            # Lambda annealed over the run's updates (`dew.nn.progress`), its learned value outside a run.
+            strength = annealed(progress().updates, self.ctx.dex, self.dex_lambda)
+            attention = differential(attention, self.ctx.dex.heads, self.dex_projection, strength,
+                                     self.ctx.precision)
         if self.exclusive_self_attention and own_value is not None:
             attention = exclusive_self_attention(attention, own_value)
         if gate is not None and self.ctx.ngpt is not None:

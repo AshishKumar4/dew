@@ -187,6 +187,11 @@ class CrossBlocks(Protocol):
         `context_lengths` tokens."""
         ...
 
+    def held_flops(self, decoder: CausalTransformer, index: int, lengths, context_lengths) -> float:
+        """The part of `flops` done by matrices the decoder holds, its layer's own, which train as its
+        trunk does: a frozen trunk's take no weight gradient (`dew.nn.flops.frozen_training_flops`)."""
+        ...
+
 
 @runtime_checkable
 class AttendsContext(Protocol):
@@ -203,6 +208,8 @@ class AttendsContext(Protocol):
 
     def context_flops(self, lengths, context_lengths) -> float: ...
 
+    def context_projection_flops(self, lengths, context_lengths) -> float: ...
+
     def context_query(self, x: jax.Array) -> tuple[jax.Array, jax.Array | None]: ...
 
     def context_keys(self, context: jax.Array) -> tuple[jax.Array, jax.Array]: ...
@@ -218,6 +225,19 @@ class LayerReads(NamedTuple):
 
     normed: Callable[[jax.Array], jax.Array]
     attention: AttendsContext
+
+
+def crossed_flops(decoder: CausalTransformer, lengths, context_lengths, *, held: bool = False) -> float:
+    """`decoder`'s cross-attention blocks' work over rows of `lengths` tokens reading contexts of
+    `context_lengths` tokens (`CrossBlocks.flops`), or with `held` the part its own matrices do
+    (`CrossBlocks.held_flops`), each block on every pass of its layer (`layer_passes`): none without
+    cross-attention, and a call without a context runs none of it."""
+    cross = decoder.cross_attention
+    if cross is None:
+        return 0.0
+    counted = cross.held_flops if held else cross.flops
+    return sum(decoder.layer_passes(index) * counted(decoder, index, lengths, context_lengths)
+               for index in cross.layer_ids)
 
 
 def named_layers(layer_ids) -> tuple[int, ...]:
@@ -296,6 +316,10 @@ class CrossAttention:
         """Layer `index`'s block's work (`GatedCrossAttention.cross_flops`)."""
         return self.block(decoder, index)(parent=None).cross_flops(lengths, context_lengths)
 
+    def held_flops(self, decoder: CausalTransformer, index: int, lengths, context_lengths) -> float:
+        """None: the block's matrices are its own, which train with it."""
+        return 0.0
+
 
 @dataclasses.dataclass(frozen=True)
 class SharedCrossAttention:
@@ -307,7 +331,14 @@ class SharedCrossAttention:
     it adds are the gates; the context's tokens are the decoder's width, which the layer's key and
     value projections read. `context_length` is the most tokens a row's context holds, which a
     decode cache keeps the keys and values of. A layer of no attention, or a KV-sharing one, projects
-    no keys of its own and is refused."""
+    no keys of its own and is refused.
+
+    Its only new weights are the gates, so what it reads is what the layer's own projections, trained
+    for its own sequence, make of the context: over a frozen trunk it learns no read those projections
+    do not already make, and a context the trunk must learn to read needs the trunk's adapters (LoRA)
+    training beside it. A toy whose answer is the context's first token (row 2320's diagnosis, armada
+    IGGATE2) stays at the no-context loss under it whatever the rate, where IDEFICS's block
+    (`CrossAttention`), fresh weights of its own, learns the read once they train at their own rate."""
 
     layer_ids: tuple[int, ...]
     context_length: int
@@ -340,12 +371,21 @@ class SharedCrossAttention:
         """Layer `index`'s attention's read of the context (`AttendsContext.context_flops`)."""
         return self._attention(decoder, index).context_flops(lengths, context_lengths)
 
+    def held_flops(self, decoder: CausalTransformer, index: int, lengths, context_lengths) -> float:
+        """Its read's projections, the layer's own matrices (`AttendsContext.context_projection_flops`):
+        all of its work but the attention between them."""
+        return self._attention(decoder, index).context_projection_flops(lengths, context_lengths)
+
     @staticmethod
     def _attention(decoder: CausalTransformer, index: int) -> AttendsContext:
         mixer = decoder.mixer_of(index)
-        if not isinstance(mixer, AttendsContext) or not mixer.reads_context:
-            raise ValueError(f"layer {index}'s mixer ({type(mixer).__name__}) projects no keys and values of "
-                             "its own to read a context with")
+        if not isinstance(mixer, AttendsContext):
+            raise ValueError(f"layer {index}'s mixer ({type(mixer).__name__}) reads no context through its "
+                             "own attention (AttendsContext, which CausalSelfAttention implements); name "
+                             "layers of standard attention, or read the context with CrossAttention's block")
+        if not mixer.reads_context:
+            raise ValueError(f"layer {index} shares its keys and values with an earlier layer, so it "
+                             "projects none of its own to read a context with")
         return mixer
 
 
@@ -593,4 +633,4 @@ def _gated(branch: jax.Array, gate: jax.Array, precision: PrecisionLike) -> jax.
 
 __all__ = ["CROSS_CACHE", "CROSS_LENGTHS", "NAME", "AttendsContext", "ContextEncoder", "CrossAttention",
            "CrossBlocks", "GatedCrossAttention", "LayerReads", "SharedCrossAttention",
-           "SharedGatedCrossAttention", "crossing", "encode_context", "gated_join"]
+           "SharedGatedCrossAttention", "crossed_flops", "crossing", "encode_context", "gated_join"]
