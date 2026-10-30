@@ -1,5 +1,5 @@
-"""Mamba's selective scan on the recurrence template's Mosaic GPU machinery (ledger 1300): a decay each channel
-and state, `h_t = exp(dt_t A) h_{t-1} + dt_t x_t B_t`, `y_t = C_t . h_t + D x_t` (`dew.nn.mixers.mamba`'s
+"""Mamba's selective scan on the recurrence template's Mosaic GPU machinery (ledger 1300): a decay each
+channel and state, `h_t = exp(dt_t A) h_{t-1} + dt_t x_t B_t`, `y_t = C_t . h_t + D x_t` (`dew.nn.mixers.mamba`'s
 `selective_scan`), which no chunk product computes: the decay between two tokens depends on the channel and
 the state together, so a chunk's pairs cost `C` times the scan's work (design: tmp design-r07-mamba1).
 
