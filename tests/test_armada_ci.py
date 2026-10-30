@@ -428,8 +428,7 @@ def test_a_python_child_joins_its_files_record(ci, tmp_path, monkeypatch, cache_
     ci.task("3.12", tests, "", tmp_path / "verdict.json", 600.0)
 
     def reused() -> list[bool]:
-        common = ci.shared("3.12")
-        return [ci.reused("3.12", name, "", common) is not None for name in tests]
+        return reusable_now(ci, tests)
 
     assert reused() == [True, True, False, False]
     (tmp_path / "notes/page.md").write_text("page again\n")
@@ -441,6 +440,164 @@ def test_a_python_child_joins_its_files_record(ci, tmp_path, monkeypatch, cache_
     assert ci.gpu_tier("3.12") == {"tests/test_child.py": ["tests/devices.py:placed"],
                                    "tests/test_killed.py": ["changed"],
                                    "tests/test_own_environment.py": ["changed"]}
+
+
+def lifetime_task(ci, tmp_path, monkeypatch, cache_worker, files: dict[str, str],
+                  sources: dict[str, str]) -> Callable[[], list[bool]]:
+    """`files` under tests/ and `sources` under src/ written, run as one 3.12 task with the test cache
+    on: whether each test file's row is reused now, in the files' order."""
+    url, _, _ = cache_worker
+    cached(monkeypatch, url)
+    written(tmp_path, files)
+    (tmp_path / "src").mkdir(exist_ok=True)
+    for name, source in sources.items():
+        (tmp_path / "src" / name).write_text(source)
+    interpreter(tmp_path, "3.12")
+    tests = [f"tests/{name}" for name in files if name.startswith("test_")]
+    ci.task("3.12", tests, "", tmp_path / "verdict.json", 600.0)
+    rows = json.loads((tmp_path / "verdict.json").read_text())["rows"]
+    assert all(row["exitCode"] == 0 for row in rows), rows
+    return lambda: reusable_now(ci, tests)
+
+
+def reusable_now(ci, tests: list[str]) -> list[bool]:
+    """Whether each of `tests` would reuse its 3.12 row now."""
+    common = ci.shared("3.12")
+    return [ci.reused("3.12", name, "", common) is not None for name in tests]
+
+
+ON_SRC = "import sys\nsys.path.insert(0, 'src')\n"
+PASSING = {"test_a.py": "def test_a():\n    pass\n", "test_b.py": "def test_b():\n    pass\n"}
+
+
+def test_what_a_conftest_starts_before_any_test_is_every_files_input(ci, tmp_path, monkeypatch,
+                                                                     cache_worker):
+    """A Python child a conftest starts before the first test, which no test file owns, runs for every
+    file the process runs: the code it executes is each one's input, so an edit to it reruns them all. A
+    start a conftest makes that no event follows (a shell) leaves every file without a key, and their
+    tests still pass."""
+    reused = lifetime_task(ci, tmp_path, monkeypatch, cache_worker, {
+        "conftest.py": "import subprocess, sys\nsubprocess.run([sys.executable, 'src/x.py'], check=True)\n",
+        **PASSING}, {"x.py": "print('x')\n"})
+    assert reused() == [True, True]
+    (tmp_path / "src/x.py").write_text("print('x, again')\n")
+    assert reused() == [False, False]
+    (tmp_path / "tests/conftest.py").write_text(
+        "import subprocess\nsubprocess.run(['sh', '-c', 'true'], check=True)\n")
+    ci.task("3.12", ["tests/test_a.py", "tests/test_b.py"], "", tmp_path / "verdict.json", 600.0)
+    assert reused() == [False, False]
+
+
+@pytest.mark.parametrize("late", [
+    "import pytest\n@pytest.fixture(scope='session', autouse=True)\ndef held():\n    yield\n"
+    "    import late\n",
+    "import pytest\n@pytest.hookimpl(trylast=True)\ndef pytest_sessionfinish(session):\n    import late\n",
+    "import atexit\natexit.register(lambda: __import__('late'))\n",
+], ids=["a session fixture's finalizer", "a trylast sessionfinish", "an atexit"])
+def test_what_runs_after_the_last_test_is_every_files_input(ci, tmp_path, monkeypatch, cache_worker, late):
+    """What a session runs after its last test, which no test file owns (a session fixture's finalizer,
+    a late sessionfinish hook, an atexit a conftest registered), is every file's input: an edit to it
+    reruns them all."""
+    reused = lifetime_task(ci, tmp_path, monkeypatch, cache_worker, {"conftest.py": ON_SRC + late,
+                                                                     **PASSING},
+                           {"late.py": "VALUE = 1\n"})
+    assert reused() == [True, True]
+    (tmp_path / "src/late.py").write_text("VALUE = 2\n")
+    assert reused() == [False, False]
+
+
+@pytest.mark.parametrize("rewritten", [False, True], ids=["plain", "under pytest's assertion rewriting"])
+def test_a_module_imported_by_name_is_its_files_input_and_no_earlier_files(ci, tmp_path, monkeypatch,
+                                                                             cache_worker, rewritten):
+    """A module a test imports by name at run time (importlib.import_module) is its file's input as an
+    import statement's is, whichever finder pytest put first (its assertion rewriter, for a name a conftest
+    registered): a helper of that name added under tests/, which leads sys.path, reruns the file, and no
+    file the process ran before it, which never saw that module."""
+    registered = "import pytest\npytest.register_assert_rewrite('tabnanny')\n"
+    conftest = {"conftest.py": registered} if rewritten else {}
+    reused = lifetime_task(ci, tmp_path, monkeypatch, cache_worker, {
+        **conftest, "test_b.py": PASSING["test_b.py"],
+        "test_named.py": "import importlib\ndef test_named():\n"
+                         "    assert importlib.import_module('tabnanny')\n"}, {})
+    assert reused() == [True, True]
+    (tmp_path / "tests/tabnanny.py").write_text("")
+    assert reused() == [True, False]
+
+
+def test_a_file_a_session_parameter_revisits_takes_what_ran_between_its_visits(ci, tmp_path, monkeypatch,
+                                                                                cache_worker):
+    """A session-scoped parameter runs A[0], B[0], A[1], B[1]: what B's first visit executed and cached
+    serves A's second, so it is A's input though A ran first; an edit to it reruns A."""
+    reused = lifetime_task(ci, tmp_path, monkeypatch, cache_worker, {
+        "conftest.py": ON_SRC + "import pytest\n@pytest.fixture(scope='session', params=[0, 1])\n"
+                                "def visit(request):\n    return request.param\n",
+        "holder.py": "VALUES = {}\n",
+        "test_a.py": "import holder\ndef test_a(visit):\n"
+                     "    assert visit == 0 or holder.VALUES['m'] == 1\n",
+        "test_b.py": "import holder\ndef test_b(visit):\n    import m\n"
+                     "    holder.VALUES.setdefault('m', m.VALUE)\n"},
+        {"m.py": "VALUE = 1\n"})
+    assert reused() == [True, True]
+    (tmp_path / "src/m.py").write_text("VALUE = 2\n")
+    assert reused() == [False, False]
+
+
+def test_each_start_needs_its_own_record_though_two_start_alike(ci, tmp_path, monkeypatch, cache_worker):
+    """Two children a file starts alike are two starts, each owing a record: two that record themselves
+    keep the file's key, and one that records itself beside one that starts with no site (-S), which no
+    recorder sees, leave the file without one, so an edit to what the second ran cannot reuse its row."""
+    plain = "    subprocess.run([sys.executable, '-c', 'pass'], check=True)\n"
+    reused = lifetime_task(ci, tmp_path, monkeypatch, cache_worker, {
+        "test_two.py": "import subprocess, sys\ndef test_two():\n" + plain * 2,
+        "test_twice.py": "import subprocess, sys\ndef test_twice():\n" + plain
+                         + "    subprocess.run([sys.executable, '-S', 'src/other.py'], check=True)\n",
+        "test_b.py": PASSING["test_b.py"]}, {"other.py": "print('other')\n"})
+    assert reused() == [True, False, True]
+
+
+def test_a_process_ending_1_after_its_tests_passed_is_red(ci, tmp_path, monkeypatch):
+    """A pytest process that ends 1 though every test it reported passed (a late hook's os._exit) is no
+    green: its tests ran in a process that failed, and every row it held is red."""
+    written(tmp_path, {"conftest.py": "import os, pytest\n@pytest.hookimpl(trylast=True)\n"
+                                      "def pytest_sessionfinish(session):\n    os._exit(1)\n", **PASSING})
+    interpreter(tmp_path, "3.12")
+    ci.task("3.12", ["tests/test_a.py", "tests/test_b.py"], "", tmp_path / "verdict.json", 600.0)
+    rows = json.loads((tmp_path / "verdict.json").read_text())["rows"]
+    assert [(row["exitCode"], "ended 1 after its tests passed" in row["output"]) for row in rows] \
+        == [(1, True)] * 2
+
+
+def test_each_files_record_is_its_own_where_files_share_a_process(ci, tmp_path, monkeypatch, cache_worker):
+    """Each input moves exactly the files that may have seen it (row 2642): a fixture's arrival reruns its
+    prober, the process's last file, alone; a helper shadowing a name only a file's child imported reruns
+    that file alone; a module one file imported lazily reruns it and every file the process ran after it,
+    which what it left may serve; and two files whose records share inputs never take each other's row."""
+    child = ("import site, sysconfig; site.addsitedir(sysconfig.get_paths()['purelib']); "
+             "import tabnanny")
+    reused = lifetime_task(ci, tmp_path, monkeypatch, cache_worker, {
+        "test_child.py": f"import subprocess, sys\ndef test_child():\n"
+                         f"    subprocess.run([sys.executable, '-c', {child!r}], check=True)\n",
+        "test_lazy.py": ON_SRC + "import holder\ndef test_lazy():\n    import lazy\n"
+                                 "    holder.VALUES['lazy'] = lazy.VALUE\n",
+        "test_later.py": "import holder\ndef test_later():\n    assert holder.VALUES.get('lazy', 1) == 1\n",
+        "test_probe.py": "import os\ndef test_probe():\n"
+                         "    assert not os.path.exists('tests/fixtures/f.txt')\n",
+        "holder.py": "VALUES = {}\n"}, {"lazy.py": "VALUE = 1\n"})
+    assert reused() == [True, True, True, True]
+    (tmp_path / "tests/fixtures").mkdir()
+    (tmp_path / "tests/fixtures/f.txt").write_text("")
+    assert reused() == [True, True, True, False]
+    (tmp_path / "tests/fixtures/f.txt").unlink()
+    (tmp_path / "tests/tabnanny.py").write_text("")
+    assert reused() == [False, True, True, True]
+    (tmp_path / "tests/tabnanny.py").unlink()
+    (tmp_path / "src/lazy.py").write_text("VALUE = 2\n")
+    assert reused() == [True, False, False, False]
+    (tmp_path / "src/lazy.py").write_text("VALUE = 1\n")
+    common = ci.shared("3.12")
+    names = ("tests/test_lazy.py", "tests/test_later.py")
+    found = [ci.reused("3.12", name, "", common)["name"] for name in names]
+    assert found == [f"3.12:{name}" for name in names]
 
 
 def fetcher(root: Path, *, due: bool = False) -> Path:
@@ -721,20 +878,21 @@ def test_a_first_gpu_lane_on_a_class_borrows_another_classs_measured_shares(
 
 
 def test_a_files_children_hold_what_they_held_at_once_and_each_start_must_leave_its_record(tmp_path):
-    """The children's records join the file that started them (`followed.gathered`): their files,
-    and the GPU they held, the most a child that took the parent's fraction used, those children as
-    shares and the bytes of those that named their own, counted only while they lived at once. A
-    file is followed only where every start it and its children saw left a record naming it and none
-    started a process it did not follow; one whose child marked its start and left no record, killed
-    before it wrote, is not."""
+    """The children's logs join the file that started them (`followed.gathered`): their files, and the
+    GPU they held, the most a child that took the parent's fraction used, those children as shares and
+    the bytes of those that named their own, counted only while they lived at once. A file is followed
+    only where every start it and its children saw left a closed log naming it and none started a
+    process it did not follow; one whose child's log never closed, killed before its end, is not."""
     followed = load("followed", "tools/armada")
     gib = 2 ** 30
 
-    def child(index, file, began, ended, pool=None, inherited=True, expected=0, unfollowed=False, peak=None):
-        (tmp_path / f"{index}.started").write_text(file)
-        (tmp_path / f"{index}.json").write_text(json.dumps({
-            "file": file, "files": [f"src/{index}.py"], "reads": [], "expected": expected, "peak": peak,
-            "unfollowed": unfollowed, "began": began, "ended": ended, "pool": pool, "inherited": inherited}))
+    def child(index, file, began, ended, pool=None, inherited=True, expected=0, unfollowed=False, peak=None,
+              closed=True):
+        lines = [f"owner\t{file}", f"inherited\t{int(inherited)}", f"began\t{began}", f"file\tsrc/{index}.py",
+                 *["start\tfollowed"] * expected, *(["unfollowed\t1"] if unfollowed else []),
+                 *([f"pool\t{pool}"] if pool else []), *([f"peak\t{peak}"] if peak is not None else []),
+                 *([f"ended\t{ended}", "closed\t1"] if closed else [])]
+        (tmp_path / f"{index}.log").write_text("\n".join(lines) + "\n")
 
     child(1, "tests/a.py", 0, 10, pool=6 * gib, peak=5 * gib)
     child(2, "tests/a.py", 5, 15, pool=6 * gib, expected=1, peak=gib)
@@ -743,7 +901,7 @@ def test_a_files_children_hold_what_they_held_at_once_and_each_start_must_leave_
     child(5, "tests/a.py", 40, 41)
     child(6, "tests/b.py", 0, 1)
     child(7, "tests/c.py", 0, 1)
-    (tmp_path / "8.started").write_text("tests/c.py")
+    child(8, "tests/c.py", 0, 1, closed=False)
     child(9, "tests/d.py", 0, 1, unfollowed=True)
     found = followed.gathered(tmp_path, {"tests/a.py": 4, "tests/b.py": 2, "tests/c.py": 2, "tests/d.py": 1})
     assert found["tests/a.py"] == {"files": {f"src/{index}.py" for index in range(1, 6)}, "reads": set(),
