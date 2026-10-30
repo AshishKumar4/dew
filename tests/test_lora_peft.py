@@ -236,11 +236,9 @@ def test_a_multi_axis_target_steps_as_its_flattened_matrix_does():
     output ones is the matrix LoRA of the flattened kernel: with x as
     [batch, 48] in the kernel's sorted axis order, A as [48, r] and B as
     [r, 30], the output is x K + bias + s x A B, and a fixed cotangent G
-    gives A's gradient s x^T G B^T and B's s (x A)^T G. The reference is that
-    flattened form in jnp, compiled as Dew's arm is, the same products on the
-    same backend (XLA's fp32 sums: its narrow dots sum serially where BLAS
-    sums in strided partials, ledger 2468), and its float64 the truth Dew's
-    forward and gradients are on par from (check 1), over drawn inputs,
+    gives A's gradient s x^T G B^T and B's s (x A)^T G. The float64 oracle
+    computes that flattened form; numpy in float32 is the reference Dew's
+    forward and gradients are on par with (check 1), over drawn inputs,
     weights, factors and cotangents."""
     model = Host()
     target = Target(rank=4, alpha=3.0)
@@ -258,6 +256,7 @@ def test_a_multi_axis_target_steps_as_its_flattened_matrix_does():
     assert tree["params"]["proj"]["kernel"].shape == (6, 8, 5, 6)
     scale = adapter.scale(target)
 
+    @jax.jit
     def dew(x, kernel, bias, a, b, cotangent):
         def output(factors):
             node = {"kernel": kernel, "bias": bias, **factors}
@@ -267,17 +266,15 @@ def test_a_multi_axis_target_steps_as_its_flattened_matrix_does():
         return {"the output": forward, "lora_A's gradient": gradient["lora_A"],
                 "lora_B's gradient": gradient["lora_B"]}
 
-    def flattened(x, kernel, bias, a, b, cotangent):
+    @as_given
+    def oracle(x, kernel, bias, a, b, cotangent):
+        dtype = x.dtype.type
         rows, seed = x.reshape(16, 48), cotangent.reshape(16, 30)
         down, up = a.reshape(48, 4), b.reshape(4, 30)
-        s = jnp.asarray(scale, x.dtype)
+        s = dtype(scale)
         out = rows @ kernel.reshape(48, 30) + bias.reshape(30) + s * ((rows @ down) @ up)
         return {"the output": out.reshape(16, 5, 6),
                 "lora_A's gradient": (s * (rows.T @ (seed @ up.T))).reshape(6, 8, 4),
                 "lora_B's gradient": (s * ((rows @ down).T @ seed)).reshape(4, 5, 6)}
 
-    def truth(*inputs):
-        with jax.enable_x64(new_val=True):
-            return jax.jit(flattened)(*(jnp.asarray(value, jnp.float64) for value in inputs))
-
-    assert_as_exact(dew, flattened, draw, "multi-axis LoRA", seeds=MULTI_AXIS_SEEDS, truth_fn=as_given(truth))
+    assert_as_exact(dew, oracle, draw, "multi-axis LoRA", seeds=MULTI_AXIS_SEEDS)
