@@ -187,11 +187,14 @@ default records the configuration it always did (a data step's identity, `dew.da
 and resumes under this Dew, and one that sets it records it (`set_added`)."""
 
 
-def set_added(value: DataclassInstance | Sequence[DataclassInstance] | JSON) -> bool:
-    """Whether `value`, a configuration, or one it holds, sets a field added after runs were saved (`ADDED`)
-    off its default."""
+def set_added(value: DataclassInstance | Sequence[DataclassInstance] | Mapping[str, DataclassInstance] | JSON
+              ) -> bool:
+    """Whether `value`, a configuration, or one it holds (in a sequence or a mapping), sets a field added
+    after runs were saved (`ADDED`) off its default."""
     if isinstance(value, (list, tuple)):
         return any(map(set_added, value))
+    if isinstance(value, Mapping):
+        return any(map(set_added, value.values()))
     if not dataclasses.is_dataclass(value) or isinstance(value, type):
         return False
     return any((field.metadata.get(ADDED) and getattr(value, field.name) != field.default)

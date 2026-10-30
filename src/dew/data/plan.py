@@ -197,11 +197,14 @@ def _configuration(step: DataclassInstance) -> dict[str, JSON]:
 def _configured(value) -> JSON:
     """A step's field, any value, as its configuration records it: a dataclass by its own fields, a
     value that holds an array entry by entry with the array by its fingerprint, which its repr
-    rounds to eight digits and cuts short past a thousand entries, and anything else by its repr,
-    without addresses."""
+    rounds to eight digits and cuts short past a thousand entries, and one that holds a configuration
+    setting an added field (`dew._records.ADDED`) entry by entry; anything else by its repr, without
+    addresses."""
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         return _configuration(value)
-    if _holds_arrays(value):
+    # A container holding an array, or a configuration that sets an added field, entry by entry, as the
+    # repr of either would not hold it whole.
+    if _holds_arrays(value) or set_added(value):
         if isinstance(value, (list, tuple)):
             return [_configured(entry) for entry in value]
         if isinstance(value, Mapping):

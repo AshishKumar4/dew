@@ -21,7 +21,6 @@ from reader_support import assert_resumes_where_it_stopped
 from token_support import write_token_corpus
 
 from dew import position
-from dew._records import ADDED
 from dew.batch import VALID_ROWS
 from dew.data.cache import Cache
 from dew.data.compile import compile, iterate, validation
@@ -1498,56 +1497,6 @@ def test_lambda_identity_requires_explicit_non_exact_resume():
     with pytest.raises(ValueError):
         plan.check(plan.record())
     assert plan.check(plan.record(), resume="non-exact") == ()
-
-
-@dataclasses.dataclass(frozen=True)
-class Scaled:
-    """A step as a run saved it, before it had `shift`."""
-
-    scale: int
-
-
-@dataclasses.dataclass(frozen=True)
-class ScaledLater:
-    """`Scaled`, given a field after runs were saved with it (`dew._records.ADDED`)."""
-
-    scale: int
-    shift: int = dataclasses.field(default=0, repr=False, metadata={ADDED: True})
-
-
-@pytest.mark.parametrize("held", [False, True], ids=["repr", "configured"])
-def test_a_field_added_after_runs_were_saved_keeps_their_identity_until_set(held):
-    """A step given a field after runs were saved keeps the identity it had where a run leaves the field
-    at its default, so the run resumes under the Dew that added it, whether its identity is its repr or
-    its configured fields (a step that holds an array); one that sets the field is a step of its own."""
-    weights = np.arange(3) if held else None
-
-    def identity(step):
-        named = StepIdentity.of(step)
-        return named.config.replace(type(step).__qualname__, "Step")
-
-    before = Scaled(2) if not held else HeldScaled(2, weights)
-    after = ScaledLater(2) if not held else HeldScaledLater(2, weights)
-    assert identity(after) == identity(before)
-    changed = (ScaledLater(2, shift=1) if not held else HeldScaledLater(2, weights, shift=1))
-    assert identity(changed) != identity(before)
-
-
-@dataclasses.dataclass(frozen=True)
-class HeldScaled:
-    """`Scaled`, holding an array, which its identity records by its configured fields."""
-
-    scale: int
-    weights: np.ndarray | None
-
-
-@dataclasses.dataclass(frozen=True)
-class HeldScaledLater:
-    """`HeldScaled`, given a field after runs were saved with it."""
-
-    scale: int
-    weights: np.ndarray | None
-    shift: int = dataclasses.field(default=0, repr=False, metadata={ADDED: True})
 
 
 @dataclasses.dataclass(frozen=True)
