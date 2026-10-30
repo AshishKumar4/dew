@@ -2,37 +2,37 @@
  "step": 2,
  "compute": "float32",
  "products": {
-  "MultimodalTransformer/language_model": [
+  "language_model": [
    "float64"
   ],
-  "MultimodalTransformer/language_model/layers_0/mlp/down_proj": [
+  "language_model/layers_0/mlp/down_proj": [
    "float64"
   ],
-  "MultimodalTransformer/language_model/layers_0/mlp/gate_up_proj": [
+  "language_model/layers_0/mlp/gate_up_proj": [
    "float64"
   ],
-  "MultimodalTransformer/language_model/layers_0/self_attn": [
+  "language_model/layers_0/self_attn": [
    "float64"
   ],
-  "MultimodalTransformer/language_model/layers_0/self_attn/o_proj": [
+  "language_model/layers_0/self_attn/o_proj": [
    "float64"
   ],
-  "MultimodalTransformer/language_model/layers_0/self_attn/qkv_proj": [
+  "language_model/layers_0/self_attn/qkv_proj": [
    "float64"
   ],
-  "MultimodalTransformer/language_model/layers_1/mlp/down_proj": [
+  "language_model/layers_1/mlp/down_proj": [
    "float64"
   ],
-  "MultimodalTransformer/language_model/layers_1/mlp/gate_up_proj": [
+  "language_model/layers_1/mlp/gate_up_proj": [
    "float64"
   ],
-  "MultimodalTransformer/language_model/layers_1/self_attn": [
+  "language_model/layers_1/self_attn": [
    "float64"
   ],
-  "MultimodalTransformer/language_model/layers_1/self_attn/o_proj": [
+  "language_model/layers_1/self_attn/o_proj": [
    "float64"
   ],
-  "MultimodalTransformer/language_model/layers_1/self_attn/qkv_proj": [
+  "language_model/layers_1/self_attn/qkv_proj": [
    "float64"
   ]
  },

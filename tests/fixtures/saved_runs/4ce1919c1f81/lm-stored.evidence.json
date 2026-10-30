@@ -2,94 +2,94 @@
  "step": 2,
  "compute": "float32",
  "products": {
-  "MultimodalTransformer/language_model/layers_0/mlp/down_proj": [
+  "language_model/layers_0/mlp/down_proj": [
    "float64"
   ],
-  "MultimodalTransformer/language_model/layers_0/mlp/gate_up_proj": [
+  "language_model/layers_0/mlp/gate_up_proj": [
    "float64"
   ],
-  "MultimodalTransformer/language_model/layers_0/self_attn": [
+  "language_model/layers_0/self_attn": [
    "float64"
   ],
-  "MultimodalTransformer/language_model/layers_0/self_attn/in_proj_a": [
+  "language_model/layers_0/self_attn/in_proj_a": [
    "float64"
   ],
-  "MultimodalTransformer/language_model/layers_0/self_attn/in_proj_b": [
+  "language_model/layers_0/self_attn/in_proj_b": [
    "float64"
   ],
-  "MultimodalTransformer/language_model/layers_0/self_attn/in_proj_qkv": [
+  "language_model/layers_0/self_attn/in_proj_qkv": [
    "float64"
   ],
-  "MultimodalTransformer/language_model/layers_0/self_attn/in_proj_z": [
+  "language_model/layers_0/self_attn/in_proj_z": [
    "float64"
   ],
-  "MultimodalTransformer/language_model/layers_0/self_attn/out_proj": [
+  "language_model/layers_0/self_attn/out_proj": [
    "float64"
   ],
-  "MultimodalTransformer/language_model/layers_1/mlp/down_proj": [
+  "language_model/layers_1/mlp/down_proj": [
    "float64"
   ],
-  "MultimodalTransformer/language_model/layers_1/mlp/gate_up_proj": [
+  "language_model/layers_1/mlp/gate_up_proj": [
    "float64"
   ],
-  "MultimodalTransformer/language_model/layers_1/self_attn": [
+  "language_model/layers_1/self_attn": [
    "float64"
   ],
-  "MultimodalTransformer/language_model/layers_1/self_attn/in_proj_a": [
+  "language_model/layers_1/self_attn/in_proj_a": [
    "float64"
   ],
-  "MultimodalTransformer/language_model/layers_1/self_attn/in_proj_b": [
+  "language_model/layers_1/self_attn/in_proj_b": [
    "float64"
   ],
-  "MultimodalTransformer/language_model/layers_1/self_attn/in_proj_qkv": [
+  "language_model/layers_1/self_attn/in_proj_qkv": [
    "float64"
   ],
-  "MultimodalTransformer/language_model/layers_1/self_attn/in_proj_z": [
+  "language_model/layers_1/self_attn/in_proj_z": [
    "float64"
   ],
-  "MultimodalTransformer/language_model/layers_1/self_attn/out_proj": [
+  "language_model/layers_1/self_attn/out_proj": [
    "float64"
   ],
-  "MultimodalTransformer/language_model/layers_2/mlp/down_proj": [
+  "language_model/layers_2/mlp/down_proj": [
    "float64"
   ],
-  "MultimodalTransformer/language_model/layers_2/mlp/gate_up_proj": [
+  "language_model/layers_2/mlp/gate_up_proj": [
    "float64"
   ],
-  "MultimodalTransformer/language_model/layers_2/self_attn": [
+  "language_model/layers_2/self_attn": [
    "float64"
   ],
-  "MultimodalTransformer/language_model/layers_2/self_attn/in_proj_a": [
+  "language_model/layers_2/self_attn/in_proj_a": [
    "float64"
   ],
-  "MultimodalTransformer/language_model/layers_2/self_attn/in_proj_b": [
+  "language_model/layers_2/self_attn/in_proj_b": [
    "float64"
   ],
-  "MultimodalTransformer/language_model/layers_2/self_attn/in_proj_qkv": [
+  "language_model/layers_2/self_attn/in_proj_qkv": [
    "float64"
   ],
-  "MultimodalTransformer/language_model/layers_2/self_attn/in_proj_z": [
+  "language_model/layers_2/self_attn/in_proj_z": [
    "float64"
   ],
-  "MultimodalTransformer/language_model/layers_2/self_attn/out_proj": [
+  "language_model/layers_2/self_attn/out_proj": [
    "float64"
   ],
-  "MultimodalTransformer/language_model/layers_3/mlp/down_proj": [
+  "language_model/layers_3/mlp/down_proj": [
    "float64"
   ],
-  "MultimodalTransformer/language_model/layers_3/mlp/gate_up_proj": [
+  "language_model/layers_3/mlp/gate_up_proj": [
    "float64"
   ],
-  "MultimodalTransformer/language_model/layers_3/self_attn": [
+  "language_model/layers_3/self_attn": [
    "float64"
   ],
-  "MultimodalTransformer/language_model/layers_3/self_attn/o_proj": [
+  "language_model/layers_3/self_attn/o_proj": [
    "float64"
   ],
-  "MultimodalTransformer/language_model/layers_3/self_attn/qkv_proj": [
+  "language_model/layers_3/self_attn/qkv_proj": [
    "float64"
   ],
-  "MultimodalTransformer/language_model/lm_head": [
+  "language_model/lm_head": [
    "float64"
   ]
  },
