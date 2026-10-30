@@ -600,7 +600,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         if self.STAGED_ROWS and not family.operands_in_registers:
             words = -(-config.block_k * config.block_m // config.warpgroups * jnp.dtype(dtype).itemsize
                       // 4 // resources.THREADS)
-            staged = resources.register_account(family).extra(words)
+            staged = max(0, words - family.held_registers)
         phases = [staged, self._epilogue_registers(ba, config)]
         # A paired product's second accumulator, carried beside the first (`mosaic_gpu.gmm`'s `paired`).
         plain += accumulator if ba.arguments.get('paired') is not None else 0
@@ -629,7 +629,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
                       for side, axes in zip(ba.arguments.get('epilogue_operands', ()), hooks.epilogue_axes,
                                             strict=True) if axes == ('columns',))
         vectors += family.column_registers(config.block_n, jnp.float32) if hooks.accumulators > 1 else 0
-        return resources.register_account(family).extra(vectors + resources.CONTROL_REGISTERS)
+        return max(0, vectors + resources.CONTROL_REGISTERS - family.held_registers)
 
     def register_budget(self, config: mosaic_gpu.Tiles) -> int:
         # Its family's budget a consumer, whatever the operands' dtype (`mosaic.Family.registers`).
