@@ -37,7 +37,7 @@ import typing
 from collections.abc import Callable, Mapping, Sequence
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, ClassVar, Literal, Self, TypedDict, Union
+from typing import TYPE_CHECKING, Annotated, ClassVar, Literal, Required, Self, TypedDict, Union
 
 import jax
 import tyro
@@ -398,7 +398,7 @@ class SourceOptionsKeywords(SourcePlacement, SourceBuild, total=False):
     it reads it (`SourcePlacement`) and the dtype it stores its parameters in
     (`RunConfig.source_keywords`)."""
 
-    param_dtype: str
+    param_dtype: Required[str]
 
 
 @dataclasses.dataclass(frozen=True)
