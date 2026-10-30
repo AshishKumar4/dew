@@ -644,8 +644,11 @@ def requested(task) -> None:
     from dew.inference.images import TextToImage
     from dew.inference.tasks import MaskedGeneration, TextGeneration
 
-    if isinstance(task, TextGeneration | MaskedGeneration):
+    if isinstance(task, TextGeneration):
         task("ab", max_new_tokens=2, key=0)
+    elif isinstance(task, MaskedGeneration):
+        # Token ids, which a source with no tokenizer of its own (dream-tiny) reads too.
+        task([[5, 17, 33, 2]], max_new_tokens=2, key=0)
     elif isinstance(task, Decide):
         question = {"team": Choice("which team", ["billing", "technical", "sales"])}
         task([({"text": "the site is down"}, question)])
@@ -735,13 +738,13 @@ def reached_by(run: RunConfig, root: Path, settings: type, flags, queued: dict[s
 
 
 def witnessed_on(builder, objective: str, settings: type, root: Path
-                 ) -> tuple[dict[str, Option], dict[str, str]]:
+                 ) -> tuple[dict[str, Option], dict[str, str], bool]:
     """The options of `settings` the run `builder` makes saves (`options_of`), and why each the run does not
     witness is not: one with no path its settings do not declare derived, or derived from data the run
     leaves unfilled; one set alone to each alternative (`reached_by`) that no run trains with, whose
     loaded task holds it nowhere it held another before (`held`), or which a request of that task reads
     nowhere it holds it (`reading`), a consumer's own read, not its record's (`unread`): a released
-    task's, its export's too (`dew export`)."""
+    task's, its export's too (`dew export`), where the run exports, which it says."""
     import dew
     from dew.objectives.base import ReleasedTask
 
@@ -751,6 +754,9 @@ def witnessed_on(builder, objective: str, settings: type, root: Path
     released = saved_task is not None and issubclass(saved_task, ReleasedTask)
     base, unset = saved_with(run, root, "unset", settings, {})
     before = held(unset)
+    # A released task's run exports where its model's format holds it (a model with cross-attention
+    # layers its checkpoint keeps alone): its witnesses' exports then hold them too.
+    exports = released and exported(root / "runs" / "unset", root / "exported" / "unset")
     options = {option.name: option for option in options_of(run, objective, settings, base)}
     failures = {}
     for name, option in options.items():
@@ -784,16 +790,24 @@ def witnessed_on(builder, objective: str, settings: type, root: Path
         task, value = reached[name]
         option = reachable[name].made(value)
         missed = unread(task, before, option)
-        if missed is None and released:
+        if missed is None and exports:
             # A released task's export (`dew export`), reloaded as its users load one, holds it too.
-            exported = root / "exported" / name
-            assert main(["export", str(root / "runs" / f"{name}{queued[name].index(value)}"),
-                         str(exported)]) == 0
-            missed = unread(dew.pipeline(str(exported)), before, option)
+            destination = root / "exported" / name
+            assert exported(root / "runs" / f"{name}{queued[name].index(value)}", destination)
+            missed = unread(dew.pipeline(str(destination)), before, option)
             missed = None if missed is None else f"its export: {missed}"
         if missed is not None:
             failures[name] = missed
-    return options, failures
+    return options, failures, exports
+
+
+def exported(run: Path, destination: Path) -> bool:
+    """Whether `dew export` writes the saved `run` to `destination`, False where it refuses the run's
+    model by name, which its format does not hold."""
+    try:
+        return main(["export", str(run), str(destination)]) == 0
+    except ValueError:
+        return False
 
 
 def unread(task, before: dict[str, object], option) -> str | None:
@@ -837,13 +851,20 @@ def test_each_option_a_saved_task_is_built_with_reaches_it_from_the_command_line
     declares alternatives in has a run here (`TASK_RUNS`), and each option is witnessed on one of them
     that holds it (`witnessed_on`)."""
     assert settings.__name__ in TASK_RUNS, f"no run here trains an objective whose task reads {settings}"
-    found = [witnessed_on(builder, objective, settings, tmp_path / builder.__name__)
-             for builder, objective in TASK_RUNS[settings.__name__]]
+    from dew.objectives.base import ReleasedTask
+
+    witnessed = [witnessed_on(builder, objective, settings, tmp_path / builder.__name__)
+                 for builder, objective in TASK_RUNS[settings.__name__]]
+    found = [(options, failures) for options, failures, _ in witnessed]
     # An option is witnessed on a run that holds it, which a release's settings may not (a split's).
     missed = {name: [failures[name] for options, failures in found if name in options]
               for name in {name for options, _ in found for name in options}
               if all(name not in options or name in failures for options, failures in found)}
     assert not missed, f"{settings.__name__}'s options no run here witnesses: {missed}"
+    # A released task's options reach an export on one of its runs at least.
+    saved_task = objectives[TASK_RUNS[settings.__name__][0][1]].saved_task
+    assert not (saved_task is not None and issubclass(saved_task, ReleasedTask)) or any(
+        exports for _, _, exports in witnessed), f"no run of {settings.__name__}'s exports"
 
 
 def read_where_held(task, declared: dict[str, object]) -> list[str]:
@@ -871,12 +892,12 @@ def test_a_masked_run_over_a_release_saves_and_reads_the_walk_the_release_declar
     source = snapshot(release, tmp_path)
     declared = Pretrained.load(source, dtype="float32", attention_impl="reference").text_generation()
     corpus = write_token_corpus(tmp_path / "tokens", np.random.RandomState(0).randint(4, 100, 400),
-                                vocab_size=128, eos_id=1)
+                                tokenizer=str(source), vocab_size=128, eos_id=1)
     data = TokenFiles(corpus.train).pipe(presets.lm, None, seq_len=11, batch=8, pack=None).loading(
         Loading(workers=0))
     model = ModelConfig("causal_transformer", {"dtype": "float32", "attention_impl": "reference"})
     run = LMRunConfig(data=data, pretrained=str(source), objective=ObjectiveConfig("masked_diffusion"),
-                      tokenizer="byte", max_new_tokens=0, model=model)
+                      tokenizer=str(source), max_new_tokens=0, model=model)
     _, task = saved_with(run, tmp_path, "over", MaskedSettings, {})
     options = {name: getattr(declared, name) for name in ("process", "solver", "steps", "block")}
     assert {name: same(getattr(task, name), option) for name, option in options.items()} == dict.fromkeys(
