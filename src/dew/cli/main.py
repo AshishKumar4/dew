@@ -67,14 +67,12 @@ class Export:
 
 def user_module(path: Path) -> types.ModuleType:
     """The user's Python file at `path`, that file and no other, imported as the module its name names
-    (`dew.registry.module_from_file`), with its directory first on the path, as `python -m` runs one
-    beside its siblings, so it imports them."""
+    (`dew.registry.module_from_file`), with its directory first on the path once it is accepted, as
+    `python -m` runs one beside its siblings, so it imports them; a file refused leaves the path as it
+    was."""
     from dew.registry import module_from_file
 
-    directory = str(path.resolve().parent)
-    if directory not in sys.path:
-        sys.path.insert(0, directory)
-    return module_from_file(path, path.stem)
+    return module_from_file(path, path.stem, beside=True)
 
 
 def chain_of(named: str, branch: Literal["train", "validation"], trust: tuple[str, ...] = ()):
