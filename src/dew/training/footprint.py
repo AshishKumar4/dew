@@ -15,6 +15,7 @@ plan records each term beside what the compile measured.
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import dataclasses
 import math
@@ -105,6 +106,15 @@ bitcast, in XLA's default row-major layout)."""
 TRANSPOSES = frozenset({"transpose"})
 """The layout primitive XLA's layout assignment folds into the storage of a value the program computes,
 laying it out as its reader needs (a returned gradient's), not into an input's, whose layout is fixed."""
+
+CUBLAS_OUTPUTS = frozenset({"float8_e4m3fn", "float8_e5m2", "float16", "bfloat16", "float32", "float64",
+                            "complex64"})
+"""The output types cuBLAS computes a product of a matrix and a vector or two matrices in
+(`IsCublasSupportedMatMul`)."""
+
+CUBLAS_MATRIX_OUTPUTS = frozenset({"float8_e3m4", "float8_e4m3", "float8_e4m3fnuz", "float8_e5m2fnuz",
+                                   "complex128"})
+"""The output types cuBLAS computes a product of two matrices alone in (`IsCublasSupportedMatMul`)."""
 
 LOOPS = frozenset({"scan", "while"})
 """The primitives that run their body turn after turn, their results held across the turns."""
@@ -204,19 +214,24 @@ class Frontier:
         self.producers = {out: equation for equation in program.eqns for out in equation.outvars}
         self.inputs = {*program.invars, *program.constvars}
         self.outputs = {out for out in program.outvars if computed(out)} if returned else set()
+        self.readers = collections.Counter(value for equation in program.eqns
+                                           for value in {read for read in equation.invars if computed(read)})
+        self.readers.update({value for value in program.outvars if computed(value)})
         self.reads: dict[jcore.Var, frozenset[jcore.Var]] = {}
 
     def view(self, value) -> bool:
         """Whether `value` is another value's storage: a shape primitive's of a value held or read
-        (`VIEWS`), or a transpose's of a value the program computes into a buffer (`TRANSPOSES`)."""
+        (`VIEWS`), or a transpose's of a value the program computes into a buffer and reads nowhere
+        else (`TRANSPOSES`)."""
         equation = self.producers.get(value)
         if equation is None or not equation.invars or not computed(equation.invars[0]):
             return False
         operand = equation.invars[0]
         if equation.primitive.name in VIEWS:
             return operand in self.inputs or not self.fused(operand) or self.view(operand)
-        return equation.primitive.name in TRANSPOSES and operand not in self.inputs and (
-            not self.fused(operand) or self.view(operand))
+        # XLA lays a value out once, so a transpose is its storage only where it is its one reader.
+        return (equation.primitive.name in TRANSPOSES and operand not in self.inputs
+                and self.readers[operand] == 1 and (not self.fused(operand) or self.view(operand)))
 
     def fused(self, value) -> bool:
         """Whether `value` holds no buffer of its own: recomputed where it is read, or a view."""
@@ -269,12 +284,15 @@ def device_share(value: jcore.Var) -> int:
 
 
 def cublas_product(equation: jcore.JaxprEqn) -> bool:
-    """Whether XLA hands `equation`, a matrix product, to cuBLAS, which takes a workspace: one each of
-    whose operands contracts a dimension (`IsCublasSupportedMatMul`, xla/service/gpu/ir_emission_utils.cc)
-    and that is not too small for it (`GEMM_REWRITE_SIZE`, or the run's
-    `--xla_gpu_gemm_rewrite_size_threshold`), as the GEMM rewriter asks
-    (xla/backends/gpu/transforms/gemm_rewriter.cc's `HandleDot`). A product XLA's Triton GEMM fusions
-    take instead takes none, which the derivation does not tell apart: it holds the workspace."""
+    """Whether XLA hands `equation`, a matrix product, to cuBLAS, which takes a workspace, as the GEMM
+    rewriter asks (xla/backends/gpu/transforms/gemm_rewriter.cc's `HandleDot`): one each of whose
+    operands contracts a dimension, one at least a matrix (its non-contracting sizes not all one), whose
+    output type cuBLAS computes (`IsCublasSupportedMatMul`, xla/service/gpu/ir_emission_utils.cc, its
+    dimensions as XLA's dot decomposition leaves them, one of each kind), and that XLA's own emitters
+    do not take for being too small (`GEMM_REWRITE_SIZE`, or the run's
+    `--xla_gpu_gemm_rewrite_size_threshold`; `IsDotSupportedByClassicalEmitters`, matmul_utils.cc). A
+    product XLA's Triton GEMM fusions take instead takes none, which this does not tell apart: it
+    holds the workspace."""
     if equation.primitive.name != "dot_general":
         return False
     (left_contracting, right_contracting), (left_batch, right_batch) = equation.params["dimension_numbers"]
@@ -286,8 +304,31 @@ def cublas_product(equation: jcore.JaxprEqn) -> bool:
                               if axis not in (*left_contracting, *left_batch)))
     kept_right = int(math.prod(size for axis, size in enumerate(right)
                                if axis not in (*right_contracting, *right_batch)))
+    matrices = (kept_left != 1) + (kept_right != 1)
+    produced = str(element_type(equation.outvars[0]))
+    operands = tuple(str(element_type(value)) for value in equation.invars)
+    supported = (produced in CUBLAS_OUTPUTS or (produced == "int32" and operands == ("int8", "int8"))
+                 or (produced in CUBLAS_MATRIX_OUTPUTS and matrices == 2))
+    if matrices == 0 or not supported:
+        return False
     threshold = int(xla_flag("xla_gpu_gemm_rewrite_size_threshold") or GEMM_REWRITE_SIZE)
-    return (kept_left + kept_right) * contracting >= threshold
+    classical = produced in ("float16", "float32", "bfloat16") and emitted_algorithm(equation)
+    return (kept_left + kept_right) * contracting >= threshold or not classical
+
+
+def emitted_algorithm(equation: jcore.JaxprEqn) -> bool:
+    """Whether XLA's own emitters compute `equation`'s product at its algorithm
+    (`IsSupportedByElementalIrEmitter`, xla/service/algorithm_util.cc): an unset one, or bf16 or f32
+    operands accumulated in f32."""
+    precision = equation.params.get("precision")
+    if not isinstance(precision, jax.lax.DotAlgorithmPreset):
+        return True
+    return precision.name in ("DEFAULT", "BF16_BF16_F32", "F32_F32_F32")
+
+
+def element_type(value) -> np.dtype | None:
+    """`value`'s element type, none where it is no array."""
+    return value.aval.dtype if isinstance(value.aval, ShapedArray) else None
 
 
 def dimensions(value) -> tuple[int, ...]:
