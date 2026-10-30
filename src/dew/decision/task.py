@@ -192,11 +192,11 @@ class DecideSettings:
     context_encoder: ContextEncoder = "table"
     """How the model encodes a row's context (`DecisionModel.context_encoder`); a run recorded before
     the choice existed embedded it by its token table."""
-    questions: int | None = None
+    questions: int | None = field(default=None, metadata={"derived": "data"})
     """The most questions a row of the run's data holds (`Layout.row_questions`), as the run recorded
     it; a pass's question slots are its windows' (`Decide.pass_shapes`), so no task reads it. None where
     the run recorded none, as before it did."""
-    options: int | None = None
+    options: int | None = field(default=None, metadata={"derived": "data"})
     """The most options a question of the run's data lays out, a "none of the above" it adds included,
     which a pass of its task pads each question to (`Budget.options`); None as `questions`."""
 
