@@ -156,7 +156,7 @@ class DiffusionNFTObjective(DiffusionObjective):
         dtype = at_least_fp32(jnp.result_type(batch["latents"]))
         samples = jax.lax.stop_gradient(jnp.asarray(batch["latents"], dtype))
         times = jax.lax.stop_gradient(jnp.asarray(batch["timesteps"], dtype))
-        advantages = jax.lax.stop_gradient(jnp.asarray(batch[ADVANTAGES_KEY], jnp.float32))
+        advantages = jax.lax.stop_gradient(jnp.asarray(batch[ADVANTAGES_KEY], dtype))
         if samples.ndim != len(self.latent_shape) + 1 or samples.shape[1:] != self.latent_shape:
             raise ValueError(f"latents must hold [batch, {self.latent_shape}]")
         if times.ndim != 2 or times.shape[0] != samples.shape[0] or advantages.shape != samples.shape[:1]:
