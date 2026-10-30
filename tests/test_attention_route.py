@@ -435,10 +435,9 @@ def test_a_dense_bias_named_onto_the_template_is_on_par_with_the_reference_path(
     `template.shared_place`), on par (check 1) with the reference path's dense bias from float64, its
     output and the query's, key's, value's and bias's gradients, the bias's in its own shape (rows 2081,
     2523). In both of the Mosaic backward's schedules for a shared bias: deterministic mode's, each program
-    its own place summed after, and the default's, the programs' adds into one place (`deterministic`
-    False drops the lane's --xla_gpu_deterministic_ops, `without_deterministic_ops`; row 2645)."""
-    if not deterministic:
-        request.getfixturevalue("without_deterministic_ops")
+    its own place summed after, and the default's, the programs' adds into one place (the flag set or
+    dropped whatever the lane's, `with_deterministic_ops`, `without_deterministic_ops`; row 2645)."""
+    request.getfixturevalue("with_deterministic_ops" if deterministic else "without_deterministic_ops")
     queries = 40
 
     def drawn(seed):
@@ -464,6 +463,30 @@ def test_a_dense_bias_named_onto_the_template_is_on_par_with_the_reference_path(
     assert_as_exact(jax.jit(attended("template")), jax.jit(attended("reference")), drawn,
                     f"a dense bias of {rows} rows and {heads} heads on the template", seeds=DENSE_BIAS_SEEDS,
                     terms=terms)
+
+
+@pytest.mark.gpu(reason="the Mosaic backward's deterministic schedule, on an H100")
+def test_a_deterministic_shared_bias_backward_repeats_bit_for_bit(with_deterministic_ops):
+    """Under --xla_gpu_deterministic_ops a dense bias every row shares, named onto the template, takes the
+    same gradients bit for bit run to run (kernel-templates.md's same-schedule reproducibility, row 2645):
+    each dK/dV program writes its bias gradient to a place of its own, summed in a fixed order, where the
+    default schedule's programs add theirs into one place in their arrival order."""
+    rng = np.random.default_rng(2645)
+    heads = (HEADS, KV_HEADS, KV_HEADS, HEADS)
+    query, key, value, cotangent = (jnp.asarray(rng.standard_normal((2, 256, count, WIDTH)), jnp.bfloat16)
+                                    for count in heads)
+    bias = jnp.asarray(0.5 * rng.standard_normal((1, HEADS, 256, 256)), jnp.float32)
+
+    @jax.jit
+    def gradients(query, key, value, bias):
+        _, pull = jax.vjp(lambda *operands: scaled_dot_product_attention(
+            *operands[:3], bias=operands[3], causal=True, implementation="template"), query, key, value, bias)
+        return pull(cotangent)
+
+    first = jax.tree.map(np.asarray, gradients(query, key, value, bias))
+    for _ in range(4):
+        again = jax.tree.map(np.asarray, gradients(query, key, value, bias))
+        assert all(np.array_equal(a, b) for a, b in zip(first, again, strict=True))
 
 
 def test_a_biased_query_of_one_key_has_nonzero_gradient_terms_where_its_gradient_is_zero():

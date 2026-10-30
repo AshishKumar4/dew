@@ -1003,11 +1003,14 @@ def test_a_training_forward_256_wide_past_the_folds_reach_is_on_par_interpreted(
 
 
 @INTERPRETS
-@pytest.mark.parametrize("hooks", ["key-bias", "tile-bias"])
-def test_a_parameter_every_row_shares_takes_each_rows_gradient_interpreted(hooks):
+@pytest.mark.parametrize(("hooks", "deterministic"), [("key-bias", False), ("tile-bias", False),
+                                                      ("tile-bias", True)])
+def test_a_parameter_every_row_shares_takes_each_rows_gradient_interpreted(hooks, deterministic, request):
     """A key's or a tile's parameter one for every batch row (`[1, H, ...]`, T5's shared bias): the dK/dV
     programs read it at its shared place and add each row's gradient into its own shape in the program
-    (`shared_place`, `Family.added`, row 2577), every gradient the reference's, under the interpreter."""
+    (`shared_place`, `Family.added`, row 2577), or under --xla_gpu_deterministic_ops each program writes its
+    own place, summed after (row 2645), every gradient the reference's, under the interpreter."""
+    request.getfixturevalue("with_deterministic_ops" if deterministic else "without_deterministic_ops")
     _check_hooked_backward(hooks, form="default", interpret=True, shared=True)
 
 
