@@ -55,13 +55,7 @@ from .kernels import decode_attention, generation
 from .kernels.generation import Route, bf16_dot_runs
 from .kernels.selection import select, selected
 from .kernels.templates import attention as template, attention_route
-from .precision import (
-    asks_default_precision,
-    at_least_fp32,
-    capped_logits,
-    float32_einsum,
-    wide_cpu_arithmetic,
-)
+from .precision import asks_default_precision, at_least_fp32, capped_logits, float32_einsum
 from .sharding import SCORES, sequence_shards
 from .visibility import window_sides
 
@@ -868,16 +862,6 @@ def _xla_kernel_narrows(query) -> bool:
         query.dtype == jnp.bfloat16 and generation.backend() == 'gpu' and not bf16_dot_runs())
 
 
-def _xla_kernel_widens_less() -> bool:
-    """Whether jax.nn's xla attention would run this call below the arithmetic its process asks of a CPU,
-    so 'auto' and 'xla' take the reference path: a CPU under Dew's test setting (`WIDE_CPU_ARITHMETIC`),
-    which sums fp32 products in float64 (`precision.accumulated`) where jax's sums them in fp32, and whose
-    reference path differentiates the softmax by its own derivative, exactly zero for a query that reads
-    one key, where jax's takes rowsum(dO * O) and leaves it a rounding. A process without the setting runs
-    jax's kernel on a CPU as on any platform."""
-    return wide_cpu_arithmetic() and generation.backend() == 'cpu'
-
-
 def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_softmax=True, softcap=None,
                    sinks=None, causal=False, sliding_window=None, mask=None, bias=None, segment_ids=None,
                    max_segments=None, key_value_seq_lengths=None, key_value_seq_starts=None,
@@ -907,7 +891,7 @@ def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_sof
                   and jnp.shape(bias)[0] > 1),
         sinks=sinks is not None, softcap=softcap, mask_as_bias=False,
         arithmetic=reference_only(query, dtype, precision, force_fp32_for_softmax),
-        narrows=_xla_kernel_narrows(query) or _xla_kernel_widens_less(),
+        narrows=_xla_kernel_narrows(query),
         folds=folds(query, key, bias, mask, causal, sliding_window),
         splash_mask=False, shards=sequence_shards(), dropout=dropout,
         form=generation.numerics().forms)
