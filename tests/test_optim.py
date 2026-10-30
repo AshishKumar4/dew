@@ -291,17 +291,23 @@ def test_a_stated_dot_algorithm_is_muons_products_or_its_platforms_refusal(algor
     lowered.compile()
 
 
-@pytest.mark.parametrize(("recorded", "stated"), [("bfloat16", None), ("tensorfloat32", "TF32_TF32_F32"),
-                                                  ("float32", "F32_F32_F32")])
-def test_a_run_saved_with_a_newton_schulz_level_loads_with_its_dot_algorithm(recorded, stated, tmp_path):
+@pytest.mark.parametrize(("recorded", "forms", "stated"), [
+    ("bfloat16", "fast", None), ("bfloat16", "accurate", "BF16_BF16_F32"),
+    ("tensorfloat32", "fast", "TF32_TF32_F32"), ("float32", "accurate", "F32_F32_F32")])
+def test_a_run_saved_with_a_newton_schulz_level_loads_with_its_dot_algorithm(recorded, forms, stated,
+                                                                             tmp_path):
     """A Muon run saved while its options named the Newton-Schulz precision by a matmul level loads with
-    that level's dot algorithm (`config.earlier_newton_schulz`): bfloat16 the run's numerics' own, none
-    stated; tensorfloat32 and float32 their algorithms, whose Muon builds."""
+    that level's dot algorithm (`config.earlier_newton_schulz`): bfloat16 the run's numerics' own in their
+    fast forms, none stated, and stated where the run's forms are accurate, whose own is float32 (row
+    2753); tensorfloat32 and float32 their algorithms, whose Muon builds."""
     from test_run_options import lm
 
     from dew.config import RunConfig
+    from dew.nn.precision import ACCURATE
 
-    run = dataclasses.replace(lm(tmp_path, drawn=False), optim=OptimConfig(
+    run = lm(tmp_path, drawn=False)
+    trainer = run.trainer if forms == "fast" else dataclasses.replace(run.trainer, precision=ACCURATE)
+    run = dataclasses.replace(run, trainer=trainer, optim=OptimConfig(
         optimizer="muon", learning_rate=LR, optimizer_opts={"ns_precision": recorded}))
     run.save(str(tmp_path / "saved"))
     loaded = RunConfig.load(str(tmp_path / "saved"))
