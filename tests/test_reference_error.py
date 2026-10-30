@@ -8,6 +8,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
+from one_draw import assert_as_exact_as_the_reference, assert_leaves_as_exact
 from reference_error import (
     FACTOR,
     PARITY,
@@ -16,8 +17,6 @@ from reference_error import (
     Inconclusive,
     as_given,
     assert_as_exact,
-    assert_as_exact_as_the_reference,
-    assert_leaves_as_exact,
     assert_moves,
     assert_same_artifact,
     declared_seeds,
@@ -82,16 +81,25 @@ def written_attention(query, key, value):
 
 
 @pytest.mark.skipif(jax.default_backend() != "cpu", reason="WITHOUT_YNN is XLA:CPU's")
-def test_a_check_whose_program_xla_cpu_compiles_only_with_ynnpacks_fusions_runs_both_arms_with_them():
+def test_a_check_whose_program_xla_cpu_compiles_only_with_ynnpacks_fusions_runs_both_arms_with_them(
+        tmp_path, monkeypatch):
     """XLA:CPU refuses jax.nn's XLA attention's backward over a single key without YNNPACK's fusions, at
-    every matmul precision (`YNN_REFUSED`); check 1 turns both arms over to the fusions there (`_Paired`),
-    the two still of one kind, and judges them."""
-    from reference_error import without_ynn
+    every matmul precision; check 1 decides, once before its draws, that both arms of that site take the
+    fusions (`_ynn_decided`), the two still of one kind, logs that decision once beside its stages
+    (STAGES_LOG), and judges them."""
+    import json
+
+    from reference_error import STAGES_LOG, without_ynn
 
     with pytest.raises(jax.errors.JaxRuntimeError):
         without_ynn(pulled_by_itself(xla_attention))(*one_key_draw(0))
+    log = tmp_path / "stages.jsonl"
+    monkeypatch.setenv(STAGES_LOG, str(log))
     assert_as_exact(pulled_by_itself(xla_attention), pulled_by_itself(written_attention), one_key_draw,
                     "attention over one key", seeds=16)
+    decided = [entry for entry in map(json.loads, log.read_text().splitlines()) if "ynn" in entry]
+    assert [(entry["label"], entry["ynn"]) for entry in decided] == [("attention over one key",
+                                                                       "with YNNPACK's fusions")]
 
 
 @pytest.mark.skipif(jax.default_backend() != "cpu", reason="WITHOUT_YNN is XLA:CPU's")
@@ -341,6 +349,19 @@ def mixed_terms(x, w):
     sizes = np.sqrt(np.square(np.asarray(x)) @ np.square(np.asarray(w)))
     sizes[:8] *= np.sqrt(2.0)
     return {"rows": np.sqrt(np.square(sizes) @ np.square(MIX.astype(np.float64)))}
+
+
+def test_check_1_sizes_rows_by_their_terms_beside_an_output_held_as_none():
+    """Term sizing reads a truth's terms by the truth's own structure (`_term_leaves`): an output held as
+    None (a gradient of an input given as None, as `with_gradients` returns one) takes no leaf of the
+    terms, so the leaves after it are sized by their own, not their neighbour's."""
+    def holding_none(arm):
+        def run(x, w):
+            return {"before": arm(x, w)["rows"], "none": None, "after": arm(x, w)["rows"][:, :2]}
+        return run
+
+    assert_as_exact(holding_none(cancelling(split=True)), holding_none(cancelling(split=False)),
+                    cancelling_draw, "terms beside a None", seeds=16, terms=True)
 
 
 def test_check_1_sizes_a_row_that_cancels_behind_its_final_sum_by_the_sites_own_terms():

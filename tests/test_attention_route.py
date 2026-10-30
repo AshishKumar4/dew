@@ -657,3 +657,56 @@ def test_a_pass_the_mosaic_mainloop_declines_reports_its_reason_under_its_row():
     [refused] = attention_route.MAINLOOP.kernel("triton").failed(
         attention_route._Pass(on_gpu=True, mosaic=None, triton=spans))
     assert (refused.code, refused.row) == ("dropout", generation.INHERENT)
+
+
+@pytest.mark.parametrize("target", [None, "sm80", "sm90"], ids=["cpu", "a100", "h100"])
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
+def test_an_accurate_call_on_the_default_route_runs_the_template_or_the_reference_path(target, dtype):
+    """Under `generation.chosen(attention_form='accurate')`, the default route ('auto') runs a call on the
+    template or the reference path, which compute the form, never on an old route, whose arithmetic is
+    its own (row 2350: FlashAttention, cuDNN, xla and splash ran an accurate run's calls fast); the fast
+    form keeps its kernels as before."""
+    import contextlib
+
+    from dew.nn.attention import attention_case
+    from dew.nn.attention_kernels import ATTENTION
+    from dew.nn.kernels.generation import assumed, chosen
+    from dew.nn.kernels.selection import select
+
+    query = jnp.zeros((2, 64, 4, 32), dtype)
+    placed = contextlib.nullcontext() if target is None else assumed(target)
+    with placed:
+        with chosen(attention_form="accurate"):
+            accurate = select(ATTENTION, attention_case(query, query, causal=True)).kernel
+        fast = select(ATTENTION, attention_case(query, query, causal=True)).kernel
+    assert accurate in ("template", "reference"), accurate
+    # On a GPU the fast form takes an old route (FlashAttention's, xla's), which the accurate one refuses;
+    # a CPU runs both on the reference path.
+    if target is not None:
+        assert fast not in ("template", "reference"), fast
+    else:
+        assert fast == accurate
+
+
+@pytest.mark.gpu(reason="a GPU's fp32 products default to TF32, which a CPU's never do")
+def test_an_accurate_call_the_template_refuses_runs_the_reference_path_on_ieee_products():
+    """An accurate call the template does not take on a GPU, one with an arbitrary mask, runs the
+    reference path, whose fp32 products the accurate form holds to IEEE fp32 (`Precision.HIGHEST`),
+    never TF32, forward and backward, so a run recorded accurate computes in its form (row 2350's
+    review, Attention)."""
+    import re
+
+    from dew.nn.kernels.generation import chosen
+
+    query = jnp.ones((1, 64, 4, 32), jnp.float32)
+    mask = jnp.tril(jnp.ones((64, 64), bool))[None, None]
+
+    def attend(query):
+        # A caller's explicit default precision, which the float32 products keep where it is named.
+        return attention.scaled_dot_product_attention(query, query, query, mask=mask,
+                                                      precision=jax.lax.Precision.DEFAULT)
+
+    with chosen(attention_form="accurate"):
+        lowered = jax.jit(jax.grad(lambda query: attend(query).sum())).lower(query).as_text()
+    dots = [line for line in lowered.splitlines() if "dot_general" in line and "f32" in line]
+    assert dots and all(re.search(r"precision = \[HIGHEST, HIGHEST\]", line) for line in dots), dots

@@ -24,13 +24,13 @@ from delta_rule_support import (
     rule_math,
     through,
 )
+from float64_terms import float64_terms
 from gdn_cases import CASES
+from one_draw import assert_as_exact_as_the_reference
 from reference_error import (
     assert_as_exact,
-    assert_as_exact_as_the_reference,
     assert_computes_the_oracle,
     chain_roundings,
-    float64_terms,
     widened,
     with_gradients,
 )

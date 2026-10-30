@@ -16,7 +16,7 @@ import flax.linen as nn
 import jax
 import jax.numpy as jnp
 import numpy as np
-from reference_error import assert_as_exact_as_the_reference
+from one_draw import assert_as_exact_as_the_reference
 
 from dew.diffusion.discrete import MDLM, DiscreteDenoiser, Unmask
 from dew.nn.protocols import OutputTable
