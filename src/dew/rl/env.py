@@ -240,5 +240,5 @@ class Driven:
         return _Driven(inner, step.done, key), self._observed(step, state.last)
 
 
-__all__ = ["Batched", "Carry", "Driven", "Env", "EnvState", "Observation", "Params", "Policy", "TimeLimit", "TimeStep",
-           "Transition", "env_rollout", "start"]
+__all__ = ["Batched", "Carry", "Driven", "Env", "EnvState", "Observation", "Params", "Policy", "TimeLimit",
+           "TimeStep", "Transition", "env_rollout", "start"]
