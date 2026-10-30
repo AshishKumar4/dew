@@ -48,7 +48,6 @@ A full audit of `main` on 2026-10-27, each finding re-checked by a second review
 - Reconstruct captured layers with the inverse of pipeline microbatching, including fetched captures. [624]
 - Group an unbound model's banks from its source shapes so unlike rows are never stacked into an invalid bank. [633]
 - Keep decode programs a fixed size in layer and loop depth: retain stacked caches across calls, then scan periodic layer groups and loop passes. [642]
-- Match the reference's highest-precision fp32 products instead of allowing default TF32 to change its arithmetic, a multimodal model's served row included. [644, 828]
 - Finish released-checkpoint nGPT and looped-model qualification against vLLM on real GPUs. Keep the reference engine's approximate-cache behavior distinct from its model code. [596, 638]
 - Route V4 through the shared attention core and preserve the reference's AltUp projection semantics. [NNF-2, NNF-4]
 - Skip quantized payload decoding for shapes-only resumes. Bind diffusion components from lazy tensor sources, including VAE running statistics. [INT-4]

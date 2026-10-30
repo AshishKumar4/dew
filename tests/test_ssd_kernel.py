@@ -34,7 +34,6 @@ from ssd_support import ssd_orbit
 
 from dew.nn.kernels.recurrence_chunk import RESET_DECAY, ssd_operands
 from dew.nn.kernels.ssd import ssd_chunk_scan
-from dew.nn.precision import float32_products, products_dtype
 
 pytestmark = pytest.mark.kernel
 
@@ -124,10 +123,10 @@ def _carry(previous, step):
 
 
 def exact_einsum(spec: str, *operands):
-    """`jnp.einsum` at its operands' precision (`precision.float32_products`): fp32 products in fp32, where
-    a TPU's default takes one bf16 pass, which hid the kernel's own default-precision matmuls from check 1
-    (template numerics review 2026-10-26 follow-up, P1-1)."""
-    return jnp.einsum(spec, *operands, precision=float32_products(products_dtype(*operands)))
+    """`jnp.einsum` at HIGHEST, which the reference states: fp32 products in fp32, where a TPU's default
+    takes one bf16 pass, which hid the kernel's own default-precision matmuls from check 1 (template
+    numerics review 2026-10-26 follow-up, P1-1)."""
+    return jnp.einsum(spec, *operands, precision=jax.lax.Precision.HIGHEST)
 
 
 def xla_chunk_scan(x, B, C, a, carried, chunk_size: int):

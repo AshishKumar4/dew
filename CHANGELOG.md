@@ -5,6 +5,10 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- A float32 product with no stated precision follows JAX's configured precision
+  (`jax_default_matmul_precision`), TF32 on recent GPUs as JAX documents, where Dew pinned it at
+  `Precision.HIGHEST`; a model's `precision` field still sets its own. A float32 run on an A100 trained
+  2.8 times slower for the pin. `jax.default_matmul_precision("highest")` takes the IEEE products back.
 - DEX (arXiv 2505.16333): a learned differential on chosen heads' attention outputs, `O'_h = O_h -
   lambda(t) O_h W_D,h`, with lambda annealed from zero over the run's first updates
   (`dew.nn.dex.DifferentialExtension`). Attach it with `Pretrained.load(..., dex=...)` or

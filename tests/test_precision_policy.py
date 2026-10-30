@@ -446,24 +446,23 @@ def dot_precisions(function, *arguments) -> list:
 HIGHEST = (jax.lax.Precision.HIGHEST, jax.lax.Precision.HIGHEST)
 
 
-def assert_float32_products(precisions) -> None:
-    """No product of float32 operands at JAX's default precision, which is TF32 on a GPU, and none
-    of narrower ones at HIGHEST. A product stating its own dot algorithm (a bf16 head's) is its own."""
+def assert_configured_products(precisions) -> None:
+    """Every product at JAX's configured precision (`jax_default_matmul_precision`, ledger 2500), none
+    pinned at HIGHEST, which JAX's default runs on a GPU in TF32 at 2.8 times the speed. A product
+    stating its own dot algorithm (a bf16 head's) is its own."""
     assert precisions
-    off = [(precision, dtype) for precision, dtype in precisions
-           if (precision is None and dtype == jnp.float32) or (precision == HIGHEST and dtype != jnp.float32)]
+    off = [(precision, dtype) for precision, dtype in precisions if precision == HIGHEST]
     assert not off, off
 
 
 @pytest.mark.parametrize("tied", [True, False])
 @pytest.mark.parametrize("stored", ["float32", "bfloat16", "bfloat16 kernels"])
 def test_a_model_with_no_dtype_multiplies_each_product_as_its_operands_compute(stored, tied):
-    """A model with no dtype computes each product in the dtype its operands promote to, as flax's
-    layers do, so float32 products multiply at HIGHEST and bf16 ones at their own precision, product
-    by product: over float32 parameters, bf16 ones, and bf16 kernels beside float32 norm scales,
-    its vocabulary head tied to its embedding or its own. Initializing it multiplies as applying it
-    does. A precision resolved once for the whole model from its parameters pinned HIGHEST on bf16
-    products and missed float32 ones."""
+    """A model with no dtype or precision computes each product in the dtype its operands promote to,
+    as flax's layers do, at JAX's configured precision, product by product: over float32 parameters,
+    bf16 ones, and bf16 kernels beside float32 norm scales, its vocabulary head tied to its embedding
+    or its own. Initializing it multiplies as applying it does. float32 products were pinned at
+    HIGHEST, over JAX's config."""
     model = LAYERS["packed"](tie_embeddings=tied)
     tokens = jnp.arange(16, dtype=jnp.int32).reshape(1, 16) % 64
     variables = model.init(jax.random.key(0), tokens)
@@ -472,29 +471,29 @@ def test_a_model_with_no_dtype_multiplies_each_product_as_its_operands_compute(s
         variables = jax.tree_util.tree_map_with_path(
             lambda path, leaf: leaf if kept and "kernel" not in jax.tree_util.keystr(path)
             else leaf.astype(jnp.bfloat16), variables)
-    assert_float32_products(dot_precisions(model.apply, variables, tokens))
-    assert_float32_products(dot_precisions(lambda key: model.init(key, tokens), jax.random.key(0)))
+    assert_configured_products(dot_precisions(model.apply, variables, tokens))
+    assert_configured_products(dot_precisions(lambda key: model.init(key, tokens), jax.random.key(0)))
 
 
-def test_a_layer_over_bf16_parameters_fed_float32_multiplies_float32_products():
-    """flax promotes a layer with no dtype over bf16 parameters and a float32 input to float32, so
-    its products multiply at HIGHEST, though its parameters are bf16."""
+def test_a_layer_over_bf16_parameters_fed_float32_multiplies_at_jax_s_configured_precision():
+    """flax promotes a layer with no dtype over bf16 parameters and a float32 input to float32, and
+    its products multiply at JAX's configured precision, as a float32 layer's do."""
     layer = GatedMLP(hidden_features=24, out_features=16)
     x = jax.random.normal(jax.random.key(0), (2, 16), jnp.float32)
     variables = jax.tree.map(lambda leaf: leaf.astype(jnp.bfloat16), layer.init(jax.random.key(1), x))
     precisions = dot_precisions(layer.apply, variables, x)
     assert precisions and all(dtype == jnp.float32 for _, dtype in precisions)
-    assert_float32_products(precisions)
+    assert_configured_products(precisions)
 
 
-def test_soft_embeddings_over_a_bf16_table_multiply_float32_products():
+def test_soft_embeddings_over_a_bf16_table_multiply_at_jax_s_configured_precision():
     """Soft embeddings mix a bf16-stored table by float32 probabilities, a product jax computes in
-    float32, so it multiplies at HIGHEST as a float32-stored table's does."""
+    float32, at JAX's configured precision, as a float32-stored table's is."""
     logits = jax.random.normal(jax.random.key(0), (2, 3, 32), jnp.float32)
     for stored in (jnp.float32, jnp.bfloat16):
         table = jax.random.normal(jax.random.key(1), (32, 16), jnp.float32).astype(stored)
         precisions = dot_precisions(lambda logits, table: soft_embeddings(logits, table, 1.0), logits, table)
-        assert [precision for precision, _ in precisions] == [HIGHEST]
+        assert [precision for precision, _ in precisions] == [None]
 
 
 def test_a_projection_factory_keeps_the_contraction_its_caller_gives():
@@ -508,16 +507,16 @@ def test_a_projection_factory_keeps_the_contraction_its_caller_gives():
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
 @pytest.mark.parametrize("precision", [None, jax.lax.Precision.HIGHEST])
-def test_xla_attention_multiplies_float32_products_and_a_stated_precision(dtype, precision):
-    """'xla' attention over float32 queries multiplies float32 products where the caller states no
-    precision, and every product at HIGHEST where it states that, on whichever path computes it;
-    bf16 queries with none stated keep their own."""
+def test_xla_attention_multiplies_at_jax_s_configured_precision_or_a_stated_one(dtype, precision):
+    """'xla' attention multiplies at JAX's configured precision where the caller states none, float32
+    queries as bf16 ones, and every product at HIGHEST where it states that, on whichever path
+    computes it."""
     query, key, value = (part.astype(dtype) for part in
                          jax.random.normal(jax.random.key(1), (3, *BF16_QKV), jnp.float32))
     precisions = dot_precisions(lambda q, k, v: scaled_dot_product_attention(
         q, k, v, implementation="xla", precision=precision), query, key, value)
     if precision is None:
-        assert_float32_products(precisions)
+        assert_configured_products(precisions)
     else:
         assert precisions and all(stated == HIGHEST for stated, _ in precisions)
 

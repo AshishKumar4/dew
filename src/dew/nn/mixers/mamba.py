@@ -46,7 +46,7 @@ from dew.nn.flops import conv_flops, projection_flops, ssd_flops
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of, sequence_blocks
 from dew.nn.linear import DepthwiseConv1d, held_scan
 from dew.nn.mixer_base import MixerBase, MixerContext
-from dew.nn.precision import accumulated, at_least_fp32, float32_dot_general, float32_einsum, float32_products
+from dew.nn.precision import accumulated, at_least_fp32, float32_dot_general, float32_einsum
 from dew.nn.sharding import logical_axes, rows_like, sequence_shards
 from dew.nn.ssm import affine_spans
 
@@ -239,7 +239,7 @@ class _StepProjection(nn.Module):
             (self.rank, self.features))
         bias = self.param('bias', inverse_softplus_step, (self.features,))
         dtype = self.dtype if self.dtype is not None else raw.dtype
-        product = functools.partial(jnp.matmul, precision=float32_products(dtype, self.precision))
+        product = functools.partial(jnp.matmul, precision=self.precision)
         widened = accumulated(product, raw.astype(dtype), kernel.astype(dtype))
         wide = at_least_fp32(widened.dtype)
         return nn.softplus(widened.astype(wide) + bias.astype(wide))

@@ -70,7 +70,7 @@ from dew.mesh import LogicalAxes
 from dew.nn.attention import AttentionImpl
 from dew.nn.inputs import document_reach
 from dew.nn.kv_cache import cache_positions, filled_slots
-from dew.nn.precision import at_least_fp32, configured_precision, float32_products, scaled
+from dew.nn.precision import at_least_fp32, configured_precision, scaled
 from dew.nn.protocols import Lacks, OutputTable
 from dew.nn.sharding import Suffix, parameter_path
 from dew.registry import resolve_dtype
@@ -1230,8 +1230,8 @@ class TorchCausalLM(nn.Module):
         return logits.astype(at_least_fp32(logits.dtype))
 
     def _step(self, variables, tokens, held, slots, filled, places, reach=None):
-        params, buffers, compute = self._operands(variables)
-        precision = float32_products(compute, self.precision)
+        params, buffers = self._operands(variables)
+        precision = self.precision
         return self.graph.step(params, buffers, tokens, cache=held, slots=slots, filled=filled,
                                positions=places, reach=reach, precision=precision)
 
@@ -1310,21 +1310,17 @@ class TorchCausalLM(nn.Module):
 
     def _over(self, held, tokens, laid, visible, key_places, head_input, *,
               train: bool) -> tuple[jax.Array, jax.Array]:
-        params, buffers, compute = self._operands(held)
+        params, buffers = self._operands(held)
         key = self.make_rng("dropout") if train and self.has_rng("dropout") else None
         return self.graph(params, buffers, jnp.asarray(tokens), train=train, key=key,
-                          precision=float32_products(compute, self.precision), laid=laid, visible=visible,
+                          precision=self.precision, laid=laid, visible=visible,
                           key_places=key_places, head_input=head_input)
 
-    def _operands(self, held) -> tuple[dict[str, jax.Array], dict[str, jax.Array], Dtype]:
-        """The forward's parameters at `dtype`, its buffers, and the dtype its products take: torch's
-        operators state no precision, so the products take the one its compute dtype does
-        (`float32_products`), `dtype` or the dtype its floating parameters hold."""
+    def _operands(self, held) -> tuple[dict[str, jax.Array], dict[str, jax.Array]]:
+        """The forward's parameters at `dtype`, and its buffers."""
         params = {name: self._compute(leaf) for name, leaf in held["params"].items()}
         buffers = {name: jnp.asarray(leaf) for name, leaf in held.get("buffers", {}).items()}
-        compute = self.dtype or jnp.result_type(*[leaf for leaf in params.values()
-                                                  if jnp.issubdtype(leaf.dtype, jnp.floating)])
-        return params, buffers, compute
+        return params, buffers
 
     def _compute(self, leaf) -> jax.Array:
         value = jnp.asarray(leaf)

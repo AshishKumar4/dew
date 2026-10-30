@@ -40,7 +40,7 @@ from .blocks import normal_kernel
 from .flops import MissingFlopsCount, counted_flops, projection_flops
 from .kernels import generation
 from .kernels.templates.gemm import template
-from .precision import at_least_fp32, float32_dot_general, float32_einsum, float32_products, rounded_operand
+from .precision import at_least_fp32, float32_dot_general, float32_einsum, rounded_operand
 from .protocols import ProjectionGroup, Routes, declared_groups
 from .sharding import logical_axes
 
@@ -470,7 +470,7 @@ def expert_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
     if implementation not in GROUPED_MATMULS:
         raise ValueError(f"implementation must be one of {list(GROUPED_MATMULS)}, got {implementation!r}")
     compute = canonicalize_dtype(x, kernel, dtype=dtype)
-    resolved = float32_products(compute, precision)
+    resolved = precision
     xla = implementation == 'xla'
     with generation.chosen(grouped_matmul='xla') if xla else contextlib.nullcontext():
         return template.gemm(x, kernel, group_sizes, compute=compute, out_dtype=compute, precision=resolved)
