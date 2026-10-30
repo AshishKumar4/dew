@@ -16,6 +16,7 @@ from rl_support import TinyHead
 
 from dew.config import ObjectiveConfig
 from dew.config.lm import PromptRollout
+from dew.nn.progress import Progress
 from dew.objectives.rl import RolloutScheduler, Synchronous
 from dew.objectives.rl.grpo import _Terms
 from dew.objectives.rl.methods import method
@@ -370,7 +371,8 @@ def test_rloo_pays_its_reference_penalty_in_the_reward_before_the_baseline():
     packed, _, state = scheduled(sessions, [0, 1], objective, groups=3, reference=objective, **rollout)
     # The reference's likelihood of each sampled id as the step scores the packed rows, and the
     # proximal policy's as they hold it (the calls' raw likelihoods).
-    reference = np.asarray(scored_rows(objective, with_ema(state.variables, state.ema), packed), np.float64)
+    reference = np.asarray(scored_rows(objective, with_ema(state.variables, state.ema), packed,
+                                       Progress(state.updates)), np.float64)
     proximal = np.asarray(packed[OLD_LOG_PROBS_KEY], np.float64)
     ids, mask = np.asarray(packed[IDS_KEY]), np.asarray(packed[RESPONSE_MASK_KEY]) > 0
     expected = {}
