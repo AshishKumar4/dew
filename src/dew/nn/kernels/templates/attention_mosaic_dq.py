@@ -169,6 +169,7 @@ def _dq_columns(query, key, value, dout, peak, prior, anchor, delta, key_index, 
                     streams, ((step, lo, hi),), start, ((block_q, share[1]),) * (2 if walk.accurate else 1),
                     walk.interpret, first=counted))
             dq, *keyed = accumulated
+            rows = (row, pl.ds(first, block_q), head)
             written = [(dq, dq_ref.at[rows])]
             if keyed_ref is not None:
                 written.append((keyed[0], keyed_ref.at[rows]))
