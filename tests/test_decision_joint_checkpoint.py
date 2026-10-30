@@ -374,8 +374,8 @@ def test_a_run_that_held_weights_frozen_serves_as_its_weights_unsplit_do(tmp_pat
     """A run that held its trunk frozen, or some members of a projection group (each attention layer's
     keys and values, its queries trained), loads as a task whose backbone packs as its export's, the
     same weights in one collection, does (`dew.inference.projections`, ledger 2439): one layout, so the
-    two loads compute one program and answer alike. A run trained from the frozen trunk's task holds
-    the trunk frozen as its run stored it (`trained_tree`)."""
+    two loads compute alike and answer alike. A run trained from either task holds frozen exactly what
+    its run held frozen (`trained_tree`), a group's frozen members among them."""
     from dew.batch import FROZEN, freeze, part, thaw
     from dew.inference.projections import inference_projections
     from dew.objectives.base import joined
@@ -407,16 +407,16 @@ def test_a_run_that_held_weights_frozen_serves_as_its_weights_unsplit_do(tmp_pat
     unsplit = replace(loaded, variables=joined({
         "backbone": inference_projections(loaded.model.backbone, part(trained, "backbone")),
         "head": part(trained, "head")}))
-    held = thaw(jax.device_get(loaded.variables))
-    assert jax.tree.structure(held) == jax.tree.structure(unsplit.variables)
-    for leaf, alike in zip(jax.tree.leaves(held), jax.tree.leaves(unsplit.variables), strict=True):
+    held = thaw(jax.device_get(loaded.variables))["params"]
+    assert jax.tree.structure(held) == jax.tree.structure(unsplit.variables["params"])
+    for leaf, alike in zip(jax.tree.leaves(held), jax.tree.leaves(unsplit.variables["params"]), strict=True):
         np.testing.assert_array_equal(np.asarray(leaf), np.asarray(alike))
     for state_text in ("charged twice!", "is the site down?"):
         found, expected = loaded(state_text, {"team": team}), unsplit(state_text, {"team": team})
         np.testing.assert_array_equal(found["team"].probabilities, expected["team"].probabilities)
-    if frozen == "trunk":
-        resumed = DecisionObjective(loaded, layout=JointLayout(max_len=1024)).init(jax.random.key(0))
-        assert jax.tree.structure(resumed[FROZEN]) == jax.tree.structure(state.variables[FROZEN])
+    resumed = DecisionObjective(loaded, layout=JointLayout(max_len=1024)).init(jax.random.key(0))
+    for collection in ("params", FROZEN):
+        assert jax.tree.structure(resumed[collection]) == jax.tree.structure(state.variables[collection])
 
 
 def test_a_joint_release_fine_tunes_averages_and_reloads_from_its_runs(tmp_path):
