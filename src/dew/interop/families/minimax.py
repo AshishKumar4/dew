@@ -154,8 +154,9 @@ def _minimax_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
             continue
         name = f'linear_attention_{index}'
         named.append(name)
-        kinds[name] = native_fields(LayerKind)(mixer={'class': 'lightning_attention', 'fields': {
-            'layer_idx': index, 'num_hidden_layers': layers, 'hidden_act': activation, 'block_size': chunk}})
+        kinds[name] = native_fields(LayerKind)(mixer=None)
+        kinds[name]['mixer'] = {'class': 'lightning_attention', 'fields': {
+            'layer_idx': index, 'num_hidden_layers': layers, 'hidden_act': activation, 'block_size': chunk}}
     used.update(('num_local_experts', 'num_experts'))
     config.update(
         layer_types=tuple(named), kinds=kinds, partial_rotary_factor=factor, partial_rotary_type='default',

@@ -30,9 +30,10 @@ import numpy as np
 import torch
 from huggingface_hub import hf_hub_download
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
+from dream_walk_support import NEW_TOKENS, PROMPTS, RELEASES, STEPS, uniforms
+
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "tests"))
-from dream_walk_support import NEW_TOKENS, PROMPTS, RELEASES, STEPS, uniforms  # noqa: E402
 
 FIXTURES = ROOT / "tests" / "fixtures" / "hf"
 AT_ORIGIN = {"diffucoder"}

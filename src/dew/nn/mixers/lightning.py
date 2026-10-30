@@ -149,14 +149,14 @@ class LightningAttention(nn.Module):
             if not allocated:
                 # The allocation-only call: init_cache's dummy token leaves no memory behind.
                 return self.out_proj(jnp.zeros((batch, length, self.features), qkv.dtype))
-        state = None if held is None else held.value
-        if call.decode and length == 1:
+        if held is not None and length == 1:
             out, _, final = recurrence.step_reference(LIGHTNING, recurrence.Step(
-                state=state, query=query[:, 0], key=key[:, 0], value=value[:, 0], log_decay=log_decay[:, 0],
-                active=None if tokens.valid is None else tokens.valid[:, 0]))
+                state=held.value, query=query[:, 0], key=key[:, 0], value=value[:, 0],
+                log_decay=log_decay[:, 0], active=None if tokens.valid is None else tokens.valid[:, 0]))
             out = out[:, None]
         else:
-            out, final = chunk(LIGHTNING, Chunk(query, key, value, log_decay=log_decay, state=state,
+            out, final = chunk(LIGHTNING, Chunk(query, key, value, log_decay=log_decay,
+                                                state=None if held is None else held.value,
                                                 starts=tokens.starts, firsts=tokens.firsts),
                                chunk_size=self.chunk_size, max_segments=tokens.max_segments)
         if held is not None:

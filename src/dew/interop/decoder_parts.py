@@ -13,7 +13,7 @@ import dataclasses
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import NamedTuple, NoReturn, NotRequired, Protocol, TypedDict
+from typing import TYPE_CHECKING, NamedTuple, NoReturn, NotRequired, Protocol, TypedDict
 
 import jax
 import jax.numpy as jnp
@@ -35,6 +35,9 @@ from dew.nn.hyper_connections import HyperConnections
 from dew.nn.mixers import AttentionMixer, MixerBase
 from dew.nn.rope import RopeScaling, YarnScaling
 from dew.registry import from_record, to_record
+
+if TYPE_CHECKING:
+    from dew.diffusion.discrete import Confident, Unmask
 
 # The KV cache is allocated at the full decode length, so a 128k-context
 # checkpoint would allocate one of those whether the caller asked or not.
@@ -1467,10 +1470,11 @@ def decoder_tensors(family: "DecoderFamily", model: CausalTransformer, variables
                'self_attn': None if model.value_experts is None else model.value_experts.experts}
 
     def names(path: tuple[str, ...]) -> str | tuple[str, ...] | None:
-        if (len(path) == 6 and path[3] == 'experts' and path[-1] == 'kernel'
-                and stacked.get(path[2]) is not None and (path[2] == 'mlp' or path[4] == 'v_proj')):
+        count = stacked.get(path[2]) if len(path) == 6 else None
+        if (count is not None and path[3] == 'experts' and path[-1] == 'kernel'
+                and (path[2] == 'mlp' or path[4] == 'v_proj')):
             named = tuple(family.tensor_name('.'.join(expert_path(path, expert)[1:]), config)
-                          for expert in range(stacked[path[2]]))
+                          for expert in range(count))
             if any(name is None for name in named):
                 raise ValueError(f'{path} has no tensor name for each expert')
             return tuple(name for name in named if name is not None)
@@ -1905,7 +1909,7 @@ class MaskedWalk:
     `generate`), and the time its grid runs to (`DiscreteProcess.endpoint`, Dream's `eps`), None for
     MDLM's."""
 
-    solver: object
+    solver: "Unmask | Confident"
     steps: int
     block: int | None = None
     endpoint: float | None = None

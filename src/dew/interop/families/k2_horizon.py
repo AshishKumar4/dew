@@ -51,8 +51,8 @@ _GATES = {'silu': 'silu', 'softplus': 'softplus2'}
 """The attention gate functions the release names (:500-506), as the mixer's activations."""
 
 
-def _routed(hf: Mapping[str, object], experts: int, used: set[str]) -> dict[str, object]:
-    """The sparse layers' MLP experts and value experts (:647-659): every layer outside
+def _route(hf: Mapping[str, object], experts: int, used: set[str], config: DecoderFields) -> None:
+    """`config` with the sparse layers' MLP experts and value experts (:647-659): every layer outside
     `mlp_only_layers` at the `decoder_sparse_step` cadence routes its MLP, and its values too where
     `mova_num_experts` is set; both routers score by `router_score_func`, the bias (`moe_gate_bias`)
     entering the selection alone, normalized over the chosen and scaled by `router_scaling_factor`."""
@@ -65,21 +65,20 @@ def _routed(hf: Mapping[str, object], experts: int, used: set[str]) -> dict[str,
     scaling = float(_records.number(hf.get('router_scaling_factor', 1.0), 'router_scaling_factor'))
     bias = bool(hf.get('moe_gate_bias', False))
     width = _records.integer(hf['moe_intermediate_size'], 'moe_intermediate_size')
-    fields: dict[str, object] = {'mixture': native_fields(Mixture)(
+    config['mixture'] = native_fields(Mixture)(
         experts=experts, top_k=_records.integer(hf['num_experts_per_tok'], 'num_experts_per_tok'),
         layers=tuple(index for index in range(layers) if index not in dense and (index + 1) % step == 0),
         score_function=score, norm_topk_prob=bool(hf.get('norm_topk_prob', False)), scaling=scaling,
         bias=bias, expert_features=width,
-        shared_features=width * _records.integer(hf.get('num_shared_experts', 0), 'num_shared_experts'))}
+        shared_features=width * _records.integer(hf.get('num_shared_experts', 0), 'num_shared_experts'))
     values = _records.integer(hf.get('mova_num_experts', 0), 'mova_num_experts')
     if values:
         top_k = _records.integer(hf['mova_num_experts_per_tok'], 'mova_num_experts_per_tok')
         # calc_router_weights normalizes whenever it chooses more than one (:158-159).
-        fields['value_experts'] = native_fields(ValueExperts)(
+        config['value_experts'] = native_fields(ValueExperts)(
             experts=values, top_k=top_k, score_function=score, norm_topk_prob=top_k > 1, scaling=scaling,
             bias=bias)
     used.update(_EXPERTS)
-    return fields
 
 
 def _k2_horizon_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
@@ -87,7 +86,8 @@ def _k2_horizon_config(hf: Mapping[str, object], used: set[str]) -> DecoderField
     experts = _records.integer(hf.get('num_experts', 128), 'num_experts')
     if hf.get('query_key_norm', True):
         refuse('query_key_norm', 'its per-head norm weighs the whole projection, which no release sets')
-    gate = hf.get('attention_gate_func')
+    gate = None if hf.get('attention_gate_func') is None else _records.text(hf['attention_gate_func'],
+                                                                             'attention_gate_func')
     if gate is not None and gate not in _GATES:
         refuse(f'attention_gate_func {gate!r}', 'the release gates by a SiLU or a softplus at beta log 2')
     head_dim = _records.integer(hf['head_dim'], 'head_dim')
@@ -104,7 +104,6 @@ def _k2_horizon_config(hf: Mapping[str, object], used: set[str]) -> DecoderField
         refuse(f'original_max_position_embeddings {stated!r}', "the rotary reads its rope_parameters' own")
     used.update(('num_experts', 'query_key_norm', 'attention_gate_func', 'rope_head_dim',
                  'use_sliding_window', 'original_max_position_embeddings', 'layernorm_num_groups', *_EXPERTS))
-    routed = _routed(hf, experts, used) if experts else {}
     # K2HorizonConfig drops the window unless use_sliding_window is set, and its attention builds
     # biases where attention_bias says (:212-223).
     # The rotary builds transformers' YaRN where rope_parameters names it (:740-748).
@@ -118,7 +117,8 @@ def _k2_horizon_config(hf: Mapping[str, object], used: set[str]) -> DecoderField
         # The gate is its own projection of the layer's input, one value a head's dimension (:390-394).
         config.update(output_gate=True, output_gate_activation=_GATES[gate],
                       mixer={'class': 'attention', 'fields': {'gate_projection': 'own'}})
-    config.update(routed)
+    if experts:
+        _route(hf, experts, used, config)
     return config
 
 
@@ -139,7 +139,7 @@ def _k2_horizon_export(model: CausalTransformer) -> Mapping[str, object]:
     }
     mixture, values = model.mixture, model.value_experts
     if mixture is not None:
-        width = mixture.expert_features or model.mlp_features
+        width = mixture.expert_features or model.hidden_features
         sparse = set(range(model.num_layers) if mixture.layers is None else mixture.layers)
         record.update(
             num_experts=mixture.experts, num_experts_per_tok=mixture.top_k, moe_intermediate_size=width,
