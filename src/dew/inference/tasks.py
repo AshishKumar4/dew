@@ -448,7 +448,7 @@ def earlier_shapes(record: Mapping[str, object]) -> Mapping[str, object]:
     and refused where it holds more than its name and fields (ledger 1239),
     a processor's source as its encoded string (ledger 1641), a Qwen or MiMo projector's earlier
     fields, a decoder's or kind's YaRN field beside its rope scaling and a decoder's cross-attention
-    by its fields alone (`_earlier_model`, ledgers 1622, 1898 and 2320), and a row of segments'
+    by its fields alone (`earlier_model`, ledgers 1622, 1898 and 2320), and a row of segments'
     question budgets, which it ignored and an earlier record wrote at their defaults (row 2006). A
     record in today's shapes passes as it is. Carried to 1.0, when it is deleted (ledger 1552)."""
     current = dict(record)
@@ -492,7 +492,7 @@ def earlier_shapes(record: Mapping[str, object]) -> Mapping[str, object]:
 
         current["processor"] = to_record(SourceReference.parse(processor), SourceReference)
     if "model" in current:
-        current = _earlier_model(current)
+        current = earlier_model(current)
     return current
 
 
@@ -501,7 +501,7 @@ _DECODER = ("dew.nn.backbones.causal_transformer:CausalTransformer", "causal_tra
 """The decoder's import path and its registry alias, either of which a record names it by."""
 
 
-def _earlier_model(record: Mapping[str, object]) -> Mapping[str, object]:
+def earlier_model(record: Mapping[str, object]) -> Mapping[str, object]:
     """A record's model with each component in today's fields (`earlier_shapes`), wherever the model
     nests it through another recorded wrapper: a Qwen or MiMo projector's earlier fields (ledger 1622),
     and a decoder's and its layer kinds' YaRN field beside their rope scaling (`_one_scaling`, ledger
@@ -537,14 +537,18 @@ def _earlier_model(record: Mapping[str, object]) -> Mapping[str, object]:
 
 
 def _declared_decoders(name: str, fields: Mapping[str, object]) -> Mapping[str, object]:
-    """The fields of the component class `name` with each decoder its fields declare
-    (`dew.registry.declared_type`) and record as their fields alone translated (`_decoder_fields`)."""
+    """The fields of the component class `name`, by import path or by its alias of any kind (a mixer's
+    `attention`), with each decoder its fields declare (`dew.registry.declared_type`) and record as
+    their fields alone translated (`_decoder_fields`); unchanged where `name` names no one class."""
     from dew.nn.backbones.causal_transformer import CausalTransformer
-    from dew.registry import declared_type, imported, models
+    from dew.registry import KINDS, declared_type, imported
 
-    owner = models[name] if name in models.paths else imported(name)
-    if not isinstance(owner, type):
+    named = [imported(name)] if ":" in name else [imported(kind.paths[name]) for kind in KINDS
+                                                   if name in kind.paths]
+    classes = [member for member in named if isinstance(member, type)]
+    if len(classes) != 1:
         return fields
+    (owner,) = classes
     return {field: (_decoder_fields(value) if isinstance(value, Mapping) and "class" not in value
                     and declared_type(owner, field) is CausalTransformer else value)
             for field, value in fields.items()}
