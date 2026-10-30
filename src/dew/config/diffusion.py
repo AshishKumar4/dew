@@ -420,7 +420,7 @@ class DiffusionRunConfig(RunConfig):
         return variables["autoencoder"]
 
     @property
-    def _compute(self) -> DtypeName | None:
+    def _compute(self) -> DtypeName:
         """The compute dtype the model's record names, which the text and audio
         encoders and a pretrained pipeline compute in too."""
         return dtype_name(resolve_dtype(self.compute_dtype()))

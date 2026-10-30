@@ -1698,15 +1698,13 @@ class RunConfig:
     def compute_dtype(self) -> str:
         """The dtype the run's model computes in: the one its record states, else its numerics'
         (`TrainerConfig.precision`)."""
-        model = getattr(self, "model", None)
-        stated = model.fields.get("dtype") if isinstance(model, ModelConfig) else None
+        stated = self.model.fields.get("dtype")
         return str(stated) if stated is not None else self.trainer.precision.dtypes.compute
 
     def numerics_fields(self) -> dict[str, str]:
         """The fields the run's numerics derive for its model (`ModelConfig.build`): its compute dtype,
         where the model takes one and its record states none."""
-        model = getattr(self, "model", None)
-        if not isinstance(model, ModelConfig) or "dtype" in model.fields or not takes_dtype(model):
+        if "dtype" in self.model.fields or not takes_dtype(self.model):
             return {}
         return {"dtype": self.trainer.precision.dtypes.compute}
 
