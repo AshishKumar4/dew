@@ -406,9 +406,9 @@ def test_a_watched_runs_step_compiled_ahead_carries_its_sampled_step():
 
 def a_watched_run_handed_its_steps_compiled_ahead_compiles_neither(tmp_path):
     """A GPU flow's cell (tests/test_gpu_training.py): a run that inspects, handed its step and sampled step
-    compiled ahead for this host's own GPU, takes both (`taken`) and
-    compiles no step program on its GPU (`Compiles`): its first plan's compile is the step compiled
-    ahead, and it trains from it (train 332's review)."""
+    compiled ahead for this host's own GPU, takes both (`taken`) and compiles no step program on its GPU
+    (`Compiles`): its first plan's compile is the step compiled ahead, and it trains from it (train 332's
+    review)."""
     from dew.nn.kernels.generation import chosen, device_generation
     from dew.telemetry.instrumentation import Compiles
     from dew.training import Inspection
