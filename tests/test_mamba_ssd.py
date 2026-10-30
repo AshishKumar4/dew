@@ -168,6 +168,38 @@ def test_the_port_is_as_exact_as_mamba_ssm(case):
                     truth_fn=as_given(lambda *args: (truth(*args),) * count))
 
 
+def test_the_template_is_as_exact_as_mamba_ssm():
+    """The SSD on the recurrence template under the run's fast forms (`chunk_ssd` with the scan's selector
+    named 'mosaic_gpu'), whose 16-bit numbers are mamba_ssm's (`mainloop._prepared`): every output and
+    gradient on par with recorded mamba_ssm on its bf16 case's declared draws, mamba_ssm's own distance from
+    float64 at the same inputs the bound (check 1), the truth Dew's float64 path as the port's test takes
+    it. Its fp32 cases are the accurate forms' bar's (test_recurrence_template_stability)."""
+    case = "bf16"
+    stored = recording(SEEDED)
+    stored.pop(PRECISION, None)
+    seeds = declared_seeds(SEEDED)[case]
+    chunk, dtype = int(stored[f"{case}.chunk"]), jnp.dtype(str(stored[f"{case}.dtype"]))
+    shape, documents = tuple(stored[f"{case}.shape"]), bool(stored[f"{case}.documents"])
+    draw, reference, truth = indexed_recording(
+        stored, case, seeds, inputs_of=lambda seed: mamba_ssd_draw(seed, shape, dtype, documents),
+        truth_fn=jax.jit(lambda inputs: mamba_ssd_xla(inputs, chunk)))
+    names = ("x", "dt", "A", "B", "C", "D", "h0")
+
+    def run(index, arrays):
+        del index
+        inputs = tuple(jnp.asarray(arrays[name], dtype if name in ("x", "B", "C") else jnp.float32)
+                       for name in names)
+        seq = arrays.get("seq")
+        starts = (None if seq is None else
+                  jnp.concatenate([seq[:, :1] > 0, seq[:, 1:] > seq[:, :-1]], axis=1))
+        with generation.chosen(ssd="mosaic_gpu"):
+            return ssd_value_and_grad(lambda *values: chunk_ssd(*values, chunk_size=chunk, starts=starts),
+                                      inputs, jnp.asarray(arrays["dy"], dtype), jnp.asarray(arrays["dfinal"]))
+
+    assert_as_exact(jax.jit(run), as_given(reference), draw, f"the template against mamba_ssm, {case}",
+                    seeds=seeds, truth_fn=as_given(truth))
+
+
 def test_the_port_takes_widths_padded_to_powers_of_two():
     """A scan whose head and state widths are no powers of two (Nemotron-H 4B's 80-wide heads) runs on the
     port over its operands padded with zero columns (`recurrence_chunk._rated_scan`): its output, final

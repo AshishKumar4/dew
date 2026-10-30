@@ -989,10 +989,11 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
     run = {"family": family or device or mainloop.INTERPRETED, "interpret": interpret, "tiles": tiles,
            "floor": floor}
     # The fast backward where its launches hold on the device (a derived launch spills nothing), else none.
-    fast = (delta and g.ndim == 3 and dtype != jnp.float32
+    fast = (mainloop.fast_backward_form(delta, rounded) and g.ndim == 3 and dtype != jnp.float32
             and mainloop.backward_holds(query, key, value, g, beta, state, tiles=tiles, family=run["family"],
                                         shared=generation.shared_budget(template.Mosaic.launched()),
-                                        starts=starts, max_segments=max_segments))
+                                        starts=starts, max_segments=max_segments, delta=delta,
+                                        rounded=rounded))
     run_back = {name: value for name, value in run.items() if name != "floor"}
 
     # The documents' starts and firsts operands, not closed over (a custom VJP's function closes over no
@@ -1032,7 +1033,7 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
                 "it refuses the port or the portable math (`MOSAIC_SUPPORTS`' 'backward')")
         grads = mainloop.gradients(query, key, value, g, beta, state, out_grad, final_grad, starts=starts,
                                    firsts=firsts, max_segments=max_segments, scale=scale, inverse=inverse,
-                                   kept=kept, **run_back)
+                                   kept=kept, delta=delta, rounded=rounded, **run_back)
         return (*grads[:5], None if state is None else grads[5], None, None)
 
     rule.defvjp(forward, backward)

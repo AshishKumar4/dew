@@ -861,14 +861,17 @@ def reverse_carried(grad: list, keys: TileLoad, weights: TileLoad, queries: Tile
     `dv = (k grad) exp2(g_last - g) + local` ('values_dv', the gradient cast to `dtype`) and the gradient of
     the memory the chunk entered, `grad exp2(g_last) + scale q^T (do exp2(g)) - w^T dv` ('reads', the
     decayed `do` fp32; 'weights_dv', `dv` cast to `dtype`). `last` and `last_low` are the chunk's last prefix
-    halves as a row's vectors, `queries(i)` and `weights(i)` key slice `i`'s tiles."""
+    halves as a row's vectors, `queries(i)` and `weights(i)` key slice `i`'s tiles. Without the delta rule
+    (`weights` None) nothing was corrected, and the memory entered takes no `w^T dv`."""
     dv = functools.reduce(jnp.add, (issue("values_dv", keys(i), part.astype(dtype))
                                     for i, part in enumerate(grad)))
     dv = dv * range_decay(last, last_low, gate, low)[:, None] + local
     read = out_grad.astype(jnp.float32) * raised(gate, low)[:, None]
     kept = raised(last, last_low)[:, None]
-    entered = [part * kept + issue("reads", queries(i).T, read) * scale
-               - issue("weights_dv", weights(i).T, dv.astype(dtype)) for i, part in enumerate(grad)]
+    entered = [part * kept + issue("reads", queries(i).T, read) * scale for i, part in enumerate(grad)]
+    if weights is not None:
+        entered = [part - issue("weights_dv", weights(i).T, dv.astype(dtype))
+                   for i, part in enumerate(entered)]
     return entered, dv
 
 
