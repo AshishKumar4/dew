@@ -1014,10 +1014,11 @@ def test_a_forward_kernel_built_for_its_facts_holds_no_calls_arrays_interpreted(
                                                       128))
         held += [hooks.initial.m, hooks.initial.acc]
     else:
-        operand = jnp.ones((shape[1],))
-        hooks = template.Hooks(score_mod=lambda s, q_pos, k_pos: s / operand.shape[-1])
-        held.append(operand)
-        del operand
+        def shape_reading(operand):
+            return lambda s, q_pos, k_pos: s / operand.shape[-1]
+
+        held.append(jnp.ones((shape[1],)))
+        hooks = template.Hooks(score_mod=shape_reading(held[-1]))
     refs = [weakref.ref(array) for array in held]
     with _device(interpret=True):
         jax.block_until_ready(attention_mosaic.forward(query, key, value, spans, hooks, interpret=True))
