@@ -747,19 +747,21 @@ class StackView:
                 if name is None:
                     continue
                 if (period := self._period(first, count)) > 1:
-                    positions = self._positions(first, count, period, prefix)
-                    held = [layer in tree for layers in positions for layer in layers]
-                    if not any(held):
-                        continue
-                    if not all(held):
-                        raise ValueError(
-                            f"collection {collection!r} holds some of the layers "
-                            f"{sorted(layer for layers in positions for layer in layers)} and not the "
-                            "others; a run reads every one of its layers or none")
-                    for layers in positions:
+                    # Each position of the period stacks its repeats; a position whose layers keep
+                    # nothing in the collection (a layer with no cache) is left out of it.
+                    stacked = {}
+                    for offset, layers in enumerate(self._positions(first, count, period, prefix)):
+                        held = [layer in tree for layer in layers]
+                        if not any(held):
+                            continue
+                        if not all(held):
+                            raise ValueError(
+                                f"collection {collection!r} holds some of the layers {layers} and not the "
+                                "others; each repeat of a period's position keeps what the others keep")
                         _refuse_unlike(collection, [tree[layer] for layer in layers], layers)
-                    tree[name] = {str(offset): stack_layers(*[tree.pop(layer) for layer in layers])
-                                  for offset, layers in enumerate(positions)}
+                        stacked[str(offset)] = stack_layers(*[tree.pop(layer) for layer in layers])
+                    if stacked:
+                        tree[name] = stacked
                     continue
                 names = self._outside_names(first, count, prefix)
                 held = [layer in tree for stage in names for layer in stage]
@@ -807,6 +809,8 @@ class StackView:
                 view = stages.pop(name)
                 if (period := self._period(first, count)) > 1:
                     for offset, layers in enumerate(self._positions(first, count, period, prefix)):
+                        if str(offset) not in view:
+                            continue
                         for repeat, layer in enumerate(layers):
                             # One repeat's leaf, taken with `index_in_dim` as `_leaf` takes a layer's.
                             row = functools.partial(jax.lax.index_in_dim, index=repeat, keepdims=False)
