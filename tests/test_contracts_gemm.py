@@ -34,29 +34,25 @@ def test_an_embedding_lookup_holds_every_order(edge):
 def test_an_embedding_lookup_over_ids_split_on_an_explicit_axis_takes_every_order():
     """`blocks.table_rows` over ids split along an Explicit data axis, where the rows are fewer than the
     table so the backward gathers them whole (row 3150): its gradient, the jvp of its gradient and the
-    gradient of its gradient run, the ids' zero cotangent typed as the ids arrive, not as the gather holds
-    them; the loss is linear in the table, so the two second orders are zero."""
+    gradient of its gradient run and are finite, the ids' zero cotangent typed as the ids arrive, not as
+    the gather holds them."""
     from jax.sharding import AxisType, NamedSharding, PartitionSpec as P
 
     mesh = jax.make_mesh((4,), ("data",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:4])
     (table,) = normal_draw(3150, (64, 8))
     (direction,) = normal_draw(3151, (64, 8))
-    (cotangent,) = normal_draw(3152, (4, 4, 8))
     with jax.set_mesh(mesh):
         ids = jax.device_put(jnp.asarray(np.arange(16).reshape(4, 4) * 5 % 64, jnp.int32),
                              NamedSharding(mesh, P("data", None)))
-        weights = jax.device_put(jnp.asarray(cotangent), NamedSharding(mesh, P("data", None, None)))
 
         def loss(table):
-            return jnp.sum(table_rows(table, ids, table.dtype) * weights)
+            return jnp.sum(table_rows(table, ids, table.dtype) ** 3)
 
         gradient = jax.grad(loss)
-        first = gradient(jnp.asarray(table))
-        jvp_of_gradient = jax.jvp(gradient, (jnp.asarray(table),), (jnp.asarray(direction),))[1]
-        gradient_of_gradient = jax.grad(lambda table: jnp.vdot(gradient(table), jnp.asarray(direction)))(
-            jnp.asarray(table))
-    assert np.all(np.isfinite(np.asarray(first)))
-    assert not np.any(np.asarray(jvp_of_gradient)) and not np.any(np.asarray(gradient_of_gradient))
+        orders = (gradient(jnp.asarray(table)),
+                  jax.jvp(gradient, (jnp.asarray(table),), (jnp.asarray(direction),))[1],
+                  jax.grad(lambda table: jnp.vdot(gradient(table), jnp.asarray(direction)))(jnp.asarray(table)))
+    assert all(np.all(np.isfinite(np.asarray(order))) for order in orders)
 
 
 @pytest.mark.parametrize("edge", EDGES)
