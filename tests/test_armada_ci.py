@@ -837,10 +837,14 @@ def test_the_durations_fold_takes_main_s_times_only_for_files_as_main_ran_them(c
     composed in a train) keeps its own entries, which name the tests it holds, and a file as main ran it takes
     the times main's rows observed (2026-10-31: train 370's fold replaced a head's 66 renamed corpus test ids
     with main's old ones, which no test collects, and the plan cut the file by count)."""
-    (tmp_path / ".armada.json").write_text(json.dumps({"target": 240}))
-    (tmp_path / "tests/test_renamed.py").write_text("def test_old_a():\n    pass\n\ndef test_old_b():\n    pass\n")
-    (tmp_path / "tests/test_unchanged.py").write_text("def test_a():\n    pass\n\ndef test_b():\n    pass\n")
     renamed, unchanged = "tests/test_renamed.py", "tests/test_unchanged.py"
+
+    def defining(path: str, *names: str) -> None:
+        (tmp_path / path).write_text("".join(f"def {name}():\n    pass\n" for name in names))
+
+    (tmp_path / ".armada.json").write_text(json.dumps({"target": 240}))
+    defining(renamed, "test_old_a", "test_old_b")
+    defining(unchanged, "test_a", "test_b")
     # main's record, which predates test_unchanged's second test.
     (tmp_path / "tests/test_durations.json").write_text(json.dumps(
         {f"{renamed}::test_old_a": 100.0, f"{renamed}::test_old_b": 100.0, f"{unchanged}::test_a": 10.0},
@@ -851,7 +855,7 @@ def test_the_durations_fold_takes_main_s_times_only_for_files_as_main_ran_them(c
             {"name": f"3.12:{unchanged}", "exitCode": 0, "seconds": 30.0,
              "tests": {f"{unchanged}::test_a": 10.0, f"{unchanged}::test_b": 20.0}}]
     # A head renames test_renamed's tests, and the queue's record of its composition names them.
-    (tmp_path / "tests/test_renamed.py").write_text("def test_new_a():\n    pass\n\ndef test_new_b():\n    pass\n")
+    defining(renamed, "test_new_a", "test_new_b")
     (tmp_path / "tests/test_durations.json").write_text(json.dumps(
         {f"{renamed}::test_new_a": 60.0, f"{renamed}::test_new_b": 140.0, f"{unchanged}::test_a": 10.0},
         indent=0) + "\n")
