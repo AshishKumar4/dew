@@ -93,9 +93,9 @@ def _dkv_allocations(family: mosaic.Family, config: BackwardTiles, width: int, v
 
 STATISTICS = MappingProxyType({"peak": jnp.float32, "total": jnp.float32, "anchor": jnp.float32,
                                "delta": jnp.float32, "chosen": jnp.int32})
-"""The per-query statistics a dK/dV step reads (`_scores`' `peak`, `total`, `anchor`, `delta` and `chosen`, the
-anchor key's index), in the order of their arrays, and their dtypes: a shared dQ's launch streams each beside
-its queries."""
+"""The per-query statistics a dK/dV step reads (`_scores`' `peak`, `total`, `anchor`, `delta` and `chosen`,
+the anchor key's index), in the order of their arrays, and their dtypes: a shared dQ's launch streams each
+beside its queries."""
 
 
 def _holders(family: mosaic.Family, consumers: int) -> int:
