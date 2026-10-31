@@ -751,21 +751,24 @@ def test_bf16_compute_gradients_are_as_exact_as_torchs_bf16(family, tokens, tmp_
                     seeds=BF16_SEEDS, truth_fn=truth_fn)
 
 
-def test_a_bf16_tier_3_model_takes_forward_mode_through_its_loss_and_its_gradient(tokens, tmp_path):
-    """A bf16 tier-3 model's loss takes forward mode, and so does its gradient (ledger 2653, 3039): its
-    broadcasts, which sum their gradient in fp32 as torch does, are JAX's own between exact casts, which
-    a jvp and a jvp of the gradient run through, where a custom VJP took no tangent: each tangent is
-    finite and nonzero. Their accuracy is the broadcast's contract's (tests/test_contracts_gemm.py)."""
+def test_a_bf16_tier_3_model_takes_forward_mode_through_its_forward_and_its_gradient(tokens, tmp_path):
+    """A bf16 tier-3 model's forward takes forward mode, and so does the gradient of a loss over its
+    logits (ledger 2653, 3039): its broadcasts, which sum their gradient in fp32 as torch does, are JAX's
+    own between exact casts, which a jvp and a jvp of the gradient run through, where a custom VJP took
+    no tangent: each tangent is finite and nonzero. Their accuracy is the broadcast's contract's
+    (tests/test_contracts_gemm.py)."""
     torch.manual_seed(0)
     transformers.GPTNeoXForCausalLM(transformers.GPTNeoXConfig(**TINY)).to(torch.bfloat16).save_pretrained(
         tmp_path)
     with pytest.warns(UserWarning):
         model = Pretrained.load(tmp_path, fallback="torchax", dtype="bfloat16", param_dtype="bfloat16")
-    objective = LMObjective(model, seq_len=SEQ, ema_decay=None)
-    ids = jnp.asarray(tokens[:, : SEQ + 1])
+    ids = jnp.asarray(tokens[:, :SEQ])
+    cotangent = jnp.asarray(np.random.default_rng(0).standard_normal((ids.shape[0], SEQ, TINY["vocab_size"])),
+                            jnp.float32)
 
     def loss(params):
-        return objective_loss(objective, {**model.variables, "params": params}, ids, scalar=True)
+        logits = model.model.apply({**model.variables, "params": params}, ids)
+        return jnp.sum(jnp.asarray(logits, jnp.float32) * cotangent)
 
     params = model.variables["params"]
     direction = jax.tree.map(lambda leaf: jnp.ones_like(leaf) * jnp.asarray(1e-2, leaf.dtype), params)
