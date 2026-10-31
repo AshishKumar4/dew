@@ -370,24 +370,23 @@ def _online(out: Path, report: dict, progress: dict, agent, races: tuple, judge,
         chunk = min(saved_every, updates - done, 10_000 - done % 10_000)
         state = trainer.fit(_idle(), steps=int(state.step) + chunk, log_every=1000, state=state)
         done += chunk
-        progress = _saved(out, {**progress, "level": level,
-                                "environment_steps": steps_before + rollout.environment_steps,
-                                "seconds": seconds_before + time.perf_counter() - began},
-                          "online", done, state.variables)
-        if done % 10_000 and done < updates:
-            continue
-        point = {"updates": done, "environment_steps": progress["environment_steps"], "level": level,
-                 "seconds": progress["seconds"], "episode_return": rollout.metrics["episode_return"],
-                 **judge(agent.act, state.variables, agent.memory(simulator.count), jax.random.key(done))}
-        report["online"].append(point)
-        print(json.dumps(point), flush=True)
-        _written(out / "world.json", json.dumps(report, indent=1))
-        if point["crashed"] < 1 / 3 and level < 1.0:
-            level = round(min(1.0, level + 0.1), 1)
-            for raced in races:
-                raced.difficulty = raced.ramp = level
-            # The checkpoint just written goes on at the level its judgment earned.
-            progress = _committed(out, {**progress, "level": level})
+        steps_now = steps_before + rollout.environment_steps
+        seconds_now = seconds_before + time.perf_counter() - began
+        if done % 10_000 == 0 or done == updates:
+            # A judgment's point and the level it earns are written before the checkpoint that commits them:
+            # a run stopped between the two goes on from the checkpoint before, and judges again.
+            point = {"updates": done, "environment_steps": steps_now, "level": level, "seconds": seconds_now,
+                     "episode_return": rollout.metrics["episode_return"],
+                     **judge(agent.act, state.variables, agent.memory(simulator.count), jax.random.key(done))}
+            report["online"].append(point)
+            print(json.dumps(point), flush=True)
+            _written(out / "world.json", json.dumps(report, indent=1))
+            if point["crashed"] < 1 / 3 and level < 1.0:
+                level = round(min(1.0, level + 0.1), 1)
+                for raced in races:
+                    raced.difficulty = raced.ramp = level
+        progress = _saved(out, {**progress, "level": level, "environment_steps": steps_now,
+                                "seconds": seconds_now}, "online", done, state.variables)
     return state
 
 
@@ -440,7 +439,9 @@ def world(out: Path, *, teacher_weights: Path, assets: Path, drones: int = 16, h
                if progress["phase"] == "online" and (out / "world.json").exists() else {})
     # A run going on keeps the online scores it wrote and every point it went on from, from its first write.
     resumes = [*earlier.get("resumes", []), progress["updates"]] if progress["phase"] == "online" else []
-    report = {"online": earlier.get("online", []), "resumes": resumes,
+    # The points a checkpoint committed: one written past it, by a run stopped before its own, is judged anew.
+    committed = [point for point in earlier.get("online", []) if point["updates"] <= progress["updates"]]
+    report = {"online": committed, "resumes": resumes,
               "drones": drones, "hz": hz, "length": length, "imagination": imagination, "level": level,
               "highlight": highlight, "teacher": judge(teacher_policy(taught), held, None, jax.random.key(4))}
     began = time.perf_counter()
