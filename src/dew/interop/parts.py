@@ -95,11 +95,15 @@ def _biased(*linears: torch.nn.Module) -> bool:
     return biased.pop()
 
 
-def _rope(config) -> Mapping[str, object]:
+def _rope(config, *, partial: bool = False) -> Mapping[str, object]:
     """The rotary a `LlamaRotaryEmbedding`-shaped class builds from its config's standardized record
-    (its rope_type through ROPE_INIT_FUNCTIONS, `decoder_parts.read_rope`), over the whole head."""
+    (its rope_type through ROPE_INIT_FUNCTIONS, `decoder_parts.read_rope`), over the whole head; where
+    `partial`, a class whose code turns the record's `partial_rotary_factor` of each head (GLM-4's and
+    StableLM's), over that fraction, its frequencies over the dimensions it turns (`partial_rotary_type`
+    'default', GPT-NeoX's)."""
     parameters = dict(config.rope_parameters or {})
-    if parameters.get('partial_rotary_factor', 1.0) != 1.0:
+    factor = parameters.get('partial_rotary_factor', 1.0)
+    if factor != 1.0 and not partial:
         raise Ambiguous("the rotary turns part of each head, which this rotation applies whole")
     entry = {key: value for key, value in parameters.items() if key != 'partial_rotary_factor'}
     try:
@@ -111,6 +115,8 @@ def _rope(config) -> Mapping[str, object]:
     fields: dict[str, object] = {'rope_theta': ropes.theta}
     if ropes.scaling is not None:
         fields['rope_scaling'] = ropes.scaling
+    if factor != 1.0:
+        fields.update(partial_rotary_factor=float(factor), partial_rotary_type='default')
     return fields
 
 
@@ -209,6 +215,43 @@ def _read_projection_qk_norm_attention(view: PartView) -> Mapping[str, object]:
     """OLMo 2's attention: Llama's with an RMSNorm over the whole query and key projections, before the
     heads split (`qk_norm_scope='projection'`, OLMo 3's)."""
     return {**_read_attention(view), 'qk_norm': True, 'qk_norm_scope': 'projection'}
+
+
+def _read_olmoe_attention(view: PartView) -> Mapping[str, object]:
+    """OLMoE's attention: OLMo 2's, which clips its queries, keys and values to the config's `clip_qkv`
+    where it states one, and hands the attention backend the config's `sliding_window`, which its eager
+    attention does not apply (its mask is the causal one); Dew's attention does neither."""
+    if view.config.clip_qkv is not None:
+        raise Ambiguous(f"the attention clips its queries, keys and values to {view.config.clip_qkv}")
+    if view.config.to_dict().get('sliding_window') is not None:
+        raise Ambiguous("the attention hands its backend a window its causal mask does not apply")
+    return _read_projection_qk_norm_attention(view)
+
+
+def _read_stablelm_attention(view: PartView) -> Mapping[str, object]:
+    """StableLM's attention: Llama's projections, its queries and keys turned over their first
+    `rotary_ndims` dimensions alone (the config's `partial_rotary_factor` of each head, GPT-NeoX's rotary),
+    each head's queries and keys normed by a layer norm of its own where `qk_layernorm`, which Dew's
+    shared query and key norm is not."""
+    if view.qk_layernorm:
+        raise Ambiguous("each head's queries and keys are normed by a layer norm of its own")
+    factor = float(view.config.rope_parameters.get('partial_rotary_factor', 1.0))
+    if view.rotary_ndims != int(view.head_dim * factor):
+        raise Ambiguous(f"the attention turns {view.rotary_ndims} of each head's {view.head_dim} dimensions")
+    fields = dict(_read_attention(view))
+    if factor != 1.0:
+        fields.update(partial_rotary_factor=factor, partial_rotary_type='default')
+    return fields
+
+
+def _read_stablelm_layer(view: PartView) -> Mapping[str, object]:
+    """StableLM's layer: pre-norm, its attention and feed-forward beside each other off one norm where
+    `use_parallel_residual` (Falcon's shared parallel norm), and its feed-forward's output dropped in
+    training at `hidden_dropout`, which Dew drops with no other output."""
+    if view.dropout.p:
+        raise Ambiguous("the layer drops its feed-forward's output alone in training")
+    parallel = bool(view.use_parallel_residual)
+    return {'parallel_residual': parallel, 'shared_parallel_norm': parallel}
 
 
 def _read_output_normed_layer(view: PartView) -> Mapping[str, object]:
@@ -336,6 +379,20 @@ def _read_rotary(view: PartView) -> Mapping[str, object]:
     return _rope(view.config)
 
 
+def _read_partial_rotary(view: PartView) -> Mapping[str, object]:
+    """A rotary whose code turns the config's `partial_rotary_factor` of each head (`_rope`)."""
+    return _rope(view.config, partial=True)
+
+
+def _read_layer_norm(view: PartView) -> Mapping[str, object]:
+    """torch's LayerNorm over the width, its weight and bias (where it holds one) applied in the input's
+    dtype, as `norm_type='layer'` with `scale_after_cast=False` (GPT-NeoX's)."""
+    if not view.elementwise_affine or len(view.normalized_shape) != 1:
+        raise Ambiguous("the layer norm scales by no weight or normalizes more than the width")
+    return {'norm_type': 'layer', 'norm_bias': view.bias is not None, 'norm_eps': float(view.eps),
+            'scale_after_cast': False, 'scale_offset': False}
+
+
 def _read_nothing(view: PartView) -> Mapping[str, object]:
     return {}
 
@@ -377,6 +434,8 @@ _GRANITE = 'transformers.models.granite.modeling_granite'
 _SMOLLM3 = 'transformers.models.smollm3.modeling_smollm3'
 _OLMO2 = 'transformers.models.olmo2.modeling_olmo2'
 _HY_V3 = 'transformers.models.hy_v3.modeling_hy_v3'
+_OLMOE = 'transformers.models.olmoe.modeling_olmoe'
+_STABLELM = 'transformers.models.stablelm.modeling_stablelm'
 _DEEPSEEK_V3 = 'transformers.models.deepseek_v3.modeling_deepseek_v3'
 _GLM4_MOE = 'transformers.models.glm4_moe.modeling_glm4_moe'
 Children = Mapping[str, tuple[str, ...]]
@@ -401,6 +460,14 @@ KNOWN: tuple[KnownPart, ...] = (
     KnownPart('causal_lm', f'{_HY_V3}:HYV3ForCausalLM', {'model': ('model',), 'lm_head': ('linear',)},
               _read_causal_lm),
     KnownPart('model', f'{_HY_V3}:HYV3Model', _MODEL_CHILDREN, _read_llama_model),
+    KnownPart('model', f'{_OLMOE}:OlmoeModel', _MODEL_CHILDREN, _read_llama_model),
+    KnownPart('causal_lm', f'{_STABLELM}:StableLmForCausalLM', {'model': ('model',), 'lm_head': ('linear',)},
+              _read_causal_lm),
+    KnownPart('model', f'{_STABLELM}:StableLmModel', _MODEL_CHILDREN, _read_llama_model),
+    KnownPart('layer', f'{_STABLELM}:StableLmDecoderLayer', _LAYER_CHILDREN, _read_stablelm_layer),
+    KnownPart('attention', f'{_STABLELM}:StableLmAttention', _ATTENTION_CHILDREN, _read_stablelm_attention),
+    KnownPart('rotary', f'{_STABLELM}:StableLmRotaryEmbedding', {}, _read_partial_rotary, whole=True),
+    KnownPart('norm', 'torch.nn:LayerNorm', {}, _read_layer_norm, ('weight', 'bias')),
     KnownPart('model', f'{_LLAMA}:LlamaModel', _MODEL_CHILDREN, _read_llama_model),
     KnownPart('model', f'{_GRANITE}:GraniteModel', _MODEL_CHILDREN, _read_scaled_model),
     KnownPart('model', f'{_MIXTRAL}:MixtralModel', _MODEL_CHILDREN, _read_windowed_model),
@@ -420,6 +487,8 @@ KNOWN: tuple[KnownPart, ...] = (
     KnownPart('attention', f'{_DEEPSEEK_V3}:DeepseekV3Attention', _LATENT_CHILDREN, _read_latent_attention),
     KnownPart('attention', f'{_HY_V3}:HYV3Attention',
               {**_ATTENTION_CHILDREN, 'q_norm': ('norm',), 'k_norm': ('norm',)}, _read_qk_norm_attention),
+    KnownPart('attention', f'{_OLMOE}:OlmoeAttention',
+              {**_ATTENTION_CHILDREN, 'q_norm': ('norm',), 'k_norm': ('norm',)}, _read_olmoe_attention),
     KnownPart('attention', f'{_OLMO2}:Olmo2Attention',
               {**_ATTENTION_CHILDREN, 'q_norm': ('norm',), 'k_norm': ('norm',)},
               _read_projection_qk_norm_attention),
@@ -431,6 +500,8 @@ KNOWN: tuple[KnownPart, ...] = (
          _read_mixtral_moe),
     KnownPart('moe', f'{_QWEN3_MOE}:Qwen3MoeSparseMoeBlock', {'gate': ('router',), 'experts': ('experts',)},
          _read_nothing),
+    KnownPart('moe', f'{_OLMOE}:OlmoeSparseMoeBlock', {'gate': ('router',), 'experts': ('experts',)},
+              _read_nothing),
     KnownPart('moe', f'{_HY_V3}:HYV3MoE', _SHARED_MOE_CHILDREN, _read_shared_moe,
               state={'e_score_correction_bias': 'gate.e_score_correction_bias'}),
     KnownPart('shared', f'{_LLAMA}:LlamaMLP',
@@ -451,7 +522,7 @@ KNOWN: tuple[KnownPart, ...] = (
     KnownPart('rotary', f'{_LLAMA}:LlamaRotaryEmbedding', {}, _read_rotary, whole=True),
     KnownPart('rotary', f'{_QWEN2}:Qwen2RotaryEmbedding', {}, _read_rotary, whole=True),
     KnownPart('rotary', f'{_OLMO2}:Olmo2RotaryEmbedding', {}, _read_rotary, whole=True),
-    KnownPart('rotary', f'{_GLM4_MOE}:Glm4MoeRotaryEmbedding', {}, _read_rotary, whole=True),
+    KnownPart('rotary', f'{_GLM4_MOE}:Glm4MoeRotaryEmbedding', {}, _read_partial_rotary, whole=True),
     KnownPart('embedding', 'torch.nn:Embedding', {}, _read_embedding, ('weight',)),
     KnownPart('embedding', f'{_GEMMA}:GemmaTextScaledWordEmbedding', {}, _read_scaled_embedding, ('weight',)),
     KnownPart('linear', 'torch.nn:Linear', {}, _read_nothing, ('weight', 'bias')),
