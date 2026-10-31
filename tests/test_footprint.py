@@ -300,5 +300,6 @@ def test_ragged_products_over_one_operand_ragged_in_two_axes_expand_it_twice():
 
     alone = jax.make_jaxpr(ragged_in(0))(square, weights, sizes).jaxpr
     program = jax.make_jaxpr(both)(square, weights, sizes).jaxpr
-    expansion = 2 * 4 * 32 * 32 * 4
-    assert peak_bytes(program, "gpu", 0) >= peak_bytes(alone, "gpu", 0) + expansion
+    # The second product's expansion of the operand, once a group, beside the first's, which the third
+    # reads again.
+    assert peak_bytes(program, "gpu", 0) >= peak_bytes(alone, "gpu", 0) + 4 * 32 * 32 * 4

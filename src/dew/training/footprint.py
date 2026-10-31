@@ -182,14 +182,15 @@ def peak_bytes(program: jcore.Jaxpr, platform: str, workspace: int) -> int:
     last.update({kept: len(program.eqns) for kept in frontier.reading(program.outvars)})
     # A ragged operand's dense expansion, one per operand and group sizes however many ragged products
     # read it (XLA's common-subexpression elimination), from the first that reads it to the last.
-    dense = {key: index for index, equation in enumerate(program.eqns)
-             for key in (expansions(equation) if platform == "gpu" else {})}
+    grown = [expansions(equation) if platform == "gpu" else {} for equation in program.eqns]
+    dense = {key: index for index, found in enumerate(grown) for key in found}
+    readers = collections.Counter(key for found in grown for key in found)
     live, held, most = 0, set(), 0
     expanded: set[tuple[jcore.Var, jcore.Var]] = set()
     for index, equation in enumerate(program.eqns):
         made = [out for out in equation.outvars if out in last and frontier.buffered(out)]
         made_bytes = sum(map(device_share, made))
-        for key, size in (expansions(equation) if platform == "gpu" else {}).items():
+        for key, size in shared(grown[index], readers).items():
             if key not in expanded:
                 expanded.add(key)
                 live += size
@@ -208,7 +209,7 @@ def peak_bytes(program: jcore.Jaxpr, platform: str, workspace: int) -> int:
         for done in [value for value in held if last[value] == index]:
             held.discard(done)
             live -= device_share(done)
-        for key, size in (expansions(equation) if platform == "gpu" else {}).items():
+        for key, size in shared(grown[index], readers).items():
             if dense[key] == index:
                 live -= size
     return most
@@ -328,31 +329,62 @@ def cublas_product(equation: jcore.JaxprEqn) -> bool:
     return (kept_left + kept_right) * contracting >= threshold or not classical
 
 
-def expansions(equation: jcore.JaxprEqn) -> dict[tuple[jcore.Var, jcore.Var], int]:
-    """The dense expansions a GPU's ragged product reads, each keyed by its operand and group sizes, with
-    its bytes: XLA expands a ragged product no grouped kernel takes into a product over its groups
-    (`RaggedDotRewriter::RunImpl`, xla/hlo/transforms/expanders/ragged_dot_rewriter.cc: cuDNN's fusion
-    takes only float16 or bfloat16, behind `xla_gpu_experimental_use_ragged_dot_fusion`, off by default;
-    hipBLASLt's grouped GEMM only on ROCm), each operand it makes dense (`RaggedToDense`) masked once a
-    group, in both its layouts and with its mask: the ragged rows of one ragged in a non-contracting
-    dimension, both operands of one ragged in its contracting dimension, none of one ragged in a batch
-    dimension (`RaggedToGeneral`)."""
+def shared(found: Mapping[tuple, int], readers: Mapping[tuple, int]) -> dict[tuple, int]:
+    """Of an equation's expansions (`expansions`), those it holds a buffer of: every dense operand, and a
+    mask only where several of the program's ragged products read it, which XLA's common-subexpression
+    elimination computes once and its fusion reads from memory in each select; one alone fuses into its
+    select."""
+    return {key: size for key, size in found.items() if key[0] == "dense" or readers[key] > 1}
+
+
+def expansions(equation: jcore.JaxprEqn) -> dict[tuple, int]:
+    """The buffers a GPU's ragged product reads that XLA makes of its operands, each keyed as XLA's
+    common-subexpression elimination tells them apart, with its bytes. XLA expands a ragged product no
+    grouped kernel takes into a product over its groups (`RaggedDotRewriter::RunImpl`,
+    xla/hlo/transforms/expanders/ragged_dot_rewriter.cc: cuDNN's fusion takes only float16 or bfloat16,
+    behind `xla_gpu_experimental_use_ragged_dot_fusion`, off by default; hipBLASLt's grouped GEMM only on
+    ROCm). Each operand it makes dense (`RaggedToGeneral`: the ragged rows of one ragged in a
+    non-contracting dimension, both operands of one ragged in its contracting dimension, none of one
+    ragged in a batch dimension) is a select of its broadcast once a group (`RaggedToDense`), which the
+    product reads from memory, keyed by the operand, its group sizes and the dimension it is ragged in
+    (the mask's iota runs over it); laid out again where the product's contracting dimensions are not
+    adjacent in it, which XLA's dot decomposer makes them (`adjacent`); and its mask, a byte an
+    element, keyed by its shape, sizes and ragged dimension alone, the same for every operand of that
+    shape (`shared_masks` holds it where several expansions read it)."""
     if equation.primitive.name != "ragged_dot_general":
         return {}
     numbers = equation.params["ragged_dot_dimension_numbers"]
-    (contracting, _), (batch, _) = numbers.dot_dimension_numbers
+    (contracting, other), (batch, _) = numbers.dot_dimension_numbers
     (ragged,) = numbers.lhs_ragged_dimensions
     sizes = equation.invars[2]
     if ragged in batch or not computed(sizes):
         return {}
-    groups = dimensions(sizes)[-1]
-    dense = equation.invars[:2] if ragged in contracting else equation.invars[:1]
-    # The operand masked into its groups (a select of its broadcast) as `RaggedToDense` lays it out, the
-    # group beside its ragged dimension, that laid out groups first (`TransposeIndexToFront`), and the
-    # mask, a byte an element: an Ampere's step at highest precision holds all three
-    # (f32[1024,4,128], f32[4,1024,128] and pred[4,1024,128] in its buffer assignment, row 2750).
-    return {(operand, sizes): groups * (2 * device_share(operand) + int(math.prod(dimensions(operand))))
-            for operand in dense if computed(operand)}
+    groups, at = dimensions(sizes)[-1], len(dimensions(sizes)) - 1
+    if ragged in contracting:
+        # Both operands made dense, the group a batch dimension of the product before the rest.
+        axis = other[contracting.index(ragged)]
+        dense = [(equation.invars[0], ragged, (), contracting), (equation.invars[1], axis, (), other)]
+    else:
+        # The rows' group joins their contraction, contracted with the weights' group.
+        dense = [(equation.invars[0], ragged, (at,), contracting)]
+    found: dict[tuple, int] = {}
+    for operand, axis, joined, contracted in dense:
+        if not computed(operand):
+            continue
+        shape = dimensions(operand)
+        made = groups * device_share(operand)
+        found[("dense", operand, sizes, axis)] = made * (1 if adjacent(at, joined, contracted) else 2)
+        found[("mask", shape, sizes, axis)] = groups * int(math.prod(shape))
+    return found
+
+
+def adjacent(at: int, joined: tuple[int, ...], contracted: Sequence[int]) -> bool:
+    """Whether a dense expansion, its group at `at`, holds the dimensions its product contracts
+    (`contracted`, the operand's, shifted past the group, and the group where it joins them, `joined`)
+    adjacent, as XLA's dot decomposer needs them for a GEMM, which else lays the operand out again
+    (xla/hlo/transforms/expanders/dot_decomposer.cc's canonical form)."""
+    positions = sorted([axis + (axis >= at) for axis in contracted] + list(joined))
+    return positions == list(range(positions[0], positions[0] + len(positions)))
 
 
 def emitted_algorithm(equation: jcore.JaxprEqn) -> bool:
