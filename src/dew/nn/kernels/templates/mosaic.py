@@ -121,8 +121,8 @@ def kernel(entry, *, out_type, grid: tuple, grid_names: tuple, warpgroups: int,
            reduction_scratch: int = 0, kernel_name: str | None = None) -> Callable:
     """Build a per-shard launch with the same reporting and interpreter semantics for every family, each call
     checked against the mesh it runs in (`per_shard`): `kernel_name` its name as its caller resolved it
-    (`report.named`, which reads the launch tracing it), a launch built once for every call of its facts
-    (`attention_mosaic_forward._kernel_of`), else `name`'s here."""
+    (`report.named`, which reads the launch tracing it), a launch lowered once for every call of its facts
+    (`tuning.lowered_once`), else `name`'s here."""
     clustered = {'cluster': (cluster,), 'cluster_names': (CLUSTER,)} if cluster > 1 else {}
     built = plgpu.kernel(entry, out_type=out_type, grid=grid, grid_names=grid_names,
                          num_threads=warpgroups, thread_name="wg", scratch_types=scratch,
