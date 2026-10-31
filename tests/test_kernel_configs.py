@@ -725,7 +725,7 @@ def test_records_a_failed_process_of_their_own_wrote_are_refused():
 def test_the_resource_gate_refuses_spills_and_invalid_allocations():
     """A record the gate reads (`mosaic_failures`): a kernel past its shared memory, its tensor memory or
     spilling fails; a spill-free model disagreement is reported."""
-    from kernel_compile import mosaic_failures, reports
+    from kernel_compile import inherited, mosaic_failures, reports
 
     within = {"kernel": "k", "unread": [], "shared": 1024, "tmem": 256, "registers": 168, "spilled": 0}
     record = {"name": "case", "limit": 2048, "tmem_limit": 512, "kernels": [within]}
@@ -744,10 +744,11 @@ def test_the_resource_gate_refuses_spills_and_invalid_allocations():
     assert mosaic_failures([{**record, "kernels": []}])
     # The program's own refusal of a block past shared memory fails it whatever its Mosaic kernels say.
     assert mosaic_failures([{**record, "shared": 4096}])
-    # An estimate without a binary, or a binary without an estimate, or an estimate without a field, is read
-    # as missing, not as within.
+    # A binary without an estimate, an estimate without a field, or a kernel whose PTX no compile covered,
+    # is read as missing, not as within.
     complete = "Resources(smem_scratch_bytes=1024, tmem_scratch_cols=0, tmem_collective_scratch_cols=0)"
-    a, b, c = (dataclasses.asdict(found) for found in reports(
+    compiled = {"a": {"registers": 168, "spilled": 0}, "b": {"registers": 255, "spilled": 40}}
+    a, b, c = (inherited(dataclasses.asdict(found), compiled) for found in reports(
         {"a": complete, "c": "Resources(smem_scratch_bytes=1024)"},
         [report.Binary("a", None, 168, 0), report.Binary("b", None, 255, 40)]))
     assert not a["unread"]

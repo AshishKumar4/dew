@@ -2,10 +2,10 @@
 A run's compile (`compiled`, owner 10-29, bible §6) reads each kernel's registers a thread and its stack
 frame from the binary its executable carries (`binaries`): a launch whose kernel spills is refused
 (`refused`) and its program lowered once more, where the launch's derivation takes the next config by its
-own rule, each such refusal a model miss (`misses`). The CPU suite's compile gate reads Mosaic's dumped
-reports and PTX instead (tests/kernel_compile.py), as it scans ptxas's caps and needs Mosaic's resource
-estimate. Each kernel's name carries the launch that traced it (`named`), so a binary names its launch and
-its config."""
+own rule, each such refusal a model miss (`misses`). The CPU suite's compile gate reads the binaries too,
+beside the resource estimate Pallas prints as it lowers a kernel and the PTX Mosaic prints as it compiles
+one, whose registers and spills ptxas states at the GPU's own compile (tests/kernel_compile.py). Each
+kernel's name carries the launch that traced it (`named`), so a binary names its launch and its config."""
 
 import contextlib
 import contextvars
@@ -31,6 +31,16 @@ LAUNCH_SUFFIX = re.compile(r"__l([0-9a-f]{10})$")
 KERNEL_FUNCTION = re.compile(r"(?P<kernel>.*)_mosaic_gpu_kernel")
 """A Mosaic GPU kernel's function in its binary: its kernel's name, the host function's `_mosaic_gpu`
 (jax/experimental/mosaic/gpu/core.py) and GPU outlining's `_kernel`."""
+
+
+def kernel_of(name: str) -> tuple[str, str | None]:
+    """`(kernel, launch)` of a kernel's `name` as it traced (`named`), its function in its binary or its PTX
+    entry (`KERNEL_FUNCTION`) or its call's location: its name less the launch's suffix, and the launch's
+    digest, None where it carries none."""
+    function = KERNEL_FUNCTION.fullmatch(name)
+    kernel = function.group("kernel") if function else name
+    launch = LAUNCH_SUFFIX.search(kernel)
+    return LAUNCH_SUFFIX.sub("", kernel), launch.group(1) if launch else None
 KERNEL_PROTO_VERSION = 4
 """The `MosaicGpuKernelProto` version jaxlib serializes (mosaic/gpu/custom_call.cc), which it alone reads."""
 MOSAIC_TARGET = b"mosaic_gpu_v2"
@@ -405,8 +415,4 @@ def _binary(function: str, elf: bytes) -> Binary:
                 at += 4
     if REGISTER_COUNT not in stated:
         raise ValueError(f"the binary of {function} states no registers")
-    named = KERNEL_FUNCTION.fullmatch(function)
-    kernel = named.group("kernel") if named else function
-    launch = LAUNCH_SUFFIX.search(kernel)
-    return Binary(LAUNCH_SUFFIX.sub("", kernel), launch.group(1) if launch else None,
-                  stated[REGISTER_COUNT], stated.get(FRAME_SIZE, 0))
+    return Binary(*kernel_of(function), stated[REGISTER_COUNT], stated.get(FRAME_SIZE, 0))

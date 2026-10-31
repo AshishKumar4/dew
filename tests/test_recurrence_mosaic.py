@@ -631,6 +631,7 @@ def compiled_cases(target: str, plans: dict, refused: list, only: tuple | None =
                              kind=kind) for tiles, kind in unheld]
             tiled = template.MOSAIC.variants(bound)
             if variant is not None:
+                assert len(tiled) - 1 <= NEIGHBOURS, f"{name} has {len(tiled) - 1} variants, past NEIGHBOURS"
                 return [case(name, dtype, args, starts, bound, tiles, training=training, packed=packed,
                              kind='') for tiles in tiled[1:][variant:variant + 1]]
             if training and not mainloop_backward.backward_holds(
