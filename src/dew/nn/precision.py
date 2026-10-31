@@ -199,12 +199,26 @@ def biased(product: jax.Array, bias: jax.Array) -> jax.Array:
     at fp32, the gradient sums at fp32 and rounds once into the bias. A CPU running Dew's wide
     arithmetic (`WIDE_CPU_ARITHMETIC`) sums it in float64, as it sums a float32 product (`spread`).
     """
-    dtype, wide = jnp.result_type(product, bias), at_least_fp32(bias.dtype)
-    # The bias takes the product's rank before the sum, as flax's layers reshape it, so no rank is
-    # promoted implicitly. Broadcast at fp32 and rounded back, it adds as flax adds it (XLA folds
-    # the round trip, so the product and bias fuse as before) and its gradient sums at fp32.
-    bias = jnp.reshape(bias.astype(wide), (1,) * (product.ndim - bias.ndim) + bias.shape)
-    return product.astype(dtype) + spread(bias, product.shape).astype(dtype)
+    dtype = jnp.result_type(product, bias)
+    # The bias over the product's trailing axes, as flax's layers reshape it, so no rank is promoted
+    # implicitly. Broadcast at fp32 and rounded back, it adds as flax adds it (XLA folds the round trip,
+    # so the product and bias fuse as before) and its gradient sums at fp32 (`broadcast_summed`).
+    leading = product.ndim - bias.ndim
+    spread_bias = broadcast_summed(bias, product.shape, tuple(range(leading, product.ndim)))
+    return product.astype(dtype) + spread_bias.astype(dtype)
+
+
+def broadcast_summed(value: jax.Array, shape: tuple[int, ...], dimensions: tuple[int, ...]) -> jax.Array:
+    """`jax.lax.broadcast_in_dim(value, shape, dimensions)`, whose gradient, the sum of a cotangent over
+    every position the value spread over, sums at fp32 or wider and rounds once to the value's dtype, as
+    torch's autograd sums a bf16 one: the value widened to fp32 between two exact casts and spread
+    (`spread`), which a CPU running Dew's wide arithmetic sums in float64. Every order JAX forms its
+    transpose at takes it, forward mode's included. A bias's spread (`biased`) and a tier-3 model's
+    broadcasts (`dew.interop.torchax_fallback`) are each this (ledger 3038)."""
+    wide = at_least_fp32(value.dtype)
+    kept = iter(value.shape)
+    placed = tuple(next(kept) if axis in dimensions else 1 for axis in range(len(shape)))
+    return spread(jnp.reshape(value.astype(wide), placed), shape).astype(value.dtype)
 
 
 def spread(value: jax.Array, shape: tuple[int, ...]) -> jax.Array:
