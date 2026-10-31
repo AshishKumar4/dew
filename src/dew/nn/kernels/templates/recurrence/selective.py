@@ -21,7 +21,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels.templates import cost, mosaic, resources, scan as block_scan
+from dew.nn.kernels.templates import mosaic, scan as block_scan
 from dew.nn.kernels.templates.recurrence import mainloop
 
 LOG2E = math.log2(math.e)
@@ -176,31 +176,21 @@ def forward(x, dt, b, c, parameters, state, resets, scan: Scan):
     return (*outs, None) if not scan.entered else tuple(outs)
 
 
-RESIDENT = 3
-"""The backward's programs a multiprocessor holds, a warpgroup each: twelve warps to hide a block's scans'
-shuffles and barriers, as mamba_ssm's backward launches at least three of its 128 threads (kMinBlocks,
-selective_scan_bwd_kernel.cuh:52). At two, an H100's warps were 12% active (mamba1-scan-h100-7d3152837)."""
-
-LIVE_ARRAYS = 15
-"""The fp32 values a backward thread holds a position at its peak: its tokens' operands and gradients'
-sums carried through the states, and a state's operands and its scans': 254 registers at 16 positions a
-thread on an H100's compile, 255 on an A100's (scanbwd2-ptxas-* at 7d3152837)."""
+POSITIONS_PER_THREAD = 16
+"""The tokens a backward thread takes, mamba_ssm's kNItems: its warpgroup's 2048 a block. ptxas fills the
+registers a kernel leaves it (Mosaic GPU asks one program a multiprocessor, nvvm.minctasm 1, jaxlib's
+mosaic/gpu/passes.cc:211), so fewer tokens hold no more programs: at 8 the backward needed 152 registers
+spill-free and took 202, at 16 needed 224 and took 254, two programs a multiprocessor either way
+(need-*-sm90 at 1213539d0 and 02c73b9f0). Three, mamba_ssm's kMinBlocks, would take a register cap
+(`.maxnreg`, or minctasm 3) at 8 tokens, which jaxlib's compile does not take."""
 
 
-def positions_per_thread(family: mosaic.Family) -> int:
-    """The tokens a backward thread takes: the most, a power of two to mamba_ssm's 16 (kNItems), whose
-    values (`LIVE_ARRAYS` a token) and control (`resources.CONTROL_REGISTERS`) fit a thread's share of the
-    multiprocessor's registers at `RESIDENT` programs, in the family's allocation steps."""
-    share = cost.REGISTERS // (block_scan.THREADS * RESIDENT) // family.register_step * family.register_step
-    return max(count for count in (1, 2, 4, 8, 16)
-               if resources.CONTROL_REGISTERS + LIVE_ARRAYS * count <= share)
-
-
-def block_positions(length: int, family: mosaic.Family) -> int:
-    """The tokens a backward block of a scan `length` tokens long takes: its threads' (`positions_per_thread`)
-    where the length is long enough, else the fewest whole tokens a thread covering it."""
+def block_positions(length: int) -> int:
+    """The tokens a backward block of a scan `length` tokens long takes: its threads'
+    (`POSITIONS_PER_THREAD`) where the length is long enough, else the fewest whole tokens a thread covering
+    it."""
     threads = block_scan.THREADS
-    return min(threads * positions_per_thread(family), -(-length // threads) * threads)
+    return min(threads * POSITIONS_PER_THREAD, -(-length // threads) * threads)
 
 
 def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan):
@@ -220,7 +210,7 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan):
     sum over the channels in global memory, each program's added atomically (mamba_ssm's atomicAdd), a
     block's tokens across the threads so a warp's adds are adjacent (cub's BlockedToStriped)."""
     rows, channels, length = x.shape
-    states, positions = b.shape[1], block_positions(length, scan.family)
+    states, positions = b.shape[1], block_positions(length)
     blocks, per = length // positions, positions // scan.chunk
     interpret = scan.interpret
     layout = block_scan.blocked(positions)
@@ -346,7 +336,7 @@ def _scan_forward(x, dt, A, B, C, D, entering, resets, scan: Scan):
 def _scan_backward(scan: Scan, residuals, grads):
     x, dt, A, B, C, D, entered, resets = residuals
     dy, dfinal = grads
-    positions = block_positions(scan.length, scan.family)
+    positions = block_positions(scan.length)
     padded = -(-scan.length // positions) * positions
 
     def leading(t):
