@@ -965,6 +965,31 @@ def test_the_reference_path_is_flax_attention_op_for_op(dtype, forced, dropout_r
                     f"rate {dropout_rate}", seeds=FLAX_SEEDS, truth_fn=flax(softmax_in_fp32=False))
 
 
+@pytest.mark.skipif(jax.default_backend() != 'cpu', reason="'auto' takes jax.nn's xla kernel on a CPU")
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16, jnp.float16])
+@pytest.mark.parametrize("implementation", ["auto", "xla"])
+def test_an_attention_over_one_key_moves_no_query_or_key(implementation, dtype):
+    """A query that reads one key attends it whatever the scores, so its query's and its key's gradients are
+    exactly zero, as the softmax's own derivative gives them and torch's does: through jax.nn's xla kernel
+    too, jitted. Its softmax differentiates `exp(x - max) / sum` by default, whose g / e - g e / e^2 is zero
+    only where that key's e is exactly 1, and XLA:CPU contracts the scaled logit and the subtraction of the
+    max into one FMA, which leaves e at 1 +- a rounding of the logit (2e-7 of gradient in float32, run op by
+    op there is none); `_fused_attention` takes jax's textbook derivative (`jax.softmax_custom_jvp`)."""
+    keys = jax.random.split(jax.random.key(3), 4)
+    query = jax.random.normal(keys[0], (2, 5, 4, 8), dtype)
+    key, value = (jax.random.normal(drawn, (2, 7, 4, 8), dtype) for drawn in keys[1:3])
+    cotangent = jax.random.normal(keys[3], (2, 5, 4, 8), dtype)
+    one = jnp.ones((2,), jnp.int32)
+
+    def attend(query, key, value):
+        return scaled_dot_product_attention(query, key, value, implementation=implementation,
+                                            key_value_seq_lengths=one)
+
+    _, into_query, into_key, _ = jax.jit(with_gradients(attend))(query, key, value, cotangent)
+    assert not np.any(np.asarray(into_query, np.float32))
+    assert not np.any(np.asarray(into_key, np.float32))
+
+
 @pytest.mark.parametrize("implementation", ["reference", "xla"])
 def test_normal_attention_ends_each_rows_keys_at_its_length_as_a_prefix_mask_does(implementation):
     """Key lengths keep each row's first keys, as the prefix mask of those lengths
