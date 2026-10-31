@@ -111,7 +111,7 @@ CONTRACTED = {
     "src/dew/nn/kernels/norm_swiglu.py::packed_swiglu.linear_tangent":
         "test_the_fused_norms_and_products_hold_every_order",
     "src/dew/objectives/perturbation.py::NodePerturbation.loss.estimated":
-        "test_a_node_perturbation_estimate_holds_its_reverse_orders",
+        "test_a_node_perturbation_estimate_holds_every_order",
     "src/dew/nn/kernels/grouped_matmul.py::portable_projection":
         "test_a_portable_grouped_projection_holds_every_order",
     "src/dew/nn/kernels/templates/gemm/template.py::_prologued.prologued":

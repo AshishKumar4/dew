@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from contract_support import EDGES, FORWARD_ORDERS, assert_contract, normal_draw
+from contract_support import EDGES, assert_contract, normal_draw
 
 from dew.nn import categorical
 from dew.nn.protocols import OutputTable
@@ -169,13 +169,11 @@ def test_the_lm_heads_hold_every_order_of_their_gradient(head, edge):
 
 
 @pytest.mark.parametrize("edge", EDGES)
-def test_a_node_perturbation_estimate_holds_its_reverse_orders(edge):
-    """A node perturbation objective's loss (`NodePerturbation.loss.estimated`, a custom VJP whose reverse
-    rule is its estimate of the gradient from the model's forwards at perturbed sites): over a two-layer
-    linear model's squared error, its primal, its estimate and the estimate's own reverse derivative finite
-    wherever its float64 run, the same perturbations drawn at float64, is a normal float32. Its estimate
-    is of the reverse product, linear in the cotangent; a forward rule is the estimate's transpose at the
-    same draws, which it does not take yet (row 2690)."""
+def test_a_node_perturbation_estimate_holds_every_order(edge):
+    """A node perturbation objective's loss (`NodePerturbation.loss.estimated`, whose reverse rule is its
+    estimate of the gradient from the model's forwards at perturbed sites, and whose forward rule is that
+    estimate's transpose at the same draws, row 2690): over a two-layer linear model's squared error, every
+    order finite wherever its float64 run, the same perturbations drawn at float64, is a normal float32."""
     from flax import linen as nn
     from model_support import parameter_loss
     from test_perturbation import squared
@@ -206,5 +204,4 @@ def test_a_node_perturbation_estimate_holds_its_reverse_orders(edge):
     primals = tuple(leaf * EDGES[edge] for leaf in normal_draw(2708, *(leaf.shape for leaf in leaves)))
     direction = normal_draw(2709, *(leaf.shape for leaf in leaves), scale=EDGES[edge])
     (cotangent,) = normal_draw(2710, ())
-    assert_contract(loss, primals, direction, cotangent, f"a node perturbation estimate {edge}",
-                    without=FORWARD_ORDERS)
+    assert_contract(loss, primals, direction, cotangent, f"a node perturbation estimate {edge}")
