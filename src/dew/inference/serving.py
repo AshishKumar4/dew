@@ -140,6 +140,7 @@ from dew.nn.kernels import generation
 from dew.nn.kernels.options import compiler_options
 from dew.nn.kv_cache import GROUPS, ROUNDING_KEYS, KVCache, is_paged, leaf_name
 from dew.nn.precision import Numerics
+from dew.nn.progress import END, Progress
 from dew.nn.protocols import CrossAttending, Layered, ProjectionGroup, Serving
 from dew.nn.scatter import DROPPED
 from dew.nn.visibility import with_served_blocks
@@ -483,6 +484,28 @@ def _refuse_unserved_modes(model: nn.Module, *, paged: bool = False, chunked: bo
                          'serving; use whole-prompt dense admission')
 
 
+def _served_mesh(task: TextGeneration) -> Mesh | None:
+    """The mesh `task`'s weights lie on, which a server serves on, refused where a server cannot: a
+    stage or sequence axis, or one over several processes."""
+    mesh = mesh_of(task.variables)
+    if mesh is None:
+        return None
+    if mesh.shape.get(STAGE_AXIS, 1) > 1:
+        raise ValueError(
+            "a server decodes through the whole layer stack every step; the stage axis "
+            "runs the stack as the training pipeline, which the decoder refuses to decode "
+            "through (one token a step leaves no microbatches to pipeline). Serve on a "
+            "mesh with stage=1"
+        )
+    if mesh.shape.get(SEQUENCE_AXIS, 1) > 1:
+        raise ValueError("a server keeps each row's cached keys whole on the devices of its group, "
+                         "and a decoder refuses to decode under a sequence axis, which splits a "
+                         "sequence's positions. Serve on a mesh with sequence=1")
+    if not NamedSharding(mesh, P()).is_fully_addressable:
+        raise ValueError("a server schedules its rows from one process; a mesh over several "
+                         "processes would need them to agree on every step's admission")
+    return mesh
+
 class Server:
     """Serves text requests with continuous batching over one resident KV cache.
 
@@ -510,7 +533,8 @@ class Server:
                  sampling: Sampling, transforms: tuple[LogitsTransform, ...], stopping: Finishing,
                  grammar: Grammar | None, rows: Rows, slots: int, capacity: int, admission: int,
                  default_budget: int | None, max_length: int | None, decode_steps: int,
-                 prefix: int | Literal["prompt"] | None = None, precision: Numerics | None = None) -> None:
+                 prefix: int | Literal["prompt"] | None = None, precision: Numerics | None = None,
+                 progress: Progress = END) -> None:
         if type(slots) is not int or slots < 1:
             raise ValueError("slots must be a positive number of resident rows")
         if type(admission) is not int or not 1 <= admission <= slots:
@@ -552,6 +576,9 @@ class Server:
         # The numerics its task's run trained in (`InItsForm`), which every step traces under; None,
         # those in effect around it.
         self.precision = precision
+        # The run's progress a model that reads one draws at (`dew.nn.progress`), an input of every step
+        # like the weights, which `reload` moves to each version it serves without a compile.
+        self.progress = progress
         self.decode_steps = decode_steps
         self.steps = 0
         self._queue: deque[_Row] = deque()
@@ -604,7 +631,7 @@ class Server:
                 _log.info("the admitting step prefills in a forward of its own: %s", self.mixed_refusal)
             formats, chosen = resident_formats(
                 model, self.variables, self.pad_id, rows.placement, decode_steps, shapes,
-                state_shardings(self.mesh, shapes), self._admitted, transforms, stopping, grammar)
+                state_shardings(self.mesh, shapes), self._admitted, transforms, stopping, grammar, progress)
             self._step, self._admitting = map(dispatched, decode_programs(formats, self._admitted,
                                                                           compiler_options(model)))
             if chosen is not None:
@@ -692,23 +719,11 @@ class Server:
         slots only two iterations gained, by under 1%. A call seats requests
         only before its first iteration, so the slots take more iterations
         to fill (docs/performance.md).
+
+        A server draws at the progress its task draws at (`TextGeneration.progress`), the run's end or a
+        run's, and `reload` moves it to the version it serves.
         """
-        mesh = mesh_of(task.variables)
-        if mesh is not None:
-            if mesh.shape.get(STAGE_AXIS, 1) > 1:
-                raise ValueError(
-                    "a server decodes through the whole layer stack every step; the stage axis "
-                    "runs the stack as the training pipeline, which the decoder refuses to decode "
-                    "through (one token a step leaves no microbatches to pipeline). Serve on a "
-                    "mesh with stage=1"
-                )
-            if mesh.shape.get(SEQUENCE_AXIS, 1) > 1:
-                raise ValueError("a server keeps each row's cached keys whole on the devices of its group, "
-                                 "and a decoder refuses to decode under a sequence axis, which splits a "
-                                 "sequence's positions. Serve on a mesh with sequence=1")
-            if not NamedSharding(mesh, P()).is_fully_addressable:
-                raise ValueError("a server schedules its rows from one process; a mesh over several "
-                                 "processes would need them to agree on every step's admission")
+        mesh = _served_mesh(task)
         if task.n != 1:
             raise ValueError("a served request draws one continuation; submit a prompt once per draw")
         policy, chain, criteria = task._controls(None, None, None)
@@ -763,7 +778,7 @@ class Server:
             ),
             default_budget=task.max_new_tokens,
             max_length=task.max_length,
-            decode_steps=decode_steps, prefix=task.prefix, precision=task.precision,
+            decode_steps=decode_steps, prefix=task.prefix, precision=task.precision, progress=task.progress,
         )
 
     @property
@@ -785,8 +800,11 @@ class Server:
         """Whether a request waits or runs, or a call's draws wait to be read."""
         return bool(self._queue or self._rows or self._pending is not None)
 
-    def reload(self, variables: Variables) -> None:
-        """Serve `variables` from the next step on, in place of the current weights.
+    def reload(self, variables: Variables, progress: Progress | None = None) -> None:
+        """Serve `variables` from the next step on, in place of the current weights, at the run's
+        `progress` where one is given (a run's version, `NativeRolloutServer.load`), else at the one it
+        served. A progress takes the place of one of its kind: a server built at the run's end serves
+        that end, and one built at a run's progress serves a run's progress, its steps compiled for it.
 
         The tree must match the served one leaf for leaf in shape, and a leaf
         that is not floating point must match its dtype too. A floating leaf
@@ -797,8 +815,13 @@ class Server:
         prefix pages the old weights wrote are no longer shared. `reload` is
         not thread-safe against `step`, so the caller must serialize the two.
         """
+        if progress is not None and (progress.updates is None) != (self.progress.updates is None):
+            raise ValueError("a server serves the run's end or a run's progress, as it was built; build it "
+                             "from a task at a run's progress (LMObjective.policy) to serve a run's versions")
         packed = pack_projections(normalized(variables, self._source_shapes), self._weight_groups)
         self.variables = reloaded(packed, self.variables)
+        if progress is not None:
+            self.progress = progress
         self.rows.reloaded()
 
     def submit(self, prompt: Prompt, max_new_tokens: int | None = None, *,
@@ -976,7 +999,8 @@ class Server:
             program = self._step if admission is None else self._admitting
             error, (self._resident, self._carried, draws) = program(
                 self.model, self.variables, self.pad_id, self.rows.placement, self.decode_steps,
-                self._resident, self._carried, admission, self.transforms, self.stopping, self.grammar)
+                self._resident, self._carried, admission, self.transforms, self.stopping, self.grammar,
+                self.progress)
             if self._captures:
                 self._states = self._captured(self._states, self._resident, self._carried,
                                               *_padded(self._captures, self.admission, 1))

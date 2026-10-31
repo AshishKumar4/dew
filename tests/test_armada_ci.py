@@ -1,5 +1,6 @@
 """Dew's CI plan and task on armada (tools/armada/ci.py), on small test files written here."""
 
+import functools
 import itertools
 import json
 import os
@@ -348,25 +349,28 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
     assert [ci.reused("3.12", f"tests/{name}", "", common) is not None
             for name in ("test_machine.py", "test_tool.py", "test_spawn.py", "test_forkserver.py",
                          "test_fork.py", "test_shell.py")] == [True, True, False, False, False, False]
-    # A day's tier is the checkout's gpu-marked files, whatever the records say a file reads (ledger 2452):
-    # the evidence is --evidence's report alone.
-    monkeypatch.setattr(sys, "argv", ["ci.py", "gpu-tier", "--shards=2"])
-    capsys.readouterr()
-    assert ci.main() == 0
-    assert capsys.readouterr().out.split() == ["tests/test_marked.py"]
-    monkeypatch.setattr(sys, "argv", ["ci.py", "gpu-tier", "--evidence"])
-    assert ci.main() == 0
-    assert {line.split("\t")[0] for line in capsys.readouterr().out.splitlines()} == set(ci.gpu_tier("3.12"))
+    # A day's tier is the checkout's gpu-marked files, whatever the records say a file reads (ledger 2452);
+    # --marked names it for the caller that still passes it (2714); --evidence prints each beside its reads.
+    tier = functools.partial(named_tier, ci, monkeypatch, capsys)
+    assert tier("--shards=2") == tier("--marked") == ["tests/test_marked.py"]
+    assert [line.split("\t")[:2] for line in tier("--evidence", lines=True)] == [
+        ["tests/test_marked.py", "1 marked"]]
     # A file gains a GPU test after its record: the checkout's marks choose, not records; a kernel's test is
     # the CPU's, interpreted.
     (tmp_path / "tests/test_plain.py").write_text(
         "import pytest\n@pytest.mark.gpu\ndef test_lowers(): pass\n")
     (tmp_path / "tests/test_new.py").write_text(
         "import pytest\n@pytest.mark.kernel\ndef test_interpreted(): pass\n")
-    for marked in ([], ["--marked"]):
-        monkeypatch.setattr(sys, "argv", ["ci.py", "gpu-tier", *marked])
-        assert ci.main() == 0
-        assert capsys.readouterr().out.split() == ["tests/test_marked.py", "tests/test_plain.py"]
+    assert tier() == ["tests/test_marked.py", "tests/test_plain.py"]
+
+
+def named_tier(ci, monkeypatch, capsys, *flags: str, lines: bool = False) -> list:
+    """What `ci.py gpu-tier` with `flags` prints: its files, or its lines where `lines`."""
+    monkeypatch.setattr(sys, "argv", ["ci.py", "gpu-tier", *flags])
+    capsys.readouterr()
+    assert ci.main() == 0
+    out = capsys.readouterr().out
+    return out.splitlines() if lines else out.split()
 
 
 def fetcher(root: Path, *, due: bool = False) -> Path:
@@ -1705,6 +1709,55 @@ def test_a_run_plans_only_the_files_whose_inputs_changed_and_its_verdict_names_e
     assert sorted(row["name"] for row in rows) == ["3.12:tests/test_a.py", "3.12:tests/test_b.py",
                                                    "3.12:tests/test_c.py"]
     assert [len((tmp_path / f"runs-{name}").read_text()) for name in ("a", "b", "c")] == [1, 1, 2]
+
+
+def test_a_plan_run_by_another_python_than_its_tasks_keeps_the_files_they_ran_green(
+        ci, tmp_path, cache_worker):
+    """The plan and a task each run tools/armada/ci.py as a script under whatever Python runs it where it runs
+    (a planner's machine, a GitHub runner, a task's image), and key a file's run alike: the files a task ran
+    green under one Python, a plan run by another keeps, in one task (2026-10-30: plans under 3.14 and 3.12
+    found none of the 3.13 tasks' records fresh, as each Python compiles a module's units to its own digests,
+    and every file took a task of its own)."""
+    interpreter(tmp_path, "3.12")
+    held = ci.cpu_class().split("-")
+    config = json.loads((ROOT / ".armada.json").read_text())
+    config["task"]["cpu"] = {"vendor": held[0], "family": int(held[1]), "model": int(held[2])}
+    (tmp_path / ".armada.json").write_text(json.dumps(config))
+    # A module whose units each Python compiles to its own digests: a documented, annotated function.
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src/shapes.py").write_text(
+        'def area(width: int, height: int = 1) -> int:\n    """An area."""\n    return width * height\n')
+    written(tmp_path, {f"test_{name}.py": "import sys\nsys.path.insert(0, 'src')\nfrom shapes import area\n"
+                                          f"def test_{name}():\n    assert area(2) == 2\n"
+                       for name in ("a", "b")})
+    (tmp_path / "tests/test_durations.json").write_text(json.dumps(
+        {f"tests/test_{name}.py::test_{name}": 250.0 for name in ("a", "b")}))
+    (tmp_path / ".verdict").mkdir()
+    url, _, _ = cache_worker
+    env = {**os.environ, "DEW_XLA_CACHE_URL": url, "DEW_XLA_CACHE_TOKEN": "token",
+           "DEW_XLA_CACHE_READ_TOKEN": "token"}
+    script = str(ROOT / "tools/armada/ci.py")
+
+    def version(python: str) -> str:
+        return subprocess.run([python, "-c", "import sys; print(sys.version_info[:2])"], capture_output=True,
+                              text=True, check=True).stdout
+
+    # The task under this Python; the plan under another the image holds: a venv of another tested Python, or
+    # the image's own.
+    other = next(python for python in (*(str(ROOT / f".venv-{each}/bin/python") for each in ci.PYTHONS),
+                                       shutil.which("python3") or "")
+                 if Path(python).is_file() and version(python) != version(sys.executable))
+    verdict = tmp_path / ".verdict/verdict.json"
+    tests = "--tests=tests/test_a.py tests/test_b.py"
+    subprocess.run([sys.executable, script, "task", "--python=3.12", tests, f"--out={verdict}", "--cache=on"],
+                   cwd=tmp_path, env=env, check=True)
+    assert [row["exitCode"] for row in json.loads(verdict.read_text())["rows"]] == [0, 0]
+    timings = tmp_path / "timings.json"
+    planned = subprocess.run([other, script, "plan", "--target=300", f"--timings={timings}"], cwd=tmp_path,
+                             env=env, capture_output=True, text=True, check=True).stdout
+    entries = [entry for entry in json.loads(planned)["include"] if entry["python"] == "3.12"]
+    assert [sorted(ci.kept_of(entry["tests"].split())[1]) for entry in entries] == [
+        ["tests/test_a.py", "tests/test_b.py"]]
 
 
 def test_a_plan_without_build_output_or_fetched_payloads_finds_what_a_task_recorded_with_them(

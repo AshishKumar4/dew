@@ -15,8 +15,7 @@ import sys
 from pathlib import Path
 
 import pytest
-
-from dew.nn.precision import WIDE_CPU_ARITHMETIC
+from lane_environment import outside_suite
 
 ROOT = Path(__file__).resolve().parents[1]
 DOCS = ROOT / "docs"
@@ -47,13 +46,10 @@ def test_a_page_s_python_blocks_run_in_order(page, tmp_path):
         f"exec(compile({chr(10) * (line - 1) + code!r}, {str(path)!r}, 'exec'), scope)"
         for line, code, reason in blocks(path) if reason is None)
     # One CPU device and the library's own arithmetic, as a reader's machine
-    # has: the suite's device count (XLA_FLAGS) would replicate each block's
-    # model across eight, and its numerics (tests/lane_environment.py's
-    # matmul precision and wide CPU arithmetic) are Dew's tests' alone, which
-    # took the language-models page past a group's 120 s (ledger 2510).
-    suite = {"XLA_FLAGS", "JAX_DEFAULT_MATMUL_PRECISION", WIDE_CPU_ARITHMETIC}
-    env = {**{name: value for name, value in os.environ.items() if name not in suite},
-           "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(ROOT / "src"), "WANDB_MODE": "disabled"}
+    # has (`outside_suite`): the suite's device count would replicate each
+    # block's model across eight, and its numerics took the language-models
+    # page past a group's 120 s (ledger 2510).
+    env = {**outside_suite(os.environ), "PYTHONPATH": str(ROOT / "src"), "WANDB_MODE": "disabled"}
     done = subprocess.run([sys.executable, "-c", f"scope = {{'__name__': '__main__'}}\n{script}"],
                           cwd=tmp_path, env=env, capture_output=True, text=True, timeout=1500)
     assert done.returncode == 0, f"{page}:\n{done.stdout[-2000:]}\n{done.stderr[-4000:]}"
