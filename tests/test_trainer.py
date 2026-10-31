@@ -1464,8 +1464,8 @@ def test_a_cooldown_branch_scores_what_a_run_decayed_there_scores_and_leaves_the
     tracker, drawn = RecordingTracker(), NoisedTargets() if rollout else None
     branched = cooldown_run(stable, 3 * at, accumulation, tracker,
                             Cooldowns(at=(at,), length=at, shape="linear"), rollout=drawn)
-    cooled = {step: scalars["cooldown_val/loss"] for step, scalars in tracker.scalars
-              if "cooldown_val/loss" in scalars}
+    cooled = {step: scalars["cooldown/val/loss"] for step, scalars in tracker.scalars
+              if "cooldown/val/loss" in scalars}
     decayed = RecordingTracker()
     cooldown_run(Linear(peak, decay_start=4, decay_steps=8), 2 * at, accumulation, decayed,
                  rollout=NoisedTargets() if rollout else None)
@@ -1476,14 +1476,41 @@ def test_a_cooldown_branch_scores_what_a_run_decayed_there_scores_and_leaves_the
         # The branch trains on the rollout's batches, not the stream's: the run with none scores otherwise.
         unrolled = RecordingTracker()
         cooldown_run(stable, 3 * at, accumulation, unrolled, Cooldowns(at=(at,), length=at, shape="linear"))
-        assert {step: scalars["cooldown_val/loss"] for step, scalars in unrolled.scalars
-                if "cooldown_val/loss" in scalars} != cooled
+        assert {step: scalars["cooldown/val/loss"] for step, scalars in unrolled.scalars
+                if "cooldown/val/loss" in scalars} != cooled
     started = next(value for _, value in tracker.artifacts if isinstance(value, FitStarted))
     assert started.cadences["cooldowns.at"] == [at]
     plain = cooldown_run(stable, 3 * at, accumulation, rollout=NoisedTargets() if rollout else None)
     for ours, theirs in zip(jax.tree.leaves(branched.variables), jax.tree.leaves(plain.variables),
                             strict=True):
         np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
+
+
+def test_a_cooldown_branchs_scoring_artifacts_keep_apart_from_the_runs_at_its_step(tmp_path):
+    """A run that keeps every evaluation's scoring artifacts (`scored_to`) keeps a cooldown branch's,
+    scored at the step it branched at, under `cooldown/` beside the run's own at that step
+    (`<scored_to>/step-<step>/cooldown/<split>-<batch>.npz`), neither written over the other."""
+    import grain.python as grain
+    from test_chain_compile import held_tokens
+
+    from dew.data import from_grain, from_iter
+    from dew.objectives.lm import Perplexity
+    from dew.training.cooldown import Cooldowns
+
+    train = from_grain(grain.MapDataset.source(list(held_tokens()) * 4), "indexed-tokens").batch(16)
+    held = from_iter(held_tokens, name="streamed-tokens").batch(8).read("streamed").workers(0)
+    model = CausalTransformer(vocab_size=8, emb_features=8, num_layers=1, num_heads=2, mlp_features=16,
+                              max_seq_len=8, attention_impl="xla")
+    objective = LMObjective(model, seq_len=4)
+    Trainer(objective, optax.inject_hyperparams(optax.adam)(learning_rate=1e-3), key=0).fit(
+        train.read("indexed").workers(0), validation=held, steps=4, eval_every=2, metrics=(Perplexity(),),
+        cooldowns=Cooldowns(at=(2,), length=1), scored_to=tmp_path)
+    run = {path.name: np.load(path) for path in (tmp_path / "step-2").glob("val-*.npz")}
+    branch = {path.name: np.load(path) for path in (tmp_path / "step-2" / "cooldown").glob("val-*.npz")}
+    assert run and branch.keys() == run.keys()
+    # The branch scored its own decayed state, the run its state at the step.
+    assert any(not np.array_equal(run[name][field], branch[name][field])
+               for name in run for field in run[name].files)
 
 
 @pytest.mark.parametrize("best", [False, True], ids=["unranked", "weights-best"])
@@ -1500,8 +1527,8 @@ def test_a_cooldown_a_preemption_cuts_short_runs_again_on_resume(tmp_path, best)
     stable, cooldowns = Linear(2.0 ** -4, decay_start=64, decay_steps=128), Cooldowns(at=(4,), length=4)
     uninterrupted = RecordingTracker()
     cooldown_run(stable, 12, 1, uninterrupted, cooldowns)
-    expected = {step: scalars["cooldown_val/loss"] for step, scalars in uninterrupted.scalars
-                if "cooldown_val/loss" in scalars}
+    expected = {step: scalars["cooldown/val/loss"] for step, scalars in uninterrupted.scalars
+                if "cooldown/val/loss" in scalars}
     optimizer = OptimConfig(optimizer="adamw", learning_rate=stable)
     # The notice sent after step 3 reaches the run after step 4, as its branch begins.
     stopped = RecordingTracker()
@@ -1511,12 +1538,12 @@ def test_a_cooldown_a_preemption_cuts_short_runs_again_on_resume(tmp_path, best)
         make_trainer(tmp_path, tracker=stopped, optimizer=optimizer).fit(
             dataset(val=val_batches(2)), steps=12, log_every=1, cooldowns=cooldowns,
             observe=preempting(3), **ranked)
-    assert not any("cooldown_val/loss" in scalars for _, scalars in stopped.scalars)
+    assert not any("cooldown/val/loss" in scalars for _, scalars in stopped.scalars)
     assert Checkpoints(str(tmp_path / "run")).latest == 4
     resumed = RecordingTracker()
     state = cooldown_run(stable, 12, 1, resumed, cooldowns, tmp_path)
-    assert {step: scalars["cooldown_val/loss"] for step, scalars in resumed.scalars
-            if "cooldown_val/loss" in scalars} == expected
+    assert {step: scalars["cooldown/val/loss"] for step, scalars in resumed.scalars
+            if "cooldown/val/loss" in scalars} == expected
     plain = cooldown_run(stable, 12, 1)
     for ours, theirs in zip(jax.tree.leaves(state.variables), jax.tree.leaves(plain.variables), strict=True):
         np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
@@ -1536,8 +1563,8 @@ def test_a_cooldown_at_the_runs_last_step_a_preemption_cuts_short_runs_on_resume
     stable, cooldowns = Linear(2.0 ** -4, decay_start=64, decay_steps=128), Cooldowns(at=(8,), length=4)
     uninterrupted = RecordingTracker()
     cooldown_run(stable, 8, 1, uninterrupted, cooldowns)
-    expected = {step: scalars["cooldown_val/loss"] for step, scalars in uninterrupted.scalars
-                if "cooldown_val/loss" in scalars}
+    expected = {step: scalars["cooldown/val/loss"] for step, scalars in uninterrupted.scalars
+                if "cooldown/val/loss" in scalars}
     assert list(expected) == [8]
     optimizer = OptimConfig(optimizer="adamw", learning_rate=stable)
     best = Best(lambda scores: scores["val/loss"], weights_only=True) if saves == "weights-best" else None
@@ -1549,11 +1576,11 @@ def test_a_cooldown_at_the_runs_last_step_a_preemption_cuts_short_runs_on_resume
     assert Checkpoints(str(tmp_path / "run")).cooldown(8) is not None
     resumed, again = RecordingTracker(), RecordingTracker()
     cooldown_run(stable, 8, 1, resumed, cooldowns, tmp_path)
-    assert {step: scalars["cooldown_val/loss"] for step, scalars in resumed.scalars
-            if "cooldown_val/loss" in scalars} == expected
+    assert {step: scalars["cooldown/val/loss"] for step, scalars in resumed.scalars
+            if "cooldown/val/loss" in scalars} == expected
     assert Checkpoints(str(tmp_path / "run")).cooldown(8) is None
     cooldown_run(stable, 8, 1, again, cooldowns, tmp_path)
-    assert not any("cooldown_val/loss" in scalars for _, scalars in again.scalars)
+    assert not any("cooldown/val/loss" in scalars for _, scalars in again.scalars)
 
 
 def test_a_cooldown_of_a_run_without_a_token_schedule_reads_nothing_from_the_devices_a_step(monkeypatch):
@@ -1632,8 +1659,8 @@ def test_a_cooldown_of_an_injected_constant_rate_is_the_run_that_decays_there():
             (optax.inject_hyperparams(optax.sgd)(learning_rate=decaying), 8, decayed, None)):
         make_trainer(tracker=sink, optimizer=optimizer).fit(
             dataset(val=val_batches(2)), steps=steps, log_every=steps, eval_every=steps, cooldowns=cooldowns)
-    cooled = {step: scalars["cooldown_val/loss"] for step, scalars in tracker.scalars
-              if "cooldown_val/loss" in scalars}
+    cooled = {step: scalars["cooldown/val/loss"] for step, scalars in tracker.scalars
+              if "cooldown/val/loss" in scalars}
     assert cooled == {4: [scalars["val/loss"] for _, scalars in decayed.scalars if "val/loss" in scalars][-1]}
 
 

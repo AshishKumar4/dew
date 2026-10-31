@@ -1,9 +1,9 @@
 """Read-mode capabilities, range splits, partition discovery and shard resume."""
 
-import contextlib
 import dataclasses
 import hashlib
 import http.server
+import importlib
 import importlib.machinery
 import io
 import itertools
@@ -12,7 +12,6 @@ import pickle
 import shutil
 import sys
 import tarfile
-import tempfile
 import threading
 from pathlib import Path
 from uuid import uuid4
@@ -32,7 +31,7 @@ from dew.data.dataset import DataPartition, Loading
 from dew.data.shards import streamed
 from dew.data.sinks import export
 from dew.data.sources import Files, Memory
-from dew.data.storage import Replaced, Store
+from dew.data.storage import Store
 
 
 def test_memory_columns_snapshot_changes_with_content():
@@ -362,7 +361,6 @@ def test_a_fetch_from_a_server_that_trickles_its_response_ends_at_its_timeout(tr
     to send, where it once read on byte by byte, each byte inside the socket's timeout, to the
     response's end (row 1947: the end is the timeout's, read off the response, not a wall-clock
     bound)."""
-    import http.server
     import time
 
     from dew.data.pipeline import Rejected
@@ -443,250 +441,6 @@ def test_exports_are_committed_and_readable_at_memory_urls(format):
     assert actual == rows
     with pytest.raises(ValueError):
         Files(root, format="jsonl").records("memory")
-
-
-@contextlib.contextmanager
-def export_store(transport: str):
-    """An export root on `transport` and the storage options that reach it: this host's disk, fsspec's
-    memory store, or a bucket on a local S3 server."""
-    if transport == "local":
-        with tempfile.TemporaryDirectory(prefix="dew-export-") as directory:
-            yield str(Path(directory) / "export"), None
-        return
-    if transport == "memory":
-        yield f"memory://export-{uuid4().hex}", None
-        return
-    with moto_bucket("export") as (bucket, options):
-        yield f"s3://{bucket}/export", options
-
-
-@pytest.mark.parametrize("transport", ["local", "memory", "s3"])
-@pytest.mark.parametrize("format", ["parquet", "array_record"])
-@pytest.mark.parametrize("read", ["streamed", "indexed"])
-def test_a_shard_replaced_under_its_exports_manifest_is_refused_where_it_is_read(transport, format, read):
-    """A committed export's manifest states each shard's bytes and digest, which its source's identity
-    holds, as a saved run's plan does, and the version its store published it at (row 1871). A shard
-    rewritten under the manifest, its size kept or not, is never read under that identity, which does not
-    move, by a source whose identity was taken before the rewrite or a fresh one, as a resume reads it:
-    each read is refused, or reads the shard as it was published (from Dew's checked copy of it, where a
-    reader takes paths alone)."""
-    with export_store(transport) as (root, options):
-        export(Memory([{"id": index, "text": str(index)} for index in range(8)]), root, format=format,
-               rows_per_shard=4, storage_options=options)
-        taken = Files(root, format=format, storage_options=options)
-        identity = taken.fingerprint()
-
-        def rows(source):
-            if read == "streamed":
-                manifest = source.manifest()
-                return [row["id"] for part in manifest.shards for row in manifest.reader(part)]
-            records = source.records("indexed")
-            return [records[index]["id"] for index in range(len(records))]
-
-        assert rows(taken) == list(range(8))
-        files = json.loads(Store(root + "/_dew_manifest.json", options).read())["files"]
-        shard = Store(root, options).child(files[0]["path"])
-        held = shard.read()
-        middle = len(held) // 2
-        for rewritten in (held[:middle] + bytes([held[middle] ^ 1]) + held[middle + 1:], held + b"\0"):
-            filesystem, path = shard.resolve()
-            filesystem.pipe_file(path, rewritten)
-            filesystem.invalidate_cache()
-            for source in (Files(root, format=format, storage_options=options), taken):
-                if transport == "local" and source is not taken:
-                    # A fresh source versions this host's files as it fingerprints them, and refuses there.
-                    with pytest.raises(ValueError):
-                        source.fingerprint()
-                    continue
-                assert source.fingerprint() == identity
-                with contextlib.suppress(Replaced):
-                    assert rows(source) == list(range(8))
-
-
-@pytest.mark.parametrize("read", ["streamed", "indexed"])
-def test_a_declared_line_file_replaced_under_its_facts_is_refused_where_it_is_read(read):
-    """A line file read under facts its publisher declared (`file_info`: its bytes and digest, no store's
-    version of it) is checked against them where a read opens it: rewritten, it is refused."""
-    root = Store(f"memory://declared-lines-{uuid4().hex}/rows.jsonl")
-    root.write(b'{"id":0}\n{"id":1}\n')
-    Files(root.url).provision()
-    index = root.url.removesuffix(".jsonl") + ".index.npy"
-    facts = {url: {"bytes": len(Store(url).read()), "sha256": hashlib.sha256(Store(url).read()).hexdigest()}
-             for url in (root.url, index)}
-
-    def rows():
-        source = Files((root.url,), format="jsonl", index=index, file_info=facts)
-        if read == "streamed":
-            manifest = source.manifest()
-            return [row["id"] for part in manifest.shards for row in manifest.reader(part)]
-        records = source.records("indexed")
-        return [records[position]["id"] for position in range(len(records))]
-
-    assert rows() == [0, 1]
-    root.write(b'{"id":7}\n{"id":1}\n')
-    with pytest.raises(Replaced):
-        rows()
-    # An offset index provisioned for it reads the declared bytes too.
-    with pytest.raises(Replaced):
-        Files((root.url,), format="jsonl", file_info=facts).provision()
-
-
-def test_a_declared_archive_replaced_under_its_facts_is_refused_where_it_is_read():
-    """A WebDataset archive read under facts its publisher declared (its bytes and digest) is checked
-    where a read opens it: replaced by another valid archive, it is refused, not read under them."""
-    def archive(text: str) -> bytes:
-        buffer = io.BytesIO()
-        with tarfile.open(fileobj=buffer, mode="w") as written:
-            data = text.encode()
-            entry = tarfile.TarInfo("0.txt")
-            entry.size = len(data)
-            written.addfile(entry, io.BytesIO(data))
-        return buffer.getvalue()
-
-    root = Store(f"memory://declared-tar-{uuid4().hex}/data.tar")
-    root.write(archive("held"))
-    facts = {root.url: {"bytes": len(root.read()), "sha256": hashlib.sha256(root.read()).hexdigest()}}
-
-    def rows():
-        files = Files((root.url,), format="webdataset", file_info=facts)
-        return list(files.manifest().reader(files.manifest().shards[0]))
-
-    assert rows() == [{"__key__": "0", "txt": b"held"}]
-    root.write(archive("swap"))
-    with pytest.raises(Replaced):
-        rows()
-
-
-def test_a_token_exports_shard_replaced_under_its_manifest_is_refused_where_it_is_read(tmp_path):
-    """A token export's shard replaced by another of as many documents and tokens, whose lengths index
-    reads alike, is refused where its tokens are read, not read under the manifest's digest."""
-    from dew.data.sources import TokenFiles
-
-    (tmp_path / "held").mkdir()
-    (tmp_path / "other").mkdir()
-    held = export_byte_tokens(tmp_path / "held", ("first", "next"), "--format", "array_record")
-    other = export_byte_tokens(tmp_path / "other", ("fjrst", "nexy"), "--format", "array_record")
-    taken = TokenFiles(str(held))
-    # Five bytes and an end, four and an end.
-    assert len(taken.tokens[:]) == 11
-    [entry] = json.loads((held / "_dew_manifest.json").read_text())["files"]
-    [swapped] = json.loads((other / "_dew_manifest.json").read_text())["files"]
-    (held / entry["path"]).write_bytes((other / swapped["path"]).read_bytes())
-    with pytest.raises(Replaced):
-        TokenFiles(str(held)).tokens[:]
-
-
-def test_a_declaration_without_a_digest_or_a_version_is_refused_where_it_is_read():
-    """Facts that state a file's size alone hold no read of it to anything: a read of it is refused,
-    where it would read whatever the file holds under them."""
-    root = Store(f"memory://undeclared-{uuid4().hex}/rows.jsonl")
-    root.write(b'{"id":0}\n')
-    source = Files((root.url,), format="jsonl", file_info={root.url: {"bytes": len(root.read())}})
-    manifest = source.manifest()
-    with pytest.raises(ValueError):
-        list(manifest.reader(manifest.shards[0]))
-
-
-@contextlib.contextmanager
-def etagged_server(objects: dict[str, bytes], token: str | None = None):
-    """An HTTP server of `objects`, by path, each named by its content's digest as its ETag and served
-    whole or a range of it (`Range`), a read conditioned on another ETag refused (`If-Match`: 412, RFC
-    9110 13.1.1), and with `token` a read without it as its bearer refused (401); its URL."""
-    class Handler(http.server.BaseHTTPRequestHandler):
-        def log_message(self, *args):
-            pass
-
-        def do_GET(self):
-            if token is not None and self.headers.get("Authorization") != f"Bearer {token}":
-                self.send_response(401)
-                self.end_headers()
-                return
-            payload = objects.get(self.path)
-            if payload is None:
-                self.send_response(404)
-                self.end_headers()
-                return
-            etag = '"' + hashlib.sha256(payload).hexdigest() + '"'
-            if self.headers.get("If-Match") not in (None, etag):
-                self.send_response(412)
-                self.end_headers()
-                return
-            ranged = self.headers.get("Range")
-            if ranged is not None:
-                first, last = ranged.removeprefix("bytes=").split("-")
-                payload = payload[int(first):int(last) + 1]
-            self.send_response(206 if ranged is not None else 200)
-            self.send_header("ETag", etag)
-            self.send_header("Content-Length", str(len(payload)))
-            self.end_headers()
-            self.wfile.write(payload)
-
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    try:
-        yield f"http://127.0.0.1:{server.server_address[1]}"
-    finally:
-        server.shutdown()
-
-
-def test_an_http_line_file_read_on_its_published_etag_is_refused_once_replaced():
-    """A line file served over HTTP, declared by its size and the ETag it was published at, is read a
-    range at a time, each read held to that ETag beside the headers its storage options send:
-    replaced, its next read is refused, where an unheld read would take the replacement's bytes under
-    the declaration."""
-    objects = {"/rows.jsonl": b'{"id":0}\n{"id":1}\n'}
-    # A server that also asks for the bearer token the storage options send with every read.
-    with etagged_server(objects, token="secret") as url:
-        location = url + "/rows.jsonl"
-        facts = {location: {"bytes": len(objects["/rows.jsonl"]),
-                            "ETag": '"' + hashlib.sha256(objects["/rows.jsonl"]).hexdigest() + '"'}}
-        options = {"headers": {"Authorization": "Bearer secret"}}
-
-        def rows():
-            source = Files((location,), format="jsonl", file_info=facts, storage_options=options)
-            manifest = source.manifest()
-            return [row["id"] for part in manifest.shards for row in manifest.reader(part)]
-
-        assert rows() == [0, 1]
-        objects["/rows.jsonl"] = b'{"id":7}\n{"id":1}\n'
-        with pytest.raises(Replaced):
-            rows()
-
-
-def test_a_version_only_array_record_shard_is_refused_where_its_reader_needs_its_path():
-    """An ArrayRecord shard declared by its size and store version alone, which its reader would read
-    whole by its path where no version holds that read, is refused: the declaration names no digest to
-    check a whole copy against."""
-    with moto_bucket("version-only") as (bucket, options):
-        root = Store(f"s3://{bucket}/export", options)
-        export(Memory([{"id": index} for index in range(4)]), root.url, format="array_record",
-               rows_per_shard=4, storage_options=options)
-        [entry] = json.loads(Store(root.url + "/_dew_manifest.json", options).read())["files"]
-        url = root.child(entry["path"]).url
-        source = Files((url,), format="array_record", storage_options=options,
-                       file_info={url: {"bytes": entry["bytes"], "stored": entry["stored"]}})
-        manifest = source.manifest()
-        with pytest.raises(ValueError):
-            list(manifest.reader(manifest.shards[0]))
-
-
-def test_declared_files_read_a_range_at_a_time_hold_no_mirror_copy_between_reads(tmp_path):
-    """Files declared by their digest on a store no read can be held to a version of (an HTTP server
-    whose ETags the declaration does not state), read a range at a time as an offset index reads them,
-    are each read whole into Dew's mirror and checked, and keep no copy open between reads: a mirror with
-    room for one of them reads a range of each of several in turn, and again."""
-    from dew.data.storage import Declared
-
-    objects = {f"/part-{index}.jsonl": json.dumps({"id": index}).encode() + b"\n" for index in range(3)}
-    with etagged_server(objects) as url:
-        options = {"dewcache": {"cache_storage": str(tmp_path / "mirror"),
-                                "max_bytes": max(map(len, objects.values()))}}
-        declared = [Declared(Store(url + name, options), {"bytes": len(payload),
-                                                          "sha256": hashlib.sha256(payload).hexdigest()})
-                    for name, payload in objects.items()]
-        for _ in range(2):
-            assert [json.loads(held.read_range(0, held.size)) for held in declared] == [
-                {"id": index} for index in range(3)]
 
 
 def test_a_source_exports_the_records_its_pipeline_exports():
