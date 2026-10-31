@@ -238,3 +238,35 @@ def test_a_configured_run_trains_two_diloco_groups_from_its_command_line(tmp_pat
     assert jax.tree.structure(inner) == jax.tree.structure(outer)
     assert all(mine.shape == (2, *theirs.shape)
                for mine, theirs in zip(jax.tree.leaves(inner), jax.tree.leaves(outer), strict=True))
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_supplied_diloco_state_trains_on_from_each_groups_own_state():
+    """A DiLoCo state supplied to a fit (`fit(state=...)`), its optimizer a schedule's, trains on from each
+    group's inner state and the outer model it holds: two more steps, each a meeting, move the outer
+    parameters, all finite."""
+    from dew.optim import Cosine, OptimConfig
+
+    def run():
+        return trainer(2, diloco=DiLoCo(every=1, rate=1.0, momentum=0.0),
+                       optimizer=OptimConfig(learning_rate=Cosine(peak_value=RATE, warmup_steps=1,
+                                                                  decay_steps=8)))
+
+    with jax.enable_x64(new_val=True):
+        first = run().fit(dataset(), steps=2, log_every=1)
+        before = params(first.variables["params"])
+        resumed = run().fit(dataset(), steps=4, log_every=1, state=first)
+    assert int(resumed.step) == 4
+    after = params(resumed.variables["params"])
+    assert np.isfinite(after).all() and not np.array_equal(after, before)
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_diloco_run_whose_layout_keeps_state_on_the_host_is_refused():
+    """A DiLoCo run whose layout keeps a field on the host is refused before it trains: the offload places
+    the outer model's fields, and no placement of a group's own reaches its step (row 876 review)."""
+    run = Trainer(Regression64(), optax.adam(RATE), key=jax.random.key(0),
+                  layout=Layout(min_shard=1, tolerance=1.0, host=("opt_state",)),
+                  mesh=MeshSpec(diloco=2).build(jax.devices()[:2]), diloco=DiLoCo(every=2))
+    with jax.enable_x64(new_val=True), pytest.raises(ValueError):
+        run.fit(dataset(), steps=1)
