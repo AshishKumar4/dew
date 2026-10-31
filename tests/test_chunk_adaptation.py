@@ -492,6 +492,20 @@ WINDOW_GRADIENT_SEEDS = 8
 failed 24 of 24)."""
 
 
+WINDOW_STACKED = 8
+"""The draws of windows each draw of their gradients stacks (`stacked_windows`): an embedding row or a
+level's column a draw's few windows touch is hit by a token or two, its error one Gaussian or two a draw,
+heavy-tailed past the pooled interval's reach (ledger 2469: 6.5 at `embed_tokens` and `continuum.up`).
+Stacked, a draw holds eight draws' windows, each window's geometry its own."""
+
+
+def stacked_windows(kind: str, seed: int) -> tuple:
+    """`WINDOW_STACKED` draws of windows (`window_segments`), each a draw of its own, their windows rows of
+    one."""
+    parts = [window_segments(kind, seed * WINDOW_STACKED + index) for index in range(WINDOW_STACKED)]
+    return jax.tree.map(lambda *leaves: np.concatenate([np.asarray(leaf) for leaf in leaves]), *parts)
+
+
 def window_segments(kind: str, seed: int, window: int = 3):
     """A draw's windows each alone, at the corner (0.5 N(0, 1) weights stepped by a half), each started
     where the literal loop in float64 stands at it, rounded to float32: every window of every document
@@ -560,7 +574,7 @@ def test_each_windows_gradient_from_its_level_is_the_literal_loops(kind):
         return lambda variables, hidden, targets, weights, fields: equation_71(
             MODEL, variables, hidden, targets, weights, fields, adaptation, truth=truth)
 
-    assert_as_exact(arm(dew), arm(reference(truth=False)), lambda seed: window_segments(kind, seed),
+    assert_as_exact(arm(dew), arm(reference(truth=False)), lambda seed: stacked_windows(kind, seed),
                     f"each window's gradient from its float64 level over {kind}", seeds=WINDOW_GRADIENT_SEEDS,
                     truth_fn=arm(reference(truth=True)))
 

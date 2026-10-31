@@ -159,16 +159,36 @@ def assert_updates_as_the_objective(obj, twin, batch, data, run_key, variables, 
     assert_the_runs_path_takes_the_trainers_update(obj, batch, data, run_key, variables)
 
 
+STACKED = 8
+"""The examples each draw of the trainer's gradient stacks (`stacked`), each its own weights and batch: a
+norm's scale or a layer's scalar sums its gradient over every token, one value an example, whose error
+is one Gaussian a draw, its log squared error spread pi / sqrt(2) wide, so two arms' ratio of it is a
+Cauchy no count of draws within MOST_SEEDS resolves (ledger 2469: 2.17 to 2.31 measured,
+tmp/Gate/sizing/noise-2469.json). Stacked, every leaf holds a row an example, its error a draw's mean
+of eight, its spread a third as wide; each example keeps the site's geometry, its rows and shapes."""
+
+
+def stacked(fn, *, given: bool = False):
+    """`fn(values, rows)` over a draw's stacked examples (`STACKED`): each example's leaves stacked as rows
+    of one, as the gate reads a draw. A `given` arm stays one the gate runs as given (`as_given`)."""
+    def each(examples):
+        outputs = [fn(*example) for example in examples]
+        return jax.tree.map(lambda *leaves: np.stack([np.asarray(leaf) for leaf in leaves]), *outputs)
+
+    return as_given(each) if given else each
+
+
 def assert_the_objectives_gradient(obj, twin, batch, run_key, variables, seeds: int, batches=None):
-    """`assert_updates_as_the_objective`'s check 1, the trainer's gradient against the objective's."""
+    """`assert_updates_as_the_objective`'s check 1, the trainer's gradient against the objective's, over
+    draws of `STACKED` examples each."""
     drawn = (lambda seed: batch) if batches is None else batches
     stepped, step, trainer = trainer_update(obj, drawn(0), run_key, optax.sgd(1.0, momentum=0.0))
     weights = moved_weights(variables)
 
     def draw(seed):
-        return (*weights(seed), drawn(seed))
+        return (tuple((*weights(seed * STACKED + index), drawn(seed * STACKED + index))
+                      for index in range(STACKED)),)
 
-    @as_given
     def trained(values, rows):
         state = stepped(values, rows)
         trace = jax.tree.map(np.asarray, optax.tree_utils.tree_get(state.opt_state, "trace"))
@@ -181,8 +201,8 @@ def assert_the_objectives_gradient(obj, twin, batch, run_key, variables, seeds: 
                          lambda values, rows: objective_gradient(obj, values, rows, step))
     # The producer marks its options-bearing jit as given, so the gate never nests it (row 1800).
     assert gradient.as_given
-    assert_as_exact(trained, gradient, draw, "trainer update", seeds=seeds,
-                    truth_fn=float64_gradient(twin, step))
+    assert_as_exact(stacked(trained, given=True), stacked(gradient, given=True), draw, "trainer update",
+                    seeds=seeds, truth_fn=stacked(float64_gradient(twin, step)))
 
 
 def assert_the_runs_path_takes_the_trainers_update(obj, batch, data, run_key, variables):
