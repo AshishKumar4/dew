@@ -293,20 +293,22 @@ class DecisionRunConfig(DecoderRunConfig):
         # Compiled once: `train` reads the run's length and cadences off this loader and trains on it.
         dataset, held = self.compiled(objective.data(), self.chain(), self.validation)
         summary["records"] = dataset.records
-        # The rows each layout refused, by reason, and the rows and tokens each cut removed, as the
-        # run's data counters count them (`Layout.refusal`, `Encoded.cuts`).
+        # The rows each layout refused, by reason, and the rows and tokens each cut removed, of the
+        # rows it delivered and the tokens of those it refused, as the run's data counters count them
+        # (`Layout.refusal`, `Encoded.cuts`, `Rejected.cut`).
         for reason in ("unfit", "options_alike"):
             refused = {name: counter.refused.get(reason, 0) for name, counter in dataset.counts.items()}
             refused["held out"] = sum(counter.refused.get(reason, 0)
                                       for counter in dataset.validation_counts.values())
             if any(refused.values()):
                 summary[reason] = refused
-        cut = {name: {kind: {"examples": counter.cut_examples[kind], "rows": rows,
-                             "removed": counter.cut_removed[kind], "unit": cut_unit(kind)}
-                      for kind, rows in counter.cut_rows.items()}
+        cut = {name: {kind: {"examples": counter.cut_examples[kind], "rows": counter.cut_rows[kind],
+                             "removed": counter.cut_removed[kind], "refused": counter.refused_cut[kind],
+                             "unit": cut_unit(kind)}
+                      for kind in {**counter.cut_rows, **counter.refused_cut}}
                for name, counter in {**dataset.counts, **{f"{name} (held out)": counter for name, counter
                                                            in dataset.validation_counts.items()}}.items()
-               if counter.cut_rows}
+               if counter.cut_rows or counter.refused_cut}
         if cut:
             summary["cut"] = cut
         # The rows whose "none of the above" a training read declines where it draws it, by why their

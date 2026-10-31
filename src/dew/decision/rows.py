@@ -3,6 +3,7 @@
 fields a row carries (`TRAINING_FIELDS`); `DecisionObjective.data` assembles them."""
 
 import collections
+import dataclasses
 import hashlib
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -344,10 +345,12 @@ class Fit(pygrain.MapTransform):
         fitted = self._fitted(element)
         # A cut an earlier step made of the record stands beside the rows' own (`composed`).
         earlier = element.get("_dew_cut")
-        if earlier and not isinstance(fitted, Rejected):
-            return {**fitted, "_dew_cut": composed(earlier, fitted.get("_dew_cut", {})),
-                    "_dew_truncated": True}
-        return fitted
+        if not earlier:
+            return fitted
+        if isinstance(fitted, Rejected):
+            removed = collections.Counter({kind: tokens for kind, (_, tokens) in earlier.items()})
+            return dataclasses.replace(fitted, cut=removed + collections.Counter(fitted.cut))
+        return {**fitted, "_dew_cut": composed(earlier, fitted.get("_dew_cut", {})), "_dew_truncated": True}
 
     def _fitted(self, element: Batch) -> Batch | Rejected:
         held = element.get("example", element)
@@ -396,8 +399,8 @@ class Fit(pygrain.MapTransform):
         refused = next((reason for reason in refusals
                         if reason is not None and not (self.scored and reason == "options_alike")), None)
         if refused is not None:
-            # The refusal keeps its rows' cuts, which the run's data report counts beside the kept rows'.
-            return Rejected(refused, cut=cut_counts(row.cuts for row in laid))
+            removed = sum((collections.Counter(row.cuts) for row in laid), collections.Counter())
+            return Rejected(refused, cut=removed)
         unread: dict[str, int] = {}
         contexts = [0] * len(laid)
         if self.context_length is not None:
@@ -437,9 +440,10 @@ class Fit(pygrain.MapTransform):
     def _apart(self, grouped: GroupedExamples) -> Batch | Rejected:
         """Grouped examples' labelled rows, each as an example of its own lays it out (`QuestionRows`
         spreads them), where no consistency term reads their groups: an example that does not fit is
-        left out as it would be alone, its siblings kept, and counted under its reason
-        (`_dew_rejected`)."""
-        rows, reasons = [], collections.Counter()
+        left out as it would be alone, its siblings kept, and counted under its reason (`_dew_rejected`)
+        with the tokens its cuts removed (`_dew_left_out_cut`), or refused with every member's where
+        none is kept."""
+        rows, reasons, removed = [], collections.Counter(), collections.Counter()
         for example in grouped.examples:
             labels = example.labels()
             if not labels:
@@ -450,13 +454,15 @@ class Fit(pygrain.MapTransform):
             fitted = self._rows(example, asked)
             if isinstance(fitted, Rejected):
                 reasons[fitted.reason] += 1
+                removed.update(fitted.cut)
                 continue
             rows.extend(fitted)
         if rows:
             return {"decision_rows": tuple(rows), "_dew_truncated": any(row.truncated for row in rows),
-                    "_dew_cut": _cuts(rows), "_dew_declined": _declined(rows), "_dew_rejected": dict(reasons)}
+                    "_dew_cut": _cuts(rows), "_dew_declined": _declined(rows), "_dew_rejected": dict(reasons),
+                    "_dew_left_out_cut": dict(removed)}
         return Rejected(next((reason for reason in ("unfit", "options_alike") if reason in reasons),
-                             "unlabelled"))
+                             "unlabelled"), cut=removed)
 
     def _longest(self, row: FittedRow) -> tuple[int, int]:
         """The most tokens `row` encodes to where the training encoding may give each answered choice a

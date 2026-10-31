@@ -55,42 +55,46 @@ class CorpusCounts:
     left_out: Counter[str] = dataclasses.field(default_factory=Counter)
     """The members delivered rows left out, by reason (`_dew_rejected`), counted apart from the records
     the corpus rejected whole, so a recount of the delivered rows (`counted_anew`) starts them over."""
+    rejected_cut: Counter[str] = dataclasses.field(default_factory=Counter)
+    """The tokens the cuts of the records the corpus rejected whole removed, by what each cut
+    (`Rejected.cut`), counted with their rejections."""
+    left_out_cut: Counter[str] = dataclasses.field(default_factory=Counter)
+    """The tokens the cuts of the members delivered rows left out removed, by what each cut
+    (`_dew_left_out_cut`), counted with them."""
     declined: Counter[str] = dataclasses.field(default_factory=Counter)
 
     def delivered(self, element: Batch | bytes) -> None:
         """Count one row the corpus delivered: accepted, cut short where it says it was
         (`_dew_truncated`), each cut it reports (`_dew_cut`: by what it cut, the rows it shortened and
-        the tokens it removed), the members it left out by reason (`_dew_rejected`), and the
-        augmentation a read declines for it, by reason (`_dew_declined`)."""
+        the tokens it removed), the members it left out by reason (`_dew_rejected`) and the tokens their
+        cuts removed (`_dew_left_out_cut`), and the augmentation a read declines for it, by reason
+        (`_dew_declined`)."""
         self.accepted += 1
         if not isinstance(element, Mapping):
             return
         self.truncated += int(bool(element.get("_dew_truncated", False)))
-        self.counted_cut(element.get("_dew_cut", {}))
-        for reason, count in element.get("_dew_rejected", {}).items():
-            self.left_out[reason] += int(count)
-        for reason, count in element.get("_dew_declined", {}).items():
-            self.declined[reason] += int(count)
-
-    def refused_one(self, refused: Rejected) -> None:
-        """Count one record the corpus refused, under its reason, and the cuts of its refused rows
-        (`Rejected.cut`) beside the delivered rows'."""
-        self.rejected[refused.reason] += 1
-        self.counted_cut(refused.cut)
-
-    def counted_cut(self, cut: Mapping[str, tuple[int, int]]) -> None:
-        """Count one record's cuts (`_dew_cut`): by what each cut, the rows it shortened and the tokens
-        it removed."""
-        for kind, (rows, tokens) in cut.items():
+        for kind, (rows, tokens) in element.get("_dew_cut", {}).items():
             self.cut_examples[kind] += 1
             self.cut_rows[kind] += int(rows)
             self.cut_removed[kind] += int(tokens)
+        for reason, count in element.get("_dew_rejected", {}).items():
+            self.left_out[reason] += int(count)
+        self.left_out_cut.update(element.get("_dew_left_out_cut", {}))
+        for reason, count in element.get("_dew_declined", {}).items():
+            self.declined[reason] += int(count)
+
+    def dropped(self, rejected: Rejected) -> None:
+        """Count one record the corpus rejected whole, under its reason, with the tokens its cuts
+        removed (`Rejected.cut`)."""
+        self.rejected[rejected.reason] += 1
+        self.rejected_cut.update(rejected.cut)
 
     def counted_anew(self) -> None:
         """Start over the counts of delivered rows, for a read that counts them again whole (a memory
         read's rows, read once more as it holds them)."""
         self.accepted, self.truncated = 0, 0
-        for counted in (self.cut_examples, self.cut_rows, self.cut_removed, self.left_out, self.declined):
+        for counted in (self.cut_examples, self.cut_rows, self.cut_removed, self.left_out, self.left_out_cut,
+                        self.declined):
             counted.clear()
 
     @property
@@ -98,6 +102,12 @@ class CorpusCounts:
         """What the corpus left out, by reason: the records it rejected whole and the members its
         delivered rows left out (`left_out`)."""
         return self.rejected + self.left_out
+
+    @property
+    def refused_cut(self) -> Counter[str]:
+        """The tokens the cuts of what the corpus left out removed, by what each cut: of the records it
+        rejected whole and of the members its delivered rows left out."""
+        return self.rejected_cut + self.left_out_cut
 
     def metrics(self, label: str) -> dict[str, float]:
         """The metrics a run logs of this corpus under `label`, each exact in one unit: the rows it
@@ -111,6 +121,7 @@ class CorpusCounts:
             **{f"data/cut_examples/{label}/{kind}": count for kind, count in self.cut_examples.items()},
             **{f"data/cut/{label}/{kind}": count for kind, count in self.cut_rows.items()},
             **{f"data/cut_removed/{label}/{kind}": count for kind, count in self.cut_removed.items()},
+            **{f"data/cut_refused/{label}/{kind}": count for kind, count in self.refused_cut.items()},
             **{f"data/declined/{label}/{reason}": count for reason, count in self.declined.items()},
         }
 
@@ -126,6 +137,8 @@ class CorpusCounts:
             "cut_examples": dict(self.cut_examples),
             "cut_rows": dict(self.cut_rows),
             "cut_removed": dict(self.cut_removed),
+            "rejected_cut": dict(self.rejected_cut),
+            "left_out_cut": dict(self.left_out_cut),
             "declined": dict(self.declined),
         }
 
@@ -139,7 +152,8 @@ class CorpusCounts:
             {name: integer(value, name) for name, value in record(state["rejected"], "rejected").items()}
         )
         # A position saved before cuts were counted holds none.
-        for name in ("cut_examples", "cut_rows", "cut_removed", "left_out", "declined"):
+        for name in ("cut_examples", "cut_rows", "cut_removed", "left_out", "rejected_cut", "left_out_cut",
+                     "declined"):
             setattr(self, name, Counter({kind: integer(value, kind)
                                          for kind, value in record(state.get(name, {}), name).items()}))
 
@@ -149,7 +163,8 @@ class CorpusCounts:
         dropped and chunked apart."""
         return dataclasses.replace(
             reader, attempted=max(self.attempted, reader.attempted), chunks=self.chunks + reader.chunks,
-            chunk_records=self.chunk_records + reader.chunk_records, rejected=self.rejected + reader.rejected)
+            chunk_records=self.chunk_records + reader.chunk_records, rejected=self.rejected + reader.rejected,
+            rejected_cut=self.rejected_cut + reader.rejected_cut)
 
     def expanded(self, outputs: Sequence[Record]) -> None:
         """Count one chunked document and its fan-out before later stages can reject chunks."""
@@ -176,7 +191,7 @@ class _KeepAccepted:
         if isinstance(element, Rejected):
             reason = element.reason
             self.owed.owe(element.consumed)
-            self.counts.counted_cut(element.cut)
+            self.counts.dropped(element)
         else:
             count = None if self.tokens is None else self.tokens(element)
             if count is not None and count < 0:
@@ -187,7 +202,7 @@ class _KeepAccepted:
                 return True
             reason = "zero_targets"
             self.owed.owe(integer(element.get(CONSUMED, 0), "a row's consumed examples"))
-        self.counts.rejected[reason] += 1
+            self.counts.rejected[reason] += 1
         self.consecutive += 1
         if not self.warned and sum(self.counts.rejected.values()) / self.counts.attempted > _WARN_OVER:
             _log.warning("corpus %s rejected more than %.1f%% of attempted records (%s)",
@@ -813,6 +828,7 @@ def _nested(counted: dict[str, CorpusCounts], inner: Mapping[str, CorpusCounts])
         combined.chunk_records = max(combined.chunk_records, counts.chunk_records)
         # Members a row left out travel with the row, as its cuts do: the outermost counts them.
         combined.rejected.update(counts.rejected)
+        combined.rejected_cut.update(counts.rejected_cut)
 
 
 def _added(counted: dict[str, CorpusCounts], counts: CorpusCounts) -> None:
@@ -830,4 +846,6 @@ def _added(counted: dict[str, CorpusCounts], counts: CorpusCounts) -> None:
     combined.cut_rows.update(counts.cut_rows)
     combined.cut_removed.update(counts.cut_removed)
     combined.left_out.update(counts.left_out)
+    combined.rejected_cut.update(counts.rejected_cut)
+    combined.left_out_cut.update(counts.left_out_cut)
     combined.declined.update(counts.declined)
