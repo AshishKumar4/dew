@@ -139,10 +139,5 @@ class Issuer:
         family, interpret = self.call.family, self.call.interpret
         shape = (lhs.shape[0], rhs.shape[1])
         if max(len(left), len(right)) == 2:
-            def issued(acc):
-                for i, j in product.terms(len(left), len(right)):
-                    acc = family.products(acc, left[i], right[j], interpret)
-                return acc
-
-            return family.summed(shape, issued, interpret)
+            return family.summed(shape, lambda acc: family.issued(acc, left, right, interpret), interpret)
         return family.apart(shape, left, right, interpret)

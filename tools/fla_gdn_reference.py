@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+"""The fixture tests hold the recurrence template's gated delta rule to: fla-core's own `chunk_gated_delta_rule`
+and `chunk_kda` (its Triton kernels) on a CUDA GPU, forward and every gradient, at each site
+tests/fla_sites.py names, over the tests' own seeded draws.
+
+    PYTHONPATH=src:tests:tools JAX_PLATFORMS=cpu python tools/fla_gdn_reference.py <fla python> [site prefix]
+
+on a GPU, Dew's environment recording and a second Python with torch and fla-core (`--serve`, the "fla"
+cohort, tools/reference_releases.py) running fla and its reference. What lands is
+tests/fixtures/fla/gdn_seeded.npz, a summary recording (`record_case(..., summary=True)`): per site, seed and
+leaf, fla's distance from float64 at the site's inputs, which the test draws again (`Site.arrays`), and the
+truth's sketch, which Dew's float64 token recurrence is held to.
+
+fla runs at its defaults (an fp32 call's products TF32, as the fast forms' bar is). Packed documents run as
+fla runs them, one flattened row of sequences (`cu_seqlens`), a row's first taking its entering memory
+unless a document starts it. The oracle is fla's own reference, `naive_recurrent_gated_delta_rule` and
+`naive_recurrent_kda` (fla/ops/*/naive.py), on each sequence in torch float64 (`torch_precision.float64`,
+which widens their fp32 casts), held at every seed to Dew's float64 token recurrence.
+"""
+
+import os
+import sys
+from pathlib import Path
+
+import numpy as np
+
+FIXTURE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "fla" / "gdn_seeded.npz"
+GRADIENTS = ("q", "k", "v", "g", "beta", "h0")
+
+
+def sequences(arrays) -> list[tuple[int, int, int, bool]]:
+    """Each sequence of a site's rows as fla runs them: `(row, start, end, entering)`, a row split at its
+    documents' starts, `entering` where it takes the row's entering memory (its row's first, no document
+    starting it)."""
+    rows, length = arrays["v"].shape[:2]
+    starts = arrays.get("starts", np.zeros((rows, length), bool))
+    found = []
+    for row in range(rows):
+        cuts = sorted({0, *np.flatnonzero(starts[row]).tolist()}) + [length]
+        for start, end in zip(cuts, cuts[1:], strict=False):
+            found.append((row, start, end, start == 0 and not starts[row, 0]))
+    return found
+
+
+def run(arrays, *, kda: bool, scale: float, rule, dtype, device, per_sequence: bool) -> dict[str, np.ndarray]:
+    """`rule` (fla's chunked rule, or its naive reference with `per_sequence`) on a site's arrays: its rows'
+    sequences flattened into one row (`cu_seqlens`), or each alone, the operands in `dtype` but the log decay
+    and memory fp32 (in float64 for the reference), the output's and final memory's gradients under the
+    drawn cotangents; leaves as `fla_sites.LEAVES`."""
+    import torch
+
+    wide = dtype == torch.float64
+    tensors = {name: torch.tensor(np.asarray(value, np.float64 if wide else np.float32), device=device)
+               for name, value in arrays.items() if name != "starts"}
+    inputs = {name: tensors[name].to(dtype if name in ("q", "k", "v", "beta") else
+                                     (torch.float64 if wide else torch.float32)).requires_grad_()
+              for name in GRADIENTS}
+    spans = sequences(arrays)
+    group = inputs["v"].shape[2] // inputs["q"].shape[2]
+
+    def piece(name, row, start, end):
+        x = inputs[name][row:row + 1, start:end]
+        return x.repeat_interleave(group, dim=2) if per_sequence and name in ("q", "k") else x
+
+    states = [inputs["h0"][row:row + 1] if entering else torch.zeros_like(inputs["h0"][:1])
+              for row, _, _, entering in spans]
+    if per_sequence:
+        outs, finals = [], []
+        for (row, start, end, _), state in zip(spans, states, strict=True):
+            q, k, v, g, beta = (piece(name, row, start, end) for name in ("q", "k", "v", "g", "beta"))
+            out, final = (rule(q, k, v, g, beta, scale=scale, initial_state=state, output_final_state=True)
+                          if kda else rule(q, k, v, beta, g, scale=scale, initial_state=state,
+                                           output_final_state=True))
+            outs.append(out)
+            finals.append(final)
+        out = torch.cat(outs, dim=1)
+    else:
+        q, k, v, g, beta = (torch.cat([piece(name, row, start, end) for row, start, end, _ in spans], dim=1)
+                            for name in ("q", "k", "v", "g", "beta"))
+        lengths = [end - start for _, start, end, _ in spans]
+        cu_seqlens = torch.tensor(np.cumsum([0, *lengths]), device=device, dtype=torch.long)
+        out, final = rule(q, k, v, g, beta, scale=scale, initial_state=torch.cat(states, dim=0),
+                          output_final_state=True, cu_seqlens=cu_seqlens)
+        finals = list(final.split(1, dim=0))
+    rows = inputs["v"].shape[0]
+    out = out.reshape(rows, -1, *out.shape[2:])
+    last = {row: index for index, (row, _, _, _) in enumerate(spans)}
+    final = torch.cat([finals[last[row]] for row in range(rows)], dim=0)
+    grads = torch.autograd.grad((out, final), tuple(inputs[name] for name in GRADIENTS),
+                                (tensors["dy"].to(out.dtype), tensors["dfinal"].to(final.dtype)),
+                                allow_unused=True)
+    found = dict(zip(("out", "final", "dq", "dk", "dv", "dg", "dbeta", "dh0"), (out, final, *grads), strict=True))
+    return {name: (np.zeros(arrays[name[1:]].shape) if value is None else
+                   value.detach().to(torch.float64).cpu().numpy())
+            for name, value in found.items()}
+
+
+def serve() -> None:
+    """The torch side: each request a line naming a site's inputs (an npz), its dtype, rule and scale, and
+    where to write fla's outputs and the reference's (`<path>.reference.npz`, `<path>.truth.npz`),
+    answered with a line `done`."""
+    import torch
+    from fla.ops.gated_delta_rule import chunk_gated_delta_rule
+    from fla.ops.gated_delta_rule.naive import naive_recurrent_gated_delta_rule
+    from fla.ops.kda import chunk_kda
+    from fla.ops.kda.naive import naive_recurrent_kda
+    from reference_releases import require
+    from torch_precision import float64
+
+    require("fla")
+    from importlib.metadata import version
+
+    print(f"ready {version('fla-core')} {torch.cuda.get_device_name()}", flush=True)
+    for line in sys.stdin:
+        path, dtype, kind, scale = line.split()
+        kda = kind == "kda"
+        with np.load(path) as stored:
+            arrays = dict(stored)
+        rule = chunk_kda if kda else chunk_gated_delta_rule
+        np.savez(f"{path}.reference.npz", **run(arrays, kda=kda, scale=float(scale), rule=rule,
+                                                dtype=getattr(torch, dtype), device="cuda", per_sequence=False))
+        with float64():
+            naive = naive_recurrent_kda if kda else naive_recurrent_gated_delta_rule
+            np.savez(f"{path}.truth.npz", **run(arrays, kda=kda, scale=float(scale), rule=naive,
+                                                dtype=torch.float64, device="cpu", per_sequence=True))
+        print("done", flush=True)
+
+
+def write_seeded(worker, prefix: str = "") -> None:
+    """Each site's seeded draws with fla's outputs and gradients and their float64 truth (`worker`,
+    `serve`'s process), recorded as a summary (`record_case`), Dew's portable rule in the site's dtype the
+    sizing proxy and its float64 token recurrence held to fla's reference at every seed."""
+    import functools
+    import tempfile
+
+    import jax
+    from fla_sites import ruled, sites
+    from recorded_references import held_to_the_oracle, provenance, record_case, save
+    from reference_error import chain_roundings, widened
+    from test_recurrence_chunk import chunk_on, token_by_token
+
+    _, version, device = worker.stdout.readline().split(maxsplit=2)
+    requests = tempfile.mkdtemp(prefix="fla-")
+    stored = {}
+    for name, site in sites().items():
+        if not name.startswith(prefix):
+            continue
+        sample = site.arrays(0)
+        dtype, kda = str(sample["q"].dtype), sample["g"].ndim == 4
+
+        def fla(arrays, dtype=dtype, kda=kda, scale=site.hooks.scale):
+            path = os.path.join(requests, "inputs.npz")
+            np.savez(path, **{key: np.asarray(value, np.float32) if key != "starts" else value
+                              for key, value in arrays.items()})
+            worker.stdin.write(f"{path} {dtype} {'kda' if kda else 'gdn'} {scale!r}\n")
+            worker.stdin.flush()
+            if worker.stdout.readline().strip() != "done":
+                raise RuntimeError("the torch process answered no request")
+            with np.load(f"{path}.reference.npz") as reference, np.load(f"{path}.truth.npz") as truth:
+                return dict(reference), dict(truth)
+
+        exact_run = jax.jit(functools.partial(lambda hooks, arrays: ruled(
+            functools.partial(token_by_token, hooks), arrays), site.hooks))
+        with jax.enable_x64(new_val=True):
+            roundings = chain_roundings(jax.make_jaxpr(exact_run)(widened(sample)))
+
+        def evaluate(arrays, fla=fla, exact_run=exact_run, roundings=roundings, name=name):
+            reference, truth = fla(arrays)
+            held_to_the_oracle(exact_run, arrays, truth, roundings, f"fla {name}")
+            return reference, truth
+
+        portable = functools.partial(lambda hooks, arrays: ruled(functools.partial(chunk_on, 'xla', hooks),
+                                                                 arrays), site.hooks)
+        stored.update(record_case(name, site.arrays, evaluate, portable, truth_proxy=exact_run,
+                                  store_inputs=False, summary=True))
+    stored["provenance"] = provenance(
+        f"fla-core {version}", f"fla-core {version}", device.strip(),
+        "PYTHONPATH=src:tests:tools JAX_PLATFORMS=cpu python tools/fla_gdn_reference.py <fla python>",
+        truth="fla's naive_recurrent_gated_delta_rule and naive_recurrent_kda on each sequence in torch float64",
+        cross_check="Dew's token recurrence in float64; assert_computes_the_oracle with its traced chain_roundings")
+    written = save(FIXTURE, stored, reference=f"fla-core {version}", license="MIT")
+    print(f"wrote {FIXTURE.name}: {written} ({written.stat().st_size:,} bytes)", flush=True)
+
+
+def main() -> None:
+    import subprocess
+
+    if sys.argv[1] == "--serve":
+        serve()
+        return
+    with subprocess.Popen([sys.argv[1], __file__, "--serve"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                          text=True) as worker:
+        write_seeded(worker, *sys.argv[2:3])
+        worker.stdin.close()
+
+
+if __name__ == "__main__":
+    os.environ.setdefault("JAX_PLATFORMS", "cpu")
+    main()

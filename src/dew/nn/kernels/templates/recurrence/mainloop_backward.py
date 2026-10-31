@@ -455,9 +455,11 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: _Call, t
             # The decayed output gradient fp32 as two parts against the queries (fla's split product, 16 of
             # its significand's bits): one part put the initial memory's gradient 5 to 7 times the port's
             # distance from float64. Its first part reuses the memory products' tile, each consumed before
-            # the next stages.
+            # the next stages; an fp32 call's two parts are the memory products' own (a third took the
+            # product's parts apart, each its own accumulator: 277 values live at the walk's peak against a
+            # 16-bit call's 133, 100 bytes spilled on an H100, back-need at 5cec06bd8).
             issue = Issuer(call, {**dict.fromkeys(("values_dv", "weights_dv"), staged),
-                                   "reads": (*staged, second)})
+                                   "reads": staged if len(staged) > 1 else (*staged, second)})
             return functools.partial(_reverse_step, lands, issue, walked + role * bv, pl.ds(role * bv, bv))
 
         def _reverse_step(lands, issue, column, columns, f, slots, grad, accumulators):
@@ -841,6 +843,9 @@ def _scores_back(q, k, corrected, do, hi, lo, taken, beta, call: _Call, *, scale
                 functools.partial(column, "out", given), blocks, gate, low, scale,
                 grads.dtype if accumulated is None else jnp.float32, Issuer(call), laid=laid,
                 column_scale=family.columns_of(beta_ref.at[h, span]) if call.gated_keys else None)
+            # The pairs' sum before the scores' gradient's store, so an fp32 call's parts form after the
+            # pairs are gone.
+            decay_ref.at[h, span][...] = algebra.summed_pairs(pairs, summed, column_sums)
             if accumulated is None:
                 grads.store(ds_ref, ds, row, CHUNK, h * CHUNK, CHUNK, family=family, smem=landing["square"])
             else:
@@ -859,7 +864,6 @@ def _scores_back(q, k, corrected, do, hi, lo, taken, beta, call: _Call, *, scale
                     grads.store(ds_ref, ds.astype(grads.dtype), row, CHUNK, head * CHUNK, CHUNK,
                                 family=family, smem=landing["square"])
 
-            decay_ref.at[h, span][...] = algebra.summed_pairs(pairs, summed, column_sums)
             return carry, accumulators
 
         read = _prefix_reader(family, streamed, vectors, first, span)

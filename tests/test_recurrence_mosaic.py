@@ -109,9 +109,15 @@ unresolved within 40 seeds, its extra seeds taking 784 and 934 s."""
 
 def geometry(case: str) -> dict:
     """Case `case`'s operands as `SHAPES` gives them, shortened and narrowed off a GPU of a family a bundle
-    claims (`INTERPRETED_LENGTH`, `INTERPRETED_HEADS`)."""
+    claims (`geometry_on`)."""
+    return geometry_on(case, interpreted=mainloop.family_of() is None)
+
+
+def geometry_on(case: str, interpreted: bool) -> dict:
+    """Case `case`'s operands as `SHAPES` gives them, shortened and narrowed where `interpreted`
+    (`INTERPRETED_LENGTH`, `INTERPRETED_HEADS`)."""
     shape = SHAPES[case]
-    if mainloop.family_of() is not None:
+    if not interpreted:
         return shape
     return {**shape, 'rows': 1, 'length': min(shape['length'], INTERPRETED_LENGTH),
             **INTERPRETED_HEADS.get(case, {})}
@@ -439,37 +445,33 @@ def test_a_16bit_delta_rule_whose_form_proves_no_range_solves_at_fp32s_range():
         assert port_kernel(*operands, report=False) == 'mosaic_gpu'
 
 
+NEAR_TWO_HOOKS = recurrence.Hooks(decay='scalar', scale=64 ** -0.5, write_bound=2.0)
+"""The gated delta rule under write gates near two (twice a sigmoid's) on keys 64 wide, no decay."""
+
+
+def near_two(seed: int) -> Chunk:
+    """Unit keys within 1e-3 of one direction over 64 tokens under write gates near two, as queries too, bf16;
+    no decay, no memory entering."""
+    tokens, width = 64, 64
+    keys = jax.random.split(jax.random.key(53 + seed), 4)
+    base = jax.random.normal(keys[0], (1, 1, 1, width))
+    key = base + 1e-3 * jax.random.normal(keys[1], (1, tokens, 1, width))
+    key = (key / jnp.linalg.norm(key, axis=-1, keepdims=True)).astype(jnp.bfloat16)
+    value = jax.random.normal(keys[2], (1, tokens, 1, width)).astype(jnp.bfloat16)
+    beta = (2.0 * jax.nn.sigmoid(6.0 + jax.random.normal(keys[3], (1, tokens, 1)))).astype(jnp.bfloat16)
+    return Chunk(key, key, value, log_decay=jnp.zeros((1, tokens, 1), jnp.float32), beta=beta,
+                 state=jnp.zeros((1, 1, width, width), jnp.float32))
+
+
 def test_the_solve_holds_a_negative_eigenvalue_rules_inverse():
     """Unit keys within 1e-3 of one direction under write gates near two (twice a sigmoid's, the
     negative-eigenvalue delta rule's), declared (`write_bound`): each transition's eigenvalue near -1, the
     chunk's inverse alternating in sign at entries up to two, within fp16's range (`recurrence.Hooks.
-    inverse_bound`). The template's 16-bit call on par from float64 with the port's, whose roundings it
-    takes (`recurrence_chunk.fla_rule`), the token recurrence the truth (check 1): no transition damps
+    inverse_bound`). The template's 16-bit call on par from float64 with recorded fla's (`fla_sites`), the
+    token recurrence the truth (check 1): no transition damps
     them, and the fp32 portable math stays 14 times nearer."""
-    tokens, width = 64, 64
-    hooks = recurrence.Hooks(decay='scalar', scale=width ** -0.5, write_bound=2.0)
-
-    def draw(seed):
-        keys = jax.random.split(jax.random.key(53 + seed), 4)
-        base = jax.random.normal(keys[0], (1, 1, 1, width))
-        key = base + 1e-3 * jax.random.normal(keys[1], (1, tokens, 1, width))
-        key = (key / jnp.linalg.norm(key, axis=-1, keepdims=True)).astype(jnp.bfloat16)
-        value = jax.random.normal(keys[2], (1, tokens, 1, width)).astype(jnp.bfloat16)
-        beta = (2.0 * jax.nn.sigmoid(6.0 + jax.random.normal(keys[3], (1, tokens, 1)))).astype(jnp.bfloat16)
-        return key, value, beta
-
-    def output(rule):
-        def run(key, value, beta):
-            drawn = Chunk(key, key, value, log_decay=jnp.zeros((1, tokens, 1), key.dtype), beta=beta,
-                          state=jnp.zeros((1, 1, width, width), jnp.promote_types(key.dtype, jnp.float32)))
-            found = rule(drawn)
-            return found[0] if isinstance(found, tuple) else found
-        return run
-
-    assert_as_exact(output(functools.partial(chunk_on, 'mosaic_gpu', hooks)),
-                    output(functools.partial(chunk_on, 'fla', hooks)), draw,
-                    "the template's solve under write gates near two", seeds=SEEDS,
-                    truth_fn=output(functools.partial(token_by_token, hooks)))
+    the_template_is_as_exact_as_fla(functools.partial(chunk_on, 'mosaic_gpu', NEAR_TWO_HOOKS), 'near two',
+                                    ('out',), "the template's solve under write gates near two")
 
 
 def test_a_gated_delta_net_named_onto_the_template_matches_the_portable_rule():
