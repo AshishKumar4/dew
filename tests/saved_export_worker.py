@@ -4,11 +4,12 @@
 Driven by tests/test_saved_sources.py. Every process places one small decoder over a mesh across the
 pool, extends each of its layers' attention with DEX (`dew.nn.dex`), whose export folds each output
 projection as it is written, and exports it as a saved run's release, the run's restore
-(`Pretrained.from_saved`) standing in for the placed decoder and the release cut into small shards, process 0 publishing and the other
-reading every tensor as it does (`publishes`). Each records the files it wrote, the peak of its host
-allocations during the export (`tracemalloc`, which counts NumPy's), and the model's size; outside the
-export's scope the write is refused. It also writes the same weights unplaced, as one process does.
-Every mode records what it saw into --out and asserts nothing.
+(`Pretrained.from_saved`) standing in for the placed decoder and the release cut into small shards,
+process 0 publishing and the other reading every tensor as it does (`publishes`). Each records the
+files it wrote, the peak of its host allocations during the export (`tracemalloc`, which counts
+NumPy's), and the model's size; outside the export's scope the write is refused. It also writes the
+same weights unplaced, as one process does. Every mode records what it saw into --out and asserts
+nothing.
 
 dew is imported inside the modes, not at module scope, because a JAX backend opened before
 jax.distributed.initialize() would pin the process to its own devices.
@@ -55,9 +56,9 @@ def exported(args) -> dict:
     import jax.numpy as jnp
 
     from dew.inference.banks import HeldBanks
-    from dew.nn.dex import DifferentialExtension
     from dew.interop.pretrained import Pretrained, PretrainedDecoder
     from dew.interop.saved_sources import export_run
+    from dew.nn.dex import DifferentialExtension
     from dew.registry import models
     from dew.training import Layout, MeshSpec
 
