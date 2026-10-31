@@ -795,8 +795,11 @@ class _Pass:
 
 
 def _stores_shared(op) -> bool:
-    """Whether `op` writes shared memory (address space 3): a store, an asynchronous one's assembly aside."""
+    """Whether `op` writes shared memory (address space 3): `stmatrix` (attention's P and dS, written from
+    their products' accumulators, `nvvm.stmatrix`), or a store to it, as an op or its assembly."""
     name = op.name.removeprefix(PREFIX)
+    if name == "nvvm.stmatrix":
+        return True
     if name in ("llvm.store", "vector.store", "memref.store", "vector.transfer_write"):
         return any("<3>" in str(operand.type) or "#gpu.address_space<workgroup>" in str(operand.type)
                    for operand in op.operands)
