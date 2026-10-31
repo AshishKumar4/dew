@@ -3,6 +3,7 @@
 import contextlib
 import dataclasses
 import hashlib
+import http.server
 import importlib.machinery
 import io
 import itertools
@@ -584,6 +585,101 @@ def test_a_declaration_without_a_digest_or_a_version_is_refused_where_it_is_read
     manifest = source.manifest()
     with pytest.raises(ValueError):
         list(manifest.reader(manifest.shards[0]))
+
+
+@contextlib.contextmanager
+def etagged_server(objects: dict[str, bytes]):
+    """An HTTP server of `objects`, by path, each named by its content's digest as its ETag and served
+    whole or a range of it (`Range`), a read conditioned on another ETag refused (`If-Match`: 412, RFC
+    9110 13.1.1); its URL."""
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            payload = objects.get(self.path)
+            if payload is None:
+                self.send_response(404)
+                self.end_headers()
+                return
+            etag = '"' + hashlib.sha256(payload).hexdigest() + '"'
+            if self.headers.get("If-Match") not in (None, etag):
+                self.send_response(412)
+                self.end_headers()
+                return
+            ranged = self.headers.get("Range")
+            if ranged is not None:
+                first, last = ranged.removeprefix("bytes=").split("-")
+                payload = payload[int(first):int(last) + 1]
+            self.send_response(206 if ranged is not None else 200)
+            self.send_header("ETag", etag)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}"
+    finally:
+        server.shutdown()
+
+
+def test_an_http_line_file_read_on_its_published_etag_is_refused_once_replaced():
+    """A line file served over HTTP, declared by its size and the ETag it was published at, is read a
+    range at a time, each read held to that ETag: replaced, its next read is refused, where an unheld
+    read would take the replacement's bytes under the declaration."""
+    objects = {"/rows.jsonl": b'{"id":0}\n{"id":1}\n'}
+    with etagged_server(objects) as url:
+        location = url + "/rows.jsonl"
+        facts = {location: {"bytes": len(objects["/rows.jsonl"]),
+                            "ETag": '"' + hashlib.sha256(objects["/rows.jsonl"]).hexdigest() + '"'}}
+
+        def rows():
+            source = Files((location,), format="jsonl", file_info=facts)
+            manifest = source.manifest()
+            return [row["id"] for part in manifest.shards for row in manifest.reader(part)]
+
+        assert rows() == [0, 1]
+        objects["/rows.jsonl"] = b'{"id":7}\n{"id":1}\n'
+        with pytest.raises(Replaced):
+            rows()
+
+
+def test_a_version_only_array_record_shard_is_refused_where_its_reader_needs_its_path():
+    """An ArrayRecord shard declared by its size and store version alone, which its reader would read
+    whole by its path where no version holds that read, is refused: the declaration names no digest to
+    check a whole copy against."""
+    with moto_bucket("version-only") as (bucket, options):
+        root = Store(f"s3://{bucket}/export", options)
+        export(Memory([{"id": index} for index in range(4)]), root.url, format="array_record",
+               rows_per_shard=4, storage_options=options)
+        [entry] = json.loads(Store(root.url + "/_dew_manifest.json", options).read())["files"]
+        url = root.child(entry["path"]).url
+        source = Files((url,), format="array_record", storage_options=options,
+                       file_info={url: {"bytes": entry["bytes"], "stored": entry["stored"]}})
+        manifest = source.manifest()
+        with pytest.raises(ValueError):
+            list(manifest.reader(manifest.shards[0]))
+
+
+def test_declared_files_read_a_range_at_a_time_hold_no_mirror_copy_between_reads(tmp_path):
+    """Files declared by their digest on a store no read can be held to a version of (an HTTP server
+    whose ETags the declaration does not state), read a range at a time as an offset index reads them,
+    are each read whole into Dew's mirror and checked, and keep no copy open between reads: a mirror with
+    room for one of them reads a range of each of several in turn, and again."""
+    from dew.data.storage import Declared
+
+    objects = {f"/part-{index}.jsonl": json.dumps({"id": index}).encode() + b"\n" for index in range(3)}
+    with etagged_server(objects) as url:
+        options = {"dewcache": {"cache_storage": str(tmp_path / "mirror"),
+                                "max_bytes": max(map(len, objects.values()))}}
+        declared = [Declared(Store(url + name, options), {"bytes": len(payload),
+                                                          "sha256": hashlib.sha256(payload).hexdigest()})
+                    for name, payload in objects.items()]
+        for _ in range(2):
+            assert [json.loads(held.read_range(0, held.size)) for held in declared] == [
+                {"id": index} for index in range(3)]
 
 
 def test_a_source_exports_the_records_its_pipeline_exports():
