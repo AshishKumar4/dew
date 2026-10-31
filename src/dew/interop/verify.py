@@ -576,14 +576,19 @@ def _layer_kinds(source: ModelSource, fields: Mapping[str, object]) -> tuple[lis
     config's per-layer lists (one as long as the depth, stated or derived: SmolLM3's `no_rope_layers`,
     HY-3's `mlp_layer_types`) and each of its modules' (`_module_kind`) across every module list as long
     as the depth; and every module's outside those lists (its table, its rotary, its final norm). None
-    where no module list is as long as the depth, or where a module's class is not transformers' or
-    torch's own, whose layers differ only as their kinds show: a source's own code may add what no kind
+    where no module list is as long as the depth, or where the model is not built by transformers' own
+    code of transformers' and torch's own classes (a remote source, a config class registered from
+    elsewhere), whose layers differ only as their kinds show: a source's own code may add what no kind
     shows (a hook on its later layers, a rotary built by its depth)."""
     import torch
 
     config, model = _skeleton(source, fields)
     depth = _records.integer(config.num_hidden_layers, 'num_hidden_layers')
-    if any(not type(module).__module__.startswith(('transformers.', 'torch.')) for module in model.modules()):
+    # The code that built the model, a remote class's constructor or a config class registered from
+    # elsewhere, is the source's own even where what it returns is transformers' classes.
+    own = ('transformers.', 'torch.')
+    if source.remote is not None or not type(config).__module__.startswith('transformers.') or any(
+            not type(module).__module__.startswith(own) for module in model.modules()):
         return None
     stacks = [module for module in model.modules() if isinstance(module, torch.nn.ModuleList)
               and len(module) == depth]

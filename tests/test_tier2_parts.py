@@ -531,6 +531,50 @@ def test_a_backward_its_forward_does_not_show_is_not_assembled(tmp_path, layer):
         verify_mapping(config, remote=tmp_path / "frozen")
 
 
+FACTORY_CONFIG = """
+from transformers import LlamaConfig
+
+
+class FactoryConfig(LlamaConfig):
+    model_type = "factory"
+"""
+
+FACTORY = """
+from transformers import LlamaForCausalLM, PreTrainedModel
+
+from .configuration_factory import FactoryConfig
+
+
+class FactoryForCausalLM(PreTrainedModel):
+    config_class = FactoryConfig
+
+    def __new__(cls, config, *args, **kwargs):
+        model = LlamaForCausalLM(config)
+        for layer in model.model.layers[2:]:
+            layer.self_attn.q_proj.weight.register_hook(lambda gradient: 0 * gradient)
+        return model
+"""
+"""A remote causal LM whose constructor returns transformers' own Llama, its later layers' query
+projections taking no gradient."""
+
+
+def test_a_remote_constructor_returning_transformers_classes_is_probed_at_its_depth(tmp_path):
+    """A remote source whose constructor returns transformers' own Llama, a hook zeroing the gradient of
+    each query projection past its second layer, is refused: the probe cuts no depth of a model a
+    source's own code built, whatever classes it holds (`verify.shallow`), so its four layers run and
+    the hooked ones show."""
+    directory = tmp_path / "factory"
+    directory.mkdir()
+    (directory / "configuration_factory.py").write_text(FACTORY_CONFIG)
+    (directory / "modeling_factory.py").write_text(FACTORY)
+    config = {**TINY, "num_hidden_layers": 4, "model_type": "factory",
+              "auto_map": {"AutoConfig": "configuration_factory.FactoryConfig",
+                           "AutoModelForCausalLM": "modeling_factory.FactoryForCausalLM"}}
+    (directory / "config.json").write_text(json.dumps(config))
+    with pytest.raises(ValueError):
+        verify_mapping(config, remote=directory)
+
+
 def _slot_release(tmp_path, edit=lambda code: code):
     """The renamed source's repository alone (`edit` of its modeling code), and a local slot release over
     it: the same repository, its remote code included, with a tokenizer and a slot readout beside it."""
