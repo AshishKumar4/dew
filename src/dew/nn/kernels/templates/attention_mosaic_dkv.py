@@ -284,6 +284,9 @@ def _fused_adds(walk: _Backward, dq_ref, stages: list, place: tuple, index, k_sm
     exchange.open()
 
     def shared(part, q_first):
+        if box is not None:
+            # Its share's stage claimed at the step's start (`mosaic.Outbox`).
+            mosaic.per_role(index, consumers, lambda role, index: box.claim(role))
         exchange.claim()
         family.staged(part, staged.at[index])
         exchange.publish()
