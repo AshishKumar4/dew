@@ -204,29 +204,13 @@ _DEFAULT_STEPS = 200
 _CONSISTENCY = Consistency()
 
 
-class _SourceSolver(Protocol):
-    @property
-    def solver(self) -> Solver: ...
-
-
-class _SourceCall(Protocol):
-    @property
-    def steps(self) -> int: ...
-
-    @property
-    def guidance(self) -> Guidance | None: ...
-
-    @property
-    def grid(self) -> SourceGrid: ...
-
-
 @runtime_checkable
 class PipelineSource(Protocol):
     """A loaded diffusion pipeline a `DiffusionObjective` can train in place
     of a bare denoiser: its denoiser `model`, starting `variables`, `process`,
-    `inputs` and `autoencoder`, and how it samples, the solver of its
-    `schedule` and the steps, guidance and grid of its `task`.
-    `dew.interop.PretrainedPipeline` is one; the protocol keeps
+    `inputs` and `autoencoder`, and how it samples, its `solver`, `steps`,
+    `guidance` and `grid`. `dew.interop.PretrainedPipeline` is one, and a
+    sampling task (`TextToImage`, a saved run's) is another; the protocol keeps
     `dew.objectives` from importing `dew.interop`."""
 
     @property
@@ -245,10 +229,16 @@ class PipelineSource(Protocol):
     def autoencoder(self) -> AutoEncoder | None: ...
 
     @property
-    def schedule(self) -> _SourceSolver: ...
+    def solver(self) -> Solver: ...
 
     @property
-    def task(self) -> _SourceCall: ...
+    def steps(self) -> int: ...
+
+    @property
+    def guidance(self) -> Guidance | None: ...
+
+    @property
+    def grid(self) -> SourceGrid | None: ...
 
 
 class DiffusionObjective(Objective[Ratio]):
@@ -404,12 +394,13 @@ class DiffusionObjective(Objective[Ratio]):
         uses the towers as built.
 
         `model` may be a loaded pipeline instead of the denoiser
-        (`DiffusionObjective(flux)`). The pipeline then supplies the denoiser,
+        (`DiffusionObjective(flux)`), or a saved run's sampling task
+        (`TextToImage.from_run`, `PipelineSource`). The pipeline then supplies the denoiser,
         `variables`, `process`, `inputs`, `autoencoder` and its own sampling policy,
         and any of them passed here overrides the pipeline's, an explicit None
         included (`autoencoder=None` trains in pixel space, `variables=None` draws
         the denoiser). Evaluation and the published task sample on the pipeline's
-        own grid and end as its solver does (`SourceTask.grid`), whatever process
+        own grid and end as its solver does (`PipelineSource.grid`), whatever process
         trains. `grid` names that grid for a denoiser built apart from its
         pipeline, as a run config builds one; None samples on the process's own
         times with a closing denoise. The pipeline's text encoder trains nothing but encodes every
@@ -449,10 +440,10 @@ class DiffusionObjective(Objective[Ratio]):
             inputs = source.inputs if inputs is None else inputs
             autoencoder = source.autoencoder if autoencoder is OMITTED else autoencoder
             variables = source.variables if variables is OMITTED else variables
-            solver = source.schedule.solver if solver is _DEFAULT_SOLVER else solver
-            guidance = source.task.guidance if guidance is _DEFAULT_GUIDANCE else guidance
-            steps = source.task.steps if steps is None else steps
-            grid = source.task.grid if grid is OMITTED else grid
+            solver = source.solver if solver is _DEFAULT_SOLVER else solver
+            guidance = source.guidance if guidance is _DEFAULT_GUIDANCE else guidance
+            steps = source.steps if steps is None else steps
+            grid = source.grid if grid is OMITTED else grid
             held = source.variables.get("encoders", {})
             if any(keyword not in held for keyword in inputs.conditions):
                 raise ValueError("this pipeline was loaded without its text encoder (text=False), and "

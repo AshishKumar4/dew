@@ -467,7 +467,7 @@ def write_minimax_m2_recordings() -> None:
                       f'uv pip install --target /tmp/tf518 --no-deps transformers=={release}; '
                       f'PYTHONPATH=/tmp/tf518:src:tools python tools/hf_reference.py --minimax-m2-recording',
                       reference='transformers MiniMaxM2ForCausalLM', revision=release, license='Apache-2.0',
-                      padded=padded)
+                      padded=padded, stepped=4 if name == 'minimax-m2-tiny' else None)
 
 
 def write_qwen2_moe() -> None:

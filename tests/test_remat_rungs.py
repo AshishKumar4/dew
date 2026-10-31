@@ -20,7 +20,7 @@ import pytest
 from architecture_cases import CASES as ARCHITECTURES, LM, SEQ_LEN, TEXT_FEATURES, TEXT_TOKENS, VOCAB, Case
 from checkpoint_cases import LENGTH, PATHS, ROWS, loaded, reads
 from flax.traverse_util import flatten_dict, unflatten_dict
-from model_support import float64_twin
+from model_support import float64_twin, stepped_outputs
 from reference_error import assert_as_exact, widened
 from tool_support import load
 from whole_suite import timed
@@ -292,7 +292,13 @@ def test_a_continuum_level_composes_with_the_scan_the_ladder_and_the_cache():
     def whole(model):
         return lambda variables, drawn, _: model.apply(variables, drawn)
 
-    assert_as_exact(jax.jit(decoded(plain)), jax.jit(whole(plain)), draw,
+    forward = jax.jit(plain.apply)
+
+    def passes(variables, drawn, _):
+        # The full passes at the shapes the decode's steps compute, one token each from an empty cache.
+        return stepped_outputs(lambda length: forward(variables, drawn[:, :length]), LENGTH, 1)
+
+    assert_as_exact(jax.jit(decoded(plain)), passes, draw,
                     "a continuum decoder's cached decode", seeds=CONTINUUM_SEEDS,
                     truth_fn=whole(float64_twin(plain)))
 

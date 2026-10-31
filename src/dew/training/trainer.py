@@ -303,6 +303,7 @@ class Trainer(Generic[Loss, Effects]):
         `param_dtype` (`dew.state.drawn_in`); None keeps each module's own.
         `inspection` names what the run watches at its sampled steps (`dew.training.inspection`).
         """
+        layout = objective.placement(layout)  # as its models place their trees (a tier-3 plan, ledger 2777)
         whole = read_whole(accumulation, split, step, layout, rollout, mesh)
         self.objective = objective
         built = isinstance(optimizer, optax.GradientTransformation)
