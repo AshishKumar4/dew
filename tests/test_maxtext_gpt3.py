@@ -1,7 +1,7 @@
 """MaxText's GPT-3 (maxtext 0.2.5, maxtext/models/gpt3.py) in Dew's decoder: learned positions added to
 the tied token embedding, LayerNorms whose weight is stored as its offset from one (`OffsetLayerNorm`)
 with biases, fused-projection attention with biases, a tanh-GELU MLP with biases, and logits by the
-embedding. MaxText's run over drawn weights and tokens is recorded (tools/maxtext_reference.py gpt3,
+embedding. MaxText's run over drawn weights and tokens is recorded (tools/venv_reference.py gpt3,
 `maxtext/` fixtures); Dew's float32 logits are as exact as MaxText's against float64 (check 1)."""
 
 from pathlib import Path
@@ -9,7 +9,7 @@ from pathlib import Path
 import jax.numpy as jnp
 import numpy as np
 from flax.traverse_util import unflatten_dict
-from maxtext_recordings import assert_as_exact_as_maxtext
+from reference_runs import assert_as_exact_as_recorded
 
 FIXTURE = Path(__file__).parent / "fixtures" / "maxtext" / "gpt3.npz"
 SHAPE = {"emb": 16, "heads": 2, "head_dim": 8, "mlp": 64, "layers": 2, "vocab": 64, "positions": 64,
@@ -95,13 +95,13 @@ def decoder(dtype):
         "dtype": jnp.dtype(dtype).name})
 
 
-OUTPUT = "logits"
-"""The name of what `dew` gives, the site's recorded leaf."""
+OUTPUTS = ("logits",)
+"""The names of what `dew` gives, the site's recorded leaves."""
 
 
 def dew(dtype, inputs) -> dict:
     """Dew's logits at `dtype` of a draw's tokens under its weights."""
-    return {OUTPUT: decoder(dtype).apply(dew_variables(inputs), inputs["ids"])}
+    return {OUTPUTS[0]: decoder(dtype).apply(dew_variables(inputs), inputs["ids"])}
 
 
 def test_dews_gpt3_computes_maxtexts_logits():
@@ -109,4 +109,4 @@ def test_dews_gpt3_computes_maxtexts_logits():
     float64 run (check 1 over the recorded seeds), Dew's float64 run held to that run's recorded
     sketch: positions, offset norms, fused attention, the GELU MLP and the tied logits all as MaxText
     computes them."""
-    assert_as_exact_as_maxtext(FIXTURE, "gpt3", GPT3_SEEDS, draw, dew, "MaxText's GPT-3 logits")
+    assert_as_exact_as_recorded(FIXTURE, "gpt3", GPT3_SEEDS, draw, dew, "MaxText's GPT-3 logits")
