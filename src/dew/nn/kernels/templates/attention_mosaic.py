@@ -392,17 +392,25 @@ def _forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dt
     operands' dtype, and the key indices int32 its anchor test compares, a thread's one per column its
     fragment holds, which its fragment's two rows share (an MMA accumulator's layout: half the tile's words;
     TWOPASS5-h100: uncounted, 64 x 128 on two consumers derived and spilled, 6.6 ms against 64 x 64's 1.06);
-    its peak walk holds less. The `natural` form holds a step's masked logits beside their exponentials
-    (`algebra.natural_exp`), one fp32 tile more (et-livehook2: its peak's selects and exp2 beside the logits;
-    et-fwdhooks2: every hooked forward, the natural form alone, spilled at the fold's count). A score hook's
-    parameters are live beside its logits (`_hook_live`)."""
+    its peak walk holds less. The `natural` form's exponential (`algebra.natural_exp`) holds at its peak the
+    scaled logits, their rounded product and its residual (`two_product`), three fp32 tiles, beside the
+    product's bit split, an int32 tile; a training walk's then its power's integral part built in bits, two
+    int32 tiles beside its weights (the corrected IR live set, ET-HOOKBREAK: 198 at 64 x 64 and width 128,
+    the acc's 66 beside 3 x 32 fp32 and 32 int32; a natural training walk 174 at width 64, its fold's 110
+    and 64 int32). A score hook's parameters are live beside its logits (`_hook_live`)."""
     block_q, block_k = tiles.block_q, tiles.block_k
     hooked, vectors = _hook_live(family, block_q, block_k, params)
-    step = ([(block_q, block_k, jnp.float32)] * (2 if natural else 1)
-            + [(block_q, block_k, dtype)] * (2 if residuals else 1)) + hooked
+    logits, weights = (block_q, block_k, jnp.float32), (block_q, block_k, dtype)
+    bits = (block_q, block_k, jnp.int32)
+    step = [logits, weights, *([weights] if residuals else []), *hooked]
     if residuals:
         step.append((block_q // 2, block_k, jnp.int32))
-    return resources.live_registers(family, [(block_q, value_width, jnp.float32)], step) + vectors
+    phases = [step]
+    if natural:
+        phases.append([logits] * 3 + [bits] + hooked)
+        if residuals:
+            phases.append([logits, weights, weights, bits, bits, *hooked])
+    return resources.live_registers(family, [(block_q, value_width, jnp.float32)], *phases) + vectors
 
 
 @overload
