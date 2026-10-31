@@ -163,30 +163,49 @@ def derived_terms(loss: Callable, params, arguments: Sequence, *, platform: str,
                   lowering: str | None = None) -> tuple[int, Peak]:
     """`residual_bytes` and `gradient_peak` of `loss(params, *arguments)` from one trace of its forward and
     backward (`traced_gradient`), as each derives it from its own."""
-    program, count, shapes = traced_gradient(loss, params, arguments)
+    traced = traced_gradient(loss, params, arguments)
     lowering = lowering or LOWERED.get(platform, platform)
-    residuals = _residuals(compiled(program.replace(outvars=program.outvars[count:]), lowering), shapes,
-                           platform)
-    peak = compiled(program.replace(outvars=program.outvars[:count]), lowering)
-    return residuals, Peak(peak_bytes(peak, platform, workspace), not bounded_below(peak, platform))
+    return _kept(*traced, platform, lowering), _peak(*traced, platform, workspace, lowering)
 
 
 def residual_bytes(loss: Callable, params, arguments: Sequence, *, platform: str,
                    lowering: str | None = None) -> int:
     """The device bytes the pullback of `loss(params, *arguments)` in `params` keeps, a device's share,
-    as XLA's fusion for `platform` keeps them: each value its traced program (`jax.make_jaxpr` of
-    `jax.vjp`'s pullback, as JAX lowers it for `lowering`, `platform`'s own name where none is given,
-    a GPU's CUDA's: `compiled`) closes over counts the values it is computed
-    from without a buffer (`Frontier.reading`), once, but those the program reads, which the state and
-    the batch already hold, and literals; a value in pinned host memory counts none. A value the
-    pullback closes over keeps its own traced sharding; one whose trace states none, and every other
-    value, count whole. Matching an axis's size to the batch size cannot identify its sharding: a weight
-    or a scan's layer axis can have that size too."""
-    def pullback(params, *arguments):
-        return jax.vjp(lambda trainable: loss(trainable, *arguments), params, has_aux=True)[1]
-    closed, shapes = jax.make_jaxpr(pullback, return_shape=True)(params, *arguments)
-    return _residuals(compiled(closed.jaxpr, lowering or LOWERED.get(platform, platform)),
-                      jax.tree.leaves(shapes), platform)
+    as XLA's fusion for `platform` keeps them: each value its traced program (`jax.vjp`'s pullback, its
+    residuals the outputs of `traced_gradient`'s program past the gradient, as JAX lowers it for
+    `lowering`, `platform`'s own name where none is given, a GPU's CUDA's: `compiled`) closes over counts
+    the values it is computed from without a buffer (`Frontier.reading`), once, but those the program
+    reads, which the state and the batch already hold, and literals; a value in pinned host memory counts
+    none. A value the pullback closes over keeps its own traced sharding; one whose trace states none, and
+    every other value, count whole. Matching an axis's size to the batch size cannot identify its
+    sharding: a weight or a scan's layer axis can have that size too."""
+    lowering = lowering or LOWERED.get(platform, platform)
+    return _kept(*traced_gradient(loss, params, arguments), platform, lowering)
+
+
+def gradient_peak(loss: Callable, params, arguments: Sequence, *, platform: str,
+                  workspace: Workspace, lowering: str | None = None) -> Peak:
+    """The most device bytes the gradient of `loss(params, *arguments)` in `params` holds at once, a
+    device's share, as XLA's fusion for `platform` keeps its values and each matrix product takes
+    `workspace` bytes beside them (`peak_bytes`), and whether that is the program's own or a bound from
+    below (`bounded_below`): the program `jax.vjp`'s pullback runs on a cotangent of ones, traced whole,
+    forward and backward (`traced_gradient`, its outputs the gradient's), as JAX lowers it for `lowering`
+    (`compiled`; `platform`'s own name where none is given, a GPU's CUDA's)."""
+    return _peak(*traced_gradient(loss, params, arguments), platform, workspace,
+                 lowering or LOWERED.get(platform, platform))
+
+
+def _kept(program: jcore.Jaxpr, count: int, shapes: Sequence, platform: str, lowering: str) -> int:
+    """`residual_bytes` of `traced_gradient`'s program, its outputs past the first `count` the residuals."""
+    return _residuals(compiled(program.replace(outvars=program.outvars[count:]), lowering), shapes, platform)
+
+
+def _peak(program: jcore.Jaxpr, count: int, shapes: Sequence, platform: str, workspace: Workspace,
+          lowering: str) -> Peak:
+    """`gradient_peak` of `traced_gradient`'s program, its first `count` outputs the gradient."""
+    del shapes
+    lowered = compiled(program.replace(outvars=program.outvars[:count]), lowering)
+    return Peak(peak_bytes(lowered, platform, workspace), not bounded_below(lowered, platform))
 
 
 def _residuals(program: jcore.Jaxpr, shapes: Sequence, platform: str) -> int:
@@ -206,22 +225,6 @@ def _residuals(program: jcore.Jaxpr, shapes: Sequence, platform: str) -> int:
         total += (math.prod(aval.shape) * aval.dtype.itemsize if shape is None or shape.sharding is None
                   else placed_bytes(shape))
     return total
-
-
-def gradient_peak(loss: Callable, params, arguments: Sequence, *, platform: str,
-                  workspace: Workspace, lowering: str | None = None) -> Peak:
-    """The most device bytes the gradient of `loss(params, *arguments)` in `params` holds at once, a
-    device's share, as XLA's fusion for `platform` keeps its values and each matrix product takes
-    `workspace` bytes beside them (`peak_bytes`), and whether that is the program's own or a bound from
-    below (`bounded_below`): the program `jax.vjp`'s pullback runs on a cotangent of ones, traced whole,
-    forward and backward, as JAX lowers it for `lowering` (`compiled`; `platform`'s own name where none
-    is given, a GPU's CUDA's)."""
-    def gradient(params, *arguments):
-        outputs, pullback, _ = jax.vjp(lambda trainable: loss(trainable, *arguments), params, has_aux=True)
-        return pullback(jax.tree.map(jax.numpy.ones_like, outputs))
-    program = jax.make_jaxpr(gradient)(params, *arguments).jaxpr
-    lowered = compiled(program, lowering or LOWERED.get(platform, platform))
-    return Peak(peak_bytes(lowered, platform, workspace), not bounded_below(lowered, platform))
 
 
 def bounded_below(program: jcore.Jaxpr, platform: str) -> bool:
