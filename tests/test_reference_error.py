@@ -406,6 +406,33 @@ def test_check_1_refuses_a_draw_its_seed_does_not_fix_and_an_arm_of_more_than_it
         assert_as_exact(planted, jnp.matmul, a_product_draw, "a planted non-finite entry", seeds=16)
 
 
+def test_check_1_refuses_a_draw_and_an_arm_that_turn_stateful_after_their_first_block():
+    """Planted controls of a later block (ledger 2641): a draw fixed by its seed in a site's first block that
+    reads a state its calls leave from then on, and an arm of no noise on its first block that adds one
+    after, are refused at the next block's first draw (`UnpairedDraw`), as every block checks its first
+    draw and its arms on it; the first block alone passes."""
+    from reference_error import UnpairedDraw
+
+    asked = []
+
+    def later_stateful(seed):
+        x, w = a_product_draw(seed)
+        asked.append(seed)
+        return (x if seed == asked[0] else x + 1e-3 * len(asked)), w
+
+    with pytest.raises(UnpairedDraw):
+        null_runs(jnp.matmul, later_stateful, "a draw stateful after its first block", seeds=8, runs=2)
+    calls = iter(range(10**6))
+
+    def noisy_later(x, w):
+        at = next(calls)
+        return x @ w + (0 if at < 2 else 1e-6 * at)
+
+    with pytest.raises(UnpairedDraw):
+        null_runs(as_given(noisy_later), a_product_draw, "an arm of noise after its first block", seeds=8,
+                  runs=2)
+
+
 def test_check_1_sizes_rows_by_their_terms_beside_an_output_held_as_none():
     """Term sizing reads a truth's terms by the truth's own structure (`_term_leaves`): an output held as
     None (a gradient of an input given as None, as `with_gradients` returns one) takes no leaf of the
@@ -1643,10 +1670,10 @@ def test_null_runs_judge_the_reference_against_itself_on_draws_no_other_run_take
         assert_as_exact(residue, exact, one_truth, "orbit", seeds=8, truth_fn=truth)
     [(verdict, _, _)] = null_runs(exact, one_truth, "orbit", seeds=8, runs=1, truth_fn=truth, dew_fn=residue)
     assert verdict == "over"
-    # The draw is drawn again once, on its first run's first seed, the check that its seed fixes it
-    # (`_of_its_seed`, once a draw however many runs ask it); its draws are otherwise each run's own.
+    # Each run draws its first seed again, the check that its seed fixes it (`_of_its_seed`); its draws are
+    # otherwise its own.
     drawn = [seed for at, seed in enumerate(taken) if not at or taken[at - 1] != seed]
-    assert len(drawn) == len(set(drawn)) and len(taken) - len(drawn) == 1
+    assert len(drawn) == len(set(drawn)) and len(taken) - len(drawn) == 3
     assert null_rate_bound(0, 1400) == pytest.approx(1 - 0.001 ** (1 / 1400), rel=1e-9)
     assert null_rate_bound(0, 200) > 0.03
     assert null_rate_bound(3, 3) == 1.0
