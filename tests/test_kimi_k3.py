@@ -101,8 +101,10 @@ def test_greedy_generation_and_decode_steps_match_the_reference(source):
 def test_cached_prefill_and_token_steps_are_as_exact_as_the_reference(source):
     """Row 0 prefilled for 40 tokens, then decoded one token at a time through
     the KDA state and the MLA cache: its logits are held to the reference
-    forward's distance from float64, as the parallel forward is. Observed
-    RMS from float64: Dew 1.39e-6, the reference 2.09e-6 (ratio 0.66 on CPU)."""
+    forwards' distance from float64, the reference read at the shapes the
+    steps compute (`stepped_logits`: the prefill's from one forward over it,
+    each later token's from one over the row up to it; ledger 1543), as the
+    parallel forward is held to the whole forward's."""
     loaded, inputs, reference = source
     model, variables = loaded.model, loaded.variables
     ids = inputs.tokens[:1]
@@ -114,7 +116,7 @@ def test_cached_prefill_and_token_steps_are_as_exact_as_the_reference(source):
             {**variables, **state}, ids[:, index : index + 1], decode=True, mutable=["cache"]
         )
         pieces.append(np.asarray(out))
-    assert_as_exact_as_the_reference(np.concatenate(pieces, axis=1)[0], reference["logits"][0],
+    assert_as_exact_as_the_reference(np.concatenate(pieces, axis=1)[0], reference["stepped_logits"][0],
                                      reference["logits_f64"][0], "cached decode")
 
 

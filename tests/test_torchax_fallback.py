@@ -218,8 +218,8 @@ def test_the_gradients_are_transformers(source, loaded, tokens):
 def test_trainer_steps_move_the_params_and_place_them_by_name(loaded, tokens):
     """AdamW through the Trainer on a fsdp x tensor mesh: the loss falls,
     every parameter moves, the rotary buffers come back bitwise, and the
-    torch names take the specs the model's tensor-parallel plan gives them, the run's layout as the
-    objective's model refines it (`Objective.placement`), as a run's trainer takes it."""
+    torch names take the specs the model's tensor-parallel plan gives them: a trainer built from Python
+    takes the layout as the objective's model refines it (`Objective.placement`, ledger 2777)."""
     params, buffers = loaded.variables["params"], loaded.variables["buffers"]
     assert set(buffers) == {"gpt_neox.rotary_emb.inv_freq", "gpt_neox.rotary_emb.original_inv_freq"}
     assert not set(params) & set(buffers)
@@ -228,7 +228,8 @@ def test_trainer_steps_move_the_params_and_place_them_by_name(loaded, tokens):
     batch = tokens[np.arange(rows) % ROWS]
     data = Loader(train=lambda partition: iter([{"text": batch}] * 4), val=None, records=rows, batch=rows)
     trainer = Trainer(objective, optax.adamw(1e-2), key=jax.random.key(0),
-                      mesh=MeshSpec(fsdp=2, tensor=2), layout=objective.placement(Layout(min_shard=1)))
+                      mesh=MeshSpec(fsdp=2, tensor=2), layout=Layout(min_shard=1))
+    assert trainer.layout == objective.placement(Layout(min_shard=1)) != Layout(min_shard=1)
 
     state = trainer.fit(data, steps=4, log_every=1)
 
@@ -282,7 +283,7 @@ def test_a_frozen_torch_base_kept_whole_drops_fsdp_from_the_name_tables_placemen
         objective = LMObjective(loaded, seq_len=SEQ, ema_decay=None, variables=variables)
         trainer = Trainer(objective, optax.adamw(1e-2), key=jax.random.key(0), mesh=mesh, checkpoints=None,
                           tracker=None,
-                          layout=objective.placement(Layout(min_shard=1, frozen_whole=frozen_whole)))
+                          layout=Layout(min_shard=1, frozen_whole=frozen_whole))
         trainer.device_mesh = mesh.build(jax.devices()[:4])
         state, shardings, _ = trainer.place()
         placed = shard_batch(trainer.device_mesh, batch)
@@ -1122,7 +1123,8 @@ def test_a_tier_3_source_generates_through_the_pipeline_loader_as_its_bundle_doe
 def test_a_tier_3_model_decodes_through_dews_cache_as_transformers_runs_each_prefix(family, stated, tmp_path):
     """A tier-3 model on Dew's attention decodes through Dew's cache: a padded prompt fills its row's
     slots and each next token one more, and every decoded step's logits hold check 1 against
-    transformers' full forward of that row's prefix (its float64 twin's the truth), Cohere 2's window
+    transformers' full forward of that row's prefix, each step's its own at the width it reads (ledger
+    1543; its float64 twin's one forward the truth), Cohere 2's window
     included, the padding stated by a validity mask or as the document 0 of the row's segments; its
     greedy generation's tokens are the full forward's argmax at each step."""
     from dew.inference import TextGeneration
@@ -1170,20 +1172,25 @@ def test_a_tier_3_model_decodes_through_dews_cache_as_transformers_runs_each_pre
     def ours(prompt, valid, continued):
         return np.asarray(decoded(loaded.variables, prompt, valid, continued), np.float64)
 
-    def theirs(source, precision=contextlib.nullcontext):
+    def theirs(source, precision=contextlib.nullcontext, *, stepped: bool = True):
+        def forward(ids):
+            with precision(), torch.no_grad():
+                return source(torch.from_numpy(ids[None]).long()).logits[0].double().numpy()
+
         def run(prompt, valid, continued):
             rows = []
             for row in range(2):
                 ids = np.concatenate([prompt[row][valid[row]], continued[row]])
-                with precision(), torch.no_grad():
-                    logits = source(torch.from_numpy(ids[None]).long()).logits[0].double().numpy()
                 real = int(valid[row].sum())
-                rows.append(logits[real - 1:real + steps])
+                if stepped:
+                    rows.append(np.stack([forward(ids[:real + step])[-1] for step in range(steps + 1)]))
+                else:
+                    rows.append(forward(ids)[real - 1:real + steps])
             return np.stack(rows)
         return as_given(run)
 
     assert_as_exact(ours, theirs(reference), draw, f"{family} cached logits ({stated})",
-                    seeds=DECODE_SEEDS[family], truth_fn=theirs(wide, float64))
+                    seeds=DECODE_SEEDS[family], truth_fn=theirs(wide, float64, stepped=False))
 
     # The rows' coordinates state the same validity and positions as their separate fields.
     prompt, valid, _ = draw(0)

@@ -311,6 +311,17 @@ layers to scan (`Pretrained.load`); a diffusion pipeline, which no override reac
 the same choices for a source as `options=SourceOptions(...)`, and refuses them for a run directory,
 whose record holds its own.
 
+A run starts from a saved Dew run as from any source: `--pretrained <run directory>` names it, and
+`--source.step` (a step, `latest`, `best` or `best:<metric>`) and `--source.ema` select its
+checkpoint, which the run's record pins to the step it read (`RunConfig.with_pinned_run`).
+`dew.interop.saved_sources.pinned_run` resolves the directory for every loader. A language model or
+decision run reads the release `dew export` writes of that checkpoint, cached under Dew's cache by
+the run, its step and Dew's code (`released_run`), so every load option applies to it as to any
+release: `Pretrained.load(run_dir, step=..., ema=...)` is the Python form. A diffusion run, which Dew
+writes no diffusers layout of, starts from the run's own sampling task (`load_diffusion_source`,
+`TextToImage.from_saved`) at the run's dtypes, placement, attention kernel and data size. A step or
+EMA choice beside a source that is no saved run is refused, as it selects nothing.
+
 Serving is one engine of kinds (`dew.inference.Engine`). A kind (`Kind`) admits waiting requests
 within its own bounds, runs them with one bounded device call a `step`, and settles each request's
 `Timed` future. The engine steps each busy kind once a turn from one thread, so a long queue of one
