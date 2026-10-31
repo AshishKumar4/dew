@@ -249,24 +249,20 @@ def test_the_derivation_decides_a_steps_fit_as_its_compile_does(layers, generati
     over decoders dense, hybrid and of experts, Ampere and Hopper, no recomputation and full, JAX's
     default and highest matmul precision (row 2113's gate, in the kernel gate's evidence shape,
     `compile_evidence`). The need is the program's as XLA lays it out on a roomy GPU, and the
-    derivation's, read off that compile, admits it at 1.6 times; it refuses it at 0.6, but where its
-    peak is a bound from below (`Footprint.exact`: an expert decoder's ragged products, which XLA lays
-    out as its target, dtype and flags choose), which never refuses wrongly and admits provisionally,
-    its compile deciding (row 2750). On a GPU stating 1.6 times, the compile fits and the derivation
-    judged so. On one stating 0.6, a step set to full recomputation compiles there alone: where XLA
-    refuses it the derivation did, unless bounded from below, and where XLA fits it, it fits by XLA's
-    own rematerialization against the stated memory, which the derivation does not model and the
-    compile decides (its temporaries below the roomy compile's)."""
+    derivation's, read off that compile, admits it at 1.6 times and refuses it at 0.6. Every gate
+    decoder's peak is the program's own (`Footprint.exact`), an expert decoder's too: its ragged products
+    run on CUDA as Pallas grouped kernels, custom calls that hold their outputs alone
+    (`compiled_program.opaque`), none a ragged product XLA lays out as its target, dtype and flags
+    choose, whose peak alone is a bound from below (tests/test_footprint.py's). On a GPU stating 1.6
+    times, the compile fits and the derivation judged so. On one stating 0.6, a step set to full
+    recomputation compiles there alone: where XLA refuses it the derivation did, and where XLA fits it,
+    it fits by XLA's own rematerialization against the stated memory, which the derivation does not
+    model and the compile decides (its temporaries below the roomy compile's)."""
     from compile_evidence import Evidence, Facts, Measurement, Prediction
 
     (roomy,) = gated(layers, generation, remat, 1 << 34, tmp_path / "roomy", precision)
     need, derived = (1 << 34) - roomy["headroom"], (1 << 34) - roomy["derived_headroom"]
-    exact = roomy["derived"]["peak_exact"]
-    # An expert decoder's ragged products are XLA's to lay out as its target, dtype and flags choose:
-    # its peak alone is a bound from below.
-    assert exact == (layers != "moe"), roomy["derived"]
-    # A bound from below is a bound: the derived need never passes the compiled one.
-    assert exact or derived <= need, (derived, need)
+    assert roomy["derived"]["peak_exact"], roomy["derived"]
     for margin, admits in ((1.6, True), (0.6, False)):
         budget = int(need * margin)
         evidence = Evidence(
@@ -275,15 +271,12 @@ def test_the_derivation_decides_a_steps_fit_as_its_compile_does(layers, generati
             Prediction({"peak": roomy["derived"]["peak"]}, derived, budget, derived <= budget, "bytes"),
             Measurement({"temp": roomy["temp"]}, need <= budget, "xla", jax.__version__))
         assert evidence.compiled.admits == admits, evidence.describe()
-        # A bound from below may admit where the compile refuses, a miss its compile corrects; it never
-        # refuses where the compile admits.
-        assert evidence.agrees or (not exact and derived <= budget), evidence.describe()
+        assert evidence.agrees, evidence.describe()
     (fitting, *_) = gated(layers, generation, remat, int(need * 1.6), tmp_path / "1.6", precision)
     assert fitting["fits"] and fitting["derived_headroom"] >= 0, fitting
     if remat == "full":
         tight = gated(layers, generation, remat, int(need * 0.6), tmp_path / "0.6", precision)[0]
-        # An exact peak refuses there; a bound from below may admit, a miss its compile corrects.
-        assert tight["derived_headroom"] < 0 or not exact, tight
+        assert tight["derived_headroom"] < 0, tight
         # Neither refuses a compile that fits, but where XLA's own rematerialization fit it below what
         # the roomy compile held, which the derivation does not model.
         assert not tight["fits"] or tight["derived_headroom"] >= 0 or tight["temp"] < roomy["temp"], tight
