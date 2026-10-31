@@ -307,7 +307,9 @@ def test_a_deviceless_matmul_holds_the_workspace_its_slice_fusion_decides(progra
     vast = 1 << 30
 
     def peak(charged: Workspace) -> int:
-        return gradient_peak(loss, specs[0], specs[1:], platform="gpu", workspace=charged).bytes
+        # Under the compile-only mesh, as the planner derives a step for it.
+        with jax.set_mesh(Mesh(np.asarray([gpu]), ("data",))):
+            return gradient_peak(loss, specs[0], specs[1:], platform="gpu", workspace=charged).bytes
 
     charged = {kind for kind, charge in (("each", Workspace(vast, 0)), ("sliced", Workspace(0, vast)))
                if peak(charge) >= vast}
@@ -339,3 +341,33 @@ def test_deriving_a_loops_offsets_runs_no_callback_of_it():
     assert called == []
     assert sliced < vast
 
+
+
+@pytest.mark.parametrize("loop", ["scan", "while"])
+def test_a_loops_carry_is_one_buffer_from_its_start_to_its_result(loop):
+    """XLA keeps a loop's carried value in one buffer from the buffer its initial value is computed into
+    to the loop's result, its body's parameter and returned value of it among them
+    (`ComputeAliasedValues`, xla/hlo/analysis/hlo_alias_analysis.cc): a loop updating a 16 MiB buffer
+    it starts from zeros turn by turn holds it once, within what XLA's compile of it on a compile-only
+    Hopper holds."""
+    from dew.training.ahead import compile_only_gpus
+
+    (gpu,) = compile_only_gpus("sm90", 1, 1 << 30)
+    rows = jax.ShapeDtypeStruct((64, 1024), jnp.float32)
+
+    def program(rows):
+        def turn(index, buffer):
+            return jax.lax.dynamic_update_slice_in_dim(buffer, jnp.tanh(rows) + index, index * 64, axis=0)
+
+        start = jnp.zeros((4096, 1024))
+        if loop == "scan":
+            return jax.lax.fori_loop(0, 64, turn, start)
+        return jax.lax.while_loop(lambda carried: carried[0] < 64,
+                                  lambda carried: (carried[0] + 1, turn(*carried)), (0, start))[1]
+
+    derived = peak_bytes(compiled(jax.make_jaxpr(program)(rows).jaxpr, "cuda"), "gpu", Workspace(0, 0))
+    sharding = NamedSharding(Mesh(np.asarray([gpu]), ("data",)), P())
+    placed = jax.ShapeDtypeStruct(rows.shape, rows.dtype, sharding=sharding)
+    held = jax.jit(program).lower(placed).compile().memory_analysis()
+    assert held is not None, "the compile states no memory"
+    assert 4096 * 1024 * 4 <= derived <= held.output_size_in_bytes + held.temp_size_in_bytes
