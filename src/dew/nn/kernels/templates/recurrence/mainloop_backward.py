@@ -327,16 +327,16 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: _Call, t
         def memory(base, i):
             return (base * call.heads + h) * width + i * call.block
 
-        key_columns = h // call.group * width
+        key_columns, value_columns = h // call.group * width, h * value_width + walked
         # Step `f` the chunk `chunks - 1 - f`: a sequence's chunks from its last, walked forward.
         views = _views(lambda f: (chunks - 1 - f, 0),
                        queries=given.views(q_ref, 0, call.rows, key_columns, width),
                        keys=given.views(k_ref, 0, call.rows, key_columns, width),
                        **({"w": held.views(w_ref, 0, call.rows, h * width, width)} if call.delta else {}),
-                       out=given.views(do_ref, 0, call.rows, h * value_width + walked, walked_width),
-                       local=grads.views(local_ref, 0, call.rows, h * value_width + walked, walked_width),
-                       **({} if call.delta else {"values": given.views(v_ref, 0, call.rows,
-                                                                       h * value_width + walked, walked_width)}))
+                       out=given.views(do_ref, 0, call.rows, value_columns, walked_width),
+                       local=grads.views(local_ref, 0, call.rows, value_columns, walked_width),
+                       **({} if call.delta else
+                          {"values": given.views(v_ref, 0, call.rows, value_columns, walked_width)}))
         final_views = _views(**{f"final{i}": final.views(dht_ref, memory(row, i), call.block, walked,
                                                          walked_width) for i in range(slices)})
         walked_streams = family.opened(streams["walked"], views)
