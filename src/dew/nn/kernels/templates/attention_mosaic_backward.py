@@ -28,7 +28,6 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _spans_of,
     approximate,
     stated,
-    traced_name,
 )
 from dew.nn.kernels.templates.attention_mosaic_scores import (
     _Backward,
@@ -190,7 +189,7 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
     if walk.fused:
         if tiles.shared_keys:
             dq, dk, dv = _coop_launch(query, key, value, dout, maximum, forward_total, anchor, delta, chosen,
-                                      spans, walk=walk, names=traced_name("attention_dkv_shared"))
+                                      spans, walk=walk)
         elif tiles.dkv_apart:
             # The fused launch keys first on its own layout (`BackwardTiles.dkv`): its consumers' shares of a
             # slot's queries each a warpgroup MMA's rows, dQ added a tile at a time.
@@ -198,7 +197,7 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
                                      spans, score_params, drop, scaled, walk=dkv_walk)
         else:
             dq, dk, dv = _fused_launch(query, key, value, dout, maximum, forward_total, anchor, delta, chosen,
-                                       spans, walk=walk, names=traced_name("attention_dkv_fused"))
+                                       spans, walk=walk)
         mass = algebra.split_mass(own, others_total, forward_total, shift)
         return (dq[..., :width], delta, anchor, maximum, forward_total, mass, chosen, dk[..., :width],
                 dv[..., :value_width])

@@ -102,7 +102,7 @@ def _length_index(root: Store, writer: str, number: int, batch,
     sizes = np.asarray(lengths, np.int64)
     np.save(encoded, np.column_stack((sizes, np.cumsum(sizes))), allow_pickle=False)
     path = f"_dew_indexes/{writer}/part-{number:06d}.lengths.npy"
-    return {"path": path, **root.child(path).published(encoded.getvalue())}
+    return {"path": path, **root.child(path).verified(encoded.getvalue())}
 
 
 def write_array_record(path: Path, payloads: Iterable[bytes]) -> None:
@@ -125,7 +125,7 @@ def _array_shard(root: Store, writer: str, number: int, batch, index: dict[str, 
             "path": relative,
             "rows": len(batch),
             "lengths": index,
-            **root.child(relative).published(path.read_bytes()),
+            **root.child(relative).verified(path.read_bytes()),
         }
 
 

@@ -47,7 +47,14 @@ from etils import epath
 import dew.io
 from dew import registry, training
 from dew._coordination import agree_process_phase, agreed, agreed_same
-from dew._records import JSON, duration, earlier_segments, is_share, recorded_duration
+from dew._records import (
+    JSON,
+    duration,
+    earlier_fields,
+    is_share,
+    json_value as field_value,
+    recorded_duration,
+)
 from dew.cache import dew_cache_dir
 from dew.checkpoints import RUN_FILE, Checkpoints, Keep, Resume
 from dew.config.sweep import RandomSearch, Search, Space, read_ledger, write_ledger
@@ -992,8 +999,11 @@ def earlier_trainer(record: Mapping[str, object]) -> Mapping[str, object]:
     fields = record.get("fields")
     segments = fields.get("segments") if isinstance(fields, Mapping) else None
     if isinstance(fields, Mapping) and isinstance(segments, list):
-        # A decision run's row of segments, in today's fields (`earlier_segments`).
-        fields = {**fields, "segments": earlier_segments(segments)}
+        # A decision run's row of segments, each component in today's fields (`earlier_fields`): the
+        # segments alone, where a layout's components are, never a field of data a row holds.
+        migrated = earlier_fields(field_value(segments, "segments"))
+        assert isinstance(migrated, list)
+        fields = {**fields, "segments": migrated}
         record = {**record, "fields": fields}
     if not isinstance(fields, Mapping) or not isinstance(fields.get("trainer"), Mapping):
         return record

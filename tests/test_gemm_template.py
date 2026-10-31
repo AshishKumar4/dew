@@ -583,6 +583,56 @@ def test_a_dense_layers_product_through_the_template_holds_check_1(generation_na
                         truth_fn=with_gradients(truth))
 
 
+def test_each_dense_launch_lowers_once_however_many_layers_call_it():
+    """Two layers' dense projections of one shape, their forward and gradients, through the template's
+    Mosaic launches lowered for an H100: each distinct launch is one Mosaic GPU call in the lowered program,
+    which both layers call, as many as one layer's (`tuning.lowered_once`; row 2808). Each call built and
+    lowered its own kernel, a model's identical layers' kernels each again."""
+    import re
+
+    operands = [jax.ShapeDtypeStruct(shape, jnp.bfloat16) for shape in ((512, 256), (256, 256))]
+
+    def layers(count: int):
+        def run(x, w):
+            total = jnp.float32(0.0)
+            for layer in range(count):
+                # Each layer's own rows, as each layer takes the one before's.
+                out = template.gemm(x * (layer + 1), w, None, out_dtype=jnp.bfloat16)
+                total = total + out.astype(jnp.float32).sum()
+            return total
+
+        return jax.grad(run, argnums=(0, 1))
+
+    def kernels(count: int) -> int:
+        with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic_gpu"):
+            text = jax.jit(layers(count)).trace(*operands).lower(lowering_platforms=("cuda",)).as_text(
+                dialect="hlo")
+        return len([line for line in text.splitlines() if re.search(r'custom_call_target="mosaic_gpu', line)])
+
+    one = kernels(1)
+    assert one > 0 and kernels(2) == one
+
+
+def test_two_launches_whose_padded_shapes_meet_name_their_own_kernels():
+    """A GEMM at 4089 rows and one at 4096, which its Mosaic mainloop pads alike, lowered for an H100 in one
+    program: each launch's kernel carries its own launch's digest (`report.named`), as a spill refuses the
+    launch that compiled it. Their shared static configuration traced once under the first launch, and the
+    second's kernel was named for the first (row 2941)."""
+    from dew.training._lowering import kernel_calls
+
+    weight = jax.ShapeDtypeStruct((256, 256), jnp.bfloat16)
+    shorter, longer = (jax.ShapeDtypeStruct((rows, 256), jnp.bfloat16) for rows in (4089, 4096))
+
+    def both(a, b, w):
+        return (template.gemm(a, w, None, out_dtype=jnp.bfloat16),
+                template.gemm(b, w, None, out_dtype=jnp.bfloat16))
+
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic_gpu"):
+        lowered = jax.jit(both).trace(shorter, longer, weight).lower(lowering_platforms=("cuda",))
+    launches = [call.launch for call in kernel_calls(lowered) if call.name == "dew_gmm"]
+    assert len(launches) == 2 and None not in launches and len(set(launches)) == 2
+
+
 @pytest.mark.parametrize("policy", ["fp32_result_dot_general", "head_dot_general"])
 def test_a_head_keeps_its_own_products_fp32_result(policy):
     """A bf16 projection whose product states a policy of its own, a DiT's prediction head

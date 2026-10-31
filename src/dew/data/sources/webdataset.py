@@ -8,7 +8,8 @@ from contextlib import ExitStack
 
 import grain.python as grain
 
-from dew.data.storage import Declared, Store
+from dew.data.declared import Declared
+from dew.data.storage import Store
 
 
 class TarRows(grain.IterDataset):

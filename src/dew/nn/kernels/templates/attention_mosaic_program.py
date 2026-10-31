@@ -25,7 +25,6 @@ from dew.nn.kernels.templates import (
     mosaic,
     mosaic_sm80,
     mosaic_sm90,
-    report,
 )
 from dew.nn.kernels.templates.attention import (
     Draw,
@@ -706,10 +705,3 @@ def _views_of(refs: dict, row, head) -> dict:
     """The streams' views by name (`Family.opened`, `Family.stream`, `mosaic.viewed`): each `[B, S, H, D]`
     operand's `[S, D]` at batch row `row` and head `head`, step `j` its `j`-th block of rows."""
     return {name: (ref.at[row, :, head], lambda j: (j, 0)) for name, ref in refs.items()}
-
-
-def traced_name(name: str) -> tuple[str, str | None]:
-    """A launch's kernel name and the one its trace reports (`report.named`, which reads the launch tracing
-    it), resolved at its call: a launch lowered once for its static facts (`tuning.lowered_once`) takes both
-    as one, so a later call's report names its own launch."""
-    return name, report.named(name)
