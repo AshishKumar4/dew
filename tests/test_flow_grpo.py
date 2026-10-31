@@ -85,18 +85,19 @@ class AffineVelocity(nn.Module):
         return gain * x + (temb / 1000)[:, None] * 0.1 + offset
 
 
-def sde_density(x, action, sigma, following, velocity, noise, dtype):
+def sde_density(x, action, sigma, following, velocity, noise, dtype, *, xp=np):
     """The authors' SDE log density of a transition from `x` to `action` [rows, ...] between the noise
     rates `sigma` and `following` (one each, or one a row) at the policy's `velocity` there, its noise
-    level `noise`, in NumPy at `dtype`: their `sde_step_with_logprob`, summed over a state's values."""
-    x, action, velocity = (np.asarray(value, dtype) for value in (x, action, velocity))
+    level `noise`, in NumPy at `dtype`, or in `xp` (jnp, which a gradient differentiates): their
+    `sde_step_with_logprob`, summed over a state's values."""
+    x, action, velocity = (xp.asarray(value, dtype) for value in (x, action, velocity))
     shape = (-1,) + (1,) * (x.ndim - 1)
-    sigma, following = (np.asarray(rate, dtype).reshape(shape) for rate in (sigma, following))
+    sigma, following = (xp.asarray(rate, dtype).reshape(shape) for rate in (sigma, following))
     dt = following - sigma
-    g_squared = noise**2 * sigma / (1 - np.where(sigma == 1, following, sigma))
+    g_squared = noise**2 * sigma / (1 - xp.where(sigma == 1, following, sigma))
     mean = x + (velocity + g_squared / (2 * sigma) * (x + (1 - sigma) * velocity)) * dt
     variance = g_squared * -dt
-    density = -0.5 * ((action - mean)**2 / variance + np.log(2 * math.pi * variance))
+    density = -0.5 * ((action - mean)**2 / variance + xp.log(2 * math.pi * variance))
     return density.sum(tuple(range(1, x.ndim)))
 
 
@@ -305,10 +306,17 @@ def clipped_terms(gain, frozen, states, times, advantages):
     old, current, reference = mean(jnp.asarray(0.25, dtype)), mean(gain), mean(jnp.asarray(frozen, dtype))
     log_ratio = (-jnp.square(following - current) + jnp.square(following - old)).mean(-1) / (2 * variance)
     ratio = jnp.exp(log_ratio)
-    advantage = jnp.clip(jnp.asarray(advantages, dtype), -2, 2)[:, None]
-    policy = jnp.maximum(-advantage * ratio, -advantage * jnp.clip(ratio, 0.999, 1.001))
+    policy, advantage = clipped_surrogate(ratio, jnp.asarray(advantages, dtype)[:, None], 0.001, 2)
     kl = jnp.square(current - reference).mean(-1) / (2 * variance)
     return policy, kl, ratio, advantage
+
+
+def clipped_surrogate(ratio, advantages, clip_range: float, most: float):
+    """Flow-GRPO's clipped policy term of each transition, PPO's without its dual cap, at the likelihood
+    ratio `ratio`, its advantages clipped to `most` first, and the clipped advantages beside it."""
+    advantage = jnp.clip(advantages, -most, most)
+    clipped = jnp.clip(ratio, 1 - clip_range, 1 + clip_range)
+    return jnp.maximum(-advantage * ratio, -advantage * clipped), advantage
 
 
 def clipped_objective(gain, frozen, states, times, advantages, mask, *, beta):
@@ -530,19 +538,19 @@ def test_flow_rollout_groups_rewards_selects_steps_and_preserves_likelihoods():
     assert np.isfinite(float(loss)) and np.isfinite(norm) and norm > 1e-5
 
 
-def recorded_density(batch, rate, velocity, noise, dtype):
+def recorded_density(batch, rate, velocity, noise, dtype, *, xp=np):
     """`sde_density` of each transition a rollout's batch records, from its own states and times, at the
     noise rate `rate(t)` of each time and the velocity `velocity(column, x, sigma)` at column `column`'s
-    state `x`, `sigma` its rates shaped against it, in NumPy at `dtype`."""
+    state `x`, `sigma` its rates shaped against it, in NumPy at `dtype`, or in `xp`."""
     columns = []
     for column in range(np.shape(batch["timesteps"])[1]):
-        x = np.asarray(batch["latents"][:, column], dtype)
+        x = xp.asarray(batch["latents"][:, column], dtype)
         shape = (-1,) + (1,) * (x.ndim - 1)
-        sigma, following = (rate(np.asarray(batch[name][:, column], dtype)).reshape(shape)
+        sigma, following = (rate(xp.asarray(batch[name][:, column], dtype)).reshape(shape)
                             for name in ("timesteps", "next_timesteps"))
         columns.append(sde_density(x, batch["next_latents"][:, column], sigma, following,
-                                   velocity(column, x, sigma), noise, dtype))
-    return np.stack(columns, 1)
+                                   velocity(column, x, sigma), noise, dtype, xp=xp))
+    return xp.stack(columns, 1)
 
 
 def assert_rescores_as_walked(objective, variables, rollout_of, density, label: str, seeds: int):
@@ -609,20 +617,13 @@ def inpainting_loss(gain, batch, dtype):
     gain = jnp.asarray(gain, dtype)
     spatial = {name: jnp.asarray(value, dtype) for name, value in batch["spatial"].items()}
     held = 0.3 * spatial["masked_image"] * (1 - spatial["mask"])
-    latents, following = (jnp.asarray(batch[name], dtype) for name in ("latents", "next_latents"))
-    sigma, after = (jnp.asarray(batch[name], dtype)[:, :, None, None, None]
-                    for name in ("timesteps", "next_timesteps"))
-    velocity = gain * latents + held[:, None] + 0.1 * sigma
-    g_squared = 0.7**2 * sigma / (1 - jnp.where(sigma == 1, after, sigma))
-    drift = velocity + g_squared / (2 * sigma) * (latents + (1 - sigma) * velocity)
-    mean, variance = latents + drift * (after - sigma), g_squared * (sigma - after)
-    density = -0.5 * (jnp.square(following - mean) / variance + jnp.log(2 * math.pi * variance))
-    current = density.sum((2, 3, 4))
-    values = math.prod(latents.shape[2:])
+    current = recorded_density(batch, lambda t: t, lambda column, x, sigma: gain * x + held + 0.1 * sigma,
+                               0.7, dtype, xp=jnp)
+    values = math.prod(np.shape(batch["latents"])[2:])
     ratio = jnp.exp((current - jnp.asarray(batch["old_log_probs"], dtype)) / values)
-    advantage = jnp.clip(jnp.asarray(batch["advantages"], dtype), -5, 5)
-    advantage = advantage[:, None] if advantage.ndim == 1 else advantage
-    surrogate = jnp.maximum(-advantage * ratio, -advantage * jnp.clip(ratio, 1 - 1e-4, 1 + 1e-4))
+    advantages = jnp.asarray(batch["advantages"], dtype)
+    surrogate, _ = clipped_surrogate(ratio, advantages[:, None] if advantages.ndim == 1 else advantages,
+                                     1e-4, 5)
     kept = jnp.asarray(batch["transition_mask"], dtype)
     return jnp.sum(kept * surrogate) / jnp.sum(kept)
 
@@ -702,9 +703,9 @@ def test_an_inpainting_rollout_rescores_with_its_masked_image_inputs():
                   batch=len(rows))
     final = trainer.fit(data, steps=1, log_every=1)
     assert int(final.updates) == 1
-    moved = (objective.model_variables(final.variables)["params"]["gain"]
-             - objective.model_variables(initial.variables)["params"]["gain"])
-    assert np.isfinite(float(moved)) and float(moved) != 0
+    step_size = (objective.model_variables(final.variables)["params"]["gain"]
+                 - objective.model_variables(initial.variables)["params"]["gain"])
+    assert np.isfinite(float(step_size)) and float(step_size) != 0
 
 
 def test_transition_matches_released_sampler_and_torch_distribution():

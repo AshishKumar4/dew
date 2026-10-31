@@ -20,6 +20,7 @@ from dew.cli.main import main
 from dew.config import ObjectiveConfig
 from dew.config.diffusion import DiffusionRunConfig, FlowRolloutConfig
 from dew.data import images as image_steps, presets
+from dew.data.dataset import DataPartition
 from dew.data.sources import source
 from dew.interop.pretrained import load_diffusion_source
 from dew.registry import ModelConfig
@@ -83,7 +84,8 @@ def test_dew_train_trains_an_inpainting_pipeline_through_its_masks(inpainting, o
                              val_metrics=(), **fields)
     built = run.build()
     assert built.inputs.mask is not None and built.inputs.mask.shape == (SIZE, SIZE, 1)
-    masks = np.asarray(next(iter(run.chain().read()))["mask"])
+    loader, _ = run.compiled(built.data(), run.chain(), None)
+    masks = np.asarray(next(iter(loader.train(DataPartition())))["mask"])
     assert masks.shape == (4, SIZE, SIZE, 1) and set(np.unique(masks)) <= {0.0, 1.0}
     assert len({mask.tobytes() for mask in masks}) > 1, "each image draws its own mask"
 
