@@ -22,8 +22,11 @@ from reference_error import FEWEST_SEEDS, as_given, assert_as_exact, with_gradie
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import counted_places
+from dew.nn.kernels import generation
+from dew.nn.kernels.generation import chosen
 from dew.nn.kv_cache import KVCache
 from dew.nn.local_attention import local_attention
+from dew.nn.precision import WIDE_CPU_ARITHMETIC
 
 SEEDS = {'window': 8, 'chunk': 8, 'packed': 8, 'given places': 8, 'gradients': 8, 'shared split': 8,
          'decode': 8, 'holey chunk': 8, 'diagnostic chunk': 8, 'holey window': 16, 'diagnostic window': 16,
@@ -234,6 +237,21 @@ def test_gradients_match_the_dense_masked_kernel(span, implementation):
     assert_as_exact(gradients(band),
                     gradients(masked(np.broadcast_to(keep, (2, length, length)))), draw,
                     f"{implementation} {span} gradients", seeds=SEEDS['gradients'])
+
+
+def test_a_chosen_reference_kernel_runs_a_window_band_on_the_reference_path(monkeypatch):
+    """Under `chosen(attention='reference')` a window's band, its sequence past twice the window, runs the
+    reference path the run names (bible §6), its mask's kernel the selector's alone (row 2664: the band's
+    mask named xla over the context's choice): every attention call it reports ran on the reference."""
+    # A library process's CPU arithmetic, where the xla kernel takes the band (the suite's wide arithmetic
+    # hands every xla call to the reference path, `_xla_kernel_widens_less`).
+    monkeypatch.delenv(WIDE_CPU_ARITHMETIC, raising=False)
+    query, key, value = (jax.random.normal(jax.random.key(seed), (1, 64, 2, 16), jnp.float32)
+                         for seed in range(3))
+    with chosen(attention="reference"), generation.routes() as found:
+        jax.jit(lambda q, k, v: local_attention(q, k, v, window=8)).trace(query, key, value)
+    ran = {route.ran for route in found if route.choice == "attention"}
+    assert ran == {"reference"}, ran
 
 
 def test_memory_grows_with_the_window_not_the_square_of_the_sequence():

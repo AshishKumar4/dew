@@ -86,32 +86,32 @@ def live_registers(family: "Family", carried, *phases) -> int:
 
 
 def operand_fragments(family: "Family", rows: int, depth: int, columns: int, lhs, rhs, *, lhs_parts: int = 1,
-                      rhs_parts: int = 1) -> list:
+                      rhs_parts: int = 1, rhs_transposed: bool = False) -> list:
     """The operand fragments a product `[rows, depth] @ [depth, columns]` holds at once where its family's
     products read registers (`Family.operands_in_registers`), none where they read shared memory: its left
-    operand a step deep, its right one a sub-step (`Family.fragment_depth`), each in the warps replicating it
-    (`lhs_copies`, `rhs_copies`), each in its dtype (`lhs`, `rhs`) and as many times as it has parts (an fp32
-    operand split into 16-bit parts): the GEMM's tiles' (`tile_registers`) and the recurrence's products'."""
+    operand a step deep, its right one's loaded depth (`Family.rhs_fragment_depth`), each in the warps
+    replicating it (`lhs_copies`, `rhs_copies`), each in its dtype (`lhs`, `rhs`), repeated for its parts
+    (an fp32 operand split into 16-bit parts): GEMM's tiles' (`tile_registers`) and recurrence's products'."""
     if not family.operands_in_registers:
         return []
     return ([(rows * family.lhs_copies, depth, lhs)] * lhs_parts
-            + [(family.fragment_depth(depth), columns * family.rhs_copies, rhs)] * rhs_parts)
+            + [(family.rhs_fragment_depth(depth, transposed=rhs_transposed),
+                columns * family.rhs_copies, rhs)] * rhs_parts)
 
 
 def tile_registers(family: "Family", consumers: int, block: tuple[int, int, int], dtype, *,
-                   stored=()) -> int:
+                   stored=(), rhs_transposed: bool = False) -> int:
     """The registers a consumer thread holds at a `(rows, columns, depth)` GEMM tile of `consumers` roles
     of `family` (`live_registers`): its share of the fp32 accumulator carried, and a step's operand
     fragments where its products read registers (`Family.operands_in_registers`; the right operand's in
     each of its replicating warps: `lhs_copies`, `rhs_copies`), the right one's a sub-step deep where
-    it loads it so (`Family.fragment_depth`), a transposed one's too: the input gradient needs no more
-    than the forward at any mma.sync tile measured (GEMMMODEL4/5: 104-120 against 112-128 at 64 x 128 x 32,
-    184-216 against 184-224 at 128 x 128 x 32). Where the family copies its outputs out through its
-    registers (`Family.stores_through_registers`), its epilogue holds one copy's rows (`copied_rows`) in the
-    widest of the `stored` dtypes beside the accumulator."""
+    it loads it so (`Family.rhs_fragment_depth`), or held whole when its transposed storage requires it.
+    Where the family copies its outputs out through its registers (`Family.stores_through_registers`),
+    its epilogue holds one copy's rows (`copied_rows`) in the widest `stored` dtype beside the accumulator."""
     rows, columns, depth = block
     share = rows // consumers
-    fragments = operand_fragments(family, share, depth, columns, dtype, dtype)
+    fragments = operand_fragments(family, share, depth, columns, dtype, dtype,
+                                 rhs_transposed=rhs_transposed)
     accumulator = (share, columns, jnp.float32)
     walk = live_registers(family, [accumulator], fragments)
     if not (family.stores_through_registers and stored):
