@@ -969,19 +969,20 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
         return self.full(shape, 0.0)
 
     def full(self, shape: tuple[int, ...], value: float, dtype=jnp.float32) -> jax.Array:
-        """`value` in `dtype` (fp32 unless given) in the accumulator's layout or a row's (`zeros`)."""
-        layout = self.layout if len(shape) == 2 else self.row
-        return plgpu.layout_cast(jnp.full(shape, value, dtype), layout)
+        """`value` in `dtype` (fp32 unless given), a splat whose layout inference takes from its uses (the
+        accumulator's or a row's)."""
+        return jnp.full(shape, value, dtype)
 
     def column_full(self, columns: int, value: float) -> jax.Array:
-        """`value` fp32 in a column's layout, `[columns]`: a tile's per-column state where its rows are its
-        keys (a keys-first walk's maxima and denominators)."""
-        return plgpu.layout_cast(jnp.full((columns,), value, jnp.float32), self.column)
+        """`value` fp32 `[columns]`: a tile's per-column state where its rows are its keys (a keys-first
+        walk's maxima and denominators), a splat inference lays out as its uses read it."""
+        return jnp.full((columns,), value, jnp.float32)
 
     def iota(self, shape: tuple[int, ...], dimension: int) -> jax.Array:
-        """Indices along `dimension` of a tile in the accumulator's layout or a row's (`zeros`)."""
-        layout = self.layout if len(shape) == 2 else self.row
-        return plgpu.broadcasted_iota(jnp.int32, shape, dimension, layout=layout)
+        """Indices along `dimension` of a tile or a row, laid out by inference from the values they meet. An
+        iota nothing reads fails inference (Mosaic's iota is not pure, so it survives the cast it would
+        have), so a template forms only the indices it reads."""
+        return plgpu.broadcasted_iota(jnp.int32, shape, dimension)
 
     def rows_of(self, ref) -> jax.Array:
         """A row vector read from `ref` (`[rows]`) in a row's layout."""

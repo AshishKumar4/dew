@@ -911,34 +911,69 @@ def test_a_plan_an_earlier_dew_saved_over_a_token_store_resumes_where_it_read_th
                 plan.check(earlier_plan(saved, plan))
 
 
-@pytest.mark.parametrize(("documents", "resumes"),
-                         [([[1, 2, 0], [3, 0]], True), ([[1, 0, 2], [3, 0]], False)],
-                         ids=["eos-closed", "eos-within"])
+def _bare(value, alike=lambda fingerprint: True):
+    """`value` with each token store's `documents` dropped where `alike` holds of its fingerprint."""
+    if isinstance(value, list):
+        return [_bare(part, alike) for part in value]
+    if not isinstance(value, dict):
+        return value
+    if value.get("store") == "tokens" and alike(value):
+        value = {name: part for name, part in value.items() if name != "documents"}
+    return {name: _bare(part, alike) for name, part in value.items()}
+
+
+@pytest.mark.parametrize(("stores", "form", "resumes"), [
+    ([([[1, 2, 0], [3, 0]], 0), ([[4, 5, 0], [6, 0]], 0)], "before", True),
+    ([([[1, 0, 2], [3, 0]], 0), ([[4, 5, 0], [6, 0]], 0)], "before", False),
+    ([([[1, 2, 3]], None), ([[4, 5, 6, 7]], None)], "before", True),
+    ([([[1, 0, 2], [3, 0]], 0), ([[4, 5, 0], [6, 0]], 0)], "named", True),
+], ids=["eos-closed", "eos-within", "one-record", "named-where-other"])
 def test_a_mix_an_earlier_dew_saved_over_token_stores_resumes_where_it_read_their_documents_alike(
-        tmp_path, documents, resumes):
-    """A mix a Dew before row 3028 saved keeps each member by a digest of the token stores it reads named
-    without `documents`: a member that read its stores' documents as today's reads them resumes as today's
-    names it (`earlier_plan`); one whose store it read otherwise, or whose sources changed, is refused."""
+        tmp_path, stores, form, resumes):
+    """A mix an earlier Dew saved keeps each member by a digest of what it reads: before row 3028 its token
+    stores named without `documents` and a store without an EOS stating no lengths; then for a while each
+    store named with `documents` only where that Dew had read others of it. A member that read its stores'
+    documents as today's reads them resumes as today's names it (`earlier_plan`); one whose store the
+    earlier Dew read otherwise, or whose sources changed, is refused."""
     from dew.data import Memory, mix
-    from dew.data.plan import fingerprint, without_documents
+    from dew.data.plan import fingerprint
     from dew.data.sinks import export
 
-    stated = {"token_store": True, "tokenizer": "byte", "vocab_size": 256, "dtype": "int32", "eos_id": 0}
     urls = []
-    for name, written in (("first", documents), ("second", [[4, 5, 0], [6, 0]])):
-        urls.append(str(tmp_path / name))
+    for index, (written, eos) in enumerate(stores):
+        stated = {"token_store": True, "tokenizer": "byte", "vocab_size": 256, "dtype": "int32",
+                  "eos_id": eos}
+        urls.append(str(tmp_path / f"store-{index}"))
         export(Memory([{"text": np.asarray(document, np.int32)} for document in written]), urls[-1],
                format="array_record", length_field="text", metadata=stated)
     plan = compile(mix([TokenFiles(url) for url in urls]).batch(1), read="streamed",
                    loading=Loading(workers=0)).plan
     assert set(plan.members) > {""}, "a streamed mix keeps its members by key"
     record_now = json.loads(json.dumps(plan.record()))
-    earlier = {**record_now, "manifest": without_documents(record_now["manifest"]),
-               "members": {key: digest for key, (digest, _) in plan.earlier_members.items()}}
+    within = {json.dumps(_bare(TokenFiles(url).fingerprint()), sort_keys=True)
+              for url, (written, eos) in zip(urls, stores, strict=True)
+              if eos is not None and any(eos in document[:-1] for document in written)}
+
+    def alike(store):
+        return json.dumps(_bare(store), sort_keys=True) not in within
+
+    def earlier_member(manifest):
+        if form == "named":
+            return _bare(manifest, alike)
+        bare = _bare(manifest)
+        unstated = {f"{index}/lengths" for index, source in enumerate(bare["sources"])
+                    if source["metadata"]["eos_id"] is None}
+        return {**bare, "derived": {name: value for name, value in bare["derived"].items()
+                                    if name not in unstated}}
+
+    members = {key: fingerprint(earlier_member(json.loads(json.dumps(manifest))) if key else manifest)
+               for key, (manifest, _) in plan.earlier_members.items()}
+    earlier = {**record_now, "members": members,
+               "manifest": _bare(record_now["manifest"], alike if form == "named" else lambda store: True)}
     assert earlier["members"] != record_now["members"]
     if resumes:
         assert plan.check(earlier_plan(earlier, plan)) == ()
-        changed = {**earlier, "members": {**earlier["members"], next(key for key in plan.members if key):
+        changed = {**earlier, "members": {**members, next(key for key in members if key):
                                           fingerprint({"another": "member"})}}
         with pytest.raises(ValueError):
             plan.check(earlier_plan(changed, plan))

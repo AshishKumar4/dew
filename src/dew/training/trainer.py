@@ -1082,10 +1082,12 @@ class Trainer(Generic[Loss, Effects]):
                                                   candidate.prepared.variables, mesh),
             self.objective, mesh, self._xla_defaults, self._narrow, None if self._base_rung is None
             else self._base_rung[1], resumed, ahead=self._ahead, capacity=capacity,
-            derive=None if recorded is not None else functools.partial(lower, lowering=False),
-            frontier=[] if frontier else None)
+            derive=None if recorded is not None else functools.partial(lower, lowering=False))
         planned, probes = search.admitted(
             candidates, candidates.index(first) if isinstance(first, int) and first in candidates else 0)
+        above = search.above(candidates, planned.split) if frontier else None
+        for probe in above or ():
+            _log.info("above the plan, fitting at fewer microbatches: %s", probe.named())
         # Consume the artifact only after its program was accepted; a refusal leaves it pending.
         self._ahead = search.ahead
         self.objective.substitute(list(planned.modules))
@@ -1102,7 +1104,7 @@ class Trainer(Generic[Loss, Effects]):
         flops, counted = plan_flops(recorded, planned.executable)
         if record_path is not None:
             keep_rung(record_path, key, {**chosen, 'flops': counted, 'launches': planned.candidate.launches})
-        self.plan = settled(planned, probes, search)
+        self.plan = settled(planned, probes, search, above)
         search.told(planned)
         if planned.split != candidates[0]:
             _log.info("the step fits the devices in the plan %s", self.plan)

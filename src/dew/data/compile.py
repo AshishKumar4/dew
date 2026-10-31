@@ -131,7 +131,7 @@ from dew.data.pipeline import (
     with_children,
     with_stores,
 )
-from dew.data.plan import Plan, StepIdentity, fingerprint, unplaced, without_documents
+from dew.data.plan import Plan, StepIdentity, fingerprint, unplaced
 from dew.data.readers import _CanonicalPass, _Host, _PerShare, _Statistics
 from dew.data.sources.base import (
     Read,
@@ -882,8 +882,7 @@ def _compiled(
         _derived(train, build),
         cache=_cache_references(original, read),
         members={key: fingerprint(manifest) for key, (manifest, _) in members.items()},
-        earlier_members={key: (fingerprint(without_documents(manifest)), stores)
-                         for key, (manifest, stores) in members.items()},
+        earlier_members=members,
         volatile=any(_volatile(stage) for stage in
                      (*_steps(original), *(stage for source in sources for stage in _written(source, ())))),
         stores=tuple(store for source in sources for store in _token_stores(source)),
