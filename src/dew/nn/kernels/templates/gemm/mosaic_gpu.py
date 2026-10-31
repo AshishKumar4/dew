@@ -54,6 +54,7 @@ from jax import lax, numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
+from dew.nn.kernels import tuning
 from dew.nn.kernels.templates import bundles, mosaic, mosaic_sm80, mosaic_sm90, resources, tail as tail_of
 from dew.nn.kernels.templates.gemm import cost, rows_padded
 
@@ -490,6 +491,8 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
     return outs if out_dtypes else outs[0]
 
 
+@tuning.lowered_once(('shape', 'tiles', 'transpose_rhs', 'dtypes', 'multiprocessors', 'interpret', 'hooks',
+                      'dense'))
 def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs: bool, dtypes: tuple,
                   multiprocessors: int, interpret, hooks: tuple, sides: tuple, dense: bool = False,
                   paired: jax.Array | None = None) -> tuple:
@@ -502,7 +505,8 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
     One multiprocessor a tile or, at `tiles.cluster` 2, a pair of them a cluster running two row tiles of
     one group, which load the group's matrix block once between them (`mosaic.Family.streams`' multicast);
     both run each pair's steps (or neither), its second's rows past the group stored nowhere. A `paired`
-    matrix streams beside the first, its blocks multiplied by the same rows' into a second accumulator."""
+    matrix streams beside the first, its blocks multiplied by the same rows' into a second accumulator.
+    Lowered once a configuration (`tuning.lowered_once`), however many layers call it."""
     family = family_of(tiles, lhs.dtype)
     prologue, prologue_axes, epilogue, epilogue_axes = hooks
     prologue_operands, epilogue_operands = sides
@@ -719,6 +723,8 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles
         prologue_axes=prologue_axes, exact_sums=exact_sums, tail=tail)
 
 
+@tuning.lowered_once(('shape', 'tiles', 'out_dtype', 'multiprocessors', 'interpret', 'prologue',
+                      'prologue_axes', 'exact_sums', 'tail'))
 def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles, out_dtype,
                       multiprocessors: int, interpret, prologue, prologue_operands: tuple,
                       prologue_axes: tuple, exact_sums: bool,
