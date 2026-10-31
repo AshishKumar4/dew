@@ -198,9 +198,9 @@ class Declared:
         each read one request, any other as `open` gives it."""
         return Pinned(self.store, self.stored, self.size) if self.stored is not None else self.open()
 
-    def held(self) -> Held:
-        """The declared bytes held open for reads of ranges of them (`Held`)."""
-        return Held(self)
+    def held(self) -> HeldFile:
+        """The declared bytes held open for reads of ranges of them (`HeldFile`)."""
+        return HeldFile(self)
 
     def still_held(self) -> None:
         """Refuse (`Replaced`) unless its store holds the object at the version it was published at,
@@ -233,7 +233,7 @@ class Declared:
         return held.name, held
 
 
-class Held:
+class HeldFile:
     """The declared bytes of one object held open for reads of ranges of them, each read as declared:
     - held to a version, each read one request held to it (`ranged`), and a Hub file at a commit each one
       request at it;

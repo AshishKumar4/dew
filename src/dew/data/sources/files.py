@@ -32,7 +32,7 @@ from s3fs import S3FileSystem
 from dew._records import integer, record, text
 from dew.batch import Batch
 from dew.data.dataset import Ranges, Records
-from dew.data.declared import Declared, Held, mirrored
+from dew.data.declared import Declared, HeldFile, mirrored
 from dew.data.pipeline import Dataset
 from dew.data.steps.generic import Fields
 from dew.data.storage import Readable, Store, commit_export, content_version, in_memory, local, on_gcs
@@ -1097,7 +1097,7 @@ class _IndexedLines:
                                  for url in self.indexes)
         self.tables = tuple(index.values for index in self.index_files)
         self.ranges = Ranges(tuple(len(index) for index in self.tables))
-        def held(url: str) -> Held:
+        def held(url: str) -> HeldFile:
             return source._declared_objects[url].held()
 
         # Each declared file checked once, as a read first asks for it, and read from what was checked
