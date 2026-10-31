@@ -1289,10 +1289,12 @@ def _states_held(call: _Call, values: _Operand, keys: _Operand, bv: int) -> _Hel
     carried = [_f32(call.width, bv)] + [_f32(CHUNK, 1)] * 5
     if call.gated_keys:
         # The write's gate on the keys' rows (`algebra.keys_gated_carried`): a key block in fp32 and narrowed
-        # for its product, beside the values' block as they are.
+        # for its product, beside the values' block as they are, and the product's own fp32 sum `[K_i, BV]`
+        # before it joins the decayed memory slice: without it the model held a 128-wide value block that
+        # spilled 520 bytes on an H100 (the resource gate's Nemotron-H 4B SSD forward alone).
         return _Held(carried=carried, phases=([
-            _f32(CHUNK, call.block), *_held(held, CHUNK, call.block), *_held(values, CHUNK, bv),
-            *_fragments(call, (held, CHUNK, call.block), (values, CHUNK, bv))],))
+            _f32(CHUNK, call.block), _f32(call.block, bv), *_held(held, CHUNK, call.block),
+            *_held(values, CHUNK, bv), *_fragments(call, (held, CHUNK, call.block), (values, CHUNK, bv))],))
     return _Held(carried=carried, phases=(
         [_f32(CHUNK, bv)] * 2 + _held(values, CHUNK, bv) + _held(held, call.block, bv)
         + _fragments(call, (held, CHUNK, call.block), (keys, CHUNK, call.block)),))
