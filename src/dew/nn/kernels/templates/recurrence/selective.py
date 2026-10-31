@@ -298,7 +298,11 @@ def selective_scan(x, dt, A, B, C, D, state=None, starts=None, *, family: mosaic
     """`dew.nn.mixers.mamba.selective_scan` on the template: `x`, `dt` `[B, S, D]` (after the softplus),
     `A` `[D, N]`, `B`, `C` `[B, S, N]`, `D` `[D]`, `state` `[B, D, N]` or None, `starts` `[B, S]` or None.
     Returns `(y [B, S, D], final state [B, D, N])` in `x`'s dtype. The sequence is padded to whole chunks
-    with a zero step, which neither decays nor writes."""
+    with a zero step, which neither decays nor writes. `chunk` divides the backward's block
+    (`block_positions`), which starts from a chunk's entering state the forward keeps."""
+    if block_scan.THREADS * POSITIONS_PER_THREAD % chunk:
+        raise ValueError(f"a chunk of {chunk} tokens divides no backward block of "
+                         f"{block_scan.THREADS * POSITIONS_PER_THREAD}: its blocks start at no kept state")
     rows, length, channels = x.shape
     states = A.shape[-1]
     padded = -(-length // chunk) * chunk
