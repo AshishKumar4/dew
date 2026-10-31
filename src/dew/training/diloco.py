@@ -17,10 +17,11 @@ whose windows commit with the others' but where a group's loss is not finite.
 """
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import functools
 import math
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -211,12 +212,15 @@ def rates_set(state: TrainState, setting: Callable[[optax.OptState], optax.OptSt
                                                                 opt_state=setting(state.inner.opt_state)))
 
 
-def group_of(state: TrainState, batch: Batch) -> tuple[TrainState, Batch]:
-    """The state and batch one group's step reads, its shapes: under DiLoCo its inner state, the first
-    group's clock as it is (every group's window holds as many microbatches), and its share of the
-    batch's rows; a run of one copy's as they are."""
+@contextlib.contextmanager
+def group_of(state: TrainState, batch: Batch) -> Iterator[tuple[TrainState, Batch]]:
+    """The state and batch one group's step reads, its shapes, and within the block its examples placed
+    among the whole step's as its step places them (`example_groups`, the first group's): under DiLoCo its
+    inner state, the first group's clock as it is (every group's window holds as many microbatches), and
+    its share of the batch's rows; a run of one copy's as they are."""
     if state.inner is None:
-        return state, batch
+        yield state, batch
+        return
     groups = jax.tree.leaves(state.inner.variables)[0].shape[0]
     view = dataclasses.replace(state, inner=None, **{field: jax.tree.map(
         lambda leaf: jax.ShapeDtypeStruct(leaf.shape[1:], leaf.dtype), getattr(state.inner, field))
@@ -225,7 +229,8 @@ def group_of(state: TrainState, batch: Batch) -> tuple[TrainState, Batch]:
         view = dataclasses.replace(view, microstep=state.inner.microstep[0])
     share = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(
         (jnp.shape(leaf)[0] // groups, *jnp.shape(leaf)[1:]) if jnp.ndim(leaf) else (), leaf.dtype), batch)
-    return view, share
+    with example_groups(groups, jnp.zeros((), jnp.int32)):
+        yield view, share
 
 
 def windowed(initialize: Callable, state: TrainState, batch,
@@ -239,8 +244,8 @@ def windowed(initialize: Callable, state: TrainState, batch,
     if state.inner is None:
         return initialize(state, batch, shape_only=place is None)
     groups = jax.tree.leaves(state.inner.variables)[0].shape[0]
-    view, share = group_of(state, batch)
-    held = initialize(view, share, shape_only=True)
+    with group_of(state, batch) as (view, share):
+        held = initialize(view, share, shape_only=True)
     if held.accumulation is view.accumulation:
         return state
     shapes = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct((groups, *leaf.shape), leaf.dtype),

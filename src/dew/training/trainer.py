@@ -1170,7 +1170,8 @@ class Trainer(Generic[Loss, Effects]):
         the copies the step builds, as it traces them over microbatches of `batch`'s shapes, none where
         `narrow` is off."""
         window = split * self.accumulation
-        shapes = None if self.step is not None else self._loss_shape(*group_of(state, batch), window, split)
+        with group_of(state, batch) as (view, rows):
+            shapes = None if self.step is not None else self._loss_shape(view, rows, window, split)
         if shapes is not None:
             self._refuse_unpipelined(schedule)
         prepared = windowed(lambda state, rows, *, shape_only: self._initialize_accumulation(
@@ -1816,9 +1817,8 @@ class Trainer(Generic[Loss, Effects]):
         evaluation_due = bool(due) or plan.falls(plan.eval_every, current, counts)
         # A run's last step, its budget's or the step after which its stream runs out, is scored and saved
         # once, by `_wind_down`, with every suite: never here before a rarer suite has. Only a step that
-        # evaluates or pauses could save first (a ranked save scores every suite), so only there is the
-        # stream read ahead (`FitRun.ends_here`): no other step's save waits on a batch a stream has yet to
-        # make.
+        # evaluates or pauses could save first (a ranked save scores every suite), so only there is the stream
+        # read ahead (`FitRun.ends_here`): no other step's save waits on a batch a stream has yet to make.
         ending = plan.finished(current, real) or (
             (evaluation_due or plan.paused(current, real, interval.consumed)) and run.ends_here(interval))
         paused = not ending and plan.paused(current, real, interval.consumed)
