@@ -276,8 +276,8 @@ class GpuTarget:
     `dew.nn.kernels.options.compiler_options`)."""
     triton_gemm_fusions: bool = True
     """Whether a training step keeps XLA's Triton GEMM fusions on this GPU (`dew.training.memory`): off
-    where a step measured cuBLAS's GEMMs faster with them off, an A100's (a2f56db61), an L4's
-    (7b6180b7b) and an H100's (bc24c332f), unless a module the step runs keeps them (`TritonGemm`)."""
+    where a step measured cuBLAS's GEMMs faster with them off, an A100's (26a01bc18), an L4's
+    (71966bcea) and an H100's (0fb7f065e), unless a module the step runs keeps them (`TritonGemm`)."""
 
     @property
     def architecture(self) -> Architecture:
@@ -405,7 +405,7 @@ class GpuTarget:
 # (locks/cuda12.txt, cuda13.txt), so it was not measured here; its Mosaic one's backward takes no mixed
 # dtypes. Requalifying that Triton backend as a comparator is ledger 153. No tokamax implementation is
 # a row's kernel; Dew calls its own through tokamax's Op. Decode (bf16, one query,
-# A100-SXM4-40GB, 2026-10-21, ced5d3ad9, synchronized ms by dew.telemetry.benchmark.samples): Qwen3-0.6B's
+# A100-SXM4-40GB, 2026-10-21, 79d8a3abf, synchronized ms by dew.telemetry.benchmark.samples): Qwen3-0.6B's
 # 16/8 heads of 128 at 1 to 128 rows over 2048 to 131072 keys, the decode kernel 1.57x faster than
 # cuDNN in geometric mean over the 28 shapes, faster in 21, at most 1.19x the fastest arm (cuDNN
 # 2.78 ms and the decode kernel 0.42 at one row of 131072 keys; cuDNN's 7 wins at 4, 16 and 128 rows
@@ -531,7 +531,7 @@ def gpu_mesh(mesh: Mesh, generation: str) -> AbstractMesh:
 # rejects the BF16_BF16_F32 dot algorithm at run time ("UNIMPLEMENTED:
 # Unsupported algorithm on the current device(s): ALG_DOT_BF16_BF16_F32"),
 # cuDNN's fused attention refuses bf16 ("SDPA FP16/BF16 requires SM80"), and
-# Triton does not compile; measured on a T4 (sm75), KernelMatrix 2026-09-22.
+# Triton does not compile; measured on a T4 (sm75), 2026-09-22.
 BF16_GPU = 80
 
 

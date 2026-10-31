@@ -110,6 +110,19 @@ class DataPartition:
         """
         return dataclasses.replace(_partition(mesh, batch_axes(mesh)), window=window)
 
+    def bounded(self, examples: int, records: int | None = None) -> int:
+        """This share's examples of the pool's first `examples`, where each share reads records of its own
+        dealt `index :: count` (`cut`) from a root of `records` a pass, each pass over its own: its records
+        in every whole pass the bound spans, and its records among those the last pass reaches. Where no
+        pass's count is known ahead (a step before the bound drops records), the examples themselves are
+        dealt so, every count-th from its index."""
+        if records is None:
+            return len(range(self.index, examples, self.count))
+        if not records:
+            return 0
+        passes, rest = divmod(examples, records)
+        return passes * len(range(self.index, records, self.count)) + len(range(self.index, rest, self.count))
+
     def held(self, rows: int, offset: int = 0) -> tuple[slice, bool]:
         """Which of `rows` rows a validation read of this share holds, and whether they are real:
         every count-th from its index, `offset` places on as a resume's count inside a batch leaves
@@ -286,8 +299,12 @@ GRAIN_KILL_SECONDS = 25
 no setting or reading of: 25 s in grain 0.2.18 (process_prefetch.py), the release tested."""
 
 
-WORKER_BUFFER = 2
-"""The batches each worker process reads ahead where none is asked for (`Loading`, `Pipeline.workers`)."""
+WORKER_BUFFER = 1
+"""The batches each worker process reads ahead where none is asked for (`Loading`, `Pipeline.workers`):
+Grain's own (`per_worker_buffer_size`). Two read no faster on a CPU and hold a second batch in each worker
+(row 2508: two workers over a record step of a few milliseconds, eight draws each, two against one at
+1.03 times the samples a second, 0.66 to 1.35, with the consumer waiting on none; 0.98 times with it
+taking 5 ms a batch; 1.00 times at 20 ms)."""
 
 
 WORKER_PROCESS_BYTES = 219 * 2**20
@@ -765,21 +782,19 @@ class Loader:
         (`examples`), with every row the objective makes of each, its last batch short where they end
         inside one, in whole updates of `window` steps, where a global order's plan counts them ahead
         (`order_records`); None for one read in its own order, as a pack that runs as rows arrive makes,
-        or one an objective expands after the bound, which no pass reads ahead to count: its run keeps its
-        progress in the examples its batches consume (`dew.batch.EXAMPLES_CONSUMED`). Refused where the
-        read is bounded to another count; in a pool, whose processes each read records of their own, so
-        neither the bound's first examples nor the step the shares end at are one the pool agrees on yet;
-        and where the last steps would make no whole update, so some examples would train nothing."""
+        or one an objective expands after the bound, which no pass reads ahead to count, such as a pool's
+        read whose shares each read records of their own and so end steps apart: its run keeps its
+        progress in the examples its batches consume (`dew.batch.EXAMPLES_CONSUMED`), a pool's every share
+        reading on until each has run out (`dew.training._fit.pooled_read`). A pool's read in one global
+        order plans as one process's does, every share ending at its steps, a share the order's last batch
+        ends before stepping batches of no real row (`dew.data.lowering._evened`). Refused where the read is
+        bounded to another count, and where the last steps would make no whole update, so some examples
+        would train nothing."""
         if self.examples != examples:
             held = "not bounded" if self.examples is None else f"bounded to {self.examples}"
             raise ValueError(f"examples={examples} reads a training chain bounded to that many records "
                              f"before packing, and this loader's is {held}; give fit the Dataset chain, "
                              "which it bounds and compiles")
-        if jax.process_count() > 1:
-            raise ValueError("a run bounded in examples trains on one process: a pool's processes each read "
-                             "records of their own, so the bound's first examples and the step their shares "
-                             "end at are not yet one the pool agrees on; count the run in steps or tokens, "
-                             "or train it on one process")
         if self.order_records is None:
             return None
         steps = self._steps(self.order_records, window)
@@ -1045,15 +1060,17 @@ class FilledBatch(pygrain.MapTransform):
     """A batch of fewer than `rows` records filled out with repeats of its
     own rows (`dew.batch.padded_rows`), and `VALID_ROWS` marking the real ones: those of
     its own a batch that marks them already marks real. Without `real` every
-    row is a repeat."""
+    row is a repeat. A whole batch is as it was, or where `marked`, marks its
+    rows too, so every batch of a read holds one tree whether or not it is
+    filled (`dew.data.lowering._evened`)."""
 
-    def __init__(self, rows: int, *, real: bool = True):
-        self._rows, self._real = rows, real
+    def __init__(self, rows: int, *, real: bool = True, marked: bool = False):
+        self._rows, self._real, self._marked = rows, real, marked
 
     def map(self, element: Batch) -> Batch:
         held = rows_of(element)
         if held == self._rows and self._real:
-            return element
+            return {VALID_ROWS: np.ones(held, bool), **element} if self._marked else element
         indices, repeats = padded_rows(held, self._rows)
         valid = ~repeats & self._real
         if VALID_ROWS in element:
@@ -1498,6 +1515,8 @@ class PhasedStream:
                 order=self._stream(phase).order,
                 completed=completed,
                 plan={"phases": plans} if any(plan is not None for plan in plans) else None,
+                tokens=() if self._tokens is None else tuple(int(end) for end in self._tokens[:phase]
+                                                             if end is not None),
             )
         )
 
@@ -1509,6 +1528,13 @@ class PhasedStream:
             if len(saved.completed) > len(self._ends):
                 raise ValueError(f"the saved run finished {len(saved.completed)} phases, and this run has "
                                  f"{len(self._ends) + 1}")
+            finished = self._tokens[:len(saved.completed)]
+            if saved.tokens != finished:
+                # Its records end where the saved run's commits reached the phases' tokens, which a phase
+                # ending at other tokens would read on from as though the run had reached them.
+                raise ValueError(f"the saved run finished its phases at {list(saved.tokens)} committed "
+                                 f"tokens, and this run's end at {list(finished)}; a phase the run has read "
+                                 "cannot change under it")
             # The ends the saved run reached, and none past them, which this run reaches as it reads.
             for index in range(len(self._ends)):
                 self._resolve(index, saved.completed[index][1] if index < len(saved.completed) else None)

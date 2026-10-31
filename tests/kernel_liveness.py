@@ -16,7 +16,7 @@ import re
 from jax._src.interpreters import mlir as jax_mlir
 from jax.extend.mlir import ir
 from jaxlib.mlir import passmanager
-from jaxlib.mlir.dialects import gpu, llvm
+from jaxlib.mlir.dialects import gpu, llvm, nvvm
 from jaxlib.mosaic.python import mosaic_gpu as mosaic_gpu_dialect
 
 from dew.nn.kernels.generation import GpuTarget
@@ -28,6 +28,10 @@ class Compiler:
     """The assembler whose scheduling the estimate describes: CUDA 13 streams transcendental chains
     that CUDA 12 keeps as vectors."""
     version: tuple[int, int]
+
+    @property
+    def streams_transcendentals(self) -> bool:
+        return self.version >= (13, 0)
 
 
 FREE = {"arith.constant", "llvm.mlir.constant", "llvm.mlir.undef", "llvm.mlir.poison", "llvm.mlir.zero",
@@ -234,40 +238,82 @@ def divergent_values(module) -> set:
     scalar in the uniform register file (sm90's 63 a warp, `UR`), apart from the registers a thread counts."""
     divergent = set()
 
-    def visit(op) -> bool:
-        changed = False
-        name = op.name.removeprefix(PREFIX)
-        tainted = DIVERGENT.match(name) or any(o in divergent for o in op.operands)
-        if tainted:
-            for value in op.results:
-                if value not in divergent:
-                    divergent.add(value)
-                    changed = True
-        for nested_region in op.regions:
-            for block in nested_region.blocks:
-                # A region's carried arguments are divergent where the values carried into them are.
-                if tainted:
-                    for argument in block.arguments:
-                        if argument not in divergent:
-                            divergent.add(argument)
-                            changed = True
-                for inner in block.operations:
-                    inner = inner.operation
-                    if inner.name.removeprefix(PREFIX) in ("scf.yield", "scf.condition") and any(
-                            o in divergent for o in inner.operands):
-                        for value in (*op.results, *block.arguments):
-                            if value not in divergent:
-                                divergent.add(value)
-                                changed = True
-                    changed |= visit(inner)
-        return changed
+    def mark(values, sources=(), *, forced=False):
+        if forced or any(source in divergent for source in sources):
+            divergent.update(values)
 
-    changed = True
-    while changed:
-        changed = False
+    def visit(op):
+        name = op.name.removeprefix(PREFIX)
+        blocks = [block for region in op.regions for block in region.blocks]
+        if isinstance(op.opview, gpu.LaunchOp):
+            # Cluster IDs (where present) and block IDs are warp-uniform; thread IDs follow them.
+            first = 6 if op.opview.clusterSizeX is not None else 3
+            mark(blocks[0].arguments[first:first + 3], forced=True)
+        elif name == 'scf.for':
+            body, = blocks
+            trip = tuple(op.operands[:3])
+            mark(body.arguments[:1], trip)
+            for argument, initial in zip(body.arguments[1:], op.operands[3:], strict=True):
+                mark((argument,), (initial, *trip))
+            for inner in body.operations:
+                if inner.operation.name.removeprefix(PREFIX) == 'scf.yield':
+                    for argument, carried, value in zip(body.arguments[1:], op.results,
+                                                        inner.operation.operands, strict=True):
+                        mark((argument, carried), (value, *trip))
+        elif name == 'scf.while':
+            before, after = blocks
+            _while_divergence(op, before, after, mark)
+        elif blocks:
+            for block in blocks:
+                mark(block.arguments, op.operands)
+                for inner in block.operations:
+                    if inner.operation.name.removeprefix(PREFIX) == 'scf.yield':
+                        for returned, value in zip(op.results, inner.operation.operands, strict=True):
+                            mark((returned,), (value, *op.operands))
+        elif _warp_broadcast(op, name):
+            pass
+        elif name == 'llvm.inline_asm' and _assembly(op) == 'mov.b64 $0, $1;':
+            mark(op.results, op.operands)
+        else:
+            mark(op.results, op.operands, forced=bool(DIVERGENT.match(name)))
+        for block in blocks:
+            for inner in block.operations:
+                visit(inner.operation)
+
+    previous = -1
+    while previous != len(divergent):
+        previous = len(divergent)
         for op in module.body.operations:
-            changed |= visit(op.operation)
+            visit(op.operation)
     return divergent
+
+
+def _while_divergence(op, before, after, mark) -> None:
+    for argument, initial in zip(before.arguments, op.operands, strict=True):
+        mark((argument,), (initial,))
+    for inner in before.operations:
+        if inner.operation.name.removeprefix(PREFIX) == 'scf.condition':
+            condition, *values = inner.operation.operands
+            mark((*before.arguments, *after.arguments, *op.results), (condition,))
+            for argument, carried, value in zip(after.arguments, op.results, values, strict=True):
+                mark((argument, carried), (value,))
+    for inner in after.operations:
+        if inner.operation.name.removeprefix(PREFIX) == 'scf.yield':
+            for argument, value in zip(before.arguments, inner.operation.operands, strict=True):
+                mark((argument,), (value,))
+
+
+def _assembly(op) -> str:
+    return ir.StringAttr(op.attributes['asm_string']).value
+
+
+def _warp_broadcast(op, name: str) -> bool:
+    if name != 'nvvm.shfl.sync':
+        return False
+    indexed = ir.AttrBuilder.get('nvvm.ShflKindAttr')(nvvm.ShflKind.idx, context=op.context)
+    lane = _constant(op.operands[2])
+    return (op.attributes['kind'] == indexed and _constant(op.operands[0]) == -1
+            and lane is not None and 0 <= lane < 32 and _constant(op.operands[3]) == 31)
 
 
 def _general_register(value) -> bool:
@@ -282,6 +328,16 @@ def _general_register(value) -> bool:
         if name in ("llvm.load", "llvm.store", "nvvm.cp.async.shared.global"):
             return True
         if name == "llvm.inline_asm" and "constraints" in op.attributes:
+            assembly = _assembly(op)
+            # Hopper's descriptors, TMA coordinates and barriers accept uniform registers in SASS,
+            # despite PTX's l/r constraints. Unknown assembly retains the conservative GPR rule.
+            if assembly == 'mov.b64 $0, $1;':
+                if any(_general_register(moved) for moved in op.results):
+                    return True
+                continue
+            if any(instruction in assembly
+                   for instruction in ('wgmma.', 'mbarrier.', 'cp.async.bulk.tensor.')):
+                continue
             constraints = [c.strip() for c in ir.StringAttr(op.attributes["constraints"]).value.split(",")
                            if c.strip() and not c.startswith(("=", "~"))]
             if (len(constraints) == len(op.operands)
@@ -289,6 +345,41 @@ def _general_register(value) -> bool:
                             for operand, constraint in zip(op.operands, constraints, strict=True))):
                 return True
     return False
+
+
+def _elementwise(op, name: str) -> bool:
+    if not ELEMENTWISE.match(name) or len(op.results) != 1:
+        return False
+    if name != 'llvm.inline_asm':
+        return True
+    type_ = op.results[0].type
+    if isinstance(type_, ir.VectorType):
+        type_ = ir.VectorType(type_).element_type
+    return (isinstance(type_, ir.FloatType) and ir.FloatType(type_).width in (16, 32)
+            and _tied(op) is None and 'has_side_effects' not in op.attributes)
+
+
+def _streams_into(value, parent, seen=None) -> bool:
+    """Follow register views to their consumers: a grouped barrier or MMA materializes its whole input.
+    A narrowing conversion is not a view of its FP32 dependencies when both representations stay live."""
+    seen = set() if seen is None else seen
+    if value in seen:
+        return True
+    seen.add(value)
+    views = ('builtin.unrealized_conversion_cast', 'vector.bitcast', 'llvm.bitcast', 'arith.bitcast',
+             'vector.extract', 'vector.extractelement', 'llvm.extractvalue', 'llvm.extractelement',
+             'vector.extract_strided_slice')
+    for use in value.uses:
+        user = use.owner.operation
+        name = user.name.removeprefix(PREFIX)
+        if not _within(user, parent):
+            return False
+        if name in views:
+            if not all(_streams_into(viewed, parent, seen) for viewed in user.results):
+                return False
+        elif not (_elementwise(user, name) or STREAMS_INTO.match(name)):
+            return False
+    return True
 
 
 class _Pass:
@@ -301,27 +392,14 @@ class _Pass:
         self.mma_words = 0
 
     def _streamed(self, op, name: str) -> bool:
-        if not ELEMENTWISE.match(name) or len(op.results) != 1:
+        if not _elementwise(op, name):
             return False
-        if name == "llvm.inline_asm" and (_tied(op) is not None or "has_side_effects" in op.attributes
-                                          or not re.fullmatch(r"(vector<\d+x)?f(16|32)>?|bf16",
-                                                              str(op.results[0].type))):
-            # Only a pure one-result float assembly is an elementwise math op (ex2.approx, rcp.approx).
-            return False
-        if self.compiler is not None and self.compiler.version < (13, 0):
+        if self.compiler is not None and not self.compiler.streams_transcendentals:
             assembly = (ir.StringAttr(op.attributes["asm_string"]).value
                         if "asm_string" in op.attributes else "")
             if name.startswith(("math.exp", "math.tanh")) or re.search(r"\b(ex2|tanh)\.", assembly):
                 return False
-        parent = op.parent
-        for use in op.results[0].uses:
-            user = use.owner.operation
-            user_name = user.name.removeprefix(PREFIX)
-            if not _within(user, parent) or not (ELEMENTWISE.match(user_name) or STREAMS_INTO.match(user_name)
-                                                 or user_name in ("builtin.unrealized_conversion_cast",
-                                                                  "vector.bitcast", "llvm.bitcast")):
-                return False
-        return True
+        return _streams_into(op.results[0], op.parent)
 
     def _accumulated(self, op) -> list | None:
         """An mma.sync's D registers where its C input dies at it (C2: ptxas writes D over C, `HMMA R88, ...,
@@ -671,3 +749,4 @@ def lowered_registers(module: bytes, compiler: Compiler) -> list[LoweredRegister
         found.append(LoweredRegisters(name, peak.total, peak.fragments, peak.scalars, peak.threads,
                                        peak.producer, peak.raised, peak.where))
     return found
+

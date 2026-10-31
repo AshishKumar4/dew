@@ -259,7 +259,7 @@ class CausalTransformer(nn.Module):
     """Whether the first block norms its attention input. ModernBERT's first
     block reads the embedding norm's output as it is (modeling_modernbert.py,
     ModernBertEncoderLayer: attn_norm is Identity at layer 0)."""
-    scale_offset: bool = False       # RMSNorm weight is (1 + w), as Gemma stores it
+    scale_offset: bool = False       # a norm's weight is (1 + w): Gemma's RMSNorm, GPT-3's LayerNorm
     scale_after_cast: bool = False   # apply the weight after casting, as Llama and Qwen3 do
     sandwich_norms: bool = False     # add a norm after each sublayer, as Gemma does
     pre_norms: bool = True           # norm each sublayer's input; False + sandwich is OLMo 3
@@ -676,8 +676,9 @@ class CausalTransformer(nn.Module):
             "kv_shared": kv_shared, "kv_store_key": layer_type,
             "partial_rotary_factor": kind.partial_rotary_factor, "attention_sinks": kind.sinks,
             "qk_norm": kind.qk_norm, "init_std": self.init_stds[0], "output_init_std": self.init_stds[1],
-            "precision": self.precision, "dex": dex, "dex_start": dex_start, "value_experts": None
-            if not routed or self.value_experts is None else self.value_experts.under(self.mixture)}
+            "precision": self.precision, "dex": dex, "dex_start": dex_start,
+            "value_experts": self.value_experts if routed else None,
+            "mixture": self.mixture if routed else None}
         return MixerContext(**resolved, **{field.name: getattr(self, field.name)
                                            for field in dataclasses.fields(MixerContext)
                                            if field.name not in resolved})
@@ -1015,7 +1016,8 @@ class CausalTransformer(nn.Module):
             engram=None if spec.engram is None or self.engram is None else functools.partial(
                 EngramLayer if self.engram.ple_conv_kernel_size is None else functools.partial(
                     PLELayer, kernel_size=self.engram.ple_conv_kernel_size,
-                    dilation=self.engram.max_ngram_size, parts=self.engram.table_parts),
+                    dilation=self.engram.max_ngram_size, parts=self.engram.table_parts,
+                    use_bias=self.engram.ple_bias),
                 rows=self.engram.num_embeddings[spec.engram], head_dim=self.engram.head_dim,
                 hc_mult=self.hyper_connections.hc_mult if self.hyper_connections else 1,
                 emb_features=self.emb_features, norm_eps=self.norm_eps,

@@ -18,7 +18,7 @@ Design record, 2026-09-03. The code blocks are design sketches, not runnable cod
 | 8 | Diffusion vocabulary stays (`NoiseScheduler`, `PredictionTransform`, the sampler names). Ownership moves into one `Process` value per convention; presets are dataclasses in a registry. | 3.5 |
 | 9 | Discrete diffusion gets its own small algebra in `dew.diffusion.discrete`, shaped like the Gaussian one. It is not a special case of it. | 6.1 |
 | 10 | The objective's loss returns an `Aux` that can carry updated non-parameter collections. That is the one channel for MoE balancing, batch statistics and sown values. | 3.3, 6.2 |
-| 11 | A custom compiled step is the one escape hatch (`Trainer(step=...)`). There is no second trainer. | 6.5 |
+| 11 | A custom compiled step is the one escape hatch (`Trainer(step=...)`). There is no second trainer. A custom step over a model that reads the run's progress passes it and says so (`PassesProgress`). | 6.5 |
 | 12 | Sharding is declared on the module that owns the parameters, with a decorator, and merged into a `Layout`. The table in `training/distributed.py` moves out of the training package. | 3.8 |
 
 ## 1. What is wrong today
@@ -27,7 +27,7 @@ The review found the mechanics sound and the ownership wrong. The compiled step 
 
 The seams named in `CONTRIBUTING.md:9` are crossed in these places, all confirmed by running the import graph:
 
-| Seam | Evidence at `102baa4` |
+| Seam | Evidence at `803fb26` |
 | --- | --- |
 | The trainer knows diffusion | `ObjectiveTrainer.__init__` takes `input_config: DiffusionInputConfig`, `noise_schedule`, `model_output_transform`, `autoencoder`, `unconditional_prob`, `native_resolution`, `loss_fn`, `name="GeneralDiffusion"`, and builds a `DiffusionObjective` when given none (`objective_trainer.py:70-146`). `import dew.training` loads `dew.diffusion`, `dew.inputs`, `dew.nn.autoencoders` and `dew.sampling`. |
 | Other objectives pay for that | JEPA constructs a `DiffusionInputConfig(conditions=[])` to hand the trainer shapes (`examples/train_jepa.py:59-60`). The LM example passes `input_config=None` and the model twice (`examples/train_lm.py:57-62`). `ObjectiveTrainer(model=None, objective=...)` fails at `model.apply` (`objective_trainer.py:204`). |
@@ -82,7 +82,7 @@ class SimpleDiT(nn.Module):
     scan_order: Literal["raster", "hilbert", "zigzag"] = "raster"   # replaces use_hilbert, use_zigzag and "+hilbert"
 ```
 
-`build` validates against `dataclasses.fields`, which the fix in `8b34869` already does for `build_model`. `canonicalize_architecture` and `ARCHITECTURE_SUFFIX_FLAGS` (`registry.py:43-86`) go; `SimpleDiT.scan_order` is already a property (`nn/backbones/dit.py:33-37`) and becomes the field.
+`build` validates against `dataclasses.fields`, which the fix in `7adad81` already does for `build_model`. `canonicalize_architecture` and `ARCHITECTURE_SUFFIX_FLAGS` (`registry.py:43-86`) go; `SimpleDiT.scan_order` is already a property (`nn/backbones/dit.py:33-37`) and becomes the field.
 
 ### 3.2 Values that cross `jit`
 
@@ -154,7 +154,7 @@ state = trainer.fit(data, steps=100_000, log_every=100, eval_every=2_000,
                     checkpoint_every=5_000, metrics=(metrics["fid"](), metrics["clip_score"]()))
 ```
 
-The trainer keeps what `CONTRIBUTING.md:9` gives it: mesh, compiled step, EMA, checkpoints, logging. The compiled step is `objective_trainer.py:237-299` with `Step` in place of positional `ema_params` and `rng`, plus the `Aux.variables` write-back. `fit` is step-based; `steps = data.epoch_steps(epochs)` is a recipe's line, counting the step an epoch's short last batch takes where its order reads on (`Loader.tail`). Publishing becomes `dew.io.publish(checkpoints.latest(), ...)`, called by a recipe after `fit`. Validation exceptions propagate (fixed in `6b747dc`).
+The trainer keeps what `CONTRIBUTING.md:9` gives it: mesh, compiled step, EMA, checkpoints, logging. The compiled step is `objective_trainer.py:237-299` with `Step` in place of positional `ema_params` and `rng`, plus the `Aux.variables` write-back. `fit` is step-based; `steps = data.epoch_steps(epochs)` is a recipe's line, counting the step an epoch's short last batch takes where its order reads on (`Loader.tail`). Publishing becomes `dew.io.publish(checkpoints.latest(), ...)`, called by a recipe after `fit`. Validation exceptions propagate (fixed in `eadef45`).
 
 ```python
 class Tracker(Protocol):
@@ -199,7 +199,7 @@ class EDM:
 process = presets.EDM(sigma_data=0.5, regime="pixel")()
 ```
 
-`get_diffusion_preset` and its 3-tuple go. min-SNR no longer needs the schedule to hold the transform (`schedules/common.py:28-31, 55-58`). The preset dataclass is what the run manifest stores and the pipeline rebuilds, which is what the bug fixed in `a65d447` needed.
+`get_diffusion_preset` and its 3-tuple go. min-SNR no longer needs the schedule to hold the transform (`schedules/common.py:28-31, 55-58`). The preset dataclass is what the run manifest stores and the pipeline rebuilds, which is what the bug fixed in `3003734` needed.
 
 ```python
 class Solver(Protocol):
@@ -210,7 +210,7 @@ class Solver(Protocol):
 samples = sample(denoise, x_T, steps, solver=samplers.Heun(), guidance=CFG(4.0, interval=(0.4, 0.6)), key=key)
 ```
 
-`sample` is one `lax.scan`. `denoise` is `process.denoiser(model, params, conditions)`; `CFG` wraps a denoiser. No tqdm, no default seed, no `self.history`, no ignored arguments in subclass signatures. A solver states which schedules it integrates (`e25bba9` added that guard to the two sigma integrators). As built, `step` takes the denoiser as its last argument, which the first draft of this signature left out: Heun's corrector and RK4's stages evaluate the model again inside one step, and the one-evaluation solvers ignore it. `init` takes the concrete time grid and process beside x_T: the Diffusers-parity solvers whose order depends on where a step is in the walk (the singlestep DPM-Solver's order list, the multistep ones' final-step lowering, UniPC's remaining-step cap, consistency sampling's noiseless last step) read its length there, and a one-step solver ignores it.
+`sample` is one `lax.scan`. `denoise` is `process.denoiser(model, params, conditions)`; `CFG` wraps a denoiser. No tqdm, no default seed, no `self.history`, no ignored arguments in subclass signatures. A solver states which schedules it integrates (`a91a324` added that guard to the two sigma integrators). As built, `step` takes the denoiser as its last argument, which the first draft of this signature left out: Heun's corrector and RK4's stages evaluate the model again inside one step, and the one-evaluation solvers ignore it. `init` takes the concrete time grid and process beside x_T: the Diffusers-parity solvers whose order depends on where a step is in the walk (the singlestep DPM-Solver's order list, the multistep ones' final-step lowering, UniPC's remaining-step cap, consistency sampling's noiseless last step) read its length there, and a one-step solver ignores it.
 
 ### 3.6 Inputs and conditioning
 
@@ -249,7 +249,7 @@ data = compile(train.shuffle(0).repeat().pipe(presets.images, 128, batch=32, aug
                validation=val.pipe(presets.images, 128, batch=32), read="memory", provision=True)
 ```
 
-The chain replaces `datasetMap`, `onlineDatasetMap` and `mediaDatasetMap`: a store and the presets and steps it is piped through ([the data design](data.md)). The per-process batch size is computed in one place that raises on `batch % processes` (done in `f3ea98b`). A stream without `get_state` trains, and its resume is refused unless it declares replay (`replayed`, `from_iter(replay=True)`).
+The chain replaces `datasetMap`, `onlineDatasetMap` and `mediaDatasetMap`: a store and the presets and steps it is piped through ([the data design](data.md)). The per-process batch size is computed in one place that raises on `batch % processes` (done in `990cd36`). A stream without `get_state` trains, and its resume is refused unless it declares replay (`replayed`, `from_iter(replay=True)`).
 
 ### 3.8 Distributed
 
@@ -305,9 +305,22 @@ with or without `text_only`. A run passes both through `--source.text-only` and
 `--source.prediction-depths` (`RunConfig.source`), whatever kind of run it is, the load's
 `modeling_overrides` through `--source.attention`, each layer kind causal or block_bidirectional,
 and its differential extension through `--source.dex`, the `DifferentialExtension`'s record as JSON
-(`dew.nn.dex`); a diffusion pipeline, which no override reaches, refuses them. `dew.pipeline` takes
+(`dew.nn.dex`), and `scan_layers` through `--source.scan-layers`, which scans a decoder's runs of
+like layers, its periodic pattern among them, its stored tree unchanged, and refuses a model with no
+layers to scan (`Pretrained.load`); a diffusion pipeline, which no override reaches, refuses them. `dew.pipeline` takes
 the same choices for a source as `options=SourceOptions(...)`, and refuses them for a run directory,
 whose record holds its own.
+
+A run starts from a saved Dew run as from any source: `--pretrained <run directory>` names it, and
+`--source.step` (a step, `latest`, `best` or `best:<metric>`) and `--source.ema` select its
+checkpoint, which the run's record pins to the step it read (`RunConfig.with_pinned_run`).
+`dew.interop.saved_sources.pinned_run` resolves the directory for every loader. A language model or
+decision run reads the release `dew export` writes of that checkpoint, cached under Dew's cache by
+the run, its step and Dew's code (`released_run`), so every load option applies to it as to any
+release: `Pretrained.load(run_dir, step=..., ema=...)` is the Python form. A diffusion run, which Dew
+writes no diffusers layout of, starts from the run's own sampling task (`load_diffusion_source`,
+`TextToImage.from_saved`) at the run's dtypes, placement, attention kernel and data size. A step or
+EMA choice beside a source that is no saved run is refused, as it selects nothing.
 
 Serving is one engine of kinds (`dew.inference.Engine`). A kind (`Kind`) admits waiting requests
 within its own bounds, runs them with one bounded device call a `step`, and settles each request's
@@ -404,7 +417,7 @@ The mixer keeps its recurrent state in the `cache` collection, exactly as the KV
 
 | Need | Boundary |
 | --- | --- |
-| Alternating or multi-optimizer updates (GAN, actor-critic) | Not one `loss`. `Trainer(step=make_my_step)` replaces the compiled step and is the one documented place for a custom step. |
+| Alternating or multi-optimizer updates (GAN, actor-critic) | Not one `loss`. `Trainer(step=make_my_step)` replaces the compiled step and is the one documented place for a custom step. A step over a model that reads the run's progress (`dew.nn.progress.ReadsProgress`, a DEX decoder) passes it `Progress(state.updates)` and its factory is wrapped, `Trainer(step=PassesProgress(make_my_step))`; the trainer refuses that model under any other custom step, which would train it at the run's end. |
 | Tensor or sequence parallel | `MeshSpec(tensor=N)` and rules are cheap; correct TP needs `with_sharding_constraint` on activations inside each model. Per-architecture work. |
 | Pipeline parallel | `MeshSpec(stage=N)` runs GPipe over a stack of like layers (a decoder's, a DiT's, a JEPA's, a UNet level's transformers; `decoder_stack.run_pipeline`); everything outside the stacks runs on every stage, and no 1F1B schedule is built. |
 | Non-grain data | `Dataset.train` is any callable returning an iterator; without `get_state` the run cannot checkpoint its position and `fit` says so. |

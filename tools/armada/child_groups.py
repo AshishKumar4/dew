@@ -10,7 +10,7 @@ A group outlives no owner: each has a lifeline (`lifeline`), this module run in 
 holds the read end of a pipe whose write end only the owner holds and kills the group once that pipe closes,
 as it does when the owner dies however it dies (a SIGKILL, a SIGTERM that unwinds no `with`) or stops the
 group (`stop`). A group that ends on its own ends its lifeline, which then kills nothing: its id is free for
-another process. The group stays in a session of its own, so a rank's cleanup signals its own (Main,
+another process. The group stays in a session of its own, so a rank's cleanup signals its own (the maintainer,
 2026-10-28: a worker outlived its killed owner 43 hours at 195% CPU on the VM).
 """
 

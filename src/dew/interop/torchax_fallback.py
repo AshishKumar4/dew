@@ -28,14 +28,13 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import copy
-import fnmatch
 import functools
 import importlib.metadata
 import json
 import math
 import warnings
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from types import FunctionType
 from typing import TYPE_CHECKING, Self
@@ -54,8 +53,9 @@ from dew.interop import sources, verify
 from dew.interop.decoder_parts import context_lengths
 from dew.interop.generation_config import read_generation_config
 from dew.interop.pickles import host_dtype, host_view
-from dew.interop.pretrained import PretrainedFallback, source_processor
-from dew.interop.weights import AUTO
+from dew.interop.pretrained import Placing, PretrainedFallback, source_processor
+from dew.interop.streaming import SourceLeaf
+from dew.interop.weights import AUTO, checkpoint_dtype
 from dew.mesh import LogicalAxes
 from dew.nn.attention import AttentionImpl
 from dew.nn.inputs import document_reach
@@ -694,62 +694,71 @@ def refuse_quantized(config: Mapping[str, object]) -> None:
             f"release, or drop fallback for a registered family whose codec Dew reads")
 
 
-TORCH_AXES: tuple[tuple[str, LogicalAxes], ...] = (
-    # nn.Linear stores [out, in]; its bias is the output side alone.
-    ("*.q_proj.weight", ("heads", "embed")), ("*.q_proj.bias", ("heads",)),
-    ("*.k_proj.weight", ("kv", "embed")), ("*.k_proj.bias", ("kv",)),
-    ("*.v_proj.weight", ("kv", "embed")), ("*.v_proj.bias", ("kv",)),
-    ("*.o_proj.weight", ("embed", "heads")),
-    ("*.self_attn.out_proj.weight", ("embed", "heads")),
-    ("*.attention.query_key_value.weight", ("heads", "embed")),
-    ("*.attention.query_key_value.bias", ("heads",)),
-    ("*.attention.dense.weight", ("embed", "heads")),
-    ("*.gate_proj.weight", ("mlp", "embed")), ("*.up_proj.weight", ("mlp", "embed")),
-    ("*.down_proj.weight", ("embed", "mlp")),
-    ("*.fc1.weight", ("mlp", "embed")), ("*.fc1.bias", ("mlp",)),
-    ("*.fc2.weight", ("embed", "mlp")),
-    ("*.dense_h_to_4h.weight", ("mlp", "embed")), ("*.dense_h_to_4h.bias", ("mlp",)),
-    ("*.dense_4h_to_h.weight", ("embed", "mlp")),
-    # GPT-2's Conv1D stores [in, out].
-    ("*.attn.c_attn.weight", ("embed", "heads")), ("*.attn.c_attn.bias", ("heads",)),
-    ("*.attn.c_proj.weight", ("heads", "embed")),
-    ("*.mlp.c_fc.weight", ("embed", "mlp")), ("*.mlp.c_fc.bias", ("mlp",)),
-    ("*.mlp.c_proj.weight", ("mlp", "embed")),
-    # Token tables and output heads are [vocab, embed], positions [positions, embed].
-    ("*embed_tokens.weight", ("vocab", "embed")), ("*.wte.weight", ("vocab", "embed")),
-    ("*embed_in.weight", ("vocab", "embed")), ("*word_embeddings.weight", ("vocab", "embed")),
-    ("lm_head.weight", ("vocab", "embed")), ("embed_out.weight", ("vocab", "embed")),
-    ("*.wpe.weight", (None, "embed")), ("*embed_positions.weight", (None, "embed")),
-)
-"""The logical axes of the tensors the common transformers conventions name,
-in their torch orientation. A rule applies to a tensor its glob matches and
-whose rank equals the length of its axes; the first such rule wins."""
+def planned_axes(model: PreTrainedModel) -> tuple[tuple[str, LogicalAxes], ...]:
+    """The logical axes of `model`'s parameters by their torch names, from its tensor-parallel plan
+    (`model.tp_plan`: its config's `base_model_tp_plan` beside its head's), each parameter's style found
+    by its module's name with its layer indices read as `*` and named by transformers' registry
+    (`ALL_PARALLEL_STYLES`, which owns the styles' names): a column-split projection's
+    (`ColwiseParallel`, `PackedColwiseParallel`: an `nn.Linear` weight `[out, in]` split on its first
+    dimension, its bias with it) output width `mlp` over its input `embed`, a row-split one's
+    (`RowwiseParallel`, `PackedRowwiseParallel`: its second, its bias whole) the other way, and the input
+    and output tables `vocab` over `embed`. Dew's rules then place them as a native model's (`mlp` on the
+    tensor axis, `embed` on fsdp). A parameter no style splits so (the plan's expert, router and
+    replicated styles, a norm) takes `Layout`'s shape heuristic."""
+    import torch
+    from transformers.distributed.tensor_parallel import (
+        ALL_PARALLEL_STYLES,
+        ColwiseParallel,
+        PackedColwiseParallel,
+        PackedRowwiseParallel,
+        RowwiseParallel,
+    )
+
+    def split(style: str | None) -> str | None:
+        layer = None if style is None or style not in ALL_PARALLEL_STYLES else ALL_PARALLEL_STYLES[style]
+        if isinstance(layer, ColwiseParallel | PackedColwiseParallel):
+            return "column"
+        return "row" if isinstance(layer, RowwiseParallel | PackedRowwiseParallel) else None
+
+    plan = model.tp_plan
+    tables = [module.weight for module in (model.get_input_embeddings(), model.get_output_embeddings())
+              if isinstance(module, torch.nn.Module) and isinstance(module.weight, torch.Tensor)]
+    axes: list[tuple[str, LogicalAxes]] = []
+    for name, parameter in model.named_parameters():
+        module, _, kind = name.rpartition(".")
+        # A layer's index, a name of digits alone, reads as the plan's `*` (`dense_h_to_4h` keeps its 4).
+        style = split(plan.get(".".join("*" if part.isdigit() else part for part in module.split("."))))
+        if parameter.ndim == 2 and any(parameter is table for table in tables):
+            axes.append((name, ("vocab", "embed")))
+        elif style == "column" and parameter.ndim in (1, 2):
+            axes.append((name, ("mlp", "embed")[:parameter.ndim]))
+        elif style == "row" and kind == "weight" and parameter.ndim == 2:
+            axes.append((name, ("embed", "mlp")))
+    return tuple(axes)
 
 
 @dataclass(frozen=True)
 class TorchLayout(Layout):
-    """A `Layout` for a tree keyed by torch parameter names.
+    """A `Layout` for a tree keyed by torch parameter names, which a tier-3 model makes of the run's
+    (`TorchCausalLM.placement`).
 
-    `names` maps a glob over a tensor's torch name to its logical axes;
-    `rules` then map those onto the mesh exactly as they do for a native
-    model, so the tensor axis, fsdp, `min_shard` and `check` mean what they
-    mean there. A tensor no name matches takes `Layout`'s shape heuristic.
-    Optimizer moments and EMA copies end in their parameter's name, so they
-    take its placement.
+    `names` gives a tensor's logical axes by its torch name, the model's
+    tensor-parallel plan's (`planned_axes`); `rules` then map those onto the
+    mesh exactly as they do for a native model, so the tensor axis, fsdp,
+    `min_shard` and `check` mean what they mean there. A tensor it names none
+    for takes `Layout`'s shape heuristic. Optimizer moments and EMA copies end
+    in their parameter's name, so they take its placement.
 
     The placement decides where GSPMD keeps each tensor, not what the forward
     computes: a spec that suits the model badly costs collectives, never
     correctness.
     """
 
-    names: tuple[tuple[str, LogicalAxes], ...] = TORCH_AXES
+    names: tuple[tuple[str, LogicalAxes], ...] = ()
 
     def axes(self, name: str, ndim: int) -> LogicalAxes | None:
-        """The logical axes the first matching rule gives `name`, or None."""
-        for pattern, axes in self.names:
-            if len(axes) == ndim and fnmatch.fnmatchcase(name, pattern):
-                return axes
-        return None
+        """The logical axes `names` gives `name` at rank `ndim`, or None."""
+        return next((axes for held, axes in self.names if held == name and len(axes) == ndim), None)
 
     def _axes(self, path, ndim: int, declared: Mapping[Suffix, LogicalAxes]) -> LogicalAxes | None:
         """The axes the name table gives the leaf's torch name, else `Layout`'s."""
@@ -777,6 +786,9 @@ class TorchGraph:
     shapes: Mapping[str, Mapping[str, jax.ShapeDtypeStruct]] = field(default_factory=dict)
     """The source's variables, `params` and `buffers`, as shapes and dtypes: what an initialization,
     which holds none of them, traces the forward over (`TorchCausalLM._run`)."""
+    axes: tuple[tuple[str, LogicalAxes], ...] = ()
+    """Its parameters' logical axes by their torch names, its tensor-parallel plan's (`planned_axes`),
+    which its placement reads (`TorchCausalLM.placement`)."""
 
     def __call__(self, params: Mapping[str, jax.Array], buffers: Mapping[str, jax.Array],
                  tokens: jax.Array, *, train: bool, key: jax.Array | None = None,
@@ -1123,6 +1135,20 @@ class TorchCausalLM(nn.Module):
     def bank_sites(self, store: Variables) -> tuple[DecoderBank, ...]:
         return ()
 
+    @nn.nowrap
+    def placement(self, layout: Layout) -> Layout:
+        """The run's `layout` for this model's torch-named tree (`dew.distributed.placement.RefinesLayout`):
+        its rules, fsdp and every other choice it makes, its tensors named by the model's tensor-parallel
+        plan (`TorchLayout`) beside those another tier-3 model of the run named (a distillation's
+        teacher), a name two models give different axes refused."""
+        names = dict(layout.names if isinstance(layout, TorchLayout) else ())
+        for name, axes in self.graph.axes:
+            if names.setdefault(name, axes) != axes:
+                raise ValueError(f"two tier-3 models of the run name {name} with different axes "
+                                 f"({names[name]} and {axes}), which one layout cannot place both by")
+        return TorchLayout(**{held.name: getattr(layout, held.name) for held in fields(Layout) if held.init},
+                           names=tuple(names.items()))
+
     @property
     def causal(self) -> bool:
         """True: `load` builds the model with `AutoModelForCausalLM`, whose
@@ -1359,7 +1385,8 @@ def _refuse_packing(packing: Mapping[str, object]) -> None:
 
 def load(source: sources.SourceReference, root: Path, *, dtype: str,
          param_dtype: str, attention_impl: AttentionImpl, max_seq_len: int | None,
-         admission: TorchAdmission | None = None, weights: bool = True) -> PretrainedFallback:
+         admission: TorchAdmission | None = None, weights: bool = True,
+         placed: Placing | None = None) -> PretrainedFallback:
     """Load the causal LM `source` selects through transformers and torchax.
 
     `root` is the metadata snapshot `Pretrained.load` resolved at `source`'s
@@ -1370,6 +1397,8 @@ def load(source: sources.SourceReference, root: Path, *, dtype: str,
     `fallback="torchax"`. Without `weights` the model is built from its
     config on torch's meta device, nothing but metadata fetched or read, and
     its variables are their shapes and dtypes alone (`jax.ShapeDtypeStruct`).
+    `placed` places them as the load asks, by the layout as the model refines it for its torch names
+    (`TorchCausalLM.placement`); they stay on the host where it is None.
     """
     name_or_dir, revision = source.name, source.revision
     directory = source.directory(root)
@@ -1388,24 +1417,13 @@ def load(source: sources.SourceReference, root: Path, *, dtype: str,
     try:
         import torch
         from torchax.interop import JittableModule, extract_all_buffers
-        from transformers import AutoModelForCausalLM
     except ImportError as error:
         raise ImportError(f"fallback='torchax' needs torch, torchax and transformers: {INSTALL}") from error
     if weights:
         directory = source.directory(source.weights(root))
     # Before transformers, whose reader fails on a malformed file without naming it.
     generation_config = read_generation_config(directory)
-    storage = "auto" if param_dtype == AUTO else getattr(torch, param_dtype)
-    if weights:
-        model = AutoModelForCausalLM.from_pretrained(str(directory), dtype=storage, local_files_only=True,
-                                                     experts_implementation=EXPERTS)
-    else:
-        from transformers import AutoConfig
-
-        stated = AutoConfig.from_pretrained(str(directory), local_files_only=True)
-        with torch.device("meta"):
-            model = AutoModelForCausalLM.from_config(
-                stated, dtype=stated.dtype if storage == "auto" else storage, experts_implementation=EXPERTS)
+    model, by_name = _built(directory, param_dtype, weights)
     model.eval()
     jittable = JittableModule(model)
     head = model.get_output_embeddings()
@@ -1418,7 +1436,8 @@ def load(source: sources.SourceReference, root: Path, *, dtype: str,
     # The head's structure, which a forward shows: the loaded model's, or without its weights the
     # same class at the probe's sizes (`verify.shrink`), since a forward on the meta device reads no
     # values, which some forwards do.
-    if head_name is not None and not (_plain_head(model, head) if weights else _shrunk_plain_head(config)):
+    if head_name is not None and not (_plain_head(model, head) if weights and by_name is None
+                                      else _shrunk_plain_head(config)):
         head_name = None
     # After the head's eager check: the functional parts and Dew's attention run only inside the traced
     # forward. The parts keep their parameters, which the jittable module holds already.
@@ -1429,19 +1448,28 @@ def load(source: sources.SourceReference, root: Path, *, dtype: str,
     # Host views of torch's storage: nothing reaches a device before the
     # caller's placement. Without the weights, their shapes and dtypes.
     def held(leaf, name):
-        if weights:
-            return host_view(leaf, name)
-        return jax.ShapeDtypeStruct(tuple(leaf.shape), host_dtype(leaf, name))
+        if not weights:
+            return jax.ShapeDtypeStruct(tuple(leaf.shape), host_dtype(leaf, name))
+        if by_name is not None and name in by_name:
+            # Read a device shard at a time, cast to its storage as the placement reads it
+            # (`dew.interop.streaming.SourceLeaf`), as a native family's checkpoint streams.
+            tensor = by_name[name]
+            return SourceLeaf((tensor,), checkpoint_dtype(np.dtype(tensor.dtype), param_dtype))
+        return host_view(leaf, name)
+
+    if by_name is not None and (unread := sorted(set(jittable.params) - set(by_name))):
+        raise ValueError(_unread(name_or_dir, unread))
 
     params = {name: held(leaf, name) for name, leaf in jittable.params.items()}
     buffers = {name: held(leaf, name) for name, leaf in extract_all_buffers(model)[1].items()}
     stored = model.state_dict()
     persistent = tuple(name for name in buffers if name in stored)
     vocab = int(head_weight.shape[0])
+    axes = planned_axes(model)
     # Torch's copies are no longer read: the forward runs on the arrays above.
     torch.nn.Module.to(model, "meta")
     graph = TorchGraph(jittable, persistent, attention_impl=attention_impl if attends else None,
-                       shapes={"params": _shapes(params), "buffers": _shapes(buffers)})
+                       shapes={"params": _shapes(params), "buffers": _shapes(buffers)}, axes=axes)
     # The decode cache's slots: the load's, else the source's own context as its config class reads it
     # (an alias, CTRL's `n_positions`, included).
     named = type(model.config).attribute_map.get("max_position_embeddings", "max_position_embeddings")
@@ -1462,14 +1490,27 @@ def load(source: sources.SourceReference, root: Path, *, dtype: str,
         f"{versions['torch']}; "
         + ("its attention on Dew's, packed rows and Dew's decode cache included; " if attends
            else "its attention transformers' own, no packing or decode cache; ")
-        + "no sharding rules beyond TorchLayout's name table; the load holds the "
-        "torch model on the host, at least 2x the checkpoint", TransformersTierWarning, stacklevel=3)
+        + f"placed by its tensor-parallel plan (TorchLayout); {_host_cost(weights, by_name)}",
+        TransformersTierWarning, stacklevel=3)
     built = {**config, "dtype": dtype, "fallback": "torchax", **versions}
-    return PretrainedFallback(module, {"params": params, "buffers": buffers}, processor, config, directory,
-                              built, generation_config, export_adapter=graph.export, revision=revision)
+    variables = {"params": params, "buffers": buffers}
+    landed = variables if placed is None else placed(variables, module)
+    # What no placement read (a load onto no mesh), read whole in its storage; torch's names are flat.
+    kept = {collection: {name: leaf.read() if isinstance(leaf, SourceLeaf) else leaf
+                         for name, leaf in tree.items()} for collection, tree in landed.items()}
+    return PretrainedFallback(module, kept, processor, config, directory, built, generation_config,
+                              export_adapter=graph.export, revision=revision)
 
 
-def _shapes(leaves: Mapping[str, np.ndarray | jax.ShapeDtypeStruct]) -> dict[str, jax.ShapeDtypeStruct]:
+def _unread(source: str | Path, names: Sequence[str]) -> str:
+    """The refusal of a source whose checkpoint lacks parameters its model's class names, which a load
+    would draw: the source is its checkpoint."""
+    return (f"{source}'s checkpoint holds no {', '.join(names[:4])}{' and more' if len(names) > 4 else ''}, "
+            "which its model's class names: a load would draw them, and the source is its checkpoint")
+
+
+def _shapes(leaves: Mapping[str, np.ndarray | SourceLeaf | jax.ShapeDtypeStruct]
+            ) -> dict[str, jax.ShapeDtypeStruct]:
     """Each leaf's shape and dtype."""
     return {name: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype) for name, leaf in leaves.items()}
 
@@ -1484,6 +1525,96 @@ def _shrunk_plain_head(config: Mapping[str, object]) -> bool:
     stated = AutoConfig.for_model(str(config["model_type"]), **fields)
     model = AutoModelForCausalLM.from_config(stated, dtype=torch.float32, experts_implementation=EXPERTS)
     return _plain_head(model.eval(), model.get_output_embeddings())
+
+
+def _host_cost(weights: bool, by_name: Mapping[str, np.ndarray] | None) -> str:
+    """What a tier-3 load held on the host (`_built`): only transformers' own load, which converts its
+    checkpoint, holds the torch model (ledger 2781)."""
+    if not weights:
+        return "its weights unread"
+    if by_name is not None:
+        return "its tensors read from the checkpoint by name, no torch copy of the model held"
+    return "the load holds the torch model on the host, at least 2x the checkpoint"
+
+
+def _built(directory: Path, param_dtype: str, weights: bool
+           ) -> tuple[PreTrainedModel, dict[str, np.ndarray] | None]:
+    """The causal LM `directory`'s config describes, and with `weights` its tensors by name
+    (`_stored_tensors`): its parameters on torch's meta device, its buffers computed as its modules
+    compute them, each tensor read from the checkpoint memory-mapped, which the load's placement streams
+    onto the mesh a leaf at a time, no copy of the model held on the host. It is built in its config's
+    dtype, or under `AUTO` with none stated in its checkpoint's first floating tensor's, as transformers'
+    own load infers it, so its computed buffers are the ones that load computes. A checkpoint a tensor
+    operation of transformers' converts (a fused expert's merge) loads through transformers' own load,
+    which alone applies them, and its tensors are the model's (None), refused where the checkpoint
+    lacks a parameter its class names. Without `weights`, the model on the meta device alone."""
+    import torch
+    from transformers import AutoConfig, AutoModelForCausalLM
+
+    try:
+        from accelerate import init_empty_weights
+    except ImportError as error:
+        raise ImportError(f"fallback='torchax' builds its model's parameters on the meta device with "
+                          f"accelerate: {INSTALL}") from error
+    storage = "auto" if param_dtype == AUTO else getattr(torch, param_dtype)
+    stated = AutoConfig.from_pretrained(str(directory), local_files_only=True)
+    built_as = stated.dtype if storage == "auto" else storage
+    shards = sources.load_shards(directory) if weights else {}
+    if built_as is None:
+        floating = (tensor.dtype for tensor in shards.values() if jnp.issubdtype(tensor.dtype, jnp.floating))
+        built_as = next((getattr(torch, dtype.name) for dtype in floating), None)
+    if not weights:
+        with torch.device("meta"):
+            built = AutoModelForCausalLM.from_config(stated, dtype=built_as, experts_implementation=EXPERTS)
+        return built, None
+    with init_empty_weights(include_buffers=False):
+        model = AutoModelForCausalLM.from_config(stated, dtype=built_as, experts_implementation=EXPERTS)
+    # Its tied parameters one, as transformers' load ties them, which `_stored_tensors` reads by each name.
+    model.tie_weights()
+    stored = _stored_tensors(model, shards)
+    if stored is not None:
+        return model, stored
+    loaded = AutoModelForCausalLM.from_pretrained(
+        str(directory), dtype=storage, local_files_only=True, experts_implementation=EXPERTS,
+        output_loading_info=True)
+    # The model and what its load read and drew (`output_loading_info`).
+    assert isinstance(loaded, tuple)
+    converted, loading = loaded
+    if loading["missing_keys"]:
+        raise ValueError(_unread(directory, sorted(loading["missing_keys"])))
+    return converted, None
+
+
+def _stored_tensors(model: PreTrainedModel, shards: Mapping[str, np.ndarray]) -> dict[str, np.ndarray] | None:
+    """A checkpoint's `shards` (`sources.load_shards`, memory-mapped) by the names `model` holds them
+    under, as stored, which the load casts to their storage leaf by leaf where it places them
+    (`_in_storage`): each key named as transformers' load names it, by the model's conversion mapping's
+    renamings (`rename_source_key`), a key the model holds nothing under left out, and a tied parameter
+    (an output table that is its input table) under each of its names from the one the checkpoint
+    stores it under. None where a key takes one of the mapping's tensor conversions (a fused expert's
+    merge), which transformers' own load applies."""
+    from transformers.conversion_mapping import get_model_conversion_mapping
+    from transformers.core_model_loading import WeightConverter, WeightRenaming, rename_source_key
+
+    transforms = get_model_conversion_mapping(model)
+    renamings = [transform for transform in transforms if isinstance(transform, WeightRenaming)]
+    converters = [transform for transform in transforms if isinstance(transform, WeightConverter)]
+    held = model.state_dict()
+    named: dict[str, np.ndarray] = {}
+    for key, tensor in shards.items():
+        name, converted = rename_source_key(key, renamings, converters, model.base_model_prefix, held)
+        if converted is not None:
+            return None
+        if name in held:
+            named[name] = tensor
+    tied: dict[int, list[str]] = {}
+    for name, parameter in model.named_parameters(remove_duplicate=False):
+        tied.setdefault(id(parameter), []).append(name)
+    for names in tied.values():
+        for stored in [name for name in names if name in named][:1]:
+            for name in names:
+                named.setdefault(name, named[stored])
+    return named
 
 
 def _plain_head(model: PreTrainedModel, head: torch.nn.Module) -> bool:

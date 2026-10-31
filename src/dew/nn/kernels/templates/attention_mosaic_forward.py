@@ -32,7 +32,14 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels.templates import attention_algebra as algebra, attention_portable, mosaic, resources
+from dew.nn.kernels import generation, tuning
+from dew.nn.kernels.templates import (
+    attention_algebra as algebra,
+    attention_portable,
+    mosaic,
+    report,
+    resources,
+)
 from dew.nn.kernels.templates.attention import (
     Draw,
     Dropout,
@@ -40,10 +47,11 @@ from dew.nn.kernels.templates.attention import (
     KeySpans,
     Param,
     Split,
+    by_power,
     output_hooked,
     output_split,
     padded_call,
-    prescaled,
+    prescale,
 )
 from dew.nn.kernels.templates.attention_mosaic_program import (
     Tiles,
@@ -143,10 +151,12 @@ def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
     rows, which a row its guards rewalk keeps too (its weighted values overflowed, not its maximum or
     denominator), no anchor key and the output as the split sums (`output_split`)."""
     family = bundle_of(tiles, query.dtype)
-    call, spec, (q, k, v), (spans_of, hooked) = _prepared(query, key, value, spans, hooks, scale=scale,
-                                                          natural=natural, tiles=tiles, family=family)
+    call, spec, (raw, k, v), (spans_of, hooked), taken = _prepared(
+        query, key, value, spans, hooks, scale=scale, natural=natural, tiles=tiles, family=family)
 
-    def launch(form: algebra.Forward, live: jax.Array | None) -> tuple[tuple, jax.Array, jax.Array]:
+    def launch(form: algebra.Forward, live: jax.Array | None, again: bool = False
+               ) -> tuple[tuple, jax.Array, jax.Array]:
+        q, form = _rewalked(spec, form, raw, taken)
         # The natural form's rewalk at its own tiles (`Tiles.relaunch`), its spans' block map of them.
         at, at_spans = _form_tiles(spec, call, form, tiles, spans_of)
         if live is None:
@@ -158,8 +168,8 @@ def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
             launched = [_launch(q, k, values, at_spans, held._replace(output=()) if split else held, None,
                                 spec=form, hooks=_unhooked(hooks) if split else hooks, tiles=at,
                                 family=family, training=False, interpret=interpret,
-                                counted=form.natural == spec.natural, finishes=rows, columns=first,
-                                out_dtype=jnp.float32 if split else None)
+                                counted=form.natural == spec.natural and not again, kept=again,
+                                finishes=rows, columns=first, out_dtype=jnp.float32 if split else None)
                         for first, values, held in blocks]
             status, _, *finished = launched[0]
             out = _output_whole(jnp.concatenate([block[1] for block in launched], axis=-1), hooks, hooked,
@@ -265,22 +275,24 @@ def _trained_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
     values overflowed take the plain-JAX mainloop's guarded training walk (its normalized split sums, shift
     -1, `algebra.split_residuals`), which this kernel's single pass does not take."""
     family = bundle_of(tiles, query.dtype)
-    call, spec, (q, k, v), (spans_of, hooked) = _prepared(query, key, value, spans, hooks, scale=scale,
-                                                          natural=natural, tiles=tiles, family=family)
+    call, spec, (raw, k, v), (spans_of, hooked), taken = _prepared(
+        query, key, value, spans, hooks, scale=scale, natural=natural, tiles=tiles, family=family)
     value_width = value.shape[3]
 
-    def launch(form: algebra.Forward, live: jax.Array | None):
+    def launch(form: algebra.Forward, live: jax.Array | None, again: bool = False):
+        q, form = _rewalked(spec, form, raw, taken)
         if live is None:
-            counted = form.natural == spec.natural
+            counted = form.natural == spec.natural and not again
             # The natural form's rewalk at its own tiles (`Tiles.relaunch`), its spans' block map of them.
             at, at_spans = _form_tiles(spec, call, form, tiles, spans_of)
             found = _launch(q, k, v, at_spans, hooked, None, spec=form, hooks=hooks, tiles=at,
-                            family=family, training=False, interpret=interpret, peaks=True, counted=counted)
+                            family=family, training=False, interpret=interpret, peaks=True, counted=counted,
+                            kept=again)
             # A training launch a block of the value columns where its tiles walk a block (`Tiles.columns`,
             # row 2526), each block's split sums side by side, their rows alike.
             launched = [_launch(q, k, values, at_spans, held, None, spec=form, hooks=hooks, tiles=at,
                                 family=family, training=True, interpret=interpret, anchors=found,
-                                counted=counted, columns=first)
+                                counted=counted, kept=again, columns=first)
                         for first, values, held in _column_blocks(v, hooked, at.columns)]
             status, rows, anchors, _ = launched[0]
             others = jnp.concatenate([block[3] for block in launched], axis=-1)
@@ -303,7 +315,8 @@ def _trained_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
         # The overflowed rows' guarded training walk, the plain-JAX mainloop's over this call's padding in
         # this launch's form (the rewalk's units kept, `algebra.unfolded`); its maxima and overflows
         # `walked_launches` does not read.
-        out, rows = attention_portable.padded_walk(form, call, hooks, block_q=tiles.block_q,
+        walked = call if q is raw else dataclasses.replace(call, query=by_power(call.query, taken))
+        out, rows = attention_portable.padded_walk(form, walked, hooks, block_q=tiles.block_q,
                                                    block_k=tiles.block_k, residuals=True)
         maximum, total, anchors, split = rows
         widened = (_widened(out, v.shape[-1]), maximum, total, anchors,
@@ -347,22 +360,42 @@ def _prepared(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     """A call as this mainloop takes it at `tiles`: padded to the program's blocks (`padded_call`, `_block`)
     and its heads to whole swizzled rows (`_columns`), with its `algebra.Forward` (every form guarding its
     sums where its values can overflow them, the fold its logits' reach, `algebra.walked_launches`) and the
-    arrays its programs read beside the operands (`_Spans`, `_Hooked`). A call it takes none of is refused
-    (`refused`, which the op's eligibility reads too)."""
+    arrays its programs read beside the operands (`_Spans`, `_Hooked`), and the power of two its plain
+    launch took into its scale (1 where none, `_rewalked`). A call it takes none of is refused (`refused`,
+    which the op's eligibility reads too)."""
     if reason := refused(query.dtype, query.shape[3], value.shape[3], hooks, backward=False, family=family):
         raise NotImplementedError(reason)
-    # The query taken by its scale's power of two before its products (`prescale`).
-    query, scale, power = prescaled(query, scale)
-    call = padded_call(query, key, value, spans, hooks, _block(tiles))
-    spec = algebra.Forward(spans.form, spans.keys, ids=spans.query_ids is not None, scale=scale,
+    # The query's power of two before its products (`prescale`). A folding call every row of which sees a
+    # key ('full', 'causal') takes it into its launch's scale (`Forward.factor`: the products' factor 2^p
+    # times the prescaled query's, so every logit bit for bit the prescaled query's where its products stay
+    # in fp32's normal range), no pass of XLA's over the queries before it (0.046 ms of Qwen3-8B's 0.66 ms
+    # causal forward, ET-GQA1-h100). Its raw products can pass fp32 where the prescaled query's do not: a
+    # row of them all past it below zero reads as a -inf maximum, which such a call's rows take as past the
+    # fold's reach (`reach_of`), so it walks again natural on the query taken by the power (`_rewalked`).
+    power, scale = prescale(query.dtype, query.shape[3], scale)
+    folding = algebra.folds(scale, power, natural=natural, score_mod=hooks.score_mod)
+    taken = power if folding and spans.form != "spans" else 1.0
+    call = padded_call(by_power(query, power / taken), key, value, spans, hooks, _block(tiles))
+    spec = algebra.Forward(spans.form, spans.keys, ids=spans.query_ids is not None, scale=scale * taken,
                            score_mod=hooks.score_mod, natural=natural, headroom=algebra.headroom(value.dtype),
                            initial=hooks.initial is not None,
                            queries=call.queries if call.query.shape[1] > call.queries else None,
-                           prescale=power)
+                           prescale=power / taken)
     unit = family.column_unit(query.dtype)
     operands = tuple(_columns(array, unit) for array in (call.query, call.key, call.value))
     read = (_spans_of(spec, call, tiles.block_q, tiles.block_k), _hooked_of(hooks, call, unit))
-    return call, spec, operands, read
+    return call, spec, operands, read, taken
+
+
+def _rewalked(spec: algebra.Forward, form: algebra.Forward, query: jax.Array, taken: float
+              ) -> tuple[jax.Array, algebra.Forward]:
+    """A launch's query operand and form: the fold's natural rewalk (`algebra.unfolded`) of a call whose
+    plain launch took its power of two into its scale (`taken`, `_prepared`) the query taken by the power
+    and the scale left after it, its products finite where the reference's are; every other launch the
+    call's own."""
+    if taken == 1.0 or form.natural == spec.natural:
+        return query, form
+    return by_power(query, taken), dataclasses.replace(form, scale=form.scale / taken, prescale=taken)
 
 
 class _Residuals(NamedTuple):
@@ -593,6 +626,7 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
             spec: algebra.Forward, hooks: Hooks, tiles: Tiles, family: mosaic.Family, training: bool,
             interpret: bool, columns: int | None = None, peaks: bool = False,
             anchors: tuple[jax.Array, jax.Array] | None = None, out_dtype=None, counted: bool = False,
+            kept: bool = False,
             finishes: bool = False):
     """The forward's launch in `spec`'s form (`guard`'s rows shifting where given): its rows' status `[2, B,
     H, Qp]` fp32, their maxima in the walk's units and 1 where their weighted values overflowed
@@ -605,7 +639,36 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
     (`peaks`) reads the keys alone and gives each row's keys' largest logit `[B, H, Qp]` fp32 in the walk's
     units and its anchor key `[B, H, Qp]` int32 (`_peak_consumer`). With `finishes`, the output's launch also
     gives its rows' finished maxima and denominators `[2, B, H, Qp]` fp32 (`Output`, `algebra.finish`).
+    Its kernel is built once for every call of its static facts (`_launched`, `tuning.lowered_once`): a
+    model's layers alike lower one.
     """
+    # Each launch named apart, so its compile reports and profile rows say which it is.
+    kind = "peaks" if peaks else "training" if training else "forward"
+    name = (f"attention_{kind}{'_natural' if spec.natural else ''}{'_kept' if kept else ''}"
+            f"{'_guarded' if guard is not None else ''}{'' if columns is None else f'_columns{columns}'}")
+    # The hooks' functions and their arrays' shapes and dtypes static, their arrays the programs' operands.
+    return _launched(query, key, value, (spans, hooked, guard, anchors),
+                     hooks=jax.tree.map(lambda array: jax.ShapeDtypeStruct(array.shape, array.dtype), hooks),
+                     spec=spec, tiles=tiles, family=family, training=training, interpret=interpret,
+                     peaks=peaks, out_dtype=None if out_dtype is None else jnp.dtype(out_dtype),
+                     counted=counted, finishes=finishes, target=generation.gpu_target(),
+                     names=(name, report.named(name)))
+
+
+@tuning.lowered_once(("hooks", "spec", "tiles", "family", "training", "interpret", "peaks", "out_dtype",
+                      "counted", "finishes", "target", "names"))
+def _launched(query, key, value, read: tuple, *, hooks: Hooks, spec: algebra.Forward, tiles: Tiles,
+              family: mosaic.Family, training: bool, interpret: bool,
+              peaks: bool, out_dtype, counted: bool, finishes: bool, target: generation.GpuTarget,
+              names: tuple[str, str | None]):
+    """`_launch`'s kernel launched on its operands and the arrays its programs read beside them (`read`, the
+    hooks' among them, `_Hooked`), its static `hooks` holding their arrays' shapes and dtypes in their place
+    (its functions a key's, which `tuning.holdable` reads), lowered once for every call of its static facts
+    and its operands' shapes and dtypes (`tuning.lowered_once`); `target` the GPU its config is derived for,
+    `names` its name and the one its trace reports (`report.named`)."""
+    del target
+    leaves, treedef = jax.tree.flatten(read)
+    name, kernel_name = names
     batch, queries, heads, width = query.shape
     keys_count, kv_heads = key.shape[1], key.shape[2]
     group, consumers = heads // kv_heads, tiles.consumers
@@ -624,7 +687,7 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
     arrays = len(scoped) - 2
 
     def body(q_ref, k_ref, v_ref, *refs, streams):
-        read, refs = refs[:len(leaves)], refs[len(leaves):]
+        read, refs = refs[:treedef.num_leaves], refs[treedef.num_leaves:]
         written, refs = refs[:len(out_type)], refs[len(out_type):]
         (q_smem, row_smem, *stages), (q_loaded, schedule) = refs[:arrays], refs[arrays:]
         out_smem, stages = (q_smem, stages) if peaks or (reuse and not training) else (stages[0], stages[1:])
@@ -672,8 +735,6 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
 
         family.roles(consumers, consumer, producer)
 
-    # The arrays the programs read beside the operands.
-    leaves, treedef = jax.tree.flatten((spans, hooked, guard, anchors))
 
     def entry(*refs):
         family.scoped(functools.partial(body, *refs), *scoped, streams=rings)
@@ -691,10 +752,6 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
         if finishes:
             out_type += (jax.ShapeDtypeStruct((2, batch, heads, queries), jnp.float32),)
     approx_math = approximate(hooks, (block_q, block_k), value.shape[-1], differentiated=False)
-    # Each launch named apart, so its compile reports and profile rows say which it is.
-    kind = "peaks" if peaks else "training" if training else "forward"
-    name = (f"attention_{kind}{'_natural' if spec.natural else ''}"
-            f"{'_guarded' if guard is not None else ''}{'' if columns is None else f'_columns{columns}'}")
     # The model's products this launch owns (`stated`): the forward's two, a peak walk's `Q K^T` and a
     # training walk's `P V` (its `Q K^T` recomputed); a rerun (a guarded launch, the fold's natural walk)
     # none, as the FLOP count bounds a conditional by every branch, which would count the call twice.
@@ -703,6 +760,6 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
             else pl.CostEstimate(flops=0, transcendentals=0, bytes_accessed=0))
     return family.kernel(entry, out_type=out_type, grid=(heads, queries // pair, batch),
                          grid_names=("heads", "q_tiles", "batch"), consumers=consumers, interpret=interpret,
-                         approx_math=approx_math, name=name, cost=cost,
-                         reducing_warpgroups=reducing(family, consumers, hooks.score_mod, hooks.output_mod))(
-                             query, key, value, *leaves)
+                         approx_math=approx_math, name=name, kernel_name=kernel_name, cost=cost,
+                         reducing_warpgroups=reducing(family, consumers, hooks.score_mod, hooks.output_mod)
+                         )(query, key, value, *leaves)

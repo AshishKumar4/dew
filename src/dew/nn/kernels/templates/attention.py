@@ -562,21 +562,31 @@ def sinks(values: jax.Array, batch: int, queries: int, width: int) -> Initial:
     return Initial(m, jnp.ones_like(m), jnp.zeros((*m.shape, width), wide))
 
 
-def capped(softcap: float, logits: jax.Array, q_pos: jax.Array, k_pos: jax.Array) -> jax.Array:
-    """Gemma 2's logit cap, `softcap * tanh(logits / softcap)`, on the scaled logits as `reference_attention`
-    takes it. It is a score hook as `functools.partial(capped, softcap)`, which reads no position."""
-    del q_pos, k_pos
-    return softcap * jnp.tanh(logits / softcap)
+@dataclasses.dataclass(frozen=True)
+class Capped:
+    """Gemma 2's logit cap as a score hook, `softcap * tanh(logits / softcap)` on the scaled logits as
+    `reference_attention` takes it, reading no position: equal for equal caps, so a launch built once for
+    its static facts serves every layer of one cap (`tuning.lowered_once`)."""
+
+    softcap: float
+
+    def __call__(self, logits: jax.Array, q_pos: jax.Array, k_pos: jax.Array) -> jax.Array:
+        del q_pos, k_pos
+        return self.softcap * jnp.tanh(logits / self.softcap)
 
 
-def biased(score_mod: Callable | None, logits: jax.Array, q_pos: jax.Array, k_pos: jax.Array,
-           bias: jax.Array) -> jax.Array:
-    """`score_mod`'s logits (the scaled logits where None) plus a bias, `bias` the tile's keys' `[1, k]` (a
-    `Kind.KEY` parameter: ALiBi's slope times each key's place) or its entries' `[q, k]` (a `Kind.TILE`
-    one: a dense bias), added after a softcap as `reference_attention` adds its bias. It is a score hook as
-    `functools.partial(biased, score_mod)`."""
-    capped = logits if score_mod is None else score_mod(logits, q_pos, k_pos)
-    return capped + bias
+@dataclasses.dataclass(frozen=True)
+class Biased:
+    """`score_mod`'s logits (the scaled logits where None) plus a bias as a score hook, its parameter the
+    tile's keys' `[1, k]` (a `Kind.KEY` one: ALiBi's slope times each key's place) or its entries' `[q, k]` (a
+    `Kind.TILE` one: a dense bias), added after a softcap as `reference_attention` adds its bias: equal for
+    equal inner hooks (`Capped`)."""
+
+    score_mod: Callable | None = None
+
+    def __call__(self, logits: jax.Array, q_pos: jax.Array, k_pos: jax.Array, bias: jax.Array) -> jax.Array:
+        capped = logits if self.score_mod is None else self.score_mod(logits, q_pos, k_pos)
+        return capped + bias
 
 
 DROP_DOMAIN = 0x6A09E667

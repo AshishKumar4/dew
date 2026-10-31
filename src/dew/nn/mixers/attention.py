@@ -29,6 +29,7 @@ from dew.nn.attention_masks import (
     visibility_mask,
 )
 from dew.nn.blocks import normal_kernel
+from dew.nn.cross_attention import sow_context_logits, with_context_logits
 from dew.nn.dense import Dense
 from dew.nn.dex import DEX_COLLECTION, DexStart, LayerDex, annealed, differential
 from dew.nn.documents import CrossDocuments
@@ -247,11 +248,6 @@ class _Masking(NamedTuple):
     `key_places`, or None."""
 
 
-CONTEXT_LOGITS = "context_max_logits"
-"""The `qk` collection's entry of each head's largest logit over a context a layer's own attention read
-(`CausalSelfAttention.attend_context`), which the layer's own maxima take in."""
-
-
 
 GATE_ACTIVATIONS = {
     'sigmoid': jax.nn.sigmoid,
@@ -395,11 +391,14 @@ class CausalSelfAttention(nn.Module):
         if not self.ctx.kv_shared and not self._packed():
             self.k_proj = dense(projections['k_proj'][1], name='k_proj')
             if self.ctx.value_experts is not None:
-                # K2 Horizon's MoVA: the values are routed experts' projections (`RoutedValues`).
+                # K2 Horizon's MoVA: the values are routed experts' projections (`RoutedValues`), run
+                # under the layer's routed MLP, without which a decoder's fields refuse them.
+                if (mixture := self.ctx.mixture) is None:
+                    raise ValueError("routed value experts run under their layer's routed MLP (a Mixture)")
                 self.experts = RoutedValues(
                     self.ctx.value_experts, self.ctx.emb_features, self.ctx.num_kv_heads * self.value_dim,
-                    init_std=self.ctx.init_std, dtype=self.ctx.dtype, precision=self.ctx.precision,
-                    name='experts')
+                    mixture=mixture, init_std=self.ctx.init_std, dtype=self.ctx.dtype,
+                    precision=self.ctx.precision, name='experts')
             elif not self.ctx.k_eq_v:
                 self.v_proj = dense(projections['v_proj'][1], name='v_proj')
         if 'gate_proj' in projections:
@@ -941,13 +940,7 @@ class CausalSelfAttention(nn.Module):
         attention excludes none."""
         if self.ctx.ngpt is not None:
             query, key = self._ngpt_rotated(self.ctx.ngpt, query, key)
-        if not self.is_initializing() and self.is_mutable_collection("qk"):
-            # The read's logits through the layer's own projections over the keys it sees, which its own
-            # call's maxima take in beside its own sequence's (`_attended`), so the QK-Clip bounds both.
-            documents = None if queries is None or segments is None else CrossDocuments(queries, segments)
-            seen = visibility_mask(query.shape[1], key.shape[-3], causal=False, sliding_window=None,
-                                   segment_ids=documents, key_value_seq_lengths=lengths)
-            self.sow("qk", CONTEXT_LOGITS, max_attention_logits(query, key, mask=seen))
+        sow_context_logits(self, query, key, lengths, queries, segments)
         # A row without context reads its first slot, so its softmax stays finite: one over no keys would
         # be NaN, which the block's join drops forward but not from the gradients.
         attention = checkpoint_name(scaled_dot_product_attention(
@@ -1242,10 +1235,8 @@ class CausalSelfAttention(nn.Module):
             # Over the keys the call sees, as its spans say them (`visibility_mask`).
             seen = visibility_mask(S, key.shape[-3], causal, window, mask, documents, block_groups=blocks,
                                    image_groups=images, key_valid=valid, key_runs=runs, places=held)
-            found = max_attention_logits(query, key, mask=seen, bias=bias)
-            if self.has_variable("qk", CONTEXT_LOGITS):
-                # A context this call read through the same projections first (`attend_context`).
-                found = jnp.maximum(found, self.get_variable("qk", CONTEXT_LOGITS)[-1])
+            # Beside a context this call read through the same projections first (`attend_context`).
+            found = with_context_logits(self, max_attention_logits(query, key, mask=seen, bias=bias))
             self.sow("qk", "max_logits", found)
             self.sow("qk", "kv_heads", jnp.asarray(key.shape[-2]))
             self.sow("qk", "head_dim", jnp.asarray(query.shape[-1]))

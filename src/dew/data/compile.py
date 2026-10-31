@@ -73,6 +73,7 @@ from dew.data.dataset import (
     take_batch,
 )
 from dew.data.facts import merge_facts
+from dew.data.holdout import selecting
 from dew.data.lowering import (
     _as_iter,
     _Build,
@@ -122,7 +123,9 @@ from dew.data.pipeline import (
     TokenGeometry,
     Windows,
     Workers,
+    chains,
     children,
+    examples_bound,
     record_stage,
     runs,
     with_children,
@@ -140,6 +143,8 @@ from dew.data.sources.base import (
     materialized,
     tokenizer_contract,
 )
+from dew.data.sources.concatenate import Concatenate
+from dew.data.sources.tokens import TokenFiles
 from dew.data.steps.generic import Coordinated
 
 _DEFAULT_LOADING = Loading()
@@ -289,15 +294,16 @@ def _pin_sources(pipelines: Sequence[Pipeline], read: Read) -> tuple[Pipeline, .
     for branch in pipelines:
         for key, measuring in _measured(branch).items():
             measured.setdefault(key, {}).update({each.measure.fact: each for each in measuring})
-    stores: dict[int, Records] = {}
+    # Each store held beside its records, so no store made later takes a freed one's address and records.
+    stores: dict[int, tuple[Source, Records]] = {}
     reading = threading.Lock()
 
     def whole(store: Source) -> Records:
         # A store several holdout parts measure over is read once for them all.
         with reading:
             if id(store) not in stores:
-                stores[id(store)] = store.records(read)
-            return stores[id(store)]
+                stores[id(store)] = (store, store.records(read))
+            return stores[id(store)][1]
 
     def pin(source: Source) -> _Facts:
         if isinstance(source, _Facts):
@@ -331,6 +337,31 @@ def _measured(pipeline: Pipeline, above: tuple[Measuring, ...] = ()) -> dict[int
         for key, child_measuring in _measured(child, measuring).items():
             found[key] = (*found.get(key, ()), *child_measuring)
     return found
+
+
+def _documented_packs(pipelines: Sequence[Pipeline], objective: ObjectiveData | None = None) -> None:
+    """Refuse to pack token documents from a store that states no document ends (neither an index of
+    them nor an EOS token), wherever it sits under the pack, its chain's own or the objective's, which
+    packs every branch (`_windowed`): its tokens would read as one document, whose pieces no producer
+    made. Checked as the chain is read, not as it is built, so a record names a store it never opens
+    (a run loaded where its data is not, to be pointed at it)."""
+    packs = objective is not None and objective.pack is not None
+    packed = (chain for pipeline in pipelines for chain in chains(pipeline)
+              if (packs and chain is pipeline) or any(isinstance(stage, Pack) for stage in chain.stages))
+    for source in (store for chain in packed for _, leaf in _leaves(chain) for store in _stores(leaf)):
+        if isinstance(source, TokenFiles) and not source.documented:
+            raise ValueError(f"packed text needs producer document boundaries or EOS: {source.describe()}")
+
+
+def _stores(source: Source) -> Iterator[Source]:
+    """Every store `source` reads: a concatenation's parts, and the store each holdout selection
+    selects from."""
+    for _, selected in selecting(source):
+        if isinstance(selected, Concatenate):
+            for part in selected.sources:
+                yield from _stores(part)
+        else:
+            yield selected
 
 
 def _tokenizer_contract(pipelines: Sequence[Pipeline]) -> None:
@@ -397,8 +428,7 @@ def _native_after_bound(pipeline: Pipeline) -> bool:
     """Whether `pipeline` counts the examples its rows consume (`MarkConsumed`) and runs a native Grain step
     after the bound that marks them."""
     stages = pipeline.stages
-    at = next((index for index, stage in enumerate(stages)
-               if isinstance(stage, Map) and isinstance(stage.step, MarkConsumed)), None)
+    at = examples_bound(stages)
     return at is not None and any(isinstance(stage, Native) for stage in stages[at:])
 
 
@@ -406,7 +436,7 @@ def _shuffles_windows(pipeline: Pipeline) -> bool:
     """Whether `pipeline` counts the examples its rows consume (`MarkConsumed`, a run bounded in examples) and
     shuffles in a window after a stage that packs or windows its rows."""
     stages = pipeline.stages
-    if not any(isinstance(stage, Map) and isinstance(stage.step, MarkConsumed) for stage in stages):
+    if examples_bound(stages) is None:
         return False
     packed = next((index for index, stage in enumerate(stages) if isinstance(stage, (Pack, Windows))), None)
     return packed is not None and any(isinstance(stage, Shuffle) and bool(stage.window)
@@ -420,10 +450,12 @@ def _bounded(pipeline: Pipeline, examples: int) -> Pipeline:
     packs or windows them, or its batch: never the rows an objective makes of an example or the windows
     a pack lays them in. A repeat without end goes before the bound
     where none is written, so the records may span passes, and the batch keeps the short one the
-    bound ends inside, filled and marked, so each record bounded is read once (`Loader.examples`).
-    Refuses a bound it cannot place: a repeat with a count before it, or any repeat after it, the
-    batch's included, a mixed corpus that packs on its own, and phases, which end by steps. A chain
-    without a batch is left for `compile` to refuse."""
+    bound ends inside, filled and marked, so each record bounded is read once (`Loader.examples`); in a
+    pool, a read in one order takes the bound before it cuts its shares, and a read whose shares each
+    read records of their own takes on each its part of the pool's first `examples`
+    (`dew.data.lowering._Build.bounded`). Refuses a bound it cannot place: a repeat with a count before
+    it, or any repeat after it, the batch's included, a mixed corpus that packs on its own, and phases,
+    which end by steps. A chain without a batch is left for `compile` to refuse."""
     if examples < 1:
         raise ValueError(f"examples must be at least 1, got {examples}")
     if isinstance(pipeline.source, Phases):
@@ -627,6 +659,7 @@ def _measure(
     for branch, scored in zip(branches, held, strict=True):
         _analyzed(branch, read, validation=scored)
     _capabilities(branches, read, provision)
+    _documented_packs(branches, objective)
     branches = _pin_sources(branches, read)
     _tokenizer_contract(branches)
     branches = tuple(_automatic(branch, read, automatic) for branch in branches)
@@ -727,9 +760,9 @@ def compile(
 def _bound_ends(pipeline: Pipeline) -> bool:
     """Whether `pipeline`'s read, bounded in examples (`_bounded`), ends where its bound does: no limit or
     slice after the bound ends it first (`Loader.bound_ends`)."""
-    at = next((index for index, stage in enumerate(pipeline.stages)
-               if isinstance(stage, Map) and isinstance(stage.step, MarkConsumed)), len(pipeline.stages))
-    return not any(isinstance(stage, (Limit, Slice)) for stage in pipeline.stages[at + 1:])
+    at = examples_bound(pipeline.stages)
+    after = () if at is None else pipeline.stages[at + 1:]
+    return not any(isinstance(stage, (Limit, Slice)) for stage in after)
 
 
 def _training_measure(train: Pipeline, validation: Pipeline | None, *, objective: ObjectiveData | None,
@@ -1685,6 +1718,8 @@ def publish(
         if not isinstance(packing, Pack) or planned != len(pipeline.stages) - 1:
             raise ValueError("publication accepts one terminal packing stage after the cached prefix")
         builder = PackingPlan(packing)
+        # The pack's stores are checked with it, which the prefix published without it is not.
+        _documented_packs((pipeline,))
         pipeline = dataclasses.replace(pipeline, stages=pipeline.stages[:planned])
     (pipeline,) = _prepared((pipeline,), read, provision=provision)
     source = pipeline.source

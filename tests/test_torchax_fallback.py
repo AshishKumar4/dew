@@ -35,6 +35,7 @@ from reference_error import as_given, assert_as_exact, equations, torch_with_gra
 
 from dew.batch import coordinates
 from dew.data.dataset import Loader
+from dew.distributed.placement import Layout
 from dew.interop import Pretrained
 from dew.interop.pretrained import PretrainedFallback
 from dew.interop.torchax_fallback import TorchLayout, TransformersTierWarning
@@ -126,6 +127,64 @@ def loss_and_gradients(loaded, model, params):
 
     return dew_fn
 
+def test_a_load_reads_each_tensor_by_name_from_its_checkpoint(source, loaded, tmp_path):
+    """A tier-3 load reads its checkpoint's tensors by name, memory-mapped, into a model built on the
+    meta device (ledger 1493): every parameter is the source's own, bit for bit, and a parameter the
+    checkpoint lacks is refused, named, where a draw would stand in for the source's."""
+    from safetensors.numpy import load_file, save_file
+
+    directory, model = source
+    params = loaded.variables["params"]
+    held = {name: value for name, value in model.state_dict().items() if name in params}
+    assert set(held) == set(params)
+    for name, value in held.items():
+        np.testing.assert_array_equal(np.asarray(params[name]), value.numpy(), err_msg=name, strict=True)
+    lacking = tmp_path / "lacking"
+    shutil.copytree(directory, lacking)
+    tensors = load_file(lacking / "model.safetensors")
+    del tensors["gpt_neox.layers.0.mlp.dense_h_to_4h.weight"]
+    save_file(tensors, lacking / "model.safetensors", metadata={"format": "pt"})
+    with pytest.raises(ValueError):
+        Pretrained.load(lacking, fallback="torchax", dtype="float32")
+
+
+def test_a_checkpoint_transformers_converts_is_refused_where_it_lacks_a_parameter(tmp_path):
+    """A tier-3 checkpoint in a layout transformers' load converts (OLMoE's experts a tensor each, which it
+    fuses) loads through that load, and is refused where it lacks a parameter its model's class names,
+    which that load would draw, as a checkpoint read by name is (ledger 1493)."""
+    from safetensors.numpy import load_file, save_file
+
+    config = transformers.OlmoeConfig(vocab_size=256, hidden_size=32, intermediate_size=32,
+                                      num_hidden_layers=1, num_attention_heads=2, num_key_value_heads=2,
+                                      num_experts=2, num_experts_per_tok=1, max_position_embeddings=64)
+    transformers.OlmoeForCausalLM(config).eval().save_pretrained(tmp_path)
+    tensors = load_file(tmp_path / "model.safetensors")
+    assert any(".mlp.experts.0." in name for name in tensors)
+    with pytest.warns(TransformersTierWarning):
+        Pretrained.load(tmp_path, fallback="torchax", dtype="float32")
+    del tensors["model.layers.0.self_attn.q_proj.weight"]
+    save_file(tensors, tmp_path / "model.safetensors", metadata={"format": "pt"})
+    with pytest.raises(ValueError):
+        Pretrained.load(tmp_path, fallback="torchax", dtype="float32")
+
+
+def test_two_tier_3_models_place_their_names_side_by_side(loaded, tmp_path):
+    """A run of two tier-3 models (a distillation's student and teacher) places each one's torch names by
+    its own plan, the second refining the layout the first refined (`TorchCausalLM.placement`), and one
+    name two models would place differently is refused, which one layout cannot place both by."""
+    ctrl = transformers.CTRLConfig(n_positions=32, n_embd=64, n_layer=2, n_head=4, dff=128, vocab_size=256)
+    transformers.CTRLLMHeadModel(ctrl).eval().save_pretrained(tmp_path)
+    with pytest.warns(TransformersTierWarning):
+        other = Pretrained.load(tmp_path, dtype="float32", fallback="torchax")
+    both = other.model.placement(loaded.model.placement(Layout()))
+    assert isinstance(both, TorchLayout)
+    assert both.axes("gpt_neox.layers.0.attention.query_key_value.weight", 2) == ("mlp", "embed")
+    assert both.axes("transformer.w.weight", 2) == ("vocab", "embed")
+    assert loaded.model.placement(both) == both
+    with pytest.raises(ValueError):
+        loaded.model.placement(TorchLayout(names=(("gpt_neox.embed_in.weight", ("embed", "vocab")),)))
+
+
 def test_the_logits_and_the_objective_loss_are_transformers(source, loaded, tokens):
     """`apply` is the torch forward, and LMObjective's chunked loss over the
     captured head input and the head weight is transformers' own loss."""
@@ -159,7 +218,8 @@ def test_the_gradients_are_transformers(source, loaded, tokens):
 def test_trainer_steps_move_the_params_and_place_them_by_name(loaded, tokens):
     """AdamW through the Trainer on a fsdp x tensor mesh: the loss falls,
     every parameter moves, the rotary buffers come back bitwise, and the
-    torch names take the specs the name table gives them."""
+    torch names take the specs the model's tensor-parallel plan gives them: a trainer built from Python
+    takes the layout as the objective's model refines it (`Objective.placement`, ledger 2777)."""
     params, buffers = loaded.variables["params"], loaded.variables["buffers"]
     assert set(buffers) == {"gpt_neox.rotary_emb.inv_freq", "gpt_neox.rotary_emb.original_inv_freq"}
     assert not set(params) & set(buffers)
@@ -168,7 +228,8 @@ def test_trainer_steps_move_the_params_and_place_them_by_name(loaded, tokens):
     batch = tokens[np.arange(rows) % ROWS]
     data = Loader(train=lambda partition: iter([{"text": batch}] * 4), val=None, records=rows, batch=rows)
     trainer = Trainer(objective, optax.adamw(1e-2), key=jax.random.key(0),
-                      mesh=MeshSpec(fsdp=2, tensor=2), layout=TorchLayout(min_shard=1))
+                      mesh=MeshSpec(fsdp=2, tensor=2), layout=Layout(min_shard=1))
+    assert trainer.layout == objective.placement(Layout(min_shard=1)) != Layout(min_shard=1)
 
     state = trainer.fit(data, steps=4, log_every=1)
 
@@ -181,16 +242,33 @@ def test_trainer_steps_move_the_params_and_place_them_by_name(loaded, tokens):
     layer = "gpt_neox.layers.0"
     assert moved[f"{layer}.attention.query_key_value.weight"].sharding.spec == P("tensor", "fsdp")
     # The row-parallel projection, [embed, mlp] in torch: the residual width
-    # takes fsdp and the 4h width the tensor axis (8a6ff3e8's Megatron 2-D).
+    # takes fsdp and the 4h width the tensor axis (40e6435b's Megatron 2-D).
     assert moved[f"{layer}.mlp.dense_4h_to_h.weight"].sharding.spec == P("fsdp", "tensor")
     assert moved["gpt_neox.embed_in.weight"].sharding.spec == P(("fsdp", "tensor"))
 
 
 @pytest.mark.mesh(devices=4)
+def test_a_load_onto_a_mesh_places_the_torch_names_by_the_models_plan(source):
+    """A tier-3 source loaded onto a mesh (a run's frozen source, `RunConfig.source_placement`) lies as its
+    model's tensor-parallel plan places its torch names (`TorchCausalLM.placement`): a column-split
+    projection's output width on the tensor axis and its input on fsdp, a row-split one's the other way,
+    its token table's rows over both; a tensor the plan names nothing for, a norm's, by the shape."""
+    with pytest.warns(UserWarning):
+        placed = Pretrained.load(source[0], fallback="torchax", dtype="float32",
+                                 mesh=MeshSpec(fsdp=2, tensor=2), layout=Layout(min_shard=1))
+    assert isinstance(placed.model.placement(Layout()), TorchLayout)
+    params, layer = placed.variables["params"], "gpt_neox.layers.0"
+    assert params[f"{layer}.attention.query_key_value.weight"].sharding.spec == P("tensor", "fsdp")
+    assert params[f"{layer}.attention.dense.weight"].sharding.spec == P("fsdp", "tensor")
+    assert params[f"{layer}.mlp.dense_h_to_4h.weight"].sharding.spec == P("tensor", "fsdp")
+    assert params["gpt_neox.embed_in.weight"].sharding.spec == P(("fsdp", "tensor"))
+
+
+@pytest.mark.mesh(devices=4)
 def test_a_frozen_torch_base_kept_whole_drops_fsdp_from_the_name_tables_placement(loaded, tokens):
-    """`Layout.frozen_whole` reaches a torch-named tree: TorchLayout's name table picks each
-    tensor's axes, and the one placement keeps the frozen tensors whole over fsdp, split over the
-    tensor axis as the table splits them, while the trained ones, their moments and one step's
+    """`Layout.frozen_whole` reaches a torch-named tree: the model's tensor-parallel plan picks each
+    tensor's axes (`TorchLayout`), and the one placement keeps the frozen tensors whole over fsdp, split
+    over the tensor axis as the plan splits them, while the trained ones, their moments and one step's
     update lie as the split layout lays them."""
     from dew.batch import FROZEN, freeze
     from dew.distributed.batches import shard_batch
@@ -204,7 +282,8 @@ def test_a_frozen_torch_base_kept_whole_drops_fsdp_from_the_name_tables_placemen
     def stepped(frozen_whole: bool):
         objective = LMObjective(loaded, seq_len=SEQ, ema_decay=None, variables=variables)
         trainer = Trainer(objective, optax.adamw(1e-2), key=jax.random.key(0), mesh=mesh, checkpoints=None,
-                          tracker=None, layout=TorchLayout(min_shard=1, frozen_whole=frozen_whole))
+                          tracker=None,
+                          layout=Layout(min_shard=1, frozen_whole=frozen_whole))
         trainer.device_mesh = mesh.build(jax.devices()[:4])
         state, shardings, _ = trainer.place()
         placed = shard_batch(trainer.device_mesh, batch)
@@ -1044,7 +1123,8 @@ def test_a_tier_3_source_generates_through_the_pipeline_loader_as_its_bundle_doe
 def test_a_tier_3_model_decodes_through_dews_cache_as_transformers_runs_each_prefix(family, stated, tmp_path):
     """A tier-3 model on Dew's attention decodes through Dew's cache: a padded prompt fills its row's
     slots and each next token one more, and every decoded step's logits hold check 1 against
-    transformers' full forward of that row's prefix (its float64 twin's the truth), Cohere 2's window
+    transformers' full forward of that row's prefix, each step's its own at the width it reads (ledger
+    1543; its float64 twin's one forward the truth), Cohere 2's window
     included, the padding stated by a validity mask or as the document 0 of the row's segments; its
     greedy generation's tokens are the full forward's argmax at each step."""
     from dew.inference import TextGeneration
@@ -1092,20 +1172,25 @@ def test_a_tier_3_model_decodes_through_dews_cache_as_transformers_runs_each_pre
     def ours(prompt, valid, continued):
         return np.asarray(decoded(loaded.variables, prompt, valid, continued), np.float64)
 
-    def theirs(source, precision=contextlib.nullcontext):
+    def theirs(source, precision=contextlib.nullcontext, *, stepped: bool = True):
+        def forward(ids):
+            with precision(), torch.no_grad():
+                return source(torch.from_numpy(ids[None]).long()).logits[0].double().numpy()
+
         def run(prompt, valid, continued):
             rows = []
             for row in range(2):
                 ids = np.concatenate([prompt[row][valid[row]], continued[row]])
-                with precision(), torch.no_grad():
-                    logits = source(torch.from_numpy(ids[None]).long()).logits[0].double().numpy()
                 real = int(valid[row].sum())
-                rows.append(logits[real - 1:real + steps])
+                if stepped:
+                    rows.append(np.stack([forward(ids[:real + step])[-1] for step in range(steps + 1)]))
+                else:
+                    rows.append(forward(ids)[real - 1:real + steps])
             return np.stack(rows)
         return as_given(run)
 
     assert_as_exact(ours, theirs(reference), draw, f"{family} cached logits ({stated})",
-                    seeds=DECODE_SEEDS[family], truth_fn=theirs(wide, float64))
+                    seeds=DECODE_SEEDS[family], truth_fn=theirs(wide, float64, stepped=False))
 
     # The rows' coordinates state the same validity and positions as their separate fields.
     prompt, valid, _ = draw(0)

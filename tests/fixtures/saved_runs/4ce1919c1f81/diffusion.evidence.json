@@ -1,7 +1,62 @@
 {
  "step": 2,
  "compute": "bfloat16",
- "task_compute": "bfloat16",
+ "products": {
+  "conditioning/text_context_proj": [
+   "bfloat16",
+   "float64"
+  ],
+  "conditioning/time_embed/layers_1/DenseGeneral_0": [
+   "bfloat16",
+   "float64"
+  ],
+  "conditioning/time_embed/layers_1/DenseGeneral_1": [
+   "bfloat16",
+   "float64"
+  ],
+  "conditioning/time_embed/layers_2": [
+   "bfloat16",
+   "float64"
+  ],
+  "dit_block_0/ada_params_module/ada_proj": [
+   "bfloat16",
+   "float64"
+  ],
+  "dit_block_0/attention": [
+   "bfloat16"
+  ],
+  "dit_block_0/attention/to_k": [
+   "bfloat16",
+   "float64"
+  ],
+  "dit_block_0/attention/to_out_0": [
+   "bfloat16",
+   "float64"
+  ],
+  "dit_block_0/attention/to_q": [
+   "bfloat16",
+   "float64"
+  ],
+  "dit_block_0/attention/to_v": [
+   "bfloat16",
+   "float64"
+  ],
+  "dit_block_0/mlp/down_proj": [
+   "bfloat16",
+   "float64"
+  ],
+  "dit_block_0/mlp/up_proj": [
+   "bfloat16",
+   "float64"
+  ],
+  "embed/patch_embed/Conv_0": [
+   "float64"
+  ],
+  "output/final_proj": [
+   "bfloat16",
+   "float64"
+  ]
+ },
  "params": [
   "float32"
  ],

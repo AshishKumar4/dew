@@ -9,6 +9,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
+from dew.nn.kernels import tuning
 from dew.nn.kernels.templates import attention_algebra as algebra, mosaic
 from dew.nn.kernels.templates.attention import Dropout
 from dew.nn.kernels.templates.attention_mosaic_program import (
@@ -18,6 +19,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _Spans,
     reducing,
     stated,
+    traced_name,
 )
 from dew.nn.kernels.templates.attention_mosaic_scores import (
     _Backward,
@@ -106,7 +108,8 @@ def _dq_launch(query, key, value, dout, peak, prior, anchor, delta, key_index, s
     columns = walk.program.tiles.columns
     width = query.shape[-1] // columns
     launched = [_dq_columns(query, key, value, dout, peak, prior, anchor, delta, key_index, spans,
-                            score_params, drop, walk=walk, share=(column * width, width))
+                            score_params, drop, walk=walk, share=(column * width, width),
+                            names=traced_name("attention_dq" + ("" if columns == 1 else f"_columns{column}")))
                 for column in range(columns)]
     if columns == 1:
         return launched[0]
@@ -115,8 +118,10 @@ def _dq_launch(query, key, value, dout, peak, prior, anchor, delta, key_index, s
     keyed = jnp.concatenate(keyed_parts, axis=-1) if keyed_parts else None
     return dq, keyed, launched[0][2]
 
+@tuning.lowered_once(("walk", "share", "names"))
 def _dq_columns(query, key, value, dout, peak, prior, anchor, delta, key_index, spans: _Spans | None,
-                score_params: tuple, drop: Dropout | None, *, walk: _Backward, share: tuple[int, int]):
+                score_params: tuple, drop: Dropout | None, *, walk: _Backward, share: tuple[int, int],
+                names: tuple[str, str | None]):
     """The dQ program's sums over its key tiles (`algebra.dq_issued`), unfinished: dQ's and, in the accurate
     form, the keys' product with the weights (`DqSums.keyed`), `[B, Qp, H, D]` fp32 each; and the rows
     `[4 + 2n, B, H, Qp]` fp32 (n the dQ parameters, `walk.summed`): the cotangents' and weights' row sums, the
@@ -199,7 +204,7 @@ def _dq_columns(query, key, value, dout, peak, prior, anchor, delta, key_index, 
         entry, out_type=(sums, sums, stats_shape) if walk.accurate else (sums, stats_shape),
         grid=(heads, queries // pair, batch), grid_names=("heads", "q_tiles", "batch"), consumers=consumers,
         interpret=walk.interpret, approx_math=walk.approx_math,
-        name="attention_dq" + ("" if share[1] == width else f"_columns{share[0] // share[1]}"),
+        name=names[0], kernel_name=names[1],
         reducing_warpgroups=reducing(family, consumers, walk.spec.score_mod),
         # Its share of dQ's product, the model's this launch owns (`stated`): its `S` and `dP` recomputed.
         cost=stated(walk.spec, batch, heads, walk.spec.queries or queries, share[1], query, key, value,

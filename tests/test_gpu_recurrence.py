@@ -12,16 +12,19 @@ cases the CPU does not interpret, run in one process (`gpu_flow`), each cell its
 - Each recurrence layer trained on its port's kernels, natively (`PORT_KERNELS`): a gated delta net on the
   FLA GDN kernels and a Kimi delta attention layer on FLA KDA's chunk_kda, packed rows, forward and every
   gradient on par from float64 with the portable rule's; their training step the same bit for bit each
-  run, on the port and on the template; and a gated delta net's decode token on its decode kernels (the
-  fused step and the step alone) on par with the portable step's.
+  run, on the port and on the template; a gated delta net's decode tokens on its decode kernels (the fused
+  step and the step alone), its state held in fp32 and in bf16, on par with the portable step's; and the
+  port on par with fla's own in fp32 and mixed dtypes (test_fla_gdn), fla run in the reference interpreter
+  DEW_FLA_PYTHON names, which a GPU job provides to a file naming it.
 """
 
 import functools
 
+import gpu_flow
 import jax
 import jax.numpy as jnp
-import numpy as np
 import pytest
+import test_fla_gdn as fla_gdn
 import test_mamba_ssd as mamba_ssd
 import test_recurrence_mosaic as forward
 import test_recurrence_mosaic_gradient as gradient
@@ -114,30 +117,42 @@ def repeats_bit_for_bit(make, kernel: str):
     params = named(layer.init, gated_delta_rule="xla")(jax.random.key(6), x)
     step = jax.jit(named(jax.grad(lambda params, x: jnp.sum(layer.apply(params, x).astype(jnp.float32) ** 2),
                                   argnums=(0, 1)), gated_delta_rule=kernel))
-    first = jax.tree.map(np.asarray, step(params, x))
-    jax.clear_caches()  # compiled afresh: a schedule its compiler picks must repeat too
-    again = jax.tree.map(np.asarray, step(params, x))
-    for (path, one), other in zip(jax.tree_util.tree_leaves_with_path(first), jax.tree.leaves(again),
-                                  strict=True):
-        np.testing.assert_array_equal(one.view(np.uint8), other.view(np.uint8),
-                                      err_msg=jax.tree_util.keystr(path))
+    gpu_flow.repeats_bit_for_bit(step, params, x)
 
 
-def decodes_on_its_kernel(kernel: str):
-    """A gated delta net's decode token on `kernel` (`linear.DELTA_DECODE`: 'fused' or 'step'), its output
-    and its updated state on par from float64 with the portable step's (check 1)."""
-    layer = fused_case(4, 128, 3, jnp.bfloat16, jnp.float32)[0]
+DECODED = 4
+"""The tokens a decode cell decodes in turn after its prefill."""
 
-    def decode(variables, cache, token):
-        out, after = layer.apply({**variables, "cache": cache}, token, MixerCall(decode=True),
-                                 mutable=["cache"])
-        return out, after["cache"]["recurrent_state"]
+
+def decodes_on_its_kernel(kernel: str, held):
+    """A gated delta net's decode tokens on `kernel` (`linear.DELTA_DECODE`: 'fused' or 'step'), `DECODED`
+    in turn after a prefill, its recurrent state held in `held`: each token's output, and the conv history
+    and recurrent state it leaves, on par with the portable step's (check 1) from the layer in float64 (the
+    truth: a bf16 layer on widened arguments fixes its projections and norm in bf16 and casts its state
+    back, so only the stored state's rounding is the contract's)."""
+    layer = fused_case(4, 128, 3, jnp.bfloat16, held)[0]
+
+    def decoded(module):
+        def decode(variables, cache, tokens):
+            outs = []
+            for at in range(DECODED):
+                out, after = module.apply({**variables, "cache": cache}, tokens[:, at:at + 1],
+                                          MixerCall(decode=True), mutable=["cache"])
+                outs.append(out)
+                cache = after["cache"]
+            return jnp.concatenate(outs, axis=1), cache["conv_state"], cache["recurrent_state"]
+        return decode
 
     def draw(seed):
-        return fused_case(4, 128, 3, jnp.bfloat16, jnp.float32, seed)[1:]
+        _, variables, cache, token = fused_case(4, 128, 3, jnp.bfloat16, held, seed)
+        later = jax.random.normal(jax.random.key(3000 + seed), (token.shape[0], DECODED - 1, token.shape[-1]))
+        return variables, cache, jnp.concatenate([token, later.astype(token.dtype)], axis=1)
 
-    assert_as_exact(named(decode, delta_decode=kernel), named(decode, delta_decode="xla"), draw,
-                    f"a gated delta net decoding on its {kernel} kernel", seeds=FEWEST_SEEDS)
+    assert_as_exact(named(decoded(layer), delta_decode=kernel), named(decoded(layer), delta_decode="xla"),
+                    draw,
+                    f"a gated delta net decoding {DECODED} tokens on its {kernel} kernel, its state held in "
+                    f"{jnp.dtype(held).name}", seeds=FEWEST_SEEDS,
+                    truth_fn=named(decoded(layer.clone(dtype=jnp.float64)), delta_decode="xla"))
 
 
 def test_the_recurrences_run_on_this_gpu():
@@ -186,12 +201,16 @@ def test_the_recurrences_run_on_this_gpu():
              functools.partial(trains_on_its_port, gated_delta_net)),
         Cell(f"a Kimi delta attention layer trains on its port on par with the portable rule "
              f"({PORT_KERNELS['kda']})", functools.partial(trains_on_its_port, kimi_delta_attention)),
-        # The template takes no Kimi delta attention call on these GPUs yet (its intra launch's registers,
-        # ledger 1445): its port's step alone.
+        # Kimi delta attention trains on its port alone: the template's fast backward takes no decay a key
+        # dimension.
         *(Cell(f"a {make.__name__} training step on {kernel} repeats bit for bit",
                functools.partial(repeats_bit_for_bit, make, kernel))
           for make, kernels in ((gated_delta_net, ("fla", "mosaic_gpu")), (kimi_delta_attention, ("fla",)))
           for kernel in kernels),
-        *(Cell(f"a gated delta net decodes on its {kernel} kernel on par with the portable step",
-               functools.partial(decodes_on_its_kernel, kernel)) for kernel in ("fused", "step")),
+        *(Cell(f"a gated delta net decodes on its {kernel} kernel on par with the portable step, its state "
+               f"held in {jnp.dtype(held).name}", functools.partial(decodes_on_its_kernel, kernel, held))
+          for kernel in ("fused", "step") for held in (jnp.float32, jnp.bfloat16)),
+        *(Cell(f"the port is as exact as fla's own: {'kda' if per_key else 'gdn'} {dtypes}",
+               functools.partial(fla_gdn.the_port_is_as_exact_as_fla, per_key, dtypes))
+          for per_key in (False, True) for dtypes in fla_gdn.FLA_DTYPES),
     ])

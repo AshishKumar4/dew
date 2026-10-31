@@ -5,19 +5,25 @@ a lettered one, a block-diffusion run over a nested decoder, a run on the exampl
 bfloat16 and in float16 (whose loss a dynamic scale scales), and a run over a source stored as it states."""
 
 import dataclasses
+import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 
-import jax.numpy as jnp
 import numpy as np
+import test_run_options as run_options
 from test_lm_recipe import SEQ, write_token_files
 from test_run_options import KINDS, decision, lm, read
-from token_support import write_token_corpus
 
-from dew.config import ObjectiveConfig, RunConfig, SourceOptions, TrainerConfig
-from dew.data import Loading, presets
+from dew.config import RunConfig, SourceOptions, TrainerConfig
+from dew.data import presets
 from dew.data.sources.tokens import TokenFiles
-from dew.decision.config import Letters
-from dew.decision.layout import Labels, built_in
+from dew.decision import Choice
+from dew.decision.layout import built_in
+from dew.decision.task import Decide
+from dew.inference.images import TextToImage
+from dew.inference.tasks import BlockGeneration, TextGeneration
 from dew.nn.precision import numerics_of
 from dew.registry import ModelConfig
 from dew.training.budget import Pause
@@ -60,25 +66,14 @@ def segmented(root: Path, drawn: bool) -> RunConfig:
 
 
 def lettered(root: Path, drawn: bool) -> RunConfig:
-    """A decision run of a fresh letter readout (`--head letters`) over a tiny causal source, its rows
-    lettered option lines read at an answer cue."""
-    # The tiny tokenizer spells each letter as one token bare ("{}"), not after a space.
-    return dataclasses.replace(decision(root, drawn), pretrained=QWEN,
-                               head=Letters(labels=Labels(variants=("{}",)), count=4),
-                               source=SourceOptions(text_only=True))
+    """`test_run_options.lettered`'s fresh letter readout, its source by its path in the repo."""
+    return dataclasses.replace(run_options.lettered(root, drawn), pretrained=QWEN)
 
 
 def blockwise(root: Path, drawn: bool) -> RunConfig:
-    """A block-diffusion run over a release whose text decoder its model nests (`DiffusionGemma.text`)."""
-    # Its windows as `test_lm_recipe.gemma_spans` writes them, the tokenizer by its path in the repo.
-    corpus = write_token_corpus(root / "gemma-tokens", np.random.RandomState(160).randint(4, 32, 160),
-                                tokenizer=DIFFUSION_GEMMA, vocab_size=32, eos_id=1)
-    spans = TokenFiles(corpus.train).pipe(presets.lm, None, seq_len=11, batch=8, pack=None).loading(
-        Loading(workers=0))
-    model = ModelConfig("causal_transformer", {"dtype": "float32", "attention_impl": "xla"})
-    return dataclasses.replace(lm(root, drawn), pretrained=DIFFUSION_GEMMA, tokenizer=DIFFUSION_GEMMA,
-                               objective=ObjectiveConfig("block_diffusion", {"prompt_length": 4}),
-                               model=model, data=spans, validation=None, max_new_tokens=0)
+    """`test_run_options.blockwise`'s block-diffusion run over a release whose text decoder its model nests,
+    its release and tokenizer, its token files' too, by their path in the repo."""
+    return run_options.blockwise(root, drawn, release=DIFFUSION_GEMMA)
 
 
 def clocked(root: Path, drawn: bool) -> RunConfig:
@@ -113,20 +108,46 @@ def stored(root: Path, drawn: bool) -> RunConfig:
     return dataclasses.replace(over(QWEN, root, drawn), source=SourceOptions(param_dtype="bfloat16"))
 
 
-def computed(model) -> str | None:
-    """The dtype a built model computes in: the first a module of it states (Flax's `dtype`), its own or
-    a module's it holds, breadth first (a decision model's backbone's, a wrapper's decoder's)."""
-    import flax.linen as nn
+def computed(directory: Path | str, step: int | None = None) -> dict[str, list[str]]:
+    """Each module's dtypes, by its variable scope's path, that one request of the task a saved run at
+    `directory` loads, at `step` or else its default, multiplies in: its products' operands'
+    (`saved_run_products`), read in a fresh interpreter, where every program the request runs lowers, as
+    the corpus's writer reads them. A model whose outer module states bfloat16 while one projection of
+    its decoder computes in float32 states float32 at that projection's scope. The products are the
+    suite's CPU's, in the suite's environment, whose wide arithmetic multiplies a product summed in
+    float32 in float64 (`dew.nn.precision.accumulated`); an accelerator lowers its own (bible §7 runs
+    these files on the CPU)."""
+    root = Path(__file__).resolve().parents[1]
+    environment = {**os.environ, "PYTHONPATH": os.pathsep.join(
+        [str(root / "src"), *filter(None, [os.environ.get("PYTHONPATH")])])}
+    # A record names the repo's sources by their path in it, read from the checkout's root.
+    done = subprocess.run([sys.executable, str(Path(__file__).with_name("saved_run_products.py")),
+                           str(directory), *([] if step is None else [str(step)])], cwd=root,
+                          env=environment, capture_output=True, text=True, timeout=600, check=False)
+    assert done.returncode == 0, done.stderr[-3000:]
+    found = json.loads(done.stdout.splitlines()[-1])
+    assert found, "the request lowered no matrix product"
+    return found
 
-    frontier = [model]
-    while frontier:
-        module = frontier.pop(0)
-        stated = getattr(module, "dtype", None)
-        if stated is not None:
-            return str(jnp.dtype(stated))
-        frontier += [value for field in dataclasses.fields(module)
-                     if isinstance(value := getattr(module, field.name, None), nn.Module)]
-    return None
+
+def answered(task) -> None:
+    """One request of a loaded task, as its kind's users make it, and its answer: a language model
+    continues a prompt by one token through the tokenizer its run recorded, a decision answers a
+    question about a state, and a text-to-image run draws an image in one step."""
+    if isinstance(task, TextGeneration):
+        assert len(task.decode(task("ab", max_new_tokens=1, key=0))) == 1
+    elif isinstance(task, BlockGeneration):
+        # A response of at least one token past the prompt, its decoder having stepped.
+        generated = task([[4, 5, 6, 7]], 4, key=0).host()
+        assert (np.asarray(generated.lengths) > 0).all() and (np.asarray(generated.decoder_steps) > 0).all()
+    elif isinstance(task, Decide):
+        question = {"team": Choice("which team", ["billing", "technical", "sales"])}
+        [answers] = task([({"text": "the site is down"}, question)])
+        assert answers["team"].choice in ("billing", "technical", "sales")
+    elif isinstance(task, TextToImage):
+        assert len(task(["a cat"], steps=1, key=0).pil()) == 1
+    else:
+        raise AssertionError(f"no request is written for a saved {type(task).__name__}")
 
 
 SAVED_KINDS = {**KINDS, "multimodal": multimodal, "decision-segments": segmented,

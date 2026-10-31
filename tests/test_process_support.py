@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 import pytest
-from process_support import ProcessGroup, run_pool, start_process, terminate
+from process_support import ProcessGroup, run_pool, running, start_process, terminate
 
 
 def test_pool_reports_follow_rank_order_and_workers_own_sessions(tmp_path):
@@ -43,12 +43,7 @@ def test_finalizer_kills_descendants_after_the_session_leader_exits():
         descendant = int(process.stdout.readline())
         process.wait(timeout=5)
         os.kill(descendant, 0)
-    try:
-        status = Path(f"/proc/{descendant}/stat").read_text().split()[2]
-    except (FileNotFoundError, ProcessLookupError):
-        # Reaped: its stat went before it could be read, or while it was.
-        status = "gone"
-    assert status in ("Z", "gone")
+    assert not running(descendant)
 
 
 def test_failed_worker_keeps_every_ranks_output_and_stops_its_peers(tmp_path, capsys):
@@ -114,8 +109,8 @@ def test_timed_out_pool_reports_every_rank_and_reaps_them(tmp_path):
 
 def test_a_worker_ends_with_its_owner_however_the_owner_dies(tmp_path):
     """A worker in a session of its own, and what it started, end when the harness that owns them dies, by
-    SIGKILL from outside as by any signal that unwinds nothing: their ownership outlives no owner (Main,
-    2026-10-28: a worker outlived its killed owner 43 hours at 195% CPU on the VM; armada job
+    SIGKILL from outside as by any signal that unwinds nothing: their ownership outlives no owner (the
+    maintainer, 2026-10-28: a worker outlived its killed owner 43 hours at 195% CPU on the VM; armada job
     20261028061537-7e66486a)."""
     owner = (
         "import sys, time\n"

@@ -8,7 +8,7 @@ from jax._src.interpreters import mlir as jax_mlir
 from jax.extend.mlir import ir
 from jaxlib.mlir import passmanager
 from jaxlib.mosaic.python import mosaic_gpu as mosaic_gpu_dialect
-from kernel_liveness import Compiler, kernel_peaks, lowered_registers
+from kernel_liveness import Compiler, divergent_values, kernel_peaks, lowered_registers
 
 
 def serialized(body: str):
@@ -118,6 +118,77 @@ def test_a_uniform_address_still_occupies_the_loads_general_registers():
       }
     """)
     assert peak.total >= 2
+
+
+def test_packed_and_original_values_take_distinct_live_registers():
+    peak = analyzed("""
+      module {
+        func.func @kernel(%x: vector<2xf32>) {
+          %narrow = arith.truncf %x : vector<2xf32> to vector<2xbf16>
+          %bits = vector.bitcast %narrow : vector<2xbf16> to vector<1xi32>
+          %packed = vector.extract %bits[0] : i32 from vector<1xi32>
+          %first = vector.extract %x[0] : f32 from vector<2xf32>
+          %second = vector.extract %x[1] : f32 from vector<2xf32>
+          llvm.inline_asm has_side_effects "", "r,f,f" %packed, %first, %second : (i32, f32, f32) -> ()
+          return
+        }
+      }
+    """)
+    assert peak.total == 3
+
+
+@pytest.mark.parametrize('variable_trip', [False, True])
+def test_a_loop_propagates_its_carries_separately_and_keeps_trip_count_dependencies(variable_trip):
+    upper = '%tid' if variable_trip else '%many'
+    with jax_mlir.make_ir_context():
+        module = ir.Module.parse(f"""
+          module {{
+            func.func @kernel() -> (f32, index) {{
+              %zero = arith.constant 0 : index
+              %one = arith.constant 1 : index
+              %many = arith.constant 16 : index
+              %tid = gpu.thread_id x
+              %integer = arith.index_cast %tid : index to i32
+              %seed = arith.sitofp %integer : i32 to f32
+              %out:2 = scf.for %i = %zero to {upper} step %one
+                  iter_args(%value = %seed, %counter = %zero) -> (f32, index) {{
+                %next = arith.addf %value, %value : f32
+                %count = arith.addi %counter, %one : index
+                scf.yield %next, %count : f32, index
+              }}
+              return %out#0, %out#1 : f32, index
+            }}
+          }}
+        """)
+        varying = divergent_values(module)
+        function = module.body.operations[0]
+        loop = next(op for op in function.regions[0].blocks[0].operations if op.operation.name == 'scf.for')
+        _, value, counter = loop.regions[0].blocks[0].arguments
+        assert value in varying
+        assert (counter in varying) == variable_trip
+        assert (loop.results[1] in varying) == variable_trip
+
+
+@pytest.mark.parametrize('mask', [-1, 65535])
+def test_only_a_full_warp_broadcast_makes_a_varying_value_uniform(mask):
+    with jax_mlir.make_ir_context():
+        module = ir.Module.parse(f"""
+          module {{
+            func.func @kernel() -> i32 {{
+              %mask = arith.constant {mask} : i32
+              %lane = arith.constant 0 : i32
+              %clamp = arith.constant 31 : i32
+              %tid = gpu.thread_id x
+              %source = arith.index_cast %tid : index to i32
+              %shared = nvvm.shfl.sync idx %mask, %source, %lane, %clamp : i32 -> i32
+              return %shared : i32
+            }}
+          }}
+        """)
+        varying = divergent_values(module)
+        function = module.body.operations[0]
+        returned = list(function.regions[0].blocks[0].operations)[-1].operation.operands[0]
+        assert (returned in varying) == (mask != -1)
 
 
 def test_the_compiler_input_accounts_for_a_transcendental_chain_kept_as_a_vector():

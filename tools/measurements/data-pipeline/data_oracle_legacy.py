@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Capture loader behavior inside the pinned 66beb5305 reference checkout.
+"""Capture loader behavior inside the pinned 7ad0d4079 reference checkout.
 
 Run through data_oracle.py beside it, which downloads that checkout and runs
 this script inside it:
@@ -44,7 +44,7 @@ def digest(batch):
     """The batch's public fields: each array's shape, dtype and content digest by its path, and each
     record's static facts (`Coordinates`' `max_segments` and `right_padded`) by theirs, not the tree's
     spelling. A field that is None holds nothing and adds no entry, where a renamed field or a changed
-    static fact still changes the digest (Main, 10-27: a field added to Coordinates once re-recorded
+    static fact still changes the digest (the maintainer, 10-27: a field added to Coordinates once re-recorded
     142 tree strings whose leaves had not moved). tests/test_pipeline_golden.py reads Dew's batches by
     this digest, so a capture and the test's reading of it are one format."""
     fields = {}
@@ -423,7 +423,7 @@ def main():
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="dew-data-oracle-") as directory:
         configurations = fixtures(Path(directory))
-        oracle = {"baseline": "66beb5305", "cases": {}}
+        oracle = {"baseline": "7ad0d4079", "cases": {}}
         for name, factory in configurations.items():
             if args.case and name not in args.case:
                 continue

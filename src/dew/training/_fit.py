@@ -22,15 +22,16 @@ from flax.training.early_stopping import EarlyStopping
 from jax.sharding import Mesh
 
 from dew import position
-from dew._coordination import agreed, agreed_next
-from dew._records import JSON
+from dew._coordination import agreed, agreed_next, agreed_reads
+from dew._records import JSON, integers
 from dew.batch import CLOSES_WINDOW, CONSUMED_COUNT, EXAMPLES_CONSUMED, VALID_ROWS, Batch, ConsumedCount
 from dew.checkpoints import Checkpoints
 from dew.data.compile import Handed, native
-from dew.data.dataset import Checkpointable, Closeable, DataPartition, Loader, PhasedStream, Reader
+from dew.data.dataset import Checkpointable, Closeable, DataPartition, Loader, PhasedStream, Reader, rows_of
 from dew.data.pipeline import Dataset
 from dew.distributed.batches import DevicePrefetchIterator, Signature, restore_position
 from dew.distributed.placement import MeshSpec, Placement
+from dew.held_updates import waiting
 from dew.objectives.base import Initializer, Metric, Objective, TrainingScalar
 from dew.optim import OptimConfig, reclocked
 from dew.state import TrainState
@@ -40,6 +41,7 @@ from dew.training.cadence import Cadence, Counted
 from dew.training.cooldown import Branch
 from dew.training.evaluation import EvalSuite, Evaluation, Summary
 from dew.training.interval import Interval, LogWriter, Taken, TokenClock
+from dew.training.model_flops import TOKENS
 from dew.training.observe import Observe
 from dew.training.profiling import ProfileWindow, start_capture
 from dew.training.runtime import PreemptionNotice
@@ -334,6 +336,16 @@ class FitRun:
     ahead: tuple[Batch | None] | None = None
     """The next batch, or None for the stream's end, read before the step that takes it, where a
     save had to know whether the run ends there (`ends_here`)."""
+    pooled: bool = False
+    """Whether the run is on the examples clock in a pool, whose shares end apart: each reads on, a share
+    that ran out with a batch of the pool's tree emptied (`emptied`), until every one has, the examples
+    each step consumed counted over the pool (`pooled_read`)."""
+    emptied: Emptied | None = None
+    """A pooled run's batches of the pool's tree with nothing in them, which a share that ran out steps
+    with (`pooled_read`)."""
+    profiled: tuple[int, int] | None = None
+    """The steps a stopped profile window traced and the step it stopped at, whose export the run's
+    cleanup waits for before it reports the window (`Trainer._exported_profile`)."""
     best: HeldBest = dataclasses.field(default_factory=HeldBest)
     """The log taken at the latest logging step and not yet read."""
     stepped: tuple[jax.Array, dict[str, jax.Array], jax.Array] | None = None
@@ -468,30 +480,53 @@ def drained(batch: Batch, consumed: int, bound: int) -> Batch:
     """A clocked run's last `batch`, its stream run out, holding the examples its bound read that no row
     it dispatched carried: an example rejected, or of no rows, after the last row kept. The stream's end
     consumes them, so the run ends at its bound (`TrainState.consumed`). `consumed` is what the batches
-    before it consumed (`Interval.consumed`)."""
-    held = batch[CONSUMED_COUNT]
-    assert isinstance(held, ConsumedCount), "a clocked run's batch is counted (`consumption_counted`)"
+    before it consumed (`Interval.consumed`), and the batch's count (`ConsumedCount`) what it consumes,
+    in a pool the whole pool's (`pooled_read`): every process counts them, and the batch's first row
+    carries them (`credited`), so the step's sum over the pool's rows takes them once."""
+    held = counted(batch)
     remainder = bound - consumed - held.examples
     assert remainder >= 0, f"the run's batches consumed {consumed + held.examples} of its {bound} examples"
     if not remainder:
         return batch
-    column = batch[EXAMPLES_CONSUMED]
-    # The batch's first row takes them, the step summing the column over the whole batch: an elementwise
-    # sum with a column laid out as the batch's, which keeps its sharding.
-    owed = np.zeros(np.shape(column), np.int32)
-    owed[0] = remainder
-    credited = column + (jax.device_put(owed, column.sharding) if isinstance(column, jax.Array) else owed)
-    return {**batch, EXAMPLES_CONSUMED: credited, CONSUMED_COUNT: ConsumedCount(held.examples + remainder)}
+    return {**batch, EXAMPLES_CONSUMED: credited(batch[EXAMPLES_CONSUMED], remainder),
+            CONSUMED_COUNT: ConsumedCount(held.examples + remainder)}
 
 
-def refuse_unclocked(state: TrainState, resume: int, examples: int | None) -> None:
-    """Refuse to resume a run on the examples clock (`examples`) from a checkpoint of a run on another
-    clock, which kept no examples consumed (`TrainState.consumed`) for its schedule to read on from."""
+def credited(column: jax.Array | np.ndarray, examples: int) -> jax.Array | np.ndarray:
+    """A batch's `column` of consumed examples with `examples` more at its first row: a placed column shard
+    by shard where it is, the shard that holds the first row taking them and the others as they were, so
+    every process of a pool does the same and no transfer waits on another process; a column on the host
+    is one process's whole batch."""
+    if not isinstance(column, jax.Array):
+        owed = np.zeros(np.shape(column), np.int32)
+        owed[0] = examples
+        return column + owed
+
+    def credit(shard: jax.Shard) -> jax.Array:
+        counts = shard.data
+        assert isinstance(counts, jax.Array), "an addressable shard holds its rows' counts"
+        if shard.index and (shard.index[0].start or 0):
+            return counts
+        owed = np.zeros(counts.shape, np.int32)
+        owed[0] = examples
+        return counts + jax.device_put(owed, shard.device)
+
+    return jax.make_array_from_single_device_arrays(column.shape, column.sharding,
+                                                    [credit(shard) for shard in column.addressable_shards])
+
+
+def restored(state: TrainState, resume: int, examples: int | None) -> TrainState:
+    """`state`, restored from step `resume`'s checkpoint, as the run reads on from it. A run on the
+    examples clock (`examples`) refuses a checkpoint of a run on another clock, which kept no examples
+    consumed (`TrainState.consumed`) for its schedule to read on from. A checkpoint that kept no tokens
+    waiting for an update its optimizer holds back (`TrainState.deferred`), as one written before they
+    waited, holds none: each call's tokens were committed with it."""
     if examples is not None and state.consumed is None:
         raise ValueError(
             f"step {resume}'s checkpoint is of a run counted in steps or tokens, which kept no examples "
             "consumed, and this run reads its schedule off them: resume it on the clock it was written "
             "on, or start a fresh run from its weights")
+    return dataclasses.replace(state, deferred=waiting(state.opt_state)) if state.deferred is None else state
 
 
 def afresh(initial: TrainState, made: optax.OptState, examples: int | None) -> TrainState:
@@ -499,7 +534,8 @@ def afresh(initial: TrainState, made: optax.OptState, examples: int | None) -> T
     where the run is on that clock (`examples`), none on another, and its schedules in the form the run's
     own optimizer makes (`made`, its init's shapes; `dew.optim.reclocked`)."""
     return dataclasses.replace(initial, consumed=None if examples is None else jnp.zeros((), jnp.int32),
-                               opt_state=reclocked(initial.opt_state, made))
+                               opt_state=reclocked(initial.opt_state, made),
+                               deferred=waiting(made) if initial.deferred is None else initial.deferred)
 
 
 def validation_read(name: str, suite: EvalSuite, *, read: bool, previewed: bool) -> None:
@@ -550,11 +586,113 @@ def waited_read(run: FitRun, interval: Interval, *, agree: bool, peek: bool = Fa
     stream = iter(run.train.peek, None) if peek else run.train
     with region("input.wait"):
         asked = time.perf_counter()
-        batch = agreed_next("training read", stream) if agree or peek else run.read()
+        if run.pooled:
+            batch = pooled_read(run, stream, peek=peek)
+        else:
+            batch = agreed_next("training read", stream) if agree or peek else run.read()
         interval.waited += time.perf_counter() - asked
     if batch is None and not run.current:
         raise ValueError("the training data holds no batch to train on")
     return batch
+
+
+def pooled(examples: int | None) -> bool:
+    """Whether a run on the examples clock (bounded to `examples`) is a pool's, whose shares end apart
+    (`FitRun.pooled`)."""
+    return examples is not None and jax.process_count() > 1
+
+
+def pooled_read(run: FitRun, stream: Iterator[Batch], *, phase: str = "training read",
+                peek: bool = False) -> Batch | None:
+    """A pooled run's next batch (`FitRun.pooled`): this share's, or one of the pool's tree emptied where
+    its stream has run out and another share's reads on (`emptied`), from the run's first read on; None
+    once every share's has run out. Each read counts the examples the whole pool's batches consume, each
+    share's once, by its first reader (`DataPartition.reader`), whose readers hold the same rows, so every
+    process's clock is the pool's; one round of the coordination service a read (`agreed_reads`). A
+    `peek` reads the stream's first batch on the host, which counts nothing: the read that takes it does.
+    An emptied batch holds as many rows as the others' batches of the step, a ramp's stage's included."""
+    partition, empty = run.partition, run.emptied
+    assert partition is not None and empty is not None
+
+    def said(batch: Batch) -> JSON:
+        # Its share's rows: a placed batch's are the step's, every share holding as many of them.
+        rows = rows_of(batch) if peek else rows_of(batch) // partition.count
+        return [counted(batch).examples if partition.reader == 0 else 0, rows]
+
+    read, words = agreed_reads(phase, stream, said)
+    live = [integers(word, "a pool's read") for word in words if word is not None]
+    if not live:
+        return None
+    if read is None:
+        # Every share's batch of the step holds as many rows (`DataPartition.rows`), a ramp's stage's.
+        read = empty(live[0][1], placed=not peek)
+    return read if peek else {**read, CONSUMED_COUNT: ConsumedCount(sum(examples for examples, _ in live))}
+
+
+def counted(batch: Batch) -> ConsumedCount:
+    """The examples a clocked run's `batch` consumes (`consumption_counted`)."""
+    held = batch[CONSUMED_COUNT]
+    assert isinstance(held, ConsumedCount), "a clocked run's batch is counted (`consumption_counted`)"
+    return held
+
+
+@dataclasses.dataclass
+class Emptied:
+    """A pooled run's batches of the pool's tree with nothing in them (`emptied`), which a share that ran out
+    steps with (`pooled_read`): each of a share's first batch (`read`, read afresh once) at as many rows as
+    the step's other batches hold (`resized`), prepared (`prepare`) and placed (`place`) as the run's
+    prefetcher prepares and places its own, made once for each count of rows and placement. It is asked
+    for only once this share's stream has run out, its prefetcher preparing nothing more."""
+
+    read: Callable[[], Batch]
+    prepare: Callable[[Batch], Batch]
+    place: Callable[[Batch], Batch]
+    first: Batch | None = None
+    made: dict[tuple[int, bool], Batch] = dataclasses.field(default_factory=dict)
+
+    def __call__(self, rows: int, *, placed: bool) -> Batch:
+        if (rows, placed) not in self.made:
+            if self.first is None:
+                self.first = self.read()
+            batch = emptied(self.prepare(resized(self.first, rows)))
+            self.made[rows, placed] = self.place(batch) if placed else batch
+        return self.made[rows, placed]
+
+
+def pooled_first(loader: Loader, partition: DataPartition) -> Batch:
+    """The first batch of the first of `partition`'s pool's shares whose training stream holds one, read
+    afresh and kept past its stream (`Emptied.read`): one share's stream has a batch where another's has
+    run out."""
+    batch = _pooled_first(loader, partition, kept=True)
+    assert batch is not None, "a share that ran out steps on only while another share's stream reads"
+    return batch
+
+
+def resized(batch: Batch, rows: int) -> Batch:
+    """`batch` holding `rows` rows, its own repeated or cut to that many: each field with a row a leaf of
+    its first dimension, the rest as they are."""
+    held = rows_of(batch)
+
+    def cut(leaf):
+        if np.ndim(leaf) and np.shape(leaf)[0] == held:
+            return np.take(np.asarray(leaf), np.arange(rows) % held, axis=0)
+        return leaf
+
+    return jax.tree.map(cut, batch)
+
+
+EMPTIED = (VALID_ROWS, EXAMPLES_CONSUMED, TOKENS)
+"""The fields a batch a share steps with once its stream has run out holds zero (`emptied`): no row real,
+none consuming an example, none counting a token."""
+
+
+def emptied(batch: Batch) -> Batch:
+    """A share's prepared `batch` of the pool's tree on the host, with no row real, none consuming an
+    example and none counting a token (`EMPTIED`): what the share steps with once its stream has run out
+    and another share's reads on, so it trains nothing and its pool's programs and collectives stay one.
+    Its rows' other fields stand as they were, masked."""
+    return {**batch, **{name: jax.tree.map(np.zeros_like, batch[name]) for name in EMPTIED if name in batch},
+            CONSUMED_COUNT: ConsumedCount(0)}
 
 
 def closes_window(batch: Batch, examples: int | None, *, last: bool = False) -> Batch:
@@ -629,19 +767,43 @@ def first_batch(loader: Loader, mesh: Mesh, position: bytes | None = None) -> Ba
     `position` a resume continues at where given, the stream then closed: what an objective that names
     its input alone reads the shape off (`Trainer._declare_input`), once, before the run opens its stream
     where it starts, and the batch a step compiled ahead is compiled over (`AheadTarget.compiled`)."""
-    stream = loader.train(DataPartition.of(mesh))
+    partition = DataPartition.of(mesh)
+    batch = _first_read(loader, partition, position)
+    # A share a pool's bound in examples deals none of its first examples reads no batch of its own, and
+    # every share's batch is of the pool's tree (`pooled_read`).
+    if batch is None and partition.count > 1:
+        batch = _pooled_first(loader, partition)
+    if batch is None:
+        raise ValueError("the training data holds no batch to read the model's input shape off")
+    return batch
+
+
+def _pooled_first(loader: Loader, partition: DataPartition, *, kept: bool = False) -> Batch | None:
+    """The first batch of the first of `partition`'s pool's shares whose training stream holds one, read
+    afresh (and `kept`, `_first_read`); None where none does."""
+    shares = (dataclasses.replace(partition, index=index) for index in range(partition.count))
+    reads = (_first_read(loader, share, kept=kept) for share in shares)
+    return next((read for read in reads if read is not None), None)
+
+
+def _first_read(loader: Loader, partition: DataPartition, position: bytes | None = None, *,
+                kept: bool = False) -> Batch | None:
+    """The first batch `loader`'s training stream gives `partition`'s share, from `position` where given,
+    the stream then closed; None where it holds none. A batch `kept` holds copies of its arrays, which
+    outlive the stream, as a batch a stream yields does only until its next read (`Loader`)."""
+    stream = loader.train(partition)
     try:
         if position is not None:
             if not isinstance(stream, Checkpointable):
                 raise TypeError("the training stream keeps no position a resume reads its batch from")
             restore_position(stream, position)
         batch = next(iter(stream), None)
+        if kept and batch is not None:
+            batch = jax.tree.map(lambda leaf: np.array(leaf) if isinstance(leaf, np.ndarray) else leaf, batch)
+        return batch
     finally:
         if isinstance(stream, Closeable):
             stream.close()
-    if batch is None:
-        raise ValueError("the training data holds no batch to read the model's input shape off")
-    return batch
 
 
 type HandedSplits = (Dataset | pygrain.MapDataset | pygrain.IterDataset

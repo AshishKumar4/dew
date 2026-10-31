@@ -21,7 +21,7 @@ import numpy as np
 import optax
 import pytest
 import torch
-from model_support import TINY_DECODER, Digits, decoder, flat_tree
+from model_support import TINY_DECODER, Digits, decoder, flat_tree, stepped_outputs
 from reference_error import as_given, assert_as_exact, torch_with_gradients, with_gradients
 from test_serving import assert_same_generation
 from whole_suite import timed
@@ -150,7 +150,7 @@ def idefics_block(wide: bool):
 
 
 PAST_TARGET = {"idefics": {"bfloat16": 132}}
-"""The cases past a group's 120 s (`timed`), each its seconds in train 272's CI (a8a9657d8, ledger 2158):
+"""The cases past a group's 120 s (`timed`), each its seconds in train 272's CI (ddee96234, ledger 2158):
 the bfloat16 block; every train computes and differentiates it in float32."""
 
 
@@ -289,14 +289,21 @@ def decoded(model: CausalTransformer):
 def assert_a_cached_context_decodes_as_the_full_forward(model: CausalTransformer, label: str,
                                                         seeds: int | None = None):
     """The context a prefill carries stays in `model`'s cache, its count a row with it, and each later
-    step attends over it without it: the steps' logits on par with the full forward's from the float64
-    forward (check 1), over `seeds` (this file's `SEEDS["decode"]` unless given)."""
+    step attends over it without it: the steps' logits on par with the full forwards', each step's at
+    the width it reads (`stepped_outputs`), from the float64 forward (check 1), over `seeds` (this
+    file's `SEEDS["decode"]` unless given)."""
     def full(model):
         run = logits(model)
         return lambda variables, ids, context, lengths: run(variables, ids, context, lengths)[:, PROMPT - 1:]
 
+    run = logits(model)
+
+    def passes(variables, ids, context, lengths):
+        return stepped_outputs(lambda length: run(variables, ids[:, :length], context, lengths),
+                               ids.shape[1], PROMPT)[:, PROMPT - 1:]
+
     draw = model_draw(model)
-    assert_as_exact(decoded(model), full(model), draw, label,
+    assert_as_exact(decoded(model), passes, draw, label,
                     seeds=SEEDS["decode"] if seeds is None else seeds, truth_fn=full(float64(model)))
     variables, ids, context, lengths = draw(0)
     _, made = model.apply(variables, B, method=CausalTransformer.init_cache, mutable=["cache"])

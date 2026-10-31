@@ -94,11 +94,14 @@ class SourceReference:
 
     def pinned(self) -> SourceReference:
         """This source at the commit its revision resolves to now, as a run records it (`hub_commit`). A
-        local directory, or a source named at a commit, is as it is."""
+        directory, local or on storage a URI names (a saved Dew run's on a bucket), or a source named at
+        a commit, is as it is: no Hub repository's id holds a scheme."""
         from huggingface_hub.file_download import REGEX_COMMIT_HASH
 
+        from dew.checkpoints import is_uri
+
         named = self.revision is not None and REGEX_COMMIT_HASH.fullmatch(self.revision)
-        if os.path.isdir(self.name) or named:
+        if os.path.isdir(self.name) or is_uri(self.name) or named:
             return self
         return replace(self, revision=hub_commit(self.name, self.revision).value)
 
@@ -279,8 +282,13 @@ def repo_file(name_or_dir: str | Path, directory: Path, filename: str) -> Path:
 
 
 def pinned_source(source: str) -> str:
-    """`source` as a run records it, `repo@commit` (`SourceReference.pinned`); a local path as it is."""
-    return source if os.path.exists(source) else SourceReference.parse(source).pinned().spelled()
+    """`source` as a run records it, `repo@commit` (`SourceReference.pinned`); a local path, or one on
+    storage a URI names, as it is."""
+    from dew.checkpoints import is_uri
+
+    if os.path.exists(source) or is_uri(source):
+        return source
+    return SourceReference.parse(source).pinned().spelled()
 
 
 def repo_files(name: str, directory: Path) -> set[str]:

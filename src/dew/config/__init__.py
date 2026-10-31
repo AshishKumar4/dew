@@ -408,6 +408,13 @@ class SourceOptions:
     source the run trains in its numerics' `dtypes.params` and one it keeps frozen as its checkpoint
     does (`RunConfig.source_keywords`). A frozen bfloat16 base beside a float32 head and adapter is
     `--source.param-dtype bfloat16`."""
+    step: int | str | None = None
+    """Where the run starts from a saved Dew run (`--pretrained <run directory>`), the checkpoint it reads:
+    a step, `latest`, `best`, `best:<metric>`, or None for the one the run's task loads by default
+    (`dew.interop.saved_sources.released_run`). The run records the step it read (`RunConfig.pinned`)."""
+    ema: bool | None = None
+    """Where the run starts from a saved Dew run, whether it reads that run's EMA weights; None its
+    task's own choice (`SavedRun.variables`)."""
 
     def overrides(self) -> Mapping[str, object] | None:
         """The `modeling_overrides` these options state, None where they state none."""
@@ -420,7 +427,8 @@ class SourceOptions:
         PyTorch pickles alone, whose shapes no header states, is read whole): a check that a base
         loads under a run's options, on a disk too small for its weights."""
         return {"text_only": self.text_only, "prediction_depths": self.prediction_depths,
-                "modeling_overrides": self.overrides(), "dex": self.dex, "scan_layers": self.scan_layers}
+                "modeling_overrides": self.overrides(), "dex": self.dex, "scan_layers": self.scan_layers,
+                "step": self.step, "ema": self.ema}
 
 
 class SourcePlacement(TypedDict, total=False):
@@ -441,6 +449,8 @@ class SourceBuild(TypedDict, total=False):
     modeling_overrides: Mapping[str, object] | None
     dex: DifferentialExtension | None
     scan_layers: bool
+    step: int | str | None
+    ema: bool | None
 
 
 class SourceOptionsKeywords(SourcePlacement, SourceBuild, total=False):
@@ -968,10 +978,12 @@ def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
     `attention_form` as the policy's `forms`; a loaded checkpoint's `pretrained_param_dtype`, and a
     decision's `param_dtype`, as the storage of the source alone (`SourceOptions.param_dtype`), the head
     and adapter it drew fresh kept in float32; its compute as its main's (`earlier_compute`); and its
-    `dynamic_scale` as it trained under it.
+    `dynamic_scale` as it trained under it; a Muon run's Newton-Schulz precision as a dot algorithm
+    (`earlier_newton_schulz`).
     A configuration written today that names the earlier knobs is refused by name, as any field its class
     does not declare. A record in today's shapes passes as it is. Carried to 1.0, when it is deleted
     (ledger 1552)."""
+    record = earlier_newton_schulz(record)
     fields = record.get("fields")
     segments = fields.get("segments") if isinstance(fields, Mapping) else None
     if isinstance(fields, Mapping) and isinstance(segments, list):
@@ -998,6 +1010,47 @@ def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
         source = fields.get("source")
         fields["source"] = {**(source if isinstance(source, Mapping) else {}), "param_dtype": stored}
     return {**record, "fields": {**fields, "trainer": {**trainer, "precision": policy}}}
+
+
+EARLIER_NS_PRECISIONS = {"bfloat16": None, "tensorfloat32": "TF32_TF32_F32", "float32": "F32_F32_F32"}
+"""A Muon or M3 run's `ns_precision` as it was recorded while it named a matmul precision level (ledger
+2637), by the dot algorithm it names now: bfloat16 the run's numerics' own (None), the others their
+algorithms."""
+
+
+def earlier_newton_schulz(record: Mapping[str, object]) -> Mapping[str, object]:
+    """A saved run's record whose optimizer's options name Muon's Newton-Schulz precision by an earlier
+    level's name (`EARLIER_NS_PRECISIONS`), with it named as a dot algorithm, or dropped where it was the
+    numerics' own: bfloat16 is the fast forms' own, and stated as `BF16_BF16_F32` where the run's forms
+    are accurate (`saved_forms`), whose own is float32 (row 2753). Carried to 1.0 (ledger 1552)."""
+    fields = record.get("fields")
+    optim = fields.get("optim") if isinstance(fields, Mapping) else None
+    inner = optim.get("fields", optim) if isinstance(optim, Mapping) else None
+    opts = inner.get("optimizer_opts") if isinstance(inner, Mapping) else None
+    named = opts.get("ns_precision") if isinstance(opts, Mapping) else None
+    if not isinstance(fields, Mapping) or not isinstance(optim, Mapping) or not isinstance(inner, Mapping) \
+            or not isinstance(opts, Mapping) or named not in EARLIER_NS_PRECISIONS:
+        return record
+    trainer = fields.get("trainer")
+    accurate = isinstance(trainer, Mapping) and saved_forms(trainer) == "accurate"
+    algorithm = "BF16_BF16_F32" if named == "bfloat16" and accurate else EARLIER_NS_PRECISIONS[named]
+    opts = {name: value for name, value in opts.items() if name != "ns_precision"}
+    opts = opts if algorithm is None else {**opts, "ns_precision": algorithm}
+    inner = {**inner, "optimizer_opts": opts}
+    optim = {**optim, "fields": inner} if "fields" in optim else inner
+    return {**record, "fields": {**fields, "optim": optim}}
+
+
+def saved_forms(trainer: Mapping[str, object]) -> str:
+    """The forms a saved trainer's numerics name: its precision's, a preset's name or a `Numerics`
+    record, or before it held one its `attention_form`; the fast ones where it names none."""
+    precision = trainer.get("precision")
+    if isinstance(precision, str):
+        return numerics_of(precision).forms
+    if isinstance(precision, Mapping):
+        return from_record(Numerics, precision).forms
+    form = trainer.get("attention_form")
+    return form if isinstance(form, str) else "fast"
 
 
 def earlier_compute(record: Mapping[str, object]) -> str:
@@ -1611,6 +1664,19 @@ class RunConfig:
         lora = None if self.lora is None else self.lora.resolved()
         return self if lora == self.lora else dataclasses.replace(self, lora=lora)
 
+    def with_pinned_run(self, pretrained: str | None) -> Self:
+        """This run with the checkpoint it reads of the saved Dew run it starts from (`pretrained`, a
+        run's directory) pinned to the step its selection resolves to now (`SourceOptions.step`:
+        `best`, `best:<metric>` or its task's default), so its record names the run and the step it
+        read and a resume reads them again. Itself where it starts from no saved run, or names a step."""
+        from dew.inference.tasks import SavedRun
+        from dew.interop.saved_sources import is_saved_run
+
+        if pretrained is None or not is_saved_run(pretrained) or isinstance(self.source.step, int):
+            return self
+        step = SavedRun.pinned(pretrained, self.source.step).step
+        return dataclasses.replace(self, source=dataclasses.replace(self.source, step=step))
+
     def profile(self, directory: str | None = None, *, warmup: int = 20, steps: int = 10,
                 capture: ProfileWindow | None = None) -> ProfileReport | None:
         """Train this run afresh under `directory` for `warmup` steps, then a window of `steps` more traced
@@ -1915,7 +1981,8 @@ class RunConfig:
         trainer = self.trainer
         return training.Trainer(
             objective, self.optim, key=trainer.key, mesh=mesh, microbatches=trainer.microbatches,
-            layout=trainer.layout, accumulation=trainer.accumulation, split=trainer.split,
+            layout=trainer.layout, accumulation=trainer.accumulation,
+            split=trainer.split,
             dynamic_scale=(self.compute_dtype() == "float16" if trainer.dynamic_scale is None
                            else trainer.dynamic_scale), rollout=rollout,
             tune_kernels=trainer.tune_kernels, param_dtype=self.drawn_dtype(), inspection=trainer.inspection,

@@ -43,7 +43,6 @@ import contextlib
 import contextvars
 import dataclasses
 import functools
-import inspect
 import math
 from collections.abc import Callable, Sequence
 
@@ -56,7 +55,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn import precision
 from dew.nn.inputs import cu_seqlens
-from dew.nn.kernels import chunked_launch, generation, recurrence_algebra as algebra
+from dew.nn.kernels import chunked_launch, generation, recurrence_algebra as algebra, tuning
 from dew.nn.kernels.templates import bundles, mosaic, mosaic_sm80, mosaic_sm90, product, resources
 from dew.nn.kernels.templates.gemm import cost
 from dew.nn.kernels.templates.recurrence.issuing import Issuer, Parts
@@ -488,21 +487,10 @@ STATIC = ("call", "tiles", "scale", "keeps", "out_dtype")
 and its constants; its every other argument an array or None."""
 
 
-def _lowered_once(launch: Callable) -> Callable:
-    """`launch` jitted, its static arguments (`STATIC`) those of its signature: each call site of a
-    configuration traces the same program, which JAX lowers once a program (its lowering caches a jaxpr's
-    function), however many layers, passes and recomputations call it. A launch's program closes over its
-    call, so each call traced its own and each kernel was lowered and serialized again a call: a hybrid
-    model's step lowered its layers' identical kernels one by one. Planning (`planned`) traces every call,
-    each launch recording itself (`_kernel`)."""
-    parameters = inspect.signature(launch).parameters
-    jitted = jax.jit(launch, static_argnames=tuple(name for name in STATIC if name in parameters))
-
-    @functools.wraps(launch)
-    def called(*args, **kwargs):
-        return launch(*args, **kwargs) if _PLANNED.get() is not None else jitted(*args, **kwargs)
-
-    return called
+_lowered_once = tuning.lowered_once(STATIC, unless=lambda: _PLANNED.get() is not None)
+"""A launch lowered once a configuration (`tuning.lowered_once`): a launch's program closes over its call,
+so each call traced its own and a hybrid model's step lowered its layers' identical kernels one by one.
+Planning (`planned`) traces every call, each launch recording itself (`_kernel`)."""
 
 
 def _scope(*allocations, reduces: bool = True, after: tuple = ()) -> resources.Scope:
@@ -1133,10 +1121,8 @@ def _sequence_walk(call: _Call, memory: _Operand, name: str, entering: tuple, wa
     (entered, entered_views), (chunks, views) = entering, walked
 
     def consumer(wg):
-        # Each role's columns and tiles at static offsets: Mosaic GPU slices a swizzled tile at static
-        # columns.
-        for role in range(walkers):
-            pl.when(wg == role)(functools.partial(walk, role, wg))
+        # Each role's columns and tiles at static offsets (`mosaic.per_role`).
+        mosaic.per_role(wg, walkers, walk)
 
     def walk(role, wg):
         walked_step = role_step = step(role)

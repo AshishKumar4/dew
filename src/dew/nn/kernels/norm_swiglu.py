@@ -8,7 +8,7 @@ reverse. The gated norm is Qwen3-Next's output norm (fla's FusedRMSNormGated
 computes the same function).
 
 The norm alone lost to XLA's fusions in a Qwen3.5-0.8B full fine-tune (bf16,
-4 x 3072 rows, A100-40, main 2215b81fc): the norms cost 16.3 ms a step
+4 x 3072 rows, A100-40, main c5e393db7): the norms cost 16.3 ms a step
 against XLA's 12.5. Its reverse pass ran at 44% of HBM bandwidth, the
 residual stream's gradient joined it in a separate 72 MiB pass that XLA had
 fused into its own reverse fusion, and a latency-bound third kernel summed
@@ -68,6 +68,7 @@ differently rounded autodiff.
 import dataclasses
 import functools
 import math
+from collections.abc import Hashable
 from typing import ClassVar, NamedTuple, Protocol
 
 import jax
@@ -363,12 +364,12 @@ NORM_SUPPORTS: tuple[Requirement[NormCase], ...] = (
 """The fused norms' requirements: a plain, stream and gated RMSNorm over fp32 or bf16 rows of at most
 8192 features, with fp32 statistics, a vector weight, and operands placed as the kernel reads them."""
 
-FUSED_FASTER = ("this module's table (469e47b1f): Qwen3.5-0.8B's 4 x 3072 rows of 1024 in bf16, the fused "
+FUSED_FASTER = ("this module's table (14a0df682): Qwen3.5-0.8B's 4 x 3072 rows of 1024 in bf16, the fused "
                 "kernels' forward and reverse against XLA's fusions of the same math on an A100-SXM4-40GB "
                 "and an H100 SXM")
 """The receipt behind the fused norm's and SiLU product's declared cells (`NORM`, `SWIGLU`)."""
 
-FP16_NORM_FASTER = ("FSNORM16 (base/kernels 3b6c752c8, CUPTI, arms rotated): Qwen3.5-0.8B's 4 x 3072 rows "
+FP16_NORM_FASTER = ("FSNORM16 (base/kernels 4d31032c6, CUPTI, arms rotated): Qwen3.5-0.8B's 4 x 3072 rows "
                     "of 1024 in fp16, the fused norm's forward and reverse against XLA's on an H100 SXM "
                     "(17.7 and 58.3 us against 33.0 and 105.3) and an A100-SXM4-40GB (40.0 and 133.7 against "
                     "74.5 and 227.8)")
@@ -643,6 +644,19 @@ class _Norm(NamedTuple):
     inverse_rounded: bool = False
 
 
+@tuning.lowered_once(('kernel', 'name', 'outputs', 'grid', 'warps', 'interpret', 'arithmetic'))
+def _launched(*operands, kernel, name: str, outputs, grid: tuple[int, ...], warps: int, interpret: bool,
+              arithmetic: tuple[tuple[str, Hashable], ...]):
+    """`kernel` launched over `operands` (None where a call has none) with its `arithmetic`'s keyword
+    arguments, lowered once a configuration (`tuning.lowered_once`): its outputs' shapes and dtypes, its grid,
+    warps and arithmetic static."""
+    return pl.pallas_call(
+        functools.partial(kernel, interpret=interpret, **dict(arithmetic)), grid=grid, out_shape=outputs,
+        compiler_params=plgpu.CompilerParams(num_warps=warps, num_stages=1),
+        interpret=interpret, name=name,
+    )(*operands)
+
+
 @dataclasses.dataclass(frozen=True)
 class RmsForward(tuning.KernelOp):
     """The norm's forward launch over `[rows, width]` (`_rms_forward`): the
@@ -657,17 +671,17 @@ class RmsForward(tuning.KernelOp):
              epsilon: float, dtype: str, offset: bool, stored: str, after_cast: bool, activation: str,
              interpret: bool, inverse_rounded: bool, config: RowsConfig, return_residuals: bool = False):
         rows, width = x.shape
-        return pl.pallas_call(
-            functools.partial(_rms_forward, row_block=config.rows, epsilon=epsilon, offset=offset,
-                              stored=jnp.dtype(stored), after_cast=after_cast,
-                              inverse_rounded=inverse_rounded, activation=activation, interpret=interpret),
+        return _launched(
+            x, branch, scale, gate, kernel=_rms_forward, name="rms_norm_forward",
+            outputs=(jax.ShapeDtypeStruct((rows, width), jnp.dtype(dtype)),
+                     None if branch is None else jax.ShapeDtypeStruct((rows, width), x.dtype),
+                     jax.ShapeDtypeStruct((rows,), jnp.float32)),
             grid=(pl.cdiv(rows, config.rows),),
-            out_shape=(jax.ShapeDtypeStruct((rows, width), jnp.dtype(dtype)),
-                       None if branch is None else jax.ShapeDtypeStruct((rows, width), x.dtype),
-                       jax.ShapeDtypeStruct((rows,), jnp.float32)),
-            compiler_params=plgpu.CompilerParams(num_warps=config.warps, num_stages=1),
-            interpret=interpret, name="rms_norm_forward",
-        )(x, branch, scale, gate), None
+            warps=config.warps, interpret=interpret, arithmetic=(
+                ('row_block', config.rows), ('epsilon', epsilon), ('offset', offset),
+                ('stored', jnp.dtype(stored)), ('after_cast', after_cast),
+                ('inverse_rounded', inverse_rounded), ('activation', activation)),
+        ), None
 
     def _get_heuristics_config(self, ba) -> RowsConfig:
         return RowsConfig(_row_block(ba.arguments['x'].shape[1]), 4)
@@ -695,17 +709,15 @@ class RmsBackward(tuning.KernelOp):
         rows, width = x.shape
         groups = max(1, min(config.programs, pl.cdiv(rows, config.rows)))
         partial = None if scale is None else jax.ShapeDtypeStruct((groups, width), jnp.float32)
-        return pl.pallas_call(
-            functools.partial(_rms_backward, row_block=config.rows, offset=offset, stored=jnp.dtype(stored),
-                              after_cast=after_cast, inverse_rounded=inverse_rounded, activation=activation,
-                              interpret=interpret),
-            grid=(groups,),
-            out_shape=(jax.ShapeDtypeStruct((rows, width), x.dtype),
-                       None if gate is None else jax.ShapeDtypeStruct((rows, width), gate.dtype),
-                       partial, partial),
-            compiler_params=plgpu.CompilerParams(num_warps=config.warps, num_stages=1),
-            interpret=interpret, name="rms_norm_backward",
-        )(x, scale, gate, mean_square, dy, ds), None
+        return _launched(
+            x, scale, gate, mean_square, dy, ds, kernel=_rms_backward, name="rms_norm_backward",
+            outputs=(jax.ShapeDtypeStruct((rows, width), x.dtype),
+                     None if gate is None else jax.ShapeDtypeStruct((rows, width), gate.dtype),
+                     partial, partial),
+            grid=(groups,), warps=config.warps, interpret=interpret, arithmetic=(
+                ('row_block', config.rows), ('offset', offset), ('stored', jnp.dtype(stored)),
+                ('after_cast', after_cast), ('inverse_rounded', inverse_rounded), ('activation', activation)),
+        ), None
 
     def _get_heuristics_config(self, ba) -> ReverseConfig:
         rows, width = ba.arguments['x'].shape
@@ -916,11 +928,8 @@ class _Elementwise(tuning.KernelOp):
 
 def _launch(kernel, name: str, operands, outputs, grid: tuple[int, ...], config: BlockConfig,
             interpret: bool):
-    return pl.pallas_call(
-        functools.partial(kernel, block=config.block, interpret=interpret), grid=grid, out_shape=outputs,
-        compiler_params=plgpu.CompilerParams(num_warps=config.warps, num_stages=1),
-        interpret=interpret, name=name,
-    )(*operands), None
+    return _launched(*operands, kernel=kernel, name=name, outputs=outputs, grid=grid, warps=config.warps,
+                     interpret=interpret, arithmetic=(('block', config.block),)), None
 
 
 @dataclasses.dataclass(frozen=True)

@@ -240,7 +240,7 @@ def between(later, earlier):
     recurrence's error from float64 (ledger 2098). The fractions' difference stays within two, its exp2
     within `_scaled`'s range, for exponents under 2^24, where a fraction's remainder `lo` is at most one: a
     chunk's prefix (its 64 tokens' at most 2^18 each). Truncating the difference into the scale, for any
-    size, cost the template's forward 1% on an H100 and 3% on an A100 (JS-954-57bf6dc05). Every pair's
+    size, cost the template's forward 1% on an H100 and 3% on an A100 (JS-954-4934890e4). Every pair's
     decay, the ports' of their separated prefix and the template's of its halves (`decayed`), and the ports'
     ranges; the template's ranges (`range_decay`) and a decay from the prefix's start are `raised`'s."""
     (whole, fraction), (other, its_fraction) = later, earlier

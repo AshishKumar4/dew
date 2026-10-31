@@ -7,6 +7,7 @@ and each tile's coordinates (`_Program`, `_Spans`, `_coords`), its hooks' parame
 import dataclasses
 import functools
 import math
+from collections.abc import Callable
 from typing import NamedTuple
 
 import jax
@@ -17,7 +18,14 @@ from jax.experimental import pallas as pl
 
 from dew.nn.kernels import generation
 from dew.nn.kernels.selection import Refusal
-from dew.nn.kernels.templates import attention_algebra as algebra, bundles, layout, mosaic, mosaic_sm90
+from dew.nn.kernels.templates import (
+    attention_algebra as algebra,
+    bundles,
+    layout,
+    mosaic,
+    mosaic_sm90,
+    report,
+)
 from dew.nn.kernels.templates.attention import (
     Draw,
     Dropout,
@@ -131,6 +139,10 @@ class BackwardTiles:
     """Whether the keys-first dK/dV launch stages its logits' queries (the call's taken by its power) a
     step from the call's own in its consumers' shared memory, where a stream of them beside the call's
     passes the block (width 256's)."""
+    shared_keys: bool = False
+    """Whether the fused launch's consumers share one key block (`attention_mosaic_coop._coop_launch`):
+    each forms the logits of its share of the keys and holds its share of the head's columns of dK, dV and
+    dQ, where a consumer's own keys' whole dK and dV sums pass its registers (width 256's)."""
 
     @property
     def dkv(self) -> "BackwardTiles":
@@ -608,6 +620,18 @@ class _Program[T: (Tiles, BackwardTiles)]:
 
         return spans.q_lo[row, block], spans.q_hi[row, block], seen_whole
 
+    def segmented(self, step: Callable, run: tuple[jax.Array, jax.Array] | None, lo, hi) -> tuple:
+        """A key block's walk of query tiles `[lo, hi)` as `Family.walk`'s segments, `step` each: where its
+        whole tiles run unbroken (`run`, `whole_run`), those one segment of their own, unmasked, and the
+        tiles around them masked, so no step chooses at run time, whose two branches' registers join
+        (FlashAttention 3's masked and unmasked iterations); else one segment choosing a tile at a time."""
+        if run is None:
+            return ((step, lo, hi),)
+        start, end = (jnp.clip(bound, lo, hi) for bound in run)
+        return ((functools.partial(step, masked=True), lo, start),
+                (functools.partial(step, masked=False), start, end),
+                (functools.partial(step, masked=True), end, hi))
+
     def whole_run(self, k_first, q_steps: int, spans: _Spans | None) -> tuple[jax.Array, jax.Array] | None:
         """The query tiles `[a, b)` that see the key block from `k_first` whole (`readers`' `whole`), one run
         of them: a causal call's, from its diagonal to its first tile holding padding rows; None for a spans
@@ -683,3 +707,10 @@ def _views_of(refs: dict, row, head) -> dict:
     """The streams' views by name (`Family.opened`, `Family.stream`, `mosaic.viewed`): each `[B, S, H, D]`
     operand's `[S, D]` at batch row `row` and head `head`, step `j` its `j`-th block of rows."""
     return {name: (ref.at[row, :, head], lambda j: (j, 0)) for name, ref in refs.items()}
+
+
+def traced_name(name: str) -> tuple[str, str | None]:
+    """A launch's kernel name and the one its trace reports (`report.named`, which reads the launch tracing
+    it), resolved at its call: a launch lowered once for its static facts (`tuning.lowered_once`) takes both
+    as one, so a later call's report names its own launch."""
+    return name, report.named(name)
