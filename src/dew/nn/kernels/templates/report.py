@@ -133,7 +133,7 @@ def _digest(text: str) -> str:
 @contextlib.contextmanager
 def launching(op, arguments: tokamax.BoundArguments, config: Hashable) -> Iterator[None]:
     """Within the block, the kernels a template's launch traces carry its digest in their names (`named`),
-    the same in every process, and their reports name the launch (`Report.launch`, `traced`)."""
+    the same in every process, and their binaries name the launch (`Binary.launch`, `traced`)."""
     token = _TRACING.set(_Pending(lambda: _identity(op, arguments), type(op).__name__, config))
     try:
         yield
@@ -309,10 +309,10 @@ def _compiled_reported(lowered: jax.stages.Lowered, options: jax.stages.Compiler
 
 @dataclasses.dataclass(frozen=True)
 class Binary:
-    """A Mosaic GPU kernel's binary as its executable carries it (`binaries`): its name and the launch that
-    traced it (`Report.kernel`, `Report.launch`), its registers a thread and its stack frame's bytes a
-    thread, nonzero where its registers spill (`REGISTER_COUNT`, `FRAME_SIZE`), and the dynamic shared
-    memory its launch asks for (its kernel proto's `smem_bytes`), None where its proto states none."""
+    """A Mosaic GPU kernel's binary as its executable carries it (`binaries`): its name less the launch it
+    carries (`LAUNCH_SUFFIX`) and that launch's digest (`named`), its registers a thread and its stack frame's
+    bytes a thread, nonzero where its registers spill (`REGISTER_COUNT`, `FRAME_SIZE`), and the dynamic
+    shared memory its launch asks for (its kernel proto's `smem_bytes`), None where its proto states none."""
     kernel: str
     launch: str | None
     registers: int
@@ -337,16 +337,20 @@ def binaries(executable: jax.stages.Compiled) -> list[Binary]:
 
         def visit(operation: ir.Operation) -> ir.WalkResult:
             if operation.name == "thunky.call_thunk_proto":
-                kernels, calls = _kernels(ir.StringAttr(operation.attributes["thunk_proto"]).value_bytes)
-                if len(kernels) != calls:
-                    # A call whose binary is missing would read as a kernel that does not spill.
-                    raise ValueError(f"a thunk names {calls} Mosaic GPU calls but carries {len(kernels)} "
-                                     "kernel binaries")
-                found.extend(kernels)
+                found.extend(thunk_kernels(ir.StringAttr(operation.attributes["thunk_proto"]).value_bytes))
             return ir.WalkResult.ADVANCE
 
         module.operation.walk(visit)
     return found
+
+
+def thunk_kernels(proto: bytes) -> list[Binary]:
+    """The kernel binaries of a thunk's serialized proto (`_kernels`), one for each Mosaic GPU call it names:
+    a call whose binary is missing would read as a kernel that does not spill, so it raises."""
+    kernels, calls = _kernels(proto)
+    if len(kernels) != calls:
+        raise ValueError(f"a thunk names {calls} Mosaic GPU calls but carries {len(kernels)} kernel binaries")
+    return kernels
 
 
 def _kernels(message: bytes) -> tuple[list[Binary], int]:
