@@ -638,6 +638,21 @@ def test_a_pipelined_stacks_watched_layers_each_report_every_microbatch():
     assert all(np.isfinite(value) and value > 0 for value in summaries.values())
 
 
+def test_a_watched_cotangent_is_summarized_unscaled_under_a_dynamic_loss_scale():
+    """Under a dynamic loss scale, whose backward is seeded with the scale, a watched block's cotangent is
+    summarized as the unscaled loss's (row 2324 review): its every statistic, the histogram's decades
+    included, the unscaled run's to the bit, a power of two scaling and unscaling each entry exactly."""
+    def logged(**scaled) -> dict[str, float]:
+        objective = watched_run(Stacked(scanned=False), None).objective
+        run = Trainer(objective, optax.sgd(RATE), key=jax.random.key(0), **scaled,
+                      inspection=Inspection(modules=("Block_1",), targets=("params",), cotangents=True,
+                                            histogram=True))
+        return {name: value for name, value in inspected(run, {"x": ROWS}).items() if "/cotangents/" in name}
+
+    plain, scaled = logged(), logged(dynamic_scale=True)
+    assert any("histogram" in name for name in plain) and scaled == plain
+
+
 def test_a_watched_layers_cotangent_is_summarized_as_the_losses_cotangent_there():
     """With cotangents watched, a sampled step summarizes the loss's cotangent at each watched block's
     output (row 2324): the root mean square, mean and shares it logs are those of the cotangent Linen's
@@ -761,3 +776,33 @@ def test_a_pipelined_stacks_watched_cotangents_are_each_layers_over_its_microbat
         if name.endswith(("/zero_fraction", "/non_finite")):
             assert piped[name] == value, name
         assert np.isfinite(piped[name])
+
+
+def test_a_critic_phases_watched_cotangent_is_the_untrained_students_zero(windows, tmp_path):
+    """An rCM critic update, which trains the fake score and runs the student under no gradient, reports
+    the student's watched cotangent as the zero it is (row 2324 review): mean and root mean square 0 and
+    its every entry zero, none of it NaN."""
+    from test_whole_validation import runnable
+
+    from dew.nn.inspection import Watched, cotangent_statistics
+    from dew.objectives.base import Step
+    from dew.training.transaction import probed_loss
+
+    objective, batch = runnable("rcm", windows, tmp_path)
+    variables = objective.init(jax.random.key(0))
+    numeric = {key: value for key, value in batch.items()
+               if getattr(value, "dtype", None) is not None and value.dtype.kind in "biuf"}
+    held = {key: value for key, value in batch.items() if key not in numeric}
+    critic = next(update for update in range(1, 64) if not bool(objective._student(update)))
+    step = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(1), ema=variables,
+                committed=jnp.asarray(critic), watched=Watched(("*Block*",), cotangents=True))
+
+    def probed(numeric):
+        stats, back, _ = probed_loss(objective, variables, {**numeric, **held}, step)
+        _, seed = jax.vjp(lambda stats: objective.reduce_loss(stats)[0], stats)
+        return [cotangent_statistics(leaf, histogram=False) for leaf in jax.tree.leaves(back(
+            seed(jnp.ones(()))[0])[1])]
+
+    summaries = jax.jit(probed)(numeric)
+    assert summaries and all(float(summary["rms"]) == 0 and float(summary["mean"]) == 0
+                             and float(summary["zero_fraction"]) == 1 for summary in summaries)
