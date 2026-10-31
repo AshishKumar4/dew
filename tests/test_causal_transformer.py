@@ -20,7 +20,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from model_support import TINY_DECODER, decode_steps, model_draw, with_logit_cotangent
+from model_support import TINY_DECODER, as_stepped, decode_steps, model_draw, with_logit_cotangent
 from reference_error import (
     as_given,
     assert_as_exact,
@@ -300,18 +300,23 @@ def decode_logits(model, params, prompt, rest):
 
 
 def decoded_against_full(model, prompt: int, label: str, seeds: int, length=SEQ, **shape):
-    """Check 1: `model`'s prefill of `prompt` tokens and single-token steps on par with its full pass
-    from position `prompt - 1` over drawn variables and tokens, the truth the model in float64. A
-    model whose logits a scaling divides is run unscaled in float64 and divided there, since the model
-    divides its states in fp32."""
+    """Check 1: `model`'s prefill of `prompt` tokens and single-token steps on par with its full passes
+    from position `prompt - 1` over drawn variables and tokens, each step's at the width it reads
+    (`as_stepped`), the truth the model's one full pass in float64. A model whose logits a scaling
+    divides is run unscaled in float64 and divided there, since the model divides its states in fp32."""
     def decoded(params, ids):
         return decode_logits(model, params, ids[:, :prompt], ids[:, prompt:])
+
+    forward = jax.jit(model.apply)
+
+    def stepped(params, ids):
+        return as_stepped(lambda tokens: forward(params, tokens), ids, prompt)[:, prompt - 1:]
 
     def full(model, divided=1.0):
         return jax.jit(lambda params, ids: model.apply(params, ids)[:, prompt - 1:] / divided)
 
     wide = float64(model.clone(logits_scaling=1.0))
-    assert_as_exact(decoded, full(model), drawn(model, length=length, **shape), label, seeds=seeds,
+    assert_as_exact(decoded, stepped, drawn(model, length=length, **shape), label, seeds=seeds,
                     truth_fn=full(wide, model.logits_scaling))
 
 

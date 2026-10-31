@@ -2265,7 +2265,7 @@ def test_a_step_compiles_from_its_arrays_shapes_before_they_are_placed():
     time, into the persistent cache, before it holds them on devices; the
     trainer's own settings (the window, the scaler) stay values. The loss's
     shape once folded the step into the key eagerly, which a key known only
-    by its shape cannot do (74761deb)."""
+    by its shape cannot do (fd591eb1)."""
     trainer, _, _ = held_lm_trainer()
     state, shardings, _ = trainer.place()
 

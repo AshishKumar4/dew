@@ -12,7 +12,7 @@ import tempfile
 import urllib.request
 from pathlib import Path
 
-BASELINE = "66beb53059c42f5226a413e26c600655f084f4fa"
+BASELINE = "7ad0d4079de7ab7280e08924201992e3ae1a7ff9"
 
 
 def main() -> None:

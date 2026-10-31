@@ -55,7 +55,7 @@
    },
    "repo": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
    "revision": "0fad780a534b6463e45facd96134c9f345acfa5b",
-   "dew_commit": "8895763d259094e9661d11091d66394946d838ca",
+   "dew_commit": "8dc055156f3d418869e20cabd91066ecf174e790",
    "dtype": {
     "compute": "bfloat16",
     "params": "float32"
@@ -128,7 +128,7 @@
    },
    "repo": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
    "revision": "0fad780a534b6463e45facd96134c9f345acfa5b",
-   "dew_commit": "8895763d259094e9661d11091d66394946d838ca",
+   "dew_commit": "8dc055156f3d418869e20cabd91066ecf174e790",
    "dtype": {
     "compute": "bfloat16",
     "params": "float32"
@@ -201,7 +201,7 @@
    },
    "repo": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
    "revision": "0fad780a534b6463e45facd96134c9f345acfa5b",
-   "dew_commit": "8895763d259094e9661d11091d66394946d838ca",
+   "dew_commit": "8dc055156f3d418869e20cabd91066ecf174e790",
    "dtype": {
     "compute": "bfloat16",
     "params": "float32"
@@ -274,7 +274,7 @@
    },
    "repo": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
    "revision": "0fad780a534b6463e45facd96134c9f345acfa5b",
-   "dew_commit": "8895763d259094e9661d11091d66394946d838ca",
+   "dew_commit": "8dc055156f3d418869e20cabd91066ecf174e790",
    "dtype": {
     "compute": "bfloat16",
     "params": "float32"

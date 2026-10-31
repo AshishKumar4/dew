@@ -10,11 +10,13 @@ import dataclasses
 import gzip
 import json
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from dew._coordination import agreed
 from dew.telemetry import profile as telemetry_profile
+from dew.telemetry.records import ProfileWindow as ProfileWindowRecord, Record
 from dew.training.tracker import LocalTracker
 
 if TYPE_CHECKING:
@@ -130,9 +132,9 @@ def stop_capture(profiler: "Profiler", loss: "jax.Array | None") -> None:
 
     The core Profiler drains the backend and stops the trace here, and
     exports its native reports in a process of its own while the run
-    trains on (`Profiler.stop`, row 2017), which `ProfileReport.read`
-    waits for. The run's last `loss` is blocked on only to order the
-    primary's failure ahead of the profiler's own drain."""
+    trains on (`Profiler.stop`, row 2017), which the run's cleanup waits
+    for (`dew.telemetry.profile.exported`). The run's last `loss` is blocked
+    on only to order the primary's failure ahead of the profiler's own drain."""
     def stop() -> None:
         try:
             if loss is not None:
@@ -147,6 +149,27 @@ def stop_capture(profiler: "Profiler", loss: "jax.Array | None") -> None:
                 primary.add_note(f"Profiler stop failed: {failure!r}")
 
     agreed("profile stop", stop)
+
+
+def reported_window(report: Callable[[Record, int], None], note: Callable[[str], None],
+                    window: ProfileWindow | None, profiled: tuple[int, int] | None,
+                    error: BaseException | None) -> BaseException | None:
+    """Report a fit's window that stopped, `profiled` its steps traced and the step it stopped at, once
+    every rank's export is written and the pool agreed the run's outcome (`Trainer._reported_outcome`),
+    whatever that outcome: its record (`report`) and its note on process zero (`note`). Returns the run's
+    `error`, or a failed report as the error of a run that had none, noted on one that had."""
+    if window is None or profiled is None:
+        return error
+    traced, step = profiled
+    try:
+        report(ProfileWindowRecord(window.directory, traced), step)
+        wrote = f"Wrote profile for {traced} steps to {window.directory}"
+        agreed("profile announcement", lambda: note(wrote))
+    except BaseException as failure:
+        if error is None:
+            return failure
+        error.add_note(f"Reporting the profile window failed: {failure!r}")
+    return error
 
 
 def traced_steps(capture: Path) -> tuple[int, ...]:
@@ -226,11 +249,9 @@ class ProfileReport:
         traced into `window`, this process's newest capture's. The run logged its steps once at the
         window's end, so that log's scalars are the steps the capture's annotations hold
         (`traced_steps`), or the report is refused."""
-        from dew.telemetry.profile import exported, process_directory
+        from dew.telemetry.profile import process_directory
         from dew.telemetry.trace import device_events
 
-        # The window's export runs beside the run (`stop_capture`), which its report waits for.
-        exported(window)
         capture = max(process_directory(window).glob("capture-*"), key=lambda path: path.stat().st_mtime)
         traced = traced_steps(capture)
         if traced != tuple(range(warmup, warmup + steps)):

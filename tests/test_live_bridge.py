@@ -208,7 +208,7 @@ def test_a_display_updated_in_place_is_one_output_its_frames_replace(bridge, mon
     """A training cell's panel is one display that IPython's handle updates eight times a second: the
     bridge sends each frame under the display's id, an update marked as one, and counts against the
     cell's output allowance what the page shows, so a long run's frames, past the allowance together,
-    end the cell as it ends (7fb1f1bd3's preview: the finetune cell stopped at 101 s), as do a redraw's
+    end the cell as it ends (b92f5788a's preview: the finetune cell stopped at 101 s), as do a redraw's
     cleared frames; displays that share an id each count."""
     monkeypatch.setattr(bridge, "available", lambda: 1 << 40)
     frames = bridge.MAX_OUTPUT // FRAME * 2
