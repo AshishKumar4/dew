@@ -328,7 +328,7 @@ class LMRunConfig(DecoderRunConfig):
         (`SourceReference.pinned`)."""
         from dew.interop.sources import pinned_source
 
-        run = super().pinned()
+        run = super().pinned().with_pinned_run(self.pretrained)
         if self.pretrained is None:
             return run
         pretrained = pinned_source(self.pretrained)

@@ -31,7 +31,9 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   call's `progress=` keyword and carries it to its layers in `AttentionMetadata.progress`, so a compiled
   forward keys on it. A run's training loss passes it (`Objective.progress`); a call that passes none
   reads the run's end. `dew.nn.progress.progress()` and `stepping` are gone, and an objective that
-  passes no progress (`Objective.passes_progress`) refuses a model that reads it.
+  passes no progress (`Objective.passes_progress`) refuses a model that reads it, as the trainer does
+  under a custom step (`Trainer(step=)`) unless its factory says it passes it
+  (`dew.training.PassesProgress`).
 - One entry point and one path for scoring decisions: `decide(state, questions)` answers a request and
   `decide([(state, questions), ...], contexts=...)` many, their rows packed into the passes a scoring
   server runs and over its compiled programs. `Decide.batch` and `Decide.fits` are gone; call the task

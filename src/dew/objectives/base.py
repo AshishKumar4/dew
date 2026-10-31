@@ -46,6 +46,7 @@ from dew._distributions import counter_key
 from dew._records import JSON
 from dew.artifacts import Artifact, Artifacts, TokenScores
 from dew.batch import EXAMPLE_ROWS, FROZEN, VALID_ROWS, Batch, PathFilter, Variables, dicts, everything, part
+from dew.distributed.placement import Layout, RefinesLayout
 from dew.nn import categorical
 from dew.nn.inspection import INSPECTED, Watched, watching
 from dew.nn.kernels.options import Held, Option, compiler_options
@@ -898,6 +899,15 @@ class Objective(ABC, Generic[Loss, Effects]):
         model = vars(self).get("model")
         return () if model is None else (ProgramModule(model, None, trained=True),)
 
+    def placement(self, layout: Layout) -> Layout:
+        """The run's `layout` as the modules this objective's programs run refine it for their own trees
+        (`dew.distributed.placement.RefinesLayout`, a tier-3 model's torch names), each in its turn; the
+        layout as it is where none does."""
+        for entry in self.program_key():
+            if isinstance(entry.module, RefinesLayout):
+                layout = entry.module.placement(layout)
+        return layout
+
     def towers(self) -> tuple[Held, ...]:
         """Every network this objective's programs run, whose quantization the options they compile
         with read (`dew.nn.kernels.options.compiler_options`): the modules `program_key` names, and
@@ -1457,16 +1467,20 @@ class Objective(ABC, Generic[Loss, Effects]):
         is for what else reads it."""
         return Progress(step.committed) if step.training else END
 
+    def progress_readers(self) -> tuple[nn.Module, ...]:
+        """The trained modules its programs run (`program_key`), whatever the objective holds, whose
+        computation changes over a run (`ReadsProgress`): those a training step passes the run's
+        progress, or trains at the run's end."""
+        return tuple(entry.module for entry in self.program_key() if entry.trained
+                     and isinstance(entry.module, ReadsProgress) and entry.module.reads_progress())
+
     def _refuse_unpassed_progress(self) -> None:
-        """Refuse a trained module whose computation changes over a run (`ReadsProgress`) under an
-        objective whose loss passes it no progress (`passes_progress`): it would train at the run's
-        end. The modules are those its programs run (`program_key`), whatever the objective holds."""
-        for entry in self.program_key():
-            module = entry.module
-            if entry.trained and isinstance(module, ReadsProgress) and module.reads_progress():
-                raise ValueError(f"{type(self).__name__} passes its model no run's progress, which a "
-                                 f"{type(module).__name__} reads (dew.nn.progress): it would train at the "
-                                 f"run's end")
+        """Refuse a module that reads the run's progress (`progress_readers`) under an objective whose
+        loss passes it none (`passes_progress`): it would train at the run's end."""
+        for module in self.progress_readers()[:1]:
+            raise ValueError(f"{type(self).__name__} passes its model no run's progress, which a "
+                             f"{type(module).__name__} reads (dew.nn.progress): it would train at the "
+                             f"run's end")
 
     def recorded_model(self) -> nn.Module:
         """The model a saved step's record names (`inference_record`): the objective's own."""

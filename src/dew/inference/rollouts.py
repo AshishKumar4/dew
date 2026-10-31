@@ -39,6 +39,7 @@ from dew._coordination import agreed, collective_host
 from dew._records import JSON, finite
 from dew.batch import Variables, thaw, token_id
 from dew.nn.inputs import key_seed, request_key
+from dew.nn.progress import Progress, progressed
 from dew.sampling.decoding import EndOfSequence, StopStrings
 from dew.sampling.text import Generation, Sampling
 
@@ -305,6 +306,12 @@ class NativeRolloutServer:
             raise ValueError("a rollout's draws end on its policy's EOS ids or stop strings, or are cut "
                              "short; this server's task also ends rows on criteria of its own, which no "
                              "draw's policy names")
+        reads = bool(progressed(server.model, Progress(jnp.asarray(version, jnp.int32))))
+        if reads and server.progress.updates is None:
+            raise ValueError("a run's versions draw a model that reads the run's progress at their updates "
+                             "(`load`), and this server draws at the run's end; build it from the task at "
+                             "the version's progress (LMObjective.policy(..., Progress(version)), "
+                             "Server.from_task)")
         self._server = server
         self._version = version
         self._engine = Engine(server, name="dew-rollout-server")
@@ -378,9 +385,14 @@ class NativeRolloutServer:
             return True
 
     def load(self, variables: Variables, version: int) -> None:
+        # A version is the updates the run committed (`Snapshot.updates`), which a model that reads the
+        # run's progress draws at (`Server.reload`).
+        at = Progress(jnp.asarray(version, jnp.int32))
+        progress = at if progressed(self._server.model, at) else None
+
         def loading() -> None:
             with self._loading:
-                self._server.reload(thaw(variables))
+                self._server.reload(thaw(variables), progress)
                 self._version = version
 
         self._engine.reload(loading)
