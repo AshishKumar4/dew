@@ -1149,7 +1149,6 @@ class Trainer(Generic[Loss, Effects]):
         else:
             # The tuner is off (bible §6): each launch takes its derived config, nothing settled or read.
             lowered, launches = lower() if lowering else None, launches or "[]"
-        # Derived for the run's own devices, whose compiler's fusion it models.
         footprint = None if self.step is not None or mesh is not None else candidate_footprint(
             self.objective, self._model_shapes(micro), split * self.accumulation, prepared, held,
             self.device_mesh.devices.flat[0])
@@ -1614,8 +1613,7 @@ class Trainer(Generic[Loss, Effects]):
         per-example shape its model reads (`Field.of`) of the run's first batch, `first`'s, placed as the
         run places it and through the loader's device steps (`_model_shapes`), which may crop or resize
         it, agreed across the pool before anything initializes."""
-        named = self.objective.named_inputs
-        if named is None or self.objective.inputs is not None:
+        if (named := self.objective.named_inputs) is None or self.objective.inputs is not None:
             return
         mesh = self.device_mesh
         batch = agreed("training input batch", first)
