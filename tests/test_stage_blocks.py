@@ -74,7 +74,7 @@ CELLS = [("dit", "fsdp2_stage2"), ("dit", "stage2_sequence2"), ("hybrid_dit", "f
          ("unet", "stage2_sequence2")]
 
 PAST_TARGET = {"stack": {("unet", "stage2_sequence2"): 153}}
-"""The cells past a group's 120 s (`timed`), each its seconds in train 284's CI (812c5b2db, ledger 2200):
+"""The cells past a group's 120 s (`timed`), each its seconds in train 284's CI (1d680d0d1, ledger 2200):
 the UNet beside the sequence axis; every train stacks the UNet's stages over fsdp2_stage2 and the DiT's
 and the JEPA encoder's beside the sequence axis."""
 

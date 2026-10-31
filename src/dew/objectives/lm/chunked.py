@@ -679,7 +679,7 @@ def chunked_tile() -> tuple[int, int]:
     Qwen3-0.6B's head (vocabulary 151936, 1024 wide, 4096 tokens, bf16) took 13.4 ms forward and backward
     at 4096 x 8192 against 19.9 at 1024 x 8192 (16.5 at 2048, 13.4 at 8192), and Qwen3.5-4B's (248320, 2560
     wide, 24576 tokens) 282 against 350 ms (305 at 2048, 272 at 8192 for 0.26 GB more), 1.30 GB of
-    temporaries (JS-headtile-h100-f5a0f8bef). On one A100, Qwen3-0.6B's took 48.7 ms at 4096 x 8192 and 60.2
+    temporaries (JS-headtile-h100-6a5bc1494). On one A100, Qwen3-0.6B's took 48.7 ms at 4096 x 8192 and 60.2
     ms at 1024 x 8192, at 0.46 and 0.21 GiB of temporaries. On an RTX 4080, a whole training step at those
     widths (2 layers, bf16): at 4096 tokens 114.6 ms against 123.4 at 1024 x 8192, 119.7 at 2048 x 8192 and
     116.6 at 4096 x 4096; at 8192 tokens 219.1 against 228.3 (1024 x 8192), 227.8 (2048 x 16384) and 219.3

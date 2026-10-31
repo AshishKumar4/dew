@@ -272,7 +272,7 @@ def the_kernels_are_as_exact_as_xla_at_the_training_shapes(model, dtype, packed)
     def exact(x, weights, grads):
         # A row at a time on the host (`row_truth`): the 9b's packed rows peaked at 9.2 GiB of an A100, past
         # a packed job's 8.9 GiB share where main's GPU tier ran them (row 1724,
-        # SE-conv1724-a100-fd8508b5a), 8.85 with the arrays on the host alone (SE-conv1724-a100-9419b90c1).
+        # SE-conv1724-a100-0c1a0c1ad), 8.85 with the arrays on the host alone (SE-conv1724-a100-ad332526f).
         pieces, gradients = row_truth(x, weights, parts, grads, segments)
         return pieces, gradients[:2]
 

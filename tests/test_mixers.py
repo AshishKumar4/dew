@@ -273,7 +273,7 @@ not resolve within 512 seeds (2048 at 8); at 8 or 16 heads of 16, or 4 of 64, it
 
 
 PAST_TARGET = {"packed": {"memory": 122}}
-"""The cases past a group's 120 s (`timed`), each its seconds in train 272's CI (a8a9657d8, ledger 2160):
+"""The cases past a group's 120 s (`timed`), each its seconds in train 272's CI (ddee96234, ledger 2160):
 the memory mixer's packed row; every train packs every other mixer's, and test_memory_composition.py
 packs the memory decoder's."""
 

@@ -4,4 +4,4 @@ These scripts produced the evidence for the move to `Pipeline` recipes: what the
 
 | File | Baseline | Purpose | Reproduction |
 | --- | --- | --- | --- |
-| `data_oracle.py`, `data_oracle_legacy.py` | Dew `66beb5305` | Records what each old loader read from synthetic records, at 0 and 2 workers and 1 and 2 shares. `data_oracle.py` downloads the baseline and runs `data_oracle_legacy.py` inside it. The gzipped output is `tests/fixtures/golden/loaders-66beb5305.json.gz`, which `tests/test_pipeline_golden.py` reads. | `python tools/measurements/data-pipeline/data_oracle.py --output loaders-66beb5305.json` |
+| `data_oracle.py`, `data_oracle_legacy.py` | Dew `7ad0d4079` | Records what each old loader read from synthetic records, at 0 and 2 workers and 1 and 2 shares. `data_oracle.py` downloads the baseline and runs `data_oracle_legacy.py` inside it. The gzipped output is `tests/fixtures/golden/loaders-7ad0d4079.json.gz`, which `tests/test_pipeline_golden.py` reads. | `python tools/measurements/data-pipeline/data_oracle.py --output loaders-7ad0d4079.json` |
