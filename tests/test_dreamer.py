@@ -307,7 +307,8 @@ def test_a_rollout_from_demonstrations_takes_no_prefill_and_writes_on_them():
     trainer.fit(data, steps=12, log_every=12)
     owed = -(-12 * 8 * 16 // 32)
     assert rollout.environment_steps == 4 * -(-owed // 4)
-    assert int(rollout._replay.filled) == 40 + rollout.environment_steps // 4
+    held = rollout.held_replay
+    assert held is not None and int(held.filled) == 40 + rollout.environment_steps // 4
 
 
 def test_a_demonstration_replay_holds_each_episode_in_the_agents_convention():
@@ -320,7 +321,7 @@ def test_a_demonstration_replay_holds_each_episode_in_the_agents_convention():
                  "action": -np.arange(n, dtype=np.float32)[:, None] - 10 * index,
                  "reward": np.arange(n, dtype=np.float32)} for index, n in enumerate((5, 3, 4))]
     replay = demonstration_replay(episodes)
-    data = jax.tree.map(lambda leaf: np.asarray(leaf)[:, 0], replay.data)
+    data = jax.tree.map(lambda leaf: np.asarray(leaf)[:, 0], replay.held)
     np.testing.assert_array_equal(data["observation"], np.concatenate([e["observation"] for e in episodes]))
     np.testing.assert_array_equal(data["action"], -data["observation"])
     np.testing.assert_array_equal(np.flatnonzero(data["first"]), [0, 5, 8])

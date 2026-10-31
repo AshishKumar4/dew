@@ -283,9 +283,14 @@ def nft(
     return report
 
 
-def bouncing(rows: int, frames: int, size: int, seed: int, radius: float = 2.5) -> np.ndarray:
-    """`rows` videos `[frames, size, size, 1]` in [-1, 1] of two balls of `radius` bouncing off the
-    walls at constant speeds."""
+BALL = 2.5
+"""A bouncing ball's radius in pixels."""
+
+
+def bouncing(rows: int, frames: int, size: int, seed: int) -> np.ndarray:
+    """`rows` videos `[frames, size, size, 1]` in [-1, 1] of two balls of radius `BALL`, their edges
+    anti-aliased, bouncing off the walls at constant speeds."""
+    radius = BALL
     rng = np.random.default_rng(seed)
     grid = np.stack(np.meshgrid(np.arange(size), np.arange(size), indexing="ij"), -1) + 0.5
     videos = np.full((rows, frames, size, size, 1), -1.0, np.float32)
@@ -294,8 +299,9 @@ def bouncing(rows: int, frames: int, size: int, seed: int, radius: float = 2.5) 
         velocity = rng.uniform(-1.5, 1.5, (2, 2))
         for frame in video:
             for ball in range(2):
-                inside = np.sum(np.square(grid - position[ball]), -1) <= radius**2
-                frame[inside, 0] = 1.0
+                # Each pixel lit by the share of it the ball covers, its edge anti-aliased over a pixel.
+                distance = np.sqrt(np.sum(np.square(grid - position[ball]), -1))
+                frame[..., 0] = np.maximum(frame[..., 0], 2 * np.clip(radius + 0.5 - distance, 0, 1) - 1)
             position = position + velocity
             bounced = (position < radius) | (position > size - radius)
             velocity = np.where(bounced, -velocity, velocity)

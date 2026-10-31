@@ -25,13 +25,17 @@ from the default model whatever model is loaded, so it is set from the loaded mo
 
 from __future__ import annotations
 
-from typing import Any
+from collections.abc import Mapping
+from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 
 from dew.rl.flight import Gates, Kinematics
+
+if TYPE_CHECKING:
+    import hyperlux
 
 GROUND = (0.35, 0.45, 0.3), (0.45, 0.55, 0.35)
 """The ground's two checker colours, linear RGB."""
@@ -43,17 +47,21 @@ SUNK = (0.0, 0.0, -1000.0)
 """Where a course's unused gates stand, out of every camera's sight."""
 
 
-def thrust_to_weight(model: dict) -> float:
+def thrust_to_weight(model: Mapping[str, object]) -> float:
     """A loaded L2F model's full-command thrust over its weight (L2F's `ideal_rates`, multirotor.h), from
-    its parameters' `dynamics.dynamics`."""
-    command = model["action_limit"]["max"]
-    thrust = sum(direction[2] * (low + linear * command + square * command ** 2)
-                 for (low, linear, square), direction in zip(model["rotor_thrust_coefficients"],
-                                                             model["rotor_thrust_directions"], strict=True))
-    return float(thrust / (model["mass"] * np.linalg.norm(model["gravity"])))
+    its parameters' `dynamics.dynamics` as HyperDrone answers them, parsed here."""
+    limit = model["action_limit"]
+    if not isinstance(limit, Mapping):
+        raise TypeError(f"an L2F model's action_limit is a mapping, not {limit!r}")
+    command = float(limit["max"])
+    low, linear, square = np.asarray(model["rotor_thrust_coefficients"], np.float64).T
+    lift = np.asarray(model["rotor_thrust_directions"], np.float64)[:, 2]
+    thrust = np.sum(lift * (low + linear * command + square * command ** 2))
+    gravity = np.linalg.norm(np.asarray(model["gravity"], np.float64))
+    return float(thrust / (float(np.asarray(model["mass"], np.float64)) * gravity))
 
 
-def _gate(opening: float, frame: float, depth: float) -> Any:  # noqa: ANN401
+def _gate(opening: float, frame: float, depth: float) -> hyperlux.ObjectAssembly:
     """A square gate facing along x: four bars `frame` wide and `depth` deep about an opening `opening`
     wide."""
     import hyperlux
@@ -67,7 +75,7 @@ def _gate(opening: float, frame: float, depth: float) -> Any:  # noqa: ANN401
     return assembly
 
 
-def _ground(extent: float, tile: float) -> Any:  # noqa: ANN401
+def _ground(extent: float, tile: float) -> hyperlux.Object:
     """A checkered square of ground `extent` metres a side about the origin, its tiles `tile` wide."""
     import hyperlux
 
@@ -110,10 +118,10 @@ class HyperDroneFlight:
         self.sim = dynamics.Sim(count, parameters={"dynamics": {**shared, "ideal_rates": ideal}}, seed=seed,
                                 device=device, control="ctbr", actuation="ideal")
         self._drawn = size, opening, frame, depth, extent, tile
-        self.renderer = None
+        self.renderer: hyperlux.HyperLux | None = None
         self._bases = jax.jit(self._placed)
 
-    def _built(self) -> None:
+    def _built(self) -> hyperlux.HyperLux:
         """The renderer, built the first time an image is asked for (a race that shows none needs none):
         the ground and sky, and each drone's gates as placements of its own overlay, its camera's alone."""
         import hyperlux
@@ -128,17 +136,19 @@ class HyperDroneFlight:
         pool = hyperlux.AssetPool()
         gate = pool.add_assembly(_gate(opening, frame, depth))
         self._rgb = RGB("rgba8")
-        self.renderer = hyperlux.HyperLux(
+        renderer = hyperlux.HyperLux(
             size, size, batch_size=self.count, fidelity="medium", num_probes=0,
             cameras=(CameraSpec("front", (self._rgb,)),), num_overlays=self.count,
             max_overlay_instances=4 * self.gates, max_overlays_per_camera=1)
-        self.renderer.init(scene, asset_pool=pool)
+        renderer.init(scene, asset_pool=pool)
         self._scene, self._pool = scene, pool
         placements = []
         for drone in range(self.count):
-            self.renderer.attach(drone, drone)
-            placements += [self.renderer.spawn(drone, gate) for _ in range(self.gates)]
-        self._placements = self.renderer.placement_batch(placements)
+            renderer.attach(drone, drone)
+            placements += [renderer.spawn(drone, gate) for _ in range(self.gates)]
+        self._placements = renderer.placement_batch(placements)
+        self.renderer = renderer
+        return renderer
 
     def _placed(self, gates: Gates) -> jax.Array:
         """Each placement's base `[count * gates, 12]`: a drone's course's gates where they stand, facing
@@ -163,35 +173,34 @@ class HyperDroneFlight:
                                                            "angular_velocity")))
 
     def reset(self, mask: jax.Array, position: jax.Array, orientation: jax.Array) -> Kinematics:
-        mask = np.asarray(mask, bool)
-        self.sim.reset(mask)
+        selected = np.asarray(mask, bool)
+        self.sim.reset(selected)
         still = np.zeros((self.count, 3))
         for name, value in (("position", position), ("orientation", orientation), ("linear_velocity", still),
                             ("angular_velocity", still)):
-            placed = np.where(mask[:, None], np.asarray(value, np.float32), self.sim.state[name])
+            placed = np.where(selected[:, None], np.asarray(value, np.float32), self.sim.state[name])
             self.sim.state[name] = placed.astype(np.float32)
         return self._kinematics()
 
     def step(self, commands: jax.Array) -> tuple[Kinematics, jax.Array, None]:
-        commands = jnp.asarray(commands, jnp.float32)
-        commands = jax.block_until_ready(commands) if self.sim.device == "cuda" else np.asarray(commands)
+        commanded = jnp.asarray(commands, jnp.float32)
+        sent = jax.block_until_ready(commanded) if self.sim.device == "cuda" else np.asarray(commanded)
         path = [self._state("position")]
         for _ in range(self.substeps):
-            self.sim.step(commands)
+            self.sim.step(sent)
             path.append(self._state("position"))
         return self._kinematics(), jnp.stack(path, 1), None
 
     def render(self, gates: Gates, cameras: jax.Array) -> jax.Array:
         import hyperlux
 
-        if self.renderer is None:
-            self._built()
+        renderer = self._built() if self.renderer is None else self.renderer
         bases = jax.block_until_ready(self._bases(gates))
-        self.renderer.set_pose(self._placements, hyperlux.Pose(bases))
-        self.renderer.update()
-        self.renderer.set_cameras(jax.block_until_ready(jnp.asarray(cameras, jnp.float32)))
-        self.renderer.render()
-        blocks = [jax.dlpack.from_dlpack(block) for block in self.renderer.outputs[self._rgb].blocks]
+        renderer.set_pose(self._placements, hyperlux.Pose(bases))
+        renderer.update()
+        renderer.set_cameras(jax.block_until_ready(jnp.asarray(cameras, jnp.float32)))
+        renderer.render()
+        blocks = [jax.dlpack.from_dlpack(block) for block in renderer.outputs[self._rgb].blocks]
         return jnp.concatenate(blocks)[..., :3]
 
 

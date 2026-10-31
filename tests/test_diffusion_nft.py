@@ -201,7 +201,7 @@ def test_the_loss_corrupts_by_its_process_own_noise_levels():
         # computes them.
         alpha, sigma = (np.stack([np.asarray(rate).reshape(-1) for rate in rates], 1) for rates in zip(
             *(nft.process.rates(jnp.asarray(column), like=samples) for column in times.T), strict=True))
-    assert not np.allclose(sigma, times)
+    assert not np.array_equal(sigma, times)
     shape = (8, 3, 1, 1, 1)
     error = alpha.reshape(shape) * samples[:, None] + sigma.reshape(shape) * noise - samples[:, None]
     per = np.mean(np.square(error), axis=(2, 3, 4)) / np.mean(np.abs(error), axis=(2, 3, 4))

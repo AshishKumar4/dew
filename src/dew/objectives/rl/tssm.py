@@ -175,7 +175,8 @@ class TSSM(nn.Module):
             return padded.reshape(rows * length, *padded.shape[2:])
 
         valid = jnp.pad(valid, ((0, 0), (0, 0), (0, horizon))).reshape(rows * length, length + horizon)
-        return Cache(*(spread(held) for held in stacked), valid,
+        cached_keys, cached_values = stacked
+        return Cache(spread(cached_keys), spread(cached_values), valid,
                      jnp.full(rows * length, length, jnp.int32), (positions + 1).reshape(-1))
 
     @nn.nowrap

@@ -36,7 +36,7 @@ import optax
 from flax import linen as nn, struct
 
 from dew.batch import Batch, Variables, merge, under
-from dew.nn.precision import at_least_fp32
+from dew.nn.precision import at_least_fp32, divided
 from dew.objectives.base import Aux, EMASpec, Objective, Ratio, Shown, Step
 from dew.objectives.rl.tssm import TSSM, Cache
 from dew.rl.distributions import (
@@ -48,9 +48,24 @@ from dew.rl.distributions import (
     twohot_mean,
     unimix_log_probs,
 )
-from dew.rl.env import Carry, Driven, Env, Observation, TimeStep, Transition, env_rollout, start
+from dew.rl.env import (
+    Carry,
+    Driven,
+    Env,
+    Memory,
+    Observation,
+    Params,
+    Policy,
+    TimeStep,
+    Transition,
+    Tree,
+    env_rollout,
+    start,
+    view,
+    views,
+)
 from dew.rl.replay import ReplayBuffer
-from dew.rl.simulator import DrivenSimulator, Simulator, device_of, simulator_rollout, simulator_start
+from dew.rl.simulator import DrivenSimulator, Simulator, simulator_rollout, simulator_start
 
 if TYPE_CHECKING:
     from dew.state import TrainState
@@ -119,7 +134,7 @@ class ConvEncoder(nn.Module):
     @nn.compact
     def __call__(self, image: jax.Array) -> jax.Array:
         lead = image.shape[:-3]
-        x = image.reshape(-1, *image.shape[-3:]).astype(self.dtype) / 255 - 0.5
+        x = divided(image.reshape(-1, *image.shape[-3:]).astype(self.dtype), 255) - 0.5
         for stage, mult in enumerate(self.mults):
             x = nn.Conv(self.depth * mult, (self.kernel, self.kernel), padding="SAME", kernel_init=_init(),
                         dtype=self.dtype, param_dtype=at_least_fp32(self.dtype), name=f"cnn{stage}")(x)
@@ -222,12 +237,12 @@ class WorldModel(nn.Module):
         layers = functools.partial(_Layers, dtype=self.dtype)
         if self.image is None:
             self.encoder = layers(self.units, 3)
-            self.decoder = layers(self.units, 3)
+            self.vector_decoder = layers(self.units, 3)
             self.decoded = dense(self.observation_size)
         else:
             self.encoder = ConvEncoder(self.conv_depth, dtype=self.dtype)
-            self.decoder = ConvDecoder(self.image, self.conv_depth, self.units, blocks=self.blocks,
-                                       dtype=self.dtype)
+            self.image_decoder = ConvDecoder(self.image, self.conv_depth, self.units, blocks=self.blocks,
+                                             dtype=self.dtype)
         self.dynamics_in = [dense(self.hidden) for _ in range(3)]
         self.dynamics_norms = [norm() for _ in range(3)]
         self.dynamics_hidden = _BlockLinear(self.deter, self.blocks, self.dtype)
@@ -275,8 +290,8 @@ class WorldModel(nn.Module):
         return jnp.zeros((*batch, self.deter)), jnp.zeros((*batch, self.stoch, self.classes))
 
     def seen(self, observation: Observation) -> jax.Array:
-        """What the encoder reads of an observation: its `reads` entry, or the observation whole."""
-        return observation if self.reads is None else observation[self.reads]
+        """What the encoder reads of an observation: its `reads` view, or the observation whole."""
+        return view(observation, self.reads)
 
     def predicted(self, name: str, feature: jax.Array) -> jax.Array:
         """The auxiliary head `name`'s prediction of its privileged entry."""
@@ -305,11 +320,13 @@ class WorldModel(nn.Module):
         # The state carried at its own dtype, whatever the networks compute in.
         return (update * candidate + (1 - update) * deter).astype(deter.dtype)
 
-    def posterior(self, deter: jax.Array, tokens: jax.Array) -> jax.Array:
+    def posterior(self, deter: jax.Array | None, tokens: jax.Array) -> jax.Array:
         """The posterior's log-probabilities `[..., stoch, classes]` (rssm.py:75-92); the TSSM's reads
-        the tokens alone."""
+        the tokens alone, the block GRU's the deterministic state too."""
         if self.dynamics is not None:
             return self.dynamics.posterior(tokens)
+        if deter is None:
+            raise ValueError("the block GRU's posterior reads the deterministic state")
         logits = self.posterior_logits(self.posterior_layers(jnp.concatenate([deter, tokens], -1)))
         return unimix_log_probs(logits.reshape(*logits.shape[:-1], self.stoch, self.classes), self.unimix)
 
@@ -330,8 +347,8 @@ class WorldModel(nn.Module):
         """The observation decoded from a latent: a vector's symlogged values, an image's pixels in
         [0, 1]."""
         if self.image is None:
-            return self.decoded(self.decoder(self.feature(deter, stoch)))
-        return self.decoder(deter, stoch)
+            return self.decoded(self.vector_decoder(self.feature(deter, stoch)))
+        return self.image_decoder(deter, stoch)
 
     def reconstruction(self, deter: jax.Array, stoch: jax.Array, observation: jax.Array) -> jax.Array:
         """The decoder's squared error, summed over the observation: against a vector's symlog, or an
@@ -339,7 +356,7 @@ class WorldModel(nn.Module):
         decoded = self.decode(deter, stoch).astype(jnp.float32)
         if self.image is None:
             return jnp.sum(jnp.square(decoded - symlog(observation)), -1)
-        return jnp.sum(jnp.square(decoded - observation.astype(decoded.dtype) / 255), (-3, -2, -1))
+        return jnp.sum(jnp.square(decoded - divided(observation.astype(decoded.dtype), 255)), (-3, -2, -1))
 
     def reward(self, feature: jax.Array) -> jax.Array:
         return self.reward_logits(self.reward_layers(feature)).astype(jnp.float32)
@@ -410,6 +427,16 @@ class _Latent:
 
 
 @struct.dataclass
+class AgentMemory:
+    """An agent's memory between its steps in an environment: the block GRU's deterministic state or the
+    TSSM's cache, `held`; the last posterior draw, `stoch`; and the action it took, `previous`."""
+
+    held: jax.Array | Cache
+    stoch: jax.Array
+    previous: jax.Array
+
+
+@struct.dataclass
 class LatentEnv:
     """The world model as an `Env`: its state the latent and a key, its step the GRU and a draw from
     the prior, its observation the latent's feature, its reward the reward head's two-hot mean and
@@ -435,13 +462,14 @@ class LatentEnv:
     def step(self, state: _Latent, action: jax.Array) -> tuple[_Latent, TimeStep]:
         key, latent = jax.random.split(state.key)
         model = self.model.bind(self.variables, rngs={"latent": latent})
-        cache = state.cache
-        if model.dynamics is None:
+        cache, dynamics = state.cache, model.dynamics
+        if dynamics is None:
             deter = model.core(state.deter, state.stoch, action)
         else:
+            if cache is None:
+                raise ValueError("a TSSM imagines from a window's cache (LatentEnv.at)")
             never = jnp.zeros(action.shape[:-1], bool)
-            inputs = model.dynamics.inputs(state.stoch, action, never)
-            deter, cache = model.dynamics.step(inputs, never, cache)
+            deter, cache = dynamics.step(dynamics.inputs(state.stoch, action, never), never, cache)
         stoch = model.categorical(model.prior(deter))
         feature = WorldModel.feature(deter, stoch)
         reward = twohot_mean(model.reward(feature), self.bins)
@@ -525,13 +553,14 @@ class DreamerV3Objective(Objective[Ratio]):
         its own of `T` keys split from `key`, as the code's scan seeds each step's sample
         (rssm.py:63-90)."""
         rows, length = first.shape
-        if self.model.dynamics is not None:
+        model = self.model.bind(variables, rngs={"latent": key})
+        dynamics = model.dynamics
+        if dynamics is not None:
             # TransDreamer: the window's posteriors at once, then the transformer over the latents and
             # actions before each step.
-            model = self.model.bind(variables, rngs={"latent": key})
             posterior = model.posterior(None, model.embed(observation))
             stoch = model.categorical(posterior)
-            deter = model.dynamics.states(model.dynamics.inputs(_shifted(stoch), previous, first), first)
+            deter = dynamics.states(dynamics.inputs(_shifted(stoch), previous, first), first)
             return deter, stoch, posterior
 
         def step(latent, inputs):
@@ -547,31 +576,38 @@ class DreamerV3Objective(Objective[Ratio]):
         deter, stoch, posterior = (jnp.swapaxes(x, 0, 1) for x in found)
         return deter, stoch, posterior
 
-    def act(self, variables: Variables, observed: Mapping[str, jax.Array], key: jax.Array,
-            memory: tuple[jax.Array, jax.Array, jax.Array]) -> tuple[jax.Array, dict, tuple]:
+    def act(self, variables: Params, observed: Observation, key: jax.Array,
+            memory: Memory) -> tuple[jax.Array, Tree, AgentMemory]:
         """The agent's step in an environment (`dew.rl.env.Policy` over `Driven`): the posterior
         given the step's observation, then an action drawn from the policy, clipped to [-1, 1]."""
+        if not isinstance(memory, AgentMemory):
+            raise TypeError("an agent acts from its own memory (DreamerV3Objective.memory)")
         latent, draw = jax.random.split(key)
         model = self.model.bind(variables, rngs={"latent": latent})
-        held, stoch, previous = memory
-        seen = model.seen(observed["observation"])
-        if model.dynamics is None:
-            deter, stoch, _ = self.observe(model, held, stoch, seen, previous, observed["first"])
+        step = views(observed)
+        seen, first = model.seen(step["observation"]), view(step, "first")
+        held, dynamics = memory.held, model.dynamics
+        if dynamics is None:
+            if isinstance(held, Cache):
+                raise TypeError("a block GRU's agent remembers its deterministic state, not a cache")
+            deter, stoch, _ = self.observe(model, held, memory.stoch, seen, memory.previous, first)
+            held = deter
         else:
-            first = observed["first"]
-            deter, held = model.dynamics.step(model.dynamics.inputs(stoch, previous, first), first, held)
+            if not isinstance(held, Cache):
+                raise TypeError("a TSSM's agent remembers its cache")
+            deter, held = dynamics.step(dynamics.inputs(memory.stoch, memory.previous, first), first, held)
             stoch = model.categorical(model.posterior(None, model.embed(seen)))
         mean, std = model.policy(WorldModel.feature(deter, stoch))
         action = jnp.clip(mean + std * jax.random.normal(draw, mean.shape), -1, 1)
-        return action, {}, (deter if model.dynamics is None else held, stoch, action)
+        return action, {}, AgentMemory(held, stoch, action)
 
-    def memory(self, count: int) -> tuple[jax.Array | Cache, jax.Array, jax.Array]:
+    def memory(self, count: int) -> AgentMemory:
         """The agent's memory at the start for each of `count` environments: a zero latent, or a TSSM's
         empty cache of its `context` steps, and a zero previous latent and action."""
         deter, stoch = self.model.initial((count,))
         dynamics = self.model.dynamics
         held = deter if dynamics is None else dynamics.empty_cache(count, dynamics.context)
-        return held, stoch, jnp.zeros((count, self.model.action_size))
+        return AgentMemory(held, stoch, jnp.zeros((count, self.model.action_size)))
 
     def loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[Ratio, Aux]:
         world_key, imagine_key = jax.random.split(step.key)
@@ -606,38 +642,43 @@ class DreamerV3Objective(Objective[Ratio]):
             mean, std = model.policy(jax.lax.stop_gradient(feature))
             losses["imitation"] = (1 - last) * -normal_log_prob(action, mean, std)
         if not any(self.scales[name] for name in ("policy", "value", "replay_value")):
-            total = sum(self.scales[name] * jnp.mean(value) for name, value in losses.items())
+            total = sum((self.scales[name] * jnp.mean(value) for name, value in losses.items()),
+                        jnp.zeros(()))
             metrics = {f"loss_{name}": jnp.mean(value) for name, value in losses.items()}
             return Ratio(total, jnp.ones(())), Aux(metrics, variables={"returns": variables["returns"]})
 
         # Imagination from every replayed posterior state, its inputs held still (agent.py:189-196).
         env = LatentEnv(self.model, jax.lax.stop_gradient(variables), self.bins)
-        starts = jax.tree.map(lambda x: jax.lax.stop_gradient(x.reshape(rows * length, *x.shape[2:])),
-                              (deter, stoch))
+        start_deter, start_stoch = (jax.lax.stop_gradient(x.reshape(rows * length, *x.shape[2:]))
+                                    for x in (deter, stoch))
         latent_key, act_key, last_key = jax.random.split(imagine_key, 3)
-        cache = None
-        if model.dynamics is not None:
+        cache, dynamics = None, model.dynamics
+        if dynamics is not None:
             # Each start's cache, the window's keys and values of its episode up to it.
-            inputs = model.dynamics.inputs(_shifted(stoch), previous, first)
-            cache = jax.lax.stop_gradient(model.dynamics.window_cache(inputs, first, self.imagination))
-        state, begin = env.at(*starts, latent_key, cache)
+            inputs = dynamics.inputs(_shifted(stoch), previous, first)
+            cache = jax.lax.stop_gradient(dynamics.window_cache(inputs, first, self.imagination))
+        state, begin = env.at(start_deter, start_stoch, latent_key, cache)
 
-        def policy(params, feature, key, memory):
-            mean, std = self.model.apply(params, feature, method=WorldModel.policy)
+        def policy(params: Params, feature: Observation, key: jax.Array, memory: Memory) -> tuple[
+                jax.Array, Tree, Memory]:
+            mean, std = self.model.bind(params).policy(view(feature))
             return mean + std * jax.random.normal(key, mean.shape), {}, None
 
         held = jax.lax.stop_gradient(variables)
         _, imagined = env_rollout(env, policy, held, Carry(state, begin, act_key), self.imagination,
                                   reset=False)
         # The start's feature then each imagined one, and the action taken at each [B*T, H + 1].
-        features = jnp.concatenate([begin[:, None], jnp.swapaxes(imagined.following.observation, 0, 1)], 1)
+        imagined_features = jnp.swapaxes(view(imagined.following.observation), 0, 1)
+        features = jnp.concatenate([begin[:, None], imagined_features], 1)
         last_action, _, _ = policy(held, features[:, -1], last_key, None)
         actions = jnp.concatenate([jnp.swapaxes(imagined.action, 0, 1), last_action[:, None]], 1)
-        rewards = twohot_mean(self.model.apply(held, features, method=WorldModel.reward), self.bins)
-        cont = jax.nn.sigmoid(self.model.apply(held, features, method=WorldModel.continue_))
+        still = self.model.bind(held)
+        rewards = twohot_mean(still.reward(features), self.bins)
+        cont = jax.nn.sigmoid(still.continue_(features))
         values = twohot_mean(model.value(features), self.bins)
-        slow = merge(variables, jax.lax.stop_gradient(step.ema)) if step.ema is not None else held
-        slow_values = twohot_mean(self.model.apply(slow, features, method=lambda m, f: m.value(f)), self.bins)
+        slow = self.model.bind(merge(variables, jax.lax.stop_gradient(step.ema)) if step.ema is not None
+                               else held)
+        slow_values = twohot_mean(slow.value(features), self.bins)
         weight = jax.lax.stop_gradient(jnp.cumprod(cont, 1))
         returns = jax.lax.stop_gradient(lambda_return(jnp.zeros_like(cont), 1 - cont, rewards, values, values,
                                                       1.0, self.lam))
@@ -662,13 +703,13 @@ class DreamerV3Objective(Objective[Ratio]):
         boot = returns[:, 0].reshape(rows, length)
         replay_returns = jax.lax.stop_gradient(lambda_return(last, terminal, reward, replay_values, boot,
                                                              1 - 1 / self.horizon, self.lam))
-        replay_slow = twohot_mean(self.model.apply(slow, feature, method=lambda m, f: m.value(f)), self.bins)
+        replay_slow = twohot_mean(slow.value(feature), self.bins)
         replay_targets = jnp.concatenate([replay_returns, jnp.zeros_like(replay_returns[:, -1:])], 1)
         replay_value = (twohot_loss(replay_logits, replay_targets, self.bins)
                         + twohot_loss(replay_logits, replay_slow, self.bins))
         losses["replay_value"] = (1 - last)[:, :-1] * replay_value[:, :-1]
 
-        total = sum(self.scales[name] * jnp.mean(value) for name, value in losses.items())
+        total = sum((self.scales[name] * jnp.mean(value) for name, value in losses.items()), jnp.zeros(()))
         metrics = {f"loss_{name}": jnp.mean(value) for name, value in losses.items()}
         metrics.update(return_scale=scale, imagined_return=jnp.mean(returns))
         stats = {"returns": {"low": jax.lax.stop_gradient(low), "high": jax.lax.stop_gradient(high)}}
@@ -695,20 +736,25 @@ class DreamerRollout:
     train_ratio: float = 1024.0
     prefill: int = 64
     replay: ReplayBuffer | None = None
-    _driven: Env | DrivenSimulator = field(init=False, repr=False)
-    _carry: Carry | None = field(default=None, init=False, repr=False)
-    _replay: ReplayBuffer | None = field(default=None, init=False, repr=False)
-    _returns: jax.Array | None = field(default=None, init=False, repr=False)
+    _live: _Live | None = field(default=None, init=False, repr=False)
     _taken: int = field(default=0, init=False, repr=False)
     _ended: tuple[float, int] = field(default=(0.0, 0), init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.replay is None and self.prefill < self.length:
             raise ValueError("the prefill must hold at least one window")
-        self._driven = DrivenSimulator(self.env) if isinstance(self.env, Simulator) else Driven(self.env)
-        # The replay is written in place, its buffer donated to the step that writes it.
-        self._acted = jax.jit(self._steps, static_argnames=("steps", "random"), donate_argnames=("replay",))
-        self._recorded = jax.jit(self._kept, donate_argnames=("replay",))
+        env = self.env
+        if isinstance(env, Simulator):
+            driven = DrivenSimulator(env)
+            self._begin = functools.partial(simulator_start, driven)
+            # The replay is written in place, its buffer donated to the step that writes it.
+            recorded = jax.jit(self._kept, donate_argnames=("replay",))
+            self._roll = functools.partial(self._simulated, driven, recorded)
+        else:
+            stepped = Driven(env)
+            self._begin = functools.partial(start, stepped)
+            self._roll = jax.jit(functools.partial(self._stepped, stepped),
+                                 static_argnames=("steps", "random"), donate_argnames=("live",))
         self._sample = jax.jit(lambda replay, key: replay.sample(key, self.batch, self.length))
 
     @property
@@ -721,20 +767,25 @@ class DreamerRollout:
         """The steps every environment has taken so far, summed."""
         return self._taken
 
-    def _uniform(self, params: Variables, observed: Mapping[str, jax.Array], key: jax.Array,
-                 memory: tuple) -> tuple[jax.Array, dict, tuple]:
+    @property
+    def held_replay(self) -> ReplayBuffer | None:
+        """The replay the rollout writes and samples, None before its first call."""
+        return None if self._live is None else self._live.replay
+
+    def _uniform(self, params: Params, observed: Observation, key: jax.Array,
+                 memory: Memory) -> tuple[jax.Array, Tree, Memory]:
         """The prefill's policy: actions uniform in [-1, 1]."""
-        shape = (observed["reward"].shape[0], self.env.action_size)
+        shape = (view(observed, "reward").shape[0], self.env.action_size)
         return jax.random.uniform(key, shape, minval=-1, maxval=1), {}, memory
 
-    def _policy(self, random: bool) -> Callable:
+    def _policy(self, random: bool) -> Policy:
         return self._uniform if random else self.objective.act
 
     def _kept(self, replay: ReplayBuffer, returns: jax.Array,
               recorded: Transition) -> tuple[ReplayBuffer, jax.Array, jax.Array, jax.Array]:
         """The replay with a rollout's steps written, each environment's running return, and the sum
         and count of the returns of the episodes that ended in it."""
-        observed = recorded.observation
+        observed = views(recorded.observation)
         replay = replay.add({**observed, "action": recorded.action})
 
         def tally(held, observed):
@@ -744,54 +795,72 @@ class DreamerRollout:
         returns, (totals, ended) = jax.lax.scan(tally, returns, observed)
         return replay, returns, jnp.sum(jnp.where(ended, totals, 0)), jnp.sum(ended)
 
-    def _steps(self, variables: Variables, carry: Carry, replay: ReplayBuffer, returns: jax.Array, *,
-               steps: int, random: bool) -> tuple[Carry, ReplayBuffer, jax.Array, jax.Array, jax.Array]:
-        policy = self._policy(random)
-        carry, recorded = env_rollout(self._driven, policy, variables, carry, steps, reset=False)
-        return carry, *self._kept(replay, returns, recorded)
+    def _stepped(self, env: Env, variables: Variables, live: _Live, *, steps: int,
+                 random: bool) -> tuple[_Live, jax.Array, jax.Array]:
+        """`live` after `steps` steps of every environment of `env`, one scan, and the ended episodes'
+        returns' sum and count."""
+        carry, recorded = env_rollout(env, self._policy(random), variables, live.carry, steps, reset=False)
+        replay, returns, total, count = self._kept(live.replay, live.returns, recorded)
+        return _Live(carry, replay, returns), total, count
+
+    def _simulated(self, simulator: DrivenSimulator, recorded: Callable, variables: Variables, live: _Live, *,
+                   steps: int, random: bool) -> tuple[_Live, jax.Array, jax.Array]:
+        """`live` after `steps` steps of every environment of `simulator`, stepped from the host, and the
+        ended episodes' returns' sum and count."""
+        carry, steps_taken = simulator_rollout(simulator, self._policy(random), variables, live.carry, steps,
+                                               reset=False)
+        replay, returns, total, count = recorded(live.replay, live.returns, steps_taken)
+        return _Live(carry, replay, returns), total, count
+
+    def _started(self, variables: Variables, key: jax.Array) -> _Live:
+        """Every environment's first episode begun, and the replay: the one given, or a fresh one the
+        prefill fills."""
+        count = self.env.count if isinstance(self.env, Simulator) else self.env.reset(key)[1].reward.shape[0]
+        carry = self._begin(key, self.objective.memory(count))
+        returns = jnp.zeros(count)
+        if self.replay is not None:
+            return _Live(carry, self.replay, returns)
+        example = {**views(carry.observation), "action": jnp.zeros((count, self.env.action_size))}
+        return self._advanced(variables, _Live(carry, ReplayBuffer.empty(example, self.capacity), returns),
+                              self.prefill, random=True)
 
     def __call__(self, state: TrainState, batch: Batch, key: jax.Array) -> Batch:
         act_key, sample_key = jax.random.split(key)
         variables = state.variables
-        if self._carry is None:
-            if isinstance(self.env, Simulator):
-                self._carry = simulator_start(self._driven, act_key, self.objective.memory(self.env.count))
-            else:
-                count = self.env.reset(act_key)[1].reward.shape[0]
-                self._carry = start(self._driven, act_key, self.objective.memory(count))
-            count = len(self._carry.observation["reward"])
-            self._returns = jnp.zeros(count)
-            if self.replay is not None:
-                self._replay = self.replay
-            else:
-                example = {**self._carry.observation, "action": jnp.zeros((count, self.env.action_size))}
-                self._replay = ReplayBuffer.empty(example, self.capacity)
-                self._advance(variables, self.prefill, random=True)
+        live = self._started(variables, act_key) if self._live is None else self._live
         owed = math.ceil((int(state.updates) + 1) * self.batch * self.length / self.train_ratio)
-        envs = self._returns.shape[0]
+        envs = live.returns.shape[0]
         prefilled = 0 if self.replay is not None else self.prefill * envs
         due = max(owed - (self._taken - prefilled), 0)
         if due:
-            self._advance(variables, -(-due // envs), random=False)
+            live = self._advanced(variables, live, -(-due // envs), random=False)
+        self._live = live
         return self.sample(sample_key)
 
     def sample(self, key: jax.Array) -> Batch:
-        """`batch` windows of `length` steps drawn from the replay as an update draws them; a simulator's
-        replay is on its device, where the key is put."""
-        if isinstance(self.env, Simulator):
-            key = jax.device_put(key, device_of(self._replay.data))
-        return jax.device_get(self._sample(self._replay, key))
+        """`batch` windows of `length` steps drawn from the replay as an update draws them, on the device
+        the replay is held on."""
+        replay = self.held_replay
+        if replay is None:
+            raise ValueError("a rollout samples its replay once it has begun (its first call)")
+        key = jax.device_put(key, jax.tree.leaves(replay.held)[0].sharding)
+        return jax.device_get(self._sample(replay, key))
 
-    def _advance(self, variables: Variables, steps: int, *, random: bool) -> None:
-        if isinstance(self.env, Simulator):
-            self._carry, recorded = simulator_rollout(self._driven, self._policy(random), variables,
-                                                      self._carry, steps, reset=False)
-            self._replay, self._returns, total, count = self._recorded(self._replay, self._returns, recorded)
-        else:
-            self._carry, self._replay, self._returns, total, count = self._acted(
-                variables, self._carry, self._replay, self._returns, steps=steps, random=random)
-        self._taken += steps * self._returns.shape[0]
+    def _advanced(self, variables: Variables, live: _Live, steps: int, *, random: bool) -> _Live:
+        live, total, count = self._roll(variables, live, steps=steps, random=random)
+        self._taken += steps * live.returns.shape[0]
         self._ended = (float(total), int(count))
+        return live
+
+
+@struct.dataclass
+class _Live:
+    """A rollout's state between collections: every environment's carry, the replay, and each
+    environment's running return."""
+
+    carry: Carry
+    replay: ReplayBuffer
+    returns: jax.Array
 
 
 def demonstration_replay(episodes: Sequence[Mapping[str, np.ndarray]]) -> ReplayBuffer:
@@ -828,19 +897,19 @@ def episodes_return(objective: DreamerV3Objective, env: Env | Simulator, variabl
         driven = DrivenSimulator(env)
         carry = simulator_start(driven, key, objective.memory(env.count))
         _, recorded = simulator_rollout(driven, objective.act, variables, carry, steps, reset=False)
-        return float(jnp.mean(jnp.sum(recorded.following.observation["reward"], axis=0)))
-    driven = Driven(env)
+        return float(jnp.mean(jnp.sum(view(recorded.following.observation, "reward"), axis=0)))
+    stepped = Driven(env)
     count = env.reset(key)[1].reward.shape[0]
 
     @jax.jit
     def run(variables: Variables, key: jax.Array) -> jax.Array:
-        carry = start(driven, key, objective.memory(count))
-        _, recorded = env_rollout(driven, objective.act, variables, carry, steps, reset=False)
-        return jnp.mean(jnp.sum(recorded.following.observation["reward"], axis=0))
+        carry = start(stepped, key, objective.memory(count))
+        _, recorded = env_rollout(stepped, objective.act, variables, carry, steps, reset=False)
+        return jnp.mean(jnp.sum(view(recorded.following.observation, "reward"), axis=0))
 
     return float(run(variables, key))
 
 
-__all__ = ["AUXILIARY_SCALE", "ConvDecoder", "ConvEncoder", "Critic", "DreamerRollout", "DreamerV3Objective",
-           "LatentEnv", "WorldModel", "demonstration_replay", "episodes_return", "lambda_return",
-           "normal_entropy", "normal_log_prob"]
+__all__ = ["AUXILIARY_SCALE", "AgentMemory", "ConvDecoder", "ConvEncoder", "Critic", "DreamerRollout",
+           "DreamerV3Objective", "LatentEnv", "WorldModel", "demonstration_replay", "episodes_return",
+           "lambda_return", "normal_entropy", "normal_log_prob"]

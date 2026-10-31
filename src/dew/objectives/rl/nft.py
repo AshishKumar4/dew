@@ -250,10 +250,10 @@ class NFTRollout(GroupedRollout):
                                           final_denoise=objective.final_denoise)
         return (latents, jnp.asarray(times)), images, {}
 
-    def _training_rows(self, generation, context: Batch, spatial: Mapping[str, np.ndarray],
+    def _training_rows(self, generated, context: Batch, spatial: Mapping[str, np.ndarray],
                        rewards: np.ndarray, owned: slice | np.ndarray) -> Batch:
         """This process's samples, their training times and their advantages."""
-        latents, times = generation
+        latents, times = generated
         grouped = rewards.reshape(-1, self.groups)
         centred = grouped - grouped.mean(axis=1, keepdims=True)
         advantages = (centred / (rewards.std() + 1e-4)).reshape(-1).astype(np.float32)

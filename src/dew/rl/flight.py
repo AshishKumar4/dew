@@ -35,15 +35,15 @@ from __future__ import annotations
 
 import dataclasses
 from functools import partial
-from typing import Any, Protocol
+from typing import Protocol
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import struct
 
-from dew.rl.env import TimeStep
-from dew.rl.simulator import chosen, received
+from dew.rl.env import TimeStep, chosen
+from dew.rl.simulator import Handed, received
 
 LAYOUTS = {
     "split_s": ((-0.9, -1.27, 3.48), (9.09, 6.26, 1.08), (9.27, -3.46, 1.17), (-4.5, -6.14, 3.4),
@@ -365,7 +365,7 @@ def commanded(racing: Racing, track: Track, action: jax.Array, thrust_to_weight:
     pending = jnp.concatenate([command[:, None], track.pending[:, :-1]], 1)
     sent = pending[jnp.arange(pending.shape[0]), airframe.delay]
     normalized = jnp.concatenate([2 * sent[:, :1] / thrust_to_weight - 1, sent[:, 1:] / rate_limit], -1)
-    return track.replace(rates=rates, pending=pending), jnp.clip(normalized, -1, 1)
+    return dataclasses.replace(track, rates=rates, pending=pending), jnp.clip(normalized, -1, 1)
 
 
 def bars(racing: Racing) -> np.ndarray:
@@ -453,8 +453,8 @@ def raced(racing: Racing, track: Track, action: jax.Array, kinematics: Kinematic
     distance = jnp.linalg.norm(track.course[rows, index] - position, axis=-1)
     reward = progress + bonus - rate - smoothness - jnp.where(crashed, racing.crash_penalty, 0.0)
     taken = track.steps + 1
-    following = track.replace(index=index, distance=distance, steps=taken, action=action,
-                              passed=track.passed + passed)
+    following = dataclasses.replace(track, index=index, distance=distance, steps=taken, action=action,
+                                    passed=track.passed + passed)
     return following, reward, crashed, ~crashed & (taken >= racing.max_steps)
 
 
@@ -519,19 +519,28 @@ class FlightBackend(Protocol):
     (their positions before it and after each of its `S` physics steps), and whether each collided with
     what the backend itself detects (None for a backend that detects nothing); `render(gates, cameras)`
     answers each drone's image `[B, H, W, C]` uint8 of its `Gates` from its camera `[B, 12]` (`cameras`).
-    Arrays cross by DLPack (`dew.rl.simulator.Arrays`)."""
+    Arrays cross by DLPack (`dew.rl.simulator.Handed`)."""
 
-    count: int
-    hz: float
-    thrust_to_weight: float
-    rate_limit: float
-    aspect: float
+    @property
+    def count(self) -> int: ...
+
+    @property
+    def hz(self) -> float: ...
+
+    @property
+    def thrust_to_weight(self) -> float: ...
+
+    @property
+    def rate_limit(self) -> float: ...
+
+    @property
+    def aspect(self) -> float: ...
 
     def reset(self, mask: jax.Array, position: jax.Array, orientation: jax.Array) -> Kinematics: ...
 
-    def step(self, commands: jax.Array) -> tuple[Kinematics, Any, Any]: ...
+    def step(self, commands: jax.Array) -> tuple[Kinematics, Handed, Handed | None]: ...
 
-    def render(self, gates: Gates, cameras: jax.Array) -> Any: ...  # noqa: ANN401
+    def render(self, gates: Gates, cameras: jax.Array) -> Handed: ...
 
 
 VIEWS = ("image", "state", "gates", "airframe", "passed", "teacher")
@@ -545,6 +554,8 @@ class GateRace:
     may change between steps."""
 
     action_size = 4
+    _key: jax.Array
+    _track: Track
 
     def __init__(self, backend: FlightBackend, racing: Racing | None = None, views: tuple[str, ...] = VIEWS):
         if not views or not set(views) <= set(VIEWS):
@@ -565,7 +576,6 @@ class GateRace:
         self._cameras = jax.jit(partial(cameras, aspect=backend.aspect))
         self._shown = jax.jit(lambda image, brightness: jnp.clip(
             image.astype(jnp.float32) * brightness[:, None, None, None], 0, 255).astype(jnp.uint8))
-        self._key = self._track = None
 
     def _observed(self, kinematics: Kinematics) -> dict[str, jax.Array]:
         shown = self._privileged(self._track, kinematics)
@@ -576,24 +586,29 @@ class GateRace:
             shown["image"] = self._shown(image, track.airframe.brightness)
         return {view: shown[view] for view in self.views}
 
-    def _started_on(self, mask: jax.Array) -> Kinematics:
+    def _drawn(self, mask: jax.Array) -> tuple[Track, Kinematics]:
+        """Fresh episodes for the drones `mask` selects, put at their starts: every drone's fresh track and
+        every drone's state."""
         self._key, key = jax.random.split(self._key)
         fresh, position, orientation = self._started(key, jnp.asarray(self.difficulty, jnp.float32))
-        kinematics = received(self.backend.reset(mask, position, orientation))
-        self._track = fresh if self._track is None else chosen(mask, fresh, self._track)
-        return kinematics
+        return fresh, received(self.backend.reset(mask, position, orientation))
 
     def reset(self, seed: int) -> dict[str, jax.Array]:
-        self._key, self._track = jax.random.key(seed), None
-        return self._observed(self._started_on(jnp.ones(self.count, bool)))
+        self._key = jax.random.key(seed)
+        self._track, kinematics = self._drawn(jnp.ones(self.count, bool))
+        return self._observed(kinematics)
 
     def restart(self, mask: jax.Array) -> dict[str, jax.Array]:
-        return self._observed(self._started_on(jnp.asarray(mask, bool)))
+        mask = jnp.asarray(mask, bool)
+        fresh, kinematics = self._drawn(mask)
+        self._track = chosen(mask, fresh, self._track)
+        return self._observed(kinematics)
 
     def step(self, action: jax.Array) -> TimeStep:
         self._track, command = self._commanded(self._track, action)
-        kinematics, path, collided = received(self.backend.step(command))
-        collided = jnp.zeros(self.count, bool) if collided is None else collided.astype(bool)
+        kinematics, path, collided = self.backend.step(command)
+        kinematics, path = received(kinematics), received(path)
+        collided = jnp.zeros(self.count, bool) if collided is None else received(collided).astype(bool)
         raced = self._raced(self._track, action, kinematics, path, collided)
         self._track, reward, terminated, truncated = raced
         return TimeStep(self._observed(kinematics), reward, terminated, truncated)

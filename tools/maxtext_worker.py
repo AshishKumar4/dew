@@ -17,10 +17,12 @@ float32 run MaxText's own arithmetic.
 from __future__ import annotations
 
 import contextlib
+import functools
 import os
 import sys
+from collections.abc import Iterator
 
-import numpy as np
+from reference_worker import Applied, answered, serve
 
 GPT3 = {"base_emb_dim": 16, "base_num_query_heads": 2, "base_num_kv_heads": 2, "head_dim": 8,
         "base_mlp_dim": 64, "base_num_decoder_layers": 2, "vocab_size": 64, "trainable_position_size": 64,
@@ -117,7 +119,7 @@ def engram(dtype: str):
 
 
 SITES = {"gpt3": gpt3, "engram": engram}
-_BUILT: dict = {}
+_BUILT: dict[tuple[str, str], Applied] = {}
 
 
 class _Widened:
@@ -150,39 +152,15 @@ def float64_casts(dtype: str):
         yield
 
 
-def run(site: str, cases: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
-    import jax
-    import jax.numpy as jnp
-
-    names = sorted({key.split(".", 1)[0] for key in cases})
-    out = {}
-    for dtype, kind, wide in (("float32", "reference", False), ("float64", "truth", True)):
-        jax.config.update("jax_enable_x64", wide)
-        with float64_casts(dtype):
-            if (site, dtype) not in _BUILT:
-                _BUILT[site, dtype] = SITES[site](dtype)
-            apply = _BUILT[site, dtype]
-            for name in names:
-                prefix, given = f"{name}.param.", f"{name}."
-                params = {key.removeprefix(prefix): jnp.asarray(value, dtype) for key, value in cases.items()
-                          if key.startswith(prefix)}
-                case = {key.removeprefix(given): value for key, value in cases.items()
-                        if key.startswith(given) and not key.startswith(prefix)}
-                for leaf, value in apply(params, case).items():
-                    out[f"{name}.{kind}.{leaf}"] = np.asarray(value, dtype)
-    return out
-
-
-def serve(site: str) -> None:
-    """Each line on stdin an `IN OUT` pair of paths, answered by `run` and a line `done` on stdout, each
-    program compiled once for every case."""
-    for line in sys.stdin:
-        given, out = line.split()
-        with np.load(given) as cases:
-            np.savez(out, **run(site, dict(cases)))
-        print("done", flush=True)
+@contextlib.contextmanager
+def applying(site: str, dtype: str) -> Iterator[Applied]:
+    """The site's run at `dtype`, built once for each and traced under `float64_casts`."""
+    with float64_casts(dtype):
+        if (site, dtype) not in _BUILT:
+            _BUILT[site, dtype] = SITES[site](dtype)
+        yield _BUILT[site, dtype]
 
 
 if __name__ == "__main__":
     os.environ.setdefault("JAX_PLATFORMS", "cpu")
-    serve(sys.argv[1])
+    serve(lambda cases: answered(cases, functools.partial(applying, sys.argv[1])))

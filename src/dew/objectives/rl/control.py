@@ -15,6 +15,7 @@ terminal state takes no value after it.
 
 from __future__ import annotations
 
+import functools
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -27,7 +28,19 @@ from flax import linen as nn
 
 from dew.batch import Batch, Variables
 from dew.objectives.base import Aux, Objective, Ratio, Shown, Step
-from dew.rl.env import Carry, Env, Observation, TimeStep, Transition, env_rollout, start
+from dew.rl.env import (
+    Carry,
+    Env,
+    Memory,
+    Observation,
+    Params,
+    TimeStep,
+    Transition,
+    Tree,
+    env_rollout,
+    start,
+    view,
+)
 from dew.rl.simulator import Simulator, rollout_start, simulator_rollout, simulator_start
 from dew.rl.surrogate import clipped_surrogate_terms
 
@@ -121,10 +134,10 @@ class ControlPPOObjective(Objective[Ratio]):
         self.reads = reads
 
     def seen(self, observation: Observation) -> jax.Array:
-        """What the actor and critic read of an observation: its `reads` entries joined, or it whole."""
+        """What the actor and critic read of an observation: its `reads` views joined, or it whole."""
         if not self.reads:
-            return observation
-        return jnp.concatenate([jnp.asarray(observation[name], jnp.float32) for name in self.reads], -1)
+            return view(observation)
+        return jnp.concatenate([jnp.asarray(view(observation, name), jnp.float32) for name in self.reads], -1)
 
     def held_variables(self) -> Variables | None:
         return self.variables
@@ -136,19 +149,19 @@ class ControlPPOObjective(Objective[Ratio]):
     def validation_loss_refusal(self) -> str | None:
         return "control PPO scores its policy by its episodes' returns, not a validation loss"
 
-    def act(self, params: Variables, observation: Observation, key: jax.Array,
-            memory: None) -> tuple[jax.Array, dict, None]:
+    def act(self, params: Params, observation: Observation, key: jax.Array,
+            memory: Memory) -> tuple[jax.Array, Tree, Memory]:
         """An action for each observation, tanh of a draw from the policy, beside the draw and its
         log-probability (`dew.rl.env.Policy`)."""
-        location, scale = self.model.apply(params, self.seen(observation), method=ActorCritic.policy)
+        location, scale = self.model.bind(params).policy(self.seen(observation))
         raw = location + scale * jax.random.normal(key, location.shape, location.dtype)
         extras = {"raw_action": raw, "log_prob": tanh_normal_log_prob(raw, location, scale)}
         return jnp.tanh(raw), extras, None
 
-    def greedy(self, params: Variables, observation: Observation, key: jax.Array,
-               memory: None) -> tuple[jax.Array, dict, None]:
+    def greedy(self, params: Params, observation: Observation, key: jax.Array,
+               memory: Memory) -> tuple[jax.Array, Tree, Memory]:
         """The policy's deterministic action, tanh of its location, as Brax evaluates it."""
-        location, _ = self.model.apply(params, self.seen(observation), method=ActorCritic.policy)
+        location, _ = self.model.bind(params).policy(self.seen(observation))
         return jnp.tanh(location), {}, None
 
     def advantages(self, values: jax.Array, following: jax.Array,
@@ -177,9 +190,10 @@ class ControlPPOObjective(Objective[Ratio]):
 
     def loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[Ratio, Aux]:
         observation, following = self.seen(batch["observation"]), self.seen(batch["following"])
-        location, scale = self.model.apply(variables, observation, method=ActorCritic.policy)
-        values = self.model.apply(variables, observation, method=ActorCritic.value)
-        after = jax.lax.stop_gradient(self.model.apply(variables, following, method=ActorCritic.value))
+        model = self.model.bind(variables)
+        location, scale = model.policy(observation)
+        values = model.value(observation)
+        after = jax.lax.stop_gradient(model.value(following))
         advantages, targets = jax.lax.stop_gradient(
             self.advantages(jax.lax.stop_gradient(values), after, batch))
         whitened = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
@@ -218,27 +232,31 @@ class ControlRollout:
     def __post_init__(self) -> None:
         if min(self.unroll_length, self.unrolls, self.epochs, self.minibatches) < 1:
             raise ValueError("a control rollout collects and serves at least one of each")
-        self._rolled = jax.jit(self._unrolled)
+        env = self.env
+        if isinstance(env, Simulator):
+            self._collect = functools.partial(self._simulated, env)
+        else:
+            self._collect = jax.jit(functools.partial(self._unrolled, env))
         self._summarized = jax.jit(self._summary)
 
     @property
     def metrics(self) -> Mapping[str, float]:
         return {"episode_return": self._ended}
 
-    def _unrolled(self, params: Variables, carry: Carry) -> tuple[Carry, Transition]:
+    def _unrolled(self, env: Env, params: Variables, carry: Carry) -> tuple[Carry, Transition]:
+        """The carry after `unrolls` rollouts of the live policy in `env` and their steps
+        `[unrolls, T, envs, ...]`, one scan, jitted whole."""
         def unroll(carry: Carry, _) -> tuple[Carry, Transition]:
-            return env_rollout(self.env, self.objective.act, params, carry, self.unroll_length)
+            return env_rollout(env, self.objective.act, params, carry, self.unroll_length)
 
         return jax.lax.scan(unroll, carry, None, length=self.unrolls)
 
-    def _rollouts(self, params: Variables, carry: Carry) -> tuple[Carry, Transition]:
-        """The carry after `unrolls` rollouts of the live policy and their steps `[unrolls, T, envs, ...]`:
-        an `Env`'s jitted whole, a `Simulator`'s stepped from the host."""
-        if not isinstance(self.env, Simulator):
-            return self._rolled(params, carry)
+    def _simulated(self, simulator: Simulator, params: Variables, carry: Carry) -> tuple[Carry, Transition]:
+        """The carry after `unrolls` rollouts of the live policy in `simulator`, stepped from the host,
+        and their steps `[unrolls, T, envs, ...]`."""
         unrolled = []
         for _ in range(self.unrolls):
-            carry, steps = simulator_rollout(self.env, self.objective.act, params, carry, self.unroll_length)
+            carry, steps = simulator_rollout(simulator, self.objective.act, params, carry, self.unroll_length)
             unrolled.append(steps)
         return carry, jax.tree.map(lambda *leaves: jnp.stack(leaves), *unrolled)
 
@@ -256,8 +274,11 @@ class ControlRollout:
             leaf = jnp.moveaxis(leaf, 2, 1)
             return leaf.reshape(-1, *leaf.shape[2:])
 
-        batch = {"observation": steps.observation, "raw_action": steps.extras["raw_action"],
-                 "log_prob": steps.extras["log_prob"], "reward": steps.following.reward,
+        extras = steps.extras
+        if not isinstance(extras, Mapping):
+            raise TypeError("a control rollout records its policy's raw actions and log-probabilities")
+        batch = {"observation": steps.observation, "raw_action": extras["raw_action"],
+                 "log_prob": extras["log_prob"], "reward": steps.following.reward,
                  "terminated": steps.following.terminated, "truncated": steps.following.truncated,
                  "following": steps.following.observation}
         ended_returns = jnp.sum(jnp.where(ended, totals, 0)) / jnp.maximum(jnp.sum(ended), 1)
@@ -265,22 +286,25 @@ class ControlRollout:
 
     def __call__(self, state: TrainState, batch: Batch, key: jax.Array) -> Batch:
         served = int(state.updates) % (self.epochs * self.minibatches)
-        if self._carry is None:
-            self._carry = rollout_start(self.env, key)
-            self._returns = jnp.zeros(len(jax.tree.leaves(self._carry.observation)[0]), jnp.float32)
-        if served == 0 or self._collected is None:
-            self._carry, steps = self._rollouts(state.variables, self._carry)
-            self._returns, collected, ended, count = self._summarized(steps, self._returns)
-            self._collected = jax.device_get(collected)
+        carry, returns = self._carry, self._returns
+        if carry is None or returns is None:
+            carry = rollout_start(self.env, key)
+            returns = jnp.zeros(len(jax.tree.leaves(carry.observation)[0]), jnp.float32)
+        collected, order = self._collected, self._order
+        if served == 0 or collected is None or order is None:
+            carry, steps = self._collect(state.variables, carry)
+            returns, gathered, ended, count = self._summarized(steps, returns)
+            collected = jax.device_get(gathered)
             self._ended = float(ended) if int(count) else float("nan")
-            sequences = len(self._collected["reward"])
+            sequences = len(collected["reward"])
             if sequences % self.minibatches:
                 raise ValueError(f"{sequences} sequences do not split into {self.minibatches} minibatches")
             rng = np.random.default_rng(np.asarray(jax.random.key_data(key)).ravel())
-            self._order = np.concatenate([rng.permutation(sequences) for _ in range(self.epochs)])
-        size = len(self._collected["reward"]) // self.minibatches
-        rows = self._order[served * size:(served + 1) * size]
-        return jax.tree.map(lambda values: values[rows], self._collected)
+            order = np.concatenate([rng.permutation(sequences) for _ in range(self.epochs)])
+        self._carry, self._returns, self._collected, self._order = carry, returns, collected, order
+        size = len(collected["reward"]) // self.minibatches
+        rows = order[served * size:(served + 1) * size]
+        return jax.tree.map(lambda values: values[rows], collected)
 
 
 def _first_episodes_return(following: TimeStep) -> jax.Array:

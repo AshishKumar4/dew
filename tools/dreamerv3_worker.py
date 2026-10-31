@@ -1,6 +1,7 @@
 """DreamerV3's own networks (danijar/dreamerv3 at e01491fad6434b2245a3b8ca201dd7faedcc458c) run on drawn
-weights and inputs, in float32 and float64: the reference arm of tools/dreamerv3_reference.py, run in an
-environment holding that checkout's code and its JAX stack (ninjax, elements), on the CPU.
+weights and inputs, in float32 and float64: the reference arm of tools/venv_reference.py's `conv` site
+(its protocol tools/reference_worker.py), run in an environment holding that checkout's code and its JAX
+stack (ninjax, elements), on the CPU.
 
     PYTHONPATH=<checkout> python tools/dreamerv3_worker.py SITE    `IN OUT` lines on stdin, each `done`
 
@@ -17,10 +18,13 @@ while it traces, its float32 run reads them as written (`computing`).
 from __future__ import annotations
 
 import contextlib
+import functools
 import os
 import sys
+from collections.abc import Iterator
 
 import numpy as np
+from reference_worker import Applied, answered, serve
 
 CONV = {"depth": 4, "mults": (2, 3, 4, 4), "kernel": 5, "units": 64, "layers": 3, "act": "silu",
         "norm": "rms", "winit": "trunc_normal_in", "outer": False, "strided": False}
@@ -96,34 +100,12 @@ def conv():
 SITES = {"conv": conv}
 
 
-def run(site: str, cases: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
-    import jax
-    import jax.numpy as jnp
-
+@contextlib.contextmanager
+def applying(site: str, dtype: str) -> Iterator[Applied]:
+    """The site's run at `dtype`, its programs traced under `computing`."""
     apply, _ = SITES[site]()
-    names = sorted({key.split(".", 1)[0] for key in cases})
-    out = {}
-    for dtype, kind, wide in (("float32", "reference", False), ("float64", "truth", True)):
-        jax.config.update("jax_enable_x64", wide)
-        with computing(dtype):
-            for name in names:
-                prefix, given = f"{name}.param.", f"{name}."
-                params = {key.removeprefix(prefix): jnp.asarray(value, dtype) for key, value in cases.items()
-                          if key.startswith(prefix)}
-                case = {key.removeprefix(given): value for key, value in cases.items()
-                        if key.startswith(given) and not key.startswith(prefix)}
-                for leaf, value in apply(dtype, params, case).items():
-                    out[f"{name}.{kind}.{leaf}"] = np.asarray(value, dtype)
-    return out
-
-
-def serve(site: str) -> None:
-    """Each line on stdin an `IN OUT` pair of paths, answered by `run` and a line `done` on stdout."""
-    for line in sys.stdin:
-        given, out = line.split()
-        with np.load(given) as cases:
-            np.savez(out, **run(site, dict(cases)))
-        print("done", flush=True)
+    with computing(dtype):
+        yield lambda params, case: apply(dtype, params, case)
 
 
 if __name__ == "__main__":
@@ -132,4 +114,4 @@ if __name__ == "__main__":
         shapes = SITES[sys.argv[1]]()[1]()
         np.savez(sys.argv[3], **{path: np.asarray(shape) for path, shape in shapes.items()})
     else:
-        serve(sys.argv[1])
+        serve(lambda cases: answered(cases, functools.partial(applying, sys.argv[1])))

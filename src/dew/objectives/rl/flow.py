@@ -475,7 +475,7 @@ class FlowRollout(GroupedRollout):
             samples = objective.autoencoder.decode(params["autoencoder"], samples)
         return trajectory, jnp.clip(samples, -1, 1), spatial
 
-    def _training_rows(self, trajectory: FlowTrajectory, context: Batch, spatial: Mapping[str, np.ndarray],
+    def _training_rows(self, generated: FlowTrajectory, context: Batch, spatial: Mapping[str, np.ndarray],
                        rewards: np.ndarray, owned: slice | np.ndarray) -> Batch:
         """Cut the trajectory into this rank's training rows.
 
@@ -496,13 +496,13 @@ class FlowRollout(GroupedRollout):
                                                  context[condition.field])
                     for condition in self.objective.inputs.conditions.values()}
         prepared.update({
-            "latents": np.asarray(trajectory.states)[owned, :selected],
-            "next_latents": np.asarray(trajectory.states)[owned, 1:selected + 1],
-            "timesteps": np.broadcast_to(trajectory.times[:selected], shape),
-            "next_timesteps": np.broadcast_to(trajectory.times[1:selected + 1], shape),
+            "latents": np.asarray(generated.states)[owned, :selected],
+            "next_latents": np.asarray(generated.states)[owned, 1:selected + 1],
+            "timesteps": np.broadcast_to(generated.times[:selected], shape),
+            "next_timesteps": np.broadcast_to(generated.times[1:selected + 1], shape),
             "rollout_steps": np.full(shape[:1], self.steps, np.int32),
-            OLD_LOG_PROBS_KEY: np.asarray(trajectory.log_probs)[owned, :selected],
-            "transition_mask": (np.asarray(trajectory.stochastic)[owned, :selected]
+            OLD_LOG_PROBS_KEY: np.asarray(generated.log_probs)[owned, :selected],
+            "transition_mask": (np.asarray(generated.stochastic)[owned, :selected]
                                 & (local_advantages[:, None] != 0)),
             ADVANTAGES_KEY: local_advantages,
             REWARDS_KEY: rewards[owned],

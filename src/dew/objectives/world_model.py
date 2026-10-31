@@ -108,6 +108,8 @@ class CausalTokenizer(nn.Module):
         that frame's probability, drawn from `key`."""
         x = self.embed(self._patchify(frames)) + self.patch_positions
         if mask_rate is not None:
+            if key is None:
+                raise ValueError("masking a tokenizer's patches draws from a key")
             masked = jax.random.uniform(key, x.shape[:-1]) < mask_rate[..., None]
             x = jnp.where(masked[..., None], self.mask_token, x)
         lead = x.shape[:-2]
@@ -156,10 +158,8 @@ class TokenizerObjective(Objective[Ratio]):
         rate_key, mask_key = jax.random.split(step.key)
         rate = jax.random.uniform(rate_key, video.shape[:2], maxval=self.max_mask) if step.training else None
 
-        def reconstructed(module: CausalTokenizer) -> jax.Array:
-            return module.decode(module.encode(video, rate, mask_key))
-
-        error = jnp.mean(jnp.square(self.model.apply(variables, method=reconstructed) - video))
+        tokenizer = self.model.bind(variables)
+        error = jnp.mean(jnp.square(tokenizer.decode(tokenizer.encode(video, rate, mask_key)) - video))
         return Ratio(error, jnp.ones(())), Aux({"mse": error})
 
 
@@ -292,8 +292,7 @@ class WorldModelObjective(Objective[Ratio]):
         return None
 
     def latents(self, video: jax.Array) -> jax.Array:
-        return jax.lax.stop_gradient(self.tokenizer.apply(self.tokenizer_variables, video,
-                                                          method=CausalTokenizer.encode))
+        return jax.lax.stop_gradient(self.tokenizer.bind(self.tokenizer_variables).encode(video))
 
     def loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[Ratio, Aux]:
         clean = self.latents(jnp.asarray(batch["video"], jnp.float32))
@@ -303,8 +302,10 @@ class WorldModelObjective(Objective[Ratio]):
         tau, d = sampled_steps(steps_key, clean.shape[:2], self.model.k_max)
         noise = jax.random.normal(noise_key, clean.shape)
 
-        def f(noisy, tau, d):
-            return self.model.apply(variables, noisy, tau, d, actions)
+        dynamics = self.model.bind(variables)
+
+        def f(noisy: jax.Array, tau: jax.Array, d: jax.Array) -> jax.Array:
+            return dynamics(noisy, tau, d, actions)
 
         if self.shortcut:
             per_frame = shortcut_forcing_loss(f, clean, noise, tau, d, d_min)
@@ -331,7 +332,7 @@ class WorldModelObjective(Objective[Ratio]):
                                        jnp.full((context.shape[0], 1), level)], 1)
                 d = jnp.full(tau.shape, d_model)
                 given = None if actions is None else actions[:, :sequence.shape[1]]
-                predicted = self.model.apply(variables, sequence, tau, d, given)[:, -1]
+                predicted = self.model.bind(variables)(sequence, tau, d, given)[:, -1]
                 current = current + (predicted - current) / (1 - level) / steps
             produced = jnp.concatenate([produced, current[:, None]], 1)
         return produced[:, context.shape[1]:]

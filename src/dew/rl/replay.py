@@ -8,37 +8,37 @@ the replay holds whole (DreamerV3's uniform replay, arXiv 2301.04104, of `length
 
 from __future__ import annotations
 
-from typing import Any
-
 import jax
 import jax.numpy as jnp
 from flax import struct
 
-type Steps = Any
+from dew.rl.env import Tree
+
+type Steps = Tree
 """A pytree of step fields, each leaf leading with its step and environment axes."""
 
 
 @struct.dataclass
 class ReplayBuffer:
-    """The replay's state: `data`'s leaves `[capacity, envs, ...]`, the slot the next step writes
+    """The replay's state: the `held` steps' leaves `[capacity, envs, ...]`, the slot the next step writes
     (`cursor`) and the steps written so far, at most `capacity` (`filled`)."""
 
-    data: Steps
+    held: Steps
     cursor: jax.Array
     filled: jax.Array
 
     @property
     def capacity(self) -> int:
-        return jax.tree.leaves(self.data)[0].shape[0]
+        return jax.tree.leaves(self.held)[0].shape[0]
 
     @classmethod
     def empty(cls, example: Steps, capacity: int) -> ReplayBuffer:
         """An empty replay of `capacity` steps of what `example`, one step `[envs, ...]`, holds."""
         if capacity < 1:
             raise ValueError("a replay holds at least one step")
-        data = jax.tree.map(lambda leaf: jnp.zeros((capacity, *jnp.shape(leaf)), jnp.result_type(leaf)),
+        held = jax.tree.map(lambda leaf: jnp.zeros((capacity, *jnp.shape(leaf)), jnp.result_type(leaf)),
                             example)
-        return cls(data, jnp.zeros((), jnp.int32), jnp.zeros((), jnp.int32))
+        return cls(held, jnp.zeros((), jnp.int32), jnp.zeros((), jnp.int32))
 
     def add(self, steps: Steps) -> ReplayBuffer:
         """The replay after `steps`, leaves `[T, envs, ...]` in order, the oldest overwritten."""
@@ -46,8 +46,8 @@ class ReplayBuffer:
         if count > self.capacity:
             raise ValueError(f"{count} steps overflow a replay of {self.capacity}")
         slots = (self.cursor + jnp.arange(count)) % self.capacity
-        data = jax.tree.map(lambda held, new: held.at[slots].set(new.astype(held.dtype)), self.data, steps)
-        return ReplayBuffer(data, (self.cursor + count) % self.capacity,
+        written = jax.tree.map(lambda old, new: old.at[slots].set(new.astype(old.dtype)), self.held, steps)
+        return ReplayBuffer(written, (self.cursor + count) % self.capacity,
                             jnp.minimum(self.filled + count, self.capacity))
 
     def sample(self, key: jax.Array, batch: int, length: int) -> Steps:
@@ -56,7 +56,7 @@ class ReplayBuffer:
         order they were written. The replay must hold `length` steps."""
         if length > self.capacity:
             raise ValueError(f"a window of {length} steps overflows a replay of {self.capacity}")
-        envs = jax.tree.leaves(self.data)[0].shape[1]
+        envs = jax.tree.leaves(self.held)[0].shape[1]
         env_key, start_key = jax.random.split(key)
         rows = jax.random.randint(env_key, (batch,), 0, envs)
         # The oldest step held is `filled` steps behind the cursor; a window starts at most
@@ -64,7 +64,7 @@ class ReplayBuffer:
         offsets = jax.random.randint(start_key, (batch,), 0, jnp.maximum(self.filled - length + 1, 1))
         oldest = self.cursor - self.filled
         times = (oldest + offsets[:, None] + jnp.arange(length)[None, :]) % self.capacity
-        return jax.tree.map(lambda held: held[times, rows[:, None]], self.data)
+        return jax.tree.map(lambda held: held[times, rows[:, None]], self.held)
 
 
 __all__ = ["ReplayBuffer", "Steps"]

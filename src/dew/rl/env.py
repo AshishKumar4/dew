@@ -13,18 +13,46 @@ Playground's auto-reset wrappers restart it, the transition that ended it record
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from typing import Any, Protocol
+from collections.abc import Callable, Mapping
+from typing import TYPE_CHECKING, Protocol
 
 import jax
 import jax.numpy as jnp
 from flax import struct
 
-type Observation = Any
-"""An environment's observation: an array, or a pytree of arrays (a dict of named views)."""
+from dew.batch import Variables
 
-type EnvState = Any
+if TYPE_CHECKING:
+    from _typeshed import DataclassInstance
+
+type Tree = jax.Array | DataclassInstance | Mapping[str, Tree] | tuple[Tree, ...] | list[Tree] | None
+"""A pytree of arrays: an array, a dataclass of them (a `flax.struct` one), a dict, tuple or list of
+them, or nothing."""
+
+type Observation = jax.Array | Mapping[str, Observation]
+"""An environment's observation: an array, or a dict of named views, each an array or a dict again."""
+
+type EnvState = Tree
 """An environment's state, a pytree of its own."""
+
+type Memory = Tree
+"""A policy's memory between steps (a recurrent policy's state), None for one that keeps none."""
+
+
+def views(observation: Observation) -> Mapping[str, Observation]:
+    """An observation's named views: it, where it is a dict of them."""
+    if not isinstance(observation, Mapping):
+        raise TypeError("an array observation has no named views")
+    return observation
+
+
+def view(observation: Observation, name: str | None = None) -> jax.Array:
+    """An observation's array: it whole, where `name` is None, or its view `name`."""
+    found = observation if name is None else views(observation)[name]
+    if isinstance(found, Mapping):
+        raise TypeError(f"{'the observation' if name is None else f'the view {name!r}'} is a dict of views, "
+                        f"{sorted(found)}, not an array")
+    return found
 
 
 @struct.dataclass
@@ -45,16 +73,17 @@ class TimeStep:
         return self.terminated | self.truncated
 
 
-class Env(Protocol):
+class Env[State: EnvState](Protocol):
     """An environment as two jittable functions over its state, a pytree: `reset(key)` starts an
     episode and `step(state, action)` advances it, each answering a `TimeStep`. `action_size` is the
     width of a continuous action in [-1, 1]."""
 
-    action_size: int
+    @property
+    def action_size(self) -> int: ...
 
-    def reset(self, key: jax.Array) -> tuple[EnvState, TimeStep]: ...
+    def reset(self, key: jax.Array) -> tuple[State, TimeStep]: ...
 
-    def step(self, state: EnvState, action: jax.Array) -> tuple[EnvState, TimeStep]: ...
+    def step(self, state: State, action: jax.Array) -> tuple[State, TimeStep]: ...
 
 
 @struct.dataclass
@@ -63,16 +92,16 @@ class _Limited:
     steps: jax.Array
 
 
-def _held(ended: jax.Array, held: Any, following: Any) -> Any:  # noqa: ANN401
-    """`held` where `ended` holds, else `following`, leaf by leaf, `ended` along the leaves' leading axes
-    and a key leaf chosen by its data."""
-    def pick(old: jax.Array, new: jax.Array) -> jax.Array:
-        if jax.dtypes.issubdtype(old.dtype, jax.dtypes.prng_key):
-            data = pick(jax.random.key_data(old), jax.random.key_data(new))
-            return jax.random.wrap_key_data(data, impl=jax.random.key_impl(old))
-        return jnp.where(ended.reshape(ended.shape + (1,) * (old.ndim - ended.ndim)), old, new)
+def chosen[T](mask: jax.Array, new: T, old: T) -> T:
+    """`new` where `mask` holds, `old` elsewhere, leaf by leaf, `mask` along the leaves' leading axes and a
+    key leaf chosen by its data."""
+    def pick(fresh: jax.Array, held: jax.Array) -> jax.Array:
+        if jnp.issubdtype(fresh.dtype, jax.dtypes.prng_key):
+            bits = pick(jax.random.key_data(fresh), jax.random.key_data(held))
+            return jax.random.wrap_key_data(bits, impl=jax.random.key_impl(fresh))
+        return jnp.where(mask.reshape(mask.shape + (1,) * (fresh.ndim - mask.ndim)), fresh, held)
 
-    return jax.tree.map(pick, held, following)
+    return jax.tree.map(pick, new, old)
 
 
 @struct.dataclass
@@ -101,8 +130,8 @@ class TimeLimit:
             ended = step.terminated | step.truncated
             following, stepped = self.env.step(inner, action)
             # An episode that ended within the repeat is held as it ended and earns nothing more.
-            inner = _held(ended, inner, following)
-            step = TimeStep(_held(ended, step.observation, stepped.observation),
+            inner = chosen(ended, inner, following)
+            step = TimeStep(chosen(ended, step.observation, stepped.observation),
                             step.reward + jnp.where(ended, 0, stepped.reward),
                             step.terminated | (~ended & stepped.terminated),
                             step.truncated | (~ended & stepped.truncated))
@@ -143,7 +172,7 @@ class Transition:
 
     observation: Observation
     action: jax.Array
-    extras: Any
+    extras: Tree
     following: TimeStep
 
 
@@ -156,19 +185,19 @@ class Carry:
     state: EnvState
     observation: Observation
     key: jax.Array
-    memory: Any = None
+    memory: Memory = None
 
 
-type Params = Any
-"""A policy's weights, a pytree."""
+type Params = Variables
+"""A policy's weights."""
 
-type Policy = Callable[[Params, Observation, jax.Array, Any], tuple[jax.Array, Any, Any]]
+type Policy = Callable[[Params, Observation, jax.Array, Memory], tuple[jax.Array, Tree, Memory]]
 """`policy(params, observation, key, memory) -> (action, extras, memory)`: an action for each
 environment, what to record beside it, and the policy's memory after it (None for one that keeps
 none)."""
 
 
-def start(env: Env, key: jax.Array, memory: Any = None) -> Carry:  # noqa: ANN401
+def start(env: Env, key: jax.Array, memory: Memory = None) -> Carry:
     """A rollout's carry at fresh episodes of `env`, the policy's `memory` as it starts."""
     reset_key, key = jax.random.split(key)
     state, step = env.reset(reset_key)
@@ -193,12 +222,7 @@ def env_rollout(env: Env, policy: Policy, params: Params, carry: Carry, steps: i
 
             def restart(state, observation):
                 fresh_state, fresh = env.reset(reset_key)
-
-                def chosen(new, old):
-                    return jnp.where(done.reshape(done.shape + (1,) * (new.ndim - done.ndim)), new, old)
-
-                return jax.tree.map(chosen, fresh_state, state), jax.tree.map(chosen, fresh.observation,
-                                                                             observation)
+                return chosen(done, fresh_state, state), chosen(done, fresh.observation, observation)
 
             # A reset runs only at a step where some episode ended.
             state, observation = jax.lax.cond(jnp.any(done), restart, lambda *held: held, state, observation)
@@ -250,16 +274,12 @@ class Driven:
 
         def restart(inner, step):
             fresh_state, fresh = self.env.reset(reset_key)
-
-            def chosen(new, old):
-                last = state.last.reshape(state.last.shape + (1,) * (new.ndim - state.last.ndim))
-                return jnp.where(last, new, old)
-
-            return jax.tree.map(chosen, fresh_state, inner), jax.tree.map(chosen, fresh, step)
+            return chosen(state.last, fresh_state, inner), chosen(state.last, fresh, step)
 
         inner, step = jax.lax.cond(jnp.any(state.last), restart, lambda *held: held, inner, step)
         return _Driven(inner, step.done, key), driven_step(step, state.last)
 
 
-__all__ = ["Batched", "Carry", "Driven", "Env", "EnvState", "Observation", "Params", "Policy", "TimeLimit",
-           "TimeStep", "Transition", "driven_step", "env_rollout", "start"]
+__all__ = ["Batched", "Carry", "Driven", "Env", "EnvState", "Memory", "Observation", "Params", "Policy",
+           "TimeLimit", "TimeStep", "Transition", "Tree", "chosen", "driven_step", "env_rollout", "start",
+           "view", "views"]

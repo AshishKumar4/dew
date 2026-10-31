@@ -649,8 +649,8 @@ class Fabric:
 
 
 class EmulatedLibrary:
-    """`dew.inference.nccl._Library` over a `Fabric`: the push's nonblocking communicators, whose
-    waits watch the replicas' HTTP calls as NCCL's polls do, a failed call raising."""
+    """A push's collectives (`dew.inference.nccl.Collectives`) over a `Fabric`: the push's nonblocking
+    communicators, whose waits watch the replicas' HTTP calls as NCCL's polls do, a failed call raising."""
 
     def __init__(self, fabric):
         self.fabric, self.comms = fabric, {}
@@ -726,16 +726,11 @@ class EmulatedWorker:
             self.fabric.abort(self.group)
 
 
-def emulated(tmp_path, monkeypatch):
-    """The library path a push loads and the maker of a replica's worker, over a `Fabric` emulating
-    NCCL on the host's devices, which the push's library then is."""
-    from dew.inference import nccl
-
+def emulated():
+    """A push's collectives and the maker of a replica's worker, both over one `Fabric` emulating NCCL on
+    the host's devices: the maker of the push's library (`NCCLPush.library`) and of each worker."""
     fabric = Fabric()
-    monkeypatch.setattr(nccl, "_Library", lambda library, ordinal: EmulatedLibrary(fabric))
-    library = tmp_path / "libnccl.so.2"
-    library.write_bytes(b"")
-    return str(library), lambda ordinal: EmulatedWorker(fabric)
+    return (lambda ordinal: EmulatedLibrary(fabric)), (lambda ordinal: EmulatedWorker(fabric))
 
 
 def nccl_library():
@@ -822,12 +817,11 @@ def an_nccl_push_delivers_every_tensor_to_each_replica_on_another_gpu(fixture):
 
 @pytest.mark.mesh(devices=2)
 @pytest.mark.parametrize("fixture", [FIXTURE, FP8], ids=["bfloat16", "fp8"])
-def test_an_emulated_push_delivers_every_tensor_to_each_replica_on_another_device(fixture, tmp_path,
-                                                                                  monkeypatch):
+def test_an_emulated_push_delivers_every_tensor_to_each_replica_on_another_device(fixture):
     """`a_push_delivers_every_tensor_to_each_replica_on_another_device` on the host's devices over NCCL's
     rendezvous and collectives emulated in host memory (`Fabric`), the protocol, ordering and delivery
     every CPU run holds, beside the GPU flow's NCCL."""
-    a_push_delivers_every_tensor_to_each_replica_on_another_device(fixture, *emulated(tmp_path, monkeypatch))
+    a_push_delivers_every_tensor_to_each_replica_on_another_device(fixture, *emulated())
 
 
 def a_push_delivers_every_tensor_to_each_replica_on_another_device(fixture, library, worker):
@@ -893,9 +887,9 @@ def a_push_whose_replica_refuses_its_join_aborts_its_group_rather_than_waiting()
                                                    lambda ordinal: Worker(nccl_library(), ordinal))
 
 
-def test_an_emulated_push_whose_replica_refuses_its_join_aborts_its_group(tmp_path, monkeypatch):
+def test_an_emulated_push_whose_replica_refuses_its_join_aborts_its_group():
     """`a_push_whose_replica_refusal_aborts_its_group` over NCCL emulated in host memory (`Fabric`)."""
-    a_push_whose_replica_refusal_aborts_its_group(*emulated(tmp_path, monkeypatch))
+    a_push_whose_replica_refusal_aborts_its_group(*emulated())
 
 
 def a_push_whose_replica_refusal_aborts_its_group(library, worker):
