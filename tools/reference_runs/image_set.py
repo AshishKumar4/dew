@@ -14,7 +14,6 @@ import argparse
 import json
 
 import numpy as np
-from array_record.python.array_record_module import ArrayRecordReader
 from common import sha256
 
 
@@ -27,22 +26,18 @@ def main() -> None:
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
 
-    from dew.data.sources.codec import unpack_dict_of_byte_arrays
+    from dew.data.images import DecodeImage
+    from dew.data.sources.records import ArrayRecords
 
-    images = []
-    for shard in args.shards:
-        reader = ArrayRecordReader(shard)
-        for index in range(reader.num_records()):
-            record = unpack_dict_of_byte_arrays(reader.read([index])[0])
-            height, width = np.frombuffer(record["shape"], "<i4")
-            images.append(np.frombuffer(record["image"], np.uint8).reshape(height, width, 3))
-            if len(images) == args.images:
-                break
-        reader.close()
-        if len(images) == args.images:
-            break
-    if len(images) < args.images:
-        raise ValueError(f"the shards hold {len(images)} records, {args.images} are needed")
+    # Dew's ArrayRecord reader over the shards in the order given, each record decoded as Dew decodes a
+    # prepared image's, a malformed one failing the set.
+    records, decode = ArrayRecords(args.shards), DecodeImage(rejects=False)
+    try:
+        if len(records) < args.images:
+            raise ValueError(f"the shards hold {len(records)} records, {args.images} are needed")
+        images = [decode.map(records[index])["image"] for index in range(args.images)]
+    finally:
+        records.close()
     generator = np.random.default_rng(args.seed)
     order = np.stack([generator.permutation(args.images) for _ in range(args.epochs)]).astype(np.int32)
     meta = {"shards": [f"{name} {sha256(name)}" for name in args.shards], "images": args.images,

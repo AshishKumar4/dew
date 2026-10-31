@@ -114,11 +114,12 @@ class DecodeImage(grain.MapTransform):
             field = field if field in decoded else "image" if "shape" in decoded else "jpg"
             element = {key: value for key, value in decoded.items()
                        if key not in ("shape", "label", "caption", "txt")}
+            # The prepared format's integers are little-endian int32 on every host.
             if "shape" in decoded:
-                height, width = np.frombuffer(decoded["shape"], np.int32)
+                height, width = np.frombuffer(decoded["shape"], "<i4")
                 element[field] = np.frombuffer(decoded[field], np.uint8).reshape(int(height), int(width), 3)
             if "label" in decoded:
-                element["label"] = np.frombuffer(decoded["label"], np.int32)[0]
+                element["label"] = np.int32(np.frombuffer(decoded["label"], "<i4")[0])
             element["caption"] = decoded.get("caption", decoded.get("txt", b"")).decode()
         image = _payload(element[field])
         if isinstance(image, bytes):

@@ -103,7 +103,7 @@ def _unopenable():
 
 def test_facts_open_no_reader():
     """A store that fails as soon as it is read: its chain's facts come without reading it."""
-    stream = from_iter(_unopenable, name="unopenable")
+    stream = from_iter(_unopenable, identity="unopenable")
     facts = stream.pipe(presets.lm, "byte", seq_len=8, batch=2).facts()
     assert facts["seq_len"] == 8
 
