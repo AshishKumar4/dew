@@ -89,6 +89,13 @@ def current_positions() -> jax.Array | None:
 PROBE = "__probe__"
 """The name a watched module's probe is sown under while a step discovers its probes, and read under."""
 
+STAGED_PROBE = "__staged_probe__"
+"""The name a pipeline stage's watched module sows its probe under, a microbatch axis ahead of it: the
+stage runs each microbatch, which the pipeline lays out one by one as it does a summary
+(`dew.nn.backbones.decoder_stack.run_pipeline`), while it reads its variables, the probe among them, by
+layer. The probe is that leaf less its microbatch axis (`probes_of`), and its gradient sums the stage
+layer's every microbatch."""
+
 COTANGENT_TERMS = ("count", "sum", "sum_squares", "non_finite", "zeros")
 """A probe's gradient's leading entries: the entries its cotangent counts, their sum and sum of squares,
 and how many are not finite and how many exactly zero; its histogram's counts (`HISTOGRAM_EDGES`) follow
@@ -96,6 +103,19 @@ where the step asks for one. Each adds over whatever a gradient adds over (the m
 the devices of a data axis), so the statistics follow from the total (`cotangent_statistics`)."""
 
 _DISCOVERING: contextvars.ContextVar[bool] = contextvars.ContextVar("discovering_probes", default=False)
+_LIVE: contextvars.ContextVar[jax.Array | None] = contextvars.ContextVar("live_rows", default=None)
+
+
+@contextlib.contextmanager
+def counted(live: jax.Array | None) -> Iterator[None]:
+    """Within the block, a probe counts its cotangent's entries only where `live`, a boolean the call runs
+    under, holds: false for a pipeline stage's bubble iteration, whose output no microbatch keeps, so its
+    cotangent, zero, is none of the step's (`dew.nn.backbones.decoder_stack.run_pipeline`)."""
+    token = _LIVE.set(live)
+    try:
+        yield
+    finally:
+        _LIVE.reset(token)
 
 
 def probe_width(histogram: bool) -> int:
@@ -164,9 +184,10 @@ def probes_of(inspected: Mapping) -> dict:
             return None
         found = {}
         for key, value in tree.items():
-            held = (jnp.zeros(value.shape, value.dtype) if key == PROBE
-                    else kept(value) if key != SOWN else None)
-            if held is not None:
+            if key in (PROBE, STAGED_PROBE):
+                # A stage's probe less the microbatch axis its pipeline laid it out along.
+                found[PROBE] = jnp.zeros(value.shape[1:] if key == STAGED_PROBE else value.shape, value.dtype)
+            elif key != SOWN and (held := kept(value)) is not None:
                 found[key] = held
         return found or None
     return kept(inspected) or {}
@@ -220,18 +241,20 @@ def watching(modules: tuple[str, ...], *, histogram: bool = False,
         if not cotangents:
             return output
         discovering = _DISCOVERING.get()
-        if discovering and in_pipeline_stage():
-            raise ValueError(f"the cotangent of {'/'.join(module.path)}, in a pipelined stack's stage, is "
-                             f"not summarized: its stage reads variables by layer, a probe its microbatches "
-                             f"would lay out; watch it without cotangents, or train it unpipelined")
         if not discovering and not module.has_variable(PROBES, PROBE):
             return output
         # A zero probe where the step discovers its probes, and where it reads one, a mark that it did,
-        # nested as the objective nests what the call sows (`probes_of`).
-        module.sow(INSPECTED, PROBE, jnp.zeros(probe_width(histogram), jnp.float32),
+        # nested as the objective nests what the call sows (`probes_of`); a stage's a microbatch apart.
+        staged = in_pipeline_stage()
+        zero = jnp.zeros(probe_width(histogram), jnp.float32)
+        module.sow(INSPECTED, STAGED_PROBE if staged else PROBE, zero[None] if staged else zero,
                    init_fn=dict, reduce_fn=lambda previous, latest: latest)
         if discovering:
             return output
+        live = _LIVE.get()
+        if live is not None:
+            rows = jnp.broadcast_to(live, first.shape[:1])
+            where = rows if where is None else where & rows.reshape(rows.shape + (1,) * (where.ndim - 1))
         leaves[index] = tapped(first, module.get_variable(PROBES, PROBE), where, histogram)
         return jax.tree.unflatten(tree, leaves)
 
@@ -247,7 +270,7 @@ def flattened(inspected: Mapping) -> dict[str, jax.Array]:
     for path, leaf in jax.tree_util.tree_flatten_with_path(inspected)[0]:
         keys = [str(entry.key) if isinstance(entry, jax.tree_util.DictKey) else str(entry) for entry in path]
         statistic, module = keys[-1], [key for key in keys[:-1] if key != SOWN]
-        if statistic == PROBE:
+        if statistic in (PROBE, STAGED_PROBE):
             continue
         for index in np.ndindex(*leaf.shape):
             found["/".join(["activations", *module, *map(str, index), statistic])] = leaf[index]
