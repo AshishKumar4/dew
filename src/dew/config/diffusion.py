@@ -371,9 +371,12 @@ class DiffusionRunConfig(RunConfig):
         if not issubclass(kind, FlowDistillationObjective | GuidanceDistillationObjective):
             raise ValueError(f"teacher_run names a distillation's teacher, and {self.objective.name} "
                              f"distills none")
+        # A student that holds its teacher reads its run for guidance distillation's components alone.
+        fresh = variables is None or TEACHER not in variables
+        if not fresh and not issubclass(kind, GuidanceDistillationObjective):
+            return {}
         run = SavedRun.pinned(self.teacher_run)
-        # A resumed student holds its teacher, so only a fresh one reads the teacher's run.
-        published = run.variables(ema=None) if variables is None or TEACHER not in variables else None
+        published = run.variables(ema=None) if fresh else None
         given: TeacherArguments = {} if published is None else {"teacher_variables": published}
         if issubclass(kind, GuidanceDistillationObjective):
             task = TextToImage.from_saved(run, variables=teacher_weights(variables, published, whole=True))
