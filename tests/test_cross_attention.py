@@ -184,6 +184,21 @@ def test_zero_gates_and_an_empty_context_leave_the_residual_as_it_is():
     assert not np.array_equal(np.asarray(out)[0], x[0]), "a row with a context moves"
 
 
+def test_a_block_whose_every_row_reads_one_context_token_moves_neither_its_query_nor_its_key_projection():
+    """A row that reads one context token attends it whatever the scores, so when every row does the
+    gradients into the block's query and key projections are exactly zero, as IDEFICS's and float64's are,
+    while its value projection moves: through jax.nn's xla kernel too, whose scaled logits XLA:CPU contracts
+    with the subtraction of their maximum into one FMA in this program, leaving each token's weight a
+    rounding off 1 (3e-7 of query and key gradient), where `_fused_attention` has its softmax take the
+    textbook derivative, zero for any such weight (two of the 2,560 seeds of
+    `test_the_block_computes_and_differentiates_as_idefics` draw every row of one token)."""
+    x, context, params, _, cotangent = block_draw(0)
+    _, _, _, gradients = dew_block(x, context, params, np.ones(B, np.int32), cotangent)
+    for name in ("q_proj", "k_proj"):
+        assert not np.any(np.asarray(gradients[name]["kernel"])), name
+    assert np.any(np.asarray(gradients["v_proj"]["kernel"]))
+
+
 def model_draw(model: CausalTransformer, *, gated: bool = True):
     """Check 1's draw for `model`: a seed's variables, their gates drawn away from zero where
     `gated`, and its tokens, a context and each row's context tokens, a row of none among them."""
