@@ -155,7 +155,11 @@ class Reasoned(Protocol):
 PACK_POLICY: Literal["first-fit", "best-fit", "concat"] = "first-fit"
 """How a pack fills its rows where none is asked for."""
 DROP_REMAINDER = True
-"""Whether a batch a training pass fills only in part is dropped, where none is asked for."""
+"""Whether a batch a training pass fills only in part is dropped, where none is asked for. Grain keeps it
+(`drop_remainder=False`); Dew drops it because the training step is compiled for one batch shape, and a
+short batch would compile a second program and take an update over fewer rows. A validation pass never
+drops one (`dew.data.lowering._Build.batch_order`), and a run bounded in examples keeps its last batch,
+filled and marked (`dew.data.compile._bounded`)."""
 TOKEN_FIELDS = ("text",)
 """The per-token fields a pack or a window lays out where none are named."""
 PACK_BINS = 32
@@ -879,6 +883,12 @@ class Dataset:
     def shuffle(
         self, seed: int = 0, *, window: int | None = None, block_shards: int | None = None
     ) -> Pipeline:
+        """The records in an order drawn from `seed`: whole, within a `window` of records, or by blocks of
+        `block_shards` physical shards. The seed is 0 where none is given, where Grain derives an unseeded
+        shuffle from its pipeline's seed (`ds.seed`), in Dew the run's (`compile(seed=)`): this stage's
+        order is the chain's own, the one every run of the chain reads and its saved plan names, so a run's
+        seed changes neither it nor what a resume reads by it. What the run's seed does draw are its random
+        steps and the order a streamed read deals its physical shards in (`dew.data.shards.streamed`)."""
         if window is not None and block_shards is not None:
             raise ValueError("shuffle uses a window or physical shard blocks, not both")
         if block_shards is not None and block_shards < 1:

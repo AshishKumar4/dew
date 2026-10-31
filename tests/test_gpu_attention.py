@@ -24,6 +24,7 @@ runs on a GPU alone, run in one process (`gpu_flow`), each cell its own file's p
   form's default route not on par with IEEE fp32, the accurate form's control (test_attention_accurate_form).
 """
 
+import dataclasses
 import functools
 
 import jax
@@ -40,11 +41,16 @@ import test_attention_triton as triton
 import test_decode_attention as decode
 import test_kernels as kernels
 import test_local_attention as local
-from gpu_flow import Cell, cells_of, run_cells
+from gpu_flow import Cell, cells_of, repeats_bit_for_bit, run_cells, when
 
 from dew.nn.attention import scaled_dot_product_attention
+from dew.nn.kernels.generation import bf16_dot_runs
 
 pytestmark = pytest.mark.gpu(reason="each route's GPU kernel: Triton, Mosaic, flash and the band")
+
+BF16_PRODUCTS = "needs a GPU whose bf16 products run, sm80 or later"
+"""Why a library kernel's cell skips: flash, cuDNN, tokamax's Triton and the band run wherever bf16 products
+do (`bf16_dot_runs`), an A10 and an L4 among them, whatever Dew's own launches' sizes."""
 
 CASES = ("causal-documents-window", *triton.IRREGULAR)
 """The Triton sweeps' calls (`triton.every_config_on_a_gpu`)."""
@@ -81,14 +87,8 @@ def a_shared_bias_step_repeats_bit_for_bit(bias_shape: tuple) -> None:
             q, k, v, bias=b, causal=True, implementation="template"), query, key, value, bias)
         return pull(cotangent)
 
-    first = [np.asarray(gradient) for gradient in step(query, key, value, bias, cotangent)]
-    for run in range(5):
-        if run == 0:
-            jax.clear_caches()  # the second run compiled afresh: a schedule its compiler picks repeats too
-        for name, one, again in zip(("query", "key", "value", "bias"), first,
-                                    step(query, key, value, bias, cotangent), strict=True):
-            np.testing.assert_array_equal(one.view(np.uint8), np.asarray(again).view(np.uint8),
-                                          err_msg=f"the {name}'s gradient on run {run + 2}")
+    repeats_bit_for_bit(step, query, key, value, bias, cotangent, runs=6,
+                        names=[f"the {name}'s gradient" for name in ("query", "key", "value", "bias")])
 
 
 def test_the_attention_kernels_run_on_this_gpu():
@@ -129,8 +129,8 @@ def test_the_fused_attention_routes_run_on_this_gpu(without_deterministic_ops):
                                  without_deterministic_ops, window))
           for window in (None, 4)),
         Cell("packed windowed bf16 attention runs its band on par",
-             functools.partial(local.packed_windowed_bf16_attention_runs_its_band_on_par,
-                               without_deterministic_ops), "sm80"),
+             when(bf16_dot_runs(), BF16_PRODUCTS, functools.partial(
+                 local.packed_windowed_bf16_attention_runs_its_band_on_par, without_deterministic_ops))),
     ])
 
 
@@ -174,7 +174,8 @@ def test_the_fused_kernels_hold_on_this_gpu(without_deterministic_ops):
     deterministic ops, each one's failure kept and all raised together."""
     run_cells([
         *(cell for check in KERNEL_CELLS
-          for cell in cells_of(check, "sm80", without_deterministic_ops=without_deterministic_ops)),
+          for cell in cells_of(check, without_deterministic_ops=without_deterministic_ops)
+          for cell in [dataclasses.replace(cell, run=when(bf16_dot_runs(), BF16_PRODUCTS, cell.run))]),
         *cells_of(masked_rows.a_row_that_sees_no_key_reads_nothing_on_the_fused_gpu_kernels,
                   without_deterministic_ops=without_deterministic_ops),
     ])

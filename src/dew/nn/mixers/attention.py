@@ -391,11 +391,14 @@ class CausalSelfAttention(nn.Module):
         if not self.ctx.kv_shared and not self._packed():
             self.k_proj = dense(projections['k_proj'][1], name='k_proj')
             if self.ctx.value_experts is not None:
-                # K2 Horizon's MoVA: the values are routed experts' projections (`RoutedValues`).
+                # K2 Horizon's MoVA: the values are routed experts' projections (`RoutedValues`), run
+                # under the layer's routed MLP, without which a decoder's fields refuse them.
+                if (mixture := self.ctx.mixture) is None:
+                    raise ValueError("routed value experts run under their layer's routed MLP (a Mixture)")
                 self.experts = RoutedValues(
                     self.ctx.value_experts, self.ctx.emb_features, self.ctx.num_kv_heads * self.value_dim,
-                    init_std=self.ctx.init_std, dtype=self.ctx.dtype, precision=self.ctx.precision,
-                    name='experts')
+                    mixture=mixture, init_std=self.ctx.init_std, dtype=self.ctx.dtype,
+                    precision=self.ctx.precision, name='experts')
             elif not self.ctx.k_eq_v:
                 self.v_proj = dense(projections['v_proj'][1], name='v_proj')
         if 'gate_proj' in projections:
