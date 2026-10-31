@@ -122,10 +122,9 @@ EXAMPLES_SCALAR = "evaluation/examples_consumed"
 """The scalar an evaluation of a run on the examples clock records the examples it had consumed under,
 the coordinate the run's own clock places it at (`Evaluation.examples`)."""
 
-COOLDOWN = "cooldown"
-"""What a cooldown branch's evaluation is named by: each suite it scores, `cooldown_<split>`, and the
-examples the branch had consumed, `cooldown/examples_consumed`, apart from the run's own at the step it
-branched at (`EXAMPLES_SCALAR`)."""
+COOLDOWN_EXAMPLES = "cooldown/examples_consumed"
+"""The scalar a cooldown branch's evaluation records the examples the branch had consumed under, apart
+from the run's own at the step it branched at (`EXAMPLES_SCALAR`)."""
 
 
 @dataclass(frozen=True)
@@ -151,19 +150,21 @@ class Evaluation:
     elapsed_seconds: float
     previews: tuple[Artifact, ...]
     examples: int | None = None
+    cooldown: bool = False
 
     @property
     def scalars(self) -> dict[str, float]:
-        """Return the metric values, plus the evaluation/* counts if a batch was scored, and on the
+        """Return the metric values, plus the split's counts if a batch was scored
+        (`evaluation/<split>/records`, each split's its own at a step that scores several), and on the
         examples clock the examples the run had consumed (`EXAMPLES_SCALAR`), a cooldown branch's under its
-        own name (`COOLDOWN`)."""
-        named = f"{COOLDOWN}/examples_consumed" if self.split.startswith(f"{COOLDOWN}_") else EXAMPLES_SCALAR
+        own name (`COOLDOWN_EXAMPLES`)."""
+        named = COOLDOWN_EXAMPLES if self.cooldown else EXAMPLES_SCALAR
         clocked = {} if self.examples is None else {named: float(self.examples)}
         if not self.coordinated_batches:
             return {**self.scores, **clocked}
         return {**self.scores,
-                "evaluation/coordinated_batches": float(self.coordinated_batches),
-                "evaluation/records": float(self.records), **clocked}
+                f"evaluation/{self.split}/coordinated_batches": float(self.coordinated_batches),
+                f"evaluation/{self.split}/records": float(self.records), **clocked}
 
     @classmethod
     def run(cls, objective: Objective[Loss, Effects], variables: Variables,

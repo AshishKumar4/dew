@@ -51,6 +51,9 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 - An evaluation of a run on the examples clock records the examples it had consumed
   (`evaluation/examples_consumed`) beside its step; a cooldown branch's, scored at the step it branched
   at, records the branch's own count under `cooldown/examples_consumed`.
+- An evaluation's counts are its split's: `evaluation/<split>/coordinated_batches` and
+  `evaluation/<split>/records`, so splits scored at one step each keep their own. A run that branches
+  into cooldowns refuses a split named as a branch's suite of another (`cooldown_<split>`).
 - A run's numerics are named where they are set: `--trainer.precision accurate` (or a Lightning dtype
   preset, "bf16-true", or a `Numerics` record's JSON), `"precision": "accurate"` in a run.json, and
   `Pretrained.load(precision=...)` and `dew.pipeline(source, precision=...)`, which load in their dtypes
