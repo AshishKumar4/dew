@@ -39,7 +39,7 @@ def test_an_embedding_lookup_over_ids_split_on_an_explicit_axis_holds_every_orde
     from jax.sharding import PartitionSpec as P
 
     mesh = jax.make_mesh((4,), ("data",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:4])
-    with jax.sharding.use_mesh(mesh):
+    with jax.set_mesh(mesh):
         ids = jax.device_put(jnp.asarray(np.arange(16).reshape(4, 4) * 5 % 64, jnp.int32),
                              NamedSharding(mesh, P("data", None)))
         (table,) = normal_draw(3150, (64, 8))
