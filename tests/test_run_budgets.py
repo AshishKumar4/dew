@@ -1039,21 +1039,87 @@ def test_a_clocked_runs_validation_records_the_examples_it_had_consumed():
 
 
 def test_a_clocked_runs_cooldown_evaluation_records_the_examples_its_branch_consumed():
-    """A clocked run's cooldown branch, scored once it ends, records the examples it had consumed then:
-    those of the run at the step it branched at and its branch's own, beyond the run's at that step."""
+    """A clocked run's cooldown branch, scored once it ends, records the examples it had consumed then
+    under its own name (`cooldown/examples_consumed`): the run's at the step it branched at and the two
+    batches its branch read on from the run's position, which the run reads next, so the run's count two
+    steps on; the run's own validation at that step records the run's count alone
+    (`evaluation/examples_consumed`)."""
     from dew.training import Cooldowns
 
     (x,) = clocked_records(0)
     held = Pipeline(Memory({"x": x[:BATCH]})).batch(BATCH)
     tracker = RecordingTracker()
     Trainer(Echoed(), OptimConfig(optimizer="adam", learning_rate=PEAK), key=0, tracker=tracker).fit(
-        clocked_chain(x), examples=CLOCKED_RECORDS, log_every=1, validation=held,
+        clocked_chain(x), examples=CLOCKED_RECORDS, log_every=1, validation=held, eval_every="25%",
         cooldowns=Cooldowns(at=("50%",), length=2))
     trained = {step: scalars["train/examples_consumed"] for step, scalars in tracker.scalars
                if "train/loss" in scalars}
-    cooled = [(step, scalars["evaluation/examples_consumed"]) for step, scalars in tracker.scalars
+    cooled = [(step, scalars["cooldown/examples_consumed"]) for step, scalars in tracker.scalars
               if any(name.startswith("cooldown_") for name in scalars)]
-    assert cooled and all(consumed > trained[step] for step, consumed in cooled)
+    validated = {step: scalars["evaluation/examples_consumed"] for step, scalars in tracker.scalars
+                 if "evaluation/examples_consumed" in scalars}
+    assert cooled and all(consumed == trained[step + 2] for step, consumed in cooled)
+    assert all(validated[step] == trained[step] for step, _ in cooled)
+
+
+def test_each_split_evaluated_at_a_step_records_its_own_counts():
+    """Two splits of unequal size scored at one step each record the batches and records they read under
+    their own names (`evaluation/counts/<split>/records`), so neither's count replaces the other's at
+    that step, nor a summary's named as a count is (`evaluation/summary/records`); a cooldown branch's
+    suites, scored at the step it branched at, record theirs apart from the run's own: no scalar takes
+    two values at one step."""
+    from dew.training import Cooldowns
+    from dew.training.evaluation import Summary
+
+    (x,) = clocked_records(0)
+    small = Pipeline(Memory({"x": x[:BATCH]})).batch(BATCH)
+    large = Pipeline(Memory({"x": x[:2 * BATCH]})).batch(BATCH)
+    tracker = RecordingTracker()
+    summaries = [Summary(name, {"summary/loss": 1.0, "large/loss": 1.0}, "lower")
+                 for name in ("records", "coordinated_batches")]
+    Trainer(Echoed(), OptimConfig(optimizer="adam", learning_rate=PEAK), key=0, tracker=tracker).fit(
+        clocked_chain(x), examples=CLOCKED_RECORDS, log_every=1, eval_every="50%", summaries=summaries,
+        validation={"summary": small, "large": large}, cooldowns=Cooldowns(at=("50%",), length=2))
+    logged = collections.defaultdict(list)
+    for step, scalars in tracker.scalars:
+        for name, value in scalars.items():
+            logged[step, name].append(value)
+    assert all(len(set(values)) == 1 for values in logged.values())
+    found = {name: values[0] for (_, name), values in logged.items()}
+    assert found["evaluation/counts/summary/records"] == BATCH
+    assert found["evaluation/counts/large/records"] == 2 * BATCH
+    assert found["evaluation/counts/cooldown_large/coordinated_batches"] == 2
+    assert "evaluation/summary/records" in found
+
+
+def test_a_split_named_like_a_cooldowns_suite_is_the_runs_own():
+    """A split whose name begins as a cooldown branch's suites' do (`cooldown_`) is the run's own: scored
+    without a cooldown, it records the examples the run had consumed (`evaluation/examples_consumed`);
+    a run that branches into cooldowns refuses one named as a branch's suite of another split is, whose
+    scores the branch's would take at the step it branched at."""
+    from dew.training import Cooldowns
+
+    (x,) = clocked_records(0)
+    held = Pipeline(Memory({"x": x[:BATCH]})).batch(BATCH)
+    tracker = RecordingTracker()
+    trainer = Trainer(Echoed(), OptimConfig(optimizer="adam", learning_rate=PEAK), key=0, tracker=tracker)
+    trainer.fit(clocked_chain(x), examples=CLOCKED_RECORDS, log_every=1, validation={"cooldown_val": held},
+                eval_every="50%")
+    trained = {step: scalars["train/examples_consumed"] for step, scalars in tracker.scalars
+               if "train/loss" in scalars}
+    validated = [(step, scalars) for step, scalars in tracker.scalars if "cooldown_val/loss" in scalars]
+    assert validated and all(scalars["evaluation/examples_consumed"] == trained[step]
+                             and "cooldown/examples_consumed" not in scalars for step, scalars in validated)
+
+    def branching(validation):
+        return Trainer(Echoed(), OptimConfig(optimizer="adam", learning_rate=PEAK), key=0).fit(
+            clocked_chain(x), examples=CLOCKED_RECORDS, eval_every="50%", validation=validation,
+            cooldowns=Cooldowns(at=("50%",), length=2))
+
+    # Beside another split the branch's suites keep apart from, the run trains.
+    assert branching({"val": held, "held_val": held}) is not None
+    with pytest.raises(ValueError):
+        branching({"val": held, "cooldown_val": held})
 
 
 def test_a_causal_windows_last_target_is_consumed_by_the_window_that_holds_it():
