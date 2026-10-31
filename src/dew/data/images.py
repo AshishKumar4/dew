@@ -367,6 +367,53 @@ class RandomResizedCrop(grain.RandomMapTransform):
 
 
 @dataclasses.dataclass(frozen=True)
+class RandomMask(grain.RandomMapTransform):
+    """An inpainting mask for each image in `field`, drawn as Diffusers' inpainting trainer draws one
+    (examples/research_projects/dreambooth_inpaint/train_dreambooth_inpaint.py's `random_mask` at
+    86ef420b1, its default `ratio=1`): a size drawn uniformly up to `ratio` of each side, a centre where
+    half of it stays within the image, and by a coin a rectangle or an ellipse there, drawn by PIL as
+    that script draws it. It is written to `to` as `[height, width, 1]` float32: 1 inside, the region a
+    run paints, and 0 outside, the masked image's pixels (`dew.inputs.diffusion.latent_image_conditions`).
+    A diffusion run over an inpainting pipeline reads it (`DiffusionRunConfig`)."""
+
+    ratio: float = 1.0
+    _: dataclasses.KW_ONLY
+    field: str = "image"
+    to: str = "mask"
+
+    def __post_init__(self) -> None:
+        if not 0 < self.ratio <= 1:
+            raise ValueError(f"a mask's size ratio is in (0, 1], not {self.ratio}")
+
+    def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
+        """The facts with a mask of the images' height and width beside them, where the facts size them."""
+        shape = record(facts.get("fields", {}), "fields").get(self.field)
+        if not isinstance(shape, list) or len(shape) != 3:
+            return unshaped(facts, self.to)
+        height, width = shape[0], shape[1]
+        if not isinstance(height, int) or not isinstance(width, int):
+            return unshaped(facts, self.to)
+        return shaped(facts, self.to, [height, width, 1])
+
+    def random_map(self, element: Batch, rng: np.random.Generator) -> Batch:
+        from PIL import Image, ImageDraw
+
+        height, width = np.asarray(element[self.field]).shape[:2]
+        # PIL's (width, height) order and inclusive bounds, as the script's `random.randint` draws them.
+        size = (int(rng.integers(0, int(width * self.ratio) + 1)),
+                int(rng.integers(0, int(height * self.ratio) + 1)))
+        centre = (int(rng.integers(size[0] // 2, width - size[0] // 2 + 1)),
+                  int(rng.integers(size[1] // 2, height - size[1] // 2 + 1)))
+        box = (centre[0] - size[0] // 2, centre[1] - size[1] // 2,
+               centre[0] + size[0] // 2, centre[1] + size[1] // 2)
+        canvas = Image.new("L", (width, height), 0)
+        draw = ImageDraw.Draw(canvas)
+        (draw.rectangle if rng.integers(0, 2) == 0 else draw.ellipse)(box, fill=255)
+        mask = (np.asarray(canvas, np.float32) / 255 >= 0.5).astype(np.float32)[..., None]
+        return {**element, self.to: mask}
+
+
+@dataclasses.dataclass(frozen=True)
 class Flip(grain.RandomMapTransform):
     """The pixels in `field` mirrored left to right with probability `p`."""
 

@@ -21,9 +21,10 @@ from dew.nn.kernels.templates import mosaic, report, resources
 
 def _staging(block: tuple, swizzle: int | None) -> tuple:
     """A stream's tile's transforms: a tile's swizzled (its own, `swizzle` where a stream names one); a side
-    vector's none, in whole 16-byte cp.async chunks."""
+    vector's none, in whole 16-byte cp.async chunks, and a tile's none where it is read a row at a time
+    (`mosaic.UNSWIZZLED`)."""
     shape, dtype = block
-    if len(shape) == 1:
+    if len(shape) == 1 or swizzle == mosaic.UNSWIZZLED:
         return ()
     return swizzled(shape, dtype) if swizzle is None else mosaic.swizzle_transforms(dtype, swizzle)
 
@@ -108,6 +109,10 @@ class Mma(mosaic.Family):
     bounded_loads = False
     role_rows = 4 * 16
     operands_in_registers = True
+    # A step loading ahead of the one consumed leaves cp.async's latency unhidden: two steps 64 deep stalled
+    # on barriers 1.1-1.5 an issue against XLA's 0.3-0.7 (FS-NCU-DW2-a100), and 32-deep steps three
+    # deep took dense products 4-8% less time than 64 deep two (FS-DENSE-STEPS1-a100).
+    loads_ahead = 2
     products_overlap = False
     stores_through_registers = True
 
@@ -230,7 +235,7 @@ class Mma(mosaic.Family):
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
                interpret: bool, approx_math: bool = True, name: str | None = None,
                cluster: int = 1, cost: pl.CostEstimate | None = None,
-               reducing_warpgroups: int = 0, kernel_name: str | None = None) -> Callable:
+               reducing_warpgroups: int = 0) -> Callable:
         # Its one warpgroup is its consumer, no producer beside it, and no cluster; its kernels' default
         # parameters reserve the scratch an implicit reduction takes (`reduction_scratch`).
         del reducing_warpgroups
@@ -238,8 +243,7 @@ class Mma(mosaic.Family):
         built = plgpu.kernel(entry, out_type=out_type, grid=grid, grid_names=grid_names,
                              compiler_params=plgpu.CompilerParams(approx_math=approx_math),
                              interpret=mosaic.interpreted(interpret),
-                             kernel_name=report.named(name) if kernel_name is None else kernel_name,
-                             cost_estimate=cost)
+                             kernel_name=report.named(name), cost_estimate=cost)
         return mosaic.checked(built, name or self.name)
 
     def scoped(self, body, *allocations, streams):

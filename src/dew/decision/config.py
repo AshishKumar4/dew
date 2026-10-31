@@ -33,6 +33,7 @@ from dew.decision.laya import LAYA
 from dew.decision.layout import (
     Framing,
     Instructions,
+    JointLayout,
     Labels,
     Layout,
     QuestionLayout,
@@ -45,6 +46,7 @@ from dew.decision.layout import (
 from dew.decision.model import DecisionModel
 from dew.decision.objective import DecisionObjective
 from dew.decision.renderer import Unit
+from dew.decision.rows import option_width
 from dew.decision.scoring import default_metrics
 from dew.decision.task import Decide
 from dew.nn.backbones.decoder_block import remat_policy
@@ -235,10 +237,7 @@ class DecisionRunConfig(DecoderRunConfig):
                              "attention_impl are choices")
         dtype = self.compute_dtype()
         attention_impl = self.source_attention()
-        budgets = {"max_len": self.max_len, "head_max_len": self.head_max_len,
-                   "option_tokens": self.option_tokens, "max_state_tokens": self.max_state_tokens,
-                   "framing": self.framing, "segments": self.segments, "reads": self.reads,
-                   "parallel": self.parallel, "unit": self.unit, "order": self.order, "split": self.split}
+        budgets = self._row_fields()
         self._refuse_unread_context()
         derived = {}
         if self.context_layers is not None:
@@ -334,6 +333,11 @@ class DecisionRunConfig(DecoderRunConfig):
         return Prepared(self, lambda name: self.train(objective, dataset, name=name, metrics=metrics,
                                                       summary=summary, after=after, validation=held))
 
+    def _row_fields(self) -> Budgets:
+        """The run's fields that lay its rows out, by the layouts' field names (`ROW_FIELDS`), which
+        `_budgeted` sets on the layout the run reads."""
+        return {name: getattr(self, name) for name in ROW_FIELDS}
+
     def _fresh_head(self, start, blocked: bool, budgets: Budgets) -> Mapping[str, object]:
         """The head a fresh backbone `start` reads and its rows' layout: the joint schema head, the
         letter readout of its own logits (`Letters`), its labels named by the backbone's tokenizer, or
@@ -396,9 +400,11 @@ class DecisionRunConfig(DecoderRunConfig):
                   if isinstance(dataset, Dataset) else None for dataset in datasets]
         if any(value is None for value in stated):
             return None
-        widest = max(integer(value, "slots.options") for value in stated)
-        added = number(self.objective.fields.get("none_of_the_above") or 0.0, "none_of_the_above") > 0
-        return widest + int(added)
+        widest = {"options": max(integer(value, "slots.options") for value in stated)}
+        fields = self.objective.fields
+        rate = number(fields.get("none_of_the_above") or 0.0, "none_of_the_above")
+        fewest = integer(fields.get("none_of_the_above_options") or 0, "none_of_the_above_options")
+        return option_width(widest, rate, fewest)
 
     def default_metrics(self, *, validates: bool) -> tuple[MetricConfig, ...]:
         """The task's own held-out suite (`default_metrics`), where the data holds held-out rows."""
@@ -408,7 +414,14 @@ class DecisionRunConfig(DecoderRunConfig):
 
 
 type Budgets = dict[str, int | bool | str | Framing | Labels | tuple[RowSegment, ...] | None]
-"""A run's budgets of a row's layout, by the layout's field names (`_budgeted`)."""
+"""A run's fields of a row's layout, by the layout's field names (`_budgeted`)."""
+
+ROW_FIELDS = tuple(sorted(
+    {entry.name for layout in (QuestionLayout, JointLayout) for entry in dataclasses.fields(layout)}
+    & {entry.name for entry in dataclasses.fields(DecisionRunConfig)}))
+"""The run's fields that lay out its rows: each a field of a decision layout (`QuestionLayout`,
+`JointLayout`) the run declares by the same name, so a layout field the run states reaches its layout
+(`_budgeted`) without a list of its own to keep."""
 
 
 def _fresh_layout(causal: bool, one_question: bool, budgets: Budgets, blocked: bool = False,

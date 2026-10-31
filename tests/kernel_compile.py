@@ -55,12 +55,11 @@ SPILLS = re.compile(r"(\d+) bytes spill stores, (\d+) bytes spill loads")
 class Report:
     """One Mosaic GPU kernel's reports: its name, the shared bytes and tensor memory columns it asks for
     (Mosaic's resource estimate), its registers a thread and its spilled bytes as the GPU compiles its PTX
-    (`inherited`; its binary's registers and stack frame until then, `report.Binary`, which the verdict
-    never reads), what the reports left `unread`: either report without the other, or a field neither
-    states, is no evidence the kernel is within its resources; and its `module`, its kernel hash, which two
-    compiles of one module share: Mosaic compiles a module once a process, so a later compile of it prints
-    no PTX of its own; and the digest of the launch that traced it (`launching`), which its name carried, or
-    None."""
+    (`inherited`, their only source: None until it reads them), what the reports left `unread`: a kernel no
+    binary carries, or a field no report states, is no evidence the kernel is within its resources; and its
+    `module`, its kernel hash, which two compiles of one module share: Mosaic compiles a module once a
+    process, so a later compile of it prints no PTX of its own; and the digest of the launch that traced it
+    (`launching`), which its name carried, or None."""
     kernel: str
     shared: int | None
     tmem: int | None
@@ -69,6 +68,11 @@ class Report:
     unread: tuple[str, ...] = ()
     module: str | None = None
     launch: str | None = None
+
+    @property
+    def traced(self) -> str:
+        """The kernel's name with its launch's (`report.launch_name`), which keys its evidence."""
+        return report.launch_name(self.kernel, self.launch)
 
     def failure(self, shared_limit: int, tmem_limit: int) -> str | None:
         """Why the kernel is not within a multiprocessor's `shared_limit` bytes and `tmem_limit` tensor memory
@@ -84,13 +88,16 @@ class Report:
 
 def reports(estimates: dict[str, str], binaries: list[report.Binary],
             modules: dict[str, str] | None = None) -> list[Report]:
-    """Each kernel's `Report` from its resource estimate (`estimates`, Pallas's printed `Resources` by kernel
-    name) and its binary (`binaries`, `report.binaries`), paired by the kernel's name, with its module
-    (`modules`, its kernel hash by name). An estimate names no kernel (`_estimates` pairs them by the
-    program's order): one past the shared memory its binary's launch asks for, or none where it asks for
-    some, is another kernel's, and raises."""
-    found = {binary.kernel: binary for binary in binaries}
-    launches = {binary.kernel: binary.launch for binary in binaries}
+    """Each kernel's `Report` of its shared memory and tensor memory from its resource estimate (`estimates`,
+    Pallas's printed `Resources`) and its binary (`binaries`, `report.binaries`), paired by the kernel's name
+    and launch (`report.launch_name`), with its module (`modules`, its kernel hash): its registers and spills
+    are its PTX's as the GPU compiles it (`inherited`). An estimate names no kernel (`_estimates` pairs them
+    by the program's order): one past the shared memory its binary's launch asks for, or none where it asks
+    for some, is another kernel's, and raises, as two binaries of one launch do."""
+    found: dict[str, report.Binary] = {}
+    for binary in binaries:
+        if found.setdefault(report.launch_name(binary.kernel, binary.launch), binary) != binary:
+            raise ValueError(f"two binaries of {report.launch_name(binary.kernel, binary.launch)}")
     found_reports = []
     for name in sorted(set(estimates) | set(found)):
         text, binary = estimates.get(name, ""), found.get(name)
@@ -99,12 +106,13 @@ def reports(estimates: dict[str, str], binaries: list[report.Binary],
                 int(shared.group(1)) <= binary.shared and (int(shared.group(1)) > 0 or binary.shared == 0)):
             raise ValueError(f"{name}'s estimate of {shared.group(1)} shared bytes pairs with a binary whose "
                              f"launch asks for {binary.shared}: the estimate is another kernel's")
+        # A kernel no binary carries is no compiled kernel, whatever its PTX's compile says.
         unread = tuple(field for field, read in (("shared bytes", shared), ("tensor memory columns", tmem),
-                                                 ("registers", binary), ("spills", binary)) if not read)
+                                                 ("binary", binary)) if not read)
+        kernel, launch = report.kernel_of(name)
         found_reports.append(Report(
-            name, int(shared.group(1)) if shared else None, sum(map(int, tmem.groups())) if tmem else None,
-            binary.registers if binary else None, binary.frame if binary else None, unread,
-            (modules or {}).get(name), launches.get(name)))
+            kernel, int(shared.group(1)) if shared else None, sum(map(int, tmem.groups())) if tmem else None,
+            None, None, unread, (modules or {}).get(name), launch))
     return found_reports
 
 
@@ -200,15 +208,17 @@ def _compiled(case, generation: str, record: dict,
     except Exception as error:  # A case that does not lower is its own failure.
         record["error"] = f"it does not lower: {str(error)[-800:]}"
         return None
-    calls = [call for call in kernel_calls(lowered) if call.kind == "mosaic_gpu"]
+    # Each kernel once, as JAX lowered it (a function's kernels however many calls reach them).
+    calls = [call for call in kernel_calls(lowered, unrun=True) if call.kind == "mosaic_gpu"]
+    named = [report.launch_name(call.name, call.launch) for call in calls]
+    modules = kernel_modules(calls)
     if directory is not None:
-        record["modules"] = {call.name: call.config for call in calls}
+        record["modules"] = modules
         record["estimates"] = _estimates(calls, "".join(estimated))
     if "models" in record:
         record["lowered"] = {
-            call.name: [dataclasses.asdict(launch)
-                        for launch in lowered_registers(call.ir, _compiler())]
-            for call in calls}
+            name: [dataclasses.asdict(launch) for launch in lowered_registers(call.ir, _compiler())]
+            for name, call in zip(named, calls, strict=True)}
     # A process whose persistent compilation cache is on keeps it on here (JAX settles that once a
     # process): a compile-only device's entry reads back as unloadable, with a warning, and compiles.
     printing = _printed(MOSAIC_GPU_DUMP_PTX="1") if directory else contextlib.nullcontext([])
@@ -225,36 +235,50 @@ def _compiled(case, generation: str, record: dict,
             return None
         if directory is not None:
             record["binaries"] = [dataclasses.asdict(found) for found in report.binaries(executable)]
-            _write_modules("".join(printed), directory)
+            write_modules("".join(printed), directory)
         return [path.read_text() for path in Path(dump).glob("*thunk_sequence.txt")], triton_kernels(lowered)
 
 
+def kernel_modules(calls: list) -> dict[str, str]:
+    """Each Mosaic GPU call's module (its kernel hash) by its kernel's name and launch (`report.launch_name`):
+    one name and launch of two modules raises, as its evidence would be one's."""
+    modules: dict[str, str] = {}
+    for call in calls:
+        name = report.launch_name(call.name, call.launch)
+        if modules.setdefault(name, call.config) != call.config:
+            raise ValueError(f"{name} names two kernels: its evidence would be one's")
+    return modules
+
+
 def _estimates(calls: list, printed: str) -> dict[str, str]:
-    """Each Mosaic GPU call's resource estimate by its kernel's name, from what its lowering printed: Pallas
-    prints one a kernel as it lowers it, in the program's order, which the calls keep; a lowering JAX
-    cached prints none, its kernels' estimates kept by their module from the lowering that printed them
-    (`ESTIMATES`)."""
+    """Each Mosaic GPU call's resource estimate by its kernel's name and launch (`report.launch_name`), from
+    what its lowering printed: Pallas prints one a kernel as it lowers it, in the order JAX lowers them,
+    which `calls` keep (`kernel_calls`: each kernel once, a function's where its first call is, one no run
+    reaches too); a lowering JAX cached prints none, its kernels' estimates kept by their module from the
+    lowering that printed them (`ESTIMATES`)."""
     printed_estimates = ["Resources(" + part for part in printed.split("Resources(")[1:]]
     if len(printed_estimates) == len(calls):
         for call, estimate in zip(calls, printed_estimates, strict=True):
             ESTIMATES[call.config] = estimate
-    return {call.name: ESTIMATES[call.config] for call in calls if call.config in ESTIMATES}
+    return {report.launch_name(call.name, call.launch): ESTIMATES[call.config] for call in calls
+            if call.config in ESTIMATES}
 
 
 ESTIMATES: dict[str, str] = {}
 """Each Mosaic GPU kernel's resource estimate this process read, by its module (its kernel hash)."""
 
 
-def _write_modules(printed: str, directory: str) -> None:
+def write_modules(printed: str, directory: str) -> None:
     """Each PTX module Mosaic printed as it compiled (`PTX_MODULE`) into `directory` as `<kernel>.ptx`, its
-    kernel's name its entry's less `report.KERNEL_FUNCTION`'s suffix and its launch."""
+    kernel's name and launch its entry's (`report.kernel_of`, `report.launch_name`)."""
     for part in printed.split(PTX_MODULE)[1:]:
         entry = PTX_ENTRY.search(part)
         if entry is None:
             raise ValueError(f"a printed PTX module names no entry: {part[:200]}")
-        named = report.KERNEL_FUNCTION.fullmatch(entry.group(1))
-        kernel = report.LAUNCH_SUFFIX.sub("", named.group("kernel") if named else entry.group(1))
-        Path(directory, f"{kernel}.ptx").write_text("//\n" + PTX_MODULE + part)
+        path = Path(directory, f"{report.launch_name(*report.kernel_of(entry.group(1)))}.ptx")
+        if path.exists():
+            raise ValueError(f"two PTX modules of {path.stem}")
+        path.write_text("//\n" + PTX_MODULE + part)
 
 
 def mosaic_kernels(record: dict) -> list[dict]:
@@ -350,15 +374,16 @@ module: Mosaic compiles a module once a process, so a later case of the same mod
 
 
 def inherited(kernel: dict, compiled: dict[str, dict]) -> dict:
-    """`kernel`'s record (`mosaic_kernels`) with its registers and spills as the GPU compiles its PTX: this
-    compile's (`compiled`, by kernel name), which this process keeps by its module (`COMPILED`), or, where
-    Mosaic compiled the same module before in this process and so printed no PTX, that compile's. Its
-    binary is this process's compile, which may not be the GPU's (`RELOCATABLE`): a kernel neither covers
-    keeps them unread."""
-    if kernel["kernel"] in compiled:
+    """`kernel`'s record (`mosaic_kernels`) with its registers and spills, their only source: as the GPU
+    compiles its PTX, this compile's (`compiled`, by its name and launch, `report.launch_name`), which this
+    process keeps by its module (`COMPILED`), or, where Mosaic compiled the same module before in this process
+    and so printed no PTX, that compile's. Its binary is this process's compile, which may not be the GPU's
+    (`RELOCATABLE`): a kernel neither covers keeps them unread."""
+    name = report.launch_name(kernel["kernel"], kernel["launch"])
+    if name in compiled:
         if kernel["module"] is not None:
-            COMPILED[kernel["module"]] = compiled[kernel["kernel"]]
-        return {**kernel, **compiled[kernel["kernel"]]}
+            COMPILED[kernel["module"]] = compiled[name]
+        return {**kernel, **compiled[name]}
     if kernel["module"] in COMPILED:
         return {**kernel, **COMPILED[kernel["module"]], "ptxas": "an earlier compile of its module"}
     unread = [*kernel["unread"], *(field for field in ("registers", "spills")
@@ -372,13 +397,14 @@ NEEDS: dict[str, int | dict | None] = {}
 
 
 def needed(kernel: dict, needs: dict[str, int | dict | None]) -> dict:
-    """`kernel`'s record with its register need: from the PTX its compile printed (`needs`, by kernel name),
-    which this process keeps by its module (`NEEDS`), or, where Mosaic compiled the same module before in
-    this process and printed none, that compile's."""
-    if kernel["kernel"] in needs:
+    """`kernel`'s record with its register need: from the PTX its compile printed (`needs`, by its name and
+    launch, `report.launch_name`), which this process keeps by its module (`NEEDS`), or, where Mosaic compiled
+    the same module before in this process and printed none, that compile's."""
+    name = report.launch_name(kernel["kernel"], kernel["launch"])
+    if name in needs:
         if kernel["module"] is not None:
-            NEEDS[kernel["module"]] = needs[kernel["kernel"]]
-        return {**kernel, "need": needs[kernel["kernel"]]}
+            NEEDS[kernel["module"]] = needs[name]
+        return {**kernel, "need": needs[name]}
     return {**kernel, "need": NEEDS.get(kernel["module"])}
 
 
@@ -506,8 +532,8 @@ def cap_decisions(assemble, model: resources.RegisterModel, *, raising: bool, ho
 
 def _compiled_reports(directory: str, generation: str) -> dict[str, dict]:
     """Each kernel's registers a thread and spilled bytes as the GPU compiles the PTX Mosaic printed into
-    `directory` (`_ptxas` at its own entry), by the kernel's name: its binary is its compile in this
-    process, which may not be the GPU's (`RELOCATABLE`)."""
+    `directory` (`_ptxas` at its own entry), by its name and launch (`report.launch_name`): its binary is its
+    compile in this process, which may not be the GPU's (`RELOCATABLE`)."""
     found = {}
     for path in Path(directory).glob("*.ptx"):
         registers, spilled, took = _ptxas(path.read_text(), generation, cap=None)
@@ -521,7 +547,8 @@ def _compiled_reports(directory: str, generation: str) -> dict[str, dict]:
 def _needs(directory: str, generation: str,
            models: dict[str, resources.RegisterModel] | None = None) -> dict[str, int | dict | None]:
     """Each kernel's register need (`register_need`) from the PTX Mosaic printed into `directory`
-    (`_write_modules`), by the kernel's name."""
+    (`write_modules`), by its name and launch (`report.launch_name`), at its model where `models` holds one
+    so."""
     found = {}
     for path in Path(directory).glob("*.ptx"):
         name = path.stem
@@ -546,7 +573,13 @@ def _compiled_here(cases, generation: str) -> list[dict]:
             _compiled(case, generation, record, directory)
             kernels = mosaic_kernels(record)
             lowered_models = _lowered_models(record, kernels, generation, models)
-            needs = _needs(directory, generation, {**models, **lowered_models})
+            # Each kernel's model: its lowered launch's, else the case's declared one for its name.
+            modelled = {}
+            for kernel in kernels:
+                name = report.launch_name(kernel["kernel"], kernel["launch"])
+                if (model := lowered_models.get(name, models.get(kernel["kernel"]))) is not None:
+                    modelled[name] = model
+            needs = _needs(directory, generation, modelled)
             compiled = _compiled_reports(directory, generation)
             record["kernels"] = [needed(inherited(kernel, compiled), needs) for kernel in kernels]
         record["tmem_limit"] = gpu_target(generation).tmem_columns or 0
@@ -560,16 +593,17 @@ def _lowered_models(record: dict, kernels: list[dict], generation: str,
     target = gpu_target(generation)
     models = {}
     for kernel in kernels:
-        launches = record.get("lowered", {}).get(kernel["kernel"], ())
+        name = report.launch_name(kernel["kernel"], kernel["launch"])
+        launches = record.get("lowered", {}).get(name, ())
         if not launches or kernel["shared"] is None or kernel["tmem"] is None:
             continue
         if len(launches) != 1:
-            raise ValueError(f"{kernel['kernel']} has {len(launches)} launches but one compiled report")
+            raise ValueError(f"{name} has {len(launches)} launches but one compiled report")
         stated = declared.get(kernel["kernel"])
         if stated is None or stated.family is None:
             continue
         launch = LoweredRegisters(**launches[0])
-        models[kernel["kernel"]] = launch.model(stated, target, shared=kernel["shared"], tmem=kernel["tmem"])
+        models[name] = launch.model(stated, target, shared=kernel["shared"], tmem=kernel["tmem"])
     record["lowered_models"] = {name: model.record() for name, model in models.items()}
     return models
 
@@ -636,19 +670,19 @@ def _register_evidence(record: dict) -> list[dict]:
     rows = []
     for kernel in record.get("kernels", ()):
         found = _report(kernel)
-        for source in ("models", "lowered_models"):
-            if (stated := record.get(source, {}).get(found.kernel)) is None:
+        for source, key in (("models", found.kernel), ("lowered_models", found.traced)):
+            if (stated := record.get(source, {}).get(key)) is None:
                 continue
             model = resources.RegisterModel(**stated)
             need = kernel.get("need")
-            actual = record.get("lowered_models", {}).get(found.kernel)
+            actual = record.get("lowered_models", {}).get(found.traced)
             evidence = _evidence(record, found, model, need,
                                  measured_model=None if actual is None else resources.RegisterModel(**actual))
             rows.append({"source": source, **evidence.record()})
         if found.spilled:
             rows.append({"case_id": f"{record['name']} {found.kernel}", "kind": "spill",
                          "spilled": found.spilled, "registers": found.registers})
-        if (launches := record.get("lowered", {}).get(found.kernel)) and found.kernel not in record.get(
+        if (launches := record.get("lowered", {}).get(found.traced)) and found.traced not in record.get(
                 "lowered_models", {}):
             rows.append({"case_id": f"{record['name']} {found.kernel}", "kind": "unmodelled",
                          "reason": "no declared family budget", "lowered": launches})

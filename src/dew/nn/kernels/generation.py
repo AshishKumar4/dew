@@ -76,7 +76,7 @@ def _facts(value):
 CHOICES = frozenset({'attention', 'attention_mainloop', 'decode', 'delta_decode',
                       'delta_gates', 'gate_up', 'gated_delta_rule', 'gemm_epilogue', 'gemm_prologue',
                       'grouped_matmul', 'local_attention', 'mla', 'narrow_copies', 'paged_decode', 'rms_norm',
-                      'short_conv', 'ssd', 'ssd_decode', 'swiglu'})
+                      'selective_scan', 'short_conv', 'ssd', 'ssd_decode', 'swiglu'})
 """The choices a dispatch reports (`route`), and so the ones `chosen` may name (`chosen_kernel`)."""
 
 

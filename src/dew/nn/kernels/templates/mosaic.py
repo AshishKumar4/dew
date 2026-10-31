@@ -118,19 +118,17 @@ def interpreted(interpret) -> plgpu.InterpretGPUParams | None:
 def kernel(entry, *, out_type, grid: tuple, grid_names: tuple, warpgroups: int,
            interpret, family: str, name: str | None = None, scratch: tuple = (),
            approx_math: bool = False, cluster: int = 1, cost: pl.CostEstimate | None = None,
-           reduction_scratch: int = 0, kernel_name: str | None = None) -> Callable:
+           reduction_scratch: int = 0) -> Callable:
     """Build a per-shard launch with the same reporting and interpreter semantics for every family, each call
-    checked against the mesh it runs in (`per_shard`): `kernel_name` its name as its caller resolved it
-    (`report.named`, which reads the launch tracing it), a launch built once for every call of its facts
-    (`attention_mosaic_forward._kernel_of`), else `name`'s here."""
+    checked against the mesh it runs in (`per_shard`), named as the launch tracing it reports `name`
+    (`report.named`)."""
     clustered = {'cluster': (cluster,), 'cluster_names': (CLUSTER,)} if cluster > 1 else {}
     built = plgpu.kernel(entry, out_type=out_type, grid=grid, grid_names=grid_names,
                          num_threads=warpgroups, thread_name="wg", scratch_types=scratch,
                          compiler_params=compiler_params(approx_math=approx_math,
                                                          reduction_scratch=reduction_scratch),
                          interpret=interpreted(interpret),
-                         kernel_name=report.named(name) if kernel_name is None else kernel_name,
-                         cost_estimate=cost, **clustered)
+                         kernel_name=report.named(name), cost_estimate=cost, **clustered)
 
     return checked(built, name or family)
 
@@ -433,6 +431,10 @@ SWIZZLE_BYTES = 128
 NARROWEST_SWIZZLE_BYTES = 32
 """The narrowest swizzle Mosaic GPU stages a block's rows at (`plgpu.find_swizzle`'s least)."""
 
+UNSWIZZLED = 0
+"""A stream's swizzle (`Family.streams`' `swizzles`) where a step reads its tile a row at a time, at a traced
+row (a scan's tokens): staged plain, no tiling or swizzle, which Mosaic GPU indexes at any row."""
+
 
 def swizzle_for(dtype, *contractions: int) -> int:
     """The widest swizzle, in bytes, a shared-memory block of `dtype` takes whose group of elements (the
@@ -463,8 +465,9 @@ def staged(shape: tuple, dtype, swizzle: int | None = None):
     """A shared-memory block of `shape` whose rows are staged at `swizzle` bytes: as layout inference stages
     them where unstated (the widest that fits); otherwise in 8-row tiles of the swizzle's row, explicitly,
     which inference does not take for a block whose products contract over fewer elements than the widest
-    swizzle's row (K32SWZ5: a register operand at a 32-row contraction lowered only so)."""
-    if swizzle is None:
+    swizzle's row (K32SWZ5: a register operand at a 32-row contraction lowered only so); plain where
+    `UNSWIZZLED`."""
+    if swizzle is None or swizzle == UNSWIZZLED:
         return plgpu.SMEM(shape, dtype)
     return plgpu.SMEM(shape, dtype, transforms=swizzle_transforms(dtype, swizzle))
 
@@ -571,6 +574,10 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     operands_in_registers: bool
     """Whether a product reads its operands from registers a consumer loads them into (mma.sync's), where
     warpgroup MMA reads both from shared memory."""
+    loads_ahead: int = 1
+    """The steps a walk keeps loading ahead of the one its products consume to hide its loads' latency: one
+    where a producer's asynchronous copies run beside the consumers (TMA), more where the consumers issue
+    them between their own products (`Mma`'s cp.async)."""
     products_overlap: bool
     """Whether a warpgroup's products run asynchronously, an issued product's accumulator held while the
     program goes on (warpgroup MMA's), where each mma.sync product completes before the next: a launch's
@@ -734,11 +741,10 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
                interpret: bool, approx_math: bool = True, name: str | None = None,
                cluster: int = 1, cost: pl.CostEstimate | None = None,
-               reducing_warpgroups: int = 0, kernel_name: str | None = None) -> Callable:
+               reducing_warpgroups: int = 0) -> Callable:
         """`entry` launched over `grid`, `consumers` compute roles a program beside the family's own, with
         `approx_math` the hardware's approximate exponential and reciprocal (`compiler_params`), named
-        `name` where given (Mosaic names its kernel and its compile reports by it; `kernel_name` that name
-        as its caller resolved it, `kernel`'s); each of `grid`'s
+        `name` where given (Mosaic names its kernel and its compile reports by it); each of `grid`'s
         programs a cluster of `cluster` along `CLUSTER` (at most the family's `cluster`); its `cost`, the
         work it states to XLA and to Dew's FLOP count (the custom call's `cost_estimate_json`); its
         `reducing_warpgroups` (the block's, where its arithmetic may reduce across warps implicitly) each
@@ -1057,14 +1063,13 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
                interpret: bool, approx_math: bool = True, name: str | None = None,
                cluster: int = 1, cost: pl.CostEstimate | None = None,
-               reducing_warpgroups: int = 0, kernel_name: str | None = None) -> Callable:
+               reducing_warpgroups: int = 0) -> Callable:
         if cluster > self.cluster:
             raise ValueError(f"{self.name} launches a cluster of at most {self.cluster}, not {cluster}")
         return kernel(entry, out_type=out_type, grid=grid, grid_names=grid_names,
                       warpgroups=self.warpgroups(consumers), family=self.name, interpret=interpret,
                       name=name, approx_math=approx_math, cluster=cluster, cost=cost,
-                      reduction_scratch=self.warpgroup_reduction_scratch * reducing_warpgroups,
-                      kernel_name=kernel_name)
+                      reduction_scratch=self.warpgroup_reduction_scratch * reducing_warpgroups)
 
     def scoped(self, body, *allocations, streams):
         return pl.run_scoped(lambda *refs, **rings: body(*refs, streams=rings), *allocations, **streams,
