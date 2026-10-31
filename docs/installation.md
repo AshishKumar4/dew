@@ -48,7 +48,7 @@ UV_SYSTEM_CERTS=true uv self update
 ```
 <!-- END pip -->
 
-Without the index the install stops before it installs anything, at resolving jax, since PyPI has no JAX build Dew accepts ([Dew's JAX build](#dews-jax-build)): uv reports `No solution found when resolving dependencies` and names dewml's jax requirement, and pip reports `No matching distribution found for jax`. Add `--extra-index-url https://pypi.dewml.dev/simple` and run it again.
+Without the index the install stops before it installs anything: dewml's releases are on Dew's index beside [Dew's JAX build](#dews-jax-build), which PyPI does not hold, and PyPI's `dewml` is a pointer whose build stops with `dewml is not installed from PyPI.` and the command to run. Add `--extra-index-url https://pypi.dewml.dev/simple` and run it again.
 
 [Which CUDA build](#which-cuda-build) explains the choice between the two. With uv, make an environment first:
 
