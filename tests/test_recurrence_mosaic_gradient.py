@@ -76,7 +76,7 @@ def restarted(fn, case: str):
 
 PAST_TARGET = {"interpreted": {'packed documents-bf16-kept': 225, 'a ragged length-bf16-kept': 161,
                                'one sequence-bf16-kept': 122}}
-"""The interpreted gradient's cases past a group's two minutes, by id (seconds, train 270's CI on f58abb8a3,
+"""The interpreted gradient's cases past a group's two minutes, by id (seconds, train 270's CI on 66a222273,
 ledger 2127), which the whole suite runs (`timed`)."""
 
 

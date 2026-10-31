@@ -237,7 +237,7 @@ def _chunk_delta_forward(query, key, value, g, beta, state, chunk_size, starts, 
     # layers the chunk loop's zero initial state came back with other values in
     # most processes (GLM-5-Next off by 8.7, 10.1 or NaN, byte-identical
     # modules). Without it a scanned GLM-5-Next's whole output is NaN at base
-    # 0b28dd7d7 (test_layer_stack, probe a079ff009). The barrier materializes
+    # 93ab9f5f3 (test_layer_stack, probe a079ff009). The barrier materializes
     # the zero. Remove it when XLA:CPU no longer returns an uninitialized scan
     # carry here.
     if generation.placed_platform() == 'cpu':

@@ -8,7 +8,7 @@ reverse. The gated norm is Qwen3-Next's output norm (fla's FusedRMSNormGated
 computes the same function).
 
 The norm alone lost to XLA's fusions in a Qwen3.5-0.8B full fine-tune (bf16,
-4 x 3072 rows, A100-40, main 2215b81fc): the norms cost 16.3 ms a step
+4 x 3072 rows, A100-40, main c5e393db7): the norms cost 16.3 ms a step
 against XLA's 12.5. Its reverse pass ran at 44% of HBM bandwidth, the
 residual stream's gradient joined it in a separate 72 MiB pass that XLA had
 fused into its own reverse fusion, and a latency-bound third kernel summed
@@ -364,12 +364,12 @@ NORM_SUPPORTS: tuple[Requirement[NormCase], ...] = (
 """The fused norms' requirements: a plain, stream and gated RMSNorm over fp32 or bf16 rows of at most
 8192 features, with fp32 statistics, a vector weight, and operands placed as the kernel reads them."""
 
-FUSED_FASTER = ("this module's table (469e47b1f): Qwen3.5-0.8B's 4 x 3072 rows of 1024 in bf16, the fused "
+FUSED_FASTER = ("this module's table (14a0df682): Qwen3.5-0.8B's 4 x 3072 rows of 1024 in bf16, the fused "
                 "kernels' forward and reverse against XLA's fusions of the same math on an A100-SXM4-40GB "
                 "and an H100 SXM")
 """The receipt behind the fused norm's and SiLU product's declared cells (`NORM`, `SWIGLU`)."""
 
-FP16_NORM_FASTER = ("FSNORM16 (base/kernels 3b6c752c8, CUPTI, arms rotated): Qwen3.5-0.8B's 4 x 3072 rows "
+FP16_NORM_FASTER = ("FSNORM16 (base/kernels 4d31032c6, CUPTI, arms rotated): Qwen3.5-0.8B's 4 x 3072 rows "
                     "of 1024 in fp16, the fused norm's forward and reverse against XLA's on an H100 SXM "
                     "(17.7 and 58.3 us against 33.0 and 105.3) and an A100-SXM4-40GB (40.0 and 133.7 against "
                     "74.5 and 227.8)")

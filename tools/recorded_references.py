@@ -48,7 +48,12 @@ __all__ = ["merge_shards", "provenance", "record_case", "record_distances", "rec
 
 def provenance(reference: str, revision: str, device: str, command: str, **details) -> np.ndarray:
     """A recording's reference, its revision, the device and the public command that reproduces it,
-    as a JSON string array to save beside the recorded arrays."""
+    as a JSON string array to save beside the recorded arrays. The command is published with the
+    recording: a path of the recording machine's own (from the root or the home, but a directory under
+    /tmp the command makes itself) is refused, the argument's name standing in its place."""
+    if any(part.startswith(("/", "~")) and not part.startswith("/tmp/")
+           for word in command.split() for part in word.split("=")[-1].split(":")):
+        raise ValueError(f"a recording's command is public, its machine's paths named, not given: {command}")
     return np.asarray(json.dumps({"reference": reference, "revision": revision, "device": device,
                                   "command": command, **details}))
 
@@ -154,7 +159,7 @@ def record_case(label: str, draw, evaluate, proxy=None, *, truth_proxy=None, sto
 
 def record_logits(directory: Path, model, wide, command: str, *, reference: str, revision: str, license: str,
                   draw=None, padded: Mapping[str, np.ndarray] | None = None, planned: bool = True,
-                  extra=None, **details) -> Path:
+                  extra=None, stepped: int | None = None, **details) -> Path:
     """The tiny decoder at `directory`'s reference recorded over check 1's seeds, which its test reads in
     the reference's place (a release's remote code or a release apart from the suite's, which the test
     cannot run; hf_reference.py `write_logits_recording`'s): each seed's ids, `draw(seed)` (`{"input_ids":
@@ -165,7 +170,10 @@ def record_logits(directory: Path, model, wide, command: str, *, reference: str,
     (`attention_mask` and its `position_ids`), the leaf `padded_logits` too: its logits over the ids
     padded with 0 where the mask is false, at the mask's valid places; and with `extra`, the leaves
     `extra(network, tokens)` gives over the unpadded ids (a looped model's exit gates), the reference's
-    alone, so its count is not planned on Dew. The count is planned on Dew's own
+    alone, so its count is not planned on Dew; and with `stepped`, the leaf `stepped_logits`: the logits at
+    the shapes a decode of a `stepped`-token prefill computes them, the prefill's from one forward over
+    it and each later id's from one over the ids up to it (ledger 1543), which a test's cached steps
+    are judged against. The count is planned on Dew's own
     load of the fixture, its padded rows under the mask alone, or, not `planned`, where Dew cannot load
     beside the reference's release (Ouro's transformers 4.56.2 pins a huggingface_hub older than Dew's
     interop imports), on the reference alone (`record_case`), and confirmed on the reference; the
@@ -185,7 +193,7 @@ def record_logits(directory: Path, model, wide, command: str, *, reference: str,
         def draw(seed):
             return {"input_ids": ids_of(seed)[0]}
 
-    def logits(network, ids):
+    def logits(network, ids, *, prefixes: bool = True):
         tokens = torch.from_numpy(ids.astype(np.int64))
         with torch.no_grad():
             out = {"logits": network(input_ids=tokens, use_cache=False).logits.numpy()}
@@ -194,11 +202,19 @@ def record_logits(directory: Path, model, wide, command: str, *, reference: str,
                 out["padded_logits"] = network(input_ids=rows, **fields, use_cache=False).logits.numpy()[mask]
             if extra is not None:
                 out.update({name: value.numpy() for name, value in extra(network, tokens).items()})
+            if stepped is not None and not prefixes:
+                # A truth's products round alike at every shape: the one forward's.
+                out["stepped_logits"] = out["logits"]
+            elif stepped is not None:
+                out["stepped_logits"] = np.concatenate([
+                    network(input_ids=tokens[:, :stepped], use_cache=False).logits.numpy(),
+                    *(network(input_ids=tokens[:, :length], use_cache=False).logits.numpy()[:, -1:]
+                      for length in range(stepped + 1, tokens.shape[1] + 1))], axis=1)
         return out
 
     def evaluate(inputs):
         with float64():
-            truth = logits(wide, inputs["input_ids"])
+            truth = logits(wide, inputs["input_ids"], prefixes=False)
         return logits(model, inputs["input_ids"]), truth
 
     def ours(network, variables):
@@ -208,6 +224,8 @@ def record_logits(directory: Path, model, wide, command: str, *, reference: str,
             if mask is not None:
                 rows = network.apply(variables, jnp.where(mask, ids, 0), attention_mask=mask)
                 out["padded_logits"] = rows[mask]
+            if stepped is not None:
+                out["stepped_logits"] = out["logits"]
             return out
         return run
 

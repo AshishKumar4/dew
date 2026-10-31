@@ -222,7 +222,8 @@ def test_grouped_examples_keep_the_examples_that_fit(grouped):
                    {"billing": "true"})
     unfit = Example("the client paid two times", {"charge": Noul("Is this a charging problem? " * 400)},
                     {"charge": "true"})
-    assert fit.map({"example": unfit}) == Rejected("unfit")
+    refused = fit.map({"example": unfit})
+    assert isinstance(refused, Rejected) and refused.reason == "unfit"
     together = GroupedExamples((fits, unfit), groups=(Group("billing", {
         "0.billing": {"true": "yes", "false": "no"}, "1.charge": {"true": "yes", "false": "no"}}),))
     def rows(element):

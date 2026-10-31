@@ -43,7 +43,7 @@ from ..kernels.recurrence_chunk import recomputing
 from ..mixer_base import ATTENTION_RESIDUALS, MLP_RESIDUALS, QKV_RESIDUALS, RESIDUALS
 from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, SparseMLP
 from ..ngpt import NGPT, stepped
-from ..norms import LayerNorm, RMSNorm
+from ..norms import LayerNorm, OffsetLayerNorm, RMSNorm
 from ..precision import float32_dot_general, scaled
 from ..protocols import ProjectionGroup, ReadsTrain, RoutesExperts, declared_groups
 from ..sharding import RESIDUAL, constrain, logical_axes
@@ -87,9 +87,12 @@ def decoder_norm(kind: Literal['rms', 'layer', 'fast_layer'], *, epsilon: float,
             return RMSNorm(epsilon=eps, scale_offset=scale_offset if spec.offset is None else spec.offset,
                            scale_after_cast=scale_after_cast, with_scale=spec.scale, groups=spec.groups,
                            dtype=dtype, name=name)
-        if spec.groups != 1 or spec.offset:
-            raise ValueError(f"{name}, a {kind} norm, takes its statistics over the whole axis under an "
-                             f"unshifted weight, not {spec}")
+        offset = scale_offset if spec.offset is None else spec.offset
+        if spec.groups != 1 or (offset and (kind != 'layer' or not spec.scale)):
+            raise ValueError(f"{name}, a {kind} norm, takes its statistics over the whole axis and a "
+                             f"weight offset from one only as a scaled 'layer' norm, not {spec}")
+        if kind == 'layer' and offset:
+            return OffsetLayerNorm(epsilon=eps, use_bias=bias, dtype=dtype, name=name)
         if kind == 'layer':
             return nn.LayerNorm(epsilon=eps, use_bias=bias, use_scale=spec.scale, use_fast_variance=False,
                                 dtype=dtype, name=name)

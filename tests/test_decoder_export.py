@@ -137,7 +137,7 @@ COPIED_MTP = ("glm4_moe", "glm_moe_dsa")
 # the source's tensor layout, against the reference's `.grad`.
 GRADIENTS = ("glm_moe_dsa", "deepseek_v4", "kimi_k25", "qwen3_next", "glm5_next")
 # Every case runs each train since the export checks compile Dew's forward (ledgers 2182, 2278): GLM-5's
-# released standalone export, 173 s in train 279's CI before, is 99 s on armada at c937fc46a after; the
+# released standalone export, 173 s in train 279's CI before, is 99 s on armada at 7f18417b3 after; the
 # gradients and the cases reading GLM-5 Next's round trip 41-55 s.
 
 

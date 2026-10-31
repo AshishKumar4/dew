@@ -9,7 +9,7 @@
  "model": {
   "model": "hybrid_dit, a Dew run directory (dewml/hybrid-dit-176m), loaded by TextToImage.from_run",
   "parameters": 175640848,
-  "dew_commit": "c1bfa2c9b914f547fa2c21ca7a87d1aef5aa6481",
+  "dew_commit": "4c103f4246c22859f87a10c74017f5c93add4998",
   "device": "NVIDIA GeForce RTX 4080"
  },
  "frames": 30,

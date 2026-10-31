@@ -259,7 +259,7 @@ class CausalTransformer(nn.Module):
     """Whether the first block norms its attention input. ModernBERT's first
     block reads the embedding norm's output as it is (modeling_modernbert.py,
     ModernBertEncoderLayer: attn_norm is Identity at layer 0)."""
-    scale_offset: bool = False       # RMSNorm weight is (1 + w), as Gemma stores it
+    scale_offset: bool = False       # a norm's weight is (1 + w): Gemma's RMSNorm, GPT-3's LayerNorm
     scale_after_cast: bool = False   # apply the weight after casting, as Llama and Qwen3 do
     sandwich_norms: bool = False     # add a norm after each sublayer, as Gemma does
     pre_norms: bool = True           # norm each sublayer's input; False + sandwich is OLMo 3
@@ -1016,7 +1016,8 @@ class CausalTransformer(nn.Module):
             engram=None if spec.engram is None or self.engram is None else functools.partial(
                 EngramLayer if self.engram.ple_conv_kernel_size is None else functools.partial(
                     PLELayer, kernel_size=self.engram.ple_conv_kernel_size,
-                    dilation=self.engram.max_ngram_size, parts=self.engram.table_parts),
+                    dilation=self.engram.max_ngram_size, parts=self.engram.table_parts,
+                    use_bias=self.engram.ple_bias),
                 rows=self.engram.num_embeddings[spec.engram], head_dim=self.engram.head_dim,
                 hc_mult=self.hyper_connections.hc_mult if self.hyper_connections else 1,
                 emb_features=self.emb_features, norm_eps=self.norm_eps,

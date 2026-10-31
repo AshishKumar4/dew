@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Capture loader behavior inside the pinned 66beb5305 reference checkout.
+"""Capture loader behavior inside the pinned 7ad0d4079 reference checkout.
 
 Run through data_oracle.py beside it, which downloads that checkout and runs
 this script inside it:
@@ -423,7 +423,7 @@ def main():
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="dew-data-oracle-") as directory:
         configurations = fixtures(Path(directory))
-        oracle = {"baseline": "66beb5305", "cases": {}}
+        oracle = {"baseline": "7ad0d4079", "cases": {}}
         for name, factory in configurations.items():
             if args.case and name not in args.case:
                 continue

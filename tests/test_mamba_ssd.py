@@ -111,7 +111,7 @@ def test_the_seeded_draw_preserves_the_mamba_ssm_native_inputs():
 
 PAST_TARGET = {"port": {"bf16": 256, "ragged-documents": 130, "wide-state-documents": 297}}
 """The port's cases whose interpreted seeds take a group past its two minutes (seconds, train 270's CI on
-f58abb8a3, ledger 2119), which the whole suite runs (`timed`)."""
+66a222273, ledger 2119), which the whole suite runs (`timed`)."""
 
 
 @pytest.mark.parametrize("case", timed(PAST_TARGET, "port", list(CASES)))

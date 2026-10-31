@@ -5,7 +5,7 @@
 Scoring the vocabulary in four chunks instead of one takes the small causal
 transformer's step from 82.977 ms to 82.017 ms and its peak allocation from
 5.803 GiB to 4.721 GiB: 1.2% faster, 18.6% leaner. Both rows were measured at
-`d19b242`, whose `chunked.py` recomputed each tile under `jax.checkpoint`, so
+`cf569ef`, whose `chunked.py` recomputed each tile under `jax.checkpoint`, so
 they do not describe the kernel that ships; the isolation table below prices
 that difference at 17.48 ms of head work, which the step row does not show,
 and the step has not been re-measured at the shipped commit. The loss is
@@ -21,10 +21,10 @@ four 0.39 GiB tiles and one gradient tile.
 
 ## Fixed point
 
-The step table and the head table were measured at commit `d19b242` of
-`wave/lm-head-perf`, against `main` at `124a347`. `d19b242` wrapped each
+The step table and the head table were measured at commit `cf569ef` of
+`wave/lm-head-perf`, against `main` at `017a29a`. `cf569ef` wrapped each
 vocabulary tile in `jax.checkpoint`; the kernel that ships keeps the tiles
-(`3d184ef`), which is the "tiles kept" row of the isolation table, so the
+(`6aff0b6`), which is the "tiles kept" row of the isolation table, so the
 step row above is the remat kernel's and the one for the shipped kernel is
 missing. To re-measure it, run the two `tools/benchmark_step.py` commands under
 Reproduction at the merge commit of this branch. I could not do it in this

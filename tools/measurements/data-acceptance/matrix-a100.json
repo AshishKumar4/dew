@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "commit": "5e4698ff52b5349c81c0d0cfb81efa89b29a8707",
+  "commit": "0af730f70ffe0b3edf94a30d1fac11564b6dd3b5",
   "inputs": {
     "image": {
       "path": "work/image/images.array_record",
