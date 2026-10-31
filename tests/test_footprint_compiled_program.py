@@ -343,18 +343,8 @@ def test_deriving_a_loops_offsets_runs_no_callback_of_it():
 
 
 
-@pytest.mark.parametrize("loop", ["scan", "while"])
-def test_a_loops_carry_is_one_buffer_from_its_start_to_its_result(loop):
-    """XLA keeps a loop's carried value in one buffer from the buffer its initial value is computed into
-    to the loop's result, its body's parameter and returned value of it among them
-    (`ComputeAliasedValues`, xla/hlo/analysis/hlo_alias_analysis.cc): a loop updating a 16 MiB buffer
-    it starts from zeros turn by turn holds it once, within what XLA's compile of it on a compile-only
-    Hopper holds."""
-    from dew.training.ahead import compile_only_gpus
-
-    (gpu,) = compile_only_gpus("sm90", 1, 1 << 30)
-    rows = jax.ShapeDtypeStruct((64, 1024), jnp.float32)
-
+def updated_buffer(loop: str):
+    """A loop updating a 16 MiB buffer it starts from zeros, turn by turn, which it returns."""
     def program(rows):
         def turn(index, buffer):
             return jax.lax.dynamic_update_slice_in_dim(buffer, jnp.tanh(rows) + index, index * 64, axis=0)
@@ -365,9 +355,57 @@ def test_a_loops_carry_is_one_buffer_from_its_start_to_its_result(loop):
         return jax.lax.while_loop(lambda carried: carried[0] < 64,
                                   lambda carried: (carried[0] + 1, turn(*carried)), (0, start))[1]
 
+    return program
+
+
+def discarded_carry(rows):
+    """A scan carrying its input, which it updates each turn, its final carry discarded."""
+    def turn(carried, _):
+        updated = jnp.tanh(carried)
+        return updated, jnp.sum(updated)
+
+    return jax.lax.scan(turn, rows, None, length=4)[1]
+
+
+def one_start_twice(rows):
+    """A scan carrying one product and a view of it as two values, each updated apart, its final carries
+    discarded."""
+    product = rows.T @ rows
+
+    def turn(carried, _):
+        square, flat = carried
+        return (jnp.tanh(square), jnp.exp(flat)), jnp.sum(square) + jnp.sum(flat)
+
+    return jax.lax.scan(turn, (product, product.reshape(-1)), None, length=4)[1]
+
+
+CARRIES = {
+    # The 16 MiB buffer, held once from its zeros to its result.
+    "scan": (updated_buffer("scan"), 4096 * 1024 * 4),
+    "while": (updated_buffer("while"), 4096 * 1024 * 4),
+    # The carry's own buffer, a copy of the input it starts from, though its result is discarded.
+    "discarded": (discarded_carry, 64 * 1024 * 4),
+    # Two 4 MiB buffers, one carry's each, though both start from one.
+    "one-start-twice": (one_start_twice, 2 * 1024 * 1024 * 4),
+}
+
+
+@pytest.mark.parametrize("carried", sorted(CARRIES))
+def test_a_loops_carry_is_one_buffer_from_its_start_to_its_result(carried):
+    """XLA keeps a loop's carried value in one buffer from the buffer its initial value is computed into
+    to the loop's result, its body's parameter and returned value of it among them
+    (`ComputeAliasedValues`, xla/hlo/analysis/hlo_alias_analysis.cc), and copies the initial value into
+    a buffer of the loop's where that is an input, or another carry's start (copy insertion,
+    xla/service/copy_insertion.cc): each loop holds its carries' buffers, the least it can, and no more
+    than XLA's compile of it on a compile-only Hopper holds."""
+    from dew.training.ahead import compile_only_gpus
+
+    (gpu,) = compile_only_gpus("sm90", 1, 1 << 30)
+    program, least = CARRIES[carried]
+    rows = jax.ShapeDtypeStruct((64, 1024), jnp.float32)
     derived = peak_bytes(compiled(jax.make_jaxpr(program)(rows).jaxpr, "cuda"), "gpu", Workspace(0, 0))
     sharding = NamedSharding(Mesh(np.asarray([gpu]), ("data",)), P())
     placed = jax.ShapeDtypeStruct(rows.shape, rows.dtype, sharding=sharding)
     held = jax.jit(program).lower(placed).compile().memory_analysis()
     assert held is not None, "the compile states no memory"
-    assert 4096 * 1024 * 4 <= derived <= held.output_size_in_bytes + held.temp_size_in_bytes
+    assert least <= derived <= held.output_size_in_bytes + held.temp_size_in_bytes
