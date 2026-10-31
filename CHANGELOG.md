@@ -94,14 +94,14 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   (`evaluation/examples_consumed`) beside its step; a cooldown branch's, scored at the step it branched
   at, records the branch's own count under `cooldown/examples_consumed`.
 - An evaluation's counts are its split's: `evaluation/counts/<split>/coordinated_batches` and
-  `evaluation/counts/<split>/records`, so splits scored at one step each keep their own. A run that branches
-  into cooldowns refuses a split named as a branch's suite of another (`cooldown_<split>`).
-  (`evaluation/examples_consumed`) beside its step.
-- A compilation cache directory a run names after its process first compiled (`prepare_process`,
-  `trainer.compilation_cache_dir`, a second run in a notebook) holds the programs compiled after, where
-  JAX kept the first directory.
   `evaluation/counts/<split>/records`, so splits scored at one step each keep their own. A cooldown
   branch's scores are named `cooldown/<split>/<metric>`, which no split's own name can take.
+- A Gauss-Newton step (`Residuals(damping=...)`) takes every derivative order: its microbatch pullback and
+  damped step are custom JVPs, so `jax.jvp`, `jax.linearize` and a Hessian-vector product run through it,
+  and a parameter's step cotangent comes in the parameter's own dtype. The LM heads (whole, tiled and
+  fused) take a gradient of their gradient and its forward derivative, a Hessian-vector product through
+  the loss, on JAX 0.12.0.1.post40, whose variadic reduce differentiates beside a constant operand.
+
 - A run's numerics are named where they are set: `--trainer.precision accurate` (or a Lightning dtype
   preset, "bf16-true", or a `Numerics` record's JSON), `"precision": "accurate"` in a run.json, and
   `Pretrained.load(precision=...)` and `dew.pipeline(source, precision=...)`, which load in their dtypes

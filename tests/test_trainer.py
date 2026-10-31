@@ -1449,7 +1449,7 @@ class NoisedTargets:
 def test_a_cooldown_branch_scores_what_a_run_decayed_there_scores_and_leaves_the_run_as_it_was(
         accumulation, rollout):
     """A linear cooldown of four updates from the fourth of a warmup-stable-decay run is the run whose
-    decay begins there: the branch's `cooldown_val/loss`, recorded at the step it branched from, is that
+    decay begins there: the branch's `cooldown/val/loss`, recorded at the step it branched from, is that
     run's final `val/loss` bit for bit (its rates, 2^-4 times 1, 3/4, 1/2 and 1/4, exact), and the run
     it branched from ends where a run with no cooldown ends, its parameters bit for bit. With a rollout
     whose batches are its states' and keys' (`NoisedTargets`), the branch trains on what the rollout

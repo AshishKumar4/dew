@@ -2,10 +2,10 @@
 A run's compile (`compiled`, owner 10-29, bible §6) reads each kernel's registers a thread and its stack
 frame from the binary its executable carries (`binaries`): a launch whose kernel spills is refused
 (`refused`) and its program lowered once more, where the launch's derivation takes the next config by its
-own rule, each such refusal a model miss (`misses`). The CPU suite's compile gate reads Mosaic's dumped
-reports and PTX instead (tests/kernel_compile.py), as it scans ptxas's caps and needs Mosaic's resource
-estimate. Each kernel's name carries the launch that traced it (`named`), so a binary names its launch and
-its config."""
+own rule, each such refusal a model miss (`misses`). The CPU suite's compile gate reads the binaries too,
+beside the resource estimate Pallas prints as it lowers a kernel and the PTX Mosaic prints as it compiles
+one, whose registers and spills ptxas states at the GPU's own compile (tests/kernel_compile.py). Each
+kernel's name carries the launch that traced it (`named`), so a binary names its launch and its config."""
 
 import contextlib
 import contextvars
@@ -31,10 +31,22 @@ LAUNCH_SUFFIX = re.compile(r"__l([0-9a-f]{10})$")
 KERNEL_FUNCTION = re.compile(r"(?P<kernel>.*)_mosaic_gpu_kernel")
 """A Mosaic GPU kernel's function in its binary: its kernel's name, the host function's `_mosaic_gpu`
 (jax/experimental/mosaic/gpu/core.py) and GPU outlining's `_kernel`."""
+
+
+def kernel_of(name: str) -> tuple[str, str | None]:
+    """`(kernel, launch)` of a kernel's `name` as it traced (`named`), its function in its binary or its PTX
+    entry (`KERNEL_FUNCTION`) or its call's location: its name less the launch's suffix, and the launch's
+    digest, None where it carries none."""
+    function = KERNEL_FUNCTION.fullmatch(name)
+    kernel = function.group("kernel") if function else name
+    launch = LAUNCH_SUFFIX.search(kernel)
+    return LAUNCH_SUFFIX.sub("", kernel), launch.group(1) if launch else None
 KERNEL_PROTO_VERSION = 4
 """The `MosaicGpuKernelProto` version jaxlib serializes (mosaic/gpu/custom_call.cc), which it alone reads."""
 MOSAIC_TARGET = b"mosaic_gpu_v2"
 """The custom call target of a Mosaic GPU kernel, which its thunk names (`_kernels`)."""
+SHARED_BYTES = 10
+"""The `MosaicGpuKernelProto` field of the dynamic shared memory a kernel's launch asks for (`smem_bytes`)."""
 REGISTER_COUNT, FRAME_SIZE = 0x2F, 0x11
 """A cubin's `.nv.info` attributes for a function's registers a thread and its stack frame's bytes
 (EIATTR_REGCOUNT, EIATTR_FRAME_SIZE), as ptxas states them: its frame holds what its registers spill."""
@@ -131,7 +143,7 @@ def _digest(text: str) -> str:
 @contextlib.contextmanager
 def launching(op, arguments: tokamax.BoundArguments, config: Hashable) -> Iterator[None]:
     """Within the block, the kernels a template's launch traces carry its digest in their names (`named`),
-    the same in every process, and their reports name the launch (`Report.launch`, `traced`)."""
+    the same in every process, and their binaries name the launch (`Binary.launch`, `traced`)."""
     token = _TRACING.set(_Pending(lambda: _identity(op, arguments), type(op).__name__, config))
     try:
         yield
@@ -307,13 +319,15 @@ def _compiled_reported(lowered: jax.stages.Lowered, options: jax.stages.Compiler
 
 @dataclasses.dataclass(frozen=True)
 class Binary:
-    """A Mosaic GPU kernel's binary as its executable carries it (`binaries`): its name and the launch that
-    traced it (`Report.kernel`, `Report.launch`), its registers a thread and its stack frame's bytes a
-    thread, nonzero where its registers spill (`REGISTER_COUNT`, `FRAME_SIZE`)."""
+    """A Mosaic GPU kernel's binary as its executable carries it (`binaries`): its name less the launch it
+    carries (`LAUNCH_SUFFIX`) and that launch's digest (`named`), its registers a thread and its stack frame's
+    bytes a thread, nonzero where its registers spill (`REGISTER_COUNT`, `FRAME_SIZE`), and the dynamic
+    shared memory its launch asks for (its kernel proto's `smem_bytes`), None where its proto states none."""
     kernel: str
     launch: str | None
     registers: int
     frame: int
+    shared: int | None = None
 
 
 def binaries(executable: jax.stages.Compiled) -> list[Binary]:
@@ -333,22 +347,27 @@ def binaries(executable: jax.stages.Compiled) -> list[Binary]:
 
         def visit(operation: ir.Operation) -> ir.WalkResult:
             if operation.name == "thunky.call_thunk_proto":
-                kernels, calls = _kernels(ir.StringAttr(operation.attributes["thunk_proto"]).value_bytes)
-                if len(kernels) != calls:
-                    # A call whose binary is missing would read as a kernel that does not spill.
-                    raise ValueError(f"a thunk names {calls} Mosaic GPU calls but carries {len(kernels)} "
-                                     "kernel binaries")
-                found.extend(kernels)
+                found.extend(thunk_kernels(ir.StringAttr(operation.attributes["thunk_proto"]).value_bytes))
             return ir.WalkResult.ADVANCE
 
         module.operation.walk(visit)
     return found
 
 
+def thunk_kernels(proto: bytes) -> list[Binary]:
+    """The kernel binaries of a thunk's serialized proto (`_kernels`), one for each Mosaic GPU call it names:
+    a call whose binary is missing would read as a kernel that does not spill, so it raises."""
+    kernels, calls = _kernels(proto)
+    if len(kernels) != calls:
+        raise ValueError(f"a thunk names {calls} Mosaic GPU calls but carries {len(kernels)} kernel binaries")
+    return kernels
+
+
 def _kernels(message: bytes) -> tuple[list[Binary], int]:
     """The kernels of each `MosaicGpuKernelProto` within a thunk's serialized proto (a message of jaxlib's
-    version, field 1, whose binary, 8, is an ELF and whose kernel name, 9, its function's), and how many
-    Mosaic GPU custom calls it names (`MOSAIC_TARGET`, a custom call thunk's target)."""
+    version, field 1, whose binary, 8, is an ELF, whose kernel name, 9, its function's, and whose
+    `SHARED_BYTES` its launch's dynamic shared memory), and how many Mosaic GPU custom calls it names
+    (`MOSAIC_TARGET`, a custom call thunk's target)."""
     parsed = empty_pb2.Empty()
     try:
         parsed.ParseFromString(message)
@@ -357,10 +376,11 @@ def _kernels(message: bytes) -> tuple[list[Binary], int]:
     fields: dict[int, list] = {}
     for field in UnknownFieldSet(parsed):
         fields.setdefault(field.field_number, []).append(field.data)
-    binary, name = fields.get(8, []), fields.get(9, [])
+    binary, name, shared = fields.get(8, []), fields.get(9, []), fields.get(SHARED_BYTES, [])
     if (fields.get(1) == [KERNEL_PROTO_VERSION] and len(binary) == len(name) == 1
             and isinstance(binary[0], bytes) and binary[0][:4] == b"\x7fELF" and isinstance(name[0], bytes)):
-        return [_binary(name[0].decode(), binary[0])], 0
+        stated = shared[0] if len(shared) == 1 and isinstance(shared[0], int) else None
+        return [dataclasses.replace(_binary(name[0].decode(), binary[0]), shared=stated)], 0
     found, calls = [], 0
     for values in fields.values():
         for value in values:
@@ -399,8 +419,4 @@ def _binary(function: str, elf: bytes) -> Binary:
                 at += 4
     if REGISTER_COUNT not in stated:
         raise ValueError(f"the binary of {function} states no registers")
-    named = KERNEL_FUNCTION.fullmatch(function)
-    kernel = named.group("kernel") if named else function
-    launch = LAUNCH_SUFFIX.search(kernel)
-    return Binary(LAUNCH_SUFFIX.sub("", kernel), launch.group(1) if launch else None,
-                  stated[REGISTER_COUNT], stated.get(FRAME_SIZE, 0))
+    return Binary(*kernel_of(function), stated[REGISTER_COUNT], stated.get(FRAME_SIZE, 0))

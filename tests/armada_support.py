@@ -6,7 +6,7 @@ import sys
 from collections.abc import Callable
 from pathlib import Path
 
-from tool_support import load
+from tool_support import git, load
 
 
 def loaded(tmp_path: Path, monkeypatch):
@@ -65,3 +65,14 @@ def reusable_now(ci, tests: list[str]) -> list[bool]:
 
 ON_SRC = "import sys\nsys.path.insert(0, 'src')\n"
 PASSING = {"test_a.py": "def test_a():\n    pass\n", "test_b.py": "def test_b():\n    pass\n"}
+
+
+def commit(root: Path, message: str) -> str:
+    """Checkout `root`'s changes committed, and the commit's sha: every file at the first, which makes the
+    repository, and the tracked and staged changes after, so what a run leaves in the checkout stays out."""
+    first = not (root / ".git").exists()
+    if first:
+        git(root, "init", "-q")
+        git(root, "add", "-A")
+    git(root, "commit", "-qm" if first else "-qam", message)
+    return git(root, "rev-parse", "HEAD").strip()
