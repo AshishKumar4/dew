@@ -180,8 +180,13 @@ def _width(width: int, family: mosaic.Family, dtype) -> int:
 
 def _block(config: Tiles | BackwardTiles) -> int:
     """The block a launch at `config` pads a call's queries and keys to: whole programs of query blocks and
-    key tiles (a forward's), or of query blocks and key blocks (a backward's dQ and dK/dV programs)."""
-    keys = config.consumers * config.block_k if isinstance(config, BackwardTiles) else config.block_k
+    key tiles (a forward's), or of query blocks and key blocks (a backward's dQ and dK/dV programs, a shared
+    dQ's dK/dV program a key block each of its consumers': padded to a block of the dQ launch's consumers,
+    its last program's last consumer read keys past the padded call, NaN interpreted)."""
+    if isinstance(config, BackwardTiles):
+        keys = (config.dkv.consumers if config.shared_dq else config.consumers) * config.block_k
+    else:
+        keys = config.block_k
     return math.lcm(config.consumers * config.block_q, keys)
 
 
