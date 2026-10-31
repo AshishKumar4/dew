@@ -868,6 +868,22 @@ def test_cpu_fp32_attention_summed_in_float64_takes_forward_mode():
         assert_as_exact_as_the_reference(np.asarray(got), np.asarray(want), np.asarray(exact), name)
 
 
+@pytest.mark.parametrize(("dtype", "key_dtype"), [(jnp.float16, jnp.float16), (jnp.float32, jnp.float64)],
+                         ids=["float16", "float32-over-float64"])
+def test_a_call_jax_nn_cannot_take_on_a_cpu_runs_the_reference_path(dtype, key_dtype):
+    """A call named onto jax.nn's xla kernel that it cannot take on a CPU, a float16 one (XLA's CPU compiler
+    has no F16_F16_F32 dot) or a float32 query over float64 keys (jax.nn takes one dtype), hands off
+    (`attention_kernels.XLA_SUPPORTS`): it compiles and runs, its output the reference path's bit for
+    bit."""
+    query, key, value = (jax.random.normal(jax.random.key(seed), (1, 16, 2, 8), kind)
+                         for seed, kind in zip(range(3), (dtype, key_dtype, key_dtype), strict=True))
+    with jax.enable_x64(new_val=True):
+        named, reference = (jax.jit(functools.partial(scaled_dot_product_attention, implementation=name,
+                                                      causal=True))(query, key, value)
+                            for name in ("xla", "reference"))
+    np.testing.assert_array_equal(np.asarray(named), np.asarray(reference))
+
+
 def test_a_layer_that_builds_its_mask_is_on_par_with_the_reference_path():
     """A layer whose rows are padded on the left builds its mask and runs the kernel a materialized mask
     takes (`kernel_for_materialized_mask`): 'auto' on par with the reference path over the real tokens
