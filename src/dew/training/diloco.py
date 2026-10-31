@@ -18,6 +18,7 @@ whose windows commit with the others' but where a group's loss is not finite.
 from __future__ import annotations
 
 import dataclasses
+import functools
 import math
 from collections.abc import Callable, Sequence
 
@@ -29,10 +30,10 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from dew.distributed.placement import Placement
 from dew.mesh import DILOCO_AXIS
 from dew.state import REPLICA_FIELDS, Replicas, TrainState
-from dew.training.transaction import example_groups
+from dew.training.transaction import cleared, example_groups, window_dropped
 
-__all__ = ["DiLoCo", "grouped", "on_groups", "rated", "rates_set", "regrouped", "shared_by_groups",
-           "window_of", "windowed", "with_window"]
+__all__ = ["DiLoCo", "dropped", "grouped", "on_groups", "rated", "rates_set", "regrouped", "shared_by_groups",
+           "windowed"]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -57,14 +58,22 @@ class DiLoCo:
             raise ValueError(f"DiLoCo's groups meet every so many windows of updates, at least 1, got "
                              f"{self.every}")
 
-    def started(self, state: TrainState, mesh: Mesh, host: Sequence[str] = ()) -> TrainState:
-        """The state a DiLoCo run over `mesh`'s groups starts from: each group's inner state a copy of
-        `state`'s, the outer variables `state`'s with their parameters in float32, the outer optimizer's
-        state fresh. A layout that keeps fields on the host (`host`, `Layout.host`) is refused: its
-        offload places the outer fields, and no placement of a group's own is carried to its step."""
+    def admits(self, host: Sequence[str], record: bool) -> None:
+        """Refuse what a DiLoCo run cannot express, before any state is made or supplied: a layout that
+        keeps fields on the host (`host`, `Layout.host`), whose offload and host-master step place the
+        outer model's fields and run no group's, and a record of each example's draws (`record`), which
+        no single tape holds of several groups' own draws."""
         if host:
             raise ValueError(f"DiLoCo keeps each group's state on its devices; this layout keeps "
-                             f"{list(host)} on the host, which places the outer model's alone")
+                             f"{list(host)} on the host, which places and steps the outer model's alone")
+        if record:
+            raise ValueError("a DiLoCo run's groups draw their own; no one record of a step's examples "
+                             "holds them")
+
+    def started(self, state: TrainState, mesh: Mesh) -> TrainState:
+        """The state a DiLoCo run over `mesh`'s groups starts from: each group's inner state a copy of
+        `state`'s, the outer variables `state`'s with their parameters in float32, the outer optimizer's
+        state fresh."""
         replicas = mesh.shape[DILOCO_AXIS]
         inner = Replicas(**{field: jax.tree.map(lambda leaf: jnp.stack([leaf] * replicas),
                                                 getattr(state, field)) for field in REPLICA_FIELDS})
@@ -128,9 +137,12 @@ class DiLoCo:
         variables = {**collections, "params": outer}
         restarted = jax.tree.map(lambda kept, met: jnp.broadcast_to(met.astype(kept.dtype), kept.shape),
                                  inner.variables, {**collections, "params": outer})
-        return dataclasses.replace(state, variables=variables, opt_state=opt_state,
-                                   ema=None if inner.ema is None else jax.tree.map(_met, inner.ema),
-                                   inner=dataclasses.replace(inner, variables=restarted))
+        met = dataclasses.replace(state, variables=variables, opt_state=opt_state,
+                                  ema=None if inner.ema is None else jax.tree.map(_met, inner.ema),
+                                  inner=dataclasses.replace(inner, variables=restarted))
+        # A group that rejected an attempt holds a part-filled window of the parameters it leaves: dropped,
+        # as a rejection drops one, so its next update pools the met parameters' gradients alone.
+        return _dropped(met, state.window_size)
 
 
 def regrouped(inner: Replicas, change: Callable[[Replicas], Replicas]) -> Replicas:
@@ -139,6 +151,40 @@ def regrouped(inner: Replicas, change: Callable[[Replicas], Replicas]) -> Replic
     groups = jax.tree.leaves(inner.variables)[0].shape[0]
     each = [change(jax.tree.map(lambda leaf, group=group: leaf[group], inner)) for group in range(groups)]
     return jax.tree.map(lambda *made: jnp.stack(made), *each)
+
+
+def _groups_dropped(first, microstep, window, size):
+    """`window_dropped` of each group's `microstep` and `window`, and the first group's microstep, the
+    run's (`first`'s place)."""
+    del first
+    microstep, window = jax.vmap(window_dropped, in_axes=(0, 0, None))(microstep, window, size)
+    return microstep[0], microstep, window
+
+
+def _dropped(state: TrainState, size) -> TrainState:
+    """`state` with each group's window of `size` microbatches dropped, traced in a step."""
+    inner = state.inner
+    if inner is None or inner.accumulation is None:
+        return state
+    first, microstep, window = _groups_dropped(state.microstep, inner.microstep, inner.accumulation, size)
+    return dataclasses.replace(state, microstep=first, inner=dataclasses.replace(
+        inner, microstep=microstep, accumulation=window))
+
+
+def dropped(state: TrainState, size: int) -> TrainState:
+    """`state` with its window of `size` microbatches dropped (`window_dropped`), each group's under DiLoCo,
+    as a ramp's stage begins (`Trainer._staged`). Only the windows' fields are compiled, so a host-master
+    state's resident weights stay where they are."""
+    if state.inner is None:
+        fields = (state.microstep, state.accumulation)
+        microstep, window = jax.jit(functools.partial(window_dropped, size=size),
+                                    out_shardings=jax.tree.map(lambda x: x.sharding, fields))(*fields)
+        return dataclasses.replace(state, microstep=microstep, accumulation=window)
+    fields = (state.microstep, state.inner.microstep, state.inner.accumulation)
+    first, microstep, window = jax.jit(functools.partial(_groups_dropped, size=size),
+                                       out_shardings=jax.tree.map(lambda x: x.sharding, fields))(*fields)
+    return dataclasses.replace(state, microstep=first, inner=dataclasses.replace(
+        state.inner, microstep=microstep, accumulation=window))
 
 
 def rated(state: TrainState) -> optax.OptState:
@@ -156,39 +202,33 @@ def rates_set(state: TrainState, setting: Callable[[optax.OptState], optax.OptSt
                                                                 opt_state=setting(state.inner.opt_state)))
 
 
-def window_of(state: TrainState):
-    """The pooling window a step reads (`TrainState.accumulation`): a run's own, or under DiLoCo its groups'
-    inner ones, stacked."""
-    return state.accumulation if state.inner is None else state.inner.accumulation
-
-
-def with_window(state: TrainState, window) -> TrainState:
-    """`state` with `window` as the pooling window its step reads (`window_of`)."""
+def windowed(initialize: Callable, state: TrainState, batch,
+             place: Callable[[TrainState], Placement[TrainState]] | None = None) -> TrainState:
+    """`initialize(state, batch, shape_only)` (the trainer's window of a batch's shapes,
+    `Trainer._initialize_accumulation`) of `state` and `batch`, its shapes alone unless `place` gives the
+    state's placement (`Trainer.shardings`) to allocate it on. Under DiLoCo, of one group's view, its
+    inner state and its share of the batch's rows, the window stacked over the groups as the inner
+    state's: allocated, each group's empty (`cleared`), where `place` puts the stacked window, so no
+    group's rows split over the groups."""
     if state.inner is None:
-        return dataclasses.replace(state, accumulation=window)
-    return dataclasses.replace(state, inner=dataclasses.replace(state.inner, accumulation=window))
-
-
-def windowed(initialize: Callable, state: TrainState, batch) -> TrainState:
-    """`initialize` (the trainer's window of a batch's shapes, `Trainer._initialize_accumulation`) of
-    `state` and `batch`: under DiLoCo of one group's view, its inner state and its share of the batch's
-    rows, the window stacked over the groups as the inner state's; a run of one copy's as it is."""
-    if state.inner is None:
-        return initialize(state, batch)
+        return initialize(state, batch, shape_only=place is None)
     groups = jax.tree.leaves(state.inner.variables)[0].shape[0]
     view = dataclasses.replace(state, inner=None, **{field: jax.tree.map(
         lambda leaf: jax.ShapeDtypeStruct(leaf.shape[1:], leaf.dtype), getattr(state.inner, field))
         for field in REPLICA_FIELDS})
-    # The groups' clocks agree; the first's says how full the window is.
-    microstep = state.inner.microstep
-    view = dataclasses.replace(view, microstep=microstep if isinstance(microstep, jax.ShapeDtypeStruct)
-                               else microstep[0])
     share = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(
         (jnp.shape(leaf)[0] // groups, *jnp.shape(leaf)[1:]) if jnp.ndim(leaf) else (), leaf.dtype), batch)
-    window = initialize(view, share).accumulation
-    stacked = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct((groups, *leaf.shape), leaf.dtype)
-                           if isinstance(leaf, jax.ShapeDtypeStruct) else jnp.stack([leaf] * groups), window)
-    return dataclasses.replace(state, inner=dataclasses.replace(state.inner, accumulation=stacked))
+    held = initialize(view, share, shape_only=True)
+    if held.accumulation is view.accumulation:
+        return state
+    shapes = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct((groups, *leaf.shape), leaf.dtype),
+                          held.accumulation)
+    if place is None:
+        return state.with_window(shapes)
+    placement = place(state.with_window(shapes)).window
+    window = jax.jit(lambda: jax.vmap(cleared)(jax.tree.map(lambda leaf: jnp.zeros(leaf.shape, leaf.dtype),
+                                                             shapes)), out_shardings=placement)()
+    return state.with_window(window)
 
 
 def grouped(shardings: Callable[[TrainState], Placement[TrainState]],

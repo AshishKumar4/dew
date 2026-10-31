@@ -166,7 +166,7 @@ class FitPlan:
         step."""
         horizon, bound = self.horizon(clock.read), clock.bound
         if horizon is not None and (bound is None or bound >= horizon):
-            clock.reread(*interval.clocked(state.accumulation))
+            clock.reread(*interval.clocked(state.first_window))
         return clock.read
 
     @property

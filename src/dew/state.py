@@ -156,6 +156,26 @@ class TrainState:
                 "read state.variables")
         return merge(self.variables, self.ema)
 
+    @property
+    def window(self) -> Accumulation | None:
+        """The pooling window a step reads: the run's own, or under DiLoCo its groups', stacked
+        (`Replicas.accumulation`)."""
+        return self.accumulation if self.inner is None else self.inner.accumulation
+
+    @property
+    def first_window(self) -> Accumulation | None:
+        """The window whose tokens a run's clocks count pending (`TokenClock`): its own, or under DiLoCo the
+        first group's, each group counting the whole batch's tokens as the run commits them."""
+        if self.inner is None or self.inner.accumulation is None:
+            return self.accumulation
+        return jax.tree.map(lambda leaf: leaf[0], self.inner.accumulation)
+
+    def with_window(self, window: Accumulation | None) -> TrainState:
+        """This state with `window` as the window its step reads (`window`)."""
+        if self.inner is None:
+            return dataclasses.replace(self, accumulation=window)
+        return dataclasses.replace(self, inner=dataclasses.replace(self.inner, accumulation=window))
+
 
 CHECKPOINTED = tuple(field.name for field in dataclasses.fields(TrainState)
                      if field.metadata.get('checkpointed', True))
