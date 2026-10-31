@@ -733,22 +733,31 @@ def test_every_objectives_watched_cotangents_reach_its_model_calls(name, windows
 
 
 @pytest.mark.mesh(devices=4)
-def test_a_pipelined_stacks_watched_cotangents_are_refused():
-    """A pipelined stack's watched cotangents are refused as the step traces (row 2324): a probe would be
-    laid out by the stage's microbatches while its stage reads variables by layer, so the step names
-    what it cannot summarize rather than summarize another layer's."""
+def test_a_pipelined_stacks_watched_cotangents_are_each_layers_over_its_microbatches():
+    """A decoder pipelined over two stages of two microbatches summarizes the loss's cotangent at each
+    watched layer over every microbatch it ran (row 2324), one summary a layer: its entries those of the
+    unpipelined step's, none of a bubble iteration's discarded zeros, so its zero and non-finite shares
+    are the unpipelined step's to the bit."""
     from model_support import TINY_DECODER
 
     from dew.objectives.lm import LMObjective
     from dew.registry import models
     from dew.training import MeshSpec
 
-    model = models.build("causal_transformer", vocab_size=64, **{**TINY_DECODER, "num_layers": 4},
-                         num_kv_heads=2)
-    run = Trainer(LMObjective(model, 16), optax.sgd(RATE), key=jax.random.key(0), microbatches=2,
-                  mesh=MeshSpec(fsdp=2, stage=2).build(jax.devices()[:4]),
-                  inspection=Inspection(modules=("*MLP",), targets=("params",), cotangents=True))
-    tokens = np.random.default_rng(1).integers(1, 64, size=(8, 17)).astype(np.int32)
-    with pytest.raises(ValueError):
-        inspected(run, {"text": tokens})
+    def cotangents(**placed) -> dict[str, float]:
+        model = models.build("causal_transformer", vocab_size=64, **{**TINY_DECODER, "num_layers": 4},
+                             num_kv_heads=2)
+        run = Trainer(LMObjective(model, 16), optax.sgd(RATE), key=jax.random.key(0), **placed,
+                      inspection=Inspection(modules=("*MLP",), targets=("params",), cotangents=True))
+        tokens = np.random.default_rng(1).integers(1, 64, size=(8, 17)).astype(np.int32)
+        return {name: value for name, value in inspected(run, {"text": tokens}).items()
+                if name.startswith("inspect/cotangents/")}
 
+    piped = cotangents(microbatches=2, mesh=MeshSpec(fsdp=2, stage=2).build(jax.devices()[:4]))
+    whole = cotangents(mesh=MeshSpec(fsdp=2).build(jax.devices()[:2]))
+    assert set(piped) == set(whole)
+    assert {f"inspect/cotangents/layers_{layer}/mlp/rms" for layer in range(4)} <= set(piped)
+    for name, value in whole.items():
+        if name.endswith(("/zero_fraction", "/non_finite")):
+            assert piped[name] == value, name
+        assert np.isfinite(piped[name])
