@@ -738,10 +738,19 @@ def _counted_trips(loop: _Instruction, caller: _Computation,
         return math.inf
     start = _constant(caller, _tuple_element(caller, loop.operands[0], index))
     step = _increment(body, _tuple_element(body, body.root, index), index)
-    if start is None or step is None or step <= 0:
+    if start is None or step is None:
+        return math.inf
+    return counted_trips(start, bound, step, int(counter.group(2)), signed=counter.group(1) == 's')
+
+
+def counted_trips(start: int, bound: int, step: int, bits: int, *, signed: bool) -> float:
+    """The trips of a loop that counts an integer of `bits` bits (`signed` or not) from `start` by `step`
+    while it is below `bound`: the one rule an executable's loop (`_counted_trips`) and a lowered program's
+    (`dew.training._lowering._trips`) are both read by. Infinite for a step that is not positive, and for a
+    last step that overflows the counter's type, since a wrapped counter need never reach the bound."""
+    if step <= 0:
         return math.inf
     trips = max(0, -(-(bound - start) // step))
-    signed, bits = counter.group(1) == 's', int(counter.group(2))
     if start + trips * step > (1 << (bits - signed)) - 1:
         return math.inf
     return float(trips)
