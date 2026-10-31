@@ -525,6 +525,7 @@ def _dkv_built(walk: _Backward, operands: tuple, treedef, shares: tuple, grades:
     def entry(*refs):
         summed = family.scoped(functools.partial(body, *refs), *scoped, streams=rings)
         if program.tiles.shared_dq:
+            assert summed is not None  # each consumer's own sums (`_own_stored`)
             dk_ref, dv_ref = refs[9 + treedef.num_leaves + walk.fused:][:2]
             _own_stored(family, summed, (dk_ref, dv_ref), consumers, program.tiles.block_k)
         elif summed is not None:
