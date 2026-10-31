@@ -30,6 +30,7 @@ from reference_error import (
 )
 from sharded import collectives
 from test_nested_learning_optim import muon_orthogonalized, newton_schulz_reference
+from torch_layout import node
 
 from dew.batch import coordinates
 from dew.newton_schulz import NEWTON_SCHULZ, orthogonalized
@@ -118,12 +119,6 @@ def group_updates(params, **kwargs):
     return updates, grads
 
 
-def at(tree, path):
-    for name in path:
-        tree = tree[name]
-    return tree
-
-
 UPDATE_SEEDS = 8
 """Check 1's declared seeds for a group's update against optax's transform on the parameter alone
 (`seeds_for`)."""
@@ -139,12 +134,12 @@ def assert_updates_as(solver, reference, params, paths, label, *, flatten=None, 
 
     def dew(params, grads):
         updates, _ = solver.update(grads, solver.init(params), params)
-        return [shape(path, at(updates, path)) for path in paths]
+        return [shape(path, node(updates, path)) for path in paths]
 
     def alone(params, grads):
         steps = []
         for path in paths:
-            grad, param = shape(path, at(grads, path)), shape(path, at(params, path))
+            grad, param = shape(path, node(grads, path)), shape(path, node(params, path))
             steps.append(reference.update(grad, reference.init(param), param)[0])
         return steps
 
@@ -479,10 +474,10 @@ def test_weight_decay_spares_the_biases_and_the_norms_unless_a_group_claims_them
     spared, grouped = decay_step(), decay_step(param_groups=(ParamGroup('all', ('*',)),))
     for path in [('output', 'final_norm', 'scale'), ('output', 'final_norm', 'bias'),
                  ('dit_block_0', 'attention', 'to_q', 'bias'), ('dit_block_0', 'mlp', 'up_proj', 'bias')]:
-        assert not np.any(at(spared, path)) and np.all(at(grouped, path)), path
+        assert not np.any(node(spared, path)) and np.all(node(grouped, path)), path
     for path in [('dit_block_0', 'attention', 'to_q', 'kernel'), ('embed', 'patch_embed', 'Conv_0', 'kernel'),
                  ('output', 'final_proj', 'kernel')]:
-        np.testing.assert_array_equal(at(spared, path), at(grouped, path), err_msg=str(path))
+        np.testing.assert_array_equal(node(spared, path), node(grouped, path), err_msg=str(path))
 
 
 def test_muon_takes_qwen35s_hidden_matrices_and_adamw_its_filters_vectors_and_lookups():
@@ -545,7 +540,7 @@ def test_both_groups_step_with_the_one_schedule():
             state, taken = solver.init(params), []
             for step in range(5):
                 updates, state = solver.update(grads, state, params)
-                taken += [scale(step) * at(updates, path) for path in paths]
+                taken += [scale(step) * node(updates, path) for path in paths]
             return taken
         return walked
 
@@ -567,7 +562,7 @@ def test_an_expert_stack_is_orthogonalized_one_expert_at_a_time():
     params = {'params': {'layers_0': {'mlp': {'experts': {'gate_proj': {
         'kernel': jnp.zeros((experts, embed, mlp))}}}}}}
     path = ('params', 'layers_0', 'mlp', 'experts', 'gate_proj', 'kernel')
-    spec = at(muon_weight_dimension_numbers(params), path)
+    spec = node(muon_weight_dimension_numbers(params), path)
     assert spec.reduction_axis == (1,) and spec.output_axis == (2,)
 
     assert_updates_as(muon_solver(), ExpertByExpert(optax.contrib.muon(LR)), params, [path],
@@ -638,9 +633,9 @@ def test_a_matrix_declared_with_no_axis_named_is_orthogonalized_as_one_matrix():
     path = ('params', 'layers_0', 'altup', 'prediction_coefs', 'kernel')
     updates, grads = group_updates(params)
     reference = optax.contrib.muon(LR)
-    one = {'kernel': at(grads, path)}
+    one = {'kernel': node(grads, path)}
     expected, _ = reference.update(one, reference.init(one), one)
-    np.testing.assert_array_equal(np.asarray(at(updates, path)), np.asarray(expected['kernel']))
+    np.testing.assert_array_equal(np.asarray(node(updates, path)), np.asarray(expected['kernel']))
 
 
 def test_the_router_gate_takes_the_adamw_update():
@@ -652,7 +647,7 @@ def test_the_router_gate_takes_the_adamw_update():
     params = {'params': {'layers_0': {'mlp': {'gate': {
         'kernel': jnp.zeros((8, 4))}}}}}
     path = ('params', 'layers_0', 'mlp', 'gate', 'kernel')
-    assert at(muon_weight_dimension_numbers(params), path) is None
+    assert node(muon_weight_dimension_numbers(params), path) is None
 
     assert_updates_as(muon_solver(), optax.adamw(LR, nesterov=True, weight_decay=0.0), params, [path],
                       "the router gate")
