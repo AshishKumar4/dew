@@ -526,7 +526,7 @@ class DecisionObjective(Objective[Ratio | Weighted]):
     def served_groups(self, variables: Variables) -> tuple[ProjectionGroup, ...]:
         """The backbone's projection groups a served task packs (`Decide._served`), their paths from
         the `params` root: what a checkpoint holds packed where its run trained a loaded task's packed
-        tree (mains 1385b203c up to ledger 2299's fix), which a resume splits back
+        tree (mains 947ac9262 up to ledger 2299's fix), which a resume splits back
         (`dew.checkpoints`). Carried to 1.0, when it is deleted (ledger 1552)."""
         backbone = part(thaw(variables), "backbone")
         return tuple(dataclasses.replace(group, path=("backbone", *group.path))

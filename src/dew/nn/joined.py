@@ -81,10 +81,10 @@ def join_case(projections: Sequence[nn.Module]) -> JoinCase:
 
 
 JOINED_FASTER = {
-    'gate_up': {'sm80': "119d78a01: Qwen3.5-0.8B's packed step, 24,576 tokens, one 1024 -> 7168 GEMM for "
+    'gate_up': {'sm80': "dbf402f36: Qwen3.5-0.8B's packed step, 24,576 tokens, one 1024 -> 7168 GEMM for "
                         "two 1024 -> 3584 ones, 0.36 ms a layer less on an A100 80GB (forward 1.67 -> 1.54, "
                         "input gradient 1.55 -> 1.49, weight gradient 1.70 -> 1.51 ms); none on an H100"},
-    'delta_gates': dict.fromkeys(('sm80', 'sm90'), "279bd19bc: a gated delta net's b and a, 24,576 tokens, "
+    'delta_gates': dict.fromkeys(('sm80', 'sm90'), "e5198da4e: a gated delta net's b and a, 24,576 tokens, "
                                                    "forward and backward 5.44 -> 5.29 ms on an A100 40GB and "
                                                    "2.006 -> 1.945 on an H100"),
 }

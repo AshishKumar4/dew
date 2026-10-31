@@ -10,6 +10,7 @@ import numpy as np
 import optax
 from flax import linen as nn
 from interop_support import scaled_gap
+from model_support import moved
 from reference_error import as_given
 
 from dew.artifacts import Representations
@@ -226,12 +227,7 @@ def moved_weights(variables):
     host = jax.tree.map(np.asarray, variables)
 
     def draw(seed):
-        keys = iter(jax.random.split(jax.random.key(seed), len(jax.tree.leaves(host["params"]))))
-
-        def moved_leaf(leaf):
-            return (leaf + 0.02 * np.asarray(jax.random.normal(next(keys), leaf.shape))).astype(leaf.dtype)
-
-        return ({**host, "params": jax.tree.map(moved_leaf, host["params"])},)
+        return ({**host, "params": moved(host["params"], jax.random.key(seed), 0.02)},)
 
     return draw
 

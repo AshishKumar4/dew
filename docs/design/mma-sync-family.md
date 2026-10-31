@@ -18,16 +18,16 @@ copy transport by compute capability, not by the MMA family (`pipeline.py:331`, 
 only below 9.0. So sm120 takes the TMA path, where `emit_pipeline` keeps refusing collective specs. An
 sm120 mma.sync bundle is a separate item with its own compile gate, not this round's.
 
-Why: R7 (980286df9) measured the one-warpgroup Mosaic mma.sync forward at 1.24x Triton's time (geomean, 1/18
+Why: R7 (652f75a9d) measured the one-warpgroup Mosaic mma.sync forward at 1.24x Triton's time (geomean, 1/18
 rows within 1.10). The best kernels for these rows run eight warps: CUTLASS's sm80 default is 128x256x64 with 3
 stages and 64x64 warp tiles, and cuBLASLt's A100 choice (PROF1) matches it. mma.sync takes no hooks and no dW
 today (`grouped_matmul.py:679`; `MosaicTgmm._families` is wgmma-only).
 
 ## 2. What exists, and what JAX already ships
 
-J (c5e14d67d): `Mma.walk` is `plgpu.emit_pipeline` with `grid=(hi - lo,)`, one call per segment and one
+J (aa3936052): `Mma.walk` is `plgpu.emit_pipeline` with `grid=(hi - lo,)`, one call per segment and one
 consumer warpgroup.
-- Commit 490f7a39d had replaced it with Dew's own cp.async ring. That ring waited for `ahead x streams` groups
+- Commit 7e9ed2c8a had replaced it with Dew's own cp.async ring. That ring waited for `ahead x streams` groups
   before issuing the step's next copy, so a step could read a slot whose copy was still in flight
   (`wait_gmem_to_smem(n)` leaves n groups pending).
 - The ring was reverted, and so was the two-warpgroup walk built on it (183c82b93, 5a7971e37).
@@ -51,7 +51,7 @@ JAX's `plgpu.emit_pipeline`, at 0.11.2 and at 0.12 (pyjax012 `jax/_src/pallas/mo
 Bible §1 and the owner: integrate JAX's machinery where it is as good or better, and fix its gaps in the
 fork.
 
-1. **mma.sync walks through `emit_pipeline`** (J, c5e14d67d). This means one call per segment, a dynamic grid,
+1. **mma.sync walks through `emit_pipeline`** (J, aa3936052). This means one call per segment, a dynamic grid,
    and the derived stages as `max_concurrent_steps`. A walk's segments each drain. GEMM walks have one segment
    and the recurrence's have one a document range. The drain's cost is measured in this round (§8).
 2. **The fork gives `emit_pipeline`'s cp.async path collective specs** (JAX fork, then upstream). For a

@@ -81,6 +81,7 @@ from dew.distributed.placement import (
     placed_bytes,
     placed_shapes,
 )
+from dew.held_updates import waiting
 from dew.inputs import Field, InputSpec
 from dew.mesh import SEQUENCE_AXIS, STAGE_AXIS, TENSOR_AXIS, LayoutRefused, LogicalAxes
 from dew.nn.flops import MissingFlopsCount
@@ -111,16 +112,8 @@ from dew.optim import held_rates, learning_rate, scaled_rates, settable_rates, w
 from dew.state import MODEL_STATE, Accumulation, TrainState, apart, drawn_in, kept_window, together
 from dew.telemetry import profile as telemetry_profile
 from dew.telemetry.instrumentation import StepFlops
-from dew.telemetry.profile import region
-from dew.telemetry.records import (
-    AxisLink,
-    CheckpointRequested,
-    FitEnded,
-    FitStarted,
-    ProfileWindow as ProfileWindowRecord,
-    Record,
-    StepCompiled,
-)
+from dew.telemetry.profile import exported as telemetry_exported, region
+from dew.telemetry.records import AxisLink, CheckpointRequested, FitEnded, FitStarted, Record, StepCompiled
 from dew.training._fit import (
     Emptied,
     FitPlan,
@@ -139,7 +132,7 @@ from dew.training._fit import (
     pooled,
     pooled_first,
     pooled_read,
-    refuse_unclocked,
+    restored,
     stage_reached,
     unrecorded_parts,
     validation_read,
@@ -202,7 +195,7 @@ from dew.training.planning import (
     splits,
     whole_step,
 )
-from dew.training.profiling import ProfileWindow, owned_capture, pgle_runs, stop_capture
+from dew.training.profiling import ProfileWindow, owned_capture, pgle_runs, reported_window, stop_capture
 from dew.training.rollout import Rollout, _branched, _reported, _rollout_metrics, rolled_out
 from dew.training.rungs import keep_rung, plan_flops, recorded_launches, recorded_rung
 from dew.training.runtime import Preempted, PreemptionNotice, ready_process
@@ -304,6 +297,7 @@ class Trainer(Generic[Loss, Effects]):
         `param_dtype` (`dew.state.drawn_in`); None keeps each module's own.
         `inspection` names what the run watches at its sampled steps (`dew.training.inspection`).
         """
+        layout = objective.placement(layout)  # as its models place their trees (a tier-3 plan, ledger 2777)
         whole = read_whole(accumulation, split, step, layout, rollout, mesh)
         self.objective = objective
         built = isinstance(optimizer, optax.GradientTransformation)
@@ -436,7 +430,7 @@ class Trainer(Generic[Loss, Effects]):
             raise ValueError(
                 f"the objective's tree has no params collection, only {sorted(params)}; "
                 "the optimizer moves params and treats every other collection as state")
-        ema = self.objective.ema
+        ema, opt_state = self.objective.ema, self._boxed_init(initialized, params["params"])
         return TrainState(
             step=jnp.zeros((), jnp.int32),
             microstep=jnp.zeros((), jnp.int32),
@@ -446,13 +440,13 @@ class Trainer(Generic[Loss, Effects]):
                 lambda leaf: jnp.array(leaf, copy=True), self._loss_scale),
             window_size=jnp.asarray(self.accumulation, jnp.int32),
             variables=params,
-            opt_state=self._boxed_init(initialized, params["params"]),
+            opt_state=opt_state,
             # The average starts equal to the parameters but as its own buffers: the step donates
             # the state, and a buffer can be donated once.
             ema=None if ema is None else jax.tree.map(jnp.copy, select(params, ema.select)),
             key=run_key,
             consumed=None if self._examples is None else jnp.zeros((), jnp.int32),
-        )
+            deferred=waiting(opt_state))
 
     @property
     def key(self) -> jax.Array:
@@ -681,7 +675,7 @@ class Trainer(Generic[Loss, Effects]):
         share = DataPartition.of(self.device_mesh) if positioned else None
         state, position = checkpoints.restore(placed_shapes(abstract, shardings), resume, share=share,
                                               served=self.objective.served_groups(abstract.variables))
-        refuse_unclocked(state, resume, self._examples)
+        state = restored(state, resume, self._examples)
         if self._config is not None:
             # The rate this run configures, not the one its checkpoint holds.
             state = dataclasses.replace(state, opt_state=with_rates(state.opt_state, self._config.rates()))
@@ -1557,8 +1551,10 @@ class Trainer(Generic[Loss, Effects]):
         # A run's last log is written at its cleanup, a failed run's only where no write waits on a step
         # its peers may never finish (`LogWriter.raise_failure`).
         unread = functools.partial(self._read_taken, run, agree=False)
+        # This rank's window's export alone: a failed one fails every rank at `_reported_outcome`'s agreement.
+        exported = None if profile is None else functools.partial(telemetry_exported, profile.directory)
         cleanups = (("Training log", unread), ("Log writer", run.writer.close), ("Training iterator", close),
-                    ("Profiler", stop_trace),
+                    ("Profiler", stop_trace), ("Profile export", exported),
                     ("Checkpoint wait", None if checkpoints is None else checkpoints.wait),
                     ("Display", self._display.close))
         try:
@@ -2368,6 +2364,7 @@ class Trainer(Generic[Loss, Effects]):
         except BaseException as failure:
             if error is None:
                 error = failure
+        error = reported_window(self._report, self._display.note, self.profile, run.profiled, error)
         if error is None:
             def report_goodput() -> None:
                 if jax.process_index() == 0:
@@ -2493,8 +2490,9 @@ class Trainer(Generic[Loss, Effects]):
     # ------------------------------------------------------------------
 
     def _stop_trace(self, run: FitRun, profile: ProfileWindow, profiler: Profiler) -> None:
-        """Stop the window's owned capture (`stop_capture`), then report it on process zero."""
+        """Stop the window's owned capture (`stop_capture`), its reports exported beside the steps after
+        it until the run's cleanup waits for them and its outcome reports the window
+        (`_reported_outcome`)."""
         stop_capture(profiler, run.loss)
-        self._report(ProfileWindowRecord(profile.directory, run.traced), run.current)
-        agreed("profile announcement", lambda: self._display.note(
-            f"Wrote profile for {run.traced} steps to {profile.directory}"))
+        run.profiled = (run.traced, run.current)
+

@@ -296,6 +296,13 @@ def _last_hidden_state(model, features, *, key: str):
     return model(**{key: features}).last_hidden_state
 
 
+_AUDIO_FILES = ("config.json", "config.*.json", "preprocessor_config.json", "processor_config.json")
+"""The files an audio tower's configuration and feature extractor are read from (transformers'
+`CONFIG_NAME` and the versioned configurations it names, of which `PreTrainedConfig.get_config_dict`
+reads one; `FEATURE_EXTRACTOR_NAME`; and `PROCESSOR_NAME`, whose nested extractor settings
+`FeatureExtractionMixin.get_feature_extractor_dict` reads first)."""
+
+
 @dataclass(frozen=True, eq=False)
 class HFAudio(ConditionEncoder[AudioRow, TextContext]):
     """Encodes audio as a transformers model's last hidden state, using the checkpoint's feature extractor.
@@ -326,15 +333,21 @@ class HFAudio(ConditionEncoder[AudioRow, TextContext]):
     module: JittableModule
     params: Variables
     extractor: FeatureExtractor
+    files: Mapping[str, object]
+    """The checkpoint's configuration and feature-extractor files the tower and `extractor` were read from,
+    hashed (`dew.data.text.pin_files`), which its identity holds (`dependencies`)."""
     dtype: Dtype | None = None
     param_dtype: str = "float32"
+    revision: str | None = None
+    """The checkpoint's git revision, recorded so a rebuild reads the same weights and extractor."""
     parameter_collections: ClassVar[tuple[str, ...] | None] = ("params",)
     reads_captions: ClassVar[bool] = False
 
     @classmethod
     def from_pretrained(cls, checkpoint: str = "facebook/wav2vec2-base-960h", *, seconds: float = 1.0,
-                        dtype=None, param_dtype: str = "float32",
+                        dtype=None, param_dtype: str = "float32", revision: str | None = None,
                         params: Variables | None = None) -> HFAudio:
+        from dew.data.text import pin_files
         from dew.interop.pickles import host_view
         from dew.interop.torchax_fallback import INSTALL
 
@@ -347,13 +360,18 @@ class HFAudio(ConditionEncoder[AudioRow, TextContext]):
             raise ImportError(
                 f"hf_audio runs transformers' audio model through torchax: {INSTALL}"
             ) from error
+        # The configuration and extractor read from one commit's files, whose hashes the identity holds,
+        # and the weights from that commit.
+        hub = revision is not None and not Path(checkpoint).is_dir()
+        files, directory = pin_files(f"{checkpoint}@{revision}" if hub else checkpoint, _AUDIO_FILES)
         if params is None:
-            model = AutoModel.from_pretrained(checkpoint, dtype=getattr(torch, param_dtype))
+            model = AutoModel.from_pretrained(checkpoint, revision=files["revision"],
+                                              dtype=getattr(torch, param_dtype))
         else:
             # Supplied weights replace every tensor, so the tower is built
             # without storage.
             with torch.device("meta"):
-                model = AutoModel.from_config(AutoConfig.from_pretrained(checkpoint))
+                model = AutoModel.from_config(AutoConfig.from_pretrained(directory))
         if model.config.is_encoder_decoder:
             model = model.get_encoder()
         model.eval()
@@ -369,8 +387,8 @@ class HFAudio(ConditionEncoder[AudioRow, TextContext]):
         # Torch's copies are no longer read: the forward runs on the arrays above.
         torch.nn.Module.to(model, "meta")
         return cls(checkpoint=checkpoint, seconds=seconds, module=module, params=params,
-                   extractor=AutoFeatureExtractor.from_pretrained(checkpoint), dtype=resolve_dtype(dtype),
-                   param_dtype=param_dtype)
+                   extractor=AutoFeatureExtractor.from_pretrained(directory), files=files,
+                   dtype=resolve_dtype(dtype), param_dtype=param_dtype, revision=revision)
 
     @property
     def input_name(self) -> str:
@@ -430,7 +448,12 @@ class HFAudio(ConditionEncoder[AudioRow, TextContext]):
 
     def recorded_fields(self) -> dict:
         return {"checkpoint": self.checkpoint, "seconds": self.seconds,
-                "dtype": dtype_name(self.dtype), "param_dtype": self.param_dtype}
+                "dtype": dtype_name(self.dtype), "param_dtype": self.param_dtype, "revision": self.revision}
+
+    def dependencies(self) -> Mapping[str, object]:
+        """The encoder's fields and the hashes of the configuration and extractor files it reads, so an
+        extractor that moved under an unpinned checkpoint name changes the identity too."""
+        return {**super().dependencies(), "files": self.files}
 
 
 __all__ = ["CLIPText", "CharTable", "ConditionEncoder", "HFAudio", "T5Text"]

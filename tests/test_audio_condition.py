@@ -109,6 +109,62 @@ def test_an_audio_condition_rebuilt_from_its_record_encodes_the_same(towers):
                                   np.asarray(condition.encoder.encode(saved, tokens).hidden))
 
 
+@pytest.mark.parametrize("held", ["preprocessor_config.json", "processor_config.json"])
+def test_an_audio_towers_identity_holds_the_extractor_files_it_reads(towers, tmp_path, held):
+    """The tower's identity (`dependencies`, which keys the audio a run's data plan encodes) holds the
+    hashes of the configuration and feature-extractor files it read, the extractor's settings in their
+    own file or nested in a processor's, which transformers reads first: a checkpoint whose extractor no
+    longer normalizes encodes the same clip to other features, and its identity moves with them (row
+    1871)."""
+    import json
+    import shutil
+
+    directory = tmp_path / "wav2vec2"
+    shutil.copytree(towers / "wav2vec2", directory)
+    settings = json.loads((directory / "preprocessor_config.json").read_text())
+    assert settings["do_normalize"]
+
+    def holding(stated):
+        (directory / held).write_text(json.dumps(stated if held == "preprocessor_config.json"
+                                                 else {"feature_extractor": stated}))
+
+    def loaded():
+        encoder = HFAudio.from_pretrained(str(directory), seconds=0.25)
+        return encoder.tokenize([_tone(330, 0.25)])["input_values"], encoder.dependencies()
+
+    holding(settings)
+    features, recorded = loaded()
+    holding({**settings, "do_normalize": False})
+    moved_features, moved = loaded()
+    assert not np.array_equal(features, moved_features)
+    assert moved != recorded
+
+
+def test_an_audio_towers_identity_holds_the_versioned_configuration_its_configuration_names(towers, tmp_path):
+    """A checkpoint whose configuration names versioned files (`configuration_files`), of which
+    transformers reads the newest it supports, holds that file's hash in the tower's identity: a setting
+    moved there, the configuration the tower reads moves, and its identity with it (row 1871)."""
+    import json
+    import shutil
+
+    from transformers import AutoConfig
+
+    directory = tmp_path / "wav2vec2"
+    shutil.copytree(towers / "wav2vec2", directory)
+    stated = json.loads((directory / "config.json").read_text())
+    named = {**stated, "configuration_files": ["config.4.0.0.json"]}
+    (directory / "config.json").write_text(json.dumps(named))
+
+    def versioned(epsilon):
+        (directory / "config.4.0.0.json").write_text(json.dumps({**stated, "layer_norm_eps": epsilon}))
+        return HFAudio.from_pretrained(str(directory), seconds=0.25).dependencies()
+
+    recorded = versioned(1e-5)
+    moved = versioned(1e-3)
+    assert AutoConfig.from_pretrained(directory).layer_norm_eps == 1e-3
+    assert moved != recorded
+
+
 def _clip(path, hertz, frames=20, side=16):
     """A lossless clip of flat frames whose brightness and audio pitch follow
     `hertz`. AVI, where ffmpeg's seek into the PCM track is sample-exact; in
