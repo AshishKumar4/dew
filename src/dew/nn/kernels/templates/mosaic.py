@@ -436,6 +436,18 @@ UNSWIZZLED = 0
 row (a scan's tokens): staged plain, no tiling or swizzle, which Mosaic GPU indexes at any row."""
 
 
+def widest_swizzle(dtype, columns: int) -> int:
+    """The widest swizzle, in bytes, a row of `columns` elements of `dtype` fills (`plgpu.find_swizzle`): the
+    one a block staged at its rows' width takes, as layout inference and jax's Ampere examples stage it."""
+    return plgpu.find_swizzle(columns * jnp.dtype(dtype).itemsize * 8)
+
+
+def swizzle_columns(dtype, swizzle: int) -> int:
+    """The elements of `dtype` a row of a `swizzle`-byte swizzle spans: a swizzled tile's width, so the least
+    slice a load of a block swizzled along that axis takes."""
+    return swizzle // jnp.dtype(dtype).itemsize
+
+
 def swizzle_for(dtype, *contractions: int) -> int:
     """The widest swizzle, in bytes, a shared-memory block of `dtype` takes whose group of elements (the
     swizzle over the itemsize: Mosaic's wgmma issues a product's contraction in groups of it, one swizzle
@@ -444,9 +456,8 @@ def swizzle_for(dtype, *contractions: int) -> int:
     operands so stages them at 64 bytes, at which its partner block must stage too (K32SWZ3: S = K Qᵀ
     over a 128-wide head lowers with both at 64 and both at 128, not mixed; dV += P dO over 32 rows lowers
     at 64, not 128)."""
-    size = jnp.dtype(dtype).itemsize
     return next((swizzle for swizzle in (SWIZZLE_BYTES, SWIZZLE_BYTES // 2, NARROWEST_SWIZZLE_BYTES)
-                 if all(contraction % (swizzle // size) == 0 for contraction in contractions)),
+                 if all(contraction % swizzle_columns(dtype, swizzle) == 0 for contraction in contractions)),
                 NARROWEST_SWIZZLE_BYTES)
 
 
@@ -458,7 +469,7 @@ uninstantiable)."""
 
 def swizzle_transforms(dtype, swizzle: int) -> tuple:
     """A shared-memory tile's transforms at `swizzle` bytes: 8-row tiles a swizzle's row wide, swizzled."""
-    return TILING((8, swizzle // jnp.dtype(dtype).itemsize)), SWIZZLE(swizzle)
+    return TILING((8, swizzle_columns(dtype, swizzle))), SWIZZLE(swizzle)
 
 
 def staged(shape: tuple, dtype, swizzle: int | None = None):
@@ -697,7 +708,7 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
         (`NARROWEST_SWIZZLE_BYTES`), 16 bf16 columns, which both families' products read (wgmma's N in
         eights, mma.sync's n of 8 twice through ldmatrix). A template splitting its columns finer than its
         stores' `column_unit` to fill the multiprocessors (the recurrence's value blocks) steps by it."""
-        return NARROWEST_SWIZZLE_BYTES // jnp.dtype(dtype).itemsize
+        return swizzle_columns(dtype, NARROWEST_SWIZZLE_BYTES)
 
     @property
     @abc.abstractmethod
@@ -969,21 +980,20 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
         return self.full(shape, 0.0)
 
     def full(self, shape: tuple[int, ...], value: float, dtype=jnp.float32) -> jax.Array:
-        """`value` in `dtype` (fp32 unless given) in the accumulator's layout or a row's (`zeros`)."""
-        layout = self.layout if len(shape) == 2 else self.row
-        return plgpu.layout_cast(jnp.full(shape, value, dtype), layout)
+        """`value` in `dtype` (fp32 unless given), a splat whose layout inference takes from its uses (the
+        accumulator's or a row's)."""
+        return jnp.full(shape, value, dtype)
 
     def column_full(self, columns: int, value: float) -> jax.Array:
-        """`value` fp32 in a column's layout, `[columns]`: a tile's per-column state where its rows are its
-        keys (a keys-first walk's maxima and denominators)."""
-        return plgpu.layout_cast(jnp.full((columns,), value, jnp.float32), self.column)
+        """`value` fp32 `[columns]`: a tile's per-column state where its rows are its keys (a keys-first
+        walk's maxima and denominators), a splat inference lays out as its uses read it."""
+        return jnp.full((columns,), value, jnp.float32)
 
-    def iota(self, shape: tuple[int, ...], dimension: int, *, columns: bool = False) -> jax.Array:
-        """Indices along `dimension` of a tile in the accumulator's layout, or a vector's in a row's layout
-        (`zeros`) or, `columns`, a column's (a tile's keys': each of a thread's indices its lane's base and
-        an immediate, no element's index computed from its place in the tile)."""
-        layout = self.layout if len(shape) == 2 else self.column if columns else self.row
-        return plgpu.broadcasted_iota(jnp.int32, shape, dimension, layout=layout)
+    def iota(self, shape: tuple[int, ...], dimension: int) -> jax.Array:
+        """Indices along `dimension` of a tile or a row, laid out by inference from the values they meet. An
+        iota nothing reads fails inference (Mosaic's iota is not pure, so it survives the cast it would
+        have), so a template forms only the indices it reads."""
+        return plgpu.broadcasted_iota(jnp.int32, shape, dimension)
 
     def rows_of(self, ref) -> jax.Array:
         """A row vector read from `ref` (`[rows]`) in a row's layout."""
@@ -1053,10 +1063,10 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
         return resources.consumer_registers(consumers)
 
     def column_unit(self, dtype) -> int:
-        return SWIZZLE_BYTES // jnp.dtype(dtype).itemsize
+        return swizzle_columns(dtype, SWIZZLE_BYTES)
 
     def depths(self, dtype) -> tuple[int, ...]:
-        return (SWIZZLE_BYTES // jnp.dtype(dtype).itemsize,)
+        return (swizzle_columns(dtype, SWIZZLE_BYTES),)
 
     def warpgroups(self, consumers: int) -> int:
         return consumers + 1
