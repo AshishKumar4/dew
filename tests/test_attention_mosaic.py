@@ -349,7 +349,7 @@ def _check_backward(call: str, shape, *, form: str | None, interpret: bool, keys
         return pull(dout)
 
     assert_as_exact(jax.jit(ours), jax.jit(reference), draw, f"mosaic backward {call} {form} {kept.name}",
-                    seeds=SEEDS, terms=_gradient_terms(spans) if kept is template.Kept.OUTPUT else False)
+                    seeds=SEEDS, terms=_gradient_terms(spans))
 
 
 def _gradient_terms(spans: template.KeySpans):
