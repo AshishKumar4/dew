@@ -59,6 +59,12 @@ class Inspection:
     language model's real tokens (`dew.nn.inspection.watched_positions`), one summary a layer in a scanned
     stack and one a microbatch in a pipelined one (`dew.nn.inspection.watching`), logged as
     `inspect/activations/<module path>/<statistic>`, a pipelined layer by its place in the stack."""
+    cotangents: bool = False
+    """Whether a sampled step also summarizes the loss's cotangent at each watched output, over the same
+    positions: its mean, standard deviation, root mean square, non-finite and zero shares (and histogram),
+    from sufficient statistics a probe's gradient carries (`dew.nn.inspection.tapped`), so no tensor of
+    the output's size is kept, logged as `inspect/cotangents/<module path>/<statistic>`. The sampled
+    microbatch's own, its pipeline's microbatches summed; no parameter or update changes with it."""
     histogram: bool = False
     """Whether each summary also holds the share of its magnitudes in each decade
     (`dew.nn.inspection.HISTOGRAM_EDGES`), logged one scalar a bin."""
@@ -66,7 +72,7 @@ class Inspection:
     @property
     def watched(self) -> Watched | None:
         """The activations a sampled step watches, where `modules` names any."""
-        return Watched(self.modules, self.histogram) if self.modules else None
+        return Watched(self.modules, self.histogram, self.cotangents) if self.modules else None
 
     def __post_init__(self):
         if self.every < 1:
@@ -75,6 +81,9 @@ class Inspection:
         if unknown:
             raise ValueError(f"an inspection's targets are params, grads, updates and deltas, not "
                              f"{sorted(unknown)}")
+        if self.cotangents and not self.modules:
+            raise ValueError("an inspection summarizes the cotangents of the modules it watches; name them "
+                             "(modules)")
 
     def samples(self, step: int, accumulation: int) -> bool:
         """Whether the step that ends at `step` is sampled: each step of every `every`-th window of

@@ -27,10 +27,10 @@ from flax.training import dynamic_scale as dynamic_scale_lib
 from typing_extensions import TypeVar
 
 from dew.averaging import ema_update
-from dew.batch import EXAMPLE_ROWS, Batch, Variables, dicts, merge
+from dew.batch import EXAMPLE_ROWS, Batch, Variables, dicts, leaves_by_path, merge
 from dew.data.dataset import rows_of
 from dew.held_updates import holds_back, input_taken, refuse_untold, update_applied
-from dew.nn.inspection import Watched, flattened
+from dew.nn.inspection import PROBES, Watched, cotangent_summaries, discovering, flattened, probes_of
 from dew.nn.kernels.options import compiler_options
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import rows_spec
@@ -161,6 +161,30 @@ def outcome(current: TrainState, advanced: TrainState, loss: jax.Array, aux: Aux
     clock = None if current.consumed is None else (current.consumed + consumed).astype(current.consumed.dtype)
     return (dataclasses.replace(advanced, step=current.step + stepped, consumed=clock), loss, metrics,
             jnp.isfinite(loss), advanced.microstep > current.microstep, committed)
+
+
+def probed_loss(objective: Objective, variables: Variables, batch: Batch, step: Step):
+    """The objective's loss statistics with its parameters and its watched outputs' cotangent probes
+    (`dew.nn.inspection.tapped`), their pullback giving the parameters' gradient and the probes', and the
+    loss's aux. The probes are laid out as the objective's model calls nest their modules, which a trace
+    of its loss that discovers them (`discovering`) sows, nothing computed; a probe no model call reads,
+    its collection dropped on the way, is refused."""
+    with discovering():
+        _, discovered = jax.eval_shape(lambda: objective._loss(variables, batch, step))
+    probes = probes_of(discovered.inspected or {})
+    if not probes:
+        raise ValueError("no watched module's output reaches the objective's loss for its cotangent to be "
+                         "summarized; name modules its model calls run (Inspection.modules)")
+
+    def loss(trainable, probes):
+        return objective._loss({**variables, "params": trainable, PROBES: probes}, batch, step)
+    stats, back, aux = jax.vjp(loss, variables["params"], probes, has_aux=True)
+    unread = sorted(set(leaves_by_path(probes)) - set(leaves_by_path(probes_of(aux.inspected or {}))))
+    if unread:
+        raise ValueError(f"the objective's model calls do not pass the step's cotangent probes "
+                         f"(variables[{PROBES!r}]) to the watched modules at {unread}; pass every "
+                         f"collection of the variables the objective is given through to its model")
+    return stats, back, aux
 
 
 def watched_activations(watched: Watched, aux: Aux) -> dict[str, jax.Array]:
@@ -300,6 +324,9 @@ class Realization(Generic[Loss, Effects]):
     stats: Loss
     aux: Aux[Effects]
     pullback: Callable[[Loss], Variables]
+    probed: Callable[[Loss], tuple[Variables, Variables]] | None = None
+    """Where the step summarizes its watched outputs' cotangents (`Watched.cotangents`), the pullback
+    that also gives its probes' gradient (`dew.nn.inspection.tapped`), one backward for both."""
 
 
 @struct.dataclass
@@ -461,10 +488,14 @@ class Transaction:
         parameter tree where the state lives. `HostExecution.realize` is the
         other one, and `step` takes either.
         """
-        def loss(trainable):
-            return self.objective._loss({**variables, "params": trainable}, batch, step_info)
-        stats, back, aux = jax.vjp(loss, variables["params"], has_aux=True)
-        return Realization(stats, aux, lambda cotangent: back(cotangent)[0])
+        watched = step_info.watched
+        if watched is None or not watched.cotangents:
+            def loss(trainable):
+                return self.objective._loss({**variables, "params": trainable}, batch, step_info)
+            stats, back, aux = jax.vjp(loss, variables["params"], has_aux=True)
+            return Realization(stats, aux, lambda cotangent: back(cotangent)[0])
+        stats, back, aux = probed_loss(self.objective, variables, batch, step_info)
+        return Realization(stats, aux, lambda cotangent: back(cotangent)[0], back)
 
     def local_reduction(self, stats, factor):
         """Reduce one microbatch's statistics to its loss and its cotangent.
@@ -683,7 +714,19 @@ class Transaction:
         unapplied = jax.tree.map(jnp.zeros_like, jax.eval_shape(apply, current)[1])
         return *_only_when(native_finite, apply, lambda x: (x, unapplied), current), native_finite, norm
 
-    def finish_attempt(self, state, batch, aux, pending, gradient, attempt, tokens):
+    def watched_summaries(self, state, aux, probed) -> dict[str, jax.Array]:
+        """A sampled step's watched modules' summaries: their outputs' (`watched_activations`), and with
+        their probes' gradient `probed`, the loss's cotangents there, unscaled by the step's loss scale
+        (`dew.nn.inspection.cotangent_summaries`)."""
+        if self.watched is None:
+            return {}
+        found = watched_activations(self.watched, aux)
+        if probed is None:
+            return found
+        factor = jnp.asarray(1., jnp.float32) if state.scale is None else state.scale.scale
+        return {**found, **cotangent_summaries(probed, factor, self.watched.histogram)}
+
+    def finish_attempt(self, state, batch, aux, pending, gradient, attempt, tokens, probed=None):
         """Commit the window when it is due, then advance the state's clocks.
 
         A rejected attempt costs the same trace as an accepted one. With a
@@ -744,8 +787,7 @@ class Transaction:
                 due, recopied, lambda x: (x, uncommitted, jnp.asarray(a=True), zero),
                 dataclasses.replace(numerical, accumulation=None))
             numerical = dataclasses.replace(numerical, accumulation=previous)
-        if self.watched is not None:
-            inspected = {**inspected, **watched_activations(self.watched, aux)}
+        inspected = {**inspected, **self.watched_summaries(state, aux, probed)}
         finite = finite & native_finite
         if scale is not None:
             accepted = finite & _all_finite((numerical.variables, numerical.opt_state, numerical.ema))
@@ -836,7 +878,9 @@ class Transaction:
             factor = jnp.asarray(1., jnp.float32) if state.scale is None else state.scale.scale
             realized = realize(self.read(state.variables, state.compute), batch, step_info)
             loss, cotangent = reduce(realized.stats, factor)
-            gradient = realized.pullback(cotangent)
+            # A step that summarizes its cotangents takes its probes' gradient from the same backward.
+            gradient, probed = (realized.pullback(cotangent), None) if realized.probed is None else (
+                realized.probed(cotangent))
             if state.compute is None or self.size > 1:
                 gradient = unscale(gradient, factor)
             # Otherwise no loss scale divides it (`Trainer._narrow_copies`),
@@ -902,7 +946,8 @@ class Transaction:
                 # its own gradient is ready.
                 aux, pending, gradient = jax.tree.map(
                     jax.lax.optimization_barrier, (realized.aux, pending, gradient))
-                return finish(self.past(state, gradient), batch, aux, pending, gradient, attempt, tokens)
+                return finish(self.past(state, gradient), batch, aux, pending, gradient, attempt, tokens,
+                              probed)
             moving, held = apart(state)
             advanced, loss, aux, committed = finish(moving, batch, realized.aux, pending, gradient, attempt,
                                                     tokens)
