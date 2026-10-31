@@ -11,6 +11,7 @@ import pickle
 import shutil
 import sys
 import tarfile
+import tempfile
 import threading
 from pathlib import Path
 from uuid import uuid4
@@ -445,8 +446,12 @@ def test_exports_are_committed_and_readable_at_memory_urls(format):
 
 @contextlib.contextmanager
 def export_store(transport: str):
-    """An export root on `transport` and the storage options that reach it: fsspec's memory store, or a
-    bucket on a local S3 server."""
+    """An export root on `transport` and the storage options that reach it: this host's disk, fsspec's
+    memory store, or a bucket on a local S3 server."""
+    if transport == "local":
+        with tempfile.TemporaryDirectory(prefix="dew-export-") as directory:
+            yield str(Path(directory) / "export"), None
+        return
     if transport == "memory":
         yield f"memory://export-{uuid4().hex}", None
         return
@@ -454,7 +459,7 @@ def export_store(transport: str):
         yield f"s3://{bucket}/export", options
 
 
-@pytest.mark.parametrize("transport", ["memory", "s3"])
+@pytest.mark.parametrize("transport", ["local", "memory", "s3"])
 @pytest.mark.parametrize("format", ["parquet", "array_record"])
 @pytest.mark.parametrize("read", ["streamed", "indexed"])
 def test_a_shard_replaced_under_its_exports_manifest_is_refused_where_it_is_read(transport, format, read):
@@ -487,6 +492,11 @@ def test_a_shard_replaced_under_its_exports_manifest_is_refused_where_it_is_read
             filesystem.pipe_file(path, rewritten)
             filesystem.invalidate_cache()
             for source in (Files(root, format=format, storage_options=options), taken):
+                if transport == "local" and source is not taken:
+                    # A fresh source versions this host's files as it fingerprints them, and refuses there.
+                    with pytest.raises(ValueError):
+                        source.fingerprint()
+                    continue
                 assert source.fingerprint() == identity
                 with contextlib.suppress(Replaced):
                     assert rows(source) == list(range(8))
@@ -515,6 +525,65 @@ def test_a_declared_line_file_replaced_under_its_facts_is_refused_where_it_is_re
     root.write(b'{"id":7}\n{"id":1}\n')
     with pytest.raises(Replaced):
         rows()
+    # An offset index provisioned for it reads the declared bytes too.
+    with pytest.raises(Replaced):
+        Files((root.url,), format="jsonl", file_info=facts).provision()
+
+
+def test_a_declared_archive_replaced_under_its_facts_is_refused_where_it_is_read():
+    """A WebDataset archive read under facts its publisher declared (its bytes and digest) is checked
+    where a read opens it: replaced by another valid archive, it is refused, not read under them."""
+    def archive(text: str) -> bytes:
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w") as written:
+            data = text.encode()
+            entry = tarfile.TarInfo("0.txt")
+            entry.size = len(data)
+            written.addfile(entry, io.BytesIO(data))
+        return buffer.getvalue()
+
+    root = Store(f"memory://declared-tar-{uuid4().hex}/data.tar")
+    root.write(archive("held"))
+    facts = {root.url: {"bytes": len(root.read()), "sha256": hashlib.sha256(root.read()).hexdigest()}}
+
+    def rows():
+        files = Files((root.url,), format="webdataset", file_info=facts)
+        return list(files.manifest().reader(files.manifest().shards[0]))
+
+    assert rows() == [{"__key__": "0", "txt": b"held"}]
+    root.write(archive("swap"))
+    with pytest.raises(Replaced):
+        rows()
+
+
+def test_a_token_exports_shard_replaced_under_its_manifest_is_refused_where_it_is_read(tmp_path):
+    """A token export's shard replaced by another of as many documents and tokens, whose lengths index
+    reads alike, is refused where its tokens are read, not read under the manifest's digest."""
+    from dew.data.sources import TokenFiles
+
+    (tmp_path / "held").mkdir()
+    (tmp_path / "other").mkdir()
+    held = export_byte_tokens(tmp_path / "held", ("first", "next"), "--format", "array_record")
+    other = export_byte_tokens(tmp_path / "other", ("fjrst", "nexy"), "--format", "array_record")
+    taken = TokenFiles(str(held))
+    # Five bytes and an end, four and an end.
+    assert len(taken.tokens[:]) == 11
+    [entry] = json.loads((held / "_dew_manifest.json").read_text())["files"]
+    [swapped] = json.loads((other / "_dew_manifest.json").read_text())["files"]
+    (held / entry["path"]).write_bytes((other / swapped["path"]).read_bytes())
+    with pytest.raises(Replaced):
+        TokenFiles(str(held)).tokens[:]
+
+
+def test_a_declaration_without_a_digest_or_a_version_is_refused_where_it_is_read():
+    """Facts that state a file's size alone hold no read of it to anything: a read of it is refused,
+    where it would read whatever the file holds under them."""
+    root = Store(f"memory://undeclared-{uuid4().hex}/rows.jsonl")
+    root.write(b'{"id":0}\n')
+    source = Files((root.url,), format="jsonl", file_info={root.url: {"bytes": len(root.read())}})
+    manifest = source.manifest()
+    with pytest.raises(ValueError):
+        list(manifest.reader(manifest.shards[0]))
 
 
 def test_a_source_exports_the_records_its_pipeline_exports():
