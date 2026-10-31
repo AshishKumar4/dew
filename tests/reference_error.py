@@ -874,13 +874,47 @@ def _within_draws(examples: list[np.ndarray]) -> np.ndarray:
     return np.concatenate([np.zeros(0), *(ratios - np.median(ratios) for ratios in examples if len(ratios))])
 
 
-EXAMPLE_POWER = ((0.4, 1024), (0.6, 2048), (0.8, 8192))
+EXAMPLE_POWER = ((0.4, 1024), (0.6, 2048), (0.8, 8192), (0.9, 16384))
 """The examples a site's leaf needs, by its examples' spread about their draws' medians (`_within_draws`,
 their standard deviation), for the examples' tail test (`_tail_sign`) to refuse Dew three times the
 reference's RMS error on a fifth of each draw's examples in at least 95% of runs, measured with the gate's
 own test (/mnt/local/dew/retained/gate/check1-examples-power.txt; ledger 2469): a leaf whose examples
 spread wider than the last, or that holds fewer than its spread's count (interpolated in its log), is not
 passed by its examples (`_typical_status`)."""
+
+
+SCALAR_NULL_QUANTILE = 0.9
+"""The share of a scalar leaf's examples (one value each) under the known null's quantile the scalar tail test
+reads above (`_scalar_tail`)."""
+
+SCALAR_EXAMPLES = 4096
+"""The examples a scalar leaf's tail test needs: at it, with the gate's own `_staged`, Dew three times off on
+a fifth of its examples passed by them in no run of 100, at 32 or 16 examples a draw, and equally exact arms
+in every run at 32 (/mnt/local/dew/retained/gate/check1-scalar-sim.txt). A scalar leaf's draws' medians
+spread about 0.35 at 32 examples a draw and 0.49 at 16, past QUALIFYING_SPREAD: it wants 32."""
+
+
+def _scalar_null_quantile() -> float:
+    """The known null's SCALAR_NULL_QUANTILE quantile: a scalar example's log RMS ratio under equal
+    exactness, each arm's rounding of it one normal (the central limit over the terms it sums), so
+    log|N1| - log|N2|, its spread pi/2 whatever their scale; drawn once, many millions."""
+    rng = np.random.default_rng(0)
+    null = np.log(np.abs(rng.standard_normal(4_000_000))) - np.log(np.abs(rng.standard_normal(4_000_000)))
+    return float(np.quantile(null, SCALAR_NULL_QUANTILE))
+
+
+def _scalar_tail(examples: list[np.ndarray]) -> float:
+    """The scalar tail test's p-value: of a scalar leaf's examples' log ratios about their median over every
+    draw (a draw's own median, of a few dozen, too noisy a centre against a fault on some of them), the count
+    above the known null's quantile (`_scalar_null_quantile`) against Binomial(n, 1 - SCALAR_NULL_QUANTILE).
+    The null is exact for a scalar, each arm's rounding a normal and its per-example ratio cancelling its
+    scale: the sign test, distribution-free, cannot see a fault through its pi/2 spread within MOST_SEEDS,
+    and this test, the null's own quantile, does."""
+    from scipy import stats
+
+    every = np.concatenate([np.zeros(0), *examples])
+    above = int(np.sum(every - np.median(every) > _scalar_null_quantile()))
+    return float(stats.binom.sf(above - 1, len(every), 1 - SCALAR_NULL_QUANTILE))
 
 
 def _examples_needed(spread: float) -> float:
@@ -903,9 +937,25 @@ def _geometric(ratios: np.ndarray, tails: tuple[float, float]) -> tuple[float, f
             float(np.exp(np.quantile(means, 1 - tails[1]))))
 
 
+def _examples_refuse(examples: list[np.ndarray], scalar: bool, tail: float = LOWER_TAIL) -> str | None:
+    """Why a leaf's examples do not pass it, or None: their ratios about their draws' medians
+    (`_within_draws`) too few for the tail test at their spread (`EXAMPLE_POWER`; SCALAR_EXAMPLES for a
+    `scalar` leaf, one value an example), or their tail above the medians (`_tail_sign`; `_scalar_tail`,
+    the known null's, for a scalar leaf)."""
+    within = _within_draws(examples)
+    needed = SCALAR_EXAMPLES if scalar else _examples_needed(float(np.std(within)))
+    if len(within) < needed:
+        return (f"its {len(within)} examples spread {float(np.std(within)):.2f} about their draws' medians, "
+                f"where the tail test needs {needed:.0f}")
+    if (found := _scalar_tail(examples) if scalar else _tail_sign(within)) < tail:
+        return f"its examples' tail lies above their median (p {found:.1e})"
+    return None
+
+
 def _typical_status(mine: np.ndarray, theirs: np.ndarray,
                     tails: tuple[float, float] = (LOWER_TAIL, UPPER_TAIL),
-                    examples: list[np.ndarray] | None = None) -> tuple[str, float, float, float, str]:
+                    examples: list[np.ndarray] | None = None,
+                    scalar: bool = False) -> tuple[str, float, float, float, str]:
     """A leaf's verdict by its draws' paired ratios, asked only where its pooled ratio leaves it
     inconclusive: "pass" where the typical draw's ratio passes (the draws' geometric mean, its interval
     `_status`), the draws' log ratios spread no wider than QUALIFYING_SPREAD (where the tail test sees a
@@ -914,7 +964,8 @@ def _typical_status(mine: np.ndarray, theirs: np.ndarray,
     examples (`examples`, each seed's per-example log ratios) each draw's ratio is its examples' median
     (`_example_medians`), and the examples' own tail about their draws' medians is asked too
     (`_within_draws`), so a fault on some of each draw's examples is refused. A pass certifies the typical
-    draw's (or example's) ratio under PARITY and no fault the tail tests see at that spread."""
+    draw's (or example's) ratio under PARITY and no fault the tail tests see at that spread; a `scalar` leaf
+    (one value an example) takes the known null's tail test (`_scalar_tail`)."""
     ratios = _log_ratios(mine, theirs) if examples is None else _example_medians(examples)
     if ratios is None or not len(ratios):
         return "inconclusive", float("nan"), float("nan"), float("nan"), "its draws hold no paired ratio"
@@ -927,20 +978,13 @@ def _typical_status(mine: np.ndarray, theirs: np.ndarray,
                 f"sees at")
     if (tail := _tail_sign(ratios)) < tails[0]:
         return "inconclusive", ratio, low, high, f"its draws' tail lies above their median (p {tail:.1e})"
-    if examples is not None:
-        within = _within_draws(examples)
-        if len(within) < (needed := _examples_needed(float(np.std(within)))):
-            return ("inconclusive", ratio, low, high,
-                    f"its {len(within)} examples spread {float(np.std(within)):.2f} about their draws' "
-                    f"medians, where the tail test needs {needed:.0f}")
-        if (tail := _tail_sign(within)) < tails[0]:
-            return ("inconclusive", ratio, low, high,
-                    f"its examples' tail lies above their draws' medians (p {tail:.1e})")
+    if examples is not None and (reason := _examples_refuse(examples, scalar, tails[0])) is not None:
+        return "inconclusive", ratio, low, high, reason
     return "pass", ratio, low, high, ""
 
 
 def _sized(mine: np.ndarray, theirs: np.ndarray, typical: bool = False,
-           examples: list[np.ndarray] | None = None) -> bool:
+           examples: list[np.ndarray] | None = None, scalar: bool = False) -> bool:
     """Whether a paired sizing takes a leaf as sized by these draws, Dew's squared errors `mine` against
     the reference's `theirs`: its pooled ratio's interval resolved (no wider than PARITY), or, with
     `typical` (a leaf the pooled ratio does not size within MOST_SEEDS, `seeds_for`), its typical draw's
@@ -954,11 +998,9 @@ def _sized(mine: np.ndarray, theirs: np.ndarray, typical: bool = False,
     if ratios is None or not len(ratios):
         return False
     _, low, high = _geometric(ratios, (LOWER_TAIL, UPPER_TAIL))
-    within = None if examples is None else _within_draws(examples)
     return (_resolves(low, high) and float(np.std(ratios)) <= QUALIFYING_SPREAD
             and _tail_sign(ratios) >= LOWER_TAIL
-            and (within is None or (len(within) >= _examples_needed(float(np.std(within)))
-                                    and _tail_sign(within) >= LOWER_TAIL)))
+            and (examples is None or _examples_refuse(examples, scalar) is None))
 
 
 def _resolves(low: float, high: float) -> bool:
@@ -1033,6 +1075,10 @@ class _Draws:
         found = [seed[index] for seed in self.examples]
         return None if any(ratios is None for ratios in found) else found
 
+    def scalar(self, index: int) -> bool:
+        """Whether leaf `index` holds one value an example (its width, the values a row, one)."""
+        return self.widths[index] <= 1
+
     def against_larger(self, library: "_Draws", leaves: Sequence[str]) -> "_Draws":
         """These draws judged against the larger of their reference's error and `library`'s, the same
         Dew on the same draws against the library arm (`assert_as_exact`'s `library_fn`), on the
@@ -1052,6 +1098,8 @@ class _Draws:
         zero_rows = [[(theirs if chosen else mine)
                       for mine, theirs, chosen in zip(seed, other, picked, strict=True)]
                      for seed, other, picked in zip(self.zero_rows, library.zero_rows, pick, strict=True)]
+        # A library arm's leaves are judged by their pooled ratio alone: their examples are not Dew's against
+        # one reference.
         return _Draws(self.names, self.mine, np.where(pick, library.theirs, self.theirs), worst, zero_rows,
                       self.finite & (library.finite | ~covered), self.widths)
 
@@ -1677,7 +1725,7 @@ def _judgement(draws: _Draws, label: str, tails: tuple[float, float] = (LOWER_TA
             found = None
             if status == "inconclusive" and contained and typical:
                 # The pooled ratio's sums unresolved: its draws' paired ratios pass it where they qualify.
-                found = _typical_status(a, b, tails, draws.of_examples(index))
+                found = _typical_status(a, b, tails, draws.of_examples(index), draws.scalar(index))
                 status = found[0]
             if status == "inconclusive":
                 unresolved.append(Finding(
@@ -2139,7 +2187,8 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
         stubborn, count = tuple(wide), max(start, FEWEST_SEEDS)
         while count <= most:
             wide = _confirmed(drawn.names, drawn.theirs, count, drawn.mine, typical=stubborn,
-                              examples=drawn.examples)
+                              examples=drawn.examples, scalars=[drawn.scalar(index)
+                                                                for index in range(len(drawn.names))])
             if not wide:
                 return count
             count *= 2
@@ -2156,12 +2205,13 @@ def _leaf_examples(examples: list, start: int, count: int, index: int) -> list[n
 
 
 def _confirmed(names, theirs: np.ndarray, count: int, mine: np.ndarray | None = None,
-               typical: tuple = (), examples: list | None = None) -> list[str]:
+               typical: tuple = (), examples: list | None = None, scalars: Sequence[bool] = ()) -> list[str]:
     """The leaves `seeds_for` leaves unresolved at `count`: on the count's own block of draws or on the
     next block of as many (`seeds_for`'s confirmation), each judged as the sizing judges it: paired,
     `mine` Dew's squared errors against the reference's (`theirs`, seed by leaf) on the same draws, or
     the reference compared with itself (`_unresolved_against_itself`, each block twice the count); the
-    leaves named in `typical` sized by their typical draw too (`_sized`)."""
+    leaves named in `typical` sized by their typical draw too (`_sized`), `scalars` saying which leaves hold
+    one value an example."""
     wide: list[str] = []
     for start in (0, count) if mine is not None else (0, 2 * count):
         if mine is not None:
@@ -2169,7 +2219,8 @@ def _confirmed(names, theirs: np.ndarray, count: int, mine: np.ndarray | None = 
             unresolved = [name for index, name in enumerate(names) if np.sum(held[:, index]) > 0
                           and not _sized(ours[:, index], held[:, index], name in typical,
                                          None if examples is None else _leaf_examples(examples, start, count,
-                                                                                      index))]
+                                                                                      index),
+                                         bool(scalars) and scalars[index])]
         else:
             unresolved = _unresolved_against_itself(theirs[start:start + 2 * count], names, count)
         wide += [name for name in unresolved if name not in wide]
