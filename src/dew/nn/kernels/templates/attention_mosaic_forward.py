@@ -23,8 +23,9 @@ fold's reach, and its overflowed rows again shifting under headroom). Its legali
 
 import dataclasses
 import functools
+import inspect
 from collections.abc import Callable
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -32,7 +33,14 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels.templates import attention_algebra as algebra, attention_portable, mosaic, resources
+from dew.nn.kernels import generation
+from dew.nn.kernels.templates import (
+    attention_algebra as algebra,
+    attention_portable,
+    mosaic,
+    report,
+    resources,
+)
 from dew.nn.kernels.templates.attention import (
     Draw,
     Dropout,
@@ -151,13 +159,19 @@ def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
         at, at_spans = _form_tiles(spec, call, form, tiles, spans_of)
         if live is None:
             # A launch a block of the value columns where its tiles walk a block (`Tiles.columns`), the
-            # blocks' outputs side by side, their rows' statistics alike.
-            launched = [_launch(q, k, values, at_spans, hooked, None, spec=form, hooks=hooks, tiles=at,
+            # blocks' outputs side by side, their rows' statistics alike; an output hook of a row's whole
+            # output in XLA past them, as the guarded launch's.
+            blocks = _column_blocks(v, hooked, at.columns)
+            split = len(blocks) > 1 and hooks.output_mod is not None
+            launched = [_launch(q, k, values, at_spans, held._replace(output=()) if split else held, None,
+                                spec=form, hooks=_unhooked(hooks) if split else hooks, tiles=at,
                                 family=family, training=False, interpret=interpret,
-                                counted=form.natural == spec.natural, finishes=rows, columns=first)
-                        for first, values in _value_blocks(v, at)]
+                                counted=form.natural == spec.natural, finishes=rows, columns=first,
+                                out_dtype=jnp.float32 if split else None)
+                        for first, values, held in blocks]
             status, _, *finished = launched[0]
-            out = jnp.concatenate([block[1] for block in launched], axis=-1)
+            out = _output_whole(jnp.concatenate([block[1] for block in launched], axis=-1), hooks, hooked,
+                                q.dtype, split)
             overflowed = functools.reduce(jnp.logical_or, [block[0][1] > 0 for block in launched])
             return (out, *finished), status[0], overflowed
         unit = guarded_columns(family, v.shape[-1], v.dtype)
@@ -168,21 +182,15 @@ def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
         # A spans call's block map counts blocks of the launch's own key tile.
         guarded_spans = _spans_of(spec, call, guarded.block_q, guarded.block_k)
         blocks = []
-        for first in range(0, v.shape[-1], unit):
-            # The guarded launch reads its live rows and its values' largest magnitudes (`algebra.room`), and
-            # the initial state's sums of its own columns.
-            columns = v[..., first:first + unit]
+        # The guarded launch reads its live rows and its values' largest magnitudes (`algebra.room`), and
+        # the initial state's sums of its own columns (`_column_blocks`), a block a launch at any width.
+        for first, columns, held in _column_blocks(v, hooked, unit, whole=False):
             guard = _Guard(live.astype(jnp.int32), jnp.swapaxes(algebra.magnitudes(columns), 1, 2))
-            initial = hooked.initial
-            held = hooked._replace(output=()) if initial is None else hooked._replace(
-                output=(), initial=(*initial[:2], initial[2][..., first:first + unit]))
-            blocks.append(_launch(q, k, columns, guarded_spans, held, guard, spec=form,
-                                  hooks=dataclasses.replace(hooks, output_mod=None, output_params=()),
-                                  tiles=guarded, family=family, training=False, interpret=interpret,
-                                  columns=first, out_dtype=jnp.float32 if hooked_blocks else None)[1])
-        out = jnp.concatenate(blocks, axis=-1)
-        if hooked_blocks:
-            out = jnp.swapaxes(_output_hooked(jnp.swapaxes(out, 1, 2), hooks, hooked), 1, 2).astype(q.dtype)
+            blocks.append(_launch(q, k, columns, guarded_spans, held._replace(output=()), guard, spec=form,
+                                  hooks=_unhooked(hooks), tiles=guarded, family=family, training=False,
+                                  interpret=interpret, columns=first,
+                                  out_dtype=jnp.float32 if hooked_blocks else None)[1])
+        out = _output_whole(jnp.concatenate(blocks, axis=-1), hooks, hooked, q.dtype, hooked_blocks)
         # Its output alone: `walked_launches` reads the plain launch's maxima and overflows, and `kept` its
         # finished rows.
         return (out,), jnp.zeros(live.shape, jnp.float32), jnp.zeros_like(live)
@@ -198,13 +206,36 @@ def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
     return out, maximum, total, jnp.full(maximum.shape, -1, jnp.int32), output_split(out)
 
 
-def _value_blocks(value: jax.Array, tiles: Tiles) -> list[tuple[int | None, jax.Array]]:
-    """The blocks of `value`'s columns a launch at `tiles` walks, each its first column and its slice: the
-    whole, first None, where its tiles walk every column (`Tiles.columns` None)."""
-    if tiles.columns is None or tiles.columns >= value.shape[-1]:
-        return [(None, value)]
-    return [(first, value[..., first:first + tiles.columns])
-            for first in range(0, value.shape[-1], tiles.columns)]
+def _column_blocks(value: jax.Array, hooked: _Hooked, columns: int | None, *, whole: bool = True
+                   ) -> list[tuple[int | None, jax.Array, _Hooked]]:
+    """The blocks of `value`'s columns a launch walks `columns` at a time, each its first column, its slice
+    and `hooked` with the initial state's sums of its own columns (`_Hooked.initial`, its maximum and
+    denominator the rows'): where `whole`, the whole, first None, where a block holds every column
+    (`Tiles.columns` None)."""
+    if whole and (columns is None or columns >= value.shape[-1]):
+        return [(None, value, hooked)]
+    width = value.shape[-1] if columns is None else columns
+
+    def held(first: int) -> _Hooked:
+        initial = hooked.initial
+        return hooked if initial is None else hooked._replace(
+            initial=(*initial[:2], initial[2][..., first:first + width]))
+
+    return [(first, value[..., first:first + width], held(first))
+            for first in range(0, value.shape[-1], width)]
+
+
+def _unhooked(hooks: Hooks) -> Hooks:
+    """`hooks` without the output hook, which a launch of a block of the value columns leaves to XLA."""
+    return dataclasses.replace(hooks, output_mod=None, output_params=())
+
+
+def _output_whole(out: jax.Array, hooks: Hooks, hooked: _Hooked, dtype, hooked_blocks: bool) -> jax.Array:
+    """The blocks' output `out` side by side, the output hook run in XLA over each row's whole output where
+    the blocks' launches left it (`hooked_blocks`), in `dtype`."""
+    if not hooked_blocks:
+        return out
+    return jnp.swapaxes(_output_hooked(jnp.swapaxes(out, 1, 2), hooks, hooked), 1, 2).astype(dtype)
 
 
 def _form_tiles(spec: algebra.Forward, call, form: algebra.Forward, tiles: Tiles, spans_of):
@@ -255,10 +286,10 @@ def _trained_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
                             family=family, training=False, interpret=interpret, peaks=True, counted=counted)
             # A training launch a block of the value columns where its tiles walk a block (`Tiles.columns`,
             # row 2526), each block's split sums side by side, their rows alike.
-            launched = [_launch(q, k, values, at_spans, hooked, None, spec=form, hooks=hooks, tiles=at,
+            launched = [_launch(q, k, values, at_spans, held, None, spec=form, hooks=hooks, tiles=at,
                                 family=family, training=True, interpret=interpret, anchors=found,
                                 counted=counted, columns=first)
-                        for first, values in _value_blocks(v, at)]
+                        for first, values, held in _column_blocks(v, hooked, at.columns)]
             status, rows, anchors, _ = launched[0]
             others = jnp.concatenate([block[3] for block in launched], axis=-1)
             status = status.at[1].set(functools.reduce(jnp.maximum, [block[0][1] for block in launched]))
@@ -582,7 +613,86 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
     (`peaks`) reads the keys alone and gives each row's keys' largest logit `[B, H, Qp]` fp32 in the walk's
     units and its anchor key `[B, H, Qp]` int32 (`_peak_consumer`). With `finishes`, the output's launch also
     gives its rows' finished maxima and denominators `[2, B, H, Qp]` fp32 (`Output`, `algebra.finish`).
+    Its kernel is built once for every call of its static facts (`_kernel_of`) where its hooks hold no
+    array (`_holdable`): a model's layers alike lower one.
     """
+    # The arrays the programs read beside the operands.
+    leaves, treedef = jax.tree.flatten((spans, hooked, guard, anchors))
+    # Each launch named apart, so its compile reports and profile rows say which it is.
+    kind = "peaks" if peaks else "training" if training else "forward"
+    name = (f"attention_{kind}{'_natural' if spec.natural else ''}"
+            f"{'_guarded' if guard is not None else ''}{'' if columns is None else f'_columns{columns}'}")
+    launch = _Launch(tuple((array.shape, jnp.dtype(array.dtype)) for array in (query, key, value)), treedef,
+                     _described(hooks), spec, tiles, family, training, interpret, peaks,
+                     None if out_dtype is None else jnp.dtype(out_dtype), counted, finishes,
+                     generation.gpu_target(), name, report.named(name))
+    built = _kernel_of if all(map(_holdable, (hooks.score_mod, hooks.output_mod))) else _kernel_of.__wrapped__
+    return built(launch)(query, key, value, *leaves)
+
+
+def _holdable(hook: Callable | None) -> bool:
+    """Whether the kernel cache may hold `hook` (`_kernel_of`) without holding an array through it: none, a
+    function of no closure, or a partial of one over values of no array (a softcap's `functools.partial`
+    of `capped`). A closure or a bound method may reach an array a call made (a hook reading an operand's
+    shape), which a cached kernel would keep alive: its launches build their kernel each call."""
+    if hook is None:
+        return True
+    if isinstance(hook, functools.partial):
+        return _holdable(hook.func) and all(map(_scalar, (*hook.args, *hook.keywords.values())))
+    return (inspect.isfunction(hook) and hook.__closure__ is None
+            and all(map(_scalar, hook.__defaults__ or ())))
+
+
+def _scalar(value) -> bool:
+    """Whether `value` is a Python scalar, a string or None, or a tuple of them: a value of no array."""
+    if isinstance(value, tuple):
+        return all(map(_scalar, value))
+    return value is None or isinstance(value, (bool, int, float, complex, str))
+
+
+@dataclasses.dataclass(frozen=True)
+class _Launch:
+    """A forward launch's static facts, all its kernel is built from (`_kernel_of`): its operands' shapes
+    and dtypes, the structure of the arrays its programs read beside them (`treedef`), its hooks with their
+    arrays' shapes and dtypes in place of the arrays (`_described`), its form, tiles and family, what it
+    gives, the target it is derived for, and its name (its form, guard and value columns) as the launch
+    tracing it resolves it (`report.named`)."""
+
+    operands: tuple
+    treedef: Any
+    hooks: Any
+    spec: algebra.Forward
+    tiles: Tiles
+    family: mosaic.Family
+    training: bool
+    interpret: Any
+    peaks: bool
+    out_dtype: Any
+    counted: bool
+    finishes: bool
+    target: Any
+    name: str
+    kernel_name: str | None
+
+
+def _described(hooks: Hooks) -> Hooks:
+    """`hooks` with each array's shape and dtype in its place (`jax.ShapeDtypeStruct`): what a kernel built
+    for many calls reads of them, no array held."""
+    return jax.tree.map(lambda array: jax.ShapeDtypeStruct(jnp.shape(array), jnp.result_type(array)), hooks)
+
+
+@functools.lru_cache(maxsize=256)
+def _kernel_of(launch: _Launch) -> Callable:
+    """`_launch`'s kernel for its static facts `launch`, built once for every call of them and reading no
+    array: its hooks' functions and their arrays' shapes and dtypes (`_described`; the arrays the programs'
+    refs), its operands' alike. A bound of 256 kernels keeps a process's memory bounded
+    (the hook programs' own cache's, `hook_program`)."""
+    query, key, value = (jax.ShapeDtypeStruct(shape, dtype) for shape, dtype in launch.operands)
+    hooks = launch.hooks
+    spec, tiles, family, training, interpret = (launch.spec, launch.tiles, launch.family, launch.training,
+                                                launch.interpret)
+    peaks, out_dtype, counted, finishes, treedef = (launch.peaks, launch.out_dtype, launch.counted,
+                                                    launch.finishes, launch.treedef)
     batch, queries, heads, width = query.shape
     keys_count, kv_heads = key.shape[1], key.shape[2]
     group, consumers = heads // kv_heads, tiles.consumers
@@ -601,7 +711,7 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
     arrays = len(scoped) - 2
 
     def body(q_ref, k_ref, v_ref, *refs, streams):
-        read, refs = refs[:len(leaves)], refs[len(leaves):]
+        read, refs = refs[:treedef.num_leaves], refs[treedef.num_leaves:]
         written, refs = refs[:len(out_type)], refs[len(out_type):]
         (q_smem, row_smem, *stages), (q_loaded, schedule) = refs[:arrays], refs[arrays:]
         out_smem, stages = (q_smem, stages) if peaks or (reuse and not training) else (stages[0], stages[1:])
@@ -649,8 +759,6 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
 
         family.roles(consumers, consumer, producer)
 
-    # The arrays the programs read beside the operands.
-    leaves, treedef = jax.tree.flatten((spans, hooked, guard, anchors))
 
     def entry(*refs):
         family.scoped(functools.partial(body, *refs), *scoped, streams=rings)
@@ -668,10 +776,6 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
         if finishes:
             out_type += (jax.ShapeDtypeStruct((2, batch, heads, queries), jnp.float32),)
     approx_math = approximate(hooks, (block_q, block_k), value.shape[-1], differentiated=False)
-    # Each launch named apart, so its compile reports and profile rows say which it is.
-    kind = "peaks" if peaks else "training" if training else "forward"
-    name = (f"attention_{kind}{'_natural' if spec.natural else ''}"
-            f"{'_guarded' if guard is not None else ''}{'' if columns is None else f'_columns{columns}'}")
     # The model's products this launch owns (`stated`): the forward's two, a peak walk's `Q K^T` and a
     # training walk's `P V` (its `Q K^T` recomputed); a rerun (a guarded launch, the fold's natural walk)
     # none, as the FLOP count bounds a conditional by every branch, which would count the call twice.
@@ -680,6 +784,6 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
             else pl.CostEstimate(flops=0, transcendentals=0, bytes_accessed=0))
     return family.kernel(entry, out_type=out_type, grid=(heads, queries // pair, batch),
                          grid_names=("heads", "q_tiles", "batch"), consumers=consumers, interpret=interpret,
-                         approx_math=approx_math, name=name, cost=cost,
-                         reducing_warpgroups=reducing(family, consumers, hooks.score_mod, hooks.output_mod))(
-                             query, key, value, *leaves)
+                         approx_math=approx_math, name=launch.name, kernel_name=launch.kernel_name,
+                         cost=cost,
+                         reducing_warpgroups=reducing(family, consumers, hooks.score_mod, hooks.output_mod))

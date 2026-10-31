@@ -124,12 +124,6 @@ class AttentionCase:
     blocks: bool
     spans_only: bool
     mask: bool
-    mask_as_bias: bool
-    """Whether cuDNN's dense-bias form of the call's mask was measured cheaper than the xla kernel's mask:
-    a window's band `[S, 2W]` (local attention: 16384 packed tokens at window 4096 in 0.60 GiB of
-    temporaries on an L4, where xla asked for 10.0 GiB at 8192) or a forward-only cache call over several
-    queries (8 prompts of 256 at Qwen3-0.6B's widths, 4.0 against xla's 6.2 ms on an RTX 4080;
-    docs/performance.md); set where a caller builds such a mask (`attention.mask_kernel`)."""
     bias: bool
     bias_hook: bool
     """Whether the call's bias is one the template reads as a score hook in fp32 (`attention.
@@ -277,9 +271,9 @@ CUDNN_SUPPORTS = (
                 "cuDNN takes no segment ids, a call's packed documents only as their mask, a dense bias "
                 "that costs more than the xla kernel's mask (`_attention_kernel` builds it where cuDNN is "
                 "named)", row='measured: cuDNN dense-mask bias (docs/performance.md)', kind='measured'),
-    _Need('mask', lambda case: not case.mask or case.mask_as_bias,
+    _Need('mask', lambda case: not case.mask,
                 "cuDNN takes an arbitrary mask as a dense bias, which costs more than the xla kernel's "
-                "mask but for a window's band or a forward-only cache call (`AttentionCase.mask_as_bias`)",
+                "mask but for a window's band or a forward-only cache call (`attention.mask_kernel`)",
                 row='measured: cuDNN dense-mask bias (docs/performance.md)', kind='measured'),
     _Need('spans_only', lambda case: not case.spans_only,
                 "cuDNN takes block groups, key validity or counted places only as the mask the call's spans "

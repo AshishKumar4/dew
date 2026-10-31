@@ -1272,7 +1272,8 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
     it: a differentiated call applies `output_mod` past the kernel, where its own derivative runs, and passes
     `dout` before it. Deterministic where `launch` writes every gradient element from one program (the
     two-launch schedules: a head parameter's partial sums added in a fixed order and a key head's query heads
-    summed in XLA); the Mosaic one-launch schedule adds dQ's tiles atomically, in their arrival order."""
+    summed in XLA); the Mosaic one-launch schedule adds dQ's tiles and a key head's query heads' dK and dV
+    atomically, in their arrival order."""
     hooks = Hooks() if hooks is None else hooks
     if hooks.output_mod is not None:
         raise ValueError("the backward takes the output before the output hook (`backward`'s docstring)")
@@ -1291,8 +1292,11 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
     delta, anchor, peak, total, mass = (array[:, :, :queries] for array in softmax)
     delta = anchor + delta
     padded_k, padded_d, padded_dv = call.key.shape[1], call.key.shape[-1], call.value.shape[-1]
-    dk = dk.reshape(batch, padded_k, kv_heads, group, padded_d).sum(axis=3)
-    dv = dv.reshape(batch, padded_k, kv_heads, group, padded_dv).sum(axis=3)
+    if dk.shape[2] != kv_heads:
+        # A launch's gradients a query head's each, a key head's summed here (in a fixed order); a launch
+        # that adds them into the key head's own returns them summed.
+        dk = dk.reshape(batch, padded_k, kv_heads, group, padded_d).sum(axis=3)
+        dv = dv.reshape(batch, padded_k, kv_heads, group, padded_dv).sum(axis=3)
     grads = []
     for param in hooks.score_params:
         match param.kind:

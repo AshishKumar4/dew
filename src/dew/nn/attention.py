@@ -889,7 +889,7 @@ def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_sof
         dense_bias=bias is not None and jnp.ndim(bias) == 4 and jnp.shape(bias)[-2] > 1,
         row_bias=(bias is not None and jnp.ndim(bias) == 4 and jnp.shape(bias)[-2] > 1
                   and jnp.shape(bias)[0] > 1),
-        sinks=sinks is not None, softcap=softcap, mask_as_bias=False,
+        sinks=sinks is not None, softcap=softcap,
         arithmetic=reference_only(query, dtype, precision, force_fp32_for_softmax),
         narrows=_xla_kernel_narrows(query),
         folds=folds(query, key, bias, mask, causal, sliding_window),
@@ -940,7 +940,9 @@ def resolve_implementation(implementation: AttentionImpl, query, key, *, dtype=N
 
 def kernel_for_materialized_mask(implementation: AttentionImpl, query, key, *, dtype=None, precision=None,
                                  force_fp32_for_softmax=True) -> AttentionImpl:
-    """Send a call that built an explicit mask to the xla kernel.
+    """The kernel a call that built an explicit mask runs: a kernel the call names, cuDNN aside, which runs
+    the mask as xla does; else the attention selector's (`_masked_kernel`): one a run's context forces
+    (`generation.chosen`), else the xla kernel, the reference path where xla hands the call on.
 
     cuDNN has no mask argument: jax hands it a bool mask as an additive bias of
     -2**41 in the compute dtype (`combine_bias_and_mask` in
@@ -948,36 +950,42 @@ def kernel_for_materialized_mask(implementation: AttentionImpl, query, key, *, d
     then refuses an odd length while training. The xla kernel masks by
     exclusion with the same fp32 softmax, at 83.6 ms and 5.80 GiB a step against
     cuDNN's fixed window at 75.8 ms and 4.99 GiB
-    (docs/concepts/language_models.md). A call the xla kernel hands off goes to
-    the reference path as its requirements say (`attention_kernels.XLA_SUPPORTS`),
-    an explicit 'cudnn' among them, which runs here as xla.
+    (docs/concepts/language_models.md).
     """
-    masked = 'xla' if implementation in ('auto', 'cudnn') else implementation
-    if masked != 'xla':
-        return masked
-    case = dataclasses.replace(attention_case(query, key, dtype=dtype, precision=precision,
-                                              force_fp32_for_softmax=force_fp32_for_softmax, named='xla'),
-                               mask=True, folds=False)
-    return attention_implementation(selected(ATTENTION, case, 'xla').name)
+    if implementation not in ('auto', 'cudnn', 'xla'):
+        return implementation
+    return _masked_kernel(implementation, 'xla' if implementation == 'xla' else None, query, key,
+                          ('xla', 'reference'), dtype=dtype, precision=precision,
+                          force_fp32_for_softmax=force_fp32_for_softmax)
 
 
 def mask_kernel(implementation: AttentionImpl, query, key, *, as_bias: bool, dtype=None, precision=None,
                 force_fp32_for_softmax=True, softcap=None, sinks: bool = False) -> AttentionImpl:
-    """The kernel a call that built its mask runs. Where the mask suits cuDNN's dense bias (`as_bias`,
-    `AttentionCase.mask_as_bias`: a window's band, a forward-only cache call over several queries) and the
-    call chooses ('auto') or names cudnn, the attention selector's pick of cuDNN where it takes the call,
-    then xla: a kernel a run's context forces (`generation.chosen`) taken as forced, a call cuDNN cannot
-    honour (sinks, a dtype or a width it refuses, a GPU this process does not place it on) on xla, or the
-    reference path where xla hands it on; elsewhere xla (`kernel_for_materialized_mask`)."""
+    """The kernel a call that built its mask runs, decided where the call builds it: where the mask suits
+    cuDNN's dense bias (`as_bias`: a window's band, a forward-only cache call over several queries) and the
+    call chooses ('auto') or names cudnn, cuDNN where it takes the call, then xla (a call cuDNN cannot
+    honour: sinks, a dtype or a width it refuses, a GPU this process does not place it on), then the
+    reference path; elsewhere `kernel_for_materialized_mask`'s. A kernel a run's context forces
+    (`generation.chosen`) is taken as forced."""
     if not (as_bias and implementation in ('auto', 'cudnn')):
         return kernel_for_materialized_mask(implementation, query, key, dtype=dtype, precision=precision,
                                             force_fp32_for_softmax=force_fp32_for_softmax)
+    return _masked_kernel(implementation, None if implementation == 'auto' else implementation, query, key,
+                          ('cudnn', 'xla', 'reference'), dtype=dtype, precision=precision,
+                          force_fp32_for_softmax=force_fp32_for_softmax, softcap=softcap, sinks=sinks)
+
+
+def _masked_kernel(implementation: AttentionImpl, named: str | None, query, key,
+                   preference: tuple[str, ...], *, dtype, precision, force_fp32_for_softmax, softcap=None,
+                   sinks: bool = False) -> AttentionImpl:
+    """The attention selector's kernel for a call of `implementation` with a mask (`selection.selected`,
+    reporting nothing: the dispatch that runs it reports its route): `named` where it takes the call, else
+    one a run's context forces, else `preference`'s first that takes it, the reference path where xla hands
+    it on (`attention_kernels.XLA_SUPPORTS`)."""
     case = dataclasses.replace(
         attention_case(query, key, dtype=dtype, precision=precision,
                        force_fp32_for_softmax=force_fp32_for_softmax, softcap=softcap,
                        sinks=True if sinks else None, named=implementation),
-        mask=True, mask_as_bias=True, folds=False)
-    named = None if implementation == 'auto' else implementation
-    # xla hands a call its requirements turn down to the reference path (`attention_kernels.XLA_SUPPORTS`).
-    return attention_implementation(select(ATTENTION, case, named,
-                                           preference=('cudnn', 'xla', 'reference')).ran)
+        mask=True, folds=False)
+    return attention_implementation(ATTENTION.hosted(selected(ATTENTION, case, named,
+                                                              preference=preference).name))
