@@ -214,7 +214,7 @@ class TSSM(nn.Module):
         # A start whose imagined episode restarts reads its window no more, at this step or after.
         window = cache.window
         if window is not None:
-            window = window.replace(valid=window.valid & ~first[:, None])
+            window = Window(window.keys, window.values, window.valid & ~first[:, None])
         h = x[:, None]
         for layer, block in enumerate(self.blocks):
             query, key, value = block.projected(h, position[:, None])
