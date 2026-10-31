@@ -828,26 +828,32 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
             return [pulled_back[index] for index in live]
 
         moving = [directions[index] for index in live]
-        return output, linear_map(tangent, transposed, (primals, saved), moving)
+        # The tangent typed as the output it perturbs, its sharding included: traced from `portable`'s
+        # tangent, every reverse pass traced the portable math's forward mode for its type alone (a gated
+        # delta net layer's training step's trace on an H100's lowering, row 3142).
+        typed = jax.tree.map(lambda leaf: jax.typeof(leaf).to_tangent_aval(), output)
+        return output, linear_map(tangent, transposed, (primals, saved), moving, out_aval=typed)
 
     bounded.defjvp(bounded_jvp, symbolic_zeros=True)
     return bounded
 
 
-def linear_map(apply: Callable, pullback: Callable, residuals, moving):
+def linear_map(apply: Callable, pullback: Callable, residuals, moving, *, out_aval=None):
     """`apply(residuals, moving)`, linear in `moving`, whose transpose is `pullback(residuals, cotangent)`
     (the cotangents of `moving`, a tree like it): one `jax.experimental.hijax.HiPrim`, so reverse mode
     runs `pullback` whether it reaches the map through a vjp or through a jvp that a shard_map, a scan
     or `jax.linear_transpose` transposes, and under `jax.vmap` too, where the map is one of `apply` and
     `pullback` mapped over the batch. Its tangent is the map of the moving tangents plus `apply`'s own
-    derivative in `residuals` (a higher order's)."""
+    derivative in `residuals` (a higher order's). `out_aval`, where given, is the output's type (a tree of
+    avals like it), which `apply` is then traced for only where forward mode runs it."""
     import jax
 
     # The output's type as `apply` traces it, its sharding included: a shape and dtype alone
     # (`jax.eval_shape`'s) drop an explicit axis's, and reverse mode would hand the pullback its cotangent
     # unsharded (row 1759).
-    traced, shapes = jax.make_jaxpr(apply, return_shape=True)(residuals, moving)
-    out_aval = jax.tree.unflatten(jax.tree.structure(shapes), traced.out_avals)
+    if out_aval is None:
+        traced, shapes = jax.make_jaxpr(apply, return_shape=True)(residuals, moving)
+        out_aval = jax.tree.unflatten(jax.tree.structure(shapes), traced.out_avals)
     in_avals = jax.tree.map(jax.typeof, (residuals, moving))
     return _linear_primitive()(apply, pullback, in_avals, out_aval)(residuals, moving)
 

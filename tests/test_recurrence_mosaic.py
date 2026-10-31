@@ -173,8 +173,8 @@ def draw(dtype, seed: int, *, rows: int, length: int, key_heads: int, value_head
 def template_call(given: Chunk, hooks: recurrence.Hooks):
     """The template's call over `given`'s operands under `hooks`, as the chunked op hands them over
     (`recurrence_chunk.chunk`): no decay a zero log decay a head, no write gate ones, the rule's form its
-    hooks', a rated scan's numbers mamba_ssm's under the run's fast forms (`rounded`, as its route resolves
-    it, `recurrence_chunk.fast_rounding`)."""
+    hooks', its numbers the run's fast forms' where they are its forms (`rounded`, as its route resolves
+    it, `recurrence_chunk.fast_rounding`: a rated scan's mamba_ssm's, an fp32 call's two parts)."""
     heads = given.value.shape[:3]
     g = jnp.zeros(heads, jnp.float32) if given.log_decay is None else given.log_decay
     beta = jnp.ones(heads, given.value.dtype) if given.beta is None else given.beta
@@ -184,7 +184,7 @@ def template_call(given: Chunk, hooks: recurrence.Hooks):
     return template.MOSAIC.bind(query, key, given.value, g, beta, given.state, given.starts,
                                 delta=hooks.delta, wide=hooks.skip or hooks.output is not None,
                                 floor=hooks.floor, bound=hooks.inverse_bound,
-                                rounded=hooks.rated and fast_rounding())
+                                rounded=fast_rounding())
 
 
 def refuses_its_gradient(fn, *drawn) -> None:
