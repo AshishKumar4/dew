@@ -8,7 +8,10 @@ long and fading memories, steep then mild decays), held as test_recurrence_stabi
 
 - finite wherever the recurrence a token at a time in float64 is;
 - check 1 (`assert_as_exact`): on par from float64 with its reference arm, the fla port where it runs the
-  form (the delta rule with a decay), else the portable math, in the call's 16-bit dtype.
+  form (the delta rule with a decay), else the portable math, in the call's 16-bit dtype. Mamba2's rated
+  decay runs under the accurate forms here, whose numbers are the portable math's; under the fast forms its
+  16-bit numbers are mamba_ssm's (`mainloop._prepared`), held to recorded mamba_ssm's own distance from
+  float64 at the same inputs (test_mamba_ssd).
 
 Natively on a GPU of a family the mainloop claims, in its GPU flow (tests/test_gpu_recurrence.py: interpreted,
 one case's check 1 outran the CPU tier's hour); off one, the CPU interprets each form's forward on the regimes
@@ -87,6 +90,12 @@ def reference_arm(hooks):
     return functools.partial(chunk_on, 'fla' if hooks.delta and hooks.decay != 'none' else 'xla', hooks)
 
 
+def forms_of(hooks) -> str:
+    """The run's forms a form's check 1 runs under: the accurate ones for the rated scan, whose numbers are
+    then the portable math's (its fast ones' bar is recorded mamba_ssm's, test_mamba_ssd), else the run's."""
+    return 'accurate' if hooks.rated else generation.numerics().forms
+
+
 def template_trains(operands: Chunk, hooks) -> bool:
     """Whether the template's fast backward takes a gradient over `operands` under `hooks` on the device its
     launches run for (`Mosaic.trains`)."""
@@ -128,25 +137,27 @@ def the_template_stays_finite_and_on_par_where_chunked_forms_break(name, regime,
             return bf16(operands, hooks), (out.astype(jnp.bfloat16), final)
 
     operands = restarting(lambda given: given, regime)(draws(0)[0])
-    if not runs(dew, hooks, operands, draws(0), product):
-        pytest.skip(f"the template refuses {name}'s {product}: a refusal, not numerical coverage")
-    for seed in range(2):
-        assert_finite(dew, truth, draws(seed), regime)
-    assert_as_exact(dew, reference, draws, f'the template, {name} under {regime}, its {product}',
-                    seeds=seeds, truth_fn=truth)
+    with generation.run_precision(dataclasses.replace(generation.numerics(), forms=forms_of(hooks))):
+        if not runs(dew, hooks, operands, draws(0), product):
+            pytest.skip(f"the template refuses {name}'s {product}: a refusal, not numerical coverage")
+        for seed in range(2):
+            assert_finite(dew, truth, draws(seed), regime)
+        assert_as_exact(dew, reference, draws, f'the template, {name} under {regime}, its {product}',
+                        seeds=seeds, truth_fn=truth)
 
 
 def test_a_ragged_chunks_last_real_write_holds_the_final_memory_interpreted():
-    """The rated scan's 16-bit forward through the template under the decay bound, interpreted off a GPU, on
-    par with the portable math from float64 over check 1's fewest draws: its rows end in a ragged chunk (70
-    tokens), and its last real token's write, which weighs most under a steep decay, is held outside the
-    product as the portable math peels it; the padded last slot's put the final memory 2.0 times the
-    portable math's distance, interpreted and on an H100."""
+    """The rated scan's 16-bit forward through the template under the decay bound and the accurate forms
+    (`forms_of`), interpreted off a GPU, on par with the portable math from float64 over check 1's fewest
+    draws: its rows end in a ragged chunk (70 tokens), and its last real token's write, which weighs most
+    under a steep decay, is held outside the product as the portable math peels it; the padded last slot's
+    put the final memory 2.0 times the portable math's distance, interpreted and on an H100."""
     hooks = SITES['rated']
-    assert_as_exact(functools.partial(chunk_on, 'mosaic_gpu', hooks), reference_arm(hooks),
-                    lambda seed: (bf16(stressed(hooks, 'the decay bound', seed)[0], hooks),),
-                    'the template, rated under the decay bound, its forward', seeds=FEWEST_SEEDS,
-                    truth_fn=functools.partial(token_by_token, hooks))
+    with generation.run_precision(dataclasses.replace(generation.numerics(), forms=forms_of(hooks))):
+        assert_as_exact(functools.partial(chunk_on, 'mosaic_gpu', hooks), reference_arm(hooks),
+                        lambda seed: (bf16(stressed(hooks, 'the decay bound', seed)[0], hooks),),
+                        'the template, rated under the decay bound, its forward', seeds=FEWEST_SEEDS,
+                        truth_fn=functools.partial(token_by_token, hooks))
 
 
 @pytest.mark.parametrize('name', SITES)

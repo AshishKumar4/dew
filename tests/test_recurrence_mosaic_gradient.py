@@ -29,7 +29,7 @@ from test_recurrence_mosaic import (
 from whole_suite import timed
 
 from dew.nn.backbones.decoder_block import RematPolicy
-from dew.nn.kernels import recurrence
+from dew.nn.kernels import generation, recurrence
 from dew.nn.kernels.recurrence_chunk import Chunk, mosaic_rule, recomputing
 from dew.nn.kernels.templates import bundles
 from dew.nn.kernels.templates.recurrence import mainloop, template
@@ -156,6 +156,59 @@ def test_a_walk_of_two_roles_is_as_exact_as_its_reference(case, product):
     draws = functools.partial(drawn, jnp.bfloat16, **shape)
     assert_as_exact(with_gradients(walked), with_gradients(reference), draws,
                     f'a two-role walk\'s gradient, {case}', seeds=SEEDS, truth_fn=with_gradients(truth))
+
+
+def test_the_fast_backward_trains_a_bf16_rated_scan_alone():
+    """A rated scan's (Mamba2's SSD) 16-bit gradient under the run's fast forms, whose numbers are
+    mamba_ssm's: the template's fast backward takes a bf16 call and refuses an fp16 one, whose products would
+    take its scores' gradient's bf16 parts (`mainloop._score_grads`) against fp16 keys, so the port trains it
+    (`mainloop.fast_backward_form`)."""
+    hooks = recurrence.Hooks(decay='scalar', rated=True, delta=False, skip=True)
+    shape = geometry('one sequence')
+    with generation.run_precision(dataclasses.replace(generation.numerics(), forms='fast')):
+        assert trained(drawn(jnp.bfloat16, 0, **shape)[0], hooks)
+        assert not trained(drawn(jnp.float16, 0, **shape)[0], hooks)
+
+
+ROUNDED_EXACTLY = {
+    "a write": ({"x": 129 / 128, "B": 1.0, "C": 0.0, "dt": 129 / 256, "dy": 0.0}, "final", 16641 / 32768),
+    "a write gate's gradient": ({"x": 1.0, "B": 1.0, "C": 129 / 128, "dt": 0.5, "dy": 129 / 128}, "ddt",
+                                16641 / 16384),
+}
+"""One live token's rated scan whose value mamba_ssm's 16-bit arithmetic holds exactly, each case's operands
+at the token (zero elsewhere, `A = D = 0`, no entering memory), the value it checks and that value: its
+write, `(B dt)^T x` with `B dt` and `x` each a bf16 number (the gate on the keys' side, `_chunk_state_fwd`),
+and its write gate's gradient, `dy (C B) x` summed in fp32 (`_chunk_scan_chunk_state_bwd_dx`)."""
+
+
+@pytest.mark.parametrize('case', ROUNDED_EXACTLY)
+def test_the_rated_scan_rounds_where_mamba_ssm_does(case):
+    """A rated scan's (Mamba2's SSD) 16-bit call on the template under the run's fast forms, interpreted off
+    a GPU, at one live token whose value mamba_ssm's arithmetic holds exactly (`ROUNDED_EXACTLY`): the
+    template's is that value, its gate on the keys' side and its values' gradient in fp32 rounding nothing
+    mamba_ssm's does not."""
+    at, checked, value = ROUNDED_EXACTLY[case]
+    hooks = recurrence.Hooks(decay='scalar', rated=True, delta=False, skip=True)
+    rows, length, heads, states, width = 1, 64, 1, 64, 64
+
+    def one(name, shape, dtype):
+        return jnp.zeros(shape, jnp.float32).at[(0,) * len(shape)].set(at[name]).astype(dtype)
+
+    x, B, C = (one(name, (rows, length, heads, size), jnp.bfloat16)
+               for name, size in (("x", width), ("B", states), ("C", states)))
+    dt = one("dt", (rows, length, heads), jnp.float32)
+    dy = one("dy", (rows, length, heads, width), jnp.float32)
+    zero = jnp.zeros((heads,), jnp.float32)
+
+    def scanned(dt):
+        return chunk_on('mosaic_gpu', hooks, Chunk(C, B, x, beta=dt, rate=zero, skip=zero), chunk_size=64)
+
+    with generation.run_precision(dataclasses.replace(generation.numerics(), forms='fast')):
+        if checked == "final":
+            found = jnp.max(jnp.abs(scanned(dt)[1]))
+        else:
+            found = jax.grad(lambda dt: jnp.sum(scanned(dt)[0].astype(jnp.float32) * dy))(dt)[0, 0, 0]
+    assert float(found) == value, f"{case}: {float(found)!r} where mamba_ssm's is {value!r}"
 
 
 def trained(given: Chunk, hooks: recurrence.Hooks) -> bool:

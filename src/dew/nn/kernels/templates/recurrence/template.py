@@ -57,17 +57,18 @@ _PLANS: dict = {}
 
 def _planned(shapes: tuple, tiles: mainloop.Tiles, family: mosaic.Family, target: generation.GpuTarget,
              max_segments: int | None, delta: bool, backward: bool,
-             floor: float | None) -> tuple[mainloop.Launch, ...]:
+             floor: float | None, rounded: bool = False) -> tuple[mainloop.Launch, ...]:
     """`mainloop.planned` of a call over `shapes` (`jax.ShapeDtypeStruct`s or None) by `family`'s bundle on
     `target`, cached by the facts a plan reads of it (two targets of one family share no plan: an sm87's and
     an sm80's multiprocessors and shared memory differ)."""
     facts = (target.generation, target.device_kind, target.shared_limit, target.multiprocessors)
-    key = (shapes, tiles, family, facts, max_segments, delta, backward, floor)
+    key = (shapes, tiles, family, facts, max_segments, delta, backward, floor, rounded,
+           generation.numerics().forms)
     if key not in _PLANS:
         *operands, starts = shapes
         _PLANS[key] = mainloop.planned(*operands, tiles=tiles, family=family, starts=starts,
                                        max_segments=max_segments, delta=delta, backward=backward, floor=floor,
-                                       target=target)
+                                       target=target, rounded=rounded)
     return _PLANS[key]
 
 
@@ -97,13 +98,13 @@ class Mosaic(base.Template[mainloop.Tiles]):
              state: jax.Array | None = None, starts: jax.Array | None = None, *,
              firsts: jax.Array | None = None, max_segments: int | None = None, scale: float | None = None,
              delta: bool = True, wide: bool = False, floor: float | None = None, bound: float | None = None,
-             config: mainloop.Tiles, return_residuals: bool = False):
+             rounded: bool = False, config: mainloop.Tiles, return_residuals: bool = False):
         from dew.nn.kernels.recurrence_chunk import mosaic_rule
 
         del return_residuals
         return mosaic_rule(query, key, value, g, beta, state, tiles=config, starts=starts, firsts=firsts,
                            max_segments=max_segments, scale=scale, delta=delta, wide=wide, floor=floor,
-                           bound=bound), None
+                           bound=bound, rounded=rounded), None
 
     @staticmethod
     def launched() -> generation.GpuTarget:
@@ -127,11 +128,14 @@ class Mosaic(base.Template[mainloop.Tiles]):
         shapes = tuple(None if x is None else jax.ShapeDtypeStruct(x.shape, x.dtype) for x in given)
         dtype = jnp.result_type(*(arguments[name].dtype for name in names[:3]))
         per_head = arguments["g"].ndim == 3
-        fast = backward and arguments.get("delta", True) and per_head and dtype != jnp.float32
+        forms = mainloop.fast_backward_form(arguments.get("delta", True), arguments.get("rounded", False),
+                                            dtype)
+        fast = backward and forms and per_head and dtype != jnp.float32
         family = bundle(target, dtype)
         assert family is not None, f"no bundle of the mainloop claims {target.generation}"
         return _planned(shapes, config, family, target, arguments.get("max_segments"),
-                        arguments.get("delta", True), bool(fast), arguments.get("floor"))
+                        arguments.get("delta", True), bool(fast), arguments.get("floor"),
+                        arguments.get("rounded", False))
 
     GENERATES: ClassVar[bool] = True
 
@@ -293,7 +297,9 @@ class Mosaic(base.Template[mainloop.Tiles]):
         arguments = ba.arguments
         dtype = jnp.result_type(*(arguments[name].dtype for name in ("query", "key", "value")))
         sixteen = dtype in (jnp.bfloat16, jnp.float16)
-        if not (arguments.get("delta", True) and arguments["g"].ndim == 3 and sixteen):
+        forms = mainloop.fast_backward_form(arguments.get("delta", True), arguments.get("rounded", False),
+                                            dtype)
+        if not (forms and arguments["g"].ndim == 3 and sixteen):
             return False
         fits = self.fits(ba, target)
         return bool(fits) and self._backward_holds(ba, fits[0], target)

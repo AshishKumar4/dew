@@ -25,6 +25,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 import test_fla_gdn as fla_gdn
+import test_mamba_ssd as mamba_ssd
 import test_recurrence_mosaic as forward
 import test_recurrence_mosaic_gradient as gradient
 import test_recurrence_stability as stability
@@ -185,6 +186,8 @@ def test_the_recurrences_run_on_this_gpu():
                functools.partial(stability.the_ssd_port_stays_finite_and_exact_where_chunked_forms_break,
                                  regime))
           for regime in stability.REGIMES),
+        Cell("the SSD on the template under the fast forms is as exact as mamba_ssm",
+             mamba_ssd.the_template_is_as_exact_as_mamba_ssm),
         *(Cell(f"the SSD port's gradient is as exact as the recurrence's: {regime}",
                functools.partial(stability.the_ssd_ports_gradient_is_as_exact_as_the_recurrences, regime))
           for regime in stability.REGIMES),
