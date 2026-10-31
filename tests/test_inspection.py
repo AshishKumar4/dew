@@ -844,8 +844,9 @@ def test_a_distribution_matching_student_updates_cotangent_reaches_its_trained_c
 @pytest.mark.parametrize("stacked", ["scanned", "pipelined"])
 def test_a_path_glob_selects_the_layer_its_log_names(stacked):
     """A glob over a module's path names it as the log does, by its layer's place in the decoder (row
-    3126): `layers_2/*` summarizes layer 2's modules alone, whether the decoder scans its layers as one
-    run (`layers_0_3`) or pipelines them over two stages (`stages/layers_j`)."""
+    3126): `layers_2/*` summarizes layer 2's modules alone, their outputs and their cotangents, whether the
+    decoder scans its layers as one run (`layers_0_3`) or pipelines them over two stages
+    (`stages/layers_j`)."""
     from model_support import TINY_DECODER
 
     from dew.objectives.lm import LMObjective
@@ -857,8 +858,8 @@ def test_a_path_glob_selects_the_layer_its_log_names(stacked):
     placed = ({"microbatches": 2, "mesh": MeshSpec(fsdp=2, stage=2).build(jax.devices()[:4])}
               if stacked == "pipelined" else {})
     run = Trainer(LMObjective(model, 16), optax.sgd(RATE), key=jax.random.key(0), **placed,
-                  inspection=Inspection(modules=("layers_2/*",), targets=("params",)))
+                  inspection=Inspection(modules=("layers_2/*",), targets=("params",), cotangents=True))
     tokens = np.random.default_rng(1).integers(1, 64, size=(8, 17)).astype(np.int32)
-    layers = {name.split("/")[2] for name in inspected(run, {"text": tokens})
-              if name.startswith("inspect/activations/")}
-    assert layers == {"layers_2"}
+    logged = inspected(run, {"text": tokens})
+    for kind in ("activations", "cotangents"):
+        assert {name.split("/")[2] for name in logged if name.startswith(f"inspect/{kind}/")} == {"layers_2"}

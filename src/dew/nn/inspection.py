@@ -14,6 +14,7 @@ import contextvars
 import dataclasses
 import fnmatch
 import functools
+import re
 from collections.abc import Iterator, Mapping
 
 import flax.linen as nn
@@ -103,6 +104,16 @@ where the step asks for one. Each adds over whatever a gradient adds over (the m
 the devices of a data axis), so the statistics follow from the total (`cotangent_statistics`)."""
 
 _DISCOVERING: contextvars.ContextVar[bool] = contextvars.ContextVar("discovering_probes", default=False)
+
+BY_PATH = "__by_path__"
+"""The mark a stacked run's module sows where a glob takes it for one of its layers alone: the log keeps
+the entries of the layers the glob names (`kept`)."""
+
+_STACKED = re.compile(r"(?:^|(?<=/))(?:stages/)?layers_\d+(?:_\d+)?(?=/|$)")
+"""A traced path's stacked layer component: a scanned run (`layers_3_7`) or a pipeline stage's layer
+(`stages/layers_1`), whose module runs layers the log names apart."""
+
+_LAYER = re.compile(r"(?:^|(?<=/))layers_[^/]*(?=/|$)")
 _LIVE: contextvars.ContextVar[jax.Array | None] = contextvars.ContextVar("live_rows", default=None)
 _SCALE: contextvars.ContextVar[jax.Array | None] = contextvars.ContextVar("loss_scale", default=None)
 
@@ -245,12 +256,22 @@ def watching(modules: tuple[str, ...], *, histogram: bool = False,
     def interceptor(next_fun, args, kwargs, context):
         output = next_fun(*args, **kwargs)
         module = context.module
-        names = (type(module).__name__, "/".join(module.path))
-        if context.method_name != "__call__" or not any(
-                fnmatch.fnmatchcase(name, glob) for glob in modules for name in names):
+        path = "/".join(module.path)
+        named = any(fnmatch.fnmatchcase(name, glob)
+                    for glob in modules for name in (type(module).__name__, path))
+        # A stacked run of layers (`layers_3_7`, a pipeline stage's `stages/layers_j`) is any of the layers
+        # the log names its entries by: a glob over one of them takes the run, and the log keeps that layer's
+        # entries alone (`flattened`).
+        widened = _STACKED.sub("layers_*", path)
+        candidate = widened != path and any(
+            fnmatch.fnmatchcase(widened, _LAYER.sub("layers_*", glob)) for glob in modules)
+        if context.method_name != "__call__" or not (named or candidate):
             return output
         if not module.is_mutable_collection(INSPECTED):
             return output
+        if not named:
+            module.sow(INSPECTED, BY_PATH, jnp.zeros((), jnp.bool_), init_fn=dict,
+                       reduce_fn=lambda previous, latest: latest)
         leaves, tree = jax.tree.flatten(output)
         index = next((index for index, leaf in enumerate(leaves) if isinstance(leaf, jax.Array)), None)
         if index is None:
@@ -285,29 +306,53 @@ def watching(modules: tuple[str, ...], *, histogram: bool = False,
         yield
 
 
-def flattened(inspected: Mapping) -> dict[str, jax.Array]:
-    """A sown `INSPECTED` collection's scalars by name, `activations/<module path>/<statistic>`. A summary
-    a lifted transform stacked (a scanned stack's, one a layer; a pipeline's, one a microbatch) names
-    each of its entries by its index, `.../<module path>/<i>/<statistic>`, one index a stacking axis."""
+def kept(inspected: Mapping, modules: tuple[str, ...]) -> set[tuple[str, ...]]:
+    """The module paths of a sown `INSPECTED` collection the log keeps: each a glob named (`watching`), a
+    stacked run's module only at the layers a glob names by their logged path (`BY_PATH`)."""
+    found: set[tuple[str, ...]] = set()
+
+    def walk(tree, path: tuple[str, ...]):
+        if not isinstance(tree, Mapping):
+            return
+        if SOWN in tree and (BY_PATH not in tree or any(
+                fnmatch.fnmatchcase("/".join(path), glob) for glob in modules)):
+            found.add(path)
+        for key, value in tree.items():
+            walk(value, (*path, str(key)))
+
+    walk(inspected, ())
+    return found
+
+
+def flattened(inspected: Mapping, modules: tuple[str, ...] = ()) -> dict[str, jax.Array]:
+    """A sown `INSPECTED` collection's scalars by name, `activations/<module path>/<statistic>`, of the
+    modules the log keeps (`kept`, by the watched globs `modules`). A summary a lifted transform stacked
+    (a pipeline's, one a microbatch) names each of its entries by its index,
+    `.../<module path>/<i>/<statistic>`, one index a stacking axis."""
+    logged = kept(inspected, modules)
     found: dict[str, jax.Array] = {}
     for path, leaf in jax.tree_util.tree_flatten_with_path(inspected)[0]:
         keys = [str(entry.key) if isinstance(entry, jax.tree_util.DictKey) else str(entry) for entry in path]
         statistic, module = keys[-1], [key for key in keys[:-1] if key != SOWN]
-        if statistic in (PROBE, STAGED_PROBE):
+        if statistic in (PROBE, STAGED_PROBE, BY_PATH) or tuple(module) not in logged:
             continue
         for index in np.ndindex(*leaf.shape):
             found["/".join(["activations", *module, *map(str, index), statistic])] = leaf[index]
     return found
 
 
-def cotangent_summaries(gradients: Mapping, histogram: bool) -> dict[str, jax.Array]:
+def cotangent_summaries(gradients: Mapping, histogram: bool,
+                        logged: set[tuple[str, ...]] | None = None) -> dict[str, jax.Array]:
     """A step's probes' gradients (`tapped`) as the statistics of each watched output's cotangent
     (`cotangent_statistics`), by name, `cotangents/<module path>/<statistic>`, a stacked probe's entries
-    each by its index as `flattened` names an activation's."""
+    each by its index as `flattened` names an activation's; with `logged`, of those module paths alone
+    (`kept`)."""
     found: dict[str, jax.Array] = {}
     for path, leaf in jax.tree_util.tree_flatten_with_path(gradients)[0]:
         keys = [str(entry.key) if isinstance(entry, jax.tree_util.DictKey) else str(entry) for entry in path]
         module = [key for key in keys if key != PROBE]
+        if logged is not None and tuple(module) not in logged:
+            continue
         for index in np.ndindex(*leaf.shape[:-1]):
             for statistic, value in cotangent_statistics(leaf[index], histogram=histogram).items():
                 found["/".join(["cotangents", *module, *map(str, index), statistic])] = value

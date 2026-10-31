@@ -36,6 +36,7 @@ from dew.nn.inspection import (
     cotangent_summaries,
     discovering,
     flattened,
+    kept,
     probes_of,
     unscaled,
 )
@@ -207,7 +208,7 @@ def watched_activations(watched: Watched, aux: Aux) -> dict[str, jax.Array]:
     if not jax.tree.leaves(aux.inspected):
         raise ValueError(f"no module the watched globs {list(watched.modules)} name runs in the objective's "
                          f"model; name them by class (`*Attention`, `MLP`) or path (`layers_3/*`)")
-    return flattened(aux.inspected)
+    return flattened(aux.inspected, watched.modules)
 
 
 def evaluation_of(aux: Aux) -> Evaluated | None:
@@ -726,7 +727,11 @@ class Transaction:
         if self.watched is None:
             return {}
         found = watched_activations(self.watched, aux)
-        return found if probed is None else {**found, **cotangent_summaries(probed, self.watched.histogram)}
+        if probed is None:
+            return found
+        assert aux.inspected is not None
+        logged = kept(aux.inspected, self.watched.modules)
+        return {**found, **cotangent_summaries(probed, self.watched.histogram, logged)}
 
     def finish_attempt(self, state, batch, aux, pending, gradient, attempt, tokens, probed=None):
         """Commit the window when it is due, then advance the state's clocks.

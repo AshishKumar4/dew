@@ -54,8 +54,8 @@ class Inspection:
     every: int = 100
     modules: tuple[str, ...] = ()
     """Modules whose outputs a sampled step summarizes, by a glob of their class name (`*Attention`, `MLP`)
-    or their path as their call runs it (`layers_3/*`; a pipeline stage's layers by their place in the
-    stage, `stages/layers_0/*`): each call's output, its first array where it returns several, over a
+    or their path as the log names it (`layers_3/*`, a layer by its place in the decoder whether the stack
+    scans or pipelines it): each call's output, its first array where it returns several, over a
     language model's real tokens (`dew.nn.inspection.watched_positions`), one summary a layer in a scanned
     stack and one a microbatch in a pipelined one (`dew.nn.inspection.watching`), logged as
     `inspect/activations/<module path>/<statistic>`, a pipelined layer by its place in the stack."""
