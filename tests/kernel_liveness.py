@@ -5,16 +5,14 @@ makes new ones; one that only regroups (a cast between a warpgroup array and its
 bitcast, an element taken from or put into a vector or struct, an MMA accumulating in place) names its
 operands' own. Split into fragment registers (float data) and scalar ones (integers, addresses).
 
-The compile gate compares this pass with the family rules and ptxas. A derivation can inspect a candidate
-with `prepare` and keep its native JAX export, so the chosen kernel lowers once, not again in the program
-that calls it. The estimate describes the lowered program; the compiler's allocation and scheduling
-constraints are checked separately."""
+The compile gate compares this pass with the family rules and ptxas. This module never compiles a kernel
+or chooses a live run's configuration. Its estimate describes the lowered program; the compiler's
+allocation and scheduling constraints are checked separately."""
 import collections
 import dataclasses
 import math
 import re
 
-import jax
 from jax._src.interpreters import mlir as jax_mlir
 from jax.extend.mlir import ir
 from jaxlib.mlir import passmanager
@@ -752,18 +750,3 @@ def lowered_registers(module: bytes, compiler: Compiler) -> list[LoweredRegister
                                        peak.producer, peak.raised, peak.where))
     return found
 
-
-def prepare(kernel, *specs: jax.ShapeDtypeStruct, compiler: Compiler
-            ) -> tuple[jax.export.Exported, tuple[LoweredRegisters, ...]]:
-    """Lower a shape-only native candidate once, returning its reusable export and each launch's live set.
-    The caller keeps `exported.call` for the selected candidate; no executable is compiled here. A caller
-    caching that call still checks its invocation's mesh (`mosaic.checked`)."""
-    from dew.training._lowering import kernel_calls_in
-
-    exported = jax.export.export(jax.jit(kernel), platforms=('cuda',))(*specs)
-    with jax_mlir.make_ir_context():
-        module = exported.mlir_module(serialized=False)
-        calls = kernel_calls_in(module)
-    registers = tuple(launch for call in calls if call.kind == 'mosaic_gpu'
-                      for launch in lowered_registers(call.ir, compiler))
-    return exported, registers
