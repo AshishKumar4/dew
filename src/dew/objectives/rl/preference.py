@@ -18,11 +18,22 @@ from dew.artifacts import TokenScores
 from dew.batch import VALID_ROWS, Variables
 from dew.data.preferences import IDS_KEY, MASK_KEY
 from dew.inputs import Field, InputSpec
+from dew.nn.inspection import watched_positions
 from dew.objectives.base import Aux, EMASpec
 from dew.objectives.routing import ExpertBalance
 from dew.rl.surrogate import preference_logsigmoid_terms
 
 from ..lm.objective import TokenScorer
+
+
+def _real_inputs(batch) -> jax.Array:
+    """Each half's real input tokens, chosen rows then rejected as the policy scores them: every token up to
+    the half's last completion token, its prompt's and its completion's, none of the padding after it
+    (`dew.data.preferences.PreferencePair`, which pads each half past its completion)."""
+    marked = jnp.asarray(batch[MASK_KEY]) > 0
+    # The last completion token and every one before it: a mark at or after the place.
+    real = jnp.flip(jnp.cumsum(jnp.flip(marked, -1), -1), -1) > 0
+    return jnp.concatenate((real[:, 0, :-1], real[:, 1, :-1]))
 
 
 class DPOObjective(TokenScorer):
@@ -104,9 +115,10 @@ class DPOObjective(TokenScorer):
         # The policy and its reference score both halves in one forward each, through the same
         # function, so a policy equal to its reference earns zero rewards wherever the two compile alike.
         pairs = jnp.concatenate((chosen_ids, rejected_ids))
-        policy = self.token_scores(variables, pairs, qk_stats=step.qk_stats, predict=predict,
-                                   progress=self.progress(step), routing=self.balance is not None,
-                                   watched=step.watched is not None)
+        with watched_positions(_real_inputs(batch) if step.watched is not None else None):
+            policy = self.token_scores(variables, pairs, qk_stats=step.qk_stats, predict=predict,
+                                       progress=self.progress(step), routing=self.balance is not None,
+                                       watched=step.watched is not None)
         policy_chosen, policy_rejected = jnp.split(-policy.losses, 2)
         ref_chosen, ref_rejected = jnp.split(
             -self.token_scores(step.ema, pairs, progress=self.progress(step)).losses, 2)

@@ -27,6 +27,7 @@ prompt once per event.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import math
 from collections.abc import Callable, Mapping, Sequence
@@ -69,7 +70,7 @@ from dew.inputs import Field, InputSpec
 from dew.nn.cross_attention import crosses_alone
 from dew.nn.flops import MissingFlopsCount, counted_flops, frozen_training_flops, parameter_flops
 from dew.nn.inputs import CONTEXT, CONTEXT_LENGTHS, ModelInputs, pad_token_rows, rotate_rows
-from dew.nn.inspection import INSPECTED, watched_positions
+from dew.nn.inspection import INSPECTED, current_positions, watched_positions
 from dew.nn.mla import INDEXER, INDEXER_COLLECTION
 from dew.nn.moe import ROUTER_COLLECTION
 from dew.nn.precision import at_least_fp32
@@ -834,8 +835,7 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
                        + ([INDEXER_COLLECTION] if indexer else []) + ([INSPECTED] if watched else []))
         stream_depth = depths and _streamed_depths(self.model)
         opened = [*collections, 'prediction_inputs'] if stream_depth else collections
-        # A watched layer's summary reads the real queries alone (`_query_weights`), as prepared here.
-        with watched_positions(self._query_weights(prepared, bool) if watched else None):
+        with self._watched(prepared, watched):
             hidden, gathered = self._hidden_states(params, inputs, train, rngs, opened, {**packing, **replay},
                                                    layers, progress)
         sown = gathered.get(ROUTER_COLLECTION, {}) if routing else None
@@ -1031,6 +1031,15 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
                 f"{self.loss_role.name.lower()} targets, but the batch carries "
                 f"no {ROLES_KEY} column; train this objective on the chat data path")
         return xp.asarray(batch[ROLES_KEY])
+
+    def _watched(self, prepared: ModelInputs, watched: bool):
+        """Where the step watches, the positions a watched layer's summary reads in the model call over
+        `prepared` (`watched_positions`): its real queries (`_query_weights`), and of them those a caller
+        names around the scorer (a preference pair's real tokens)."""
+        if not watched:
+            return contextlib.nullcontext()
+        real, named = self._query_weights(prepared, bool), current_positions()
+        return watched_positions(real if named is None else real & named)
 
     def _query_weights(self, prepared: ModelInputs, dtype):
         """Mark every real query whose router statistics and indexer KL count.
@@ -1334,10 +1343,11 @@ class LMObjective(TokenScorer):
         prepared = self._text(batch)
         inputs, _ = self._rows(prepared.tokens)
         collections = step.sown(INDEXER_COLLECTION)
-        _, gathered = self._hidden_states(
-            thaw(params), inputs, train=step.training, rngs=model_rngs(step.key, training=step.training),
-            collections=collections, packing=prepared.slice_tokens(stop=-1).kwargs(),
-            progress=self.progress(step))
+        with self._watched(prepared, step.watched is not None):
+            _, gathered = self._hidden_states(
+                thaw(params), inputs, train=step.training, rngs=model_rngs(step.key, training=step.training),
+                collections=collections, packing=prepared.slice_tokens(stop=-1).kwargs(),
+                progress=self.progress(step))
         statistics, kl = self._warmup_statistics(gathered[INDEXER_COLLECTION], prepared, batch)
         reported = {"indexer_kl": kl}
         qk = gathered.get("qk", {}) if step.qk_stats else None
