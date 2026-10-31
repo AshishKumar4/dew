@@ -63,9 +63,10 @@ class Global:
     `records` counts every record of the run, the completed phases' too."""
 
     plan: Mapping[str, object] | None = None
-    tokens: tuple[int, ...] = ()
+    tokens: tuple[int, ...] | None = ()
     """The committed tokens each phase of `completed` ended at, for a run on the committed-token clock
-    (`dew.data.pipeline.schedule`), which no record count of a phase states; empty on the record clock."""
+    (`dew.data.pipeline.schedule`), which no record count of a phase states; empty on the record clock,
+    None in a position written before positions held them."""
 
 
 def encode(place: Global) -> bytes:
@@ -92,7 +93,7 @@ def decode(position: bytes) -> Global | None:
     plan = envelope.get("plan")
     return Global(records=int(envelope["records"]), order=str(envelope["order"]),
                   completed=completed, plan=None if plan is None else record(plan, "data plan"),
-                  tokens=tuple(int(end) for end in envelope.get("tokens", ())))
+                  tokens=None if "tokens" not in envelope else tuple(int(end) for end in envelope["tokens"]))
 
 
 def read(position: bytes) -> Global:

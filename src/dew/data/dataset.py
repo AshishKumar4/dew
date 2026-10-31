@@ -1529,7 +1529,12 @@ class PhasedStream:
                 raise ValueError(f"the saved run finished {len(saved.completed)} phases, and this run has "
                                  f"{len(self._ends) + 1}")
             finished = self._tokens[:len(saved.completed)]
-            if saved.tokens != finished:
+            if saved.tokens is None and saved.completed:
+                raise ValueError(f"the saved run finished {len(saved.completed)} phases in a position "
+                                 "written before positions held the committed tokens each ended at, so nothing "
+                                 "says where they ended on this run's clock; resume it with the Dew that "
+                                 "wrote it")
+            if saved.tokens is not None and saved.tokens != finished:
                 # Its records end where the saved run's commits reached the phases' tokens, which a phase
                 # ending at other tokens would read on from as though the run had reached them.
                 raise ValueError(f"the saved run finished its phases at {list(saved.tokens)} committed "
