@@ -480,10 +480,10 @@ def test_a_gated_delta_net_named_onto_the_template_matches_the_portable_rule():
 
 def test_the_factored_pairs_keep_a_pair_across_a_steep_sub_chunk():
     """A decay a key dimension's pairs (`algebra.key_decayed_pairs`, the intra launch's) on plain products,
-    each pair `r_i . (k_j exp2(g_i - g_j))` within fp32's resolution of its terms from the float64 sum, at a prefix steep in
-    its first sub-chunk and shallow after (base 2: -1 at token 0, -7 a token to 15, -5 at 16, -1 a token on),
-    within the declared floor: the pair of tokens 32 and 15, `2^-21`, whose lift from token 0's sub-chunk to
-    token 32's, `2^-126`, is under `PAIR_FLOOR` alone, its key gated up by `2^105`."""
+    each pair `r_i . (k_j exp2(g_i - g_j))` within fp32's resolution of its terms from the float64 sum, at a
+    prefix steep in its first sub-chunk and shallow after (base 2: -1 at token 0, -7 a token to 15, -5 at 16,
+    -1 a token on), within the declared floor: the pair of tokens 32 and 15, `2^-21`, whose lift from token
+    0's sub-chunk to token 32's, `2^-126`, is under `PAIR_FLOOR` alone, its key gated up by `2^105`."""
     from dew.nn.kernels import recurrence_algebra as algebra
 
     chunk, keys = 64, 16
