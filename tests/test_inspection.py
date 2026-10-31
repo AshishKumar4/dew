@@ -741,8 +741,10 @@ def test_every_objectives_watched_cotangents_reach_its_model_calls(name, windows
         return jax.grad(loss)(variables["params"])
 
     (params, probes), expected = jax.jit(gradients)(numeric), jax.jit(plain)(numeric)
-    assert probes and all(leaf[..., 0].min() > 0 and np.isfinite(leaf[..., 2]).all()
-                          for leaf in jax.tree.leaves(probes))
+    # rCM's student phase runs its fake score under no gradient (`test_an_rcm_critic_updates_...`).
+    trained = {key: tree for key, tree in probes.items() if not (name == "rcm" and key == "fake_score")}
+    assert trained and all(leaf[..., 0].min() > 0 and np.isfinite(leaf[..., 2]).all()
+                           for leaf in jax.tree.leaves(trained))
     assert all((left == right).all()
                for left, right in zip(jax.tree.leaves(params), jax.tree.leaves(expected), strict=True))
 
@@ -778,14 +780,16 @@ def test_a_pipelined_stacks_watched_cotangents_are_each_layers_over_its_microbat
         assert np.isfinite(piped[name])
 
 
-def test_a_critic_phases_watched_cotangent_is_the_untrained_students_zero(windows, tmp_path):
-    """An rCM critic update, which trains the fake score and runs the student under no gradient, reports
-    the student's watched cotangent as the zero it is (row 2324 review): mean and root mean square 0 and
-    its every entry zero, none of it NaN."""
+def test_an_rcm_critic_updates_watched_cotangents_are_its_fake_scores(windows, tmp_path):
+    """An rCM critic update past its warm-up, which trains the fake score and runs the student under no
+    gradient, summarizes the loss's cotangent at the fake score's watched modules, each reached by it, and
+    the student's as the zero it is (row 2324 review): no statistic NaN, a probe no cotangent reached
+    counting none."""
     from test_whole_validation import runnable
 
     from dew.nn.inspection import Watched, cotangent_statistics
     from dew.objectives.base import Step
+    from dew.objectives.diffusion.consistency import FAKE_SCORE
     from dew.training.transaction import probed_loss
 
     objective, batch = runnable("rcm", windows, tmp_path)
@@ -793,16 +797,22 @@ def test_a_critic_phases_watched_cotangent_is_the_untrained_students_zero(window
     numeric = {key: value for key, value in batch.items()
                if getattr(value, "dtype", None) is not None and value.dtype.kind in "biuf"}
     held = {key: value for key, value in batch.items() if key not in numeric}
-    critic = next(update for update in range(1, 64) if not bool(objective._student(update)))
+    critic = next(update for update in range(objective.tangent_warmup, objective.tangent_warmup + 64)
+                  if not bool(objective._student(update)))
     step = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(1), ema=variables,
                 committed=jnp.asarray(critic), watched=Watched(("*Block*",), cotangents=True))
 
     def probed(numeric):
         stats, back, _ = probed_loss(objective, variables, {**numeric, **held}, step)
         _, seed = jax.vjp(lambda stats: objective.reduce_loss(stats)[0], stats)
-        return [cotangent_statistics(leaf, histogram=False) for leaf in jax.tree.leaves(back(
-            seed(jnp.ones(()))[0])[1])]
+        return back(seed(jnp.ones(()))[0])[1]
 
-    summaries = jax.jit(probed)(numeric)
-    assert summaries and all(float(summary["rms"]) == 0 and float(summary["mean"]) == 0
-                             and float(summary["zero_fraction"]) == 1 for summary in summaries)
+    probes = jax.jit(probed)(numeric)
+    fake = jax.tree.leaves(probes[FAKE_SCORE])
+    student = jax.tree.leaves({name: tree for name, tree in probes.items() if name != FAKE_SCORE})
+    assert fake and student
+    assert all(leaf[..., 0].min() > 0 for leaf in fake) and all((leaf[..., 0] == 0).all() for leaf in student)
+    for leaf in student:
+        summary = cotangent_statistics(leaf.reshape(-1, leaf.shape[-1])[0], histogram=False)
+        assert all(np.isfinite(float(value)) for value in summary.values())
+        assert float(summary["rms"]) == 0 and float(summary["zero_fraction"]) == 1
