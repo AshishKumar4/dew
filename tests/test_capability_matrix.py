@@ -87,6 +87,7 @@ from dew.objectives.lm import LMObjective
 from dew.objectives.rl import PPOObjective, ValueHead
 from dew.objectives.rl.flow import FlowGRPOObjective, FlowRollout
 from dew.objectives.rl.grpo import GRPOObjective
+from dew.objectives.rl.nft import DiffusionNFTObjective, NFTRollout
 from dew.objectives.rl.ppo import OLD_VALUES_KEY, RETURNS_KEY
 from dew.objectives.rl.preference import DPOObjective
 from dew.objectives.rl.sessions import (
@@ -907,6 +908,18 @@ def flow_grpo(family: Family, directory: Path) -> None:
     assert_trains(objective, denoised_batch(inputs), directory, sampled=False, rollout=rollout)
 
 
+def diffusion_nft(family: Family, directory: Path) -> None:
+    """DiffusionNFT's implicit positive and negative policies over the clean samples its rollout draws
+    with the old policy, each scored against its group by a reward, its velocity held near the base
+    model's (the starting tree's)."""
+    held = loaded(family)
+    inputs = family.inputs()
+    objective = DiffusionNFTObjective(held.model, presets.Flow(), inputs, steps=2, variables=held.variables)
+    rollout = NFTRollout(objective, reward=lambda samples, batch: np.mean(samples, axis=tuple(
+        range(1, np.ndim(samples)))), groups=2, steps=3, train_steps=2)
+    assert_trains(objective, denoised_batch(inputs), directory, sampled=False, rollout=rollout)
+
+
 def jepa(family: Family, directory: Path) -> None:
     """I-JEPA's or V-JEPA's prediction of masked blocks' target states, its target encoder averaged."""
     video = len(family.inputs().sample.shape) == 4
@@ -1055,6 +1068,8 @@ METHODS: tuple[Method, ...] = (
     Method("rcm", frozenset({DENOISES}), frozenset(), rcm, trains=("rcm",),
            within=lambda family: family.name in DISTILLED),
     Method("flow_grpo", frozenset({DENOISES}), frozenset(), flow_grpo, trains=("flow_grpo",),
+           within=lambda family: family.name in DISTILLED),
+    Method("diffusion_nft", frozenset({DENOISES}), frozenset(), diffusion_nft, trains=("diffusion_nft",),
            within=lambda family: family.name in DISTILLED),
     Method("ladd", frozenset({DENOISES}), frozenset({FEATURES}), ladd, refuse_ladd, trains=("ladd",),
            within=lambda family: family.name in DISTILLED | {"hybrid_dit"}),
