@@ -432,6 +432,12 @@ def _named_as_today(value: JSON, stores: Sequence[TokenFiles]) -> JSON:
     if not isinstance(value, dict):
         return value
     if value.get("store") == "tokens" and "documents" not in value:
+        import sys
+        print("PROBE saved", json.dumps(value, sort_keys=True)[:3000], file=sys.stderr)
+        print("PROBE stores", len(stores), file=sys.stderr)
+        for store in stores:
+            print("PROBE today", json.dumps(json_value({n: p for n, p in store.fingerprint().items() if n != "documents"}, "x"), sort_keys=True)[:3000], file=sys.stderr)
+            print("PROBE alike", store.read_alike(), file=sys.stderr)
         for store in stores:
             before = {name: part for name, part in store.fingerprint().items() if name != "documents"}
             if json_value(before, "token store fingerprint") == value and store.read_alike():
