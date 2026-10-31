@@ -62,7 +62,7 @@ class _Block(nn.Module):
     width: int
     heads: int
     ffup: int
-    dtype: jnp.dtype
+    dtype: Dtype
 
     def setup(self) -> None:
         head = self.width // self.heads
