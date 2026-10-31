@@ -8,6 +8,7 @@ import functools
 import os
 import re
 import tempfile
+import threading
 from pathlib import Path
 
 import fla_gdn_support as support
@@ -21,7 +22,7 @@ from jax.sharding import PartitionSpec
 from kernel_compile import compile_kernels, failures
 
 from dew.nn.kernels import chunked_launch, fla_gdn, fla_kda, generation, grouped_matmul, recurrence, tuning
-from dew.nn.kernels.templates import bundles, resources
+from dew.nn.kernels.templates import bundles, report, resources
 from dew.nn.kernels.templates.gemm import mosaic_gpu
 
 
@@ -222,6 +223,31 @@ class _OnlyTile(_Uncounted):
                 and super().candidate(ba, config, target))
 
 
+def _spilling_forward(launch, rows: int, devices):
+    """A paired SwiGLU forward of `launch` at `rows` rows, its abstract operands placed on `devices`."""
+    placed = jax.sharding.NamedSharding(devices, PartitionSpec())
+    shapes = [jax.ShapeDtypeStruct(shape, dtype, sharding=placed)
+              for shape, dtype in (((rows, 2048), jnp.bfloat16), ((8, 2048, 4096), jnp.bfloat16),
+                                   ((8, 2048, 4096), jnp.bfloat16), ((8,), jnp.int32))]
+
+    def forward(x, gate, up, sizes):
+        return launch(x, gate, sizes, paired=up, hooks=grouped_matmul.Hooks(
+            epilogue=lambda g, u: jax.nn.silu(g) * u), out_dtype="bfloat16", trans_rhs=False, interpret=False)
+
+    return forward, shapes
+
+
+def _lowering(forward, shapes, traced: list):
+    """`forward` lowered at `shapes` afresh at each call, the config its launch takes added to `traced`."""
+    def lowered():
+        with tuning.seen() as seen:
+            program = jax.jit(forward).trace(*shapes).lower()
+        traced.append(seen.taken[0][0])
+        return program
+
+    return lowered
+
+
 @lowers("sm90")
 @pytest.mark.parametrize("exhausted", [False, True])
 def test_a_spilling_launch_is_refused_and_its_derivation_steps_down_once(exhausted):
@@ -233,23 +259,9 @@ def test_a_spilling_launch_is_refused_and_its_derivation_steps_down_once(exhaust
     from dew.nn.kernels.templates import report
     from dew.training.ahead import compile_only_gpus
 
-    launch = _OnlyTile() if exhausted else _Uncounted()
     devices = jax.sharding.Mesh(np.array(compile_only_gpus("sm90")), ("data",))
-    placed = jax.sharding.NamedSharding(devices, PartitionSpec())
-    shapes = [jax.ShapeDtypeStruct(shape, dtype, sharding=placed)
-              for shape, dtype in (((4096, 2048), jnp.bfloat16), ((8, 2048, 4096), jnp.bfloat16),
-                                   ((8, 2048, 4096), jnp.bfloat16), ((8,), jnp.int32))]
     traced = []
-
-    def lowered():
-        def forward(x, gate, up, sizes):
-            return launch(x, gate, sizes, paired=up, hooks=grouped_matmul.Hooks(
-                epilogue=lambda g, u: jax.nn.silu(g) * u), out_dtype="bfloat16", trans_rhs=False,
-                          interpret=False)
-        with tuning.seen() as seen:
-            program = jax.jit(forward).trace(*shapes).lower()
-        traced.append(seen.taken[0][0])
-        return program
+    lowered = _lowering(*_spilling_forward(_OnlyTile() if exhausted else _Uncounted(), 4096, devices), traced)
 
     with (report.refusals(), generation.assumed("sm90"),
           jax.sharding.use_abstract_mesh(generation.gpu_mesh(devices, "sm90"))):
@@ -282,6 +294,54 @@ def test_a_spilling_launch_is_refused_and_its_derivation_steps_down_once(exhaust
         assert [(miss.config, miss.stepped) for miss in report.misses()[:1]] == [
             (miss.config, miss.stepped) for miss in misses[:1]]
         assert report.refused_launches() == refused
+
+
+@lowers("sm90")
+def test_a_compile_beside_other_threads_mosaic_compiles_reads_only_its_own_kernels():
+    """A run compiles its programs from several threads at once (scoring's pass shapes, row 2790). A compile
+    through `report.compiled` beside a thread compiling other spilling Mosaic programs throughout finishes,
+    refuses its own launch alone and steps it down: a scoring run crashed here, the compile's dump directory
+    removed under the other thread's writes, and the other thread's kernels read as the compile's own."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from dew.nn.kernels.templates import report
+    from dew.training.ahead import compile_only_gpus
+
+    devices = jax.sharding.Mesh(np.array(compile_only_gpus("sm90")), ("data",))
+    mesh = generation.gpu_mesh(devices, "sm90")
+    started, stop = threading.Event(), threading.Event()
+
+    def others():
+        # Launches of other rows, so other kernels, spilling as the reading compile's does; a failure
+        # releases the wait for it too, and its result raises it.
+        rows = 4096
+        try:
+            with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
+                while not stop.is_set():
+                    rows += 64
+                    forward, shapes = _spilling_forward(_Uncounted(), rows, devices)
+                    lowered = jax.jit(forward).trace(*shapes).lower()
+                    started.set()
+                    lowered.compile()
+        finally:
+            started.set()
+
+    traced = []
+    lowered = _lowering(*_spilling_forward(_Uncounted(), 4096, devices), traced)
+
+    with ThreadPoolExecutor(1) as pool:
+        other = pool.submit(others)
+        started.wait()
+        try:
+            with (report.refusals(), generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh)):
+                report.compiled(lowered(), relower=lowered)
+                refused = report.refused_launches()
+        finally:
+            stop.set()
+        other.result()
+    first, kept = traced
+    assert kept != first
+    assert [config for _, config, _ in refused] == [first]
 
 
 GEMM_SHAPES = {"qwen3 gate": (4096, 2048, 768, 128), "mixtral up": (4096, 4096, 14336, 8),
@@ -666,7 +726,7 @@ def test_records_a_failed_process_of_their_own_wrote_are_refused():
 def test_the_resource_gate_refuses_spills_and_invalid_allocations():
     """A record the gate reads (`mosaic_failures`): a kernel past its shared memory, its tensor memory or
     spilling fails; a spill-free model disagreement is reported."""
-    from kernel_compile import mosaic_failures, mosaic_kernels
+    from kernel_compile import inherited, mosaic_failures, reports
 
     within = {"kernel": "k", "unread": [], "shared": 1024, "tmem": 256, "registers": 168, "spilled": 0}
     record = {"name": "case", "limit": 2048, "tmem_limit": 512, "kernels": [within]}
@@ -685,20 +745,47 @@ def test_the_resource_gate_refuses_spills_and_invalid_allocations():
     assert mosaic_failures([{**record, "kernels": []}])
     # The program's own refusal of a block past shared memory fails it whatever its Mosaic kernels say.
     assert mosaic_failures([{**record, "shared": 4096}])
-    # Either report without the other, or a report without a field, is read as missing, not as within.
-    complete = ("smem_scratch_bytes=1024 tmem_scratch_cols=0, tmem_collective_scratch_cols=0",
-                "Used 168 registers\n0 bytes spill stores, 0 bytes spill loads")
+    # A binary without an estimate, an estimate without a field, or a kernel whose PTX no compile covered,
+    # is read as missing, not as within.
+    complete = "Resources(smem_scratch_bytes=1024, tmem_scratch_cols=0, tmem_collective_scratch_cols=0)"
+    compiled = {"a": {"registers": 168, "spilled": 0}, "b": {"registers": 255, "spilled": 40}}
+    a, b, c = (inherited(dataclasses.asdict(found), compiled) for found in reports(
+        {"a": complete, "c": "Resources(smem_scratch_bytes=1024)"},
+        [report.Binary("a", None, 168, 0), report.Binary("b", None, 255, 40)]))
+    assert not a["unread"]
+    assert set(b["unread"]) == {"shared bytes", "tensor memory columns"}
+    assert set(c["unread"]) == {"tensor memory columns", "binary", "registers", "spills"}
+    assert len(mosaic_failures([{**record, "kernels": [a, b, c]}])) == 2
+    # An estimate past the shared memory its binary's launch asks for is another kernel's: it raises.
+    with pytest.raises(ValueError):
+        reports({"a": complete}, [report.Binary("a", None, 168, 0, shared=512)])
+    # A complete estimate and its PTX's compile without a binary: no compiled kernel, read as missing.
+    (unbound,) = (inherited(dataclasses.asdict(found), compiled) for found in reports({"a": complete}, []))
+    assert "binary" in unbound["unread"]
+    assert mosaic_failures([{**record, "kernels": [unbound]}])
+
+
+def test_the_resource_gate_refuses_two_kernels_of_one_name_and_launch():
+    """Evidence of one kernel's name and launch from two kernels is one kernel's at most: two modules
+    (`kernel_modules`), two binaries (`reports`) or two PTX modules (`write_modules`) of one raise."""
+    from kernel_compile import PTX_MODULE, kernel_modules, reports, write_modules
+
+    from dew.training._lowering import KernelCall
+
+    calls = [KernelCall("mosaic_gpu", "k", b"", module, None, "0123456789") for module in ("aa", "bb")]
+    assert kernel_modules(calls[:1]) == {"k__l0123456789": "aa"}
+    with pytest.raises(ValueError):
+        kernel_modules(calls)
+    binaries = [report.Binary("k", "0123456789", registers, 0) for registers in (168, 200)]
+    assert len(reports({}, binaries[:1])) == 1
+    with pytest.raises(ValueError):
+        reports({}, binaries)
+    module = f"//\n{PTX_MODULE}\n.visible .entry k__l0123456789_mosaic_gpu_kernel(\n)\n{{\n}}\n"
     with tempfile.TemporaryDirectory() as directory:
-        Path(directory, "a.resources.txt").write_text(complete[0])
-        Path(directory, "a.ptxas").write_text(complete[1])
-        spilling = "Used 255 registers\n40 bytes spill stores, 40 bytes spill loads"
-        Path(directory, "b.ptxas").write_text(spilling)
-        Path(directory, "c.resources.txt").write_text("smem_scratch_bytes=1024")
-        a, b, c = mosaic_kernels(directory)
-        assert not a["unread"]
-        assert set(b["unread"]) == {"shared bytes", "tensor memory columns"}
-        assert set(c["unread"]) == {"tensor memory columns", "registers", "spills"}
-        assert len(mosaic_failures([{**record, "kernels": [a, b, c]}])) == 2
+        write_modules(module, directory)
+        assert [path.name for path in Path(directory).iterdir()] == ["k__l0123456789.ptx"]
+    with tempfile.TemporaryDirectory() as directory, pytest.raises(ValueError):
+        write_modules(module * 2, directory)
 
 
 @COMPILES_FOR_TPU

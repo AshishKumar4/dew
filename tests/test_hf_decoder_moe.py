@@ -10,7 +10,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from interop_support import fixture_ids, transformers_arms, transformers_model
-from model_support import flat_tree
+from model_support import flat_tree, stepped_outputs
 from reference_error import (
     FACTOR,
     assert_as_exact,
@@ -51,12 +51,16 @@ prefilled and stepped through the cache, and left-padded, sized by `seeds_for` p
 on the CPU."""
 
 
-def assert_routed(name: str, ours, label: str, leaf: str = 'logits', *, wide=None, **fields) -> None:
+def assert_routed(name: str, ours, label: str, leaf: str = 'logits', *, wide=None, prefill: int | None = None,
+                  **fields) -> None:
     """Check 1 of `ours(model, variables)`, Dew's fp32 function of a draw's ids (`fixture_ids`), against
     transformers' logits over them, the padded rows' `fields` beside them (their `attention_mask`, which
     pads the ids with 0, and `position_ids`) at the mask's valid places: run in the test from its float64
     twin, or for a `RECORDED` decoder its recording's `leaf`, the truth Dew's `wide` (by default `ours`)
-    run in float64 and held to the recording's sketch (`indexed_recording`)."""
+    run in float64 and held to the recording's sketch (`indexed_recording`). With `prefill`, `ours`
+    decodes through its cache and transformers' logits are read at the shapes its steps compute
+    (`stepped_outputs`: the prefill's from one forward over it, each later id's from one over the ids up
+    to it; ledger 1543), the float64 truth one forward over the whole row."""
     import torch
 
     directory = FIXTURES / name
@@ -65,6 +69,8 @@ def assert_routed(name: str, ours, label: str, leaf: str = 'logits', *, wide=Non
     if name in RECORDED:
         path = directory / 'recorded_logits.npz'
         seeds = declared_seeds(path)['logits']
+        # A cached decode's reference is the recording's at the shapes its steps compute.
+        leaf = leaf if prefill is None else 'stepped_logits'
         fp32 = ours(model, variables)
         wide = (wide or ours)(model.clone(dtype=jnp.float64), widened(variables))
         recorded, reference, truth = indexed_recording(
@@ -81,7 +87,12 @@ def assert_routed(name: str, ours, label: str, leaf: str = 'logits', *, wide=Non
             return model(ids, use_cache=False).logits
         return model(torch.where(valid, ids, 0), **tensors, use_cache=False).logits[valid]
 
-    reference, truth = transformers_arms(transformers_model(directory), read)
+    def stepped(model, ids):
+        return torch.from_numpy(np.asarray(stepped_outputs(
+            lambda length: read(model, ids[:, :length]).numpy(), ids.shape[1], prefill)))
+
+    reference, _ = transformers_arms(transformers_model(directory), read if prefill is None else stepped)
+    _, truth = transformers_arms(transformers_model(directory), read)
     assert_as_exact(ours(model, variables), reference, draw, label, seeds=ROUTED_SEEDS, truth_fn=truth)
 
 
@@ -118,7 +129,7 @@ def test_a_routed_decoders_prefill_and_token_steps_match_the_reference(name):
         return run
 
     # The truth is the whole forward's in float64: a recording holds no cache walk of its own.
-    assert_routed(name, stepped, f'{ROUTED[name]} cache', wide=whole)
+    assert_routed(name, stepped, f'{ROUTED[name]} cache', wide=whole, prefill=4)
 
 
 @pytest.mark.parametrize('name', ROUTED)

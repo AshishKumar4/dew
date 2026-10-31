@@ -12,6 +12,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.devices import deterministic_ops_requested
+from dew.nn.kernels import tuning
 from dew.nn.kernels.templates import attention_algebra as algebra, mosaic
 from dew.nn.kernels.templates.attention import DKV_GRADS, Dropout, Kind, by_power, shared_place
 from dew.nn.kernels.templates.attention_mosaic_program import (
@@ -295,7 +296,8 @@ def _keys_last(arrays, kinds) -> tuple[jax.Array, ...]:
     return tuple(jnp.swapaxes(array, -1, -2) if kind == Kind.TILE else array
                  for array, kind in zip(arrays, kinds, strict=True))
 
-def _dkv_kernel(walk: _Backward, entry, graded: list[Kind], query, key, value, dout, shares: tuple):
+def _dkv_kernel(walk: _Backward, entry, graded: list[Kind], query, key, value, dout, shares: tuple,
+                name: str):
     """The dK/dV program `entry`'s launch (`Family.kernel`) over `query` `[B, Qp, H, D]` and `key` and
     `value` `[B, Kp, Hk, D]`: dK and dV `[B, Kp, H, D]` fp32 out, each its share's columns (`shares`), the
     hook's key and tile gradients added into refs of their own (`_dkv_launched`); a program a query head's
@@ -310,8 +312,7 @@ def _dkv_kernel(walk: _Backward, entry, graded: list[Kind], query, key, value, d
         grid=(heads, keys_padded // (_holders(family, consumers) * walk.program.tiles.block_k), batch),
         grid_names=("heads", "k_tiles", "batch"), consumers=consumers, interpret=walk.interpret,
         approx_math=walk.approx_math,
-        name=("attention_dkv_fused" if walk.fused else "attention_dkv")
-        + ("" if shares[0][1] == width else f"_columns{shares[0][0] // shares[0][1]}"),
+        name=name,
         reducing_warpgroups=reducing(family, consumers, walk.spec.score_mod),
         # The model's products this launch owns (`stated`): its shares of dK's and dV's, dP's in the first
         # share's and dQ's where it adds it; its `S` (and a later share's dP) recomputed.
@@ -327,18 +328,22 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
     queries taken by the call's power, its logits' (`_dkv_step`)."""
     columns = walk.program.tiles.columns
     width, value_width = query.shape[-1] // columns, value.shape[-1] // columns
-    launched = [_dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index, spans,
-                             score_params, drop, scaled, walk=walk,
-                             shares=((column * width, width), (column * value_width, value_width)))
-                for column in range(columns)]
+    name = "attention_dkv_fused" if walk.fused else "attention_dkv"
+    launched: list[tuple[jax.Array, ...]] = [
+        _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index, spans, score_params,
+                     drop, scaled, walk=walk,
+                     shares=((column * width, width), (column * value_width, value_width)),
+                     name=name + ("" if columns == 1 else f"_columns{column}"))
+        for column in range(columns)]
     if columns == 1:
         return launched[0]
     dk, dv = (jnp.concatenate([out[place] for out in launched], axis=-1) for place in (0, 1))
     return dk, dv, *launched[0][2:]
 
+@tuning.lowered_once(("walk", "shares", "name"))
 def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index, spans: _Spans | None,
                  score_params: tuple, drop: Dropout | None, scaled: jax.Array, *, walk: _Backward,
-                 shares: tuple) -> tuple[jax.Array, ...]:
+                 shares: tuple, name: str) -> tuple[jax.Array, ...]:
     """The dK/dV program under the dQ program's softmax: each consumer's `block_k` keys of a query head,
     resident, walked by the query tiles that see them, streamed with their output cotangents through a ring
     each; a tile's weights and score cotangents (the algebra's, rows the keys, `_dkv_step`) the transposed
@@ -447,7 +452,7 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
             _summed_stored(family, summed, _shared_views(outputs, grads, graded, block_k), consumers,
                            walk.interpret)
 
-    launch = _dkv_kernel(walk, entry, graded, query, key, value, dout, shares)
+    launch = _dkv_kernel(walk, entry, graded, query, key, value, dout, shares, name)
     operands = (query, key, value, dout, peak, total, anchor, delta, key_index, *leaves)
     graded_params = [param for param, kind in zip(score_params, kinds, strict=True) if kind in graded]
     return _dkv_launched(walk, launch, operands, graded, [param.shape for param in graded_params],

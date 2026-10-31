@@ -47,8 +47,10 @@ import contextlib
 import contextvars
 import dataclasses
 import enum
+import functools
 import hashlib
 import importlib
+import inspect
 import json
 import logging
 import os
@@ -559,6 +561,61 @@ class KernelOp(tokamax.Op):
         keys = jax.random.split(jax.random.key(seed), len(specs))
         return [jax.random.normal(key, spec.shape, spec.dtype) if jnp.issubdtype(spec.dtype, jnp.floating)
                 else jnp.zeros(spec.shape, spec.dtype) for key, spec in zip(keys, specs, strict=True)]
+
+
+def lowered_once(static: tuple[str, ...], *, unless: Callable[[], bool] = lambda: False
+                 ) -> Callable[[Callable], Callable]:
+    """A kernel launch jitted with the arguments its signature names among `static` static: JAX keys its
+    program on them and on its operands' shapes and dtypes, so each configuration is traced and lowered
+    once however many layers, passes and recomputations call it, and no operand is held (a model's layers'
+    identical kernels were each lowered again: a 9B step lowered 880 RMS norm calls for 15 programs, row
+    2440). The launch tracing it is a static too (`report.launch_digest`): its kernels' names carry it, so
+    two launches whose statics meet (a GEMM's 4089 and 4096 rows, padded alike) trace apart, each kernel
+    named for its own, and a spill refuses the launch that compiled it (row 2941). A call whose static
+    arguments reach a function closing over values (`holdable`), or one `unless` names (a plan tracing
+    every call), runs the launch itself: jit's cache would keep the closure, and any array it reaches,
+    alive."""
+    def decorate(launch: Callable) -> Callable:
+        signature = inspect.signature(launch)
+        names = tuple(name for name in static if name in signature.parameters)
+
+        # One jitted launch a launch digest. JAX keys its trace cache on the function a jit wraps, not the
+        # jit, so each digest wraps a function object of its own.
+        @functools.cache
+        def jitted(digest: str | None) -> Callable:
+            del digest
+            return jax.jit(functools.partial(launch), static_argnames=names)
+
+        @functools.wraps(launch)
+        def called(*args, **kwargs):
+            bound = signature.bind(*args, **kwargs).arguments
+            if unless() or not all(holdable(bound[name]) for name in names if name in bound):
+                return launch(*args, **kwargs)
+            return jitted(report.launch_digest())(*args, **kwargs)
+
+        return called
+
+    return decorate
+
+
+def holdable(value: Hashable | jax.Array) -> bool:
+    """Whether a cache may hold `value` without holding an array through it: no array, and no function of
+    a closure, bound method or callable object but a dataclass (a hook reading an operand's shape may reach
+    the array its call made), within a partial's arguments, a tuple or a dataclass's fields alike (a static
+    argument is hashable, so no list or dict)."""
+    if isinstance(value, (jax.Array, np.ndarray)) or inspect.ismethod(value):
+        return False
+    if isinstance(value, functools.partial):
+        return holdable(value.func) and all(map(holdable, (*value.args, *value.keywords.values())))
+    if inspect.isfunction(value):
+        return value.__closure__ is None and all(map(holdable, value.__defaults__ or ()))
+    if isinstance(value, tuple):
+        return all(map(holdable, value))
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return all(holdable(getattr(value, field.name)) for field in dataclasses.fields(value))
+    # Any other callable object (a hook class's instance) may hold an array its call reads, which no check
+    # sees; a class is a value.
+    return isinstance(value, type) or not callable(value)
 
 
 def program(function: Callable, *arguments: jax.ShapeDtypeStruct) -> str:

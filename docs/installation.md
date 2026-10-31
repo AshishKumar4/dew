@@ -99,13 +99,13 @@ A run applies it too: on a machine with an NVIDIA GPU, `prepare_process`, or the
 ### Dew's JAX build
 
 <!-- BEGIN JAX requirement (site/scripts/gen_install.py) -->
-Dew requires `jax>=0.12.0.1.post38,<0.12.1`.
+Dew requires `jax>=0.12.0.1.post41,<0.12.1`.
 <!-- END JAX requirement -->
 
 It is the JAX release that requirement names, with fixes no JAX release has yet, built from [AshishKumar4/jax](https://github.com/AshishKumar4/jax) and served by Dew's package index, the one every install above names, which serves jax alone. Every other package, jaxlib and its CUDA plugins included, comes from PyPI. The fixes:
 
 - A Pallas Triton kernel's cache key leaves out its source locations ([jax-ml/jax#41502](https://github.com/jax-ml/jax/issues/41502)), so two checkouts share one compiled kernel. JAX is removing its Pallas Triton backend and takes no change to it, so this fix stays in the build while Dew runs Pallas Triton.
-- The device-to-host transfer guard holds on a CPU array's implicit host read (`float`, `item`, `np.asarray`, its buffer) as on an accelerator's copy, which a steady state's guard needs on the CPU suite.
+- The device-to-host transfer guard holds on a CPU array's first implicit host read (`float`, `item`, `np.asarray`, its buffer), as on the copy an accelerator array's first read caches.
 - Pallas Triton divides 16-bit floats and computes `erf_inv` through float32, correctly rounded, which a GEMM template's prologue dividing in bfloat16 needs on CUDA.
 - A `custom_vjp` call (and Mosaic GPU's `custom_jvp` call) in a Pallas Triton or Mosaic GPU kernel lowers as its primal function, which a template's score hook through a `jax.custom_vjp` needs.
 - Mosaic GPU relays an MMA's accumulator out to a 16-bit MMA's left operand in registers, and an abstract device states its compute capability, which Mosaic GPU lowers for: the templates' Mosaic kernels need both on sm80.
@@ -126,10 +126,13 @@ It is the JAX release that requirement names, with fixes no JAX release has yet,
 - Mosaic GPU's WGMMA forms its shared-operand descriptors at its instructions rather than hoisting them out of an enclosing loop.
 - Mosaic GPU's TMA load coordinates reach ptxas as values it cannot fold: ptxas had miscompiled a literal coordinate into a misaligned copy, which stopped the attention training forward at head dim 128 on an H100 on an illegal instruction.
 - A persistent compilation cache entry is written aside and renamed into place, so a process reading the cache beside its writer, as packed jobs on one GPU do, sees the whole entry or none of it.
+- Resetting the compilation cache (`jax.experimental.compilation_cache.compilation_cache.reset_cache`) takes the lock its initialization holds, so a compile that sets the cache up while a reset runs is waited for, and the reset never leaves a cache behind that its flags call uninitialized.
 - `JAX_EXPLAIN_CACHE_MISSES` explains, rather than fails, a Pallas Triton reduction, whose body's earlier traces are keyed by keyword.
 - Pallas's Mosaic GPU interpreter hands its own callbacks the host's NumPy arrays, with no transfer to the CPU device a call; `jax.experimental.io_callback` still hands its callback `jax.Array`s.
 - Pallas Mosaic GPU's snake traversal keeps a full power-of-two band as a shift and mask and selects its coordinates without branching, preventing the full-band and partial-tail divisors from becoming one runtime divisor.
 - A compiled executable keeps the SHA-256 of its exact serialized bytes, taken where the persistent compilation cache writes or reads them, so an executable loaded from the cache names the artifact its writer compiled.
+- Ragged products differentiate through contracting and batch dimensions at higher orders, preserving explicit sharding, metadata prefixes and the requested accumulation precision; grouped expert products can take reverse-over-reverse derivatives.
+- A reduction's forward derivative keeps a symbolic zero tangent zero instead of materializing it, and Mosaic GPU's warpgroup loads preserve their requested fragment layout.
 
 Each fix goes from the build once a JAX release has it, and Dew then returns to that release.
 

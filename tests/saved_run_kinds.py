@@ -4,28 +4,23 @@ and each variant a run serializes apart (row 2640): a decision row of its own se
 a lettered one, a block-diffusion run over a nested decoder, a run on the examples clock, fresh runs in
 bfloat16 and in float16 (whose loss a dynamic scale scales), and a run over a source stored as it states."""
 
-import collections
 import dataclasses
-import re
-import tempfile
 from pathlib import Path
 
-import jax
 import numpy as np
+import process_support
+import run_kinds
+from run_kinds import KINDS, decision, lm, read, requested
 from test_lm_recipe import SEQ, write_token_files
-from test_run_options import KINDS, decision, lm, read
-from token_support import write_token_corpus
 
-from dew.config import ObjectiveConfig, RunConfig, SourceOptions, TrainerConfig
-from dew.data import Loading, presets
+from dew.config import RunConfig, SourceOptions, TrainerConfig
+from dew.data import presets
 from dew.data.sources.tokens import TokenFiles
-from dew.decision import Choice
 from dew.decision.config import Letters
-from dew.decision.layout import Labels, built_in
+from dew.decision.layout import AnswerCue, Instructions, Labels, OptionLines, State, Text, built_in
 from dew.decision.task import Decide
 from dew.inference.images import TextToImage
-from dew.inference.tasks import BlockGeneration, TextGeneration
-from dew.nn.kernels import options
+from dew.inference.tasks import BlockGeneration, MaskedGeneration, TextGeneration
 from dew.nn.precision import numerics_of
 from dew.registry import ModelConfig
 from dew.training.budget import Pause
@@ -68,25 +63,28 @@ def segmented(root: Path, drawn: bool) -> RunConfig:
 
 
 def lettered(root: Path, drawn: bool) -> RunConfig:
-    """A decision run of a fresh letter readout (`--head letters`) over a tiny causal source, its rows
-    lettered option lines read at an answer cue."""
-    # The tiny tokenizer spells each letter as one token bare ("{}"), not after a space.
-    return dataclasses.replace(decision(root, drawn), pretrained=QWEN,
-                               head=Letters(labels=Labels(variants=("{}",)), count=4),
-                               source=SourceOptions(text_only=True))
+    """`run_kinds.lettered`'s fresh letter readout, its source by its path in the repo."""
+    return dataclasses.replace(run_kinds.lettered(root, drawn), pretrained=QWEN)
+
+
+def lettered_in_context(root: Path, drawn: bool) -> RunConfig:
+    """A decision run of a letter readout whose question is read as the row's context (row 2008):
+    the state and the answer cue in the row, the question and its lettered options in the context its
+    cross-attention reads. A main whose option lines named their stream (0b4eb412b, rows 2008 to 2450)
+    recorded them so, which a later main reads (row 2627)."""
+    labels = Labels(variants=("{}",))
+    segments = (Text("STATE:\n"), State(), Instructions({"choice": "{}"}, stream="context"),
+                OptionLines(line="\n{label}. {option}", bare="\n{label}. {option}", join="",
+                            noul_first="false"),
+                AnswerCue(template="\nAnswer:", many="\nAnswer:"))
+    return dataclasses.replace(lettered(root, drawn), segments=segments, context_layers=(0,),
+                               head=Letters(labels=labels, count=4))
 
 
 def blockwise(root: Path, drawn: bool) -> RunConfig:
-    """A block-diffusion run over a release whose text decoder its model nests (`DiffusionGemma.text`)."""
-    # Its windows as `test_lm_recipe.gemma_spans` writes them, the tokenizer by its path in the repo.
-    corpus = write_token_corpus(root / "gemma-tokens", np.random.RandomState(160).randint(4, 32, 160),
-                                tokenizer=DIFFUSION_GEMMA, vocab_size=32, eos_id=1)
-    spans = TokenFiles(corpus.train).pipe(presets.lm, None, seq_len=11, batch=8, pack=None).loading(
-        Loading(workers=0))
-    model = ModelConfig("causal_transformer", {"dtype": "float32", "attention_impl": "xla"})
-    return dataclasses.replace(lm(root, drawn), pretrained=DIFFUSION_GEMMA, tokenizer=DIFFUSION_GEMMA,
-                               objective=ObjectiveConfig("block_diffusion", {"prompt_length": 4}),
-                               model=model, data=spans, validation=None, max_new_tokens=0)
+    """`run_kinds.blockwise`'s block-diffusion run over a release whose text decoder its model nests,
+    its release and tokenizer, its token files' too, by their path in the repo."""
+    return run_kinds.blockwise(root, drawn, release=DIFFUSION_GEMMA)
 
 
 def clocked(root: Path, drawn: bool) -> RunConfig:
@@ -121,62 +119,46 @@ def stored(root: Path, drawn: bool) -> RunConfig:
     return dataclasses.replace(over(QWEN, root, drawn), source=SourceOptions(param_dtype="bfloat16"))
 
 
-def computed(task) -> dict[str, int]:
-    """How many matrix products a loaded task multiplies in each dtype, its operands' dtypes joined by a
-    comma where they differ: the products of the programs one request of it lowers (`answered`), read
-    from the StableHLO JAX writes as it lowers them (`jax_dump_ir_to`). A model whose outer module states
-    bfloat16 while one projection of its decoder computes in float32 multiplies one product fewer in
-    bfloat16. JAX's caches and Dew's outer programs (`dew.nn.kernels.options.program`, which an equal
-    model's earlier task compiled) are cleared first, so every program lowers anew. The products are the
-    suite's CPU's, as the corpus's writer counts them under the suite's environment, whose wide
-    arithmetic multiplies a product summed in float32 in float64 (`dew.nn.precision.accumulated`); an
-    accelerator lowers its own (bible §7 runs these files on the CPU)."""
-    assert jax.default_backend() == "cpu", "a saved run's products are counted on the suite's CPU"
-    jax.clear_caches()
-    options._program.cache_clear()
-    before = jax.config.values["jax_dump_ir_to"]
-    with tempfile.TemporaryDirectory() as dump:
-        jax.config.update("jax_dump_ir_to", dump)
-        try:
-            answered(task)
-        finally:
-            jax.config.update("jax_dump_ir_to", before)
-        lowered = "".join(path.read_text() for path in Path(dump).glob("*.mlir"))
-    products = collections.Counter(",".join(sorted({DTYPES[operand.rsplit("x", 1)[-1]] for operand in pair}))
-                                   for pair in PRODUCT.findall(lowered))
-    assert products, "the request lowered no matrix product"
-    return dict(sorted(products.items()))
-
-
-PRODUCT = re.compile(r"stablehlo\.dot_general [^\n]*: \(tensor<([^>]*)>, tensor<([^>]*)>\)")
-"""A matrix product of a lowered program and its operands' tensor types, shape and element type."""
-
-DTYPES = {"bf16": "bfloat16", "f16": "float16", "f32": "float32", "f64": "float64"}
-"""The dtype StableHLO's element type names."""
+def computed(directory: Path | str, step: int | None = None) -> dict[str, dict[str, list[str]]]:
+    """Each module's dtypes, by its variable scope's path, that one request of the task a saved run at
+    `directory` loads, at `step` or else its default, multiplies in (`products`, a packed projection's at
+    each of its members), beside the projections its model packs (`packs`): its products' operands'
+    (`saved_run_products`), read in a fresh interpreter, where every program the request runs lowers, as
+    the corpus's writer reads them. A model whose outer module states bfloat16 while one projection of
+    its decoder computes in float32 states float32 at that projection's scope. The products are the
+    suite's CPU's, in the suite's environment, whose wide arithmetic multiplies a product summed in
+    float32 in float64 (`dew.nn.precision.accumulated`); an accelerator lowers its own (bible §7 runs
+    these files on the CPU)."""
+    # A record names the repo's sources by their path in it, read from the checkout's root.
+    found = process_support.fresh(Path(__file__).with_name("saved_run_products.py"), str(directory),
+                                  *([] if step is None else [str(step)]), cwd=process_support.REPO_ROOT)
+    assert found["products"], "the request lowered no matrix product"
+    return found
 
 
 def answered(task) -> None:
-    """One request of a loaded task, as its kind's users make it, and its answer: a language model
-    continues a prompt by one token through the tokenizer its run recorded, a decision answers a
-    question about a state, and a text-to-image run draws an image in one step."""
+    """One request of a loaded task, as its kind's users make it (`run_kinds.requested`), and its answer:
+    a language model continues a prompt through the tokenizer its run recorded, a block or masked
+    generation steps its decoder past the prompt, a decision answers a question about a state with one
+    of its options, and a text-to-image run draws an image."""
+    answer = requested(task)
     if isinstance(task, TextGeneration):
-        assert len(task.decode(task("ab", max_new_tokens=1, key=0))) == 1
-    elif isinstance(task, BlockGeneration):
+        assert task.decode(answer)
+    elif isinstance(task, MaskedGeneration | BlockGeneration):
         # A response of at least one token past the prompt, its decoder having stepped.
-        generated = task([[4, 5, 6, 7]], 4, key=0).host()
+        generated = answer.host()
         assert (np.asarray(generated.lengths) > 0).all() and (np.asarray(generated.decoder_steps) > 0).all()
     elif isinstance(task, Decide):
-        question = {"team": Choice("which team", ["billing", "technical", "sales"])}
-        [answers] = task([({"text": "the site is down"}, question)])
+        [answers] = answer
         assert answers["team"].choice in ("billing", "technical", "sales")
     elif isinstance(task, TextToImage):
-        assert len(task(["a cat"], steps=1, key=0).pil()) == 1
-    else:
-        raise AssertionError(f"no request is written for a saved {type(task).__name__}")
+        assert len(answer.pil()) == 1
 
 
 SAVED_KINDS = {**KINDS, "multimodal": multimodal, "decision-segments": segmented,
-               "decision-lettered": lettered, "block-diffusion": blockwise, "lm-examples": clocked,
+               "decision-lettered": lettered, "decision-lettered-context": lettered_in_context,
+               "block-diffusion": blockwise, "lm-examples": clocked,
                "lm-bf16": fresh, "lm-float16": scaled, "lm-scaled": chosen_scale, "lm-stored": stored}
-"""Each kind the corpus saves a run of: every run kind (`test_run_options.KINDS`), an LM run whose decoder
-its source's model nests, and each serialized variant beside them."""
+"""Each kind the corpus saves a run of: every run kind (`run_kinds.KINDS`), an LM run whose decoder
+its source's model nests, and each serialized variant beside them, a lettered question read in context
+among them."""

@@ -5,6 +5,75 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- A file an export's manifest or a source's `file_info` declares is never read as other bytes under
+  that declaration, which a run's identity holds: an export records the version its store published
+  each shard at (an S3 ETag, a GCS generation), and each read of a range of it is held to that version,
+  refused (`dew.data.declared.Replaced`) where the store no longer holds it; Parquet and Arrow files on
+  S3 or GCS keep Arrow's own clients, each read of a fragment between two reads of the file's version;
+  an export on a Hub repository read by its branch is read at the commit the branch names as its
+  manifest is read, every file it lists at that commit; a local or in-memory file is checked against its
+  digest as a read opens it, and an indexed reader reads the file it checked while it holds it; any
+  other remote file, and an ArrayRecord shard, which its reader opens by path, is read whole into Dew's
+  mirror and checked there. A published cache generation's shards and lengths, and a token export's
+  lengths, are read as declared too.
+- A streamed Hub split reads the files of the configuration it names, or of the default its card
+  states, as `datasets` resolves its card's `configs` (`data_files` under `data_dir`), and its Parquet
+  conversion reads that configuration's directory: naming none, where a card states several and marks
+  no default, is refused, as is naming one it does not state, where every configuration's split of
+  that name was read before.
+- MaxText's GPT-3 builds as a decoder: `scale_offset` on a `'layer'` norm stores its weight as its
+  offset from one (`dew.nn.norms.OffsetLayerNorm`), beside learned positions, biased attention and MLP
+  and tied logits; MaxText's Engram layer, from its bucket ids, is the PLE layer a decoder builds with
+  biased projections (`Engram.ple_bias`). Each is held to MaxText 0.2.5's run
+  (`tests/test_maxtext_gpt3.py`, `tests/test_maxtext_engram.py`). MaxText's hashing of tokens to buckets
+  is not Dew's: its prime bases per n-gram order, its seed and its multipliers bounded for int32.
+- A MoVA run saved while its value experts recorded their layer's dispatch loads again, and a trainer
+  places a MoVA model's stacked value experts on the expert axis.
+- A compilation cache directory a run names after its process first compiled (`prepare_process`,
+  `trainer.compilation_cache_dir`, a second run in a notebook) holds the programs compiled after, where
+  JAX kept the first directory.
+- A decision run's summary states each question budget with where it came from beside the window's
+  (`capacities["question"]`, `capacities["option"]`: stated, the release's, Laya's where a release
+  states none, or whole), and a row a budget's cut refuses keeps that cut, which the run's data report
+  counts beside the delivered rows' (`Rejected.cut`).
+- A schedule's saved position holds the committed tokens each finished stage ended at, and a resume
+  whose finished stage ends at other tokens is refused, where it read the next stage at once.
+- An audio tower (`HFAudio`, `AudioCondition`) takes a `revision`, reads its configuration and feature
+  extractor from one commit's files, and holds their hashes in its identity, so an extractor that moved
+  under the checkpoint's name re-keys the encoded audio.
+- A run whose optimizer holds its whole update back on some calls (`optax.MultiSteps`, or
+  `optax.apply_every` last in a chain) counts its update count, EMA, committed tokens and
+  `power_profiles`' averages by the updates the optimizer applies, as its state says, where it counted
+  every call; the tokens of a held call wait in the state (`TrainState.deferred`) for the update that
+  applies them, an input `MultiSteps`' skip predicate discards commits none, and each held call draws
+  its examples afresh. A held update whose state does not say which call applied one is refused before
+  any step, naming the composition and the supported one: `optax.apply_if_finite` (drop non-finite
+  steps with `Trainer(dynamic_scale=...)`), `optax.conditionally_mask` anywhere but under
+  `dew.held_updates.phased`, which says each update trains one of the networks it alternates (the
+  consistency objective's phases), and a held update within another, under a mask, partition or
+  condition, or before a later transform.
+- Muon's and M3's Newton-Schulz multiply in the run's numerics: bfloat16 operands in its fast forms
+  (the default) and float32 at `Numerics.matmul` in its accurate ones (`--trainer.precision accurate`:
+  IEEE float32), each matrix whole on one device and the matrices spread over the mesh. A run states its
+  products exactly with `--optim.optimizer-opts '{"ns_precision": "F32_F32_F32"}'` (a
+  `jax.lax.DotAlgorithmPreset` by name), refused in JAX's own words where its platform has not the
+  algorithm; a run saved with `ns_precision` as a precision level loads with its algorithm. Opt-in beside
+  it: `per_head` (head widths by parameter pattern) orthogonalizes each head's block alone, as Kimi K3;
+  `ns_coeffs: "polar_express"` takes Polar Express's coefficients; `neuron_beta2` normalizes each output
+  neuron as NorMuon. Muon's Newton-Schulz lives in `dew.newton_schulz`, its coefficients
+  (`NEWTON_SCHULZ`) exported there alone.
+- An evaluation of a run on the examples clock records the examples it had consumed
+  (`evaluation/examples_consumed`) beside its step; a cooldown branch's, scored at the step it branched
+  at, records the branch's own count under `cooldown/examples_consumed`.
+- An evaluation's counts are its split's: `evaluation/counts/<split>/coordinated_batches` and
+  `evaluation/counts/<split>/records`, so splits scored at one step each keep their own. A cooldown
+  branch's scores are named `cooldown/<split>/<metric>`, which no split's own name can take.
+- A Gauss-Newton step (`Residuals(damping=...)`) takes every derivative order: its microbatch pullback and
+  damped step are custom JVPs, so `jax.jvp`, `jax.linearize` and a Hessian-vector product run through it,
+  and a parameter's step cotangent comes in the parameter's own dtype. The LM heads (whole, tiled and
+  fused) take a gradient of their gradient and its forward derivative, a Hessian-vector product through
+  the loss, on JAX 0.12.0.1.post40, whose variadic reduce differentiates beside a constant operand.
+
 - A run's numerics are named where they are set: `--trainer.precision accurate` (or a Lightning dtype
   preset, "bf16-true", or a `Numerics` record's JSON), `"precision": "accurate"` in a run.json, and
   `Pretrained.load(precision=...)` and `dew.pipeline(source, precision=...)`, which load in their dtypes

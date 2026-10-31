@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "config": {
-    "output": "/armada/task/artifacts/scaling-cpu.json",
+    "output": "scaling-cpu.json",
     "work": "matrix-work",
     "shards": 16,
     "records": 4096,

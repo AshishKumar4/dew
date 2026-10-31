@@ -20,7 +20,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from model_support import decode_through
+from model_support import as_stepped, decode_through
 from one_draw import assert_as_exact_as_the_reference
 from reference_error import FACTOR, assert_as_exact, declared_seeds, indexed_recording, recording, widened
 from sequence_split_support import SPLIT_ROWS, assert_split_as_whole
@@ -218,12 +218,12 @@ def test_the_layer_in_bfloat16_matches_the_reference_in_bfloat16(reference, geom
 
 def test_the_layer_decodes_as_it_prefills(reference, geometry):
     """A prefill against the cache and single-token steps after it reproduce
-    the parallel forward: the conv tail and the SSM state both cross the
-    step boundary."""
+    the parallel forwards, each step's at the width it reads (`as_stepped`):
+    the conv tail and the SSM state both cross the step boundary."""
     module = layer(geometry)
     variables = layer_params(reference)
     hidden = jnp.asarray(reference["layer.hidden"])
-    parallel = module.apply(variables, hidden)
+    parallel = as_stepped(jax.jit(lambda held: module.apply(variables, held)), hidden, 5)
 
     decoded, cache, _ = decode_through(module, variables, hidden, prefill=5)
     assert all(not jnp.any(leaf) for leaf in jax.tree.leaves(cache))
@@ -427,12 +427,13 @@ def tiny_lm(**overrides) -> CausalTransformer:
 def test_the_model_decodes_as_it_scores_in_parallel():
     """A prefill of four tokens and eight single-token steps, every layer's
     state riding the flax cache collection, against the same twelve tokens
-    scored at once."""
+    scored by full passes, each step's at the width it reads (`as_stepped`),
+    from the twelve scored at once in float64."""
     model = tiny_lm()
     rng = jax.random.key(0)
     ids = jax.random.randint(rng, (2, 12), 0, 32)
     params = model.init(rng, ids)
-    full = jnp.asarray(model.apply(params, ids))
+    full = as_stepped(jax.jit(lambda held: model.apply(params, held)), ids, 4)
 
     cache = model.apply(params, 2, method=CausalTransformer.init_cache, mutable=["cache"])[1]["cache"]
     assert all(not jnp.any(leaf) for leaf in jax.tree.leaves(cache))

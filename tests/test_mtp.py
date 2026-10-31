@@ -69,22 +69,26 @@ def test_mean_stream_trunk_exposes_normalized_states_to_plain_prediction():
             method=CausalTransformer.mtp_step, decode=True, mutable=['cache'])
         return logits, carried
 
-    def first_depth(model):
+    def first_depth(model, width=None):
         def logits(variables, ids):
             hidden = model.apply(variables, ids, method=CausalTransformer.hidden_states)
-            return model.apply(variables, hidden, ids, method=CausalTransformer.mtp_logits)[0][:, :1]
+            # The depth over the trunk's whole states, or the first `width` of them and their tokens.
+            depths = model.apply(variables, hidden[:, :width], ids[:, :width],
+                                 method=CausalTransformer.mtp_logits)
+            return depths[0][:, :1]
         return logits
 
     assert jnp.asarray(decoded(variables, ids)[1]).shape == (ids.shape[0], 1, model.emb_features)
-    # The decode step's first-depth logits on par with the full depth's at its first position, the
-    # whole sequence's forward at its own shape (check 1 over drawn models and tokens).
+    # The decode step's first-depth logits on par with the depth's over the step's own operands, the
+    # trunk's first state and its next token (ledger 1543: the reference at the shapes the step computes),
+    # from the full depth's in float64 (check 1 over drawn models and tokens).
     init = jax.jit(model.init)
 
     def draw(seed):
         ids = token_batch(batch=2, seed=seed)[TEXT_KEY]
         return init(jax.random.key(seed), ids), ids
 
-    assert_as_exact(lambda variables, ids: decoded(variables, ids)[0], first_depth(model), draw,
+    assert_as_exact(lambda variables, ids: decoded(variables, ids)[0], first_depth(model, 2), draw,
                     "the decode step's depth logits", seeds=DECODE_SEEDS,
                     truth_fn=first_depth(model.clone(dtype=jnp.float64)))
 

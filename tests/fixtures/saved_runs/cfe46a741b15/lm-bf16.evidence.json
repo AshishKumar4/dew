@@ -1,0 +1,40 @@
+{
+ "step": 2,
+ "compute": "bfloat16",
+ "products": {
+  "": [
+   "float64"
+  ],
+  "layers_0/mlp/down_proj": [
+   "bfloat16"
+  ],
+  "layers_0/mlp/gate_up_proj": [
+   "bfloat16"
+  ],
+  "layers_0/self_attn": [
+   "bfloat16"
+  ],
+  "layers_0/self_attn/o_proj": [
+   "bfloat16"
+  ],
+  "layers_0/self_attn/qkv_proj": [
+   "bfloat16"
+  ]
+ },
+ "params": [
+  "float32"
+ ],
+ "scale": null,
+ "finite_steps": null,
+ "consumed": null,
+ "remat": null,
+ "plan": {
+  "split": 1,
+  "rows": 8,
+  "head_tile": null,
+  "head_fused": false,
+  "remat": null,
+  "xla_defaults": false,
+  "narrow": true
+ }
+}

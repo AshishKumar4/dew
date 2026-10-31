@@ -26,7 +26,7 @@ from dew.batch import Variables
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import DataPartition, Reader
 from dew.data.mixing import CorpusCounts
-from dew.data.pipeline import Pack, Refused, cut_counts, cut_unit
+from dew.data.pipeline import Pack, Refused, Rejected, cut_counts, cut_unit
 from dew.data.text import HFTokenizer, Tokenizer
 from dew.decision.calibration import (
     BUCKET_MINIMUM,
@@ -185,10 +185,12 @@ class DecideSettings:
     head: Mapping[str, object]
     """The head's class record (`Head.record`), which `Head.from_record` builds over the backbone it reads,
     its one field the record leaves to the backbone: a record, not a value the settings build."""
-    layout: Layout
+    layout: Layout = field(metadata={"derived": "budgets"})
+    """The rows' layout, which the run builds of its budgets (`DecisionRunConfig.max_len`, ...), its
+    head's labels and its source's attention."""
     specials: Specials
     tokenizer: str | None
-    processor: SourceReference | None
+    processor: SourceReference | None = field(metadata={"derived": "source"})
     context_encoder: ContextEncoder = "table"
     """How the model encodes a row's context (`DecisionModel.context_encoder`); a run recorded before
     the choice existed embedded it by its token table."""
@@ -1258,11 +1260,13 @@ class WireScoring(_DecideScoring[Mapping[str, object], _Admitted, dict[str, JSON
             else:
                 rows = tuple(_Row(row) for row in decide._encoded(state, questions, context=context))
         except Refused as refused:
-            self.counts.rejected[refused.reason] += 1
+            self.counts.dropped(Rejected(refused.reason))
             raise
         usage = usage_of([row.encoded for row in rows])
         if self.whole and (usage.truncated or usage.trimmed):
-            self.counts.rejected["cut"] += 1
+            # Counted as a run counts a row it refused: its reason and the tokens its cut removed.
+            removed = {kind: tokens for kind, (_, tokens) in usage.cut.items()}
+            self.counts.dropped(Rejected("cut", cut=removed))
             cut = "state" if usage.truncated else "instructions or options"
             raise Refused("cut", f"the request does not fit the maximum context length, max_len="
                                  f"{decide.layout.max_len} tokens, without cutting its {cut}")

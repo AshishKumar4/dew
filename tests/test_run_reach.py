@@ -15,11 +15,11 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from run_kinds import TINY_LAYA, decision, diffusion, lm, scalars, trained
 from test_block_sft import assert_tree_equal
 from test_eval_harness import instance
 from test_lm_recipe import SEQ, export_tiny_decoder, recipe_args, write_token_files
 from test_run_option_matrix import recorded
-from test_run_options import TINY_LAYA, decision, diffusion, lm, scalars, trained
 
 from dew.checkpoints import Checkpoints
 from dew.cli.main import main
@@ -284,7 +284,8 @@ def test_a_decision_run_that_ends_on_its_best_loads_at_its_calibrated_step(tmp_p
     saved task loads there by default, through `Decide.from_run` and `dew.pipeline` alike, where the
     run's latest checkpoint is its last step (row 2352: the load refused the calibration's step), and
     `dew export` writes it from there (row 2553), the run's every reader pinning one default step
-    (`SavedRun.pinned`); an average reads each run at its latest step, as it states (2553's review)."""
+    (`SavedRun.pinned`); its latest step, whose weights the calibration was not fitted on, is refused;
+    an average reads each run at its latest step, as it states (2553's review)."""
     import dew
     from dew.checkpoints import averaged
     from dew.decision.task import Decide
@@ -301,6 +302,9 @@ def test_a_decision_run_that_ends_on_its_best_loads_at_its_calibrated_step(tmp_p
     assert best != checkpoints.latest, "the last step ranked best: the default step is the latest"
     for loaded in (Decide.from_run(str(runs / "ended")), dew.pipeline(str(runs / "ended"))):
         assert loaded.weights.step == best
+    # The latest step's weights would pair with the best step's calibration.
+    with pytest.raises(ValueError):
+        Decide.from_run(str(runs / "ended"), step=checkpoints.latest)
     assert main(["export", str(runs / "ended"), str(tmp_path / "exported")]) == 0
     assert [step for _, step, _ in averaged([runs / "ended"] * 2).runs] == [checkpoints.latest] * 2
 

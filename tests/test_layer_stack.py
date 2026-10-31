@@ -286,7 +286,7 @@ class ScanCase:
 
 
 PAST_TARGET = {"scan": {"gemma3n": 151}}
-"""The cases past a group's 120 s (`timed`), each its seconds in train 270's CI (f58abb8a3, ledger 2137):
+"""The cases past a group's 120 s (`timed`), each its seconds in train 270's CI (66a222273, ledger 2137):
 Gemma 3n's scanned stack; every train scans the other shapes, the sparse gate's fault among them."""
 
 
@@ -620,9 +620,9 @@ def token_draw(rows):
 
 
 PIPELINED_STATES_SEEDS = 8
-"""The pipelined layer states' check-1 seeds, sized by `seeds_for` on armada (f913cd36a)."""
+"""The pipelined layer states' check-1 seeds, sized by `seeds_for` on armada (b11e684df)."""
 FETCHED_STATES_SEEDS = 8
-"""The host-fetched layer states' check-1 seeds, sized by `seeds_for` on armada (f913cd36a)."""
+"""The host-fetched layer states' check-1 seeds, sized by `seeds_for` on armada (b11e684df)."""
 
 
 def pipelined_layer_states():

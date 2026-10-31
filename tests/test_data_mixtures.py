@@ -667,6 +667,55 @@ def test_a_schedule_reads_a_stage_until_the_run_ends_it_then_reads_as_its_phases
     assert packed_rows(again, 2) == whole[5:7]
 
 
+def test_a_schedules_position_holds_the_tokens_its_finished_stages_ended_at(tmp_path):
+    """A schedule's saved position holds the committed tokens each stage it finished ended at, beside
+    where in its records: the same schedule, or one whose later stages changed, resumes it, reading on
+    alike, and one whose finished stage ends at other tokens is refused, which would have read on in its
+    next stage at once, as though the run had committed the new tokens (row 1871)."""
+    _, first, second = weighted_packed(tmp_path, (1.0, 1.0))
+    both = {first: 1.0, second: 1.0}
+    stream = scheduled_packed((first, 1000), (both, None)).train(DataPartition())
+    packed_rows(stream, 3)
+    opened = scheduled_packed((first, 1000), (both, None)).train(DataPartition())
+    assert isinstance(opened, PhasedStream)
+    ended = opened.ending(stream.get_state())
+    assert position.read(ended).tokens == (1000,)
+    read = []
+    for entries in (((first, 1000), (both, None)), ((first, 1000), (both, 500), (second, None))):
+        resumed = scheduled_packed(*entries).train(DataPartition())
+        resumed.set_state(ended)
+        read.append(packed_rows(resumed, 2))
+    assert read[0] == read[1]
+    with pytest.raises(ValueError):
+        scheduled_packed((first, 5000), (both, None)).train(DataPartition()).set_state(ended)
+
+
+def test_a_schedules_position_saved_before_it_held_stage_tokens_resumes_only_in_its_first_stage(tmp_path):
+    """A schedule's position written before positions held the tokens its finished stages ended at (no
+    `tokens` in its envelope) records none: one standing in its first stage, which finished none, resumes;
+    one past it is refused, as nothing says where its finished stage ended in tokens (row 2862)."""
+    _, first, second = weighted_packed(tmp_path, (1.0, 1.0))
+    both = {first: 1.0, second: 1.0}
+
+    def unrecorded(state: bytes) -> bytes:
+        held = json.loads(state)
+        held["dew_global_position"].pop("tokens")
+        return json.dumps(held).encode()
+
+    stream = scheduled_packed((first, 1000), (both, None)).train(DataPartition())
+    packed_rows(stream, 3)
+    early = unrecorded(stream.get_state())
+    opened = scheduled_packed((first, 1000), (both, None)).train(DataPartition())
+    assert isinstance(opened, PhasedStream)
+    past = unrecorded(opened.ending(stream.get_state()))
+    assert position.read(early).tokens is None and position.read(past).tokens is None
+    # Saved again as it was read, it still records none.
+    assert position.read(position.encode(position.read(past))).tokens is None
+    scheduled_packed((first, 1000), (both, None)).train(DataPartition()).set_state(early)
+    with pytest.raises(ValueError):
+        scheduled_packed((first, 1000), (both, None)).train(DataPartition()).set_state(past)
+
+
 def test_a_schedule_counts_the_tokens_of_every_stage_but_its_last(tmp_path):
     """Every stage but the last commits a count of tokens, at least one; the last runs on, or ends
     the data at its own. Only a stage on the token clock, and not the last, ends where the run
@@ -1117,8 +1166,8 @@ def test_a_cooldown_branch_ends_a_schedules_stage_where_a_run_decayed_there_does
     constant = optax.inject_hyperparams(optax.sgd)(learning_rate=peak)
     tracker = RecordingTracker()
     branched = run(constant, 8, tracker, Cooldowns(at=(2,), length=4, shape="linear"))
-    cooled = {step: scalars["cooldown_val/loss"] for step, scalars in tracker.scalars
-              if "cooldown_val/loss" in scalars}
+    cooled = {step: scalars["cooldown/val/loss"] for step, scalars in tracker.scalars
+              if "cooldown/val/loss" in scalars}
     decaying = optax.inject_hyperparams(optax.sgd)(learning_rate=optax.join_schedules(
         [optax.constant_schedule(peak), optax.linear_schedule(peak, 0.0, 4)], [2]))
     decayed = RecordingTracker()
@@ -1149,7 +1198,7 @@ def test_a_cooldown_branch_past_a_schedules_last_tokens_records_no_score(tmp_pat
 
     tracker = RecordingTracker()
     branched = run(tracker, Cooldowns(at=(1,), length=12, shape="linear"))
-    assert not any("cooldown_val/loss" in scalars for _, scalars in tracker.scalars)
+    assert not any("cooldown/val/loss" in scalars for _, scalars in tracker.scalars)
     assert_same(parameters(branched), parameters(run()), "the run a branch left")
 
 

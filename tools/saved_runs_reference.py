@@ -1,7 +1,7 @@
 """Write a saved run of each run kind at this checkout, for tests/test_saved_runs.py to read at every
 later main (row 2282).
 
-Each kind's run (tests/saved_run_kinds.py's `SAVED_KINDS`: tests/test_run_options.py's `KINDS`, its data
+Each kind's run (tests/saved_run_kinds.py's `SAVED_KINDS`: tests/run_kinds.py's `KINDS`, its data
 as there, synthetic tickets, the repo's tiny image records and token files, the tiny Laya fixture, an LM
 run over a tiny multimodal source, and each serialized variant beside them) trains two steps from Python,
 or to its examples clock's bound, its own trainer otherwise, and keeps its last checkpoint; what
@@ -43,11 +43,12 @@ def anonymous(run: Path, name: str, places: dict[str, str]) -> bytes:
     a directory of the machine that wrote it (its scratch directory, its checkout), read in every text
     file as the place a later checkout reads it from, so the archive names no user, host or directory
     of the writer's; a binary file, which a later main reads as it was written, is kept as it is."""
+    import fixture_archive
+
     packed = io.BytesIO()
-    with tarfile.open(fileobj=packed, mode="w:xz") as archive:
+    with tarfile.open(fileobj=packed, mode="w:xz", preset=fixture_archive.PRESET) as archive:
         for path in sorted([run, *run.rglob("*")]):
-            info = tarfile.TarInfo((Path(name) / path.relative_to(run)).as_posix())
-            info.mtime, info.uid, info.gid, info.uname, info.gname = 0, 0, 0, "", ""
+            info = fixture_archive.anonymous(tarfile.TarInfo((Path(name) / path.relative_to(run)).as_posix()))
             if path.is_dir():
                 info.type, info.mode = tarfile.DIRTYPE, 0o755
                 archive.addfile(info)
@@ -67,9 +68,10 @@ def anonymous(run: Path, name: str, places: dict[str, str]) -> bytes:
     return packed.getvalue()
 
 
-EVIDENCE = 1
+EVIDENCE = 2
 """The version of what a recorded generation's runs record they serialized (`evidence`), which its
-`source.json` states; a generation that states one holds every kind's."""
+`source.json` states; a generation that states one holds every kind's. Version 2 records the dtypes
+one request of each task multiplies in by module path (`products`)."""
 
 
 def evidence(run, state, directory: Path) -> dict:
@@ -81,16 +83,15 @@ def evidence(run, state, directory: Path) -> dict:
     import jax
     from saved_run_kinds import computed
 
-    import dew
     from dew.registry import objectives
 
     lines = (directory / "tracking" / "records.jsonl").read_text().splitlines()
     records = [json.loads(line) for line in lines]
     compiled = [row["value"] for row in records if row["type"] == "StepCompiled"][-1]
     plan = compiled["plan"] or {}
-    task = None if objectives[run.objective.name].saved_task is None else dew.pipeline(str(directory))
+    tasked = objectives[run.objective.name].saved_task is not None
     return {"step": int(state.step), "compute": run.compute_dtype(),
-            "products": None if task is None else computed(task),
+            "products": computed(directory)["products"] if tasked else None,
             "params": sorted({str(leaf.dtype) for leaf in jax.tree.leaves(state.variables["params"])}),
             "scale": None if state.scale is None else float(state.scale.scale),
             "finite_steps": None if state.scale is None else int(state.scale.fin_steps),

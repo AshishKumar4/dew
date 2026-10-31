@@ -35,6 +35,9 @@ class Rejected:
     consumed: int = 0
     """The source examples a rejected row was the last of (`CONSUMED`), which the next row its corpus keeps
     carries on (`dew.data.mixing.Accepted`)."""
+    cut: Mapping[str, int] = dataclasses.field(default_factory=dict)
+    """The tokens the cuts of the refused rows removed, by what each cut, which its corpus counts beside
+    the refusal (`dew.data.mixing.CorpusCounts.dropped`)."""
 
 
 CONSUMED = "_dew_consumed"
@@ -330,6 +333,14 @@ class Map:
     identity: str | None = None
     rejects: bool = False
     configured: Bound | None = None
+
+
+def examples_bound(stages: Sequence[object]) -> int | None:
+    """Where a run bounded in examples marks the source examples it reads (`MarkConsumed`), the stage
+    after the bound's limit (`dew.data.compile._bounded`): its index in `stages`, None for a read the run
+    bounds otherwise. The one locator of the bound every compile and lowering step asks."""
+    return next((index for index, stage in enumerate(stages)
+                 if isinstance(stage, Map) and isinstance(stage.step, MarkConsumed)), None)
 
 
 @dataclasses.dataclass(frozen=True)

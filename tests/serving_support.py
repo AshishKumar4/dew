@@ -38,6 +38,25 @@ def served_inputs(row: np.ndarray, request: Served, vocab: int) -> ModelInputs:
                        {name: jnp.asarray([held], jnp.int32) for name, held in request.groups.items()})
 
 
+def drawn_scores(forward, weights: Variables, prompt: np.ndarray, tokens: np.ndarray,
+                 held: dict[str, np.ndarray], *, per_step: bool) -> np.ndarray:
+    """Each drawn token's log probability under `forward` (`[B, S, V]` log probabilities over `weights`,
+    tokens and their `held` fields) after `prompt` `[1, P]` and the tokens drawn before it: with
+    `per_step`, from a forward of its own over the prompt and those tokens, at the width the step that
+    drew it reads (ledger 1543: a step's reference at the shapes the step computes); else from one
+    forward over the whole row, as a float64 truth, whose products round alike at every shape."""
+    def at(step: int) -> jax.Array:
+        tail = np.full((1, step), -1, np.int32)
+        logits = forward(weights, jnp.asarray(np.concatenate([prompt, tokens[None, :step]], 1)),
+                         {name: jnp.asarray(np.concatenate([value, tail], 1))
+                          for name, value in held.items()})
+        return logits[0, prompt.shape[1] - 1:]
+
+    steps = len(tokens)
+    read = jnp.stack([at(step)[step] for step in range(steps)]) if per_step else at(steps - 1)
+    return np.asarray(jnp.take_along_axis(read, jnp.asarray(tokens)[:, None], -1)[:, 0])
+
+
 def assert_served_as_exact(task: TextGeneration, requests: Sequence[Served], label: str, *, serving: dict,
                            hits: Sequence[int] | None = None, rounds: Sequence[int] | None = None,
                            budget: int = SERVED_BUDGET, alone: bool = True,
@@ -68,9 +87,15 @@ def assert_served_as_exact(task: TextGeneration, requests: Sequence[Served], lab
     # One server for every draw, as a deployment serves request after request: its programs compile
     # once, and a draw's prompts share no page with another's, their tokens drawn apart.
     server = Server.from_task(task, **serving)
+    services: dict[bytes, list] = {}
 
     def serve(row) -> list:
-        """The server's generations of `row`'s requests, queued in `rounds`, its prefix hits checked."""
+        """The server's generations of `row`'s requests, queued in `rounds`, its prefix hits checked: each row
+        served once, as a deployment serves a prompt, and asked again (the gate's check that a draw and an
+        arm are functions of their inputs) the generations of that one service, as a second would read the
+        pages and states the first left, which no other draw's prompt shares."""
+        if (key := np.asarray(row).tobytes()) in services:
+            return services[key]
         tickets, shared, before = [], [], server.prefix_hits
         for end in itertools.accumulate(rounds):
             tickets.extend(server.submit(served_inputs(row, requests[index], vocab), budget, key=index)
@@ -78,7 +103,8 @@ def assert_served_as_exact(task: TextGeneration, requests: Sequence[Served], lab
             server.run()
             shared.append(server.prefix_hits - before)
         assert hits is None or shared == list(hits), shared
-        return [ticket.result().host() for ticket in tickets]
+        services[key] = [ticket.result().host() for ticket in tickets]
+        return services[key]
 
     def likelihoods(generations) -> tuple:
         return tuple(np.asarray(generation.raw_log_probs[0], np.float32) for generation in generations)
@@ -105,7 +131,11 @@ def assert_served_as_exact(task: TextGeneration, requests: Sequence[Served], lab
 
     def explicit(model, wide_weights: bool = False):
         """The full forward's scores of each request's draws, a host loop over the requests whose
-        forward compiles as Dew's users compile it, as the server's programs do."""
+        forward compiles as Dew's users compile it, as the server's programs do. The reference arm
+        (`wide_weights` False) scores each drawn token from a forward of its own over the prompt and the
+        tokens drawn before it, at the width the server's step reads (ledger 1543, the gate's ruling: a
+        step's reference at the shapes the step computes); the float64 truth, whose products round
+        alike at every shape, scores them all from one forward over the whole row."""
         forward = jax.jit(lambda weights, tokens, groups: jax.nn.log_softmax(
             model.apply(weights, tokens, **groups)))
 
@@ -118,12 +148,7 @@ def assert_served_as_exact(task: TextGeneration, requests: Sequence[Served], lab
                 prompt, tokens = np.asarray(inputs.tokens), np.asarray(tokens)
                 carried = {name: np.asarray(value) for name, value in inputs.token_fields.items()}
                 held = with_served_blocks(carried, np.ones(prompt.shape, bool), task.prefix)
-                tail = np.full((1, budget - 1), -1, np.int32)
-                logits = forward(weights, jnp.asarray(np.concatenate([prompt, tokens[None, :-1]], 1)),
-                                 {name: jnp.asarray(np.concatenate([value, tail], 1))
-                                  for name, value in held.items()})
-                read = logits[0, prompt.shape[1] - 1:]
-                scores.append(np.asarray(jnp.take_along_axis(read, jnp.asarray(tokens)[:, None], -1)[:, 0]))
+                scores.append(drawn_scores(forward, weights, prompt, tokens, held, per_step=not wide_weights))
             return tuple(scores)
         return scored
 

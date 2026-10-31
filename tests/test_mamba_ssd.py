@@ -111,7 +111,7 @@ def test_the_seeded_draw_preserves_the_mamba_ssm_native_inputs():
 
 PAST_TARGET = {"port": {"bf16": 256, "ragged-documents": 130, "wide-state-documents": 297}}
 """The port's cases whose interpreted seeds take a group past its two minutes (seconds, train 270's CI on
-f58abb8a3, ledger 2119), which the whole suite runs (`timed`)."""
+66a222273, ledger 2119), which the whole suite runs (`timed`)."""
 
 
 @pytest.mark.parametrize("case", timed(PAST_TARGET, "port", list(CASES)))
@@ -166,6 +166,33 @@ def test_the_port_is_as_exact_as_mamba_ssm(case):
                     as_given(lambda *args: (reference(*args),) * count), draw,
                     f"mamba_ssm {case}, heads {CASES[case]}", seeds=seeds,
                     truth_fn=as_given(lambda *args: (truth(*args),) * count))
+
+
+def the_template_is_as_exact_as_mamba_ssm():
+    """The SSD on the recurrence template under the run's fast forms (`chunk_ssd` with the scan's selector
+    named 'mosaic_gpu'), whose 16-bit numbers are mamba_ssm's (`mainloop._prepared`): every output and
+    gradient on par with recorded mamba_ssm on its bf16 case's declared draws, mamba_ssm's own distance from
+    float64 at the same inputs the bound (check 1), the truth Dew's float64 path as the port's test takes
+    it. A GPU cell (tests/test_gpu_recurrence.py): interpreted, the template's training at the case's shape
+    outlasts a test's budget. Its fp32 cases are the accurate forms' bar's
+    (test_recurrence_template_stability)."""
+    case = "bf16"
+    stored = recording(SEEDED)
+    stored.pop(PRECISION, None)
+    seeds = declared_seeds(SEEDED)[case]
+    chunk, dtype = int(stored[f"{case}.chunk"]), jnp.dtype(str(stored[f"{case}.dtype"]))
+    shape, documents = tuple(stored[f"{case}.shape"]), bool(stored[f"{case}.documents"])
+    draw, reference, truth = indexed_recording(
+        stored, case, seeds, inputs_of=lambda seed: mamba_ssd_draw(seed, shape, dtype, documents),
+        truth_fn=jax.jit(lambda inputs: mamba_ssd_xla(inputs, chunk)))
+
+    def run(index, arrays):
+        del index
+        with generation.chosen(ssd="mosaic_gpu"):
+            return mamba_ssd_xla(arrays, chunk, dtype)
+
+    assert_as_exact(jax.jit(run), as_given(reference), draw, f"the template against mamba_ssm, {case}",
+                    seeds=seeds, truth_fn=as_given(truth))
 
 
 def test_the_port_takes_widths_padded_to_powers_of_two():

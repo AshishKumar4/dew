@@ -102,7 +102,9 @@ class DecisionObjective(Objective[Ratio | Weighted]):
     The loss is `loss`, a proper scoring rule or a sum of them, computed against
     each row's right option, with `label_smoothing` spread evenly over its
     options. `shuffle_options` and `none_of_the_above` augment the rows as
-    `Encoding` describes, and `data` supplies their pipeline steps. The
+    `Encoding` describes, a choice of fewer than `none_of_the_above_options`
+    options drawing no "none of the above" (a yes or a no), and `data`
+    supplies their pipeline steps. The
     training stream and the validation pass pack rows first-fit into windows
     of the layout's `max_len` tokens (`packing`), as many rows, questions and
     options as its `bounds` let a window hold, so a step pays for its tokens
@@ -240,7 +242,8 @@ class DecisionObjective(Objective[Ratio | Weighted]):
                  label_smoothing: float = 0.0, shuffle_options: bool = True,
                  none_of_the_above: float = 0.0, temperatures: Temperatures | None = None,
                  segments: int | None = 16, context_encoder: ContextEncoder | None = None,
-                 consistency: float = 0.0, context_window: int | None = None):
+                 consistency: float = 0.0, context_window: int | None = None,
+                 none_of_the_above_options: int = 0):
         held: Variables | None = None
         widths: tuple[int | None, int] | None = None
         self.image_processor = None
@@ -282,6 +285,9 @@ class DecisionObjective(Objective[Ratio | Weighted]):
             raise ValueError("label_smoothing is a share of the target, in [0, 1)")
         if not 0.0 <= none_of_the_above <= 1.0:
             raise ValueError("none_of_the_above is a probability")
+        if none_of_the_above_options < 0:
+            raise ValueError(f"none_of_the_above_options counts options, so it is nonnegative, got "
+                             f"{none_of_the_above_options}")
         if segments is not None and segments < 1:
             raise ValueError(f"a window holds at least one row; got segments={segments}")
         if head is None:
@@ -311,6 +317,7 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         self.consistency = consistency
         self.shuffle_options = shuffle_options
         self.none_of_the_above = none_of_the_above
+        self.none_of_the_above_options = none_of_the_above_options
         self.temperatures = temperatures
         self.segments = segments
         # The most questions a row and options a question of the run's data hold, which its run records
@@ -477,10 +484,11 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         grouped = bool(self.consistency)
         training = ConfigureLayout(self.layout, self.tokenizer, self.specials, self.shuffle_options,
                                    self.none_of_the_above, train=True, context_length=self.context_length,
-                                   grouped=grouped)
+                                   grouped=grouped, none_of_the_above_options=self.none_of_the_above_options)
         evaluating = dataclasses.replace(training, train=False)
         fit = Fit(self.layout, self.tokenizer, self.specials, self.model.head, self.context_length, grouped,
-                  self.bounds, self.none_of_the_above, self.context_window)
+                  self.bounds, self.none_of_the_above, self.context_window,
+                  none_of_the_above_options=self.none_of_the_above_options)
         held = dataclasses.replace(fit, none_of_the_above=0.0, scored=True)
         # Rows a record spreads into: a layout of a question a row's, or grouped examples' apart.
         expand = (QuestionRows(),)
@@ -501,7 +509,7 @@ class DecisionObjective(Objective[Ratio | Weighted]):
             return
         slots = record(widths["slots"], "decision slots")
         self.widths = (self.layout.row_questions(integer(slots.get("questions"), "slots.questions")),
-                       option_width(slots, self.none_of_the_above))
+                       option_width(slots, self.none_of_the_above, self.none_of_the_above_options))
 
     def task_settings(self) -> DecideSettings:
         """What a saved run rebuilds its task from beside the backbone.
@@ -526,7 +534,7 @@ class DecisionObjective(Objective[Ratio | Weighted]):
     def served_groups(self, variables: Variables) -> tuple[ProjectionGroup, ...]:
         """The backbone's projection groups a served task packs (`Decide._served`), their paths from
         the `params` root: what a checkpoint holds packed where its run trained a loaded task's packed
-        tree (mains 1385b203c up to ledger 2299's fix), which a resume splits back
+        tree (mains 947ac9262 up to ledger 2299's fix), which a resume splits back
         (`dew.checkpoints`). Carried to 1.0, when it is deleted (ledger 1552)."""
         backbone = part(thaw(variables), "backbone")
         return tuple(dataclasses.replace(group, path=("backbone", *group.path))

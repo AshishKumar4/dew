@@ -1,0 +1,19 @@
+{
+ "commit": "cfe46a741b153695711e9342dd8c5985ac146020",
+ "kinds": [
+  "block-diffusion",
+  "decision",
+  "decision-lettered",
+  "decision-segments",
+  "diffusion",
+  "jepa",
+  "lm",
+  "lm-bf16",
+  "lm-examples",
+  "lm-float16",
+  "lm-scaled",
+  "lm-stored",
+  "multimodal"
+ ],
+ "evidence": 2
+}

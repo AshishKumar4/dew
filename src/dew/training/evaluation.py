@@ -118,6 +118,17 @@ class Summary:
                                  f"score ({sorted(declared | ({'loss'} if loss else set()))})")
 
 
+EXAMPLES_SCALAR = "evaluation/examples_consumed"
+"""The scalar an evaluation of a run on the examples clock records the examples it had consumed under,
+the coordinate the run's own clock places it at (`Evaluation.examples`)."""
+
+COOLDOWN = "cooldown"
+"""What a cooldown branch's evaluation is named under (`Evaluation.branched`): each split it scores,
+`cooldown/<split>`, which no split's own name can be (a split's name holds no `/`), and the examples the
+branch had consumed, `cooldown/examples_consumed`, apart from the run's own at the step it branched at
+(`EXAMPLES_SCALAR`)."""
+
+
 @dataclass(frozen=True)
 class Evaluation:
     """The result of one evaluation, with its previews kept on process 0.
@@ -127,8 +138,9 @@ class Evaluation:
     `coordinated_batches` is the number of batches every process scored, and
     `records` the number of real rows in them, which covers every record of the
     split once. `elapsed_seconds` is process 0's wall time, including closing the
-    batch iterator. The metric accumulators and the validation batches are not
-    kept.
+    batch iterator. `examples` is the source examples the run had consumed when it
+    evaluated, on the examples clock, its own coordinate there; None on another. The
+    metric accumulators and the validation batches are not kept.
     """
 
     step: int
@@ -139,15 +151,27 @@ class Evaluation:
     event_key: tuple[int, ...]
     elapsed_seconds: float
     previews: tuple[Artifact, ...]
+    examples: int | None = None
 
     @property
     def scalars(self) -> dict[str, float]:
-        """Return the metric values, plus the evaluation/* counts if a batch was scored."""
+        """Return the metric values, plus the split's counts if a batch was scored
+        (`evaluation/counts/<split>/records`, each split's its own at a step that scores several, apart
+        from every summary's, `Summary.SPLIT`), and on the
+        examples clock the examples the run had consumed (`EXAMPLES_SCALAR`), a cooldown branch's under its
+        own name (`COOLDOWN`)."""
+        named = f"{COOLDOWN}/examples_consumed" if self.split.startswith(f"{COOLDOWN}/") else EXAMPLES_SCALAR
+        clocked = {} if self.examples is None else {named: float(self.examples)}
         if not self.coordinated_batches:
-            return dict(self.scores)
+            return {**self.scores, **clocked}
         return {**self.scores,
-                "evaluation/coordinated_batches": float(self.coordinated_batches),
-                "evaluation/records": float(self.records)}
+                f"evaluation/counts/{self.split}/coordinated_batches": float(self.coordinated_batches),
+                f"evaluation/counts/{self.split}/records": float(self.records), **clocked}
+
+    def branched(self) -> Evaluation:
+        """This evaluation as a cooldown branch's: its split and every score named under `COOLDOWN`."""
+        return replace(self, split=f"{COOLDOWN}/{self.split}",
+                       scores={f"{COOLDOWN}/{name}": value for name, value in self.scores.items()})
 
     @classmethod
     def run(cls, objective: Objective[Loss, Effects], variables: Variables,

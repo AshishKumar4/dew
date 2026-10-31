@@ -195,7 +195,7 @@ def test_a_configured_run_compiles_its_step_ahead_for_gpus_it_lacks_and_trains_n
     its default the run's own config) compiles its first step for one compile-only A100, writes it
     where it names, and ends with status 0, the step loadable and what it costs stated; it writes no
     checkpoint or tracking, as it trains nothing (row 1915)."""
-    from test_run_options import lm
+    from run_kinds import lm
 
     from dew.config.lm import LMRunConfig
     from dew.training.ahead import AheadOfTime, CompiledAhead
@@ -222,7 +222,7 @@ def test_a_configured_run_compiles_its_step_ahead_for_a_tpu_topology_with_its_st
     compiles its first step for that topology's compile-only devices here, through the plan a run takes,
     and writes it as any step compiled ahead (ledger 2551). The links it compiles with are the run's own
     (`trainer.links`), which the step records (ledger 2552)."""
-    from test_run_options import lm
+    from run_kinds import lm
 
     from dew.config.lm import LMRunConfig
     from dew.training.ahead import AheadOfTime, CompiledAhead
@@ -250,7 +250,7 @@ def test_a_run_on_the_examples_clock_compiles_its_step_ahead_reading_its_progres
     its steps, keeps its progress on the examples clock: compiled ahead for a GPU it lacks, its step reads
     that progress as fit's does (`Trainer.reading`), under a schedule over the run (`Linear`), and the run
     ends with the step saved, where it was compiled over no clock and refused the schedule (row 2434)."""
-    from test_run_options import decision
+    from run_kinds import decision
 
     from dew.decision.config import DecisionRunConfig
     from dew.training.ahead import AheadOfTime, CompiledAhead
@@ -270,6 +270,37 @@ def test_a_run_on_the_examples_clock_compiles_its_step_ahead_reading_its_progres
         run.run()
     assert ended.value.code == 0
     assert AheadOfTime.load(path).peak_bytes > 0
+
+
+def a_clocked_run_with_a_cooldown_trains_from_its_step_compiled_ahead_compiling_no_other(tmp_path):
+    """A GPU flow's cell (tests/test_gpu_training.py; it trains from a step compiled ahead on this host's own
+    GPU): a decision run on the examples clock under a schedule over the run, with a cooldown, compiled
+    ahead through its command line for this GPU's generation (`--trainer.compile-ahead`) and then handed
+    the step it saved (`--trainer.ahead`), trains from that step through its cooldown's branch, its last
+    window's too, and compiles no step program of its own: each batch it steps closes its window as the
+    one it compiled ahead over did (ledgers 2434, 2527)."""
+    from run_kinds import decision
+
+    from dew.decision.config import DecisionRunConfig
+    from dew.nn.kernels.generation import device_generation
+    from dew.training.ahead import CompiledAhead
+
+    runs, path = tmp_path / "runs", tmp_path / "step.dew-aot"
+    default = decision(tmp_path, drawn=False)
+    stated = ["--trainer.checkpoint-dir", str(runs), "--trainer.examples", "48",
+              "--trainer.multi-host", "False", "--trainer.compilation-cache-dir", "None",
+              "--trainer.cooldowns.at", "50%", "--trainer.cooldowns.length", "25%",
+              "--optim.learning-rate", '{"class": "linear", "fields": {"peak_value": 0.001}}']
+    ahead = ["--trainer.compile-ahead.generation", device_generation(),
+             "--trainer.compile-ahead.devices", "1", "--trainer.compile-ahead.path", str(path)]
+    compiling = DecisionRunConfig.cli(["--trainer.name", "ahead", *stated, *ahead], default=default)
+    with pytest.raises(CompiledAhead):
+        compiling.run()
+    handed = DecisionRunConfig.cli(["--trainer.name", "handed", *stated, "--trainer.ahead", str(path)],
+                                   default=default)
+    with Compiles("step") as compiles:
+        state = handed.run()
+    assert compiles.count == 0 and int(state.updates) > 0
 
 
 ACCUMULATION_CELLS = [("sm80", "bfloat16"), ("sm90", "float32")]

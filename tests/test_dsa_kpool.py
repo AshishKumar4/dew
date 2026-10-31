@@ -30,6 +30,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 from flax import linen as nn
+from model_support import stepped_outputs
 from reference_error import (
     as_given,
     assert_as_exact,
@@ -152,16 +153,31 @@ def call(valid):
     return MixerCall(AttentionMetadata(coordinates=coordinates(valid=valid)))
 
 
-def dew_block(variables, **overrides):
-    """Dew's block over `variables` as a function of a draw: its output on the valid rows."""
+def dew_block(variables, *, prefill: int | None = None, **overrides):
+    """Dew's block over `variables` as a function of a draw: its output on the valid rows; with
+    `prefill`, at the shapes a decode of a `prefill`-token prefill computes them (`stepped_outputs`)."""
     run = jax.jit(lambda hidden, valid: module(**overrides).apply(variables, hidden, call(valid)))
-    return as_given(lambda hidden, valid: {'output': on_valid_rows(run(hidden, valid), valid)})
+
+    def output(hidden, valid):
+        if prefill is None:
+            return run(hidden, valid)
+        return stepped_outputs(lambda length: run(hidden[:, :length], valid[:, :length]), hidden.shape[1],
+                               prefill)
+
+    return as_given(lambda hidden, valid: {'output': on_valid_rows(output(hidden, valid), valid)})
 
 
-def reference_block_output(block):
-    """The reference block, fp32, as a function of a draw: its output on the valid rows."""
-    return as_given(lambda hidden, valid: {'output': on_valid_rows(reference_output(block, hidden, valid),
-                                                                    valid)})
+def reference_block_output(block, *, prefill: int | None = None):
+    """The reference block, fp32, as a function of a draw: its output on the valid rows; with `prefill`,
+    at the shapes a decode of a `prefill`-token prefill computes them (`stepped_outputs`)."""
+    def output(hidden, valid):
+        if prefill is None:
+            return reference_output(block, hidden, valid)
+        return stepped_outputs(lambda length: jnp.asarray(reference_output(block, hidden[:, :length],
+                                                                           valid[:, :length])),
+                               hidden.shape[1], prefill)
+
+    return as_given(lambda hidden, valid: {'output': on_valid_rows(output(hidden, valid), valid)})
 
 
 def wide_block(block):
@@ -363,14 +379,14 @@ def test_prefill_then_token_steps_reproduce_the_parallel_block():
     """Five tokens, then one at a time through the fixed-capacity cache: each
     step's pools are read off the cache slots, the tail is empty after an
     even count of keys and one token after an odd one, so it changes at
-    every step; the steps are on par with the block over the whole sequence,
-    and it with the reference (check 1)."""
+    every step; the steps are on par with the block's passes, each step's at
+    the width it reads, and the block with the reference (check 1)."""
     block = reference_block()
     variables = translated(block)
     draw, truth = drawn(block, padded=False), float64_block(block)
     assert_as_exact(dew_block(variables), reference_block_output(block), draw, 'unpadded k-pool block',
                     seeds=SEEDS['parallel'], truth_fn=truth)
-    assert_as_exact(stepped(variables, rows=False), dew_block(variables), draw, 'k-pool decode',
+    assert_as_exact(stepped(variables, rows=False), dew_block(variables, prefill=5), draw, 'k-pool decode',
                     seeds=SEEDS['decode'], truth_fn=truth)
 
 
@@ -379,15 +395,15 @@ def test_a_padded_prefill_decodes_like_the_padded_parallel_block():
     pools from the row's first real key: the same pools, so the valid rows
     are on par (check 1); the padded queries' steps write nothing."""
     block = reference_block()
-    assert_as_exact(stepped(translated(block)), reference_block_output(block), drawn(block),
+    assert_as_exact(stepped(translated(block)), reference_block_output(block, prefill=5), drawn(block),
                     'padded k-pool decode', seeds=SEEDS['padded decode'], truth_fn=float64_block(block))
 
 
 def test_a_row_with_a_hole_pools_as_its_cache_does():
     """A validity hole inside a row: the parallel block pools and tails the row's real keys in the
     order its cache compacts them (`valid_order`), which the reference does not, so its real queries
-    are on par with the prefill-then-steps ones (check 1), as a left-padded row's are; the truth is
-    Dew's block in float64."""
+    are on par with the prefill-then-steps ones, each step's at the width it reads (check 1), as a
+    left-padded row's are; the truth is Dew's block in float64."""
     variables = translated(reference_block())
 
     def draw(seed):
@@ -399,8 +415,8 @@ def test_a_row_with_a_hole_pools_as_its_cache_does():
         wide = module(dtype=jnp.float64).apply(widened(variables), hidden, call(valid))
         return {'output': on_valid_rows(wide, valid)}
 
-    assert_as_exact(stepped(variables), dew_block(variables), draw, 'k-pool hole', seeds=SEEDS['hole'],
-                    truth_fn=truth)
+    assert_as_exact(stepped(variables), dew_block(variables, prefill=5), draw, 'k-pool hole',
+                    seeds=SEEDS['hole'], truth_fn=truth)
 
 
 def test_the_kind_builds_from_the_configs_fields_and_is_nope():

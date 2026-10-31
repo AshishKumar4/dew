@@ -162,12 +162,13 @@ class DiffusionRunConfig(RunConfig):
     autoencoder: PretrainedAutoencoder | None = None
     """The autoencoder for latent diffusion; None trains in pixel space."""
     pretrained: str | None = None
-    """A published diffusion pipeline to fine-tune.
+    """A published diffusion pipeline to fine-tune, or a saved diffusion run to start from.
 
-    It is a Hub repo, `repo@revision` or a local directory in the diffusers layout.
-    The checkpoint decides the model, its text conditioning and its autoencoder, so
-    `--model` holds only the precision settings and `text` and `autoencoder` stay
-    unset.
+    It is a Hub repo, `repo@revision` or a local directory in the diffusers layout,
+    or a saved Dew run's directory, which loads as its own sampling task at the step
+    `--source.step` selects (`load_diffusion_source`). The checkpoint decides the
+    model, its text conditioning and its autoencoder, so `--model` holds only the
+    precision settings and `text` and `autoencoder` stay unset.
     """
     teacher_run: str | None = None
     """The run directory a distillation's teacher trained in. Its published weights are the frozen
@@ -240,6 +241,25 @@ class DiffusionRunConfig(RunConfig):
         one whose size varies."""
         return media_field(self.chain(), "diffusion")
 
+    def mask_field(self, sample: Field, wanted: Field) -> Field:
+        """The batch field an inpainting pipeline reads its mask from (`wanted`, the pipeline's own): the
+        chain's `wanted.key` at the samples' height and width, one channel, as `dew.data.images.RandomMask`
+        draws one or a dataset's own column decodes one. A chain that carries none is refused, naming
+        RandomMask: an inpainting pipeline paints the region its mask marks, and a plain image chain
+        marks none."""
+        fields = record(self.chain().facts()["fields"], "the chain's fields")
+        shape = fields.get(wanted.key)
+        expected = (*sample.shape[:-1], 1)
+        if shape is None:
+            raise ValueError(f"{self.pretrained} is an inpainting pipeline, which paints the region a mask "
+                             f"marks in each image; the chain carries no {wanted.key!r} field: draw one per "
+                             f"image with dew.data.images.RandomMask() (images(..., augment=RandomMask())), "
+                             f"or decode a dataset's own into {wanted.key!r}")
+        if not isinstance(shape, list | tuple) or tuple(shape) != expected:
+            raise ValueError(f"the chain's {wanted.key!r} field is {shape!r}, and an inpainting pipeline "
+                             f"over {sample.key} of {sample.shape} reads a mask of {list(expected)}")
+        return Field(wanted.key, expected)
+
     def model_fields(self, autoencoder: AutoEncoder | None) -> dict[str, Configured]:
         """Return the fields the run derives for the model, which `ModelConfig.build`
         takes over the model's `arguments`.
@@ -303,6 +323,7 @@ class DiffusionRunConfig(RunConfig):
 
     def _objective(self, variables: Variables | None) -> DiffusionObjective:
         """The configured objective over `variables`."""
+        mask = None
         if self.pretrained is None:
             self.built_fresh()
             model, conditions, autoencoder = self._scratch(variables)
@@ -319,9 +340,6 @@ class DiffusionRunConfig(RunConfig):
                 source = source.adapt(self.lora, key=self.trainer.key)
             if source.inputs is None:
                 raise ValueError(f"{self.pretrained} loads no diffusion inputs to train on")
-            if source.inputs.mask is not None:
-                raise ValueError(f"{self.pretrained} is an inpainting pipeline, which trains "
-                                 "on masks an image dataset does not carry")
             # The objective is built over the pipeline itself, which brings the sampling policy it
             # samples by (`DiffusionObjective`'s `model`); the run's own process, inputs and tree
             # stand over the pipeline's.
@@ -330,7 +348,8 @@ class DiffusionRunConfig(RunConfig):
             # The data's geometry, in the autoencoder's own pixel channels:
             # Qwen-Image 2.1's are RGBA.
             sample = source.inputs.sample
-        inputs = InputSpec(sample=sample, conditions=conditions)
+            mask = None if source.inputs.mask is None else self.mask_field(sample, source.inputs.mask)
+        inputs = InputSpec(sample=sample, conditions=conditions, mask=mask)
         objective = self.objective.build(model=model, process=self._process(convention), inputs=inputs,
                                          autoencoder=autoencoder, variables=variables,
                                          **self._teacher(variables))
@@ -431,7 +450,7 @@ class DiffusionRunConfig(RunConfig):
         return None if held is None else dtype_name(resolve_dtype(str(held)))
 
     def _source(self, variables: Variables | None):
-        """The `pretrained` pipeline at the data's resolution: its own
+        """The `pretrained` pipeline, or saved run's task, at the data's resolution: its own
         weights, or `variables` bound over its metadata."""
         from dew.interop.pretrained import load_diffusion_source
         from dew.interop.sources import SourceReference

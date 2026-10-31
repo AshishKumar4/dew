@@ -11,6 +11,7 @@ import pytest
 from examples_clock_worker import Questioned
 from recording import RecordingTracker
 from reference_error import as_given, assert_as_exact
+from test_barren_reads import Untouched
 
 from dew.batch import EXAMPLES_CONSUMED, VALID_ROWS
 from dew.config import RunConfig, TrainerConfig
@@ -187,17 +188,6 @@ def dealt_shards(ids: np.ndarray, examples: int, index: int, *, rewound: bool) -
         examples -= len(shard)
         place += 1
     return read
-
-
-@dataclasses.dataclass(frozen=True)
-class Untouched:
-    """A random step that leaves its record as it is, which keeps a stream's repeat where it is written,
-    after the shards each share reads."""
-
-    identity = "untouched@1"
-
-    def __call__(self, row, rng):
-        return row
 
 
 POOL_DEALS = {
@@ -635,6 +625,36 @@ def test_a_clocked_fit_from_a_supplied_state_reads_its_bound_afresh_and_another_
     assert int(thin_fit(x, examples=CLOCKED_RECORDS, state=stepped).consumed) == CLOCKED_RECORDS
 
 
+@pytest.mark.parametrize("accumulation", [1, 2])
+def test_a_run_of_steps_resumes_a_checkpoint_that_kept_no_count_and_a_clocked_run_refuses_it(tmp_path,
+                                                                                           accumulation):
+    """A run of steps keeps no examples consumed in its checkpoints (`TrainState.consumed`), as a run from
+    before the examples clock kept none: a run of steps resumes such a checkpoint, its pending window read
+    through the template every resume reads (`Checkpoints.accumulation_template`, row 2433), while a run on
+    the examples clock, whose schedule would read its progress off the count, refuses it before any step.
+    Every fit reads one loader under one constant rate, so the count is all the checkpoints differ by; a
+    clocked run's checkpoint, which kept its count, resumes on the examples clock (the control)."""
+    (x,) = clocked_records(0)
+    optim = OptimConfig(optimizer="adam", learning_rate=PEAK)
+    loader, _ = fitted(clocked_chain(x), None, objective=Echoed().data(), examples=CLOCKED_RECORDS)
+
+    def fit(directory, **bound):
+        checkpoints = Checkpoints(str(directory))
+        state = Trainer(Echoed(), optim, key=0, accumulation=accumulation, checkpoints=checkpoints).fit(
+            loader, log_every=1, checkpoint_every=1, **bound)
+        checkpoints.wait()
+        return state
+
+    assert fit(tmp_path / "steps", steps=1).consumed is None
+    resumed = fit(tmp_path / "steps", steps=2)
+    assert int(resumed.step) == 2 and resumed.consumed is None
+    with pytest.raises(ValueError):
+        fit(tmp_path / "steps", examples=CLOCKED_RECORDS)
+    assert Checkpoints(str(tmp_path / "steps")).latest == 2
+    fit(tmp_path / "examples", examples=CLOCKED_RECORDS, stop=Pause(0.5))
+    assert int(fit(tmp_path / "examples", examples=CLOCKED_RECORDS).consumed) == CLOCKED_RECORDS
+
+
 class Placed(Pulled):
     """`Pulled`, keeping the fields of every batch the trainer places for its step, as it reads each placed
     batch's row geometry (`Objective.row_tokens`)."""
@@ -992,6 +1012,107 @@ def test_a_clocked_run_of_a_warmup_as_a_share_trains_and_records_it_as_written(s
     consumed = [scalars["train/examples_consumed"] for _, scalars in tracker.scalars
                 if "train/loss" in scalars]
     assert consumed == sorted(consumed) and consumed[-1] == CLOCKED_RECORDS
+
+
+def test_a_clocked_runs_validation_records_the_examples_it_had_consumed():
+    """A run bounded in examples that counts no steps ahead records with each validation, beside its step,
+    the examples it had consumed when it validated (`evaluation/examples_consumed`), the coordinate its
+    own clock places it at: at a share of its examples, each the count its step's log records, rising to
+    its bound; a run counted in steps records none."""
+    (x,) = clocked_records(0)
+    held = Pipeline(Memory({"x": x[:BATCH]})).batch(BATCH)
+    optim = OptimConfig(optimizer="adam", learning_rate=PEAK)
+    tracker = RecordingTracker()
+    Trainer(Echoed(), optim, key=0, tracker=tracker).fit(
+        clocked_chain(x), examples=CLOCKED_RECORDS, log_every=1, validation=held, eval_every="25%")
+    trained = {step: scalars["train/examples_consumed"] for step, scalars in tracker.scalars
+               if "train/loss" in scalars}
+    validated = [(step, scalars["evaluation/examples_consumed"]) for step, scalars in tracker.scalars
+                 if "val/loss" in scalars]
+    assert len(validated) > 1 and all(trained[step] == consumed for step, consumed in validated)
+    assert validated[-1][1] == CLOCKED_RECORDS
+    stepped = RecordingTracker()
+    Trainer(Echoed(), optim, key=0, tracker=stepped).fit(clocked_chain(x), steps=4, log_every=1,
+                                                         validation=held, eval_every=2)
+    scored = [scalars for _, scalars in stepped.scalars if "val/loss" in scalars]
+    assert scored and not any("evaluation/examples_consumed" in scalars for scalars in scored)
+
+
+def test_a_clocked_runs_cooldown_evaluation_records_the_examples_its_branch_consumed():
+    """A clocked run's cooldown branch, scored once it ends, records the examples it had consumed then
+    under its own name (`cooldown/examples_consumed`): the run's at the step it branched at and the two
+    batches its branch read on from the run's position, which the run reads next, so the run's count two
+    steps on; the run's own validation at that step records the run's count alone
+    (`evaluation/examples_consumed`)."""
+    from dew.training import Cooldowns
+
+    (x,) = clocked_records(0)
+    held = Pipeline(Memory({"x": x[:BATCH]})).batch(BATCH)
+    tracker = RecordingTracker()
+    Trainer(Echoed(), OptimConfig(optimizer="adam", learning_rate=PEAK), key=0, tracker=tracker).fit(
+        clocked_chain(x), examples=CLOCKED_RECORDS, log_every=1, validation=held, eval_every="25%",
+        cooldowns=Cooldowns(at=("50%",), length=2))
+    trained = {step: scalars["train/examples_consumed"] for step, scalars in tracker.scalars
+               if "train/loss" in scalars}
+    cooled = [(step, scalars["cooldown/examples_consumed"]) for step, scalars in tracker.scalars
+              if "cooldown/val/loss" in scalars]
+    validated = {step: scalars["evaluation/examples_consumed"] for step, scalars in tracker.scalars
+                 if "evaluation/examples_consumed" in scalars}
+    assert cooled and all(consumed == trained[step + 2] for step, consumed in cooled)
+    assert all(validated[step] == trained[step] for step, _ in cooled)
+
+
+def test_each_split_evaluated_at_a_step_records_its_own_counts():
+    """Two splits of unequal size scored at one step each record the batches and records they read under
+    their own names (`evaluation/counts/<split>/records`), so neither's count replaces the other's at
+    that step, nor a summary's named as a count is (`evaluation/summary/records`); a cooldown branch's
+    suites, scored at the step it branched at, record theirs apart from the run's own: no scalar takes
+    two values at one step."""
+    from dew.training import Cooldowns
+    from dew.training.evaluation import Summary
+
+    (x,) = clocked_records(0)
+    small = Pipeline(Memory({"x": x[:BATCH]})).batch(BATCH)
+    large = Pipeline(Memory({"x": x[:2 * BATCH]})).batch(BATCH)
+    tracker = RecordingTracker()
+    summaries = [Summary(name, {"summary/loss": 1.0, "large/loss": 1.0}, "lower")
+                 for name in ("records", "coordinated_batches")]
+    Trainer(Echoed(), OptimConfig(optimizer="adam", learning_rate=PEAK), key=0, tracker=tracker).fit(
+        clocked_chain(x), examples=CLOCKED_RECORDS, log_every=1, eval_every="50%", summaries=summaries,
+        validation={"summary": small, "large": large}, cooldowns=Cooldowns(at=("50%",), length=2))
+    logged = collections.defaultdict(list)
+    for step, scalars in tracker.scalars:
+        for name, value in scalars.items():
+            logged[step, name].append(value)
+    assert all(len(set(values)) == 1 for values in logged.values())
+    found = {name: values[0] for (_, name), values in logged.items()}
+    assert found["evaluation/counts/summary/records"] == BATCH
+    assert found["evaluation/counts/large/records"] == 2 * BATCH
+    assert found["evaluation/counts/cooldown/large/coordinated_batches"] == 2
+    assert "evaluation/summary/records" in found
+
+
+def test_a_split_named_like_a_cooldowns_suite_is_the_runs_own():
+    """A cooldown branch's scores are named under `cooldown/`, which no split's name can hold (`/` stands
+    between a split and its metric): a split called `cooldown_val` beside `val` is the run's own, scored as
+    the run, its examples the run's (`evaluation/examples_consumed`), while the branch scores `val` as
+    `cooldown/val` at the step it branched at, its examples its own (`cooldown/examples_consumed`)."""
+    from dew.training import Cooldowns
+
+    (x,) = clocked_records(0)
+    held = Pipeline(Memory({"x": x[:BATCH]})).batch(BATCH)
+    tracker = RecordingTracker()
+    Trainer(Echoed(), OptimConfig(optimizer="adam", learning_rate=PEAK), key=0, tracker=tracker).fit(
+        clocked_chain(x), examples=CLOCKED_RECORDS, log_every=1, eval_every="50%",
+        validation={"val": held, "cooldown_val": held}, cooldowns=Cooldowns(at=("50%",), length=2))
+    trained = {step: scalars["train/examples_consumed"] for step, scalars in tracker.scalars
+               if "train/loss" in scalars}
+    validated = [(step, scalars) for step, scalars in tracker.scalars if "cooldown_val/loss" in scalars]
+    assert validated and all(scalars["evaluation/examples_consumed"] == trained[step]
+                             and "cooldown/examples_consumed" not in scalars for step, scalars in validated)
+    cooled = [(step, scalars) for step, scalars in tracker.scalars if "cooldown/val/loss" in scalars]
+    assert cooled and all(scalars["cooldown/examples_consumed"] == trained[step + 2]
+                          for step, scalars in cooled)
 
 
 def test_a_causal_windows_last_target_is_consumed_by_the_window_that_holds_it():

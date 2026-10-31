@@ -1,0 +1,121 @@
+{
+ "step": 2,
+ "compute": "float32",
+ "products": {
+  "backbone/layers_0/mlp/down_proj": [
+   "float64"
+  ],
+  "backbone/layers_0/mlp/gate_up_proj": [
+   "float64"
+  ],
+  "backbone/layers_0/self_attn": [
+   "float64"
+  ],
+  "backbone/layers_0/self_attn/o_proj": [
+   "float64"
+  ],
+  "backbone/layers_0/self_attn/qkv_proj": [
+   "float64"
+  ],
+  "backbone/layers_1/mlp/down_proj": [
+   "float64"
+  ],
+  "backbone/layers_1/mlp/gate_up_proj": [
+   "float64"
+  ],
+  "backbone/layers_1/self_attn": [
+   "float64"
+  ],
+  "backbone/layers_1/self_attn/o_proj": [
+   "float64"
+  ],
+  "backbone/layers_1/self_attn/qkv_proj": [
+   "float64"
+  ],
+  "backbone/layers_2/mlp/down_proj": [
+   "float64"
+  ],
+  "backbone/layers_2/mlp/gate_up_proj": [
+   "float64"
+  ],
+  "backbone/layers_2/self_attn": [
+   "float64"
+  ],
+  "backbone/layers_2/self_attn/o_proj": [
+   "float64"
+  ],
+  "backbone/layers_2/self_attn/qkv_proj": [
+   "float64"
+  ],
+  "head/layers_0/mlp/down_proj": [
+   "float64"
+  ],
+  "head/layers_0/mlp/up_proj": [
+   "float64"
+  ],
+  "head/layers_0/self_attn": [
+   "float64"
+  ],
+  "head/layers_0/self_attn/k_proj": [
+   "float64"
+  ],
+  "head/layers_0/self_attn/o_proj": [
+   "float64"
+  ],
+  "head/layers_0/self_attn/q_proj": [
+   "float64"
+  ],
+  "head/layers_0/self_attn/v_proj": [
+   "float64"
+  ],
+  "head/layers_1/mlp/down_proj": [
+   "float64"
+  ],
+  "head/layers_1/mlp/up_proj": [
+   "float64"
+  ],
+  "head/layers_1/self_attn": [
+   "float64"
+  ],
+  "head/layers_1/self_attn/k_proj": [
+   "float64"
+  ],
+  "head/layers_1/self_attn/o_proj": [
+   "float64"
+  ],
+  "head/layers_1/self_attn/q_proj": [
+   "float64"
+  ],
+  "head/layers_1/self_attn/v_proj": [
+   "float64"
+  ],
+  "head/scorer_hidden": [
+   "float64"
+  ],
+  "head/scorer_out": [
+   "float64"
+  ]
+ },
+ "params": [
+  "float32"
+ ],
+ "scale": null,
+ "finite_steps": null,
+ "consumed": null,
+ "remat": [
+  null,
+  null
+ ],
+ "plan": {
+  "split": 1,
+  "rows": 8,
+  "head_tile": null,
+  "head_fused": false,
+  "remat": [
+   null,
+   null
+  ],
+  "xla_defaults": false,
+  "narrow": true
+ }
+}

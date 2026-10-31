@@ -13,6 +13,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
+from dew.nn.kernels import tuning
 from dew.nn.kernels.templates import mosaic
 from dew.nn.kernels.templates.attention_mosaic_program import (
     BackwardTiles,
@@ -80,6 +81,7 @@ def _coop_step(walk: _Backward, share: int, resident: tuple, exchanged, rows_of,
     return carry, (dk_acc, dv_acc)
 
 
+@tuning.lowered_once(("walk",))
 def _coop_launch(query, key, value, dout, peak, total, anchor, delta, key_index, spans: _Spans | None, *,
                  walk: _Backward) -> tuple[jax.Array, jax.Array, jax.Array]:
     """The fast form's one launch over shared keys (`BackwardTiles.shared_keys`): a program's `block_k` keys

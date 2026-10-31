@@ -28,6 +28,7 @@ import httpx
 import jax
 import numpy as np
 import pytest
+from process_support import running
 from rl_support import Published
 
 from dew.interop.gateway import Gateway, calls
@@ -498,14 +499,6 @@ def test_a_trial_past_its_timeout_is_interrupted_and_the_scheduler_retries_it(tm
     assert len(list((tmp_path / "trials").glob("*/result.json"))) == 2 * tasks
 
 
-def ended(pid):
-    """Whether process `pid` is gone or a zombie waiting to be reaped."""
-    try:
-        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] == "Z"
-    except FileNotFoundError:
-        return True
-
-
 def test_a_finished_trial_ends_what_it_left_running_in_its_group(tmp_path, harbor):
     """Harbor finishes its trial and exits with a server it started still running in its process
     group, its output elsewhere: the trial completes, and the server ends with it."""
@@ -519,7 +512,7 @@ def test_a_finished_trial_ends_what_it_left_running_in_its_group(tmp_path, harbo
     finally:
         source.close()
     (child,) = (tmp_path / "trials").glob("*/child.json")
-    assert rollout.status is Status.COMPLETED and ended(json.loads(child.read_text()))
+    assert rollout.status is Status.COMPLETED and not running(json.loads(child.read_text()))
 
 
 @pytest.mark.parametrize("task", ["lingering-exits", "lingering-waits", "lingering-detached-waits"])
@@ -545,7 +538,7 @@ def test_a_trial_past_its_timeout_resolves_whatever_holds_its_output(tmp_path, h
     if "detached" in task:
         os.kill(pid, 9)
     else:
-        assert ended(pid)
+        assert not running(pid)
     assert rollout.status is Status.INFRA_ERROR and resolved < 20
 
 
@@ -564,7 +557,7 @@ def test_a_trial_that_closes_its_output_and_runs_on_is_bounded_by_its_deadline(t
     finally:
         source.close()
     (seen,) = (tmp_path / "trials").glob("*/seen.json")
-    assert ended(json.loads(seen.read_text())["pid"])
+    assert not running(json.loads(seen.read_text())["pid"])
     assert rollout.status is Status.INFRA_ERROR and time.monotonic() - began < 20
 
 
@@ -755,9 +748,9 @@ def test_an_interrupted_trainer_kills_its_trials_and_starts_no_queued_one(tmp_pa
     # trainer, it is reparented to the namespace's init, which may leave it a zombie for longer.
     pid = json.loads(seen.read_text())["pid"]
     deadline = time.monotonic() + 10
-    while not ended(pid) and time.monotonic() < deadline:
+    while running(pid) and time.monotonic() < deadline:
         time.sleep(0.1)
-    alive = not ended(pid)
+    alive = running(pid)
     if alive:
         os.kill(pid, 9)
     assert not alive, "the interrupted trainer's running trial outlived it"
@@ -765,9 +758,9 @@ def test_an_interrupted_trainer_kills_its_trials_and_starts_no_queued_one(tmp_pa
         (child,) = (tmp_path / "trials").glob("*/child.json")
         pid = json.loads(child.read_text())
         deadline = time.monotonic() + 10
-        while not ended(pid) and time.monotonic() < deadline:
+        while running(pid) and time.monotonic() < deadline:
             time.sleep(0.1)
-        lingering = not ended(pid)
+        lingering = running(pid)
         if lingering:
             os.kill(pid, 9)
         assert not lingering, "a child of the interrupted trainer's trial outlived it"

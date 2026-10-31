@@ -10,6 +10,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
+from dew.nn.kernels import tuning
 from dew.nn.kernels.templates import mosaic
 from dew.nn.kernels.templates.attention_mosaic_program import (
     BackwardTiles,
@@ -67,6 +68,7 @@ def _fused_step(walk: _Backward, resident: tuple, rows_of, staged, coords_of, wh
     add_dq(q_first, family.product(cotangents_staged, k_smem, (tiles.block_q, k_smem.shape[-1])))
     return carry, (dk_acc, dv_acc)
 
+@tuning.lowered_once(("walk",))
 def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index, spans: _Spans | None, *,
                   walk: _Backward) -> tuple[jax.Array, jax.Array, jax.Array]:
     """The fast form's one launch of a hookless call (`BackwardTiles.fused`), on the dQ launch's layout:

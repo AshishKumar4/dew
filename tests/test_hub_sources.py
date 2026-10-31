@@ -366,7 +366,10 @@ def test_hub_shard_capability_and_urls_list_each_revision_once(monkeypatch, revi
 
     def listing(self, repo, *, repo_type, revision):
         listed.append(revision)
-        if not native and revision == "original":
+        if revision == "converted":
+            # The conversion holds each configuration's splits in a directory of its name.
+            return ["default/train/0001.parquet", "default/train/0000.parquet"]
+        if not native:
             return ["train.tar"]
         return ["train-1.parquet", "train-0.parquet"]
 
@@ -380,8 +383,9 @@ def test_hub_shard_capability_and_urls_list_each_revision_once(monkeypatch, revi
     commit = "original" if native else "converted"
     assert source.supports("streamed")
     assert source.streamed == commit
-    assert source.files.url == tuple(f"hf://datasets/owner/data@{commit}/train-{index}.parquet"
-                                     for index in range(2))
+    shards = [f"train-{index}.parquet" if native else f"default/train/000{index}.parquet"
+              for index in range(2)]
+    assert source.files.url == tuple(f"hf://datasets/owner/data@{commit}/{shard}" for shard in shards)
     assert source.files.format == "parquet"
     assert source.supports("streamed")
     assert listed == (["original"] if native else ["original", "converted"])
@@ -605,3 +609,177 @@ def test_a_hub_split_holds_the_files_datasets_resolves_to_it(listing, split, exp
     from dew.data.sources.hub import split_files
 
     assert split_files(listing, split) == expected
+
+
+CARD = """---
+configs:
+- config_name: cola
+  data_files:
+  - split: train
+    path: cola/train-*
+  - split: validation
+    path: cola/validation-*
+- config_name: wiki
+  data_dir: text
+  data_files:
+  - split: train
+    path: en-*.parquet
+---
+"""
+"""A card stating two configurations: one by its files' patterns, one under a directory that names
+another (`data_dir`), its files of one language among two."""
+
+
+def carded_hub(monkeypatch, directory: Path, card: str, listings: dict[str, list[str]]):
+    """A repository at commit `original` whose card is `card`, each revision listing its own files
+    (`listings`), its Parquet conversion at `converted`, which `refs/convert/parquet` names."""
+    from types import SimpleNamespace
+
+    from huggingface_hub import HfApi, HfFileSystem
+    from huggingface_hub.hf_api import GitRefInfo, GitRefs
+
+    (directory / "README.md").write_text(card)
+    conversion = GitRefInfo(name="parquet", ref="refs/convert/parquet", target_commit="converted")
+    commits = {None: "original", "refs/convert/parquet": "converted"}
+    monkeypatch.setattr(HfApi, "dataset_info", lambda self, repo, revision=None, **kwargs: SimpleNamespace(
+        sha=commits.get(revision, revision)))
+    monkeypatch.setattr(HfApi, "list_repo_files",
+                        lambda self, repo, *, repo_type, revision: listings[revision])
+    monkeypatch.setattr(HfApi, "list_repo_refs",
+                        lambda self, repo, **kwargs: GitRefs(branches=[], converts=[conversion], tags=[]))
+    monkeypatch.setattr(HfFileSystem, "_open", lambda self, path, mode="rb", **options: io.BytesIO(
+        (directory / Path(path).name).read_bytes()))
+    stated_shards(monkeypatch)
+
+
+@pytest.mark.parametrize("name, default, expected", [
+    ("cola", None, ["cola/train-00000-of-00001.parquet"]),
+    ("wiki", None, ["text/en-00000.parquet"]),
+    (None, "wiki", ["text/en-00000.parquet"]),
+    (None, None, None),
+    ("mnli", None, None),
+], ids=["named", "under-its-directory", "default", "several-unnamed", "unstated"])
+def test_a_hub_split_reads_the_files_of_the_configuration_its_card_states(tmp_path, monkeypatch, name,
+                                                                          default, expected):
+    """A repository whose card states its configurations (`configs`) streams the split of the one named,
+    or of the card's default where none is (one marked so, as `datasets` chooses it), as its patterns
+    resolve under its directory: its own files, never another configuration's because a directory names
+    it. Naming none where the card states several and marks no default, or naming one it does not state,
+    is refused, as `datasets` refuses both. Offline, the split reads the files it read online."""
+    from hub_support import offline
+
+    from dew.data.sources import Hub
+
+    card = CARD if default is None else CARD.replace(f"- config_name: {default}\n",
+                                                     f"- config_name: {default}\n  default: true\n")
+    listing = ["README.md", "cola/train-00000-of-00001.parquet", "cola/validation-00000-of-00001.parquet",
+               "mnli/train-00000-of-00001.parquet", "text/en-00000.parquet", "text/fr-00000.parquet"]
+    carded_hub(monkeypatch, tmp_path, card, {"original": listing})
+    source = Hub("owner/carded", name=name)
+    if expected is None:
+        with pytest.raises(ValueError):
+            _ = source.files
+        return
+    assert source.files.url == tuple(f"hf://datasets/owner/carded@original/{path}" for path in expected)
+    offline(monkeypatch)
+    assert Hub("owner/carded", name=name).files.url == source.files.url
+
+
+@pytest.mark.parametrize("name, default, expected", [
+    ("cola", None, "cola/train/0000.parquet"),
+    (None, "wiki", "wiki/train/0000.parquet"),
+    (None, None, None),
+], ids=["named", "default", "several-unnamed"])
+def test_a_hub_splits_parquet_conversion_reads_its_configurations_directory(tmp_path, monkeypatch, name,
+                                                                           default, expected):
+    """A repository with no shards a stream reads (Arrow) streams its Parquet conversion, which holds each
+    configuration's splits in a directory of its name (`<config>/<split>/`): the named configuration's,
+    or the default its card states, never every configuration's split of that name; naming none where the
+    card states several and marks no default is refused."""
+    from dew.data.sources import Hub
+
+    card = CARD if default is None else CARD.replace(f"- config_name: {default}\n",
+                                                     f"- config_name: {default}\n  default: true\n")
+    carded_hub(monkeypatch, tmp_path, card, {
+        "original": ["README.md", "cola/train.arrow", "text/en.arrow"],
+        "converted": ["cola/train/0000.parquet", "cola/validation/0000.parquet", "wiki/train/0000.parquet"]})
+    source = Hub("owner/converted", name=name)
+    if expected is None:
+        with pytest.raises(ValueError):
+            _ = source.files
+        return
+    assert source.files.url == (f"hf://datasets/owner/converted@converted/{expected}",)
+
+
+@pytest.mark.parametrize("revision", ["refs/convert/parquet", "converted"])
+@pytest.mark.parametrize("name, expected", [("cola", "cola/train/0000.parquet"), (None, None)],
+                         ids=["named", "several-unnamed"])
+def test_a_split_pinned_to_its_parquet_conversion_reads_its_configurations_directory(tmp_path, monkeypatch,
+                                                                                    revision, name, expected):
+    """A split pinned to the Hub's Parquet conversion, by its ref or its commit, reads the named
+    configuration's directory, never every configuration's split of that name; naming none where it
+    holds several is refused, as its listing, which holds no card, marks none the default."""
+    from dew.data.sources import Hub
+
+    carded_hub(monkeypatch, tmp_path, CARD, {
+        "converted": ["cola/train/0000.parquet", "cola/validation/0000.parquet", "wiki/train/0000.parquet"]})
+    source = Hub("owner/converted", name=name, revision=revision)
+    if expected is None:
+        with pytest.raises(ValueError):
+            _ = source.files
+        return
+    assert source.files.url == (f"hf://datasets/owner/converted@converted/{expected}",)
+
+
+@pytest.mark.parametrize("pattern, expected", [
+    ("hf://datasets/owner/carded/cola/train-*", "cola/train-00000-of-00001.parquet"),
+    ("hf://datasets/owner/carded@original/cola/train-*", "cola/train-00000-of-00001.parquet"),
+    ("hf://datasets/someone/else/train-*", None),
+    ("{local}/train.parquet", None),
+], ids=["its-repository", "its-commit", "another-repository", "a-local-path"])
+def test_a_cards_pattern_naming_its_repository_by_url_reads_the_commits_listing(tmp_path, monkeypatch,
+                                                                                pattern, expected):
+    """A configuration whose card names its files by a URL of the repository, at its commit or none,
+    reads them from the commit's listing, with no file system the listing is not; one naming files of
+    another repository, or an absolute path, holds none of this commit's, so the split streams none of
+    its files, a local file of that path among them."""
+    from fsspec.implementations.local import LocalFileSystem
+    from huggingface_hub import HfFileSystem
+
+    from dew.data.sources import Hub
+
+    def walked(*args, **options):
+        raise AssertionError("a file system beside the listing's walked")
+
+    (tmp_path / "local").mkdir()
+    (tmp_path / "local" / "train.parquet").write_bytes(b"")
+    pattern = pattern.format(local=tmp_path / "local")
+    card = f"---\nconfigs:\n- config_name: cola\n  data_files:\n  - split: train\n    path: {pattern}\n---\n"
+    carded_hub(monkeypatch, tmp_path, card, {
+        "original": ["README.md", "cola/train-00000-of-00001.parquet", "mnli/train-00000-of-00001.parquet"],
+        "converted": []})
+    monkeypatch.setattr(HfFileSystem, "glob", walked)
+    monkeypatch.setattr(LocalFileSystem, "glob", walked)
+    source = Hub("owner/carded", name="cola")
+    if expected is None:
+        with pytest.raises(FileNotFoundError):
+            _ = source.files
+        return
+    assert source.files.url == (f"hf://datasets/owner/carded@original/{expected}",)
+
+
+@pytest.mark.parametrize("listing", [
+    ["default/train/0000.parquet", "extra/train/0000.parquet"],
+    ["part1/train/0000.parquet", "part2/train/0000.parquet"],
+], ids=["default-and-extra", "parts"])
+def test_a_card_less_repository_laid_out_as_a_conversion_reads_its_one_configuration(tmp_path, monkeypatch,
+                                                                                     listing):
+    """A repository whose own files are laid out as the Parquet conversion lays its out, with no card,
+    holds the one configuration `datasets` gives it, its split every file its patterns resolve to it: the
+    conversion's ref names another commit, so its directories are no configurations of its."""
+    from dew.data.sources import Hub
+
+    carded_hub(monkeypatch, tmp_path, "", {"original": listing})
+    assert Hub("owner/laid-out").files.url == tuple(
+        f"hf://datasets/owner/laid-out@original/{path}" for path in listing)
+

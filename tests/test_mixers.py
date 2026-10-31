@@ -253,7 +253,7 @@ REFUSED = {"kpool_sparse_attention"}
 """Kinds that refuse packed rows."""
 
 SEEDS = {"attention": 64, "deepseek_v4": 256, "deepseek_v4 csa": 256, "deepseek_v4 csa2": 256,
-         "deepseek_v4 hca": 256, "gated_delta_net": 512, "kimi_delta_attention": 512,
+         "deepseek_v4 hca": 256, "gated_delta_net": 512, "kimi_delta_attention": 64,
          "lightning_attention": 64, "llama4": 128, "mamba": 32, "mamba2": 256, "memory": 256, "mla": 64,
          "mlp": 64, "qsa_attention": 128, "short_conv": 64}
 """Each kind's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for`: the fewest for which
@@ -269,11 +269,13 @@ Mamba2's defaults (128 heads of 64 over a state of 128 in 256-token chunks, wher
 one chunk); the scan's packed resets within a chunk stay held by tests/test_mamba2.py and
 tests/test_mamba_ssd.py at their own geometries. Lightning attention runs 8 heads of 16 in 64-token chunks
 (`KIND_FIELDS`): at the model's 4 heads, of 8, 16 or 32 channels, the reference compared with itself did
-not resolve within 512 seeds (2048 at 8); at 8 or 16 heads of 16, or 4 of 64, it resolves at 64."""
+not resolve within 512 seeds (2048 at 8); at 8 or 16 heads of 16, or 4 of 64, it resolves at 64. Kimi delta
+attention's 64 are sized paired (`seeds_for` with the packed row as its Dew arm, on armada, ledger 2828):
+compared with themselves its documents alone take 512."""
 
 
 PAST_TARGET = {"packed": {"memory": 122}}
-"""The cases past a group's 120 s (`timed`), each its seconds in train 272's CI (a8a9657d8, ledger 2160):
+"""The cases past a group's 120 s (`timed`), each its seconds in train 272's CI (ddee96234, ledger 2160):
 the memory mixer's packed row; every train packs every other mixer's, and test_memory_composition.py
 packs the memory decoder's."""
 
@@ -545,8 +547,9 @@ ONE_TAP_SEEDS = {"gated_delta_net": 8, "kimi_delta_attention": 8, "mamba": 8, "m
 def test_a_recurrent_mixer_whose_conv_takes_one_tap_decodes_as_its_whole_pass(kind):
     """A one-tap causal conv is a scale per channel with no history to hold: each recurrent mixer
     builds with one, and its decode (a 3-token prefill, then one token a step) is on par with its
-    whole pass from the float64 whole pass over drawn inputs (check 1)."""
-    from model_support import decode_through
+    passes, each step's at the width it reads (`as_stepped`), from the float64 whole pass over drawn
+    inputs (check 1)."""
+    from model_support import as_stepped, decode_through
 
     module = one_tap(kind)
     shape = (2, 9, module.emb_features)
@@ -559,5 +562,7 @@ def test_a_recurrent_mixer_whose_conv_takes_one_tap_decodes_as_its_whole_pass(ki
         return module.clone(dtype=jnp.float64).apply(widened(variables), hidden)
 
     assert_as_exact(lambda hidden: decode_through(module, variables, hidden, prefill=3)[0],
-                    lambda hidden: module.apply(variables, hidden), draw, f"{kind} decode",
+                    jax.jit(lambda hidden: as_stepped(lambda held: module.apply(variables, held), hidden,
+                                                      3)),
+                    draw, f"{kind} decode",
                     seeds=ONE_TAP_SEEDS[kind], truth_fn=truth)

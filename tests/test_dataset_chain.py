@@ -282,6 +282,21 @@ class FetchLike:
                 {**row, "payload": np.full(4, row["i"], dtype=np.uint8)})
 
 
+class CutThirds:
+    """Refuses every third row under the cut that refused it, three tokens of its text, as a budget
+    refuses a row it cut until it no longer fits; the rows it was called on (`calls`)."""
+
+    rejects = True
+    identity = "cut-thirds@1"
+
+    def __init__(self):
+        self.calls: list[int] = []
+
+    def __call__(self, row):
+        self.calls.append(row["i"])
+        return Rejected("third", cut={"text": 3}) if row["i"] % 3 == 0 else row
+
+
 @dataclass(frozen=True)
 class ConfigureFetch:
     identity = "fetch-like-factory@1"
@@ -881,6 +896,35 @@ def test_a_runs_truncated_share_is_of_the_rows_it_delivered():
     assert counts["data/truncated/memory"] == 1.0
     assert counts["data/cut/memory/text"] == counts["data/cut_examples/memory/text"] == 1
     assert counts["data/cut_removed/memory/text"] == 3
+
+
+@pytest.mark.parametrize(("read", "cached"), [("memory", False), ("memory", True), ("indexed", False),
+                                            ("streamed", False)])
+def test_a_refused_records_cut_counts_beside_its_refusal_in_every_read(tmp_path, read, cached):
+    """A record a step refuses keeps the cut that refused it (`Rejected.cut`), which every read counts
+    beside the refusal (`data/cut_refused`): a memory read, which counts its rows anew as it holds them,
+    its step run or, through a cache, filled and then read back without running it; and an indexed or
+    streamed read, whose filter counts its refusals within the reader's counts. The delivered rows' cuts
+    count none of it."""
+    steps = [CutThirds() for _ in range(2 if cached else 1)]
+    for step in steps:
+        chain = Memory(rows("sample", 6)).named("sample").filter_map(step)
+        data = compile((chain.cache(str(tmp_path / "cache")) if cached else chain).batch(1), read=read,
+                       loading=READ)
+        stream = data.train(DataPartition())
+        try:
+            for _ in range(4):
+                next(stream)
+        finally:
+            stream.close()
+        counts = data.statistics()
+        assert counts["data/rejected/sample/third"] >= 2
+        assert counts["data/cut_refused/sample/text"] == 3 * counts["data/rejected/sample/third"]
+        delivered = ("data/cut/", "data/cut_examples/", "data/cut_removed/")
+        assert not any(name.startswith(delivered) for name in counts)
+    if cached:
+        # The second read took the refusals and their cuts from the cache its first filled.
+        assert steps[-1].calls == []
 
 
 def test_successive_cuts_of_a_record_compose_in_its_record():
