@@ -788,7 +788,7 @@ users' are (ledger 1698) leave their scores' paired ratio unresolved within 512 
 wide and 16 draws a request resolve at 256 (armada, rows/1698-serving-hybrid)."""
 
 
-@pytest.mark.parametrize("requests, options, hits, rounds", [
+@pytest.mark.parametrize("requests, options, hits, rounds, site", [
     ((Served(12), Served(12), Served(12, flipped=(9,)), Served(12, flipped=(1,)), Served(12),
       Served(12, flipped=(6,))), {}, (0, 8, 16, 16, 24, 24), None, WIDE_HYBRID),
     ((Served(12), Served(12), Served(12, flipped=(9,))), {"chunk": 3}, (0, 8, 16), None, WIDE_HYBRID),
