@@ -161,12 +161,16 @@ def flown(env, objective, params, key: jax.Array, steps: int, crash_penalty: flo
                            following.terminated | following.truncated, crash_penalty)
 
 
-def teacher_policy(objective):
-    """The teacher's greedy action from a driven step."""
-    def greedy(params, observed, key, memory):
-        return objective.greedy(params, observed["observation"], key, memory)
+def teacher_policy(objective, *, explore: bool = False):
+    """The teacher's action from a driven step: its greedy one, or where it `explore`s a draw from its policy
+    as it trained (tanh of a normal draw)."""
+    acted = objective.act if explore else objective.greedy
 
-    return greedy
+    def policy(params, observed, key, memory):
+        action, _, memory = acted(params, observed["observation"], key, memory)
+        return action, {}, memory
+
+    return policy
 
 
 def check(out: Path, *, assets: Path, hz: float = 60.0) -> dict:
@@ -266,8 +270,12 @@ def teacher(out: Path, *, seconds: float = 6600.0, drones: int = 4096, hz: float
 
 
 def demonstrations(simulator, objective, variables, steps: int, capacity: int, chunk: int = 1000):
-    """The teacher's greedy flight from every drone of `simulator` for `steps` steps, recorded in the
-    agent's convention, as a replay of `capacity` steps a drone the online agent goes on writing. The flight
+    """The teacher's flight from every drone of `simulator` for `steps` steps, recorded in the agent's
+    convention, as a replay of `capacity` steps a drone the online agent goes on writing. The teacher flies
+    its policy's draws as it trained, not its greedy action: the demonstrations then hold the states a small
+    error leads to and the teacher's way back from them (DART, Laskey et al., arXiv 1703.09327), where a
+    student cloned from greedy flight alone missed the teacher's actions on fresh flights by three times its
+    training error (on the G4, 10-31) and crashed within two seconds. The flight
     is written `chunk` steps at a time into the replay, which each write updates in place: a whole flight's
     record beside the replay would hold its 96-pixel images several times over (16 drones' 18,000 steps
     took the G4's 96 GB)."""
@@ -278,7 +286,7 @@ def demonstrations(simulator, objective, variables, steps: int, capacity: int, c
     carry, replay = simulator_start(driven, jax.random.key(3)), None
     added = jax.jit(lambda replay, stream: replay.add(stream), donate_argnums=0)
     for start in range(0, steps, chunk):
-        carry, taken = simulator_rollout(driven, teacher_policy(objective), variables, carry,
+        carry, taken = simulator_rollout(driven, teacher_policy(objective, explore=True), variables, carry,
                                          min(chunk, steps - start), reset=False)
         stream = {**taken.observation, "action": taken.action}
         if replay is None:
@@ -391,7 +399,7 @@ def _online(out: Path, report: dict, progress: dict, agent, races: tuple, judge,
 
 
 def world(out: Path, *, teacher_weights: Path, assets: Path, drones: int = 16, hz: float = 60.0,
-          demonstration_seconds: float = 300.0, pretrain_updates: int = 50_000,
+          demonstration_seconds: float = 600.0, pretrain_updates: int = 50_000,
           environment_seconds: float = 33_333.0, capacity_seconds: float = 600.0,
           highlight: bool = True, saved_every: int = 2000, level: float = 1.0) -> dict:
     """FlyDreamer's agent at its size (TransDreamer's dynamics, bfloat16) on the image alone: pretrained on
