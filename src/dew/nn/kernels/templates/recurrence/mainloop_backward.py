@@ -18,8 +18,8 @@ from dew.nn.kernels import generation, recurrence_algebra as algebra
 from dew.nn.kernels.templates import mosaic, product
 from dew.nn.kernels.templates.recurrence.issuing import Issuer, Parts
 from dew.nn.kernels.templates.recurrence.mainloop import (
+    _PLANNED,
     CHUNK,
-    kept_forward,
     Launch,
     Tiles,
     Work,
@@ -39,7 +39,6 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     _memory_landing,
     _Operand,
     _padded,
-    _PLANNED,
     _prefix_reader,
     _prepared,
     _roled,
@@ -55,6 +54,7 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     _views,
     _walk,
     _walk_stores,
+    kept_forward,
 )
 
 

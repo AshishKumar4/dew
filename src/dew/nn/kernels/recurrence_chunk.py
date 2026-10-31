@@ -720,7 +720,7 @@ TEMPLATE_SUPPORTS: tuple[Requirement[Templated], ...] = (
     Requirement('backward', lambda case: case.product != 'training' or _trains(case.call),
                 "a gradient the template's fast backward does not take: fp32 operands, no delta rule, a "
                 "decay a key dimension, or launches past the device's registers or shared memory at the "
-                "call's tiles (`backward.backward_holds`)", row='ledger 1294'),
+                "call's tiles (`mainloop_backward.backward_holds`)", row='ledger 1294'),
 )
 """What the recurrence template's Mosaic GPU mainloop (`templates.recurrence.template.Mosaic`) needs of a
 call under either selector (`GATED_DELTA`, `SCAN`): its own launches' call (`Template.eligible`: dtypes,
@@ -956,22 +956,22 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
                 firsts=None, rounded: bool = False):
     """The chunked rule, a decay a head (`g` `[B, S, Hv]`) or a key dimension (`[B, S, Hv, Dk]`), with or
     without the `delta` rule, on the recurrence template's Mosaic GPU mainloop
-    (`templates.recurrence.mainloop.forward`): `fla_rule`'s operands and results, the operands in their
-    common dtype and beta with them, the decay and the memory fp32, on one device, by the bundle of its
-    instruction family (`mainloop.family_of`, `bundles.of`), interpreted off a GPU (Mosaic GPU's
-    interpreter, `mainloop.INTERPRETED`'s). Its gradient: the gated delta rule's in a 16-bit call on the
-    mainloop (`backward.gradients`, fla's DAG, fla's rounding) where its launches hold on the device
-    (`backward.backward_holds`); it takes no other call's, which raises NotImplementedError as the gradient
-    is traced: the delta rule's selector gives a training call it refuses another kernel
-    (`MOSAIC_SUPPORTS`' 'backward', `Mosaic.trains`), and a call that names the mainloop insists on it
-    (ledger 1926: no kernel falls back inside itself). Its states and output launches take `tiles`
-    (`mainloop.Tiles`, the template's config, `templates.recurrence.template`); a `family` given is the bundle
-    it issues by, interpreted off a GPU of that family (a CPU's). A decay a key dimension takes the layer's
-    declared `floor`, which the mainloop's intra launch reads (`mainloop.per_key_refusal`), and a 16-bit
-    delta rule the chunk inverse's `bound` its form proves, which its solve's range needs
-    (`template.inverse_refusal`); a `rounded` call without it (the SSD's) takes mamba_ssm's 16-bit numbers
-    under the run's fast forms (`mainloop.forward`)."""
-    from .templates.recurrence import backward, mainloop, template
+    (`templates.recurrence.mainloop.forward`): `fla_rule`'s operands and results, the operands in their common
+    dtype and beta with them, the decay and the memory fp32, on one device, by the bundle of its instruction
+    family (`mainloop.family_of`, `bundles.of`), interpreted off a GPU (Mosaic GPU's interpreter,
+    `mainloop.INTERPRETED`'s). Its gradient: the gated delta rule's in a 16-bit call on the mainloop
+    (`mainloop_backward.gradients`, fla's DAG, fla's rounding) where its launches hold on the device
+    (`mainloop_backward.backward_holds`); it takes no other call's, which raises NotImplementedError as the
+    gradient is traced: the delta rule's selector gives a training call it refuses another kernel
+    (`MOSAIC_SUPPORTS`' 'backward', `Mosaic.trains`), and a call that names the mainloop insists on it (ledger
+    1926: no kernel falls back inside itself). Its states and output launches take `tiles` (`mainloop.Tiles`,
+    the template's config, `templates.recurrence.template`); a `family` given is the bundle it issues by,
+    interpreted off a GPU of that family (a CPU's). A decay a key dimension takes the layer's declared
+    `floor`, which the mainloop's intra launch reads (`mainloop.per_key_refusal`), and a 16-bit delta rule the
+    chunk inverse's `bound` its form proves, which its solve's range needs (`template.inverse_refusal`); a
+    `rounded` call without it (the SSD's) takes mamba_ssm's 16-bit numbers under the run's fast forms
+    (`mainloop.forward`)."""
+    from .templates.recurrence import mainloop, mainloop_backward, template
 
     dtype = jnp.result_type(query, key, value)
     if refused := template.inverse_refusal(dtype, delta, bound):
@@ -989,11 +989,12 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
     run = {"family": family or device or mainloop.INTERPRETED, "interpret": interpret, "tiles": tiles,
            "floor": floor}
     # The fast backward where its launches hold on the device (a derived launch spills nothing), else none.
-    fast = (backward.fast_backward_form(delta, rounded, dtype) and g.ndim == 3 and dtype != jnp.float32
-            and backward.backward_holds(query, key, value, g, beta, state, tiles=tiles, family=run["family"],
-                                        shared=generation.shared_budget(template.Mosaic.launched()),
-                                        starts=starts, max_segments=max_segments, delta=delta,
-                                        rounded=rounded))
+    fast = (mainloop_backward.fast_backward_form(delta, rounded, dtype) and g.ndim == 3
+            and dtype != jnp.float32
+            and mainloop_backward.backward_holds(
+                query, key, value, g, beta, state, tiles=tiles, family=run["family"],
+                shared=generation.shared_budget(template.Mosaic.launched()), starts=starts,
+                max_segments=max_segments, delta=delta, rounded=rounded))
     run_back = {name: value for name, value in run.items() if name != "floor"}
 
     # The documents' starts and firsts operands, not closed over (a custom VJP's function closes over no
@@ -1031,9 +1032,10 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
                 f"the recurrence template's fast backward takes no gradient of this call ({form}, or its "
                 "launches past the device's at these tiles): the delta rule's selector gives a training call "
                 "it refuses the port or the portable math (`MOSAIC_SUPPORTS`' 'backward')")
-        grads = backward.gradients(query, key, value, g, beta, state, out_grad, final_grad, starts=starts,
-                                   firsts=firsts, max_segments=max_segments, scale=scale, inverse=inverse,
-                                   kept=kept, delta=delta, rounded=rounded, **run_back)
+        grads = mainloop_backward.gradients(query, key, value, g, beta, state, out_grad, final_grad,
+                                            starts=starts, firsts=firsts, max_segments=max_segments,
+                                            scale=scale, inverse=inverse, kept=kept, delta=delta,
+                                            rounded=rounded, **run_back)
         return (*grads[:5], None if state is None else grads[5], None, None)
 
     rule.defvjp(forward, backward)
@@ -1348,10 +1350,10 @@ SCAN_CELLS: dict[tuple[str | None, str], tuple[str, str]] = {
 product (`chunk(SSD, ...)` with its skip, output width, chunk and geometry, row 1964) shows the port of
 mamba_ssm's kernels faster than the recurrence template, each its old route's kernel and that receipt: the
 scan's selector runs the port on them where it takes the call (`Op.declared`); the list shrinks as the
-template wins its cells. An A100's forward is the template's: 1.418 ms against the port's 1.506 on
-Nemotron-H 4B's and 0.510 against 0.541 on 30B's (ssd-rounded-a100-fdab2424c). The template trains the
-rated scan under the fast forms (`backward.fast_backward_form`); under the accurate ones its training is the
-port's by the template's refusal, not a cell."""
+template wins its cells. An A100's forward is the template's: 1.418 ms against the port's 1.506 on Nemotron-H
+4B's and 0.510 against 0.541 on 30B's (ssd-rounded-a100-fdab2424c). The template trains the rated scan under
+the fast forms (`mainloop_backward.fast_backward_form`); under the accurate ones its training is the port's by
+the template's refusal, not a cell."""
 
 SCAN: Op[ScanCase] = Op('ssd', (Kernel('mosaic_gpu', (*SSD_SUPPORTS[:3], *TEMPLATE_SUPPORTS)),
                                Kernel('pallas', SSD_SUPPORTS), Kernel('tpu', TPU_SCAN_SUPPORTS),
