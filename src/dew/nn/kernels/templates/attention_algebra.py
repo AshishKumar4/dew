@@ -499,11 +499,15 @@ def power2(x: jax.Array, k: jax.Array, reach: float = POWER2_REACH) -> jax.Array
     281 registers at its peak)."""
     k = jnp.clip(jnp.asarray(k, jnp.float32), -reach, reach)
     if reach <= 2 * 127:
-        # The half truncated from an exact multiply, `k` an integer only at each factor's bias: an int32 `k`
-        # halved (a shift or a floored division alike) spilled an A100's recurrence query_key launch 32
-        # bytes at the 27B gated delta net's training tiles, the float half none (gate_one, ledger 2519).
-        half = jnp.trunc(k * np.float32(0.5))
-        return x * exact_power2(half.astype(jnp.int32)) * exact_power2((k - half).astype(jnp.int32))
+        # The half truncated from an exact multiply by its conversion, `k` an integer only at each factor's
+        # bias: an int32 `k` halved (a shift or a floored division alike) spilled an A100's recurrence
+        # query_key launch 32 bytes at the 27B gated delta net's training tiles, the float half none
+        # (gate_one, ledger 2519); a float `trunc` compares each entry's sign, whose predicates over a
+        # 32-entry fragment pass a thread's seven and ptxas parks them in general registers, holding the
+        # exponent's parts live to their selects (an A100's hooked training forwards at width 128 spilled
+        # 496 to 588 bytes; the conversion's own truncation none).
+        half = (k * np.float32(0.5)).astype(jnp.int32)
+        return x * exact_power2(half) * exact_power2((k - half.astype(jnp.float32)).astype(jnp.int32))
     k = k.astype(jnp.int32)
     first = k // 3
     second = (k - first) // 2
