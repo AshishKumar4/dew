@@ -1648,11 +1648,15 @@ def _output(q, k, h, corrected, hi, lo, taken, beta, call: _Call, tiles: Tiles, 
         q, k if scores is None else scores, h, corrected, hi, lo, hi, lo, taken, beta)
 
 
+@jax.jit
 def prefix(g):
     """The decay's prefix within each chunk, compensated, in base 2: `g` `[..., C, H]` (natural log) to `(hi,
     lo)`, each token's `g log2(e)` an exact pair (its product with log2(e)'s fp32 rounding error-free,
     `precision.two_product`, plus its product with the rounding's remainder) summed compensated
-    (`precision.compensated_add`), so a difference of two positions is as precise as its own range."""
+    (`precision.compensated_add`), so a difference of two positions is as precise as its own range. One
+    program JAX traces once for `g`'s type: its exact sums traced afresh, each layer's forward, its kept
+    forward in the backward and its gradient's preparation each paid them, 226 s of Qwen3.5-4B's 1208 s
+    ahead-of-time compile (row 3142, FS2440-4B-STACKS)."""
     scale = np.float32(LOG2_E)
     scaled, error = precision.two_product(g, jnp.full_like(g, scale), bit_split=True)
     error = error + g * float(np.float32(LOG2_E - float(scale)))
