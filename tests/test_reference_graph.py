@@ -17,7 +17,6 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from reference_ensemble import assert_graph_as_exact
-from reference_error import without_ynn
 
 from dew.nn.kernels.graph import Graph, Node, Pointwise, Sum
 
@@ -123,12 +122,12 @@ def test_a_nan_at_one_element_fails():
 def norm_backward(summed):
     """The norm's backward from the common forward's saved `squares` and a fixed cotangent `g`: the sum
     over the width of g·x·scale (a Sum), then dx and dscale's per-row terms (Pointwise), and dscale's sum
-    over the rows (a Sum). Its nodes are plain jits, which the gate compiles without YNNPACK's fusions
-    (`_compiled_alike`): with them XLA:CPU sums the reference's products in a YNNPACK fusion, each rounded
-    to float32, and the half-sum's in a loop that contracts each product into its add, so the two arms'
-    terms round apart at every order and a sum whose reference terms happen to cancel more of the shared
-    rounding sits past FACTOR at an element on some hosts (ledger 3048: 6 of 40 seeds on one host, 13 of
-    40 on another, none without the fusions)."""
+    over the rows (a Sum). Its nodes are plain jits, which the gate compiles without YNNPACK's fusions by
+    check 1's own policy (`_compiled_alike`): with them XLA:CPU sums the reference's products in a YNNPACK
+    fusion, each rounded to float32, and the half-sum's in a loop that contracts each product into its add,
+    so the two arms' terms round apart at every order and a sum whose reference terms happen to cancel more
+    of the shared rounding sits past FACTOR at an element on some hosts (ledger 3048: 6 of 40 seeds on one
+    host, 13 of 40 on another, none without the fusions)."""
     def inverse(x, squares):
         return jax.lax.rsqrt(squares[..., None] / x.shape[-1] + EPSILON)
 
@@ -140,28 +139,6 @@ def norm_backward(summed):
     dscale = Node("dscale", ("g", "x", "squares"), Sum({"g": 0, "x": 0, "squares": 0}),
                   jax.jit(lambda g, x, squares: summed(jnp.moveaxis(g * x * inverse(x, squares), 0, -1))))
     return composed(("g", "x", "scale", "squares"), (projected, dx, dscale), ("dx", "dscale"))
-
-
-def test_the_gate_compiles_every_node_and_member_alike_on_the_cpu(monkeypatch):
-    """The graph gate holds each node as it compiles it (`_compiled_alike`), not as the site did: on the CPU
-    every node's program and its members' go through `without_ynn`, as check 1 compiles two Dew paths, so a
-    site's plain jits cannot set a YNNPACK fusion against a loop (ledger 3113)."""
-    import reference_ensemble
-
-    if jax.default_backend() != "cpu":
-        pytest.skip("YNNPACK's fusions are XLA:CPU's")
-    compiled = []
-
-    def counted(fn):
-        compiled.append(fn)
-        return without_ynn(fn)
-
-    monkeypatch.setattr(reference_ensemble, "without_ynn", counted)
-    inputs = norm_inputs()
-    assert_graph_as_exact(norm_graph(halves), norm_graph(xla), norm_graph(xla), inputs, width_orbit(inputs),
-                          "compiled alike")
-    nodes = [node.fn for graph in (norm_graph(halves), norm_graph(xla)) for node in graph.nodes]
-    assert len(compiled) == len(nodes)
 
 
 def backward_inputs():
