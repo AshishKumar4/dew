@@ -756,8 +756,9 @@ class Objective(ABC, Generic[Loss, Effects]):
         networks of its own, such as a few-step student and the fake score
         that critiques it, can give each network its own copy of `tx`, with
         its own state and update count, by `optax.multi_transform` over the
-        networks. It can then alternate them with `optax.conditionally_mask`,
-        whose count is the trainer's number of committed updates, the clock
+        networks. It can then alternate them with `optax.conditionally_mask`
+        under `dew.held_updates.phased`, which says each update trains one of
+        them, whose count is the trainer's number of committed updates, the clock
         its loss reads as `Step.updates`: every microbatch an update
         accumulates is of that update's phase, however many it takes.
         """

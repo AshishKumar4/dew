@@ -998,29 +998,32 @@ def test_the_backward_is_on_par_under_every_score_hook_interpreted(hooks, form):
 
 
 @INTERPRETS
-def test_a_folded_forward_whose_products_pass_fp32_below_zero_rewalks_natural_interpreted():
-    """A full call whose raw products pass fp32's range below zero (a query 2^126 against keys -8, scale 1/4)
-    takes its query by the scale's power of two first, so its products stay finite (-2^127): its rows'
-    maxima pass the fold's reach, they walk again natural, and every equal logit weighs its values alike,
-    the output the values' mean, 1 (a power taken into the scale instead overflowed to -inf, which reads as
-    a row that saw no key: review of the FA3-gap batch's F3)."""
+@pytest.mark.parametrize("kept", [template.Kept.NONE, template.Kept.SPLIT], ids=["forward", "training"])
+def test_a_folded_forward_whose_products_pass_fp32_below_zero_rewalks_natural_interpreted(kept):
+    """A full call whose raw products pass fp32's range below zero (a query 2^126 against keys -8, scale
+    1/4: its power of two taken into the launch's scale, `_prepared`): every row's maximum reads -inf, which
+    a call whose every row sees a key takes as past the fold's reach (`reach_of`), so it walks again
+    natural on the query taken by the power, where its products stay finite (-2^127), and every equal
+    logit weighs its values alike: the output, the training forward's too, the values' mean, 1 (as an empty
+    row's -inf it read nothing: review of the FA3-gap batch's F3)."""
     shape = (1, 64, 1, 16)
     query = jnp.zeros(shape, jnp.bfloat16).at[..., 0].set(2.0 ** 126)
     key = jnp.zeros(shape, jnp.bfloat16).at[..., 0].set(-8.0)
     value = jnp.ones(shape, jnp.bfloat16)
     spans = template.spans(shape[1], shape[1], shape[0])
     with _device(interpret=True):
-        out = attention_mosaic.forward(query, key, value, spans, scale=0.25, interpret=True)
+        out = attention_mosaic.forward(query, key, value, spans, scale=0.25, residuals=kept, interpret=True)
+    out = out if kept is template.Kept.NONE else out[0]
     assert np.array_equal(np.asarray(out, np.float32), np.ones(shape, np.float32))
 
 
 @INTERPRETS
 def test_a_forward_kernel_built_for_its_facts_runs_each_calls_own_interpreted():
-    """The forward's kernel is built once for every call of its static facts (`_kernel_of`, row 2440): calls
-    alike but for their scale, past their queries' one power of two (0.2 and 0.24, both 2^-3 times a scale
-    left of 1.6 and 1.92), each run their own though their kernels' names agree (launched outside an
-    op's report, which names them by its launch, `report.named`), each on par (check 1) with the reference's
-    at its scale from float64."""
+    """The forward's kernel is lowered once for every call of its static facts (`tuning.lowered_once`, row
+    2440): calls alike but for their scale, past their queries' one power of two (0.2 and 0.24, both 2^-3
+    times a scale left of 1.6 and 1.92), each run their own though their kernels' names agree (launched
+    outside an op's report, which names them by its launch, `report.named`), each on par (check 1) with the
+    reference's at its scale from float64."""
     shape = SHAPES["interpreted"]
     spans = template.spans(shape[1], shape[1], shape[0], causal=True)
     for scale in (0.2, 0.24):
@@ -1041,10 +1044,9 @@ def test_a_forward_kernel_built_for_its_facts_runs_each_calls_own_interpreted():
 
 @INTERPRETS
 def test_a_forward_kernel_built_for_its_facts_holds_no_calls_arrays_interpreted():
-    """The forward's kernel, built once for every call of its static facts (`_kernel_of`, row 2440), holds
-    none of a call's arrays, its operands' nor its hooks' (an initial state's sums, which its key describes
-    by shape and dtype, `_described`): each is released once the call is. (A hook closing over an array is
-    built for its call alone, `_holdable`: JAX's own trace caches hold such a closure as they did before.)"""
+    """The forward's kernel, lowered once for every call of its static facts (`tuning.lowered_once`, rows
+    2440, 2808), holds none of a call's arrays, its operands' nor its hooks' (an initial state's sums, which
+    its static hooks describe by shape and dtype): each is released once the call is."""
     shape = SHAPES["interpreted"]
     spans = template.spans(shape[1], shape[1], shape[0], causal=True)
     query, key, value, _ = _drawn(shape, jnp.bfloat16)(0)

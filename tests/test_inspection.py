@@ -13,7 +13,7 @@ import numpy as np
 import optax
 import pytest
 import test_run_budgets
-from test_run_options import KINDS, lm, scalars
+from run_kinds import KINDS, lm, scalars
 
 from dew.cli.main import main
 from dew.data.dataset import Loader

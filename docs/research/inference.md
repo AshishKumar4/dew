@@ -1,12 +1,12 @@
 # Inference and rollout serving
 
-Research checked on 2026-09-06. Dew citations refer to `65fd2f4`. Upstream source links pin commits. Hosted documentation describes the page retrieved on this date. MaxText package observations refer to `maxtext==0.2.4`, unpacked at `/tmp/mt/maxtext`; the linked source snapshot is `c55443590e2925b5da66f82ea7bc9a32a8c662e3`. Their line numbers differ. Package citations below use package-relative paths.
+Research checked on 2026-09-06. Dew citations refer to `cb9ce8f`. Upstream source links pin commits. Hosted documentation describes the page retrieved on this date. MaxText package observations refer to `maxtext==0.2.4`, unpacked at `/tmp/mt/maxtext`; the linked source snapshot is `c55443590e2925b5da66f82ea7bc9a32a8c662e3`. Their line numbers differ. Package citations below use package-relative paths.
 
 This note records capabilities and fit recommendations. It makes no interface decision. It reports no throughput measurement or end-to-end compatibility result. I read source and documentation without loading model weights or running a serving engine. A kernel or export path in source does not establish model-wide serving parity.
 
 ## Correction, 2026-09-22
 
-"Dew today", the "What Dew has today" columns and the correctness gaps under "Rollout throughput" describe `65fd2f4`. The current source differs:
+"Dew today", the "What Dew has today" columns and the correctness gaps under "Rollout throughput" describe `cb9ce8f`. The current source differs:
 
 - `generate(model, params, inputs, max_new_tokens, *, key=None, sampling=Sampling(), n=1, logits=None, stopping=None, strategy=None)` returns a `Generation` (`src/dew/sampling/text.py:682-686`). `Sampling` holds temperature, top-k, top-p, min-p, EOS ids and a pad id (`src/dew/sampling/text.py:130-147`). `Generation` carries per-row lengths, a terminated flag, the behaviour policy's log probabilities and the raw model's (`src/dew/sampling/text.py:192-216`). The `n` continuations of one prompt share its prefill (`src/dew/sampling/text.py:702-705`).
 - An `attention_mask` in the inputs marks the real prompt tokens, and `SampledRollout` builds it from the prompt lengths (`src/dew/sampling/text.py:689`; `src/dew/objectives/rl/rollout.py:79-94`). The reward sees each completion up to its length, without the EOS token (`src/dew/objectives/rl/rollout.py:125-129`). `old_log_probs` records the raw policy and `behavior_log_probs` the distribution that drew the tokens (`src/dew/objectives/rl/rollout.py:23-31`). So the two correctness gaps and the temperature ambiguity in the `[INFERENCE]` paragraph are closed.

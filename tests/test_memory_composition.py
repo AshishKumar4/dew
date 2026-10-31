@@ -19,6 +19,7 @@ from memory_support import (
     STEP,
     WIDTH,
     applied,
+    decode_passes,
     decoded,
     drawn,
     head_of,
@@ -43,7 +44,7 @@ memories' at 256, the decoder's last logits after a cached decode at 16, an adap
 and paired with the arm judged (`seeds_for(..., dew_fn=)`): each served memory (`SERVED`) at 8 with
 quantized training, the scanned memory decoder's gradients, every parameter's leaf, at 32 and the rematted
 one's at 64, and the quantized memory decoder served and alone against its full forward at 128 each
-(armada IGMEM2 at main 34c949ee8, where the gradients' unpaired 512 cost the rematted site 124 s)."""
+(armada IGMEM2 at main 4893fcdd3, where the gradients' unpaired 512 cost the rematted site 124 s)."""
 
 
 def decoder(memory: InContextMemory | None = None, **fields):
@@ -247,8 +248,8 @@ coarse steps at 8 to 16 times it."""
 def test_a_cached_linear_memory_off_the_recurrence_continues_its_full_pass():
     """A linear memory whose heads' inputs a checkpoint's input quantization rounds runs its general path
     on every call, while its cache holds the recurrence's state: a prefill and a token-by-token decode
-    through that cache read each token as the full pass does, on par against its paper's update over
-    the rounded inputs in float64 (check 1)."""
+    through that cache read each token as the full passes do, each step's at the width it reads
+    (`decode_passes`), on par against its paper's update over the rounded inputs in float64 (check 1)."""
     from dew.quantization import QUANTIZATION, InputQuantization, InputQuantizer
 
     module = layer("gated_linear_attention")
@@ -262,7 +263,7 @@ def test_a_cached_linear_memory_off_the_recurrence_continues_its_full_pass():
         return x, {**params, QUANTIZATION: scales}
 
     rounded = InputQuantizer.fp8(SCALE).qdq
-    assert_as_exact(decoded(quantized), applied(quantized), scaled,
+    assert_as_exact(decoded(quantized), decode_passes(quantized, None, 6), scaled,
                     "decoded quantized gated_linear_attention memory",
                     seeds=MEMORY_SEEDS,
                     truth_fn=written(module, dtype=jnp.float64, inputs=rounded))
@@ -572,7 +573,7 @@ def test_a_server_serves_a_quantized_memory_decoder_on_par_with_its_full_forward
     relative change of the weights crosses, moving the likelihoods by 1.2e-2 where the unquantized
     decoder moves by 1.4e-6, so a lone task batched with itself already moves its likelihoods by 8.8e-4
     and no two programs of it draw alike by rule (ledger 2032; armada probes IG2032 and IG2032c at main
-    783ea620a)."""
+    4c22ca953)."""
     pytest.importorskip("qwix")
     from model_support import Digits
     from serving_support import Served, assert_served_as_exact

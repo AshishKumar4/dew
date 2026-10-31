@@ -55,6 +55,7 @@ The pages assume you know Python, NumPy and the basics of training with gradient
 | Diffusion processes, presets, solvers and guidance | [Diffusion processes and solvers](concepts/diffusion.md) |
 | Training an image diffusion model | [Diffusion training](guides/diffusion.md) |
 | Language models: training, loading published checkpoints | [Language models](concepts/language_models.md) |
+| Diffusion language models: masked diffusion, DiffusionGemma | [Diffusion language models](concepts/diffusion_language_models.md) |
 | Mixture-of-experts layers | [Mixture of experts](concepts/moe.md) |
 | SFT, DPO, GRPO and PPO | [Post-training](concepts/post_training.md) |
 | Text generation and serving | [Generation and serving](concepts/inference.md) |

@@ -886,7 +886,7 @@ PAST_TARGET = {
                     ("a cotangent on a small column beside an overflowing one",): 118},
     "decode": {("a decode step's weight at the exponent's edge on a large value, float32", "default"): 143}}
 """The cases past or within 5 s of a group's 120 s target, by test and case, each its seconds on armada in
-train 281's or 283's CI (5861ec46b, 8089624e4; rows 2117, 2193, 2204): the whole suite's run holds them
+train 281's or 283's CI (f083bb557, cdc28de85; rows 2117, 2193, 2204): the whole suite's run holds them
 (`timed`), every other case of their tests runs each train."""
 
 

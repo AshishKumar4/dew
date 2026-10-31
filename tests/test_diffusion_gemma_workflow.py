@@ -7,6 +7,7 @@ from pathlib import Path
 import jax
 import numpy as np
 import pytest
+from model_support import moved
 
 from dew.diffusion.block import BlockProcess
 from dew.interop import Pretrained
@@ -166,10 +167,7 @@ def test_transformers_reads_a_trained_export_at_dews_logits_and_tokens(tmp_path)
     from tools.diffusion_gemma_reference import reference_generation
 
     bundle = Pretrained.load(str(FIXTURE), dtype="float32", attention_impl="xla", max_seq_len=32)
-    leaves, tree = jax.tree.flatten(bundle.variables)
-    keys = jax.random.split(jax.random.key(5), len(leaves))
-    changed = jax.tree.unflatten(tree, [leaf + 0.02 * jax.random.normal(key, leaf.shape, leaf.dtype)
-                                        for leaf, key in zip(leaves, keys, strict=True)])
+    changed = moved(bundle.variables, jax.random.key(5), 0.02)
     bundle.save(str(tmp_path), variables=changed)
     with np.load(FIXTURE / "reference.npz") as stored:
         reference = {name: stored[name] for name in stored.files}

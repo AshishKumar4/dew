@@ -29,6 +29,7 @@ from typing_extensions import TypeVar
 from dew.averaging import ema_update
 from dew.batch import EXAMPLE_ROWS, Batch, Variables, dicts, merge
 from dew.data.dataset import rows_of
+from dew.held_updates import holds_back, input_taken, refuse_untold, update_applied
 from dew.nn.inspection import Watched, flattened
 from dew.nn.kernels.options import compiler_options
 from dew.nn.precision import at_least_fp32
@@ -342,7 +343,8 @@ def example_places(slot, split: int, rows: int, column: jax.Array | None = None,
     return (step * rows * split + column).astype(jnp.int32)
 
 
-def example_fields(state, slot, split: int, batch, slots: int = 1, part=None, rejected=0) -> dict:
+def example_fields(state, slot, split: int, batch, slots: int = 1, part=None, rejected=0,
+                   microstep=None) -> dict:
     """The `Step` fields of the microbatch in window slot `slot` of the update `state` commits next, of
     `slots` microbatches, its steps read in `split` microbatches each, this the `part`th, after the run
     rejected `rejected` attempts: the update's key (`Step.example_key`), which folds in the rejections,
@@ -354,6 +356,13 @@ def example_fields(state, slot, split: int, batch, slots: int = 1, part=None, re
         return {}
     key = jax.random.fold_in(jax.random.fold_in(jax.random.fold_in(state.key, EXAMPLE_STREAM),
                                                 state.updates), rejected)
+    if holds_back(state.opt_state):
+        # Each input the optimizer takes, holds or skips draws apart: by the windows accepted before it,
+        # read off the microbatches accepted (`microstep`, the state's where none is given) over a
+        # window's (`slots`, its parts counted), so a window's slots and parts share its draw however
+        # its batch is split.
+        accepted = state.microstep if microstep is None else microstep
+        key = jax.random.fold_in(key, accepted // slots)
     index = example_places(slot, split, rows, batch.get(EXAMPLE_ROWS), part)
     return {"example_key": key, "example_index": placed_as_rows(index, batch), "example_count": slots * rows}
 
@@ -422,7 +431,7 @@ class Transaction:
         """`state` for the commit, its host-resident fields (`fetch`) brought to the device past `gradient`:
         they pass an optimization barrier with it, so the device takes them only once it is ready. Where
         nothing rests on the host the state is the commit's as it is: with the barrier there too, a step
-        that fit by a byte past its own rung found no rung (tests/test_narrow.py, at f001b108c)."""
+        that fit by a byte past its own rung found no rung (tests/test_narrow.py, at ada6c5686)."""
         if self.fetch is None:
             return state
         resting = {field: getattr(state, field) for field in COMMIT_FIELDS}
@@ -550,11 +559,11 @@ class Transaction:
                          with_ema(variables, self.fetched(state).ema), committed=state.updates,
                          record=self.record, qk_stats=clips_qk(state.opt_state), watched=self.watched,
                          **self.examples(state, index, batch, part=attempt % self.split,
-                                         rejected=attempt - accepted))
+                                         rejected=attempt - accepted, microstep=accepted))
         return self.read(variables, state.compute), batch, step_info
 
-    def examples(self, state, slot, batch, part=None, rejected=0) -> dict:
-        return example_fields(state, slot, self.split, batch, self.size, part, rejected)
+    def examples(self, state, slot, batch, part=None, rejected=0, microstep=None) -> dict:
+        return example_fields(state, slot, self.split, batch, self.size, part, rejected, microstep)
 
     def _places(self, slot, evaluated: Evaluated, part) -> jax.Array:
         """The places the window's slot `slot` and the column its loss saw give an evaluation's rows
@@ -598,6 +607,18 @@ class Transaction:
         Admission is decided by finish_attempt after checking the updated
         parameters and optimizer state as well.
         """
+        # The clocks count the updates the optimizer applies (`update_applied`), which an optimizer that holds
+        # some back says by its state; one whose state does not, or a held update whose post-step
+        # effects no update would apply, is refused as the step is traced, before any runs.
+        refuse_untold(current.opt_state)
+        if holds_back(current.opt_state) and self.aux_shape.effects is not None:
+            raise ValueError("an objective with post-step effects (Aux.effects) under an optimizer that "
+                             "holds updates back, whose held calls' effects no update applies; accumulate "
+                             "gradients with Trainer(accumulation=k)")
+        if holds_back(current.opt_state) and current.deferred is None:
+            raise ValueError("the state holds no tokens waiting for the update its optimizer holds back "
+                             "(TrainState.deferred): build it with Trainer.initial_state, or restore it "
+                             "through the trainer, which gives one written before them none waiting")
         native = jax.tree.map(_descending, gradient, current.variables["params"])
         native_finite = _all_finite(native)
         norm = optax.global_norm(native)
@@ -617,6 +638,7 @@ class Transaction:
             # rescale, a bounded group's clamp) acts on them (`stepped`).
             params = {**current.variables, "params": self.objective.projected(
                 stepped(stored, update, current.opt_state, opt_state), updated=True)}
+            done = update_applied(current.opt_state, opt_state)
             if self.aux_shape.effects is not None:
                 params = write_back(params, self.objective.apply_effects(
                     params, self.effects_tree.unflatten(effects)))
@@ -626,12 +648,13 @@ class Transaction:
                     raise ValueError("the objective declares EMA but the state carries none")
                 # A decay over the run's progress reads it where the run keeps one (`EMASpec.progressed`).
                 at = self.progress(current) if self.objective.ema.progressed else current.updates
-                averaged = _chosen(self.objective.averages(current.updates),
+                averaged = _chosen(self.objective.averages(current.updates) & done,
                                    ema_update(averaged, params, self.objective.ema.decay(at)), averaged)
             inspected = {} if self.inspection is None else summaries(
                 self.inspection, stored, native, update, params["params"])
+            updates = current.updates + done.astype(current.updates.dtype)
             return dataclasses.replace(current, variables=params, opt_state=opt_state, ema=averaged,
-                                       updates=current.updates + 1), inspected
+                                       updates=updates), inspected
 
         if current.scale is None:
             return *apply(current), native_finite, norm
@@ -747,7 +770,16 @@ class Transaction:
             advanced = dataclasses.replace(advanced, compute=narrowed(advanced.variables, self.copies))
         if scale is not None:
             advanced = dataclasses.replace(advanced, scale=_advance_scale(scale, finite))
-        counted = due & accepted
+        # An update the optimizer holds back commits nothing yet: its tokens wait in the state
+        # (`TrainState.deferred`) for the update that applies them (`update_applied`).
+        # An input the optimizer skipped trains no update, so its tokens wait for none (`input_taken`).
+        done = update_applied(state.opt_state, advanced.opt_state)
+        counted = due & accepted & done
+        if state.deferred is not None:
+            taken = input_taken(state.opt_state, advanced.opt_state)
+            held = _TokenCount.add(state.deferred, jnp.where(taken, held, 0).astype(jnp.uint32))
+            waiting = jnp.where(due & accepted & ~done, held, jnp.where(counted, 0, state.deferred))
+            advanced = dataclasses.replace(advanced, deferred=waiting.astype(jnp.uint32))
         summary = stacked(inspected)
         return advanced, loss, aux, Committed(
             jnp.where(counted, norm, 0.), counted.astype(jnp.int32),

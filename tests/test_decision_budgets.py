@@ -16,7 +16,7 @@ import pytest
 from real_tokenizers import TOKENIZERS, backbone_reading, real_tokenizer
 
 from dew.data.dataset import Loading
-from dew.data.pipeline import Refused
+from dew.data.pipeline import Refused, Rejected
 from dew.data.sources import Memory
 from dew.data.text import ByteTokenizer, HFTokenizer
 from dew.decision import Choice, Decide, Example, Noul
@@ -144,6 +144,64 @@ def test_fit_counts_each_cut_by_kind_and_none_where_the_question_is_whole():
     read = dataclasses.replace(example, context="a document the backbone reads no part of")
     unread = Fit(fresh, BYTES, BYTE_SPECIALS, DecisionHead(64)).map({"example": read})
     assert unread["_dew_cut"] == {"context": (1, len("a document the backbone reads no part of"))}
+
+
+def _picked(options: list[str]) -> Example:
+    return Example("the state", {"q": Choice("Pick one", options)}, {"q": options[0]})
+
+
+# Options apart from their first word, and options alike but their last letter, which a budget of a few
+# tokens an option keeps apart and leaves alike.
+APART = _picked(["apple pie with cream on top", "banana split with cream on top"])
+ALIKE = _picked(["the order with cream on top a", "the order with cream on top b"])
+
+
+def test_a_refused_row_keeps_the_cut_that_refused_it_beside_its_records_earlier_cut():
+    """A row a declared budget cuts until its options read alike is refused (`options_alike`) with that
+    cut (`Rejected.cut`, the tokens it removed by what it cut), added to a cut an earlier step made of
+    its record. Grouped examples trained apart keep a refused member's cut beside its siblings', and a
+    group refused whole keeps every member's: a memory read, which counts its rows anew as it holds
+    them, counts them all beside the refusals, apart from the delivered rows' cuts."""
+    from dew.data.compile import compile
+    from dew.data.pipeline import ObjectiveData
+
+    layout = StateFirstLayout(max_len=512, labels=BYTE_LABELS, option_tokens=8)
+    [apart] = layout.rows(BYTES, BYTE_SPECIALS, APART.state, APART.questions)
+    [alike] = layout.rows(BYTES, BYTE_SPECIALS, ALIKE.state, ALIKE.questions)
+    assert layout.refusal(apart) is None and layout.refusal(alike) == "options_alike"
+    fit = Fit(layout, BYTES, BYTE_SPECIALS, DecisionHead(64))
+    refused = fit.map({"example": ALIKE, "_dew_cut": {"state": (1, 5), "options": (1, 2)}})
+    assert isinstance(refused, Rejected) and refused.reason == "options_alike"
+    assert refused.cut == {"options": alike.cuts["options"] + 2, "state": 5}
+    records = [{"example": GroupedExamples((APART, ALIKE))}, {"example": GroupedExamples((ALIKE, ALIKE))},
+               {"example": APART}]
+    loader = compile(Memory(records).batch(1), read="memory", objective=ObjectiveData(train=(fit,)))
+    [counts] = loader.counts.values()
+    assert counts.accepted == 2 and counts.refused == {"options_alike": 2}
+    assert counts.refused_cut == {"options": 3 * alike.cuts["options"]}
+    assert counts.cut_removed == {"options": 2 * apart.cuts["options"]}
+
+
+def test_a_runs_summary_counts_the_cut_of_the_rows_it_refused(backbone):
+    """A run whose declared option budget keeps one question's options apart and leaves another's alike
+    reports, beside the delivered row's cut, the cut of the row it refused (`cut`'s `refused`)."""
+    data = (Memory([{"example": APART}, {"example": ALIKE}]).pipe(decisions).read("memory").batch(8)
+            .loading(Loading(workers=0)))
+    objective, _, _ = dataclasses.replace(_run(backbone, 2), data=data).prepare().train("x")
+
+    def laid(budget: int, example: Example):
+        layout = dataclasses.replace(objective.layout, option_tokens=budget)
+        [row] = layout.rows(objective.tokenizer, objective.specials, example.state, example.questions)
+        return row, layout.refusal(row)
+
+    budget = next(budget for budget in range(1, 64) if laid(budget, APART)[1] is None)
+    (apart, _), (alike, reason) = laid(budget, APART), laid(budget, ALIKE)
+    assert reason == "options_alike" and apart.cuts["options"] > 0
+    run = dataclasses.replace(_run(backbone, 2, option_tokens=budget), data=data)
+    _, _, summary = run.prepare().train("x")
+    [cut] = summary["cut"].values()
+    assert cut["options"]["removed"] == apart.cuts["options"]
+    assert cut["options"]["refused"] == alike.cuts["options"]
 
 
 def test_a_context_no_cross_attention_reads_counts_as_a_cut_of_it():
@@ -320,8 +378,12 @@ def test_a_fresh_runs_rows_hold_their_whole_questions_and_count_each_declared_cu
     assert summary["capacities"]["labels"] == {"count": letters, "from": "tokenizer"} and letters >= count
     lines = [objective.tokenizer.decode(row.tokens[start:end]) for start, end in row.questions[0].options]
     assert lines == [f"\n{label}. {option}" for label, option in zip(names, question.options, strict=True)]
+    # Each question budget whole, as the run states none.
+    assert summary["capacities"]["question"] == {"tokens": None, "from": "whole"}
+    assert summary["capacities"]["option"] == {"tokens": None, "from": "whole"}
     shortest = min(end - start for start, end in row.questions[0].options)
-    _, declared, _ = _run(backbone, count, option_tokens=shortest - 3).prepare().train("x")
+    _, declared, stated = _run(backbone, count, option_tokens=shortest - 3).prepare().train("x")
+    assert stated["capacities"]["option"] == {"tokens": shortest - 3, "from": "stated"}
     [cut] = declared.counts.values()
     assert cut.accepted == count and cut.refused == {}
     assert cut.cut_examples["options"] == cut.cut_rows["options"] == count
@@ -361,8 +423,8 @@ def test_a_server_admits_a_large_question_whole_and_counts_what_it_refuses_as_tr
     """The run's task, served whole (`Decide.scoring(whole=True)`), admits a request of 77 or 151 intents
     as it lays it out whole, its usage reporting no cut, and counts it admitted; the same task under
     Laya's declared budgets, served whole, refuses it under `cut`, counted in the server's own counters
-    (`WireScoring.counts`), and answers a short request whose instructions those budgets cut with the cut
-    in its usage where it is not served whole."""
+    (`WireScoring.counts`) with the tokens its cut would have removed (`refused_cut`), and answers a short
+    request whose instructions those budgets cut with the cut in its usage where it is not served whole."""
     objective, _, _ = _run(backbone, count).prepare().train("x")
     task = Decide(objective.model, objective.init(jax.random.key(0)), objective.layout, objective.tokenizer,
                   objective.specials)
@@ -375,6 +437,7 @@ def test_a_server_admits_a_large_question_whole_and_counts_what_it_refuses_as_tr
     with pytest.raises(Refused) as refused:
         strict.admit(body)
     assert refused.value.reason == "cut" and strict.counts.rejected == {"cut": 1}
+    before = strict.counts.refused_cut["instructions"]
     worded = Noul("Does the customer " + "really and truly " * 120 + "need a new card?")
     short = {"state": "my card is lost", "questions": {"holds": worded.wire()}}
     with pytest.raises(Refused) as whole:
@@ -384,3 +447,25 @@ def test_a_server_admits_a_large_question_whole_and_counts_what_it_refuses_as_tr
     [row] = [row.encoded for row in lenient.admit(short).rows]
     assert set(row.cuts) == {"instructions"} and lenient.counts.cut_rows == {"instructions": 1}
     assert lenient.counts.cut_removed == {"instructions": row.instructions_cut}
+    # The cut the whole server refused counts beside its refusal, as a run's data counters count it.
+    assert strict.counts.refused_cut["instructions"] - before == row.instructions_cut
+
+
+def test_a_release_runs_question_budgets_name_where_each_came_from(tmp_path):
+    """A run over Laya's release states each question budget with where it came from: the release's own
+    question budget, which its config states, and Laya's option budget, which its config leaves unstated
+    and Laya's code fixes at 48 tokens (`LAYA_BUDGETS`), so the release reads as Laya reads it; a budget
+    the run states is the run's."""
+    from run_kinds import TINY_LAYA, decision
+
+    run = decision(tmp_path, drawn=False)
+    assert run.pretrained == str(TINY_LAYA)
+    _, _, summary = Fitted(**{field.name: getattr(run, field.name) for field in dataclasses.fields(run)
+                              if field.init}).prepare().train("x")
+    assert summary["capacities"]["question"] == {"tokens": 48, "from": "release"}
+    assert summary["capacities"]["option"] == {"tokens": 48, "from": "laya"}
+    stated = dataclasses.replace(run, option_tokens=12)
+    _, _, summary = Fitted(**{field.name: getattr(stated, field.name) for field in dataclasses.fields(stated)
+                              if field.init}).prepare().train("x")
+    assert summary["capacities"]["option"] == {"tokens": 12, "from": "stated"}
+

@@ -1515,6 +1515,8 @@ class PhasedStream:
                 order=self._stream(phase).order,
                 completed=completed,
                 plan={"phases": plans} if any(plan is not None for plan in plans) else None,
+                tokens=() if self._tokens is None else tuple(int(end) for end in self._tokens[:phase]
+                                                             if end is not None),
             )
         )
 
@@ -1526,6 +1528,18 @@ class PhasedStream:
             if len(saved.completed) > len(self._ends):
                 raise ValueError(f"the saved run finished {len(saved.completed)} phases, and this run has "
                                  f"{len(self._ends) + 1}")
+            finished = self._tokens[:len(saved.completed)]
+            if saved.tokens is None and saved.completed:
+                raise ValueError(f"the saved run finished {len(saved.completed)} phases in a position "
+                                 "written before positions held the committed tokens each ended at, so "
+                                 "nothing says where they ended on this run's clock; resume it with the Dew "
+                                 "that wrote it")
+            if saved.tokens is not None and saved.tokens != finished:
+                # Its records end where the saved run's commits reached the phases' tokens, which a phase
+                # ending at other tokens would read on from as though the run had reached them.
+                raise ValueError(f"the saved run finished its phases at {list(saved.tokens)} committed "
+                                 f"tokens, and this run's end at {list(finished)}; a phase the run has read "
+                                 "cannot change under it")
             # The ends the saved run reached, and none past them, which this run reaches as it reads.
             for index in range(len(self._ends)):
                 self._resolve(index, saved.completed[index][1] if index < len(saved.completed) else None)
