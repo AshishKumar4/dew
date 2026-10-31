@@ -224,6 +224,33 @@ def test_corrupt_committed_index_is_an_error_without_fallback():
     assert list(cache.generation(key).outputs(0)) == [{"id": 0}]
 
 
+@pytest.mark.parametrize("transport", ["memory", "local"])
+def test_a_published_shard_replaced_under_its_generation_is_refused_where_it_is_read(transport, tmp_path):
+    """A published generation's shard, which its manifest declares, replaced since by another shard of
+    as many records is never read under the generation's identity, as any declared file is not
+    (`dew.data.declared.Declared`): refused (`Replaced`) where a read opens it, or read as it was
+    published, from Dew's checked copy of it where its reader reads a copy."""
+    from dew.data.declared import Replaced
+
+    url = f"memory://artifact-{uuid4().hex}" if transport == "memory" else str(tmp_path / "cache")
+    published = []
+    for ids in ([0, 1], [10, 11]):
+        source = Memory([{"id": value} for value in ids])
+        cache, key = Cache(f"{url}-{ids[0]}"), _key()
+        rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), key)
+        [rows[index] for index in range(len(ids))]
+        rows.finish()
+        rows.close()
+        published.append(cache.publish(key, source))
+    held, other = published
+    [shard] = held.manifest["shards"]
+    [swapped] = other.manifest["shards"]
+    Store(held.manifest["root"]).child(shard).write(Store(other.manifest["root"]).child(swapped).read())
+    with contextlib.suppress(Replaced):
+        assert list(held.outputs(0)) == [{"id": 0}]
+        assert transport == "memory", "a local shard is read where it is, and refused"
+
+
 @pytest.mark.parametrize("spool_bytes", [256, 1 << 20])
 def test_full_spool_stops_admitting_and_training_continues(spool_bytes):
     """A row larger than the spool is served but not admitted, so its cache

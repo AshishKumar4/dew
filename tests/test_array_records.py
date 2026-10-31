@@ -254,8 +254,8 @@ def test_arrayrecords_release_an_idle_mirror_before_opening_its_replacement(
     among them."""
     import grain.python as grain
 
+    from dew.data.declared import Declared
     from dew.data.sources.records import ArrayRecords
-    from dew.data.storage import Declared
 
     root = Store(f"memory://bounded-record-mirror-{uuid4().hex}")
     shards = [root.child(f"{index}.array_record") for index in range(len(arrayrecord_paths))]
