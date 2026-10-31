@@ -104,9 +104,10 @@ def stored(root: Path, drawn: bool) -> RunConfig:
     return dataclasses.replace(over(QWEN, root, drawn), source=SourceOptions(param_dtype="bfloat16"))
 
 
-def computed(directory: Path | str, step: int | None = None) -> dict[str, list[str]]:
+def computed(directory: Path | str, step: int | None = None) -> dict[str, dict[str, list[str]]]:
     """Each module's dtypes, by its variable scope's path, that one request of the task a saved run at
-    `directory` loads, at `step` or else its default, multiplies in: its products' operands'
+    `directory` loads, at `step` or else its default, multiplies in (`products`, a packed projection's at
+    each of its members), beside the projections its model packs (`packs`): its products' operands'
     (`saved_run_products`), read in a fresh interpreter, where every program the request runs lowers, as
     the corpus's writer reads them. A model whose outer module states bfloat16 while one projection of
     its decoder computes in float32 states float32 at that projection's scope. The products are the
@@ -116,7 +117,7 @@ def computed(directory: Path | str, step: int | None = None) -> dict[str, list[s
     # A record names the repo's sources by their path in it, read from the checkout's root.
     found = process_support.fresh(Path(__file__).with_name("saved_run_products.py"), str(directory),
                                   *([] if step is None else [str(step)]), cwd=process_support.REPO_ROOT)
-    assert found, "the request lowered no matrix product"
+    assert found["products"], "the request lowered no matrix product"
     return found
 
 
