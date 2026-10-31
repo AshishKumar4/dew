@@ -583,6 +583,36 @@ def test_a_dense_layers_product_through_the_template_holds_check_1(generation_na
                         truth_fn=with_gradients(truth))
 
 
+def test_each_dense_launch_lowers_once_however_many_layers_call_it():
+    """Two layers' dense projections of one shape, their forward and gradients, through the template's
+    Mosaic launches lowered for an H100: each distinct launch is one Mosaic GPU call in the lowered program,
+    which both layers call, as many as one layer's (`tuning.lowered_once`; row 2808). Each call built and
+    lowered its own kernel, a model's identical layers' kernels each again."""
+    import re
+
+    operands = [jax.ShapeDtypeStruct(shape, jnp.bfloat16) for shape in ((512, 256), (256, 256))]
+
+    def layers(count: int):
+        def run(x, w):
+            total = jnp.float32(0.0)
+            for layer in range(count):
+                # Each layer's own rows, as each layer takes the one before's.
+                out = template.gemm(x * (layer + 1), w, None, out_dtype=jnp.bfloat16)
+                total = total + out.astype(jnp.float32).sum()
+            return total
+
+        return jax.grad(run, argnums=(0, 1))
+
+    def kernels(count: int) -> int:
+        with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic_gpu"):
+            text = jax.jit(layers(count)).trace(*operands).lower(lowering_platforms=("cuda",)).as_text(
+                dialect="hlo")
+        return len([line for line in text.splitlines() if re.search(r'custom_call_target="mosaic_gpu', line)])
+
+    one = kernels(1)
+    assert one > 0 and kernels(2) == one
+
+
 @pytest.mark.parametrize("policy", ["fp32_result_dot_general", "head_dot_general"])
 def test_a_head_keeps_its_own_products_fp32_result(policy):
     """A bf16 projection whose product states a policy of its own, a DiT's prediction head

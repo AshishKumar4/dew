@@ -1,23 +1,25 @@
 """Live inspection of a run's parameters, gradients and updates (row 2317).
 
 A run names what it watches (`Inspection`): parameter paths by glob, the trees whose leaves at those paths
-it summarizes, and every how many steps. The summaries are reduced inside the jitted step, over the global
-arrays (each process's share reduced in the one SPMD program, replicas counted once), so only scalars
-leave the devices; they ride the step's commit telemetry (`dew.training.transaction.Committed`) and are
-read one log late off the step loop (`dew.training.interval.LogWriter`). A run with no inspection compiles
-its step unchanged; one with an inspection compiles a second, sampled step, which the loop takes on the
-steps it samples."""
+it summarizes, and every how many windows of steps. The summaries are reduced inside the jitted step,
+over the global arrays (each process's share reduced in the one SPMD program, replicas counted once), so
+only scalars leave the devices; they ride the step's commit telemetry (`dew.training.transaction.Committed`)
+and are read one log late off the step loop (`dew.training.interval.LogWriter`). A run with no inspection
+compiles its step unchanged; one with an inspection compiles a second, sampled step, which the loop takes
+on the steps it samples."""
 
 from __future__ import annotations
 
 import dataclasses
 import fnmatch
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Literal, SupportsFloat
+from typing import TYPE_CHECKING, Literal
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
+from flax import struct
 
 from dew.nn.inspection import Watched, statistics
 from dew.optim import parameter_name
@@ -42,9 +44,10 @@ class Inspection:
     selects is summarized on its own, for each target: its mean, standard deviation, root mean square,
     largest magnitude, non-finite share and zero fraction. Every sampled step also reports each
     target's global L2 norm, over every parameter, and the update-to-weight ratio,
-    ||update|| / ||params||. `every` is the steps
-    between samples; the run's logs carry the latest sample, so a cadence of the logs' or a multiple of
-    it reports each sample once."""
+    ||update|| / ||params||. `every` is the windows of the run's accumulation steps between samples
+    (`samples`): the update that commits in each, every `every`-th update of a run no step of which is
+    rejected; the run's logs carry the latest sample, so a cadence of the logs' or a multiple of it reports
+    each sample once."""
 
     paths: tuple[str, ...] = ()
     targets: tuple[Target, ...] = ("params", "grads", "updates", "deltas")
@@ -64,15 +67,20 @@ class Inspection:
 
     def __post_init__(self):
         if self.every < 1:
-            raise ValueError(f"an inspection samples every positive number of steps, not {self.every}")
+            raise ValueError(f"an inspection samples every positive number of windows, not {self.every}")
         unknown = {str(target) for target in self.targets} - {"params", "grads", "updates", "deltas"}
         if unknown:
             raise ValueError(f"an inspection's targets are params, grads, updates and deltas, not "
                              f"{sorted(unknown)}")
 
-    def samples(self, step: int) -> bool:
-        """Whether the step that ends at `step` is sampled."""
-        return step % self.every == 0
+    def samples(self, step: int, accumulation: int) -> bool:
+        """Whether the step that ends at `step` is sampled: each step of every `every`-th window of
+        `accumulation` steps, the loop's count of the steps it attempts, so the update that commits in it
+        is sampled at the window's end or early, where a run on the examples clock closes its last window
+        short. A rejected step (a non-finite loss under a dynamic loss scale) drops its window and shifts
+        the commits after it, which the loop sees only on the devices: a sampled window that then holds
+        no commit skips its sample, as often as rejections so fall."""
+        return -(-step // accumulation) % self.every == 0
 
 
 def summaries(inspection: Inspection, params, grads, updates, stepped) -> dict[str, jax.Array]:
@@ -98,9 +106,31 @@ def summaries(inspection: Inspection, params, grads, updates, stepped) -> dict[s
     return found
 
 
-def logged(inspected: Mapping[str, SupportsFloat]) -> dict[str, float]:
-    """A sample's scalars as a run logs them, under `inspect/`."""
-    return {f"inspect/{name}": float(value) for name, value in inspected.items()}
+@struct.dataclass
+class Summaries:
+    """A sampled commit's scalars (`summaries`, `dew.training.transaction.watched_activations`) as one
+    float32 vector, `values`, beside their names, `names`, which its step fixes as it traces: a sample
+    crosses the step loop and reaches the host as one array, named off it by the log's reader
+    (`logged`), not one scalar each (row 2723)."""
+
+    values: jax.Array
+    names: tuple[str, ...] = struct.field(pytree_node=False)
+
+
+def stacked(scalars: Mapping[str, jax.Array], kept: jax.Array) -> Summaries | None:
+    """`scalars` as one vector (`Summaries`) in their order, each zero where `kept` is false (an attempt
+    that committed nothing), None where there are none, a step that samples nothing."""
+    if not scalars:
+        return None
+    names = tuple(scalars)
+    values = jnp.stack([jnp.asarray(scalars[name], jnp.float32) for name in names])
+    return Summaries(jnp.where(kept, values, 0.), names)
+
+
+def logged(inspected: Summaries) -> dict[str, float]:
+    """A sample's scalars as a run logs them, under `inspect/`, each by its name."""
+    return {f"inspect/{name}": float(value)
+            for name, value in zip(inspected.names, np.asarray(inspected.values), strict=True)}
 
 
 def inspected[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch, *,
@@ -113,6 +143,8 @@ def inspected[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch, 
     `steps`, the run's length, as `fit(steps=...)` builds it. The stepped state is discarded."""
     if trainer.inspection is None:
         raise ValueError("the trainer names no inspection (Trainer(inspection=...)) to report")
+    # An objective that names its input field alone reads its shape off the batch, as `fit` does.
+    trainer._declare_input(lambda: batch)
     trainer.scheduled(None if steps is None else steps // trainer.accumulation)
     state, _, _ = trainer.place()
     step, window = trainer.compile(state, batch), int(state.window_size)
@@ -122,7 +154,7 @@ def inspected[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch, 
     committed = None
     for _ in range(-(-(window - int(state.microstep) % window) // split)):
         state, *_, committed = step(state, batch, sampled=True)
-    if committed is None or not int(committed.count):
+    if committed is None or committed.inspected is None or not int(committed.count):
         raise ValueError("the sampled window did not commit over this batch (a part of it rejected, its "
                          "loss not finite); inspect a batch whose window commits")
     return logged(jax.device_get(committed.inspected))

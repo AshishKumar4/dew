@@ -1,7 +1,9 @@
 """Live inspection (row 2317): what a run watches is summarized inside its step, from the arrays its commit
 holds, and logged one log late; a run that watches nothing compiles its step unchanged."""
 
+import collections
 import contextlib
+import itertools
 import json
 
 import flax.linen as nn
@@ -115,6 +117,18 @@ def test_a_loaded_runs_view_is_the_live_runs():
     live = trained(inspection, 1)[1]
     offline = inspected(trainer(inspection), {"x": ROWS})
     assert offline == {name: value for name, value in live.items() if name.startswith("inspect/")}
+
+
+def test_an_offline_view_of_an_objective_naming_its_input_alone_declares_it_from_its_batch():
+    """The offline view of a trainer whose objective names its input field alone (`Supervised(inputs="x")`,
+    the documented form) declares that input at the shape its batch gives, as `fit` does from its loader's
+    first, and reports the sampled update (row 2719)."""
+    from dew.objectives.supervised import Supervised
+
+    objective = Supervised(nn.Dense(2), lambda outputs, batch: jnp.sum(outputs ** 2, axis=-1), inputs="x")
+    trainer = Trainer(objective, optax.sgd(RATE), key=jax.random.key(0),
+                      inspection=Inspection(paths=("*",), targets=("params",)))
+    assert inspected(trainer, {"x": ROWS})["inspect/params/l2"] > 0
 
 
 def test_a_custom_step_refuses_an_inspection():
@@ -322,12 +336,13 @@ def test_a_watched_module_with_a_child_named_output_is_summarized():
     assert "inspect/activations/abs_max" in logged
 
 
-def accumulating(inspection, tracker=None, checkpoints=None, split=1):
-    """A trainer of two `split`-microbatch steps an update, over four data shards, whose rows split in two."""
+def accumulating(inspection, tracker=None, checkpoints=None, split=1, accumulation=2):
+    """A trainer of `accumulation` `split`-microbatch steps an update, over four data shards, whose rows
+    split in two."""
     from dew.training import MeshSpec
 
     return Trainer(Pulled(), optax.sgd(RATE), key=jax.random.key(0), tracker=tracker, inspection=inspection,
-                   accumulation=2, checkpoints=checkpoints, split=split,
+                   accumulation=accumulation, checkpoints=checkpoints, split=split,
                    mesh=MeshSpec().build(jax.devices()[:4]))
 
 
@@ -339,6 +354,60 @@ def test_a_log_at_a_step_that_commits_nothing_keeps_the_sample_before():
         Loader(lambda partition: stream(), None, batch=BATCH, records=None), steps=3, log_every=3,
         eval_every=None, checkpoint_every=None)
     assert tracker.rows[3]["inspect/params/l2"] > 0
+
+
+@pytest.mark.parametrize("every", [2, 3])
+def test_an_inspection_samples_every_nth_update_of_an_accumulating_run(every):
+    """`every` counts optimizer updates (row 2720): with three steps an update, logged at each update,
+    no log carries a sample before the `every`-th update's commit, which carries one, whether or not
+    `every` divides the steps an update takes."""
+    tracker = Kept()
+    accumulating(Inspection(paths=("w",), targets=("params",), every=every), tracker, accumulation=3).fit(
+        Loader(lambda partition: stream(), None, batch=BATCH, records=None), steps=3 * every, log_every=3,
+        eval_every=None, checkpoint_every=None)
+    sampled = [step for step, row in sorted(tracker.rows.items()) if "inspect/params/l2" in row]
+    assert sampled == [3 * every]
+
+
+def test_an_examples_runs_short_last_window_samples_its_commit():
+    """A run on the examples clock whose last window closes short samples the update that commits there
+    (row 2720): with three steps an update, every second update sampled and five batches, the second
+    update commits early, at the fifth step, and its log carries the sample."""
+    from dew.data import Memory
+    from dew.data.pipeline import Pipeline
+
+    tracker = Kept()
+    chain = Pipeline(Memory({"x": np.concatenate([ROWS] * 5)})).read("streamed").batch(BATCH)
+    Trainer(Pulled(), optax.sgd(RATE), key=jax.random.key(0), tracker=tracker, accumulation=3,
+            inspection=Inspection(paths=("w",), targets=("params",), every=2)).fit(
+        chain, examples=5 * BATCH, log_every=1, eval_every=None, checkpoint_every=None)
+    sampled = [step for step, row in sorted(tracker.rows.items()) if "inspect/params/l2" in row]
+    assert sampled == [5]
+
+
+def test_a_rejected_step_skips_one_sample_and_the_run_samples_on():
+    """A step whose loss is not finite under a dynamic loss scale is rejected and drops its window,
+    shifting the windows after it;
+    the sampled window it shifted holds no commit, so that sample is skipped, and the next sampled window's
+    commit is sampled: with three steps an update and every second window sampled, a rejection at the
+    fourth step moves the updates to the seventh and tenth steps, and the tenth's log carries the sample
+    (row 2720)."""
+    poisoned = ROWS.copy()
+    poisoned[0, 0] = np.inf
+
+    def rows(partition):
+        for step in itertools.count(1):
+            yield {"x": poisoned if step == 4 else ROWS}
+
+    from flax.training.dynamic_scale import DynamicScale
+
+    tracker = Kept()
+    Trainer(Pulled(), optax.sgd(RATE), key=jax.random.key(0), tracker=tracker, accumulation=3,
+            dynamic_scale=DynamicScale(), inspection=Inspection(paths=("w",), targets=("params",), every=2)
+            ).fit(Loader(rows, None, batch=BATCH, records=None), steps=12, log_every=1, eval_every=None,
+                  checkpoint_every=None)
+    sampled = [step for step, row in sorted(tracker.rows.items()) if "inspect/params/l2" in row]
+    assert sampled[0] == 10
 
 
 def test_an_accumulating_trainers_offline_view_steps_its_whole_window():
@@ -367,22 +436,24 @@ def test_an_offline_view_restored_mid_window_steps_to_its_commit(tmp_path, split
 
 
 TRANSFORMED = ("mean_flow", "ladd", "rcm")
-"""Objectives whose trained forward runs inside a transform (a `jax.jvp`, a `lax.cond`), whose watched
-forward at its inputs XLA computes once with it; Flow-GRPO's, inside its scan, returns its own
+"""Objectives whose trained forward runs inside a transform (a `jax.jvp`, a `lax.cond`) or beside one, which
+returns what the watched modules sow through it; Flow-GRPO's, inside its scan, returns its own
 (`test_flow_grpo`)."""
 
 
 @pytest.mark.parametrize("name", TRANSFORMED)
 def test_a_sampled_step_summarizes_its_trained_forward_at_no_forward_more(name):
     """A sampled step of an objective whose trained forward runs inside a transform summarizes that very
-    forward, returned through the transform, and computes the model no more than an unsampled step does:
-    the sampled loss and gradient run the unsampled's matmuls, their work the same (`step_flops`), the
-    summaries elementwise alone (row 2512: one stop-gradient forward more, at its inputs)."""
+    forward, returned through the transform, and traces the model no more than an unsampled step does:
+    as an H100 would run it (`generation.assumed`), the sampled loss and gradient hold the unsampled's
+    products and kernel launches, so no second forward rides on a compiler merging it, which two
+    attention kernels of different forms never are (rows 2512 and 2718)."""
     from objective_cases import cases
+    from reference_error import equations
 
     from dew.nn.inspection import Watched, watching
+    from dew.nn.kernels import generation
     from dew.objectives.base import Step
-    from dew.telemetry.instrumentation import step_flops
 
     objective, batch = cases(None)[name]()
     variables = objective.init(jax.random.key(0))
@@ -391,7 +462,7 @@ def test_a_sampled_step_summarizes_its_trained_forward_at_no_forward_more(name):
     held = {key: value for key, value in batch.items() if key not in numeric}
     kinds = ("*Block*", "*Attention*", "*Mlp*", "*MLP*")
 
-    def work(*, watched: bool) -> tuple[float, object]:
+    def work(*, watched: bool) -> tuple[collections.Counter, object]:
         # The step's count is an argument, so a branch on it (rCM's phases) stays a branch.
         def loss(params, numeric, count):
             step = Step(step=count, key=jax.random.key(1), ema=None,
@@ -401,10 +472,12 @@ def test_a_sampled_step_summarizes_its_trained_forward_at_no_forward_more(name):
             return objective.reduce_loss(stats)[0], aux.inspected
         stepped = jax.value_and_grad(loss, has_aux=True)
         count = jnp.zeros((), jnp.int32)
-        flops = step_flops(jax.jit(stepped).lower(variables["params"], numeric, count).compile())
-        assert flops is not None
-        return flops.hardware, jax.eval_shape(stepped, variables["params"], numeric, count)[0][1]
+        with generation.assumed("sm90"):
+            graph, shapes = jax.make_jaxpr(stepped, return_shape=True)(variables["params"], numeric, count)
+        names = (equation.primitive.name for equation in equations(graph, platform="cuda"))
+        launched = collections.Counter(name for name in names if name in ("dot_general", "pallas_call"))
+        return launched, shapes[0][1]
 
     plain, _ = work(watched=False)
     sampled, inspected = work(watched=True)
-    assert inspected and sampled == plain
+    assert inspected and plain["dot_general"] and sampled == plain

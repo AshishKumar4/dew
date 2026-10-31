@@ -30,7 +30,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from reference_error import as_given, assert_as_exact, assert_computes_the_oracle, with_gradients, without_ynn
-from ssd_support import ssd_orbit
+from ssd_support import ssd_orbit, stepwise_scan
 
 from dew.nn.kernels.recurrence_chunk import RESET_DECAY, ssd_operands
 from dew.nn.kernels.ssd import ssd_chunk_scan
@@ -71,19 +71,6 @@ def mixer_operands(shape, seed: int = 0):
             jax.random.normal(keys[4], (batch, steps, groups, state_size), jnp.float32),
             jax.random.normal(keys[5], (heads,), jnp.float32),
             jax.random.normal(keys[6], (batch, heads, head_dim, state_size), jnp.float32))
-
-
-def stepwise_scan(x, b, c, a, state):
-    """The recurrence one step at a time, no chunks: `h_t = exp(a_t) h_{t-1}
-    + x_t b_t^T`, `y_t = h_t c_t`. Written apart from both chunked paths, so
-    in float64 it is an oracle neither of them shares a line with."""
-    def step(h, inputs):
-        x, b, c, a = inputs
-        h = jnp.exp(a)[..., None, None] * h + x[..., :, None] * b[..., None, :]
-        return h, jnp.einsum('bhpn,bhn->bhp', h, c)
-
-    final, ys = jax.lax.scan(step, state, tuple(jnp.moveaxis(t, 1, 0) for t in (x, b, c, a)))
-    return jnp.moveaxis(ys, 0, 1), final
 
 
 def segment_sum(x):
