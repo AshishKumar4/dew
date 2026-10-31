@@ -969,8 +969,8 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
     interpreted off a GPU of that family (a CPU's). A decay a key dimension takes the layer's declared
     `floor`, which the mainloop's intra launch reads (`mainloop.per_key_refusal`), and a 16-bit delta rule the
     chunk inverse's `bound` its form proves, which its solve's range needs (`template.inverse_refusal`); a
-    `rounded` call without it (the SSD's) takes mamba_ssm's 16-bit numbers under the run's fast forms
-    (`mainloop.forward`)."""
+    `rounded` call without it (the SSD's under the run's fast forms, `mamba_rounding`) takes mamba_ssm's
+    16-bit numbers (`mainloop.forward`)."""
     from .templates.recurrence import mainloop, mainloop_backward, template
 
     dtype = jnp.result_type(query, key, value)
@@ -1166,7 +1166,7 @@ def _rated_scan(hooks: recurrence.Hooks, query, key, value, g, beta, given: dict
         if kernel == 'mosaic_gpu':
             out, final = template_rule(query, key, value, g, beta, state, starts, firsts,
                                        max_segments=max_segments, scale=1.0, delta=False, wide=True,
-                                       rounded=True)
+                                       rounded=mamba_rounding())
             return recurrence.skipped(hooks, out, value, {'skip': skip}, work), final
         operand = jnp.result_type(query, key, value)
         x, B, C = (jnp.asarray(t, operand) for t in (value, key, query))
@@ -1317,6 +1317,13 @@ def scan_case(x, B, chunk_size: int, *, tpu: bool = True, padded: bool = False, 
                     call=call, family=family, product=product)
 
 
+def mamba_rounding() -> bool:
+    """Whether the SSD's call on the template takes mamba_ssm's 16-bit numbers (`rounded`): under the run's
+    fast forms (`generation.numerics`), resolved here at its route, so its launches and their caches key on
+    it, never on the run's numerics read inside them."""
+    return generation.numerics().forms == 'fast'
+
+
 def scan_kernel(query, key, value, g, beta, state=None, starts=None, *, chunk_size: int,
                 max_segments: int | None = None, product: str = 'forward', report: bool = True) -> str:
     """The kernel the scan's selector (`SCAN`) gives a rated scan over these operands (`_rated_scan`'s:
@@ -1326,7 +1333,7 @@ def scan_kernel(query, key, value, g, beta, state=None, starts=None, *, chunk_si
     from .templates.recurrence import template
 
     call = base.call((template.MOSAIC,), query, key, value, g, beta, state, starts,
-                     max_segments=max_segments, scale=1.0, delta=False, wide=True, rounded=True)
+                     max_segments=max_segments, scale=1.0, delta=False, wide=True, rounded=mamba_rounding())
     case = scan_case(value, key, chunk_size, padded=True, call=call, product=product)
     return select(SCAN, case).kernel if report else selected(SCAN, case).name
 

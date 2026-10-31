@@ -62,8 +62,7 @@ def _planned(shapes: tuple, tiles: mainloop.Tiles, family: mosaic.Family, target
     bundle on `target`, cached by the facts a plan reads of it (two targets of one family share no plan: an
     sm87's and an sm80's multiprocessors and shared memory differ)."""
     facts = (target.generation, target.device_kind, target.shared_limit, target.multiprocessors)
-    key = (shapes, tiles, family, facts, max_segments, delta, backward, floor, rounded,
-           generation.numerics().forms)
+    key = (shapes, tiles, family, facts, max_segments, delta, backward, floor, rounded)
     if key not in _PLANS:
         *operands, starts = shapes
         _PLANS[key] = mainloop_backward.planned(*operands, tiles=tiles, family=family, starts=starts,
