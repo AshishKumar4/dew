@@ -56,10 +56,12 @@ def decode_token(name: str, rows: int):
     allocated = module.apply(variables, hidden[:, :1], call, mutable=['cache'])[1]
     _, cache = module.apply({**variables, **allocated}, hidden[:, :PREFILL], call, mutable=['cache'])
 
-    def step(cache, token):
+    # The weights are an argument: `program` keeps each function it compiled, and a closure over them would
+    # keep every shape's model.
+    def step(variables, cache, token):
         return module.apply({**variables, **cache}, token, call, mutable=['cache'])
 
-    return program(step), (cache, hidden[:, PREFILL:])
+    return program(step), (variables, cache, hidden[:, PREFILL:])
 
 
 def main(argv=None) -> int:
