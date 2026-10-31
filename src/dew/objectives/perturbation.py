@@ -58,11 +58,13 @@ from collections.abc import Mapping
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import linen as nn
 
 from dew._distributions import counter_key
 from dew.batch import Batch, Variables, leaves_by_path
 from dew.data.dataset import rows_of
+from dew.nn.kernels.generation import linear_map
 from dew.nn.precision import at_least_fp32, float32_einsum
 from dew.nn.protocols import OutputTable, RematChoosing, head_table
 from dew.objectives.base import Aux, Objective, Step, _has_aux, stream
@@ -72,6 +74,13 @@ NOISE = jnp.float32
 draws, and a bfloat16 site jitters by the draw cast to bfloat16."""
 
 Path = tuple[str, ...]
+
+
+def _still(leaf):
+    """A tangent of zero for `leaf`: float0's for one of no tangent space, an index or a count."""
+    if jnp.issubdtype(leaf.dtype, jnp.inexact):
+        return jnp.zeros_like(leaf)
+    return np.zeros(jnp.shape(leaf), jax.dtypes.float0)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -197,26 +206,48 @@ class NodePerturbation[LossT, EffectsT](Objective[LossT, EffectsT]):
                              "at a module to summarize; watch its activations without cotangents")
         held = {name: value for name, value in variables.items() if name != "params"}
 
-        @jax.custom_vjp
+        @jax.custom_jvp
         def estimated(params, rest):
             others, held_batch, held_step = rest
             return self._objective_loss({**others, "params": params}, held_batch, held_step)
 
-        def forward(params, rest):
-            return estimated(params, rest), (params, rest)
+        @estimated.defjvp
+        def _(primals, tangents):
+            params, rest = primals
+            stats, aux = estimated(params, rest)
+            # The variables held, the batch and the step move nothing, as their cotangents are none.
+            moved = linear_map(functools.partial(self._estimate_transposed, stats), self._estimate_of,
+                               (params, rest), tangents[0])
+            return (stats, aux), (moved, jax.tree.map(_still, aux))
 
-        def backward(saved, cotangent):
-            params, rest = saved
-            others, held_batch, held_step = rest
-            stats, _ = cotangent
-            # The estimate runs the model again through the objective's loss over the held step, which
-            # passes the model the step's progress as the loss did (`Objective.progress`).
-            estimated = self.estimate(params, others, held_batch, held_step, stats)
-            # None: the variables held, the batch and the step take no cotangent.
-            return estimated, None
-
-        estimated.defvjp(forward, backward)
         return estimated(variables["params"], (held, batch, step))
+
+    def _estimate_of(self, residuals, cotangent) -> Variables:
+        """The estimate (`estimate`) at `residuals`, the parameters and what the loss held, of the
+        statistics' inner product with `cotangent`: its reverse rule. It runs the model again through the
+        objective's loss over the held step, which passes the model the step's progress as the loss did
+        (`Objective.progress`)."""
+        params, (others, batch, step) = residuals
+        return self.estimate(params, others, batch, step, cotangent)
+
+    def _estimate_transposed(self, stats, residuals, direction):
+        """The statistics' change along the parameters' `direction` that the estimate states, its
+        transpose at the same draws (`_estimate_of`, linear in its cotangent): the forward rule. A
+        statistic of no tangent space (a count) is still."""
+        leaves, structure = jax.tree.flatten(stats)
+        moving = [index for index, leaf in enumerate(leaves) if jnp.issubdtype(leaf.dtype, jnp.inexact)]
+
+        def pulled(*floating):
+            whole = [jnp.zeros_like(leaf) for leaf in leaves]
+            for index, value in zip(moving, floating, strict=True):
+                whole[index] = value
+            return self._estimate_of(residuals, jax.tree.unflatten(structure, whole))
+
+        changed = jax.linear_transpose(pulled, *(leaves[index] for index in moving))(direction)
+        tangents = [_still(leaf) for leaf in leaves]
+        for index, value in zip(moving, changed, strict=True):
+            tangents[index] = value
+        return jax.tree.unflatten(structure, tangents)
 
     def _objective_loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[LossT, Aux[EffectsT]]:
         """The objective's own statistics and `Aux` for `batch`, the `Aux` empty where it returns none

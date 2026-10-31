@@ -620,9 +620,6 @@ class Transaction:
                             slots=self.size, attempt=attempt, part=part, slot=slot, microstep=microstep,
                             record=self.record, watched=self.watched)
 
-    def examples(self, state, slot, batch, part=None, rejected=0, microstep=None) -> dict:
-        return example_fields(state, slot, self.split, batch, self.size, part, rejected, microstep)
-
     def _places(self, slot, evaluated: Evaluated, part) -> jax.Array:
         """The places the window's slot `slot` and the column its loss saw give an evaluation's rows
         (`example_places`), which its own are held to (`recorded`)."""
