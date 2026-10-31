@@ -107,11 +107,17 @@ def triton_evidence(calls: dict[str, int], thunks: list[str]) -> dict:
     return {"shared": max(size for name in calls for size in launches[name])}
 
 
-def _compiled(case, generation: str, record: dict) -> tuple[list[str], dict[str, int]] | None:
+def _compiled(case, generation: str, record: dict,
+              reporting: contextlib.AbstractContextManager | None = None
+              ) -> tuple[list[str], dict[str, int]] | None:
     """`case` lowered as on the CUDA `generation` (`assumed`, `gpu_mesh`) and compiled by XLA for a
-    compile-only device of it: XLA's thunk sequences and the lowered program's Triton calls by name
-    (`triton_kernels`), or None, `record` holding why: the error, or the shared bytes of a block XLA
-    refused."""
+    compile-only device of it, within `reporting` (Mosaic's reports, `reported`) for its compile alone,
+    where given: XLA's thunk sequences and the lowered program's Triton calls by name (`triton_kernels`),
+    or None, `record` holding why: the error, or the shared bytes of a block XLA refused.
+    `record['modules']` holds each Mosaic kernel's module by its name (its kernel hash), as its reports
+    name it. Reports on while it lowered, Mosaic's layout inference printed its whole constraint system,
+    each of its variables printing its operation: 47.6 of a Kimi Linear A100 forward cell's 138 seconds
+    (cProfile, armada, 9e65ee222)."""
     mesh = _device(generation)
     replicated = NamedSharding(mesh, PartitionSpec())
     fn, args = case.call()
@@ -123,14 +129,16 @@ def _compiled(case, generation: str, record: dict) -> tuple[list[str], dict[str,
     except Exception as error:  # A case that does not lower is its own failure.
         record["error"] = f"it does not lower: {str(error)[-800:]}"
         return None
+    calls = [call for call in kernel_calls(lowered) if call.kind == "mosaic_gpu"]
+    record["modules"] = {call.name: call.config for call in calls}
     if "models" in record:
         record["lowered"] = {
             call.name: [dataclasses.asdict(launch)
                         for launch in lowered_registers(call.ir, _compiler())]
-            for call in kernel_calls(lowered) if call.kind == "mosaic_gpu"}
+            for call in calls}
     # A process whose persistent compilation cache is on keeps it on here (JAX settles that once a
     # process): a compile-only device's entry reads back as unloadable, with a warning, and compiles.
-    with tempfile.TemporaryDirectory(prefix="dew-compile-") as dump:
+    with reporting or contextlib.nullcontext(), tempfile.TemporaryDirectory(prefix="dew-compile-") as dump:
         try:
             lowered.compile(compiler_options={"xla_dump_to": dump})
         except jax.errors.JaxRuntimeError as error:
@@ -418,14 +426,17 @@ def _compiled_here(cases, generation: str) -> list[dict]:
         record: dict = {"name": case.name, "generation": generation,
                         "limit": gpu_target(generation).shared_limit,
                         "models": {name: model.record() for name, model in models.items()}}
-        with (tempfile.TemporaryDirectory(prefix="dew-mosaic-") as directory,
-              reported(directory)):
-            _compiled(case, generation, record)
-            lowered_models = _lowered_models(record, mosaic_kernels(directory), generation, models)
+        with tempfile.TemporaryDirectory(prefix="dew-mosaic-") as directory:
+            _compiled(case, generation, record, reported(directory))
+            # Each report's module its kernel's, as the lowered program names it.
+            modules = record.get("modules", {})
+            kernels = [{**kernel, "module": kernel["module"] or modules.get(kernel["kernel"])}
+                       for kernel in mosaic_kernels(directory)]
+            lowered_models = _lowered_models(record, kernels, generation, models)
             needs = _needs(directory, generation, {**models, **lowered_models})
             compiled = _compiled_reports(directory, generation)
             record["kernels"] = [needed(inherited({**kernel, **compiled.get(kernel["kernel"], {})}), needs)
-                                 for kernel in mosaic_kernels(directory)]
+                                 for kernel in kernels]
         record["tmem_limit"] = gpu_target(generation).tmem_columns or 0
         record["evidence"] = _register_evidence(record)
         found.append(record)
