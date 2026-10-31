@@ -577,17 +577,23 @@ def _layer_kinds(source: ModelSource, fields: Mapping[str, object]) -> tuple[lis
     HY-3's `mlp_layer_types`) and each of its modules' (`_module_kind`) across every module list as long
     as the depth; and every module's outside those lists (its table, its rotary, its final norm). None
     where no module list is as long as the depth, or where the model is not built by transformers' own
-    code of transformers' and torch's own classes (a remote source, a config class registered from
-    elsewhere), whose layers differ only as their kinds show: a source's own code may add what no kind
-    shows (a hook on its later layers, a rotary built by its depth)."""
+    code of transformers' and torch's own classes (a remote source; a config class, or a causal LM class
+    the auto registry resolves it to, registered from elsewhere), whose layers differ only as their kinds
+    show: a source's own code may add what no kind shows (a hook on its later layers, a rotary built by
+    its depth)."""
     import torch
 
     config, model = _skeleton(source, fields)
     depth = _records.integer(config.num_hidden_layers, 'num_hidden_layers')
-    # The code that built the model, a remote class's constructor or a config class registered from
-    # elsewhere, is the source's own even where what it returns is transformers' classes.
+    # The code that built the model, a remote class's constructor or a class registered from elsewhere, is
+    # the source's own even where what it returns is transformers' classes.
+    from transformers import MODEL_FOR_CAUSAL_LM_MAPPING
+
+    if source.remote is not None:
+        return None
+    builders = (type(config), MODEL_FOR_CAUSAL_LM_MAPPING[type(config)])
     own = ('transformers.', 'torch.')
-    if source.remote is not None or not type(config).__module__.startswith('transformers.') or any(
+    if any(not built.__module__.startswith('transformers.') for built in builders) or any(
             not type(module).__module__.startswith(own) for module in model.modules()):
         return None
     stacks = [module for module in model.modules() if isinstance(module, torch.nn.ModuleList)
