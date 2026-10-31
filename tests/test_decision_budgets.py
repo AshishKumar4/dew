@@ -16,7 +16,7 @@ import pytest
 from real_tokenizers import TOKENIZERS, backbone_reading, real_tokenizer
 
 from dew.data.dataset import Loading
-from dew.data.pipeline import Refused
+from dew.data.pipeline import Refused, Rejected
 from dew.data.sources import Memory
 from dew.data.text import ByteTokenizer, HFTokenizer
 from dew.decision import Choice, Decide, Example, Noul
@@ -144,6 +144,27 @@ def test_fit_counts_each_cut_by_kind_and_none_where_the_question_is_whole():
     read = dataclasses.replace(example, context="a document the backbone reads no part of")
     unread = Fit(fresh, BYTES, BYTE_SPECIALS, DecisionHead(64)).map({"example": read})
     assert unread["_dew_cut"] == {"context": (1, len("a document the backbone reads no part of"))}
+
+
+def test_a_refused_row_keeps_the_cut_that_refused_it_and_its_corpus_counts_it():
+    """A row a declared budget cuts until its options read alike is refused (`options_alike`), and the
+    refusal keeps that cut (`Rejected.cut`), which its corpus counts beside the rows it delivered: the
+    run's data report says how much of its question the budget removed from the rows it refused too."""
+    from dew.data.mixing import CorpusCounts
+
+    questions = {"q": Choice("Choose the banking intent", {
+        f"intent_{index}": f"the full meaning of banking intent {index}" for index in range(77)})}
+    example = Example("the state", questions, {"q": "intent_0"})
+    declared = StateFirstLayout(max_len=6144, labels=BYTE_LABELS, head_max_len=4096, option_tokens=1)
+    [row] = declared.rows(BYTES, BYTE_SPECIALS, example.state, questions)
+    refused = Fit(declared, BYTES, BYTE_SPECIALS, DecisionHead(64)).map({"example": example})
+    assert isinstance(refused, Rejected) and refused.reason == "options_alike"
+    assert refused.cut["options"] == (1, row.options_cut) and row.options_cut > 0
+    counts = CorpusCounts("corpus", "corpus")
+    counts.refused_one(refused)
+    assert counts.rejected == {"options_alike": 1}
+    assert (counts.cut_examples["options"], counts.cut_rows["options"], counts.cut_removed["options"]) == (
+        1, 1, row.options_cut)
 
 
 def test_a_context_no_cross_attention_reads_counts_as_a_cut_of_it():
