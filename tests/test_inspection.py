@@ -818,7 +818,7 @@ def test_an_rcm_critic_updates_watched_cotangents_are_its_fake_scores(windows, t
         assert float(summary["rms"]) == 0 and float(summary["zero_fraction"]) == 1
 
 
-def test_a_distribution_matching_student_updates_watched_cotangent_reaches_its_trained_call(windows, tmp_path):
+def test_a_distribution_matching_student_updates_cotangent_reaches_its_trained_call(windows, tmp_path):
     """An rCM student update by distribution matching alone, whose simulation's every call but the last
     runs under no gradient, summarizes the loss's cotangent at the student's watched modules from the call
     that trains it, the simulation's last (row 2324 review): each student probe counts that call's
