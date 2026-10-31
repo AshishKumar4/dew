@@ -39,8 +39,7 @@ from delta_rule_support import fused_step
 from gpu_flow import Cell, run_cells, when
 from jax.sharding import NamedSharding, PartitionSpec
 from model_support import decode_through
-from one_draw import assert_as_exact_as_the_reference
-from reference_error import FEWEST_SEEDS, assert_as_exact, widened, with_gradients
+from reference_error import FEWEST_SEEDS, as_given, assert_as_exact, with_gradients
 from test_linear_attention import decode_operands, fused_case, fused_inputs
 
 from dew.batch import coordinates
@@ -202,22 +201,30 @@ def the_fused_decode_step_gives_the_same_bits_however_its_launches_are_timed():
 def a_layer_choosing_the_fused_step_decodes_on_a_mesh_as_on_one_device(axis: str):
     """A gated delta net choosing the fused step (`generation.chosen`) over two GPUs, its rows (`axis`
     'data') or its heads ('tensor') split two ways (`_fused_token`: each shard's channels its heads'
-    queries, keys and values): 9 decode tokens after a 3-token prefill within tests/reference_error.py's
-    rule of the same layer on one device, from the float64 parallel forward."""
+    queries, keys and values): 9 decode tokens after a 3-token prefill on par (check 1) with the same
+    layer's on one device, from the float64 parallel forward, over drawn hidden states and weights."""
     module = GatedDeltaNet(emb_features=64, num_k_heads=2, num_v_heads=4, head_k_dim=32, head_v_dim=32,
                            dtype=jnp.float32)
-    hidden = jax.random.normal(jax.random.key(13), (2, 12, 64), jnp.float32)
-    variables = module.init(jax.random.key(14), hidden[:, :1])
-    with jax.enable_x64(new_val=True):
-        truth = np.asarray(module.clone(dtype=jnp.float64).apply(widened(variables), widened(hidden)))
-    with generation.chosen(delta_decode="fused"):
-        alone = np.asarray(decode_through(module, variables, hidden, prefill=3)[0])
-        # The data axis takes the devices the others leave.
-        mesh = MeshSpec(**({} if axis == "data" else {axis: 2})).build(jax.devices()[:2])
+    # The data axis takes the devices the others leave.
+    mesh = MeshSpec(**({} if axis == "data" else {axis: 2})).build(jax.devices()[:2])
+
+    def draw(seed):
+        hidden = jax.random.normal(jax.random.key(13 + 2 * seed), (2, 12, 64), jnp.float32)
+        return module.init(jax.random.key(14 + 2 * seed), hidden[:, :1]), hidden
+
+    def decoded(variables, hidden):
+        return decode_through(module, variables, hidden, prefill=3)[0]
+
+    split_run = jax.jit(named(decoded, delta_decode="fused"))
+
+    @as_given
+    def split(variables, hidden):
         with jax.set_mesh(mesh):
-            placed = jax.device_put(hidden, NamedSharding(mesh, PartitionSpec()))
-            split = np.asarray(decode_through(module, variables, placed, prefill=3)[0])
-    assert_as_exact_as_the_reference(split, alone, truth, f"{axis} decode")
+            return split_run(variables, jax.device_put(hidden, NamedSharding(mesh, PartitionSpec())))
+
+    assert_as_exact(split, named(decoded, delta_decode="fused"), draw,
+                    f"a layer choosing the fused step, decoding split over {axis}", seeds=FEWEST_SEEDS,
+                    truth_fn=module.clone(dtype=jnp.float64).apply)
 
 
 def test_the_recurrences_run_on_this_gpu():
