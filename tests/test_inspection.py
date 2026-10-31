@@ -13,6 +13,7 @@ import numpy as np
 import optax
 import pytest
 import test_run_budgets
+from reference_error import assert_computes_the_oracle
 from run_kinds import KINDS, lm, scalars
 
 from dew.cli.main import main
@@ -632,3 +633,44 @@ def test_a_pipelined_stacks_watched_layers_each_report_every_microbatch():
     assert set(summaries) == {f"inspect/activations/layers_{layer}/mlp/{microbatch}"
                               for layer in range(4) for microbatch in range(2)}
     assert all(np.isfinite(value) and value > 0 for value in summaries.values())
+
+
+def test_a_watched_layers_cotangent_is_summarized_as_the_losses_cotangent_there():
+    """With cotangents watched, a sampled step summarizes the loss's cotangent at each watched block's
+    output (row 2324): the root mean square, mean and shares it logs are those of the cotangent Linen's
+    own perturbation of the block's output receives under the same loss, from a probe's few numbers
+    rather than a tensor of the output's size; its gradients and activations are the unwatched step's to
+    the bit."""
+
+    class Perturbed(nn.Module):
+        """`Stacked(scanned=False)`'s layers under its names, the second block's output perturbed."""
+
+        @nn.compact
+        def __call__(self, x):
+            x = x.astype(jnp.float32)
+            for index in range(3):
+                x, _ = Block()(x)
+                if index == 1:
+                    x = self.perturb("block_1", x)
+            return nn.Dense(1, name="head")(x)
+
+    def logged(*, cotangents: bool) -> dict[str, float]:
+        run = watched_run(Stacked(scanned=False), Inspection(modules=("Block_1",), targets=("grads",),
+                                                             cotangents=cotangents))
+        return inspected(run, {"x": ROWS})
+
+    watched, unwatched = logged(cotangents=True), logged(cotangents=False)
+    state, _, _ = watched_run(Stacked(scanned=False), None).place()
+    params = jax.device_get(state.variables)["params"]
+    perturbations = Perturbed().init(jax.random.key(0), jnp.asarray(ROWS))["perturbations"]
+
+    def loss(perturbations):
+        outputs = Perturbed().apply({"params": params, "perturbations": perturbations}, jnp.asarray(ROWS))
+        return jnp.mean(jnp.square(outputs[:, 0]))
+
+    expected = statistics(jax.grad(loss)(perturbations)["block_1"])
+    for statistic in ("rms", "mean", "non_finite", "zero_fraction"):
+        # Each statistic sums the cotangent's entries, each entry its rows' squared outputs' derivatives.
+        assert_computes_the_oracle(watched[f"inspect/cotangents/Block_1/{statistic}"], expected[statistic],
+                                   f"the watched block's cotangent {statistic}", roundings=ROWS.size)
+    assert {name: value for name, value in watched.items() if "/cotangents/" not in name} == unwatched
