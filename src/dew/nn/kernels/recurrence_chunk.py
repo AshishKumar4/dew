@@ -659,9 +659,10 @@ stores the memories by where they pass, as many as the tokens' chunks, a row's a
 
 PORT_CELLS: dict[tuple[str | None, str], tuple[str, str]] = {
     ('wgmma', 'forward, a decay a key dimension'): (
-        'fla', "on an H100 PCIe, 16-bit, the port's forward 2.03 ms against the template's 3.24 on Kimi "
-               "Linear's delta attention, the template's intra launch 1.95 ms against the port's intra rows "
-               "and solve's 1.03 (JS-kdacells-h100-a928ea2b4)"),
+        'fla', "on an H100 80GB HBM3, 16-bit, the port's forward 1.406 ms against the template's 1.624 on "
+               "Kimi Linear's delta attention, the template's intra pairs 0.65 ms against the port's intra "
+               "rows' 0.65 and its keys' weighted launch 0.25 against the port's 0.17 "
+               "(window-h100-c70aaa8-b8109ee)"),
 }
 """The cells, each an instruction family and a product (`PortCase.cell`), where a receipt shows the fla
 port faster than the recurrence template, each its old route's kernel and that receipt: the delta rule's
@@ -1346,9 +1347,9 @@ SCAN_CELLS: dict[tuple[str | None, str], tuple[str, str]] = {
                   "template's 0.575 against 0.606, each the same `chunk(SSD, ...)` call under the fast forms "
                   "(ssd-rounded-h100-fdab2424c)"),
     ('wgmma', 'training'): (
-        'pallas', "on an H100 80GB HBM3, the port's forward and gradient 1.593 ms against the template's "
-                  "1.840 on Nemotron-H 4B's SSD and 0.663 against 1.018 on 30B's, its query/key launch "
-                  "0.499 and 0.277 of them (ssd-train-h100-fdab2424c)"),
+        'pallas', "on an H100 80GB HBM3, the port's forward and gradient 1.592 ms against the template's "
+                  "1.877 on Nemotron-H 4B's SSD and 0.660 against 0.820 on 30B's, its query/key launch "
+                  "0.385 and 0.160 of them (window-h100-c70aaa8-b8109ee)"),
     ('mma.sync', 'training'): (
         'pallas', "on an A100 SXM4 40GB, the port's forward and gradient 3.954 ms against the template's "
                   "4.217 on Nemotron-H 4B's SSD and 1.584 against 2.200 on 30B's (ssd-train-a100-fdab2424c)"),
