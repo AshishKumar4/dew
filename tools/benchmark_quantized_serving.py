@@ -112,7 +112,7 @@ def forward(pipe: TextToImage) -> dict:
         return pipe.process.denoiser(pipe.model, variables, prepared.conditions,
                                      prepared.unconditional).raw_both(x, t)
 
-    compiled = program(step, pipe.model).executable(variables, x, t)
+    compiled = jax.jit(step).lower(variables, x, t).compile()
     memory = compiled.memory_analysis()
     times = samples(compiled, variables, x, t, warmup=1, repeats=5)
     return {"weights_mib": round(nbytes(variables["params"]) / 2**20, 1),
