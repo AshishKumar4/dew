@@ -196,7 +196,7 @@ def test_transformers_reads_a_trained_image_reading_runs_export(tmp_path):
 
     run = tmp_path / "run"
     run.mkdir()
-    make_block_run(run, moved=0.02, tokenizer=str(FIXTURE), pad_token_id=5)
+    make_block_run(run, scale=0.02, tokenizer=str(FIXTURE), pad_token_id=5)
     exported = Pretrained.from_run(str(run), ema=False)
     exported.save(tmp_path / "export")
     assert (tmp_path / "export" / "tokenizer.json").read_bytes() == (FIXTURE / "tokenizer.json").read_bytes()

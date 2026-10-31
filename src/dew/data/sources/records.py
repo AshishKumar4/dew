@@ -15,7 +15,7 @@ import grain.python as grain
 
 from dew.batch import Batch
 from dew.data.dataset import Loading, Ranges
-from dew.data.storage import Store, local, on_gcs
+from dew.data.storage import Declared, Store, local, on_gcs
 
 from .codec import decode
 
@@ -190,10 +190,13 @@ class ArrayRecords:
         *,
         record_codec: bool = False,
         counts: Sequence[int] | None = None,
+        declared: Sequence[Declared | None] | None = None,
     ):
         self.urls = tuple(urls)
         self.storage_options = storage_options
         self.record_codec = record_codec
+        # Each shard as its producer declared it (`Declared`), read from a checked file on this host.
+        self.declared = (None,) * len(self.urls) if declared is None else tuple(declared)
         self.counts = None if counts is None else tuple(counts)
         if self.counts is not None and (
             len(self.counts) != len(self.urls) or any(count < 0 for count in self.counts)
@@ -205,7 +208,8 @@ class ArrayRecords:
     def _shard(self, shard: int) -> ArrayRecords:
         """Physical shard `shard`'s own reader, checked against its producer's row count."""
         assert self.counts is not None
-        opened = ArrayRecords((self.urls[shard],), self.storage_options, record_codec=self.record_codec)
+        opened = ArrayRecords((self.urls[shard],), self.storage_options, record_codec=self.record_codec,
+                              declared=(self.declared[shard],))
         if len(opened) != self.counts[shard]:
             opened.close()
             raise ValueError(f"ArrayRecord {self.urls[shard]} differs from its producer's row count")
@@ -218,7 +222,14 @@ class ArrayRecords:
     @cached_property
     def reader(self):
         paths = []
-        for url in self.urls:
+        for url, declared in zip(self.urls, self.declared, strict=True):
+            if declared is not None:
+                # ArrayRecord's reader opens paths alone, so a declared shard is read from a checked file
+                # on this host: its own, or its copy in Dew's mirror, a GCS one's too, held while it reads.
+                path, held = declared.leased()
+                self._pins.append(held)
+                paths.append(path)
+                continue
             fs, path = Store(url, self.storage_options).resolve()
             if local(fs):
                 paths.append(path)
@@ -262,6 +273,7 @@ class ArrayRecords:
             "storage_options": self.storage_options,
             "record_codec": self.record_codec,
             "counts": self.counts,
+            "declared": self.declared,
         }
 
     def __setstate__(self, state: Mapping[str, object]) -> None:

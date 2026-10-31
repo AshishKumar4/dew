@@ -928,16 +928,18 @@ def test_explicit_average_requests_do_not_substitute_live_weights(tmp_path):
                                   live("the ", key=7).host().tokens)
 
 
-def make_block_run(directory, fixture="diffusion-gemma-workflow", moved=0.0, tokenizer="byte",
+def make_block_run(directory, fixture="diffusion-gemma-workflow", scale=0.0, tokenizer="byte",
                    pad_token_id=0):
     """A block-diffusion run directory: a committed DiffusionGemma fixture's
     weights under a checkpoint that records the objective, its `pad_token_id`
-    and the tokenizer `tokenizer` names, each parameter moved by `moved` times
-    a seeded normal draw (a stand-in for training); returns the objective and
+    and the tokenizer `tokenizer` names, each parameter moved by `scale` times
+    a seeded normal draw (a stand-in for training, `model_support.moved`); returns the objective and
     the saved state. The default fixture reads images and is the published
     layout's own; `diffusion-gemma-sft` is Google's dense text-only model,
     which transformers' class cannot build, so its export is refused."""
     from pathlib import Path
+
+    from model_support import moved
 
     from dew.data.text import tokenizer_for
     from dew.interop import Pretrained
@@ -949,11 +951,8 @@ def make_block_run(directory, fixture="diffusion-gemma-workflow", moved=0.0, tok
                                         pad_token_id=pad_token_id,
                                         processor=RunProcessor(tokenizer_for(tokenizer)))
     state = Trainer(objective, optax.sgd(0.01), key=jax.random.PRNGKey(2)).initial_state()
-    if moved:
-        leaves, tree = jax.tree.flatten(state.variables["params"])
-        keys = jax.random.split(jax.random.key(5), len(leaves))
-        params = jax.tree.unflatten(tree, [leaf + moved * jax.random.normal(key, leaf.shape, leaf.dtype)
-                                           for leaf, key in zip(leaves, keys, strict=True)])
+    if scale:
+        params = moved(state.variables["params"], jax.random.key(5), scale)
         state = state.replace(variables={**state.variables, "params": params})
     checkpoints = Checkpoints(str(directory))
     checkpoints.save(0, state, None, artifact=objective.inference_record())

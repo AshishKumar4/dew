@@ -35,13 +35,13 @@ def gpu_driver(root: Path, monkeypatch) -> None:
     monkeypatch.setenv("PATH", f"{tools}:{os.environ['PATH']}")
 
 
-def armada_task(ci, monkeypatch, out: Path, policy: str = "on") -> list[dict]:
-    """The 3.12 tasks the plan makes under DEW_TEST_CACHE=`policy`, each run as armada starts it:
-    .armada.json's command filled from its plan entry, in .armada.json's environment, which the plan's
-    DEW_TEST_CACHE is not part of. Their rows, in the plan's order."""
+def armada_task(ci, monkeypatch, out: Path, policy: str = "on", target: float = 300.0) -> list[dict]:
+    """The 3.12 tasks the plan makes under DEW_TEST_CACHE=`policy` for tasks of `target` seconds, each run as
+    armada starts it: .armada.json's command filled from its plan entry, in .armada.json's environment, which
+    the plan's DEW_TEST_CACHE is not part of. Their rows, in the plan's order."""
     command = json.loads((ROOT / ".armada.json").read_text())["task"]["command"]
     monkeypatch.setenv("DEW_TEST_CACHE", policy)
-    entries = [entry for entry in ci.plan(300.0, {}) if entry["python"] == "3.12"]
+    entries = [entry for entry in ci.plan(target, {}) if entry["python"] == "3.12"]
     monkeypatch.delenv("DEW_TEST_CACHE")
     rows = []
     for entry in entries:
@@ -1773,6 +1773,37 @@ def test_a_run_plans_only_the_files_whose_inputs_changed_and_its_verdict_names_e
     assert [len((tmp_path / f"runs-{name}").read_text()) for name in ("a", "b", "c")] == [1, 1, 2]
 
 
+SCRIPT = str(ROOT / "tools/armada/ci.py")
+
+
+def ran_by_script(ci, root: Path, cache_worker, names: tuple[str, ...], module: str) -> dict[str, str]:
+    """Test files `names` that import src/shapes.py (`module` its text), each weighing about a task, run
+    green by tools/armada/ci.py as a script, as one 3.12 task against the shared test cache, in a checkout
+    whose .armada.json pins its tasks to this host's class: the environment a plan of theirs runs in, which
+    names the cache and its tokens."""
+    interpreter(root, "3.12")
+    held = ci.cpu_class().split("-")
+    config = json.loads((ROOT / ".armada.json").read_text())
+    config["task"]["cpu"] = {"vendor": held[0], "family": int(held[1]), "model": int(held[2])}
+    (root / ".armada.json").write_text(json.dumps(config))
+    (root / "src").mkdir()
+    (root / "src/shapes.py").write_text(module)
+    written(root, {f"test_{name}.py": "import sys\nsys.path.insert(0, 'src')\nfrom shapes import area\n"
+                                      f"def test_{name}():\n    assert area(2) == 2\n" for name in names})
+    (root / "tests/test_durations.json").write_text(json.dumps(
+        {f"tests/test_{name}.py::test_{name}": 250.0 for name in names}))
+    (root / ".verdict").mkdir()
+    url, _, _ = cache_worker
+    env = {**os.environ, "DEW_XLA_CACHE_URL": url, "DEW_XLA_CACHE_TOKEN": "token",
+           "DEW_XLA_CACHE_READ_TOKEN": "token"}
+    verdict = root / ".verdict/verdict.json"
+    tests = "--tests=" + " ".join(f"tests/test_{name}.py" for name in names)
+    subprocess.run([sys.executable, SCRIPT, "task", "--python=3.12", tests, f"--out={verdict}", "--cache=on"],
+                   cwd=root, env=env, check=True)
+    assert [row["exitCode"] for row in json.loads(verdict.read_text())["rows"]] == [0] * len(names)
+    return env
+
+
 def test_a_plan_run_by_another_python_than_its_tasks_keeps_the_files_they_ran_green(
         ci, tmp_path, cache_worker):
     """The plan and a task each run tools/armada/ci.py as a script under whatever Python runs it where it runs
@@ -1780,25 +1811,10 @@ def test_a_plan_run_by_another_python_than_its_tasks_keeps_the_files_they_ran_gr
     green under one Python, a plan run by another keeps, in one task (2026-10-30: plans under 3.14 and 3.12
     found none of the 3.13 tasks' records fresh, as each Python compiles a module's units to its own digests,
     and every file took a task of its own)."""
-    interpreter(tmp_path, "3.12")
-    held = ci.cpu_class().split("-")
-    config = json.loads((ROOT / ".armada.json").read_text())
-    config["task"]["cpu"] = {"vendor": held[0], "family": int(held[1]), "model": int(held[2])}
-    (tmp_path / ".armada.json").write_text(json.dumps(config))
     # A module whose units each Python compiles to its own digests: a documented, annotated function.
-    (tmp_path / "src").mkdir()
-    (tmp_path / "src/shapes.py").write_text(
-        'def area(width: int, height: int = 1) -> int:\n    """An area."""\n    return width * height\n')
-    written(tmp_path, {f"test_{name}.py": "import sys\nsys.path.insert(0, 'src')\nfrom shapes import area\n"
-                                          f"def test_{name}():\n    assert area(2) == 2\n"
-                       for name in ("a", "b")})
-    (tmp_path / "tests/test_durations.json").write_text(json.dumps(
-        {f"tests/test_{name}.py::test_{name}": 250.0 for name in ("a", "b")}))
-    (tmp_path / ".verdict").mkdir()
-    url, _, _ = cache_worker
-    env = {**os.environ, "DEW_XLA_CACHE_URL": url, "DEW_XLA_CACHE_TOKEN": "token",
-           "DEW_XLA_CACHE_READ_TOKEN": "token"}
-    script = str(ROOT / "tools/armada/ci.py")
+    env = ran_by_script(ci, tmp_path, cache_worker, ("a", "b"),
+                        'def area(width: int, height: int = 1) -> int:\n    """An area."""\n'
+                        '    return width * height\n')
 
     def version(python: str) -> str:
         return subprocess.run([python, "-c", "import sys; print(sys.version_info[:2])"], capture_output=True,
@@ -1809,17 +1825,35 @@ def test_a_plan_run_by_another_python_than_its_tasks_keeps_the_files_they_ran_gr
     other = next(python for python in (*(str(ROOT / f".venv-{each}/bin/python") for each in ci.PYTHONS),
                                        shutil.which("python3") or "")
                  if Path(python).is_file() and version(python) != version(sys.executable))
-    verdict = tmp_path / ".verdict/verdict.json"
-    tests = "--tests=tests/test_a.py tests/test_b.py"
-    subprocess.run([sys.executable, script, "task", "--python=3.12", tests, f"--out={verdict}", "--cache=on"],
-                   cwd=tmp_path, env=env, check=True)
-    assert [row["exitCode"] for row in json.loads(verdict.read_text())["rows"]] == [0, 0]
     timings = tmp_path / "timings.json"
-    planned = subprocess.run([other, script, "plan", "--target=300", f"--timings={timings}"], cwd=tmp_path,
+    planned = subprocess.run([other, SCRIPT, "plan", "--target=300", f"--timings={timings}"], cwd=tmp_path,
                              env=env, capture_output=True, text=True, check=True).stdout
     entries = [entry for entry in json.loads(planned)["include"] if entry["python"] == "3.12"]
     assert [sorted(ci.kept_of(entry["tests"].split())[1]) for entry in entries] == [
         [("tests/test_a.py", ""), ("tests/test_b.py", "")]]
+
+
+def test_a_plan_reads_each_input_once_however_many_rows_ran_it(ci, tmp_path, cache_worker):
+    """The plan keys every row it looks up from one reading of the checkout: a module three files' runs
+    executed is read once, as the plan runs in CI, under the Python its keys are hashed by (2026-10-31:
+    train 368's plan read each of a row's ~3,000 inputs again for each of 1,682 rows, 9.5 minutes before its
+    first task)."""
+    names = ("a", "b", "c")
+    env = ran_by_script(ci, tmp_path, cache_worker, names,
+                        "def area(width, height=1):\n    return width * height\n")
+    # The plan as CI's runs it, under the Python its keys are hashed by, each file it opens counted.
+    opened = tmp_path / ".verdict/opened.json"
+    counted = ("import json, runpy, sys\nopened = []\n"
+               "sys.addaudithook(lambda event, args: event == 'open' and opened.append(str(args[0])))\n"
+               f"sys.argv = [{SCRIPT!r}, 'plan', '--target=300', '--timings={tmp_path / 'timings.json'}']\n"
+               f"try:\n    runpy.run_path({SCRIPT!r}, run_name='__main__')\n"
+               f"finally:\n    open({str(opened)!r}, 'w').write(json.dumps(opened))\n")
+    planned = subprocess.run(["uv", "run", "--no-project", "--python", ci.HASHED_BY, "python", "-c", counted],
+                             cwd=tmp_path, env=env, capture_output=True, text=True)
+    entries = [entry for entry in json.loads(planned.stdout)["include"] if entry["python"] == "3.12"]
+    assert [sorted(ci.kept_of(entry["tests"].split())[1]) for entry in entries] == [
+        [(f"tests/test_{name}.py", "") for name in names]]
+    assert json.loads(opened.read_text()).count("src/shapes.py") == 1
 
 
 def test_a_plan_without_build_output_or_fetched_payloads_finds_what_a_task_recorded_with_them(
@@ -1941,6 +1975,49 @@ def test_a_plan_keeps_each_green_group_of_a_heavy_file_and_a_task_runs_a_group_w
     ran = json.loads(verdict.read_text())["rows"]
     assert [(row["name"], row["exitCode"]) for row in ran] == [(heavy[1], 0)]
     assert [len((tmp_path / f"runs-{name}").read_text()) for name in "cd"] == [1, 2]
+
+
+def test_a_plan_spreads_its_kept_rows_over_tasks_of_the_targets_lookups(ci, tmp_path, monkeypatch,
+                                                                        cache_worker):
+    """The plan's kept rows fill tasks of at most the target's lookups, a lookup a row in seconds, each of
+    which reuses its rows, so no kept task outlasts the rest of the run and none carries more tokens than a
+    process starts with (2026-10-31: main de315f9a05's kept rows were one task, whose 149,515-byte --tests
+    argument started no task, and its run was not graded)."""
+    verdict, _ = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
+    assert all(row["exitCode"] == 0 for row in armada_task(ci, monkeypatch, verdict))
+    names = ["3.12:tests/test_a.py", "3.12:tests/test_b.py", "3.12:tests/test_c.py"]
+    entries = [entry for entry in ci.plan(2.0, {}) if entry["python"] == "3.12"]
+    assert [(entry["rows"], entry["weight"]) for entry in entries] == [(names[:2], 2.0), (names[2:], 1.0)]
+    rows = armada_task(ci, monkeypatch, verdict, target=2.0)
+    assert [(row["name"], row["exitCode"]) for row in rows] == [(name, 0) for name in names]
+    assert [len((tmp_path / f"runs-{name}").read_text()) for name in "abc"] == [1, 1, 1]
+
+
+def test_a_kept_tasks_entry_stays_within_what_a_process_starts_with_however_high_the_target(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """However many lookups the target allows, a kept task's entry, which armada hands its task whole as one
+    environment string (ARMADA_ITEM), and its tokens, one argument (--tests), stay within the 131,071 bytes
+    Linux starts a process with, and every kept row is reused (2026-10-31: main de315f9a05's kept rows were
+    one task, whose 149,515-byte argument started none)."""
+    verdict, _ = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
+    # Files of long names (beside a fetched fixture's manifest name, within a file system's 255 bytes), enough
+    # that their kept rows' tokens and names pass what a process starts with together.
+    names = [f"tests/test_{index:03d}{'x' * 200}.py" for index in range(300)]
+    written(tmp_path, {Path(name).name: f"def test_{index}():\n    pass\n"
+                       for index, name in enumerate(names)})
+    durations = tmp_path / "tests/test_durations.json"
+    durations.write_text(json.dumps({**json.loads(durations.read_text()),
+                                     **{f"{name}::test_{index}": 1.0 for index, name in enumerate(names)}}))
+    assert all(row["exitCode"] == 0 for row in armada_task(ci, monkeypatch, verdict, target=100_000.0))
+    entries = [entry for entry in ci.plan(100_000.0, {}) if entry["python"] == "3.12"]
+    every = sorted(f"3.12:{name}" for name in [*names, *(f"tests/test_{letter}.py" for letter in "abc")])
+    assert sorted(row for entry in entries for row in entry["rows"]) == every
+    assert all(ci.KEPT_AT in token for entry in entries for token in entry["tests"].split())
+    assert max(len(f"ARMADA_ITEM={json.dumps(entry)}".encode()) for entry in entries) <= 131_071
+    assert max(len(f"--tests={entry['tests']}".encode()) for entry in entries) <= 131_071
+    rows = armada_task(ci, monkeypatch, verdict, target=100_000.0)
+    assert sorted((row["name"], row["exitCode"]) for row in rows) == [(name, 0) for name in every]
+    assert [len((tmp_path / f"runs-{name}").read_text()) for name in "abc"] == [1, 1, 1]
 
 
 def test_a_kept_task_whose_deadline_runs_out_names_its_unread_groups_red_and_runs_none_past_it(
