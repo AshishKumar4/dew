@@ -27,6 +27,7 @@ import inspect
 import pkgutil
 import re
 import sys
+import types
 import typing
 from pathlib import Path
 
@@ -44,9 +45,33 @@ def shown(value) -> str:
     return ADDRESS.sub("", repr(value))
 
 
+@functools.cache
+def markers() -> dict[int, str]:
+    """tyro's configuration markers, by id: each one's name in `tyro.conf`."""
+    import tyro
+
+    return {id(value): name for name, value in vars(tyro.conf).items() if not name.startswith("_")}
+
+
+def metadata(item) -> str:
+    """An `Annotated` type's metadata item: a tyro marker by its name, anything else by its type's."""
+    return markers().get(id(item), type(item).__name__)
+
+
 def annotation(value) -> str:
-    """A type annotation as written: a string annotation as is, else its formatted form."""
-    return value if isinstance(value, str) else ADDRESS.sub("", inspect.formatannotation(value))
+    """A type annotation as written: a string annotation as is, a union as `A | B`, an `Annotated` type with
+    its metadata by their types (a parser's spec holds callables, whose names are no contract), else its
+    formatted form."""
+    if isinstance(value, str):
+        return value
+    if value is type(None):
+        return "None"
+    origin = typing.get_origin(value)
+    if origin is typing.Annotated:
+        return f"Annotated[{annotation(value.__origin__)}, {', '.join(map(metadata, value.__metadata__))}]"
+    if origin in (typing.Union, types.UnionType):
+        return " | ".join(annotation(member) for member in typing.get_args(value))
+    return ADDRESS.sub("", inspect.formatannotation(value))
 
 
 def signature(obj) -> str:
@@ -145,14 +170,11 @@ def config() -> list[str]:
 def declared(hint) -> tuple[object, list[str]]:
     """A field's type and what tyro is told of it: each marker of `tyro.conf` by its name, and an argument
     configuration's spelling (`name`, `aliases`, `metavar`), from the `Annotated` layers around the type."""
-    import tyro
-
-    markers = {id(value): name for name, value in vars(tyro.conf).items() if not name.startswith("_")}
     notes = []
     while typing.get_origin(hint) is typing.Annotated:
         for item in hint.__metadata__:
-            if id(item) in markers:
-                notes.append(markers[id(item)])
+            if id(item) in markers():
+                notes.append(markers()[id(item)])
             elif type(item).__name__ == "_ArgConfig":
                 notes += [f"{key}={value!r}" for key in ("name", "aliases", "metavar")
                           if (value := getattr(item, key)) is not None]
@@ -178,12 +200,9 @@ def arguments(cls) -> list[str]:
     return lines
 
 
-def configured(markers) -> str:
+def configured(configured_markers) -> str:
     """A command group's tyro configuration, each marker by its name in `tyro.conf`."""
-    import tyro
-
-    names = {id(value): name for name, value in vars(tyro.conf).items() if not name.startswith("_")}
-    return ", ".join(names.get(id(marker), shown(marker)) for marker in markers)
+    return ", ".join(markers().get(id(marker), shown(marker)) for marker in configured_markers)
 
 
 def cli() -> list[str]:

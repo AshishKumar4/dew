@@ -325,10 +325,10 @@ dew.config.DecoderRunConfig
   optim: dew.optim.OptimConfig = dew.optim.OptimConfig()
   trainer: dew.config.TrainerConfig = dew.config.TrainerConfig()
   objective: dew.config.ObjectiveConfig | None = None
-  lora: Optional[Annotated[dew.lora.LoRA, _SubcommandConfig(name='lora', default=tyro.MISSING_NONPROP, description=None, prefix_name=True, constructor_factory=None, aliases=None, is_default=False)]] = None
-  val_metrics: Optional[Annotated[tuple[dew.config.MetricConfig, ...], PrimitiveConstructorSpec(nargs=1, metavar='JSON', instance_from_str=<function record_argument.<locals>.<lambda>>, is_instance=<function record_argument.<locals>.<lambda>>, str_from_instance=<function record_argument.<locals>.<lambda>>, choices=None, _action=None)]] = None
-  val_every: Annotated[collections.abc.Mapping[str, int | str], PrimitiveConstructorSpec(nargs=1, metavar='JSON', instance_from_str=<function record_argument.<locals>.<lambda>>, is_instance=<function record_argument.<locals>.<lambda>>, str_from_instance=<function record_argument.<locals>.<lambda>>, choices=None, _action=None)] = builtins.dict()
-  val_summaries: Annotated[tuple[dew.training.evaluation.Summary, ...], PrimitiveConstructorSpec(nargs=1, metavar='JSON', instance_from_str=<function record_argument.<locals>.<lambda>>, is_instance=<function record_argument.<locals>.<lambda>>, str_from_instance=<function record_argument.<locals>.<lambda>>, choices=None, _action=None)] = ()
+  lora: Annotated[dew.lora.LoRA, _SubcommandConfig] | None = None
+  val_metrics: Annotated[tuple[dew.config.MetricConfig, ...], PrimitiveConstructorSpec] | None = None
+  val_every: Annotated[collections.abc.Mapping[str, int | str], PrimitiveConstructorSpec] = builtins.dict()
+  val_summaries: Annotated[tuple[dew.training.evaluation.Summary, ...], PrimitiveConstructorSpec] = ()
   loop_steps: int | None = None
   loop_layers: tuple[int, int] | None = None
   loop_backprop_steps: int | None = None
@@ -360,15 +360,15 @@ dew.config.RunConfig
   optim: dew.optim.OptimConfig = dew.optim.OptimConfig()
   trainer: dew.config.TrainerConfig = dew.config.TrainerConfig()
   objective: dew.config.ObjectiveConfig | None = None
-  lora: Optional[Annotated[dew.lora.LoRA, _SubcommandConfig(name='lora', default=tyro.MISSING_NONPROP, description=None, prefix_name=True, constructor_factory=None, aliases=None, is_default=False)]] = None
-  val_metrics: Optional[Annotated[tuple[dew.config.MetricConfig, ...], PrimitiveConstructorSpec(nargs=1, metavar='JSON', instance_from_str=<function record_argument.<locals>.<lambda>>, is_instance=<function record_argument.<locals>.<lambda>>, str_from_instance=<function record_argument.<locals>.<lambda>>, choices=None, _action=None)]] = None
-  val_every: Annotated[collections.abc.Mapping[str, int | str], PrimitiveConstructorSpec(nargs=1, metavar='JSON', instance_from_str=<function record_argument.<locals>.<lambda>>, is_instance=<function record_argument.<locals>.<lambda>>, str_from_instance=<function record_argument.<locals>.<lambda>>, choices=None, _action=None)] = builtins.dict()
-  val_summaries: Annotated[tuple[dew.training.evaluation.Summary, ...], PrimitiveConstructorSpec(nargs=1, metavar='JSON', instance_from_str=<function record_argument.<locals>.<lambda>>, is_instance=<function record_argument.<locals>.<lambda>>, str_from_instance=<function record_argument.<locals>.<lambda>>, choices=None, _action=None)] = ()
+  lora: Annotated[dew.lora.LoRA, _SubcommandConfig] | None = None
+  val_metrics: Annotated[tuple[dew.config.MetricConfig, ...], PrimitiveConstructorSpec] | None = None
+  val_every: Annotated[collections.abc.Mapping[str, int | str], PrimitiveConstructorSpec] = builtins.dict()
+  val_summaries: Annotated[tuple[dew.training.evaluation.Summary, ...], PrimitiveConstructorSpec] = ()
 dew.config.SourceOptions
   text_only: bool = False
   prediction_depths: int | None = None
   attention: dict[str, typing.Literal['causal', 'block_bidirectional']] | None = None
-  dex: Annotated[dew.nn.dex.DifferentialExtension | None, PrimitiveConstructorSpec(nargs=1, metavar='JSON|None', instance_from_str=<function _record_argument.<locals>.<lambda>>, is_instance=<function _record_argument.<locals>.<lambda>>, str_from_instance=<function _record_argument.<locals>.<lambda>>, choices=None, _action=None)] = None
+  dex: Annotated[dew.nn.dex.DifferentialExtension, PrimitiveConstructorSpec] | None = None
   scan_layers: bool = False
   param_dtype: str | None = None
   step: int | str | None = None
@@ -376,21 +376,21 @@ dew.config.SourceOptions
 dew.config.TrainerConfig
   name: str | None = None
   checkpoint_dir: str = './checkpoints'
-  keep: Annotated[int | dew.checkpoints.Keep, PrimitiveConstructorSpec(nargs=1, metavar='LATEST|JSON', instance_from_str=<function _keep_argument.<locals>.<lambda>>, is_instance=<function _keep_argument.<locals>.<lambda>>, str_from_instance=<function _keep_argument.<locals>.<lambda>>, choices=None, _action=None)] = 2
+  keep: Annotated[int | dew.checkpoints.Keep, PrimitiveConstructorSpec] = 2
   resume: Literal['auto', 'require', 'never'] = 'auto'
-  best: Annotated[str | dew.training.selection.Best | tuple[dew.training.selection.Best, ...] | None, PrimitiveConstructorSpec(nargs=1, metavar='METRIC|JSON', instance_from_str=<function _best_argument.<locals>.read>, is_instance=<function _best_argument.<locals>.<lambda>>, str_from_instance=<function _best_argument.<locals>.write>, choices=None, _action=None)] = None
+  best: Annotated[str | dew.training.selection.Best | tuple[dew.training.selection.Best, ...] | None, PrimitiveConstructorSpec] = None
   update_tokens: int | None = None
   key: int = 0
   steps: int | None = None
   epochs: int | None = None
   tokens: int | None = None
   examples: int | None = None
-  stop: Union[Annotated[dew.training.budget.Pause, _SubcommandConfig(name='pause', default=tyro.MISSING_NONPROP, description=None, prefix_name=True, constructor_factory=None, aliases=None, is_default=False)], Annotated[dew.training.budget.Plateau, _SubcommandConfig(name='plateau', default=tyro.MISSING_NONPROP, description=None, prefix_name=True, constructor_factory=None, aliases=None, is_default=False)], NoneType] = None
+  stop: Annotated[dew.training.budget.Pause, _SubcommandConfig] | Annotated[dew.training.budget.Plateau, _SubcommandConfig] | None = None
   restore_best: bool = False
-  cooldowns: Optional[Annotated[dew.training.cooldown.Cooldowns, _SubcommandConfig(name='cooldowns', default=tyro.MISSING_NONPROP, description=None, prefix_name=True, constructor_factory=None, aliases=None, is_default=False)]] = None
-  log_every: Annotated[int | str, PrimitiveConstructorSpec(nargs=1, metavar='STEPS|SHARE%|epoch', instance_from_str=<function _cadence_argument.<locals>.read>, is_instance=<function _cadence_argument.<locals>.<lambda>>, str_from_instance=<function _cadence_argument.<locals>.<lambda>>, choices=None, _action=None)] = 100
-  eval_every: Annotated[int | str | None, PrimitiveConstructorSpec(nargs=1, metavar='STEPS|SHARE%|epoch', instance_from_str=<function _cadence_argument.<locals>.read>, is_instance=<function _cadence_argument.<locals>.<lambda>>, str_from_instance=<function _cadence_argument.<locals>.<lambda>>, choices=None, _action=None)] = 'epoch'
-  checkpoint_every: Annotated[int | str | datetime.timedelta | None, PrimitiveConstructorSpec(nargs=1, metavar='STEPS|DURATION|SHARE%|epoch', instance_from_str=<function _cadence_argument.<locals>.read>, is_instance=<function _cadence_argument.<locals>.<lambda>>, str_from_instance=<function _cadence_argument.<locals>.<lambda>>, choices=None, _action=None)] = 'epoch'
+  cooldowns: Annotated[dew.training.cooldown.Cooldowns, _SubcommandConfig] | None = None
+  log_every: Annotated[int | str, PrimitiveConstructorSpec] = 100
+  eval_every: Annotated[int | str | None, PrimitiveConstructorSpec] = 'epoch'
+  checkpoint_every: Annotated[int | str | datetime.timedelta | None, PrimitiveConstructorSpec] = 'epoch'
   checkpoint_final: bool = True
   local_directory: str | None = None
   local_every: int | str | None = None
@@ -399,7 +399,7 @@ dew.config.TrainerConfig
   split: int | None = None
   batch_ramp: dew.data.dataset.Ramp | None = None
   dynamic_scale: bool | None = None
-  precision: Annotated[dew.nn.precision.Numerics, PrimitiveConstructorSpec(nargs=1, metavar='NAME|JSON', instance_from_str=<function _numerics_argument.<locals>.<lambda>>, is_instance=<function _numerics_argument.<locals>.<lambda>>, str_from_instance=<function _numerics_argument.<locals>.<lambda>>, choices=None, _action=None)] = dew.nn.precision.Numerics()
+  precision: Annotated[dew.nn.precision.Numerics, PrimitiveConstructorSpec] = dew.nn.precision.Numerics()
   mesh: dew.distributed.placement.MeshSpec = dew.distributed.placement.MeshSpec()
   microbatches: int | None = None
   layout: dew.distributed.placement.Layout = dew.distributed.placement.Layout()
@@ -411,10 +411,10 @@ dew.config.TrainerConfig
   xla_flags: str | None = None
   quantization: dew.quantization.Quantization | None = None
   lower_for: str | None = None
-  compile_ahead: Optional[Annotated[dew.training.ahead.AheadTarget, _SubcommandConfig(name='ahead', default=tyro.MISSING_NONPROP, description=None, prefix_name=True, constructor_factory=None, aliases=None, is_default=False)]] = None
+  compile_ahead: Annotated[dew.training.ahead.AheadTarget, _SubcommandConfig] | None = None
   ahead: str | None = None
-  inspection: Optional[Annotated[dew.training.inspection.Inspection, _SubcommandConfig(name='inspect', default=tyro.MISSING_NONPROP, description=None, prefix_name=True, constructor_factory=None, aliases=None, is_default=False)]] = None
-  links: Annotated[collections.abc.Mapping[str, dew.nn.sharding.Link], PrimitiveConstructorSpec(nargs=1, metavar='JSON', instance_from_str=<function record_argument.<locals>.<lambda>>, is_instance=<function record_argument.<locals>.<lambda>>, str_from_instance=<function record_argument.<locals>.<lambda>>, choices=None, _action=None)] = builtins.dict()
+  inspection: Annotated[dew.training.inspection.Inspection, _SubcommandConfig] | None = None
+  links: Annotated[collections.abc.Mapping[str, dew.nn.sharding.Link], PrimitiveConstructorSpec] = builtins.dict()
   tune_kernels: bool = False
 dew.config.diffusion.DiffusionRunConfig
   model: ModelConfig = dew.config.diffusion.DiffusionRunConfig.<lambda>()
@@ -425,10 +425,10 @@ dew.config.diffusion.DiffusionRunConfig
   optim: dew.optim.OptimConfig = dew.optim.OptimConfig()
   trainer: dew.config.TrainerConfig = dew.config.TrainerConfig()
   objective: ObjectiveConfig = dew.config.diffusion.DiffusionRunConfig.<lambda>()
-  lora: Optional[Annotated[dew.lora.LoRA, _SubcommandConfig(name='lora', default=tyro.MISSING_NONPROP, description=None, prefix_name=True, constructor_factory=None, aliases=None, is_default=False)]] = None
-  val_metrics: Optional[Annotated[tuple[dew.config.MetricConfig, ...], PrimitiveConstructorSpec(nargs=1, metavar='JSON', instance_from_str=<function record_argument.<locals>.<lambda>>, is_instance=<function record_argument.<locals>.<lambda>>, str_from_instance=<function record_argument.<locals>.<lambda>>, choices=None, _action=None)]] = None
-  val_every: Annotated[collections.abc.Mapping[str, int | str], PrimitiveConstructorSpec(nargs=1, metavar='JSON', instance_from_str=<function record_argument.<locals>.<lambda>>, is_instance=<function record_argument.<locals>.<lambda>>, str_from_instance=<function record_argument.<locals>.<lambda>>, choices=None, _action=None)] = builtins.dict()
-  val_summaries: Annotated[tuple[dew.training.evaluation.Summary, ...], PrimitiveConstructorSpec(nargs=1, metavar='JSON', instance_from_str=<function record_argument.<locals>.<lambda>>, is_instance=<function record_argument.<locals>.<lambda>>, str_from_instance=<function record_argument.<locals>.<lambda>>, choices=None, _action=None)] = ()
+  lora: Annotated[dew.lora.LoRA, _SubcommandConfig] | None = None
+  val_metrics: Annotated[tuple[dew.config.MetricConfig, ...], PrimitiveConstructorSpec] | None = None
+  val_every: Annotated[collections.abc.Mapping[str, int | str], PrimitiveConstructorSpec] = builtins.dict()
+  val_summaries: Annotated[tuple[dew.training.evaluation.Summary, ...], PrimitiveConstructorSpec] = ()
   preset: PresetSpec | None = dew.diffusion.presets.EDM()
   text: TextCondition | None = dew.inputs.spec.TextCondition()
   audio: AudioCondition | None = None
@@ -450,10 +450,10 @@ dew.config.jepa.JepaRunConfig
   optim: OptimConfig = dew.config.jepa.JepaRunConfig.<lambda>()
   trainer: dew.config.TrainerConfig = dew.config.TrainerConfig()
   objective: ObjectiveConfig = dew.config.jepa.JepaRunConfig.<lambda>()
-  lora: Optional[Annotated[dew.lora.LoRA, _SubcommandConfig(name='lora', default=tyro.MISSING_NONPROP, description=None, prefix_name=True, constructor_factory=None, aliases=None, is_default=False)]] = None
-  val_metrics: Optional[Annotated[tuple[dew.config.MetricConfig, ...], PrimitiveConstructorSpec(nargs=1, metavar='JSON', instance_from_str=<function record_argument.<locals>.<lambda>>, is_instance=<function record_argument.<locals>.<lambda>>, str_from_instance=<function record_argument.<locals>.<lambda>>, choices=None, _action=None)]] = None
-  val_every: Annotated[collections.abc.Mapping[str, int | str], PrimitiveConstructorSpec(nargs=1, metavar='JSON', instance_from_str=<function record_argument.<locals>.<lambda>>, is_instance=<function record_argument.<locals>.<lambda>>, str_from_instance=<function record_argument.<locals>.<lambda>>, choices=None, _action=None)] = builtins.dict()
-  val_summaries: Annotated[tuple[dew.training.evaluation.Summary, ...], PrimitiveConstructorSpec(nargs=1, metavar='JSON', instance_from_str=<function record_argument.<locals>.<lambda>>, is_instance=<function record_argument.<locals>.<lambda>>, str_from_instance=<function record_argument.<locals>.<lambda>>, choices=None, _action=None)] = ()
+  lora: Annotated[dew.lora.LoRA, _SubcommandConfig] | None = None
+  val_metrics: Annotated[tuple[dew.config.MetricConfig, ...], PrimitiveConstructorSpec] | None = None
+  val_every: Annotated[collections.abc.Mapping[str, int | str], PrimitiveConstructorSpec] = builtins.dict()
+  val_summaries: Annotated[tuple[dew.training.evaluation.Summary, ...], PrimitiveConstructorSpec] = ()
   predictor: JsonDict = builtins.dict()
   num_target_blocks: int = 4
   target_scale: tuple[float, float] = (0.15, 0.2)
@@ -469,10 +469,10 @@ dew.config.lm.LMRunConfig
   optim: OptimConfig = dew.config.lm.LMRunConfig.<lambda>()
   trainer: dew.config.TrainerConfig = dew.config.TrainerConfig()
   objective: ObjectiveConfig = dew.config.lm.LMRunConfig.<lambda>()
-  lora: Optional[Annotated[dew.lora.LoRA, _SubcommandConfig(name='lora', default=tyro.MISSING_NONPROP, description=None, prefix_name=True, constructor_factory=None, aliases=None, is_default=False)]] = None
-  val_metrics: Optional[Annotated[tuple[dew.config.MetricConfig, ...], PrimitiveConstructorSpec(nargs=1, metavar='JSON', instance_from_str=<function record_argument.<locals>.<lambda>>, is_instance=<function record_argument.<locals>.<lambda>>, str_from_instance=<function record_argument.<locals>.<lambda>>, choices=None, _action=None)]] = None
-  val_every: Annotated[collections.abc.Mapping[str, int | str], PrimitiveConstructorSpec(nargs=1, metavar='JSON', instance_from_str=<function record_argument.<locals>.<lambda>>, is_instance=<function record_argument.<locals>.<lambda>>, str_from_instance=<function record_argument.<locals>.<lambda>>, choices=None, _action=None)] = builtins.dict()
-  val_summaries: Annotated[tuple[dew.training.evaluation.Summary, ...], PrimitiveConstructorSpec(nargs=1, metavar='JSON', instance_from_str=<function record_argument.<locals>.<lambda>>, is_instance=<function record_argument.<locals>.<lambda>>, str_from_instance=<function record_argument.<locals>.<lambda>>, choices=None, _action=None)] = ()
+  lora: Annotated[dew.lora.LoRA, _SubcommandConfig] | None = None
+  val_metrics: Annotated[tuple[dew.config.MetricConfig, ...], PrimitiveConstructorSpec] | None = None
+  val_every: Annotated[collections.abc.Mapping[str, int | str], PrimitiveConstructorSpec] = builtins.dict()
+  val_summaries: Annotated[tuple[dew.training.evaluation.Summary, ...], PrimitiveConstructorSpec] = ()
   loop_steps: int | None = None
   loop_layers: tuple[int, int] | None = None
   loop_backprop_steps: int | None = None
@@ -542,7 +542,7 @@ dew data  [tyro config: FlagCreatePairsOff, PositionalMetavarFromFieldName]
 dew data export  [dew.cli.main.DataExport]
   data: str  [Positional]
   destination: str  [Positional]
-  format: Optional[Literal['parquet', 'array_record']] = None
+  format: Literal['parquet', 'array_record'] | None = None
   rows_per_shard: int = 100000
   branch: Literal['train', 'validation'] = 'train'
   read: Literal['memory', 'indexed', 'streamed'] = 'streamed'
