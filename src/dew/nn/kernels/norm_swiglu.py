@@ -68,6 +68,7 @@ differently rounded autodiff.
 import dataclasses
 import functools
 import math
+from collections.abc import Hashable
 from typing import ClassVar, NamedTuple, Protocol
 
 import jax
@@ -643,19 +644,14 @@ class _Norm(NamedTuple):
     inverse_rounded: bool = False
 
 
-_STATIC = ('kernel', 'name', 'outputs', 'grid', 'warps', 'interpret', 'block', 'row_block', 'epsilon',
-           'offset', 'stored', 'after_cast', 'inverse_rounded', 'activation')
-"""A launch's static arguments (`_launched`): its kernel, its outputs' shapes and dtypes, its grid and
-warps, and its kernel's arithmetic; its operands the rest."""
-
-
-@tuning.lowered_once(_STATIC)
+@tuning.lowered_once(('kernel', 'name', 'outputs', 'grid', 'warps', 'interpret', 'arithmetic'))
 def _launched(*operands, kernel, name: str, outputs, grid: tuple[int, ...], warps: int, interpret: bool,
-              **parameters):
-    """`kernel` launched over `operands` (None where a call has none), lowered once a configuration
-    (`tuning.lowered_once`)."""
+              arithmetic: tuple[tuple[str, Hashable], ...]):
+    """`kernel` launched over `operands` (None where a call has none) with its `arithmetic`'s keyword
+    arguments, lowered once a configuration (`tuning.lowered_once`): its outputs' shapes and dtypes, its grid,
+    warps and arithmetic static."""
     return pl.pallas_call(
-        functools.partial(kernel, interpret=interpret, **parameters), grid=grid, out_shape=outputs,
+        functools.partial(kernel, interpret=interpret, **dict(arithmetic)), grid=grid, out_shape=outputs,
         compiler_params=plgpu.CompilerParams(num_warps=warps, num_stages=1),
         interpret=interpret, name=name,
     )(*operands)
@@ -681,9 +677,10 @@ class RmsForward(tuning.KernelOp):
                      None if branch is None else jax.ShapeDtypeStruct((rows, width), x.dtype),
                      jax.ShapeDtypeStruct((rows,), jnp.float32)),
             grid=(pl.cdiv(rows, config.rows),),
-            warps=config.warps, interpret=interpret, row_block=config.rows, epsilon=epsilon, offset=offset,
-            stored=jnp.dtype(stored), after_cast=after_cast, inverse_rounded=inverse_rounded,
-            activation=activation,
+            warps=config.warps, interpret=interpret, arithmetic=(
+                ('row_block', config.rows), ('epsilon', epsilon), ('offset', offset),
+                ('stored', jnp.dtype(stored)), ('after_cast', after_cast),
+                ('inverse_rounded', inverse_rounded), ('activation', activation)),
         ), None
 
     def _get_heuristics_config(self, ba) -> RowsConfig:
@@ -717,9 +714,9 @@ class RmsBackward(tuning.KernelOp):
             outputs=(jax.ShapeDtypeStruct((rows, width), x.dtype),
                      None if gate is None else jax.ShapeDtypeStruct((rows, width), gate.dtype),
                      partial, partial),
-            grid=(groups,), warps=config.warps, interpret=interpret, row_block=config.rows, offset=offset,
-            stored=jnp.dtype(stored), after_cast=after_cast, inverse_rounded=inverse_rounded,
-            activation=activation,
+            grid=(groups,), warps=config.warps, interpret=interpret, arithmetic=(
+                ('row_block', config.rows), ('offset', offset), ('stored', jnp.dtype(stored)),
+                ('after_cast', after_cast), ('inverse_rounded', inverse_rounded), ('activation', activation)),
         ), None
 
     def _get_heuristics_config(self, ba) -> ReverseConfig:
@@ -932,7 +929,7 @@ class _Elementwise(tuning.KernelOp):
 def _launch(kernel, name: str, operands, outputs, grid: tuple[int, ...], config: BlockConfig,
             interpret: bool):
     return _launched(*operands, kernel=kernel, name=name, outputs=outputs, grid=grid, warps=config.warps,
-                     interpret=interpret, block=config.block), None
+                     interpret=interpret, arithmetic=(('block', config.block),)), None
 
 
 @dataclasses.dataclass(frozen=True)
