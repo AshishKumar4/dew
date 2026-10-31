@@ -116,18 +116,19 @@ WORKER = Path(__file__).with_name("saved_export_worker.py")
 
 @pytest.mark.distributed
 @pytest.mark.mesh
-def test_a_pool_writes_a_model_spanning_its_processes_a_tensor_at_a_time(tmp_path):
-    """Two real processes write a decoder whose kernels span both, as a run's export writes its release
-    (`export_run`, ledger 2874): inside `reading_home` each reads one tensor home at a time, together, so
-    neither holds more than the largest tensor beyond the shard it writes, where the pool read the
-    whole tree home first; both write the files one process writes of the same weights unplaced, byte for
-    byte. Outside the scope the write is refused rather than left waiting on the other process."""
-    reports = run_pool("exported", tmp_path / "pool", processes=2, script=WORKER, devices=2, fsdp_size=4,
-                       run_dir=str(tmp_path))
-    for report in reports:
+def test_a_pool_exports_a_model_spanning_its_processes_a_shard_at_a_time(tmp_path):
+    """Two real processes export a decoder whose kernels span both as a saved run's release (`export_run`,
+    ledger 2874), in a score of shards: each reads one tensor home at a time, together, so neither host's
+    allocations during the export peak at half the model, where the pool read the whole tree home
+    first. The publishing process writes the files one process writes of the same weights unplaced,
+    byte for byte; the other writes the release's small files alone, no weights. Outside the export's
+    scope the write is refused rather than left waiting on the other process."""
+    publisher, reader = run_pool("exported", tmp_path / "pool", processes=2, script=WORKER, devices=2,
+                                 fsdp_size=4, run_dir=str(tmp_path))
+    for report in (publisher, reader):
         assert report["processes"] == 2 and report["spanning"] > 0
         assert report["refused_outside"]
-        assert report["pooled"] == report["alone"] == reports[0]["alone"] and report["pooled"]
-        assert report["gathers"] >= report["spanning"]
-        assert report["largest_gathered"] <= report["largest_leaf"] < report["whole"]
+        assert report["largest_leaf"] <= report["peak"] < report["whole"] / 2
+    assert publisher["release"] == publisher["alone"] == reader["alone"] and len(publisher["release"]) > 10
+    assert reader["release"] == {} and reader["small_files"] == publisher["small_files"]
 

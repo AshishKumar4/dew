@@ -35,6 +35,7 @@ import numpy as np
 from flax.traverse_util import unflatten_dict
 from jax.typing import DTypeLike
 
+from dew._coordination import read_home
 from dew.batch import leaves_by_path
 
 __all__ = ["DEX_COLLECTION", "DEX_CONSTANTS", "DEX_PARAMETERS", "DexStart", "DifferentialExtension",
@@ -177,10 +178,11 @@ def folded(variables: Mapping[str, Mapping], compute: DTypeLike | None) -> dict[
     does outside a run (`annealed`), `O'_h K_h = O_h (I - lambda W_h) K_h`. Lambda and `W_h` are the
     ones the layer multiplies by, rounded to its `compute` dtype as `differential` rounds them (None for
     its parameters' own). A layer whose heads' outputs pass through more before `o_proj` does not fold
-    (`HeadOutputs.dex_fold_refusal`)."""
+    (`HeadOutputs.dex_fold_refusal`). Each operand is read home as a pool's export reads it
+    (`read_home`), the layers in order, the same on every process."""
 
     def multiplied(value) -> np.ndarray:
-        held = np.asarray(value)
+        held = read_home(value)
         return np.asarray(held if compute is None else held.astype(jnp.dtype(compute)), np.float64)
 
     params: dict[tuple[str, ...], jax.Array | np.ndarray] = dict(leaves_by_path(variables["params"]))
@@ -188,15 +190,15 @@ def folded(variables: Mapping[str, Mapping], compute: DTypeLike | None) -> dict[
     for prefix in [key[:-1] for key in params if key[-1] == "dex_projection"]:
         projection = multiplied(params.pop((*prefix, "dex_projection")))
         strength = multiplied(params.pop((*prefix, "dex_lambda")))
-        heads = np.asarray(held.pop((*prefix, "dex_heads")))
+        heads = read_home(held.pop((*prefix, "dex_heads")))
         del held[(*prefix, "dex_lambda_init")]
         kernel = params[(*prefix, "o_proj", "kernel")]
-        wide = np.array(kernel, np.float64)
+        wide = read_home(kernel).astype(np.float64)
         width = projection.shape[-1]
         for slot, head in enumerate(heads):
             rows = slice(int(head) * width, (int(head) + 1) * width)
             wide[rows] -= strength * projection[slot] @ wide[rows]
-        params[(*prefix, "o_proj", "kernel")] = wide.astype(np.asarray(kernel).dtype)
+        params[(*prefix, "o_proj", "kernel")] = wide.astype(kernel.dtype)
     rest = {name: tree for name, tree in variables.items() if name not in ("params", DEX_COLLECTION)}
     kept = {DEX_COLLECTION: unflatten_dict(held)} if held else {}
     return {**rest, "params": unflatten_dict(params), **kept}

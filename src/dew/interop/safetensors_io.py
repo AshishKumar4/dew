@@ -21,7 +21,7 @@ import jax
 import ml_dtypes
 import numpy as np
 
-from dew._coordination import read_home
+from dew._coordination import read_home, writes_weights
 from dew._records import JSON
 from dew.files import replacing, write_atomically
 from dew.interop.unread import Stored, Unread
@@ -104,12 +104,11 @@ def _publish(
     or replacement leaves the old file intact and removes the temporary.
     """
     _, backend = _safetensors()
+    hosted = {name: _host_array(array) for name, array in tensors().items()}
+    if not writes_weights():
+        return  # read as a pool's publisher reads them, and written by it alone
     with replacing(path) as temporary:
-        backend.save_file(
-            {name: _host_array(array) for name, array in tensors().items()},
-            os.fspath(temporary),
-            metadata=None if metadata is None else dict(metadata),
-        )
+        backend.save_file(hosted, os.fspath(temporary), metadata=None if metadata is None else dict(metadata))
         if metadata is not None and len(metadata) > 1:
             _sort_metadata(os.fspath(temporary))
 
@@ -446,6 +445,8 @@ def save_sharded(
     for filename, members in split.filename_to_tensors.items():
         _publish(lambda members=members: {name: tensors[name] for name in members},
                  folder / names[filename], {"format": "pt"})
+    if not writes_weights():
+        return
     if split.is_sharded:
         write_index(folder, {name: names[filename] for name, filename in split.tensor_to_filename.items()},
                     split.metadata["total_size"], stem)

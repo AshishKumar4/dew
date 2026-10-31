@@ -48,25 +48,28 @@ if TYPE_CHECKING:
 
 
 def export_run(run: SavedRun, destination: str | Path, *, ema: bool | None = None,
-               mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None) -> None:
+               mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
+               publishes: bool = True) -> None:
     """Write `run`'s pinned checkpoint (`SavedRun.pinned`) to `destination` as its release, its EMA
     weights where `ema`: a task's own released layout (`ReleasedTask`), or the model in its family's
     source layout (`Pretrained.from_saved`). Its weights restore where `mesh` and `layout` place them,
     so no device holds more of them than a load does, and the writer reads them home a tensor at a time
     as it writes them, one shard of the release at a time (`save_sharded`). On a pool every process
     runs this same writer, reading each tensor that spans the pool's processes home together
-    (`reading_home`), so each host holds a shard of the release, not the model (ledger 2874)."""
+    (`reading_home`), so each host holds a shard of the release, not the model (ledger 2874). One that
+    does not `publish` reads every tensor as the one that does and writes no weights to `destination`,
+    only the release's small files."""
     from dew.interop.pretrained import Pretrained
     from dew.objectives.base import ReleasedTask
 
     task = run.objective.saved_task
     if task is not None and issubclass(task, ReleasedTask):
         released = task.from_saved(run, ema=ema, mesh=mesh, layout=layout)
-        with reading_home("saved run export"):
+        with reading_home("saved run export", writes=publishes):
             released.save_pretrained(str(destination))
     else:
         bundle = Pretrained.from_saved(run, ema=ema, mesh=mesh, layout=layout)
-        with reading_home("saved run export"):
+        with reading_home("saved run export", writes=publishes):
             bundle.save(destination)
 
 
@@ -232,14 +235,15 @@ def released_run(name_or_dir: str | Path, *, step: int | str | None = None, ema:
         return release
     # Every process restores and writes, the pool reading its tensors home together. Where the pool
     # shares the cache and every process asks for the one release, the first publishes it and the others
-    # write theirs to a directory of their own, discarded; elsewhere each publishes its own, and one that
-    # holds it already keeps it (`staged`). A key reads each host's own checkpoint files
-    # (`_fingerprint`), which copies of one checkpoint on several hosts may stamp apart.
+    # read every tensor as it does, writing only the release's small files, to a directory discarded;
+    # elsewhere each publishes its own, and one that holds it already keeps it (`staged`). A key reads
+    # each host's own checkpoint files (`_fingerprint`), which copies of one checkpoint on several hosts
+    # may stamp apart.
     shared = (jax.process_count() > 1 and len(set(from_every_process(release.name))) == 1
               and all(seen_by_every_process(str(release.parent))))
     if shared and jax.process_index() != 0:
         with tempfile.TemporaryDirectory() as discarded:
-            export_run(run, discarded, ema=ema, mesh=mesh, layout=layout)
+            export_run(run, discarded, ema=ema, mesh=mesh, layout=layout, publishes=False)
     else:
         with staged(release) as destination:
             export_run(run, destination, ema=ema, mesh=mesh, layout=layout)

@@ -173,18 +173,36 @@ def collective_host[T](value: T, *, phase: str, held_by: Literal["every", "first
 _READS_HOME: contextvars.ContextVar[str | None] = contextvars.ContextVar("reads_home", default=None)
 """The phase of the scope `read_home` reads a pool's arrays home in (`reading_home`), None outside one."""
 
+_WRITES_WEIGHTS: contextvars.ContextVar[bool] = contextvars.ContextVar("writes_weights", default=True)
+"""Whether a weights writer in this scope writes what it reads (`reading_home`, `writes_weights`)."""
+
 
 @contextlib.contextmanager
-def reading_home(phase: str) -> Iterator[None]:
+def reading_home(phase: str, *, writes: bool = True) -> Iterator[None]:
     """A scope in which `read_home` reads an array spanning the pool's processes home by a collective
     (`collective_host`), every process of the pool reading the same arrays in the same order: each
     process running the same writer over the same tree (`dew.interop.saved_sources.export_run`), a
-    writer that reads one tensor at a time then holds one on every host, not the whole tree."""
-    token = _READS_HOME.set(phase)
+    writer that reads one tensor at a time then holds one on every host, not the whole tree. Without
+    `writes`, a weights writer reads every tensor as it would and writes none of them
+    (`writes_weights`), as a pool's processes beside the one that publishes do.
+
+    A process that fails inside the scope publishes its failure (`publish_failure`), which ends the
+    pool within `FAILURE_GRACE_SECONDS`: the others may be waiting on it in a read it will not join."""
+    token, writing = _READS_HOME.set(phase), _WRITES_WEIGHTS.set(writes)
     try:
         yield
+    except BaseException as failure:
+        if jax.process_count() > 1:
+            publish_failure(failure, f"phase {phase}")
+        raise
     finally:
         _READS_HOME.reset(token)
+        _WRITES_WEIGHTS.reset(writing)
+
+
+def writes_weights() -> bool:
+    """Whether a weights writer writes the tensors it reads here (`reading_home`), as it does outside one."""
+    return _WRITES_WEIGHTS.get()
 
 
 def read_home(value) -> np.ndarray:
