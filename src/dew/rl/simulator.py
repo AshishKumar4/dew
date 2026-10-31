@@ -80,7 +80,11 @@ def simulator_rollout(simulator: Simulator, policy: Policy, params: Params, carr
     `[steps, ...]`, as `env_rollout` records them; the carry's state is the simulator's own, held by it,
     so the carry holds None there. With `reset`, an episode that ended restarts before the next step,
     its transition keeping the observation it ended at; a simulator that restarts its episodes itself
-    (`DrivenSimulator`) passes False."""
+    (`DrivenSimulator`) passes False. The policy acts on the device the simulator's arrays are on, its
+    `params` and `carry` put there (a no-op where they already are)."""
+    device = next(iter(jax.tree.leaves(carry.observation)[0].devices()))
+    params, carry = jax.device_put((params, carry), device)
+
     @jax.jit
     def act(carry: Carry) -> tuple[jax.Array, Any, Any, jax.Array]:
         key, act_key = jax.random.split(carry.key)

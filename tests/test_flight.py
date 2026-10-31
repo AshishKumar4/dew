@@ -122,7 +122,7 @@ class Replay:
         self.steps, self.episodes, self.commands, self.held = 0, np.zeros(self.count, int), [], None
 
     def kinematics(self) -> Kinematics:
-        return Kinematics(*np.split(self.held, [3, 6, 10], axis=-1))
+        return Kinematics(*(np.ascontiguousarray(part) for part in np.split(self.held, [3, 6, 10], axis=-1)))
 
     def reset(self, mask, position, orientation):
         mask = np.asarray(mask)
