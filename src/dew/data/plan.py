@@ -408,7 +408,7 @@ def earlier_plan(saved: Mapping[str, object], plan: Plan) -> Mapping[str, object
     1.0 (ledger 1552)."""
     manifest = record(saved.get("manifest", {}), "saved data manifest")
     named = _named_as_today(json_value(manifest.get("source", {}), "saved data source"), plan.stores)
-    saved = {**saved, "manifest": {**manifest, "source": named}}
+    saved = {**saved, "manifest": {**manifest, "source": named}, **_members_as_today(saved, plan)}
     saved_sources = record(named, "saved data source").get("sources")
     sources = record(plan.manifest.semantic().get("source", {}), "data source").get("sources")
     if not isinstance(saved_sources, list) or not isinstance(sources, list):
@@ -420,6 +420,35 @@ def earlier_plan(saved: Mapping[str, object], plan: Plan) -> Mapping[str, object
                 and _unstated_lengths(today)):
             held[name] = plan.derived[name]
     return {**saved, "derived": held}
+
+
+def _members_as_today(saved: Mapping[str, object], plan: Plan) -> dict[str, JSON]:
+    """`saved`'s member digests (`Plan.members`), a saved record read at its boundary, each a Dew before
+    row 3028 made of a member `plan` keeps as today's makes it, where it is the digest that Dew made of
+    today's member (`Plan.earlier_members`) and that Dew read the documents of each token store the member
+    reads as today's does (`TokenFiles.read_alike`); none where `saved` keeps no members."""
+    members = saved.get("members")
+    if not isinstance(members, dict):
+        return {}
+    held: dict[str, JSON] = {}
+    for key, digest in members.items():
+        earlier, stores = plan.earlier_members.get(key, (None, ()))
+        today = plan.members.get(key)
+        if digest != today and digest == earlier and all(store.read_alike() for store in stores):
+            digest = today
+        held[key] = digest
+    return {"members": held}
+
+
+def without_documents(value: JSON) -> JSON:
+    """`value`, a fingerprint of sources or a manifest holding them, each token store in it named as a Dew
+    before row 3028 named it, without `documents` (`earlier_plan`)."""
+    if isinstance(value, list):
+        return [without_documents(part) for part in value]
+    if not isinstance(value, dict):
+        return value
+    return {name: without_documents(part) for name, part in value.items()
+            if not (name == "documents" and value.get("store") == "tokens")}
 
 
 def _named_as_today(value: JSON, stores: Sequence[TokenFiles]) -> JSON:
@@ -528,6 +557,11 @@ class Plan:
     stores: tuple[TokenFiles, ...] = dataclasses.field(default=(), compare=False, repr=False)
     """The token stores beneath the plan's sources, which a plan a Dew before row 3028 saved names
     otherwise (`earlier_plan`); no part of the plan's record."""
+    earlier_members: Mapping[str, tuple[str, tuple[TokenFiles, ...]]] = dataclasses.field(
+        default_factory=dict, compare=False, repr=False)
+    """Each of `members`' digests as a Dew before row 3028 made it, its token stores named without
+    `documents` (`without_documents`), with the token stores the member reads (`earlier_plan`); no part
+    of the plan's record."""
     version: ClassVar[int] = 7
 
     def record(self) -> dict[str, JSON]:
