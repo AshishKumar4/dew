@@ -589,7 +589,7 @@ def lowered_once(static: tuple[str, ...], *, unless: Callable[[], bool] = lambda
     return decorate
 
 
-def holdable(value: Hashable) -> bool:
+def holdable(value: Hashable | jax.Array) -> bool:
     """Whether a cache may hold `value` without holding an array through it: no array, and no function of
     a closure or a bound method (a hook reading an operand's shape may reach the array its call made),
     within a partial's arguments, a tuple or a dataclass's fields alike (a static argument is hashable, so
