@@ -463,14 +463,9 @@ class _Pass:
 
     def _rematerialized(self, op, name: str) -> bool:
         """Whether `op` is scalar arithmetic over free values only (immediates, special registers and what
-        they compute), which the compiler recomputes at its uses rather than keeps: within `RECOMPUTED`
-        instructions of them, or wherever it is not read inside a loop it lies outside of."""
-        if not op.results or not self._recomputable(op, name):
+        they compute), which the compiler recomputes at its uses rather than keeps."""
+        if not op.results:
             return False
-        return _recomputed(op, set()) <= RECOMPUTED or not _read_in_outer_loop(op)
-
-    def _recomputable(self, op, name: str) -> bool:
-        """Whether `op` computes over free values only, a vector or struct of them or scalar arithmetic."""
         if name in ("llvm.insertelement", "vector.insert", "vector.insertelement", "llvm.insertvalue",
                     "vector.broadcast", "vector.splat", "vector.from_elements", "llvm.bitcast",
                     "vector.bitcast"):
@@ -493,6 +488,12 @@ class _Pass:
                 self.mma_words = max(self.mma_words, words)
         self.atoms.making = f"{name}:{str(op.results[0].type)[:28]}" if len(op.results) else name
         produced = list(op.results)
+        if (name not in FREE and self._rematerialized(op, name) and _read_in_outer_loop(op)
+                and _recomputed(op, set()) > RECOMPUTED):
+            # Hoisted out of a loop that reads it, and longer than ptxas recomputes: kept in registers.
+            for value in produced:
+                self.atoms.of[value] = self.atoms.fresh(value.type)
+            return
         if name in FREE or self._rematerialized(op, name):
             for value in produced:
                 self.atoms.of[value] = []
