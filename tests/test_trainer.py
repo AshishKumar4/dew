@@ -454,6 +454,25 @@ def checkpoint_writers() -> set[threading.Thread]:
     return {thread for thread in threading.enumerate() if any(name in thread.name for name in WRITERS)}
 
 
+@pytest.mark.parametrize("held", ["multi_steps", "chained", "apply_every"])
+def test_an_optimizer_that_holds_updates_back_is_refused_before_any_step(held):
+    """An optimizer that holds its updates back over calls (`optax.MultiSteps`, `optax.apply_every`),
+    alone or within a chain, applies none on most calls, while the trainer counts each call an update: its
+    average, the objective's post-step effects and its committed tokens would move on calls that moved no
+    weight (row 1870). It is refused before any step; the trainer's window (`Trainer(accumulation=)`)
+    accumulates gradients and applies one update a window, which every clock counts. The same optimizer
+    applying every update trains."""
+    solver = optax.sgd(1e-2)
+    optimizer = {"multi_steps": optax.MultiSteps(solver, every_k_schedule=2).gradient_transformation(),
+                 "chained": optax.chain(optax.clip_by_global_norm(1.0),
+                                        optax.MultiSteps(solver, 2).gradient_transformation()),
+                 "apply_every": optax.chain(solver, optax.apply_every(2))}[held]
+    with pytest.raises(ValueError):
+        Trainer(Regression(), optimizer, key=0).fit(dataset(), steps=2, log_every=1)
+    state = Trainer(Regression(), solver, key=0).fit(dataset(), steps=2, log_every=1)
+    assert int(state.updates) == 2
+
+
 def test_closed_checkpoints_leave_no_writer_running_across_trials(tmp_path):
     """Trials in one process each close their checkpoints, as RunConfig.train does, so Orbax's
     managers and metadata stores leave no writer behind: after the first, which starts what Orbax
