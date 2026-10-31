@@ -72,6 +72,8 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 - A compilation cache directory a run names after its process first compiled (`prepare_process`,
   `trainer.compilation_cache_dir`, a second run in a notebook) holds the programs compiled after, where
   JAX kept the first directory.
+  `evaluation/counts/<split>/records`, so splits scored at one step each keep their own. A cooldown
+  branch's scores are named `cooldown/<split>/<metric>`, which no split's own name can take.
 - A run's numerics are named where they are set: `--trainer.precision accurate` (or a Lightning dtype
   preset, "bf16-true", or a `Numerics` record's JSON), `"precision": "accurate"` in a run.json, and
   `Pretrained.load(precision=...)` and `dew.pipeline(source, precision=...)`, which load in their dtypes
