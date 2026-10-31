@@ -11,7 +11,6 @@ import torch
 from one_draw import assert_as_exact_as_the_reference, assert_leaves_as_exact
 from reference_error import (
     FACTOR,
-    MOST_SEEDS,
     PARITY,
     REDRAW,
     GateFailure,
@@ -975,11 +974,8 @@ def test_a_failing_site_raises_its_findings_as_data():
 def test_check_one_is_inconclusive_where_its_seeds_cannot_resolve_the_factor():
     """Errors set seed by seed, alike on every host: Dew's squared error is 4 on even seeds and 0.01 on
     odd ones, the reference's 1 on each, so the pooled ratio (1.42) is under PARITY but its interval
-    straddles it and is wider than it over 8 seeds and over the second stage's 40 alike, never a pass by
-    it: the typical draw's ratio (0.45) decides, resolved under PARITY over the second stage's seeds, and
-    the arms' mean RMS ratio (1.05) under it too (`_typically`, ledger 2469). Fewer seeds than
-    FEWEST_SEEDS are inconclusive whatever they read."""
-    from reference_error import _interval, _mean_rms_ratio, _status, _typically
+    straddles it and is wider than it over 8 seeds and over the second stage's 40 alike: inconclusive,
+    never a pass. Fewer seeds than FEWEST_SEEDS are inconclusive whatever they read."""
     def errors(seed):
         return (np.zeros(64, np.float32), np.full(64, 2.0 if seed % 2 == 0 else 0.1, np.float32),
                 np.ones(64, np.float32))
@@ -996,10 +992,8 @@ def test_check_one_is_inconclusive_where_its_seeds_cannot_resolve_the_factor():
     def truth(x, mine, theirs):
         return {"y": x}
 
-    mine, theirs = np.asarray([4.0, 0.01] * 20), np.ones(40)
-    assert _status(math.sqrt(2.005), *_interval(mine, theirs)) == "inconclusive"
-    assert _status(*_typically(mine, theirs)) == "pass" and _mean_rms_ratio(mine, theirs) < PARITY
-    assert_as_exact(dew, reference, errors, "straddling", seeds=8, truth_fn=truth)
+    with pytest.raises(Inconclusive):
+        assert_as_exact(dew, reference, errors, "straddling", seeds=8, truth_fn=truth)
     with pytest.raises(Inconclusive):
         assert_as_exact(_reordered, _product, _draw, "two seeds", seeds=2)
     # And seeds_for never declares fewer, whatever it is asked to start from.
@@ -1949,57 +1943,3 @@ def test_a_leaf_read_from_its_rows_distances_is_the_leaf_read_whole():
                     leaf_summary(np.zeros((0, 4), np.float32), np.zeros((0, 4))))
     for field in ("mse", "worst", "zero_rows", "finite"):
         np.testing.assert_array_equal(getattr(empty, field), getattr(exact, field), err_msg=field)
-
-
-def rounding_apart(seed):
-    """A draw whose two arms round apart, as two programs under fp32 sums do (ledger 2469): a value, its
-    scale (lognormal, sigma 2, as a draw's conditioning sets it) and each arm's own rounding's size on it
-    (lognormal, sigma 0.5, each arm's own)."""
-    rng = np.random.default_rng([2469, seed])
-    return (rng.standard_normal(64).astype(np.float32), np.float32(np.exp(rng.normal(0, 2.0))),
-            np.exp(rng.normal(0, 0.5, 2)).astype(np.float32))
-
-
-def rounded_apart(arm: int, factor: float = 1.0, *, every: int = 1):
-    """`rounding_apart`'s arm `arm`: its value plus its own rounding, the draw's scale times its size times a
-    fixed pattern of its own; Dew's `factor` times further on every `every`th draw's value (by its first
-    element's bits)."""
-    @as_given
-    def run(x, scale, sizes):
-        pattern = np.random.default_rng([arm, int(np.asarray(x).view(np.uint32)[0])]).standard_normal(x.shape)
-        hit = int(np.asarray(x).view(np.uint32)[0]) % every == 0
-        return np.asarray(x, np.float64) + scale * sizes[arm] * 1e-7 * pattern * (factor if hit else 1.0)
-    return run
-
-
-def exact_value(x, scale, sizes):
-    return np.asarray(x, np.float64)
-
-
-def test_arms_rounding_apart_are_judged_by_the_typical_draw_and_a_fault_on_it_or_on_a_minority_is_refused():
-    """Where two arms round apart (each draw's error the draw's scale times each arm's own rounding, both
-    heavy-tailed), the pooled ratio does not resolve within MOST_SEEDS, and the typical draw's ratio decides
-    (`_typical`, ledger 2469): an equally exact pair passes at the count it sizes; a Dew twice off on every
-    draw is over; one ten times off on a tenth of its draws, which the typical draw's ratio leaves under
-    PARITY, is refused by the arms' mean RMS ratio (`_mean_rms_ratio`)."""
-    from reference_error import _interval
-
-    reference = rounded_apart(1)
-    seeds = seeds_for(reference, rounding_apart, "rounding apart", truth_fn=exact_value,
-                      dew_fn=rounded_apart(0))
-    # The pooled ratio does not resolve even at MOST_SEEDS: its sums are ruled by their largest draws.
-    def squared(arm, seed):
-        x, scale, sizes = rounding_apart(seed)
-        return float(np.mean((arm(x, scale, sizes) - exact_value(x, scale, sizes)) ** 2))
-
-    most = [[squared(arm, seed) for seed in range(MOST_SEEDS)] for arm in (rounded_apart(0), reference)]
-    low, high = _interval(*(np.asarray(errors) for errors in most))
-    assert high > PARITY * low and seeds <= MOST_SEEDS
-    assert_as_exact(rounded_apart(0), reference, rounding_apart, "rounding apart", seeds=seeds,
-                    truth_fn=exact_value)
-    with pytest.raises(GateFailure):
-        assert_as_exact(rounded_apart(0, 2.0), reference, rounding_apart, "twice off", seeds=seeds,
-                        truth_fn=exact_value)
-    with pytest.raises(GateFailure):
-        assert_as_exact(rounded_apart(0, 10.0, every=10), reference, rounding_apart, "a tenth ten times off",
-                        seeds=seeds, truth_fn=exact_value)

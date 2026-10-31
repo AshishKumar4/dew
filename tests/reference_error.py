@@ -826,52 +826,6 @@ def _interval(mine: np.ndarray, theirs: np.ndarray | None = None, control: np.nd
     return float(np.quantile(ratios, tails[0])), float(np.quantile(ratios, 1 - tails[1]))
 
 
-def _typical(mine: np.ndarray, theirs: np.ndarray) -> float:
-    """The typical draw's RMS ratio: the geometric mean over draws of each draw's RMS ratio,
-    exp(mean(log sqrt(a / b))), draws where both arms are exactly float64 left out, and not a number where
-    one arm is exact on a draw and the other is not (a ratio no log holds). Where the arms round apart (fp32
-    sums, `summed_as_run`) each draw's error is the draw's own scale times each arm's own rounding, both
-    heavy-tailed across draws: the pooled ratio's sums are ruled by its few largest draws and resolve only
-    past thousands of seeds, while this ratio's logs are light-tailed, unbiased for a factor Dew's
-    rounding holds on every draw (the arms exchangeable, the mean of their logs' difference is the factor's
-    log, whatever their own distribution), and resolve in a few hundred (ledger 2469)."""
-    if np.any((mine > 0) != (theirs > 0)):
-        return float("nan")
-    kept = mine > 0
-    return float(np.exp(np.mean(0.5 * np.log(mine[kept] / theirs[kept])))) if kept.any() else 1.0
-
-
-def _typical_interval(mine: np.ndarray, theirs: np.ndarray,
-                      tails: tuple[float, float] = (LOWER_TAIL, UPPER_TAIL)) -> tuple[float, float]:
-    """`_typical`'s bootstrap interval over seeds, Dew's and the reference's errors resampled by the same
-    seeds, its lower and upper `tails` left out (`_interval`'s, on the draws' log ratios)."""
-    if np.any((mine > 0) != (theirs > 0)):
-        return float("nan"), float("nan")
-    kept = mine > 0
-    logs = np.where(kept, 0.5 * np.log(np.where(kept, mine, 1) / np.where(kept, theirs, 1)), 0.0)
-    picks = np.random.default_rng(0).integers(0, len(mine), (BOOTSTRAP, len(mine)))
-    means = logs[picks].sum(axis=1) / np.maximum(kept[picks].sum(axis=1), 1)
-    return float(np.exp(np.quantile(means, tails[0]))), float(np.exp(np.quantile(means, 1 - tails[1])))
-
-
-def _mean_rms_ratio(mine: np.ndarray, theirs: np.ndarray) -> float:
-    """The ratio of the arms' mean RMS errors over draws, sum(sqrt a) / sum(sqrt b): what `_typical`'s
-    pass is guarded by, as a fault on a minority of draws (Dew 6 times off on a tenth of them) moves it past
-    PARITY where the typical draw's ratio stays under it."""
-    return float(np.sum(np.sqrt(mine)) / np.sum(np.sqrt(theirs))) if np.sum(theirs) > 0 else float("inf")
-
-
-def _typically(mine: np.ndarray, theirs: np.ndarray,
-               tails: tuple[float, float] = (LOWER_TAIL, UPPER_TAIL)) -> tuple[float, float, float]:
-    """A leaf's typical ratio and its interval (`_typical`, `_typical_interval`), judged where its pooled
-    ratio is inconclusive (`_judgement`, `seeds_for`), and treated as inconclusive where it would pass with
-    the arms' mean RMS ratio over PARITY (`_mean_rms_ratio`), a fault on a minority of draws."""
-    ratio, (low, high) = _typical(mine, theirs), _typical_interval(mine, theirs, tails)
-    if _status(ratio, low, high) == "pass" and not _mean_rms_ratio(mine, theirs) <= PARITY:
-        return ratio, low, float("nan")
-    return ratio, low, high
-
-
 def _resolves(low: float, high: float) -> bool:
     """Whether a pooled ratio's interval is no wider than PARITY, so it tells an equally exact
     computation from one PARITY off."""
@@ -1490,23 +1444,11 @@ def _judgement(draws: _Draws, label: str, tails: tuple[float, float] = (LOWER_TA
             status = _status(ratio, low, high, contained=contained)
             # The ratio's log from its sums' logs, finite where a sum or the ratio itself would overflow.
             measure = (log_sum(a) - log_sum(b)) / 2
-            typical = None
-            if status == "inconclusive" and contained:
-                # The pooled ratio's sums unresolved: the typical draw's ratio decides where it resolves.
-                typical = _typically(a, b, tails)
-                status = _status(*typical)
             if status == "inconclusive":
                 unresolved.append(Finding(
                     leaf, "inconclusive", measure, f"{leaf}: inconclusive: the pooled ratio {ratio:.3f}'s "
-                    f"interval over {count} seeds is [{low:.3f}, {high:.3f}], wider than {PARITY}"
-                    + ("" if typical is None else f", and the typical draw's {typical[0]:.3f}'s "
-                       f"[{typical[1]:.3f}, {typical[2]:.3f}] (mean RMS ratio {_mean_rms_ratio(a, b):.3f})")
-                    + "; give the site larger inputs or more seeds (`seeds_for`)"))
-            elif status == "over" and typical is not None:
-                over.append(Finding(leaf, "pooled", measure, f"{leaf}: the typical draw's RMS error from "
-                                    f"float64 is {typical[0]:.3f} times the reference's over {count} seeds, "
-                                    f"interval [{typical[1]:.3f}, {typical[2]:.3f}] (allowed {PARITY}; the "
-                                    f"pooled ratio {ratio:.3f} unresolved)"))
+                    f"interval over {count} seeds is [{low:.3f}, {high:.3f}], wider than {PARITY}; give the "
+                    f"site larger inputs or more seeds (`seeds_for`)"))
             elif status == "over":
                 over.append(Finding(leaf, "pooled", measure, f"{leaf}: dew's RMS error from float64 is "
                                     f"{ratio:.3f} times the reference's over {count} seeds, interval "
@@ -1926,8 +1868,7 @@ def _confirmed(names, theirs: np.ndarray, count: int, mine: np.ndarray | None = 
         if mine is not None:
             held, ours = theirs[start:start + count], mine[start:start + count]
             unresolved = [name for index, name in enumerate(names) if np.sum(held[:, index]) > 0
-                          and not _resolves(*_interval(ours[:, index], held[:, index]))
-                          and not _resolves(*_typically(ours[:, index], held[:, index])[1:])]
+                          and not _resolves(*_interval(ours[:, index], held[:, index]))]
         else:
             unresolved = _unresolved_against_itself(theirs[start:start + 2 * count], names, count)
         wide += [name for name in unresolved if name not in wide]
