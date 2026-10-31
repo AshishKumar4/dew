@@ -164,7 +164,7 @@ def test_a_pool_reads_a_saved_runs_release_through_one_publisher(tmp_path, monke
     assert publisher["export_code"] == reader["export_code"] == 0
     assert [scope["writes"] for scope in reader["exported"]] == [False]
     assert main(["export", str(source), str(tmp_path / "alone")]) == 0
-    assert exported_tensors(tmp_path / "exported") == exported_tensors(tmp_path / "alone")
+    assert exported_tensors(source.parent / "exported") == exported_tensors(tmp_path / "alone")
 
 
 def exported_tensors(directory: Path) -> dict[str, bytes]:
