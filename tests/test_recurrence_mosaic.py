@@ -744,7 +744,12 @@ def compiled_cases(target: str, plans: dict, refused: list, only: tuple | None =
         two = (template.MOSAIC._staged(bound, derived.block_v, facts, walkers=2,
                                        wide=derived.block_o or derived.block_v)
                if family.consumers >= 2 and not packed and value_width // derived.block_v % 2 == 0 else None)
-        walked = [] if two is None else [(two, 'two roles ')]
+        # A gradient at two roles its fast backward's launches do not hold is no run's (`backward_holds`, as
+        # at the derived tiles): compiled for the model's evidence alone.
+        with generation.assumed(facts):
+            two_held = two is None or not training or mainloop_backward.backward_holds(
+                *args, tiles=two, family=family, shared=shared, starts=starts, max_segments=None, **unwide)
+        walked = [] if two is None else [(two, 'two roles ' if two_held else 'refused two roles ')]
         # A forward without a gradient at its own tiles (`Tiles.forward`), which no fast backward narrows.
         alone = [] if training or derived.forward is None else [(derived.forward, 'alone ')]
         return [case(name, dtype, args, starts, bound, tiles, training=training, packed=packed, kind=kind)
