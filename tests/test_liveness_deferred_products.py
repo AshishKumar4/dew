@@ -277,14 +277,15 @@ def test_the_pass_reads_no_more_than_ptxas_holds_an_attention_backward():
         def case(models: dict):
             return KernelCase("backward", lambda: (backward, (query, key, key, query, shapes)), models)
 
-        # The pass's count (`lowered_models`, by launch), and each launch's PTX's least spill-free cap by
-        # ptxas (`kernel_compile.register_need`), compiled again into a directory this test reads.
-        (record,) = kernel_compile.compile_mosaic_kernels([case(models)], "sm90")
+        # Compiled once as the gate compiles a case (`kernel_compile._compiled_here`): the pass's count by
+        # launch (`_lowered_models`) and each launch's PTX's least spill-free cap by ptxas (`register_need`).
+        record = {"name": "backward", "generation": "sm90", "models": {}}
         with tempfile.TemporaryDirectory() as directory:
-            kernel_compile._compiled(case(models), "sm90", {"name": "backward", "models": {}}, directory)
+            kernel_compile._compiled(case(models), "sm90", record, directory)
+            lowered = kernel_compile._lowered_models(record, kernel_compile.mosaic_kernels(record), "sm90",
+                                                      models)
             need = {path.stem: kernel_compile.register_need(path.read_text(), "sm90")
                     for path in Path(directory).glob("*.ptx")}
-    lowered = record.get("lowered_models", {})
-    checked = [(name, model["registers"], need.get(name)) for name, model in lowered.items()]
+    checked = [(name, model.registers, need.get(name)) for name, model in lowered.items()]
     assert checked and all(found is not None for _, _, found in checked), (checked, sorted(need))
     assert all(registers <= found for _, registers, found in checked), checked
