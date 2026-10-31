@@ -154,16 +154,23 @@ def launching(op, arguments: tokamax.BoundArguments, config: Hashable) -> Iterat
 def named(name: str | None) -> str | None:
     """A kernel's name carrying the launch tracing it (`launching`; `kernel` for an unnamed one), as is
     where none is."""
+    digest = launch_digest()
+    return name if digest is None else f"{name or 'kernel'}__l{digest}"
+
+
+def launch_digest() -> str | None:
+    """The digest of the launch tracing (`launching`), which its kernels' names carry (`named`), or None
+    where none is."""
     pending = _TRACING.get()
     if pending is None:
-        return name
+        return None
     if pending.digest is None:
         identity = pending.identity()
         digest = _digest(f"{identity}|{pending.config!r}")
         with _GUARD:
             _LAUNCHES.setdefault(digest, Launch(identity, pending.op, pending.config))
         pending.digest = digest
-    return f"{name or 'kernel'}__l{pending.digest}"
+    return pending.digest
 
 
 def traced(digest: str) -> Launch | None:

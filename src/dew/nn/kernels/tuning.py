@@ -569,20 +569,33 @@ def lowered_once(static: tuple[str, ...], *, unless: Callable[[], bool] = lambda
     program on them and on its operands' shapes and dtypes, so each configuration is traced and lowered
     once however many layers, passes and recomputations call it, and no operand is held (a model's layers'
     identical kernels were each lowered again: a 9B step lowered 880 RMS norm calls for 15 programs, row
-    2440). A call whose static arguments reach a function closing over values (`holdable`), or one
-    `unless` names (a plan tracing every call), runs the launch itself: jit's cache would keep the
-    closure, and any array it reaches, alive."""
+    2440). The launch tracing it is a static too (`report.launch_digest`): its kernels' names carry it, so
+    two launches whose statics meet (a GEMM's 4089 and 4096 rows, padded alike) trace apart, each kernel
+    named for its own, and a spill refuses the launch that compiled it (row 2941). A call whose static
+    arguments reach a function closing over values (`holdable`), or one `unless` names (a plan tracing
+    every call), runs the launch itself: jit's cache would keep the closure, and any array it reaches,
+    alive."""
     def decorate(launch: Callable) -> Callable:
         signature = inspect.signature(launch)
         names = tuple(name for name in static if name in signature.parameters)
-        jitted = jax.jit(launch, static_argnames=names)
+
+        def keyed(*args, launch_digest, **kwargs):
+            del launch_digest
+            return launch(*args, **kwargs)
+
+        parameters = list(signature.parameters.values())
+        at = next((index for index, parameter in enumerate(parameters)
+                   if parameter.kind is inspect.Parameter.VAR_KEYWORD), len(parameters))
+        parameters.insert(at, inspect.Parameter("launch_digest", inspect.Parameter.KEYWORD_ONLY))
+        keyed.__signature__ = signature.replace(parameters=parameters)
+        jitted = jax.jit(keyed, static_argnames=(*names, "launch_digest"))
 
         @functools.wraps(launch)
         def called(*args, **kwargs):
             bound = signature.bind(*args, **kwargs).arguments
             if unless() or not all(holdable(bound[name]) for name in names if name in bound):
                 return launch(*args, **kwargs)
-            return jitted(*args, **kwargs)
+            return jitted(*args, launch_digest=report.launch_digest(), **kwargs)
 
         return called
 
