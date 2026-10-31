@@ -441,9 +441,9 @@ BUILT_IN_SEEDS = {"granite": 8, "smollm3": 8, "olmo2": 8, "hy_v3": 8, "glm4_moe_
 
 
 def with_prediction_depth(directory, layers: int, width: int) -> None:
-    """The checkpoint at `directory` with a prediction depth past its `layers` trunk layers, as GLM-4.7-Flash's
-    and HY-3's releases store one (`model.layers.{layers}.*`): its normed inputs, their projection and a
-    block, beside the trunk the source's own save writes."""
+    """The checkpoint at `directory` with a prediction depth past its `layers` trunk layers, as
+    GLM-4.7-Flash's and HY-3's releases store one (`model.layers.{layers}.*`): its normed inputs, their
+    projection and a block, beside the trunk the source's own save writes."""
     from safetensors.torch import load_file, save_file
 
     path = directory / "model.safetensors"
