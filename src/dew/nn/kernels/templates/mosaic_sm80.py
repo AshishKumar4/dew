@@ -154,11 +154,12 @@ class Mma(mosaic.Family):
     def rhs_fragment_depth(self, depth: int, *, transposed: bool = False) -> int:
         # A transposed stage's rows are its depth: a load takes a whole swizzle tile of it (`products`; D64's
         # K in QKᵀ at the widest held its whole 64 x 192 stage, 162 registers, census80). An ordinary one
-        # slices its rows' 8-row tiles.
-        return self._staged_depth(depth) if transposed else self.fragment_depth(depth)
+        # slices its rows' 8-row tiles. Either holds the next load beside the one its products read
+        # (`products` loads a slice ahead).
+        return min(depth, 2 * (self._staged_depth(depth) if transposed else self.fragment_depth(depth)))
 
     def lhs_fragment_depth(self, depth: int) -> int:
-        return self._staged_depth(depth)
+        return min(depth, 2 * self._staged_depth(depth))
 
     def _staged_depth(self, depth: int) -> int:
         """The depth a load of a stage whose rows are `depth` deep takes: one tile of the widest swizzle its
@@ -423,12 +424,23 @@ class Mma(mosaic.Family):
         held = self._left(lhs) if isinstance(lhs, jax.Array) else None
         lefts: dict[int, jax.Array] = {}
         rights: dict[int, jax.Array] = {}
-        for start in range(0, rhs.shape[0], instruction):
+
+        def loaded(start: int) -> None:
             left_at, right_at = start - start % lhs_depth, start - start % rhs_depth
             if held is None and left_at not in lefts:
                 lefts[left_at] = self._left(lhs.at[:, pl.ds(left_at, lhs_depth)])
             if right_at not in rights:
                 rights[right_at] = plgpu.load(rhs.at[pl.ds(right_at, rhs_depth)], layout=self.rhs)
+
+        # Each slice's fragments are loaded before the previous slice's products issue, so their shared
+        # memory reads overlap those products rather than stalling the next (short scoreboard 0.43 an
+        # issue against XLA's 0.01-0.10, FS-NCU-DW3-a100).
+        starts = range(0, rhs.shape[0], instruction)
+        loaded(0)
+        for start in starts:
+            if start + instruction < rhs.shape[0]:
+                loaded(start + instruction)
+            left_at, right_at = start - start % lhs_depth, start - start % rhs_depth
             left = held[:, start:start + instruction] if held is not None else lefts[left_at][
                 :, start - left_at:start - left_at + instruction]
             right = rights[right_at][start - right_at:start - right_at + instruction]
