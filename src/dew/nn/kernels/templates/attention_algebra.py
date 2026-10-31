@@ -1901,6 +1901,9 @@ def exponent(logits: jax.Array, peak: jax.Array, how: Recompute = PLAIN) -> jax.
         return jnp.minimum(logits - peak, 0.0) * how.factor
     if how.exact:
         return jnp.where(logits < peak, logits - peak, 0.0)
+    import os
+    if os.environ.get("DEW_LAB_NOCLAMP"):
+        return logits - peak
     return jnp.minimum(logits - peak, 0.0)
 
 
@@ -1935,7 +1938,8 @@ def grad_scores(exponentials: jax.Array, products: jax.Array, anchor: jax.Array,
     key" and causal windows' first queries: rows whose float64 gradient is exactly 0)."""
     products = dropped_products(products, multiplier)
     relative = products - expand(anchor, products)
-    if at_anchor is not None:
+    import os
+    if at_anchor is not None and not os.environ.get("DEW_LAB_NOANCHOR"):
         relative = jnp.where(at_anchor, 0.0, relative)
     centred = (relative - expand(delta, relative)) * expand(inverse_total, relative)
     return where_seen(seen, exponentials * centred, 0.0)
