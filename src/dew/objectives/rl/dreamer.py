@@ -49,7 +49,7 @@ from dew.rl.distributions import (
 )
 from dew.rl.env import Carry, Driven, Env, Observation, TimeStep, Transition, env_rollout, start
 from dew.rl.replay import ReplayBuffer
-from dew.rl.simulator import DrivenSimulator, Simulator, rollout_start, simulator_rollout, simulator_start
+from dew.rl.simulator import DrivenSimulator, Simulator, simulator_rollout, simulator_start
 
 if TYPE_CHECKING:
     from dew.state import TrainState
@@ -747,9 +747,12 @@ class DreamerRollout:
         act_key, sample_key = jax.random.split(key)
         variables = state.variables
         if self._carry is None:
-            simulated = isinstance(self.env, Simulator)
-            count = self.env.count if simulated else self.env.reset(act_key)[1].reward.shape[0]
-            self._carry = rollout_start(self._driven, act_key, self.objective.memory(count))
+            if isinstance(self.env, Simulator):
+                self._carry = simulator_start(self._driven, act_key, self.objective.memory(self.env.count))
+            else:
+                count = self.env.reset(act_key)[1].reward.shape[0]
+                self._carry = start(self._driven, act_key, self.objective.memory(count))
+            count = len(self._carry.observation["reward"])
             example = {**self._carry.observation, "action": jnp.zeros((count, self.env.action_size))}
             self._replay = ReplayBuffer.empty(example, self.capacity)
             self._returns = jnp.zeros(count)

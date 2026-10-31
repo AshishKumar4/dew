@@ -133,12 +133,44 @@ def transformer():
     return TSSM(action_size=1, stoch=4, classes=4, width=16, layers=1, heads=2, context=16)
 
 
-AGENTS = {"gru": (Target, lambda: tiny()), "transformer": (Target, lambda: tiny(dynamics=transformer())),
-          "transformer-pixels": (Seen, lambda: tiny(0, image=(16, 16, 1), conv_depth=2, reads="image",
-                                                    auxiliary=(("state", 1, 8),), dynamics=transformer()))}
-"""Each agent's environment and world model: the block GRU's and TransDreamer's dynamics over the walk's
-position, and TransDreamer's over the walk seen as pixels alone, its position predicted from the latent
-by an auxiliary head."""
+class HostTarget:
+    """`Target`'s walks, eight of them cut after 20 steps, simulated on the host in NumPy as a simulator
+    outside JAX simulates them, restarting the episodes it is told to (`dew.rl.simulator.Simulator`)."""
+
+    action_size, count = 1, 8
+
+    def reset(self, seed: int) -> np.ndarray:
+        self.rng = np.random.default_rng(seed)
+        self.x, self.steps = self.rng.uniform(-1, 1, self.count).astype(np.float32), np.zeros(self.count, int)
+        return self.x[:, None].copy()
+
+    def step(self, action) -> TimeStep:
+        self.x = (self.x + 0.5 * np.from_dlpack(action)[:, 0]).astype(np.float32)
+        self.steps += 1
+        terminated = np.abs(self.x) > 3
+        truncated = ~terminated & (self.steps >= 20)
+        return TimeStep(self.x[:, None].copy(), -np.square(self.x - 1), terminated, truncated)
+
+    def restart(self, mask) -> np.ndarray:
+        mask = np.asarray(mask)
+        self.x = np.where(mask, self.rng.uniform(-1, 1, self.count), self.x).astype(np.float32)
+        self.steps = np.where(mask, 0, self.steps)
+        return self.x[:, None].copy()
+
+
+def walks(walk):
+    """Eight of `walk`'s episodes cut after 20 steps, batched."""
+    return lambda: Batched(TimeLimit(walk(), episode_length=20), 8)
+
+
+AGENTS = {"gru": (walks(Target), lambda: tiny()), "gru-simulator": (HostTarget, lambda: tiny()),
+          "transformer": (walks(Target), lambda: tiny(dynamics=transformer())),
+          "transformer-pixels": (walks(Seen), lambda: tiny(0, image=(16, 16, 1), conv_depth=2,
+                                                           reads="image", auxiliary=(("state", 1, 8),),
+                                                           dynamics=transformer()))}
+"""Each agent's environments and world model: the block GRU's and TransDreamer's dynamics over the walk's
+position, the GRU's again over the walks simulated on the host, and TransDreamer's over the walk seen as
+pixels alone, its position predicted from the latent by an auxiliary head."""
 
 
 def test_imagination_is_the_world_models_prior_stepped_in_an_env_rollout():
@@ -175,15 +207,16 @@ def test_an_agent_learns_its_world_from_its_replay(agent):
     """A small DreamerV3 agent acting in batched target walks and trained from its replay at a fixed
     ratio, its actor and critic learning in imagination beside it, predicts the replay's observations
     and rewards better than it did at the start, on the same replayed windows: with the block GRU's
-    dynamics or TransDreamer's, over the walk's position or its pixels, the pixels' agent predicting the
+    dynamics or TransDreamer's, over the walk's position, the walks simulated on the host, or its
+    pixels, the pixels' agent predicting the
     privileged position it never reads better too. Its policy's return is the acceptance run's to judge,
     on a task at the steps the paper reports."""
     from dew.data.dataset import Loader
     from dew.objectives.base import Step
     from dew.training import Trainer
 
-    walk, model = AGENTS[agent]
-    env = Batched(TimeLimit(walk(), episode_length=20), 8)
+    environments, model = AGENTS[agent]
+    env = environments()
     objective = DreamerV3Objective(model())
     rollout = DreamerRollout(objective, env, capacity=400, batch=8, length=16, train_ratio=32.0, prefill=24)
     trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(7), rollout=rollout)
