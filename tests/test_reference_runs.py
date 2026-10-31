@@ -24,10 +24,8 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import NamedTuple
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
@@ -41,18 +39,6 @@ from dew.optim import Cosine, OptimConfig, ParamGroup
 from dew.training import MeshSpec, Trainer
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
-
-
-class NormState(NamedTuple):
-    norm: jax.Array
-
-
-def recorded_norm() -> optax.GradientTransformation:
-    """Pass the gradient on and keep its global norm, the value torch's
-    `clip_grad_norm_` returns, in the optimizer state."""
-    return optax.GradientTransformation(
-        lambda params: NormState(jnp.zeros((), jnp.float32)),
-        lambda updates, state, params=None: (updates, NormState(optax.tree.norm(updates))))
 
 
 def test_lm_fine_tune_steps_are_as_exact_as_torch():
@@ -69,15 +55,18 @@ def test_lm_fine_tune_steps_are_as_exact_as_torch():
     solver = OptimConfig(
         optimizer="adamw", b1=0.9, b2=0.95, optimizer_opts={"eps": 1e-8}, learning_rate=schedule,
         weight_decay=0.1, clip_grads=1.0, param_groups=(ParamGroup("all", ("*",)),)).build(steps)
-    trainer = Trainer(objective, optax.chain(recorded_norm(), solver), key=jax.random.key(0),
+    trainer = Trainer(objective, solver, key=jax.random.key(0),
                       mesh=MeshSpec(), checkpoints=None, tracker=None)
     state, _, _ = trainer.place()
     step = trainer.compile(state, {TEXT_KEY: tokens[0]})
     losses, norms = [], []
     for rows in tokens:
-        state, loss, _, _, _, _ = step(state, {TEXT_KEY: rows})
+        state, loss, _, _, _, committed = step(state, {TEXT_KEY: rows})
         losses.append(float(loss))
-        norms.append(float(state.opt_state[0].norm))
+        # The trainer's commit telemetry: the global norm of the gradient it handed the solver, the
+        # value torch's `clip_grad_norm_` returns.
+        assert int(committed.count) == 1
+        norms.append(float(committed.norm))
 
     np.testing.assert_allclose([schedule.schedule(steps)(index) for index in range(steps)],
                                fixture["lr"], rtol=1e-6)

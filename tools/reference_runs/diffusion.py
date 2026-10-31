@@ -18,9 +18,10 @@ flaxdiff run as an npz (`--init`) and read by Dew's as its `pretrained` tree.
 Each side's own trainer builds the step: flaxdiff's
 `GeneralDiffusionTrainer._define_train_step` over its data/fsdp mesh, Dew's
 `Trainer.compile` over `MeshSpec`. The optimizer is optax AdamW on the cosine
-schedule with global-norm clipping on both, behind `recorded_norm` so the
-gradient norm leaves the compiled step; the EMA runs on both, as both
-trainers keep one.
+schedule with global-norm clipping on both. Dew's gradient norm is its
+trainer's commit telemetry (`Committed.norm`); flaxdiff's, which reports
+none, a transformation chained in front of its solver keeps (`recorded_norm`).
+The EMA runs on both, as both trainers keep one.
 
     python tools/reference_runs/diffusion.py --framework flaxdiff \\
         --flaxdiff-path <dir holding flaxdiff/> --data flowers.npz --init init.npz \\
@@ -35,7 +36,7 @@ import json
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -54,7 +55,6 @@ from common import (
     window_rows,
     write_record,
 )
-from dew_lm import recorded_norm
 from flax.traverse_util import flatten_dict, unflatten_dict
 from reference_source import dew_revision
 
@@ -118,11 +118,30 @@ def save_tree(path: str | Path, tree) -> None:
     np.savez(path, **arrays)
 
 
+class NormState(NamedTuple):
+    norm: jax.Array
+
+
+def recorded_norm() -> optax.GradientTransformation:
+    """Pass the gradient through and keep its global norm in the state: flaxdiff's step reports no
+    gradient norm, so its run reads it here."""
+
+    def init(params):
+        del params
+        return NormState(jnp.zeros((), jnp.float32))
+
+    def update(updates, state, params=None):
+        del state, params
+        return updates, NormState(optax.tree.norm(updates).astype(jnp.float32))
+
+    return optax.GradientTransformation(init, update)
+
+
 def solver(args, total: int) -> tuple[optax.GradientTransformation, optax.Schedule]:
     schedule = optax.warmup_cosine_decay_schedule(
         init_value=args.lr_init, peak_value=args.lr_peak, warmup_steps=args.warmup,
         decay_steps=total, end_value=args.lr_end)
-    return optax.chain(recorded_norm(), optax.clip_by_global_norm(args.clip),
+    return optax.chain(optax.clip_by_global_norm(args.clip),
                        optax.adamw(schedule, b1=args.b1, b2=args.b2, eps=args.eps,
                                    weight_decay=args.weight_decay)), schedule
 
@@ -162,6 +181,7 @@ def flaxdiff_side(args, images, total, attention):
                            input_config=input_config, input_shapes=input_config.get_input_shapes(),
                            unconditional_prob=0.0, ema_decay=args.ema)
     optimizer, schedule = solver(args, total)
+    optimizer = optax.chain(recorded_norm(), optimizer)
     trainer = GeneralDiffusionTrainer(
         model, optimizer, input_config, jax.random.PRNGKey(0), noise_schedule=train_schedule,
         objective=objective, unconditional_prob=0.0, model_output_transform=transform,
@@ -182,7 +202,7 @@ def flaxdiff_side(args, images, total, attention):
     def run(state, batch):
         nonlocal rng_state
         state, loss, _, rng_state, _ = step_fn(state, rng_state, batch)
-        return state, loss
+        return state, loss, jnp.copy(state.opt_state[0].norm)
 
     def place(batch):
         from flaxdiff.utils import shard_batch
@@ -267,8 +287,9 @@ def dew_side(args, images, total, attention):
     def run(state, batch):
         if not compiled:
             compiled["step"] = trainer.compile(state, batch)
-        state, loss, _, _, _, _ = compiled["step"](state, batch)
-        return state, loss
+        state, loss, _, _, _, committed = compiled["step"](state, batch)
+        # The norm of the update it committed, none (NaN) where it committed none.
+        return state, loss, committed.norm / committed.count
 
     return state, run, place, schedule, dict(trainer.device_mesh.shape), trainer, work
 
@@ -302,12 +323,12 @@ def main() -> None:
     compile_start = time.perf_counter()
     for step in range(total):
         window.before(step, loss)
-        state, loss = run(state, batch(step))
+        state, loss, norm = run(state, batch(step))
         if step == 0:
             jax.block_until_ready(loss)
             first_step_seconds = time.perf_counter() - compile_start
         losses.append(loss)
-        norms.append(jnp.copy(state.opt_state[0].norm))
+        norms.append(norm)
     window_seconds = window.close(loss)
 
     device_kind = jax.devices()[0].device_kind
@@ -326,7 +347,8 @@ def main() -> None:
                    "schedule_steps": schedule_steps, "data_sha256": sha256(args.data),
                    "init_sha256": sha256(args.init), "mesh": mesh_shape,
                    "convention": "EDM (P_mean -0.4, P_std 1, sigma_data 0.5), l2 loss, EDM weight",
-                   "optimizer": "optax.chain(recorded_norm, clip_by_global_norm, adamw)"},
+                   "optimizer": "optax.chain(clip_by_global_norm, adamw), the gradient norm Dew's commit "
+                                "telemetry or, for flaxdiff, recorded_norm chained before it"},
         "versions": built_from,
         "device": device_kind,
         "host": host(),
