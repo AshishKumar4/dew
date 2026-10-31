@@ -245,13 +245,14 @@ class TokenFiles(Dataset):
     def _read_alike(self) -> bool:
         """Whether a Dew before row 3028, which read a token store's documents by its EOS, read this store's
         as its producer's records: stating no EOS, one record holding every token; stating one, each record
-        ended by that EOS and holding no other (`_earlier_ends`), a scan of every token, kept in Dew's cache
-        under the export's content (`export_content`), which no write changes. Carried to 1.0 (ledger
-        1552)."""
+        ended by that EOS and holding no other (`_earlier_ends`), a scan of every token of the field read,
+        kept in Dew's cache under the export's content (`export_content`), which no write changes, and that
+        field. Carried to 1.0 (ledger 1552)."""
         tokens, ends = self.tokens, self.document_ends()
         if tokens.eos_id is None:
             return np.array_equal(ends, [len(tokens)] if len(tokens) else [])
-        content = json.dumps(json_value(export_content(self.committed), "token export"), sort_keys=True)
+        read = {"export": export_content(self.committed), "field": tokens.field}
+        content = json.dumps(json_value(read, "token export's field"), sort_keys=True)
         named = hashlib.sha256(content.encode()).hexdigest()
         kept = Path(dew_cache_dir()) / "token-documents" / f"{named}.json"
         if kept.exists():

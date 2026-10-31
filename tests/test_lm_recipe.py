@@ -907,6 +907,22 @@ def test_a_plan_an_earlier_dew_saved_over_a_token_store_resumes_where_it_read_th
             plan.check(saved)
 
 
+def test_whether_an_earlier_dew_read_a_token_stores_documents_alike_is_each_fields_own(tmp_path):
+    """An export holding two token fields is read alike by a Dew before row 3028 in one and not the other:
+    each field's records closed by the EOS alone, or not. Each field's store says so, whichever is read
+    first, so neither takes the other's answer from Dew's cache."""
+    from dew.data import Memory
+    from dew.data.sinks import export
+
+    url = str(tmp_path / "tokens")
+    stated = {"token_store": True, "tokenizer": "byte", "vocab_size": 256, "dtype": "int32", "eos_id": 0}
+    rows = [{"text": np.asarray([1, 0], np.int32), "ids": np.asarray([0, 1], np.int32)},
+            {"text": np.asarray([2, 0], np.int32), "ids": np.asarray([0, 2], np.int32)}]
+    export(Memory(rows), url, format="array_record", length_field="text", metadata=stated)
+    assert "documents" not in TokenFiles(url).fingerprint()
+    assert TokenFiles(url, field="ids").fingerprint()["documents"] == "records"
+
+
 @pytest.mark.parametrize("eos", [None, 0], ids=["no-eos", "eos"])
 def test_a_token_stores_documents_are_the_records_its_producer_wrote(tmp_path, eos):
     """A token export's documents are the records its producer wrote, each where its length index ends it

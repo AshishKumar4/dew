@@ -415,11 +415,14 @@ def earlier_lengths(previous: Mapping[str, object], saved: Sequence[object], cur
 
 def _unstated_lengths(source: Mapping[str, object]) -> bool:
     """Whether a Dew before row 3028 stated no lengths for the source fingerprinted `source`: a token store
-    stating no EOS, which it read as one stream, or a concatenation holding one, whose lengths are its
-    parts' together."""
+    stating no EOS, which it read as one stream, a concatenation holding one, whose lengths are its parts'
+    together, or a slice of records of either, whose lengths are its source's sliced."""
     if source.get("store") == "tokens":
         stated = source.get("metadata")
         return isinstance(stated, Mapping) and stated.get("eos_id") is None
+    sliced = source.get("of")
+    if source.get("selection") == "slice" and isinstance(sliced, Mapping):
+        return _unstated_lengths(sliced)
     parts = source.get("concatenate")
     return isinstance(parts, list) and any(isinstance(part, Mapping) and _unstated_lengths(part)
                                            for part in parts)
