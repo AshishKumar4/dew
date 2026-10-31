@@ -774,7 +774,7 @@ class FitSearch[LossT, EffectsT]:
             # the need the compile found, which a sourced rule is to reach.
             footprint = candidate.footprint
             _log.warning("a model miss: the derivation judged %s %s with %d bytes to spare%s, and its "
-                         "compile %s with %s, its temporaries %d bytes against a derived peak of %s "
+                         "compile %s with %s, its temporaries %s bytes against a derived peak of %s "
                          "(derived terms %s); the compile decides, and the derivation is to fix",
                          probe.named(), "fits" if judged >= 0 else "does not fit", judged,
                          "" if footprint is None or footprint.exact else " (its peak a bound from below)",
