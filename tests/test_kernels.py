@@ -868,11 +868,13 @@ def test_cpu_fp32_attention_summed_in_float64_takes_forward_mode():
         assert_as_exact_as_the_reference(np.asarray(got), np.asarray(want), np.asarray(exact), name)
 
 
-@pytest.mark.parametrize(("dtype", "key_dtype"), [(jnp.float16, jnp.float16), (jnp.float32, jnp.float64)],
-                         ids=["float16", "float32-over-float64"])
+@pytest.mark.parametrize(("dtype", "key_dtype"), [(jnp.float16, jnp.float16), (jnp.float32, jnp.float64),
+                                                   (jnp.float64, jnp.float64)],
+                         ids=["float16", "float32-over-float64", "float64"])
 def test_a_call_jax_nn_cannot_take_on_a_cpu_runs_the_reference_path(dtype, key_dtype):
     """A call named onto jax.nn's xla kernel that it cannot take on a CPU, a float16 one (XLA's CPU compiler
-    has no F16_F16_F32 dot) or a float32 query over float64 keys (jax.nn takes one dtype), hands off
+    has no F16_F16_F32 dot), a float32 query over float64 keys (jax.nn takes one dtype) or a float64 one
+    (jax.nn takes its softmax in float32, a float64 run's attention in float32 precision), hands off
     (`attention_kernels.XLA_SUPPORTS`): it compiles and runs, its output the reference path's bit for
     bit."""
     with jax.enable_x64(new_val=True):

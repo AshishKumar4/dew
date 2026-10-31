@@ -404,6 +404,10 @@ XLA_SUPPORTS = (
           lambda case: f"jax.nn's attention takes a query of its keys' dtype, not {case.dtype} over "
                        f"{case.key_dtype} (`dot_product_attention`'s `_check_shape_and_dtype`)",
           row=INHERENT, kind='handoff'),
+    _Need('float64', lambda case: case.dtype != np.float64,
+          "jax.nn's attention takes its softmax in float32 whatever its operands' dtype "
+          "(`_dot_product_attention_core`'s `astype(np.float32)`), which a float64 call does not keep",
+          row=INHERENT, kind='handoff'),
     _Need('cpu_float16', lambda case: not (case.dtype == np.float16 and generation.backend() == 'cpu'),
           "XLA's CPU compiler has no float16 dot into float32 (F16_F16_F32), the algorithm jax.nn's "
           "attention names for a float16 query (`_dot_product_attention_core`), past its trace-time fallback",
