@@ -1289,10 +1289,12 @@ def _states_held(call: _Call, values: _Operand, keys: _Operand, bv: int) -> _Hel
     carried = [_f32(call.width, bv)] + [_f32(CHUNK, 1)] * 5
     if call.gated_keys:
         # The write's gate on the keys' rows (`algebra.keys_gated_carried`): a key block in fp32 and narrowed
-        # for its product, beside the values' block as they are.
+        # for its product, beside the values' block as they are, and the product's own fp32 sum `[K_i, BV]`
+        # before it joins the decayed memory slice: without it the model held a 128-wide value block that
+        # spilled 520 bytes on an H100 (the resource gate's Nemotron-H 4B SSD forward alone).
         return _Held(carried=carried, phases=([
-            _f32(CHUNK, call.block), *_held(held, CHUNK, call.block), *_held(values, CHUNK, bv),
-            *_fragments(call, (held, CHUNK, call.block), (values, CHUNK, bv))],))
+            _f32(CHUNK, call.block), _f32(call.block, bv), *_held(held, CHUNK, call.block),
+            *_held(values, CHUNK, bv), *_fragments(call, (held, CHUNK, call.block), (values, CHUNK, bv))],))
     return _Held(carried=carried, phases=(
         [_f32(CHUNK, bv)] * 2 + _held(values, CHUNK, bv) + _held(held, call.block, bv)
         + _fragments(call, (held, CHUNK, call.block), (keys, CHUNK, call.block)),))
@@ -1305,7 +1307,8 @@ def _states(k, w, u, hi, lo, beta, h0, sequences, taken, call: _Call, tiles: Til
     in order over a value block (`algebra.corrected`, `carried`). Under the delta rule `u` is the weighted
     values and `w` the weighted keys (`_weighted`); without it (`w` None) `u` is the values, each chunk's
     write gated by `beta` (`algebra.weighted`'s identity inverse; on the keys' rows where `_Call.gated_keys`,
-    `algebra.keys_gated_carried`, the values themselves its corrected values) and nothing corrected. A decay a
+    `algebra.keys_gated_carried`, the values themselves its corrected values, `u` returned for them, no copy
+    stored) and nothing corrected. A decay a
     head gates each chunk's write to its end (`algebra.scalar_write`); under one a key dimension `k` is the
     keys decayed so (`_weighted`'s third) and the memory's rows take their own decays. `sequences` `[N, 5]` is
     each sequence's first chunk, its chunks, its row and whether it begins and ends its row; `h0` `[B * HV *
@@ -1322,8 +1325,12 @@ def _states(k, w, u, hi, lo, beta, h0, sequences, taken, call: _Call, tiles: Til
     # The keys the memory takes: a key head's, or a value head's decayed to their chunk's end.
     keys, keyed = (held, 1) if call.per_key else (call.given, call.group)
 
-    def program(k_ref, w_ref, u_ref, hi_ref, lo_ref, beta_ref, h0_ref, seq_ref, taken_ref, h_ref,
-                corrected_ref, final_ref, *, streams, staging, landing):
+    # Where the keys take the write gate, the corrected values are the values as given: none stored.
+    stores_corrected = not call.gated_keys
+
+    def program(k_ref, w_ref, u_ref, hi_ref, lo_ref, beta_ref, h0_ref, seq_ref, taken_ref, h_ref, *outputs,
+                streams, staging, landing):
+        corrected_ref, final_ref = outputs if stores_corrected else (None, *outputs)
         j, s, h = lax.axis_index("blocks"), lax.axis_index("sequences"), lax.axis_index("heads")
         first, count, row, begins, ends = (seq_ref[s, i] for i in range(5))
         roled = _roled(staging, landing, walkers)
@@ -1343,8 +1350,8 @@ def _states(k, w, u, hi, lo, beta, h0, sequences, taken, call: _Call, tiles: Til
         entering = family.opened(streams["once"], initial_views)
 
         prefetch = functools.partial(_prefetched, family, (hi_ref, lo_ref), None if delta else beta_ref, h)
-        # Each key slice of the memory and the corrected values, a store each in flight.
-        before_store = _walk_stores(family, width // call.block + 1)
+        # Each key slice of the memory and, where stored, the corrected values, a store each in flight.
+        before_store = _walk_stores(family, width // call.block + int(stores_corrected))
 
         def step(role):
             (staged, scratch), lands = roled(role)
@@ -1358,6 +1365,10 @@ def _states(k, w, u, hi, lo, beta, h0, sequences, taken, call: _Call, tiles: Til
                 before_store()
                 memories.store(h_ref, part, memory(n, i), call.block, column, bv, family=family,
                                smem=lands[f"memory{i}"], wait=False)
+            if call.gated_keys:
+                # The values as they are the write's operand and their own corrected values: none formed.
+                state = _keys_gated_write(call, slots, keys, values, loaded, state, issue, role, bv)
+                return state, accumulators
             tile = _tile(slots, "values", values, columns=pl.ds(role * bv, bv)).value()
             if delta:
                 def weights(i):
@@ -1366,14 +1377,11 @@ def _states(k, w, u, hi, lo, beta, h0, sequences, taken, call: _Call, tiles: Til
                 corrected = algebra.corrected(tile, weights, state, held.dtype, issue)
             else:
                 betas = family.rows_of(beta_ref.at[h, span]) if loaded is None else loaded[2]
-                written = tile if call.gated_keys else algebra.weighted("apply_u", None, tile, betas, issue)
+                written = algebra.weighted("apply_u", None, tile, betas, issue)
                 corrected = algebra.corrected(written, None, state, held.dtype, issue)
             before_store()
             held.store(corrected_ref, corrected, n * CHUNK, CHUNK, h * value_width + column, bv,
                        family=family, smem=lands["corrected"], wait=False)
-            if call.gated_keys:
-                state = _keys_gated_write(call, slots, keys, values, loaded, state, issue, role, bv)
-                return state, accumulators
             gated, decay = _gated_write(call, corrected, loaded, (hi_ref, lo_ref), last, h)
             # An fp32 call's last real token's write outside the product; a 16-bit call's is fla's product.
             separate = (_last_write(call, keys, k_ref, n * CHUNK, taken_ref[n] - 1, h // keyed * width,
@@ -1390,29 +1398,48 @@ def _states(k, w, u, hi, lo, beta, h0, sequences, taken, call: _Call, tiles: Til
                        prefetch=None if call.per_key else prefetch,
                        landing=lambda role: roled(role)[1].get("final"), walkers=walkers)
 
-    out_type = (memories.shape(value_width), held.shape(call.heads * value_width),
+    out_type, blocks, initials, work = _states_launch(call, tiles, delta, keys, values, batch,
+                                                      sequences.shape[0], stores_corrected)
+    final_landing, after = _final_landing(call, bv)
+    launched = _kernel(program, call, out_type=out_type,
+                     grid=(value_width // walked_width, sequences.shape[0], call.heads),
+                     grid_names=("blocks", "sequences", "heads"), blocks=blocks, stages=tiles.stages,
+                     live=lambda refs: refs[7][lax.axis_index("sequences"), 1] > 0, work=work,
+                     consumers=walkers,
+                     held=_states_held(call, values, keys, bv),
+                     staging=(*_staging(held, (CHUNK, call.block) if call.gated_keys else (call.block, bv)),
+                              _column_scratch(call)), once=initials,
+                     landing={**_memory_landing(call, bv),
+                              **({"corrected": held.landing(CHUNK, bv)} if stores_corrected else {}),
+                              **final_landing},
+                     after=after,
+                     # Its last write's column sums an fp32 call's alone (`_columns`).
+                     reduces=held.parts > 1)(
+        k, k if w is None else w, u, hi, lo, beta, h0, sequences, taken)
+    if stores_corrected:
+        return launched
+    assert jnp.dtype(u.dtype) == held.dtype, "the values as given are held so (`_Call.gated_keys`)"
+    h, final = launched
+    return h, u, final
+
+
+def _states_launch(call: _Call, tiles: Tiles, delta: bool, keys: _Operand, values: _Operand, batch: int,
+                   sequences: int, stores_corrected: bool) -> tuple:
+    """`_states`' outputs (the memories, the corrected values where it stores them, the final memories),
+    its streamed blocks and its initial memories' at `tiles`, and its `Work` over `sequences`."""
+    width, value_width, walked_width = call.width, call.value_width, tiles.block_v * tiles.walkers
+    held, initial = dataclasses.replace(call.held, rows=call.rows), _Operand(batch * call.heads * width, 1,
+                                                                            jnp.dtype(jnp.float32))
+    out_type = (call.memories.shape(value_width),
+                *((held.shape(call.heads * value_width),) if stores_corrected else ()),
                 jax.ShapeDtypeStruct((batch * call.heads * width, value_width), jnp.float32))
     blocks = _streamed(**({"w": ((CHUNK, width), held)} if delta else {}), keys=((CHUNK, width), keys),
                        values=((CHUNK, walked_width), values))
-    initials = _streamed(**{f"initial{i}": ((call.block, walked_width), initial) for i in range(slices)})
+    initials = _streamed(**{f"initial{i}": ((call.block, walked_width), initial)
+                            for i in range(width // call.block)})
     # A sequence's chunks, the mean over the laid sequences; two products a chunk.
-    steps = call.chunks / sequences.shape[0]
-    work = Work(4 * CHUNK * width * walked_width * steps, steps)
-    final_landing, after = _final_landing(call, bv)
-    return _kernel(program, call, out_type=out_type,
-                   grid=(value_width // walked_width, sequences.shape[0], call.heads),
-                   grid_names=("blocks", "sequences", "heads"), blocks=blocks, stages=tiles.stages,
-                   live=lambda refs: refs[7][lax.axis_index("sequences"), 1] > 0, work=work,
-                   consumers=walkers,
-                   held=_states_held(call, values, keys, bv),
-                   staging=(*_staging(held, (CHUNK, call.block) if call.gated_keys else (call.block, bv)),
-                            _column_scratch(call)), once=initials,
-                   landing={**_memory_landing(call, bv), "corrected": held.landing(CHUNK, bv),
-                            **final_landing},
-                   after=after,
-                   # Its last write's column sums an fp32 call's alone (`_columns`).
-                   reduces=held.parts > 1)(
-        k, k if w is None else w, u, hi, lo, beta, h0, sequences, taken)
+    steps = call.chunks / sequences
+    return out_type, blocks, initials, Work(4 * CHUNK * width * walked_width * steps, steps)
 
 
 def _output_streams(call: _Call, bv: int) -> tuple[dict, tuple]:
@@ -1751,15 +1778,15 @@ def _prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles
     rows = chunks * CHUNK
     given = _Operand(rows, _parts(dtype), dtype)
     # What the launches pass between them: the delta rule's in the operands' dtype, as fla's rounds it (the
-    # port is its reference). Without it, a `rounded` call's (the SSD's) under the run's fast forms
-    # (`generation.numerics`) in the operands' dtype too, as mamba_ssm rounds its scores and entered memories
-    # for its products (`_chunk_scan_fwd`'s `cb` and `prev_states`), its memory summed and passed in fp32: on
-    # an H100 Nemotron-H 4B's SSD forward took 0.581 ms against fp32's three parts' 2.031 and the port's
-    # 0.606, 30B's 0.249 against 0.593 and 0.229 (ssd-held-h100-fdab2424c). Else, and under the accurate
-    # forms, fp32's three parts, as the portable math holds them (a 16-bit call's rounded put the output 1.7
-    # times and the final memory up to 540 times the portable math's distance from float64).
-    fast = rounded and generation.numerics().forms == "fast"
-    held = given if delta or fast else _Operand(rows, PARTS, jnp.dtype(jnp.float32))
+    # port is its reference). Without it, a `rounded` call's (the SSD's under the run's fast forms, which its
+    # route resolves, `recurrence_chunk.mamba_rounding`) in the operands' dtype too, as mamba_ssm rounds its
+    # scores and entered memories for its products (`_chunk_scan_fwd`'s `cb` and `prev_states`), its memory
+    # summed and passed in fp32: on an H100 Nemotron-H 4B's SSD forward took 0.581 ms against fp32's three
+    # parts' 2.031 and the port's 0.606, 30B's 0.249 against 0.593 and 0.229 (ssd-held-h100-fdab2424c). Else,
+    # and under the accurate forms, fp32's three parts, as the portable math holds them (a 16-bit call's
+    # rounded put the output 1.7 times and the final memory up to 540 times the portable math's distance from
+    # float64).
+    held = given if delta or rounded else _Operand(rows, PARTS, jnp.dtype(jnp.float32))
     call = _Call(heads, heads // k.shape[2], width, columns, rows, given, held, per_key, delta, family,
                  interpret, generation.gpu_target())
     hi, lo = prefix(laid(g).reshape(chunks, CHUNK, -1))

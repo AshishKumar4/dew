@@ -266,11 +266,11 @@ def test_the_scheduler_steps_as_the_source_on_the_same_model_outputs(pipeline, w
     from diffusion_support import walk as step_by_step
 
     _, _, arrays = walk
-    process, times = pipeline.task.grid(steps)
+    process, times = pipeline.grid(steps)
     timesteps = arrays[f"replay.{steps}.fp32.timesteps"]
     np.testing.assert_array_equal(np.asarray(process.sampler_schedule.model_time(times[:-1])), timesteps)
     model = Replay(tuple(int(time) for time in timesteps), jnp.asarray(arrays[f"replay.{steps}.outputs"]))
-    latents = step_by_step(pipeline.schedule.solver, process, model,
+    latents = step_by_step(pipeline.solver, process, model,
                            jnp.asarray(arrays[f"replay.{steps}.x_T"]), times)
     assert_as_exact_as_the_reference(np.asarray(latents), arrays[f"replay.{steps}.fp32.latents"],
                                      arrays[f"replay.{steps}.fp64.latents"], f"{steps}-step replay")

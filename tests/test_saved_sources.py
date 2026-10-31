@@ -3,10 +3,12 @@ release `dew export` writes of the run's checkpoint (`dew.interop.saved_sources`
 own sampling task, at the step its selection pins, which its record names."""
 
 import dataclasses
+from pathlib import Path
 
 import jax
 import numpy as np
 import pytest
+from process_support import run_pool
 from run_kinds import decision, diffusion, trained
 
 from dew.batch import FROZEN
@@ -42,9 +44,7 @@ def test_a_decision_run_starts_from_a_saved_decision_run_as_from_its_export(tmp_
 
     from_run = started(source, "from_run", "--source.step", "latest")
     from_export = started(exported, "from_export")
-    for leaf, alike in zip(jax.tree.leaves(jax.device_get(from_run.variables)),
-                           jax.tree.leaves(jax.device_get(from_export.variables)), strict=True):
-        np.testing.assert_array_equal(np.asarray(leaf), np.asarray(alike), strict=True)
+    leaves_alike(from_run.variables, from_export.variables)
     recorded = DecisionRunConfig.load(str(tmp_path / "runs" / "from_run"))
     assert recorded.pretrained == str(source)
     assert recorded.source.step == SavedRun.pinned(str(source)).step
@@ -109,3 +109,29 @@ def test_a_diffusion_run_starts_from_a_saved_diffusion_run_as_from_its_task(tmp_
         load_diffusion_source(str(source), dtype="float32", size=(8, 8))
     with pytest.raises(ValueError):
         released_run(source)
+
+
+WORKER = Path(__file__).with_name("saved_export_worker.py")
+
+
+@pytest.mark.distributed
+@pytest.mark.mesh
+def test_a_pool_exports_a_model_spanning_its_processes_a_shard_at_a_time(tmp_path):
+    """Two real processes export a decoder whose kernels span both, every layer's attention extended by
+    DEX, as a saved run's release (`export_run`, ledger 2874), in a score of shards, each output
+    projection folded as it is written: each reads one tensor home at a time, together, so neither host's
+    allocations during the export peak at half the model, where the pool read the whole tree home
+    first. The publishing process writes the tensors one process writes of the same weights unplaced,
+    byte for byte, though the restored tree's key order may place one in another shard; the other
+    writes the release's small files alone, no weights. Outside the export's scope the write is
+    refused rather than left waiting on the other process."""
+    publisher, reader = run_pool("exported", tmp_path / "pool", processes=2, script=WORKER, devices=2,
+                                 fsdp_size=4, run_dir=str(tmp_path))
+    for report in (publisher, reader):
+        assert report["processes"] == 2 and report["spanning"] > 0
+        assert report["refused_outside"]
+        assert report["largest_leaf"] <= report["peak"] < report["whole"] / 2
+    assert publisher["differing"] == {} and len(publisher["release"]) > 10
+    assert publisher["alone"] == reader["alone"]
+    assert reader["release"] == {} and reader["small_files"] == publisher["small_files"]
+

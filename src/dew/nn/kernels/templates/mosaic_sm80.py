@@ -11,6 +11,7 @@ from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
+from jax._src.pallas.mosaic_gpu import core as plgpu_core
 from jax._src.state import types as state_types
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
@@ -20,9 +21,10 @@ from dew.nn.kernels.templates import mosaic, report, resources
 
 def _staging(block: tuple, swizzle: int | None) -> tuple:
     """A stream's tile's transforms: a tile's swizzled (its own, `swizzle` where a stream names one); a side
-    vector's none, in whole 16-byte cp.async chunks."""
+    vector's none, in whole 16-byte cp.async chunks, and a tile's none where it is read a row at a time
+    (`mosaic.UNSWIZZLED`)."""
     shape, dtype = block
-    if len(shape) == 1:
+    if len(shape) == 1 or swizzle == mosaic.UNSWIZZLED:
         return ()
     return swizzled(shape, dtype) if swizzle is None else mosaic.swizzle_transforms(dtype, swizzle)
 
@@ -31,6 +33,19 @@ def swizzled(shape: tuple[int, ...], dtype) -> tuple:
     """A `[rows, columns]` shared-memory tile's transforms: 8-row tiles as wide as the swizzle its row
     bytes allow, swizzled (bank-conflict-free ldmatrix), as jax's Ampere examples stage their operands."""
     return mosaic.swizzle_transforms(dtype, plgpu.find_swizzle(shape[-1] * jnp.dtype(dtype).itemsize * 8))
+
+
+def _depth_granule(ref, axis: int, instruction: int) -> int:
+    """The depth slice a ref's staging allows: one MMA, or a whole swizzle along its tiled columns."""
+    if not isinstance(ref, state_types.TransformedRef):
+        return instruction
+    transposed = sum(isinstance(transform, state_types.TransposeTransform)
+                     and transform.permutation == (1, 0) for transform in ref.transforms) % 2
+    if axis != (0 if transposed else 1):
+        return instruction
+    swizzle = max((transform.swizzle for transform in ref.transforms
+                   if isinstance(transform, plgpu_core.UnswizzleRef)), default=0)
+    return max(instruction, swizzle // jnp.dtype(ref.dtype).itemsize)
 
 
 class Slots:
@@ -94,6 +109,10 @@ class Mma(mosaic.Family):
     bounded_loads = False
     role_rows = 4 * 16
     operands_in_registers = True
+    # A step loading ahead of the one consumed leaves cp.async's latency unhidden: two steps 64 deep stalled
+    # on barriers 1.1-1.5 an issue against XLA's 0.3-0.7 (FS-NCU-DW2-a100), and 32-deep steps three
+    # deep took dense products 4-8% less time than 64 deep two (FS-DENSE-STEPS1-a100).
+    loads_ahead = 2
     products_overlap = False
     stores_through_registers = True
 
@@ -132,9 +151,23 @@ class Mma(mosaic.Family):
         # 8-row tiles allow (a swizzled row takes no slice narrower than its tile).
         return min(depth, 8 * max(32 // (jnp.dtype(self.dtype).itemsize * 8), 1))
 
-    def rhs_fragment_depth(self, depth: int, *, transposed: bool = False) -> int:
-        # A transposed shared view cannot take the narrow row slices used by the ordinary RHS.
-        return depth if transposed else self.fragment_depth(depth)
+    def rhs_fragment_depth(self, depth: int, *, transposed: bool = False, swizzle: int | None = None) -> int:
+        # A transposed stage's rows are its depth: a load takes a whole swizzle tile of it (`products`), one
+        # instruction's at the narrowest swizzle (a stream staged so by `streams`' `swizzles`: D64's K in
+        # QKᵀ at the widest held its whole 64 x 192 stage, 162 registers, ET's census80). An ordinary one
+        # slices its rows' 8-row tiles.
+        return self._staged_depth(depth, swizzle) if transposed else self.fragment_depth(depth)
+
+    def lhs_fragment_depth(self, depth: int) -> int:
+        return self._staged_depth(depth)
+
+    def _staged_depth(self, depth: int, swizzle: int | None = None) -> int:
+        """The depth a load of a stage whose rows are `depth` deep takes: one tile of its `swizzle` (bytes;
+        the widest its row bytes allow where None, `swizzled`, `_depth_granule`), the whole depth where it
+        is narrower."""
+        itemsize = jnp.dtype(self.dtype).itemsize
+        swizzle = plgpu.find_swizzle(depth * itemsize * 8) if swizzle is None else swizzle
+        return max(self.fragment_depth(depth), min(depth, swizzle // itemsize))
     most_shared = 163 * 1024  # sm80's and sm87's opt-in block (sm86's and sm89's 99 KiB)
     copies_vectors = False  # cp.async spreads a copy over the warpgroup's threads, 128 elements at least
     reduction_scratch = plgpu.CompilerParams().reduction_scratch_bytes  # its kernels' default parameters
@@ -202,7 +235,7 @@ class Mma(mosaic.Family):
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
                interpret: bool, approx_math: bool = True, name: str | None = None,
                cluster: int = 1, cost: pl.CostEstimate | None = None,
-               reducing_warpgroups: int = 0, kernel_name: str | None = None) -> Callable:
+               reducing_warpgroups: int = 0) -> Callable:
         # Its one warpgroup is its consumer, no producer beside it, and no cluster; its kernels' default
         # parameters reserve the scratch an implicit reduction takes (`reduction_scratch`).
         del reducing_warpgroups
@@ -210,8 +243,7 @@ class Mma(mosaic.Family):
         built = plgpu.kernel(entry, out_type=out_type, grid=grid, grid_names=grid_names,
                              compiler_params=plgpu.CompilerParams(approx_math=approx_math),
                              interpret=mosaic.interpreted(interpret),
-                             kernel_name=report.named(name) if kernel_name is None else kernel_name,
-                             cost_estimate=cost)
+                             kernel_name=report.named(name), cost_estimate=cost)
         return mosaic.checked(built, name or self.name)
 
     def scoped(self, body, *allocations, streams):
@@ -382,22 +414,27 @@ class Mma(mosaic.Family):
         if interpret:
             # mma has no rule on a CPU: its sum, in fp32.
             return acc + jnp.dot(lhs[...], rhs[...], preferred_element_type=jnp.float32)
-        # The left operand a step deep, sliced in registers along the depth at its layout's tiles; the
-        # right one a sub-step at a time from the stage (`fragment_depth`), along its rows' 8-row tiles,
-        # or, a transposed view (whose rows are a swizzled tile's columns, no narrower slice of which
-        # lowers), a step deep and sliced in registers too.
-        left, depth = self._left(lhs), self.fragment_depth(rhs.shape[0])
-        if depth == rhs.shape[0]:
-            return plgpu.mma(acc, left, plgpu.load(rhs, layout=self.rhs), m_warps=self.m_warps)
-        transposed = isinstance(rhs, state_types.TransformedRef) and any(
-            isinstance(transform, state_types.TransposeTransform) for transform in rhs.transforms)
-        right = (plgpu.load(rhs, layout=self.rhs)
-                 if self.rhs_fragment_depth(int(rhs.shape[0]), transposed=transposed) == rhs.shape[0]
-                 else None)
-        for start in range(0, rhs.shape[0], depth):
-            part = (right[start:start + depth] if right is not None
-                    else plgpu.load(rhs.at[pl.ds(start, depth)], layout=self.rhs))
-            acc = plgpu.mma(acc, left[:, start:start + depth], part, m_warps=self.m_warps)
+        # The left operand loads a whole swizzle tile of its depth at a time (`lhs_fragment_depth`), as a
+        # transposed left operand loaded in instruction slices took the A100's kernel gradient 7% slower
+        # (FS-DENSE-AB1); the right loads only the fragments the next instructions consume, as narrow as
+        # its staging allows (`_depth_granule`), which took its input gradient 12% faster. A register operand
+        # (an accumulator's value) is cast once and sliced.
+        instruction = self.fragment_depth(int(rhs.shape[0]))
+        lhs_depth = max(_depth_granule(lhs, 1, instruction), self.lhs_fragment_depth(int(lhs.shape[1])))
+        rhs_depth = _depth_granule(rhs, 0, instruction)
+        held = self._left(lhs) if isinstance(lhs, jax.Array) else None
+        lefts: dict[int, jax.Array] = {}
+        rights: dict[int, jax.Array] = {}
+        for start in range(0, rhs.shape[0], instruction):
+            left_at, right_at = start - start % lhs_depth, start - start % rhs_depth
+            if held is None and left_at not in lefts:
+                lefts[left_at] = self._left(lhs.at[:, pl.ds(left_at, lhs_depth)])
+            if right_at not in rights:
+                rights[right_at] = plgpu.load(rhs.at[pl.ds(right_at, rhs_depth)], layout=self.rhs)
+            left = held[:, start:start + instruction] if held is not None else lefts[left_at][
+                :, start - left_at:start - left_at + instruction]
+            right = rights[right_at][start - right_at:start - right_at + instruction]
+            acc = plgpu.mma(acc, left, right, m_warps=self.m_warps)
         return acc
 
     def registers_product(self, lhs: jax.Array, rhs, interpret: bool) -> jax.Array:
