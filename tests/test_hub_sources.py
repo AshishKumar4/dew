@@ -735,28 +735,51 @@ def test_a_split_pinned_to_its_parquet_conversion_reads_its_configurations_direc
     ("hf://datasets/owner/carded/cola/train-*", "cola/train-00000-of-00001.parquet"),
     ("hf://datasets/owner/carded@original/cola/train-*", "cola/train-00000-of-00001.parquet"),
     ("hf://datasets/someone/else/train-*", None),
-], ids=["its-repository", "its-commit", "elsewhere"])
+    ("{local}/train.parquet", None),
+], ids=["its-repository", "its-commit", "another-repository", "a-local-path"])
 def test_a_cards_pattern_naming_its_repository_by_url_reads_the_commits_listing(tmp_path, monkeypatch,
                                                                                 pattern, expected):
     """A configuration whose card names its files by a URL of the repository, at its commit or none,
     reads them from the commit's listing, with no file system the listing is not; one naming files of
-    another repository holds none of this commit's, so the split streams none of its files."""
+    another repository, or an absolute path, holds none of this commit's, so the split streams none of
+    its files, a local file of that path among them."""
+    from fsspec.implementations.local import LocalFileSystem
     from huggingface_hub import HfFileSystem
 
     from dew.data.sources import Hub
 
     def walked(*args, **options):
-        raise AssertionError("the Hub's file system walked")
+        raise AssertionError("a file system beside the listing's walked")
 
+    (tmp_path / "local").mkdir()
+    (tmp_path / "local" / "train.parquet").write_bytes(b"")
+    pattern = pattern.format(local=tmp_path / "local")
     card = f"---\nconfigs:\n- config_name: cola\n  data_files:\n  - split: train\n    path: {pattern}\n---\n"
     carded_hub(monkeypatch, tmp_path, card, {
         "original": ["README.md", "cola/train-00000-of-00001.parquet", "mnli/train-00000-of-00001.parquet"],
         "converted": []})
     monkeypatch.setattr(HfFileSystem, "glob", walked)
+    monkeypatch.setattr(LocalFileSystem, "glob", walked)
     source = Hub("owner/carded", name="cola")
     if expected is None:
         with pytest.raises(FileNotFoundError):
             _ = source.files
         return
     assert source.files.url == (f"hf://datasets/owner/carded@original/{expected}",)
+
+
+@pytest.mark.parametrize("listing", [
+    ["default/train/0000.parquet", "extra/train/0000.parquet"],
+    ["part1/train/0000.parquet", "part2/train/0000.parquet"],
+], ids=["default-and-extra", "parts"])
+def test_a_card_less_repository_laid_out_as_a_conversion_reads_its_one_configuration(tmp_path, monkeypatch,
+                                                                                     listing):
+    """A repository whose own files are laid out as the Parquet conversion lays its out, with no card,
+    holds the one configuration `datasets` gives it, its split every file its patterns resolve to it: the
+    conversion's ref names another commit, so its directories are no configurations of its."""
+    from dew.data.sources import Hub
+
+    carded_hub(monkeypatch, tmp_path, "", {"original": listing})
+    assert Hub("owner/laid-out").files.url == tuple(
+        f"hf://datasets/owner/laid-out@original/{path}" for path in listing)
 
