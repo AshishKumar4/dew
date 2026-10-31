@@ -22,6 +22,7 @@ import jax
 import pytest
 from reference_error import recording
 from saved_run_kinds import SAVED_KINDS, answered, computed
+from saved_run_products import unpacked
 
 from dew.checkpoints import Checkpoints
 from dew.config import RunConfig
@@ -99,7 +100,8 @@ def test_a_run_an_earlier_main_saved_loads_and_answers(tmp_path, recorded, kind)
         if task is not None and seen["version"] >= PRODUCTS:
             # The task loaded multiplies as the one the run saved did: one request's products, module by
             # module, in the dtypes they multiplied in then.
-            assert computed(run) == seen["products"]
+            found = computed(run)
+            assert found["products"] == unpacked(seen["products"], found["packs"])
     with Checkpoints(str(run)) as checkpoints:
         last = checkpoints.latest
         declared = checkpoints.artifact(last) is not None
@@ -161,11 +163,31 @@ def test_a_run_an_earlier_main_saved_resumes_from_its_checkpoint(tmp_path, monke
         # The model the resumed fit trained computes as the saved one did: the task its new step saves.
         task = objectives[recorded_run.objective.name].saved_task
         if task is not None and seen["version"] >= PRODUCTS:
-            assert computed(run, int(state.step)) == seen["products"]
+            found = computed(run, int(state.step))
+            assert found["products"] == unpacked(seen["products"], found["packs"])
         # The step the resumed fit compiled, at the rung it was admitted at.
         compiled = [row["value"] for row in records[resumed:] if row["type"] == "StepCompiled"][-1]
         assert compiled["remat"] == seen["remat"]
         assert {name: (compiled["plan"] or {}).get(name) for name in seen["plan"]} == seen["plan"]
+
+
+def test_a_packed_projections_products_count_at_each_of_its_members():
+    """A task that serves a group of projections packed (`dew.nn.protocols.ProjectionGroup`: a decoder's
+    q, k and v as `qkv_proj`) multiplies them in one product, which the evidence counts at each member
+    (`unpacked`), so a run a main saved before the task packed them compares with one it packs: the same
+    dtypes at the same members. A member whose dtype moved still differs, and a module of the same name
+    the task does not pack keeps its own path."""
+    from saved_run_products import unpacked
+
+    packs = {"qkv_proj": ["q_proj", "k_proj", "v_proj"], "gate_up_proj": ["gate_proj", "up_proj"]}
+    then = {"layers_0/self_attn/q_proj": ["float64"], "layers_0/self_attn/k_proj": ["float64"],
+            "layers_0/self_attn/v_proj": ["float64"], "layers_0/mlp/gate_proj": ["float32"],
+            "layers_0/mlp/up_proj": ["float32"], "layers_1/cross_attention/q_proj": ["float64"]}
+    now = {"layers_0/self_attn/qkv_proj": ["float64"], "layers_0/mlp/gate_up_proj": ["float32"],
+           "layers_1/cross_attention/q_proj": ["float64"]}
+    assert unpacked(now, packs) == unpacked(then, packs) == then
+    moved = {**then, "layers_0/mlp/up_proj": ["bfloat16"]}
+    assert unpacked(moved, packs) != unpacked(now, packs)
 
 
 def test_a_requests_products_are_named_by_their_variable_scopes():
