@@ -397,22 +397,26 @@ def _forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dt
     product's bit split, an int32 tile; a training walk's then its power's integral part built in bits, two
     int32 tiles beside its weights (the corrected IR live set, ET-HOOKBREAK: 198 at 64 x 64 and width 128,
     the acc's 66 beside 3 x 32 fp32 and 32 int32; a natural training walk 174 at width 64, its fold's 110
-    and 64 int32). A score hook's parameters are live beside its logits (`_hook_live`)."""
+    and 64 int32). A score hook's parameters are live beside the logits it reads (`_hook_live`), a phase of
+    their own: the hook adds them into its logits, dead past it (ET-PINFWD: key-bias and tile-bias at 64 x 64
+    on two consumers, width 64, ptxas 168 unspilled where they priced beside the weights 180 and 196)."""
     block_q, block_k = tiles.block_q, tiles.block_k
     hooked, vectors = _hook_live(family, block_q, block_k, params)
     logits, weights = (block_q, block_k, jnp.float32), (block_q, block_k, dtype)
     bits = (block_q, block_k, jnp.int32)
-    step = [logits, weights, *([weights] if residuals else []), *hooked]
+    step = [logits, weights, *([weights] if residuals else [])]
     if residuals:
         step.append((block_q // 2, block_k, jnp.int32))
     phases = [step]
     if natural:
-        phases.append([logits] * 3 + [bits] + hooked)
+        phases.append([logits] * 3 + [bits])
         if residuals:
-            phases.append([logits, weights, weights, bits, bits, *hooked])
+            phases.append([logits, weights, weights, bits, bits])
+    carried = [(block_q, value_width, jnp.float32)]
+    scored = resources.live_registers(family, carried, [logits, *hooked]) + vectors
     # A training walk's per-query rows (`TRAINING_ROWS`), in the accumulator's row layout.
     rows = TRAINING_ROWS * family.row_registers(block_q, jnp.float32) if residuals else 0
-    return resources.live_registers(family, [(block_q, value_width, jnp.float32)], *phases) + vectors + rows
+    return max(resources.live_registers(family, carried, *phases), scored) + rows
 
 
 @overload
