@@ -372,13 +372,15 @@ def test_a_scoring_server_reports_the_share_of_each_pass_shapes_tokens_its_rows_
     for future in futures:
         future.result()
     held = [row for body in CASES.values() for row in task.admit(body).rows if row.media is None]
-    shapes = task.passes.computed
-    assert shapes and sum(task.passes.real.values()) == sum(len(row.encoded.tokens) for row in held)
+    shapes = task.passes.shapes
+    assert shapes and sum(passes.real for passes in shapes.values()) == sum(
+        len(row.encoded.tokens) for row in held)
     assert set(shapes) <= set(decide.pass_shapes)
-    assert all(computed == task.passes.passes[shape] * shape.rows * shape.length
-               for shape, computed in shapes.items())
+    # Each pass computes its shape's windows, or more where a mesh's devices pad them (`RowPlan.count`).
+    assert all(passes.windows >= passes.passes * shape.rows for shape, passes in shapes.items())
+    computed = sum(passes.windows * shape.length for shape, passes in shapes.items())
     metrics = task.passes.metrics()
-    assert metrics["served/real_token_share"] == sum(task.passes.real.values()) / sum(shapes.values())
+    assert metrics["served/real_token_share"] == sum(passes.real for passes in shapes.values()) / computed
     assert 0 < metrics["served/real_token_share"] < 1
     assert {name for name in metrics if name.endswith("/passes")} == {
         f"served/passes/{shape.rows}x{shape.length}/passes" for shape in shapes}
