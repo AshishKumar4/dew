@@ -357,8 +357,9 @@ class Files(Dataset):
         """Each file its producer declared, read as declared (`Declared`): held to the version its
         store published it at, or checked against its digest, so a file replaced under its declaration
         is refused where it is read rather than read under it (row 1871)."""
-        return {url: Declared(Store(url, self.storage_options), facts)
-                for url, facts in self.declared.items()}
+        # Its data files: an offset index it declares is read by `ArrayIndex`, checked by its digest there.
+        return {url: Declared(Store(url, self.storage_options), self.declared[url])
+                for url in self.paths if url in self.declared}
 
     def _opened(self, url: str) -> BinaryIO:
         """A binary file of `url`'s bytes: as its producer declared them where one did
