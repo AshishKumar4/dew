@@ -128,6 +128,21 @@ class Issuer:
         return family.summed(shape, issued, interpret)
 
     def __call__(self, name: str, lhs, rhs) -> jax.Array:
+        """The product `lhs @ rhs`: its operands' parts' products (`product.terms`), each into its own
+        accumulator where an operand takes three parts (an fp32 call's accurate forms, `Family.apart`: a part
+        accumulated onto a larger one loses its last bit), else into one in place. Two parts are the fast
+        forms' (`mainloop.FAST_PARTS`), TF32's precision and past it, which that last bit is far below; apart,
+        an fp32 call's solve held its products' accumulators at once, 576 bytes a thread spilled on an H100
+        (fast32d-sm90 at 83b47d66f6)."""
         left = self._operand(lhs, name, rhs)
         right = self._operand(rhs, name, lhs)
-        return self.call.family.apart((lhs.shape[0], rhs.shape[1]), left, right, self.call.interpret)
+        family, interpret = self.call.family, self.call.interpret
+        shape = (lhs.shape[0], rhs.shape[1])
+        if max(len(left), len(right)) == 2:
+            def issued(acc):
+                for i, j in product.terms(len(left), len(right)):
+                    acc = family.products(acc, left[i], right[j], interpret)
+                return acc
+
+            return family.summed(shape, issued, interpret)
+        return family.apart(shape, left, right, interpret)
