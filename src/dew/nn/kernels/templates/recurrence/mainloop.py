@@ -378,6 +378,10 @@ _TILE: contextvars.ContextVar[dict | None] = contextvars.ContextVar("tile", defa
 _WALKED: contextvars.ContextVar[list | None] = contextvars.ContextVar("walked", default=None)
 """Where a persistent launch's program gives its walk (`_walk`) for its tile instead of running it."""
 
+_ROLE: contextvars.ContextVar[int] = contextvars.ContextVar("role", default=0)
+"""A persistent launch's consumer role its step runs as (`_kernel`'s `consumers`), a static index: each
+role walks every tile, its step the role's share of it."""
+
 
 def _axis(name: str):
     """The program's index along its grid's `name` axis: a persistent launch's tile's (`_TILE`), else the
@@ -682,19 +686,27 @@ def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, s
                 (views, _, _, steps), taken = given(at)
                 return taken, steps, views, at
 
-            def consumer(_, at, walk, store, *, active):
-                del store
-                if not active:
-                    return
+            def walked(at, walk, role, _=None):
                 (_, step, prologue, _), _ = given(at)
-                token = _TILE.set(at)
+                token, role_token = _TILE.set(at), _ROLE.set(role)
                 try:
                     walk(step if prologue is None else functools.partial(step, loaded=prologue()), None, ())
                 finally:
+                    _ROLE.reset(role_token)
                     _TILE.reset(token)
 
-            family.persist(streams["walked"], (tiles,), schedule, consumer, consumers=1, axis="programs",
-                           outputs=(), interpret=call.interpret)
+            def consumer(index, at, walk, store, *, active):
+                del store
+                if not active:
+                    return
+                if consumers == 1:
+                    walked(at, walk, 0)
+                else:
+                    # Each role's step built at its own static index (`mosaic.per_role`).
+                    mosaic.per_role(index, consumers, functools.partial(walked, at, walk))
+
+            family.persist(streams["walked"], (tiles,), schedule, consumer, consumers=consumers,
+                           axis="programs", outputs=(), interpret=call.interpret)
 
         if persistent:
             family.scoped(scoped, staging, streams=streams)
@@ -895,10 +907,17 @@ def _intra(q, k, hi, lo, beta, taken, call: _Call, *, scale: float):
     `call.held`: the chunk's scores and its keys' system, each pair's decay factored over the chunk's
     sub-chunks (`algebra.key_decayed_pairs`, which the call's declared floor bounds), their products on the
     tensor cores, and the system inverted (`algebra.doubled`): fla_kda's intra rows and solve, fused.
-    Without the delta rule, `(Aqk,)` alone."""
+    Without the delta rule, `(Aqk,)` alone.
+
+    With the delta rule, where the family's program takes two consumer roles (`Family.consumers`) and a
+    role's registers hold at their budget, the scores are one role's and the system and its inverse the
+    other's, both reading each step's tiles: one role a multiprocessor issued 12.5% of its warps' cycles
+    on an H100, its stalls few, the launch 0.944 ms of Kimi Linear's 1.86 ms forward
+    (kda-ncu-h100-1170e4d25)."""
     width, held, gates = call.width, dataclasses.replace(call.held, rows=call.rows), call.gates
     family = call.family
-    keys = _key_block(call, functools.partial(_intra_held, call))
+    roles = 2 if call.delta and family.consumers >= 2 else 1
+    keys = _key_block(call, functools.partial(_intra_held, call), roles)
     # The key blocks rolled where products read shared memory, unrolled where they read registers. Kimi
     # Linear's forward, intra launch, rolled against unrolled: an H100 0.95 ms against 1.16
     # (kda-rolled-h100-b93c360d8), an A100 2.58 against 2.27 (kda-intra-split-a100-aa7f58a7e). Unrolled, each
@@ -915,11 +934,13 @@ def _intra(q, k, hi, lo, beta, taken, call: _Call, *, scale: float):
                        keys=call.given.views(k_ref, row, CHUNK, keyed, width),
                        gates=gates.views(hi_ref, row, CHUNK, h * width, width),
                        lows=gates.views(lo_ref, row, CHUNK, h * width, width))
-        pairing, referenced, *merges = staging
-
         def step(index, slots, carry, accumulators):
             del index
-            # Every slot acquired in the step's own trace: the rolled sub-chunks read them.
+            role = _ROLE.get()
+            # The role's own staging and landing tiles (`_roled`).
+            (pairing, referenced, *merges), lands = _roled(staging, landing, roles)(role)
+            # Every slot acquired in the step's own trace: the rolled sub-chunks read them, and each role
+            # releases each slot.
             slots.acquire_all()
             # The sub-chunks' first tokens' prefix halves read once a step into a plain tile, a row each:
             # read from global memory in each rolled turn, their latency bound an H100's launch (ncu: 59% of
@@ -953,15 +974,17 @@ def _intra(q, k, hi, lo, beta, taken, call: _Call, *, scale: float):
             pairs = functools.partial(algebra.key_decayed_pairs, columns=width // keys, gates=gated,
                                       reference=reference, summed=Issuer(call, {"pairs": pairing}).summed,
                                       chunk=CHUNK, rolled=rolled)
-            scores = pairs(operand("queries"), operand("keys"), strict=False) * scale
-            held.store(outs[-1], scores, row, CHUNK, h * CHUNK, CHUNK, family=family, smem=landing["square"])
-            if call.delta:
+            if role == 0:
+                scores = pairs(operand("queries"), operand("keys"), strict=False) * scale
+                held.store(outs[-1], scores, row, CHUNK, h * CHUNK, CHUNK, family=family,
+                           smem=lands["square"])
+            if call.delta and role == roles - 1:
                 betas = family.rows_of(beta_ref.at[h, span])
                 system = pairs(lambda c: operand("keys")(c) * betas[:, None], operand("keys"), strict=True)
                 rows, cols = (family.iota((CHUNK, CHUNK), dimension) for dimension in (0, 1))
                 inverse = algebra.doubled(-system, _merging(tuple(merges), call))
                 held.store(outs[0], inverse - jnp.where(rows == cols, 1.0, 0.0), row, CHUNK, h * CHUNK, CHUNK,
-                           family=family, smem=landing["square"])
+                           family=family, smem=lands["square"])
             return carry, accumulators
 
         _walk(streams, views, step, call)
@@ -980,7 +1003,7 @@ def _intra(q, k, hi, lo, beta, taken, call: _Call, *, scale: float):
     return _kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
                    grid_names=("chunks", "heads"), blocks=blocks, stages=1, live=_taken(5), work=work,
                    held=_intra_held(call, keys), staging=staging,
-                   landing={"square": held.landing(CHUNK, CHUNK)}, persistent=True,
+                   landing={"square": held.landing(CHUNK, CHUNK)}, persistent=True, consumers=roles,
                    # Each stream staged at its key block's row: a tile slices only whole swizzle rows.
                    swizzles={name: min(keys * jnp.dtype(dtype).itemsize, mosaic.SWIZZLE_BYTES)
                              for name, (_, dtype) in blocks.items()})(
