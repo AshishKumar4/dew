@@ -12,6 +12,7 @@ parameters' and compute dtypes, its loss scale, the examples it consumed and its
 this main reads back: the record's compute, and the resumed run's parameters, scale, clock and rung."""
 
 import dataclasses
+import gc
 import io
 import json
 import re
@@ -173,8 +174,9 @@ def test_a_requests_products_are_named_by_their_variable_scopes():
     of the module that runs them in the task's tree, whichever method or class runs them: a helper
     method's product is its owner's, a shared scope's its sharer's, two siblings' apart, two roots of one
     class applied over two branches of the tree apart, a renamed class's the same; and a projection whose
-    dtype moves moves alone. Two branches alike in every leaf, which no root's reading tells apart, are
-    refused."""
+    dtype moves moves alone; roots applied one after another, the scope of each freed before the next is
+    made, each over its own branch. Two branches alike in every leaf, which no root's reading tells apart,
+    are refused."""
     import jax.numpy as jnp
     from flax import linen as nn
     from saved_run_products import products, scoping
@@ -215,7 +217,12 @@ def test_a_requests_products_are_named_by_their_variable_scopes():
         tree = {"params": {name: root.init(jax.random.key(0), x)["params"] for name, root in roots.items()}}
 
         def request(tree, x):
-            return sum(root.apply({"params": tree["params"][name]}, x) for name, root in roots.items())
+            total = 0
+            for name, root in roots.items():
+                total = total + root.apply({"params": tree["params"][name]}, x)
+                # Each root's scope freed before the next is made, which may take its address.
+                gc.collect()
+            return total
 
         with nn.intercept_methods(scoping(tree)):
             lowered = jax.jit(request).lower(tree, x)
@@ -229,3 +236,8 @@ def test_a_requests_products_are_named_by_their_variable_scopes():
         "second/right": ["bfloat16"]}
     with pytest.raises(ValueError):
         read({"first": Pair(jnp.float32), "second": Pair(jnp.bfloat16)})
+    # Roots applied one after another, each over its own branch, each named by its own (row 2867).
+    many = {f"r{index}": Pair(jnp.bfloat16 if index % 2 else jnp.float32, width=4 + index)
+            for index in range(12)}
+    assert read(many) == {f"r{index}/{side}": ["bfloat16" if index % 2 and side == "right" else "float32"]
+                          for index in range(12) for side in ("left", "right")}
