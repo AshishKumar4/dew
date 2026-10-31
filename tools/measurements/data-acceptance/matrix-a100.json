@@ -3,19 +3,19 @@
   "commit": "0af730f70ffe0b3edf94a30d1fac11564b6dd3b5",
   "inputs": {
     "image": {
-      "path": "/home/ubuntu/tightpig-receipt/work/image/images.array_record",
+      "path": "work/image/images.array_record",
       "bytes": 983040,
       "sha256": "6f7e125353b7677951f22da3ef9df1a6d702a0ac111e77e4ffd57320f8eed6a7",
       "rows": 4096,
-      "source": "/home/ubuntu/tightpig-receipt/work/image"
+      "source": "work/image"
     },
     "text": {
-      "path": "/home/ubuntu/tightpig-receipt/work/text/train.bin",
+      "path": "work/text/train.bin",
       "bytes": 2044542,
       "sha256": "7f6c7f1e9e5bd27c6b620e9d25f2a7990468df341b29ea74195272054b0bbf3a",
       "rows": 18000,
       "tokens": 1022271,
-      "source": "/home/ubuntu/tightpig-receipt/work/text"
+      "source": "work/text"
     }
   },
   "rows": [
@@ -25,8 +25,8 @@
       "config": {
         "engine": "dew",
         "workload": "image",
-        "source": "/home/ubuntu/tightpig-receipt/work/image",
-        "output": "/home/ubuntu/tightpig-receipt/work/0-image-dew.json",
+        "source": "work/image",
+        "output": "work/0-image-dew.json",
         "steps": 128,
         "warmup": 8,
         "train_steps": 16,
@@ -304,8 +304,8 @@
       "config": {
         "engine": "grain",
         "workload": "image",
-        "source": "/home/ubuntu/tightpig-receipt/work/image",
-        "output": "/home/ubuntu/tightpig-receipt/work/1-image-grain.json",
+        "source": "work/image",
+        "output": "work/1-image-grain.json",
         "steps": 128,
         "warmup": 8,
         "train_steps": 16,
@@ -580,8 +580,8 @@
       "config": {
         "engine": "dew",
         "workload": "text",
-        "source": "/home/ubuntu/tightpig-receipt/work/text",
-        "output": "/home/ubuntu/tightpig-receipt/work/2-text-dew.json",
+        "source": "work/text",
+        "output": "work/2-text-dew.json",
         "steps": 128,
         "warmup": 8,
         "train_steps": 16,
@@ -873,8 +873,8 @@
       "config": {
         "engine": "grain",
         "workload": "text",
-        "source": "/home/ubuntu/tightpig-receipt/work/text",
-        "output": "/home/ubuntu/tightpig-receipt/work/3-text-grain.json",
+        "source": "work/text",
+        "output": "work/3-text-grain.json",
         "steps": 128,
         "warmup": 8,
         "train_steps": 16,
@@ -1163,8 +1163,8 @@
       "config": {
         "engine": "grain_prepacked",
         "workload": "text",
-        "source": "/home/ubuntu/tightpig-receipt/work/text",
-        "output": "/home/ubuntu/tightpig-receipt/work/4-text-grain_prepacked.json",
+        "source": "work/text",
+        "output": "work/4-text-grain_prepacked.json",
         "steps": 128,
         "warmup": 8,
         "train_steps": 16,
@@ -1453,8 +1453,8 @@
       "config": {
         "engine": "dew",
         "workload": "image",
-        "source": "/home/ubuntu/tightpig-receipt/work/5-image-dew-cold.inputs",
-        "output": "/home/ubuntu/tightpig-receipt/work/5-image-dew-cold.json",
+        "source": "work/5-image-dew-cold.inputs",
+        "output": "work/5-image-dew-cold.json",
         "steps": 4,
         "warmup": 0,
         "train_steps": 0,
@@ -1520,8 +1520,8 @@
       "config": {
         "engine": "grain",
         "workload": "image",
-        "source": "/home/ubuntu/tightpig-receipt/work/6-image-grain-cold.inputs",
-        "output": "/home/ubuntu/tightpig-receipt/work/6-image-grain-cold.json",
+        "source": "work/6-image-grain-cold.inputs",
+        "output": "work/6-image-grain-cold.json",
         "steps": 4,
         "warmup": 0,
         "train_steps": 0,
@@ -1584,8 +1584,8 @@
       "config": {
         "engine": "dew",
         "workload": "text",
-        "source": "/home/ubuntu/tightpig-receipt/work/7-text-dew-cold.inputs",
-        "output": "/home/ubuntu/tightpig-receipt/work/7-text-dew-cold.json",
+        "source": "work/7-text-dew-cold.inputs",
+        "output": "work/7-text-dew-cold.json",
         "steps": 4,
         "warmup": 0,
         "train_steps": 0,
@@ -1651,8 +1651,8 @@
       "config": {
         "engine": "grain",
         "workload": "text",
-        "source": "/home/ubuntu/tightpig-receipt/work/8-text-grain-cold.inputs",
-        "output": "/home/ubuntu/tightpig-receipt/work/8-text-grain-cold.json",
+        "source": "work/8-text-grain-cold.inputs",
+        "output": "work/8-text-grain-cold.json",
         "steps": 4,
         "warmup": 0,
         "train_steps": 0,
@@ -1745,8 +1745,8 @@
     }
   ],
   "config": {
-    "output": "/home/ubuntu/tightpig-receipt/matrix-a100.json",
-    "work": "/home/ubuntu/tightpig-receipt/work",
+    "output": "matrix-a100.json",
+    "work": "work",
     "seed": 17,
     "steps": 128,
     "warmup": 8,
