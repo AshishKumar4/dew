@@ -606,6 +606,10 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
         """The right operand's depth held in registers, including its storage orientation."""
         del transposed
         return self.fragment_depth(depth)
+
+    def lhs_fragment_depth(self, depth: int) -> int:
+        """The left operand's depth held in registers by a product at the family's default staging."""
+        return depth
     widest_product: int | None = None
     """The most columns one product spans (warpgroup MMA's 256, wgmma's widest N), which a tile's columns
     are at most; None where a tile's columns are many products' (mma.sync's 8 each), held by its
