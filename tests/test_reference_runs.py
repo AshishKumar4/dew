@@ -254,3 +254,35 @@ assert seconds > 0 and len(samples) == 1 and record["finite_losses"]
     done = subprocess.run([sys.executable, "-c", script, str(REPO_ROOT), str(tmp_path / "work.json")],
                           env=env, capture_output=True, text=True, timeout=600)
     assert done.returncode == 0, done.stderr[-3000:]
+
+
+def test_dews_diffusion_reference_replays_the_batchs_draws_through_its_own_loss(monkeypatch):
+    """The Dew side of the diffusion reference trains Dew's own loss on the noise levels and noise its
+    batch holds (`replayed`): any attempt's key gives the same loss, other draws give another, and an
+    update split into two microbatches, each replaying its rows at their places among the update's
+    examples, sums to the whole update's loss."""
+    from dew.objectives.base import Step
+
+    monkeypatch.syspath_prepend(str(REPO_ROOT / "tools" / "reference_runs"))
+    runner = load("reference_runs/diffusion")
+    objective = runner.counting_objective((8, 8, 3), "float32", "xla")
+    variables = objective.init(jax.random.key(0))
+    images = np.random.default_rng(0).integers(0, 255, (4, 8, 8, 3), dtype=np.uint8)
+    levels, noise = runner.draws(0, 2, 4, (8, 8, 3))
+
+    def loss(levels, rows=(0, 1, 2, 3), key=0, places=None) -> float:
+        """The summed loss of the batch's `rows` under `levels`, the attempt's key `key`, the rows at
+        `places` among an update of four (the batch's own rows where None)."""
+        rows = list(rows)
+        batch = {"image": images[rows], "t": levels[rows], "noise": noise[0][rows]}
+        step = Step(np.int32(0), jax.random.key(key), variables,
+                    example_index=None if places is None else np.asarray(places, np.int32),
+                    example_count=None if places is None else 4)
+        taped, drawn = runner.replayed(step, jax.tree.map(np.asarray, batch))
+        return float(objective.loss(variables, drawn, taped)[0].total)
+
+    whole = loss(levels[0])
+    assert loss(levels[0], key=7) == whole
+    assert loss(levels[1]) != whole
+    halves = loss(levels[0], (0, 1), 3, (0, 1)) + loss(levels[0], (2, 3), 5, (2, 3))
+    np.testing.assert_allclose(halves, whole, rtol=1e-6)
