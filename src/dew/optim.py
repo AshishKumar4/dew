@@ -619,14 +619,15 @@ def refuse_held_back(opt_state: optax.OptState) -> None:
     within a chain (`_held_back`): a call it holds back moves no weight, which the trainer's
     transaction, counting each call an update, would count as one, moving its average, an objective's
     post-step effects and its committed tokens (row 1870). The trainer's window accumulates gradients,
-    and its own check rejects a non-finite update."""
+    and a run with a dynamic loss scale rejects an attempt whose values are not finite, uncounted."""
     kinds = _held_back()
     held = jax.tree.leaves(opt_state, is_leaf=lambda node: isinstance(node, kinds))
     if any(isinstance(node, kinds) for node in held):
         raise ValueError("the optimizer holds an update back on some calls (optax.MultiSteps, apply_every, "
                          "conditionally_mask, apply_if_finite), which the run would count as updates; "
                          "accumulate gradients with Trainer(accumulation=k), whose window applies one "
-                         "update, and leave a non-finite update to the trainer, which rejects it")
+                         "update, and reject non-finite steps with Trainer(dynamic_scale=...), whose "
+                         "rejected attempts count nothing")
 
 
 def stepped(params, updates, before, after):
