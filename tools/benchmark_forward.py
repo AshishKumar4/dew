@@ -25,6 +25,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from dew.nn.kernels.options import program
 from dew.telemetry.benchmark import samples
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -36,8 +37,8 @@ def measure(name: str, warmup: int, repeats: int) -> float:
     """The median milliseconds of one forward call of case `name`."""
     module, shape = FORWARD[name]()
     inputs = jnp.asarray(np.random.default_rng(0).normal(size=shape), jnp.float32)
-    variables = jax.jit(module.init)(jax.random.key(0), inputs)
-    forward = jax.jit(module.apply)
+    variables = program(module.init)(jax.random.key(0), inputs)
+    forward = program(module.apply)
     return 1e3 * statistics.median(samples(forward, variables, inputs, warmup=warmup, repeats=repeats))
 
 
