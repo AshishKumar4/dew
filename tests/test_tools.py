@@ -506,12 +506,30 @@ class Drawing:
         params = {"w": jnp.asarray(.2, jnp.float64 if wide else jnp.float32)}
         batch = {"y": np.arange(4, dtype=np.float32)}
         places = jnp.arange(4, dtype=jnp.int32)
-        fields = {"step": jnp.asarray(0), "key": jax.random.key(3), "ema": None,
-                  "example_key": jax.random.key(4), "example_index": places, "example_count": 4}
-        loss, kinds = tool.recording_loss(self.objective(), {}, fields)
+        from dew.objectives.base import Step
+
+        step = Step(jnp.asarray(0), jax.random.key(3), None, example_key=jax.random.key(4),
+                    example_index=places, example_count=4)
+        loss, kinds = tool.recording_loss(self.objective(), {}, step)
         tool.audited(loss, kinds, params, batch, "drawing", wide=wide)
         _, values = loss(params, batch)
         return tool.witnessed({"values": values, "example_index": places}, "drawing")
+
+
+def test_layout_parity_reads_the_first_step_as_the_trainer_does():
+    """The tool's first step is the trainer's (`first_step`, `attempt_step`, ledger 3057): after updates
+    the run committed, the step its arms and its float64 anchor read states them, as a model reading the
+    run's progress reads them, where a step built by hand stated none and traced the run's end."""
+    import optax
+
+    from dew.training import Trainer
+
+    tool = load("layout_parity")
+    state = Trainer(Drawing().objective(), optax.sgd(0.1), key=jax.random.key(0)).initial_state()
+    state = state.replace(updates=jnp.asarray(5, jnp.int32))
+    batch = {"y": np.arange(4, dtype=np.float32)}
+    step = tool.first_step(state, state.variables, None, batch)
+    assert int(step.committed) == 5 and step.example_count == 4
 
 
 def test_layout_parity_holds_every_arm_to_the_references_sample():
@@ -941,7 +959,7 @@ def test_the_host_offload_benchmark_counts_each_parameter_in_the_memory_space_it
 # tools/benchmark_quantized_serving.py
 # ---------------------------------------------------------------------------
 
-def test_the_quantized_serving_benchmark_samples_through_the_task_and_reads_its_real_rows():
+def test_the_quantized_serving_benchmark_samples_through_the_task_and_reads_its_real_rows(tmp_path):
     """The benchmark's samples are the task's own walk and decode, read back as their real rows: a
     pixel-space model's too, which has no autoencoder, and its twelve prompts once on eight devices,
     which the walk pads to sixteen rows, so quality() scores twelve images against twelve prompts."""
@@ -971,8 +989,15 @@ def test_the_quantized_serving_benchmark_samples_through_the_task_and_reads_its_
     scaled = TextToImage(Scaled(), Process(FlowMatchingScheduler(), DirectPredictionTransform()),
                          InputSpec(Field("image", (2, 2, 1))), {"params": {"scale": jnp.ones(())}}, steps=1,
                          guidance=None, solver=Euler())
-    row = tool.forward(scaled)
+    # The model's program's options reach the timed executable: an option `compiled_with` adds is one of
+    # them, and a bare jit of the step dumps nothing (row 3062); the prompts' own programs dump apart.
+    dumps = tmp_path / "dumps"
+    from dew.nn.kernels import options
+
+    with options.compiled_with({"xla_dump_to": str(dumps)}):
+        row = tool.forward(scaled)
     assert row["forward_ms"] > 0 and row["weights_mib"] >= 0
+    assert any(dumps.glob("*jit_step*.txt"))
 
 
 # ---------------------------------------------------------------------------

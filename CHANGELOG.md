@@ -1,7 +1,9 @@
 # Changelog
 
 Dew's releases, newest first. The version is `dew.__version__`, and a
-release's tag is that version with a `v` in front (`v0.1.0`).
+release's tag is that version with a `v` in front (`v0.1.0`). A release's
+notes are frozen once it is cut: its section's sha256 is recorded in
+tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
@@ -24,6 +26,12 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   `from_torch` does; a saved chain's iterator `name` reads as its identity.
 - A record's remote media path is read from Dew's mirror, refused (`Unmirrored`) where the mirror has no
   room for it.
+- Muon's and MuonClip's AdamW group, the norms, biases and embeddings, keeps both moments in float32 by
+  default (`state_dtype`), as AdamW does: under bfloat16 or float16 weights its second moment no longer
+  underflows.
+- A distillation's `teacher_run` is read as its run's task loads it (`dew.inference.SavedRun`): the
+  model the run publishes, so a Flow-GRPO run's trained policy and not its KL reference; guidance
+  distillation's teacher objective is the run's own sampling task.
 
 - Environments and reinforcement learning for control, in `dew.rl` and `dew.objectives`:
   - Environments as two pure functions: an `Env`'s `reset` and `step`, batched, cut at a time limit, rolled
@@ -60,12 +68,6 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 The first release on Dew's own package index, `pip install dewml --extra-index-url
 https://pypi.dewml.dev/simple`, beside Dew's JAX build, which PyPI does not hold. PyPI's `dewml` is a
 pointer from now on: its 0.1.1 installs nothing and names the index.
-- Muon's and MuonClip's AdamW group, the norms, biases and embeddings, keeps both moments in float32 by
-  default (`state_dtype`), as AdamW does: under bfloat16 or float16 weights its second moment no longer
-  underflows.
-- A distillation's `teacher_run` is read as its run's task loads it (`dew.inference.SavedRun`): the
-  model the run publishes, so a Flow-GRPO run's trained policy and not its KL reference; guidance
-  distillation's teacher objective is the run's own sampling task.
 
 - The fit search's derived first candidate counts what its gradient program holds at its peak, as JAX
   lowers it and the GPU's fusion keeps its values (a one-device `shard_map` inline, a Pallas kernel its

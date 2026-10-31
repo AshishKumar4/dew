@@ -213,16 +213,18 @@ def measure(case: dict, config: BenchmarkConfig) -> dict:
 
         row.update(served=True, forward_ms=time_call(fn, q, k, v))
 
-        def loss(q, k, v):
+        # The cotangent is an argument: `program` keeps each function it compiled, and a closure over it
+        # would keep every case's (128 to 256 MiB in fp32) until the sweep ended.
+        def loss(q, k, v, cotangent):
             return jnp.sum(kernel(q, k, v).astype(jnp.float32) * cotangent)
 
         grads = None
         if not config.forward_only:
             grad = program(jax.grad(loss, argnums=(0, 1, 2)))
             try:
-                grads = grad(q, k, v)
+                grads = grad(q, k, v, cotangent)
                 jax.block_until_ready(grads)
-                row['forward_backward_ms'] = time_call(grad, q, k, v)
+                row['forward_backward_ms'] = time_call(grad, q, k, v, cotangent)
             except (NotImplementedError, jax.errors.JaxRuntimeError) as e:
                 row['backward_reason'] = failure(e)
 

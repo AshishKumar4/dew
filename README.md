@@ -1455,7 +1455,7 @@ UV_SYSTEM_CERTS=true uv self update
 ```
 <!-- END pip -->
 
-Dew runs on its own build of JAX, which only its package index serves; without `--extra-index-url https://pypi.dewml.dev/simple` the install stops at resolving jax ([installation guide](https://github.com/AshishKumar4/dew/blob/main/docs/installation.md#dews-jax-build)).
+Dew's releases are on its own package index, beside its own build of JAX; without `--extra-index-url https://pypi.dewml.dev/simple` the install stops before it installs anything, as PyPI's `dewml` is a pointer whose build stops with `dewml is not installed from PyPI.` ([installation guide](https://github.com/AshishKumar4/dew/blob/main/docs/installation.md#dews-jax-build)).
 
 CUDA 13 also needs a GPU of compute capability 7.5 or later ([which CUDA build](https://github.com/AshishKumar4/dew/blob/main/docs/installation.md#which-cuda-build)).
 
