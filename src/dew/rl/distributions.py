@@ -85,14 +85,5 @@ def onehot_sample(key: jax.Array, log_probs: jax.Array) -> jax.Array:
     return drawn + probs - jax.lax.stop_gradient(probs)
 
 
-def categorical_kl(log_p: jax.Array, log_q: jax.Array) -> jax.Array:
-    """KL(p || q) of categoricals over the last axis."""
-    return jnp.sum(jnp.exp(log_p) * (log_p - log_q), axis=-1)
-
-
-def categorical_entropy(log_p: jax.Array) -> jax.Array:
-    return -jnp.sum(jnp.exp(log_p) * log_p, axis=-1)
-
-
-__all__ = ["categorical_entropy", "categorical_kl", "onehot_sample", "symexp", "symlog", "twohot_bins",
-           "twohot_loss", "twohot_mean", "unimix_log_probs"]
+__all__ = ["onehot_sample", "symexp", "symlog", "twohot_bins", "twohot_loss", "twohot_mean",
+           "unimix_log_probs"]

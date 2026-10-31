@@ -297,6 +297,50 @@ def test_each_replayed_step_draws_its_posterior_from_its_own_key():
     np.testing.assert_array_equal(np.argmax(stoch, -1), np.argmax(stepped(variables), -1))
 
 
+def test_the_worlds_kl_losses_are_the_codes_and_the_representation_one_spares_the_prior():
+    """A window's dynamics and representation losses are the code's KLs between each step's posterior and
+    prior (rssm.py:125-129), KL(sg(post) || prior) and KL(post || sg(prior)), summed over the latent's
+    categoricals and floored at the free nat step by step: within float64 rounding of that formula run in
+    NumPy over the posterior and prior the model drew. The prior's heads take a gradient from the dynamics
+    loss and exactly none from the representation loss, which trains the posterior alone."""
+    from dew.objectives.base import Step
+
+    model = tiny(dtype=jnp.float64)
+    objective = DreamerV3Objective(model, scales={"policy": 0.0, "value": 0.0, "replay_value": 0.0})
+    rng = np.random.default_rng(14)
+    first = np.zeros((3, 6), bool)
+    first[:, 0] = first[1, 3] = True
+    with jax.enable_x64(new_val=True):
+        variables = objective.init(jax.random.key(15))
+        windows = {"observation": jnp.asarray(3 * rng.normal(size=(3, 6, 1))),
+                   "action": jnp.asarray(rng.uniform(-1, 1, (3, 6, 1))),
+                   "reward": jnp.asarray(rng.normal(size=(3, 6))), "first": jnp.asarray(first),
+                   "last": jnp.zeros((3, 6), bool), "terminal": jnp.zeros((3, 6), bool)}
+        step = Step(jnp.asarray(0), jax.random.key(16), None)
+
+        def kls(prior_head):
+            params = {**variables["params"], "prior_logits": prior_head}
+            metrics = objective.loss({**variables, "params": params}, windows, step)[1].metrics
+            return jnp.stack([metrics["loss_dynamics"], metrics["loss_representation"]])
+
+        head = variables["params"]["prior_logits"]
+        found, moved = np.asarray(kls(head)), jax.jacrev(kls)(head)
+        roundings = chain_roundings(jax.make_jaxpr(kls)(head))
+        # The loss draws its posterior from the first of its step key's two halves.
+        world_key = jax.random.split(step.key)[0]
+        previous = jnp.concatenate([jnp.zeros_like(windows["action"][:, :1]), windows["action"][:, :-1]], 1)
+        deter, _, posterior = objective.observed(variables, model.seen(windows["observation"]), previous,
+                                                 windows["first"], world_key)
+        prior = model.bind(variables, rngs={"latent": world_key}).prior(deter)
+    post, prior = np.asarray(posterior, np.float64), np.asarray(prior, np.float64)
+    divergence = np.sum(np.exp(post) * (post - prior), axis=(-1, -2))
+    expected = np.mean(np.maximum(divergence, objective.free_nats))
+    assert_computes_the_oracle(found, np.full(2, expected), "the world's KL losses", roundings=roundings)
+    gradients = [np.asarray(leaf) for leaf in jax.tree.leaves(moved)]
+    assert all(np.any(gradient[0]) for gradient in gradients)
+    assert not any(np.any(gradient[1]) for gradient in gradients)
+
+
 def demonstrations(count: int, length: int, seed: int) -> list[dict]:
     """`count` target walks of `length` steps each, a scripted pilot steering toward 1, recorded in the
     agent's convention: each row's observation, the reward that came with it, and the action taken at
