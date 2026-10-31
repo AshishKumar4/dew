@@ -8,7 +8,7 @@ can drift.
     python tools/gen_exports.py [--check] [PACKAGE]
 
 ruff orders and wraps the imports and `__all__` (I001, RUF022), so the written file is the one the ruff gate
-passes; `__all__` also names `__version__` where the package assigns it."""
+passes."""
 
 import argparse
 import ast
@@ -43,13 +43,12 @@ def written(path: Path) -> str:
     assigned = {target.id: node for node in tree.body if isinstance(node, ast.Assign)
                 for target in node.targets if isinstance(target, ast.Name)}
     exports = ast.literal_eval(assigned["_EXPORTS"].value)
-    names = [*exports, *(["__version__"] if "__version__" in assigned else [])]
     checking = next(node for node in tree.body if isinstance(node, ast.If) and isinstance(node.test, ast.Name)
                     and node.test.id == "TYPE_CHECKING")
     lines = text.splitlines()
     spans = sorted([(checking.lineno, checking.end_lineno, imports(exports)),
                     (assigned["__all__"].lineno, assigned["__all__"].end_lineno,
-                     ["__all__ = [", *(f'    "{name}",' for name in names), "]"])], reverse=True)
+                     ["__all__ = [", *(f'    "{name}",' for name in exports), "]"])], reverse=True)
     for start, end, block in spans:
         lines[start - 1:end] = block
     return ruffed("\n".join(lines) + "\n", path)

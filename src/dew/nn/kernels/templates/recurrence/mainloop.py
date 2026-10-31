@@ -396,6 +396,15 @@ class Work:
     exponentials: float = 0
 
 
+SCALARS = 40
+"""The registers a recurrence consumer thread holds beside its tiles, pending their census (row 3117, which
+derives them from the launches' liveness and deletes this): `mosaic.Family.held_registers`' 40, wgmma's
+count before base/kernels f6498da7d0 lowered it to 4 from the attention census (HELD-CENSUS3, attention and
+GEMM alone). The sm90 SSD fp32 states launch's SASS keeps about 60 integer-class registers for uniform values
+(addresses, R2UR copies) where the IR holds 11 scalars; priced at 4, the packed forward's states launch at two
+roles derived tiles that spill 28 to 392 bytes (base/kernels f6ae7b862, bisected to f6498da7d0)."""
+
+
 @dataclasses.dataclass(frozen=True)
 class _Held:
     """What a launch's consumer thread holds in registers, as its program states it: the tiles it carries
@@ -407,8 +416,10 @@ class _Held:
     phases: Sequence = ()
 
     def registers(self, family: mosaic.Family) -> int:
-        """A consumer thread's registers at the program's peak (`resources.live_registers`)."""
-        return resources.live_registers(family, self.carried, *self.phases)
+        """A consumer thread's registers at the program's peak (`resources.live_registers`), its scalars
+        the recurrence's own where they pass its family's held count (`SCALARS`)."""
+        scalars = max(0, SCALARS - family.held_registers)
+        return resources.live_registers(family, self.carried, *self.phases) + scalars
 
 
 def _f32(rows: int, columns: int) -> tuple:

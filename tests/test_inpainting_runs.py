@@ -221,8 +221,9 @@ def test_an_inpainting_run_validates_through_its_held_out_images_masks(inpaintin
                     "trainer.compilation_cache_dir": "None", "optim.learning_rate": "0.05"}
         flags = [flag for path, value in settings.items() for flag in ("--set", f"{path}={value}")]
         assert main(["train", str(record / "run.json"), *flags]) == 0
-        rows = [json.loads(row)["scalars"] for row in
-                (runs / name / "tracking" / "scalars.jsonl").read_text().splitlines()]
+        from dew.training import LocalTracker
+
+        rows = [values for _, values in LocalTracker(runs / name / "tracking").scalars()]
         assert [row["train/loss"] for row in rows if "train/loss" in row]
         return [value for row in rows for key, value in sorted(row.items())
                 if key.startswith("val/") and key.endswith("loss")]

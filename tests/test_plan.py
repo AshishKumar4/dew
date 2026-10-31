@@ -493,7 +493,7 @@ def test_a_profile_window_traces_steps_past_the_first_compile_and_is_refused_und
     fit(tmp_path / "window")
     # A step after the window logged while its export waited, which the run's end waited for in turn.
     assert tracker.stepped == [5] and stalled.released
-    (window,) = [value for _, value in tracker.artifacts if type(value).__name__ == "ProfileWindow"]
+    (window,) = [value for _, value in tracker.artifacts if type(value).__name__ == "ProfileTraced"]
     (capture,) = (tmp_path / "window").glob("capture-*")
     assert window.steps == 3 and traced_steps(capture) == (1, 2, 3)
     assert json.loads((capture / "manifest.json").read_text())["export_status"] == "completed"
@@ -531,7 +531,7 @@ def test_a_run_that_fails_after_its_profile_window_still_reports_the_window(tmp_
     with pytest.raises(LaterStepFailed):
         trainer.fit(Loader(lambda partition: rows, None, None, ROWS), steps=6, log_every=1,
                     observe=Observe(1, failing))
-    (window,) = [value for _, value in tracker.artifacts if type(value).__name__ == "ProfileWindow"]
+    (window,) = [value for _, value in tracker.artifacts if type(value).__name__ == "ProfileTraced"]
     (capture,) = tmp_path.glob("capture-*")
     assert window.steps == 2
     assert json.loads((capture / "manifest.json").read_text())["export_status"] == "completed"
