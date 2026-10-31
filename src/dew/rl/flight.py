@@ -50,6 +50,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import struct
 
+from dew.nn.precision import divided
 from dew.rl.env import TimeStep, chosen
 from dew.rl.quadrotor import GRAVITY, Body, Flight, Quadrotor, drawn_body, flown, hovering, rotation
 from dew.rl.simulator import Handed, received
@@ -794,11 +795,12 @@ def cameras(race: Race, aspect: float, before: float = 0.0) -> jax.Array:
 
 
 def developed(image: jax.Array, camera: Camera, key: jax.Array) -> jax.Array:
-    """A rendered image `[H, W, 3]` uint8 as a drone's camera develops it: its exposure, white balance and
-    gamma, and read noise of the camera's std (full scale)."""
-    light = image.astype(jnp.float32) / 255 * camera.exposure * camera.white_balance
+    """A rendered image `[H, W, 3]` uint8 as a drone's camera develops it, in the camera's dtype: its
+    exposure, white balance and gamma, and read noise of the camera's std (full scale)."""
+    dtype = camera.exposure.dtype
+    light = divided(image.astype(dtype), 255) * camera.exposure * camera.white_balance
     light = jnp.power(jnp.clip(light, 0.0, 1.0), camera.gamma)
-    light = light + camera.noise * jax.random.normal(key, light.shape)
+    light = light + camera.noise * jax.random.normal(key, light.shape, dtype)
     return jnp.round(jnp.clip(light, 0.0, 1.0) * 255).astype(jnp.uint8)
 
 

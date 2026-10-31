@@ -387,21 +387,22 @@ def test_a_camera_is_hyperdrones_of_its_mounted_frame():
 
 
 def test_an_image_is_developed_as_its_camera_does():
-    """A drawn image developed by drawn cameras: exposure and white balance, then gamma, then read noise, the
-    result rounded to 8 bits, held to a float32 transcription: every pixel within one level of it."""
+    """A drawn image developed by drawn cameras in float64: exposure and white balance, then gamma, then read
+    noise, the result rounded to 8 bits, is the float64 transcription's rounded to 8 bits, level for level."""
     rng = np.random.default_rng([532, 8])
-    race = races(RACING, 4, 16)
     image = rng.integers(0, 256, (16, 12, 12, 3), np.uint8)
     keys = jax.random.split(jax.random.key(5), 16)
-    shown = np.asarray(jax.jit(jax.vmap(lambda race, image, key: developed(image, race.camera, key)))(
-        race, jnp.asarray(image), keys))
-    camera = jax.tree.map(np.asarray, race.camera)
-    for drone in range(16):
-        noise = np.asarray(jax.random.normal(keys[drone], (12, 12, 3)))
-        light = image[drone].astype(np.float32) / 255 * camera.exposure[drone] * camera.white_balance[drone]
-        light = np.clip(light, 0, 1) ** camera.gamma[drone] + camera.noise[drone] * noise
-        expected = np.round(np.clip(light, 0, 1) * 255)
-        assert np.abs(shown[drone].astype(np.float64) - expected).max() <= 1
+    with jax.enable_x64(new_val=True):
+        camera = races(RACING, 4, 16).camera
+        shown = np.asarray(jax.jit(jax.vmap(developed))(jnp.asarray(image), camera, keys))
+        camera = jax.tree.map(np.asarray, camera)
+        expected = []
+        for drone in range(16):
+            noise = np.asarray(jax.random.normal(keys[drone], (12, 12, 3)))
+            light = image[drone] / 255 * camera.exposure[drone] * camera.white_balance[drone]
+            light = np.clip(light, 0, 1) ** camera.gamma[drone] + camera.noise[drone] * noise
+            expected.append(np.round(np.clip(light, 0, 1) * 255))
+    np.testing.assert_array_equal(shown, np.stack(expected).astype(np.uint8))
 
 
 def test_the_teacher_sees_the_next_gates_and_nearest_pillars_from_its_body():
