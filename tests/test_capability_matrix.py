@@ -911,10 +911,11 @@ def flow_grpo(family: Family, directory: Path) -> None:
 def diffusion_nft(family: Family, directory: Path) -> None:
     """DiffusionNFT's implicit positive and negative policies over the clean samples its rollout draws
     with the old policy, each scored against its group by a reward, its velocity held near the base
-    model's (the starting tree's)."""
+    model's where the family starts from one (a loaded tree; a fresh one has no base to stay near)."""
     held = loaded(family)
     inputs = family.inputs()
-    objective = DiffusionNFTObjective(held.model, presets.Flow(), inputs, steps=2, variables=held.variables)
+    objective = DiffusionNFTObjective(held.model, presets.Flow(), inputs, steps=2, variables=held.variables,
+                                      kl=0.0 if held.variables is None else 1e-4)
     rollout = NFTRollout(objective, reward=lambda samples, batch: np.mean(samples, axis=tuple(
         range(1, np.ndim(samples)))), groups=2, steps=3, train_steps=2)
     assert_trains(objective, denoised_batch(inputs), directory, sampled=False, rollout=rollout)
