@@ -353,8 +353,10 @@ class Files(Dataset):
         """Each file its producer declared, read as declared (`Declared`): held to the version its
         store published it at, or checked against its digest, so a file replaced under its declaration
         is refused where it is read rather than read under it (row 1871)."""
+        # A file declared by no digest (a Hub file at a commit, which its URL pins) is read as its URL
+        # names it.
         return {url: Declared(Store(url, self.storage_options), facts)
-                for url, facts in self.declared.items()}
+                for url, facts in self.declared.items() if "sha256" in facts}
 
     def _opened(self, url: str) -> BinaryIO:
         """A binary file of `url`'s bytes: as its producer declared them where one did
