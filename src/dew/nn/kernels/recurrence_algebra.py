@@ -723,7 +723,7 @@ def carried(state, keys: Load, values, decay, dtype, issue: Issue, last: tuple |
             for i, part in enumerate(state)]
 
 
-def keys_gated_carried(state, keys: Load, values, gate, decay, dtype, issue: Issue) -> list:
+def keys_gated_carried(state, keys: TileLoad, values, gate, decay, dtype, issue: Issue) -> list:
     """`carried` with the write's gate on the keys' side: `state[i] decay[i] + (keys(i) gate)^T values`, each
     key row scaled by its token's `gate` `[C]` (its write gate and its decay to the chunk's end) in fp32 and
     rounded to `dtype` for the product, the values (`values`, a tile) as they are: mamba_ssm's state write,
@@ -879,8 +879,8 @@ def local_gradient(keys: TileLoad, queries: TileLoad, columns: int, gate, low, o
     return issue("local_dv", product.astype(out_grad.dtype), out_grad)
 
 
-def reverse_carried(grad: list, keys: TileLoad, weights: TileLoad, queries: TileLoad, out_grad, local, gate,
-                    low, last, last_low, scale: float, dtype, issue: Issue) -> tuple[list, jax.Array]:
+def reverse_carried(grad: list, keys: TileLoad, weights: TileLoad | None, queries: TileLoad, out_grad, local,
+                    gate, low, last, last_low, scale: float, dtype, issue: Issue) -> tuple[list, jax.Array]:
     """One chunk of the memory's reverse recurrence (fla's dhu) under a decay a head: from the gradient of
     the memory leaving the chunk `grad`, its key slices `[K_i, BV]` fp32, the corrected values' gradient
     `dv = (k grad) exp2(g_last - g) + local` ('values_dv', the gradient cast to `dtype`) and the gradient of
@@ -925,8 +925,8 @@ def scores_gradient(queries: TileLoad, keys: TileLoad, columns: int, values: Til
 
 
 def memory_gradients(queries: TileLoad, keys: TileLoad, columns: int, values: TileLoad, out_grads: TileLoad,
-                     value_grads: TileLoad, entered: TileLoad, leaving: TileLoad, blocks: int, ds, gate, low,
-                     last, last_low, memory_decay, scale: float, issue: Issue,
+                     value_grads: TileLoad | None, entered: TileLoad, leaving: TileLoad, blocks: int, ds,
+                     gate, low, last, last_low, memory_decay, scale: float, issue: Issue,
                      emit: Callable[[str, int, jax.Array], None],
                      row_scale=None) -> tuple[jax.Array, jax.Array]:
     """The queries', keys' and weights' gradients of a chunk and value head (fla's dqkwg's memory products)

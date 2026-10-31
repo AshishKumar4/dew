@@ -6,7 +6,7 @@ its bundle's facts (`Mosaic.derived`): the widest value block whose carried memo
 registers hold (`resources.live_registers`) and whose states launch fills the device's multiprocessors,
 with as many chunks in flight as every launch's shared memory
 allows a block of the device (`staged_bytes`: each launch's streams and staging tiles as its bundle declares
-them, `mainloop.planned`, the fast backward's with the forward's where a call takes it). Nothing is
+them, `backward.planned`, the fast backward's with the forward's where a call takes it). Nothing is
 measured, tabled, swept or ranked: a GPU no row names derives its tiles from its own facts, and a measured
 gap is fixed in the derivation or the kernel. The cost model's estimate (`cost`) reports the derived
 launches' seconds.
@@ -23,7 +23,7 @@ import tokamax
 
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import base, bundles, cost, mosaic, report, resources
-from dew.nn.kernels.templates.recurrence import mainloop
+from dew.nn.kernels.templates.recurrence import backward, mainloop
 
 INTERPRETED_GENERATION = "sm90"
 """The generation whose facts rank a call's configs off a GPU of a family a bundle claims (a CPU): the
@@ -58,7 +58,7 @@ _PLANS: dict = {}
 def _planned(shapes: tuple, tiles: mainloop.Tiles, family: mosaic.Family, target: generation.GpuTarget,
              max_segments: int | None, delta: bool, backward: bool,
              floor: float | None, rounded: bool = False) -> tuple[mainloop.Launch, ...]:
-    """`mainloop.planned` of a call over `shapes` (`jax.ShapeDtypeStruct`s or None) by `family`'s bundle on
+    """`backward.planned` of a call over `shapes` (`jax.ShapeDtypeStruct`s or None) by `family`'s bundle on
     `target`, cached by the facts a plan reads of it (two targets of one family share no plan: an sm87's and
     an sm80's multiprocessors and shared memory differ)."""
     facts = (target.generation, target.device_kind, target.shared_limit, target.multiprocessors)
@@ -66,7 +66,7 @@ def _planned(shapes: tuple, tiles: mainloop.Tiles, family: mosaic.Family, target
            generation.numerics().forms)
     if key not in _PLANS:
         *operands, starts = shapes
-        _PLANS[key] = mainloop.planned(*operands, tiles=tiles, family=family, starts=starts,
+        _PLANS[key] = backward.planned(*operands, tiles=tiles, family=family, starts=starts,
                                        max_segments=max_segments, delta=delta, backward=backward, floor=floor,
                                        target=target, rounded=rounded)
     return _PLANS[key]
@@ -120,7 +120,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
 
     def _launches(self, ba: tokamax.BoundArguments, config: mainloop.Tiles, target: generation.GpuTarget, *,
                   backward: bool) -> tuple[mainloop.Launch, ...]:
-        """The launches the call `ba` runs at `config` by `target`'s bundle (`mainloop.planned`); with
+        """The launches the call `ba` runs at `config` by `target`'s bundle (`backward.planned`); with
         `backward`, its fast backward's too where it takes it (a decay a head, 16-bit operands)."""
         arguments = ba.arguments
         names = ("query", "key", "value", "g", "beta", "state", "starts")
@@ -128,7 +128,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
         shapes = tuple(None if x is None else jax.ShapeDtypeStruct(x.shape, x.dtype) for x in given)
         dtype = jnp.result_type(*(arguments[name].dtype for name in names[:3]))
         per_head = arguments["g"].ndim == 3
-        forms = mainloop.fast_backward_form(arguments.get("delta", True), arguments.get("rounded", False),
+        forms = backward.fast_backward_form(arguments.get("delta", True), arguments.get("rounded", False),
                                             dtype)
         fast = backward and forms and per_head and dtype != jnp.float32
         family = bundle(target, dtype)
@@ -143,7 +143,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
         """The most registers a consumer thread of any of the forward's launches holds (`Launch.registers`,
         each launch's stated tiles, `resources.live_registers`): a legal config's launches spill nothing. The
         fast backward's launches are held to the same budget where its rule takes them
-        (`mainloop.backward_holds`), and a call they do not hold takes no gradient of it (`trains`)."""
+        (`backward.backward_holds`), and a call they do not hold takes no gradient of it (`trains`)."""
         target = self.launched()
         if bundle(target) is None:
             return None
@@ -297,7 +297,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
         arguments = ba.arguments
         dtype = jnp.result_type(*(arguments[name].dtype for name in ("query", "key", "value")))
         sixteen = dtype in (jnp.bfloat16, jnp.float16)
-        forms = mainloop.fast_backward_form(arguments.get("delta", True), arguments.get("rounded", False),
+        forms = backward.fast_backward_form(arguments.get("delta", True), arguments.get("rounded", False),
                                             dtype)
         if not (forms and arguments["g"].ndim == 3 and sixteen):
             return False
@@ -306,13 +306,13 @@ class Mosaic(base.Template[mainloop.Tiles]):
 
     def _backward_holds(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles,
                         target: generation.GpuTarget) -> bool:
-        """Whether the call's fast backward's launches, past the forward's, hold at `tiles` (`mainloop.holds`;
+        """Whether the call's fast backward's launches, past the forward's, hold at `tiles` (`backward.holds`;
         a call taking none, `_launches`', holds)."""
         forward = self._launches(ba, tiles, target, backward=False)
         both = self._launches(ba, tiles, target, backward=True)
         family = bundle(target, _dtype(ba))
         assert family is not None
-        return mainloop.holds(both[len(forward):], family, generation.shared_budget(target))
+        return backward.holds(both[len(forward):], family, generation.shared_budget(target))
 
     def states_held(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles, target: generation.GpuTarget
                     ) -> int:

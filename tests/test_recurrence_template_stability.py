@@ -34,7 +34,7 @@ from test_recurrence_stability import GRADIENT_SEEDS, REGIMES, SEEDS, SITES, cot
 
 from dew.nn.kernels import generation
 from dew.nn.kernels.recurrence_chunk import Chunk
-from dew.nn.kernels.templates.recurrence import mainloop, template
+from dew.nn.kernels.templates.recurrence import backward, mainloop, template
 
 pytestmark = pytest.mark.kernel
 
@@ -67,7 +67,7 @@ def fast_backward(operands: Chunk) -> bool:
     bound = template.MOSAIC.bind(operands.query, operands.key, operands.value, operands.log_decay,
                                  operands.beta, operands.state, operands.starts)
     tiles = template.MOSAIC.derived(bound, target)
-    return mainloop.backward_holds(operands.query, operands.key, operands.value, operands.log_decay,
+    return backward.backward_holds(operands.query, operands.key, operands.value, operands.log_decay,
                                    operands.beta, operands.state, tiles=tiles,
                                    family=mainloop.family_of() or mainloop.INTERPRETED,
                                    shared=generation.shared_budget(target), starts=operands.starts)
@@ -186,7 +186,7 @@ def test_the_template_gradient_takes_the_fast_backward_where_its_launches_hold(r
 @pytest.mark.whole_suite  # 130 s interpreted, past a group's two minutes (ledger 2145).
 def test_the_fast_backward_decay_gradient_holds_under_decays_near_zero_interpreted():
     """The fast backward's log decay gradient, interpreted, as near float64 as the port's under decays near
-    zero on a draw: a chunk's ranges sum each token's terms before it (`mainloop.gradients`), never a token's
+    zero on a draw: a chunk's ranges sum each token's terms before it (`backward.gradients`), never a token's
     own order-one term added and taken away, which rounded away the `exp(-30)` terms before it (65 to 169
     times the port's distance on three draws, the H100's check 1 140 times, SE-numerics-h100-fd61e11eeb;
     0.98 to 1.00 times after), held on one draw by the gate's one-draw rule. On a GPU whose launches do not
