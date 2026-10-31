@@ -17,9 +17,11 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 from jax.experimental import pallas as pl
+from jax.experimental.mosaic.gpu import fragmented_array as fa
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels.templates import cost, mosaic, resources
+from dew.nn.kernels.templates.recurrence import mainloop
 
 LOG2E = math.log2(math.e)
 """`exp(z) = exp2(z log2(e))`: the scan's decays are exp2 of the rate scaled by it."""
@@ -181,9 +183,16 @@ def padding(family: mosaic.Family, columns: int, dtype) -> int:
     written a row at a traced token cannot be swizzled (Mosaic GPU's tiling takes no row index). Unpadded,
     a 128-column fp32 tile's rows sat 512 bytes apart, on the same banks: 251M of the backward's 608M
     shared-load wavefronts conflicted (an H100, mamba1-ncu-ref-h100-1d3b0f647)."""
-    fragment = next(tile for tile in reversed(family.layout.to_mgpu().tiling.tiles) if len(tile) == 2)[-1]
+    fragment = next(tile for tile in reversed(_tiled(family).tiling.tiles) if len(tile) == 2)[-1]
     size = jnp.dtype(dtype).itemsize
     return (fragment - columns) * size % cost.SHARED_BYTES_PER_CLOCK // size
+
+
+def _tiled(family: mosaic.Family) -> fa.TiledLayout:
+    """The family's accumulator layout as Mosaic GPU tiles it."""
+    layout = family.layout.to_mgpu()
+    assert isinstance(layout, fa.TiledLayout), "an accumulator's layout is a tiled one"
+    return layout
 
 
 def group(scan: "Scan", streamed: int) -> int:
@@ -195,7 +204,7 @@ def group(scan: "Scan", streamed: int) -> int:
     programs' shares where any group fits them (a program's walk stalls on its own barriers alone), else
     one's. The fewer the groups, the fewer the replays and sums."""
     family, chunk, block = scan.family, scan.chunk, scan.block
-    rows = family.layout.to_mgpu().base_tile_shape[0]
+    rows = _tiled(family).base_tile_shape[0]
     terms = 2 * chunk * (block + padding(family, block, jnp.float32)) * 4
     per_state = (chunk + 1) * block * 4 + terms
     fixed = streamed + 2 * chunk * block * 4 + block * 4
@@ -215,17 +224,17 @@ class _Chunk:
     `[C + 1, size, block]`, the channels' terms `[2 C size, block]` (the readout's rows, then the write's),
     and the tokens' write and decay gradients' sums `[C, block]`."""
 
-    xs: object
-    dts: object
-    bs: object
-    cs: object
-    dys: object
-    resets: object
+    xs: mosaic.Ref
+    dts: mosaic.Ref
+    bs: mosaic.Ref
+    cs: mosaic.Ref
+    dys: mosaic.Ref
+    resets: mosaic.Ref | None
     rates: list
-    kept: object
-    terms: object
-    writes: object
-    decays: object
+    kept: mosaic.Ref
+    terms: mosaic.Ref
+    writes: mosaic.Ref
+    decays: mosaic.Ref
     size: int
 
     @property
@@ -357,7 +366,7 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan):
                 def step(index, slots, carry, accumulators):
                     g, d_rates, d_skip = carry
                     n_chunk = chunks - 1 - index
-                    walk = _Chunk(*(slots[name] for name in ("x", "dt", "b", "c", "dy")),
+                    walk = _Chunk(slots["x"], slots["dt"], slots["b"], slots["c"], slots["dy"],
                                   slots["resets"] if scan.packed else None, rates, kept_smem, terms,
                                   writes_smem, decays_smem, size)
                     writes_smem[...] = jnp.zeros(writes_smem.shape, jnp.float32)
@@ -428,9 +437,7 @@ def selective_scan(x, dt, A, B, C, D, state=None, starts=None, *, family: mosaic
     states = A.shape[-1]
     padded = -(-length // chunk) * chunk
 
-    def pad(t):
-        return jnp.pad(t, ((0, 0), (0, padded - length)) + ((0, 0),) * (t.ndim - 2))
-
+    pad = functools.partial(mainloop._padded, axis=1, size=padded)
     resets = (jnp.zeros((rows, padded, RESET_WIDTH), jnp.int8) if starts is None else
               jnp.broadcast_to(pad(jnp.asarray(starts, jnp.int8))[..., None], (rows, padded, RESET_WIDTH)))
     entering = (jnp.zeros((rows, states, channels), jnp.float32) if state is None
