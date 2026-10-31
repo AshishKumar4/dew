@@ -71,3 +71,36 @@ def test_a_tests_child_process_compiles_into_the_suites_cache():
     child = json.loads(subprocess.run([sys.executable, "-c", read], capture_output=True, text=True,
                                       check=True).stdout)
     assert child == [getattr(jax.config, name) for name in names]
+
+
+LATE = """
+import json
+import sys
+
+from dew.cache import enable_compilation_cache
+
+import jax
+
+enable_compilation_cache(sys.argv[1])
+jax.jit(lambda x: x * 3)(1).block_until_ready()
+enable_compilation_cache(sys.argv[2])
+jax.jit(lambda x: x - 5)(1).block_until_ready()
+print(json.dumps({"directory": jax.config.jax_compilation_cache_dir}))
+"""
+
+
+def test_a_cache_directory_named_after_the_first_compile_holds_the_programs_compiled_after(tmp_path):
+    """JAX settles its persistent cache at the process's first compile; a directory a run names after it
+    (`prepare_process` in a process that compiled, as a second run in a notebook does) holds the
+    programs compiled after, not the first directory (row 2836)."""
+    from process_support import fresh
+
+    first, later = tmp_path / "first", tmp_path / "later"
+    held = fresh(LATE, str(first), str(later), cache_dir=first, flags="")
+    assert held["directory"] == str(later)
+
+    def programs(directory):
+        return {path.name for path in directory.glob("*-cache")}
+
+    assert len(programs(first)) == 1 and len(programs(later)) == 1
+

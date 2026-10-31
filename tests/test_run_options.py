@@ -806,14 +806,13 @@ def answered_alike(first: list[object], second: list[object]) -> bool:
 
 def trained_by_cli(run: RunConfig, root: Path, name: str, assigned: dict[str, str]) -> Path:
     """The run directory one step of `dew train` writes for `run` with each `path=value` of `assigned`,
-    its programs compiled into a cache the runs under `root` share (`compilation_cache_dir`): an option
-    that leaves the step as it was compiles nothing."""
+    its programs compiled into the suite's cache, which a run naming its own would leave this process
+    holding."""
     record, runs = root / f"{name}-record", root / "runs"
     run.save(str(record))
     given = {"trainer.name": name, "trainer.checkpoint_dir": str(runs), "trainer.steps": "1",
              "trainer.eval_every": "None", "trainer.checkpoint_every": "None",
-             "trainer.multi_host": "False", "trainer.compilation_cache_dir": str(root / "compiled"),
-             **assigned}
+             "trainer.multi_host": "False", "trainer.compilation_cache_dir": "None", **assigned}
     assert main(["train", str(record / "run.json"),
                  *(part for path, value in given.items() for part in ("--set", f"{path}={value}"))]) == 0
     return runs / name
