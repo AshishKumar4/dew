@@ -923,48 +923,6 @@ def mode_profile_failure(args) -> dict:
             "recovered": recovered}
 
 
-def mode_profile_stop_failure(args) -> dict:
-    """A profile window whose capture rank 0 cannot stop: its capture's directory made unwritable while the
-    window traces (by an observer, which runs at each step on the loop), so its trace cannot be written as
-    the window stops, while rank 1's stop starts its export. Every rank fails the stop together, and the
-    run's cleanup still waits for the export rank 1 started (`export_wait`): none outlives the fit."""
-    import os
-    import stat
-
-    import jax
-    import optax
-
-    from dew._coordination import agree_process_phase
-    from dew.telemetry import profile
-    from dew.training import Observe, ProfileWindow, Trainer
-
-    profile_dir = Path(args.profile_dir)
-
-    def locked(state) -> int:
-        # On rank 0, the window's capture directory unwritable at the window's first step, before it stops.
-        if jax.process_index() == 0:
-            for capture in (profile_dir / "process-0").glob("capture-*"):
-                os.chmod(capture, stat.S_IRUSR | stat.S_IXUSR)
-        return 0
-
-    loader = indexed_loader(args.records, BATCH // args.processes)
-    trainer = Trainer(make_objective(), optax.adam(1e-3), key=jax.random.key(0),
-                      profile=ProfileWindow(str(profile_dir), steps=2, warmup=0))
-    error = None
-    try:
-        trainer.fit(Loader(lambda partition: iter(loader), None, batch=BATCH, records=None),
-                    steps=args.steps, log_every=1, observe=Observe(1, locked))
-    except BaseException as failure:
-        error = failure
-    exporting = len(profile._exporting)
-    manifests = len(list((profile_dir / f"process-{args.process_id}").glob("capture-*/manifest.json")))
-    for capture in (profile_dir / "process-0").glob("capture-*"):
-        os.chmod(capture, stat.S_IRWXU)
-    recovered = agree_process_phase(None, phase="after the profile stop failure")
-    return {"failed": None if error is None else f"{type(error).__name__}: {error}",
-            "exporting": exporting, "manifests": manifests, "recovered": recovered}
-
-
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 PROMPTS = ["a red bird", "two cats on a mat", "a harbour at dawn", "rain on the roof",
            "bread and jam", "birds at dawn", "a short note", "the sun set"]
@@ -2473,8 +2431,7 @@ MODES = {"matrix": mode_matrix, "token_budget": mode_token_budget, "schedule_fit
          "evaluation_replicas": mode_evaluation_replicas,
          "evaluation_kept": mode_evaluation_kept,
          "evaluation_clocks": mode_evaluation_clocks,
-         "profile_failure": mode_profile_failure, "profile_stop_failure": mode_profile_stop_failure,
-         "pool_refusals": mode_pool_refusals,
+         "profile_failure": mode_profile_failure, "pool_refusals": mode_pool_refusals,
          "fp8_sites": mode_fp8_sites}
 
 

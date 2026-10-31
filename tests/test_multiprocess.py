@@ -66,6 +66,8 @@ BLOCK_AFTER = 5
 RECORDS = worker.BATCH * 16
 AVERAGING = Path(__file__).with_name("averaging_worker.py")
 """The worker of the pools that average runs."""
+PROFILE_STOP = Path(__file__).with_name("profile_stop_worker.py")
+"""The worker of the pools whose profile window one rank cannot stop."""
 EXAMPLES_CLOCK = Path(__file__).with_name("examples_clock_worker.py")
 """The worker of the pools that run on the examples clock."""
 CLOCKED = 17
@@ -1775,9 +1777,9 @@ def test_a_profile_window_that_one_rank_cannot_stop_still_waits_for_its_peers_ex
     fails the stop together, and each rank's cleanup waits for the exports it started, so rank 1's export
     has written its manifest and none runs on as the fit returns (row 2767's review)."""
     pytest.importorskip("xprof.convert.raw_to_tool_data", reason="optional profile extra")
-    reports = run_pool("profile_stop_failure", tmp_path / "pool", 2, devices=2, timeout=300, steps=4,
-                       profile_dir=str(tmp_path / "pool" / "trace"))
-    assert all("profile stop" in report["failed"] for report in reports)
+    reports = run_pool("profile_stop_failure", tmp_path / "pool", 2, script=PROFILE_STOP, devices=2,
+                       timeout=300, steps=4, profile_dir=str(tmp_path / "pool" / "trace"))
+    assert all("profile stop" in (report["failed"] or "") for report in reports), reports
     assert [report["exporting"] for report in reports] == [0, 0]
     assert reports[1]["manifests"] == 1
     assert all(report["recovered"] == 2 for report in reports)
