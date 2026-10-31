@@ -7,6 +7,7 @@ import dataclasses
 import hashlib
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
+from typing import TypeGuard
 
 import grain.python as pygrain
 import numpy as np
@@ -254,7 +255,7 @@ def _grouped(group_of: GroupOf, encoded: Encoded, asked: Mapping[str, Question],
     return groups, canonical
 
 
-def draws_none(question: Question, fewest: int) -> bool:
+def draws_none(question: Question, fewest: int) -> TypeGuard[Choice]:
     """Whether a training read may draw a "none of the above" on `question` (`Encoding`): a choice of at
     least `fewest` options."""
     return isinstance(question, Choice) and len(question.options) >= fewest
