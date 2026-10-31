@@ -1110,11 +1110,16 @@ def test_a_split_named_like_a_cooldowns_suite_is_the_runs_own():
     validated = [(step, scalars) for step, scalars in tracker.scalars if "cooldown_val/loss" in scalars]
     assert validated and all(scalars["evaluation/examples_consumed"] == trained[step]
                              and "cooldown/examples_consumed" not in scalars for step, scalars in validated)
-    refused = Trainer(Echoed(), OptimConfig(optimizer="adam", learning_rate=PEAK), key=0)
-    with pytest.raises(ValueError, match="cooldown_val"):
-        refused.fit(clocked_chain(x), examples=CLOCKED_RECORDS, eval_every="50%",
-                    validation={"val": held, "cooldown_val": held},
-                    cooldowns=Cooldowns(at=("50%",), length=2))
+
+    def branching(validation):
+        return Trainer(Echoed(), OptimConfig(optimizer="adam", learning_rate=PEAK), key=0).fit(
+            clocked_chain(x), examples=CLOCKED_RECORDS, eval_every="50%", validation=validation,
+            cooldowns=Cooldowns(at=("50%",), length=2))
+
+    # Beside another split the branch's suites keep apart from, the run trains.
+    assert branching({"val": held, "held_val": held}) is not None
+    with pytest.raises(ValueError):
+        branching({"val": held, "cooldown_val": held})
 
 
 def test_a_causal_windows_last_target_is_consumed_by_the_window_that_holds_it():
