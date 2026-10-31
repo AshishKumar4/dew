@@ -80,14 +80,20 @@ class PinnedTokenizer:
 
 
 def pin_tokenizer(name: str, *, local_files_only: bool = False) -> PinnedTokenizer:
-    """Resolve `name` once: a local directory, or a hub repo (optionally
-    `repo@revision`) downloaded at the commit its revision names, with every
-    file its loader can read hashed. The Hub cache keeps a commit's files in
-    a directory named for the commit, which is the revision recorded; offline
-    (`HF_HUB_OFFLINE`), or with `local_files_only`, the name resolves to the
-    commit the local cache holds."""
+    """Resolve `name` once (`pin_files`), with every file its loader can read hashed."""
     if name == "byte":
         raise ValueError("'byte' names Dew's byte vocabulary (ByteTokenizer), which has no tokenizer files")
+    return PinnedTokenizer(*pin_files(name, _TOKENIZER_FILES, local_files_only=local_files_only))
+
+
+def pin_files(name: str, patterns: Sequence[str], *,
+              local_files_only: bool = False) -> tuple[Mapping[str, object], str]:
+    """Resolve `name` once: a local directory, or a hub repo (optionally `repo@revision`) downloaded at
+    the commit its revision names, with every file of `patterns` hashed: the snapshot an identity holds
+    (its repo, the commit and each file's hash) and the directory to read those files from, one commit by
+    construction. The Hub cache keeps a commit's files in a directory named for the commit, which is the
+    revision recorded; offline (`HF_HUB_OFFLINE`), or with `local_files_only`, the name resolves to the
+    commit the local cache holds."""
     directory = Path(name)
     repo = resolved = None
     if not directory.is_dir():
@@ -95,14 +101,13 @@ def pin_tokenizer(name: str, *, local_files_only: bool = False) -> PinnedTokeniz
 
         repo, separator, revision = name.rpartition("@")
         repo, revision = (repo, revision) if separator else (name, None)
-        directory = Path(snapshot_download(repo, revision=revision, allow_patterns=_TOKENIZER_FILES,
+        directory = Path(snapshot_download(repo, revision=revision, allow_patterns=list(patterns),
                                            local_files_only=local_files_only))
         resolved = directory.name
     files = {str(path.relative_to(directory)): hashlib.sha256(path.read_bytes()).hexdigest()
-             for pattern in _TOKENIZER_FILES
+             for pattern in patterns
              for path in directory.rglob(pattern) if path.is_file()}
-    snapshot = {"name": repo, "revision": resolved, "files": files}
-    return PinnedTokenizer(snapshot, str(directory))
+    return {"name": repo, "revision": resolved, "files": files}, str(directory)
 
 
 def load_tokenizer(name: str, *, revision: str | None = None, local_files_only: bool = False,

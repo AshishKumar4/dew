@@ -35,6 +35,7 @@ from dew.diffusion.presets import Preset
 from dew.diffusion.process import Process
 from dew.diffusion.schedules import FlowMatchingScheduler, expand
 from dew.diffusion.schedules.flow import static_shift
+from dew.held_updates import phased
 from dew.inputs import InputSpec
 from dew.nn.attention import forward_mode_attention
 from dew.nn.inspection import INSPECTED
@@ -294,8 +295,8 @@ class ConsistencyDistillationObjective(FlowDistillationObjective):
         def critic(step, **_):
             return ~self._student(step)
 
-        return optax.multi_transform({"student": optax.conditionally_mask(tx, student),
-                                      FAKE_SCORE: optax.conditionally_mask(tx, critic)}, network)
+        return phased(optax.multi_transform({"student": optax.conditionally_mask(tx, student),
+                                             FAKE_SCORE: optax.conditionally_mask(tx, critic)}, network))
 
     def averages(self, update: jax.Array) -> jax.Array:
         return self._student(update)

@@ -8,6 +8,7 @@ importing the FLOP accounting.
 import contextlib
 import dataclasses
 import functools
+import hashlib
 import importlib.metadata
 import os
 import sys
@@ -27,6 +28,18 @@ def dew_cache_dir() -> str:
     return os.path.expanduser(
         os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.join("~", ".cache"), "dew")
     )
+
+
+@functools.cache
+def package_digest() -> str:
+    """The digest of Dew's own implementation, every source file of `dew` by its path and contents: what a
+    cache of what Dew's code computed keys on, so that any change of that code computes it again. Read
+    once a process."""
+    package = Path(__file__).parent
+    digest = hashlib.sha256()
+    for path in sorted(package.rglob("*.py")):
+        digest.update(str(path.relative_to(package)).encode() + b"\0" + path.read_bytes())
+    return digest.hexdigest()
 
 
 def dew_config_dir() -> Path:

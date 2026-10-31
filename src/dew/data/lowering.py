@@ -98,7 +98,6 @@ from dew.data.pipeline import (
     Map,
     MapBatch,
     MapWithIndex,
-    MarkConsumed,
     Mixture,
     Native,
     Owed,
@@ -118,6 +117,7 @@ from dew.data.pipeline import (
     Windows,
     Workers,
     children,
+    examples_bound,
 )
 from dew.data.plan import Manifest
 from dew.data.readers import _FillShare
@@ -410,22 +410,14 @@ def _chained(
 
 def _consumes(pipeline: Pipeline) -> bool:
     """Whether `pipeline`'s rows carry the source examples they consume (`CONSUMED`): a run bounded in
-    examples marks each where its bound is (`MarkConsumed`), so every row after it holds a count."""
-    return any(isinstance(stage, Map) and isinstance(stage.step, MarkConsumed) for stage in pipeline.stages)
-
-
-def _bounds(stages: Sequence[Stage], at: int) -> bool:
-    """Whether the stage at `at` is a run's bound in examples: the limit `dew.data.compile._bounded` writes,
-    the examples it reads marked right after it (`MarkConsumed`)."""
-    marks = stages[at + 1] if at + 1 < len(stages) else None
-    return (isinstance(stages[at], Limit) and isinstance(marks, Map)
-            and isinstance(marks.step, MarkConsumed))
+    examples marks each where its bound is (`examples_bound`), so every row after it holds a count."""
+    return examples_bound(pipeline.stages) is not None
 
 
 def _bound(pipeline: Pipeline, at: int) -> int:
-    """The examples of the bound at `at` (`_bounds`)."""
+    """The examples of the bound's limit at `at`, the stage before its marks (`examples_bound`)."""
     stage = pipeline.stages[at]
-    assert isinstance(stage, Limit), "a bound in examples is a limit"
+    assert isinstance(stage, Limit), "a bound in examples is the limit before its marks"
     return stage.count
 
 
@@ -1649,12 +1641,14 @@ class _Build:
         return lambda examples: partition.bounded(examples, records())
 
     def bound_at(self, pipeline: Pipeline, partition: DataPartition) -> int | None:
-        """Where a per-share training read of several shares holds a run's bound in examples (`_bounds`),
-        which each share reads its part of (`DataPartition.bounded`); None for a read of one share or in
-        one order, which takes the bound whole before it cuts its shares."""
+        """Where a per-share training read of several shares holds a run's bound in examples, the limit
+        before its marks (`examples_bound`), which each share reads its part of (`DataPartition.bounded`);
+        None for a read of one share or in one order, which takes the bound whole before it cuts its
+        shares."""
         if self.global_order or not self.training or partition.count == 1:
             return None
-        return next((at for at in range(len(pipeline.stages)) if _bounds(pipeline.stages, at)), None)
+        marked = examples_bound(pipeline.stages)
+        return None if marked is None else marked - 1
 
     def dealt_examples(self, pipeline: Pipeline, partition: DataPartition, consumed: int) -> int | None:
         """The bound's examples (`bound_at`) where the root deals them to the shares as it deals its source:
