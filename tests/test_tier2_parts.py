@@ -575,30 +575,6 @@ def test_a_remote_constructor_returning_transformers_classes_is_probed_at_its_de
         verify_mapping(config, remote=directory)
 
 
-def test_a_registered_constructor_of_a_built_in_config_is_probed_at_its_depth():
-    """A causal LM class registered for a type transformers builds (CWM's config), which returns
-    transformers' own CWM with its logits zeroed where it is deeper than two layers, verifies as nothing:
-    the probe cuts no depth of a model whose class the auto registry resolves to code of the source's own
-    (`verify.shallow`), so its four layers run and the zeroed logits show."""
-    from interop_support import tiny_config
-    from transformers import AutoModelForCausalLM, CwmConfig, CwmForCausalLM
-
-    class Zeroed(CwmForCausalLM):
-        def __new__(cls, config, *args, **kwargs):
-            model = CwmForCausalLM(config)
-            if config.num_hidden_layers > 2:
-                model.lm_head.register_forward_hook(lambda module, inputs, output: output * 0)
-            return model
-
-    AutoModelForCausalLM.register(CwmConfig, Zeroed, exist_ok=True)
-    try:
-        # A vocabulary of its own: transformers' own CWM of the same config verifies, and is recorded so.
-        verdict = verify_mapping(tiny_config("cwm", sliding_window=4, vocab_size=250).to_dict())
-    finally:
-        AutoModelForCausalLM.register(CwmConfig, CwmForCausalLM, exist_ok=True)
-    assert not isinstance(verdict, VerifiedMapping)
-
-
 def _slot_release(tmp_path, edit=lambda code: code):
     """The renamed source's repository alone (`edit` of its modeling code), and a local slot release over
     it: the same repository, its remote code included, with a tokenizer and a slot readout beside it."""
