@@ -484,8 +484,7 @@ class Pretrained:
         config. `dex` attaches DEX (`with_dex`) from key 0; `scan_layers` scans like layers (`Scanning`).
         A saved Dew run loads as `dew export` writes it, at `step` with `ema` (`released_run`).
         """
-        name_or_dir = released_run(name_or_dir, step=step, ema=ema, weights=weights, mesh=mesh,
-                                   layout=layout)
+        name_or_dir = released_run(name_or_dir, step=step, ema=ema, mesh=mesh, layout=layout)
         selected = _selected_payload(fallback, gguf_file=gguf_file, single_file=single_file,
                                      dduf_file=dduf_file)
         streaming, placed = _placement(mesh, layout, on_host=on_host, weights=weights)

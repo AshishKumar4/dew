@@ -21,11 +21,12 @@ from dataclasses import Field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, Protocol, runtime_checkable
 
+import jax
 from etils import epath
 from jax.sharding import Mesh
 
-from dew._coordination import agreed_same, collective_host, from_every_process
-from dew.cache import dew_cache_dir
+from dew._coordination import agreed_same, collective_host, from_every_process, seen_by_every_process
+from dew.cache import dew_cache_dir, package_digest
 from dew.checkpoints import RUN_FILE
 from dew.files import staged
 
@@ -46,13 +47,17 @@ class _Weighted(Protocol):
 
 
 def export_run(run: SavedRun, destination: str | Path, *, ema: bool | None = None,
-               mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None) -> None:
+               mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
+               shared: bool = False) -> None:
     """Write `run`'s pinned checkpoint (`SavedRun.pinned`) to `destination` as its release, its EMA
     weights where `ema`: a task's own released layout (`ReleasedTask`), or the model in its family's
     source layout (`Pretrained.from_saved`). Its weights restore where `mesh` and `layout` place them,
-    so no device holds more of them than a load does, and every process of a pool, each writing a
-    release of its own, reads them home together (`collective_host`) for the writer, which writes
-    whole host tensors."""
+    so no device holds more of them than a load does.
+
+    On one process the writer reads them from the devices as it writes, a shard at a time
+    (`save_sharded`). A pool reads them home together (`collective_host`): every process, each writing
+    a release of its own, or where the pool `shared` the destination, the first alone, which writes it
+    once while the others take part in the restore and the gathers (ledger 2776)."""
     from dew.interop.pretrained import Pretrained
     from dew.objectives.base import ReleasedTask
 
@@ -62,12 +67,23 @@ def export_run(run: SavedRun, destination: str | Path, *, ema: bool | None = Non
         if not isinstance(released, _Weighted):
             raise TypeError(f"{task.__name__} releases no dataclass of its weights (variables), which an "
                             "export reads home before it writes them")
-        hosted = collective_host(released.variables, phase="saved run export")
-        replace(released, variables=hosted).save_pretrained(str(destination))
+        hosted = _written(released.variables, shared=shared)
+        if hosted is not None:
+            replace(released, variables=hosted).save_pretrained(str(destination))
     else:
         bundle = Pretrained.from_saved(run, ema=ema, mesh=mesh, layout=layout)
-        hosted = collective_host(bundle.variables, phase="saved run export")
-        replace(bundle, variables=hosted).save(destination)
+        hosted = _written(bundle.variables, shared=shared)
+        if hosted is not None:
+            replace(bundle, variables=hosted).save(destination)
+
+
+def _written(variables: Variables, *, shared: bool) -> Variables | None:
+    """`variables` as this process's writer of an export reads them (`export_run`), None on a process that
+    writes none: as restored on one process, and across a pool read home by every process, or by the
+    first alone where the pool `shared` the destination."""
+    if jax.process_count() == 1:
+        return variables
+    return collective_host(variables, phase="saved run export", held_by="first" if shared else "every")
 
 
 def is_saved_run(name_or_dir: str | Path) -> bool:
@@ -79,11 +95,12 @@ def is_saved_run(name_or_dir: str | Path) -> bool:
 
 def _fingerprint(run: SavedRun, ema: bool | None) -> str:
     """What an export of `run`'s pinned step with `ema` is a function of: the run's location, its step,
-    the EMA choice, the contents of the run's own records beside its checkpoints (its run record and a
-    task's assets, a decision task's calibration among them), and the step's metadata files, by size and
-    write time, which a new save of the step rewrites."""
+    the EMA choice, the code that writes it (`package_digest`, ledger 2775), the contents of the run's
+    own records beside its checkpoints (its run record and a task's assets, a decision task's
+    calibration among them), and the step's metadata files, by size and write time, which a new save of
+    the step rewrites."""
     root = epath.Path(run.directory)
-    digest = hashlib.sha256(json.dumps([str(root), run.step, ema]).encode())
+    digest = hashlib.sha256(json.dumps([str(root), run.step, ema, package_digest()]).encode())
     for path in sorted((path for path in root.iterdir() if path.is_file()), key=str):
         digest.update(f"{path.name}\0".encode() + path.read_bytes())
     for path in sorted((root / str(run.step)).iterdir(), key=str):
@@ -121,7 +138,7 @@ def samples_images(run: SavedRun) -> bool:
 
 
 def released_run(name_or_dir: str | Path, *, step: int | str | None = None, ema: bool | None = None,
-                 trust: Sequence[str] = (), weights: bool = True, mesh: MeshSpec | Mesh | None = None,
+                 trust: Sequence[str] = (), mesh: MeshSpec | Mesh | None = None,
                  layout: Layout | None = None) -> str | Path:
     """`name_or_dir` as a language model's or a decision task's loader reads it: itself, or where it is a
     saved Dew run (`pinned_run`), the release its checkpoint at `step` with `ema` exports to
@@ -132,8 +149,9 @@ def released_run(name_or_dir: str | Path, *, step: int | str | None = None, ema:
     Every process of a pool agrees on whether any of them lacks the release, and then all of them export
     it, each writing its own cache, as a restore is collective; the export restores where the load
     would place it (`mesh`, `layout`), so it holds no more of the weights on a device than the load
-    does. A load `weights=False` (a resume's, which its restore fills) exports none: it reads the
-    release's records alone where they are written, else the run's own at that step."""
+    does. A load without weights (a resume's, which its restore fills) reads the release's records and
+    headers, so a host whose cache lacks the release (a resumed job on another node, a cleared cache, a
+    run whose records changed) writes it as the first load did (ledger 2774)."""
     run = pinned_run(name_or_dir, step=step, ema=ema, trust=trust)
     if run is None:
         return name_or_dir
@@ -144,12 +162,13 @@ def released_run(name_or_dir: str | Path, *, step: int | str | None = None, ema:
     lacking = any(from_every_process(not release.is_dir()))
     if not lacking:
         return release
-    if not weights:
-        raise ValueError(f"{name_or_dir} at step {run.step} has no release written under Dew's cache, and a "
-                         "load without weights (a resume's) restores none to write one; load it with its "
-                         "weights once, or start the run from its export (dew export)")
-    # Every process restores, a collective; one that holds the release already, or that another process
-    # of a shared cache published first, keeps it (`staged`).
-    with staged(release) as destination:
-        export_run(run, destination, ema=ema, mesh=mesh, layout=layout)
+    # Every process restores, a collective. Where the pool shares the cache, the first writes the release
+    # alone; elsewhere each writes its own, and one that holds it already keeps it (`staged`).
+    shared = jax.process_count() > 1 and all(seen_by_every_process(str(release.parent)))
+    if shared and jax.process_index() != 0:
+        export_run(run, release, ema=ema, mesh=mesh, layout=layout, shared=True)
+    else:
+        with staged(release) as destination:
+            export_run(run, destination, ema=ema, mesh=mesh, layout=layout, shared=shared)
+    from_every_process(None)  # every process reads the release once it is published
     return release

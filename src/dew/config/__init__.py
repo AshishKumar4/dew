@@ -1938,8 +1938,7 @@ class RunConfig:
         trainer = self.trainer
         return training.Trainer(
             objective, self.optim, key=trainer.key, mesh=mesh, microbatches=trainer.microbatches,
-            # The run's layout as its models place their own trees (`Objective.placement`).
-            layout=objective.placement(trainer.layout), accumulation=trainer.accumulation,
+            layout=trainer.layout, accumulation=trainer.accumulation,
             split=trainer.split,
             dynamic_scale=(self.compute_dtype() == "float16" if trainer.dynamic_scale is None
                            else trainer.dynamic_scale), rollout=rollout,

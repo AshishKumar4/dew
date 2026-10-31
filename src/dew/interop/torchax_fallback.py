@@ -1490,8 +1490,8 @@ def load(source: sources.SourceReference, root: Path, *, dtype: str,
         f"{versions['torch']}; "
         + ("its attention on Dew's, packed rows and Dew's decode cache included; " if attends
            else "its attention transformers' own, no packing or decode cache; ")
-        + "placed by its tensor-parallel plan (TorchLayout); the load holds the "
-        "torch model on the host, at least 2x the checkpoint", TransformersTierWarning, stacklevel=3)
+        + f"placed by its tensor-parallel plan (TorchLayout); {_host_cost(weights, by_name)}",
+        TransformersTierWarning, stacklevel=3)
     built = {**config, "dtype": dtype, "fallback": "torchax", **versions}
     variables = {"params": params, "buffers": buffers}
     landed = variables if placed is None else placed(variables, module)
@@ -1525,6 +1525,16 @@ def _shrunk_plain_head(config: Mapping[str, object]) -> bool:
     stated = AutoConfig.for_model(str(config["model_type"]), **fields)
     model = AutoModelForCausalLM.from_config(stated, dtype=torch.float32, experts_implementation=EXPERTS)
     return _plain_head(model.eval(), model.get_output_embeddings())
+
+
+def _host_cost(weights: bool, by_name: Mapping[str, np.ndarray] | None) -> str:
+    """What a tier-3 load held on the host (`_built`): only transformers' own load, which converts its
+    checkpoint, holds the torch model (ledger 2781)."""
+    if not weights:
+        return "its weights unread"
+    if by_name is not None:
+        return "its tensors read by name a device shard at a time"
+    return "the load holds the torch model on the host, at least 2x the checkpoint"
 
 
 def _built(directory: Path, param_dtype: str, weights: bool

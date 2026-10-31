@@ -218,8 +218,8 @@ def test_the_gradients_are_transformers(source, loaded, tokens):
 def test_trainer_steps_move_the_params_and_place_them_by_name(loaded, tokens):
     """AdamW through the Trainer on a fsdp x tensor mesh: the loss falls,
     every parameter moves, the rotary buffers come back bitwise, and the
-    torch names take the specs the model's tensor-parallel plan gives them, the run's layout as the
-    objective's model refines it (`Objective.placement`), as a run's trainer takes it."""
+    torch names take the specs the model's tensor-parallel plan gives them: a trainer built from Python
+    takes the layout as the objective's model refines it (`Objective.placement`, ledger 2777)."""
     params, buffers = loaded.variables["params"], loaded.variables["buffers"]
     assert set(buffers) == {"gpt_neox.rotary_emb.inv_freq", "gpt_neox.rotary_emb.original_inv_freq"}
     assert not set(params) & set(buffers)
@@ -228,7 +228,8 @@ def test_trainer_steps_move_the_params_and_place_them_by_name(loaded, tokens):
     batch = tokens[np.arange(rows) % ROWS]
     data = Loader(train=lambda partition: iter([{"text": batch}] * 4), val=None, records=rows, batch=rows)
     trainer = Trainer(objective, optax.adamw(1e-2), key=jax.random.key(0),
-                      mesh=MeshSpec(fsdp=2, tensor=2), layout=objective.placement(Layout(min_shard=1)))
+                      mesh=MeshSpec(fsdp=2, tensor=2), layout=Layout(min_shard=1))
+    assert trainer.layout == objective.placement(Layout(min_shard=1)) != Layout(min_shard=1)
 
     state = trainer.fit(data, steps=4, log_every=1)
 
@@ -282,7 +283,7 @@ def test_a_frozen_torch_base_kept_whole_drops_fsdp_from_the_name_tables_placemen
         objective = LMObjective(loaded, seq_len=SEQ, ema_decay=None, variables=variables)
         trainer = Trainer(objective, optax.adamw(1e-2), key=jax.random.key(0), mesh=mesh, checkpoints=None,
                           tracker=None,
-                          layout=objective.placement(Layout(min_shard=1, frozen_whole=frozen_whole)))
+                          layout=Layout(min_shard=1, frozen_whole=frozen_whole))
         trainer.device_mesh = mesh.build(jax.devices()[:4])
         state, shardings, _ = trainer.place()
         placed = shard_batch(trainer.device_mesh, batch)

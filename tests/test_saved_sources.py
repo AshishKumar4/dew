@@ -27,8 +27,8 @@ def test_a_decision_run_starts_from_a_saved_decision_run_as_from_its_export(tmp_
     """A decision run named on the command line by a saved decision run (`--pretrained <run>`,
     `--source.step latest`) starts from the weights its export does (`dew export`):
     one step from each, alike in every other option, lands every leaf bit for bit alike, and its record
-    names the run it started from and the step it read. A step beside a source that is no run is
-    refused."""
+    names the run it started from and the step it read. Its record resumes on a host whose cache lacks
+    the export (another node's, ledger 2774). A step beside a source that is no run is refused."""
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
     first = decision(tmp_path, drawn=False)
     trained(first, tmp_path, "first", trainer={"checkpoint_final": True})
@@ -38,7 +38,7 @@ def test_a_decision_run_starts_from_a_saved_decision_run_as_from_its_export(tmp_
 
     def started(pretrained, name: str, *flags: str):
         run = DecisionRunConfig.cli(["--pretrained", str(pretrained), *flags], default=first)
-        return trained(run, tmp_path, name)[0]
+        return trained(run, tmp_path, name, trainer={"checkpoint_final": True})[0]
 
     from_run = started(source, "from_run", "--source.step", "latest")
     from_export = started(exported, "from_export")
@@ -48,6 +48,9 @@ def test_a_decision_run_starts_from_a_saved_decision_run_as_from_its_export(tmp_
     recorded = DecisionRunConfig.load(str(tmp_path / "runs" / "from_run"))
     assert recorded.pretrained == str(source)
     assert recorded.source.step == SavedRun.pinned(str(source)).step
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "another_cache"))
+    trained(recorded, tmp_path, "from_run", trainer={"steps": 2, "checkpoint_final": True})
+    assert "2" in {path.name for path in (tmp_path / "runs" / "from_run").iterdir()}
     assert released_run(source, step="latest") == released_run(source)
     with pytest.raises(ValueError):
         released_run(exported, step="latest")
