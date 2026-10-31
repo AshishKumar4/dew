@@ -433,6 +433,8 @@ class _Pass:
         self.run: dict = {}
         self.reads: dict = {}
         self.open: dict = {}
+        # Each block's open run's products whose values the threads wrote to shared memory since it opened.
+        self.stored: dict = {}
 
     def _streamed(self, op, name: str) -> bool:
         if not _elementwise(op, name):
@@ -734,31 +736,31 @@ class _Pass:
 
     def _define_all(self, op):
         """`op` defined (`define`), a product placed in its run: a block's products in order, a run closing
-        where a product reads, through any ops between, a product of the run's (attention's S, then P, then
+        where a product reads a product of the run's, through any ops between (a region's yields among them)
+        or through shared memory (attention's S, then P stored from it and fenced to the async proxy, then
         PV: one can't be issued before the one it reads), so only independent products' accumulators are
         held to their run's last (row 3154)."""
         if op.results and op.results[0] in self.atoms.of:
             return
         self.define(op)
-
-        def read(operands) -> set:
-            return set().union(*(self.reads.get(operand.owner, ()) for operand in operands
-                                 if not isinstance(operand.owner, ir.Block)))
-
-        upstream = read(op.operands)
-        if _orders_shared_memory(op):
-            # A product after it may read what the threads wrote to shared memory before it (attention's P,
-            # stored from S's accumulators): ptxas issues none past it, so it closes the block's run.
+        upstream = self._read(op.operands) | self._captured(op)
+        key, members = self.open.get(op.parent, (None, set()))
+        if _stores_shared(op):
+            # A run's product's value written to shared memory, which a product after the fence may read.
+            self.stored[op.parent] = self.stored.get(op.parent, set()) | (upstream & members)
+        if _fences_shared_for_products(op) and self.stored.get(op.parent):
             self.open.pop(op.parent, None)
+            self.stored.pop(op.parent, None)
+            key, members = None, set()
         if _product(op):
             # A product accumulating in place onto another's accumulators (a contraction's next K step) is
             # the same accumulation: only its other operands (its left operand's registers, an address) can
             # read a run-mate.
             tied = _tied(op) or []
-            reads = read([operand for operand in op.operands if not any(operand == t for t in tied)])
-            key, members = self.open.get(op.parent, (None, set()))
+            reads = self._read([operand for operand in op.operands if not any(operand == t for t in tied)])
             if key is None or reads & members:
                 key, members = (op.parent, op), set()
+                self.stored.pop(op.parent, None)
             members.add(op)
             self.open[op.parent] = (key, members)
             self.run[op] = key
@@ -767,15 +769,52 @@ class _Pass:
             upstream.add(op)
         self.reads[op] = frozenset(upstream)
 
+    def _read(self, operands) -> set:
+        """The products of their blocks `operands` read through (`_define_all`)."""
+        return set().union(*(self.reads.get(operand.owner, ()) for operand in operands
+                             if not isinstance(operand.owner, ir.Block)))
 
-def _orders_shared_memory(op) -> bool:
-    """Whether `op` fences the threads' shared-memory writes before the asynchronous proxy reads them (a
-    warpgroup product's operands): `fence.proxy.async`, as `nvvm.fence.proxy` or its assembly."""
+    def _captured(self, op) -> set:
+        """The products a region op's results read through the values its regions capture from outside
+        it, which its body may yield (a loop's or a branch's result): none for an op without regions."""
+        if not op.regions:
+            return set()
+        inside, captured = set(), []
+
+        def visit(inner):
+            inside.add(inner)
+            captured.extend(inner.operands)
+            return ir.WalkResult.ADVANCE
+
+        for region in op.regions:
+            for block in region.blocks:
+                for inner in block.operations:
+                    inner.operation.walk(visit)
+        return self._read(operand for operand in captured
+                          if isinstance(operand.owner, ir.Block) or operand.owner not in inside)
+
+
+def _stores_shared(op) -> bool:
+    """Whether `op` writes shared memory (address space 3): a store, an asynchronous one's assembly aside."""
     name = op.name.removeprefix(PREFIX)
-    if name.startswith("nvvm.fence.proxy"):
-        return True
+    if name in ("llvm.store", "vector.store", "memref.store", "vector.transfer_write"):
+        return any("<3>" in str(operand.type) or "#gpu.address_space<workgroup>" in str(operand.type)
+                   for operand in op.operands)
     return (name == "llvm.inline_asm" and "asm_string" in op.attributes
-            and "fence.proxy.async" in ir.StringAttr(op.attributes["asm_string"]).value)
+            and re.search(r"\bst(matrix)?\.(.*\.)?shared", ir.StringAttr(op.attributes["asm_string"]).value)
+            is not None)
+
+
+def _fences_shared_for_products(op) -> bool:
+    """Whether `op` fences the threads' shared-memory writes before the asynchronous proxy reads them (a
+    warpgroup product's operands): `nvvm.fence.proxy` of an async kind, or `fence.proxy.async`'s
+    assembly; the tensor-map fences (`nvvm.fence.proxy.acquire`, `.release`) order no shared memory."""
+    name = op.name.removeprefix(PREFIX)
+    if name == "nvvm.fence.proxy":
+        return "async" in str(op.attributes["kind"]) if "kind" in op.attributes else False
+    return (name == "llvm.inline_asm" and "asm_string" in op.attributes
+            and re.search(r"fence\.proxy\.async(\.shared)?", ir.StringAttr(op.attributes["asm_string"]).value)
+            is not None)
 
 
 def _product(op) -> bool:

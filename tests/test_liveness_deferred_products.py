@@ -27,9 +27,10 @@ TYPES = "(" + ", ".join(["vector<1xf32>"] * 8 + ["i64", "i64"] + ["i32"] * 5) + 
 SHAPES = [(2, 6), (3, 4), (1, 12)]
 
 
-def module_text(batches: int, products: int) -> str:
+def module_text(batches: int, products: int, fenced: bool = False) -> str:
     """A Mosaic-shaped module: one warpgroup's `gpu.launch` of a loop over 4 steps carrying `batches` [64, 16]
-    state tiles."""
+    state tiles; where `fenced`, a fence of shared memory to the async proxy before each product, with no
+    product's value written there."""
     out, count = [], [0]
 
     def name(prefix):
@@ -60,6 +61,9 @@ def module_text(batches: int, products: int) -> str:
         total = None
         for _ in range(products):
             acc = ["%zero"] * 8
+            if fenced:
+                out.append('        llvm.inline_asm has_side_effects asm_dialect = att '
+                           '"fence.proxy.async.shared::cta;\\0A", "" : () -> ()')
             out.append(
                 '        llvm.inline_asm has_side_effects asm_dialect = att '
                 '"wgmma.fence.sync.aligned;\\0A", "" : () -> ()'
@@ -108,7 +112,7 @@ def module_text(batches: int, products: int) -> str:
     return "\n".join(out) + "\n"
 
 
-def ptx_text(batches: int, products: int) -> str:
+def ptx_text(batches: int, products: int, fenced: bool = False) -> str:
     """The same program as ptxas gets it: each product's zero tile, a fence, four `wgmma.mma_async`, commit
     and wait, its words added into the batch's sum right after, the sum folded into the batch's carried tile
     of 8 words, a barrier between batches."""
@@ -141,6 +145,8 @@ def ptx_text(batches: int, products: int) -> str:
             tile = [ints[0] + k for k in range(8)]
             ints[0] += 8
             lines += [f"\tmov.b32 \t%r{r}, 0;" for r in tile]
+            if fenced:
+                lines.append("\tfence.proxy.async.shared::cta;")
             lines.append("\twgmma.fence.sync.aligned;")
             out = ",".join(f"%r{r}" for r in tile)
             for step in range(4):
@@ -186,11 +192,11 @@ def ptx_text(batches: int, products: int) -> str:
     return header + "\n".join(lines) + "\n\tret;\n}\n"
 
 
-def _peak(batches: int, products: int) -> int:
+def _peak(batches: int, products: int, fenced: bool = False) -> int:
     with jax_mlir.make_ir_context() as context:
         kernel_liveness.mosaic_gpu_dialect.register_dialect(context)
         context.allow_unregistered_dialects = True
-        module = mlir_ir.Module.parse(module_text(batches, products))
+        module = mlir_ir.Module.parse(module_text(batches, products, fenced=fenced))
         kernel_liveness.passmanager.PassManager.parse(kernel_liveness.CANONICAL).run(module.operation)
         divergent = kernel_liveness.divergent_values(module)
         totals = []
@@ -225,6 +231,16 @@ def test_the_pass_counts_the_registers_ptxas_allocates_for_independent_products(
     assert 8 * (batches * products + batches) <= _peak(batches, products) <= used
 
 
+def test_a_fence_no_products_value_crossed_keeps_the_products_together():
+    """The independent products with a fence of shared memory to the async proxy before each, and no product's
+    value written to shared memory: ptxas still allocates every product's accumulators, and the pass, which
+    closes a run at a fence only where a run's product was stored before it (`_define_all`), counts them
+    all, no more than ptxas allocates."""
+    used, spilled, took = kernel_compile._ptxas(ptx_text(2, 6, fenced=True), "sm90", cap=None)
+    assert took and not spilled
+    assert 8 * (2 * 6 + 2) <= _peak(2, 6, fenced=True) <= used
+
+
 def test_the_pass_reads_no_more_than_ptxas_holds_an_attention_backward():
     """The H100's fused key and value backward of a causal attention 128 wide (the attention resource gate's
     case, tests/test_attention_mosaic.py), whose products read each other (S, then P, then the value and key
@@ -254,15 +270,16 @@ def test_the_pass_reads_no_more_than_ptxas_holds_an_attention_backward():
     with generation.assumed("sm90"):
         models = attention._backward_models(op, ba, config)
         shapes = jax.tree.map(lambda array: jax.ShapeDtypeStruct(array.shape, array.dtype), residuals)
-        (record,) = kernel_compile.compile_mosaic_kernels(
-            [KernelCase("backward", lambda: (backward, (query, key, key, query, shapes)), models)], "sm90")
-    def least(need) -> int:
-        # ptxas's least cap that holds the kernel spill-free (`kernel_compile.register_decisions`' caps).
-        return need if isinstance(need, int) else min(cap["cap"] for cap in need["caps"] if cap["holds"])
 
+        def case(models: dict):
+            return KernelCase("backward", lambda: (backward, (query, key, key, query, shapes)), models)
+
+        # The pass's count beside the launch's model, and ptxas's least spill-free cap with no model asked
+        # (`kernel_compile.register_need`).
+        (record,), (needed,) = (kernel_compile.compile_mosaic_kernels([case(found)], "sm90")
+                                for found in (models, {}))
+    need = {kernel_compile._report(kernel).traced: kernel["need"] for kernel in needed["kernels"]}
     lowered = record.get("lowered_models", {})
-    checked = [(found.traced, lowered[found.traced]["registers"], least(kernel["need"]))
-               for kernel in record["kernels"] if (found := kernel_compile._report(kernel)).traced in lowered
-               and kernel.get("need") is not None]
-    assert checked, (sorted(lowered), [kernel["kernel"] for kernel in record["kernels"]])
-    assert all(registers <= need for _, registers, need in checked), checked
+    checked = [(name, model["registers"], need.get(name)) for name, model in lowered.items()]
+    assert checked and all(found is not None for _, _, found in checked), (checked, sorted(need))
+    assert all(registers <= found for _, registers, found in checked), checked
