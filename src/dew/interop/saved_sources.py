@@ -16,16 +16,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import tempfile
 from collections.abc import Sequence
-from dataclasses import Field, dataclass, fields, replace
+from dataclasses import dataclass, fields, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar, Protocol, runtime_checkable
+from typing import TYPE_CHECKING
 
 import jax
 from etils import epath
 from jax.sharding import Mesh
 
-from dew._coordination import agreed_same, collective_host, from_every_process, seen_by_every_process
+from dew._coordination import agreed_same, from_every_process, reading_home, seen_by_every_process
 from dew.cache import dew_cache_dir, package_digest
 from dew.checkpoints import RUN_FILE
 from dew.files import staged
@@ -46,54 +47,27 @@ if TYPE_CHECKING:
     from dew.sampling.solvers.common import Solver
 
 
-@runtime_checkable
-class _Weighted(Protocol):
-    """A released task as an export writes it: a dataclass of its weights (`variables`)."""
-
-    __dataclass_fields__: ClassVar[dict[str, Field[object]]]
-    variables: Variables
-
-    def save_pretrained(self, directory: str) -> None: ...
-
-
 def export_run(run: SavedRun, destination: str | Path, *, ema: bool | None = None,
-               mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
-               shared: bool = False) -> None:
+               mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None) -> None:
     """Write `run`'s pinned checkpoint (`SavedRun.pinned`) to `destination` as its release, its EMA
     weights where `ema`: a task's own released layout (`ReleasedTask`), or the model in its family's
     source layout (`Pretrained.from_saved`). Its weights restore where `mesh` and `layout` place them,
-    so no device holds more of them than a load does.
-
-    On one process the writer reads them from the devices as it writes, a shard at a time
-    (`save_sharded`). A pool reads them home together (`collective_host`): every process, each writing
-    a release of its own, or where the pool `shared` the destination, the first alone, which writes it
-    once while the others take part in the restore and the gathers (ledger 2776)."""
+    so no device holds more of them than a load does, and the writer reads them home a tensor at a time
+    as it writes them, one shard of the release at a time (`save_sharded`). On a pool every process
+    runs this same writer, reading each tensor that spans the pool's processes home together
+    (`reading_home`), so each host holds a shard of the release, not the model (ledger 2874)."""
     from dew.interop.pretrained import Pretrained
     from dew.objectives.base import ReleasedTask
 
     task = run.objective.saved_task
     if task is not None and issubclass(task, ReleasedTask):
         released = task.from_saved(run, ema=ema, mesh=mesh, layout=layout)
-        if not isinstance(released, _Weighted):
-            raise TypeError(f"{task.__name__} releases no dataclass of its weights (variables), which an "
-                            "export reads home before it writes them")
-        hosted = _written(released.variables, shared=shared)
-        if hosted is not None:
-            replace(released, variables=hosted).save_pretrained(str(destination))
+        with reading_home("saved run export"):
+            released.save_pretrained(str(destination))
     else:
         bundle = Pretrained.from_saved(run, ema=ema, mesh=mesh, layout=layout)
-        hosted = _written(bundle.variables, shared=shared)
-        if hosted is not None:
-            replace(bundle, variables=hosted).save(destination)
-
-
-def _written(variables: Variables, *, shared: bool) -> Variables | None:
-    """`variables` as this process's writer of an export reads them (`export_run`), None on a process that
-    writes none: as restored on one process, and across a pool read home by every process, or by the
-    first alone where the pool `shared` the destination."""
-    if jax.process_count() == 1:
-        return variables
-    return collective_host(variables, phase="saved run export", held_by="first" if shared else "every")
+        with reading_home("saved run export"):
+            bundle.save(destination)
 
 
 def is_saved_run(name_or_dir: str | Path) -> bool:
@@ -256,16 +230,18 @@ def released_run(name_or_dir: str | Path, *, step: int | str | None = None, ema:
     lacking = any(from_every_process(not release.is_dir()))
     if not lacking:
         return release
-    # Every process restores, a collective. Where the pool shares the cache and every process asks for
-    # the one release, the first writes it alone; elsewhere each writes its own, and one that holds it
-    # already keeps it (`staged`). A key reads each host's own checkpoint files (`_fingerprint`), which
-    # copies of one checkpoint on several hosts may stamp apart.
+    # Every process restores and writes, the pool reading its tensors home together. Where the pool
+    # shares the cache and every process asks for the one release, the first publishes it and the others
+    # write theirs to a directory of their own, discarded; elsewhere each publishes its own, and one that
+    # holds it already keeps it (`staged`). A key reads each host's own checkpoint files
+    # (`_fingerprint`), which copies of one checkpoint on several hosts may stamp apart.
     shared = (jax.process_count() > 1 and len(set(from_every_process(release.name))) == 1
               and all(seen_by_every_process(str(release.parent))))
     if shared and jax.process_index() != 0:
-        export_run(run, release, ema=ema, mesh=mesh, layout=layout, shared=True)
+        with tempfile.TemporaryDirectory() as discarded:
+            export_run(run, discarded, ema=ema, mesh=mesh, layout=layout)
     else:
         with staged(release) as destination:
-            export_run(run, destination, ema=ema, mesh=mesh, layout=layout, shared=shared)
+            export_run(run, destination, ema=ema, mesh=mesh, layout=layout)
     from_every_process(None)  # every process reads the release once it is published
     return release

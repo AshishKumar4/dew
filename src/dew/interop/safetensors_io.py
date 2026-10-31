@@ -21,6 +21,7 @@ import jax
 import ml_dtypes
 import numpy as np
 
+from dew._coordination import read_home
 from dew._records import JSON
 from dew.files import replacing, write_atomically
 from dew.interop.unread import Stored, Unread
@@ -156,8 +157,9 @@ def _leaf_name(path) -> str:
 
 
 def _host_array(leaf) -> np.ndarray:
-    """`leaf` on the host, C-contiguous: the one step every safetensors write takes."""
-    array = np.asarray(leaf)
+    """`leaf` on the host, C-contiguous: the one step every safetensors write takes, a pool's array read
+    home by the pool together where it reads them so (`read_home`)."""
+    array = read_home(leaf)
     return array if array.flags.c_contiguous else np.ascontiguousarray(array)
 
 

@@ -11,6 +11,8 @@ coordinate through these, so they live apart from any one of them.
 from __future__ import annotations
 
 import atexit
+import contextlib
+import contextvars
 import hashlib
 import itertools
 import json
@@ -166,6 +168,33 @@ def collective_host[T](value: T, *, phase: str, held_by: Literal["every", "first
         error = failure
     agree_process_phase(error, phase=f"{phase} tree reconstruction")
     return materialized if held else None
+
+
+_READS_HOME: contextvars.ContextVar[str | None] = contextvars.ContextVar("reads_home", default=None)
+"""The phase of the scope `read_home` reads a pool's arrays home in (`reading_home`), None outside one."""
+
+
+@contextlib.contextmanager
+def reading_home(phase: str) -> Iterator[None]:
+    """A scope in which `read_home` reads an array spanning the pool's processes home by a collective
+    (`collective_host`), every process of the pool reading the same arrays in the same order: each
+    process running the same writer over the same tree (`dew.interop.saved_sources.export_run`), a
+    writer that reads one tensor at a time then holds one on every host, not the whole tree."""
+    token = _READS_HOME.set(phase)
+    try:
+        yield
+    finally:
+        _READS_HOME.reset(token)
+
+
+def read_home(value) -> np.ndarray:
+    """`value` on this host: an array spanning other processes' devices read home by the pool together
+    inside `reading_home`, and any other as it is (`np.asarray`), which refuses such an array outside
+    one rather than wait on processes that are not reading it."""
+    phase = _READS_HOME.get()
+    if phase is not None and isinstance(value, jax.Array) and not value.is_fully_addressable:
+        return np.asarray(collective_host(value, phase=phase))
+    return np.asarray(value)
 
 
 def from_every_process(value) -> list:

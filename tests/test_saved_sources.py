@@ -3,10 +3,12 @@ release `dew export` writes of the run's checkpoint (`dew.interop.saved_sources`
 own sampling task, at the step its selection pins, which its record names."""
 
 import dataclasses
+from pathlib import Path
 
 import jax
 import numpy as np
 import pytest
+from process_support import run_pool
 from run_kinds import decision, diffusion, trained
 
 from dew.batch import FROZEN
@@ -107,3 +109,25 @@ def test_a_diffusion_run_starts_from_a_saved_diffusion_run_as_from_its_task(tmp_
         load_diffusion_source(str(source), dtype="float32", size=(8, 8))
     with pytest.raises(ValueError):
         released_run(source)
+
+
+WORKER = Path(__file__).with_name("saved_export_worker.py")
+
+
+@pytest.mark.distributed
+@pytest.mark.mesh
+def test_a_pool_writes_a_model_spanning_its_processes_a_tensor_at_a_time(tmp_path):
+    """Two real processes write a decoder whose kernels span both, as a run's export writes its release
+    (`export_run`, ledger 2874): inside `reading_home` each reads one tensor home at a time, together, so
+    neither holds more than the largest tensor beyond the shard it writes, where the pool read the
+    whole tree home first; both write the files one process writes of the same weights unplaced, byte for
+    byte. Outside the scope the write is refused rather than left waiting on the other process."""
+    reports = run_pool("exported", tmp_path / "pool", processes=2, script=WORKER, devices=2, fsdp_size=4,
+                       run_dir=str(tmp_path))
+    for report in reports:
+        assert report["processes"] == 2 and report["spanning"] > 0
+        assert report["refused_outside"]
+        assert report["pooled"] == report["alone"] == reports[0]["alone"] and report["pooled"]
+        assert report["gathers"] >= report["spanning"]
+        assert report["largest_gathered"] <= report["largest_leaf"] < report["whole"]
+

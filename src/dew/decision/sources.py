@@ -128,7 +128,8 @@ def _save_laya(bundle: PretrainedDecision, directory: str | Path, *,
     Decide.of(bundle).save_pretrained(directory, max_shard_size=max_shard_size)
 
 
-def _export_laya(bundle: PretrainedDecision, variables: Mapping[str, object] | None) -> dict[str, np.ndarray]:
+def _export_laya(bundle: PretrainedDecision, variables: Mapping[str, object] | None
+                 ) -> Mapping[str, np.ndarray]:
     held = bundle if variables is None else dataclasses.replace(bundle, variables=dict(variables))
     task = Decide.of(held)
     return laya_tensors(task.model, task.variables)[0]

@@ -23,6 +23,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from dew._coordination import read_home
 from dew._model_types import LAYER_SCALAR_COLLECTIONS
 from dew.distributed.host import evict
 from dew.interop.unread import Stored, valued
@@ -204,7 +205,8 @@ class WeightLayout:
 
     def _source(self, leaves, *, on_host: bool):
         xp = np if on_host else jnp
-        arrays = [xp.asarray(leaf) for leaf in leaves]
+        # A leaf spanning a pool's processes is read home by the pool together where it reads them so.
+        arrays = [read_home(leaf) if on_host else jnp.asarray(leaf) for leaf in leaves]
         if self.concatenate is None:
             value = arrays[0]
         elif self.chunks is None:
@@ -243,7 +245,8 @@ class WeightLayout:
         device_transpose = (len(leaves) == 1 and self.transpose is not None
                             and isinstance(leaves[0], jax.Array)
                             and jax.dtypes.canonicalize_dtype(leaves[0].dtype) == leaves[0].dtype)
-        value = np.ascontiguousarray(self._source(leaves, on_host=not device_transpose)).reshape(self.shape)
+        value = np.ascontiguousarray(read_home(self._source(leaves, on_host=not device_transpose)))
+        value = value.reshape(self.shape)
         return value if self.dtype is None else value.astype(self.dtype)
 
     def restore(self, tensor: np.ndarray, shape: tuple[int, ...]) -> np.ndarray:
