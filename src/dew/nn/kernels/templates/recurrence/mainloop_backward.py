@@ -406,9 +406,10 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: _Call, t
     # summed; a step's two fp32 tiles at once, the corrected values' gradient beside the local one it adds
     # or the decayed output's gradient read after it (`algebra.reverse_carried`: the local one folds into it
     # before the read forms), beside the output's gradient, a memory slice as an operand, and the stored
-    # tiles' casts; without the delta rule the values beside the gradient for beta's sum.
+    # tiles' casts; without the delta rule the values as stored and in fp32, their product with the gradient
+    # for beta's sum and the gradient gated, beside it.
     held_tiles = _Held(carried=[_f32(width, bv)] * 2, phases=(
-        [_f32(CHUNK, bv)] * (2 + (not call.delta)) + _held(given, CHUNK, bv) * (1 + (not call.delta))
+        [_f32(CHUNK, bv)] * (2 + 3 * (not call.delta)) + _held(given, CHUNK, bv) * (1 + (not call.delta))
         + _held(held, call.block, bv) + _held(memories, call.block, bv) + _held(grads, CHUNK, bv)
         + _fragments(call, (given, CHUNK, call.block), (held, CHUNK, call.block)),))
     final_landing, after = _final_landing(call, bv)
