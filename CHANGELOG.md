@@ -5,6 +5,25 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- A token export's documents are the records its producer wrote, by its length index, not its tokens'
+  EOS: an EOS a document's own text spells splits nothing, an export without an EOS packs, an empty
+  record is no document, and no `train.documents.npy` is written or read. A plan saved before resumes
+  where it read the same documents and is refused where it read others.
+- A diffusion run derives its preset's resolution shift and EDM space where it builds its process, so a
+  `data.images.size` or autoencoder override derives them afresh. A JEPA run's predictor computes in its
+  built encoder's dtype and attention kernel.
+- One capture path: `dew.telemetry.profile.CaptureOptions` replaces `capture_options()`, and a
+  `ProfileWindow` holds it as `capture` in place of its `host_tracer_level`, `python_tracer_level` and
+  `activity_cap` (a saved run's are read as its capture's). `Profiler(reports=False)` captures a trace a
+  reader reads alone, with no XProf reports; the benchmarks and PGLE's guided profile capture through
+  it. The fit's trace record is `ProfileTraced`.
+- The step and data benchmarks rate MFU over the whole mesh's peak, as the trainer does, and report
+  their compiled work as a lower bound beside the launches it left out.
+- `from_grain`, `from_iter` and `from_hf` take a source's content version as `identity=`, as
+  `from_torch` does; a saved chain's iterator `name` reads as its identity.
+- A record's remote media path is read from Dew's mirror, refused (`Unmirrored`) where the mirror has no
+  room for it.
+
 ## 0.2.0
 
 The first release on Dew's own package index, `pip install dewml --extra-index-url
