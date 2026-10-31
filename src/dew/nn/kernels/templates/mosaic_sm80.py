@@ -20,10 +20,9 @@ from dew.nn.kernels.templates import mosaic, report, resources
 
 def _staging(block: tuple, swizzle: int | None) -> tuple:
     """A stream's tile's transforms: a tile's swizzled (its own, `swizzle` where a stream names one); a side
-    vector's none, in whole 16-byte cp.async chunks, and a tile's none where it is read a row at a time
-    (`mosaic.UNSWIZZLED`)."""
+    vector's none, in whole 16-byte cp.async chunks."""
     shape, dtype = block
-    if len(shape) == 1 or swizzle == mosaic.UNSWIZZLED:
+    if len(shape) == 1:
         return ()
     return swizzled(shape, dtype) if swizzle is None else mosaic.swizzle_transforms(dtype, swizzle)
 

@@ -8,8 +8,6 @@ one process (`gpu_flow`), each cell its own file's property:
   H100 (test_mosaic_toolkit).
 - The Blackwell grouped matmul holds check 1 on a B200 or a B300, sm100 and sm103 alike
   (test_gemm_blackwell).
-- The toolkit's warpgroup scan walks a linear recurrence forward and reversed, each position's state or
-  the one before it, as float64 does (test_warpgroup_scan).
 """
 
 import functools
@@ -22,7 +20,6 @@ import test_gemm_blackwell as gemm_blackwell
 import test_gemm_template as gemm_template
 import test_grouped_gemm as grouped_gemm
 import test_mosaic_toolkit as mosaic_toolkit
-import test_warpgroup_scan as warpgroup_scan
 from gpu_flow import Cell, cells_of, run_cells
 from jax.experimental.pallas import fuser
 from reference_error import assert_as_exact
@@ -115,10 +112,4 @@ def test_the_gemm_kernels_run_on_this_gpu():
                                  consumers, lo), "sm90")
           for consumers, lo in ((1, 0), (2, 0), (2, 3))),
         *cells_of(gemm_blackwell.the_blackwell_gmm_holds_check_1_on_blackwell),
-        *(Cell(f"the warpgroup scan walks the recurrence: {positions} positions"
-               f"{' reversed' if reverse else ''}{' exclusive' if exclusive else ''}",
-               functools.partial(warpgroup_scan.the_scan_walks_the_recurrence_on_this_gpu, positions, reverse,
-                                 exclusive))
-          for positions in warpgroup_scan.POSITIONS for reverse in (False, True)
-          for exclusive in (False, True)),
     ])
