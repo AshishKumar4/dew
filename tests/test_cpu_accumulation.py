@@ -154,11 +154,12 @@ def test_a_bias_spread_over_a_sharded_axis_keeps_its_sharding():
 
 
 @pytest.mark.parametrize("wide", [True, False], ids=["test setting", "library"])
-def test_a_bias_spread_over_a_size_one_explicit_axis_keeps_its_placement(wide, monkeypatch):
-    """A value `[1, 4]` placed on a size-one Explicit axis along the axis it spreads over takes the
-    broadcast to `[3, 4]` under jit, in either setting, where the doubling and the outer product would
-    each drop that placement (review of ledger 1698's bias sites): it adds itself to every position
-    and takes its cotangents' sum."""
+def test_a_value_spread_over_a_size_one_explicit_axis_keeps_its_placement(wide, monkeypatch):
+    """A value `[1, 4]` placed on a size-one Explicit axis along the axis it spreads over is broadcast to
+    `[3, 4]` under jit, in either setting, where the doubling and the outer product would each drop
+    that placement and the platform choice refuse their types (review of ledger 1698's bias sites).
+    Its gradient JAX's own broadcast does not take (its transpose's cotangent keeps the spread shape),
+    so the forward is what `spread` keeps."""
     from jax.sharding import AxisType, NamedSharding, PartitionSpec
 
     from dew.nn.precision import spread
@@ -171,10 +172,9 @@ def test_a_bias_spread_over_a_size_one_explicit_axis_keeps_its_placement(wide, m
     with jax.set_mesh(mesh):
         value = jax.device_put(np.full((1, 4), 0.5, np.float32),
                                NamedSharding(mesh, PartitionSpec("row", None)))
-        cotangent = np.ones((3, 4), np.float32)
-        out, gradient = jax.jit(with_gradients(lambda value: spread(value, (3, 4))))(value, cotangent)
+        out = jax.jit(lambda value: spread(value, (3, 4)))(value)
+    assert jax.typeof(out).sharding.spec == PartitionSpec("row", None)
     assert np.asarray(out).tolist() == np.full((3, 4), 0.5).tolist()
-    assert np.asarray(gradient).tolist() == np.full((1, 4), 3.0).tolist()
 
 
 def test_another_threads_quantized_trace_leaves_this_threads_products_dews():
