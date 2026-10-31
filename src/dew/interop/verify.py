@@ -47,6 +47,7 @@ import numpy as np
 from flax import traverse_util as flax_traverse
 
 from dew import _records
+from dew.cache import package_digest
 from dew.interop import decoder_parts, hf_decoders as decoders, parts, sources
 from dew.interop.decoder_families import ENTRIES
 from dew.nn.blocks import padded_row
@@ -752,24 +753,18 @@ _VERIFIED = 'verified'
 
 def _record_key(hf_config: Mapping[str, object], source: ModelSource) -> str:
     """What a verification holds for: the config, the transformers and torch releases, Dew's own
-    implementation (every source file of `dew`, so any change of a reader, the shrink or a model
-    verifies again) and the repository, commit and folder the remote code was fetched at
-    (`ModelSource.pinned`), as one digest."""
-    from transformers import __version__
-
-    import dew
-
-    digest = hashlib.sha256()
+    implementation (`package_digest`, so any change of a reader, the shrink or a model verifies again)
+    and the repository, commit and folder the remote code was fetched at (`ModelSource.pinned`), as one
+    digest."""
     import importlib.metadata
 
+    from transformers import __version__
+
     remote = None if source.pinned is None else asdict(source.pinned)
-    digest.update(json.dumps({'config': hf_config, 'transformers': __version__, 'remote': remote,
-                              'torch': importlib.metadata.version('torch')},
-                             sort_keys=True, default=str).encode())
-    package = Path(dew.__file__).parent
-    for path in sorted(package.rglob('*.py')):
-        digest.update(str(path.relative_to(package)).encode() + b'\0' + path.read_bytes())
-    return digest.hexdigest()
+    return hashlib.sha256(json.dumps({'config': hf_config, 'transformers': __version__, 'remote': remote,
+                                      'torch': importlib.metadata.version('torch'),
+                                      'dew': package_digest()},
+                                     sort_keys=True, default=str).encode()).hexdigest()
 
 
 def _recorded(key: str) -> VerifiedMapping | None:

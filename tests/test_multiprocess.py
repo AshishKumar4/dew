@@ -66,6 +66,8 @@ BLOCK_AFTER = 5
 RECORDS = worker.BATCH * 16
 AVERAGING = Path(__file__).with_name("averaging_worker.py")
 """The worker of the pools that average runs."""
+PROFILE_STOP = Path(__file__).with_name("profile_stop_worker.py")
+"""The worker of the pools whose profile window one rank cannot stop."""
 EXAMPLES_CLOCK = Path(__file__).with_name("examples_clock_worker.py")
 """The worker of the pools that run on the examples clock."""
 CLOCKED = 17
@@ -1596,11 +1598,11 @@ def test_evaluation_coordinates_root_consumers_keys_and_host_failures(tmp_path):
         assert len(preview) == 1 and preview[0] not in scoring
         assert report["results"]["preview_only"]["events"][0][0] == "preview"
         assert len(report["results"]["preview_only"]["events"]) == 1
-        assert report["results"]["preview_only"]["scores"]["evaluation/coordinated_batches"] == 1
-        assert report["results"]["preview_only"]["scores"]["evaluation/records"] == 8
+        assert report["results"]["preview_only"]["scores"]["evaluation/counts/val/coordinated_batches"] == 1
+        assert report["results"]["preview_only"]["scores"]["evaluation/counts/val/records"] == 8
         # Process 0 holds one batch and process 1 two: process 0 covers the
         # second with its first's rows marked repeats, so the pass reads all 12.
-        assert report["results"]["uneven"]["scores"]["evaluation/coordinated_batches"] == 2
+        assert report["results"]["uneven"]["scores"]["evaluation/counts/val/coordinated_batches"] == 2
         for phase in ("metric", "preview", "finalize", "log", "render", "construct", "next"):
             assert "error" in report["results"][phase], (phase, report)
             if phase != "construct":
@@ -1609,8 +1611,8 @@ def test_evaluation_coordinates_root_consumers_keys_and_host_failures(tmp_path):
         assert report["results"]["empty"] == {"scores": {}, "events": []}
         assert report["results"]["no_consumer"] == {"scores": {}, "events": []}
         assert "no_consumer" not in report["closed"]
-        assert report["results"]["normal"]["scores"]["evaluation/records"] == 16
-        assert report["results"]["uneven"]["scores"]["evaluation/records"] == 12
+        assert report["results"]["normal"]["scores"]["evaluation/counts/val/records"] == 16
+        assert report["results"]["uneven"]["scores"]["evaluation/counts/val/records"] == 12
         for invalid in ("mismatch", "duplicates"):
             assert "error" in report["results"][invalid]
             assert report["results"][invalid]["events"] == []
@@ -1640,7 +1642,7 @@ def test_evaluation_counts_rows_once_across_replicated_process_axes(tmp_path, ax
     assert reports[0]["measured"] == reports[1]["measured"]
     for report in reports:
         assert report["measured"]["val/count"] == 3
-        assert report["measured"]["evaluation/records"] == 3
+        assert report["measured"]["evaluation/counts/val/records"] == 3
         assert report["no_consumer"] == {}
 
 
@@ -1768,6 +1770,19 @@ def test_a_profile_window_that_fails_on_one_rank_fails_the_pool_together(tmp_pat
     assert "NotADirectoryError" in reports[0]["failed"]
     assert "profiling window start" in reports[1]["failed"]
     assert all(report["recovered"] == 2 for report in reports)
+
+@pytest.mark.distributed
+def test_a_profile_window_that_one_rank_cannot_stop_still_waits_for_its_peers_exports(tmp_path):
+    """Rank 0 cannot write its trace as the window stops, while rank 1's stop starts its export: the pool
+    fails the stop together, and each rank's cleanup waits for the exports it started, so rank 1's export
+    has written its manifest and none runs on as the fit returns (row 2767's review)."""
+    pytest.importorskip("xprof.convert.raw_to_tool_data", reason="optional profile extra")
+    reports = run_pool("profile_stop_failure", tmp_path / "pool", 2, script=PROFILE_STOP, devices=2,
+                       timeout=300, steps=4, profile_dir=str(tmp_path / "pool" / "trace"))
+    assert all("profile stop" in (report["failed"] or "") for report in reports), reports
+    assert reports[1]["manifests"] == 1
+    assert all(report["recovered"] == 2 for report in reports)
+
 
 @pytest.mark.distributed
 def test_a_pool_refuses_what_its_processes_do_not_share_before_any_trains(tmp_path):

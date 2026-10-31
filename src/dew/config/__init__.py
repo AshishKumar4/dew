@@ -47,7 +47,7 @@ from etils import epath
 import dew.io
 from dew import registry, training
 from dew._coordination import agree_process_phase, agreed, agreed_same
-from dew._records import JSON, duration, earlier_segments, is_share, recorded_duration
+from dew._records import JSON, duration, earlier_fields, is_share, recorded_duration
 from dew.cache import dew_cache_dir
 from dew.checkpoints import RUN_FILE, Checkpoints, Keep, Resume
 from dew.config.sweep import RandomSearch, Search, Space, read_ledger, write_ledger
@@ -983,12 +983,20 @@ def earlier_run(record: Mapping[str, object]) -> Mapping[str, object]:
     A configuration written today that names the earlier knobs is refused by name, as any field its class
     does not declare. A record in today's shapes passes as it is. Carried to 1.0, when it is deleted
     (ledger 1552)."""
-    record = earlier_newton_schulz(record)
+    return earlier_newton_schulz(earlier_trainer(record))
+
+
+def earlier_trainer(record: Mapping[str, object]) -> Mapping[str, object]:
+    """A saved run's record with its decision segments and its trainer's numerics in today's shapes
+    (`earlier_run`), its optimizer's as it was."""
     fields = record.get("fields")
     segments = fields.get("segments") if isinstance(fields, Mapping) else None
     if isinstance(fields, Mapping) and isinstance(segments, list):
-        # A decision run's row of segments, in today's fields (`earlier_segments`).
-        fields = {**fields, "segments": earlier_segments(segments)}
+        # A decision run's row of segments, each component in today's fields (`earlier_fields`): the
+        # segments alone, where a layout's components are, never a field of data a row holds.
+        migrated = earlier_fields(json_value(segments))
+        assert isinstance(migrated, list)
+        fields = {**fields, "segments": migrated}
         record = {**record, "fields": fields}
     if not isinstance(fields, Mapping) or not isinstance(fields.get("trainer"), Mapping):
         return record
@@ -1042,15 +1050,14 @@ def earlier_newton_schulz(record: Mapping[str, object]) -> Mapping[str, object]:
 
 
 def saved_forms(trainer: Mapping[str, object]) -> str:
-    """The forms a saved trainer's numerics name: its precision's, a preset's name or a `Numerics`
-    record, or before it held one its `attention_form`; the fast ones where it names none."""
+    """The forms a saved trainer's numerics name, in today's shapes (`earlier_trainer`): its precision's,
+    a preset's name or a `Numerics` record; the fast ones where it names none."""
     precision = trainer.get("precision")
     if isinstance(precision, str):
         return numerics_of(precision).forms
     if isinstance(precision, Mapping):
         return from_record(Numerics, precision).forms
-    form = trainer.get("attention_form")
-    return form if isinstance(form, str) else "fast"
+    return "fast"
 
 
 def earlier_compute(record: Mapping[str, object]) -> str:
@@ -1981,8 +1988,7 @@ class RunConfig:
         trainer = self.trainer
         return training.Trainer(
             objective, self.optim, key=trainer.key, mesh=mesh, microbatches=trainer.microbatches,
-            # The run's layout as its models place their own trees (`Objective.placement`).
-            layout=objective.placement(trainer.layout), accumulation=trainer.accumulation,
+            layout=trainer.layout, accumulation=trainer.accumulation,
             split=trainer.split,
             dynamic_scale=(self.compute_dtype() == "float16" if trainer.dynamic_scale is None
                            else trainer.dynamic_scale), rollout=rollout,

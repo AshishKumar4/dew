@@ -76,8 +76,8 @@ def _classic(model: CausalTransformer):
         raise ValueError('first_attention_norm=False drops a pre-norm, so it requires pre_norms')
     if model.head_transform not in (None, 'gelu', 'gelu_exact'):
         raise ValueError("head_transform must be None, 'gelu' or 'gelu_exact'")
-    if model.norm_type == 'layer' and model.scale_offset:
-        raise ValueError('scale_offset describes RMSNorm weights')
+    if model.norm_type == 'fast_layer' and model.scale_offset:
+        raise ValueError("scale_offset describes an RMSNorm's or a 'layer' norm's weight")
     if model.position_embedding not in ('rotary', 'learned', 'alibi'):
         raise ValueError('position_embedding must be rotary, learned or alibi')
     if model.position_embedding_size is not None and (

@@ -480,7 +480,7 @@ _exporting: dict[Path, subprocess.Popen[bytes]] = {}
 """The captures a stop left exporting in a process of their own (`Profiler.stop`), until `exported`."""
 
 
-def exported(directory: Path | None = None) -> None:
+def exported(directory: str | os.PathLike[str] | None = None) -> None:
     """Wait for the exports `Profiler.stop` left running in processes of their own, of every capture or of
     those under `directory`, refusing any that failed: what reads a capture's reports and manifest reads
     them after this (`dew.training.profiling.ProfileReport`)."""
@@ -500,8 +500,6 @@ def _export(capture: Path, converter: _Converter, metadata: dict[str, JSON],
     """Export a stopped `capture`: its status from what it holds (`held_back`), its native reports and its
     manifest (`_reports`), raising every failure of the stop (`failures`) and of the export together."""
     reasons = [] if failures else held_back(capture, metadata)
-    # The process that made the reports: the stopping one's own, or one beside it (`Profiler.stop`).
-    metadata["exported_by"] = os.getpid()
     metadata["capture_status"] = "failed" if failures else "partial" if reasons else "completed"
     metadata["capture_errors"] = [str(error) for error in failures]
     metadata["capture_reasons"] = [*reasons]

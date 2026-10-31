@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 from jupyter_client.manager import KernelManager
 from process_support import free_port
+from tool_support import run_from
 from websockets.asyncio.client import connect
 
 CONTAINER = Path(__file__).resolve().parents[1] / "site" / "live" / "container"
@@ -99,9 +100,10 @@ def serving(port: int) -> bool:
 
 
 def process(connection: Path) -> int:
-    """The process of the kernel whose connection file is `connection`."""
-    found, = [int(path.parent.name) for path in Path("/proc").glob("[0-9]*/cmdline")
-              if str(connection).encode() in path.read_bytes()]
+    """The process of the kernel whose connection file is `connection`, of those the bridge reads
+    (`shared_bridge.processes`)."""
+    with run_from("shared_bridge", "site/live/container") as bridge:
+        found, = [pid for pid, _, command in bridge.processes() if str(connection).encode() in command]
     return found
 
 

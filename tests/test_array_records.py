@@ -1,9 +1,11 @@
 """ArrayRecord shard readers: how many each source and the process hold open, their mirrors, and
 reads in flight through eviction and close."""
 
+import hashlib
 import os
 import pickle
 import threading
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from uuid import uuid4
@@ -149,9 +151,11 @@ def test_arrayrecords_keep_busy_readers_alive_during_eviction_or_close(
         return {opened.fd for opened in psutil.Process().open_files() if opened.path == real}
 
     def blocked_read(reader, index):
+        # The first reader by a weak reference, which neither keeps it alive nor names a later reader
+        # made at its address once it is freed.
         if not first_reader:
-            first_reader.append(id(reader))
-        held = id(reader) == first_reader[0]
+            first_reader.append(weakref.ref(reader))
+        held = first_reader[0]() is reader
         payload = underlying_read(reader, index)
         # A failed read's traceback must not keep the external reader alive after Dew closes it.
         del reader
@@ -240,12 +244,17 @@ def test_arrayrecords_refuse_a_mirror_without_room_for_the_read_width(arrayrecor
         source.close()
 
 
+@pytest.mark.parametrize("declared", [False, True])
 @pytest.mark.parametrize("busy_oldest,retire", [(False, "eviction"), (True, "eviction"), (True, "close")])
 def test_arrayrecords_release_an_idle_mirror_before_opening_its_replacement(
-    arrayrecord_paths, tmp_path, monkeypatch, busy_oldest, retire
+    arrayrecord_paths, tmp_path, monkeypatch, busy_oldest, retire, declared
 ):
+    """A mirror with room for all shards but one serves them all, each shard's copy released as its
+    reader idles: shards read as their producer declared them (`Declared`, each checked in the mirror)
+    among them."""
     import grain.python as grain
 
+    from dew.data.declared import Declared
     from dew.data.sources.records import ArrayRecords
 
     root = Store(f"memory://bounded-record-mirror-{uuid4().hex}")
@@ -253,10 +262,14 @@ def test_arrayrecords_release_an_idle_mirror_before_opening_its_replacement(
     for shard, path in zip(shards, arrayrecord_paths, strict=True):
         shard.write(Path(path).read_bytes())
     capacity = sum(Path(path).stat().st_size for path in arrayrecord_paths[:-1])
+    options = {"dewcache": {"cache_storage": str(tmp_path / "mirror"), "max_bytes": capacity}}
     source = ArrayRecords(
         [shard.url for shard in shards],
-        {"dewcache": {"cache_storage": str(tmp_path / "mirror"), "max_bytes": capacity}},
+        options,
         counts=(8,) * len(shards),
+        declared=tuple(Declared(Store(shard.url, options), {
+            "bytes": len(shard.read()), "sha256": hashlib.sha256(shard.read()).hexdigest()})
+            for shard in shards) if declared else None,
     )
     entered, released = threading.Event(), threading.Event()
     underlying_read = grain.ArrayRecordDataSource.__getitem__

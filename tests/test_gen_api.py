@@ -209,7 +209,8 @@ def test_check_rejects_an_unresolvable_or_nondeclaration_reference(
 def test_a_notebook_pinned_to_a_commit_is_held_to_that_commits_api(gen_api, reference_package, monkeypatch):
     """A notebook whose install pins the package to a commit shows the API that commit documented: a name it
     documented resolves there though the package has since renamed it, one it never held does not, and an
-    unpinned notebook is held to the API as it is."""
+    unpinned notebook is held to the API as it is; a pin to a commit the checkout's history does not hold is
+    refused (ledger 2783)."""
     source, overview = reference_package
     root = overview.parent
     source.write_text("def old_name(): ...\n")
@@ -227,8 +228,13 @@ def test_a_notebook_pinned_to_a_commit_is_held_to_that_commits_api(gen_api, refe
     monkeypatch.setattr("sys.argv", ["gen_api.py", "--check"])
     notebook(root / "pinned.ipynb", install, "from example import old_name\nold_name()\n")
     gen_api.main()
+    # A commit with the same tree that the history does not hold, as one from before a rewrite is to an
+    # environment built before it: refused, though its object is there to archive.
+    outside = git(root, "commit-tree", f"{commit}^{{tree}}", "-m", "outside the history").strip()
+    stray = install.replace(commit, outside)
     for name, cells in (("pinned_absent.ipynb", (install, "import example\nexample.never_held()\n")),
-                        ("current.ipynb", ("from example import old_name\n",))):
+                        ("current.ipynb", ("from example import old_name\n",)),
+                        ("pinned_outside.ipynb", (stray, "from example import old_name\nold_name()\n"))):
         notebook(root / name, *cells)
         with pytest.raises(SystemExit) as stopped:
             gen_api.main()
