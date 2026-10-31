@@ -207,17 +207,42 @@ def biased(product: jax.Array, bias: jax.Array) -> jax.Array:
     return product.astype(dtype) + spread(bias, product.shape).astype(dtype)
 
 
+def _doubled(value: jax.Array, shape: tuple[int, ...], axes: tuple[int, ...]) -> jax.Array:
+    """`value` broadcast to `shape` over its size-one `axes` by doubling: along each axis each entry is
+    paired with itself until the axis is covered, then cut to it, so JAX's transpose at any order sums a
+    cotangent over that axis pairwise, neighbours added level by level, and a cotangent split into
+    blocks over devices adds within each until a block is one entry. The broadcast's transpose is
+    XLA's reduction, which a CPU sums in an order up to twice torch's error at a few hundred rows of
+    16 channels (ledger 1698's Z-Image bias); the pairs' tree is under torch's at every size measured,
+    in the reduction's time."""
+    for axis in axes:
+        count = shape[axis]
+        while value.shape[axis] < count:
+            paired = jnp.stack([value, value], axis=axis + 1)
+            value = paired.reshape(*value.shape[:axis], 2 * value.shape[axis], *value.shape[axis + 1:])
+        value = jax.lax.slice_in_dim(value, 0, count, axis=axis)
+    return value
+
+
 def spread(value: jax.Array, shape: tuple[int, ...]) -> jax.Array:
     """`value` broadcast to `shape`, whose transpose, the sum of a cotangent over every position the
     value spread over (a bias's gradient), a CPU running wide arithmetic (`WIDE_CPU_ARITHMETIC`, Dew's
     tests) takes in float64 and rounds once, as it sums a float32 product (`accumulated`): there the
     broadcast is the outer product of ones and the value, whose transpose is a product. Elsewhere,
-    or where `accumulated` leaves a product its own sum, it is the broadcast, whose transpose JAX
-    sums in the value's dtype."""
+    or where `accumulated` leaves a product its own sum, a CPU spreads a floating value by doubling
+    (`_doubled`), so its transpose sums pairwise in the value's dtype, and an accelerator broadcasts
+    it, whose transpose JAX sums in the value's dtype."""
     axes = tuple(axis for axis, (size, total) in enumerate(zip(value.shape, shape, strict=True))
                  if size == 1 and total != 1)
-    if not axes or not _sums_in_float64(value):
+    if not axes:
         return jnp.broadcast_to(value, shape)
+    if not _sums_in_float64(value):
+        if not jnp.issubdtype(value.dtype, jnp.floating):
+            return jnp.broadcast_to(value, shape)
+        # A CPU sums the transpose pairwise (`_doubled`); an accelerator's reduction is a tree already.
+        return jax.lax.platform_dependent(
+            value, cpu=functools.partial(_doubled, shape=tuple(shape), axes=axes),
+            default=functools.partial(jnp.broadcast_to, shape=tuple(shape)))
     kept = tuple(axis for axis in range(len(shape)) if axis not in axes)
 
     def outer(value: jax.Array) -> jax.Array:
