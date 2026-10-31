@@ -53,12 +53,6 @@ class Template[Config: Hashable](tuning.KernelOp):
         family sets how a compiler lays it out (a warpgroup MMA's operands, a pipeline's stages)."""
         raise NotImplementedError(f"{type(self).__name__} declares no staged bytes")
 
-    def padded(self, ba: tokamax.BoundArguments, config: Config) -> float | None:
-        """The share of the launch's tile grid at `config` outside its operands' extents, the work its
-        tiles' tails compute of nothing (`report.Launch.padded`, row 2772); None where the launch states
-        none."""
-        return None
-
     def registers(self, ba: tokamax.BoundArguments, config: Config) -> int | None:
         """The 32-bit registers a thread of the launch's program holds live at `config`, from its tiles'
         sizes; None where the launch states none. Past `register_budget` the program spills."""

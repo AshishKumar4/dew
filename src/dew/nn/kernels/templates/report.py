@@ -59,8 +59,8 @@ _log = logging.getLogger("dew.kernels")
 @dataclasses.dataclass(frozen=True)
 class Launch:
     """A template launch as it traced: its identity apart from its config (`_identity`), its op's name and
-    its config, none of its traced values; and the share of its tile grid its tails pad (`Template.padded`),
-    None where its template states none."""
+    its config, none of its traced values; and the share of its tile grid its tails pad
+    (`tuning.KernelOp.padded`), None where its op states none."""
     identity: str
     op: str
     config: Hashable
@@ -150,19 +150,11 @@ def launching(op, arguments: tokamax.BoundArguments, config: Hashable) -> Iterat
     """Within the block, the kernels a template's launch traces carry its digest in their names (`named`),
     the same in every process, and their binaries name the launch (`Binary.launch`, `traced`)."""
     token = _TRACING.set(_Pending(lambda: _identity(op, arguments), type(op).__name__, config,
-                                  lambda: _padded(op, arguments, config)))
+                                  lambda: op.padded(arguments, config)))
     try:
         yield
     finally:
         _TRACING.reset(token)
-
-
-def _padded(op, arguments: tokamax.BoundArguments, config: Hashable) -> float | None:
-    """The share of `op`'s tile grid at `config` its tails pad for `arguments` (`Template.padded`), None for
-    a launch of no template's."""
-    from dew.nn.kernels.templates.base import Template
-
-    return op.padded(arguments, config) if isinstance(op, Template) else None
 
 
 def named(name: str | None) -> str | None:

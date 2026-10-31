@@ -1366,9 +1366,10 @@ def test_a_topology_compile_neither_reads_nor_writes_the_persistent_cache(tmp_pa
 
 def test_a_kernel_report_states_the_share_of_its_launches_tile_grids_their_tails_pad():
     """Each kernel of a step's report states `padded`, the share of its launches' tile grids outside
-    their operands (`Template.padded`, row 2772), over its calls: a dense product's rows by its
-    `block_m` and columns by its `block_n`, an attention's queries by its keys each to its blocks; None
-    for a grouped product, whose groups' rows a step routes, and for a call no template's launch traced."""
+    their operands (`KernelOp.padded`, row 2772), over its calls: a dense product's rows by its
+    `block_m` and columns by its `block_n`, a kernel gradient's its kernel's, an attention's queries by
+    its keys each to its blocks; None for a grouped call, whose groups' rows a step routes, and for a
+    call no launch traced."""
     import tokamax
 
     from dew.nn.kernels import grouped_matmul
@@ -1384,6 +1385,11 @@ def test_a_kernel_report_states_the_share_of_its_launches_tile_grids_their_tails
     assert gemm.padded(dense, tile) == 1 - 200 * 300 / (256 * 512)
     grouped = tokamax.BoundArguments(gemm, {**dense.arguments, "dense": False})
     assert gemm.padded(grouped, tile) is None
+    # A kernel gradient's grid is its kernel's, the tokens' width by the cotangent's.
+    gradient = grouped_matmul.Tgmm()
+    weights = tokamax.BoundArguments(gradient, {"tokens": spec(200, 64), "cotangent": spec(200, 300),
+                                                "dense": True})
+    assert gradient.padded(weights, tile) == 1 - 64 * 300 / (128 * 512)
     attention = attention_mosaic.MosaicForward()
     tiles = attention_mosaic_program.Tiles(block_q=64, block_k=128, stages=2, consumers=2)
     scores = tokamax.BoundArguments(attention, {"query": spec(1, 100, 2, 64), "key": spec(1, 200, 2, 64)})

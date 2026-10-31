@@ -116,7 +116,7 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
 
     def padded(self, ba: tokamax.BoundArguments, config: Config) -> float | None:
         """The share of the score grid, each head's queries by its keys, that the launch's blocks pad
-        past the call's (`_padded`, `base.Template.padded`): its query and key blocks' tails."""
+        past the call's (`_padded`, `tuning.KernelOp.padded`): its query and key blocks' tails."""
         queries, keys = ba.arguments["query"].shape[1], ba.arguments["key"].shape[1]
         padded_queries, padded_keys = _padded(queries, keys, config)
         return 1 - queries * keys / (padded_queries * padded_keys)

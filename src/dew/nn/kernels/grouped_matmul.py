@@ -238,14 +238,17 @@ class _GroupedLaunch[Config: Hashable](base.Template[Config]):
     `tokens` and `cotangent`."""
 
     def padded(self, ba, config: Config) -> float | None:
-        """A dense product's (`dense`) output grid, its rows tiled by `block_m` and its columns by `block_n`
-        (`base.Template.padded`); None for a grouped call, whose groups' rows a step routes, for a kernel
-        gradient's and for a tile of no such blocks (a TPU's)."""
-        if self.ROWS != ('tokens',) or not ba.arguments.get('dense') or not isinstance(
-                config, Tile | mosaic_gpu.Tiles):
+        """A dense call's (`dense`) output grid, its rows tiled by `block_m` and its columns by `block_n`
+        (`tuning.KernelOp.padded`): a product's tokens by its kernel's width, a kernel gradient's tokens'
+        width (its depth) by its cotangent's, the tokens the contraction; None for a grouped call, whose
+        groups' rows a step routes, and for a tile of no such blocks (a TPU's)."""
+        if not ba.arguments.get('dense') or not isinstance(config, Tile | mosaic_gpu.Tiles):
             return None
-        kernel = ba.arguments['kernel']
-        rows, width = ba.arguments['tokens'].shape[0], kernel.shape[1 if ba.arguments['trans_rhs'] else 2]
+        if self.ROWS == ('tokens',):
+            kernel = ba.arguments['kernel']
+            rows, width = ba.arguments['tokens'].shape[0], kernel.shape[1 if ba.arguments['trans_rhs'] else 2]
+        else:
+            rows, width = ba.arguments['tokens'].shape[1], ba.arguments['cotangent'].shape[1]
         grid = -(-rows // config.block_m) * config.block_m * -(-width // config.block_n) * config.block_n
         return 1 - rows * width / grid if grid else None
 
