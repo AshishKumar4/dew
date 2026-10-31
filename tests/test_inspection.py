@@ -14,14 +14,14 @@ import optax
 import pytest
 import test_run_budgets
 from objective_cases import cases
-from reference_error import assert_computes_the_oracle
+from reference_error import assert_computes_the_oracle, assert_fp32_reduction_bound
 from run_kinds import KINDS, lm, scalars
 
 from dew.cli.main import main
 from dew.data.dataset import Loader
-from dew.nn.inspection import statistics
+from dew.nn.inspection import HISTOGRAM_EDGES, statistics
 from dew.telemetry.instrumentation import Compiles
-from dew.training import Inspection, Trainer, inspected
+from dew.training import Inspection, MeshSpec, Trainer, inspected
 
 BATCH, RATE = 8, 0.25
 FEATURES = test_run_budgets.FEATURES
@@ -288,6 +288,27 @@ def test_a_watched_module_path_selects_its_layer_alone():
     expected = statistics(jnp.asarray(outputs_of(run, 3)[1]))
     for statistic in ("abs_max", "non_finite", "zero_fraction"):
         assert logged[f"{blocks[0]}/{statistic}"] == float(expected[statistic]), statistic
+
+
+def test_a_summary_over_no_entries_is_a_zero_one():
+    """A summary of no entries (a row set all padding) is a zero tensor's, as a cotangent probe no
+    cotangent reached reads (row 3143): mean, deviation, root mean square and non-finite share 0, its zero
+    share 1, its histogram all in the lowest decade, none of it NaN."""
+    summary = statistics(jnp.ones((3, 4, 5)), histogram=True, where=jnp.zeros((3, 4), bool))
+    assert {name: float(value) for name, value in summary.items()} == {
+        "mean": 0.0, "std": 0.0, "rms": 0.0, "abs_max": 0.0, "non_finite": 0.0, "zero_fraction": 1.0,
+        **{f"histogram_{index}": float(index == 0) for index in range(len(HISTOGRAM_EDGES) + 1)}}
+
+
+def test_a_summarys_deviation_holds_far_from_zero():
+    """A summary's standard deviation of values far from zero, 1e4 apart by 1e-1, is float64's within
+    float32's rounding of their sum (row 3143): taken about the values' own mean, not as the gap between
+    two squares a float32 cannot tell apart."""
+    values = (1e4 + 0.1 * np.random.default_rng(3).normal(size=(64, 32))).astype(np.float32)
+    variance = np.var(values.astype(np.float64))
+    deviation = float(statistics(jnp.asarray(values))["std"])
+    # The variance sums its 2048 entries' squares about their mean, which itself sums them.
+    assert_fp32_reduction_bound(deviation ** 2, variance, variance, terms=2 * values.size)
 
 
 def test_a_watched_histogram_sums_to_its_whole_output():
@@ -638,6 +659,27 @@ def test_a_pipelined_stacks_watched_layers_each_report_every_microbatch():
     assert all(np.isfinite(value) and value > 0 for value in summaries.values())
 
 
+def test_a_watched_cotangent_is_the_updates_loss_whatever_its_split():
+    """A window split into microbatches summarizes the cotangent of the update's pooled loss at its
+    committing microbatch, not the microbatch's own loss (row 3144): over a batch of one row repeated, the
+    split of two logs the cotangent the whole batch's step logs."""
+    def logged(split: int) -> dict[str, float]:
+        objective = watched_run(Stacked(scanned=False), None).objective
+        run = Trainer(objective, optax.sgd(RATE), key=jax.random.key(0), split=split,
+                      mesh=MeshSpec().build(jax.devices()[:1]),
+                      inspection=Inspection(modules=("Block_1",), targets=("params",), cotangents=True))
+        # One row throughout, so any microbatch's rows are the batch's own, however the split deals them.
+        rows = np.repeat(ROWS[:1], BATCH, axis=0)
+        return {name: value for name, value in inspected(run, {"x": rows}).items() if "/cotangents/" in name}
+
+    whole, split = logged(1), logged(2)
+    assert set(whole) == set(split)
+    # The mean square sums the committing microbatch's entries, half the batch's, each the same row's.
+    squares = np.square(whole["inspect/cotangents/Block_1/rms"])
+    assert_fp32_reduction_bound(np.square(split["inspect/cotangents/Block_1/rms"]), squares, squares,
+                                terms=ROWS.size)
+
+
 def test_a_watched_cotangent_is_summarized_unscaled_under_a_dynamic_loss_scale():
     """Under a dynamic loss scale, whose backward is seeded with the scale, a watched block's cotangent is
     summarized as the unscaled loss's (row 2324 review): its every statistic, the histogram's decades
@@ -814,7 +856,7 @@ def test_an_rcm_critic_updates_watched_cotangents_are_its_fake_scores(windows, t
     gradient, summarizes the loss's cotangent at the fake score's watched modules, each reached by it, and
     the student's as the zero it is (row 2324 review): no statistic NaN, a probe no cotangent reached
     counting none."""
-    from dew.nn.inspection import cotangent_statistics
+    from dew.nn.inspection import summarized
     from dew.objectives.diffusion.consistency import FAKE_SCORE
 
     probes = rcm_probes(windows, tmp_path, student=False)
@@ -823,7 +865,7 @@ def test_an_rcm_critic_updates_watched_cotangents_are_its_fake_scores(windows, t
     assert fake and student
     assert all(leaf[..., 0].min() > 0 for leaf in fake) and all((leaf[..., 0] == 0).all() for leaf in student)
     for leaf in student:
-        summary = cotangent_statistics(leaf.reshape(-1, leaf.shape[-1])[0], histogram=False)
+        summary = summarized(leaf.reshape(-1, leaf.shape[-1])[0], histogram=False)
         assert all(np.isfinite(float(value)) for value in summary.values())
         assert float(summary["rms"]) == 0 and float(summary["zero_fraction"]) == 1
 
