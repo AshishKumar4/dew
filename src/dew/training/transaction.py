@@ -598,6 +598,15 @@ class Transaction:
             if jnp.issubdtype(leaf.dtype, jnp.inexact) else cot,
             back(jnp.asarray(factor, value.dtype))[0], current_stats)
 
+    def update_seed(self, pooled, current_stats, factor):
+        """The cotangent of the update's loss, the window's `pooled` statistics', on this microbatch's
+        `current_stats`, seeded with `factor`: `pooled_cotangent`'s, or, for a loss stated as one scalar,
+        which a shared window pools as the mean of its microbatches' (`prepare_attempt`), `factor` over
+        their count."""
+        if isinstance(pooled, Ratio) and not isinstance(current_stats, Ratio):
+            return jnp.asarray(factor / pooled.mass, jnp.result_type(current_stats))
+        return self.pooled_cotangent(pooled, current_stats, factor)
+
     def replay_input(self, state, fill, index):
         """Rebuild the inputs of the window's `index`-th microbatch.
 
@@ -906,7 +915,7 @@ class Transaction:
             if probing is not None and not whole:
                 # The probes summarize the cotangent of the update's loss, the window's pooled one, as replay
                 # differentiates it (`pooled_cotangent`), whatever microbatches the plan splits it into.
-                probed = probing(pooled(pending.pooled, realized.stats, factor))[1]
+                probed = probing(self.update_seed(pending.pooled, realized.stats, factor))[1]
 
             # The record of each of the window's other microbatches the commit replays, in its slot.
             own = evaluation_of(realized.aux)
