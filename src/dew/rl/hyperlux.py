@@ -59,6 +59,8 @@ class HyperLuxRenderer:
             raise ValueError(f"the assets' pillars are of aspects {manifest['aspects']}, the race's "
                              f"{ASPECTS}")
         self.count, self.motion_blur = count, motion_blur
+        drawn = manifest["gate_geometry"]
+        self.gate = (float(drawn["opening"]), float(drawn["frame"]), float(drawn["depth"]))
         pool = hyperlux.AssetPool()
 
         def loaded(name: str) -> int:

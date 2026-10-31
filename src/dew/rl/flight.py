@@ -655,16 +655,25 @@ def dynamics(racing: Racing, race: Race) -> jax.Array:
     nominal: its mass, inertia `[3]`, thrust and drag coefficients and top speed; its rotor, quadratic `[2]`
     and vertical drag; its ground effect's strength; its battery's voltage now over full and its charge drawn
     over the pack's; and its constant force over its mass times the disturbance's limit and its moment over
-    the nominal inertia times its limit `[3]` each, within [-1, 1]."""
+    the nominal inertia times its limit `[3]` each, within [-1, 1]. A term a quadrotor turns off (its nominal
+    or limit zero, so every drone's zero too) reads as the nominal's, 1, and an absent disturbance as 0."""
     q, body, flight = racing.quadrotor, race.body, race.flight
     return jnp.concatenate([
         jnp.stack([body.mass / q.mass]), body.inertia / jnp.asarray(q.inertia),
-        jnp.stack([body.thrust_coefficient / q.thrust_coefficient, body.drag_coefficient / q.drag_coefficient,
-                   body.top_speed / q.top_speed, body.rotor_drag / q.rotor_drag]),
-        body.quadratic_drag / jnp.asarray(q.quadratic_drag),
-        jnp.stack([body.vertical_drag / q.vertical_drag, body.ground_effect, flight.voltage / q.full_voltage,
-                   flight.drawn / q.capacity]),
-        body.force / (body.mass * q.bias_force), body.moment / (jnp.asarray(q.inertia) * q.bias_moment)])
+        jnp.stack([body.thrust_coefficient / q.thrust_coefficient,
+                   _over(body.drag_coefficient, q.drag_coefficient), body.top_speed / q.top_speed,
+                   _over(body.rotor_drag, q.rotor_drag)]),
+        _over(body.quadratic_drag, q.quadratic_drag),
+        jnp.stack([_over(body.vertical_drag, q.vertical_drag), body.ground_effect,
+                   flight.voltage / q.full_voltage, flight.drawn / q.capacity]),
+        _over(body.force / body.mass, q.bias_force, 0.0),
+        _over(body.moment, np.asarray(q.inertia) * q.bias_moment, 0.0)])
+
+
+def _over(value: jax.Array, nominal: float | tuple[float, ...] | np.ndarray, off: float = 1.0) -> jax.Array:
+    """`value` over a quadrotor's `nominal`, and `off` where that nominal is zero (the term turned off)."""
+    nominal = np.asarray(nominal, np.float64)
+    return jnp.where(nominal == 0, off, value / np.where(nominal == 0, 1.0, nominal).astype(value.dtype))
 
 
 def privileged(racing: Racing, race: Race) -> dict[str, jax.Array]:
@@ -760,7 +769,8 @@ class Scene:
 class Renderer(Protocol):
     """A renderer of a batch of `count` drones' cameras: `render(scene, cameras, opened)` answers each drone's
     image `[B, H, W, 3]` uint8 of its `Scene` from its camera at the shutter's close `[B, 12]` (`cameras`)
-    and at its open (for motion blur). Its `aspect` is its images' width over height. Arrays cross by DLPack
+    and at its open (for motion blur). Its `aspect` is its images' width over height, and `gate` the opening,
+    frame and depth of the gates it draws, which a race's must be. Arrays cross by DLPack
     (`dew.rl.simulator.Handed`)."""
 
     @property
@@ -768,6 +778,9 @@ class Renderer(Protocol):
 
     @property
     def aspect(self) -> float: ...
+
+    @property
+    def gate(self) -> tuple[float, float, float]: ...
 
     def render(self, scene: Scene, cameras: jax.Array, opened: jax.Array) -> Handed: ...
 
@@ -821,6 +834,10 @@ class GateRace:
         if renderer is None and ("image" in views or count is None):
             raise ValueError("a gate race without a renderer shows no image and is told its drones' count")
         racing = Racing() if racing is None else racing
+        if renderer is not None and tuple(renderer.gate) != (racing.opening, racing.frame, racing.depth):
+            raise ValueError(f"the renderer draws gates of opening, frame and depth {tuple(renderer.gate)}, "
+                             f"the race's are {(racing.opening, racing.frame, racing.depth)}: its drones "
+                             "would see gates they do not fly through")
         self.renderer, self.racing, self.views = renderer, racing, views
         self.count = renderer.count if renderer is not None else int(count or 0)
         self.difficulty, self.ramp = 1.0, 1.0
