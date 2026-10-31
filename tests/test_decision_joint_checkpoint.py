@@ -421,12 +421,15 @@ def test_a_run_that_held_weights_frozen_serves_as_its_weights_unsplit_do(tmp_pat
         assert jax.tree.structure(resumed[collection]) == jax.tree.structure(state.variables[collection])
 
 
+@pytest.mark.whole_suite
 def test_a_joint_release_fine_tunes_averages_and_reloads_from_its_runs(tmp_path):
     """A joint-head release is a whole task to fine-tune: its Qwen 3.5 backbone, joint head and layout
     train together on rows of several questions, and the saved run loads back as a task with identical
     probabilities. Two such runs average into one task, its temperatures refit on held-out answers
     (`Decide.averaged`), which saves to a directory of its own and reloads through `from_run` and
-    `dew.pipeline` answering as it did (1505)."""
+    `dew.pipeline` answering as it did (1505). Its two fits, average and reloads take 352 s on armada
+    (run sf-cost-2142 at main 4c08ec97d), past a group's 120 s target at any row length the release's
+    rows fit, so the whole suite's run alone takes it (`whole_suite`, ledger 2142)."""
     import dataclasses
 
     from dew.decision import Calibration
@@ -442,11 +445,9 @@ def test_a_joint_release_fine_tunes_averages_and_reloads_from_its_runs(tmp_path)
                 ("how much is pro", "sales", "false"), ("refund please", "billing", "false"))
     examples = [Example(state, {"team": team, "urgent": urgent}, {"team": label, "urgent": hurry})
                 for state, label, hurry in answered * 2]
-    # Training pads every row to the layout's max_len, here past the longest row of these examples (the
-    # release's instructions make a row of no question 310 tokens, these over 512); the release serves up
-    # to 16384.
+    # Training pads every row to the layout's max_len; the release serves up to 16384.
     objective = DecisionObjective(Decide.from_pretrained(release, attention_impl="xla"),
-                                  layout=JointLayout(max_len=768))
+                                  layout=JointLayout(max_len=1024))
     data = decision_rows(examples, 8, examples, objective=objective.data())
     start = jax.jit(objective.init)(jax.random.key(0))
     runs, states = [], []
