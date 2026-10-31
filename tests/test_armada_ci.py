@@ -1869,7 +1869,10 @@ def test_a_plan_keeps_each_green_group_of_a_heavy_file_and_a_task_runs_a_group_w
     rows = armada_task(ci, monkeypatch, verdict)
     assert sorted(row["name"] for row in rows) == ["3.12:tests/test_a.py", "3.12:tests/test_b.py", *heavy]
     assert [len((tmp_path / f"runs-{name}").read_text()) for name in "abcd"] == [1, 1, 1, 1]
-    # A kept group whose green run is not where its token says: its task runs that group alone.
+    # A kept group whose green run its task cannot read, its file changed since the plan: the task runs that
+    # group alone.
+    test_c = tmp_path / "tests/test_c.py"
+    test_c.write_text(test_c.read_text() + "\n# changed after the plan\n")
     monkeypatch.setattr(sys, "argv", ["ci.py", "task", "--python=3.12", "--tests=tests/test_c.py#2/2@"
                                       "GenuineIntel-6-143:0000", f"--out={verdict}", "--cache=on"])
     assert ci.main() == 0
