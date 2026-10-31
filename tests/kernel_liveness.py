@@ -746,6 +746,10 @@ class _Pass:
                                  if not isinstance(operand.owner, ir.Block)))
 
         upstream = read(op.operands)
+        if _orders_shared_memory(op):
+            # A product after it may read what the threads wrote to shared memory before it (attention's P,
+            # stored from S's accumulators): ptxas issues none past it, so it closes the block's run.
+            self.open.pop(op.parent, None)
         if _product(op):
             # A product accumulating in place onto another's accumulators (a contraction's next K step) is
             # the same accumulation: only its other operands (its left operand's registers, an address) can
@@ -762,6 +766,16 @@ class _Pass:
                                       if a is not None)
             upstream.add(op)
         self.reads[op] = frozenset(upstream)
+
+
+def _orders_shared_memory(op) -> bool:
+    """Whether `op` fences the threads' shared-memory writes before the asynchronous proxy reads them (a
+    warpgroup product's operands): `fence.proxy.async`, as `nvvm.fence.proxy` or its assembly."""
+    name = op.name.removeprefix(PREFIX)
+    if name.startswith("nvvm.fence.proxy"):
+        return True
+    return (name == "llvm.inline_asm" and "asm_string" in op.attributes
+            and "fence.proxy.async" in ir.StringAttr(op.attributes["asm_string"]).value)
 
 
 def _product(op) -> bool:
