@@ -24,11 +24,13 @@ from dew.interop.verify import _ROUNDING
 from dew.sampling import Sampling, generate
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from hf_reference import write_device_tiny
 from reference_source import torch_generated, torch_logits
 
 
 def write_fixture(family):
+    # The fixture writer alone reads hf_reference, whose import loads transformers' models.
+    from hf_reference import write_device_tiny
+
     config = (OPTConfig(vocab_size=128, hidden_size=32, num_hidden_layers=2,
                         num_attention_heads=4, ffn_dim=48, max_position_embeddings=64,
                         dropout=0, attention_dropout=0, bos_token_id=1,

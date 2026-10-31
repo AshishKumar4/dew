@@ -39,7 +39,7 @@ def main() -> None:
                              capture_output=True, text=True, check=True).stdout.strip()
     if version != "0.2.5":
         raise SystemExit(f"the recording is of maxtext 0.2.5; {python} holds {version}")
-    worker = subprocess.Popen([python, str(ROOT / "tools" / "maxtext_worker.py"), site, "--serve"],
+    worker = subprocess.Popen([python, str(ROOT / "tools" / "maxtext_worker.py"), site],
                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
                               env={**{key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
                                    "JAX_PLATFORMS": "cpu"})
