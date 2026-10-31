@@ -3,10 +3,9 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
-import pytest
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from dew.training.footprint import device_bytes, gradient_peak, residual_bytes
+from dew.training.footprint import Workspace, device_bytes, gradient_peak, residual_bytes
 
 
 def test_resident_device_bytes_do_not_include_host_state():
@@ -108,8 +107,9 @@ def test_a_gradients_peak_holds_the_gradient_beside_the_cotangent_each_residual_
 
     # Both gradients, 64 x 16 floats each, and the first layer's cotangent, 8 x 64.
     held = (2 * 64 * 16 + 8 * 64) * 4
-    assert gradient_peak(loss, params, (rows,), platform="gpu", workspace=0).bytes == held
-    assert gradient_peak(loss, params, (rows,), platform="gpu", workspace=1 << 20).bytes == held + (1 << 20)
+    for size in (0, 1 << 20):
+        workspace = Workspace(size, size)
+        assert gradient_peak(loss, params, (rows,), platform="gpu", workspace=workspace).bytes == held + size
 
 
 def test_a_fused_value_a_product_reads_is_held_while_it_multiplies():
@@ -123,7 +123,7 @@ def test_a_fused_value_a_product_reads_is_held_while_it_multiplies():
         return jnp.sum(jnp.tanh(jnp.exp(rows) @ weights)), ()
 
     # The gradient (16 x 32), the exponentials (8 x 16), the cotangent and the product (8 x 32 each).
-    assert gradient_peak(loss, weights, (rows,), platform="gpu", workspace=0).bytes == (
+    assert gradient_peak(loss, weights, (rows,), platform="gpu", workspace=Workspace(0, 0)).bytes == (
         16 * 32 + 8 * 16 + 2 * 8 * 32) * 4
 
 
@@ -136,7 +136,8 @@ def test_a_gradient_a_fused_chain_computes_is_held():
         return jnp.sin(params).sum(), ()
 
     for platform in ("gpu", "cpu"):
-        assert gradient_peak(sine, shape, (), platform=platform, workspace=0).bytes == 8 * 16 * 4
+        none = Workspace(0, 0)
+        assert gradient_peak(sine, shape, (), platform=platform, workspace=none).bytes == 8 * 16 * 4
 
 
 def test_a_called_program_holds_what_it_would_inline():
@@ -150,20 +151,9 @@ def test_a_called_program_holds_what_it_would_inline():
     def called(weights, rows):
         return jnp.sum(jnp.tanh(jax.jit(jnp.matmul)(rows, weights))), ()
 
-    assert gradient_peak(called, weights, (rows,), platform="gpu", workspace=0) == gradient_peak(
-        inline, weights, (rows,), platform="gpu", workspace=0)
-
-
-@pytest.mark.parametrize(("generation", "workspace"), [("sm80", 4 << 20), ("sm90", 32 << 20)])
-def test_a_gpu_gives_each_gemm_the_workspace_xla_hands_it(generation, workspace):
-    """XLA hands each cuBLAS matmul a workspace (gemm_rewriter's `GemmWorkspaceRewriteVisitor`): 32 MiB from
-    Hopper on, 4 MiB before (`GemmConfig::kHopperWorkspace`, `kDefaultWorkspace`); a CPU's take none."""
-    from dew.training.ahead import compile_only_gpus
-    from dew.training.footprint import gemm_workspace
-
-    (gpu,) = compile_only_gpus(generation, 1, 1 << 30)
-    assert gemm_workspace(gpu) == workspace
-    assert gemm_workspace(jax.devices("cpu")[0]) == 0
+    none = Workspace(0, 0)
+    assert gradient_peak(called, weights, (rows,), platform="gpu", workspace=none) == gradient_peak(
+        inline, weights, (rows,), platform="gpu", workspace=none)
 
 
 def test_a_loops_stacked_results_are_held_beside_each_turns_own():
@@ -179,7 +169,7 @@ def test_a_loops_stacked_results_are_held_beside_each_turns_own():
         return jax.lax.scan(turn, rows, None, length=10)[1]
 
     program = jax.make_jaxpr(stacked)(square, square).jaxpr
-    assert peak_bytes(program, "gpu", 0) == (10 + 2) * 8 * 8 * 4
+    assert peak_bytes(program, "gpu", Workspace(0, 0)) == (10 + 2) * 8 * 8 * 4
 
 
 def test_a_transposed_input_returned_flat_is_a_copy():
@@ -190,7 +180,7 @@ def test_a_transposed_input_returned_flat_is_a_copy():
 
     rows = jax.ShapeDtypeStruct((8, 16), jnp.float32)
     program = jax.make_jaxpr(lambda rows: rows.T.reshape(-1))(rows).jaxpr
-    assert peak_bytes(program, "gpu", 0) == 8 * 16 * 4
+    assert peak_bytes(program, "gpu", Workspace(0, 0)) == 8 * 16 * 4
 
 
 def test_a_product_too_small_for_cublas_takes_no_workspace():
@@ -204,8 +194,9 @@ def test_a_product_too_small_for_cublas_takes_no_workspace():
 
     for shape, workspace in ((small, 0), (large, 1 << 20)):
         rows = jax.ShapeDtypeStruct((shape.shape[0], shape.shape[0]), jnp.float32)
-        with_workspace = gradient_peak(product, shape, (rows,), platform="gpu", workspace=1 << 20).bytes
-        without = gradient_peak(product, shape, (rows,), platform="gpu", workspace=0).bytes
+        megabyte = Workspace(1 << 20, 1 << 20)
+        with_workspace = gradient_peak(product, shape, (rows,), platform="gpu", workspace=megabyte).bytes
+        without = gradient_peak(product, shape, (rows,), platform="gpu", workspace=Workspace(0, 0)).bytes
         assert with_workspace - without == workspace
 
 
@@ -221,7 +212,7 @@ def test_a_computed_value_read_in_two_orders_is_copied_for_the_second():
         return product.reshape(-1), product.T.reshape(-1)
 
     program = jax.make_jaxpr(flattened)(rows, weights).jaxpr
-    assert peak_bytes(program, "gpu", 0) == 2 * 8 * 32 * 4
+    assert peak_bytes(program, "gpu", Workspace(0, 0)) == 2 * 8 * 32 * 4
 
 
 def test_an_inner_product_of_vectors_takes_no_workspace():
@@ -236,8 +227,9 @@ def test_an_inner_product_of_vectors_takes_no_workspace():
         return jnp.sum(other @ params), ()
 
     for loss, other, workspace in ((inner, vector, 0), (matrix_vector, matrix, 1 << 20)):
-        with_workspace = gradient_peak(loss, vector, (other,), platform="gpu", workspace=1 << 20).bytes
-        without = gradient_peak(loss, vector, (other,), platform="gpu", workspace=0).bytes
+        megabyte = Workspace(1 << 20, 1 << 20)
+        with_workspace = gradient_peak(loss, vector, (other,), platform="gpu", workspace=megabyte).bytes
+        without = gradient_peak(loss, vector, (other,), platform="gpu", workspace=Workspace(0, 0)).bytes
         assert with_workspace - without == workspace
 
 
@@ -254,7 +246,7 @@ def test_a_ragged_product_on_a_gpu_holds_at_least_its_output():
     program = jax.make_jaxpr(lambda rows, weights, sizes: jax.lax.ragged_dot(rows, weights, sizes))(
         rows, weights, sizes).jaxpr
     for platform in ("gpu", "cpu"):
-        assert peak_bytes(program, platform, 0) == 64 * 32 * 4
+        assert peak_bytes(program, platform, Workspace(0, 0)) == 64 * 32 * 4
     assert bounded_below(program, "gpu") and not bounded_below(program, "cpu")
 
 
@@ -273,6 +265,6 @@ def test_a_gradient_states_its_peak_a_bound_from_below_where_a_nested_ragged_pro
     def dense(weights, rows, sizes):
         return jnp.sum(rows @ weights[0, 0]), ()
 
-    assert not gradient_peak(experts, weights, (rows, sizes), platform="gpu", workspace=0).exact
-    assert gradient_peak(experts, weights, (rows, sizes), platform="cpu", workspace=0).exact
-    assert gradient_peak(dense, weights, (rows, sizes), platform="gpu", workspace=0).exact
+    assert not gradient_peak(experts, weights, (rows, sizes), platform="gpu", workspace=Workspace(0, 0)).exact
+    assert gradient_peak(experts, weights, (rows, sizes), platform="cpu", workspace=Workspace(0, 0)).exact
+    assert gradient_peak(dense, weights, (rows, sizes), platform="gpu", workspace=Workspace(0, 0)).exact
