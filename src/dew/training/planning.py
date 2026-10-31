@@ -494,14 +494,18 @@ class Forecast:
         return min(guesses, default=None)
 
 
-def settled(planned: Planned, probes: Sequence[Probe], search: FitSearch) -> dict[str, JSON]:
+def settled(planned: Planned, probes: Sequence[Probe], search: FitSearch,
+            frontier: Sequence[Probe] | None = None) -> dict[str, JSON]:
     """The admitted plan, its kernel report, every compile needed to find it, each rung the derivation
     read before them (`FitSearch.derived`), and the kernels those compiles found spilling and the launch
     configs refused where it searched (`FitSearch.kernels`), which the run's telemetry reports with it
-    (`StepCompiled`). There is no alternative-policy timing or selection in the run's admission record."""
+    (`StepCompiled`); planned ahead with its `frontier`, each rung above the plan that fits at fewer
+    microbatches (`FitSearch.above`). There is no alternative-policy timing or selection in the record."""
     _log.info("the step's %s", planned.candidate.kernels.summary())
+    above: dict[str, JSON] = {} if frontier is None else {"frontier": [probe.record() for probe in frontier]}
     return {**planned.record(), "kernels": planned.candidate.kernels.record(),
-            "probes": [probe.record() for probe in probes], "derived": list(search.derived), **search.kernels}
+            "probes": [probe.record() for probe in probes], "derived": list(search.derived), **search.kernels,
+            **above}
 
 
 def refusal_record(identity: str, config: Hashable, names: frozenset[str]) -> dict[str, JSON]:
@@ -605,6 +609,27 @@ class FitSearch[LossT, EffectsT]:
         if split is None or self.fitted is None:
             raise PlanRefused(self.probes) from (self.refusals[-1] if self.refusals else None)
         return self.found(split), tuple(self.probes)
+
+    def above(self, candidates: Sequence[int], split: int) -> tuple[Probe, ...]:
+        """Past the admitted plan at `split`, each rung above it that fits at fewer of `candidates` than every
+        plan before it, at the fewest that fit there, compiled: the plans a run's speed is chosen among
+        offline (`dew.training.ahead.compile_ahead`'s frontier). A rung at as many microbatches as one below
+        it recomputes more for none fewer, which no speed favours, so it is not compiled; a remat rung takes
+        the run's own head again (`recompute_more`), so a rung may fit at fewer than the one before it, and
+        the search reads the ladder to its end, or until a rung fits at the fewest. The objective is left
+        at the last rung read, the run's to restore."""
+        # A frontier rung that misses is no checkpoint's rung missing (`fits_here`).
+        self.resumed = None
+        fewer, found = list(candidates[:candidates.index(split)]), []
+        while fewer and self.onward(lambda: recompute_more(self.objective, self.base)):
+            asked = len(self.probes)
+            fewest = planned(fewer, 0, self.fits_here, lambda: False,
+                             lambda split: self.forecast.likely(self.rung(), split))
+            if fewest is not None:
+                found.append(next(probe for probe in self.probes[asked:]
+                                  if probe.fits and probe.split == fewest))
+                fewer = fewer[:fewer.index(fewest)]
+        return tuple(found)
 
     def derived_start(self, split: int) -> None:
         """Move the objective to the least-recompute rung whose derived footprint at `split`, the run's

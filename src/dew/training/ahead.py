@@ -20,6 +20,15 @@ A configured run does both ends: `--trainer.compile-ahead.generation sm90 --trai
 8 --trainer.compile-ahead.path step.dew-aot` compiles its first step for eight H100s and exits
 (`AheadTarget`), and `--trainer.ahead step.dew-aot` on a host of that topology runs it in place of
 compiling its first step, where it is the very program the run compiles first (`AheadOfTime.taken`).
+
+A run's plan is the fewest microbatches at the least recomputation that fit, which memory decides; which
+plan steps fastest, a rung that recomputes more at fewer microbatches or the plan's own, the GPUs alone
+tell. `--trainer.compile-ahead.frontier`, with each GPU's memory stated, lists past the plan each rung
+above it at its fewest microbatches that fit (`compile_ahead`'s `frontier`); tools/benchmark_step.py
+times each on the GPUs, a case at its remat and head tile, a plan of s microbatches as its microbatch's
+rows accumulated s times (`accumulation`), the time it reports a microbatch's, s of them an update; and
+the run names the fastest by its model's remat, `--trainer.split` and `LMObjective.head_tile`. No run
+times plans itself.
 """
 
 from __future__ import annotations
@@ -60,7 +69,10 @@ def target_config(generation: str, capacity: int | None = None) -> str:
     """The `gpu_device_info` XLA compiles for, from the CUDA `generation`'s target
     (`generation.TARGETS`): its compute capability, the shared memory a block may opt into, its
     multiprocessors, clock and bandwidth; CUDA's per-capability limits for the rest. The fields past
-    the capability and shared memory only steer XLA's own fusions, never a Triton kernel's code."""
+    the capability and shared memory only steer XLA's own fusions, never a Triton kernel's code. From
+    Hopper on, its capability states the architecture-specific features (sm_90a, sm_100a, sm_120a), which
+    Mosaic GPU's PTX targets: left unspecified, an sm120's assembled for plain sm_120 and refused its own
+    PTX ('.target sm_120a cannot be compiled for architecture sm_120')."""
     target, version = gpu_target(generation), capability(generation)
     shared, multiprocessors = target.shared_limit, target.multiprocessors
     clock, bandwidth = target.clock_hz, target.memory_bandwidth
@@ -85,6 +97,7 @@ def target_config(generation: str, capacity: int | None = None) -> str:
   cuda_compute_capability {{
     major: {major}
     minor: {minor}
+    feature_extension: {"ACCELERATED_FEATURES" if major >= 9 else "NONE"}
   }}
   registers_per_core_limit: 65536
   registers_per_block_limit: 65536
@@ -303,6 +316,8 @@ class AheadTarget:
     devices: int
     path: str
     capacity_gib: float | None = None
+    frontier: bool = False
+    """Whether the report lists every rung above the plan that fits too (`compile_ahead`)."""
 
     @property
     def capacity(self) -> int | None:
@@ -331,7 +346,8 @@ class AheadTarget:
         if trainer.rollout is not None:
             raise ValueError("compile_ahead lowers the step over the loader's batches; this run's step reads "
                              "its rollout's, which it makes only as it trains")
-        ahead = compile_ahead(trainer, first_step_batch(trainer, loader, steps, examples), self.capacity)
+        ahead = compile_ahead(trainer, first_step_batch(trainer, loader, steps, examples), self.capacity,
+                              frontier=self.frontier)
         ahead.save(self.path)
         return CompiledAhead(self.path, ahead)
 
@@ -393,14 +409,16 @@ def step_batch[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch)
 
 
 def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch,
-                                   capacity: int | None = None) -> AheadOfTime:
+                                   capacity: int | None = None, *, frontier: bool = False) -> AheadOfTime:
     """`trainer`'s first step over a batch of `batch`'s shapes, compiled for the compile-only devices its
     mesh is built over, GPUs of one CUDA generation (`compile_only_gpus`) or a TPU topology's
     (`compile_only_tpus`), and never run. The planner `Trainer.compile` uses
     (`Trainer._compiled_plan`) selects and compiles the step once; that executable is serialized, not compiled
     again. Its batch is what `fit` hands to its step (`step_batch`), its fresh state abstract, and
     tracing reads the target's kernel choices (`assumed`). The plan reports every compile and the
-    time the search took. `capacity` states bytes per GPU; absent it, memory fit is unknown rather
+    time the search took, and with `frontier` each rung above it at its fewest microbatches that fit
+    (`FitSearch.frontier`), compiled and not saved: the plans a run's speed is chosen among (the module's
+    docstring). `capacity` states bytes per GPU; absent it, memory fit is unknown rather
     than measured. Profiling, tuning and rollout require execution and are refused."""
     if capacity is not None and capacity <= 0:
         raise ValueError("compile-ahead capacity must be positive bytes per GPU")
@@ -421,6 +439,10 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
     if capacity is not None and on_tpus:
         raise ValueError(f"a TPU topology states its own memory; compile it ahead for {generation} with no "
                          "capacity")
+    if frontier and capacity is None and not on_tpus:
+        raise ValueError("a frontier lists the rungs that fit the GPUs' memory, which compile-only GPUs "
+                         "do not state; name it (--trainer.compile-ahead.capacity-gib, compile_ahead's "
+                         "capacity)")
     if capacity is not None:
         mesh = trainer.device_mesh
         devices = compile_only_gpus(generation, len(devices), capacity)
@@ -435,7 +457,7 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
     # for it nor writes one (`dew.cache.uncached`).
     with assumed(generation), uncached() if on_tpus else contextlib.nullcontext():
         target = gpu_target()
-        planned = trainer._compiled_plan(start.abstract, step_batch(trainer, batch), None, capacity)
+        planned = trainer._compiled_plan(start.abstract, step_batch(trainer, batch), None, capacity, frontier)
     # The sampled step as the search compiled it, its program what it lowered then.
     sampled = None if planned.sampled is None else AheadProgram.of(*planned.sampled)
     seconds = time.perf_counter() - began
