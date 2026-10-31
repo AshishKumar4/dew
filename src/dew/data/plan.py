@@ -397,8 +397,8 @@ _LIMIT = re.compile(r"Limit\(count=(\d+)\)")
 """A limit's record in an order's stages (`Limit`'s repr)."""
 
 
-def earlier_lengths(previous: Mapping[str, object], source: object,
-                    derived: Mapping[str, str]) -> dict[str, object]:
+def earlier_lengths(previous: Mapping[str, object], source: JSON,
+                    derived: Mapping[str, str]) -> Mapping[str, object]:
     """`previous`, a saved plan's derived order, with today's lengths of each token store an earlier Dew
     stated none for (`derived`'s): a store whose producer stated no EOS, which it read as one stream, its
     documents neither stated nor packed, so the plan's positions counted none of them; today's are the
@@ -562,8 +562,9 @@ class Plan:
         if grown is None:
             raise ValueError(f"saved data plan order changed: {saved.get('order')!r} -> {current['order']!r}")
         saved_manifest = record(json_value(saved.get("manifest", {}), "saved data manifest"), "data manifest")
-        previous = earlier_lengths(record(saved.get("derived", {}), "saved derived order"),
-                                   saved_manifest.get("source"), self.derived)
+        saved_source = json_value(saved_manifest.get("source"), "saved data source")
+        previous = earlier_lengths(record(saved.get("derived", {}), "saved derived order"), saved_source,
+                                   self.derived)
         for name in sorted(set(previous) | set(self.derived)) if edited is None else ():
             if previous.get(name) != self.derived.get(name):
                 raise ValueError(f"saved data plan derived order {name} changed")

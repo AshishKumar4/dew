@@ -409,8 +409,8 @@ def test_a_saved_runs_profile_window_reads_its_capture_options_as_its_captures(t
     record = json.loads(path.read_text())
     # A field that declares its class exactly is the record of its fields; a union's is a class record.
     trainer = record["fields"]["trainer"]
-    window = trainer.get("fields", trainer)["profile"]
-    saved = window.get("fields", window)
+    written = trainer.get("fields", trainer)["profile"]
+    saved = written.get("fields", written)
     saved.update(saved.pop("capture"))
     path.write_text(json.dumps(record))
     assert RunConfig.load(str(path)).trainer.profile == window

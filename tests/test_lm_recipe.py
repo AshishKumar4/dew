@@ -878,8 +878,8 @@ def test_a_plan_an_earlier_dew_saved_over_a_token_store_resumes_as_its_documents
     resumes where today's states the producer's records (row 3028). A store stating an EOS had its
     lengths stated then, so a plan without them is another's, refused."""
     corpus = write_token_corpus(tmp_path / "tokens", np.arange(1, 40) % 7, eos_id=eos)
-    windows = TokenFiles(corpus.train).pipe(presets.token_windows, seq_len=4, batch=2)
-    plan = compile(windows, read="indexed", loading=Loading(workers=0)).plan
+    # Read whole into memory, its source's lengths among its derived facts.
+    plan = compile(TokenFiles(corpus.train).batch(1), read="memory", loading=Loading(workers=0)).plan
     assert "0/lengths" in plan.derived
     earlier = dataclasses.replace(plan, derived={name: value for name, value in plan.derived.items()
                                                  if name != "0/lengths"})
