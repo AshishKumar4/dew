@@ -77,6 +77,80 @@ RUNS = {
 }
 
 
+def random_mask(random, im_shape, ratio=1, mask_full_image=False):
+    """Diffusers' `random_mask` (examples/research_projects/dreambooth_inpaint/train_dreambooth_inpaint.py
+    at 86ef420b1, Apache-2.0), verbatim but for `random`, its module, passed in, and its boxes' lines
+    wrapped."""
+    from PIL import Image, ImageDraw
+
+    mask = Image.new("L", im_shape, 0)
+    draw = ImageDraw.Draw(mask)
+    size = (random.randint(0, int(im_shape[0] * ratio)), random.randint(0, int(im_shape[1] * ratio)))
+    # use this to always mask the whole image
+    if mask_full_image:
+        size = (int(im_shape[0] * ratio), int(im_shape[1] * ratio))
+    limits = (im_shape[0] - size[0] // 2, im_shape[1] - size[1] // 2)
+    center = (random.randint(size[0] // 2, limits[0]), random.randint(size[1] // 2, limits[1]))
+    draw_type = random.randint(0, 1)
+    if draw_type == 0 or mask_full_image:
+        draw.rectangle(
+            (center[0] - size[0] // 2, center[1] - size[1] // 2,
+             center[0] + size[0] // 2, center[1] + size[1] // 2),
+            fill=255,
+        )
+    else:
+        draw.ellipse(
+            (center[0] - size[0] // 2, center[1] - size[1] // 2,
+             center[0] + size[0] // 2, center[1] + size[1] // 2),
+            fill=255,
+        )
+
+    return mask
+
+
+class Scripted:
+    """The integer draws a script states, in turn, each within the bounds its caller asks: Python's
+    `randint(a, b)` (inclusive) for the reference, NumPy's `integers(low, high)` (exclusive) for Dew."""
+
+    def __init__(self, draws):
+        self.draws = iter(draws)
+
+    def randint(self, low, high):
+        drawn = next(self.draws)
+        assert low <= drawn <= high, (low, drawn, high)
+        return drawn
+
+    def integers(self, low, high):
+        return self.randint(low, high - 1)
+
+
+DRAWS = {
+    "rectangle": [7, 11, 5, 9, 0],
+    "ellipse": [7, 11, 5, 9, 1],
+    "whole image": [12, 20, 12, 20, 0],
+    "at the far corner": [5, 3, 12, 20, 1],
+    "empty": [0, 0, 0, 0, 0],
+}
+"""Draws over a 12-wide, 20-high image: size (width, height), centre (x, y), then the shape, at its
+bounds' ends among them."""
+
+
+@pytest.mark.parametrize("draws", list(DRAWS))
+def test_a_random_mask_draws_as_diffusers_inpainting_trainer_draws(draws):
+    """`RandomMask` over the same integer draws makes Diffusers' mask (`random_mask`, then its
+    `prepare_mask_and_masked_image` binarizing at a half) bit for bit, over a non-square image, either
+    shape and its draws' bounds, written as [height, width, 1] float32 (1 the region painted)."""
+    width, height = 12, 20
+    image = np.zeros((height, width, 3), np.uint8)
+    drawn = image_steps.RandomMask().random_map({"image": image}, Scripted(DRAWS[draws]))["mask"]
+    mask = np.asarray(random_mask(Scripted(DRAWS[draws]), (width, height)).convert("L"), np.float32) / 255.0
+    mask[mask < 0.5] = 0
+    mask[mask >= 0.5] = 1
+    np.testing.assert_array_equal(drawn, mask[..., None], strict=True)
+    facts = image_steps.RandomMask().declared({"fields": {"image": [height, width, 3]}})
+    assert facts["fields"]["mask"] == [height, width, 1]
+
+
 @pytest.mark.parametrize("objective", list(RUNS))
 def test_dew_train_trains_an_inpainting_pipeline_through_its_masks(inpainting, objective, tmp_path):
     """`dew train` over the inpainting pipeline, its images' masks drawn by RandomMask, commits a step
