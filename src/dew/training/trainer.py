@@ -157,7 +157,7 @@ from dew.training.distributed import (
     step_reads,
     traced_start,
 )
-from dew.training.evaluation import EvalSuite, Evaluation, Summary, admit_split
+from dew.training.evaluation import COOLDOWN, EvalSuite, Evaluation, Summary, admit_split
 from dew.training.footprint import candidate_footprint, traced_loss
 from dew.training.inspection import Inspection
 from dew.training.interval import Interval, Reading, Taken, TokenClock, held, logged_scalars
@@ -1334,7 +1334,8 @@ class Trainer(Generic[Loss, Effects]):
 
         Previews are generated only when `preview=True` and a tracker receives them; scalar reporting never
         triggers preview work. `scored_to`, a directory, takes every validation batch's scoring artifacts at
-        each evaluation, `<scored_to>/step-<step>/<split>-<batch>.npz` (`Evaluation.run`). `observe` takes
+        each evaluation, `<scored_to>/step-<step>/<split>-<batch>.npz` (`Evaluation.run`), a cooldown
+        branch's under `cooldown/` there. `observe` takes
         values of the state at a cadence of its own while the run trains (`Observe`). `device_prefetch`
         training batches are placed on the devices ahead of the step, which the step's memory plan holds
         room for. The process is readied first
@@ -2455,7 +2456,9 @@ class Trainer(Generic[Loss, Effects]):
                 step=state.step, schedule_step=state.microstep * self.accumulation // state.window_size,
                 averaged=averaged, preview=preview, mesh=mesh, loss=loss, split=split, training=training,
                 warm=warm, updates=state.updates,
-                scored_to=None if scored_to is None else os.path.join(scored_to, f"step-{int(state.step)}"))
+                # A cooldown branch's beside the run's at the step it branched at (`COOLDOWN`).
+                scored_to=None if scored_to is None else os.path.join(
+                    scored_to, f"step-{int(state.step)}", *((COOLDOWN,) if cooled else ())))
         # On the examples clock an evaluation is placed by the examples the run had consumed, as its host
         # counted them, its record their coordinate beside its step.
         if examples is not None:
