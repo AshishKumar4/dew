@@ -80,15 +80,19 @@ def teacher_objective():
                                lam=0.95, clip=0.2, entropy_cost=1e-4, reads=("teacher",))
 
 
-def scored(simulator, policy, params, memory, key: jax.Array, steps: int) -> dict:
+def scored(simulator, policy, params, memory, key: jax.Array, steps: int, *,
+           film: Path | None = None) -> dict:
     """Each drone's first episode under `policy` (reading the driven step whole): its return, gates
-    passed, whether it crashed and its steps, averaged over the drones."""
+    passed, whether it crashed and its steps, averaged over the drones; with `film`, the first four
+    drones' camera images over the steps written there `[steps, 4, H, W, 3]`."""
     from dew.rl.simulator import DrivenSimulator, simulator_rollout, simulator_start
 
     driven = DrivenSimulator(simulator)
     _, taken = simulator_rollout(driven, policy, params, simulator_start(driven, key, memory), steps,
                                  reset=False)
     observed = jax.device_get(taken.observation)
+    if film is not None:
+        np.savez_compressed(film, frames=observed["observation"]["image"][:, :4])
     ended = np.cumsum(observed["last"], 0) - observed["last"] > 0
     reward = np.where(ended, 0, observed["reward"])
     passed = np.where(ended, 0, observed["observation"]["passed"]).max(0)
@@ -197,7 +201,9 @@ def world(out: Path, *, teacher_weights: Path, drones: int = 16, hz: float = 60.
     """FlyDreamer's agent at its size (TransDreamer's dynamics, bfloat16) on the image alone: pretrained on
     the teacher's demonstrations (FlyDreamer's `pretrain_wm` scales and behaviour cloning), then trained
     online at train ratio 128, starting from the demonstrations' replay; the teacher, the cloned agent and
-    the online agent scored alike (world.json, pretrained.msgpack, world.msgpack). Each drone flies
+    the online agent scored alike (world.json, pretrained.msgpack, world.msgpack), the online agent
+    every 10,000 updates, and the cloned and the final agents' first drones filmed (cloned.npz,
+    video.npz). Each drone flies
     `demonstration_seconds` for the demonstrations; the agent flies `environment_seconds` online over all
     its drones (FlyDreamer's 1M steps at 30 Hz); the replay holds `capacity_seconds` a drone."""
     from rl_acceptance import laprop
@@ -238,7 +244,7 @@ def world(out: Path, *, teacher_weights: Path, drones: int = 16, hz: float = 60.
     (out / "pretrained.msgpack").write_bytes(serialization.to_bytes(jax.device_get(pretrained.variables)))
     agent = DreamerV3Objective(model, imagination=imagination, variables=jax.device_get(pretrained.variables))
     report["cloned"] = scored(simulator, agent.act, pretrained.variables, agent.memory(drones),
-                              jax.random.key(7), horizon)
+                              jax.random.key(7), horizon, film=out / "cloned.npz")
     print(json.dumps(report), flush=True)
     (out / "world.json").write_text(json.dumps(report, indent=1))
 
@@ -249,13 +255,15 @@ def world(out: Path, *, teacher_weights: Path, drones: int = 16, hz: float = 60.
     for done in range(10_000, updates + 10_000, 10_000):
         state = trainer.fit(_idle(), steps=min(done, updates), log_every=1000, state=state)
         point = {"updates": min(done, updates), "environment_steps": rollout.environment_steps,
-                 "seconds": time.perf_counter() - began, "episode_return": rollout.metrics["episode_return"]}
+                 "seconds": time.perf_counter() - began, "episode_return": rollout.metrics["episode_return"],
+                 **scored(simulator, agent.act, state.variables, agent.memory(drones), jax.random.key(done),
+                          horizon)}
         report["online"].append(point)
         print(json.dumps(point), flush=True)
         (out / "world.msgpack").write_bytes(serialization.to_bytes(jax.device_get(state.variables)))
         (out / "world.json").write_text(json.dumps(report, indent=1))
     report["online_agent"] = scored(simulator, agent.act, state.variables, agent.memory(drones),
-                                    jax.random.key(9), horizon)
+                                    jax.random.key(9), horizon, film=out / "video.npz")
     (out / "world.json").write_text(json.dumps(report, indent=1))
     return report
 
