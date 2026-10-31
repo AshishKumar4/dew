@@ -149,15 +149,23 @@ class Outbox:
     producer adds into global memory (TMA's reduction) and frees (FlashAttention 3's dQ store warp: the add's
     waits off the consumers' walk): a consumer `put`s its share of a step once the producer has read the
     stage's last one; the producer `take`s a step once every share is staged, adds each into its view and
-    frees the stage once the adds have read it (`streamed`'s `adds`). Allocated with `outbox`."""
+    frees the stage once the adds have read it (`streamed`'s `adds`), having freed it once before its first
+    (`opened`). Allocated with `outbox`."""
 
     smem: jax.Ref
     full: jax.Ref
     empty: jax.Ref
 
-    def put(self, share: int, value: jax.Array, *, after) -> None:
-        """Consumer share `share`'s `value` staged, `after` (traced) a step whose share the producer read."""
-        pl.when(after)(lambda: plgpu.barrier_wait(self.empty.at[share]))
+    def opened(self) -> None:
+        """The producer's every stage freed before its first step, so a consumer's first put waits as its
+        others do (a wait of its own past the first put's step held its value across a branch: ptxas
+        spilled 364 bytes where the consumers' own adds spill 72, a shared dQ at width 128)."""
+        for share in range(self.smem.shape[0]):
+            plgpu.barrier_arrive(self.empty.at[share])
+
+    def put(self, share: int, value: jax.Array) -> None:
+        """Consumer share `share`'s `value` staged once the producer has read the stage's last."""
+        plgpu.barrier_wait(self.empty.at[share])
         self.smem.at[share][...] = value
         plgpu.commit_smem()
         plgpu.barrier_arrive(self.full.at[share])
@@ -240,6 +248,8 @@ def streamed(rings: tuple, views, lo, hi, *, adds: tuple | None = None) -> None:
     views of a step's sum), each step's sum added, a ring's depth behind its loads: a step's sum is staged
     after its slots are released, so the producer waits for it no sooner than for the next load's slot."""
     lag = min(ring.stages for ring in rings) if adds is not None else 0
+    if adds is not None:
+        adds[0].opened()
 
     @pl.loop(lo, hi + lag)
     def _(index):

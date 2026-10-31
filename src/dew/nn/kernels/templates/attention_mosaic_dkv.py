@@ -258,15 +258,14 @@ def _outbox(walk: _Backward, stages: list) -> mosaic.Outbox | None:
     return mosaic.Outbox(*stages[1:4])
 
 
-def _fused_adds(walk: _Backward, dq_ref, stages: list, place: tuple, index, k_smem, holder, lo):
+def _fused_adds(walk: _Backward, dq_ref, stages: list, place: tuple, index, k_smem, holder):
     """A fused launch's consumer `index`'s dQ adds (`_dkv_step`'s `add_dq(score cotangents, first query)`),
     None where the launch adds none: its score cotangents staged (`stages[0]`), their transpose times its
     keys (`k_smem`, `[holders, bk, D]`, its `holder`'s), the tile's dQ added into dQ at `place`
     (`_dq_added`); shared
     (`BackwardTiles.shared_dq`), staged into its slot of the exchanged block (`mosaic.Exchange`), each
     consumer's share of dQ's columns over every consumer's keys, at static columns (`mosaic.per_role`), staged
-    for the producer's add where it adds them (`_outbox`, past the walk's first step from `lo` once it has
-    read the last)."""
+    for the producer's add where it adds them (`_outbox`)."""
     if not walk.fused:
         return None
     family, consumers = walk.program.family, walk.consumers
@@ -304,7 +303,7 @@ def _fused_adds(walk: _Backward, dq_ref, stages: list, place: tuple, index, k_sm
             if box is None:
                 _dq_added(walk, dq_ref, out_stage, place, index, q_first, dq, columns=share)
             else:
-                box.put(role, dq, after=q_first > lo * rows)
+                box.put(role, dq)
 
         mosaic.per_role(index, consumers, mine)
         exchange.release()
@@ -552,7 +551,7 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
             params_of = functools.partial(_score_params, family, score_refs, kinds, row, head,
                                           k_first=k_first, keys_first=True)
             resident = k_smem.at[holder], v_smem.at[holder]
-            adds = _fused_adds(walk, dq_ref, fused_stages, (row, head), index, k_smem, holder, lo)
+            adds = _fused_adds(walk, dq_ref, fused_stages, (row, head), index, k_smem, holder)
             stage = _logits_stage(family, consumers, logits_stages, index)
             statistics = None if program.tiles.shared_dq else rows_of
             step = functools.partial(_dkv_step, walk, resident, statistics, coords_of, params_of, store_tiles,
