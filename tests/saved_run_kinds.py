@@ -130,8 +130,9 @@ def answered(task) -> None:
     if isinstance(task, TextGeneration):
         assert task.decode(answer)
     elif isinstance(task, MaskedGeneration | BlockGeneration):
+        # A response of at least one token past the prompt, its decoder having stepped.
         generated = answer.host()
-        assert (np.asarray(generated.lengths) > 0).all()
+        assert (np.asarray(generated.lengths) > 0).all() and (np.asarray(generated.decoder_steps) > 0).all()
     elif isinstance(task, Decide):
         [answers] = answer
         assert answers["team"].choice in ("billing", "technical", "sales")
