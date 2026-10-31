@@ -509,10 +509,10 @@ window's geometry its own."""
 
 
 def stacked_windows(kind: str, seed: int) -> tuple:
-    """`WINDOW_STACKED` draws of windows (`window_segments`), each a draw of its own, their windows rows of
-    one."""
+    """`WINDOW_STACKED` draws of windows (`window_segments`), each a draw of its own and one example on a new
+    leading axis: a draw's rows share its windows, so they are one example, not many."""
     parts = [window_segments(kind, seed * WINDOW_STACKED + index) for index in range(WINDOW_STACKED)]
-    return jax.tree.map(lambda *leaves: np.concatenate([np.asarray(leaf) for leaf in leaves]), *parts)
+    return jax.tree.map(lambda *leaves: np.stack([np.asarray(leaf) for leaf in leaves]), *parts)
 
 
 @functools.cache
@@ -582,7 +582,8 @@ def test_each_windows_gradient_from_its_level_is_the_literal_loops(kind):
                 return jnp.sum(weights * scores(variables, hidden[None], targets[None], weights[None],
                                                 fields)[0])
             return with_gradients(loss)(variables, hidden, jnp.ones((), hidden.dtype))
-        return jax.jit(jax.vmap(one))
+        # Each example a draw of windows (`stacked_windows`), each window a row of it.
+        return jax.jit(jax.vmap(jax.vmap(one)))
 
     def dew(variables, hidden, targets, weights, fields):
         return adapted_scores(MODEL, variables, hidden, targets, weights, fields, adaptation, predict=False,
