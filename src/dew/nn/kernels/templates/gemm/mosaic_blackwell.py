@@ -225,12 +225,10 @@ def _stores(tile: _Tile, sides, outs, scratch: _Scratch, epilogue, epilogue_axes
 
 def _epilogue(epilogue, acc, gmems, smems, barriers, axes_of, origins: dict, extent: dict) -> tuple:
     """`epilogue(acc, *side_tiles)` as a tuple of outputs, each side operand's tile at the chunk's rows and
-    columns brought to shared memory by TMA first."""
-    for index, (gmem, smem, axes) in enumerate(zip(gmems, smems, axes_of, strict=True)):
-        plgpu.copy_gmem_to_smem(gmem.at[tuple(pl.ds(origins[axis], extent[axis]) for axis in axes)], smem,
-                                barriers.at[index])
-    for index in range(len(gmems)):
-        plgpu.barrier_wait(barriers.at[index])
+    columns brought to shared memory by TMA first (`mosaic.loaded`)."""
+    mosaic.loaded(tuple((gmem.at[tuple(pl.ds(origins[axis], extent[axis]) for axis in axes)], smem,
+                         barriers.at[index])
+                        for index, (gmem, smem, axes) in enumerate(zip(gmems, smems, axes_of, strict=True))))
     outs = epilogue(acc, *(smem[...] for smem in smems))
     return outs if isinstance(outs, tuple) else (outs,)
 
