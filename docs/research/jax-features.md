@@ -9,7 +9,7 @@ This extends [google-jax-stack.md](google-jax-stack.md). The [MaxText inventory]
 The requested command printed JAX `0.11.1` and Flax `0.12.9`:
 
 ```sh
-/home/mrwhite0racle/Desktop/dew/.venv/bin/python -c 'import jax, flax; print(jax.__version__, flax.__version__)'
+.venv/bin/python -c 'import jax, flax; print(jax.__version__, flax.__version__)'
 ```
 
 Installed distribution metadata also reports jaxlib `0.11.1`, Optax `0.2.8`, Grain `0.2.18`, Orbax Checkpoint `0.12.4` and Qwix `0.1.8`. JAX source links below use tag `jax-v0.11.1`; Flax links use `v0.12.9`. MaxText links use the 0.2.4 commit `538fe7a3f3376d94cf3f04e77741aa6d7e8efa45`. Its base file matches the release tag byte for byte.
@@ -163,7 +163,7 @@ All 17 flag assignments in the two tables were accepted by the installed jaxlib 
 ```sh
 ulimit -c 0
 JAX_PLATFORMS=cpu XLA_FLAGS='--xla_gpu_pipeline_all_gather=on' \
-  /home/mrwhite0racle/Desktop/dew/.venv/bin/python -c 'import jax; print(jax.devices()[0].platform)'
+  .venv/bin/python -c 'import jax; print(jax.devices()[0].platform)'
 ```
 
 This checks spelling and parser availability. It does not exercise GPU lowering, collectives, kernels or performance. The note does not recommend enabling the flags without a target-topology run. Copying the command-buffer setting as a default would hurt most, because Dew already measured slower single-card execution with command buffers disabled (`docs/performance.md:219-247`).
