@@ -149,13 +149,17 @@ def stop_capture(profiler: "Profiler", loss: "jax.Array | None") -> None:
     agreed("profile stop", stop)
 
 
-def export_wait(directory: str | Path) -> None:
-    """Wait on every rank for the export each one's window under `directory` left running
-    (`dew.telemetry.profile.exported`), a failed export raised on every rank, as a failed stop is
-    (`stop_capture`): no export outlives the run that captured it."""
+def export_wait(directory: str | Path, *, agree: bool = True) -> None:
+    """Wait for the exports this rank's window under `directory` left running
+    (`dew.telemetry.profile.exported`), so no export outlives the run that captured it: on every rank,
+    a failed export raised on all of them where they `agree`, as a failed stop is (`stop_capture`); on
+    this rank alone in a failed run's cleanup, whose peers may never reach an agreement."""
     from dew.telemetry.profile import exported
 
-    agreed("profile export", lambda: exported(Path(directory)))
+    if agree:
+        agreed("profile export", lambda: exported(Path(directory)))
+    else:
+        exported(Path(directory))
 
 
 def traced_steps(capture: Path) -> tuple[int, ...]:

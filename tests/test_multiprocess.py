@@ -1770,6 +1770,20 @@ def test_a_profile_window_that_fails_on_one_rank_fails_the_pool_together(tmp_pat
     assert all(report["recovered"] == 2 for report in reports)
 
 @pytest.mark.distributed
+def test_a_profile_window_that_one_rank_cannot_stop_still_waits_for_its_peers_exports(tmp_path):
+    """Rank 0 cannot write its trace as the window stops, while rank 1's stop starts its export: the pool
+    fails the stop together, and each rank's cleanup waits for the exports it started, so rank 1's export
+    has written its manifest and none runs on as the fit returns (row 2767's review)."""
+    pytest.importorskip("xprof.convert.raw_to_tool_data", reason="optional profile extra")
+    reports = run_pool("profile_stop_failure", tmp_path / "pool", 2, devices=2, timeout=300, steps=4,
+                       profile_dir=str(tmp_path / "pool" / "trace"))
+    assert all("profile stop" in report["failed"] for report in reports)
+    assert [report["exporting"] for report in reports] == [0, 0]
+    assert reports[1]["manifests"] == 1
+    assert all(report["recovered"] == 2 for report in reports)
+
+
+@pytest.mark.distributed
 def test_a_pool_refuses_what_its_processes_do_not_share_before_any_trains(tmp_path):
     """Each process opens its own stream over its own copy of the corpus, reads
     its batches on its own prefetch thread and lists the checkpoints itself.

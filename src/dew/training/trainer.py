@@ -1554,7 +1554,8 @@ class Trainer(Generic[Loss, Effects]):
         # A run's last log is written at its cleanup, a failed run's only where no write waits on a step
         # its peers may never finish (`LogWriter.raise_failure`).
         unread = functools.partial(self._read_taken, run, agree=False)
-        exported = None if profile is None else functools.partial(self._exported_profile, run, profile)
+        exported = None if profile is None else functools.partial(self._exported_profile, run, profile,
+                                                                  agree=primary is None)
         cleanups = (("Training log", unread), ("Log writer", run.writer.close), ("Training iterator", close),
                     ("Profiler", stop_trace), ("Profile export", exported),
                     ("Checkpoint wait", None if checkpoints is None else checkpoints.wait),
@@ -2481,13 +2482,15 @@ class Trainer(Generic[Loss, Effects]):
         stop_capture(profiler, run.loss)
         run.profiled = (run.traced, run.current)
 
-    def _exported_profile(self, run: FitRun, profile: ProfileWindow) -> None:
-        """Wait at the run's cleanup for the export its window left running (`export_wait`), a failed one
-        raised on every rank, then report the window on process zero, its reports written."""
+    def _exported_profile(self, run: FitRun, profile: ProfileWindow, *, agree: bool) -> None:
+        """Wait at the run's cleanup for every export its window left running (`export_wait`), a stop that
+        failed on some rank included, whose peers' exports still run; a failed one raised on every rank
+        where the run itself `agree`s, as one that failed does not. Then report a window that stopped on
+        process zero, its reports written."""
+        export_wait(profile.directory, agree=agree)
         if run.profiled is None:
             return
         traced, step = run.profiled
-        export_wait(profile.directory)
         self._report(ProfileWindowRecord(profile.directory, traced), step)
         agreed("profile announcement", lambda: self._display.note(
             f"Wrote profile for {traced} steps to {profile.directory}"))
