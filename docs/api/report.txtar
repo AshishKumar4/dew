@@ -194,8 +194,8 @@ class Process(schedule: NoiseScheduler, prediction: PredictionTransform, weighti
   .times(self, steps: int) -> jax.Array
   .variances(self, t, *, like: jax.Array) -> tuple[jax.Array, jax.Array]
   .weight(self, t) -> jax.Array
-class ProfileWindow(directory: str, steps: int, warmup: int = 2, host_tracer_level: int = 2, python_tracer_level: int = 0, activity_cap: int = 2097152) -> None  [dew.training.profiling]
-class Profiler(directory: str | os.PathLike[str] | None = None, *, options: jax.profiler.ProfileOptions | None = None) -> None  [dew.telemetry.profile]
+class ProfileWindow(directory: str, steps: int, warmup: int = 2, capture: dew.telemetry.profile.CaptureOptions = <factory>) -> None  [dew.training.profiling]
+class Profiler(directory: str | os.PathLike[str] | None = None, *, options: jax.profiler.ProfileOptions | None = None, reports: bool = True) -> None  [dew.telemetry.profile]
   .captures: property -> tuple[Path, ...]
   .directory: property -> Path | None
   .region(self, name: str) -> AbstractContextManager[None]
@@ -710,7 +710,7 @@ dew.telemetry.records.StepCompiled
 dew.telemetry.records.CheckpointRequested
   directory: str
   local: bool = False
-dew.telemetry.records.ProfileWindow
+dew.telemetry.records.ProfileTraced
   directory: str
   steps: int
 dew.telemetry.records.FitEnded

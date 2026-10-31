@@ -51,7 +51,7 @@ seams: profiler: {
 	purpose: "a capture runs only when a Profiler starts one, and a region is annotated only through it"
 	paths:   _src
 	type:    "jax.profiler"
-	onlyIn:  ["Profiler.*", "capture_options", "CaptureOptions.*", "region"]
+	onlyIn:  ["Profiler.*", "CaptureOptions.*", "region"]
 }
 
 seams: programs: {
