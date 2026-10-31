@@ -880,19 +880,22 @@ def key_decayed_output(gated: Load, entered: Load, columns: int, scores, value,
 # (`recurrence_chunk.chunk_delta_rule`'s).
 
 
-def local_gradient(keys: TileLoad, queries: TileLoad, columns: int, gate, low, out_grad, scale: float,
-                   issue: Issue, *, laid: tuple | None = None):
-    """The corrected values' gradient from the chunk's own output, `[C, BV]` fp32: `A^T do` for
-    `chunk_output`'s scores `A[t, s] = scale (q_t . k_s) exp2(g_t - g_s)` (`s <= t`), its transpose taken as
-    `k q^T` ('local_t') and cast to the gradient's dtype for its product ('local_dv'); `laid` as
-    `chunk_output`'s. The pairs' decays come before the products, as `chunk_scores`'."""
+def local_gradient(keys: TileLoad, queries: TileLoad, columns: int, gate, low, out_grads: TileLoad,
+                   blocks: int, scale: float, dtype, issue: Issue, *,
+                   emit: Callable[[int, jax.Array], None], laid: tuple | None = None) -> None:
+    """The corrected values' gradient from the chunk's own output, each value block `j`'s `[C, BV]` fp32 to
+    `emit(j, dv)`: `A^T do` for `chunk_output`'s scores `A[t, s] = scale (q_t . k_s) exp2(g_t - g_s)`
+    (`s <= t`), its transpose taken as `k q^T` ('local_t') and cast to the gradient's `dtype` once for every
+    block's product with `out_grads(j)` ('local_dv'); `laid` as `chunk_output`'s. The pairs' decays come
+    before the products, as `chunk_scores`'."""
     column_gate, column_low = (gate, low) if laid is None else laid
     decay = decayed(-gate, -low, -column_gate, -column_low)
     product = functools.reduce(jnp.add, (issue("local_t", keys(c), queries(c).T) for c in range(columns)))
     product = product * decay
     lag = _lags(product.shape)
-    product = jnp.where(lag <= 0, product * scale, 0.0)
-    return issue("local_dv", product.astype(out_grad.dtype), out_grad)
+    scores = jnp.where(lag <= 0, product * scale, 0.0).astype(dtype)
+    for j in range(blocks):
+        emit(j, issue("local_dv", scores, out_grads(j)))
 
 
 def reverse_carried(grad: list, keys: TileLoad, weights: TileLoad | None, queries: TileLoad, out_grad, local,

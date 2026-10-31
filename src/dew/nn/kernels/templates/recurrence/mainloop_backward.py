@@ -6,7 +6,7 @@ and backward (`planned`, `holds`), from which the template derives its tiles."""
 import contextlib
 import dataclasses
 import functools
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -245,6 +245,30 @@ def gradients(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None, fi
 # XLA adds.
 
 
+def _value_block(call: _Call, held: Callable[[int], _Held], consumers: int = 1) -> int:
+    """A launch's value block where it takes a value row a block at a time: the call's value width, halved
+    while its register model (`held(block)`, `_Held`) is past a consumer thread's registers
+    (`Family.registers`) and the block stays whole blocks (`_Call.block`); the narrowest where none holds,
+    which the launch then refuses."""
+    block = call.value_width
+    while block > call.block and held(block).registers(call.family) > call.family.registers(consumers):
+        block //= 2
+    return block
+
+
+def _local_back_held(call: _Call, vb: int) -> _Held:
+    """`_local_back`'s consumer thread at value block `vb`: the local scores, their decays and masks; then
+    their narrow form's product with a block of the output's gradient and its cast (`algebra.local_gradient`:
+    the scores are narrowed before the products): as one phase, an H100's model stated 248 registers where
+    ptxas needed 136, an A100's 280 against 160."""
+    held, given = dataclasses.replace(call.held, rows=call.rows), call.given
+    return _Held(phases=(
+        [_f32(CHUNK, CHUNK)] * 2 + _masks(CHUNK, CHUNK)
+        + _fragments(call, (given, CHUNK, call.block), (given, CHUNK, call.block)),
+        [*_held(held, CHUNK, CHUNK), _f32(CHUNK, vb), *_held(_value_grads(call), CHUNK, vb),
+         *_fragments(call, (held, CHUNK, CHUNK), (given, CHUNK, vb))]))
+
+
 @_lowered_once
 def _local_back(q, k, do, hi, lo, taken, call: _Call, *, scale: float):
     """`[R, HV * Dv]` in `_value_grads`' form: the corrected values' gradient from each chunk's own output
@@ -254,6 +278,7 @@ def _local_back(q, k, do, hi, lo, taken, call: _Call, *, scale: float):
     width, value_width, family = call.width, call.value_width, call.family
     held, given = dataclasses.replace(call.held, rows=call.rows), call.given
     grads = _value_grads(call)
+    vb = _value_block(call, functools.partial(_local_back_held, call))
 
     def program(q_ref, k_ref, do_ref, hi_ref, lo_ref, column_hi_ref, column_lo_ref, taken_ref, dv_ref, *,
                 streams, staging, landing):
@@ -280,12 +305,15 @@ def _local_back(q, k, do, hi, lo, taken, call: _Call, *, scale: float):
             def block(name, c):
                 return _tile(slots, name, given, columns=pl.ds(c * call.block, call.block))
 
-            # The local scores once, against the output's gradient's whole row.
-            dv = algebra.local_gradient(
+            def stored(j, dv):
+                grads.store(dv_ref, dv, row, CHUNK, h * value_width + j * vb, vb, family=family,
+                            smem=landing["row"])
+
+            # The local scores once, staged for every value block's product with the output's gradient.
+            algebra.local_gradient(
                 functools.partial(block, "keys"), functools.partial(block, "queries"), width // call.block,
-                gate, low, _tile(slots, "out", given), scale, Issuer(call, {"local_dv": local}), laid=laid)
-            grads.store(dv_ref, dv, row, CHUNK, h * value_width, value_width, family=family,
-                       smem=landing["row"])
+                gate, low, lambda j: _tile(slots, "out", given, columns=pl.ds(j * vb, vb)), value_width // vb,
+                scale, given.dtype, Issuer(call, {"local_dv": [local]}), emit=stored, laid=laid)
             return carry, accumulators
 
         _walk(streams, views, step, call, prologue=None if streamed else lambda: read(None))
@@ -295,18 +323,11 @@ def _local_back(q, k, do, hi, lo, taken, call: _Call, *, scale: float):
     tiles |= _vector_blocks(call, "gate", "low", "column_gate", "column_low")
     # The local scores, then their product with the output's gradient.
     work = Work(2 * CHUNK * CHUNK * (width + value_width), exponentials=CHUNK * CHUNK)
-    # The local scores, their decays and masks; then their narrow form's product with the output's gradient
-    # and its cast (`algebra.local_gradient`: the scores are narrowed before the product): as one phase, an
-    # H100's model stated 248 registers where ptxas needed 136, an A100's 280 against 160.
-    held_tiles = _Held(phases=(
-        [_f32(CHUNK, CHUNK)] * 2 + _masks(CHUNK, CHUNK)
-        + _fragments(call, (given, CHUNK, call.block), (given, CHUNK, call.block)),
-        [*_held(held, CHUNK, CHUNK), _f32(CHUNK, value_width), *_held(grads, CHUNK, value_width),
-         *_fragments(call, (held, CHUNK, CHUNK), (given, CHUNK, value_width))]))
     return _kernel(program, call, out_type=grads.shape(call.heads * value_width),
                    grid=(call.chunks, call.heads), grid_names=("chunks", "heads"), blocks=tiles, stages=1,
-                   live=_taken(7), work=work, held=held_tiles, staging=_staging(held, (CHUNK, CHUNK)),
-                   landing={"row": grads.landing(CHUNK, value_width)}, persistent=True)(
+                   live=_taken(7), work=work, held=_local_back_held(call, vb),
+                   staging=_staging(held, (CHUNK, CHUNK)), landing={"row": grads.landing(CHUNK, vb)},
+                   persistent=True)(
         q, k, do, hi, lo, hi, lo, taken)
 
 

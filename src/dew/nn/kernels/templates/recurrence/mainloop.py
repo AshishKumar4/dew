@@ -508,7 +508,7 @@ _PLANNED: contextvars.ContextVar[list | None] = contextvars.ContextVar("planned"
 """Where `mainloop_backward.planned` collects its launches; None where they run."""
 
 
-STATIC = ("call", "tiles", "scale", "keeps", "out_dtype")
+STATIC = ("call", "tiles", "scale", "keeps", "applies", "out_dtype")
 """A launch's static arguments, by name (`_lowered_once`): its call's geometry, bundle and target, its tiles
 and its constants; its every other argument an array or None."""
 
