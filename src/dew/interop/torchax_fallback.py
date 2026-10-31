@@ -1578,25 +1578,22 @@ def _built(directory: Path, param_dtype: str, weights: bool
 def _stored_tensors(model: PreTrainedModel, shards: Mapping[str, np.ndarray]) -> dict[str, np.ndarray] | None:
     """A checkpoint's `shards` (`sources.load_shards`, memory-mapped) by the names `model` holds them
     under, as stored, which the load casts to their storage leaf by leaf where it places them
-    (`_in_storage`): each key named as transformers' load names it, by the model's conversion mapping's
-    renamings (`rename_source_key`), a key the model holds nothing under left out, and a tied parameter
-    (an output table that is its input table) under each of its names from the one the checkpoint
-    stores it under. None where a key takes one of the mapping's tensor conversions (a fused expert's
-    merge), which transformers' own load applies."""
-    from transformers.conversion_mapping import get_model_conversion_mapping
-    from transformers.core_model_loading import WeightConverter, WeightRenaming, rename_source_key
-
-    transforms = get_model_conversion_mapping(model)
-    renamings = [transform for transform in transforms if isinstance(transform, WeightRenaming)]
-    converters = [transform for transform in transforms if isinstance(transform, WeightConverter)]
+    (`_in_storage`): each key named as transformers' load names it (`sources.load_names`), a key the model
+    holds nothing under left out, and a tied parameter (an output table that is its input table) under
+    each of its names from the one the checkpoint stores it under. None where a key takes one of the
+    mapping's tensor conversions (a fused expert's merge), or the mapping renames a key by whether
+    another is stored, which transformers' own load applies."""
+    names = sources.load_names(model)
+    if names is None:
+        return None
     held = model.state_dict()
     named: dict[str, np.ndarray] = {}
     for key, tensor in shards.items():
-        name, converted = rename_source_key(key, renamings, converters, model.base_model_prefix, held)
-        if converted is not None:
+        read = names(key)
+        if read.converter is not None:
             return None
-        if name in held:
-            named[name] = tensor
+        if read.name in held:
+            named[read.name] = tensor
     tied: dict[int, list[str]] = {}
     for name, parameter in model.named_parameters(remove_duplicate=False):
         tied.setdefault(id(parameter), []).append(name)
