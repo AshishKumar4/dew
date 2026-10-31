@@ -447,7 +447,9 @@ def within(value, platform: str):
         return value.replace(jaxpr=compiled(value.jaxpr, platform))
     if isinstance(value, jcore.Jaxpr):
         return compiled(value, platform)
-    if isinstance(value, tuple | list):
+    # A plain sequence of programs (a conditional's branches); a named tuple (a gather's dimension
+    # numbers, a key's implementation) holds none and stays as it is.
+    if type(value) in (tuple, list):
         return type(value)(within(each, platform) for each in value)
     return value
 
