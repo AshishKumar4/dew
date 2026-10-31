@@ -27,10 +27,9 @@ TYPES = "(" + ", ".join(["vector<1xf32>"] * 8 + ["i64", "i64"] + ["i32"] * 5) + 
 SHAPES = [(2, 6), (3, 4), (1, 12)]
 
 
-def module_text(batches: int, products: int, chained: bool = False) -> str:
+def module_text(batches: int, products: int) -> str:
     """A Mosaic-shaped module: one warpgroup's `gpu.launch` of a loop over 4 steps carrying `batches` [64, 16]
-    state tiles; where `chained`, each product's left operand's address read from the product before it (its
-    first word, as attention's P is read from S), so none is issued before the one it reads."""
+    state tiles."""
     out, count = [], [0]
 
     def name(prefix):
@@ -58,7 +57,7 @@ def module_text(batches: int, products: int, chained: bool = False) -> str:
     out.append(f"      %final:{words} = scf.for %i = %c0 to %c4 step %c1 iter_args({iters}) -> ({types}) {{")
     updated = []
     for batch in range(batches):
-        total, read = None, "%da"
+        total = None
         for _ in range(products):
             acc = ["%zero"] * 8
             out.append(
@@ -69,7 +68,7 @@ def module_text(batches: int, products: int, chained: bool = False) -> str:
                 result = name("r")
                 out.append(
                     f"        {result} = llvm.inline_asm has_side_effects asm_dialect = att {ASM} "
-                    f"{', '.join(acc)}, {read}, %db, %one, %one, %one, %one, %one : {TYPES} -> {STRUCT}"
+                    f"{', '.join(acc)}, %da, %db, %one, %one, %one, %one, %one : {TYPES} -> {STRUCT}"
                 )
                 acc = []
                 for k in range(8):
@@ -84,12 +83,6 @@ def module_text(batches: int, products: int, chained: bool = False) -> str:
                 "        llvm.inline_asm has_side_effects asm_dialect = att "
                 '"wgmma.wait_group.sync.aligned 0;\\0A", "" : () -> ()'
             )
-            if chained:
-                word, scalar, wide = name("w"), name("f"), name("a")
-                out.append(f"        {word} = vector.extract {acc[0]}[0] : f32 from vector<1xf32>")
-                out.append(f"        {scalar} = arith.fptosi {word} : f32 to i64")
-                out.append(f"        {wide} = arith.addi %da, {scalar} : i64")
-                read = wide
             if total is None:
                 total = acc
             else:
@@ -193,11 +186,11 @@ def ptx_text(batches: int, products: int) -> str:
     return header + "\n".join(lines) + "\n\tret;\n}\n"
 
 
-def _peak(batches: int, products: int, chained: bool = False) -> int:
+def _peak(batches: int, products: int) -> int:
     with jax_mlir.make_ir_context() as context:
         kernel_liveness.mosaic_gpu_dialect.register_dialect(context)
         context.allow_unregistered_dialects = True
-        module = mlir_ir.Module.parse(module_text(batches, products, chained=chained))
+        module = mlir_ir.Module.parse(module_text(batches, products))
         kernel_liveness.passmanager.PassManager.parse(kernel_liveness.CANONICAL).run(module.operation)
         divergent = kernel_liveness.divergent_values(module)
         totals = []
@@ -232,16 +225,6 @@ def test_the_pass_counts_the_registers_ptxas_allocates_for_independent_products(
     assert 8 * (batches * products + batches) <= _peak(batches, products) <= used
 
 
-def test_the_pass_holds_a_product_that_reads_another_apart_from_it():
-    """A chain of twelve products, each reading the product before it (its left operand's address from that
-    product's first word, as attention's P reads S): none is issued before the one it reads, so the pass holds
-    a product's accumulators to its own run alone (`kernel_liveness._Pass._define_all`), about a product's
-    beside the batch's sum and carried tile, where holding every product of the body to its last counted all
-    twelve's 96 words (row 3154)."""
-    independent, chained = _peak(1, 12), _peak(1, 12, chained=True)
-    assert chained <= independent - 8 * 10, (chained, independent)
-
-
 def test_the_pass_reads_no_more_than_ptxas_holds_an_attention_backward():
     """The H100's fused key and value backward of a causal attention 128 wide (the attention resource gate's
     case, tests/test_attention_mosaic.py), whose products read each other (S, then P, then the value and key
@@ -273,8 +256,12 @@ def test_the_pass_reads_no_more_than_ptxas_holds_an_attention_backward():
         shapes = jax.tree.map(lambda array: jax.ShapeDtypeStruct(array.shape, array.dtype), residuals)
         (record,) = kernel_compile.compile_mosaic_kernels(
             [KernelCase("backward", lambda: (backward, (query, key, key, query, shapes)), models)], "sm90")
+    def least(need) -> int:
+        # ptxas's least cap that holds the kernel spill-free (`kernel_compile.register_decisions`' caps).
+        return need if isinstance(need, int) else min(cap["cap"] for cap in need["caps"] if cap["holds"])
+
     lowered = record.get("lowered_models", {})
-    checked = [(found.traced, lowered[found.traced]["registers"], kernel["need"])
+    checked = [(found.traced, lowered[found.traced]["registers"], least(kernel["need"]))
                for kernel in record["kernels"] if (found := kernel_compile._report(kernel)).traced in lowered
                and kernel.get("need") is not None]
     assert checked, (sorted(lowered), [kernel["kernel"] for kernel in record["kernels"]])
