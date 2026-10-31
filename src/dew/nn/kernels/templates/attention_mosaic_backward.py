@@ -14,6 +14,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels.templates import attention_algebra as algebra, bundles, mosaic
 from dew.nn.kernels.templates.attention import DQ_GRADS, Dropout, Hooks, Kind, PaddedCall, Param, by_power
+from dew.nn.kernels.templates.attention_mosaic_coop import _coop_launch
 from dew.nn.kernels.templates.attention_mosaic_dkv import _dkv_launch
 from dew.nn.kernels.templates.attention_mosaic_dq import _dq_launch
 from dew.nn.kernels.templates.attention_mosaic_fused import _fused_launch
@@ -186,7 +187,10 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
         program, family=bundles.named(dkv_tiles.family, query.dtype), tiles=dkv_tiles),
         consumers=dkv_tiles.consumers)
     if walk.fused:
-        if tiles.dkv_apart:
+        if tiles.shared_keys:
+            dq, dk, dv = _coop_launch(query, key, value, dout, maximum, forward_total, anchor, delta, chosen,
+                                      spans, walk=walk)
+        elif tiles.dkv_apart:
             # The fused launch keys first on its own layout (`BackwardTiles.dkv`): its consumers' shares of a
             # slot's queries each a warpgroup MMA's rows, dQ added a tile at a time.
             dq, dk, dv = _dkv_launch(query, key, value, dout, maximum, forward_total, anchor, delta, chosen,
