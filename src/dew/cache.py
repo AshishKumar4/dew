@@ -126,6 +126,11 @@ def beside_compilation_cache(variable: str, name: str) -> Path | None:
     return None if not cache else Path(cache) / name
 
 
+_UNCACHED = threading.RLock()
+"""Held while the process's cache is set up again (`enable_compilation_cache`) or turned off for a while
+(`uncached`), so neither restores a setting the other made; one thread may do both, nested."""
+
+
 def enable_compilation_cache(path: str):
     """Persist compiled executables so restarts skip XLA compilation, and the
     GPU autotuner's picks beside them.
@@ -155,11 +160,14 @@ def enable_compilation_cache(path: str):
     from jax.experimental.compilation_cache import compilation_cache
 
     os.makedirs(path, exist_ok=True)
-    if jax.config.jax_compilation_cache_dir not in (None, path):
-        # JAX settles its cache at the process's first compile and keeps it; `reset_cache` forgets it, so
-        # the next compile settles it again here (row 2836).
-        compilation_cache.reset_cache()
-    jax.config.update('jax_compilation_cache_dir', path)
+    with _UNCACHED:
+        moved = jax.config.jax_compilation_cache_dir not in (None, path)
+        jax.config.update('jax_compilation_cache_dir', path)
+        if moved:
+            # JAX settles its cache at the process's first compile and keeps it; `reset_cache` forgets
+            # it, so the next compile settles it again, under the directory named first, so no compile
+            # between the two settles it on the old one (row 2836).
+            compilation_cache.reset_cache()
     # The autotuner's picks follow the policy above, through XLA_FLAGS; JAX's own placement of them
     # in the cache directory would name one directory for every jaxlib and write picks from a
     # process this policy keeps to reading (`jax._src.compiler.get_compile_options`).
@@ -177,9 +185,6 @@ def enable_compilation_cache(path: str):
         if picks:
             os.makedirs(picks, exist_ok=True)
         os.environ['XLA_FLAGS'] = f"{flags} --xla_gpu_per_fusion_autotune_cache_dir={picks}".strip()
-
-
-_UNCACHED = threading.Lock()
 
 
 @contextlib.contextmanager
