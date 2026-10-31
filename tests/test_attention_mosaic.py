@@ -249,7 +249,7 @@ def _check_spans(label: str, spans: template.KeySpans, shape, *, interpret: bool
         seeds = (BACKWARD_SEEDS.get((score, jnp.dtype(dtype).name), SEEDS) if backward
                  else ALL_HOOKS_SEEDS if len(score) + gate > 1 else SEEDS)
     assert_as_exact(jax.jit(ours), jax.jit(reference), draw, name, seeds=seeds,
-                    terms=_gradient_terms(spans, hooked) if backward else None)
+                    terms=_gradient_terms(spans, hooked, score) if backward else None)
 
 
 def _check_hooks(hooks: str, dtype, natural: bool, *, interpret: bool):
@@ -354,22 +354,23 @@ def _check_backward(call: str, shape, *, form: str | None, interpret: bool, keys
                     seeds=SEEDS, terms=_gradient_terms(spans))
 
 
-def _gradient_terms(spans: template.KeySpans, hooked: Callable | None = None):
+def _gradient_terms(spans: template.KeySpans, hooked: Callable | None = None, score: tuple = ()):
     """The float64 terms of the query's, key's and value's gradients over `spans` (`attention_terms`): a
     logit's gradient `P (dP - D)` sized by `P (|dP| + sum |out dout|)`, the rounding a D formed from the
     rounded output carries (`template.Kept.OUTPUT`'s, and the fast form's: its anchor key's `dP - c` its
     product's rounding), so a row that cancels to zero in float64 is held to it, not to its own zero. Under
     score hooks (`hooked(params, initial)`, a draw's `(query, key, value, dout, params, initial)`), the
-    logits are the hook's (`template.score_modded`) and its parameters' and initial state's gradients sized
-    by their truth alone; a call resuming from an initial state takes check 1's own terms (None)."""
+    logits are the hook's (`template.score_modded`) and its parameters' gradients sized by their truth
+    alone. A call resuming from an initial state (`score` naming sinks or a resumed partial) takes check
+    1's own terms (None): its weights start from the state, which `attention_terms` does not carry."""
+    if {"sinks", "resumed"} & set(score):
+        return None
     keep = template.dense(spans)[:, None]
 
     def terms(query, key, value, dout, *hooks):
         if not hooks:
             return tuple(attention_terms(query, key, value, dout, keep)[1:])
-        params, initial = hooks
-        if initial is not None:
-            return None
+        params, _ = hooks
         wide = tuple(jnp.asarray(np.asarray(param), np.float64) for param in params)
         found = attention_terms(query, key, value, dout, keep,
                                 score=lambda raw: template.score_modded(raw, hooked(wide, None)))
