@@ -107,6 +107,21 @@ def draws(seed: int, steps: int, batch: int, shape: tuple[int, ...]) -> tuple[np
     return levels, noise
 
 
+DRAWS = (("times", "t"), ("noise", "noise"))
+"""Each of the step's draws (`Step.sample`'s name) and the batch's field holding it."""
+
+
+def replayed(step, batch: dict) -> tuple[Any, dict]:
+    """`step` replaying the batch's draws (`DRAWS`) through its tape, each row at its example's place
+    among the update's (`Step.places`), and the batch without them: Dew's own loss then reads the draws
+    the batch holds, on any split of the update into microbatches."""
+    places, count = step.places(batch["t"].shape[0])
+    tape = {name: jnp.zeros((count, *batch[field].shape[1:]), batch[field].dtype).at[places].set(batch[field])
+            for name, field in DRAWS}
+    drawn = {field for _, field in DRAWS}
+    return step.replace(tape=tape), {name: value for name, value in batch.items() if name not in drawn}
+
+
 def load_tree(path: str | Path) -> dict:
     """The npz of `/`-joined leaf paths `save_tree` writes, as its nested dict."""
     with np.load(path) as arrays:
@@ -227,34 +242,20 @@ def dew_side(args, images, total, attention):
     """Dew's trainer over `MeshSpec`, with the draws read from the batch."""
     from work import measure
 
-    from dew.diffusion.schedules import expand
-    from dew.diffusion.transforms import broadcast_rates
     from dew.distributed.batches import batch_shardings
-    from dew.inputs import unit_range
-    from dew.objectives.base import Aux, Ratio
     from dew.objectives.diffusion import DiffusionObjective
     from dew.training import MeshSpec, Trainer
 
     class FixedDraws(DiffusionObjective):
-        """Dew's `DiffusionObjective.loss`, the two draws read from the batch."""
+        """Dew's `DiffusionObjective.loss`, its two draws the batch's (`replayed`)."""
 
         def model_flops(self, model, batch):
             """Fixed randomness changes no forward geometry from the counted objective."""
             return counted.model_flops(model, batch)
 
         def loss(self, variables, batch, step):
-            samples = unit_range(batch[self.inputs.sample.key])
-            schedule = self.process.schedule
-            t, noise = batch["t"], batch["noise"]
-            rates = broadcast_rates(schedule, t, samples)
-            noisy, c_in, target = self.process.prediction.forward_diffusion(samples, noise, rates)
-            preds = self.model.apply(self.model_variables(variables), noisy * c_in, schedule.model_time(t),
-                                     train=True, rngs={"dropout": step.key})
-            preds = self.process.prediction.pred_transform(noisy, preds, rates, t)
-            losses = optax.l2_loss(preds, target)
-            weights = expand(self.process.weight(t), losses)
-            total = jnp.asarray(losses.size, jnp.promote_types(losses.dtype, jnp.float32))
-            return Ratio(jnp.sum(losses * weights), total), Aux(metrics={})
+            taped, images = replayed(step, batch)
+            return super().loss(variables, images, taped)
 
     counted = counting_objective(images.shape[1:], args.dtype, attention)
     model = counted.model
