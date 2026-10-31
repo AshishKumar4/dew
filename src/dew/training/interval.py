@@ -166,6 +166,20 @@ class Interval:
     """`consumed` before the latest step."""
     consumed_committed: int = 0
     """`consumed` at the run's last update boundary (`FitRun.committed_examples`)."""
+    watched: tuple[int, _Settled] | None = None
+    """The latest taken step whose loss was not computed at its take, which the loop looks at as it steps
+    (`seen`)."""
+    finished: tuple[int, float] | None = None
+    """The latest step the loop saw finished on the devices and when (`seen`, `take`): every step before
+    it had finished by then, as the devices run steps in order, which bounds the `done` of a log whose
+    step was not finished at its take (`Taken.read`)."""
+
+    def seen(self) -> None:
+        """Note when the loop first sees the watched step finished (`watched`, `finished`): one look,
+        which never waits, as it steps."""
+        watched = self.watched
+        if watched is not None and watched[1].is_ready():
+            self.watched, self.finished = None, (watched[0], time.time())
 
     def count(self, batch: Batch, flops: StepFlops | None, loss: jax.Array, finite: jax.Array,
               committed: Committed | None, aux: Mapping[str, jax.Array] | None = None) -> None:
@@ -272,8 +286,15 @@ class Interval:
         for leaf in jax.tree.leaves(reading):
             if isinstance(leaf, jax.Array):
                 leaf.copy_to_host_async()
-        taken = Taken(step, self, dataclasses.replace(self), reading,
-                      time.time() if isinstance(loss, _Settled) and loss.is_ready() else None)
+        self.seen()
+        done = None
+        if isinstance(loss, _Settled):
+            done = time.time() if loss.is_ready() else None
+            if done is None:
+                self.watched = (step, loss)
+            else:
+                self.watched, self.finished = None, (step, done)
+        taken = Taken(step, self, dataclasses.replace(self), reading, done)
         if self.tokens_counted and book is not None:
             self.logged_tokens = book.tokens if self.logged_tokens is None else _added_tokens(
                 self.logged_tokens, book.tokens)
@@ -398,8 +419,10 @@ class Taken(NamedTuple):
 
     `counts` is the live `interval` as it stood at the take. `done` is when
     the host first saw the step finished: at the take if it already was,
-    else at the read, which waits for it. The read ends the interval's clock
-    there, and the next interval's clock starts there (`LogWriter.since`).
+    else where the loop first saw it or a later step finished as it stepped
+    (`Interval.seen`), or at the read, which waits for it, whichever came
+    first. The read ends the interval's clock there, and the next interval's
+    clock starts there (`LogWriter.since`).
     """
 
     step: int
@@ -417,8 +440,16 @@ class Taken(NamedTuple):
         interval's seconds since `since`, the previous log's `done` (the interval's own start for the first),
         and its `done`."""
         read = on_host(self.reading, self.step)
+        done = self.done
+        if done is None:
+            # Its step was done when the read returned at the latest, and when the loop first saw it or a
+            # later step finished (`Interval.finished`): a reader that runs late, after the loop took the
+            # next log, would otherwise end this interval past the next one's `done`, leaving that one
+            # no seconds and no rates.
+            seen = self.interval.finished
+            done = time.time() if seen is None or seen[0] < self.step else min(time.time(), seen[1])
         # A log read late is done no earlier than the one read before it.
-        done = max(time.time() if self.done is None else self.done, since or 0.0)
+        done = max(done, since or 0.0)
         if read.streak is not None:
             checked_streak(int(read.streak), self.step, display)
         return read, done - (self.counts.last_log_time if since is None else since), done
