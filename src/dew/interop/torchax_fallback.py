@@ -1041,23 +1041,29 @@ def _narrow_float(value) -> bool:
     return jnp.issubdtype(dtype, jnp.floating) and jnp.finfo(dtype).bits < 32
 
 
-@functools.partial(jax.custom_vjp, nondiff_argnums=(1, 2))
 def _accumulated(value: jax.Array, shape: tuple[int, ...], dimensions: tuple[int, ...]) -> jax.Array:
-    """`jax.lax.broadcast_in_dim`, whose gradient sums in fp32 and rounds once to `value`'s dtype."""
-    return jax.lax.broadcast_in_dim(value, shape, dimensions)
+    """`jax.lax.broadcast_in_dim`, whose gradient sums in fp32 and rounds once to `value`'s dtype, at every
+    order (`_wide_summed`)."""
+    return _wide_summed(shape, dimensions)(value)
 
 
-def _accumulated_forward(value, shape, dimensions):
-    return _accumulated(value, shape, dimensions), value
+@functools.cache
+def _wide_summed(shape: tuple[int, ...], dimensions: tuple[int, ...]) -> Callable[[jax.Array], jax.Array]:
+    """The broadcast to `shape` over `dimensions` as one differentiable function (`linear_tangent`), built
+    once a broadcast so its traces are JAX's cached ones: its tangent the broadcast's own, its transpose
+    the cotangent summed in fp32 and rounded once to the value's dtype, so forward mode, reverse mode and
+    their compositions all take it (ledger 2653), where a custom VJP takes no forward mode."""
+    from dew.nn.kernels.generation import linear_tangent
 
+    def broadcast(value: jax.Array) -> jax.Array:
+        return jax.lax.broadcast_in_dim(value, shape, dimensions)
 
-def _accumulated_backward(shape, dimensions, value, cotangent):
-    _, transpose = jax.vjp(lambda wide: jax.lax.broadcast_in_dim(wide, shape, dimensions),
-                           value.astype(jnp.float32))
-    return (transpose(cotangent.astype(jnp.float32))[0].astype(value.dtype),)
+    def summed(_saved: tuple[()], operands: tuple[jax.Array], cotangent: jax.Array) -> tuple[jax.Array]:
+        (value,) = operands
+        _, transpose = jax.vjp(broadcast, value.astype(jnp.float32))
+        return (transpose(cotangent.astype(jnp.float32))[0].astype(value.dtype),)
 
-
-_accumulated.defvjp(_accumulated_forward, _accumulated_backward)
+    return linear_tangent(lambda value: (broadcast(value), ()), summed, broadcast)
 
 
 def _forward(model: PreTrainedModel, tokens: torch.Tensor, positions: torch.Tensor | None = None,
