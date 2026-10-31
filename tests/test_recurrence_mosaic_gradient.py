@@ -159,9 +159,9 @@ def test_a_walk_of_two_roles_is_as_exact_as_its_reference(case, product):
 
 
 def test_the_fast_backward_trains_a_bf16_rated_scan_alone():
-    """A rated scan's (Mamba2's SSD) 16-bit gradient under the run's fast forms, whose numbers are mamba_ssm's:
-    the template's fast backward takes a bf16 call and refuses an fp16 one, whose products would take its
-    scores' gradient's bf16 parts (`mainloop._score_grads`) against fp16 keys, so the port trains it
+    """A rated scan's (Mamba2's SSD) 16-bit gradient under the run's fast forms, whose numbers are
+    mamba_ssm's: the template's fast backward takes a bf16 call and refuses an fp16 one, whose products would
+    take its scores' gradient's bf16 parts (`mainloop._score_grads`) against fp16 keys, so the port trains it
     (`mainloop.fast_backward_form`)."""
     hooks = recurrence.Hooks(decay='scalar', rated=True, delta=False, skip=True)
     shape = geometry('one sequence')
