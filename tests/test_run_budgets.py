@@ -641,23 +641,28 @@ def test_a_run_of_steps_resumes_a_checkpoint_that_kept_no_count_and_a_clocked_ru
     """A run of steps keeps no examples consumed in its checkpoints (`TrainState.consumed`), as a run from
     before the examples clock kept none: a run of steps resumes such a checkpoint, its pending window read
     through the template every resume reads (`Checkpoints.accumulation_template`, row 2433), while a run on
-    the examples clock, whose schedule would read its progress off the count, refuses it before any step."""
+    the examples clock, whose schedule would read its progress off the count, refuses it before any step.
+    Every fit reads one loader under one constant rate, so the count is all the checkpoints differ by; a
+    clocked run's checkpoint, which kept its count, resumes on the examples clock (the control)."""
     (x,) = clocked_records(0)
-    optim = OptimConfig(optimizer="adam", learning_rate=Linear(peak_value=PEAK, end_value=CLOCKED_END))
+    optim = OptimConfig(optimizer="adam", learning_rate=PEAK)
+    loader, _ = fitted(clocked_chain(x), None, objective=Echoed().data(), examples=CLOCKED_RECORDS)
 
-    def fit(**bound):
-        checkpoints = Checkpoints(str(tmp_path))
+    def fit(directory, **bound):
+        checkpoints = Checkpoints(str(directory))
         state = Trainer(Echoed(), optim, key=0, accumulation=accumulation, checkpoints=checkpoints).fit(
-            clocked_chain(x), log_every=1, checkpoint_every=1, **bound)
+            loader, log_every=1, checkpoint_every=1, **bound)
         checkpoints.wait()
         return state
 
-    assert fit(steps=2).consumed is None
-    resumed = fit(steps=4)
-    assert int(resumed.step) == 4 and resumed.consumed is None
+    assert fit(tmp_path / "steps", steps=1).consumed is None
+    resumed = fit(tmp_path / "steps", steps=2)
+    assert int(resumed.step) == 2 and resumed.consumed is None
     with pytest.raises(ValueError):
-        fit(examples=CLOCKED_RECORDS)
-    assert Checkpoints(str(tmp_path)).latest == 4
+        fit(tmp_path / "steps", examples=CLOCKED_RECORDS)
+    assert Checkpoints(str(tmp_path / "steps")).latest == 2
+    fit(tmp_path / "examples", examples=CLOCKED_RECORDS, stop=Pause(0.5))
+    assert int(fit(tmp_path / "examples", examples=CLOCKED_RECORDS).consumed) == CLOCKED_RECORDS
 
 
 class Placed(Pulled):
