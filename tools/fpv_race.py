@@ -386,6 +386,8 @@ def _online(out: Path, report: dict, progress: dict, agent, races: tuple, judge,
             level = round(min(1.0, level + 0.1), 1)
             for raced in races:
                 raced.difficulty = raced.ramp = level
+            # The checkpoint just written goes on at the level its judgment earned.
+            progress = _committed(out, {**progress, "level": level})
     return state
 
 
