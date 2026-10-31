@@ -423,7 +423,7 @@ def _contraction(product: Callable, preferred_element_type) -> tuple | None:
     them, with the dtype it is asked for: the contraction, the arguments' tree and their leaves; None for any
     other product."""
     function, arguments, keywords = product, (), {}
-    while type(function) is functools.partial:
+    while isinstance(function, functools.partial) and type(function) is functools.partial:
         arguments, keywords = function.args + arguments, {**function.keywords, **keywords}
         function = function.func
     intercepted = (jax.lax.dot_general.__code__, jnp.einsum.__code__) != _JAX_CODE
