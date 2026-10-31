@@ -10,6 +10,12 @@ over a ground and its own course's gates, placed on the device each frame. The s
 cameras cross between them and JAX by DLPack on the device. The course, reward and collisions are the
 race's, in JAX.
 
+Both parts compile on first use with CMake against the CUDA toolkit nvcc belongs to (`CUDACXX`, or
+`CUDAToolkit_ROOT` where a distribution's toolkit lives under /usr), and the renderer loads the
+driver's OptiX library, `libnvoptix.so.1`. A headless data-center driver ships none: its own version's
+`libnvoptix.so` and `libnvidia-rtcore.so`, extracted from NVIDIA's runfile for that driver
+(`--extract-only`), serve on `LD_LIBRARY_PATH`.
+
 The drone is L2F's `flightmare` quadrotor, the nearest it holds to a five-inch racer: 0.73 kg on arms
 of 0.17 m, its four rotors lifting 12.1 times its weight at full command (parameters/dynamics/
 flightmare.h). Ideal actuation reads its thrust-to-weight from its own parameters, which 0.1.10 derives
