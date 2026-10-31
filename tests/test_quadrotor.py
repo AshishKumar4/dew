@@ -1,21 +1,39 @@
 """A racing quadrotor's physics (`dew.rl.quadrotor`): a control step of drawn drones under drawn commands held
 to a float64 NumPy transcription of the physics, written from the sources apart from Dew's code (the rigid
 body, the rotors' lag and the battery's voltage, the drag, the ground effect, the disturbances and the flight
-controller); a nominal drone holding its hover, an equilibrium of that physics; and a drone's drawn
-parameters about nominal."""
+controller); a nominal drone holding its hover, an equilibrium of that physics; and the drones' drawn
+parameters, the racer's randomization written out over the draws."""
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from reference_error import assert_computes_the_oracle, chain_roundings
 
 from dew.rl.quadrotor import Body, Flight, Quadrotor, drawn_body, flown, hovering
 
 QUADROTOR = Quadrotor()
 HZ = 60.0
-NOMINAL_RATIO = 4 * 1.563e-6 * 2400 ** 2 / (0.768 * 9.81)
-"""The nominal racer's thrust over its weight at full charge, from Kaufmann et al.'s Table II: four rotors of
-1.563e-6 N s^2 at 2400 rad/s under 0.768 kg."""
+NOMINAL = {
+    "mass": 0.768, "mass_spread": 0.2, "inertia": (2.5e-3, 2.1e-3, 4.3e-3), "inertia_spread": 0.3,
+    "thrust_coefficient": 1.563e-6, "drag_coefficient": 1.909e-8, "coefficient_spread": 0.15,
+    "top_speed": 2400.0, "top_spread": 0.1, "motor_lag": (0.02, 0.06), "rotor_drag": 5.37e-5,
+    "quadratic_drag": (4.10e-3, 1.51e-2), "vertical_drag": 0.15, "drag_spread": 0.3,
+    "ground_effect": (0.75, 1.0), "charged": (3.7, 4.2), "full_voltage": 4.2, "resistance": (0.003, 0.012),
+    "bias_force": 2.0, "bias_moment": 2.0,
+}
+"""The nominal racer and its parameters' randomization as `dew.rl.quadrotor`'s documentation gives them
+(Kaufmann et al.'s Table II racer, the drag, ground-effect, battery and disturbance figures it cites, and its
+own spreads and ranges), each under the name of the `Quadrotor` field it is."""
+RETUNED = {
+    "mass": 0.55, "mass_spread": 0.11, "inertia": (1.6e-3, 1.4e-3, 2.9e-3), "inertia_spread": 0.13,
+    "thrust_coefficient": 1.2e-6, "drag_coefficient": 1.5e-8, "coefficient_spread": 0.17,
+    "top_speed": 2900.0, "top_spread": 0.07, "motor_lag": (0.03, 0.05), "rotor_drag": 4.4e-5,
+    "quadratic_drag": (3.3e-3, 1.9e-2), "vertical_drag": 0.21, "drag_spread": 0.23,
+    "ground_effect": (0.6, 0.9), "charged": (3.5, 4.0), "full_voltage": 4.1, "resistance": (0.004, 0.009),
+    "bias_force": 1.3, "bias_moment": 2.9,
+}
+"""A second racer with every parameter `drawn_body` reads changed, and no two spreads or biases alike."""
 
 
 def quaternion_matrix(q: np.ndarray) -> np.ndarray:
@@ -176,29 +194,85 @@ def test_a_nominal_drone_holds_its_hover():
                                    roundings=roundings)
 
 
-def test_drawn_drones_spread_about_the_nominal_racer():
-    """At no randomization every drone is the nominal racer (4.8 times its weight at full charge, no
-    disturbance); at full randomization 4096 drones' masses, top speeds, lags and charges span their ranges
-    and their thrust-to-weight ratios lie within the ranges' extremes."""
+def body_draws(key: jax.Array) -> dict:
+    """Every draw `drawn_body` makes from `key`, uniform in [0, 1), by the keys it splits off in the order it
+    takes them, named for the parameter it sets."""
+    keys = jax.random.split(key, 16)
+    return {"mass": jax.random.uniform(keys[0]), "inertia": jax.random.uniform(keys[1], (3,)),
+            "thrust": jax.random.uniform(keys[2]), "drag": jax.random.uniform(keys[3]),
+            "top": jax.random.uniform(keys[4]), "lag": jax.random.uniform(keys[5]),
+            "rotor_drag": jax.random.uniform(keys[6]), "quadratic": jax.random.uniform(keys[7], (2,)),
+            "vertical": jax.random.uniform(keys[8]), "ground": jax.random.uniform(keys[9]),
+            "charged": jax.random.uniform(keys[10]), "resistance": jax.random.uniform(keys[11]),
+            "force": jax.random.uniform(keys[12], (3,)), "moment": jax.random.uniform(keys[13], (3,))}
+
+
+def written_body(racer: dict, ramp: float, draws: dict) -> dict[str, np.ndarray]:
+    """The parameters of the drones whose draws are `draws` (`body_draws`), written out from a racer's table
+    at a ramp: a scale parameter is its nominal times a factor within 1 +- the ramp times its spread; a
+    parameter in a range is its nominal moved the ramp's share of the way to its draw in the range (the
+    nominal lag the middle of its range, the nominal ground effect its strongest, the nominal charge the
+    full voltage, the nominal resistance its least); the disturbance force is the drawn mass and the moment
+    the nominal inertia, each times the ramp, its bias and a draw within +-1."""
+
+    def scaled(nominal, spread: float, unit: np.ndarray) -> np.ndarray:
+        return np.asarray(nominal) * (1 + ramp * spread * (2 * unit - 1))
+
+    def moved(span: tuple[float, float], nominal: float, unit: np.ndarray) -> np.ndarray:
+        return nominal + ramp * (span[0] + (span[1] - span[0]) * unit - nominal)
+
+    r, unit = racer, draws
+    mass = scaled(r["mass"], r["mass_spread"], unit["mass"])
+    return {
+        "mass": mass,
+        "inertia": scaled(r["inertia"], r["inertia_spread"], unit["inertia"]),
+        "thrust_coefficient": scaled(r["thrust_coefficient"], r["coefficient_spread"], unit["thrust"]),
+        "drag_coefficient": scaled(r["drag_coefficient"], r["coefficient_spread"], unit["drag"]),
+        "top_speed": scaled(r["top_speed"], r["top_spread"], unit["top"]),
+        "motor_lag": moved(r["motor_lag"], sum(r["motor_lag"]) / 2, unit["lag"]),
+        "rotor_drag": scaled(r["rotor_drag"], r["drag_spread"], unit["rotor_drag"]),
+        "quadratic_drag": scaled(r["quadratic_drag"], r["drag_spread"], unit["quadratic"]),
+        "vertical_drag": scaled(r["vertical_drag"], r["drag_spread"], unit["vertical"]),
+        "ground_effect": moved(r["ground_effect"], max(r["ground_effect"]), unit["ground"]),
+        "charged": moved(r["charged"], r["full_voltage"], unit["charged"]),
+        "resistance": moved(r["resistance"], min(r["resistance"]), unit["resistance"]),
+        "force": mass[:, None] * ramp * r["bias_force"] * (2 * unit["force"] - 1),
+        "moment": np.asarray(r["inertia"]) * ramp * r["bias_moment"] * (2 * unit["moment"] - 1),
+    }
+
+
+def written_ratio(racer: dict, body: dict[str, np.ndarray]) -> np.ndarray:
+    """A drone's full thrust over its weight at its charge at the start: its four rotors' thrust at its top
+    speed scaled by its charge's share of the full voltage, over its mass times 9.81."""
+    top = body["top_speed"] * body["charged"] / racer["full_voltage"]
+    return 4 * body["thrust_coefficient"] * top ** 2 / (body["mass"] * 9.81)
+
+
+@pytest.mark.parametrize("ramp", [0.0, 0.5, 1.0])
+@pytest.mark.parametrize(("quadrotor", "racer"), [(QUADROTOR, NOMINAL), (Quadrotor(**RETUNED), RETUNED)],
+                         ids=["nominal", "retuned"])
+def test_drawn_drones_are_the_randomization_written_out(quadrotor, racer, ramp):
+    """4096 drones drawn at a ramp, in float64, of the nominal racer and of a retuned one (each parameter
+    changed, so each is read from the quadrotor drawn from): every field of a drone's body is the
+    randomization written out over the draws `drawn_body` makes (`written_body`) to float64 rounding, and at
+    no randomization exactly the racer's own, with no disturbance; and the drone's thrust-to-weight ratio is
+    the written formula's."""
     keys = jax.random.split(jax.random.key(3), 4096)
 
-    def at_no_randomization(key):
-        body = drawn_body(QUADROTOR, key, jnp.asarray(0.0))
-        return body.thrust_to_weight(QUADROTOR), body.force, body.moment
+    def drawn(key):
+        body = drawn_body(quadrotor, key, jnp.asarray(ramp))
+        return body, body.thrust_to_weight(quadrotor)
 
     with jax.enable_x64(new_val=True):
-        ratio, force, moment = jax.jit(jax.vmap(at_no_randomization))(keys)
-        roundings = chain_roundings(jax.make_jaxpr(jax.vmap(at_no_randomization))(keys))
-        assert_computes_the_oracle(np.asarray(ratio), np.full(4096, NOMINAL_RATIO),
-                                   "the nominal racer's thrust-to-weight ratio", roundings=roundings)
-    assert not np.asarray(force).any() and not np.asarray(moment).any()
-    drawn = jax.vmap(lambda key: drawn_body(QUADROTOR, key, jnp.asarray(1.0)))(keys)
-    mass, top = np.asarray(drawn.mass), np.asarray(drawn.top_speed)
-    assert mass.min() < 0.768 * 0.82 and mass.max() > 0.768 * 1.18
-    assert top.min() < 2400 * 0.92 and top.max() > 2400 * 1.08
-    lag, charged = np.asarray(drawn.motor_lag), np.asarray(drawn.charged)
-    assert lag.min() < 0.022 and lag.max() > 0.058 and charged.min() < 3.72 and charged.max() > 4.18
-    ratio = np.asarray(jax.vmap(lambda body: body.thrust_to_weight(QUADROTOR))(drawn))
-    weakest = NOMINAL_RATIO * 0.85 * (0.9 * 3.7 / 4.2) ** 2 / 1.2
-    strongest = NOMINAL_RATIO * 1.15 * 1.1 ** 2 / 0.8
-    assert weakest < ratio.min() and ratio.max() < strongest
+        bodies, ratio = jax.jit(jax.vmap(drawn))(keys)
+        draws = jax.tree.map(np.asarray, jax.jit(jax.vmap(body_draws))(keys))
+        roundings = chain_roundings(jax.make_jaxpr(jax.vmap(drawn))(keys))
+    expected = written_body(racer, ramp, draws)
+    for name in Body.__dataclass_fields__:
+        shown = np.asarray(getattr(bodies, name))
+        if ramp:
+            assert_computes_the_oracle(shown, expected[name], f"a drone's {name}", roundings=roundings)
+        else:
+            np.testing.assert_array_equal(shown, expected[name])
+    assert_computes_the_oracle(np.asarray(ratio), written_ratio(racer, expected),
+                               "a drone's thrust-to-weight ratio", roundings=roundings)
