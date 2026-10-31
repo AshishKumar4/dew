@@ -196,12 +196,9 @@ def across(x: jax.Array, like: jax.Array) -> jax.Array:
     return jax.lax.broadcast_in_dim(x, like.shape, tuple(range(like.ndim - x.ndim, like.ndim)))
 
 
-@dataclasses.dataclass(frozen=True)
-class Coords:
+class Coords(NamedTuple):
     """A tile's coordinates as the mainloop provides them (in the layout its products give): the query
-    indices `q_pos` `[bq, 1]` (`q_places`, or a function building them at their first read, so a branch
-    that reads none traces none: Mosaic GPU keeps an unread iota without its layout, which its inference
-    cannot place) and key indices `k_pos` `[1, bk]`, and where the spans narrow, each
+    indices `q_pos` `[bq, 1]` and key indices `k_pos` `[1, bk]`, and where the spans narrow, each
     query's intervals `spans`, one a run (a call's runs, `KeySpans`; one where it has none), each its
     first and past-last keys `[bq]` (`intervals`), with documents the queries' and keys' ids `ids`,
     `[bq]` and `[bk]`, and with dropout its entries' draw `drop` (`Draw`). A tile whose rows are its keys
@@ -210,18 +207,13 @@ class Coords:
     mainloop that reads its walk's tile a part at a time states the tile's keys (`tile_keys`), which a
     part past the call's keys lies within (`key_count`)."""
 
-    q_places: jax.Array | Callable[[], jax.Array]
+    q_pos: jax.Array
     k_pos: jax.Array
     spans: tuple[tuple[jax.Array, jax.Array], ...] | None = None
     ids: tuple[jax.Array, jax.Array] | None = None
     drop: Draw | None = None
     keys_first: bool = False
     tile_keys: int | None = None
-
-    @functools.cached_property
-    def q_pos(self) -> jax.Array:
-        """The tile's query indices (`q_places`), built at their first read where given as a function."""
-        return self.q_places() if callable(self.q_places) else self.q_places
 
     def queries(self, x: jax.Array, like: jax.Array) -> jax.Array:
         """A per-query `x` (`[bq]`) broadcast over the tile `like`."""
