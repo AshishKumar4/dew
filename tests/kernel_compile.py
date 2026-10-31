@@ -113,8 +113,9 @@ def reports(estimates: dict[str, str], binaries: list[report.Binary],
                 int(shared.group(1)) <= binary.shared and (int(shared.group(1)) > 0 or binary.shared == 0)):
             raise ValueError(f"{name}'s estimate of {shared.group(1)} shared bytes pairs with a binary whose "
                              f"launch asks for {binary.shared}: the estimate is another kernel's")
-        unread = tuple(field for field, read in (("shared bytes", shared), ("tensor memory columns", tmem))
-                       if not read)
+        # A kernel no binary carries is no compiled kernel, whatever its PTX's compile says.
+        unread = tuple(field for field, read in (("shared bytes", shared), ("tensor memory columns", tmem),
+                                                 ("binary", binary)) if not read)
         kernel, launch = report.kernel_of(name)
         found_reports.append(Report(
             kernel, int(shared.group(1)) if shared else None, sum(map(int, tmem.groups())) if tmem else None,
@@ -216,10 +217,7 @@ def _compiled(case, generation: str, record: dict,
         return None
     calls = [call for call in kernel_calls(lowered) if call.kind == "mosaic_gpu"]
     named = [traced(call.name, call.launch) for call in calls]
-    modules: dict[str, str] = {}
-    for name, call in zip(named, calls, strict=True):
-        if modules.setdefault(name, call.config) != call.config:
-            raise ValueError(f"{name} names two kernels: its evidence would be one's")
+    modules = kernel_modules(calls)
     if directory is not None:
         record["modules"] = modules
         record["estimates"] = _estimates(calls, named, "".join(estimated))
@@ -243,8 +241,19 @@ def _compiled(case, generation: str, record: dict,
             return None
         if directory is not None:
             record["binaries"] = [dataclasses.asdict(found) for found in report.binaries(executable)]
-            _write_modules("".join(printed), directory)
+            write_modules("".join(printed), directory)
         return [path.read_text() for path in Path(dump).glob("*thunk_sequence.txt")], triton_kernels(lowered)
+
+
+def kernel_modules(calls: list) -> dict[str, str]:
+    """Each Mosaic GPU call's module (its kernel hash) by its kernel's name and launch (`traced`): one name
+    and launch of two modules raises, as its evidence would be one's."""
+    modules: dict[str, str] = {}
+    for call in calls:
+        name = traced(call.name, call.launch)
+        if modules.setdefault(name, call.config) != call.config:
+            raise ValueError(f"{name} names two kernels: its evidence would be one's")
+    return modules
 
 
 def _estimates(calls: list, named: list[str], printed: str) -> dict[str, str]:
@@ -265,7 +274,7 @@ ESTIMATES: dict[str, str] = {}
 """Each Mosaic GPU kernel's resource estimate this process read, by its module (its kernel hash)."""
 
 
-def _write_modules(printed: str, directory: str) -> None:
+def write_modules(printed: str, directory: str) -> None:
     """Each PTX module Mosaic printed as it compiled (`PTX_MODULE`) into `directory` as `<kernel>.ptx`, its
     kernel's name and launch its entry's (`report.kernel_of`, `traced`)."""
     for part in printed.split(PTX_MODULE)[1:]:
@@ -544,7 +553,7 @@ def _compiled_reports(directory: str, generation: str) -> dict[str, dict]:
 def _needs(directory: str, generation: str,
            models: dict[str, resources.RegisterModel] | None = None) -> dict[str, int | dict | None]:
     """Each kernel's register need (`register_need`) from the PTX Mosaic printed into `directory`
-    (`_write_modules`), by its name and launch (`traced`), at its model where `models` holds one so."""
+    (`write_modules`), by its name and launch (`traced`), at its model where `models` holds one so."""
     found = {}
     for path in Path(directory).glob("*.ptx"):
         name = path.stem

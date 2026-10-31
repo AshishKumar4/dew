@@ -7,6 +7,7 @@ import dataclasses
 import functools
 import os
 import re
+import tempfile
 import threading
 from pathlib import Path
 
@@ -753,11 +754,38 @@ def test_the_resource_gate_refuses_spills_and_invalid_allocations():
         [report.Binary("a", None, 168, 0), report.Binary("b", None, 255, 40)]))
     assert not a["unread"]
     assert set(b["unread"]) == {"shared bytes", "tensor memory columns"}
-    assert set(c["unread"]) == {"tensor memory columns", "registers", "spills"}
+    assert set(c["unread"]) == {"tensor memory columns", "binary", "registers", "spills"}
     assert len(mosaic_failures([{**record, "kernels": [a, b, c]}])) == 2
     # An estimate past the shared memory its binary's launch asks for is another kernel's: it raises.
     with pytest.raises(ValueError):
         reports({"a": complete}, [report.Binary("a", None, 168, 0, shared=512)])
+    # A complete estimate and its PTX's compile without a binary: no compiled kernel, read as missing.
+    (unbound,) = (inherited(dataclasses.asdict(found), compiled) for found in reports({"a": complete}, []))
+    assert "binary" in unbound["unread"]
+    assert mosaic_failures([{**record, "kernels": [unbound]}])
+
+
+def test_the_resource_gate_refuses_two_kernels_of_one_name_and_launch():
+    """Evidence of one kernel's name and launch from two kernels is one kernel's at most: two modules
+    (`kernel_modules`), two binaries (`reports`) or two PTX modules (`write_modules`) of one raise."""
+    from kernel_compile import PTX_MODULE, kernel_modules, reports, write_modules
+
+    from dew.training._lowering import KernelCall
+
+    calls = [KernelCall("mosaic_gpu", "k", b"", module, None, "0123456789") for module in ("aa", "bb")]
+    assert kernel_modules(calls[:1]) == {"k__l0123456789": "aa"}
+    with pytest.raises(ValueError):
+        kernel_modules(calls)
+    binaries = [report.Binary("k", "0123456789", registers, 0) for registers in (168, 200)]
+    assert len(reports({}, binaries[:1])) == 1
+    with pytest.raises(ValueError):
+        reports({}, binaries)
+    module = f"//\n{PTX_MODULE}\n.visible .entry k__l0123456789_mosaic_gpu_kernel(\n)\n{{\n}}\n"
+    with tempfile.TemporaryDirectory() as directory:
+        write_modules(module, directory)
+        assert [path.name for path in Path(directory).iterdir()] == ["k__l0123456789.ptx"]
+    with tempfile.TemporaryDirectory() as directory, pytest.raises(ValueError):
+        write_modules(module * 2, directory)
 
 
 @COMPILES_FOR_TPU
