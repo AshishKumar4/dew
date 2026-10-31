@@ -139,6 +139,16 @@ def test_a_run_recorded_while_its_iterators_identities_were_their_names_reads_it
     assert [part.identity for part in loaded.validation["val"].source.sources] == ["rows@3", "rows@4"]
 
 
+def test_a_saved_runs_data_shaped_like_an_earlier_iterators_record_loads_as_it_was_written(tmp_path):
+    """A store's data (a Memory's column) shaped like an iterator's earlier record is data, which a saved
+    run loads as it wrote it: the translation of earlier records reads stores alone (`earlier_chains`)."""
+    from dew.config import RunConfig
+
+    payload = {"class": "dew.data.sources.iterator:Iterated", "fields": {"name": "literal"}}
+    path = Path(RunConfig(data=Memory({"payload": [payload]}).batch(1)).save(str(tmp_path / "run")))
+    assert list(RunConfig.load(str(path)).data.source.values["payload"]) == [payload]
+
+
 def test_held_reads_a_dataset_in_its_own_batch_or_the_one_given():
     """A validation dataset read once: in its own batches, in the batches given where it states
     none, and refused where it states none and none is given."""

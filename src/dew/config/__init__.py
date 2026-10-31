@@ -990,30 +990,77 @@ name by today's: an iterator's content version, `identity` as every opaque sourc
 
 def earlier_chains(record: Mapping[str, object]) -> Mapping[str, object]:
     """A saved run's record whose chains (`_CHAINS`) hold a store under fields its class renamed since
-    (`RENAMED_FIELDS`), with them under today's names, wherever a chain holds it (a mix's member, a
-    concatenation's part). A recorded chain holds no row data shaped like a class record (a Memory of such
-    rows is not recorded), so every class record in it is a component's. Carried to 1.0 (ledger 1552)."""
+    (`RENAMED_FIELDS`), with them under today's names, wherever a chain holds the store: its source, a mix's
+    or a phase's member, a store's field that holds stores (a concatenation's parts, a view's source). Data a
+    store holds (a Memory's columns) is read as it was. Carried to 1.0 (ledger 1552)."""
     fields = record.get("fields")
     if not isinstance(fields, Mapping) or not any(name in fields for name in _CHAINS):
         return record
-    return {**record, "fields": {name: _renamed(field_value(value, name)) if name in _CHAINS else value
+    return {**record, "fields": {name: _renamed_chain(field_value(value, name)) if name in _CHAINS else value
                                  for name, value in fields.items()}}
 
 
-def _renamed(value: JSON) -> JSON:
-    """`value`, a chain's record or a part of one, with each class record's renamed fields (`RENAMED_FIELDS`)
-    under today's names."""
+def _renamed_chain(chain: JSON) -> JSON:
+    """A chain's record (`dew.data.records`), or a run's named splits of them, its stores' renamed fields
+    under today's names (`_renamed_stores`)."""
+    if not isinstance(chain, dict):
+        return chain
+    splits = chain.get("splits")
+    if isinstance(splits, list):
+        pairs = [[pair[0], _renamed_chain(pair[1])] if isinstance(pair, list) and len(pair) == 2 else pair
+                 for pair in splits]
+        return {**chain, "splits": pairs}
+    stages = chain.get("stages")
+    if isinstance(stages, list):
+        chain = {**chain, "stages": [_renamed_call(stage) for stage in stages]}
+    source = chain.get("source")
+    if not isinstance(source, dict):
+        return chain
+    members = next((key for key in ("mix", "phases") if isinstance(source.get(key), list)), None)
+    if members is not None:
+        member_chains = source[members]
+        assert isinstance(member_chains, list)
+        return {**chain, "source": {**source, members: [_renamed_chain(member) for member in member_chains]}}
+    if "pipe" in source:
+        return {**chain, "source": {**_renamed_call(source), "input": _renamed_chain(source.get("input"))}}
+    return {**chain, "source": _renamed_stores(source)}
+
+
+def _renamed_call(call: JSON) -> JSON:
+    """A call of `pipe` a chain records (`{"pipe": ..., "settings": {...}}`), each setting that holds stores
+    with their renamed fields under today's names (`_renamed_stores`); any other entry as it is."""
+    if not isinstance(call, dict) or "pipe" not in call or not isinstance(call.get("settings"), dict):
+        return call
+    settings = call["settings"]
+    assert isinstance(settings, dict)
+    return {**call, "settings": {name: _renamed_stores(value) for name, value in settings.items()}}
+
+
+def _renamed_stores(value: JSON) -> JSON:
+    """`value`, a store's class record or a list of them, each store's fields its class renamed
+    (`RENAMED_FIELDS`) under today's names, and each of its fields that holds stores the same; anything
+    else, a store's data among it, as it is."""
     if isinstance(value, list):
-        return [_renamed(part) for part in value]
-    if not isinstance(value, dict):
+        return [_renamed_stores(part) for part in value] if value and all(map(_is_store, value)) else value
+    if not _is_store(value):
         return value
-    held = {key: _renamed(part) for key, part in value.items()}
-    named = held.get("class")
-    renamed = RENAMED_FIELDS.get(named, {}) if isinstance(named, str) else {}
-    fields = held.get("fields")
-    if renamed and isinstance(fields, dict):
-        held["fields"] = {renamed.get(name, name): field for name, field in fields.items()}
-    return held
+    assert isinstance(value, dict)
+    named, fields = value["class"], value["fields"]
+    assert isinstance(named, str) and isinstance(fields, dict)
+    renamed = RENAMED_FIELDS.get(named, {})
+    held = {renamed.get(name, name): _renamed_stores(field) for name, field in fields.items()}
+    return {**value, "fields": held}
+
+
+def _is_store(value: JSON) -> bool:
+    """Whether `value` is the class record of one of Dew's stores (`dew.data.pipeline.Dataset`)."""
+    if not isinstance(value, dict) or not isinstance(value.get("fields"), dict):
+        return False
+    named = value.get("class")
+    if not isinstance(named, str) or not named.startswith("dew.") or ":" not in named:
+        return False
+    built = registry.imported(named)
+    return isinstance(built, type) and issubclass(built, Dataset)
 
 
 def earlier_trainer(record: Mapping[str, object]) -> Mapping[str, object]:
