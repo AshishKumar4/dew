@@ -36,5 +36,5 @@ def test_a_run_that_names_its_marks_selects_them():
     """The network lane names its marks (`-m network`), and so may anyone: the default yields to them."""
     assert collected("-m", "network") == ["test_online"]
     assert collected("-mnetwork") == ["test_online"]
-    assert collected("--markexpr=network or not network") == ["test_offline", "test_online"]
+    assert collected("-m", "network or not network") == ["test_offline", "test_online"]
     assert collected("-m", "") == ["test_offline", "test_online"]
