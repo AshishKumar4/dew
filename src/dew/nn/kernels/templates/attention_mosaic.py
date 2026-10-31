@@ -364,16 +364,18 @@ class MosaicForward(_Mainloop[Tiles]):
 def _products(family: mosaic.Family, dtype, *products) -> list:
     """The phases a step's products hold where its family's read their operands from registers
     (`resources.operand_fragments`; none where they read shared memory, wgmma's): each product
-    `(rows, depth, columns, beside, register_lhs, rhs_transposed)` its operands' fragments beside the tiles
+    `(rows, depth, columns, beside, register_lhs, rhs_whole)` its operands' fragments beside the tiles
     `beside` it holds at once (its output, a tile it reads in registers), a left operand in registers
-    (`register_lhs`: the weights, the score cotangents) no fragment of its own (mma.sync: ET-CENSUS80, the
-    product phase's ldmatrix fragments 162 of a 64 x 192 forward's 291 registers, uncounted)."""
+    (`register_lhs`: the weights, the score cotangents) no fragment of its own, a right one read as it is
+    stored, `[depth, columns]` (the values, the queries, the keys of dQ), held whole (`rhs_whole`, the
+    family's transposed load), one read as a transpose of its stored tile streamed (mma.sync: ET-CENSUS80,
+    a 64 x 192 forward's values' fragments 162 of its 291 registers at its peak, uncounted)."""
     if not family.operands_in_registers:
         return []
     return [list(beside) + resources.operand_fragments(family, rows, depth, columns, dtype, dtype,
                                                        lhs_parts=0 if register_lhs else 1,
-                                                       rhs_transposed=transposed)
-            for rows, depth, columns, beside, register_lhs, transposed in products]
+                                                       rhs_transposed=whole)
+            for rows, depth, columns, beside, register_lhs, whole in products]
 
 
 def _forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dtype, residuals: bool, *,
@@ -395,8 +397,8 @@ def _forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dt
     if residuals:
         step.append((block_q // 2, block_k, jnp.int32))
     depth = value_width if width is None else width
-    products = _products(family, dtype, (block_q, depth, block_k, [logits], False, True),
-                         (block_q, block_k, value_width, [weights], True, False))
+    products = _products(family, dtype, (block_q, depth, block_k, [logits], False, False),
+                         (block_q, block_k, value_width, [weights], True, True))
     return resources.live_registers(family, [(block_q, value_width, jnp.float32)], step, *products)
 
 
@@ -510,9 +512,9 @@ def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int
         rows = DQ_ROWS * family.row_registers(block_q, jnp.float32)
         # Its products' fragments where they read registers (`_products`): the logits', the output
         # cotangents' beside them, and dQ's of the score cotangents in registers.
-        fragments = _products(family, dtype, (block_q, width, block_k, [logits], False, True),
-                              (block_q, value_width, block_k, [logits] * 2, False, True),
-                              (block_q, block_k, width // config.columns, cotangents[1:], True, False))
+        fragments = _products(family, dtype, (block_q, width, block_k, [logits], False, False),
+                              (block_q, value_width, block_k, [logits] * 2, False, False),
+                              (block_q, block_k, width // config.columns, cotangents[1:], True, True))
         return resources.live_registers(family, carried, products, cotangents, *fragments) + rows
     if config.shared_keys:
         # Shared keys (`attention_mosaic_coop`): a consumer's share of the head's columns of dK and dV
@@ -533,11 +535,11 @@ def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int
         dq_tile = [(block_q, width, jnp.float32)]
         # Its products' fragments where they read registers (`_products`): the logits' and the output
         # cotangents', then dV's, dK's and dQ's of the weights and score cotangents it stages.
-        fragments = _products(family, dtype, (block_q, width, block_k, [logits], False, True),
-                              (block_q, value_width, block_k, [logits] * 2, False, True),
-                              (block_k, block_q, value_width, [logits], False, False),
-                              (block_k, block_q, width, [logits], False, False),
-                              (block_q, block_k, width, dq_tile, False, False))
+        fragments = _products(family, dtype, (block_q, width, block_k, [logits], False, False),
+                              (block_q, value_width, block_k, [logits] * 2, False, False),
+                              (block_k, block_q, value_width, [logits], False, True),
+                              (block_k, block_q, width, [logits], False, True),
+                              (block_q, block_k, width, dq_tile, False, True))
         return resources.live_registers(family, carried, products, dq_tile, *fragments) + statistics
     queries = block_q // config.consumers if split else block_q
     step = [(queries, block_k, jnp.float32)] * 2
@@ -550,10 +552,10 @@ def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int
     # cotangents in registers.
     weights = (block_k, queries, dtype)
     columns = config.columns
-    fragments = _products(family, dtype, (block_k, width // columns, queries, step[:1], False, True),
-                          (block_k, value_width // columns, queries, step, False, True),
-                          (block_k, queries, value_width // columns, [weights], True, False),
-                          (block_k, queries, width // columns, [weights], True, False))
+    fragments = _products(family, dtype, (block_k, width // columns, queries, step[:1], False, False),
+                          (block_k, value_width // columns, queries, step, False, False),
+                          (block_k, queries, value_width // columns, [weights], True, True),
+                          (block_k, queries, width // columns, [weights], True, True))
     return resources.live_registers(family, carried, step, *added, *fragments) + statistics
 
 
