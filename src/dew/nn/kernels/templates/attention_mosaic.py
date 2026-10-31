@@ -430,7 +430,7 @@ def _forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dt
         step.append((block_q // 2, block_k, jnp.int32))
     phases = [step]
     if natural:
-        phases.append([logits] * 3 + [bits])
+        phases.append([logits] * 2 + [bits])
         if residuals:
             phases.append([logits, weights, weights, bits, bits])
     carried = [(block_q, value_width, jnp.float32)]
