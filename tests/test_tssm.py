@@ -164,25 +164,30 @@ def test_a_step_at_a_time_over_its_cache_computes_the_written_transformers_state
 
 
 def test_imagination_from_each_step_reads_the_window_up_to_it():
-    """Imagination's first step from each step k of a window, over the window's cache, computes the written
-    transformer's state over the window up to k extended by the imagined step's input, to float64
-    rounding."""
+    """Imagination's first two steps from each step k of a window, over the window's cache (the window held
+    once for every start, beside each start's own imagined steps), compute the written transformer's states
+    over the window up to k extended by the imagined steps' inputs, to float64 rounding."""
     with jax.enable_x64(new_val=True):
         model = tiny(jnp.float64)
         held = variables(model)
         x, first = window(2)
-        following = np.random.default_rng([2202, 3]).normal(size=(ROWS * LENGTH, WIDTH))
+        following = np.random.default_rng([2202, 3]).normal(size=(2, ROWS * LENGTH, WIDTH))
 
         def imagined(following):
             cache = model.apply(held, x, first, 2, method=TSSM.window_cache)
-            return model.apply(held, following, jnp.zeros(ROWS * LENGTH, bool), cache, method=TSSM.step)[0]
+            found = []
+            for step in range(2):
+                h, cache = model.apply(held, following[step], jnp.zeros(ROWS * LENGTH, bool), cache,
+                                       method=TSSM.step)
+                found.append(h)
+            return jnp.stack(found, 1)
 
         expected = []
         for row in range(ROWS):
             for k in range(LENGTH):
-                extended = np.concatenate([x[row, :k + 1], following[row * LENGTH + k][None]])[None]
-                starts = np.concatenate([first[row, :k + 1], [False]])[None]
-                expected.append(np.asarray(written_states(held, jnp.asarray(extended), starts))[0, -1])
+                extended = np.concatenate([x[row, :k + 1], following[:, row * LENGTH + k]])[None]
+                starts = np.concatenate([first[row, :k + 1], [False, False]])[None]
+                expected.append(np.asarray(written_states(held, jnp.asarray(extended), starts))[0, -2:])
         roundings = chain_roundings(jax.make_jaxpr(imagined)(following))
         assert_computes_the_oracle(np.asarray(imagined(following)), np.stack(expected),
                                    "imagination from a window's steps", roundings=roundings)

@@ -23,22 +23,34 @@ import jax.numpy as jnp
 from flax import struct
 
 from dew.nn.attention import reference_attention
-from dew.nn.precision import at_least_fp32
+from dew.nn.precision import at_least_fp32, float32_einsum
 from dew.nn.rope import rotary_freqs, rotate
 from dew.rl.distributions import unimix_log_probs
 
 
 @struct.dataclass
+class Window:
+    """A window's keys and values `[B, layers, T, heads, head]` that imagination from each of its `B * T`
+    steps attends to, held once for all of them, and which of the window's steps each start reads `[B * T, T]`
+    (those of its episode up to itself)."""
+
+    keys: jax.Array
+    values: jax.Array
+    valid: jax.Array
+
+
+@struct.dataclass
 class Cache:
-    """The keys and values a step attends to, `[B, layers, C, heads, head]` each, with each slot's
-    `position` within its episode and whether it is `valid` `[B, C]`, the slot the next step writes
-    (`index`, wrapping round the C slots) and that step's `position` within its episode `[B]`."""
+    """The keys and values a step attends to, `[B, layers, C, heads, head]` each, with whether each slot is
+    `valid` `[B, C]`, the slot the next step writes (`index`, wrapping round the C slots) and that step's
+    `position` within its episode `[B]`; for imagination, beside them the `window` its starts share."""
 
     keys: jax.Array
     values: jax.Array
     valid: jax.Array
     index: jax.Array
     position: jax.Array
+    window: Window | None = None
 
 
 class _Block(nn.Module):
@@ -76,7 +88,11 @@ class _Block(nn.Module):
                  mask: jax.Array) -> jax.Array:
         """The block's output for rows `x` whose queries attend to `keys` and `values` under `mask`
         `[B, S, K]`."""
-        attended = reference_attention(query, keys, values, mask=mask[:, None], wide_logits=True)
+        return self.after(x, reference_attention(query, keys, values, mask=mask[:, None], wide_logits=True))
+
+    def after(self, x: jax.Array, attended: jax.Array) -> jax.Array:
+        """The block's output for rows `x` from what their queries `attended` `[B, S, heads, head]`: its
+        projection added, then the feed-forward layer's."""
         x = x + self.out(attended)
         h = self.feed_norm(x)
         return x + self.down(nn.silu(self.gate(h)) * self.up(h))
@@ -154,9 +170,9 @@ class TSSM(nn.Module):
         return self.out_norm(x)
 
     def window_cache(self, x: jax.Array, first: jax.Array, horizon: int) -> Cache:
-        """For each step k of a window `[B, T]`, the cache imagination from it attends to: the window's
-        keys and values at the steps of k's episode up to k, `B * T` rows of `T + horizon` slots, the
-        next written at slot T, at the position after k's."""
+        """For each step k of a window `[B, T]`, the cache imagination from it attends to: the window's keys
+        and values (`Window`, held once), of which k reads its episode's steps up to k, and `horizon` slots
+        of its own for the steps it imagines, the next at the position after k's."""
         rows, length = first.shape
         segment, positions = _segments(first)
         # [B, k, t]: the window's step t is in the cache of start k.
@@ -167,17 +183,11 @@ class TSSM(nn.Module):
             keys.append(key)
             values.append(value)
             x = block.finished(x, query, key, value, valid)
-        stacked = [jnp.stack(held, 1) for held in (keys, values)]  # [B, layers, T, heads, head]
-
-        def spread(held):
-            tiled = jnp.broadcast_to(held[:, None], (rows, length, *held.shape[1:]))
-            padded = jnp.pad(tiled, [(0, 0)] * 3 + [(0, horizon)] + [(0, 0)] * 2)
-            return padded.reshape(rows * length, *padded.shape[2:])
-
-        valid = jnp.pad(valid, ((0, 0), (0, 0), (0, horizon))).reshape(rows * length, length + horizon)
-        cached_keys, cached_values = stacked
-        return Cache(spread(cached_keys), spread(cached_values), valid,
-                     jnp.full(rows * length, length, jnp.int32), (positions + 1).reshape(-1))
+        window = Window(jnp.stack(keys, 1), jnp.stack(values, 1), valid.reshape(rows * length, length))
+        own = (rows * length, self.layers, horizon, self.heads, self.width // self.heads)
+        return Cache(jnp.zeros(own, self.dtype), jnp.zeros(own, self.dtype),
+                     jnp.zeros((rows * length, horizon), bool), jnp.zeros(rows * length, jnp.int32),
+                     (positions + 1).reshape(-1), window)
 
     @nn.nowrap
     def empty_cache(self, rows: int, size: int) -> Cache:
@@ -206,8 +216,36 @@ class TSSM(nn.Module):
             keys = keys.at[jnp.arange(x.shape[0]), layer, slot].set(key[:, 0])
             values = values.at[jnp.arange(x.shape[0]), layer, slot].set(value[:, 0])
             mask = (valid | written)[:, None, :]
-            h = block.finished(h, query, keys[:, layer], values[:, layer], mask)
-        return self.out_norm(h[:, 0]), Cache(keys, values, valid | written, cache.index + 1, position + 1)
+            if cache.window is None:
+                h = block.finished(h, query, keys[:, layer], values[:, layer], mask)
+            else:
+                attended = _windowed(query, cache.window, layer, keys[:, layer], values[:, layer], mask[:, 0],
+                                     ~first)
+                h = block.after(h, attended)
+        return self.out_norm(h[:, 0]), Cache(keys, values, valid | written, cache.index + 1, position + 1,
+                                             cache.window)
+
+
+def _windowed(query: jax.Array, window: Window, layer: int, keys: jax.Array, values: jax.Array,
+              mask: jax.Array, continuing: jax.Array) -> jax.Array:
+    """`reference_attention` (wide logits) of each start's query `[B * T, 1, heads, head]` over the keys and
+    values of `window`'s `layer` its start reads (where it is `continuing` its episode) and its own `keys`
+    and `values` `[B * T, C, heads, head]` under `mask` `[B * T, C]`, one softmax over both: the window's
+    part one product for all of its starts, so no start holds a copy of its window."""
+    windows, _, length, heads, head = window.keys.shape
+    wide = at_least_fp32(query.dtype)
+    asked = query[:, 0].astype(wide)
+    shared = float32_einsum("bshd,bthd->bsht", asked.reshape(windows, length, heads, head),
+                            window.keys[:, layer].astype(wide)).reshape(-1, heads, length)
+    own = float32_einsum("rhd,rchd->rhc", asked, keys.astype(wide))
+    logits = jnp.concatenate([shared, own], -1) * head ** -0.5
+    seen = jnp.concatenate([window.valid & continuing[:, None], mask], -1)[:, None]
+    weights = jax.nn.softmax(jnp.where(seen, logits, jnp.finfo(query.dtype).min)).astype(values.dtype)
+    spread = weights[..., :length].reshape(windows, length, heads, length)
+    from_window = float32_einsum("bsht,bthd->bshd", spread, window.values[:, layer],
+                                 preferred_element_type=wide)
+    from_own = float32_einsum("rhc,rchd->rhd", weights[..., length:], values, preferred_element_type=wide)
+    return (from_window.reshape(-1, heads, head) + from_own).astype(values.dtype)[:, None]
 
 
 def _segments(first: jax.Array) -> tuple[jax.Array, jax.Array]:
@@ -220,4 +258,4 @@ def _segments(first: jax.Array) -> tuple[jax.Array, jax.Array]:
     return segment, index - began
 
 
-__all__ = ["TSSM", "Cache"]
+__all__ = ["TSSM", "Cache", "Window"]
