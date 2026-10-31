@@ -131,11 +131,11 @@ def mamba_ssm_run(scan, arrays, dtype) -> dict[str, np.ndarray]:
 def _extension(checkout: str):
     """mamba_ssm's `selective_scan_cuda` for this GPU: the installed one, else built from the checkout's
     sources by torch's JIT build, as mamba_ssm's setup.py compiles them."""
-    try:
-        import selective_scan_cuda
-        return selective_scan_cuda
-    except ImportError:
-        pass
+    import importlib
+    import importlib.util
+
+    if importlib.util.find_spec("selective_scan_cuda") is not None:
+        return importlib.import_module("selective_scan_cuda")
     import torch
     from torch.utils.cpp_extension import load
 
@@ -180,8 +180,8 @@ def write_seeded(worker) -> None:
 
     import jax
     import jax.numpy as jnp
-    from recorded_references import provenance, record_case, save
-    from reference_error import assert_computes_the_oracle, chain_roundings, widened
+    from recorded_references import held_to_the_oracle, provenance, record_case, save
+    from reference_error import chain_roundings, widened
     from selective_support import selective_draw, selective_xla
 
     _, version, revision, device = worker.stdout.readline().split(maxsplit=3)
@@ -210,11 +210,7 @@ def write_seeded(worker) -> None:
 
         def evaluate(arrays, dtype=dtype, exact_run=exact_run, roundings=roundings):
             reference, truth = mamba_ssm(arrays, dtype)
-            with jax.enable_x64(new_val=True):
-                twin = jax.tree.map(np.asarray, exact_run(widened(arrays)))
-            for name in truth:
-                assert_computes_the_oracle(twin[name], truth[name], f"mamba_ssm float64 {name}",
-                                          roundings=roundings)
+            held_to_the_oracle(exact_run, arrays, truth, roundings, "mamba_ssm")
             return reference, truth
 
         stored.update(record_case(
