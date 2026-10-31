@@ -1,4 +1,4 @@
-"""The recurrence template's Mosaic GPU mainloop's gradient (`mainloop.gradients`, its fast backward)
+"""The recurrence template's Mosaic GPU mainloop's gradient (`backward.gradients`, its fast backward)
 through the chunked op's explicit route, as test_recurrence_mosaic holds its forward: check 1 of the rule's
 gradient against its reference's, both from float64, over a GPU's cases and, interpreted off one, the cases
 that cover each launch (`INTERPRETED_GRADIENT`); a gradient the fast backward does not take, refused. A file
@@ -32,7 +32,7 @@ from dew.nn.backbones.decoder_block import RematPolicy
 from dew.nn.kernels import generation, recurrence
 from dew.nn.kernels.recurrence_chunk import Chunk, mosaic_rule, recomputing
 from dew.nn.kernels.templates import bundles
-from dew.nn.kernels.templates.recurrence import mainloop, template
+from dew.nn.kernels.templates.recurrence import backward, mainloop, template
 from dew.nn.mixer_base import DELTA_RULE_RESIDUALS
 
 pytestmark = pytest.mark.kernel
@@ -85,7 +85,7 @@ ledger 2127), which the whole suite runs (`timed`)."""
 def test_the_mosaic_gradient_is_as_exact_as_its_reference(case, dtype, remat):
     """The gradient of the mainloop's rule on par from float64 with its reference's over the case's draws
     (check 1, truth the recurrence a token at a time's in float64): in a 16-bit call the mainloop's fast
-    backward (`mainloop.gradients`, fla's DAG) against the fla port's, whose numbers it runs, from the
+    backward (`backward.gradients`, fla's DAG) against the fla port's, whose numbers it runs, from the
     forward's memories kept, under a remat rung that recomputes them (`recomputing`) recomputed, or under a
     checkpoint saving the delta rule's names kept by them. A call
     the template refuses is checked refused and its gradient on the mainloop's rule (`on_the_mainloop`). A
@@ -161,8 +161,8 @@ def test_a_walk_of_two_roles_is_as_exact_as_its_reference(case, product):
 def test_the_fast_backward_trains_a_bf16_rated_scan_alone():
     """A rated scan's (Mamba2's SSD) 16-bit gradient under the run's fast forms, whose numbers are
     mamba_ssm's: the template's fast backward takes a bf16 call and refuses an fp16 one, whose products would
-    take its scores' gradient's bf16 parts (`mainloop._score_grads`) against fp16 keys, so the port trains it
-    (`mainloop.fast_backward_form`)."""
+    take its scores' gradient's bf16 parts (`backward._score_grads`) against fp16 keys, so the port trains it
+    (`backward.fast_backward_form`)."""
     hooks = recurrence.Hooks(decay='scalar', rated=True, delta=False, skip=True)
     shape = geometry('one sequence')
     with generation.run_precision(dataclasses.replace(generation.numerics(), forms='fast')):
