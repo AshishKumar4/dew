@@ -446,12 +446,12 @@ balancing bias, renormalized over a sum with its own epsilon."""
 
 BUILT_IN_SEEDS = {"granite": 8, "smollm3": 8, "olmo2": 8, "hy_v3": 8, "glm4_moe_lite": 8, "lfm2": 8,
                   "lfm2_moe": 8}
+"""Each built-in type's declared check-1 seeds for its logits, sized by `seeds_for` on armada."""
 
 STORED_EXPERT = {"hy_v3": "model.layers.1.mlp.experts.0.gate_proj.weight",
                  "glm4_moe_lite": "model.layers.1.mlp.experts.0.gate_proj.weight",
                  "lfm2_moe": "model.layers.1.feed_forward.experts.0.w1.weight"}
 """A routed type's first stored expert projection, as `save_pretrained` stores its experts one by one."""
-"""Each built-in type's declared check-1 seeds for its logits, sized by `seeds_for` on armada."""
 
 
 def with_prediction_depth(directory, layers: int, width: int, extra: tuple[str, ...] = ()) -> None:
