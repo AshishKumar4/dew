@@ -117,7 +117,7 @@ seams: "port-cells": {
 	purpose: "each cell routes the delta rule to the fla port on a receipt that shows the port faster"
 	paths:   ["src/dew/nn/kernels/recurrence_chunk.py"]
 	entries: "PORT_CELLS"
-	declared: "(wgmma, forward, a decay a key dimension)": "Kimi delta attention's forward on an H100, the port's 2.03 ms against the template's 3.24"
+	declared: "(wgmma, forward, a decay a key dimension)": "Kimi delta attention's forward on an H100 80GB HBM3, the port's 1.406 ms against the template's 1.624"
 }
 
 seams: "scan-cells": {
@@ -129,19 +129,6 @@ seams: "scan-cells": {
 		"(wgmma, forward)":     "Nemotron-H's SSD forward on an H100"
 		"(wgmma, training)":    "Nemotron-H's SSD training on an H100"
 		"(mma.sync, training)": "the SSD's training on an A100"
-	}
-}
-
-seams: "selective-cells": {
-	kind:    "declared-set"
-	purpose: "each cell routes the selective scan to XLA where its kernel cannot run or is slower"
-	paths:   ["src/dew/nn/kernels/recurrence_chunk.py"]
-	entries: "SELECTIVE_CELLS"
-	declared: {
-		"(mma.sync, forward)":  "strided cp.async on an A100"
-		"(mma.sync, training)": "strided cp.async on an A100"
-		"(wgmma, forward)":     "the ungated scan on an H100"
-		"(wgmma, training)":    "the ungated scan on an H100"
 	}
 }
 
