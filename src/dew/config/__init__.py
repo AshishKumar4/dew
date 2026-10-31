@@ -996,22 +996,22 @@ def earlier_chains(record: Mapping[str, object]) -> Mapping[str, object]:
     fields = record.get("fields")
     if not isinstance(fields, Mapping) or not any(name in fields for name in _CHAINS):
         return record
-    return {**record, "fields": {name: _renamed(value) if name in _CHAINS else value
+    return {**record, "fields": {name: _renamed(field_value(value, name)) if name in _CHAINS else value
                                  for name, value in fields.items()}}
 
 
-def _renamed(value: object) -> object:
+def _renamed(value: JSON) -> JSON:
     """`value`, a chain's record or a part of one, with each class record's renamed fields (`RENAMED_FIELDS`)
     under today's names."""
     if isinstance(value, list):
         return [_renamed(part) for part in value]
-    if not isinstance(value, Mapping):
+    if not isinstance(value, dict):
         return value
     held = {key: _renamed(part) for key, part in value.items()}
     named = held.get("class")
     renamed = RENAMED_FIELDS.get(named, {}) if isinstance(named, str) else {}
     fields = held.get("fields")
-    if renamed and isinstance(fields, Mapping):
+    if renamed and isinstance(fields, dict):
         held["fields"] = {renamed.get(name, name): field for name, field in fields.items()}
     return held
 
