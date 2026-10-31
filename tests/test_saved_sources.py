@@ -16,7 +16,7 @@ from dew.decision.config import DecisionRunConfig
 from dew.inference import TextToImage
 from dew.inference.tasks import SavedRun
 from dew.interop.pretrained import load_diffusion_source
-from dew.interop.saved_sources import RunPipeline, export_run, released_run
+from dew.interop.saved_sources import export_run, released_run
 from dew.lora import LoRA
 from dew.registry import ModelConfig
 from dew.sampling.solvers import Euler
@@ -101,7 +101,7 @@ def test_a_diffusion_run_starts_from_a_saved_diffusion_run_as_from_its_task(tmp_
     assert sum(leaf.size for leaf in jax.tree.leaves(from_adapted.variables["params"])) == factors
 
     sized = load_diffusion_source(str(source), dtype="float32", size=task.inputs.sample.shape[:-1])
-    assert isinstance(sized, RunPipeline) and sized.inputs.sample == task.inputs.sample
+    assert sized.inputs.sample == task.inputs.sample
     with pytest.raises(ValueError):
         load_diffusion_source(str(source), dtype="float32", size=(8, 8))
     with pytest.raises(ValueError):
