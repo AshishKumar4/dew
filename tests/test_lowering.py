@@ -166,6 +166,18 @@ def test_a_steps_kernel_report_names_its_launches_and_the_flop_count_sizes_them_
     assert (flops.hardware, flops.unsized) == (sum(entry["flops"] for entry in templated), unstated)
 
 
+def test_a_call_that_runs_none_adds_none_however_often_its_caller_runs():
+    """A function's runs from the entry (`instrumentation.call_weights`) take nothing from a call that runs
+    none: one in a loop of no trips inside a function of unknown runs (a loop of no static count around
+    it), so a kernel the entry also calls once runs once, known, not unknown (row 2933's review)."""
+    import math
+
+    from dew.telemetry.instrumentation import call_weights
+
+    weights = call_weights({"main": {"f": math.inf, "k": 1.0}, "f": {"k": 0.0}, "k": {}}, "main")
+    assert weights == {"main": 1.0, "f": math.inf, "k": 1.0}
+
+
 def test_a_kernel_is_named_from_its_location_wherever_the_location_nests_the_name():
     """A Mosaic GPU call's kernel name (`_lowering._kernel_name`) from its location's name stack wherever the
     location nests it: its own, a call site's callee's, a fused location's part (a rewrite that merged

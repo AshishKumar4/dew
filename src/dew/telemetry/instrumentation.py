@@ -827,8 +827,9 @@ def call_weights(calls: Mapping[str, Mapping[str, float]], entry: str) -> dict[s
         for callee, times in calls[name].items():
             if callee not in weights:
                 continue
-            # A function that runs none runs its callees none, however many times its loops would.
-            weights[callee] += weights[name] * times if weights[name] else 0.0
+            # A call that runs none adds none: a function that runs none, however many times its loops
+            # would, or a call in a loop of no trips, however often its caller runs.
+            weights[callee] += weights[name] * times if weights[name] and times else 0.0
             callers[callee] -= 1
             if callers[callee] == 0:
                 ready.append(callee)
