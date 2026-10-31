@@ -274,7 +274,7 @@ class BoundedFileCache(WholeFileCacheFileSystem):
                 with self.fs.open(path, "rb", size=size) as source, pending.open("wb") as target:
                     shutil.copyfileobj(source, target, length=2**20)
                 with pending.open("rb") as downloaded:
-                    unchanged = hashlib.file_digest(downloaded, "sha256").hexdigest() == version[7:]
+                    unchanged = object_info(downloaded)["sha256"] == version[7:]
             else:
                 self.fs.get_file(path, str(pending))
                 unchanged = self.fs.ukey(path) == version
@@ -379,10 +379,7 @@ def content_version(fs: AbstractFileSystem, path: str, size: int) -> str:
             if held["key"] == key:
                 return text(held["sha256"], "content version's checksum")
         with fs.open(path, "rb") as file:
-            digest = hashlib.sha256()
-            while payload := file.read(2**20):
-                digest.update(payload)
-        checksum = digest.hexdigest()
+            checksum = object_info(file)["sha256"]
         if list(_local_file_key(path, size)) != key:
             raise OSError(f"local file changed while its content was versioned: {path}")
         write_atomically(kept, json.dumps({"key": key, "sha256": checksum}))
