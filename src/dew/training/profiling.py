@@ -10,11 +10,13 @@ import dataclasses
 import gzip
 import json
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from dew._coordination import agreed
 from dew.telemetry import profile as telemetry_profile
+from dew.telemetry.records import ProfileWindow as ProfileWindowRecord, Record
 from dew.training.tracker import LocalTracker
 
 if TYPE_CHECKING:
@@ -147,6 +149,27 @@ def stop_capture(profiler: "Profiler", loss: "jax.Array | None") -> None:
                 primary.add_note(f"Profiler stop failed: {failure!r}")
 
     agreed("profile stop", stop)
+
+
+def reported_window(report: Callable[[Record, int], None], note: Callable[[str], None],
+                    window: ProfileWindow | None, profiled: tuple[int, int] | None,
+                    error: BaseException | None) -> BaseException | None:
+    """Report a fit's window that stopped, `profiled` its steps traced and the step it stopped at, once
+    every rank's export is written and the pool agreed the run's outcome (`Trainer._reported_outcome`),
+    whatever that outcome: its record (`report`) and its note on process zero (`note`). Returns the run's
+    `error`, or a failed report as the error of a run that had none, noted on one that had."""
+    if window is None or profiled is None:
+        return error
+    traced, step = profiled
+    try:
+        report(ProfileWindowRecord(window.directory, traced), step)
+        wrote = f"Wrote profile for {traced} steps to {window.directory}"
+        agreed("profile announcement", lambda: note(wrote))
+    except BaseException as failure:
+        if error is None:
+            return failure
+        error.add_note(f"Reporting the profile window failed: {failure!r}")
+    return error
 
 
 def traced_steps(capture: Path) -> tuple[int, ...]:

@@ -480,7 +480,7 @@ _exporting: dict[Path, subprocess.Popen[bytes]] = {}
 """The captures a stop left exporting in a process of their own (`Profiler.stop`), until `exported`."""
 
 
-def exported(directory: Path | None = None) -> None:
+def exported(directory: str | os.PathLike[str] | None = None) -> None:
     """Wait for the exports `Profiler.stop` left running in processes of their own, of every capture or of
     those under `directory`, refusing any that failed: what reads a capture's reports and manifest reads
     them after this (`dew.training.profiling.ProfileReport`)."""

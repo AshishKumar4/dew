@@ -515,9 +515,12 @@ def test_a_run_that_fails_after_its_profile_window_still_reports_the_window(tmp_
 
     tracker = RecordingTracker()
 
+    class LaterStepFailed(RuntimeError):
+        """The run's failure, steps after its window stopped."""
+
     def failing(state):
         if int(state.step) >= 4:
-            raise RuntimeError("a later step failed")
+            raise LaterStepFailed
         return 0
 
     model = CausalTransformer(vocab_size=64, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
@@ -525,7 +528,7 @@ def test_a_run_that_fails_after_its_profile_window_still_reports_the_window(tmp_
     trainer = one_device(Trainer(LMObjective(model, seq_len=SEQ), optax.sgd(1e-2), key=jax.random.key(0),
                                  tracker=tracker, profile=ProfileWindow(str(tmp_path), steps=2, warmup=0)))
     rows = Replaying(lambda position: {"text": np.asarray(BATCH["text"])})
-    with pytest.raises(RuntimeError, match="a later step failed"):
+    with pytest.raises(LaterStepFailed):
         trainer.fit(Loader(lambda partition: rows, None, None, ROWS), steps=6, log_every=1,
                     observe=Observe(1, failing))
     (window,) = [value for _, value in tracker.artifacts if type(value).__name__ == "ProfileWindow"]

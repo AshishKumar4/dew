@@ -112,15 +112,7 @@ from dew.state import MODEL_STATE, Accumulation, TrainState, apart, drawn_in, ke
 from dew.telemetry import profile as telemetry_profile
 from dew.telemetry.instrumentation import StepFlops
 from dew.telemetry.profile import exported as telemetry_exported, region
-from dew.telemetry.records import (
-    AxisLink,
-    CheckpointRequested,
-    FitEnded,
-    FitStarted,
-    ProfileWindow as ProfileWindowRecord,
-    Record,
-    StepCompiled,
-)
+from dew.telemetry.records import AxisLink, CheckpointRequested, FitEnded, FitStarted, Record, StepCompiled
 from dew.training._fit import (
     Emptied,
     FitPlan,
@@ -201,7 +193,7 @@ from dew.training.planning import (
     splits,
     whole_step,
 )
-from dew.training.profiling import ProfileWindow, owned_capture, pgle_runs, stop_capture
+from dew.training.profiling import ProfileWindow, owned_capture, pgle_runs, reported_window, stop_capture
 from dew.training.rollout import Rollout, _branched, _reported, _rollout_metrics, rolled_out
 from dew.training.rungs import keep_rung, plan_flops, recorded_launches, recorded_rung
 from dew.training.runtime import Preempted, PreemptionNotice, ready_process
@@ -1554,8 +1546,7 @@ class Trainer(Generic[Loss, Effects]):
         # A run's last log is written at its cleanup, a failed run's only where no write waits on a step
         # its peers may never finish (`LogWriter.raise_failure`).
         unread = functools.partial(self._read_taken, run, agree=False)
-        # This rank's own window's export, waited on here alone: a failed one fails the run on every rank at
-        # its outcome's agreement (`_reported_outcome`), as any failed cleanup does.
+        # This rank's window's export alone: a failed one fails every rank at `_reported_outcome`'s agreement.
         exported = None if profile is None else functools.partial(telemetry_exported, profile.directory)
         cleanups = (("Training log", unread), ("Log writer", run.writer.close), ("Training iterator", close),
                     ("Profiler", stop_trace), ("Profile export", exported),
@@ -2368,19 +2359,7 @@ class Trainer(Generic[Loss, Effects]):
         except BaseException as failure:
             if error is None:
                 error = failure
-        profile = self.profile
-        if profile is not None and run.profiled is not None:
-            # A window that stopped, reported once its reports are written, whatever the run's outcome.
-            traced, step = run.profiled
-            try:
-                self._report(ProfileWindowRecord(profile.directory, traced), step)
-                agreed("profile announcement", lambda: self._display.note(
-                    f"Wrote profile for {traced} steps to {profile.directory}"))
-            except BaseException as failure:
-                if error is None:
-                    error = failure
-                else:
-                    error.add_note(f'Reporting the profile window failed: {failure!r}')
+        error = reported_window(self._report, self._display.note, self.profile, run.profiled, error)
         if error is None:
             def report_goodput() -> None:
                 if jax.process_index() == 0:
