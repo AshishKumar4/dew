@@ -153,8 +153,9 @@ def test_a_resumed_diloco_run_restores_each_replica_and_ends_where_an_unbroken_o
 
 @pytest.mark.mesh(devices=2)
 def test_a_diloco_mesh_holds_each_replicas_rows_and_inner_copy_on_its_own_devices():
-    """A mesh of two DiLoCo replicas splits a batch's rows over them, holds the outer parameters whole on
-    each, and each replica's inner copy on its own devices alone."""
+    """A mesh of two DiLoCo replicas splits a batch's rows over them, holds each replica's inner copy on
+    its own devices alone, and splits the outer parameters over the replicas where a dimension divides,
+    each holding a share of the model only their meeting reads."""
     from dew.distributed.batches import batch_shardings
     from dew.mesh import DILOCO_AXIS
 
@@ -164,8 +165,9 @@ def test_a_diloco_mesh_holds_each_replicas_rows_and_inner_copy_on_its_own_device
         mesh = run.device_mesh
         rows = batch_shardings(mesh, {"x": np.zeros((BATCH, FEATURES))})["x"]
     assert rows.spec[0] == DILOCO_AXIS or DILOCO_AXIS in rows.spec[0]
-    for leaf in jax.tree.leaves(state.variables["params"]):
-        assert leaf.sharding.is_fully_replicated
+    kernel = state.variables["params"]["Dense_0"]["kernel"]
+    assert DILOCO_AXIS in jax.tree.leaves(tuple(kernel.sharding.spec))
+    assert {shard.data.shape for shard in kernel.addressable_shards} == {(FEATURES, 1)}
     for leaf in jax.tree.leaves(state.inner.variables["params"]):
         assert leaf.shape[0] == 2 and leaf.sharding.spec[0] == DILOCO_AXIS
         assert {shard.device for shard in leaf.addressable_shards if shard.index[0] == slice(0, 1)} == {
