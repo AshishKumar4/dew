@@ -194,10 +194,30 @@ class _RamplessFlash(Glm4MoeLiteForCausalLM):
         _by_conventions(self)
 
 
+class _DeepRamplessConfig(Glm4MoeLiteConfig):
+    model_type = "deep_rampless_flash"
+
+
+class _DeepRamplessFlash(Glm4MoeLiteForCausalLM):
+    """GLM-4.7-Flash whose rotary turns at the plain frequencies where it is deeper than two layers,
+    whatever ramp its config states: two of its layers alone would turn the ramp."""
+    config_class = _DeepRamplessConfig
+
+    def __init__(self, config):
+        super().__init__(config)
+        if config.num_hidden_layers > 2:
+            plain = copy.deepcopy(config)
+            plain.rope_parameters = {"rope_type": "default",
+                                     "rope_theta": config.rope_parameters["rope_theta"]}
+            self.model.rotary_emb = Glm4MoeLiteRotaryEmbedding(plain)
+        _by_conventions(self)
+
+
 FLASH_TYPES = {"flash": (_FlashConfig, _Flash), "unpadded": (_UnpaddedConfig, _UnpaddedFlash),
                "unpadded-parts": (_UnpaddedPartsConfig, _UnpaddedPartsFlash),
                "ungenerating": (_UngeneratingConfig, _UngeneratingFlash),
-               "rampless": (_RamplessConfig, _RamplessFlash)}
+               "rampless": (_RamplessConfig, _RamplessFlash),
+               "deep-rampless": (_DeepRamplessConfig, _DeepRamplessFlash)}
 """GLM-4.7-Flash's classes as types Dew registers no family for: unchanged, and changed where the
 probe's eval logits over its first positions do not show it."""
 
@@ -247,23 +267,35 @@ def test_parts_pad_the_row_their_source_table_pads():
     assert isinstance(verified, VerifiedMapping) and verified.family == "parts"
 
 
+def test_a_probe_keeps_the_depth_of_code_not_transformers_own():
+    """GLM-4.7-Flash's classes subclassed under a type of their own keep their stated depth in the probe
+    (`verify.shallow`), whose cut reads each layer's kind: code other than transformers' own may compute
+    by its depth what no kind shows, as a rotary built by it or a hook on its later layers would."""
+    from dew.interop import verify
+
+    source = verify.ModelSource("registered_flash")
+    shrunk = verify.shrink(_registered("flash", num_hidden_layers=6), source)
+    assert verify.shallow(source, shrunk) == shrunk
+
+
 FAR_RAMP = {"rope_type": "yarn", "rope_theta": 1e6, "factor": 40.0, "original_max_position_embeddings": 2**28,
             "beta_fast": 32.0, "beta_slow": 1.0, "mscale": 1.0, "mscale_all_dim": 1.0}
 """A YaRN record of amplitude one whose stated original context is past every wavelength of the
 probe's rotary, so that at it the ramp rescales no frequency the probe turns."""
 
 
-@pytest.mark.parametrize("kind", ["flash", "rampless"])
+@pytest.mark.parametrize("kind", ["flash", "rampless", "deep-rampless"])
 def test_a_convention_turns_the_ramp_its_source_turns_past_the_original_context(kind):
     """Under a YaRN record, GLM-4.7-Flash's classes under a type of their own, called so that tier 2 does
     not assemble them (`_by_conventions`), verify as DeepSeek V3's convention, and the same classes whose
-    rotary turns at the plain frequencies do not: the probe runs
+    rotary turns at the plain frequencies do not, nor do those that turn them only past two layers, whose
+    depth the probe keeps (`verify.shallow`): the probe runs
     past the record's original context, shrunk below its length as a window is, where the ramp rescales
     the frequencies it turns."""
     from dew.interop.verify import Unmapped, VerifiedMapping, verify_mapping
 
     verified = verify_mapping(_registered(kind, rope_parameters=FAR_RAMP, max_position_embeddings=2**29))
-    if kind == "rampless":
+    if kind != "flash":
         assert isinstance(verified, Unmapped)
     else:
         assert isinstance(verified, VerifiedMapping) and verified.family != "parts"

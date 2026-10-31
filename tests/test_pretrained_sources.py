@@ -309,6 +309,17 @@ def test_the_probe_shrinks_a_config_by_whichever_names_its_class_reads(spelled):
     assert isinstance(verify.verify_mapping(config), verify.Unmapped)
 
 
+def test_a_probe_whose_source_builds_no_model_is_unavailable():
+    """A type whose shrunken config builds no causal LM (CWM asking for an attention backend this host
+    does not install) is `ProbeUnavailable`, wherever the probe first builds it, its depth's cut
+    (`verify.shallow`) included."""
+    from dew.interop import verify
+
+    config = {**tiny_config("cwm", sliding_window=4).to_dict(), "attn_implementation": "flash_attention_2"}
+    with pytest.raises(verify.ProbeUnavailable):
+        verify.verify_mapping(config)
+
+
 HY_V3 = {"num_experts": 8, "num_experts_per_tok": 2, "num_shared_experts": 1, "moe_intermediate_size": 32}
 """A small HY-3's routing, its first layer dense and the rest routed."""
 

@@ -539,65 +539,9 @@ _LAYER_INDEXES = frozenset({'layer_idx', 'layer_id', 'layer_index', 'layer_numbe
 their computations apart."""
 
 
-def _layer_kinds(source: ModelSource, fields: Mapping[str, object]) -> list[tuple] | None:
-    """Each decoder layer's kind in the model `fields` builds, on torch's meta device: its entry in each of
-    the config's per-layer lists (one as long as the depth, stated or derived: SmolLM3's
-    `no_rope_layers`, HY-3's `mlp_layer_types`), and each of its modules' class, public scalar
-    attributes (its place aside, `_LAYER_INDEXES`) and parameter and buffer shapes, across every module
-    list as long as the depth. None where no module list is."""
-    import torch
-
-    config = source.configured(fields)
-    depth = _records.integer(config.num_hidden_layers, 'num_hidden_layers')
-    with torch.device('meta'):
-        model = source.causal_lm(config)
-    stacks = [module for module in model.modules() if isinstance(module, torch.nn.ModuleList)
-              and len(module) == depth]
-    if not stacks:
-        return None
-    lists = sorted((name, tuple(value)) for name, value in vars(config).items()
-                   if isinstance(value, (list, tuple)) and len(value) == depth)
-
-    def kind(layer: torch.nn.Module) -> tuple:
-        return tuple((path, type(module).__module__, type(module).__qualname__,
-                      tuple(sorted((key, value) for key, value in vars(module).items()
-                                   if not key.startswith('_') and key not in _LAYER_INDEXES
-                                   and isinstance(value, (bool, int, float, str, NoneType)))),
-                      tuple((name, tuple(tensor.shape)) for name, tensor in (
-                          *module.named_parameters(recurse=False), *module.named_buffers(recurse=False))))
-                     for path, module in layer.named_modules())
-
-    return [(tuple(json.dumps(value, sort_keys=True, default=str) for _, value in
-                   ((name, values[index]) for name, values in lists)),
-             tuple(kind(stack[index]) for stack in stacks)) for index in range(depth)]
-
-
-def shallow(source: ModelSource, fields: Mapping[str, object]) -> Mapping[str, object]:
-    """`fields` (`shrink`'s) cut to the fewest first layers that hold every kind of layer its stated depth
-    builds (`_layer_kinds`), at least two, each stated per-layer list cut alike: HY-3's 80 layers probe as
-    its dense first and a routed one, SmolLM3's 36 as its first four, the fourth without positions. The
-    cut holds only where its layers are the deep model's first ones kind for kind; the depth stays
-    otherwise, as it does where no kind is told apart (no module list as long as the depth)."""
-    kinds = _layer_kinds(source, fields)
-    if kinds is None:
-        return fields
-    firsts = {}
-    for index, layer in enumerate(kinds):
-        firsts.setdefault(layer, index)
-    count = max(max(firsts.values()) + 1, min(2, len(kinds)))
-    if count == len(kinds):
-        return fields
-    key = _Sizes.of(fields, source).key('num_hidden_layers')
-    cut = {name: (list(value[:count]) if isinstance(value, (list, tuple)) and len(value) == len(kinds)
-                  and name != key else value) for name, value in fields.items()}
-    cut[key] = count
-    return cut if _layer_kinds(source, cut) == kinds[:count] else fields
-
-
-def _reference_config(source: ModelSource, fields: Mapping[str, object]) -> tuple[PretrainedConfig, int, str]:
-    """transformers' config for the type at the probe's sizes, the parameter
-    count of the model it builds (on torch's meta device, so an unshrunk
-    layer allocates nothing), and the class's name and release."""
+def _skeleton(source: ModelSource, fields: Mapping[str, object]) -> tuple[PretrainedConfig, PreTrainedModel]:
+    """transformers' config for the type at `fields` and the causal LM it builds on torch's meta device, so
+    an unshrunk layer allocates nothing; `ProbeUnavailable` where it builds none."""
     model_type = source.model_type
     try:
         import torch
@@ -610,10 +554,83 @@ def _reference_config(source: ModelSource, fields: Mapping[str, object]) -> tupl
     try:
         config = source.configured(fields)
         with torch.device('meta'):
-            skeleton = source.causal_lm(config)
+            return config, source.causal_lm(config)
     except Exception as error:
         raise _unavailable(model_type, f"transformers {__version__} builds no causal LM from its shrunken "
                            f"config ({type(error).__name__}: {error})") from error
+
+
+def _module_kind(path: str, module: torch.nn.Module) -> tuple:
+    """A module's kind: its place under its layer or model, its class, its public scalar attributes (a
+    layer's place aside, `_LAYER_INDEXES`) and its own parameters' and buffers' shapes."""
+    return (path, type(module).__module__, type(module).__qualname__,
+            tuple(sorted((key, value) for key, value in vars(module).items()
+                         if not key.startswith('_') and key not in _LAYER_INDEXES
+                         and isinstance(value, (bool, int, float, str, NoneType)))),
+            tuple((name, tuple(tensor.shape)) for name, tensor in (
+                *module.named_parameters(recurse=False), *module.named_buffers(recurse=False))))
+
+
+def _layer_kinds(source: ModelSource, fields: Mapping[str, object]) -> tuple[list[tuple], tuple] | None:
+    """The kinds of the model `fields` builds (`_skeleton`): each decoder layer's, its entry in each of the
+    config's per-layer lists (one as long as the depth, stated or derived: SmolLM3's `no_rope_layers`,
+    HY-3's `mlp_layer_types`) and each of its modules' (`_module_kind`) across every module list as long
+    as the depth; and every module's outside those lists (its table, its rotary, its final norm). None
+    where no module list is as long as the depth, or where a module's class is not transformers' or
+    torch's own, whose layers differ only as their kinds show: a source's own code may add what no kind
+    shows (a hook on its later layers, a rotary built by its depth)."""
+    import torch
+
+    config, model = _skeleton(source, fields)
+    depth = _records.integer(config.num_hidden_layers, 'num_hidden_layers')
+    if any(not type(module).__module__.startswith(('transformers.', 'torch.')) for module in model.modules()):
+        return None
+    stacks = [module for module in model.modules() if isinstance(module, torch.nn.ModuleList)
+              and len(module) == depth]
+    if not stacks:
+        return None
+    lists = sorted((name, tuple(value)) for name, value in vars(config).items()
+                   if isinstance(value, (list, tuple)) and len(value) == depth)
+    inside = {id(module) for stack in stacks for module in stack.modules()}
+    outside = tuple(_module_kind(path, module) for path, module in model.named_modules()
+                    if id(module) not in inside)
+    layers = [(tuple(json.dumps(values[index], sort_keys=True, default=str) for _, values in lists),
+               tuple(tuple(_module_kind(path, module) for path, module in stack[index].named_modules())
+                     for stack in stacks)) for index in range(depth)]
+    return layers, outside
+
+
+def shallow(source: ModelSource, fields: Mapping[str, object]) -> Mapping[str, object]:
+    """`fields` (`shrink`'s) cut to the fewest first layers that hold every kind of layer its stated depth
+    builds (`_layer_kinds`), at least two, each stated per-layer list cut alike: HY-3's 80 layers probe as
+    its dense first and a routed one, SmolLM3's 36 as its first four, the fourth without positions. The
+    cut holds only where its layers are the deep model's first ones kind for kind and every module
+    outside them is the deep model's; the depth stays otherwise, and where no kind is told
+    (`_layer_kinds` is None)."""
+    deep = _layer_kinds(source, fields)
+    if deep is None:
+        return fields
+    kinds, outside = deep
+    firsts = {}
+    for index, layer in enumerate(kinds):
+        firsts.setdefault(layer, index)
+    count = max(max(firsts.values()) + 1, min(2, len(kinds)))
+    if count == len(kinds):
+        return fields
+    key = _Sizes.of(fields, source).key('num_hidden_layers')
+    cut = {name: (list(value[:count]) if isinstance(value, (list, tuple)) and len(value) == len(kinds)
+                  and name != key else value) for name, value in fields.items()}
+    cut[key] = count
+    return cut if _layer_kinds(source, cut) == (kinds[:count], outside) else fields
+
+
+def _reference_config(source: ModelSource, fields: Mapping[str, object]) -> tuple[PretrainedConfig, int, str]:
+    """transformers' config for the type at the probe's sizes, the parameter
+    count of the model it builds (on torch's meta device, so an unshrunk
+    layer allocates nothing), and the class's name and release."""
+    config, skeleton = _skeleton(source, fields)
+    from transformers import __version__
+
     size = sum(parameter.numel() for parameter in skeleton.parameters())
     origin = f"transformers {__version__}'s" if source.remote is None else f"{source.remote.name}'s remote"
     return config, size, f"{origin} {type(skeleton).__name__}"
@@ -883,13 +900,15 @@ def _verified(hf_config: Mapping[str, object], source: ModelSource) -> VerifiedM
             reasons[convention] = str(error)
     with _quiet():
         try:
-            fields = shallow(source, shrink(hf_config, source))
-            layers = _Sizes.of(fields, source).stated('num_hidden_layers')
+            shrunk = shrink(hf_config, source)
+            _Sizes.of(hf_config, source).stated('num_hidden_layers')
         except (KeyError, ValueError) as error:
             # A reader may take a config by its own names or its defaults (OPT's
             # defaults every size); the probe shrinks it by the standard names.
             raise _unavailable(model_type, f"its config states no {error.args[0]!r} the probe shrinks it "
                                "by") from error
+        fields = shallow(source, shrunk)
+        layers = _Sizes.of(fields, source).stated('num_hidden_layers')
         config, size, name = _reference_config(source, fields)
         # A candidate that builds another architecture is dismissed on its
         # parameter count before its own model is run.
