@@ -11,6 +11,7 @@ from affine_run import FEATURES, Affine, Counting, dataset
 from recording import RecordingTracker
 from test_trainer import TokenRegression, make_trainer
 
+from dew.data.dataset import Loader
 from dew.held_updates import phased
 from dew.objectives.base import Aux, Objective
 from dew.optim import power_profiles
@@ -125,9 +126,9 @@ def test_a_held_optimizers_inputs_each_draw_once_however_the_trainer_reads_them(
     tracker = RecordingTracker()
     # Batches of two rows a device, which two parts each read one of.
     wide = 2 * jax.device_count()
+    rows = Loader(train=lambda partition: Counting(wide), val=None, batch=wide, records=None)
     make_trainer(objective=Drawing(), optimizer=held_optimizer("multi_steps"), tracker=tracker,
-                 accumulation=2, split=split).fit(dataset(lambda: Counting(wide), batch=wide), steps=8,
-                                                  log_every=1)
+                 accumulation=2, split=split).fit(rows, steps=8, log_every=1)
     draws = [scalars["train/draw"] for _, scalars in tracker.scalars if "train/draw" in scalars]
     assert len(draws) == 8 and all(draws[index] == draws[index + 1] for index in range(0, 8, 2))
     assert len(set(draws)) == 4
