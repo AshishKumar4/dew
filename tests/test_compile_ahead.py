@@ -366,7 +366,10 @@ def a_clocked_run_with_a_cooldown_trains_from_its_step_compiled_ahead_compiling_
 
     runs, path = tmp_path / "runs", tmp_path / "step.dew-aot"
     default = decision(tmp_path, drawn=False)
-    stated = ["--trainer.checkpoint-dir", str(runs), "--trainer.examples", "48",
+    # Its tickets stream, of no record count, so its evaluations and checkpoints are counted in steps
+    # (ledger 3153).
+    stated = ["--trainer.checkpoint-dir", str(runs), "--trainer.examples", "48", "--trainer.eval-every", "3",
+              "--trainer.checkpoint-every", "3",
               "--trainer.multi-host", "False", "--trainer.compilation-cache-dir", "None",
               "--trainer.cooldowns.at", "50%", "--trainer.cooldowns.length", "25%",
               "--optim.learning-rate", '{"class": "linear", "fields": {"peak_value": 0.001}}']
