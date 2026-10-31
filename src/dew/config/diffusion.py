@@ -253,10 +253,13 @@ class DiffusionRunConfig(RunConfig):
         shape = fields.get(wanted.key)
         expected = (*sample.shape[:-1], 1)
         if shape is None:
+            recipe = ("images(..., augment=RandomMask())" if chain is None else
+                      "images(..., augment=RandomMask(), rejects=False), whose random steps draw by each "
+                      "record's own index, which a dropped record would shift")
             raise ValueError(f"{self.pretrained} is an inpainting pipeline, which paints the region a mask "
                              f"marks in each image; {name} carries no {wanted.key!r} field: draw one per "
-                             f"image with dew.data.images.RandomMask() (images(..., augment=RandomMask())), "
-                             f"or decode a dataset's own into {wanted.key!r}")
+                             f"image with dew.data.images.RandomMask() ({recipe}), or decode a dataset's "
+                             f"own into {wanted.key!r}")
         if not isinstance(shape, list | tuple) or tuple(shape) != expected:
             raise ValueError(f"{name}'s {wanted.key!r} field is {shape!r}, and an inpainting pipeline "
                              f"over {sample.key} of {sample.shape} reads a mask of {list(expected)}")
