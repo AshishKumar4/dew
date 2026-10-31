@@ -318,17 +318,30 @@ def admitted(devices: Sequence, capacity: int | None, resident: int, beside: int
     in use already; None where a device states no memory. A device that states none, one compiled for and
     absent (`compile_only_gpus`), holds the `capacity` it is stated to, `resident` in it as it would be."""
     memory = [device_memory(device, capacity, resident) for device in devices]
-    if not all('bytes_limit' in m and 'bytes_in_use' in m for m in memory):
+    if not stated(memory):
         return None
     return min(placeable(m, unclaimed(d, m)) - beside - temporaries * stranding(d, m)
                for d, m in zip(devices, memory, strict=True))
+
+
+def stated(memory: Sequence[Mapping[str, int]]) -> bool:
+    """Whether every device's `memory` (`device_memory`) states its limit and its use, which a fit check
+    reads; a CPU's states none, so no step's headroom on it is known ahead of its run."""
+    return all('bytes_limit' in m and 'bytes_in_use' in m for m in memory)
+
+
+def judged(device) -> bool:
+    """Whether a step's footprint derived for `device` is judged against its memory (`derived_headroom`):
+    a device of this process judges it where it states its memory, which a CPU does not, and a device with
+    none attached (a compile-only GPU, `dew.training.ahead.compile_only_gpus`) against the capacity a plan
+    states for it."""
+    return device not in jax.local_devices() or stated([device_memory(device)])
 
 
 def stranding(device, memory: Mapping[str, int]) -> int:
     """How many times its temporaries a step needs room for on `device`, its allocator stating `memory`:
     2 where it can strand them (`strands_temporaries`), else 1."""
     return 2 if strands_temporaries(device.platform, memory) else 1
-
 
 
 def device_memory(device, capacity: int | None = None, arguments: int = 0) -> Mapping[str, int]:
