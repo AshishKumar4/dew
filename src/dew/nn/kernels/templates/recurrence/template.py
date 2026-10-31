@@ -57,29 +57,38 @@ _PLANS: dict = {}
 
 def _planned(shapes: tuple, tiles: mainloop.Tiles, family: mosaic.Family, target: generation.GpuTarget,
              max_segments: int | None, delta: bool, backward: bool,
-             floor: float | None, rounded: bool = False, wide: bool = False) -> tuple[mainloop.Launch, ...]:
+             floor: float | None, rounded: bool = False, wide: bool = False,
+             ranged: bool = False) -> tuple[mainloop.Launch, ...]:
     """`mainloop_backward.planned` of a call over `shapes` (`jax.ShapeDtypeStruct`s or None) by `family`'s
     bundle on `target`, cached by the facts a plan reads of it (two targets of one family share no plan: an
     sm87's and an sm80's multiprocessors and shared memory differ)."""
     facts = (target.generation, target.device_kind, target.shared_limit, target.multiprocessors)
-    key = (shapes, tiles, family, facts, max_segments, delta, backward, floor, rounded, wide)
+    key = (shapes, tiles, family, facts, max_segments, delta, backward, floor, rounded, wide, ranged)
     if key not in _PLANS:
         *operands, starts = shapes
         _PLANS[key] = mainloop_backward.planned(*operands, tiles=tiles, family=family, starts=starts,
                                        max_segments=max_segments, delta=delta, backward=backward, floor=floor,
-                                       target=target, rounded=rounded, wide=wide)
+                                       target=target, rounded=rounded, wide=wide, ranged=ranged)
     return _PLANS[key]
 
 
-def inverse_refusal(dtype, delta: bool, bound: float | None) -> str | None:
+def inverse_refusal(dtype, delta: bool, bound: float | None, takes_tf32: bool) -> str | None:
     """Why the mainloop refuses a call's delta-rule solve, None where it takes it: a 16-bit call's merges
     stage the chunk's inverse in fp16 (`mainloop._merges`), whose range holds it where the call's form
     proves its entries at most two (`bound`, `recurrence.Hooks.inverse_bound`), as a layer declares of its
-    keys and write gates. An fp32 call's three bf16 parts hold fp32's range."""
-    if not delta or jnp.dtype(dtype) == jnp.float32 or bound is not None:
+    keys and write gates; where it proves none, in fp32 as TF32 on a family whose products take it
+    (`takes_tf32`, the call `ranged`). An fp32 call's operands hold fp32's range."""
+    if not delta or jnp.dtype(dtype) == jnp.float32 or bound is not None or takes_tf32:
         return None
     return ("a 16-bit delta rule's solve stages its chunk inverse in fp16, which holds it where the layer "
-            "declares keys of unit norm and write gates at most two (recurrence.Hooks.inverse_bound)")
+            "declares keys of unit norm and write gates at most two (recurrence.Hooks.inverse_bound); fp32's "
+            "range takes TF32 merges, which this family's products do not take")
+
+
+def ranged(dtype, delta: bool, bound: float | None) -> bool:
+    """Whether a call's solve holds its chunk inverse at fp32's range (`mainloop._Call.ranged`): a 16-bit
+    delta rule whose form proves no bound on the inverse's entries."""
+    return delta and jnp.dtype(dtype) != jnp.float32 and bound is None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -127,14 +136,15 @@ class Mosaic(base.Template[mainloop.Tiles]):
         shapes = tuple(None if x is None else jax.ShapeDtypeStruct(x.shape, x.dtype) for x in given)
         dtype = jnp.result_type(*(arguments[name].dtype for name in names[:3]))
         per_head = arguments["g"].ndim == 3
-        forms = mainloop_backward.fast_backward_form(arguments.get("delta", True),
-                                                     arguments.get("rounded", False), dtype)
-        fast = backward and forms and per_head and dtype != jnp.float32
         family = bundle(target, dtype)
         assert family is not None, f"no bundle of the mainloop claims {target.generation}"
-        return _planned(shapes, config, family, target, arguments.get("max_segments"),
-                        arguments.get("delta", True), bool(fast), arguments.get("floor"),
-                        arguments.get("rounded", False), arguments.get("wide", False))
+        delta = arguments.get("delta", True)
+        forms = mainloop_backward.fast_backward_form(delta, arguments.get("rounded", False), dtype,
+                                                     family.takes_tf32)
+        fast = backward and forms and per_head
+        return _planned(shapes, config, family, target, arguments.get("max_segments"), delta, bool(fast),
+                        arguments.get("floor"), arguments.get("rounded", False), arguments.get("wide", False),
+                        ranged(dtype, delta, arguments.get("bound")))
 
     GENERATES: ClassVar[bool] = True
 
@@ -296,10 +306,10 @@ class Mosaic(base.Template[mainloop.Tiles]):
             target = self.launched()
         arguments = ba.arguments
         dtype = jnp.result_type(*(arguments[name].dtype for name in ("query", "key", "value")))
-        sixteen = dtype in (jnp.bfloat16, jnp.float16)
-        forms = mainloop_backward.fast_backward_form(arguments.get("delta", True),
-                                                     arguments.get("rounded", False), dtype)
-        if not (forms and arguments["g"].ndim == 3 and sixteen):
+        family = bundle(target, dtype)
+        forms = family is not None and mainloop_backward.fast_backward_form(
+            arguments.get("delta", True), arguments.get("rounded", False), dtype, family.takes_tf32)
+        if not (forms and arguments["g"].ndim == 3):
             return False
         fits = self.fits(ba, target)
         return bool(fits) and self._backward_holds(ba, fits[0], target)
@@ -392,9 +402,10 @@ class Mosaic(base.Template[mainloop.Tiles]):
         if dtype not in (jnp.bfloat16, jnp.float16, jnp.float32):
             return False
         factored = arguments["g"].ndim == 3 or mainloop.per_key_refusal(dtype, arguments.get("floor")) is None
-        ranged = inverse_refusal(dtype, arguments.get("delta", True), arguments.get("bound")) is None
-        if not (factored and ranged and bundle(target, dtype) is not None
-                and target.tensor_rate("16bit") is not None):
+        family = bundle(target, dtype)
+        solved = family is not None and inverse_refusal(dtype, arguments.get("delta", True),
+                                                        arguments.get("bound"), family.takes_tf32) is None
+        if not (factored and solved and target.tensor_rate("16bit") is not None):
             return False
         return bool(self.fits(ba, target))
 

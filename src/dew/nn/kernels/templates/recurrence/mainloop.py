@@ -129,9 +129,11 @@ def per_key_refusal(dtype, floor: float | None) -> str | None:
     return None
 
 
-def _parts(dtype) -> int:
-    """The parts a product takes an operand of `dtype` as: three for fp32, one for 16 bits."""
-    return PARTS if jnp.dtype(dtype) == jnp.float32 else 1
+def _parts(dtype, tf32: bool = False) -> int:
+    """The parts a product takes an operand of `dtype` as: one for 16 bits, and for fp32 one where its
+    products take it as TF32 (`tf32`: the run's fast forms on a family whose products take it,
+    `Family.takes_tf32`; JAX's default precision for an fp32 product, and fla's), else three."""
+    return PARTS if jnp.dtype(dtype) == jnp.float32 and not tf32 else 1
 
 
 def _diagonal(size: int, family: mosaic.Family) -> jax.Array:
@@ -205,6 +207,10 @@ class _Call:
     family: mosaic.Family
     interpret: bool
     target: generation.GpuTarget
+    ranged: bool = False
+    """Whether its solve holds the chunk inverse at fp32's range: a 16-bit delta rule whose form proves no
+    bound on the inverse's entries (`recurrence.Hooks.inverse_bound`), its merges staged in fp32
+    (`_merges`)."""
 
     @property
     def gated_keys(self) -> bool:
@@ -327,9 +333,17 @@ def _merges(call: _Call) -> tuple:
     proves its entries at most two (`recurrence.Hooks.inverse_bound`: unit keys, write gates at most two),
     the call's contract (`template.inverse_refusal`). Unnormalized keys with `beta |k|^2` past two grow it
     geometrically, past fp16's largest in about 16 tokens (row 2381): fp32's range in bf16 parts spilled the
-    solve on an A100 and an H100, one bf16 part put a normalized call's inverse 2.1 to 2.7 times as far from
-    float64, and Mosaic's mma.sync takes no TF32, so those calls take the port's or the portable math."""
-    dtype, parts = (jnp.bfloat16, PARTS) if call.held.parts > 1 else (jnp.float16, 1)
+    solve on an A100 and an H100 and one bf16 part put a normalized call's inverse 2.1 to 2.7 times as far
+    from float64, so such a `ranged` call's merges take fp32 itself, as TF32 (`Family.takes_tf32`), fla's own
+    merges; so does an fp32 call that takes its operands as TF32 (`_parts`)."""
+    if call.held.parts > 1:
+        dtype, parts = jnp.bfloat16, PARTS
+    elif call.held.dtype == jnp.float32 or call.ranged:
+        # fp32 itself, the products taking it as TF32 (`Family.takes_tf32`): an fp32 call's one part, and a
+        # 16-bit call's inverse at fp32's range where its form proves no bound, as fla merges in TF32.
+        dtype, parts = jnp.float32, 1
+    else:
+        dtype, parts = jnp.float16, 1
     tile = (CHUNK, CHUNK)
     return tuple(tuple(plgpu.SMEM(tile, dtype) for _ in range(parts)) for _ in range(3))
 
@@ -1701,7 +1715,7 @@ def forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts=None
             max_segments: int | None = None,
             scale: float | None = None, delta: bool = True, wide: bool = False,
             family: mosaic.Family | None = None, interpret: bool = False, floor: float | None = None,
-            rounded: bool = False):
+            rounded: bool = False, ranged: bool = False):
     """The chunked rule's forward on this mainloop: `(o [B, T, HV, Dv], final [B, HV, Dk, Dv])` for `q`, `k`
     `[B, T, H, Dk]`, `v` `[B, T, HV, Dv]`, the natural log decay `g`, a head's `[B, T, HV]` (the gated delta
     rule) or a key dimension's `[B, T, HV, Dk]` (Kimi delta attention), the write gate `beta` `[B, T, HV]` and
@@ -1717,13 +1731,15 @@ def forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts=None
     memory and registers a launch). Its states and output launches take `tiles` (the template's config,
     `templates.recurrence.template`), and its launches issue by `family`'s bundle (the device's, `family_of`,
     where None), interpreted where `interpret`. A decay a key dimension takes the layer's declared `floor`
-    (`per_key_refusal`). A `rounded` call without the delta rule (Mamba2's SSD, whose 16-bit numbers are
-    mamba_ssm's) passes its values between launches in the operands' dtype under the run's fast forms
-    (`_prepared`)."""
+    (`per_key_refusal`). A `rounded` call takes the run's fast forms' numbers: without the delta rule
+    (Mamba2's SSD, whose 16-bit numbers are mamba_ssm's) it passes its values between launches in the
+    operands' dtype, and an fp32 call's products take its operands as TF32 where the family's do
+    (`_prepared`, `_parts`). A `ranged` 16-bit delta rule, whose form proves no bound on its chunk inverse,
+    solves it at fp32's range (`_merges`)."""
     out, final, _ = kept_forward(q, k, v, g, beta, h0, starts=starts, firsts=firsts,
                                  max_segments=max_segments, scale=scale, delta=delta, tiles=tiles, wide=wide,
                                  family=family, interpret=interpret, floor=floor, keeps=False,
-                                 rounded=rounded)
+                                 rounded=rounded, ranged=ranged)
     return out, final
 
 
@@ -1732,7 +1748,7 @@ def kept_forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts
                  scale: float | None = None, delta: bool = True, wide: bool = False,
                  family: mosaic.Family | None = None, interpret: bool = False,
                  floor: float | None = None, keeps: bool = True,
-                 rounded: bool = False) -> tuple[jax.Array, jax.Array, tuple]:
+                 rounded: bool = False, ranged: bool = False) -> tuple[jax.Array, jax.Array, tuple]:
     """`forward`'s `(o, final)` and what the fast backward takes rather than compute again
     (`mainloop_backward.gradients`' `inverse` and `kept`): each chunk's inverse under a decay a head
     (`_solved`'s, None otherwise or where the call `keeps` none, `forward`'s), as fla's backward keeps its
@@ -1740,7 +1756,7 @@ def kept_forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts
     keeps unless a remat rung recomputes them (`recurrence_chunk.RECOMPUTED`), the caller's choice."""
     run = _prepared(q, k, v, g, beta, h0, starts=starts, max_segments=max_segments, scale=scale, delta=delta,
                     tiles=tiles, family=family, interpret=interpret, floor=floor, keeps=keeps, firsts=firsts,
-                    rounded=rounded)
+                    rounded=rounded, ranged=ranged)
     call, tiles = run.call, run.tiles
     o = _output(run.q, run.k, run.h, run.corrected, run.hi, run.lo, run.taken, run.beta, call, tiles,
                 scale=run.scale, out_dtype=jnp.float32 if wide else run.dtype, scores=run.scores)
@@ -1782,7 +1798,7 @@ class _Run:
 def _prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles, family, interpret,
               firsts=None,
               inverse=None, kept=None, floor: float | None = None, keeps: bool = True,
-              rounded: bool = False) -> _Run:
+              rounded: bool = False, ranged: bool = False) -> _Run:
     """`forward`'s operands checked, padded and laid, and its launches before the output run: under a decay a
     head the solve's but where its `inverse` is given, and the weighted and states launches' but where their
     `kept` values, `(w, h, corrected)`, are (`kept_forward`'s; its final memory then None). The solve stores
@@ -1815,10 +1831,10 @@ def _prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles
         h0 = jnp.where(starts[:, 0, None, None, None], 0.0, h0)
     chunks, taken, sequences, laid, unlaid = _layout(batch, length, starts, max_segments, firsts)
     rows = chunks * CHUNK
-    given = _Operand(rows, _parts(dtype), dtype)
+    given = _Operand(rows, _parts(dtype, rounded and family.takes_tf32), dtype)
     # What the launches pass between them: the delta rule's in the operands' dtype, as fla's rounds it (the
     # port is its reference). Without it, a `rounded` call's (the SSD's under the run's fast forms, which its
-    # route resolves, `recurrence_chunk.mamba_rounding`) in the operands' dtype too, as mamba_ssm rounds its
+    # route resolves, `recurrence_chunk.fast_rounding`) in the operands' dtype too, as mamba_ssm rounds its
     # scores and entered memories for its products (`_chunk_scan_fwd`'s `cb` and `prev_states`), its memory
     # summed and passed in fp32: on an H100 Nemotron-H 4B's SSD forward took 0.581 ms against fp32's three
     # parts' 2.031 and the port's 0.606, 30B's 0.249 against 0.593 and 0.229 (ssd-held-h100-fdab2424c). Else,
@@ -1827,7 +1843,7 @@ def _prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles
     # float64).
     held = given if delta or rounded else _Operand(rows, PARTS, jnp.dtype(jnp.float32))
     call = _Call(heads, heads // k.shape[2], width, columns, rows, given, held, per_key, delta, family,
-                 interpret, generation.gpu_target())
+                 interpret, generation.gpu_target(), ranged=ranged)
     hi, lo = prefix(laid(g).reshape(chunks, CHUNK, -1))
     # A decay a head's prefix a head's row of vectors `[HV, R]`, one a key dimension's tiles `[R, HV * Dk]`.
     hi, lo = (x.reshape(rows, -1) if per_key else x.reshape(rows, heads).T for x in (hi, lo))

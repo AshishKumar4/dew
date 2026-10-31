@@ -54,6 +54,7 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     _views,
     _walk,
     _walk_stores,
+    family_of,
     kept_forward,
 )
 
@@ -61,7 +62,7 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
 def planned(q, k, v, g, beta, h0=None, *, tiles: Tiles, family: mosaic.Family, starts=None,
             max_segments: int | None = None, delta: bool = True, backward: bool = False,
             floor: float | None = None, target: generation.GpuTarget | None = None,
-            rounded: bool = False, wide: bool = False) -> tuple[Launch, ...]:
+            rounded: bool = False, wide: bool = False, ranged: bool = False) -> tuple[Launch, ...]:
     """The launches a call over operands of these shapes (`jax.ShapeDtypeStruct`s, `forward`'s) runs at
     `tiles` by `family`'s bundle on `target` (the device's, or the assumed one's, where None), in order, as
     planned (`Launch`): its arrays abstract (`jax.eval_shape`), its kernels declared and not built
@@ -75,11 +76,11 @@ def planned(q, k, v, g, beta, h0=None, *, tiles: Tiles, family: mosaic.Family, s
         try:
             out, final, (inverse, kept) = kept_forward(q, k, v, g, beta, h0, tiles=tiles, starts=starts,
                                                        max_segments=max_segments, delta=delta, family=family,
-                                                       floor=floor, rounded=rounded, wide=wide)
+                                                       floor=floor, rounded=rounded, wide=wide, ranged=ranged)
             if backward:
                 gradients(q, k, v, g, beta, h0, out, final, tiles=tiles, starts=starts,
                           max_segments=max_segments, family=family, inverse=inverse, kept=kept, delta=delta,
-                          rounded=rounded)
+                          rounded=rounded, ranged=ranged)
         finally:
             _PLANNED.reset(token)
 
@@ -97,17 +98,21 @@ def holds(launches: tuple[Launch, ...], family: mosaic.Family, shared: int) -> b
                for launch in launches)
 
 
-def fast_backward_form(delta: bool, rounded: bool, dtype) -> bool:
-    """Whether the fast backward takes a call's form (a decay a head in a 16-bit call besides): the delta
-    rule, fla's DAG at fla's rounding, or a bf16 `rounded` call without it (the SSD's under the run's fast
-    forms, its route's), the same DAG without the delta rule's at mamba_ssm's rounding (`_prepared`), held to
-    recorded mamba_ssm's bf16 case; an fp16 call's, which no recording holds, the port's."""
-    return delta or (rounded and jnp.dtype(dtype) == jnp.bfloat16)
+def fast_backward_form(delta: bool, rounded: bool, dtype, tf32: bool = False) -> bool:
+    """Whether the fast backward takes a call's form (a decay a head besides): the delta rule, fla's DAG at
+    fla's rounding, or a bf16 `rounded` call without it (the SSD's under the run's fast forms, its route's),
+    the same DAG without the delta rule's at mamba_ssm's rounding (`_prepared`), held to recorded mamba_ssm's
+    bf16 case; either in fp32 where its operands are one part, a `rounded` call's on a family whose products
+    take them as TF32 (`tf32`, `mainloop._parts`). An fp16 call without the delta rule, which no recording
+    holds, and an fp32 call's three parts (the accurate forms) take none."""
+    if jnp.dtype(dtype) == jnp.float32 and not (rounded and tf32):
+        return False
+    return delta or (rounded and jnp.dtype(dtype) in (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float32)))
 
 
 def backward_holds(q, k, v, g, beta, h0=None, *, tiles: Tiles, family: mosaic.Family, shared: int,
                    starts=None, max_segments: int | None = None, delta: bool = True,
-                   rounded: bool = False) -> bool:
+                   rounded: bool = False, ranged: bool = False) -> bool:
     """Whether the fast backward's launches (`gradients`'s, past the forward's) hold on `family`'s bundle at
     `tiles` within a block of `shared` bytes (`holds`); where they do not, the rule's gradient is the
     portable math's."""
@@ -115,16 +120,16 @@ def backward_holds(q, k, v, g, beta, h0=None, *, tiles: Tiles, family: mosaic.Fa
                                                                                     starts)]
     *operands, starts = shapes
     forward = planned(*operands, tiles=tiles, family=family, starts=starts, max_segments=max_segments,
-                      delta=delta, rounded=rounded)
+                      delta=delta, rounded=rounded, ranged=ranged)
     both = planned(*operands, tiles=tiles, family=family, starts=starts, max_segments=max_segments,
-                   backward=True, delta=delta, rounded=rounded)
+                   backward=True, delta=delta, rounded=rounded, ranged=ranged)
     return holds(both[len(forward):], family, shared)
 
 
 def gradients(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None, firsts=None,
               max_segments: int | None = None, scale: float | None = None,
               family: mosaic.Family | None = None, interpret: bool = False,
-              inverse=None, kept=None, delta: bool = True, rounded: bool = False):
+              inverse=None, kept=None, delta: bool = True, rounded: bool = False, ranged: bool = False):
     """The fast backward of the gated delta rule, a decay a head (`forward`'s, `g` `[B, T, HV]`), in a 16-bit
     call, or of a `rounded` call without it (the SSD's under the run's fast forms, `fast_backward_form`):
     `(dq, dk, dv, dg, dbeta, dh0)` for the output's and final memory's gradients `do`, `dfinal`, fla's DAG
@@ -137,12 +142,14 @@ def gradients(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None, fi
     the delta rule there is no system: the corrected values are the values gated, `u = v beta`, whose gradient
     `du` (the reverse walk's) gives `dv = du beta` and `dbeta = sum(v du)`, and the memory walks back with no
     `w^T dv`."""
-    if not fast_backward_form(delta, rounded, jnp.result_type(q, k, v)):
+    dtype = jnp.result_type(q, k, v)
+    family = family_of(dtype) if family is None else family
+    if not fast_backward_form(delta, rounded, dtype, family is not None and family.takes_tf32):
         raise NotImplementedError("the fast backward takes the delta rule, or a rounded call without it "
-                                  "under the run's fast forms")
+                                  "under the run's fast forms, in fp32 its operands as TF32")
     run = _prepared(q, k, v, g, beta, h0, starts=starts, max_segments=max_segments, scale=scale, delta=delta,
                     tiles=tiles, family=family, interpret=interpret, inverse=inverse, kept=kept,
-                    firsts=firsts, rounded=rounded)
+                    firsts=firsts, rounded=rounded, ranged=ranged)
     call = run.call
     if call.per_key or call.held.parts > 1:
         raise NotImplementedError("the fast backward takes a decay a head in a 16-bit call")

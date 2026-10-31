@@ -574,7 +574,7 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
             if kernel == 'mosaic_gpu':
                 return template_rule(query, key, value, g, beta, state, starts, firsts,
                                      max_segments=max_segments, scale=scale, delta=hooks.delta, wide=epilogue,
-                                     floor=hooks.floor, bound=hooks.inverse_bound)
+                                     floor=hooks.floor, bound=hooks.inverse_bound, rounded=fast_rounding())
             if kernel == 'fla':
                 # Unrounded where an epilogue follows, as on the portable math.
                 return fla_rule(query, key, value, g, beta, state, starts=starts, max_segments=max_segments,
@@ -729,10 +729,14 @@ widths, a decay a key dimension's floor, a bundle for the device's family, a con
 a training product its fast backward (`Mosaic.trains`; the rule's gradient takes no other, row 1926)."""
 
 def _inverse_range(case: PortCase) -> bool:
-    """Whether the template's solve holds the call's chunk inverse (`template.inverse_refusal`)."""
+    """Whether the template's solve holds the call's chunk inverse (`template.inverse_refusal`), its merges at
+    fp32's range where the device's products take TF32 (`Family.takes_tf32`)."""
+    from .templates import bundles
     from .templates.recurrence import template
 
-    return template.inverse_refusal(case.dtype, case.delta, case.bound) is None
+    family = bundles.of(generation.device_generation(), case.dtype) if case.family is not None else None
+    return template.inverse_refusal(case.dtype, case.delta, case.bound,
+                                    family is not None and family.takes_tf32) is None
 
 
 MOSAIC_SUPPORTS: tuple[Requirement[PortCase], ...] = (
@@ -775,7 +779,8 @@ def port_kernel(query, key, value, g, beta, state=None, starts=None, *, max_segm
     from .templates.recurrence import template
 
     call = base.call((template.MOSAIC,), query, key, value, g, beta, state, starts,
-                     max_segments=max_segments, scale=scale, delta=delta, wide=wide, floor=floor, bound=bound)
+                     max_segments=max_segments, scale=scale, delta=delta, wide=wide, floor=floor, bound=bound,
+                     rounded=fast_rounding())
     family = generation.family(generation.device_generation()) if generation.backend() == 'gpu' else None
     case = PortCase(bound=bound, varying=bool(jax.typeof(value).mat.varying),
                     dtype=jnp.dtype(jnp.result_type(query, key, value)), key_width=key.shape[-1], call=call,
@@ -970,12 +975,14 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
     interpreted off a GPU of that family (a CPU's). A decay a key dimension takes the layer's declared
     `floor`, which the mainloop's intra launch reads (`mainloop.per_key_refusal`), and a 16-bit delta rule the
     chunk inverse's `bound` its form proves, which its solve's range needs (`template.inverse_refusal`); a
-    `rounded` call without it (the SSD's under the run's fast forms, `mamba_rounding`) takes mamba_ssm's
+    `rounded` call without it (the SSD's under the run's fast forms, `fast_rounding`) takes mamba_ssm's
     16-bit numbers (`mainloop.forward`)."""
     from .templates.recurrence import mainloop, mainloop_backward, template
 
     dtype = jnp.result_type(query, key, value)
-    if refused := template.inverse_refusal(dtype, delta, bound):
+    device, interpret = mainloop.family_of(dtype), generation.backend() != 'gpu'
+    issuing = family or device or mainloop.INTERPRETED
+    if refused := template.inverse_refusal(dtype, delta, bound, issuing.takes_tf32):
         raise NotImplementedError(refused)
     query, key, value = (x.astype(dtype) for x in (query, key, value))
     # The delta rule's write gate in the operands' dtype, as fla's layer holds it; without the delta rule the
@@ -983,19 +990,17 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
     beta = beta.astype(dtype) if delta else beta
     g = g.astype(jnp.float32)
     # Interpreted off a GPU (an assumed one's calls lower for it); a GPU no bundle claims runs no launch.
-    device, interpret = mainloop.family_of(dtype), generation.backend() != 'gpu'
     if family is None and device is None and not interpret:
         raise NotImplementedError(f"the recurrence template has no bundle for the "
                                   f"{generation.family(generation.device_generation())!r} family")
-    run = {"family": family or device or mainloop.INTERPRETED, "interpret": interpret, "tiles": tiles,
-           "floor": floor}
+    run = {"family": issuing, "interpret": interpret, "tiles": tiles, "floor": floor,
+           "ranged": template.ranged(dtype, delta, bound)}
     # The fast backward where its launches hold on the device (a derived launch spills nothing), else none.
-    fast = (mainloop_backward.fast_backward_form(delta, rounded, dtype) and g.ndim == 3
-            and dtype != jnp.float32
+    fast = (mainloop_backward.fast_backward_form(delta, rounded, dtype, issuing.takes_tf32) and g.ndim == 3
             and mainloop_backward.backward_holds(
-                query, key, value, g, beta, state, tiles=tiles, family=run["family"],
+                query, key, value, g, beta, state, tiles=tiles, family=issuing,
                 shared=generation.shared_budget(template.Mosaic.launched()), starts=starts,
-                max_segments=max_segments, delta=delta, rounded=rounded))
+                max_segments=max_segments, delta=delta, rounded=rounded, ranged=run["ranged"]))
     run_back = {name: value for name, value in run.items() if name != "floor"}
 
     # The documents' starts and firsts operands, not closed over (a custom VJP's function closes over no
@@ -1167,7 +1172,7 @@ def _rated_scan(hooks: recurrence.Hooks, query, key, value, g, beta, given: dict
         if kernel == 'mosaic_gpu':
             out, final = template_rule(query, key, value, g, beta, state, starts, firsts,
                                        max_segments=max_segments, scale=1.0, delta=False, wide=True,
-                                       rounded=mamba_rounding())
+                                       rounded=fast_rounding())
             return recurrence.skipped(hooks, out, value, {'skip': skip}, work), final
         operand = jnp.result_type(query, key, value)
         x, B, C = (jnp.asarray(t, operand) for t in (value, key, query))
@@ -1318,10 +1323,11 @@ def scan_case(x, B, chunk_size: int, *, tpu: bool = True, padded: bool = False, 
                     call=call, family=family, product=product)
 
 
-def mamba_rounding() -> bool:
-    """Whether the SSD's call on the template takes mamba_ssm's 16-bit numbers (`rounded`): under the run's
-    fast forms (`generation.numerics`), resolved here at its route, so its launches and their caches key on
-    it, never on the run's numerics read inside them."""
+def fast_rounding() -> bool:
+    """Whether a call on the template takes the run's fast forms' numbers (`rounded`): the SSD's mamba_ssm's
+    16-bit ones, an fp32 call's products TF32 (JAX's default precision for an fp32 product, and fla's), under
+    the run's fast forms (`generation.numerics`), resolved at its route, so its launches and their caches key
+    on it, never on the run's numerics read inside them."""
     return generation.numerics().forms == 'fast'
 
 
@@ -1334,7 +1340,7 @@ def scan_kernel(query, key, value, g, beta, state=None, starts=None, *, chunk_si
     from .templates.recurrence import template
 
     call = base.call((template.MOSAIC,), query, key, value, g, beta, state, starts,
-                     max_segments=max_segments, scale=1.0, delta=False, wide=True, rounded=mamba_rounding())
+                     max_segments=max_segments, scale=1.0, delta=False, wide=True, rounded=fast_rounding())
     case = scan_case(value, key, chunk_size, padded=True, call=call, product=product)
     return select(SCAN, case).kernel if report else selected(SCAN, case).name
 
@@ -1398,7 +1404,7 @@ class SelectiveCase:
     """A selective scan (Mamba's, `dew.nn.mixers.mamba.selective_scan`) as its selector reads it
     (`SELECTIVE`): whether a shard_map that checks varying axes holds its operands, its operands' dtype and
     its states' rows' narrower one (B's or C's, which stream each in its own: the narrower's rows are the
-    shorter), its tokens, channels and states, whether the run's forms are the fast ones (`mamba_rounding`),
+    shorter), its tokens, channels and states, whether the run's forms are the fast ones (`fast_rounding`),
     its device's instruction family (None off a GPU) and the `product`."""
 
     varying: bool
@@ -1487,7 +1493,7 @@ def selective_kernel(x, A, B, C, *, product: str = 'forward', report: bool = Tru
     case = SelectiveCase(varying=bool(jax.typeof(x).mat.varying), dtype=jnp.dtype(x.dtype),
                          state_dtype=min(jnp.dtype(jnp.result_type(B)), jnp.dtype(jnp.result_type(C)),
                                          key=lambda dtype: dtype.itemsize),
-                         length=x.shape[1], channels=x.shape[-1], states=A.shape[-1], fast=mamba_rounding(),
+                         length=x.shape[1], channels=x.shape[-1], states=A.shape[-1], fast=fast_rounding(),
                          family=family, product=product)
     return select(SELECTIVE, case).kernel if report else selected(SELECTIVE, case).name
 
