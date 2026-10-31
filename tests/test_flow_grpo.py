@@ -665,7 +665,9 @@ def test_an_inpainting_rollout_rescores_with_its_masked_image_inputs():
     # The mask reaches the scoring: the batch's transitions under the other half masked score otherwise.
     rescore = jax.jit(objective.log_probs)
     flipped = {**batch, "spatial": {**batch["spatial"], "mask": 1 - batch["spatial"]["mask"]}}
-    assert np.all(np.asarray(rescore(variables, flipped)) != np.asarray(rescore(variables, batch)))
+    other, own = np.asarray(rescore(variables, flipped)), np.asarray(rescore(variables, batch))
+    assert np.all(np.isfinite(other)) and np.all(np.isfinite(own))
+    assert np.all(other != own)
 
     step = Step(jnp.asarray(0), jax.random.key(43), None)
     gain = objective.model_variables(variables)["params"]["gain"]
