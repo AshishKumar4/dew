@@ -88,11 +88,11 @@ CONTRACTED = {
         "test_the_short_conv_holds_every_order",
     "src/dew/objectives/base.py::_ruled":
         "test_a_ruled_loss_holds_every_order",
-    "src/dew/objectives/lm/chunked.py::_bounded_head":
+    "src/dew/objectives/lm/chunked.py::_bounded_head.linear_tangent":
         "test_the_lm_heads_hold_every_order_of_their_gradient",
-    "src/dew/objectives/lm/chunked.py::_whole_head":
+    "src/dew/objectives/lm/chunked.py::_whole_head.linear_tangent":
         "test_the_lm_heads_hold_every_order_of_their_gradient",
-    "src/dew/objectives/lm/chunked.py::_fused":
+    "src/dew/objectives/lm/chunked.py::_fused.linear_tangent":
         "test_the_lm_heads_hold_every_order_of_their_gradient",
     "src/dew/objectives/lm/chunked.py::_whole_losses":
         "test_the_whole_logits_losses_hold_every_order",
