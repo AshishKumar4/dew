@@ -154,8 +154,8 @@ class Mma(mosaic.Family):
     def rhs_fragment_depth(self, depth: int, *, transposed: bool = False, swizzle: int | None = None) -> int:
         # A transposed stage's rows are its depth: a load takes a whole swizzle tile of it (`products`), one
         # instruction's at the narrowest swizzle (a stream staged so by `streams`' `swizzles`: D64's K in
-        # QKᵀ at the widest held its whole 64 x 192 stage, 162 registers, ET's census80). An ordinary one
-        # slices its rows' 8-row tiles.
+        # QKᵀ at the widest held its whole 64 x 192 stage, 162 registers, census80). An ordinary one slices
+        # its rows' 8-row tiles.
         return self._staged_depth(depth, swizzle) if transposed else self.fragment_depth(depth)
 
     def lhs_fragment_depth(self, depth: int) -> int:

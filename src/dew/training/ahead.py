@@ -325,33 +325,40 @@ class AheadTarget:
     def compiled[LossT, EffectsT](self, trainer: Trainer[LossT, EffectsT], loader: Loader,
                                   steps: int | None, examples: int | None = None) -> CompiledAhead:
         """`trainer`, built over this target's devices (`compile_only`), its first step compiled ahead
-        (`compile_ahead`) and saved, as what ends the run, as `fit` would start it: an input its objective
-        names alone declared first (`Trainer._declare_input`), the loader read through its device steps
-        and the run's clock (its `steps`, or the `examples` it is bounded to, `Trainer.reading`), and the
-        batch the step takes `loader`'s first, read from the position its checkpoint left a resumed run
-        at (`Checkpoints.position`), at whose rung the step compiles. A run whose step reads a rollout's
-        batches, which it makes as it trains, is refused, as is one its checkpoint completes."""
-        from dew.data.dataset import DataPartition
-        from dew.training._fit import first_batch
-
+        (`compile_ahead`) and saved, as what ends the run, over the batch `fit` would start it on
+        (`first_step_batch`), at the rung a resumed run's checkpoint left it. A run whose step reads a
+        rollout's batches, which it makes as it trains, is refused."""
         if trainer.rollout is not None:
             raise ValueError("compile_ahead lowers the step over the loader's batches; this run's step reads "
                              "its rollout's, which it makes only as it trains")
-        named = trainer.objective.named_inputs
-        if named is not None and trainer.objective.inputs is None:
-            trainer._declare_input(named, loader)
-        trainer.reading(loader, examples=examples, steps=steps)
-        trainer.validate(steps=steps)
-        checkpoints = trainer.checkpoints
-        resumed = None if checkpoints is None else checkpoints.resumed("auto")
-        if resumed is not None and steps is not None and resumed >= steps:
-            raise ValueError(f"the run is complete at step {resumed}, its last checkpoint written, so it has "
-                             "no step to compile ahead")
-        position = None if checkpoints is None or resumed is None else checkpoints.position(
-            resumed, DataPartition.of(trainer.device_mesh))
-        ahead = compile_ahead(trainer, first_batch(loader, trainer.device_mesh, position), self.capacity)
+        ahead = compile_ahead(trainer, first_step_batch(trainer, loader, steps, examples), self.capacity)
         ahead.save(self.path)
         return CompiledAhead(self.path, ahead)
+
+
+def first_step_batch[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], loader: Loader, steps: int | None,
+                                      examples: int | None = None) -> Batch:
+    """The batch `trainer`'s first step takes from `loader`, as `fit` would start the run: an input its
+    objective names alone declared first (`Trainer._declare_input`), the loader read through its device
+    steps and the run's clock (its `steps`, or the `examples` it is bounded to, `Trainer.reading`), the
+    run checked (`Trainer.validate`), and the loader's first batch from the position its checkpoint left
+    a resumed run at (`Checkpoints.position`). A run its checkpoint completes has no step to take, and
+    is refused. What a step compiled ahead (`AheadTarget.compiled`) and an offline view of a run
+    (`dew.config.RunConfig.viewed`) start from."""
+    from dew.data.dataset import DataPartition
+    from dew.training._fit import first_batch
+
+    trainer._declare_input(lambda: first_batch(loader, trainer.device_mesh))
+    trainer.reading(loader, examples=examples, steps=steps)
+    trainer.validate(steps=steps)
+    checkpoints = trainer.checkpoints
+    resumed = None if checkpoints is None else checkpoints.resumed("auto")
+    if resumed is not None and steps is not None and resumed >= steps:
+        raise ValueError(f"the run is complete at step {resumed}, its last checkpoint written, so it has no "
+                         "step to take")
+    position = None if checkpoints is None or resumed is None else checkpoints.position(
+        resumed, DataPartition.of(trainer.device_mesh))
+    return first_batch(loader, trainer.device_mesh, position)
 
 
 class CompiledAhead(SystemExit):

@@ -366,6 +366,77 @@ TILE_SIDES = (32, 64, 128, 192, 256)
 them."""
 
 
+def score_places(hooks: Hooks | None) -> tuple[bool, bool]:
+    """Whether the score hook reads its queries' places and its keys' (its `q_pos`, `k_pos`): traced, never
+    run, on a tile."""
+    if hooks is None or not callable(hooks.score_mod):
+        return False, False
+    params = tuple((param.kind, kept_dtype(param.value.dtype)) for param in hooks.score_params)
+    return _score_places(hooks.score_mod, params)
+
+
+@functools.lru_cache(maxsize=256)
+def _score_places(score_mod, params: tuple) -> tuple[bool, bool]:
+    """`score_places` of `score_mod` under parameters of `params`' kinds and dtypes."""
+    side = TILE_SIDES[0]
+    jaxpr = _score_jaxprs(score_mod, params, (side, side), differentiated=False)[0]
+    _, queries, keys, *_ = _live_inputs(jaxpr, [True] * len(jaxpr.outvars))
+    return queries, keys
+
+
+def _live_inputs(jaxpr: jax_core.Jaxpr, live_outputs: list[bool]) -> list[bool]:
+    """Which of `jaxpr`'s inputs its `live_outputs` surely read: through each equation whose outputs are live,
+    into a call's own jaxpr input by input (a jitted helper's, a custom derivative's primal); an equation of
+    any other nested computation (a branch's, a loop's) surely reads none, a place it may read left a tile
+    (`_coords`)."""
+    live = {var for var, used in zip(jaxpr.outvars, live_outputs, strict=True)
+            if used and not isinstance(var, jax_core.Literal)}
+    for eqn in reversed(jaxpr.eqns):
+        used = [var in live for var in eqn.outvars]
+        if not any(used):
+            continue
+        nested = list(jax_core.jaxprs_in_params(eqn.params))
+        called = [inner for name in ("jaxpr", "call_jaxpr") if (inner := eqn.params.get(name)) is not None]
+        inner = getattr(called[0], "jaxpr", called[0]) if called else None
+        if isinstance(inner, jax_core.Jaxpr) and len(inner.invars) == len(eqn.invars) and len(nested) == 1:
+            reads = _live_inputs(inner, used)
+        else:
+            reads = [not nested] * len(eqn.invars)
+        live.update(var for var, read in zip(eqn.invars, reads, strict=True)
+                    if read and not isinstance(var, jax_core.Literal))
+    return [var in live for var in jaxpr.invars]
+
+
+def varying_slopes(hooks: Hooks | None) -> int:
+    """The tiles a backward step's score-hook pullback forms that vary with its inputs (`algebra.scored`):
+    its output and each slope along an input it differentiates but a constant one (a hook linear in an input
+    slopes 1 along it, which folds away); traced, never run, on a tile. None without a hook."""
+    if hooks is None or not callable(hooks.score_mod):
+        return 0
+    params = tuple((param.kind, kept_dtype(param.value.dtype)) for param in hooks.score_params)
+    return _varying_slopes(hooks.score_mod, params)
+
+
+@functools.lru_cache(maxsize=256)
+def _varying_slopes(score_mod, params: tuple) -> int:
+    """`varying_slopes` of `score_mod` under parameters of `params`' kinds and dtypes."""
+    tile = (TILE_SIDES[0], TILE_SIDES[0])
+    positions, logits = jax.ShapeDtypeStruct(tile, jnp.int32), jax.ShapeDtypeStruct(tile, jnp.float32)
+
+    def scored(s, q_pos, k_pos, *values):
+        out, slopes = algebra.scored(score_mod, s, q_pos, k_pos, values, slopes=True)
+        assert slopes is not None
+        return out, *slopes
+
+    values = [_entries(kind, dtype, tile) for kind, dtype in params]
+    jaxpr = jax.make_jaxpr(scored)(logits, positions, positions, *values).jaxpr
+    varying = set(jaxpr.invars)
+    for eqn in jaxpr.eqns:
+        if any(not isinstance(var, jax_core.Literal) and var in varying for var in eqn.invars):
+            varying.update(eqn.outvars)
+    return sum(not isinstance(var, jax_core.Literal) and var in varying for var in jaxpr.outvars)
+
+
 def transposable(hooks: Hooks) -> bool:
     """Whether the score hook and its pullback run on a tile held keys first (`[bk, bq]`, the dK/dV
     program's) as written for the reference's `[bq, bk]` (`layout.transposed`): traced, never run, at every
@@ -706,22 +777,37 @@ def _streamed(reaches: list) -> tuple[jax.Array, jax.Array]:
 
 
 def _coords(family: mosaic.Family, spans: _Spans | None, row, first, k_first, shape: tuple[int, int],
-            q_pos=None, columns=None, *, keys_first: bool = False,
+            q_pos=None, columns=None, *, keys_first: bool = False, read: tuple[bool, bool] = (False, False),
             draw: Draw | None = None) -> algebra.Coords:
     """A tile's coordinates (`algebra.Coords`): its queries' and keys' places from `first` and `k_first`, the
     tile's entries in the accumulator's layout (`q_pos` the query places and `columns` the tile's key
     offsets, where the caller holds them; a hook reads them so, `_param`), and a spans call's queries'
     intervals and, with documents, both blocks' ids, and a dropping call's `draw`. A tile whose rows are its
     keys (`keys_first`, `shape` `[bk, bq]`) holds its queries' vectors in a column's layout and its keys' in
-    a row's."""
+    a row's: each one's places a vector broadcast where the step surely reads them (`read`, its queries' and
+    its keys', `algebra.places_read`), a tile otherwise."""
     query_axis, key_axis = (1, 0) if keys_first else (0, 1)
-    q_pos = first + family.iota(shape, query_axis) if q_pos is None else q_pos
-    if keys_first:
-        # The keys' places a row vector broadcast, no int tile held (a query's column vector does not lower:
-        # Mosaic GPU's layout inference finds no layout for it beside the tile's).
-        k_pos = lax.broadcast_in_dim(k_first + family.iota((shape[0],), 0), shape, (0,))
+
+    def places(start, axis: int) -> jax.Array:
+        # A tile's places along `axis` from a row's or a column's vector broadcast: each element's index its
+        # lane's base and an immediate. An iota of the whole tile computes each column's from its place (a
+        # remainder by the tile's width, seven instructions at 192), chains LLVM hoists out of the walk and
+        # ptxas holds across it (the held-term census: 45-127 such integers live at the peak, D64's 64 x 192
+        # forward spilling 344 bytes, D128's training 64 x 64 72); a row's needs no remainder.
+        return lax.broadcast_in_dim(start + family.iota((shape[axis],), 0, columns=axis == 1), shape, (axis,))
+
+    # Each one's places a vector broadcast where the step reads them (a row's keys first, a column's queries
+    # first); a tile otherwise (Mosaic GPU keeps an unread vector's iota without its layout, which its
+    # inference cannot place, row 2977), and the queries' keys first (a query's column vector beside the
+    # tile finds no layout).
+    queries_read, keys_read = read
+    if q_pos is None:
+        q_pos = (places(first, query_axis) if queries_read and not keys_first
+                 else first + family.iota(shape, query_axis))
+    if columns is not None and not keys_first:
+        k_pos = k_first + columns
     else:
-        k_pos = k_first + (family.iota(shape, key_axis) if columns is None else columns)
+        k_pos = places(k_first, key_axis) if keys_read else k_first + family.iota(shape, key_axis)
     if spans is None:
         return algebra.Coords(q_pos, k_pos, drop=draw, keys_first=keys_first)
     rows, keys = pl.ds(first, shape[query_axis]), pl.ds(k_first, shape[key_axis])

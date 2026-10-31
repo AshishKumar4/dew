@@ -93,7 +93,7 @@ def operand_fragments(family: "Family", rows: int, depth: int, columns: int, lhs
     operand's loaded depth (`Family.lhs_fragment_depth`), its right one's at its stage's swizzle
     (`Family.rhs_fragment_depth`; `rhs_swizzle` bytes, the family's default where None), each in the warps
     replicating it (`lhs_copies`, `rhs_copies`) and its dtype (`lhs`, `rhs`), repeated for its parts (an
-    fp32 operand split into 16-bit parts): GEMM's and recurrence's products'."""
+    fp32 operand split into 16-bit parts): GEMM's, recurrence's and attention's products'."""
     if not family.operands_in_registers:
         return []
     return ([(rows * family.lhs_copies, family.lhs_fragment_depth(depth), lhs)] * lhs_parts

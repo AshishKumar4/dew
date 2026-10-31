@@ -304,21 +304,22 @@ def peak_memory_gib() -> float | None:
 def derived_headroom(footprint: Footprint, devices: Sequence, capacity: int | None = None,
                      built: int = 0) -> int | None:
     """The bytes a step whose derived footprint is `footprint` would leave free on its tightest device, as
-    `step_headroom` reads a compiled step's: its temporaries the derivation names, its residuals and
-    gradient, in one block beside what it holds (`Footprint.held`), twice where the allocator strands
-    them; None where the derivation names no residuals or a device states no memory. The resident
-    state is in use already, or, on a stated device, its arguments but the `built` bytes its first
-    call builds, which `held` counts. XLA's workspace beyond these is no term of it
-    (`dew.training.footprint`): a compile confirms."""
-    if footprint.residuals is None:
+    `step_headroom` reads a compiled step's: its temporaries the derivation names, the most its gradient
+    program holds at once (`Footprint.peak`), its GEMMs' workspace among them, in one block beside what
+    it holds (`Footprint.held`), twice where the allocator strands them; None where
+    the derivation names no peak or a device states no memory. The resident state is in use already,
+    or, on a stated device, its arguments but the `built` bytes its first call builds, which `held`
+    counts. What else XLA's buffer assignment and scheduling make of the program is no term of it
+    (`dew.training.footprint`): a compile confirms, and a miss is the derivation's to fix."""
+    if footprint.peak is None:
         return None
     memory = [device_memory(device, capacity, sum(footprint.resident.values()) - built) for device in devices]
     if not all('bytes_limit' in m and 'bytes_in_use' in m for m in memory):
         return None
-    temporaries = footprint.residuals + footprint.gradients
     return min(placeable(m, unclaimed(d, m)) - footprint.held
-               - temporaries * (2 if strands_temporaries(d.platform, m) else 1)
+               - footprint.peak * (2 if strands_temporaries(d.platform, m) else 1)
                for d, m in zip(devices, memory, strict=True))
+
 
 
 def device_memory(device, capacity: int | None = None, arguments: int = 0) -> Mapping[str, int]:
