@@ -430,6 +430,24 @@ def _scored(program: _Program, spec: algebra.Forward, q, index, slots, first, sp
     return k_first, coords, logits, products
 
 
+def _initial(family: mosaic.Family, spec: algebra.Forward, hooked: _Hooked, rows: tuple,
+             live: jax.Array | None) -> algebra.Partial:
+    """The call's initial state at a consumer's `rows` (batch row, head, queries) in the family's layouts
+    (`algebra.resumed`), its `live` rows the guard's."""
+    assert hooked.initial is not None
+    m0, total0, acc0 = hooked.initial
+    return algebra.resumed(spec, family.rows_of(m0.at[rows]), family.rows_of(total0.at[rows]),
+                           family.tile_of(acc0.at[rows]), live=live)
+
+
+def _empty(family: mosaic.Family, shape: tuple[int, int], live: jax.Array | None) -> algebra.Partial:
+    """`algebra.started`'s empty state of a walk's `[bq, Dv]` sums (`shape`) in the family's layouts,
+    headroomed at the guard's `live` rows."""
+    rows = shape[0]
+    start = algebra.Partial(family.zeros(shape), family.full((rows,), -jnp.inf), family.zeros((rows,)))
+    return start if live is None else algebra.headroomed(start, live)
+
+
 def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_view, status_views, q_smem,
               q_loaded, out_smem, row_smem, streams, views: dict, turn, streamed: tuple, first,
               spans: _Spans | None, hooked: _Hooked, guard: _Guard | None, place: tuple, *, hooks: Hooks,
@@ -460,23 +478,12 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
     state_rows = (row, head, pl.ds(first, tiles.block_q))
     live = None if guard is None else family.rows_of(guard.live.at[state_rows]) > 0
 
-    def initial_state():
-        assert hooked.initial is not None
-        m0, total0, acc0 = hooked.initial
-        return algebra.resumed(spec, family.rows_of(m0.at[state_rows]), family.rows_of(total0.at[state_rows]),
-                               family.tile_of(acc0.at[state_rows]), live=live)
-
     # A plain inference walk starts empty and merges the initial state past its keys (`algebra.merge`): read
     # before the walk, the state's rows held live across it beside its products and the walk spilled 296
     # bytes at D128's 64 x 128 (the held-term census), where an empty start's are constants.
     merged = hooked.initial is not None and guard is None and residuals is None
-    if hooked.initial is not None and not merged:
-        start = initial_state()
-    else:
-        # `algebra.started`'s empty state, in the family's layouts.
-        start = algebra.Partial(family.zeros((tiles.block_q, value_width)),
-                                family.full((tiles.block_q,), -jnp.inf), family.zeros((tiles.block_q,)))
-        start = start if live is None else algebra.headroomed(start, live)
+    start = (_initial(family, spec, hooked, state_rows, live) if hooked.initial is not None and not merged
+             else _empty(family, (tiles.block_q, value_width), live))
     pl.when(consumer == 1)(turn)
 
     def scored(index, slots):
@@ -529,7 +536,7 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
     state, trained = family.walk_own(streams, views, (lo, hi), streamed, consumer, walked,
                                      between=lambda: (turn(), turn()))
     if merged:
-        state = algebra.merge(spec, initial_state(), state)
+        state = algebra.merge(spec, _initial(family, spec, hooked, state_rows, live), state)
     if residuals is not None:
         # The split sums as the walk left them, shift 0 (`algebra.split_residuals`' plain walk).
         family.stored((state.acc,), (residuals.others,), smem=out_smem)
