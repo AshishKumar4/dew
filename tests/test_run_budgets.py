@@ -1062,6 +1062,56 @@ def test_a_clocked_runs_cooldown_evaluation_records_the_examples_its_branch_cons
     assert all(validated[step] == trained[step] for step, _ in cooled)
 
 
+def test_each_split_evaluated_at_a_step_records_its_own_counts():
+    """Two splits of unequal size scored at one step each record the batches and records they read under
+    their own names (`evaluation/<split>/records`), so neither's count replaces the other's at that
+    step; a cooldown branch's suites, scored at the step it branched at, record theirs apart from the
+    run's own."""
+    from dew.training import Cooldowns
+
+    (x,) = clocked_records(0)
+    small = Pipeline(Memory({"x": x[:BATCH]})).batch(BATCH)
+    large = Pipeline(Memory({"x": x[:2 * BATCH]})).batch(BATCH)
+    tracker = RecordingTracker()
+    Trainer(Echoed(), OptimConfig(optimizer="adam", learning_rate=PEAK), key=0, tracker=tracker).fit(
+        clocked_chain(x), examples=CLOCKED_RECORDS, log_every=1, validation={"small": small, "large": large},
+        eval_every="50%", cooldowns=Cooldowns(at=("50%",), length=2))
+    counted = collections.defaultdict(list)
+    for step, scalars in tracker.scalars:
+        for name, value in scalars.items():
+            if name.endswith(("/records", "/coordinated_batches")):
+                counted[step, name].append(value)
+    assert counted and all(len(values) == 1 for values in counted.values())
+    found = {name: values[0] for (_, name), values in counted.items()}
+    assert found["evaluation/small/records"] == BATCH and found["evaluation/large/records"] == 2 * BATCH
+    assert found["evaluation/cooldown_large/coordinated_batches"] == 2
+
+
+def test_a_split_named_like_a_cooldowns_suite_is_the_runs_own():
+    """A split whose name begins as a cooldown branch's suites' do (`cooldown_`) is the run's own: scored
+    without a cooldown, it records the examples the run had consumed (`evaluation/examples_consumed`);
+    a run that branches into cooldowns refuses one named as a branch's suite of another split is, whose
+    scores the branch's would take at the step it branched at."""
+    from dew.training import Cooldowns
+
+    (x,) = clocked_records(0)
+    held = Pipeline(Memory({"x": x[:BATCH]})).batch(BATCH)
+    tracker = RecordingTracker()
+    trainer = Trainer(Echoed(), OptimConfig(optimizer="adam", learning_rate=PEAK), key=0, tracker=tracker)
+    trainer.fit(clocked_chain(x), examples=CLOCKED_RECORDS, log_every=1, validation={"cooldown_val": held},
+                eval_every="50%")
+    trained = {step: scalars["train/examples_consumed"] for step, scalars in tracker.scalars
+               if "train/loss" in scalars}
+    validated = [(step, scalars) for step, scalars in tracker.scalars if "cooldown_val/loss" in scalars]
+    assert validated and all(scalars["evaluation/examples_consumed"] == trained[step]
+                             and "cooldown/examples_consumed" not in scalars for step, scalars in validated)
+    refused = Trainer(Echoed(), OptimConfig(optimizer="adam", learning_rate=PEAK), key=0)
+    with pytest.raises(ValueError, match="cooldown_val"):
+        refused.fit(clocked_chain(x), examples=CLOCKED_RECORDS, eval_every="50%",
+                    validation={"val": held, "cooldown_val": held},
+                    cooldowns=Cooldowns(at=("50%",), length=2))
+
+
 def test_a_causal_windows_last_target_is_consumed_by_the_window_that_holds_it():
     """A document whose last token is the last target of the stream's final causal window is consumed by
     that window, the first that holds it, though the next window's stride would begin at it."""

@@ -152,8 +152,8 @@ def test_fit_trains_indexed_tokens_and_scores_its_independent_streamed_split(nam
         metrics=(Perplexity(),))
     scores = [scalars for _, scalars in tracker.scalars if "val/perplexity" in scalars]
     assert int(state.step) == 1 and scores
-    assert scores[-1]["evaluation/records"] == 17
-    assert scores[-1]["evaluation/coordinated_batches"] == 3
+    assert scores[-1]["evaluation/val/records"] == 17
+    assert scores[-1]["evaluation/val/coordinated_batches"] == 3
     assert np.isfinite(scores[-1]["val/perplexity"])
 
 
