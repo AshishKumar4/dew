@@ -541,12 +541,13 @@ def _query_key_views(call: _Call, keyed: tuple, served: tuple, memory: tuple, *,
         del operands["value_grads"]
     memory_row = (chunk * call.heads + first) * width + block * call.block
     vq = value_width if vq is None else vq
-    # Step `i` the `i`-th value head's columns from the split's, a value head's columns apart.
+    # Step `i` the `i`-th value head's columns from the split's, a value head's columns apart: the view from
+    # the first head's split to the last head's, `vq` blocks.
     columns, apart = first * value_width + split * vq, value_width // vq
     return {**_views(lambda i: (0, 0), queries=given.views(q_ref, row, CHUNK, key_columns, call.block),
                      keys=given.views(k_ref, row, CHUNK, key_columns, call.block)),
             **_views(lambda i: (0, i * apart),
-                     **{name: operand.views(ref, row, CHUNK, columns, group * value_width - split * vq)
+                     **{name: operand.views(ref, row, CHUNK, columns, (group - 1) * value_width + vq)
                         for name, (operand, ref) in operands.items()}),
             **_views(lambda i: (i * (width // call.block), 0),
                      **{name: memories.views(ref, memory_row, group * width, split * vq, vq)
@@ -639,12 +640,12 @@ def _query_key_launched(call: _Call, vq: int) -> tuple[dict, tuple]:
                       **({"value_grads": ((CHUNK, vq), held)} if call.delta else {}),
                       entered=((call.block, vq), memories),
                       leaving=((call.block, vq), memories), ds=((CHUNK, CHUNK), _score_grads(call)))
-    keyed_out = jax.ShapeDtypeStruct((splits, call.rows, call.heads // call.group * width), jnp.float32)
-    terms = jax.ShapeDtypeStruct((splits, width // call.block, call.heads, call.rows), jnp.float32)
+    keyed_out = jax.ShapeDtypeStruct((call.rows, splits * call.heads // call.group * width), jnp.float32)
+    terms = jax.ShapeDtypeStruct((splits * width // call.block, call.heads, call.rows), jnp.float32)
     weights = (dataclasses.replace(held, rows=call.rows).shape(call.heads * width) if splits == 1
-               else jax.ShapeDtypeStruct((splits, call.rows, call.heads * width), jnp.float32))
+               else jax.ShapeDtypeStruct((call.rows, splits * call.heads * width), jnp.float32))
     return tiles, (keyed_out, keyed_out, weights, terms, terms,
-                   jax.ShapeDtypeStruct((splits, width // call.block, call.heads, call.chunks * call.block),
+                   jax.ShapeDtypeStruct((splits * width // call.block, call.heads, call.chunks * call.block),
                                         jnp.float32))
 
 
@@ -669,6 +670,7 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: _C
     grads = _score_grads(call)
     vq = _query_key_split(call)
     splits, blocks, group = value_width // vq, vq // call.block, call.group
+    keyed_width, key_blocks = call.heads // group * width, width // call.block
 
     def program(q_ref, k_ref, v_ref, do_ref, dv_ref, h_ref, dh_ref, ds_ref, hi_ref, lo_ref, taken_ref,
                 beta_ref, dq_ref, dk_ref, dw_ref, after_ref, leaving_ref, memory_ref, *, streams, staging,
@@ -700,12 +702,14 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: _C
             ending, ending_low = (jnp.full((CHUNK,), ref[h, last]) for ref in (hi_ref, lo_ref))
             first_head = index == 0
 
-            columns = pl.ds(key_columns, call.block)
-            sums = {"dq": dq_ref.at[split, span, columns], "dk": dk_ref.at[split, span, columns]}
+            # Each split's sums its own, a split's columns after another's.
+            columns = pl.ds(split * keyed_width + key_columns, call.block)
+            sums = {"dq": dq_ref.at[span, columns], "dk": dk_ref.at[span, columns]}
+            weights_at = h * width + c * call.block
             stored = functools.partial(
                 _gradient_stored, call,
-                weights=(held.views(dw_ref, row, CHUNK, h * width + c * call.block, call.block) if splits == 1
-                         else [dw_ref.at[split, span, pl.ds(h * width + c * call.block, call.block)]]),
+                weights=(held.views(dw_ref, row, CHUNK, weights_at, call.block) if splits == 1 else
+                         [dw_ref.at[span, pl.ds(split * call.heads * width + weights_at, call.block)]]),
                 sums=sums, first=first_head, landing=landing, apart=splits > 1)
 
             issue = Issuer(call)
@@ -726,16 +730,17 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: _C
                         family.store_wait(0)
                         family.added(issue("scores_dq", lhs, rhs), sums[kind], call.interpret,
                                      smem=landing["sums"])
-            after_ref.at[split, c, h, span][...] = after
-            leaving_ref.at[split, c, h, span][...] = leaving
+            after_ref.at[split * key_blocks + c, h, span][...] = after
+            leaving_ref.at[split * key_blocks + c, h, span][...] = leaving
             # `sum(S dS)` over the block's rows, read here rather than both memories again: where products
             # read registers (mma.sync's), each value block's `S^T dS` diagonal, a product of the memories
             # as they lie in shared memory (their elementwise product held two fp32 tiles beside the step's
             # fragments, past an A100's 255 registers); where they read shared memory, that elementwise
             # product (the product's accumulator spilled 44 bytes a thread on an H100's).
-            memory_ref.at[split, c, h, pl.ds(n * call.block, call.block)][...] = functools.reduce(jnp.add, (
+            traced = functools.reduce(jnp.add, (
                 _memory_sum(call, issue, column("entered", memories, j), column("leaving", memories, j))
                 for j in range(blocks)))
+            memory_ref.at[split * key_blocks + c, h, pl.ds(n * call.block, call.block)][...] = traced
             # The step's reduce-adds ('dq', 'dk', `Family.added`) waited on by design, not by 'dw''s store
             # being emitted after them: Mosaic GPU waits on no copy at a kernel's exit (template numerics
             # review 2026-10-26, P3-4).
@@ -761,8 +766,10 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: _C
                  else ((CHUNK, call.block), jnp.float32), "sums": ((CHUNK, call.block), jnp.float32)})(
         q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta)
     # The splits' own sums added (one split's, as they are, where a program takes every value column).
-    dq, dk, after, leaving, memory = (x.sum(0) for x in (dq, dk, after, leaving, memory))
-    return dq, dk, dw if splits == 1 else held.split(dw.sum(0)), after, leaving, memory
+    if splits > 1:
+        dq, dk, dw = (x.reshape(call.rows, splits, -1).sum(1) for x in (dq, dk, dw))
+    after, leaving, memory = (x.reshape(splits, -1, *x.shape[1:]).sum(0) for x in (after, leaving, memory))
+    return dq, dk, dw if splits == 1 else held.split(dw), after, leaving, memory
 
 
 def _value_grads(call: _Call) -> _Operand:
