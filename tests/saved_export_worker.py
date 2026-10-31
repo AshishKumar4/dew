@@ -99,7 +99,53 @@ def exported(args) -> dict:
             "largest_leaf": max(leaf.nbytes for leaf in leaves)}
 
 
-MODES = {"exported": exported}
+def scoped_peaks(modules) -> list[dict]:
+    """Each `reading_home` scope the export opens (`dew.interop.saved_sources`), as it closes: the peak
+    of the host's allocations inside it (`tracemalloc`) and whether its writer wrote weights."""
+    import contextlib
+    import tracemalloc
+
+    from dew import _coordination
+
+    scopes: list[dict] = []
+    opened = modules.reading_home
+
+    @contextlib.contextmanager
+    def measured(phase, **options):
+        tracemalloc.start()
+        try:
+            with opened(phase, **options):
+                writes = _coordination.writes_weights()
+                yield
+        finally:
+            scopes.append({"peak": tracemalloc.get_traced_memory()[1], "writes": writes})
+            tracemalloc.stop()
+
+    modules.reading_home = measured
+    return scopes
+
+
+def released(args) -> dict:
+    """A saved run's release read through `released_run` over a cache the pool shares, which writes it
+    once, and its export through `dew export` to a destination the pool shares."""
+    import jax
+
+    from dew.cli.main import main
+    from dew.interop import saved_sources
+
+    scopes = scoped_peaks(saved_sources)
+    release = saved_sources.released_run(args.run_dir)
+    read = list(scopes)
+    scopes.clear()
+    destination = Path(args.run_dir).parent / "exported"
+    code = main(["export", args.run_dir, str(destination)])
+    return {"processes": jax.process_count(), "rank": jax.process_index(), "release": str(release),
+            "export_code": code,
+            "release_files": digests(Path(release)), "read": read, "exported": list(scopes),
+            "export_files": digests(destination)}
+
+
+MODES = {"exported": exported, "released": released}
 
 
 def main(argv=None) -> None:

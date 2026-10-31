@@ -46,6 +46,7 @@ from dew.training.compiled_program import (
     dimensions,
     lowering_platform,
 )
+from dew.training.memory import judged
 from dew.training.narrow import forward_variables
 from dew.training.transaction import attempt_step
 
@@ -524,12 +525,13 @@ def candidate_footprint[LossT, EffectsT](objective: Objective[LossT, EffectsT],
     `row_axes`) the residuals are one device's: the loss traced as one device's step, over a mesh of the
     run's axes each of one device, at that device's share of the microbatch (each leaf's shard,
     `shard_shape`), its parameters whole as those layouts gather them. A layout that splits more than the
-    rows (stages, tensor, sequence) derives no residuals, which its compile judges."""
+    rows (stages, tensor, sequence) derives no residuals, which its compile judges, nor does a step for a
+    device whose memory nothing judges (`judged`: a CPU), as its walk ends unknown whatever it derives."""
     mesh = jax.sharding.get_abstract_mesh()
     spread = set() if mesh.empty else {name for name, size in mesh.shape.items() if size > 1}
     # Data and fully sharded data parallelism split the rows alone; an expert axis splits the experts too.
     rows = set(row_axes(rows_of(micro), mesh=mesh)) & {DATA_AXIS, FSDP_AXIS} if spread else set()
-    if not spread <= rows:
+    if not spread <= rows or not judged(target):
         residuals = peak = None
     else:
         loss, (variables, *rest) = traced_loss(objective, prepared, window, split)

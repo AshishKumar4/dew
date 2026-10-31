@@ -1723,3 +1723,21 @@ def test_a_config_of_a_type_transformers_lacks_reads_its_layers_by_its_familys_c
     config = json.loads((FIXTURES / "dream-tiny" / "config.json").read_text())
     assert translate_config({**config, "head_dim": None}) == translate_config(
         {name: value for name, value in config.items() if name != "head_dim"})
+
+
+def test_a_decoder_of_the_default_feed_forward_width_exports(tmp_path):
+    """A decoder that leaves its feed-forward width unstated computes four times its residual's, which its
+    export states, so the export reads back the model it was (`refuse_lossy_export`, ledger 3065): its
+    logits after a round trip are its own."""
+    from dew.interop.pretrained import Pretrained, PretrainedDecoder
+    from dew.registry import models
+
+    model = models.build("causal_transformer", vocab_size=64, emb_features=32, num_layers=2, num_heads=4,
+                         max_seq_len=16, dtype="float32")
+    assert model.mlp_features is None
+    variables = model.init(jax.random.key(0), jnp.ones((1, 4), jnp.int32))
+    PretrainedDecoder.from_model(model, variables).save(tmp_path)
+    back = Pretrained.load(tmp_path, dtype="float32")
+    ids = jnp.arange(8, dtype=jnp.int32)[None]
+    np.testing.assert_array_equal(np.asarray(back.model.apply(back.variables, ids)),
+                                  np.asarray(model.apply(variables, ids)))
