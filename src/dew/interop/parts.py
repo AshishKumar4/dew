@@ -521,6 +521,23 @@ def _read_nope_attention(view: PartView) -> Mapping[str, object]:
     return {**_read_attention(view), _LAYER: {'nope': not bool(view.use_rope)}}
 
 
+def _read_projection_qk_norm_attention(view: PartView) -> Mapping[str, object]:
+    """OLMo 2's attention: Llama's with an RMSNorm over the whole query and key projections, before the
+    heads split (`qk_norm_scope='projection'`, OLMo 3's)."""
+    return {**_read_attention(view), 'qk_norm': True, 'qk_norm_scope': 'projection'}
+
+
+def _read_output_normed_layer(view: PartView) -> Mapping[str, object]:
+    """OLMo 2's layer: each sublayer's output normed before it joins the residual, its input not
+    (`sandwich_norms` without `pre_norms`, OLMo 3's)."""
+    return {'sandwich_norms': True, 'pre_norms': False}
+
+
+def _read_scale_first_norm(view: PartView) -> Mapping[str, object]:
+    """OLMo 2's RMSNorm: its weight times the normalized input in float32, cast after."""
+    return {'norm_eps': float(view.variance_epsilon), 'scale_after_cast': False, 'scale_offset': False}
+
+
 def _read_mlp(view: PartView) -> Mapping[str, object]:
     return {'mlp': gated_activation(view.act_fn), 'mlp_features': view.gate_proj.out_features,
             'mlp_bias': _biased(view.gate_proj, view.up_proj, view.down_proj)}
@@ -607,6 +624,7 @@ _MISTRAL = 'transformers.models.mistral.modeling_mistral'
 _QWEN2 = 'transformers.models.qwen2.modeling_qwen2'
 _GRANITE = 'transformers.models.granite.modeling_granite'
 _SMOLLM3 = 'transformers.models.smollm3.modeling_smollm3'
+_OLMO2 = 'transformers.models.olmo2.modeling_olmo2'
 Children = Mapping[str, tuple[str, ...]]
 _MODEL_CHILDREN: Children = {'embed_tokens': ('embedding',), 'layers': ('layers',), 'norm': ('norm',),
                              'rotary_emb': ('rotary',)}
@@ -630,10 +648,16 @@ KNOWN: tuple[KnownPart, ...] = (
     KnownPart('layer', f'{_LLAMA}:LlamaDecoderLayer', _LAYER_CHILDREN, _read_nothing),
     KnownPart('layer', f'{_MIXTRAL}:MixtralDecoderLayer', _LAYER_CHILDREN, _read_nothing),
     KnownPart('layer', f'{_GRANITE}:GraniteDecoderLayer', _LAYER_CHILDREN, _read_scaled_layer),
+    KnownPart('layer', f'{_OLMO2}:Olmo2DecoderLayer',
+              {'self_attn': ('attention',), 'mlp': ('mlp', 'moe'), 'post_attention_layernorm': ('norm',),
+               'post_feedforward_layernorm': ('norm',)}, _read_output_normed_layer),
     KnownPart('attention', f'{_LLAMA}:LlamaAttention', _ATTENTION_CHILDREN, _read_attention),
     KnownPart('attention', f'{_MIXTRAL}:MixtralAttention', _ATTENTION_CHILDREN, _read_attention),
     KnownPart('attention', f'{_QWEN2}:Qwen2Attention', _ATTENTION_CHILDREN, _read_attention),
     KnownPart('attention', f'{_SMOLLM3}:SmolLM3Attention', _ATTENTION_CHILDREN, _read_nope_attention),
+    KnownPart('attention', f'{_OLMO2}:Olmo2Attention',
+              {**_ATTENTION_CHILDREN, 'q_norm': ('norm',), 'k_norm': ('norm',)},
+              _read_projection_qk_norm_attention),
     KnownPart('attention', f'{_QWEN3}:Qwen3Attention',
          {**_ATTENTION_CHILDREN, 'q_norm': ('norm',), 'k_norm': ('norm',)}, _read_qk_norm_attention),
     KnownPart('mlp', f'{_LLAMA}:LlamaMLP', dict.fromkeys(('gate_proj', 'up_proj', 'down_proj'), ('linear',)),
@@ -649,8 +673,10 @@ KNOWN: tuple[KnownPart, ...] = (
     KnownPart('experts', f'{_MIXTRAL}:MixtralExperts', {}, _read_experts, ('gate_up_proj', 'down_proj')),
     KnownPart('norm', f'{_LLAMA}:LlamaRMSNorm', {}, _read_rms_norm, ('weight',)),
     KnownPart('norm', f'{_GEMMA}:GemmaRMSNorm', {}, _read_offset_norm, ('weight',)),
+    KnownPart('norm', f'{_OLMO2}:Olmo2RMSNorm', {}, _read_scale_first_norm, ('weight',)),
     KnownPart('rotary', f'{_LLAMA}:LlamaRotaryEmbedding', {}, _read_rotary, whole=True),
     KnownPart('rotary', f'{_QWEN2}:Qwen2RotaryEmbedding', {}, _read_rotary, whole=True),
+    KnownPart('rotary', f'{_OLMO2}:Olmo2RotaryEmbedding', {}, _read_rotary, whole=True),
     KnownPart('embedding', 'torch.nn:Embedding', {}, _read_embedding, ('weight',)),
     KnownPart('embedding', f'{_GEMMA}:GemmaTextScaledWordEmbedding', {}, _read_scaled_embedding, ('weight',)),
     KnownPart('linear', 'torch.nn:Linear', {}, _read_nothing, ('weight', 'bias')),
