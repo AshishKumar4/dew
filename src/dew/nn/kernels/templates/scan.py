@@ -118,8 +118,8 @@ def _to_striped(x: fa.FragmentedArray, staged):
 
 
 def summed(values: jax.Array, exchanged, *, interpret: bool = False) -> jax.Array:
-    """The sum of `values`, fp32 `[T]` in `blocked(T)`'s layout, a scalar: a thread's positions in its
-    registers, its warp's by shuffles, the four warps' through `exchanged` (`scratch()`'s)."""
+    """The sum of `values`, fp32 `[T]` in `blocked(T)`'s layout, a scalar (`FragmentedArray.reduce`), its
+    warps' aggregates through `exchanged` (`scratch()`'s)."""
     positions = values.shape[0]
     if interpret:
         return values.sum()
@@ -131,28 +131,9 @@ def summed(values: jax.Array, exchanged, *, interpret: bool = False) -> jax.Arra
 
 
 def _summed(x: fa.FragmentedArray, exchanged):
-    """`summed` in Mosaic GPU's terms."""
-    index, i32 = ir.IndexType.get(), ir.IntegerType.get_signless(32)
-    [vec] = x.registers.flat
-    count = ir.VectorType(vec.type).shape[0]
-    total = vector.extract(vec, [], [0])
-    for i in range(1, count):
-        total = arith.addf(total, vector.extract(vec, [], [i]))
-    for distance in (16, 8, 4, 2, 1):
-        total = arith.addf(total, utils.shfl_bfly(total, distance))
-    thread = arith.remui(utils.thread_idx(), arith.constant(i32, THREADS))
-    warp = arith.index_cast(index, arith.divui(thread, arith.constant(i32, WARP)))
-    utils.warpgroup_barrier()
-    with utils.when(arith.cmpi(arith.CmpIPredicate.eq, arith.remui(thread, arith.constant(i32, WARP)),
-                               arith.constant(i32, 0))):
-        memref.store(total, exchanged, [arith.constant(index, 0), warp])
-    utils.warpgroup_barrier()
-    total = memref.load(exchanged, [arith.constant(index, 0), arith.constant(index, 0)])
-    for w in range(1, THREADS // WARP):
-        column = [arith.constant(index, 0), arith.constant(index, w)]
-        total = arith.addf(total, memref.load(exchanged, column))
-    utils.warpgroup_barrier()
-    return fa.FragmentedArray.splat(total, ())
+    """`summed` in Mosaic GPU's terms: the array's own reduction, its warps' aggregates through a row of
+    `exchanged`."""
+    return x.reduce("add", 0, utils.memref_slice(exchanged, 0))
 
 
 def _interpreted(decays, writes, carried, reverse: bool, exclusive: bool):

@@ -1395,12 +1395,14 @@ def _ssd_ported(x, dt, A, B, C, D, state, chunk_size: int, starts):
 @dataclasses.dataclass(frozen=True)
 class SelectiveCase:
     """A selective scan (Mamba's, `dew.nn.mixers.mamba.selective_scan`) as its selector reads it
-    (`SELECTIVE`): whether a shard_map that checks varying axes holds its operands, its operands' dtype,
+    (`SELECTIVE`): whether a shard_map that checks varying axes holds its operands, its operands' dtype and
+    its states' rows' (B's and C's),
     its tokens, channels and states, its device's instruction family (None off a GPU) and the
     `product`."""
 
     varying: bool
     dtype: np.dtype
+    state_dtype: np.dtype
     length: int
     channels: int
     states: int
@@ -1441,9 +1443,9 @@ SELECTIVE_SUPPORTS: tuple[Requirement[SelectiveCase], ...] = (
     Requirement('states', lambda case: case.states <= SELECTIVE_STATES,
                 lambda case: f"{case.states} states, past the {SELECTIVE_STATES} a thread's registers hold "
                              "three times", row='ledger 1300'),
-    Requirement('state rows', lambda case: case.states * case.dtype.itemsize % COPY_BYTES == 0,
-                lambda case: f"{case.states} states of {case.dtype}, a B or C row of no whole number of a "
-                             f"bulk copy's {COPY_BYTES} bytes, which its streams copy unpadded",
+    Requirement('state rows', lambda case: case.states * case.state_dtype.itemsize % COPY_BYTES == 0,
+                lambda case: f"{case.states} states of {case.state_dtype}, a B or C row of no whole number "
+                             f"of a bulk copy's {COPY_BYTES} bytes, which its streams copy unpadded",
                 row='ledger 1300'),
     Requirement('tokens', lambda case: case.length >= SELECTIVE_CHUNK,
                 lambda case: f"{case.length} tokens, fewer than a chunk of {SELECTIVE_CHUNK}: a decode "
@@ -1481,7 +1483,7 @@ template's forward took 0.759 ms at 8x2048x5120 against mamba_ssm's 1.322, its t
 against mamba_ssm's 7.21 (mamba1-two-h100-e3b43f7d6)."""
 
 
-def selective_kernel(x, A, *, product: str = 'forward', report: bool = True) -> str:
+def selective_kernel(x, A, B, *, product: str = 'forward', report: bool = True) -> str:
     """The kernel the selective scan's selector (`SELECTIVE`) gives a scan over `x` `[B, S, D]` with rates
     `A` `[D, N]` for `product` ('forward', 'training'), on the target: reported as its route, or not where
     not `report`."""
@@ -1492,6 +1494,7 @@ def selective_kernel(x, A, *, product: str = 'forward', report: bool = True) -> 
     bundled = on_gpu and bundles.of(generation.device_generation(), x.dtype) is not None
     family = generation.family(generation.device_generation()) if bundled else None
     case = SelectiveCase(varying=bool(jax.typeof(x).mat.varying), dtype=jnp.dtype(x.dtype),
+                         state_dtype=jnp.dtype(jnp.result_type(B)),
                          length=x.shape[1], channels=x.shape[-1], states=A.shape[-1], family=family,
                          product=product)
     return select(SELECTIVE, case).kernel if report else selected(SELECTIVE, case).name
@@ -1524,5 +1527,5 @@ def selective_scan(x, dt, A, B, C, D, state, starts, *, portable: Callable):
         specs = (three, three, P(None, None), three, three, P(None), three, P(rows, None))
         return manual_map(template, specs[:len(operands)], (three, three))(*operands)
 
-    return _per_product(lambda product: selective_kernel(x, A, product=product), run, x, dt, A, B, C, D,
+    return _per_product(lambda product: selective_kernel(x, A, B, product=product), run, x, dt, A, B, C, D,
                         state)

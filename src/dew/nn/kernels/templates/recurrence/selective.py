@@ -21,6 +21,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
+from dew.nn.kernels import tuning
 from dew.nn.kernels.templates import mosaic, scan as block_scan
 from dew.nn.kernels.templates.recurrence import mainloop
 
@@ -37,7 +38,8 @@ class Scan:
     """A selective scan's geometry: `rows` sequences of `length` tokens (a whole number of `chunk`s) of
     `channels` channels and `states` states each, `block` channels a program, on `family`'s Mosaic GPU
     mainloop (interpreted where `interpret`); `packed` where tokens reset their state (a document's first),
-    `entered` where each chunk's entering state is kept for the backward."""
+    `entered` where the entering state of each chunk opening a backward block (`block_positions`) is kept
+    for the backward, which starts its blocks from them."""
 
     rows: int
     length: int
@@ -53,6 +55,11 @@ class Scan:
     @property
     def chunks(self) -> int:
         return self.length // self.chunk
+
+    @property
+    def opening(self) -> int:
+        """The chunks a backward block takes, its first's entering state the forward keeps (`entered`)."""
+        return block_positions(self.length) // self.chunk
 
     @property
     def blocks(self) -> int:
@@ -78,12 +85,15 @@ PARAMETER_ROWS = 8
 rows come in."""
 
 
+@tuning.lowered_once(("scan",))
 def forward(x, dt, b, c, parameters, state, resets, scan: Scan):
     """The scan's outputs from padded operands: `x`, `dt` `[R, T, D]`, `b`, `c` `[R, T, N]`, `parameters`
     `[N + PARAMETER_ROWS, D]` fp32 (the rates `A log2(e)` transposed, then the skip `D`), `state` `[R, N, D]`
     fp32 and `resets` `[R, T, RESET_WIDTH]` int8 (a token's flag in every column; ignored unless
     `scan.packed`). Returns `y` `[R, T, D]` in `x`'s dtype, the final state `[R, N, D]` fp32 and, with
-    `scan.entered`, each chunk's entering state `[R, chunks, N, D]` fp32 (None without)."""
+    `scan.entered`, the entering state of each chunk opening a backward block `[R, chunks / opening, N, D]`
+    fp32 (`Scan.opening`; None without): every chunk's, at 2048-token blocks of 32-token chunks, kept 64
+    times what the backward reads (4.3 GB at Falcon 7B's step, 2970)."""
     family, chunk, block, states = scan.family, scan.chunk, scan.block, scan.states
     blocks = {"x": ((chunk, block), x.dtype), "dt": ((chunk, block), dt.dtype),
               "b": ((chunk, states), b.dtype), "c": ((chunk, states), c.dtype)}
@@ -97,7 +107,8 @@ def forward(x, dt, b, c, parameters, state, resets, scan: Scan):
     out_type = [jax.ShapeDtypeStruct(x.shape, x.dtype),
                 jax.ShapeDtypeStruct((scan.rows, states, scan.channels), jnp.float32)]
     if scan.entered:
-        out_type.append(jax.ShapeDtypeStruct((scan.rows, scan.chunks, states, scan.channels), jnp.float32))
+        kept = -(-scan.chunks // scan.opening)
+        out_type.append(jax.ShapeDtypeStruct((scan.rows, kept, states, scan.channels), jnp.float32))
 
     def entry(x_ref, dt_ref, b_ref, c_ref, parameters_ref, state_ref, resets_ref, y_ref, final_ref,
               *entered_ref):
@@ -131,8 +142,11 @@ def forward(x, dt, b, c, parameters, state, resets, scan: Scan):
 
                 def step(index, slots, h, accumulators):
                     if scan.entered:
-                        family.stored(list(h), [entered_ref[0].at[row, index, n, columns]
-                                                for n in range(states)], smem=state_smem)
+                        @pl.when(index % scan.opening == 0)
+                        def _():
+                            kept = index // scan.opening
+                            family.stored(list(h), [entered_ref[0].at[row, kept, n, columns]
+                                                    for n in range(states)], smem=state_smem)
                     xs, dts, bs, cs = (slots[name] for name in ("x", "dt", "b", "c"))
                     resets = slots["resets"] if scan.packed else None
 
@@ -193,9 +207,10 @@ def block_positions(length: int) -> int:
     return min(threads * POSITIONS_PER_THREAD, -(-length // threads) * threads)
 
 
+@tuning.lowered_once(("scan",))
 def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan):
     """The scan's gradients from `forward`'s operands, channels leading: `x`, `dt`, `dy` `[R, D, T]`, `b`,
-    `c` `[R, N, T]`, `parameters` (`forward`'s), its chunks' entering states `entered` `[R, chunks, N, D]`
+    `c` `[R, N, T]`, `parameters` (`forward`'s), its blocks' entering states `entered` `[R, blocks, N, D]`
     fp32, `resets` `[R, T]` int8 and the final state's cotangent `dfinal` `[R, N, D]` fp32, `T` a whole
     number of blocks (`block_positions`). Returns `(dx, ddt [R, D, T], db, dc [R, N, T], dA [R, N, D],
     dD [R, D], dstate [R, N, D])`, fp32.
@@ -211,7 +226,7 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan):
     block's tokens across the threads so a warp's adds are adjacent (cub's BlockedToStriped)."""
     rows, channels, length = x.shape
     states, positions = b.shape[1], block_positions(length)
-    blocks, per = length // positions, positions // scan.chunk
+    blocks = length // positions
     interpret = scan.interpret
     layout = block_scan.blocked(positions)
 
@@ -244,7 +259,7 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan):
                 bs, cs = load(b_ref.at[row, n, span]), load(c_ref.at[row, n, span])
                 a = jnp.exp2(dts * rate) if kept is None else jnp.exp2(dts * rate) * kept
                 written = dts * xs * bs
-                entering = entered_ref[row, k * per, n, channel]
+                entering = entered_ref[row, k, n, channel]
                 before, _ = block_scan.linear_scan(a, written, entering, exchanged, exclusive=True,
                                                    interpret=interpret)
                 read = cs * dys
