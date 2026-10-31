@@ -348,8 +348,8 @@ class MosaicForward(_Mainloop[Tiles]):
         query, value = ba.arguments["query"], ba.arguments["value"]
         natural = config.natural_form or self._natural(ba.arguments["query"])
         value_width = config.columns or _width(value.shape[-1], family, query.dtype)
-        params = tuple(zip(self.score_kinds, (param.dtype for param in ba.arguments["score_params"]),
-                           strict=True))
+        params = tuple(zip(self.score_kinds,
+                           (kept_dtype(param.dtype) for param in ba.arguments["score_params"]), strict=True))
         return _forward_registers(family, config, value_width, query.dtype,
                                   ba.arguments.get("residuals") is Kept.SPLIT, natural=natural, params=params)
 
@@ -367,9 +367,10 @@ def _hook_live(family: mosaic.Family, block_q: int, block_k: int, params: tuple,
                keys_first: bool = False) -> tuple[list, int]:
     """A step's score-hook parameters (`params`, each its `Kind` and dtype), live beside its logits: a
     TILE's `[bq, bk]` tile, a KEY's vector in the accumulator's column layout and a QUERY's in its row
-    layout (`Family.column_registers`, `row_registers`); a HEAD's scalar no tile. With `grads`, a backward
-    launch's gradients of them too, fp32: a TILE's tile a step, and carried across its walk a KEY's in the
-    dK/dV launch (`grads="keys"`), a QUERY's in the dQ launch (`grads="queries"`). A `keys_first` step's
+    layout (`Family.column_registers`, `row_registers`); a HEAD's scalar no tile; each in the dtype its kernel
+    loads it (`kept_dtype`). With `grads`, a backward launch's gradients of them too, fp32, where it forms
+    them: a TILE's tile a step and a KEY's carried across its walk in the dK/dV launch (`grads="keys"`), a
+    QUERY's carried in the dQ launch (`grads="queries"`, `DQ_GRADS`). A `keys_first` step's
     tile lays its keys along its rows, so a KEY's vector is in the row layout and a QUERY's in the column.
     Returns the step's tiles and the vectors' registers."""
     keys, queries = ((family.row_registers, family.column_registers) if keys_first
@@ -377,7 +378,8 @@ def _hook_live(family: mosaic.Family, block_q: int, block_k: int, params: tuple,
     step, vectors = [], 0
     for kind, dtype in params:
         if kind is Kind.TILE:
-            step += [(block_q, block_k, dtype)] + ([(block_q, block_k, jnp.float32)] if grads else [])
+            grad = [(block_q, block_k, jnp.float32)] if grads == "keys" else []
+            step += [(block_q, block_k, dtype), *grad]
         elif kind is Kind.KEY:
             vectors += keys(block_k, dtype) + (keys(block_k, jnp.float32) if grads == "keys" else 0)
         elif kind is Kind.QUERY:
@@ -792,8 +794,8 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
             family = bundle_of(tiles, query.dtype)
             width, value_width = (_width(array.shape[-1], family, query.dtype) for array in (query, value))
             split = split_queries(family) and not config.queries_first
-            params = tuple(zip(self.score_kinds, (param.dtype for param in ba.arguments["score_params"]),
-                               strict=True))
+            params = tuple(zip(self.score_kinds, (kept_dtype(param.dtype)
+                                                  for param in ba.arguments["score_params"]), strict=True))
             counts.append(_backward_registers(family, tiles, width, value_width, query.dtype,
                                               accurate=self.accurate, dq=dq, split=split, params=params,
                                               slopes=self.score_slopes))

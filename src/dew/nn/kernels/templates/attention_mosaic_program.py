@@ -331,9 +331,31 @@ def _score_places(score_mod, params: tuple) -> tuple[bool, bool]:
     """`score_places` of `score_mod` under parameters of `params`' kinds and dtypes."""
     side = TILE_SIDES[0]
     jaxpr = _score_jaxprs(score_mod, params, (side, side), differentiated=False)[0]
-    read = [*jaxpr.outvars, *(var for eqn in jaxpr.eqns for var in eqn.invars)]
-    queries, keys = jaxpr.invars[1:3]
-    return any(var is queries for var in read), any(var is keys for var in read)
+    _, queries, keys, *_ = _live_inputs(jaxpr, [True] * len(jaxpr.outvars))
+    return queries, keys
+
+
+def _live_inputs(jaxpr: jax_core.Jaxpr, live_outputs: list[bool]) -> list[bool]:
+    """Which of `jaxpr`'s inputs its `live_outputs` surely read: through each equation whose outputs are live,
+    into a call's own jaxpr input by input (a jitted helper's, a custom derivative's primal); an equation of
+    any other nested computation (a branch's, a loop's) surely reads none, a place it may read left a tile
+    (`_coords`)."""
+    live = {var for var, used in zip(jaxpr.outvars, live_outputs, strict=True)
+            if used and not isinstance(var, jax_core.Literal)}
+    for eqn in reversed(jaxpr.eqns):
+        used = [var in live for var in eqn.outvars]
+        if not any(used):
+            continue
+        nested = list(jax_core.jaxprs_in_params(eqn.params))
+        called = [inner for name in ("jaxpr", "call_jaxpr") if (inner := eqn.params.get(name)) is not None]
+        inner = getattr(called[0], "jaxpr", called[0]) if called else None
+        if isinstance(inner, jax_core.Jaxpr) and len(inner.invars) == len(eqn.invars) and len(nested) == 1:
+            reads = _live_inputs(inner, used)
+        else:
+            reads = [not nested] * len(eqn.invars)
+        live.update(var for var, read in zip(eqn.invars, reads, strict=True)
+                    if read and not isinstance(var, jax_core.Literal))
+    return [var in live for var in jaxpr.invars]
 
 
 def varying_slopes(hooks: Hooks | None) -> int:

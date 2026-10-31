@@ -406,12 +406,13 @@ class _Residuals(NamedTuple):
 
 
 def _scored(program: _Program, spec: algebra.Forward, q, index, slots, first, spans: _Spans | None,
-            hooked: _Hooked, place: tuple, whole, turn, *, hooks: Hooks) -> tuple:
+            hooked: _Hooked, place: tuple, whole, turn, *, hooks: Hooks, drawn: bool) -> tuple:
     """A key tile's first key, coordinates and logits under the score hook (batch row and head `place`, its
     queries from `first`), and their products where the logits are a factor of them (`algebra.logits_of`),
     every walk's (`_consumer`'s, `_peak_consumer`'s), so a peak walk's logits are the training walk's to the
-    bit. A tile every query sees whole takes no mask: one walk, the choice a tile's (a walk of each, these
-    rings' waits and arrivals in two loops, faulted on an H100 under jax 0.11.2's lowering)."""
+    bit; its places read by the walk's dropout where it draws it (`drawn`). A tile every query sees whole
+    takes no mask: one walk, the choice a tile's (a walk of each, these rings' waits and arrivals in two
+    loops, faulted on an H100 under jax 0.11.2's lowering)."""
     row, head = place
     family, tiles = program.family, program.tiles
     shape = (tiles.block_q, tiles.block_k)
@@ -420,7 +421,7 @@ def _scored(program: _Program, spec: algebra.Forward, q, index, slots, first, sp
     k_first = index * tiles.block_k
     # The tile's places formed a step, not held across the walk beside its sums (`_coords`).
     # Its mask chosen at run time (`whole`): the masked tile's reads.
-    read = algebra.places_read(spec, masked=True, hooked=score_places(hooks), dropped=hooked.drop is not None,
+    read = algebra.places_read(spec, masked=True, hooked=score_places(hooks), dropped=drawn,
                                padded=spec.keys % tiles.block_k != 0)
     coords = _coords(family, spans, row, first, k_first, shape, read=read,
                      draw=None if hooked.drop is None else hooked.drop.draw(row, head))
@@ -488,7 +489,7 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
 
     def scored(index, slots):
         return _scored(program, spec, q, index, slots, first, spans, hooked, (row, head), whole, turn,
-                       hooks=hooks)
+                       hooks=hooks, drawn=hooked.drop is not None)
 
     def value_of(slots):
         # The value slot, once the partner's products are issued: its turn on the tensor cores is over when
@@ -618,8 +619,9 @@ def _peak_consumer(program: _Program, spec: algebra.Forward, consumer, q_view, p
     pl.when(consumer == 1)(turn)
 
     def step(index, slots, arg, accumulators):
+        # The peak walk's logits draw no dropout.
         _, coords, logits, _ = _scored(program, spec, q, index, slots, first, spans, hooked, place, whole,
-                                       turn, hooks=hooks)
+                                       turn, hooks=hooks, drawn=False)
         # The partner's turn, as a training step's value product would take it.
         turn(wait=False)
         turn(arrive=False)
