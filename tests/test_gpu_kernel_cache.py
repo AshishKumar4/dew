@@ -1,4 +1,4 @@
-"""A training restart shares native artifacts without reviving a refused spilling launch."""
+"""A training restart over a shared compilation cache steps down past a spilling launch again."""
 
 import pytest
 from generation_support import lowers
@@ -11,5 +11,5 @@ pytestmark = pytest.mark.gpu(reason="three H100 training processes share a nativ
 
 
 @lowers("sm90")
-def test_a_training_restart_runs_the_stepped_native_artifact(tmp_path, nonce):
+def test_a_training_restart_steps_down_from_its_cached_program(tmp_path, nonce):
     a_cached_spilling_run_trains_its_stepped_program(tmp_path, nonce)
