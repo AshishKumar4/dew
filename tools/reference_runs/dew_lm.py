@@ -5,10 +5,9 @@ The same windows in the same order as `torch_lm.py`, through the trainer's
 own compiled step: `LMObjective` over the checkpoint `Pretrained.load`
 reads (fp32 masters, `--dtype` compute), the solver `OptimConfig.build` makes
 from an `OptimConfig` (global-norm clip, then AdamW on the cosine schedule),
-and the mesh `MeshSpec` describes. One transformation is chained in front of
-that solver, `recorded_norm`, which keeps the global norm of the gradient it
-is handed in the optimizer state and passes the gradient on unchanged; it
-is how the step's gradient norm leaves the compiled step.
+and the mesh `MeshSpec` describes. The step's gradient norm is the trainer's
+own commit telemetry (`Committed.norm`, the optimizer input's global norm
+before clipping), over the updates the step committed.
 
 No EMA (`ema_decay=None`): the reference keeps none, and the average would
 cost the step memory and time the comparison does not ask about.
@@ -27,7 +26,7 @@ import json
 import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -48,24 +47,6 @@ from common import (
     write_record,
 )
 from reference_source import dew_revision
-
-
-class NormState(NamedTuple):
-    norm: jax.Array
-
-
-def recorded_norm() -> optax.GradientTransformation:
-    """Pass the gradient through and keep its global norm in the state."""
-
-    def init(params):
-        del params
-        return NormState(jnp.zeros((), jnp.float32))
-
-    def update(updates, state, params=None):
-        del state, params
-        return updates, NormState(optax.tree.norm(updates).astype(jnp.float32))
-
-    return optax.GradientTransformation(init, update)
 
 
 def arguments() -> argparse.Namespace:
@@ -180,7 +161,7 @@ def build(args: argparse.Namespace) -> Run:
         param_groups=(ParamGroup("all", ("*",)),)).build(schedule_steps)
     devices = jax.device_count()
     mesh = {"data": MeshSpec(), "fsdp": MeshSpec(fsdp=devices), "expert": MeshSpec(expert=devices)}[args.mesh]
-    trainer = Trainer(objective, optax.chain(recorded_norm(), solver), key=jax.random.key(0),
+    trainer = Trainer(objective, solver, key=jax.random.key(0),
                       mesh=mesh, checkpoints=None, tracker=None, split=args.split)
     state, _, _ = trainer.place()
     del pretrained
@@ -262,12 +243,13 @@ def train(args: argparse.Namespace, run: Run, probe: RouterProbe | None) -> tupl
             spent = probe(step, state.variables)
             if window.times(step):
                 window.excluded += spent
-        state, loss, metrics, _, _, _ = run.step(state, run.batch(step))
+        state, loss, metrics, _, _, committed = run.step(state, run.batch(step))
         # The step's loss is the whole objective, balance terms included;
         # the cross entropy the reference records as its loss is `ce`.
         losses.append(metrics["ce"])
         objectives.append(loss)
-        norms.append(jnp.copy(state.opt_state[0].norm))
+        # The norm of the update it committed, none (NaN) where it committed none.
+        norms.append(committed.norm / committed.count)
         if args.aux_loss_alpha is not None:
             extras.append({"aux_loss": metrics["aux_loss"]})
     return state, Curves(losses, objectives, norms, extras, window.close(loss), window.timed_steps)
@@ -302,8 +284,8 @@ def record(args: argparse.Namespace, run: Run, curves: Curves, probe: RouterProb
                    "seq": run.seq,
                    "data_sha256": sha256(args.data), "model_type": hf_config["model_type"],
                    "mesh": dict(run.trainer.device_mesh.shape),
-                   "optimizer": "optax.chain(recorded_norm, clip_by_global_norm, adamw) "
-                                "via OptimConfig.build",
+                   "optimizer": "optax.chain(clip_by_global_norm, adamw) via OptimConfig.build, "
+                                "its gradient norm the trainer's commit telemetry",
                    "schedule": "dew.optim.Cosine", "ema": None,
                    "model_config": to_record(ModelConfig.from_model(run.trainer.objective.model),
                                              ModelConfig)},

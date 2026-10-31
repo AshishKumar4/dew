@@ -19,7 +19,6 @@ import tyro
 
 from dew._records import number, record
 from dew.batch import Variables, merge
-from dew.checkpoints import Checkpoints
 from dew.config import MetricConfig, ObjectiveConfig, Prepared, RunConfig
 from dew.config.media import media_field
 from dew.diffusion.presets import EDM, Flow, build_process
@@ -60,6 +59,7 @@ if TYPE_CHECKING:
     from dew.data.pipeline import Dataset
     from dew.diffusion.presets import Preset
     from dew.objectives.rl.flow import FlowGRPOObjective, FlowRollout
+    from dew.objectives.rl.nft import DiffusionNFTObjective, NFTRollout
 
     # A kind's `union` imports every aliased class, so the run builds it at
     # the end of the module, where the annotations, read when a command line
@@ -84,10 +84,12 @@ DEFAULT_MODEL_CONFIG = {
 
 @dataclasses.dataclass(frozen=True)
 class FlowRolloutConfig:
-    """A run's Flow-GRPO rollout: `groups` samples of each prompt over `steps` time points, the first
-    `train_steps` transitions trained (all of them when None), each scored by the image metric
-    `reward` names, an alias or an import path, against its own prompt, higher being better
-    (`clip_score`). `build` makes the `FlowRollout` over an objective."""
+    """A run's flow RL rollout: `groups` samples of each prompt over `steps` time points, each scored by
+    the image metric `reward` names, an alias or an import path, against its own prompt, higher being
+    better (`clip_score`). Flow-GRPO trains the first `train_steps` transitions of each trajectory (all
+    of them when None) and DiffusionNFT each clean sample at the first `train_steps` times of its
+    sampler's grid (the released 9 when None). `build` makes the objective's rollout, a `FlowRollout`
+    or an `NFTRollout`."""
 
     reward: str = "clip_score"
     groups: int = 4
@@ -99,11 +101,12 @@ class FlowRolloutConfig:
             raise ValueError(f"reward names {self.reward!r}, which no metric alias names; the aliases are "
                              f"{sorted(metrics)}, or name a metric by its import path")
 
-    def build(self, objective: FlowGRPOObjective) -> FlowRollout:
+    def build(self, objective: FlowGRPOObjective | DiffusionNFTObjective) -> FlowRollout | NFTRollout:
         """The rollout over `objective`, scoring each sample with the metric's per-sample measure."""
         from dew.artifacts import ImageGrid
         from dew.eval.common import ImageMetric
         from dew.objectives.rl.flow import FlowRollout
+        from dew.objectives.rl.nft import DiffusionNFTObjective, NFTRollout
 
         metric = metrics[self.reward]()
         if not isinstance(metric, ImageMetric):
@@ -113,6 +116,9 @@ class FlowRolloutConfig:
         def reward(images, batch):
             return np.asarray(metric.fn(ImageGrid(images), batch))
 
+        if isinstance(objective, DiffusionNFTObjective):
+            trained = {} if self.train_steps is None else {"train_steps": self.train_steps}
+            return NFTRollout(objective, reward, groups=self.groups, steps=self.steps, **trained)
         return FlowRollout(objective, reward, groups=self.groups, steps=self.steps,
                            train_steps=self.train_steps)
 
@@ -186,12 +192,13 @@ class DiffusionRunConfig(RunConfig):
         if not issubclass(objectives[self.objective.name], DiffusionObjective):
             raise ValueError(f"--objective {self.objective.name} trains no diffusion model")
         from dew.objectives.rl.flow import FlowGRPOObjective
+        from dew.objectives.rl.nft import DiffusionNFTObjective
 
-        flow = issubclass(objectives[self.objective.name], FlowGRPOObjective)
+        flow = issubclass(objectives[self.objective.name], (FlowGRPOObjective, DiffusionNFTObjective))
         if flow and self.rollout is None:
             object.__setattr__(self, "rollout", FlowRolloutConfig())
         if not flow and self.rollout is not None:
-            raise ValueError(f"--rollout configures a Flow-GRPO run's rollout, and --objective "
+            raise ValueError(f"--rollout configures a flow RL run's rollout, and --objective "
                              f"{self.objective.name} trains on its data")
 
         if self.pretrained is not None:
@@ -362,26 +369,32 @@ class DiffusionRunConfig(RunConfig):
         return objective
 
     def _teacher(self, variables: Variables | None) -> TeacherArguments:
-        """The teacher a distillation reads from `teacher_run`: the tree its run published, unless the
-        starting tree holds the teacher (`TEACHER`), and for guidance distillation the teacher's
-        objective rebuilt from the run's record over the tree the student holds frozen
-        (`teacher_weights`)."""
+        """The teacher a distillation reads from `teacher_run`, its step the one its task loads by
+        default (`SavedRun.pinned`): the model its run publishes (`SavedRun.variables`: the trained
+        policy, not a reference its average holds), unless the starting tree holds the teacher
+        (`TEACHER`), and for guidance distillation the teacher's objective over the run's own sampling
+        task (`TextToImage.from_saved`: its model, adapters included, its process and its inputs) bound
+        to the tree the student holds frozen (`teacher_weights`)."""
+        from dew.inference.images import TextToImage
+        from dew.inference.tasks import SavedRun
+
         if self.teacher_run is None:
             return {}
         kind = objectives[self.objective.name]
         if not issubclass(kind, FlowDistillationObjective | GuidanceDistillationObjective):
             raise ValueError(f"teacher_run names a distillation's teacher, and {self.objective.name} "
                              f"distills none")
-        published: Variables | None = None
-        if variables is None or TEACHER not in variables:
-            # A resumed student holds its teacher, so only a fresh one reads the teacher's run.
-            with Checkpoints(self.teacher_run) as checkpoints:
-                published = checkpoints.variables(ema=None, step=None, mesh=None, layout=None,
-                                                  param_dtype=None)
+        # A student that holds its teacher reads its run for guidance distillation's components alone.
+        fresh = variables is None or TEACHER not in variables
+        if not fresh and not issubclass(kind, GuidanceDistillationObjective):
+            return {}
+        run = SavedRun.pinned(self.teacher_run)
+        published = run.variables(ema=None) if fresh else None
         given: TeacherArguments = {} if published is None else {"teacher_variables": published}
         if issubclass(kind, GuidanceDistillationObjective):
-            held = teacher_weights(variables, published, whole=True)
-            given["teacher"] = DiffusionRunConfig.load(self.teacher_run).build(variables=held)
+            task = TextToImage.from_saved(run, variables=teacher_weights(variables, published, whole=True))
+            given["teacher"] = DiffusionObjective(task.model, task.process, task.inputs,
+                                                  autoencoder=task.autoencoder, ema_decay=None)
         return given
 
     def build_run(self) -> Prepared:
@@ -390,6 +403,7 @@ class DiffusionRunConfig(RunConfig):
         tokenize. `val_metrics` score each validation, and Flow-GRPO samples
         the batches it trains on (`rollout`)."""
         from dew.objectives.rl.flow import FlowGRPOObjective
+        from dew.objectives.rl.nft import DiffusionNFTObjective
 
         run = self
         objective = run.build()
@@ -403,7 +417,7 @@ class DiffusionRunConfig(RunConfig):
         dataset, held = run.compiled(objective.data(), run.chain(), run.validation)
         metrics = run.validation_metrics(validates=bool(held))
         rollout = None
-        if isinstance(objective, FlowGRPOObjective) and run.rollout is not None:
+        if isinstance(objective, (FlowGRPOObjective, DiffusionNFTObjective)) and run.rollout is not None:
             rollout = run.rollout.build(objective)
         return Prepared(run, objective, dataset, metrics=metrics, rollout=rollout, validation=held)
 
