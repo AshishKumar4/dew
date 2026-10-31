@@ -872,6 +872,26 @@ def test_a_packed_runs_record_loads_where_its_token_store_is_not(tmp_path):
 
 
 @pytest.mark.parametrize("eos", [None, 0], ids=["no-eos", "eos"])
+def test_a_plan_an_earlier_dew_saved_over_a_token_store_resumes_as_its_documents_were_read(tmp_path, eos):
+    """An earlier Dew stated no document lengths for a token store whose producer stated no EOS: it read
+    the store as one stream and packed none of it, so a plan it saved counted none of its documents and
+    resumes where today's states the producer's records (row 3028). A store stating an EOS had its
+    lengths stated then, so a plan without them is another's, refused."""
+    corpus = write_token_corpus(tmp_path / "tokens", np.arange(1, 40) % 7, eos_id=eos)
+    windows = TokenFiles(corpus.train).pipe(presets.token_windows, seq_len=4, batch=2)
+    plan = compile(windows, read="indexed", loading=Loading(workers=0)).plan
+    assert "0/lengths" in plan.derived
+    earlier = dataclasses.replace(plan, derived={name: value for name, value in plan.derived.items()
+                                                 if name != "0/lengths"})
+    assert plan.check(plan.record()) == ()
+    if eos is None:
+        assert plan.check(earlier.record()) == ()
+    else:
+        with pytest.raises(ValueError):
+            plan.check(earlier.record())
+
+
+@pytest.mark.parametrize("eos", [None, 0], ids=["no-eos", "eos"])
 def test_a_token_stores_documents_are_the_records_its_producer_wrote(tmp_path, eos):
     """A token export's documents are the records its producer wrote, each where its length index ends it
     (row 3028): with or without an EOS id, an EOS a document's own tokens spell within it splits nothing,

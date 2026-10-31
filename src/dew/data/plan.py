@@ -397,6 +397,26 @@ _LIMIT = re.compile(r"Limit\(count=(\d+)\)")
 """A limit's record in an order's stages (`Limit`'s repr)."""
 
 
+def earlier_lengths(previous: Mapping[str, object], source: object,
+                    derived: Mapping[str, str]) -> dict[str, object]:
+    """`previous`, a saved plan's derived order, with today's lengths of each token store an earlier Dew
+    stated none for (`derived`'s): a store whose producer stated no EOS, which it read as one stream, its
+    documents neither stated nor packed, so the plan's positions counted none of them; today's are the
+    producer's records (row 3028). The saved plan's `source` names its stores, in the order its derived
+    facts number them. Carried to 1.0 (ledger 1552)."""
+    held = dict(previous)
+    stores = source.get("sources") if isinstance(source, Mapping) else None
+    for index, store in enumerate(stores if isinstance(stores, list) else []):
+        name = f"{index}/lengths"
+        if not isinstance(store, Mapping) or store.get("store") != "tokens":
+            continue
+        stated = store.get("metadata")
+        eos = stated.get("eos_id") if isinstance(stated, Mapping) else None
+        if name not in held and name in derived and eos is None:
+            held[name] = derived[name]
+    return held
+
+
 def grown_limits(saved: dict[str, JSON] | list[JSON] | str | int | float | bool | None,
                  current: dict[str, JSON] | list[JSON] | str | int | float | bool | None
                  ) -> frozenset[tuple[str, str]] | None:
@@ -541,7 +561,9 @@ class Plan:
         grown = grown_limits(saved_order, unplaced(current["order"])) if edited is None else frozenset()
         if grown is None:
             raise ValueError(f"saved data plan order changed: {saved.get('order')!r} -> {current['order']!r}")
-        previous = record(saved.get("derived", {}), "saved derived order")
+        saved_manifest = record(json_value(saved.get("manifest", {}), "saved data manifest"), "data manifest")
+        previous = earlier_lengths(record(saved.get("derived", {}), "saved derived order"),
+                                   saved_manifest.get("source"), self.derived)
         for name in sorted(set(previous) | set(self.derived)) if edited is None else ():
             if previous.get(name) != self.derived.get(name):
                 raise ValueError(f"saved data plan derived order {name} changed")
