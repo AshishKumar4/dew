@@ -120,7 +120,8 @@ def test_a_run_resumed_inside_a_held_window_lands_where_the_whole_run_does(tmp_p
 def test_an_input_the_optimizer_skips_trains_nothing_and_commits_no_tokens():
     """`optax.MultiSteps` with a skip predicate discards the inputs it skips: they move no weight, no
     average and no update count, and their tokens wait for no update, as its state says by moving
-    neither its mini-step nor its gradient step; one that skips none trains as `MultiSteps` alone does."""
+    neither its mini-step nor its gradient step; each skipped call draws afresh, so a predicate that
+    rejects a draw meets another; one that skips none trains as `MultiSteps` alone does."""
     def skipping(*, skip: bool):
         def skipped(updates, gradient_step, params) -> tuple[jax.Array, tuple[()]]:
             # Its diagnostics empty, as a predicate may return them.
@@ -129,7 +130,7 @@ def test_an_input_the_optimizer_skips_trains_nothing_and_commits_no_tokens():
         return optax.MultiSteps(optax.sgd(0.1), 2, should_skip_update_fn=skipped).gradient_transformation()
 
     tracker = RecordingTracker()
-    trainer = make_trainer(objective=TokenRegression(), optimizer=skipping(skip=True), tracker=tracker)
+    trainer = make_trainer(objective=Drawing(), optimizer=skipping(skip=True), tracker=tracker)
     first = trainer.initial_state()
     start = [np.asarray(leaf) for leaf in jax.tree.leaves((first.variables, first.ema))]
     state = trainer.fit(dataset(), steps=4, log_every=1)
@@ -137,6 +138,7 @@ def test_an_input_the_optimizer_skips_trains_nothing_and_commits_no_tokens():
     assert all(np.array_equal(old, np.asarray(new)) for old, new in zip(
         start, jax.tree.leaves((state.variables, state.ema)), strict=True))
     assert [scalars["train/tokens"] for _, scalars in tracker.scalars if "train/tokens" in scalars] == [0] * 4
+    assert len({scalars["train/draw"] for _, scalars in tracker.scalars if "train/draw" in scalars}) == 4
     kept = make_trainer(objective=TokenRegression(), optimizer=skipping(skip=False)).fit(dataset(), steps=4)
     plain = make_trainer(objective=TokenRegression(), optimizer=held_optimizer("multi_steps")).fit(
         dataset(), steps=4)
