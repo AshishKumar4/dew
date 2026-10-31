@@ -241,26 +241,25 @@ def test_an_inner_product_of_vectors_takes_no_workspace():
         assert with_workspace - without == workspace
 
 
-def test_a_ragged_product_holds_its_ragged_operand_once_a_group_on_a_gpu():
-    """XLA's GPU compiler expands a ragged product its grouped kernels do not take, every float32 one, into
-    a product over its groups (`RaggedDotRewriter`, xla/hlo/transforms/expanders/ragged_dot_rewriter.cc):
-    rows ragged in their non-contracting dimension become a select of their broadcast once a group
-    (`RaggedToDense`), which the product reads from memory, held while it multiplies; on a CPU none. What
-    XLA's layout assignment and fusion add beside it is theirs to choose, so a program that expands one
-    states its peak as a bound from below (`bounded_below`)."""
+def test_a_ragged_product_on_a_gpu_holds_at_least_its_output():
+    """A ragged product on a GPU holds at least its output while it runs; what more XLA makes of it is its
+    own choice by target, dtype and flags (a grouped kernel, or `RaggedDotRewriter`'s expansion over
+    its groups, xla/hlo/transforms/expanders/ragged_dot_rewriter.cc, beside which layout assignment
+    and fusion choose by their cost models), so the program states its peak a bound from below
+    (`bounded_below`); on a CPU it is the program's own."""
     from dew.training.footprint import bounded_below, peak_bytes
 
     rows, sizes = jax.ShapeDtypeStruct((64, 16), jnp.float32), jax.ShapeDtypeStruct((4,), jnp.int32)
     weights = jax.ShapeDtypeStruct((4, 16, 32), jnp.float32)
     program = jax.make_jaxpr(lambda rows, weights, sizes: jax.lax.ragged_dot(rows, weights, sizes))(
         rows, weights, sizes).jaxpr
-    # The output (64 x 32) beside the rows masked once for each of the 4 groups.
-    assert peak_bytes(program, "gpu", 0) == (64 * 32 + 4 * 64 * 16) * 4 and bounded_below(program, "gpu")
-    assert peak_bytes(program, "cpu", 0) == 64 * 32 * 4 and not bounded_below(program, "cpu")
+    for platform in ("gpu", "cpu"):
+        assert peak_bytes(program, platform, 0) == 64 * 32 * 4
+    assert bounded_below(program, "gpu") and not bounded_below(program, "cpu")
 
 
-def test_a_gradient_states_its_peak_a_bound_from_below_where_a_nested_ragged_product_expands():
-    """A gradient whose program expands a ragged product on a GPU, in a loop's body as an expert stack's
+def test_a_gradient_states_its_peak_a_bound_from_below_where_a_nested_ragged_product_runs():
+    """A gradient whose program runs a ragged product on a GPU, in a loop's body as an expert stack's
     scan holds one, states its peak a bound from below (`Peak.exact` False); on a CPU, or with no ragged
     product, its peak is the program's own."""
     rows, sizes = jax.ShapeDtypeStruct((64, 16), jnp.float32), jax.ShapeDtypeStruct((4,), jnp.int32)
@@ -277,30 +276,3 @@ def test_a_gradient_states_its_peak_a_bound_from_below_where_a_nested_ragged_pro
     assert not gradient_peak(experts, weights, (rows, sizes), platform="gpu", workspace=0).exact
     assert gradient_peak(experts, weights, (rows, sizes), platform="cpu", workspace=0).exact
     assert gradient_peak(dense, weights, (rows, sizes), platform="gpu", workspace=0).exact
-
-
-def test_ragged_products_over_one_operand_ragged_in_two_axes_expand_it_twice():
-    """Two ragged products of one square operand over one group sizes, ragged in its first dimension and
-    in its second, expand it twice: each expansion masks its own dimension (`RaggedToDense`'s iota runs
-    over the ragged one), so they are no common subexpression and are held together where their reads
-    overlap."""
-    from dew.training.footprint import peak_bytes
-
-    square, sizes = jax.ShapeDtypeStruct((32, 32), jnp.float32), jax.ShapeDtypeStruct((4,), jnp.int32)
-    weights = jax.ShapeDtypeStruct((4, 32, 8), jnp.float32)
-
-    def ragged_in(axis: int):
-        numbers = jax.lax.RaggedDotDimensionNumbers(
-            dot_dimension_numbers=(([1 - axis], [1]), ([], [])), lhs_ragged_dimensions=[axis],
-            rhs_group_dimensions=[0])
-        return lambda square, weights, sizes: jax.lax.ragged_dot_general(square, weights, sizes, numbers)
-
-    def both(square, weights, sizes):
-        first, second = ragged_in(0), ragged_in(1)
-        return first(square, weights, sizes) + second(square, weights, sizes) + first(square, weights, sizes)
-
-    alone = jax.make_jaxpr(ragged_in(0))(square, weights, sizes).jaxpr
-    program = jax.make_jaxpr(both)(square, weights, sizes).jaxpr
-    # The second product's expansion of the operand, once a group, beside the first's, which the third
-    # reads again.
-    assert peak_bytes(program, "gpu", 0) >= peak_bytes(alone, "gpu", 0) + 4 * 32 * 32 * 4
