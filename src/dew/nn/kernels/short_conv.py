@@ -408,8 +408,8 @@ class ConvForward(_ConvLaunch):
     def _fwd(self, x: jax.Array, taps: jax.Array, bias: jax.Array | None, valid: jax.Array | None,
              documents: jax.Array | None, *, parts: tuple[tuple[int, int | None], ...], activation: bool,
              eps: float, dtype: str, interpret: bool, config: Tile, return_residuals: bool = False):
-        return _forward(x, taps, bias, valid, documents, parts=parts, activation=activation, eps=eps,
-                        dtype=dtype, interpret=interpret, config=config), None
+        return _forward_launch(x, taps, bias, valid, documents, parts=parts, activation=activation, eps=eps,
+                               dtype=dtype, interpret=interpret, config=config), None
 
     def _get_heuristics_config(self, ba) -> Tile:
         return TILE
@@ -429,8 +429,8 @@ class ConvBackward(_ConvLaunch):
              documents: jax.Array | None, before: jax.Array | None, dy: jax.Array, *, first: int,
              head: int | None, activation: bool, eps: float, interpret: bool, config: Walk,
              return_residuals: bool = False):
-        return _backward(x, taps, bias, valid, documents, before, dy, first=first, head=head,
-                         activation=activation, eps=eps, interpret=interpret, config=config), None
+        return _backward_launch(x, taps, bias, valid, documents, before, dy, first=first, head=head,
+                                activation=activation, eps=eps, interpret=interpret, config=config), None
 
     def _get_heuristics_config(self, ba) -> Walk:
         return self._walk(ba, WALK)
@@ -443,8 +443,9 @@ class ConvBackward(_ConvLaunch):
 
 
 @tuning.lowered_once(('parts', 'activation', 'eps', 'dtype', 'interpret', 'config'))
-def _forward(x, taps, bias, valid, documents, *, parts: tuple[tuple[int, int | None], ...], activation: bool,
-             eps: float, dtype: str, interpret: bool, config: Tile) -> tuple[jax.Array, ...]:
+def _forward_launch(x, taps, bias, valid, documents, *, parts: tuple[tuple[int, int | None], ...],
+                    activation: bool, eps: float, dtype: str, interpret: bool, config: Tile
+                    ) -> tuple[jax.Array, ...]:
     """`ConvForward`'s launch, lowered once a configuration (`tuning.lowered_once`)."""
     batch, length, _ = x.shape
     pieces, programs = [], 0
@@ -467,8 +468,8 @@ def _forward(x, taps, bias, valid, documents, *, parts: tuple[tuple[int, int | N
 
 
 @tuning.lowered_once(('first', 'head', 'activation', 'eps', 'interpret', 'config'))
-def _backward(x, taps, bias, valid, documents, before, dy, *, first: int, head: int | None, activation: bool,
-              eps: float, interpret: bool, config: Walk) -> tuple[jax.Array, ...]:
+def _backward_launch(x, taps, bias, valid, documents, before, dy, *, first: int, head: int | None,
+                     activation: bool, eps: float, interpret: bool, config: Walk) -> tuple[jax.Array, ...]:
     """`ConvBackward`'s launch, lowered once a configuration (`tuning.lowered_once`)."""
     batch, length, channels = x.shape
     count, width = taps.shape[1], dy.shape[-1]
