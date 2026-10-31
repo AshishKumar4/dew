@@ -177,11 +177,12 @@ def ns_operands(dtype, preconditioning: Preconditioning = "frobenius",
 
     The fast forms' bfloat16, where optax iterates in its momentum's own float32: the quintic brings the
     singular values only near one, roughly within 0.7 to 1.2 (optax `orthogonalize_via_newton_schulz`), far
-    coarser than bfloat16's rounding. A Qwen3.5-4B decision fine-tune on one H100 (b0ea09e28, 8192 tokens a
-    step) stepped in 842 ms with its iteration in bfloat16, 1288 ms in float32 at TF32 and 4650 ms at IEEE
-    float32, against AdamW's 495 ms, its loss over 30 steps within 0.03 of the float32 iteration's; at
-    65536 tokens an update, eight microbatches accumulated, Muon's iteration cost the update 9% over AdamW's
-    (ledger 2685)."""
+    coarser than bfloat16's rounding. A Qwen3.5-4B decision fine-tune on one H100 (node job
+    LR-h100-muon-2752c at 699d038ca, 8192 tokens a step) stepped in 844 ms with its iteration in bfloat16
+    (`BF16_BF16_F32`), 1287 ms at TF32 (`TF32_TF32_F32`) and 4641 ms at IEEE float32 (`F32_F32_F32`), against
+    AdamW's 495 ms, its loss at each of 30 steps within 0.07 of the float32 iteration's (0.02 on average);
+    at 65536 tokens an update, eight microbatches accumulated, a step in 469 ms against AdamW's 466 (ledger
+    2685, 2752)."""
     from dew.nn.kernels.generation import numerics
 
     if jnp.issubdtype(dtype, jnp.complexfloating):
