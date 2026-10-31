@@ -183,14 +183,16 @@ def gradient_peak(loss: Callable, params, arguments: Sequence, *, platform: str,
 
 
 def bounded_below(program: jcore.Jaxpr, platform: str) -> bool:
-    """Whether `program`'s derived peak bounds what XLA makes of it from below: on a GPU, where it expands
-    a ragged product (`expansions`), beside whose expansion XLA's layout assignment may lay an operand
-    out again as a copy rather than a bitcast (xla/service/layout_assignment.cc) and its fusion may keep
-    the expansion's mask in a buffer of its own (xla/backends/gpu/transforms/priority_fusion.cc), each
-    by its cost model's judgment, no rule the derivation can source. Such a step's compile decides its
-    fit, and a miss is logged with the need it compiled to (`FitSearch.compiled`)."""
+    """Whether `program`'s derived peak bounds what XLA makes of it from below: on a GPU, where it runs a
+    ragged product, which holds at least its output while XLA lays the rest out as its target, dtype
+    and flags choose: a grouped kernel, or a product over its groups that expands its operands
+    (`RaggedDotRewriter`, xla/hlo/transforms/expanders/ragged_dot_rewriter.cc), beside which its layout
+    assignment (xla/service/layout_assignment.cc) and fusion (xla/backends/gpu/transforms/
+    priority_fusion.cc) keep buffers by their cost models' judgment, no rule the derivation can source.
+    Such a step's compile decides its fit, and a miss is logged with the need it compiled to."""
     return platform == "gpu" and any(
-        expansions(equation) or any(bounded_below(body, platform) for body in bodies(equation))
+        equation.primitive.name == "ragged_dot_general"
+        or any(bounded_below(body, platform) for body in bodies(equation))
         for equation in program.eqns)
 
 
@@ -208,17 +210,10 @@ def peak_bytes(program: jcore.Jaxpr, platform: str, workspace: int) -> int:
     last.update({kept: len(program.eqns) for kept in frontier.reading(program.outvars)})
     # A ragged operand's dense expansion, one per operand and group sizes however many ragged products
     # read it (XLA's common-subexpression elimination), from the first that reads it to the last.
-    grown = [expansions(equation) if platform == "gpu" else {} for equation in program.eqns]
-    dense = {key: index for index, found in enumerate(grown) for key in found}
     live, held, most = 0, set(), 0
-    expanded: set[tuple[jcore.Var, jcore.Var]] = set()
     for index, equation in enumerate(program.eqns):
         made = [out for out in equation.outvars if out in last and frontier.buffered(out)]
         made_bytes = sum(map(device_share, made))
-        for key, size in grown[index].items():
-            if key not in expanded:
-                expanded.add(key)
-                live += size
         if made or not frontier.fusing(equation):
             inner = max((peak_bytes(body, platform, workspace) for body in bodies(equation)), default=0)
             operands = 0 if frontier.fusing(equation) else sum(
@@ -234,9 +229,6 @@ def peak_bytes(program: jcore.Jaxpr, platform: str, workspace: int) -> int:
         for done in [value for value in held if last[value] == index]:
             held.discard(done)
             live -= device_share(done)
-        for key, size in grown[index].items():
-            if dense[key] == index:
-                live -= size
     return most
 
 
@@ -352,34 +344,6 @@ def cublas_product(equation: jcore.JaxprEqn) -> bool:
     threshold = int(xla_flag("xla_gpu_gemm_rewrite_size_threshold") or GEMM_REWRITE_SIZE)
     classical = produced in ("float16", "float32", "bfloat16") and emitted_algorithm(equation)
     return (kept_left + kept_right) * contracting >= threshold or not classical
-
-
-def expansions(equation: jcore.JaxprEqn) -> dict[tuple, int]:
-    """The dense operands a GPU's ragged product reads that XLA makes of its operands, each keyed as XLA's
-    common-subexpression elimination tells them apart (the operand, its group sizes and the dimension it
-    is ragged in, whose iota the mask runs over), with its bytes. XLA expands a ragged product no grouped
-    kernel takes into a product over its groups (`RaggedDotRewriter::RunImpl`,
-    xla/hlo/transforms/expanders/ragged_dot_rewriter.cc: cuDNN's fusion takes only float16 or bfloat16,
-    behind `xla_gpu_experimental_use_ragged_dot_fusion`, off by default; hipBLASLt's grouped GEMM only on
-    ROCm): each operand it makes dense (`RaggedToGeneral`: the ragged rows of one ragged in a
-    non-contracting dimension, both operands of one ragged in its contracting dimension, none of one
-    ragged in a batch dimension) is a select of its broadcast once a group (`RaggedToDense`), which the
-    product reads from memory. What XLA's layout assignment and fusion add beside it is theirs to choose
-    (`bounded_below`)."""
-    if equation.primitive.name != "ragged_dot_general":
-        return {}
-    numbers = equation.params["ragged_dot_dimension_numbers"]
-    (contracting, other), (batch, _) = numbers.dot_dimension_numbers
-    (ragged,) = numbers.lhs_ragged_dimensions
-    sizes = equation.invars[2]
-    if ragged in batch or not computed(sizes):
-        return {}
-    groups = dimensions(sizes)[-1]
-    dense = [(equation.invars[0], ragged)]
-    if ragged in contracting:
-        dense.append((equation.invars[1], other[contracting.index(ragged)]))
-    return {(operand, sizes, axis): groups * device_share(operand)
-            for operand, axis in dense if computed(operand)}
 
 
 def emitted_algorithm(equation: jcore.JaxprEqn) -> bool:
