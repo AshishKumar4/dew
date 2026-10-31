@@ -723,6 +723,16 @@ def carried(state, keys: Load, values, decay, dtype, issue: Issue, last: tuple |
             for i, part in enumerate(state)]
 
 
+def keys_gated_carried(state, keys: TileLoad, values, gate, decay, dtype, issue: Issue) -> list:
+    """`carried` with the write's gate on the keys' side: `state[i] decay[i] + (keys(i) gate)^T values`, each
+    key row scaled by its token's `gate` `[C]` (its write gate and its decay to the chunk's end) in fp32 and
+    rounded to `dtype` for the product, the values (`values`, a tile) as they are: mamba_ssm's state write,
+    `(B dt exp(dA_last - dA))^T x` (`_chunk_state_fwd`), whose rounding a 16-bit call's takes."""
+    return [part * decay[i] + issue("write", Transposed(
+        (keys(i).value().astype(jnp.float32) * gate[:, None]).astype(dtype)), values)
+        for i, part in enumerate(state)]
+
+
 def scalar_write(corrected_values, last, gate, last_lo, gate_lo):
     """A decay a head's write: the corrected values gated by `exp2(g_last - g)` over both halves, and the
     memory's decay `exp2(g_last)`."""
@@ -731,17 +741,21 @@ def scalar_write(corrected_values, last, gate, last_lo, gate_lo):
 
 
 def chunk_scores(queries: Load, keys: Load, columns: int, gate, low, dtype, issue: Issue, *,
-                 laid: tuple | None = None):
+                 laid: tuple | None = None, column_scale=None):
     """A chunk's own pairs' scores `[C, C]` under a decay a head, `tril((q k^T) exp2(g_s - g_t))`, the key
     column blocks `queries(c)` and `keys(c)` summed into fp32 ('scores'), in `dtype` for `chunk_output`'s
     'local', which every value block of the chunk takes. `laid` is the prefix's halves `(gate, low)` as a
     column's vectors where a mainloop's layouts keep them apart from a row's (`system`'s). The pairs' decays
-    come before the products, their exponents' working tiles done before the products' sum is live."""
+    come before the products, their exponents' working tiles done before the products' sum is live.
+    `column_scale` `[C]`, where given, scales each key token's column before the scores are rounded (the
+    write gate on the keys' side, mamba_ssm's `CB exp(dA_i - dA_j) dt_j`, `_chunk_scan_fwd`)."""
     decay = decayed(gate, low, *((gate, low) if laid is None else laid))
     scores = jnp.zeros((gate.shape[0], gate.shape[0]), jnp.float32)
     for c in range(columns):
         scores += issue("scores", queries(c), keys(c).T)
     scores = scores * decay
+    if column_scale is not None:
+        scores = scores * column_scale[None, :]
     lag = _lags(scores.shape)
     return jnp.where(lag >= 0, scores, 0.0).astype(dtype)
 
@@ -873,34 +887,45 @@ def local_gradient(keys: TileLoad, queries: TileLoad, columns: int, gate, low, o
     return issue("local_dv", product.astype(out_grad.dtype), out_grad)
 
 
-def reverse_carried(grad: list, keys: TileLoad, weights: TileLoad, queries: TileLoad, out_grad, local, gate,
-                    low, last, last_low, scale: float, dtype, issue: Issue) -> tuple[list, jax.Array]:
+def reverse_carried(grad: list, keys: TileLoad, weights: TileLoad | None, queries: TileLoad, out_grad, local,
+                    gate, low, last, last_low, scale: float, dtype, issue: Issue) -> tuple[list, jax.Array]:
     """One chunk of the memory's reverse recurrence (fla's dhu) under a decay a head: from the gradient of
     the memory leaving the chunk `grad`, its key slices `[K_i, BV]` fp32, the corrected values' gradient
     `dv = (k grad) exp2(g_last - g) + local` ('values_dv', the gradient cast to `dtype`) and the gradient of
     the memory the chunk entered, `grad exp2(g_last) + scale q^T (do exp2(g)) - w^T dv` ('reads', the
     decayed `do` fp32; 'weights_dv', `dv` cast to `dtype`). `last` and `last_low` are the chunk's last prefix
-    halves as a row's vectors, `queries(i)` and `weights(i)` key slice `i`'s tiles."""
+    halves as a row's vectors, `queries(i)` and `weights(i)` key slice `i`'s tiles. Without the delta rule
+    (`weights` None) nothing was corrected, and the memory entered takes no `w^T dv`."""
     dv = functools.reduce(jnp.add, (issue("values_dv", keys(i), part.astype(dtype))
                                     for i, part in enumerate(grad)))
     dv = dv * range_decay(last, last_low, gate, low)[:, None] + local
     read = out_grad.astype(jnp.float32) * raised(gate, low)[:, None]
     kept = raised(last, last_low)[:, None]
-    entered = [part * kept + issue("reads", queries(i).T, read) * scale
-               - issue("weights_dv", weights(i).T, dv.astype(dtype)) for i, part in enumerate(grad)]
-    return entered, dv
+    def slice_entered(i, part):
+        # A slice's terms in one expression, so each slice's products are live alone (formed slice by slice
+        # into a list first, every slice's partial sum stayed live past the products: 128 bytes spilled in
+        # an H100's reverse walk of Qwen3.5-27B's gated delta net).
+        entered = part * kept + issue("reads", queries(i).T, read) * scale
+        return entered if weights is None else entered - issue("weights_dv", weights(i).T, dv.astype(dtype))
+
+    return [slice_entered(i, part) for i, part in enumerate(grad)], dv
 
 
 def scores_gradient(queries: TileLoad, keys: TileLoad, columns: int, values: TileLoad, out_grads: TileLoad,
                     blocks: int, gate, low, scale: float, dtype, issue: Issue, *,
-                    laid: tuple | None = None) -> tuple[jax.Array, jax.Array]:
+                    laid: tuple | None = None, column_scale=None) -> tuple[jax.Array, jax.Array]:
     """A chunk and value head's scores' gradient under a decay a head, `ds = do v^T` over the value blocks
     `j` gated by its pairs' decays, causal and scaled, in `dtype` (which `memory_gradients`' `dq += ds k`
     and `dk += ds^T q` take), and the decay's pair terms `ds (q k^T)` (strictly lower, fp32,
-    `summed_pairs`'): the part of fla's dqkwg the memory's products do not take, a launch of its own."""
+    `summed_pairs`'): the part of fla's dqkwg the memory's products do not take, a launch of its own.
+    `column_scale` `[C]`, where given, scales each value token's column in fp32 after the products: the
+    write gate on the keys' side (`chunk_scores`'), mamba_ssm's `dCB = (dout x^T) dt`
+    (`_chunk_scan_bwd_dcb`)."""
     column_gate, column_low = (gate, low) if laid is None else laid
     pair_decay = decayed(gate, low, column_gate, column_low)
     ds = functools.reduce(jnp.add, (issue("values_ds", out_grads(j), values(j).T) for j in range(blocks)))
+    if column_scale is not None:
+        ds = ds * column_scale[None, :]
     lag = _lags(ds.shape)
     ds = jnp.where(lag >= 0, ds * pair_decay, 0.0) * scale
     scores = functools.reduce(jnp.add, (issue("local_t", queries(c), keys(c).T) for c in range(columns)))
@@ -908,19 +933,23 @@ def scores_gradient(queries: TileLoad, keys: TileLoad, columns: int, values: Til
 
 
 def memory_gradients(queries: TileLoad, keys: TileLoad, columns: int, values: TileLoad, out_grads: TileLoad,
-                     value_grads: TileLoad, entered: TileLoad, leaving: TileLoad, blocks: int, ds, gate, low,
-                     last, last_low, memory_decay, scale: float, issue: Issue,
-                     emit: Callable[[str, int, jax.Array], None]) -> tuple[jax.Array, jax.Array]:
+                     value_grads: TileLoad | None, entered: TileLoad, leaving: TileLoad, blocks: int, ds,
+                     gate, low, last, last_low, memory_decay, scale: float, issue: Issue,
+                     emit: Callable[[str, int, jax.Array], None],
+                     row_scale=None) -> tuple[jax.Array, jax.Array]:
     """The queries', keys' and weights' gradients of a chunk and value head (fla's dqkwg's memory products)
     under a decay a head, given its scores' gradient `ds` (`scores_gradient`'s, a tile its products read as
     they are, in the operands' dtype): over the value blocks `j`, `dq = do S^T`, `dk = v dS^T` and
     `dw = -dv S^T` for the corrected values `values(j)`, the output's gradient `out_grads(j)`, the corrected
     values' own `value_grads(j)` and the memories the chunk entered and left `entered(c, j)`, `leaving(c, j)`
-    (key block `c`), then the gates and `dq += ds k`, `dk += ds^T q`, each key block's to `emit('dq' | 'dk'
-    | 'dw', c, grad)` as it is final; and the decay's range terms `(after, leaving)` (`summed_back`'s),
+    (key block `c`), then the gates and `dq += ds k`, `dk += ds^T q` (none where `ds` is None: a caller
+    summing the scores' gradient over value heads first takes them once), each key block's to `emit('dq' |
+    'dk' | 'dw', c, grad)` as it is final; and the decay's range terms `(after, leaving)` (`summed_back`'s),
     `leaving` `[C]` each token's write into the memory the chunk leaves. `memory_decay` is the decay's
     gradient through the memory the chunk leaves, `sum(S dS)` (a row's vector of it; None where a caller
-    summing key blocks apart adds it once)."""
+    summing key blocks apart adds it once). Without the delta rule (`value_grads` None) there are no weights
+    and no `dw`. `row_scale` `[C]`, where given, scales each token's row of `dk`'s memory products in fp32:
+    the write gate on the keys' side (`keys_gated_carried`), mamba_ssm's `dB = (x dstates^T) dt`."""
     row_decay = raised(gate, low)[:, None]
     leaving_decay = range_decay(last, last_low, gate, low)[:, None]
     leaving_terms, after = [], []
@@ -928,12 +957,14 @@ def memory_gradients(queries: TileLoad, keys: TileLoad, columns: int, values: Ti
         dq = _summed(issue("memory_dq", out_grads(j), entered(c, j).T) for j in range(blocks))
         dq = dq * row_decay * scale
         after.append(jnp.sum(dq * queries(c).value().astype(jnp.float32), axis=1))
-        emit("dq", c, dq + issue("scores_dq", ds, keys(c)))
+        emit("dq", c, dq if ds is None else dq + issue("scores_dq", ds, keys(c)))
         dk = _summed(issue("memory_dk", values(j), leaving(c, j).T) for j in range(blocks))
-        dk = dk * leaving_decay
+        dk = dk * leaving_decay if row_scale is None else dk * (leaving_decay * row_scale[:, None])
         leaving_terms.append(jnp.sum(dk * keys(c).value().astype(jnp.float32), axis=1))
-        emit("dk", c, dk + issue("scores_dq", Transposed(ds), queries(c)))
-        emit("dw", c, -_summed(issue("memory_dw", value_grads(j), entered(c, j).T) for j in range(blocks)))
+        emit("dk", c, dk if ds is None else dk + issue("scores_dq", Transposed(ds), queries(c)))
+        if value_grads is not None:
+            emit("dw", c, -_summed(issue("memory_dw", value_grads(j), entered(c, j).T)
+                                   for j in range(blocks)))
     after = _summed(after)
     if memory_decay is not None:
         lag = _lags((after.shape[0],) * 2)
