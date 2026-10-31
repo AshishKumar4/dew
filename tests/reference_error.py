@@ -1858,6 +1858,16 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
                          f"give the site larger inputs or fewer shared factors")
 
 
+def _decided(mine: np.ndarray, theirs: np.ndarray) -> bool:
+    """Whether check 1's verdict on a leaf is decided by these draws, Dew's squared errors `mine` against
+    the reference's `theirs`: its pooled ratio's interval resolved (no wider than PARITY), or lying wholly
+    on one side of PARITY (`_status`, a pass or an over whatever its width). A paired sizing asks this of
+    each block, as the verdict decides by it; where the arms round apart (fp32 sums, `summed_as_run`),
+    a leaf's interval can lie wholly under PARITY at a count yet resolve only past MOST_SEEDS, its draws'
+    errors heavy-tailed (ledger 2469)."""
+    return _status(_pooled(mine, theirs), *_interval(mine, theirs)) != "inconclusive"
+
+
 def _confirmed(names, theirs: np.ndarray, count: int, mine: np.ndarray | None = None) -> list[str]:
     """The leaves `seeds_for` leaves unresolved at `count`: on the count's own block of draws or on the
     next block of as many (`seeds_for`'s confirmation), each judged as the sizing judges it: paired,
@@ -1868,7 +1878,7 @@ def _confirmed(names, theirs: np.ndarray, count: int, mine: np.ndarray | None = 
         if mine is not None:
             held, ours = theirs[start:start + count], mine[start:start + count]
             unresolved = [name for index, name in enumerate(names) if np.sum(held[:, index]) > 0
-                          and not _resolves(*_interval(ours[:, index], held[:, index]))]
+                          and not _decided(ours[:, index], held[:, index])]
         else:
             unresolved = _unresolved_against_itself(theirs[start:start + 2 * count], names, count)
         wide += [name for name in unresolved if name not in wide]
