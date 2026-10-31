@@ -151,8 +151,6 @@ class Mma(mosaic.Family):
         del transposed
         return self.fragment_depth(depth)
 
-    def lhs_fragment_depth(self, depth: int) -> int:
-        return self.fragment_depth(depth)
     most_shared = 163 * 1024  # sm80's and sm87's opt-in block (sm86's and sm89's 99 KiB)
     copies_vectors = False  # cp.async spreads a copy over the warpgroup's threads, 128 elements at least
     reduction_scratch = plgpu.CompilerParams().reduction_scratch_bytes  # its kernels' default parameters
