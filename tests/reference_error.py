@@ -854,22 +854,30 @@ def _typical_interval(mine: np.ndarray, theirs: np.ndarray,
     return float(np.exp(np.quantile(means, tails[0]))), float(np.exp(np.quantile(means, 1 - tails[1])))
 
 
-def _mean_rms_ratio(mine: np.ndarray, theirs: np.ndarray) -> float:
-    """The ratio of the arms' mean RMS errors over draws, sum(sqrt a) / sum(sqrt b): what `_typical`'s
-    pass is guarded by, as a fault on a minority of draws (Dew 6 times off on a tenth of them) moves it past
-    PARITY where the typical draw's ratio stays under it."""
-    return float(np.sum(np.sqrt(mine)) / np.sum(np.sqrt(theirs))) if np.sum(theirs) > 0 else float("inf")
-
-
-def _typically(mine: np.ndarray, theirs: np.ndarray,
-               tails: tuple[float, float] = (LOWER_TAIL, UPPER_TAIL)) -> tuple[float, float, float]:
-    """A leaf's typical ratio and its interval (`_typical`, `_typical_interval`), judged where its pooled
-    ratio is inconclusive (`_judgement`, `seeds_for`), and treated as inconclusive where it would pass with
-    the arms' mean RMS ratio over PARITY (`_mean_rms_ratio`), a fault on a minority of draws."""
+def _typical_status(mine: np.ndarray, theirs: np.ndarray, pooled_high: float,
+                    tails: tuple[float, float] = (LOWER_TAIL, UPPER_TAIL)) -> tuple[str, float, float, float]:
+    """A leaf's verdict by its typical draw (`_typical`, `_typical_interval`), asked only where its pooled
+    ratio leaves it inconclusive: "pass" where the typical draw's ratio passes (`_status`) and the pooled
+    ratio's interval's high end, `pooled_high`, is at most PARITY², else "inconclusive", never "over". A pass
+    so certifies what a pooled pass does, the pooled ratio's high end at most PARITY² on the same interval
+    at the same tail, and further that the typical draw's ratio passes; a fault on a minority of draws that
+    the typical draw's ratio misses moves the pooled ratio's high end past PARITY² and is not passed."""
     ratio, (low, high) = _typical(mine, theirs), _typical_interval(mine, theirs, tails)
-    if _status(ratio, low, high) == "pass" and not _mean_rms_ratio(mine, theirs) <= PARITY:
-        return ratio, low, float("nan")
-    return ratio, low, high
+    passed = _status(ratio, low, high) == "pass" and pooled_high <= PARITY ** 2
+    return ("pass" if passed else "inconclusive"), ratio, low, high
+
+
+def _sized(mine: np.ndarray, theirs: np.ndarray, typical: bool = False) -> bool:
+    """Whether a paired sizing takes a leaf as sized by these draws, Dew's squared errors `mine` against
+    the reference's `theirs`: its pooled ratio's interval resolved (no wider than PARITY), or, with
+    `typical` (a leaf the pooled ratio does not size within MOST_SEEDS, `seeds_for`), its typical draw's
+    (`_typical_interval`) resolved with the pooled interval's high end at most PARITY², the certificate a
+    typical pass needs (`_typical_status`)."""
+    low, high = _interval(mine, theirs)
+    if _resolves(low, high):
+        return True
+    return (typical and _resolves(*_typical_interval(mine, theirs))
+            and max(high, _pooled(mine, theirs)) <= PARITY ** 2)
 
 
 def _resolves(low: float, high: float) -> bool:
@@ -1467,9 +1475,11 @@ def _judged(draws: _Draws, index: int, tails: tuple[float, float] = (LOWER_TAIL,
 
 
 def _judgement(draws: _Draws, label: str, tails: tuple[float, float] = (LOWER_TAIL, UPPER_TAIL), *,
-               contained: bool = True) -> tuple[list[Finding], list[Finding]]:
+               contained: bool = True, typical: bool = False) -> tuple[list[Finding], list[Finding]]:
     """Check 1's findings over `draws` (`assert_as_exact`): each leaf over PARITY (`_status`), a row or
-    a value it fails, and each leaf its draws leave inconclusive."""
+    a value it fails, and each leaf its draws leave inconclusive; with `typical` (a final verdict), a
+    leaf its pooled ratio leaves inconclusive passed by its typical draw where that decides
+    (`_typical_status`)."""
     over, unresolved = [], []
     for index, name in enumerate(draws.names):
         leaf, count = label + name, len(draws.mine)
@@ -1490,23 +1500,19 @@ def _judgement(draws: _Draws, label: str, tails: tuple[float, float] = (LOWER_TA
             status = _status(ratio, low, high, contained=contained)
             # The ratio's log from its sums' logs, finite where a sum or the ratio itself would overflow.
             measure = (log_sum(a) - log_sum(b)) / 2
-            typical = None
-            if status == "inconclusive" and contained:
-                # The pooled ratio's sums unresolved: the typical draw's ratio decides where it resolves.
-                typical = _typically(a, b, tails)
-                status = _status(*typical)
+            found = None
+            if status == "inconclusive" and contained and typical:
+                # The pooled ratio's sums unresolved: its typical draw passes it where that decides, within
+                # the pooled ratio's own certificate.
+                found = _typical_status(a, b, max(high, ratio), tails)
+                status = found[0]
             if status == "inconclusive":
                 unresolved.append(Finding(
                     leaf, "inconclusive", measure, f"{leaf}: inconclusive: the pooled ratio {ratio:.3f}'s "
                     f"interval over {count} seeds is [{low:.3f}, {high:.3f}], wider than {PARITY}"
-                    + ("" if typical is None else f", and the typical draw's {typical[0]:.3f}'s "
-                       f"[{typical[1]:.3f}, {typical[2]:.3f}] (mean RMS ratio {_mean_rms_ratio(a, b):.3f})")
+                    + ("" if found is None else f", and the typical draw's {found[1]:.3f}'s "
+                       f"[{found[2]:.3f}, {found[3]:.3f}] with the pooled high end against {PARITY ** 2}")
                     + "; give the site larger inputs or more seeds (`seeds_for`)"))
-            elif status == "over" and typical is not None:
-                over.append(Finding(leaf, "pooled", measure, f"{leaf}: the typical draw's RMS error from "
-                                    f"float64 is {typical[0]:.3f} times the reference's over {count} seeds, "
-                                    f"interval [{typical[1]:.3f}, {typical[2]:.3f}] (allowed {PARITY}; the "
-                                    f"pooled ratio {ratio:.3f} unresolved)"))
             elif status == "over":
                 over.append(Finding(leaf, "pooled", measure, f"{leaf}: dew's RMS error from float64 is "
                                     f"{ratio:.3f} times the reference's over {count} seeds, interval "
@@ -1579,7 +1585,9 @@ def _staged(drawn, seeds: int, label: str, *,
                       for index in range(len(draws.names)))
     if further:
         draws = draws.joined(drawn(seeds, (1 + REDRAW) * seeds))
-    return (*_judgement(draws, label, tails, contained=two_stage), 2 if further else 1)
+    # The stage drawn by the pooled ratio alone; the final verdict's leaves it leaves inconclusive asked of
+    # their typical draw (`_judgement`'s `typical`).
+    return (*_judgement(draws, label, tails, contained=two_stage, typical=two_stage), 2 if further else 1)
 
 
 STAGES_LOG = "DEW_CHECK1_STAGES"
@@ -1911,23 +1919,34 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
         if not wide:
             return count
         count *= 2
+    if dew_fn is not None:
+        # The leaves the pooled ratio does not size within `most`, its draws ruled by their largest (each arm
+        # rounding apart, ledger 2469), sized by their typical draw on the draws already held, every other
+        # leaf by its pooled ratio as before: the first count at which each is.
+        stubborn, count = tuple(wide), max(start, FEWEST_SEEDS)
+        while count <= most:
+            wide = _confirmed(drawn.names, drawn.theirs, count, drawn.mine, typical=stubborn)
+            if not wide:
+                return count
+            count *= 2
     compared = "the reference compared with itself" if dew_fn is None else "Dew paired with the reference"
     raise AssertionError(f"{label}: {compared} does not resolve {PARITY} within {most} seeds at {wide[:4]}; "
                          f"give the site larger inputs or fewer shared factors")
 
 
-def _confirmed(names, theirs: np.ndarray, count: int, mine: np.ndarray | None = None) -> list[str]:
+def _confirmed(names, theirs: np.ndarray, count: int, mine: np.ndarray | None = None,
+               typical: tuple = ()) -> list[str]:
     """The leaves `seeds_for` leaves unresolved at `count`: on the count's own block of draws or on the
     next block of as many (`seeds_for`'s confirmation), each judged as the sizing judges it: paired,
     `mine` Dew's squared errors against the reference's (`theirs`, seed by leaf) on the same draws, or
-    the reference compared with itself (`_unresolved_against_itself`, each block twice the count)."""
+    the reference compared with itself (`_unresolved_against_itself`, each block twice the count); the
+    leaves named in `typical` sized by their typical draw too (`_sized`)."""
     wide: list[str] = []
     for start in (0, count) if mine is not None else (0, 2 * count):
         if mine is not None:
             held, ours = theirs[start:start + count], mine[start:start + count]
             unresolved = [name for index, name in enumerate(names) if np.sum(held[:, index]) > 0
-                          and not _resolves(*_interval(ours[:, index], held[:, index]))
-                          and not _resolves(*_typically(ours[:, index], held[:, index])[1:])]
+                          and not _sized(ours[:, index], held[:, index], name in typical)]
         else:
             unresolved = _unresolved_against_itself(theirs[start:start + 2 * count], names, count)
         wide += [name for name in unresolved if name not in wide]

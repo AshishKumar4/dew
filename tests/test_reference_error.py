@@ -976,10 +976,10 @@ def test_check_one_is_inconclusive_where_its_seeds_cannot_resolve_the_factor():
     """Errors set seed by seed, alike on every host: Dew's squared error is 4 on even seeds and 0.01 on
     odd ones, the reference's 1 on each, so the pooled ratio (1.42) is under PARITY but its interval
     straddles it and is wider than it over 8 seeds and over the second stage's 40 alike, never a pass by
-    it: the typical draw's ratio (0.45) decides, resolved under PARITY over the second stage's seeds, and
-    the arms' mean RMS ratio (1.05) under it too (`_typically`, ledger 2469). Fewer seeds than
-    FEWEST_SEEDS are inconclusive whatever they read."""
-    from reference_error import _interval, _mean_rms_ratio, _status, _typically
+    it: the final verdict asks its typical draw (0.45), resolved under PARITY over the second stage's
+    seeds, with the pooled interval's high end under PARITY² (`_typical_status`, ledger 2469), and passes.
+    Fewer seeds than FEWEST_SEEDS are inconclusive whatever they read."""
+    from reference_error import _interval, _status, _typical_status
     def errors(seed):
         return (np.zeros(64, np.float32), np.full(64, 2.0 if seed % 2 == 0 else 0.1, np.float32),
                 np.ones(64, np.float32))
@@ -997,8 +997,9 @@ def test_check_one_is_inconclusive_where_its_seeds_cannot_resolve_the_factor():
         return {"y": x}
 
     mine, theirs = np.asarray([4.0, 0.01] * 20), np.ones(40)
-    assert _status(math.sqrt(2.005), *_interval(mine, theirs)) == "inconclusive"
-    assert _status(*_typically(mine, theirs)) == "pass" and _mean_rms_ratio(mine, theirs) < PARITY
+    low, high = _interval(mine, theirs)
+    assert _status(math.sqrt(2.005), low, high) == "inconclusive" and high <= PARITY ** 2
+    assert _typical_status(mine, theirs, high)[0] == "pass"
     assert_as_exact(dew, reference, errors, "straddling", seeds=8, truth_fn=truth)
     with pytest.raises(Inconclusive):
         assert_as_exact(_reordered, _product, _draw, "two seeds", seeds=2)
@@ -1978,11 +1979,12 @@ def exact_value(x, scale, sizes):
 
 def test_arms_rounding_apart_are_judged_by_the_typical_draw_and_a_fault_on_it_or_on_a_minority_is_refused():
     """Where two arms round apart (each draw's error the draw's scale times each arm's own rounding, both
-    heavy-tailed), the pooled ratio does not resolve within MOST_SEEDS, and the typical draw's ratio decides
-    (`_typical`, ledger 2469): an equally exact pair passes at the count it sizes; a Dew twice off on every
-    draw is over; one ten times off on a tenth of its draws, which the typical draw's ratio leaves under
-    PARITY, is refused by the arms' mean RMS ratio (`_mean_rms_ratio`)."""
-    from reference_error import _interval
+    heavy-tailed), the pooled ratio does not resolve within MOST_SEEDS, and a final verdict it leaves
+    inconclusive asks the typical draw's ratio (`_typical_status`, ledger 2469): an equally exact pair passes
+    at the count it sizes; a Dew twice off on every draw is refused; one ten times off on a tenth of its
+    draws, which the typical draw's ratio leaves under PARITY, is refused by the pooled interval's high
+    end past PARITY², the certificate a pass gives."""
+    from reference_error import _interval, _typical_status
 
     reference = rounded_apart(1)
     seeds = seeds_for(reference, rounding_apart, "rounding apart", truth_fn=exact_value,
@@ -2003,3 +2005,25 @@ def test_arms_rounding_apart_are_judged_by_the_typical_draw_and_a_fault_on_it_or
     with pytest.raises(GateFailure):
         assert_as_exact(rounded_apart(0, 10.0, every=10), reference, rounding_apart, "a tenth ten times off",
                         seeds=seeds, truth_fn=exact_value)
+    # Dew a hundred times the reference's squared error on 13 of 256 draws, equal on the rest: the pooled
+    # ratio 2.46, unresolved, the typical draw's ratio under PARITY; its high end past PARITY² refuses it.
+    mine, theirs = np.where(np.arange(256) < 13, 100.0, 1.0), np.ones(256)
+    low, high = _interval(mine, theirs)
+    assert high > PARITY ** 2 and _typical_status(mine, theirs, high)[0] == "inconclusive"
+
+
+def test_a_leaf_the_second_stage_finds_over_is_over_whatever_its_first_stages_typical_draw():
+    """The second stage is drawn by the pooled ratio alone, and its typical draw asked only of a final
+    verdict the pooled ratio leaves inconclusive: a leaf whose first 32 seeds straddle PARITY (Dew's squared
+    error 4 and 0.01 by turns, the reference's 1), whose typical draw would pass them, and whose further
+    seeds read 4, is over at the second stage."""
+    from reference_error import NO_ZERO_ROWS, _Draws, _staged
+
+    def drawn(start, stop):
+        count = stop - start
+        dew = np.asarray([4.0 if seed >= 32 or seed % 2 == 0 else 0.01 for seed in range(start, stop)])
+        return _Draws(["leaf"], dew[:, None], np.ones((count, 1)), np.zeros((count, 1, 2)),
+                      [[NO_ZERO_ROWS]] * count, np.ones((count, 1), bool), (0,))
+
+    over, unresolved, stage = _staged(drawn, 32, "over later")
+    assert stage == 2 and [finding.leaf for finding in over] == ["over laterleaf"] and not unresolved
