@@ -68,8 +68,9 @@ def _dq_step(walk: _Backward, operands: tuple, stats: tuple, coords_of, params_o
     def issued(*, masked: bool):
         # A tile every query sees whole (`masked` False) takes no mask; the row sums and the parts are taken
         # where the mask is read (`algebra.pulled`).
-        coords = coords_of(k_first, read=walk.places_read(masked=masked))
-        scored = _scores(walk, coords, params, s, dp, peak, prior, anchor, delta, chosen, masked=masked)
+        coords_now = functools.partial(coords_of, k_first, read=walk.places_read(masked=masked))
+        scored = _scores(walk, coords_now(), params, s, dp, peak, prior, anchor, delta, chosen, masked=masked,
+                         again=coords_now)
         exponentials, _, cotangents, slopes, seen = scored
         terms, parts, keyed = algebra.dq_issued(sums, exponentials, cotangents, slopes, seen, k_slot.dtype,
                                                 prior, scale=walk.grad_scale, kinds=walk.kinds,

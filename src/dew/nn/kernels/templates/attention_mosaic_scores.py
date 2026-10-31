@@ -4,6 +4,7 @@ hook parameters and its weights and score cotangents under the forward's statist
 
 import dataclasses
 import functools
+from collections.abc import Callable
 
 import jax
 from jax import lax
@@ -124,10 +125,14 @@ def _tile_scores(walk: _Backward, slots: tuple, resident: tuple, rows: tuple, co
 
 
 def _scores(walk: _Backward, coords: algebra.Coords, params: tuple, s, dp, peak, total, anchor, delta,
-            chosen, *, masked: bool):
+            chosen, *, masked: bool, again: Callable[[], algebra.Coords] | None = None):
     """A backward tile's weights unnormalized and over `total`, its score cotangents (`algebra.grad_scores`)
     and the score hook's slopes (`algebra.tile_logits`), from its products `s` and `dp`, its coordinates, its
-    hook parameters `params`, its mask (`algebra.seen` where `masked`) and its queries' statistics."""
+    hook parameters `params`, its mask (`algebra.seen` where `masked`) and its queries' statistics. The
+    mask again where its cotangents take it from coordinates formed afresh (`again`; the step's own where
+    None): carried from the logits, ptxas held a row pass's predicates pending across the step (P2R, about
+    25 words at 64 x 64 and 128 x 64, its dQ launch at 128 x 64 and width 64 spilling 280 bytes). Returns
+    the mask the cotangents took."""
     seen = algebra.seen(walk.spec, coords, s) if masked else None
     how = walk.how
     logits, slopes = algebra.tile_logits(coords.hooked(walk.spec.score_mod), s, seen, coords.q_pos,
@@ -141,6 +146,9 @@ def _scores(walk: _Backward, coords: algebra.Coords, params: tuple, s, dp, peak,
 
     inverse_total = per_query(algebra.inverse(total))
     exponentials, weights = algebra.normalized(logits, per_query(peak), inverse_total, how)
+    if masked and again is not None:
+        coords = again()
+        seen = algebra.seen(walk.spec, coords, s)
     at_anchor = coords.k_pos == coords.queries(chosen, coords.k_pos)
     multiplier = algebra.drawn(coords, coords.q_pos, coords.k_pos)
     cotangents = algebra.grad_scores(exponentials, dp, per_query(anchor), per_query(delta), seen, at_anchor,
