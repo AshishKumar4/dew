@@ -81,6 +81,10 @@ from dew.cache import enable_compilation_cache
 
 import jax
 
+# The cache on, every program kept, whatever the suite's own cache policy hands this process.
+jax.config.update("jax_enable_compilation_cache", True)
+jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
+jax.config.update("jax_persistent_cache_min_compile_time_secs", 0.0)
 enable_compilation_cache(sys.argv[1])
 jax.jit(lambda x: x * 3)(1).block_until_ready()
 enable_compilation_cache(sys.argv[2])

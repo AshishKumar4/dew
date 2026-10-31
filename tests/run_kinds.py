@@ -287,8 +287,9 @@ def requested(task) -> object:
     if isinstance(task, TextGeneration):
         return task("ab", max_new_tokens=2, key=0)
     if isinstance(task, MaskedGeneration | BlockGeneration):
-        # Token ids, which a source with no tokenizer of its own (dream-tiny) reads too.
-        return task([[5, 17, 33, 2]], max_new_tokens=2, key=0)
+        # Token ids, which a source with no tokenizer of its own (dream-tiny) reads too, within every tiny
+        # source's vocabulary (diffusion-gemma-sft's 32).
+        return task([[4, 5, 6, 7]], max_new_tokens=2, key=0)
     if isinstance(task, Decide):
         question = {"team": Choice("which team", ["billing", "technical", "sales"])}
         # A context beside the state where the backbone's cross-attention reads one (`context_length`).
