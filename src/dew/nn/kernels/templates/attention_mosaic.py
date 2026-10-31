@@ -579,6 +579,9 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
             return False
         dtype = ba.arguments["query"].dtype
         family = bundle_of(config, dtype)
+        if config.producer_dq and not config.shared_dq:
+            # The producer adds a shared dQ's staged shares alone (`mosaic.Outbox`).
+            return False
         if config.shared_dq:
             # Keys first, each consumer its own keys (no layout whose consumers feed their rings), each its
             # share of dQ's columns whole swizzled rows (`_fused_adds`).

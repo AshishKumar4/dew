@@ -72,8 +72,10 @@ def _dkv_allocations(family: mosaic.Family, config: BackwardTiles, width: int, v
         # (`BackwardTiles.shared_dq`), every consumer's read by each, its share of dQ's columns staged, and
         # the exchange's barriers (`Family.exchange`).
         share = width // consumers if config.shared_dq else width
-        scoped += [plgpu.SMEM((consumers, block_k, rows), dtype),
-                   plgpu.SMEM((consumers, rows, share), jnp.float32),
+        # Its dQ stage the producer's outbox where the producer adds it (`BackwardTiles.producer_dq`).
+        stage = (mosaic.outbox((rows, share), jnp.float32, consumers) if config.producer_dq
+                 else [plgpu.SMEM((consumers, rows, share), jnp.float32)])
+        scoped += [plgpu.SMEM((consumers, block_k, rows), dtype), *stage,
                    *(family.exchange(consumers) if config.shared_dq else [])]
     if config.staged_logits:
         # One slot's queries taken by the power, which the first consumer stages for every consumer's share,
@@ -199,17 +201,28 @@ def _staged_logits(walk: _Backward, stage: tuple, q_slot, part: tuple):
     first, count = part
     return ref if count == ref.shape[0] else ref.at[pl.ds(first, count)]
 
-def _fused_adds(walk: _Backward, dq_ref, stages: list, place: tuple, index, k_smem, holder):
+def _outbox(walk: _Backward, stages: list) -> mosaic.Outbox | None:
+    """A fused launch's dQ outbox where its producer adds its dQ (`BackwardTiles.producer_dq`), compiled;
+    None where its consumers add theirs (interpreted, the interpreter's TMA taking no reduction)."""
+    if not (walk.fused and walk.program.tiles.producer_dq) or walk.interpret:
+        return None
+    return mosaic.Outbox(*stages[1:4])
+
+
+def _fused_adds(walk: _Backward, dq_ref, stages: list, place: tuple, index, k_smem, holder, lo):
     """A fused launch's consumer `index`'s dQ adds (`_dkv_step`'s `add_dq(score cotangents, first query)`),
     None where the launch adds none: its score cotangents staged (`stages[0]`), their transpose times its
     keys (`k_smem`, `[holders, bk, D]`, its `holder`'s), the tile's dQ added into dQ at `place`
     (`_dq_added`); shared
     (`BackwardTiles.shared_dq`), staged into its slot of the exchanged block (`mosaic.Exchange`), each
-    consumer's share of dQ's columns over every consumer's keys, at static columns (`mosaic.per_role`)."""
+    consumer's share of dQ's columns over every consumer's keys, at static columns (`mosaic.per_role`), staged
+    for the producer's add where it adds them (`_outbox`, past the walk's first step from `lo` once it has
+    read the last)."""
     if not walk.fused:
         return None
     family, consumers = walk.program.family, walk.consumers
     staged, out_stage = stages[0], stages[1]
+    box = _outbox(walk, stages)
 
     def own(part, q_first):
         family.staged(part, staged.at[index])
@@ -219,7 +232,7 @@ def _fused_adds(walk: _Backward, dq_ref, stages: list, place: tuple, index, k_sm
 
     if not walk.program.tiles.shared_dq:
         return own
-    exchange = mosaic.Exchange(family, stages[2], stages[3], consumers)
+    exchange = mosaic.Exchange(family, stages[-2], stages[-1], consumers)
     exchange.open()
 
     def shared(part, q_first):
@@ -239,7 +252,10 @@ def _fused_adds(walk: _Backward, dq_ref, stages: list, place: tuple, index, k_sm
                 return acc
 
             dq = family.summed((rows, columns), issue, walk.interpret)
-            _dq_added(walk, dq_ref, out_stage, place, index, q_first, dq, columns=share)
+            if box is None:
+                _dq_added(walk, dq_ref, out_stage, place, index, q_first, dq, columns=share)
+            else:
+                box.put(role, dq, after=q_first > lo * rows)
 
         mosaic.per_role(index, consumers, mine)
         exchange.release()
@@ -443,7 +459,8 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
         q_ref, k_ref, v_ref, do_ref, *stat_refs = inputs
         k_smem, v_smem, out_smem, dv_smem, rows_smem, k_loaded, v_loaded, *rest = held
         tile_stage, rest = (rest[-1], rest[:-1]) if tiled else (None, rest)
-        fused = (4 if program.tiles.shared_dq else 2) if walk.fused else 0
+        tiles = program.tiles
+        fused = 2 + 2 * tiles.shared_dq + 2 * tiles.producer_dq if walk.fused else 0
         fused_stages, logits_stages = rest[:fused], rest[fused:]
         row, head = lax.axis_index("batch"), lax.axis_index("heads")
 
@@ -471,7 +488,8 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
                       (v_ref.at[keys_view], v_smem.at[holder], v_loaded.at[holder]))
             # Shared between the consumers (`split_queries`): the first loads them, each waits.
             family.loaded(copies, issued=index == 0 if split else True)
-            lo, hi, _ = program.readers(k_first, q_steps, spans_of, row)
+            # A shared dQ's consumers walk every streamed step in step: each step's exchange takes them all.
+            lo, hi = streamed if tiles.shared_dq else program.readers(k_first, q_steps, spans_of, row)[:2]
             part = (index * count, count) if split else (0, block_q)
 
             store_tiles = functools.partial(_tiles_added, family, tile_refs, tile_stage, (row, head), k_first,
@@ -481,7 +499,7 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
             params_of = functools.partial(_score_params, family, score_refs, kinds, row, head,
                                           k_first=k_first, keys_first=True)
             resident = k_smem.at[holder], v_smem.at[holder]
-            adds = _fused_adds(walk, dq_ref, fused_stages, (row, head), index, k_smem, holder)
+            adds = _fused_adds(walk, dq_ref, fused_stages, (row, head), index, k_smem, holder, lo)
             stage = _logits_stage(family, consumers, logits_stages, index)
             statistics = None if program.tiles.shared_dq else rows_of
             step = functools.partial(_dkv_step, walk, resident, statistics, coords_of, params_of, store_tiles,
@@ -507,7 +525,15 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
             return None
 
         def producer():
-            family.stream(streams, views, *streamed)
+            box = _outbox(walk, fused_stages)
+            share = width // consumers
+
+            def targets(step):
+                # A step's dQ tile, a share of its columns each consumer's (`_fused_adds`).
+                rows = dq_ref.at[0, row, pl.ds(step * block_q, block_q), head]
+                return tuple(rows.at[:, pl.ds(index * share, share)] for index in range(consumers))
+
+            family.stream(streams, views, *streamed, adds=None if box is None else (box, targets))
 
         return family.roles(consumers, consumer, producer)
 

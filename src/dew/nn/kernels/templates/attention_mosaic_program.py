@@ -138,6 +138,10 @@ class BackwardTiles:
     once a program (FlashAttention 3's width 128, run_mha_bwd_hdim128: AtomLayoutMdQ 1 over two MMA
     warpgroups; each consumer adding a whole tile over its own keys adds twice, the measured bound,
     ET-DQBOUND-h100)."""
+    producer_dq: bool = False
+    """Whether a shared dQ's adds are its producer's (`mosaic.Outbox`): each consumer stages its share of a
+    tile's dQ, which the producer adds by TMA's reduction a ring's depth behind its loads and frees once
+    read, the adds' waits off the consumers' walk (FlashAttention 3's dQ store warp)."""
     shared_keys: bool = False
     """Whether the fused launch's consumers share one key block (`attention_mosaic_coop._coop_launch`):
     each forms the logits of its share of the keys and holds its share of the head's columns of dK, dV and
