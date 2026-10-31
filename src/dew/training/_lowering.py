@@ -85,11 +85,12 @@ def _read[T](lowered: jax.stages.Lowered, read: Callable[[ir.Operation], T | Non
         functions = {ir.StringAttr(op.attributes["sym_name"]).value: op.operation
                      for op in module.body.operations if op.operation.name == "func.func"}
         assert "main" in functions, "a lowered program's entry is its module's main"
-        callees: dict[str, Counter[str]] = {name: Counter() for name in functions}
+        callees: dict[str, dict[str, float]] = {name: {} for name in functions}
         for name, function in functions.items():
             for operation, times in _walked(function, 1.0):
                 if operation.name == "func.call":
-                    callees[name][ir.FlatSymbolRefAttr(operation.attributes["callee"]).value] += times
+                    callee = ir.FlatSymbolRefAttr(operation.attributes["callee"]).value
+                    callees[name][callee] = callees[name].get(callee, 0.0) + times
         runs = call_weights(callees, "main")
         for name, function in functions.items():
             if runs[name]:
@@ -311,8 +312,8 @@ class KernelReport:
             entry["calls"] += runs
             if call.config not in entry["configs"]:
                 entry["configs"].append(call.config)
-            stated = entry["flops"] is not None and call.flops is not None
-            entry["flops"] = entry["flops"] + call.flops * runs if stated else None
+            stated, flops = entry["flops"], call.flops
+            entry["flops"] = stated + flops * runs if stated is not None and flops is not None else None
         for entry in launches.values():
             entry["calls"] = int(entry["calls"]) if math.isfinite(entry["calls"]) else None
             if entry["flops"] is not None and not math.isfinite(entry["flops"]):

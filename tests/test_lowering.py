@@ -340,13 +340,17 @@ def test_a_scanned_stacks_kernel_report_counts_every_layers_launches_as_the_flop
             trainer.compile(state, {"text": jax.ShapeDtypeStruct((jax.device_count(), 129), jnp.int32)})
         return lowered.value.kernels.record(), hlo_flops(lowered.value.lowered.as_text(dialect="hlo"))
 
-    (scanned, counted), (unrolled, _) = reported(scanned=True), reported(scanned=False)
+    (scanned, counted), (unrolled, alike) = reported(scanned=True), reported(scanned=False)
+
     def launches(record) -> dict[str, tuple]:
         return {entry["name"]: (entry["calls"], entry["flops"]) for entry in record["launches"]}
 
     assert launches(scanned) and launches(scanned) == launches(unrolled)
-    templated = [entry for entry in scanned["launches"] if entry["kind"] == "mosaic_gpu"]
-    assert counted is not None and counted.hardware == sum(entry["flops"] or 0.0 for entry in templated)
+    # The FLOP count sizes the launches the report states and leaves out the ones it leaves unsized, so
+    # both count every layer's: the same FLOPs and the same unsized launches scanned as unrolled.
+    assert counted is not None and alike is not None
+    assert (counted.hardware, counted.unsized) == (alike.hardware, alike.unsized)
+    assert scanned["unsized"] == unrolled["unsized"] == counted.unsized
 
 
 @pytest.mark.parametrize("bound", [None, 64], ids=["undeclared", "declared"])
