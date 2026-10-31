@@ -296,9 +296,10 @@ def _last_hidden_state(model, features, *, key: str):
     return model(**{key: features}).last_hidden_state
 
 
-_AUDIO_FILES = ("config.json", "preprocessor_config.json")
+_AUDIO_FILES = ("config.json", "preprocessor_config.json", "processor_config.json")
 """The files an audio tower's configuration and feature extractor are read from (transformers'
-`CONFIG_NAME` and `FEATURE_EXTRACTOR_NAME`)."""
+`CONFIG_NAME`, `FEATURE_EXTRACTOR_NAME`, and `PROCESSOR_NAME`, whose nested extractor settings
+`FeatureExtractionMixin.get_feature_extractor_dict` reads first)."""
 
 
 @dataclass(frozen=True, eq=False)
