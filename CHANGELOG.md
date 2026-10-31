@@ -18,6 +18,10 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   is not Dew's: its prime bases per n-gram order, its seed and its multipliers bounded for int32.
 - A MoVA run saved while its value experts recorded their layer's dispatch loads again, and a trainer
   places a MoVA model's stacked value experts on the expert axis.
+- A decision run's summary states each question budget with where it came from beside the window's
+  (`capacities["question"]`, `capacities["option"]`: stated, the release's, Laya's where a release
+  states none, or whole), and a row a budget's cut refuses keeps that cut, which the run's data report
+  counts beside the delivered rows' (`Rejected.cut`).
 - Muon's and M3's Newton-Schulz multiply in the run's numerics: bfloat16 operands in its fast forms
   (the default) and float32 at `Numerics.matmul` in its accurate ones (`--trainer.precision accurate`:
   IEEE float32), each matrix whole on one device and the matrices spread over the mesh. A run states its

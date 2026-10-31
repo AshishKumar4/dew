@@ -35,6 +35,9 @@ class Rejected:
     consumed: int = 0
     """The source examples a rejected row was the last of (`CONSUMED`), which the next row its corpus keeps
     carries on (`dew.data.mixing.Accepted`)."""
+    cut: Mapping[str, int] = dataclasses.field(default_factory=dict)
+    """The tokens the cuts of the refused rows removed, by what each cut, which its corpus counts beside
+    the refusal (`dew.data.mixing.CorpusCounts.dropped`)."""
 
 
 CONSUMED = "_dew_consumed"
