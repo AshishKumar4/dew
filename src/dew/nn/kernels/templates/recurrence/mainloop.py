@@ -901,7 +901,7 @@ def _intra(q, k, hi, lo, beta, taken, call: _Call, *, scale: float):
                        keys=call.given.views(k_ref, row, CHUNK, keyed, width),
                        gates=gates.views(hi_ref, row, CHUNK, h * width, width),
                        lows=gates.views(lo_ref, row, CHUNK, h * width, width))
-        pairing, referenced, *merges = staging
+        pairing, referenced, gated_tiles, *merges = staging
 
         def step(index, slots, carry, accumulators):
             del index
@@ -910,10 +910,12 @@ def _intra(q, k, hi, lo, beta, taken, call: _Call, *, scale: float):
             # The sub-chunks' first tokens' prefix halves read once a step into a plain tile, a row each:
             # read from global memory in each rolled turn, their latency bound an H100's launch (ncu: 59% of
             # its stalls on L1TEX scoreboards, JS-kdakept-h100-797377e5d).
+            # A key block's own row of the tile, which a rolled key block indexes.
             for half, ref in enumerate((hi_ref, lo_ref)):
                 for sub in range(CHUNK // algebra.SUB):
-                    referenced[half, sub, :] = family.columns_of(
-                        ref.at[row + sub * algebra.SUB, pl.ds(h * width, width)])
+                    for c in range(width // keys):
+                        referenced[half, sub, c, :] = family.columns_of(
+                            ref.at[row + sub * algebra.SUB, pl.ds(h * width + c * keys, keys)])
 
             def block(name, operand, c):
                 return _tile(slots, name, operand, columns=pl.ds(c * keys, keys)).value()
@@ -925,15 +927,20 @@ def _intra(q, k, hi, lo, beta, taken, call: _Call, *, scale: float):
                 """The sub-chunk's first token's prefix halves on key block `c`, a column's vectors, from the
                 step's plain tile of them (a stream's tiles carry their bundle's transforms, which a traced
                 row does not commute through)."""
-                columns = pl.ds(c * keys, keys)
-                return tuple(family.columns_of(referenced.at[half, sub, columns]) for half in (0, 1))
+                return tuple(family.columns_of(referenced.at[half, sub, c]) for half in (0, 1))
 
             def gated(c):
                 return block("gates", gates, c), block("lows", gates, c)
 
+            def kept(name, value):
+                # A key block's gated rows or keys kept in shared memory for its sub-chunks' turns.
+                tile = gated_tiles.at[0 if name == "down" else 1]
+                tile[...] = value
+                return lambda: tile[...]
+
             pairs = functools.partial(algebra.key_decayed_pairs, columns=width // keys, gates=gated,
                                       reference=reference, summed=Issuer(call, {"pairs": pairing}).summed,
-                                      chunk=CHUNK)
+                                      kept=kept, chunk=CHUNK)
             scores = pairs(operand("queries"), operand("keys"), strict=False) * scale
             held.store(outs[-1], scores, row, CHUNK, h * CHUNK, CHUNK, family=family, smem=landing["square"])
             if call.delta:
@@ -953,11 +960,13 @@ def _intra(q, k, hi, lo, beta, taken, call: _Call, *, scale: float):
     # Each sub-chunk's and key block's gated rows and keys and their product, for the scores and the system,
     # then the inverse's doubling.
     pairs = (CHUNK // algebra.SUB) * (1 + call.delta)
-    # The exponentials: a key block's rows gated down once, its keys up a sub-chunk at a time.
+    # The exponentials: a key block's rows gated down and its keys up once, each sub-chunk's lifts a vector
+    # from each sub-chunk up to it.
+    subs = CHUNK // algebra.SUB
     work = Work(pairs * 2 * CHUNK * CHUNK * width + (_inverse_flops() if call.delta else 0),
-                exponentials=(CHUNK // algebra.SUB + 1) * (1 + call.delta) * CHUNK * width)
-    staging = (_pairing(call, keys), plgpu.SMEM((2, CHUNK // algebra.SUB, width), jnp.float32),
-               *(_merges(call) if call.delta else ()))
+                exponentials=(2 * CHUNK + subs * (subs + 1) // 2) * width * (1 + call.delta))
+    staging = (_pairing(call, keys), plgpu.SMEM((2, CHUNK // algebra.SUB, width // keys, keys), jnp.float32),
+               plgpu.SMEM((2, CHUNK, keys), jnp.float32), *(_merges(call) if call.delta else ()))
     return _kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
                    grid_names=("chunks", "heads"), blocks=blocks, stages=1, live=_taken(5), work=work,
                    held=_intra_held(call, keys), staging=staging,
