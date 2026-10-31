@@ -54,10 +54,11 @@ class Report:
     """One Mosaic GPU kernel's reports: its name, the shared bytes and tensor memory columns it asks for
     (Mosaic's resource estimate), its registers a thread and its spilled bytes (ptxas's, the most over the
     kernel's functions), what the reports left `unread`: either report without the other, or a field
-    neither states, is no evidence the kernel is within its resources; and its `module`, the digest of
-    Mosaic's module after layout inference less its dump's name, which two compiles of one module share:
-    Mosaic compiles a module once a process, so a later compile of it reports no ptxas run of its own; and
-    the digest of the launch that traced it (`launching`), which its name carried, or None."""
+    neither states, is no evidence the kernel is within its resources; and its `module`, which two
+    compiles of one module share (the digest of Mosaic's module after layout inference less its dump's
+    name, where a lowering dumped it; the gate's, which lowers without reports, its kernel hash,
+    `_compiled`): Mosaic compiles a module once a process, so a later compile of it reports no ptxas run of
+    its own; and the digest of the launch that traced it (`launching`), which its name carried, or None."""
     kernel: str
     shared: int | None
     tmem: int | None
@@ -307,9 +308,8 @@ def compiled_apart() -> list[dict]:
 
 PTXAS_REPORTS: dict[str, tuple[int, int]] = {}
 """Each Mosaic GPU kernel's ptxas report this process read, its registers and spilled bytes, by its module
-(the digest of Mosaic's module after layout inference, `mosaic_kernels`): Mosaic compiles a module once a
-process, so a later case of the same module dumps the module and its resources, never PTX or ptxas's
-report (`inherited`)."""
+(`Report.module`): Mosaic compiles a module once a process, so a later case of the same module dumps its
+resources, never PTX or ptxas's report (`inherited`)."""
 
 
 def inherited(kernel: dict) -> dict:
