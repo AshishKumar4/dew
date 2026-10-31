@@ -90,6 +90,7 @@ import argparse
 import ast
 import collections
 import concurrent.futures
+import dataclasses
 import functools
 import hashlib
 import heapq
@@ -415,32 +416,51 @@ def shapes(module: types.CodeType) -> list[list]:
     return sorted(found, key=json.dumps)
 
 
+@dataclasses.dataclass
+class Reading:
+    """One reading of the checkout's inputs (`cache_key`): each input's part by its path, and each module's
+    units by its path, read once, by whichever of the threads looking rows up asks first. A reading lasts
+    while the checkout stands still: a plan's lookups, gpu_tier's, a task's before its tests run (2026-10-31:
+    train 368's plan read each of a row's ~3,000 inputs again for each of 1,682 rows, 9.5 minutes before its
+    first task)."""
+
+    parts: dict[str, bytes] = dataclasses.field(default_factory=dict)
+    modules: dict[str, dict[str, bytes] | bytes] = dataclasses.field(default_factory=dict)
+    lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
+
+    def part(self, path: str) -> bytes:
+        """Input `path`'s part of a key: a unit's digest (`unit`), or its contents' (`contents`)."""
+        found = self.parts.get(path)
+        if found is None:
+            with self.lock:
+                found = self.parts.get(path)
+                if found is None:
+                    found = self.parts[path] = self.read(path)
+        return found
+
+    def read(self, path: str) -> bytes:
+        module, _, executed = path.partition(followed.CODE)
+        if not executed or not Path(module).is_file():
+            return contents(path)
+        if module not in self.modules:
+            self.modules[module] = units(module)
+        found = self.modules[module]
+        return found.get(executed, b"missing") if isinstance(found, dict) else found
+
+
 def cache_key(common: str, name: str, split: str, depends: list[str],
-              read: dict[str, bytes] | None = None) -> str:
+              reading: Reading | None = None) -> str:
     """The key of test file `name`'s row in `split`'s group whose run executed or read `depends`
     (executed.py): its `inputs`' contents, its directories' entries, `common`, and for a group of a split
     file, the group and the tests split.py cuts into it from the durations record (`members`), the record's
     only part a run's outcome depends on: not their seconds, which each train's fold of main's durations
     moves (the maintainer, 2026-10-28: every train re-keyed its split files and reran them cold, row 2000).
-    `read` holds what one reading of the checkout found of each input, by its path, and takes what this key
-    reads: the keys of one reading (a plan's lookups, a task's before its tests run) read each input once,
-    however many rows name it (2026-10-31: train 368's plan read each of a row's ~3,000 inputs again for each
-    of 1,682 rows, 9.5 minutes before its first task)."""
+    The inputs as `reading` finds them: the keys of one reading read each input once, however many rows
+    name it."""
     digest = hashlib.sha256(common.encode())
-    read = {} if read is None else read
-    # A module's units read from one reading of its text.
-    modules: dict[str, dict[str, bytes] | bytes] = {}
+    reading = Reading() if reading is None else reading
     for path in inputs(name, depends):
-        if path not in read:
-            module, _, executed = path.partition(followed.CODE)
-            if executed and Path(module).is_file():
-                if module not in modules:
-                    modules[module] = units(module)
-                found = modules[module]
-                read[path] = found.get(executed, b"missing") if isinstance(found, dict) else found
-            else:
-                read[path] = contents(path)
-        digest.update(path.encode() + read[path])
+        digest.update(path.encode() + reading.part(path))
     if split and split != COLLECT:
         digest.update(split.encode() + json.dumps(members(name, split)).encode())
     return digest.hexdigest()
@@ -607,13 +627,13 @@ def reusable(python: str, rows: list[tuple[str, str]], common: str) -> dict[tupl
     token, held = os.environ.get(READ_TOKEN), pinned_classes()
     if not token or not held or "DEW_XLA_CACHE_URL" not in os.environ:
         return {}
-    # The plan's one reading of the checkout, which every row's key reads its inputs from (`cache_key`).
-    read: dict[str, bytes] = {}
+    # The plan's one reading of the checkout, which every row's key reads its inputs from.
+    reading = Reading()
 
     def hit(each_row: tuple[str, str]) -> str | None:
         name, group = each_row
         for each in held:
-            found = green_record(python, name, group, common, token, [each], read)
+            found = green_record(python, name, group, common, token, [each], reading)
             # Kept only where its green run is kept by its key, as the task reads it.
             if found is not None and recorded(green_key(python, row(python, name, group), each, found["key"]),
                                               token) is not None:
@@ -655,18 +675,18 @@ def kept_of(tests: list[str]) -> tuple[list[str], dict[tuple[str, str], tuple[st
 
 
 def green_record(python: str, name: str, split: str, common: str, token: str,
-                 classes: list[str], read: dict[str, bytes] | None = None) -> dict | None:
+                 classes: list[str], reading: Reading | None = None) -> dict | None:
     """The record of test file `name`'s row (in `split`'s group) that ran green on exactly these inputs on one
-    of `classes`, the first found; else None. The plan (`reusable`) and a task (`reused`) read it alike, each
-    input once a reading (`read`, `cache_key`)."""
+    of `classes`, the first found; else None. The plan (`reusable`) and a task (`reused`) read it alike, from
+    one reading of the inputs (`Reading`)."""
     for each in classes:
         found = recorded(record_key(python, row(python, name, split), each, common), token)
-        if found is not None and fresh(found, name, common, read):
+        if found is not None and fresh(found, name, common, reading):
             return found
         # The last run's record is another commit's: its file's inputs, as that run found them, hashed
         # here, name the green run of exactly these, kept by its key (`green_key`) whatever ran since.
         if found is not None and found["depends"] is not None:
-            key = cache_key(common, name, split, found["depends"], read)
+            key = cache_key(common, name, split, found["depends"], reading)
             kept = recorded(green_key(python, row(python, name, split), each, key), token)
             if kept is not None and kept["key"] == key:
                 return kept
@@ -682,29 +702,29 @@ def reused_classes(network: bool = False) -> list[str]:
 
 
 def reused(python: str, name: str, split: str, common: str, network: bool = False,
-           kept: tuple[str, str] | None = None, read: dict[str, bytes] | None = None) -> dict | None:
+           kept: tuple[str, str] | None = None, reading: Reading | None = None) -> dict | None:
     """The green row of test file `name` (in `split`'s group) recorded on a class this host reuses
     (`reused_classes`), if it ran green there on exactly these inputs; else None. A file its plan kept
     (`kept`: its green run's class and key, `reusable`) reads that run, fresh here; any other, the record of
     the last run on these shared inputs: a key hashes them (`cache_key`), so no run on others, whose record
-    the last run's may be, can be fresh here. Each input is read once a reading (`read`, `cache_key`)."""
+    the last run's may be, can be fresh here, all from one reading of the inputs (`Reading`)."""
     token = os.environ.get("DEW_XLA_CACHE_TOKEN")
     if not token or "DEW_XLA_CACHE_URL" not in os.environ:
         return None
     if kept is not None:
         found = recorded(green_key(python, row(python, name, split), *kept), token)
-        if found is not None and found["key"] == kept[1] and fresh(found, name, common, read):
+        if found is not None and found["key"] == kept[1] and fresh(found, name, common, reading):
             return found["row"]
-    found = green_record(python, name, split, common, token, reused_classes(network), read)
+    found = green_record(python, name, split, common, token, reused_classes(network), reading)
     return None if found is None else found["row"]
 
 
-def fresh(recorded: dict, name: str, common: str, read: dict[str, bytes] | None = None) -> bool:
-    """Whether test file `name`'s record was made by a green run on exactly these inputs, each read once a
-    reading (`read`, `cache_key`). A red run, or one of a file that started another Python process, whose
-    code no event saw, leaves no key."""
+def fresh(recorded: dict, name: str, common: str, reading: Reading | None = None) -> bool:
+    """Whether test file `name`'s record was made by a green run on exactly these inputs, as `reading` finds
+    them (`cache_key`). A red run, or one of a file that started another Python process, whose code no event
+    saw, leaves no key."""
     return recorded["key"] is not None and recorded["key"] == cache_key(
-        common, name, parsed_row(recorded["row"]["name"])[2], recorded["depends"], read)
+        common, name, parsed_row(recorded["row"]["name"])[2], recorded["depends"], reading)
 
 
 RECORD_TRIES = 4
@@ -1136,11 +1156,11 @@ def reused_rows(python: str, tests: list[str], group: str, common: str, network:
                 kept: Mapping[str, tuple[str, str]] | None = None) -> list[dict]:
     """The green rows of `tests` in `group` recorded on these inputs on this host's class (`reused`), those
     its plan kept read where it found them (`kept`), said. They are looked up before any test runs, from one
-    reading of the checkout (`cache_key`)."""
+    reading of the checkout (`Reading`)."""
     kept = kept or {}
-    read: dict[str, bytes] = {}
+    reading = Reading()
     rows = [found for name in tests
-            if (found := reused(python, name, group, common, network, kept.get(name), read))]
+            if (found := reused(python, name, group, common, network, kept.get(name), reading))]
     if rows:
         print(f"{len(rows)} files ran green on these inputs on {', '.join(reused_classes(network))}; "
               "their rows are reused")
@@ -1370,15 +1390,15 @@ def gpu_tier(python: str) -> dict[str, list[str]]:
         raise SystemExit("the GPU tier is chosen from the test cache's records, which need its URL and token")
     inputs = (shared(python), lane_inputs(python))
     prefix = f"{CACHE_PREFIX}/{python}/"
-    # One reading of the checkout, which every record's key reads its inputs from (`cache_key`).
-    read: dict[str, bytes] = {}
+    # One reading of the checkout, which every record's key reads its inputs from.
+    reading = Reading()
 
     def evidence_of(key: str) -> tuple[str, list[str]]:
         _, name, _ = key_parts(key)
         found = recorded(f"{prefix}{key}", token)
         if found is None:
             return name, ["unrecorded"]
-        current = any(fresh(found, name, common, read) for common in inputs)
+        current = any(fresh(found, name, common, reading) for common in inputs)
         return name, found["reads"] or ([] if current else ["changed"])
 
     try:
