@@ -273,9 +273,9 @@ def test_the_pass_reads_no_more_than_ptxas_holds_an_attention_backward():
         shapes = jax.tree.map(lambda array: jax.ShapeDtypeStruct(array.shape, array.dtype), residuals)
         (record,) = kernel_compile.compile_mosaic_kernels(
             [KernelCase("backward", lambda: (backward, (query, key, key, query, shapes)), models)], "sm90")
-    read = {kernel["kernel"]: kernel.get("need") for kernel in record["kernels"]}
     lowered = record.get("lowered_models", {})
-    checked = [(name, model["registers"], read[name]) for name, model in lowered.items()
-               if name in read and read[name] is not None]
-    assert checked, (sorted(lowered), read)
+    checked = [(found.traced, lowered[found.traced]["registers"], kernel["need"])
+               for kernel in record["kernels"] if (found := kernel_compile._report(kernel)).traced in lowered
+               and kernel.get("need") is not None]
+    assert checked, (sorted(lowered), [kernel["kernel"] for kernel in record["kernels"]])
     assert all(registers <= need for _, registers, need in checked), checked
