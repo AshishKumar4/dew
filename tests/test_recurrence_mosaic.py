@@ -523,9 +523,9 @@ key heads, value heads, key and value widths, and whether the decay is a key dim
 
 def test_the_resource_gate_reads_each_launch_of_one_kernel_apart():
     """The 27B gated delta net's forward launched twice in one program on an H100, at its derived tiles and
-    at a variant: each of its kernels' names compiles under two launches (`report.launching`), each gated
-    on its own launch's evidence, the variant's shared memory its own; a gate that read a kernel by its name
-    alone kept one launch's and dropped the other's."""
+    at a variant: a kernel's name compiled under both launches (`report.launching`) is gated on each
+    launch's evidence, the variant's shared memory its own; a gate that read a kernel by its name alone kept
+    one launch's and dropped the other's."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels
 
@@ -561,9 +561,9 @@ def test_the_resource_gate_reads_each_launch_of_one_kernel_apart():
     for kernel in record['kernels']:
         assert not kernel['unread'], f"{kernel['kernel']}: {kernel['unread']}"
         launches.setdefault(kernel['kernel'], []).append((kernel['launch'], kernel['shared']))
-    assert launches
-    assert all(len({launch for launch, _ in found}) == 2 for found in launches.values()), launches
-    assert any(len({shared for _, shared in found}) == 2 for found in launches.values()), launches
+    # A launch whose module both tiles share is built once (`_lowered_once`), under the first launch's name.
+    twice = [found for found in launches.values() if len({launch for launch, _ in found}) == 2]
+    assert any(len({shared for _, shared in found}) == 2 for found in twice), launches
 
 
 @pytest.mark.parametrize('kernel', ['recurrence_states', 'recurrence_reverse'], ids=['forward', 'backward'])
