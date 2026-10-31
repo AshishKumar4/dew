@@ -320,8 +320,12 @@ def test_a_fresh_runs_rows_hold_their_whole_questions_and_count_each_declared_cu
     assert summary["capacities"]["labels"] == {"count": letters, "from": "tokenizer"} and letters >= count
     lines = [objective.tokenizer.decode(row.tokens[start:end]) for start, end in row.questions[0].options]
     assert lines == [f"\n{label}. {option}" for label, option in zip(names, question.options, strict=True)]
+    # Each question budget whole, as the run states none.
+    assert summary["capacities"]["question"] == {"tokens": None, "from": "whole"}
+    assert summary["capacities"]["option"] == {"tokens": None, "from": "whole"}
     shortest = min(end - start for start, end in row.questions[0].options)
-    _, declared, _ = _run(backbone, count, option_tokens=shortest - 3).prepare().train("x")
+    _, declared, stated = _run(backbone, count, option_tokens=shortest - 3).prepare().train("x")
+    assert stated["capacities"]["option"] == {"tokens": shortest - 3, "from": "stated"}
     [cut] = declared.counts.values()
     assert cut.accepted == count and cut.refused == {}
     assert cut.cut_examples["options"] == cut.cut_rows["options"] == count
@@ -384,3 +388,23 @@ def test_a_server_admits_a_large_question_whole_and_counts_what_it_refuses_as_tr
     [row] = [row.encoded for row in lenient.admit(short).rows]
     assert set(row.cuts) == {"instructions"} and lenient.counts.cut_rows == {"instructions": 1}
     assert lenient.counts.cut_removed == {"instructions": row.instructions_cut}
+
+
+def test_a_release_runs_question_budgets_name_where_each_came_from(tmp_path):
+    """A run over Laya's release states each question budget with where it came from: the release's own
+    question budget, which its config states, and Laya's option budget, which its config leaves unstated
+    and Laya's code fixes at 48 tokens (`LAYA_BUDGETS`), so the release reads as Laya reads it; a budget
+    the run states is the run's."""
+    from test_run_options import TINY_LAYA, decision
+
+    run = decision(tmp_path, drawn=False)
+    assert run.pretrained == str(TINY_LAYA)
+    _, _, summary = Fitted(**{field.name: getattr(run, field.name) for field in dataclasses.fields(run)
+                              if field.init}).prepare().train("x")
+    assert summary["capacities"]["question"] == {"tokens": 48, "from": "release"}
+    assert summary["capacities"]["option"] == {"tokens": 48, "from": "laya"}
+    stated = dataclasses.replace(run, option_tokens=12)
+    _, _, summary = Fitted(**{field.name: getattr(stated, field.name) for field in dataclasses.fields(stated)
+                              if field.init}).prepare().train("x")
+    assert summary["capacities"]["option"] == {"tokens": 12, "from": "stated"}
+
