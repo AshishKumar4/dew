@@ -218,8 +218,8 @@ def test_ptxas_allocates_every_independent_products_accumulators_together(batche
 @pytest.mark.parametrize("batches, products", SHAPES)
 def test_the_pass_counts_the_registers_ptxas_allocates_for_independent_products(batches, products):
     """The pass's peak for the loop counts every product's accumulators and each batch's carried tile, as
-    ptxas allocates them, and no more than ptxas allocates: it holds every product's accumulators of the loop's
-    body to its last product (`kernel_liveness._product`), where the program order would kill a batch's at its
-    fold into its carried tile and count one batch's."""
+    ptxas allocates them, and no more than ptxas allocates: it holds every product's accumulators of the
+    loop's body to its last product (`kernel_liveness._product`), where the program order would kill a
+    batch's at its fold into its carried tile and count one batch's."""
     used, _, _ = kernel_compile._ptxas(ptx_text(batches, products), "sm90", cap=None)
     assert 8 * (batches * products + batches) <= _peak(batches, products) <= used
