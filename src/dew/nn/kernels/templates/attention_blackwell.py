@@ -254,16 +254,18 @@ def _softmax(block: _Block, scratch: _Scratch, outs, *, spec: algebra.Forward, t
         plgpu.barrier_arrive(scratch.p_full)
         return m, total
 
-    whole = block.steps
     padded = bool(spec.keys % block_k)
-    if spec.form == "causal" or padded:
-        # The blocks every query of the block sees whole, below its diagonal and before padding.
-        whole = jnp.maximum(jnp.minimum(lax.div(block.first, block_k), blocks - padded), 0)
+    masks = spec.form == "causal" or padded
+    # The blocks every query of the block sees whole, below its diagonal and before padding; a full call's
+    # every block where its keys fill whole tiles, none masked (a mask chosen at run time held a select of
+    # each entry live beside the logits: width 64's natural forward spilled 16 bytes on a B200).
+    whole = jnp.maximum(jnp.minimum(lax.div(block.first, block_k), blocks - padded), 0) if masks else None
     # Its layouts inferred from the row reductions the walk's carry meets.
     start = (jnp.full((rows,), -jnp.inf, jnp.float32), jnp.zeros((rows,), jnp.float32))
     def walked(index, carry):
         # A block the query block walks, masked from its first that some query sees in part.
-        return lax.cond(index < block.steps, lambda carry: step(index, carry, masked=index >= whole),
+        masked = index >= whole if masks else False
+        return lax.cond(index < block.steps, lambda carry: step(index, carry, masked=masked),
                         lambda carry: carry, carry)
 
     m, total = lax.fori_loop(0, blocks, walked, start)
