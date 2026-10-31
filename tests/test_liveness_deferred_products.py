@@ -276,7 +276,10 @@ def test_the_pass_reads_no_more_than_ptxas_holds_an_attention_backward():
 
         # The pass's count by launch (`lowered_models`) and each launch's least spill-free cap by ptxas
         # (`least`, `kernel_compile.register_need`).
-        (record,) = kernel_compile.compile_mosaic_kernels([case(models)], "sm90", least=True)
+        # Twice: a module compiled before in the process prints no PTX, its cap read from its first print.
+        records = [kernel_compile.compile_mosaic_kernels([case(models)], "sm90", least=least)[0]
+                   for least in (False, True)]
+        record = records[-1]
     lowered = record.get("lowered_models", {})
     least = {kernel_compile.report.launch_name(kernel["kernel"], kernel["launch"]): kernel["least"]
              for kernel in record["kernels"]}

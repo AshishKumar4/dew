@@ -413,6 +413,18 @@ NEEDS: dict[str, int | dict | None] = {}
 `COMPILED` keeps its compile: a later compile of the same module prints no PTX."""
 
 
+PTX: dict[str, str] = {}
+"""Each Mosaic GPU module's PTX this process printed, by its module, as `COMPILED` keeps its compile: a later
+compile of the same module prints none, and a least spill-free cap asked of it after (`_least`) reads this."""
+
+
+@functools.cache
+def _least(module: str | None, generation: str) -> int | None:
+    """The least spill-free cap of the kernel `module` names (`register_need`), from its PTX this process
+    printed (`PTX`); None where it printed none."""
+    return None if module not in PTX else register_need(PTX[module], generation)
+
+
 def needed(kernel: dict, needs: dict[str, int | dict | None]) -> dict:
     """`kernel`'s record with its register need: from the PTX its compile printed (`needs`, by its name and
     launch, `report.launch_name`), which this process keeps by its module (`NEEDS`), or, where Mosaic compiled
@@ -599,10 +611,13 @@ def _compiled_here(cases, generation: str, *, least: bool = False) -> list[dict]
             needs = _needs(directory, generation, modelled)
             compiled = _compiled_reports(directory, generation)
             record["kernels"] = [needed(inherited(kernel, compiled), needs) for kernel in kernels]
-            if least:
-                caps = _needs(directory, generation)
-                for kernel in record["kernels"]:
-                    kernel["least"] = caps.get(report.launch_name(kernel["kernel"], kernel["launch"]))
+            printed = {path.stem: path.read_text() for path in Path(directory).glob("*.ptx")}
+            for kernel in record["kernels"]:
+                name = report.launch_name(kernel["kernel"], kernel["launch"])
+                if kernel["module"] is not None and name in printed:
+                    PTX[kernel["module"]] = printed[name]
+                if least:
+                    kernel["least"] = _least(kernel["module"], generation)
         record["tmem_limit"] = gpu_target(generation).tmem_columns or 0
         record["evidence"] = _register_evidence(record)
         found.append(record)
