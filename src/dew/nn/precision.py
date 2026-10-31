@@ -28,7 +28,9 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import enum
 import functools
+import inspect
 import os
 from collections.abc import Callable, Hashable, Sequence
 from typing import Literal, overload
@@ -226,7 +228,7 @@ def spread(value: jax.Array, shape: tuple[int, ...]) -> jax.Array:
 def _spreads(shape: tuple[int, ...], axes: tuple[int, ...]) -> tuple[Callable, Callable]:
     """`spread`'s two branches to `shape` over the size-one `axes`, the CPU's outer product and the
     broadcast, built once a shape: `platform_dependent` traces its branches once a function, so the same
-    functions find JAX's traces of them cached (`_accumulation`)."""
+    functions find JAX's traces of them cached (`_float64_sums`)."""
     kept = tuple(axis for axis in range(len(shape)) if axis not in axes)
 
     def outer(value: jax.Array) -> jax.Array:
@@ -412,60 +414,90 @@ def accumulated(product: Callable[..., jax.Array], *operands,
     products here. A computation that stands for such a target, a reference for a kernel interpreted
     on a CPU, states its fp32 sums with JAX's dot algorithm for them, `with
     jax.default_matmul_precision(FP32_SUMS)`, which jit's cache keys as it keys every precision."""
-    if not _sums_in_float64(*operands):
-        return product(*operands, preferred_element_type=preferred_element_type)
-    shapes = tuple(jax.ShapeDtypeStruct(operand.shape, operand.dtype) for operand in operands)
-    branches = _accumulation(_keyed(product), preferred_element_type, shapes, jax.config.jax_enable_x64,
-                             jax.config.jax_default_matmul_precision)
-    if branches is None:
-        return product(*operands, preferred_element_type=preferred_element_type)
-    wide, narrow = branches
-    return jax.lax.platform_dependent(*operands, cpu=wide, default=narrow)
-
-
-@dataclasses.dataclass(frozen=True)
-class _Keyed:
-    """A product (`accumulated`) by what it computes, `key`, which alone compares (`_keyed`)."""
-
-    key: Hashable
-    product: Callable[..., jax.Array] = dataclasses.field(compare=False)
-
-
-def _keyed(product: Callable[..., jax.Array]) -> _Keyed:
-    """`product` keyed by what it computes: a partial by its function, arguments and keywords, so the
-    partials callers build apart at each call key one entry (`_accumulation`); any other product, or a
-    partial over an unhashable argument (an array), by itself."""
-    if not isinstance(product, functools.partial):
-        return _Keyed(product, product)
-    stated = (product.func, product.args, tuple(sorted(product.keywords.items())))
-    try:
-        hash(stated)
-    except TypeError:  # an unhashable argument: the partial keys by itself
-        return _Keyed(product, product)
-    return _Keyed(stated, product)
-
-
-@functools.lru_cache(maxsize=4096)
-def _accumulation(keyed: _Keyed, preferred_element_type: DTypeLike | None,
-                  shapes: tuple[jax.ShapeDtypeStruct, ...], x64: bool,
-                  matmul_precision: str | None) -> tuple[Callable, Callable] | None:
-    """`accumulated`'s two branches for `keyed`'s product over operands of `shapes`, the CPU's float64 sum
-    and the plain product, built once a product, operand types and the trace's x64 and matmul precision
-    settings: `platform_dependent` traces its branches once a function, so the same functions find
-    JAX's traces of them cached where a model forms the product again (each layer of a stack, each trace
-    of a step), where fresh ones traced both at every call. None where the products are not float32's,
-    or the product carries a backward of its own, which take the plain product."""
-    from dew.nn.kernels.generation import linear_tangent
-
-    del x64, matmul_precision  # keys: what the traces read of the configuration
-    product = keyed.product
     narrow = functools.partial(product, preferred_element_type=preferred_element_type)
-    traced, shape = jax.make_jaxpr(narrow, return_shape=True)(*shapes)
+    if not _sums_in_float64(*operands):
+        return narrow(*operands)
+    # The product as these operands make it, weak types, shardings and any library intercepting it
+    # included, probed at every call.
+    traced, shape = jax.make_jaxpr(narrow, return_shape=True)(*operands)
     dtype = shape.dtype
     if jnp.promote_types(dtype, jnp.float32) != jnp.float32 or _own_backward(traced.jaxpr):
         # A wider result converts the operands to it, so the products are not float32's; a product
         # with a backward of its own is its library's.
+        return narrow(*operands)
+    stated = _stated(product)
+    if stated is None:
+        wide = _float64_sum(product, dtype)
+    else:
+        wide = _float64_sums(stated, product, dtype, str(traced.jaxpr), jax.config.jax_enable_x64,
+                             jax.config.jax_default_matmul_precision)
+    return jax.lax.platform_dependent(*operands, cpu=wide, default=narrow)
+
+
+@dataclasses.dataclass(frozen=True, eq=False)
+class _Same:
+    """A function compared and hashed by its identity alone, whatever equality it states (dataclass
+    equality off, so `object`'s identity holds)."""
+
+    function: Callable[..., jax.Array]
+
+
+type _Argument = (tuple[_Argument, ...] | bool | int | float | str | enum.Enum | np.dtype | jax.Array
+                 | np.ndarray | Callable[..., jax.Array] | None)
+"""An argument a product's partial binds: a statement's value (`_STATED_VALUES`), or an array or a
+function, which states nothing."""
+
+_STATED_VALUES = (bool, int, float, str, type(None), enum.Enum, np.dtype)
+"""The argument values a product's statement holds as what they are (`_stated`): immutable, no array,
+no tracer."""
+
+
+def _stated(product: Callable[..., jax.Array]) -> Hashable | None:
+    """What `product` computes, where that alone fixes it: a function of its module's (no closure, no
+    method of an instance, nothing built at a call), or a partial of one over immutable arguments, each by
+    its type and value (`_STATED_VALUES`, tuples of them), so a scalar of another type is another
+    product. None for any other product, which `accumulated` builds afresh at each call, as it holds
+    nothing a trace may not keep (a tracer it closes over, an array)."""
+    function, arguments, keywords = ((product.func, product.args, product.keywords)
+                                     if isinstance(product, functools.partial) else (product, (), {}))
+    # A function of its module's: a plain function, not a method, defined at no call (`<locals>`) and
+    # closing over nothing (a wrapper `functools.wraps` names as what it wraps does).
+    if (not inspect.isfunction(function) or "<locals>" in function.__qualname__
+            or function.__closure__ is not None):
         return None
+
+    def value(argument: _Argument) -> Hashable | None:
+        if isinstance(argument, tuple):
+            held = tuple(value(element) for element in argument)
+            return None if any(element is None for element in held) else (tuple, held)
+        if isinstance(argument, _STATED_VALUES):
+            return (type(argument), argument)
+        return None
+
+    held = [value(argument) for argument in arguments]
+    named = [(name, value(argument)) for name, argument in sorted(keywords.items())]
+    if any(entry is None for entry in held) or any(entry is None for _, entry in named):
+        return None
+    return (_Same(function), tuple(held), tuple(named))
+
+
+@functools.lru_cache(maxsize=1024)
+def _float64_sums(stated: Hashable, product: Callable[..., jax.Array], dtype: np.dtype, probed: str,
+                  x64: bool, matmul_precision: str | None) -> Callable:
+    """`_float64_sum` of the product `stated` names, built once a product, its result's dtype, the
+    program its operands made of it (`probed`, which a library patching the product in place changes)
+    and the trace's x64 and matmul precision settings: `platform_dependent` traces a branch once a
+    function, so where a model forms the product again (each layer of a stack, each trace of a step)
+    the same function finds JAX's trace of it, where a fresh one traced it at every call. `product` is
+    the first caller's, which computes what every one `stated` names computes."""
+    del stated, probed, x64, matmul_precision  # keys: what the branch computes
+    return _float64_sum(product, dtype)
+
+
+def _float64_sum(product: Callable[..., jax.Array], dtype: np.dtype) -> Callable:
+    """`accumulated`'s CPU branch for `product`: its products summed in float64 and rounded once to
+    `dtype`, forward and reverse."""
+    from dew.nn.kernels.generation import linear_tangent
 
     def summed(*operands):
         return float64_sum(product, *operands, dtype=dtype)
@@ -491,8 +523,7 @@ def _accumulation(keyed: _Keyed, preferred_element_type: DTypeLike | None,
             return tuple(transposed(index) for index in live)
 
     # Forward mode differentiates `summed` as it traces, inside its scope; reverse mode runs `pulled`.
-    wide = linear_tangent(lambda *operands: (summed(*operands), ()), pulled, summed, live_cotangents=True)
-    return wide, narrow
+    return linear_tangent(lambda *operands: (summed(*operands), ()), pulled, summed, live_cotangents=True)
 
 
 L2NORM_EPS = 1e-6

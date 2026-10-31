@@ -6,6 +6,7 @@ backends keep their own arithmetic. A library process, without the setting, trac
 products."""
 
 import contextlib
+import functools
 
 import jax
 import jax.numpy as jnp
@@ -312,3 +313,73 @@ def test_wide_cpu_arithmetic_is_the_test_settings_alone(wide, monkeypatch):
     # A float64 division is the plain division under either setting.
     with jax.enable_x64(new_val=True):
         assert not chosen(traced(divided, np.ones(3, np.float64), np.float64(3.0)))
+
+
+def scaled_dot(lhs, rhs, scale, *, preferred_element_type=None, precision=None):
+    """A product of its module's whose result's dtype its `scale` decides: a Python scalar keeps
+    float32's, a NumPy float64 promotes it under x64."""
+    return jnp.dot(lhs, rhs, precision=precision, preferred_element_type=preferred_element_type) * scale
+
+
+def test_a_product_traced_again_takes_its_cached_sum():
+    """A product formed again over operands of the same types (a stack's layers, a step traced again)
+    takes the CPU branch JAX traced before, which a branch built afresh at each call traced again: the
+    second trace of a layer's gradient logs no tracing cache miss in `accumulated`."""
+    import logging
+
+    layer = Dense(4)
+    x = jnp.asarray(np.random.default_rng(0).standard_normal((3, 5)), jnp.float32)
+    params = layer.init(jax.random.key(0), x)
+
+    def loss(params):
+        return jnp.sum(layer.apply(params, x) ** 2)
+
+    missed = []
+
+    class Missed(logging.Handler):
+        def emit(self, record):
+            if "accumulated" in record.getMessage() and "CACHE MISS" in record.getMessage():
+                missed.append(record.getMessage())
+
+    jax.make_jaxpr(jax.grad(loss))(params)
+    handler = Missed()
+    logging.getLogger("jax").addHandler(handler)
+    try:
+        with jax.explain_cache_misses(new_val=True):
+            jax.make_jaxpr(jax.grad(loss))(params)
+    finally:
+        logging.getLogger("jax").removeHandler(handler)
+    assert not missed, missed[:1]
+
+
+def test_products_alike_but_for_a_scalars_type_are_two_products():
+    """A partial over 1 and one over NumPy's float64 1 compare equal and are not one product: under x64 the
+    second promotes the result to float64, so it takes the plain product, as it did first."""
+    lhs, rhs = np.ones((2, 3), np.float32), np.ones((3, 2), np.float32)
+    with jax.enable_x64(new_val=True):
+        plain = accumulated(functools.partial(scaled_dot, scale=1), lhs, rhs)
+        promoted = accumulated(functools.partial(scaled_dot, scale=np.float64(1)), lhs, rhs)
+    assert plain.dtype == jnp.float32
+    assert promoted.dtype == jnp.float64
+
+
+def test_a_weak_operand_keeps_the_products_dtype():
+    """A Python scalar's weak float32 beside a bfloat16 array makes a bfloat16 product, as the plain
+    product does, the operands probed as given."""
+    weak, half = jnp.asarray(2.0), jnp.ones((), jnp.bfloat16)
+    assert accumulated(jnp.dot, weak, half).dtype == jnp.dot(weak, half).dtype == jnp.bfloat16
+
+
+def test_a_product_closing_over_a_tracer_keeps_none_past_its_trace():
+    """A product built inside a trace over a traced value sums in float64 there and keeps no tracer once the
+    trace ends (`jax.checking_leaks`)."""
+    lhs, rhs = np.ones((2, 3), np.float32), np.ones((3, 2), np.float32)
+
+    @jax.jit
+    def scaled(scale):
+        def product(lhs, rhs, *, preferred_element_type=None):
+            return jnp.dot(lhs, rhs, preferred_element_type=preferred_element_type) * scale
+        return accumulated(product, lhs, rhs)
+
+    with jax.checking_leaks():
+        np.testing.assert_array_equal(np.asarray(scaled(np.float32(2))), np.full((2, 2), 6, np.float32))
