@@ -542,7 +542,8 @@ def _emitted_forms(family, shape: str | None = None) -> set[str]:
 GATE_PARTS = 10
 """The parts each generation's compile gate runs in apart (`test_each_gemm_mainloop_compiles_at_its_picks`),
 each within a test's 120 s: at six, sm90's parts took 125 to 159 s, each kernel lowered, compiled, read by
-the liveness pass that sets its decided caps and scanned for its least spill-free cap (GATE-PROFILE-SM90-0)."""
+the liveness pass that sets its decided caps and scanned for its least spill-free cap
+(GATE-PROFILE-SM90-0)."""
 
 
 @pytest.mark.parametrize("shape", GEMM_SHAPES)
