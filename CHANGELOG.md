@@ -35,6 +35,9 @@ release's tag is that version with a `v` in front (`v0.1.0`).
     pillars and props (`tools/fpv_assets.py`, CC0 textures).
   - `tools/fpv_race.py` runs the race's phases: a privileged PPO teacher, its demonstrations, and a
     DreamerV3 agent on the camera alone.
+- A run's watched activations (`Inspection.modules`) name a module by its class or its path, and a language
+  model's are summarized over its real tokens alone, its scorer's as it prepared them, through a pipelined
+  stack's microbatches too; a preference pair lays out each half's real tokens (`real_mask`).
 ## 0.2.0
 
 The first release on Dew's own package index, `pip install dewml --extra-index-url
