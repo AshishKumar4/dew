@@ -350,11 +350,12 @@ def binaries(executable: jax.stages.Compiled) -> list[Binary]:
     """Every Mosaic GPU and Pallas-Triton kernel binary `executable` carries, read from its own serialized
     form: XLA keeps a Mosaic kernel's cubin in its custom call's state (`MosaicGpuKernelProto`), whether this
     compile ran ptxas for it, another thread's program compiled it first (Mosaic compiles a module once a
-    process), or the executable was loaded from the persistent cache, and a Triton kernel's on its thunk
-    itself (its `binary`, which a Mosaic thunk leaves empty). Nothing is read from or written to the process's
-    environment or disk: a compile that set Mosaic's dump settings around itself handed its directory to
-    every other thread's compile and removed it under them ('Directory not empty', row 2790), and the
-    settings turn on every dump Mosaic has (row 2816)."""
+    process), or the executable was loaded from the persistent cache, and a Pallas-Triton template
+    launch's on its thunk itself (its `binary`, which a Mosaic thunk leaves empty), its kernel naming its
+    launch. Nothing is read from or written to the process's environment or disk: a compile that set
+    Mosaic's dump settings around itself handed its directory to every other thread's compile and removed
+    it under them ('Directory not empty', row 2790), and the settings turn on every dump Mosaic has (row
+    2816)."""
     from jax._src.thunky import thunky
 
     found: list[Binary] = []
@@ -367,8 +368,11 @@ def binaries(executable: jax.stages.Compiled) -> list[Binary]:
                 attributes = operation.attributes
                 found.extend(thunk_kernels(ir.StringAttr(attributes["thunk_proto"]).value_bytes))
                 elf = ir.StringAttr(attributes["binary"]).value_bytes if "binary" in attributes else b""
-                if elf[:4] == ELF:
-                    found.append(_binary(ir.StringAttr(attributes["kernel_name"]).value, elf))
+                name = ir.StringAttr(attributes["kernel_name"]).value
+                # XLA's own kernels (its fusions, its Triton GEMMs) carry their cubins so too: a template
+                # launch's names its launch (`named`).
+                if elf[:4] == ELF and LAUNCH_SUFFIX.search(name):
+                    found.append(_binary(name, elf))
             return ir.WalkResult.ADVANCE
 
         module.operation.walk(visit)

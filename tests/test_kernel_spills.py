@@ -395,9 +395,10 @@ def test_a_thunk_whose_kernel_binary_is_missing_refuses_rather_than_reading_as_n
 
 @lowers("sm90")
 def test_an_executable_carries_each_mosaic_and_triton_kernels_binary_once():
-    """A program of a Pallas-Triton kernel feeding a Mosaic GPU kernel, compiled for an H100:
-    `report.binaries` reads each once, the Triton kernel's cubin from its thunk's own binary and the Mosaic
-    kernel's from its kernel proto (a Mosaic thunk's binary is empty), each stating its registers."""
+    """A program of a Pallas-Triton launch feeding a Mosaic GPU kernel and an XLA fusion, compiled for an
+    H100: `report.binaries` reads the launch once, its cubin from its thunk's own binary, and the Mosaic
+    kernel once, from its kernel proto (a Mosaic thunk's binary is empty), each stating its registers; the
+    fusion, whose thunk carries its cubin too, names no launch and is no template's."""
     from jax.experimental import pallas as pl
     from jax.experimental.pallas import mosaic_gpu as plgpu, triton as pltriton
     from jax.sharding import NamedSharding, PartitionSpec
@@ -417,16 +418,18 @@ def test_an_executable_carries_each_mosaic_and_triton_kernels_binary_once():
 
     shape = jax.ShapeDtypeStruct((128, 128), jnp.float32)
     copy = plgpu.kernel(copied, out_type=shape, num_threads=1, thread_name="wg",
-                        scratch_types=[plgpu.SMEM((128, 128), jnp.float32), plgpu.Barrier(num_barriers=1)],
-                        name="dew_copied")
+                        scratch_types=[plgpu.SMEM((128, 128), jnp.float32), plgpu.Barrier(num_barriers=1)])
 
     def program(x, y):
-        return copy(pl.pallas_call(added, out_shape=shape, grid=(1,), name="dew_added",
-                                   compiler_params=pltriton.CompilerParams(num_warps=4, num_stages=1))(x, y))
+        launched = pl.pallas_call(added, out_shape=shape, grid=(1,), name="dew_added__l0123456789",
+                                  compiler_params=pltriton.CompilerParams(num_warps=4, num_stages=1))(x, y)
+        return jnp.concatenate([copy(launched), jnp.sin(x)]).sum(axis=1)
 
     devices = jax.sharding.Mesh(np.array(compile_only_gpus("sm90")), ("data",))
     spec = jax.ShapeDtypeStruct((128, 128), jnp.float32, sharding=NamedSharding(devices, PartitionSpec()))
     with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(generation.gpu_mesh(devices, "sm90")):
         compiled = jax.jit(program).trace(spec, spec).lower().compile()
-    found = sorted((found.kernel, found.registers > 0, found.frame) for found in report.binaries(compiled))
-    assert found == [("dew_added", True, 0), ("dew_copied", True, 0)]
+    found = report.binaries(compiled)
+    assert len(found) == 2 and all(binary.registers > 0 and not binary.frame for binary in found)
+    launched = [(binary.kernel, binary.launch) for binary in found if binary.launch]
+    assert launched == [("dew_added", "0123456789")]
