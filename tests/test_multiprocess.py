@@ -330,7 +330,7 @@ def test_the_mesh_covers_every_process_in_the_pool(two_processes):
         assert report["process_count"] == 2
         assert report["device_count"] == MESH_DEVICES
         assert report["local_device_count"] == MESH_DEVICES // 2
-        assert report["mesh_shape"] == {"data": MESH_DEVICES // 2, "expert": 1, "fsdp": 2,
+        assert report["mesh_shape"] == {"diloco": 1, "data": MESH_DEVICES // 2, "expert": 1, "fsdp": 2,
                                         "tensor": 1, "sequence": 1, "stage": 1}
         assert report["mesh_devices"] == MESH_DEVICES
         assert report["mesh_process_indices"] == [0, 1]
@@ -353,7 +353,7 @@ def test_four_processes_build_the_same_mesh_as_two(tmp_path):
     for index, report in enumerate(reports):
         assert report["process_index"] == index
         assert report["local_device_count"] == MESH_DEVICES // 4
-        assert report["mesh_shape"] == {"data": MESH_DEVICES // 2, "expert": 1, "fsdp": 2,
+        assert report["mesh_shape"] == {"diloco": 1, "data": MESH_DEVICES // 2, "expert": 1, "fsdp": 2,
                                         "tensor": 1, "sequence": 1, "stage": 1}
         assert report["mesh_process_indices"] == [0, 1, 2, 3]
 
@@ -597,6 +597,7 @@ def test_a_checkpoint_written_by_one_process_restores_in_a_pool(tmp_path):
     for index, report in enumerate(pool):
         assert report["restored_step"] == 4
         assert report["mesh_shape"] == {
+            "diloco": 1,
             "data": 2,
             "expert": 1,
             "fsdp": 4,
