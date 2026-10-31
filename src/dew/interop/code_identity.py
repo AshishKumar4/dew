@@ -270,11 +270,12 @@ def _grad_modes() -> tuple[type, ...]:
     return (torch.no_grad, torch.enable_grad, torch.inference_mode, torch.set_grad_enabled)
 
 
-def _paired(ours: object, theirs: object, seen: set) -> bool:
-    """Whether a container `ours` binds may stand for the one `theirs` binds: neither is already paired
-    with another (`seen` holds each pair compared), so two names that bind one list on one side bind one
-    on the other, and a mutation through one name reaches the other alike."""
-    return not any((first == id(ours)) != (second == id(theirs)) for first, second in seen)
+def _paired(ours: int, theirs: int, seen: set) -> bool:
+    """Whether the container whose identity is `ours` may stand for the one whose identity is `theirs`:
+    neither is already paired with another (`seen` holds each pair of identities compared), so two names
+    that bind one list on one side bind one on the other, and a mutation through one reaches the other
+    alike."""
+    return not any((first == ours) != (second == theirs) for first, second in seen)
 
 
 def _same_bindings(ours: Mapping[str, object], theirs: Mapping[str, object], names: Iterable[tuple[str, str]],
@@ -291,7 +292,7 @@ def _same_bindings(ours: Mapping[str, object], theirs: Mapping[str, object], nam
     for our_name, their_name in names:
         a, b = ours.get(our_name, _MISSING), theirs.get(their_name, _MISSING)
         if isinstance(a, tuple | list):
-            if not _paired(a, b, seen):
+            if not _paired(id(a), id(b), seen):
                 return False
             if a is b:
                 seen.add((id(a), id(b)))
@@ -314,8 +315,8 @@ def _same_bindings(ours: Mapping[str, object], theirs: Mapping[str, object], nam
                 continue
             seen.add((id(a), id(b)))
             if len(a) != len(b) or not _same_bindings(
-                    {str(index): item for index, item in enumerate(a)},
-                    {str(index): item for index, item in enumerate(b)},
+                    {str(index): held for index, held in enumerate(a)},
+                    {str(index): held for index, held in enumerate(b)},
                     [(str(index), str(index)) for index in range(len(a))], renaming, seen):
                 return False
         # A grad-mode decorator keeps its whole state in its instance's attributes; any other object
