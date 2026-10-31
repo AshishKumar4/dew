@@ -59,10 +59,12 @@ _log = logging.getLogger("dew.kernels")
 @dataclasses.dataclass(frozen=True)
 class Launch:
     """A template launch as it traced: its identity apart from its config (`_identity`), its op's name and
-    its config, none of its traced values."""
+    its config, none of its traced values; and the share of its tile grid its tails pad (`Template.padded`),
+    None where its template states none."""
     identity: str
     op: str
     config: Hashable
+    padded: float | None = None
 
 
 @dataclasses.dataclass
@@ -72,6 +74,7 @@ class _Pending:
     identity: Callable[[], str]
     op: str
     config: Hashable
+    padded: Callable[[], float | None]
     digest: str | None = None
 
 
@@ -146,11 +149,20 @@ def _digest(text: str) -> str:
 def launching(op, arguments: tokamax.BoundArguments, config: Hashable) -> Iterator[None]:
     """Within the block, the kernels a template's launch traces carry its digest in their names (`named`),
     the same in every process, and their binaries name the launch (`Binary.launch`, `traced`)."""
-    token = _TRACING.set(_Pending(lambda: _identity(op, arguments), type(op).__name__, config))
+    token = _TRACING.set(_Pending(lambda: _identity(op, arguments), type(op).__name__, config,
+                                  lambda: _padded(op, arguments, config)))
     try:
         yield
     finally:
         _TRACING.reset(token)
+
+
+def _padded(op, arguments: tokamax.BoundArguments, config: Hashable) -> float | None:
+    """The share of `op`'s tile grid at `config` its tails pad for `arguments` (`Template.padded`), None for
+    a launch of no template's."""
+    from dew.nn.kernels.templates.base import Template
+
+    return op.padded(arguments, config) if isinstance(op, Template) else None
 
 
 def named(name: str | None) -> str | None:
@@ -176,7 +188,7 @@ def launch_digest() -> str | None:
         identity = pending.identity()
         digest = _digest(f"{identity}|{pending.config!r}")
         with _GUARD:
-            _LAUNCHES.setdefault(digest, Launch(identity, pending.op, pending.config))
+            _LAUNCHES.setdefault(digest, Launch(identity, pending.op, pending.config, pending.padded()))
         pending.digest = digest
     return pending.digest
 

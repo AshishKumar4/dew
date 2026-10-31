@@ -233,6 +233,22 @@ class _GroupedLaunch[Config: Hashable](base.Template[Config]):
             accumulators=1 if ba.arguments.get('paired') is None else 2)
         return ba if stated == hooks else type(ba)(ba.op, {**ba.arguments, 'hooks': stated})
 
+    ROWS: ClassVar[tuple[str, ...]]
+    """The operands whose rows the launch's groups split: a product's `tokens`, a kernel gradient's
+    `tokens` and `cotangent`."""
+
+    def padded(self, ba, config: Config) -> float | None:
+        """A dense product's (`dense`) output grid, its rows tiled by `block_m` and its columns by `block_n`
+        (`base.Template.padded`); None for a grouped call, whose groups' rows a step routes, for a kernel
+        gradient's and for a tile of no such blocks (a TPU's)."""
+        if self.ROWS != ('tokens',) or not ba.arguments.get('dense') or not isinstance(
+                config, Tile | mosaic_gpu.Tiles):
+            return None
+        kernel = ba.arguments['kernel']
+        rows, width = ba.arguments['tokens'].shape[0], kernel.shape[1 if ba.arguments['trans_rhs'] else 2]
+        grid = -(-rows // config.block_m) * config.block_m * -(-width // config.block_n) * config.block_n
+        return 1 - rows * width / grid if grid else None
+
     def traced(self, name: str, value: Callable | str | None) -> str | None:
         """The launch's `Hooks` as its picks key them (`tuning.KernelOp.traced`): each hook by what it
         computes (`tuning.program`) as a kernel traces it (`Hooks.before`, `Hooks.after`), at a
