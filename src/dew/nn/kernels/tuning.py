@@ -579,23 +579,18 @@ def lowered_once(static: tuple[str, ...], *, unless: Callable[[], bool] = lambda
         signature = inspect.signature(launch)
         names = tuple(name for name in static if name in signature.parameters)
 
-        def keyed(*args, launch_digest, **kwargs):
-            del launch_digest
-            return launch(*args, **kwargs)
-
-        parameters = list(signature.parameters.values())
-        at = next((index for index, parameter in enumerate(parameters)
-                   if parameter.kind is inspect.Parameter.VAR_KEYWORD), len(parameters))
-        parameters.insert(at, inspect.Parameter("launch_digest", inspect.Parameter.KEYWORD_ONLY))
-        keyed.__signature__ = signature.replace(parameters=parameters)
-        jitted = jax.jit(keyed, static_argnames=(*names, "launch_digest"))
+        # One jitted launch a launch digest, each with its own trace cache.
+        @functools.cache
+        def jitted(digest: str | None) -> Callable:
+            del digest
+            return jax.jit(launch, static_argnames=names)
 
         @functools.wraps(launch)
         def called(*args, **kwargs):
             bound = signature.bind(*args, **kwargs).arguments
             if unless() or not all(holdable(bound[name]) for name in names if name in bound):
                 return launch(*args, **kwargs)
-            return jitted(*args, launch_digest=report.launch_digest(), **kwargs)
+            return jitted(report.launch_digest())(*args, **kwargs)
 
         return called
 
