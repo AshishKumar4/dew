@@ -49,6 +49,8 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   stack's microbatches too; a preference pair lays out each half's real tokens (`real_mask`).
 - `Inspection(cotangents=True)` logs the loss's cotangent at each watched output (`inspect/cotangents/...`),
   from a probe's gradient, every objective's model calls carrying the probes.
+- A JEPA run's watched activations are named by the part that runs them, `context_encoder/...` (was
+  `encoder/...`) and `predictor/...`.
 - A step compiled ahead lists, past the plan it takes, each rung that recomputes more at the fewest
   microbatches that fit (`compile_ahead(..., frontier=True)`, `--trainer.compile-ahead.frontier`), the plans
   `tools/benchmark_step.py` times on the GPUs; a run names the fastest by its remat, `--trainer.split` and

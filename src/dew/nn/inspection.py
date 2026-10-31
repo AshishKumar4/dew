@@ -21,6 +21,7 @@ import flax.linen as nn
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.custom_derivatives import zero_from_primal
 
 from dew.batch import PROBES
 from dew.nn.sharding import in_pipeline_stage
@@ -35,29 +36,27 @@ first, above 1e4 in the last, one bin a decade between."""
 
 def statistics(values: jax.Array, *, histogram: bool = False,
                where: jax.Array | None = None) -> dict[str, jax.Array]:
-    """A tensor's summary in float32 over its global array: mean, standard deviation, root mean square,
-    largest magnitude, the share of its entries that are not finite, which makes the others non-finite as
-    they are of the values, and the share that is exactly zero; with `histogram`, the share of its
-    magnitudes in each decade (`HISTOGRAM_EDGES`), one scalar a bin, `histogram_<bin>`. `where`, given,
-    holds the entries summarized, its axes the values' leading ones, each true entry's every trailing
-    one in."""
+    """A tensor's summary in float32 over its global array (`summarized`): mean, standard deviation, root
+    mean square, the share of its entries that are not finite, which makes the others non-finite as they
+    are of the values, the share that is exactly zero, and its largest magnitude; with `histogram`, the
+    share of its magnitudes in each decade (`HISTOGRAM_EDGES`), one scalar a bin, `histogram_<bin>`.
+    `where`, given, holds the entries summarized, its axes the values' leading ones, each true entry's
+    every trailing one in. Its moments are taken about the entries' own mean, so a deviation far from
+    zero is float32's to resolve, not the gap between two squares it cannot tell apart."""
     values = values.astype(jnp.float32)
-    keep = None if where is None else jnp.broadcast_to(
-        where.reshape(where.shape + (1,) * (values.ndim - where.ndim)), values.shape)
-    magnitudes = jnp.abs(values)
-    found = {"mean": jnp.mean(values, where=keep), "std": jnp.std(values, where=keep),
-             "rms": jnp.sqrt(jnp.mean(jnp.square(values), where=keep)),
-             "abs_max": magnitudes.max() if keep is None else jnp.max(magnitudes, where=keep, initial=0.0),
-             "non_finite": jnp.mean(~jnp.isfinite(values), where=keep),
-             "zero_fraction": jnp.mean(values == 0, where=keep)}
-    if histogram:
-        exponents = jnp.log10(jnp.maximum(magnitudes, 1e-30)).reshape(-1)
-        bins = jnp.searchsorted(jnp.asarray(HISTOGRAM_EDGES, jnp.float32), exponents)
-        weights = 1.0 if keep is None else keep.reshape(-1).astype(jnp.float32)
-        counted = exponents.size if keep is None else jnp.sum(keep)
-        counts = jnp.zeros(len(HISTOGRAM_EDGES) + 1, jnp.float32).at[bins].add(weights) / counted
-        found.update({f"histogram_{index}": counts[index] for index in range(counts.shape[0])})
-    return found
+    keep = _kept(values, where)
+    count = jnp.sum(keep, dtype=jnp.float32)
+    center = jnp.where(count > 0, jnp.sum(jnp.where(keep, values, 0)) / jnp.maximum(count, 1), 0)
+    magnitudes = jnp.where(keep, jnp.abs(values), 0)
+    return {**summarized(sufficient(values, where, histogram, center), histogram=histogram, center=center),
+            "abs_max": magnitudes.max(initial=0.0)}
+
+
+def _kept(values: jax.Array, where: jax.Array | None) -> jax.Array:
+    """`where` over every entry of `values`, its axes their leading ones; every entry where None."""
+    if where is None:
+        return jnp.ones(values.shape, bool)
+    return jnp.broadcast_to(where.reshape(where.shape + (1,) * (values.ndim - where.ndim)), values.shape)
 
 
 SOWN = "__summary__"
@@ -101,7 +100,7 @@ COTANGENT_TERMS = ("count", "sum", "sum_squares", "non_finite", "zeros")
 """A probe's gradient's leading entries: the entries its cotangent counts, their sum and sum of squares,
 and how many are not finite and how many exactly zero; its histogram's counts (`HISTOGRAM_EDGES`) follow
 where the step asks for one. Each adds over whatever a gradient adds over (the microbatches of a pipeline,
-the devices of a data axis), so the statistics follow from the total (`cotangent_statistics`)."""
+the devices of a data axis), so the statistics follow from the total (`summarized`)."""
 
 _DISCOVERING: contextvars.ContextVar[bool] = contextvars.ContextVar("discovering_probes", default=False)
 
@@ -147,16 +146,18 @@ def probe_width(histogram: bool) -> int:
     return len(COTANGENT_TERMS) + (len(HISTOGRAM_EDGES) + 1 if histogram else 0)
 
 
-def sufficient(values: jax.Array, where: jax.Array | None, histogram: bool) -> jax.Array:
-    """`values`' sufficient statistics in float32 (`COTANGENT_TERMS`, a histogram's counts with
-    `histogram`), over the entries `where` holds (`statistics`' `where`), every entry where None."""
+def sufficient(values: jax.Array, where: jax.Array | None, histogram: bool,
+               center: jax.Array | float = 0.0) -> jax.Array:
+    """`values`' sufficient statistics in float32 over the entries `where` holds (`statistics`' `where`),
+    about `center` (`COTANGENT_TERMS`, the first two moments of the entries less it), with `histogram` its
+    magnitudes' counts in each decade; each term adds over whatever a sum of them adds over, so the
+    summary of several follows from their total (`summarized`)."""
     values = values.astype(jnp.float32)
-    keep = (jnp.ones(values.shape, bool) if where is None else jnp.broadcast_to(
-        where.reshape(where.shape + (1,) * (values.ndim - where.ndim)), values.shape))
+    keep = _kept(values, where)
     weights = keep.astype(jnp.float32)
-    terms = [jnp.sum(weights), jnp.sum(jnp.where(keep, values, 0)),
-             jnp.sum(jnp.where(keep, values * values, 0)), jnp.sum(weights * ~jnp.isfinite(values)),
-             jnp.sum(weights * (values == 0))]
+    moved = jnp.where(keep, values - center, 0)
+    terms = [jnp.sum(weights), jnp.sum(moved), jnp.sum(moved * moved),
+             jnp.sum(weights * ~jnp.isfinite(values)), jnp.sum(weights * (values == 0))]
     if histogram:
         exponents = jnp.log10(jnp.maximum(jnp.abs(values), 1e-30)).reshape(-1)
         bins = jnp.searchsorted(jnp.asarray(HISTOGRAM_EDGES, jnp.float32), exponents)
@@ -181,10 +182,8 @@ def _tapped_forward(x, probe, where, scale, histogram):
 
 def _tapped_backward(histogram, saved, cotangent):
     where, scale = saved
-    # The positions are booleans: their cotangent is float0's zero.
-    unmoved = None if where is None else np.zeros(where.shape, jax.dtypes.float0)
     terms = sufficient(cotangent.astype(jnp.float32) / scale, where, histogram)
-    return cotangent, terms, unmoved, jnp.zeros_like(scale)
+    return cotangent, terms, zero_from_primal(where), zero_from_primal(scale)
 
 
 tapped.defvjp(_tapped_forward, _tapped_backward)
@@ -220,24 +219,23 @@ def probes_of(inspected: Mapping) -> dict:
     return kept(inspected) or {}
 
 
-def cotangent_statistics(terms: jax.Array, *, histogram: bool) -> dict[str, jax.Array]:
-    """The statistics of a cotangent whose sufficient statistics are `terms` (`sufficient`): mean, standard
-    deviation, root mean square, the share not finite and the share exactly zero, and with `histogram` the
-    share of its magnitudes in each decade. A probe no cotangent reached, its call under no gradient (a
-    phase that trains another network), counts no entry: its cotangent is zero, as is every statistic but
-    the zero share, 1."""
+def summarized(terms: jax.Array, *, histogram: bool,
+               center: jax.Array | float = 0.0) -> dict[str, jax.Array]:
+    """The summary of entries whose sufficient statistics about `center` are `terms` (`sufficient`): mean,
+    standard deviation, root mean square, the share not finite and the share exactly zero, and with
+    `histogram` the share of their magnitudes in each decade. No entries (a row set all padding, a probe
+    no cotangent reached, its call under no gradient) summarize as a zero tensor: every statistic 0 but
+    the zero share, 1, its magnitudes all below the lowest decade."""
     reached = terms[0] > 0
     count = jnp.where(reached, terms[0], 1)
-    mean = terms[1] / count
-    squares = terms[2] / count
-    found = {"mean": mean, "std": jnp.sqrt(jnp.maximum(squares - jnp.square(mean), 0)),
-             "rms": jnp.sqrt(squares), "non_finite": terms[3] / count,
-             "zero_fraction": jnp.where(reached, terms[4] / count, 1)}
+    offset = terms[1] / count
+    variance = jnp.maximum(terms[2] / count - jnp.square(offset), 0)
+    mean = jnp.where(reached, center + offset, 0)
+    found = {"mean": mean, "std": jnp.sqrt(variance), "rms": jnp.sqrt(variance + jnp.square(mean)),
+             "non_finite": terms[3] / count, "zero_fraction": jnp.where(reached, terms[4] / count, 1)}
     if histogram:
-        # An unreached probe's zeros sit below the lowest decade.
-        bins = terms[len(COTANGENT_TERMS):]
         found.update({f"histogram_{index}": jnp.where(reached, value / count, index == 0)
-                      for index, value in enumerate(bins)})
+                      for index, value in enumerate(terms[len(COTANGENT_TERMS):])})
     return found
 
 
@@ -347,7 +345,7 @@ def flattened(inspected: Mapping, modules: tuple[str, ...] = ()) -> dict[str, ja
 def cotangent_summaries(gradients: Mapping, histogram: bool,
                         logged: set[tuple[str, ...]] | None = None) -> dict[str, jax.Array]:
     """A step's probes' gradients (`tapped`) as the statistics of each watched output's cotangent
-    (`cotangent_statistics`), by name, `cotangents/<module path>/<statistic>`, a stacked probe's entries
+    (`summarized`), by name, `cotangents/<module path>/<statistic>`, a stacked probe's entries
     each by its index as `flattened` names an activation's; with `logged`, of those module paths alone
     (`kept`)."""
     found: dict[str, jax.Array] = {}
@@ -357,7 +355,7 @@ def cotangent_summaries(gradients: Mapping, histogram: bool,
         if logged is not None and tuple(module) not in logged:
             continue
         for index in np.ndindex(*leaf.shape[:-1]):
-            for statistic, value in cotangent_statistics(leaf[index], histogram=histogram).items():
+            for statistic, value in summarized(leaf[index], histogram=histogram).items():
                 found["/".join(["cotangents", *module, *map(str, index), statistic])] = value
     return found
 

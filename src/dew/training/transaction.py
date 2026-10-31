@@ -888,9 +888,12 @@ class Transaction:
             with unscaled(factor):
                 realized = realize(self.read(state.variables, state.compute), batch, step_info)
             loss, cotangent = reduce(realized.stats, factor)
-            # A step that summarizes its cotangents takes its probes' gradient from the same backward.
-            gradient, probed = (realized.pullback(cotangent), None) if realized.probed is None else (
-                realized.probed(cotangent))
+            # A step that summarizes its cotangents takes its probes' gradient from the same backward where
+            # the microbatch is its update's whole window; otherwise from the pooled loss's, below.
+            probing = realized.probed
+            whole = probing is not None and self.size == 1
+            gradient, probed = (realized.pullback(cotangent), None) if probing is None or not whole else (
+                probing(cotangent))
             if state.compute is None or self.size > 1:
                 gradient = unscale(gradient, factor)
             # Otherwise no loss scale divides it (`Trainer._narrow_copies`),
@@ -900,6 +903,10 @@ class Transaction:
             # A run whose stream ends inside the window closes it at the step's last part (`closes`).
             closing = None if closes is None else jnp.logical_and(closes, part == self.split - 1)
             pending = prepare(state, realized.stats, realized.aux, loss, gradient, closing)
+            if probing is not None and not whole:
+                # The probes summarize the cotangent of the update's loss, the window's pooled one, as replay
+                # differentiates it (`pooled_cotangent`), whatever microbatches the plan splits it into.
+                probed = probing(pooled(pending.pooled, realized.stats, factor))[1]
 
             # The record of each of the window's other microbatches the commit replays, in its slot.
             own = evaluation_of(realized.aux)
