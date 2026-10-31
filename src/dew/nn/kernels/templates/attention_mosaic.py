@@ -54,6 +54,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     Tiles,
     _block,
     _padded,
+    _products,
     _width,
     bundle,
     bundle_of,
@@ -61,6 +62,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     layouts,
     reducing,
     refused,
+    stagings,
     whole_tiles,
 )
 from dew.nn.kernels.templates.attention_mosaic_scores import split_queries
@@ -86,10 +88,9 @@ def _derived[Config: (Tiles, BackwardTiles)](family: mosaic.Family, dtype, held:
     of a smaller one). `tiles(rows, walked, consumers)` builds the config. None where no tile fits."""
     rows = extents(family, dtype, held)[-1]
     most = family.consumers if overlapped else 1
-    stagings = (False, True) if family.operands_in_registers else (False,)
     for consumers in range(max(1, min(most, -(-held // rows))), 0, -1):
         for extent in extents(family, dtype, walked):
-            for narrow in stagings:
+            for narrow in stagings(family):
                 config = dataclasses.replace(tiles(rows, extent, consumers), narrow=narrow)
                 if fits(config):
                     return config
@@ -268,7 +269,8 @@ class MosaicForward(_Mainloop[Tiles]):
             return True
         family = bundle_of(config, query.dtype)
         columns = guarded_columns(family, value.shape[3], value.dtype)
-        return guarded_tiles(family, config, columns, value.dtype) is not None
+        width = _width(query.shape[3], family, query.dtype)
+        return guarded_tiles(family, config, columns, value.dtype, width) is not None
 
     def derived(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> Tiles | None:
         """Its tiles from the facts (`_derived`): each consumer a unit of queries, the key tile the largest
@@ -363,26 +365,6 @@ class MosaicForward(_Mainloop[Tiles]):
                       tuple(map(Param, ba.arguments["output_params"], self.output_kinds)),
                       ba.arguments["drop"])
         return refused(query.dtype, query.shape[3], value.shape[3], hooks, backward=False, family=family)
-
-
-def _products(family: mosaic.Family, dtype, *products, narrow: bool = False) -> list:
-    """The phases a step's products hold where its family's read their operands from registers
-    (`resources.operand_fragments`; none where they read shared memory, wgmma's): each product
-    `(rows, depth, columns, beside, register_lhs, rhs_transposed)` its operands' fragments beside the tiles
-    `beside` it holds at once (its output, a tile it reads in registers), a left operand in registers
-    (`register_lhs`: the weights, the score cotangents) no fragment of its own, a right one read as the
-    transpose of its stored tile (`rhs_transposed`: the keys of the logits, the values of dP) loaded at its
-    stage's swizzle granule (`Family.rhs_fragment_depth`; mma.sync: ET-CENSUS80, a 64 x 192 forward's keys'
-    fragments 162 of its 291 registers at its peak, uncounted), the narrowest where its launch stages them
-    `narrow` (`Tiles.narrow`)."""
-    if not family.operands_in_registers:
-        return []
-    narrowest = mosaic.NARROWEST_SWIZZLE_BYTES if narrow else None
-    return [list(beside) + resources.operand_fragments(family, rows, depth, columns, dtype, dtype,
-                                                       lhs_parts=0 if register_lhs else 1,
-                                                       rhs_transposed=transposed,
-                                                       rhs_swizzle=narrowest if transposed else None)
-            for rows, depth, columns, beside, register_lhs, transposed in products]
 
 
 def _forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dtype, residuals: bool, *,

@@ -56,6 +56,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _Hooked,
     _hooked_of,
     _param,
+    _products,
     _Program,
     _Spans,
     _spans_of,
@@ -66,6 +67,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     extents,
     reducing,
     refused,
+    stagings,
     stated,
     transposed_swizzles,
 )
@@ -109,26 +111,35 @@ each row's shift, reach, unshifted denominator and liveness), each held by the f
 row spans, two rows a thread: a `[block_q, 4]` fp32 tile's words a statistic (`guarded_tiles`)."""
 
 
-def guarded_tiles(family: mosaic.Family, tiles: Tiles, columns: int, dtype) -> Tiles | None:
+def guarded_tiles(family: mosaic.Family, tiles: Tiles, columns: int, dtype, width: int) -> Tiles | None:
     """The guarded launch's tiles beside the plain launch's `tiles` (`_plain_forward`): its query blocks, the
     widest of the family's key extents (`extents`) that divides the plain key tile, so the plain launch's
     padded keys are whole tiles of it, and the most of the plain launch's consumers, whose live set a
     consumer's registers hold (`resources.live_registers`): its shifted and unshifted sums of `columns` value
     columns fp32 and its rows' statistics (`GUARD_ROWS`) carried, beside a step's logits and weights fp32
-    and the two products the step forms (`algebra.stepped`). Uncounted, the statistics left 64 x 64 on two
-    consumers spilling 20 bytes a thread at heads 128 and 256 wide (ptxas, sm90a). None where none fits:
-    the plain launch is then illegal at `tiles` (`MosaicForward.legal`)."""
+    and the two products the step forms (`algebra.stepped`), their operands' fragments where its family
+    reads them from registers (`_products`: the logits' of `width`-deep queries and keys, the values' of its
+    weights), its keys staged narrowest where the family's own swizzle's do not fit (`stagings`; ET-CENSUS80:
+    the guarded launch at 64 x 64, width 128, spilled 132 bytes on an A100, its IR live set 274, 144 of it
+    fragments). Uncounted, the statistics left 64 x 64 on two consumers spilling 20 bytes a thread at heads
+    128 and 256 wide (ptxas, sm90a). None where none fits: the plain launch is then illegal at `tiles`
+    (`MosaicForward.legal`)."""
     rows = tiles.block_q
     carried = [(rows, columns, jnp.float32)] * 2 + [(rows, 4 * GUARD_ROWS, jnp.float32)]
 
-    def held(block: int, consumers: int) -> bool:
-        stepped = [(rows, block, jnp.float32)] * 2 + [(rows, columns, jnp.float32)] * 2
-        return resources.live_registers(family, carried, stepped) <= family.registers(consumers)
+    def held(candidate: Tiles) -> bool:
+        block = candidate.block_k
+        logits, sums = [(rows, block, jnp.float32)] * 2, [(rows, columns, jnp.float32)] * 2
+        fragments = _products(family, dtype, (rows, width, block, logits, False, True),
+                              (rows, block, columns, logits[:1] + sums, True, False), narrow=candidate.narrow)
+        live = resources.live_registers(family, carried, logits + sums, *fragments)
+        return live <= family.registers(candidate.consumers)
 
     blocks = [block for block in extents(family, dtype, tiles.block_k) if tiles.block_k % block == 0]
-    candidates = (dataclasses.replace(tiles, block_k=block, consumers=consumers)
-                  for consumers in range(tiles.consumers, 0, -1) for block in blocks)
-    return next((candidate for candidate in candidates if held(candidate.block_k, candidate.consumers)), None)
+    candidates = (dataclasses.replace(tiles, block_k=block, consumers=consumers, narrow=narrow)
+                  for consumers in range(tiles.consumers, 0, -1) for block in blocks
+                  for narrow in stagings(family))
+    return next((candidate for candidate in candidates if held(candidate)), None)
 
 
 def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks, *,
@@ -173,7 +184,7 @@ def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
             overflowed = functools.reduce(jnp.logical_or, [block[0][1] > 0 for block in launched])
             return (out, *finished), status[0], overflowed
         unit = guarded_columns(family, v.shape[-1], v.dtype)
-        guarded = guarded_tiles(family, at, unit, v.dtype)
+        guarded = guarded_tiles(family, at, unit, v.dtype, q.shape[-1])
         hooked_blocks = hooks.output_mod is not None
         # The plain launch's legality held a guarded tile at its tiles (`MosaicForward.legal`).
         assert guarded is not None, at

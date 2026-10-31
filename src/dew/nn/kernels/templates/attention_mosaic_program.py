@@ -25,6 +25,7 @@ from dew.nn.kernels.templates import (
     mosaic,
     mosaic_sm80,
     mosaic_sm90,
+    resources,
 )
 from dew.nn.kernels.templates.attention import (
     Draw,
@@ -187,6 +188,33 @@ def _width(width: int, family: mosaic.Family, dtype) -> int:
     """A head width as a launch stages it: a power of two (`padded_call`) in whole swizzled rows
     (`Family.column_unit`)."""
     return whole(power_of_two(width), family.column_unit(dtype))
+
+
+def _products(family: mosaic.Family, dtype, *products, narrow: bool = False) -> list:
+    """The phases a step's products hold where its family's read their operands from registers
+    (`resources.operand_fragments`; none where they read shared memory, wgmma's): each product
+    `(rows, depth, columns, beside, register_lhs, rhs_transposed)` its operands' fragments beside the tiles
+    `beside` it holds at once (its output, a tile it reads in registers), a left operand in registers
+    (`register_lhs`: the weights, the score cotangents) no fragment of its own, a right one read as the
+    transpose of its stored tile (`rhs_transposed`: the keys of the logits, the values of dP) loaded at its
+    stage's swizzle granule (`Family.rhs_fragment_depth`; mma.sync: ET-CENSUS80, a 64 x 192 forward's keys'
+    fragments 162 of its 291 registers at its peak, uncounted), the narrowest where its launch stages them
+    `narrow` (`Tiles.narrow`)."""
+    if not family.operands_in_registers:
+        return []
+    narrowest = mosaic.NARROWEST_SWIZZLE_BYTES if narrow else None
+    return [list(beside) + resources.operand_fragments(family, rows, depth, columns, dtype, dtype,
+                                                       lhs_parts=0 if register_lhs else 1,
+                                                       rhs_transposed=transposed,
+                                                       rhs_swizzle=narrowest if transposed else None)
+            for rows, depth, columns, beside, register_lhs, transposed in products]
+
+
+def stagings(family: mosaic.Family) -> tuple[bool, ...]:
+    """Whether a launch's transposed streams stage narrowest (`Tiles.narrow`), the stagings a derivation
+    tries in turn: the family's own swizzle first, then the narrowest where its products read their
+    operands from registers (`Family.operands_in_registers`), whose fragments a narrow stage shrinks."""
+    return (False, True) if family.operands_in_registers else (False,)
 
 
 def _block(config: Tiles | BackwardTiles) -> int:
