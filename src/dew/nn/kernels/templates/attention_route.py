@@ -4,7 +4,7 @@ the template's forward and backward under one `jax.custom_vjp`, on the mainloops
 On a GPU the process places calls on, of sm80 or later (`generation.bf16_dot_runs`), the forward and the
 backward run on the Mosaic template, Mosaic GPU's mainloop, where it runs the call on the device
 (`attention_mosaic.forward_takes`, `attention_mosaic.backward_takes`: its family has a bundle there, the call
-is one it takes and a config fits), else by legality on the frozen Triton mainloop (`attention_triton`, which
+is one it takes and a config fits), else by legality on the Pallas-Triton mainloop (`attention_triton`, which
 walks no call's runs, `attention_triton.refused`). Everywhere else, or where neither takes the call, both run
 the plain-JAX mainloop (`attention_portable`). Every mainloop's training forward gives the same residuals, so
 the backward runs on whichever takes it by legality (a 16-bit call's fp16 backward on Triton's, which Mosaic's
@@ -246,7 +246,7 @@ def _backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
 
 def _spread(hooks: Hooks, query: jax.Array) -> Hooks:
     """`hooks` with each query, key or tile parameter spread over the batch rows and query heads it shares
-    (`template.shared_place`), as the frozen Triton mainloop indexes them; the other mainloops read them
+    (`template.shared_place`), as the Pallas-Triton mainloop indexes them; the other mainloops read them
     shared."""
     batch, heads = query.shape[0], query.shape[2]
     return dataclasses.replace(hooks, score_params=tuple(
