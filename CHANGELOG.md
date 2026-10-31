@@ -5,6 +5,11 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- A schedule's saved position holds the committed tokens each finished stage ended at, and a resume
+  whose finished stage ends at other tokens is refused, where it read the next stage at once.
+- An audio tower (`HFAudio`, `AudioCondition`) takes a `revision`, reads its configuration and feature
+  extractor from one commit's files, and holds their hashes in its identity, so an extractor that moved
+  under the checkpoint's name re-keys the encoded audio.
 - Muon's and M3's Newton-Schulz multiply in the run's numerics: bfloat16 operands in its fast forms
   (the default) and float32 at `Numerics.matmul` in its accurate ones (`--trainer.precision accurate`:
   IEEE float32), each matrix whole on one device and the matrices spread over the mesh. A run states its
