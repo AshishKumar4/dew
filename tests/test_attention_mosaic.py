@@ -1438,14 +1438,17 @@ def test_a_hook_that_forms_a_unit_axis_compiles_for_an_h100(axis):
     assert not failures(found), "\n".join(failures(found))
 
 
-BACKWARD_GATE = [(generation_name, width, accurate, "none") for generation_name in ("sm90",)
+GATED = ("sm90", "sm80")
+"""The GPUs whose families the mainloop qualifies (`attention_mosaic_program.QUALIFIED`): an H100's wgmma
+and an A100's mma.sync."""
+
+BACKWARD_GATE = [(generation_name, width, accurate, "none") for generation_name in GATED
                  for width in (64, 128, 256) for accurate in (False, True)]
-BACKWARD_GATE += [("sm90", width, False, hooks) for width in (64, 128) for hooks in BACKWARD_HOOKS
-                  if hooks != "none"]
-"""The backward resource gate's cases: each GPU whose family the mainloop qualifies (an H100's; mma.sync's
-is not, `test_an_a100_derives_no_mosaic_backward`), a causal call's head widths, each form, hookless; and
-each score hook at the widths a hooked call's derivation takes whole (row 2281: its live set beside the
-step's)."""
+BACKWARD_GATE += [(generation_name, width, False, hooks) for generation_name in GATED for width in (64, 128)
+                  for hooks in BACKWARD_HOOKS if hooks != "none"]
+"""The backward resource gate's cases: each GPU whose family the mainloop qualifies (`GATED`), a causal
+call's head widths, each form, hookless; and each score hook at the widths a hooked call's derivation takes
+whole (row 2281: its live set beside the step's)."""
 
 
 def _gated_hooks(hooks: str, queries: int, width: int):
@@ -1477,21 +1480,14 @@ def _gated_backward(generation_name: str, width: int, accurate: bool, hooks: str
         return op, ba, op.derived(ba, generation.gpu_target())
 
 
-@pytest.mark.parametrize("accurate", [False, True], ids=["default", "accurate"])
-def test_an_a100_derives_no_mosaic_backward(accurate):
-    """The mma.sync family is not one this mainloop qualifies (`attention_mosaic_program.QUALIFIED`, row
-    2078): an A100's backward derives no config, so the route takes another mainloop there."""
-    assert _gated_backward("sm80", 128, accurate)[2] is None
-
-
-FORWARD_GATE = [(width, training, "none") for width in (64, 128, 256)
-                for training in (template.Kept.NONE, template.Kept.SPLIT)]
-FORWARD_GATE += [(width, training, hooks) for width in (64, 128)
+FORWARD_GATE = [(generation_name, width, training, "none") for generation_name in GATED
+                for width in (64, 128, 256) for training in (template.Kept.NONE, template.Kept.SPLIT)]
+FORWARD_GATE += [(generation_name, width, training, hooks) for generation_name in GATED for width in (64, 128)
                  for training in (template.Kept.NONE, template.Kept.SPLIT)
                  for hooks in BACKWARD_HOOKS if hooks != "none"]
-"""The forward resource gate's cases on an H100: a causal call's head widths, the inference and the training
-forward, hookless, and each score hook at the widths a hooked call's derivation takes (row 2281: its live
-set beside the walk's)."""
+"""The forward resource gate's cases: each GPU whose family the mainloop qualifies (`GATED`), a causal call's
+head widths, the inference and the training forward, hookless, and each score hook at the widths a hooked
+call's derivation takes (row 2281: its live set beside the walk's)."""
 
 
 def _forward_kernels(op, ba, config) -> dict:
@@ -1509,10 +1505,10 @@ def _forward_kernels(op, ba, config) -> dict:
 
 
 @COMPILES_ON_CPU
-@pytest.mark.parametrize(("width", "training", "hooks"), FORWARD_GATE)
-def test_the_forward_compiles_spill_free_as_its_model_decides(width, training, hooks):
+@pytest.mark.parametrize(("generation_name", "width", "training", "hooks"), FORWARD_GATE)
+def test_the_forward_compiles_spill_free_as_its_model_decides(generation_name, width, training, hooks):
     """The forward, the training forward where `training`, at its derived tiles of a causal call `width`
-    wide under the score hook `hooks` names, lowered and compiled by ptxas for an H100 on this CPU
+    wide under the score hook `hooks` names, lowered and compiled by ptxas for `generation_name` on this CPU
     (tests/kernel_compile.py): every launch within its shared memory, spilling nothing, and its register
     model's decision ptxas's (`mosaic_failures`)."""
     from fla_gdn_support import KernelCase
@@ -1527,7 +1523,7 @@ def test_the_forward_compiles_spill_free_as_its_model_decides(width, training, h
     def forward(query, key, value):
         return attention_mosaic.forward(query, key, value, spans, hooked, residuals=training)
 
-    with generation.assumed("sm90"):
+    with generation.assumed(generation_name):
         zeros = [jnp.zeros(array.shape, array.dtype) for array in (query, key, key)]
         op, args = attention_mosaic._forward_call(*zeros, spans, hooked, scale=None,
                                                   natural=attention_mosaic.NATURAL)
@@ -1536,7 +1532,7 @@ def test_the_forward_compiles_spill_free_as_its_model_decides(width, training, h
         assert config is not None, f"the Mosaic forward derives no config {width} wide"
         found = compile_mosaic_kernels(
             [KernelCase("forward", lambda: (forward, (query, key, key)), _forward_kernels(op, ba, config))],
-            "sm90")
+            generation_name)
     assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
 
 
