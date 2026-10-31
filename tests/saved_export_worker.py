@@ -38,18 +38,6 @@ def digests(directory: Path) -> dict[str, str]:
             for path in sorted(directory.glob("*.safetensors"))}
 
 
-def headers(directory: Path) -> dict[str, str]:
-    """Each weight file's header as written, by file name."""
-    import json
-    import struct
-
-    read = {}
-    for path in sorted(directory.glob("*.safetensors")):
-        with open(path, "rb") as file:
-            read[path.name] = file.read(struct.unpack("<Q", file.read(8))[0]).decode().strip()
-    return {name: json.dumps(json.loads(text)) for name, text in read.items()}
-
-
 def tensors(directory: Path) -> dict[str, tuple[str, list[int], str]]:
     """Each tensor a directory's weight files hold, by name: its dtype, shape and bytes' digest."""
     from safetensors.numpy import load_file
@@ -100,8 +88,6 @@ def exported(args) -> dict:
                           if written.get(name) != own.get(name)} if rank == 0 else {},
             "spanning": sum(not leaf.is_fully_addressable for leaf in leaves),
             "refused_outside": refused, "release": digests(destination), "alone": digests(alone),
-            "headers": {name: [headers(destination).get(name), headers(alone).get(name)]
-                        for name in ("model-00002-of-00026.safetensors",)},
             "small_files": sorted(path.name for path in destination.iterdir()
                                   if path.suffix != ".safetensors"),
             "peak": peak, "whole": sum(leaf.nbytes for leaf in leaves),

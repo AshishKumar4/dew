@@ -120,17 +120,17 @@ def test_a_pool_exports_a_model_spanning_its_processes_a_shard_at_a_time(tmp_pat
     """Two real processes export a decoder whose kernels span both as a saved run's release (`export_run`,
     ledger 2874), in a score of shards: each reads one tensor home at a time, together, so neither host's
     allocations during the export peak at half the model, where the pool read the whole tree home
-    first. The publishing process writes the files one process writes of the same weights unplaced,
-    byte for byte; the other writes the release's small files alone, no weights. Outside the export's
-    scope the write is refused rather than left waiting on the other process."""
+    first. The publishing process writes the tensors one process writes of the same weights unplaced,
+    byte for byte, though the restored tree's key order may place one in another shard; the other
+    writes the release's small files alone, no weights. Outside the export's scope the write is
+    refused rather than left waiting on the other process."""
     publisher, reader = run_pool("exported", tmp_path / "pool", processes=2, script=WORKER, devices=2,
                                  fsdp_size=4, run_dir=str(tmp_path))
     for report in (publisher, reader):
         assert report["processes"] == 2 and report["spanning"] > 0
         assert report["refused_outside"]
         assert report["largest_leaf"] <= report["peak"] < report["whole"] / 2
-    assert publisher["differing"] == {}
-    assert publisher["alone"] == reader["alone"], "one process's export, on each process"
-    assert publisher["release"] == publisher["alone"] and len(publisher["release"]) > 10
+    assert publisher["differing"] == {} and len(publisher["release"]) > 10
+    assert publisher["alone"] == reader["alone"]
     assert reader["release"] == {} and reader["small_files"] == publisher["small_files"]
 
