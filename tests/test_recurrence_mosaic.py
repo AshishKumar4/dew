@@ -30,7 +30,7 @@ from test_recurrence_chunk import (
 )
 
 from dew.nn.kernels import generation, recurrence
-from dew.nn.kernels.recurrence_chunk import Chunk, mosaic_rule
+from dew.nn.kernels.recurrence_chunk import Chunk, mamba_rounding, mosaic_rule
 from dew.nn.kernels.selection import KernelRefused
 from dew.nn.kernels.templates import bundles, mosaic, product, report, resources
 from dew.nn.kernels.templates.base import Unfitted
@@ -159,7 +159,8 @@ def draw(dtype, seed: int, *, rows: int, length: int, key_heads: int, value_head
 def template_call(given: Chunk, hooks: recurrence.Hooks):
     """The template's call over `given`'s operands under `hooks`, as the chunked op hands them over
     (`recurrence_chunk.chunk`): no decay a zero log decay a head, no write gate ones, the rule's form its
-    hooks', a rated scan's numbers mamba_ssm's under the run's fast forms (`rounded`)."""
+    hooks', a rated scan's numbers mamba_ssm's under the run's fast forms (`rounded`, as its route resolves
+    it, `recurrence_chunk.mamba_rounding`)."""
     heads = given.value.shape[:3]
     g = jnp.zeros(heads, jnp.float32) if given.log_decay is None else given.log_decay
     beta = jnp.ones(heads, given.value.dtype) if given.beta is None else given.beta
@@ -168,7 +169,8 @@ def template_call(given: Chunk, hooks: recurrence.Hooks):
                   if hooks.l2norm else (given.query, given.key))
     return template.MOSAIC.bind(query, key, given.value, g, beta, given.state, given.starts,
                                 delta=hooks.delta, wide=hooks.skip or hooks.output is not None,
-                                floor=hooks.floor, bound=hooks.inverse_bound, rounded=hooks.rated)
+                                floor=hooks.floor, bound=hooks.inverse_bound,
+                                rounded=hooks.rated and mamba_rounding())
 
 
 def refuses_its_gradient(fn, *drawn) -> None:
@@ -517,9 +519,14 @@ def every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_token_by_
                     f'the mosaic forward, {hooks} packed={packed}', seeds=HOOK_SEEDS[hooks, packed])
 
 
-RESOURCE_SHAPES = {'qwen3.5-27b-gdn': (16, 48, 128, 128, False), 'kimi-linear-kda': (32, 32, 128, 128, True)}
-"""The scoreboard's delta-rule geometries the resource gate compiles (`tools/benchmark_recurrence.SHAPES`):
-key heads, value heads, key and value widths, and whether the decay is a key dimension's."""
+RESOURCE_SHAPES = {'qwen3.5-27b-gdn': (16, 48, 128, 128, False), 'kimi-linear-kda': (32, 32, 128, 128, True),
+                   'nemotron-h-4b-ssd': (8, 96, 128, 80, False)}
+"""The scoreboard's geometries the resource gate compiles (`tools/benchmark_recurrence.SHAPES`): key heads,
+value heads, key and value widths, and whether the decay is a key dimension's."""
+
+RATED = frozenset({'nemotron-h-4b-ssd'})
+"""The gate's rated scans (Mamba2's SSD): no delta rule, its 16-bit call `rounded` (the fast forms), its
+launches the keys-gated ones (`mainloop._Call.gated_keys`)."""
 
 
 @lowers('sm90')
@@ -621,7 +628,11 @@ GATE_GROUPS = [(name, dtype, training, packed, variant) for name in RESOURCE_SHA
                for dtype in (jnp.bfloat16, jnp.float32) for packed in (False, True)
                for training in (False, True) for variant in (None, *range(NEIGHBOURS))
                if not (RESOURCE_SHAPES[name][4] and dtype == jnp.float32)
-               and not (training and (name, dtype) != ('qwen3.5-27b-gdn', jnp.bfloat16))
+               # The rated scan's 16-bit call, its fast forms' launches; its fp32 forward's spill at an
+               # H100's derived tiles is row 2939's.
+               and not (name in RATED and dtype == jnp.float32)
+               and not (training and (name, dtype) not in {('qwen3.5-27b-gdn', jnp.bfloat16),
+                                                           ('nemotron-h-4b-ssd', jnp.bfloat16)})
                and not (variant is not None and (training or packed or dtype == jnp.float32))]
 """The resource gate's groups (`compiled_cases`' `only`), a test each so each compiles in its own group:
 every geometry's forward in a 16-bit and an fp32 call, one row and packed documents, and the gated delta
@@ -662,7 +673,7 @@ def compiled_cases(target: str, plans: dict, refused: list, only: tuple | None =
                                                         kind=jnp.float32)]
         starts = array(rows, length, kind=jnp.bool_) if packed else None
         bound = template.MOSAIC.bind(*args, starts, max_segments=8 if packed else None,
-                                     floor=FLOOR if per_key else None)
+                                     floor=FLOOR if per_key else None, **form(name, dtype))
         with generation.assumed(facts):
             derived = template.MOSAIC.derived(bound, facts)
             held = Unbudgeted().derived(bound, facts)
@@ -681,9 +692,10 @@ def compiled_cases(target: str, plans: dict, refused: list, only: tuple | None =
                 assert len(tiled) - 1 <= NEIGHBOURS, f"{name} has {len(tiled) - 1} variants, past NEIGHBOURS"
                 return [case(name, dtype, args, starts, bound, tiles, training=training, packed=packed,
                              kind='') for tiles in tiled[1:][variant:variant + 1]]
+            unwide = {key: value for key, value in form(name, dtype).items() if key != 'wide'}
             if training and not mainloop_backward.backward_holds(
                     *args, tiles=derived, family=family, shared=shared, starts=starts,
-                    max_segments=8 if packed else None):
+                    max_segments=8 if packed else None, **unwide):
                 # The rule's gradient is the port's or the portable math's where the fast backward's launches
                 # do not hold (`mainloop_backward.backward_holds`); where only their registers refuse them,
                 # the gate compiles them, held to ptxas's need.
@@ -708,6 +720,11 @@ def compiled_cases(target: str, plans: dict, refused: list, only: tuple | None =
         return [case(name, dtype, args, starts, bound, tiles, training=training, packed=packed, kind=kind)
                 for tiles, kind in derived_tiles + walked + alone + ([] if training else unheld)]
 
+    def form(name: str, dtype) -> dict:
+        """The call's form beside its operands: a rated scan's without the delta rule, wide for its skip,
+        `rounded` (its fast forms, `mamba_rounding`), as the SSD's route gives it."""
+        return {'delta': False, 'wide': True, 'rounded': True} if name in RATED else {}
+
     def case(name: str, dtype, args, starts, bound, tiles, *, training: bool, packed: bool, kind: str):
         _, value_heads, key_width, value_width, per_key = RESOURCE_SHAPES[name]
 
@@ -723,8 +740,9 @@ def compiled_cases(target: str, plans: dict, refused: list, only: tuple | None =
             if training:
                 given += [array(rows, length, value_heads, value_width),
                           array(rows, value_heads, key_width, value_width, kind=jnp.float32)]
-            run = (mainloop_backward.gradients if training
-                   else functools.partial(mainloop.forward, floor=FLOOR if per_key else None))
+            formed = {key: value for key, value in form(name, dtype).items() if key != 'wide' or not training}
+            run = functools.partial(mainloop_backward.gradients if training else mainloop.forward, **formed,
+                                    **({} if training else {'floor': FLOOR if per_key else None}))
 
             def fn(*operands):
                 *operands, documents = operands if packed else (*operands, None)
@@ -763,7 +781,9 @@ def _gated(target: str, group: tuple):
 
 
 @pytest.mark.parametrize('target, group', [_gated(target, group) for target in ('sm80', 'sm90')
-                                           for group in GATE_GROUPS])
+                                           for group in GATE_GROUPS
+                                           # The SSD's A100 forward output launch's model miss is row 2943's.
+                                           if not (target == 'sm80' and group[0] in RATED and not group[2])])
 def test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides(target, group):
     """The mainloop's launches (`compiled_cases`), compiled by Mosaic for a compile-only A100 and H100 on this
     CPU (tests/kernel_compile.py): every launch compiles within the multiprocessor's shared memory (163 KB,

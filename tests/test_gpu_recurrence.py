@@ -175,9 +175,10 @@ def test_the_recurrences_run_on_this_gpu():
                functools.partial(gradient.test_a_walk_of_two_roles_is_as_exact_as_its_reference, *values),
                "sm90")
           for name, values in forward.native(gradient.WALK_GRID, gradient.INTERPRETED_WALKS)),
-        *(Cell(f"the template stays finite and on par where chunked forms break: {name} {regime} {product}",
-               functools.partial(templates_finite, name, regime, product))
-          for name, regime, product in template_stability.CASES),
+        *(Cell(f"the template stays finite and on par where chunked forms break: {name} {regime} {product}"
+               f"{'' if forms is None else f' ({forms} forms)'}",
+               functools.partial(templates_finite, name, regime, product, forms))
+          for name, regime, product, forms in template_stability.CASES),
         *(Cell(f"the portable backward as a GPU compiles it is as exact as the recurrence's: {name} {regime}",
                functools.partial(stability.test_the_chunked_ops_gradient_is_as_exact_as_the_recurrences,
                                  name, regime))
