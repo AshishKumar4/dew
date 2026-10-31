@@ -928,6 +928,9 @@ def test_the_quantized_serving_benchmark_samples_through_the_task_and_reads_its_
     pixels, found = tool.sample(pipe, 0)
     assert pixels.shape == (len(tool.PROMPTS), 2, 2, 1) and pixels.dtype == np.uint8
     assert found == {"latents": 0, "pixels": 0}
+    # Its timed forward is the denoiser's program over the model, the one sampling compiles through (row 3032).
+    row = tool.forward(pipe)
+    assert row["forward_ms"] > 0 and row["arguments_mib"] >= 0
 
 
 # ---------------------------------------------------------------------------
