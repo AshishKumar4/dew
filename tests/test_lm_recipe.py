@@ -881,11 +881,11 @@ def test_a_packed_runs_record_loads_where_its_token_store_is_not(tmp_path):
 def test_a_plan_an_earlier_dew_saved_over_a_token_store_resumes_where_it_read_the_same_documents(
         tmp_path, documents, eos, resumes):
     """A Dew before row 3028 read a token store's documents by its EOS, or, stating none, its whole stream
-    as one, stating no lengths then. Where it read the documents today's reads, the producer's records
-    (one record with no EOS, or records each closed by the EOS alone), the store's fingerprint is as it
-    gave it and a plan it saved resumes; where it read others (an EOS within a record, records without
-    an EOS one stream to it), however many, the fingerprint says how today's reads them (`documents`), and
-    the plan, which counted those others, is refused."""
+    as one, stating no lengths then, and named the store without saying how it reads them (`documents`).
+    Where it read the documents today's reads, the producer's records (one record with no EOS, or records
+    each closed by the EOS alone), a plan it saved resumes, read as today's names the store
+    (`earlier_plan`); where it read others (an EOS within a record, records without an EOS one stream to
+    it), however many, the plan, which counted those others, is refused."""
     from dew.data import Memory
     from dew.data.sinks import export
 
@@ -896,7 +896,7 @@ def test_a_plan_an_earlier_dew_saved_over_a_token_store_resumes_where_it_read_th
     plan = compile(TokenFiles(url).batch(1), read="memory", loading=Loading(workers=0)).plan
     saved = json.loads(json.dumps(plan.record()))
     (fingerprint,) = saved["manifest"]["source"]["sources"]
-    assert fingerprint.pop("documents", None) == (None if resumes else "records")
+    assert fingerprint.pop("documents") == "records"
     # The lengths that Dew stated: none without an EOS; with one, its documents', today's where alike.
     if eos is None or not resumes:
         saved["derived"].pop("0/lengths")
@@ -912,7 +912,8 @@ def test_a_plan_an_earlier_dew_saved_over_a_token_store_resumes_where_it_read_th
 def test_whether_an_earlier_dew_read_a_token_stores_documents_alike_is_each_fields_own(tmp_path):
     """An export holding two token fields is read alike by a Dew before row 3028 in one and not the other:
     each field's records closed by the EOS alone, or not. Each field's store says so, whichever is read
-    first, so neither takes the other's answer from Dew's cache."""
+    first, so neither takes the other's answer from Dew's cache; and neither's fingerprint asks it, which
+    every run computes: it names how today's reads the documents, and the scan waits for a resume."""
     from dew.data import Memory
     from dew.data.sinks import export
 
@@ -921,8 +922,11 @@ def test_whether_an_earlier_dew_read_a_token_stores_documents_alike_is_each_fiel
     rows = [{"text": np.asarray([1, 0], np.int32), "ids": np.asarray([0, 1], np.int32)},
             {"text": np.asarray([2, 0], np.int32), "ids": np.asarray([0, 2], np.int32)}]
     export(Memory(rows), url, format="array_record", length_field="text", metadata=stated)
-    assert "documents" not in TokenFiles(url).fingerprint()
-    assert TokenFiles(url, field="ids").fingerprint()["documents"] == "records"
+    text, ids = TokenFiles(url), TokenFiles(url, field="ids")
+    assert text.fingerprint()["documents"] == ids.fingerprint()["documents"] == "records"
+    assert "_read_alike" not in vars(text) and "_read_alike" not in vars(ids)
+    assert not ids.read_alike()
+    assert text.read_alike()
 
 
 @pytest.mark.parametrize("eos", [None, 0], ids=["no-eos", "eos"])

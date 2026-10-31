@@ -18,6 +18,7 @@ import functools
 import itertools
 import os
 import threading
+import typing
 from collections.abc import Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from typing import ClassVar, Literal, Protocol, runtime_checkable
@@ -143,6 +144,7 @@ from dew.data.sources.base import (
     tokenizer_contract,
 )
 from dew.data.sources.concatenate import Concatenate
+from dew.data.sources.tokens import TokenFiles
 from dew.data.steps.generic import Coordinated
 
 _DEFAULT_LOADING = Loading()
@@ -346,6 +348,16 @@ def _stores(source: Source) -> Iterator[Source]:
                 yield from _stores(part)
         else:
             yield selected
+
+
+def _token_stores(source: Source) -> Iterator[TokenFiles]:
+    """The token stores `source` reads, through every view and a concatenation's parts."""
+    for each in beneath(source, typing.get_args(Rows.__value__)):
+        if isinstance(each, Concatenate):
+            for part in each.sources:
+                yield from _token_stores(part)
+        elif isinstance(each, TokenFiles):
+            yield each
 
 
 def _tokenizer_contract(pipelines: Sequence[Pipeline]) -> None:
@@ -869,6 +881,7 @@ def _compiled(
         members=_member_manifests(train, build, host),
         volatile=any(_volatile(stage) for stage in
                      (*_steps(original), *(stage for source in sources for stage in _written(source, ())))),
+        stores=tuple(store for source in sources for store in _token_stores(source)),
     )
     tuned = build.tuned(train)
     # The training read's workers move before what drops records (`pooled`); validation reads its own.

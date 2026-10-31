@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     from _typeshed import DataclassInstance
 
     from dew.batch import Batch
+    from dew.data.sources.tokens import TokenFiles
 
 
 def _canonical(value: JSON | Mapping[str, object]) -> bytes:
@@ -399,13 +400,16 @@ _LIMIT = re.compile(r"Limit\(count=(\d+)\)")
 
 def earlier_plan(saved: Mapping[str, object], plan: Plan) -> Mapping[str, object]:
     """`saved`, a data plan a saved position records, as `plan`, this run's, reads it (`Plan.check`): the
-    position's one translation, where a reader's `set_state` decodes it. Its derived order holds today's
-    lengths (`plan`'s) of each source a Dew before row 3028 stated none for (`_unstated_lengths`), where the
-    plan names the source as today's does, so its documents are the ones that Dew read
-    (`TokenFiles._read_alike`); the saved and current manifests' sources are numbered as their derived
-    facts number them. Carried to 1.0 (ledger 1552)."""
-    saved_sources = record(record(saved.get("manifest", {}), "saved data manifest").get("source", {}),
-                           "saved data source").get("sources")
+    position's one translation, where a reader's `set_state` decodes it. A token store a Dew before row 3028
+    named without saying how its documents are read is named as today's names it where that Dew read the
+    same documents of it (`_named_as_today`); its derived order holds today's lengths (`plan`'s) of each
+    source that Dew stated none for (`_unstated_lengths`), where the plan names the source as today's does;
+    the saved and current manifests' sources are numbered as their derived facts number them. Carried to
+    1.0 (ledger 1552)."""
+    manifest = record(saved.get("manifest", {}), "saved data manifest")
+    named = _named_as_today(json_value(manifest.get("source", {}), "saved data source"), plan.stores)
+    saved = {**saved, "manifest": {**manifest, "source": named}}
+    saved_sources = record(named, "saved data source").get("sources")
     sources = record(plan.manifest.semantic().get("source", {}), "data source").get("sources")
     if not isinstance(saved_sources, list) or not isinstance(sources, list):
         return saved
@@ -416,6 +420,24 @@ def earlier_plan(saved: Mapping[str, object], plan: Plan) -> Mapping[str, object
                 and _unstated_lengths(today)):
             held[name] = plan.derived[name]
     return {**saved, "derived": held}
+
+
+def _named_as_today(value: JSON, stores: Sequence[TokenFiles]) -> JSON:
+    """`value`, a saved plan's fingerprint of its sources or a part of one, a saved record read at its
+    boundary: each token store in it a Dew before row 3028 named without `documents` named with it, as
+    today's names it, where it is one of `stores` and that Dew read its documents as today's does
+    (`TokenFiles.read_alike`, a scan of its tokens only here); anything else as it is."""
+    if isinstance(value, list):
+        return [_named_as_today(part, stores) for part in value]
+    if not isinstance(value, dict):
+        return value
+    if value.get("store") == "tokens" and "documents" not in value:
+        for store in stores:
+            before = {name: part for name, part in store.fingerprint().items() if name != "documents"}
+            if json_value(before, "token store fingerprint") == value and store.read_alike():
+                return {**value, "documents": "records"}
+        return value
+    return {name: _named_as_today(part, stores) for name, part in value.items()}
 
 
 def _unstated_lengths(source: Mapping[str, object]) -> bool:
@@ -501,6 +523,9 @@ class Plan:
     """A mixture's members, each what it reads and runs as one digest under its key, and its own
     stages under the empty key (`dew.data.analysis._member_manifests`): what a streamed mix's
     resume reads of a member that joined or left (`check`)."""
+    stores: tuple[TokenFiles, ...] = dataclasses.field(default=(), compare=False, repr=False)
+    """The token stores beneath the plan's sources, which a plan a Dew before row 3028 saved names
+    otherwise (`earlier_plan`); no part of the plan's record."""
     version: ClassVar[int] = 7
 
     def record(self) -> dict[str, JSON]:
