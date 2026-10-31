@@ -400,8 +400,9 @@ def test_an_executable_carries_each_mosaic_and_triton_kernels_binary_once():
     kernel once, from its kernel proto (a Mosaic thunk's binary is empty), each stating its registers; the
     fusion, whose thunk carries its cubin too, names no launch and is no template's."""
     from jax.experimental import pallas as pl
-    from jax.experimental.pallas import mosaic_gpu as plgpu, triton as pltriton
+    from jax.experimental.pallas import triton as pltriton
     from jax.sharding import NamedSharding, PartitionSpec
+    from kernel_compile import staged_copy
 
     from dew.nn.kernels import generation
     from dew.nn.kernels.templates import report
@@ -410,15 +411,8 @@ def test_an_executable_carries_each_mosaic_and_triton_kernels_binary_once():
     def added(x_ref, y_ref, o_ref):
         o_ref[...] = x_ref[...] + y_ref[...]
 
-    def copied(source, out, staged, barrier):
-        plgpu.copy_gmem_to_smem(source, staged, barrier.at[0])
-        plgpu.barrier_wait(barrier.at[0])
-        plgpu.copy_smem_to_gmem(staged, out)
-        plgpu.wait_smem_to_gmem(0)
-
+    copy = staged_copy((128, 128), jnp.float32)
     shape = jax.ShapeDtypeStruct((128, 128), jnp.float32)
-    copy = plgpu.kernel(copied, out_type=shape, num_threads=1, thread_name="wg",
-                        scratch_types=[plgpu.SMEM((128, 128), jnp.float32), plgpu.Barrier(num_barriers=1)])
 
     def program(x, y):
         launched = pl.pallas_call(added, out_shape=shape, grid=(1,), name="dew_added__l0123456789",

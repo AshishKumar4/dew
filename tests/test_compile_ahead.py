@@ -164,18 +164,9 @@ def test_a_compile_only_gpu_assembles_mosaic_gpus_architecture_specific_code(gen
     assembles. An sm120 stating no feature extension assembled for plain sm_120 and refused its own PTX
     ('.target sm_120a cannot be compiled for architecture sm_120')."""
     from fla_gdn_support import KernelCase
-    from jax.experimental.pallas import mosaic_gpu as plgpu
-    from kernel_compile import compile_mosaic_kernels
+    from kernel_compile import compile_mosaic_kernels, staged_copy
 
-    def body(source, out, staged, barrier):
-        plgpu.copy_gmem_to_smem(source, staged, barrier.at[0])
-        plgpu.barrier_wait(barrier.at[0])
-        plgpu.copy_smem_to_gmem(staged, out)
-        plgpu.wait_smem_to_gmem(0)
-
-    kernel = plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((64, 64), jnp.bfloat16), num_threads=1,
-                          thread_name="wg", scratch_types=[plgpu.SMEM((64, 64), jnp.bfloat16),
-                                                           plgpu.Barrier(num_barriers=1)])
+    kernel = staged_copy((64, 64), jnp.bfloat16)
     spec = jax.ShapeDtypeStruct((64, 64), jnp.bfloat16)
     record, = compile_mosaic_kernels([KernelCase("copy", lambda: (kernel, (spec,)), {})], generation)
     assert "error" not in record, record["error"]
