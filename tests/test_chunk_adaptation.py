@@ -5,6 +5,7 @@ Each claim is held to a literal reading of equation 71, a Python loop over each 
 that steps the level by `rate` times its window's summed weighted gradient, written here apart from
 the scan, on par with it by check 1 against its own float64 run."""
 
+import functools
 from pathlib import Path
 
 import jax
@@ -507,6 +508,18 @@ def stacked_windows(kind: str, seed: int) -> tuple:
     return jax.tree.map(lambda *leaves: np.concatenate([np.asarray(leaf) for leaf in leaves]), *parts)
 
 
+@functools.cache
+def float64_levels(kind: str, window: int):
+    """The literal loop's levels in float64 over a `kind` row's fields (`equation_71`), one program a kind
+    and window: every draw's windows read it (`window_segments`), a stacked draw 32 times, so none
+    traces or compiles it again."""
+    fields = fields_of(kind)
+    adaptation = ChunkAdaptation(window=window, rate=0.5)
+    return jax.jit(lambda *inputs: equation_71(
+        MODEL, *inputs, {name: jnp.asarray(value) for name, value in fields.items()}, adaptation,
+        levels=True, truth=True)[1])
+
+
 def window_segments(kind: str, seed: int, window: int = 3):
     """A draw's windows each alone, at the corner (0.5 N(0, 1) weights stepped by a half), each started
     where the literal loop in float64 stands at it, rounded to float32: every window of every document
@@ -514,12 +527,9 @@ def window_segments(kind: str, seed: int, window: int = 3):
     its own row with its own level and documents."""
     variables, hidden, targets, weights = draw(seed, scale=0.5)
     fields = fields_of(kind)
-    adaptation = ChunkAdaptation(window=window, rate=0.5)
     with jax.enable_x64(new_val=True):
-        loop = jax.jit(lambda *inputs: equation_71(
-            MODEL, *inputs, {name: jnp.asarray(value) for name, value in fields.items()}, adaptation,
-            levels=True, truth=True)[1])
-        levels = jax.device_get(loop(*widened((variables, hidden, targets, weights))))
+        levels = jax.device_get(float64_levels(kind, window)(*widened((variables, hidden, targets,
+                                                                       weights))))
     documents = fields.get("segment_ids", np.ones((len(targets), LENGTH), np.int32))
     picked = []
     for row in range(len(targets)):
