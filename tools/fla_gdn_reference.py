@@ -132,7 +132,40 @@ def serve() -> None:
         print("done", flush=True)
 
 
-def write_seeded(worker, prefix: str = "") -> None:
+class Worker:
+    """`serve`'s torch process in the fla Python `python`, started again where it died: one request a line,
+    answered `done` (`ask`)."""
+
+    def __init__(self, python: str):
+        self.python, self.process, self.started = python, None, None
+
+    def start(self) -> str:
+        """The process started, its `ready` line's words after the first: fla's version and the device."""
+        import subprocess
+
+        self.process = subprocess.Popen([self.python, __file__, "--serve"], stdin=subprocess.PIPE,
+                                        stdout=subprocess.PIPE, text=True)
+        self.started = self.process.stdout.readline().split(maxsplit=1)[1]
+        return self.started
+
+    def ask(self, line: str) -> None:
+        """`line` answered, the process started once more where it died on it (its exit code printed)."""
+        for attempt in range(2):
+            self.process.stdin.write(f"{line}\n")
+            self.process.stdin.flush()
+            if self.process.stdout.readline().strip() == "done":
+                return
+            print(f"the torch process died on a request (exit {self.process.wait()}), attempt {attempt + 1}",
+                  flush=True)
+            self.start()
+        raise RuntimeError("the torch process answered no request twice")
+
+    def close(self) -> None:
+        self.process.stdin.close()
+        self.process.wait()
+
+
+def write_seeded(worker: Worker, prefix: str = "") -> None:
     """Each site's seeded draws with fla's outputs and gradients and their float64 truth (`worker`,
     `serve`'s process), recorded as a summary (`record_case`), Dew's portable rule in the site's dtype the
     sizing proxy and its float64 token recurrence held to fla's reference at every seed."""
@@ -145,7 +178,7 @@ def write_seeded(worker, prefix: str = "") -> None:
     from reference_error import chain_roundings, widened
     from test_recurrence_chunk import chunk_on, token_by_token
 
-    _, version, device = worker.stdout.readline().split(maxsplit=2)
+    version, device = worker.start().split(maxsplit=1)
     requests = tempfile.mkdtemp(prefix="fla-")
     stored = {}
     for name, site in sites().items():
@@ -158,10 +191,7 @@ def write_seeded(worker, prefix: str = "") -> None:
             path = os.path.join(requests, "inputs.npz")
             np.savez(path, **{key: np.asarray(value, np.float32) if key != "starts" else value
                               for key, value in arrays.items()})
-            worker.stdin.write(f"{path} {dtype} {'kda' if kda else 'gdn'} {scale!r}\n")
-            worker.stdin.flush()
-            if worker.stdout.readline().strip() != "done":
-                raise RuntimeError("the torch process answered no request")
+            worker.ask(f"{path} {dtype} {'kda' if kda else 'gdn'} {scale!r}")
             with np.load(f"{path}.reference.npz") as reference, np.load(f"{path}.truth.npz") as truth:
                 return dict(reference), dict(truth)
 
@@ -191,15 +221,12 @@ def write_seeded(worker, prefix: str = "") -> None:
 
 
 def main() -> None:
-    import subprocess
-
     if sys.argv[1] == "--serve":
         serve()
         return
-    with subprocess.Popen([sys.argv[1], __file__, "--serve"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                          text=True) as worker:
-        write_seeded(worker, *sys.argv[2:3])
-        worker.stdin.close()
+    worker = Worker(sys.argv[1])
+    write_seeded(worker, *sys.argv[2:3])
+    worker.close()
 
 
 if __name__ == "__main__":
