@@ -9,8 +9,10 @@ inside the suite never hit it, since `dew` is already loaded.
 import ast
 import json
 import os
+import re
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -191,3 +193,21 @@ def test_a_lazy_packages_modules_read_through_it_as_an_eager_packages_did(packag
               f"'{package}.{module}'), {name!r})\n")
     subprocess.run([sys.executable, "-c", script], check=True,
                    env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(SOURCE)})
+
+
+def test_the_release_version_is_read_from_a_module_import_dew_does_not_run():
+    """`dew.__version__` comes from `dew._version`, imported when the version is first read, and the package
+    metadata takes it from there: a release's bump then changes no module `import dew` executes, whose top
+    level every test file's CI key covers (train 396: the 0.1.0 to 0.2.0 line in src/dew/__init__.py re-keyed
+    every row of its suite, 0.0% reused, where nothing a test reads had changed)."""
+    script = ("import sys\nimport dew\n"
+              "assert 'dew._version' not in sys.modules, 'import dew ran the version module'\n"
+              "version = dew.__version__\n"
+              "assert sys.modules['dew._version'].__version__ == version\n"
+              "print(version)\n")
+    run = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True,
+                         env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(SOURCE)}, timeout=120)
+    assert run.returncode == 0, run.stderr
+    metadata = tomllib.loads((SOURCE.parent / "pyproject.toml").read_text())
+    assert metadata["tool"]["setuptools"]["dynamic"]["version"] == {"attr": "dew._version.__version__"}
+    assert re.fullmatch(r"\d+\.\d+\.\d+", run.stdout.strip())

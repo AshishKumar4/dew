@@ -36,6 +36,7 @@ from dew.interop.decoder_parts import ACTIVATIONS, PLAIN_SPELLING, DecoderFields
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind
+from dew.nn.mla import MultiHeadLatentAttention
 
 if TYPE_CHECKING:
     import torch
@@ -441,6 +442,21 @@ def _read_causal_lm(view: PartView) -> Mapping[str, object]:
     return {}
 
 
+def _read_scaled_causal_lm(view: PartView) -> Mapping[str, object]:
+    """Granite's head: Llama's, its logits divided by the config's `logits_scaling`."""
+    return {**_read_causal_lm(view), 'logits_scaling': float(view.config.logits_scaling)}
+
+
+def _read_scaled_model(view: PartView) -> Mapping[str, object]:
+    """Granite's model: Llama's, its embeddings times its `embedding_multiplier`."""
+    return {**_read_llama_model(view), 'embedding_multiplier': float(view.embedding_multiplier)}
+
+
+def _read_scaled_layer(view: PartView) -> Mapping[str, object]:
+    """Granite's layer: Llama's, each sublayer's output times its `residual_multiplier` into the residual."""
+    return {'residual_multiplier': float(view.residual_multiplier)}
+
+
 def _read_llama_model(view: PartView) -> Mapping[str, object]:
     layers = len(view.layers)
     if view.config.num_hidden_layers != layers:
@@ -500,6 +516,29 @@ def _read_qk_norm_attention(view: PartView) -> Mapping[str, object]:
     return {**_read_attention(view), 'qk_norm': True}
 
 
+def _read_nope_attention(view: PartView) -> Mapping[str, object]:
+    """SmolLM3's attention: Llama's, rotating its queries and keys only where `use_rope` (each fourth layer
+    attends without positions, `no_rope_layers`), a per-layer fact `assemble` makes a kind of."""
+    return {**_read_attention(view), _LAYER: {'nope': not bool(view.use_rope)}}
+
+
+def _read_projection_qk_norm_attention(view: PartView) -> Mapping[str, object]:
+    """OLMo 2's attention: Llama's with an RMSNorm over the whole query and key projections, before the
+    heads split (`qk_norm_scope='projection'`, OLMo 3's)."""
+    return {**_read_attention(view), 'qk_norm': True, 'qk_norm_scope': 'projection'}
+
+
+def _read_output_normed_layer(view: PartView) -> Mapping[str, object]:
+    """OLMo 2's layer: each sublayer's output normed before it joins the residual, its input not
+    (`sandwich_norms` without `pre_norms`, OLMo 3's)."""
+    return {'sandwich_norms': True, 'pre_norms': False}
+
+
+def _read_scale_first_norm(view: PartView) -> Mapping[str, object]:
+    """OLMo 2's RMSNorm: its weight times the normalized input in float32, cast after."""
+    return {'norm_eps': float(view.variance_epsilon), 'scale_after_cast': False, 'scale_offset': False}
+
+
 def _read_mlp(view: PartView) -> Mapping[str, object]:
     return {'mlp': gated_activation(view.act_fn), 'mlp_features': view.gate_proj.out_features,
             'mlp_bias': _biased(view.gate_proj, view.up_proj, view.down_proj)}
@@ -516,12 +555,75 @@ def _read_router(view: PartView, *, normalized: bool | None) -> Mapping[str, obj
     return {_LAYER: {'top_k': int(view.top_k), 'experts': int(view.num_experts), 'norm_topk_prob': norm}}
 
 
+def _read_sigmoid_router(view: PartView) -> Mapping[str, object]:
+    """HY-3's router: sigmoid scores in float32, chosen by score plus the block's correction bias,
+    weighted by score renormalized over the chosen and times `router_scaling_factor` (DeepSeek V3's)."""
+    return {_LAYER: {'top_k': int(view.top_k), 'experts': int(view.num_experts), 'norm_topk_prob': True,
+                     'score_function': 'sigmoid', 'scaling': float(view.router_scaling_factor), 'bias': True}}
+
+
+def _read_grouped_router(view: PartView) -> Mapping[str, object]:
+    """DeepSeek V3's router (GLM-4.7-Flash's): sigmoid scores in float32 plus its correction bias,
+    experts chosen within the `topk_group` best of `num_group` groups (each scored by its two best),
+    weighted by score, renormalized where `norm_topk_prob`, times `routed_scaling_factor`."""
+    return {_LAYER: {'top_k': int(view.top_k), 'experts': int(view.num_experts),
+                     'norm_topk_prob': bool(view.norm_topk_prob), 'score_function': 'sigmoid',
+                     'scaling': float(view.routed_scaling_factor), 'bias': True,
+                     'groups': int(view.num_group), 'groups_per_token': int(view.topk_group)}}
+
+
+def _read_latent_attention(view: PartView) -> Mapping[str, object]:
+    """DeepSeek V3's multi-head latent attention (GLM-4.7-Flash's): queries through a low-rank latent
+    where `q_lora_rank` (whole otherwise), keys and values from one normed latent beside a shared rotated
+    key, each head's query and key a rotated and an unrotated part (the `mla` mixer). Its latents are
+    normed at their own epsilon, which the mixer holds at `MultiHeadLatentAttention.norm_eps`, and its
+    scale takes the yarn ramp's mscale off its config's rope record, the rotary's (`_rope`), as the
+    mixer's does off the layer's."""
+    if not view.is_causal:
+        raise Ambiguous("the attention is not causal")
+    nope, rope = int(view.qk_nope_head_dim), int(view.qk_rope_head_dim)
+    rank = view.q_lora_rank
+    norms = [view.kv_a_layernorm] + ([] if rank is None else [view.q_a_layernorm])
+    epsilon = MultiHeadLatentAttention.norm_eps
+    if any(float(norm.variance_epsilon) != epsilon for norm in norms):
+        raise Ambiguous(f"the latents are normed at an epsilon other than {epsilon}")
+    heads = int(view.num_heads)
+    return {**_rope(view.config), 'num_heads': heads, 'num_kv_heads': heads // int(view.num_key_value_groups),
+            'head_dim': nope + rope, 'qk_norm': False,
+            'attention_bias': view.kv_a_proj_with_mqa.bias is not None,
+            'attention_dropout_rate': float(view.attention_dropout),
+            'mixer': {'class': 'mla', 'fields': {
+                'q_lora_rank': None if rank is None else int(rank), 'kv_lora_rank': int(view.kv_lora_rank),
+                'qk_nope_head_dim': nope, 'qk_rope_head_dim': rope, 'v_head_dim': int(view.v_head_dim),
+                'rope_interleave': bool(view.config.rope_interleave)}}}
+
+
+def _read_shared_moe(view: PartView) -> Mapping[str, object]:
+    """A routed block beside always-on shared experts (`shared_experts`, an MLP read as `shared`), the two
+    summed: DeepSeek V3's, and HY-3's, whose float32 sum of two values of the compute dtype rounds as
+    their sum there does (`enable_moe_fp32_combine`), so it reads no field."""
+    return {}
+
+
+def _read_shared_mlp(view: PartView) -> Mapping[str, object]:
+    """A routed block's shared experts: Llama's MLP, its width the block's (`Mixture.shared_features`)."""
+    width = int(view.gate_proj.out_features)
+    return {'mlp': gated_activation(view.act_fn), _LAYER: {'shared_features': width}}
+
+
 def _read_experts(view: PartView) -> Mapping[str, object]:
     return {'mlp': gated_activation(view.act_fn), _LAYER: {'expert_features': int(view.intermediate_dim)}}
 
 
 def _read_rms_norm(view: PartView) -> Mapping[str, object]:
     return {'norm_eps': float(view.variance_epsilon), 'scale_after_cast': True, 'scale_offset': False}
+
+
+def _read_latent_norm(view: PartView) -> Mapping[str, object]:
+    """A latent attention's norm (Llama's RMSNorm): the latent mixer norms at the block norms' rounding
+    (`MLAMixer.build` passes the layer's), so it states that rounding, which the block norms' must agree
+    with; its epsilon the attention's reader holds to the mixer's own."""
+    return {'scale_after_cast': True, 'scale_offset': False}
 
 
 def _read_offset_norm(view: PartView) -> Mapping[str, object]:
@@ -571,6 +673,10 @@ class KnownPart:
     """Whether every method of the known class is compared, its constructor's included: a part whose
     buffers its constructor computes (a rotary's frequencies), which the forward reads and the reader
     takes from the config."""
+    state: Mapping[str, str] = field(default_factory=dict)
+    """The state a checkpoint stores beside its parameters (a router's correction bias, a buffer), by the
+    known class's names, onto its canonical name under the part (HY-3's MoE holds the bias its router
+    reads, which Dew keeps in the router, `gate.e_score_correction_bias`)."""
 
     def known(self) -> type:
         module, _, qualname = self.location.partition(':')
@@ -584,28 +690,56 @@ _QWEN3_MOE = 'transformers.models.qwen3_moe.modeling_qwen3_moe'
 _GEMMA = 'transformers.models.gemma.modeling_gemma'
 _MISTRAL = 'transformers.models.mistral.modeling_mistral'
 _QWEN2 = 'transformers.models.qwen2.modeling_qwen2'
+_GRANITE = 'transformers.models.granite.modeling_granite'
+_SMOLLM3 = 'transformers.models.smollm3.modeling_smollm3'
+_OLMO2 = 'transformers.models.olmo2.modeling_olmo2'
+_HY_V3 = 'transformers.models.hy_v3.modeling_hy_v3'
+_DEEPSEEK_V3 = 'transformers.models.deepseek_v3.modeling_deepseek_v3'
+_GLM4_MOE = 'transformers.models.glm4_moe.modeling_glm4_moe'
 Children = Mapping[str, tuple[str, ...]]
 _MODEL_CHILDREN: Children = {'embed_tokens': ('embedding',), 'layers': ('layers',), 'norm': ('norm',),
                              'rotary_emb': ('rotary',)}
 _LAYER_CHILDREN: Children = {'self_attn': ('attention',), 'mlp': ('mlp', 'moe'), 'input_layernorm': ('norm',),
                              'post_attention_layernorm': ('norm',)}
 _ATTENTION_CHILDREN: Children = dict.fromkeys(('q_proj', 'k_proj', 'v_proj', 'o_proj'), ('linear',))
+_SHARED_MOE_CHILDREN: Children = {'gate': ('router',), 'experts': ('experts',), 'shared_experts': ('shared',)}
+_LATENT_CHILDREN: Children = {
+    **dict.fromkeys(('q_proj', 'q_a_proj', 'q_b_proj', 'kv_a_proj_with_mqa', 'kv_b_proj', 'o_proj'),
+                    ('linear',)),
+    **dict.fromkeys(('q_a_layernorm', 'kv_a_layernorm'), ('latent_norm',))}
 
 KNOWN: tuple[KnownPart, ...] = (
     KnownPart('causal_lm', f'{_LLAMA}:LlamaForCausalLM', {'model': ('model',), 'lm_head': ('linear',)},
          _read_causal_lm),
     KnownPart('causal_lm', f'{_MIXTRAL}:MixtralForCausalLM', {'model': ('model',), 'lm_head': ('linear',)},
          _read_causal_lm),
+    KnownPart('causal_lm', f'{_GRANITE}:GraniteForCausalLM', {'model': ('model',), 'lm_head': ('linear',)},
+              _read_scaled_causal_lm),
+    KnownPart('causal_lm', f'{_HY_V3}:HYV3ForCausalLM', {'model': ('model',), 'lm_head': ('linear',)},
+              _read_causal_lm),
+    KnownPart('model', f'{_HY_V3}:HYV3Model', _MODEL_CHILDREN, _read_llama_model),
     KnownPart('model', f'{_LLAMA}:LlamaModel', _MODEL_CHILDREN, _read_llama_model),
+    KnownPart('model', f'{_GRANITE}:GraniteModel', _MODEL_CHILDREN, _read_scaled_model),
     KnownPart('model', f'{_MIXTRAL}:MixtralModel', _MODEL_CHILDREN, _read_windowed_model),
     KnownPart('model', f'{_GEMMA}:GemmaModel', _MODEL_CHILDREN, _read_llama_model),
     KnownPart('model', f'{_MISTRAL}:MistralModel', _MODEL_CHILDREN, _read_windowed_model),
     KnownPart('model', f'{_QWEN2}:Qwen2Model', _MODEL_CHILDREN, _read_layer_typed_model),
     KnownPart('layer', f'{_LLAMA}:LlamaDecoderLayer', _LAYER_CHILDREN, _read_nothing),
     KnownPart('layer', f'{_MIXTRAL}:MixtralDecoderLayer', _LAYER_CHILDREN, _read_nothing),
+    KnownPart('layer', f'{_GRANITE}:GraniteDecoderLayer', _LAYER_CHILDREN, _read_scaled_layer),
+    KnownPart('layer', f'{_OLMO2}:Olmo2DecoderLayer',
+              {'self_attn': ('attention',), 'mlp': ('mlp', 'moe'), 'post_attention_layernorm': ('norm',),
+               'post_feedforward_layernorm': ('norm',)}, _read_output_normed_layer),
     KnownPart('attention', f'{_LLAMA}:LlamaAttention', _ATTENTION_CHILDREN, _read_attention),
     KnownPart('attention', f'{_MIXTRAL}:MixtralAttention', _ATTENTION_CHILDREN, _read_attention),
     KnownPart('attention', f'{_QWEN2}:Qwen2Attention', _ATTENTION_CHILDREN, _read_attention),
+    KnownPart('attention', f'{_SMOLLM3}:SmolLM3Attention', _ATTENTION_CHILDREN, _read_nope_attention),
+    KnownPart('attention', f'{_DEEPSEEK_V3}:DeepseekV3Attention', _LATENT_CHILDREN, _read_latent_attention),
+    KnownPart('attention', f'{_HY_V3}:HYV3Attention',
+              {**_ATTENTION_CHILDREN, 'q_norm': ('norm',), 'k_norm': ('norm',)}, _read_qk_norm_attention),
+    KnownPart('attention', f'{_OLMO2}:Olmo2Attention',
+              {**_ATTENTION_CHILDREN, 'q_norm': ('norm',), 'k_norm': ('norm',)},
+              _read_projection_qk_norm_attention),
     KnownPart('attention', f'{_QWEN3}:Qwen3Attention',
          {**_ATTENTION_CHILDREN, 'q_norm': ('norm',), 'k_norm': ('norm',)}, _read_qk_norm_attention),
     KnownPart('mlp', f'{_LLAMA}:LlamaMLP', dict.fromkeys(('gate_proj', 'up_proj', 'down_proj'), ('linear',)),
@@ -614,6 +748,15 @@ KNOWN: tuple[KnownPart, ...] = (
          _read_mixtral_moe),
     KnownPart('moe', f'{_QWEN3_MOE}:Qwen3MoeSparseMoeBlock', {'gate': ('router',), 'experts': ('experts',)},
          _read_nothing),
+    KnownPart('moe', f'{_HY_V3}:HYV3MoE', _SHARED_MOE_CHILDREN, _read_shared_moe,
+              state={'e_score_correction_bias': 'gate.e_score_correction_bias'}),
+    KnownPart('shared', f'{_LLAMA}:LlamaMLP',
+              dict.fromkeys(('gate_proj', 'up_proj', 'down_proj'), ('linear',)), _read_shared_mlp),
+    KnownPart('router', f'{_HY_V3}:HYV3TopKRouter', {}, _read_sigmoid_router, ('weight',)),
+    KnownPart('moe', f'{_DEEPSEEK_V3}:DeepseekV3MoE', _SHARED_MOE_CHILDREN, _read_shared_moe),
+    KnownPart('router', f'{_DEEPSEEK_V3}:DeepseekV3TopkRouter', {}, _read_grouped_router,
+              ('weight',), state={'e_score_correction_bias': 'e_score_correction_bias'}),
+    KnownPart('latent_norm', f'{_LLAMA}:LlamaRMSNorm', {}, _read_latent_norm, ('weight',)),
     KnownPart('router', f'{_MIXTRAL}:MixtralTopKRouter', {}, lambda view: _read_router(view, normalized=True),
          ('weight',)),
     KnownPart('router', f'{_QWEN3_MOE}:Qwen3MoeTopKRouter', {},
@@ -621,15 +764,20 @@ KNOWN: tuple[KnownPart, ...] = (
     KnownPart('experts', f'{_MIXTRAL}:MixtralExperts', {}, _read_experts, ('gate_up_proj', 'down_proj')),
     KnownPart('norm', f'{_LLAMA}:LlamaRMSNorm', {}, _read_rms_norm, ('weight',)),
     KnownPart('norm', f'{_GEMMA}:GemmaRMSNorm', {}, _read_offset_norm, ('weight',)),
+    KnownPart('norm', f'{_OLMO2}:Olmo2RMSNorm', {}, _read_scale_first_norm, ('weight',)),
     KnownPart('rotary', f'{_LLAMA}:LlamaRotaryEmbedding', {}, _read_rotary, whole=True),
     KnownPart('rotary', f'{_QWEN2}:Qwen2RotaryEmbedding', {}, _read_rotary, whole=True),
+    KnownPart('rotary', f'{_OLMO2}:Olmo2RotaryEmbedding', {}, _read_rotary, whole=True),
+    KnownPart('rotary', f'{_GLM4_MOE}:Glm4MoeRotaryEmbedding', {}, _read_rotary, whole=True),
     KnownPart('embedding', 'torch.nn:Embedding', {}, _read_embedding, ('weight',)),
     KnownPart('embedding', f'{_GEMMA}:GemmaTextScaledWordEmbedding', {}, _read_scaled_embedding, ('weight',)),
     KnownPart('linear', 'torch.nn:Linear', {}, _read_nothing, ('weight', 'bias')),
 )
-"""The known parts, the registered families' own classes. A class of another registered family that
-computes one of these by its code (Qwen2's MLP is Llama's, Qwen3-MoE's experts Mixtral's) matches it
-through `same_code`, so each entry stands for every copy of its code."""
+"""The known parts: transformers' classes whose computation Dew's decoder states by the fields their readers
+return, a registered family's or a type's own (Granite's, OLMo 2's), each assembly of them still verified
+against its source's code (`dew.interop.verify`). A class that computes one of these by its code (Qwen2's
+MLP is Llama's, Qwen3-MoE's experts Mixtral's, GLM-4.7-Flash's attention DeepSeek V3's) matches it through
+`same_code`, so each entry stands for every copy of its code."""
 
 
 @cache
@@ -683,20 +831,99 @@ class Assembly:
     dropouts: tuple[tuple[str, str], ...] = ()
     """Each attention module's path and the attribute its code reads its dropout rate from, which a
     deterministic training forward sets to zero (`dew.interop.verify`'s training qualification)."""
+    loaded: Callable[[str], tuple[str, tuple[str, str] | None]] = lambda name: (name, None)
+    """A stored tensor's name as the source's load names it, and for one expert's own tensor, which the
+    load stacks into its experts module's fused one, the expert's index and canonical projection
+    (`_load_names`). It reads stored names alone: a name the model holds (a gradient's) is stored first
+    as `save_pretrained` stores it (`dew.interop.verify.gradient_parity`)."""
 
     def canonical(self, name: str) -> str | None:
         """A stored tensor's canonical name: its module's canonical path and its parameter's known
-        name, a part a fused tensor splits into (`_SPLIT`) by its own; None where no part holds it. A
-        checkpoint stored in another layout than the model holds (one transformers converts on load
-        by its model_type) holds names no part does, so it maps to none."""
-        module, _, parameter = name.rpartition('.')
+        name, a part a fused tensor splits into (`_SPLIT`) by its own, one expert's tensor of a
+        checkpoint stored per expert by its index and projection; None where no part holds it."""
+        loaded, expert = self.loaded(name)
+        module, _, parameter = loaded.rpartition('.')
         held = self.names.get(module)
         if held is None:
             return None
         path, parameters = held
         if parameter.startswith(_SPLIT):
             return f'{path}.{parameter.removeprefix(_SPLIT)}'
-        return f'{path}.{parameters[parameter]}' if parameter in parameters else None
+        if parameter not in parameters:
+            return None
+        if expert is not None:
+            index, projection = expert
+            return f'{path}.{index}.{projection}.weight'
+        return f'{path}.{parameters[parameter]}'
+
+
+_PER_EXPERT = {'gate_up_proj': ('gate_proj', 'up_proj'), 'down_proj': ('down_proj',)}
+"""Each fused experts tensor (`_fused_experts`) by the canonical projections a checkpoint stored per expert
+holds it as, in the order the fused one concatenates them."""
+
+
+def _load_names(model: PreTrainedModel) -> Callable[[str], tuple[str, tuple[str, str] | None]]:
+    """The name `model`'s load gives a stored tensor, as transformers' load names it
+    (`convert_and_load_state_dict_in_model`, by the conversion mapping it keeps for the model's type,
+    `get_model_conversion_mapping`): every renaming applied (HY-3's `mlp.expert_bias` is its
+    `mlp.e_score_correction_bias`), then at most one merge, the base model's prefix added or dropped as
+    the model holds the name, and the stored name itself where only it is held. An expert's own tensor,
+    `{experts}.{index}.{stored}.weight`, is named as the fused tensor the load stacks it into, with its
+    index and its canonical projection, the one at its place among the merge's sources (Mixtral's `w1`,
+    `w3` and `w2` are the gate, up and down projections). A merge is read only where it stacks experts on
+    the first axis and concatenates its sources in `_PER_EXPERT`'s order on the second, as the fused tensor
+    `_fused_experts` splits holds them; any other conversion's tensor keeps its stored name, which no part
+    holds. A renaming that renames a key by whether another is stored (`GroupWeightRename`) is
+    `Ambiguous`: no read of one name tells it."""
+    from transformers.conversion_mapping import get_model_conversion_mapping
+    from transformers.core_model_loading import (
+        Concatenate,
+        GroupWeightRename,
+        MergeModulelist,
+        WeightConverter,
+        WeightRenaming,
+        rename_source_key,
+    )
+
+    transforms = get_model_conversion_mapping(model)
+    if any(isinstance(transform, GroupWeightRename) for transform in transforms):
+        raise Ambiguous("its checkpoint conversion renames a key by whether another is stored")
+    renamings = [transform for transform in transforms if isinstance(transform, WeightRenaming)]
+    converters = [transform for transform in transforms if isinstance(transform, WeightConverter)]
+    held, prefix = model.state_dict(), model.base_model_prefix
+
+    def stacked(converter: WeightConverter, fused: str) -> tuple[str, ...]:
+        """The canonical projections of `converter`'s sources, in their order, where it stacks them into
+        `fused` as `_fused_experts` splits it; none otherwise."""
+        projections = _PER_EXPERT.get(fused, ())
+        operations = [(type(operation), operation.dim) for operation in converter.operations
+                      if isinstance(operation, (MergeModulelist, Concatenate))]
+        merges = [(MergeModulelist, 0)] + [(Concatenate, 1)] * (len(projections) > 1)
+        if (len(converter.source_patterns) != len(projections) or len(operations) != len(converter.operations)
+                or operations != merges):
+            return ()
+        return projections
+
+    def loaded(name: str) -> tuple[str, tuple[str, str] | None]:
+        renamed, pattern = rename_source_key(name, renamings, converters, prefix, held)
+        if renamed not in held and name in held:
+            renamed, pattern = rename_source_key(name, [], [], prefix, held)
+        if pattern is None:
+            return renamed, None
+        converter = next(converter for converter in converters if pattern in converter.source_patterns)
+        module, _, fused = renamed.rpartition('.')
+        stored, _ = rename_source_key(name, renamings, [])
+        spellings = (module, module.removeprefix(f'{prefix}.'), f'{prefix}.{module}')
+        tails = [stored.removeprefix(f'{spelled}.') for spelled in spellings
+                 if stored.startswith(f'{spelled}.')]
+        index, _, own = tails[0].removesuffix('.weight').partition('.') if tails else ('', '', '')
+        projections = stacked(converter, fused)
+        if not (index.isdigit() and own and '.' not in own and tails[0] == f'{index}.{own}.weight'
+                and projections):
+            return name, None
+        return renamed, (index, projections[converter.source_patterns.index(pattern)])
+
+    return loaded
 
 
 
@@ -748,8 +975,10 @@ class _Assembler:
         expected = {view.name(name): name for name in part.parameters}
         if held - set(expected):
             raise Ambiguous(f"{path} holds parameters {sorted(held - set(expected))} its code does not read")
-        if held:
-            self.names[path] = (canonical, {name: expected[name] for name in held})
+        stored = {view.name(name): known for name, known in part.state.items()
+                  if view.name(name) in dict(module.named_buffers(recurse=False))}
+        if held or stored:
+            self.names[path] = (canonical, {**{name: expected[name] for name in held}, **stored})
         children = dict(module.named_children())
         claimed = set()
         for known, child_roles in part.children.items():
@@ -780,21 +1009,27 @@ def assemble(model: PreTrainedModel) -> Assembly:
     routed = sorted(layer for layer, facts in assembler.layers.items() if facts.get('routed'))
     if routed:
         routes = {tuple(sorted((key, value) for key, value in assembler.layers[layer].items()
-                               if key != 'routed')) for layer in routed}
+                               if key not in ('routed', 'nope'))) for layer in routed}
         if len(routes) != 1:
             raise Ambiguous("the routed layers route differently")
         mixture = dict(routes.pop())
         width = _records.integer(mixture['expert_features'], 'expert_features')
-        fields['mixture'] = native_fields(Mixture)(
+        # A router's scores, scaling and correction bias and a block's shared experts, where its parts
+        # state them (DeepSeek's routing, HY-3's).
+        stated = {key: mixture[key] for key in ('score_function', 'scaling', 'bias', 'shared_features',
+                                                'groups', 'groups_per_token') if key in mixture}
+        fields['mixture'] = {**native_fields(Mixture)(
             experts=_records.integer(mixture['experts'], 'experts'),
             top_k=_records.integer(mixture['top_k'], 'top_k'),
             norm_topk_prob=bool(mixture['norm_topk_prob']), expert_features=width,
-            layers=None if len(routed) == fields['num_layers'] else tuple(routed))
+            layers=None if len(routed) == fields['num_layers'] else tuple(routed)), **stated}
         fields.setdefault('mlp_features', width)
     for required in ('vocab_size', 'num_layers', 'num_heads', 'mlp', 'mlp_features', 'norm_eps',
                      'rope_theta'):
         if required not in fields:
             raise Ambiguous(f"no part states {required}")
+    unrotated = sorted(layer for layer, facts in assembler.layers.items() if facts.get('nope'))
+    fields.update(_without_positions(fields, unrotated))
     capacity, context = decoder_parts.context_lengths(
         {'max_position_embeddings': model.config.to_dict().get('max_position_embeddings')})
     fields.update(max_seq_len=capacity, context_length=context)
@@ -802,7 +1037,29 @@ def assemble(model: PreTrainedModel) -> Assembly:
     record = native_fields(CausalTransformer)(**fields)
     record['kinds'] = kinds
     return Assembly(record, assembler.names, tuple(dict.fromkeys(assembler.packed)), (head, table),
-                    tuple(assembler.dropouts))
+                    tuple(assembler.dropouts), _load_names(model))
+
+
+def _without_positions(fields: Mapping[str, object], layers: list[int]) -> Mapping[str, object]:
+    """The layer types and kinds that make each of `layers` (the ones whose attention rotates nothing,
+    SmolLM3's NoPE layers) a kind of its own beside its layer type's, its attention taking no positions,
+    as Llama 4's NoPE layers do."""
+    if not layers:
+        return {}
+    count = _records.integer(fields['num_layers'], 'num_layers')
+    stated_types = fields.get('layer_types')
+    types = (list(_records.strings(stated_types, 'layer_types')) if stated_types
+             else ['full_attention'] * count)
+    kinds = dict(_records.record(fields.get('kinds', {}), 'kinds'))
+    for layer in layers:
+        stated = types[layer]
+        unrotated = f'{stated}_nope'
+        if unrotated not in kinds:
+            kind = dict(_records.record(kinds.get(stated) or native_fields(LayerKind)(), stated))
+            kind['mixer'] = {'class': 'attention', 'fields': {'nope': True}}
+            kinds[unrotated] = kind
+        types[layer] = unrotated
+    return {'layer_types': tuple(types), 'kinds': kinds}
 
 
 def _fused_experts(module: str, view: PartView) -> tuple[decoder_parts.Packed, ...]:
