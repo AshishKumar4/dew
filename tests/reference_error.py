@@ -832,9 +832,10 @@ def _typical(mine: np.ndarray, theirs: np.ndarray) -> float:
     one arm is exact on a draw and the other is not (a ratio no log holds). Where the arms round apart (fp32
     sums, `summed_as_run`) each draw's error is the draw's own scale times each arm's own rounding, both
     heavy-tailed across draws: the pooled ratio's sums are ruled by its few largest draws and resolve only
-    past thousands of seeds, while this ratio's logs are light-tailed, unbiased for a factor Dew's
-    rounding holds on every draw (the arms exchangeable, the mean of their logs' difference is the factor's
-    log, whatever their own distribution), and resolve in a few hundred (ledger 2469)."""
+    past thousands of seeds, while this ratio's logs are light-tailed and resolve in a few hundred. Its
+    mean log is unbiased for the log of a factor Dew's rounding holds on every draw (the arms exchangeable,
+    the mean of their logs' difference is the factor's log, whatever their own distribution), and the
+    ratio itself consistent for the factor, Jensen's exp(var/4n) above it at n draws (ledger 2469)."""
     if np.any((mine > 0) != (theirs > 0)):
         return float("nan")
     kept = mine > 0
