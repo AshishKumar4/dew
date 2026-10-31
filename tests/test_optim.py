@@ -293,13 +293,15 @@ def test_a_stated_dot_algorithm_is_muons_products_or_its_platforms_refusal(algor
 
 @pytest.mark.parametrize(("recorded", "forms", "stated"), [
     ("bfloat16", "fast", None), ("bfloat16", "accurate", "BF16_BF16_F32"),
+    ("bfloat16", "accurate attention", "BF16_BF16_F32"),
     ("tensorfloat32", "fast", "TF32_TF32_F32"), ("float32", "accurate", "F32_F32_F32")])
 def test_a_run_saved_with_a_newton_schulz_level_loads_with_its_dot_algorithm(recorded, forms, stated,
                                                                              tmp_path):
     """A Muon run saved while its options named the Newton-Schulz precision by a matmul level loads with
     that level's dot algorithm (`config.earlier_newton_schulz`): bfloat16 the run's numerics' own in their
     fast forms, none stated, and stated where the run's forms are accurate, whose own is float32 (row
-    2753); tensorfloat32 and float32 their algorithms, whose Muon builds."""
+    2753), a run saved before its trainer held a precision policy accurate by its `attention_form`
+    among them; tensorfloat32 and float32 their algorithms, whose Muon builds."""
     from test_run_options import lm
 
     from dew.config import RunConfig
@@ -310,6 +312,12 @@ def test_a_run_saved_with_a_newton_schulz_level_loads_with_its_dot_algorithm(rec
     run = dataclasses.replace(run, trainer=trainer, optim=OptimConfig(
         optimizer="muon", learning_rate=LR, optimizer_opts={"ns_precision": recorded}))
     run.save(str(tmp_path / "saved"))
+    if forms == "accurate attention":
+        written = tmp_path / "saved" / "run.json"
+        record = json.loads(written.read_text())
+        trainer = {name: value for name, value in record["fields"]["trainer"].items() if name != "precision"}
+        record["fields"]["trainer"] = {**trainer, "attention_form": "accurate"}
+        written.write_text(json.dumps(record))
     loaded = RunConfig.load(str(tmp_path / "saved"))
     assert loaded.optim.optimizer_opts.get("ns_precision") == stated
     loaded.optim.build(10)
