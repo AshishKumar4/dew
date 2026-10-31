@@ -846,12 +846,17 @@ class DreamerRollout:
         if due:
             live = self._advanced(variables, live, -(-due // envs), random=False)
         self._live = live
-        return self.sample(sample_key)
+        # The update's windows stay on the device the replay is held on, which the trainer places from: the
+        # host does not wait to fetch them (a FlyDreamer update's 56 MB of images went there and back).
+        return self._drawn(sample_key)
 
     def sample(self, key: jax.Array) -> Batch:
-        """`batch` windows of `length` steps drawn from the replay as an update draws them, on the device
-        the replay is held on and left there: the update reads them where they are, and the host does not
-        wait for the device to fetch them (a FlyDreamer update's 56 MB of images went there and back)."""
+        """`batch` windows of `length` steps drawn from the replay as an update draws them, fetched to the
+        host."""
+        return jax.device_get(self._drawn(key))
+
+    def _drawn(self, key: jax.Array) -> Batch:
+        """`sample`'s windows on the device the replay is held on."""
         replay = self.held_replay
         if replay is None:
             raise ValueError("a rollout samples its replay once it has begun (its first call)")
