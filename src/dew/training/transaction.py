@@ -205,10 +205,11 @@ def watched_activations(watched: Watched, aux: Aux) -> dict[str, jax.Array]:
         raise ValueError("the run watches activations (Inspection.modules), which its objective's model "
                          "calls do not return: they open Step.sown() and return what it sowed "
                          "(Aux.inspected)")
-    if not jax.tree.leaves(aux.inspected):
+    found = flattened(aux.inspected, watched.modules)
+    if not found:
         raise ValueError(f"no module the watched globs {list(watched.modules)} name runs in the objective's "
                          f"model; name them by class (`*Attention`, `MLP`) or path (`layers_3/*`)")
-    return flattened(aux.inspected, watched.modules)
+    return found
 
 
 def evaluation_of(aux: Aux) -> Evaluated | None:

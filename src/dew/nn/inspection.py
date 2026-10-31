@@ -284,6 +284,9 @@ def watching(modules: tuple[str, ...], *, histogram: bool = False,
         if not cotangents:
             return output
         discovering = _DISCOVERING.get()
+        if discovering and in_pipeline_stage() and module.path[-1:] == ("stages",):
+            raise ValueError(f"{'/'.join(module.path)} runs a pipeline stage's layers, whose cotangent no "
+                             f"layer of the log holds; watch its layers' (`layers_*/*`) for their cotangents")
         if not discovering and not module.has_variable(PROBES, PROBE):
             return output
         # A zero probe where the step discovers its probes, and where it reads one, a mark that it did,
