@@ -310,14 +310,14 @@ def test_an_objective_on_a_loaded_pipeline_samples_on_the_pipelines_own_grid(sav
         """A seed's step and the noise its evaluation draws from the step's key, which the walks start
         from too."""
         key = jax.random.fold_in(jax.random.PRNGKey(4), int(seed))
-        x_T = source.task.grid(3)[0].noise(jax.random.split(key)[0], (rows, *objective.latent_shape))
+        x_T = source.grid(3)[0].noise(jax.random.split(key)[0], (rows, *objective.latent_shape))
         return Step(jnp.asarray(0), key, None), x_T
 
     def walked(source, objective, variables, step, x_T):
         """The pipeline's solver over its own grid from `x_T`, with no closing denoise, decoded."""
-        process, times = source.task.grid(3)
+        process, times = source.grid(3)
         denoise = objective.denoiser(variables, objective.encoded_conditions(variables, batch), None, process)
-        latents = sample(denoise, x_T, solver=source.schedule.solver, key=jax.random.split(step.key)[1],
+        latents = sample(denoise, x_T, solver=source.solver, key=jax.random.split(step.key)[1],
                          times=np.asarray(times), final_denoise=False)
         return jnp.clip(source.autoencoder.decode(variables["autoencoder"], latents), -1.0, 1.0)
 
