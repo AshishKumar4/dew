@@ -62,6 +62,7 @@ def _parse_absl_flags() -> None:
 _parse_absl_flags()
 
 if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
+    from dew._version import __version__
     from dew.artifacts import ImageGrid, Representations, TextSamples, TokenScores, VideoGrid
     from dew.data import Dataset
     from dew.diffusion import Process
@@ -94,8 +95,6 @@ if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
         WandbTracker,
     )
 
-__version__ = "0.2.0"
-
 _EXPORTS = {
     "Best": "dew.training", "Keep": "dew.training", "Plateau": "dew.training", "EvalSuite": "dew.training",
     "Observe": "dew.training", "Pause": "dew.training",
@@ -117,6 +116,7 @@ _EXPORTS = {
     "ImageGrid": "dew.artifacts", "VideoGrid": "dew.artifacts",
     "TextSamples": "dew.artifacts", "Representations": "dew.artifacts",
     "TokenScores": "dew.artifacts",
+    "__version__": "dew._version",
 }
 
 
