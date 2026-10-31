@@ -534,15 +534,6 @@ class Tgmm(_Triton):
                                exact_sums=exact_sums), None
 
 
-KERNEL_GRADIENT_SCALARS = 40
-"""The registers a kernel gradient's consumer thread holds beside its prologue's rewrite of its rows' stage,
-pending their census (row 3117, which derives them from the launch's liveness and deletes this):
-`mosaic.Family.held_registers`' 40, wgmma's count before base/kernels f6498da7d0 lowered it to 4 from a census
-of the plain and hooked forwards alone (HELD-CENSUS3); priced at 4, the exact normed kernel gradient at
-256 x 64 x 64, three stages, two warpgroups, derived and spilled 32 bytes (base/kernels c4db4e10a,
-test_kernel_configs' sm90 compile gate)."""
-
-
 class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
     """JAX's Pallas Mosaic GPU kernels (`templates.gemm.mosaic_gpu`) on their instruction family's bundle
     (Hopper's warpgroup MMA, Ampere's mma.sync), one 16-bit dtype, their one tile generated from the
@@ -595,16 +586,19 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         # read shared memory on such a family; mma.sync's products hold that stage in registers already.
         # sm90's kernel gradient needs 24 more than the forward at 128 x 192 and 128 x 256 (148 and 181,
         # DECIDE1).
-        staged = 0
+        # Its rewrite and its zeroing address the stage's tiles themselves: its depth half of the rows, a
+        # rows atom past it, and the cotangent's atom it loads and stores (`_staged_halves`; 3117's census,
+        # 8 registers at 256 x 64 exact normed).
+        staged = rewritten = 0
         if self.STAGED_ROWS and not family.operands_in_registers:
             words = -(-config.block_k * config.block_m // config.warpgroups * jnp.dtype(dtype).itemsize
                       // 4 // resources.THREADS)
-            staged = max(0, words - family.held_registers)
-        # A prologue's rewrite holds a kernel gradient's scalars where they pass its family's held count,
-        # pending their census (`KERNEL_GRADIENT_SCALARS`).
+            atom = (config.block_k, mosaic.swizzle_columns(dtype, mosaic.SWIZZLE_BYTES))
+            tiles = [((config.block_k, config.block_m // config.warpgroups), dtype)] + [(atom, dtype)] * 3
+            rewritten = family.scalar_registers(tiles) - family.scalar_registers()
+            staged = max(0, words - family.held_registers) + rewritten
         prologue = self._prologue_registers(ba, config)
-        if prologue and self.STAGED_ROWS:
-            prologue += max(0, KERNEL_GRADIENT_SCALARS - family.held_registers)
+        prologue += rewritten if prologue else 0
         phases = [staged, prologue, self._epilogue_registers(ba, config, stored)]
         # A paired product's second accumulator, carried beside the first (`mosaic_gpu.gmm`'s `paired`).
         plain += accumulator if ba.arguments.get('paired') is not None else 0

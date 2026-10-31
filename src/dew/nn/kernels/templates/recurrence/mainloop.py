@@ -396,15 +396,6 @@ class Work:
     exponentials: float = 0
 
 
-SCALARS = 40
-"""The registers a recurrence consumer thread holds beside its tiles, pending their census (row 3117, which
-derives them from the launches' liveness and deletes this): `mosaic.Family.held_registers`' 40, wgmma's
-count before base/kernels f6498da7d0 lowered it to 4 from the attention census (HELD-CENSUS3, attention and
-GEMM alone). The sm90 SSD fp32 states launch's SASS keeps about 60 integer-class registers for uniform values
-(addresses, R2UR copies) where the IR holds 11 scalars; priced at 4, the packed forward's states launch at two
-roles derived tiles that spill 28 to 392 bytes (base/kernels f6ae7b862, bisected to f6498da7d0)."""
-
-
 @dataclasses.dataclass(frozen=True)
 class _Held:
     """What a launch's consumer thread holds in registers, as its program states it: the tiles it carries
@@ -415,11 +406,18 @@ class _Held:
     carried: Sequence = ()
     phases: Sequence = ()
 
-    def registers(self, family: mosaic.Family) -> int:
-        """A consumer thread's registers at the program's peak (`resources.live_registers`), its scalars
-        the recurrence's own where they pass its family's held count (`SCALARS`)."""
-        scalars = max(0, SCALARS - family.held_registers)
-        return resources.live_registers(family, self.carried, *self.phases) + scalars
+    def registers(self, family: mosaic.Family, addressed=()) -> int:
+        """A consumer thread's registers at the program's peak (`resources.live_registers`), beside its
+        addresses into the shared tiles it stages and lands itself (`addressed`, `_addressed`)."""
+        return resources.live_registers(family, self.carried, *self.phases, addressed=addressed)
+
+
+def _addressed(staging: tuple, landing: dict) -> list:
+    """The shared tiles a launch's consumer thread reads and writes through its registers, each `(shape,
+    dtype)` a role's own (`resources.addresses`): its staging tiles and its stores' landings."""
+    staged = [(tile.shape, tile.dtype) for tile in jax.tree.leaves(staging, is_leaf=lambda leaf: hasattr(
+        leaf, "shape"))]
+    return staged + list(landing.values())
 
 
 def _f32(rows: int, columns: int) -> tuple:
@@ -602,6 +600,14 @@ def _stated(work: Work, tiles: int, arrays, out_type) -> pl.CostEstimate:
     return dataclasses.replace(stated, transcendentals=int(work.exponentials * tiles))
 
 
+def _tile_at(index, grid: tuple, grid_names: tuple) -> dict:
+    """`grid`'s indices by name of a persistent loop's tile `index` (its first axis the slowest)."""
+    flat, indices = index[0], {}
+    for axis, extent in reversed(tuple(zip(grid_names, grid, strict=True))):
+        flat, indices[axis] = flat // extent, flat % extent
+    return indices
+
+
 def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, stages: int, live,
             work: Work, held: _Held, staging: tuple = (), once: dict | None = None,
             landing: dict | None = None, persistent: bool = False, reduces: bool = True,
@@ -622,6 +628,7 @@ def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, s
     `Tiles.walkers`) holds each staging and landing tile once a role, along a leading axis a role indexes
     (`_roled`): one role's products' tiles are no other's to write while its products read them."""
     family = call.family
+    registers = held.registers(family, _addressed(staging, landing or {}))
     staging, landing = _roles_staged(staging, landing or {}, consumers)
     staging = (*staging, _landed(landing, family))
     tiles = math.prod(grid)
@@ -638,7 +645,7 @@ def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, s
     def scope(depth: int) -> resources.Scope:
         return _scope(allocations(depth), staging, reduces=reduces, after=after)
 
-    found, programs = _laid(call, scope, held.registers(family), tiles, stages=None if persistent else stages,
+    found, programs = _laid(call, scope, registers, tiles, stages=None if persistent else stages,
                             consumers=consumers)
     stages = found.stages
     streams = allocations(stages)
@@ -653,7 +660,7 @@ def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, s
             each = -(-tiles // programs)
             flops = work.flops * _products(call.held.parts) * each
             collected.append(Launch(name, programs, threads, resources.shared_bytes(family, scope(stages)),
-                                    held.registers(family), work.steps * each, stages, stepped, flops,
+                                    registers, work.steps * each, stages, stepped, flops,
                                     work.exponentials * each, moved, found.programs, consumers, family))
             return jax.tree.map(lambda x: jnp.zeros(x.shape, x.dtype), out_type)
 
@@ -667,13 +674,6 @@ def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, s
             if not persistent:
                 program(*arrays, streams=streams, staging=tuple(staged), landing=lands)
                 return
-
-            def tile(index) -> dict:
-                """The grid's indices of the persistent loop's tile `index` (its first axis the slowest)."""
-                flat, indices = index[0], {}
-                for axis, extent in reversed(tuple(zip(grid_names, grid, strict=True))):
-                    flat, indices[axis] = flat // extent, flat % extent
-                return indices
 
             def given(at: dict) -> tuple:
                 """The tile's walk as its program gives it (`_walk`'s), and whether the tile holds tokens."""
@@ -689,7 +689,7 @@ def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, s
                 return found, taken
 
             def schedule(index):
-                at = tile(index)
+                at = _tile_at(index, grid, grid_names)
                 (views, _, _, steps), taken = given(at)
                 return taken, steps, views, at
 
