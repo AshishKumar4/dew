@@ -103,14 +103,16 @@ GMM = 2 * 256 * 128 * 128
 gradients of 256 rows by 128 by 128."""
 
 
-def _reported(generation: str):
-    """A grouped GEMM's forward and backward beside a Triton kernel, lowered on this CPU for `generation`'s
-    GPU, with the routes its dispatches reported (`routes`)."""
+def _reported(generation: str, layers: int = 1):
+    """A grouped GEMM's forward and backward, `layers` times over one shape (as a model's same-shape layers
+    each call it, its kernels lowered once, `tuning.lowered_once`), beside a Triton kernel, lowered on this
+    CPU for `generation`'s GPU, with the routes its dispatches reported (`routes`)."""
     from dew.nn.kernels.templates.gemm import template
 
     def step(x, w, sizes):
         def loss(x, w):
-            return template.gemm(x, w, sizes, out_dtype=jnp.bfloat16).astype(jnp.float32).sum()
+            return sum(template.gemm(x * (layer + 1), w, sizes, out_dtype=jnp.bfloat16)
+                       .astype(jnp.float32).sum() for layer in range(layers))
 
         return jax.grad(loss, argnums=(0, 1))(x, w), _doubled(x)
 
@@ -122,16 +124,28 @@ def _reported(generation: str):
     return lowered, found
 
 
+def templated_calls(record) -> dict[str, int]:
+    """A kernel report's template launches, by kernel name, with the calls of each."""
+    return {entry["name"]: entry["calls"] for entry in record["launches"] if entry["kind"] == "mosaic_gpu"}
+
+
+@pytest.mark.parametrize("layers", [1, 2])
 @pytest.mark.parametrize("generation", ["sm80", "sm90"])
-def test_a_steps_kernel_report_names_its_launches_and_the_flop_count_sizes_them_as_it_does(generation):
+def test_a_steps_kernel_report_names_its_launches_and_the_flop_count_sizes_them_as_it_does(generation,
+                                                                                             layers):
     """A grouped GEMM's step lowered for the GPU (row 1895): its kernel report lists the program's
     launches, the template's by kernel name with the FLOPs each states, a Triton launch's stating none,
     and the FLOP count of the same program counts the stated FLOPs and leaves out, as unsized, the
-    launches the report does."""
+    launches the report does. Two same-shape layers, whose kernels lower once and run from each layer's
+    call, make twice one layer's launches and FLOPs in both (row 2905)."""
     from dew.telemetry.instrumentation import hlo_flops
 
-    lowered, found = _reported(generation)
+    lowered, found = _reported(generation, layers)
     record = kernel_report(found, lowered).record()
+    if layers > 1:
+        lowered_alone, found_alone = _reported(generation)
+        once = templated_calls(kernel_report(found_alone, lowered_alone).record())
+        assert once and templated_calls(record) == {name: layers * calls for name, calls in once.items()}
     launches = {entry["name"]: entry for entry in record["launches"]}
     templated = [entry for entry in record["launches"] if entry["kind"] == "mosaic_gpu"]
     assert all(entry["flops"] == entry["calls"] * GMM for entry in templated)
