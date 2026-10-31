@@ -25,10 +25,12 @@ from sharded import collectives
 from test_nested_learning_optim import muon_orthogonalized, newton_schulz_reference
 
 from dew.batch import coordinates
+from dew.newton_schulz import NEWTON_SCHULZ, orthogonalized
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.dit import SimpleDiT
+from dew.nn.kernels.generation import run_precision
+from dew.nn.precision import ACCURATE, Numerics
 from dew.optim import (
-    NEWTON_SCHULZ,
     OPTIMIZER_MAP,
     Cosine,
     Exponential,
@@ -44,7 +46,6 @@ from dew.optim import (
     learning_rate,
     muon_partition,
     muon_weight_dimension_numbers,
-    orthogonalized,
     rates_of,
     scale_by_qk_clip,
     stepped,
@@ -76,11 +77,21 @@ def dit_params():
     return model.init(jax.random.key(0), jnp.ones((1, 8, 8, 3)), jnp.ones((1,)))
 
 
-def muon_solver(ns_precision: str = "float32", optimizer: str = "muon", **kwargs):
-    """Dew's Muon, or `optimizer` its MuonClip, over the run's own build, its Newton-Schulz at
-    `ns_precision`: float32 where it is held to optax's Muon, which iterates in its momentum's float32."""
-    opts = {"ns_precision": ns_precision, **kwargs.pop("optimizer_opts", {})}
-    return OptimConfig(optimizer=optimizer, learning_rate=LR, optimizer_opts=opts, **kwargs).build(10)
+def muon_solver(forms: str = "accurate", optimizer: str = "muon", **kwargs):
+    """Dew's Muon, or `optimizer` its MuonClip, over the run's own build, its update traced under numerics
+    in `forms` (`generation.run_precision`): the accurate forms' float32 Newton-Schulz where it is held to
+    optax's Muon, which iterates in its momentum's float32."""
+    built = OptimConfig(optimizer=optimizer, learning_rate=LR, **kwargs).build(10)
+    return in_forms(built, forms)
+
+
+def in_forms(solver: optax.GradientTransformation, forms: str) -> optax.GradientTransformation:
+    """`solver` whose update traces under numerics in `forms` (`generation.run_precision`), as a run's
+    step traces its optimizer's."""
+    def update(updates, state, params=None, **extra):
+        with run_precision(Numerics(forms=forms)):
+            return solver.update(updates, state, params, **extra)
+    return optax.GradientTransformationExtraArgs(solver.init, update)
 
 
 def fixed_gradients(params):
@@ -169,9 +180,19 @@ def test_muons_default_precision_preconditions_spectrally():
     """A spectral preconditioning at Muon's default bfloat16 products, whose norm is an SVD of float32
     operands: its update on par with optax's spectral Muon of the matrix (check 1)."""
     opts = {"preconditioning": "spectral"}
-    assert_updates_as(muon_solver("bfloat16", optimizer_opts=opts), optax.contrib.muon(LR, **opts),
+    assert_updates_as(muon_solver("fast", optimizer_opts=opts), optax.contrib.muon(LR, **opts),
                       decoder_params(), [('params', 'layers_0', 'self_attn', 'q_proj', 'kernel')],
                       "spectral Muon in bfloat16")
+
+
+def test_muon_refuses_a_real_dot_algorithm_for_a_complex_update():
+    """A dot algorithm states real products (`ns_precision`), which a complex update's Newton-Schulz cannot
+    take: Muon refuses it by name rather than multiply the update's real part alone."""
+    solver = OptimConfig(optimizer="muon", learning_rate=LR,
+                         optimizer_opts={"ns_precision": "F32_F32_F32"}).build(10)
+    params = {"w": jnp.zeros((16, 24), jnp.complex64)}
+    with pytest.raises(ValueError):
+        solver.update({"w": jnp.ones((16, 24), jnp.complex64) * 1j}, solver.init(params), params)
 
 
 def test_muon_steps_a_complex_matrix_as_optax_does():
@@ -209,22 +230,109 @@ def test_muons_state_is_optaxs_tree_and_steps_its_moments_bit_for_bit():
     assert largest_difference(state, expected) == 0.0
 
 
+@pytest.mark.parametrize("forms", ["fast", "accurate"])
+def test_muons_newton_schulz_multiplies_in_the_runs_numerics(forms):
+    """Muon's Newton-Schulz reads the run's numerics (`generation.numerics`, `ns_operands`): the update a
+    run's step traces under its policy multiplies, in the fast forms, bfloat16 operands, and in the
+    accurate preset (`--precision accurate`), float32 operands at IEEE float32 (HIGHEST), as its lowered
+    program's products state them."""
+    params = decoder_params()
+    solver = OPTIMIZER_MAP["muon"](LR)
+    policies = ({"fast": Numerics()} if forms == "fast"
+                else {"default": Numerics(forms="accurate"), "highest": ACCURATE})
+    found = {}
+    for name, policy in policies.items():
+        def update(grads, state, policy=policy):
+            with run_precision(policy):
+                return solver.update(grads, state, params)
+        # The process's own default cleared, so what the products state is the policy's alone.
+        with jax.default_matmul_precision(None):
+            text = jax.jit(update).lower(fixed_gradients(params), solver.init(params)).as_text()
+        # The iteration's products, X X^T and A A, each over a stack of square operands' batch.
+        products = [line for line in text.splitlines() if "dot_general" in line and "batching_dims" in line]
+        assert products
+        found[name] = products
+    if forms == "fast":
+        assert all("xbf16>" in line for line in found["fast"])
+    else:
+        assert all("xf32>" in line and "HIGHEST" not in line for line in found["default"])
+        assert all("xf32>" in line and "HIGHEST" in line for line in found["highest"])
+
+
+@pytest.mark.parametrize("algorithm", ["BF16_BF16_F32", "TF32_TF32_F32", "F32_F32_F32"])
+def test_a_stated_dot_algorithm_is_muons_products_or_its_platforms_refusal(algorithm):
+    """A dot algorithm Muon states for its Newton-Schulz (`ns_precision`, a record's name of it) is its
+    iteration's products, whatever the run's numerics: its lowered products name the algorithm over its
+    operands' type (`ns_operands`), and it compiles; a platform that has not the algorithm refuses it in
+    JAX's own words, as a CPU refuses TF32, with no fallback of Dew's."""
+    params = decoder_params()
+    solver = OptimConfig(optimizer="muon", learning_rate=LR,
+                         optimizer_opts={"ns_precision": algorithm}).build(10)
+    operand = "bf16" if algorithm.startswith("BF16") else "f32"
+
+    def update(grads, state):
+        with run_precision(ACCURATE):
+            return solver.update(grads, state, params)
+    arguments = (fixed_gradients(params), solver.init(params))
+    if algorithm == "TF32_TF32_F32" and jax.default_backend() == "cpu":
+        with pytest.raises(ValueError):
+            jax.jit(update).lower(*arguments)
+        return
+    lowered = jax.jit(update).lower(*arguments)
+    products = [line for line in lowered.as_text().splitlines()
+                if "dot_general" in line and "batching_dims" in line]
+    # The algorithm itself, its operands' and accumulation's types and its one primitive product.
+    # The algorithm's own precision type (TF32's tf32), apart from its operands' f32 storage.
+    precision = algorithm.split("_")[0].lower()
+    stated = (f"algorithm = <lhs_precision_type = {precision}, rhs_precision_type = {precision}, "
+              "accumulation_type = f32, lhs_component_count = 1, rhs_component_count = 1, "
+              "num_primitive_operations = 1,")
+    assert products and all(f"x{operand}>" in line and stated in line for line in products)
+    lowered.compile()
+
+
+@pytest.mark.parametrize(("recorded", "forms", "stated"), [
+    ("bfloat16", "fast", None), ("bfloat16", "accurate", "BF16_BF16_F32"),
+    ("tensorfloat32", "fast", "TF32_TF32_F32"), ("float32", "accurate", "F32_F32_F32")])
+def test_a_run_saved_with_a_newton_schulz_level_loads_with_its_dot_algorithm(recorded, forms, stated,
+                                                                             tmp_path):
+    """A Muon run saved while its options named the Newton-Schulz precision by a matmul level loads with
+    that level's dot algorithm (`config.earlier_newton_schulz`): bfloat16 the run's numerics' own in their
+    fast forms, none stated, and stated where the run's forms are accurate, whose own is float32 (row
+    2753); tensorfloat32 and float32 their algorithms, whose Muon builds."""
+    from test_run_options import lm
+
+    from dew.config import RunConfig
+    from dew.nn.precision import ACCURATE
+
+    run = lm(tmp_path, drawn=False)
+    trainer = run.trainer if forms == "fast" else dataclasses.replace(run.trainer, precision=ACCURATE)
+    run = dataclasses.replace(run, trainer=trainer, optim=OptimConfig(
+        optimizer="muon", learning_rate=LR, optimizer_opts={"ns_precision": recorded}))
+    run.save(str(tmp_path / "saved"))
+    loaded = RunConfig.load(str(tmp_path / "saved"))
+    assert loaded.optim.optimizer_opts.get("ns_precision") == stated
+    loaded.optim.build(10)
+
+
+def stacked_draw(seed):
+    """A wide stack of three 24 x 40 matrices and a tall stack of two 40 x 24, drawn at `seed`: the
+    orthogonalizations' inputs (`test_muon_variants`)."""
+    keys = jax.random.split(jax.random.key(seed))
+    return (np.asarray(jax.random.normal(keys[0], (3, 24, 40))),
+            np.asarray(jax.random.normal(keys[1], (2, 40, 24))))
+
+
 def test_muons_bfloat16_newton_schulz_is_as_exact_as_jordans():
-    """Dew's orthogonalization in bfloat16 (`MUON_NS_PRECISION`, `orthogonalized`: each shape's matrices
-    stacked, cast, iterated by optax and handed back) over a wide and a tall stack, on par from float64 with
-    Jordan's own iteration in bfloat16 (modded-nanogpt's `zeropower_via_newtonschulz5`, which Moonlight
-    runs too) (check 1)."""
+    """Dew's orthogonalization in the default numerics' fast forms, bfloat16 (`ns_operands`,
+    `orthogonalized`: each shape's matrices stacked, cast, iterated by optax and handed back) over a wide and
+    a tall stack, on par from float64 with Jordan's own iteration in bfloat16 (modded-nanogpt's
+    `zeropower_via_newtonschulz5`, which Moonlight runs too) (check 1)."""
     numbers = {"wide": optax.contrib.MuonDimensionNumbers((1,), (2,)),
                "tall": optax.contrib.MuonDimensionNumbers((1,), (2,))}
 
-    def draw(seed):
-        keys = jax.random.split(jax.random.key(seed))
-        return (np.asarray(jax.random.normal(keys[0], (3, 24, 40))),
-                np.asarray(jax.random.normal(keys[1], (2, 40, 24))))
-
     def dew(wide, tall):
-        done = orthogonalized({"wide": wide, "tall": tall}, numbers, jnp.asarray(NEWTON_SCHULZ), 5, 1e-8,
-                              "bfloat16")
+        done = orthogonalized({"wide": wide, "tall": tall}, numbers, jnp.asarray(NEWTON_SCHULZ), 5, 1e-8)
         return [done["wide"], done["tall"]]
 
     def jordan(wide, tall):
@@ -234,7 +342,8 @@ def test_muons_bfloat16_newton_schulz_is_as_exact_as_jordans():
         return [np.stack([newton_schulz_reference(np.asarray(matrix, np.float64)) for matrix in stack])
                 for stack in (wide, tall)]
 
-    assert_as_exact(dew, jordan, draw, "Muon's Newton-Schulz in bfloat16", seeds=UPDATE_SEEDS, truth_fn=truth)
+    assert_as_exact(dew, jordan, stacked_draw, "Muon's Newton-Schulz in bfloat16", seeds=UPDATE_SEEDS,
+                    truth_fn=truth)
 
 
 class Placed:
