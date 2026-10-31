@@ -1,13 +1,16 @@
 """Every custom derivative of Dew's under a contract (ledger 2641): each seam in src/dew (a custom_jvp or
 custom_vjp, and each call of generation.linear_tangent, which builds three) named in `CONTRACTED` with the
-test of tests/test_derivative_contracts.py that holds it to its contract (`assert_contract`: every order
+test of tests/test_contracts_*.py that holds it to its contract (`assert_contract`: every order
 finite wherever its float64 truth is a normal float32, at every exponent edge, beside an independent plain
-formula). A new seam fails here until a contract names it."""
+formula). A new seam fails here until a contract names it. The harness's own validation is here too."""
 
 import ast
+import importlib
 from pathlib import Path
 
-import test_derivative_contracts
+import jax.numpy as jnp
+import pytest
+from contract_support import LessFinite, assert_contract
 
 SOURCE = Path(__file__).resolve().parents[1] / "src" / "dew"
 
@@ -130,8 +133,7 @@ CONTRACTED = {
     "src/dew/sampling/flow.py::linear_tangent": "test_a_transitions_kl_holds_every_order",
     "src/dew/sampling/guidance.py::_guided": "test_a_guided_prediction_holds_every_order",
 }
-"""Each contracted seam, `path::qualified name`, and the test of tests/test_derivative_contracts.py that holds
-it."""
+"""Each contracted seam, `path::qualified name`, and the test of tests/test_contracts_*.py that holds it."""
 
 
 def _named(node) -> str | None:
@@ -179,12 +181,15 @@ def seams() -> list[str]:
 
 
 def test_every_custom_derivative_is_under_a_contract():
-    """Each seam is contracted (`CONTRACTED`, its test one of tests/test_derivative_contracts.py's), and each
-    named seam exists, so the list never outlives its code."""
+    """Each seam is contracted (`CONTRACTED`, its test one of tests/test_contracts_*.py's), and each named
+    seam exists, so the list never outlives its code."""
     found = set(seams())
     assert found - set(CONTRACTED) == set(), "a seam with no contract"
     assert set(CONTRACTED) - found == set(), "a named seam no longer in src/dew"
-    assert all(callable(getattr(test_derivative_contracts, test, None)) for test in CONTRACTED.values())
+    contracts = [importlib.import_module(path.stem)
+                 for path in Path(__file__).parent.glob("test_contracts_*.py")]
+    assert all(any(callable(getattr(module, test, None)) for module in contracts)
+               for test in CONTRACTED.values())
 
 
 def test_the_scan_finds_each_form_of_a_custom_derivative():
@@ -200,3 +205,16 @@ def test_the_scan_finds_each_form_of_a_custom_derivative():
         "def plain(x): return x\n")
     assert seams_of("m.py", text) == ["m.py::a", "m.py::b", "m.py::c", "m.py::outer.inner",
                                       "m.py::tangent.linear_tangent"]
+
+
+def test_the_contract_refuses_a_formula_less_finite_than_the_plain_one():
+    """The rule's validation: a formula overflowing where the plain one does not (|x| as the root of its
+    square, past 2**64) is refused, at its primal and its derivatives; the plain formula against itself
+    holds, at the same edge, where float32's own arithmetic holds every value."""
+    x = (jnp.asarray([2.0**70, -3.0, 2.0**-70], jnp.float32),)
+    direction = (jnp.ones((3,), jnp.float32),)
+    cotangent = jnp.ones((3,), jnp.float32)
+    assert_contract(jnp.abs, x, direction, cotangent, "the plain formula", plain_fn=jnp.abs)
+    with pytest.raises(LessFinite):
+        assert_contract(lambda x: jnp.sqrt(x * x), x, direction, cotangent, "a squared root",
+                        plain_fn=jnp.abs)
