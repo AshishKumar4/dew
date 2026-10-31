@@ -95,8 +95,8 @@ def test_the_attention_kernels_run_on_this_gpu():
     """Every kernel cell above on this GPU (`gpu_flow.run_cells`), each one's failure kept and all raised
     together; the Mosaic cells on an H100 alone."""
     run_cells([
-        sweep(triton.every_config_on_a_gpu, triton.attention_triton.SPACE),
-        sweep(triton.every_backward_config_on_a_gpu, triton.attention_triton.BACKWARD_SPACE),
+        sweep(triton.every_config_on_a_gpu, triton.attention_triton.FORWARD_STEPS),
+        sweep(triton.every_backward_config_on_a_gpu, triton.attention_triton.BACKWARD_STEPS),
         *(Cell(f"the frozen Triton mainloop's default is finite at fp32's edges: {family}",
                functools.partial(stability.default_is_finite, family, "triton"))
           for family in stability.GPU_TRITON_FAMILIES),
