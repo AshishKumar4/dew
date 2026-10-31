@@ -190,6 +190,15 @@ def env_rollout(env: Env, policy: Policy, params: Params, carry: Carry, steps: i
     return jax.lax.scan(one, carry, None, length=steps)
 
 
+def driven_step(step: TimeStep, first: jax.Array) -> TimeStep:
+    """`step` as a world-model learner's driver records it (`Driven`): its observation the dict of the
+    `observation`, the `reward` that came with it, and whether it is its episode's `first`, its `last`
+    or `terminal`."""
+    observed = {"observation": step.observation, "reward": step.reward, "first": first, "last": step.done,
+                "terminal": step.terminated}
+    return TimeStep(observed, step.reward, step.terminated, step.truncated)
+
+
 @struct.dataclass
 class _Driven:
     inner: EnvState
@@ -211,16 +220,10 @@ class Driven:
     def action_size(self) -> int:
         return self.env.action_size
 
-    @staticmethod
-    def _observed(step: TimeStep, first: jax.Array) -> TimeStep:
-        observed = {"observation": step.observation, "reward": step.reward, "first": first,
-                    "last": step.done, "terminal": step.terminated}
-        return TimeStep(observed, step.reward, step.terminated, step.truncated)
-
     def reset(self, key: jax.Array) -> tuple[_Driven, TimeStep]:
         reset_key, key = jax.random.split(key)
         state, step = self.env.reset(reset_key)
-        observed = self._observed(step, jnp.ones_like(step.done))
+        observed = driven_step(step, jnp.ones_like(step.done))
         return _Driven(state, jnp.zeros_like(step.done), key), observed
 
     def step(self, state: _Driven, action: jax.Array) -> tuple[_Driven, TimeStep]:
@@ -237,8 +240,8 @@ class Driven:
             return jax.tree.map(chosen, fresh_state, inner), jax.tree.map(chosen, fresh, step)
 
         inner, step = jax.lax.cond(jnp.any(state.last), restart, lambda *held: held, inner, step)
-        return _Driven(inner, step.done, key), self._observed(step, state.last)
+        return _Driven(inner, step.done, key), driven_step(step, state.last)
 
 
 __all__ = ["Batched", "Carry", "Driven", "Env", "EnvState", "Observation", "Params", "Policy", "TimeLimit",
-           "TimeStep", "Transition", "env_rollout", "start"]
+           "TimeStep", "Transition", "driven_step", "env_rollout", "start"]

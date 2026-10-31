@@ -140,13 +140,16 @@ def test_advantages_are_brax_two_passes_over_each_sequence():
     assert_computes_the_oracle(advantages, expected, "advantages", roundings=roundings)
 
 
-def test_ppo_raises_the_greedy_policys_return_on_the_walk():
-    """A few PPO updates of a fresh actor-critic on walks cut at 8 steps raise its greedy policy's
-    mean return above the fresh one's, the collection served as two passes of two minibatches."""
+@pytest.mark.parametrize("simulated", [False, True], ids=["env", "simulator"])
+def test_ppo_raises_the_greedy_policys_return_on_the_walk(simulated):
+    """A few PPO updates of a fresh actor-critic on walks cut at 8 steps, a JAX environment or a simulator
+    stepped from the host, raise its greedy policy's mean return above the fresh one's, the collection
+    served as two passes of two minibatches."""
     from dew.data.dataset import Loader
     from dew.training import Trainer
 
-    env = Batched(TimeLimit(Walk(limit=50.0), episode_length=8), 64)
+    walks = Batched(TimeLimit(Walk(limit=50.0), episode_length=8), 64)
+    env = HostWalks(64, 8, limit=50.0) if simulated else walks
     objective = ControlPPOObjective(ActorCritic(1, (16, 16), (32, 32)), 1, discount=0.9, entropy_cost=1e-3)
     rollout = ControlRollout(objective, env, unroll_length=8, epochs=2, minibatches=2)
     trainer = Trainer(objective, optax.adam(3e-3), key=jax.random.key(5), rollout=rollout)
@@ -177,29 +180,29 @@ class Settled(Walk):
 class HostWalks:
     """`Settled` walks cut after `length` steps, simulated on the host in NumPy as a simulator outside JAX
     simulates them: it reads each action through DLPack, answers NumPy arrays, which JAX takes the same
-    way, and restarts an ended episode itself, in place."""
+    way, and restarts the episodes it is told to."""
 
     action_size = 1
 
-    def __init__(self, count: int, length: int):
-        self.count, self.length = count, length
+    def __init__(self, count: int, length: int, limit: float = 4.0):
+        self.count, self.length, self.limit = count, length, limit
 
     def reset(self, seed: int):
         self.x, self.steps = np.ones(self.count, np.float32), np.zeros(self.count, np.int32)
         return self.x[:, None].copy()
 
     def step(self, action):
-        from dew.rl.simulator import SimulatorStep
-
-        x = self.x + np.round(2 * np.from_dlpack(action)[:, 0])
+        self.x = (self.x + np.round(2 * np.from_dlpack(action)[:, 0])).astype(np.float32)
         self.steps = self.steps + 1
-        terminated = np.abs(x) > 4.0
+        terminated = np.abs(self.x) > self.limit
         truncated = ~terminated & (self.steps >= self.length)
-        reached = x[:, None].astype(np.float32)
-        done = terminated | truncated
-        self.x = np.where(done, np.float32(1), x).astype(np.float32)
-        self.steps = np.where(done, 0, self.steps)
-        return SimulatorStep(reached, -np.square(x), terminated, truncated, self.x[:, None].copy())
+        return TimeStep(self.x[:, None].copy(), -np.square(self.x), terminated, truncated)
+
+    def restart(self, mask):
+        mask = np.asarray(mask)
+        self.x = np.where(mask, np.float32(1), self.x).astype(np.float32)
+        self.steps = np.where(mask, 0, self.steps)
+        return self.x[:, None].copy()
 
 
 def heads_home(params, observation, key, memory):
@@ -210,8 +213,8 @@ def heads_home(params, observation, key, memory):
 @pytest.mark.parametrize("policy", [heads_home, pushes], ids=["settled", "drawn"])
 def test_a_simulator_outside_jax_rolls_out_as_its_env_does(policy):
     """A simulator stepped from the host (`simulator_rollout`), its arrays crossing by DLPack and its
-    ended episodes restarted in place, records what `env_rollout` records of the same walks as a JAX
-    environment: the observations acted on, the actions and the policy's extras, every step's reward,
+    ended episodes restarted before the next step, records what `env_rollout` records of the same walks
+    as a JAX environment: the observations acted on, the actions and the policy's extras, every step's reward,
     terminal and cut flags and the observation each episode ended at, bit for bit. Where the policy
     draws, each action is drawn from the key the rollout's carry hands it, a step's split of it."""
     from dew.rl.simulator import simulator_rollout, simulator_start
@@ -240,3 +243,24 @@ def test_a_simulator_outside_jax_rolls_out_as_its_env_does(policy):
         observation = jnp.where(done[:, None], fresh.observation, following.observation)
     np.testing.assert_array_equal(ended.observation, observation)
     assert np.asarray(simulated.following.done).any()
+
+
+def test_a_driven_simulator_records_what_a_driven_env_records():
+    """A simulator driven for a world-model learner (`DrivenSimulator`), each ended episode answered as a
+    step of its own and restarted a step later, records what `Driven` records of the same walks as a JAX
+    environment: every step's observation, reward, first, last and terminal flags and the actions taken,
+    bit for bit."""
+    from dew.rl.env import Driven
+    from dew.rl.simulator import DrivenSimulator, simulator_rollout, simulator_start
+
+    def home(params, observed, key, memory):
+        return heads_home(params, observed["observation"], key, memory)
+
+    driven = Driven(Batched(TimeLimit(Settled(), episode_length=3), 5))
+    _, expected = env_rollout(driven, home, None, start(driven, jax.random.key(4)), 11, reset=False)
+    simulator = DrivenSimulator(HostWalks(5, 3))
+    _, simulated = simulator_rollout(simulator, home, None, simulator_start(simulator, jax.random.key(4)), 11,
+                                     reset=False)
+    jax.tree.map(np.testing.assert_array_equal, (simulated.observation, simulated.action),
+                 (expected.observation, expected.action))
+    assert np.asarray(expected.observation["first"])[1:].any()

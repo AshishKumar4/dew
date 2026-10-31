@@ -2977,6 +2977,28 @@
     ],
     "note": "DreamerV3's simple image encoder and decoder at the 1M size (depth 4, units 64, five-tap convolutions, block-diagonal deterministic input in 8 blocks) run by tools/dreamerv3_worker.py conv on the CPU over each seed's drawn weights, 64x64 RGB images, deterministic states and one-hot categoricals, in float32 and, the code's compute dtype and every module's float32 set to float64, in float64; kept as its evidence and its truth's sketch."
   },
+  "flydreamer/course.npz": {
+    "tool": "tools/venv_reference.py",
+    "sources": [
+      {
+        "repo": "AshishKumar4/FlyDreamer",
+        "revision": "043c9ef382048278ccf26849e54814ef5510a737",
+        "runs": "embodied/envs/fpv/waypoints/base.py WaypointManager._apply_randomization"
+      }
+    ],
+    "note": "FlyDreamer's waypoint randomization at its run's config (configs.yaml env.fpv waypoint_randomization) run by tools/flydreamer_worker.py course on the CPU in float64 over eight seeds' drawn courses and draws (angle, radius, height), its generator answering the drawn values; each placed course kept whole as the oracle."
+  },
+  "flydreamer/race.npz": {
+    "tool": "tools/venv_reference.py",
+    "sources": [
+      {
+        "repo": "AshishKumar4/FlyDreamer",
+        "revision": "043c9ef382048278ccf26849e54814ef5510a737",
+        "runs": "embodied/envs/fpv/env.py FPVEnv with rewards/navigation.py NavigationReward"
+      }
+    ],
+    "note": "FlyDreamer's FPV task built as its run builds it (factory.py over configs.yaml env.fpv, waypoint randomization off, episodes cut at 100 steps) run by tools/flydreamer_worker.py race on the CPU in float64 over three seeds of four drones flown through drawn states, collisions and actions by a backend replaying them; each step's reward, terminal and last flags, privileged state and goal, and command kept whole as the oracle."
+  },
   "mdlm/continuation.npz": {
    "tool": "tools/mdlm_sampling_reference.py",
    "sources": [{"repo": "kuleshov-group/mdlm", "version": "c112c526d193436838c98d81455ee51f90309470", "runs": "fetched"}, {"repo": "pytorch/pytorch", "version": "2.14.0", "runs": "torch"}],

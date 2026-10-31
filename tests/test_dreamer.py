@@ -104,7 +104,8 @@ def test_a_driver_records_an_episodes_last_observation_then_restarts():
 
 @struct.dataclass
 class Seen:
-    """`Target` seen as a 16-pixel-square image: a bright column where the point is on [-3, 3]."""
+    """`Target` seen as a 16-pixel-square image, a bright column where the point is on [-3, 3], beside the
+    point's position, privileged (`state`)."""
 
     action_size: int = struct.field(pytree_node=False, default=1)
 
@@ -116,11 +117,11 @@ class Seen:
 
     def reset(self, key):
         x, step = Target().reset(key)
-        return x, step.replace(observation=self.image(x))
+        return x, step.replace(observation={"image": self.image(x), "state": step.observation})
 
     def step(self, x, action):
         x, step = Target().step(x, action)
-        return x, step.replace(observation=self.image(x))
+        return x, step.replace(observation={"image": self.image(x), "state": step.observation})
 
 
 def tiny(observation_size=1, action_size=1, **options):
@@ -133,10 +134,11 @@ def transformer():
 
 
 AGENTS = {"gru": (Target, lambda: tiny()), "transformer": (Target, lambda: tiny(dynamics=transformer())),
-          "transformer-pixels": (Seen, lambda: tiny(0, image=(16, 16, 1), conv_depth=2,
-                                                    dynamics=transformer()))}
+          "transformer-pixels": (Seen, lambda: tiny(0, image=(16, 16, 1), conv_depth=2, reads="image",
+                                                    auxiliary=(("state", 1, 8),), dynamics=transformer()))}
 """Each agent's environment and world model: the block GRU's and TransDreamer's dynamics over the walk's
-position, and TransDreamer's over the walk seen as pixels."""
+position, and TransDreamer's over the walk seen as pixels alone, its position predicted from the latent
+by an auxiliary head."""
 
 
 def test_imagination_is_the_world_models_prior_stepped_in_an_env_rollout():
@@ -173,8 +175,9 @@ def test_an_agent_learns_its_world_from_its_replay(agent):
     """A small DreamerV3 agent acting in batched target walks and trained from its replay at a fixed
     ratio, its actor and critic learning in imagination beside it, predicts the replay's observations
     and rewards better than it did at the start, on the same replayed windows: with the block GRU's
-    dynamics or TransDreamer's, over the walk's position or its pixels. Its policy's return is the
-    acceptance run's to judge, on a task at the steps the paper reports."""
+    dynamics or TransDreamer's, over the walk's position or its pixels, the pixels' agent predicting the
+    privileged position it never reads better too. Its policy's return is the acceptance run's to judge,
+    on a task at the steps the paper reports."""
     from dew.data.dataset import Loader
     from dew.objectives.base import Step
     from dew.training import Trainer
@@ -196,8 +199,8 @@ def test_an_agent_learns_its_world_from_its_replay(agent):
         return {name: float(value) for name, value in aux.metrics.items()}
 
     before, after = losses(initial), losses(final)
-    for name in ("loss_decoder", "loss_reward"):
-        assert after[name] < before[name], (name, before[name], after[name])
+    for name in ("decoder", "reward", *(entry for entry, _, _ in objective.model.auxiliary)):
+        assert after[f"loss_{name}"] < before[f"loss_{name}"], (name, before, after)
 
 
 def test_each_replayed_step_draws_its_posterior_from_its_own_key():

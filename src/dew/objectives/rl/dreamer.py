@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import functools
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -47,8 +47,9 @@ from dew.rl.distributions import (
     twohot_mean,
     unimix_log_probs,
 )
-from dew.rl.env import Carry, Driven, Env, TimeStep, env_rollout, start
+from dew.rl.env import Carry, Driven, Env, Observation, TimeStep, Transition, env_rollout, start
 from dew.rl.replay import ReplayBuffer
+from dew.rl.simulator import DrivenSimulator, Simulator, rollout_start, simulator_rollout, simulator_start
 
 if TYPE_CHECKING:
     from dew.state import TrainState
@@ -186,6 +187,14 @@ class WorldModel(nn.Module):
     decoded by convolutions (`ConvEncoder`, `ConvDecoder`, `conv_depth` channels); None for a vector of
     `observation_size`."""
     conv_depth: int = 64
+    reads: str | None = None
+    """Where observations are dicts, the entry the encoder reads and the decoder rebuilds (FlyDreamer's
+    `image`); the others are privileged, read by the `auxiliary` heads alone."""
+    auxiliary: tuple[tuple[str, int, int], ...] = ()
+    """Privileged entries the latent learns to predict, each `(entry, width, units)`: two layers of
+    `units` then a linear map to the entry's `width`, its squared error summed (FlyDreamer's
+    `aux_state_head` and `aux_goal_head`, dreamerv3/agent.py:72-78 and :207-217, configs.yaml
+    `{layers: 2, output: mse}`)."""
     dynamics: TSSM | None = None
     """TransDreamer's transformer dynamics (`dew.objectives.rl.tssm.TSSM`) in place of the block GRU,
     its own posterior and prior; None for the GRU's (RSSM)."""
@@ -235,6 +244,8 @@ class WorldModel(nn.Module):
         self.policy_mean = dense(self.action_size, kernel_init=_init(0.01))
         self.policy_std = dense(self.action_size, kernel_init=_init(0.01))
         self.value = Critic(self.units, self.bins, self.dtype)
+        self.auxiliary_heads = {name: (layers(units, 2), dense(width))
+                                for name, width, units in self.auxiliary}
 
     def __call__(self, observation: jax.Array, action: jax.Array) -> jax.Array:
         """Every network once, for initialization: a step from a zero latent."""
@@ -248,8 +259,9 @@ class WorldModel(nn.Module):
             prior = self.dynamics(tokens[:, None], action[:, None], jnp.ones((action.shape[0], 1), bool))
         feature = self.feature(deter, stoch)
         mean, _ = self.policy(feature)
+        predicted = sum(self.predicted(name, feature).sum() for name, _, _ in self.auxiliary)
         return (self.decode(deter, stoch).sum() + self.reward(feature).sum() + self.continue_(feature).sum()
-                + mean.sum() + self.value(feature).sum() + prior.sum())
+                + mean.sum() + self.value(feature).sum() + prior.sum() + predicted)
 
     @property
     def observation_shape(self) -> tuple[int, ...]:
@@ -260,6 +272,15 @@ class WorldModel(nn.Module):
             held = self.dynamics
             return jnp.zeros((*batch, held.width)), jnp.zeros((*batch, held.stoch, held.classes))
         return jnp.zeros((*batch, self.deter)), jnp.zeros((*batch, self.stoch, self.classes))
+
+    def seen(self, observation: Observation) -> jax.Array:
+        """What the encoder reads of an observation: its `reads` entry, or the observation whole."""
+        return observation if self.reads is None else observation[self.reads]
+
+    def predicted(self, name: str, feature: jax.Array) -> jax.Array:
+        """The auxiliary head `name`'s prediction of its privileged entry."""
+        hidden, out = self.auxiliary_heads[name]
+        return out(hidden(feature)).astype(jnp.float32)
 
     def embed(self, observation: jax.Array) -> jax.Array:
         """The encoder's tokens of an observation: a vector's symlogged first (rssm.py:218), an image's
@@ -427,6 +448,10 @@ class LatentEnv:
         return _Latent(deter, stoch, key, cache), TimeStep(feature, reward, never, never)
 
 
+AUXILIARY_SCALE = 0.5
+"""An auxiliary head's loss weight, FlyDreamer's `aux_state` and `aux_goal` (configs.yaml `loss_scales`)."""
+
+
 class DreamerV3Objective(Objective[Ratio]):
     """DreamerV3 over a `WorldModel` (the module docstring). A batch holds replayed windows `[B, T]`
     of DreamerV3's steps (`Driven`): `observation`, the `action` taken at it, the `reward` that came
@@ -444,18 +469,20 @@ class DreamerV3Objective(Objective[Ratio]):
                  lam: float = 0.95, entropy: float = 3e-4, free_nats: float = 1.0, slow_decay: float = 0.98,
                  return_rate: float = 0.01, variables: Variables | None = None,
                  scales: Mapping[str, float] | None = None, imitation: float = 0.0):
-        """`scales` overrides the losses' weights by name (pretraining from demonstrations sets
-        `policy`, `value` and `replay_value` to 0, and imagination is then skipped); `imitation` weighs
+        """`scales` overrides the losses' weights by name, each auxiliary head's its entry's name
+        (`AUXILIARY_SCALE` unless set; pretraining from demonstrations sets `policy`, `value` and
+        `replay_value` to 0, and imagination is then skipped); `imitation` weighs
         behaviour cloning, the actor's negative log-likelihood of each replayed action at its posterior
         state, which reaches the actor alone."""
         if imagination < 1 or not 0 <= lam <= 1 or horizon <= 1:
             raise ValueError("imagination must be positive, lam in [0, 1] and the horizon past one step")
-        unknown = set(scales or {}) - set(type(self).scales)
+        known = {**type(self).scales, **{name: AUXILIARY_SCALE for name, _, _ in model.auxiliary}}
+        unknown = set(scales or {}) - set(known)
         if unknown or imitation < 0:
-            raise ValueError(f"scales name the losses {sorted(type(self).scales)}, not {sorted(unknown)}, "
+            raise ValueError(f"scales name the losses {sorted(known)}, not {sorted(unknown)}, "
                              "and imitation weighs at least 0")
         imitating = {"imitation": imitation} if imitation else {}
-        self.scales = {**type(self).scales, **(scales or {}), **imitating}
+        self.scales = {**known, **(scales or {}), **imitating}
         self.model = model
         self.horizon, self.imagination, self.lam = horizon, imagination, lam
         self.entropy, self.free_nats, self.return_rate = entropy, free_nats, return_rate
@@ -526,13 +553,13 @@ class DreamerV3Objective(Objective[Ratio]):
         latent, draw = jax.random.split(key)
         model = self.model.bind(variables, rngs={"latent": latent})
         held, stoch, previous = memory
+        seen = model.seen(observed["observation"])
         if model.dynamics is None:
-            deter, stoch, _ = self.observe(model, held, stoch, observed["observation"], previous,
-                                           observed["first"])
+            deter, stoch, _ = self.observe(model, held, stoch, seen, previous, observed["first"])
         else:
             first = observed["first"]
             deter, held = model.dynamics.step(model.dynamics.inputs(stoch, previous, first), first, held)
-            stoch = model.categorical(model.posterior(None, model.embed(observed["observation"])))
+            stoch = model.categorical(model.posterior(None, model.embed(seen)))
         mean, std = model.policy(WorldModel.feature(deter, stoch))
         action = jnp.clip(mean + std * jax.random.normal(draw, mean.shape), -1, 1)
         return action, {}, (deter if model.dynamics is None else held, stoch, action)
@@ -548,7 +575,7 @@ class DreamerV3Objective(Objective[Ratio]):
     def loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[Ratio, Aux]:
         world_key, imagine_key = jax.random.split(step.key)
         model = self.model.bind(variables, rngs={"latent": world_key})
-        observation, action = batch["observation"], batch["action"]
+        observation, action = model.seen(batch["observation"]), batch["action"]
         reward = jnp.asarray(batch["reward"], jnp.float32)
         # A window starts its episode's latent afresh at its first step.
         first = jnp.asarray(batch["first"], bool).at[:, 0].set(True)
@@ -570,6 +597,9 @@ class DreamerV3Objective(Objective[Ratio]):
         alive = (1 - terminal) * (1 - 1 / self.horizon)
         logit = model.continue_(feature)
         losses["continue"] = -(alive * jax.nn.log_sigmoid(logit) + (1 - alive) * jax.nn.log_sigmoid(-logit))
+        for name, _, _ in self.model.auxiliary:
+            target = jnp.asarray(batch["observation"][name], jnp.float32)
+            losses[name] = jnp.sum(jnp.square(model.predicted(name, feature) - target), -1)
         if "imitation" in self.scales:
             # Each replayed action at the state it was taken at; a last step's action takes no effect.
             mean, std = model.policy(jax.lax.stop_gradient(feature))
@@ -647,20 +677,21 @@ class DreamerV3Objective(Objective[Ratio]):
 @dataclass
 class DreamerRollout:
     """The trainer's rollout of a `DreamerV3Objective` (`dew.training.rollout.Rollout`): its agent acts
-    in `env`, a batched `Env` driven as `Driven` drives it, writing each step to a device replay of
-    `capacity` steps an environment; each update trains on `batch` windows of `length` replayed steps
-    while the agent takes environment steps so that each replays `train_ratio` steps (the code's
-    `run.train_ratio`), after `prefill` steps of each environment taken uniformly at random.
-    `metrics` reports the mean return of the episodes that ended since the last update."""
+    in `env`, a batched `Env` driven as `Driven` drives it or a `Simulator` driven alike
+    (`DrivenSimulator`), writing each step to a device replay of `capacity` steps an environment; each
+    update trains on `batch` windows of `length` replayed steps while the agent takes environment steps
+    so that each replays `train_ratio` steps (the code's `run.train_ratio`), after `prefill` steps of
+    each environment taken uniformly at random. `metrics` reports the mean return of the episodes that
+    ended since the last update."""
 
     objective: DreamerV3Objective
-    env: Env
+    env: Env | Simulator
     capacity: int = 100_000
     batch: int = 16
     length: int = 64
     train_ratio: float = 1024.0
     prefill: int = 64
-    _driven: Env = field(init=False, repr=False)
+    _driven: Env | DrivenSimulator = field(init=False, repr=False)
     _carry: Carry | None = field(default=None, init=False, repr=False)
     _replay: ReplayBuffer | None = field(default=None, init=False, repr=False)
     _returns: jax.Array | None = field(default=None, init=False, repr=False)
@@ -670,8 +701,9 @@ class DreamerRollout:
     def __post_init__(self) -> None:
         if self.prefill < self.length:
             raise ValueError("the prefill must hold at least one window")
-        self._driven = Driven(self.env)
+        self._driven = DrivenSimulator(self.env) if isinstance(self.env, Simulator) else Driven(self.env)
         self._acted = jax.jit(self._steps, static_argnames=("steps", "random"))
+        self._recorded = jax.jit(self._kept)
         self._sample = jax.jit(lambda replay, key: replay.sample(key, self.batch, self.length))
 
     @property
@@ -684,32 +716,41 @@ class DreamerRollout:
         """The steps every environment has taken so far, summed."""
         return self._taken
 
-    def _steps(self, variables: Variables, carry: Carry, replay: ReplayBuffer, returns: jax.Array, *,
-               steps: int, random: bool) -> tuple[Carry, ReplayBuffer, jax.Array, jax.Array, jax.Array]:
+    def _policy(self, random: bool) -> Callable:
         def uniform(params, observed, key, memory):
             shape = (observed["reward"].shape[0], self.env.action_size)
             return jax.random.uniform(key, shape, minval=-1, maxval=1), {}, memory
 
-        policy = uniform if random else self.objective.act
-        carry, recorded = env_rollout(self._driven, policy, variables, carry, steps, reset=False)
+        return uniform if random else self.objective.act
+
+    def _kept(self, replay: ReplayBuffer, returns: jax.Array,
+              recorded: Transition) -> tuple[ReplayBuffer, jax.Array, jax.Array, jax.Array]:
+        """The replay with a rollout's steps written, each environment's running return, and the sum
+        and count of the returns of the episodes that ended in it."""
         observed = recorded.observation
         replay = replay.add({**observed, "action": recorded.action})
-        # Each environment's running return, read where its episode ends.
+
         def tally(held, observed):
             total = jnp.where(observed["first"], 0, held) + observed["reward"]
             return total, (total, observed["last"])
 
         returns, (totals, ended) = jax.lax.scan(tally, returns, observed)
-        return carry, replay, returns, jnp.sum(jnp.where(ended, totals, 0)), jnp.sum(ended)
+        return replay, returns, jnp.sum(jnp.where(ended, totals, 0)), jnp.sum(ended)
+
+    def _steps(self, variables: Variables, carry: Carry, replay: ReplayBuffer, returns: jax.Array, *,
+               steps: int, random: bool) -> tuple[Carry, ReplayBuffer, jax.Array, jax.Array, jax.Array]:
+        policy = self._policy(random)
+        carry, recorded = env_rollout(self._driven, policy, variables, carry, steps, reset=False)
+        return carry, *self._kept(replay, returns, recorded)
 
     def __call__(self, state: TrainState, batch: Batch, key: jax.Array) -> Batch:
         act_key, sample_key = jax.random.split(key)
         variables = state.variables
         if self._carry is None:
-            count = self.env.reset(act_key)[1].reward.shape[0]
-            self._carry = start(self._driven, act_key, self.objective.memory(count))
-            observed = jax.tree.map(lambda leaf: leaf, self._carry.observation)
-            example = {**observed, "action": jnp.zeros((count, self.env.action_size))}
+            simulated = isinstance(self.env, Simulator)
+            count = self.env.count if simulated else self.env.reset(act_key)[1].reward.shape[0]
+            self._carry = rollout_start(self._driven, act_key, self.objective.memory(count))
+            example = {**self._carry.observation, "action": jnp.zeros((count, self.env.action_size))}
             self._replay = ReplayBuffer.empty(example, self.capacity)
             self._returns = jnp.zeros(count)
             self._advance(variables, self.prefill, random=True)
@@ -725,8 +766,13 @@ class DreamerRollout:
         return jax.device_get(self._sample(self._replay, key))
 
     def _advance(self, variables: Variables, steps: int, *, random: bool) -> None:
-        self._carry, self._replay, self._returns, total, count = self._acted(
-            variables, self._carry, self._replay, self._returns, steps=steps, random=random)
+        if isinstance(self.env, Simulator):
+            self._carry, recorded = simulator_rollout(self._driven, self._policy(random), variables,
+                                                      self._carry, steps, reset=False)
+            self._replay, self._returns, total, count = self._recorded(self._replay, self._returns, recorded)
+        else:
+            self._carry, self._replay, self._returns, total, count = self._acted(
+                variables, self._carry, self._replay, self._returns, steps=steps, random=random)
         self._taken += steps * self._returns.shape[0]
         self._ended = (float(total), int(count))
 
@@ -737,15 +783,17 @@ def demonstration_replay(episodes: Sequence[Mapping[str, np.ndarray]]) -> Replay
     the reward that came with it (none at its first), and the action taken at it, after it was seen
     (FlyDreamer's recorder stored each action one row later, with the observation it produced, and so
     shifted every action-conditioned prediction). An episode is `observation`, `action` and `reward`
-    along its steps, and `terminal` where it ended in a terminal state (only its last step can)."""
+    along its steps (an observation an array or a dict of them), and `terminal` where it ended in a
+    terminal state (only its last step can)."""
     rows = []
     for episode in episodes:
         length = len(episode["reward"])
         terminal = np.asarray(episode.get("terminal", np.zeros(length, bool)), bool)
-        if terminal[:-1].any() or any(len(episode[name]) != length for name in ("observation", "action")):
+        leaves = jax.tree.leaves((episode["observation"], episode["action"]))
+        if terminal[:-1].any() or any(len(leaf) != length for leaf in leaves):
             raise ValueError("an episode's fields hold one row a step, and only its last step is terminal")
         steps = np.arange(length)
-        rows.append({"observation": np.asarray(episode["observation"]),
+        rows.append({"observation": jax.tree.map(np.asarray, episode["observation"]),
                      "action": np.asarray(episode["action"]),
                      "reward": np.asarray(episode["reward"], np.float32), "first": steps == 0,
                      "last": steps == length - 1, "terminal": terminal})
@@ -754,10 +802,16 @@ def demonstration_replay(episodes: Sequence[Mapping[str, np.ndarray]]) -> Replay
     return ReplayBuffer.empty(example, len(stream["reward"])).add(stream)
 
 
-def episodes_return(objective: DreamerV3Objective, env: Env, variables: Variables, key: jax.Array,
+def episodes_return(objective: DreamerV3Objective, env: Env | Simulator, variables: Variables, key: jax.Array,
                     steps: int) -> float:
-    """The mean return of `env`'s environments over `steps` steps of the agent from fresh episodes,
-    each episode summed from its first step: one episode each where `steps` is its length."""
+    """The mean return of `env`'s environments, an `Env` or a `Simulator`, over `steps` steps of the agent
+    from fresh episodes, each episode summed from its first step: one episode each where `steps` is its
+    length."""
+    if isinstance(env, Simulator):
+        driven = DrivenSimulator(env)
+        carry = simulator_start(driven, key, objective.memory(env.count))
+        _, recorded = simulator_rollout(driven, objective.act, variables, carry, steps, reset=False)
+        return float(jnp.mean(jnp.sum(recorded.observation["reward"], axis=0)))
     driven = Driven(env)
     count = env.reset(key)[1].reward.shape[0]
 
@@ -770,6 +824,6 @@ def episodes_return(objective: DreamerV3Objective, env: Env, variables: Variable
     return float(run(variables, key))
 
 
-__all__ = ["ConvDecoder", "ConvEncoder", "Critic", "DreamerRollout", "DreamerV3Objective", "LatentEnv",
-           "WorldModel", "demonstration_replay", "episodes_return", "lambda_return", "normal_entropy",
-           "normal_log_prob"]
+__all__ = ["AUXILIARY_SCALE", "ConvDecoder", "ConvEncoder", "Critic", "DreamerRollout", "DreamerV3Objective",
+           "LatentEnv", "WorldModel", "demonstration_replay", "episodes_return", "lambda_return",
+           "normal_entropy", "normal_log_prob"]
