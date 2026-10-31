@@ -17,6 +17,7 @@ import contextlib
 import enum
 import functools
 import math
+import weakref
 import zlib
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Hashable, Mapping, Sequence
@@ -1659,6 +1660,37 @@ def token_log_probs(logits: jax.Array, tokens: jax.Array) -> jax.Array:
     """
     return -categorical.cross_entropy(logits, tokens)
 
+
+_TRACED: weakref.WeakKeyDictionary[object, dict[Hashable, tuple[float, float]]] = (
+    weakref.WeakKeyDictionary())
+
+
+def traced_update_flops(objective: Objective[Loss, Effects], batch: Batch) -> tuple[float, float]:
+    """The work of an update of `objective` on `batch` as its traced programs run it, for an objective whose
+    work no closed form counts (`dew.nn.flops.traced_flops`): its loss's forward, and its loss's gradient's
+    program, the forward and the backward as JAX differentiates it, none through a stopped gradient (a world
+    model's imagined rollouts, whose actor learns by REINFORCE). Kept by the batch's shapes, so a run whose
+    batches keep theirs traces once."""
+    from dew.nn.flops import traced_flops
+
+    shapes = jax.eval_shape(lambda batch: batch, batch)
+    signature = (jax.tree.structure(shapes), tuple(jax.tree.leaves(shapes)))
+    kept = _TRACED.setdefault(objective, {})
+    if signature not in kept:
+        variables = jax.eval_shape(objective.init, jax.random.key(0))
+        step = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(0), ema=None)
+        rest = {name: value for name, value in variables.items() if name != "params"}
+
+        def forward(variables: Variables, batch: Batch) -> jax.Array:
+            return objective.scalar_loss(variables, batch, step)[0]
+
+        def gradient(params: Variables, rest: Variables, batch: Batch) -> Variables:
+            return jax.grad(lambda params: forward({**rest, "params": params}, batch))(params)
+
+        kept[signature] = (traced_flops(forward, variables, shapes),
+                           traced_flops(gradient, variables["params"], rest, shapes))
+    return kept[signature]
+
 __all__ = [
     "OMITTED",
     "Aux",
@@ -1677,5 +1709,6 @@ __all__ = [
     "TrainingScalars",
     "joined",
     "model_rngs",
+    "traced_update_flops",
     "training_rngs",
 ]
