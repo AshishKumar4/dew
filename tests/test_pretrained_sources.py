@@ -273,13 +273,14 @@ def test_tier_three_admits_a_causal_lm_it_can_train_and_refuses_the_rest():
 
 def test_tier_three_runs_dews_attention_where_every_layer_asks_the_interface_for_it():
     """Tier 3 observes, on the probe's model, whether every decoder layer asks transformers' attention
-    interface for its attention with a mask Dew's visibility reproduces: BioGPT's do, though its
-    class declares no attention backend, and run on Dew's; OpenAI GPT's and GPT-NeoX Japanese's compute
-    their own, and keep them, saying why."""
+    interface for its attention with a mask Dew's visibility reproduces: StableLM's do, though its
+    class declares no attention backend, and run on Dew's (a StableLM norming each head's queries and keys
+    by a layer norm of its own, which tier 2 does not assemble); OpenAI GPT's and GPT-NeoX Japanese's
+    compute their own, and keep them, saying why."""
     from dew.interop.pretrained import source_route
 
-    biogpt = source_route(tiny_config("biogpt").to_dict()).admitted
-    assert biogpt.attends and not biogpt.why
+    stablelm = source_route(tiny_config("stablelm", qk_layernorm=True).to_dict()).admitted
+    assert stablelm.attends and not stablelm.why
     openai = source_route(tiny_config("openai-gpt").to_dict()).admitted
     assert not openai.attends and openai.why
     # GPT-NeoX Japanese adds the mask it is given to its scores in its own code: the probe's mask is
