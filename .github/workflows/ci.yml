@@ -81,8 +81,9 @@ jobs:
         ARMADA_TOKEN: ${{ secrets.ARMADA_TOKEN }}
       run: |
         base=$(git merge-base HEAD origin/main)
-        # A train's gates, and a push to main's, start before lanes' runs, as their suites do.
-        case "$GITHUB_REF_NAME" in ci/batch-*|ci/fix-*|main) priority=--priority=10 ;; ci/stage-*) priority=--priority=5 ;; *) priority= ;; esac
+        # A train's gates start before lanes' runs, a push to main's and a staged train's after a train's, as their
+        # suites do.
+        case "$GITHUB_REF_NAME" in ci/batch-*|ci/fix-*) priority=--priority=10 ;; ci/stage-*|main) priority=--priority=5 ;; *) priority= ;; esac
         grep -v '^#' tools/check_gates | cut -f1 | armada map --commit=${{ github.sha }} --items=- --size=medium \
           $priority --label="lint-$GITHUB_REF_NAME" -- \
           sh -c 'venv=$PWD/.venv-$(tr -d "\n" < .python-version); PYTHON=$venv/bin/python PATH=$venv/bin:$PATH BASE="$1" sh tools/check.sh --gate "$2"' \
@@ -233,6 +234,7 @@ jobs:
         ${{ (startsWith(github.ref_name, 'ci/full-whole-') && 'armada-whole')
         || ((startsWith(github.ref_name, 'ci/base-') || github.ref_name == 'base/kernels') && 'armada-base')
         || (startsWith(github.ref_name, 'ci/stage-') && 'armada-stage')
+        || (github.ref_name == 'main' && 'armada-main')
         || 'armada' }}
       cancel-in-progress: false
       queue: max
@@ -287,12 +289,14 @@ jobs:
         # ledger). A train staged on the testing train's tip (ci/stage-*, its own concurrency group above)
         # runs beside it, at 5: it publishes only after that train, so it takes what that train leaves (owner
         # and the maintainer, 2026-10-28). A push to main the queue did not grade (a direct push: a train's
-        # tip is proven and runs neither) is its tip's only test, and runs as a train's (the maintainer,
-        # 2026-10-29: 34c949ee8's, at 0 on a full fleet, left a gang's fourth rank unplaced past its
-        # deadline).
+        # tip is proven and runs neither) is its tip's only test: it runs beside the trains in a concurrency
+        # group of its own, never holding theirs, at a staged train's 5, so a train's jobs start first and it
+        # takes what they leave, above a lane's run (the maintainer, 2026-10-29: 34c949ee8's, at 0 on a full
+        # fleet, left a gang's fourth rank unplaced past its deadline; 2026-10-31: a direct push's run held
+        # the trains' group, and a nine-head train's test job waited 14 minutes for it).
         case "$GITHUB_REF_NAME" in
-          ci/batch-*|ci/fix-*|main) priority=--priority=10 ;;
-          ci/stage-*) priority=--priority=5 ;;
+          ci/batch-*|ci/fix-*) priority=--priority=10 ;;
+          ci/stage-*|main) priority=--priority=5 ;;
           ci/base-*|base/kernels|ci/full-whole-*) priority=--priority=-10 ;;
           *) priority= ;;
         esac
