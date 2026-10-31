@@ -844,22 +844,53 @@ def test_a_distribution_matching_student_updates_cotangent_reaches_its_trained_c
 @pytest.mark.parametrize("stacked", ["scanned", "pipelined"])
 def test_a_path_glob_selects_the_layer_its_log_names(stacked):
     """A glob over a module's path names it as the log does, by its layer's place in the decoder (row
-    3126): `layers_2/*` summarizes layer 2's modules alone, their outputs and their cotangents, whether the
-    decoder scans its layers as one run (`layers_0_3`) or pipelines them over two stages
-    (`stages/layers_j`)."""
+    3126): `layers_2/*` logs layer 2's modules alone, every entry and value a run watching every module
+    logs for them, their outputs and their cotangents, whether the decoder scans its layers as one run
+    (`layers_0_3`) or pipelines them over two stages (`stages/layers_j`); a glob naming no layer of the
+    decoder is refused."""
     from model_support import TINY_DECODER
 
     from dew.objectives.lm import LMObjective
     from dew.registry import models
     from dew.training import MeshSpec
 
-    fields = {**TINY_DECODER, "num_layers": 4, **({"scan_layers": True} if stacked == "scanned" else {})}
-    model = models.build("causal_transformer", vocab_size=64, **fields, num_kv_heads=2)
-    placed = ({"microbatches": 2, "mesh": MeshSpec(fsdp=2, stage=2).build(jax.devices()[:4])}
-              if stacked == "pipelined" else {})
-    run = Trainer(LMObjective(model, 16), optax.sgd(RATE), key=jax.random.key(0), **placed,
-                  inspection=Inspection(modules=("layers_2/*",), targets=("params",), cotangents=True))
-    tokens = np.random.default_rng(1).integers(1, 64, size=(8, 17)).astype(np.int32)
-    logged = inspected(run, {"text": tokens})
-    for kind in ("activations", "cotangents"):
-        assert {name.split("/")[2] for name in logged if name.startswith(f"inspect/{kind}/")} == {"layers_2"}
+    def logged(*modules: str) -> dict[str, float]:
+        fields = {**TINY_DECODER, "num_layers": 4, **({"scan_layers": True} if stacked == "scanned" else {})}
+        model = models.build("causal_transformer", vocab_size=64, **fields, num_kv_heads=2)
+        placed = ({"microbatches": 2, "mesh": MeshSpec(fsdp=2, stage=2).build(jax.devices()[:4])}
+                  if stacked == "pipelined" else {})
+        run = Trainer(LMObjective(model, 16), optax.sgd(RATE), key=jax.random.key(0), **placed,
+                      inspection=Inspection(modules=modules, targets=("params",), cotangents=True))
+        tokens = np.random.default_rng(1).integers(1, 64, size=(8, 17)).astype(np.int32)
+        return {name: value for name, value in inspected(run, {"text": tokens}).items()
+                if name.startswith(("inspect/activations/", "inspect/cotangents/"))}
+
+    selected, every = logged("layers_2/*"), logged("layers_*/*")
+    reference = {name: value for name, value in every.items() if name.split("/")[2] == "layers_2"}
+    assert set(selected) == set(reference) and any("/cotangents/" in name for name in selected)
+    # The statistics no reduction order changes are the very entries' to the bit.
+    for name in selected:
+        if name.endswith(("/abs_max", "/non_finite", "/zero_fraction")):
+            assert selected[name] == reference[name], name
+    with pytest.raises(ValueError):
+        logged("layers_9/*")
+
+
+@pytest.mark.mesh(devices=4)
+def test_a_pipeline_stage_modules_cotangent_is_refused():
+    """A pipeline's stage module (`stages`), which runs a stage's layers and which the log names by no
+    layer, has its watched cotangent refused as the step traces, naming the layers to watch instead
+    (row 3126 review)."""
+    from model_support import TINY_DECODER
+
+    from dew.objectives.lm import LMObjective
+    from dew.registry import models
+    from dew.training import MeshSpec
+
+    model = models.build("causal_transformer", vocab_size=64, **{**TINY_DECODER, "num_layers": 4},
+                         num_kv_heads=2)
+    run = Trainer(LMObjective(model, 16), optax.sgd(RATE), key=jax.random.key(0), microbatches=2,
+                  mesh=MeshSpec(fsdp=2, stage=2).build(jax.devices()[:4]),
+                  inspection=Inspection(modules=("stages",), targets=("params",), cotangents=True))
+    with pytest.raises(ValueError):
+        inspected(run, {"text": np.random.default_rng(1).integers(1, 64, size=(8, 17)).astype(np.int32)})
