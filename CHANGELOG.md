@@ -7,11 +7,15 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 - A file an export's manifest or a source's `file_info` declares is never read as other bytes under
   that declaration, which a run's identity holds: an export records the version its store published
-  each shard at (an S3 ETag, a GCS generation, a Hub commit), and each read of a range of it is held to
-  that version, refused (`dew.data.declared.Replaced`) where the store no longer holds it; a local or
-  in-memory file is checked against its digest as a read opens it; any other remote file, and an
-  ArrayRecord shard, which its reader opens by path, is read whole into Dew's mirror and checked there.
-  Declared Parquet on S3 or GCS reads through Dew's ranged reads rather than Arrow's own clients.
+  each shard at (an S3 ETag, a GCS generation), and each read of a range of it is held to that version,
+  refused (`dew.data.declared.Replaced`) where the store no longer holds it; Parquet and Arrow files on
+  S3 or GCS keep Arrow's own clients, each read of a fragment between two reads of the file's version;
+  an export on a Hub repository read by its branch is read at the commit the branch names as its
+  manifest is read, every file it lists at that commit; a local or in-memory file is checked against its
+  digest as a read opens it, and an indexed reader reads the file it checked while it holds it; any
+  other remote file, and an ArrayRecord shard, which its reader opens by path, is read whole into Dew's
+  mirror and checked there. A published cache generation's shards and lengths, and a token export's
+  lengths, are read as declared too.
 - A streamed Hub split reads the files of the configuration it names, or of the default its card
   states, as `datasets` resolves its card's `configs` (`data_files` under `data_dir`), and its Parquet
   conversion reads that configuration's directory: naming none, where a card states several and marks

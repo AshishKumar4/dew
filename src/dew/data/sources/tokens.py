@@ -193,8 +193,8 @@ class TokenFiles(Dataset):
                     f"token export needs the producer's lengths; export with length_field="
                     f"{self.field or 'text'!r}"
                 )
-            index = ArrayIndex(root.child(entry["lengths"]["path"]).url, self.storage_options)
-            index.verify(entry["lengths"])
+            lengths = root.child(entry["lengths"]["path"])
+            index = ArrayIndex(lengths.url, self.storage_options, Declared(lengths, entry["lengths"]))
             if index.values.ndim != 2 or index.values.shape[1] != 2:
                 raise ValueError("token export index needs length and cumulative end columns")
             indexes.append(index)

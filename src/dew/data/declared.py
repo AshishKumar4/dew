@@ -13,13 +13,19 @@ from fsspec.implementations.cached import CachingFileSystem
 from fsspec.implementations.http import HTTPFileSystem
 from fsspec.spec import AbstractFileSystem
 from gcsfs import GCSFileSystem
-from huggingface_hub import HfFileSystem, parse_hf_uri
-from huggingface_hub.file_download import REGEX_COMMIT_HASH
-from huggingface_hub.hf_file_system import HfFileSystemResolvedRepositoryPath
 from s3fs import S3FileSystem
 
 from dew._records import integer, text
-from dew.data.storage import STORED, Store, _local_file_key, content_version, in_memory, local
+from dew.data.storage import (
+    STORED,
+    SourceChanged,
+    Store,
+    _local_file_key,
+    content_version,
+    in_memory,
+    local,
+    pinned_by_url,
+)
 
 
 class Replaced(OSError):
@@ -68,22 +74,36 @@ PINNED_BUFFER = 8 << 20
 def stored_kind(fs: AbstractFileSystem) -> str | None:
     """The version a remote store `fs` holds an object at and a read of it can be held to (`STORED`),
     none for a store with none such."""
-    while isinstance(fs, CachingFileSystem):
-        fs = fs.fs
+    fs = _backing(fs)
     if isinstance(fs, S3FileSystem | HTTPFileSystem):
         return STORED["s3"]
-    if isinstance(fs, GCSFileSystem):
-        return STORED["gs"]
-    return STORED["hf"] if isinstance(fs, HfFileSystem) else None
+    return STORED["gs"] if isinstance(fs, GCSFileSystem) else None
 
 
-def pinned_by_url(fs: AbstractFileSystem, path: str) -> bool:
-    """Whether the object at `path` is one version by its URL alone: a Hub repository's file at a full
-    commit, which no write moves."""
-    if not isinstance(fs, HfFileSystem):
-        return False
-    revision = parse_hf_uri(f"hf://{path}").revision
-    return revision is not None and REGEX_COMMIT_HASH.fullmatch(revision) is not None
+def _backing(fs: AbstractFileSystem) -> AbstractFileSystem:
+    """The store `fs` reads from, through any transport cache over it."""
+    while isinstance(fs, CachingFileSystem):
+        fs = fs.fs
+    return fs
+
+
+def mirrored(store: Store, size: int | None = None, digest: str | None = None) -> io.BufferedReader:
+    """The object at `store`, its copy in Dew's mirror open, which the mirror keeps while it is: checked
+    against `digest`, of `size` bytes, as it downloads where one is given (`Replaced` where it holds
+    others), refused where the mirror has no room for it beside the files its readers hold open."""
+    mirror, path = store.cached().resolve()
+    snapshot = None if digest is None else {"size": size, "sha256": digest}
+    try:
+        opened = mirror.open(path, "rb", source_snapshot=snapshot)
+    except SourceChanged as error:
+        if digest is None:
+            raise
+        raise Replaced(f"{store.url} holds other bytes than the {size} its producer declared") from error
+    if not isinstance(opened, io.BufferedReader) or not isinstance(opened.name, str):
+        opened.close()
+        raise ValueError(f"{store.url} is read from Dew's mirror, which has no room for it beside the files "
+                         "its readers hold open (as many as Loading's read threads a source)")
+    return opened
 
 
 def checked_open(fs: AbstractFileSystem, path: str, size: int, digest: str) -> BinaryIO:
@@ -117,9 +137,10 @@ class Declared:
     - a Hub file at a full commit, which its URL pins, is read as its URL names it;
     - a remote object published at a version is read in ranges held to it (`Pinned`), refused
       (`Replaced`) where its store no longer holds it there;
-    - a local or in-memory file is checked as each read opens it (`checked_open`);
+    - a local or in-memory file is checked as a read opens it (`checked_open`), and a reader that holds
+      it open (`held`) reads the file it checked;
     - any other remote object it states a digest of, and one a reader reads by its path on this host, is
-      read whole into Dew's mirror and checked there, which a mirror without room for it refuses.
+      read whole into Dew's mirror and checked there (`mirrored`).
     A declaration with neither a digest nor a version of a store's own is refused: nothing holds a read
     of it to what it declares."""
 
@@ -149,18 +170,6 @@ class Declared:
     def _identity(self) -> tuple:
         return self.store.url, self.size, self.digest, tuple(sorted((self.stored or {}).items()))
 
-    def mirrored(self) -> io.BufferedReader:
-        """The object's copy in Dew's mirror, checked against its digest as it downloads, open: the
-        mirror keeps it while it is."""
-        mirror, mirrored = self.store.cached().resolve()
-        snapshot = None if self.digest is None else {"size": self.size, "sha256": self.digest}
-        opened = mirror.open(mirrored, "rb", source_snapshot=snapshot)
-        if not isinstance(opened, io.BufferedReader) or not isinstance(opened.name, str):
-            opened.close()
-            raise ValueError(f"{self.store.url} is read whole into Dew's mirror to check it, which has no "
-                             f"room for its {self.size} bytes")
-        return opened
-
     def open(self) -> BinaryIO:
         """A binary file of the declared bytes, a pinned object's read `PINNED_BUFFER` bytes at a time."""
         fs, path = self.store.resolve()
@@ -171,21 +180,29 @@ class Declared:
             return io.BufferedReader(Pinned(self.store, self.stored, self.size), buffer_size=PINNED_BUFFER)
         if self.digest is not None and (local(fs) or in_memory(fs)):
             return checked_open(fs, path, self.size, self.digest)
-        return self.mirrored()
+        return mirrored(self.store, self.size, self.digest)
 
     def unbuffered(self) -> Pinned | BinaryIO:
         """A file of the declared bytes for a reader that plans its own reads (Arrow): a pinned object's
         each read one request, any other as `open` gives it."""
         return Pinned(self.store, self.stored, self.size) if self.stored is not None else self.open()
 
-    def read_range(self, start: int, end: int) -> bytes:
-        """The declared bytes `start` to `end`: in one request where they are held to a version, else
-        from a file opened, checked, for the read alone, which holds nothing open after it."""
-        if self.stored is not None:
-            return ranged(self.store, start, end, self.stored)
-        with self.open() as opened:
-            opened.seek(start)
-            return opened.read(end - start)
+    def held(self) -> Held:
+        """The declared bytes held open for reads of ranges of them (`Held`)."""
+        return Held(self)
+
+    def still_held(self) -> None:
+        """Refuse (`Replaced`) unless its store holds the object at the version it was published at,
+        as one request for its metadata states it: the check a reader that holds no read to a version
+        (Arrow's own clients) makes before and after it reads."""
+        assert self.stored is not None, "a version to hold the object to"
+        fs, path = self.store.resolve()
+        fs = _backing(fs)
+        fs.invalidate_cache(path)
+        [(kind, version)] = self.stored.items()
+        found = fs.info(path).get("ETag" if kind == "etag" else kind)
+        if str(found) != version:
+            raise Replaced(f"{self.store.url} is no longer the object published at {kind} {version}")
 
     def leased(self) -> tuple[str, BinaryIO]:
         """A path on this host's disk to the declared bytes, for a reader that opens paths alone
@@ -201,18 +218,58 @@ class Declared:
             opened = checked_open(fs, path, self.size, self.digest)
             descriptor = f"/proc/self/fd/{opened.fileno()}"
             return (descriptor if os.path.exists(descriptor) else path), opened
-        held = self.mirrored()
+        held = mirrored(self.store, self.size, self.digest)
         return held.name, held
+
+
+class Held:
+    """The declared bytes of one object held open for reads of ranges of them, each read as declared:
+    - held to a version, each read one request held to it (`ranged`), and a Hub file at a commit each one
+      request at it;
+    - a local file read from the descriptor checked as it opened (`os.pread`, which threads share), the
+      file it checked though another is put in its place since, and refused (`Replaced`) once that file
+      is rewritten in place (its size or modification time moved);
+    - an in-memory file from its bytes checked, and any other from its copy in Dew's mirror, pinned while
+      it is held."""
+
+    def __init__(self, declared: Declared):
+        self.declared = declared
+        fs, _ = declared.store.resolve()
+        self.file = None if declared.stored is not None or declared.pinned else declared.open()
+        self.checked = None
+        if self.file is not None and local(fs):
+            held = os.fstat(self.file.fileno())
+            self.checked = held.st_size, held.st_mtime_ns
+
+    def __getitem__(self, span: slice) -> bytes:
+        start, end = int(span.start), int(span.stop)
+        declared = self.declared
+        if declared.stored is not None:
+            return ranged(declared.store, start, end, declared.stored)
+        if self.file is None:
+            readable = declared.store.readable()
+            return readable.fs.cat_file(readable.path, start=start, end=end)
+        if isinstance(self.file, io.BytesIO):
+            return bytes(self.file.getbuffer()[start:end])
+        if self.checked is not None:
+            held = os.fstat(self.file.fileno())
+            if (held.st_size, held.st_mtime_ns) != self.checked:
+                raise Replaced(f"{declared.store.url} was rewritten since it was checked against the "
+                               f"{declared.size} bytes its producer declared")
+        return os.pread(self.file.fileno(), end - start, start)
+
+    def close(self) -> None:
+        if self.file is not None:
+            self.file.close()
 
 
 def ranged(store: Store, start: int, end: int, stored: Mapping[str, str]) -> bytes:
     """Bytes `start` to `end` of the object at `store` as its store holds it at the version `stored` names
     (`STORED`), in one request held to it, which raises `Replaced` where the store no longer holds
     it there: an S3 range read on the object's ETag (`IfMatch`), an HTTP one on its ETag (`If-Match`,
-    RFC 9110 13.1.1), a GCS one of its generation, a Hub file's at its commit."""
+    RFC 9110 13.1.1), a GCS one of its generation."""
     fs, path = store.resolve()
-    while isinstance(fs, CachingFileSystem):
-        fs = fs.fs
+    fs = _backing(fs)
     kind = stored_kind(fs)
     version = None if kind is None else stored.get(kind)
     if version is None:
@@ -254,13 +311,8 @@ def ranged(store: Store, start: int, end: int, stored: Mapping[str, str]) -> byt
                 return await read.read()
 
         return sync(loop, body)
-    if isinstance(fs, GCSFileSystem):
-        try:
-            return fs.cat_file(path, start=start, end=end, generation=version, concurrency=1)
-        except FileNotFoundError as error:
-            raise Replaced(f"{store.url} holds no generation {version}: replaced or removed") from error
-    resolved = fs.resolve_path(path) if isinstance(fs, HfFileSystem) else None
-    if not isinstance(resolved, HfFileSystemResolvedRepositoryPath):
-        raise ValueError(f"{store.url} is no repository file")
-    return fs.cat_file(f"{resolved.repo_type}s/{resolved.repo_id}@{version}/{resolved.path_in_repo}",
-                       start=start, end=end)
+    assert isinstance(fs, GCSFileSystem), "the stores STORED names"
+    try:
+        return fs.cat_file(path, start=start, end=end, generation=version, concurrency=1)
+    except FileNotFoundError as error:
+        raise Replaced(f"{store.url} holds no generation {version}: replaced or removed") from error

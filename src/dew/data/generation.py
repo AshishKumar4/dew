@@ -18,11 +18,12 @@ import numpy as np
 from dew._records import JSON
 from dew.batch import Batch
 from dew.data.dataset import Records
+from dew.data.declared import Declared, Replaced
 from dew.data.pipeline import Record, Rejected
 from dew.data.plan import array_digest
 from dew.data.retention import LocalRetention
 from dew.data.sources.base import Read, Shard, ShardManifest, Source, _indexed_manifest, _uncounted, url_label
-from dew.data.sources.codec import decode, encode, encoded_fingerprint, fingerprint
+from dew.data.sources.codec import decode, encode, encoded_fingerprint
 from dew.data.sources.index import ArrayIndex
 from dew.data.sources.records import ArrayRecords, ShardReaders
 from dew.data.storage import Store, Versioned, local
@@ -294,8 +295,21 @@ def _segment(root: Store, segment: Mapping[str, object], completions: dict, shar
         raise ValueError(f"the cache segment {segment['path']} was written under schema "
                          f"{record.get('schema')!r}, and this Dew reads schema {GENERATION_SCHEMA}, whose "
                          "inputs and digests are named otherwise; fill the cache again")
-    _checked(root, record["shard"])
-    with closing(ArrayRecords((root.child(record["shard"]["path"]).url,), root.storage_options)) as rows:
+    shard = root.child(record["shard"]["path"])
+    declared = Declared(shard, record["shard"])
+    # A publication certifies its store holds each shard as declared, whatever copy of it this host's
+    # mirror holds: a remote shard hashed where the store holds it, in bounded reads; a local one checked
+    # as its reader opens it.
+    fs, path = shard.resolve()
+    if not local(fs):
+        digest, size = hashlib.sha256(), 0
+        with fs.open(path, "rb") as stored:
+            while payload := stored.read(2**20):
+                digest.update(payload)
+                size += len(payload)
+        if (digest.hexdigest(), size) != (declared.digest, declared.size):
+            raise Replaced(f"{shard.url} holds other bytes than its writer's segment declares")
+    with closing(ArrayRecords((shard.url,), root.storage_options, declared=(declared,))) as rows:
         if sorted(entry["record"] for entry in record["completions"]) != list(range(len(rows))):
             raise ValueError(f"cache shard has records without one completion: {record['shard']['path']}")
         for entry in record["completions"]:
@@ -467,26 +481,16 @@ class Generation:
         return opened
 
     @cached_property
-    def _shards(self) -> ShardReaders[str]:
+    def _shards(self) -> ShardReaders[str, int, Batch | bytes | None]:
         # As many shards' readers stay open as a read's threads, the room the transport's mirror holds
-        # (`ShardReaders`): a local shard is checked whole (its size and digest) as its reader opens,
-        # which stands for every record that reader reads (`outputs`), and checked again only once it
-        # reopens.
+        # (`ShardReaders`): each shard read as its manifest declares it (`Declared`), from the file
+        # checked as its reader opens, which stands for every record that reader reads.
         def opened(path: str) -> ArrayRecords:
-            root = Store(self.manifest["root"], self.storage_options)
-            if self._local:
-                # Checked in place, the file its reader reads.
-                _checked(root, self.manifest["shards"][path])
-            return ArrayRecords((root.child(path).url,), self.storage_options)
+            shard = Store(self.manifest["root"], self.storage_options).child(path)
+            return ArrayRecords((shard.url,), self.storage_options,
+                                declared=(Declared(shard, self.manifest["shards"][path]),))
 
         return ShardReaders(opened)
-
-    @cached_property
-    def _local(self) -> bool:
-        """Whether its shards are local files, which a reader reads as they were checked whole as it
-        opened them (`_shards`); a remote shard's reader reads an object the check did not, so each
-        record it reads is checked against its digest (`outputs`)."""
-        return local(Store(self.manifest["root"], self.storage_options).resolve()[0])
 
     def __getstate__(self) -> Mapping[str, object]:
         return {"url": self.url, "storage_options": self.storage_options, "_definition": self._definition,
@@ -542,14 +546,11 @@ class Generation:
 
     def outputs(self, row_id: RowId) -> Outputs:
         row_key = _row_key(row_id)
-        shard, place, digest = self._page(input_page(row_key))[row_key]
+        shard, place, _ = self._page(input_page(row_key))[row_key]
         payload = self._shards.read(shard, place)
         if not isinstance(payload, bytes):
             raise ValueError(f"committed cache record is not bytes: {self.url}")
-        values = _decode_outputs(payload)
-        if not self._local and fingerprint(values) != digest:
-            raise ValueError(f"committed cache completion is corrupt for {row_key}")
-        return values
+        return _decode_outputs(payload)
 
     def __len__(self) -> int:
         return self.manifest["rows"]
@@ -626,10 +627,5 @@ class _GenerationSource:
     @cached_property
     def _length_index(self) -> ArrayIndex:
         entry = self.generation.manifest["metadata"]["lengths"]
-        index = ArrayIndex(
-            self.generation.url.rstrip("/") + "/" + entry["path"],
-            self.generation.storage_options,
-            metadata=entry,
-        )
-        index.verify(entry)
-        return index
+        lengths = Store(self.generation.url, self.generation.storage_options).child(entry["path"])
+        return ArrayIndex(lengths.url, self.generation.storage_options, Declared(lengths, entry))
