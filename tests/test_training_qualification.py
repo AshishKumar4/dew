@@ -130,7 +130,7 @@ def source_model(kind: str, vocab: int):
 @pytest.fixture(scope="module", params=["dense", "moe"])
 def qualified(tmp_path_factory, request) -> Path:
     directory = tmp_path_factory.mktemp(f"qualification-{request.param}")
-    # A text of its own, CONTRIBUTING.md as of 29288bad9: the MoE source is
+    # A text of its own, CONTRIBUTING.md as of 55c522529: the MoE source is
     # checked for near ties in its routing over these tokens, and an edit to
     # the live file failed that check.
     (directory / "corpus.txt").write_bytes((FIXTURES / "qualification_corpus.txt").read_bytes())

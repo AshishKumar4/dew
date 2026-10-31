@@ -16,7 +16,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from block_support import VOCAB, block_causal, model, wrapped
-from model_support import model_draw
+from model_support import called_outputs, model_draw
 from reference_error import assert_as_exact
 
 from dew.batch import coordinates, token_coordinates
@@ -187,7 +187,8 @@ CACHED_SEEDS = 16
 def test_a_cached_rollout_reads_its_blocks_as_the_full_pass_does(shared):
     """Gemma 4's layout, images on its sliding layers and blocks on its full ones: a prefill, a cached call of
     several tokens and single steps, each call's groups at its tokens' slots, on par with the full pass over
-    the same groups from the cached rollout's first prediction on (check 1, from float64). With shared keys
+    the same groups from the cached rollout's first prediction on, each call's at the width it reads
+    (`called_outputs`; check 1, from the one full pass in float64). With shared keys
     the last two layers read the first two's (Gemma 4's trailing run), so a layer reading groups over keys
     another layer caches holds no cache of its own."""
     kinds = {"sliding_attention": {"window": 3, "mixer": AttentionMixer(bidirectional_images=True)},
@@ -201,7 +202,14 @@ def test_a_cached_rollout_reads_its_blocks_as_the_full_pass_does(shared):
 
     rolled = rollout(decoder, CALLS, block_groups=blocks, image_groups=images)
     wide = decoder.clone(dtype=jnp.float64, attention_impl="reference")
-    assert_as_exact(lambda params, ids: rolled(params, ids)[:, 3:], full(decoder),
+    forward = jax.jit(lambda params, ids, held_blocks, held_images: decoder.apply(
+        params, ids, block_groups=held_blocks, image_groups=held_images))
+
+    def calls(params, ids):
+        return called_outputs(lambda hi: forward(params, ids[:, :hi], blocks[:, :hi], images[:, :hi]),
+                              CALLS)[:, 3:]
+
+    assert_as_exact(lambda params, ids: rolled(params, ids)[:, 3:], calls,
                     model_draw(decoder, (2, 12), VOCAB), "cached blocks", seeds=CACHED_SEEDS,
                     truth_fn=full(wide))
 
@@ -313,7 +321,8 @@ def test_a_prediction_depth_reads_the_groups_of_the_tokens_it_reads():
 def test_a_multimodal_wrappers_cached_rollout_reads_its_blocks_as_its_full_pass_does():
     """A multimodal wrapper hands its language model the call's groups (`MultimodalTransformer`): text alone
     through its cache, a prefill, a cached call and single steps, with blocks inside each call, on par with
-    its full pass over the same groups from float64 (check 1)."""
+    its full passes over the same groups, each call's at the width it reads (`called_outputs`), from the one
+    full pass in float64 (check 1)."""
     decoder = model(full_attention={"mixer": AttentionMixer(bidirectional_blocks=True)})
     wrapper = wrapped(decoder)
     groups = jnp.asarray(CACHED_BLOCKS)
@@ -323,7 +332,12 @@ def test_a_multimodal_wrappers_cached_rollout_reads_its_blocks_as_its_full_pass_
 
     rolled = rollout(wrapper, CALLS, block_groups=groups)
     wide = wrapped(decoder.clone(dtype=jnp.float64, attention_impl="reference"))
-    assert_as_exact(lambda params, ids: rolled(params, ids)[:, 3:], full(wrapper),
+    forward = jax.jit(lambda params, ids, held: wrapper.apply(params, ids, block_groups=held))
+
+    def calls(params, ids):
+        return called_outputs(lambda hi: forward(params, ids[:, :hi], groups[:, :hi]), CALLS)[:, 3:]
+
+    assert_as_exact(lambda params, ids: rolled(params, ids)[:, 3:], calls,
                     model_draw(wrapper, (2, 12), VOCAB), "multimodal cached blocks", seeds=CACHED_SEEDS,
                     truth_fn=full(wide))
 

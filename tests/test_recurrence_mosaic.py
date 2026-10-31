@@ -564,17 +564,25 @@ class Unbudgeted(template.Mosaic):
         return True
 
 
-GATE_GROUPS = [(name, dtype, training, packed, variants) for name in RESOURCE_SHAPES
+NEIGHBOURS = 3
+"""The most variants a call's derived tiles have beside them (`Mosaic.neighbours`: the value block either
+side of the derived one and its stages' other depth), the resource gate's variant groups (`GATE_GROUPS`)."""
+
+
+GATE_GROUPS = [(name, dtype, training, packed, variant) for name in RESOURCE_SHAPES
                for dtype in (jnp.bfloat16, jnp.float32) for packed in (False, True)
-               for training in (False, True) for variants in (False, True)
+               for training in (False, True) for variant in (None, *range(NEIGHBOURS))
                if not (RESOURCE_SHAPES[name][4] and dtype == jnp.float32)
                and not (training and (name, dtype) != ('qwen3.5-27b-gdn', jnp.bfloat16))
-               and not (variants and (training or packed))]
+               and not (variant is not None and (training or packed or dtype == jnp.float32))]
 """The resource gate's groups (`compiled_cases`' `only`), a test each so each compiles in its own group:
 every geometry's forward in a 16-bit and an fp32 call, one row and packed documents, and the gated delta
 rule's 16-bit training pass (Kimi's keys, 128 wide, past what an fp32 call takes under a decay a key
-dimension); one row's forward at its derived tiles apart from its variants (`variants`). One test compiling
-them all took 674 seconds on sm90, a group with its variants 132 on sm80."""
+dimension); one row's 16-bit forward at its derived tiles apart from each of its variants (`variant`, a
+test each: an fp32 forward, which every family refuses, has none). One test compiling them all took 674
+seconds on sm90, a group with its variants 132 on sm80, and Kimi Linear's three variants 117 on sm80 at
+9e65ee222's gate, each about the forward's 89 (armada)."""
+
 
 
 def compiled_cases(target: str, plans: dict, refused: list, only: tuple | None = None) -> list:
@@ -591,9 +599,9 @@ def compiled_cases(target: str, plans: dict, refused: list, only: tuple | None =
     rows, length = 1, 256
     shared = generation.shared_budget(facts)
 
-    def cases(name: str, dtype, *, training: bool, packed: bool, variants: bool) -> list:
-        """The case's kernels at its derived tiles, or, one row's forward, at each of its other variants
-        (`variants`)."""
+    def cases(name: str, dtype, *, training: bool, packed: bool, variant: int | None) -> list:
+        """The case's kernels at its derived tiles, or, one row's forward, at its `variant`-th other variant
+        (`Mosaic.variants`)."""
         key_heads, value_heads, key_width, value_width, per_key = RESOURCE_SHAPES[name]
 
         def array(*shape, kind=dtype):
@@ -612,7 +620,7 @@ def compiled_cases(target: str, plans: dict, refused: list, only: tuple | None =
             held = Unbudgeted().derived(bound, facts)
             # The tile the derivation takes where every register held, refused for its registers alone.
             unheld = [] if held is None or held == derived else [(held, 'refused ')]
-            if derived is None and variants:
+            if derived is None and variant is not None:
                 return []
             if derived is None:
                 # Refused: a launch's registers or shared memory past the device's at every tile.
@@ -621,9 +629,9 @@ def compiled_cases(target: str, plans: dict, refused: list, only: tuple | None =
                 return [case(name, dtype, args, starts, bound, tiles, training=training, packed=packed,
                              kind=kind) for tiles, kind in unheld]
             tiled = template.MOSAIC.variants(bound)
-            if variants:
+            if variant is not None:
                 return [case(name, dtype, args, starts, bound, tiles, training=training, packed=packed,
-                             kind='') for tiles in tiled[1:]]
+                             kind='') for tiles in tiled[1:][variant:variant + 1]]
             if training and not mainloop.backward_holds(
                     *args, tiles=derived, family=family, shared=shared, starts=starts,
                     max_segments=8 if packed else None):
@@ -681,7 +689,7 @@ def compiled_cases(target: str, plans: dict, refused: list, only: tuple | None =
                           required=not kind.startswith('refused'))
 
     return [kernel for group in (GATE_GROUPS if only is None else [only])
-            for kernel in cases(group[0], group[1], training=group[2], packed=group[3], variants=group[4])]
+            for kernel in cases(group[0], group[1], training=group[2], packed=group[3], variant=group[4])]
 
 
 def planned_failures(found: list, plans: dict) -> list[str]:
@@ -698,14 +706,11 @@ def planned_failures(found: list, plans: dict) -> list[str]:
 
 
 def _gated(target: str, group: tuple):
-    """The gate's test of `target` and `group`: an A100's Kimi forward, whose refused launches spill (its
-    model and ptxas agreeing on the refusal), compiles past a group's two minutes (136 seconds), so it runs
-    on the whole suite."""
-    name, dtype, training, packed, variants = group
+    """The gate's test of `target` and `group`, named by them."""
+    name, dtype, training, packed, variant = group
     label = (f"{target}-{name}-{jnp.dtype(dtype).name}-{'training' if training else 'forward'}"
-             f"{'-packed' if packed else ''}{'-variants' if variants else ''}")
-    marks = [pytest.mark.whole_suite] if target == 'sm80' and RESOURCE_SHAPES[name][4] else []
-    return pytest.param(target, group, marks=marks, id=label)
+             f"{'-packed' if packed else ''}{'' if variant is None else f'-variant-{variant}'}")
+    return pytest.param(target, group, id=label)
 
 
 @pytest.mark.parametrize('target, group', [_gated(target, group) for target in ('sm80', 'sm90')

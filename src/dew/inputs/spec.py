@@ -250,6 +250,8 @@ class AudioCondition:
 
     encoder: ClassVar[str] = "hf_audio"
     checkpoint: str = "facebook/wav2vec2-base-960h"
+    revision: str | None = None
+    """The checkpoint's git revision; None reads its default branch, as it stands when the run starts."""
     dtype: DtypeName | None = None
     """The tower's compute dtype; None follows the model's compute dtype."""
     param_dtype: DtypeName = "float32"
@@ -261,7 +263,7 @@ class AudioCondition:
         `Dataset.facts`), without loading source weights or casting storage."""
         return Condition(
             ConditionEncoder.bound({"class": self.encoder, "fields": {
-                "checkpoint": self.checkpoint, "seconds": seconds,
+                "checkpoint": self.checkpoint, "seconds": seconds, "revision": self.revision,
                 "dtype": dtype if self.dtype is None else self.dtype, "param_dtype": self.param_dtype}},
                 params=params),
             field="audio", unconditional=0.0)

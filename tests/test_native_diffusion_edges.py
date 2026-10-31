@@ -18,7 +18,7 @@ def edges(tmp_path_factory):
 
 
 PAST_TARGET = {"parity": {"dpm-karras": 171}}
-"""The cases past a group's 120 s (`timed`), each its seconds in train 270's CI (f58abb8a3, ledger 2133):
+"""The cases past a group's 120 s (`timed`), each its seconds in train 270's CI (66a222273, ledger 2133):
 DPM-Karras's schedule; every train walks the same native-source path under DDIM, DDIM-clip, Euler and
 PNDM, row 647's proof."""
 

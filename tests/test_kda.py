@@ -22,7 +22,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from certified import assert_certified
-from model_support import decode_through
+from model_support import as_stepped, decode_through
 from reference_error import (
     assert_as_exact,
     assert_computes_the_oracle,
@@ -287,9 +287,10 @@ def test_default_eps_gradients_certify_element_by_element(monkeypatch):
 
 def test_prefill_then_token_steps_reproduce_the_parallel_layer():
     """The decode cache: a prefill of three tokens, then one token at a time
-    through the conv and recurrent states, on par with the layer over the
-    whole sequence from the transcription's float64 evaluation over drawn
-    inputs (check 1); the allocation call leaves no state behind."""
+    through the conv and recurrent states, on par with the layer's passes,
+    each step's at the width it reads (`as_stepped`), from the transcription's
+    float64 evaluation over the whole sequence and drawn inputs (check 1); the
+    allocation call leaves no state behind."""
     module, _, variables = layer_and_params(-5.0)
     params = oracle_params(variables)
 
@@ -299,7 +300,8 @@ def test_prefill_then_token_steps_reproduce_the_parallel_layer():
     _, allocated, _ = decode_through(module, variables, jnp.asarray(draw(0)[0]), prefill=3)
     assert not np.asarray(allocated["recurrent_state"]).any()
     assert_as_exact(lambda x: decode_through(module, variables, x, prefill=3)[0], jax.jit(
-        lambda x: module.apply(variables, x)), draw, "decode", seeds=SEEDS['decode'],
+        lambda x: as_stepped(lambda held: module.apply(variables, held), x, 3)), draw, "decode",
+        seeds=SEEDS['decode'],
         truth_fn=lambda x: oracle_layer(x, jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), params),
                                         -5.0, 1e-5, partial(oracle_chunk, chunk_size=4)))
 

@@ -55,8 +55,8 @@ SEEDS = {'attention cache capacity': 32, 'attention cached scores raw': 8,
          'attention registered scores raw': 16, 'attention registered scores policy': 16,
          'deepseek_v4 registered scores raw': 16, 'deepseek_v4 registered scores policy': 16,
          'gated_delta_net registered scores raw': 32, 'gated_delta_net registered scores policy': 64,
-         'kimi_delta_attention registered scores raw': 64,
-         'kimi_delta_attention registered scores policy': 64,
+         'kimi_delta_attention registered scores raw': 8,
+         'kimi_delta_attention registered scores policy': 8,
          'kpool_sparse_attention registered scores raw': 8,
          'kpool_sparse_attention registered scores policy': 32,
          'lightning_attention registered scores raw': 8, 'lightning_attention registered scores policy': 8,
@@ -115,22 +115,24 @@ def _right_padded(model, params, contexts, width: int, positions=None, progress:
 def row_logits(model, params, prompt, lengths, tokens, positions=None, progress: Progress = END):
     """Each row's logits for its drawn `tokens`, from full forwards over every row's unpadded tokens,
     right-padded as a learner scores a batch of rollouts, at `positions` where given (a row each, the
-    prompt's and the tokens', continued past the row's end). The first token's are a forward over the
-    prompts alone at the prompt batch's width, the shapes the cached prefill computes them at, so a GPU
-    picks each product's kernel as it does there; the later tokens' are one forward over each prompt and
-    the tokens drawn before it, at its longest row, each at the run's `progress`. A cached decode step
-    projects one token a row, ROWS
-    of them, where that forward projects every token of a row, ROWS x (prompt + step), so the later
-    steps' ratio holds what a GPU's kernel for each shape rounds apart too: on an A100, kpool's at 1.35 and
-    1.26 (row 1543, a float32 dot's error by the rows cuBLAS's kernel takes, 1.5e-7 to 4.1e-7 at K=512).
-    In the model's dtype: an array a row, a step each."""
+    prompt's and the tokens', continued past the row's end), each at the run's `progress`: a step's
+    reference at the shapes the step computes (ledger 1543, the gate's ruling). The first token's are a
+    forward over the prompts alone at the prompt batch's width, the shapes the cached prefill computes
+    them at, so a GPU picks each product's kernel as it does there; each later token's, step `s`'s, a
+    forward of its own over each prompt and the `s` tokens drawn before it, at the width
+    (`prompt + s`) the step's attention reads, where one forward at the longest row would compute every
+    step's products at that one row count, which a GPU's kernel rounds apart by M (row 1543: kpool's
+    decode at 1.35 and 1.26 on an A100, a float32 dot's error 1.5e-7 to 4.1e-7 at K=512 by the rows
+    cuBLAS's kernel takes). In the model's dtype: an array a row, a step each."""
     width, lengths = prompt.shape[1], np.asarray(lengths)
     prompts = [prompt[row, width - length:] for row, length in enumerate(lengths)]
-    contexts = [np.concatenate([alone, tokens[row, :-1]]) for row, alone in enumerate(prompts)]
     first = _right_padded(model, params, prompts, width, positions, progress)
-    later = _right_padded(model, params, contexts, max(len(context) for context in contexts), positions,
-                          progress)
-    return [jnp.concatenate([first[row, length - 1:length], later[row, length:length - 1 + tokens.shape[1]]])
+    steps = [first]
+    for step in range(1, tokens.shape[1]):
+        contexts = [np.concatenate([alone, tokens[row, :step]]) for row, alone in enumerate(prompts)]
+        steps.append(_right_padded(model, params, contexts, width + step, positions, progress))
+    return [jnp.concatenate([held[row, length - 1 + step:length + step]
+                             for step, held in enumerate(steps)])
             for row, length in enumerate(lengths)]
 
 

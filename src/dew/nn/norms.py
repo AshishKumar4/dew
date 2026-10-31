@@ -272,6 +272,26 @@ class RMSNorm(nn.Module):
         return stream, normed.reshape(stream.shape)
 
 
+class OffsetLayerNorm(nn.Module):
+    """A LayerNorm whose weight is stored as its offset from one, zero at initialization: the input
+    normalized by torch's exact variance in fp32 (flax's `nn.LayerNorm`), times (1 + `scale`), plus
+    `bias` (MaxText's `Gpt3LayerNorm`, maxtext/models/gpt3.py, PaxML's layer norm)."""
+
+    epsilon: float = 1e-5
+    use_bias: bool = True
+    dtype: Dtype | None = None
+
+    @nn.compact
+    def __call__(self, x: jax.Array) -> jax.Array:
+        normed = nn.LayerNorm(epsilon=self.epsilon, use_scale=False, use_bias=False, use_fast_variance=False,
+                              dtype=self.dtype, name="normalized")(x)
+        scale = self.param("scale", nn.initializers.zeros, (x.shape[-1],), jnp.float32)
+        y = normed * (1 + scale.astype(normed.dtype))
+        if self.use_bias:
+            y = y + self.param("bias", nn.initializers.zeros, (x.shape[-1],), jnp.float32).astype(y.dtype)
+        return y
+
+
 class LayerNorm(nn.remat(nn.LayerNorm, policy=jax.checkpoint_policies.nothing_saveable)):
     """flax's `nn.LayerNorm`, rematerialized saving nothing: its backward pass keeps the input as
     it arrived and its parameters, not the two fp32 copies flax's own differentiation keeps

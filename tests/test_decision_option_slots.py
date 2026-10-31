@@ -126,7 +126,7 @@ def ragged() -> list[Example]:
 OPTION_SEEDS = 512
 """The compacted-options site's declared draws, the larger of two sizings by `seeds_for` paired, with its
 confirming block, on armada over two streams of draws, 256 and 512 (run-tests rows-memory-probe14-462cd0cea),
-as docs/design/testing.md's check 1 rules (d28b1c318); both arms read the same head, states and cotangent,
+as docs/design/testing.md's check 1 rules (6eafb57ba); both arms read the same head, states and cotangent,
 so their upstream rounding is shared. The head's scalar parameters, the prior's logit scale among them,
 take their gradient's error from one sum over every option, whose ratio to the reference's varies widely
 from draw to draw. The site took 190.1 s at it."""
@@ -242,7 +242,7 @@ def test_a_ragged_batch_trains_on_compacted_options_as_on_the_grid():
         raise AssertionError(f"no candidate of seed {seed} has its scorer gap above {SCORER_MARGIN}")
 
     on_grid = scored(objective, grid)
-    # The truth of the algebraic zeros is exactly zero, which each of their rows is held to.
+    # A leaf zero by algebra cancels in its sum, which the check sizes by the terms it adds (`terms`).
     assert_as_exact(scored(objective, compact), on_grid, draw, "compacted options logits and gradients",
                     seeds=OPTION_SEEDS, truth_fn=on_grid, terms=True)
 

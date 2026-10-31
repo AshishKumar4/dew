@@ -15,11 +15,11 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from run_kinds import TINY_LAYA, decision, diffusion, lm, scalars, trained
 from test_block_sft import assert_tree_equal
 from test_eval_harness import instance
 from test_lm_recipe import SEQ, export_tiny_decoder, recipe_args, write_token_files
 from test_run_option_matrix import recorded
-from test_run_options import TINY_LAYA, decision, diffusion, lm, scalars, trained
 
 from dew.checkpoints import Checkpoints
 from dew.cli.main import main
