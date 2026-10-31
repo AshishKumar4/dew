@@ -53,9 +53,10 @@ class Inspection:
     targets: tuple[Target, ...] = ("params", "grads", "updates", "deltas")
     every: int = 100
     modules: tuple[str, ...] = ()
-    """Module kinds whose outputs a sampled step summarizes, by class-name glob (`*Attention`, `MLP`):
-    each call's output, its first array where it returns several, one summary a layer in a scanned
-    stack (`dew.nn.inspection.watching`), logged as `inspect/activations/<module path>/<statistic>`."""
+    """Modules whose outputs a sampled step summarizes, by a glob of their class name (`*Attention`, `MLP`)
+    or their path (`layers_3/*`): each call's output, its first array where it returns several, one
+    summary a layer in a scanned stack (`dew.nn.inspection.watching`), logged as
+    `inspect/activations/<module path>/<statistic>`."""
     histogram: bool = False
     """Whether each summary also holds the share of its magnitudes in each decade
     (`dew.nn.inspection.HISTOGRAM_EDGES`), logged one scalar a bin."""

@@ -50,17 +50,18 @@ variable, so it never collides with a module's own (a DiT's `output` head)."""
 
 
 @contextlib.contextmanager
-def watching(kinds: tuple[str, ...], *, histogram: bool = False) -> Iterator[None]:
-    """Within the block, each module whose class name a glob of `kinds` matches (`*Attention`, `MLP`)
-    sows its output's summary (`statistics`) into `INSPECTED` where its apply opened it, under `SOWN`,
-    the latest call's where a module runs more than once. A module whose output is no single
-    array (a tuple, a cache) sows its first array's. Nothing is sown where the apply opened no such
-    collection, as a module sows nothing into a collection it cannot write."""
+def watching(modules: tuple[str, ...], *, histogram: bool = False) -> Iterator[None]:
+    """Within the block, each module whose class name or path (`layers_3/attn`) a glob of `modules` matches
+    (`*Attention`, `MLP`, `layers_3/*`) sows its output's summary (`statistics`) into `INSPECTED` where
+    its apply opened it, under `SOWN`, the latest call's where a module runs more than once. A module
+    whose output is no single array (a tuple, a cache) sows its first array's. Nothing is sown where the
+    apply opened no such collection, as a module sows nothing into a collection it cannot write."""
     def interceptor(next_fun, args, kwargs, context):
         output = next_fun(*args, **kwargs)
         module = context.module
+        names = (type(module).__name__, "/".join(module.path))
         if context.method_name != "__call__" or not any(
-                fnmatch.fnmatchcase(type(module).__name__, kind) for kind in kinds):
+                fnmatch.fnmatchcase(name, glob) for glob in modules for name in names):
             return output
         if not module.is_mutable_collection(INSPECTED):
             return output
@@ -89,8 +90,8 @@ def flattened(inspected: Mapping) -> dict[str, jax.Array]:
 
 @dataclasses.dataclass(frozen=True)
 class Watched:
-    """The activations a sampled step watches (`dew.training.inspection.Inspection.modules`): the module
-    kinds by class-name glob, and whether each summary holds a histogram."""
+    """The activations a sampled step watches (`dew.training.inspection.Inspection.modules`): the modules
+    by a glob of their class name or path (`watching`), and whether each summary holds a histogram."""
 
-    kinds: tuple[str, ...]
+    modules: tuple[str, ...]
     histogram: bool = False

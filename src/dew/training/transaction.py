@@ -173,8 +173,8 @@ def watched_activations(watched: Watched, aux: Aux) -> dict[str, jax.Array]:
                          "calls do not return: they open Step.sown() and return what it sowed "
                          "(Aux.inspected)")
     if not jax.tree.leaves(aux.inspected):
-        raise ValueError(f"no module of the watched kinds {list(watched.kinds)} runs in the objective's "
-                         f"model; name them by class (`*Attention`, `MLP`)")
+        raise ValueError(f"no module the watched globs {list(watched.modules)} name runs in the objective's "
+                         f"model; name them by class (`*Attention`, `MLP`) or path (`layers_3/*`)")
     return flattened(aux.inspected)
 
 
