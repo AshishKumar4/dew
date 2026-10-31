@@ -3,6 +3,7 @@
 import dataclasses
 import importlib
 import json
+from collections.abc import Mapping
 from pathlib import Path
 
 import jax
@@ -895,3 +896,23 @@ def test_a_token_stores_documents_are_the_records_its_producer_wrote(tmp_path, e
     assert [row["text"].tolist() for row in read] == [[1, 2, 0, 3], [4, 5], [6, 7, 8, 9]]
     packed = store.pipe(presets.lm, None, seq_len=3, batch=2)
     assert next(iter(packed))["text"].shape == (2, 4)
+    # A plan a Dew that read these documents by their EOS saved counts positions in other documents under
+    # the same files: its source names no reading of them, so an exact resume refuses it.
+    plan = compile(Pipeline(store).batch(2), read="indexed", loading=Loading(workers=0)).plan
+    earlier = dataclasses.replace(plan, manifest=dataclasses.replace(
+        plan.manifest, source=read_by_eos(plan.manifest.source)))
+    assert earlier.manifest.source != plan.manifest.source
+    assert plan.check(plan.record()) == ()
+    with pytest.raises(ValueError):
+        plan.check(earlier.record())
+
+
+def read_by_eos(value):
+    """`value`, a plan's source, with each token store named as a Dew that read its documents by their
+    EOS named it, without `documents`."""
+    if isinstance(value, Mapping):
+        return {name: read_by_eos(each) for name, each in value.items()
+                if not (value.get("store") == "tokens" and name == "documents")}
+    if isinstance(value, list | tuple):
+        return [read_by_eos(each) for each in value]
+    return value

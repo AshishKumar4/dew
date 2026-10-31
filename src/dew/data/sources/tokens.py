@@ -203,7 +203,8 @@ class TokenFiles(Dataset):
         """Tokens and metadata, by the export's committed manifest and the files it names, each by its
         content and place in the manifest, not the name its writer gave it (`export_content`), so two
         exports of the same documents agree: the documents are the producer's records, which its length
-        index states. The keys an export's fingerprint has always had (`_SPLIT`)."""
+        index states, as `documents` names them, so a plan an earlier reading of them (by EOS) counted
+        positions in is not this source's. The keys an export's fingerprint has always had (`_SPLIT`)."""
         store, _ = Store(self.url, self.storage_options).resolve()
         # A local store is named by its content, so hosts that mounted it at different paths agree.
         place = {} if local(store) else {"url": self.url}
@@ -219,6 +220,7 @@ class TokenFiles(Dataset):
             "index": None,
             "shard_rows": None,
             "producer": export_content(self.committed),
+            "documents": "records",
         }
 
     def supports(self, read: Read) -> bool:
