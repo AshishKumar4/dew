@@ -493,12 +493,12 @@ WINDOW_GRADIENT_SEEDS = 8
 failed 24 of 24)."""
 
 
-WINDOW_STACKED = 32
+WINDOW_STACKED = 8
 """The draws of windows each draw of their gradients stacks (`stacked_windows`): an embedding row or a
 level's column a draw's few windows touch is hit by a token or two, its error one Gaussian or two a draw,
 heavy-tailed past the pooled interval's reach (ledger 2469: 6.5 at `embed_tokens` and `continuum.up`).
-Stacked, a draw holds 32 draws' windows, its spread 1 / sqrt(32) as wide, each window's geometry its
-own."""
+Stacked, a draw holds 8 draws' windows, paired window by window (`assert_as_exact`'s `examples`), each
+window's geometry its own."""
 
 
 def stacked_windows(kind: str, seed: int) -> tuple:
@@ -587,7 +587,7 @@ def test_each_windows_gradient_from_its_level_is_the_literal_loops(kind):
 
     assert_as_exact(arm(dew), arm(reference(truth=False)), lambda seed: stacked_windows(kind, seed),
                     f"each window's gradient from its float64 level over {kind}", seeds=WINDOW_GRADIENT_SEEDS,
-                    truth_fn=arm(reference(truth=True)))
+                    truth_fn=arm(reference(truth=True)), examples=True)
 
 
 def test_a_level_at_its_start_is_the_identity():

@@ -159,14 +159,14 @@ def assert_updates_as_the_objective(obj, twin, batch, data, run_key, variables, 
     assert_the_runs_path_takes_the_trainers_update(obj, batch, data, run_key, variables)
 
 
-STACKED = 32
+STACKED = 16
 """The examples each draw of the trainer's gradient stacks (`stacked`), each its own weights and batch: a
 norm's scale or a layer's scalar sums its gradient over every token, one value an example, whose error
 is one Gaussian a draw, its log squared error spread pi / sqrt(2) wide, so two arms' ratio of it is a
 Cauchy no count of draws within MOST_SEEDS resolves (ledger 2469: 2.17 to 2.31 measured,
 tmp/Gate/sizing/noise-2469.json). Stacked, every leaf holds a row an example, its error a draw's mean
-of them, its spread 1 / sqrt(32) as wide: about 0.34 where eight left the noisiest leaves at 0.5 to
-0.67, inside the gate's 0.40 (`typical`). Each example keeps the site's geometry, its rows and shapes."""
+of them, paired example by example (`assert_as_exact`'s `examples`), each draw's median spread inside
+the gate's 0.40. Each example keeps the site's geometry, its rows and shapes."""
 
 
 def stacked(fn, *, given: bool = False):
@@ -203,7 +203,7 @@ def assert_the_objectives_gradient(obj, twin, batch, run_key, variables, seeds: 
     # The producer marks its options-bearing jit as given, so the gate never nests it (row 1800).
     assert gradient.as_given
     assert_as_exact(stacked(trained, given=True), stacked(gradient, given=True), draw, "trainer update",
-                    seeds=seeds, truth_fn=stacked(float64_gradient(twin, step)))
+                    seeds=seeds, truth_fn=stacked(float64_gradient(twin, step)), examples=True)
 
 
 def assert_the_runs_path_takes_the_trainers_update(obj, batch, data, run_key, variables):
