@@ -5,25 +5,21 @@ a lettered one, a block-diffusion run over a nested decoder, a run on the exampl
 bfloat16 and in float16 (whose loss a dynamic scale scales), and a run over a source stored as it states."""
 
 import dataclasses
-import json
-import os
-import subprocess
-import sys
 from pathlib import Path
 
 import numpy as np
-import test_run_options as run_options
+import process_support
+import run_kinds
+from run_kinds import KINDS, decision, lm, read, requested
 from test_lm_recipe import SEQ, write_token_files
-from test_run_options import KINDS, decision, lm, read
 
 from dew.config import RunConfig, SourceOptions, TrainerConfig
 from dew.data import presets
 from dew.data.sources.tokens import TokenFiles
-from dew.decision import Choice
 from dew.decision.layout import built_in
 from dew.decision.task import Decide
 from dew.inference.images import TextToImage
-from dew.inference.tasks import BlockGeneration, TextGeneration
+from dew.inference.tasks import BlockGeneration, MaskedGeneration, TextGeneration
 from dew.nn.precision import numerics_of
 from dew.registry import ModelConfig
 from dew.training.budget import Pause
@@ -66,14 +62,14 @@ def segmented(root: Path, drawn: bool) -> RunConfig:
 
 
 def lettered(root: Path, drawn: bool) -> RunConfig:
-    """`test_run_options.lettered`'s fresh letter readout, its source by its path in the repo."""
-    return dataclasses.replace(run_options.lettered(root, drawn), pretrained=QWEN)
+    """`run_kinds.lettered`'s fresh letter readout, its source by its path in the repo."""
+    return dataclasses.replace(run_kinds.lettered(root, drawn), pretrained=QWEN)
 
 
 def blockwise(root: Path, drawn: bool) -> RunConfig:
-    """`test_run_options.blockwise`'s block-diffusion run over a release whose text decoder its model nests,
+    """`run_kinds.blockwise`'s block-diffusion run over a release whose text decoder its model nests,
     its release and tokenizer, its token files' too, by their path in the repo."""
-    return run_options.blockwise(root, drawn, release=DIFFUSION_GEMMA)
+    return run_kinds.blockwise(root, drawn, release=DIFFUSION_GEMMA)
 
 
 def clocked(root: Path, drawn: bool) -> RunConfig:
@@ -117,41 +113,33 @@ def computed(directory: Path | str, step: int | None = None) -> dict[str, list[s
     suite's CPU's, in the suite's environment, whose wide arithmetic multiplies a product summed in
     float32 in float64 (`dew.nn.precision.accumulated`); an accelerator lowers its own (bible §7 runs
     these files on the CPU)."""
-    root = Path(__file__).resolve().parents[1]
-    environment = {**os.environ, "PYTHONPATH": os.pathsep.join(
-        [str(root / "src"), *filter(None, [os.environ.get("PYTHONPATH")])])}
     # A record names the repo's sources by their path in it, read from the checkout's root.
-    done = subprocess.run([sys.executable, str(Path(__file__).with_name("saved_run_products.py")),
-                           str(directory), *([] if step is None else [str(step)])], cwd=root,
-                          env=environment, capture_output=True, text=True, timeout=600, check=False)
-    assert done.returncode == 0, done.stderr[-3000:]
-    found = json.loads(done.stdout.splitlines()[-1])
+    found = process_support.fresh(Path(__file__).with_name("saved_run_products.py"), str(directory),
+                                  *([] if step is None else [str(step)]), cwd=process_support.REPO_ROOT)
     assert found, "the request lowered no matrix product"
     return found
 
 
 def answered(task) -> None:
-    """One request of a loaded task, as its kind's users make it, and its answer: a language model
-    continues a prompt by one token through the tokenizer its run recorded, a decision answers a
-    question about a state, and a text-to-image run draws an image in one step."""
+    """One request of a loaded task, as its kind's users make it (`run_kinds.requested`), and its answer:
+    a language model continues a prompt through the tokenizer its run recorded, a block or masked
+    generation steps its decoder past the prompt, a decision answers a question about a state with one
+    of its options, and a text-to-image run draws an image."""
+    answer = requested(task)
     if isinstance(task, TextGeneration):
-        assert len(task.decode(task("ab", max_new_tokens=1, key=0))) == 1
-    elif isinstance(task, BlockGeneration):
-        # A response of at least one token past the prompt, its decoder having stepped.
-        generated = task([[4, 5, 6, 7]], 4, key=0).host()
-        assert (np.asarray(generated.lengths) > 0).all() and (np.asarray(generated.decoder_steps) > 0).all()
+        assert task.decode(answer)
+    elif isinstance(task, MaskedGeneration | BlockGeneration):
+        generated = answer.host()
+        assert (np.asarray(generated.lengths) > 0).all()
     elif isinstance(task, Decide):
-        question = {"team": Choice("which team", ["billing", "technical", "sales"])}
-        [answers] = task([({"text": "the site is down"}, question)])
+        [answers] = answer
         assert answers["team"].choice in ("billing", "technical", "sales")
     elif isinstance(task, TextToImage):
-        assert len(task(["a cat"], steps=1, key=0).pil()) == 1
-    else:
-        raise AssertionError(f"no request is written for a saved {type(task).__name__}")
+        assert len(answer.pil()) == 1
 
 
 SAVED_KINDS = {**KINDS, "multimodal": multimodal, "decision-segments": segmented,
                "decision-lettered": lettered, "block-diffusion": blockwise, "lm-examples": clocked,
                "lm-bf16": fresh, "lm-float16": scaled, "lm-scaled": chosen_scale, "lm-stored": stored}
-"""Each kind the corpus saves a run of: every run kind (`test_run_options.KINDS`), an LM run whose decoder
+"""Each kind the corpus saves a run of: every run kind (`run_kinds.KINDS`), an LM run whose decoder
 its source's model nests, and each serialized variant beside them."""

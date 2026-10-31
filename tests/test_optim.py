@@ -300,7 +300,7 @@ def test_a_run_saved_with_a_newton_schulz_level_loads_with_its_dot_algorithm(rec
     that level's dot algorithm (`config.earlier_newton_schulz`): bfloat16 the run's numerics' own in their
     fast forms, none stated, and stated where the run's forms are accurate, whose own is float32 (row
     2753); tensorfloat32 and float32 their algorithms, whose Muon builds."""
-    from test_run_options import lm
+    from run_kinds import lm
 
     from dew.config import RunConfig
     from dew.nn.precision import ACCURATE
