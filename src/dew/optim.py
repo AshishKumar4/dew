@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import dataclasses
 import fnmatch
+import functools
 import glob
 import inspect
 import json
@@ -603,21 +604,29 @@ POST_STEP = (QKClipState, BoundsState)
 """The optimizer states whose effect acts on the weights an update moved (`stepped`)."""
 
 
-_HELD_BACK = (optax.MultiStepsState, type(optax.apply_every().init(())))
-"""The states of the optimizers that hold their updates back over calls, applying none on most:
-`optax.MultiSteps`', and `optax.apply_every`'s, whose type optax names only through its state."""
+@functools.cache
+def _held_back() -> tuple[type, ...]:
+    """The states of the optimizers that hold an update back on some calls, applying none:
+    `optax.MultiSteps`' and `optax.apply_every`'s over calls, `optax.conditionally_mask`'s where its
+    condition fails, `optax.apply_if_finite`'s on a non-finite update. Optax names `apply_every`'s type
+    only through its state, made here abstractly, so no backend opens."""
+    every = jax.eval_shape(optax.apply_every().init, ())
+    return optax.MultiStepsState, type(every), optax.ConditionallyMaskState, optax.ApplyIfFiniteState
 
 
 def refuse_held_back(opt_state: optax.OptState) -> None:
-    """Refuse an optimizer, by its state `opt_state`, that holds its updates back over calls, alone or
-    within a chain (`_HELD_BACK`): a call it holds back moves no weight, which the trainer, counting each
-    call an update, would count as one, moving its average, an objective's post-step effects and its
-    committed tokens (row 1870). The trainer's window accumulates gradients instead."""
-    held = jax.tree.leaves(opt_state, is_leaf=lambda node: isinstance(node, _HELD_BACK))
-    if any(isinstance(node, _HELD_BACK) for node in held):
-        raise ValueError("the optimizer holds its updates back over calls (optax.MultiSteps, "
-                         "optax.apply_every), which the run would count as updates; accumulate "
-                         "gradients with Trainer(accumulation=k), whose window applies one update")
+    """Refuse an optimizer, by its state `opt_state`, that holds an update back on some calls, alone or
+    within a chain (`_held_back`): a call it holds back moves no weight, which the trainer's
+    transaction, counting each call an update, would count as one, moving its average, an objective's
+    post-step effects and its committed tokens (row 1870). The trainer's window accumulates gradients,
+    and its own check rejects a non-finite update."""
+    kinds = _held_back()
+    held = jax.tree.leaves(opt_state, is_leaf=lambda node: isinstance(node, kinds))
+    if any(isinstance(node, kinds) for node in held):
+        raise ValueError("the optimizer holds an update back on some calls (optax.MultiSteps, apply_every, "
+                         "conditionally_mask, apply_if_finite), which the run would count as updates; "
+                         "accumulate gradients with Trainer(accumulation=k), whose window applies one "
+                         "update, and leave a non-finite update to the trainer, which rejects it")
 
 
 def stepped(params, updates, before, after):

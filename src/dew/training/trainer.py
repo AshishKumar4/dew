@@ -107,7 +107,7 @@ from dew.objectives.base import (
     TrainingScalar,
     taken_record,
 )
-from dew.optim import held_rates, learning_rate, refuse_held_back, scaled_rates, settable_rates, with_rates
+from dew.optim import held_rates, learning_rate, scaled_rates, settable_rates, with_rates
 from dew.state import MODEL_STATE, Accumulation, TrainState, apart, drawn_in, kept_window, together
 from dew.telemetry import profile as telemetry_profile
 from dew.telemetry.instrumentation import StepFlops
@@ -496,9 +496,7 @@ class Trainer(Generic[Loss, Effects]):
         """The optimizer's state of `params`, Muon's grouping reading the axes
         modules boxed on them in `initialized`."""
         with boxed(ruled_boxes(boxed_axes(initialized), self.layout.axis_rules)):
-            state = self.optimizer.init(params)
-        refuse_held_back(state)
-        return state
+            return self.optimizer.init(params)
 
     def _groups(self, state: TrainState) -> dict[str, str] | None:
         """Where the optimizer's split sent each parameter (`OptimConfig.groups`), read under the axes the

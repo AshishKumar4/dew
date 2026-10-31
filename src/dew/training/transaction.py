@@ -44,7 +44,7 @@ from dew.objectives.base import (
     recorded_metrics,
     with_projected,
 )
-from dew.optim import clips_qk, stepped
+from dew.optim import clips_qk, refuse_held_back, stepped
 from dew.state import Accumulation, TrainState, apart, together
 from dew.training.inspection import Inspection, summaries
 from dew.training.model_flops import _TokenCount, step_counts
@@ -598,6 +598,9 @@ class Transaction:
         Admission is decided by finish_attempt after checking the updated
         parameters and optimizer state as well.
         """
+        # Each call commits one update, which every clock counts: an optimizer that applies none on some
+        # calls is refused as the step is traced, before any runs.
+        refuse_held_back(current.opt_state)
         native = jax.tree.map(_descending, gradient, current.variables["params"])
         native_finite = _all_finite(native)
         norm = optax.global_norm(native)
