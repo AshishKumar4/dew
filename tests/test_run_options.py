@@ -23,13 +23,16 @@ import inspect
 import json
 import types
 import typing
+from collections.abc import Mapping
 from pathlib import Path
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
 from objective_data import IMAGES
 from test_lm_recipe import SEQ, write_token_files
+from token_support import write_token_corpus
 
 from dew import registry
 from dew.batch import FROZEN
@@ -42,7 +45,8 @@ from dew.data import TFDS, Files, Loading, images as image_steps, presets
 from dew.data.pipeline import Rejected
 from dew.data.sources.tokens import TokenFiles
 from dew.decision import decisions
-from dew.decision.config import DecisionRunConfig
+from dew.decision.config import DecisionRunConfig, Letters
+from dew.decision.layout import Labels, QuestionSegment, Reads, built_in
 from dew.diffusion.presets import Flow
 from dew.inputs import TextCondition
 from dew.lora import LoRA
@@ -54,6 +58,8 @@ from dew.training.evaluation import Summary
 pytestmark = pytest.mark.mesh
 
 TINY_LAYA = Path(__file__).parent / "fixtures" / "laya" / "tiny"
+QWEN_TINY = Path(__file__).parent / "fixtures" / "hf" / "qwen38-dense-tiny"
+DIFFUSION_GEMMA = Path(__file__).parent / "fixtures" / "hf" / "diffusion-gemma-sft"
 RATE = 0.0123
 """A learning rate no kind takes by default, which the run's optimizer logs as it steps."""
 
@@ -301,6 +307,23 @@ def masked(root: Path, drawn: bool) -> RunConfig:
                                max_new_tokens=0)
 
 
+def dreamed(root: Path, drawn: bool, release: str = "dream") -> RunConfig:
+    """A masked-diffusion run over a Dream `release` (dream-tiny as it ships, `test_dream_walk.snapshot`,
+    under `root / release`), its walk the release's own, its grid's endpoint among it (ledger 2563), over
+    token files in the release's tokenizer."""
+    from test_dream_walk import snapshot
+
+    source = snapshot(release, root)
+    corpus = write_token_corpus(root / "dream-tokens", np.random.RandomState(0).randint(4, 100, 400),
+                                tokenizer=str(source), vocab_size=128, eos_id=1)
+    data = TokenFiles(corpus.train).pipe(presets.lm, None, seq_len=11, batch=8, pack=None).loading(
+        Loading(workers=0))
+    model = ModelConfig("causal_transformer", {"dtype": "float32", "attention_impl": "reference"})
+    return dataclasses.replace(lm(root, drawn), data=data, validation=None, pretrained=str(source),
+                               tokenizer=str(source), model=model, max_new_tokens=0,
+                               objective=ObjectiveConfig("masked_diffusion"))
+
+
 def members_of(annotation: type, base=None) -> list[object]:
     """The values of Dew's classes that are `annotation`s: every member of a registry kind
     (`registry.KINDS`) and every class its package exports (`dew.sampling`'s CFG, APG, ...) that derives
@@ -334,20 +357,29 @@ def members_of(annotation: type, base=None) -> list[object]:
     return values
 
 
+WITNESSES = {Reads: (Reads((("row", "self", "whole"),)), Reads((("row", "self", "causal"),))),
+             tuple[QuestionSegment, ...]: (built_in(None, "question_first"),)}
+"""Values of Dew's classes that build from no defaults, and of tuples of them, each one a run here trains
+with: a row's reads of its streams (`Reads`), here its one stream reading its whole document both ways,
+or up to each token (a bidirectional backbone's rows read so apart), and a question layout's own row
+written as its segments (`built_in`)."""
+
+
 def members_built(member: type) -> list[object]:
-    """`member` built from its defaults, where it has them."""
+    """`member` built from its defaults, where it has them, else its `WITNESSES`."""
     try:
         return [member()]
     except (TypeError, ValueError):
-        return []
+        return list(WITNESSES.get(member, ()))
 
 
 def alternatives(annotation, base=None) -> list[object]:
     """The values `annotation` declares as alternatives, in its order: a literal's values, a flag's two, an
-    optional's None and its member's, Dew's classes that are one (`members_of`), and a dataclass's
-    instances: `base`, the value a run saved, with one of its fields changed to each of that field's
-    alternatives, or, with no base, built over its fields' alternatives. A plain number or text declares
-    none, nor a record (a union holding a mapping or a list), whose values are its writer's."""
+    optional's None and its member's (an optional number's beside the saved one), Dew's classes that are
+    one (`members_of`), and a dataclass's instances: `base`, the value a run saved, with one of its fields
+    changed to each of that field's alternatives, or, with no base, built over its fields' alternatives. A
+    plain number or text declares none, nor a record (a union holding a mapping or a list), whose values
+    are its writer's."""
     if isinstance(annotation, typing.TypeAliasType):
         return alternatives(annotation.__value__, base)
     origin = typing.get_origin(annotation)
@@ -357,31 +389,43 @@ def alternatives(annotation, base=None) -> list[object]:
         return list(typing.get_args(annotation))
     if annotation is bool:
         return [False, True]
+    if origin is tuple:
+        return list(WITNESSES.get(annotation, ()))
     if origin in (types.UnionType, typing.Union):
-        members = typing.get_args(annotation)
-        if any(typing.get_origin(member) in (dict, list, typing.Mapping) or member in (dict, list)
-               for member in members):
+        if record(annotation):
             return []
+        members = typing.get_args(annotation)
         found = []
         for member in members:
-            values = [None] if member is type(None) else [1] if member is int else alternatives(member, base)
+            # A count's witnesses: one, two, where one is a block no wider than causal reading (a prefix
+            # of one token), and one past the saved count, which a budget that one would cut to nothing
+            # takes (a layout's option tokens); a number's, a half and twice the saved one.
+            counts = [1, 2, *([base + 1] if type(base) is int else [])]
+            numbers = [0.5, *([base * 2] if type(base) is float else [])]
+            values = ([None] if member is type(None) else counts if member is int
+                      else numbers if member is float else alternatives(member, base))
+            if typing.get_origin(member) is tuple:
+                values = [value for value in values if value != base]
             if dataclasses.is_dataclass(member) and not isinstance(base, member):
                 values = [*members_built(member), *values]
             found += [value for value in values if value not in found]
         return found
     if dataclasses.is_dataclass(annotation) and isinstance(annotation, type):
-        hints = typing.get_type_hints(annotation)
-        fields = [field.name for field in dataclasses.fields(annotation) if field.init]
         if isinstance(base, annotation):
-            # The saved value with one field changed, each field's alternatives in turn.
+            # The saved value with one field changed, each field's alternatives in turn: the fields of
+            # its own class, a subclass's beside the annotation's.
+            saved = type(base)
+            hints = typing.get_type_hints(saved)
             changed = []
-            for name in fields:
+            for name in (field.name for field in dataclasses.fields(saved) if field.init):
                 for value in alternatives(hints[name], getattr(base, name)):
                     try:
                         changed.append(dataclasses.replace(base, **{name: value}))
                     except (TypeError, ValueError):
                         continue
             return [base, *(value for value in changed if value != base)]
+        hints = typing.get_type_hints(annotation)
+        fields = [field.name for field in dataclasses.fields(annotation) if field.init]
         declared = {name: alternatives(hints[name]) for name in fields}
         declared = {name: values for name, values in declared.items() if len(values) > 1}
         try:
@@ -393,6 +437,28 @@ def alternatives(annotation, base=None) -> list[object]:
     if isinstance(annotation, type) and annotation.__module__.startswith("dew."):
         return members_of(annotation, base)
     return []
+
+
+def record(annotation) -> bool:
+    """Whether `annotation` is a record's: a union holding a mapping or a list, whose values its writer's
+    are."""
+    if isinstance(annotation, typing.TypeAliasType):
+        return record(annotation.__value__)
+    if typing.get_origin(annotation) is typing.Annotated:
+        return record(typing.get_args(annotation)[0])
+    return typing.get_origin(annotation) in (types.UnionType, typing.Union) and any(
+        typing.get_origin(member) in (dict, list, typing.Mapping) or member in (dict, list)
+        for member in typing.get_args(annotation))
+
+
+def dews(annotation) -> bool:
+    """Whether `annotation` names one of Dew's types anywhere within it: alone, in a union, an alias or a
+    container's arguments (a tuple of a layout's segments)."""
+    if isinstance(annotation, typing.TypeAliasType):
+        return dews(annotation.__value__)
+    if isinstance(annotation, type) and typing.get_origin(annotation) is None:
+        return annotation.__module__.startswith("dew.")
+    return any(dews(argument) for argument in typing.get_args(annotation) if argument is not Ellipsis)
 
 
 def bare(annotation):
@@ -440,10 +506,24 @@ def builds(annotation, option) -> bool:
     return any(isinstance(member, type) and bare(option) in made(member) for member in members)
 
 
-def reach(run: RunConfig, objective: str, name: str, annotation) -> Reach | None:
+def holds(field, option) -> bool:
+    """Whether a run's field of type `field` takes an option of type `option`: the same type, or a tuple
+    whose items' kinds hold the option's items' (a run's row segments a question layout's)."""
+    if field == option:
+        return True
+    if typing.get_origin(field) is not tuple or typing.get_origin(option) is not tuple:
+        return False
+    def kinds(annotation) -> set:
+        item = typing.get_args(annotation)[0]
+        item = item.__value__ if isinstance(item, typing.TypeAliasType) else item
+        return set(typing.get_args(item) or (item,))
+    return kinds(option) <= kinds(field)
+
+
+def reach(run: RunConfig, objective: str, name: str, annotation, argument: bool = True) -> Reach | None:
     """Where `dew train` sets a saved task's option `name` of `annotation`: a field of the run, or of a
     section it holds, declared of that type (a number or a text's of that name) or a builder of it
-    (`builds`), else its objective's argument of that name; None where it has none."""
+    (`builds`), else, with `argument`, its objective's argument of that name; None where it has none."""
     # A number's or a text's field is the option's by its name; any other type's, by its type.
     named = bare(annotation) in (int, float, str, bool)
 
@@ -451,27 +531,93 @@ def reach(run: RunConfig, objective: str, name: str, annotation) -> Reach | None
         hints = typing.get_type_hints(type(config), include_extras=True)
         for field in dataclasses.fields(config):
             value, hint = getattr(config, field.name), hints[field.name]
-            if field.name == name if named else bare(hint) == bare(annotation):
+            if field.name == name if named else holds(bare(hint), bare(annotation)):
                 yield Reach(prefix + field.name, hint)
             elif not named and builds(hint, annotation):
                 yield Reach(prefix + field.name, hint, builds=True)
             elif dataclasses.is_dataclass(value) and type(value).__module__.startswith("dew.config"):
                 yield from paths(value, f"{prefix}{field.name}.")
     found = next(paths(run, ""), None)
-    if found is None and name in inspect.signature(objectives[objective]).parameters:
+    if found is None and argument and name in inspect.signature(objectives[objective]).parameters:
         return Reach(f"objective.{name}", annotation)
     return found
 
 
+@dataclasses.dataclass(frozen=True)
+class Option:
+    """An option a saved task is built with: its name in the settings, dotted where it is a field of one
+    of theirs (`layout.reads`), its alternatives (`witnessed`), where `dew train` sets it (`reach`), None
+    where nothing does, and the field that declares it."""
+
+    name: str
+    values: list[object]
+    found: Reach | None
+    field: dataclasses.Field
+
+
+def unwitnessed(kind: type, options) -> list[str]:
+    """The fields of `kind` of Dew's types (`dews`) that declare fewer than two alternatives, so no option
+    of `options` witnesses them, none declared derived from the run nor a record, its writer's."""
+    hints = typing.get_type_hints(kind)
+    return [field.name for field in dataclasses.fields(kind) if field.name not in options
+            and dews(hints[field.name]) and "derived" not in field.metadata and not record(hints[field.name])]
+
+
+def options_of(run: RunConfig, objective: str, kind: type, base, prefix: str = "") -> list[Option]:
+    """The options `base`, a `kind` a run saved, holds (`witnessed`), each where `dew train` sets it. A
+    field its class declares derived is the run's, set by no objective argument, which the run fills
+    (`ObjectiveConfig.build`); where its saved value is a dataclass the run builds from fields of its own
+    (a decision run's layout from its budgets, `_budgeted`), its options are that value's fields', each
+    reached as the run sets it. A field of Dew's types that no alternative witnesses fails."""
+    hints = typing.get_type_hints(kind)
+    fields = {field.name: field for field in dataclasses.fields(kind)}
+    declared = witnessed(kind, base)
+    missing = unwitnessed(kind, declared)
+    assert not missing, f"{kind.__name__}'s {', '.join(missing)} declares no alternative to witness it by"
+    found = []
+    for name, values in declared.items():
+        derived = "derived" in fields[name].metadata
+        # An objective's argument of the name is the settings' own option, not a field of a value the run
+        # builds (a decision objective's segments count, a layout's segments).
+        path = reach(run, objective, name, hints[name], argument=not derived and not prefix)
+        value = getattr(base, name)
+        # A derived value the run builds is itself an option the run fills (`--head`'s labels), and its
+        # fields are options of their own.
+        found.append(Option(prefix + name, values, path, fields[name]))
+        if path is None and derived and dataclasses.is_dataclass(value) and not isinstance(value, type):
+            found += options_of(run, objective, type(value), value, f"{prefix}{name}.")
+    return found
+
+
+def held_at(value, name: str):
+    """The option a dotted `name` names in `value`, a field of a field where it is dotted."""
+    for part in name.split("."):
+        value = getattr(value, part)
+    return value
+
+
+def replaced(value, name: str, option):
+    """`value` with the option a dotted `name` names in it replaced by `option`."""
+    head, _, rest = name.partition(".")
+    inner = replaced(getattr(value, head), rest, option) if rest else option
+    return dataclasses.replace(value, **{head: inner})
+
+
 def flag(value, annotation) -> str:
-    """`value` as `--set` writes it for a field of `annotation`: a record's JSON, or its text."""
+    """`value` as `--set` writes it for a field of `annotation`: a record's JSON, a tuple's values, or its
+    text."""
     if value is None or isinstance(value, bool | int | str):
         return str(value)
+    # A tuple of numbers or texts as its values in turn, as the command line reads one.
+    if isinstance(value, tuple) and all(isinstance(item, bool | int | str) for item in value):
+        return " ".join(map(str, value))
     return json.dumps(registry.to_record(value, bare(annotation)))
 
 
 def prefixed(root: Path, drawn: bool) -> RunConfig:
-    """`lm`'s run over a decoder whose attention reads a prefix's blocks, which a prefix run needs."""
+    """`lm`'s run over a decoder whose attention reads a prefix's blocks, which a prefix run needs, in two
+    layers: one alone answers a generation from the prompt's last place, which a prefix's block shows
+    nothing new, where a second reads what the block's places saw."""
     from dew.nn.backbones.causal_transformer import CausalTransformer, LayerKind
     from dew.nn.mixers.attention import AttentionMixer
 
@@ -479,17 +625,91 @@ def prefixed(root: Path, drawn: bool) -> RunConfig:
     kinds = {"blocks": LayerKind(mixer=AttentionMixer(bidirectional_blocks=True))}
     record = registry.to_record(kinds, typing.get_type_hints(CausalTransformer)["kinds"])
     return dataclasses.replace(run, model=ModelConfig("causal_transformer", {
-        **run.model.fields, "layer_types": ["blocks"], "kinds": record}))
+        **run.model.fields, "num_layers": 2, "layer_types": ["blocks", "blocks"], "kinds": record}))
 
 
-def contexted(root: Path, drawn: bool) -> RunConfig:
-    """`decision`'s run with context layers, which read a row's context as its encoder says."""
-    return dataclasses.replace(decision(root, drawn), context_layers=(0,), context_length=16)
+def state_then_question() -> tuple[QuestionSegment, ...]:
+    """The built-in question row's segments (`built_in`) with the state first and the question's header
+    straight after it, no separator between, so a state's last word and the header's first abut: a row
+    whose unit (`QuestionLayout.unit`) its tokens show."""
+    begin, header, separator, lines, _, state, end = built_in(None, "question_first")
+    return begin, state, header, separator, lines, end
 
 
-TASK_RUNS = {"TextSettings": (prefixed, "lm"), "MaskedSettings": (masked, "masked_diffusion"),
-             "ImageSettings": (diffusion, "diffusion"), "DecideSettings": (contexted, "decision")}
-"""A run here of an objective that records each saved task's settings, and the objective's name."""
+BESIDE = {"layout.framing": {"segments": built_in(None, "question_first"), "max_len": 256},
+          "layout.unit": {"segments": state_then_question(), "max_len": 256},
+          "context_encoder": {"context_layers": (0,), "context_length": 64}}
+"""What an option's reader takes it only beside, by the run's path, set with it: a framing frames a row of
+its own segments (`_budgeted`), here the question layout's own row as segments (`built_in`), in a row long
+enough for its conversation's turns; a unit encodes a row of segments, the built-in row piece by piece,
+here one whose state's text abuts its question's (`state_then_question`), where a tokenizer that merges
+"n" and "c" (`merged`'s) reads a row encoded whole as other tokens;
+a context's encoder encodes it for context layers, which read a row's context."""
+
+
+def lettered(root: Path, drawn: bool) -> RunConfig:
+    """A decision run of a fresh letter readout (`--head letters`) over a tiny causal source, its rows
+    lettered option lines read at an answer cue, the layout's labels the head's."""
+    # The tiny tokenizer spells each letter as one token bare ("{}"), not after a space.
+    return dataclasses.replace(decision(root, drawn), pretrained=str(QWEN_TINY),
+                               head=Letters(labels=Labels(variants=("{}",)), count=4),
+                               source=SourceOptions(text_only=True))
+
+
+def merged(root: Path, drawn: bool) -> RunConfig:
+    """A decision run of a fresh head over the tiny causal source with a tokenizer that merges "n" and "c"
+    (`merging_source`), where a row encoded whole and one encoded piece by piece are other tokens, which
+    its byte-level tokenizer alone never makes them."""
+    return dataclasses.replace(decision(root, drawn), pretrained=str(merging_source(root)),
+                               source=SourceOptions(text_only=True))
+
+
+def merging_source(root: Path) -> Path:
+    """The tiny Qwen source under `root`, its byte-level tokenizer given one merge, "n" and "c", in place of
+    the last byte's token (U+0143, byte 0xff), which no text here holds: a vocabulary of the model's size
+    in which a state's last word ("down") and a header's first ("choice") read whole as other tokens."""
+    import shutil
+
+    source = Path(shutil.copytree(QWEN_TINY, root / "merging-qwen", ignore=shutil.ignore_patterns(
+        "*.npy", "*.npz", "video*", "images*", "preprocessor_config.json")))
+    tokenizer = json.loads((source / "tokenizer.json").read_text())
+    vocabulary = tokenizer["model"]["vocab"]
+    vocabulary["nc"] = vocabulary.pop("Ń")
+    tokenizer["model"]["merges"] = [["n", "c"]]
+    (source / "tokenizer.json").write_text(json.dumps(tokenizer))
+    return source
+
+
+def blockwise(root: Path, drawn: bool, release: str = str(DIFFUSION_GEMMA)) -> RunConfig:
+    """A block-diffusion run over a release whose text decoder its model nests (`DiffusionGemma.text`), its
+    windows token files in the release's own tokenizer, both named as `release` names them."""
+    corpus = write_token_corpus(root / "gemma-tokens", np.random.RandomState(160).randint(4, 32, 160),
+                                tokenizer=release, vocab_size=32, eos_id=1)
+    spans = TokenFiles(corpus.train).pipe(presets.lm, None, seq_len=11, batch=8, pack=None).loading(
+        Loading(workers=0))
+    model = ModelConfig("causal_transformer", {"dtype": "float32", "attention_impl": "xla"})
+    return dataclasses.replace(lm(root, drawn), pretrained=release, tokenizer=release, model=model,
+                               data=spans, validation=None,
+                               objective=ObjectiveConfig("block_diffusion", {"prompt_length": 4}),
+                               max_new_tokens=0)
+
+
+def blocked(root: Path, drawn: bool) -> RunConfig:
+    """`decision`'s run as a fresh head over a tiny causal backbone whose full attention reads blocks
+    (`--source.attention`), whose rows a split takes, which a release's rows never are."""
+    return dataclasses.replace(decision(root, drawn), pretrained=str(QWEN_TINY), source=SourceOptions(
+        text_only=True, attention={"full_attention": "block_bidirectional"}))
+
+
+TASK_RUNS = {"TextSettings": ((prefixed, "lm"),),
+             "MaskedSettings": ((masked, "masked_diffusion"), (dreamed, "masked_diffusion")),
+             "ImageSettings": ((diffusion, "diffusion"),), "BlockSettings": ((blockwise, "block_diffusion"),),
+             "DecideSettings": ((decision, "decision"), (blocked, "decision"), (lettered, "decision"),
+                                (merged, "decision"))}
+"""The runs here of an objective that records each saved task's settings, and the objective's name: a
+decision release's, which exports, a fresh head's over a backbone that reads blocks, a fresh letter
+readout's, whose labels its layout takes, and a fresh head's over a tokenizer that merges, whose unit a row
+shows; a masked run over a release, whose walk it takes."""
 
 
 def witnessed(settings: type, base=None) -> dict[str, list[object]]:
@@ -502,13 +722,15 @@ def witnessed(settings: type, base=None) -> dict[str, list[object]]:
 
 
 SETTINGS = sorted({cls.settings for cls in (objectives[name] for name in objectives)
-                   if cls.settings is not None and witnessed(cls.settings)},
-                  key=lambda settings: settings.__name__)
+                   if cls.settings is not None}, key=lambda settings: settings.__name__)
+"""Every settings type an objective saves its task with, each one witnessed (`witnessed_on`): one whose
+options a saved value alone declares (a block process's) is collected too, and fails where none is."""
 
 
-def held(task, depth: int = 3) -> dict[str, object]:
-    """What the loaded `task` holds, by path: its attributes, and theirs where they are Dew's objects or
-    dataclasses (its model's fields), `depth` deep."""
+def held_by(task, depth: int = 3) -> dict[str, tuple[object, str]]:
+    """Where the loaded `task` holds each of its values, by path: the object and its attribute's name, for
+    its attributes, and theirs where they are Dew's objects or dataclasses (its model's fields), `depth`
+    deep."""
     found, frontier = {}, [("", task)]
     for _ in range(depth):
         following = []
@@ -517,28 +739,94 @@ def held(task, depth: int = 3) -> dict[str, object]:
                      else list(vars(value)) if type(value).__module__.startswith("dew.") else [])
             for name in names:
                 inner = getattr(value, name, None)
-                found[prefix + name] = inner
+                found[prefix + name] = (value, name)
                 if dataclasses.is_dataclass(inner) or type(inner).__module__.startswith("dew."):
                     following.append((f"{prefix}{name}.", inner))
         frontier = following
     return found
 
 
-def saved_with(run: RunConfig, root: Path, name: str, settings: type, assigned: dict[str, str]):
-    """The `settings` the task of `run` saves after one step of `dew train` with each `path=value` of
-    `assigned` set, and what the task loaded from them holds (`dew.pipeline`, `held`)."""
-    import dew
-    from dew.inference.tasks import SavedRun, saved_settings
+def held(task) -> dict[str, object]:
+    """What the loaded `task` holds, by path (`held_by`)."""
+    return {path: getattr(holder, name, None) for path, (holder, name) in held_by(task).items()}
 
+
+def requested(task) -> object:
+    """One request of a loaded task, as its kind's users make it, at the task's own defaults but a
+    generation's budget of two tokens, its answers: a decision's with a context beside its state where its
+    backbone reads one."""
+    from dew.decision import Choice
+    from dew.decision.task import Decide
+    from dew.inference.images import TextToImage
+    from dew.inference.tasks import BlockGeneration, MaskedGeneration, TextGeneration
+
+    if isinstance(task, TextGeneration):
+        return task("ab", max_new_tokens=2, key=0)
+    if isinstance(task, MaskedGeneration | BlockGeneration):
+        # Token ids, which a source with no tokenizer of its own (dream-tiny) reads too.
+        return task([[5, 17, 33, 2]], max_new_tokens=2, key=0)
+    if isinstance(task, Decide):
+        question = {"team": Choice("which team", ["billing", "technical", "sales"])}
+        # A context beside the state where the backbone's cross-attention reads one (`context_length`).
+        context = None if task.context_length is None else {"plan": "enterprise"}
+        # A state of plain text, which a row lays as written, its last word "down".
+        return task([("the site is down", question)], contexts=[context])
+    if isinstance(task, TextToImage):
+        return task(["a cat"], key=0)
+    raise AssertionError(f"no request is written for a loaded {type(task).__name__}")
+
+
+def answers(task) -> list[object]:
+    """What one request of `task` answers (`requested`), each leaf a host value, in order."""
+    def leaves(value) -> list[object]:
+        if isinstance(value, Mapping):
+            return [leaf for name in sorted(value) for leaf in leaves(value[name])]
+        if dataclasses.is_dataclass(value) and not isinstance(value, type):
+            return [leaf for field in dataclasses.fields(value)
+                    for leaf in leaves(getattr(value, field.name))]
+        if isinstance(value, list | tuple):
+            return [leaf for item in value for leaf in leaves(item)]
+        # A generation's decoder, a callback each request builds anew, is how it reads, not what it answers.
+        if callable(value):
+            return []
+        return [np.asarray(value) if isinstance(value, jax.Array | np.ndarray) else value]
+    return leaves(requested(task))
+
+
+def answered_alike(first: list[object], second: list[object]) -> bool:
+    """Whether two requests' answers (`answers`) are one: each leaf equal, an array's in shape and in
+    every entry."""
+    def alike(a, b) -> bool:
+        if isinstance(a, np.ndarray) or isinstance(b, np.ndarray):
+            return (isinstance(a, np.ndarray) and isinstance(b, np.ndarray) and a.shape == b.shape
+                    and np.array_equal(a, b, equal_nan=True))
+        return bool(a == b)
+    return len(first) == len(second) and all(alike(a, b) for a, b in zip(first, second, strict=True))
+
+
+def trained_by_cli(run: RunConfig, root: Path, name: str, assigned: dict[str, str]) -> Path:
+    """The run directory one step of `dew train` writes for `run` with each `path=value` of `assigned`,
+    its programs compiled into a cache the runs under `root` share (`compilation_cache_dir`): an option
+    that leaves the step as it was compiles nothing."""
     record, runs = root / f"{name}-record", root / "runs"
     run.save(str(record))
     given = {"trainer.name": name, "trainer.checkpoint_dir": str(runs), "trainer.steps": "1",
              "trainer.eval_every": "None", "trainer.checkpoint_every": "None",
-             "trainer.multi_host": "False", "trainer.compilation_cache_dir": "None", **assigned}
+             "trainer.multi_host": "False", "trainer.compilation_cache_dir": str(root / "compiled"),
+             **assigned}
     assert main(["train", str(record / "run.json"),
                  *(part for path, value in given.items() for part in ("--set", f"{path}={value}"))]) == 0
-    return (saved_settings(SavedRun.pinned(str(runs / name)).record, settings),
-            held(dew.pipeline(str(runs / name))))
+    return runs / name
+
+
+def saved_with(run: RunConfig, root: Path, name: str, settings: type, assigned: dict[str, str]):
+    """The `settings` the task of `run` saves after one step of `dew train` with each `path=value` of
+    `assigned` set (`trained_by_cli`), and the task loaded from them (`dew.pipeline`)."""
+    import dew
+    from dew.inference.tasks import SavedRun, saved_settings
+
+    directory = trained_by_cli(run, root, name, assigned)
+    return saved_settings(SavedRun.pinned(str(directory)).record, settings), dew.pipeline(str(directory))
 
 
 def same(first, second) -> bool:
@@ -552,36 +840,161 @@ def same(first, second) -> bool:
         return bool(first == second)
 
 
-def consumed(before: dict[str, object], after: dict[str, object], value) -> bool:
-    """Whether a task holds `value` where the task before it held another (`held`): the option reached
-    what the task reads, not its record alone."""
-    return any(same(inner, value) and not same(before.get(path), inner) for path, inner in after.items())
-
-
 def accepted(saved, name: str, value) -> bool:
-    """Whether `saved` settings take `value` for `name` beside the rest they hold."""
+    """Whether `saved` settings take `value` for the option `name` names beside the rest they hold."""
     try:
-        dataclasses.replace(saved, **{name: value})
+        replaced(saved, name, value)
     except (TypeError, ValueError):
         return False
     return True
 
 
-def reached_by(run: RunConfig, root: Path, settings: type, flags, queued: dict[str, list[object]]):
+def witnessed_by(run: RunConfig, root: Path, settings: type, flags, queued: dict[str, list[object]],
+                 consumed) -> dict[str, list[str]]:
     """Each option of `queued` set alone through `dew train` (`flags` writes its `--set`s), so what its
-    task holds differs from the run that sets none by it alone: at its first alternative, or its next where
-    a reader refuses one. The settings each saves, what its task holds and the value it was set to, for each
-    that trains."""
-    reached = {}
+    task holds differs from the run that sets none by it alone, at each alternative in turn until one is
+    consumed (`consumed`: why the saved settings and the loaded task do not witness it, or None). Why
+    each alternative failed, for each option none witnesses."""
+    failed: dict[str, list[str]] = {}
     for name, values in queued.items():
         for index, value in enumerate(values):
             try:
-                saved, after = saved_with(run, root, f"{name}{index}", settings, flags({name: value}))
-                reached[name] = (saved, after, value)
-                break
-            except ValueError:  # A reader refused it, which names what refused it: the next.
+                saved, task = saved_with(run, root, f"{name}{index}", settings, flags({name: value}))
+            except ValueError as error:  # A reader refused it, which names what refused it: the next.
+                failed.setdefault(name, []).append(f"{value!r}: {error}")
                 continue
-    return reached
+            if (why := consumed(saved, name, value, task, index)) is None:
+                failed.pop(name, None)
+                break
+            failed.setdefault(name, []).append(f"{value!r}: {why}")
+        else:
+            failed.setdefault(name, ["no alternative to set"])
+    return failed
+
+
+def witnessed_on(builder, objective: str, settings: type, root: Path, elsewhere: frozenset[str] = frozenset()
+                 ) -> tuple[dict[str, Option], dict[str, str], bool]:
+    """The options of `settings` the run `builder` makes saves (`options_of`), and why each the run does not
+    witness is not: one with no path its settings do not declare derived, or derived from data the run
+    leaves unfilled; one set alone to each alternative in turn (`witnessed_by`) none of which trains, saves
+    it and has its loaded task consume it: hold it where it held another before (`held`) and answer apart
+    from the same task with what it held before in its place, the consumer's work, not its record
+    (`unread`), a released task's export too (`dew export`), where the run exports, which it says. An
+    option another run witnessed already (`elsewhere`) is not set again here."""
+    import dew
+    from dew.objectives.base import ReleasedTask
+
+    root.mkdir(parents=True)
+    run = builder(root, drawn=False)
+    saved_task = objectives[objective].saved_task
+    released = saved_task is not None and issubclass(saved_task, ReleasedTask)
+    base, unset = saved_with(run, root, "unset", settings, {})
+    before = held(unset)
+    # A released task's run exports where its model's format holds it (a model with cross-attention
+    # layers its checkpoint keeps alone): its witnesses' exports then hold them too.
+    exports = released and exported(root / "runs" / "unset", root / "exported" / "unset")
+    options = {option.name: option for option in options_of(run, objective, settings, base)}
+    failures = {}
+    for name, option in options.items():
+        if option.found is None and "derived" not in option.field.metadata:
+            failures[name] = "it has no path"
+        # A derived field the run fills, from its data or the option its declaration names (`--head`'s
+        # labels): on one run at least, where it holds other than its default.
+        elif (option.found is None and option.field.default is not dataclasses.MISSING
+              and same(held_at(base, name), option.field.default)):
+            failures[name] = "the run fills none"
+    # A builder's path is witnessed by its own alternatives, each the option its call makes; an option
+    # set beside what its reader takes it with (`BESIDE`) is judged by the run alone.
+    queued = {name: [value for value in (alternatives(found.annotation) if found.builds else option.values)
+                     if found.makes(value) and not same(found.made(value), held_at(base, name))
+                     and (name in BESIDE or accepted(base, name, found.made(value)))]
+              for name, option in options.items()
+              if (found := option.found) is not None and name not in elsewhere}
+    reachable = {name: option.found for name, option in options.items() if option.found is not None}
+    hints = typing.get_type_hints(type(run), include_extras=True)
+
+    def flags(assigned: dict[str, object]) -> dict[str, str]:
+        """The `--set`s of each option `assigned`, and of what its reader takes it only beside (`BESIDE`)."""
+        beside = {path: flag(value, hints[path])
+                  for name in assigned for path, value in BESIDE.get(name, {}).items()}
+        return {**beside, **{reachable[name].path: flag(value, reachable[name].annotation)
+                             for name, value in assigned.items()}}
+    def consumed(saved, name: str, value, task, index: int) -> str | None:
+        """Why the task a run saved with `name` set to `value` does not witness it, None where it does: it
+        saved another (`held_at`), or its loaded task, or a released task's export (`dew export`) reloaded
+        as its users load one, does not consume it (`unread`). A format that holds no such option refuses
+        it by name (a release's holds its budgets alone), never drops it."""
+        option = reachable[name].made(value)
+        if not same(held_at(saved, name), option):
+            return f"saved {held_at(saved, name)!r}"
+        missed = unread(task, before, option)
+        destination = root / "exported" / f"{name}{index}"
+        if missed is None and exports and exported(root / "runs" / f"{name}{index}", destination):
+            missed = unread(dew.pipeline(str(destination)), before, option)
+            return None if missed is None else f"its export: {missed}"
+        return missed
+    witnessing = witnessed_by(run, root, settings, flags, queued, consumed)
+    failures.update({name: f"no alternative witnesses it: {why}" for name, why in witnessing.items()})
+    return options, failures, exports
+
+
+UNHELD = ("states a layout's window, budgets and option layout alone",
+          "Laya's layout holds a ModernBERT encoder", "the source's format holds no cross-attention layers",
+          "Laya's layout is a MarkerLayout over a Hugging Face tokenizer")
+"""What `dew export` says refusing a run whose format holds not all it saved, rather than dropping it: a
+release's config (Laya's) its layout's window, budgets and option layout alone, its weights a ModernBERT
+encoder's, and its source's format no cross-attention layer a context reads through."""
+
+
+def exported(run: Path, destination: Path) -> bool:
+    """Whether `dew export` writes the saved `run` to `destination`, False where it refuses the run as a
+    format that holds not all it saved (`UNHELD`); any other failure is the export's own, raised."""
+    try:
+        return main(["export", str(run), str(destination)]) == 0
+    except ValueError as error:
+        if not any(said in str(error) for said in UNHELD):
+            raise
+        return False
+
+
+def unread(task, before: dict[str, object], option) -> str | None:
+    """Why the loaded `task` does not consume `option`, None where it does: it holds it nowhere it held
+    another before (`held`), or a request of it answers as the same task does holding there what it held
+    before (`answers`): the same weights, drawn afresh so every part of the model answers its input
+    (`drawn_afresh`), the option alone apart, so what differs is the consumer's work with it, not its
+    record. A request of one task answers alike twice, so an answer apart is the option's alone."""
+    places = [path for path, inner in held(task).items()
+              if same(inner, option) and path in before and not same(before[path], inner)]
+    if not places:
+        return "the task loaded holds none set"
+    drawn = drawn_afresh(task)
+    # Swapped wherever a dataclass holds it, which rebuilds what the task derives from it; a copy an
+    # object of another kind holds goes with the dataclass that made it.
+    swapped = drawn
+    for path in places:
+        try:
+            swapped = replaced(swapped, path, before[path])
+        except TypeError:
+            continue
+    if swapped is drawn:
+        return "the task loaded holds it nowhere a swap reaches"
+    answered = answers(drawn)
+    assert answered_alike(answered, answers(drawn)), "a request of one task answers apart twice"
+    if answered_alike(answered, answers(swapped)):
+        return f"a request of it answers as with {[before[path] for path in places]} in its place"
+    return None
+
+
+def drawn_afresh(task):
+    """`task` with each of its floating weights moved by a seeded normal draw, so no part of its model
+    answers every input alike as an untrained one may (a zero-initialized output layer, a run whose first
+    step its warmup leaves unstepped)."""
+    leaves, structure = jax.tree.flatten(task.variables)
+    keys = jax.random.split(jax.random.key(2639), len(leaves))
+    moved = [leaf + jax.random.normal(key, leaf.shape, leaf.dtype) * 0.1
+             if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf
+             for leaf, key in zip(leaves, keys, strict=True)]
+    return dataclasses.replace(task, variables=jax.tree.unflatten(structure, moved))
 
 
 @pytest.mark.mesh(devices=8)
@@ -591,33 +1004,88 @@ def test_each_option_a_saved_task_is_built_with_reaches_it_from_the_command_line
     (`alternatives`: a literal's values, an optional's, a flag's, Dew's classes that are one, a saved
     dataclass with one field changed) reaches the task `dew train` saves from its path (`reach`): beside
     a run that sets none, a run sets each alone to an alternative its settings accept other than the one
-    saved (the next where a run refuses it, `reached_by`), and the task saves it and, loaded, holds it
-    where the first held another (`consumed`). An option with no path is row 1061's blockwise walk,
-    unless its settings declare it derived from the run's data (`metadata={"derived": ...}`), which the
-    run fills. Every settings type an objective declares alternatives in has a run here (`TASK_RUNS`)."""
+    saved (the next where one does not witness it, `witnessed_by`), and the task saves it and, loaded,
+    holds it where the first held another, and a request of it answers apart from the same task holding
+    there what it held before (`unread`), the consumer's work, not its record. An option with no path is row
+    1061's blockwise walk,
+    unless its settings declare it derived from the run (`metadata={"derived": ...}`): from its data,
+    which the run fills, or a value the run builds of fields of its own (a decision run's layout), whose
+    fields are its options (`options_of`). A field of Dew's types that declares fewer than two
+    alternatives fails, unless derived or a record (`unwitnessed`). Every settings type an objective
+    saves (`SETTINGS`) has a run here (`TASK_RUNS`), and each option is witnessed on one of them that
+    holds it (`witnessed_on`).
+
+    A request of a loaded task answers alike twice (`answered_alike`), so an answer apart is the
+    option's alone."""
     assert settings.__name__ in TASK_RUNS, f"no run here trains an objective whose task reads {settings}"
-    builder, objective = TASK_RUNS[settings.__name__]
-    hints = typing.get_type_hints(settings)
-    fields = {field.name: field for field in dataclasses.fields(settings)}
-    run = builder(tmp_path, drawn=False)
-    base, before = saved_with(run, tmp_path, "unset", settings, {})
-    options = witnessed(settings, base)
-    paths = {name: reach(run, objective, name, hints[name]) for name in options}
-    for name in (name for name in options if paths[name] is None):
-        assert "derived" in fields[name].metadata, f"{settings.__name__}.{name} has no path"
-        assert getattr(base, name) != fields[name].default, f"the run fills no {settings.__name__}.{name}"
-    # A builder's path is witnessed by its own alternatives, each the option its call makes.
-    queued = {name: [value for value in (alternatives(found.annotation) if found.builds else values)
-                     if found.makes(value) and not same(found.made(value), getattr(base, name))
-                     and accepted(base, name, found.made(value))]
-              for name, values in options.items() if (found := paths[name]) is not None}
-    reachable = {name: found for name, found in paths.items() if found is not None}
-    reached = reached_by(run, tmp_path, settings, lambda assigned: {
-        reachable[name].path: flag(value, reachable[name].annotation) for name, value in assigned.items()},
-        queued)
-    for name in queued:
-        assert name in reached, f"no alternative of {settings.__name__}.{name} trains: {queued[name]}"
-        saved, after, value = reached[name]
-        option = paths[name].made(value)
-        assert same(getattr(saved, name), option), (name, option)
-        assert consumed(before, after, option), f"the task loaded holds no {settings.__name__}.{name} set"
+    from dew.objectives.base import ReleasedTask
+
+    # Each run witnesses the options no run before it did, each option set once on the runs that hold it.
+    witnessed, done = [], frozenset()
+    for builder, objective in TASK_RUNS[settings.__name__]:
+        witnessed.append(witnessed_on(builder, objective, settings, tmp_path / builder.__name__, done))
+        options, failures, _ = witnessed[-1]
+        done |= {name for name in options if name not in failures}
+    found = [(options, failures) for options, failures, _ in witnessed]
+    # An option is witnessed on a run that holds it, which a release's settings may not (a split's).
+    missed = {name: [failures[name] for options, failures in found if name in options]
+              for name in {name for options, _ in found for name in options}
+              if all(name not in options or name in failures for options, failures in found)}
+    assert not missed, f"{settings.__name__}'s options no run here witnesses: {missed}"
+    # A released task's options reach an export on one of its runs at least.
+    saved_task = objectives[TASK_RUNS[settings.__name__][0][1]].saved_task
+    assert not (saved_task is not None and issubclass(saved_task, ReleasedTask)) or any(
+        exports for _, _, exports in witnessed), f"no run of {settings.__name__}'s exports"
+
+
+@pytest.mark.parametrize("release", ["dream", "diffucoder"])
+def test_a_masked_run_over_a_release_saves_and_reads_the_walk_the_release_declares(release, tmp_path):
+    """A masked-diffusion run over a Dream release (dream-tiny as the release ships it, its generation
+    config and its own sampling code, `test_dream_walk.snapshot`), setting nothing of its task, saves the
+    walk the release's own task declares (`Pretrained.text_generation`): its process, the grid's endpoint
+    among it (ledger 2563), its solver, its steps and its blocks; and the grid its loaded task walks runs
+    to that endpoint, a loaded source's default reaching its consumer. A walk's tokens show the endpoint
+    only where a last step leaves a place masked, which no request here reaches."""
+    from dew.inference.tasks import MaskedSettings
+    from dew.interop import Pretrained
+
+    run = dreamed(tmp_path, drawn=False, release=release)
+    source = Pretrained.load(tmp_path / release, dtype="float32", attention_impl="reference")
+    declared = source.text_generation()
+    _, task = saved_with(run, tmp_path, "over", MaskedSettings, {})
+    options = {name: getattr(declared, name) for name in ("process", "solver", "steps", "block")}
+    assert {name: same(getattr(task, name), option) for name, option in options.items()} == dict.fromkeys(
+        options, True)
+    # The grid its walk takes runs to that endpoint (`DiscreteProcess.times`), not MDLM's.
+    unended = dataclasses.replace(task.process, endpoint=None)
+    assert not np.array_equal(task.process.times(task.steps), unended.times(task.steps))
+
+
+def test_a_decision_run_over_a_release_saves_and_reads_the_task_the_release_declares(tmp_path):
+    """A decision run over a release (tiny Laya), setting nothing of its task, saves the task the
+    release's own declares (`Decide.from_pretrained`): its layout, its special tokens and its confidence,
+    its budget the run's data's (`DecideSettings.questions`). What reads each, the gate above witnesses
+    (`witnessed_on`)."""
+    from dew.decision.task import Decide, DecideSettings
+
+    declared = Decide.from_pretrained(TINY_LAYA)
+    _, task = saved_with(decision(tmp_path, drawn=False), tmp_path, "over", DecideSettings, {})
+    options = {name: getattr(declared, name) for name in ("layout", "specials", "confidence")}
+    assert {name: same(getattr(task, name), option) for name, option in options.items()} == dict.fromkeys(
+        options, True)
+
+
+def the_attention_forms_a_run_names_reach_its_step(tmp_path):
+    """A GPU flow's cell (tests/test_gpu_training.py): the attention forms a run's numerics name on the
+    command line (`--set trainer.precision`, `Numerics.forms`) reach its step through the default route: a
+    step in the accurate forms (IEEE fp32 products) and one in the fast (a GPU's TF32), the model's
+    compute float32 in both, score its batch apart, so the route reads the run's forms, not its record
+    alone (ledger 2350). A CPU multiplies fp32 one way in both, so only a GPU tells them apart."""
+    from process_support import logged_losses
+
+    from dew.nn.precision import Numerics
+
+    run = lm(tmp_path, drawn=False)
+    losses = {forms: logged_losses(trained_by_cli(run, tmp_path, forms, {
+        "trainer.precision": flag(Numerics(forms=forms), Numerics)})) for forms in ("fast", "accurate")}
+    assert losses["fast"] and losses["fast"] != losses["accurate"]

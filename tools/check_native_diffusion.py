@@ -224,7 +224,8 @@ def train_and_reload(source, reference, key, given, noise):
 
 
 PARTS = ("walk", "update")
-"""What a pipeline's check holds, each part in a process of its own (`check_pipeline`)."""
+"""What a pipeline's check holds (`check_pipeline`): the suite runs each part in a process of its own, and a
+call that names no `--part` runs both in one."""
 
 
 def check_pipeline(directory, part: str, streamed: bool = False):

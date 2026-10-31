@@ -67,9 +67,10 @@ def anonymous(run: Path, name: str, places: dict[str, str]) -> bytes:
     return packed.getvalue()
 
 
-EVIDENCE = 1
+EVIDENCE = 2
 """The version of what a recorded generation's runs record they serialized (`evidence`), which its
-`source.json` states; a generation that states one holds every kind's."""
+`source.json` states; a generation that states one holds every kind's. Version 2 records the dtypes
+one request of each task multiplies in by module path (`products`)."""
 
 
 def evidence(run, state, directory: Path) -> dict:
@@ -81,16 +82,15 @@ def evidence(run, state, directory: Path) -> dict:
     import jax
     from saved_run_kinds import computed
 
-    import dew
     from dew.registry import objectives
 
     lines = (directory / "tracking" / "records.jsonl").read_text().splitlines()
     records = [json.loads(line) for line in lines]
     compiled = [row["value"] for row in records if row["type"] == "StepCompiled"][-1]
     plan = compiled["plan"] or {}
-    task = None if objectives[run.objective.name].saved_task is None else dew.pipeline(str(directory))
+    tasked = objectives[run.objective.name].saved_task is not None
     return {"step": int(state.step), "compute": run.compute_dtype(),
-            "products": None if task is None else computed(task),
+            "products": computed(directory) if tasked else None,
             "params": sorted({str(leaf.dtype) for leaf in jax.tree.leaves(state.variables["params"])}),
             "scale": None if state.scale is None else float(state.scale.scale),
             "finite_steps": None if state.scale is None else int(state.scale.fin_steps),
