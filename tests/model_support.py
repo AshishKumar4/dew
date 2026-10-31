@@ -12,6 +12,7 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
+from lane_environment import outside_suite
 from flax import linen as nn
 
 from dew.inference import RunProcessor, TextGeneration
@@ -198,8 +199,7 @@ def streamed_export(writer: str, argument: Path, directory: Path, shard_size: st
     CPU device, as a user's has (the suite's simulated mesh would place every leaf eight times over),
     so no heap the writer freed is there for the save to reuse."""
     root = Path(__file__).resolve().parents[1]
-    env = {**{name: value for name, value in os.environ.items() if name != "XLA_FLAGS"},
-           "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(root / "src")}
+    env = {**outside_suite(os.environ), "PYTHONPATH": str(root / "src")}
     written = subprocess.run([sys.executable, "-c", writer, str(argument), str(directory / "source")],
                              capture_output=True, text=True, env=env)
     assert written.returncode == 0, written.stderr[-2000:]

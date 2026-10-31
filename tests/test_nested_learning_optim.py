@@ -10,14 +10,22 @@ import optax
 import pytest
 from reference_error import as_given, assert_as_exact, seeds_for
 
-from dew.optim import NEWTON_SCHULZ, delta_gradient_descent, scale_by_m3
+from dew.newton_schulz import NEWTON_SCHULZ
+from dew.optim import delta_gradient_descent, scale_by_m3
 
-M3_FACTORS = {"beta1": 0.9, "beta2": 0.99, "beta3": 0.5, "alpha": 0.3, "eps": 1e-2, "frequency": 3,
-              "ns_precision": "float32"}
+M3_FACTORS = {"beta1": 0.9, "beta2": 0.99, "beta3": 0.5, "alpha": 0.3, "eps": 1e-2, "frequency": 3}
 """M3's factors in the proofs below: three updates a chunk, so seven updates close two chunks. An `eps`
 of 1e-2 keeps an entry whose early gradients are near zero from dividing its direction by a near-zero
-root, which would let one entry's rounding stand for a draw's whole error. Its Newton-Schulz in float32,
-which the paper's float32 reference iterates in; bfloat16's, Muon's default, Muon's own tests hold."""
+root, which would let one entry's rounding stand for a draw's whole error."""
+
+
+def m3(**factors) -> optax.GradientTransformation:
+    """`scale_by_m3` whose update traces under the accurate numerics (`test_optim.in_forms`): its
+    Newton-Schulz in float32, which the paper's float32 reference iterates in; the fast forms' bfloat16,
+    Muon's default, Muon's own tests hold."""
+    from test_optim import in_forms
+
+    return in_forms(scale_by_m3(**{**M3_FACTORS, **factors}), "accurate")
 NESTED_SEEDS = 8
 """Check 1's declared seeds for delta gradient descent's step."""
 
@@ -74,7 +82,7 @@ def test_m3s_directions_are_algorithm_1s_across_its_chunks():
     (ledger 1650: XLA:CPU's are ten times further from float64 than one matrix's, an A100's are not), and
     the truth by NumPy's in float64. Within a chunk the slow momentum and its orthogonalization hold still,
     and each changes once, as the chunk closes; the first chunk's slow direction is zero."""
-    transform = scale_by_m3(**M3_FACTORS)
+    transform = m3()
 
     @jax.jit
     def scanned(gradients):
@@ -127,7 +135,7 @@ def test_m3_keeps_a_bfloat16_matrixs_state_in_float32():
     """M3 over a bfloat16 matrix given float32 gradients, across a chunk's close under jit: its momenta,
     second moment, chunk sum and slow direction stay float32 on every update, so neither branch of the
     once-a-chunk close changes the state's dtype, and the directions are float32 and finite."""
-    transform = scale_by_m3(**M3_FACTORS)
+    transform = m3()
     params = {"kernel": jnp.ones((6, 4), jnp.bfloat16)}
     gradients = np.random.default_rng(0).standard_normal((4, 6, 4)).astype(np.float32)
     step = jax.jit(transform.update)
@@ -170,7 +178,7 @@ def test_m3_iterates_each_matrix_whole_over_a_mesh():
               if leaf.ndim == 2}
     moved = {}
     for steps in (1, 5):
-        placed = Placed(scale_by_m3(**M3_FACTORS, ns_steps=steps), mesh)
+        placed = Placed(m3(ns_steps=steps), mesh)
         text = placed.compiled(fixed_gradients(params), placed.init(params), params)
         moved[steps] = sorted((kind, sorted(map(tuple, shapes))) for kind, shapes in collectives(text))
     assert moved[1] == moved[5]
