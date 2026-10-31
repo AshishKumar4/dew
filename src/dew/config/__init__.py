@@ -1030,41 +1030,69 @@ def _renamed_chain(chain: JSON) -> JSON:
 
 def _renamed_call(call: JSON) -> JSON:
     """A call of `pipe` a saved chain records (`{"pipe": ..., "settings": {...}}`), read at that boundary:
-    each setting that holds stores with their renamed fields under today's names (`_renamed_stores`); any
-    other entry as it is."""
-    if not isinstance(call, dict) or "pipe" not in call or not isinstance(call.get("settings"), dict):
+    each setting its function declares a store (`_holds_store`) with its stores' renamed fields under today's
+    names (`_renamed_stores`); any other setting or entry as it is."""
+    if not isinstance(call, dict) or not isinstance(call.get("pipe"), str):
         return call
-    settings = call["settings"]
-    assert isinstance(settings, dict)
-    return {**call, "settings": {name: _renamed_stores(value) for name, value in settings.items()}}
+    settings, named = call.get("settings"), call["pipe"]
+    if not isinstance(settings, dict) or not isinstance(named, str) or not named.startswith("dew."):
+        return call
+    hints = typing.get_type_hints(registry.imported(named))
+    return {**call, "settings": {name: _renamed_stores(value) if _holds_store(hints.get(name)) else value
+                                 for name, value in settings.items()}}
 
 
 def _renamed_stores(value: JSON) -> JSON:
     """`value`, a store's class record or a list of them as a saved chain holds them, read at that boundary:
-    each store's fields its class renamed (`RENAMED_FIELDS`) under today's names, and each of its fields that
-    holds stores the same; anything else, a store's data among it, as it is."""
+    each store's fields its class renamed (`RENAMED_FIELDS`) under today's names, and each of its fields its
+    class declares a store (`_store_fields`) the same; any other field, a store's data among them, as it
+    is."""
     if isinstance(value, list):
-        return [_renamed_stores(part) for part in value] if value and all(map(_is_store, value)) else value
-    if not _is_store(value):
+        return [_renamed_stores(part) for part in value]
+    named = _store_class(value)
+    if named is None:
         return value
     assert isinstance(value, dict)
-    named, fields = value["class"], value["fields"]
-    assert isinstance(named, str) and isinstance(fields, dict)
-    renamed = RENAMED_FIELDS.get(named, {})
-    held = {renamed.get(name, name): _renamed_stores(field) for name, field in fields.items()}
+    fields = value["fields"]
+    assert isinstance(fields, dict)
+    renamed, holding = RENAMED_FIELDS.get(named, {}), _store_fields(named)
+    held = {renamed.get(name, name): _renamed_stores(field) if renamed.get(name, name) in holding else field
+            for name, field in fields.items()}
     return {**value, "fields": held}
 
 
-def _is_store(value: JSON) -> bool:
-    """Whether `value`, read from a saved chain at its boundary, is the class record of one of Dew's stores
-    (`dew.data.pipeline.Dataset`)."""
+def _store_class(value: JSON) -> str | None:
+    """The import path of the store whose class record `value` is, read from a saved chain at its boundary:
+    one of Dew's stores (`dew.data.pipeline.Dataset`) or views of one (`dew.data.sources.base.View`); else
+    None."""
+    from dew.data.sources.base import View
+
     if not isinstance(value, dict) or not isinstance(value.get("fields"), dict):
-        return False
+        return None
     named = value.get("class")
     if not isinstance(named, str) or not named.startswith("dew.") or ":" not in named:
-        return False
+        return None
     built = registry.imported(named)
-    return isinstance(built, type) and issubclass(built, Dataset)
+    return named if isinstance(built, type) and issubclass(built, Dataset | View) else None
+
+
+def _store_fields(named: str) -> frozenset[str]:
+    """The fields of the store class at import path `named` that its declared types say hold stores (a
+    concatenation's parts, a view's source)."""
+    hints = typing.get_type_hints(registry.imported(named))
+    return frozenset(name for name, hint in hints.items() if _holds_store(hint))
+
+
+def _holds_store(hint: registry.Annotation | typing.TypeVar) -> bool:
+    """Whether a declared type `hint` holds stores: Dew's store protocol (`Source`), a store or view class, or
+    any type made of one (a tuple of them, an optional one, a view's type variable bound to one)."""
+    from dew.data.sources.base import Source, View
+
+    if isinstance(hint, typing.TypeVar):
+        return hint.__bound__ is not None and _holds_store(hint.__bound__)
+    if hint is Source or (isinstance(hint, type) and issubclass(hint, Dataset | View)):
+        return True
+    return any(_holds_store(argument) for argument in typing.get_args(hint))
 
 
 def earlier_trainer(record: Mapping[str, object]) -> Mapping[str, object]:

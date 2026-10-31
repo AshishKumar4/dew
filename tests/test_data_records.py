@@ -145,8 +145,25 @@ def test_a_saved_runs_data_shaped_like_an_earlier_iterators_record_loads_as_it_w
     from dew.config import RunConfig
 
     payload = {"class": "dew.data.sources.iterator:Iterated", "fields": {"name": "literal"}}
-    path = Path(RunConfig(data=Memory({"payload": [payload]}).batch(1)).save(str(tmp_path / "run")))
-    assert list(RunConfig.load(str(path)).data.source.values["payload"]) == [payload]
+    columns = Path(RunConfig(data=Memory({"payload": [payload]}).batch(1)).save(str(tmp_path / "columns")))
+    assert list(RunConfig.load(str(columns)).data.source.values["payload"]) == [payload]
+    rows = Path(RunConfig(data=Memory([payload]).batch(1)).save(str(tmp_path / "rows")))
+    loaded = RunConfig.load(str(rows)).data.source.values
+    assert {name: list(column) for name, column in loaded.items()} == {"class": [payload["class"]],
+                                                                      "fields": [payload["fields"]]}
+
+
+def test_a_run_recorded_while_a_held_out_iterators_identity_was_its_name_loads_its_view_renamed(tmp_path):
+    """An iterator an earlier record names by `name` beneath a view of it, a holdout's part, loads with that
+    version its `identity`: the view's source is a store its class declares (`earlier_chains`)."""
+    from dew.config import RunConfig
+
+    train, _ = from_iter(_rows, identity="rows@1").holdout(0.25)
+    path = Path(RunConfig(data=train.batch(1)).save(str(tmp_path / "run")))
+    written = path.read_text()
+    path.write_text(written.replace('"identity": "rows@', '"name": "rows@'))
+    assert path.read_text() != written
+    assert RunConfig.load(str(path)).data.source.source.identity == "rows@1"
 
 
 def test_held_reads_a_dataset_in_its_own_batch_or_the_one_given():
