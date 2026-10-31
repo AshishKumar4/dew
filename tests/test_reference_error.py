@@ -422,15 +422,21 @@ def test_check_1_refuses_a_draw_and_an_arm_that_turn_stateful_after_their_first_
 
     with pytest.raises(UnpairedDraw):
         null_runs(jnp.matmul, later_stateful, "a draw stateful after its first block", seeds=8, runs=2)
-    calls = iter(range(10**6))
+    calls = []
 
     def noisy_later(x, w):
-        at = next(calls)
-        return x @ w + (0 if at < 2 else 1e-6 * at)
+        calls.append(len(calls))
+        return x @ w + (0 if len(calls) <= 2 else 1e-6 * len(calls))
 
+    # Its truth a pure product of its own, so the arm's first two calls are its first block's evaluation and
+    # that check's replay: the first block passes, and the second's replay refuses it.
+    [(verdict, _, _)] = null_runs(as_given(noisy_later), a_product_draw, "an arm pure on its first block",
+                                  seeds=8, runs=1, truth_fn=jnp.matmul)
+    assert verdict == "pass" and len(calls) > 2
+    calls.clear()
     with pytest.raises(UnpairedDraw):
         null_runs(as_given(noisy_later), a_product_draw, "an arm of noise after its first block", seeds=8,
-                  runs=2)
+                  runs=2, truth_fn=jnp.matmul)
 
 
 def test_check_1_sizes_rows_by_their_terms_beside_an_output_held_as_none():
