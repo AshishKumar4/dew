@@ -336,16 +336,17 @@ def _pretrained(out: Path, pretraining, windows: Loader, updates: int, saved_eve
 def world(out: Path, *, teacher_weights: Path, assets: Path, drones: int = 16, hz: float = 60.0,
           demonstration_seconds: float = 300.0, pretrain_updates: int = 50_000,
           environment_seconds: float = 33_333.0, capacity_seconds: float = 600.0,
-          highlight: bool = True, saved_every: int = 2000) -> dict:
+          highlight: bool = True, saved_every: int = 2000, level: float = 1.0) -> dict:
     """FlyDreamer's agent at its size (TransDreamer's dynamics, bfloat16) on the image alone: pretrained on
     the teacher's demonstrations (FlyDreamer's `pretrain_wm` scales and behaviour cloning), then trained
     online at train ratio 128, starting from the demonstrations' replay; the teacher, the cloned agent and
     the online agent scored alike (world.json, pretrained.msgpack, world.msgpack), the online agent every
     10,000 updates, and the cloned and the final agents' first drones filmed (cloned.npz, video.npz), each
     on an evaluation race of its own, on the training families and, held out, the others. Without
-    `highlight` the next gate is not lit and the courses are loops alone (a comparison). Each drone flies
-    `demonstration_seconds` for the demonstrations; the agent flies `environment_seconds` online over all
-    its drones (FlyDreamer's 1M steps at 30 Hz); the replay holds `capacity_seconds` a drone (16 GB of
+    `highlight` the next gate is not lit and the courses are loops alone (a comparison). Every race is at the
+    curriculum's `level` (its courses' difficulty and its drones' randomization), the teacher's. Each drone
+    flies `demonstration_seconds` for the demonstrations; the agent flies `environment_seconds` online over
+    all its drones (FlyDreamer's 1M steps at 30 Hz); the replay holds `capacity_seconds` a drone (16 GB of
     96-pixel images over 16 drones at 60 Hz). Every `saved_every` updates of either phase (about ten minutes
     on a G4) the weights so far are written with where the run is (progress.json names the weight files it
     goes on from, `_committed`); a run whose `out` holds them goes on from there, its replay the
@@ -362,7 +363,9 @@ def world(out: Path, *, teacher_weights: Path, assets: Path, drones: int = 16, h
     families = TRAINING if highlight else (("loop", 1.0),)
 
     def raced(families):
-        return race(drones, views, hz=hz, families=families, assets=assets, highlight=highlight)
+        raced = race(drones, views, hz=hz, families=families, assets=assets, highlight=highlight)
+        raced.difficulty = raced.ramp = level
+        return raced
 
     simulator, judged, held_out = raced(families), raced(families), raced(HELD_OUT)
     horizon = simulator.racing.max_steps
@@ -378,7 +381,7 @@ def world(out: Path, *, teacher_weights: Path, assets: Path, drones: int = 16, h
                 else {"phase": "pretrain", "updates": 0, "pretrained": None, "world": None})
     earlier = (json.loads((out / "world.json").read_text())
                if progress["phase"] == "online" and (out / "world.json").exists() else {})
-    report = {"drones": drones, "hz": hz, "length": length, "imagination": imagination,
+    report = {"drones": drones, "hz": hz, "length": length, "imagination": imagination, "level": level,
               "highlight": highlight, "teacher": judge(teacher_policy(taught), held, None, jax.random.key(4))}
     began = time.perf_counter()
     replay = demonstrations(simulator, taught, held, round(demonstration_seconds * hz),
@@ -450,7 +453,8 @@ def main() -> None:
     parser.add_argument("--teacher", type=Path)
     parser.add_argument("--assets", type=Path)
     parser.add_argument("--warm", type=Path)
-    parser.add_argument("--level", type=float, default=0.2)
+    parser.add_argument("--level", type=float, help="the curriculum's level: the teacher's first (0.2), the "
+                        "world phase's every race's (1.0)")
     parser.add_argument("--no-highlight", action="store_true")
     parser.add_argument("--pretrain-updates", type=int, default=50_000)
     parser.add_argument("--environment-seconds", type=float, default=33_333.0)
@@ -460,12 +464,13 @@ def main() -> None:
         report = check(arguments.out, assets=arguments.assets, hz=arguments.hz)
     elif arguments.phase == "teacher":
         report = teacher(arguments.out, seconds=arguments.seconds, hz=arguments.hz, warm=arguments.warm,
-                         level=arguments.level)
+                         level=0.2 if arguments.level is None else arguments.level)
     else:
         report = world(arguments.out, teacher_weights=arguments.teacher, assets=arguments.assets,
                        hz=arguments.hz, pretrain_updates=arguments.pretrain_updates,
                        environment_seconds=arguments.environment_seconds,
-                       highlight=not arguments.no_highlight)
+                       highlight=not arguments.no_highlight,
+                       level=1.0 if arguments.level is None else arguments.level)
     print(json.dumps({key: value for key, value in report.items() if not isinstance(value, list)}))
 
 
