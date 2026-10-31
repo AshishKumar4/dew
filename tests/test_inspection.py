@@ -868,10 +868,14 @@ def test_a_path_glob_selects_the_layer_its_log_names(stacked):
     selected, every = logged("layers_2/*"), logged("layers_*/*")
     reference = {name: value for name, value in every.items() if name.split("/")[2] == "layers_2"}
     assert set(selected) == set(reference) and any("/cotangents/" in name for name in selected)
-    # The statistics no reduction order changes are the very entries' to the bit.
+    # The statistics no reduction order changes are the very entries' to the bit; a cotangent's root mean
+    # square, which sums every entry of the layer's output (8 rows of 16 tokens by its width), the reference's
+    # as one order of that sum is another's.
     for name in selected:
         if name.endswith(("/abs_max", "/non_finite", "/zero_fraction")):
             assert selected[name] == reference[name], name
+        elif "/cotangents/" in name and name.endswith("/rms"):
+            assert_computes_the_oracle(selected[name], reference[name], name, roundings=8 * 16 * 64)
     with pytest.raises(ValueError):
         logged("layers_9/*")
 
