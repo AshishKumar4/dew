@@ -189,14 +189,14 @@ def rotation(orientation: jax.Array) -> jax.Array:
                         [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)]])
 
 
-def _mixer(quadrotor: Quadrotor) -> jax.Array:
+def _mixer(quadrotor: Quadrotor, dtype: jnp.dtype) -> jax.Array:
     """The nominal map `[4, 4]` from (collective thrust, roll, pitch and yaw torques) to each rotor's
     thrust: the inverse of the rotors' thrusts' sums, moments and drag torques, the nominal drone's, a
-    constant of the program (inverted once as it traces, not by the device each step)."""
+    constant of the program in `dtype` (inverted once as it traces, not by the device each step)."""
     kappa = quadrotor.drag_coefficient / quadrotor.thrust_coefficient
     rows = np.asarray([[1.0] * 4, [y for _, y in POSITIONS], [-x for x, _ in POSITIONS],
                        [spin * kappa for spin in SPINS]])
-    return jnp.asarray(np.linalg.inv(rows), jnp.float32)
+    return jnp.asarray(np.linalg.inv(rows), dtype)
 
 
 def hovering(quadrotor: Quadrotor, body: Body, position: jax.Array, orientation: jax.Array) -> Flight:
@@ -219,7 +219,8 @@ def duties(quadrotor: Quadrotor, flight: Flight, collective: jax.Array, rates: j
     measured = flight.angular_velocity
     wanted = q.rate_gain * (rates - measured) - q.rate_damping * (measured - flight.measured) / dt
     torque = jnp.asarray(q.inertia) * wanted
-    thrusts = _mixer(q) @ jnp.concatenate([collective[None], torque])
+    wrench = jnp.concatenate([collective[None], torque])
+    thrusts = _mixer(q, wrench.dtype) @ wrench
     speed = jnp.sqrt(jnp.maximum(thrusts, 0.0) / q.thrust_coefficient)
     return jnp.clip((speed - q.idle_speed) / (q.top_speed - q.idle_speed), 0.0, 1.0), measured
 
