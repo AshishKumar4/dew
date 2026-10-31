@@ -260,10 +260,10 @@ def test_the_derivation_decides_a_steps_fit_as_its_compile_does(layers, generati
     times the compile is the roomy one, whose need it holds, XLA's rematerialization changing nothing in a
     module already within its limit (`RematerializeComputation`,
     xla/hlo/transforms/simplifiers/hlo_rematerialization.cc), so its fit is read off that compile. On one
-    stating 0.6, a step set to full recomputation compiles there alone: where XLA refuses it the
-    derivation did, but where bounded from below, and where XLA fits it, it fits by XLA's own
-    rematerialization against the stated memory, which the derivation does not model and the compile
-    decides (its temporaries below the roomy compile's)."""
+    stating 0.6, a step set to full recomputation whose peak is exact compiles there alone: where XLA
+    refuses it the derivation did, and where XLA fits it, it fits by XLA's own rematerialization against
+    the stated memory, which the derivation does not model and the compile decides (its temporaries below
+    the roomy compile's). A bound from below decides no refusal there for that compile to check."""
     from compile_evidence import Evidence, Facts, Measurement, Prediction
 
     (roomy,) = gated(layers, generation, remat, 1 << 34, tmp_path / "roomy", precision)
@@ -280,9 +280,9 @@ def test_the_derivation_decides_a_steps_fit_as_its_compile_does(layers, generati
             Measurement({"temp": roomy["temp"]}, need <= budget, "xla", jax.__version__))
         assert evidence.compiled.admits == admits, evidence.describe()
         assert evidence.agrees or (not exact and derived <= budget), evidence.describe()
-    if remat == "full":
+    if remat == "full" and exact:
         tight = gated(layers, generation, remat, int(need * 0.6), tmp_path / "0.6", precision)[0]
-        assert tight["derived_headroom"] < 0 or not exact, tight
+        assert tight["derived_headroom"] < 0, tight
         # Neither refuses a compile that fits, but where XLA's own rematerialization fit it below what
         # the roomy compile held, which the derivation does not model.
         assert not tight["fits"] or tight["derived_headroom"] >= 0 or tight["temp"] < roomy["temp"], tight
