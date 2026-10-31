@@ -125,6 +125,7 @@ from dew.data.pipeline import (
     Workers,
     chains,
     children,
+    examples_bound,
     record_stage,
     runs,
     with_children,
@@ -426,8 +427,7 @@ def _native_after_bound(pipeline: Pipeline) -> bool:
     """Whether `pipeline` counts the examples its rows consume (`MarkConsumed`) and runs a native Grain step
     after the bound that marks them."""
     stages = pipeline.stages
-    at = next((index for index, stage in enumerate(stages)
-               if isinstance(stage, Map) and isinstance(stage.step, MarkConsumed)), None)
+    at = examples_bound(stages)
     return at is not None and any(isinstance(stage, Native) for stage in stages[at:])
 
 
@@ -435,7 +435,7 @@ def _shuffles_windows(pipeline: Pipeline) -> bool:
     """Whether `pipeline` counts the examples its rows consume (`MarkConsumed`, a run bounded in examples) and
     shuffles in a window after a stage that packs or windows its rows."""
     stages = pipeline.stages
-    if not any(isinstance(stage, Map) and isinstance(stage.step, MarkConsumed) for stage in stages):
+    if examples_bound(stages) is None:
         return False
     packed = next((index for index, stage in enumerate(stages) if isinstance(stage, (Pack, Windows))), None)
     return packed is not None and any(isinstance(stage, Shuffle) and bool(stage.window)
@@ -759,9 +759,9 @@ def compile(
 def _bound_ends(pipeline: Pipeline) -> bool:
     """Whether `pipeline`'s read, bounded in examples (`_bounded`), ends where its bound does: no limit or
     slice after the bound ends it first (`Loader.bound_ends`)."""
-    at = next((index for index, stage in enumerate(pipeline.stages)
-               if isinstance(stage, Map) and isinstance(stage.step, MarkConsumed)), len(pipeline.stages))
-    return not any(isinstance(stage, (Limit, Slice)) for stage in pipeline.stages[at + 1:])
+    at = examples_bound(pipeline.stages)
+    after = () if at is None else pipeline.stages[at + 1:]
+    return not any(isinstance(stage, (Limit, Slice)) for stage in after)
 
 
 def _training_measure(train: Pipeline, validation: Pipeline | None, *, objective: ObjectiveData | None,
