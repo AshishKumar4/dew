@@ -23,9 +23,8 @@ fold's reach, and its overflowed rows again shifting under headroom). Its legali
 
 import dataclasses
 import functools
-import inspect
 from collections.abc import Callable
-from typing import Any, NamedTuple
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -33,7 +32,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels import generation
+from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import (
     attention_algebra as algebra,
     attention_portable,
@@ -613,86 +612,41 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
     (`peaks`) reads the keys alone and gives each row's keys' largest logit `[B, H, Qp]` fp32 in the walk's
     units and its anchor key `[B, H, Qp]` int32 (`_peak_consumer`). With `finishes`, the output's launch also
     gives its rows' finished maxima and denominators `[2, B, H, Qp]` fp32 (`Output`, `algebra.finish`).
-    Its kernel is built once for every call of its static facts (`_kernel_of`) where its hooks hold no
-    array (`_holdable`): a model's layers alike lower one.
+    Its kernel is built once for every call of its static facts (`_launched`, `tuning.lowered_once`): a
+    model's layers alike lower one.
     """
-    # The arrays the programs read beside the operands.
-    leaves, treedef = jax.tree.flatten((spans, hooked, guard, anchors))
     # Each launch named apart, so its compile reports and profile rows say which it is.
     kind = "peaks" if peaks else "training" if training else "forward"
     name = (f"attention_{kind}{'_natural' if spec.natural else ''}"
             f"{'_guarded' if guard is not None else ''}{'' if columns is None else f'_columns{columns}'}")
-    launch = _Launch(tuple((array.shape, jnp.dtype(array.dtype)) for array in (query, key, value)), treedef,
-                     _described(hooks), spec, tiles, family, training, interpret, peaks,
-                     None if out_dtype is None else jnp.dtype(out_dtype), counted, finishes,
-                     generation.gpu_target(), name, report.named(name))
-    built = _kernel_of if all(map(_holdable, (hooks.score_mod, hooks.output_mod))) else _kernel_of.__wrapped__
-    return built(launch)(query, key, value, *leaves)
+    # The hooks' functions and their parameters' kinds static, their arrays the programs' operands.
+    hook_arrays, hook_tree = jax.tree.flatten(hooks)
+    return _launched(query, key, value, (spans, hooked, guard, anchors), hook_arrays, hook_tree=(hook_tree,),
+                     spec=spec, tiles=tiles, family=family, training=training, interpret=interpret,
+                     peaks=peaks, out_dtype=None if out_dtype is None else jnp.dtype(out_dtype),
+                     counted=counted, finishes=finishes, target=generation.gpu_target(),
+                     names=(name, report.named(name)))
 
 
-def _holdable(hook: Callable | None) -> bool:
-    """Whether the kernel cache may hold `hook` (`_kernel_of`) without holding an array through it: none, a
-    function of no closure, or a partial of one over values of no array (a softcap's `functools.partial`
-    of `capped`). A closure or a bound method may reach an array a call made (a hook reading an operand's
-    shape), which a cached kernel would keep alive: its launches build their kernel each call."""
-    if hook is None:
-        return True
-    if isinstance(hook, functools.partial):
-        return _holdable(hook.func) and all(map(_scalar, (*hook.args, *hook.keywords.values())))
-    return (inspect.isfunction(hook) and hook.__closure__ is None
-            and all(map(_scalar, hook.__defaults__ or ())))
+_HookTree = tuple[jax.tree_util.PyTreeDef]
+"""A launch's hooks' structure (`_launched`): their functions and their parameters' kinds, its arrays apart;
+`PyTreeDef` held in a tuple, as a type admits it (`options._Structure`)."""
 
 
-def _scalar(value) -> bool:
-    """Whether `value` is a Python scalar, a string or None, or a tuple of them: a value of no array."""
-    if isinstance(value, tuple):
-        return all(map(_scalar, value))
-    return value is None or isinstance(value, (bool, int, float, complex, str))
-
-
-@dataclasses.dataclass(frozen=True)
-class _Launch:
-    """A forward launch's static facts, all its kernel is built from (`_kernel_of`): its operands' shapes
-    and dtypes, the structure of the arrays its programs read beside them (`treedef`), its hooks with their
-    arrays' shapes and dtypes in place of the arrays (`_described`), its form, tiles and family, what it
-    gives, the target it is derived for, and its name (its form, guard and value columns) as the launch
-    tracing it resolves it (`report.named`)."""
-
-    operands: tuple
-    treedef: Any
-    hooks: Any
-    spec: algebra.Forward
-    tiles: Tiles
-    family: mosaic.Family
-    training: bool
-    interpret: Any
-    peaks: bool
-    out_dtype: Any
-    counted: bool
-    finishes: bool
-    target: Any
-    name: str
-    kernel_name: str | None
-
-
-def _described(hooks: Hooks) -> Hooks:
-    """`hooks` with each array's shape and dtype in its place (`jax.ShapeDtypeStruct`): what a kernel built
-    for many calls reads of them, no array held."""
-    return jax.tree.map(lambda array: jax.ShapeDtypeStruct(jnp.shape(array), jnp.result_type(array)), hooks)
-
-
-@functools.lru_cache(maxsize=256)
-def _kernel_of(launch: _Launch) -> Callable:
-    """`_launch`'s kernel for its static facts `launch`, built once for every call of them and reading no
-    array: its hooks' functions and their arrays' shapes and dtypes (`_described`; the arrays the programs'
-    refs), its operands' alike. A bound of 256 kernels keeps a process's memory bounded
-    (the hook programs' own cache's, `hook_program`)."""
-    query, key, value = (jax.ShapeDtypeStruct(shape, dtype) for shape, dtype in launch.operands)
-    hooks = launch.hooks
-    spec, tiles, family, training, interpret = (launch.spec, launch.tiles, launch.family, launch.training,
-                                                launch.interpret)
-    peaks, out_dtype, counted, finishes, treedef = (launch.peaks, launch.out_dtype, launch.counted,
-                                                    launch.finishes, launch.treedef)
+@tuning.lowered_once(("hook_tree", "spec", "tiles", "family", "training", "interpret", "peaks", "out_dtype",
+                      "counted", "finishes", "target", "names"))
+def _launched(query, key, value, read: tuple, hook_arrays: list, *, hook_tree: _HookTree,
+              spec: algebra.Forward, tiles: Tiles, family: mosaic.Family, training: bool, interpret: bool,
+              peaks: bool, out_dtype, counted: bool, finishes: bool, target: generation.GpuTarget,
+              names: tuple[str, str | None]):
+    """`_launch`'s kernel launched on its operands, the arrays its programs read beside them (`read`) and its
+    hooks' (`hook_arrays`, of the static `hook_tree`), lowered once for every call of its static facts
+    and its operands' shapes and dtypes (`tuning.lowered_once`); `target` the GPU its config is derived for,
+    `names` its name and the one its trace reports (`report.named`)."""
+    del target
+    hooks: Hooks = jax.tree.unflatten(hook_tree[0], hook_arrays)
+    leaves, treedef = jax.tree.flatten(read)
+    name, kernel_name = names
     batch, queries, heads, width = query.shape
     keys_count, kv_heads = key.shape[1], key.shape[2]
     group, consumers = heads // kv_heads, tiles.consumers
@@ -784,6 +738,6 @@ def _kernel_of(launch: _Launch) -> Callable:
             else pl.CostEstimate(flops=0, transcendentals=0, bytes_accessed=0))
     return family.kernel(entry, out_type=out_type, grid=(heads, queries // pair, batch),
                          grid_names=("heads", "q_tiles", "batch"), consumers=consumers, interpret=interpret,
-                         approx_math=approx_math, name=launch.name, kernel_name=launch.kernel_name,
-                         cost=cost,
-                         reducing_warpgroups=reducing(family, consumers, hooks.score_mod, hooks.output_mod))
+                         approx_math=approx_math, name=name, kernel_name=kernel_name, cost=cost,
+                         reducing_warpgroups=reducing(family, consumers, hooks.score_mod, hooks.output_mod)
+                         )(query, key, value, *leaves)

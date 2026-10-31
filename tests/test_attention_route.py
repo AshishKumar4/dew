@@ -431,7 +431,7 @@ def test_a_dense_bias_named_onto_the_template_is_on_par_with_the_reference_path(
                                                                                 request):
     """A causal bf16 call whose bias varies by query, `[B or 1, H or 1, Q, K]` (a learned relative
     position's, T5's one table for every row), named onto the template: its score hook reads the bias a
-    tile at a time where it is shared, never broadcast (`template.biased`, a `Kind.TILE` parameter at
+    tile at a time where it is shared, never broadcast (`template.Biased`, a `Kind.TILE` parameter at
     `template.shared_place`), on par (check 1) with the reference path's dense bias from float64, its
     output and the query's, key's, value's and bias's gradients, the bias's in its own shape (rows 2081,
     2523). In both of the Mosaic backward's schedules for a shared bias: deterministic mode's, each program
@@ -703,7 +703,7 @@ def test_the_route_takes_score_hooks_and_the_initial_state_and_refuses_an_output
     query, key, value, sinks, _ = drawing(QUERIES, KEYS, jnp.float32, sinks=True)(0)
     assert sinks is not None
     spans = template.spans(QUERIES, KEYS, ROWS, causal=True)
-    hooks = template.Hooks(score_mod=functools.partial(template.capped, SOFTCAP),
+    hooks = template.Hooks(score_mod=template.Capped(SOFTCAP),
                            initial=template.sinks(sinks, ROWS, QUERIES, WIDTH))
     assert attention_route.attend(query, key, value, spans, hooks).shape == (ROWS, QUERIES, HEADS, WIDTH)
     with pytest.raises(ValueError):
