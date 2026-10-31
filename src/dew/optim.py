@@ -34,9 +34,10 @@ import optax
 import tyro
 
 from dew._hashing import fmix32
+from dew._moments import bias_corrected
 from dew._records import share
 from dew.held_updates import refuse_untold, update_applied
-from dew.laprop import bias_corrected, laprop
+from dew.laprop import laprop
 from dew.mesh import LogicalAxes
 from dew.newton_schulz import (
     NEWTON_SCHULZ,
