@@ -8,11 +8,21 @@ with a held state."""
 import contextlib
 import dataclasses
 import functools
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import pytest
-from reference_error import FEWEST_SEEDS, assert_as_exact, with_gradients
+from reference_error import (
+    FEWEST_SEEDS,
+    as_given,
+    assert_as_exact,
+    declared_seeds,
+    indexed_recording,
+    recording,
+    with_gradients,
+)
+from selective_support import selective_draw, selective_xla
 
 from dew.batch import coordinates
 from dew.nn.inputs import AttentionMetadata, MixerCall
@@ -74,6 +84,33 @@ def the_template_is_as_exact_as_the_portable_scan(case: str, packed: bool, dtype
 @pytest.mark.parametrize("packed", [False, True], ids=["one row", "packed documents"])
 def test_the_template_is_as_exact_as_the_portable_scan_interpreted(packed):
     the_template_is_as_exact_as_the_portable_scan("interpreted", packed)
+
+
+SEEDED = Path(__file__).resolve().parent / "fixtures" / "mamba" / "selective_mamba_ssm_seeded.npz"
+
+
+def the_template_is_as_exact_as_mamba_ssm(case: str):
+    """`case` of the recording (tools/mamba_selective_reference.py's) through the scan's selector with the
+    template named, under the run's fast forms, its operands in the case's dtype: the output and every
+    input's gradient on par with recorded mamba_ssm on the case's declared draws, mamba_ssm's own distance
+    from float64 at the same inputs the bound (check 1), the truth Dew's float64 portable scan, which the
+    recorder held to the oracle at every seed. A GPU cell (tests/test_gpu_recurrence.py), the template
+    compiled."""
+    stored = recording(SEEDED)
+    seeds = declared_seeds(SEEDED)[case]
+    dtype = jnp.dtype(str(stored[f"{case}.dtype"]))
+    draw, reference, truth = indexed_recording(
+        stored, case, seeds, inputs_of=functools.partial(selective_draw, case=case),
+        truth_fn=jax.jit(selective_xla))
+    scan = functools.partial(recurrence_chunk.selective_scan, portable=portable)
+
+    def run(index, arrays):
+        del index
+        with generation.chosen(selective_scan="mosaic_gpu"):
+            return selective_xla(arrays, dtype, scan=scan)
+
+    assert_as_exact(jax.jit(run), as_given(reference), draw, f"the selective template against mamba_ssm, "
+                    f"{case}", seeds=seeds, truth_fn=as_given(truth))
 
 
 def test_the_training_forward_keeps_a_state_a_backward_block():
