@@ -304,9 +304,9 @@ def _segment(root: Store, segment: Mapping[str, object], completions: dict, shar
     if not local(fs):
         digest, size = hashlib.sha256(), 0
         with fs.open(path, "rb") as stored:
-            while payload := stored.read(2**20):
-                digest.update(payload)
-                size += len(payload)
+            while read := stored.read(2**20):
+                digest.update(read)
+                size += len(read)
         if (digest.hexdigest(), size) != (declared.digest, declared.size):
             raise Replaced(f"{shard.url} holds other bytes than its writer's segment declares")
     with closing(ArrayRecords((shard.url,), root.storage_options, declared=(declared,))) as rows:

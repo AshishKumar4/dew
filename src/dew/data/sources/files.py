@@ -352,6 +352,15 @@ class Files(Dataset):
         return {url: Declared(Store(url, self.storage_options), self.declared[url])
                 for url in self.paths if url in self.declared}
 
+    def _declared_index(self, url: str) -> Declared | None:
+        """The offset index at `url` as its producer declared it, where the declaration holds a read of it
+        to something (`Declared`: a digest or its store's version); an index stated by its size alone is
+        read as its store holds it, its records' bounds checked as each is read (`_IndexedLines`)."""
+        stated = self.declared.get(url)
+        if stated is None or not ({"sha256", "stored", "ETag"} & set(stated)):
+            return None
+        return Declared(Store(url, self.storage_options), stated)
+
     def _opened(self, url: str) -> BinaryIO:
         """A binary file of `url`'s bytes: as its producer declared them where one did
         (`_declared_objects`), else as its store holds them (`Store.readable`)."""
@@ -379,10 +388,14 @@ class Files(Dataset):
 
     @cached_property
     def _root(self) -> Store:
-        """Where an export's manifest and the files it lists are read: its URL, a Hub repository's branch at
-        the commit it names as the manifest is first read (`Store.pinned`), so every file is read at the
-        commit its manifest was, though the branch moves on."""
-        return Store(str(self.url), self.storage_options).pinned()
+        """Where an export's manifest and the files it lists are read: its URL, and for an export on a Hub
+        repository's branch the commit the branch names as its manifest is first read (`Store.pinned`), so
+        every file is read at the commit its manifest was, though the branch moves on."""
+        named = Store(str(self.url), self.storage_options)
+        if self.file_info is not None or not isinstance(self.url, str):
+            return named
+        fs, path = named.child("_dew_manifest.json").resolve()
+        return named.pinned() if fs.exists(path) else named
 
     @cached_property
     def committed(self) -> Mapping[str, object] | None:
@@ -1078,12 +1091,8 @@ class _IndexedLines:
 
         self.source = source
         self.indexes = source._indexes
-        self.index_files = tuple(
-            ArrayIndex(url, source.storage_options,
-                       Declared(Store(url, source.storage_options), source.declared[url])
-                       if url in source.declared else None)
-            for url in self.indexes
-        )
+        self.index_files = tuple(ArrayIndex(url, source.storage_options, source._declared_index(url))
+                                 for url in self.indexes)
         self.tables = tuple(index.values for index in self.index_files)
         self.ranges = Ranges(tuple(len(index) for index in self.tables))
         def held(url: str) -> Held:
