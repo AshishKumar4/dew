@@ -421,20 +421,83 @@ BUILT_IN = {
     "smollm3": {},
     "olmo2": {},
     "hy_v3": {"num_experts": 8, "num_experts_per_tok": 2, "num_shared_experts": 1,
-              "moe_intermediate_size": 32, "router_scaling_factor": 2.826},
+              "moe_intermediate_size": 32, "router_scaling_factor": 2.826,
+              "num_nextn_predict_layers": 1},
     "glm4_moe_lite": {"head_dim": None, "num_key_value_heads": 4, "n_routed_experts": 8,
                       "num_experts_per_tok": 2, "n_shared_experts": 1, "moe_intermediate_size": 32,
                       "q_lora_rank": 24, "kv_lora_rank": 16, "qk_nope_head_dim": 16, "qk_rope_head_dim": 8,
-                      "v_head_dim": 16, "n_group": 2, "topk_group": 1, "routed_scaling_factor": 1.8},
+                      "v_head_dim": 16, "n_group": 2, "topk_group": 1, "routed_scaling_factor": 1.8,
+                      "num_nextn_predict_layers": 1},
 }
 """transformers' own types that no registered family reads, each made of known parts, by their fields beside
 `tiny_config`'s: Granite's multipliers, SmolLM3's layers without positions (its fourth), OLMo 2's
 output-normed sublayers, HY-3's routed experts beside a shared one, and GLM-4.7-Flash's latent attention
 (DeepSeek V3's, whose `head_dim` names the rotated slice, so it is left to the config) with its grouped
-sigmoid router. Each type's first layer is dense and the others route."""
+sigmoid router. Each type's first layer is dense and the others route; the last two state one prediction
+depth, which their releases store past the trunk (`with_prediction_depth`)."""
 
 BUILT_IN_SEEDS = {"granite": 8, "smollm3": 8, "olmo2": 8, "hy_v3": 8, "glm4_moe_lite": 8}
 """Each built-in type's declared check-1 seeds for its logits, sized by `seeds_for` on armada."""
+
+
+def with_prediction_depth(directory, layers: int, width: int, extra: tuple[str, ...] = ()) -> None:
+    """The checkpoint at `directory` with a prediction depth past its `layers` trunk layers, as
+    GLM-4.7-Flash's and HY-3's releases store one (`model.layers.{layers}.*`): its normed inputs, their
+    projection, its output norm and a block, and GLM-4.7-Flash's copies of the trunk's table and head,
+    beside the trunk the source's own save writes; `extra` names more tensors under it."""
+    from safetensors.torch import load_file, save_file
+
+    path = directory / "model.safetensors"
+    tensors = load_file(path)
+    last, depth = f"model.layers.{layers - 1}.", f"model.layers.{layers}."
+    tensors.update({depth + name.removeprefix(last): tensor.clone() for name, tensor in tensors.items()
+                    if name.startswith(last)})
+    generator = torch.Generator().manual_seed(7)
+    tensors.update({depth + "eh_proj.weight": torch.randn(width, 2 * width, generator=generator),
+                    depth + "enorm.weight": torch.ones(width), depth + "hnorm.weight": torch.ones(width),
+                    depth + "shared_head.norm.weight": torch.ones(width),
+                    depth + "embed_tokens.weight": tensors["model.embed_tokens.weight"].clone(),
+                    depth + "shared_head.head.weight": tensors["lm_head.weight"].clone(),
+                    **{depth + name: torch.ones(width) for name in extra}})
+    save_file(tensors, path, metadata={"format": "pt"})
+
+
+def test_a_released_prediction_depth_is_left_unread_and_its_copies_follow_the_trunk(tmp_path):
+    """GLM-4.7-Flash's release stores a prediction depth past its trunk, which its own code builds none
+    of and its load leaves unread: a load reads the trunk alone, whether it keeps the depth or not
+    (`prediction_depths=0`), and computes the same logits; the depth's copies of the table and head are
+    the trunk's, so a save after the table changes writes the copy that reloads. A tensor under the depth
+    that is none of its own and no block's is refused."""
+    from interop_support import tiny_config
+    from safetensors import safe_open
+    from transformers import AutoModelForCausalLM
+
+    torch.manual_seed(0)
+    config = tiny_config("glm4_moe_lite", **BUILT_IN["glm4_moe_lite"])
+    model = AutoModelForCausalLM.from_config(config, dtype=torch.float32)
+    scatter_weights(model)
+    model.save_pretrained(tmp_path / "release")
+    with_prediction_depth(tmp_path / "release", config.num_hidden_layers, config.hidden_size)
+    kept = Pretrained.load(tmp_path / "release", dtype="float32", attention_impl="reference")
+    trunk = Pretrained.load(tmp_path / "release", dtype="float32", attention_impl="reference",
+                            prediction_depths=0)
+    ids = np.random.default_rng(0).integers(0, config.vocab_size, (2, 12)).astype(np.int32)
+    np.testing.assert_array_equal(np.asarray(kept.model.apply(kept.variables, ids)),
+                                  np.asarray(trunk.model.apply(trunk.variables, ids)))
+    table = kept.variables["params"]["embed_tokens"]["embedding"]
+    kept.save(tmp_path / "saved", variables={**kept.variables, "params": {
+        **kept.variables["params"], "embed_tokens": {"embedding": np.asarray(table) * 2}}})
+    reloaded = Pretrained.load(tmp_path / "saved", dtype="float32", attention_impl="reference")
+    np.testing.assert_array_equal(np.asarray(reloaded.variables["params"]["embed_tokens"]["embedding"]),
+                                  np.asarray(table) * 2)
+    copy = f"model.layers.{config.num_hidden_layers}.embed_tokens.weight"
+    with safe_open(tmp_path / "saved" / "model.safetensors", "np") as stored:
+        np.testing.assert_array_equal(stored.get_tensor(copy), np.asarray(table) * 2)
+    model.save_pretrained(tmp_path / "unknown")
+    with_prediction_depth(tmp_path / "unknown", config.num_hidden_layers, config.hidden_size,
+                          ("unknown.weight",))
+    with pytest.raises(ValueError):
+        Pretrained.load(tmp_path / "unknown", dtype="float32", attention_impl="reference")
 
 
 @pytest.mark.parametrize("model_type", sorted(BUILT_IN))
@@ -442,7 +505,9 @@ def test_a_built_in_type_of_known_parts_loads_natively(tmp_path, model_type):
     """A type transformers builds and no registered family reads verifies from parts and loads as a
     native decoder, its logits holding check 1 against transformers' own. A routed type's checkpoint
     holds each expert's projections apart, as transformers saves them, which its load stacks into the
-    fused tensors its experts module holds (its conversion mapping): the load reads them as stored."""
+    fused tensors its experts module holds (its conversion mapping): the load reads them as stored. A
+    release's prediction depth past the trunk, which the source's own code builds none of and its load
+    leaves unread, is left unread too."""
     from interop_support import tiny_config
     from safetensors import safe_open
     from transformers import AutoModelForCausalLM
@@ -452,6 +517,8 @@ def test_a_built_in_type_of_known_parts_loads_natively(tmp_path, model_type):
     model = AutoModelForCausalLM.from_config(config, dtype=torch.float32)
     scatter_weights(model)
     model.save_pretrained(tmp_path)
+    if BUILT_IN[model_type].get("num_nextn_predict_layers"):
+        with_prediction_depth(tmp_path, config.num_hidden_layers, config.hidden_size)
     with safe_open(tmp_path / "model.safetensors", "pt") as stored:
         names = set(stored.keys())
     routed = model_type in ("hy_v3", "glm4_moe_lite")

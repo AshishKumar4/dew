@@ -113,11 +113,19 @@ def test_a_verified_load_saves_the_source_config_and_reloads(tmp_path, model_typ
                                   np.asarray(loaded.model.apply(loaded.variables, ids)))
 
 
-def _by_conventions(model: Glm4MoeLiteForCausalLM) -> None:
-    """`model` with its rotary called through its instance's own forward, the same rotation, which tier 2
-    does not assemble from parts (`parts.identify`): the probe's candidates are the conventions alone."""
-    rotary = model.model.rotary_emb
-    rotary.forward = rotary.forward
+class _ConventionRotary(Glm4MoeLiteRotaryEmbedding):
+    """GLM-4.7-Flash's rotary, its forward a call of the known one's: the same rotation by code no known
+    part's is, so tier 2 assembles no model holding it from parts and the probe's candidates are the
+    conventions alone."""
+
+    def forward(self, x, position_ids):
+        cos, sin = super().forward(x, position_ids)
+        return cos, sin
+
+
+def _by_conventions(model: Glm4MoeLiteForCausalLM, config: Glm4MoeLiteConfig | None = None) -> None:
+    """`model` turning its rotary (of `config`, its own by default) through `_ConventionRotary`."""
+    model.model.rotary_emb = _ConventionRotary(model.config if config is None else config)
 
 
 class _FlashConfig(Glm4MoeLiteConfig):
@@ -190,8 +198,7 @@ class _RamplessFlash(Glm4MoeLiteForCausalLM):
         super().__init__(config)
         plain = copy.deepcopy(config)
         plain.rope_parameters = {"rope_type": "default", "rope_theta": config.rope_parameters["rope_theta"]}
-        self.model.rotary_emb = Glm4MoeLiteRotaryEmbedding(plain)
-        _by_conventions(self)
+        _by_conventions(self, plain)
 
 
 class _DeepRamplessConfig(Glm4MoeLiteConfig):

@@ -490,6 +490,18 @@ class VerifiedMapping:
             return parts.family(self.model_type, _assembled(source, hf_config))
         return dict(CONVENTIONS)[self.family]
 
+    def record(self, hf_config: Mapping[str, object],
+               entry: decoder_parts.DecoderFamily | None = None) -> decoder_parts.DecoderFields:
+        """The real config's record through `entry` (`entry`'s family by default), its tensor names
+        unchecked: what a load's selection of the checkpoint's tensors (its prediction depths,
+        `DecoderFamily.prediction_depth`) reads before `translate` checks the selection's names."""
+        entry = self.entry(hf_config) if entry is None else entry
+        try:
+            record, _ = _translate(hf_config, self.family, entry)
+        except _Mismatch as error:
+            raise _refuse(self.model_type, str(error)) from error
+        return record
+
     def translate(self, hf_config: Mapping[str, object], tensor_names: Collection[str],
                   entry: decoder_parts.DecoderFamily | None = None) -> decoder_parts.DecoderFields:
         """Translate the real config and check the real tensor names, then warn once.
@@ -499,10 +511,7 @@ class VerifiedMapping:
         `entry` is the family `entry` gave for this config, where the caller holds it.
         """
         entry = self.entry(hf_config) if entry is None else entry
-        try:
-            record, _ = _translate(hf_config, self.family, entry)
-        except _Mismatch as error:
-            raise _refuse(self.model_type, str(error)) from error
+        record = self.record(hf_config, entry)
         unmapped = _unmapped(tensor_names, record, entry)
         if unmapped:
             raise _refuse(self.model_type, f"the tensors {unmapped[:8]} have no path in the {self.family!r} "
