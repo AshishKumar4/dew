@@ -675,8 +675,14 @@ def _coords(family: mosaic.Family, spans: _Spans | None, row, first, k_first, sh
         # 64 x 192 forward spilling 344 bytes, D128's training 64 x 64 72).
         return lax.broadcast_in_dim(start + family.iota((shape[axis],), 0, columns=axis == 1), shape, (axis,))
 
-    q_pos = places(first, query_axis) if q_pos is None else q_pos
-    k_pos = (places(k_first, key_axis) if columns is None or keys_first else k_first + columns)
+    if keys_first:
+        # Keys first, the queries' places a tile (a query's column vector beside the tile's layout finds no
+        # layout in Mosaic GPU's inference), the keys' a row vector broadcast.
+        q_pos = first + family.iota(shape, query_axis) if q_pos is None else q_pos
+        k_pos = places(k_first, key_axis)
+    else:
+        q_pos = places(first, query_axis) if q_pos is None else q_pos
+        k_pos = places(k_first, key_axis) if columns is None else k_first + columns
     if spans is None:
         return algebra.Coords(q_pos, k_pos, drop=draw, keys_first=keys_first)
     rows, keys = pl.ds(first, shape[query_axis]), pl.ds(k_first, shape[key_axis])
