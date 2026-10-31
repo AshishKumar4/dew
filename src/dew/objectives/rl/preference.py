@@ -16,7 +16,7 @@ import jax.numpy as jnp
 
 from dew.artifacts import TokenScores
 from dew.batch import VALID_ROWS, Variables
-from dew.data.preferences import IDS_KEY, MASK_KEY
+from dew.data.preferences import IDS_KEY, MASK_KEY, REAL_KEY
 from dew.inputs import Field, InputSpec
 from dew.nn.inspection import watched_positions
 from dew.objectives.base import Aux, EMASpec
@@ -27,12 +27,12 @@ from ..lm.objective import TokenScorer
 
 
 def _real_inputs(batch) -> jax.Array:
-    """Each half's real input tokens, chosen rows then rejected as the policy scores them: every token up to
-    the half's last completion token, its prompt's and its completion's, none of the padding after it
-    (`dew.data.preferences.PreferencePair`, which pads each half past its completion)."""
-    marked = jnp.asarray(batch[MASK_KEY]) > 0
-    # The last completion token and every one before it: a mark at or after the place.
-    real = jnp.flip(jnp.cumsum(jnp.flip(marked, -1), -1), -1) > 0
+    """Each half's real input tokens as its pair's layout marks them (`dew.data.preferences.REAL_KEY`),
+    chosen rows then rejected as the policy scores them."""
+    if REAL_KEY not in batch:
+        raise ValueError(f"a preference run that watches activations reads each half's real tokens from its "
+                         f"batch's {REAL_KEY!r}, which dew.data.preferences.PreferencePair lays out")
+    real = jnp.asarray(batch[REAL_KEY]) > 0
     return jnp.concatenate((real[:, 0, :-1], real[:, 1, :-1]))
 
 
