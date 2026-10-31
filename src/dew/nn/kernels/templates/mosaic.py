@@ -576,6 +576,10 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     operands_in_registers: bool
     """Whether a product reads its operands from registers a consumer loads them into (mma.sync's), where
     warpgroup MMA reads both from shared memory."""
+    loads_ahead: int = 1
+    """The steps a walk keeps loading ahead of the one its products consume to hide its loads' latency: one
+    where a producer's asynchronous copies run beside the consumers (TMA), more where the consumers issue
+    them between their own products (`Mma`'s cp.async)."""
     products_overlap: bool
     """Whether a warpgroup's products run asynchronously, an issued product's accumulator held while the
     program goes on (warpgroup MMA's), where each mma.sync product completes before the next: a launch's

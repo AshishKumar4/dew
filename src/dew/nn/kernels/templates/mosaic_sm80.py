@@ -95,6 +95,10 @@ class Mma(mosaic.Family):
     bounded_loads = False
     role_rows = 4 * 16
     operands_in_registers = True
+    # A step loading ahead of the one consumed leaves cp.async's latency unhidden: two steps 64 deep stalled
+    # on barriers 1.1-1.5 an issue against XLA's 0.3-0.7 (FS-NCU-DW2-a100), and 32-deep steps three
+    # deep took dense products 4-8% less time than 64 deep two (FS-DENSE-STEPS1-a100).
+    loads_ahead = 2
     products_overlap = False
     stores_through_registers = True
 
