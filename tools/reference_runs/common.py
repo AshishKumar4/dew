@@ -220,7 +220,7 @@ class TracedWindow:
     The steps from `warmup` up to the last `profiled` ones are timed,
     synchronized at both ends and nowhere inside; the last `profiled` are
     traced by jax.profiler into `trace_dir`, with its Python tracer off as
-    in a Dew capture (`dew.telemetry.profile.capture_options`, which this
+    in a Dew capture (`dew.telemetry.profile.CaptureOptions`, which this
     module can't import): the tracer records every Python and C call and
     slows a host-bound run's steps. Call `before(step, pending)` ahead of
     each step with the newest output still in flight, add any in-window

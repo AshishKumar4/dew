@@ -901,6 +901,40 @@ def test_kernel_sums_preserve_decode_categories_counts_and_overlapping_streams(s
     assert sum(durations.values()) > split["busy"]
 
 
+
+def test_the_shared_image_set_reads_its_shards_in_the_order_given_as_dew_decodes_a_prepared_image(
+        tmp_path, monkeypatch):
+    """tools/reference_runs/image_set.py reads its prepared ArrayRecord shards through Dew's reader in the
+    order its command line names them, each record's pixels as Dew decodes a prepared image
+    (`DecodeImage`, its integers little-endian), and draws its epochs from its seed (row 3030)."""
+    from array_record.python.array_record_module import ArrayRecordWriter
+
+    from dew.data.sources.codec import pack_dict_of_byte_arrays
+
+    images = [np.arange(18, dtype=np.uint8).reshape(2, 3, 3) + 20 * value for value in range(5)]
+    shards = [str(tmp_path / f"{name}.array_record") for name in ("b", "a")]
+    for path, held in zip(shards, (images[:3], images[3:]), strict=True):
+        writer = ArrayRecordWriter(path, "group_size:1")
+        for image in held:
+            writer.write(pack_dict_of_byte_arrays({"shape": np.asarray([2, 3], "<i4").tobytes(),
+                                                   "image": image.tobytes(),
+                                                   "label": np.asarray([7], "<i4").tobytes()}))
+        writer.close()
+    monkeypatch.syspath_prepend(str(REPO_ROOT / "tools" / "reference_runs"))
+    tool = load("reference_runs/image_set")
+    out = tmp_path / "set.npz"
+    monkeypatch.setattr(sys, "argv", ["image_set.py", "--shards", *shards, "--images", "4", "--epochs", "2",
+                                      "--seed", "3", "--out", str(out)])
+    tool.main()
+    saved = np.load(out)
+    generator = np.random.default_rng(3)
+    np.testing.assert_array_equal(saved["images"], np.stack(images[:4]))
+    np.testing.assert_array_equal(saved["order"], np.stack([generator.permutation(4) for _ in range(2)]))
+    monkeypatch.setattr(sys, "argv", ["image_set.py", "--shards", *shards, "--images", "6",
+                                      "--out", str(out)])
+    with pytest.raises(ValueError):
+        tool.main()
+
 # ---------------------------------------------------------------------------
 # tools/reference_runs/scoreboard.py
 # ---------------------------------------------------------------------------
@@ -2000,6 +2034,57 @@ def test_the_data_benchmark_counts_a_grain_packing_and_dews_alike_as_the_objecti
     next(pictures)
     assert {key: value for key, value in pictures.counts.get().items() if key != "padded_tokens"} == {
         "rows": 2, "tokens": 2, "model_flops": None}
+
+
+def test_the_data_benchmark_rates_its_training_window_over_the_whole_mesh_as_the_trainer_does():
+    """The data benchmark's training window is rated as the trainer's interval rates its steps
+    (`dew.training.interval.throughput`): the objective's work on the host's whole batch over the peak of
+    every device the step's mesh spans, not over one device's, and the compiled work, each device's, a
+    lower bound beside the launches it left out (row 3023)."""
+    from dew.nn.kernels.generation import gpu_target
+    from dew.telemetry.instrumentation import StepFlops
+
+    tool = load("benchmark_data")
+    peak = gpu_target("a100").bf16_peak
+    work, compiled = 3.0e13, StepFlops(2.0e12, 4.0e12)
+    rates = tool.rated(2.0, 2, 16, compiled, work, 8, peak=peak)
+    assert rates["model_mfu_bf16_peak"] == work / 8 / 2 / (2.0 / 2) / peak
+    assert rates["hlo_utilization_bf16_peak"] == compiled.hardware / 2 / (2.0 / 2) / peak
+    assert rates["unsized_kernels_per_step"] == 0
+    uncounted = tool.rated(2.0, 2, 16, StepFlops(2.0e12, 4.0e12, 6.0), None, 8, peak=peak)
+    assert uncounted["model_mfu_bf16_peak"] is None
+    assert uncounted["hlo_utilization_bf16_peak"] == compiled.hardware / 2 / (2.0 / 2) / peak
+    assert uncounted["unsized_kernels_per_step"] == 3.0
+
+
+@pytest.mark.mesh
+def test_the_data_benchmark_reports_a_steps_uncounted_launches_beside_its_utilization():
+    """A step that runs a launch no count sizes (here LAPACK's Cholesky on a CPU, which no table
+    knows) is reported as the trainer reports it, beside the launches it left out, so its compiled work
+    reads as the lower bound it is, never as a complete count (row 3023)."""
+    import itertools
+
+    from flax import linen as nn
+
+    from dew.inputs import Field, InputSpec
+    from dew.objectives.supervised import Supervised
+
+    class Factored(nn.Module):
+        @nn.compact
+        def __call__(self, image):
+            values = nn.Dense(3)(jnp.mean(image.astype(jnp.float32), axis=(1, 2)))
+            gram = values.T @ values + jnp.eye(3)
+            return values @ jnp.linalg.cholesky(gram)
+
+    tool = load("benchmark_data")
+    worker = tool.Worker("dew", "image", Path("in"), Path("out"),
+                         tool.Measurement(batch=8, image_size=4, warmup=1, train_steps=2))
+    objective = Supervised(Factored(), lambda outputs, batch: jnp.mean(jnp.square(outputs), axis=-1),
+                           inputs=InputSpec(Field("image", (4, 4, 3))))
+    batch = {"image": np.ones((8, 4, 4, 3), np.uint8)}
+    measured = tool.training_measure(lambda: itertools.repeat(batch), objective, worker)
+    assert measured["unsized_kernels_per_step"] >= 1
+    assert measured["model_mfu_bf16_peak"] is None
 
 
 def test_every_remote_code_release_carries_the_fields_its_loader_reads(monkeypatch):

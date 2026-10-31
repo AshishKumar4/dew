@@ -73,12 +73,15 @@ class JepaRunConfig(RunConfig):
                              "go together")
         # A frame is [height, width, channels], an image's or each of a clip's.
         grid = (sample.shape[-3] // encoder.patch_size, sample.shape[-2] // encoder.patch_size)
-        # The encoder's effective arguments, its class's defaults among them, as the encoder was built.
-        fields = self.model.arguments
+        # The encoder's settings as it was built, read off the built module: its class's defaults and what
+        # the run derived for it (its compute dtype from the run's numerics), which no record of its
+        # arguments states. The predictor takes the shared ones unless `predictor` sets them, and always
+        # computes as the encoder does, its dtype and attention kernel.
+        shared = {key: getattr(encoder, key) for key in SHARED_MODEL_KEYS
+                  if hasattr(encoder, key) and key not in self.predictor}
         predictor = ModelConfig("jepa_predictor", {
-            **{key: value for key, value in fields.items() if key in SHARED_MODEL_KEYS}, **self.predictor,
-            "grid": grid, "factorized": video, "scan_order": encoder.scan_order,
-            **{key: fields[key] for key in ("dtype", "attention_impl") if key in fields}}).build()
+            **self.predictor, "grid": grid, "factorized": video, "scan_order": encoder.scan_order}).build(
+                **shared, dtype=encoder.dtype, attention_impl=encoder.attention_impl)
         mask = MultiBlockMask.for_grid(grid, num_targets=self.num_target_blocks, scale=self.target_scale,
                                        aspect=self.target_aspect, scan_order=encoder.scan_order)
         ramp = {}
