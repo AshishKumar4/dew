@@ -31,12 +31,13 @@ class Regression64(Objective):
     step's draw, so a step's key shows in its gradient; `scaled`, its error times a batch scalar;
     `weighted`, its error a `Weighted` of one term, statistics a window replays rather than pools;
     `rowwise`, its statistics each row's error and count, which add over a window and its own reduction
-    divides."""
+    divides; `drawn`, beside them the update's draws of a value an example (`Step.sample_update`), one an
+    example of the whole update, which its reduction leaves aside."""
 
     def __init__(self, *, noisy: bool = False, scaled: bool = False, weighted: bool = False,
-                 rowwise: bool = False):
+                 rowwise: bool = False, drawn: bool = False):
         self.model, self.noisy, self.scaled, self.weighted = Affine64(), noisy, scaled, weighted
-        self.rowwise = rowwise
+        self.rowwise, self.drawn = rowwise or drawn, drawn
 
     def reduce_loss(self, stats):
         if self.rowwise:
@@ -52,7 +53,12 @@ class Regression64(Objective):
             x = x + 0.1 * jax.random.normal(step.key, x.shape, x.dtype)
         squares = (self.model.apply(variables, x) - batch["y"]) ** 2
         if self.rowwise:
-            return (jnp.mean(squares, axis=-1), jnp.ones(squares.shape[:1], squares.dtype)), Aux({})
+            count = jnp.ones(squares.shape[:1], squares.dtype)
+            if not self.drawn:
+                return (jnp.mean(squares, axis=-1), count), Aux({})
+            update = step.sample_update("weight", jax.random.uniform, (), dtype=squares.dtype,
+                                        rows=squares.shape[0])
+            return (jnp.mean(squares, axis=-1), count, update), Aux({})
         if self.weighted:
             term = Ratio(jnp.sum(squares), jnp.asarray(squares.size, squares.dtype))
             return Weighted((term,), (1.0,)), Aux({})
@@ -279,12 +285,12 @@ def test_a_supplied_diloco_state_trains_on_from_each_groups_own_state():
 
 
 @pytest.mark.mesh(devices=2)
-@pytest.mark.parametrize("statistics", ["weighted", "rowwise"])
+@pytest.mark.parametrize("statistics", ["weighted", "rowwise", "drawn"])
 def test_a_diloco_run_of_replayed_windows_trains_as_one_pooling_its_gradients(statistics):
-    """A loss whose statistics a window replays rather than pools, a `Weighted` or each row's error, each
-    group's window its own rows' (row 876 review): the groups' windows are shaped and allocated as one
-    group's, and with every inner update's window of two steps the run trains as one whose loss pools
-    them."""
+    """A loss whose statistics a window replays rather than pools, a `Weighted`, each row's error, or those
+    beside the update's draws of every example (row 876 review): the groups' windows are shaped and
+    allocated as one group's step reads them, its examples among the whole update's, and with every inner
+    update's window of two steps the run trains as one whose loss pools them."""
     with jax.enable_x64(new_val=True):
         def run(objective):
             return trainer(2, diloco=DiLoCo(every=2, rate=OUTER_RATE, momentum=MOMENTUM), objective=objective,
