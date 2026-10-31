@@ -43,33 +43,31 @@ def linear_scan(decays: jax.Array, writes: jax.Array, carried: jax.Array, exchan
                 interpret: bool = False) -> tuple[jax.Array, jax.Array]:
     """`(states, last)`: each position's state of the recurrence `h_t = a_t h_{t-1} + b_t` over `decays`
     `a` and `writes` `b`, fp32 `[T]` in `blocked(T)`'s layout, from `carried`, the state before the first
-    position, fp32 `[T]` each element the same; `last`, the state past the block, in `carried`'s form.
+    position, an fp32 scalar; `last`, the state past the block, a scalar too.
     `reverse` runs from the last position, `h_t = a_t h_{t+1} + b_t`; `exclusive` gives each position the
     state before it in the scan's order (`h_{t-1}`, or `h_{t+1}` reversed) rather than its own. `exchanged`
     is `scratch()`'s, which the warpgroup's threads meet on (a barrier) before and after they read it."""
     if interpret:
         return _interpreted(decays, writes, carried, reverse, exclusive)
     positions = decays.shape[0]
-    layout, splat = blocked(positions), plgpu.Layout.WG_SPLAT((positions,))
+    layout, scalar = blocked(positions), plgpu.Layout.WG_SPLAT(())
     scanned: Callable[..., tuple[jax.Array, jax.Array]] = plgpu.inline_mgpu(
-        arg_types=(layout, layout, splat, plgpu.RefType()),
+        arg_types=(layout, layout, scalar, plgpu.RefType()),
         return_type=(plgpu.ShapeDtypeStruct((positions,), jnp.dtype(jnp.float32), layout=layout),
-                     plgpu.ShapeDtypeStruct((positions,), jnp.dtype(jnp.float32), layout=splat)),
+                     plgpu.ShapeDtypeStruct((), jnp.dtype(jnp.float32), layout=scalar)),
     )(lambda ctx, a, b, h, ref: _scanned(a, b, h, ref, reverse, exclusive))
     return scanned(decays, writes, carried, exchanged)
 
 
 def summed(values: jax.Array, exchanged, *, interpret: bool = False) -> jax.Array:
-    """The sum of `values`, fp32 `[T]` in `blocked(T)`'s layout, as `[T]` each element the same: a thread's
-    positions in its registers, its warp's by shuffles, the four warps' through `exchanged`
-    (`scratch()`'s)."""
+    """The sum of `values`, fp32 `[T]` in `blocked(T)`'s layout, a scalar: a thread's positions in its
+    registers, its warp's by shuffles, the four warps' through `exchanged` (`scratch()`'s)."""
     positions = values.shape[0]
     if interpret:
-        return jnp.full_like(values, values.sum())
-    splat = plgpu.Layout.WG_SPLAT((positions,))
+        return values.sum()
     total: Callable[..., jax.Array] = plgpu.inline_mgpu(
         arg_types=(blocked(positions), plgpu.RefType()),
-        return_type=plgpu.ShapeDtypeStruct((positions,), jnp.dtype(jnp.float32), layout=splat),
+        return_type=plgpu.ShapeDtypeStruct((), jnp.dtype(jnp.float32), layout=plgpu.Layout.WG_SPLAT(())),
     )(lambda ctx, x, ref: _summed(x, ref))
     return total(values, exchanged)
 
@@ -96,7 +94,7 @@ def _summed(x: fa.FragmentedArray, exchanged):
         column = [arith.constant(index, 0), arith.constant(index, w)]
         total = arith.addf(total, memref.load(exchanged, column))
     utils.warpgroup_barrier()
-    return fa.FragmentedArray.splat(total, x.shape, fa.WGSplatFragLayout(x.shape))
+    return fa.FragmentedArray.splat(total, ())
 
 
 def _interpreted(decays, writes, carried, reverse: bool, exclusive: bool):
@@ -106,11 +104,12 @@ def _interpreted(decays, writes, carried, reverse: bool, exclusive: bool):
 
     a, b = lax.associative_scan(combined, (decays, writes), reverse=reverse)
     states = a * carried + b
-    last = jnp.full_like(carried, states[0] if reverse else states[-1])
+    last = states[0] if reverse else states[-1]
     if exclusive:
         # Each position's state the one before it in the scan's order, the carried state's at its first.
-        states = (jnp.concatenate([states[1:], carried[:1]]) if reverse
-                  else jnp.concatenate([carried[:1], states[:-1]]))
+        before = jnp.reshape(carried, (1,)).astype(states.dtype)
+        states = (jnp.concatenate([states[1:], before]) if reverse
+                  else jnp.concatenate([before, states[:-1]]))
     return states, last
 
 
@@ -194,4 +193,4 @@ def _scanned(a: fa.FragmentedArray, b: fa.FragmentedArray, carried: fa.Fragmente
     registers.flat[0] = vector.from_elements(a_vector.type, states)
     last = arith.addf(arith.mulf(total[0], h), total[1])
     return (fa.FragmentedArray(_registers=registers, _layout=a.layout, _is_signed=None),
-            fa.FragmentedArray.splat(last, carried.shape, carried.layout))
+            fa.FragmentedArray.splat(last, ()))

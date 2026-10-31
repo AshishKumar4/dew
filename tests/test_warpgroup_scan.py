@@ -33,14 +33,14 @@ def _scanned(decays, writes, *, reverse: bool, exclusive: bool = False, interpre
         layout = scan.blocked(positions)
         a, b = (plgpu.load(gmem, layout=layout, optimized=False) for gmem in (a_gmem, b_gmem))
         interpreted = interpret is not None
-        states, last = scan.linear_scan(a, b, jnp.full((positions,), CARRIED, jnp.float32), exchanged,
+        states, last = scan.linear_scan(a, b, jnp.asarray(CARRIED, jnp.float32), exchanged,
                                         reverse=reverse, exclusive=exclusive, interpret=interpreted)
         plgpu.store(states_gmem, states, optimized=False)
-        plgpu.store(last_gmem, last, optimized=False)
-        plgpu.store(total_gmem, scan.summed(b, exchanged, interpret=interpreted), optimized=False)
+        last_gmem[0] = last
+        total_gmem[0] = scan.summed(b, exchanged, interpret=interpreted)
 
-    vector = jax.ShapeDtypeStruct((positions,), jnp.float32)
-    return plgpu.kernel(body, out_type=(vector, vector, vector), grid=(1,), grid_names=("block",),
+    vector, scalar = (jax.ShapeDtypeStruct(shape, jnp.float32) for shape in ((positions,), (1,)))
+    return plgpu.kernel(body, out_type=(vector, scalar, scalar), grid=(1,), grid_names=("block",),
                         scratch_types=(scan.scratch(),), compiler_params=mosaic.compiler_params(),
                         interpret=interpret)(decays, writes)
 
@@ -70,7 +70,7 @@ def _assert_walked(found, decays, writes, reverse: bool, exclusive: bool) -> Non
     """The kernel's states, last state and sum within an fp32 scan's rounding of the walk's: each one's
     error against the largest state's size (the writes' largest for the sum), which a sum of `T` fp32
     products of decays below one keeps under `T` roundings."""
-    states, last, total = (np.asarray(x, np.float64) for x in found)
+    states, (last,), (total,) = (np.asarray(x, np.float64) for x in found)
     truth, past = _walked(decays, writes, reverse, exclusive)
     rounding = len(truth) * np.finfo(np.float32).eps
     size = max(np.abs(truth).max(), abs(past))
