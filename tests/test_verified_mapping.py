@@ -216,8 +216,9 @@ class _DeepRamplessFlash(Glm4MoeLiteForCausalLM):
             plain = copy.deepcopy(config)
             plain.rope_parameters = {"rope_type": "default",
                                      "rope_theta": config.rope_parameters["rope_theta"]}
-            self.model.rotary_emb = Glm4MoeLiteRotaryEmbedding(plain)
-        _by_conventions(self)
+            _by_conventions(self, plain)
+        else:
+            _by_conventions(self)
 
 
 FLASH_TYPES = {"flash": (_FlashConfig, _Flash), "unpadded": (_UnpaddedConfig, _UnpaddedFlash),
