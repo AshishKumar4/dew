@@ -662,9 +662,14 @@ def test_a_pipelined_stacks_watched_layers_each_report_every_microbatch():
 def test_a_watched_cotangent_is_the_updates_loss_whatever_its_split():
     """A window split into microbatches summarizes the cotangent of the update's pooled loss at its
     committing microbatch, not the microbatch's own loss (row 3144): over a batch of one row repeated, the
-    split of two logs the cotangent the whole batch's step logs."""
-    def logged(split: int) -> dict[str, float]:
+    split of two logs the cotangent the whole batch's step logs, and a loss stated as a scalar is
+    summarized too."""
+    def logged(split: int, *, scalar: bool = False) -> dict[str, float]:
         objective = watched_run(Stacked(scanned=False), None).objective
+        if scalar:
+            # A loss its objective states as one scalar, pooled by the microbatches' mean.
+            objective.loss = lambda variables, batch, step, loss=objective.loss: (
+                lambda stats, aux: (stats.mean()[0], aux))(*loss(variables, batch, step))
         run = Trainer(objective, optax.sgd(RATE), key=jax.random.key(0), split=split,
                       mesh=MeshSpec().build(jax.devices()[:1]),
                       inspection=Inspection(modules=("Block_1",), targets=("params",), cotangents=True))
@@ -673,7 +678,7 @@ def test_a_watched_cotangent_is_the_updates_loss_whatever_its_split():
         return {name: value for name, value in inspected(run, {"x": rows}).items() if "/cotangents/" in name}
 
     whole, split = logged(1), logged(2)
-    assert set(whole) == set(split)
+    assert set(whole) == set(split) and logged(2, scalar=True)
     # The mean square sums the committing microbatch's entries, half the batch's, each the same row's.
     squares = np.square(whole["inspect/cotangents/Block_1/rms"])
     assert_fp32_reduction_bound(np.square(split["inspect/cotangents/Block_1/rms"]), squares, squares,
