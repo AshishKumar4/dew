@@ -262,6 +262,9 @@ def test_the_derivation_decides_a_steps_fit_as_its_compile_does(layers, generati
     (roomy,) = gated(layers, generation, remat, 1 << 34, tmp_path / "roomy", precision)
     need, derived = (1 << 34) - roomy["headroom"], (1 << 34) - roomy["derived_headroom"]
     exact = roomy["derived"]["peak_exact"]
+    # An expert decoder's ragged products reach XLA at highest precision, where Dew's expert kernels
+    # step aside, and XLA expands them: its peak alone is a bound from below.
+    assert exact == (layers != "moe" or precision != "highest"), roomy["derived"]
     # A bound from below is a bound: the derived need never passes the compiled one.
     assert exact or derived <= need, (derived, need)
     for margin, admits in ((1.6, True), (0.6, False)):
@@ -279,5 +282,8 @@ def test_the_derivation_decides_a_steps_fit_as_its_compile_does(layers, generati
     assert fitting["fits"] and fitting["derived_headroom"] >= 0, fitting
     if remat == "full":
         tight = gated(layers, generation, remat, int(need * 0.6), tmp_path / "0.6", precision)[0]
+        # An exact peak refuses there; a bound from below may admit, a miss its compile corrects.
         assert tight["derived_headroom"] < 0 or not exact, tight
-        assert not tight["fits"] or tight["temp"] < roomy["temp"], tight
+        # Neither refuses a compile that fits, but where XLA's own rematerialization fit it below what
+        # the roomy compile held, which the derivation does not model.
+        assert not tight["fits"] or tight["derived_headroom"] >= 0 or tight["temp"] < roomy["temp"], tight

@@ -259,6 +259,26 @@ def test_a_ragged_product_holds_its_ragged_operand_once_a_group_on_a_gpu():
     assert peak_bytes(program, "cpu", 0) == 64 * 32 * 4 and not bounded_below(program, "cpu")
 
 
+def test_a_gradient_states_its_peak_a_bound_from_below_where_a_nested_ragged_product_expands():
+    """A gradient whose program expands a ragged product on a GPU, in a loop's body as an expert stack's
+    scan holds one, states its peak a bound from below (`Peak.exact` False); on a CPU, or with no ragged
+    product, its peak is the program's own."""
+    rows, sizes = jax.ShapeDtypeStruct((64, 16), jnp.float32), jax.ShapeDtypeStruct((4,), jnp.int32)
+    weights = jax.ShapeDtypeStruct((2, 4, 16, 16), jnp.float32)
+
+    def experts(weights, rows, sizes):
+        def layer(carried, kernel):
+            return jax.lax.ragged_dot(carried, kernel, sizes), None
+        return jnp.sum(jax.lax.scan(layer, rows, weights)[0]), ()
+
+    def dense(weights, rows, sizes):
+        return jnp.sum(rows @ weights[0, 0]), ()
+
+    assert not gradient_peak(experts, weights, (rows, sizes), platform="gpu", workspace=0).exact
+    assert gradient_peak(experts, weights, (rows, sizes), platform="cpu", workspace=0).exact
+    assert gradient_peak(dense, weights, (rows, sizes), platform="gpu", workspace=0).exact
+
+
 def test_ragged_products_over_one_operand_ragged_in_two_axes_expand_it_twice():
     """Two ragged products of one square operand over one group sizes, ragged in its first dimension and
     in its second, expand it twice: each expansion masks its own dimension (`RaggedToDense`'s iota runs
