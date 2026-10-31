@@ -348,6 +348,9 @@ def test_a_compile_beside_other_threads_mosaic_compiles_reads_only_its_own_kerne
     first, kept = traced
     assert kept != first
     assert [config for _, config, _ in refused] == [first]
+    # Every compile read is removed: the directory holds no more than the compiles since the last reading.
+    report.collected(())
+    assert not list(report.DIRECTORY.iterdir())
 
 
 GEMM_SHAPES = {"qwen3 gate": (4096, 2048, 768, 128), "mixtral up": (4096, 4096, 14336, 8),

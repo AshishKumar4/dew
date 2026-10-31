@@ -28,8 +28,10 @@ from filelock import FileLock
 from dew.files import write_atomically
 from dew.nn.kernels import generation
 
-DUMPS = {"MOSAIC_GPU_DUMP_PTXAS": "1", "MOSAIC_GPU_DUMP_RESOURCES": "1"}
-"""The settings that turn Mosaic GPU's reports on, written under `MOSAIC_GPU_DUMP_TO`."""
+DUMPS = {"MOSAIC_GPU_DUMP_PTXAS": "1"}
+"""The settings that turn on the report a run's compile reads (`compiled`), ptxas's, written under
+`MOSAIC_GPU_DUMP_TO` as each kernel compiles. Mosaic's resource estimate is written as a kernel lowers,
+whether or not it ever compiles, so only the compile gate asks for it."""
 OWNED = "DEW_MOSAIC_REPORTS"
 """The variable naming the reports directory a Dew process set (`DIRECTORY`): a child process inherits its
 parent's environment and takes a directory of its own."""
@@ -51,7 +53,8 @@ _log = logging.getLogger("dew.kernels")
 
 
 def _reports_directory() -> tuple[Path | None, tempfile.TemporaryDirectory | None]:
-    """Where this process's Mosaic GPU compiles write their reports, set once at import and never changed.
+    """Where this process's Mosaic GPU compiles write their reports, set once at import and never changed: a
+    directory of the process's own, which no other process's compiles write into or read by name.
     Mosaic reads the settings in every compile, whichever thread runs it, so a scope that set and restored
     them around one compile handed its directory to other threads' compiles and removed it under them (a
     task's scoring, its pass shapes compiled at once: 'Directory not empty', row 2790), and setting the
@@ -405,7 +408,7 @@ class Report:
 @dataclasses.dataclass
 class _Collected:
     """The reports this process's compiles wrote (`collected`), by kernel (`Report.kernel` and
-    `Report.launch`), and each compile's files read (their stem)."""
+    `Report.launch`), and the compiles read in a user's directory, whose files stay (their stem)."""
     kernels: dict[tuple[str, str | None], Report] = dataclasses.field(default_factory=dict)
     read: set[str] = dataclasses.field(default_factory=set)
 
@@ -418,29 +421,30 @@ def collected(kernels) -> list[Report]:
     `_lowering.KernelCall`) the process's compiles wrote (`DIRECTORY`), each kernel's compiles merged: one
     launch is one kernel whichever compile of it reported (a program calling it at several layers compiles
     it once a call; another thread's program may have compiled it first, Mosaic compiling a module once a
-    process). Another program's compiles are left to it. A compile is read once its ptxas report is whole,
-    then removed from Dew's own directory."""
+    process). Every compile whose ptxas report is whole is read, whichever program it was, and removed from
+    Dew's own directory, so the directory holds no more than the compiles since the last reading; one still
+    being written is read by a later call."""
     if DIRECTORY is None:
         return []
-    wanted = set(kernels)
     with _GUARD:
         for stem, found in _compiles(DIRECTORY).items():
-            name = KERNEL_COUNTER.sub("", stem)
-            launch = LAUNCH_SUFFIX.search(name)
-            key = (LAUNCH_SUFFIX.sub("", name), launch.group(1) if launch else None)
-            if stem in _COLLECTED.read or key not in wanted:
+            if stem in _COLLECTED.read:
                 continue
+            name = KERNEL_COUNTER.sub("", stem)
             report = _report(name, found, None)
             if report.registers is None:
-                # Its compile is still writing it: another thread's, of the same kernel.
+                # Its compile is still writing it.
                 continue
-            _COLLECTED.read.add(stem)
+            key = (report.kernel, report.launch)
             known = _COLLECTED.kernels.get(key)
             _COLLECTED.kernels[key] = report if known is None else _merged(known, report)
-            if _SCRATCH is not None:
+            if _SCRATCH is None:
+                _COLLECTED.read.add(stem)
+            else:
                 for path in found.values():
                     path.unlink()
-        return [_COLLECTED.kernels[key] for key in sorted(wanted, key=repr) if key in _COLLECTED.kernels]
+        found = _COLLECTED.kernels
+        return [found[key] for key in sorted(set(kernels), key=repr) if key in found]
 
 
 def _merged(first: Report, second: Report) -> Report:

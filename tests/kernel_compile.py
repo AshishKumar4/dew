@@ -155,13 +155,13 @@ _REPORTING = threading.Lock()
 
 @contextlib.contextmanager
 def reported(directory: str):
-    """Mosaic GPU's reports, each kernel's PTX among them (its register need, `register_need`), into
-    `directory` for the compiles in the block, the process's own settings (`report.DIRECTORY`) back after:
-    the gate compiles one case at a time in its process."""
-    names = (*report.DUMPS, "MOSAIC_GPU_DUMP_PTX", "MOSAIC_GPU_DUMP_TO")
+    """Mosaic GPU's reports, each kernel's resource estimate and PTX among them (its register need,
+    `register_need`), into `directory` for the lowerings and compiles in the block, the process's own settings
+    (`report.DIRECTORY`) back after: the gate compiles one case at a time in its process."""
+    dumps = {**report.DUMPS, "MOSAIC_GPU_DUMP_RESOURCES": "1", "MOSAIC_GPU_DUMP_PTX": "1"}
     with _REPORTING:
-        before = {name: os.environ.get(name) for name in names}
-        os.environ.update(report.DUMPS, MOSAIC_GPU_DUMP_PTX="1", MOSAIC_GPU_DUMP_TO=directory)
+        before = {name: os.environ.get(name) for name in (*dumps, "MOSAIC_GPU_DUMP_TO")}
+        os.environ.update(dumps, MOSAIC_GPU_DUMP_TO=directory)
         try:
             yield
         finally:
