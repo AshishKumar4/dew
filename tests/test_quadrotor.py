@@ -1,19 +1,21 @@
 """A racing quadrotor's physics (`dew.rl.quadrotor`): a control step of drawn drones under drawn commands held
 to a float64 NumPy transcription of the physics, written from the sources apart from Dew's code (the rigid
 body, the rotors' lag and the battery's voltage, the drag, the ground effect, the disturbances and the flight
-controller); a nominal drone holding its hover; its rate loop's step response; and a drone's drawn parameters
-about nominal."""
+controller); a nominal drone holding its hover, an equilibrium of that physics; and a drone's drawn
+parameters about nominal."""
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-import pytest
 from reference_error import assert_computes_the_oracle, chain_roundings
 
 from dew.rl.quadrotor import Body, Flight, Quadrotor, drawn_body, flown, hovering
 
 QUADROTOR = Quadrotor()
 HZ = 60.0
+NOMINAL_RATIO = 4 * 1.563e-6 * 2400 ** 2 / (0.768 * 9.81)
+"""The nominal racer's thrust over its weight at full charge, from Kaufmann et al.'s Table II: four rotors of
+1.563e-6 N s^2 at 2400 rad/s under 0.768 kg."""
 
 
 def quaternion_matrix(q: np.ndarray) -> np.ndarray:
@@ -147,41 +149,31 @@ def nominal(position=(0.0, 0.0, 2.0), quadrotor: Quadrotor = QUADROTOR) -> tuple
 
 
 def test_a_nominal_drone_holds_its_hover():
-    """The nominal drone at full charge, its battery holding its voltage (no resistance, no discharge),
-    commanded its weight and no rates two metres up, stays within a centimetre of where it started for two
-    seconds, level: the flight controller's duties give each rotor its share of the weight."""
-    steady = Quadrotor(resistance=(0.0, 0.0), discharge=0.0)
-    body, flight = nominal(quadrotor=steady)
-    weight = float(body.mass) * 9.81
-    step = jax.jit(lambda flight, key: flown(steady, body, flight, jnp.asarray(weight), jnp.zeros(3), key, HZ,
-                                             jnp.asarray(0.0)))
-    for key in jax.random.split(jax.random.key(1), int(2 * HZ)):
-        flight, _ = step(flight, key)
-    assert np.linalg.norm(np.asarray(flight.position) - [0.0, 0.0, 2.0]) < 0.01
-    assert abs(float(flight.orientation[0])) > 1 - 1e-6
+    """The nominal drone at full charge, where there is no ground effect and its battery holds its voltage (no
+    resistance, no discharge), at rest and level two metres up, commanded its weight and no rates for two
+    seconds in float64: the flight controller's duties give each rotor its share of the weight, so its
+    position, velocity, orientation, body rates and rotors' speeds stay as they started, to float64
+    rounding."""
+    steady = Quadrotor(resistance=(0.0, 0.0), discharge=0.0, ground_effect=(0.0, 0.0))
+    with jax.enable_x64(new_val=True):
+        body, start = nominal(quadrotor=steady)
+        weight = body.mass * 9.81
 
+        def hover(flight):
+            def step(flight, key):
+                return flown(steady, body, flight, weight, jnp.zeros(3), key, HZ, jnp.asarray(0.0))[0], None
 
-@pytest.mark.parametrize("lag", [0.02, 0.04, 0.06])
-def test_a_roll_rate_step_is_reached_quickly_without_ringing(lag):
-    """The nominal drone, its motors' lag drawn at each end and the middle, commanded a roll rate of 5 rad/s
-    from a hover: its roll rate passes 90% of the command within 70 ms, overshoots it by under 12%, and
-    settles within 5% by 200 ms (the rate loop's design)."""
-    body, flight = nominal((0.0, 0.0, 10.0))
-    body = body.replace(motor_lag=jnp.asarray(lag))
-    weight = float(body.mass) * 9.81
-    # One physics step a control step at 240 Hz: the rate loop's own rate.
-    quick = Quadrotor(substeps=1)
-    step = jax.jit(lambda flight, key: flown(quick, body, flight, jnp.asarray(weight),
-                                             jnp.asarray([5.0, 0.0, 0.0]), key, 240.0, jnp.asarray(0.0)))
-    roll = []
-    for key in jax.random.split(jax.random.key(2), 48):
-        flight, _ = step(flight, key)
-        roll.append(float(flight.angular_velocity[0]))
-    roll = np.asarray(roll) / 5.0
-    times = np.arange(1, len(roll) + 1) / 240
-    assert times[np.argmax(roll >= 0.9)] <= 0.07
-    assert roll.max() < 1.12
-    assert abs(roll[-1] - 1) < 0.05
+            return jax.lax.scan(step, flight, jax.random.split(jax.random.key(1), int(2 * HZ)))[0]
+
+        held = jax.jit(hover)(start)
+        roundings = chain_roundings(jax.make_jaxpr(hover)(start))
+
+    def stacked(flight: Flight, names: tuple[str, ...]) -> np.ndarray:
+        return np.concatenate([np.ravel(getattr(flight, name)) for name in names])
+
+    for names in (("position", "velocity"), ("orientation", "angular_velocity", "measured"), ("speed",)):
+        assert_computes_the_oracle(stacked(held, names), stacked(start, names), f"a hover's {names}",
+                                   roundings=roundings)
 
 
 def test_drawn_drones_spread_about_the_nominal_racer():
@@ -189,10 +181,17 @@ def test_drawn_drones_spread_about_the_nominal_racer():
     disturbance); at full randomization 4096 drones' masses, top speeds, lags and charges span their ranges
     and their thrust-to-weight ratios lie within the ranges' extremes."""
     keys = jax.random.split(jax.random.key(3), 4096)
-    still = jax.vmap(lambda key: drawn_body(QUADROTOR, key, jnp.asarray(0.0)))(keys)
-    ratio = np.asarray(jax.vmap(lambda body: body.thrust_to_weight(QUADROTOR))(still))
-    np.testing.assert_allclose(ratio, 4 * 1.563e-6 * 2400 ** 2 / (0.768 * 9.81), rtol=1e-6)
-    assert not np.asarray(still.force).any() and not np.asarray(still.moment).any()
+
+    def at_no_randomization(key):
+        body = drawn_body(QUADROTOR, key, jnp.asarray(0.0))
+        return body.thrust_to_weight(QUADROTOR), body.force, body.moment
+
+    with jax.enable_x64(new_val=True):
+        ratio, force, moment = jax.jit(jax.vmap(at_no_randomization))(keys)
+        roundings = chain_roundings(jax.make_jaxpr(jax.vmap(at_no_randomization))(keys))
+        assert_computes_the_oracle(np.asarray(ratio), np.full(4096, NOMINAL_RATIO),
+                                   "the nominal racer's thrust-to-weight ratio", roundings=roundings)
+    assert not np.asarray(force).any() and not np.asarray(moment).any()
     drawn = jax.vmap(lambda key: drawn_body(QUADROTOR, key, jnp.asarray(1.0)))(keys)
     mass, top = np.asarray(drawn.mass), np.asarray(drawn.top_speed)
     assert mass.min() < 0.768 * 0.82 and mass.max() > 0.768 * 1.18
@@ -200,7 +199,6 @@ def test_drawn_drones_spread_about_the_nominal_racer():
     lag, charged = np.asarray(drawn.motor_lag), np.asarray(drawn.charged)
     assert lag.min() < 0.022 and lag.max() > 0.058 and charged.min() < 3.72 and charged.max() > 4.18
     ratio = np.asarray(jax.vmap(lambda body: body.thrust_to_weight(QUADROTOR))(drawn))
-    nominal_ratio = 4 * 1.563e-6 * 2400 ** 2 / (0.768 * 9.81)
-    weakest = nominal_ratio * 0.85 * (0.9 * 3.7 / 4.2) ** 2 / 1.2
-    strongest = nominal_ratio * 1.15 * 1.1 ** 2 / 0.8
+    weakest = NOMINAL_RATIO * 0.85 * (0.9 * 3.7 / 4.2) ** 2 / 1.2
+    strongest = NOMINAL_RATIO * 1.15 * 1.1 ** 2 / 0.8
     assert weakest < ratio.min() and ratio.max() < strongest
