@@ -26,7 +26,7 @@ import numpy as np
 import optax
 import pytest
 from confident_support import confident, label_derivative, log_partition, log_softmax
-from reference_error import as_given, assert_as_exact, seeds_for, with_gradients
+from reference_error import as_given, assert_as_exact, assert_computes_the_oracle, seeds_for, with_gradients
 from residual_orders import order
 from sharded import collectives
 
@@ -1682,3 +1682,85 @@ def test_a_tile_of_the_excluded_column_alone_is_differentiated_twice_as_it_runs(
     value, curvature = jax.value_and_grad(moved)(hidden)
     assert value == moved(hidden)
     assert np.isfinite(np.asarray(curvature)).all()
+
+
+@pytest.mark.parametrize("head", ["whole", "tiled", "fused"])
+def test_each_heads_forward_derivative_is_the_whole_logits(head):
+    """Each head's own forward derivative (row 2690), in float64, where the heads compute in float64: its
+    losses' and log partitions' tangents along drawn directions of the states, the head, the per-column
+    scale and the bias are the whole logits' log-softmax's, the tiled head's over short last tiles; the
+    fused head's sum's too, and its per-token terms carry none, as in reverse (`fused_head_loss`)."""
+    with jax.enable_x64(new_val=True):
+        states, matrix, targets = inputs(vocab=37, features=6, tokens=(3, 5), dtype=jnp.float64)
+        primals = tuple(term.astype(jnp.float64) for term in (states, matrix, *columns(37)))
+        directions = tuple(jax.random.normal(jax.random.key(9 + index), term.shape, jnp.float64)
+                           for index, term in enumerate(primals))
+        weights = jnp.arange(15, dtype=jnp.float64).reshape(3, 5) % 3
+
+        def scored(states, matrix, scale, bias):
+            table = OutputTable(matrix, vocab_major=False, bias=bias, scale=scale)
+            if head == "fused":
+                total, (losses, _, log_z) = fused_head_loss(states, table, targets, weights, z_loss=1e-2,
+                                                            tile=(4, 11), predict=False)
+                return total, losses, log_z
+            losses, _, log_z = chunked_cross_entropy(states, table, targets, 4, predict=False,
+                                                     tile=None if head == "whole" else (4, 11))
+            return losses, log_z
+
+        def whole(states, matrix, scale, bias):
+            logits = OutputTable(matrix, vocab_major=False, bias=bias, scale=scale).logits(states)
+            log_z = jax.nn.logsumexp(logits, axis=-1)
+            losses = log_z - jnp.take_along_axis(logits, targets[..., None], axis=-1)[..., 0]
+            if head == "fused":
+                return jnp.sum(weights * (losses + 1e-2 * jnp.square(log_z))), losses, log_z
+            return losses, log_z
+
+        with jax.default_matmul_precision('highest'):
+            moved = jax.jvp(scored, primals, directions)[1]
+            truth = jax.jvp(whole, primals, directions)[1]
+    # Each logit sums its 6 features, each row's partition its 37 logits, the fused sum its 15 tokens.
+    if head == "fused":
+        assert_computes_the_oracle(moved[0], truth[0], "the fused head's sum's tangent",
+                                   roundings=6 + 37 + 15)
+        assert not np.asarray(moved[1]).any() and not np.asarray(moved[2]).any()
+    else:
+        for tangent, true_tangent, name in zip(moved, truth, ("losses'", "log partitions'"), strict=True):
+            assert_computes_the_oracle(tangent, true_tangent, f"the {head} head's {name} tangent",
+                                       roundings=6 + 37)
+
+
+@pytest.mark.mesh(devices=2)
+@pytest.mark.parametrize('tile', [None, (2, 64)], ids=['whole', 'tiled'])
+def test_a_vocabulary_split_heads_forward_derivative_is_one_devices(tile):
+    """Split over the vocabulary on a mesh (`_vocabulary_split`), the head's own forward derivative in
+    float64 is one device's whole head's: the shards' sums moved to the row's largest maximum, which no
+    tangent moves (row 2690)."""
+    from jax.sharding import NamedSharding, PartitionSpec as P
+
+    from dew.training import MeshSpec
+
+    with jax.enable_x64(new_val=True):
+        states, matrix, targets = inputs(vocab=512, features=16, tokens=(4, 5), dtype=jnp.float64)
+        primals = tuple(term.astype(jnp.float64) for term in (states, matrix, *columns(512)))
+        directions = tuple(jax.random.normal(jax.random.key(9 + index), term.shape, jnp.float64)
+                           for index, term in enumerate(primals))
+
+        def scored(states, matrix, scale, bias):
+            table = OutputTable(matrix, vocab_major=False, bias=bias, scale=scale)
+            losses, _, log_z = chunked_cross_entropy(states, table, targets, 4, tile=tile, predict=False)
+            return losses, log_z
+
+        def moved(*terms):
+            return jax.jvp(scored, terms[:4], terms[4:])[1]
+
+        mesh = MeshSpec(fsdp=2).build(jax.devices()[:2])
+        specs = (P('fsdp'), P(None, 'fsdp'), P('fsdp'), P('fsdp')) * 2
+        with jax.default_matmul_precision('highest'):
+            alone = jax.jit(moved)(*primals, *directions)
+            with jax.set_mesh(mesh):
+                placed = [jax.device_put(term, NamedSharding(mesh, spec))
+                          for term, spec in zip((*primals, *directions), specs, strict=True)]
+                split = jax.jit(moved)(*placed)
+    for tangent, single, name in zip(split, alone, ("losses'", "log partitions'"), strict=True):
+        # Each logit sums its 16 features, each row's partition its 512 logits.
+        assert_computes_the_oracle(tangent, single, f"the split head's {name} tangent", roundings=16 + 512)

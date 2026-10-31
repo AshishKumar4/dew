@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from contract_support import EDGES, FORWARD_ORDERS, OWN_FORWARD_ORDERS, assert_contract, normal_draw
+from contract_support import EDGES, FORWARD_ORDERS, assert_contract, normal_draw
 
 from dew.nn import categorical
 from dew.nn.protocols import OutputTable
@@ -133,13 +133,11 @@ def test_the_whole_logits_losses_hold_every_order(edge):
 @pytest.mark.parametrize("head", ["whole", "tiled", "fused"])
 @pytest.mark.parametrize("edge", EDGES)
 def test_the_lm_heads_hold_every_order_of_their_gradient(head, edge):
-    """The LM head's three custom VJPs (`chunked._whole_head`, `_bounded_head`, `_fused`): the head's
-    per-token cross entropy and log partition of `hidden @ table.T`, whole, in tiles, or summed with its
-    gradient taken in the forward. Their reverse orders and their gradients' forward ones (jvp of grad,
-    remat'd, nested and scanned) finite wherever float64 is a normal float32 and the plain formula, the
-    whole logits' log-softmax, is. JAX runs no forward derivative through a custom VJP itself; a forward
-    rule beside the hand-written backward is a custom JVP whose tangent is a linear map transposing to it
-    (`dew.nn.kernels.generation.linear_tangent`), which the heads do not take yet (row 2690)."""
+    """The LM head's three hand-written backwards (`chunked._whole_head`, `_bounded_head`, `_fused`): the
+    head's per-token cross entropy and log partition of `hidden @ table.T`, whole, in tiles, or summed with
+    its gradient taken in the forward. Every order, their own forward derivatives among them (a tangent that
+    transposes to the hand-written backward, row 2690), finite wherever float64 is a normal float32 and
+    the plain formula, the whole logits' log-softmax, is."""
     scale = EDGES[edge]
     hidden, table = normal_draw(2704, (2, 4, 8), (11, 8), scale=scale)
     direction = normal_draw(2705, hidden.shape, table.shape, scale=scale)
@@ -167,8 +165,7 @@ def test_the_lm_heads_hold_every_order_of_their_gradient(head, edge):
 
     (cotangent,) = normal_draw(2706, jax.eval_shape(plain, hidden, table).shape)
     assert_contract(heads, (hidden, table), direction, cotangent, f"the {head} LM head {edge}",
-                    truth_fn=plain, plain_fn=plain,
-                    without=OWN_FORWARD_ORDERS)
+                    truth_fn=plain, plain_fn=plain)
 
 
 @pytest.mark.parametrize("edge", EDGES)
