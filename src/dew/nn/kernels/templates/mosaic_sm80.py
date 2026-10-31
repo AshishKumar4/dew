@@ -415,16 +415,18 @@ class Mma(mosaic.Family):
         instruction = self.fragment_depth(int(rhs.shape[0]))
         lhs_depth, rhs_depth = _depth_granule(lhs, 1, instruction), _depth_granule(rhs, 0, instruction)
         held = self._left(lhs) if isinstance(lhs, jax.Array) else None
-        left = right = None
+        lefts: dict[int, jax.Array] = {}
+        rights: dict[int, jax.Array] = {}
         for start in range(0, rhs.shape[0], instruction):
-            if held is None and start % lhs_depth == 0:
-                left = (self._left(lhs.at[:, pl.ds(start, lhs_depth)]), start)
-            if start % rhs_depth == 0:
-                right = (plgpu.load(rhs.at[pl.ds(start, rhs_depth)], layout=self.rhs), start)
-            lhs_part = (held[:, start:start + instruction] if held is not None
-                        else left[0][:, start - left[1]:start - left[1] + instruction])
-            rhs_part = right[0][start - right[1]:start - right[1] + instruction]
-            acc = plgpu.mma(acc, lhs_part, rhs_part, m_warps=self.m_warps)
+            left_at, right_at = start - start % lhs_depth, start - start % rhs_depth
+            if held is None and left_at not in lefts:
+                lefts[left_at] = self._left(lhs.at[:, pl.ds(left_at, lhs_depth)])
+            if right_at not in rights:
+                rights[right_at] = plgpu.load(rhs.at[pl.ds(right_at, rhs_depth)], layout=self.rhs)
+            left = held[:, start:start + instruction] if held is not None else lefts[left_at][
+                :, start - left_at:start - left_at + instruction]
+            right = rights[right_at][start - right_at:start - right_at + instruction]
+            acc = plgpu.mma(acc, left, right, m_warps=self.m_warps)
         return acc
 
     def registers_product(self, lhs: jax.Array, rhs, interpret: bool) -> jax.Array:
