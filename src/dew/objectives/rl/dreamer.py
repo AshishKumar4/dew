@@ -37,11 +37,11 @@ from flax import linen as nn, struct
 from flax.typing import Dtype
 
 from dew.batch import Batch, Variables, merge, under
+from dew.nn.categorical import kl_divergence
 from dew.nn.precision import at_least_fp32, divided
 from dew.objectives.base import Aux, EMASpec, Objective, Ratio, Shown, Step, traced_update_flops
 from dew.objectives.rl.tssm import TSSM, Cache
 from dew.rl.distributions import (
-    categorical_kl,
     onehot_sample,
     symlog,
     twohot_bins,
@@ -632,10 +632,12 @@ class DreamerV3Objective(Objective[Ratio]):
         deter, stoch, posterior = self.observed(variables, observation, previous, first, world_key)
         prior = model.prior(deter)
         feature = WorldModel.feature(deter, stoch)
+        # `kl_divergence(logits, reference)` is KL(reference || logits): the code's dynamics loss
+        # KL(sg(post) || prior) and representation loss KL(post || sg(prior)) (rssm.py:125-126).
         losses = {
-            "dynamics": jnp.maximum(categorical_kl(jax.lax.stop_gradient(posterior), prior).sum(-1),
+            "dynamics": jnp.maximum(kl_divergence(prior, jax.lax.stop_gradient(posterior)).sum(-1),
                                     self.free_nats),
-            "representation": jnp.maximum(categorical_kl(posterior, jax.lax.stop_gradient(prior)).sum(-1),
+            "representation": jnp.maximum(kl_divergence(jax.lax.stop_gradient(prior), posterior).sum(-1),
                                           self.free_nats),
             "decoder": model.reconstruction(deter, stoch, observation),
             "reward": twohot_loss(model.reward(feature), reward, self.bins),

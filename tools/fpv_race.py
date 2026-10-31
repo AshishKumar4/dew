@@ -325,8 +325,7 @@ def _pretrained(out: Path, pretraining, windows: Loader, updates: int, saved_eve
     """The world model pretrained on `windows` to `updates` updates from where `progress` holds it, its
     weights written every `saved_every` updates (`_saved`), then the online phase made begun; and the run's
     progress."""
-    from rl_acceptance import laprop
-
+    from dew.optim import laprop
     from dew.training import Trainer
 
     done = progress["updates"]
@@ -351,9 +350,8 @@ def _online(out: Path, report: dict, progress: dict, agent, races: tuple, judge,
     goes on from `level`, as the teacher's did: up a tenth, to 1, at each point whose crashes fall under a
     third, every race's courses and drones drawn at it. Its environment steps and seconds go on from those
     its checkpoint holds. Returns its last state."""
-    from rl_acceptance import laprop
-
     from dew.objectives.rl.dreamer import DreamerRollout
+    from dew.optim import laprop
     from dew.training import Trainer
 
     simulator = races[0]

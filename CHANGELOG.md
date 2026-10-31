@@ -15,6 +15,8 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   - Brax's PPO for continuous control (`dew.objectives.rl.control`).
   - DreamerV3 as its code computes it (`dew.objectives.rl.dreamer`): vector or image observations, bfloat16
     compute, privileged auxiliary heads, and pretraining from demonstrations with behaviour cloning.
+  - DreamerV3's optimizer, LaProp after adaptive gradient clipping, as the `laprop` optimizer of
+    `dew.optim`, which `OptimConfig.optimizer` names.
   - TransDreamer's transformer dynamics (`dew.objectives.rl.tssm`).
   - Dreamer 4's shortcut-forcing world model (`dew.objectives.world_model`).
   - DiffusionNFT (`dew.objectives.rl.nft`).

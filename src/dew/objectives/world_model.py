@@ -25,11 +25,13 @@ import jax.numpy as jnp
 from flax import linen as nn
 
 from dew.batch import Batch, Variables
+from dew.nn.attention import reference_attention
 from dew.objectives.base import Aux, Objective, Ratio, Shown, Step
 
 
 class _Block(nn.Module):
-    """A pre-RMSNorm transformer block: QK-normed attention under `mask`, then a SwiGLU MLP."""
+    """A pre-RMSNorm transformer block: QK-normed attention under `mask` (`reference_attention`), then a
+    SwiGLU MLP."""
 
     width: int
     heads: int
@@ -40,10 +42,9 @@ class _Block(nn.Module):
         h = nn.RMSNorm()(x)
         q, k, v = (nn.DenseGeneral((self.heads, head))(h) for _ in range(3))
         q, k = nn.RMSNorm()(q), nn.RMSNorm()(k)
-        # JAX's attention over [batch, tokens, heads, head], any leading axes folded into the batch.
-        lead = q.shape[:-3]
-        attended = jax.nn.dot_product_attention(*(t.reshape(-1, *t.shape[-3:]) for t in (q, k, v)),
-                                                mask=mask[None, None]).reshape(*lead, *q.shape[-3:])
+        # In at least float32, as TSSM's blocks attend (`reference_attention`); any leading axes of the
+        # tokens are batch axes, which `mask` `[tokens, tokens]` is shared across.
+        attended = reference_attention(q, k, v, mask=mask, wide_logits=True)
         x = x + nn.DenseGeneral(self.width, axis=(-2, -1))(attended)
         h = nn.RMSNorm()(x)
         gate, up = nn.Dense(4 * self.width)(h), nn.Dense(4 * self.width)(h)

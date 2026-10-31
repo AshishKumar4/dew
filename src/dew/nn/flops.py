@@ -14,6 +14,7 @@ from flax import linen as nn
 from jax.core import ShapedArray
 from jax.extend import core as jaxpr_core
 
+from .programs import platform_branch
 from .protocols import Counted, CountedParameters
 
 
@@ -214,15 +215,12 @@ def _program_flops(program: jaxpr_core.Jaxpr) -> float:
             branches = equation.params["branches"]
             platforms = equation.params.get("branches_platforms")
             if platforms is not None:
-                branches = [branches[next(index for index, names in enumerate(platforms)
-                                          if names is None or "cuda" in names)]]
+                branches = [branches[platform_branch(platforms, "cuda")]]
             total += max(_program_flops(branch) for branch in branches)
         elif name == "while":
             raise MissingFlopsCount("a while loop's trips are unknown to a traced count")
         else:
-            nested = [program for value in equation.params.values()
-                      for program in (value if isinstance(value, tuple | list) else (value,))
-                      if isinstance(program, jaxpr_core.Jaxpr)]
+            nested = list(jaxpr_core.jaxprs_in_params(equation.params))
             if len(nested) > 1:
                 raise MissingFlopsCount(f"{name} holds {len(nested)} programs, which of them run a trace "
                                         "does not tell")

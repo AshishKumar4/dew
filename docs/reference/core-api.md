@@ -110,7 +110,7 @@ Checkpointable data must supply the consumed iterator position. A failed scaled 
 
 An `OptimConfig` is built by `fit` over the run's optimizer updates. If you need `initial_state`, `place` or `compile` before `fit`, pass `OptimConfig(...).build(steps)` to `Trainer` instead, where `steps` is the run's length in optimizer updates.
 
-`OptimConfig.optimizer` names one of Dew's optimizers (`adam`, `adamw`, `lamb`, `muon`, `muonclip`) or any Optax optimizer factory by its import path, `OptimConfig(optimizer="optax:sgd", optimizer_opts={"momentum": 0.9})`, built as `factory(learning_rate, **optimizer_opts)` with the config's `b1`, `b2` and `weight_decay` where set, so a recorded run (`--optim.optimizer optax:sgd`) trains on the transformation an experiment ran.
+`OptimConfig.optimizer` names one of Dew's optimizers (`adam`, `adamw`, `lamb`, `muon`, `muonclip`, `laprop`) or any Optax optimizer factory by its import path, `OptimConfig(optimizer="optax:sgd", optimizer_opts={"momentum": 0.9})`, built as `factory(learning_rate, **optimizer_opts)` with the config's `b1`, `b2` and `weight_decay` where set, so a recorded run (`--optim.optimizer optax:sgd`) trains on the transformation an experiment ran. `laprop` is DreamerV3's optimizer: the config's `b1` and `b2` are its momentum's and mean square's decays, `optimizer_opts` carry its `eps` and its adaptive gradient clip `agc` (0 clips nothing), and it takes no weight decay.
 
 <!-- api: dew.training.Trainer.initial_state dew.training.Trainer.place dew.training.Trainer.compile dew.training.trainer.CompiledStep -->
 
