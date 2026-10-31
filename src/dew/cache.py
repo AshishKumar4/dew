@@ -141,14 +141,24 @@ def enable_compilation_cache(path: str):
     (`gpu-run -n 0.5` sets XLA's AUTOTUNE_CACHE_MODE_READ). Neither the
     directory nor the mode is in JAX's cache key, so a run and a process
     that compiled its programs ahead of it share executables. XLA reads its
-    flags at the first compile; a directory the run names is kept.
+    flags at the first compile; a directory the run names is kept, and a
+    process whose first compile named one keeps its picks there.
+
+    A directory named after the process first compiled holds the programs
+    compiled after: JAX's cache is settled again at the next compile.
 
     A run under `--xla_gpu_deterministic_ops` keeps no picks (`keeps_picks`):
     jax 0.11.2's XLA measures nothing there and gives each instruction the
     first configuration that compiles, but would still take a stored pick
     over that one, so such a run names an empty directory.
     """
+    from jax.experimental.compilation_cache import compilation_cache
+
     os.makedirs(path, exist_ok=True)
+    if jax.config.jax_compilation_cache_dir not in (None, path):
+        # JAX settles its cache at the process's first compile and keeps it; `reset_cache` forgets it, so
+        # the next compile settles it again here (row 2836).
+        compilation_cache.reset_cache()
     jax.config.update('jax_compilation_cache_dir', path)
     # The autotuner's picks follow the policy above, through XLA_FLAGS; JAX's own placement of them
     # in the cache directory would name one directory for every jaxlib and write picks from a
