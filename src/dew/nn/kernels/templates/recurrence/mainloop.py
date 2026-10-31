@@ -1254,9 +1254,17 @@ def _states_held(call: _Call, values: _Operand, keys: _Operand, bv: int) -> _Hel
     """What `_states`' consumer thread holds: the memory carried, its key slices in fp32, and the next
     chunk's prefix vectors (`prefetch`); a step's corrected and written values beside the values' block and
     a memory slice as a product's operand (and, where products read registers, a block of the weighted keys
-    and of the keys)."""
+    and of the keys); where the write's gate takes the keys' side (`_Call.gated_keys`), a key block gated
+    in fp32 and narrowed beside the values' block instead."""
     held = call.held
-    return _Held(carried=[_f32(call.width, bv)] + [_f32(CHUNK, 1)] * 5, phases=(
+    carried = [_f32(call.width, bv)] + [_f32(CHUNK, 1)] * 5
+    if call.gated_keys:
+        # The write's gate on the keys' rows (`algebra.keys_gated_carried`): a key block in fp32 and narrowed
+        # for its product, beside the values' block as they are.
+        return _Held(carried=carried, phases=(
+            [_f32(CHUNK, call.block)] + _held(held, CHUNK, call.block) + _held(values, CHUNK, bv)
+            + _fragments(call, (held, CHUNK, call.block), (values, CHUNK, bv)),))
+    return _Held(carried=carried, phases=(
         [_f32(CHUNK, bv)] * 2 + _held(values, CHUNK, bv) + _held(held, call.block, bv)
         + _fragments(call, (held, CHUNK, call.block), (keys, CHUNK, call.block)),))
 
