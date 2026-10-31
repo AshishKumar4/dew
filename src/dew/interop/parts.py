@@ -841,7 +841,9 @@ def _without_positions(fields: dict[str, object], layers: list[int]) -> None:
     if not layers:
         return
     count = _records.integer(fields['num_layers'], 'num_layers')
-    types = list(fields.get('layer_types') or ('full_attention',) * count)
+    stated_types = fields.get('layer_types')
+    types = (list(_records.strings(stated_types, 'layer_types')) if stated_types
+             else ['full_attention'] * count)
     kinds = dict(_records.record(fields.get('kinds', {}), 'kinds'))
     for layer in layers:
         stated = types[layer]
