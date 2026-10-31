@@ -43,7 +43,8 @@ def _dq_allocations(family: mosaic.Family, config: BackwardTiles, width: int, va
               plgpu.SMEM((consumers, block_q), jnp.float32),
               family.load_barriers(consumers), family.load_barriers(consumers)]
     blocks = {"keys": ((block_k, width), dtype), "values": ((block_k, value_width), dtype)}
-    return scoped, family.streams(blocks, stages, consumers)
+    # The logits' and dP's products read the keys and values transposed (`Family.streams`' `transposed`).
+    return scoped, family.streams(blocks, stages, consumers, transposed=("keys", "values"))
 
 def _dq_step(walk: _Backward, operands: tuple, stats: tuple, coords_of, params_of, whole, share, index, slots,
              rows, accumulators):

@@ -77,7 +77,10 @@ def _dkv_allocations(family: mosaic.Family, config: BackwardTiles, width: int, v
     if tiled:
         scoped.append(plgpu.SMEM((consumers, block_k, rows), jnp.float32))
     swizzles = None if swizzle is None else dict.fromkeys(blocks, swizzle)
-    return scoped, family.streams(blocks, stages, consumers, swizzles=swizzles)
+    # Keys first, the logits' and dP's products read their queries (the stream of them by the power where it
+    # has one) and the output cotangents transposed (`Family.streams`' `transposed`).
+    transposed = ("logits" if "logits" in blocks else "queries", "douts")
+    return scoped, family.streams(blocks, stages, consumers, swizzles=swizzles, transposed=transposed)
 
 def _holders(family: mosaic.Family, consumers: int) -> int:
     """The key blocks a dK/dV program holds: one its consumers share (`split_queries`), else one each."""

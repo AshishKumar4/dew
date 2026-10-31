@@ -119,7 +119,7 @@ def _centre_launch(query, key, value, dout, peak, spans: _Spans | None, score_pa
               family.load_barriers(consumers), family.load_barriers(consumers)]
     rings = family.streams({"keys": ((block_k, width), key.dtype), "values": ((block_k, value.shape[-1]),
                                                                               value.dtype)},
-                           program.stages, consumers)
+                           program.stages, consumers, transposed=("keys", "values"))
 
     def entry(*refs):
         family.scoped(functools.partial(body, *refs), *scoped, streams=rings)
