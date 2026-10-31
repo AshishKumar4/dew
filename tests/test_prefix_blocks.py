@@ -254,7 +254,8 @@ def test_a_saved_prefix_runs_bundle_serves_as_the_runs_own_task(tmp_path):
         trainer.fit(stream, steps=1, log_every=100, checkpoint_every=1)
     checkpoints.wait()
     model = dataclasses.asdict(ModelConfig.from_model(decoder))
-    (tmp_path / "run.json").write_text(json.dumps({"objective": "lm", "data": {"seq_len": SEQ}, "model": model}))
+    record = {"objective": "lm", "data": {"seq_len": SEQ}, "model": model}
+    (tmp_path / "run.json").write_text(json.dumps(record))
     native = TextGeneration.from_run(str(tmp_path))
     bundle = Pretrained.from_run(str(tmp_path))
     task = bundle.pipeline()
