@@ -1887,6 +1887,7 @@ def test_a_kept_task_whose_deadline_runs_out_names_its_unread_groups_red_and_run
     runs no group after it: each is a red row its task's deadline cut off, and the task writes every row
     (review: each later group was still read and run, a fresh grace and settle each, past the deadline)."""
     verdict, _ = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
+    _, _, seen = cache_worker
     names = "cde"
     written(tmp_path, {"test_c.py": "import time\nfrom pathlib import Path\n" + "".join(
         f"def test_{name}():\n    Path('runs-{name}').write_text('x')\n    time.sleep(3)\n"
@@ -1896,11 +1897,15 @@ def test_a_kept_task_whose_deadline_runs_out_names_its_unread_groups_red_and_run
     groups = " ".join(f"tests/test_c.py#{index}/3@GenuineIntel-6-143:0000" for index in (1, 2, 3))
     monkeypatch.setattr(sys, "argv", ["ci.py", "task", "--python=3.12", f"--tests={groups}",
                                       f"--out={verdict}", "--cache=on", "--deadline=1"])
+    seen.clear()
     assert ci.main() == 0
     rows = json.loads(verdict.read_text())["rows"]
     assert [(row["name"], row["exitCode"], row["kind"]) for row in rows] == [
         (f"3.12:tests/test_c.py#{index}/3", 1, "deadline") for index in (1, 2, 3)]
     assert [(tmp_path / f"runs-{name}").exists() for name in names] == [True, False, False]
+    # The groups past the deadline were never looked up.
+    assert [any(f"tests/test_c.py/{index}-of-3" in path for path in seen) for index in (1, 2, 3)] == [
+        True, False, False]
 
 
 def test_a_kept_task_reuses_its_rows_after_another_commit_changes_the_recorded_dependencies(
