@@ -103,16 +103,23 @@ GMM = 2 * 256 * 128 * 128
 gradients of 256 rows by 128 by 128."""
 
 
-def _reported(generation: str, layers: int = 1):
+def _reported(generation: str, layers: int = 1, *, scanned: bool = False):
     """A grouped GEMM's forward and backward, `layers` times over one shape (as a model's same-shape layers
-    each call it, its kernels lowered once, `tuning.lowered_once`), beside a Triton kernel, lowered on this
-    CPU for `generation`'s GPU, with the routes its dispatches reported (`routes`)."""
+    each call it, its kernels lowered once, `tuning.lowered_once`), unrolled or under a scan (`scanned`, as
+    `scan_layers=True` runs a stack of like layers), beside a Triton kernel, lowered on this CPU for
+    `generation`'s GPU, with the routes its dispatches reported (`routes`)."""
     from dew.nn.kernels.templates.gemm import template
 
     def step(x, w, sizes):
+        def layer(x, w, scale):
+            return template.gemm(x * scale, w, sizes, out_dtype=jnp.bfloat16).astype(jnp.float32).sum()
+
         def loss(x, w):
-            return sum(template.gemm(x * (layer + 1), w, sizes, out_dtype=jnp.bfloat16)
-                       .astype(jnp.float32).sum() for layer in range(layers))
+            if scanned:
+                scales = jnp.arange(1, layers + 1, dtype=x.dtype)
+                return jax.lax.scan(lambda total, scale: (total + layer(x, w, scale), None),
+                                    jnp.float32(0), scales)[0]
+            return sum(layer(x, w, layer_index + 1) for layer_index in range(layers))
 
         return jax.grad(loss, argnums=(0, 1))(x, w), _doubled(x)
 
@@ -129,18 +136,20 @@ def templated_calls(record) -> dict[str, int]:
     return {entry["name"]: entry["calls"] for entry in record["launches"] if entry["kind"] == "mosaic_gpu"}
 
 
-@pytest.mark.parametrize("layers", [1, 2])
+@pytest.mark.parametrize("stacked", ["one", "unrolled", "scanned"])
 @pytest.mark.parametrize("generation", ["sm80", "sm90"])
 def test_a_steps_kernel_report_names_its_launches_and_the_flop_count_sizes_them_as_it_does(generation,
-                                                                                             layers):
+                                                                                             stacked):
     """A grouped GEMM's step lowered for the GPU (row 1895): its kernel report lists the program's
     launches, the template's by kernel name with the FLOPs each states, a Triton launch's stating none,
     and the FLOP count of the same program counts the stated FLOPs and leaves out, as unsized, the
     launches the report does. Two same-shape layers, whose kernels lower once and run from each layer's
-    call, make twice one layer's launches and FLOPs in both (row 2905)."""
+    call (row 2905), or under a scan whose body runs them once a trip (row 2933), make twice one layer's
+    launches and FLOPs in both."""
     from dew.telemetry.instrumentation import hlo_flops
 
-    lowered, found = _reported(generation, layers)
+    layers = 1 if stacked == "one" else 2
+    lowered, found = _reported(generation, layers, scanned=stacked == "scanned")
     record = kernel_report(found, lowered).record()
     if layers > 1:
         lowered_alone, found_alone = _reported(generation)
@@ -155,6 +164,18 @@ def test_a_steps_kernel_report_names_its_launches_and_the_flop_count_sizes_them_
     flops = hlo_flops(lowered.as_text(dialect="hlo"))
     assert flops is not None
     assert (flops.hardware, flops.unsized) == (sum(entry["flops"] for entry in templated), unstated)
+
+
+def test_a_call_that_runs_none_adds_none_however_often_its_caller_runs():
+    """A function's runs from the entry (`instrumentation.call_weights`) take nothing from a call that runs
+    none: one in a loop of no trips inside a function of unknown runs (a loop of no static count around
+    it), so a kernel the entry also calls once runs once, known, not unknown (row 2933's review)."""
+    import math
+
+    from dew.telemetry.instrumentation import call_weights
+
+    weights = call_weights({"main": {"f": math.inf, "k": 1.0}, "f": {"k": 0.0}, "k": {}}, "main")
+    assert weights == {"main": 1.0, "f": math.inf, "k": 1.0}
 
 
 def test_a_kernel_is_named_from_its_location_wherever_the_location_nests_the_name():
@@ -292,6 +313,44 @@ def test_a_hybrid_language_model_step_lowers_for_every_gpu(generation):
     """A Qwen 3.5 hybrid's training step, its gated delta nets, attention, norms and SwiGLU, lowers on this
     CPU for every GPU Dew's sessions take (`GPUS`): its dry run raises the `Lowered` program."""
     _step_lowered(generation)
+
+
+@pytest.mark.parametrize("generation", ["sm80", "sm90"])
+def test_a_scanned_stacks_kernel_report_counts_every_layers_launches_as_the_flop_count_does(generation):
+    """A bf16 language model of two like layers, its stack scanned (`scan_layers=True`, as host and bank
+    layouts require) or unrolled, its training step lowered for the GPU through `lower_for`
+    (`--trainer.lower-for`'s dry run): its kernel report counts each kernel's launches and FLOPs alike both
+    ways, every layer's, and as the FLOP count of the same program counts them (row 2933: a scan's body
+    once, its kernels at half)."""
+    import optax
+
+    from dew.nn.backbones import CausalTransformer
+    from dew.objectives.lm import LMObjective
+    from dew.telemetry.instrumentation import hlo_flops
+    from dew.training import Trainer
+    from dew.training._lowering import Lowered
+
+    def reported(scanned: bool) -> tuple[dict, object]:
+        model = CausalTransformer(vocab_size=256, emb_features=128, num_layers=2, num_heads=2,
+                                  mlp_features=256, max_seq_len=128, dtype=jnp.bfloat16, scan_layers=scanned)
+        trainer = Trainer(LMObjective(model, 128), optax.adamw(1e-4), key=jax.random.key(0),
+                          lower_for=generation)
+        state = jax.eval_shape(trainer.initial_state, trainer.objective.initializer, trainer.key)
+        with pytest.raises(Lowered) as lowered:
+            trainer.compile(state, {"text": jax.ShapeDtypeStruct((jax.device_count(), 129), jnp.int32)})
+        return lowered.value.kernels.record(), hlo_flops(lowered.value.lowered.as_text(dialect="hlo"))
+
+    (scanned, counted), (unrolled, alike) = reported(scanned=True), reported(scanned=False)
+
+    def launches(record) -> dict[str, tuple]:
+        return {entry["name"]: (entry["calls"], entry["flops"]) for entry in record["launches"]}
+
+    assert launches(scanned) and launches(scanned) == launches(unrolled)
+    # The FLOP count sizes the launches the report states and leaves out the ones it leaves unsized, so
+    # both count every layer's: the same FLOPs and the same unsized launches scanned as unrolled.
+    assert counted is not None and alike is not None
+    assert (counted.hardware, counted.unsized) == (alike.hardware, alike.unsized)
+    assert scanned["unsized"] == unrolled["unsized"] == counted.unsized
 
 
 @pytest.mark.parametrize("bound", [None, 64], ids=["undeclared", "declared"])
