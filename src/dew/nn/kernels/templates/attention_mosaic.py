@@ -469,9 +469,9 @@ def _scope(family: mosaic.Family, allocations: tuple, reducing_warpgroups: int) 
 DQ_ROWS = 7
 """The per-query rows a dQ step holds across its walk (`_backward_registers`)."""
 DKV_STATISTICS = 5
-"""The per-query statistics a dK/dV step holds, the maximum, the denominator, the anchor, D and the anchor
-key (`attention_mosaic_scores._scores`): column vectors keys first, row vectors in a fused launch's queries
-first (`_backward_registers`)."""
+"""The per-query statistics a dK/dV step reads, the maximum, the denominator, the anchor, D and the anchor
+key (`attention_mosaic_scores._scores`): row vectors a fused launch's queries first holds
+(`_backward_registers`); column vectors keys first, one at a time."""
 
 
 def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int, value_width: int, dtype, *,
@@ -533,9 +533,11 @@ def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int
         return resources.live_registers(family, carried, products, dq_tile, *fragments) + statistics
     queries = block_q // config.consumers if split else block_q
     step = [(queries, block_k, jnp.float32)] * 2
-    # The keys-first step's statistics in its tiles' column layout (`Family.column_registers`); a fused
+    # The keys-first step's statistics in its tiles' column layout (`Family.column_registers`), read from
+    # global memory at each use, which ptxas staggers: one's column vector live at a time (an A100's
+    # keys-first launch at 64 x 64, width 128: 17 to 18 words at its peak, where all five's are 80); a fused
     # launch's dQ tile of its share `[queries, D]` fp32 beside its score cotangents.
-    statistics = DKV_STATISTICS * family.column_registers(queries, jnp.float32)
+    statistics = family.column_registers(queries, jnp.float32)
     added = [[step[0], (queries, width, jnp.float32)]] if config.fused else []
     # Its products' fragments where they read registers (`_products`), keys first: the logits' and the
     # output cotangents' of the keys against the queries, then dV's and dK's of the weights and the score
