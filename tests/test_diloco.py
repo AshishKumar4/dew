@@ -2,6 +2,8 @@
 into the outer model by an outer optimizer. What is asserted is the algorithm's arithmetic against an
 independent float64 reference, its limits (one replica, one inner update), where the replicas and their
 rows live, and that a resumed run restores each replica exactly."""
+import dataclasses
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -11,7 +13,7 @@ from affine_run import BATCH, FEATURES, Counting, dataset
 from flax import linen as nn
 from reference_error import assert_computes_the_oracle
 
-from dew.objectives.base import Aux, Objective
+from dew.objectives.base import Aux, Objective, Ratio, Weighted
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
 from dew.training.diloco import DiLoCo
 
@@ -26,10 +28,11 @@ class Affine64(nn.Module):
 
 class Regression64(Objective):
     """Squared error of a float64 affine map against `2 * x[:, :2]`; `noisy`, its inputs perturbed by the
-    step's draw, so a step's key shows in its gradient; `scaled`, its error times a batch scalar."""
+    step's draw, so a step's key shows in its gradient; `scaled`, its error times a batch scalar;
+    `weighted`, its error a `Weighted` of one term, statistics a window replays rather than pools."""
 
-    def __init__(self, *, noisy: bool = False, scaled: bool = False):
-        self.model, self.noisy, self.scaled = Affine64(), noisy, scaled
+    def __init__(self, *, noisy: bool = False, scaled: bool = False, weighted: bool = False):
+        self.model, self.noisy, self.scaled, self.weighted = Affine64(), noisy, scaled, weighted
 
     def fresh_variables(self, key, held):
         return self.model.init(key, jnp.zeros((1, FEATURES)))
@@ -38,8 +41,11 @@ class Regression64(Objective):
         x = batch["x"]
         if self.noisy:
             x = x + 0.1 * jax.random.normal(step.key, x.shape, x.dtype)
-        error = jnp.mean((self.model.apply(variables, x) - batch["y"]) ** 2)
-        return error * (batch["weight"] if self.scaled else 1.0), Aux({})
+        squares = (self.model.apply(variables, x) - batch["y"]) ** 2
+        if self.weighted:
+            term = Ratio(jnp.sum(squares), jnp.asarray(squares.size, squares.dtype))
+            return Weighted((term,), (1.0,)), Aux({})
+        return jnp.mean(squares) * (batch["weight"] if self.scaled else 1.0), Aux({})
 
 
 def trainer(replicas: int, *, diloco: DiLoCo | None = None, optimizer=None, path=None, objective=None,
@@ -262,11 +268,52 @@ def test_a_supplied_diloco_state_trains_on_from_each_groups_own_state():
 
 
 @pytest.mark.mesh(devices=2)
-def test_a_diloco_run_whose_layout_keeps_state_on_the_host_is_refused():
-    """A DiLoCo run whose layout keeps a field on the host is refused before it trains: the offload places
-    the outer model's fields, and no placement of a group's own reaches its step (row 876 review)."""
-    run = Trainer(Regression64(), optax.adam(RATE), key=jax.random.key(0),
-                  layout=Layout(min_shard=1, tolerance=1.0, host=("opt_state",)),
-                  mesh=MeshSpec(diloco=2).build(jax.devices()[:2]), diloco=DiLoCo(every=2))
-    with jax.enable_x64(new_val=True), pytest.raises(ValueError):
-        run.fit(dataset(), steps=1)
+def test_a_diloco_run_of_replayed_windows_trains_as_one_pooling_its_gradients():
+    """A loss whose statistics a window replays (`Weighted`) rather than pools, each group's window one
+    row a microbatch: the groups' windows allocate on their own devices, and with every inner update's
+    window of two steps the run trains as one whose loss pools them (row 876 review)."""
+    with jax.enable_x64(new_val=True):
+        def run(weighted: bool):
+            return trainer(2, diloco=DiLoCo(every=2, rate=OUTER_RATE, momentum=MOMENTUM),
+                           objective=Regression64(weighted=weighted), accumulation=2).fit(
+                dataset(), steps=4, log_every=1)
+        replayed, pooled = run(weighted=True), run(weighted=False)
+    # Each parameter sums its replica's rows' terms over 4 steps, and 2 replicas' means.
+    assert_computes_the_oracle(params(replayed.variables["params"]), params(pooled.variables["params"]),
+                               "a replaying DiLoCo run's outer parameters", roundings=4 * 4 * 2 + 4)
+
+
+def test_a_diloco_trainer_refuses_what_it_cannot_express_as_it_is_made():
+    """A DiLoCo trainer whose layout keeps state on the host, or which records each example's draws, is
+    refused as it is made, before any state is supplied or placed (row 876 review): its host step and its
+    offload would place and step the outer model alone, and no one record holds every group's draws."""
+    for options in ({"layout": Layout(min_shard=1, tolerance=1.0, host=("opt_state",))}, {"record": True}):
+        with pytest.raises(ValueError):
+            Trainer(Regression64(), optax.adam(RATE), key=jax.random.key(0), diloco=DiLoCo(every=2),
+                    **options)
+
+
+def test_a_meeting_and_a_new_stage_drop_each_groups_part_filled_window():
+    """At a meeting, and as a ramp's stage begins, each group's part-filled window is dropped as a rejected
+    attempt drops one, its microstep back at the window's start, and the run's microstep the first
+    group's: no update pools gradients of parameters the meeting replaced, or of an earlier stage."""
+    from dew.state import Accumulation, Replicas, TrainState
+    from dew.training.diloco import dropped
+
+    def stacked(*values):
+        return jnp.asarray(values)
+
+    window = Accumulation(gradient=None, mass=stacked(2.0, 1.0), statistics=(stacked(3.0, 5.0),),
+                          effects=(), qk_stats=(), batches=None, variables=None, attempts=None, tokens=None)
+    inner = Replicas(microstep=stacked(6, 5), updates=stacked(3, 2),
+                     variables={"params": {"w": jnp.ones((2, 3))}}, opt_state=(), ema=None, scale=None,
+                     accumulation=window, deferred=None)
+    state = TrainState(step=jnp.asarray(5), microstep=jnp.asarray(6), updates=jnp.asarray(3),
+                       variables={"params": {"w": jnp.ones(3)}}, opt_state=(), ema=None,
+                       key=jax.random.key(0), scale=None, window_size=jnp.asarray(2), inner=inner)
+    diloco = DiLoCo(every=1, rate=1.0, momentum=0.0)
+    met = diloco.synced(dataclasses.replace(state, opt_state=diloco.outer.init(state.variables["params"])))
+    for after in (met, dropped(state, 2)):
+        assert after.inner.microstep.tolist() == [6, 4] and int(after.microstep) == 6
+        assert after.inner.accumulation.mass.tolist() == [0.0, 0.0]
+        assert after.inner.accumulation.statistics[0].tolist() == [0.0, 0.0]
