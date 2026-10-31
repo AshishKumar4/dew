@@ -216,12 +216,13 @@ def _muon_groups(learning_rate, weight_decay=0.0, adam_weight_decay=None, *, ns_
     NorMuon's neuron-wise normalization of the orthogonal update at that second-moment decay
     (`scale_by_neuron_norm`).
 
-    Its Newton-Schulz runs once an update, whatever its microbatches, so it is timed per update: a
-    Qwen3.5-4B decision fine-tune on one H100 at 65536 tokens an update, eight microbatches accumulated,
-    takes each accumulating microbatch as AdamW does (about 470 ms) and its update's in 860 ms against
-    AdamW's 516, about 9.5% over AdamW summed over the update (the bfloat16 iteration); at 8192 tokens,
-    one microbatch an update, 844 ms against 495 (1.71x), the iteration's cost undivided (node job
-    LR-h100-muon-2752c at 699d038ca; `ns_operands` holds each precision's; ledger 2637, 2685, 2752)."""
+    Its Newton-Schulz runs once an update, whatever its microbatches, so its cost is fixed per update:
+    a Qwen3.5-4B decision fine-tune on one H100 takes each accumulating microbatch of 8192 tokens as
+    AdamW does (about 470 ms) and its update's in 860 ms against AdamW's 516, the bfloat16 iteration's
+    344 ms. That is 9.0% over AdamW at 65,536 tokens an update (measured, eight microbatches), about
+    2.3% at 262,144 and 0.6% at 1,048,576; at 8192 tokens, one microbatch an update, 844 ms against 495
+    (1.71x), the iteration undivided (node job LR-h100-muon-2752c at 699d038ca; `ns_operands` holds each
+    precision's; ledger 2637, 2685, 2752)."""
     def labels(params):
         return jax.tree.map(lambda numbers: "adam" if numbers is None else "muon",
                             muon_weight_dimension_numbers(params), is_leaf=muon_leaf)
