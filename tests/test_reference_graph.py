@@ -17,6 +17,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from reference_ensemble import assert_graph_as_exact
+from reference_error import without_ynn
 
 from dew.nn.kernels.graph import Graph, Node, Pointwise, Sum
 
@@ -122,17 +123,22 @@ def test_a_nan_at_one_element_fails():
 def norm_backward(summed):
     """The norm's backward from the common forward's saved `squares` and a fixed cotangent `g`: the sum
     over the width of g·x·scale (a Sum), then dx and dscale's per-row terms (Pointwise), and dscale's sum
-    over the rows (a Sum)."""
+    over the rows (a Sum). Each node compiles without YNNPACK's fusions (`without_ynn`), as check 1 compiles
+    two Dew paths: with them XLA:CPU sums the reference's products in a YNNPACK fusion, each rounded to
+    float32, and the half-sum's in a loop that contracts each product into its add, so the two arms' terms
+    round apart at every order and a sum whose reference terms happen to cancel more of the shared rounding
+    sits past FACTOR at an element on some hosts (ledger 3048: 6 of 40 seeds on one host, 13 of 40 on
+    another, none without the fusions)."""
     def inverse(x, squares):
         return jax.lax.rsqrt(squares[..., None] / x.shape[-1] + EPSILON)
 
     projected = Node("projected", ("g", "x", "scale"), Sum({"g": -1, "x": -1, "scale": -1}),
-                     jax.jit(lambda g, x, scale: summed(g * scale * x)))
+                     without_ynn(lambda g, x, scale: summed(g * scale * x)))
     dx = Node("dx", ("g", "x", "scale", "squares", "projected"), Pointwise(),
-              jax.jit(lambda g, x, scale, squares, projected: inverse(x, squares) * scale * g
+              without_ynn(lambda g, x, scale, squares, projected: inverse(x, squares) * scale * g
                       - x * inverse(x, squares) ** 3 * projected[..., None] / x.shape[-1]))
     dscale = Node("dscale", ("g", "x", "squares"), Sum({"g": 0, "x": 0, "squares": 0}),
-                  jax.jit(lambda g, x, squares: summed(jnp.moveaxis(g * x * inverse(x, squares), 0, -1))))
+                  without_ynn(lambda g, x, squares: summed(jnp.moveaxis(g * x * inverse(x, squares), 0, -1))))
     return composed(("g", "x", "scale", "squares"), (projected, dx, dscale), ("dx", "dscale"))
 
 
