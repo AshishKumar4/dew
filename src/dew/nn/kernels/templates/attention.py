@@ -814,14 +814,20 @@ def scores(query: jax.Array, key: jax.Array, spans: KeySpans, hooks: Hooks | Non
     products = float32_einsum("bqhgd,bkhd->bhgqk", grouped, key,
                               preferred_element_type=wide).reshape(batch, heads, queries, spans.keys)
     products = products * jnp.asarray(scale, wide)
+    return jnp.where(seen[:, None], score_modded(products, hooks), -jnp.inf)
+
+
+def score_modded(products: jax.Array, hooks: Hooks) -> jax.Array:
+    """`hooks.score_mod` over scaled products `[B, H, Q, K]` at their positions, each row and head reading
+    its own parameters (`_per_head`); the products where the hooks have no score_mod."""
+    if hooks.score_mod is None:
+        return products
+    batch, heads, queries, keys = products.shape
+    q_pos, k_pos = jnp.arange(queries)[:, None], jnp.arange(keys)[None, :]
 
     def one(row, head):
-        s = products[row, head]
-        if hooks.score_mod is not None:
-            q_pos = jnp.arange(queries)[:, None]
-            k_pos = jnp.arange(spans.keys)[None, :]
-            s = hooks.score_mod(s, q_pos, k_pos, *(_per_head(p, row, head) for p in hooks.score_params))
-        return jnp.where(seen[row], s, -jnp.inf)
+        params = (_per_head(p, row, head) for p in hooks.score_params)
+        return hooks.score_mod(products[row, head], q_pos, k_pos, *params)
 
     return jax.vmap(jax.vmap(one, in_axes=(None, 0)), in_axes=(0, None))(jnp.arange(batch), jnp.arange(heads))
 
