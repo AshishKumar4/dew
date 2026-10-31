@@ -8,6 +8,17 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 - A compilation cache directory a run names after its process first compiled (`prepare_process`,
   `trainer.compilation_cache_dir`, a second run in a notebook) holds the programs compiled after, where
   JAX kept the first directory.
+- Muon's and M3's Newton-Schulz multiply in the run's numerics: bfloat16 operands in its fast forms
+  (the default) and float32 at `Numerics.matmul` in its accurate ones (`--trainer.precision accurate`:
+  IEEE float32), each matrix whole on one device and the matrices spread over the mesh. A run states its
+  products exactly with `--optim.optimizer-opts '{"ns_precision": "F32_F32_F32"}'` (a
+  `jax.lax.DotAlgorithmPreset` by name), refused in JAX's own words where its platform has not the
+  algorithm; a run saved with `ns_precision` as a precision level loads with its algorithm. Opt-in beside
+  it: `per_head` (head widths by parameter pattern) orthogonalizes each head's block alone, as Kimi K3;
+  `ns_coeffs: "polar_express"` takes Polar Express's coefficients; `neuron_beta2` normalizes each output
+  neuron as NorMuon. Muon's Newton-Schulz lives in `dew.newton_schulz`.
+- An evaluation of a run on the examples clock records the examples it had consumed
+  (`evaluation/examples_consumed`) beside its step.
 - A run's numerics are named where they are set: `--trainer.precision accurate` (or a Lightning dtype
   preset, "bf16-true", or a `Numerics` record's JSON), `"precision": "accurate"` in a run.json, and
   `Pretrained.load(precision=...)` and `dew.pipeline(source, precision=...)`, which load in their dtypes

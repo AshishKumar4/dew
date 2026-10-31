@@ -726,8 +726,10 @@ def _gathered_tangent(*operands, softcap=None):
 
 
 def _paged_forward(query, key, value, table, lengths, starts=None, sinks=None, *, softcap=None):
+    # Interpreted off a GPU, as splash's kernels are off a TPU (`tpu_attention`).
     return decode_attention.attend_paged(query, key, value, table, jnp.maximum(lengths, 1), starts,
-                                         softcap=softcap, sinks=sinks), ()
+                                         softcap=softcap, sinks=sinks,
+                                         interpret=jax.default_backend() != "gpu"), ()
 
 
 def _paged_backward(saved, operands, cotangent, *, softcap=None):

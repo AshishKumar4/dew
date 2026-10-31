@@ -408,24 +408,35 @@ class ConvForward(_ConvLaunch):
     def _fwd(self, x: jax.Array, taps: jax.Array, bias: jax.Array | None, valid: jax.Array | None,
              documents: jax.Array | None, *, parts: tuple[tuple[int, int | None], ...], activation: bool,
              eps: float, dtype: str, interpret: bool, config: Tile, return_residuals: bool = False):
+        operands = (x, taps, bias, valid, documents)
+        specs = jax.tree.map(lambda value: jax.ShapeDtypeStruct(value.shape, value.dtype), operands)
+        call = self._call(*specs, parts=parts, activation=activation, eps=eps, dtype=dtype,
+                          interpret=interpret, config=config)
+        return tuple(call(*(value for value in operands if value is not None))), None
+
+    @staticmethod
+    @functools.lru_cache(maxsize=256)
+    def _call(x, taps, bias, valid, documents, *, parts, activation: bool, eps: float, dtype: str,
+              interpret: bool, config: Tile):
+        # Specs, never arrays: repeated layers share Pallas's trace and lowering caches.
         batch, length, _ = x.shape
         pieces, programs = [], 0
         for first, width, head in _pieces(parts):
             block = block_width(width, head)
             pieces.append((programs, first, block, head is not None))
             programs += width // block
-        specs, operands = _inputs(x, taps, bias, valid, documents)
+        specs, _ = _inputs(x, taps, bias, valid, documents)
         kernel = functools.partial(
             _forward_kernel, pieces=tuple(pieces), rows=config.rows, count=taps.shape[1], length=length,
             has_bias=bias is not None, has_valid=valid is not None, has_documents=documents is not None,
             activation=activation, eps=eps, interpret=interpret)
         widths = [width for width, _ in parts]
-        return tuple(pl.pallas_call(
+        return pl.pallas_call(
             kernel, grid=(programs, pl.cdiv(length, config.rows), batch), in_specs=specs,
             out_specs=[pl.BlockSpec((None, length, width), lambda c, t, b: (b, 0, 0)) for width in widths],
             out_shape=[jax.ShapeDtypeStruct((batch, length, width), jnp.dtype(dtype)) for width in widths],
             compiler_params=_params(config.warps), interpret=interpret, name="short_conv_forward",
-        )(*operands)), None
+        )
 
     def _get_heuristics_config(self, ba) -> Tile:
         return TILE
@@ -445,6 +456,16 @@ class ConvBackward(_ConvLaunch):
              documents: jax.Array | None, before: jax.Array | None, dy: jax.Array, *, first: int,
              head: int | None, activation: bool, eps: float, interpret: bool, config: Walk,
              return_residuals: bool = False):
+        operands = (x, taps, bias, valid, documents, before, dy)
+        specs = jax.tree.map(lambda value: jax.ShapeDtypeStruct(value.shape, value.dtype), operands)
+        call = self._call(*specs, first=first, head=head, activation=activation, eps=eps,
+                          interpret=interpret, config=config)
+        return tuple(call(*(value for value in operands if value is not None))), None
+
+    @staticmethod
+    @functools.lru_cache(maxsize=256)
+    def _call(x, taps, bias, valid, documents, before, dy, *, first: int, head: int | None,
+              activation: bool, eps: float, interpret: bool, config: Walk):
         batch, length, channels = x.shape
         count, width = taps.shape[1], dy.shape[-1]
         block = block_width(width, head)
@@ -464,14 +485,14 @@ class ConvBackward(_ConvLaunch):
             out_specs.append(pl.BlockSpec((None, None, width), lambda c, t, b: (b, t, 0)))
             out_shape.append(jax.ShapeDtypeStruct((batch, tiles, width), jnp.float32))
         held = [] if before is None else [before]
-        return tuple(pl.pallas_call(
+        return pl.pallas_call(
             kernel, grid=grid,
             in_specs=[*specs, *([whole] if held else []),
                       pl.BlockSpec((None, length, width), lambda c, t, b: (b, 0, 0))],
             out_specs=out_specs, out_shape=out_shape,
             input_output_aliases={len(operands): 0} if held else {},
             compiler_params=_params(config.warps), interpret=interpret, name="short_conv_backward",
-        )(*operands, *held, dy)), None
+        )
 
     def _get_heuristics_config(self, ba) -> Walk:
         return self._walk(ba, WALK)
