@@ -5,10 +5,13 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
-- A run refuses an optimizer that holds an update back on some calls (`optax.MultiSteps`,
-  `optax.apply_every`, `optax.conditionally_mask`, `optax.apply_if_finite`, alone or in a chain), whose
-  held calls it counted as updates, moving its EMA, post-step effects and committed tokens; accumulate
-  with `Trainer(accumulation=k)`, and reject non-finite steps with `Trainer(dynamic_scale=...)`.
+- A run whose optimizer holds updates back on some calls (`optax.MultiSteps`, `optax.apply_every`,
+  `optax.apply_if_finite`) counts its update count, EMA, committed tokens and `power_profiles`'
+  averages by the updates the optimizer applies, as its state says, where it counted every call; the
+  tokens of a held call wait in the state (`TrainState.deferred`) for the update that applies them, and
+  each held call draws its examples afresh. One whose state does not say (`optax.conditionally_mask`,
+  a held update under a mask or partition or followed by a stateful transform), or an objective with
+  post-step effects under one, is refused before any step.
 - Muon's and M3's Newton-Schulz multiply in the run's numerics: bfloat16 operands in its fast forms
   (the default) and float32 at `Numerics.matmul` in its accurate ones (`--trainer.precision accurate`:
   IEEE float32), each matrix whole on one device and the matrices spread over the mesh. A run states its

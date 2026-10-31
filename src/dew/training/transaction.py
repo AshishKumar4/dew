@@ -29,6 +29,7 @@ from typing_extensions import TypeVar
 from dew.averaging import ema_update
 from dew.batch import EXAMPLE_ROWS, Batch, Variables, dicts, merge
 from dew.data.dataset import rows_of
+from dew.held_updates import held_places, holds_back, refuse_untold, update_applied
 from dew.nn.inspection import Watched, flattened
 from dew.nn.kernels.options import compiler_options
 from dew.nn.precision import at_least_fp32
@@ -44,7 +45,7 @@ from dew.objectives.base import (
     recorded_metrics,
     with_projected,
 )
-from dew.optim import clips_qk, refuse_held_back, stepped
+from dew.optim import clips_qk, stepped
 from dew.state import Accumulation, TrainState, apart, together
 from dew.training.inspection import Inspection, summaries
 from dew.training.model_flops import _TokenCount, step_counts
@@ -354,6 +355,9 @@ def example_fields(state, slot, split: int, batch, slots: int = 1, part=None, re
         return {}
     key = jax.random.fold_in(jax.random.fold_in(jax.random.fold_in(state.key, EXAMPLE_STREAM),
                                                 state.updates), rejected)
+    # The calls an optimizer holds an update back over draw apart (`held_places`), as a window's slots do.
+    for place in held_places(state.opt_state):
+        key = jax.random.fold_in(key, place)
     index = example_places(slot, split, rows, batch.get(EXAMPLE_ROWS), part)
     return {"example_key": key, "example_index": placed_as_rows(index, batch), "example_count": slots * rows}
 
@@ -598,9 +602,14 @@ class Transaction:
         Admission is decided by finish_attempt after checking the updated
         parameters and optimizer state as well.
         """
-        # Each call commits one update, which every clock counts: an optimizer that applies none on some
-        # calls is refused as the step is traced, before any runs.
-        refuse_held_back(current.opt_state)
+        # The clocks count the updates the optimizer applies (`update_applied`), which an optimizer that holds
+        # some back says by its state; one whose state does not, or a held update whose post-step
+        # effects no update would apply, is refused as the step is traced, before any runs.
+        refuse_untold(current.opt_state)
+        if holds_back(current.opt_state) and self.aux_shape.effects is not None:
+            raise ValueError("an objective with post-step effects (Aux.effects) under an optimizer that "
+                             "holds updates back, whose held calls' effects no update applies; accumulate "
+                             "gradients with Trainer(accumulation=k)")
         native = jax.tree.map(_descending, gradient, current.variables["params"])
         native_finite = _all_finite(native)
         norm = optax.global_norm(native)
@@ -620,6 +629,7 @@ class Transaction:
             # rescale, a bounded group's clamp) acts on them (`stepped`).
             params = {**current.variables, "params": self.objective.projected(
                 stepped(stored, update, current.opt_state, opt_state), updated=True)}
+            done = update_applied(current.opt_state, opt_state)
             if self.aux_shape.effects is not None:
                 params = write_back(params, self.objective.apply_effects(
                     params, self.effects_tree.unflatten(effects)))
@@ -629,12 +639,13 @@ class Transaction:
                     raise ValueError("the objective declares EMA but the state carries none")
                 # A decay over the run's progress reads it where the run keeps one (`EMASpec.progressed`).
                 at = self.progress(current) if self.objective.ema.progressed else current.updates
-                averaged = _chosen(self.objective.averages(current.updates),
+                averaged = _chosen(self.objective.averages(current.updates) & done,
                                    ema_update(averaged, params, self.objective.ema.decay(at)), averaged)
             inspected = {} if self.inspection is None else summaries(
                 self.inspection, stored, native, update, params["params"])
+            updates = current.updates + done.astype(current.updates.dtype)
             return dataclasses.replace(current, variables=params, opt_state=opt_state, ema=averaged,
-                                       updates=current.updates + 1), inspected
+                                       updates=updates), inspected
 
         if current.scale is None:
             return *apply(current), native_finite, norm
@@ -750,7 +761,14 @@ class Transaction:
             advanced = dataclasses.replace(advanced, compute=narrowed(advanced.variables, self.copies))
         if scale is not None:
             advanced = dataclasses.replace(advanced, scale=_advance_scale(scale, finite))
-        counted = due & accepted
+        # An update the optimizer holds back commits nothing yet: its tokens wait in the state
+        # (`TrainState.deferred`) for the update that applies them (`update_applied`).
+        done = update_applied(state.opt_state, advanced.opt_state)
+        counted = due & accepted & done
+        if state.deferred is not None:
+            held = _TokenCount.add(state.deferred, held)
+            waiting = jnp.where(due & accepted & ~done, held, jnp.where(counted, 0, state.deferred))
+            advanced = dataclasses.replace(advanced, deferred=waiting.astype(jnp.uint32))
         return advanced, loss, aux, Committed(
             jnp.where(counted, norm, 0.), counted.astype(jnp.int32),
             jnp.where(counted, held, jnp.zeros((2,), jnp.uint32)),
