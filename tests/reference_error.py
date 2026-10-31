@@ -1724,9 +1724,10 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     terms_fn, also = _site(dew_fn, reference_fn, label, seeds=seeds, truth_fn=truth_fn, library_fn=library_fn,
                            library_row=library_row, library_leaves=library_leaves, also=also, terms=terms)
     narrow_leaves: list[str] = []
+    compiled = _arms_with(dew_fn, reference_fn, list(also.values()), label)
     _refuse_numpy_arms(draw, dew_fn, reference_fn, *([] if library_fn is None else [library_fn]),
                        *also.values())
-    dew_fn, reference_fn, further = _arms_with(dew_fn, reference_fn, list(also.values()), label)
+    dew_fn, reference_fn, further = compiled
     library_fn = None if library_fn is None else _arms(library_fn, library_fn)[1]
     truth_fn = _truth_program(truth_fn)
     # Each range's draws, every reference's, computed once for the stages of them all.
