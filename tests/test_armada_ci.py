@@ -817,7 +817,7 @@ def test_the_durations_fold_rewrites_only_a_file_its_record_no_longer_cuts(ci, t
                  "tests": {"tests/test_gone.py::test_x": 5.0, "tests/test_gone.py::test_y": 1.0}})
     (tmp_path / "tests/test_durations.json").write_text(json.dumps(record, indent=0) + "\n")
     verdict = tmp_path / "main.json"
-    verdict.write_text(json.dumps({"rows": rows}))
+    verdict.write_text(json.dumps({"sha": commit(tmp_path, "main"), "part": "all", "rows": rows}))
     monkeypatch.setattr(sys, "argv", ["ci.py", "durations", str(verdict)])
     assert ci.main() == 0
     folded = json.loads((tmp_path / "tests/test_durations.json").read_text())
@@ -830,6 +830,39 @@ def test_the_durations_fold_rewrites_only_a_file_its_record_no_longer_cuts(ci, t
         assert {node: s for node, s in folded.items() if f"/{name}.py" in node} == {
             node: s for node, s in record.items() if f"/{name}.py" in node}
     assert not [node for node in folded if node.startswith("tests/test_gone.py")]
+
+
+def test_the_durations_fold_takes_main_s_times_only_for_files_as_main_ran_them(ci, tmp_path, monkeypatch):
+    """main's CI ran main's test files: a file the checkout has changed since (a head that renamed its tests,
+    composed in a train) keeps its own entries, which name the tests it holds, and a file as main ran it takes
+    the times main's rows observed (2026-10-31: train 370's fold replaced a head's 66 renamed corpus test ids
+    with main's old ones, which no test collects, and the plan cut the file by count)."""
+    (tmp_path / ".armada.json").write_text(json.dumps({"target": 240}))
+    (tmp_path / "tests/test_renamed.py").write_text("def test_old_a():\n    pass\n\ndef test_old_b():\n    pass\n")
+    (tmp_path / "tests/test_unchanged.py").write_text("def test_a():\n    pass\n\ndef test_b():\n    pass\n")
+    renamed, unchanged = "tests/test_renamed.py", "tests/test_unchanged.py"
+    # main's record, which predates test_unchanged's second test.
+    (tmp_path / "tests/test_durations.json").write_text(json.dumps(
+        {f"{renamed}::test_old_a": 100.0, f"{renamed}::test_old_b": 100.0, f"{unchanged}::test_a": 10.0},
+        indent=0) + "\n")
+    main = commit(tmp_path, "main")
+    rows = [{"name": f"3.12:{renamed}", "exitCode": 0, "seconds": 200.0,
+             "tests": {f"{renamed}::test_old_a": 100.0, f"{renamed}::test_old_b": 100.0}},
+            {"name": f"3.12:{unchanged}", "exitCode": 0, "seconds": 30.0,
+             "tests": {f"{unchanged}::test_a": 10.0, f"{unchanged}::test_b": 20.0}}]
+    # A head renames test_renamed's tests, and the queue's record of its composition names them.
+    (tmp_path / "tests/test_renamed.py").write_text("def test_new_a():\n    pass\n\ndef test_new_b():\n    pass\n")
+    (tmp_path / "tests/test_durations.json").write_text(json.dumps(
+        {f"{renamed}::test_new_a": 60.0, f"{renamed}::test_new_b": 140.0, f"{unchanged}::test_a": 10.0},
+        indent=0) + "\n")
+    commit(tmp_path, "a train composed on main")
+    verdict = tmp_path / "main.json"
+    verdict.write_text(json.dumps({"sha": main, "part": "all", "rows": rows}))
+    monkeypatch.setattr(sys, "argv", ["ci.py", "durations", str(verdict)])
+    assert ci.main() == 0
+    assert json.loads((tmp_path / "tests/test_durations.json").read_text()) == {
+        f"{renamed}::test_new_a": 60.0, f"{renamed}::test_new_b": 140.0,
+        f"{unchanged}::test_a": 10.0, f"{unchanged}::test_b": 20.0}
 
 
 def test_a_tasks_wall_time_is_apportioned_by_its_files_tests_times(ci):
@@ -1069,7 +1102,7 @@ def test_a_fold_that_moves_a_test_between_groups_runs_each_test_once_in_its_new_
 
     assert run() == {"3.12:tests/test_moved.py#1/2": nodes[:1], "3.12:tests/test_moved.py#2/2": nodes[1:]}
     main_ci = tmp_path / ".verdict/main.json"
-    main_ci.write_text(json.dumps({"rows": [
+    main_ci.write_text(json.dumps({"sha": base, "part": "all", "rows": [
         {"name": "3.12:tests/test_moved.py#1/2", "exitCode": 0, "seconds": 100.0, "tests": {nodes[0]: 100.0}},
         {"name": "3.12:tests/test_moved.py#2/2", "exitCode": 0, "seconds": 600.0,
          "tests": {nodes[1]: 100.0, nodes[2]: 500.0}}]}))
