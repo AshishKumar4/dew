@@ -4,8 +4,8 @@
     python tools/smoke_wheel.py dist/dewml-*.whl
 
 The wheel is installed from PyPI's index and Dew's package index, which
-serves Dew's JAX build alone (`INDEX`), as a user installs it, so a
-requirement neither can serve fails here. Then, from outside the checkout so
+serves Dew's JAX build, dewml's releases and the forks Dew carries (`INDEX`),
+as a user installs it, so a requirement neither can serve fails here. Then, from outside the checkout so
 nothing of it is importable:
 
 - every module the wheel installed compiles (`compileall`), so a syntax
