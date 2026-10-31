@@ -193,7 +193,7 @@ def traced_flops[**Arguments, Result](function: Callable[Arguments, Result], *ar
     return _program_flops(traced.jaxpr)
 
 
-def _program_flops(program: jaxpr_core.Jaxpr | jaxpr_core.ClosedJaxpr) -> float:
+def _program_flops(program: jaxpr_core.Jaxpr) -> float:
     """`traced_flops` of a program."""
     total = 0.0
     for equation in program.eqns:
@@ -221,7 +221,7 @@ def _program_flops(program: jaxpr_core.Jaxpr | jaxpr_core.ClosedJaxpr) -> float:
         else:
             for value in equation.params.values():
                 for nested in value if isinstance(value, tuple | list) else (value,):
-                    if isinstance(nested, jaxpr_core.Jaxpr | jaxpr_core.ClosedJaxpr):
+                    if isinstance(nested, jaxpr_core.Jaxpr):
                         total += _program_flops(nested)
     return total
 

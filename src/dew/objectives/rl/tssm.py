@@ -21,6 +21,7 @@ import flax.linen as nn
 import jax
 import jax.numpy as jnp
 from flax import struct
+from flax.typing import Dtype
 
 from dew.nn.attention import reference_attention
 from dew.nn.precision import at_least_fp32, float32_einsum
@@ -111,7 +112,7 @@ class TSSM(nn.Module):
     unimix: float = 0.01
     context: int = 64
     """The steps an acting cache holds (`empty_cache`), the windows' length it trained on."""
-    dtype: jnp.dtype = jnp.float32
+    dtype: Dtype = jnp.float32
     """The computation's dtype, bfloat16 for speed; parameters stay at least float32 (`at_least_fp32`),
     so a bfloat16 computation updates float32 weights (DreamerV3's COMPUTE_DTYPE beside its float32
     parameters), and the latents' distributions are at least float32."""

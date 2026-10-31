@@ -34,6 +34,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 from flax import linen as nn, struct
+from flax.typing import Dtype
 
 from dew.batch import Batch, Variables, merge, under
 from dew.nn.precision import at_least_fp32, divided
@@ -79,7 +80,7 @@ def _init(scale: float = 1.0) -> nn.initializers.Initializer:
     if scale == 0:
         return nn.initializers.zeros
 
-    def init(key: jax.Array, shape: tuple[int, ...], dtype: jnp.dtype = jnp.float32) -> jax.Array:
+    def init(key: jax.Array, shape: tuple[int, ...], dtype: Dtype = jnp.float32) -> jax.Array:
         deviation = 1.1368 * scale / math.sqrt(math.prod(shape[:-1]))
         return (deviation * jax.random.truncated_normal(key, -2, 2, shape)).astype(dtype)
 
@@ -91,7 +92,7 @@ class _Layers(nn.Module):
 
     units: int
     count: int
-    dtype: jnp.dtype = jnp.float32
+    dtype: Dtype = jnp.float32
 
     @nn.compact
     def __call__(self, x: jax.Array) -> jax.Array:
@@ -107,7 +108,7 @@ class _BlockLinear(nn.Module):
 
     features: int
     blocks: int
-    dtype: jnp.dtype = jnp.float32
+    dtype: Dtype = jnp.float32
 
     @nn.compact
     def __call__(self, x: jax.Array) -> jax.Array:
@@ -129,7 +130,7 @@ class ConvEncoder(nn.Module):
     depth: int = 64
     mults: tuple[int, ...] = (2, 3, 4, 4)
     kernel: int = 5
-    dtype: jnp.dtype = jnp.float32
+    dtype: Dtype = jnp.float32
 
     @nn.compact
     def __call__(self, image: jax.Array) -> jax.Array:
@@ -160,7 +161,7 @@ class ConvDecoder(nn.Module):
     mults: tuple[int, ...] = (2, 3, 4, 4)
     kernel: int = 5
     blocks: int = 8
-    dtype: jnp.dtype = jnp.float32
+    dtype: Dtype = jnp.float32
 
     @nn.compact
     def __call__(self, deter: jax.Array, stoch: jax.Array) -> jax.Array:
@@ -224,7 +225,7 @@ class WorldModel(nn.Module):
     unimix: float = 0.01
     min_std: float = 0.1
     max_std: float = 1.0
-    dtype: jnp.dtype = jnp.float32
+    dtype: Dtype = jnp.float32
     """The networks' computation dtype, bfloat16 for speed (DreamerV3's COMPUTE_DTYPE): parameters stay at
     least float32, and norms, distributions, heads' outputs and losses at least float32. A TSSM's
     dynamics compute in its own dtype."""
@@ -378,7 +379,7 @@ class Critic(nn.Module):
 
     units: int
     bins: int
-    dtype: jnp.dtype = jnp.float32
+    dtype: Dtype = jnp.float32
 
     @nn.compact
     def __call__(self, feature: jax.Array) -> jax.Array:
