@@ -419,9 +419,10 @@ def _forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dt
     under a softcap at 64 x 64, ptxas 255 unspilled where three fp32 tiles priced 260; the IR's breadth-first
     live set holds the third, ET-HOOKBREAK); a training walk's then its power's integral part built in bits,
     two int32 tiles beside its weights (ET-HOOKBREAK: a natural training walk 174 at width 64, its fold's
-    110 and 64 int32). A score hook's parameters are live beside the logits it reads (`_hook_live`), a phase of
-    their own: the hook adds them into its logits, dead past it (ET-PINFWD: key-bias and tile-bias at 64 x 64
-    on two consumers, width 64, ptxas 168 unspilled where they priced beside the weights 180 and 196)."""
+    110 and 64 int32). A score hook's parameters are live beside the logits it reads (`_hook_live`), a phase
+    of their own: the hook adds them into its logits, dead past it (ET-PINFWD: key-bias and tile-bias at
+    64 x 64 on two consumers, width 64, ptxas 168 unspilled where they priced beside the weights 180 and
+    196)."""
     block_q, block_k = tiles.block_q, tiles.block_k
     hooked, vectors = _hook_live(family, block_q, block_k, params)
     logits, weights = (block_q, block_k, jnp.float32), (block_q, block_k, dtype)
