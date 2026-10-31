@@ -111,7 +111,7 @@ from dew.optim import held_rates, learning_rate, scaled_rates, settable_rates, w
 from dew.state import MODEL_STATE, Accumulation, TrainState, apart, drawn_in, kept_window, together
 from dew.telemetry import profile as telemetry_profile
 from dew.telemetry.instrumentation import StepFlops
-from dew.telemetry.profile import region
+from dew.telemetry.profile import exported as telemetry_exported, region
 from dew.telemetry.records import (
     AxisLink,
     CheckpointRequested,
@@ -201,7 +201,7 @@ from dew.training.planning import (
     splits,
     whole_step,
 )
-from dew.training.profiling import ProfileWindow, export_wait, owned_capture, pgle_runs, stop_capture
+from dew.training.profiling import ProfileWindow, owned_capture, pgle_runs, stop_capture
 from dew.training.rollout import Rollout, _branched, _reported, _rollout_metrics, rolled_out
 from dew.training.rungs import keep_rung, plan_flops, recorded_launches, recorded_rung
 from dew.training.runtime import Preempted, PreemptionNotice, ready_process
@@ -1554,8 +1554,9 @@ class Trainer(Generic[Loss, Effects]):
         # A run's last log is written at its cleanup, a failed run's only where no write waits on a step
         # its peers may never finish (`LogWriter.raise_failure`).
         unread = functools.partial(self._read_taken, run, agree=False)
-        exported = None if profile is None else functools.partial(self._exported_profile, run, profile,
-                                                                  agree=primary is None)
+        # This rank's own window's export, waited on here alone: a failed one fails the run on every rank at
+        # its outcome's agreement (`_reported_outcome`), as any failed cleanup does.
+        exported = None if profile is None else functools.partial(telemetry_exported, profile.directory)
         cleanups = (("Training log", unread), ("Log writer", run.writer.close), ("Training iterator", close),
                     ("Profiler", stop_trace), ("Profile export", exported),
                     ("Checkpoint wait", None if checkpoints is None else checkpoints.wait),
@@ -2357,6 +2358,19 @@ class Trainer(Generic[Loss, Effects]):
         except BaseException as failure:
             if error is None:
                 error = failure
+        profile = self.profile
+        if profile is not None and run.profiled is not None:
+            # A window that stopped, reported once its reports are written, whatever the run's outcome.
+            traced, step = run.profiled
+            try:
+                self._report(ProfileWindowRecord(profile.directory, traced), step)
+                agreed("profile announcement", lambda: self._display.note(
+                    f"Wrote profile for {traced} steps to {profile.directory}"))
+            except BaseException as failure:
+                if error is None:
+                    error = failure
+                else:
+                    error.add_note(f'Reporting the profile window failed: {failure!r}')
         if error is None:
             def report_goodput() -> None:
                 if jax.process_index() == 0:
@@ -2478,20 +2492,8 @@ class Trainer(Generic[Loss, Effects]):
 
     def _stop_trace(self, run: FitRun, profile: ProfileWindow, profiler: Profiler) -> None:
         """Stop the window's owned capture (`stop_capture`), its reports exported beside the steps after
-        it until the run's cleanup waits for them (`_exported_profile`)."""
+        it until the run's cleanup waits for them and its outcome reports the window
+        (`_reported_outcome`)."""
         stop_capture(profiler, run.loss)
         run.profiled = (run.traced, run.current)
 
-    def _exported_profile(self, run: FitRun, profile: ProfileWindow, *, agree: bool) -> None:
-        """Wait at the run's cleanup for every export its window left running (`export_wait`), a stop that
-        failed on some rank included, whose peers' exports still run; a failed one raised on every rank
-        where the run itself `agree`s, as one that failed does not. Then report a window that stopped on
-        process zero, its reports written: a failed run reports none, as its ranks agree on nothing more
-        before its cleanup's own outcome."""
-        export_wait(profile.directory, agree=agree)
-        if run.profiled is None or not agree:
-            return
-        traced, step = run.profiled
-        self._report(ProfileWindowRecord(profile.directory, traced), step)
-        agreed("profile announcement", lambda: self._display.note(
-            f"Wrote profile for {traced} steps to {profile.directory}"))

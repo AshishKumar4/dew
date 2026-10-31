@@ -502,6 +502,38 @@ def test_a_profile_window_traces_steps_past_the_first_compile_and_is_refused_und
     assert not (tmp_path / "pgle").exists()
 
 
+def test_a_run_that_fails_after_its_profile_window_still_reports_the_window(tmp_path):
+    """A run whose window stopped and which fails steps later reports the window at its end, its reports
+    written (row 2824): the record says where the capture is whatever the run's outcome, as its manifest
+    says whether its export completed."""
+    pytest.importorskip("xprof.convert.raw_to_tool_data", reason="optional profile extra")
+    from affine_run import Replaying
+    from recording import RecordingTracker
+
+    from dew.data.dataset import Loader
+    from dew.training import Observe, ProfileWindow
+
+    tracker = RecordingTracker()
+
+    def failing(state):
+        if int(state.step) >= 4:
+            raise RuntimeError("a later step failed")
+        return 0
+
+    model = CausalTransformer(vocab_size=64, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
+                              max_seq_len=SEQ)
+    trainer = one_device(Trainer(LMObjective(model, seq_len=SEQ), optax.sgd(1e-2), key=jax.random.key(0),
+                                 tracker=tracker, profile=ProfileWindow(str(tmp_path), steps=2, warmup=0)))
+    rows = Replaying(lambda position: {"text": np.asarray(BATCH["text"])})
+    with pytest.raises(RuntimeError, match="a later step failed"):
+        trainer.fit(Loader(lambda partition: rows, None, None, ROWS), steps=6, log_every=1,
+                    observe=Observe(1, failing))
+    (window,) = [value for _, value in tracker.artifacts if type(value).__name__ == "ProfileWindow"]
+    (capture,) = tmp_path.glob("capture-*")
+    assert window.steps == 2
+    assert json.loads((capture / "manifest.json").read_text())["export_status"] == "completed"
+
+
 def test_a_borrowed_compile_under_autopgle_profiles_beside_the_state_only_where_the_devices_hold_both(
         monkeypatch):
     """Under AutoPGLE a compile given no trials profiles its step on a copy of the state beside the

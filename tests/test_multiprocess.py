@@ -1780,7 +1780,6 @@ def test_a_profile_window_that_one_rank_cannot_stop_still_waits_for_its_peers_ex
     reports = run_pool("profile_stop_failure", tmp_path / "pool", 2, script=PROFILE_STOP, devices=2,
                        timeout=300, steps=4, profile_dir=str(tmp_path / "pool" / "trace"))
     assert all("profile stop" in (report["failed"] or "") for report in reports), reports
-    assert [report["exporting"] for report in reports] == [0, 0]
     assert reports[1]["manifests"] == 1
     assert all(report["recovered"] == 2 for report in reports)
 

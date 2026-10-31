@@ -131,8 +131,8 @@ def stop_capture(profiler: "Profiler", loss: "jax.Array | None") -> None:
     The core Profiler drains the backend and stops the trace here, and
     exports its native reports in a process of its own while the run
     trains on (`Profiler.stop`, row 2017), which the run's cleanup waits
-    for (`export_wait`). The run's last `loss` is blocked on only to order
-    the primary's failure ahead of the profiler's own drain."""
+    for (`dew.telemetry.profile.exported`). The run's last `loss` is blocked
+    on only to order the primary's failure ahead of the profiler's own drain."""
     def stop() -> None:
         try:
             if loss is not None:
@@ -147,19 +147,6 @@ def stop_capture(profiler: "Profiler", loss: "jax.Array | None") -> None:
                 primary.add_note(f"Profiler stop failed: {failure!r}")
 
     agreed("profile stop", stop)
-
-
-def export_wait(directory: str | Path, *, agree: bool = True) -> None:
-    """Wait for the exports this rank's window under `directory` left running
-    (`dew.telemetry.profile.exported`), so no export outlives the run that captured it: on every rank,
-    a failed export raised on all of them where they `agree`, as a failed stop is (`stop_capture`); on
-    this rank alone in a failed run's cleanup, whose peers may never reach an agreement."""
-    from dew.telemetry.profile import exported
-
-    if agree:
-        agreed("profile export", lambda: exported(Path(directory)))
-    else:
-        exported(Path(directory))
 
 
 def traced_steps(capture: Path) -> tuple[int, ...]:

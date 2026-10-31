@@ -1,4 +1,4 @@
-"""Workers for a profile window a pool cannot stop on every rank (`dew.training.profiling.export_wait`): each
+"""Workers for a profile window a pool cannot stop on every rank (`dew.telemetry.profile.exported`): each
 process a rank of a run whose window rank 0 cannot write its trace for.
 
 dew is imported inside the modes, as `multiprocess_worker`'s are, so the pool starts before JAX does.
@@ -16,7 +16,8 @@ def mode_profile_stop_failure(args) -> dict:
     """A profile window whose capture rank 0 cannot stop: its capture's directory made unwritable while the
     window traces (by an observer, which runs at each step on the loop), so its trace cannot be written as
     the window stops, while rank 1's stop starts its export. Every rank fails the stop together, and the
-    run's cleanup still waits for the export rank 1 started (`export_wait`): none outlives the fit."""
+    run's cleanup still waits for the export rank 1 started (`dew.telemetry.profile.exported`): its manifest
+    is written as the fit returns."""
     import os
     import stat
 
@@ -25,7 +26,6 @@ def mode_profile_stop_failure(args) -> dict:
 
     from dew._coordination import agree_process_phase
     from dew.data.dataset import Loader
-    from dew.telemetry import profile
     from dew.training import Observe, ProfileWindow, Trainer
 
     profile_dir = Path(args.profile_dir)
@@ -48,7 +48,6 @@ def mode_profile_stop_failure(args) -> dict:
                     steps=args.steps, log_every=1, observe=Observe(1, locked))
     except BaseException as failure:
         error = failure
-    exporting = len(profile._exporting)
     manifests = len(list((profile_dir / f"process-{args.process_id}").glob("capture-*/manifest.json")))
     for capture in (profile_dir / "process-0").glob("capture-*"):
         for directory in (capture, *(path for path in capture.rglob("*") if path.is_dir())):
@@ -56,7 +55,7 @@ def mode_profile_stop_failure(args) -> dict:
     recovered = agree_process_phase(None, phase="after the profile stop failure")
     return {"failed": None if error is None else
             f"{type(error).__name__}: {error} | {'; '.join(getattr(error, '__notes__', ()))}",
-            "exporting": exporting, "manifests": manifests, "recovered": recovered}
+            "manifests": manifests, "recovered": recovered}
 
 
 MODES = {"profile_stop_failure": mode_profile_stop_failure}

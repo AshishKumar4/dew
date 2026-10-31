@@ -1641,9 +1641,10 @@ class _Build:
         return lambda examples: partition.bounded(examples, records())
 
     def bound_at(self, pipeline: Pipeline, partition: DataPartition) -> int | None:
-        """Where a per-share training read of several shares holds a run's bound in examples (`_bounds`),
-        which each share reads its part of (`DataPartition.bounded`); None for a read of one share or in
-        one order, which takes the bound whole before it cuts its shares."""
+        """Where a per-share training read of several shares holds a run's bound in examples, the limit
+        before its marks (`examples_bound`), which each share reads its part of (`DataPartition.bounded`);
+        None for a read of one share or in one order, which takes the bound whole before it cuts its
+        shares."""
         if self.global_order or not self.training or partition.count == 1:
             return None
         marked = examples_bound(pipeline.stages)
