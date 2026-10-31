@@ -511,3 +511,42 @@ def test_a_launch_is_chosen_for_the_gpu_its_operands_or_its_mesh_name():
     assert tuning._kind(keyed) == jax.devices()[0].device_kind
     concrete = tokamax.BoundArguments(norm_swiglu.RmsForward(), {"x": jnp.ones((8, 64), jnp.bfloat16)})
     assert tuning._kind(concrete) == jax.devices()[0].device_kind
+
+
+class _Holding:
+    """A hook object whose call reads an array it holds: a cache keyed on it would keep the array alive."""
+
+    def __init__(self, array):
+        self.array = array
+
+    def __call__(self, x):
+        return x * self.array.shape[0]
+
+
+@dataclasses.dataclass(frozen=True)
+class _Scaled:
+    """A hook of a value alone: equal for equal factors, which a cache may hold."""
+
+    by: float
+
+    def __call__(self, x):
+        return x * self.by
+
+
+@pytest.mark.parametrize(("hook", "cached"), [(jnp.tanh, True), (_Scaled(2.0), True),
+                                              (_Holding(jnp.ones(3)), False), (lambda x: x, True)],
+                         ids=["function", "dataclass", "array-holding-object", "plain-lambda"])
+def test_a_launch_lowered_once_traces_again_only_for_a_hook_that_may_hold_an_array(hook, cached):
+    """`tuning.lowered_once` traces a launch once for a static hook it may hold (a function of no closure,
+    a dataclass of values), and again each call for one that may reach an array (a callable object's
+    attributes, which no check sees): run uncached, it keeps nothing alive."""
+    traced = []
+
+    @tuning.lowered_once(("hook",))
+    def launch(x, *, hook):
+        traced.append(1)
+        return hook(x)
+
+    for _ in range(2):
+        jax.block_until_ready(launch(jnp.ones(4), hook=hook))
+    assert len(traced) == (1 if cached else 2)
