@@ -962,6 +962,17 @@ def test_the_quantized_serving_benchmark_samples_through_the_task_and_reads_its_
     pixels, found = tool.sample(pipe, 0)
     assert pixels.shape == (len(tool.PROMPTS), 2, 2, 1) and pixels.dtype == np.uint8
     assert found == {"latents": 0, "pixels": 0}
+    # Its timed forward is the denoiser's program over the model, which sampling compiles through (3032).
+    class Scaled(nn.Module):
+        @nn.compact
+        def __call__(self, x, time, train=False):
+            return x * self.param("scale", nn.initializers.ones, ())
+
+    scaled = TextToImage(Scaled(), Process(FlowMatchingScheduler(), DirectPredictionTransform()),
+                         InputSpec(Field("image", (2, 2, 1))), {"params": {"scale": jnp.ones(())}}, steps=1,
+                         guidance=None, solver=Euler())
+    row = tool.forward(scaled)
+    assert row["forward_ms"] > 0 and row["weights_mib"] >= 0
 
 
 # ---------------------------------------------------------------------------

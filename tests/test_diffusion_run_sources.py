@@ -674,6 +674,33 @@ def test_a_saved_flow_grpo_run_restores_its_policy_and_not_its_kl_reference(tmp_
                for got, before in zip(restored, started, strict=True))
 
 
+def test_a_distillation_from_a_flow_grpo_run_distills_its_policy_and_not_its_kl_reference(tmp_path):
+    """A distillation whose teacher run trained under Flow-GRPO with a KL term, whose averaged weights
+    are the frozen initial model, distills the trained policy the run publishes, as its task restores
+    it (`SavedRun.variables`), not that reference."""
+    from dew.checkpoints import Checkpoints
+    from dew.objectives.base import TEACHER
+    from dew.sampling import Consistency
+
+    config = grpo_run(beta=0.1, directory=str(tmp_path))
+    objective = config.build()
+    assert config.rollout is not None
+    checkpoints = Checkpoints(str(tmp_path / "run"))
+    _, started, state = grpo_step(objective, config.rollout.build(objective), checkpoints=checkpoints)
+    checkpoints.save(1, state, None, {}, artifact=objective.inference_record())
+    checkpoints.wait()
+    config.save(str(tmp_path / "run"))
+    distillation = ObjectiveConfig("rcm", {"solver": Consistency(), "steps": 3, "ema_decay": None})
+    student = dataclasses.replace(grpo_run(directory=str(tmp_path)), rollout=None,
+                                  teacher_run=str(tmp_path / "run"), objective=distillation)
+    distilled = jax.tree.leaves(student.build().init(jax.random.PRNGKey(0))[TEACHER]["params"])
+    published = jax.tree.leaves(objective.pipeline(state).variables["params"])
+    for got, want in zip(distilled, published, strict=True):
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+    assert any(not np.array_equal(np.asarray(got), before)
+               for got, before in zip(distilled, started, strict=True))
+
+
 def test_flow_grpo_over_a_loaded_pipeline_samples_on_the_pipelines_grid(pipelines, tmp_path):
     """Flow-GRPO built over a published pipeline, its grid left out, evaluates on the pipeline's own
     grid as the denoising objective over it does, and its published task and the task a saved run

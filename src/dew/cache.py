@@ -270,9 +270,9 @@ KERNEL_PINS = jax.make_user_context(())
 thread, keyed on as `KERNEL_TUNES` is."""
 
 KERNEL_ASSUMED = jax.make_user_context(default_value=None)
-"""The device `dew.nn.kernels.generation.assumed` stands in for in this thread, its generation and its
-facts where given them, keyed on as `KERNEL_TUNES` is, so a program traced for one device's launches
-traces again for another's."""
+"""The device `dew.nn.kernels.generation.assumed` stands in for in this thread (`generation.Assumption`:
+its generation and its facts where given them), keyed on as `KERNEL_TUNES` is, so a program traced for one
+device's launches traces again for another's."""
 
 KERNEL_CHOICES = jax.make_user_context(())
 """The `(choice, kernel)` pairs `dew.nn.kernels.generation.chosen` holds in

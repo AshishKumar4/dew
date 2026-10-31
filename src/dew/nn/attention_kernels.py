@@ -180,13 +180,13 @@ def _on_gpu(case: AttentionCase) -> bool:
 def _flash_installed(case: AttentionCase) -> bool:
     # A step traced for an assumed GPU on a host without the wheel takes the wheel its target
     # installs: what the host lacks shows as what it ran (`_hosted`), not as the target's refusal.
-    return flash_architectures() is not None or generation.ASSUMED.get() is not None
+    return flash_architectures() is not None or generation.assumption() is not None
 
 
 def _flash_built(case: AttentionCase) -> bool:
     # A step traced for an assumed GPU takes the wheel its target installs, as `_flash_installed` holds.
     architectures = flash_architectures()
-    return (architectures is None or generation.ASSUMED.get() is not None
+    return (architectures is None or generation.assumption() is not None
             or flash_built_for(device_generation(), architectures))
 
 
