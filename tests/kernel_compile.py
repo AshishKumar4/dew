@@ -54,12 +54,13 @@ SPILLS = re.compile(r"(\d+) bytes spill stores, (\d+) bytes spill loads")
 @dataclasses.dataclass(frozen=True)
 class Report:
     """One Mosaic GPU kernel's reports: its name, the shared bytes and tensor memory columns it asks for
-    (Mosaic's resource estimate), its registers a thread and its spilled bytes (its binary's, `report.Binary`:
-    its stack frame, nonzero exactly where ptxas spills), what the reports left `unread`: either report
-    without the other, or a field neither states, is no evidence the kernel is within its resources; and its
-    `module`, its kernel hash, which two compiles of one module share: Mosaic compiles a module once a
-    process, so a later compile of it prints no PTX of its own; and the digest of the launch that traced it
-    (`launching`), which its name carried, or None."""
+    (Mosaic's resource estimate), its registers a thread and its spilled bytes as the GPU compiles its PTX
+    (`inherited`; its binary's registers and stack frame until then, `report.Binary`, which the verdict
+    never reads), what the reports left `unread`: either report without the other, or a field neither
+    states, is no evidence the kernel is within its resources; and its `module`, its kernel hash, which two
+    compiles of one module share: Mosaic compiles a module once a process, so a later compile of it prints
+    no PTX of its own; and the digest of the launch that traced it (`launching`), which its name carried, or
+    None."""
     kernel: str
     shared: int | None
     tmem: int | None
@@ -85,13 +86,19 @@ def reports(estimates: dict[str, str], binaries: list[report.Binary],
             modules: dict[str, str] | None = None) -> list[Report]:
     """Each kernel's `Report` from its resource estimate (`estimates`, Pallas's printed `Resources` by kernel
     name) and its binary (`binaries`, `report.binaries`), paired by the kernel's name, with its module
-    (`modules`, its kernel hash by name)."""
+    (`modules`, its kernel hash by name). An estimate names no kernel (`_estimates` pairs them by the
+    program's order): one past the shared memory its binary's launch asks for, or none where it asks for
+    some, is another kernel's, and raises."""
     found = {binary.kernel: binary for binary in binaries}
     launches = {binary.kernel: binary.launch for binary in binaries}
     found_reports = []
     for name in sorted(set(estimates) | set(found)):
         text, binary = estimates.get(name, ""), found.get(name)
         shared, tmem = SHARED.search(text), TENSOR_MEMORY.search(text)
+        if shared and binary is not None and binary.shared is not None and not (
+                int(shared.group(1)) <= binary.shared and (int(shared.group(1)) > 0 or binary.shared == 0)):
+            raise ValueError(f"{name}'s estimate of {shared.group(1)} shared bytes pairs with a binary whose "
+                             f"launch asks for {binary.shared}: the estimate is another kernel's")
         unread = tuple(field for field, read in (("shared bytes", shared), ("tensor memory columns", tmem),
                                                  ("registers", binary), ("spills", binary)) if not read)
         found_reports.append(Report(
@@ -345,15 +352,18 @@ module: Mosaic compiles a module once a process, so a later case of the same mod
 def inherited(kernel: dict, compiled: dict[str, dict]) -> dict:
     """`kernel`'s record (`mosaic_kernels`) with its registers and spills as the GPU compiles its PTX: this
     compile's (`compiled`, by kernel name), which this process keeps by its module (`COMPILED`), or, where
-    Mosaic compiled the same module before in this process and so printed no PTX, that compile's; its
-    binary's otherwise."""
+    Mosaic compiled the same module before in this process and so printed no PTX, that compile's. Its
+    binary is this process's compile, which may not be the GPU's (`RELOCATABLE`): a kernel neither covers
+    keeps them unread."""
     if kernel["kernel"] in compiled:
         if kernel["module"] is not None:
             COMPILED[kernel["module"]] = compiled[kernel["kernel"]]
         return {**kernel, **compiled[kernel["kernel"]]}
     if kernel["module"] in COMPILED:
         return {**kernel, **COMPILED[kernel["module"]], "ptxas": "an earlier compile of its module"}
-    return {**kernel, "ptxas": "its binary"}
+    unread = [*kernel["unread"], *(field for field in ("registers", "spills")
+                                   if field not in kernel["unread"])]
+    return {**kernel, "registers": None, "spilled": None, "unread": unread}
 
 
 NEEDS: dict[str, int | dict | None] = {}
