@@ -1350,8 +1350,8 @@ def _states(k, w, u, hi, lo, beta, h0, sequences, taken, call: _Call, tiles: Til
         entering = family.opened(streams["once"], initial_views)
 
         prefetch = functools.partial(_prefetched, family, (hi_ref, lo_ref), None if delta else beta_ref, h)
-        # Each key slice of the memory and the corrected values, a store each in flight.
-        before_store = _walk_stores(family, width // call.block + 1)
+        # Each key slice of the memory and, where stored, the corrected values, a store each in flight.
+        before_store = _walk_stores(family, width // call.block + int(stores_corrected))
 
         def step(role):
             (staged, scratch), lands = roled(role)
