@@ -128,8 +128,10 @@ def start_capture(profiler: "Profiler") -> None:
 def stop_capture(profiler: "Profiler", loss: "jax.Array | None") -> None:
     """Stop the window's owned capture on every rank.
 
-    The core Profiler drains the backend and exports the native reports
-    on `stop`. The run's last `loss` is blocked on only to order the
+    The core Profiler drains the backend and stops the trace here, and
+    exports its native reports in a process of its own while the run
+    trains on (`Profiler.stop`, row 2017), which `ProfileReport.read`
+    waits for. The run's last `loss` is blocked on only to order the
     primary's failure ahead of the profiler's own drain."""
     def stop() -> None:
         try:
@@ -138,7 +140,7 @@ def stop_capture(profiler: "Profiler", loss: "jax.Array | None") -> None:
         finally:
             primary = sys.exception()
             try:
-                profiler.stop()
+                profiler.stop(wait=False)
             except BaseException as failure:
                 if primary is None:
                     raise
@@ -224,9 +226,11 @@ class ProfileReport:
         traced into `window`, this process's newest capture's. The run logged its steps once at the
         window's end, so that log's scalars are the steps the capture's annotations hold
         (`traced_steps`), or the report is refused."""
-        from dew.telemetry.profile import process_directory
+        from dew.telemetry.profile import exported, process_directory
         from dew.telemetry.trace import device_events
 
+        # The window's export runs beside the run (`stop_capture`), which its report waits for.
+        exported(window)
         capture = max(process_directory(window).glob("capture-*"), key=lambda path: path.stat().st_mtime)
         traced = traced_steps(capture)
         if traced != tuple(range(warmup, warmup + steps)):

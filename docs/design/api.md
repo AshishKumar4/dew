@@ -18,7 +18,7 @@ Design record, 2026-09-03. The code blocks are design sketches, not runnable cod
 | 8 | Diffusion vocabulary stays (`NoiseScheduler`, `PredictionTransform`, the sampler names). Ownership moves into one `Process` value per convention; presets are dataclasses in a registry. | 3.5 |
 | 9 | Discrete diffusion gets its own small algebra in `dew.diffusion.discrete`, shaped like the Gaussian one. It is not a special case of it. | 6.1 |
 | 10 | The objective's loss returns an `Aux` that can carry updated non-parameter collections. That is the one channel for MoE balancing, batch statistics and sown values. | 3.3, 6.2 |
-| 11 | A custom compiled step is the one escape hatch (`Trainer(step=...)`). There is no second trainer. | 6.5 |
+| 11 | A custom compiled step is the one escape hatch (`Trainer(step=...)`). There is no second trainer. A custom step over a model that reads the run's progress passes it and says so (`PassesProgress`). | 6.5 |
 | 12 | Sharding is declared on the module that owns the parameters, with a decorator, and merged into a `Layout`. The table in `training/distributed.py` moves out of the training package. | 3.8 |
 
 ## 1. What is wrong today
@@ -305,7 +305,9 @@ with or without `text_only`. A run passes both through `--source.text-only` and
 `--source.prediction-depths` (`RunConfig.source`), whatever kind of run it is, the load's
 `modeling_overrides` through `--source.attention`, each layer kind causal or block_bidirectional,
 and its differential extension through `--source.dex`, the `DifferentialExtension`'s record as JSON
-(`dew.nn.dex`); a diffusion pipeline, which no override reaches, refuses them. `dew.pipeline` takes
+(`dew.nn.dex`), and `scan_layers` through `--source.scan-layers`, which scans a decoder's runs of
+like layers, its periodic pattern among them, its stored tree unchanged, and refuses a model with no
+layers to scan (`Pretrained.load`); a diffusion pipeline, which no override reaches, refuses them. `dew.pipeline` takes
 the same choices for a source as `options=SourceOptions(...)`, and refuses them for a run directory,
 whose record holds its own.
 
@@ -404,7 +406,7 @@ The mixer keeps its recurrent state in the `cache` collection, exactly as the KV
 
 | Need | Boundary |
 | --- | --- |
-| Alternating or multi-optimizer updates (GAN, actor-critic) | Not one `loss`. `Trainer(step=make_my_step)` replaces the compiled step and is the one documented place for a custom step. |
+| Alternating or multi-optimizer updates (GAN, actor-critic) | Not one `loss`. `Trainer(step=make_my_step)` replaces the compiled step and is the one documented place for a custom step. A step over a model that reads the run's progress (`dew.nn.progress.ReadsProgress`, a DEX decoder) passes it `Progress(state.updates)` and its factory is wrapped, `Trainer(step=PassesProgress(make_my_step))`; the trainer refuses that model under any other custom step, which would train it at the run's end. |
 | Tensor or sequence parallel | `MeshSpec(tensor=N)` and rules are cheap; correct TP needs `with_sharding_constraint` on activations inside each model. Per-architecture work. |
 | Pipeline parallel | `MeshSpec(stage=N)` runs GPipe over a stack of like layers (a decoder's, a DiT's, a JEPA's, a UNet level's transformers; `decoder_stack.run_pipeline`); everything outside the stacks runs on every stage, and no 1F1B schedule is built. |
 | Non-grain data | `Dataset.train` is any callable returning an iterator; without `get_state` the run cannot checkpoint its position and `fit` says so. |

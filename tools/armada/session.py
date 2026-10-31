@@ -40,7 +40,7 @@ def pytest_run(python: str, report: Path, *measured: str) -> list[str]:
     cut short, and pytest's JUnit report written to `report`; `measured`, a module and its arguments that run
     pytest in turn (coverage's `run`).
     No timed dump of every thread's stack runs beside the tests, as walking threads that run killed the
-    process mid-dump (exit 245, a SIGSEGV, in 3 of 5 runs of a multithreaded interpreted kernel's test, Main
+    process mid-dump (exit 245, a SIGSEGV, in 3 of 5 runs of a multithreaded interpreted kernel's test,
     2026-10-25): a caller's deadline ends a hang (ci.py's `tested`: SIGINT, whose report pytest prints where
     it can handle it, then the group killed past the grace), and a fatal signal still prints the stacks
     (pytest's faulthandler)."""
