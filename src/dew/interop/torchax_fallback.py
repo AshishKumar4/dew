@@ -1042,28 +1042,12 @@ def _narrow_float(value) -> bool:
 
 
 def _accumulated(value: jax.Array, shape: tuple[int, ...], dimensions: tuple[int, ...]) -> jax.Array:
-    """`jax.lax.broadcast_in_dim`, whose gradient sums in fp32 and rounds once to `value`'s dtype, at every
-    order (`_wide_summed`)."""
-    return _wide_summed(shape, dimensions)(value)
-
-
-@functools.cache
-def _wide_summed(shape: tuple[int, ...], dimensions: tuple[int, ...]) -> Callable[[jax.Array], jax.Array]:
-    """The broadcast to `shape` over `dimensions` as one differentiable function (`linear_tangent`), built
-    once a broadcast so its traces are JAX's cached ones: its tangent the broadcast's own, its transpose
-    the cotangent summed in fp32 and rounded once to the value's dtype, so forward mode, reverse mode and
-    their compositions all take it (ledger 2653), where a custom VJP takes no forward mode."""
-    from dew.nn.kernels.generation import linear_tangent
-
-    def broadcast(value: jax.Array) -> jax.Array:
-        return jax.lax.broadcast_in_dim(value, shape, dimensions)
-
-    def summed(_saved: tuple[()], operands: tuple[jax.Array], cotangent: jax.Array) -> tuple[jax.Array]:
-        (value,) = operands
-        _, transpose = jax.vjp(broadcast, value.astype(jnp.float32))
-        return (transpose(cotangent.astype(jnp.float32))[0].astype(value.dtype),)
-
-    return linear_tangent(lambda value: (broadcast(value), ()), summed, broadcast)
+    """`jax.lax.broadcast_in_dim`, whose gradient sums in fp32 and rounds once to `value`'s dtype at every
+    order: the broadcast taken in fp32 between two casts, each exact, so its transpose, wherever JAX forms
+    one (a gradient, a gradient's gradient, forward over reverse), widens the cotangent, sums it in fp32
+    and rounds the sum once (ledger 2653). A custom VJP takes no forward mode, and a custom JVP over the
+    plain broadcast would sum its nested derivatives narrow."""
+    return jax.lax.broadcast_in_dim(value.astype(jnp.float32), shape, dimensions).astype(value.dtype)
 
 
 def _forward(model: PreTrainedModel, tokens: torch.Tensor, positions: torch.Tensor | None = None,

@@ -831,6 +831,30 @@ def test_a_broadcast_summing_its_gradient_wide_holds_every_order(edge):
                     truth_fn=plain, plain_fn=plain)
 
 
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16])
+def test_a_broadcast_sums_its_gradient_wide_at_every_order(dtype):
+    """`torchax_fallback._accumulated`'s transpose sums in float32 and rounds once wherever a derivative
+    forms one: a weighted square's gradient, the gradient's tangent (forward over reverse) and its gradient
+    (reverse over reverse) each sum 4096 terms of the value's narrow dtype, every product exact, to the
+    float32 sum rounded once, where a sum in the narrow dtype rounds its partial sums (ledger 2653)."""
+    rows = 4096
+    weights = jnp.asarray(1 + (np.arange(rows * 4).reshape(rows, 4) % 7) * 2.0**-7, dtype)
+    ones = jnp.ones(4, dtype)
+
+    def loss(value):
+        return jnp.sum(weights * jnp.square(torchax_fallback._accumulated(value, (rows, 4), (1,))))
+
+    # Each term 2 w, exact in the narrow dtype, summed exactly in float32 and rounded once.
+    expected = np.asarray(2 * np.asarray(weights, np.float32).sum(0)).astype(dtype)
+    gradient = jax.grad(loss)(ones)
+    tangent = jax.jvp(jax.grad(loss), (ones,), (ones,))[1]
+    curvature = jax.grad(lambda value: jnp.vdot(jax.grad(loss)(value), ones).astype(jnp.float32))(ones)
+    for derivative in (gradient, tangent, curvature):
+        np.testing.assert_array_equal(np.asarray(derivative), expected, strict=True)
+    narrow = np.asarray(2 * weights).sum(0, dtype=dtype)
+    assert not np.array_equal(narrow, expected), "a narrow sum rounds these terms apart"
+
+
 
 INTERPRETED = jax.default_backend() != "gpu"
 """The ported kernels interpret off a GPU."""
