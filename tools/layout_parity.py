@@ -793,19 +793,31 @@ def _named(eqn) -> str:
     return f"{eqn.primitive.name} in {eqn.source_info.name_stack or 'the loss'} -> {outputs}"
 
 
-def recording_loss(objective, variables, step_fields: Mapping[str, Any]):
-    """The loss of `objective` over `variables`' other collections as a function of the parameters and
-    the batch, and of a `Step.tape` to read its draws and boundaries from where one is given, returning
-    beside it what its `Step.sample` and `Step.boundary` calls produced by name, and the kind of each
-    name once traced (`Witness.kinds`)."""
-    from dew.objectives.base import Step, Witness
+def first_step(state, variables, ema, batch):
+    """The `Step` the trainer's first step reads (`attempt_step`): its key folded with the step, its
+    examples' (`example_fields`), which draw a diffusion objective's noise and a masked one's masks, the
+    frozen EMA DPO and GRPO score against beside `variables`, the updates committed, which a model
+    reading the run's progress reads (ledger 3057), and the optimizer's QK statistics where it clips
+    them."""
+    from dew.training.transaction import attempt_step
+
+    return attempt_step(state, variables, ema, batch, split=1, slots=1, attempt=state.step, part=None,
+                        slot=0)
+
+
+def recording_loss(objective, variables, step):
+    """The loss of `objective` over `variables`' other collections at `step` as a function of the
+    parameters and the batch, and of a `Step.tape` to read its draws and boundaries from where one is
+    given, returning beside it what its `Step.sample` and `Step.boundary` calls produced by name, and
+    the kind of each name once traced (`Witness.kinds`)."""
+    from dew.objectives.base import Witness
 
     kinds: dict[str, str] = {}
 
     def loss(params, batch, tape=None):
         witness = Witness()
-        step = Step(**step_fields, tape=tape, witness=witness)
-        value, _ = objective.scalar_loss({**variables, "params": params}, batch, step)
+        value, _ = objective.scalar_loss({**variables, "params": params}, batch,
+                                         step.replace(tape=tape, witness=witness))
         kinds.update(witness.kinds)
         return value, dict(witness.values)
 
@@ -850,22 +862,13 @@ def anchor_loss(case, batch, state):
     """The fp64 loss of the trainer's first step over `state`'s widened variables, as a function of
     the parameters and the batch, and those widened parameters."""
     import benchmark_models as bench
-    import jax
-
-    from dew.objectives.base import Step
-    from dew.training.transaction import example_fields, with_ema
 
     sys.path.insert(0, str(REPO / "tests"))
     from reference_error import widened
 
     wide = widened(state.variables)
     objective = bench.build_objective(case, widened=True)
-    # The trainer's first step: its key folded with the step, its examples' (`example_fields`), which
-    # draw a diffusion objective's noise and a masked one's masks, and the frozen EMA DPO and GRPO
-    # score against.
-    step = Step(state.microstep, jax.random.fold_in(state.key, state.step),
-                with_ema(wide, None if state.ema is None else widened(state.ema)),
-                **example_fields(state, 0, 1, batch))
+    step = first_step(state, wide, None if state.ema is None else widened(state.ema), batch)
 
     def loss(variables, batch):
         return objective.scalar_loss({**wide, "params": variables}, batch, step)[0]
@@ -914,7 +917,6 @@ class Anchor:
         import benchmark_models as bench
         import jax
 
-        from dew.training.transaction import example_fields, with_ema
 
         sys.path.insert(0, str(REPO / "tests"))
         from reference_error import widened
@@ -928,11 +930,9 @@ class Anchor:
                                       "the model's but its dtype")
         wide = widened(state.variables)
         first = drawn_batch(case, 0)
-        self.places = example_fields(state, 0, 1, first)["example_index"]
-        fields = {"step": state.microstep, "key": jax.random.fold_in(state.key, state.step),
-                  "ema": with_ema(wide, None if state.ema is None else widened(state.ema)),
-                  **example_fields(state, 0, 1, first)}
-        self.loss, self.kinds = recording_loss(objective, wide, fields)
+        step = first_step(state, wide, None if state.ema is None else widened(state.ema), first)
+        self.places = step.example_index
+        self.loss, self.kinds = recording_loss(objective, wide, step)
         self.params = wide["params"]
         read = audited(self.loss, self.kinds, self.params, first, label, wide=False)
         self.read = frozenset(read)
@@ -1046,15 +1046,11 @@ class Judge:
     def audit(self) -> None:
         """Refuse a reference whose loss reads randomness outside its draws (`audited`)."""
         import benchmark_models as bench
-        import jax
-
-        from dew.training.transaction import example_fields, with_ema
 
         state, _, _ = _trainer(self.case, {}, one_device=True).place()
         first = drawn_batch(self.case, 0)
-        fields = {"step": state.microstep, "key": jax.random.fold_in(state.key, state.step),
-                  "ema": with_ema(state.variables, state.ema), **example_fields(state, 0, 1, first)}
-        loss, kinds = recording_loss(bench.build_objective(self.case), state.variables, fields)
+        loss, kinds = recording_loss(bench.build_objective(self.case), state.variables,
+                                     first_step(state, state.variables, state.ema, first))
         audited(loss, kinds, state.variables["params"], first, self.label, wide=False)
 
     @property
