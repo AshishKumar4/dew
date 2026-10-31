@@ -29,7 +29,7 @@ from typing_extensions import TypeVar
 from dew.averaging import ema_update
 from dew.batch import EXAMPLE_ROWS, Batch, Variables, dicts, merge
 from dew.data.dataset import rows_of
-from dew.held_updates import held_places, holds_back, input_taken, refuse_untold, update_applied
+from dew.held_updates import holds_back, input_taken, refuse_untold, update_applied
 from dew.nn.inspection import Watched, flattened
 from dew.nn.kernels.options import compiler_options
 from dew.nn.precision import at_least_fp32
@@ -343,7 +343,8 @@ def example_places(slot, split: int, rows: int, column: jax.Array | None = None,
     return (step * rows * split + column).astype(jnp.int32)
 
 
-def example_fields(state, slot, split: int, batch, slots: int = 1, part=None, rejected=0) -> dict:
+def example_fields(state, slot, split: int, batch, slots: int = 1, part=None, rejected=0,
+                   microstep=None) -> dict:
     """The `Step` fields of the microbatch in window slot `slot` of the update `state` commits next, of
     `slots` microbatches, its steps read in `split` microbatches each, this the `part`th, after the run
     rejected `rejected` attempts: the update's key (`Step.example_key`), which folds in the rejections,
@@ -355,9 +356,10 @@ def example_fields(state, slot, split: int, batch, slots: int = 1, part=None, re
         return {}
     key = jax.random.fold_in(jax.random.fold_in(jax.random.fold_in(state.key, EXAMPLE_STREAM),
                                                 state.updates), rejected)
-    # The calls an optimizer holds an update back over draw apart (`held_places`), as a window's slots do.
-    for place in held_places(state.opt_state):
-        key = jax.random.fold_in(key, place)
+    if holds_back(state.opt_state):
+        # The calls an optimizer holds an update back over, and those it skips, draw apart by the
+        # microbatches accepted before each (`microstep`, the state's where none is given).
+        key = jax.random.fold_in(key, state.microstep if microstep is None else microstep)
     index = example_places(slot, split, rows, batch.get(EXAMPLE_ROWS), part)
     return {"example_key": key, "example_index": placed_as_rows(index, batch), "example_count": slots * rows}
 
@@ -554,11 +556,11 @@ class Transaction:
                          with_ema(variables, self.fetched(state).ema), committed=state.updates,
                          record=self.record, qk_stats=clips_qk(state.opt_state), watched=self.watched,
                          **self.examples(state, index, batch, part=attempt % self.split,
-                                         rejected=attempt - accepted))
+                                         rejected=attempt - accepted, microstep=accepted))
         return self.read(variables, state.compute), batch, step_info
 
-    def examples(self, state, slot, batch, part=None, rejected=0) -> dict:
-        return example_fields(state, slot, self.split, batch, self.size, part, rejected)
+    def examples(self, state, slot, batch, part=None, rejected=0, microstep=None) -> dict:
+        return example_fields(state, slot, self.split, batch, self.size, part, rejected, microstep)
 
     def _places(self, slot, evaluated: Evaluated, part) -> jax.Array:
         """The places the window's slot `slot` and the column its loss saw give an evaluation's rows

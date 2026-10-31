@@ -1,10 +1,10 @@
 """Optimizers that hold an update back on some calls, as their states tell it (row 1870).
 
-`optax.MultiSteps`, `optax.apply_every` and `optax.apply_if_finite` apply no update on some calls, and
-each says by its state which call applied one. The trainer counts its clocks, its update count, its
-average and its committed tokens by the updates applied (`update_applied`), keeps the tokens of a held
-call waiting (`waiting`), draws each held call apart (`held_places`), and refuses an optimizer whose
-state does not say (`refuse_untold`).
+`optax.MultiSteps` and `optax.apply_every` apply no update on some calls, and over the whole update each
+says by its state which call applied one. The trainer counts its clocks, its update count, its average
+and its committed tokens by the updates applied (`update_applied`), keeps the tokens of a held call
+waiting (`waiting`) and drops a skipped one's (`input_taken`), and refuses an optimizer whose state does
+not say (`refuse_untold`).
 """
 
 from __future__ import annotations
@@ -19,15 +19,13 @@ import optax
 
 
 class _Hold(NamedTuple):
-    """How a wrapper that holds an update back on some calls tells it by its state: whether a call
-    applied one, from its state before and after the call (`applied`), and where among the calls it
-    holds one stands (`place`), which that call's draws fold in."""
+    """How a wrapper that holds an update back on some calls tells it by its state, from its state before
+    and after a call: whether the call applied one (`applied`), and whether it took its input in, to
+    apply now or later (`taken`), false where the wrapper skipped it."""
 
     name: str
     applied: Callable[[Any, Any], jax.Array]
     taken: Callable[[Any, Any], jax.Array]
-    """Whether the call took its input in, to apply now or later: false where the wrapper skipped it."""
-    place: Callable[[Any], jax.Array]
 
 
 @functools.cache
@@ -42,10 +40,9 @@ def _holds() -> Mapping[type, _Hold]:
         optax.MultiStepsState: _Hold(
             "optax.MultiSteps", lambda before, after: after.gradient_step != before.gradient_step,
             lambda before, after: (after.gradient_step != before.gradient_step)
-            | (after.mini_step != before.mini_step),
-            lambda state: state.mini_step),
+            | (after.mini_step != before.mini_step)),
         every: _Hold("optax.apply_every", lambda before, after: after.count == 0,
-                     lambda before, after: jnp.asarray(a=True), lambda state: state.count),
+                     lambda before, after: jnp.asarray(a=True)),
     }
 
 
@@ -131,14 +128,6 @@ def waiting(opt_state: optax.OptState) -> jax.Array | None:
     `opt_state` holds back (`TrainState.deferred`): none yet, two uint32 words; None for an optimizer that
     applies every update."""
     return jnp.zeros((2,), jnp.uint32) if holds_back(opt_state) else None
-
-
-def held_places(opt_state: optax.OptState) -> list[jax.Array]:
-    """Where among the calls the wrapper in `opt_state` that holds the whole update back has the next
-    call stand (`_Hold.place`), which its draws fold in: the calls of one update draw apart, as the
-    slots of the trainer's own window do."""
-    table = _holds()
-    return [table[type(node)].place(node) for node in _outermost(opt_state)]
 
 
 _WHOLE = ("hold the whole update back: optax.MultiSteps(optimizer, k), or optax.chain(optimizer, "
