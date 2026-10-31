@@ -30,10 +30,10 @@ import contextlib
 import dataclasses
 import enum
 import functools
-import inspect
 import os
+import sys
 from collections.abc import Callable, Hashable, Sequence
-from typing import Literal, overload
+from typing import Literal, Protocol, overload, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -434,6 +434,14 @@ def accumulated(product: Callable[..., jax.Array], *operands,
     return jax.lax.platform_dependent(*operands, cpu=wide, default=narrow)
 
 
+@runtime_checkable
+class _Named(Protocol):
+    """A function by its module and its name there: a module's function or a jitted one (`_stated`)."""
+
+    __module__: str
+    __qualname__: str
+
+
 @dataclasses.dataclass(frozen=True, eq=False)
 class _Same:
     """A function compared and hashed by its identity alone, whatever equality it states (dataclass
@@ -460,10 +468,12 @@ def _stated(product: Callable[..., jax.Array]) -> Hashable | None:
     nothing a trace may not keep (a tracer it closes over, an array)."""
     function, arguments, keywords = ((product.func, product.args, product.keywords)
                                      if isinstance(product, functools.partial) else (product, (), {}))
-    # A function of its module's: a plain function, not a method, defined at no call (`<locals>`) and
-    # closing over nothing (a wrapper `functools.wraps` names as what it wraps does).
-    if (not inspect.isfunction(function) or "<locals>" in function.__qualname__
-            or function.__closure__ is not None):
+    # A function of its module's, the one its module holds under its name: made once, at import, where a
+    # closure made at a call (named as what it wraps, by `functools.wraps`) is another object.
+    if not isinstance(function, _Named):
+        return None
+    module = sys.modules.get(function.__module__)
+    if module is None or vars(module).get(function.__qualname__) is not function:
         return None
 
     def value(argument: _Argument) -> Hashable | None:
