@@ -367,6 +367,22 @@ def example_fields(state, slot, split: int, batch, slots: int = 1, part=None, re
     return {"example_key": key, "example_index": placed_as_rows(index, batch), "example_count": slots * rows}
 
 
+def attempt_step(state, variables, ema, batch, *, split: int, slots: int, attempt, part, slot,
+                 microstep=None, record: bool = False, watched: Watched | None = None) -> Step:
+    """The `Step` the loss of attempt `attempt` of the update `state` commits next reads: the step it
+    counts, its microbatches accepted (`microstep`, the state's where none is given) over the `split`
+    each step is read in; the attempt's own key; the averaged weights `ema` beside `variables`; the
+    updates committed, which a model whose computation moves over a run reads (`Objective.progress`);
+    and the microbatch's examples, its window `slot` of `slots`, its `part`, after the attempts the run
+    rejected (`example_fields`). An attempt and its replay read it, and so do the traces that shape and
+    narrow the step (`dew.training.footprint.traced_loss`, `dew.training.narrow.narrow_copies`), which
+    record nothing and watch nothing."""
+    accepted = state.microstep if microstep is None else microstep
+    return Step(accepted // split, jax.random.fold_in(state.key, attempt), with_ema(variables, ema),
+                committed=state.updates, record=record, qk_stats=clips_qk(state.opt_state), watched=watched,
+                **example_fields(state, slot, split, batch, slots, part, attempt - accepted, microstep))
+
+
 def placed_as_rows(index: jax.Array, batch) -> jax.Array:
     """`index`, an entry for each of `batch`'s rows, placed as the batch's rows are, so each device
     reads its own rows' entries alone."""
@@ -555,12 +571,15 @@ class Transaction:
             **state.variables, **jax.tree.map(lambda x: x[index], previous.variables)}
         accepted, attempt = state.microstep - fill + index, previous.attempts[index]
         # The part its input ran as, which an attempt counts (`step` times `split` plus its part).
-        step_info = Step(accepted // self.split, jax.random.fold_in(state.key, attempt),
-                         with_ema(variables, self.fetched(state).ema), committed=state.updates,
-                         record=self.record, qk_stats=clips_qk(state.opt_state), watched=self.watched,
-                         **self.examples(state, index, batch, part=attempt % self.split,
-                                         rejected=attempt - accepted, microstep=accepted))
+        step_info = self.attempt(state, variables, batch, attempt, attempt % self.split, index,
+                                 microstep=accepted)
         return self.read(variables, state.compute), batch, step_info
+
+    def attempt(self, state, variables, batch, attempt, part, slot, microstep=None) -> Step:
+        """`attempt_step` of this transaction's split, window, recording and watch."""
+        return attempt_step(state, variables, self.fetched(state).ema, batch, split=self.split,
+                            slots=self.size, attempt=attempt, part=part, slot=slot, microstep=microstep,
+                            record=self.record, watched=self.watched)
 
     def examples(self, state, slot, batch, part=None, rejected=0, microstep=None) -> dict:
         return example_fields(state, slot, self.split, batch, self.size, part, rejected, microstep)
@@ -811,12 +830,9 @@ class Transaction:
             # is its real tokens, which the trainer reads off the accounting
             # columns the objective's batch no longer holds (`model_batch`).
             attempt = state.step * self.split + part
-            # Every attempt the run made and did not accept, so a rejected one's slot draws afresh.
-            rejected = attempt - state.microstep
-            step_info = Step(state.microstep // self.split, jax.random.fold_in(state.key, attempt),
-                             with_ema(state.variables, self.fetched(state).ema), committed=state.updates,
-                             record=self.record, qk_stats=clips_qk(state.opt_state), watched=self.watched,
-                             **self.examples(state, state.microstep % self.size, batch, part, rejected))
+            # Every attempt the run made and did not accept draws afresh (`attempt_step`'s rejections).
+            slot = state.microstep % self.size
+            step_info = self.attempt(state, state.variables, batch, attempt, part, slot)
             factor = jnp.asarray(1., jnp.float32) if state.scale is None else state.scale.scale
             realized = realize(self.read(state.variables, state.compute), batch, step_info)
             loss, cotangent = reduce(realized.stats, factor)

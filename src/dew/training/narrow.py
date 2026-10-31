@@ -146,29 +146,33 @@ def forward_variables(variables: Variables, compute: Variables | None) -> Variab
     return variables if compute is None else merge(variables, compute)
 
 
-def narrow_copies(objective, state, batch, model_batch, *, composed: bool) -> dict:
+def narrow_copies(objective, state, batch, model_batch, *, composed: bool, window: int = 1,
+                  split: int = 1) -> dict:
     """The parameters a step reads through narrow copies, by path under `params` (`narrowed_paths`):
     on every GPU but one whose row measured them off, for a step the trainer composes (`composed`),
     without a loss scale, whose state holds no frozen collection. `model_batch` is the trainer's
-    batch as the model reads it."""
+    batch as the model reads it; the loss is the one its first attempt reads (`attempt_step`), its
+    update a `window` of microbatches, each step read in `split`, its committed updates among its
+    inputs, so a parameter the step computes on before its cast (a DEX lambda's anneal) is not
+    copied."""
     from dew.nn.kernels.generation import backend, chosen_kernel
-    from dew.objectives.base import Step
-    from dew.optim import clips_qk
-    from dew.training.transaction import with_ema
+    from dew.training.transaction import attempt_step
 
     if (chosen_kernel('narrow_copies', 'on' if backend() == 'gpu' else 'off') == 'off'
             or not composed or FROZEN in state.variables):
         return {}
     variables = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), state.variables)
 
-    def loss(params, rest, batch, microstep, key, step, ema):
+    def loss(params, rest, batch, microstep, key, step, ema, updates):
         # As the trainer's loss shape traces it, the averaged weights the step hands the objective
         # included: a parameter read there is used twice.
         variables = {**rest, "params": params}
-        return objective._loss(variables, model_batch(batch),
-                               Step(microstep, jax.random.fold_in(key, step), with_ema(variables, ema),
-                                    qk_stats=clips_qk(state.opt_state)))
+        current = state.replace(microstep=microstep, key=key, step=step, updates=updates)
+        read = model_batch(batch)
+        return objective._loss(variables, read, attempt_step(
+            current, variables, ema, read, split=split, slots=window, attempt=step * split, part=0,
+            slot=microstep % window))
 
     rest = {name: tree for name, tree in variables.items() if name != "params"}
     return narrowed_paths(loss, variables["params"], rest, batch, state.microstep, state.key, state.step,
-                          state.ema)
+                          state.ema, state.updates)

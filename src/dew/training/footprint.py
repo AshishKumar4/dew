@@ -34,8 +34,7 @@ from dew.devices import xla_flag
 from dew.distributed.placement import placed_bytes
 from dew.mesh import DATA_AXIS, FSDP_AXIS, row_axes
 from dew.nn.kernels.generation import _compute_capability
-from dew.objectives.base import Objective, Step
-from dew.optim import clips_qk
+from dew.objectives.base import Objective
 from dew.state import TrainState
 from dew.training.compiled_program import (
     VIEWS,
@@ -48,7 +47,7 @@ from dew.training.compiled_program import (
     lowering_platform,
 )
 from dew.training.narrow import forward_variables
-from dew.training.transaction import with_ema
+from dew.training.transaction import attempt_step
 
 
 @dataclasses.dataclass(frozen=True)
@@ -494,26 +493,29 @@ def gemm_workspace(device) -> Workspace:
     return Workspace(DEFAULT_WORKSPACE if deviceless(device) else rewritten, rewritten)
 
 
-def traced_loss[LossT, EffectsT](objective: Objective[LossT, EffectsT], state: TrainState, window: int
-                                 ) -> tuple[Callable, tuple]:
-    """The loss the step evaluates for `objective` over `state`, with the abstract arguments it is
-    traced over (but the batch): the variables, the microstep, the key, the step and the EMA. Shapes
+def traced_loss[LossT, EffectsT](objective: Objective[LossT, EffectsT], state: TrainState, window: int,
+                                 split: int) -> tuple[Callable, tuple]:
+    """The loss the step evaluates for `objective` over `state`, its update a `window` of microbatches,
+    each step read in `split`, with the abstract arguments it is traced over (but the batch): the
+    variables, the microstep, the key, the step, the EMA and the updates committed. Shapes
     and dtypes only: a resident frozen leaf sits in another memory space than the moving ones, and
     the loss the realization runs reads a snapshot in one space. The step's key is drawn inside the
     trace, so an abstract state compiles a step as a placed one does."""
     variables = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), state.variables)
 
-    def loss(variables, batch, microstep, key, step, ema):
-        return objective._loss(variables, batch, Step(
-            microstep, jax.random.fold_in(key, step), with_ema(variables, ema),
-            qk_stats=clips_qk(state.opt_state), example_count=window * rows_of(batch) or None))
+    def loss(variables, batch, microstep, key, step, ema, updates):
+        # The step's first attempt of its first part, as the transaction reads it (`attempt_step`).
+        current = state.replace(microstep=microstep, key=key, step=step, updates=updates)
+        return objective._loss(variables, batch, attempt_step(
+            current, variables, ema, batch, split=split, slots=window, attempt=step * split, part=0,
+            slot=microstep % window))
 
-    return loss, (variables, state.microstep, state.key, state.step, state.ema)
+    return loss, (variables, state.microstep, state.key, state.step, state.ema, state.updates)
 
 
 def candidate_footprint[LossT, EffectsT](objective: Objective[LossT, EffectsT],
                                           micro: Batch, window: int, prepared: TrainState,
-                                          held: int, target) -> Footprint:
+                                          held: int, target, split: int = 1) -> Footprint:
     """What a step over microbatches of `micro`'s shapes, its state `prepared` as placed, takes of a
     device like `target` beside that state (`Footprint`): its loss's residuals and its gradient
     program's peak at one microbatch, as that device's compiler keeps them and its GEMMs' workspace
@@ -524,13 +526,13 @@ def candidate_footprint[LossT, EffectsT](objective: Objective[LossT, EffectsT],
     `shard_shape`), its parameters whole as those layouts gather them. A layout that splits more than the
     rows (stages, tensor, sequence) derives no residuals, which its compile judges."""
     mesh = jax.sharding.get_abstract_mesh()
-    split = set() if mesh.empty else {name for name, size in mesh.shape.items() if size > 1}
+    spread = set() if mesh.empty else {name for name, size in mesh.shape.items() if size > 1}
     # Data and fully sharded data parallelism split the rows alone; an expert axis splits the experts too.
-    rows = set(row_axes(rows_of(micro), mesh=mesh)) & {DATA_AXIS, FSDP_AXIS} if split else set()
-    if not split <= rows:
+    rows = set(row_axes(rows_of(micro), mesh=mesh)) & {DATA_AXIS, FSDP_AXIS} if spread else set()
+    if not spread <= rows:
         residuals = peak = None
     else:
-        loss, (variables, *rest) = traced_loss(objective, prepared, window)
+        loss, (variables, *rest) = traced_loss(objective, prepared, window, split)
         variables = forward_variables(variables, prepared.compute)
 
         def trained(params, variables, batch, *rest):
