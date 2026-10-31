@@ -342,6 +342,55 @@ def _pretrained(out: Path, pretraining, windows: Loader, updates: int, saved_eve
     return jax.device_get(state.variables), _committed(out, {**progress, "phase": "online", "updates": 0})
 
 
+def _online(out: Path, report: dict, progress: dict, agent, races: tuple, judge, replay, *, level: float,
+            length: int, steps: int, saved_every: int):
+    """The world phase's online training of `agent` over the first of `races` (the training race, then the
+    two it is judged on) at train ratio 128 from `replay`, for `steps` environment steps over all its drones,
+    from where `progress` holds it: its weights and where it is written every `saved_every` updates
+    (`_saved`), and every 10,000 updates its point (`judge`) added to `report` (world.json). Its curriculum
+    goes on from `level`, as the teacher's did: up a tenth, to 1, at each point whose crashes fall under a
+    third, every race's courses and drones drawn at it. Its environment steps and seconds go on from those
+    its checkpoint holds. Returns its last state."""
+    from rl_acceptance import laprop
+
+    from dew.objectives.rl.dreamer import DreamerRollout
+    from dew.training import Trainer
+
+    simulator = races[0]
+    online = progress["updates"] if progress["phase"] == "online" else 0
+    if online:
+        agent.variables = _resumed(out, agent, progress["world"])
+    level = progress.get("level", level)
+    for raced in races:
+        raced.difficulty = raced.ramp = level
+    rollout = DreamerRollout(agent, simulator, batch=16, length=length, train_ratio=128.0, replay=replay)
+    trainer = Trainer(agent, laprop(), key=jax.random.key(8 + online), rollout=rollout)
+    updates = int(steps * rollout.train_ratio / (rollout.batch * rollout.length))
+    steps_before, seconds_before = progress.get("environment_steps", 0), progress.get("seconds", 0.0)
+    state, began, done = trainer.place()[0], time.perf_counter(), online
+    while done < updates:
+        chunk = min(saved_every, updates - done, 10_000 - done % 10_000)
+        state = trainer.fit(_idle(), steps=int(state.step) + chunk, log_every=1000, state=state)
+        done += chunk
+        progress = _saved(out, {**progress, "level": level,
+                                "environment_steps": steps_before + rollout.environment_steps,
+                                "seconds": seconds_before + time.perf_counter() - began},
+                          "online", done, state.variables)
+        if done % 10_000 and done < updates:
+            continue
+        point = {"updates": done, "environment_steps": progress["environment_steps"], "level": level,
+                 "seconds": progress["seconds"], "episode_return": rollout.metrics["episode_return"],
+                 **judge(agent.act, state.variables, agent.memory(simulator.count), jax.random.key(done))}
+        report["online"].append(point)
+        print(json.dumps(point), flush=True)
+        _written(out / "world.json", json.dumps(report, indent=1))
+        if point["crashed"] < 1 / 3 and level < 1.0:
+            level = round(min(1.0, level + 0.1), 1)
+            for raced in races:
+                raced.difficulty = raced.ramp = level
+    return state
+
+
 def world(out: Path, *, teacher_weights: Path, assets: Path, drones: int = 16, hz: float = 60.0,
           demonstration_seconds: float = 300.0, pretrain_updates: int = 50_000,
           environment_seconds: float = 33_333.0, capacity_seconds: float = 600.0,
@@ -361,11 +410,9 @@ def world(out: Path, *, teacher_weights: Path, assets: Path, drones: int = 16, h
     on a G4) the weights so far are written with where the run is (progress.json names the weight files it
     goes on from, `_committed`); a run whose `out` holds them goes on from there, its replay the
     demonstrations again and its optimizer's moments afresh."""
-    from rl_acceptance import laprop
 
-    from dew.objectives.rl.dreamer import DreamerRollout, DreamerV3Objective, WorldModel
+    from dew.objectives.rl.dreamer import DreamerV3Objective, WorldModel
     from dew.objectives.rl.tssm import TSSM
-    from dew.training import Trainer
 
     scale = hz / 30
     length, imagination = round(64 * scale), round(15 * scale)
@@ -391,7 +438,10 @@ def world(out: Path, *, teacher_weights: Path, assets: Path, drones: int = 16, h
                 else {"phase": "pretrain", "updates": 0, "pretrained": None, "world": None})
     earlier = (json.loads((out / "world.json").read_text())
                if progress["phase"] == "online" and (out / "world.json").exists() else {})
-    report = {"drones": drones, "hz": hz, "length": length, "imagination": imagination, "level": level,
+    # A run going on keeps the online scores it wrote and every point it went on from, from its first write.
+    resumes = [*earlier.get("resumes", []), progress["updates"]] if progress["phase"] == "online" else []
+    report = {"online": earlier.get("online", []), "resumes": resumes,
+              "drones": drones, "hz": hz, "length": length, "imagination": imagination, "level": level,
               "highlight": highlight, "teacher": judge(teacher_policy(taught), held, None, jax.random.key(4))}
     began = time.perf_counter()
     replay = demonstrations(simulator, taught, held, round(demonstration_seconds * hz),
@@ -426,37 +476,8 @@ def world(out: Path, *, teacher_weights: Path, assets: Path, drones: int = 16, h
     print(json.dumps(report), flush=True)
     _written(out / "world.json", json.dumps(report, indent=1))
 
-    online = progress["updates"] if progress["phase"] == "online" else 0
-    if online:
-        agent.variables = _resumed(out, agent, progress["world"])
-    # The online curriculum goes on from the teacher's level, as the teacher's did: up a tenth, to 1, at each
-    # score whose crashes fall under a third, its every race's courses and drones drawn at it.
-    level = progress.get("level", level)
-    for raced_now in (simulator, judged, held_out):
-        raced_now.difficulty = raced_now.ramp = level
-    rollout = DreamerRollout(agent, simulator, batch=16, length=length, train_ratio=128.0, replay=replay)
-    trainer = Trainer(agent, laprop(), key=jax.random.key(8 + online), rollout=rollout)
-    updates = int(environment_seconds * hz * rollout.train_ratio / (rollout.batch * rollout.length))
-    state, report["online"], began = trainer.place()[0], earlier.get("online", []), time.perf_counter()
-    report["resumed_at"] = online
-    done = online
-    while done < updates:
-        chunk = min(saved_every, updates - done, 10_000 - done % 10_000)
-        state = trainer.fit(_idle(), steps=int(state.step) + chunk, log_every=1000, state=state)
-        done += chunk
-        progress = _saved(out, {**progress, "level": level}, "online", done, state.variables)
-        if done % 10_000 and done < updates:
-            continue
-        point = {"updates": done, "environment_steps": rollout.environment_steps, "level": level,
-                 "seconds": time.perf_counter() - began, "episode_return": rollout.metrics["episode_return"],
-                 **judge(agent.act, state.variables, agent.memory(drones), jax.random.key(done))}
-        report["online"].append(point)
-        print(json.dumps(point), flush=True)
-        _written(out / "world.json", json.dumps(report, indent=1))
-        if point["crashed"] < 1 / 3 and level < 1.0:
-            level = round(min(1.0, level + 0.1), 1)
-            for raced_now in (simulator, judged, held_out):
-                raced_now.difficulty = raced_now.ramp = level
+    state = _online(out, report, progress, agent, (simulator, judged, held_out), judge, replay, level=level,
+                    length=length, steps=round(environment_seconds * hz), saved_every=saved_every)
     (out / "world.msgpack").write_bytes(serialization.to_bytes(jax.device_get(state.variables)))
     report["online_agent"] = judge(agent.act, state.variables, agent.memory(drones), jax.random.key(9),
                                    film=out / "video.npz")
