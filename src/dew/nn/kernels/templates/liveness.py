@@ -28,21 +28,12 @@ from dew.nn.kernels.templates import resources
 @dataclasses.dataclass(frozen=True)
 class Compiler:
     """The assembler whose scheduling the estimate describes: CUDA 13 streams transcendental chains
-    that CUDA 12 keeps as vectors. A compile gate knows its assembler's version; a native launch reads
-    the selected Mosaic compilation provider's supported PTX ISA, not a package's installed version."""
-    version: tuple[int, int] | None = None
-    ptx_isa: int | None = None
-
-    @classmethod
-    def selected(cls) -> "Compiler":
-        from jax._src.lib import mosaic_gpu
-
-        return cls(ptx_isa=mosaic_gpu._mosaic_gpu_ext._get_ptxas_isa_version())
+    that CUDA 12 keeps as vectors."""
+    version: tuple[int, int]
 
     @property
     def streams_transcendentals(self) -> bool:
-        # PTX 9.0 starts with CUDA 13.0; this is the selected assembler's capability, not the GPU's.
-        return self.version >= (13, 0) if self.version is not None else (self.ptx_isa or 0) >= 90
+        return self.version >= (13, 0)
 
 
 FREE = {"arith.constant", "llvm.mlir.constant", "llvm.mlir.undef", "llvm.mlir.poison", "llvm.mlir.zero",
