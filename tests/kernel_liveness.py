@@ -400,11 +400,17 @@ def _recomputed(op, seen: set) -> int:
 
 def _read_in_outer_loop(op) -> bool:
     """Whether a result of `op` is read inside a loop that `op` lies outside of."""
+    def inside(loop) -> bool:
+        enclosing = op.parent
+        while enclosing is not None and enclosing != loop:
+            enclosing = enclosing.parent
+        return enclosing is not None
+
     for result in op.results:
         for use in result.uses:
             parent = use.owner.operation.parent
             while parent is not None:
-                if parent.name.removeprefix(PREFIX) in ("scf.for", "scf.while") and not _within(op, parent):
+                if parent.name.removeprefix(PREFIX) in ("scf.for", "scf.while") and not inside(parent):
                     return True
                 parent = parent.parent
     return False
