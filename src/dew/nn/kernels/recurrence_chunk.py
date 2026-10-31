@@ -659,7 +659,7 @@ stores the memories by where they pass, as many as the tokens' chunks, a row's a
 
 PORT_CELLS: dict[tuple[str | None, str], tuple[str, str]] = {
     ('wgmma', 'forward, a decay a key dimension'): (
-        'fla', "on an H100 80GB HBM3, 16-bit, the port's forward 1.400 ms against the template's 1.624 on "
+        'fla', "on an H100 80GB HBM3, 16-bit, the port's forward 1.406 ms against the template's 1.624 on "
                "Kimi Linear's delta attention, the template's intra pairs 0.65 ms against the port's intra "
                "rows' 0.65 and its keys' weighted launch 0.25 against the port's 0.17 "
                "(window-h100-c70aaa8-b8109ee)"),
