@@ -121,6 +121,8 @@ def exports() -> list[str]:
             lines.extend(members(value))
         elif callable(value):
             lines.append(f"def {name}{signature(value)}  [{getattr(value, '__module__', '?')}]")
+        elif name == "__version__":  # moves at every release, which the changelog records
+            lines.append(f"{name}: {type(value).__name__}")
         else:
             lines.append(f"{name} = {shown(value)}")
     return lines
