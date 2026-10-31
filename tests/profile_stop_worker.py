@@ -54,7 +54,8 @@ def mode_profile_stop_failure(args) -> dict:
         for directory in (capture, *(path for path in capture.rglob("*") if path.is_dir())):
             os.chmod(directory, stat.S_IRWXU)
     recovered = agree_process_phase(None, phase="after the profile stop failure")
-    return {"failed": None if error is None else f"{type(error).__name__}: {error}",
+    return {"failed": None if error is None else
+            f"{type(error).__name__}: {error} | {'; '.join(getattr(error, '__notes__', ()))}",
             "exporting": exporting, "manifests": manifests, "recovered": recovered}
 
 
