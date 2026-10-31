@@ -532,8 +532,27 @@ def _short_conv_step(rows: int):
                   jax.ShapeDtypeStruct((256, 4), jnp.bfloat16), jax.ShapeDtypeStruct((256,), jnp.bfloat16))
 
 
+def _selective_step(rows: int):
+    """A bf16 Mamba layer over `[2, rows / 2, 64]`, one channel block of 128 wide, its scan the template's
+    (`generation.chosen`): its scan runs per shard of rows, B and C every channel's (`manual_map`)."""
+    from dew.nn.mixers.mamba import Mamba
+
+    layer = Mamba(emb_features=64, intermediate_size=128, state_size=16, time_step_rank=8, chunk_size=32,
+                  dtype=jnp.bfloat16)
+    x = jax.ShapeDtypeStruct((2, rows // 2, 64), jnp.bfloat16)
+    variables = jax.eval_shape(lambda: layer.init(jax.random.key(1), jnp.zeros(x.shape, x.dtype)))
+
+    from dew.nn.kernels.generation import chosen
+
+    def loss(variables, x):
+        with chosen(selective_scan="mosaic_gpu"):
+            return jnp.asarray(layer.apply(variables, x)).astype(jnp.float32).sum()
+
+    return loss, (variables, x)
+
+
 PER_SHARD_STEPS = {"expert layer": _expert_layer_step, "rms norm": _norm_step, "swiglu": _swiglu_step,
-                   "short conv": _short_conv_step}
+                   "short conv": _short_conv_step, "selective scan": _selective_step}
 """Each op whose kernels run per shard (row 1923, bible §7), its step at a number of rows. Each lane adds its
 ops here."""
 
@@ -604,6 +623,41 @@ def _mamba2_lowered(generation: str):
     mesh = gpu_mesh(Mesh(np.array(jax.devices()[:1]), ('data',)), generation)
     with assumed(generation), jax.sharding.use_abstract_mesh(mesh):
         return tuning.tune(lower)[0]
+
+
+def _mamba1_lowered(generation_name: str):
+    """A bf16 Mamba layer's forward and backward, its selective scan the template's where its selector takes
+    the call (`recurrence_chunk.SELECTIVE`, the template chosen), lowered for `generation_name` after its
+    launches are settled as the trainer settles a step's (`tuning.tune`)."""
+    from dew.nn.kernels import tuning
+    from dew.nn.kernels.generation import chosen
+    from dew.nn.mixers.mamba import Mamba
+
+    layer = Mamba(emb_features=64, intermediate_size=256, state_size=16, time_step_rank=8, chunk_size=32,
+                  dtype=jnp.bfloat16)
+    x = jax.ShapeDtypeStruct((2, 128, 64), jnp.bfloat16)
+    variables = jax.eval_shape(lambda: layer.init(jax.random.key(1), jnp.zeros(x.shape, x.dtype)))
+
+    def loss(variables, x):
+        return jnp.asarray(layer.apply(variables, x)).astype(jnp.float32).sum()
+
+    def lower():
+        return jax.jit(jax.value_and_grad(loss)).trace(variables, x).lower(lowering_platforms=('cuda',))
+
+    mesh = gpu_mesh(Mesh(np.array(jax.devices()[:1]), ('data',)), generation_name)
+    with assumed(generation_name), jax.sharding.use_abstract_mesh(mesh), chosen(selective_scan="mosaic_gpu"):
+        return tuning.tune(lower)[0]
+
+
+@pytest.mark.parametrize("generation_name", ["sm80", "sm90"])
+def test_a_mamba_layer_lowers_its_template_scan_for_each_gpu_it_takes(generation_name):
+    """A Mamba layer, its selective scan the template's and its launches settled as the trainer settles
+    them, lowers on this CPU for an A100 and an H100, forward and backward each a Mosaic GPU launch."""
+    from dew.training._lowering import kernel_calls
+
+    names = {call.name for call in kernel_calls(_mamba1_lowered(generation_name))
+             if call.kind == "mosaic_gpu"}
+    assert {"selective_scan", "selective_scan_backward"} <= names, names
 
 
 @pytest.mark.parametrize("generation", GPUS)

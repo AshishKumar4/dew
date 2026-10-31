@@ -9,6 +9,9 @@ cases the CPU does not interpret, run in one process (`gpu_flow`), each cell its
 - The portable backward as a GPU compiles it, and the SSD port's forward and gradient, finite and on par
   under every regime (test_recurrence_stability).
 - The short conv's kernels as exact as XLA's conv at the training shapes (test_short_conv).
+- Mamba's selective scan on the template as exact as the portable scan at Falcon Mamba 7B's widths, one row
+  and packed documents, under every regime, and a Mamba layer under the template's choice, packed and from a
+  held state (test_selective_template).
 - Each recurrence layer trained on its port's kernels, natively (`PORT_KERNELS`): a gated delta net on the
   FLA GDN kernels and a Kimi delta attention layer on FLA KDA's chunk_kda, packed rows, forward and every
   gradient on par from float64 with the portable rule's; their training step the same bit for bit each
@@ -30,6 +33,7 @@ import test_recurrence_mosaic as forward
 import test_recurrence_mosaic_gradient as gradient
 import test_recurrence_stability as stability
 import test_recurrence_template_stability as template_stability
+import test_selective_template as selective_template
 import test_short_conv as short_conv
 from gpu_flow import Cell, run_cells
 from reference_error import FEWEST_SEEDS, assert_as_exact, with_gradients
@@ -160,6 +164,17 @@ def test_the_recurrences_run_on_this_gpu():
     together; every direct mainloop call keeps its own bound."""
     templates_finite = template_stability.the_template_stays_finite_and_on_par_where_chunked_forms_break
     run_cells([
+        *(Cell(f"the selective template is as exact as the portable scan: packed {packed}",
+               functools.partial(selective_template.the_template_is_as_exact_as_the_portable_scan,
+                                 "falcon-mamba-7b", packed))
+          for packed in (False, True)),
+        *(Cell(f"the selective template holds its regime: {regime}",
+               functools.partial(selective_template.the_template_holds_a_regime, regime,
+                                 selective_template.SHAPES["falcon-mamba-7b"]))
+          for regime in selective_template.REGIMES),
+        *(Cell(f"a Mamba layer is as exact under the template: packed {packed}, held {held}",
+               functools.partial(selective_template.the_layer_is_as_exact_under_the_template, packed, held))
+          for packed, held in ((False, False), (True, False), (False, True))),
         *(Cell(f"the Mosaic forward is as exact as its reference: {name}",
                functools.partial(forward.test_the_mosaic_forward_is_as_exact_as_its_reference, *values))
           for name, values in forward.native(forward.FORWARD_GRID, forward.INTERPRETED_FORWARD)),
