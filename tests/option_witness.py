@@ -478,7 +478,8 @@ def witnessed_on(builder, objective: str, settings: type, root: Path, elsewhere:
     from dew.objectives.base import ReleasedTask
 
     root.mkdir(parents=True)
-    run = builder(root, drawn=False)
+    # A saved task's options are its training's; no validation split scores or saves any of them.
+    run = dataclasses.replace(builder(root, drawn=False), validation=None)
     saved_task = objectives[objective].saved_task
     released = saved_task is not None and issubclass(saved_task, ReleasedTask)
     base, unset = saved_with(run, root, "unset", settings, {})
