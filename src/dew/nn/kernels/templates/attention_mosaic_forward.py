@@ -438,9 +438,14 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
     live = None if guard is None else family.rows_of(guard.live.at[state_rows]) > 0
     if hooked.initial is not None:
         m0, total0, acc0 = hooked.initial
-        start = algebra.resumed(spec, family.rows_of(m0.at[state_rows]),
-                                family.rows_of(total0.at[state_rows]), family.tile_of(acc0.at[state_rows]),
-                                live=live)
+        # Lab (never lands as is): the initial rows staged through the row stage, free before the walk, and
+        # read from shared memory, not each thread's global load (the held term's spill, ET-HOOKBREAK).
+        rows = []
+        for ref in (m0, total0):
+            family.loaded(((ref.at[state_rows], row_smem, q_loaded),))
+            rows.append(family.rows_of(row_smem))
+            plgpu.commit_smem()
+        start = algebra.resumed(spec, rows[0], rows[1], family.tile_of(acc0.at[state_rows]), live=live)
     else:
         # `algebra.started`'s empty state, in the family's layouts.
         start = algebra.Partial(family.zeros((tiles.block_q, value_width)),
