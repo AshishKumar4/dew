@@ -22,3 +22,57 @@ def test_the_api_report_reads_every_section_and_names_no_address():
     sections = [line[3:-3] for line in report.splitlines() if line.startswith("-- ") and line.endswith(" --")]
     assert sections == ["exports", "config", "cli", "records"]
     assert " at 0x" not in report
+
+
+def test_a_field_the_constructor_takes_by_keyword_or_not_at_all_is_marked():
+    """A config field moved to keyword-only, or out of the constructor, breaks a caller's positional or
+    keyword argument, so its line says so."""
+    import dataclasses
+
+    @dataclasses.dataclass
+    class Fields:
+        plain: int
+        hidden: int = dataclasses.field(default=0, init=False)
+        named: str = dataclasses.field(default="a", kw_only=True)
+
+    assert load("api_report").fields(Fields) == [
+        "plain: int", "hidden: int = 0  [no constructor argument]", "named: str = 'a'  [keyword-only]"]
+
+
+def test_a_property_shows_its_getters_type_and_whether_it_is_set():
+    """A property's type and a setter it gains or loses move its line."""
+    class Held:
+        @property
+        def read(self) -> int:
+            return 0
+
+        @property
+        def written(self) -> str:
+            return ""
+
+        @written.setter
+        def written(self, value: str) -> None:
+            pass
+
+    assert load("api_report").members(Held) == [
+        "  .read: property -> int", "  .written: property -> str [set]"]
+
+
+def test_a_commands_arguments_are_its_parsers():
+    """A positional argument shows by its name, not as a flag no parser takes, and a repeated one as
+    repeated, each with its field's type, aliases resolved, and default."""
+    import dataclasses
+    from typing import Annotated
+
+    import tyro
+
+    Count = Annotated[int | None, tyro.conf.arg(metavar="N")]
+
+    @dataclasses.dataclass
+    class Command:
+        run: tyro.conf.Positional[str]
+        count: Count = None
+        set: Annotated[tuple[str, ...], tyro.conf.UseAppendAction] = ()
+
+    assert load("api_report").arguments(Command) == [
+        "  <run> STR: str", "  --count N: int | None = None", "  --set STR: tuple[str, ...] = ()  [repeated]"]

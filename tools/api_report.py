@@ -2,12 +2,15 @@
 
 A txtar archive of four sections, each a contract consumers outside the repository bind to:
 
-- `exports`: each name of `dew.__all__`, its kind and signature; an exported class's public methods and
-  properties, each with its signature.
-- `config`: each dataclass of `dew.config`, its fields with their types and defaults.
+- `exports`: each name of `dew.__all__`, its kind and signature; an exported class's public methods, each
+  with its signature, and its properties, each with its getter's type and whether it is set or deleted.
+- `config`: each dataclass of `dew.config`, its fields with their types and defaults, and a field that is
+  keyword-only or no constructor argument marked so.
 - `cli`: each command of `dew` (`dew.cli.main.COMMANDS`, `DATA_COMMANDS` under `dew data`,
-  `dew.cli.tpu.COMMANDS` under `dew tpu`), its flags with their types and defaults.
-- `records`: each run record type (`dew.telemetry.records.RECORD_TYPES`), its fields with their types, and
+  `dew.cli.tpu.COMMANDS` under `dew tpu`), each argument as the command's parser takes it: its spellings
+  (none for a positional one), its metavar, whether it is required or repeated, and its field's type, aliases
+  resolved, and default.
+- `records`: each run record type (`dew.telemetry.records.RECORD_TYPES`), its fields as `config`'s, and
   the schema versions the records, generations and kernel reports carry.
 
 An API change moves a line of one section, which tests/test_api_report.py and thresh's published-language
@@ -18,11 +21,14 @@ seams (.thresh/thresh.cue) both see.
 """
 import argparse
 import dataclasses
+import functools
 import importlib
 import inspect
 import pkgutil
 import re
 import sys
+import typing
+import warnings
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -52,18 +58,37 @@ def signature(obj) -> str:
         return "(...)"
 
 
+def default(field) -> str:
+    """A field's default as ` = value`, a default factory by its name, never run (one may read the checkout,
+    as a run record's `dew_sha` does); "" where it has none."""
+    if field.default is not dataclasses.MISSING:
+        return f" = {shown(field.default)}"
+    if field.default_factory is not dataclasses.MISSING:
+        return f" = {shown(field.default_factory)}()"
+    return ""
+
+
 def fields(cls) -> list[str]:
-    """A dataclass's fields: `name: type = default`, a default factory by its name, never run (one may read
-    the checkout, as a run record's `dew_sha` does); a dataclass it builds is listed on its own."""
+    """A dataclass's fields: `name: type = default`, marked where its constructor takes it by keyword alone
+    or not at all; a dataclass it builds is listed on its own."""
     lines = []
     for field in dataclasses.fields(cls):
-        line = f"{field.name}: {annotation(field.type)}"
-        if field.default is not dataclasses.MISSING:
-            line += f" = {shown(field.default)}"
-        elif field.default_factory is not dataclasses.MISSING:
-            line += f" = {shown(field.default_factory)}()"
+        line = f"{field.name}: {annotation(field.type)}{default(field)}"
+        if not field.init:
+            line += "  [no constructor argument]"
+        elif field.kw_only is True:
+            line += "  [keyword-only]"
         lines.append(line)
     return lines
+
+
+def returned(getter) -> str:
+    """A getter's return annotation as ` -> type`, read without calling it; "" where it has none."""
+    try:
+        written = inspect.signature(getter).return_annotation
+    except (TypeError, ValueError):
+        return ""
+    return "" if written is inspect.Signature.empty else f" -> {annotation(written)}"
 
 
 def members(cls) -> list[str]:
@@ -74,7 +99,11 @@ def members(cls) -> list[str]:
             continue
         attribute = inspect.getattr_static(cls, name)
         if isinstance(attribute, property):
-            lines.append(f"  .{name}: property")
+            written = "".join(f" [{verb}]" for verb, method in
+                              (("set", attribute.fset), ("deleted", attribute.fdel)) if method is not None)
+            lines.append(f"  .{name}: property{returned(attribute.fget)}{written}")
+        elif isinstance(attribute, functools.cached_property):
+            lines.append(f"  .{name}: cached property{returned(attribute.func)}")
         elif isinstance(attribute, (staticmethod, classmethod)):
             lines.append(f"  .{name}{signature(attribute.__func__)}  [{type(attribute).__name__}]")
         elif inspect.isfunction(attribute):
@@ -112,6 +141,35 @@ def config() -> list[str]:
     return lines
 
 
+def arguments(cls) -> list[str]:
+    """A command's arguments as its parser takes them (tyro's, as `dew` builds it): each one's spellings, or
+    its name in angle brackets where it is positional; its metavar; whether it is required or repeated; and
+    the type and default of the field it fills, the type's aliases resolved (`Zone` is `str | None`)."""
+    import tyro
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        parser = tyro.extras.get_parser(cls)
+    try:
+        types = typing.get_type_hints(cls)
+    except (NameError, TypeError):
+        types = {}
+    filled = {field.name.replace("_", "-"): field for field in dataclasses.fields(cls)}
+    lines = []
+    for action in parser._actions:  # tyro's own argparse: its actions known by their class names
+        if type(action).__name__ == "_HelpAction":
+            continue
+        line = "  " + (", ".join(action.option_strings) or f"<{action.dest}>")
+        if action.metavar:
+            line += f" {action.metavar}"
+        if field := filled.get(action.dest):
+            line += f": {annotation(types.get(field.name, field.type))}{default(field)}"
+        notes = [note for note, holds in (("required", action.required and action.option_strings),
+                                          ("repeated", type(action).__name__ == "_AppendAction")) if holds]
+        lines.append(line + "".join(f"  [{note}]" for note in notes))
+    return lines
+
+
 def cli() -> list[str]:
     from dew.cli import main, tpu
 
@@ -120,10 +178,7 @@ def cli() -> list[str]:
     for prefix, commands in groups:
         for name, cls in sorted(commands.items()):
             lines.append(f"{prefix} {name}  [{cls.__module__}.{cls.__qualname__}]")
-            for line in fields(cls):
-                # tyro's flag for a field: its name, underscores as hyphens.
-                flag, _, rest = line.partition(":")
-                lines.append(f"  --{flag.replace('_', '-')}:{rest}")
+            lines.extend(arguments(cls))
     return lines
 
 
