@@ -23,6 +23,7 @@ in float32 where the code runs bfloat16.
 
 from __future__ import annotations
 
+import functools
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -53,13 +54,14 @@ if TYPE_CHECKING:
 
 def _init(scale: float = 1.0) -> nn.initializers.Initializer:
     """The code's `trunc_normal_in`: a standard normal truncated to two deviations, uncorrected, times
-    1.1368 sqrt(1 / fan in), times `scale` (nets.py:169-175), the fan in a kernel's second-to-last
-    axis (a block's own inputs for a block-diagonal kernel)."""
+    1.1368 sqrt(1 / fan in), times `scale` (nets.py:169-175), the fan in every axis but the output's
+    (`compute_fans`, nets.py:187-197): a dense kernel's inputs, a convolution's window of input
+    channels, a block-diagonal kernel's inputs over all its blocks."""
     if scale == 0:
         return nn.initializers.zeros
 
     def init(key: jax.Array, shape: tuple[int, ...], dtype: jnp.dtype = jnp.float32) -> jax.Array:
-        deviation = 1.1368 * scale / math.sqrt(shape[-2])
+        deviation = 1.1368 * scale / math.sqrt(math.prod(shape[:-1]))
         return (deviation * jax.random.truncated_normal(key, -2, 2, shape)).astype(dtype)
 
     return init
@@ -83,14 +85,82 @@ class _BlockLinear(nn.Module):
 
     features: int
     blocks: int
+    dtype: jnp.dtype = jnp.float32
 
     @nn.compact
     def __call__(self, x: jax.Array) -> jax.Array:
         grouped = x.reshape(*x.shape[:-1], self.blocks, x.shape[-1] // self.blocks)
         fan = grouped.shape[-1]
-        kernel = self.param("kernel", _init(), (self.blocks, fan, self.features // self.blocks))
-        bias = self.param("bias", nn.initializers.zeros, (self.features,))
+        kernel = self.param("kernel", _init(), (self.blocks, fan, self.features // self.blocks), self.dtype)
+        bias = self.param("bias", nn.initializers.zeros, (self.features,), self.dtype)
         return jnp.einsum("...gi,gio->...go", grouped, kernel).reshape(*x.shape[:-1], self.features) + bias
+
+
+class ConvEncoder(nn.Module):
+    """DreamerV3's image encoder (rssm.py:179-248, the `simple` encoder): pixels `[..., H, W, C]` in
+    [0, 255] scaled to [-0.5, 0.5], then a stage for each of `mults`: a `kernel`-square same-padded
+    convolution to `depth` times the multiplier channels, a 2x2 max pool, an RMS norm and a SiLU; the
+    last stage's map flattened. The defaults are configs.yaml's `enc.simple` at its 200M size."""
+
+    depth: int = 64
+    mults: tuple[int, ...] = (2, 3, 4, 4)
+    kernel: int = 5
+    dtype: jnp.dtype = jnp.float32
+
+    @nn.compact
+    def __call__(self, image: jax.Array) -> jax.Array:
+        lead = image.shape[:-3]
+        x = image.reshape(-1, *image.shape[-3:]).astype(self.dtype) / 255 - 0.5
+        for stage, mult in enumerate(self.mults):
+            x = nn.Conv(self.depth * mult, (self.kernel, self.kernel), padding="SAME", kernel_init=_init(),
+                        dtype=self.dtype, param_dtype=self.dtype, name=f"cnn{stage}")(x)
+            rows, height, width, channels = x.shape
+            x = x.reshape(rows, height // 2, 2, width // 2, 2, channels).max((2, 4))
+            norm = nn.RMSNorm(epsilon=1e-4, dtype=self.dtype, param_dtype=self.dtype, name=f"cnn{stage}norm")
+            x = nn.silu(norm(x))
+        return x.reshape(*lead, -1)
+
+
+class ConvDecoder(nn.Module):
+    """DreamerV3's image decoder (rssm.py:253-355, the `simple` decoder with `bspace` 8): from the
+    deterministic state through `blocks` block-diagonal maps and from the categoricals through two
+    dense layers to the smallest map, its side the image's over 2 to the stages, summed, normed and
+    a SiLU; then a stage for each but the last of `mults`, deepest first: a 2x nearest upsampling, a
+    convolution, an RMS norm and a SiLU; a last upsampling and convolution to the image's channels;
+    a sigmoid, the pixels in [0, 1]."""
+
+    image: tuple[int, int, int]
+    depth: int = 64
+    units: int = 1024
+    mults: tuple[int, ...] = (2, 3, 4, 4)
+    kernel: int = 5
+    blocks: int = 8
+    dtype: jnp.dtype = jnp.float32
+
+    @nn.compact
+    def __call__(self, deter: jax.Array, stoch: jax.Array) -> jax.Array:
+        lead = deter.shape[:-1]
+        depths = [self.depth * mult for mult in self.mults]
+        height, width = (side // 2 ** len(depths) for side in self.image[:2])
+        shape = (height, width, depths[-1])
+        size = math.prod(shape)
+        dense = functools.partial(nn.Dense, kernel_init=_init(), dtype=self.dtype, param_dtype=self.dtype)
+        conv = functools.partial(nn.Conv, kernel_size=(self.kernel, self.kernel), padding="SAME",
+                                 dtype=self.dtype, param_dtype=self.dtype)
+        norm = functools.partial(nn.RMSNorm, epsilon=1e-4, dtype=self.dtype, param_dtype=self.dtype)
+        x0 = _BlockLinear(size, self.blocks, self.dtype, name="sp0")(deter.reshape(-1, deter.shape[-1]))
+        # Each block's outputs its own channels of every position: '(g h w c) -> h w (g c)'.
+        x0 = x0.reshape(-1, self.blocks, height, width, depths[-1] // self.blocks)
+        x0 = x0.transpose(0, 2, 3, 1, 4).reshape(-1, *shape)
+        x1 = dense(2 * self.units, name="sp1")(stoch.reshape(math.prod(lead), -1))
+        x1 = dense(size, name="sp2")(nn.silu(norm(name="sp1norm")(x1)))
+        x = nn.silu(norm(name="spnorm")(x0 + x1.reshape(-1, *shape)))
+        # The stages' names are the code's, `conv{i}` the stage before the i-th encoder stage's map.
+        for stage in reversed(range(len(depths) - 1)):
+            x = conv(depths[stage], kernel_init=_init(), name=f"conv{stage}")(x.repeat(2, -2).repeat(2, -3))
+            x = nn.silu(norm(name=f"conv{stage}norm")(x))
+        x = conv(self.image[-1], kernel_init=_init(), name="imgout")(x.repeat(2, -2).repeat(2, -3))
+        return jax.nn.sigmoid(x).reshape(*lead, *self.image)
 
 
 class WorldModel(nn.Module):
