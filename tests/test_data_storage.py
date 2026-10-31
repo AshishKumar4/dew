@@ -579,3 +579,18 @@ def test_real_r2_conditional_publication_and_bounded_read(tmp_path):
     assert fs.cat_file(path, start=0, end=8) == first[:8]
     fs.rm(path)
     assert not fs.exists(path)
+
+
+@pytest.mark.parametrize("opened", ["memory", "local"])
+def test_an_open_files_size_and_digest_are_its_bytes_whatever_store_opened_it(opened, tmp_path):
+    """The size and digest of a file read from its start (`object_info`) are its bytes', an in-memory
+    store's file, whose digest reads its buffer and leaves its position, as a local one's."""
+    import fsspec
+
+    from dew.data.storage import object_info
+
+    payload = bytes(range(256)) * 9
+    path = f"memory://object-info-{uuid4().hex}/data" if opened == "memory" else str(tmp_path / "data")
+    fsspec.filesystem("memory" if opened == "memory" else "file").pipe_file(path, payload)
+    with fsspec.open(path, "rb") as handle:
+        assert object_info(handle) == object_info(payload)
