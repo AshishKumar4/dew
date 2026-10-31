@@ -179,17 +179,22 @@ def run_pipeline(run: SavedRun, checkpoint: str, *, dtype: str, param_dtype: str
                  variables: Variables | None, mesh: MeshSpec | Mesh | None, layout: Layout | None,
                  text: bool, ema: bool | None) -> RunPipeline:
     """The diffusion run `run` (`checkpoint`) as a diffusion run starts from it: its own task's parts and
-    policy (`TextToImage.from_saved`), computing in `dtype`, its weights restored stored in `param_dtype`
-    (as saved where None) where `mesh` and `layout` place them, or bound from supplied `variables`, its
-    denoiser attending through `attention_impl` where its class takes a kernel, and its sample at `size`
-    in its own channels.
+    policy (`TextToImage.from_saved`), computing in `dtype`, over its tree as its checkpoint holds it
+    (`restored_tree`: an adapter's split of it kept, so its base stays frozen), stored in `param_dtype` (as
+    saved where None) where `mesh` and `layout` place it, or over supplied `variables`, the starting run's
+    own tree, held as given; its denoiser attending through `attention_impl` where its class takes a
+    kernel.
 
     A run of another task, a revision of a directory, and `text=False`, which the restore of a run's
-    tree cannot skip, are refused, as is a kernel other than `auto` for a denoiser that takes none."""
+    tree cannot skip, are refused, as is a kernel other than `auto` for a denoiser that takes none. So
+    are a run that tuned its autoencoder (`end_to_end`), whose tuned autoencoder a run started from it
+    records nothing of (ledger 2797), and a `size` other than the run's own, whose conditioning, grid
+    and process are bound to its size (ledger 2798)."""
     from dew._records import record
     from dew.diffusion.schedules.source import SourceGrid
-    from dew.inference.images import ImageSettings, TextToImage
+    from dew.inference.images import ImageSettings, TextToImage, restored_tree
     from dew.inference.tasks import saved_settings
+    from dew.objectives.diffusion.objective import without_loss_heads
     from dew.registry import from_record
 
     if not samples_images(run):
@@ -200,26 +205,30 @@ def run_pipeline(run: SavedRun, checkpoint: str, *, dtype: str, param_dtype: str
     if not text:
         raise ValueError(f"{checkpoint} is a saved run, whose tree restores its text encoder with its "
                          "denoiser; text=False skips none of it")
-    task = TextToImage.from_saved(run, ema=ema, mesh=mesh, layout=layout, dtype=dtype,
-                                  param_dtype=param_dtype, variables=variables)
+    settings = saved_settings(run.record, ImageSettings)
+    if settings.end_to_end is not None:
+        raise ValueError(f"{checkpoint} tuned its autoencoder end to end, which a run started from it "
+                         "records nothing of; resume it under its name (--trainer.resume), or serve it "
+                         "(TextToImage.from_run)")
+    # The tree as the checkpoint holds it, not as the task reads it whole, its loss heads the run's own.
+    tree = (without_loss_heads(restored_tree(run, ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype))
+            if variables is None else variables)
+    task = TextToImage.from_saved(run, dtype=dtype, variables=tree)
+    sample = task.inputs.sample
+    if size is not None and tuple(size) != sample.shape[:-1]:
+        raise ValueError(f"{checkpoint} trained on {sample.key} of shape {sample.shape[:-1]}, to which its "
+                         f"conditioning, grid and process are bound, and this run's data is {tuple(size)}; "
+                         "train on data of the run's size")
     model = task.model
     if "attention_impl" in {field.name for field in fields(model)}:
         model = model.clone(attention_impl=attention_impl)
     elif attention_impl != "auto":
         raise ValueError(f"{type(model).__name__} takes no attention_impl: the attention its record states "
                          "is its run's")
-    inputs = task.inputs
-    if size is not None:
-        sample = inputs.sample
-        if len(size) != len(sample.shape) - 1:
-            raise ValueError(f"{checkpoint} samples {sample.key} of shape {sample.shape}, which size {size} "
-                             "does not shape")
-        inputs = replace(inputs, sample=replace(sample, shape=(*size, sample.shape[-1])))
     # The grid as its record states it, the one `from_saved` built the task's from.
-    stated = saved_settings(run.record, ImageSettings).grid
-    grid = None if stated is None else from_record(SourceGrid, record(stated, "grid"))
-    return RunPipeline(model, task.variables, task.process, inputs, task.autoencoder, task.solver,
-                       task.steps, task.guidance, grid)
+    grid = None if settings.grid is None else from_record(SourceGrid, record(settings.grid, "grid"))
+    return RunPipeline(model, tree, task.process, task.inputs, task.autoencoder, task.solver, task.steps,
+                       task.guidance, grid)
 
 
 def released_run(name_or_dir: str | Path, *, step: int | str | None = None, ema: bool | None = None,
@@ -247,9 +256,12 @@ def released_run(name_or_dir: str | Path, *, step: int | str | None = None, ema:
     lacking = any(from_every_process(not release.is_dir()))
     if not lacking:
         return release
-    # Every process restores, a collective. Where the pool shares the cache, the first writes the release
-    # alone; elsewhere each writes its own, and one that holds it already keeps it (`staged`).
-    shared = jax.process_count() > 1 and all(seen_by_every_process(str(release.parent)))
+    # Every process restores, a collective. Where the pool shares the cache and every process asks for
+    # the one release, the first writes it alone; elsewhere each writes its own, and one that holds it
+    # already keeps it (`staged`). A key reads each host's own checkpoint files (`_fingerprint`), which
+    # copies of one checkpoint on several hosts may stamp apart.
+    shared = (jax.process_count() > 1 and len(set(from_every_process(release.name))) == 1
+              and all(seen_by_every_process(str(release.parent))))
     if shared and jax.process_index() != 0:
         export_run(run, release, ema=ema, mesh=mesh, layout=layout, shared=True)
     else:

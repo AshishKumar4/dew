@@ -1533,7 +1533,7 @@ def _host_cost(weights: bool, by_name: Mapping[str, np.ndarray] | None) -> str:
     if not weights:
         return "its weights unread"
     if by_name is not None:
-        return "its tensors read by name a device shard at a time"
+        return "its tensors read from the checkpoint by name, no torch copy of the model held"
     return "the load holds the torch model on the host, at least 2x the checkpoint"
 
 
