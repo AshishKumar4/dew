@@ -175,16 +175,21 @@ def test_a_packed_projections_products_count_at_each_of_its_members():
     """A task that serves a group of projections packed (`dew.nn.protocols.ProjectionGroup`: a decoder's
     q, k and v as `qkv_proj`) multiplies them in one product, which the evidence counts at each member
     (`unpacked`), so a run a main saved before the task packed them compares with one it packs: the same
-    dtypes at the same members. A member whose dtype moved still differs, and a module of the same name
-    the task does not pack keeps its own path."""
+    dtypes at the same members. A member whose dtype moved still differs; a module of the same name that
+    no group declares (a linear attention's own `qkv_proj`) keeps its path; and two groups of one packed
+    name unpack each to its own members."""
     from saved_run_products import unpacked
 
-    packs = {"qkv_proj": ["q_proj", "k_proj", "v_proj"], "gate_up_proj": ["gate_proj", "up_proj"]}
+    packs = {"layers_0/self_attn/qkv_proj": ["layers_0/self_attn/q_proj", "layers_0/self_attn/k_proj",
+                                             "layers_0/self_attn/v_proj"],
+             "layers_0/mlp/gate_up_proj": ["layers_0/mlp/gate_proj", "layers_0/mlp/up_proj"],
+             "layers_1/self_attn/qkv_proj": ["layers_1/self_attn/q_proj", "layers_1/self_attn/kv_proj"]}
     then = {"layers_0/self_attn/q_proj": ["float64"], "layers_0/self_attn/k_proj": ["float64"],
             "layers_0/self_attn/v_proj": ["float64"], "layers_0/mlp/gate_proj": ["float32"],
-            "layers_0/mlp/up_proj": ["float32"], "layers_1/cross_attention/q_proj": ["float64"]}
+            "layers_0/mlp/up_proj": ["float32"], "layers_1/self_attn/q_proj": ["float64"],
+            "layers_1/self_attn/kv_proj": ["float64"], "layers_2/lightning/qkv_proj": ["float64"]}
     now = {"layers_0/self_attn/qkv_proj": ["float64"], "layers_0/mlp/gate_up_proj": ["float32"],
-           "layers_1/cross_attention/q_proj": ["float64"]}
+           "layers_1/self_attn/qkv_proj": ["float64"], "layers_2/lightning/qkv_proj": ["float64"]}
     assert unpacked(now, packs) == unpacked(then, packs) == then
     moved = {**then, "layers_0/mlp/up_proj": ["bfloat16"]}
     assert unpacked(moved, packs) != unpacked(now, packs)
