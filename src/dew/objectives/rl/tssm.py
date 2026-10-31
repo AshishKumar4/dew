@@ -22,6 +22,7 @@ import jax
 import jax.numpy as jnp
 from flax import struct
 
+from dew.nn.attention import reference_attention
 from dew.nn.precision import at_least_fp32
 from dew.nn.rope import rotary_freqs, rotate
 from dew.rl.distributions import unimix_log_probs
@@ -41,8 +42,9 @@ class Cache:
 
 
 class _Block(nn.Module):
-    """A pre-norm transformer block: rotary, RMS-normed multi-head attention, then a SiLU-gated
-    feed-forward layer, each added to its input."""
+    """A pre-norm transformer block: rotary, RMS-normed multi-head attention (its logits and softmax in at
+    least float32, `reference_attention`), then a SiLU-gated feed-forward layer, each added to its
+    input."""
 
     width: int
     heads: int
@@ -74,7 +76,7 @@ class _Block(nn.Module):
                  mask: jax.Array) -> jax.Array:
         """The block's output for rows `x` whose queries attend to `keys` and `values` under `mask`
         `[B, S, K]`."""
-        attended = jax.nn.dot_product_attention(query, keys, values, mask=mask[:, None])
+        attended = reference_attention(query, keys, values, mask=mask[:, None], wide_logits=True)
         x = x + self.out(attended)
         h = self.feed_norm(x)
         return x + self.down(nn.silu(self.gate(h)) * self.up(h))
