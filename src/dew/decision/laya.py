@@ -23,8 +23,8 @@ from dew.data.text import HFTokenizer
 from dew.decision.head import DecisionHead
 from dew.decision.layout import MarkerLayout, Specials
 from dew.decision.model import DecisionModel
-from dew.interop.decoder_parts import Packed, packed_layouts
-from dew.interop.safetensors_io import MAX_SHARD_SIZE, save_sharded
+from dew.interop.decoder_parts import Packed, layout_tensors, packed_layouts
+from dew.interop.safetensors_io import MAX_SHARD_SIZE, LazyTensors, save_sharded, tensor_specs
 from dew.lora import FACTORS
 from dew.registry import from_record
 
@@ -129,11 +129,12 @@ class LayaCheckpoint:
 
 
 def laya_tensors(model: DecisionModel, variables: Variables
-                 ) -> tuple[dict[str, np.ndarray], Mapping[str, object]]:
+                 ) -> tuple[LazyTensors[np.ndarray], Mapping[str, object]]:
     """Every tensor of a Laya release of `model` over `variables`, by its name in `model.safetensors`
     (the encoder's ModernBertModel tensors under `encoder.`, the head's under Laya's names), and the
     encoder's config, which `LayaCheckpoint.save` writes and a release's `export` returns. A backbone
-    under LoRA has its factors merged into their kernels (`Pretrained.bound`)."""
+    under LoRA has its factors merged into their kernels (`Pretrained.bound`). Each tensor is built as
+    it is read, so a sharded writer holds one shard of the release (ledger 2874)."""
     from dew.interop.pretrained import PretrainedDecoder
 
     backbone = thaw(part(variables, "backbone"))
@@ -145,13 +146,16 @@ def laya_tensors(model: DecisionModel, variables: Variables
         raise ValueError("the backbone carries LoRA factors its model binds to no adapter")
     if bundle.config.get("model_type") != "modernbert":
         raise ValueError(f"Laya's layout holds a ModernBERT encoder, not a {bundle.config.get('model_type')}")
-    tensors = {f"encoder.{name.removeprefix('model.')}": np.asarray(tensor)
-               for name, tensor in bundle.export().items()}
-    tensors.update(_head_tensors(thaw(part(variables, "head"))["params"]))
-    return tensors, bundle.config
+    encoder_tensors = bundle.export()
+    names = {f"encoder.{name.removeprefix('model.')}": name for name in encoder_tensors}
+    head = _head_tensors(thaw(part(variables, "head"))["params"])
+    specs = {**{name: tensor_specs(encoder_tensors)[source] for name, source in names.items()},
+             **tensor_specs(head)}
+    return LazyTensors(specs, lambda name: (np.asarray(encoder_tensors[names[name]]) if name in names
+                                            else head[name])), bundle.config
 
 
-def _head_tensors(params: Mapping[str, object]) -> dict[str, np.ndarray]:
+def _head_tensors(params: Mapping[str, object]) -> LazyTensors[np.ndarray]:
     """`DecisionHead`'s parameters under Laya's tensor names, `_head_path`'s inverse."""
     from dew.interop.weights import in_params, native_layouts
 
@@ -171,7 +175,7 @@ def _head_tensors(params: Mapping[str, object]) -> dict[str, np.ndarray]:
     variables = {"params": params}
     layouts = packed_layouts({layout.name: layout for layout in native_layouts(
         variables, name_of, in_params(_head_path))}, IN_PROJ)
-    return {name: layout.export(variables) for name, layout in layouts.items()}
+    return layout_tensors(layouts, variables)
 
 
 def _token(value: object, name: str) -> int:
