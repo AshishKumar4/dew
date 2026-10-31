@@ -243,7 +243,12 @@ def _softmax(block: _Block, scratch: _Scratch, outs, *, spec: algebra.Forward, t
                 plgpu.async_store_tmem(chunk, algebra.rescale(acc, alpha))
 
         for part in range(parts):
-            weights = algebra.weights(spec, logits(read, index, part, masked)[0], m)
+            # The weights complete before their two readers, the sum below and the narrowed copy `P V` takes:
+            # else the compiler fuses each one's last multiply into the sum's fma and sinks the sums past the
+            # last part (a full call's parts are one block, no mask's branch between them), keeping both
+            # operands of every earlier part's weights live to there, 24 registers a part, 250 of 255 and the
+            # denominator spilled at width 64 (ptxas for a B200, tests/test_attention_blackwell.py's compile).
+            weights = lax.optimization_barrier(algebra.weights(spec, logits(read, index, part, masked)[0], m))
             total = (algebra.denominator_after(total, alpha, weights) if part == 0
                      else total + weights.sum(axis=-1))
             plgpu.async_store_tmem(mosaic_sm100.columns(scratch.p_tmem, part * PART, PART),
