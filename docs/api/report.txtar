@@ -501,177 +501,177 @@ dew.config.sweep.RandomSearch
   seed: int = 0
 -- cli --
 dew export  [dew.cli.main.Export]
-  <run> STR: str
-  <destination> STR: str
-  --ema {None,True,False}: bool | None = None
-  --step {None}|INT|STR: int | str | None = None
-  --trust [STR [STR ...]]: tuple[str, ...] = ()
+  run: str  [Positional]
+  destination: str  [Positional]
+  ema: bool | None = None
+  step: int | str | None = None
+  trust: tuple[str, ...] = ()
 dew inspect  [dew.cli.main.Inspect]
-  <run> STR: str
-  --set STR: tuple[str, ...] = ()  [repeated]
-  --trust [STR [STR ...]]: tuple[str, ...] = ()
+  run: str  [Positional]
+  set: tuple[str, ...] = ()  [UseAppendAction]
+  trust: tuple[str, ...] = ()
 dew launch  [dew.cli.launch.Launch]
-  <command> [[STR [STR ...]]]: tuple[str, ...]
-  --hosts NAME: tuple[str, ...] = ()
-  --hostfile FILE: pathlib.Path | None = None
-  --tpu NAME: tuple[str, ...] = ()
-  --zone ZONE: str | None = None
-  --processes-per-host N: int | None = None
-  --devices-per-process N: int | None = None
-  --port N: int | None = None
-  --coordinator HOST: str | None = None
-  --env NAME=VALUE: tuple[str, ...] = ()  [repeated]
-  --cwd DIR: str | None = None
-  --dry-run, --no-dry-run: bool = False
+  command: tuple[str, ...]  [Positional]
+  hosts: tuple[str, ...] = ()  [metavar='NAME']
+  hostfile: pathlib.Path | None = None  [metavar='FILE']
+  tpu: tuple[str, ...] = ()  [metavar='NAME']
+  zone: str | None = None  [metavar='ZONE']
+  processes_per_host: int | None = None  [metavar='N']
+  devices_per_process: int | None = None  [metavar='N']
+  port: int | None = None  [metavar='N']
+  coordinator: str | None = None  [metavar='HOST']
+  env: tuple[str, ...] = ()  [metavar='NAME=VALUE']  [UseAppendAction]
+  cwd: str | None = None  [metavar='DIR']
+  dry_run: bool = False
 dew profile  [dew.cli.main.Profile]
-  <run> STR: str
-  --warmup INT: int = 20
-  --steps INT: int = 10
-  --out {None}|STR: str | None = None
-  --set STR: tuple[str, ...] = ()  [repeated]
-  --trust [STR [STR ...]]: tuple[str, ...] = ()
-  --host-tracer-level {None}|INT: int | None = None
-  --python-tracer-level {None}|INT: int | None = None
-  --activity-cap {None}|INT: int | None = None
+  run: str  [Positional]
+  warmup: int = 20
+  steps: int = 10
+  out: str | None = None
+  set: tuple[str, ...] = ()  [UseAppendAction]
+  trust: tuple[str, ...] = ()
+  host_tracer_level: int | None = None
+  python_tracer_level: int | None = None
+  activity_cap: int | None = None
 dew train  [dew.cli.main.Train]
-  <run> STR: str
-  --set STR: tuple[str, ...] = ()  [repeated]
-  --trust [STR [STR ...]]: tuple[str, ...] = ()
+  run: str  [Positional]
+  set: tuple[str, ...] = ()  [UseAppendAction]
+  trust: tuple[str, ...] = ()
 dew data export  [dew.cli.main.DataExport]
-  <data> STR: str
-  <destination> STR: str
-  --format {None,parquet,array_record}: Optional[Literal['parquet', 'array_record']] = None
-  --rows-per-shard INT: int = 100000
-  --branch {train,validation}: Literal['train', 'validation'] = 'train'
-  --read {memory,indexed,streamed}: Literal['memory', 'indexed', 'streamed'] = 'streamed'
-  --provision, --no-provision: bool = False
-  --tokenizer {None}|STR: str | None = None
-  --eos, --no-eos: bool = False
+  data: str  [Positional]
+  destination: str  [Positional]
+  format: Optional[Literal['parquet', 'array_record']] = None
+  rows_per_shard: int = 100000
+  branch: Literal['train', 'validation'] = 'train'
+  read: Literal['memory', 'indexed', 'streamed'] = 'streamed'
+  provision: bool = False
+  tokenizer: str | None = None
+  eos: bool = False
 dew data provision  [dew.cli.main.DataProvision]
-  <source> STR: str
+  source: str  [Positional]
 dew data publish  [dew.cli.main.DataPublish]
-  <data> STR: str
-  <destination> STR: str
-  --branch {train,validation}: Literal['train', 'validation'] = 'train'
-  --read {memory,indexed,streamed}: Literal['memory', 'indexed', 'streamed'] = 'streamed'
-  --provision, --no-provision: bool = False
+  data: str  [Positional]
+  destination: str  [Positional]
+  branch: Literal['train', 'validation'] = 'train'
+  read: Literal['memory', 'indexed', 'streamed'] = 'streamed'
+  provision: bool = False
 dew tpu attach-disk  [dew.cli.tpu.AttachDisk]
-  --zone ZONE: str | None = None
-  --dry-run, --no-dry-run: bool = False
-  <name> STR: str
-  <disk> STR: str
-  --read-only, --no-read-only: bool = False
+  zone: str | None = None  [metavar='ZONE']
+  dry_run: bool = False
+  name: str  [Positional]
+  disk: str  [Positional]
+  read_only: bool = False
 dew tpu copy  [dew.cli.tpu.Copy]
-  --zone ZONE: str | None = None
-  --dry-run, --no-dry-run: bool = False
-  <name> STR: str
-  <src> STR: str
-  <dst> STR: str
-  --worker N|all: str = 'all'
+  zone: str | None = None  [metavar='ZONE']
+  dry_run: bool = False
+  name: str  [Positional]
+  src: str  [Positional]
+  dst: str  [Positional]
+  worker: str = 'all'  [metavar='N|all']
 dew tpu create  [dew.cli.tpu.Create]
-  --zone ZONE: str | None = None
-  --dry-run, --no-dry-run: bool = False
-  <name> STR: str
-  --type TYPE: str | None = None
-  --spot, --no-spot: bool = False
-  --queued, --no-queued: bool = False
-  --version VERSION: str | None = None
-  --disk DISK: str | None = None
+  zone: str | None = None  [metavar='ZONE']
+  dry_run: bool = False
+  name: str  [Positional]
+  type: str | None = None  [metavar='TYPE']
+  spot: bool = False
+  queued: bool = False
+  version: str | None = None  [metavar='VERSION']
+  disk: str | None = None  [metavar='DISK']
 dew tpu delete  [dew.cli.tpu.Delete]
-  --zone ZONE: str | None = None
-  --dry-run, --no-dry-run: bool = False
-  <name> STR: str
+  zone: str | None = None  [metavar='ZONE']
+  dry_run: bool = False
+  name: str  [Positional]
 dew tpu describe  [dew.cli.tpu.Describe]
-  --zone ZONE: str | None = None
-  --dry-run, --no-dry-run: bool = False
-  <name> STR: str
+  zone: str | None = None  [metavar='ZONE']
+  dry_run: bool = False
+  name: str  [Positional]
 dew tpu init  [dew.cli.tpu.Init]
-  --project PROJECT: str | None = None
-  --zones ZONES: str | None = None
-  --accelerator-type TYPE: str | None = None
-  --runtime-version VERSION: str | None = None
-  --ssh-user USER: str | None = None
-  --gcs-bucket BUCKET: str | None = None
-  --data-disk DISK: str | None = None
-  --python-version X.Y: str | None = None
-  --dry-run, --no-dry-run: bool = False
+  project: str | None = None  [metavar='PROJECT']
+  zones: str | None = None  [metavar='ZONES']
+  accelerator_type: str | None = None  [metavar='TYPE']
+  runtime_version: str | None = None  [metavar='VERSION']
+  ssh_user: str | None = None  [metavar='USER']
+  gcs_bucket: str | None = None  [metavar='BUCKET']
+  data_disk: str | None = None  [metavar='DISK']
+  python_version: str | None = None  [metavar='X.Y']
+  dry_run: bool = False
 dew tpu list  [dew.cli.tpu.List]
-  --zone ZONE: str | None = None
-  --dry-run, --no-dry-run: bool = False
+  zone: str | None = None  [metavar='ZONE']
+  dry_run: bool = False
 dew tpu logs  [dew.cli.tpu.Logs]
-  --zone ZONE: str | None = None
-  --dry-run, --no-dry-run: bool = False
-  <name> STR: str
-  <job> STR: str
-  --worker N|all: str = '0'
-  --follow, --no-follow: bool = False
-  --lines INT: int = 200
+  zone: str | None = None  [metavar='ZONE']
+  dry_run: bool = False
+  name: str  [Positional]
+  job: str  [Positional]
+  worker: str = '0'  [metavar='N|all']
+  follow: bool = False
+  lines: int = 200
 dew tpu reset  [dew.cli.tpu.Reset]
-  --zone ZONE: str | None = None
-  --dry-run, --no-dry-run: bool = False
-  <name> STR: str
+  zone: str | None = None  [metavar='ZONE']
+  dry_run: bool = False
+  name: str  [Positional]
 dew tpu run  [dew.cli.tpu.Run]
-  --zone ZONE: str | None = None
-  --dry-run, --no-dry-run: bool = False
-  <name> STR: str
-  --worker N|all: str = 'all'
-  --detach, --no-detach: bool = False
-  --job JOB: str = ''
+  zone: str | None = None  [metavar='ZONE']
+  dry_run: bool = False
+  name: str  [Positional]
+  worker: str = 'all'  [metavar='N|all']
+  detach: bool = False
+  job: str = ''  [metavar='JOB']
 dew tpu setup  [dew.cli.tpu.Setup]
-  --zone ZONE: str | None = None
-  --dry-run, --no-dry-run: bool = False
-  <name> STR: str
-  --from-source, --no-from-source: bool = False
-  --version VERSION: str = ''
-  --extras LIST: str = ''
-  --gcs-bucket BUCKET: str | None = None
-  --python-version X.Y: str | None = None
-  --type TYPE: str | None = None
-  --delete, --no-delete: bool = False
-  --git-key FILE: pathlib.Path | None = None
+  zone: str | None = None  [metavar='ZONE']
+  dry_run: bool = False
+  name: str  [Positional]
+  from_source: bool = False
+  version: str = ''  [metavar='VERSION']
+  extras: str = ''  [metavar='LIST']
+  gcs_bucket: str | None = None  [metavar='BUCKET']
+  python_version: str | None = None  [metavar='X.Y']
+  type: str | None = None  [metavar='TYPE']
+  delete: bool = False
+  git_key: pathlib.Path | None = None  [metavar='FILE']
 dew tpu spawn  [dew.cli.tpu.Spawn]
-  --zone ZONE: str | None = None
-  --dry-run, --no-dry-run: bool = False
-  <base> STR: str
-  <count> INT: int
-  --type TYPE: str | None = None
-  --spot, --no-spot: bool = False
-  --queued, --no-queued: bool = False
-  --extras LIST: str = ''
+  zone: str | None = None  [metavar='ZONE']
+  dry_run: bool = False
+  base: str  [Positional]
+  count: int  [Positional]
+  type: str | None = None  [metavar='TYPE']
+  spot: bool = False
+  queued: bool = False
+  extras: str = ''  [metavar='LIST']
 dew tpu ssh  [dew.cli.tpu.Ssh]
-  --zone ZONE: str | None = None
-  --dry-run, --no-dry-run: bool = False
-  <name> STR: str
-  --worker INT: int = 0
-  -L, --forward PORT: tuple[int, ...] = ()  [repeated]
+  zone: str | None = None  [metavar='ZONE']
+  dry_run: bool = False
+  name: str  [Positional]
+  worker: int = 0
+  forward: tuple[int, ...] = ()  [UseAppendAction]  [aliases=('-L',)]  [metavar='PORT']
 dew tpu ssh-config  [dew.cli.tpu.SshConfig]
-  --zone ZONE: str | None = None
-  --dry-run, --no-dry-run: bool = False
-  <name> STR: str
+  zone: str | None = None  [metavar='ZONE']
+  dry_run: bool = False
+  name: str  [Positional]
 dew tpu start  [dew.cli.tpu.Start]
-  --zone ZONE: str | None = None
-  --dry-run, --no-dry-run: bool = False
-  <name> STR: str
+  zone: str | None = None  [metavar='ZONE']
+  dry_run: bool = False
+  name: str  [Positional]
 dew tpu status  [dew.cli.tpu.Status]
-  --zone ZONE: str | None = None
-  --dry-run, --no-dry-run: bool = False
-  <name> STR: str
+  zone: str | None = None  [metavar='ZONE']
+  dry_run: bool = False
+  name: str  [Positional]
 dew tpu stop  [dew.cli.tpu.Stop]
-  --zone ZONE: str | None = None
-  --dry-run, --no-dry-run: bool = False
-  <name> STR: str
+  zone: str | None = None  [metavar='ZONE']
+  dry_run: bool = False
+  name: str  [Positional]
 dew tpu sync  [dew.cli.tpu.Sync]
-  --zone ZONE: str | None = None
-  --dry-run, --no-dry-run: bool = False
-  <name> STR: str
-  --exclude PATTERN: tuple[str, ...] = ()  [repeated]
-  --delete, --no-delete: bool = False
+  zone: str | None = None  [metavar='ZONE']
+  dry_run: bool = False
+  name: str  [Positional]
+  exclude: tuple[str, ...] = ()  [UseAppendAction]  [metavar='PATTERN']
+  delete: bool = False
 dew tpu train  [dew.cli.tpu.Train]
-  --zone ZONE: str | None = None
-  --dry-run, --no-dry-run: bool = False
-  <name> STR: str
-  --job JOB: str = ''
-  --delete, --no-delete: bool = False
+  zone: str | None = None  [metavar='ZONE']
+  dry_run: bool = False
+  name: str  [Positional]
+  job: str = ''  [metavar='JOB']
+  delete: bool = False
 -- records --
 dew.telemetry.records.RunRecord
   name: str

@@ -58,15 +58,15 @@ def test_a_property_shows_its_getters_type_and_whether_it_is_set():
         "  .read: property -> int", "  .written: property -> str [set]"]
 
 
-def test_a_commands_arguments_are_its_parsers():
-    """A positional argument shows by its name, not as a flag no parser takes, and a repeated one as
-    repeated, each with its field's type, aliases resolved, and default."""
+def test_a_commands_arguments_are_as_it_declares_them():
+    """A positional argument shows as positional, not as a flag, and a repeated one as repeated, each with
+    its field's type, aliases resolved, its default and the spelling tyro is told of."""
     import dataclasses
     from typing import Annotated
 
     import tyro
 
-    Count = Annotated[int | None, tyro.conf.arg(metavar="N")]
+    Count = Annotated[int | None, tyro.conf.arg(metavar="N", aliases=("-n",))]
 
     @dataclasses.dataclass
     class Command:
@@ -75,4 +75,5 @@ def test_a_commands_arguments_are_its_parsers():
         set: Annotated[tuple[str, ...], tyro.conf.UseAppendAction] = ()
 
     assert load("api_report").arguments(Command) == [
-        "  <run> STR: str", "  --count N: int | None = None", "  --set STR: tuple[str, ...] = ()  [repeated]"]
+        "  run: str  [Positional]", "  count: int | None = None  [aliases=('-n',)]  [metavar='N']",
+        "  set: tuple[str, ...] = ()  [UseAppendAction]"]

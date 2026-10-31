@@ -7,9 +7,8 @@ A txtar archive of four sections, each a contract consumers outside the reposito
 - `config`: each dataclass of `dew.config`, its fields with their types and defaults, and a field that is
   keyword-only or no constructor argument marked so.
 - `cli`: each command of `dew` (`dew.cli.main.COMMANDS`, `DATA_COMMANDS` under `dew data`,
-  `dew.cli.tpu.COMMANDS` under `dew tpu`), each argument as the command's parser takes it: its spellings
-  (none for a positional one), its metavar, whether it is required or repeated, and its field's type, aliases
-  resolved, and default.
+  `dew.cli.tpu.COMMANDS` under `dew tpu`), each argument as the command declares it to tyro: its field's
+  name, type (aliases resolved) and default, and the markers and spelling tyro is told of.
 - `records`: each run record type (`dew.telemetry.records.RECORD_TYPES`), its fields as `config`'s, and
   the schema versions the records, generations and kernel reports carry.
 
@@ -28,7 +27,6 @@ import pkgutil
 import re
 import sys
 import typing
-import warnings
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -141,32 +139,39 @@ def config() -> list[str]:
     return lines
 
 
-def arguments(cls) -> list[str]:
-    """A command's arguments as its parser takes them (tyro's, as `dew` builds it): each one's spellings, or
-    its name in angle brackets where it is positional; its metavar; whether it is required or repeated; and
-    the type and default of the field it fills, the type's aliases resolved (`Zone` is `str | None`)."""
+def declared(hint) -> tuple[object, list[str]]:
+    """A field's type and what tyro is told of it: each marker of `tyro.conf` by its name, and an argument
+    configuration's spelling (`name`, `aliases`, `metavar`), from the `Annotated` layers around the type."""
     import tyro
 
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", DeprecationWarning)
-        parser = tyro.extras.get_parser(cls)
+    markers = {id(value): name for name, value in vars(tyro.conf).items() if not name.startswith("_")}
+    notes = []
+    while typing.get_origin(hint) is typing.Annotated:
+        for item in hint.__metadata__:
+            if id(item) in markers:
+                notes.append(markers[id(item)])
+            elif type(item).__name__ == "_ArgConfig":
+                notes += [f"{key}={value!r}" for key in ("name", "aliases", "metavar")
+                          if (value := getattr(item, key)) is not None]
+            else:
+                notes.append(shown(item))
+        hint = hint.__origin__
+    return hint, notes
+
+
+def arguments(cls) -> list[str]:
+    """A command's arguments as it declares them to tyro, which spells them (a field `name` the flag
+    `--name`, underscores as hyphens, unless it is `Positional` or `arg` names it): each field's name, its
+    type with its aliases resolved (`Zone` is `str | None`), its default, and what tyro is told of it."""
     try:
-        types = typing.get_type_hints(cls)
+        hints = typing.get_type_hints(cls, include_extras=True)
     except (NameError, TypeError):
-        types = {}
-    filled = {field.name.replace("_", "-"): field for field in dataclasses.fields(cls)}
+        hints = {}
     lines = []
-    for action in parser._actions:  # tyro's own argparse: its actions known by their class names
-        if type(action).__name__ == "_HelpAction":
-            continue
-        line = "  " + (", ".join(action.option_strings) or f"<{action.dest}>")
-        if action.metavar:
-            line += f" {action.metavar}"
-        if field := filled.get(action.dest):
-            line += f": {annotation(types.get(field.name, field.type))}{default(field)}"
-        notes = [note for note, holds in (("required", action.required and action.option_strings),
-                                          ("repeated", type(action).__name__ == "_AppendAction")) if holds]
-        lines.append(line + "".join(f"  [{note}]" for note in notes))
+    for field in dataclasses.fields(cls):
+        written, notes = declared(hints.get(field.name, field.type))
+        marks = "".join(f"  [{note}]" for note in notes)
+        lines.append(f"  {field.name}: {annotation(written)}{default(field)}{marks}")
     return lines
 
 
