@@ -36,6 +36,7 @@ import tyro
 from dew._hashing import fmix32
 from dew._records import share
 from dew.held_updates import refuse_untold, update_applied
+from dew.laprop import bias_corrected, laprop
 from dew.mesh import LogicalAxes
 from dew.newton_schulz import (
     NEWTON_SCHULZ,
@@ -795,22 +796,6 @@ def stochastic_round_bf16(x: jax.Array, seed: jax.Array) -> jax.Array:
     return stochastic_bf16(x, fmix32(index * jnp.uint32(0x9E3779B1) + seed.astype(jnp.uint32)))
 
 
-def _bias_corrected(moment, decay, count):
-    """`optax.tree.bias_correction`, with the correction of a Python `decay` in (0, 1) formed as
-    -expm1(count log decay), its log taken in double before the trace.
-
-    Optax forms 1 - decay**count inside a jit, where a Python decay is already rounded to float32:
-    0.999 becomes 0.99900001, so the correction at count 1 is 1.3e-5 off (2.2e-4 at 0.9999), where
-    torch forms it in double. A decay given as an array, a schedule's (`scheduled_solver`), takes
-    optax's own. google-deepmind/optax#1827 makes this optax's; delete this, and
-    `scale_by_adam` with it, once a release carries it.
-    """
-    if isinstance(decay, (int, float)) and 0 < decay < 1:
-        correction = -jnp.expm1(count * math.log(decay))
-        return jax.tree.map(lambda leaf: leaf / correction.astype(leaf.dtype), moment)
-    return optax.tree.bias_correction(moment, decay, count)
-
-
 def moment_dtype(param, dtype):
     """The dtype a first moment of `param` is stored in under a requested `dtype`: the parameter's own
     where None, and for a complex parameter the complex type that holds `dtype`'s values in each
@@ -825,7 +810,7 @@ def moment_dtype(param, dtype):
 def scale_by_adam(b1=0.9, b2=0.999, eps=1e-8, eps_root=0.0, mu_dtype=None, *,
                   nesterov: bool = False, nu_dtype=None) -> optax.GradientTransformation:
     """`optax.scale_by_adam` (optax 0.2.8) with its bias corrections formed in double
-    (`_bias_corrected`): optax's moments, state layout (`optax.ScaleByAdamState`) and update,
+    (`bias_corrected`): optax's moments, state layout (`optax.ScaleByAdamState`) and update,
     composed from optax's public tree math. `nu_dtype` stores the second moment as `mu_dtype` does
     the first, each the parameter's dtype where None; a gradient narrower than its moment is
     widened before either reads it, so an fp16 gradient's square does not underflow first."""
@@ -850,11 +835,11 @@ def scale_by_adam(b1=0.9, b2=0.999, eps=1e-8, eps_root=0.0, mu_dtype=None, *,
         count = optax.safe_increment(state.count)
         if nesterov:
             mu_hat = jax.tree.map(lambda m, g: b1 * m + (1 - b1) * g,
-                                  _bias_corrected(mu, b1, optax.safe_increment(count)),
-                                  _bias_corrected(updates, b1, count))
+                                  bias_corrected(mu, b1, optax.safe_increment(count)),
+                                  bias_corrected(updates, b1, count))
         else:
-            mu_hat = _bias_corrected(mu, b1, count)
-        nu_hat = _bias_corrected(nu, b2, count)
+            mu_hat = bias_corrected(mu, b1, count)
+        nu_hat = bias_corrected(nu, b2, count)
         scaled = jax.tree.map(lambda m, v: None if m is None else m / (jnp.sqrt(v + eps_root) + eps),
                               mu_hat, nu_hat, is_leaf=lambda leaf: leaf is None)
         # A requested dtype is each leaf's own (`moment_dtype`): a complex leaf's first moment stays
@@ -1188,7 +1173,7 @@ def power_profiles(solver: optax.GradientTransformation,
     return optax.GradientTransformationExtraArgs(init_fn, update_fn)
 
 
-Optimizer = Literal['adam', 'adamw', 'lamb', 'muon', 'muonclip']
+Optimizer = Literal['adam', 'adamw', 'lamb', 'muon', 'muonclip', 'laprop']
 """The optimizers `OptimConfig.optimizer` names, each built by its `OPTIMIZER_MAP` entry."""
 
 STATE_OPTIMIZERS: dict[str, dict[Optimizer, Callable[..., optax.GradientTransformation]]] = {
@@ -1205,6 +1190,7 @@ OPTIMIZER_MAP: dict[Optimizer, Callable[..., optax.GradientTransformation]] = {
     'lamb': optax.lamb,
     'muon': _muon_groups,
     'muonclip': _muonclip_groups,
+    'laprop': laprop,
 }
 
 optimizers: Aliases[Callable[..., optax.GradientTransformation], optax.GradientTransformation] = Aliases(
@@ -2252,9 +2238,9 @@ class OptimConfig:
     Optax decays every parameter (`mask=None`), which False restores. A param group decays all it claims
     unless its own `spared` says otherwise (`ParamGroup.spared`); a run's default groups follow this."""
     b1: float | None = None
-    """Adam's first-moment decay, for adam, adamw and lamb; None keeps the optimizer's."""
+    """First-moment decay, for adam, adamw and lamb and laprop's momentum; None keeps the optimizer's."""
     b2: float | None = None
-    """Adam's second-moment decay, for adam, adamw and lamb; None keeps the optimizer's."""
+    """Second-moment decay, for adam, adamw and lamb and laprop's mean square; None keeps the optimizer's."""
     param_groups: Annotated[tuple[ParamGroup, ...], record_argument(tuple[ParamGroup, ...])] = ()
     """Per-group learning rates, momentum schedules, weight decay and bounds; the first
     matching group wins.
@@ -2428,4 +2414,5 @@ class OptimConfig:
 
 __all__ = ["BoundsState", "Cosine", "DeltaState", "Exponential", "Linear", "M3State",
            "OneCycle", "OptimConfig", "ParamGroup", "Power", "PowerProfilesState", "PowerTail",
-           "QKClipState", "ScheduleBase", "ScheduleSpec", "delta_gradient_descent", "scale_by_m3", "stepped"]
+           "QKClipState", "ScheduleBase", "ScheduleSpec", "delta_gradient_descent", "laprop", "scale_by_m3",
+           "stepped"]
