@@ -397,7 +397,9 @@ _LIMIT = re.compile(r"Limit\(count=(\d+)\)")
 """A limit's record in an order's stages (`Limit`'s repr)."""
 
 
-def grown_limits(saved: JSON, current: JSON) -> frozenset[tuple[str, str]] | None:
+def grown_limits(saved: dict[str, JSON] | list[JSON] | str | int | float | bool | None,
+                 current: dict[str, JSON] | list[JSON] | str | int | float | bool | None
+                 ) -> frozenset[tuple[str, str]] | None:
     """The limits the order `current` sets higher than `saved` does, each its saved and its current
     record, where `current` is `saved` but for them; None where it differs otherwise. Only the run's own
     chain's limit grows (never a mixed corpus's or a phase's, which the mixture's own stages read after
@@ -412,7 +414,9 @@ def grown_limits(saved: JSON, current: JSON) -> frozenset[tuple[str, str]] | Non
     return _grown_stages(saved.get("stages"), current.get("stages"))
 
 
-def _grown_stages(saved: JSON, current: JSON) -> frozenset[tuple[str, str]] | None:
+def _grown_stages(saved: dict[str, JSON] | list[JSON] | str | int | float | bool | None,
+                  current: dict[str, JSON] | list[JSON] | str | int | float | bool | None
+                  ) -> frozenset[tuple[str, str]] | None:
     """`grown_limits` of the run's chain's stages (their records, in order)."""
     if not (isinstance(saved, list) and isinstance(current, list)) or len(saved) != len(current):
         return frozenset() if saved == current else None
@@ -428,7 +432,9 @@ def _grown_stages(saved: JSON, current: JSON) -> frozenset[tuple[str, str]] | No
     return frozenset(found)
 
 
-def _steps_grown(saved: JSON, current: JSON, grown: frozenset[tuple[str, str]]) -> bool:
+def _steps_grown(saved: dict[str, JSON] | list[JSON] | str | int | float | bool | None,
+                 current: dict[str, JSON] | list[JSON] | str | int | float | bool | None,
+                 grown: frozenset[tuple[str, str]]) -> bool:
     """Whether a manifest's steps `current` are `saved`'s but for the limits the order grew (`grown`)."""
     if not (isinstance(saved, list) and isinstance(current, list)) or len(saved) != len(current):
         return False

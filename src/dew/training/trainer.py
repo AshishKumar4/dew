@@ -1405,9 +1405,8 @@ class Trainer(Generic[Loss, Effects]):
             metrics=metrics, preview=preview and self.tracker is not None, best=selection, stop=plateau,
             suites=suites, pause=pause, scored_to=None if scored_to is None else os.fspath(scored_to),
             held_best=restore_best and self.checkpoints is None, observe=observe, summaries=tuple(summaries),
-            declared=declared,
-            branches=() if cooldowns is None else cooldowns.branches(steps, tokens, self.accumulation,
-                                                                     self._examples),
+            declared=declared, branches=() if cooldowns is None else cooldowns.branches(
+                steps, tokens, self.accumulation, self._examples),
         )
 
     def scheduled(self, updates: int | None) -> None:
@@ -1612,13 +1611,12 @@ class Trainer(Generic[Loss, Effects]):
         it, agreed across the pool before anything initializes."""
         if (named := self.objective.named_inputs) is None or self.objective.inputs is not None:
             return
-        mesh = self.device_mesh
         batch = agreed("training input batch", first)
-        with jax.set_mesh(mesh):
-            device, _ = split_fields(placed_abstract(mesh, batch))
+        with jax.set_mesh(self.device_mesh):
+            device, _ = split_fields(placed_abstract(self.device_mesh, batch))
             shape = Field.of(named, self._model_shapes(device)).shape
-        held = agreed_same("training input shape", lambda: list(shape))
-        self.objective.inputs = InputSpec(Field(named, tuple(held)))
+        self.objective.inputs = InputSpec(Field(named, tuple(agreed_same("training input shape",
+                                                                       lambda: list(shape)))))
 
     def _opened(self, plan: FitPlan, run: FitRun, interval: Interval, current: int, position,
                 placed: Callable[[], tuple[TrainState, Placement[TrainState]]],

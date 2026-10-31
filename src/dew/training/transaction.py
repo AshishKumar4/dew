@@ -780,11 +780,9 @@ class Transaction:
             held = _TokenCount.add(state.deferred, jnp.where(taken, held, 0).astype(jnp.uint32))
             waiting = jnp.where(due & accepted & ~done, held, jnp.where(counted, 0, state.deferred))
             advanced = dataclasses.replace(advanced, deferred=waiting.astype(jnp.uint32))
-        summary = stacked(inspected)
         return advanced, loss, aux, Committed(
             jnp.where(counted, norm, 0.), counted.astype(jnp.int32),
-            jnp.where(counted, held, jnp.zeros((2,), jnp.uint32)),
-            None if summary is None else Summaries(jnp.where(counted, summary.values, 0.), summary.names))
+            jnp.where(counted, held, jnp.zeros((2,), jnp.uint32)), stacked(inspected, counted))
 
     def step(self, *, realize=None, host=False):
         """Build the function that runs one attempt over the shared phases.

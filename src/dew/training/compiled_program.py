@@ -120,9 +120,8 @@ def compiled(program: jcore.Jaxpr, lowering: str) -> jcore.Jaxpr:
 def within(value, lowering: str):
     """`value`, an equation's parameter, with each program in it as `compiled` makes it: a plain
     sequence of programs (a conditional's branches) item by item; a named tuple (a gather's dimension
-    numbers, a key's implementation) holds none and stays as it is."""
-    if isinstance(value, jcore.ClosedJaxpr):
-        return value.replace(jaxpr=compiled(value.jaxpr, lowering))
+    numbers, a key's implementation) holds none and stays as it is. A program carries its own constants
+    (on JAX 0.12 a closed program is a `Jaxpr`), which `compiled` keeps."""
     if isinstance(value, jcore.Jaxpr):
         return compiled(value, lowering)
     if type(value) in (tuple, list):
@@ -162,10 +161,8 @@ def bodies(equation: jcore.JaxprEqn) -> list[jcore.Jaxpr]:
         return []
     found = []
     for value in equation.params.values():
-        for each in value if isinstance(value, tuple | list) else (value,):
-            body = each.jaxpr if isinstance(each, jcore.ClosedJaxpr) else each
-            if isinstance(body, jcore.Jaxpr):
-                found.append(body)
+        found.extend(each for each in (value if isinstance(value, tuple | list) else (value,))
+                     if isinstance(each, jcore.Jaxpr))
     return found
 
 

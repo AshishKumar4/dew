@@ -117,13 +117,14 @@ class Summaries:
     names: tuple[str, ...] = struct.field(pytree_node=False)
 
 
-def stacked(scalars: Mapping[str, jax.Array]) -> Summaries | None:
-    """`scalars` as one vector (`Summaries`) in their order, None where there are none, a step that samples
-    nothing."""
+def stacked(scalars: Mapping[str, jax.Array], kept: jax.Array) -> Summaries | None:
+    """`scalars` as one vector (`Summaries`) in their order, each zero where `kept` is false (an attempt
+    that committed nothing), None where there are none, a step that samples nothing."""
     if not scalars:
         return None
     names = tuple(scalars)
-    return Summaries(jnp.stack([jnp.asarray(scalars[name], jnp.float32) for name in names]), names)
+    values = jnp.stack([jnp.asarray(scalars[name], jnp.float32) for name in names])
+    return Summaries(jnp.where(kept, values, 0.), names)
 
 
 def logged(inspected: Summaries) -> dict[str, float]:
