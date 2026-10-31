@@ -10,7 +10,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from contract_support import EDGES, INTERPRETED, REVERSE_ONLY, assert_contract, flattened, normal_draw
+from contract_support import EDGES, REVERSE_ONLY, assert_contract, normal_draw
 from ssd_support import stepwise_scan
 
 from dew.nn.kernels import fla_gdn, fla_kda, mamba_ssd, recurrence, recurrence_chunk, short_conv, ssd
@@ -22,6 +22,15 @@ DELTA_RULE_EDGES = {"normal": 1.0, "the largest its chunk holds": 2.0**62, "near
 """The chunked delta rule's edges. Near float32's largest its chunk's own products overflow at entries the
 token recurrence keeps finite, as fla's chunked form's do at the same entries (`precedent_chunked`, on an
 H100: ledger 2470), which that edge compares it with in place of the recurrence."""
+
+
+INTERPRETED = jax.default_backend() != "gpu"
+"""The ported kernels interpret off a GPU."""
+
+
+def flattened(fn):
+    """`fn`'s outputs as one vector, which the orders through its gradient sum against one cotangent."""
+    return lambda *operands: jnp.concatenate([out.ravel() for out in jax.tree.leaves(fn(*operands))])
 
 
 PACKED_OVERFLOW_ORDERS = ("primal", "jvp", "vjp", "second jvp", "second jvp, remat")
