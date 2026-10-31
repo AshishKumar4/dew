@@ -152,10 +152,10 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
     - Step: the family's widest depth dividing the call's (`Family.depths`) at those rows, a shallower
       one before fewer rows (a family whose products read registers holds a step's fragments).
     - Stages: the deepest its program's share of shared memory holds at those programs (`resources.plan`,
-      the planner every template's derivation reads), at least those the walk keeps busy (one loading
-      ahead beside the one consumed and, on a family that keeps its products in flight, the one in
-      flight: `_IN_FLIGHT`); a tile that cannot stage that deep gives way to the next narrower or
-      shorter one.
+      the planner every template's derivation reads), at least those the walk keeps busy (those loading
+      ahead, `Family.loads_ahead`, beside the one consumed and, on a family that keeps its products in
+      flight, the one in flight: `_IN_FLIGHT`); a tile that cannot stage that deep gives way to the next
+      narrower or shorter one, or a shallower step.
     - Cluster: where grouped and a group's rows span at least as many row tiles as the family's cluster
       takes (`Family.cluster`: a pair on warpgroup MMA), that many multiprocessors a cluster, running row
       tiles of one group that load its matrix block once between them (multicast), CUTLASS's and
@@ -172,7 +172,7 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
     widest = min(width, family.widest_product or width)
     columns = [block_n for block_n in range(widest - widest % unit, 0, -unit) if width % block_n == 0]
     steps = [step for step in family.depths(dtype) if depth is None or depth % step == 0]
-    busy = 2 + (0 if family.operands_in_registers else _IN_FLIGHT)
+    busy = 1 + family.loads_ahead + (0 if family.operands_in_registers else _IN_FLIGHT)
 
     def tiled(consumers: int, programs: int) -> Tiles | None:
         role = family.role_rows * consumers

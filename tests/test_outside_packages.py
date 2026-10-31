@@ -179,8 +179,7 @@ class ActivityRun(RunConfig):
         data = Memory({"x": rows}).read("memory").shuffle().repeat().batch(8).loading(loading)
         held = Memory({"x": rows[:20]}).read("memory").batch(8).loading(loading)
         objective = Rate(self.model.build(), self.target)
-        return Prepared(self, lambda name: self.train(objective, data, name=name, metrics=(MeanRate(),),
-                                                      validation=held))
+        return Prepared(self, objective, data, metrics=(MeanRate(),), validation=held)
 '''
 
 TRAIN_RUN = '''

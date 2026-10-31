@@ -17,6 +17,7 @@ from dew.nn.backbones.decoder_block import REMAT_POLICIES
 from dew.objectives.lm import LMObjective
 from dew.telemetry.instrumentation import Compiles
 from dew.training import MeshSpec, Trainer
+from dew.training.planning import PlanRefused
 
 
 def deep(remat=None):
@@ -158,3 +159,129 @@ def test_a_run_over_two_devices_that_sets_its_remat_is_told_the_rung_its_derivat
     assert derived and derived[0]["remat"] is None and derived[-1]["label"] == "fits"
     assert not [record for record in caplog.records if "compiling it again" in record.getMessage()]
     assert [record for record in caplog.records if "recomputes less" in record.getMessage()]
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_run_over_a_tensor_axis_that_sets_its_remat_hears_its_derivation_cannot_judge_it(
+        monkeypatch, tmp_path, caplog):
+    """A run over a tensor axis of two that sets full recomputation, whose footprint the derivation reads
+    per device only over data and fsdp axes, hears once that its derivation cannot judge its layout,
+    rather than nothing, and compiles at its own rung alone (row 2721; 2615 stays open for such layouts)."""
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "tensor"))
+    free(monkeypatch, LIMIT)
+    model = CausalTransformer(vocab_size=64, emb_features=32, num_layers=8, num_heads=2, mlp_features=64,
+                              max_seq_len=256, remat=REMAT_POLICIES["full"])
+    trainer = Trainer(LMObjective(model, seq_len=256), optax.sgd(1e-2), key=jax.random.key(0), split=1,
+                      mesh=MeshSpec(tensor=2).build(jax.devices()[:2]))
+    with caplog.at_level(logging.WARNING, logger="dew"), Compiles("step") as compiles:
+        compiled(trainer)
+    assert compiles.count == 1 and trainer.plan["remat"] == "full"
+    assert trainer.plan["derived"][-1]["label"] == "unknown"
+    assert len([record for record in caplog.records if record.name == "dew.training.planning"]) == 1
+
+
+def test_a_compile_the_derivation_judged_otherwise_is_told_as_a_model_miss(monkeypatch, tmp_path, caplog):
+    """Every compile's plan record holds the headroom the derivation judged beside the one the compile
+    measured, and each compile whose fit the derivation judged otherwise is told as a model miss, the
+    compile deciding: with room between what the derivation and the compile say a step at full
+    recomputation needs, the run hears a miss for its first compile and one for each it judged so."""
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "sizing"))
+    free(monkeypatch, LIMIT)
+    sizing = deep(REMAT_POLICIES["full"])
+    compiled(sizing)
+    (measured,) = sizing.plan["probes"]
+    derived, compiled_need = LIMIT - measured["derived_headroom"], LIMIT - measured["headroom"]
+    assert derived != compiled_need
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "between"))
+    free(monkeypatch, (derived + compiled_need) // 2)
+    trainer = deep(REMAT_POLICIES["full"])
+    with caplog.at_level(logging.WARNING, logger="dew"), Compiles("step") as compiles:
+        if compiled_need > derived:
+            with pytest.raises(PlanRefused):
+                compiled(trainer)
+        else:
+            compiled(trainer)
+    missed = [record for record in caplog.records if "model miss" in record.getMessage()]
+    probes = (trainer.plan or {}).get("probes") or []
+    judged = [probe for probe in probes if (probe["derived_headroom"] >= 0) != probe["fits"]]
+    assert compiles.count >= 1 and missed and (not probes or len(missed) == len(judged))
+
+
+GATE_LAYERS = {
+    "decoder": {},
+    "hybrid": {"layer_types": ("mamba", "attention") * 2, "kinds": {"mamba": {"mixer": {
+        "class": "mamba2", "fields": {"num_heads": 4, "head_dim": 16, "state_size": 8, "n_groups": 1,
+                                      "chunk_size": 32}}}, "attention": {}}},
+    "moe": {"mixture": {"experts": 4, "top_k": 2, "layers": (1, 3)}},
+}
+"""The gate's decoders (row 2113): dense, hybrid of Mamba-2 and attention layers, and mixture of experts."""
+
+
+def gated(layers: str, generation: str, remat: str, capacity: int, records, precision: str) -> list[dict]:
+    """A gate case's step compiled ahead for one compile-only GPU of `generation` stating `capacity`
+    bytes at JAX's matmul `precision`, its rungs recorded under `records`: every compile its plan made,
+    refused or not."""
+    from dew.registry import models
+    from dew.training.ahead import compile_ahead, compile_only_gpus
+
+    model = models.build("causal_transformer", vocab_size=128, emb_features=64, num_layers=4, num_heads=4,
+                         num_kv_heads=2, mlp_features=128, max_seq_len=128,
+                         remat=None if remat == "none" else REMAT_POLICIES[remat], **GATE_LAYERS[layers])
+    trainer = Trainer(LMObjective(model, seq_len=128), optax.adamw(1e-3), key=jax.random.key(0), split=1,
+                      mesh=MeshSpec().build(compile_only_gpus(generation, 1)))
+    tokens = ((np.arange(4 * 129).reshape(4, 129) * 7) % 128).astype(np.int32)
+    with pytest.MonkeyPatch.context() as patch, jax.default_matmul_precision(precision):
+        patch.setenv("DEW_RUNG_RECORDS", str(records))
+        try:
+            compile_ahead(trainer, {"text": tokens}, capacity=capacity)
+        except PlanRefused as refused:
+            return [probe.record() for probe in refused.probes]
+    return list(trainer.plan["probes"])
+
+
+@pytest.mark.parametrize("precision", ["default", "highest"])
+@pytest.mark.parametrize("remat", ["none", "full"])
+@pytest.mark.parametrize("generation", ["sm80", "sm90"])
+@pytest.mark.parametrize("layers", list(GATE_LAYERS))
+def test_the_derivation_decides_a_steps_fit_as_its_compile_does(layers, generation, remat, precision,
+                                                                   tmp_path):
+    """The derivation judges a step's fit as its compile does at 0.6 and 1.6 times what the compile needs,
+    over decoders dense, hybrid and of experts, Ampere and Hopper, no recomputation and full, JAX's
+    default and highest matmul precision (row 2113's gate, in the kernel gate's evidence shape,
+    `compile_evidence`). The need is the program's as XLA lays it out on a roomy GPU, and the
+    derivation's, read off that compile, admits it at 1.6 times and refuses it at 0.6. A gate decoder's
+    peak is the program's own (`Footprint.exact`), an expert decoder's at JAX's default precision too:
+    its ragged products run on CUDA as Pallas grouped kernels, custom calls that hold their outputs alone
+    (`compiled_program.opaque`). At highest precision they are XLA's ragged products, the GEMM template's
+    portable route (`grouped_matmul.xla_ragged_dot`), which XLA lays out as its target, dtype and flags
+    choose: that peak alone is a bound from below, never above the compile's need, which
+    never refuses a step the compile fits and may admit one it refuses, a miss its compile corrects. On
+    a GPU stating 1.6 times, the compile fits and the derivation judged so. On one stating 0.6, a step
+    set to full recomputation compiles there alone: where XLA refuses it the derivation did, but where
+    bounded from below, and where XLA fits it, it fits by XLA's own rematerialization against the stated
+    memory, which the derivation does not model and the compile decides (its temporaries below the
+    roomy compile's)."""
+    from compile_evidence import Evidence, Facts, Measurement, Prediction
+
+    (roomy,) = gated(layers, generation, remat, 1 << 34, tmp_path / "roomy", precision)
+    need, derived = (1 << 34) - roomy["headroom"], (1 << 34) - roomy["derived_headroom"]
+    exact = roomy["derived"]["peak_exact"]
+    assert exact == (layers != "moe" or precision != "highest"), roomy["derived"]
+    assert exact or derived <= need, (derived, need)
+    for margin, admits in ((1.6, True), (0.6, False)):
+        budget = int(need * margin)
+        evidence = Evidence(
+            f"{layers} {generation} remat {remat} {precision} at {margin} of its need", "",
+            Facts((layers, remat), generation),
+            Prediction({"peak": roomy["derived"]["peak"]}, derived, budget, derived <= budget, "bytes"),
+            Measurement({"temp": roomy["temp"]}, need <= budget, "xla", jax.__version__))
+        assert evidence.compiled.admits == admits, evidence.describe()
+        assert evidence.agrees or (not exact and derived <= budget), evidence.describe()
+    (fitting, *_) = gated(layers, generation, remat, int(need * 1.6), tmp_path / "1.6", precision)
+    assert fitting["fits"] and fitting["derived_headroom"] >= 0, fitting
+    if remat == "full":
+        tight = gated(layers, generation, remat, int(need * 0.6), tmp_path / "0.6", precision)[0]
+        assert tight["derived_headroom"] < 0 or not exact, tight
+        # Neither refuses a compile that fits, but where XLA's own rematerialization fit it below what
+        # the roomy compile held, which the derivation does not model.
+        assert not tight["fits"] or tight["derived_headroom"] >= 0 or tight["temp"] < roomy["temp"], tight
