@@ -22,14 +22,9 @@ import jax
 import jax.numpy as jnp
 from flax import struct
 
+from dew.nn.precision import at_least_fp32
 from dew.nn.rope import rotary_freqs, rotate
 from dew.rl.distributions import unimix_log_probs
-
-
-def parameters_of(dtype: jnp.dtype) -> jnp.dtype:
-    """The dtype a module computing in `dtype` keeps its parameters in: at least float32, so a bfloat16
-    computation updates float32 weights (DreamerV3's COMPUTE_DTYPE beside its float32 parameters)."""
-    return jnp.promote_types(jnp.float32, dtype)
 
 
 @struct.dataclass
@@ -56,9 +51,9 @@ class _Block(nn.Module):
 
     def setup(self) -> None:
         head = self.width // self.heads
-        dense = functools.partial(nn.DenseGeneral, dtype=self.dtype, param_dtype=parameters_of(self.dtype))
+        dense = functools.partial(nn.DenseGeneral, dtype=self.dtype, param_dtype=at_least_fp32(self.dtype))
         norm = functools.partial(nn.RMSNorm, epsilon=1e-6, dtype=self.dtype,
-                                 param_dtype=parameters_of(self.dtype))
+                                 param_dtype=at_least_fp32(self.dtype))
         self.attention_norm, self.feed_norm = norm(), norm()
         self.query, self.key, self.value = (dense((self.heads, head)) for _ in range(3))
         self.query_norm, self.key_norm = norm(), norm()
@@ -70,7 +65,7 @@ class _Block(nn.Module):
     def projected(self, x: jax.Array, positions: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
         """The rotated queries and keys, and the values, of rows `[B, S, width]` at `positions` `[B, S]`."""
         h = self.attention_norm(x)
-        cos, sin = rotary_freqs(positions, self.width // self.heads, 10000.0, dtype=jnp.float32)
+        cos, sin = rotary_freqs(positions, self.width // self.heads, 10000.0, dtype=at_least_fp32(self.dtype))
         query = rotate(self.query_norm(self.query(h)), cos, sin)
         key = rotate(self.key_norm(self.key(h)), cos, sin)
         return query, key, self.value(h)
@@ -99,16 +94,17 @@ class TSSM(nn.Module):
     context: int = 64
     """The steps an acting cache holds (`empty_cache`), the windows' length it trained on."""
     dtype: jnp.dtype = jnp.float32
-    """The computation's dtype, bfloat16 for speed; parameters stay at least float32 (`parameters_of`)
-    and the latents' distributions in at least float32."""
+    """The computation's dtype, bfloat16 for speed; parameters stay at least float32 (`at_least_fp32`),
+    so a bfloat16 computation updates float32 weights (DreamerV3's COMPUTE_DTYPE beside its float32
+    parameters), and the latents' distributions are at least float32."""
 
     def setup(self) -> None:
-        dense = functools.partial(nn.Dense, dtype=self.dtype, param_dtype=parameters_of(self.dtype))
+        dense = functools.partial(nn.Dense, dtype=self.dtype, param_dtype=at_least_fp32(self.dtype))
         norm = functools.partial(nn.RMSNorm, epsilon=1e-6, dtype=self.dtype,
-                                 param_dtype=parameters_of(self.dtype))
+                                 param_dtype=at_least_fp32(self.dtype))
         self.embed = dense(self.width)
         self.start = self.param("start", nn.initializers.normal(0.02), (self.width,),
-                                parameters_of(self.dtype))
+                                at_least_fp32(self.dtype))
         self.blocks = [_Block(self.width, self.heads, self.ffup, self.dtype) for _ in range(self.layers)]
         self.out_norm = norm()
         self.prior_layers = [(dense(self.width), norm()) for _ in range(2)]
@@ -221,4 +217,4 @@ def _segments(first: jax.Array) -> tuple[jax.Array, jax.Array]:
     return segment, index - began
 
 
-__all__ = ["TSSM", "Cache", "parameters_of"]
+__all__ = ["TSSM", "Cache"]

@@ -52,11 +52,13 @@ class _MLP(nn.Module):
 class ActorCritic(nn.Module):
     """Brax PPO's networks over a flat observation: the policy MLP's location and raw scale of each
     of `action_size` action dimensions, and the value MLP's one value. Brax's DM Control widths:
-    four layers of 32 for the policy, five of 256 for the value."""
+    four layers of 32 for the policy, five of 256 for the value. `spread` multiplies the policy's scale:
+    below 1, a policy explores less from the start (a drone's first rollouts fly rather than tumble)."""
 
     action_size: int
     policy_layers: Sequence[int] = (32, 32, 32, 32)
     value_layers: Sequence[int] = (256, 256, 256, 256, 256)
+    spread: float = 1.0
 
     def setup(self) -> None:
         self.policy_net = _MLP(tuple(self.policy_layers), 2 * self.action_size)
@@ -69,7 +71,7 @@ class ActorCritic(nn.Module):
     def policy(self, observation: jax.Array) -> tuple[jax.Array, jax.Array]:
         """The normal's location and scale before the tanh, each `[..., action_size]`."""
         location, raw = jnp.split(self.policy_net(observation), 2, axis=-1)
-        return location, jax.nn.softplus(raw) + _MIN_STD
+        return location, (jax.nn.softplus(raw) + _MIN_STD) * self.spread
 
     def value(self, observation: jax.Array) -> jax.Array:
         return self.value_net(observation)[..., 0]

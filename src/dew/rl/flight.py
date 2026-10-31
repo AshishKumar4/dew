@@ -74,7 +74,8 @@ class Racing:
     reward's weights are `raced`'s; `hz` the control rate, 60 Hz (a teacher at 60 Hz passed 27% more gates
     than at 30 in the same time and crashed less; Swift's and Song's run at 90 to 100 Hz); an episode is
     cut after `episode_seconds` (Swift's 1500 steps). Gates' openings are `opening` square (1.5 m,
-    SkyDreamer's and Ferede's) in a frame `frame` wide; the drone is a sphere of `radius`. `spread` is each
+    SkyDreamer's and Ferede's) in a frame `frame` wide and `depth` deep; the drone collides as a cube of
+    half-width `radius` aligned with the gate it meets (`struck`). `spread` is each
     drone parameter's randomization about nominal, `latency` the command latency's range in seconds, `lag`
     the rate response's time constant's, `uptilt` the camera's tilt above the body's forward axis in
     degrees, `fov` its horizontal field of view and `fov_spread` and `mount_spread` their randomization,
@@ -88,6 +89,7 @@ class Racing:
     episode_seconds: float = 25.0
     opening: float = 1.5
     frame: float = 0.25
+    depth: float = 0.1
     radius: float = 0.2
     progress_scale: float = 1.0
     rate_cost: float = 1.0
@@ -165,9 +167,9 @@ class Airframe:
 class Track:
     """Each drone's episode: its course's gates `[B, G, 3]`, their facings `[B, G]` (radians) and count
     `[B]`; the gate it heads for, its distance from it after the last step, the steps taken and the gates
-    passed; the last
-    action, the rates' command after its lag and the commands awaiting their latency `[B, L, 4]`; and its
-    `Airframe`."""
+    passed; the last action, the rates' command after its lag, and the commands awaiting their latency
+    `[B, L, 4]` (each a collective acceleration in g and body rates in radians a second, hovering at the
+    start); and its `Airframe`."""
 
     course: jax.Array
     facing: jax.Array
@@ -207,49 +209,74 @@ def _layout_courses() -> tuple[np.ndarray, np.ndarray]:
     and its gate count."""
     courses, counts = [], []
     for name in LAYOUTS:
-        gates = np.asarray(LAYOUTS[name], np.float32)
+        gates = np.asarray(LAYOUTS[name])
         gates = gates - np.r_[gates[:, :2].mean(0), 0.0]
         courses.append(np.concatenate([gates, np.repeat(gates[:1], GATES - len(gates), 0)]))
         counts.append(len(gates))
     return np.stack(courses), np.asarray(counts, np.int32)
 
 
-def random_loop(key: jax.Array, difficulty: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """A random closed loop `[GATES, 3]` of 6 to 12 gates and its count: gates about an ellipse of radii 12 to
-    30 m, flown either way round, each moved along the ellipse and across it by up to a quarter of the
-    spacing and up to 3 m, and between 1.5 and 1.5 + 4.5 m high, the moves and heights growing with
-    `difficulty`."""
-    count_key, radii_key, turn_key, along_key, across_key, height_key, way_key = jax.random.split(key, 7)
-    count = jax.random.randint(count_key, (), 6, GATES + 1)
-    radii = jax.random.uniform(radii_key, (2,), minval=12.0, maxval=30.0)
-    step = 2 * jnp.pi / count
+@struct.dataclass
+class CourseDraw:
+    """An episode's course's draws, each uniform in its range: the layout (`which`, its index in `LAYOUTS`)
+    and each of its gates' move `[G, 3]` in [-1, 1]; whether the course is a random loop instead; and the
+    loop's gate count (6 to `GATES`), its ellipse's radii `[2]` (12 to 30 m), its turn (0 to 2 pi), each
+    gate's move along the ellipse `[G]` (-1/4 to 1/4 of the gates' spacing) and across it (-0.1 to 0.1 of
+    its radius), and height `[G]` (0 to 4.5 m), and whether it is flown anticlockwise."""
+
+    which: jax.Array
+    moved: jax.Array
+    looped: jax.Array
+    count: jax.Array
+    radii: jax.Array
+    turn: jax.Array
+    along: jax.Array
+    across: jax.Array
+    height: jax.Array
+    anticlockwise: jax.Array
+
+
+def course_draws(racing: Racing, key: jax.Array) -> CourseDraw:
+    """An episode's course's draws (`CourseDraw`): its layout one of `racing.layouts`, alike likely, and a
+    random loop with `random_share`."""
+    kept = np.asarray([name in racing.layouts for name in LAYOUTS])
+    keys = iter(jax.random.split(key, 10))
+
+    def within(low, high, shape=()):
+        return jax.random.uniform(next(keys), shape, minval=low, maxval=high)
+
+    return CourseDraw(which=jax.random.choice(next(keys), len(LAYOUTS), p=jnp.asarray(kept / kept.sum())),
+                      moved=within(-1.0, 1.0, (GATES, 3)), looped=within(0.0, 1.0) < racing.random_share,
+                      count=jax.random.randint(next(keys), (), 6, GATES + 1), radii=within(12.0, 30.0, (2,)),
+                      turn=within(0.0, 2 * jnp.pi), along=within(-0.25, 0.25, (GATES,)),
+                      across=within(-0.1, 0.1, (GATES,)), height=within(0.0, 4.5, (GATES,)),
+                      anticlockwise=jax.random.bernoulli(next(keys)))
+
+
+def course_of(racing: Racing, drawn: CourseDraw, difficulty: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """An episode's course `[GATES, 3]` and gate count from its draws at `difficulty`: its layout, each
+    gate moved by its move times `jitter` across and up, times the difficulty, and held at least 0.75 m
+    high; or its random loop, gates spaced evenly about an ellipse (each moved along and across it by its
+    moves times the difficulty), turned, flown its way round, and 1.5 m high plus its height times the
+    difficulty, the course's unused gates its first."""
+    courses, counts = _layout_courses()
+    reach = jnp.asarray([racing.jitter[0], racing.jitter[0], racing.jitter[1]])
+    layout = jnp.asarray(courses)[drawn.which] + difficulty * drawn.moved * reach
+    layout = layout.at[:, 2].set(jnp.maximum(layout[:, 2], 0.75))
     order = jnp.arange(GATES)
-    moved = jax.random.uniform(along_key, (GATES,), minval=-0.25, maxval=0.25)
-    angle = (order + difficulty * moved) * step
-    turned = jax.random.uniform(turn_key, (), maxval=2 * jnp.pi)
-    angle = jnp.where(jax.random.bernoulli(way_key), angle, -angle) + turned
-    across = 1 + difficulty * jax.random.uniform(across_key, (GATES,), minval=-0.1, maxval=0.1)
-    height = 1.5 + difficulty * jax.random.uniform(height_key, (GATES,), maxval=4.5)
-    gates = jnp.stack([radii[0] * across * jnp.cos(angle), radii[1] * across * jnp.sin(angle), height], -1)
-    return jnp.where((order < count)[:, None], gates, gates[0]), count
+    angle = (order + difficulty * drawn.along) * (2 * jnp.pi / drawn.count)
+    angle = jnp.where(drawn.anticlockwise, angle, -angle) + drawn.turn
+    spread = 1 + difficulty * drawn.across
+    loop = jnp.stack([drawn.radii[0] * spread * jnp.cos(angle), drawn.radii[1] * spread * jnp.sin(angle),
+                      1.5 + difficulty * drawn.height], -1)
+    loop = jnp.where((order < drawn.count)[:, None], loop, loop[0])
+    return (jnp.where(drawn.looped, loop, layout),
+            jnp.where(drawn.looped, drawn.count, jnp.asarray(counts)[drawn.which]))
 
 
 def drawn_track(racing: Racing, key: jax.Array, difficulty: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """An episode's course `[GATES, 3]` and gate count: one of `racing.layouts`, its gates each moved by up
-    to `jitter` across and up (at `difficulty`) and no lower than 0.75 m, or with `random_share` a random
-    loop (`random_loop`)."""
-    courses, counts = _layout_courses()
-    kept = np.asarray([name in racing.layouts for name in LAYOUTS])
-    pick_key, jitter_key, loop_key, kind_key = jax.random.split(key, 4)
-    which = jax.random.choice(pick_key, len(LAYOUTS), p=jnp.asarray(kept / kept.sum(), jnp.float32))
-    across, up = racing.jitter
-    reach = jnp.asarray([across, across, up])
-    moved = jax.random.uniform(jitter_key, (GATES, 3), minval=-1.0, maxval=1.0) * reach
-    layout = jnp.asarray(courses)[which] + difficulty * moved
-    layout = layout.at[:, 2].set(jnp.maximum(layout[:, 2], 0.75))
-    loop, loop_count = random_loop(loop_key, difficulty)
-    looped = jax.random.uniform(kind_key) < racing.random_share
-    return jnp.where(looped, loop, layout), jnp.where(looped, loop_count, jnp.asarray(counts)[which])
+    """An episode's course `[GATES, 3]` and gate count drawn from `key` (`course_draws`, `course_of`)."""
+    return course_of(racing, course_draws(racing, key), difficulty)
 
 
 def quaternion(roll: jax.Array, pitch: jax.Array, yaw: jax.Array) -> jax.Array:
@@ -313,9 +340,10 @@ def started(racing: Racing, key: jax.Array, difficulty: jax.Array) -> tuple[Trac
     orientation = quaternion(roll, pitch, facing[index] + yaw)
     airframe = drawn_airframe(racing, airframe_key)
     longest = racing.delays[1]
+    hovering = jnp.tile(jnp.asarray([1.0, 0.0, 0.0, 0.0]), (longest + 1, 1))
     track = Track(course, facing, count, index, jnp.linalg.norm(course[index] - position),
-                  jnp.zeros((), jnp.int32), jnp.zeros((), jnp.int32), jnp.zeros(4), jnp.zeros(3),
-                  jnp.zeros((longest + 1, 4)), airframe)
+                  jnp.zeros((), jnp.int32), jnp.zeros((), jnp.int32), jnp.zeros(4), jnp.zeros(3), hovering,
+                  airframe)
     return track, position, orientation
 
 
@@ -325,41 +353,70 @@ def commanded(racing: Racing, track: Track, action: jax.Array, thrust_to_weight:
     collective acceleration's range (0 to `thrust_to_weight` g) and its rate range (`rate_limit`), and the
     track after it. The throttle is a share of the drone's own full thrust, `racing`'s nominal times its
     factor, the hover at zero; the rates its limit's share, through the drone's lag; the command then waits
-    out the drone's latency (`Track.pending`)."""
+    out the drone's latency (`Track.pending`), the drone hovering until its first command arrives."""
     action = jnp.clip(action, -1, 1)
     airframe = track.airframe
     strongest = airframe.thrust * thrust_to_weight / (1 + racing.spread)
     hover = 1 / strongest
     throttle = hover + action[:, 0] * jnp.where(action[:, 0] >= 0, 1 - hover, hover)
-    collective = 2 * throttle * strongest / thrust_to_weight - 1
     wanted = action[:, 1:] * (airframe.rates * racing.rate_limit)[:, None]
     rates = track.rates + airframe.smoothing[:, None] * (wanted - track.rates)
-    command = jnp.concatenate([collective[:, None], rates / rate_limit], -1)
+    command = jnp.concatenate([(throttle * strongest)[:, None], rates], -1)
     pending = jnp.concatenate([command[:, None], track.pending[:, :-1]], 1)
     sent = pending[jnp.arange(pending.shape[0]), airframe.delay]
-    return track.replace(rates=rates, pending=pending), jnp.clip(sent, -1, 1)
+    normalized = jnp.concatenate([2 * sent[:, :1] / thrust_to_weight - 1, sent[:, 1:] / rate_limit], -1)
+    return track.replace(rates=rates, pending=pending), jnp.clip(normalized, -1, 1)
+
+
+def bars(racing: Racing) -> np.ndarray:
+    """A gate's four frame bars `[4, 3, 2]`, each a box's extent along the gate's normal, its left and up
+    from its centre, grown by the drone's `radius` on every side: where the drone's centre meets the
+    frame."""
+    half, deep = racing.opening / 2, racing.depth / 2
+    edge = half + racing.frame
+    boxes = np.asarray([[(-deep, deep), (-edge, edge), (half, edge)],
+                        [(-deep, deep), (-edge, edge), (-edge, -half)],
+                        [(-deep, deep), (half, edge), (-half, half)],
+                        [(-deep, deep), (-edge, -half), (-half, half)]])
+    return boxes + np.asarray([-racing.radius, racing.radius])
 
 
 def struck(racing: Racing, track: Track, path: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Where each drone's path through a step `[B, S + 1, 3]` (its positions before it and after each
     physics step, each pair joined by a straight segment) crashed, passed the gate it heads for, and how far
     across from its centre it passed, `[B]` each. It crashes on coming within `radius` of the ground or
-    climbing past `ceiling`, on crossing a gate's plane where its sphere overlaps the frame, or on crossing
-    the next gate's plane in its direction outside the opening within `miss_radius` (a missed gate). It
-    passes that gate on crossing its plane in its direction with its sphere inside the opening."""
+    climbing past `ceiling`, on a segment entering the inside of a gate's frame bar grown by `radius`
+    (`bars`), or on crossing the next gate's plane in its direction outside the opening's frame within
+    `miss_radius` (a missed gate). It passes that gate on crossing its plane in its direction with its
+    centre within `radius` of the opening's inside, the larger of its offsets across and up from the
+    centre (`across`) no more than half the opening less `radius`."""
     grounded = jnp.any((path[:, 1:, 2] < racing.radius) | (path[:, 1:, 2] > racing.ceiling), -1)
     normal, left = _gate_axes(track.facing[:, None])
+    up = jnp.broadcast_to(jnp.asarray([0.0, 0.0, 1.0], normal.dtype), normal.shape)
+    frame = jnp.stack([normal, left, up], -1)  # [B, 1, G, 3 (world), 3 (gate)]
     begin, end = path[:, :-1, None], path[:, 1:, None]
     center = track.course[:, None]
-    before, after = (jnp.sum((point - center) * normal, -1) for point in (begin, end))
+    near, far = (jnp.einsum("bsgi,bsgij->bsgj", point - center, frame) for point in (begin, end))
+    # The segment meets a bar's open box where the parameters at which it is inside each axis's open
+    # interval overlap (Liang-Barsky's clipping).
+    boxes = jnp.asarray(bars(racing), path.dtype)
+    start, along = near[..., None, :], (far - near)[..., None, :]
+    still = along == 0
+    step = jnp.where(still, 1.0, along)
+    low, high = (boxes[..., 0] - start) / step, (boxes[..., 1] - start) / step
+    entered = jnp.max(jnp.where(still, -jnp.inf, jnp.minimum(low, high)), -1)
+    left_at = jnp.min(jnp.where(still, jnp.inf, jnp.maximum(low, high)), -1)
+    inside = jnp.all(~still | ((boxes[..., 0] < start) & (start < boxes[..., 1])), -1)
+    met = inside & (jnp.maximum(entered, 0.0) < jnp.minimum(left_at, 1.0))
+    active = (jnp.arange(track.course.shape[1]) < track.count[:, None])[:, None]
+    framed = jnp.any(met, -1) & active
+    before, after = near[..., 0], far[..., 0]
     crossing = (before * after <= 0) & (before != after)
     share = before / jnp.where(before != after, before - after, 1.0)
-    offset = begin + share[..., None] * (end - begin) - center
-    across = jnp.maximum(jnp.abs(jnp.sum(offset * left, -1)), jnp.abs(offset[..., 2]))
+    offset = near + share[..., None] * (far - near)
+    across = jnp.maximum(jnp.abs(offset[..., 1]), jnp.abs(offset[..., 2]))
     half = racing.opening / 2
-    active = (jnp.arange(track.course.shape[1]) < track.count[:, None])[:, None]
     inner, outer = half - racing.radius, half + racing.frame + racing.radius
-    framed = crossing & active & (across > inner) & (across < outer)
     target = jax.nn.one_hot(track.index, track.course.shape[1], dtype=bool)[:, None]
     forward = crossing & target & (before < 0)
     passed = forward & (across <= inner)
@@ -542,7 +599,7 @@ class GateRace:
         return TimeStep(self._observed(kinematics), reward, terminated, truncated)
 
 
-__all__ = ["GATES", "LAYOUTS", "VIEWS", "Airframe", "FlightBackend", "GateRace", "Gates", "Kinematics",
-           "Racing", "Track", "cameras", "commanded", "corners", "drawn_airframe", "drawn_track", "facings",
-           "privileged",
-           "quaternion", "raced", "random_loop", "rotation", "started", "struck"]
+__all__ = ["GATES", "LAYOUTS", "VIEWS", "Airframe", "CourseDraw", "FlightBackend", "GateRace", "Gates",
+           "Kinematics", "Racing", "Track", "bars", "cameras", "commanded", "corners", "course_draws",
+           "course_of", "drawn_airframe", "drawn_track", "facings", "privileged", "quaternion", "raced",
+           "rotation", "started", "struck"]

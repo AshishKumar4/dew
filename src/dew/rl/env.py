@@ -63,11 +63,25 @@ class _Limited:
     steps: jax.Array
 
 
+def _held(ended: jax.Array, held: Any, following: Any) -> Any:  # noqa: ANN401
+    """`held` where `ended` holds, else `following`, leaf by leaf, `ended` along the leaves' leading axes
+    and a key leaf chosen by its data."""
+    def pick(old: jax.Array, new: jax.Array) -> jax.Array:
+        if jax.dtypes.issubdtype(old.dtype, jax.dtypes.prng_key):
+            data = pick(jax.random.key_data(old), jax.random.key_data(new))
+            return jax.random.wrap_key_data(data, impl=jax.random.key_impl(old))
+        return jnp.where(ended.reshape(ended.shape + (1,) * (old.ndim - ended.ndim)), old, new)
+
+    return jax.tree.map(pick, held, following)
+
+
 @struct.dataclass
 class TimeLimit:
     """`env` whose episodes are cut after `episode_length` steps, each step repeating its action
     `action_repeat` times and summing their rewards (Brax's EpisodeWrapper, which Playground's
-    training wraps its environments in): a cut episode is `truncated`, not `terminated`."""
+    training wraps its environments in): a cut episode is `truncated`, not `terminated`. An episode `env`
+    itself ends, terminated or truncated, ends there: within a repeat it is held as it ended, earning
+    nothing more."""
 
     env: Env = struct.field(pytree_node=False)
     episode_length: int = struct.field(pytree_node=False, default=1000)
@@ -83,18 +97,22 @@ class TimeLimit:
 
     def step(self, state: _Limited, action: jax.Array) -> tuple[_Limited, TimeStep]:
         def repeated(carry, _):
-            inner, reward, terminated = carry
-            inner, step = self.env.step(inner, action)
-            # A terminated episode earns nothing more within the repeat.
-            return (inner, reward + jnp.where(terminated, 0, step.reward), terminated | step.terminated), step
+            inner, step = carry
+            ended = step.terminated | step.truncated
+            following, stepped = self.env.step(inner, action)
+            # An episode that ended within the repeat is held as it ended and earns nothing more.
+            inner = _held(ended, inner, following)
+            step = TimeStep(_held(ended, step.observation, stepped.observation),
+                            step.reward + jnp.where(ended, 0, stepped.reward),
+                            step.terminated | (~ended & stepped.terminated),
+                            step.truncated | (~ended & stepped.truncated))
+            return (inner, step), None
 
-        first, initial = self.env.step(state.inner, action)
-        (inner, reward, terminated), last = jax.lax.scan(
-            repeated, (first, initial.reward, initial.terminated), None, length=self.action_repeat - 1)
-        last = initial if self.action_repeat == 1 else jax.tree.map(lambda leaf: leaf[-1], last)
+        (inner, step), _ = jax.lax.scan(repeated, self.env.step(state.inner, action), None,
+                                        length=self.action_repeat - 1)
         steps = state.steps + 1
-        return _Limited(inner, steps), TimeStep(last.observation, reward, terminated,
-                                               ~terminated & (steps >= self.episode_length))
+        cut = ~step.terminated & (step.truncated | (steps >= self.episode_length))
+        return _Limited(inner, steps), TimeStep(step.observation, step.reward, step.terminated, cut)
 
 
 @struct.dataclass

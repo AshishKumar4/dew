@@ -41,6 +41,49 @@ class Walk:
         return x, TimeStep(x[None], -jnp.square(x), jnp.abs(x) > self.limit, jnp.zeros((), bool))
 
 
+@struct.dataclass
+class Counter:
+    """A count raised by one each step and paid as its value, its episode ended by the environment
+    itself: terminated at `stop`, truncated at `cut`."""
+
+    stop: int = struct.field(pytree_node=False)
+    cut: int = struct.field(pytree_node=False)
+    action_size: int = struct.field(pytree_node=False, default=1)
+
+    def reset(self, key):
+        return jnp.zeros(()), TimeStep(jnp.zeros(1), jnp.zeros(()), jnp.zeros((), bool), jnp.zeros((), bool))
+
+    def step(self, x, action):
+        x = x + 1
+        return x, TimeStep(x[None], x, x == self.stop, x == self.cut)
+
+
+@pytest.mark.parametrize(("stop", "cut", "repeat"),
+                         [(99, 2, 1), (2, 99, 3), (99, 2, 3), (99, 99, 2), (3, 3, 2)])
+def test_a_time_limit_keeps_the_ends_its_environment_reports(stop, cut, repeat):
+    """A time limit of 4 steps over a count its environment terminates or truncates by itself, each step
+    repeating its action: every step's observation, reward and ends are a step-by-step loop's until the
+    episode ends, the environment's own end reported where it falls, a step's repeats after it neither
+    stepping nor paying, and the limit's own cut where the environment's falls later."""
+    env = TimeLimit(Counter(stop, cut), episode_length=4, action_repeat=repeat)
+    state, _ = env.reset(jax.random.key(0))
+    step = jax.jit(env.step)
+    x = 0
+    for _ in range(4):
+        reward, terminated, truncated = 0, False, False
+        for _ in range(repeat):
+            if not (terminated or truncated):
+                x += 1
+                reward, terminated, truncated = reward + x, x == stop, x == cut
+        state, stepped = step(state, jnp.zeros(1))
+        truncated = not terminated and (truncated or int(state.steps) >= 4)
+        np.testing.assert_array_equal(np.asarray(stepped.observation), [x])
+        assert (float(stepped.reward), bool(stepped.terminated), bool(stepped.truncated)) == (
+            reward, terminated, truncated)
+        if terminated or truncated:
+            break
+
+
 def pushes(params, observation, key, memory):
     """A policy pushing each point by the sign of a drawn number, half a step a time."""
     return 0.5 * jnp.sign(jax.random.normal(key, (observation.shape[0], 1))), {}, None
@@ -104,6 +147,18 @@ def test_the_squashed_normals_log_density_is_the_change_of_variables():
     normal = -0.5 * ((raw - location) / scale) ** 2 - np.log(scale * np.sqrt(2 * np.pi))
     expected = np.sum(normal - np.log1p(-np.tanh(raw) ** 2), axis=-1)
     assert_computes_the_oracle(found, expected, "the squashed normal's log-density", roundings=roundings)
+
+
+def test_an_actor_critics_spread_multiplies_its_policys_scale():
+    """An actor-critic of spread 0.2 answers the location of one of spread 1 with the same weights, and a
+    fifth of its scale, bit for bit."""
+    observation = jnp.asarray(np.random.default_rng([532, 10]).normal(size=(8, 5)), jnp.float32)
+    held = ActorCritic(3).init(jax.random.key(0), observation)
+    location, scale = ActorCritic(3).apply(held, observation, method=ActorCritic.policy)
+    narrow = ActorCritic(3, spread=0.2)
+    narrow_location, narrow_scale = narrow.apply(held, observation, method=ActorCritic.policy)
+    np.testing.assert_array_equal(np.asarray(narrow_location), np.asarray(location))
+    np.testing.assert_array_equal(np.asarray(narrow_scale), np.asarray(scale * np.float32(0.2)))
 
 
 def test_advantages_are_brax_two_passes_over_each_sequence():

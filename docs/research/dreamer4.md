@@ -6,12 +6,15 @@ arXiv 2509.24527v1 (29 September 2025). No official code exists: the project pag
 does not exist. Everything below is the paper's, by equation and section; what the paper leaves
 open is listed last and is chosen, never inferred, by an implementation.
 
-Dew implements the world model's core, the shortcut-forcing dynamics over a causal tokenizer's
-latents, in `dew.objectives.world_model` (`ShortcutForcing`), with a diffusion-forcing baseline
-(`DiffusionForcing`) on the same model and data, and a small reproduction of the paper's claim
-that shortcut forcing generates at four steps what diffusion forcing needs many for
-(`tools/dreamer4_reproduction.py`). The agent (behaviour cloning, reward model and PMPO in
-imagination) is specified here and reuses DreamerV3's two-hot heads (`dew.rl.distributions`).
+Dew implements the world model's core in `dew.objectives.world_model`: a causal tokenizer
+(`CausalTokenizer`, trained by `TokenizerObjective`) and the dynamics over its latents (`Dynamics`), trained
+by shortcut forcing (`WorldModelObjective`) or, with `shortcut=False`, by diffusion forcing on the same model
+and data. `python tools/rl_acceptance.py dreamer4 OUT` compares the two on bouncing balls: both are trained
+for the same steps, and their open-loop predictions after held-out context frames are scored at 4 sampling
+steps and at 64. This tests the paper's claim that shortcut forcing generates at four steps what diffusion
+forcing needs many steps for. The comparison is a tool to run; its result is not recorded here. The agent
+(behaviour cloning, reward model and PMPO in imagination) is specified here and reuses DreamerV3's two-hot
+heads (`dew.rl.distributions`).
 
 ## Pipeline (Algorithm 1)
 

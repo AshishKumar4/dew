@@ -167,7 +167,7 @@ def dreamer(
     trainer = Trainer(objective, laprop(), key=jax.random.key(0), rollout=rollout, tracker=tracker)
     updates = int(environment_steps * rollout.train_ratio / (rollout.batch * rollout.length))
     final = trainer.fit(_idle(len(jax.devices())), steps=updates, log_every=1000)
-    evaluated = episodes_return(objective, playground(task, envs), final.variables, jax.random.key(1), 1001)
+    evaluated = episodes_return(objective, playground(task, envs), final.variables, jax.random.key(1), 1000)
     report = {
         "task": task,
         "environment_steps": rollout.environment_steps,

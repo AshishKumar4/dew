@@ -47,12 +47,13 @@ def thrust_to_weight(model: dict) -> float:
     return float(thrust / (model["mass"] * np.linalg.norm(model["gravity"])))
 
 
-def _gate(opening: float, frame: float) -> Any:  # noqa: ANN401
-    """A square gate facing along x: four bars `frame` wide about an opening `opening` wide."""
+def _gate(opening: float, frame: float, depth: float) -> Any:  # noqa: ANN401
+    """A square gate facing along x: four bars `frame` wide and `depth` deep about an opening `opening`
+    wide."""
     import hyperlux
     from hyperlux.primitives import box
 
-    assembly, half, depth = hyperlux.ObjectAssembly(), opening / 2 + frame / 2, 0.1
+    assembly, half = hyperlux.ObjectAssembly(), opening / 2 + frame / 2
     outer = opening + 2 * frame
     for size, position in (((depth, outer, frame), (0, 0, half)), ((depth, outer, frame), (0, 0, -half)),
                            ((depth, frame, opening), (0, half, 0)), ((depth, frame, opening), (0, -half, 0))):
@@ -81,14 +82,15 @@ class HyperDroneFlight:
     `1 / hz` seconds `substeps` physics steps, commanded up to the model's thrust-to-weight and
     `rate_limit` radians a second, each times `headroom` (the race's randomization's, 1 + `Racing.spread`);
     each drone's camera `size` pixels square over a ground of `extent` metres a side and its course's up to
-    `gates` gates of `opening` and `frame` (the race's `Racing.opening` and `frame`). Its image is
-    `[count, size, size, 3]` uint8."""
+    `gates` gates of `opening`, `frame` and `depth` (the race's `Racing.opening`, `frame` and `depth`). Its
+    image is `[count, size, size, 3]` uint8."""
 
     aspect = 1.0
 
     def __init__(self, count: int, gates: int, *, size: int = 96, model: str = "flightmare",
                  hz: float = 60.0, substeps: int = 2, rate_limit: float = 10.0, headroom: float = 1.2,
-                 opening: float = 1.5, frame: float = 0.25, extent: float = 200.0, tile: float = 5.0,
+                 opening: float = 1.5, frame: float = 0.25, depth: float = 0.1, extent: float = 200.0,
+                 tile: float = 5.0,
                  seed: int = 0, device: str = "cuda"):
         from hyperdrone import dynamics
 
@@ -101,7 +103,7 @@ class HyperDroneFlight:
         ideal = {"thrust_to_weight": self.thrust_to_weight, "rate_limit": [self.rate_limit] * 3}
         self.sim = dynamics.Sim(count, parameters={"dynamics": {**shared, "ideal_rates": ideal}}, seed=seed,
                                 device=device, control="ctbr", actuation="ideal")
-        self._drawn = size, opening, frame, extent, tile
+        self._drawn = size, opening, frame, depth, extent, tile
         self.renderer = None
         self._bases = jax.jit(self._placed)
 
@@ -111,14 +113,14 @@ class HyperDroneFlight:
         import hyperlux
         from hyperlux.camera import RGB, CameraSpec
 
-        size, opening, frame, extent, tile = self._drawn
+        size, opening, frame, depth, extent, tile = self._drawn
         scene = hyperlux.Scene()
         scene.add_object(_ground(extent, tile))
         scene.add_light(hyperlux.SceneLight.directional(direction=(0.3, 0.2, -1.0), color=(1.0, 1.0, 1.0)))
         scene.add_light(hyperlux.SceneLight.directional(direction=(-0.5, 0.4, -0.3), color=(0.4, 0.4, 0.5)))
         scene.set_environment(ambient=(0.3, 0.3, 0.3), background=SKY)
         pool = hyperlux.AssetPool()
-        gate = pool.add_assembly(_gate(opening, frame))
+        gate = pool.add_assembly(_gate(opening, frame, depth))
         self._rgb = RGB("rgba8")
         self.renderer = hyperlux.HyperLux(
             size, size, batch_size=self.count, fidelity="medium", num_probes=0,

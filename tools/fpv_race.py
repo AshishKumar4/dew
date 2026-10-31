@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import itertools
 import json
+import math
 import time
 from pathlib import Path
 
@@ -54,43 +55,41 @@ def _idle() -> Loader:
 
 
 def race(drones: int, views: tuple[str, ...], *, hz: float = 60.0, size: int = 96):
-    """A gate race of `drones` drones on HyperDrone at `hz`, its physics at 90 Hz or the nearest rate a
-    whole number of steps a control step reaches."""
+    """A gate race of `drones` drones on HyperDrone at `hz`, its physics the fewest whole steps a control
+    step that reach 90 Hz."""
     from dew.rl.flight import GATES, GateRace, Racing
     from dew.rl.hyperdrone import HyperDroneFlight
 
     racing = Racing(hz=hz)
-    backend = HyperDroneFlight(drones, GATES, size=size, hz=hz, substeps=max(round(90 / hz), 1),
+    backend = HyperDroneFlight(drones, GATES, size=size, hz=hz, substeps=math.ceil(90 / hz),
                                rate_limit=racing.rate_limit, headroom=1 + racing.spread,
-                               opening=racing.opening, frame=racing.frame)
+                               opening=racing.opening, frame=racing.frame, depth=racing.depth)
     return GateRace(backend, racing, views=views)
 
 
 def teacher_objective():
-    """PPO over the teacher's view, its policy's spread a fifth of the actor-critic's at the start, so the
-    first rollouts fly rather than tumble."""
+    """PPO over the teacher's view, its policy's spread a fifth of the actor-critic's, so the first
+    rollouts fly rather than tumble."""
     from dew.objectives.rl.control import ActorCritic, ControlPPOObjective
 
-    class Steady(ActorCritic):
-        def policy(self, observation):
-            location, spread = super().policy(observation)
-            return location, spread / 5
-
-    return ControlPPOObjective(Steady(4, (256, 256, 256), (256, 256, 256, 256)), TEACHER_SIZE, discount=0.99,
-                               lam=0.95, clip=0.2, entropy_cost=1e-4, reads=("teacher",))
+    networks = ActorCritic(4, (256, 256, 256), (256, 256, 256, 256), spread=0.2)
+    return ControlPPOObjective(networks, TEACHER_SIZE, discount=0.99, lam=0.95, clip=0.2, entropy_cost=1e-4,
+                               reads=("teacher",))
 
 
 def scored(simulator, policy, params, memory, key: jax.Array, steps: int, *,
            film: Path | None = None) -> dict:
-    """Each drone's first episode under `policy` (reading the driven step whole): its return, gates
-    passed, whether it crashed and its steps, averaged over the drones; with `film`, the first four
-    drones' camera images over the steps written there `[steps, 4, H, W, 3]`."""
+    """Each drone's first episode under `policy` (reading the driven step whole) over `steps` steps from
+    fresh episodes of `simulator`, an evaluation race of its own: its return, gates passed, whether it
+    crashed and its steps, averaged over the drones, each read from the transitions the steps reach up to
+    the episode's last; with `film`, the first four drones' camera images after each step written there
+    `[steps, 4, H, W, 3]`."""
     from dew.rl.simulator import DrivenSimulator, simulator_rollout, simulator_start
 
     driven = DrivenSimulator(simulator)
     _, taken = simulator_rollout(driven, policy, params, simulator_start(driven, key, memory), steps,
                                  reset=False)
-    observed = jax.device_get(taken.observation)
+    observed = jax.device_get(taken.following.observation)
     if film is not None:
         np.savez_compressed(film, frames=observed["observation"]["image"][:, :4])
     ended = np.cumsum(observed["last"], 0) - observed["last"] > 0
@@ -99,7 +98,7 @@ def scored(simulator, policy, params, memory, key: jax.Array, steps: int, *,
     return {"return": float(reward.sum(0).mean()), "gates": float(passed.mean()),
             "gates_max": int(passed.max()),
             "crashed": float((observed["terminal"] & ~ended).any(0).mean()),
-            "steps": float((~ended).sum(0).mean() - 1)}
+            "steps": float((~ended).sum(0).mean())}
 
 
 def teacher_policy(objective):
@@ -149,7 +148,8 @@ def teacher(out: Path, *, seconds: float = 6600.0, drones: int = 4096, hz: float
     from dew.training import Trainer
 
     simulator = race(drones, ("teacher", "passed"), hz=hz)
-    simulator.difficulty = 0.2
+    judged = race(1024, ("teacher", "passed"), hz=hz)
+    simulator.difficulty = judged.difficulty = 0.2
     objective = teacher_objective()
     rollout = ControlRollout(objective, simulator, unroll_length=round(32 * hz / 30), epochs=4,
                              minibatches=32)
@@ -164,7 +164,7 @@ def teacher(out: Path, *, seconds: float = 6600.0, drones: int = 4096, hz: float
         point = {"updates": updates, "seconds": round(time.perf_counter() - began, 1),
                  "environment_steps": updates // (rollout.epochs * rollout.minibatches) * drones
                  * rollout.unroll_length, "difficulty": simulator.difficulty,
-                 **scored(simulator, teacher_policy(objective), state.variables, None, jax.random.key(1),
+                 **scored(judged, teacher_policy(objective), state.variables, None, jax.random.key(1),
                           horizon)}
         report["curve"].append(point)
         print(json.dumps(point), flush=True)
@@ -172,12 +172,12 @@ def teacher(out: Path, *, seconds: float = 6600.0, drones: int = 4096, hz: float
             best = simulator.difficulty, point["return"]
             (out / "teacher.msgpack").write_bytes(serialization.to_bytes(jax.device_get(state.variables)))
         if point["crashed"] < 1 / 3:
-            simulator.difficulty = min(1.0, simulator.difficulty + 0.1)
+            simulator.difficulty = judged.difficulty = min(1.0, simulator.difficulty + 0.1)
         (out / "teacher.json").write_text(json.dumps(report, indent=1))
     kept = (out / "teacher.msgpack").read_bytes()
     variables = serialization.from_bytes(jax.device_get(state.variables), kept)
-    report["best"] = {"difficulty": best[0], **scored(simulator, teacher_policy(objective), variables, None,
-                                                      jax.random.key(2), simulator.racing.max_steps)}
+    report["best"] = {"difficulty": best[0], **scored(judged, teacher_policy(objective), variables, None,
+                                                      jax.random.key(2), judged.racing.max_steps)}
     (out / "teacher.json").write_text(json.dumps(report, indent=1))
     return report
 
@@ -196,16 +196,17 @@ def demonstrations(simulator, objective, variables, steps: int, capacity: int):
 
 
 def world(out: Path, *, teacher_weights: Path, drones: int = 16, hz: float = 60.0,
-          demonstration_seconds: float = 546.0, pretrain_updates: int = 50_000,
-          environment_seconds: float = 33_333.0, capacity_seconds: float = 1092.0) -> dict:
+          demonstration_seconds: float = 300.0, pretrain_updates: int = 50_000,
+          environment_seconds: float = 33_333.0, capacity_seconds: float = 600.0) -> dict:
     """FlyDreamer's agent at its size (TransDreamer's dynamics, bfloat16) on the image alone: pretrained on
     the teacher's demonstrations (FlyDreamer's `pretrain_wm` scales and behaviour cloning), then trained
     online at train ratio 128, starting from the demonstrations' replay; the teacher, the cloned agent and
     the online agent scored alike (world.json, pretrained.msgpack, world.msgpack), the online agent
     every 10,000 updates, and the cloned and the final agents' first drones filmed (cloned.npz,
-    video.npz). Each drone flies
-    `demonstration_seconds` for the demonstrations; the agent flies `environment_seconds` online over all
-    its drones (FlyDreamer's 1M steps at 30 Hz); the replay holds `capacity_seconds` a drone."""
+    video.npz), each on an evaluation race of its own. Each drone flies `demonstration_seconds` for the
+    demonstrations; the agent flies `environment_seconds` online over all its drones (FlyDreamer's 1M
+    steps at 30 Hz); the replay holds `capacity_seconds` a drone (16 GB of 96-pixel images over 16 drones at
+    60 Hz)."""
     from rl_acceptance import laprop
 
     from dew.objectives.rl.dreamer import DreamerRollout, DreamerV3Objective, WorldModel
@@ -214,12 +215,13 @@ def world(out: Path, *, teacher_weights: Path, drones: int = 16, hz: float = 60.
 
     scale = hz / 30
     length, imagination = round(64 * scale), round(15 * scale)
-    simulator = race(drones, ("image", "state", "gates", "airframe", "passed", "teacher"), hz=hz)
+    views = ("image", "state", "gates", "airframe", "passed", "teacher")
+    simulator, judged = race(drones, views, hz=hz), race(drones, views, hz=hz)
     horizon = simulator.racing.max_steps
     taught = teacher_objective()
     held = serialization.from_bytes(taught.init(jax.random.key(0)), teacher_weights.read_bytes())
     report = {"drones": drones, "hz": hz, "length": length, "imagination": imagination,
-              "teacher": scored(simulator, teacher_policy(taught), held, None, jax.random.key(4), horizon)}
+              "teacher": scored(judged, teacher_policy(taught), held, None, jax.random.key(4), horizon)}
     began = time.perf_counter()
     replay = demonstrations(simulator, taught, held, round(demonstration_seconds * hz),
                             round(capacity_seconds * hz))
@@ -243,7 +245,7 @@ def world(out: Path, *, teacher_weights: Path, drones: int = 16, hz: float = 60.
     report["pretrain_seconds"] = time.perf_counter() - began
     (out / "pretrained.msgpack").write_bytes(serialization.to_bytes(jax.device_get(pretrained.variables)))
     agent = DreamerV3Objective(model, imagination=imagination, variables=jax.device_get(pretrained.variables))
-    report["cloned"] = scored(simulator, agent.act, pretrained.variables, agent.memory(drones),
+    report["cloned"] = scored(judged, agent.act, pretrained.variables, agent.memory(drones),
                               jax.random.key(7), horizon, film=out / "cloned.npz")
     print(json.dumps(report), flush=True)
     (out / "world.json").write_text(json.dumps(report, indent=1))
@@ -256,13 +258,13 @@ def world(out: Path, *, teacher_weights: Path, drones: int = 16, hz: float = 60.
         state = trainer.fit(_idle(), steps=min(done, updates), log_every=1000, state=state)
         point = {"updates": min(done, updates), "environment_steps": rollout.environment_steps,
                  "seconds": time.perf_counter() - began, "episode_return": rollout.metrics["episode_return"],
-                 **scored(simulator, agent.act, state.variables, agent.memory(drones), jax.random.key(done),
+                 **scored(judged, agent.act, state.variables, agent.memory(drones), jax.random.key(done),
                           horizon)}
         report["online"].append(point)
         print(json.dumps(point), flush=True)
         (out / "world.msgpack").write_bytes(serialization.to_bytes(jax.device_get(state.variables)))
         (out / "world.json").write_text(json.dumps(report, indent=1))
-    report["online_agent"] = scored(simulator, agent.act, state.variables, agent.memory(drones),
+    report["online_agent"] = scored(judged, agent.act, state.variables, agent.memory(drones),
                                     jax.random.key(9), horizon, film=out / "video.npz")
     (out / "world.json").write_text(json.dumps(report, indent=1))
     return report

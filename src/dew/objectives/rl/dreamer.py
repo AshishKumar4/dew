@@ -36,8 +36,9 @@ import optax
 from flax import linen as nn, struct
 
 from dew.batch import Batch, Variables, merge, under
+from dew.nn.precision import at_least_fp32
 from dew.objectives.base import Aux, EMASpec, Objective, Ratio, Shown, Step
-from dew.objectives.rl.tssm import TSSM, Cache, parameters_of
+from dew.objectives.rl.tssm import TSSM, Cache
 from dew.rl.distributions import (
     categorical_kl,
     onehot_sample,
@@ -79,7 +80,7 @@ class _Layers(nn.Module):
 
     @nn.compact
     def __call__(self, x: jax.Array) -> jax.Array:
-        held = parameters_of(self.dtype)
+        held = at_least_fp32(self.dtype)
         for _ in range(self.count):
             x = nn.Dense(self.units, kernel_init=_init(), dtype=self.dtype, param_dtype=held)(x)
             x = nn.silu(nn.RMSNorm(epsilon=1e-4, dtype=self.dtype, param_dtype=held)(x))
@@ -97,7 +98,7 @@ class _BlockLinear(nn.Module):
     def __call__(self, x: jax.Array) -> jax.Array:
         grouped = x.reshape(*x.shape[:-1], self.blocks, x.shape[-1] // self.blocks)
         fan = grouped.shape[-1]
-        held = parameters_of(self.dtype)
+        held = at_least_fp32(self.dtype)
         kernel = self.param("kernel", _init(), (self.blocks, fan, self.features // self.blocks), held)
         bias = self.param("bias", nn.initializers.zeros, (self.features,), held)
         grouped, kernel, bias = (value.astype(self.dtype) for value in (grouped, kernel, bias))
@@ -121,10 +122,10 @@ class ConvEncoder(nn.Module):
         x = image.reshape(-1, *image.shape[-3:]).astype(self.dtype) / 255 - 0.5
         for stage, mult in enumerate(self.mults):
             x = nn.Conv(self.depth * mult, (self.kernel, self.kernel), padding="SAME", kernel_init=_init(),
-                        dtype=self.dtype, param_dtype=parameters_of(self.dtype), name=f"cnn{stage}")(x)
+                        dtype=self.dtype, param_dtype=at_least_fp32(self.dtype), name=f"cnn{stage}")(x)
             rows, height, width, channels = x.shape
             x = x.reshape(rows, height // 2, 2, width // 2, 2, channels).max((2, 4))
-            norm = nn.RMSNorm(epsilon=1e-4, dtype=self.dtype, param_dtype=parameters_of(self.dtype),
+            norm = nn.RMSNorm(epsilon=1e-4, dtype=self.dtype, param_dtype=at_least_fp32(self.dtype),
                               name=f"cnn{stage}norm")
             x = nn.silu(norm(x))
         return x.reshape(*lead, -1)
@@ -154,11 +155,11 @@ class ConvDecoder(nn.Module):
         shape = (height, width, depths[-1])
         size = math.prod(shape)
         dense = functools.partial(nn.Dense, kernel_init=_init(), dtype=self.dtype,
-                                  param_dtype=parameters_of(self.dtype))
+                                  param_dtype=at_least_fp32(self.dtype))
         conv = functools.partial(nn.Conv, kernel_size=(self.kernel, self.kernel), padding="SAME",
-                                 dtype=self.dtype, param_dtype=parameters_of(self.dtype))
+                                 dtype=self.dtype, param_dtype=at_least_fp32(self.dtype))
         norm = functools.partial(nn.RMSNorm, epsilon=1e-4, dtype=self.dtype,
-                                 param_dtype=parameters_of(self.dtype))
+                                 param_dtype=at_least_fp32(self.dtype))
         x0 = _BlockLinear(size, self.blocks, self.dtype, name="sp0")(deter.reshape(-1, deter.shape[-1]))
         # Each block's outputs its own channels of every position: '(g h w c) -> h w (g c)'.
         x0 = x0.reshape(-1, self.blocks, height, width, depths[-1] // self.blocks)
@@ -215,9 +216,9 @@ class WorldModel(nn.Module):
 
     def setup(self) -> None:
         dense = functools.partial(nn.Dense, kernel_init=_init(), dtype=self.dtype,
-                                  param_dtype=parameters_of(self.dtype))
+                                  param_dtype=at_least_fp32(self.dtype))
         norm = functools.partial(nn.RMSNorm, epsilon=1e-4, dtype=self.dtype,
-                                 param_dtype=parameters_of(self.dtype))
+                                 param_dtype=at_least_fp32(self.dtype))
         layers = functools.partial(_Layers, dtype=self.dtype)
         if self.image is None:
             self.encoder = layers(self.units, 3)
@@ -365,7 +366,7 @@ class Critic(nn.Module):
     @nn.compact
     def __call__(self, feature: jax.Array) -> jax.Array:
         logits = nn.Dense(self.bins, kernel_init=_init(0.0), dtype=self.dtype,
-                          param_dtype=parameters_of(self.dtype))(_Layers(self.units, 3, self.dtype)(feature))
+                          param_dtype=at_least_fp32(self.dtype))(_Layers(self.units, 3, self.dtype)(feature))
         return logits.astype(jnp.float32)
 
 
@@ -821,13 +822,13 @@ def demonstration_replay(episodes: Sequence[Mapping[str, np.ndarray]]) -> Replay
 def episodes_return(objective: DreamerV3Objective, env: Env | Simulator, variables: Variables, key: jax.Array,
                     steps: int) -> float:
     """The mean return of `env`'s environments, an `Env` or a `Simulator`, over `steps` steps of the agent
-    from fresh episodes, each episode summed from its first step: one episode each where `steps` is its
-    length."""
+    from fresh episodes: the rewards of every transition the steps reach, one episode each where `steps`
+    is its length."""
     if isinstance(env, Simulator):
         driven = DrivenSimulator(env)
         carry = simulator_start(driven, key, objective.memory(env.count))
         _, recorded = simulator_rollout(driven, objective.act, variables, carry, steps, reset=False)
-        return float(jnp.mean(jnp.sum(recorded.observation["reward"], axis=0)))
+        return float(jnp.mean(jnp.sum(recorded.following.observation["reward"], axis=0)))
     driven = Driven(env)
     count = env.reset(key)[1].reward.shape[0]
 
@@ -835,7 +836,7 @@ def episodes_return(objective: DreamerV3Objective, env: Env | Simulator, variabl
     def run(variables: Variables, key: jax.Array) -> jax.Array:
         carry = start(driven, key, objective.memory(count))
         _, recorded = env_rollout(driven, objective.act, variables, carry, steps, reset=False)
-        return jnp.mean(jnp.sum(recorded.observation["reward"], axis=0))
+        return jnp.mean(jnp.sum(recorded.following.observation["reward"], axis=0))
 
     return float(run(variables, key))
 
