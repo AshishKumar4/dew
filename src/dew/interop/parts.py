@@ -576,7 +576,9 @@ def _read_latent_attention(view: PartView) -> Mapping[str, object]:
     """DeepSeek V3's multi-head latent attention (GLM-4.7-Flash's): queries through a low-rank latent
     where `q_lora_rank` (whole otherwise), keys and values from one normed latent beside a shared rotated
     key, each head's query and key a rotated and an unrotated part (the `mla` mixer). Its latents are
-    normed at their own epsilon, which the mixer holds at `MultiHeadLatentAttention.norm_eps`."""
+    normed at their own epsilon, which the mixer holds at `MultiHeadLatentAttention.norm_eps`, and its
+    scale takes the yarn ramp's mscale off its config's rope record, the rotary's (`_rope`), as the
+    mixer's does off the layer's."""
     if not view.is_causal:
         raise Ambiguous("the attention is not causal")
     nope, rope = int(view.qk_nope_head_dim), int(view.qk_rope_head_dim)
@@ -586,7 +588,7 @@ def _read_latent_attention(view: PartView) -> Mapping[str, object]:
     if any(float(norm.variance_epsilon) != epsilon for norm in norms):
         raise Ambiguous(f"the latents are normed at an epsilon other than {epsilon}")
     heads = int(view.num_heads)
-    return {'num_heads': heads, 'num_kv_heads': heads // int(view.num_key_value_groups),
+    return {**_rope(view.config), 'num_heads': heads, 'num_kv_heads': heads // int(view.num_key_value_groups),
             'head_dim': nope + rope, 'qk_norm': False,
             'attention_bias': view.kv_a_proj_with_mqa.bias is not None,
             'attention_dropout_rate': float(view.attention_dropout),
@@ -615,6 +617,13 @@ def _read_experts(view: PartView) -> Mapping[str, object]:
 
 def _read_rms_norm(view: PartView) -> Mapping[str, object]:
     return {'norm_eps': float(view.variance_epsilon), 'scale_after_cast': True, 'scale_offset': False}
+
+
+def _read_latent_norm(view: PartView) -> Mapping[str, object]:
+    """A latent attention's norm (Llama's RMSNorm): the latent mixer norms at the block norms' rounding
+    (`MLAMixer.build` passes the layer's), so it states that rounding, which the block norms' must agree
+    with; its epsilon the attention's reader holds to the mixer's own."""
+    return {'scale_after_cast': True, 'scale_offset': False}
 
 
 def _read_offset_norm(view: PartView) -> Mapping[str, object]:
@@ -747,7 +756,7 @@ KNOWN: tuple[KnownPart, ...] = (
     KnownPart('moe', f'{_DEEPSEEK_V3}:DeepseekV3MoE', _SHARED_MOE_CHILDREN, _read_shared_moe),
     KnownPart('router', f'{_DEEPSEEK_V3}:DeepseekV3TopkRouter', {}, _read_grouped_router,
               ('weight',), state={'e_score_correction_bias': 'e_score_correction_bias'}),
-    KnownPart('latent_norm', f'{_LLAMA}:LlamaRMSNorm', {}, _read_nothing, ('weight',)),
+    KnownPart('latent_norm', f'{_LLAMA}:LlamaRMSNorm', {}, _read_latent_norm, ('weight',)),
     KnownPart('router', f'{_MIXTRAL}:MixtralTopKRouter', {}, lambda view: _read_router(view, normalized=True),
          ('weight',)),
     KnownPart('router', f'{_QWEN3_MOE}:Qwen3MoeTopKRouter', {},
@@ -824,8 +833,9 @@ class Assembly:
     deterministic training forward sets to zero (`dew.interop.verify`'s training qualification)."""
     loaded: Callable[[str], tuple[str, tuple[str, str] | None]] = lambda name: (name, None)
     """A stored tensor's name as the source's load names it, and for one expert's own tensor, which the
-    load stacks into its experts module's fused one, the expert's index and projection
-    (`_load_names`)."""
+    load stacks into its experts module's fused one, the expert's index and canonical projection
+    (`_load_names`). It reads stored names alone: a name the model holds (a gradient's) is stored first
+    as `save_pretrained` stores it (`dew.interop.verify.gradient_parity`)."""
 
     def canonical(self, name: str) -> str | None:
         """A stored tensor's canonical name: its module's canonical path and its parameter's known
@@ -848,21 +858,27 @@ class Assembly:
 
 
 _PER_EXPERT = {'gate_up_proj': ('gate_proj', 'up_proj'), 'down_proj': ('down_proj',)}
-"""Each fused experts tensor (`_fused_experts`) by the projections a checkpoint stored per expert holds
-it as, in the order the fused one concatenates them."""
+"""Each fused experts tensor (`_fused_experts`) by the canonical projections a checkpoint stored per expert
+holds it as, in the order the fused one concatenates them."""
 
 
 def _load_names(model: PreTrainedModel) -> Callable[[str], tuple[str, tuple[str, str] | None]]:
-    """The name `model`'s load gives a stored tensor, by the conversion mapping transformers keeps for
-    its model_type (`get_model_conversion_mapping`): its renamings applied (HY-3's `mlp.expert_bias` is
-    its `mlp.e_score_correction_bias`), and an expert's own tensor `{experts}.{index}.{projection}.weight`
-    named as the fused one the load stacks it into, with its index and projection. A merge is read only
-    where it stacks experts on the first axis and concatenates `_PER_EXPERT`'s projections in order on
-    the second, as the fused tensor `_fused_experts` splits holds them; any other conversion's tensor
-    keeps its own name, which no part holds."""
+    """The name `model`'s load gives a stored tensor, as transformers' load names it
+    (`convert_and_load_state_dict_in_model`, by the conversion mapping it keeps for the model's type,
+    `get_model_conversion_mapping`): every renaming applied (HY-3's `mlp.expert_bias` is its
+    `mlp.e_score_correction_bias`), then at most one merge, the base model's prefix added or dropped as
+    the model holds the name, and the stored name itself where only it is held. An expert's own tensor,
+    `{experts}.{index}.{stored}.weight`, is named as the fused tensor the load stacks it into, with its
+    index and its canonical projection, the one at its place among the merge's sources (Mixtral's `w1`,
+    `w3` and `w2` are the gate, up and down projections). A merge is read only where it stacks experts on
+    the first axis and concatenates its sources in `_PER_EXPERT`'s order on the second, as the fused tensor
+    `_fused_experts` splits holds them; any other conversion's tensor keeps its stored name, which no part
+    holds. A renaming that renames a key by whether another is stored (`GroupWeightRename`) is
+    `Ambiguous`: no read of one name tells it."""
     from transformers.conversion_mapping import get_model_conversion_mapping
     from transformers.core_model_loading import (
         Concatenate,
+        GroupWeightRename,
         MergeModulelist,
         WeightConverter,
         WeightRenaming,
@@ -870,31 +886,42 @@ def _load_names(model: PreTrainedModel) -> Callable[[str], tuple[str, tuple[str,
     )
 
     transforms = get_model_conversion_mapping(model)
+    if any(isinstance(transform, GroupWeightRename) for transform in transforms):
+        raise Ambiguous("its checkpoint conversion renames a key by whether another is stored")
     renamings = [transform for transform in transforms if isinstance(transform, WeightRenaming)]
     converters = [transform for transform in transforms if isinstance(transform, WeightConverter)]
+    held, prefix = model.state_dict(), model.base_model_prefix
 
-    def stacks(converter: WeightConverter, position: int, fused: str, projection: str) -> bool:
+    def stacked(converter: WeightConverter, fused: str) -> tuple[str, ...]:
+        """The canonical projections of `converter`'s sources, in their order, where it stacks them into
+        `fused` as `_fused_experts` splits it; none otherwise."""
         projections = _PER_EXPERT.get(fused, ())
         operations = [(type(operation), operation.dim) for operation in converter.operations
                       if isinstance(operation, (MergeModulelist, Concatenate))]
-        return (len(converter.source_patterns) == len(projections) > position
-                and projections[position] == projection
-                and len(operations) == len(converter.operations)
-                and operations == [(MergeModulelist, 0)] + [(Concatenate, 1)] * (len(projections) > 1))
+        merges = [(MergeModulelist, 0)] + [(Concatenate, 1)] * (len(projections) > 1)
+        if (len(converter.source_patterns) != len(projections) or len(operations) != len(converter.operations)
+                or operations != merges):
+            return ()
+        return projections
 
     def loaded(name: str) -> tuple[str, tuple[str, str] | None]:
-        renamed, _ = rename_source_key(name, renamings, [])
-        for converter in converters:
-            target, pattern = converter.rename_source_key(renamed)
-            if pattern is None:
-                continue
-            module, _, fused = target.rpartition('.')
-            index, _, projection = renamed.removeprefix(f'{module}.').removesuffix('.weight').partition('.')
-            if (renamed == f'{module}.{index}.{projection}.weight' and index.isdigit()
-                    and stacks(converter, converter.source_patterns.index(pattern), fused, projection)):
-                return target, (index, projection)
+        renamed, pattern = rename_source_key(name, renamings, converters, prefix, held)
+        if renamed not in held and name in held:
+            renamed, pattern = rename_source_key(name, [], [], prefix, held)
+        if pattern is None:
             return renamed, None
-        return renamed, None
+        converter = next(converter for converter in converters if pattern in converter.source_patterns)
+        module, _, fused = renamed.rpartition('.')
+        stored, _ = rename_source_key(name, renamings, [])
+        spellings = (module, module.removeprefix(f'{prefix}.'), f'{prefix}.{module}')
+        tails = [stored.removeprefix(f'{spelled}.') for spelled in spellings
+                 if stored.startswith(f'{spelled}.')]
+        index, _, own = tails[0].removesuffix('.weight').partition('.') if tails else ('', '', '')
+        projections = stacked(converter, fused)
+        if not (index.isdigit() and own and '.' not in own and tails[0] == f'{index}.{own}.weight'
+                and projections):
+            return name, None
+        return renamed, (index, projections[converter.source_patterns.index(pattern)])
 
     return loaded
 

@@ -473,6 +473,28 @@ def test_a_built_in_type_of_known_parts_loads_natively(tmp_path, model_type):
                     truth_fn=torch_logits(wide, float64))
 
 
+def test_a_stored_name_reads_as_the_sources_load_reads_it():
+    """An assembly reads a stored tensor's name as transformers' load does (`get_model_conversion_mapping`):
+    Mixtral's release stores each expert's projections apart, as `w1`, `w3` and `w2` under
+    `block_sparse_moe`, which its load renames and stacks into the fused tensors its experts hold; each
+    reads as its expert's canonical gate, up or down projection by its place among the merge's sources. A
+    backbone's name without the base model's prefix reads under it, and a name the source holds as stored
+    reads as stored."""
+    from interop_support import tiny_config
+    from transformers import AutoModelForCausalLM
+
+    with torch.device("meta"):
+        model = AutoModelForCausalLM.from_config(tiny_config("mixtral", num_local_experts=4))
+    assembly = parts.assemble(model)
+    layer = "model.layers.1"
+    assert [assembly.canonical(f"{layer}.block_sparse_moe.experts.2.{stored}.weight")
+            for stored in ("w1", "w3", "w2")] == [
+        f"{layer}.mlp.experts.2.{projection}.weight" for projection in ("gate_proj", "up_proj", "down_proj")]
+    assert assembly.canonical("layers.1.self_attn.q_proj.weight") == f"{layer}.self_attn.q_proj.weight"
+    assert assembly.canonical(f"{layer}.mlp.gate.weight") == f"{layer}.mlp.gate.weight"
+    assert assembly.canonical(f"{layer}.block_sparse_moe.experts.2.w4.weight") is None
+
+
 def test_a_remote_causal_lm_over_a_built_in_config_is_its_own(tmp_path):
     """A repository naming its own causal LM beside transformers' config for a type transformers
     builds verifies its own class, as transformers resolves the auto map: the renamed Llama over CWM's
