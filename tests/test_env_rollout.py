@@ -163,3 +163,80 @@ def test_ppo_raises_the_greedy_policys_return_on_the_walk():
 def test_a_discount_lambda_or_clip_outside_its_range_is_refused(asked):
     with pytest.raises(ValueError):
         ControlPPOObjective(ActorCritic(1), 1, **asked)
+
+
+@struct.dataclass
+class Settled(Walk):
+    """`Walk` restarting at 1 every time, so a reset draws nothing."""
+
+    def reset(self, key):
+        x = jnp.ones((), jnp.float32)
+        return x, TimeStep(x[None], jnp.zeros(()), jnp.zeros((), bool), jnp.zeros((), bool))
+
+
+class HostWalks:
+    """`Settled` walks cut after `length` steps, simulated on the host in NumPy as a simulator outside JAX
+    simulates them: it reads each action through DLPack, answers NumPy arrays, which JAX takes the same
+    way, and restarts an ended episode itself, in place."""
+
+    action_size = 1
+
+    def __init__(self, count: int, length: int):
+        self.count, self.length = count, length
+
+    def reset(self, seed: int):
+        self.x, self.steps = np.ones(self.count, np.float32), np.zeros(self.count, np.int32)
+        return self.x[:, None].copy()
+
+    def step(self, action):
+        from dew.rl.simulator import SimulatorStep
+
+        x = self.x + np.round(2 * np.from_dlpack(action)[:, 0])
+        self.steps = self.steps + 1
+        terminated = np.abs(x) > 4.0
+        truncated = ~terminated & (self.steps >= self.length)
+        reached = x[:, None].astype(np.float32)
+        done = terminated | truncated
+        self.x = np.where(done, np.float32(1), x).astype(np.float32)
+        self.steps = np.where(done, 0, self.steps)
+        return SimulatorStep(reached, -np.square(x), terminated, truncated, self.x[:, None].copy())
+
+
+def heads_home(params, observation, key, memory):
+    """A policy pushing each point a step toward the origin, its key unread."""
+    return -0.5 * jnp.sign(observation), {"seen": observation}, None
+
+
+@pytest.mark.parametrize("policy", [heads_home, pushes], ids=["settled", "drawn"])
+def test_a_simulator_outside_jax_rolls_out_as_its_env_does(policy):
+    """A simulator stepped from the host (`simulator_rollout`), its arrays crossing by DLPack and its
+    ended episodes restarted in place, records what `env_rollout` records of the same walks as a JAX
+    environment: the observations acted on, the actions and the policy's extras, every step's reward,
+    terminal and cut flags and the observation each episode ended at, bit for bit. Where the policy
+    draws, each action is drawn from the key the rollout's carry hands it, a step's split of it."""
+    from dew.rl.simulator import simulator_rollout, simulator_start
+
+    env = Batched(TimeLimit(Settled(), episode_length=3), 5)
+    simulator = HostWalks(5, 3)
+    carry = simulator_start(simulator, jax.random.key(4))
+    ended, simulated = simulator_rollout(simulator, policy, None, carry, 11)
+
+    # The same walks in JAX, each action drawn from the key the simulator's rollout drew it from.
+    state, observation, key = env.reset(jax.random.key(5))[0], carry.observation, carry.key
+    for index in range(11):
+        key, act_key = jax.random.split(key)
+        action, extras, _ = policy(None, observation, act_key, None)
+        state, following = env.step(state, action)
+        np.testing.assert_array_equal(simulated.observation[index], observation)
+        np.testing.assert_array_equal(simulated.action[index], action)
+        jax.tree.map(np.testing.assert_array_equal, jax.tree.map(lambda leaf, index=index: leaf[index],
+                                                                 simulated.extras), extras)
+        for name in ("observation", "reward", "terminated", "truncated"):
+            np.testing.assert_array_equal(getattr(simulated.following, name)[index], getattr(following, name))
+        done = np.asarray(following.done)
+        fresh_state, fresh = env.reset(jax.random.key(index))
+        state = jax.tree.map(lambda new, old, done=done: jnp.where(done.reshape(-1, *(1,) * (new.ndim - 1)),
+                                                                   new, old), fresh_state, state)
+        observation = jnp.where(done[:, None], fresh.observation, following.observation)
+    np.testing.assert_array_equal(ended.observation, observation)
+    assert np.asarray(simulated.following.done).any()
