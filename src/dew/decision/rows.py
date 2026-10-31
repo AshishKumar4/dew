@@ -396,7 +396,8 @@ class Fit(pygrain.MapTransform):
         refused = next((reason for reason in refusals
                         if reason is not None and not (self.scored and reason == "options_alike")), None)
         if refused is not None:
-            return Rejected(refused)
+            # The refusal keeps its rows' cuts, which the run's data report counts beside the kept rows'.
+            return Rejected(refused, cut=cut_counts(row.cuts for row in laid))
         unread: dict[str, int] = {}
         contexts = [0] * len(laid)
         if self.context_length is not None:

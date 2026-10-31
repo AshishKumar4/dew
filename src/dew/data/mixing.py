@@ -66,14 +66,25 @@ class CorpusCounts:
         if not isinstance(element, Mapping):
             return
         self.truncated += int(bool(element.get("_dew_truncated", False)))
-        for kind, (rows, tokens) in element.get("_dew_cut", {}).items():
-            self.cut_examples[kind] += 1
-            self.cut_rows[kind] += int(rows)
-            self.cut_removed[kind] += int(tokens)
+        self.counted_cut(element.get("_dew_cut", {}))
         for reason, count in element.get("_dew_rejected", {}).items():
             self.left_out[reason] += int(count)
         for reason, count in element.get("_dew_declined", {}).items():
             self.declined[reason] += int(count)
+
+    def refused_one(self, refused: Rejected) -> None:
+        """Count one record the corpus refused, under its reason, and the cuts of its refused rows
+        (`Rejected.cut`) beside the delivered rows'."""
+        self.rejected[refused.reason] += 1
+        self.counted_cut(refused.cut)
+
+    def counted_cut(self, cut: Mapping[str, tuple[int, int]]) -> None:
+        """Count one record's cuts (`_dew_cut`): by what each cut, the rows it shortened and the tokens
+        it removed."""
+        for kind, (rows, tokens) in cut.items():
+            self.cut_examples[kind] += 1
+            self.cut_rows[kind] += int(rows)
+            self.cut_removed[kind] += int(tokens)
 
     def counted_anew(self) -> None:
         """Start over the counts of delivered rows, for a read that counts them again whole (a memory
@@ -165,6 +176,7 @@ class _KeepAccepted:
         if isinstance(element, Rejected):
             reason = element.reason
             self.owed.owe(element.consumed)
+            self.counts.counted_cut(element.cut)
         else:
             count = None if self.tokens is None else self.tokens(element)
             if count is not None and count < 0:
