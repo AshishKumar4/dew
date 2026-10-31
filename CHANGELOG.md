@@ -35,6 +35,10 @@ release's tag is that version with a `v` in front (`v0.1.0`).
     pillars and props (`tools/fpv_assets.py`, CC0 textures).
   - `tools/fpv_race.py` runs the race's phases: a privileged PPO teacher, its demonstrations, and a
     DreamerV3 agent on the camera alone.
+- A step compiled ahead lists, past the plan it takes, each rung that recomputes more at the fewest
+  microbatches that fit (`compile_ahead(..., frontier=True)`, `--trainer.compile-ahead.frontier`), the plans
+  `tools/benchmark_step.py` times on the GPUs; a run names the fastest by its remat, `--trainer.split` and
+  `LMObjective.head_tile`.
 ## 0.2.0
 
 The first release on Dew's own package index, `pip install dewml --extra-index-url
