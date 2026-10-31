@@ -686,6 +686,7 @@ _SMOLLM3 = 'transformers.models.smollm3.modeling_smollm3'
 _OLMO2 = 'transformers.models.olmo2.modeling_olmo2'
 _HY_V3 = 'transformers.models.hy_v3.modeling_hy_v3'
 _DEEPSEEK_V3 = 'transformers.models.deepseek_v3.modeling_deepseek_v3'
+_GLM4_MOE = 'transformers.models.glm4_moe.modeling_glm4_moe'
 Children = Mapping[str, tuple[str, ...]]
 _MODEL_CHILDREN: Children = {'embed_tokens': ('embedding',), 'layers': ('layers',), 'norm': ('norm',),
                              'rotary_emb': ('rotary',)}
@@ -758,13 +759,16 @@ KNOWN: tuple[KnownPart, ...] = (
     KnownPart('rotary', f'{_LLAMA}:LlamaRotaryEmbedding', {}, _read_rotary, whole=True),
     KnownPart('rotary', f'{_QWEN2}:Qwen2RotaryEmbedding', {}, _read_rotary, whole=True),
     KnownPart('rotary', f'{_OLMO2}:Olmo2RotaryEmbedding', {}, _read_rotary, whole=True),
+    KnownPart('rotary', f'{_GLM4_MOE}:Glm4MoeRotaryEmbedding', {}, _read_rotary, whole=True),
     KnownPart('embedding', 'torch.nn:Embedding', {}, _read_embedding, ('weight',)),
     KnownPart('embedding', f'{_GEMMA}:GemmaTextScaledWordEmbedding', {}, _read_scaled_embedding, ('weight',)),
     KnownPart('linear', 'torch.nn:Linear', {}, _read_nothing, ('weight', 'bias')),
 )
-"""The known parts, the registered families' own classes. A class of another registered family that
-computes one of these by its code (Qwen2's MLP is Llama's, Qwen3-MoE's experts Mixtral's) matches it
-through `same_code`, so each entry stands for every copy of its code."""
+"""The known parts: transformers' classes whose computation Dew's decoder states by the fields their readers
+return, a registered family's or a type's own (Granite's, OLMo 2's), each assembly of them still verified
+against its source's code (`dew.interop.verify`). A class that computes one of these by its code (Qwen2's
+MLP is Llama's, Qwen3-MoE's experts Mixtral's, GLM-4.7-Flash's attention DeepSeek V3's) matches it through
+`same_code`, so each entry stands for every copy of its code."""
 
 
 @cache
