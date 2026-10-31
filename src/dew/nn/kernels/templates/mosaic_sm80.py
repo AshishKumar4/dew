@@ -223,18 +223,9 @@ class Mma(mosaic.Family):
         consumer(0)
 
     def streams(self, blocks: dict, stages: int, consumers: int, multicast: tuple[str, ...] = (),
-                swizzles: dict[str, int] | None = None, column_streams: tuple[str, ...] = ()):
+                swizzles: dict[str, int] | None = None):
         _one(consumers, clustered=bool(multicast))
-        del column_streams  # Its one consumer owns every column of each stream.
         return Pipeline(blocks, stages, dict(swizzles or {}))
-
-    def column_shape(self, shape: tuple, consumers: int) -> tuple:
-        _one(consumers)
-        return shape
-
-    def column_part(self, ref, role):
-        del role
-        return ref
 
     def lifetimes(self, streams: Pipeline) -> tuple[tuple, tuple]:
         # `emit_pipeline` allocates a walk's slots in its own scope.
@@ -371,7 +362,8 @@ class Mma(mosaic.Family):
         pass
 
     def held(self, ref):
-        return plgpu.load(ref, layout=self.lhs, optimized=False)
+        # A resident operand stays in shared memory between products, not beside every loop carry.
+        return ref
 
     def _left(self, lhs):
         """A product's left operand in the MMA's layout: a shared-memory tile read, or a register value's

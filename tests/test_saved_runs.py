@@ -195,6 +195,53 @@ def test_a_packed_projections_products_count_at_each_of_its_members():
     assert unpacked(moved, packs) != unpacked(now, packs)
 
 
+def test_roots_applied_one_after_another_are_each_named_by_their_own_branch():
+    """Roots applied one after another, each over its own branch of the task's tree, each freed before the
+    next is made, which Python may make at the freed one's address: each root's products are named by its
+    own branch, never an earlier root's (row 2867: the reading kept each root's branch by its address,
+    and a later root made there read an earlier one's)."""
+    import types
+    import weakref
+
+    import jax.numpy as jnp
+    import numpy as np
+    from saved_run_products import products, scoping
+
+    branches = {f"r{index}": {"w": np.zeros((index + 1, 2), np.float32)} for index in range(12)}
+    scoped = scoping({"params": branches})
+
+    class Root:
+        """A root scope as the reading reads one: the variables it was applied over."""
+
+        def __init__(self, params):
+            self.params = params
+
+        def variables(self):
+            return {"params": self.params}
+
+    def request(x):
+        total = jnp.zeros_like(x)
+        for params in branches.values():
+            root = Root(params)
+            context = types.SimpleNamespace(module=types.SimpleNamespace(
+                scope=types.SimpleNamespace(root=root, path=())))
+            total = total + scoped(lambda: x @ x, (), {}, context)
+            del root, context
+        return total
+
+    found = products([jax.jit(request).lower(jnp.ones((2, 2))).as_text(debug_info=True)])
+    assert found == {name: ["float32"] for name in branches}
+    # Whether a freed root's address goes to the next is the allocator's to say; that the reading keeps
+    # each root it named, so none can, is the reading's, on every interpreter.
+    root = Root(branches["r0"])
+    named = weakref.ref(root)
+    context = types.SimpleNamespace(module=types.SimpleNamespace(
+        scope=types.SimpleNamespace(root=root, path=())))
+    scoped(lambda: None, (), {}, context)
+    del root, context
+    assert named() is not None
+
+
 def test_a_requests_products_are_named_by_their_variable_scopes():
     """The products the saved-run evidence compares (`saved_run_products`) are named by the variable scope
     of the module that runs them in the task's tree, whichever method or class runs them: a helper

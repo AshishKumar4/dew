@@ -436,6 +436,14 @@ def test_an_earlier_projector_record_reloads_its_saved_image_model(tmp_path, fam
     np.testing.assert_array_equal(actual, expected)
 
 
+def reloaded(directory, state, record) -> TextGeneration:
+    """The task a run saved at step 0 under `record` reloads (`TextGeneration.from_run`)."""
+    with Checkpoints(str(directory), keep=1) as checkpoints:
+        checkpoints.save(0, state, artifact=record)
+        checkpoints.wait()
+    return TextGeneration.from_run(str(directory), step=0)
+
+
 def test_an_earlier_yarn_record_reloads_its_saved_decoder(tmp_path):
     """A run saved when a decoder and its layer kinds stated YaRN in a field of its own beside
     `rope_scaling` reloads (`earlier_shapes`), its YaRN read as today's one rope scaling (ledger
@@ -463,11 +471,30 @@ def test_an_earlier_yarn_record_reloads_its_saved_decoder(tmp_path):
     fields = record["model"]["fields"]
     fields["kinds"]["sliding_attention"] = earlier(fields["kinds"]["sliding_attention"])
     record["model"]["fields"] = earlier(fields)
-    with Checkpoints(str(tmp_path), keep=1) as checkpoints:
-        checkpoints.save(0, state, artifact=record)
-        checkpoints.wait()
-    restored = TextGeneration.from_run(str(tmp_path), step=0)
+    restored = reloaded(tmp_path, state, record)
     tokens = jnp.asarray([[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]], jnp.int32)
+    np.testing.assert_array_equal(restored.model.apply(restored.variables, tokens),
+                                  model.apply(inference_projections(model, state.variables), tokens))
+
+
+def test_an_earlier_mova_record_reloads_its_saved_decoder(tmp_path):
+    """A MoVA run saved when its value experts recorded the layer dispatch they ran under, at its
+    defaults, reloads (ledger 2751): the experts read their layer's routed MLP today, and the restored
+    task computes, bit for bit, what the trained model does over its weights packed as a task packs
+    them (`inference_projections`)."""
+    from dew.interop import Pretrained
+    from dew.objectives.lm import LMObjective
+
+    mova = Path(__file__).parent / "fixtures" / "hf" / "k2-horizon-mova-tiny"
+    model = Pretrained.load(mova, weights=False, dtype="float32", attention_impl="reference").model
+    objective = LMObjective(model, 4, ema_decay=None)
+    state = Trainer(objective, optax.sgd(0.01), key=3).initial_state()
+    record = objective.inference_record()
+    values = record["model"]["fields"]["value_experts"]
+    held = values["fields"] if "class" in values else values
+    held.update(implementation="auto", dispatch="global", capacity_factor=None)
+    restored = reloaded(tmp_path, state, record)
+    tokens = jnp.asarray(np.load(mova / "input_ids.npy"))
     np.testing.assert_array_equal(restored.model.apply(restored.variables, tokens),
                                   model.apply(inference_projections(model, state.variables), tokens))
 
@@ -498,10 +525,7 @@ def test_an_earlier_multimodal_record_reloads_its_saved_decoder(tmp_path, scaled
     # The earlier decoder wrote its YaRN, the fields alone, in a field of its own.
     scaling = decoder.pop("rope_scaling")
     decoder.update(rope_scaling=None, yarn=None if scaling is None else scaling["fields"])
-    with Checkpoints(str(tmp_path), keep=1) as checkpoints:
-        checkpoints.save(0, state, artifact=record)
-        checkpoints.wait()
-    restored = TextGeneration.from_run(str(tmp_path), step=0)
+    restored = reloaded(tmp_path, state, record)
     tokens = jnp.asarray([[1, 30, 4, 5, 6, 7, 8, 9, 10, 11]], jnp.int32)
     conditioning = {"pixel_values": jnp.arange(48, dtype=jnp.float32).reshape(1, 1, 3, 4, 4) / 48,
                     "image_lengths": jnp.asarray([[1]], jnp.int32)}

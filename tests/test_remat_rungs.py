@@ -228,8 +228,8 @@ PAST_TARGET = {"rungs": {"deepseek-v4-tiny": 130, "deepseek-v41-tiny": 126, "qwe
                          "glm5-next-tiny": 162, "kimi-k3-tiny": 128, "kimi-linear-tiny": 127,
                          "qwen4-exp-native-tiny": 121}}
 """The checkpoints whose rungs take past a group's 120 s to step (`timed`), each its seconds on armada:
-DeepSeek V4's and V4.1's at 727e70cb1 and d00c68f8f, Kimi K3's and Kimi Linear's at 4b732a903, Qwen 3.5's
-and GLM-5 Next's in the durations record, Qwen4-Exp's native checkpoint at 09fab1340. Every train steps
+DeepSeek V4's and V4.1's at 93d13e2ae and d1cea9074, Kimi K3's and Kimi Linear's at 52ec00f1f, Qwen 3.5's
+and GLM-5 Next's in the durations record, Qwen4-Exp's native checkpoint at 5163cd0bd. Every train steps
 every other checkpoint's rungs, and the architectures' rungs cover each mixer these hold; Qwen4-Exp's
 transformers checkpoint (qwen4-exp-tiny, 111 s) steps the native one's decoder."""
 

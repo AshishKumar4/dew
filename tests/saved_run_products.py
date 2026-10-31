@@ -52,15 +52,17 @@ def scoping(variables) -> Callable:
 
     # A trunk held frozen is read as its whole tree is (`thaw`).
     walk(thaw(variables).get("params", {}), ())
-    rooted: dict[int, tuple[str, ...]] = {}
+    # Each root by its address, held so that no later root's scope, made after it was freed, takes its
+    # address and its branch (row 2867).
+    rooted: dict[int, tuple[Scope, tuple[str, ...]]] = {}
 
     def branch(root: Scope) -> tuple[str, ...]:
         if id(root) not in rooted:
             found = branches.get(signature(thaw(dict(root.variables())).get("params", {})), [()])
             if len(found) > 1:
                 raise ValueError(f"a root reads one of the branches {found}, alike in every leaf")
-            rooted[id(root)] = found[0]
-        return rooted[id(root)]
+            rooted[id(root)] = (root, found[0])
+        return rooted[id(root)][1]
 
     def scoped(next_fun, args, kwargs, context):
         scope = context.module.scope

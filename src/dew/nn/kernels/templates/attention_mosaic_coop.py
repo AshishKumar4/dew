@@ -13,6 +13,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
+from dew.nn.kernels import tuning
 from dew.nn.kernels.templates import mosaic
 from dew.nn.kernels.templates.attention_mosaic_program import (
     BackwardTiles,
@@ -79,8 +80,9 @@ def _coop_step(walk: _Backward, share: int, resident: tuple, exchanged, rows_of,
     return carry, (dk_acc, dv_acc)
 
 
+@tuning.lowered_once(("walk", "names"))
 def _coop_launch(query, key, value, dout, peak, total, anchor, delta, key_index, spans: _Spans | None, *,
-                 walk: _Backward) -> tuple[jax.Array, jax.Array, jax.Array]:
+                 walk: _Backward, names: tuple[str, str | None]) -> tuple[jax.Array, jax.Array, jax.Array]:
     """The fast form's one launch over shared keys (`BackwardTiles.shared_keys`): a program's `block_k` keys
     of a key head resident, walked by the query tiles that see them, streamed with their output cotangents
     through one ring its consumers read (`_coop_step`), under the first pass's D and the forward's
@@ -159,7 +161,7 @@ def _coop_launch(query, key, value, dout, peak, total, anchor, delta, key_index,
     launch = family.kernel(
         entry, out_type=(), grid=(heads, keys_padded // block_k, batch),
         grid_names=("heads", "k_tiles", "batch"), consumers=consumers, interpret=walk.interpret,
-        approx_math=walk.approx_math, name="attention_dkv_shared",
+        approx_math=walk.approx_math, name=names[0], kernel_name=names[1],
         # The model's products this launch owns (`stated`): dQ's, dK's, dV's and dP's; its `S` recomputed.
         cost=stated(walk.spec, batch, heads, walk.spec.queries or queries, 4 * width, query, key, value,
                     dout))

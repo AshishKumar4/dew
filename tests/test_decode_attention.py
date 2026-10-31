@@ -172,7 +172,7 @@ SINK_CASES = [(dtype, hooks, natural, splits) for dtype in ("bfloat16", "float32
 """The hooked decode cases, `(dtype, hooks, form, slice count)`, by name."""
 PAST_TARGET = {"sinks and softcap": {("float32", "both", "natural", 32): 137,
                                      ("float32", "both", "fold", 32): 126}}
-"""The cases past a group's 120 s target, each its seconds on armada in a verdict on main 7f03fae28: the
+"""The cases past a group's 120 s target, each its seconds on armada in a verdict on main 495ef4e0e: the
 whole suite's run holds them (`whole_suite.timed`), every other case runs each train."""
 
 

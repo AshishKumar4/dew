@@ -24,7 +24,6 @@ import torch
 from model_support import TINY_DECODER, Digits, decoder, flat_tree, stepped_outputs
 from reference_error import as_given, assert_as_exact, torch_with_gradients, with_gradients
 from test_serving import assert_same_generation
-from whole_suite import timed
 
 from dew.batch import FROZEN, coordinates, thaw
 from dew.checkpoints import Checkpoints
@@ -82,12 +81,18 @@ SEEDS = {"block float32": 512, "block bfloat16": 512, "base": 16, "decode": 16, 
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` on armada."""
 
 
+@functools.cache
+def block_shapes():
+    """The block's parameters' shapes, traced once for every draw."""
+    return jax.eval_shape(BLOCK.init, jax.random.key(0), jnp.zeros((B, S, D)),
+                          CrossContext(jnp.zeros((B, C, FEATURES)), jnp.ones((B,), jnp.int32)))["params"]
+
+
 def block_draw(seed, dtype=np.float32):
     """The residual, a context, each row's real context tokens (one or more), the block's parameters
     with its gates away from zero, and a cotangent on its output, drawn from `seed` in `dtype`."""
     rng = np.random.default_rng(seed)
-    shapes = jax.eval_shape(BLOCK.init, jax.random.key(0), jnp.zeros((B, S, D)),
-                            CrossContext(jnp.zeros((B, C, FEATURES)), jnp.ones((B,), jnp.int32)))["params"]
+    shapes = block_shapes()
 
     def leaf(path, shape):
         name = path[-1].key
@@ -121,12 +126,19 @@ def idefics_block(wide: bool):
 
     from tools.torch_precision import float64
 
-    def forward(x, context, params, *, lengths):
+    @functools.cache
+    def built(dtype):
+        """The layer in `dtype`, built once under the arm's precision: every parameter it computes with is
+        the draw's (`functional_call`), so one build serves every draw."""
         with float64() if wide else contextlib.nullcontext():
             config = IdeficsConfig(hidden_size=D, num_attention_heads=H, intermediate_size=WIDTH,
                                    rms_norm_eps=EPS, hidden_act="silu", vision_config={"embed_dim": FEATURES},
                                    attn_implementation="eager")
-            layer = IdeficsGatedCrossAttentionLayer(config).to(x.dtype)
+            return IdeficsGatedCrossAttentionLayer(config).to(dtype)
+
+    def forward(x, context, params, *, lengths):
+        layer = built(x.dtype)
+        with float64() if wide else contextlib.nullcontext():
             mlp = params["mlp"]
             weights = {
                 "input_layernorm.weight": params["input_layernorm"]["scale"],
@@ -149,12 +161,7 @@ def idefics_block(wide: bool):
     return run
 
 
-PAST_TARGET = {"idefics": {"bfloat16": 132}}
-"""The cases past a group's 120 s (`timed`), each its seconds in train 272's CI (a8a9657d8, ledger 2158):
-the bfloat16 block; every train computes and differentiates it in float32."""
-
-
-@pytest.mark.parametrize("precision", timed(PAST_TARGET, "idefics", ["float32", "bfloat16"]))
+@pytest.mark.parametrize("precision", ["float32", "bfloat16"])
 def test_the_block_computes_and_differentiates_as_idefics(precision):
     """Through both gated branches, the output and the gradients into the residual, the context and
     every parameter on par with IDEFICS's in float32 and in bfloat16 (check 1), over contexts of

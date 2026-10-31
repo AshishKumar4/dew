@@ -10,7 +10,6 @@ import dataclasses
 import functools
 import gc
 import json
-import os
 import struct
 import weakref
 from collections.abc import Callable, Iterator
@@ -21,6 +20,7 @@ import numpy as np
 import optax
 import pytest
 from affine_run import FEATURES, Regression
+from export_support import Stalled
 from jax.extend.backend import get_backend
 from reference_error import as_given, assert_as_exact, seeds_for
 from sharded import collectives
@@ -42,7 +42,6 @@ from dew.objectives.lm import LMObjective
 from dew.objectives.lm.chunked import chunked_tile
 from dew.registry import mixers
 from dew.state import TrainState, apart
-from dew.telemetry import profile as telemetry_profile
 from dew.telemetry.instrumentation import Compiles
 from dew.training import Trainer
 from dew.training.distributed import microbatch
@@ -446,11 +445,12 @@ def test_the_executable_a_profile_replaces_goes_with_its_program():
     assert live_executables() == trials.live and int(state.step) == 3
 
 
-def test_a_profile_window_traces_steps_past_the_first_compile_and_is_refused_under_autopgle(tmp_path):
+def test_a_profile_window_traces_steps_past_the_first_compile_and_is_refused_under_autopgle(tmp_path,
+                                                                                            monkeypatch):
     """A fit's window opens once its warmup steps have run and its first step has compiled, so a window of
     no warmup traces the three steps after the first, never the compile; its reports are exported in a
-    process of their own while the run trains on, never by the run's (row 2017), and are whole once
-    `exported` returns. Under JAX's AutoPGLE, which
+    process of their own while the run trains on, a step after the window logging while the export waits
+    (`Stalled`, row 2017), and the run's end waits for them, whole. Under JAX's AutoPGLE, which
     profiles each program's first runs in a profiling session of its own where a process holds one at a
     time, a fit with a window is refused before it trains, naming JAX's way to capture guided programs
     (`PGLE_CAPTURE`): JAX's sessions would fail inside the window, as the trainer's would."""
@@ -462,7 +462,24 @@ def test_a_profile_window_traces_steps_past_the_first_compile_and_is_refused_und
     from dew.training import ProfileWindow
     from dew.training.profiling import traced_steps
 
-    tracker = RecordingTracker()
+    stalled = Stalled.under(tmp_path / "stalled", monkeypatch)
+
+    class Releasing(RecordingTracker):
+        """The run's logs, the window's export released at the first log of a step after the window, once
+        the export waits: a log the run can make only while the export is held where it runs beside it."""
+
+        def __init__(self):
+            super().__init__()
+            self.stepped: list[int] = []
+
+        def log(self, scalars, step):
+            super().log(scalars, step)
+            if step > 4 and not self.stepped:
+                stalled.await_start()
+                self.stepped.append(step)
+                stalled.release()
+
+    tracker = Releasing()
 
     def fit(directory):
         model = CausalTransformer(vocab_size=64, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
@@ -474,15 +491,50 @@ def test_a_profile_window_traces_steps_past_the_first_compile_and_is_refused_und
         trainer.fit(Loader(lambda partition: rows, None, None, ROWS), steps=5, log_every=1)
 
     fit(tmp_path / "window")
-    telemetry_profile.exported(tmp_path / "window")
+    # A step after the window logged while its export waited, which the run's end waited for in turn.
+    assert tracker.stepped == [5] and stalled.released
     (window,) = [value for _, value in tracker.artifacts if type(value).__name__ == "ProfileWindow"]
     (capture,) = (tmp_path / "window").glob("capture-*")
     assert window.steps == 3 and traced_steps(capture) == (1, 2, 3)
-    record = json.loads((capture / "manifest.json").read_text())
-    assert record["export_status"] == "completed" and record["exported_by"] != os.getpid()
+    assert json.loads((capture / "manifest.json").read_text())["export_status"] == "completed"
     with autopgle(2), pytest.raises(ValueError):
         fit(tmp_path / "pgle")
     assert not (tmp_path / "pgle").exists()
+
+
+def test_a_run_that_fails_after_its_profile_window_still_reports_the_window(tmp_path):
+    """A run whose window stopped and which fails steps later reports the window at its end, its reports
+    written (row 2824): the record says where the capture is whatever the run's outcome, as its manifest
+    says whether its export completed."""
+    pytest.importorskip("xprof.convert.raw_to_tool_data", reason="optional profile extra")
+    from affine_run import Replaying
+    from recording import RecordingTracker
+
+    from dew.data.dataset import Loader
+    from dew.training import Observe, ProfileWindow
+
+    tracker = RecordingTracker()
+
+    class LaterStepFailed(RuntimeError):
+        """The run's failure, steps after its window stopped."""
+
+    def failing(state):
+        if int(state.step) >= 4:
+            raise LaterStepFailed
+        return 0
+
+    model = CausalTransformer(vocab_size=64, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
+                              max_seq_len=SEQ)
+    trainer = one_device(Trainer(LMObjective(model, seq_len=SEQ), optax.sgd(1e-2), key=jax.random.key(0),
+                                 tracker=tracker, profile=ProfileWindow(str(tmp_path), steps=2, warmup=0)))
+    rows = Replaying(lambda position: {"text": np.asarray(BATCH["text"])})
+    with pytest.raises(LaterStepFailed):
+        trainer.fit(Loader(lambda partition: rows, None, None, ROWS), steps=6, log_every=1,
+                    observe=Observe(1, failing))
+    (window,) = [value for _, value in tracker.artifacts if type(value).__name__ == "ProfileWindow"]
+    (capture,) = tmp_path.glob("capture-*")
+    assert window.steps == 2
+    assert json.loads((capture / "manifest.json").read_text())["export_status"] == "completed"
 
 
 def test_a_borrowed_compile_under_autopgle_profiles_beside_the_state_only_where_the_devices_hold_both(
