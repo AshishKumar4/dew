@@ -652,7 +652,7 @@ class QuestionLayout(Layout):
     """The most tokens one option keeps, as a release declares it (Laya's 48), or None to keep each
     whole."""
     parallel: bool = False
-    labels: Labels | None = None
+    labels: Labels | None = dataclasses.field(default=None, metadata={"derived": "head"})
     """Options rendered as lettered lines and read at an answer cue (`Labels`), or None for a marker
     after each option, read at the marker."""
     segments: "tuple[QuestionSegment, ...] | None" = None
@@ -662,7 +662,7 @@ class QuestionLayout(Layout):
     """How `segments`' text is encoded: piece by piece, or whole (`dew.decision.renderer`)."""
     framing: "Framing | None" = None
     """The conversation `segments`' text is the user's turn of, or None for none."""
-    blocks: bool = False
+    blocks: bool = dataclasses.field(default=False, metadata={"derived": "source attention"})
     """Whether each row splits into two blocks (`Encoded.blocks`), its parts as `segments` order them:
     a state-first row's state, and its question from its header to the row's end, a published slot
     release's prefix and suffix (serve.patch `block_ids`); a question-first row's question, and its
