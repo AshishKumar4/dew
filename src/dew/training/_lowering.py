@@ -36,7 +36,7 @@ from jax.extend.mlir import ir
 from dew.nn.kernels import generation
 from dew.nn.kernels.generation import Route
 from dew.nn.kernels.templates import report
-from dew.telemetry.instrumentation import custom_call_kind, sizes
+from dew.telemetry.instrumentation import call_weights, custom_call_kind, sizes
 
 _log = logging.getLogger(__name__)
 
@@ -49,14 +49,16 @@ class KernelCall:
     Mosaic TPU call's `kernel_name`, a Mosaic GPU call's location, the name-stack entry its `mpmd_map`
     lowers under, its kernel's hash where its location names none; any other call's target), a Pallas
     kernel's IR as Pallas serialized it (Triton IR, or Mosaic's module bytecode), its `config` (Triton's
-    warps and stages, a Mosaic GPU kernel's hash), and the FLOPs its kernel states (its cost estimate), None
-    where it states none."""
+    warps and stages, a Mosaic GPU kernel's hash), the FLOPs its kernel states (its cost estimate), None
+    where it states none, and the launch that traced a Mosaic GPU kernel, which its location's name carried
+    (`report.named`), None where it carried none."""
 
     kind: str | None
     name: str
     ir: bytes
     config: str
     flops: float | None
+    launch: str | None = None
 
 
 @dataclass(frozen=True)
@@ -72,20 +74,44 @@ class CustomCall:
 
 def _read[T](lowered: jax.stages.Lowered, read: Callable[[ir.Operation], T | None]) -> list[T]:
     """What `read` makes of each operation of a lowered program's StableHLO module, in program order: the
-    operations it makes something of."""
-    found: list[T] = []
-
-    def visit(operation: ir.Operation) -> ir.WalkResult:
-        made = read(operation)
-        if made is not None:
-            found.append(made)
-        return ir.WalkResult.ADVANCE
-
+    operations it makes something of, an operation of a function the program calls (a nested jit's, a
+    kernel `tuning.lowered_once` lowers once for every layer that calls it) once for each call that
+    reaches it from the entry (`_calls_from_entry`), as the program runs it."""
     module = lowered.compiler_ir(dialect="stablehlo")
     assert module is not None, "a lowered program always has its StableHLO module"
+    found: list[T] = []
     with module.context:
-        module.operation.walk(visit, ir.WalkOrder.PRE_ORDER)
+        functions = {ir.StringAttr(op.attributes["sym_name"]).value: op
+                     for op in module.body.operations if op.operation.name == "func.func"}
+        for name, times in _calls_from_entry(functions).items():
+
+            def visit(operation: ir.Operation, times: int = times) -> ir.WalkResult:
+                made = read(operation)
+                if made is not None:
+                    found.extend([made] * times)
+                return ir.WalkResult.ADVANCE
+
+            functions[name].operation.walk(visit, ir.WalkOrder.PRE_ORDER)
     return found
+
+
+def _calls_from_entry(functions: dict[str, ir.OpView]) -> dict[str, int]:
+    """How many times each of a module's `functions` runs a call of its entry (`main`): each `func.call`
+    site of a function that runs adds its own runs to its callee's (`call_weights`, as `hlo_flops` weighs
+    an executable's computations); one the entry cannot reach runs none."""
+    callees: dict[str, Counter[str]] = {name: Counter() for name in functions}
+    for name, function in functions.items():
+
+        def note(operation: ir.Operation, name: str = name) -> ir.WalkResult:
+            if operation.name == "func.call":
+                callees[name][ir.FlatSymbolRefAttr(operation.attributes["callee"]).value] += 1
+            return ir.WalkResult.ADVANCE
+
+        function.operation.walk(note, ir.WalkOrder.PRE_ORDER)
+    assert "main" in functions, "a lowered program's entry is its module's main"
+    weights = call_weights({name: {callee: float(sites) for callee, sites in called.items()}
+                            for name, called in callees.items()}, "main")
+    return {name: int(times) for name, times in weights.items() if times}
 
 
 def _read_calls[T](lowered: jax.stages.Lowered, read: Callable[[str, ir.Operation], T | None]) -> list[T]:
@@ -97,6 +123,40 @@ def _read_calls[T](lowered: jax.stages.Lowered, read: Callable[[str, ir.Operatio
         return read(ir.StringAttr(operation.attributes["call_target_name"]).value, operation)
 
     return _read(lowered, call)
+
+
+def lowered_kernels(lowered: jax.stages.Lowered) -> list[KernelCall]:
+    """Each kernel call operation a lowered program's StableHLO module holds once, in the order JAX lowered
+    them: the entry's operations in order, each function it calls lowered where its first call site is
+    (`jax.jit`'s and `tuning.lowered_once`'s callees, lowered once however many calls reach them). A
+    kernel's compile reports printed as it lowered (Mosaic GPU's resource estimate) come in this order."""
+    module = lowered.compiler_ir(dialect="stablehlo")
+    assert module is not None, "a lowered program always has its StableHLO module"
+    found: list[KernelCall] = []
+    with module.context:
+        functions = {ir.StringAttr(op.attributes["sym_name"]).value: op
+                     for op in module.body.operations if op.operation.name == "func.func"}
+        lowered_functions: set[str] = set()
+
+        def lower(name: str) -> None:
+            lowered_functions.add(name)
+
+            def visit(operation: ir.Operation) -> ir.WalkResult:
+                if operation.name == "func.call":
+                    callee = ir.FlatSymbolRefAttr(operation.attributes["callee"]).value
+                    if callee not in lowered_functions and callee in functions:
+                        lower(callee)
+                elif operation.name == "stablehlo.custom_call":
+                    target = ir.StringAttr(operation.attributes["call_target_name"]).value
+                    kind = custom_call_kind(target)
+                    if kind != "no_matmul":
+                        found.append(_kernel_call(kind, target, operation))
+                return ir.WalkResult.ADVANCE
+
+            functions[name].operation.walk(visit, ir.WalkOrder.PRE_ORDER)
+
+        lower("main")
+    return found
 
 
 def operations(lowered: jax.stages.Lowered) -> list[str]:
@@ -144,9 +204,10 @@ def _kernel_call(kind: str | None, target: str, operation: ir.Operation) -> Kern
         stated = (json.loads(ir.StringAttr(config["cost_estimate_json"]).value)
                   if "cost_estimate_json" in config else {})
         hashed = ir.StringAttr(config["kernel_hash"]).value_bytes.hex()[:16]
+        named = _kernel_name(operation.location)
         # A call whose location names no kernel is named by its kernel's hash, apart from every other.
-        return KernelCall(kind, _kernel_name(operation.location) or hashed,
-                          ir.StringAttr(config["module"]).value_bytes, hashed, stated.get("flops"))
+        return KernelCall(kind, named[0] if named else hashed, ir.StringAttr(config["module"]).value_bytes,
+                          hashed, stated.get("flops"), named[1] if named else None)
     if kind == "mosaic_tpu":
         config = json.loads(ir.StringAttr(attributes["backend_config"]).value)["custom_call_config"]
         return KernelCall(kind, ir.StringAttr(attributes["kernel_name"]).value, config["body"].encode(), "",
@@ -154,16 +215,15 @@ def _kernel_call(kind: str | None, target: str, operation: ir.Operation) -> Kern
     return KernelCall(kind, target, b"", "", None)
 
 
-def _kernel_name(location: ir.Location) -> str | None:
-    """A Mosaic GPU call's kernel name: its location's name stack (`_named`) ends `<kernel>/mpmd_map`; None
-    where its location carries no name."""
+def _kernel_name(location: ir.Location) -> tuple[str, str | None] | None:
+    """A Mosaic GPU call's kernel name and the launch it carries (`report.kernel_of`): its location's name
+    stack (`_named`) ends `<kernel>/mpmd_map`; None where its location carries no name."""
     named = _named(location)
     if named is None:
         return None
     stack = named.split("/")
     # Less the launch the kernel's name carries (`report.named`), so a kernel reads as itself in every call.
-    kernel = stack[-2] if len(stack) > 1 and stack[-1] == "mpmd_map" else stack[-1]
-    return report.LAUNCH_SUFFIX.sub("", kernel)
+    return report.kernel_of(stack[-2] if len(stack) > 1 and stack[-1] == "mpmd_map" else stack[-1])
 
 
 def _named(location: ir.Location) -> str | None:
