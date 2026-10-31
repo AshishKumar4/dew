@@ -147,11 +147,10 @@ def checked(built: Callable, kernel: str) -> Callable:
 class Outbox:
     """A stage each of a program's consumers writes its share of a step's sum into, which the program's
     producer adds into global memory (TMA's reduction) and frees (FlashAttention 3's dQ store warp: the add's
-    waits off the consumers' walk): a consumer `claim`s its stage once the producer has read its last
-    share, before forming the next (a sum formed first and held across the wait spilled its 32 registers,
-    ptxas 12.9, a shared dQ at width 128), and `put`s it; the producer `take`s a step once every share is
-    staged, adds each into its view and frees the stage once the adds have read it (`streamed`'s `adds`),
-    having freed it once before its first (`opened`). Allocated with `outbox`."""
+    waits off the consumers' walk): a consumer `put`s its share of a step once the producer has read the
+    stage's last one; the producer `take`s a step once every share is staged, adds each into its view and
+    frees the stage once the adds have read it (`streamed`'s `adds`), having freed it once before its first
+    (`opened`). Allocated with `outbox`."""
 
     smem: jax.Ref
     full: jax.Ref
@@ -163,12 +162,9 @@ class Outbox:
         for share in range(self.smem.shape[0]):
             plgpu.barrier_arrive(self.empty.at[share])
 
-    def claim(self, share: int) -> None:
-        """Consumer share `share`'s stage, once the producer has read its last."""
-        plgpu.barrier_wait(self.empty.at[share])
-
     def put(self, share: int, value: jax.Array) -> None:
-        """Consumer share `share`'s `value` staged in its claimed stage (`claim`)."""
+        """Consumer share `share`'s `value` staged once the producer has read the stage's last."""
+        plgpu.barrier_wait(self.empty.at[share])
         self.smem.at[share][...] = value
         plgpu.commit_smem()
         plgpu.barrier_arrive(self.full.at[share])

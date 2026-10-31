@@ -299,8 +299,6 @@ def _fused_adds(walk: _Backward, dq_ref, stages: list, place: tuple, index, k_sm
                     acc = family.products(acc, staged.at[other].transpose((1, 0)), keys, walk.interpret)
                 return acc
 
-            if box is not None:
-                box.claim(role)
             dq = family.summed((rows, columns), issue, walk.interpret)
             if box is None:
                 _dq_added(walk, dq_ref, out_stage, place, index, q_first, dq, columns=share)
