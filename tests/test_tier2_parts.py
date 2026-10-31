@@ -435,6 +435,8 @@ BUILT_IN = {
     "stablelm-parallel": {"model_type": "stablelm", "head_dim": None, "use_parallel_residual": True,
                           "rope_parameters": {"rope_type": "default", "rope_theta": 10000.0,
                                               "partial_rotary_factor": 0.5}},
+    "ernie4_5_moe": {"head_dim": None, "moe_num_experts": 8, "moe_k": 2, "moe_intermediate_size": 32,
+                     "moe_num_shared_experts": 1, "moe_layer_start_index": 1},
     "lfm2": {"head_dim": None, "layer_types": ["conv", "full_attention", "conv", "full_attention"],
              "conv_L_cache": 3, "block_auto_adjust_ff_dim": False},
     "lfm2_moe": {"head_dim": None, "layer_types": ["conv", "full_attention", "conv", "full_attention"],
@@ -451,16 +453,19 @@ under OLMo 2's whole-projection query and key norms; StableLM's layer-normed blo
 each head, in sequence or (`stablelm-parallel`) beside each other off one norm; and LFM2's gated short
 convolutions between its attention layers, its modules under names of their own (`operator_norm`,
 `feed_forward.w1`, `out_proj`), and LFM2-MoE's, its layers past the first routed by sigmoid scores and a
-balancing bias, renormalized over a sum with its own epsilon."""
+balancing bias, renormalized over a sum with its own epsilon; and ERNIE 4.5's routed layers past its
+first, a softmax router selecting with a `[1, experts]` correction bias beside a shared expert, its
+rotary turning adjacent pairs."""
 
 BUILT_IN_SEEDS = {"granite": 8, "smollm3": 8, "olmo2": 8, "hy_v3": 8, "glm4_moe_lite": 8, "olmoe": 8,
-                  "stablelm": 8, "stablelm-parallel": 8, "lfm2": 8, "lfm2_moe": 8}
+                  "stablelm": 8, "stablelm-parallel": 8, "lfm2": 8, "lfm2_moe": 8, "ernie4_5_moe": 8}
 """Each built-in type's declared check-1 seeds for its logits, sized by `seeds_for` on armada."""
 
 STORED_EXPERT = {"hy_v3": "model.layers.1.mlp.experts.0.gate_proj.weight",
                  "glm4_moe_lite": "model.layers.1.mlp.experts.0.gate_proj.weight",
                  "olmoe": "model.layers.1.mlp.experts.0.gate_proj.weight",
-                 "lfm2_moe": "model.layers.1.feed_forward.experts.0.w1.weight"}
+                 "lfm2_moe": "model.layers.1.feed_forward.experts.0.w1.weight",
+                 "ernie4_5_moe": "model.layers.1.mlp.experts.0.gate_proj.weight"}
 """A routed type's first stored expert projection, as `save_pretrained` stores its experts one by one."""
 
 

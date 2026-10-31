@@ -31,6 +31,7 @@ from dew.interop import decoder_parts, sources
 from dew.interop.code_identity import Renaming, matched_class, same_code
 from dew.interop.config_records import native_fields
 from dew.interop.decoder_parts import ACTIVATIONS, PLAIN_SPELLING, DecoderFields
+from dew.interop.unread import Stored, held
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind
@@ -339,6 +340,31 @@ def _read_sigmoid_router(view: PartView) -> Mapping[str, object]:
                      'score_function': 'sigmoid', 'scaling': float(view.router_scaling_factor), 'bias': True}}
 
 
+def _read_ernie_attention(view: PartView) -> Mapping[str, object]:
+    """ERNIE 4.5's attention: Llama's, its rotary turning adjacent pairs of each head (its
+    `apply_rotary_pos_emb` repeats each angle over a pair and rotates `(x[2i], x[2i+1])`, in float32,
+    rounded once to the queries' dtype); a per-layer fact (`_with_adjacent_pairs`)."""
+    return {**_read_attention(view), _LAYER: {'pairs': 'adjacent'}}
+
+
+def _read_ernie_router(view: PartView) -> Mapping[str, object]:
+    """ERNIE 4.5's router: float32 logits and their softmax over every expert, chosen by score plus the
+    correction bias its `moe_statics` holds, weighted by score renormalized over the chosen (their sum
+    clamped below at `moe_norm_min`, which binds nowhere below `top_k / experts`, the least the chosen
+    can sum to)."""
+    top_k, experts = int(view.top_k), int(view.num_experts)
+    if float(view.norm_min) >= top_k / experts:
+        raise Ambiguous(f"the router clamps its chosen weights' sum at {view.norm_min}, which binds")
+    return {_LAYER: {'top_k': top_k, 'experts': experts, 'norm_topk_prob': True, 'score_function': 'softmax',
+                     'bias': True}}
+
+
+def _read_ernie_moe(view: PartView) -> Mapping[str, object]:
+    """ERNIE 4.5's MoE: its routed experts beside shared ones where `moe_num_shared_experts` (an MLP read
+    as `shared`), summed, rounded to the input's dtype."""
+    return {}
+
+
 def _read_lfm2_moe_router(view: PartView) -> Mapping[str, object]:
     """LFM2-MoE's router: sigmoid scores, chosen by score plus the block's `expert_bias` where
     `use_expert_bias`, weighted by score, renormalized over the chosen where `norm_topk_prob` with 1e-6
@@ -480,7 +506,12 @@ class KnownPart:
     reads, which Dew keeps in the router, `gate.e_score_correction_bias`)."""
     canonical: Mapping[str, str] = field(default_factory=dict)
     """Each child's canonical module name, by the known class's attribute name, where the two differ:
-    LFM2's `operator_norm` is the shared `input_layernorm`, its `feed_forward.w1` the `mlp.gate_proj`."""
+    LFM2's `operator_norm` is the shared `input_layernorm`, its `feed_forward.w1` the `mlp.gate_proj`;
+    the empty name reads the child's parameters as the part's own (ERNIE 4.5's `moe_statics` holds its
+    router's correction bias)."""
+    flat: tuple[str, ...] = ()
+    """The parameters the source stores with leading unit axes that its leaf holds flat (ERNIE 4.5's
+    `[1, experts]` correction bias), by the known class's names (`Assembly.flat`)."""
 
     def known(self) -> type:
         module, _, qualname = self.location.partition(':')
@@ -501,6 +532,7 @@ _HY_V3 = 'transformers.models.hy_v3.modeling_hy_v3'
 _OLMOE = 'transformers.models.olmoe.modeling_olmoe'
 _STABLELM = 'transformers.models.stablelm.modeling_stablelm'
 _LFM2 = 'transformers.models.lfm2.modeling_lfm2'
+_ERNIE = 'transformers.models.ernie4_5_moe.modeling_ernie4_5_moe'
 _LFM2_MOE = 'transformers.models.lfm2_moe.modeling_lfm2_moe'
 _DEEPSEEK_V3 = 'transformers.models.deepseek_v3.modeling_deepseek_v3'
 _GLM4_MOE = 'transformers.models.glm4_moe.modeling_glm4_moe'
@@ -534,6 +566,14 @@ KNOWN: tuple[KnownPart, ...] = (
     KnownPart('attention', f'{_STABLELM}:StableLmAttention', _ATTENTION_CHILDREN, _read_stablelm_attention),
     KnownPart('rotary', f'{_STABLELM}:StableLmRotaryEmbedding', {}, _read_partial_rotary, whole=True),
     KnownPart('norm', 'torch.nn:LayerNorm', {}, _read_layer_norm, ('weight', 'bias')),
+    KnownPart('model', f'{_ERNIE}:Ernie4_5_MoeModel', _MODEL_CHILDREN, _read_llama_model),
+    KnownPart('rotary', f'{_ERNIE}:Ernie4_5_MoeRotaryEmbedding', {}, _read_rotary, whole=True),
+    KnownPart('attention', f'{_ERNIE}:Ernie4_5_MoeAttention', _ATTENTION_CHILDREN, _read_ernie_attention),
+    KnownPart('moe', f'{_ERNIE}:Ernie4_5_MoeSparseMoeBlock', _SHARED_MOE_CHILDREN, _read_ernie_moe),
+    KnownPart('router', f'{_ERNIE}:Ernie4_5_MoeTopKRouter', {'moe_statics': ('statics',)}, _read_ernie_router,
+              ('weight',), canonical={'moe_statics': ''}),
+    KnownPart('statics', f'{_ERNIE}:Ernie4_5_MoeStatics', {}, _read_nothing, ('e_score_correction_bias',),
+              flat=('e_score_correction_bias',)),
     KnownPart('model', f'{_LFM2}:Lfm2Model', {**_MODEL_CHILDREN, 'embedding_norm': ('norm',)},
               _read_lfm2_model, canonical={'embedding_norm': 'norm'}),
     KnownPart('model', f'{_LFM2_MOE}:Lfm2MoeModel',
@@ -680,6 +720,9 @@ class Assembly:
     load stacks into its experts module's fused one, the expert's index and canonical projection
     (`_load_names`). It reads stored names alone: a name the model holds (a gradient's) is stored first
     as `save_pretrained` stores it (`dew.interop.verify.gradient_parity`)."""
+    flat: frozenset[str] = frozenset()
+    """The canonical names of the parameters the source stores with leading unit axes that their leaves
+    hold flat (`KnownPart.flat`), which the family's `prepare` reads flat."""
     depths: int = 0
     """The prediction depths the source's release stores past the trunk (its config's
     `num_nextn_predict_layers`: GLM-4.7-Flash's `model.layers.47.*`, HY-3's `.80.*`), which its own code
@@ -765,6 +808,7 @@ class _Assembler:
         self.tables: dict[str, tuple[str, object]] = {}
         self.packed: list[decoder_parts.Packed] = []
         self.dropouts: list[tuple[str, str]] = []
+        self.flat: set[str] = set()
 
     def state(self, fields: Mapping[str, object], where: str, layer: int | None) -> None:
         for key, value in fields.items():
@@ -809,6 +853,7 @@ class _Assembler:
                   if view.name(name) in dict(module.named_buffers(recurse=False))}
         if held or stored:
             self.names[path] = (canonical, {**{name: expected[name] for name in held}, **stored})
+        self.flat.update(f'{canonical}.{name}' for name in part.flat)
         children = dict(module.named_children())
         claimed = set()
         for known, child_roles in part.children.items():
@@ -818,8 +863,8 @@ class _Assembler:
             if child is None:
                 continue
             spelled = part.canonical.get(known, known)
-            role = self.walk(child, child_roles, f'{path}.{name}' if path else name,
-                             f'{canonical}.{spelled}' if canonical else spelled, layer)
+            under = canonical if not spelled else f'{canonical}.{spelled}' if canonical else spelled
+            role = self.walk(child, child_roles, f'{path}.{name}' if path else name, under, layer)
             if part.role == 'layer' and spelled == 'mlp' and layer is not None:
                 self.layers.setdefault(layer, {})['routed'] = role == 'moe'
         unclaimed = [name for name, child in children.items() if name not in claimed
@@ -840,7 +885,7 @@ def assemble(model: PreTrainedModel) -> Assembly:
     routed = sorted(layer for layer, facts in assembler.layers.items() if facts.get('routed'))
     if routed:
         routes = {tuple(sorted((key, value) for key, value in assembler.layers[layer].items()
-                               if key not in ('routed', 'nope', 'conv'))) for layer in routed}
+                               if key not in ('routed', 'nope', 'conv', 'pairs'))) for layer in routed}
         if len(routes) != 1:
             raise Ambiguous("the routed layers route differently")
         mixture = dict(routes.pop())
@@ -864,6 +909,8 @@ def assemble(model: PreTrainedModel) -> Assembly:
     fields.update(_without_positions(fields, unrotated))
     convolutions = {layer: facts['conv'] for layer, facts in assembler.layers.items() if 'conv' in facts}
     fields.update(_with_convolutions(fields, convolutions))
+    fields.update(_with_adjacent_pairs(fields, sorted(layer for layer, facts in assembler.layers.items()
+                                                      if facts.get('pairs') == 'adjacent')))
     capacity, context = decoder_parts.context_lengths(
         {'max_position_embeddings': model.config.to_dict().get('max_position_embeddings')})
     fields.update(max_seq_len=capacity, context_length=context)
@@ -873,7 +920,28 @@ def assemble(model: PreTrainedModel) -> Assembly:
     depths = _records.integer(model.config.to_dict().get('num_nextn_predict_layers') or 0,
                               'num_nextn_predict_layers')
     return Assembly(record, assembler.names, tuple(dict.fromkeys(assembler.packed)), (head, table),
-                    tuple(assembler.dropouts), _load_names(model), depths)
+                    tuple(assembler.dropouts), _load_names(model), frozenset(assembler.flat), depths)
+
+
+def _with_adjacent_pairs(fields: Mapping[str, object], layers: list[int]) -> Mapping[str, object]:
+    """The kinds that make every layer's attention turn adjacent pairs of each head (ERNIE 4.5's), its
+    layer types' kinds otherwise as they are."""
+    if not layers:
+        return {}
+    count = _records.integer(fields['num_layers'], 'num_layers')
+    if layers != list(range(count)):
+        raise Ambiguous("only some layers turn adjacent pairs")
+    stated_types = fields.get('layer_types')
+    types = (list(_records.strings(stated_types, 'layer_types')) if stated_types
+             else ['full_attention'] * count)
+    kinds = dict(_records.record(fields.get('kinds', {}), 'kinds'))
+    for name in dict.fromkeys(types):
+        kind = dict(_records.record(kinds[name], name)) if name in kinds else dict(native_fields(LayerKind)())
+        if kind.get('mixer') is not None:
+            raise Ambiguous(f"the {name} layers' mixer is stated elsewhere")
+        kind['mixer'] = {'class': 'attention', 'fields': {'rotary_pairs': 'adjacent'}}
+        kinds[name] = kind
+    return {'layer_types': tuple(types), 'kinds': kinds}
 
 
 def _with_convolutions(fields: Mapping[str, object], convolutions: Mapping[int, object]
@@ -974,7 +1042,18 @@ def family(model_type: str, assembly: Assembly) -> decoder_parts.DecoderFamily:
         leaves = {**_STACKED_EXPERTS, **decoder_parts.SHORT_CONV_LEAVES}
         return decoder_parts.renamed_path((), canonical, config, layer_leaves=leaves)
 
+    def prepare(tensors: Mapping[str, Stored], _config: Mapping[str, object] | None = None
+                ) -> Mapping[str, Stored]:
+        prepared = dict(tensors)
+        for name, value in tensors.items():
+            if assembly.canonical(name) in assembly.flat:
+                stored = held(value)
+                if any(size != 1 for size in stored.shape[:-1]):
+                    raise ValueError(f"the checkpoint's {name!r} holds {stored.shape}, not one row")
+                prepared[name] = stored.reshape(-1)
+        return prepared
+
     return decoder_parts.DecoderFamily(
         (model_type,), translated, lambda fields: False, model_type, 'ForCausalLM', lambda model: {},
         preserve_source_layout=True, weight_path=weight_path, packed=assembly.packed,
-        tied_head_names=assembly.tied, prediction_depth=decoder_parts.layer_depth)
+        tied_head_names=assembly.tied, prediction_depth=decoder_parts.layer_depth, prepare=prepare)
