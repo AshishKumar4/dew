@@ -1659,3 +1659,26 @@ def test_a_projected_head_is_scored_as_one_matrix_as_its_exact_head_scores(fused
     assert_as_exact(jax.jit(highest(scored(tiled))), jax.jit(highest(scored(exact))), draw, label,
                     seeds=SEEDS[label], truth_fn=truth)
 
+
+
+@pytest.mark.parametrize("predict", [False, True])
+def test_a_tile_of_the_excluded_column_alone_is_differentiated_twice_as_it_runs(predict):
+    """A tiled head whose excluded column fills a vocabulary tile of its own (one column wide, every logit
+    of it -inf): the gradient's derivative in the states is finite, and the gradient a second derivative
+    differentiates is the one the head runs, its row terms the one reduction's."""
+    hidden, table, direction = (jax.random.normal(jax.random.key(seed), shape)
+                                for seed, shape in ((0, (2, 4, 8)), (1, (5, 8)), (2, (2, 4, 8))))
+    targets = jnp.asarray([[1, 2, 3, 4], [4, 3, 2, 1]], jnp.int32)
+    head = OutputTable(table, vocab_major=True, precision=jax.lax.Precision.HIGHEST)
+
+    def loss(hidden):
+        losses, _, _ = chunked_cross_entropy(hidden, head, targets, 1, tile=(4, 1), predict=predict,
+                                             excluded=0)
+        return jnp.sum(losses)
+
+    def moved(hidden):
+        return jnp.vdot(jax.grad(loss)(hidden), direction)
+
+    value, curvature = jax.value_and_grad(moved)(hidden)
+    assert value == moved(hidden)
+    assert np.isfinite(np.asarray(curvature)).all()

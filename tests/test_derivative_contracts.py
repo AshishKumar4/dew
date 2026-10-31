@@ -1137,12 +1137,12 @@ def test_a_ruled_loss_holds_every_order(edge):
 
 
 @pytest.mark.parametrize("edge", EDGES)
-def test_the_residual_pullbacks_hold_their_reverse_orders(edge):
-    """The Gauss-Newton step's two custom VJPs (`residuals._pulled`, `residuals._stepped`): a microbatch's
-    J^T r whose pullback hands the parameters their share of the cotangent, and the zero whose derivative
-    in the pooled J^T r is the damped step, its dual's J^T (J J^T + damping I)^-1 r. Their reverse orders
-    finite wherever float64 is a normal float32 and the plain formulas' are, the step solved as JAX solves
-    a linear system; forward mode, row 2690's."""
+def test_the_residual_pullbacks_hold_every_order(edge):
+    """The Gauss-Newton step's two custom JVPs (`residuals._pulled`, `residuals._stepped`): a microbatch's
+    J^T r whose derivative hands the parameters' move its share, and the zero whose derivative in the
+    pooled J^T r is the damped step, its dual's J^T (J J^T + damping I)^-1 r. Every order finite wherever
+    float64 is a normal float32 and the plain formulas' are, the step solved as JAX solves a linear
+    system."""
     scale = EDGES[edge]
     first, second, pulled = normal_draw(2695, (2, 3), (4,), (10,), scale=scale)
     direction = normal_draw(2696, (2, 3), (4,), (10,), scale=scale)
@@ -1156,8 +1156,7 @@ def test_the_residual_pullbacks_hold_their_reverse_orders(edge):
         return jax.lax.stop_gradient(pulled) + 0.25 * (raveled - jax.lax.stop_gradient(raveled))
 
     assert_contract(pullback, (first, second, pulled), direction, cotangent,
-                    f"a microbatch's pullback {edge}", truth_fn=plain_pullback, plain_fn=plain_pullback,
-                    without=FORWARD_ORDERS)
+                    f"a microbatch's pullback {edge}", truth_fn=plain_pullback, plain_fn=plain_pullback)
     jacobian, residual, pulled = normal_draw(2698, (3, 10), (3,), (10,), scale=scale)
     directions = normal_draw(2699, (10,), (3, 10), (3,), scale=scale)
     (stepped,) = normal_draw(2700, ())
@@ -1172,7 +1171,7 @@ def test_the_residual_pullbacks_hold_their_reverse_orders(edge):
         return jnp.vdot(pulled - jax.lax.stop_gradient(pulled), jacobian.T @ solved)
 
     assert_contract(step, (pulled, jacobian, residual), directions, stepped, f"a damped step {edge}",
-                    truth_fn=plain_step, plain_fn=plain_step, without=FORWARD_ORDERS)
+                    truth_fn=plain_step, plain_fn=plain_step)
 
 
 @pytest.mark.parametrize("edge", EDGES)
@@ -1199,12 +1198,14 @@ def test_the_whole_logits_losses_hold_every_order(edge):
 
 @pytest.mark.parametrize("head", ["whole", "tiled", "fused"])
 @pytest.mark.parametrize("edge", EDGES)
-def test_the_lm_heads_hold_their_reverse_orders(head, edge):
+def test_the_lm_heads_hold_every_order_of_their_gradient(head, edge):
     """The LM head's three custom VJPs (`chunked._whole_head`, `_bounded_head`, `_fused`): the head's
     per-token cross entropy and log partition of `hidden @ table.T`, whole, in tiles, or summed with its
-    gradient taken in the forward. Their reverse orders finite wherever float64 is a normal float32 and the
-    plain formula, the whole logits' log-softmax, is; forward mode and reverse over reverse, whose backward
-    meets a symbolic zero it reshapes, row 2690's."""
+    gradient taken in the forward. Their reverse orders and their gradients' forward ones (jvp of grad,
+    remat'd, nested and scanned) finite wherever float64 is a normal float32 and the plain formula, the
+    whole logits' log-softmax, is. JAX runs no forward derivative through a custom VJP itself; a forward
+    rule beside the hand-written backward is a custom JVP whose tangent is a linear map transposing to it
+    (`dew.nn.kernels.generation.linear_tangent`), which the heads do not take yet (row 2690)."""
     scale = EDGES[edge]
     hidden, table = normal_draw(2704, (2, 4, 8), (11, 8), scale=scale)
     direction = normal_draw(2705, hidden.shape, table.shape, scale=scale)
@@ -1232,7 +1233,8 @@ def test_the_lm_heads_hold_their_reverse_orders(head, edge):
 
     (cotangent,) = normal_draw(2706, jax.eval_shape(plain, hidden, table).shape)
     assert_contract(heads, (hidden, table), direction, cotangent, f"the {head} LM head {edge}",
-                    truth_fn=plain, plain_fn=plain, without=(*FORWARD_ORDERS, "grad of grad"))
+                    truth_fn=plain, plain_fn=plain,
+                    without=OWN_FORWARD_ORDERS)
 
 
 @pytest.mark.parametrize("edge", EDGES)
@@ -1240,8 +1242,9 @@ def test_a_node_perturbation_estimate_holds_its_reverse_orders(edge):
     """A node perturbation objective's loss (`NodePerturbation.loss.estimated`, a custom VJP whose reverse
     rule is its estimate of the gradient from the model's forwards at perturbed sites): over a two-layer
     linear model's squared error, its primal, its estimate and the estimate's own reverse derivative finite
-    wherever its float64 run, the same perturbations drawn at float64, is a normal float32; forward mode,
-    which an estimate from forwards alone has none of, row 2690's."""
+    wherever its float64 run, the same perturbations drawn at float64, is a normal float32. Its estimate
+    is of the reverse product, linear in the cotangent; a forward rule is the estimate's transpose at the
+    same draws, which it does not take yet (row 2690)."""
     from flax import linen as nn
     from model_support import parameter_loss
     from test_perturbation import squared
