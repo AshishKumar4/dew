@@ -276,6 +276,18 @@ def test_a_sampled_step_summarizes_each_watched_modules_output(scanned):
         assert {"mean", "std", "rms"} <= summarized
 
 
+def test_a_watched_module_path_selects_its_layer_alone():
+    """A glob over a module's path (`Block_1`) watches that call alone (row 2324): a sampled step
+    summarizes the second block's output as its forward computed it, and no other block's."""
+    run = watched_run(Stacked(scanned=False), Inspection(modules=("Block_1",), targets=("params",)))
+    logged = inspected(run, {"x": ROWS})
+    blocks = sorted({name.rsplit("/", 1)[0] for name in logged if name.startswith("inspect/activations/")})
+    assert blocks == ["inspect/activations/Block_1"]
+    expected = statistics(jnp.asarray(outputs_of(run, 3)[1]))
+    for statistic in ("abs_max", "non_finite", "zero_fraction"):
+        assert logged[f"{blocks[0]}/{statistic}"] == float(expected[statistic]), statistic
+
+
 def test_a_watched_histogram_sums_to_its_whole_output():
     """An opt-in histogram reports the share of a watched output's magnitudes in each decade, one scalar
     a bin, which together are the whole output."""
