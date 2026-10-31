@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import io
 import itertools
 import threading
 import weakref
@@ -10,27 +9,38 @@ from collections import OrderedDict
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from functools import cached_property
+from typing import Protocol
 
 import grain.python as grain
 
 from dew.batch import Batch
 from dew.data.dataset import Loading, Ranges
-from dew.data.storage import Declared, Store, local, on_gcs
+from dew.data.declared import Declared, Unmirrored, mirrored
+from dew.data.storage import Store, local, on_gcs
 
 from .codec import decode
 
 _MAX_OPEN_SHARDS = Loading().threads
 
 
+class ShardReader[P, V](Protocol):
+    """A reader of one shard's records, by their place in it (`P`), that `ShardReaders` holds open and
+    closes."""
+
+    def __getitem__(self, place: P, /) -> V: ...
+
+    def close(self) -> None: ...
+
+
 @dataclass
-class _OpenedShard:
-    reader: ArrayRecords
+class _OpenedShard[P, V]:
+    reader: ShardReader[P, V]
     reads: int = 0
     used: int = 0
     """When a read last asked for it, on the process's clock of reads (`ShardReaders._clock`)."""
 
 
-class ShardReaders[K]:
+class ShardReaders[K, P, V]:
     """At most `limit` shards' readers open at once, each opened by `open` for its key as a read
     first asks for it and closed as the least recent idle one makes room: the bound every physical
     shard's mirror is sized by (`_MAX_OPEN_SHARDS`, Loading's default read threads). Busy readers stay
@@ -55,10 +65,10 @@ class ShardReaders[K]:
     # it scans nothing.
     _idle = 0
 
-    def __init__(self, open: Callable[[K], ArrayRecords], limit: int = _MAX_OPEN_SHARDS):
+    def __init__(self, open: Callable[[K], ShardReader[P, V]], limit: int = _MAX_OPEN_SHARDS):
         self.open, self.limit = open, limit
-        self._opened: OrderedDict[K, _OpenedShard] = OrderedDict()
-        self._retired: list[_OpenedShard] = []
+        self._opened: OrderedDict[K, _OpenedShard[P, V]] = OrderedDict()
+        self._retired: list[_OpenedShard[P, V]] = []
         self._lock = threading.Condition(threading.Lock())
         with ShardReaders._registry:
             ShardReaders._live.add(self)
@@ -71,7 +81,7 @@ class ShardReaders[K]:
             cls._idle += change
             return cls._idle > _MAX_OPEN_SHARDS
 
-    def read(self, key: K, row: int) -> Batch | bytes | None:
+    def read(self, key: K, row: P) -> V:
         """Row `row` of shard `key`'s reader, opened for it where none is."""
         with self._lock:
             while (
@@ -86,7 +96,7 @@ class ShardReaders[K]:
                     idle = next(held for held, opened in self._opened.items() if not opened.reads)
                     self._opened.pop(idle).reader.close()
                     ShardReaders._idled(-1)
-                self._opened[key] = _OpenedShard(self.open(key))
+                self._opened[key] = _OpenedShard(self._admitted(key))
             self._opened.move_to_end(key)
             opened_shard = self._opened[key]
             if not opening and not opened_shard.reads:
@@ -109,6 +119,18 @@ class ShardReaders[K]:
                     self._lock.notify_all()
             if over:
                 ShardReaders._trim()
+
+    def _admitted(self, key: K) -> ShardReader[P, V]:
+        """Shard `key`'s reader, opened under the lock: where Dew's mirror has no room for the copy it
+        reads (`Unmirrored`), this source's idle readers let go of theirs and it opens again; its busy
+        readers keep theirs, and a mirror without room beside them refuses."""
+        try:
+            return self.open(key)
+        except Unmirrored:
+            for idle in [held for held, opened in self._opened.items() if not opened.reads]:
+                self._opened.pop(idle).reader.close()
+                ShardReaders._idled(-1)
+            return self.open(key)
 
     @classmethod
     def _trim(cls) -> None:
@@ -236,14 +258,7 @@ class ArrayRecords:
             elif on_gcs(fs):
                 paths.append("gs://" + path)
             else:
-                fs, path = Store(url, self.storage_options).cached().resolve()
-                pin = fs.open(path, "rb")
-                if not isinstance(pin, io.BufferedReader) or not isinstance(pin.name, str):
-                    pin.close()
-                    raise ValueError(
-                        f"ArrayRecord {url} needs mirror room for {_MAX_OPEN_SHARDS} physical shards "
-                        "(Loading's default read threads)"
-                    )
+                pin = mirrored(Store(url, self.storage_options))
                 self._pins.append(pin)
                 paths.append(pin.name)
         return grain.ArrayRecordDataSource(paths)

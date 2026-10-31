@@ -1166,8 +1166,8 @@ def test_a_cooldown_branch_ends_a_schedules_stage_where_a_run_decayed_there_does
     constant = optax.inject_hyperparams(optax.sgd)(learning_rate=peak)
     tracker = RecordingTracker()
     branched = run(constant, 8, tracker, Cooldowns(at=(2,), length=4, shape="linear"))
-    cooled = {step: scalars["cooldown_val/loss"] for step, scalars in tracker.scalars
-              if "cooldown_val/loss" in scalars}
+    cooled = {step: scalars["cooldown/val/loss"] for step, scalars in tracker.scalars
+              if "cooldown/val/loss" in scalars}
     decaying = optax.inject_hyperparams(optax.sgd)(learning_rate=optax.join_schedules(
         [optax.constant_schedule(peak), optax.linear_schedule(peak, 0.0, 4)], [2]))
     decayed = RecordingTracker()
@@ -1198,7 +1198,7 @@ def test_a_cooldown_branch_past_a_schedules_last_tokens_records_no_score(tmp_pat
 
     tracker = RecordingTracker()
     branched = run(tracker, Cooldowns(at=(1,), length=12, shape="linear"))
-    assert not any("cooldown_val/loss" in scalars for _, scalars in tracker.scalars)
+    assert not any("cooldown/val/loss" in scalars for _, scalars in tracker.scalars)
     assert_same(parameters(branched), parameters(run()), "the run a branch left")
 
 

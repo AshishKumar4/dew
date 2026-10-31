@@ -8,7 +8,10 @@ long and fading memories, steep then mild decays), held as test_recurrence_stabi
 
 - finite wherever the recurrence a token at a time in float64 is;
 - check 1 (`assert_as_exact`): on par from float64 with its reference arm, the fla port where it runs the
-  form (the delta rule with a decay), else the portable math, in the call's 16-bit dtype.
+  form (the delta rule with a decay), else the portable math, in the call's 16-bit dtype. Mamba2's rated
+  decay runs under both forms (`forms_of`): the accurate ones held to the portable math, the fast ones, its
+  16-bit numbers mamba_ssm's (`mainloop._prepared`), to the port of mamba_ssm's kernels, as recorded
+  mamba_ssm holds them at the same inputs (test_mamba_ssd).
 
 Natively on a GPU of a family the mainloop claims, in its GPU flow (tests/test_gpu_recurrence.py: interpreted,
 one case's check 1 outran the CPU tier's hour); off one, the CPU interprets each form's forward on the regimes
@@ -31,16 +34,24 @@ from test_recurrence_stability import GRADIENT_SEEDS, REGIMES, SEEDS, SITES, cot
 
 from dew.nn.kernels import generation
 from dew.nn.kernels.recurrence_chunk import Chunk
-from dew.nn.kernels.templates.recurrence import mainloop, template
+from dew.nn.kernels.templates.recurrence import mainloop, mainloop_backward, template
 
 pytestmark = pytest.mark.kernel
 
 HOOKS = SITES['scalar delta']
 """The template's default call: the gated delta rule, a decay a head."""
 
-CASES = [(name, regime, product)
-         for name in SITES for regime in REGIMES for product in ('forward', 'gradient')]
-"""Every form's regimes, forward and gradient: the GPU flow's alone (tests/test_gpu_recurrence.py)."""
+def forms_of(hooks) -> tuple[str | None, ...]:
+    """The run's forms a form's checks run under: the rated scan's fast and accurate both, whose numbers
+    differ (mamba_ssm's rounding, `mainloop._prepared`, and three fp32 parts), any other form's the run's
+    own (None), which its numbers do not read."""
+    return ('fast', 'accurate') if hooks.rated else (None,)
+
+
+CASES = [(name, regime, product, forms) for name in SITES for forms in forms_of(SITES[name])
+         for regime in REGIMES for product in ('forward', 'gradient')]
+"""Every form's regimes, forward and gradient, under each of its forms: the GPU flow's alone
+(tests/test_gpu_recurrence.py)."""
 
 INTERPRETED = ('aligned keys', 'decays near zero')
 """The regimes the CPU interprets each form's forward under: where the template's tiles grow most, the
@@ -64,7 +75,7 @@ def fast_backward(operands: Chunk) -> bool:
     bound = template.MOSAIC.bind(operands.query, operands.key, operands.value, operands.log_decay,
                                  operands.beta, operands.state, operands.starts)
     tiles = template.MOSAIC.derived(bound, target)
-    return mainloop.backward_holds(operands.query, operands.key, operands.value, operands.log_decay,
+    return mainloop_backward.backward_holds(operands.query, operands.key, operands.value, operands.log_decay,
                                    operands.beta, operands.state, tiles=tiles,
                                    family=mainloop.family_of() or mainloop.INTERPRETED,
                                    shared=generation.shared_budget(target), starts=operands.starts)
@@ -81,10 +92,19 @@ def assert_finite(fn, truth, operands, regime: str) -> None:
             f'{regime}: not finite where float64 is')
 
 
-def reference_arm(hooks):
-    """The arm the template is held against for a form: the fla port where it runs it (the delta rule with a
-    decay), else the portable math, each in the call's dtype."""
-    return functools.partial(chunk_on, 'fla' if hooks.delta and hooks.decay != 'none' else 'xla', hooks)
+def reference_arm(hooks, forms: str | None):
+    """The arm the template is held against for a form under `forms`, each in the call's dtype: the fla port
+    where it runs it (the delta rule with a decay), the port of mamba_ssm's kernels for the rated scan under
+    the fast forms (its numbers mamba_ssm's), else the portable math."""
+    if hooks.delta and hooks.decay != 'none':
+        return functools.partial(chunk_on, 'fla', hooks)
+    return functools.partial(chunk_on, 'pallas' if hooks.rated and forms == 'fast' else 'xla', hooks)
+
+
+def under(forms: str | None):
+    """The run's numerics under `forms`, the run's own where None."""
+    numerics = generation.numerics()
+    return generation.run_precision(numerics if forms is None else dataclasses.replace(numerics, forms=forms))
 
 
 def template_trains(operands: Chunk, hooks) -> bool:
@@ -107,13 +127,14 @@ def runs(fn, hooks, operands: Chunk, drawn, product: str) -> bool:
     return True
 
 
-def the_template_stays_finite_and_on_par_where_chunked_forms_break(name, regime, product):
-    """Each form's 16-bit forward through the template, or its forward and gradient, finite wherever the
-    float64 recurrence's are on the regime's first draws, and on par with its reference arm's from float64
-    over the site's declared seeds (check 1); a form or gradient it refuses is checked refused and skipped."""
+def the_template_stays_finite_and_on_par_where_chunked_forms_break(name, regime, product, forms):
+    """Each form's 16-bit forward through the template, or its forward and gradient, under `forms`
+    (`forms_of`), finite wherever the float64 recurrence's are on the regime's first draws, and on par with
+    its reference arm's from float64 over the site's declared seeds (check 1); a form or gradient it refuses
+    is checked refused and skipped."""
     hooks = SITES[name]
     mosaic = functools.partial(chunk_on, 'mosaic_gpu', hooks)
-    reference, exact = reference_arm(hooks), functools.partial(token_by_token, hooks)
+    reference, exact = reference_arm(hooks, forms), functools.partial(token_by_token, hooks)
     if product == 'forward':
         dew, truth, seeds = mosaic, exact, SEEDS[name, regime]
 
@@ -128,25 +149,30 @@ def the_template_stays_finite_and_on_par_where_chunked_forms_break(name, regime,
             return bf16(operands, hooks), (out.astype(jnp.bfloat16), final)
 
     operands = restarting(lambda given: given, regime)(draws(0)[0])
-    if not runs(dew, hooks, operands, draws(0), product):
-        pytest.skip(f"the template refuses {name}'s {product}: a refusal, not numerical coverage")
-    for seed in range(2):
-        assert_finite(dew, truth, draws(seed), regime)
-    assert_as_exact(dew, reference, draws, f'the template, {name} under {regime}, its {product}',
-                    seeds=seeds, truth_fn=truth)
+    with under(forms):
+        if not runs(dew, hooks, operands, draws(0), product):
+            pytest.skip(f"the template refuses {name}'s {product}: a refusal, not numerical coverage")
+        for seed in range(2):
+            assert_finite(dew, truth, draws(seed), regime)
+        assert_as_exact(dew, reference, draws, f'the template, {name} under {regime}, its {product}',
+                        seeds=seeds, truth_fn=truth)
 
 
-def test_a_ragged_chunks_last_real_write_holds_the_final_memory_interpreted():
-    """The rated scan's 16-bit forward through the template under the decay bound, interpreted off a GPU, on
-    par with the portable math from float64 over check 1's fewest draws: its rows end in a ragged chunk (70
-    tokens), and its last real token's write, which weighs most under a steep decay, is held outside the
-    product as the portable math peels it; the padded last slot's put the final memory 2.0 times the
-    portable math's distance, interpreted and on an H100."""
+@pytest.mark.parametrize('forms', forms_of(SITES['rated']))
+def test_a_ragged_chunks_last_real_write_holds_the_final_memory_interpreted(forms):
+    """The rated scan's 16-bit forward through the template under the decay bound and `forms`, interpreted
+    off a GPU, on par from float64 over check 1's fewest draws with its reference arm (`reference_arm`): the
+    port of mamba_ssm's kernels under the fast forms, whose numbers the template's then are, the portable
+    math under the accurate ones, which hold them in fp32. Its rows end in a ragged chunk (70 tokens), and
+    its last real token's write, which weighs most under a steep decay, is held outside the product as the
+    portable math peels it; the padded last slot's put the final memory 2.0 times the portable math's
+    distance, interpreted and on an H100."""
     hooks = SITES['rated']
-    assert_as_exact(functools.partial(chunk_on, 'mosaic_gpu', hooks), reference_arm(hooks),
-                    lambda seed: (bf16(stressed(hooks, 'the decay bound', seed)[0], hooks),),
-                    'the template, rated under the decay bound, its forward', seeds=FEWEST_SEEDS,
-                    truth_fn=functools.partial(token_by_token, hooks))
+    with under(forms):
+        assert_as_exact(functools.partial(chunk_on, 'mosaic_gpu', hooks), reference_arm(hooks, forms),
+                        lambda seed: (bf16(stressed(hooks, 'the decay bound', seed)[0], hooks),),
+                        f'the template, rated under the decay bound, its forward ({forms} forms)',
+                        seeds=FEWEST_SEEDS, truth_fn=functools.partial(token_by_token, hooks))
 
 
 @pytest.mark.parametrize('name', SITES)
@@ -175,9 +201,9 @@ def test_the_template_gradient_takes_the_fast_backward_where_its_launches_hold(r
 @pytest.mark.whole_suite  # 130 s interpreted, past a group's two minutes (ledger 2145).
 def test_the_fast_backward_decay_gradient_holds_under_decays_near_zero_interpreted():
     """The fast backward's log decay gradient, interpreted, as near float64 as the port's under decays near
-    zero on a draw: a chunk's ranges sum each token's terms before it (`mainloop.gradients`), never a token's
-    own order-one term added and taken away, which rounded away the `exp(-30)` terms before it (65 to 169
-    times the port's distance on three draws, the H100's check 1 140 times, SE-numerics-h100-fd61e11eeb;
+    zero on a draw: a chunk's ranges sum each token's terms before it (`mainloop_backward.gradients`), never a
+    token's own order-one term added and taken away, which rounded away the `exp(-30)` terms before it (65 to
+    169 times the port's distance on three draws, the H100's check 1 140 times, SE-numerics-h100-fd61e11eeb;
     0.98 to 1.00 times after), held on one draw by the gate's one-draw rule. On a GPU whose launches do not
     hold the fast backward the rule refuses the gradient (row 1926)."""
     regime = 'decays near zero'

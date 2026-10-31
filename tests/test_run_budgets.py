@@ -515,8 +515,8 @@ def clocked_descent(accumulation: int):
 
 
 def clocked_fit(x, accumulation: int, *, directory=None, stop: Pause | None = None, log_every=1,
-                learning_rate=None):
-    """A run bounded to CLOCKED_RECORDS examples of `x`, read in order as a stream, whose objective makes
+                learning_rate=None, examples: int = CLOCKED_RECORDS):
+    """A run bounded to `examples` examples of `x`, read in order as a stream, whose objective makes
     `id % 3 + 1` rows of each, under `Linear` from PEAK to CLOCKED_END, updating every `accumulation`
     batches of BATCH rows, checkpointed to `directory` where given: its final state and its tracker."""
     tracker = RecordingTracker()
@@ -526,7 +526,7 @@ def clocked_fit(x, accumulation: int, *, directory=None, stop: Pause | None = No
                                                                                 end_value=CLOCKED_END))
     trainer = Trainer(Echoed(), optim, key=0, tracker=tracker, accumulation=accumulation,
                       checkpoints=None if directory is None else Checkpoints(str(directory)))
-    return trainer.fit(chain.batch(BATCH), examples=CLOCKED_RECORDS, log_every=log_every, stop=stop), tracker
+    return trainer.fit(chain.batch(BATCH), examples=examples, log_every=log_every, stop=stop), tracker
 
 
 def clocked_run(accumulation: int, directory=None, stops: tuple[Pause | None, ...] = (None,)):
@@ -819,6 +819,57 @@ def test_a_run_no_pass_counts_ahead_reads_its_schedule_off_the_examples_it_consu
                     f"clocked run of {accumulation}", seeds=EXAMPLES_SEEDS)
 
 
+def test_a_clocked_run_resumed_with_a_larger_bound_trains_on_to_it(tmp_path):
+    """A run bounded in examples, trained to its bound and resumed with a larger one, trains on from the
+    examples it consumed to the new bound, as a run on the steps clock resumed with more steps does: the
+    larger bound's first examples are the smaller one's, its order read further (row 2649). Resumed with a
+    bound below what it consumed, it is refused: that order reads less than the run read."""
+    (x,) = clocked_records(0)
+    first, _ = clocked_fit(x, 1, directory=tmp_path, examples=CLOCKED_RECORDS // 2)
+    assert int(first.consumed) == CLOCKED_RECORDS // 2
+    resumed, _ = clocked_fit(x, 1, directory=tmp_path)
+    assert int(resumed.consumed) == CLOCKED_RECORDS and int(resumed.step) > int(first.step)
+    with pytest.raises(ValueError):
+        clocked_fit(x, 1, directory=tmp_path, examples=CLOCKED_RECORDS // 2)
+
+
+def test_a_resume_refuses_a_limit_grown_before_a_repeat(tmp_path):
+    """A limit a repeat reads after (`take(5).repeat()`), grown on resume, reads other records past the
+    saved position (its second pass the larger limit's next records, not the first five again), so the
+    resume is refused: only a bound with nothing but a batch after it reads on (row 2649)."""
+    (x,) = clocked_records(0)
+
+    def fit(count: int, steps: int):
+        chain = Pipeline(Memory({"x": x})).read("streamed").take(count).repeat().batch(BATCH)
+        trainer = Trainer(Pulled(), OptimConfig(learning_rate=PEAK), key=0,
+                          checkpoints=Checkpoints(str(tmp_path)))
+        return trainer.fit(chain, steps=steps, log_every=1)
+
+    fit(5, 2)
+    with pytest.raises(ValueError):
+        fit(10, 4)
+
+
+def test_a_resume_refuses_a_mixed_corpus_limit_grown_beneath_the_mixtures_repeat(tmp_path):
+    """A mixed corpus's limit, grown on resume, holds records its mixture's own shuffle and repeat read
+    after it (`mix([member.take(5)]).shuffle(window=2).take(100).repeat()`), so the resume is refused: only
+    the run's own chain's bound grows (row 2649)."""
+    from dew.data.pipeline import mix
+
+    (x,) = clocked_records(0)
+
+    def fit(count: int, steps: int):
+        member = Pipeline(Memory({"x": x})).take(count)
+        chain = mix([member]).read("streamed").shuffle(window=2).take(100).repeat().batch(BATCH)
+        trainer = Trainer(Pulled(), OptimConfig(learning_rate=PEAK), key=0,
+                          checkpoints=Checkpoints(str(tmp_path)))
+        return trainer.fit(chain, steps=steps, log_every=1)
+
+    fit(5, 2)
+    with pytest.raises(ValueError):
+        fit(10, 4)
+
+
 def test_a_paused_run_resumed_trains_on_as_one_that_never_paused(tmp_path):
     """A run paused halfway through its budget and resumed without the pause lands where the whole
     run does, step for step and in its weight (check 1): the budget, not the pause, sized its
@@ -1055,7 +1106,7 @@ def test_a_clocked_runs_cooldown_evaluation_records_the_examples_its_branch_cons
     trained = {step: scalars["train/examples_consumed"] for step, scalars in tracker.scalars
                if "train/loss" in scalars}
     cooled = [(step, scalars["cooldown/examples_consumed"]) for step, scalars in tracker.scalars
-              if any(name.startswith("cooldown_") for name in scalars)]
+              if "cooldown/val/loss" in scalars]
     validated = {step: scalars["evaluation/examples_consumed"] for step, scalars in tracker.scalars
                  if "evaluation/examples_consumed" in scalars}
     assert cooled and all(consumed == trained[step + 2] for step, consumed in cooled)
@@ -1088,38 +1139,31 @@ def test_each_split_evaluated_at_a_step_records_its_own_counts():
     found = {name: values[0] for (_, name), values in logged.items()}
     assert found["evaluation/counts/summary/records"] == BATCH
     assert found["evaluation/counts/large/records"] == 2 * BATCH
-    assert found["evaluation/counts/cooldown_large/coordinated_batches"] == 2
+    assert found["evaluation/counts/cooldown/large/coordinated_batches"] == 2
     assert "evaluation/summary/records" in found
 
 
 def test_a_split_named_like_a_cooldowns_suite_is_the_runs_own():
-    """A split whose name begins as a cooldown branch's suites' do (`cooldown_`) is the run's own: scored
-    without a cooldown, it records the examples the run had consumed (`evaluation/examples_consumed`);
-    a run that branches into cooldowns refuses one named as a branch's suite of another split is, whose
-    scores the branch's would take at the step it branched at."""
+    """A cooldown branch's scores are named under `cooldown/`, which no split's name can hold (`/` stands
+    between a split and its metric): a split called `cooldown_val` beside `val` is the run's own, scored as
+    the run, its examples the run's (`evaluation/examples_consumed`), while the branch scores `val` as
+    `cooldown/val` at the step it branched at, its examples its own (`cooldown/examples_consumed`)."""
     from dew.training import Cooldowns
 
     (x,) = clocked_records(0)
     held = Pipeline(Memory({"x": x[:BATCH]})).batch(BATCH)
     tracker = RecordingTracker()
-    trainer = Trainer(Echoed(), OptimConfig(optimizer="adam", learning_rate=PEAK), key=0, tracker=tracker)
-    trainer.fit(clocked_chain(x), examples=CLOCKED_RECORDS, log_every=1, validation={"cooldown_val": held},
-                eval_every="50%")
+    Trainer(Echoed(), OptimConfig(optimizer="adam", learning_rate=PEAK), key=0, tracker=tracker).fit(
+        clocked_chain(x), examples=CLOCKED_RECORDS, log_every=1, eval_every="50%",
+        validation={"val": held, "cooldown_val": held}, cooldowns=Cooldowns(at=("50%",), length=2))
     trained = {step: scalars["train/examples_consumed"] for step, scalars in tracker.scalars
                if "train/loss" in scalars}
     validated = [(step, scalars) for step, scalars in tracker.scalars if "cooldown_val/loss" in scalars]
     assert validated and all(scalars["evaluation/examples_consumed"] == trained[step]
                              and "cooldown/examples_consumed" not in scalars for step, scalars in validated)
-
-    def branching(validation):
-        return Trainer(Echoed(), OptimConfig(optimizer="adam", learning_rate=PEAK), key=0).fit(
-            clocked_chain(x), examples=CLOCKED_RECORDS, eval_every="50%", validation=validation,
-            cooldowns=Cooldowns(at=("50%",), length=2))
-
-    # Beside another split the branch's suites keep apart from, the run trains.
-    assert branching({"val": held, "held_val": held}) is not None
-    with pytest.raises(ValueError):
-        branching({"val": held, "cooldown_val": held})
+    cooled = [(step, scalars) for step, scalars in tracker.scalars if "cooldown/val/loss" in scalars]
+    assert cooled and all(scalars["cooldown/examples_consumed"] == trained[step + 2]
+                          for step, scalars in cooled)
 
 
 def test_a_causal_windows_last_target_is_consumed_by_the_window_that_holds_it():

@@ -738,10 +738,19 @@ def _counted_trips(loop: _Instruction, caller: _Computation,
         return math.inf
     start = _constant(caller, _tuple_element(caller, loop.operands[0], index))
     step = _increment(body, _tuple_element(body, body.root, index), index)
-    if start is None or step is None or step <= 0:
+    if start is None or step is None:
+        return math.inf
+    return counted_trips(start, bound, step, int(counter.group(2)), signed=counter.group(1) == 's')
+
+
+def counted_trips(start: int, bound: int, step: int, bits: int, *, signed: bool) -> float:
+    """The trips of a loop that counts an integer of `bits` bits (`signed` or not) from `start` by `step`
+    while it is below `bound`: the one rule an executable's loop (`_counted_trips`) and a lowered program's
+    (`dew.training._lowering._trips`) are both read by. Infinite for a step that is not positive, and for a
+    last step that overflows the counter's type, since a wrapped counter need never reach the bound."""
+    if step <= 0:
         return math.inf
     trips = max(0, -(-(bound - start) // step))
-    signed, bits = counter.group(1) == 's', int(counter.group(2))
     if start + trips * step > (1 << (bits - signed)) - 1:
         return math.inf
     return float(trips)
@@ -802,21 +811,24 @@ def _increment(body: _Computation, name: str | None, index: int) -> int | None:
 
 
 def _weights(computations: dict[str, _Computation], entry: str) -> dict[str, float]:
-    """How many times each computation runs per call of the entry computation.
+    """How many times each computation runs per call of the entry computation (`call_weights`)."""
+    return call_weights({name: _merged_call_counts(computation, computations)
+                         for name, computation in computations.items()}, entry)
 
-    HLO computations cannot recurse, so the call graph is a DAG and one pass in
-    topological order gives every computation the sum of its callers' counts.
-    Anything the entry cannot reach keeps a count of zero.
+
+def call_weights(calls: Mapping[str, Mapping[str, float]], entry: str) -> dict[str, float]:
+    """How many times each function of a program runs per call of its `entry`, given how often each runs
+    each function it calls (`calls`), an HLO computation's or a StableHLO function's alike.
+
+    Neither recurses, so the call graph is a DAG and one pass in topological order gives every function
+    the sum of its callers' counts. Anything the entry cannot reach keeps a count of zero.
     """
-    calls = {
-        name: _merged_call_counts(computation, computations)
-        for name, computation in computations.items()}
-    callers = dict.fromkeys(computations, 0)
+    callers = dict.fromkeys(calls, 0)
     for callees in calls.values():
         for callee in callees:
             if callee in callers:
                 callers[callee] += 1
-    weights = dict.fromkeys(computations, 0.0)
+    weights = dict.fromkeys(calls, 0.0)
     weights[entry] = 1.0
     ready = [name for name, count in callers.items() if count == 0]
     while ready:
@@ -824,7 +836,9 @@ def _weights(computations: dict[str, _Computation], entry: str) -> dict[str, flo
         for callee, times in calls[name].items():
             if callee not in weights:
                 continue
-            weights[callee] += weights[name] * times
+            # A call that runs none adds none: a function that runs none, however many times its loops
+            # would, or a call in a loop of no trips, however often its caller runs.
+            weights[callee] += weights[name] * times if weights[name] and times else 0.0
             callers[callee] -= 1
             if callers[callee] == 0:
                 ready.append(callee)

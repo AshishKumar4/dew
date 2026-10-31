@@ -126,7 +126,7 @@ def examples_clock(args) -> dict:
     trained = [scalars for scalars in tracker.scalars if "train/loss" in scalars]
     counts = {record: sum(scalars[f"train/id_{record}"] for scalars in trained)
               for record in range(1, RECORDS + 1)}
-    cooled = [scalars["cooldown_val/loss"] for scalars in tracker.scalars if "cooldown_val/loss" in scalars]
+    cooled = [scalars["cooldown/val/loss"] for scalars in tracker.scalars if "cooldown/val/loss" in scalars]
     # A run whose plan counts its steps ahead keeps no clock (`TrainState.consumed`).
     consumed = None if state.consumed is None else int(state.consumed)
     return {"step": int(state.step), "consumed": consumed, "counts": counts, "dealt": dealt,

@@ -38,7 +38,7 @@ from dew.state import TrainState
 from dew.telemetry.profile import Profiler, region
 from dew.training.budget import Pause, Plateau, every_step, recorded
 from dew.training.cadence import Cadence, Counted
-from dew.training.cooldown import Branch, branch_suites
+from dew.training.cooldown import Branch
 from dew.training.evaluation import EvalSuite, Evaluation, Summary
 from dew.training.interval import Interval, LogWriter, Taken, TokenClock
 from dew.training.model_flops import TOKENS
@@ -167,11 +167,6 @@ class FitPlan:
         if horizon is not None and (bound is None or bound >= horizon):
             clock.reread(*interval.clocked(state.accumulation))
         return clock.read
-
-    def cooling(self) -> FitPlan:
-        """This plan as a cooldown branch is scored by it: by its suites, each named as a branch's
-        (`branch_suites`), and no summary of them."""
-        return dataclasses.replace(self, suites=branch_suites(self.suites), summaries=())
 
     @property
     def scored(self) -> tuple[Metric, ...]:

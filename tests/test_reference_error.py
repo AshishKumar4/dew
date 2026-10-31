@@ -1985,3 +1985,35 @@ def test_a_leaf_read_from_its_rows_distances_is_the_leaf_read_whole():
                     leaf_summary(np.zeros((0, 4), np.float32), np.zeros((0, 4))))
     for field in ("mse", "worst", "zero_rows", "finite"):
         np.testing.assert_array_equal(getattr(empty, field), getattr(exact, field), err_msg=field)
+
+
+def bits_apart():
+    """A product whose last bits alternate from call to call, as a GPU reduction that adds with atomics in
+    arrival order does: odd calls exact, even calls an ulp up (its calls counted in a list it closes over)."""
+    calls = []
+
+    def product(x, w):
+        calls.append(len(calls))
+        out = np.asarray(x, np.float32) @ np.asarray(w, np.float32)
+        return out if len(calls) % 2 else np.nextafter(out, np.float32(np.inf))
+    return as_given(product)
+
+
+@pytest.mark.parametrize(("backend", "deterministic", "refused"), [
+    ("gpu", False, False), ("gpu", True, True), ("cpu", False, True)])
+def test_check_1_holds_an_arm_to_a_bitwise_repeat_only_where_one_is_promised(
+        monkeypatch, request, backend, deterministic, refused):
+    """Check 1 replays a site's arms on their first draw and requires their outputs again bit for bit only
+    where the run promises a repeat (`_repeat_promised`, ledger 2842): on a GPU by default, whose reductions
+    add with atomics in arrival order, an arm whose last bits move is not refused; on a GPU in deterministic
+    mode (`with_deterministic_ops`), and on a CPU, it is (`UnpairedDraw`)."""
+    from reference_error import UnpairedDraw
+
+    monkeypatch.setattr(jax, "default_backend", lambda: backend)
+    request.getfixturevalue("with_deterministic_ops" if deterministic else "without_deterministic_ops")
+    label = f"bits apart on a {backend}" + (", deterministic" if deterministic else "")
+    if refused:
+        with pytest.raises(UnpairedDraw):
+            null_runs(bits_apart(), a_product_draw, label, seeds=8, runs=1, truth_fn=jnp.matmul)
+    else:
+        null_runs(bits_apart(), a_product_draw, label, seeds=8, runs=1, truth_fn=jnp.matmul)

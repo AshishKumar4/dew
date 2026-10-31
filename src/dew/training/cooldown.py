@@ -1,7 +1,7 @@
 """Cooldown branches of a run (Hägele et al. 2024, "Scaling Laws and Compute-Optimal Training Beyond Fixed
 Training Durations", arXiv:2405.18392): at chosen points of a run on a constant or slowly decaying rate,
 a branch from the run's state trains on with its rate decayed to zero, is scored by the run's validation
-suites as `cooldown_<split>/<metric>`, and is discarded, the run continuing as though none ran. A
+suites as `cooldown/<split>/<metric>`, and is discarded, the run continuing as though none ran. A
 warmup-stable-decay schedule (`dew.optim.Linear`'s `decay_start`) so reads what a run annealed at each
 point would score, without a run for each."""
 
@@ -133,25 +133,15 @@ def decay(shape: str, update: int, updates: int) -> float:
     return 1.0 - done if shape == "linear" else 1.0 - math.sqrt(done)
 
 
-def branch_suites[SuiteT](suites: Mapping[str, SuiteT]) -> dict[str, SuiteT]:
-    """The suites a cooldown branch is scored by: each of the run's, named `cooldown_<split>`."""
-    return {f"cooldown_{name}": suite for name, suite in suites.items()}
-
-
 def check_branches(branching: bool, suites: Mapping[str, object], *, settable: bool) -> None:
-    """Refuse cooldown branches, where the run is `branching`, that it could not score or decay or whose
-    scores would take a split's name: one with no validation suite to score them, a split named as a
-    branch's suite of another is (`branch_suites`), and an optimizer whose state holds no learning rate
-    a branch can scale (`settable`, `dew.optim.settable_rates`)."""
+    """Refuse cooldown branches, where the run is `branching`, that it could not score or decay: one
+    with no validation suite to score them, and an optimizer whose state holds no learning rate a
+    branch can scale (`settable`, `dew.optim.settable_rates`)."""
     if not branching:
         return
     if not suites:
         raise ValueError("a cooldown branch is scored by the run's validation suites, and this run "
                          "scores none: pass validation=, or eval_every= or metrics= over its val split")
-    if taken := sorted(set(branch_suites(suites)) & set(suites)):
-        raise ValueError(f"a cooldown branch scores each split as cooldown_<split>, the name of the run's "
-                         f"splits {taken}, whose scores its own would take at the step it branches at: "
-                         "rename them")
     if not settable:
         raise ValueError("a cooldown scales the learning rate the optimizer's state holds, as an "
                          "OptimConfig's solvers and optax.inject_hyperparams of a constant hold it; this "

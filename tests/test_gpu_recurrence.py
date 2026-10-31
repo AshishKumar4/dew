@@ -25,6 +25,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 import test_fla_gdn as fla_gdn
+import test_mamba_ssd as mamba_ssd
 import test_recurrence_mosaic as forward
 import test_recurrence_mosaic_gradient as gradient
 import test_recurrence_stability as stability
@@ -174,9 +175,10 @@ def test_the_recurrences_run_on_this_gpu():
                functools.partial(gradient.test_a_walk_of_two_roles_is_as_exact_as_its_reference, *values),
                "sm90")
           for name, values in forward.native(gradient.WALK_GRID, gradient.INTERPRETED_WALKS)),
-        *(Cell(f"the template stays finite and on par where chunked forms break: {name} {regime} {product}",
-               functools.partial(templates_finite, name, regime, product))
-          for name, regime, product in template_stability.CASES),
+        *(Cell(f"the template stays finite and on par where chunked forms break: {name} {regime} {product}"
+               f"{'' if forms is None else f' ({forms} forms)'}",
+               functools.partial(templates_finite, name, regime, product, forms))
+          for name, regime, product, forms in template_stability.CASES),
         *(Cell(f"the portable backward as a GPU compiles it is as exact as the recurrence's: {name} {regime}",
                functools.partial(stability.test_the_chunked_ops_gradient_is_as_exact_as_the_recurrences,
                                  name, regime))
@@ -185,6 +187,8 @@ def test_the_recurrences_run_on_this_gpu():
                functools.partial(stability.the_ssd_port_stays_finite_and_exact_where_chunked_forms_break,
                                  regime))
           for regime in stability.REGIMES),
+        Cell("the SSD on the template under the fast forms is as exact as mamba_ssm",
+             mamba_ssd.the_template_is_as_exact_as_mamba_ssm),
         *(Cell(f"the SSD port's gradient is as exact as the recurrence's: {regime}",
                functools.partial(stability.the_ssd_ports_gradient_is_as_exact_as_the_recurrences, regime))
           for regime in stability.REGIMES),

@@ -10,12 +10,11 @@ docs/performance.md, "Kernel choices per generation".
 from __future__ import annotations
 
 import contextlib
-import contextvars
 import dataclasses
 import functools
 import inspect
 import logging
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -27,12 +26,22 @@ if TYPE_CHECKING:
 
 _log = logging.getLogger(__name__)
 
-ASSUMED: contextvars.ContextVar[str | None] = contextvars.ContextVar("assumed_generation", default=None)
-"""The generation `assumed` stands in for the default device's, None outside it."""
+@dataclasses.dataclass(frozen=True)
+class Assumption:
+    """The device `assumed` stands in for the default device's: its generation, and its facts (`target`)
+    where it was given them. Equal wherever the generation and every fact are (`_facts`), as JAX's trace
+    key reads it, not by a target's identity or its partial hash."""
+    generation: str
+    target: GpuTarget | None = dataclasses.field(default=None, compare=False, hash=False)
+    facts: Hashable = None
 
-ASSUMED_TARGET: contextvars.ContextVar[GpuTarget | None] = contextvars.ContextVar("assumed_target",
-                                                                                    default=None)
-"""The device facts `assumed` stands in for the default device's where it was given them, None otherwise."""
+
+def assumption() -> Assumption | None:
+    """The device `assumed` stands in for in this thread, None outside it: one value, which JAX's trace
+    and compile caches key on (`dew.cache.KERNEL_ASSUMED`) and every choice reads."""
+    from dew import cache
+
+    return cache.KERNEL_ASSUMED.value
 
 
 @contextlib.contextmanager
@@ -47,20 +56,14 @@ def assumed(generation: str | GpuTarget | None) -> Iterator[None]:
     from dew import cache
 
     if isinstance(generation, GpuTarget):
-        target, name = generation, generation.generation
+        value = Assumption(generation.generation, generation, _facts(generation))
     else:
-        target, name = None, generation
-    token = ASSUMED.set(name)
-    facts = ASSUMED_TARGET.set(target)
-    try:
-        with cache.KERNEL_ASSUMED((name, None if target is None else _facts(target))):
-            yield
-    finally:
-        ASSUMED_TARGET.reset(facts)
-        ASSUMED.reset(token)
+        value = None if generation is None else Assumption(generation)
+    with cache.KERNEL_ASSUMED(value):
+        yield
 
 
-def _facts(value):
+def _facts(value: Hashable | Mapping | list) -> Hashable:
     """`value`'s facts as a hashable tree, equal wherever the facts are: a dataclass's fields by name, a
     mapping's entries sorted by key, a sequence's items in order."""
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
@@ -76,7 +79,7 @@ def _facts(value):
 CHOICES = frozenset({'attention', 'attention_mainloop', 'decode', 'delta_decode',
                       'delta_gates', 'gate_up', 'gated_delta_rule', 'gemm_epilogue', 'gemm_prologue',
                       'grouped_matmul', 'local_attention', 'mla', 'narrow_copies', 'paged_decode', 'rms_norm',
-                      'short_conv', 'ssd', 'ssd_decode', 'swiglu'})
+                      'selective_scan', 'short_conv', 'ssd', 'ssd_decode', 'swiglu'})
 """The choices a dispatch reports (`route`), and so the ones `chosen` may name (`chosen_kernel`)."""
 
 
@@ -480,13 +483,13 @@ def gpu_target(identifier: str | None = None) -> GpuTarget:
     generation takes the generation's canonical device. SKU queries retain
     that SKU's peaks. Unknown kinds have empty resources.
     """
-    if identifier is None and (facts := ASSUMED_TARGET.get()) is not None:
-        return facts
+    if identifier is None and (found := assumption()) is not None and found.target is not None:
+        return found.target
     if identifier is None:
         import jax
         device = jax.local_devices()[0]
         generation, kind = device_generation(), device.device_kind
-        real = device.platform == 'gpu' and ASSUMED.get() is None
+        real = device.platform == 'gpu' and assumption() is None
         if real and gpu_placed():
             _one_kind(jax.devices())
         target = gpu_target(kind)
@@ -628,9 +631,8 @@ def device_generation() -> str:
     every choice keyed on the target follows it there.
     """
     import jax
-    generation = ASSUMED.get()
-    if generation is not None:
-        return generation
+    if (found := assumption()) is not None:
+        return found.generation
     if (platform := placed_platform()) != jax.default_backend():
         return platform
     device = jax.local_devices()[0]
@@ -966,16 +968,16 @@ def gpu_placed() -> bool:
     assumed GPU. A step traced for an assumed GPU (`lower_for`) lowers without devices, even on a
     GPU host, so it makes none."""
     import jax
-    return ASSUMED.get() is None and jax.default_backend() == 'gpu' and placed_platform() == 'gpu'
+    return assumption() is None and jax.default_backend() == 'gpu' and placed_platform() == 'gpu'
 
 
 def backend() -> str:
     """The platform a call's code is chosen for: `placed_platform()`, or within `assumed` the
     assumed generation's, 'gpu' for an `smXY` and 'tpu' for a TPU's, so a choice keyed on the
     platform acts as on that device while a step traces for it on another."""
-    generation = ASSUMED.get()
-    if generation is None:
+    if (found := assumption()) is None:
         return placed_platform()
+    generation = found.generation
     if generation.startswith('sm'):
         return 'gpu'
     if generation in TARGETS and tpu(TARGETS[generation]):

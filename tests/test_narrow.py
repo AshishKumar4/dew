@@ -115,9 +115,10 @@ def _keeping_gradients(optimizer):
     return optax.chain(kept, optimizer)
 
 
-def _decoder(*, scanned=False, remat=None, mixture=False, rows=8):
+def _decoder(*, scanned=False, remat=None, mixture=False, rows=8, dex=False):
     """`_trained`'s tied bf16 decoder over fp32 parameters, as its LM objective, and the batch of
-    `rows` rows it trains on."""
+    `rows` rows it trains on; with `dex`, its first layer's two heads a differential pair whose lambda
+    anneals over its first ten updates, the whole decoder training beside it."""
     from dew.batch import TEXT_KEY
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.lm import LMObjective
@@ -126,13 +127,17 @@ def _decoder(*, scanned=False, remat=None, mixture=False, rows=8):
                               num_kv_heads=1, mlp="swiglu", mlp_features=64, max_seq_len=16, qk_norm=True,
                               tie_embeddings=True, dtype=jnp.bfloat16, scan_layers=scanned, remat=remat,
                               mixture={"experts": 4, "top_k": 2} if mixture else None)
+    if dex:
+        from dew.nn.dex import DifferentialExtension
+
+        model = model.with_dex(DifferentialExtension(((0, (0, 1)),), anneal_steps=10, trains="all"))
     objective = LMObjective(model, seq_len=8, pad_id=0,
                             balance=ExpertBalance(aux_loss_alpha=.01) if mixture else None)
     return objective, {TEXT_KEY: jnp.asarray(np.random.default_rng(0).integers(1, 64, (rows, 9)), jnp.int32)}
 
 
 def _trained(optimizer, *, copies, steps=3, mesh=None, padded=0, accumulation=1, split=None,
-             mixture=False, rows=8, ragged=False, scanned=False, remat=None, longer=None):
+             mixture=False, rows=8, ragged=False, scanned=False, remat=None, longer=None, dex=False):
     """A tied bf16 decoder over fp32 parameters, trained `steps` steps on
     one batch and then `padded` steps on a batch of padding alone, with
     `copies` on or off on this device's generation, on `mesh` with every
@@ -144,11 +149,12 @@ def _trained(optimizer, *, copies, steps=3, mesh=None, padded=0, accumulation=1,
     `scanned` decoder of four layers runs them as one scan over their
     stacked weights, each layer's stored apart, and each block recomputes
     as `remat` names. With `longer`, every other step reads a batch of that
-    many rows, whose shape the trainer plans apart. Returns the state, each
-    step's loss and the trainer, its plan the last shape's."""
+    many rows, whose shape the trainer plans apart. A `dex` decoder's first
+    layer is a differential pair (`_decoder`). Returns the state, each step's
+    loss and the trainer, its plan the last shape's."""
     from dew.batch import TEXT_KEY
     from dew.training import Layout, MeshSpec, Trainer
-    objective, batch = _decoder(scanned=scanned, remat=remat, mixture=mixture, rows=rows)
+    objective, batch = _decoder(scanned=scanned, remat=remat, mixture=mixture, rows=rows, dex=dex)
     long = longer and {TEXT_KEY: jnp.asarray(np.random.default_rng(1).integers(1, 64, (longer, 9)),
                                              jnp.int32)}
     with chosen(narrow_copies='on' if copies else 'off'):
@@ -254,6 +260,18 @@ def test_a_window_of_microbatches_reads_its_copies_and_commits_the_plain_update(
     narrow, losses, _ = _trained(_keeping_gradients(optax.sgd(0.5)), copies=True, **run)
     plain, plain_losses, _ = _trained(_keeping_gradients(optax.sgd(0.5)), copies=False, **run)
     assert int(narrow.updates) == int(plain.updates) == 2
+    assert _assert_plain_update(narrow, losses, plain, plain_losses)
+
+
+def test_a_dex_decoder_through_its_copies_trains_as_it_does_without_them():
+    """A decoder whose differential lambda anneals over the run's updates reads, in training, a float32
+    lambda the anneal computes on before its cast to bfloat16, which outside training (no updates) it
+    casts at once: the copies, chosen off the loss the step runs, its committed updates among its
+    inputs, leave lambda out, so through them every parameter, the last gradient and every loss over
+    three updates are bitwise a plain run's."""
+    narrow, losses, _ = _trained(_keeping_gradients(optax.sgd(0.5)), copies=True, steps=3, dex=True)
+    plain, plain_losses, _ = _trained(_keeping_gradients(optax.sgd(0.5)), copies=False, steps=3, dex=True)
+    assert int(narrow.updates) == 3
     assert _assert_plain_update(narrow, losses, plain, plain_losses)
 
 

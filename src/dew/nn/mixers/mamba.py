@@ -44,6 +44,7 @@ from dew.nn.blocks import normal_kernel
 from dew.nn.dense import Dense
 from dew.nn.flops import conv_flops, projection_flops, ssd_flops
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of, sequence_blocks
+from dew.nn.kernels import recurrence_chunk
 from dew.nn.linear import DepthwiseConv1d, held_scan
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.precision import accumulated, at_least_fp32, float32_dot_general, float32_einsum
@@ -217,8 +218,10 @@ class Mamba(nn.Module):
             # A zero step neither decays nor writes the state.
             step = jnp.where(valid[:, :, None], step, 0.0)
         wide = xs.dtype
-        return selective_scan(xs, step, -jnp.exp(jnp.asarray(self.A_log, wide)), B, C,
-                              jnp.asarray(self.D, wide), held, starts, self.chunk_size)
+        # The scan on the kernel its selector gives each product (`recurrence_chunk.SELECTIVE`).
+        return recurrence_chunk.selective_scan(
+            xs, step, -jnp.exp(jnp.asarray(self.A_log, wide)), B, C, jnp.asarray(self.D, wide), held, starts,
+            portable=functools.partial(selective_scan, chunk_size=self.chunk_size))
 
 
 class _StepProjection(nn.Module):

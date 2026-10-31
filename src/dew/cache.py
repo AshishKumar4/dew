@@ -179,8 +179,8 @@ def enable_compilation_cache(path: str):
         if moved:
             # JAX settles its cache at the process's first compile and keeps it; `reset_cache` forgets
             # it, so the next compile settles it again, under the directory named first, so no compile
-            # between the two settles it on the old one (row 2836). JAX's reset does not wait for a
-            # compile on another thread already settling it, which may keep the old one (row 2836).
+            # between the two settles it on the old one; a compile on another thread already settling
+            # it is waited for, under JAX's own initialization lock (Dew's JAX build, row 2836).
             compilation_cache.reset_cache()
     # The autotuner's picks follow the policy above, through XLA_FLAGS; JAX's own placement of them
     # in the cache directory would name one directory for every jaxlib and write picks from a
@@ -270,9 +270,9 @@ KERNEL_PINS = jax.make_user_context(())
 thread, keyed on as `KERNEL_TUNES` is."""
 
 KERNEL_ASSUMED = jax.make_user_context(default_value=None)
-"""The device `dew.nn.kernels.generation.assumed` stands in for in this thread, its generation and its
-facts where given them, keyed on as `KERNEL_TUNES` is, so a program traced for one device's launches
-traces again for another's."""
+"""The device `dew.nn.kernels.generation.assumed` stands in for in this thread (`generation.Assumption`:
+its generation and its facts where given them), keyed on as `KERNEL_TUNES` is, so a program traced for one
+device's launches traces again for another's."""
 
 KERNEL_CHOICES = jax.make_user_context(())
 """The `(choice, kernel)` pairs `dew.nn.kernels.generation.chosen` holds in

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import csv
 import hashlib
 import io
@@ -11,7 +12,7 @@ import math
 import os
 import posixpath
 import threading
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import cached_property, lru_cache
 from pathlib import PurePosixPath
@@ -31,16 +32,17 @@ from s3fs import S3FileSystem
 from dew._records import integer, record, text
 from dew.batch import Batch
 from dew.data.dataset import Ranges, Records
+from dew.data.declared import Declared, HeldFile, mirrored
 from dew.data.pipeline import Dataset
 from dew.data.steps.generic import Fields
 from dew.data.storage import (
-    Declared,
     Readable,
     Store,
     commit_export,
     content_version,
     in_memory,
     local,
+    object_info,
     on_gcs,
 )
 
@@ -348,9 +350,7 @@ class Files(Dataset):
         entries = committed["files"]
         if not isinstance(entries, list):
             raise ValueError("export manifest files must be a list")
-        return {
-            Store(str(self.url), self.storage_options).child(entry["path"]).url: entry for entry in entries
-        }
+        return {self._root.child(entry["path"]).url: entry for entry in entries}
 
     @cached_property
     def _declared_objects(self) -> Mapping[str, Declared]:
@@ -360,6 +360,15 @@ class Files(Dataset):
         # Its data files: an offset index it declares is read by `ArrayIndex`, checked by its digest there.
         return {url: Declared(Store(url, self.storage_options), self.declared[url])
                 for url in self.paths if url in self.declared}
+
+    def _declared_index(self, url: str) -> Declared | None:
+        """The offset index at `url` as its producer declared it, where the declaration holds a read of it
+        to something (`Declared`: a digest or its store's version); an index stated by its size alone is
+        read as its store holds it, its records' bounds checked as each is read (`_IndexedLines`)."""
+        stated = self.declared.get(url)
+        if stated is None or not ({"sha256", "stored", "ETag"} & set(stated)):
+            return None
+        return Declared(Store(url, self.storage_options), stated)
 
     def _opened(self, url: str) -> BinaryIO:
         """A binary file of `url`'s bytes: as its producer declared them where one did
@@ -387,10 +396,21 @@ class Files(Dataset):
         return self.format or _format(self.url if isinstance(self.url, str) else self.url[0])
 
     @cached_property
+    def _root(self) -> Store:
+        """Where an export's manifest and the files it lists are read: its URL, and for an export on a Hub
+        repository's branch the commit the branch names as its manifest is first read (`Store.pinned`), so
+        every file is read at the commit its manifest was, though the branch moves on."""
+        named = Store(str(self.url), self.storage_options)
+        if self.file_info is not None or not isinstance(self.url, str):
+            return named
+        fs, path = named.child("_dew_manifest.json").resolve()
+        return named.pinned() if fs.exists(path) else named
+
+    @cached_property
     def committed(self) -> Mapping[str, object] | None:
         if self.file_info is not None or not isinstance(self.url, str):
             return None
-        store = Store(self.url, self.storage_options).child("_dew_manifest.json")
+        store = self._root.child("_dew_manifest.json")
         fs, path = store.resolve()
         if not fs.exists(path):
             return None
@@ -427,7 +447,7 @@ class Files(Dataset):
                 raise ValueError(f"published source facts do not name {missing[0]}")
             return urls
         if self.committed is not None:
-            root = Store(str(self.url), self.storage_options)
+            root = self._root
             entries = self.committed["files"]
             if not isinstance(entries, list):
                 raise ValueError(f"export manifest has invalid files at {self.url}")
@@ -558,7 +578,7 @@ class Files(Dataset):
         places it (`export_place`); none for other files."""
         if self.committed is None:
             return {}
-        root = Store(str(self.url), self.storage_options)
+        root = self._root
         entries = self.committed["files"]
         if not isinstance(entries, list):
             raise ValueError(f"export manifest has invalid files at {self.url}")
@@ -585,11 +605,12 @@ class Files(Dataset):
             return True
         if self.kind == "webdataset":
             return False
-        if "index_headers" in self.__dict__:
+        # Found once, kept: an index provisioned since a miss is looked for again (`provision` clears it).
+        if self.__dict__.get("indexes_present"):
             return True
         if not all(self._present(url) for url in self._indexes):
             return False
-        self.__dict__["index_headers"] = {url: self._header(url) for url in self._indexes}
+        self.__dict__["indexes_present"] = True
         return True
 
     def _present(self, url: str) -> bool:
@@ -633,7 +654,7 @@ class Files(Dataset):
         self.__dict__.pop("_file_facts", None)
         self.__dict__.pop("_snapshot", None)
         self.__dict__.pop("_metadata", None)
-        self.__dict__.pop("index_headers", None)
+        self.__dict__.pop("indexes_present", None)
         return self
 
     def _provision_arrayrecord(self) -> Files:
@@ -651,12 +672,8 @@ class Files(Dataset):
             opened = ArrayRecords((url,), self.storage_options)
             try:
                 count = len(opened)
-                mirror, mirrored_path = Store(url, self.storage_options).cached().resolve()
-                with mirror.open(mirrored_path, "rb") as reader:
-                    if not isinstance(reader.name, str):
-                        raise ValueError(f"ArrayRecord provisioning needs a mirror that can hold {url}")
-                    with open(reader.name, "rb") as local:
-                        digest = hashlib.file_digest(local, "sha256").hexdigest()
+                with mirrored(Store(url, self.storage_options)) as reader:
+                    digest = object_info(reader)["sha256"]
             finally:
                 opened.close()
             files.append(
@@ -727,9 +744,9 @@ class Files(Dataset):
         if len({local(place.fs) for place in located}) > 1:
             located = [Readable(*store.resolve(), None) for store in stores]
         declared = {url: self._declared_objects[url] for url in self.paths if url in self._declared_objects}
-        if declared:
-            # Arrow opens each declared file through Dew's reads of it, held to its version or checked
-            # as it opens; its own clients hold no read to a version.
+        if declared and not self._versioned:
+            # Arrow opens each declared file through Dew's reads of it, checked as it opens or held to its
+            # version where Arrow's own client is not the store's.
             filesystem = pafs.PyFileSystem(_DeclaredHandler(located[0].fs, {
                 place.path: declared[url] for place, url in zip(located, self.paths, strict=True)
                 if url in declared}))
@@ -741,6 +758,32 @@ class Files(Dataset):
         base = posixpath.commonpath(roots) if len(roots) == len(located) else None
         return filesystem, paths, names, base
 
+    @cached_property
+    def _versioned(self) -> Mapping[str, Declared]:
+        """The declared files Arrow reads through its own S3 or GCS client, by URL, each held to the
+        version its store published it at by reads of that version around Arrow's (`_versions_held`):
+        where every file is declared at a version, and Arrow's client of their store carries every setting
+        it reads with (`_arrow_filesystem`), as it reads row groups 1.4x (S3) to 2.1x (GCS) faster than
+        Dew's reads; none otherwise, Arrow reading through Dew's (`_DeclaredHandler`)."""
+        declared = self._declared_objects
+        if not self.paths or any(url not in declared or declared[url].stored is None for url in self.paths):
+            return {}
+        fs, _ = Store(self.paths[0], self.storage_options).resolve()
+        native = not isinstance(_arrow_filesystem(fs), pafs.PyFileSystem) and not local(fs)
+        return {url: declared[url] for url in self.paths} if native else {}
+
+    @contextlib.contextmanager
+    def _versions_held(self, urls: Iterable[str]) -> Iterator[None]:
+        """Arrow's reads within of the files at `urls` held to the versions their store published them at,
+        where Arrow reads them through its own client (`_versioned`): each still at it before and after
+        (`Declared.still_held`), refused (`Replaced`) where it moved."""
+        held = [self._versioned[url] for url in urls if url in self._versioned]
+        for declared in held:
+            declared.still_held()
+        yield
+        for declared in held:
+            declared.still_held()
+
     def _shard_name(self, path: str) -> str:
         """The place of the file Arrow reads at `path` (`_places`), whichever copy Arrow reads it from
         (`_arrow_files`), which its shards' ids are made of."""
@@ -749,23 +792,26 @@ class Files(Dataset):
     @cached_property
     def arrow(self) -> ds.Dataset:
         filesystem, paths, _, base = self._arrow_files
-        return ds.dataset(
-            list(paths),
-            filesystem=filesystem,
-            format="ipc" if self.kind == "arrow" else "parquet",
-            partitioning=self.partitioning,
-            partition_base_dir=base,
-        )
+        # Its schema read off its files' footers.
+        with self._versions_held(self.paths):
+            return ds.dataset(
+                list(paths),
+                filesystem=filesystem,
+                format="ipc" if self.kind == "arrow" else "parquet",
+                partitioning=self.partitioning,
+                partition_base_dir=base,
+            )
 
     @cached_property
     def fragments(self):
         if not self.paths:
             return ()
-        return tuple(
-            piece
-            for fragment in self.arrow.get_fragments()
-            for piece in (fragment.split_by_row_group() if self.kind == "parquet" else (fragment,))
-        )
+        with self._versions_held(self.paths):
+            return tuple(
+                piece
+                for fragment in self.arrow.get_fragments()
+                for piece in (fragment.split_by_row_group() if self.kind == "parquet" else (fragment,))
+            )
 
     def manifest(self) -> ShardManifest:
         """The files' shards, each named by its file's place (`_places`) and where in it it starts, so a
@@ -900,7 +946,7 @@ class Files(Dataset):
     def order_fingerprints(self) -> Mapping[str, str]:
         if self.kind not in ("jsonl", "text", "csv"):
             return {}
-        if "index_headers" not in self.__dict__ and not self.supports("indexed"):
+        if not self.supports("indexed"):
             return {}
         indexes = set(self._indexes)
         headers = [metadata for url, metadata in self._file_facts if url in indexes]
@@ -951,7 +997,8 @@ class Files(Dataset):
 
     def lengths(self) -> np.ndarray | None:
         if self.kind in ("parquet", "arrow") and "length" in self.arrow.schema.names:
-            return self.arrow.to_table(columns=["length"])["length"].to_numpy()
+            with self._versions_held(self.paths):
+                return self.arrow.to_table(columns=["length"])["length"].to_numpy()
         if self.index:
             with io.BytesIO(Store(self.index, self.storage_options).read()) as file:
                 index = np.load(file, allow_pickle=False)
@@ -1000,11 +1047,16 @@ class _ArrowFragment:
     def table(self) -> pa.Table:
         with self.lock:
             if "_table" not in self.__dict__:
-                self.__dict__["_table"] = self.source.fragments[self.index].to_table(
-                    schema=self.source.arrow.schema,
-                    columns=list(self.source.columns) if self.source.columns is not None else None,
-                    filter=self.source.where,
-                )
+                fragment, source = self.source.fragments[self.index], self.source
+                held = (source._arrow_files[2][fragment.path],) if source._versioned else ()
+                with source._versions_held(held):
+                    table = fragment.to_table(
+                        schema=self.source.arrow.schema,
+                        columns=list(self.source.columns) if self.source.columns is not None else None,
+                        filter=self.source.where,
+                    )
+                # Kept once its file is found at its version after the read too.
+                self.__dict__["_table"] = table
             return self.__dict__["_table"]
 
     def __len__(self) -> int:
@@ -1047,14 +1099,20 @@ class _ArrowRecords:
 
 class _IndexedLines:
     def __init__(self, source: Files):
+        from .records import ShardReaders
+
         self.source = source
         self.indexes = source._indexes
-        headers = source.__dict__.get("index_headers", {})
-        self.index_files = tuple(
-            ArrayIndex(url, source.storage_options, headers.get(url)) for url in self.indexes
-        )
+        self.index_files = tuple(ArrayIndex(url, source.storage_options, source._declared_index(url))
+                                 for url in self.indexes)
         self.tables = tuple(index.values for index in self.index_files)
         self.ranges = Ranges(tuple(len(index) for index in self.tables))
+        def held(url: str) -> HeldFile:
+            return source._declared_objects[url].held()
+
+        # Each declared file checked once, as a read first asks for it, and read from what was checked
+        # while it is held, as many held as the reads' threads (`ShardReaders`).
+        self.held = ShardReaders(held)
 
     def __getstate__(self) -> Mapping[str, object]:
         return {"source": self.source}
@@ -1089,7 +1147,7 @@ class _IndexedLines:
                 _seek_lines(file, offset)
                 payload = file.read(int(entry["bytes"]))
         elif declared is not None:
-            payload = declared.read_range(offset, offset + int(entry["bytes"]))
+            payload = self.held.read(url, slice(offset, offset + int(entry["bytes"])))
         else:
             fs, path, _ = Store(url, self.source.storage_options).readable()
             payload = fs.cat_file(path, start=offset, end=offset + int(entry["bytes"]))

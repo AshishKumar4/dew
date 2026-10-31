@@ -22,7 +22,6 @@ too (`ModelConfig.defaults`), so a default changed since leaves the record
 building what it built.
 """
 
-import contextvars
 import copy
 import dataclasses
 import datetime
@@ -47,7 +46,14 @@ from etils import epath
 import dew.io
 from dew import registry, training
 from dew._coordination import agree_process_phase, agreed, agreed_same
-from dew._records import JSON, duration, earlier_segments, is_share, recorded_duration
+from dew._records import (
+    JSON,
+    duration,
+    earlier_fields,
+    is_share,
+    json_value as field_value,
+    recorded_duration,
+)
 from dew.cache import dew_cache_dir
 from dew.checkpoints import RUN_FILE, Checkpoints, Keep, Resume
 from dew.config.sweep import RandomSearch, Search, Space, read_ledger, write_ledger
@@ -293,11 +299,8 @@ def _best_argument():
             return None
         if text.startswith(('{', '[')):
             policies = json.loads(text)
-            return (
-                tuple(Best(**policy) for policy in policies)
-                if isinstance(policies, list)
-                else Best(**policies)
-            )
+            kind = tuple[Best, ...] if isinstance(policies, list) else Best
+            return from_record(kind, policies, dtypes=False)
         return Best(text)
 
     def write(policy):
@@ -319,18 +322,6 @@ def _best_argument():
         str_from_instance=write)
 
 
-def _record_argument[T](kind: type[T]):
-    """A record's command-line form, its JSON (`to_record`'s, read back by `from_record`), or None."""
-    return tyro.constructors.PrimitiveConstructorSpec(
-        nargs=1,
-        metavar="JSON|None",
-        instance_from_str=lambda given: (None if given[0] == "None"
-                                         else from_record(kind, json.loads(given[0]))),
-        is_instance=lambda value: value is None or isinstance(value, kind),
-        str_from_instance=lambda value: ["None" if value is None else json.dumps(to_record(value, kind))],
-    )
-
-
 def _numerics_argument():
     """A run's numerics on the command line: a preset's name ("accurate", "default"), the usual dtypes'
     Lightning name ("bf16-true"), or a `Numerics` record's JSON (`dew.nn.precision.numerics_of`)."""
@@ -348,7 +339,7 @@ def _keep_argument():
     return tyro.constructors.PrimitiveConstructorSpec(
         nargs=1,
         metavar="LATEST|JSON",
-        instance_from_str=lambda given: Keep(**json.loads(given[0]))
+        instance_from_str=lambda given: from_record(Keep, json.loads(given[0]), dtypes=False)
         if given[0].startswith("{")
         else int(given[0]),
         is_instance=lambda keep: isinstance(keep, (int, Keep)),
@@ -396,7 +387,7 @@ class SourceOptions:
     block_bidirectional, each of a row's blocks read whole, which a run's rows then lie in
     (`Pretrained.load`'s `modeling_overrides`); None the checkpoint's own:
     `--source.attention full_attention block_bidirectional`."""
-    dex: Annotated[DifferentialExtension | None, _record_argument(DifferentialExtension)] = None
+    dex: Annotated[DifferentialExtension, record_argument(DifferentialExtension)] | None = None
     """DEX's differential on chosen heads (`dew.nn.dex`, `Pretrained.load`'s `dex`), its record as
     JSON: `--source.dex '{"layers": [[0, [1, 3]], [5, [0, 2]]], "anneal_steps": 1000}'`, its
     `trains` the paper's recipe unless "all"; None for none."""
@@ -871,30 +862,34 @@ def _artifact_name(name: str) -> str:
     return re.sub(r"[^\w.-]", "-", name)
 
 
-_VIEWING: contextvars.ContextVar[bool] = contextvars.ContextVar("viewing", default=False)
-"""Set while a run is viewed offline (`RunConfig.inspected`): its `train` views one sampled update and
-ends there, training nothing (`_Viewed`)."""
-
-
-class _Viewed(Exception):
-    """What ends a run's `train` under `RunConfig.inspected`: the view it took (`RunConfig.viewed`)."""
-
-    def __init__(self, scalars: dict[str, float]):
-        super().__init__()
-        self.scalars = scalars
-
-
 @dataclasses.dataclass(frozen=True)
-class Prepared:
+class Prepared[LossT, EffectsT]:
     """What a run trains, as its class builds it (`RunConfig.prepare`).
 
     `run` is the run as it records itself, with what building resolved (a
-    pinned source, the model's fields as built). `train` trains it under a
-    name: `run.train` over the objective and the data the class built.
+    pinned source, the model's fields as built); `objective` and `dataset`
+    what it trains on, and the rest what `RunConfig.train` takes beside them.
+    `train` trains it under a name, and `inspected` views one sampled update
+    of it there (`RunConfig.viewed`).
     """
 
     run: "RunConfig"
-    train: Callable[[str], TrainState]
+    objective: Objective[LossT, EffectsT]
+    dataset: Dataset | Loader
+    metrics: Sequence[Metric] = ()
+    rollout: Rollout | None = None
+    summary: Mapping[str, object] | None = None
+    validation: Dataset | Mapping[str, Dataset | Reader] | None = None
+    after: Callable[[TrainState, str], None] | None = None
+
+    def train(self, name: str) -> TrainState:
+        return self.run.train(self.objective, self.dataset, name=name, metrics=self.metrics,
+                              rollout=self.rollout, summary=self.summary, validation=self.validation,
+                              after=self.after)
+
+    def inspected(self, name: str) -> dict[str, float]:
+        return self.run.viewed(self.objective, self.dataset, name=name, rollout=self.rollout,
+                               validation=self.validation)
 
 
 def flag_selected(given: Sequence[str], selected: Mapping[str, str]) -> list[str]:
@@ -992,8 +987,11 @@ def earlier_trainer(record: Mapping[str, object]) -> Mapping[str, object]:
     fields = record.get("fields")
     segments = fields.get("segments") if isinstance(fields, Mapping) else None
     if isinstance(fields, Mapping) and isinstance(segments, list):
-        # A decision run's row of segments, in today's fields (`earlier_segments`).
-        fields = {**fields, "segments": earlier_segments(segments)}
+        # A decision run's row of segments, each component in today's fields (`earlier_fields`): the
+        # segments alone, where a layout's components are, never a field of data a row holds.
+        migrated = earlier_fields(field_value(segments, "segments"))
+        assert isinstance(migrated, list)
+        fields = {**fields, "segments": migrated}
         record = {**record, "fields": fields}
     if not isinstance(fields, Mapping) or not isinstance(fields.get("trainer"), Mapping):
         return record
@@ -1590,8 +1588,7 @@ class RunConfig:
         self.built_fresh()
         objective = self.objective.build(model=self.model.build(**self.numerics_fields()))
         scored = self.validation_metrics(validates=self.validation is not None)
-        return Prepared(self, lambda name: self.train(objective, self.chain(), name=name, metrics=scored,
-                                                      validation=self.validation))
+        return Prepared(self, objective, self.chain(), metrics=scored, validation=self.validation)
 
     def default_metrics(self, *, validates: bool) -> tuple[MetricConfig, ...]:
         """The metrics a validation pass scores where `val_metrics` names none, by what the run's data
@@ -1766,6 +1763,28 @@ class RunConfig:
                              "carries none of it: train the run through `run()`, or call prepare_process "
                              "with them before anything calls JAX")
 
+    def readied(self, objective: Objective[Loss, Effects], dataset: Dataset | Loader,
+                validation: Dataset | Mapping[str, Dataset | Reader] | None, metrics: Sequence[Metric],
+                name: str) -> tuple[Self, Loader, Mapping[str, Reader] | None, Mapping[str, EvalSuite] | None,
+                                    int | None]:
+        """This run as it trains `objective` under `name`, and what it trains on, before anything is
+        placed (`train`, `viewed`): its data compiled with the objective's own stages and its validation
+        splits with it, the suites they score (`suites`), sized and ramped (`TrainerConfig.resolved`), with
+        its steps; its trunk quantized where it asks; its record naming the run's directory and its
+        optimizer's groups (`grouped`)."""
+        self.check_process()
+        dataset, held = self.compiled(objective.data(), dataset, validation)
+        # Each split scores the metrics `val_metrics` names for it, or else `metrics`, the kind's.
+        suites = self.suites(dataset, held, metrics)
+        sized, dataset, steps = self.trainer.resolved(dataset)
+        run = dataclasses.replace(self, trainer=sized)
+        if run.trainer.quantization is not None:
+            quantize_trunk(objective, run.trainer.quantization)
+        # The record names the run's directory, so its run.json trains the same run again.
+        run = dataclasses.replace(run.recorded(objective),
+                                  trainer=dataclasses.replace(run.trainer, name=name))
+        return dataclasses.replace(run, optim=run.grouped(objective, name)), dataset, held, suites, steps
+
     def train(self, objective: Objective[Loss, Effects], dataset: Dataset | Loader, *, name: str,
               metrics: Sequence[Metric] = (), rollout: Rollout | None = None,
               summary: Mapping[str, object] | None = None,
@@ -1801,23 +1820,13 @@ class RunConfig:
         on and the run's directory before the checkpoint is published, as a
         decision run fits its calibration there, so what it writes is published.
         """
-        self.check_process()
-        dataset, validation = self.compiled(objective.data(), dataset, validation)
-        # Each split scores the metrics `val_metrics` names for it, or else `metrics`, the kind's.
-        suites = self.suites(dataset, validation, metrics)
-        sized, dataset, steps = self.trainer.resolved(dataset)
-        self = dataclasses.replace(self, trainer=sized)
-        if self.trainer.quantization is not None:
-            quantize_trunk(objective, self.trainer.quantization)
-        # The record names the run's directory, so its run.json trains the same run again.
-        self = dataclasses.replace(self.recorded(objective),
-                                   trainer=dataclasses.replace(self.trainer, name=name))
-        self = dataclasses.replace(self, optim=self.grouped(objective, name))
+        self, dataset, validation, suites, steps = self.readied(objective, dataset, validation, metrics,
+                                                                name)
         trainer = self.trainer
         if dataset.plan is not None:
             summary = {**(summary or {}), "data_plan": dataset.plan.record()}
-        if trainer.compile_ahead is not None or _VIEWING.get():
-            raise self.ended(objective, dataset, steps, rollout, name)
+        if trainer.compile_ahead is not None:
+            raise self.compiled_ahead(objective, dataset, steps, rollout, name)
         tracker = checkpoints = None
         try:
             wandb_tracker = None
@@ -1903,29 +1912,23 @@ class RunConfig:
         with generation.run_precision(self.trainer.precision):
             return target.compiled(trainer, dataset, steps, self.trainer.examples if steps is None else None)
 
-    def ended[LossT, EffectsT](self, objective: Objective[LossT, EffectsT], dataset: Loader,
-                                steps: int | None, rollout: Rollout | None,
-                                name: str) -> CompiledAhead | _Viewed:
-        """What ends a run before it trains: its first step compiled ahead (`compiled_ahead`), or, viewed
-        offline, its view (`viewed`, `inspected`)."""
-        if self.trainer.compile_ahead is not None:
-            return self.compiled_ahead(objective, dataset, steps, rollout, name)
-        return _Viewed(self.viewed(objective, dataset, steps, rollout, name))
-
-    def viewed[LossT, EffectsT](self, objective: Objective[LossT, EffectsT], dataset: Loader,
-                                 steps: int | None, rollout: Rollout | None, name: str) -> dict[str, float]:
-        """The run's inspection of one sampled update over its training data's first batch
-        (`dew.training.inspected`), its trainer built as `train` builds it, from the checkpoints its
-        directory `name` holds, their latest, else its start, with no tracker: what `inspected` returns."""
+    def viewed(self, objective: Objective[Loss, Effects], dataset: Dataset | Loader, *, name: str,
+               rollout: Rollout | None = None,
+               validation: Dataset | Mapping[str, Dataset | Reader] | None = None) -> dict[str, float]:
+        """The run's inspection of one sampled update over the batch its first step takes
+        (`dew.training.inspected`, `first_step_batch`), the run readied as `train` readies it
+        (`readied`) and its trainer built as `train` builds it, from the checkpoints its directory `name`
+        holds, their latest, else its start, with no tracker: what `inspected` returns."""
         from dew.training import inspected
-        from dew.training._fit import first_batch
+        from dew.training.ahead import first_step_batch
 
-        held = epath.Path(self.trainer.checkpoint_dir, name).is_dir()
-        trainer = self.built(objective, self.trainer.mesh, rollout,
-                             checkpoints=self.trainer.checkpoints(name) if held else None)
-        with generation.run_precision(self.trainer.precision):
-            trainer.reading(dataset, examples=self.trainer.examples if steps is None else None, steps=steps)
-            return inspected(trainer, first_batch(dataset, trainer.device_mesh), steps=steps)
+        run, loader, _, _, steps = self.readied(objective, dataset, validation, (), name)
+        held = epath.Path(run.trainer.checkpoint_dir, name).is_dir()
+        trainer = run.built(objective, run.trainer.mesh, rollout,
+                            checkpoints=run.trainer.checkpoints(name) if held else None)
+        with generation.run_precision(run.trainer.precision):
+            batch = first_step_batch(trainer, loader, steps, run.trainer.examples if steps is None else None)
+            return inspected(trainer, batch, steps=steps)
 
     def inspected(self) -> dict[str, float]:
         """What the run's inspection (`TrainerConfig.inspection`) logs of one sampled update over its training
@@ -1937,14 +1940,7 @@ class RunConfig:
         if trainer.inspection is None:
             raise ValueError("the run names no inspection to view; name one, as --set trainer.inspection=...")
         prepare_process(None, trainer.multi_host, trainer.xla_flags, trainer.compilation_cache_dir)
-        token = _VIEWING.set(True)
-        try:
-            self.prepare().train(trainer.name or "inspected")
-        except _Viewed as view:
-            return view.scalars
-        finally:
-            _VIEWING.reset(token)
-        raise RuntimeError(f"{type(self).__name__} trained without its RunConfig.train, which views the run")
+        return self.prepare().inspected(trainer.name or "inspected")
 
     def grouped(self, objective: Objective[Loss, Effects], name: str) -> OptimConfig:
         """The run's optimizer as it trains under `name`: each group it names that claims the modules its

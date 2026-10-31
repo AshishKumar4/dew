@@ -111,7 +111,7 @@ def test_a_kinds_run_cools_down_and_skips_its_final_save_as_set(kind, tmp_path):
     run saves nothing."""
     run = trained(kind, tmp_path, "cooled", **{"trainer.steps": 4, "trainer.checkpoint_final": "False",
                                                  "trainer.cooldowns": {"at": [2], "length": 1}})
-    assert any(name.startswith("cooldown_") for name in scalars(run)[2])
+    assert any(name.startswith("cooldown/") for name in scalars(run)[2])
     assert saved(run) == []
 
 

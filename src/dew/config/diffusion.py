@@ -19,7 +19,6 @@ import tyro
 
 from dew._records import number, record
 from dew.batch import Variables, merge
-from dew.checkpoints import Checkpoints
 from dew.config import MetricConfig, ObjectiveConfig, Prepared, RunConfig
 from dew.config.media import media_field
 from dew.diffusion.presets import EDM, Flow, build_process
@@ -241,6 +240,25 @@ class DiffusionRunConfig(RunConfig):
         one whose size varies."""
         return media_field(self.chain(), "diffusion")
 
+    def mask_field(self, sample: Field, wanted: Field) -> Field:
+        """The batch field an inpainting pipeline reads its mask from (`wanted`, the pipeline's own): the
+        chain's `wanted.key` at the samples' height and width, one channel, as `dew.data.images.RandomMask`
+        draws one or a dataset's own column decodes one. A chain that carries none is refused, naming
+        RandomMask: an inpainting pipeline paints the region its mask marks, and a plain image chain
+        marks none."""
+        fields = record(self.chain().facts()["fields"], "the chain's fields")
+        shape = fields.get(wanted.key)
+        expected = (*sample.shape[:-1], 1)
+        if shape is None:
+            raise ValueError(f"{self.pretrained} is an inpainting pipeline, which paints the region a mask "
+                             f"marks in each image; the chain carries no {wanted.key!r} field: draw one per "
+                             f"image with dew.data.images.RandomMask() (images(..., augment=RandomMask())), "
+                             f"or decode a dataset's own into {wanted.key!r}")
+        if not isinstance(shape, list | tuple) or tuple(shape) != expected:
+            raise ValueError(f"the chain's {wanted.key!r} field is {shape!r}, and an inpainting pipeline "
+                             f"over {sample.key} of {sample.shape} reads a mask of {list(expected)}")
+        return Field(wanted.key, expected)
+
     def model_fields(self, autoencoder: AutoEncoder | None) -> dict[str, Configured]:
         """Return the fields the run derives for the model, which `ModelConfig.build`
         takes over the model's `arguments`.
@@ -304,6 +322,7 @@ class DiffusionRunConfig(RunConfig):
 
     def _objective(self, variables: Variables | None) -> DiffusionObjective:
         """The configured objective over `variables`."""
+        mask = None
         if self.pretrained is None:
             self.built_fresh()
             model, conditions, autoencoder = self._scratch(variables)
@@ -320,9 +339,6 @@ class DiffusionRunConfig(RunConfig):
                 source = source.adapt(self.lora, key=self.trainer.key)
             if source.inputs is None:
                 raise ValueError(f"{self.pretrained} loads no diffusion inputs to train on")
-            if source.inputs.mask is not None:
-                raise ValueError(f"{self.pretrained} is an inpainting pipeline, which trains "
-                                 "on masks an image dataset does not carry")
             # The objective is built over the pipeline itself, which brings the sampling policy it
             # samples by (`DiffusionObjective`'s `model`); the run's own process, inputs and tree
             # stand over the pipeline's.
@@ -331,7 +347,8 @@ class DiffusionRunConfig(RunConfig):
             # The data's geometry, in the autoencoder's own pixel channels:
             # Qwen-Image 2.1's are RGBA.
             sample = source.inputs.sample
-        inputs = InputSpec(sample=sample, conditions=conditions)
+            mask = None if source.inputs.mask is None else self.mask_field(sample, source.inputs.mask)
+        inputs = InputSpec(sample=sample, conditions=conditions, mask=mask)
         objective = self.objective.build(model=model, process=self._process(convention), inputs=inputs,
                                          autoencoder=autoencoder, variables=variables,
                                          **self._teacher(variables))
@@ -339,26 +356,32 @@ class DiffusionRunConfig(RunConfig):
         return objective
 
     def _teacher(self, variables: Variables | None) -> TeacherArguments:
-        """The teacher a distillation reads from `teacher_run`: the tree its run published, unless the
-        starting tree holds the teacher (`TEACHER`), and for guidance distillation the teacher's
-        objective rebuilt from the run's record over the tree the student holds frozen
-        (`teacher_weights`)."""
+        """The teacher a distillation reads from `teacher_run`, its step the one its task loads by
+        default (`SavedRun.pinned`): the model its run publishes (`SavedRun.variables`: the trained
+        policy, not a reference its average holds), unless the starting tree holds the teacher
+        (`TEACHER`), and for guidance distillation the teacher's objective over the run's own sampling
+        task (`TextToImage.from_saved`: its model, adapters included, its process and its inputs) bound
+        to the tree the student holds frozen (`teacher_weights`)."""
+        from dew.inference.images import TextToImage
+        from dew.inference.tasks import SavedRun
+
         if self.teacher_run is None:
             return {}
         kind = objectives[self.objective.name]
         if not issubclass(kind, FlowDistillationObjective | GuidanceDistillationObjective):
             raise ValueError(f"teacher_run names a distillation's teacher, and {self.objective.name} "
                              f"distills none")
-        published: Variables | None = None
-        if variables is None or TEACHER not in variables:
-            # A resumed student holds its teacher, so only a fresh one reads the teacher's run.
-            with Checkpoints(self.teacher_run) as checkpoints:
-                published = checkpoints.variables(ema=None, step=None, mesh=None, layout=None,
-                                                  param_dtype=None)
+        # A student that holds its teacher reads its run for guidance distillation's components alone.
+        fresh = variables is None or TEACHER not in variables
+        if not fresh and not issubclass(kind, GuidanceDistillationObjective):
+            return {}
+        run = SavedRun.pinned(self.teacher_run)
+        published = run.variables(ema=None) if fresh else None
         given: TeacherArguments = {} if published is None else {"teacher_variables": published}
         if issubclass(kind, GuidanceDistillationObjective):
-            held = teacher_weights(variables, published, whole=True)
-            given["teacher"] = DiffusionRunConfig.load(self.teacher_run).build(variables=held)
+            task = TextToImage.from_saved(run, variables=teacher_weights(variables, published, whole=True))
+            given["teacher"] = DiffusionObjective(task.model, task.process, task.inputs,
+                                                  autoencoder=task.autoencoder, ema_decay=None)
         return given
 
     def build_run(self) -> Prepared:
@@ -376,8 +399,7 @@ class DiffusionRunConfig(RunConfig):
         rollout = None
         if isinstance(objective, FlowGRPOObjective) and run.rollout is not None:
             rollout = run.rollout.build(objective)
-        return Prepared(run, lambda name: run.train(objective, dataset, name=name, metrics=metrics,
-                                                    rollout=rollout, validation=held))
+        return Prepared(run, objective, dataset, metrics=metrics, rollout=rollout, validation=held)
 
     def pinned(self) -> DiffusionRunConfig:
         """Return this run with its Hub sources pinned to the commits they resolve to now: an imported
