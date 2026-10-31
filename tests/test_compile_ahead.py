@@ -195,7 +195,7 @@ def test_a_configured_run_compiles_its_step_ahead_for_gpus_it_lacks_and_trains_n
     its default the run's own config) compiles its first step for one compile-only A100, writes it
     where it names, and ends with status 0, the step loadable and what it costs stated; it writes no
     checkpoint or tracking, as it trains nothing (row 1915)."""
-    from test_run_options import lm
+    from run_kinds import lm
 
     from dew.config.lm import LMRunConfig
     from dew.training.ahead import AheadOfTime, CompiledAhead
@@ -222,7 +222,7 @@ def test_a_configured_run_compiles_its_step_ahead_for_a_tpu_topology_with_its_st
     compiles its first step for that topology's compile-only devices here, through the plan a run takes,
     and writes it as any step compiled ahead (ledger 2551). The links it compiles with are the run's own
     (`trainer.links`), which the step records (ledger 2552)."""
-    from test_run_options import lm
+    from run_kinds import lm
 
     from dew.config.lm import LMRunConfig
     from dew.training.ahead import AheadOfTime, CompiledAhead
@@ -250,7 +250,7 @@ def test_a_run_on_the_examples_clock_compiles_its_step_ahead_reading_its_progres
     its steps, keeps its progress on the examples clock: compiled ahead for a GPU it lacks, its step reads
     that progress as fit's does (`Trainer.reading`), under a schedule over the run (`Linear`), and the run
     ends with the step saved, where it was compiled over no clock and refused the schedule (row 2434)."""
-    from test_run_options import decision
+    from run_kinds import decision
 
     from dew.decision.config import DecisionRunConfig
     from dew.training.ahead import AheadOfTime, CompiledAhead
@@ -279,7 +279,7 @@ def a_clocked_run_with_a_cooldown_trains_from_its_step_compiled_ahead_compiling_
     the step it saved (`--trainer.ahead`), trains from that step through its cooldown's branch, its last
     window's too, and compiles no step program of its own: each batch it steps closes its window as the
     one it compiled ahead over did (ledgers 2434, 2527)."""
-    from test_run_options import decision
+    from run_kinds import decision
 
     from dew.decision.config import DecisionRunConfig
     from dew.nn.kernels.generation import device_generation

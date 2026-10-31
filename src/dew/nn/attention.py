@@ -271,7 +271,7 @@ def template_attention(query, key, value, causal: bool, sliding_window, *, sinks
     (`key_spans`): its causality, window, documents (`segment_ids`, or `CrossDocuments` aligned to their last
     keys), key lengths and starts, block and image groups, and key validity and counted places, with
     probability dropout at `dropout_rate` drawn from `dropout_seed`. A softcap is a score hook, a `bias` a
-    score hook added after it (`template.biased`): one term a key `[B or 1, H or 1, 1, K]` (ALiBi's, over the
+    score hook added after it (`template.Biased`): one term a key `[B or 1, H or 1, 1, K]` (ALiBi's, over the
     keys' logical places) a key parameter, a dense `[B or 1, H or 1, Q, K]` one a tile parameter, read a
     tile at a time and its gradient the tiles' pulled cotangents; sinks are the softmax's initial state. On
     a mesh it runs per shard (`on_attention_shards`), as the decode kernel does: the key heads repeat until
@@ -297,7 +297,7 @@ def template_attention(query, key, value, causal: bool, sliding_window, *, sinks
                                     dropout_places.queries, dropout_places.keys)
         elif seed is not None and global_rows is not None and global_heads is not None:
             drop = template.Dropout(seed, global_rows, global_heads, dropout_rate)
-        capped = None if softcap is None else functools.partial(template.capped, softcap)
+        capped = None if softcap is None else template.Capped(softcap)
         if bias is None:
             params = ()
         elif bias.shape[2] == 1:
@@ -305,7 +305,7 @@ def template_attention(query, key, value, causal: bool, sliding_window, *, sinks
         else:
             params = (template.Param(bias, template.Kind.TILE),)
         hooks = template.Hooks(
-            score_mod=capped if bias is None else functools.partial(template.biased, capped),
+            score_mod=capped if bias is None else template.Biased(capped),
             score_params=params,
             initial=None if sinks is None else template.sinks(sinks, batch, queries, value.shape[-1]),
             drop=drop)

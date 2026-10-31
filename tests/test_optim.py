@@ -304,7 +304,7 @@ def test_a_run_saved_with_a_newton_schulz_level_loads_with_its_dot_algorithm(rec
     fast forms, none stated, and stated where the run's forms are accurate, whose own is float32 (row
     2753), a run saved before its trainer held a precision policy accurate by its `attention_form`
     among them; tensorfloat32 and float32 their algorithms, whose Muon builds."""
-    from test_run_options import lm
+    from run_kinds import lm
 
     from dew.config import RunConfig
     from dew.nn.precision import ACCURATE
