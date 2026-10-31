@@ -610,6 +610,10 @@ class Transaction:
             raise ValueError("an objective with post-step effects (Aux.effects) under an optimizer that "
                              "holds updates back, whose held calls' effects no update applies; accumulate "
                              "gradients with Trainer(accumulation=k)")
+        if holds_back(current.opt_state) and current.deferred is None:
+            raise ValueError("the state holds no tokens waiting for the update its optimizer holds back "
+                             "(TrainState.deferred): build it with Trainer.initial_state, or restore it "
+                             "through the trainer, which gives one written before them none waiting")
         native = jax.tree.map(_descending, gradient, current.variables["params"])
         native_finite = _all_finite(native)
         norm = optax.global_norm(native)

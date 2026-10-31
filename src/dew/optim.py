@@ -35,7 +35,7 @@ import tyro
 
 from dew._hashing import fmix32
 from dew._records import share
-from dew.held_updates import update_applied
+from dew.held_updates import refuse_untold, update_applied
 from dew.mesh import LogicalAxes
 from dew.newton_schulz import (
     NEWTON_SCHULZ,
@@ -1155,10 +1155,12 @@ def power_profiles(solver: optax.GradientTransformation,
     solver = optax.with_extra_args_support(solver)
 
     def init_fn(params):
+        inner = solver.init(params)
+        # Its averages move on the updates `solver` applies, which its state must say (`update_applied`).
+        refuse_untold(inner)
         return PowerProfilesState(updates=jnp.zeros([], jnp.int32), stds=jnp.asarray(stds, jnp.float32),
                                   powers=jnp.asarray([exponent(std) + 1 for std in stds], jnp.float32),
-                                  averages=tuple(jax.tree.map(jnp.copy, params) for _ in stds),
-                                  inner=solver.init(params))
+                                  averages=tuple(jax.tree.map(jnp.copy, params) for _ in stds), inner=inner)
 
     def update_fn(updates, state, params=None, **extra_args):
         if params is None:
