@@ -1486,6 +1486,33 @@ def test_a_cooldown_branch_scores_what_a_run_decayed_there_scores_and_leaves_the
         np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
 
 
+def test_a_cooldown_branchs_scoring_artifacts_keep_apart_from_the_runs_at_its_step(tmp_path):
+    """A run that keeps every evaluation's scoring artifacts (`scored_to`) keeps a cooldown branch's,
+    scored at the step it branched at, under `cooldown/` beside the run's own at that step
+    (`<scored_to>/step-<step>/cooldown/<split>-<batch>.npz`), neither written over the other."""
+    import grain.python as grain
+    from test_chain_compile import held_tokens
+
+    from dew.data import from_grain, from_iter
+    from dew.objectives.lm import Perplexity
+    from dew.training.cooldown import Cooldowns
+
+    train = from_grain(grain.MapDataset.source(list(held_tokens()) * 4), "indexed-tokens").batch(16)
+    held = from_iter(held_tokens, name="streamed-tokens").batch(8).read("streamed").workers(0)
+    model = CausalTransformer(vocab_size=8, emb_features=8, num_layers=1, num_heads=2, mlp_features=16,
+                              max_seq_len=8, attention_impl="xla")
+    objective = LMObjective(model, seq_len=4)
+    Trainer(objective, optax.inject_hyperparams(optax.adam)(learning_rate=1e-3), key=0).fit(
+        train.read("indexed").workers(0), validation=held, steps=4, eval_every=2, metrics=(Perplexity(),),
+        cooldowns=Cooldowns(at=(2,), length=1), scored_to=tmp_path)
+    run = {path.name: np.load(path) for path in (tmp_path / "step-2").glob("val-*.npz")}
+    branch = {path.name: np.load(path) for path in (tmp_path / "step-2" / "cooldown").glob("val-*.npz")}
+    assert run and branch.keys() == run.keys()
+    # The branch scored its own decayed state, the run its state at the step.
+    assert any(not np.array_equal(run[name][field], branch[name][field])
+               for name in run for field in run[name].files)
+
+
 @pytest.mark.parametrize("best", [False, True], ids=["unranked", "weights-best"])
 def test_a_cooldown_a_preemption_cuts_short_runs_again_on_resume(tmp_path, best):
     """A preemption that reaches a run as it branches into a cooldown stops it at the step the branch
