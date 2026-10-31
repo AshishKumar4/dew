@@ -2975,7 +2975,7 @@
      "runs": "maxtext"
     }
    ],
-   "note": "MaxText's GPT-3 (decoder_block gpt3, model gpt3-52k at two layers, a vocabulary and position table of 64) run by tools/maxtext_worker.py on the CPU over each seed's drawn weights and eight tokens, in float32 and, its validated config's dtypes set to float64, in float64; kept as its evidence and its truth's sketch over 40 draws (8 declared seeds and their redraw)."
+   "note": "MaxText's GPT-3 (decoder_block gpt3, model gpt3-52k at two layers, a vocabulary and position table of 64) run by tools/maxtext_worker.py gpt3 on the CPU over each seed's drawn weights and eight tokens, in float32 and, its validated config's dtypes set to float64 and its bfloat16 read of the tied table and its RMSNorm's float32 carried in float64 (float64_casts), in float64; kept as its evidence and its truth's sketch over 80 draws (16 declared seeds and their redraw)."
   },
   "maxtext/engram.npz": {
    "tool": "tools/maxtext_reference.py",

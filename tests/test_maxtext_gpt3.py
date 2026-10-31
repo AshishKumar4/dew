@@ -15,7 +15,7 @@ FIXTURE = Path(__file__).parent / "fixtures" / "maxtext" / "gpt3.npz"
 SHAPE = {"emb": 16, "heads": 2, "head_dim": 8, "mlp": 64, "layers": 2, "vocab": 64, "positions": 64,
          "tokens": 8}
 """gpt3-52k's shape at two layers and a vocabulary and position table of 64 (tools/maxtext_worker.py)."""
-GPT3_SEEDS = 8
+GPT3_SEEDS = 16
 """The declared seeds, sized by `seeds_for` paired as the recording confirmed them."""
 
 
@@ -40,15 +40,12 @@ def maxtext_layout() -> dict[str, tuple[int, ...]]:
 def draw(seed: int) -> dict[str, np.ndarray]:
     """A seed's MaxText weights and tokens: kernels and tables at a deviation of 0.1, the norms' offsets
     and every bias at 0.5, so none sits at its initialization (MaxText's own GPT-3 test draws its
-    norms and biases off zero, tests/unit/gpt3_test.py), and eight tokens. The token table is drawn
-    exact in bfloat16: MaxText 0.2.5 reads the tied table in bfloat16 for the logits whatever its
-    dtype (maxtext/layers/embeddings.py:199-204, `attend_on_embedding`), a rounding of its own, which a
-    bfloat16-exact table makes the identity, so both compute the architecture's logits."""
+    norms and biases off zero, tests/unit/gpt3_test.py), and eight tokens. MaxText's float32 run reads
+    the tied table in bfloat16 for its logits (maxtext/layers/embeddings.py:199-204), a rounding of its
+    own, which its recorded float64 truth does not make (tools/maxtext_worker.py `float64_casts`)."""
     rng = np.random.default_rng([878, seed])
     drawn = {f"param.{path}": (rng.normal(0, 0.5 if path.endswith(("scale", "bias")) else 0.1, shape)
                                .astype(np.float32)) for path, shape in maxtext_layout().items()}
-    table = "param.token_embedder/embedding"
-    drawn[table] = np.asarray(jnp.asarray(drawn[table], jnp.bfloat16), np.float32)
     return {**drawn, "ids": rng.integers(0, SHAPE["vocab"], (1, SHAPE["tokens"])).astype(np.int32)}
 
 
@@ -80,7 +77,7 @@ def dew_variables(inputs) -> dict:
     return {"params": unflatten_dict({tuple(path.split("/")): value for path, value in tree.items()})}
 
 
-def decoder(dtype=jnp.float32):
+def decoder(dtype):
     """MaxText's gpt3-52k as Dew's decoder at `SHAPE`."""
     from importlib import import_module
 
@@ -98,9 +95,13 @@ def decoder(dtype=jnp.float32):
         "dtype": jnp.dtype(dtype).name})
 
 
-def logits(model, inputs) -> dict:
-    """Dew's logits of a draw's tokens under its weights."""
-    return {"logits": model.apply(dew_variables(inputs), inputs["ids"])}
+OUTPUT = "logits"
+"""The name of what `dew` gives, the site's recorded leaf."""
+
+
+def dew(dtype, inputs) -> dict:
+    """Dew's logits at `dtype` of a draw's tokens under its weights."""
+    return {OUTPUT: decoder(dtype).apply(dew_variables(inputs), inputs["ids"])}
 
 
 def test_dews_gpt3_computes_maxtexts_logits():
@@ -108,5 +109,4 @@ def test_dews_gpt3_computes_maxtexts_logits():
     float64 run (check 1 over the recorded seeds), Dew's float64 run held to that run's recorded
     sketch: positions, offset norms, fused attention, the GELU MLP and the tied logits all as MaxText
     computes them."""
-    assert_as_exact_as_maxtext(FIXTURE, "gpt3", GPT3_SEEDS, draw,
-                               lambda dtype, inputs: logits(decoder(dtype), inputs), "MaxText's GPT-3 logits")
+    assert_as_exact_as_maxtext(FIXTURE, "gpt3", GPT3_SEEDS, draw, dew, "MaxText's GPT-3 logits")

@@ -9,6 +9,7 @@ float64 twin their truth.
 import argparse
 import dataclasses
 import json
+import sys
 from pathlib import Path
 
 import jax
@@ -22,12 +23,12 @@ from dew.interop import Pretrained
 from dew.interop.verify import _ROUNDING
 from dew.sampling import Sampling, generate
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from hf_reference import write_device_tiny
+from reference_source import torch_generated, torch_logits
+
 
 def write_fixture(family):
-    # The tests import this module as tools.classic_gpt_reference, where
-    # hf_reference is not on the path; the fixture runs as a script beside it.
-    from hf_reference import write_device_tiny
-
     config = (OPTConfig(vocab_size=128, hidden_size=32, num_hidden_layers=2,
                         num_attention_heads=4, ffn_dim=48, max_position_embeddings=64,
                         dropout=0, attention_dropout=0, bos_token_id=1,
@@ -45,10 +46,6 @@ def check_checkpoint(checkpoint, output, revision):
     """`checkpoint`'s fp32 logits and greedy continuation at its pinned `revision` through the loader
     against transformers'. The reference runs on the CPU whatever JAX's platform, so a CPU-only Torch
     build supplies it beside a GPU and no TF32 enters it."""
-    # The tests import this module as tools.classic_gpt_reference, where reference_source is not on the
-    # path; the check runs as a script beside it.
-    from reference_source import torch_generated, torch_logits
-
     config = AutoConfig.from_pretrained(checkpoint, revision=revision)
     reference = AutoModelForCausalLM.from_pretrained(checkpoint, dtype=torch.float32,
                                                     attn_implementation='eager', revision=revision).eval()

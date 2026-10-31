@@ -355,7 +355,8 @@ def write_classic_tiny(name: str, model: PreTrainedModel) -> None:
     generated = torch_generated(model, ids[:, :4], 6)
     if model.config.model_type == 'phi3':
         np.save(directory / 'transformers_generated.npy', generated)
-        generated = torch_greedy(model, ids[:, :4], 6)
+        # In the release generate's ids, as transformers_generated.npy beside it holds them.
+        generated = torch_greedy(model, ids[:, :4], 6).astype(np.int64)
     np.save(directory / 'generated.npy', generated)
 
 

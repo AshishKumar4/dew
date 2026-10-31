@@ -9,7 +9,6 @@ the streams. MaxText's layer over drawn weights, streams and buckets is recorded
 
 from pathlib import Path
 
-import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax.traverse_util import unflatten_dict
@@ -67,25 +66,28 @@ def dew_variables(inputs) -> dict:
     return {"params": unflatten_dict({tuple(path.split("/")): value for path, value in tree.items()})}
 
 
-def layer(dtype=jnp.float32):
+def layer(dtype):
     from dew.nn.engram import PLELayer
 
     return PLELayer(rows=sum(VOCAB_SIZES), head_dim=HEAD_DIM, hc_mult=STREAMS, emb_features=WIDTH,
                     norm_eps=EPSILON, kernel_size=KERNEL, dilation=MAX_NGRAM, use_bias=True, dtype=dtype)
 
 
-def output(model, inputs) -> dict:
-    """Dew's streams after the layer, each head's local bucket offset into the one table."""
+OUTPUT = "streams"
+"""The name of what `dew` gives, the site's recorded leaf."""
+
+
+def dew(dtype, inputs) -> dict:
+    """Dew's streams at `dtype` after the layer, each head's local bucket offset into the one table."""
     offsets = np.cumsum((0, *VOCAB_SIZES[:-1]))
-    return {"streams": model.apply(dew_variables(inputs), inputs["streams"], inputs["ids"] + offsets)}
+    return {OUTPUT: layer(dtype).apply(dew_variables(inputs), inputs["streams"], inputs["ids"] + offsets)}
 
 
 def test_the_ple_layer_computes_maxtexts_engram():
     """Dew's float32 streams after its PLE layer under MaxText's Engram weights are as exact as
     MaxText's own float32 layer against its float64 run (check 1 over the recorded seeds), Dew's float64
     run held to that run's recorded sketch."""
-    assert_as_exact_as_maxtext(FIXTURE, "engram", ENGRAM_SEEDS, draw,
-                               lambda dtype, inputs: output(layer(dtype), inputs), "MaxText's Engram")
+    assert_as_exact_as_maxtext(FIXTURE, "engram", ENGRAM_SEEDS, draw, dew, "MaxText's Engram")
 
 
 def test_a_bias_for_v41s_engram_layer_is_refused():

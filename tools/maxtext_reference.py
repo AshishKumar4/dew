@@ -24,18 +24,17 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tests"))
 sys.path.insert(0, str(ROOT / "tools"))
 
-SITES = {"gpt3": ("test_maxtext_gpt3", lambda test, inputs: test.logits(test.decoder(), inputs)),
-         "engram": ("test_maxtext_engram", lambda test, inputs: test.output(test.layer(), inputs))}
-"""Each site's test module and Dew's float32 run on a draw."""
+SITES = {"gpt3": "test_maxtext_gpt3", "engram": "test_maxtext_engram"}
+"""Each site's test module, whose `draw`, `dew` (Dew's run at a dtype) and `OUTPUT` the recording reads."""
 
 
 def main() -> None:
     import jax
+    import jax.numpy as jnp
     from recorded_references import provenance, record_case, save
 
     site, python = sys.argv[1], sys.argv[2]
-    module, dew_run = SITES[site]
-    test = importlib.import_module(module)
+    test = importlib.import_module(SITES[site])
     version = subprocess.run([python, "-c", "import importlib.metadata as m; print(m.version('maxtext'))"],
                              capture_output=True, text=True, check=True).stdout.strip()
     if version != "0.2.5":
@@ -54,10 +53,9 @@ def main() -> None:
         if worker.stdout.readline().strip() != "done":
             raise RuntimeError("MaxText's worker stopped")
         with np.load(out) as answered:
-            name = next(iter(dew_run(test, inputs)))
-            return {name: answered["case.reference"]}, {name: answered["case.truth"]}
+            return {test.OUTPUT: answered["case.reference"]}, {test.OUTPUT: answered["case.truth"]}
 
-    dew = jax.jit(lambda inputs: dew_run(test, inputs))
+    dew = jax.jit(lambda inputs: test.dew(jnp.float32, inputs))
     arrays = record_case(site, test.draw, evaluate, store_inputs=False, summary=True, dew=dew)
     worker.stdin.close()
     worker.wait()

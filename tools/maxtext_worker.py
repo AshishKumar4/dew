@@ -2,19 +2,21 @@
 tools/maxtext_reference.py, run in an environment holding maxtext 0.2.5 (its JAX stack, apart from
 Dew's), on the CPU.
 
-    python tools/maxtext_worker.py SITE --layout OUT    the model's parameters by path and shape
-    python tools/maxtext_worker.py SITE --serve         `IN OUT` lines on stdin, each answered `done`
+    python tools/maxtext_worker.py SITE    `IN OUT` lines on stdin, each answered `done`
 
 SITE is `gpt3` (maxtext/models/gpt3.py's decoder, gpt3-52k at `GPT3`) or `engram` (maxtext/layers/
 engram.py's layer at `ENGRAM`). IN holds cases `<case>.<input>` and `<case>.param.<path>` each
 parameter by its path (`/`-joined) in MaxText's own layout; OUT gets `<case>.reference` and
 `<case>.truth`, the output in float32 and float64. MaxText's config takes float32 at widest; its
 float64 run is the same model with its computation's and weights' dtypes set to float64 after the
-config validates, its own arithmetic carried in float64.
+config validates, its own arithmetic carried in float64, the narrower dtypes it casts to whatever its
+dtype among it (`float64_casts`): its float64 run computes the architecture, its float32 run MaxText's
+own arithmetic.
 """
 
 from __future__ import annotations
 
+import contextlib
 import os
 import sys
 
@@ -57,12 +59,11 @@ def mesh(held):
 
 
 def gpt3(dtype: str):
-    """`(apply(params, case), layout)`: MaxText's GPT-3 logits of a case's `ids` `[B, T]` at positions
-    0..T-1, one document, and its parameter shapes."""
-    import flax.linen as nn
+    """`apply(params, case)`: MaxText's GPT-3 logits of a case's `ids` `[B, T]` at positions 0..T-1, one
+    document."""
     import jax
     import jax.numpy as jnp
-    from flax.traverse_util import flatten_dict, unflatten_dict
+    from flax.traverse_util import unflatten_dict
     from maxtext.common.common_types import MODEL_MODE_TRAIN
     from maxtext.layers import quantizations
     from maxtext.models import models
@@ -84,28 +85,17 @@ def gpt3(dtype: str):
         tree = unflatten_dict({tuple(path.split("/")): value for path, value in params.items()})
         return forward(tree, jnp.asarray(case["ids"], jnp.int32))
 
-    ids = jnp.zeros((1, 4), jnp.int32)
-    keys = {"params": jax.random.key(0), "dropout": jax.random.key(0)}
-    shapes = nn.unbox(jax.eval_shape(lambda: net.init(keys, ids, ids, decoder_segment_ids=jnp.ones_like(ids),
-                                                      enable_dropout=False))["params"])
-    return apply, {"/".join(path): leaf.shape for path, leaf in flatten_dict(shapes).items()}
+    return apply
 
 
 def engram(dtype: str):
-    """`(apply(params, case), layout)`: MaxText's Engram layer over a case's `streams` `[B, S, G, D]` and
-    each head's local bucket `ids` `[B, S, H_total]`, the caller's residual added (the layer leaves it
-    to its caller, maxtext/layers/engram.py:621-695), and its parameter shapes."""
-    import types
-
+    """`apply(params, case)`: MaxText's Engram layer over a case's `streams` `[B, S, G, D]` and each head's
+    local bucket `ids` `[B, S, H_total]`, the caller's residual added (the layer leaves it to its caller,
+    maxtext/layers/engram.py:621-695)."""
     import jax.numpy as jnp
     from flax import nnx
-    from maxtext.layers import normalizations
     from maxtext.layers.engram import Engram
 
-    if dtype == "float64":
-        # MaxText's RMSNorm computes in float32 whatever its dtype (maxtext/layers/normalizations.py:96,
-        # 118); its float64 run carries that arithmetic in float64, the module's own float32 read as it.
-        normalizations.jnp = types.SimpleNamespace(**{**vars(jnp), "float32": jnp.float64})
     held = config(dtype, base_emb_dim=ENGRAM_WIDTH)
     module = Engram(config=held, mesh=mesh(held), rngs=nnx.Rngs(0), **ENGRAM)
     flat = nnx.to_flat_state(nnx.state(module, nnx.Param))
@@ -122,11 +112,41 @@ def engram(dtype: str):
         nnx.update(module, nnx.from_flat_state(given))
         return forward(module, jnp.asarray(case["streams"], dtype), jnp.asarray(case["ids"], jnp.int32))
 
-    return apply, {named(path): tuple(leaf.get_value().shape) for path, leaf in flat}
+    return apply
 
 
 SITES = {"gpt3": gpt3, "engram": engram}
 _BUILT: dict = {}
+
+
+class _Widened:
+    """`jax.numpy` with the dtypes in `names` read as float64, everything else its own."""
+
+    def __init__(self, names: frozenset[str]):
+        self.names = names
+
+    def __getattr__(self, name: str):
+        import jax.numpy as jnp
+
+        return jnp.float64 if name in self.names else getattr(jnp, name)
+
+
+@contextlib.contextmanager
+def float64_casts(dtype: str):
+    """While a float64 program builds and traces, the casts MaxText makes whatever its dtype carried in
+    float64: its RMSNorm's to float32 (maxtext/layers/normalizations.py:96, 118) and its tied table's to
+    bfloat16 for the logits (maxtext/layers/embeddings.py:199-204, `attend_on_embedding`); its float32
+    programs read them as written."""
+    if dtype != "float64":
+        yield
+        return
+    from unittest import mock
+
+    from maxtext.layers import embeddings, normalizations
+
+    with (mock.patch.object(normalizations, "jnp", _Widened(frozenset({"float32"}))),
+          mock.patch.object(embeddings, "jnp", _Widened(frozenset({"bfloat16"})))):
+        yield
 
 
 def run(site: str, cases: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
@@ -137,16 +157,17 @@ def run(site: str, cases: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     out = {}
     for dtype, kind, wide in (("float32", "reference", False), ("float64", "truth", True)):
         jax.config.update("jax_enable_x64", wide)
-        if (site, dtype) not in _BUILT:
-            _BUILT[site, dtype] = SITES[site](dtype)[0]
-        apply = _BUILT[site, dtype]
-        for name in names:
-            prefix, given = f"{name}.param.", f"{name}."
-            params = {key.removeprefix(prefix): jnp.asarray(value, dtype) for key, value in cases.items()
-                      if key.startswith(prefix)}
-            case = {key.removeprefix(given): value for key, value in cases.items()
-                    if key.startswith(given) and not key.startswith(prefix)}
-            out[f"{name}.{kind}"] = np.asarray(apply(params, case), dtype)
+        with float64_casts(dtype):
+            if (site, dtype) not in _BUILT:
+                _BUILT[site, dtype] = SITES[site](dtype)
+            apply = _BUILT[site, dtype]
+            for name in names:
+                prefix, given = f"{name}.param.", f"{name}."
+                params = {key.removeprefix(prefix): jnp.asarray(value, dtype) for key, value in cases.items()
+                          if key.startswith(prefix)}
+                case = {key.removeprefix(given): value for key, value in cases.items()
+                        if key.startswith(given) and not key.startswith(prefix)}
+                out[f"{name}.{kind}"] = np.asarray(apply(params, case), dtype)
     return out
 
 
@@ -162,9 +183,4 @@ def serve(site: str) -> None:
 
 if __name__ == "__main__":
     os.environ.setdefault("JAX_PLATFORMS", "cpu")
-    site, mode = sys.argv[1], sys.argv[2]
-    if mode == "--layout":
-        shapes = SITES[site]("float32")[1]
-        np.savez(sys.argv[3], **{path: np.asarray(shape) for path, shape in shapes.items()})
-    else:
-        serve(site)
+    serve(sys.argv[1])
