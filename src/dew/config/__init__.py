@@ -1001,14 +1001,14 @@ def earlier_chains(record: Mapping[str, object]) -> Mapping[str, object]:
 
 
 def _renamed_chain(chain: JSON) -> JSON:
-    """A chain's record (`dew.data.records`), or a run's named splits of them, its stores' renamed fields
-    under today's names (`_renamed_stores`)."""
+    """A chain's record (`dew.data.records`), or a run's named splits of them, as a saved run's record holds
+    it, read at that boundary: its stores' renamed fields under today's names (`_renamed_stores`)."""
     if not isinstance(chain, dict):
         return chain
     splits = chain.get("splits")
     if isinstance(splits, list):
-        pairs = [[pair[0], _renamed_chain(pair[1])] if isinstance(pair, list) and len(pair) == 2 else pair
-                 for pair in splits]
+        pairs: list[JSON] = [[pair[0], _renamed_chain(pair[1])] if isinstance(pair, list) and len(pair) == 2
+                             else pair for pair in splits]
         return {**chain, "splits": pairs}
     stages = chain.get("stages")
     if isinstance(stages, list):
@@ -1022,13 +1022,16 @@ def _renamed_chain(chain: JSON) -> JSON:
         assert isinstance(member_chains, list)
         return {**chain, "source": {**source, members: [_renamed_chain(member) for member in member_chains]}}
     if "pipe" in source:
-        return {**chain, "source": {**_renamed_call(source), "input": _renamed_chain(source.get("input"))}}
+        called = _renamed_call(source)
+        assert isinstance(called, dict)
+        return {**chain, "source": {**called, "input": _renamed_chain(source.get("input"))}}
     return {**chain, "source": _renamed_stores(source)}
 
 
 def _renamed_call(call: JSON) -> JSON:
-    """A call of `pipe` a chain records (`{"pipe": ..., "settings": {...}}`), each setting that holds stores
-    with their renamed fields under today's names (`_renamed_stores`); any other entry as it is."""
+    """A call of `pipe` a saved chain records (`{"pipe": ..., "settings": {...}}`), read at that boundary:
+    each setting that holds stores with their renamed fields under today's names (`_renamed_stores`); any
+    other entry as it is."""
     if not isinstance(call, dict) or "pipe" not in call or not isinstance(call.get("settings"), dict):
         return call
     settings = call["settings"]
@@ -1037,9 +1040,9 @@ def _renamed_call(call: JSON) -> JSON:
 
 
 def _renamed_stores(value: JSON) -> JSON:
-    """`value`, a store's class record or a list of them, each store's fields its class renamed
-    (`RENAMED_FIELDS`) under today's names, and each of its fields that holds stores the same; anything
-    else, a store's data among it, as it is."""
+    """`value`, a store's class record or a list of them as a saved chain holds them, read at that boundary:
+    each store's fields its class renamed (`RENAMED_FIELDS`) under today's names, and each of its fields that
+    holds stores the same; anything else, a store's data among it, as it is."""
     if isinstance(value, list):
         return [_renamed_stores(part) for part in value] if value and all(map(_is_store, value)) else value
     if not _is_store(value):
@@ -1053,7 +1056,8 @@ def _renamed_stores(value: JSON) -> JSON:
 
 
 def _is_store(value: JSON) -> bool:
-    """Whether `value` is the class record of one of Dew's stores (`dew.data.pipeline.Dataset`)."""
+    """Whether `value`, read from a saved chain at its boundary, is the class record of one of Dew's stores
+    (`dew.data.pipeline.Dataset`)."""
     if not isinstance(value, dict) or not isinstance(value.get("fields"), dict):
         return False
     named = value.get("class")
