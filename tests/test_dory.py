@@ -16,6 +16,7 @@ import pytest
 from decision_support import decision_rows
 from float64_terms import float64_forward
 from interop_support import assert_reloads, assert_same_stored_tensors
+from model_support import as_stepped
 from one_draw import assert_as_exact_as_the_reference
 from reference_error import (
     as_given,
@@ -167,8 +168,9 @@ def test_a_cached_greedy_continuation_reads_each_cache_as_vllm_keeps_it(mode, lo
     float64.
     A per-pass cache is exact, the full forward's: the uncached logits of the whole continuation
     hold to the same rule at the positions each step decoded, and the cached steps to the rule of
-    those uncached logits. A last-loop cache is the model's own approximation, held to the
-    reference's decoding under it."""
+    the uncached logits at the shapes each step computes (`as_stepped`: the prompt's from one
+    forward over it, each later step's from one over the continuation up to it; ledger 1543). A
+    last-loop cache is the model's own approximation, held to the reference's decoding under it."""
     loaded = load()
     model = with_cache(loaded.model if loops is None else loaded.model.with_passes(loops), mode)
     tag = mode if loops is None else f'{mode}_{loops}'
@@ -187,9 +189,12 @@ def test_a_cached_greedy_continuation_reads_each_cache_as_vllm_keeps_it(mode, lo
     reference, truth = REFERENCE[f'step_logits_{tag}'], REFERENCE[f'step_logits_{tag}_f64']
     assert_as_exact_as_the_reference(steps, reference, truth, f"Dory's {tag} decoding")
     if mode == 'per_loop':
-        whole = np.asarray(model.apply(variables, jnp.asarray(expected[None, :-1])))[0, 5:]
+        continuation = jnp.asarray(expected[None, :-1])
+        whole = np.asarray(model.apply(variables, continuation))[0, 5:]
         assert_as_exact_as_the_reference(whole, reference, truth, "Dory's forward over its continuation")
-        assert_as_exact_as_the_reference(steps, whole, truth, "Dory's per-pass cache against its forward")
+        forward = jax.jit(lambda tokens: model.apply(variables, tokens))
+        stepped = np.asarray(as_stepped(forward, continuation, 6))[0, 5:]
+        assert_as_exact_as_the_reference(steps, stepped, truth, "Dory's per-pass cache against its forwards")
 
 
 @pytest.mark.parametrize('mode', ['per_loop', 'last_loop'])

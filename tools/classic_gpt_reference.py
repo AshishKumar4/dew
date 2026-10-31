@@ -9,6 +9,7 @@ float64 twin their truth.
 import argparse
 import dataclasses
 import json
+import sys
 from pathlib import Path
 
 import jax
@@ -22,10 +23,12 @@ from dew.interop import Pretrained
 from dew.interop.verify import _ROUNDING
 from dew.sampling import Sampling, generate
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from reference_source import torch_generated, torch_logits
+
 
 def write_fixture(family):
-    # The tests import this module as tools.classic_gpt_reference, where
-    # hf_reference is not on the path; the fixture runs as a script beside it.
+    # The fixture writer alone reads hf_reference, whose import loads transformers' models.
     from hf_reference import write_device_tiny
 
     config = (OPTConfig(vocab_size=128, hidden_size=32, num_hidden_layers=2,
@@ -50,10 +53,7 @@ def check_checkpoint(checkpoint, output, revision):
                                                     attn_implementation='eager', revision=revision).eval()
     tokenizer = AutoTokenizer.from_pretrained(checkpoint, revision=revision)
     ids = tokenizer('The capital of France is', return_tensors='np')['input_ids'].astype(np.int32)
-    with torch.no_grad():
-        expected = reference(torch.from_numpy(ids).long(), use_cache=False).logits.numpy()
-        generated = reference.generate(torch.from_numpy(ids).long(), do_sample=False, max_new_tokens=6,
-                                       eos_token_id=None, pad_token_id=0).numpy()
+    expected, generated = torch_logits(reference, ids), torch_generated(reference, ids, 6)
     del reference
     loaded = Pretrained.load(checkpoint, dtype='float32', attention_impl='reference', max_seq_len=64,
                              revision=revision)

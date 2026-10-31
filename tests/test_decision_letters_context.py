@@ -237,11 +237,11 @@ def test_a_run_names_its_lettered_question_read_in_context_on_the_command_line(t
 
 
 def test_a_lettered_run_saved_when_its_option_lines_named_a_stream_loads():
-    """A lettered run saved at a main whose option lines named their stream (0b4eb412b, between rows 2008
+    """A lettered run saved at a main whose option lines named their stream (794e70385, between rows 2008
     and 2450) loads: its run record (`earlier_run`) and its checkpoint's task record (`SavedRun`,
     `earlier_shapes`) read their option lines without it, which follow their instructions now, so their
     question still stands in the context (row 2627)."""
-    saved = SAVED_RECORDS / "0b4eb412b"
+    saved = SAVED_RECORDS / "794e70385"
     # The run's record as a resume reads it (`RunConfig.check_resume`): its segments in today's fields.
     fields = earlier_run(json.loads((saved / "lettered-run.json").read_text()))["fields"]
     segments = from_record(tuple[RowSegment, ...], fields["segments"])

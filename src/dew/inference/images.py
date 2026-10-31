@@ -234,7 +234,7 @@ class TextToImage(SavedRunTask, InItsForm):
     @classmethod
     def from_saved(cls, run: SavedRun, *, ema: bool | None = None, mesh: MeshSpec | Mesh | None = None,
                    layout: Layout | None = None, dtype: DTypeLike | None = None,
-                   param_dtype: DTypeLike | None = None) -> TextToImage:
+                   param_dtype: DTypeLike | None = None, variables: Variables | None = None) -> TextToImage:
         """Load the run `run` (its checkpoint pinned, `SavedRun.pinned`), built from the inference record
         its checkpoint holds (`Checkpoints.artifact`) the way the recipe built it; the run's `run.json`
         is not read. `from_run` loads one from its directory.
@@ -249,7 +249,9 @@ class TextToImage(SavedRunTask, InItsForm):
 
         `dtype` sets the compute dtype of the model, the encoders and the VAE.
         `param_dtype` sets the dtype the parameters are stored in; None keeps
-        the checkpoint's dtypes exactly.
+        the checkpoint's dtypes exactly. Supplied `variables`, a tree of the
+        run's own form (a run that started from it saved them), are bound in
+        place of the checkpoint's, which is not read.
         """
         from dew._records import record as fields
         from dew.diffusion.schedules.source import SourceGrid
@@ -273,8 +275,8 @@ class TextToImage(SavedRunTask, InItsForm):
                 for keyword, condition in conditions.items()}}
             if autoencoder_record is not None:
                 autoencoder_record = _computing(autoencoder_record, compute)
-        params = run.variables(ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype,
-                               parameter_roots=_parameter_roots(inputs_record, autoencoder_record))
+        params = (restored_tree(run, ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype)
+                  if variables is None else variables)
         inputs = InputSpec.bound(inputs_record, params=params.get('encoders', {}))
         end_to_end = settings.end_to_end
         autoencoder = None
@@ -711,6 +713,22 @@ class TextToImage(SavedRunTask, InItsForm):
                                solver, chosen, np.asarray(grid, np.float32), initial, self.variables,
                                prepared.conditions, prepared.unconditional, prepared.noise, walk)
         return replace(generated, rows=plan.rows)
+
+
+def restored_tree(run: SavedRun, *, ema: bool | None, mesh: MeshSpec | Mesh | None, layout: Layout | None,
+                  param_dtype: DTypeLike | None) -> Variables:
+    """The diffusion run `run`'s tree as its checkpoint holds it, an adapter's split of it kept
+    (`SavedRun.variables`), each parameter root its record names (`_parameter_roots`) stored in
+    `param_dtype` (as saved where None), restored where `mesh` and `layout` place it:
+    what `TextToImage.from_saved` binds, and what a run that starts from `run` trains
+    (`dew.interop.saved_sources.pipeline_of_run`)."""
+    from dew._records import record as fields
+    from dew.inference.tasks import saved_settings
+
+    settings = saved_settings(run.record, ImageSettings)
+    autoencoder = None if settings.autoencoder is None else fields(settings.autoencoder, 'autoencoder')
+    return run.variables(ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype,
+                         parameter_roots=_parameter_roots(fields(settings.inputs, 'inputs'), autoencoder))
 
 
 def _parameter_roots(inputs: Mapping[str, object], autoencoder: Mapping[str, object] | None

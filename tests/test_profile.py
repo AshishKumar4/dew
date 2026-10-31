@@ -12,6 +12,7 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import pytest
+from export_support import Stalled
 from steady_state import guarded
 
 import dew
@@ -85,24 +86,28 @@ def test_manual_context_and_restart_preserve_each_native_capture(tmp_path, nativ
     assert result.is_ready()
 
 
-def test_a_stop_that_does_not_wait_exports_its_capture_in_a_process_of_its_own(tmp_path, native_reports):
+def test_a_stop_that_does_not_wait_returns_while_its_capture_exports(tmp_path, native_reports, monkeypatch):
     """A capture stopped without waiting (`Profiler.stop(wait=False)`, a training window's) is stopped at
-    once and its reports and manifest made in a process of their own, never by the caller's, whole once
-    `exported` returns (row 2017); one that waits makes them itself."""
+    once, and its caller goes on while its reports and manifest are made: with its export held at its
+    start (`Stalled`), the stop returns and no manifest is written until the test releases it, then
+    `exported` waits for a whole one (row 2017). One that waits has made them as it returns."""
+    stalled = Stalled.under(tmp_path / "stalled", monkeypatch)
     profiler = dew.Profiler(tmp_path / "beside").start()
     work().block_until_ready()
     profiler.stop(wait=False)
     assert not profiler.running and active_profile() is None
-    profile.exported(tmp_path / "beside")
     (capture,) = captures(tmp_path / "beside")
+    assert not (capture / "manifest.json").exists()
+    stalled.release()
+    profile.exported(tmp_path / "beside")
+    assert stalled.released
     record = manifest(capture)
-    assert record["exported_by"] != os.getpid()
     assert record["capture_status"] == record["export_status"] == "completed"
     assert any(report["status"] == "completed" for report in record["reports"])
     waited = dew.Profiler(tmp_path / "waited").start()
     work().block_until_ready()
     waited.stop()
-    assert manifest(*captures(tmp_path / "waited"))["exported_by"] == os.getpid()
+    assert manifest(*captures(tmp_path / "waited"))["export_status"] == "completed"
 
 
 def test_a_program_read_from_stdin_exports_beside_itself_and_runs_once(tmp_path, native_reports):

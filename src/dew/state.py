@@ -106,6 +106,11 @@ class TrainState:
     whether or not the update it joins commits, so the run's schedules and cadences read its progress
     exactly, the same on every process; None in a run counted otherwise, which a checkpoint that holds
     none restores (`OPTIONAL`)."""
+    deferred: jax.Array | None = dataclasses.field(default=None, metadata={"optional": True})
+    """The real tokens of the calls whose updates the optimizer holds back
+    (`dew.held_updates.update_applied`), two uint32 words (`dew.training.model_flops._TokenCount`),
+    committed with the update that applies them; None for an optimizer that applies every update, which
+    a checkpoint that holds none restores."""
     compute: Variables | None = struct.field(default=None,
                                              metadata={'checkpointed': False, 'variables': True})
     """The lower-precision copies of the parameters that the forward pass reads, such as bf16 copies

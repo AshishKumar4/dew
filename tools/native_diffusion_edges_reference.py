@@ -164,11 +164,10 @@ def reload_source(source, exported):
 
 def bundle(directory, destination):
     """Package the focused numeric oracles and tiny source UNet."""
-    import tarfile
+    from fixture_archive import write
     root = Path(directory)
-    with tarfile.open(destination, "w:xz") as archive:
-        for path in (root / "schedulers.npz", root / "unet_reference.npz", root / "unet"):
-            archive.add(path, arcname=path.name)
+    write(destination, ((path, path.name) for path in (root / "schedulers.npz", root / "unet_reference.npz",
+                                                        root / "unet")))
 
 
 if __name__ == "__main__":

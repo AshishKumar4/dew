@@ -22,6 +22,7 @@ from memory_support import (
     ROWS,
     WIDTH,
     applied,
+    decode_passes,
     decoded,
     drawn,
     head_of,
@@ -152,9 +153,10 @@ def test_logical_positions_leave_a_documents_chunks_in_place():
 def test_a_decode_continues_the_full_pass(name):
     """A prefill and then one token a call, through the cache, reads each token as the full pass does,
     momentum, chunk boundaries and a level's network as its last scheduled update committed it carried
-    across the calls: on par against float64 (check 1)."""
+    across the calls: on par with the full passes, each step's at the width it reads (`decode_passes`),
+    against float64 (check 1)."""
     module = layer(name)
-    full = applied(module, packed(np.ones((ROWS, LENGTH), np.int32)))
+    full = decode_passes(module, np.ones((ROWS, LENGTH), np.int32), 6)
     assert_as_exact(decoded(module), full, drawn(module), f"decoded {name} memory",
                     seeds=SEEDS.get(f"decoded {name}", MEMORY_SEEDS),
                     truth_fn=written(module, dtype=jnp.float64))
@@ -165,7 +167,8 @@ def test_a_cached_prefill_starts_each_packed_document_afresh(name):
     """A cached prefill of packed documents starts each from the initial network, its chunks counted
     from its own first token, and the calls after it continue its last document: a prefill of a
     three-token document and five tokens of the next, then that document's last four one call each,
-    reads each token as the full packed pass does, on par against float64 (check 1)."""
+    reads each token as the full packed passes do, each step's at the width it reads (`decode_passes`), on
+    par against float64 (check 1)."""
     module = layer(name)
     decode = MixerCall(decode=True)
     segments = np.where(np.arange(LENGTH) < 3, 1, 2).astype(np.int32)
@@ -182,7 +185,7 @@ def test_a_cached_prefill_starts_each_packed_document_afresh(name):
             reads.append(token)
         return jnp.concatenate(reads, axis=1)
 
-    full = applied(module, packed(np.broadcast_to(segments, (ROWS, LENGTH))))
+    full = decode_passes(module, np.broadcast_to(segments, (ROWS, LENGTH)), 8)
     assert_as_exact(decoded, full, drawn(module), f"packed cached {name} memory", seeds=MEMORY_SEEDS,
                     truth_fn=written(module, dtype=jnp.float64, segments=segments))
 
