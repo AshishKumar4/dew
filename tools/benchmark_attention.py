@@ -45,6 +45,7 @@ import tokamax
 import tyro
 
 from dew.nn.attention_kernels import ATTENTION
+from dew.nn.kernels.options import program
 from dew.telemetry.benchmark import largest_difference, samples
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -199,7 +200,8 @@ def measure(case: dict, config: BenchmarkConfig) -> dict:
         try:
             kernel = attention_fn(case['implementation'], config, causal, sinks, block_groups=block_groups,
                                   runs=runs)
-            fn = jax.jit(kernel)
+            # Dew's arm compiles as a run's program does (`program`: the spill step-down).
+            fn = program(kernel)
             out = fn(q, k, v)
             out.block_until_ready()
         except (ImportError, NotImplementedError, ValueError, jax.errors.JaxRuntimeError) as e:
@@ -216,7 +218,7 @@ def measure(case: dict, config: BenchmarkConfig) -> dict:
 
         grads = None
         if not config.forward_only:
-            grad = jax.jit(jax.grad(loss, argnums=(0, 1, 2)))
+            grad = program(jax.grad(loss, argnums=(0, 1, 2)))
             try:
                 grads = grad(q, k, v)
                 jax.block_until_ready(grads)

@@ -45,6 +45,8 @@ from pathlib import Path
 
 import numpy as np
 
+from dew.nn.kernels.options import program
+
 
 @dataclasses.dataclass(frozen=True)
 class Shape:
@@ -202,7 +204,7 @@ def jax_arms(name: str, shape: Shape, warmup: int, repeats: int) -> list[dict]:
         if refusals.get(arm):
             row.update(fwd_ms=None, fwd_bwd_ms=None, error=f"refuses: {refusals[arm]}")
             continue
-        for part, compiled in (('fwd_ms', jax.jit(fn)), ('fwd_bwd_ms', jax.jit(forward_backward(fn)))):
+        for part, compiled in (('fwd_ms', program(fn)), ('fwd_bwd_ms', program(forward_backward(fn)))):
             try:
                 measured = samples(compiled, *inputs, warmup=warmup, repeats=repeats)
                 row[part] = 1e3 * statistics.median(measured)
