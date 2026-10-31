@@ -18,7 +18,7 @@ from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar, Literal, NamedTuple, NoReturn, Self
+from typing import TYPE_CHECKING, ClassVar, Literal, NamedTuple, NoReturn, Protocol, Self
 
 import jax
 import jax.numpy as jnp
@@ -32,6 +32,7 @@ from dew._model_types import QWEN35_TYPES
 from dew.batch import Variables
 from dew.diffusion.process import Process
 from dew.diffusion.schedules.source import SourceSchedule
+from dew.distributed.placement import Layout, MeshSpec, RefinesLayout
 from dew.inference import BlockGeneration, MaskedGeneration, TextGeneration
 from dew.inference.images import TextToImage
 from dew.inference.loading import place
@@ -63,6 +64,7 @@ from dew.interop.pipeline_assembly import (
 )
 from dew.interop.processors import Processor, hosts
 from dew.interop.safetensors_io import MAX_SHARD_SIZE, LazyTensors, tensor_specs
+from dew.interop.saved_sources import is_saved_run, released_run
 from dew.interop.streaming import WeightLayout
 from dew.interop.weights import AUTO, checkpoint_dtype, declared_dtype
 from dew.nn.autoencoders import AutoEncoder
@@ -79,13 +81,26 @@ from dew.sampling.text import Sampling
 if TYPE_CHECKING:
     from jax.sharding import Mesh
 
-    from dew.distributed.placement import Layout, MeshSpec
     from dew.inference.tasks import SavedRun
     from dew.interop.torchax_fallback import TorchAdmission
     from dew.lora import Adapter, LoRA
     from dew.nn.attention import AttentionImpl
     from dew.nn.cross_attention import CrossBlocks
     from dew.nn.dex import DifferentialExtension
+
+
+def _refined(layout: Layout | None, model: RefinesLayout | None) -> Layout | None:
+    """`layout`, Dew's default where None, as `model` places its own tree (`RefinesLayout`); as it is
+    where no model refines it."""
+    return layout if model is None else model.placement(layout or Layout())
+
+
+class Placing(Protocol):
+    """A load's placement of what it read (`Pretrained.load`'s `mesh` and `layout`): its variables placed
+    a leaf at a time, by the layout as `model`, where it places its own tree, refines it
+    (`RefinesLayout`); as they are where the load places nothing."""
+
+    def __call__(self, variables: Variables, model: RefinesLayout | None = None) -> Variables: ...
 
 
 
@@ -303,7 +318,8 @@ class Pretrained:
         return cls.from_saved(SavedRun.pinned(str(directory), step, trust), ema=ema)
 
     @classmethod
-    def from_saved(cls, run: SavedRun, *, ema: bool | None = None) -> Self:
+    def from_saved(cls, run: SavedRun, *, ema: bool | None = None, mesh: MeshSpec | Mesh | None = None,
+                   layout: Layout | None = None) -> Self:
         """Return the pinned checkpoint `run` (`SavedRun.pinned`), rebuilt from the run's own inference
         record, in the layout of the architecture the record names."""
         from dew.inference.tasks import (
@@ -318,7 +334,8 @@ class Pretrained:
 
         model_config = saved_model(run.record, None)
         model = model_config.build()
-        variables = run.variables(ema=ema)
+        # Restored where `mesh` and `layout` place them, sharded as a run's own load is.
+        variables = run.variables(ema=ema, mesh=mesh, layout=layout)
         # The run's task as its loader reads it (`saved_settings`): its policy, budget, pad and
         # end-of-sequence ids and process, which the export writes in the format its readers read.
         held = None if run.objective.settings is None else saved_settings(run.record, run.objective.settings)
@@ -384,7 +401,8 @@ class Pretrained:
              modeling_overrides: Mapping[str, object] | None = None,
              trust_remote_code: bool = False, text_only: bool = False,
              prediction_depths: int | None = None, dex: DifferentialExtension | None = None,
-             precision: Numerics | str | None = None, scan_layers: bool = False) -> Self:
+             precision: Numerics | str | None = None, scan_layers: bool = False,
+             step: int | str | None = None, ema: bool | None = None) -> Self:
         """Load a source as a native Flax model with explicit parameter trees, as the kind of source it is.
 
         `name_or_dir` is a local HF directory or a Hub model ID. Decoder, tower and
@@ -462,19 +480,13 @@ class Pretrained:
         (`AttentionMixer.bidirectional_blocks`, a call's `block_groups`) on any decoder or wrapper this
         loads natively, and "causal" turns a release's back off. A saved model states it in its own
         config. `dex` attaches DEX (`with_dex`) from key 0; `scan_layers` scans like layers (`Scanning`).
+        A saved Dew run loads as `dew export` writes it, at `step` with `ema` (`released_run`).
         """
+        name_or_dir = released_run(name_or_dir, step=step, ema=ema, weights=weights, mesh=mesh,
+                                   layout=layout)
         selected = _selected_payload(fallback, gguf_file=gguf_file, single_file=single_file,
                                      dduf_file=dduf_file)
-        if on_host and (mesh is not None or layout is not None):
-            raise ValueError("on_host keeps the variables as host arrays, and mesh and layout place them; "
-                             "pass one")
-        streaming = mesh is not None or layout is not None
-        if streaming and not weights:
-            raise ValueError("a source loaded without its weights has nothing to place; the restore that "
-                             "fills it places it, so pass no mesh or layout")
-
-        def placed(variables: Variables) -> Variables:
-            return place(variables, mesh, layout) if streaming else variables
+        streaming, placed = _placement(mesh, layout, on_host=on_host, weights=weights)
 
         numerics, dtype, param_dtype = _load_settings(precision, dtype, param_dtype, prediction_depths)
         # The reference refuses a folder outside the source before anything is fetched.
@@ -979,13 +991,33 @@ def _no_language_model(name: str, kind: str) -> NoReturn:
     raise ValueError(f"{name} is a {kind}, which has no wrapper's language model for text_only to take")
 
 
+def _placement(mesh: MeshSpec | Mesh | None, layout: Layout | None, *, on_host: bool,
+               weights: bool) -> tuple[bool, Placing]:
+    """Whether a load places what it reads on `mesh` by `layout` (`Pretrained.load`), and its placement
+    of a tree, a leaf at a time (`place`), by the layout as a model that places its own tree refines it
+    (`_refined`), or none: refused beside `on_host`, which keeps the variables as host arrays, or a load
+    without its weights, whose restore places them."""
+    if on_host and (mesh is not None or layout is not None):
+        raise ValueError("on_host keeps the variables as host arrays, and mesh and layout place them; "
+                         "pass one")
+    streaming = mesh is not None or layout is not None
+    if streaming and not weights:
+        raise ValueError("a source loaded without its weights has nothing to place; the restore that "
+                         "fills it places it, so pass no mesh or layout")
+
+    def placed(variables: Variables, model: RefinesLayout | None = None) -> Variables:
+        return place(variables, mesh, _refined(layout, model)) if streaming else variables
+
+    return streaming, placed
+
 def load_diffusion_source(checkpoint: str, *, dtype: str = "bfloat16", param_dtype: str = "float32",
                           revision: str | None = None, attention_impl: AttentionImpl = "auto",
                           size: tuple[int, ...] | None = None, variables: Variables | None = None,
                           mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
                           text: bool = True, text_only: bool = False,
                           prediction_depths: int | None = None,
-                          modeling_overrides: Mapping[str, object] | None = None) -> PretrainedPipeline:
+                          modeling_overrides: Mapping[str, object] | None = None,
+                          step: int | str | None = None, ema: bool | None = None) -> PretrainedPipeline:
     """A published diffusion pipeline, to train from its own weights.
 
     `size` is the (height, width) in pixels the pipeline runs at instead of
@@ -1009,8 +1041,13 @@ def load_diffusion_source(checkpoint: str, *, dtype: str = "bfloat16", param_dty
     `text_only`, `prediction_depths` and `modeling_overrides` read as
     `Pretrained.load`'s do: a pipeline has no wrapper's language model for
     `text_only` to take, its components hold no prediction depths, so any
-    count keeps them all, and none reads overrides, which are refused.
+    count keeps them all, and none reads overrides, which are refused. A saved Dew run, which Dew
+    writes no diffusion release of, is refused, as a step or EMA choice beside a release is.
     """
+    if is_saved_run(checkpoint) or step is not None or ema is not None:
+        raise ValueError(f"{checkpoint}: a diffusion run starts from a published pipeline; Dew writes no "
+                         "diffusion release of a saved run to start from, so resume the run under its "
+                         "name (--trainer.resume) or serve it (TextToImage.from_run)")
     _unread_overrides(modeling_overrides, "a diffusion pipeline")
     if text_only:
         _no_language_model(checkpoint, "diffusion pipeline")
@@ -1262,7 +1299,7 @@ def _names_a_model(directory: Path) -> bool:
 
 def _loaded_kind(reference: sources.SourceReference, directory: Path, composite: CompositeSource | None, *,
                  fallback: str | None, gguf_file: str | None, single_file: str | None,
-                 dduf_file: str | None, placed: Callable[[Variables], Variables], streaming: bool,
+                 dduf_file: str | None, placed: Placing, streaming: bool,
                  weights: bool, dtype: str, param_dtype: str, attention_impl: AttentionImpl,
                  max_seq_len: int | None, overrides: Mapping[str, object] | None,
                  trust_remote_code: bool, text_only: bool,
@@ -1298,8 +1335,7 @@ def _loaded_kind(reference: sources.SourceReference, directory: Path, composite:
         _unread_overrides(overrides, "the transformers forward")
         loaded = torchax_fallback.load(reference, directory, dtype=dtype, param_dtype=param_dtype,
                                        attention_impl=attention_impl, max_seq_len=max_seq_len,
-                                       weights=weights)
-        loaded = replace(loaded, variables=placed(loaded.variables))
+                                       weights=weights, placed=placed)
     elif gguf_file is None:
         # A selected GGUF file is a decoder, whatever pipeline index the repo also ships.
         loaded = _pipeline_source(reference, directory, single_file, dduf_file, placed,
@@ -1796,7 +1832,7 @@ def _composite_description(directory: Path,
 
 
 def _load_composite_source(source: sources.SourceReference, root: Path,
-                           description: CompositeSource, *, placed: Callable[[Variables], Variables],
+                           description: CompositeSource, *, placed: Placing,
                            streaming: bool, dtype: str, param_dtype: str, attention_impl: AttentionImpl,
                            max_seq_len: int | None, weights: bool,
                            overrides: Mapping[str, object] | None = None,
@@ -2073,7 +2109,7 @@ def _kept_tensors(tensors: Mapping[str, unread.Stored], config: Mapping[str, obj
 
 
 def _load_native_source(source: sources.SourceReference, root: Path, *,
-                        gguf_file: str | None, placed: Callable[[Variables], Variables], streaming: bool,
+                        gguf_file: str | None, placed: Placing, streaming: bool,
                         dtype: str, param_dtype: str, attention_impl: AttentionImpl,
                         max_seq_len: int | None, weights: bool = True,
                         component: NativeComponent | None = None,
@@ -2126,8 +2162,8 @@ def _load_native_source(source: sources.SourceReference, root: Path, *,
         selected = source if component is None else source.component(component.config_folder)
         loaded = torchax_fallback.load(selected, root, dtype=dtype, param_dtype=param_dtype,
                                        attention_impl=attention_impl, max_seq_len=max_seq_len,
-                                       admission=route.admitted, weights=weights)
-        return replace(loaded, variables=placed(loaded.variables)), False
+                                       admission=route.admitted, weights=weights, placed=placed)
+        return loaded, False
     if tensors is None and not weights:
         tensors = sources.stored_tensors(source, root)
     if tensors is None:

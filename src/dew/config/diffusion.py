@@ -394,7 +394,8 @@ class DiffusionRunConfig(RunConfig):
                 objective = dataclasses.replace(
                     objective, fields={**objective.fields, "alignment": to_record(pinned, Alignment)})
         pretrained = None if self.pretrained is None else pinned_source(self.pretrained)
-        return dataclasses.replace(super().pinned(), objective=objective, pretrained=pretrained)
+        return dataclasses.replace(super().pinned().with_pinned_run(self.pretrained), objective=objective,
+                                   pretrained=pretrained)
 
     def _scratch(self, variables: Variables | None):
         """The registry's model, the run's text or audio condition and its
@@ -447,7 +448,8 @@ class DiffusionRunConfig(RunConfig):
             size=self.sample_field().shape[:-1],
             variables=variables, mesh=placement.get("mesh"), layout=placement.get("layout"),
             text_only=placement.get("text_only", False), prediction_depths=placement.get("prediction_depths"),
-            modeling_overrides=placement.get("modeling_overrides"))
+            modeling_overrides=placement.get("modeling_overrides"), step=placement.get("step"),
+            ema=placement.get("ema"))
 
     def _process(self, convention: Process | None) -> Process:
         """The preset's process, which must be of the kind the pretrained

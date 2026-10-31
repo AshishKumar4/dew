@@ -50,31 +50,23 @@ class Export:
 
     def run_command(self) -> int:
         from dew.inference.tasks import SavedRun
-        from dew.interop import Pretrained
-        from dew.objectives.base import ReleasedTask
+        from dew.interop.saved_sources import export_run
 
         # A task that publishes its own released layout (a decision run's) writes it; any other
         # run writes its model in the source layout its family reads, both at the step pinned here.
-        run = SavedRun.pinned(self.run, self.step, self.trust)
-        task = run.objective.saved_task
-        if task is not None and issubclass(task, ReleasedTask):
-            task.from_saved(run, ema=self.ema).save_pretrained(self.destination)
-        else:
-            Pretrained.from_saved(run, ema=self.ema).save(self.destination)
+        export_run(SavedRun.pinned(self.run, self.step, self.trust), self.destination, ema=self.ema)
         emit(f"exported {self.run} to {self.destination}")
         return 0
 
 
 def user_module(path: Path) -> types.ModuleType:
     """The user's Python file at `path`, that file and no other, imported as the module its name names
-    (`dew.registry.module_from_file`), with its directory first on the path, as `python -m` runs one
-    beside its siblings, so it imports them."""
+    (`dew.registry.module_from_file`), with its directory first on the path once it is accepted, as
+    `python -m` runs one beside its siblings, so it imports them; a file refused leaves the path as it
+    was."""
     from dew.registry import module_from_file
 
-    directory = str(path.resolve().parent)
-    if directory not in sys.path:
-        sys.path.insert(0, directory)
-    return module_from_file(path, path.stem)
+    return module_from_file(path, path.stem, beside=True)
 
 
 def chain_of(named: str, branch: Literal["train", "validation"], trust: tuple[str, ...] = ()):
