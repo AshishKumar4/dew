@@ -197,10 +197,11 @@ def test_the_recurrences_run_on_this_gpu():
         *(Cell(f"the selective scan on the template under the fast forms is as exact as mamba_ssm: {case}",
                functools.partial(selective_template.the_template_is_as_exact_as_mamba_ssm, case), "sm90")
           for case in selective_support.SEEDED_CASES),
-        *(Cell(f"a Mamba layer is as exact under the template: packed {packed}, held {held}",
+        *(Cell(f"a Mamba layer is as exact under the template: packed {packed}"
+               f"{f', a held state {held}' if held else ''}",
                functools.partial(selective_template.the_layer_is_as_exact_under_the_template, packed, held),
                "sm90")
-          for packed, held in ((False, False), (True, False), (False, True))),
+          for packed, held in ((False, None), (True, None), (False, "through the template"))),
         *(Cell(f"the SSD port's gradient is as exact as the recurrence's: {regime}",
                functools.partial(stability.the_ssd_ports_gradient_is_as_exact_as_the_recurrences, regime))
           for regime in stability.REGIMES),

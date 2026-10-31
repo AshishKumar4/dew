@@ -221,16 +221,16 @@ def routed(target: str, states: int, c_dtype=jnp.float32, *, forms: str = "fast"
     return {(route.kernel, route.refusal and route.refusal.code) for route in found}
 
 
-def test_the_selector_takes_the_template_only_where_a_call_names_it():
-    """An H100's scan of whole blocks of Mamba's 16 states goes to the portable math with the template's
-    qualification its refusal, against recorded mamba_ssm (row 2968), no measurement claimed, and under the
-    accurate forms with those its refusal; a call naming the template (`generation.chosen`) takes it, and an
-    A100's refuses it for its strided copies whatever the call names."""
+def test_the_selector_takes_the_template_where_it_is_qualified():
+    """An H100's scan of whole blocks of Mamba's 16 states takes the template under the fast forms, held to
+    recorded mamba_ssm there (row 2968), and the portable math under the accurate forms with those its
+    refusal, as a call naming the template overrides; an A100's refuses it for its strided copies whatever
+    the call names."""
     from dew.nn.kernels.selection import KernelRefused
 
-    assert routed("sm90", 16) == {("xla", "qualified")}
+    assert routed("sm90", 16) == {("mosaic_gpu", None)}
     assert routed("sm90", 16, forms="accurate") == {("xla", "forms")}
-    assert routed("sm90", 16, named=True) == {("mosaic_gpu", None)}
+    assert routed("sm90", 16, forms="accurate", named=True) == {("mosaic_gpu", None)}
     with pytest.raises(KernelRefused) as refused:
         routed("sm80", 16, named=True)
     assert [refusal.code for refusal in refused.value.refusals] == ["strided copies"]

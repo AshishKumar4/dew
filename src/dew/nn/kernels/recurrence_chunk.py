@@ -1454,17 +1454,17 @@ SELECTIVE_SUPPORTS: tuple[Requirement[SelectiveCase], ...] = (
     Requirement('forms', lambda case: case.fast,
                 "the run's accurate forms, whose sums the portable math compensates (row 1698); the template "
                 "sums at mamba_ssm's rounding, the fast forms' bar", row='ledger 2968', kind='measured'),
-    Requirement('qualified', lambda case: False,
-                "the template's selective scan sums at mamba_ssm's rounding, its bar mamba_ssm's own "
-                "recorded distance from float64 at the same inputs, which is not recorded yet; the "
-                "portable math's sums are compensated (row 1698)", row='ledger 2968', kind='measured'),
+    Requirement('qualified', lambda case: case.family == 'wgmma',
+                "the template's selective scan held to recorded mamba_ssm's distance from float64 on an H100 "
+                "alone (selective-recorded2-h100-497ea24e7), not on this GPU", row='ledger 2968',
+                kind='measured'),
 )
 """What the template's selective scan (`templates.recurrence.selective`) needs of a call: no caller's
 `shard_map` that checks varying axes, a GPU of a family its bundles cover, 16-bit or fp32 operands, whole
 blocks of channels, at most `SELECTIVE_STATES` states, a chunk's tokens at least (a decode step hands off
 to the portable math), no untiled strided copies (an A100's, until post42), the run's fast forms, and its
-qualification against recorded mamba_ssm, which no call meets yet: only a call that names the template
-(`generation.chosen`) takes it."""
+qualification against recorded mamba_ssm on the GPU's family: on an H100 the template is as exact as
+mamba_ssm in every recorded case (tests/test_gpu_recurrence.py)."""
 
 SELECTIVE: Op[SelectiveCase] = Op('selective_scan', (Kernel('mosaic_gpu', SELECTIVE_SUPPORTS),
                                                      Kernel('xla', (), generic=True)))
