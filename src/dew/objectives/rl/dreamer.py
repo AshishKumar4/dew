@@ -681,8 +681,10 @@ class DreamerRollout:
     (`DrivenSimulator`), writing each step to a device replay of `capacity` steps an environment; each
     update trains on `batch` windows of `length` replayed steps while the agent takes environment steps
     so that each replays `train_ratio` steps (the code's `run.train_ratio`), after `prefill` steps of
-    each environment taken uniformly at random. `metrics` reports the mean return of the episodes that
-    ended since the last update."""
+    each environment taken uniformly at random. A `replay` given (demonstrations recorded in the
+    agent's convention from as many environments, `[capacity, envs, ...]`) is the replay it starts from
+    and writes on, in place of the prefill. `metrics` reports the mean return of the episodes that ended
+    since the last update."""
 
     objective: DreamerV3Objective
     env: Env | Simulator
@@ -691,6 +693,7 @@ class DreamerRollout:
     length: int = 64
     train_ratio: float = 1024.0
     prefill: int = 64
+    replay: ReplayBuffer | None = None
     _driven: Env | DrivenSimulator = field(init=False, repr=False)
     _carry: Carry | None = field(default=None, init=False, repr=False)
     _replay: ReplayBuffer | None = field(default=None, init=False, repr=False)
@@ -699,7 +702,7 @@ class DreamerRollout:
     _ended: tuple[float, int] = field(default=(0.0, 0), init=False, repr=False)
 
     def __post_init__(self) -> None:
-        if self.prefill < self.length:
+        if self.replay is None and self.prefill < self.length:
             raise ValueError("the prefill must hold at least one window")
         self._driven = DrivenSimulator(self.env) if isinstance(self.env, Simulator) else Driven(self.env)
         # The replay is written in place, its buffer donated to the step that writes it.
@@ -756,13 +759,17 @@ class DreamerRollout:
                 count = self.env.reset(act_key)[1].reward.shape[0]
                 self._carry = start(self._driven, act_key, self.objective.memory(count))
             count = len(self._carry.observation["reward"])
-            example = {**self._carry.observation, "action": jnp.zeros((count, self.env.action_size))}
-            self._replay = ReplayBuffer.empty(example, self.capacity)
             self._returns = jnp.zeros(count)
-            self._advance(variables, self.prefill, random=True)
+            if self.replay is not None:
+                self._replay = self.replay
+            else:
+                example = {**self._carry.observation, "action": jnp.zeros((count, self.env.action_size))}
+                self._replay = ReplayBuffer.empty(example, self.capacity)
+                self._advance(variables, self.prefill, random=True)
         owed = math.ceil((int(state.updates) + 1) * self.batch * self.length / self.train_ratio)
         envs = self._returns.shape[0]
-        due = max(owed - (self._taken - self.prefill * envs), 0)
+        prefilled = 0 if self.replay is not None else self.prefill * envs
+        due = max(owed - (self._taken - prefilled), 0)
         if due:
             self._advance(variables, -(-due // envs), random=False)
         return self.sample(sample_key)
