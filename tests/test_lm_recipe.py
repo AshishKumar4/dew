@@ -911,6 +911,42 @@ def test_a_plan_an_earlier_dew_saved_over_a_token_store_resumes_where_it_read_th
                 plan.check(earlier_plan(saved, plan))
 
 
+@pytest.mark.parametrize(("documents", "resumes"),
+                         [([[1, 2, 0], [3, 0]], True), ([[1, 0, 2], [3, 0]], False)],
+                         ids=["eos-closed", "eos-within"])
+def test_a_mix_an_earlier_dew_saved_over_token_stores_resumes_where_it_read_their_documents_alike(
+        tmp_path, documents, resumes):
+    """A mix a Dew before row 3028 saved keeps each member by a digest of the token stores it reads named
+    without `documents`: a member that read its stores' documents as today's reads them resumes as today's
+    names it (`earlier_plan`); one whose store it read otherwise, or whose sources changed, is refused."""
+    from dew.data import Memory, mix
+    from dew.data.plan import fingerprint, without_documents
+    from dew.data.sinks import export
+
+    stated = {"token_store": True, "tokenizer": "byte", "vocab_size": 256, "dtype": "int32", "eos_id": 0}
+    urls = []
+    for name, written in (("first", documents), ("second", [[4, 5, 0], [6, 0]])):
+        urls.append(str(tmp_path / name))
+        export(Memory([{"text": np.asarray(document, np.int32)} for document in written]), urls[-1],
+               format="array_record", length_field="text", metadata=stated)
+    plan = compile(mix([TokenFiles(url) for url in urls]).batch(1), read="streamed",
+                   loading=Loading(workers=0)).plan
+    assert set(plan.members) > {""}, "a streamed mix keeps its members by key"
+    record_now = json.loads(json.dumps(plan.record()))
+    earlier = {**record_now, "manifest": without_documents(record_now["manifest"]),
+               "members": {key: digest for key, (digest, _) in plan.earlier_members.items()}}
+    assert earlier["members"] != record_now["members"]
+    if resumes:
+        assert plan.check(earlier_plan(earlier, plan)) == ()
+        changed = {**earlier, "members": {**earlier["members"], next(key for key in plan.members if key):
+                                          fingerprint({"another": "member"})}}
+        with pytest.raises(ValueError):
+            plan.check(earlier_plan(changed, plan))
+    else:
+        with pytest.raises(ValueError):
+            plan.check(earlier_plan(earlier, plan))
+
+
 def test_whether_an_earlier_dew_read_a_token_stores_documents_alike_is_each_fields_own(tmp_path):
     """An export holding two token fields is read alike by a Dew before row 3028 in one and not the other:
     each field's records closed by the EOS alone, or not. Each field's store says so, whichever is read
