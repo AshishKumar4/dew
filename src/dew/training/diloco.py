@@ -27,6 +27,7 @@ import jax.numpy as jnp
 import optax
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
+from dew.batch import Batch
 from dew.distributed.placement import Placement
 from dew.mesh import DILOCO_AXIS
 from dew.optim import learning_rate
@@ -210,7 +211,7 @@ def rates_set(state: TrainState, setting: Callable[[optax.OptState], optax.OptSt
                                                                 opt_state=setting(state.inner.opt_state)))
 
 
-def group_of(state: TrainState, batch) -> tuple[TrainState, object]:
+def group_of(state: TrainState, batch: Batch) -> tuple[TrainState, Batch]:
     """The state and batch one group's step reads, its shapes: under DiLoCo its inner state, the first
     group's clock as it is (every group's window holds as many microbatches), and its share of the
     batch's rows; a run of one copy's as they are."""
