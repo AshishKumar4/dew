@@ -4,7 +4,7 @@
     python3 tools/armada/ci.py plan --target=SECONDS --timings=FILE
     python3 tools/armada/ci.py task --python=3.12 --tests="tests/a.py tests/b.py" --split=[G/N] --out=FILE
     python3 tools/armada/ci.py durations VERDICT
-    python3 tools/armada/ci.py gpu-tier [--marked] [--evidence] [--shards=N]
+    python3 tools/armada/ci.py gpu-tier [--evidence] [--shards=N]
     python3 tools/armada/ci.py gpu-lane --tests="tests/a.py tests/b.py" --out=FILE --cache=on --processes=N
     python3 tools/armada/ci.py gpu-lane --network [--tests=...] --out=FILE --cache=on --processes=N
     python3 tools/armada/ci.py coverage items --target=SECONDS --timings=FILE > ITEMS
@@ -131,6 +131,12 @@ with the default deadline and grace (session.DEADLINE + session.GRACE + 30 + the
 1800)."""
 
 REPO = Path(__file__).resolve().parents[2]
+HASHED_BY = "3.13"
+"""The Python this file runs under wherever it runs, the plan's and every task's alike (`pinned`), so a key
+the plan computes is the one a task recorded: a module's units are what this Python's parser and compiler
+make of its text (`digested`), which each release changes (2026-10-30: plans under the PC's 3.14 and a GitHub
+runner's 3.12 found none of the 3.13 tasks' records fresh, and every file took a task of its own). It is the
+Python the tasks' image runs this file under, so a task runs it as it is."""
 _CLASSIFIERS = tomllib.loads((REPO / "pyproject.toml").read_text())["project"]["classifiers"]
 _PREFIX = "Programming Language :: Python :: "
 PYTHONS = tuple(sorted((classifier.removeprefix(_PREFIX) for classifier in _CLASSIFIERS
@@ -244,7 +250,7 @@ def shared(python: str) -> str:
             digest.update(str(path).encode())
     # The names of every data file under tests/ but its fixtures, and of every package's data: an existence
     # probe a library makes at import, before the recorder starts, is no record's. A fixture is its openers',
-    # listers' and probers' alone, as a run records every probe it makes (followed.py's `PROBES`; Main,
+    # listers' and probers' alone, as a run records every probe it makes (followed.py's `PROBES`;
     # 2026-10-29: train 277 reused 2 of 1967 rows once a head added fixtures). A build's output and a fetched
     # payload, which a planner's checkout lacks, are not named: they are their build's and their manifest's
     # (`built`, FETCHED, `contents`), whose names are.
@@ -287,7 +293,7 @@ def contents(name: str) -> bytes:
     it is downloaded here or not, so a planner that never fetches it keys it as a task does. An execution
     limit a run read (followed.py's `LIMITS`: "limit:cpu", "limit:memory") is the one binding this process
     (host.py's `limit`): a row green on 4 vCPUs is not reused on 8, nor on a planner, which reads its own (row
-    1998, Main 2026-10-28). A path a run probed (followed.py's `PROBED`: "probe:" and the path) is its kind
+    1998, 2026-10-28). A path a run probed (followed.py's `PROBED`: "probe:" and the path) is its kind
     where it is a directory, whose probe never reads its entries, and as read otherwise."""
     if name.startswith("limit:"):
         return hashlib.sha256(host().limit(name).encode()).digest()
@@ -1741,6 +1747,16 @@ def releasing(args: argparse.Namespace) -> int:
     return release(args.python, args.tests.split(), args.requirement, args.out)
 
 
+def tier_arguments(choosing: argparse.ArgumentParser) -> None:
+    """`gpu-tier`'s arguments: the tier it names is the checkout's gpu-marked files (`gpu_tier`)."""
+    choosing.add_argument("--evidence", action="store_true",
+                          help="each file of the tier with its marked tests and its records' backend reads")
+    choosing.add_argument("--shards", type=int, default=1, help="how many GPUs share the tier")
+    choosing.add_argument("--marked", action="store_true",
+                          help="the gpu-marked files, which the tier is: kept for dew-ops' GPU verifier "
+                               "(dewops.kernel_lab.verify.tier), which still passes it (ledger 2714)")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="tools/armada/ci.py")
     operations = parser.add_subparsers(dest="operation", required=True)
@@ -1763,11 +1779,7 @@ def main() -> int:
     itemizing.add_argument("--timings", type=Path, required=True)
     reporting = stages.add_parser("report")
     reporting.add_argument("directory", type=Path)
-    choosing = operations.add_parser("gpu-tier")
-    choosing.add_argument("--evidence", action="store_true", help="each file's backend reads and marks too")
-    choosing.add_argument("--marked", action="store_true",
-                          help="only the files with a test marked to run on a GPU, as collected here")
-    choosing.add_argument("--shards", type=int, default=1, help="how many GPUs share the tier")
+    tier_arguments(operations.add_parser("gpu-tier"))
     lane = operations.add_parser("gpu-lane")
     lane.add_argument("--tests", help="the test files; with --network, every file holding a "
                                        "network-marked test by default (`network_files`)")
@@ -1813,13 +1825,14 @@ def main() -> int:
         print(f"{len(changed)} files refolded in {session.DURATIONS}: {' '.join(changed) or 'none'}")
         return 0
     if args.operation == "gpu-tier":
-        # A GPU runs its marked files alone, a batch's and a day's alike (ledger 2452): the records' evidence
-        # (`gpu_tier`) is what --evidence reports, which a day's tier no longer chooses by.
-        tier = ({name: [f"{count} marked"] for name, count in marked(PYTHONS[0]).items()}
-                if args.marked or not args.evidence else gpu_tier(PYTHONS[0]))
+        # A GPU runs its marked files alone, a batch's and a day's alike (ledger 2452); --evidence prints that
+        # tier, each file with its records' backend reads beside its marked tests.
+        tier = marked(PYTHONS[0])
         if args.evidence:
-            for name, evidence in tier.items():
-                print(name, *evidence, sep="\t")
+            reads = gpu_tier(PYTHONS[0])
+            for name, count in tier.items():
+                evidence = [item for item in reads.get(name, []) if "marked" not in item]
+                print(name, f"{count} marked", *evidence, sep="\t")
             return 0
         # Each shard's files on a line, spread by their tests' recorded times.
         recorded = recorded_tests()
@@ -1856,5 +1869,17 @@ def main() -> int:
                 coverage=args.coverage, whole=args.whole == "1")
 
 
+def pinned(argv: list[str]) -> None:
+    """This file run again under HASHED_BY, as uv finds or fetches it, with `argv`, where another Python
+    runs it: on a planner's machine, a GitHub runner or a GPU node. Not `coverage report`, which keys nothing
+    and reads coverage.py's data under the interpreter its caller installed coverage.py in
+    (`coverage_report`)."""
+    running = f"{sys.version_info.major}.{sys.version_info.minor}"
+    if argv[:2] != ["coverage", "report"] and running != HASHED_BY:
+        os.execvp("uv", ["uv", "run", "--no-project", "--python", HASHED_BY, "python",
+                         str(Path(__file__).resolve()), *argv])
+
+
 if __name__ == "__main__":
+    pinned(sys.argv[1:])
     raise SystemExit(main())
