@@ -50,11 +50,12 @@ class Export:
 
     def run_command(self) -> int:
         from dew.inference.tasks import SavedRun
-        from dew.interop.saved_sources import export_run
+        from dew.interop.saved_sources import pooled_export
 
         # A task that publishes its own released layout (a decision run's) writes it; any other
         # run writes its model in the source layout its family reads, both at the step pinned here.
-        export_run(SavedRun.pinned(self.run, self.step, self.trust), self.destination, ema=self.ema)
+        # A pool sharing the destination publishes it from its first process (`pooled_export`).
+        pooled_export(SavedRun.pinned(self.run, self.step, self.trust), Path(self.destination), ema=self.ema)
         emit(f"exported {self.run} to {self.destination}")
         return 0
 
