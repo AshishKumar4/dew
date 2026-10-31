@@ -882,8 +882,11 @@ def _scores_back(q, k, corrected, do, hi, lo, taken, beta, call: _Call, *, scale
     # The scores' gradient fp32 and narrow, the pairs' decays, the scores and the pair terms, the masks, and
     # the pairs' sum's product: four fp32 tiles at once, the decays taken before the scores' product
     # (`algebra.scores_gradient`); five stated an A100's 280 registers where ptxas needed 240. A key head's
-    # sum read back beside them.
-    held_tiles = _Held(phases=([_f32(CHUNK, CHUNK)] * (4 + (group > 1)) + _held(grads, CHUNK, CHUNK)
+    # sum read back beside them; and where the scores' gradient leaves in parts (an fp32 call's), the
+    # remainder each part after the first is formed from (`product.formed`): without it the model stated
+    # 232 registers where ptxas spilled 32 bytes past 255 on an H100 (back-need2 at 170dd3a22).
+    held_tiles = _Held(phases=([_f32(CHUNK, CHUNK)] * (4 + (group > 1) + (grads.parts > 1))
+                               + _held(grads, CHUNK, CHUNK)
                                + _masks(CHUNK, CHUNK)
                                + _fragments(call, (given, CHUNK, call.block), (given, CHUNK, call.block)),))
     summing = _summing(call) + ((plgpu.SMEM((CHUNK, CHUNK), jnp.float32),) if group > 1 else ())
