@@ -380,10 +380,12 @@ def _wide(*operands: jax.Array) -> tuple[jax.Array, ...]:
 
 def rescaled(maximum: jax.Array, total: jax.Array, larger: jax.Array) -> jax.Array:
     """A sum of exponentials moved from its own maximum to the larger one, as a blockwise partition
-    combines its blocks; unchanged where they agree, so two sums whose maximum is -inf add rather than
-    turn NaN."""
+    combines its blocks: where the two agree the shift is exactly 0 and the sum unchanged, its derivative
+    still the moved sum's, so two blocks whose maxima tie each move by their own maximum's tangent less
+    the larger's; two sums whose maximum is -inf add as they are rather than turn NaN."""
     maximum, total, larger = _wide(maximum, total, larger)
-    return jnp.where(maximum == larger, total, total * jnp.exp(maximum - larger))
+    empty = (maximum == larger) & ~jnp.isfinite(larger)
+    return jnp.where(empty, total, total * jnp.exp(jnp.where(empty, 0, maximum - larger)))
 
 
 def target_loss(peak: jax.Array, mass: jax.Array, target: jax.Array) -> jax.Array:
