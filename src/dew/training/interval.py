@@ -166,20 +166,23 @@ class Interval:
     """`consumed` before the latest step."""
     consumed_committed: int = 0
     """`consumed` at the run's last update boundary (`FitRun.committed_examples`)."""
-    watched: tuple[int, _Settled] | None = None
-    """The latest taken step whose loss was not computed at its take, which the loop looks at as it steps
-    (`seen`)."""
-    finished: tuple[int, float] | None = None
-    """The latest step the loop saw finished on the devices and when (`seen`, `take`): every step before
-    it had finished by then, as the devices run steps in order, which bounds the `done` of a log whose
-    step was not finished at its take (`Taken.read`)."""
+    watched: collections.deque[tuple[int, _Settled]] = dataclasses.field(default_factory=collections.deque)
+    """The taken steps whose loss was not computed at their take, in order, which the loop looks at as it
+    steps until it sees each done (`seen`)."""
+    finished: dict[int, float] = dataclasses.field(default_factory=dict)
+    """When the loop first saw each watched step done, until its log's read takes it (`Taken.read`)."""
+    read_through: int = -1
+    """The step of the last log the writer read, whose watched steps need no time (`seen`)."""
 
     def seen(self) -> None:
-        """Note when the loop first sees the watched step finished (`watched`, `finished`): one look,
-        which never waits, as it steps."""
-        watched = self.watched
-        if watched is not None and watched[1].is_ready():
-            self.watched, self.finished = None, (watched[0], time.time())
+        """Note when the loop first sees each watched step done (`watched`, `finished`): a look at the
+        earliest, which never waits, then at each after it, as the devices finish steps in order."""
+        now = None
+        while self.watched and self.watched[0][1].is_ready():
+            step, _ = self.watched.popleft()
+            now = time.time() if now is None else now
+            if step > self.read_through:
+                self.finished[step] = now
 
     def count(self, batch: Batch, flops: StepFlops | None, loss: jax.Array, finite: jax.Array,
               committed: Committed | None, aux: Mapping[str, jax.Array] | None = None) -> None:
@@ -291,9 +294,7 @@ class Interval:
         if isinstance(loss, _Settled):
             done = time.time() if loss.is_ready() else None
             if done is None:
-                self.watched = (step, loss)
-            else:
-                self.watched, self.finished = None, (step, done)
+                self.watched.append((step, loss))
         taken = Taken(step, self, dataclasses.replace(self), reading, done)
         if self.tokens_counted and book is not None:
             self.logged_tokens = book.tokens if self.logged_tokens is None else _added_tokens(
@@ -419,10 +420,10 @@ class Taken(NamedTuple):
 
     `counts` is the live `interval` as it stood at the take. `done` is when
     the host first saw the step finished: at the take if it already was,
-    else where the loop first saw it or a later step finished as it stepped
-    (`Interval.seen`), or at the read, which waits for it, whichever came
-    first. The read ends the interval's clock there, and the next interval's
-    clock starts there (`LogWriter.since`).
+    else where the loop first saw it done as it stepped (`Interval.seen`),
+    or at the read, which waits for it, whichever came first. The read ends
+    the interval's clock there, and the next interval's clock starts there
+    (`LogWriter.since`).
     """
 
     step: int
@@ -442,12 +443,13 @@ class Taken(NamedTuple):
         read = on_host(self.reading, self.step)
         done = self.done
         if done is None:
-            # Its step was done when the read returned at the latest, and when the loop first saw it or a
-            # later step finished (`Interval.finished`): a reader that runs late, after the loop took the
-            # next log, would otherwise end this interval past the next one's `done`, leaving that one
-            # no seconds and no rates.
-            seen = self.interval.finished
-            done = time.time() if seen is None or seen[0] < self.step else min(time.time(), seen[1])
+            # Its step was done when the read returned at the latest, or where the loop first saw it done
+            # as it stepped (`Interval.seen`): a reader that runs late, after the loop took the next log,
+            # would otherwise end this interval past the next one's `done`, leaving that one no seconds
+            # and no rates.
+            seen = self.interval.finished.pop(self.step, None)
+            done = time.time() if seen is None else min(time.time(), seen)
+        self.interval.read_through = self.step
         # A log read late is done no earlier than the one read before it.
         done = max(done, since or 0.0)
         if read.streak is not None:
