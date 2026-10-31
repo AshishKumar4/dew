@@ -11,8 +11,9 @@ import numpy as np
 
 from dew.batch import Batch
 from dew.data.dataset import Ranges, Records
+from dew.data.declared import Declared
 from dew.data.pipeline import Dataset
-from dew.data.storage import Declared, Store, local
+from dew.data.storage import Store, local
 
 from .base import Read, ShardManifest, _indexed_manifest, url_label
 from .files import Files, export_content
@@ -192,8 +193,8 @@ class TokenFiles(Dataset):
                     f"token export needs the producer's lengths; export with length_field="
                     f"{self.field or 'text'!r}"
                 )
-            index = ArrayIndex(root.child(entry["lengths"]["path"]).url, self.storage_options)
-            index.verify(entry["lengths"])
+            lengths = root.child(entry["lengths"]["path"])
+            index = ArrayIndex(lengths.url, self.storage_options, Declared(lengths, entry["lengths"]))
             if index.values.ndim != 2 or index.values.shape[1] != 2:
                 raise ValueError("token export index needs length and cumulative end columns")
             indexes.append(index)
