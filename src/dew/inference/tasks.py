@@ -50,6 +50,7 @@ from dew.interop.weights import decoding_storage
 from dew.nn.inputs import Media, ModelInputs, default_placement, mesh_of, request_key
 from dew.nn.kernels import generation
 from dew.nn.precision import Numerics
+from dew.nn.progress import END, Progress
 from dew.nn.protocols import Bounded, CacheCapacity, TokenModel, refuse_prefix
 from dew.objectives.base import UNREAD, Objective
 from dew.sampling import decoding, vocabulary
@@ -647,13 +648,13 @@ class TaskSettings:
     """What every generation run records beside its model: `seq_len`, its training row length,
     `max_new_tokens`, its task's response budget (0 for none), and its host processor's source:
     `tokenizer` names the run tokenizer (`recorded_tokenizer`) and `processor` a checkpoint's own
-    processor source (`recorded_processor`); either may be None. Each task's settings add what its
-    generation reads."""
+    processor source (`recorded_processor`), the run's source's; either may be None. Each task's settings
+    add what its generation reads."""
 
     seq_len: int
     max_new_tokens: int
     tokenizer: str | None
-    processor: SourceReference | None
+    processor: SourceReference | None = dataclasses.field(metadata={"derived": "source"})
 
     def __post_init__(self) -> None:
         if type(self.max_new_tokens) is not int or self.max_new_tokens < 0:
@@ -672,12 +673,13 @@ class TextSettings(TaskSettings):
 
 @dataclass(frozen=True, kw_only=True)
 class MaskedSettings(TaskSettings):
-    """A masked-diffusion run's settings (`MaskedGeneration.from_settings`): the masking process,
-    the unmasking solver (`Unmask`, or `Confident` for a release's blockwise walk) and its step
-    count, the places a blockwise walk unmasks together (`block`; None walks the whole response),
-    and the end-of-sequence ids a response stops at, beside the common ones."""
+    """A masked-diffusion run's settings (`MaskedGeneration.from_settings`): the masking process, the
+    run's over its model's mask id, the unmasking solver (`Unmask`, or `Confident` for a release's
+    blockwise walk) and its step count, the places a blockwise walk unmasks together (`block`; None
+    walks the whole response), and the end-of-sequence ids a response stops at, beside the common
+    ones."""
 
-    process: DiscreteProcess
+    process: DiscreteProcess = dataclasses.field(metadata={"derived": "model"})
     solver: Solver
     sampling_steps: int
     eos_token_ids: tuple[int, ...] = ()
@@ -696,10 +698,11 @@ class MaskedSettings(TaskSettings):
 
 @dataclass(frozen=True, kw_only=True)
 class BlockSettings(TaskSettings):
-    """A block-diffusion run's settings (`BlockGeneration.from_settings`): the block process, the
-    pad id and the end-of-sequence ids a response stops at beside the common ones."""
+    """A block-diffusion run's settings (`BlockGeneration.from_settings`): the block process, the run's
+    over its model's canvas and vocabulary, the pad id and the end-of-sequence ids a response stops at
+    beside the common ones."""
 
-    process: BlockProcess
+    process: BlockProcess = dataclasses.field(metadata={"derived": "model"})
     pad_token_id: int
     eos_token_ids: tuple[int, ...] = ()
 
@@ -888,6 +891,9 @@ class TextGeneration(_NativeTextTask):
     prefix: int | Literal["prompt"] | None = None
     """The prefix run the model trained (`LMObjective(prefix=...)`): a prompt's first tokens, or all of it
     under "prompt", form one block the model reads whole. A request's own blocks stand; None is causal."""
+    progress: Progress = END
+    """The run's progress a model that reads one draws at (`dew.nn.progress`): a run's collection's, the
+    updates it committed before its step (`LMObjective.policy`); a finished run's end otherwise."""
     _stops: tuple[Stopping, ...] = dataclasses.field(default=(), init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -905,6 +911,12 @@ class TextGeneration(_NativeTextTask):
                              "that lists its vocabulary; pass processor=")
         return (decoding.stop_strings(self.processor, strings,
                                       self.model.vocab_size if isinstance(self.model, Bounded) else None),)
+
+    def bind(self, variables: Variables, progress: Progress | None = None) -> Self:
+        """This task over `variables` (`_NativeTextTask.bind`), drawing at the run's `progress` where one
+        is given, a collection's step's (`EpisodeInference.bind`), else at its own."""
+        bound = super().bind(variables)
+        return bound if progress is None else dataclasses.replace(bound, progress=progress)
 
     def _controls(self, sampling: Sampling | None, logits: Transforms | None, stopping: Criteria | None
                   ) -> tuple[Sampling, Transforms | None, tuple[Stopping, ...]]:
@@ -987,7 +999,7 @@ class TextGeneration(_NativeTextTask):
             generated = generate(cache_sized(self.model, capacity), self.placed, shaped, budget,
                                  key=random_key, sampling=policy, n=self.n if n is None else n, logits=chain,
                                  stopping=criteria, strategy=self.strategy if strategy is None else strategy,
-                                 trips=trips, prefix=self.prefix)
+                                 trips=trips, prefix=self.prefix, progress=self.progress)
             padding = shaped.tokens.shape[1] - inputs.tokens.shape[1]
             return self._decoded(_requested(generated, budget, padding))
 

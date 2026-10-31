@@ -1,5 +1,6 @@
 """Dew's CI plan and task on armada (tools/armada/ci.py), on small test files written here."""
 
+import functools
 import itertools
 import json
 import os
@@ -195,7 +196,7 @@ def test_a_task_rows_each_file_red_where_ci_would_fail(ci, tmp_path):
 
 def test_a_tasks_tests_run_with_no_timed_stack_dump_armed(ci, tmp_path):
     """A task's pytest arms no timed dump of every thread's stack, which killed a multithreaded test mid-dump
-    (exit 245, a SIGSEGV, Main 2026-10-25): the test process CI starts carries no dump timer. A test running
+    (exit 245, a SIGSEGV, 2026-10-25): the test process CI starts carries no dump timer. A test running
     past the old ten minutes through a task is green with no dump (armada receipt in the head's review)."""
     (tmp_path / "tests/test_timer.py").write_text(
         "def test_no_dump_timer(request):\n"
@@ -348,25 +349,28 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
     assert [ci.reused("3.12", f"tests/{name}", "", common) is not None
             for name in ("test_machine.py", "test_tool.py", "test_spawn.py", "test_forkserver.py",
                          "test_fork.py", "test_shell.py")] == [True, True, False, False, False, False]
-    # A day's tier is the checkout's gpu-marked files, whatever the records say a file reads (ledger 2452):
-    # the evidence is --evidence's report alone.
-    monkeypatch.setattr(sys, "argv", ["ci.py", "gpu-tier", "--shards=2"])
-    capsys.readouterr()
-    assert ci.main() == 0
-    assert capsys.readouterr().out.split() == ["tests/test_marked.py"]
-    monkeypatch.setattr(sys, "argv", ["ci.py", "gpu-tier", "--evidence"])
-    assert ci.main() == 0
-    assert {line.split("\t")[0] for line in capsys.readouterr().out.splitlines()} == set(ci.gpu_tier("3.12"))
+    # A day's tier is the checkout's gpu-marked files, whatever the records say a file reads (ledger 2452);
+    # --marked names it for the caller that still passes it (2714); --evidence prints each beside its reads.
+    tier = functools.partial(named_tier, ci, monkeypatch, capsys)
+    assert tier("--shards=2") == tier("--marked") == ["tests/test_marked.py"]
+    assert [line.split("\t")[:2] for line in tier("--evidence", lines=True)] == [
+        ["tests/test_marked.py", "1 marked"]]
     # A file gains a GPU test after its record: the checkout's marks choose, not records; a kernel's test is
     # the CPU's, interpreted.
     (tmp_path / "tests/test_plain.py").write_text(
         "import pytest\n@pytest.mark.gpu\ndef test_lowers(): pass\n")
     (tmp_path / "tests/test_new.py").write_text(
         "import pytest\n@pytest.mark.kernel\ndef test_interpreted(): pass\n")
-    for marked in ([], ["--marked"]):
-        monkeypatch.setattr(sys, "argv", ["ci.py", "gpu-tier", *marked])
-        assert ci.main() == 0
-        assert capsys.readouterr().out.split() == ["tests/test_marked.py", "tests/test_plain.py"]
+    assert tier() == ["tests/test_marked.py", "tests/test_plain.py"]
+
+
+def named_tier(ci, monkeypatch, capsys, *flags: str, lines: bool = False) -> list:
+    """What `ci.py gpu-tier` with `flags` prints: its files, or its lines where `lines`."""
+    monkeypatch.setattr(sys, "argv", ["ci.py", "gpu-tier", *flags])
+    capsys.readouterr()
+    assert ci.main() == 0
+    out = capsys.readouterr().out
+    return out.splitlines() if lines else out.split()
 
 
 def fetcher(root: Path, *, due: bool = False) -> Path:
@@ -947,6 +951,31 @@ def test_every_row_carries_its_cases_reports_and_a_reused_row_keeps_them(ci, tmp
     node = "tests/test_gpu_band.py::test_the_band_runs"
     expected = {"3.12:tests/test_gpu_band.py": ([{"node": node, **sites[0]}], {node: counts}),
                 "3.12:tests/test_plain.py": ([], {})}
+    assert fields() == expected
+    assert fields() == expected
+    assert (tmp_path / "runs").read_text() == "x", "the second task reused the rows"
+
+
+def test_every_row_carries_its_flows_cell_counts_and_a_reused_row_keeps_them(ci, tmp_path, monkeypatch,
+                                                                             cache_worker):
+    """Each row a task runs carries `cells`, its file's GPU flows' counts by case (the JUnit property
+    tests/conftest.py writes from tests/gpu_flow.py), an empty object where it runs no flow; a green row a
+    later task reuses keeps them, so the train's native gate reads a cached flow's counts (ledger 2643)."""
+    counts = {"passed": 2, "failed": 0, "skipped": 1, "device": "cpu"}
+    written(tmp_path, {
+        "test_gpu_band.py": "import json\n"
+                            "from pathlib import Path\n"
+                            "def test_the_band_runs(record_property):\n"
+                            "    with Path('runs').open('a') as runs: runs.write('x')\n"
+                            f"    record_property('cells', json.dumps({counts!r}))\n",
+        "test_plain.py": "def test_plain(): pass\n"})
+    out = cached_checkout(ci, tmp_path, monkeypatch, cache_worker)
+
+    def fields() -> dict[str, dict]:
+        return {row["name"]: row["cells"] for row in armada_task(ci, monkeypatch, out)}
+
+    expected = {"3.12:tests/test_gpu_band.py": {"tests/test_gpu_band.py::test_the_band_runs": counts},
+                "3.12:tests/test_plain.py": {}}
     assert fields() == expected
     assert fields() == expected
     assert (tmp_path / "runs").read_text() == "x", "the second task reused the rows"
@@ -1707,6 +1736,55 @@ def test_a_run_plans_only_the_files_whose_inputs_changed_and_its_verdict_names_e
     assert [len((tmp_path / f"runs-{name}").read_text()) for name in ("a", "b", "c")] == [1, 1, 2]
 
 
+def test_a_plan_run_by_another_python_than_its_tasks_keeps_the_files_they_ran_green(
+        ci, tmp_path, cache_worker):
+    """The plan and a task each run tools/armada/ci.py as a script under whatever Python runs it where it runs
+    (a planner's machine, a GitHub runner, a task's image), and key a file's run alike: the files a task ran
+    green under one Python, a plan run by another keeps, in one task (2026-10-30: plans under 3.14 and 3.12
+    found none of the 3.13 tasks' records fresh, as each Python compiles a module's units to its own digests,
+    and every file took a task of its own)."""
+    interpreter(tmp_path, "3.12")
+    held = ci.cpu_class().split("-")
+    config = json.loads((ROOT / ".armada.json").read_text())
+    config["task"]["cpu"] = {"vendor": held[0], "family": int(held[1]), "model": int(held[2])}
+    (tmp_path / ".armada.json").write_text(json.dumps(config))
+    # A module whose units each Python compiles to its own digests: a documented, annotated function.
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src/shapes.py").write_text(
+        'def area(width: int, height: int = 1) -> int:\n    """An area."""\n    return width * height\n')
+    written(tmp_path, {f"test_{name}.py": "import sys\nsys.path.insert(0, 'src')\nfrom shapes import area\n"
+                                          f"def test_{name}():\n    assert area(2) == 2\n"
+                       for name in ("a", "b")})
+    (tmp_path / "tests/test_durations.json").write_text(json.dumps(
+        {f"tests/test_{name}.py::test_{name}": 250.0 for name in ("a", "b")}))
+    (tmp_path / ".verdict").mkdir()
+    url, _, _ = cache_worker
+    env = {**os.environ, "DEW_XLA_CACHE_URL": url, "DEW_XLA_CACHE_TOKEN": "token",
+           "DEW_XLA_CACHE_READ_TOKEN": "token"}
+    script = str(ROOT / "tools/armada/ci.py")
+
+    def version(python: str) -> str:
+        return subprocess.run([python, "-c", "import sys; print(sys.version_info[:2])"], capture_output=True,
+                              text=True, check=True).stdout
+
+    # The task under this Python; the plan under another the image holds: a venv of another tested Python, or
+    # the image's own.
+    other = next(python for python in (*(str(ROOT / f".venv-{each}/bin/python") for each in ci.PYTHONS),
+                                       shutil.which("python3") or "")
+                 if Path(python).is_file() and version(python) != version(sys.executable))
+    verdict = tmp_path / ".verdict/verdict.json"
+    tests = "--tests=tests/test_a.py tests/test_b.py"
+    subprocess.run([sys.executable, script, "task", "--python=3.12", tests, f"--out={verdict}", "--cache=on"],
+                   cwd=tmp_path, env=env, check=True)
+    assert [row["exitCode"] for row in json.loads(verdict.read_text())["rows"]] == [0, 0]
+    timings = tmp_path / "timings.json"
+    planned = subprocess.run([other, script, "plan", "--target=300", f"--timings={timings}"], cwd=tmp_path,
+                             env=env, capture_output=True, text=True, check=True).stdout
+    entries = [entry for entry in json.loads(planned)["include"] if entry["python"] == "3.12"]
+    assert [sorted(ci.kept_of(entry["tests"].split())[1]) for entry in entries] == [
+        [("tests/test_a.py", ""), ("tests/test_b.py", "")]]
+
+
 def test_a_plan_without_build_output_or_fetched_payloads_finds_what_a_task_recorded_with_them(
         ci, tmp_path, monkeypatch, cache_worker):
     """The plan's checkout, clean, keys rows as the task's checkout does, though the task's holds an editable
@@ -1789,6 +1867,70 @@ def test_a_row_run_green_on_these_inputs_is_reused_though_another_commits_run_of
     rows = armada_task(ci, monkeypatch, verdict)
     assert len(rows) == 3 and all(row["exitCode"] == 0 for row in rows)
     assert [len((tmp_path / f"runs-{name}").read_text()) for name in "abc"] == [1, 1, 2]
+
+
+def test_a_plan_keeps_each_green_group_of_a_heavy_file_and_a_task_runs_a_group_whose_green_run_is_gone(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A file heavier than the target runs as groups, each a row the plan looks up as it does a whole file's:
+    once every group ran green on these inputs, one task holds them with the light files and reuses each
+    row, running nothing; a kept group whose green run its task cannot read, it runs (2026-10-30: the plan
+    looked up whole files alone, and a docs-only change's 1,034 green groups of heavy files each booted a
+    container to read its record)."""
+    verdict, _ = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
+    written(tmp_path, {"test_c.py": "from pathlib import Path\n" + "".join(
+        f"def test_{name}():\n    with Path('runs-{name}').open('a') as runs: runs.write('x')\n"
+        for name in "cd")})
+    (tmp_path / "tests/test_durations.json").write_text(json.dumps(
+        {**{f"tests/test_{name}.py::test_{name}": 250.0 for name in "ab"},
+         "tests/test_c.py::test_c": 250.0, "tests/test_c.py::test_d": 250.0}))
+
+    def planned() -> list[list[str]]:
+        return sorted(sorted(entry["rows"]) for entry in ci.plan(300.0, {}) if entry["python"] == "3.12")
+
+    heavy = ["3.12:tests/test_c.py#1/2", "3.12:tests/test_c.py#2/2"]
+    assert planned() == [["3.12:tests/test_a.py"], ["3.12:tests/test_b.py"], heavy[:1], heavy[1:]]
+    assert all(row["exitCode"] == 0 for row in armada_task(ci, monkeypatch, verdict))
+    assert planned() == [["3.12:tests/test_a.py", "3.12:tests/test_b.py", *heavy]]
+    rows = armada_task(ci, monkeypatch, verdict)
+    assert sorted(row["name"] for row in rows) == ["3.12:tests/test_a.py", "3.12:tests/test_b.py", *heavy]
+    assert [len((tmp_path / f"runs-{name}").read_text()) for name in "abcd"] == [1, 1, 1, 1]
+    # A kept group whose green run its task cannot read, its file changed since the plan: the task runs that
+    # group alone.
+    test_c = tmp_path / "tests/test_c.py"
+    test_c.write_text(test_c.read_text() + "\n# changed after the plan\n")
+    monkeypatch.setattr(sys, "argv", ["ci.py", "task", "--python=3.12", "--tests=tests/test_c.py#2/2@"
+                                      "GenuineIntel-6-143:0000", f"--out={verdict}", "--cache=on"])
+    assert ci.main() == 0
+    ran = json.loads(verdict.read_text())["rows"]
+    assert [(row["name"], row["exitCode"]) for row in ran] == [(heavy[1], 0)]
+    assert [len((tmp_path / f"runs-{name}").read_text()) for name in "cd"] == [1, 2]
+
+
+def test_a_kept_task_whose_deadline_runs_out_names_its_unread_groups_red_and_runs_none_past_it(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A kept task that must run a kept group whose green run it cannot read, past its deadline, reads and
+    runs no group after it: each is a red row its task's deadline cut off, and the task writes every row
+    (review: each later group was still read and run, a fresh grace and settle each, past the deadline)."""
+    verdict, _ = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
+    _, _, seen = cache_worker
+    names = "cde"
+    written(tmp_path, {"test_c.py": "import time\nfrom pathlib import Path\n" + "".join(
+        f"def test_{name}():\n    Path('runs-{name}').write_text('x')\n    time.sleep(3)\n"
+        for name in names)})
+    (tmp_path / "tests/test_durations.json").write_text(json.dumps(
+        {f"tests/test_c.py::test_{name}": 250.0 for name in names}))
+    groups = " ".join(f"tests/test_c.py#{index}/3@GenuineIntel-6-143:0000" for index in (1, 2, 3))
+    monkeypatch.setattr(sys, "argv", ["ci.py", "task", "--python=3.12", f"--tests={groups}",
+                                      f"--out={verdict}", "--cache=on", "--deadline=1"])
+    seen.clear()
+    assert ci.main() == 0
+    rows = json.loads(verdict.read_text())["rows"]
+    assert [(row["name"], row["exitCode"], row["kind"]) for row in rows] == [
+        (f"3.12:tests/test_c.py#{index}/3", 1, "deadline") for index in (1, 2, 3)]
+    assert [(tmp_path / f"runs-{name}").exists() for name in names] == [True, False, False]
+    # The groups past the deadline were never looked up.
+    assert [any(f"tests/test_c.py/{index}-of-3" in path for path in seen) for index in (1, 2, 3)] == [
+        True, False, False]
 
 
 def test_a_kept_task_reuses_its_rows_after_another_commit_changes_the_recorded_dependencies(
@@ -2204,7 +2346,7 @@ def test_a_release_check_marked_whole_suite_or_network_too_runs_in_its_release_t
 def test_a_release_mark_without_one_requirement_fails_its_files_collection(ci, tmp_path, monkeypatch, mark):
     """A release_env mark that names no one requirement string (none, a keyword's, two, or not a string)
     fails its file's collection, naming its test: every suite task sets a marked test aside, and no release
-    task would plan it, so it would run nowhere (Main's read of b94d89999)."""
+    task would plan it, so it would run nowhere (the maintainer's read of b94d89999)."""
     interpreter(tmp_path, "3.12")
     written(tmp_path, {"test_release.py": f"import pytest\n@pytest.mark.{mark}\n"
                        "def test_under_the_release():\n    pass\n"

@@ -198,7 +198,7 @@ class DecisionRunConfig(DecoderRunConfig):
         among them (`SourceReference.pinned`), so its record names the commit it read."""
         from dew.interop.sources import SourceReference
 
-        run = super().pinned()
+        run = super().pinned().with_pinned_run(self.pretrained)
         revision = SourceReference(self.pretrained, self.revision, self.subfolder).pinned().revision
         return run if revision == self.revision else dataclasses.replace(run, revision=revision)
 

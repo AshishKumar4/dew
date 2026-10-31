@@ -29,6 +29,7 @@ from dew.nn.attention_masks import (
     visibility_mask,
 )
 from dew.nn.blocks import normal_kernel
+from dew.nn.cross_attention import sow_context_logits, with_context_logits
 from dew.nn.dense import Dense
 from dew.nn.dex import DEX_COLLECTION, DexStart, LayerDex, annealed, differential
 from dew.nn.documents import CrossDocuments
@@ -247,11 +248,6 @@ class _Masking(NamedTuple):
     `key_places`, or None."""
 
 
-CONTEXT_LOGITS = "context_max_logits"
-"""The `qk` collection's entry of each head's largest logit over a context a layer's own attention read
-(`CausalSelfAttention.attend_context`), which the layer's own maxima take in."""
-
-
 
 GATE_ACTIVATIONS = {
     'sigmoid': jax.nn.sigmoid,
@@ -395,11 +391,14 @@ class CausalSelfAttention(nn.Module):
         if not self.ctx.kv_shared and not self._packed():
             self.k_proj = dense(projections['k_proj'][1], name='k_proj')
             if self.ctx.value_experts is not None:
-                # K2 Horizon's MoVA: the values are routed experts' projections (`RoutedValues`).
+                # K2 Horizon's MoVA: the values are routed experts' projections (`RoutedValues`), run
+                # under the layer's routed MLP, without which a decoder's fields refuse them.
+                if (mixture := self.ctx.mixture) is None:
+                    raise ValueError("routed value experts run under their layer's routed MLP (a Mixture)")
                 self.experts = RoutedValues(
                     self.ctx.value_experts, self.ctx.emb_features, self.ctx.num_kv_heads * self.value_dim,
-                    init_std=self.ctx.init_std, dtype=self.ctx.dtype, precision=self.ctx.precision,
-                    name='experts')
+                    mixture=mixture, init_std=self.ctx.init_std, dtype=self.ctx.dtype,
+                    precision=self.ctx.precision, name='experts')
             elif not self.ctx.k_eq_v:
                 self.v_proj = dense(projections['v_proj'][1], name='v_proj')
         if 'gate_proj' in projections:
@@ -941,13 +940,7 @@ class CausalSelfAttention(nn.Module):
         attention excludes none."""
         if self.ctx.ngpt is not None:
             query, key = self._ngpt_rotated(self.ctx.ngpt, query, key)
-        if not self.is_initializing() and self.is_mutable_collection("qk"):
-            # The read's logits through the layer's own projections over the keys it sees, which its own
-            # call's maxima take in beside its own sequence's (`_attended`), so the QK-Clip bounds both.
-            documents = None if queries is None or segments is None else CrossDocuments(queries, segments)
-            seen = visibility_mask(query.shape[1], key.shape[-3], causal=False, sliding_window=None,
-                                   segment_ids=documents, key_value_seq_lengths=lengths)
-            self.sow("qk", CONTEXT_LOGITS, max_attention_logits(query, key, mask=seen))
+        sow_context_logits(self, query, key, lengths, queries, segments)
         # A row without context reads its first slot, so its softmax stays finite: one over no keys would
         # be NaN, which the block's join drops forward but not from the gradients.
         attention = checkpoint_name(scaled_dot_product_attention(
@@ -1135,18 +1128,18 @@ class CausalSelfAttention(nn.Module):
         groups = _Groups() if prefix is not None else self._key_groups(attention_metadata, history, decode, S)
         if self._reads_whole_blocks(attention_metadata, prefix, append, decode):
             causal, window, groups = False, None, groups._replace(block_groups=None)
-        # Over the keys the call reads, the cache's or the prefix's joined.
-        masked = self._mask_kernel(query, key, decode)
+        # Over the keys the call reads (the cache's or the prefix's joined), decided only where it is taken.
+        masked = functools.partial(self._mask_kernel, query, key, decode)
         cached = isinstance(documents, CrossDocuments)
         if (cached or groups != _Groups()) and self.ctx.attention_impl != 'auto':
-            implementation = masked  # a named kernel's handoff (`_mask_kernel`)
+            implementation = masked()  # a named kernel's handoff (`_mask_kernel`)
         valid = None
         if prefix is None and self._restricts_visibility(attention_metadata, decode, causal) and not cached:
             # A decode step's mask and a cache call's documents hold the rows' validity; an uncached
             # call's real keys reach the kernel beside the rest, its window counting real tokens.
             valid = None if decode or attention_metadata is None else attention_metadata.valid
             if decode or self.ctx.attention_impl != 'auto':
-                implementation = masked
+                implementation = masked()
         runs = None
         own, implementation = self._overridden(attention_metadata, rotary_positions, B, S, key.shape[-3],
                                                key_places, implementation, masked, decode)
@@ -1158,7 +1151,7 @@ class CausalSelfAttention(nn.Module):
                                     key.shape[-3], self.ctx.attention_chunk, block_groups=groups.block_groups,
                                     image_groups=groups.image_groups)
             causal, window, documents, groups, valid, runs = False, None, None, _Groups(), None, None
-            implementation = masked
+            implementation = masked()
         max_segments = (None if documents is None else 1 if isinstance(documents, CrossDocuments)
                         else coordinates_of(attention_metadata, B, S).max_segments)
         return _Masking(query, key, value, causal, window, mask, documents, max_segments, implementation,
@@ -1205,15 +1198,16 @@ class CausalSelfAttention(nn.Module):
                                 starts=None, implementation=kernel)
 
     def _overridden(self, metadata: AttentionMetadata | None, rotary_positions, B: int, S: int, keys: int,
-                    key_places, implementation: AttentionImpl, masked: AttentionImpl, decode: bool):
+                    key_places, implementation: AttentionImpl, masked: Callable[[], AttentionImpl],
+                    decode: bool):
         """A call's own visibility (`call_visibility`), None where it states none, and the kernel it takes:
-        a mask's the masked one (`masked`), as a cached call's or a named kernel's runs do; an uncached
+        a mask's the masked one (`masked()`), as a cached call's or a named kernel's runs do; an uncached
         call's runs the one the layer chooses ('auto')."""
         own = None if metadata is None else call_visibility(
             metadata, rotary_positions, batch=B, queries=S, keys=keys, key_places=key_places,
             sliding_window=self.ctx.sliding_window)
         if own is not None and (own.mask is not None or decode or self.ctx.attention_impl != 'auto'):
-            implementation = masked
+            implementation = masked()
         return own, implementation
 
     @property
@@ -1241,10 +1235,8 @@ class CausalSelfAttention(nn.Module):
             # Over the keys the call sees, as its spans say them (`visibility_mask`).
             seen = visibility_mask(S, key.shape[-3], causal, window, mask, documents, block_groups=blocks,
                                    image_groups=images, key_valid=valid, key_runs=runs, places=held)
-            found = max_attention_logits(query, key, mask=seen, bias=bias)
-            if self.has_variable("qk", CONTEXT_LOGITS):
-                # A context this call read through the same projections first (`attend_context`).
-                found = jnp.maximum(found, self.get_variable("qk", CONTEXT_LOGITS)[-1])
+            # Beside a context this call read through the same projections first (`attend_context`).
+            found = with_context_logits(self, max_attention_logits(query, key, mask=seen, bias=bias))
             self.sow("qk", "max_logits", found)
             self.sow("qk", "kv_heads", jnp.asarray(key.shape[-2]))
             self.sow("qk", "head_dim", jnp.asarray(query.shape[-1]))

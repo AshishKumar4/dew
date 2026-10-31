@@ -5,6 +5,17 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- Muon's and M3's Newton-Schulz multiply in the run's numerics: bfloat16 operands in its fast forms
+  (the default) and float32 at `Numerics.matmul` in its accurate ones (`--trainer.precision accurate`:
+  IEEE float32), each matrix whole on one device and the matrices spread over the mesh. A run states its
+  products exactly with `--optim.optimizer-opts '{"ns_precision": "F32_F32_F32"}'` (a
+  `jax.lax.DotAlgorithmPreset` by name), refused in JAX's own words where its platform has not the
+  algorithm; a run saved with `ns_precision` as a precision level loads with its algorithm. Opt-in beside
+  it: `per_head` (head widths by parameter pattern) orthogonalizes each head's block alone, as Kimi K3;
+  `ns_coeffs: "polar_express"` takes Polar Express's coefficients; `neuron_beta2` normalizes each output
+  neuron as NorMuon. Muon's Newton-Schulz lives in `dew.newton_schulz`.
+- An evaluation of a run on the examples clock records the examples it had consumed
+  (`evaluation/examples_consumed`) beside its step.
 - A run's numerics are named where they are set: `--trainer.precision accurate` (or a Lightning dtype
   preset, "bf16-true", or a `Numerics` record's JSON), `"precision": "accurate"` in a run.json, and
   `Pretrained.load(precision=...)` and `dew.pipeline(source, precision=...)`, which load in their dtypes
@@ -22,7 +33,9 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   call's `progress=` keyword and carries it to its layers in `AttentionMetadata.progress`, so a compiled
   forward keys on it. A run's training loss passes it (`Objective.progress`); a call that passes none
   reads the run's end. `dew.nn.progress.progress()` and `stepping` are gone, and an objective that
-  passes no progress (`Objective.passes_progress`) refuses a model that reads it.
+  passes no progress (`Objective.passes_progress`) refuses a model that reads it, as the trainer does
+  under a custom step (`Trainer(step=)`) unless its factory says it passes it
+  (`dew.training.PassesProgress`).
 - One entry point and one path for scoring decisions: `decide(state, questions)` answers a request and
   `decide([(state, questions), ...], contexts=...)` many, their rows packed into the passes a scoring
   server runs and over its compiled programs. `Decide.batch` and `Decide.fits` are gone; call the task

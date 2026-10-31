@@ -25,10 +25,10 @@ import jax
 import jax.experimental.topologies as topologies
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
-from kernel_liveness import Compiler, LoweredRegisters, lowered_registers
 
 from dew.nn.kernels.generation import assumed, capability, gpu_mesh, gpu_target
 from dew.nn.kernels.templates import report, resources
+from dew.nn.kernels.templates.liveness import Compiler, LoweredRegisters, lowered_registers
 from dew.training._lowering import kernel_calls, triton_kernels
 from dew.training.ahead import compile_only_gpus
 
@@ -470,6 +470,11 @@ def mosaic_failures(found: list[dict]) -> list[str]:
                               f"bytes of scratch, the kernel asks for {found_kernel.shared}")
         record["evidence"] = _register_evidence(record)
     return failed
+
+
+def compiled_kernels(record: dict) -> set[str]:
+    """The names of the kernels `record` compiled, as its models name them (`report.Report.kernel`)."""
+    return {_report(kernel).kernel for kernel in record.get("kernels", ())}
 
 
 def _report(kernel: dict) -> report.Report:

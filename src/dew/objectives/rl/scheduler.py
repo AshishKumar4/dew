@@ -151,7 +151,7 @@ from dew.cleanup import attempted
 from dew.data.dataset import DataPartition, Loader, tapped
 from dew.distributed.batches import first_reader_batch, shard_batch
 from dew.nn.inputs import local_rows, mesh_of
-from dew.nn.progress import END, Progress
+from dew.nn.progress import Progress
 from dew.objectives.base import Shown
 from dew.sampling.text import Sampling
 from dew.state import TrainState
@@ -512,7 +512,7 @@ class Asynchronous:
     def stale(self, sample: _Sample, updates: int) -> bool:
         return updates - sample.submitted > self.lag
 
-    def rescore(self, variables: Variables, packed: Mapping[str, np.ndarray], progress: Progress = END
+    def rescore(self, variables: Variables, packed: Mapping[str, np.ndarray], progress: Progress
                 ) -> np.ndarray:
         """The packed ids' proximal log-probabilities under `variables`, the trainer's weights, at the
         run's `progress` the step's loss reads (`GRPOObjective.loss`), so the two policies agree where
@@ -525,7 +525,7 @@ class Asynchronous:
 
 
 def scored_rows(objective: GRPOObjective, variables: Variables, packed: Mapping[str, np.ndarray],
-                progress: Progress = END) -> np.ndarray:
+                progress: Progress) -> np.ndarray:
     """This process's packed rows' sampled ids' log-probabilities under `variables` (`packed_log_probs`)
     at the run's `progress`, over a mesh scored once over the pool's rows, placed as the step places the
     batch."""
@@ -947,7 +947,8 @@ class RolloutScheduler:
         if frozen is None:
             raise ValueError("the rewards' reference penalty reads the frozen starting policy, and the "
                              "state holds none; build it from the objective that names the penalty")
-        reference = scored_rows(self.reference, frozen, packed)
+        # At the progress the proximal column is read at, so the penalty is nil where the weights are alike.
+        reference = scored_rows(self.reference, frozen, packed, Progress(state.updates))
         shaping = (None if rollouts is None else
                    reference_penalties(rollouts, packed, reference, self.reference.reward_kl))
         whitening = self._whitening(mesh, rollouts or [], shaping) if self.estimator == "global" else None
