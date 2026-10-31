@@ -133,7 +133,7 @@ class AttentionCase:
     none of them, row 2578), of at most fp32's width."""
     dense_bias: bool
     """Whether the call's bias varies by query (`[B or 1, H or 1, Q, K]`), which the template reads a tile at
-    a time (`template.biased`)."""
+    a time (`template.Biased`)."""
     row_bias: bool
     """Whether that dense bias varies by batch row too (`[B, H or 1, Q, K]`); a table every row shares (T5's
     `[1, H, Q, K]`) the Mosaic mainloop reads once a tile (`template.shared_place`)."""

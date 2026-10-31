@@ -562,21 +562,31 @@ def sinks(values: jax.Array, batch: int, queries: int, width: int) -> Initial:
     return Initial(m, jnp.ones_like(m), jnp.zeros((*m.shape, width), wide))
 
 
-def capped(softcap: float, logits: jax.Array, q_pos: jax.Array, k_pos: jax.Array) -> jax.Array:
-    """Gemma 2's logit cap, `softcap * tanh(logits / softcap)`, on the scaled logits as `reference_attention`
-    takes it. It is a score hook as `functools.partial(capped, softcap)`, which reads no position."""
-    del q_pos, k_pos
-    return softcap * jnp.tanh(logits / softcap)
+@dataclasses.dataclass(frozen=True)
+class Capped:
+    """Gemma 2's logit cap as a score hook, `softcap * tanh(logits / softcap)` on the scaled logits as
+    `reference_attention` takes it, reading no position: equal for equal caps, so a launch built once for
+    its static facts serves every layer of one cap (`tuning.lowered_once`)."""
+
+    softcap: float
+
+    def __call__(self, logits: jax.Array, q_pos: jax.Array, k_pos: jax.Array) -> jax.Array:
+        del q_pos, k_pos
+        return self.softcap * jnp.tanh(logits / self.softcap)
 
 
-def biased(score_mod: Callable | None, logits: jax.Array, q_pos: jax.Array, k_pos: jax.Array,
-           bias: jax.Array) -> jax.Array:
-    """`score_mod`'s logits (the scaled logits where None) plus a bias, `bias` the tile's keys' `[1, k]` (a
-    `Kind.KEY` parameter: ALiBi's slope times each key's place) or its entries' `[q, k]` (a `Kind.TILE`
-    one: a dense bias), added after a softcap as `reference_attention` adds its bias. It is a score hook as
-    `functools.partial(biased, score_mod)`."""
-    capped = logits if score_mod is None else score_mod(logits, q_pos, k_pos)
-    return capped + bias
+@dataclasses.dataclass(frozen=True)
+class Biased:
+    """`score_mod`'s logits (the scaled logits where None) plus a bias as a score hook, its parameter the
+    tile's keys' `[1, k]` (a `Kind.KEY` one: ALiBi's slope times each key's place) or its entries' `[q, k]` (a
+    `Kind.TILE` one: a dense bias), added after a softcap as `reference_attention` adds its bias: equal for
+    equal inner hooks (`Capped`)."""
+
+    score_mod: Callable | None = None
+
+    def __call__(self, logits: jax.Array, q_pos: jax.Array, k_pos: jax.Array, bias: jax.Array) -> jax.Array:
+        capped = logits if self.score_mod is None else self.score_mod(logits, q_pos, k_pos)
+        return capped + bias
 
 
 DROP_DOMAIN = 0x6A09E667
@@ -804,14 +814,20 @@ def scores(query: jax.Array, key: jax.Array, spans: KeySpans, hooks: Hooks | Non
     products = float32_einsum("bqhgd,bkhd->bhgqk", grouped, key,
                               preferred_element_type=wide).reshape(batch, heads, queries, spans.keys)
     products = products * jnp.asarray(scale, wide)
+    return jnp.where(seen[:, None], score_modded(products, hooks), -jnp.inf)
+
+
+def score_modded(products: jax.Array, hooks: Hooks) -> jax.Array:
+    """`hooks.score_mod` over scaled products `[B, H, Q, K]` at their positions, each row and head reading
+    its own parameters (`_per_head`); the products where the hooks have no score_mod."""
+    if hooks.score_mod is None:
+        return products
+    batch, heads, queries, keys = products.shape
+    q_pos, k_pos = jnp.arange(queries)[:, None], jnp.arange(keys)[None, :]
 
     def one(row, head):
-        s = products[row, head]
-        if hooks.score_mod is not None:
-            q_pos = jnp.arange(queries)[:, None]
-            k_pos = jnp.arange(spans.keys)[None, :]
-            s = hooks.score_mod(s, q_pos, k_pos, *(_per_head(p, row, head) for p in hooks.score_params))
-        return jnp.where(seen[row], s, -jnp.inf)
+        params = (_per_head(p, row, head) for p in hooks.score_params)
+        return hooks.score_mod(products[row, head], q_pos, k_pos, *params)
 
     return jax.vmap(jax.vmap(one, in_axes=(None, 0)), in_axes=(0, None))(jnp.arange(batch), jnp.arange(heads))
 

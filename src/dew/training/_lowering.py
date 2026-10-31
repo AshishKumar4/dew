@@ -73,12 +73,6 @@ class CustomCall:
 def _read[T](lowered: jax.stages.Lowered, read: Callable[[ir.Operation], T | None]) -> list[T]:
     """What `read` makes of each operation of a lowered program's StableHLO module, in program order: the
     operations it makes something of."""
-    module = lowered.compiler_ir(dialect="stablehlo")
-    assert module is not None, "a lowered program always has its StableHLO module"
-    return _read_module(module, read)
-
-
-def _read_module[T](module: ir.Module, read: Callable[[ir.Operation], T | None]) -> list[T]:
     found: list[T] = []
 
     def visit(operation: ir.Operation) -> ir.WalkResult:
@@ -87,6 +81,8 @@ def _read_module[T](module: ir.Module, read: Callable[[ir.Operation], T | None])
             found.append(made)
         return ir.WalkResult.ADVANCE
 
+    module = lowered.compiler_ir(dialect="stablehlo")
+    assert module is not None, "a lowered program always has its StableHLO module"
     with module.context:
         module.operation.walk(visit, ir.WalkOrder.PRE_ORDER)
     return found
@@ -128,20 +124,11 @@ def kernel_calls(lowered: jax.stages.Lowered) -> list[KernelCall]:
     no matmul (`instrumentation.custom_call_kind`), the launches one dispatch expands into, forward and
     backward, which only the lowered program shows (a dispatch's `generation.Route` holds its decision
     alone)."""
-    return _read(lowered, _read_kernel)
+    def read(target: str, operation: ir.Operation) -> KernelCall | None:
+        kind = custom_call_kind(target)
+        return None if kind == "no_matmul" else _kernel_call(kind, target, operation)
 
-
-def kernel_calls_in(module: ir.Module) -> list[KernelCall]:
-    """The kernel calls of a StableHLO module, including a native JAX export's module."""
-    return _read_module(module, _read_kernel)
-
-
-def _read_kernel(operation: ir.Operation) -> KernelCall | None:
-    if operation.name != 'stablehlo.custom_call':
-        return None
-    target = ir.StringAttr(operation.attributes['call_target_name']).value
-    kind = custom_call_kind(target)
-    return None if kind == "no_matmul" else _kernel_call(kind, target, operation)
+    return _read_calls(lowered, read)
 
 
 def _kernel_call(kind: str | None, target: str, operation: ir.Operation) -> KernelCall:

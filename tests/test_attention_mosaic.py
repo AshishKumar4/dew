@@ -13,15 +13,17 @@ import dataclasses
 import functools
 import gc
 import weakref
+from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 from attention_oracle import attention_terms
+from float64_terms import float64_terms
 from generation_support import COMPILES_ON_CPU, INTERPRETS, lowers
 from jax.sharding import Mesh
-from reference_error import as_given, assert_as_exact
+from reference_error import as_given, assert_as_exact, widened
 from test_attention_template import CASES, ROWS, RUN_CASES, arguments, geometry as core_geometry
 from test_attention_triton import BACKWARD_SEEDS, HOOKS, SCORE_HOOKS, gate_of, hooks_for, score_hooks
 
@@ -247,7 +249,8 @@ def _check_spans(label: str, spans: template.KeySpans, shape, *, interpret: bool
     if seeds is None:
         seeds = (BACKWARD_SEEDS.get((score, jnp.dtype(dtype).name), SEEDS) if backward
                  else ALL_HOOKS_SEEDS if len(score) + gate > 1 else SEEDS)
-    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, name, seeds=seeds)
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, name, seeds=seeds,
+                    terms=_gradient_terms(spans, hooked, score, jax.jit(reference)) if backward else None)
 
 
 def _check_hooks(hooks: str, dtype, natural: bool, *, interpret: bool):
@@ -349,18 +352,34 @@ def _check_backward(call: str, shape, *, form: str | None, interpret: bool, keys
         return pull(dout)
 
     assert_as_exact(jax.jit(ours), jax.jit(reference), draw, f"mosaic backward {call} {form} {kept.name}",
-                    seeds=SEEDS, terms=_gradient_terms(spans) if kept is template.Kept.OUTPUT else False)
+                    seeds=SEEDS, terms=_gradient_terms(spans))
 
 
-def _gradient_terms(spans: template.KeySpans):
+def _gradient_terms(spans: template.KeySpans, hooked: Callable | None = None, score: tuple = (),
+                    reference: Callable | None = None):
     """The float64 terms of the query's, key's and value's gradients over `spans` (`attention_terms`): a
     logit's gradient `P (dP - D)` sized by `P (|dP| + sum |out dout|)`, the rounding a D formed from the
-    rounded output carries (`template.Kept.OUTPUT`'s, FlashAttention's), so a row that cancels to zero in
-    float64 is held to it, not to its own zero."""
+    rounded output carries (`template.Kept.OUTPUT`'s, and the fast form's: its anchor key's `dP - c` its
+    product's rounding), so a row that cancels to zero in float64 is held to it, not to its own zero. Under
+    score hooks (`hooked(params, initial)`, a draw's `(query, key, value, dout, params, initial)`), the
+    logits are the hook's (`template.score_modded`), and its parameters' gradients take the terms check 1
+    traces from `reference` (`float64_terms`). A call resuming from an initial state (`score` naming sinks
+    or a resumed partial) takes check 1's own terms (None): its weights start from the state, which
+    `attention_terms` does not carry."""
+    if {"sinks", "resumed"} & set(score):
+        return None
     keep = template.dense(spans)[:, None]
 
-    def terms(query, key, value, dout):
-        return tuple(attention_terms(query, key, value, dout, keep)[1:])
+    def terms(query, key, value, dout, *hooks):
+        if not hooks:
+            return tuple(attention_terms(query, key, value, dout, keep)[1:])
+        params, _ = hooks
+        wide = tuple(jnp.asarray(np.asarray(param), np.float64) for param in params)
+        found = attention_terms(query, key, value, dout, keep,
+                                score=lambda raw: template.score_modded(raw, hooked(wide, None)))
+        with jax.enable_x64(new_val=True):
+            _, traced = float64_terms(reference, *widened((query, key, value, dout, *hooks)))
+        return (*found[1:], *traced[3:])
 
     return terms
 
@@ -998,29 +1017,32 @@ def test_the_backward_is_on_par_under_every_score_hook_interpreted(hooks, form):
 
 
 @INTERPRETS
-def test_a_folded_forward_whose_products_pass_fp32_below_zero_rewalks_natural_interpreted():
-    """A full call whose raw products pass fp32's range below zero (a query 2^126 against keys -8, scale 1/4)
-    takes its query by the scale's power of two first, so its products stay finite (-2^127): its rows'
-    maxima pass the fold's reach, they walk again natural, and every equal logit weighs its values alike,
-    the output the values' mean, 1 (a power taken into the scale instead overflowed to -inf, which reads as
-    a row that saw no key: review of the FA3-gap batch's F3)."""
+@pytest.mark.parametrize("kept", [template.Kept.NONE, template.Kept.SPLIT], ids=["forward", "training"])
+def test_a_folded_forward_whose_products_pass_fp32_below_zero_rewalks_natural_interpreted(kept):
+    """A full call whose raw products pass fp32's range below zero (a query 2^126 against keys -8, scale
+    1/4: its power of two taken into the launch's scale, `_prepared`): every row's maximum reads -inf, which
+    a call whose every row sees a key takes as past the fold's reach (`reach_of`), so it walks again
+    natural on the query taken by the power, where its products stay finite (-2^127), and every equal
+    logit weighs its values alike: the output, the training forward's too, the values' mean, 1 (as an empty
+    row's -inf it read nothing: review of the FA3-gap batch's F3)."""
     shape = (1, 64, 1, 16)
     query = jnp.zeros(shape, jnp.bfloat16).at[..., 0].set(2.0 ** 126)
     key = jnp.zeros(shape, jnp.bfloat16).at[..., 0].set(-8.0)
     value = jnp.ones(shape, jnp.bfloat16)
     spans = template.spans(shape[1], shape[1], shape[0])
     with _device(interpret=True):
-        out = attention_mosaic.forward(query, key, value, spans, scale=0.25, interpret=True)
+        out = attention_mosaic.forward(query, key, value, spans, scale=0.25, residuals=kept, interpret=True)
+    out = out if kept is template.Kept.NONE else out[0]
     assert np.array_equal(np.asarray(out, np.float32), np.ones(shape, np.float32))
 
 
 @INTERPRETS
 def test_a_forward_kernel_built_for_its_facts_runs_each_calls_own_interpreted():
-    """The forward's kernel is built once for every call of its static facts (`_kernel_of`, row 2440): calls
-    alike but for their scale, past their queries' one power of two (0.2 and 0.24, both 2^-3 times a scale
-    left of 1.6 and 1.92), each run their own though their kernels' names agree (launched outside an
-    op's report, which names them by its launch, `report.named`), each on par (check 1) with the reference's
-    at its scale from float64."""
+    """The forward's kernel is lowered once for every call of its static facts (`tuning.lowered_once`, row
+    2440): calls alike but for their scale, past their queries' one power of two (0.2 and 0.24, both 2^-3
+    times a scale left of 1.6 and 1.92), each run their own though their kernels' names agree (launched
+    outside an op's report, which names them by its launch, `report.named`), each on par (check 1) with the
+    reference's at its scale from float64."""
     shape = SHAPES["interpreted"]
     spans = template.spans(shape[1], shape[1], shape[0], causal=True)
     for scale in (0.2, 0.24):
@@ -1041,10 +1063,9 @@ def test_a_forward_kernel_built_for_its_facts_runs_each_calls_own_interpreted():
 
 @INTERPRETS
 def test_a_forward_kernel_built_for_its_facts_holds_no_calls_arrays_interpreted():
-    """The forward's kernel, built once for every call of its static facts (`_kernel_of`, row 2440), holds
-    none of a call's arrays, its operands' nor its hooks' (an initial state's sums, which its key describes
-    by shape and dtype, `_described`): each is released once the call is. (A hook closing over an array is
-    built for its call alone, `_holdable`: JAX's own trace caches hold such a closure as they did before.)"""
+    """The forward's kernel, lowered once for every call of its static facts (`tuning.lowered_once`, rows
+    2440, 2808), holds none of a call's arrays, its operands' nor its hooks' (an initial state's sums, which
+    its static hooks describe by shape and dtype): each is released once the call is."""
     shape = SHAPES["interpreted"]
     spans = template.spans(shape[1], shape[1], shape[0], causal=True)
     query, key, value, _ = _drawn(shape, jnp.bfloat16)(0)

@@ -116,18 +116,21 @@ def _anchored_backward(weights, cotangent):
 anchored_softmax.defvjp(_anchored_forward, _anchored_backward)
 
 
-def float64_weights(q, k, keep, sinks, softcap, *, anchored: bool = False, bias=None):
+def float64_weights(q, k, keep, sinks, softcap, *, anchored: bool = False, bias=None, score=None):
     """The attention weights of `[B, S, H, D]` queries over their keys, key
     heads repeated over their group, and the logits before the cap: over
     sqrt(D), capped `c tanh(l / c)`, a `bias` `[B or 1, H or 1, q, k]` added
-    after the cap, the keys `keep` `[B or 1, 1, q, k]` keeps, a softmax whose
-    denominator a sink joins, its derivative the float64 truth's
-    (`anchored_softmax`) where `anchored`. A query that keeps no key has no
-    weight."""
+    after the cap, or a `score` of them in the cap's place (a Dew score hook,
+    `template.score_modded`), the keys `keep` `[B or 1, 1, q, k]` keeps, a
+    softmax whose denominator a sink joins, its derivative the float64
+    truth's (`anchored_softmax`) where `anchored`. A query that keeps no key
+    has no weight."""
     heads, kv_heads = q.shape[2], k.shape[2]
     group = jnp.arange(heads) // (heads // kv_heads)
     raw = jnp.einsum('bqhd,bkhd->bhqk', q, k[:, :, group]) / np.sqrt(q.shape[3])
     logits = raw if softcap is None else softcap * jnp.tanh(raw / softcap)
+    if score is not None:
+        logits = score(raw)
     if bias is not None:
         logits = logits + bias
     keep = np.broadcast_to(keep, logits.shape)
@@ -142,7 +145,7 @@ def float64_weights(q, k, keep, sinks, softcap, *, anchored: bool = False, bias=
     return jnp.where(keep & sees, softmax(logits)[..., :keep.shape[-1]], 0.0), raw
 
 
-def attention_terms(query, key, value, cotangent, keep, sinks=None, softcap=None, bias=None):
+def attention_terms(query, key, value, cotangent, keep, sinks=None, softcap=None, bias=None, score=None):
     """Each entry's float64 terms of attention's output and its query, key and
     value gradients under `cotangent`, sized as `float64_terms.float64_terms`
     sizes them: the root sum of squares of the terms its final sum adds, for
@@ -160,14 +163,16 @@ def attention_terms(query, key, value, cotangent, keep, sinks=None, softcap=None
     of those sizes: such a row is held to that rounding, not to its own zero.
     A `bias` `[B or 1, H or 1, q, k]` joins the logits after the cap, and its
     gradient's terms, a fifth, are those logit sizes before the scale and the
-    cap, their squares summed over the rows and heads the bias shares."""
+    cap, their squares summed over the rows and heads the bias shares. A
+    `score` of the scaled logits in the cap's place (`float64_weights`) carries
+    them through its slope, as the cap's."""
     with jax.enable_x64(new_val=True):
         q, k, v, dout = (jnp.asarray(np.asarray(x, np.float64)) for x in (query, key, value, cotangent))
         heads, kv_heads, width = q.shape[2], k.shape[2], q.shape[3]
         group = jnp.arange(heads) // (heads // kv_heads)
         sunk = None if sinks is None else jnp.asarray(np.asarray(sinks, np.float64))
         shared = None if bias is None else jnp.asarray(np.asarray(bias, np.float64))
-        weights, raw = float64_weights(q, k, keep, sunk, softcap, bias=shared)
+        weights, raw = float64_weights(q, k, keep, sunk, softcap, bias=shared, score=score)
         keys, values = k[:, :, group], v[:, :, group]
         products = jnp.einsum('bqhd,bkhd->bhqk', dout, values)
         out = jnp.einsum('bhqk,bkhd->bqhd', weights, values)
@@ -179,6 +184,9 @@ def attention_terms(query, key, value, cotangent, keep, sinks=None, softcap=None
         logit_sizes = bias_sizes / np.sqrt(width)
         if softcap is not None:
             logit_sizes = logit_sizes * jnp.abs(1 - jnp.tanh(raw / softcap) ** 2)
+        if score is not None:
+            # Its slope at each entry, read back (a hook of a custom derivative has no forward one).
+            logit_sizes = logit_sizes * jnp.abs(jax.vjp(score, raw)[1](jnp.ones_like(raw))[0])
 
         def per_key_head(x):
             return x.reshape(*x.shape[:2], kv_heads, heads // kv_heads, x.shape[-1]).sum(3)
