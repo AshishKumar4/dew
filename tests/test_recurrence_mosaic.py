@@ -280,7 +280,7 @@ def test_an_unseen_gpus_facts_derive_the_templates_tiles_as_exact_as_its_referen
     hooks = recurrence.Hooks(decay='scalar', scale=SHAPES[case]['key_width'] ** -0.5, write_bound=1.0)
     (operands,) = draw(dtype, 0, **geometry(case))
     bound = template.MOSAIC.bind(operands.query, operands.key, operands.value, operands.log_decay,
-                                 operands.beta, operands.state, operands.starts)
+                                 operands.beta, operands.state, operands.starts, bound=hooks.inverse_bound)
     budget = generation.shared_budget(UNSEEN)
     if dtype == jnp.float32:
         with generation.assumed(UNSEEN):
@@ -571,7 +571,7 @@ def test_the_resource_gate_reads_each_launch_of_one_kernel_apart():
     target = 'sm90'
     family, facts = bundles.of(target, jnp.bfloat16), generation.gpu_target(target)
     args = resource_operands('qwen3.5-27b-gdn', jnp.bfloat16, 1, 256)
-    bound = template.MOSAIC.bind(*args, None, max_segments=None, floor=None)
+    bound = template.MOSAIC.bind(*args, None, max_segments=None, floor=None, bound=1.0)
     with generation.assumed(facts):
         derived, variant = template.MOSAIC.variants(bound)[:2]
 
@@ -611,7 +611,8 @@ def test_two_launches_whose_padded_lengths_meet_name_their_own_kernels():
     operands = {length: resource_operands('qwen3.5-27b-gdn', jnp.bfloat16, 1, length) for length in lengths}
     with generation.assumed(facts):
         launches = {length: (bound := template.MOSAIC.bind(*operands[length], None, max_segments=None,
-                                                           floor=None), template.MOSAIC.variants(bound)[0])
+                                                           floor=None, bound=1.0),
+                             template.MOSAIC.variants(bound)[0])
                     for length in lengths}
 
     def both(*flat):
@@ -642,7 +643,7 @@ def test_a_compile_refusing_the_joined_tiles_steps_the_derivation_down(kernel):
     which runs at both; a refusal of the joined tiles once matched none of the rules' candidates, and the
     call found none (`Unfitted`)."""
     args = resource_operands('qwen3.5-27b-gdn', jnp.bfloat16, 1, 4096)
-    bound = template.MOSAIC.bind(*args, None)
+    bound = template.MOSAIC.bind(*args, None, bound=1.0)
     with report.refusals(), generation.assumed('sm90'):
         target = template.Mosaic.launched()
         first = template.MOSAIC.derived(bound, target)
@@ -718,8 +719,10 @@ def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: t
         per_key = RESOURCE_SHAPES[name][4]
         args = resource_operands(name, dtype, rows, length)
         starts = jax.ShapeDtypeStruct((rows, length), jnp.bool_) if packed else None
+        # A delta rule's layer declares unit keys and sigmoid write gates (`recurrence.Hooks.inverse_bound`).
         bound = template.MOSAIC.bind(*args, starts, max_segments=8 if packed else None,
-                                     floor=FLOOR if per_key else None, **form(name, dtype))
+                                     floor=FLOOR if per_key else None, bound=None if name in RATED else 1.0,
+                                     **form(name, dtype))
         with generation.assumed(facts):
             derived = template.MOSAIC.derived(bound, facts)
             held = Unbudgeted().derived(bound, facts)

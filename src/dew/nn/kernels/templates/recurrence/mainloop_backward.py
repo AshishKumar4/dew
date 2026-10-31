@@ -193,12 +193,12 @@ def gradients(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None, fi
         # The same from the walk's gradient of the values gated, elementwise in fp32, beta's sum over the
         # value columns in the rows' own layout.
         du = dv2.astype(jnp.float32).reshape(rows, heads, columns)
-        values = run.v.astype(jnp.float32).reshape(rows, heads, columns)
+        values = call.given.joined(run.v).reshape(rows, heads, columns)
         dv = du * run.beta.T[:, :, None]
         dbeta = jnp.sum(du * values, -1)
         dskip = None
         if skip is not None:
-            read = laid_do.astype(jnp.float32).reshape(rows, heads, columns)
+            read = call.given.joined(laid_do).reshape(rows, heads, columns)
             dv, dskip = dv + skip.astype(jnp.float32)[:, None] * read, jnp.sum(read * values, (0, 2))
         dv = dv.reshape(rows, heads * columns)
         dk_w, after_w, decay_w = None, 0.0, 0.0

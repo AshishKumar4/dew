@@ -73,7 +73,7 @@ def fast_backward(operands: Chunk) -> bool:
     the call's derived tiles on the device's bundle, or interpreted, the interpreted one's (`mosaic_rule`)."""
     target = template.Mosaic.launched()
     bound = template.MOSAIC.bind(operands.query, operands.key, operands.value, operands.log_decay,
-                                 operands.beta, operands.state, operands.starts)
+                                 operands.beta, operands.state, operands.starts, bound=HOOKS.inverse_bound)
     tiles = template.MOSAIC.derived(bound, target)
     return mainloop_backward.backward_holds(operands.query, operands.key, operands.value, operands.log_decay,
                                    operands.beta, operands.state, tiles=tiles,

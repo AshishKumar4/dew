@@ -1154,14 +1154,19 @@ def _rated_scan(hooks: recurrence.Hooks, query, key, value, g, beta, given: dict
 
     def run(kernel, query, key, value, g, beta, rate, skip, state, starts, firsts):
         if kernel == 'mosaic_gpu':
-            # The skip in the template's own output and walk (`mainloop._output`, `_reverse`), as
-            # mamba_ssm's kernels add it: added after, its fp32 output's skip and cast took 0.045 ms past an
-            # H100's launches, and its gradient's 0.094 (ssd-rounded-h100-fdab2424c,
-            # window-h100-c70aaa8-b8109ee).
-            # Its output in the operands' dtype where no epilogue reads it after (`hooks.output`'s norm).
-            return template_rule(query, key, value, g, beta, state, starts, firsts,
-                                 skip=skip if hooks.skip else None, max_segments=max_segments, scale=1.0,
-                                 delta=False, wide=hooks.output is not None, rounded=fast_rounding())
+            # Under the fast forms the skip in the template's own output and walk (`mainloop._output`,
+            # `_reverse`), as mamba_ssm's kernels add it, the output in the operands' dtype where no epilogue
+            # reads it after (`hooks.output`'s norm): added after, its fp32 output's skip and cast took
+            # 0.045 ms past an H100's launches, and its gradient's 0.094 (ssd-rounded-h100-fdab2424c,
+            # window-h100-c70aaa8-b8109ee). Under the accurate forms the values the template holds are
+            # gated (`mainloop._Call.gated_keys`), so the skip is added after.
+            fast = fast_rounding()
+            fused = fast and hooks.skip
+            out, final = template_rule(query, key, value, g, beta, state, starts, firsts,
+                                       skip=skip if fused else None, max_segments=max_segments, scale=1.0,
+                                       delta=False, wide=not fused or hooks.output is not None, rounded=fast)
+            out = out.astype(work)
+            return (out if fused else recurrence.skipped(hooks, out, value, {'skip': skip}, work)), final
         operand = jnp.result_type(query, key, value)
         x, B, C = (jnp.asarray(t, operand) for t in (value, key, query))
         batch, _, heads, head_dim = x.shape
