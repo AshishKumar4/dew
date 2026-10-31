@@ -641,10 +641,9 @@ def _with_ema_deltas(state_tree: dict[str, StateLeaf]) -> tuple[dict[str, StateL
               if _stored_as_delta(average, live)]
     if not chosen:
         return state_tree, []
-    # Every leaf's planes in one program, sharded as each leaf is: one compile a save, not one a leaf.
-    encoded = iter(jax.jit(lambda pairs: [_delta_planes(*pair) for pair in pairs], out_shardings=[
-        _planes_sharding(leaves[i].sharding) for i in chosen])([(leaves[i], lives[i]) for i in chosen]))
-    leaves = [next(encoded) if index in chosen else leaf for index, leaf in enumerate(leaves)]
+    for index in chosen:
+        encode = jax.jit(_delta_planes, out_shardings=_planes_sharding(leaves[index].sharding))
+        leaves[index] = encode(leaves[index], lives[index])
     return ({**state_tree, 'ema': jax.tree.unflatten(structure, leaves)},
             [jax.tree_util.keystr(paths_leaves[index][0]) for index in chosen])
 
