@@ -136,33 +136,28 @@ LAYER = {"emb_features": 64, "intermediate_size": 128, "state_size": 16, "time_s
 """A Mamba layer one channel block wide (`recurrence_chunk.SELECTIVE_BLOCK`), Mamba's 16 states."""
 
 
-def the_layer_is_as_exact_under_the_template(packed: bool, held: bool, *, length: int = 70,
+HELD = {"into the template": (False, True), "out of the template": (True, False),
+        "through the template": (True, True)}
+"""Where a held state's case takes the template (`the_layer_is_as_exact_under_the_template`), by name: on its
+first call, which leaves the state, and on its second, which starts from it."""
+
+
+def the_layer_is_as_exact_under_the_template(packed: bool, held: str | None, *, length: int = 70,
                                              dtype=jnp.bfloat16):
     """A Mamba layer in `dtype` (its scan widened to fp32, as the mixer runs it) over two rows of `length`
     tokens, through its selector with the template chosen (`generation.chosen`), on par from float64 with
     the layer's portable scan, output and every input's and parameter's gradient, over check 1's fewest
     draws: documents starting a third and two thirds in where `packed` (`MixerCall`'s segments), and the
-    scan from a held state where `held` (the decode cache a first call of `length // 2` tokens leaves, the
-    second call's tokens alone compared)."""
+    scan from a held state where `held` names one (`HELD`: the decode cache a first call of `length // 2`
+    tokens leaves, the second call's tokens alone compared, the template on the first call, the second or
+    both)."""
     layer = Mamba(**LAYER, dtype=dtype)
     variables = layer.init(jax.random.key(1), jnp.zeros((2, length, LAYER["emb_features"]), dtype))
     metadata = None
     if packed:
         starts = jnp.zeros((2, length), jnp.int32).at[:, (length // 3, 2 * length // 3)].set(1)
         metadata = AttentionMetadata(coordinates=coordinates(segments=jnp.cumsum(starts, axis=1)))
-    call = MixerCall(metadata, decode=held)
-
-    def run(module, chosen):
-        def mixed(variables, x):
-            with chosen():
-                if not held:
-                    return module.apply(variables, x, call)
-                first = length // 2
-                allocated = module.apply(variables, x[:, :1], call, mutable=["cache"])[1]
-                _, cache = module.apply({**variables, **allocated}, x[:, :first], call, mutable=["cache"])
-                return module.apply({**variables, **cache}, x[:, first:], call, mutable=["cache"])[0]
-
-        return mixed
+    call = MixerCall(metadata, decode=held is not None)
 
     def template_chosen():
         return generation.chosen(selective_scan="mosaic_gpu")
@@ -170,23 +165,44 @@ def the_layer_is_as_exact_under_the_template(packed: bool, held: bool, *, length
     def portable_chosen():
         return generation.chosen(selective_scan="xla")
 
+    def run(module, *, template: bool):
+        """The layer's arm: the template where `template` takes it (on the calls `held` names), else the
+        portable scan."""
+        taken = HELD.get(held, (True, True)) if template else (False, False)
+        leaving, starting = (template_chosen if each else portable_chosen for each in taken)
+
+        def mixed(variables, x):
+            if held is None:
+                with starting():
+                    return module.apply(variables, x, call)
+            first = length // 2
+            with leaving():
+                allocated = module.apply(variables, x[:, :1], call, mutable=["cache"])[1]
+                _, cache = module.apply({**variables, **allocated}, x[:, :first], call, mutable=["cache"])
+            with starting():
+                return module.apply({**variables, **cache}, x[:, first:], call, mutable=["cache"])[0]
+
+        return mixed
+
     def draws(seed):
         keys = jax.random.split(jax.random.key(seed))
         x = jax.random.normal(keys[0], (2, length, LAYER["emb_features"])).astype(dtype)
-        out = (2, length - length // 2 if held else length, LAYER["emb_features"])
+        out = (2, length if held is None else length - length // 2, LAYER["emb_features"])
         return variables, x, jax.random.normal(keys[1], out).astype(dtype)
 
     truth = layer.clone(dtype=jnp.float64)
-    assert_as_exact(jax.jit(with_gradients(run(layer, template_chosen))),
-                    jax.jit(with_gradients(run(layer, portable_chosen))), draws,
+    assert_as_exact(jax.jit(with_gradients(run(layer, template=True))),
+                    jax.jit(with_gradients(run(layer, template=False))), draws,
                     f"a Mamba layer under the template{', packed' if packed else ''}"
-                    f"{', held' if held else ''}",
-                    seeds=FEWEST_SEEDS, truth_fn=jax.jit(with_gradients(run(truth, portable_chosen))))
+                    f"{f', a held state {held}' if held else ''}",
+                    seeds=FEWEST_SEEDS, truth_fn=jax.jit(with_gradients(run(truth, template=False))))
 
 
-@pytest.mark.parametrize("packed, held", [(False, False), (True, False), (False, True)],
-                         ids=["one row", "packed documents", "a held state"])
+@pytest.mark.parametrize("packed, held", [(False, None), (True, None), (False, "into the template"),
+                                          (False, "out of the template")])
 def test_a_mamba_layer_is_as_exact_under_the_template_interpreted(packed, held):
+    """The layer's cases interpreted, a held state's into the template and out of it apart: through it on
+    both calls it took 189 s on armada (6f7a1978a), each call 11 s a draw, past a test's two minutes."""
     the_layer_is_as_exact_under_the_template(packed, held)
 
 
