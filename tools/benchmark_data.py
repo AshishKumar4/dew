@@ -1136,20 +1136,23 @@ def run_declared_shard(config: DeclaredShard) -> None:
     from dew.data.declared import Declared
     from dew.data.storage import Store
 
-    store, fs, path, info, stated = declared_object(config.url, config.anonymous, "")
-    digest = hashlib.sha256(fs.cat_file(path)).hexdigest()
+    store, _, _, info, stated = declared_object(config.url, config.anonymous, "")
+    declared = Declared(store, stated)
+    # The digest the mirror checks its copy against, of the declared generation's bytes.
+    with declared.open() as opened:
+        digest = hashlib.sha256(opened.read()).hexdigest()
 
     def native(count: int) -> tuple[float, float]:
         started = time.perf_counter()
-        before = fs.info(path)["generation"]
+        # Held to the declared generation as Arrow's own clients are (`Declared.still_held`, `Files`).
+        declared.still_held()
         source = grain.ArrayRecordDataSource([config.url])
         order = np.random.default_rng(count).permutation(len(source))[:count]
         first = None
         for index in order:
             source[int(index)]
             first = first or time.perf_counter() - started
-        if fs.info(path)["generation"] != before:
-            raise RuntimeError(f"{config.url} was replaced while it was read")
+        declared.still_held()
         return time.perf_counter() - started, first or 0.0
 
     def mirror(count: int) -> tuple[float, float]:
