@@ -1537,16 +1537,17 @@ def test_adamw_steps_land_as_near_float64_as_torchs():
     assert_as_exact(dews, torchs, draw, "adamw steps", seeds=ADAMW_SEEDS, truth_fn=truth)
 
 
-@pytest.mark.parametrize("optimizer", ["adam", "adamw"])
+@pytest.mark.parametrize("optimizer", ["adam", "adamw", "muon", "muonclip"])
 @pytest.mark.parametrize("dtype", [jnp.float16, jnp.bfloat16])
 def test_narrow_weights_step_on_float32_moments_as_float32_weights_do(optimizer, dtype):
     """With `state_dtype='float32'`, the default, weights in float16 or bfloat16 keep their moments in
     float32: a gradient of 1e-4, whose square is below float16's smallest number, steps them as the
-    same gradient steps float32 weights, by the rate and not by the rate over eps. (A decay of the
-    weights themselves reads them in their own dtype, so none is taken here.)"""
+    same gradient steps float32 weights, by the rate and not by the rate over eps; a norm's scale under
+    Muon or MuonClip too, which their AdamW group steps. (A decay of the weights themselves reads them
+    in their own dtype, so none is taken here.)"""
     solver = OptimConfig(optimizer=optimizer, learning_rate=1e-3, clip_grads=0, weight_decay=0.0).build(4)
-    weights = {"w": jnp.full((4, 4), 0.5, dtype)}
-    gradient = {"w": jnp.full((4, 4), 1e-4, dtype)}
+    weights = {"w": jnp.full((4,), 0.5, dtype)}
+    gradient = {"w": jnp.full((4,), 1e-4, dtype)}
     narrow, _ = solver.update(gradient, solver.init(weights), weights)
     wide_weights = jax.tree.map(lambda leaf: leaf.astype(jnp.float32), weights)
     wide, _ = solver.update(jax.tree.map(lambda leaf: leaf.astype(jnp.float32), gradient),

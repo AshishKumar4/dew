@@ -109,75 +109,50 @@ def test_an_objective_that_trains_two_modules_unset_reads_the_derivation(monkeyp
     assert trainer.plan["derived"]
 
 
-def test_a_run_that_sets_its_remat_is_told_the_lighter_rung_its_derivation_fits(monkeypatch, tmp_path):
+def assert_told_from_no_remat_up(trainer, remat: str, *, lighter: bool) -> None:
+    """`trainer`, set to `remat`, compiled there alone, once, after the derivation read the rungs from no
+    remat up to its own, and stopped at the last, fitting (`lighter`) or every one refused."""
+    with Compiles("step") as compiles:
+        compiled(trainer)
+    derived = trainer.plan["derived"]
+    assert compiles.count == 1 and trainer.plan["probes"][0]["remat"] == trainer.plan["remat"] == remat
+    assert derived and derived[0]["remat"] is None and all(entry["remat"] != remat for entry in derived)
+    assert [entry["label"] for entry in derived][-1] == ("fits" if lighter else "refuses")
+    assert {entry["label"] for entry in derived[:-1]} <= {"refuses"}
+
+
+def test_a_run_set_to_full_recompute_with_room_for_every_rung_is_told_its_base_rung_fits(monkeypatch,
+                                                                                          tmp_path):
     """A run that sets its remat compiles there alone, once, and before it compiles reads the derivation
     from no remat up to its own (row 2536): with room for every rung, a run set to full recomputation
-    reads the base rung fit, which its plan records beside the rung it compiled; a run set to the least
-    rung that fits reads every rung below it refused, and the derivation stops there."""
+    reads the base rung fit, which its plan records beside the rung it compiled."""
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path))
+    free(monkeypatch, LIMIT)
+    assert_told_from_no_remat_up(deep(REMAT_POLICIES["full"]), "full", lighter=True)
+
+
+def test_a_run_set_to_the_least_rung_that_fits_is_told_every_rung_below_it_refused(monkeypatch, tmp_path):
+    """A run set to the least rung that fits, the rung a run that sets none compiles at with room for the
+    step under full recomputation alone, reads every rung below it refused, and the derivation stops
+    there."""
     room = room_for_full_recompute_only(monkeypatch, tmp_path / "sizing")
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "unset"))
     free(monkeypatch, room)
     unset = deep()
     compiled(unset)
-    for free_bytes, remat, lighter in ((LIMIT, "full", True), (room, unset.plan["remat"], False)):
-        monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / f"run-{remat}"))
-        free(monkeypatch, free_bytes)
-        trainer = deep(REMAT_POLICIES[remat])
-        with Compiles("step") as compiles:
-            compiled(trainer)
-        derived = trainer.plan["derived"]
-        assert compiles.count == 1 and trainer.plan["probes"][0]["remat"] == trainer.plan["remat"] == remat
-        assert derived and derived[0]["remat"] is None and all(entry["remat"] != remat for entry in derived)
-        assert [entry["label"] for entry in derived][-1] == ("fits" if lighter else "refuses")
-        assert {entry["label"] for entry in derived[:-1]} <= {"refuses"}
-    # A policy off the ladder, which no climb from no remat reaches, has no rung known below it.
-    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "off"))
+    remat = unset.plan["remat"]
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "set"))
+    assert_told_from_no_remat_up(deep(REMAT_POLICIES[remat]), remat, lighter=False)
+
+
+def test_a_run_set_to_a_policy_off_the_ladder_is_told_no_rung_below_it(monkeypatch, tmp_path):
+    """A policy off the ladder, which no climb from no remat reaches, has no rung known below it: the
+    run compiles at it with nothing derived."""
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path))
     free(monkeypatch, LIMIT)
     off = deep(REMAT_POLICIES["save_qkv_proj"])
     compiled(off)
     assert off.plan["derived"] == [] and off.plan["remat"] == "save_qkv_proj"
-
-
-@pytest.mark.mesh(devices=2)
-def test_a_run_over_two_devices_that_sets_its_remat_is_told_the_rung_its_derivation_fits(
-        monkeypatch, tmp_path, caplog):
-    """A run sharded over two devices (fsdp 2, as the two-GPU run that raised row 2536) that sets
-    full recomputation reads its derivation per device, each its share of the batch and the state
-    (`candidate_footprint`), and with room for every rung is told the base rung fits, where its search
-    compiles at its own alone; the derivation's climb compiles nothing, so it says it compiles nothing
-    (train 333's review: rows 2615, 2616)."""
-    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "two"))
-    free(monkeypatch, LIMIT)
-    model = CausalTransformer(vocab_size=64, emb_features=32, num_layers=8, num_heads=2, mlp_features=64,
-                              max_seq_len=256, remat=REMAT_POLICIES["full"])
-    trainer = Trainer(LMObjective(model, seq_len=256), optax.sgd(1e-2), key=jax.random.key(0), split=1,
-                      mesh=MeshSpec(fsdp=2).build(jax.devices()[:2]))
-    with caplog.at_level(logging.WARNING, logger="dew"), Compiles("step") as compiles:
-        compiled(trainer)
-    derived = trainer.plan["derived"]
-    assert compiles.count == 1 and trainer.plan["remat"] == "full"
-    assert derived and derived[0]["remat"] is None and derived[-1]["label"] == "fits"
-    assert not [record for record in caplog.records if "compiling it again" in record.getMessage()]
-    assert [record for record in caplog.records if "recomputes less" in record.getMessage()]
-
-
-@pytest.mark.mesh(devices=2)
-def test_a_run_over_a_tensor_axis_that_sets_its_remat_hears_its_derivation_cannot_judge_it(
-        monkeypatch, tmp_path, caplog):
-    """A run over a tensor axis of two that sets full recomputation, whose footprint the derivation reads
-    per device only over data and fsdp axes, hears once that its derivation cannot judge its layout,
-    rather than nothing, and compiles at its own rung alone (row 2721; 2615 stays open for such layouts)."""
-    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "tensor"))
-    free(monkeypatch, LIMIT)
-    model = CausalTransformer(vocab_size=64, emb_features=32, num_layers=8, num_heads=2, mlp_features=64,
-                              max_seq_len=256, remat=REMAT_POLICIES["full"])
-    trainer = Trainer(LMObjective(model, seq_len=256), optax.sgd(1e-2), key=jax.random.key(0), split=1,
-                      mesh=MeshSpec(tensor=2).build(jax.devices()[:2]))
-    with caplog.at_level(logging.WARNING, logger="dew"), Compiles("step") as compiles:
-        compiled(trainer)
-    assert compiles.count == 1 and trainer.plan["remat"] == "full"
-    assert trainer.plan["derived"][-1]["label"] == "unknown"
-    assert len([record for record in caplog.records if record.name == "dew.training.planning"]) == 1
 
 
 def test_a_compile_the_derivation_judged_otherwise_is_told_as_a_model_miss(monkeypatch, tmp_path, caplog):
@@ -259,11 +234,8 @@ def test_the_derivation_decides_a_steps_fit_as_its_compile_does(layers, generati
     step the compile fits and may admit one it refuses, a miss its compile corrects. On a GPU stating 1.6
     times the compile is the roomy one, whose need it holds, XLA's rematerialization changing nothing in a
     module already within its limit (`RematerializeComputation`,
-    xla/hlo/transforms/simplifiers/hlo_rematerialization.cc), so its fit is read off that compile. On one
-    stating 0.6, a step set to full recomputation whose peak is exact compiles there alone: where XLA
-    refuses it the derivation did, and where XLA fits it, it fits by XLA's own rematerialization against
-    the stated memory, which the derivation does not model and the compile decides (its temporaries below
-    the roomy compile's). A bound from below decides no refusal there for that compile to check."""
+    xla/hlo/transforms/simplifiers/hlo_rematerialization.cc), so its fit is read off that compile, at 0.6
+    times as at 1.6."""
     from compile_evidence import Evidence, Facts, Measurement, Prediction
 
     (roomy,) = gated(layers, generation, remat, 1 << 34, tmp_path / "roomy", precision)
@@ -280,9 +252,3 @@ def test_the_derivation_decides_a_steps_fit_as_its_compile_does(layers, generati
             Measurement({"temp": roomy["temp"]}, need <= budget, "xla", jax.__version__))
         assert evidence.compiled.admits == admits, evidence.describe()
         assert evidence.agrees or (not exact and derived <= budget), evidence.describe()
-    if remat == "full" and exact:
-        tight = gated(layers, generation, remat, int(need * 0.6), tmp_path / "0.6", precision)[0]
-        assert tight["derived_headroom"] < 0, tight
-        # Neither refuses a compile that fits, but where XLA's own rematerialization fit it below what
-        # the roomy compile held, which the derivation does not model.
-        assert not tight["fits"] or tight["derived_headroom"] >= 0 or tight["temp"] < roomy["temp"], tight

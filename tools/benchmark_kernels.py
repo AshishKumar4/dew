@@ -32,6 +32,7 @@ import optax
 from benchmark_cases import LM_DENSE, LM_MOE, Case
 from benchmark_models import build_trainer, compiled_step, timed_steps
 
+from dew.nn.kernels.options import program
 from dew.nn.moe import expert_projection
 from dew.optim import OptimConfig
 from dew.telemetry.benchmark import samples
@@ -68,8 +69,8 @@ def projection(args: argparse.Namespace) -> dict[str, object]:
     def loss(x, kernel):
         return jnp.sum(project(x, kernel).astype(jnp.float32) * cotangent.astype(jnp.float32))
 
-    forward = jax.jit(project)
-    both = jax.jit(jax.value_and_grad(loss, argnums=(0, 1)))
+    forward = program(project)
+    both = program(jax.value_and_grad(loss, argnums=(0, 1)))
     output = np.asarray(forward(x, kernel), np.float64)
     _, (dx, dk) = both(x, kernel)
     oracle, dx_oracle, dk_oracle = grouped_oracle.products(x, kernel.astype(jnp.bfloat16), cotangent, sizes)

@@ -197,7 +197,7 @@ def _placement(path: jax.tree_util.KeyPath, param, decays: bool,
 
 def _muon_groups(learning_rate, weight_decay=0.0, adam_weight_decay=None, *, ns_coeffs=NEWTON_SCHULZ,
                  ns_steps: int = 5, beta: float = 0.95, eps: float = 1e-8, weight_decay_mask=None,
-                 mu_dtype=None, nesterov: bool = True, adaptive: bool = False,
+                 mu_dtype=None, nu_dtype=None, nesterov: bool = True, adaptive: bool = False,
                  preconditioning: Preconditioning = "frobenius", consistent_rms: float | None = None,
                  ns_precision: jax.lax.DotAlgorithmPreset | str | None = None,
                  per_head: Mapping[str, int] | None = None, neuron_beta2: float | None = None,
@@ -234,9 +234,11 @@ def _muon_groups(learning_rate, weight_decay=0.0, adam_weight_decay=None, *, ns_
         _scale_by_shape(consistent_rms, per_head),
         optax.add_decayed_weights(weight_decay, weight_decay_mask),
         optax.scale_by_learning_rate(learning_rate))
-    adam = optax.adamw(learning_rate if adam_learning_rate is None else adam_learning_rate, b1=adam_b1,
-                       b2=adam_b2, eps=eps, eps_root=adam_eps_root, mu_dtype=mu_dtype, nesterov=nesterov,
-                       weight_decay=weight_decay if adam_weight_decay is None else adam_weight_decay)
+    # Dew's AdamW, its moments' arithmetic and storage the AdamW run's own (`scale_by_adam`): `nu_dtype` as
+    # `mu_dtype`, and its decay of every leaf of the group, norms and biases included (no mask).
+    adam = _adamw(learning_rate if adam_learning_rate is None else adam_learning_rate, b1=adam_b1, b2=adam_b2,
+                  eps=eps, eps_root=adam_eps_root, mu_dtype=mu_dtype, nu_dtype=nu_dtype, nesterov=nesterov,
+                  weight_decay=weight_decay if adam_weight_decay is None else adam_weight_decay)
     return optax.partition({"muon": muon, "adam": adam}, labels)
 
 
@@ -2331,10 +2333,9 @@ class OptimConfig:
                     f"state_dtype={self.state_dtype!r} stores Adam's moments, which "
                     f"{sorted(STATE_OPTIMIZERS[self.state_dtype])} have; {self.optimizer!r} does not")
             make = STATE_OPTIMIZERS[self.state_dtype][self.optimizer]
-        elif self.optimizer in ('adam', 'adamw'):
+        elif self.optimizer in ('adam', 'adamw', 'muon', 'muonclip'):
+            # Muon's and MuonClip's AdamW group stores its moments as AdamW's do.
             opts = {'mu_dtype': 'float32', 'nu_dtype': 'float32', **opts}
-        elif self.optimizer in ('muon', 'muonclip'):
-            opts = {'mu_dtype': 'float32', **opts}
         if self.param_groups:
             names = [group.name for group in self.param_groups]
             if len(set(names)) != len(names):

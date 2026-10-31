@@ -18,9 +18,10 @@ flaxdiff run as an npz (`--init`) and read by Dew's as its `pretrained` tree.
 Each side's own trainer builds the step: flaxdiff's
 `GeneralDiffusionTrainer._define_train_step` over its data/fsdp mesh, Dew's
 `Trainer.compile` over `MeshSpec`. The optimizer is optax AdamW on the cosine
-schedule with global-norm clipping on both, behind `recorded_norm` so the
-gradient norm leaves the compiled step; the EMA runs on both, as both
-trainers keep one.
+schedule with global-norm clipping on both. Dew's gradient norm is its
+trainer's commit telemetry (`Committed.norm`); flaxdiff's, which reports
+none, a transformation chained in front of its solver keeps (`recorded_norm`).
+The EMA runs on both, as both trainers keep one.
 
     python tools/reference_runs/diffusion.py --framework flaxdiff \\
         --flaxdiff-path <dir holding flaxdiff/> --data flowers.npz --init init.npz \\
@@ -35,7 +36,7 @@ import json
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -54,7 +55,6 @@ from common import (
     window_rows,
     write_record,
 )
-from dew_lm import recorded_norm
 from flax.traverse_util import flatten_dict, unflatten_dict
 from reference_source import dew_revision
 
@@ -107,6 +107,21 @@ def draws(seed: int, steps: int, batch: int, shape: tuple[int, ...]) -> tuple[np
     return levels, noise
 
 
+DRAWS = (("times", "t"), ("noise", "noise"))
+"""Each of the step's draws (`Step.sample`'s name) and the batch's field holding it."""
+
+
+def replayed(step, batch: dict) -> tuple[Any, dict]:
+    """`step` replaying the batch's draws (`DRAWS`) through its tape, each row at its example's place
+    among the update's (`Step.places`), and the batch without them: Dew's own loss then reads the draws
+    the batch holds, on any split of the update into microbatches."""
+    places, count = step.places(batch["t"].shape[0])
+    tape = {name: jnp.zeros((count, *batch[field].shape[1:]), batch[field].dtype).at[places].set(batch[field])
+            for name, field in DRAWS}
+    drawn = {field for _, field in DRAWS}
+    return step.replace(tape=tape), {name: value for name, value in batch.items() if name not in drawn}
+
+
 def load_tree(path: str | Path) -> dict:
     """The npz of `/`-joined leaf paths `save_tree` writes, as its nested dict."""
     with np.load(path) as arrays:
@@ -118,11 +133,30 @@ def save_tree(path: str | Path, tree) -> None:
     np.savez(path, **arrays)
 
 
+class NormState(NamedTuple):
+    norm: jax.Array
+
+
+def recorded_norm() -> optax.GradientTransformation:
+    """Pass the gradient through and keep its global norm in the state: flaxdiff's step reports no
+    gradient norm, so its run reads it here."""
+
+    def init(params):
+        del params
+        return NormState(jnp.zeros((), jnp.float32))
+
+    def update(updates, state, params=None):
+        del state, params
+        return updates, NormState(optax.tree.norm(updates).astype(jnp.float32))
+
+    return optax.GradientTransformation(init, update)
+
+
 def solver(args, total: int) -> tuple[optax.GradientTransformation, optax.Schedule]:
     schedule = optax.warmup_cosine_decay_schedule(
         init_value=args.lr_init, peak_value=args.lr_peak, warmup_steps=args.warmup,
         decay_steps=total, end_value=args.lr_end)
-    return optax.chain(recorded_norm(), optax.clip_by_global_norm(args.clip),
+    return optax.chain(optax.clip_by_global_norm(args.clip),
                        optax.adamw(schedule, b1=args.b1, b2=args.b2, eps=args.eps,
                                    weight_decay=args.weight_decay)), schedule
 
@@ -162,6 +196,7 @@ def flaxdiff_side(args, images, total, attention):
                            input_config=input_config, input_shapes=input_config.get_input_shapes(),
                            unconditional_prob=0.0, ema_decay=args.ema)
     optimizer, schedule = solver(args, total)
+    optimizer = optax.chain(recorded_norm(), optimizer)
     trainer = GeneralDiffusionTrainer(
         model, optimizer, input_config, jax.random.PRNGKey(0), noise_schedule=train_schedule,
         objective=objective, unconditional_prob=0.0, model_output_transform=transform,
@@ -182,13 +217,33 @@ def flaxdiff_side(args, images, total, attention):
     def run(state, batch):
         nonlocal rng_state
         state, loss, _, rng_state, _ = step_fn(state, rng_state, batch)
-        return state, loss
+        return state, loss, jnp.copy(state.opt_state[0].norm)
 
     def place(batch):
         from flaxdiff.utils import shard_batch
         return shard_batch(trainer.batch_sharding, batch)
 
     return state, run, place, schedule, dict(trainer.mesh.shape), None, work
+
+
+def fixed_draws(counted, initial: dict, ema: float | None):
+    """The objective Dew's side trains: `counted`'s model, process and inputs over the `initial` tree, its
+    loss Dew's own (`DiffusionObjective.loss`), its two draws the batch's (`replayed`)."""
+    from dew.objectives.diffusion import DiffusionObjective
+
+    class FixedDraws(DiffusionObjective):
+        """Dew's `DiffusionObjective.loss`, its two draws the batch's (`replayed`)."""
+
+        def model_flops(self, model, batch):
+            """Fixed randomness changes no forward geometry from the counted objective."""
+            return counted.model_flops(model, batch)
+
+        def loss(self, variables, batch, step):
+            taped, images = replayed(step, batch)
+            return super().loss(variables, images, taped)
+
+    return FixedDraws(counted.model, counted.process, counted.inputs, ema_decay=ema, guidance=None,
+                      variables=initial)
 
 
 def counting_objective(shape: tuple[int, ...], dtype: str, attention: str):
@@ -207,34 +262,8 @@ def dew_side(args, images, total, attention):
     """Dew's trainer over `MeshSpec`, with the draws read from the batch."""
     from work import measure
 
-    from dew.diffusion.schedules import expand
-    from dew.diffusion.transforms import broadcast_rates
     from dew.distributed.batches import batch_shardings
-    from dew.inputs import unit_range
-    from dew.objectives.base import Aux, Ratio
-    from dew.objectives.diffusion import DiffusionObjective
     from dew.training import MeshSpec, Trainer
-
-    class FixedDraws(DiffusionObjective):
-        """Dew's `DiffusionObjective.loss`, the two draws read from the batch."""
-
-        def model_flops(self, model, batch):
-            """Fixed randomness changes no forward geometry from the counted objective."""
-            return counted.model_flops(model, batch)
-
-        def loss(self, variables, batch, step):
-            samples = unit_range(batch[self.inputs.sample.key])
-            schedule = self.process.schedule
-            t, noise = batch["t"], batch["noise"]
-            rates = broadcast_rates(schedule, t, samples)
-            noisy, c_in, target = self.process.prediction.forward_diffusion(samples, noise, rates)
-            preds = self.model.apply(self.model_variables(variables), noisy * c_in, schedule.model_time(t),
-                                     train=True, rngs={"dropout": step.key})
-            preds = self.process.prediction.pred_transform(noisy, preds, rates, t)
-            losses = optax.l2_loss(preds, target)
-            weights = expand(self.process.weight(t), losses)
-            total = jnp.asarray(losses.size, jnp.promote_types(losses.dtype, jnp.float32))
-            return Ratio(jnp.sum(losses * weights), total), Aux(metrics={})
 
     counted = counting_objective(images.shape[1:], args.dtype, attention)
     model = counted.model
@@ -248,8 +277,7 @@ def dew_side(args, images, total, attention):
     constants = jax.tree.map(np.asarray, model.init(
         jax.random.key(0), jnp.zeros((1, *images.shape[1:])), jnp.zeros((1,)))["constants"])
     initial = {**load_tree(args.init), "constants": constants, "encoders": {}}
-    objective = FixedDraws(model, counted.process, counted.inputs,
-                           ema_decay=args.ema, guidance=None, variables=initial)
+    objective = fixed_draws(counted, initial, args.ema)
     optimizer, schedule = solver(args, total)
     devices = jax.device_count()
     mesh = MeshSpec(fsdp=devices) if args.mesh == "fsdp" else MeshSpec()
@@ -267,8 +295,9 @@ def dew_side(args, images, total, attention):
     def run(state, batch):
         if not compiled:
             compiled["step"] = trainer.compile(state, batch)
-        state, loss, _, _, _, _ = compiled["step"](state, batch)
-        return state, loss
+        state, loss, _, _, _, committed = compiled["step"](state, batch)
+        # The norm of the update it committed, none (NaN) where it committed none.
+        return state, loss, committed.norm / committed.count
 
     return state, run, place, schedule, dict(trainer.device_mesh.shape), trainer, work
 
@@ -302,12 +331,12 @@ def main() -> None:
     compile_start = time.perf_counter()
     for step in range(total):
         window.before(step, loss)
-        state, loss = run(state, batch(step))
+        state, loss, norm = run(state, batch(step))
         if step == 0:
             jax.block_until_ready(loss)
             first_step_seconds = time.perf_counter() - compile_start
         losses.append(loss)
-        norms.append(jnp.copy(state.opt_state[0].norm))
+        norms.append(norm)
     window_seconds = window.close(loss)
 
     device_kind = jax.devices()[0].device_kind
@@ -326,7 +355,8 @@ def main() -> None:
                    "schedule_steps": schedule_steps, "data_sha256": sha256(args.data),
                    "init_sha256": sha256(args.init), "mesh": mesh_shape,
                    "convention": "EDM (P_mean -0.4, P_std 1, sigma_data 0.5), l2 loss, EDM weight",
-                   "optimizer": "optax.chain(recorded_norm, clip_by_global_norm, adamw)"},
+                   "optimizer": "optax.chain(clip_by_global_norm, adamw), the gradient norm Dew's commit "
+                                "telemetry or, for flaxdiff, recorded_norm chained before it"},
         "versions": built_from,
         "device": device_kind,
         "host": host(),

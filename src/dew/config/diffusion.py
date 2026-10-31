@@ -19,7 +19,6 @@ import tyro
 
 from dew._records import number, record
 from dew.batch import Variables, merge
-from dew.checkpoints import Checkpoints
 from dew.config import MetricConfig, ObjectiveConfig, Prepared, RunConfig
 from dew.config.media import media_field
 from dew.diffusion.presets import EDM, Flow, build_process
@@ -57,6 +56,7 @@ from dew.sampling.solvers import EulerAncestral, Solver
 
 if TYPE_CHECKING:
 
+    from dew.data.pipeline import Dataset
     from dew.diffusion.presets import Preset
     from dew.objectives.rl.flow import FlowGRPOObjective, FlowRollout
     from dew.objectives.rl.nft import DiffusionNFTObjective, NFTRollout
@@ -249,22 +249,26 @@ class DiffusionRunConfig(RunConfig):
         one whose size varies."""
         return media_field(self.chain(), "diffusion")
 
-    def mask_field(self, sample: Field, wanted: Field) -> Field:
+    def mask_field(self, sample: Field, wanted: Field, chain: Dataset | None = None,
+                   name: str = "the chain") -> Field:
         """The batch field an inpainting pipeline reads its mask from (`wanted`, the pipeline's own): the
-        chain's `wanted.key` at the samples' height and width, one channel, as `dew.data.images.RandomMask`
-        draws one or a dataset's own column decodes one. A chain that carries none is refused, naming
-        RandomMask: an inpainting pipeline paints the region its mask marks, and a plain image chain
-        marks none."""
-        fields = record(self.chain().facts()["fields"], "the chain's fields")
+        chain's `wanted.key` (the run's data, or `chain`, a validation split `name`) at the samples' height
+        and width, one channel, as `dew.data.images.RandomMask` draws one or a dataset's own column decodes
+        one. A chain that carries none is refused, naming RandomMask: an inpainting pipeline paints the
+        region its mask marks, and a plain image chain marks none."""
+        fields = record((self.chain() if chain is None else chain).facts()["fields"], f"{name}'s fields")
         shape = fields.get(wanted.key)
         expected = (*sample.shape[:-1], 1)
         if shape is None:
+            recipe = ("images(..., augment=RandomMask())" if chain is None else
+                      "images(..., augment=RandomMask(), rejects=False), whose random steps draw by each "
+                      "record's own index, which a dropped record would shift")
             raise ValueError(f"{self.pretrained} is an inpainting pipeline, which paints the region a mask "
-                             f"marks in each image; the chain carries no {wanted.key!r} field: draw one per "
-                             f"image with dew.data.images.RandomMask() (images(..., augment=RandomMask())), "
-                             f"or decode a dataset's own into {wanted.key!r}")
+                             f"marks in each image; {name} carries no {wanted.key!r} field: draw one per "
+                             f"image with dew.data.images.RandomMask() ({recipe}), or decode a dataset's "
+                             f"own into {wanted.key!r}")
         if not isinstance(shape, list | tuple) or tuple(shape) != expected:
-            raise ValueError(f"the chain's {wanted.key!r} field is {shape!r}, and an inpainting pipeline "
+            raise ValueError(f"{name}'s {wanted.key!r} field is {shape!r}, and an inpainting pipeline "
                              f"over {sample.key} of {sample.shape} reads a mask of {list(expected)}")
         return Field(wanted.key, expected)
 
@@ -365,26 +369,32 @@ class DiffusionRunConfig(RunConfig):
         return objective
 
     def _teacher(self, variables: Variables | None) -> TeacherArguments:
-        """The teacher a distillation reads from `teacher_run`: the tree its run published, unless the
-        starting tree holds the teacher (`TEACHER`), and for guidance distillation the teacher's
-        objective rebuilt from the run's record over the tree the student holds frozen
-        (`teacher_weights`)."""
+        """The teacher a distillation reads from `teacher_run`, its step the one its task loads by
+        default (`SavedRun.pinned`): the model its run publishes (`SavedRun.variables`: the trained
+        policy, not a reference its average holds), unless the starting tree holds the teacher
+        (`TEACHER`), and for guidance distillation the teacher's objective over the run's own sampling
+        task (`TextToImage.from_saved`: its model, adapters included, its process and its inputs) bound
+        to the tree the student holds frozen (`teacher_weights`)."""
+        from dew.inference.images import TextToImage
+        from dew.inference.tasks import SavedRun
+
         if self.teacher_run is None:
             return {}
         kind = objectives[self.objective.name]
         if not issubclass(kind, FlowDistillationObjective | GuidanceDistillationObjective):
             raise ValueError(f"teacher_run names a distillation's teacher, and {self.objective.name} "
                              f"distills none")
-        published: Variables | None = None
-        if variables is None or TEACHER not in variables:
-            # A resumed student holds its teacher, so only a fresh one reads the teacher's run.
-            with Checkpoints(self.teacher_run) as checkpoints:
-                published = checkpoints.variables(ema=None, step=None, mesh=None, layout=None,
-                                                  param_dtype=None)
+        # A student that holds its teacher reads its run for guidance distillation's components alone.
+        fresh = variables is None or TEACHER not in variables
+        if not fresh and not issubclass(kind, GuidanceDistillationObjective):
+            return {}
+        run = SavedRun.pinned(self.teacher_run)
+        published = run.variables(ema=None) if fresh else None
         given: TeacherArguments = {} if published is None else {"teacher_variables": published}
         if issubclass(kind, GuidanceDistillationObjective):
-            held = teacher_weights(variables, published, whole=True)
-            given["teacher"] = DiffusionRunConfig.load(self.teacher_run).build(variables=held)
+            task = TextToImage.from_saved(run, variables=teacher_weights(variables, published, whole=True))
+            given["teacher"] = DiffusionObjective(task.model, task.process, task.inputs,
+                                                  autoencoder=task.autoencoder, ema_decay=None)
         return given
 
     def build_run(self) -> Prepared:
@@ -397,6 +407,12 @@ class DiffusionRunConfig(RunConfig):
 
         run = self
         objective = run.build()
+        mask = objective.inputs.mask
+        if mask is not None and run.validation is not None:
+            # Each evaluation scores its splits through their masks, as the run trains through its own.
+            splits = run.validation if isinstance(run.validation, Mapping) else {"validation": run.validation}
+            for name, split in splits.items():
+                run.mask_field(objective.inputs.sample, mask, split, f"the {name!r} split")
         # Compiled once: `train` reads the run's length and cadences off this loader and trains on it.
         dataset, held = run.compiled(objective.data(), run.chain(), run.validation)
         metrics = run.validation_metrics(validates=bool(held))
