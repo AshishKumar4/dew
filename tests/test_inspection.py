@@ -780,34 +780,44 @@ def test_a_pipelined_stacks_watched_cotangents_are_each_layers_over_its_microbat
         assert np.isfinite(piped[name])
 
 
-def test_an_rcm_critic_updates_watched_cotangents_are_its_fake_scores(windows, tmp_path):
-    """An rCM critic update past its warm-up, which trains the fake score and runs the student under no
-    gradient, summarizes the loss's cotangent at the fake score's watched modules, each reached by it, and
-    the student's as the zero it is (row 2324 review): no statistic NaN, a probe no cotangent reached
-    counting none."""
+def rcm_probes(windows, tmp_path, *, student: bool, consistency_weight: float | None = None) -> dict:
+    """The gradient of an rCM step's watched blocks' cotangent probes (`probed_loss`), at the first update
+    past its warm-up of the phase `student` names, its consistency weight `consistency_weight` if given."""
     from test_whole_validation import runnable
 
-    from dew.nn.inspection import Watched, cotangent_statistics
+    from dew.nn.inspection import Watched
     from dew.objectives.base import Step
-    from dew.objectives.diffusion.consistency import FAKE_SCORE
     from dew.training.transaction import probed_loss
 
     objective, batch = runnable("rcm", windows, tmp_path)
+    if consistency_weight is not None:
+        objective.consistency_weight = consistency_weight
     variables = objective.init(jax.random.key(0))
     numeric = {key: value for key, value in batch.items()
                if getattr(value, "dtype", None) is not None and value.dtype.kind in "biuf"}
     held = {key: value for key, value in batch.items() if key not in numeric}
-    critic = next(update for update in range(objective.tangent_warmup, objective.tangent_warmup + 64)
-                  if not bool(objective._student(update)))
+    update = next(update for update in range(objective.tangent_warmup, objective.tangent_warmup + 64)
+                  if bool(objective._student(update)) == student)
     step = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(1), ema=variables,
-                committed=jnp.asarray(critic), watched=Watched(("*Block*",), cotangents=True))
+                committed=jnp.asarray(update), watched=Watched(("*Block*",), cotangents=True))
 
     def probed(numeric):
         stats, back, _ = probed_loss(objective, variables, {**numeric, **held}, step)
         _, seed = jax.vjp(lambda stats: objective.reduce_loss(stats)[0], stats)
         return back(seed(jnp.ones(()))[0])[1]
 
-    probes = jax.jit(probed)(numeric)
+    return jax.jit(probed)(numeric)
+
+
+def test_an_rcm_critic_updates_watched_cotangents_are_its_fake_scores(windows, tmp_path):
+    """An rCM critic update past its warm-up, which trains the fake score and runs the student under no
+    gradient, summarizes the loss's cotangent at the fake score's watched modules, each reached by it, and
+    the student's as the zero it is (row 2324 review): no statistic NaN, a probe no cotangent reached
+    counting none."""
+    from dew.nn.inspection import cotangent_statistics
+    from dew.objectives.diffusion.consistency import FAKE_SCORE
+
+    probes = rcm_probes(windows, tmp_path, student=False)
     fake = jax.tree.leaves(probes[FAKE_SCORE])
     student = jax.tree.leaves({name: tree for name, tree in probes.items() if name != FAKE_SCORE})
     assert fake and student
@@ -823,29 +833,8 @@ def test_a_distribution_matching_student_updates_cotangent_reaches_its_trained_c
     runs under no gradient, summarizes the loss's cotangent at the student's watched modules from the call
     that trains it, the simulation's last (row 2324 review): each student probe counts that call's
     entries."""
-    from test_whole_validation import runnable
-
-    from dew.nn.inspection import Watched
-    from dew.objectives.base import Step
     from dew.objectives.diffusion.consistency import FAKE_SCORE
-    from dew.training.transaction import probed_loss
 
-    objective, batch = runnable("rcm", windows, tmp_path)
-    objective.consistency_weight = 0.0
-    variables = objective.init(jax.random.key(0))
-    numeric = {key: value for key, value in batch.items()
-               if getattr(value, "dtype", None) is not None and value.dtype.kind in "biuf"}
-    held = {key: value for key, value in batch.items() if key not in numeric}
-    student = next(update for update in range(objective.tangent_warmup, objective.tangent_warmup + 64)
-                   if bool(objective._student(update)))
-    step = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(1), ema=variables,
-                committed=jnp.asarray(student), watched=Watched(("*Block*",), cotangents=True))
-
-    def probed(numeric):
-        stats, back, _ = probed_loss(objective, variables, {**numeric, **held}, step)
-        _, seed = jax.vjp(lambda stats: objective.reduce_loss(stats)[0], stats)
-        return back(seed(jnp.ones(()))[0])[1]
-
-    probes = jax.jit(probed)(numeric)
+    probes = rcm_probes(windows, tmp_path, student=True, consistency_weight=0.0)
     trained = jax.tree.leaves({name: tree for name, tree in probes.items() if name != FAKE_SCORE})
     assert trained and all(leaf[..., 0].min() > 0 and np.isfinite(leaf[..., 2]).all() for leaf in trained)
