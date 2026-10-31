@@ -336,6 +336,36 @@ def _score_places(score_mod, params: tuple) -> tuple[bool, bool]:
     return any(var is queries for var in read), any(var is keys for var in read)
 
 
+def varying_slopes(hooks: Hooks | None) -> int:
+    """The tiles a backward step's score-hook pullback forms that vary with its inputs (`algebra.scored`):
+    its output and each slope along an input it differentiates but a constant one (a hook linear in an input
+    slopes 1 along it, which folds away); traced, never run, on a tile. None without a hook."""
+    if hooks is None or not callable(hooks.score_mod):
+        return 0
+    params = tuple((param.kind, kept_dtype(param.value.dtype)) for param in hooks.score_params)
+    return _varying_slopes(hooks.score_mod, params)
+
+
+@functools.lru_cache(maxsize=256)
+def _varying_slopes(score_mod, params: tuple) -> int:
+    """`varying_slopes` of `score_mod` under parameters of `params`' kinds and dtypes."""
+    tile = (TILE_SIDES[0], TILE_SIDES[0])
+    positions, logits = jax.ShapeDtypeStruct(tile, jnp.int32), jax.ShapeDtypeStruct(tile, jnp.float32)
+
+    def scored(s, q_pos, k_pos, *values):
+        out, slopes = algebra.scored(score_mod, s, q_pos, k_pos, values, slopes=True)
+        assert slopes is not None
+        return out, *slopes
+
+    values = [_entries(kind, dtype, tile) for kind, dtype in params]
+    jaxpr = jax.make_jaxpr(scored)(logits, positions, positions, *values).jaxpr
+    varying = set(jaxpr.invars)
+    for eqn in jaxpr.eqns:
+        if any(not isinstance(var, jax_core.Literal) and var in varying for var in eqn.invars):
+            varying.update(eqn.outvars)
+    return sum(not isinstance(var, jax_core.Literal) and var in varying for var in jaxpr.outvars)
+
+
 def transposable(hooks: Hooks) -> bool:
     """Whether the score hook and its pullback run on a tile held keys first (`[bk, bq]`, the dK/dV
     program's) as written for the reference's `[bq, bk]` (`layout.transposed`): traced, never run, at every
