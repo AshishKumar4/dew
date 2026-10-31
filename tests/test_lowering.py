@@ -644,10 +644,10 @@ def _mamba2_lowered(generation: str):
         return tuning.tune(lower)[0]
 
 
-def _mamba1_lowered(generation_name: str):
-    """A bf16 Mamba layer's forward and backward, its selective scan the template's where its selector takes
-    the call (`recurrence_chunk.SELECTIVE`, the template chosen), lowered for `generation_name` after its
-    launches are settled as the trainer settles a step's (`tuning.tune`)."""
+def _mamba1_lowered(generation_name: str, layers: int = 1):
+    """`layers` bf16 Mamba layers of one shape in series, forward and backward, their selective scans the
+    template's where its selector takes the call (`recurrence_chunk.SELECTIVE`, the template chosen), lowered
+    for `generation_name` after its launches are settled as the trainer settles a step's (`tuning.tune`)."""
     from dew.nn.kernels import tuning
     from dew.nn.kernels.generation import chosen
     from dew.nn.mixers.mamba import Mamba
@@ -658,7 +658,9 @@ def _mamba1_lowered(generation_name: str):
     variables = jax.eval_shape(lambda: layer.init(jax.random.key(1), jnp.zeros(x.shape, x.dtype)))
 
     def loss(variables, x):
-        return jnp.asarray(layer.apply(variables, x)).astype(jnp.float32).sum()
+        for _ in range(layers):
+            x = layer.apply(variables, x)
+        return jnp.asarray(x).astype(jnp.float32).sum()
 
     def lower():
         return jax.jit(jax.value_and_grad(loss)).trace(variables, x).lower(lowering_platforms=('cuda',))
@@ -678,6 +680,19 @@ def test_a_mamba_layer_lowers_its_template_scan_for_each_gpu_it_takes(generation
     names = {call.name for call in kernel_calls(_mamba1_lowered(generation_name))
              if call.kind == "mosaic_gpu"}
     assert {"selective_scan", "selective_scan_backward"} <= names, names
+
+
+def test_two_mamba_layers_lower_the_template_scans_launches_once():
+    """Two Mamba layers of one shape, forward and backward, lowered for an H100: each of the selective
+    template's launches is one Mosaic GPU call in the lowered program, which both layers call
+    (`tuning.lowered_once`), as many as one layer's. Built in each call, a model's layers' identical
+    launches were each traced and lowered again (row 2969)."""
+    def launches(layers: int) -> int:
+        text = _mamba1_lowered("sm90", layers).as_text(dialect="hlo")
+        return len(re.findall(r'custom_call_target="mosaic_gpu', text))
+
+    one = launches(1)
+    assert one > 0 and launches(2) == one
 
 
 @pytest.mark.parametrize("generation", GPUS)

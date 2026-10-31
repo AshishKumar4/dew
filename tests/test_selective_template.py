@@ -5,6 +5,8 @@ row strided in global memory), and at Falcon Mamba 7B's widths on a GPU (`tests/
 and a Mamba layer through its selector under the template's choice (`recurrence_chunk.SELECTIVE`) on par
 with the layer's portable scan, at the mixer's own dtypes (its scan in fp32), with packed documents and
 with a held state."""
+import contextlib
+import dataclasses
 import functools
 
 import jax
@@ -14,7 +16,7 @@ from reference_error import FEWEST_SEEDS, assert_as_exact, with_gradients
 
 from dew.batch import coordinates
 from dew.nn.inputs import AttentionMetadata, MixerCall
-from dew.nn.kernels import generation
+from dew.nn.kernels import generation, recurrence_chunk
 from dew.nn.kernels.templates import bundles, mosaic_sm90
 from dew.nn.kernels.templates.recurrence import selective
 from dew.nn.mixers.mamba import Mamba, selective_scan as portable
@@ -72,6 +74,24 @@ def the_template_is_as_exact_as_the_portable_scan(case: str, packed: bool, dtype
 @pytest.mark.parametrize("packed", [False, True], ids=["one row", "packed documents"])
 def test_the_template_is_as_exact_as_the_portable_scan_interpreted(packed):
     the_template_is_as_exact_as_the_portable_scan("interpreted", packed)
+
+
+def test_the_training_forward_keeps_a_state_a_backward_block():
+    """What the template's training forward keeps for its backward over 8192 tokens, four backward blocks of
+    2048 (`selective.block_positions`): beyond its operands, the entering state of each block's first chunk,
+    not of every 32-token chunk, which kept 64 times the states the backward reads, 4.3 GB over Falcon
+    Mamba 7B's step (row 2970)."""
+    rows, length, channels, states = 1, 8192, 128, 16
+    operands = (jax.ShapeDtypeStruct((rows, length, channels), jnp.bfloat16),) * 2 + (
+        jax.ShapeDtypeStruct((channels, states), jnp.float32),
+        *(jax.ShapeDtypeStruct((rows, length, states), jnp.bfloat16),) * 2,
+        jax.ShapeDtypeStruct((channels,), jnp.float32))
+    template = functools.partial(selective.selective_scan, family=mosaic_sm90.WGMMA, interpret=True)
+    kept = jax.eval_shape(lambda *operands: jax.vjp(template, *operands)[1], *operands)
+    beyond = sum(leaf.size * leaf.dtype.itemsize for leaf in jax.tree.leaves(kept)) - sum(
+        operand.size * operand.dtype.itemsize for operand in operands)
+    chunks = length // recurrence_chunk.SELECTIVE_CHUNK
+    assert beyond < chunks * rows * states * channels * 4, beyond
 
 
 LAYER = {"emb_features": 64, "intermediate_size": 128, "state_size": 16, "time_step_rank": 8,
@@ -133,24 +153,45 @@ def test_a_mamba_layer_is_as_exact_under_the_template_interpreted(packed, held):
     the_layer_is_as_exact_under_the_template(packed, held)
 
 
+def routed(target: str, states: int, c_dtype=jnp.float32, *, forms: str = "fast", named: bool = False):
+    """The kernels and refusals the selective scan's dispatch (`recurrence_chunk.selective_scan`) reports
+    for a scan traced for `target` over fp32 `x` and `B` and a `c_dtype` `C` of `states` states, two rows of
+    a chunk's tokens and a channel block, under the run's `forms`, the template named where `named`: each
+    route's `(kernel, refusal code)`; or the refusal it raises."""
+    x = jnp.zeros((2, recurrence_chunk.SELECTIVE_CHUNK, recurrence_chunk.SELECTIVE_BLOCK), jnp.float32)
+    a, b = jnp.zeros((x.shape[-1], states)), jnp.zeros((*x.shape[:2], states))
+    named_template = generation.chosen(selective_scan="mosaic_gpu") if named else contextlib.nullcontext()
+    with (generation.assumed(target), named_template, generation.routes() as found,
+          generation.run_precision(dataclasses.replace(generation.numerics(), forms=forms))):
+        jax.eval_shape(functools.partial(recurrence_chunk.selective_scan, portable=portable),
+                       x, x, a, b, b.astype(c_dtype), x[0, 0], None, None)
+    return {(route.kernel, route.refusal and route.refusal.code) for route in found}
+
+
 def test_the_selector_takes_the_template_only_where_a_call_names_it():
-    """An H100's Mamba layer scan, whole blocks of Mamba's 16 states, goes to the portable math with the
-    template's qualification its refusal, against recorded mamba_ssm (row 2968), no measurement claimed; a
-    call naming the template (`generation.chosen`) takes it, and an A100's refuses it for its strided
-    copies whatever the call names."""
-    from dew.nn.kernels import recurrence_chunk
-    from dew.nn.kernels.selection import KernelRefused, select
+    """An H100's scan of whole blocks of Mamba's 16 states goes to the portable math with the template's
+    qualification its refusal, against recorded mamba_ssm (row 2968), no measurement claimed, and under the
+    accurate forms with those its refusal; a call naming the template (`generation.chosen`) takes it, and an
+    A100's refuses it for its strided copies whatever the call names."""
+    from dew.nn.kernels.selection import KernelRefused
 
-    def case(family):
-        return recurrence_chunk.SelectiveCase(
-            varying=False, dtype=jnp.dtype(jnp.float32), state_dtype=jnp.dtype(jnp.float32), length=2048,
-            channels=5120, states=16, family=family)
-
-    route = select(recurrence_chunk.SELECTIVE, case("wgmma"))
-    assert route.kernel == "xla" and route.refusal is not None and route.refusal.code == "qualified"
-    with generation.chosen(selective_scan="mosaic_gpu"):
-        assert select(recurrence_chunk.SELECTIVE, case("wgmma")).kernel == "mosaic_gpu"
-        with pytest.raises(KernelRefused) as refused:
-            select(recurrence_chunk.SELECTIVE, case("mma.sync"))
+    assert routed("sm90", 16) == {("xla", "qualified")}
+    assert routed("sm90", 16, forms="accurate") == {("xla", "forms")}
+    assert routed("sm90", 16, named=True) == {("mosaic_gpu", None)}
+    with pytest.raises(KernelRefused) as refused:
+        routed("sm80", 16, named=True)
     assert [refusal.code for refusal in refused.value.refusals] == ["strided copies"]
 
+
+@pytest.mark.parametrize("states", [4, 12])
+def test_the_selector_refuses_a_state_row_of_either_stream_no_bulk_copy_takes(states):
+    """fp32 `x` and `B` with a bf16 `C` at `states` states, whose B rows a bulk copy's 16 bytes divide and
+    whose C rows (8 or 24 bytes) they do not: the template's streams copy each unpadded in its own dtype, so
+    a call naming the template is refused for C's rows (row 2975), and the same scan with an fp32 `C`, every
+    row whole, is taken."""
+    from dew.nn.kernels.selection import KernelRefused
+
+    with pytest.raises(KernelRefused) as refused:
+        routed("sm90", states, jnp.bfloat16, named=True)
+    assert [refusal.code for refusal in refused.value.refusals] == ["state rows"]
+    assert routed("sm90", states, named=True) == {("mosaic_gpu", None)}

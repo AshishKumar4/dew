@@ -1396,9 +1396,9 @@ def _ssd_ported(x, dt, A, B, C, D, state, chunk_size: int, starts):
 class SelectiveCase:
     """A selective scan (Mamba's, `dew.nn.mixers.mamba.selective_scan`) as its selector reads it
     (`SELECTIVE`): whether a shard_map that checks varying axes holds its operands, its operands' dtype and
-    its states' rows' (B's and C's),
-    its tokens, channels and states, its device's instruction family (None off a GPU) and the
-    `product`."""
+    its states' rows' narrower one (B's or C's, which stream each in its own: the narrower's rows are the
+    shorter), its tokens, channels and states, whether the run's forms are the fast ones (`mamba_rounding`),
+    its device's instruction family (None off a GPU) and the `product`."""
 
     varying: bool
     dtype: np.dtype
@@ -1406,6 +1406,7 @@ class SelectiveCase:
     length: int
     channels: int
     states: int
+    fast: bool
     family: str | None = None
     product: str = 'forward'
 
@@ -1450,6 +1451,9 @@ SELECTIVE_SUPPORTS: tuple[Requirement[SelectiveCase], ...] = (
                 "addresses at the block's width, not its row's stride, reading the wrong rows "
                 "(cp-async-alone4-h100-3674febe1's unfixed run; the jax fork's fix ships in post42)",
                 row='ledger 1300'),
+    Requirement('forms', lambda case: case.fast,
+                "the run's accurate forms, whose sums the portable math compensates (row 1698); the template "
+                "sums at mamba_ssm's rounding, the fast forms' bar", row='ledger 2968', kind='measured'),
     Requirement('qualified', lambda case: False,
                 "the template's selective scan sums at mamba_ssm's rounding, its bar mamba_ssm's own "
                 "recorded distance from float64 at the same inputs, which is not recorded yet; the "
@@ -1458,9 +1462,9 @@ SELECTIVE_SUPPORTS: tuple[Requirement[SelectiveCase], ...] = (
 """What the template's selective scan (`templates.recurrence.selective`) needs of a call: no caller's
 `shard_map` that checks varying axes, a GPU of a family its bundles cover, 16-bit or fp32 operands, whole
 blocks of channels, at most `SELECTIVE_STATES` states, a chunk's tokens at least (a decode step hands off
-to the portable math), no untiled strided copies (an A100's, until post42), and its qualification against
-recorded mamba_ssm, which no call meets yet: only a call that names the template (`generation.chosen`)
-takes it."""
+to the portable math), no untiled strided copies (an A100's, until post42), the run's fast forms, and its
+qualification against recorded mamba_ssm, which no call meets yet: only a call that names the template
+(`generation.chosen`) takes it."""
 
 SELECTIVE: Op[SelectiveCase] = Op('selective_scan', (Kernel('mosaic_gpu', SELECTIVE_SUPPORTS),
                                                      Kernel('xla', (), generic=True)))
@@ -1469,10 +1473,10 @@ it takes the call, else the portable math. On an H100 the template's training st
 8x2048x5120 against mamba_ssm's 7.21 (mamba1-scan2-h100-ac0dc3a9b)."""
 
 
-def selective_kernel(x, A, B, *, product: str = 'forward', report: bool = True) -> str:
+def selective_kernel(x, A, B, C, *, product: str = 'forward', report: bool = True) -> str:
     """The kernel the selective scan's selector (`SELECTIVE`) gives a scan over `x` `[B, S, D]` with rates
-    `A` `[D, N]` for `product` ('forward', 'training'), on the target: reported as its route, or not where
-    not `report`."""
+    `A` `[D, N]` and states' rows `B`, `C` `[B, S, N]` for `product` ('forward', 'training'), on the
+    target: reported as its route, or not where not `report`."""
     from .templates import bundles
 
     # A GPU's family where a bundle claims it (consumer Blackwell's and tcgen05's have none yet).
@@ -1480,9 +1484,10 @@ def selective_kernel(x, A, B, *, product: str = 'forward', report: bool = True) 
     bundled = on_gpu and bundles.of(generation.device_generation(), x.dtype) is not None
     family = generation.family(generation.device_generation()) if bundled else None
     case = SelectiveCase(varying=bool(jax.typeof(x).mat.varying), dtype=jnp.dtype(x.dtype),
-                         state_dtype=jnp.dtype(jnp.result_type(B)),
-                         length=x.shape[1], channels=x.shape[-1], states=A.shape[-1], family=family,
-                         product=product)
+                         state_dtype=min(jnp.dtype(jnp.result_type(B)), jnp.dtype(jnp.result_type(C)),
+                                         key=lambda dtype: dtype.itemsize),
+                         length=x.shape[1], channels=x.shape[-1], states=A.shape[-1], fast=mamba_rounding(),
+                         family=family, product=product)
     return select(SELECTIVE, case).kernel if report else selected(SELECTIVE, case).name
 
 
@@ -1513,5 +1518,5 @@ def selective_scan(x, dt, A, B, C, D, state, starts, *, portable: Callable):
         specs = (three, three, P(None, None), three, three, P(None), three, P(rows, None))
         return manual_map(template, specs[:len(operands)], (three, three))(*operands)
 
-    return _per_product(lambda product: selective_kernel(x, A, B, product=product), run, x, dt, A, B, C, D,
+    return _per_product(lambda product: selective_kernel(x, A, B, C, product=product), run, x, dt, A, B, C, D,
                         state)

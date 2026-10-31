@@ -14,11 +14,12 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import lax
-from jax._src.lib.mlir.dialects import arith, memref, nvvm, vector
+from jax._src.lib.mlir.dialects import nvvm
 from jax._src.pallas.mosaic_gpu import core as plgpu_core
 from jax.experimental.mosaic.gpu import fragmented_array as fa, utils
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.extend.mlir import ir
+from jax.extend.mlir.dialects import arith, memref, vector
 
 THREADS = 128
 """A warpgroup's threads, a block's positions spread over them."""
