@@ -385,6 +385,19 @@ def _hook_live(family: mosaic.Family, block_q: int, block_k: int, params: tuple,
     return step, vectors
 
 
+def _mask_registers(family: mosaic.Family, block_q: int, block_k: int) -> int:
+    """The registers a queries-first backward step's mask holds (`algebra.seen`), from its logits to its
+    cotangents: its predicates packed a bit an entry, a row pass's of them pending in registers between
+    the compares that form them and the selects that read them (ptxas saves each, its seven predicate
+    registers too few, P2R), and the coordinates it compares, the keys' column vector and the queries' row
+    vector, int32 (the SASS of dQ at 128 x 64, width 64, under sinks: 49 words, 2 packed, 27 pending and 20
+    coordinates; at 64 x 64, width 128, under a tile bias 25 pending)."""
+    entries = block_q * block_k // resources.THREADS
+    pending = family.role_rows * block_k // resources.THREADS
+    coordinates = family.column_registers(block_k, jnp.int32) + family.row_registers(block_q, jnp.int32)
+    return -(-entries // 32) + pending + coordinates
+
+
 def _forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dtype, residuals: bool, *,
                        natural: bool = False, params: tuple = ()) -> int:
     """The registers a forward consumer holds at `tiles` (`resources.live_registers`): its weighted values'
@@ -535,13 +548,19 @@ def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int
     products = [(block_q, block_k, jnp.float32)] * 2 + [(block_q, block_k, jnp.int8)] + held
     pullback = products[1:] + [(block_q, block_k, jnp.float32)] * slopes
     if dq:
+        # dQ's mask priced as its SASS holds it (`_mask_registers`), its hook's parameters and gradients beside
+        # its pullback, not its products: they stream in and out of its entries (dQ under a tile bias at
+        # 64 x 64, width 128: S's and dP's accumulators the only float tiles at its peak).
+        mask = _mask_registers(family, block_q, block_k)
+        products = products[:2]
+        pullback = products[1:] + [(block_q, block_k, jnp.float32)] * slopes + held
         carried = [(block_q, width // config.columns, jnp.float32)] * (2 if accurate else 1)
         cotangents = [(block_q, block_k, jnp.float32), (block_q, block_k, dtype)]
         # Its per-query rows in the accumulator's row layout (`Family.row_registers`), live across the walk:
         # the maximum, the prior total, the anchor, D, the anchor key and the residual and mass sums
         # (DQROWPROOF64/128: seven rows, D64 at 128 queries past the budget).
         rows = DQ_ROWS * family.row_registers(block_q, jnp.float32)
-        return resources.live_registers(family, carried, products, pullback, cotangents) + rows + vectors
+        return resources.live_registers(family, carried, products, pullback, cotangents) + mask + rows + vectors
     if config.shared_keys:
         # Shared keys (`attention_mosaic_coop`): a consumer's share of the head's columns of dK and dV
         # carried, beside a step's two products over its share of the keys and its share of the dQ tile,
