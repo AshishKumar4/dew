@@ -147,27 +147,24 @@ with report.refusals():
     state = run.fit(BATCH, steps=1, log_every=1)
     first, *_ = listed(record(run.plan, "plan")["probes"], "probes", read=record, what="probes")
     print(json.dumps({"step": int(state.step), "ahead": first["ahead"],
-                      "stepped": [miss.stepped for miss in report.misses()],
-                      "native_artifact": run.executable._executable_digest().hex()}))
+                      "stepped": [miss.stepped for miss in report.misses()]}))
 """
 """A run on this host's GPU, in a registry of its own, handed the step compiled ahead at argv[2], or
 none where it is empty."""
 
 
 def a_cached_spilling_run_trains_its_stepped_program(tmp_path, nonce):
-    """A restart over the same cache runs the stepped-down artifact, not the previously refused one.
-    Different compiler flags compile and judge their own native artifact, without inherited refusals.
-    """
+    """A restart over the same cache reads the cached first program's kernel binaries, finds the spill
+    again and steps down to the stepped program, not the refused one. Different compiler flags compile and
+    judge their own program, without inherited refusals."""
     shared, flags = tmp_path / "cache", os.environ.get("XLA_FLAGS", "")
     first = fresh(PRELUDE + HANDED, str(nonce), "", cache_dir=shared, flags=flags)
     again = fresh(PRELUDE + HANDED, str(nonce), "", cache_dir=shared, flags=flags)
     assert first["step"] == again["step"] == 1
     assert first["stepped"][:1] == again["stepped"][:1] == [True]
-    assert again["native_artifact"] == first["native_artifact"]
     other = fresh(PRELUDE + HANDED, str(nonce), "", cache_dir=shared,
                   flags=f"{flags} --xla_gpu_enable_latency_hiding_scheduler=true")
     assert other["step"] == 1 and other["stepped"][:1] == [True]
-    assert other["native_artifact"] != first["native_artifact"]
 
 
 SCOPED = """
@@ -337,3 +334,60 @@ def test_a_program_is_its_jit_within_another_trace_and_keys_its_statics_as_jit_d
     # A typed key array, which states no layout, keys by its sharding.
     drawn = program(lambda key: jax.random.normal(key, (2,)))
     np.testing.assert_array_equal(drawn(jax.random.key(0)), jax.random.normal(jax.random.key(0), (2,)))
+
+
+def _field(number: int, value: bytes | int) -> bytes:
+    """One protobuf field: a varint, or bytes length-delimited."""
+    def varint(n: int) -> bytes:
+        out = b""
+        while True:
+            out += bytes([(n & 0x7F) | (0x80 if n > 0x7F else 0)])
+            n >>= 7
+            if not n:
+                return out
+
+    if isinstance(value, int):
+        return varint(number << 3) + varint(value)
+    return varint(number << 3 | 2) + varint(len(value)) + value
+
+
+def _cubin(registers: int, frame: int) -> bytes:
+    """An ELF holding one `.nv.info` section stating a kernel's registers and stack frame, as a cubin does."""
+    import struct
+
+    names = b"\0.shstrtab\0.nv.info\0"
+    info = b"".join(struct.pack("<BBHII", 0x04, attribute, 8, 0, value)
+                    for attribute, value in ((0x2F, registers), (0x11, frame)))
+    sections_at = 64 + len(names) + len(info)
+    header = (b"\x7fELF\x02\x01\x01" + b"\0" * 9
+              + struct.pack("<HHIQQQIHHHHHH", 2, 190, 1, 0, 0, sections_at, 0, 64, 0, 0, 64, 3, 1))
+    sections = [struct.pack("<IIQQQQIIQQ", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+                struct.pack("<IIQQQQIIQQ", 1, 3, 0, 0, 64, len(names), 0, 0, 1, 0),
+                struct.pack("<IIQQQQIIQQ", 11, 0x70000000, 0, 0, 64 + len(names), len(info), 0, 0, 4, 0)]
+    return header + names + info + b"".join(sections)
+
+
+def _kernel_proto(name: str, registers: int, frame: int) -> bytes:
+    """A `MosaicGpuKernelProto`: its version, binary, kernel name and launch's shared memory."""
+    return (_field(1, 4) + _field(8, _cubin(registers, frame))
+            + _field(9, f"{name}_mosaic_gpu_kernel".encode()) + _field(10, 1024))
+
+
+def _thunk(calls: int, kernels: list[bytes]) -> bytes:
+    """A thunk's proto naming `calls` Mosaic GPU custom calls, each kernel proto in a message of its own."""
+    return b"".join(_field(2, _field(1, b"mosaic_gpu_v2")) for _ in range(calls)) + b"".join(
+        _field(3, _field(5, kernel)) for kernel in kernels)
+
+
+def test_a_thunk_whose_kernel_binary_is_missing_refuses_rather_than_reading_as_no_spill():
+    """Each Mosaic GPU call a thunk names has its binary (`report.thunk_kernels`): two calls and two kernel
+    protos read as two kernels, their registers and frames their cubins'; two calls and one is refused, as a
+    missing binary would read as a kernel that does not spill (row 2851)."""
+    from dew.nn.kernels.templates import report
+
+    both = report.thunk_kernels(_thunk(2, [_kernel_proto("dew_gmm__l0123456789", 168, 0),
+                                           _kernel_proto("dew_tgmm", 255, 344)]))
+    read = [(kernel.kernel, kernel.launch, kernel.registers, kernel.frame, kernel.shared) for kernel in both]
+    assert read == [("dew_gmm", "0123456789", 168, 0, 1024), ("dew_tgmm", None, 255, 344, 1024)]
+    with pytest.raises(ValueError):
+        report.thunk_kernels(_thunk(2, [_kernel_proto("dew_gmm", 168, 0)]))

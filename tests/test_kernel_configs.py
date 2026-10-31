@@ -22,7 +22,7 @@ from jax.sharding import PartitionSpec
 from kernel_compile import compile_kernels, failures
 
 from dew.nn.kernels import chunked_launch, fla_gdn, fla_kda, generation, grouped_matmul, recurrence, tuning
-from dew.nn.kernels.templates import bundles, resources
+from dew.nn.kernels.templates import bundles, report, resources
 from dew.nn.kernels.templates.gemm import mosaic_gpu
 
 
@@ -726,7 +726,7 @@ def test_records_a_failed_process_of_their_own_wrote_are_refused():
 def test_the_resource_gate_refuses_spills_and_invalid_allocations():
     """A record the gate reads (`mosaic_failures`): a kernel past its shared memory, its tensor memory or
     spilling fails; a spill-free model disagreement is reported."""
-    from kernel_compile import mosaic_failures, mosaic_kernels
+    from kernel_compile import inherited, mosaic_failures, reports
 
     within = {"kernel": "k", "unread": [], "shared": 1024, "tmem": 256, "registers": 168, "spilled": 0}
     record = {"name": "case", "limit": 2048, "tmem_limit": 512, "kernels": [within]}
@@ -745,20 +745,47 @@ def test_the_resource_gate_refuses_spills_and_invalid_allocations():
     assert mosaic_failures([{**record, "kernels": []}])
     # The program's own refusal of a block past shared memory fails it whatever its Mosaic kernels say.
     assert mosaic_failures([{**record, "shared": 4096}])
-    # Either report without the other, or a report without a field, is read as missing, not as within.
-    complete = ("smem_scratch_bytes=1024 tmem_scratch_cols=0, tmem_collective_scratch_cols=0",
-                "Used 168 registers\n0 bytes spill stores, 0 bytes spill loads")
+    # A binary without an estimate, an estimate without a field, or a kernel whose PTX no compile covered,
+    # is read as missing, not as within.
+    complete = "Resources(smem_scratch_bytes=1024, tmem_scratch_cols=0, tmem_collective_scratch_cols=0)"
+    compiled = {"a": {"registers": 168, "spilled": 0}, "b": {"registers": 255, "spilled": 40}}
+    a, b, c = (inherited(dataclasses.asdict(found), compiled) for found in reports(
+        {"a": complete, "c": "Resources(smem_scratch_bytes=1024)"},
+        [report.Binary("a", None, 168, 0), report.Binary("b", None, 255, 40)]))
+    assert not a["unread"]
+    assert set(b["unread"]) == {"shared bytes", "tensor memory columns"}
+    assert set(c["unread"]) == {"tensor memory columns", "binary", "registers", "spills"}
+    assert len(mosaic_failures([{**record, "kernels": [a, b, c]}])) == 2
+    # An estimate past the shared memory its binary's launch asks for is another kernel's: it raises.
+    with pytest.raises(ValueError):
+        reports({"a": complete}, [report.Binary("a", None, 168, 0, shared=512)])
+    # A complete estimate and its PTX's compile without a binary: no compiled kernel, read as missing.
+    (unbound,) = (inherited(dataclasses.asdict(found), compiled) for found in reports({"a": complete}, []))
+    assert "binary" in unbound["unread"]
+    assert mosaic_failures([{**record, "kernels": [unbound]}])
+
+
+def test_the_resource_gate_refuses_two_kernels_of_one_name_and_launch():
+    """Evidence of one kernel's name and launch from two kernels is one kernel's at most: two modules
+    (`kernel_modules`), two binaries (`reports`) or two PTX modules (`write_modules`) of one raise."""
+    from kernel_compile import PTX_MODULE, kernel_modules, reports, write_modules
+
+    from dew.training._lowering import KernelCall
+
+    calls = [KernelCall("mosaic_gpu", "k", b"", module, None, "0123456789") for module in ("aa", "bb")]
+    assert kernel_modules(calls[:1]) == {"k__l0123456789": "aa"}
+    with pytest.raises(ValueError):
+        kernel_modules(calls)
+    binaries = [report.Binary("k", "0123456789", registers, 0) for registers in (168, 200)]
+    assert len(reports({}, binaries[:1])) == 1
+    with pytest.raises(ValueError):
+        reports({}, binaries)
+    module = f"//\n{PTX_MODULE}\n.visible .entry k__l0123456789_mosaic_gpu_kernel(\n)\n{{\n}}\n"
     with tempfile.TemporaryDirectory() as directory:
-        Path(directory, "a.resources.txt").write_text(complete[0])
-        Path(directory, "a.ptxas").write_text(complete[1])
-        spilling = "Used 255 registers\n40 bytes spill stores, 40 bytes spill loads"
-        Path(directory, "b.ptxas").write_text(spilling)
-        Path(directory, "c.resources.txt").write_text("smem_scratch_bytes=1024")
-        a, b, c = mosaic_kernels(directory)
-        assert not a["unread"]
-        assert set(b["unread"]) == {"shared bytes", "tensor memory columns"}
-        assert set(c["unread"]) == {"tensor memory columns", "registers", "spills"}
-        assert len(mosaic_failures([{**record, "kernels": [a, b, c]}])) == 2
+        write_modules(module, directory)
+        assert [path.name for path in Path(directory).iterdir()] == ["k__l0123456789.ptx"]
+    with tempfile.TemporaryDirectory() as directory, pytest.raises(ValueError):
+        write_modules(module * 2, directory)
 
 
 @COMPILES_FOR_TPU

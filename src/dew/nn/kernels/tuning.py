@@ -591,9 +591,9 @@ def lowered_once(static: tuple[str, ...], *, unless: Callable[[], bool] = lambda
 
 def holdable(value: Hashable | jax.Array) -> bool:
     """Whether a cache may hold `value` without holding an array through it: no array, and no function of
-    a closure or a bound method (a hook reading an operand's shape may reach the array its call made),
-    within a partial's arguments, a tuple or a dataclass's fields alike (a static argument is hashable, so
-    no list or dict)."""
+    a closure, bound method or callable object but a dataclass (a hook reading an operand's shape may reach
+    the array its call made), within a partial's arguments, a tuple or a dataclass's fields alike (a static
+    argument is hashable, so no list or dict)."""
     if isinstance(value, (jax.Array, np.ndarray)) or inspect.ismethod(value):
         return False
     if isinstance(value, functools.partial):
@@ -604,7 +604,9 @@ def holdable(value: Hashable | jax.Array) -> bool:
         return all(map(holdable, value))
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         return all(holdable(getattr(value, field.name)) for field in dataclasses.fields(value))
-    return True
+    # Any other callable object (a hook class's instance) may hold an array its call reads, which no check
+    # sees; a class is a value.
+    return isinstance(value, type) or not callable(value)
 
 
 def program(function: Callable, *arguments: jax.ShapeDtypeStruct) -> str:

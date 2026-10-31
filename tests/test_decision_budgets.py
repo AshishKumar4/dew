@@ -237,6 +237,42 @@ def _options(row: dict) -> list[tuple[int, ...]]:
     return [tuple(tokens[start + 1:end]) for start, end in zip(markers, ends, strict=True)]
 
 
+def test_a_choice_of_fewer_options_than_its_floor_draws_no_none_of_the_above():
+    """A choice of fewer options than the objective's floor (`none_of_the_above_options`), a yes or a no,
+    draws no "none of the above" however often a read draws one, where it would change what the question
+    asks, while a choice of as many draws it at its rate; with the floor left at 0 both draw it, as
+    before (row 2903). The rows are the objective's own training steps' (`DecisionObjective.data`): its
+    fit, its rows of a question each and the read it configures from the data's widest question, whose
+    slots take the added option only where a question that wide draws it."""
+    from dew.decision.objective import DecisionObjective
+    from dew.decision.rows import NONE_OF_THE_ABOVE, QuestionRows
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+
+    two = Choice("Is it on?", ["yes", "no"])
+    three = Choice("Which colour?", ["red", "green", "blue"])
+    example = Example("the lamp", {"two": two, "three": three}, {"two": "yes", "three": "red"})
+    layout = MarkerLayout(max_len=256)
+    backbone = CausalTransformer(vocab_size=256, emb_features=32, num_layers=1, num_heads=2, mlp_features=48,
+                                 max_seq_len=256, attention_impl="xla")
+
+    def offers(fewest: int) -> dict[str, bool]:
+        objective = DecisionObjective(backbone, tokenizer=BYTES, specials=BYTE_SPECIALS, layout=layout,
+                                      none_of_the_above=1.0, none_of_the_above_options=fewest)
+        fit, expand, configured = objective.data().train
+        assert isinstance(expand, QuestionRows)
+        narrow = configured.factory({"slots": {"options": 2, "questions": 1}})
+        assert narrow.encoding.width == 2 + (fewest <= 2)
+        read = configured.factory({"slots": {"options": 3, "questions": 1}})
+        rows = {row["decision"].names[0]: row for row in expand.flat_map(fit.map({"example": example}))}
+        rng = np.random.default_rng(0)
+        return {name: any(NONE_OF_THE_ABOVE in bytes(option).decode()
+                          for _ in range(16) for option in _options(read.random_map(row, rng)))
+                for name, row in rows.items()}
+
+    assert offers(3) == {"two": False, "three": True}
+    assert offers(0) == {"two": True, "three": True}
+
+
 def test_a_none_of_the_above_draw_never_leaves_a_row_unfit():
     """A "none of the above" that would leave its question alone past the window lays the question out as
     Fit admitted it, where the encoding refused the row before; a draw whose row fits (one replacing the
@@ -423,8 +459,8 @@ def test_a_server_admits_a_large_question_whole_and_counts_what_it_refuses_as_tr
     """The run's task, served whole (`Decide.scoring(whole=True)`), admits a request of 77 or 151 intents
     as it lays it out whole, its usage reporting no cut, and counts it admitted; the same task under
     Laya's declared budgets, served whole, refuses it under `cut`, counted in the server's own counters
-    (`WireScoring.counts`), and answers a short request whose instructions those budgets cut with the cut
-    in its usage where it is not served whole."""
+    (`WireScoring.counts`) with the tokens its cut would have removed (`refused_cut`), and answers a short
+    request whose instructions those budgets cut with the cut in its usage where it is not served whole."""
     objective, _, _ = _run(backbone, count).prepare().train("x")
     task = Decide(objective.model, objective.init(jax.random.key(0)), objective.layout, objective.tokenizer,
                   objective.specials)
@@ -437,6 +473,7 @@ def test_a_server_admits_a_large_question_whole_and_counts_what_it_refuses_as_tr
     with pytest.raises(Refused) as refused:
         strict.admit(body)
     assert refused.value.reason == "cut" and strict.counts.rejected == {"cut": 1}
+    before = strict.counts.refused_cut["instructions"]
     worded = Noul("Does the customer " + "really and truly " * 120 + "need a new card?")
     short = {"state": "my card is lost", "questions": {"holds": worded.wire()}}
     with pytest.raises(Refused) as whole:
@@ -446,6 +483,8 @@ def test_a_server_admits_a_large_question_whole_and_counts_what_it_refuses_as_tr
     [row] = [row.encoded for row in lenient.admit(short).rows]
     assert set(row.cuts) == {"instructions"} and lenient.counts.cut_rows == {"instructions": 1}
     assert lenient.counts.cut_removed == {"instructions": row.instructions_cut}
+    # The cut the whole server refused counts beside its refusal, as a run's data counters count it.
+    assert strict.counts.refused_cut["instructions"] - before == row.instructions_cut
 
 
 def test_a_release_runs_question_budgets_name_where_each_came_from(tmp_path):
@@ -453,7 +492,7 @@ def test_a_release_runs_question_budgets_name_where_each_came_from(tmp_path):
     question budget, which its config states, and Laya's option budget, which its config leaves unstated
     and Laya's code fixes at 48 tokens (`LAYA_BUDGETS`), so the release reads as Laya reads it; a budget
     the run states is the run's."""
-    from test_run_options import TINY_LAYA, decision
+    from run_kinds import TINY_LAYA, decision
 
     run = decision(tmp_path, drawn=False)
     assert run.pretrained == str(TINY_LAYA)

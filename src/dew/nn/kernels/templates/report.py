@@ -2,10 +2,10 @@
 A run's compile (`compiled`, owner 10-29, bible §6) reads each kernel's registers a thread and its stack
 frame from the binary its executable carries (`binaries`): a launch whose kernel spills is refused
 (`refused`) and its program lowered once more, where the launch's derivation takes the next config by its
-own rule, each such refusal a model miss (`misses`). The CPU suite's compile gate reads Mosaic's dumped
-reports besides (`reports`, tests/kernel_compile.py): ptxas's registers and spilled bytes and Mosaic's
-resource estimate (the shared bytes and tensor memory columns a kernel asks for). Each kernel's name
-carries the launch that traced it (`named`), so either names the launch and its config."""
+own rule, each such refusal a model miss (`misses`). The CPU suite's compile gate reads the binaries too,
+beside the resource estimate Pallas prints as it lowers a kernel and the PTX Mosaic prints as it compiles
+one, whose registers and spills ptxas states at the GPU's own compile (tests/kernel_compile.py). Each
+kernel's name carries the launch that traced it (`named`), so a binary names its launch and its config."""
 
 import contextlib
 import contextvars
@@ -16,32 +16,37 @@ import re
 import struct
 import threading
 from collections.abc import Callable, Hashable, Iterator
-from pathlib import Path
 
 import jax
 import tokamax
+from google.protobuf import empty_pb2
+from google.protobuf.message import DecodeError
+from google.protobuf.unknown_fields import UnknownFieldSet
 from jax.extend.mlir import ir
 
 from dew.nn.kernels import generation
-
-REGISTERS = re.compile(r"Used (\d+) registers")
-SPILLS = re.compile(r"(\d+) bytes spill stores, (\d+) bytes spill loads")
-SHARED = re.compile(r"smem_scratch_bytes=(\d+)")
-TENSOR_MEMORY = re.compile(r"tmem_scratch_cols=(\d+), tmem_collective_scratch_cols=(\d+)")
-KERNEL_COUNTER = re.compile(r"_\d+$")
-"""The counter Mosaic GPU appends to a kernel's name in its reports' file names, which JAX 0.12 numbers
-apart for a kernel's two reports."""
-DUMP_NAME = re.compile(r'mosaic_gpu\.dump_basename = "[^"]*"')
-"""The one attribute of Mosaic's module dump that names the dump (its counter) rather than the module."""
-
 
 LAUNCH_SUFFIX = re.compile(r"__l([0-9a-f]{10})$")
 """The suffix a kernel's name carries for the launch that traced it (`named`): the digest of its launch."""
 KERNEL_FUNCTION = re.compile(r"(?P<kernel>.*)_mosaic_gpu_kernel")
 """A Mosaic GPU kernel's function in its binary: its kernel's name, the host function's `_mosaic_gpu`
 (jax/experimental/mosaic/gpu/core.py) and GPU outlining's `_kernel`."""
+
+
+def kernel_of(name: str) -> tuple[str, str | None]:
+    """`(kernel, launch)` of a kernel's `name` as it traced (`named`), its function in its binary or its PTX
+    entry (`KERNEL_FUNCTION`) or its call's location: its name less the launch's suffix, and the launch's
+    digest, None where it carries none."""
+    function = KERNEL_FUNCTION.fullmatch(name)
+    kernel = function.group("kernel") if function else name
+    launch = LAUNCH_SUFFIX.search(kernel)
+    return LAUNCH_SUFFIX.sub("", kernel), launch.group(1) if launch else None
 KERNEL_PROTO_VERSION = 4
 """The `MosaicGpuKernelProto` version jaxlib serializes (mosaic/gpu/custom_call.cc), which it alone reads."""
+MOSAIC_TARGET = b"mosaic_gpu_v2"
+"""The custom call target of a Mosaic GPU kernel, which its thunk names (`_kernels`)."""
+SHARED_BYTES = 10
+"""The `MosaicGpuKernelProto` field of the dynamic shared memory a kernel's launch asks for (`smem_bytes`)."""
 REGISTER_COUNT, FRAME_SIZE = 0x2F, 0x11
 """A cubin's `.nv.info` attributes for a function's registers a thread and its stack frame's bytes
 (EIATTR_REGCOUNT, EIATTR_FRAME_SIZE), as ptxas states them: its frame holds what its registers spill."""
@@ -108,7 +113,7 @@ class Miss:
     op: str | None
     config: Hashable | None
     registers: int | None
-    spilled: int | None
+    frame: int | None
     stepped: bool
 
 
@@ -138,7 +143,7 @@ def _digest(text: str) -> str:
 @contextlib.contextmanager
 def launching(op, arguments: tokamax.BoundArguments, config: Hashable) -> Iterator[None]:
     """Within the block, the kernels a template's launch traces carry its digest in their names (`named`),
-    the same in every process, and their reports name the launch (`Report.launch`, `traced`)."""
+    the same in every process, and their binaries name the launch (`Binary.launch`, `traced`)."""
     token = _TRACING.set(_Pending(lambda: _identity(op, arguments), type(op).__name__, config))
     try:
         yield
@@ -297,8 +302,8 @@ def _recorded(found: list, *, stepped: bool) -> None:
                     None if launch is None else launch.config, report.registers, report.frame,
                     stepped and launch is not None)
         _record(None, miss)
-        _log.warning("kernel %s spilled %s bytes at %s registers (%s at %s); %s", miss.kernel, miss.spilled,
-                     miss.registers, miss.op, miss.config,
+        _log.warning("kernel %s spills to a %s-byte stack frame at %s registers (%s at %s); %s", miss.kernel,
+                     miss.frame, miss.registers, miss.op, miss.config,
                      "its launch steps down" if miss.stepped else "no step-down")
 
 
@@ -314,13 +319,15 @@ def _compiled_reported(lowered: jax.stages.Lowered, options: jax.stages.Compiler
 
 @dataclasses.dataclass(frozen=True)
 class Binary:
-    """A Mosaic GPU kernel's binary as its executable carries it (`binaries`): its name and the launch that
-    traced it (`Report.kernel`, `Report.launch`), its registers a thread and its stack frame's bytes a
-    thread, nonzero where its registers spill (`REGISTER_COUNT`, `FRAME_SIZE`)."""
+    """A Mosaic GPU kernel's binary as its executable carries it (`binaries`): its name less the launch it
+    carries (`LAUNCH_SUFFIX`) and that launch's digest (`named`), its registers a thread and its stack frame's
+    bytes a thread, nonzero where its registers spill (`REGISTER_COUNT`, `FRAME_SIZE`), and the dynamic
+    shared memory its launch asks for (its kernel proto's `smem_bytes`), None where its proto states none."""
     kernel: str
     launch: str | None
     registers: int
     frame: int
+    shared: int | None = None
 
 
 def binaries(executable: jax.stages.Compiled) -> list[Binary]:
@@ -340,61 +347,50 @@ def binaries(executable: jax.stages.Compiled) -> list[Binary]:
 
         def visit(operation: ir.Operation) -> ir.WalkResult:
             if operation.name == "thunky.call_thunk_proto":
-                found.extend(_kernels(ir.StringAttr(operation.attributes["thunk_proto"]).value_bytes))
+                found.extend(thunk_kernels(ir.StringAttr(operation.attributes["thunk_proto"]).value_bytes))
             return ir.WalkResult.ADVANCE
 
         module.operation.walk(visit)
     return found
 
 
-def _kernels(message: bytes) -> list[Binary]:
-    """The kernels of each `MosaicGpuKernelProto` within a thunk's serialized proto: a message of jaxlib's
-    version (field 1) whose binary (8) is an ELF and whose kernel name (9) its function's."""
-    fields = _fields(message)
-    if fields is None:
-        return []
-    binary, name = fields.get(8, []), fields.get(9, [])
+def thunk_kernels(proto: bytes) -> list[Binary]:
+    """The kernel binaries of a thunk's serialized proto (`_kernels`), one for each Mosaic GPU call it names:
+    a call whose binary is missing would read as a kernel that does not spill, so it raises."""
+    kernels, calls = _kernels(proto)
+    if len(kernels) != calls:
+        raise ValueError(f"a thunk names {calls} Mosaic GPU calls but carries {len(kernels)} kernel binaries")
+    return kernels
+
+
+def _kernels(message: bytes) -> tuple[list[Binary], int]:
+    """The kernels of each `MosaicGpuKernelProto` within a thunk's serialized proto (a message of jaxlib's
+    version, field 1, whose binary, 8, is an ELF, whose kernel name, 9, its function's, and whose
+    `SHARED_BYTES` its launch's dynamic shared memory), and how many Mosaic GPU custom calls it names
+    (`MOSAIC_TARGET`, a custom call thunk's target)."""
+    parsed = empty_pb2.Empty()
+    try:
+        parsed.ParseFromString(message)
+    except DecodeError:
+        return [], 0
+    fields: dict[int, list] = {}
+    for field in UnknownFieldSet(parsed):
+        fields.setdefault(field.field_number, []).append(field.data)
+    binary, name, shared = fields.get(8, []), fields.get(9, []), fields.get(SHARED_BYTES, [])
     if (fields.get(1) == [KERNEL_PROTO_VERSION] and len(binary) == len(name) == 1
             and isinstance(binary[0], bytes) and binary[0][:4] == b"\x7fELF" and isinstance(name[0], bytes)):
-        return [_binary(name[0].decode(), binary[0])]
-    return [kernel for values in fields.values() for value in values if isinstance(value, bytes)
-            for kernel in _kernels(value)]
-
-
-def _fields(message: bytes) -> dict[int, list[int | bytes]] | None:
-    """A protobuf message's fields by number, each a varint or bytes; None where `message` is not one."""
-    fields: dict[int, list[int | bytes]] = {}
-    at = 0
-    while at < len(message):
-        key, at = _varint(message, at)
-        number, kind = key >> 3, key & 7
-        if at < 0 or number == 0:
-            return None
-        if kind == 0:
-            value, at = _varint(message, at)
-        elif kind == 2:
-            size, at = _varint(message, at)
-            value, at = message[at:at + size], at + size
-        elif kind in (1, 5):
-            value, at = message[at:at + (8 if kind == 1 else 4)], at + (8 if kind == 1 else 4)
-        else:
-            return None
-        if at < 0 or at > len(message):
-            return None
-        fields.setdefault(number, []).append(value)
-    return fields
-
-
-def _varint(message: bytes, at: int) -> tuple[int, int]:
-    """The varint at `at` and the place after it; a place of -1 where `message` ends inside it."""
-    value = shift = 0
-    while at < len(message):
-        byte = message[at]
-        value |= (byte & 0x7F) << shift
-        at, shift = at + 1, shift + 7
-        if byte < 0x80:
-            return value, at
-    return 0, -1
+        stated = shared[0] if len(shared) == 1 and isinstance(shared[0], int) else None
+        return [dataclasses.replace(_binary(name[0].decode(), binary[0]), shared=stated)], 0
+    found, calls = [], 0
+    for values in fields.values():
+        for value in values:
+            if value == MOSAIC_TARGET:
+                calls += 1
+            elif isinstance(value, bytes):
+                kernels, named = _kernels(value)
+                found += kernels
+                calls += named
+    return found, calls
 
 
 def _binary(function: str, elf: bytes) -> Binary:
@@ -423,78 +419,4 @@ def _binary(function: str, elf: bytes) -> Binary:
                 at += 4
     if REGISTER_COUNT not in stated:
         raise ValueError(f"the binary of {function} states no registers")
-    named = KERNEL_FUNCTION.fullmatch(function)
-    kernel = named.group("kernel") if named else function
-    launch = LAUNCH_SUFFIX.search(kernel)
-    return Binary(LAUNCH_SUFFIX.sub("", kernel), launch.group(1) if launch else None,
-                  stated[REGISTER_COUNT], stated.get(FRAME_SIZE, 0))
-
-
-@dataclasses.dataclass(frozen=True)
-class Report:
-    """One Mosaic GPU kernel's reports: its name, the shared bytes and tensor memory columns it asks for
-    (Mosaic's resource estimate), its registers a thread and its spilled bytes (ptxas's, the most over the
-    kernel's functions), what the reports left `unread`: either report without the other, or a field
-    neither states, is no evidence the kernel is within its resources; and its `module`, the digest of
-    Mosaic's module after layout inference less its dump's name, which two compiles of one module share:
-    Mosaic compiles a module once a process, so a later compile of it reports no ptxas run of its own; and
-    the digest of the launch that traced it (`launching`), which its name carried, or None."""
-    kernel: str
-    shared: int | None
-    tmem: int | None
-    registers: int | None
-    spilled: int | None
-    unread: tuple[str, ...] = ()
-    module: str | None = None
-    launch: str | None = None
-
-    def failure(self, shared_limit: int, tmem_limit: int) -> str | None:
-        """Why the kernel is not within a multiprocessor's `shared_limit` bytes and `tmem_limit` tensor memory
-        columns without spilling registers, or None where it is."""
-        if self.unread:
-            return f"its reports state no {', '.join(self.unread)}"
-        if (self.shared is not None and self.tmem is not None and self.shared <= shared_limit
-                and self.tmem <= tmem_limit and self.spilled == 0):
-            return None
-        return (f"{self.shared} shared bytes (limit {shared_limit}), {self.tmem} tensor memory columns "
-                f"(limit {tmem_limit}), {self.spilled} bytes spilled")
-
-
-def kernel_name(stem: str) -> str:
-    """A kernel's name from a report file's stem: less Mosaic's counter (`KERNEL_COUNTER`) and the launch
-    its name carried (`LAUNCH_SUFFIX`)."""
-    return LAUNCH_SUFFIX.sub("", KERNEL_COUNTER.sub("", stem))
-
-
-def reports(directory: str) -> list[Report]:
-    """Each kernel's `Report` in `directory`, its reports and module dump paired by the kernel's name less the
-    counter Mosaic appends (`KERNEL_COUNTER`); the compiles a directory holds name each kernel once."""
-    by_kernel: dict[str, dict[str, Path]] = {}
-    for kind, suffix in (("resources", ".resources.txt"), ("ptxas", ".ptxas"),
-                         ("module", ".after_layout_inference.txt")):
-        for path in Path(directory).glob(f"*{suffix}"):
-            found = by_kernel.setdefault(KERNEL_COUNTER.sub("", path.name.removesuffix(suffix)), {})
-            # Paired by name: compiles that name a kernel twice would pair the wrong reports.
-            assert kind not in found, f"{path.name} and {found[kind].name} compiled under one name"
-            found[kind] = path
-    found_reports = []
-    for name, found in sorted(by_kernel.items()):
-        text = found["resources"].read_text() if "resources" in found else ""
-        log = found["ptxas"].read_text() if "ptxas" in found else ""
-        shared, tmem = SHARED.search(text), TENSOR_MEMORY.search(text)
-        registers, spills = REGISTERS.findall(log), SPILLS.findall(log)
-        unread = tuple(field for field, read in (("shared bytes", shared), ("tensor memory columns", tmem),
-                                                 ("registers", registers), ("spills", spills)) if not read)
-        module = found.get("module")
-        launch = LAUNCH_SUFFIX.search(name)
-        found_reports.append(Report(
-            LAUNCH_SUFFIX.sub("", name), int(shared.group(1)) if shared else None,
-            sum(map(int, tmem.groups())) if tmem else None, max(map(int, registers), default=None),
-            max((int(stores) + int(loads) for stores, loads in spills), default=None), unread,
-            hashlib.sha256(DUMP_NAME.sub("", module.read_text()).encode()).hexdigest() if module else None,
-            launch.group(1) if launch else None))
-    return found_reports
-
-
-REFUSED = re.compile(r"Shared memory size limit exceeded: requested (\d+)")
-"""XLA's refusal of a kernel whose shared memory a block of the GPU does not hold."""
+    return Binary(*kernel_of(function), stated[REGISTER_COUNT], stated.get(FRAME_SIZE, 0))

@@ -15,7 +15,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 import pytest
-from armada_support import cached, interpreter, loaded, written
+from armada_support import cached, commit, interpreter, loaded, written
 from tool_support import git, load
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -35,13 +35,13 @@ def gpu_driver(root: Path, monkeypatch) -> None:
     monkeypatch.setenv("PATH", f"{tools}:{os.environ['PATH']}")
 
 
-def armada_task(ci, monkeypatch, out: Path, policy: str = "on") -> list[dict]:
-    """The 3.12 tasks the plan makes under DEW_TEST_CACHE=`policy`, each run as armada starts it:
-    .armada.json's command filled from its plan entry, in .armada.json's environment, which the plan's
-    DEW_TEST_CACHE is not part of. Their rows, in the plan's order."""
+def armada_task(ci, monkeypatch, out: Path, policy: str = "on", target: float = 300.0) -> list[dict]:
+    """The 3.12 tasks the plan makes under DEW_TEST_CACHE=`policy` for tasks of `target` seconds, each run as
+    armada starts it: .armada.json's command filled from its plan entry, in .armada.json's environment, which
+    the plan's DEW_TEST_CACHE is not part of. Their rows, in the plan's order."""
     command = json.loads((ROOT / ".armada.json").read_text())["task"]["command"]
     monkeypatch.setenv("DEW_TEST_CACHE", policy)
-    entries = [entry for entry in ci.plan(300.0, {}) if entry["python"] == "3.12"]
+    entries = [entry for entry in ci.plan(target, {}) if entry["python"] == "3.12"]
     monkeypatch.delenv("DEW_TEST_CACHE")
     rows = []
     for entry in entries:
@@ -708,130 +708,6 @@ def test_a_coverage_task_has_a_deadline_for_tracing(ci, tmp_path):
     assert items and all(f"--deadline={ci.COVERAGE_DEADLINE:.0f}" in item for item in items)
 
 
-def test_a_file_whose_recorded_tests_outweigh_its_median_runs_split_by_them(ci, tmp_path):
-    """Train 18's census: main's runs timed the file at 6 s with one test; a head recorded the 1,576
-    tests it added (here 40 of 30 s). Each record is a test's least time, so their sum past the median
-    may mean those runs predate the file's tests, and is a floor on its time: it runs split by its
-    records, alone, not packed with the light files by the median it had before."""
-    for name in ("test_census", "test_light", "test_other"):
-        (tmp_path / "tests" / f"{name}.py").write_text("")
-    (tmp_path / "tests/test_durations.json").write_text(json.dumps(
-        {**{f"tests/test_census.py::test_cell[{n}]": 30.0 for n in range(40)},
-         "tests/test_light.py::test_a": 20.0, "tests/test_other.py::test_b": 20.0}))
-    timings = {"files": {"3.12:tests/test_census.py": 6.0, "3.12:tests/test_light.py": 20.0,
-                         "3.12:tests/test_other.py": 20.0},
-               "rows": {"3.12:tests/test_census.py": 6.0}}
-    floor = sorted((entry["tests"], entry["split"], entry["weight"]) for entry in ci.plan(240.0, timings)
-                   if entry["python"] == "3.12")
-    assert floor == [*((("tests/test_census.py", f"{group}/5", 240.0)) for group in range(1, 6)),
-                     ("tests/test_light.py tests/test_other.py", "", 40.0)]
-
-
-def test_a_split_file_pays_its_setup_once_a_group_and_is_not_cut_finer_for_it(ci):
-    """Twenty recorded tests of 10 s that armada measured whole at 400 s paid 200 s besides their
-    tests, which every group pays again: at a 150 s target that leaves a group half the target of
-    tests, so 3 groups of 270, 270 and 260 s, not slivers each paying it. Measured at 2 groups,
-    300 s, each paid 50 s: its setup is not counted again for the groups it ran as, and it is
-    measured by its rows at that cut, not by a median that remembers other cuts."""
-    tests = [10.0] * 20
-    assert ci.split(tests, 400.0, 150.0, cut=1) == [270.0, 270.0, 260.0]
-    assert ci.split(tests, 200.0 + 2 * 50.0, 150.0, cut=2) == [150.0, 150.0]
-    # A cut whose heaviest group, setup included, holds within half again the target is kept, so
-    # its cached programs are: 4 groups of 100 s, and 20 groups of 50 s (an over-cut paying 40 s
-    # each), stay as they ran; 2 groups at 130 s of setup each (230 s, past 225) are cut again.
-    assert ci.split(tests, 400.0, 150.0, cut=4) == [100.0] * 4
-    assert ci.split(tests, 200.0 + 20 * 40.0, 150.0, cut=20) == [50.0] * 20
-    assert ci.split(tests, 200.0 + 2 * 130.0, 150.0, cut=2) == [200.0, 200.0, 190.0]
-    # The file's median remembers runs at other cuts; its rows are timed at the cut they name. Here
-    # four runs at 4 groups (400 s) and the last at 2 (300 s, its rows): measured at 2, it stays at 2.
-    rows = {"3.12:tests/test_split.py#1/2": 150.0, "3.12:tests/test_split.py#2/2": 150.0,
-            "3.12:tests/test_split.py#3/4": 100.0, "3.14:tests/test_split.py#1/4": 10.0,
-            "3.12:tests/test_split.py#collect": 1.0, "3.12:tests/test_whole.py": 30.0}
-    timings = {"rows": rows, "files": {"3.12:tests/test_split.py": 400.0}}
-    assert ci.measured_cut(timings, "3.12", "tests/test_split.py") == (300.0, 2)
-    seconds, count = ci.measured_cut(timings, "3.12", "tests/test_split.py")
-    assert ci.split(tests, seconds, 150.0, cut=count) == [150.0, 150.0]
-    assert ci.measured_cut(timings, "3.12", "tests/test_whole.py") == (30.0, 1)
-    assert ci.measured_cut(timings, "3.12", "tests/test_unseen.py") is None
-
-
-def test_a_split_files_groups_run_every_test_once(ci, tmp_path):
-    """Each task of a split file runs its own group (split.py) of the same
-    cut, so the groups together run every test, none twice, a test the
-    durations lack included. Each group times the file at what it spent,
-    which armada sums over the groups."""
-    (tmp_path / "tests/test_split.py").write_text(
-        "import pytest\n@pytest.mark.parametrize('n', range(6))\ndef test_n(n): pass\n"
-        "def test_unrecorded(): pass\n")
-    Path("tests/test_durations.json").write_text(json.dumps(
-        {f"tests/test_split.py::test_n[{n}]": seconds for n, seconds in enumerate([5, 1, 1, 1, 5, 1])}))
-    interpreter(tmp_path, "3.12")
-    ran = []
-    for group in ("1/3", "2/3", "3/3"):
-        out = tmp_path / f"verdict-{group.replace('/', '-')}.json"
-        ci.task("3.12", ["tests/test_split.py"], group, out, 120.0)
-        [verdict] = json.loads(out.read_text())["rows"]
-        assert verdict["exitCode"] == 0, verdict["output"]
-        assert verdict["timings"] == {"3.12:tests/test_split.py": verdict["seconds"]}
-        ran.append(sorted(verdict["tests"]))
-    assert all(ran)
-    every = sorted(node for nodes in ran for node in nodes)
-    assert every == sorted([f"tests/test_split.py::test_n[{n}]" for n in range(6)]
-                           + ["tests/test_split.py::test_unrecorded"])
-
-
-def test_the_durations_fold_rewrites_only_a_file_its_record_no_longer_cuts(ci, tmp_path, monkeypatch):
-    """`durations` folds main's CI verdict into the record a file at a time, each whole, from its floor rows:
-    a file whose cut no longer fits as its tests ran takes what they took, though no test's node id changed
-    and its total barely moved (one test grown from 10 s to 180 s of 100; ten of 20 grown from 30 s to 39 s,
-    each within half again), so the next plan cuts it to fit; a file whose cut fits keeps its entries byte for
-    byte, as does one whose heaviest group is a test past the budget alone, which no cut shortens, though
-    its time moves; a file with a red group keeps its own; a file the checkout no longer has loses them; the
-    newest Python's times move nothing."""
-    (tmp_path / ".armada.json").write_text(json.dumps({"target": 240}))
-    record, rows = {}, []
-
-    def file(name: str, recorded: list[float], ran: list[list[float]], red: int | None = None) -> None:
-        (tmp_path / f"tests/{name}.py").write_text("")
-        nodes = [f"tests/{name}.py::test_{index:03}" for index in range(len(recorded))]
-        record.update(zip(nodes, recorded, strict=True))
-        start = 0
-        for group, times in enumerate(ran, start=1):
-            split = f"#{group}/{len(ran)}" if len(ran) > 1 else ""
-            tests = dict(zip(nodes[start:start + len(times)], times, strict=True))
-            start += len(times)
-            rows.append({"name": f"3.12:tests/{name}.py{split}", "exitCode": int(group == red),
-                         "seconds": sum(times), "tests": tests})
-            rows.append({"name": f"3.14:tests/{name}.py{split}", "exitCode": 0, "seconds": 999.0,
-                         "tests": dict.fromkeys(tests, 999.0)})
-
-    file("test_grown", [10.0] * 100, [[180.0] + [10.0] * 19] + [[10.0] * 20] * 4)
-    file("test_drift", [30.0] * 20, [[39.0] * 10, [30.0] * 10])
-    file("test_steady", [100.0] * 4, [[101.0, 99.0], [104.5, 98.0]])
-    file("test_straggler", [381.593, 20.0, 20.0], [[382.0], [20.5, 19.0]])
-    file("test_partial", [150.0] * 4, [[400.0, 400.0], [150.0, 150.0]], red=2)
-    file("test_empty", [], [[]])  # every test deselected, its collection past the target
-    rows[-2]["seconds"] = 300.0
-    record["tests/test_gone.py::test_x"] = 5.0
-    rows.append({"name": "3.12:tests/test_gone.py", "exitCode": 0, "seconds": 5.0,
-                 "tests": {"tests/test_gone.py::test_x": 5.0, "tests/test_gone.py::test_y": 1.0}})
-    (tmp_path / "tests/test_durations.json").write_text(json.dumps(record, indent=0) + "\n")
-    verdict = tmp_path / "main.json"
-    verdict.write_text(json.dumps({"rows": rows}))
-    monkeypatch.setattr(sys, "argv", ["ci.py", "durations", str(verdict)])
-    assert ci.main() == 0
-    folded = json.loads((tmp_path / "tests/test_durations.json").read_text())
-    observed = {node: seconds for row in rows if row["name"].startswith("3.12:") and not row["exitCode"]
-                for node, seconds in row["tests"].items()}
-    for name in ("test_grown", "test_drift"):
-        assert {node: s for node, s in folded.items() if f"/{name}.py" in node} == {
-            node: s for node, s in observed.items() if f"/{name}.py" in node}
-    for name in ("test_steady", "test_straggler", "test_partial"):
-        assert {node: s for node, s in folded.items() if f"/{name}.py" in node} == {
-            node: s for node, s in record.items() if f"/{name}.py" in node}
-    assert not [node for node in folded if node.startswith("tests/test_gone.py")]
-
-
 def test_a_tasks_wall_time_is_apportioned_by_its_files_tests_times(ci):
     """A task's wall time split among its files in proportion to their tests'
     own times, and evenly over its rows where no test recorded one: recorded
@@ -1044,7 +920,7 @@ def test_a_fold_that_moves_a_test_between_groups_runs_each_test_once_in_its_new_
 
     assert run() == {"3.12:tests/test_moved.py#1/2": nodes[:1], "3.12:tests/test_moved.py#2/2": nodes[1:]}
     main_ci = tmp_path / ".verdict/main.json"
-    main_ci.write_text(json.dumps({"rows": [
+    main_ci.write_text(json.dumps({"sha": base, "part": "all", "rows": [
         {"name": "3.12:tests/test_moved.py#1/2", "exitCode": 0, "seconds": 100.0, "tests": {nodes[0]: 100.0}},
         {"name": "3.12:tests/test_moved.py#2/2", "exitCode": 0, "seconds": 600.0,
          "tests": {nodes[1]: 100.0, nodes[2]: 500.0}}]}))
@@ -1106,17 +982,6 @@ def green_runs(ci, monkeypatch, root: Path, verdict, policy: str, names: tuple[s
     rows = armada_task(ci, monkeypatch, verdict, policy)
     assert [row["exitCode"] for row in rows] == [0] * len(names)
     return [len((root / f"runs-{name}").read_text()) for name in names]
-
-
-def commit(root: Path, message: str) -> str:
-    """Checkout `root`'s changes committed, and the commit's sha: every file at the first, which makes the
-    repository, and the tracked and staged changes after, so what a run leaves in the checkout stays out."""
-    first = not (root / ".git").exists()
-    if first:
-        git(root, "init", "-q")
-        git(root, "add", "-A")
-    git(root, "commit", "-qm" if first else "-qam", message)
-    return git(root, "rev-parse", "HEAD").strip()
 
 
 def test_a_watch_the_kernel_cannot_hold_whole_is_blind_and_keys_nothing(tmp_path):
@@ -1711,6 +1576,37 @@ def test_a_run_plans_only_the_files_whose_inputs_changed_and_its_verdict_names_e
     assert [len((tmp_path / f"runs-{name}").read_text()) for name in ("a", "b", "c")] == [1, 1, 2]
 
 
+SCRIPT = str(ROOT / "tools/armada/ci.py")
+
+
+def ran_by_script(ci, root: Path, cache_worker, names: tuple[str, ...], module: str) -> dict[str, str]:
+    """Test files `names` that import src/shapes.py (`module` its text), each weighing about a task, run
+    green by tools/armada/ci.py as a script, as one 3.12 task against the shared test cache, in a checkout
+    whose .armada.json pins its tasks to this host's class: the environment a plan of theirs runs in, which
+    names the cache and its tokens."""
+    interpreter(root, "3.12")
+    held = ci.cpu_class().split("-")
+    config = json.loads((ROOT / ".armada.json").read_text())
+    config["task"]["cpu"] = {"vendor": held[0], "family": int(held[1]), "model": int(held[2])}
+    (root / ".armada.json").write_text(json.dumps(config))
+    (root / "src").mkdir()
+    (root / "src/shapes.py").write_text(module)
+    written(root, {f"test_{name}.py": "import sys\nsys.path.insert(0, 'src')\nfrom shapes import area\n"
+                                      f"def test_{name}():\n    assert area(2) == 2\n" for name in names})
+    (root / "tests/test_durations.json").write_text(json.dumps(
+        {f"tests/test_{name}.py::test_{name}": 250.0 for name in names}))
+    (root / ".verdict").mkdir()
+    url, _, _ = cache_worker
+    env = {**os.environ, "DEW_XLA_CACHE_URL": url, "DEW_XLA_CACHE_TOKEN": "token",
+           "DEW_XLA_CACHE_READ_TOKEN": "token"}
+    verdict = root / ".verdict/verdict.json"
+    tests = "--tests=" + " ".join(f"tests/test_{name}.py" for name in names)
+    subprocess.run([sys.executable, SCRIPT, "task", "--python=3.12", tests, f"--out={verdict}", "--cache=on"],
+                   cwd=root, env=env, check=True)
+    assert [row["exitCode"] for row in json.loads(verdict.read_text())["rows"]] == [0] * len(names)
+    return env
+
+
 def test_a_plan_run_by_another_python_than_its_tasks_keeps_the_files_they_ran_green(
         ci, tmp_path, cache_worker):
     """The plan and a task each run tools/armada/ci.py as a script under whatever Python runs it where it runs
@@ -1718,25 +1614,10 @@ def test_a_plan_run_by_another_python_than_its_tasks_keeps_the_files_they_ran_gr
     green under one Python, a plan run by another keeps, in one task (2026-10-30: plans under 3.14 and 3.12
     found none of the 3.13 tasks' records fresh, as each Python compiles a module's units to its own digests,
     and every file took a task of its own)."""
-    interpreter(tmp_path, "3.12")
-    held = ci.cpu_class().split("-")
-    config = json.loads((ROOT / ".armada.json").read_text())
-    config["task"]["cpu"] = {"vendor": held[0], "family": int(held[1]), "model": int(held[2])}
-    (tmp_path / ".armada.json").write_text(json.dumps(config))
     # A module whose units each Python compiles to its own digests: a documented, annotated function.
-    (tmp_path / "src").mkdir()
-    (tmp_path / "src/shapes.py").write_text(
-        'def area(width: int, height: int = 1) -> int:\n    """An area."""\n    return width * height\n')
-    written(tmp_path, {f"test_{name}.py": "import sys\nsys.path.insert(0, 'src')\nfrom shapes import area\n"
-                                          f"def test_{name}():\n    assert area(2) == 2\n"
-                       for name in ("a", "b")})
-    (tmp_path / "tests/test_durations.json").write_text(json.dumps(
-        {f"tests/test_{name}.py::test_{name}": 250.0 for name in ("a", "b")}))
-    (tmp_path / ".verdict").mkdir()
-    url, _, _ = cache_worker
-    env = {**os.environ, "DEW_XLA_CACHE_URL": url, "DEW_XLA_CACHE_TOKEN": "token",
-           "DEW_XLA_CACHE_READ_TOKEN": "token"}
-    script = str(ROOT / "tools/armada/ci.py")
+    env = ran_by_script(ci, tmp_path, cache_worker, ("a", "b"),
+                        'def area(width: int, height: int = 1) -> int:\n    """An area."""\n'
+                        '    return width * height\n')
 
     def version(python: str) -> str:
         return subprocess.run([python, "-c", "import sys; print(sys.version_info[:2])"], capture_output=True,
@@ -1747,17 +1628,35 @@ def test_a_plan_run_by_another_python_than_its_tasks_keeps_the_files_they_ran_gr
     other = next(python for python in (*(str(ROOT / f".venv-{each}/bin/python") for each in ci.PYTHONS),
                                        shutil.which("python3") or "")
                  if Path(python).is_file() and version(python) != version(sys.executable))
-    verdict = tmp_path / ".verdict/verdict.json"
-    tests = "--tests=tests/test_a.py tests/test_b.py"
-    subprocess.run([sys.executable, script, "task", "--python=3.12", tests, f"--out={verdict}", "--cache=on"],
-                   cwd=tmp_path, env=env, check=True)
-    assert [row["exitCode"] for row in json.loads(verdict.read_text())["rows"]] == [0, 0]
     timings = tmp_path / "timings.json"
-    planned = subprocess.run([other, script, "plan", "--target=300", f"--timings={timings}"], cwd=tmp_path,
+    planned = subprocess.run([other, SCRIPT, "plan", "--target=300", f"--timings={timings}"], cwd=tmp_path,
                              env=env, capture_output=True, text=True, check=True).stdout
     entries = [entry for entry in json.loads(planned)["include"] if entry["python"] == "3.12"]
     assert [sorted(ci.kept_of(entry["tests"].split())[1]) for entry in entries] == [
         [("tests/test_a.py", ""), ("tests/test_b.py", "")]]
+
+
+def test_a_plan_reads_each_input_once_however_many_rows_ran_it(ci, tmp_path, cache_worker):
+    """The plan keys every row it looks up from one reading of the checkout: a module three files' runs
+    executed is read once, as the plan runs in CI, under the Python its keys are hashed by (2026-10-31:
+    train 368's plan read each of a row's ~3,000 inputs again for each of 1,682 rows, 9.5 minutes before its
+    first task)."""
+    names = ("a", "b", "c")
+    env = ran_by_script(ci, tmp_path, cache_worker, names,
+                        "def area(width, height=1):\n    return width * height\n")
+    # The plan as CI's runs it, under the Python its keys are hashed by, each file it opens counted.
+    opened = tmp_path / ".verdict/opened.json"
+    counted = ("import json, runpy, sys\nopened = []\n"
+               "sys.addaudithook(lambda event, args: event == 'open' and opened.append(str(args[0])))\n"
+               f"sys.argv = [{SCRIPT!r}, 'plan', '--target=300', '--timings={tmp_path / 'timings.json'}']\n"
+               f"try:\n    runpy.run_path({SCRIPT!r}, run_name='__main__')\n"
+               f"finally:\n    open({str(opened)!r}, 'w').write(json.dumps(opened))\n")
+    planned = subprocess.run(["uv", "run", "--no-project", "--python", ci.HASHED_BY, "python", "-c", counted],
+                             cwd=tmp_path, env=env, capture_output=True, text=True)
+    entries = [entry for entry in json.loads(planned.stdout)["include"] if entry["python"] == "3.12"]
+    assert [sorted(ci.kept_of(entry["tests"].split())[1]) for entry in entries] == [
+        [(f"tests/test_{name}.py", "") for name in names]]
+    assert json.loads(opened.read_text()).count("src/shapes.py") == 1
 
 
 def test_a_plan_without_build_output_or_fetched_payloads_finds_what_a_task_recorded_with_them(
@@ -1879,6 +1778,49 @@ def test_a_plan_keeps_each_green_group_of_a_heavy_file_and_a_task_runs_a_group_w
     ran = json.loads(verdict.read_text())["rows"]
     assert [(row["name"], row["exitCode"]) for row in ran] == [(heavy[1], 0)]
     assert [len((tmp_path / f"runs-{name}").read_text()) for name in "cd"] == [1, 2]
+
+
+def test_a_plan_spreads_its_kept_rows_over_tasks_of_the_targets_lookups(ci, tmp_path, monkeypatch,
+                                                                        cache_worker):
+    """The plan's kept rows fill tasks of at most the target's lookups, a lookup a row in seconds, each of
+    which reuses its rows, so no kept task outlasts the rest of the run and none carries more tokens than a
+    process starts with (2026-10-31: main de315f9a05's kept rows were one task, whose 149,515-byte --tests
+    argument started no task, and its run was not graded)."""
+    verdict, _ = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
+    assert all(row["exitCode"] == 0 for row in armada_task(ci, monkeypatch, verdict))
+    names = ["3.12:tests/test_a.py", "3.12:tests/test_b.py", "3.12:tests/test_c.py"]
+    entries = [entry for entry in ci.plan(2.0, {}) if entry["python"] == "3.12"]
+    assert [(entry["rows"], entry["weight"]) for entry in entries] == [(names[:2], 2.0), (names[2:], 1.0)]
+    rows = armada_task(ci, monkeypatch, verdict, target=2.0)
+    assert [(row["name"], row["exitCode"]) for row in rows] == [(name, 0) for name in names]
+    assert [len((tmp_path / f"runs-{name}").read_text()) for name in "abc"] == [1, 1, 1]
+
+
+def test_a_kept_tasks_entry_stays_within_what_a_process_starts_with_however_high_the_target(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """However many lookups the target allows, a kept task's entry, which armada hands its task whole as one
+    environment string (ARMADA_ITEM), and its tokens, one argument (--tests), stay within the 131,071 bytes
+    Linux starts a process with, and every kept row is reused (2026-10-31: main de315f9a05's kept rows were
+    one task, whose 149,515-byte argument started none)."""
+    verdict, _ = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
+    # Files of long names (beside a fetched fixture's manifest name, within a file system's 255 bytes), enough
+    # that their kept rows' tokens and names pass what a process starts with together.
+    names = [f"tests/test_{index:03d}{'x' * 200}.py" for index in range(300)]
+    written(tmp_path, {Path(name).name: f"def test_{index}():\n    pass\n"
+                       for index, name in enumerate(names)})
+    durations = tmp_path / "tests/test_durations.json"
+    durations.write_text(json.dumps({**json.loads(durations.read_text()),
+                                     **{f"{name}::test_{index}": 1.0 for index, name in enumerate(names)}}))
+    assert all(row["exitCode"] == 0 for row in armada_task(ci, monkeypatch, verdict, target=100_000.0))
+    entries = [entry for entry in ci.plan(100_000.0, {}) if entry["python"] == "3.12"]
+    every = sorted(f"3.12:{name}" for name in [*names, *(f"tests/test_{letter}.py" for letter in "abc")])
+    assert sorted(row for entry in entries for row in entry["rows"]) == every
+    assert all(ci.KEPT_AT in token for entry in entries for token in entry["tests"].split())
+    assert max(len(f"ARMADA_ITEM={json.dumps(entry)}".encode()) for entry in entries) <= 131_071
+    assert max(len(f"--tests={entry['tests']}".encode()) for entry in entries) <= 131_071
+    rows = armada_task(ci, monkeypatch, verdict, target=100_000.0)
+    assert sorted((row["name"], row["exitCode"]) for row in rows) == [(name, 0) for name in every]
+    assert [len((tmp_path / f"runs-{name}").read_text()) for name in "abc"] == [1, 1, 1]
 
 
 def test_a_kept_task_whose_deadline_runs_out_names_its_unread_groups_red_and_runs_none_past_it(

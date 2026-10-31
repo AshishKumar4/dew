@@ -54,7 +54,16 @@ from jax import lax, numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels.templates import bundles, mosaic, mosaic_sm80, mosaic_sm90, resources, tail as tail_of
+from dew.nn.kernels import tuning
+from dew.nn.kernels.templates import (
+    bundles,
+    mosaic,
+    mosaic_sm80,
+    mosaic_sm90,
+    report,
+    resources,
+    tail as tail_of,
+)
 from dew.nn.kernels.templates.gemm import cost, rows_padded
 
 FAMILY: mosaic.Family = mosaic_sm90.WGMMA
@@ -485,14 +494,17 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
     outs = _gmm_mainloop(lhs, rhs, table, (m, n, k, g), tiles=tiles, transpose_rhs=transpose_rhs,
                          dtypes=dtypes, multiprocessors=multiprocessors, interpret=interpret,
                          hooks=(prologue, prologue_axes, epilogue, epilogue_axes),
-                         sides=(prologue_operands, epilogue_operands), dense=dense, paired=paired)
+                         sides=(prologue_operands, epilogue_operands), dense=dense, paired=paired,
+                         kernel_name=report.named("dew_gmm"))
     outs = tuple(out[:rows] for out in outs)
     return outs if out_dtypes else outs[0]
 
 
+@tuning.lowered_once(('shape', 'tiles', 'transpose_rhs', 'dtypes', 'multiprocessors', 'interpret', 'hooks',
+                      'dense', 'kernel_name'))
 def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs: bool, dtypes: tuple,
                   multiprocessors: int, interpret, hooks: tuple, sides: tuple, dense: bool = False,
-                  paired: jax.Array | None = None) -> tuple:
+                  paired: jax.Array | None = None, kernel_name: str | None = None) -> tuple:
     """Dew: `gmm` on its instruction family's bundle (`family_of`): `tiles.warpgroups` consumer roles, each
     its share of the rows by all the columns, one MMA a step (two: CUTLASS's cooperative split, 2-7% faster
     on every H100 scoreboard row than halving the columns), persistent over the tiles in a planar snake,
@@ -502,7 +514,10 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
     One multiprocessor a tile or, at `tiles.cluster` 2, a pair of them a cluster running two row tiles of
     one group, which load the group's matrix block once between them (`mosaic.Family.streams`' multicast);
     both run each pair's steps (or neither), its second's rows past the group stored nowhere. A `paired`
-    matrix streams beside the first, its blocks multiplied by the same rows' into a second accumulator."""
+    matrix streams beside the first, its blocks multiplied by the same rows' into a second accumulator.
+    Lowered once a configuration (`tuning.lowered_once`), however many layers call it; its `kernel_name` the
+    launch's as the caller resolved it (`report.named`), so two launches whose padded shapes meet keep their
+    own (4089 and 4096 rows)."""
     family = family_of(tiles, lhs.dtype)
     prologue, prologue_axes, epilogue, epilogue_axes = hooks
     prologue_operands, epilogue_operands = sides
@@ -594,7 +609,8 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
     operands = (lhs, rhs) if paired is None else (lhs, rhs, paired)
     kernel = family.kernel(body, out_type=out_type,
                            grid=(multiprocessors // pair,), grid_names=("programs",), consumers=consumers,
-                           interpret=interpret, approx_math=False, name="dew_gmm", cluster=pair,
+                           interpret=interpret, approx_math=False, name="dew_gmm", kernel_name=kernel_name,
+                           cluster=pair,
                            cost=cost(2 * m * n * k * len(matrices), *operands, *prologue_operands,
                                       *epilogue_operands, *out_type))
     return kernel(*(operands if dense else (table, *operands)), *prologue_operands, *epilogue_operands)
@@ -716,13 +732,16 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles
         (lhs, rhs), (group_sizes, group_starts, group_ends, group_num_blocks, group_block_starts),
         (k, m, n, g), tiles=tiles, out_dtype=out_dtype, multiprocessors=multiprocessors,
         interpret=interpret, prologue=prologue, prologue_operands=prologue_operands,
-        prologue_axes=prologue_axes, exact_sums=exact_sums, tail=tail)
+        prologue_axes=prologue_axes, exact_sums=exact_sums, tail=tail,
+        kernel_name=report.named("dew_tgmm"))
 
 
+@tuning.lowered_once(('shape', 'tiles', 'out_dtype', 'multiprocessors', 'interpret', 'prologue',
+                      'prologue_axes', 'exact_sums', 'tail', 'kernel_name'))
 def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles, out_dtype,
                       multiprocessors: int, interpret, prologue, prologue_operands: tuple,
                       prologue_axes: tuple, exact_sums: bool,
-                      tail: tail_of.Tail | None = None) -> jax.Array:
+                      tail: tail_of.Tail | None = None, kernel_name: str | None = None) -> jax.Array:
     """Dew: `tgmm`'s product at a tile `tiles.warpgroups` consumer roles compute, each its share of the depth
     by all the columns, one MMA a step (two: CUTLASS's cooperative sm90 schedule), on its instruction
     family's bundle (`family_of`), its streams running across the persistent loop's tiles where the family
@@ -820,7 +839,7 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
     kernel = family.kernel(body, out_type=(out_type, *workspace),
                            grid=(1 if interpret else multiprocessors,), grid_names=("programs",),
                            consumers=consumers,
-                           interpret=interpret, approx_math=False, name="dew_tgmm",
+                           interpret=interpret, approx_math=False, name="dew_tgmm", kernel_name=kernel_name,
                            cost=cost(2 * lhs.shape[0] * m * n, lhs, rhs, *prologue_operands, out_type))
     return kernel(*groups, lhs, rhs, *prologue_operands)[0]
 

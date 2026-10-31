@@ -621,7 +621,7 @@ jaraco-functools==4.6.0
     # via
     #   cheroot
     #   keyring
-jax==0.12.0.1.post40
+jax==0.12.0.1.post41
     # via
     #   -c constraints.txt
     #   dewml (pyproject.toml)
@@ -1148,6 +1148,7 @@ proto-plus==1.29.0
     #   google-cloud-storage-control
 protobuf==6.33.6
     # via
+    #   dewml (pyproject.toml)
     #   databricks-sdk
     #   google-api-core
     #   google-cloud-storage-control

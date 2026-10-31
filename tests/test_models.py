@@ -15,6 +15,7 @@ import pytest
 from flax import linen as nn
 from flax.core import freeze, unfreeze
 from float64_terms import float64_terms
+from model_support import moved
 from one_draw import assert_as_exact_as_the_reference
 from reference_error import as_given, assert_as_exact, torch_with_gradients, widened, with_gradients
 
@@ -644,10 +645,7 @@ def test_group_norm_is_flax_s(rng, dtype, shape):
         drawn about flax's initial ones."""
         keys = jax.random.split(jax.random.key(seed), 3)
         drawn = (jax.random.normal(keys[0], shape, jnp.float32) * 3 + 1).astype(dtype or jnp.float32)
-        leaves, tree = jax.tree.flatten(params)
-        moved = [leaf + 0.1 * jax.random.normal(key, leaf.shape) for leaf, key
-                 in zip(leaves, jax.random.split(keys[1], len(leaves)), strict=True)]
-        return np.asarray(drawn), jax.tree.unflatten(tree, [np.asarray(leaf) for leaf in moved])
+        return np.asarray(drawn), jax.tree.map(np.asarray, moved(params, keys[1], 0.1))
 
     def truth(drawn, moved):
         return nn.GroupNorm(4, epsilon=1e-5, dtype=jnp.float64).apply(moved, drawn)
@@ -743,11 +741,8 @@ def test_layer_norm_is_flax_s_keeping_only_its_input_for_the_backward(rng, use_s
         parameters moved about them, and a cotangent for the output."""
         keys = jax.random.split(jax.random.key(seed), 3)
         drawn = (jax.random.normal(keys[0], x.shape, jnp.float32) * 3 + 1).astype(x.dtype)
-        leaves, tree = jax.tree.flatten(params)
-        moved = [leaf + 0.1 * jax.random.normal(key, leaf.shape) for leaf, key
-                 in zip(leaves, jax.random.split(keys[1], len(leaves)), strict=True)]
         cotangent = jax.random.normal(keys[2], x.shape, jnp.float32)
-        return np.asarray(drawn), jax.tree.unflatten(tree, [np.asarray(leaf) for leaf in moved]), \
+        return np.asarray(drawn), jax.tree.map(np.asarray, moved(params, keys[1], 0.1)), \
             np.asarray(cotangent)
 
     def observed(module):
