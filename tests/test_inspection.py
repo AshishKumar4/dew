@@ -493,3 +493,53 @@ def test_a_sampled_step_summarizes_its_trained_forward_at_no_forward_more(name):
     plain, _ = work(watched=False)
     sampled, inspected = work(watched=True)
     assert inspected and plain["dot_general"] and sampled == plain
+
+
+def test_a_watched_summary_over_given_positions_is_their_statistics():
+    """Watched with the positions a summary reads (`watching`'s `positions`, `[rows, tokens]`), a module's
+    output is summarized over those positions alone, every feature of each, as its statistics over them
+    are; an output whose leading axes are no `[rows, tokens]` is summarized whole."""
+    from dew.nn.inspection import INSPECTED, SOWN, watching
+
+    class Mapped(nn.Module):
+        @nn.compact
+        def __call__(self, x):
+            return nn.Dense(3, name="inner")(x).sum(axis=1)
+
+    values = jnp.asarray(np.random.default_rng(2).normal(size=(4, 5, 2)), jnp.float32)
+    positions = jnp.asarray(np.arange(20).reshape(4, 5) % 3 != 0)
+    variables = Mapped().init(jax.random.key(0), values)
+
+    def summarized(variables, values, positions):
+        with watching(("Dense", "Mapped"), positions=positions):
+            output, sown = Mapped().apply(variables, values, mutable=[INSPECTED])
+        inner = nn.Dense(3).apply({"params": variables["params"]["inner"]}, values)
+        return sown[INSPECTED], inner, statistics(output)
+
+    sown, inner, whole = jax.jit(summarized)(variables, values, positions)
+    # The statistics no reduction order changes identify the very entries summarized.
+    expected = statistics(jnp.asarray(np.asarray(inner)[np.asarray(positions)]))
+    for statistic in ("abs_max", "non_finite", "zero_fraction"):
+        assert float(sown["inner"][SOWN][statistic]) == float(expected[statistic]), statistic
+    assert jax.tree.map(float, sown[SOWN]) == jax.tree.map(float, whole)
+
+
+def test_a_language_models_watched_layers_read_none_of_its_padding():
+    """A language model's watched layers summarize their outputs at its real tokens alone (row 2324): two
+    rows padded past their text, once with one pad id and once with another, whose causal forward is the
+    same at every real token and differs at the padding, give the same summary of each MLP to the bit."""
+    from model_support import TINY_DECODER
+
+    from dew.objectives.lm import LMObjective
+    from dew.registry import models
+
+    def summaries(pad: int) -> dict[str, float]:
+        model = models.build("causal_transformer", vocab_size=64, **TINY_DECODER, num_kv_heads=2)
+        run = Trainer(LMObjective(model, 16, pad_id=pad), optax.sgd(RATE), key=jax.random.key(0),
+                      inspection=Inspection(modules=("layers_*/mlp",), targets=("params",)))
+        tokens = np.random.default_rng(1).integers(1, 63, size=(8, 17)).astype(np.int32)
+        tokens[1, 10:], tokens[6, 3:] = pad, pad
+        return {name: value for name, value in inspected(run, {"text": tokens}).items() if "/mlp/" in name}
+
+    first, second = summaries(0), summaries(63)
+    assert len(first) >= 12 and first == second
