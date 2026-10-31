@@ -35,7 +35,16 @@ from dew.data.dataset import Ranges, Records
 from dew.data.declared import Declared, HeldFile, mirrored
 from dew.data.pipeline import Dataset
 from dew.data.steps.generic import Fields
-from dew.data.storage import Readable, Store, commit_export, content_version, in_memory, local, on_gcs
+from dew.data.storage import (
+    Readable,
+    Store,
+    commit_export,
+    content_version,
+    in_memory,
+    local,
+    object_info,
+    on_gcs,
+)
 
 from .base import Read, Shard, ShardManifest, preparing, url_label
 from .index import ArrayIndex
@@ -596,11 +605,12 @@ class Files(Dataset):
             return True
         if self.kind == "webdataset":
             return False
-        if "index_headers" in self.__dict__:
+        # Found once, kept: an index provisioned since a miss is looked for again (`provision` clears it).
+        if self.__dict__.get("indexes_present"):
             return True
         if not all(self._present(url) for url in self._indexes):
             return False
-        self.__dict__["index_headers"] = {url: self._header(url) for url in self._indexes}
+        self.__dict__["indexes_present"] = True
         return True
 
     def _present(self, url: str) -> bool:
@@ -644,7 +654,7 @@ class Files(Dataset):
         self.__dict__.pop("_file_facts", None)
         self.__dict__.pop("_snapshot", None)
         self.__dict__.pop("_metadata", None)
-        self.__dict__.pop("index_headers", None)
+        self.__dict__.pop("indexes_present", None)
         return self
 
     def _provision_arrayrecord(self) -> Files:
@@ -663,7 +673,7 @@ class Files(Dataset):
             try:
                 count = len(opened)
                 with mirrored(Store(url, self.storage_options)) as reader:
-                    digest = hashlib.file_digest(reader, "sha256").hexdigest()
+                    digest = object_info(reader)["sha256"]
             finally:
                 opened.close()
             files.append(
@@ -936,7 +946,7 @@ class Files(Dataset):
     def order_fingerprints(self) -> Mapping[str, str]:
         if self.kind not in ("jsonl", "text", "csv"):
             return {}
-        if "index_headers" not in self.__dict__ and not self.supports("indexed"):
+        if not self.supports("indexed"):
             return {}
         indexes = set(self._indexes)
         headers = [metadata for url, metadata in self._file_facts if url in indexes]

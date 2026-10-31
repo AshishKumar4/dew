@@ -26,7 +26,7 @@ from dew.data.sources.base import Read, Shard, ShardManifest, Source, _indexed_m
 from dew.data.sources.codec import decode, encode, encoded_fingerprint
 from dew.data.sources.index import ArrayIndex
 from dew.data.sources.records import ArrayRecords, ShardReaders
-from dew.data.storage import Store, Versioned, local
+from dew.data.storage import Store, Versioned, local, object_info
 
 if TYPE_CHECKING:
     from dew.data.cache import Cache
@@ -302,12 +302,9 @@ def _segment(root: Store, segment: Mapping[str, object], completions: dict, shar
     # as its reader opens it.
     fs, path = shard.resolve()
     if not local(fs):
-        digest, size = hashlib.sha256(), 0
         with fs.open(path, "rb") as stored:
-            while read := stored.read(2**20):
-                digest.update(read)
-                size += len(read)
-        if (digest.hexdigest(), size) != (declared.digest, declared.size):
+            found = object_info(stored)
+        if (found["sha256"], found["bytes"]) != (declared.digest, declared.size):
             raise Replaced(f"{shard.url} holds other bytes than its writer's segment declares")
     with closing(ArrayRecords((shard.url,), root.storage_options, declared=(declared,))) as rows:
         if sorted(entry["record"] for entry in record["completions"]) != list(range(len(rows))):
