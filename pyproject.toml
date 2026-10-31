@@ -401,7 +401,7 @@ patch = ["subprocess"]
 concurrency = ["thread", "multiprocessing"]
 
 [tool.setuptools.dynamic]
-version = {attr = "dew.__version__"}
+version = {attr = "dew._version.__version__"}
 
 [tool.setuptools.package-data]
 dew = ["py.typed"]

@@ -18,10 +18,12 @@ same probe from its config, at 65 GB beyond what this suite downloads. Over
 every registered family, `tools/hf_coverage.py` on the 400 most downloaded
 text-generation repos (2026-10-05) finds one more type that loads:
 GLM-4.7-Flash, as kimi_k2, which the offline GLM_FLASH case checks. Its
-classes registered as a type of their own verify as DeepSeek V3's convention
-too, and the probe refuses each of two changes its eval logits over the
-first positions would not show: a table that pads no row, and a rotary that
-takes no ramp.
+classes registered as a type of their own, their rotary called through code
+tier 2 does not assemble from parts, verify as DeepSeek V3's convention too,
+and the probe refuses each of two changes its eval logits over the first
+positions would not show: a table that pads no row, and a rotary that takes
+no ramp. Assembled from parts, which read the pad row off the table itself,
+the table that pads no row verifies as it is.
 Measured on CPU against transformers 5.16.1 in fp32, over two rows of 64
 random ids:
 
@@ -111,6 +113,13 @@ def test_a_verified_load_saves_the_source_config_and_reloads(tmp_path, model_typ
                                   np.asarray(loaded.model.apply(loaded.variables, ids)))
 
 
+def _by_conventions(model: Glm4MoeLiteForCausalLM) -> None:
+    """`model` with its rotary called through its instance's own forward, the same rotation, which tier 2
+    does not assemble from parts (`parts.identify`): the probe's candidates are the conventions alone."""
+    rotary = model.model.rotary_emb
+    rotary.forward = rotary.forward
+
+
 class _FlashConfig(Glm4MoeLiteConfig):
     model_type = "registered_flash"
 
@@ -118,6 +127,10 @@ class _FlashConfig(Glm4MoeLiteConfig):
 class _Flash(Glm4MoeLiteForCausalLM):
     """GLM-4.7-Flash's own causal LM, under a type of its own."""
     config_class = _FlashConfig
+
+    def __init__(self, config):
+        super().__init__(config)
+        _by_conventions(self)
 
 
 class _UnpaddedConfig(Glm4MoeLiteConfig):
@@ -127,6 +140,20 @@ class _UnpaddedConfig(Glm4MoeLiteConfig):
 class _UnpaddedFlash(Glm4MoeLiteForCausalLM):
     """GLM-4.7-Flash whose table pads no row, whatever pad id its config states."""
     config_class = _UnpaddedConfig
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.model.embed_tokens.padding_idx = None
+        _by_conventions(self)
+
+
+class _UnpaddedPartsConfig(Glm4MoeLiteConfig):
+    model_type = "unpadded_parts_flash"
+
+
+class _UnpaddedPartsFlash(Glm4MoeLiteForCausalLM):
+    """GLM-4.7-Flash whose table pads no row, its every module one tier 2 assembles from parts."""
+    config_class = _UnpaddedPartsConfig
 
     def __init__(self, config):
         super().__init__(config)
@@ -141,6 +168,10 @@ class _UngeneratingFlash(Glm4MoeLiteForCausalLM):
     """GLM-4.7-Flash that does not generate, so its config's pad id is not a generation config's, which
     transformers holds nonnegative when it saves (generation/configuration_utils.py:879)."""
     config_class = _UngeneratingConfig
+
+    def __init__(self, config):
+        super().__init__(config)
+        _by_conventions(self)
 
     @classmethod
     def can_generate(cls) -> bool:
@@ -160,9 +191,11 @@ class _RamplessFlash(Glm4MoeLiteForCausalLM):
         plain = copy.deepcopy(config)
         plain.rope_parameters = {"rope_type": "default", "rope_theta": config.rope_parameters["rope_theta"]}
         self.model.rotary_emb = Glm4MoeLiteRotaryEmbedding(plain)
+        _by_conventions(self)
 
 
 FLASH_TYPES = {"flash": (_FlashConfig, _Flash), "unpadded": (_UnpaddedConfig, _UnpaddedFlash),
+               "unpadded-parts": (_UnpaddedPartsConfig, _UnpaddedPartsFlash),
                "ungenerating": (_UngeneratingConfig, _UngeneratingFlash),
                "rampless": (_RamplessConfig, _RamplessFlash)}
 """GLM-4.7-Flash's classes as types Dew registers no family for: unchanged, and changed where the
@@ -188,16 +221,30 @@ def _registered(kind: str, **fields) -> dict:
 
 @pytest.mark.parametrize(("kind", "pad"), [("flash", 0), ("ungenerating", -1), ("unpadded", 0)])
 def test_a_convention_pads_the_row_its_source_pads(kind, pad):
-    """GLM-4.7-Flash's classes under a type of their own verify as DeepSeek V3's convention, and the same
-    classes whose table pads no row, under a config stating a pad id, do not: the probe holds each
+    """GLM-4.7-Flash's classes under a type of their own, called so that tier 2 does not assemble them
+    (`_by_conventions`), verify as DeepSeek V3's convention, and the same classes whose table pads no
+    row, under a config stating a pad id, do not: the probe holds each
     candidate's pad row to the source's own table's, which takes no gradient there (ledger 1593) and
     which no eval logit shows. A negative pad id, which a source that does not generate may state, names
     the row it counts back from the table's end, as torch's lookup and Dew's both read it, so -1 is the
     last row in each."""
     from dew.interop.verify import Unmapped, VerifiedMapping, verify_mapping
 
-    config = _registered(kind, pad_token_id=pad)
-    assert isinstance(verify_mapping(config), Unmapped if kind == "unpadded" else VerifiedMapping)
+    verified = verify_mapping(_registered(kind, pad_token_id=pad))
+    if kind == "unpadded":
+        assert isinstance(verified, Unmapped)
+    else:
+        assert isinstance(verified, VerifiedMapping) and verified.family != "parts"
+
+
+def test_parts_pad_the_row_their_source_table_pads():
+    """GLM-4.7-Flash's classes whose table pads no row, under a config stating a pad id, verify from parts:
+    tier 2 reads the pad row off the source's own table (ledger 1593), so its decoder pads none, as the
+    source does, where a convention reading the config's pad id is refused."""
+    from dew.interop.verify import VerifiedMapping, verify_mapping
+
+    verified = verify_mapping(_registered("unpadded-parts", pad_token_id=0))
+    assert isinstance(verified, VerifiedMapping) and verified.family == "parts"
 
 
 FAR_RAMP = {"rope_type": "yarn", "rope_theta": 1e6, "factor": 40.0, "original_max_position_embeddings": 2**28,
@@ -208,11 +255,15 @@ probe's rotary, so that at it the ramp rescales no frequency the probe turns."""
 
 @pytest.mark.parametrize("kind", ["flash", "rampless"])
 def test_a_convention_turns_the_ramp_its_source_turns_past_the_original_context(kind):
-    """Under a YaRN record, GLM-4.7-Flash's classes under a type of their own verify as DeepSeek V3's
-    convention, and the same classes whose rotary turns at the plain frequencies do not: the probe runs
+    """Under a YaRN record, GLM-4.7-Flash's classes under a type of their own, called so that tier 2 does
+    not assemble them (`_by_conventions`), verify as DeepSeek V3's convention, and the same classes whose
+    rotary turns at the plain frequencies do not: the probe runs
     past the record's original context, shrunk below its length as a window is, where the ramp rescales
     the frequencies it turns."""
     from dew.interop.verify import Unmapped, VerifiedMapping, verify_mapping
 
-    config = _registered(kind, rope_parameters=FAR_RAMP, max_position_embeddings=2**29)
-    assert isinstance(verify_mapping(config), Unmapped if kind == "rampless" else VerifiedMapping)
+    verified = verify_mapping(_registered(kind, rope_parameters=FAR_RAMP, max_position_embeddings=2**29))
+    if kind == "rampless":
+        assert isinstance(verified, Unmapped)
+    else:
+        assert isinstance(verified, VerifiedMapping) and verified.family != "parts"
