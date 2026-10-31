@@ -122,6 +122,11 @@ EXAMPLES_SCALAR = "evaluation/examples_consumed"
 """The scalar an evaluation of a run on the examples clock records the examples it had consumed under,
 the coordinate the run's own clock places it at (`Evaluation.examples`)."""
 
+COOLDOWN = "cooldown"
+"""What a cooldown branch's evaluation is named by: each suite it scores, `cooldown_<split>`, and the
+examples the branch had consumed, `cooldown/examples_consumed`, apart from the run's own at the step it
+branched at (`EXAMPLES_SCALAR`)."""
+
 
 @dataclass(frozen=True)
 class Evaluation:
@@ -150,8 +155,10 @@ class Evaluation:
     @property
     def scalars(self) -> dict[str, float]:
         """Return the metric values, plus the evaluation/* counts if a batch was scored, and on the
-        examples clock the examples the run had consumed (`EXAMPLES_SCALAR`)."""
-        clocked = {} if self.examples is None else {EXAMPLES_SCALAR: float(self.examples)}
+        examples clock the examples the run had consumed (`EXAMPLES_SCALAR`), a cooldown branch's under its
+        own name (`COOLDOWN`)."""
+        named = f"{COOLDOWN}/examples_consumed" if self.split.startswith(f"{COOLDOWN}_") else EXAMPLES_SCALAR
+        clocked = {} if self.examples is None else {named: float(self.examples)}
         if not self.coordinated_batches:
             return {**self.scores, **clocked}
         return {**self.scores,

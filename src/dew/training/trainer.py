@@ -157,7 +157,7 @@ from dew.training.distributed import (
     step_reads,
     traced_start,
 )
-from dew.training.evaluation import EvalSuite, Evaluation, Summary, admit_split
+from dew.training.evaluation import COOLDOWN, EvalSuite, Evaluation, Summary, admit_split
 from dew.training.footprint import candidate_footprint, traced_loss
 from dew.training.inspection import Inspection
 from dew.training.interval import Interval, Reading, Taken, TokenClock, held, logged_scalars
@@ -1939,7 +1939,7 @@ class Trainer(Generic[Loss, Effects]):
             self._display.note(f"The training data ran out {done} steps into the cooldown from step "
                                f"{run.current}, which records no score")
         else:
-            suites = {f"cooldown_{name}": suite for name, suite in plan.suites.items()}
+            suites = {f"{COOLDOWN}_{name}": suite for name, suite in plan.suites.items()}
             self._evaluation(dataclasses.replace(plan, suites=suites, summaries=()),
                              dataclasses.replace(cooled, step=step_at), shardings, {},
                              examples=self._consumed(interval, counted))

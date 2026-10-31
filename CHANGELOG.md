@@ -48,7 +48,8 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   `ns_coeffs: "polar_express"` takes Polar Express's coefficients; `neuron_beta2` normalizes each output
   neuron as NorMuon. Muon's Newton-Schulz lives in `dew.newton_schulz`.
 - An evaluation of a run on the examples clock records the examples it had consumed
-  (`evaluation/examples_consumed`) beside its step.
+  (`evaluation/examples_consumed`) beside its step; a cooldown branch's, scored at the step it branched
+  at, records the branch's own count under `cooldown/examples_consumed`.
 - A run's numerics are named where they are set: `--trainer.precision accurate` (or a Lightning dtype
   preset, "bf16-true", or a `Numerics` record's JSON), `"precision": "accurate"` in a run.json, and
   `Pretrained.load(precision=...)` and `dew.pipeline(source, precision=...)`, which load in their dtypes
