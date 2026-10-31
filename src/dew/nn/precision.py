@@ -429,8 +429,8 @@ def accumulated(product: Callable[..., jax.Array], *operands,
     if stated is None:
         wide = _float64_sum(product, dtype)
     else:
-        wide = _float64_sums(stated, product, dtype, str(traced.jaxpr), jax.config.jax_enable_x64,
-                             jax.config.jax_default_matmul_precision)
+        wide, narrow = _float64_sums(stated, product, preferred_element_type, dtype, str(traced.jaxpr),
+                                     jax.config.jax_enable_x64, jax.config.jax_default_matmul_precision)
     return jax.lax.platform_dependent(*operands, cpu=wide, default=narrow)
 
 
@@ -482,16 +482,19 @@ def _stated(product: Callable[..., jax.Array]) -> Hashable | None:
 
 
 @functools.lru_cache(maxsize=1024)
-def _float64_sums(stated: Hashable, product: Callable[..., jax.Array], dtype: np.dtype, probed: str,
-                  x64: bool, matmul_precision: str | None) -> Callable:
-    """`_float64_sum` of the product `stated` names, built once a product, its result's dtype, the
-    program its operands made of it (`probed`, which a library patching the product in place changes)
-    and the trace's x64 and matmul precision settings: `platform_dependent` traces a branch once a
-    function, so where a model forms the product again (each layer of a stack, each trace of a step)
-    the same function finds JAX's trace of it, where a fresh one traced it at every call. `product` is
-    the first caller's, which computes what every one `stated` names computes."""
-    del stated, probed, x64, matmul_precision  # keys: what the branch computes
-    return _float64_sum(product, dtype)
+def _float64_sums(stated: Hashable, product: Callable[..., jax.Array],
+                  preferred_element_type: DTypeLike | None, dtype: np.dtype, probed: str, x64: bool,
+                  matmul_precision: str | None) -> tuple[Callable, Callable]:
+    """`accumulated`'s two branches for the product `stated` names, its float64 sum (`_float64_sum`) and
+    the plain product at `preferred_element_type`, built once a product, its result's dtype, the program
+    its operands made of it (`probed`, which a library patching the product in place changes) and the
+    trace's x64 and matmul precision settings: `platform_dependent` traces a branch once a function, so
+    where a model forms the product again (each layer of a stack, each trace of a step) the same functions
+    find JAX's traces of them, where fresh ones traced both at every call. `product` is the first
+    caller's, which computes what every one `stated` names computes."""
+    del stated, probed, x64, matmul_precision  # keys: what the branches compute
+    return (_float64_sum(product, dtype),
+            functools.partial(product, preferred_element_type=preferred_element_type))
 
 
 def _float64_sum(product: Callable[..., jax.Array], dtype: np.dtype) -> Callable:

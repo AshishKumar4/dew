@@ -377,8 +377,9 @@ def test_a_product_closing_over_a_tracer_keeps_none_past_its_trace():
 
     @jax.jit
     def scaled(scale):
-        def product(lhs, rhs, *, preferred_element_type=None):
-            return jnp.dot(lhs, rhs, preferred_element_type=preferred_element_type) * scale
+        def product(lhs, rhs, *, preferred_element_type=None, precision=None):
+            product = jnp.dot(lhs, rhs, precision=precision, preferred_element_type=preferred_element_type)
+            return product * scale
         return accumulated(product, lhs, rhs)
 
     with jax.checking_leaks():
