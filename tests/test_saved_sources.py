@@ -51,7 +51,8 @@ def test_a_decision_run_starts_from_a_saved_decision_run_as_from_its_export(tmp_
     # Named, the run resumes from its own checkpoint (`TrainerConfig.resumes`), reading its source without
     # weights, on a host whose cache holds no release.
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "another_cache"))
-    trained(recorded, tmp_path, "from_run", trainer={"name": "from_run", "steps": 2, "checkpoint_final": True})
+    trained(recorded, tmp_path, "from_run",
+            trainer={"name": "from_run", "steps": 2, "checkpoint_final": True})
     assert "2" in {path.name for path in (tmp_path / "runs" / "from_run").iterdir()}
     assert released_run(source, step="latest") == released_run(source)
     with pytest.raises(ValueError):
