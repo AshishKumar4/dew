@@ -242,8 +242,8 @@ class LMRunConfig(DecoderRunConfig):
         else:
             source = self.pretrained_source(written, vocab_size, context)
             source = self.looped(source)
-            # The model the run trains, a loop given since its load included (ledger 3009).
-            model, fields = source.model, dict(source.declaration.fields)
+            # Its fields name the mask id a masked objective reads, which a loop leaves as loaded.
+            model, fields = source.model, dict(source.model_config)
         if source is None:
             run = dataclasses.replace(run, model=dataclasses.replace(self.model, fields=fields))
         variables = None if source is None else source.variables

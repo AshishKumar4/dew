@@ -204,21 +204,25 @@ def biased(product: jax.Array, bias: jax.Array) -> jax.Array:
     # implicitly. Broadcast at fp32 and rounded back, it adds as flax adds it (XLA folds the round trip,
     # so the product and bias fuse as before) and its gradient sums at fp32 (`broadcast_summed`).
     leading = product.ndim - bias.ndim
-    spread_bias = broadcast_summed(bias, product.shape, tuple(range(leading, product.ndim)))
-    return product.astype(dtype) + spread_bias.astype(dtype)
+    spread_bias = broadcast_summed(bias, product.shape, tuple(range(leading, product.ndim)), dtype=dtype)
+    return product.astype(dtype) + spread_bias
 
 
-def broadcast_summed(value: jax.Array, shape: tuple[int, ...], dimensions: tuple[int, ...]) -> jax.Array:
-    """`jax.lax.broadcast_in_dim(value, shape, dimensions)`, whose gradient, the sum of a cotangent over
-    every position the value spread over, sums at fp32 or wider and rounds once to the value's dtype, as
-    torch's autograd sums a bf16 one: the value widened to fp32 between two exact casts and spread
-    (`spread`), which a CPU running Dew's wide arithmetic sums in float64. Every order JAX forms its
-    transpose at takes it, forward mode's included. A bias's spread (`biased`) and a tier-3 model's
-    broadcasts (`dew.interop.torchax_fallback`) are each this (ledger 3038)."""
+def broadcast_summed(value: jax.Array, shape: tuple[int, ...], dimensions: tuple[int, ...], *,
+                     dtype: DTypeLike | None = None) -> jax.Array:
+    """`jax.lax.broadcast_in_dim(value, shape, dimensions)` in `dtype` (the value's where None), whose
+    gradient, the sum of a cotangent over every position the value spread over, sums at fp32 or wider
+    and rounds once to the value's dtype, as torch's autograd sums a bf16 one: the value widened to fp32
+    between exact casts and spread (`spread`), which a CPU running Dew's wide arithmetic sums in
+    float64, then cast to `dtype`, so a cotangent wider than the value sums before it rounds. Every
+    order JAX forms its transpose at takes it, forward mode's included. A bias's spread (`biased`, in
+    the dtype its addition promotes to) and a tier-3 model's broadcasts (`dew.interop.torchax_fallback`)
+    are each this (ledger 3038)."""
     wide = at_least_fp32(value.dtype)
     kept = iter(value.shape)
     placed = tuple(next(kept) if axis in dimensions else 1 for axis in range(len(shape)))
-    return spread(jnp.reshape(value.astype(wide), placed), shape).astype(value.dtype)
+    spread_value = spread(jnp.reshape(value.astype(wide), placed), shape)
+    return spread_value.astype(value.dtype if dtype is None else dtype)
 
 
 def spread(value: jax.Array, shape: tuple[int, ...]) -> jax.Array:

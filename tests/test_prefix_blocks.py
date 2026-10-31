@@ -264,6 +264,11 @@ def test_a_saved_prefix_runs_bundle_serves_as_the_runs_own_task(tmp_path):
     ours, theirs = task(prompt, NEW, key=0), native(prompt, NEW, key=0)
     np.testing.assert_array_equal(ours.tokens, theirs.tokens)
     np.testing.assert_array_equal(ours.raw_log_probs, theirs.raw_log_probs)
+    # A policy given in the run's place stops and pads where the run's does.
+    given = bundle.text_generation(sampling=Sampling(temperature=0.5)).sampling
+    assert given.temperature == 0.5
+    stated = task.sampling
+    assert (given.eos_token_ids, given.pad_token_id) == (stated.eos_token_ids, stated.pad_token_id)
     bundle.save(tmp_path / "export")
     assert Pretrained.load(tmp_path / "export", dtype="float32").settings is None
 

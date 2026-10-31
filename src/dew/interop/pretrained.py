@@ -85,7 +85,7 @@ from dew.registry import (
     resolve_dtype,
     towers,
 )
-from dew.sampling.text import Sampling
+from dew.sampling.text import Sampling, with_ids_of
 
 if TYPE_CHECKING:
     from jax.sharding import Mesh
@@ -290,7 +290,8 @@ class Pretrained:
     def declaration(self) -> ModelConfig:
         """The record of the model this bundle holds now (`ModelConfig.from_model`): its class, every field
         and each wrapper it was made in, an extension given since its load included, where `model_config`
-        keeps the record it was loaded as (ledger 3009)."""
+        keeps the record it was loaded as (ledger 3009). A tier-3 model, whose graph holds a live torch
+        module, records nothing more than its load's record, which a caller reads instead."""
         return ModelConfig.from_model(self.model)
 
     def map_variables(self, transform: Callable[[Variables], Variables]) -> Self:
@@ -1034,7 +1035,9 @@ def _text_generation(loaded: Pretrained, sampling: Sampling | None) -> TextGener
     if isinstance(loaded.settings, TextSettings):
         task = TextGeneration.from_settings(loaded.model, loaded.variables, loaded.settings,
                                             loaded.text_processor)
-        return loaded.formed(task if sampling is None else replace(task, sampling=sampling))
+        # A policy given in its place stops and pads where the run's does, where it names no ids.
+        policy = None if sampling is None else with_ids_of(sampling, task.sampling)
+        return loaded.formed(task if policy is None else replace(task, sampling=policy))
     rows = return_sequences(loaded.config, loaded.generation_config)
     policy, logits, strategy = source_decoding(loaded.config, loaded.generation_config, loaded.model, rows,
                                                sampling)
