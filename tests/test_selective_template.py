@@ -199,7 +199,9 @@ def the_layer_is_as_exact_under_the_template(packed: bool, held: str | None, *, 
 
 
 @pytest.mark.parametrize("packed, held", [(False, None), (True, None), (False, "into the template"),
-                                          (False, "out of the template")])
+                                          (False, "out of the template")],
+                         ids=["one row", "packed documents", "a held state into the template",
+                              "a held state out of the template"])
 def test_a_mamba_layer_is_as_exact_under_the_template_interpreted(packed, held):
     """The layer's cases interpreted, a held state's into the template and out of it apart: through it on
     both calls it took 189 s on armada (6f7a1978a), each call 11 s a draw, past a test's two minutes."""
