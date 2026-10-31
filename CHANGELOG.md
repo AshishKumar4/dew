@@ -5,6 +5,31 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- Environments and reinforcement learning for control, in `dew.rl` and `dew.objectives`:
+  - Environments as two pure functions: an `Env`'s `reset` and `step`, batched, cut at a time limit, rolled
+    out by one `lax.scan` (`dew.rl.env`). MuJoCo Playground's environments are Envs (`dew.rl.playground`,
+    the `playground` extra).
+  - Simulators outside JAX, stepped from the host with their arrays crossing by DLPack
+    (`dew.rl.simulator`).
+  - A device replay (`dew.rl.replay`).
+  - Brax's PPO for continuous control (`dew.objectives.rl.control`).
+  - DreamerV3 as its code computes it (`dew.objectives.rl.dreamer`): vector or image observations, bfloat16
+    compute, privileged auxiliary heads, and pretraining from demonstrations with behaviour cloning.
+  - TransDreamer's transformer dynamics (`dew.objectives.rl.tssm`).
+  - Dreamer 4's shortcut-forcing world model (`dew.objectives.world_model`).
+  - DiffusionNFT (`dew.objectives.rl.nft`).
+  - `tools/rl_acceptance.py` runs these against their papers. `tutorials/12-world-models.ipynb` acts and
+    imagines in one loop.
+- A first-person drone gate race (`dew.rl.flight`) with any flight simulator behind it:
+  - Progress-to-gate rewards, gates passed only through their openings, and frames and ground that are
+    solid along each physics step.
+  - Published racing layouts and random loops under a difficulty curriculum.
+  - Each drone's dynamics, latency and camera randomized.
+  - HyperDrone as its simulator (`dew.rl.hyperdrone`, the `hyperdrone` extra). This uses Dew's build of
+    HyperDrone, `hyperdrone==0.1.10.post1` from Dew's index, whose CUDA dynamics compile under thrust and
+    body-rate control.
+  - `tools/fpv_race.py` runs the race's phases: a privileged PPO teacher, its demonstrations, and a
+    DreamerV3 agent on the camera alone.
 - Muon's and M3's Newton-Schulz multiply in the run's numerics: bfloat16 operands in its fast forms
   (the default) and float32 at `Numerics.matmul` in its accurate ones (`--trainer.precision accurate`:
   IEEE float32), each matrix whole on one device and the matrices spread over the mesh. A run states its
