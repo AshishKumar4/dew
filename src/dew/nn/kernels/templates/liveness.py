@@ -259,9 +259,9 @@ def divergent_values(module) -> set:
                 mark((argument,), (initial, *trip))
             for inner in body.operations:
                 if inner.operation.name.removeprefix(PREFIX) == 'scf.yield':
-                    for argument, result, value in zip(body.arguments[1:], op.results,
+                    for argument, carried, value in zip(body.arguments[1:], op.results,
                                                         inner.operation.operands, strict=True):
-                        mark((argument, result), (value, *trip))
+                        mark((argument, carried), (value, *trip))
         elif name == 'scf.while':
             before, after = blocks
             _while_divergence(op, before, after, mark)
@@ -270,8 +270,8 @@ def divergent_values(module) -> set:
                 mark(block.arguments, op.operands)
                 for inner in block.operations:
                     if inner.operation.name.removeprefix(PREFIX) == 'scf.yield':
-                        for result, value in zip(op.results, inner.operation.operands, strict=True):
-                            mark((result,), (value, *op.operands))
+                        for returned, value in zip(op.results, inner.operation.operands, strict=True):
+                            mark((returned,), (value, *op.operands))
         elif _warp_broadcast(op, name):
             pass
         elif name == 'llvm.inline_asm' and _assembly(op) == 'mov.b64 $0, $1;':
@@ -297,8 +297,8 @@ def _while_divergence(op, before, after, mark) -> None:
         if inner.operation.name.removeprefix(PREFIX) == 'scf.condition':
             condition, *values = inner.operation.operands
             mark((*before.arguments, *after.arguments, *op.results), (condition,))
-            for argument, result, value in zip(after.arguments, op.results, values, strict=True):
-                mark((argument, result), (value,))
+            for argument, carried, value in zip(after.arguments, op.results, values, strict=True):
+                mark((argument, carried), (value,))
     for inner in after.operations:
         if inner.operation.name.removeprefix(PREFIX) == 'scf.yield':
             for argument, value in zip(before.arguments, inner.operation.operands, strict=True):
@@ -334,7 +334,7 @@ def _general_register(value) -> bool:
             # Hopper's descriptors, TMA coordinates and barriers accept uniform registers in SASS,
             # despite PTX's l/r constraints. Unknown assembly retains the conservative GPR rule.
             if assembly == 'mov.b64 $0, $1;':
-                if any(_general_register(result) for result in op.results):
+                if any(_general_register(moved) for moved in op.results):
                     return True
                 continue
             if any(instruction in assembly
@@ -377,7 +377,7 @@ def _streams_into(value, parent, seen=None) -> bool:
         if not _within(user, parent):
             return False
         if name in views:
-            if not all(_streams_into(result, parent, seen) for result in user.results):
+            if not all(_streams_into(viewed, parent, seen) for viewed in user.results):
                 return False
         elif not (_elementwise(user, name) or STREAMS_INTO.match(name)):
             return False
