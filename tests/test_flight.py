@@ -146,8 +146,8 @@ def test_a_gate_race_pays_ends_shows_and_commands_as_flydreamer():
     `simulator_rollout`): every step's reward FlyDreamer's (gates reached and their bonuses, progress, the
     rates' and their changes' penalties, time, the waypoint out of view, collisions) to float64 rounding,
     its episodes ended and cut on the same steps, each ended drone restarted on a fresh track, its
-    privileged state FlyDreamer's bit for bit and its goal to float64 rounding, and each action
-    commanded as FlyDreamer commands it."""
+    privileged state and goal FlyDreamer's, and each action commanded as FlyDreamer commands it (the
+    draws' trigonometry rounds alike to an ulp from machine to machine)."""
     racing = Racing(xy_radius=0.0, z_range=(0.0, 0.0), max_steps=MAX_STEPS, solid=False)
     with jax.enable_x64(new_val=True):
         for seed, recorded in enumerate(RACE.recorded()):
@@ -170,10 +170,10 @@ def test_a_gate_race_pays_ends_shows_and_commands_as_flydreamer():
                                        roundings=roundings)
             np.testing.assert_array_equal(reached.terminated, recorded["terminal"])
             np.testing.assert_array_equal(reached.truncated, recorded["last"] & ~recorded["terminal"])
-            np.testing.assert_array_equal(reached.observation["state"], recorded["state"])
             roundings = chain_roundings(jax.make_jaxpr(privileged)(track, kinematics))
-            assert_computes_the_oracle(reached.observation["goal"], recorded["goal"], f"race {seed}'s goals",
-                                       roundings=roundings)
+            for name in ("state", "goal"):
+                assert_computes_the_oracle(reached.observation[name], recorded[name],
+                                           f"race {seed}'s {name}s", roundings=roundings)
             roundings = chain_roundings(jax.make_jaxpr(lambda action: commands(racing, action))(actions[0]))
             assert_computes_the_oracle(np.stack(backend.commands, 1), recorded["command"],
                                        f"race {seed}'s commands", roundings=roundings)
