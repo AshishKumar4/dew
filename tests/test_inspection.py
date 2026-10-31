@@ -543,3 +543,28 @@ def test_a_language_models_watched_layers_read_none_of_its_padding():
 
     first, second = summaries(0), summaries(63)
     assert len(first) >= 12 and first == second
+
+
+@pytest.mark.mesh(devices=4)
+def test_a_pipelined_stacks_watched_layers_each_report_every_microbatch():
+    """A decoder pipelined over two stages of two microbatches each reports every layer it watches (row
+    2324): each of its four MLPs' summary, one a microbatch the pipeline runs, finite, from the sampled
+    step's own forward, each named by its layer's place in the decoder, not in its stage."""
+    from model_support import TINY_DECODER
+
+    from dew.objectives.lm import LMObjective
+    from dew.registry import models
+    from dew.training import MeshSpec
+
+    model = models.build("causal_transformer", vocab_size=64, **{**TINY_DECODER, "num_layers": 4},
+                         num_kv_heads=2)
+    run = Trainer(LMObjective(model, 16), optax.sgd(RATE), key=jax.random.key(0), microbatches=2,
+                  mesh=MeshSpec(fsdp=2, stage=2).build(jax.devices()[:4]),
+                  inspection=Inspection(modules=("*MLP",), targets=("params",)))
+    tokens = np.random.default_rng(1).integers(1, 64, size=(8, 17)).astype(np.int32)
+    logged = inspected(run, {"text": tokens})
+    summaries = {name.rsplit("/", 1)[0]: value for name, value in logged.items()
+                 if name.endswith("/rms") and "activations" in name}
+    assert set(summaries) == {f"inspect/activations/layers_{layer}/mlp/{microbatch}"
+                              for layer in range(4) for microbatch in range(2)}
+    assert all(np.isfinite(value) and value > 0 for value in summaries.values())
