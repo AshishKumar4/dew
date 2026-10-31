@@ -20,7 +20,7 @@ import contextlib
 import dataclasses
 import math
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from typing import TypeGuard
+from typing import NamedTuple, TypeGuard
 
 import jax
 import jax.extend.core as jcore
@@ -53,18 +53,30 @@ class Footprint:
     gradients: int
     held: int
     resident: Mapping[str, int] = dataclasses.field(default_factory=dict)
+    """The prepared state's logical bytes by field and device, before buffer assignment aliases
+    anything. These are not additional temporary bytes: the state's existing allocations already
+    count against allocator headroom, and newly built copies and accumulators are in `held`."""
     peak: int | None = None
     """The most bytes its loss's gradient program holds at once at one microbatch, in its traced order
     (`peak_bytes`): the residuals still live, the backward's cotangents and the gradient as it is
     built. None where `residuals` is."""
-    """The prepared state's logical bytes by field and device, before buffer assignment aliases
-    anything. These are not additional temporary bytes: the state's existing allocations already
-    count against allocator headroom, and newly built copies and accumulators are in `held`."""
+    exact: bool = True
+    """Whether `peak` is the program's as XLA's rules make it, else a bound from below
+    (`bounded_below`): a step whose derived headroom is then an upper bound refuses on it soundly and
+    admits on it provisionally, its compile deciding."""
 
     def record(self) -> dict[str, JSON]:
         """The terms traced, not an admission decision: XLA's fit check remains authoritative."""
         return {"residuals": self.residuals, "gradients": self.gradients, "held": self.held,
-                "resident": dict(self.resident), "peak": self.peak}
+                "resident": dict(self.resident), "peak": self.peak, "peak_exact": self.exact}
+
+
+class Peak(NamedTuple):
+    """A gradient program's derived peak (`gradient_peak`): its bytes, and whether they are the
+    program's own or a bound from below (`bounded_below`)."""
+
+    bytes: int
+    exact: bool
 
 
 def device_bytes(tree) -> int:
@@ -156,16 +168,30 @@ def residual_bytes(loss: Callable, params, arguments: Sequence, *, platform: str
     return total
 
 
-def gradient_peak(loss: Callable, params, arguments: Sequence, *, platform: str, workspace: int) -> int:
+def gradient_peak(loss: Callable, params, arguments: Sequence, *, platform: str, workspace: int) -> Peak:
     """The most device bytes the gradient of `loss(params, *arguments)` in `params` holds at once, a
     device's share, as XLA's fusion for `platform` keeps its values and each matrix product takes
-    `workspace` bytes beside them (`peak_bytes`): the program `jax.vjp`'s pullback runs on a cotangent
-    of ones, traced whole, forward and backward."""
+    `workspace` bytes beside them (`peak_bytes`), and whether that is the program's own or a bound from
+    below (`bounded_below`): the program `jax.vjp`'s pullback runs on a cotangent of ones, traced whole,
+    forward and backward."""
     def gradient(params, *arguments):
         outputs, pullback, _ = jax.vjp(lambda trainable: loss(trainable, *arguments), params, has_aux=True)
         return pullback(jax.tree.map(jax.numpy.ones_like, outputs))
 
-    return peak_bytes(jax.make_jaxpr(gradient)(params, *arguments).jaxpr, platform, workspace)
+    program = jax.make_jaxpr(gradient)(params, *arguments).jaxpr
+    return Peak(peak_bytes(program, platform, workspace), not bounded_below(program, platform))
+
+
+def bounded_below(program: jcore.Jaxpr, platform: str) -> bool:
+    """Whether `program`'s derived peak bounds what XLA makes of it from below: on a GPU, where it expands
+    a ragged product (`expansions`), beside whose expansion XLA's layout assignment may lay an operand
+    out again as a copy rather than a bitcast (xla/service/layout_assignment.cc) and its fusion may keep
+    the expansion's mask in a buffer of its own (xla/backends/gpu/transforms/priority_fusion.cc), each
+    by its cost model's judgment, no rule the derivation can source. Such a step's compile decides its
+    fit, and a miss is logged with the need it compiled to (`FitSearch.compiled`)."""
+    return platform == "gpu" and any(
+        expansions(equation) or any(bounded_below(body, platform) for body in bodies(equation))
+        for equation in program.eqns)
 
 
 def peak_bytes(program: jcore.Jaxpr, platform: str, workspace: int) -> int:
@@ -184,13 +210,12 @@ def peak_bytes(program: jcore.Jaxpr, platform: str, workspace: int) -> int:
     # read it (XLA's common-subexpression elimination), from the first that reads it to the last.
     grown = [expansions(equation) if platform == "gpu" else {} for equation in program.eqns]
     dense = {key: index for index, found in enumerate(grown) for key in found}
-    readers = collections.Counter(key for found in grown for key in found)
     live, held, most = 0, set(), 0
     expanded: set[tuple[jcore.Var, jcore.Var]] = set()
     for index, equation in enumerate(program.eqns):
         made = [out for out in equation.outvars if out in last and frontier.buffered(out)]
         made_bytes = sum(map(device_share, made))
-        for key, size in shared(grown[index], readers).items():
+        for key, size in grown[index].items():
             if key not in expanded:
                 expanded.add(key)
                 live += size
@@ -209,7 +234,7 @@ def peak_bytes(program: jcore.Jaxpr, platform: str, workspace: int) -> int:
         for done in [value for value in held if last[value] == index]:
             held.discard(done)
             live -= device_share(done)
-        for key, size in shared(grown[index], readers).items():
+        for key, size in grown[index].items():
             if dense[key] == index:
                 live -= size
     return most
@@ -329,28 +354,18 @@ def cublas_product(equation: jcore.JaxprEqn) -> bool:
     return (kept_left + kept_right) * contracting >= threshold or not classical
 
 
-def shared(found: Mapping[tuple, int], readers: Mapping[tuple, int]) -> dict[tuple, int]:
-    """Of an equation's expansions (`expansions`), those it holds a buffer of: every dense operand, and a
-    mask only where several of the program's ragged products read it, which XLA's common-subexpression
-    elimination computes once and its fusion reads from memory in each select; one alone fuses into its
-    select."""
-    return {key: size for key, size in found.items() if key[0] == "dense" or readers[key] > 1}
-
-
 def expansions(equation: jcore.JaxprEqn) -> dict[tuple, int]:
-    """The buffers a GPU's ragged product reads that XLA makes of its operands, each keyed as XLA's
-    common-subexpression elimination tells them apart, with its bytes. XLA expands a ragged product no
-    grouped kernel takes into a product over its groups (`RaggedDotRewriter::RunImpl`,
+    """The dense operands a GPU's ragged product reads that XLA makes of its operands, each keyed as XLA's
+    common-subexpression elimination tells them apart (the operand, its group sizes and the dimension it
+    is ragged in, whose iota the mask runs over), with its bytes. XLA expands a ragged product no grouped
+    kernel takes into a product over its groups (`RaggedDotRewriter::RunImpl`,
     xla/hlo/transforms/expanders/ragged_dot_rewriter.cc: cuDNN's fusion takes only float16 or bfloat16,
     behind `xla_gpu_experimental_use_ragged_dot_fusion`, off by default; hipBLASLt's grouped GEMM only on
-    ROCm). Each operand it makes dense (`RaggedToGeneral`: the ragged rows of one ragged in a
+    ROCm): each operand it makes dense (`RaggedToGeneral`: the ragged rows of one ragged in a
     non-contracting dimension, both operands of one ragged in its contracting dimension, none of one
     ragged in a batch dimension) is a select of its broadcast once a group (`RaggedToDense`), which the
-    product reads from memory, keyed by the operand, its group sizes and the dimension it is ragged in
-    (the mask's iota runs over it); laid out again where the product's contracting dimensions are not
-    adjacent in it, which XLA's dot decomposer makes them (`adjacent`); and its mask, a byte an
-    element, keyed by its shape, sizes and ragged dimension alone, the same for every operand of that
-    shape (`shared_masks` holds it where several expansions read it)."""
+    product reads from memory. What XLA's layout assignment and fusion add beside it is theirs to choose
+    (`bounded_below`)."""
     if equation.primitive.name != "ragged_dot_general":
         return {}
     numbers = equation.params["ragged_dot_dimension_numbers"]
@@ -359,32 +374,12 @@ def expansions(equation: jcore.JaxprEqn) -> dict[tuple, int]:
     sizes = equation.invars[2]
     if ragged in batch or not computed(sizes):
         return {}
-    groups, at = dimensions(sizes)[-1], len(dimensions(sizes)) - 1
+    groups = dimensions(sizes)[-1]
+    dense = [(equation.invars[0], ragged)]
     if ragged in contracting:
-        # Both operands made dense, the group a batch dimension of the product before the rest.
-        axis = other[contracting.index(ragged)]
-        dense = [(equation.invars[0], ragged, (), contracting), (equation.invars[1], axis, (), other)]
-    else:
-        # The rows' group joins their contraction, contracted with the weights' group.
-        dense = [(equation.invars[0], ragged, (at,), contracting)]
-    found: dict[tuple, int] = {}
-    for operand, axis, joined, contracted in dense:
-        if not computed(operand):
-            continue
-        shape = dimensions(operand)
-        made = groups * device_share(operand)
-        found[("dense", operand, sizes, axis)] = made * (1 if adjacent(at, joined, contracted) else 2)
-        found[("mask", shape, sizes, axis)] = groups * int(math.prod(shape))
-    return found
-
-
-def adjacent(at: int, joined: tuple[int, ...], contracted: Sequence[int]) -> bool:
-    """Whether a dense expansion, its group at `at`, holds the dimensions its product contracts
-    (`contracted`, the operand's, shifted past the group, and the group where it joins them, `joined`)
-    adjacent, as XLA's dot decomposer needs them for a GEMM, which else lays the operand out again
-    (xla/hlo/transforms/expanders/dot_decomposer.cc's canonical form)."""
-    positions = sorted([axis + (axis >= at) for axis in contracted] + list(joined))
-    return positions == list(range(positions[0], positions[0] + len(positions)))
+        dense.append((equation.invars[1], other[contracting.index(ragged)]))
+    return {(operand, sizes, axis): groups * device_share(operand)
+            for operand, axis in dense if computed(operand)}
 
 
 def emitted_algorithm(equation: jcore.JaxprEqn) -> bool:
@@ -506,4 +501,5 @@ def candidate_footprint[LossT, EffectsT](objective: Objective[LossT, EffectsT],
     resident = {name: device_bytes(value) for name, value in {
         "variables": prepared.variables, "optimizer": prepared.opt_state, "ema": prepared.ema,
         "accumulation": prepared.accumulation, "compute": prepared.compute}.items()}
-    return Footprint(residuals, device_bytes(prepared.variables["params"]), held, resident, peak)
+    return Footprint(residuals, device_bytes(prepared.variables["params"]), held, resident,
+                     None if peak is None else peak.bytes, peak is None or peak.exact)

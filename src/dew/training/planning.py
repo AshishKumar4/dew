@@ -770,11 +770,16 @@ class FitSearch[LossT, EffectsT]:
             candidate.footprint, local_devices(self.mesh), self.capacity, candidate.built)
         probe = dataclasses.replace(probe, ahead=taken, compile_seconds=seconds, derived_headroom=judged)
         if judged is not None and (judged >= 0) != fit:
-            _log.warning("a model miss: the derivation judged %s %s with %d bytes to spare, and its "
-                         "compile %s with %s (derived terms %s); the compile decides, and the derivation "
-                         "is to fix",
+            # A derived peak bounded from below (`Footprint.exact`) admits provisionally: its miss names
+            # the need the compile found, which a sourced rule is to reach.
+            footprint = candidate.footprint
+            _log.warning("a model miss: the derivation judged %s %s with %d bytes to spare%s, and its "
+                         "compile %s with %s, its temporaries %d bytes against a derived peak of %s "
+                         "(derived terms %s); the compile decides, and the derivation is to fix",
                          probe.named(), "fits" if judged >= 0 else "does not fit", judged,
-                         "fits" if fit else "does not fit", headroom,
+                         "" if footprint is None or footprint.exact else " (its peak a bound from below)",
+                         "fits" if fit else "does not fit", headroom, probe.temp,
+                         None if footprint is None else footprint.peak,
                          None if probe.derived is None else probe.derived.record())
         return options, candidate, executable, probe
 
