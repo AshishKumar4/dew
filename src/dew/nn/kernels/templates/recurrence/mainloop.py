@@ -37,11 +37,10 @@ dtype, the memory fp32 across chunks. An fp32 call keeps them fp32; as the tenso
 alone (mma.sync's), an fp32 operand is three bf16 parts summing to it exactly (`product.formed`) and its
 product the six of the parts' whose orders sum under three, an fp32 product's accuracy.
 
-The fast backward's launches and the plan of a call's launches, forward and backward, are `backward`'s, on
-this module's machinery. Decode is not on the mainloop: a one-token step takes `recurrence.step` (row 1424
-for its Mosaic form)."""
+The fast backward's launches and the plan of a call's launches, forward and backward, are
+`mainloop_backward`'s, on this module's machinery. Decode is not on the mainloop: a one-token step takes
+`recurrence.step` (row 1424 for its Mosaic form)."""
 
-import contextlib
 import contextvars
 import dataclasses
 import functools
@@ -455,13 +454,13 @@ def _fragments(call: _Call, *tiles) -> list:
 
 @dataclasses.dataclass(frozen=True)
 class Launch:
-    """A launch as planned (`backward.planned`): its name (`recurrence_states`, ...), its programs and each
-    one's threads (its bundle's warpgroups, `Family.warpgroups`), the shared memory a program allocates (its
-    streams' slots and barriers and its staging tiles, as its bundle declares them), the registers a consumer
-    thread holds at its program's peak (`resources.live_registers` of the tiles it states), its steps, the
-    chunks in flight, the bytes a step streams in, a program's tensor FLOPs and exponentials, the bytes it
-    reads and writes in global memory, the programs a multiprocessor holds of it at once
-    (`resources.plan`), its consumer roles, and the bundle it issues by (`family`: the call's, or the
+    """A launch as planned (`mainloop_backward.planned`): its name (`recurrence_states`, ...), its programs
+    and each one's threads (its bundle's warpgroups, `Family.warpgroups`), the shared memory a program
+    allocates (its streams' slots and barriers and its staging tiles, as its bundle declares them), the
+    registers a consumer thread holds at its program's peak (`resources.live_registers` of the tiles it
+    states), its steps, the chunks in flight, the bytes a step streams in, a program's tensor FLOPs and
+    exponentials, the bytes it reads and writes in global memory, the programs a multiprocessor holds of it at
+    once (`resources.plan`), its consumer roles, and the bundle it issues by (`family`: the call's, or the
     layout a launch takes for itself, `_solving`), which every check of it reads."""
 
     name: str
@@ -481,7 +480,7 @@ class Launch:
 
 
 _PLANNED: contextvars.ContextVar[list | None] = contextvars.ContextVar("planned", default=None)
-"""Where `backward.planned` collects its launches; None where they run."""
+"""Where `mainloop_backward.planned` collects its launches; None where they run."""
 
 
 STATIC = ("call", "tiles", "scale", "keeps", "out_dtype")
@@ -492,7 +491,7 @@ and its constants; its every other argument an array or None."""
 _lowered_once = tuning.lowered_once(STATIC, unless=lambda: _PLANNED.get() is not None)
 """A launch lowered once a configuration (`tuning.lowered_once`): a launch's program closes over its call,
 so each call traced its own and a hybrid model's step lowered its layers' identical kernels one by one.
-Planning (`backward.planned`) traces every call, each launch recording itself (`_kernel`)."""
+Planning (`mainloop_backward.planned`) traces every call, each launch recording itself (`_kernel`)."""
 
 
 def _scope(*allocations, reduces: bool = True, after: tuple = ()) -> resources.Scope:
@@ -601,7 +600,8 @@ def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, s
     allocations (of `blocks`, `stages` deep, and of `once`'s blocks, loaded once, one deep; `Family.opened`
     takes them with their views), its staging tiles and its stores' (`landing`, `_landed`) scoped, named for
     its launch (`recurrence_solved`, ...). `held` is what a consumer thread holds in registers (`_Held`).
-    Where `backward.planned` collects launches, the launch's record instead (`Launch`, its `work`), and zeros.
+    Where `mainloop_backward.planned` collects launches, the launch's record instead (`Launch`, its `work`),
+    and zeros.
 
     A `persistent` launch runs `grid`'s tiles on as many programs as the device's multiprocessors hold at
     once, its streams' rings running on across them (`_planned_launch`); its program gives its tile's walk
@@ -1639,8 +1639,8 @@ def forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts=None
     memory fp32. Without the `delta` rule nothing is corrected and each token writes its values gated by
     `beta` (the identity inverse: Mamba2's SSD through its rated decay's log gates, the gated linear
     attentions, GLA's with a decay a key dimension). Keys and values padded to whole blocks (`block_of`), at
-    any width whose launches the device holds (the template's legality, `backward.planned`'s shared memory and
-    registers a launch). Its states and output launches take `tiles` (the template's config,
+    any width whose launches the device holds (the template's legality, `mainloop_backward.planned`'s shared
+    memory and registers a launch). Its states and output launches take `tiles` (the template's config,
     `templates.recurrence.template`), and its launches issue by `family`'s bundle (the device's, `family_of`,
     where None), interpreted where `interpret`. A decay a key dimension takes the layer's declared `floor`
     (`per_key_refusal`). A `rounded` call without the delta rule (Mamba2's SSD, whose 16-bit numbers are
@@ -1660,10 +1660,10 @@ def kept_forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts
                  floor: float | None = None, keeps: bool = True,
                  rounded: bool = False) -> tuple[jax.Array, jax.Array, tuple]:
     """`forward`'s `(o, final)` and what the fast backward takes rather than compute again
-    (`backward.gradients`' `inverse` and `kept`): each chunk's inverse under a decay a head (`_solved`'s,
-    None otherwise or where the call `keeps` none, `forward`'s), as fla's backward keeps its `A`, and the
-    launches' weighted keys, memories and corrected values, `(w, h, corrected)`, which the port keeps unless a
-    remat rung recomputes them (`recurrence_chunk.RECOMPUTED`), the caller's choice."""
+    (`mainloop_backward.gradients`' `inverse` and `kept`): each chunk's inverse under a decay a head
+    (`_solved`'s, None otherwise or where the call `keeps` none, `forward`'s), as fla's backward keeps its
+    `A`, and the launches' weighted keys, memories and corrected values, `(w, h, corrected)`, which the port
+    keeps unless a remat rung recomputes them (`recurrence_chunk.RECOMPUTED`), the caller's choice."""
     run = _prepared(q, k, v, g, beta, h0, starts=starts, max_segments=max_segments, scale=scale, delta=delta,
                     tiles=tiles, family=family, interpret=interpret, floor=floor, keeps=keeps, firsts=firsts,
                     rounded=rounded)

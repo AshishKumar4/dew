@@ -33,7 +33,7 @@ from dew.nn.kernels.recurrence_chunk import Chunk, mosaic_rule
 from dew.nn.kernels.selection import KernelRefused
 from dew.nn.kernels.templates import bundles, mosaic, product, report, resources
 from dew.nn.kernels.templates.base import Unfitted
-from dew.nn.kernels.templates.recurrence import backward, mainloop, template
+from dew.nn.kernels.templates.recurrence import mainloop, mainloop_backward, template
 
 pytestmark = pytest.mark.kernel
 
@@ -220,7 +220,8 @@ def on_the_mainloop(hooks: recurrence.Hooks, case: str, dtype):
                   for x in (operands.query, operands.key, operands.value, operands.log_decay, operands.beta,
                             operands.state, operands.starts)]
         *given, starts = shapes
-        launches = backward.planned(*given, tiles=narrowest, family=family, starts=starts, floor=hooks.floor)
+        launches = mainloop_backward.planned(*given, tiles=narrowest, family=family, starts=starts,
+                                             floor=hooks.floor)
         if max(launch.shared for launch in launches) > generation.shared_budget(template.Mosaic.launched()):
             return None
 
@@ -264,12 +265,12 @@ memory a block, 16 multiprocessors, its clock and its memory's bandwidth, as its
 def test_an_unseen_gpus_facts_derive_the_templates_tiles_as_exact_as_its_reference(dtype):
     """The recurrence template on a GPU no row names (`UNSEEN`): its facts and its family's bundle's
     (mma.sync's) alone derive the call's tiles (`template.Mosaic.derived`): every launch's shared memory as
-    the bundle declares it within a block of it (`backward.planned`), with two chunks in flight unless two
-    are past it or leave a multiprocessor fewer of the states launch's programs (`Mosaic.states_held`); at
-    those tiles the forward, on the bundle interpreted, is on par from float64 with its reference's (check 1,
-    as `test_the_mosaic_forward_is_as_exact_as_its_reference`'s). Its variants, which
-    the opt-in tuner times (`Mosaic.variants`), lead with those tiles, each legal there and on par too. An
-    fp32 call it refuses: a launch's registers at its narrowest tiles pass a thread's (the fp32 solve's
+    the bundle declares it within a block of it (`mainloop_backward.planned`), with two chunks in flight
+    unless two are past it or leave a multiprocessor fewer of the states launch's programs
+    (`Mosaic.states_held`); at those tiles the forward, on the bundle interpreted, is on par from float64 with
+    its reference's (check 1, as `test_the_mosaic_forward_is_as_exact_as_its_reference`'s). Its variants,
+    which the opt-in tuner times (`Mosaic.variants`), lead with those tiles, each legal there and on par too.
+    An fp32 call it refuses: a launch's registers at its narrowest tiles pass a thread's (the fp32 solve's
     merges hold the inverse's three parts)."""
     assert generation.family(UNSEEN.generation) == 'mma.sync'
     case = 'one sequence'
@@ -621,7 +622,7 @@ def compiled_cases(target: str, plans: dict, refused: list, only: tuple | None =
     forward, at each of their variants; beside them the tiles the derivation takes where every register held
     (`Template._held`) and refused for registers alone, and the fast backward its launches' registers refuse,
     so a model over ptxas's need fails as one under it does. Each case's plan by its label into `plans`
-    (`backward.planned`), each call the template refuses into `refused`."""
+    (`mainloop_backward.planned`), each call the template refuses into `refused`."""
     from fla_gdn_support import KernelCase
 
     family, facts = bundles.of(target, jnp.bfloat16), generation.gpu_target(target)
@@ -661,11 +662,11 @@ def compiled_cases(target: str, plans: dict, refused: list, only: tuple | None =
             if variants:
                 return [case(name, dtype, args, starts, bound, tiles, training=training, packed=packed,
                              kind='') for tiles in tiled[1:]]
-            if training and not backward.backward_holds(
+            if training and not mainloop_backward.backward_holds(
                     *args, tiles=derived, family=family, shared=shared, starts=starts,
                     max_segments=8 if packed else None):
-                # The rule's gradient is the port's or the portable math's where the fast backward's
-                # launches do not hold (`backward.backward_holds`); where only their registers refuse them,
+                # The rule's gradient is the port's or the portable math's where the fast backward's launches
+                # do not hold (`mainloop_backward.backward_holds`); where only their registers refuse them,
                 # the gate compiles them, held to ptxas's need.
                 refused.append(f"{name} {jnp.dtype(dtype).name} fast backward{' packed' if packed else ''}")
                 launches = template.MOSAIC._launches(bound, derived, facts, backward=True)
@@ -703,7 +704,7 @@ def compiled_cases(target: str, plans: dict, refused: list, only: tuple | None =
             if training:
                 given += [array(rows, length, value_heads, value_width),
                           array(rows, value_heads, key_width, value_width, kind=jnp.float32)]
-            run = (backward.gradients if training
+            run = (mainloop_backward.gradients if training
                    else functools.partial(mainloop.forward, floor=FLOOR if per_key else None))
 
             def fn(*operands):
@@ -722,9 +723,9 @@ def compiled_cases(target: str, plans: dict, refused: list, only: tuple | None =
 
 
 def planned_failures(found: list, plans: dict) -> list[str]:
-    """Each compiled kernel past its plan's shared memory (`backward.planned`'s launch of its name, from
-    which the tiles are derived): the recurrence's shared-memory model, beside the register model the shared
-    gate holds to ptxas (`kernel_compile.mosaic_failures`)."""
+    """Each compiled kernel past its plan's shared memory (`mainloop_backward.planned`'s launch of its name,
+    from which the tiles are derived): the recurrence's shared-memory model, beside the register model the
+    shared gate holds to ptxas (`kernel_compile.mosaic_failures`)."""
     def planned(record: dict, kernel: dict) -> int:
         return max((launch.shared for launch in plans[record['name']]
                     if kernel['kernel'].startswith(launch.name)), default=0)
@@ -750,15 +751,15 @@ def _gated(target: str, group: tuple):
 def test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides(target, group):
     """The mainloop's launches (`compiled_cases`), compiled by Mosaic for a compile-only A100 and H100 on this
     CPU (tests/kernel_compile.py): every launch compiles within the multiprocessor's shared memory (163 KB,
-    227 KB) and tensor memory and at most its plan's shared memory (`backward.planned`, from which the tiles
-    are derived, `planned_failures`), no launch the template's legality holds spills a register (a refused
-    tile's compiled as the model's evidence, `KernelCase.required`), and each launch's register model decides
-    as ptxas's need does, admitting a tile or refusing it (row 1971, `kernel_compile.mosaic_failures`).
-    Lowering alone takes no device's budget: a launch past an A100's shared memory lowered and failed on the
-    GPU (the fast backward's readout's third staging tile). The gated delta rule's 16-bit call, the production
-    cell, derives tiles on every family. A GPU host's ptxas builds for its own GPU and those before it, not a
-    newer one's (an A100's refuses sm_90a), so there the newer targets are the CPU suite's alone. A test a
-    group of cases (`GATE_GROUPS`)."""
+    227 KB) and tensor memory and at most its plan's shared memory (`mainloop_backward.planned`, from which
+    the tiles are derived, `planned_failures`), no launch the template's legality holds spills a register (a
+    refused tile's compiled as the model's evidence, `KernelCase.required`), and each launch's register model
+    decides as ptxas's need does, admitting a tile or refusing it (row 1971,
+    `kernel_compile.mosaic_failures`). Lowering alone takes no device's budget: a launch past an A100's shared
+    memory lowered and failed on the GPU (the fast backward's readout's third staging tile). The gated delta
+    rule's 16-bit call, the production cell, derives tiles on every family. A GPU host's ptxas builds for its
+    own GPU and those before it, not a newer one's (an A100's refuses sm_90a), so there the newer targets are
+    the CPU suite's alone. A test a group of cases (`GATE_GROUPS`)."""
     if jax.default_backend() == 'gpu':
         local = generation.capability(generation.device_generation())
         if local is not None and local < generation.capability(target):
