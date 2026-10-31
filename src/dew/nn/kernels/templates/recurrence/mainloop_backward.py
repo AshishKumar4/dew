@@ -376,9 +376,10 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: _Call, t
                 functools.partial(block, "queries", given), out.value(), local, gate, low, ending,
                 ending_low, scale, held.dtype, issue)
             if not call.delta:
-                values = _tile(slots, "values", given, columns=columns).value().astype(jnp.float32)
-                gated_ref[0].at[column // bv, h, span][...] = jnp.sum(dv * values, axis=1)
-                dv = dv * family.rows_of(beta_ref.at[h, span])[:, None]
+                dv, beta_grad = algebra.gated_values_back(
+                    dv, _tile(slots, "values", given, columns=columns).value().astype(jnp.float32),
+                    family.rows_of(beta_ref.at[h, span]))
+                gated_ref[0].at[column // bv, h, span][...] = beta_grad
             before_store()
             grads.store(dv_ref, dv, n * CHUNK, CHUNK, h * value_width + column, bv, family=family,
                         smem=lands["corrected"], wait=False)
