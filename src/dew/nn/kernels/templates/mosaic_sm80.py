@@ -405,11 +405,14 @@ class Mma(mosaic.Family):
         if interpret:
             # mma has no rule on a CPU: its sum, in fp32.
             return acc + jnp.dot(lhs[...], rhs[...], preferred_element_type=jnp.float32)
-        # Each operand loads only the fragments the next instructions consume: a depth slice of its stage
-        # as narrow as its staging allows (a swizzled axis a whole swizzle tile, `_depth_granule`), each
-        # operand at its own; a register operand (an accumulator's value) is cast once and sliced.
+        # The left operand loads a whole swizzle tile of its depth at a time (`lhs_fragment_depth`), as a
+        # transposed left operand loaded in instruction slices took the A100's kernel gradient 7% slower
+        # (FS-DENSE-AB1); the right loads only the fragments the next instructions consume, as narrow as
+        # its staging allows (`_depth_granule`), which took its input gradient 12% faster. A register operand
+        # (an accumulator's value) is cast once and sliced.
         instruction = self.fragment_depth(int(rhs.shape[0]))
-        lhs_depth, rhs_depth = _depth_granule(lhs, 1, instruction), _depth_granule(rhs, 0, instruction)
+        lhs_depth = max(_depth_granule(lhs, 1, instruction), self.lhs_fragment_depth(int(lhs.shape[1])))
+        rhs_depth = _depth_granule(rhs, 0, instruction)
         held = self._left(lhs) if isinstance(lhs, jax.Array) else None
         lefts: dict[int, jax.Array] = {}
         rights: dict[int, jax.Array] = {}
