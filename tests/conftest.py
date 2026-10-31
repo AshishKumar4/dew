@@ -61,6 +61,27 @@ def bundle(node) -> str:
                                os.environ.get("PYTEST_XDIST_WORKER"))
 
 
+def _selection() -> str:
+    """CI's selection of tests (tools/armada/session.py's `SELECTION`), read from the module the plan and
+    every task share, which needs the standard library alone."""
+    import importlib.util
+
+    path = Path(__file__).resolve().parents[1] / "tools" / "armada" / "session.py"
+    spec = importlib.util.spec_from_file_location("ci_session", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.SELECTION[1]
+
+
+def pytest_configure(config):
+    """A run that names no marks (`-m`) selects as CI does: the network-marked tests, which reach the Hub and
+    a GPU node's memory and run on the network lane (`ci.py gpu-lane --network`), set aside, counted as
+    deselected. So a plain `pytest tests/test_x.py`, or an armada map of it, grades what CI grades, never a
+    real checkpoint's download on a container's disk (gpt-oss-20b's filled one, 2026-10-31)."""
+    if not config.option.markexpr:
+        config.option.markexpr = _selection()
+
+
 def pytest_collectstart(collector):
     if _remote is not None and isinstance(collector, pytest.Module):
         _remote.opened(bundle(collector))
