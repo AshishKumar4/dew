@@ -233,19 +233,31 @@ def released_run(name_or_dir: str | Path, *, step: int | str | None = None, ema:
     lacking = any(from_every_process(not release.is_dir()))
     if not lacking:
         return release
-    # Every process restores and writes, the pool reading its tensors home together. Where the pool
-    # shares the cache and every process asks for the one release, the first publishes it and the others
-    # read every tensor as it does, writing only the release's small files, to a directory discarded;
-    # elsewhere each publishes its own, and one that holds it already keeps it (`staged`). A key reads
-    # each host's own checkpoint files (`_fingerprint`), which copies of one checkpoint on several hosts
-    # may stamp apart.
-    shared = (jax.process_count() > 1 and len(set(from_every_process(release.name))) == 1
-              and all(seen_by_every_process(str(release.parent))))
+    # One that holds the release already keeps it (`staged`). A key reads each host's own checkpoint
+    # files (`_fingerprint`), which copies of one checkpoint on several hosts may stamp apart, so a pool
+    # shares a release only where every process asks for the one.
+    pooled_export(run, release, ema=ema, mesh=mesh, layout=layout, staging=True)
+    return release
+
+
+def pooled_export(run: SavedRun, destination: Path, *, ema: bool | None = None,
+                  mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
+                  staging: bool = False) -> None:
+    """Write `run`'s release to `destination` from every process of a pool, or from one (`export_run`):
+    every process restores and writes, the pool reading its tensors home together. Where the pool shares
+    the destination, every process naming the one and seeing one directory, the first publishes it and
+    the others read every tensor as it does, writing only the release's small files, to a directory
+    discarded; elsewhere each publishes its own. A `staging` export publishes through `staged`, which
+    keeps a release written already; another writes in place, as `dew export` does. Every process
+    returns once the release is published (ledgers 2874, 2992)."""
+    shared = (jax.process_count() > 1 and len(set(from_every_process(destination.name))) == 1
+              and all(seen_by_every_process(str(destination.parent))))
     if shared and jax.process_index() != 0:
         with tempfile.TemporaryDirectory() as discarded:
             export_run(run, discarded, ema=ema, mesh=mesh, layout=layout, publishes=False)
+    elif staging:
+        with staged(destination) as staged_at:
+            export_run(run, staged_at, ema=ema, mesh=mesh, layout=layout)
     else:
-        with staged(release) as destination:
-            export_run(run, destination, ema=ema, mesh=mesh, layout=layout)
+        export_run(run, destination, ema=ema, mesh=mesh, layout=layout)
     from_every_process(None)  # every process reads the release once it is published
-    return release

@@ -978,16 +978,17 @@ class Trainer(Generic[Loss, Effects]):
         return self._runner(planned.released(), self.device_mesh)
 
     @ruled
-    def _compiled_plan(self, state: TrainState, batch: Batch, trials: Trials | None,
-              capacity: int | None) -> Planned:
-        """The shared device-step planner: its record and chosen rung. The caller reads its lowering
-        before releasing it (`compile`) or serializing its executable (`compile_ahead`)."""
+    def _compiled_plan(self, state: TrainState, batch: Batch, trials: Trials | None, capacity: int | None,
+                       frontier: bool = False) -> Planned:
+        """The shared device-step planner: its record and chosen rung, with `frontier` every rung above it
+        that fits too (`FitSearch.frontier`). The caller reads its lowering before releasing it (`compile`)
+        or serializing its executable (`compile_ahead`)."""
         mesh = self.device_mesh
         links = self._links(mesh)
         shaped = self._at_base_rung(batch)
         resumed, self._resumed_rung = self._resumed_rung if shaped is None else shaped, None
         with self._traced_on(mesh, links) as schedule:
-            planned, flops = self._planned(state, batch, mesh, schedule, resumed, trials, capacity)
+            planned, flops = self._planned(state, batch, mesh, schedule, resumed, trials, capacity, frontier)
             split, candidate, self.executable = planned.split, planned.candidate, planned.executable
             self._split = split
             self._shape_rungs[batch_layout(batch)] = self._rung()
@@ -1049,13 +1050,13 @@ class Trainer(Generic[Loss, Effects]):
         return run
 
     def _planned(self, state: TrainState, batch: Batch, mesh: Mesh, schedule: Schedule, resumed: JSON,
-                 trials: Trials | None, capacity: int | None) -> tuple[Planned, StepFlops | None]:
-        """The plan `compile` reads `batch` in (`FitSearch`), from the run's splits (`splits`), the
-        first that fits, guided under AutoPGLE (`Planned.guided`), with `plan` its record and the
-        objective at its rung, and a microbatch's
-        FLOPs (`plan_flops`). A plan recorded beside the compilation cache (`recorded_rung`) is the first
-        candidate, kept untimed; `resumed` is a checkpoint's rung; `capacity` the bytes a device that
-        states none holds (`FitSearch.capacity`)."""
+                 trials: Trials | None, capacity: int | None,
+                 frontier: bool) -> tuple[Planned, StepFlops | None]:
+        """The plan `compile` reads `batch` in (`FitSearch`), from the run's splits (`splits`), the first that
+        fits, guided under AutoPGLE (`Planned.guided`), with `plan` its record and the objective at its rung,
+        and a microbatch's FLOPs (`plan_flops`). A plan recorded beside the compilation cache
+        (`recorded_rung`) is the first candidate, kept untimed; `resumed` is a checkpoint's rung; `capacity`
+        the bytes a device that states none holds (`FitSearch.capacity`); `frontier` asks every rung above."""
         replicated = NamedSharding(mesh, P())
         placement = batch_shardings(mesh, batch)
         candidates = splits(self._rows, batch, mesh, self.microbatches, self._split)
@@ -1081,7 +1082,8 @@ class Trainer(Generic[Loss, Effects]):
                                                   candidate.prepared.variables, mesh),
             self.objective, mesh, self._xla_defaults, self._narrow, None if self._base_rung is None
             else self._base_rung[1], resumed, ahead=self._ahead, capacity=capacity,
-            derive=None if recorded is not None else functools.partial(lower, lowering=False))
+            derive=None if recorded is not None else functools.partial(lower, lowering=False),
+            frontier=[] if frontier else None)
         planned, probes = search.admitted(
             candidates, candidates.index(first) if isinstance(first, int) and first in candidates else 0)
         # Consume the artifact only after its program was accepted; a refusal leaves it pending.
@@ -1337,10 +1339,9 @@ class Trainer(Generic[Loss, Effects]):
         Previews are generated only when `preview=True` and a tracker receives them; scalar reporting never
         triggers preview work. `scored_to`, a directory, takes every validation batch's scoring artifacts at
         each evaluation, `<scored_to>/step-<step>/<split>-<batch>.npz` (`Evaluation.run`), a cooldown
-        branch's under `cooldown/` there. `observe` takes
-        values of the state at a cadence of its own while the run trains (`Observe`). `device_prefetch`
-        training batches are placed on the devices ahead of the step, which the step's memory plan holds
-        room for. The process is readied first
+        branch's under `cooldown/` there. `observe` takes values of the state at a cadence of its own while
+        the run trains (`Observe`). `device_prefetch` training batches are placed on the devices ahead of
+        the step, which the step's memory plan holds room for. The process is readied first
         (`dew.training.runtime.ready_process`), as `prepare_process` readies it: a program that never called
         that gets Dew's log handler, and one whose JAX opened on the CPU beside an NVIDIA GPU stops.
         """
@@ -2189,15 +2190,12 @@ class Trainer(Generic[Loss, Effects]):
     def _counted_batch(self, batch: Batch) -> Batch:
         """Prepare host counts before placement, never fetch a device batch to count it.
 
-        The count is the capability: from the first batch whose work the
-        model or objective cannot declare (`MissingFlopsCount`, as a media
-        row's tower), this process counts no more, says why in the debug
-        log, and trains on. Its batches keep their work
-        columns, as unknown work (`uncounted`), so every process runs one
-        step program and the step's global sum leaves train/mfu unreported
-        pool-wide. One thread prepares batches, the prefetch worker or a
-        rollout's caller, and only it writes the reason. A count asked of the
-        objective directly stays strict.
+        The count is the capability: from the first batch whose work the model or objective cannot declare
+        (`MissingFlopsCount`, as a media row's tower), this process counts no more, says why in the debug
+        log, and trains on. Its batches keep their work columns, as unknown work (`uncounted`), so every
+        process runs one step program and the step's global sum leaves train/mfu unreported pool-wide. One
+        thread prepares batches, the prefetch worker or a rollout's caller, and only it writes the reason.
+        A count asked of the objective directly stays strict.
         """
         batch = consumption_counted(batch, clocked=self._examples is not None)
         if self._refusal is None:
