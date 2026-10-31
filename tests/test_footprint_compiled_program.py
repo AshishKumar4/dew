@@ -379,12 +379,23 @@ def one_start_twice(rows):
     return jax.lax.scan(turn, (product, product.reshape(-1)), None, length=4)[1]
 
 
+def nested_carry(rows):
+    """A scan whose body runs a scan over its carry, returning the inner scan's result as its own."""
+    def turn(carried, _):
+        inner = jax.lax.scan(lambda value, _: (jnp.tanh(value), None), carried, None, length=2)[0]
+        return inner, jnp.sum(inner)
+
+    return jax.lax.scan(turn, rows, None, length=2)[1]
+
+
 CARRIES = {
     # The 16 MiB buffer, held once from its zeros to its result.
     "scan": (updated_buffer("scan"), 4096 * 1024 * 4),
     "while": (updated_buffer("while"), 4096 * 1024 * 4),
     # The carry's own buffer, a copy of the input it starts from, though its result is discarded.
     "discarded": (discarded_carry, 64 * 1024 * 4),
+    # One buffer, the outer carry's, which the inner scan's start and result are too.
+    "nested": (nested_carry, 64 * 1024 * 4),
     # Two 4 MiB buffers, one carry's each, though both start from one.
     "one-start-twice": (one_start_twice, 2 * 1024 * 1024 * 4),
 }
