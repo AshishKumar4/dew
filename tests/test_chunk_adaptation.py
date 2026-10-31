@@ -582,8 +582,9 @@ def test_each_windows_gradient_from_its_level_is_the_literal_loops(kind):
                 return jnp.sum(weights * scores(variables, hidden[None], targets[None], weights[None],
                                                 fields)[0])
             return with_gradients(loss)(variables, hidden, jnp.ones((), hidden.dtype))
-        # Each example a draw of windows (`stacked_windows`), each window a row of it.
-        return jax.jit(jax.vmap(jax.vmap(one)))
+        # Each example a draw of windows (`stacked_windows`), each window a row of it; the draws one at a
+        # time, so one draw's intermediates are held at once, as one draw's were before they were stacked.
+        return jax.jit(lambda *drawn: jax.lax.map(lambda example: jax.vmap(one)(*example), drawn))
 
     def dew(variables, hidden, targets, weights, fields):
         return adapted_scores(MODEL, variables, hidden, targets, weights, fields, adaptation, predict=False,
