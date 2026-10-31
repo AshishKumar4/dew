@@ -54,9 +54,11 @@ class Inspection:
     every: int = 100
     modules: tuple[str, ...] = ()
     """Modules whose outputs a sampled step summarizes, by a glob of their class name (`*Attention`, `MLP`)
-    or their path (`layers_3/*`): each call's output, its first array where it returns several, one
-    summary a layer in a scanned stack (`dew.nn.inspection.watching`), logged as
-    `inspect/activations/<module path>/<statistic>`."""
+    or their path as their call runs it (`layers_3/*`; a pipeline stage's layers by their place in the
+    stage, `stages/layers_0/*`): each call's output, its first array where it returns several, over the
+    objective's real positions (`Objective.watched_positions`), one summary a layer in a scanned stack and
+    one a microbatch in a pipelined one (`dew.nn.inspection.watching`), logged as
+    `inspect/activations/<module path>/<statistic>`, a pipelined layer by its place in the stack."""
     histogram: bool = False
     """Whether each summary also holds the share of its magnitudes in each decade
     (`dew.nn.inspection.HISTOGRAM_EDGES`), logged one scalar a bin."""
