@@ -55,7 +55,7 @@ def _fused_step(walk: _Backward, resident: tuple, rows_of, staged, coords_of, wh
     dk_acc, dv_acc = accumulators
     q_slot, do_slot = slots["queries"], slots["douts"]
     q_first = index * tiles.block_q
-    coords = coords_of(q_first, queries_read=walk.queries_read(masked))
+    coords = coords_of(q_first, read=walk.places_read(masked=masked))
     narrowed, part = _tile_scores(walk, (q_slot, do_slot), resident, rows_of(q_first), coords, whole(index),
                                   shape, masked=masked)
     family.staged(narrowed, staged.at[0])

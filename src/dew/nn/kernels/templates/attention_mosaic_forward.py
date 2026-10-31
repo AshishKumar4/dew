@@ -66,7 +66,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     extents,
     reducing,
     refused,
-    score_reads_queries,
+    score_places,
     stated,
 )
 
@@ -420,9 +420,9 @@ def _scored(program: _Program, spec: algebra.Forward, q, index, slots, first, sp
     k_first = index * tiles.block_k
     # The tile's places formed a step, not held across the walk beside its sums (`_coords`).
     # Its mask chosen at run time (`whole`): the masked tile's reads.
-    reads = algebra.reads_query_places(spec, masked=True, positional=score_reads_queries(hooks),
-                                       dropped=hooked.drop is not None)
-    coords = _coords(family, spans, row, first, k_first, shape, queries_read=reads,
+    read = algebra.places_read(spec, masked=True, hooked=score_places(hooks), dropped=hooked.drop is not None,
+                               padded=spec.keys % tiles.block_k != 0)
+    coords = _coords(family, spans, row, first, k_first, shape, read=read,
                      draw=None if hooked.drop is None else hooked.drop.draw(row, head))
     params = tuple(_param(family, ref, param.kind, row, head, first, s, k_first)
                    for ref, param in zip(hooked.score, hooks.score_params, strict=True))

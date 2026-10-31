@@ -44,16 +44,17 @@ class _Backward:
     approx_math: bool
     """Whether its launches take the hardware's approximate transcendentals (`approximate`): never in the
     accurate form."""
-    positional: bool
-    """Whether its score hook reads its queries' places (`score_reads_queries`)."""
+    hooked: tuple[bool, bool]
+    """Whether its score hook reads its queries' places and its keys' (`score_places`)."""
     dropped: bool
     """Whether the call drops entries (a `Dropout`)."""
 
-    def queries_read(self, masked: bool | None = None) -> bool:
-        """Whether a step reads its queries' places (`algebra.reads_query_places`), `masked` or not, or
-        either (None: chosen at run time, or every entry's visibility read)."""
-        return algebra.reads_query_places(self.spec, masked=masked is not False, positional=self.positional,
-                                          dropped=self.dropped)
+    def places_read(self, *, masked: bool | None = None) -> tuple[bool, bool]:
+        """Whether a step surely reads its queries' places and its keys' (`algebra.places_read`), `masked` or
+        not, or either (None: chosen at run time, or every entry's visibility read)."""
+        return algebra.places_read(self.spec, masked=masked is not False, hooked=self.hooked,
+                                   dropped=self.dropped,
+                                   padded=self.spec.keys % self.program.tiles.block_k != 0)
 
     @property
     def how(self) -> algebra.Recompute:

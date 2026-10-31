@@ -123,7 +123,7 @@ def _dkv_step(walk: _Backward, resident: tuple, rows_of, coords_of, params_of, s
     # Every tile masked, its queries' statistics read past its products: a tile chosen masked or whole at
     # run time joins both choices' tiles and its column statistics, 16 registers each, past a consumer's
     # (spilled 1184 bytes at 64 x 64, one consumer).
-    coords = coords_of(q_first, shape=shape)
+    coords = coords_of(q_first, shape=shape, read=walk.places_read(masked=True))
     exponentials, weights, cotangents, slopes, seen = _scores(
         walk, coords, params, s, dp, *rows_of(q_first, count), masked=True)
     logits, pieces = algebra.pulled(cotangents, slopes, seen, kinds, KEY_ROWS)
