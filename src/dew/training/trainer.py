@@ -1144,7 +1144,8 @@ class Trainer(Generic[Loss, Effects]):
             # The tuner is off (bible §6): each launch takes its derived config, nothing settled or read.
             lowered, launches = lower() if lowering else None, launches or "[]"
         footprint = None if self.step is not None or mesh is not None else candidate_footprint(
-            self.objective, self._model_shapes(micro), split * self.accumulation, prepared, held)
+            self.objective, self._model_shapes(micro), split * self.accumulation, prepared, held,
+            self.device_mesh.devices.flat[0])
         # The sampled step lowers as the step does, over the same arguments, for the same platforms.
         watched = None if self.inspection is None else self._jitted(shapes, copies, shardings, placement,
                                                                     replicated, split, sampled=True)
@@ -1404,9 +1405,8 @@ class Trainer(Generic[Loss, Effects]):
             metrics=metrics, preview=preview and self.tracker is not None, best=selection, stop=plateau,
             suites=suites, pause=pause, scored_to=None if scored_to is None else os.fspath(scored_to),
             held_best=restore_best and self.checkpoints is None, observe=observe, summaries=tuple(summaries),
-            declared=declared,
-            branches=() if cooldowns is None else cooldowns.branches(steps, tokens, self.accumulation,
-                                                                     self._examples),
+            declared=declared, branches=() if cooldowns is None else cooldowns.branches(
+                steps, tokens, self.accumulation, self._examples),
         )
 
     def scheduled(self, updates: int | None) -> None:
@@ -1490,7 +1490,7 @@ class Trainer(Generic[Loss, Effects]):
                 with region("train.step"):
                     state, loss, aux, finite, accepted, committed = train_step(
                         state, device, sampled=self.inspection is not None and self.inspection.samples(
-                            run.current + 1))
+                            run.current + 1, self.accumulation))
                 # Written off the loop, which never waits on it (row 2313), its clock the step it sees done.
                 interval.seen()
                 self._read_taken(run, wait=False)
@@ -1578,8 +1578,7 @@ class Trainer(Generic[Loss, Effects]):
         under "never" into a directory that holds no run either. An objective that names its input field
         alone declares it first (`_declare_input`)."""
         checkpoints = self.checkpoints
-        if self.objective.named_inputs is not None and self.objective.inputs is None:
-            self._declare_input(self.objective.named_inputs, dataset)
+        self._declare_input(lambda: first_batch(dataset, self.device_mesh))
         if resume == "require" and (checkpoints is None or initial is not None):
             raise ValueError("resume='require' continues the checkpointer's latest checkpoint, which a "
                              "trainer with no checkpointer, or a run given its state=, starts without")
@@ -1605,18 +1604,19 @@ class Trainer(Generic[Loss, Effects]):
         return (start.resume, checkpoints.position(start.resume, DataPartition.of(self.device_mesh)),
                 lambda: self._placed(start, positioned=False)[:2], start.abstract)
 
-    def _declare_input(self, named: str, dataset: Loader) -> None:
-        """Declare the objective's input `named` (`Objective.named_inputs`) at the per-example shape its
-        model reads (`Field.of`): of `dataset`'s first batch, placed as the run places it and through the
-        loader's device steps (`_model_shapes`), which may crop or resize it, agreed across the pool
-        before anything initializes."""
-        mesh = self.device_mesh
-        first = agreed("training input batch", lambda: first_batch(dataset, mesh))
-        with jax.set_mesh(mesh):
-            device, _ = split_fields(placed_abstract(mesh, first))
+    def _declare_input(self, first: Callable[[], Batch]) -> None:
+        """Declare the objective's input where it names its field alone (`Objective.named_inputs`), at the
+        per-example shape its model reads (`Field.of`) of the run's first batch, `first`'s, placed as the
+        run places it and through the loader's device steps (`_model_shapes`), which may crop or resize
+        it, agreed across the pool before anything initializes."""
+        if (named := self.objective.named_inputs) is None or self.objective.inputs is not None:
+            return
+        batch = agreed("training input batch", first)
+        with jax.set_mesh(self.device_mesh):
+            device, _ = split_fields(placed_abstract(self.device_mesh, batch))
             shape = Field.of(named, self._model_shapes(device)).shape
-        held = agreed_same("training input shape", lambda: list(shape))
-        self.objective.inputs = InputSpec(Field(named, tuple(held)))
+        self.objective.inputs = InputSpec(Field(named, tuple(agreed_same("training input shape",
+                                                                       lambda: list(shape)))))
 
     def _opened(self, plan: FitPlan, run: FitRun, interval: Interval, current: int, position,
                 placed: Callable[[], tuple[TrainState, Placement[TrainState]]],

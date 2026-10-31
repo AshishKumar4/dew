@@ -271,8 +271,7 @@ class LMRunConfig(DecoderRunConfig):
         validation = run.validation_metrics(validates=scored)
         decode = tokenizer_for(written).decode
         rollout = None if self.rollout is None else self.rollout.build(objective, decode)
-        return Prepared(run, lambda name: run.train(objective, loaded, name=name, metrics=validation,
-                                                     validation=held, rollout=rollout))
+        return Prepared(run, objective, loaded, metrics=validation, validation=held, rollout=rollout)
 
     def default_metrics(self, *, validates: bool) -> tuple[MetricConfig, ...]:
         """Perplexity, where the run evaluates a validation split it holds."""

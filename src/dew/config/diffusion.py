@@ -403,8 +403,7 @@ class DiffusionRunConfig(RunConfig):
         rollout = None
         if isinstance(objective, (FlowGRPOObjective, DiffusionNFTObjective)) and run.rollout is not None:
             rollout = run.rollout.build(objective)
-        return Prepared(run, lambda name: run.train(objective, dataset, name=name, metrics=metrics,
-                                                    rollout=rollout, validation=held))
+        return Prepared(run, objective, dataset, metrics=metrics, rollout=rollout, validation=held)
 
     def pinned(self) -> DiffusionRunConfig:
         """Return this run with its Hub sources pinned to the commits they resolve to now: an imported
