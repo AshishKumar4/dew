@@ -179,18 +179,19 @@ def test_a_call_that_runs_none_adds_none_however_often_its_caller_runs():
 
 
 def test_a_kernel_is_named_from_its_location_wherever_the_location_nests_the_name():
-    """A Mosaic GPU call's kernel name (`_lowering._kernel_name`) from its location's name stack wherever the
-    location nests it: its own, a call site's callee's, a fused location's part (a rewrite that merged
-    operations); a location that carries no name gives none, and the report names the call by its hash."""
+    """A Mosaic GPU call's kernel name and launch (`_lowering._kernel_name`) from its location's name stack
+    wherever the location nests it: its own, a call site's callee's, a fused location's part (a rewrite
+    that merged operations); a location that carries no name gives none, and the report names the call by
+    its hash."""
     from jax.extend.mlir import ir
 
     from dew.training import _lowering
 
     with ir.Context():
-        named = ir.Location.name("jit(step)/attention_forward/mpmd_map")
+        named = ir.Location.name("jit(step)/attention_forward__l0123456789/mpmd_map")
         source = ir.Location.file("model.py", 1, 1)
         for location in (named, ir.Location.callsite(named, [source]), ir.Location.fused([source, named])):
-            assert _lowering._kernel_name(location) == "attention_forward"
+            assert _lowering._kernel_name(location) == ("attention_forward", "0123456789")
         assert _lowering._kernel_name(ir.Location.fused([source])) is None
 
 

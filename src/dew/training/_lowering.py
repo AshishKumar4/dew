@@ -50,14 +50,16 @@ class KernelCall:
     Mosaic TPU call's `kernel_name`, a Mosaic GPU call's location, the name-stack entry its `mpmd_map`
     lowers under, its kernel's hash where its location names none; any other call's target), a Pallas
     kernel's IR as Pallas serialized it (Triton IR, or Mosaic's module bytecode), its `config` (Triton's
-    warps and stages, a Mosaic GPU kernel's hash), and the FLOPs its kernel states (its cost estimate), None
-    where it states none."""
+    warps and stages, a Mosaic GPU kernel's hash), the FLOPs its kernel states (its cost estimate), None
+    where it states none, and the launch that traced a Mosaic GPU kernel, which its location's name carried
+    (`report.named`), None where it carried none."""
 
     kind: str | None
     name: str
     ir: bytes
     config: str
     flops: float | None
+    launch: str | None = None
 
 
 @dataclass(frozen=True)
@@ -185,6 +187,40 @@ def _read_calls[T](lowered: jax.stages.Lowered,
     return _read(lowered, call)
 
 
+def lowered_kernels(lowered: jax.stages.Lowered) -> list[KernelCall]:
+    """Each kernel call operation a lowered program's StableHLO module holds once, in the order JAX lowered
+    them: the entry's operations in order, each function it calls lowered where its first call site is
+    (`jax.jit`'s and `tuning.lowered_once`'s callees, lowered once however many calls reach them). A
+    kernel's compile reports printed as it lowered (Mosaic GPU's resource estimate) come in this order."""
+    module = lowered.compiler_ir(dialect="stablehlo")
+    assert module is not None, "a lowered program always has its StableHLO module"
+    found: list[KernelCall] = []
+    with module.context:
+        functions = {ir.StringAttr(op.attributes["sym_name"]).value: op
+                     for op in module.body.operations if op.operation.name == "func.func"}
+        lowered_functions: set[str] = set()
+
+        def lower(name: str) -> None:
+            lowered_functions.add(name)
+
+            def visit(operation: ir.Operation) -> ir.WalkResult:
+                if operation.name == "func.call":
+                    callee = ir.FlatSymbolRefAttr(operation.attributes["callee"]).value
+                    if callee not in lowered_functions and callee in functions:
+                        lower(callee)
+                elif operation.name == "stablehlo.custom_call":
+                    target = ir.StringAttr(operation.attributes["call_target_name"]).value
+                    kind = custom_call_kind(target)
+                    if kind != "no_matmul":
+                        found.append(_kernel_call(kind, target, operation))
+                return ir.WalkResult.ADVANCE
+
+            functions[name].operation.walk(visit, ir.WalkOrder.PRE_ORDER)
+
+        lower("main")
+    return found
+
+
 def operations(lowered: jax.stages.Lowered) -> list[str]:
     """The name of every operation a lowered program's StableHLO module holds, in program order, each once
     (a collective a `shard_map` body issues among them, `stablehlo.all_gather`)."""
@@ -237,9 +273,10 @@ def _kernel_call(kind: str | None, target: str, operation: ir.Operation) -> Kern
         stated = (json.loads(ir.StringAttr(config["cost_estimate_json"]).value)
                   if "cost_estimate_json" in config else {})
         hashed = ir.StringAttr(config["kernel_hash"]).value_bytes.hex()[:16]
+        named = _kernel_name(operation.location)
         # A call whose location names no kernel is named by its kernel's hash, apart from every other.
-        return KernelCall(kind, _kernel_name(operation.location) or hashed,
-                          ir.StringAttr(config["module"]).value_bytes, hashed, stated.get("flops"))
+        return KernelCall(kind, named[0] if named else hashed, ir.StringAttr(config["module"]).value_bytes,
+                          hashed, stated.get("flops"), named[1] if named else None)
     if kind == "mosaic_tpu":
         config = json.loads(ir.StringAttr(attributes["backend_config"]).value)["custom_call_config"]
         return KernelCall(kind, ir.StringAttr(attributes["kernel_name"]).value, config["body"].encode(), "",
@@ -247,16 +284,15 @@ def _kernel_call(kind: str | None, target: str, operation: ir.Operation) -> Kern
     return KernelCall(kind, target, b"", "", None)
 
 
-def _kernel_name(location: ir.Location) -> str | None:
-    """A Mosaic GPU call's kernel name: its location's name stack (`_named`) ends `<kernel>/mpmd_map`; None
-    where its location carries no name."""
+def _kernel_name(location: ir.Location) -> tuple[str, str | None] | None:
+    """A Mosaic GPU call's kernel name and the launch it carries (`report.kernel_of`): its location's name
+    stack (`_named`) ends `<kernel>/mpmd_map`; None where its location carries no name."""
     named = _named(location)
     if named is None:
         return None
     stack = named.split("/")
     # Less the launch the kernel's name carries (`report.named`), so a kernel reads as itself in every call.
-    kernel = stack[-2] if len(stack) > 1 and stack[-1] == "mpmd_map" else stack[-1]
-    return report.LAUNCH_SUFFIX.sub("", kernel)
+    return report.kernel_of(stack[-2] if len(stack) > 1 and stack[-1] == "mpmd_map" else stack[-1])
 
 
 def _named(location: ir.Location) -> str | None:
