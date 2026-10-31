@@ -212,7 +212,7 @@ def test_ptxas_allocates_every_independent_products_accumulators_together(batche
     issued; an in-place chain of the same products (one accumulator) takes a fraction."""
     used, spilled, took = kernel_compile._ptxas(ptx_text(batches, products), "sm90", cap=None)
     assert took and not spilled
-    assert used >= 8 * (batches * products + batches), (used, "registers for", batches * products, "products")
+    assert used >= 8 * (batches * products + batches), (used, "registers for", batches * products)
 
 
 @pytest.mark.parametrize("batches, products", SHAPES)
