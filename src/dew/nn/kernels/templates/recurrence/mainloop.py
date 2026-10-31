@@ -932,13 +932,16 @@ def _intra_held(call: _Call, block: int) -> _Held:
 
 def _doubling_held(call: _Call) -> list:
     """A chunk's inverse by doubling as a thread holds it (`algebra.solved`): the inverse, its power and their
-    product beside the masks, merges in parts (`_merged`) splitting one operand into them at a time (`Issuer`
-    stages a product's left operand before it forms its right one); the system, staged negated for the
-    merges, held no longer. Both operands' parts at once stated 264 registers for a ranged bf16 call's solve
-    apart, which ptxas held spill-free at 255 on an H100 and an A100 (fast32e at cdcd620ef)."""
+    product beside the masks, merges in parts (`_merged`) splitting the inverse and the power into them; the
+    system, staged negated for the merges, held no longer. Two parts (`FAST_PARTS`, one accumulator in place,
+    `Issuer`) hold one operand's at a time: both at once stated 264 registers for a ranged bf16 call's solve
+    apart, which ptxas held spill-free at 255 on an H100 and an A100 (fast32e at cdcd620ef); three parts,
+    each product its own accumulator, both (as one, an fp32 call's solve spilled 1588 bytes a thread on an
+    H100, gaps4 at 97e2852bf)."""
     merged = _merged(call)
+    held = 1 if merged.parts == FAST_PARTS else 2
     return ([_f32(CHUNK, CHUNK)] * 3 + _masks(CHUNK, CHUNK) * 2
-            + (_held(merged, CHUNK, CHUNK) if merged.parts > 1 else []))
+            + (_held(merged, CHUNK, CHUNK) * held if merged.parts > 1 else []))
 
 
 def _systems(call: _Call) -> _Operand:

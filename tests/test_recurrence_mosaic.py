@@ -21,10 +21,10 @@ import pytest
 from generation_support import lowers
 from reference_error import assert_as_exact
 from test_recurrence_chunk import (
-    accurate,
     FORMED,
     HOOKS,
     SEEDS as HOOK_SEEDS,
+    accurate,
     chunk_on,
     draw as hooked_draw,
     token_by_token,
@@ -689,6 +689,7 @@ GATE_GROUPS = [(name, dtype, training, packed, variant) for name in RESOURCE_SHA
                # H100's derived tiles is row 2939's.
                and not (name in RATED and dtype == jnp.float32)
                and not (training and (name, dtype) not in {('qwen3.5-27b-gdn', jnp.bfloat16),
+                                                           ('qwen3.5-27b-gdn', jnp.float32),
                                                            ('nemotron-h-4b-ssd', jnp.bfloat16)})
                and not (variant is not None and (training or packed or dtype == jnp.float32))]
 """The resource gate's groups (`compiled_cases`' `only`), a test each so each compiles in its own group:
@@ -773,9 +774,10 @@ def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: t
                 for tiles, kind in derived_tiles + walked + alone + ([] if training else unheld)]
 
     def form(name: str, dtype) -> dict:
-        """The call's form beside its operands: a rated scan's without the delta rule, wide for its skip,
-        `rounded` (its fast forms, `fast_rounding`), as the SSD's route gives it."""
-        return {'delta': False, 'wide': True, 'rounded': True} if name in RATED else {}
+        """The call's form beside its operands under the run's fast forms (`rounded`, `fast_rounding`, an fp32
+        call's operands in two parts), as its route gives it: a rated scan's without the delta rule and wide
+        for its skip."""
+        return {'delta': False, 'wide': True, 'rounded': True} if name in RATED else {'rounded': True}
 
     def case(name: str, dtype, args, starts, bound, tiles, *, training: bool, packed: bool, kind: str):
         _, value_heads, key_width, value_width, per_key = RESOURCE_SHAPES[name]
