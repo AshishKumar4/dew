@@ -40,8 +40,12 @@ class _Tracker:
         self.began, self.scalars = time.perf_counter(), []
 
     def log(self, scalars, step) -> None:
-        """The training scalars by their own names, `train/` dropped."""
-        named = {name.removeprefix("train/"): float(value) for name, value in scalars.items()}
+        """The training and rollout scalars by their own names, `train/` and `rollout/` dropped (a
+        rollout's `episode_return` or `reward` is logged as `rollout/<name>`)."""
+        named = {
+            name.removeprefix("train/").removeprefix("rollout/"): float(value)
+            for name, value in scalars.items()
+        }
         self.scalars.append({"step": int(step), "seconds": time.perf_counter() - self.began, **named})
 
     def artifact(self, value, step) -> None:
@@ -188,7 +192,7 @@ def flowers(size: int, batch: int, data: str) -> Loader:
 
     return (
         TFDS("oxford_flowers102", split="all", path=data)
-        .shuffle(seed=0)
+        .shuffle(seed=0, window=1024)
         .repeat()
         .pipe(presets.images, size, batch=batch, augment=True)
     )
@@ -279,23 +283,23 @@ def nft(
     return report
 
 
-def bouncing(rows: int, frames: int, size: int, seed: int) -> np.ndarray:
-    """`rows` videos `[frames, size, size, 1]` in [-1, 1] of two balls of radius 2.5 bouncing off the
+def bouncing(rows: int, frames: int, size: int, seed: int, radius: float = 2.5) -> np.ndarray:
+    """`rows` videos `[frames, size, size, 1]` in [-1, 1] of two balls of `radius` bouncing off the
     walls at constant speeds."""
     rng = np.random.default_rng(seed)
     grid = np.stack(np.meshgrid(np.arange(size), np.arange(size), indexing="ij"), -1) + 0.5
     videos = np.full((rows, frames, size, size, 1), -1.0, np.float32)
     for video in videos:
-        position = rng.uniform(3, size - 3, (2, 2))
+        position = rng.uniform(radius + 0.5, size - radius - 0.5, (2, 2))
         velocity = rng.uniform(-1.5, 1.5, (2, 2))
         for frame in video:
             for ball in range(2):
-                inside = np.sum(np.square(grid - position[ball]), -1) <= 2.5**2
+                inside = np.sum(np.square(grid - position[ball]), -1) <= radius**2
                 frame[inside, 0] = 1.0
             position = position + velocity
-            bounced = (position < 2.5) | (position > size - 2.5)
+            bounced = (position < radius) | (position > size - radius)
             velocity = np.where(bounced, -velocity, velocity)
-            position = np.clip(position, 2.5, size - 2.5)
+            position = np.clip(position, radius, size - radius)
     return videos
 
 
