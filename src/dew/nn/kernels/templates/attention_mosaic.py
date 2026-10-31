@@ -499,7 +499,7 @@ def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int
                                         ) + statistics
     carried = [(block_k, width // config.columns, jnp.float32), (block_k, value_width // config.columns,
                                                                  jnp.float32)]
-    if config.fused and not split:
+    if config.fused and not split and not config.shared_dq:
         # Queries first (`attention_mosaic_fused._fused_launch`), on either layout: its statistics row
         # vectors.
         statistics = DKV_STATISTICS * family.row_registers(block_q, jnp.float32)
@@ -507,9 +507,11 @@ def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int
         return resources.live_registers(family, carried, products, dq_tile) + statistics
     queries = block_q // config.consumers if split else block_q
     step = [(queries, block_k, jnp.float32)] * 2
-    # The keys-first step's statistics in its tiles' column layout (`Family.column_registers`); a fused
+    # The keys-first step's statistics in its tiles' column layout (`Family.column_registers`), a shared
+    # dQ's one at a time, each read from its stream's stage where it is used (`STATISTICS`); a fused
     # launch's dQ tile of its share `[queries, D]` fp32 beside its score cotangents.
-    statistics = DKV_STATISTICS * family.column_registers(queries, jnp.float32)
+    read = 1 if config.shared_dq else DKV_STATISTICS
+    statistics = read * family.column_registers(queries, jnp.float32)
     # A shared dQ (`BackwardTiles.shared_dq`) its share of the columns.
     dq_width = width // config.consumers if config.shared_dq else width
     added = [[step[0], (queries, dq_width, jnp.float32)]] if config.fused else []

@@ -64,7 +64,8 @@ def _dkv_allocations(family: mosaic.Family, config: BackwardTiles, width: int, v
     scoped = [mosaic.staged((holders, block_k, width), dtype, swizzle),
               mosaic.staged((holders, block_k, value_width), dtype, swizzle), *outputs,
               family.load_barriers(holders), family.load_barriers(holders)]
-    blocks = {"queries": ((block_q, width), dtype), "douts": ((block_q, value_width), dtype)}
+    blocks: dict[str, tuple] = {"queries": ((block_q, width), dtype),
+                                "douts": ((block_q, value_width), dtype)}
     if config.fused:
         # A fused launch's (`_dkv_step`'s `add_dq`): each consumer's score cotangents staged for dQ's
         # product, their transpose its left operand, and its dQ tile's stage for the add; shared
@@ -83,8 +84,17 @@ def _dkv_allocations(family: mosaic.Family, config: BackwardTiles, width: int, v
         blocks["logits"] = ((block_q, width), dtype)
     if tiled:
         scoped.append(plgpu.SMEM((consumers, block_k, rows), jnp.float32))
+    if config.shared_dq:
+        # Its queries' statistics streamed beside them, read from their stage where a step uses each
+        # (FlashAttention 3's LSE and dPsum): held a step in registers they took 80 of a consumer's.
+        blocks.update(dict.fromkeys(STATISTICS, ((block_q,), jnp.float32)))
     swizzles = None if swizzle is None else dict.fromkeys(blocks, swizzle)
     return scoped, family.streams(blocks, stages, consumers, swizzles=swizzles)
+
+STATISTICS = ("peak", "total", "anchor", "delta", "chosen")
+"""The per-query statistics a dK/dV step reads (`_scores`' `peak`, `total`, `anchor`, `delta` and `chosen`),
+in the order of their arrays: a shared dQ's launch streams each beside its queries."""
+
 
 def _holders(family: mosaic.Family, consumers: int) -> int:
     """The key blocks a dK/dV program holds: one its consumers share (`split_queries`), else one each."""
@@ -132,8 +142,15 @@ def _dkv_step(walk: _Backward, resident: tuple, rows_of, coords_of, params_of, s
     # run time joins both choices' tiles and its column statistics, 16 registers each, past a consumer's
     # (spilled 1184 bytes at 64 x 64, one consumer).
     coords = coords_of(q_first, shape=shape)
+    if rows_of is None:
+        # Streamed with the queries (`STATISTICS`), each read from its stage where it is used.
+        def stage_of(name):
+            return family.columns_of(slots[name].at[pl.ds(first_row, count)])
+        rows = tuple(functools.partial(stage_of, name) for name in STATISTICS)
+    else:
+        rows = rows_of(q_first, count)
     exponentials, weights, cotangents, slopes, seen = _scores(
-        walk, coords, params, s, dp, *rows_of(q_first, count), masked=True)
+        walk, coords, params, s, dp, *rows, masked=True)
     logits, pieces = algebra.pulled(cotangents, slopes, seen, kinds, KEY_ROWS)
     # dV's weights the dropped ones (`algebra.value_operands`); the dQ program's sums take them undropped.
     multiplier = algebra.drawn(coords, coords.q_pos, coords.k_pos)
@@ -430,6 +447,10 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
 
         named = {"queries": q_ref, "douts": do_ref, **({} if l_ref is None else {"logits": l_ref})}
         views = _views_of(named, row, head)
+        if program.tiles.shared_dq:
+            # Its queries' statistics streamed beside them, a step's block of each (`STATISTICS`).
+            views.update({name: (ref.at[row, head], lambda j: (j,))
+                          for name, ref in zip(STATISTICS, stat_refs, strict=True)})
         streams = family.opened(streams, views)
         pair_first = lax.axis_index("k_tiles") * pair
         holders = 1 if split else consumers
@@ -460,7 +481,8 @@ def _dkv_columns(query, key, value, dout, peak, total, anchor, delta, key_index,
             resident = k_smem.at[holder], v_smem.at[holder]
             adds = _fused_adds(walk, dq_ref, fused_stages, (row, head), index, k_smem, holder)
             stage = _logits_stage(family, consumers, logits_stages, index)
-            step = functools.partial(_dkv_step, walk, resident, rows_of, coords_of, params_of, store_tiles,
+            statistics = None if program.tiles.shared_dq else rows_of
+            step = functools.partial(_dkv_step, walk, resident, statistics, coords_of, params_of, store_tiles,
                                      shares, part, stage, adds)
             # The tiles its partner reads around its own, or its consumers' own loads of the query stream
             # where they feed it, the one key block's readers (`Family.walk_own`).
