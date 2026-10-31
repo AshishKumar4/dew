@@ -147,8 +147,10 @@ class Mma(mosaic.Family):
         return min(depth, 8 * max(32 // (jnp.dtype(self.dtype).itemsize * 8), 1))
 
     def rhs_fragment_depth(self, depth: int, *, transposed: bool = False) -> int:
-        # A transposed stage's rows are its depth: a load takes a whole swizzle tile of it (`products`).
-        return self._staged_depth(depth) if transposed else self.fragment_depth(depth)
+        # A transposed stage is staged at the narrowest swizzle (`streams`' `transposed`), a whole tile of
+        # which is one instruction's depth; an ordinary one slices its rows' 8-row tiles.
+        del transposed
+        return self.fragment_depth(depth)
 
     def lhs_fragment_depth(self, depth: int) -> int:
         return self._staged_depth(depth)
@@ -246,9 +248,13 @@ class Mma(mosaic.Family):
         consumer(0)
 
     def streams(self, blocks: dict, stages: int, consumers: int, multicast: tuple[str, ...] = (),
-                swizzles: dict[str, int] | None = None):
+                swizzles: dict[str, int] | None = None, transposed: tuple[str, ...] = ()):
         _one(consumers, clustered=bool(multicast))
-        return Pipeline(blocks, stages, dict(swizzles or {}))
+        # A transposed right operand stages at the narrowest swizzle, a whole tile of which is one
+        # instruction's depth (`fragment_depth`): a product loads one instruction of it at a time, not a
+        # wide swizzle's depth (D64's K in QKᵀ held its whole 64 x 192 stage, 162 registers, ET's census80).
+        staged = dict.fromkeys(transposed, mosaic.NARROWEST_SWIZZLE_BYTES)
+        return Pipeline(blocks, stages, {**staged, **(swizzles or {})})
 
     def lifetimes(self, streams: Pipeline) -> tuple[tuple, tuple]:
         # `emit_pipeline` allocates a walk's slots in its own scope.

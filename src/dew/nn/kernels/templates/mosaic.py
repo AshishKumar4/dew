@@ -760,11 +760,13 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
 
     @abc.abstractmethod
     def streams(self, blocks: dict, stages: int, consumers: int,
-                multicast: tuple[str, ...] = (), swizzles: dict[str, int] | None = None) -> Allocated:
+                multicast: tuple[str, ...] = (), swizzles: dict[str, int] | None = None,
+                transposed: tuple[str, ...] = ()) -> Allocated:
         """The scoped allocations of a stream of each `blocks[name]` `(shape, dtype)` in `stages` slots read
         by `consumers` (`opened` once scoped), each stream `multicast` names one the programs of a cluster
         share, loaded once between them (`kernel`'s `cluster`), each `swizzles` names staged at its swizzle
-        (`swizzle_for`; inference's own otherwise)."""
+        (`swizzle_for`; inference's own otherwise), each `transposed` names one a product reads as its right
+        operand transposed, staged as the family's products load it (`rhs_fragment_depth`)."""
 
     @abc.abstractmethod
     def opened(self, allocated: Allocated, views: dict | None = None) -> Opened:
@@ -1073,7 +1075,9 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
         roles(lax.axis_index("wg"), consumers, consumer, producer)
 
     def streams(self, blocks: dict, stages: int, consumers: int, multicast: tuple[str, ...] = (),
-                swizzles: dict[str, int] | None = None) -> dict:
+                swizzles: dict[str, int] | None = None, transposed: tuple[str, ...] = ()) -> dict:
+        # A warpgroup MMA reads a transposed stage through its descriptor, as staged.
+        del transposed
         return {name: ring(shape, dtype, stages, consumers=consumers, multicast=name in multicast,
                            swizzle=(swizzles or {}).get(name))
                 for name, (shape, dtype) in blocks.items()}
