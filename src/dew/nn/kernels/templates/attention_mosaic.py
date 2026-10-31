@@ -558,7 +558,8 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         # The one launch adds each tile's dQ under the first pass's D: the fast form's, a hookless and
         # undropped call's of equal head widths, its dK/dV program queries first on the dQ launch's layout
         # or keys first on one whose consumers share a key block (`split_queries`), each consumer's share of
-        # a slot's queries a warpgroup MMA's rows (dQ's product's M).
+        # a slot's queries a warpgroup MMA's rows (dQ's product's M), or keys first each consumer its own
+        # keys over the whole slot where they share dQ (`BackwardTiles.shared_dq`).
         hooked = (self.score_mod is not None or ba.arguments["initial"] is not None
                   or ba.arguments["drop"] is not None)
         found = {family.name: family for family in layouts(target.generation, ba.arguments["query"].dtype)}
@@ -567,8 +568,9 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
             return False
         keys_first = config.dkv_apart
         if config.fused and (ba.arguments["query"].shape[-1] != ba.arguments["value"].shape[-1] or (
-                keys_first and not (split_queries(dkv_family)
-                                    and (config.block_q // config.dkv.consumers) % dkv_family.rows == 0))
+                keys_first and not ((split_queries(dkv_family)
+                                     and (config.block_q // config.dkv.consumers) % dkv_family.rows == 0)
+                                    or (config.shared_dq and config.block_q % dkv_family.rows == 0)))
                 or (config.staged_logits and not keys_first)):
             return False
         if (config.fused and (self.accurate or hooked)) or not super().legal(ba, config, target):
