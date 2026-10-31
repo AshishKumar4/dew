@@ -5,7 +5,7 @@ selection pins, which its record names."""
 import jax
 import numpy as np
 import pytest
-from test_run_options import decision, trained
+from run_kinds import decision, trained
 
 from dew.decision.config import DecisionRunConfig
 from dew.inference.tasks import SavedRun
