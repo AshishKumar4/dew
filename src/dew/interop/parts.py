@@ -61,10 +61,18 @@ class Ambiguous(ValueError):
     """A part the source's code does not let tier 2 read, which leaves the decoder to tier 3."""
 
 
-def gated_activation(module: torch.nn.Module) -> str:
+def gated_activation(module: torch.nn.Module | Callable[..., object]) -> str:
     """The gated MLP Dew computes for the activation module a source part holds: the `hidden_act` name
-    transformers' ACT2FN builds that same module for, read back by its class and state."""
+    transformers' ACT2FN builds that same module for, read back by its class and state, or for torch's
+    own function that computes it (LFM2-MoE's experts hold `F.silu`)."""
+    import torch
     from transformers.activations import ACT2FN
+
+    functions = {torch.nn.functional.silu: 'silu', torch.nn.functional.gelu: 'gelu'}
+    if not isinstance(module, torch.nn.Module):
+        if module not in functions:
+            raise Ambiguous(f"the activation {module!r} is none of torch's {sorted(functions.values())}")
+        return ACTIVATIONS[functions[module]]
 
     def state(activation: torch.nn.Module) -> dict[str, tuple]:
         """Each public attribute as it computes: a partial by its function and arguments, a bound
