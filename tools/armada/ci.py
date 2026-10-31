@@ -658,6 +658,30 @@ def kept_token(name: str, group: str, at: str) -> str:
     return f"{name}{GROUP_AT + group if group else ''}{KEPT_AT}{at}"
 
 
+KEPT_BYTES = 64 * 1024
+"""The most bytes of tokens and row names a kept task holds: its entry travels whole as one environment
+string (armada's ARMADA_ITEM) and its tokens as one argument (--tests), each of which Linux starts no process
+with past 131,071 bytes (MAX_ARG_STRLEN); half of that, for the entry's other fields (2026-10-31: main
+de315f9a05's kept rows were one task, whose 149,515-byte argument started none)."""
+
+
+def kept_tasks(python: str, found: Mapping[tuple[str, str], str], target: float) -> list[list[tuple[str, str]]]:
+    """The rows `found` kept (`reusable`), in tasks of at most the target's lookups, a lookup a row in seconds,
+    so no kept task outlasts the rest of the run, and at most `KEPT_BYTES` of their tokens and names."""
+    tasks: list[list[tuple[str, str]]] = []
+    held: list[tuple[str, str]] = []
+    size = 0
+    for name, group in sorted(found):
+        # Its token, its row's name, and the JSON quotes and separators around them.
+        cost = len(f"{kept_token(name, group, found[(name, group)])} {row(python, name, group)}".encode()) + 6
+        if held and (len(held) >= max(int(target), 1) or size + cost > KEPT_BYTES):
+            tasks.append(held)
+            held, size = [], 0
+        held.append((name, group))
+        size += cost
+    return tasks + ([held] if held else [])
+
+
 def kept_of(tests: list[str]) -> tuple[list[str], dict[tuple[str, str], tuple[str, str]]]:
     """A task's `tests`, each a file's name, or a kept row's token, its file's name with its group where it
     has one and where its green run is kept (`KEPT_AT`): the files the task runs whole, those kept among
@@ -945,14 +969,9 @@ def plan(target: float, timings: dict) -> list[dict]:
         rows_of = [(name, "") for name in timed if name not in groups] + [
             (name, group) for name, cut in groups.items() for group, _ in cut]
         found = reusable(python, rows_of, shared(python)) if cache == "on" else {}
-        kept = sorted(found)
-        # A lookup a row, in seconds: a kept task's weight is its container's start and those lookups, at
-        # most the target's, so no kept task outlasts the rest of the run, and its rows' tokens (`kept_token`,
-        # about 100 bytes each) stay far inside the argument and the item Linux starts a process with
-        # (2026-10-31: main de315f9a05's kept rows were one task, whose 149,515-byte argument started none).
-        most = max(int(target), 1)
+        # A lookup a row, in seconds: a kept task's weight is its container's start and those lookups.
         tasks: list[tuple[list[tuple[str, str]], float]] = [
-            (kept[at:at + most], float(len(kept[at:at + most]))) for at in range(0, len(kept), most)]
+            (held, float(len(held))) for held in kept_tasks(python, found, target)]
         tasks += [([(name, "")], target) for name, seconds in timed.items()
                   if seconds is None and (name, "") not in found]
         tasks += [([(name, group)], weight) for name, cut in groups.items() for group, weight in cut
