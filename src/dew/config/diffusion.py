@@ -19,7 +19,6 @@ import tyro
 
 from dew._records import number, record
 from dew.batch import Variables, merge
-from dew.checkpoints import Checkpoints
 from dew.config import MetricConfig, ObjectiveConfig, Prepared, RunConfig
 from dew.config.media import media_field
 from dew.diffusion.presets import EDM, Flow, build_process
@@ -357,26 +356,29 @@ class DiffusionRunConfig(RunConfig):
         return objective
 
     def _teacher(self, variables: Variables | None) -> TeacherArguments:
-        """The teacher a distillation reads from `teacher_run`: the tree its run published, unless the
-        starting tree holds the teacher (`TEACHER`), and for guidance distillation the teacher's
-        objective rebuilt from the run's record over the tree the student holds frozen
-        (`teacher_weights`)."""
+        """The teacher a distillation reads from `teacher_run`, its step the one its task loads by
+        default (`SavedRun.pinned`): the model its run publishes (`SavedRun.variables`: the trained
+        policy, not a reference its average holds), unless the starting tree holds the teacher
+        (`TEACHER`), and for guidance distillation the teacher's objective over the run's own sampling
+        task (`TextToImage.from_saved`: its model, adapters included, its process and its inputs) bound
+        to the tree the student holds frozen (`teacher_weights`)."""
+        from dew.inference.images import TextToImage
+        from dew.inference.tasks import SavedRun
+
         if self.teacher_run is None:
             return {}
         kind = objectives[self.objective.name]
         if not issubclass(kind, FlowDistillationObjective | GuidanceDistillationObjective):
             raise ValueError(f"teacher_run names a distillation's teacher, and {self.objective.name} "
                              f"distills none")
-        published: Variables | None = None
-        if variables is None or TEACHER not in variables:
-            # A resumed student holds its teacher, so only a fresh one reads the teacher's run.
-            with Checkpoints(self.teacher_run) as checkpoints:
-                published = checkpoints.variables(ema=None, step=None, mesh=None, layout=None,
-                                                  param_dtype=None)
+        run = SavedRun.pinned(self.teacher_run)
+        # A resumed student holds its teacher, so only a fresh one reads the teacher's run.
+        published = run.variables(ema=None) if variables is None or TEACHER not in variables else None
         given: TeacherArguments = {} if published is None else {"teacher_variables": published}
         if issubclass(kind, GuidanceDistillationObjective):
-            held = teacher_weights(variables, published, whole=True)
-            given["teacher"] = DiffusionRunConfig.load(self.teacher_run).build(variables=held)
+            task = TextToImage.from_saved(run, variables=teacher_weights(variables, published, whole=True))
+            given["teacher"] = DiffusionObjective(task.model, task.process, task.inputs,
+                                                  autoencoder=task.autoencoder, ema_decay=None)
         return given
 
     def build_run(self) -> Prepared:

@@ -203,7 +203,8 @@ def test_a_run_config_distills_a_saved_flow_run_and_alternates_student_and_criti
     for directory in ("teacher", "student"):
         (tmp_path / directory).mkdir()
     checkpoints = Checkpoints(str(tmp_path / "teacher"))
-    checkpoints.save(1, state, None)
+    # As the teacher's run saves it, its task's record beside its weights.
+    checkpoints.save(1, state, None, {}, artifact=teacher.inference_record())
     checkpoints.wait()
     teacher_run.save(str(tmp_path / "teacher"))
 
@@ -307,7 +308,8 @@ def test_an_accumulated_distillation_alternates_its_networks_update_by_update(tm
     state, *_ = trainer.compile(state, batch)(state, batch)
     (tmp_path / "teacher").mkdir()
     checkpoints = Checkpoints(str(tmp_path / "teacher"))
-    checkpoints.save(1, state, None)
+    # As the teacher's run saves it, its task's record beside its weights.
+    checkpoints.save(1, state, None, {}, artifact=teacher.inference_record())
     checkpoints.wait()
     teacher_run.save(str(tmp_path / "teacher"))
     task = dataclasses.replace(teacher_run, teacher_run=str(tmp_path / "teacher"), objective=ObjectiveConfig(
