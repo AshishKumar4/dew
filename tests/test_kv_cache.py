@@ -347,7 +347,7 @@ def test_a_paged_decode_step_lowers_for_a_tpu_on_a_mesh_that_splits_rows_or_head
 
 PAGED_DERIVATIVE_SEEDS = 8
 """The native paged kernel's declared seeds, each width, window, softcap and sinks alike: sized 8 on an A100
-and on an H100 by paired `seeds_for` (receipts ig-size1931@a100 and @h100 at 681226dd9; the test runs only
+and on an H100 by paired `seeds_for` (receipts ig-size1931@a100 and @h100 at 0ba9b5312; the test runs only
 on a GPU)."""
 
 SOFTCAP_PAGED_SEEDS = 8

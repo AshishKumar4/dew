@@ -370,7 +370,7 @@ def test_a_run_config_builds_the_objective_the_python_api_builds(family, pipelin
     same initial variables, so both score a batch alike, through the VAE
     and the text towers. The loss the two share is held to Diffusers'
     train_dreambooth_flux.py statements on matched draws in
-    tests/test_flow_matching.py (ad63cc6a). Both sample by the same policy, the
+    tests/test_flow_matching.py (cdbe61e1). Both sample by the same policy, the
     pipeline's own grid and finish: their evaluations draw alike from one key,
     unlike an evaluation on the process's own times, and the run's published
     task draws the walk the pipeline's own task draws from the same noise. A

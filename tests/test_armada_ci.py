@@ -2257,7 +2257,7 @@ def test_a_release_check_marked_whole_suite_or_network_too_runs_in_its_release_t
 def test_a_release_mark_without_one_requirement_fails_its_files_collection(ci, tmp_path, monkeypatch, mark):
     """A release_env mark that names no one requirement string (none, a keyword's, two, or not a string)
     fails its file's collection, naming its test: every suite task sets a marked test aside, and no release
-    task would plan it, so it would run nowhere (the maintainer's read of b94d89999)."""
+    task would plan it, so it would run nowhere (the maintainer's read of 6b48c32ee)."""
     interpreter(tmp_path, "3.12")
     written(tmp_path, {"test_release.py": f"import pytest\n@pytest.mark.{mark}\n"
                        "def test_under_the_release():\n    pass\n"

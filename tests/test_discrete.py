@@ -584,7 +584,7 @@ def test_masked_diffusion_lm_memorises_the_toy_corpus():
     corpus at over 80% accuracy where a random byte would be right 1 in 257
     times, and rows unmasked from nothing match a corpus sentence at a rate
     above the 0.19 that rows of random corpus characters reach (measured,
-    tests/test_discrete.py at c0f4156). The loss reports the masked accuracy
+    tests/test_discrete.py at ac8809c). The loss reports the masked accuracy
     and the masked fraction beside the NELBO."""
     process = MDLM(mask_id=BYTE_MASK)()
     model = CausalTransformer(vocab_size=257, emb_features=64, num_layers=2, num_heads=4,

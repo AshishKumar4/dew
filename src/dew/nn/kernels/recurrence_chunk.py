@@ -237,7 +237,7 @@ def _chunk_delta_forward(query, key, value, g, beta, state, chunk_size, starts, 
     # layers the chunk loop's zero initial state came back with other values in
     # most processes (GLM-5-Next off by 8.7, 10.1 or NaN, byte-identical
     # modules). Without it a scanned GLM-5-Next's whole output is NaN at base
-    # 0b28dd7d7 (test_layer_stack, probe a079ff009). The barrier materializes
+    # 93ab9f5f3 (test_layer_stack, probe a079ff009). The barrier materializes
     # the zero. Remove it when XLA:CPU no longer returns an uninitialized scan
     # carry here.
     if generation.placed_platform() == 'cpu':
@@ -672,17 +672,17 @@ the port's 8.81 (JS-kdacells-a100-a928ea2b4); its training is the port's by the 
 backward takes no decay a key dimension), not a cell. A gated delta net's training is the template's, its
 keys launch a key block a program and its query/key launch's memory sum a product: its forward and gradient
 on an H100 2.46 ms against the port's 3.12
-on Qwen3.5-27B's gated delta net and 1.92 against 2.44 on Qwen3-Next's (JS-train80-h100-db2c4aca0), and on an
-A100 SXM4 40GB 3.46 against 4.21 and 2.50 against 3.24 (JS-2075cellsd-a100-863706e94).
+on Qwen3.5-27B's gated delta net and 1.92 against 2.44 on Qwen3-Next's (JS-train80-h100-8bbab2fa0), and on an
+A100 SXM4 40GB 3.46 against 4.21 and 2.50 against 3.24 (JS-2075cellsd-a100-5b998bb2b).
 An A100's forward is the template's, its walks' 16-bit stores coalesced (`mosaic.coalesced`): 0.931 ms
 against the port's 0.981 on Qwen3.5-27B's gated delta net and 0.692 against 0.759 on Qwen3-Next's, each in a
-process of its own, three rounds (JS-2075cellsd-a100-863706e94; the port's Qwen3-Next forward took 0.650 in
-two runs that followed a training run in one process, JS-2075cells-a100-491c05798).
+process of its own, three rounds (JS-2075cellsd-a100-5b998bb2b; the port's Qwen3-Next forward took 0.650 in
+two runs that followed a training run in one process, JS-2075cells-a100-b98879a95).
 An H100's forward is the template's, its solve launch two programs a multiprocessor on warpgroup MMA's layout
 without a producer (`mainloop._solving`): on an H100 80GB HBM3 0.364 ms against the port's 0.514 on
-Qwen3.5-27B's gated delta net and 0.279 against 0.327 on Qwen3-Next's (JS-solvefed-h100-92eacee68; on an
+Qwen3.5-27B's gated delta net and 0.279 against 0.327 on Qwen3-Next's (JS-solvefed-h100-b1ee0e645; on an
 H100 PCIe, before its states and output launches kept a producer, 0.520 against 0.691,
-JS-fed3-h100-9d3a38de3)."""
+JS-fed3-h100-a1972b0c3)."""
 
 def _trains(call: base.Call | None) -> bool:
     """Whether the recurrence template's gradient runs the call (`Mosaic.trains`)."""
@@ -1147,7 +1147,7 @@ def _rated_scan(hooks: recurrence.Hooks, query, key, value, g, beta, given: dict
     `beta` form (`recurrence.log_gates`), which the port's kernels form themselves. The port and the TPU's
     scan take head and state widths padded with zero columns to powers of two (`_scan_widths`), which change
     no real output or gradient, the outputs cut back: Nemotron-H 4B's 80-wide heads took the portable math,
-    6.89 ms a forward against mamba_ssm's 0.89 (SE-ssd-mamba-h100-0428aad7b). Returns the output in `work`,
+    6.89 ms a forward against mamba_ssm's 0.89 (SE-ssd-mamba-h100-66f1d0b2e). Returns the output in `work`,
     unrounded, and the memory `[B, Hv, Dk, Dv]`."""
     rate = given['rate'].astype(work)
     skip = given['skip'].astype(work) if hooks.skip else jnp.zeros(rate.shape, work)
@@ -1328,11 +1328,11 @@ SCAN_CELLS: dict[tuple[str | None, str], tuple[str, str]] = {
     ('wgmma', 'forward'): (
         'pallas', "on an H100 PCIe, the port's forward 0.840 ms against the template's 0.954 on "
                   "Nemotron-H 4B's SSD (chunk 256) and 0.329 against 0.377 on Nemotron-H 30B's (chunk 128), "
-                  "each the same `chunk(SSD, ...)` call (SE-1964-h100-5e6e356e0)"),
+                  "each the same `chunk(SSD, ...)` call (SE-1964-h100-e6dac79ca)"),
     ('mma.sync', 'forward'): (
         'pallas', "on an A100 SXM4 40GB, the port's forward 1.486 ms against the template's 1.821 on "
                   "Nemotron-H 4B's SSD and 0.529 against 0.769 on 30B's, each the same `chunk(SSD, ...)` "
-                  "call (SE-1964-a100-5e6e356e0)"),
+                  "call (SE-1964-a100-e6dac79ca)"),
 }
 """The cells, each an instruction family and a product (`ScanCase.cell`), where a receipt timing the same
 product (`chunk(SSD, ...)` with its skip, output width, chunk and geometry, row 1964) shows the port of

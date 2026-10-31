@@ -185,7 +185,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
         - a forward without a gradient: the same rules without the fast backward's (`Tiles.forward`, where
           they differ): on an H100 the 27B gated delta net's forward took 0.513 ms at the training call's
           32-wide block, its states launch's 192 programs two waves, and 0.433 at 64 wide, one wave of 96,
-          where fla's port took 0.440 (JS-fwdtiles2-h100-a7ec9a134).
+          where fla's port took 0.440 (JS-fwdtiles2-h100-931850457).
         None where no block is legal: the launch refuses the call.
 
         A compile that refused the joined tiles (`report.spilled`: kernels of the launch spilled) steps the
@@ -334,7 +334,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
         a multiprocessor holds as many programs as one stage's (`states_held`; `resources.deepest`, within
         `Family.most_shared` over a step's bytes), else one stage; None where no output block is legal
         beside it. The ring deepest alone held an A100's states launch to one program a multiprocessor,
-        where its registers held three (SE-family-a100-8c5b5b16a)."""
+        where its registers held three (SE-family-a100-9d9083868)."""
         family = bundle(target, _dtype(ba))
         assert family is not None
         widths = self._blocks(ba, family) if wide is None else [wide]

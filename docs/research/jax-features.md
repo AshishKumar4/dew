@@ -1,6 +1,6 @@
 # JAX and Flax features for Dew
 
-Research date: 2026-09-06. Dew source: `65fd2f4`.
+Research date: 2026-09-06. Dew source: `cb9ce8f`.
 
 This extends [google-jax-stack.md](google-jax-stack.md). The [MaxText inventory](maxtext-parity.md) names the missing training capabilities. This note identifies the upstream primitives that can implement them. Fit entries are recommendations, not approved designs.
 
@@ -22,7 +22,7 @@ No cloud run, model download or GPU/TPU benchmark was performed. Expected wins a
 
 ## Correction, 2026-09-22
 
-Dew changed after this survey. Line numbers elsewhere in this note refer to `65fd2f4`. Checked against the current source, these statements are out of date:
+Dew changed after this survey. Line numbers elsewhere in this note refer to `cb9ce8f`. Checked against the current source, these statements are out of date:
 
 - The decoder has named-residual remat. `RematPolicy` and `REMAT_POLICIES` (`src/dew/nn/backbones/causal_transformer.py:433-520`) carry MaxText's recipes, `save_dot_except_mlp` among them, and can offload residuals to `pinned_host` through `save_and_offload_only_these_names` (`src/dew/nn/backbones/causal_transformer.py:474-481`). The "No decoder policy" gaps in the activation-memory table and item 1 under "What Dew needs" describe the older source.
 - A layout can keep `params`, `opt_state` or `ema` in pinned host memory between steps (`HOST_RESIDENT`, `src/dew/training/distributed.py:271-276`; `Trainer.shardings`, `src/dew/training/trainer.py:342-356`). The state-residency rows that say every field inherits device memory describe the older source.
