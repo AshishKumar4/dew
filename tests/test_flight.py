@@ -16,6 +16,7 @@ from reference_error import assert_computes_the_oracle, chain_roundings
 
 from dew.rl.env import env_rollout, start
 from dew.rl.flight import (
+    ASPECTS,
     FAMILIES,
     GATES,
     INTERFACE,
@@ -48,6 +49,12 @@ def races(racing: Racing, seed: int, count: int = DRONES, difficulty: float = 1.
     """`count` drones' episodes drawn at `difficulty` and full randomization."""
     keys = jax.random.split(jax.random.key(seed), count)
     return jax.vmap(lambda key: started(racing, key, jnp.asarray(difficulty), jnp.asarray(1.0)))(keys)
+
+
+def numpy_of(tree):
+    """A tree's arrays in NumPy, its keys as they are."""
+    return jax.tree.map(lambda leaf: leaf if jnp.issubdtype(leaf.dtype, jax.dtypes.prng_key)
+                        else np.asarray(leaf), tree)
 
 
 def axes(facing: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -217,7 +224,7 @@ def test_a_step_pays_passes_ends_and_finishes_as_the_race_rules():
     rng = np.random.default_rng([532, 5])
     with jax.enable_x64(new_val=True):
         racing = Racing(episode_seconds=0.05)
-        race = jax.tree.map(np.asarray, races(racing, 0))
+        race = numpy_of(races(racing, 0))
         # Some drones head for an open track's last gate, to finish it.
         last = ~race.course.closed & (rng.random(DRONES) < 0.3)
         index = np.where(last, race.course.count - 1, race.index)
@@ -317,19 +324,19 @@ def test_commands_carry_each_drones_throttle_rates_and_latency():
         for action in actions:
             race, collective, rates = step(race, jnp.asarray(action))
             sent.append(np.c_[np.asarray(collective), np.asarray(rates)])
-        held = jax.tree.map(np.asarray, race)
+        kept = numpy_of(race)
         full = RACING.quadrotor.nominal_thrust
         expected = np.zeros((10, 64, 4))
         for drone in range(64):
-            hover = held.body.mass[drone] * GRAVITY
+            hover = kept.body.mass[drone] * GRAVITY
             queue = [np.asarray([hover, 0.0, 0.0, 0.0])] * (RACING.delays[1] + 1)
             for index, action in enumerate(np.clip(actions[:, drone], -1, 1)):
                 collective = hover + action[0] * ((full - hover) if action[0] >= 0 else hover)
-                queue = [np.r_[collective, action[1:] * held.rate_limit[drone]], *queue[:-1]]
-                expected[index, drone] = queue[held.delay[drone]]
+                queue = [np.r_[collective, action[1:] * kept.rate_limit[drone]], *queue[:-1]]
+                expected[index, drone] = queue[kept.delay[drone]]
         roundings = chain_roundings(jax.make_jaxpr(step)(race, jnp.asarray(actions[0])))
         assert_computes_the_oracle(np.stack(sent), expected, "the commands", roundings=roundings)
-    assert set(np.unique(held.delay)) == set(range(RACING.delays[0], RACING.delays[1] + 1))
+    assert set(np.unique(kept.delay)) == set(range(RACING.delays[0], RACING.delays[1] + 1))
 
 
 def test_a_camera_is_hyperdrones_of_its_mounted_frame():
@@ -348,7 +355,7 @@ def test_a_camera_is_hyperdrones_of_its_mounted_frame():
         computed = jax.jit(jax.vmap(lambda race: (cameras(race, 1.0),
                                                   cameras(race, 1.0, race.camera.shutter))))
         camera = jax.tree.map(np.asarray, race.camera)
-        held = jax.tree.map(np.asarray, flight)
+        moved = jax.tree.map(np.asarray, flight)
         expected = []
         for before in (False, True):
             for drone in range(64):
@@ -359,12 +366,12 @@ def test_a_camera_is_hyperdrones_of_its_mounted_frame():
                 turned = np.asarray([[cy, -sy, 0], [sy, cy, 0], [0, 0, 1]])
                 tilted = np.asarray([[cp, 0, sp], [0, 1, 0], [-sp, 0, cp]])
                 mount = turned @ tilted @ np.asarray([[1, 0, 0], [0, cr, -sr], [0, sr, cr]])
-                body = np.asarray(rotation(jnp.asarray(held.orientation[drone])))
-                position = held.position[drone]
+                body = np.asarray(rotation(jnp.asarray(moved.orientation[drone])))
+                position = moved.position[drone]
                 if before:
                     shutter = camera.shutter[drone]
-                    position = position - shutter * held.velocity[drone]
-                    back = -shutter * held.angular_velocity[drone]
+                    position = position - shutter * moved.velocity[drone]
+                    back = -shutter * moved.angular_velocity[drone]
                     angle = np.linalg.norm(back)
                     x, y, z = back / angle
                     k = np.array([[0, -z, y], [z, 0, -x], [-y, x, 0]])
@@ -407,24 +414,24 @@ def test_the_teacher_sees_the_next_gates_and_nearest_pillars_from_its_body():
                                                privileged(RACING, race))))
         gates, pillars, views = shown(race)
         gates, pillars, views = np.asarray(gates), np.asarray(pillars), jax.tree.map(np.asarray, views)
-        held = jax.tree.map(np.asarray, race)
+        kept = numpy_of(race)
         half = RACING.opening / 2
         expected_gates, expected_pillars = [], []
         for drone in range(64):
-            to_body = np.asarray(rotation(jnp.asarray(held.flight.orientation[drone]))).T
-            position = held.flight.position[drone]
-            count, closed = int(held.course.count[drone]), bool(held.course.closed[drone])
+            to_body = np.asarray(rotation(jnp.asarray(kept.flight.orientation[drone]))).T
+            position = kept.flight.position[drone]
+            count, closed = int(kept.course.count[drone]), bool(kept.course.closed[drone])
             seen = []
             for step in range(2):
-                gate = ((held.index[drone] + step) % count if closed
-                        else min(held.index[drone] + step, count - 1))
-                _, left = axes(held.course.facing[drone, gate])
+                gate = ((kept.index[drone] + step) % count if closed
+                        else min(kept.index[drone] + step, count - 1))
+                _, left = axes(kept.course.facing[drone, gate])
                 for sideways, upward in ((1, 1), (-1, 1), (-1, -1), (1, -1)):
                     offset = (sideways * left + upward * np.r_[0, 0, 1]) * half
-                    corner = held.course.center[drone, gate] + offset
+                    corner = kept.course.center[drone, gate] + offset
                     seen.append(to_body @ (corner - position))
             expected_gates.append(np.concatenate(seen))
-            active = [pillar for pillar in held.course.obstacles[drone] if pillar[2] > 0]
+            active = [pillar for pillar in kept.course.obstacles[drone] if pillar[2] > 0]
             axis = [np.r_[pillar[:2], min(max(position[2], 0.0), pillar[3])] for pillar in active]
             order = np.argsort([np.linalg.norm(point - position) for point in axis], kind="stable")[:NEAREST]
             near = [np.r_[to_body @ (axis[k] - position), active[k][2]] for k in order]
@@ -444,9 +451,10 @@ def test_courses_keep_their_families_shapes(difficulty):
     """4096 courses drawn at a difficulty from every family: each layout course is a published layout
     (centred across) moved by at most the jitter times the difficulty and held 0.75 m high; each loop closed,
     6 to 12 gates; each chained track open, 8 to 16 gates, each 7 to 16 m on from the last (a split-S's 2.5
-    to 4 m below and a metre behind) and between 1 and 20 m high, no two of its gates within 3 m across and
-    2.5 m in height but a split-S's pair; each figure-eight closed, 8 to 12 gates; the gates of a loop or a
-    figure-eight at least 2 m apart; every pillar at least 3 m and its radius from every gate."""
+    to 4 m below and a metre behind, at first) and between 1 and 20 m high, no two of its gates within 3 m
+    across and 2.5 m in height; each figure-eight closed, 8 to 12 gates; the gates of a loop or a
+    figure-eight at least 2 m apart; every pillar at least 3 m and its radius from every gate, its height its
+    radius times one of the aspects."""
     racing = Racing(families=tuple((family, 1.0) for family in FAMILIES))
     keys = jax.random.split(jax.random.key(6), 4096)
     courses = jax.tree.map(np.asarray, jax.jit(jax.vmap(
@@ -472,18 +480,17 @@ def test_courses_keep_their_families_shapes(difficulty):
         else:
             assert 8 <= count <= GATES and np.all((gates[:, 2] >= 1 - 1e-5) & (gates[:, 2] <= 20 + 1e-5))
             steps = np.linalg.norm(np.diff(gates[:, :2], axis=0), axis=-1)
-            drops = -np.diff(gates[:, 2])
-            split = (np.abs(steps - 1.0) < 1e-4) & (drops >= 2.5 - 1e-4) & (drops <= 4 + 1e-4)
+            split = np.abs(steps - 1.0) < 1e-4
             assert np.all(split | ((steps >= 7 - 1e-4) & (steps <= 16 + 1e-4)))
             across = np.linalg.norm(gates[:, None, :2] - gates[None, :, :2], axis=-1)
             height = np.abs(gates[:, None, 2] - gates[None, :, 2])
-            pairs = np.abs(np.arange(count)[:, None] - np.arange(count)[None]) == 1
-            crowded = (across < 3.0) & (height < 2.5) & ~np.eye(count, dtype=bool)
-            assert not np.any(crowded & ~(pairs & (np.abs(across - 1.0) < 1e-4)))
+            assert not np.any((across < 3.0) & (height < 2.5) & ~np.eye(count, dtype=bool))
         if family in ("loop", "figure8"):
             apart = np.linalg.norm(gates[:, None] - gates[None], axis=-1)
             assert np.all(apart[~np.eye(count, dtype=bool)] > 2.0)
         pillars = courses.obstacles[row][courses.obstacles[row, :, 2] > 0]
+        aspect = pillars[:, 3] / pillars[:, 2]
+        assert np.all(np.min(np.abs(aspect[:, None] - np.asarray(ASPECTS)[None]), -1) < 1e-4)
         if len(pillars):
             across = np.linalg.norm(pillars[:, None, :2] - gates[None, :, :2], axis=-1)
             assert np.all(across > 3.0 + pillars[:, 2:3])
@@ -494,7 +501,7 @@ def test_a_hovering_drone_flies_and_is_cut_at_its_time():
     """Drones at no randomization started hovering on simple loops and left to hover (zero action) for an
     episode's steps: none crashes before its episode is cut, each cut exactly at its time."""
     racing = Racing(families=(("loop", 1.0),), flying_share=0.0, obstacles=0, episode_seconds=1.0)
-    env = FlightEnv(racing, ("state",), difficulty=jnp.asarray(0.0), ramp=jnp.asarray(0.0))
+    env = FlightEnv(racing, ("state",), difficulty=0.0, ramp=0.0)
 
     def still(params, observation, key, memory):
         return jnp.zeros(4), {}, memory

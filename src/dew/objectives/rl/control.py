@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import functools
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -228,20 +228,27 @@ class ControlRollout:
     _collected: Mapping[str, np.ndarray] | None = field(default=None, init=False, repr=False)
     _order: np.ndarray | None = field(default=None, init=False, repr=False)
     _ended: float = field(default=float("nan"), init=False, repr=False)
+    _bound: tuple[Env | Simulator, Callable[[Variables, Carry], tuple[Carry, Transition]]] | None = field(
+        default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if min(self.unroll_length, self.unrolls, self.epochs, self.minibatches) < 1:
             raise ValueError("a control rollout collects and serves at least one of each")
-        env = self.env
-        if isinstance(env, Simulator):
-            self._collect = functools.partial(self._simulated, env)
-        else:
-            self._collect = jax.jit(functools.partial(self._unrolled, env))
         self._summarized = jax.jit(self._summary)
 
     @property
     def metrics(self) -> Mapping[str, float]:
         return {"episode_return": self._ended}
+
+    def _collector(self) -> Callable[[Variables, Carry], tuple[Carry, Transition]]:
+        """The collection for the rollout's environment as it is now: a run may change it between
+        collections (a curriculum), its collection made again; episodes under way carry on."""
+        env = self.env
+        if self._bound is None or self._bound[0] != env:
+            collect = (functools.partial(self._simulated, env) if isinstance(env, Simulator)
+                       else jax.jit(functools.partial(self._unrolled, env)))
+            self._bound = (env, collect)
+        return self._bound[1]
 
     def _unrolled(self, env: Env, params: Variables, carry: Carry) -> tuple[Carry, Transition]:
         """The carry after `unrolls` rollouts of the live policy in `env` and their steps
@@ -292,7 +299,7 @@ class ControlRollout:
             returns = jnp.zeros(len(jax.tree.leaves(carry.observation)[0]), jnp.float32)
         collected, order = self._collected, self._order
         if served == 0 or collected is None or order is None:
-            carry, steps = self._collect(state.variables, carry)
+            carry, steps = self._collector()(state.variables, carry)
             returns, gathered, ended, count = self._summarized(steps, returns)
             collected = jax.device_get(gathered)
             self._ended = float(ended) if int(count) else float("nan")

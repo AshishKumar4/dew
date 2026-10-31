@@ -77,6 +77,8 @@ GATES = 16
 """The most gates a course holds; a shorter one's last are inactive."""
 OBSTACLES = 8
 """The most obstacles a course holds; an inactive one has no radius."""
+ASPECTS = (6.0, 12.0, 24.0)
+"""A pillar's height over its radius, one of these: a renderer draws each as its shape scaled."""
 NEAREST = 3
 """The obstacles a teacher is shown, the nearest first."""
 
@@ -310,12 +312,11 @@ def _chain(key: jax.Array, difficulty: jax.Array) -> tuple[jax.Array, jax.Array,
     order = jnp.arange(GATES)
 
     def separated(center: jax.Array, gate: jax.Array) -> tuple[jax.Array, None]:
-        # A gate within 3 m across and 2.5 m in height of an earlier one (where the chain crosses itself),
-        # but a split-S's from its own last, climbs 3 m above the highest of them.
+        # A gate within 3 m across and 2.5 m in height of an earlier one (where the chain crosses itself)
+        # climbs 3 m above the highest of them; a split-S's pair stands 2.5 m apart in height or more.
         point = center[gate]
         across = jnp.linalg.norm(center[:, :2] - point[:2], axis=-1)
         crowded = (order < gate) & (across < 3.0) & (jnp.abs(center[:, 2] - point[2]) < 2.5)
-        crowded = crowded & ~((order == gate - 1) & (jnp.abs(across - 1.0) < 1e-4))
         lifted = jnp.max(jnp.where(crowded, center[:, 2], -jnp.inf)) + 3.0
         return center.at[gate, 2].set(jnp.where(crowded.any(), jnp.minimum(lifted, 20.0), point[2])), None
 
@@ -349,8 +350,8 @@ def _obstacles(racing: Racing, key: jax.Array, center: jax.Array, count: jax.Arr
                difficulty: jax.Array) -> jax.Array:
     """Up to `racing.obstacles` times the difficulty vertical pillars `[O, 4]` (x, y, radius, height): each
     at a random point 30 to 70% along a segment between consecutive gates, on the line at the share `on_line`
-    and else 1.5 to 4 m beside it, 0.2 to 0.6 m in radius and 3 to 12 m high; one within 3 m of a gate is
-    dropped (its radius 0)."""
+    and else 1.5 to 4 m beside it, 0.2 to 0.6 m in radius, its height its radius times one of `ASPECTS` (1.2
+    to 14.4 m: a post a drone may clear, or a tower); one within 3 m of a gate is dropped (its radius 0)."""
     keys = iter(jax.random.split(key, 9))
     segments = jnp.where(closed, count, count - 1)
     segment = jax.random.randint(next(keys), (OBSTACLES,), 0, jnp.maximum(segments, 1))
@@ -364,7 +365,7 @@ def _obstacles(racing: Racing, key: jax.Array, center: jax.Array, count: jax.Arr
                       * jnp.sign(jax.random.uniform(next(keys), (OBSTACLES,), minval=-1.0, maxval=1.0)))
     xy = point[:, :2] + aside[:, None] * jnp.stack([-jnp.sin(heading), jnp.cos(heading)], -1)
     radius = jax.random.uniform(next(keys), (OBSTACLES,), minval=0.2, maxval=0.6)
-    height = jax.random.uniform(next(keys), (OBSTACLES,), minval=3.0, maxval=12.0)
+    height = radius * jnp.asarray(ASPECTS)[jax.random.randint(next(keys), (OBSTACLES,), 0, len(ASPECTS))]
     active = jnp.arange(OBSTACLES) < jnp.floor(difficulty * racing.obstacles
                                                 * jax.random.uniform(next(keys), (), minval=0.25, maxval=1.0))
     gates = jnp.arange(GATES) < count
@@ -703,14 +704,14 @@ VIEWS = ("image", "state", "gates", "airframe", "dynamics", "obstacles", "passed
 @struct.dataclass
 class FlightEnv:
     """One drone racing `racing`'s courses as a `dew.rl.env.Env`: actions `[4]` in [-1, 1] (`commanded`);
-    observations a dict of the privileged `views` asked for (`privileged`). Its curriculum, `difficulty` and
-    `ramp`, are arrays a rollout may change between collections without retracing; an episode is drawn at
-    the curriculum its reset sees."""
+    observations a dict of the privileged `views` asked for (`privileged`). An episode is drawn at its
+    curriculum, `difficulty` and `ramp` (`started`); a curriculum changes the env, its programs compiled again
+    (a few times a run)."""
 
     racing: Racing = struct.field(pytree_node=False)
     views: tuple[str, ...] = struct.field(pytree_node=False, default=("teacher",))
-    difficulty: jax.Array = struct.field(default_factory=lambda: jnp.asarray(1.0))
-    ramp: jax.Array = struct.field(default_factory=lambda: jnp.asarray(1.0))
+    difficulty: float = struct.field(pytree_node=False, default=1.0)
+    ramp: float = struct.field(pytree_node=False, default=1.0)
 
     action_size = 4
 
@@ -723,7 +724,7 @@ class FlightEnv:
         return {view: shown[view] for view in self.views}
 
     def reset(self, key: jax.Array) -> tuple[Race, TimeStep]:
-        race = started(self.racing, key, self.difficulty, self.ramp)
+        race = started(self.racing, key, jnp.asarray(self.difficulty), jnp.asarray(self.ramp))
         zero = jnp.zeros((), bool)
         return race, TimeStep(self._observed(race), jnp.zeros(()), zero, zero)
 
@@ -834,8 +835,7 @@ class GateRace:
                                                        cameras(race, aspect, race.camera.shutter))))
 
     def _env_now(self) -> FlightEnv:
-        return dataclasses.replace(self._env, difficulty=jnp.asarray(self.difficulty, jnp.float32),
-                                   ramp=jnp.asarray(self.ramp, jnp.float32))
+        return dataclasses.replace(self._env, difficulty=float(self.difficulty), ramp=float(self.ramp))
 
     def _observed(self, observation: dict[str, jax.Array]) -> dict[str, jax.Array]:
         shown = dict(observation)
@@ -873,7 +873,8 @@ def _scene(racing: Racing, race: Race) -> Scene:
     return Scene(course.center, course.facing, course.count, lit, course.obstacles, race.camera.look)
 
 
-__all__ = ["FAMILIES", "GATES", "INTERFACE", "LAYOUTS", "NEAREST", "OBSTACLES", "TEACHER", "VIEWS", "Camera",
-           "Course", "FlightEnv", "GateRace", "Race", "Racing", "Renderer", "Scene", "airframe", "bars",
-           "cameras", "commanded", "corners", "developed", "drawn_camera", "drawn_course", "dynamics",
-           "facings", "nearest", "privileged", "quaternion", "raced", "started", "struck"]
+__all__ = ["ASPECTS", "FAMILIES", "GATES", "INTERFACE", "LAYOUTS", "NEAREST", "OBSTACLES", "TEACHER",
+           "VIEWS", "Camera", "Course", "FlightEnv", "GateRace", "Race", "Racing", "Renderer", "Scene",
+           "airframe", "bars", "cameras", "commanded", "corners", "developed", "drawn_camera",
+           "drawn_course", "dynamics", "facings", "nearest", "privileged", "quaternion", "raced",
+           "started", "struck"]
