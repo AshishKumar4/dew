@@ -15,15 +15,15 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   - Brax's PPO for continuous control (`dew.objectives.rl.control`).
   - DreamerV3 as its code computes it (`dew.objectives.rl.dreamer`): vector or image observations, bfloat16
     compute, privileged auxiliary heads, and pretraining from demonstrations with behaviour cloning.
-  - DreamerV3's optimizer, LaProp after adaptive gradient clipping, as the `laprop` optimizer of
-    `dew.optim`, which `OptimConfig.optimizer` names.
+  - DreamerV3's optimizer, LaProp after adaptive gradient clipping (`dew.laprop`), as the `laprop`
+    optimizer of `dew.optim`, which `OptimConfig.optimizer` names.
   - TransDreamer's transformer dynamics (`dew.objectives.rl.tssm`).
   - Dreamer 4's shortcut-forcing world model (`dew.objectives.world_model`).
   - DiffusionNFT (`dew.objectives.rl.nft`).
   - `tools/rl_acceptance.py` runs these against their papers. `tutorials/12-world-models.ipynb` acts and
     imagines in one loop.
 - A first-person drone gate race in JAX (`dew.rl.flight`), flown by a racing quadrotor's physics in JAX
-  (`dew.rl.quadrotor`: a 5-inch racer at 4.8 times its weight, first-order motors, a Betaflight-form rate
+  (`dew.rl.quadrotor`: a 5-inch racer at 12 times its weight, first-order motors, a Betaflight-form rate
   loop, rotor, body and vertical drag, ground effect, a LiPo pack's sag, disturbances and noise, each drawn
   per episode):
   - Progress-to-gate rewards, gates passed only through their openings, and frames, pillars and the ground
