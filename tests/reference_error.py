@@ -855,30 +855,72 @@ def _typical_interval(mine: np.ndarray, theirs: np.ndarray,
     return float(np.exp(np.quantile(means, tails[0]))), float(np.exp(np.quantile(means, 1 - tails[1])))
 
 
-def _typical_status(mine: np.ndarray, theirs: np.ndarray, pooled_high: float,
-                    tails: tuple[float, float] = (LOWER_TAIL, UPPER_TAIL)) -> tuple[str, float, float, float]:
-    """A leaf's verdict by its typical draw (`_typical`, `_typical_interval`), asked only where its pooled
-    ratio leaves it inconclusive: "pass" where the typical draw's ratio passes (`_status`) and the pooled
-    ratio's interval's high end, `pooled_high`, is at most PARITY², else "inconclusive", never "over". A pass
-    so certifies what a pooled pass does, the pooled ratio's high end at most PARITY² on the same interval
-    at the same tail, and further that the typical draw's ratio passes; a fault on a minority of draws that
-    the typical draw's ratio misses moves the pooled ratio's high end past PARITY² and is not passed."""
+QUALIFYING_SPREAD = 0.40
+"""The most a leaf's draws' log RMS ratios (`_log_ratios`) may spread, their standard deviation, for its
+typical draw to pass it (`_typical_status`): at it and under it, check 1's tail test (`_tail_sign`) with the
+spread itself refuses Dew three times the reference's RMS error on a fifth of the draws in at least 95% of
+runs at 256 seeds and more, Dew as exact passing (/mnt/local/dew/retained/gate/check1-qualifying-sim.py,
+the gate's own functions; ledger 2469). A fault on some draws only widens the spread, so a leaf whose fault
+the tail test misses is held inconclusive by it."""
+TAIL_SHARE = 0.1
+"""The share of a leaf's draws, the farthest from their median, the tail test reads (`_tail_sign`)."""
+
+
+def _log_ratios(mine: np.ndarray, theirs: np.ndarray) -> np.ndarray | None:
+    """Each draw's log RMS ratio, half the log of Dew's squared error over the reference's, the draws where
+    both are exactly float64 left out; None where one arm is exact on a draw and the other is not."""
+    if np.any((mine > 0) != (theirs > 0)):
+        return None
+    kept = mine > 0
+    return 0.5 * np.log(mine[kept] / theirs[kept])
+
+
+def _tail_sign(ratios: np.ndarray) -> float:
+    """The tail test's p-value: of the draws in the farthest TAIL_SHARE of their log ratios from the median,
+    the count above it against Binomial(n, 1/2). Where the two arms are equally exact their roundings are
+    exchangeable about the typical ratio, so a draw is as likely above it as below whatever their spread
+    (distribution-free); Dew worse by a factor on some draws puts their tail above it."""
+    from scipy import stats
+
+    centred = ratios - np.median(ratios)
+    tail = centred[np.abs(centred) >= np.quantile(np.abs(centred), 1 - TAIL_SHARE)]
+    return float(stats.binom.sf(int(np.sum(tail > 0)) - 1, len(tail), 0.5))
+
+
+def _typical_status(mine: np.ndarray, theirs: np.ndarray,
+                    tails: tuple[float, float] = (LOWER_TAIL, UPPER_TAIL)) -> tuple[str, float, float, float,
+                                                                                    str]:
+    """A leaf's verdict by its draws' paired ratios, asked only where its pooled ratio leaves it
+    inconclusive: "pass" where the typical draw's ratio passes (`_typical`, its interval `_status`), the
+    draws' log ratios spread no wider than QUALIFYING_SPREAD (where the tail test sees a fault on a fifth of
+    the draws) and their tail is not above the median's (`_tail_sign`, at the lower tail), else
+    "inconclusive", never "over"; with the reason it is not passed. A pass certifies the typical draw's
+    ratio under PARITY and no fault the tail test sees at that spread."""
     ratio, (low, high) = _typical(mine, theirs), _typical_interval(mine, theirs, tails)
-    passed = _status(ratio, low, high) == "pass" and pooled_high <= PARITY ** 2
-    return ("pass" if passed else "inconclusive"), ratio, low, high
+    ratios = _log_ratios(mine, theirs)
+    if ratios is None or _status(ratio, low, high) != "pass":
+        return "inconclusive", ratio, low, high, "the typical draw's ratio does not pass"
+    if (spread := float(np.std(ratios))) > QUALIFYING_SPREAD:
+        return ("inconclusive", ratio, low, high,
+                f"its draws' log ratios spread {spread:.2f}, past the {QUALIFYING_SPREAD} the tail test "
+                f"sees at")
+    if (tail := _tail_sign(ratios)) < tails[0]:
+        return "inconclusive", ratio, low, high, f"its draws' tail lies above their median (p {tail:.1e})"
+    return "pass", ratio, low, high, ""
 
 
 def _sized(mine: np.ndarray, theirs: np.ndarray, typical: bool = False) -> bool:
     """Whether a paired sizing takes a leaf as sized by these draws, Dew's squared errors `mine` against
     the reference's `theirs`: its pooled ratio's interval resolved (no wider than PARITY), or, with
     `typical` (a leaf the pooled ratio does not size within MOST_SEEDS, `seeds_for`), its typical draw's
-    (`_typical_interval`) resolved with the pooled interval's high end at most PARITY², the certificate a
-    typical pass needs (`_typical_status`)."""
+    interval (`_typical_interval`) resolved, its draws' log ratios within QUALIFYING_SPREAD and their tail
+    not above their median (`_typical_status`)."""
     low, high = _interval(mine, theirs)
     if _resolves(low, high):
         return True
-    return (typical and _resolves(*_typical_interval(mine, theirs))
-            and max(high, _pooled(mine, theirs)) <= PARITY ** 2)
+    ratios = _log_ratios(mine, theirs)
+    return (typical and ratios is not None and _resolves(*_typical_interval(mine, theirs))
+            and float(np.std(ratios)) <= QUALIFYING_SPREAD and _tail_sign(ratios) >= LOWER_TAIL)
 
 
 def _resolves(low: float, high: float) -> bool:
@@ -1240,6 +1282,45 @@ def _summaries(references, held: _LaidTruths) -> list[RecordedLeaf | None]:
     return summaries
 
 
+class UnpairedDraw(AssertionError):
+    """A check's draw or arm that depends on more than its seed or its inputs (`_of_its_seed`,
+    `_of_its_inputs`): randomness of its own, or state a call left, so its arms compare draws no seed
+    pairs."""
+
+
+def _same_bits(one, other) -> str | None:
+    """The first leaf path at which `one` and `other` differ in structure, shape or bits, or None."""
+    if jax.tree.structure(one) != jax.tree.structure(other):
+        return "its structure"
+    for (path, first), second in zip(jax.tree_util.tree_leaves_with_path(one), jax.tree.leaves(other),
+                                     strict=True):
+        if isinstance(first, RecordedLeaf) or not (hasattr(first, "shape")
+                                                    or isinstance(first, (int, float, complex, bool))):
+            # A recording's evidence (`RecordedLeaf`), read from its seed's rows: no values of its own.
+            continue
+        first, second = np.asarray(first), np.asarray(second)
+        if first.shape != second.shape or first.dtype != second.dtype or first.tobytes() != second.tobytes():
+            return jax.tree_util.keystr(path) or "its value"
+    return None
+
+
+def _of_its_seed(label: str, draw, seed, inputs) -> None:
+    """Raise unless `draw` gives `inputs` again at `seed`: a draw of a randomness its seed does not fix (a
+    global generator) gives each run of a site other inputs (ledger 2641)."""
+    if (where := _same_bits(inputs, draw(seed))) is not None:
+        raise UnpairedDraw(f"{label}: the draw at seed {seed} differs at {where} drawn again, so its seed "
+                           f"does not fix it")
+
+
+def _of_its_inputs(label: str, name: str, fn, inputs, first) -> None:
+    """Raise unless `fn`, `name` of a check's arms, gives `first` again on the same `inputs`: an arm that
+    draws a noise of its own, or reads state its last call left, compares Dew with a reference on draws no
+    seed pairs (ledger 2641)."""
+    if (where := _same_bits(first, fn(*inputs))) is not None:
+        raise UnpairedDraw(f"{label}: {name} differs at {where} run again on the same inputs, so its output "
+                           f"depends on more than them")
+
+
 def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=None, orders=None,
            library_fn=None, library_leaves: Sequence[str] = (), also: Sequence = (), terms_fn=None,
            label: str = ""):
@@ -1284,6 +1365,8 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
         """Every arm's evidence on the draw at `seed`, the `at`th, its orders' worst rows the larger."""
         nonlocal names, widths
         inputs = draw(seed)
+        if not at:
+            _of_its_seed(label, draw, seed, inputs)
         # The site's arms' mode, decided on its first draw's inputs before any arm runs, no draw of its own,
         # on the programs the arms run (their scope, `summed_as_run`).
         with summed_as_run():
@@ -1302,8 +1385,11 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
                 raise ValueError(f"orders of {len(ordered)}; an orbit holds the draw's own and another")
         rows = [None for _ in arms]
         for mine_at, theirs_at in ordered:
+            # Each arm, and its replay on the same inputs, in the arithmetic arms run in (`summed_as_run`).
             with summed_as_run():
                 dew = dew_fn(*mine_at)
+                if not at and mine_at is ordered[0][0]:
+                    _of_its_inputs(label, "Dew's arm", dew_fn, mine_at, dew)
             names = names or [jax.tree_util.keystr(path)
                               for path, _ in jax.tree_util.tree_leaves_with_path(dew)]
             widths = widths or tuple(int(np.shape(leaf)[-1]) if np.ndim(leaf) >= 2 else 0
@@ -1317,6 +1403,8 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
                                                else (mine_at, truth, terms))
                 with summed_as_run():
                     other = dew if dew_fn is arm and here is mine_at else arm(*here)
+                    if not at and arm is reference_fn and arm is not dew_fn and here is ordered[0][1]:
+                        _of_its_inputs(label, "the reference", arm, here, other)
                 evidence = _evidence(prepared, other, true_here, shared=true_here is truth,
                                      their_terms=terms_here)
                 rows[at_arm] = evidence if rows[at_arm] is None else [
@@ -1503,16 +1591,15 @@ def _judgement(draws: _Draws, label: str, tails: tuple[float, float] = (LOWER_TA
             measure = (log_sum(a) - log_sum(b)) / 2
             found = None
             if status == "inconclusive" and contained and typical:
-                # The pooled ratio's sums unresolved: its typical draw passes it where that decides, within
-                # the pooled ratio's own certificate.
-                found = _typical_status(a, b, max(high, ratio), tails)
+                # The pooled ratio's sums unresolved: its draws' paired ratios pass it where they qualify.
+                found = _typical_status(a, b, tails)
                 status = found[0]
             if status == "inconclusive":
                 unresolved.append(Finding(
                     leaf, "inconclusive", measure, f"{leaf}: inconclusive: the pooled ratio {ratio:.3f}'s "
                     f"interval over {count} seeds is [{low:.3f}, {high:.3f}], wider than {PARITY}"
                     + ("" if found is None else f", and the typical draw's {found[1]:.3f}'s "
-                       f"[{found[2]:.3f}, {found[3]:.3f}] with the pooled high end against {PARITY ** 2}")
+                       f"[{found[2]:.3f}, {found[3]:.3f}]: {found[4]}")
                     + "; give the site larger inputs or more seeds (`seeds_for`)"))
             elif status == "over":
                 over.append(Finding(leaf, "pooled", measure, f"{leaf}: dew's RMS error from float64 is "
