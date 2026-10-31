@@ -6,12 +6,13 @@ import json
 import os
 import subprocess
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+from lane_environment import outside_suite
 from flax import linen as nn
 
 from dew.inference import RunProcessor, TextGeneration
@@ -95,6 +96,31 @@ def decode_through(module: nn.Module, variables, hidden, prefill: int):
     return jnp.concatenate(outputs, axis=1), allocated["cache"], cache["cache"]
 
 
+def called_outputs(forward: Callable[[int], jax.Array], calls: Sequence[tuple[int, int]]) -> jax.Array:
+    """A sequence's outputs at the shapes a cached rollout's `calls` compute them, each `(lo, hi)` a call
+    over positions `lo` to `hi`, `forward(n)` a forward over the sequence's first `n` positions: each
+    call's positions from a forward of its own over the sequence up to the call's last, at the width
+    the call reads (ledger 1543, the gate's ruling: a call's reference at the shapes the call computes,
+    where one forward over the whole sequence would compute every call's products at one row count,
+    which a GPU's kernel rounds apart by row count). Joined along the sequence, as one forward over it
+    would be; a float64 truth, whose products round alike at every shape, reads that one forward."""
+    return jnp.concatenate([forward(hi)[:, lo:hi] for lo, hi in calls], axis=1)
+
+
+def stepped_outputs(forward: Callable[[int], jax.Array], length: int, prefill: int) -> jax.Array:
+    """A sequence's outputs `[B, length, ...]` at the shapes a cached decode computes them (`called_outputs`),
+    `forward(n)` a forward over its first `n` positions: a prefill of its first `prefill` positions, then
+    one position a step."""
+    return called_outputs(forward, [(0, prefill), *((position, position + 1)
+                                                     for position in range(prefill, length))])
+
+
+def as_stepped(forward: Callable[[jax.Array], jax.Array], sequence: jax.Array, prefill: int) -> jax.Array:
+    """`forward`'s outputs over `sequence` `[B, S, ...]` at the shapes a cached decode computes them
+    (`stepped_outputs`)."""
+    return stepped_outputs(lambda length: forward(sequence[:, :length]), sequence.shape[1], prefill)
+
+
 def float64_twin(model: nn.Module) -> nn.Module:
     """`model` computing in float64, its own `dtype` and every module it
     holds: the truth a float32 run's rounding is measured from."""
@@ -173,8 +199,7 @@ def streamed_export(writer: str, argument: Path, directory: Path, shard_size: st
     CPU device, as a user's has (the suite's simulated mesh would place every leaf eight times over),
     so no heap the writer freed is there for the save to reuse."""
     root = Path(__file__).resolve().parents[1]
-    env = {**{name: value for name, value in os.environ.items() if name != "XLA_FLAGS"},
-           "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(root / "src")}
+    env = {**outside_suite(os.environ), "PYTHONPATH": str(root / "src")}
     written = subprocess.run([sys.executable, "-c", writer, str(argument), str(directory / "source")],
                              capture_output=True, text=True, env=env)
     assert written.returncode == 0, written.stderr[-2000:]

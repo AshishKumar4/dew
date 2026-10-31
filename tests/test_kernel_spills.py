@@ -147,27 +147,24 @@ with report.refusals():
     state = run.fit(BATCH, steps=1, log_every=1)
     first, *_ = listed(record(run.plan, "plan")["probes"], "probes", read=record, what="probes")
     print(json.dumps({"step": int(state.step), "ahead": first["ahead"],
-                      "stepped": [miss.stepped for miss in report.misses()],
-                      "native_artifact": run.executable._executable_digest().hex()}))
+                      "stepped": [miss.stepped for miss in report.misses()]}))
 """
 """A run on this host's GPU, in a registry of its own, handed the step compiled ahead at argv[2], or
 none where it is empty."""
 
 
 def a_cached_spilling_run_trains_its_stepped_program(tmp_path, nonce):
-    """A restart over the same cache runs the stepped-down artifact, not the previously refused one.
-    Different compiler flags compile and judge their own native artifact, without inherited refusals.
-    """
+    """A restart over the same cache reads the cached first program's kernel binaries, finds the spill
+    again and steps down to the stepped program, not the refused one. Different compiler flags compile and
+    judge their own program, without inherited refusals."""
     shared, flags = tmp_path / "cache", os.environ.get("XLA_FLAGS", "")
     first = fresh(PRELUDE + HANDED, str(nonce), "", cache_dir=shared, flags=flags)
     again = fresh(PRELUDE + HANDED, str(nonce), "", cache_dir=shared, flags=flags)
     assert first["step"] == again["step"] == 1
     assert first["stepped"][:1] == again["stepped"][:1] == [True]
-    assert again["native_artifact"] == first["native_artifact"]
     other = fresh(PRELUDE + HANDED, str(nonce), "", cache_dir=shared,
                   flags=f"{flags} --xla_gpu_enable_latency_hiding_scheduler=true")
     assert other["step"] == 1 and other["stepped"][:1] == [True]
-    assert other["native_artifact"] != first["native_artifact"]
 
 
 SCOPED = """
@@ -304,19 +301,6 @@ def test_a_programs_calls_of_two_shapes_compile_at_once_from_two_threads():
     with ThreadPoolExecutor(2) as pool:
         outputs = list(pool.map(run, (jnp.ones(2), jnp.ones(3))))
     np.testing.assert_array_equal(outputs[1], jnp.full(3, 2.0))
-
-
-def test_a_program_without_mosaic_compiles_while_kernel_reports_are_held(tmp_path):
-    """A plain program needs no Mosaic report: another thread's report scope must not block its compile."""
-    from concurrent.futures import ThreadPoolExecutor
-
-    from dew.nn.kernels.templates import report
-
-    run = program(lambda x: x * 7 + 3)
-    values = np.arange(11, dtype=np.float32)
-    with ThreadPoolExecutor(1) as pool, report.reported(str(tmp_path)):
-        executable = pool.submit(run.executable, values).result(timeout=30)
-    np.testing.assert_array_equal(executable(values), values * 7 + 3)
 
 
 def test_a_program_is_its_jit_within_another_trace_and_keys_its_statics_as_jit_does():

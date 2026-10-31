@@ -162,12 +162,13 @@ class DiffusionRunConfig(RunConfig):
     autoencoder: PretrainedAutoencoder | None = None
     """The autoencoder for latent diffusion; None trains in pixel space."""
     pretrained: str | None = None
-    """A published diffusion pipeline to fine-tune.
+    """A published diffusion pipeline to fine-tune, or a saved diffusion run to start from.
 
-    It is a Hub repo, `repo@revision` or a local directory in the diffusers layout.
-    The checkpoint decides the model, its text conditioning and its autoencoder, so
-    `--model` holds only the precision settings and `text` and `autoencoder` stay
-    unset.
+    It is a Hub repo, `repo@revision` or a local directory in the diffusers layout,
+    or a saved Dew run's directory, which loads as its own sampling task at the step
+    `--source.step` selects (`load_diffusion_source`). The checkpoint decides the
+    model, its text conditioning and its autoencoder, so `--model` holds only the
+    precision settings and `text` and `autoencoder` stay unset.
     """
     teacher_run: str | None = None
     """The run directory a distillation's teacher trained in. Its published weights are the frozen
@@ -394,7 +395,8 @@ class DiffusionRunConfig(RunConfig):
                 objective = dataclasses.replace(
                     objective, fields={**objective.fields, "alignment": to_record(pinned, Alignment)})
         pretrained = None if self.pretrained is None else pinned_source(self.pretrained)
-        return dataclasses.replace(super().pinned(), objective=objective, pretrained=pretrained)
+        return dataclasses.replace(super().pinned().with_pinned_run(self.pretrained), objective=objective,
+                                   pretrained=pretrained)
 
     def _scratch(self, variables: Variables | None):
         """The registry's model, the run's text or audio condition and its
@@ -430,7 +432,7 @@ class DiffusionRunConfig(RunConfig):
         return None if held is None else dtype_name(resolve_dtype(str(held)))
 
     def _source(self, variables: Variables | None):
-        """The `pretrained` pipeline at the data's resolution: its own
+        """The `pretrained` pipeline, or saved run's task, at the data's resolution: its own
         weights, or `variables` bound over its metadata."""
         from dew.interop.pretrained import load_diffusion_source
         from dew.interop.sources import SourceReference
@@ -447,7 +449,8 @@ class DiffusionRunConfig(RunConfig):
             size=self.sample_field().shape[:-1],
             variables=variables, mesh=placement.get("mesh"), layout=placement.get("layout"),
             text_only=placement.get("text_only", False), prediction_depths=placement.get("prediction_depths"),
-            modeling_overrides=placement.get("modeling_overrides"))
+            modeling_overrides=placement.get("modeling_overrides"), step=placement.get("step"),
+            ema=placement.get("ema"))
 
     def _process(self, convention: Process | None) -> Process:
         """The preset's process, which must be of the kind the pretrained

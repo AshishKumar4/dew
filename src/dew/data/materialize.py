@@ -169,7 +169,7 @@ def _memory_inputs(
                     raise TypeError("cached input must return its tuple of expansion outputs")
                 for child, value in enumerate(_CachedOutputs().flat_map(outputs)):
                     if isinstance(value, Rejected):
-                        counter.rejected[value.reason] += 1
+                        counter.dropped(value)
                     elif automatic:
                         rows.append((source.identifiers[index] if isinstance(source, _Memory) else (index,),
                                      value))
@@ -295,7 +295,7 @@ def _memory_stages(
             for (identifier, _), outputs in zip(rows, made, strict=True):
                 for child, output in enumerate(outputs):
                     if isinstance(output, Rejected):
-                        counter.rejected[output.reason] += 1
+                        counter.dropped(output)
                     else:
                         output_id = (*identifier, child) if isinstance(stage, FlatMap) else identifier
                         expanded.append((output_id, output))

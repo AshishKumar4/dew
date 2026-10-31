@@ -68,6 +68,7 @@ from dew.distributed.batches import (
     batch_signature,
     placed_abstract,
     prefetched_bytes,
+    shard_batch,
     split_fields,
 )
 from dew.distributed.host import snapshot
@@ -80,6 +81,7 @@ from dew.distributed.placement import (
     placed_bytes,
     placed_shapes,
 )
+from dew.held_updates import waiting
 from dew.inputs import Field, InputSpec
 from dew.mesh import SEQUENCE_AXIS, STAGE_AXIS, TENSOR_AXIS, LayoutRefused, LogicalAxes
 from dew.nn.flops import MissingFlopsCount
@@ -110,17 +112,10 @@ from dew.optim import held_rates, learning_rate, scaled_rates, settable_rates, w
 from dew.state import MODEL_STATE, Accumulation, TrainState, apart, drawn_in, kept_window, together
 from dew.telemetry import profile as telemetry_profile
 from dew.telemetry.instrumentation import StepFlops
-from dew.telemetry.profile import region
-from dew.telemetry.records import (
-    AxisLink,
-    CheckpointRequested,
-    FitEnded,
-    FitStarted,
-    ProfileWindow as ProfileWindowRecord,
-    Record,
-    StepCompiled,
-)
+from dew.telemetry.profile import exported as telemetry_exported, region
+from dew.telemetry.records import AxisLink, CheckpointRequested, FitEnded, FitStarted, Record, StepCompiled
 from dew.training._fit import (
+    Emptied,
     FitPlan,
     FitRun,
     HandedSplits,
@@ -134,7 +129,10 @@ from dew.training._fit import (
     first_batch,
     fit_policies,
     handed_splits,
-    refuse_unclocked,
+    pooled,
+    pooled_first,
+    pooled_read,
+    restored,
     stage_reached,
     unrecorded_parts,
     validation_read,
@@ -196,7 +194,7 @@ from dew.training.planning import (
     splits,
     whole_step,
 )
-from dew.training.profiling import ProfileWindow, owned_capture, pgle_runs, stop_capture
+from dew.training.profiling import ProfileWindow, owned_capture, pgle_runs, reported_window, stop_capture
 from dew.training.rollout import Rollout, _branched, _reported, _rollout_metrics, rolled_out
 from dew.training.rungs import keep_rung, plan_flops, recorded_launches, recorded_rung
 from dew.training.runtime import Preempted, PreemptionNotice, ready_process
@@ -211,6 +209,7 @@ from dew.training.transaction import (
     compact_qk,
     loss_scale,
     outcome,
+    refuse_unpassed_progress,
     window_dropped,
     with_ema,
 )
@@ -297,6 +296,7 @@ class Trainer(Generic[Loss, Effects]):
         `param_dtype` (`dew.state.drawn_in`); None keeps each module's own.
         `inspection` names what the run watches at its sampled steps (`dew.training.inspection`).
         """
+        layout = objective.placement(layout)  # as its models place their trees (a tier-3 plan, ledger 2777)
         whole = read_whole(accumulation, split, step, layout, rollout, mesh)
         self.objective = objective
         built = isinstance(optimizer, optax.GradientTransformation)
@@ -429,7 +429,7 @@ class Trainer(Generic[Loss, Effects]):
             raise ValueError(
                 f"the objective's tree has no params collection, only {sorted(params)}; "
                 "the optimizer moves params and treats every other collection as state")
-        ema = self.objective.ema
+        ema, opt_state = self.objective.ema, self._boxed_init(initialized, params["params"])
         return TrainState(
             step=jnp.zeros((), jnp.int32),
             microstep=jnp.zeros((), jnp.int32),
@@ -439,13 +439,13 @@ class Trainer(Generic[Loss, Effects]):
                 lambda leaf: jnp.array(leaf, copy=True), self._loss_scale),
             window_size=jnp.asarray(self.accumulation, jnp.int32),
             variables=params,
-            opt_state=self._boxed_init(initialized, params["params"]),
+            opt_state=opt_state,
             # The average starts equal to the parameters but as its own buffers: the step donates
             # the state, and a buffer can be donated once.
             ema=None if ema is None else jax.tree.map(jnp.copy, select(params, ema.select)),
             key=run_key,
             consumed=None if self._examples is None else jnp.zeros((), jnp.int32),
-        )
+            deferred=waiting(opt_state))
 
     @property
     def key(self) -> jax.Array:
@@ -674,7 +674,7 @@ class Trainer(Generic[Loss, Effects]):
         share = DataPartition.of(self.device_mesh) if positioned else None
         state, position = checkpoints.restore(placed_shapes(abstract, shardings), resume, share=share,
                                               served=self.objective.served_groups(abstract.variables))
-        refuse_unclocked(state, resume, self._examples)
+        state = restored(state, resume, self._examples)
         if self._config is not None:
             # The rate this run configures, not the one its checkpoint holds.
             state = dataclasses.replace(state, opt_state=with_rates(state.opt_state, self._config.rates()))
@@ -929,9 +929,8 @@ class Trainer(Generic[Loss, Effects]):
             return Transaction(self.objective, self.optimizer, split * self.accumulation, shapes, copies,
                                split=split, record=self.record, fetch=fetch, examples=self._examples,
                                inspection=self.inspection if sampled else None).step()
-        if not isinstance(self.step, PassesProgress):
-            # A custom step need not run the objective's loss, which refuses a model it passes no progress.
-            self.objective._refuse_unpassed_progress()
+        # A custom step need not run the objective's loss, which passes a model the run's progress.
+        refuse_unpassed_progress(self.objective, passes=isinstance(self.step, PassesProgress))
         custom = self.step(self.objective, self.optimizer)
 
         def run(current, batch, part, tokens, closes=None):
@@ -1491,7 +1490,8 @@ class Trainer(Generic[Loss, Effects]):
                     state, loss, aux, finite, accepted, committed = train_step(
                         state, device, sampled=self.inspection is not None and self.inspection.samples(
                             run.current + 1))
-                # Written off the loop, which never waits on it (row 2313).
+                # Written off the loop, which never waits on it (row 2313), its clock the step it sees done.
+                interval.seen()
                 self._read_taken(run, wait=False)
                 if self._unproven:
                     # A step's failure on the devices surfaces at the next program that reads its
@@ -1549,8 +1549,10 @@ class Trainer(Generic[Loss, Effects]):
         # A run's last log is written at its cleanup, a failed run's only where no write waits on a step
         # its peers may never finish (`LogWriter.raise_failure`).
         unread = functools.partial(self._read_taken, run, agree=False)
+        # This rank's window's export alone: a failed one fails every rank at `_reported_outcome`'s agreement.
+        exported = None if profile is None else functools.partial(telemetry_exported, profile.directory)
         cleanups = (("Training log", unread), ("Log writer", run.writer.close), ("Training iterator", close),
-                    ("Profiler", stop_trace),
+                    ("Profiler", stop_trace), ("Profile export", exported),
                     ("Checkpoint wait", None if checkpoints is None else checkpoints.wait),
                     ("Display", self._display.close))
         try:
@@ -1743,9 +1745,12 @@ class Trainer(Generic[Loss, Effects]):
             # corpus, and none reads a record before all agree it is one.
             agreed_same("training data", lambda: (
                 f"{plan.dataset.batch} records a step of {stream_identity(source)}"))
-        run.endless = stream_endless(source)
+        run.endless, run.pooled = stream_endless(source), pooled(self._examples)
         self._marked = marked(run.partition, self._counted_batch)
         prepare = self._marked if self.rollout is None else None
+        if run.pooled:
+            run.emptied = Emptied(functools.partial(pooled_first, plan.dataset, run.partition), self._marked,
+                                  functools.partial(shard_batch, self.device_mesh, reads=run.reads))
         return DevicePrefetchIterator(source, self.device_mesh, self._prefetch, source_state=position,
                                       reads=run.reads, prepare=prepare)
 
@@ -1812,7 +1817,8 @@ class Trainer(Generic[Loss, Effects]):
             with region("evaluate"), run.held():
                 # A checkpoint that ranks the steps reads every suite's score.
                 names = None if ranked else due
-                run.evaluation = self._evaluation(plan, state, shardings, run.training, names)
+                run.evaluation = self._evaluation(plan, state, shardings, run.training, names,
+                                                  examples=self._consumed(interval))
                 run.scored = frozenset(plan.suites if names is None else names)
                 run.other += run.evaluation.elapsed_seconds
         scores = (
@@ -1906,7 +1912,8 @@ class Trainer(Generic[Loss, Effects]):
                         break
                     self._scheduled(plan, branched)
                     assert branched.train is not None
-                    batch = agreed_next("cooldown read", branched.train)
+                    batch = (pooled_read(branched, branched.train, phase="cooldown read") if branched.pooled
+                             else agreed_next("cooldown read", branched.train))
                     if batch is None:
                         break
                     batch = rolled_out(self.rollout, cooled, batch, self.device_mesh, self._marked, counted,
@@ -1934,7 +1941,8 @@ class Trainer(Generic[Loss, Effects]):
         else:
             suites = {f"cooldown_{name}": suite for name, suite in plan.suites.items()}
             self._evaluation(dataclasses.replace(plan, suites=suites, summaries=()),
-                             dataclasses.replace(cooled, step=step_at), shardings, {})
+                             dataclasses.replace(cooled, step=step_at), shardings, {},
+                             examples=self._consumed(interval, counted))
         if checkpoints is not None and not cut:
             checkpoints.cooling(None)
         for leaf in (leaf for leaf in jax.tree.leaves(apart(cooled)[0]) if not leaf.is_deleted()):
@@ -2068,7 +2076,8 @@ class Trainer(Generic[Loss, Effects]):
             missing = [name for name in plan.suites if name not in scored]
             if not plan.suites or missing:
                 run.evaluation = self._evaluation(plan, state, shardings, run.training, missing,
-                                                  joined=None if joined is None else joined.scores)
+                                                  joined=None if joined is None else joined.scores,
+                                                  examples=self._consumed(interval))
                 run.other += run.evaluation.elapsed_seconds
             assert run.evaluation is not None
             scores = run.evaluation.scores
@@ -2110,9 +2119,16 @@ class Trainer(Generic[Loss, Effects]):
             for split, suite in plan.suites.items():
                 admit_split(self.objective, suite.data, self.device_mesh, split)
 
+    def _consumed(self, *intervals: Interval) -> int | None:
+        """The examples a run on the examples clock had consumed, as its host counted them over `intervals`
+        (`Interval.consumed`: the run's, and a cooldown branch's beyond it), the count its log records;
+        None for a run counted in steps."""
+        return None if self._examples is None else sum(interval.consumed for interval in intervals)
+
     def _evaluation(self, plan: FitPlan, state: TrainState, shardings: Placement[TrainState],
                     training: Mapping[str, jax.Array], names: Sequence[str] | None = None, *,
-                    warm: bool = False, joined: Mapping[str, float] | None = None) -> Evaluation:
+                    warm: bool = False, joined: Mapping[str, float] | None = None,
+                    examples: int | None = None) -> Evaluation:
         """Score the suites in `names`, every suite when None, as one evaluation, joined to the scores
         the step's earlier evaluation of the others recorded (`joined`, `_wind_down`).
 
@@ -2124,7 +2140,7 @@ class Trainer(Generic[Loss, Effects]):
         chosen = list(plan.suites if names is None else names)
         if not chosen:
             return self._evaluate(state, shardings, None, (), plan.preview, split="val", training=reports,
-                                  warm=warm)
+                                  warm=warm, examples=examples)
         evaluations = []
         for split in chosen:
             suite = plan.suites[split]
@@ -2135,7 +2151,7 @@ class Trainer(Generic[Loss, Effects]):
                     and not any(metric.name == 'loss' for metric in suite.metrics))
             evaluations.append(self._evaluate(state, shardings, suite.data, suite.metrics, plan.preview,
                                               loss=loss, split=split, training=reports, warm=warm,
-                                              scored_to=plan.scored_to))
+                                              scored_to=plan.scored_to, examples=examples))
         scores = {**(joined or {}),
                   **{name: value for report in evaluations for name, value in report.scores.items()}}
         # Each summary is formed once a step, here, by the evaluation that completes the splits it weighs.
@@ -2346,6 +2362,7 @@ class Trainer(Generic[Loss, Effects]):
         except BaseException as failure:
             if error is None:
                 error = failure
+        error = reported_window(self._report, self._display.note, self.profile, run.profiled, error)
         if error is None:
             def report_goodput() -> None:
                 if jax.process_index() == 0:
@@ -2406,6 +2423,7 @@ class Trainer(Generic[Loss, Effects]):
         training: Mapping[str, jax.Array] | None = None,
         warm: bool = False,
         scored_to: str | None = None,
+        examples: int | None = None,
     ) -> Evaluation:
         """Score the validation split with this state's variables and report
         it, returning the seconds it took: the run's, but not its steps',
@@ -2439,6 +2457,10 @@ class Trainer(Generic[Loss, Effects]):
                 averaged=averaged, preview=preview, mesh=mesh, loss=loss, split=split, training=training,
                 warm=warm, updates=state.updates,
                 scored_to=None if scored_to is None else os.path.join(scored_to, f"step-{int(state.step)}"))
+        # On the examples clock an evaluation is placed by the examples the run had consumed, as its host
+        # counted them, its record their coordinate beside its step.
+        if examples is not None:
+            evaluation = dataclasses.replace(evaluation, examples=examples)
         if not warm:
             # The training values ride along for ranking (`_ranking`); the log interval reports
             # them, so the evaluation's own report leaves them out.
@@ -2466,8 +2488,9 @@ class Trainer(Generic[Loss, Effects]):
     # ------------------------------------------------------------------
 
     def _stop_trace(self, run: FitRun, profile: ProfileWindow, profiler: Profiler) -> None:
-        """Stop the window's owned capture (`stop_capture`), then report it on process zero."""
+        """Stop the window's owned capture (`stop_capture`), its reports exported beside the steps after
+        it until the run's cleanup waits for them and its outcome reports the window
+        (`_reported_outcome`)."""
         stop_capture(profiler, run.loss)
-        self._report(ProfileWindowRecord(profile.directory, run.traced), run.current)
-        agreed("profile announcement", lambda: self._display.note(
-            f"Wrote profile for {run.traced} steps to {profile.directory}"))
+        run.profiled = (run.traced, run.current)
+

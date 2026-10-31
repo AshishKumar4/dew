@@ -2,16 +2,21 @@
 
 import gzip
 import json
+import os
 import shutil
+import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import pytest
+from export_support import Stalled
 from steady_state import guarded
 
 import dew
+from dew.telemetry import profile
 from dew.telemetry.profile import active_profile, program_kernels
 
 
@@ -79,6 +84,55 @@ def test_manual_context_and_restart_preserve_each_native_capture(tmp_path, nativ
                     if artifact.suffix == ".json":
                         json.loads(artifact.read_bytes())
     assert result.is_ready()
+
+
+def test_a_stop_that_does_not_wait_returns_while_its_capture_exports(tmp_path, native_reports, monkeypatch):
+    """A capture stopped without waiting (`Profiler.stop(wait=False)`, a training window's) is stopped at
+    once, and its caller goes on while its reports and manifest are made: with its export held at its
+    start (`Stalled`), the stop returns and no manifest is written until the test releases it, then
+    `exported` waits for a whole one (row 2017). One that waits has made them as it returns."""
+    stalled = Stalled.under(tmp_path / "stalled", monkeypatch)
+    profiler = dew.Profiler(tmp_path / "beside").start()
+    work().block_until_ready()
+    profiler.stop(wait=False)
+    assert not profiler.running and active_profile() is None
+    (capture,) = captures(tmp_path / "beside")
+    assert not (capture / "manifest.json").exists()
+    stalled.release()
+    profile.exported(tmp_path / "beside")
+    assert stalled.released
+    record = manifest(capture)
+    assert record["capture_status"] == record["export_status"] == "completed"
+    assert any(report["status"] == "completed" for report in record["reports"])
+    waited = dew.Profiler(tmp_path / "waited").start()
+    work().block_until_ready()
+    waited.stop()
+    assert manifest(*captures(tmp_path / "waited"))["export_status"] == "completed"
+
+
+def test_a_program_read_from_stdin_exports_beside_itself_and_runs_once(tmp_path, native_reports):
+    """A program that stops its capture without waiting runs once, its export in an interpreter of the
+    exporter alone (`dew.telemetry.export`), never the program again: one read from stdin, which no
+    process could run a second time, writes its manifest, and its own lines are written once."""
+    script = f"""
+import jax.numpy as jnp
+import dew
+from dew.telemetry import profile
+with open({str(tmp_path / "runs")!r}, "a") as runs:
+    runs.write("ran\\n")
+profiler = dew.Profiler({str(tmp_path / "capture")!r}).start()
+(jnp.ones((32, 32)) @ jnp.ones((32, 32))).block_until_ready()
+profiler.stop(wait=False)
+profile.exported()
+"""
+    # The Dew under test first on the program's path, as on this one's.
+    source = str(Path(dew.__file__).resolve().parents[1])
+    path = os.pathsep.join([source, *filter(None, [os.environ.get("PYTHONPATH")])])
+    subprocess.run([sys.executable, "-"], input=script, text=True, check=True,
+                   env={**os.environ, "PYTHONPATH": path})
+    assert (tmp_path / "runs").read_text() == "ran\n"
+    record = manifest(*captures(tmp_path / "capture"))
+    assert record["export_status"] == "completed"
 
 
 def test_body_failure_keeps_trace_and_releases_for_next_capture(tmp_path, native_reports):

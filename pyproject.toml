@@ -18,13 +18,13 @@ dependencies = [
     "flax>=0.12.10,<0.13",
     # Dew's JAX build: 0.12.0.1 with the fixes no release has yet (constraints.txt
     # names them), which only Dew's package index serves, pypi.dewml.dev. The
-    # first build with every fix is post38; a release sorts below it, so an
+    # first build with every fix is post40; a release sorts below it, so an
     # install from PyPI alone stops at resolving jax rather than running on a
     # jax without them (docs/installation.md). The accelerator builds the
     # cuda12, cuda13 and tpu extras name are 0.12.0.1's. A bump runs the GPU
     # checks docs/installation.md lists under "Bumping JAX" first: CI is
     # CPU-only.
-    "jax>=0.12.0.1.post38,<0.12.1",
+    "jax>=0.12.0.1.post40,<0.12.1",
     "optax>=0.2.2",
     "orbax-checkpoint>=0.12.4",
     "numpy",
@@ -58,6 +58,10 @@ dependencies = [
     "s3fs>=2026.6.0",
     "pyarrow>=25.0.1",
     "array-record>=0.8.3; sys_platform != 'win32'",
+    # dew.nn.kernels.templates.report reads each Mosaic GPU kernel's binary from
+    # the protobuf its executable serializes; grain and orbax-checkpoint already
+    # depend on it.
+    "protobuf",
     # dew.nn.kernels.tuning: every Pallas launch is a tokamax Op, whose config
     # is measured per GPU model and shape. 0.0.13 and 0.0.14 pin
     # typeguard==2.13.3, which tyro excludes.
@@ -241,8 +245,10 @@ vision = ["torchvision>=0.29"]
 augment = ["albumentations>=2"]
 # Pretrained.load(fallback="torchax"): transformers' PyTorch forward lowered to
 # JAX. torchax 0.0.13 fails to import on torch 2.14; this nightly is the build
-# the fallback's tests ran against.
-torchax = ["torch>=2.14,<2.15", "torchax==0.0.14.dev20260922"]
+# the fallback's tests ran against. accelerate builds the model's parameters on
+# the meta device with its buffers computed (init_empty_weights), so the load
+# streams the checkpoint by name and holds no copy of the model on the host.
+torchax = ["torch>=2.14,<2.15", "torchax==0.0.14.dev20260922", "accelerate>=1.15"]
 # tests/kernel_compile.py compiles every declared Pallas kernel config for each GPU generation with the
 # compiler the GPU runs, XLA's CUDA backend of this jaxlib for a compile-only device (the Triton jaxlib
 # bundles, CUDA's libdevice and ptxas from the nvcc wheel, which Mosaic GPU's kernels compile through

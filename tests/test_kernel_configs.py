@@ -8,6 +8,7 @@ import functools
 import os
 import re
 import tempfile
+import threading
 from pathlib import Path
 
 import fla_gdn_support as support
@@ -222,6 +223,31 @@ class _OnlyTile(_Uncounted):
                 and super().candidate(ba, config, target))
 
 
+def _spilling_forward(launch, rows: int, devices):
+    """A paired SwiGLU forward of `launch` at `rows` rows, its abstract operands placed on `devices`."""
+    placed = jax.sharding.NamedSharding(devices, PartitionSpec())
+    shapes = [jax.ShapeDtypeStruct(shape, dtype, sharding=placed)
+              for shape, dtype in (((rows, 2048), jnp.bfloat16), ((8, 2048, 4096), jnp.bfloat16),
+                                   ((8, 2048, 4096), jnp.bfloat16), ((8,), jnp.int32))]
+
+    def forward(x, gate, up, sizes):
+        return launch(x, gate, sizes, paired=up, hooks=grouped_matmul.Hooks(
+            epilogue=lambda g, u: jax.nn.silu(g) * u), out_dtype="bfloat16", trans_rhs=False, interpret=False)
+
+    return forward, shapes
+
+
+def _lowering(forward, shapes, traced: list):
+    """`forward` lowered at `shapes` afresh at each call, the config its launch takes added to `traced`."""
+    def lowered():
+        with tuning.seen() as seen:
+            program = jax.jit(forward).trace(*shapes).lower()
+        traced.append(seen.taken[0][0])
+        return program
+
+    return lowered
+
+
 @lowers("sm90")
 @pytest.mark.parametrize("exhausted", [False, True])
 def test_a_spilling_launch_is_refused_and_its_derivation_steps_down_once(exhausted):
@@ -233,23 +259,9 @@ def test_a_spilling_launch_is_refused_and_its_derivation_steps_down_once(exhaust
     from dew.nn.kernels.templates import report
     from dew.training.ahead import compile_only_gpus
 
-    launch = _OnlyTile() if exhausted else _Uncounted()
     devices = jax.sharding.Mesh(np.array(compile_only_gpus("sm90")), ("data",))
-    placed = jax.sharding.NamedSharding(devices, PartitionSpec())
-    shapes = [jax.ShapeDtypeStruct(shape, dtype, sharding=placed)
-              for shape, dtype in (((4096, 2048), jnp.bfloat16), ((8, 2048, 4096), jnp.bfloat16),
-                                   ((8, 2048, 4096), jnp.bfloat16), ((8,), jnp.int32))]
     traced = []
-
-    def lowered():
-        def forward(x, gate, up, sizes):
-            return launch(x, gate, sizes, paired=up, hooks=grouped_matmul.Hooks(
-                epilogue=lambda g, u: jax.nn.silu(g) * u), out_dtype="bfloat16", trans_rhs=False,
-                          interpret=False)
-        with tuning.seen() as seen:
-            program = jax.jit(forward).trace(*shapes).lower()
-        traced.append(seen.taken[0][0])
-        return program
+    lowered = _lowering(*_spilling_forward(_OnlyTile() if exhausted else _Uncounted(), 4096, devices), traced)
 
     with (report.refusals(), generation.assumed("sm90"),
           jax.sharding.use_abstract_mesh(generation.gpu_mesh(devices, "sm90"))):
@@ -284,6 +296,54 @@ def test_a_spilling_launch_is_refused_and_its_derivation_steps_down_once(exhaust
         assert report.refused_launches() == refused
 
 
+@lowers("sm90")
+def test_a_compile_beside_other_threads_mosaic_compiles_reads_only_its_own_kernels():
+    """A run compiles its programs from several threads at once (scoring's pass shapes, row 2790). A compile
+    through `report.compiled` beside a thread compiling other spilling Mosaic programs throughout finishes,
+    refuses its own launch alone and steps it down: a scoring run crashed here, the compile's dump directory
+    removed under the other thread's writes, and the other thread's kernels read as the compile's own."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from dew.nn.kernels.templates import report
+    from dew.training.ahead import compile_only_gpus
+
+    devices = jax.sharding.Mesh(np.array(compile_only_gpus("sm90")), ("data",))
+    mesh = generation.gpu_mesh(devices, "sm90")
+    started, stop = threading.Event(), threading.Event()
+
+    def others():
+        # Launches of other rows, so other kernels, spilling as the reading compile's does; a failure
+        # releases the wait for it too, and its result raises it.
+        rows = 4096
+        try:
+            with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
+                while not stop.is_set():
+                    rows += 64
+                    forward, shapes = _spilling_forward(_Uncounted(), rows, devices)
+                    lowered = jax.jit(forward).trace(*shapes).lower()
+                    started.set()
+                    lowered.compile()
+        finally:
+            started.set()
+
+    traced = []
+    lowered = _lowering(*_spilling_forward(_Uncounted(), 4096, devices), traced)
+
+    with ThreadPoolExecutor(1) as pool:
+        other = pool.submit(others)
+        started.wait()
+        try:
+            with (report.refusals(), generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh)):
+                report.compiled(lowered(), relower=lowered)
+                refused = report.refused_launches()
+        finally:
+            stop.set()
+        other.result()
+    first, kept = traced
+    assert kept != first
+    assert [config for _, config, _ in refused] == [first]
+
+
 GEMM_SHAPES = {"qwen3 gate": (4096, 2048, 768, 128), "mixtral up": (4096, 4096, 14336, 8),
                "mixtral down": (4096, 14336, 4096, 8), "deepseek-v3 up": (4096, 7168, 2048, 256),
                "llama up": (4096, 4096, 14336, 1), "qwen3.5-4b up": (24576, 2560, 9216, 1),
@@ -299,11 +359,15 @@ PLAIN_FORMS = ("forward", "forward bf16", "forward fp16", "input gradient", "inp
                "kernel gradient", "kernel gradient fp32", "kernel gradient fp16")
 """The forms every family's GEMM launches emit: each product and output dtype they take."""
 
-HOOKED_FORMS = ("kernel gradient exact fp32", "scaled forward", "row scaled forward", "paired swiglu forward")
-"""The hooked and exactly summed forms whose register need the family's model prices (`Family.counts_hooks`,
-`grouped_matmul._priced`): epilogues over side vectors (a column or row scale), a paired product's SwiGLU
-over its two accumulators, and the running sum. A prologue, an epilogue's side tile and a second output are
-not yet priced; their calls take another launch."""
+HOOKED_FORMS = ("kernel gradient exact fp32", "normed biased forward", "normed biased input gradient",
+                "normed kernel gradient", "exact normed kernel gradient", "fp16 normed biased forward",
+                "cast forward", "gated forward", "gated kernel gradient", "residual forward",
+                "two bf16 outputs forward", "scaled forward", "row scaled forward", "paired swiglu forward",
+                "paired forward")
+"""The hooked and exactly summed forms a family whose model counts what they hold emits
+(`Family.counts_hooks`): prologues (a norm, a cast, SwiGLU's gate tile), epilogues over side vectors and a
+side tile, a second output, a paired product, and the running sum, each priced by what it materializes
+(`grouped_matmul._Mosaic.registers`)."""
 
 
 def _gemm_forms(rows: int, depth: int, width: int, groups: int) -> list:

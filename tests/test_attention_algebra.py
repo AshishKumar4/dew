@@ -139,6 +139,28 @@ MERGE_SEEDS = 8
 """The merge site's declared draws (check 1)."""
 
 
+@pytest.mark.parametrize("form", ["full", "causal"])
+def test_a_padded_call_whose_rows_stay_in_reach_keeps_its_folded_launch(form):
+    """A folded call padded past its queries (`Forward.queries`), whose real rows' maxima are finite and
+    within the fold's reach, keeps its folded launch's outputs: a padded query reads nothing, its maximum
+    -inf, which `walked_launches` reads over the call's own rows alone (the batch-2 review: over every row
+    a full or causal call's -inf took the natural rewalk on every padded call). A real row's -inf still
+    walks again natural (its products past fp32 below zero)."""
+    spec = algebra.Forward(form, 64, ids=False, scale=0.5, queries=48)
+    assert spec.base2
+
+    def launched(maxima):
+        def launch(launched_form, live, again=False):
+            del live, again
+            return jnp.float32(launched_form.natural), maxima, jnp.zeros(maxima.shape, bool)
+
+        return algebra.walked_launches(spec, launch, lambda live, guarded, plain: plain)
+
+    rows = jnp.full((1, 1, 64), 3.0).at[..., 48:].set(-jnp.inf)
+    assert float(launched(rows)) == 0.0
+    assert float(launched(rows.at[..., 5].set(-jnp.inf))) == 1.0
+
+
 def test_two_states_merged_are_on_par_with_one_pass_over_their_keys():
     """`merge` of the states over the first and second halves of a row's keys, in order, finished, is on
     par with one pass over all of them (check 1, against float64's), and `merge` with `empty` changes

@@ -238,14 +238,20 @@ def loaded(copies, issued: jax.Array | bool = True) -> None:
         plgpu.barrier_wait(barrier)
 
 
-def chunked(value: jax.Array, view, smem) -> list[tuple[jax.Array, object]]:
-    """`value` and its `view` a chunk of `smem`'s columns at a time, the whole where `smem` holds every one:
-    a stage narrower than the tile it moves (CUTLASS's sub-tiled epilogue, `staged_columns`)."""
+def column_chunks(value: jax.Array, width: int) -> list[tuple[int, jax.Array]]:
+    """`value` `width` of its columns at a time, each chunk with its first column, the whole where it is no
+    wider: a stage narrower than the tile it moves (CUTLASS's sub-tiled epilogue, `staged_columns`)."""
+    if width >= value.shape[-1]:
+        return [(0, value)]
+    return [(first, value[..., first:first + width]) for first in range(0, value.shape[-1], width)]
+
+
+def chunked(value: jax.Array, view, smem) -> list[tuple[jax.Array, Ref]]:
+    """`value` and its `view` a chunk of `smem`'s columns at a time (`column_chunks`)."""
     width = smem.shape[-1]
     if width >= value.shape[-1]:
         return [(value, view)]
-    return [(value[..., first:first + width], view.at[..., pl.ds(first, width)])
-            for first in range(0, value.shape[-1], width)]
+    return [(piece, view.at[..., pl.ds(first, width)]) for first, piece in column_chunks(value, width)]
 
 
 def stored(parts, views, *, smem, wait: bool = True) -> None:
@@ -363,16 +369,9 @@ class Ring:
         return int(self.smem.shape[0])
 
     @property
-    def column_parts(self) -> int | None:
-        """Column tiles staged independently along a leading role axis, if the load barriers name one."""
-        return int(self.full.shape[1]) if len(self.full.shape) == 2 else None
-
-    @property
     def block(self) -> tuple:
-        """The logical block read from global memory, before its columns are staged per role."""
-        if self.column_parts is None:
-            return self.smem.shape[1:]
-        return (*self.smem.shape[2:-1], self.column_parts * self.smem.shape[-1])
+        """The block a slot holds."""
+        return self.smem.shape[1:]
 
     @property
     def multicast(self) -> tuple | None:
@@ -389,25 +388,13 @@ class Ring:
         """The producer's load of step `counter` from `view`, once its slot is free."""
         slot = self.slot(counter)
         pl.when(counter >= self.stages)(lambda: plgpu.barrier_wait(self.consumed.at[slot]))
-        if self.column_parts is None:
-            plgpu.copy_gmem_to_smem(view, self.smem.at[slot], self.full.at[slot],
-                                    collective_axes=self.multicast)
-        else:
-            width = self.smem.shape[-1]
-            for part in range(self.column_parts):
-                plgpu.copy_gmem_to_smem(view.at[..., pl.ds(part * width, width)],
-                                        self.smem.at[slot, part], self.full.at[slot, part],
-                                        collective_axes=self.multicast)
+        plgpu.copy_gmem_to_smem(view, self.smem.at[slot], self.full.at[slot], collective_axes=self.multicast)
 
     def acquire(self, counter):
         """A consumer's wait for step `counter`'s load: its slot. Each load is waited for once (a wait takes
         the barrier's next phase)."""
         slot = self.slot(counter)
-        if self.column_parts is None:
-            plgpu.barrier_wait(self.full.at[slot])
-        else:
-            for part in range(self.column_parts):
-                plgpu.barrier_wait(self.full.at[slot, part])
+        plgpu.barrier_wait(self.full.at[slot])
         return self.smem.at[slot]
 
     def at(self, counter):
@@ -429,23 +416,15 @@ class Ring:
 
 
 def ring(block: tuple, dtype, stages: int, *, consumers: int = 1, multicast: bool = False,
-         swizzle: int | None = None, column_parts: int | None = None) -> dict:
+         swizzle: int | None = None) -> dict:
     """A `Ring`'s allocations for `pl.run_scoped`: `stages` slots of `block` in `dtype` (their rows staged
     at `swizzle`, `staged`), a load barrier each, and a release barrier each that `consumers` arrive at,
     with `multicast` the `consumers` of each program of the cluster (`CLUSTER`), whose programs share the
     ring's blocks. `Ring(**allocated)` once scoped."""
     consumed = (plgpu.ClusterBarrier(collective_axes=(CLUSTER,), num_arrivals=consumers, num_barriers=stages)
                 if multicast else plgpu.Barrier(num_arrivals=consumers, num_barriers=stages))
-    stored = block if column_parts is None else _column_block(block, column_parts)
-    loads = stages if column_parts is None else (stages, column_parts)
-    return {'smem': staged((stages, *stored), dtype, swizzle), 'full': plgpu.Barrier(num_barriers=loads),
+    return {'smem': staged((stages, *block), dtype, swizzle), 'full': plgpu.Barrier(num_barriers=stages),
             'consumed': consumed}
-
-
-def _column_block(shape: tuple, parts: int) -> tuple:
-    if parts < 1 or shape[-1] % parts:
-        raise ValueError(f"{shape[-1]} columns do not split into {parts} equal role tiles")
-    return (parts, *shape[:-1], shape[-1] // parts)
 
 
 SWIZZLE_BYTES = 128
@@ -632,10 +611,6 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
         """The right operand's depth held in registers, including its storage orientation."""
         del transposed
         return self.fragment_depth(depth)
-
-    def swizzle_for(self, columns: int, dtype) -> int:
-        """The staging swizzle for a block whose contiguous extent is `columns` elements."""
-        return swizzle_for(dtype, columns)
     widest_product: int | None = None
     """The most columns one product spans (warpgroup MMA's 256, wgmma's widest N), which a tile's columns
     are at most; None where a tile's columns are many products' (mma.sync's 8 each), held by its
@@ -786,13 +761,11 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
 
     @abc.abstractmethod
     def streams(self, blocks: dict, stages: int, consumers: int,
-                multicast: tuple[str, ...] = (), swizzles: dict[str, int] | None = None,
-                column_streams: tuple[str, ...] = ()) -> Allocated:
+                multicast: tuple[str, ...] = (), swizzles: dict[str, int] | None = None) -> Allocated:
         """The scoped allocations of a stream of each `blocks[name]` `(shape, dtype)` in `stages` slots read
         by `consumers` (`opened` once scoped), each stream `multicast` names one the programs of a cluster
         share, loaded once between them (`kernel`'s `cluster`), each `swizzles` names staged at its swizzle
-        (`swizzle_for`; inference's own otherwise). A `column_streams` block stages each consumer's share
-        of its columns along a leading role axis, with static copies and one load completion per share."""
+        (`swizzle_for`; inference's own otherwise)."""
 
     @abc.abstractmethod
     def opened(self, allocated: Allocated, views: dict | None = None) -> Opened:
@@ -868,28 +841,6 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
         """The scoped allocation of `count` whole loads' completions (`loaded`'s barriers), which a program's
         allocations hold beside its streams (`scoped`, `resources.Scope`)."""
         return plgpu.Barrier(num_barriers=count)
-
-    def column_staging(self, shape: tuple, dtype, consumers: int) -> dict:
-        """A resident block's per-role column tiles and their load completions."""
-        block = self.column_shape(shape, consumers)
-        return {'parts': staged(block, dtype, self.swizzle_for(block[-1], dtype)),
-                'barriers': self.load_barriers(consumers)}
-
-    def column_shape(self, shape: tuple, consumers: int) -> tuple:
-        """A column-partitioned block's physical shape: its independent tiles along the role axis."""
-        return _column_block(shape, consumers)
-
-    def column_part(self, ref, role):
-        """A role's native ref to its column tile, resident or streamed."""
-        return ref.at[role]
-
-    def columns_loaded(self, source, allocated: dict, *, issued: jax.Array | bool = True) -> None:
-        """Load a resident block into its per-role column staging, each source slice static."""
-        parts, barriers = allocated['parts'], allocated['barriers']
-        width = parts.shape[-1]
-        self.loaded(tuple((source.at[..., pl.ds(part * width, width)], self.column_part(parts, part),
-                           barriers.at[part]) for part in range(barriers.shape[0])),
-                    issued=issued)
 
     def schedule(self, consumers: int):
         """The scoped allocation of `consumers`' turns on the tensor cores (`turn`): one barrier each of
@@ -1053,14 +1004,6 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     warps implicitly takes as its share (`kernel`'s `reducing_warpgroups`, `resources.Scope`'s): a family
     whose kernels reserve no scratch by default (`reduction_scratch`)."""
 
-    def rows_summed(self, tile_ref, out_ref) -> None:
-        """A shared floating-point tile's columns summed at least in fp32, stored as a global vector.
-        The tile's writes are ready before entry; the load, reduction and store keep the family's layout.
-        """
-        values = plgpu.load(tile_ref, layout=self.layout, optimized=False)
-        summed = values.sum(axis=1, dtype=jnp.result_type(values.dtype, jnp.float32))
-        plgpu.store(out_ref, summed.astype(out_ref.dtype), optimized=False)
-
     def column_sums(self, value: jax.Array, scratch, interpret: bool) -> jax.Array:
         """The sums of `value`'s columns `[columns]` in a column's layout, `value` `[rows, columns]` in the
         accumulator's layout: across the warps holding its rows, through the consumer's own `scratch`
@@ -1131,10 +1074,9 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
         roles(lax.axis_index("wg"), consumers, consumer, producer)
 
     def streams(self, blocks: dict, stages: int, consumers: int, multicast: tuple[str, ...] = (),
-                swizzles: dict[str, int] | None = None, column_streams: tuple[str, ...] = ()) -> dict:
+                swizzles: dict[str, int] | None = None) -> dict:
         return {name: ring(shape, dtype, stages, consumers=consumers, multicast=name in multicast,
-                           swizzle=(swizzles or {}).get(name),
-                           column_parts=consumers if name in column_streams else None)
+                           swizzle=(swizzles or {}).get(name))
                 for name, (shape, dtype) in blocks.items()}
 
     def opened(self, allocated: dict, views: dict | None = None) -> dict[str, Ring]:
@@ -1198,14 +1140,14 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
                 smem = smems[output].at[index]
                 buffers, width = smem.shape[0], smem.shape[-1]
                 row_start, first, stored, column, *ladder = place
-                for chunk in range(value.shape[1] // width):
+                for chunk, (start, piece) in enumerate(column_chunks(value, width)):
                     if chunk == 0 or chunk >= buffers:
                         # The buffer's last store (the last tile's, at its first chunk) has read it.
                         plgpu.wait_smem_to_gmem(0, wait_read_only=True)
                     buffer = smem.at[chunk % buffers]
-                    buffer[...] = value[:, chunk * width:(chunk + 1) * width].astype(smem.dtype)
+                    buffer[...] = piece.astype(smem.dtype)
                     plgpu.commit_smem()
-                    store_rows(buffer, ref, row_start, first, stored, column + chunk * width, *ladder)
+                    store_rows(buffer, ref, row_start, first, stored, column + start, *ladder)
 
             @plgpu.nd_loop(tiles, collective_axes=axis, init_carry=jnp.int32(0))
             def ended(loop: plgpu.NDLoopInfo, carry):
