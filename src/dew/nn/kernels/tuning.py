@@ -591,7 +591,7 @@ def lowered_once(static: tuple[str, ...], *, unless: Callable[[], bool] = lambda
             bound = signature.bind(*args, **kwargs).arguments
             if unless() or not all(holdable(bound[name]) for name in names if name in bound):
                 return launch(*args, **kwargs)
-            return jitted(report.launch_digest())(*args, **kwargs)
+            return jitted(None)(*args, **kwargs)
 
         return called
 
