@@ -220,18 +220,29 @@ def gradient(objective, variables, batch):
     return jax.grad(total)(variables)
 
 
-def located(tree, path: tuple[str, ...]):
-    """The node of a variables tree at a module's scope `path`, whose model applies it at the tree's root
-    or under one of its top-level modules: the one node there is."""
+def located(tree, path: tuple[str, ...], held) -> tuple[str, ...]:
+    """Where in a parameters tree a module whose scope is `path` holds `held`, its own parameters as its
+    apply read them: its model applies it at the tree's root or under one of its top-level modules, a
+    backbone's and a head's scopes alike (`layers_0/self_attn` in both), so the one place whose
+    parameters are `held`'s is its."""
     found = []
-    for root in (tree, *(node for node in tree.values() if isinstance(node, dict))):
-        node = root
-        for name in path:
+    for root in ((), *((name,) for name, node in tree.items() if isinstance(node, dict))):
+        node = tree
+        for name in (*root, *path):
             node = node.get(name) if isinstance(node, dict) else None
-        if node is not None:
-            found.append(node)
-    assert len(found) == 1, f"{path} is at {len(found)} places of the variables"
+        if node is not None and jax.tree.structure(node) == jax.tree.structure(held) and all(
+                np.array_equal(np.asarray(mine), np.asarray(its))
+                for mine, its in zip(jax.tree.leaves(node), jax.tree.leaves(held), strict=True)):
+            found.append((*root, *path))
+    assert len(found) == 1, f"{path} is at {len(found)} places of the parameters"
     return found[0]
+
+
+def at(tree, place: tuple[str, ...]):
+    """The node of `tree` at `place` (`located`)."""
+    for name in place:
+        tree = tree[name]
+    return tree
 
 
 READ = ("_heads", "__call__")
@@ -268,6 +279,7 @@ class AttentionTerms:
                     record[args[0]] = (args[1], out)
                     return out
                 record["documents"] = (kwargs["segment_ids"], kwargs.get("key_segment_ids"))
+                record["params"] = module.variables["params"]
                 record["out"] = out
                 return out + added[path] if path in added else out
 
@@ -280,8 +292,8 @@ class AttentionTerms:
         self.added: dict | None = None
 
     def __call__(self, variables) -> dict:
-        """The terms carried to each attention's projections, by its module path: each projection's
-        input and its heads' terms."""
+        """The terms carried to each attention's projections, by its place in the parameters (`located`):
+        each projection's input and its heads' terms."""
         if self.added is None:
             # Every draw's variables are of one tree, so its attentions' outputs of one shape.
             _, shapes = jax.eval_shape(self.total, variables, {})
@@ -297,11 +309,12 @@ class AttentionTerms:
             key_ids = query_ids if key_ids is None else key_ids
             queried = query_ids[:, None, :, None]
             keep = (queried == key_ids[:, None, None, :]) & (queried != 0)
-            kernel = located(variables["params"], path)[out_name]["kernel"]
+            place = located(variables["params"], path, record["params"])
+            kernel = at(variables["params"], place)[out_name]["kernel"]
             heads, width = queries.shape[2:]
             dout = jnp.einsum("bsf,hdf->bshd", cotangents[path], kernel.reshape(heads, width, -1))
             _, query_terms, key_terms, value_terms = attention_terms(queries, keys, values, dout, keep)
-            carried[path] = {name: (np.asarray(into, np.float64), terms) for name, into, terms in (
+            carried[place] = {name: (np.asarray(into, np.float64), terms) for name, into, terms in (
                 (query_name, into_queries, query_terms), (key_name, into_keys, key_terms),
                 (value_name, into_keys, value_terms))}
         return carried
@@ -311,8 +324,8 @@ def with_attention_terms(sized, carried: dict):
     """`sized`, a gradient's float64 terms (`float64_terms`), each attention projection's bias and kernel
     sized by at least the attention's terms carried to it (`AttentionTerms`)."""
     sized = jax.tree.map(np.array, sized)
-    for path, projections in carried.items():
-        node = located(sized["params"], path)
+    for place, projections in carried.items():
+        node = at(sized["params"], place)
         for name, (into, terms) in projections.items():
             leaf = node[name]
             squares = np.asarray(terms, np.float64) ** 2
