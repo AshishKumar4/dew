@@ -302,7 +302,9 @@ def _openai_gpt_config(hf: Mapping[str, object], used: set[str]) -> DecoderField
     config = gpt2_config({**hf, 'activation_function': spelled[afn], 'n_inner': None,
                           'vocab_size': hf.get('vocab_size', 40478),
                           'n_positions': hf.get('n_positions', 512)}, used)
-    used.update(('afn', 'predict_special_tokens'))
+    # The original release's `n_special`, which transformers' OpenAI GPT reads nowhere: its vocabulary
+    # counts the special tokens.
+    used.update(('afn', 'predict_special_tokens', 'n_special'))
     config.update({'pre_norms': False, 'post_residual_norms': True, 'final_norm': False})
     return config
 
