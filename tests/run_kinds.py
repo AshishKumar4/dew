@@ -29,7 +29,7 @@ from dew.diffusion.presets import Flow
 from dew.inputs import TextCondition
 from dew.registry import ModelConfig
 from dew.sampling import Euler
-from dew.training import Layout, MeshSpec
+from dew.training import Layout, LocalTracker, MeshSpec
 
 TINY_LAYA = Path(__file__).parent / "fixtures" / "laya" / "tiny"
 QWEN_TINY = Path(__file__).parent / "fixtures" / "hf" / "qwen38-dense-tiny"
@@ -139,11 +139,10 @@ ADAPTED = {"lm": ("q_proj",), "decision": ("q_proj",), "diffusion": ("ada_proj",
 DEFAULT_METRICS = {"lm": "val/perplexity", "decision": "val/accuracy"}
 """A metric each kind scores where `val_metrics` names none, for the kinds that score one."""
 def scalars(run: Path) -> dict[int, dict[str, float]]:
-    """Each step's scalars the run logged, joined."""
+    """Each step's scalars the run logged (`LocalTracker.scalars`), joined."""
     logged = {}
-    for line in (run / "tracking" / "scalars.jsonl").read_text().splitlines():
-        row = json.loads(line)
-        logged.setdefault(row["step"], {}).update(row["scalars"])
+    for step, values in LocalTracker(run / "tracking").scalars():
+        logged.setdefault(step, {}).update(values)
     return logged
 
 

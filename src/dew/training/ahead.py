@@ -50,7 +50,7 @@ import jax.experimental.topologies as topologies
 import numpy as np
 from jax.experimental import serialize_executable
 
-from dew._records import JSON, listed, record
+from dew._records import JSON, record
 from dew.batch import Batch
 from dew.cache import uncached
 from dew.nn.kernels.generation import GpuTarget, assumed, capability, gpu_target, tpu
@@ -392,11 +392,6 @@ class CompiledAhead(SystemExit):
             assert isinstance(probes, list)
             _log.info("planned on them in %.1f s, %d programs compiled, the plan %s", ahead.planned_seconds,
                       len(probes), json.dumps(ahead.plan))
-            for above in listed(record(ahead.plan, "plan").get("frontier", []), "frontier", read=record,
-                                what="frontier"):
-                _log.info("above it, fitting: %s x %s rows at remat %r, the head tile %s%s, %s bytes of "
-                          "temporaries", above["split"], above["rows"], above["remat"], above["head_tile"],
-                          " fused" if above["head_fused"] else "", above["temp"])
 
 
 def step_batch[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch) -> Batch:
@@ -444,6 +439,10 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
     if capacity is not None and on_tpus:
         raise ValueError(f"a TPU topology states its own memory; compile it ahead for {generation} with no "
                          "capacity")
+    if frontier and capacity is None and not on_tpus:
+        raise ValueError("a frontier lists the rungs that fit the GPUs' memory, which compile-only GPUs "
+                         "do not state; name it (--trainer.compile-ahead.capacity-gib, compile_ahead's "
+                         "capacity)")
     if capacity is not None:
         mesh = trainer.device_mesh
         devices = compile_only_gpus(generation, len(devices), capacity)

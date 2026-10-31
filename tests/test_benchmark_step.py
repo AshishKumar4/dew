@@ -49,6 +49,21 @@ def test_a_cpu_smoke_case_measures_a_finite_step_through_the_trainer(architectur
     except MissingFlopsCount:
         counted = None
     assert row["training_flops"] == counted
+    # The CPU step runs no launch its count leaves out; one that does is reported (row 3023).
+    assert row["unsized_kernels"] == 0
+
+
+def test_a_steps_count_some_launches_work_is_missing_from_reads_as_a_lower_bound():
+    """A row whose step runs launches no count sizes (`StepFlops.unsized`) shows its FLOPs and
+    utilization as the lower bounds they are, as the trainer names them train/hfu_lower_bound; a
+    complete count shows as it is (row 3023)."""
+    tool = load("benchmark_step")
+    row = {"architecture": "causal_transformer", "flops_per_step": 2e9, "utilization": 0.25, "mfu": 0.2}
+    counted, uncounted = (tool.format_table([{**row, "unsized_kernels": unsized}]).splitlines()[-1].split()
+                          for unsized in (0.0, 2.0))
+    assert [cell for cell in counted if cell in ("2.0", "25.0", "20.0")] == ["2.0", "25.0", "20.0"]
+    assert [cell for cell in uncounted if cell.endswith(("2.0", "25.0", "20.0"))] == [
+        ">=2.0", ">=25.0", "20.0"]
 
 
 def peak_row(tmp_path, platform: str, *arguments: str, settings: dict[str, str] | None = None) -> dict:

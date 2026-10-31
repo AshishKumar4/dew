@@ -11,6 +11,7 @@ costs, not a subtraction-based estimate of overlapping compute.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import json
 import math
@@ -32,6 +33,7 @@ from dew.nn.inputs import ModelInputs
 from dew.registry import models
 from dew.sampling.text import decode_ops, prefill_state
 from dew.telemetry.benchmark import resident_memory
+from dew.telemetry.profile import Profiler
 from dew.training import Layout, MeshSpec
 
 
@@ -141,13 +143,9 @@ def measure(config: DiskConfig):
             decode = decode.lower(variables, shapes, jnp.zeros((1,), jnp.int32)).compile()
         before = source.stats()
         before_io = storage_reads()
-        if config.trace:
-            jax.profiler.start_trace(config.trace)
-        try:
+        # The trace alone, which XProf opens as it is; the bank reads annotate it (`SafetensorsBanks`).
+        with Profiler(config.trace, reports=False) if config.trace else contextlib.nullcontext():
             runs = [run() for _ in range(config.repeats)]
-        finally:
-            if config.trace:
-                jax.profiler.stop_trace()
         after = source.stats()
         after_io = storage_reads()
         decode_seconds = sum(run[1] for run in runs)

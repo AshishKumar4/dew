@@ -39,7 +39,7 @@ class HF(Dataset):
     stream of it, or an `IterableDataset`, read over its shards whose
     positions its own `state_dict` checkpoints; the `.map()`s it holds are already applied. An
     image column reads as its encoded bytes, which `images.DecodeImage` decodes.
-    `name` is its identity in a run's plan, a cache's key and its logs, its
+    `identity` is its content version in a run's plan, a cache's key and its logs, its
     fingerprint by default; a stream has no fingerprint of its content, so
     it is named, with its version, or refused.
 
@@ -53,16 +53,17 @@ class HF(Dataset):
     cannot publish: publication needs the store's own shards."""
 
     dataset: datasets.Dataset | datasets.IterableDataset
-    name: str | None = None
+    identity: str | None = None
 
     def __post_init__(self) -> None:
         from datasets import IterableDataset
 
         if not isinstance(self.dataset, IterableDataset):
             return
-        if self.name is None:
-            raise ValueError("an IterableDataset has no fingerprint of its content; name it, with its "
-                             "version, so a resume can tell it from another stream: from_hf(dataset, name=)")
+        if self.identity is None:
+            raise ValueError("an IterableDataset has no fingerprint of its content; give its identity, with "
+                             "its version, so a resume can tell it from another stream: "
+                             "from_hf(dataset, identity=)")
         if _buffer_shuffled(self.dataset._ex_iterable):
             raise ValueError("an IterableDataset's own shuffle loses its buffer on resume; pass it "
                              "unshuffled and shuffle with the chain's shuffle(window=)")
@@ -74,13 +75,13 @@ class HF(Dataset):
         return isinstance(self.dataset, IterableDataset)
 
     def label(self) -> str:
-        return self.name or self.dataset.info.dataset_name or "hf"
+        return self.identity or self.dataset.info.dataset_name or "hf"
 
     def describe(self) -> str:
         from datasets import Dataset as Arrow
 
-        if self.name:
-            return f"hf:{self.name}"
+        if self.identity:
+            return f"hf:{self.identity}"
         if isinstance(self.dataset, Arrow):
             return f"hf:{self.dataset._fingerprint}"
         return f"hf:{type(self.dataset).__name__}"
@@ -216,10 +217,10 @@ class _Rows(Iterator[Batch]):
             self._rows.close()
 
 
-def from_hf(dataset: datasets.Dataset | datasets.IterableDataset, name: str | None = None) -> HF:
+def from_hf(dataset: datasets.Dataset | datasets.IterableDataset, identity: str | None = None) -> HF:
     """A Hugging Face `datasets.Dataset` or `IterableDataset` as a Dew
-    dataset (`HF`): an `IterableDataset` named, unshuffled."""
-    return HF(dataset, name)
+    dataset (`HF`): an `IterableDataset` with its `identity`, unshuffled."""
+    return HF(dataset, identity)
 
 
 def _buffer_shuffled(layer: _BaseExamplesIterable) -> bool:

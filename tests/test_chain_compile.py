@@ -121,7 +121,7 @@ def held_tokens():
 def test_fit_reads_validation_with_its_own_mode_loading_and_batch(named):
     train = from_grain(grain.MapDataset.source([{"id": np.int32(index)} for index in range(8)]),
                        "indexed-train").batch(4).read("indexed").workers(0)
-    held = from_iter(held_rows, name="streamed-held").batch(2).read("streamed").workers(0)
+    held = from_iter(held_rows, identity="streamed-held").batch(2).read("streamed").workers(0)
     data, readers = fitted(train, {"val": held} if named else held, objective=ObjectiveData())
     stream = data.train(DataPartition())
     try:
@@ -143,7 +143,7 @@ def test_fit_reads_validation_with_its_own_mode_loading_and_batch(named):
 def test_fit_trains_indexed_tokens_and_scores_its_independent_streamed_split(named):
     train = from_grain(grain.MapDataset.source(list(held_tokens())), "indexed-tokens")
     train = train.batch(16).read("indexed").workers(0)
-    held = from_iter(held_tokens, name="streamed-tokens").batch(8).read("streamed").workers(0)
+    held = from_iter(held_tokens, identity="streamed-tokens").batch(8).read("streamed").workers(0)
     objective = LMObjective(CausalTransformer(vocab_size=8, emb_features=8, num_layers=1,
                             num_heads=2, mlp_features=16, max_seq_len=8, attention_impl="xla"), seq_len=4)
     tracker = RecordingTracker()
