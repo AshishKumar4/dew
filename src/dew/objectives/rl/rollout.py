@@ -15,6 +15,7 @@ from dew.data.dataset import DataPartition
 from dew.data.prompts import INFO_KEY, LENGTH_KEY, PROMPT_KEY, SOURCE_KEY, TRUTH_KEY, PromptRecord
 from dew.inference.rollouts import INFRASTRUCTURE, Draw, response
 from dew.nn.inputs import ModelInputs, local_rows, mesh_of, pad_token_rows
+from dew.nn.progress import Progress
 from dew.sampling.text import Sampling
 
 from ..lm import TokenScorer
@@ -151,7 +152,10 @@ class PolicyCollector:
         mesh = mesh_of(snapshot.variables)
         prompts, width, inputs = (self._prepared(tasks) if mesh is None
                                   else agreed("rollout input preparation", lambda: self._prepared(tasks)))
-        generated = self.objective.policy(snapshot.variables, self.sampling)(
+        # The policy the step's loss reads, at the updates the run committed (`Objective.progress`), whose
+        # likelihoods are the proximal column's.
+        progress = Progress(jnp.asarray(snapshot.updates, jnp.int32))
+        generated = self.objective.policy(snapshot.variables, self.sampling, progress)(
             inputs, self.max_new_tokens, key=snapshot.key, n=samples).host()
         if mesh is not None and DataPartition.of(mesh).reader != 0:
             # A share's later reader drew its part of the program; the first reader scores the share.
