@@ -542,3 +542,30 @@ def test_a_race_without_a_renderer_shows_no_image():
     """A gate race without a renderer asked for images is refused."""
     with pytest.raises(ValueError):
         GateRace(None, Racing(), views=("image",), count=4)
+
+
+def test_an_asset_comes_out_of_hyperluxs_loader_as_it_was_made(tmp_path):
+    """A part the asset tool writes comes out of HyperLux's GLB loader, which turns glTF's y-up frame into the
+    race's by (x, y, z) to (x, -z, y) (rl_tools/hyperlux/datasets/glb/operations_cpu.h, `convert_mesh`), at
+    the points and normals it was made with: the ground lies flat at z = 0, a pillar stands along z."""
+    import json
+    import struct
+
+    from tools.fpv_assets import cylinder, flat, glb, ground
+
+    parts = [ground(flat((90, 120, 60)), extent=16.0, tile=8.0), cylinder(1.0, 6.0, flat((120, 120, 120)))]
+    glb(tmp_path / "parts.glb", parts)
+    data = (tmp_path / "parts.glb").read_bytes()
+    length = struct.unpack("<I", data[12:16])[0]
+    document, binary = json.loads(data[20:20 + length]), data[28 + length:]
+
+    def loaded(index):
+        accessor = document["accessors"][index]
+        view = document["bufferViews"][accessor["bufferView"]]
+        written = np.frombuffer(binary, np.float32, accessor["count"] * 3, view["byteOffset"]).reshape(-1, 3)
+        return np.stack([written[:, 0], -written[:, 2], written[:, 1]], -1)
+
+    for mesh, (positions, normals, *_) in zip(document["meshes"], parts, strict=True):
+        attributes = mesh["primitives"][0]["attributes"]
+        np.testing.assert_array_equal(loaded(attributes["POSITION"]), positions)
+        np.testing.assert_array_equal(loaded(attributes["NORMAL"]), normals)

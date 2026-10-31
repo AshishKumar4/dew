@@ -17,7 +17,9 @@
 
 Every texture is CC0 (polyhaven.com/license); the files are fetched from Poly Haven's API and its CDN and
 shrunk to 256 pixels (a sky's to 1024 by 512): the race's camera sees 96. A GLB here is written by
-`glb`, each part a node of its own with its own base-color texture (glTF 2.0, binary)."""
+`glb`, each part a node of its own with its own base-color texture (glTF 2.0, binary). Parts are made in the
+race's frame (x forward, y left, z up) and written in glTF's, y up (`gltf_frame`), which HyperLux's loader
+turns back into the race's."""
 
 import io
 import json
@@ -210,6 +212,13 @@ def rock(image: Image.Image, seed: int = 0) -> Part:
             np.asarray(faces, np.uint32), image)
 
 
+def gltf_frame(vectors: np.ndarray) -> np.ndarray:
+    """Points or directions `[N, 3]` of the race's frame (z up) in glTF's (y up): (x, y, z) to (x, z, -y), the
+    inverse of the turn HyperLux's GLB loader gives every vertex and normal, (x, y, z) to (x, -z, y)
+    (rl_tools/hyperlux/datasets/glb/operations_cpu.h, `convert_mesh`)."""
+    return np.stack([vectors[:, 0], vectors[:, 2], -vectors[:, 1]], -1).astype(np.float32)
+
+
 def glb(path: Path, parts: list[Part]) -> None:
     """`parts` written as a binary glTF 2.0 file, each a node and mesh of its own, its image a PNG base-color
     texture (repeating, linear) on an unlit-looking rough dielectric."""
@@ -242,8 +251,8 @@ def glb(path: Path, parts: list[Part]) -> None:
         textures.append({"sampler": 0, "source": len(images) - 1})
         materials.append({"pbrMetallicRoughness": {"baseColorTexture": {"index": len(textures) - 1},
                                                    "metallicFactor": 0.0, "roughnessFactor": 1.0}})
-        primitive = {"attributes": {"POSITION": accessor(positions, "VEC3", 5126, 34962),
-                                    "NORMAL": accessor(normals, "VEC3", 5126, 34962),
+        primitive = {"attributes": {"POSITION": accessor(gltf_frame(positions), "VEC3", 5126, 34962),
+                                    "NORMAL": accessor(gltf_frame(normals), "VEC3", 5126, 34962),
                                     "TEXCOORD_0": accessor(uvs, "VEC2", 5126, 34962)},
                      "indices": accessor(faces.reshape(-1), "SCALAR", 5125, 34963),
                      "material": len(materials) - 1}
