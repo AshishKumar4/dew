@@ -1963,8 +1963,9 @@ def test_a_kept_tasks_entry_stays_within_what_a_process_starts_with_however_high
     Linux starts a process with, and every kept row is reused (2026-10-31: main de315f9a05's kept rows were
     one task, whose 149,515-byte argument started none)."""
     verdict, _ = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
-    # Files named as long as a file system allows, enough that their kept rows pass the bound together.
-    names = [f"tests/test_{index:03d}{'x' * 240}.py" for index in range(240)]
+    # Files of long names (beside a fetched fixture's manifest name, within a file system's 255 bytes), enough
+    # that their kept rows' tokens and names pass what a process starts with together.
+    names = [f"tests/test_{index:03d}{'x' * 200}.py" for index in range(300)]
     written(tmp_path, {Path(name).name: f"def test_{index}():\n    pass\n"
                        for index, name in enumerate(names)})
     durations = tmp_path / "tests/test_durations.json"
