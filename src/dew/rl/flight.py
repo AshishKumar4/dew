@@ -374,6 +374,8 @@ def raced(racing: Racing, track: Track, action: jax.Array, kinematics: Kinematic
     simulator's), less `crash_penalty`, which ends the episode. An episode is cut after `max_steps` steps."""
     crashed, passed, across = struck(racing, track, path)
     crashed = crashed | collided
+    # A crash voids a passage in the same step, the simulator's as the race's own.
+    passed = passed & ~crashed
     rows = jnp.arange(track.index.shape[0])
     position = kinematics.position
     distance = jnp.linalg.norm(track.course[rows, track.index] - position, axis=-1)
