@@ -118,11 +118,8 @@ def warmed(path: Path):
 def scored(simulator, policy, params, memory, key: jax.Array, steps: int, *,
            film: Path | None = None) -> dict:
     """Each drone's first episode under `policy` (reading the driven step whole) over `steps` steps from
-    fresh episodes of `simulator`, an evaluation race of its own: its return, gates passed, whether it
-    crashed or finished an open track (an end whose step paid less than half the crash penalty is a crash)
-    and its steps, averaged over the drones, each read from the transitions the steps reach up to the
-    episode's last; with `film`, the first four drones' camera images after each step written there
-    `[steps, 4, H, W, 3]`."""
+    fresh episodes of `simulator`, an evaluation race of its own (`_first_episodes`); with `film`, the first
+    four drones' camera images after each step written there `[steps, 4, H, W, 3]`."""
     from dew.rl.simulator import DrivenSimulator, simulator_rollout, simulator_start
 
     driven = DrivenSimulator(simulator)
@@ -131,14 +128,24 @@ def scored(simulator, policy, params, memory, key: jax.Array, steps: int, *,
     observed = jax.device_get(taken.following.observation)
     if film is not None:
         np.savez_compressed(film, frames=observed["observation"]["image"][:, :4])
-    ended = np.cumsum(observed["last"], 0) - observed["last"] > 0
-    reward = np.where(ended, 0, observed["reward"])
-    passed = np.where(ended, 0, observed["observation"]["passed"]).max(0)
-    terminal = observed["terminal"] & ~ended
-    crashed = terminal & (observed["reward"] < -simulator.racing.crash_penalty / 2)
-    return {"return": float(reward.sum(0).mean()), "gates": float(passed.mean()),
-            "gates_max": int(passed.max()), "crashed": float(crashed.any(0).mean()),
-            "finished": float((terminal & ~crashed).any(0).mean()), "steps": float((~ended).sum(0).mean())}
+    return _first_episodes(observed["reward"], observed["observation"]["passed"], observed["terminal"],
+                           observed["last"], simulator.racing.crash_penalty)
+
+
+def _first_episodes(reward: np.ndarray, passed: np.ndarray, terminal: np.ndarray, last: np.ndarray,
+                    crash_penalty: float) -> dict:
+    """Each drone's first episode from its steps' rewards, gates passed so far, and whether each step was its
+    episode's `terminal` or `last` `[steps, drones]`: its return, gates passed, whether it crashed or
+    finished an open track (an end whose step paid less than half the crash penalty is a crash) and its
+    steps, averaged over the drones."""
+    ended = np.cumsum(last, 0) - last > 0
+    earned = np.where(ended, 0, reward)
+    gates = np.where(ended, 0, passed).max(0)
+    ending = terminal & ~ended
+    crashed = ending & (reward < -crash_penalty / 2)
+    return {"return": float(earned.sum(0).mean()), "gates": float(gates.mean()),
+            "gates_max": int(gates.max()), "crashed": float(crashed.any(0).mean()),
+            "finished": float((ending & ~crashed).any(0).mean()), "steps": float((~ended).sum(0).mean())}
 
 
 def flown(env, objective, params, key: jax.Array, steps: int, crash_penalty: float) -> dict:
@@ -150,15 +157,8 @@ def flown(env, objective, params, key: jax.Array, steps: int, crash_penalty: flo
         return env_rollout(env, objective.greedy, params, start(env, key), steps)[1].following
 
     following = jax.device_get(jax.jit(rolled)(params, key))
-    last = following.terminated | following.truncated
-    ended = np.cumsum(last, 0) - last > 0
-    reward = np.where(ended, 0, following.reward)
-    passed = np.where(ended, 0, following.observation["passed"]).max(0)
-    terminal = following.terminated & ~ended
-    crashed = terminal & (following.reward < -crash_penalty / 2)
-    return {"return": float(reward.sum(0).mean()), "gates": float(passed.mean()),
-            "gates_max": int(passed.max()), "crashed": float(crashed.any(0).mean()),
-            "finished": float((terminal & ~crashed).any(0).mean()), "steps": float((~ended).sum(0).mean())}
+    return _first_episodes(following.reward, following.observation["passed"], following.terminated,
+                           following.terminated | following.truncated, crash_penalty)
 
 
 def teacher_policy(objective):
@@ -278,13 +278,25 @@ def demonstrations(simulator, objective, variables, steps: int, capacity: int):
     return ReplayBuffer.empty(jax.tree.map(lambda leaf: leaf[0], stream), capacity).add(stream)
 
 
-def _saved(out: Path, phase: str, updates: int, variables) -> None:
-    """A world run's weights so far and where it is (progress.json: its phase and that phase's updates),
-    each file written whole before it replaces the last."""
-    name = "pretrained.msgpack" if phase == "pretrain" else "world.msgpack"
-    (out / f"{name}.part").write_bytes(serialization.to_bytes(jax.device_get(variables)))
-    (out / f"{name}.part").replace(out / name)
-    (out / "progress.json").write_text(json.dumps({"phase": phase, "updates": updates}))
+def _committed(out: Path, progress: dict) -> dict:
+    """`progress` made where a world run is (progress.json: its phase, that phase's updates, and the weight
+    files of each phase it holds), written whole before it replaces the last, then every weight file it
+    no longer names removed: a run stopped at any point goes on from one consistent generation."""
+    (out / "progress.json.part").write_text(json.dumps(progress))
+    (out / "progress.json.part").replace(out / "progress.json")
+    for stale in out.glob("*-[0-9]*.msgpack"):
+        if stale.name not in (progress["pretrained"], progress["world"]):
+            stale.unlink()
+    return progress
+
+
+def _saved(out: Path, progress: dict, phase: str, updates: int, variables) -> dict:
+    """The phase's weights after `updates` updates written to a file of their own, then made where the run
+    is (`_committed`)."""
+    kind = "pretrained" if phase == "pretrain" else "world"
+    name = f"{kind}-{updates:07d}.msgpack"
+    (out / name).write_bytes(serialization.to_bytes(jax.device_get(variables)))
+    return _committed(out, {**progress, "phase": phase, "updates": updates, kind: name})
 
 
 def _resumed(out: Path, objective, name: str):
@@ -293,25 +305,26 @@ def _resumed(out: Path, objective, name: str):
     return serialization.from_bytes(fresh, (out / name).read_bytes())
 
 
-def _pretrained(out: Path, pretraining, windows: Loader, updates: int, saved_every: int, done: int):
-    """The world model pretrained on `windows` to `updates` updates from `done` (pretrained.msgpack's, where
-    a run goes on), its weights written every `saved_every` updates (`_saved`), and then the online phase
-    marked begun."""
+def _pretrained(out: Path, pretraining, windows: Loader, updates: int, saved_every: int,
+                progress: dict) -> tuple[object, dict]:
+    """The world model pretrained on `windows` to `updates` updates from where `progress` holds it, its
+    weights written every `saved_every` updates (`_saved`), then the online phase made begun; and the run's
+    progress."""
     from rl_acceptance import laprop
 
     from dew.training import Trainer
 
+    done = progress["updates"]
     if done:
-        pretraining.variables = _resumed(out, pretraining, "pretrained.msgpack")
+        pretraining.variables = _resumed(out, pretraining, progress["pretrained"])
     trainer = Trainer(pretraining, laprop(), key=jax.random.key(6 + done))
     state = trainer.place()[0]
     while done < updates:
         chunk = min(saved_every, updates - done)
         state = trainer.fit(windows, steps=int(state.step) + chunk, log_every=1000, state=state)
         done += chunk
-        _saved(out, "pretrain", done, state.variables)
-    (out / "progress.json").write_text(json.dumps({"phase": "online", "updates": 0}))
-    return jax.device_get(state.variables)
+        progress = _saved(out, progress, "pretrain", done, state.variables)
+    return jax.device_get(state.variables), _committed(out, {**progress, "phase": "online", "updates": 0})
 
 
 def world(out: Path, *, teacher_weights: Path, assets: Path, drones: int = 16, hz: float = 60.0,
@@ -328,9 +341,9 @@ def world(out: Path, *, teacher_weights: Path, assets: Path, drones: int = 16, h
     `demonstration_seconds` for the demonstrations; the agent flies `environment_seconds` online over all
     its drones (FlyDreamer's 1M steps at 30 Hz); the replay holds `capacity_seconds` a drone (16 GB of
     96-pixel images over 16 drones at 60 Hz). Every `saved_every` updates of either phase (about ten minutes
-    on a G4) the weights so far are written (pretrained.msgpack, world.msgpack) with the phase and its updates
-    (progress.json); a run whose `out` holds them goes on from there, its replay the demonstrations again and
-    its optimizer's moments afresh."""
+    on a G4) the weights so far are written with where the run is (progress.json names the weight files it
+    goes on from, `_committed`); a run whose `out` holds them goes on from there, its replay the
+    demonstrations again and its optimizer's moments afresh."""
     from rl_acceptance import laprop
 
     from dew.objectives.rl.dreamer import DreamerRollout, DreamerV3Objective, WorldModel
@@ -356,7 +369,7 @@ def world(out: Path, *, teacher_weights: Path, assets: Path, drones: int = 16, h
 
     # Where an earlier run of this `out` stopped and the online scores it wrote, read before any is written.
     progress = (json.loads((out / "progress.json").read_text()) if (out / "progress.json").exists()
-                else {"phase": "pretrain", "updates": 0})
+                else {"phase": "pretrain", "updates": 0, "pretrained": None, "world": None})
     earlier = (json.loads((out / "world.json").read_text())
                if progress["phase"] == "online" and (out / "world.json").exists() else {})
     report = {"drones": drones, "hz": hz, "length": length, "imagination": imagination,
@@ -379,9 +392,12 @@ def world(out: Path, *, teacher_weights: Path, assets: Path, drones: int = 16, h
     windows = Loader(train=lambda partition: (jax.device_get(sample(next(drawn))) for _ in itertools.count()),
                      val=None, records=16, batch=16)
     began = time.perf_counter()
-    pretrained_variables = (_pretrained(out, pretraining, windows, pretrain_updates, saved_every,
-                                        progress["updates"]) if progress["phase"] == "pretrain"
-                            else _resumed(out, pretraining, "pretrained.msgpack"))
+    if progress["phase"] == "pretrain":
+        pretrained_variables, progress = _pretrained(out, pretraining, windows, pretrain_updates, saved_every,
+                                                     progress)
+    else:
+        pretrained_variables = _resumed(out, pretraining, progress["pretrained"])
+    (out / "pretrained.msgpack").write_bytes(serialization.to_bytes(pretrained_variables))
     report["pretrain_seconds"] = time.perf_counter() - began
     agent = DreamerV3Objective(model, imagination=imagination, variables=pretrained_variables)
     report["cloned"] = judge(agent.act, pretrained_variables, agent.memory(drones), jax.random.key(7),
@@ -391,7 +407,7 @@ def world(out: Path, *, teacher_weights: Path, assets: Path, drones: int = 16, h
 
     online = progress["updates"] if progress["phase"] == "online" else 0
     if online:
-        agent.variables = _resumed(out, agent, "world.msgpack")
+        agent.variables = _resumed(out, agent, progress["world"])
     rollout = DreamerRollout(agent, simulator, batch=16, length=length, train_ratio=128.0, replay=replay)
     trainer = Trainer(agent, laprop(), key=jax.random.key(8 + online), rollout=rollout)
     updates = int(environment_seconds * hz * rollout.train_ratio / (rollout.batch * rollout.length))
@@ -402,7 +418,7 @@ def world(out: Path, *, teacher_weights: Path, assets: Path, drones: int = 16, h
         chunk = min(saved_every, updates - done, 10_000 - done % 10_000)
         state = trainer.fit(_idle(), steps=int(state.step) + chunk, log_every=1000, state=state)
         done += chunk
-        _saved(out, "online", done, state.variables)
+        progress = _saved(out, progress, "online", done, state.variables)
         if done % 10_000 and done < updates:
             continue
         point = {"updates": done, "environment_steps": rollout.environment_steps,
@@ -411,6 +427,7 @@ def world(out: Path, *, teacher_weights: Path, assets: Path, drones: int = 16, h
         report["online"].append(point)
         print(json.dumps(point), flush=True)
         (out / "world.json").write_text(json.dumps(report, indent=1))
+    (out / "world.msgpack").write_bytes(serialization.to_bytes(jax.device_get(state.variables)))
     report["online_agent"] = judge(agent.act, state.variables, agent.memory(drones), jax.random.key(9),
                                    film=out / "video.npz")
     (out / "world.json").write_text(json.dumps(report, indent=1))
