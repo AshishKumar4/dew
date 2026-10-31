@@ -13,15 +13,14 @@ from pathlib import Path
 import jax
 import numpy as np
 import pytest
-from diffusion_support import images_of
+from objective_data import IMAGES
 
 from dew.checkpoints import Checkpoints
 from dew.cli.main import main
 from dew.config import ObjectiveConfig
 from dew.config.diffusion import DiffusionRunConfig, FlowRolloutConfig
-from dew.data import images as image_steps, presets
+from dew.data import TFDS, images as image_steps, presets
 from dew.data.dataset import DataPartition
-from dew.data.sources import source
 from dew.interop.pretrained import load_diffusion_source
 from dew.registry import ModelConfig
 from dew.sampling.solvers import Euler
@@ -53,10 +52,14 @@ def inpainting(tmp_path_factory) -> dict[str, Path]:
     return {"ddim": root / "inpaint", "flow": flow}
 
 
+def pictures():
+    """The suite's own images (tests/fixtures/tfds/dew_images), which a run reads offline."""
+    return TFDS("dew_images", path=str(IMAGES), split="all")
+
+
 def masked_images(batch: int = 4):
     """The run's images at SIZE with a mask drawn for each (`RandomMask`)."""
-    return source("tfds://oxford_flowers102").pipe(presets.images, SIZE, batch=batch,
-                                                   augment=image_steps.RandomMask())
+    return pictures().pipe(presets.images, SIZE, batch=batch, augment=image_steps.RandomMask())
 
 
 def precision() -> ModelConfig:
@@ -111,7 +114,7 @@ def test_an_inpainting_run_over_a_chain_without_masks_is_refused(inpainting):
     """An inpainting pipeline paints the region its mask marks: over images that carry no mask the run
     is refused as it builds."""
     run = DiffusionRunConfig(pretrained=str(inpainting["ddim"]), preset=None, model=precision(),
-                             data=images_of("tfds://oxford_flowers102", SIZE), val_metrics=(),
+                             data=pictures().pipe(presets.images, SIZE, batch=4), val_metrics=(),
                              objective=RUNS["diffusion"][1]["objective"])
     with pytest.raises(ValueError):
         run.build()
