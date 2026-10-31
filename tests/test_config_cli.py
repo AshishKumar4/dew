@@ -183,9 +183,9 @@ def test_dew_profile_trains_a_run_afresh_and_reports_where_its_window_spent_the_
 
 
 def test_dew_profiles_capture_options_reach_the_capture(tmp_path):
-    """`dew profile --host-tracer-level 1 --python-tracer-level 1` captures with those options: the window
-    owns them (`ProfileWindow`), the command only maps its flags onto it, and the capture's manifest records
-    what it ran with (row 1894)."""
+    """`dew profile --host-tracer-level 1 --python-tracer-level 1` captures with those options: the capture's
+    options own them (`CaptureOptions`, the window's `capture`), the command only maps its flags onto them,
+    and the capture's manifest records what it ran with (rows 1894, 2932)."""
     pytest.importorskip("xprof.convert.raw_to_tool_data", reason="optional profile extra")
     import autoencoder_experiment
 

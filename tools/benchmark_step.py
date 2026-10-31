@@ -71,7 +71,7 @@ from dew.nn.flops import MissingFlopsCount
 from dew.pool import joins_pool, pool_cluster
 from dew.registry import models
 from dew.telemetry.benchmark import carried
-from dew.telemetry.profile import capture_options
+from dew.telemetry.profile import Profiler
 from dew.telemetry.trace import communication_totals, device_events, window_split
 from dew.training import Trainer
 from dew.training.interval import throughput
@@ -393,25 +393,17 @@ def measure(case: Case, config: BenchmarkConfig, peaks: list[int | None] | None)
         timeline = {}
         if config.profile_dir:
             # After the timed windows, so the trace's own overhead is not in
-            # them. Each process traces its own devices into its own
-            # directory, since the trace file is named after the host.
-            directory = os.path.join(config.profile_dir, case.label.replace(" ", "_"),
-                                     f"process{jax.process_index()}")
-            jax.profiler.start_trace(directory, profiler_options=capture_options())
-            try:
+            # them. Each process of a pool traces its own devices into a
+            # directory of its own (`Profiler`). The timeline reads the trace
+            # alone, which XProf opens as it is, so no reports are written.
+            with Profiler(os.path.join(config.profile_dir, case.label.replace(" ", "_")),
+                          reports=False) as capture:
                 for _ in range(config.profile_steps):
                     state, loss, is_finite = step(state)
                 loss.block_until_ready()
-            finally:
-                primary = sys.exception()
-                try:
-                    jax.profiler.stop_trace()
-                except BaseException as error:
-                    if primary is None:
-                        raise
-                    primary.add_note(f"Profiler stop failed: {error!r}")
             # A peak process traces the steps for their memory; their timeline is the case process's.
             if not config.peak_run:
+                (directory,) = (str(captured) for captured in capture.captures)
                 planes = device_events(directory)[0]
                 timeline = {**device_timeline(directory, config.profile_steps, planes=planes),
                             **communication(directory, config.profile_steps, planes=planes)}

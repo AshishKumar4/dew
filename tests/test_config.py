@@ -395,6 +395,24 @@ def test_train_runs_the_trainer_its_config_describes(tmp_path):
     assert any(path.is_file() for path in trace.rglob("*"))
 
 
+def test_a_saved_runs_profile_window_reads_its_capture_options_as_its_captures(tmp_path):
+    """A run saved while its profile window held its capture's options as its own fields
+    (`host_tracer_level`, `python_tracer_level`, `activity_cap`) loads with them its capture's
+    (`ProfileWindow.capture`, row 2932), so it captures as it did."""
+    from dew.telemetry.profile import CaptureOptions
+    from dew.training import ProfileWindow
+
+    capture = CaptureOptions(host_tracer_level=1, python_tracer_level=1, activity_cap=7)
+    window = ProfileWindow(str(tmp_path / "trace"), 3, capture=capture)
+    path = tmp_path / "run" / "run.json"
+    assert RunConfig(trainer=TrainerConfig(profile=window)).save(str(tmp_path / "run")) == str(path)
+    record = json.loads(path.read_text())
+    saved = record["fields"]["trainer"]["profile"]["fields"]
+    saved.update(saved.pop("capture"))
+    path.write_text(json.dumps(record))
+    assert RunConfig.load(str(path)).trainer.profile == window
+
+
 class _Bucket:
     """The three calls a run record makes on a path, recorded, and backed by a
     local directory: a real gs:// write needs credentials and a network, and

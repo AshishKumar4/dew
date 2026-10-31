@@ -545,7 +545,7 @@ def training_measure(factory, objective, config: Worker) -> dict:
 
     from dew.distributed.batches import DevicePrefetchIterator
     from dew.telemetry.instrumentation import NO_FLOPS
-    from dew.telemetry.profile import capture_options
+    from dew.telemetry.profile import Profiler
     from dew.training import Trainer
     from dew.training.interval import throughput
 
@@ -596,7 +596,8 @@ def training_measure(factory, objective, config: Worker) -> dict:
             # After the timed steps, so the trace's own overhead is not in them, as `benchmark_step`
             # traces. A shape first seen here compiles inside the window, and its idle counts.
             with tempfile.TemporaryDirectory() as directory:
-                with jax.profiler.trace(directory, profiler_options=capture_options()):
+                # The timeline reads the trace alone, so the capture writes no reports.
+                with Profiler(directory, reports=False) as capture:
                     for _ in range(timed.train_steps):
                         batch = next(reader)
                         counted.counts.get_nowait()
@@ -605,7 +606,8 @@ def training_measure(factory, objective, config: Worker) -> dict:
                             compiled[key] = trainer.compile(state, batch)
                         state = compiled[key](state, batch)[0]
                     jax.block_until_ready(state)
-                timeline = device_idle(directory)
+                (captured,) = capture.captures
+                timeline = device_idle(str(captured))
     resolved = jax.device_get(signals)
     if any(not bool(finite) or not bool(accepted) for _, finite, accepted in resolved):
         raise ValueError("the real small-model update was nonfinite or not accepted")

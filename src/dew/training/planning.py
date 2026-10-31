@@ -17,7 +17,6 @@ import logging
 import tempfile
 import time
 from collections.abc import Callable, Hashable, Mapping, Sequence
-from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 
 import jax
@@ -38,7 +37,7 @@ from dew.nn.kernels.templates import report
 from dew.nn.protocols import RematChoosing
 from dew.objectives.base import RECORD, Objective
 from dew.state import TrainState, apart, together
-from dew.telemetry.profile import active_profile, capture_options
+from dew.telemetry.profile import Profiler, active_profile
 from dew.training.ahead import handed, program_of
 from dew.training.distributed import batch_divisor
 from dew.training.footprint import Footprint
@@ -436,13 +435,15 @@ class Trials:
             current, held = apart(stepped)
             parts = planned.parts(mesh)
             with tempfile.TemporaryDirectory() as directory:
-                with jax.profiler.trace(directory, profiler_options=capture_options()):
+                # XLA reads the trace alone, so the capture writes no XProf reports.
+                with Profiler(directory, reports=False) as profiler:
                     for _ in range(runs):
                         for part in parts:
                             current, *_ = planned.executable(current, held, self.batch, part)
                         jax.block_until_ready(current)
-                (capture,) = Path(directory).glob("plugins/profile/*")
-                return get_profiled_instructions_proto(str(capture))
+                (capture,) = profiler.captures
+                (session,) = capture.glob("plugins/profile/*")
+                return get_profiled_instructions_proto(str(session))
 
         return self.run(profile)
 
