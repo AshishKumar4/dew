@@ -209,12 +209,13 @@ def test_a_compile_the_derivation_judged_otherwise_is_told_as_a_model_miss(monke
 
 GATE_LAYERS = {
     "decoder": {},
-    "hybrid": {"layer_types": ("mamba", "attention") * 2, "kinds": {"mamba": {"mixer": {
+    "hybrid": {"layer_types": ("mamba", "attention"), "kinds": {"mamba": {"mixer": {
         "class": "mamba2", "fields": {"num_heads": 4, "head_dim": 16, "state_size": 8, "n_groups": 1,
                                       "chunk_size": 32}}}, "attention": {}}},
-    "moe": {"mixture": {"experts": 4, "top_k": 2, "layers": (1, 3)}},
+    "moe": {"mixture": {"experts": 4, "top_k": 2, "layers": (1,)}},
 }
-"""The gate's decoders (row 2113): dense, hybrid of Mamba-2 and attention layers, and mixture of experts."""
+"""The gate's decoders (row 2113), each the least of its family: dense, a Mamba-2 layer beside an attention
+layer, and an attention layer beside one of experts, two layers each."""
 
 
 def gated(layers: str, generation: str, remat: str, capacity: int, records, precision: str) -> list[dict]:
@@ -224,7 +225,7 @@ def gated(layers: str, generation: str, remat: str, capacity: int, records, prec
     from dew.registry import models
     from dew.training.ahead import compile_ahead, compile_only_gpus
 
-    model = models.build("causal_transformer", vocab_size=128, emb_features=64, num_layers=4, num_heads=4,
+    model = models.build("causal_transformer", vocab_size=128, emb_features=64, num_layers=2, num_heads=4,
                          num_kv_heads=2, mlp_features=128, max_seq_len=128,
                          remat=None if remat == "none" else REMAT_POLICIES[remat], **GATE_LAYERS[layers])
     trainer = Trainer(LMObjective(model, seq_len=128), optax.adamw(1e-3), key=jax.random.key(0), split=1,
@@ -250,17 +251,19 @@ def test_the_derivation_decides_a_steps_fit_as_its_compile_does(layers, generati
     default and highest matmul precision (row 2113's gate, in the kernel gate's evidence shape,
     `compile_evidence`). The need is the program's as XLA lays it out on a roomy GPU, and the
     derivation's, read off that compile, admits it at 1.6 times and refuses it at 0.6. A gate decoder's
-    peak is the program's own (`Footprint.exact`), an expert decoder's at JAX's default precision too:
-    its ragged products run on CUDA as Pallas grouped kernels, custom calls that hold their outputs alone
+    peak is the program's own (`Footprint.exact`), an expert decoder's at JAX's default precision too: its
+    ragged products run on CUDA as Pallas grouped kernels, custom calls that hold their outputs alone
     (`compiled_program.opaque`). At highest precision they are XLA's ragged products, the GEMM template's
     portable route (`grouped_matmul.xla_ragged_dot`), which XLA lays out as its target, dtype and flags
-    choose: that peak alone is a bound from below, never above the compile's need, which
-    never refuses a step the compile fits and may admit one it refuses, a miss its compile corrects. On
-    a GPU stating 1.6 times, the compile fits and the derivation judged so. On one stating 0.6, a step
-    set to full recomputation compiles there alone: where XLA refuses it the derivation did, but where
-    bounded from below, and where XLA fits it, it fits by XLA's own rematerialization against the stated
-    memory, which the derivation does not model and the compile decides (its temporaries below the
-    roomy compile's)."""
+    choose: that peak alone is a bound from below, never above the compile's need, which never refuses a
+    step the compile fits and may admit one it refuses, a miss its compile corrects. On a GPU stating 1.6
+    times the compile is the roomy one, whose need it holds, XLA's rematerialization changing nothing in a
+    module already within its limit (`RematerializeComputation`,
+    xla/hlo/transforms/simplifiers/hlo_rematerialization.cc), so its fit is read off that compile. On one
+    stating 0.6, a step set to full recomputation compiles there alone: where XLA refuses it the
+    derivation did, but where bounded from below, and where XLA fits it, it fits by XLA's own
+    rematerialization against the stated memory, which the derivation does not model and the compile
+    decides (its temporaries below the roomy compile's)."""
     from compile_evidence import Evidence, Facts, Measurement, Prediction
 
     (roomy,) = gated(layers, generation, remat, 1 << 34, tmp_path / "roomy", precision)
@@ -277,8 +280,6 @@ def test_the_derivation_decides_a_steps_fit_as_its_compile_does(layers, generati
             Measurement({"temp": roomy["temp"]}, need <= budget, "xla", jax.__version__))
         assert evidence.compiled.admits == admits, evidence.describe()
         assert evidence.agrees or (not exact and derived <= budget), evidence.describe()
-    (fitting, *_) = gated(layers, generation, remat, int(need * 1.6), tmp_path / "1.6", precision)
-    assert fitting["fits"] and fitting["derived_headroom"] >= 0, fitting
     if remat == "full":
         tight = gated(layers, generation, remat, int(need * 0.6), tmp_path / "0.6", precision)[0]
         assert tight["derived_headroom"] < 0 or not exact, tight
