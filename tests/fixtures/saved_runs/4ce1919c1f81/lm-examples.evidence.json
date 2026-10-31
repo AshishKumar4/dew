@@ -2,7 +2,8 @@
  "step": 80,
  "compute": "float32",
  "products": {
-  "float64": 14
+  "float32": 4,
+  "float64": 10
  },
  "params": [
   "float32"

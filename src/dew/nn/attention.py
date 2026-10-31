@@ -624,11 +624,18 @@ def _fused_attention(query, key, value, bias, mask, causal, sliding_window, impl
     elif implementation == 'xla':
         # A window of (l, r) keeps the l keys before the query and the r after
         # it on both the xla and the cudnn path, the sides `window_sides` counts.
-        out = jax.nn.dot_product_attention(
-            query, key, value, bias=bias, mask=mask, is_causal=causal,
-            key_value_seq_lengths=key_value_seq_lengths,
-            local_window_size=None if sliding_window is None else window_sides(causal, sliding_window),
-            implementation='xla')
+        # Its softmax takes the textbook derivative y (g - sum(y g)) (`jax.softmax_custom_jvp`, which jax
+        # ships off), exactly zero for a query that reads one key, as torch's and the reference path's.
+        # The default differentiates `exp(x - max) / sum`, whose g / e - g e / e^2 is zero only where that
+        # key's e is exactly 1, and XLA:CPU contracts the scaled logit and the subtraction of the max
+        # into one FMA, which leaves e at 1 +- a rounding of the logit, so a rounding's worth of query
+        # and key gradient there. The values are the same bits either way.
+        with jax.softmax_custom_jvp(new_val=True):
+            out = jax.nn.dot_product_attention(
+                query, key, value, bias=bias, mask=mask, is_causal=causal,
+                key_value_seq_lengths=key_value_seq_lengths,
+                local_window_size=None if sliding_window is None else window_sides(causal, sliding_window),
+                implementation='xla')
     elif implementation == 'template':
         out = template_attention(query, key, value, causal, sliding_window, sinks=sinks, softcap=softcap,
                                  segment_ids=segment_ids, lengths=key_value_seq_lengths,

@@ -752,12 +752,16 @@ def test_a_lora_decision_runs_source_loads_onto_its_trainers_mesh():
 
 def test_a_decision_run_that_ended_on_its_best_step_loads_there(tmp_path):
     """A decision run that ends on the step it ranked best (`restore_best`), its best an earlier step than
-    its last (its validation loss, which it ranks by, lowest at its first step, a rate far past stable
-    driving it up after),
-    calibrates that
-    step, and `Decide.from_run` and `dew.pipeline` load the run there by default (`Decide.default_step`),
-    its calibration the step's own, answering a request; asked its latest, the run refuses a calibration
-    fitted on another step (row 2352)."""
+    its last, calibrates that step, and `Decide.from_run` and `dew.pipeline` load the run there by default
+    (`Decide.default_step`), its calibration the step's own, answering a request; asked its latest, the
+    run refuses a calibration fitted on another step (row 2352).
+
+    The run trains on tickets whose teams are each shifted to the next one's and ranks by its validation
+    loss over the same tickets with their own teams, so each step it takes moves it further from them: its
+    validation loss is lowest at its first step, whatever the arithmetic (0.84, 1.02 and 1.10 on a CPU
+    with fp32 or float64 sums in its attention, and with the learning rate 1e-6 higher). A rate far past
+    stable ordered them by chance, as rounding set the weights it blew up to: the same run, its learning
+    rate one part in a million apart, ranked its second step best and its last."""
     from test_run_options import decision
 
     import dew
@@ -766,11 +770,27 @@ def test_a_decision_run_that_ended_on_its_best_step_loads_there(tmp_path):
     from dew.decision.questions import ChoiceAnswer
     from dew.optim import OptimConfig
 
+    tickets = [("charged twice for March", "billing"), ("the site is down", "technical"),
+               ("how much is the pro plan", "sales"), ("refund my last invoice", "billing")]
+    shifted = {"billing": "technical", "technical": "sales", "sales": "billing"}
+
+    def asked(name, team):
+        table = tmp_path / f"{name}.csv"
+        with table.open("w", newline="") as file:
+            writer = csv.writer(file)
+            writer.writerow(["text", "label"])
+            writer.writerows([(f"{text}, ticket {index}", team(label)) for index in range(8)
+                              for text, label in tickets])
+        return Files(str(table), format="csv").pipe(decisions, question="team").read("memory").batch(
+            8).loading(Loading(workers=0))
+
     trainer = TrainerConfig(name="best", checkpoint_dir=str(tmp_path / "runs"), steps=3, log_every=1,
                             eval_every=1, checkpoint_every=1, multi_host=False, compilation_cache_dir=None,
                             restore_best=True)
-    optim = OptimConfig(learning_rate=10.0)
-    dataclasses.replace(decision(tmp_path, drawn=False), trainer=trainer, optim=optim).run()
+    optim = OptimConfig(learning_rate=0.1)
+    dataclasses.replace(decision(tmp_path, drawn=False), trainer=trainer, optim=optim,
+                        data=asked("train", shifted.__getitem__),
+                        validation=asked("validation", lambda team: team)).run()
     directory = tmp_path / "runs" / "best"
     with Checkpoints(str(directory)) as checkpoints:
         best, latest = checkpoints.best, checkpoints.latest

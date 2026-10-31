@@ -51,6 +51,9 @@ from dew.objectives.diffusion import DiffusionObjective
 
 ROOT = Path(__file__).resolve().parents[1]
 CASES = ("published", "variant")
+WALK_ATTENTION = "reference"
+"""The attention the pipeline walks load: Dew's reference path, its products summed in float64 under the
+lane's wide arithmetic (`assert_walked_as_the_source`)."""
 
 
 @pytest.fixture(scope="module")
@@ -146,7 +149,7 @@ def walk(tmp_path_factory):
 def pipeline(walk):
     from dew.interop.pretrained import Pretrained
 
-    return Pretrained.load(str(walk[0] / "pipeline"), dtype="float32", attention_impl="xla")
+    return Pretrained.load(str(walk[0] / "pipeline"), dtype="float32", attention_impl=WALK_ATTENTION)
 
 
 @pytest.fixture(scope="module")
@@ -156,7 +159,8 @@ def streamed(walk):
     from dew.interop.pretrained import Pretrained
     from dew.training import MeshSpec
 
-    return Pretrained.load(str(walk[0] / "pipeline"), dtype="float32", attention_impl="xla", mesh=MeshSpec())
+    return Pretrained.load(str(walk[0] / "pipeline"), dtype="float32", attention_impl=WALK_ATTENTION,
+                           mesh=MeshSpec())
 
 
 def assert_walked_as_the_source(walked, arrays, rows: int, task) -> None:
@@ -170,7 +174,15 @@ def assert_walked_as_the_source(walked, arrays, rows: int, task) -> None:
     every stage up to the cross-attention's inputs at most 1.05, the
     cross-attention 1.93. XLA's float32 attention over Wan's 512 text keys
     rounds 2.07 times as far from float64 as torch's SDPA does on the same
-    call (its math and flash backends both measure 1.0)."""
+    call (its math and flash backends both measure 1.0).
+
+    Those figures are of the walk with its attention through jax.nn's xla kernel, which a CPU runs as every
+    platform does: its probabilities-values product sums the 512 text keys in fp32 (the latents measure
+    2.03 to 2.11 of the source's distance on an EPYC; that product alone summed in float64 takes them to
+    0.32 to 0.34, its scores' product to 1.99 to 2.03, its softmax to 1.99 to 2.06, and its logits'
+    FMA contraction away to 2.03 to 2.09). The walks load Dew's reference path (`WALK_ATTENTION`), whose
+    products sum in float64 under the lane's wide arithmetic, so the rule holds the port's own error
+    (0.31 to 0.35) and not jax.nn's sum over the text keys."""
     frames = np.clip(np.asarray(walked.images) / 2 + 0.5, 0.0, 1.0)
     # Each frame entry's terms, what the decode's own sums add over the walk's latents in float64 on the
     # CPU (`float64_terms`), halved as the frame halves the decoded image.
@@ -229,7 +241,7 @@ def test_a_text_free_walk_from_the_sources_own_encodings_matches_the_source(walk
     from dew.interop.pretrained import load_diffusion_source
 
     _, record, arrays = walk
-    source = load_diffusion_source(str(walk[0] / "pipeline"), dtype="float32", attention_impl="xla",
+    source = load_diffusion_source(str(walk[0] / "pipeline"), dtype="float32", attention_impl=WALK_ATTENTION,
                                    text=False)
     assert "conditioning" not in source.variables.get("encoders", {})
     task = source.text_to_image()
