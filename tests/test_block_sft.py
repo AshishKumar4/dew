@@ -159,13 +159,14 @@ def assert_updates_as_the_objective(obj, twin, batch, data, run_key, variables, 
     assert_the_runs_path_takes_the_trainers_update(obj, batch, data, run_key, variables)
 
 
-STACKED = 8
+STACKED = 32
 """The examples each draw of the trainer's gradient stacks (`stacked`), each its own weights and batch: a
 norm's scale or a layer's scalar sums its gradient over every token, one value an example, whose error
 is one Gaussian a draw, its log squared error spread pi / sqrt(2) wide, so two arms' ratio of it is a
 Cauchy no count of draws within MOST_SEEDS resolves (ledger 2469: 2.17 to 2.31 measured,
 tmp/Gate/sizing/noise-2469.json). Stacked, every leaf holds a row an example, its error a draw's mean
-of eight, its spread a third as wide; each example keeps the site's geometry, its rows and shapes."""
+of them, its spread 1 / sqrt(32) as wide: about 0.34 where eight left the noisiest leaves at 0.5 to
+0.67, inside the gate's 0.40 (`typical`). Each example keeps the site's geometry, its rows and shapes."""
 
 
 def stacked(fn, *, given: bool = False):
