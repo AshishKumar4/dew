@@ -237,6 +237,38 @@ def _options(row: dict) -> list[tuple[int, ...]]:
     return [tuple(tokens[start + 1:end]) for start, end in zip(markers, ends, strict=True)]
 
 
+def test_a_choice_of_fewer_options_than_its_floor_draws_no_none_of_the_above():
+    """A choice of fewer options than the objective's floor (`none_of_the_above_options`), a yes or a no,
+    draws no "none of the above" however often a read draws one, where it would change what the question
+    asks, while a choice of as many draws it at its rate; the floor left at 0 draws it on both, as before
+    (row 2903). The objective's training steps carry the floor to every read and fit of its rows."""
+    from dew.decision.objective import DecisionObjective
+    from dew.decision.rows import NONE_OF_THE_ABOVE, Encoding
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+
+    two = Choice("Is it on?", ["yes", "no"])
+    three = Choice("Which colour?", ["red", "green", "blue"])
+    example = Example("the lamp", {"two": two, "three": three}, {"two": "yes", "three": "red"})
+    layout = MarkerLayout(max_len=256)
+
+    def offers(fewest: int) -> dict[str, bool]:
+        encoding = Encoding(layout, BYTES, BYTE_SPECIALS, width=4, none_of_the_above=1.0, shuffle=False,
+                            none_of_the_above_options=fewest)
+        rng = np.random.default_rng(0)
+        return {name: any(NONE_OF_THE_ABOVE in bytes(option).decode()
+                          for _ in range(16) for option in _options(encoding(example, [name], rng)))
+                for name in ("two", "three")}
+
+    assert offers(3) == {"two": False, "three": True}
+    assert offers(0) == {"two": True, "three": True}
+    backbone = CausalTransformer(vocab_size=256, emb_features=32, num_layers=1, num_heads=2, mlp_features=48,
+                                 max_seq_len=256, attention_impl="xla")
+    objective = DecisionObjective(backbone, tokenizer=BYTES, specials=BYTE_SPECIALS, layout=layout,
+                                  none_of_the_above=1.0, none_of_the_above_options=3)
+    fit, *_, configured = objective.data().train
+    assert fit.none_of_the_above_options == configured.factory.none_of_the_above_options == 3
+
+
 def test_a_none_of_the_above_draw_never_leaves_a_row_unfit():
     """A "none of the above" that would leave its question alone past the window lays the question out as
     Fit admitted it, where the encoding refused the row before; a draw whose row fits (one replacing the
