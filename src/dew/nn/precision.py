@@ -407,37 +407,46 @@ def accumulated(product: Callable[..., jax.Array], *operands,
     return _summed_wide(product, preferred_element_type, *operands)
 
 
-CONTRACTIONS = frozenset((jnp.einsum, jnp.matmul, jnp.dot, jnp.tensordot, jnp.vdot, jnp.inner,
-                          jax.lax.dot_general))
+CONTRACTIONS = (jnp.einsum, jnp.matmul, jnp.dot, jnp.tensordot, jnp.vdot, jnp.inner, jax.lax.dot_general)
 """The contractions `accumulated` traces once a call (`_contraction`): JAX's own, whose trace states no
 derivative of its own (`_own_backward`) and depends on its operands' types and its arguments alone."""
 
+_JAX_CODE = (jax.lax.dot_general.__code__, jnp.einsum.__code__)
+"""The code of the contractions every other one calls through, as JAX defines it: a library that
+intercepts JAX's products in place (Qwix's `quantize_model` replaces `jax.lax.dot_general`'s and
+`jax.numpy.einsum`'s) changes it, and a trace cached before would skip the library's product."""
+
 
 def _contraction(product: Callable, preferred_element_type) -> tuple | None:
-    """`product` as a key of one of JAX's contractions (`CONTRACTIONS`) bound to hashable arguments, through
-    any `functools.partial` around it, with the dtype it is asked for; None for any other product."""
+    """`product` as a key of one of JAX's contractions (`CONTRACTIONS`, each as JAX defines it), bound through
+    plain `functools.partial`s around it (a subclass may call it otherwise) to arguments with no array among
+    them, with the dtype it is asked for: the contraction, the arguments' tree and their leaves; None for any
+    other product."""
     function, arguments, keywords = product, (), {}
-    while isinstance(function, functools.partial):
+    while type(function) is functools.partial:
         arguments, keywords = function.args + arguments, {**function.keywords, **keywords}
         function = function.func
-    bound = (arguments, keywords, preferred_element_type)
-    # Arrays among its arguments are no key; every other leaf (a subscript, a precision, a dtype) is one.
-    if function not in CONTRACTIONS or not all(
-            isinstance(leaf, Hashable) and not isinstance(leaf, jax.Array | np.ndarray)
-            for leaf in jax.tree.leaves(bound)):
+    intercepted = (jax.lax.dot_general.__code__, jnp.einsum.__code__) != _JAX_CODE
+    if intercepted or not any(function is contraction for contraction in CONTRACTIONS):
         return None
-    return function, arguments, tuple(sorted(keywords.items())), preferred_element_type
+    leaves, tree = jax.tree.flatten((arguments, keywords, preferred_element_type))
+    if not all(isinstance(leaf, Hashable) and not isinstance(leaf, jax.Array | np.ndarray)
+               for leaf in leaves):
+        return None
+    return function, tree, tuple(leaves)
 
 
-@functools.cache
+@functools.lru_cache(maxsize=1024)
 def _traced_once(key: tuple) -> Callable:
     """`_summed_wide` of the contraction `key` names (`_contraction`) as one program JAX traces once for its
     operands' types: a gated delta net layer's portable chunked math sums some 64 contractions a call,
     each traced afresh at about 6.6 ms (the wide sum, its derivative and the narrow one each traced
     again), 130 s of a decision witness's trace under Dew's test arithmetic (row 3142). Its arithmetic is
-    the product's own, the call a nested program XLA inlines."""
-    function, arguments, keywords, preferred_element_type = key
-    product = functools.partial(function, *arguments, **dict(keywords))
+    the product's own, the call a nested program XLA inlines. The most recent 1024 contractions are kept,
+    a model's working set many times over."""
+    function, tree, leaves = key
+    arguments, keywords, preferred_element_type = jax.tree.unflatten(tree, leaves)
+    product = functools.partial(function, *arguments, **keywords)
     return jax.jit(functools.partial(_summed_wide, product, preferred_element_type))
 
 
