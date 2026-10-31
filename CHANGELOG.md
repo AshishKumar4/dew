@@ -7,6 +7,9 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- DiLoCo (`Trainer(diloco=DiLoCo(every=...))`, `--trainer.mesh.diloco N --trainer.diloco.every H`): the
+  mesh's outermost axis holds replica groups, each training its own copy on its own rows, averaged into the
+  outer model by Nesterov SGD every H windows of updates; a checkpoint holds every group's state.
 - A token export's documents are the records its producer wrote, by its length index, not its tokens'
   EOS: an EOS a document's own text spells splits nothing, an export without an EOS packs, an empty
   record is no document, and no `train.documents.npy` is written or read. A plan saved before resumes

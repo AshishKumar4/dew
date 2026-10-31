@@ -1,13 +1,11 @@
 """The trainer: mesh, compiled step, EMA, checkpoints and logging.
 
-What is learned is up to the objective (`dew.objectives.base`). The trainer
-creates the objective's variables on the mesh, compiles one step over the
-global batch, and updates the EMA copy once per optimizer update. Side effects
-go to the objects it was given: a `Checkpoints` for disk and a `Tracker` for
-numbers and artifacts.
+What is learned is up to the objective (`dew.objectives.base`). The trainer creates the objective's variables
+on the mesh, compiles one step over the global batch, and updates the EMA copy once per optimizer update. Side
+effects go to the objects it was given: a `Checkpoints` for disk and a `Tracker` for numbers and artifacts.
 
-Constructing a trainer opens nothing; the mesh, the compiled step and those
-objects' resources are created in `fit`.
+Constructing a trainer opens nothing; the mesh, the compiled step and those objects' resources are created in
+`fit`.
 """
 
 from __future__ import annotations
@@ -141,6 +139,7 @@ from dew.training._fit import (
 from dew.training._lowering import KernelReport, Lowered, Routed, routed
 from dew.training.budget import Pause, Plateau
 from dew.training.cooldown import Cooldowns, Pending, check_branches, decay, resolved, schedule_ended
+from dew.training.diloco import DiLoCo, grouped, rated, rates_set
 from dew.training.display import TRAINER_SHOWN, TrainingDisplay, goodput
 from dew.training.distributed import (
     check_batch,
@@ -270,6 +269,7 @@ class Trainer(Generic[Loss, Effects]):
         links: Mapping[str, Link] | None = None,
         inspection: Inspection | None = None,
         param_dtype: str | None = None,
+        diloco: DiLoCo | None = None,
     ):
         """Hold everything a run needs, without opening any of it.
 
@@ -294,7 +294,8 @@ class Trainer(Generic[Loss, Effects]):
         passed as a boundary (`taken_record`). `links` states an axis's `Link` by name in place of measuring
         it (`_links`). `param_dtype`, a dtype's name, stores the parameters the run draws fresh, as Flax's
         `param_dtype` (`dew.state.drawn_in`); None keeps each module's own.
-        `inspection` names what the run watches at its sampled steps (`dew.training.inspection`).
+        `inspection` names what the run watches at its sampled steps (`dew.training.inspection`). `diloco`
+        trains the mesh's diloco groups apart, every few updates averaged (`dew.training.diloco`).
         """
         layout = objective.placement(layout)  # as its models place their trees (a tier-3 plan, ledger 2777)
         whole = read_whole(accumulation, split, step, layout, rollout, mesh)
@@ -322,8 +323,7 @@ class Trainer(Generic[Loss, Effects]):
         self.records: list[Recorded] = []
         self.profile = profile
         self.lower_for, self._ahead, self.tune_kernels = lower_for, ahead, tune_kernels
-        self.inspection = inspection
-        self.param_dtype = param_dtype
+        self.inspection, self.param_dtype, self.diloco = inspection, param_dtype, diloco
         # Set by `compile`, for the batch shape it was called with. A ramped run has one value per stage;
         # `fit` keeps them beside each step. The executable is the step as compiled, whose memory analysis a
         # benchmark reads; the program it was lowered from is released with its plan (`Planned.released`).
@@ -390,15 +390,14 @@ class Trainer(Generic[Loss, Effects]):
 
     def initial_state(self, initializer: Initializer | None = None,
                       key: int | jax.Array | None = None) -> TrainState:
-        """Build the state a fresh run starts from.
-
+        """Build the state a fresh run starts from, a DiLoCo run's with its groups' copies (`DiLoCo.started`).
         It is pure, so `fit` traces it once for its shapes and once, sharded, for its values.
 
         Both inputs default to the run's own, and `place` passes them explicitly so that what it compiles
         takes them as arguments. A held checkpoint then reaches the device as an argument instead of a
-        constant embedded in the executable. Passing None means "use the configured input", which is what
-        a call without arguments does. This is the only implementation of the state, so a subclass
-        overrides it here and every path sees the override.
+        constant embedded in the executable. Passing None means "use the configured input", which is what a
+        call without arguments does. This is the only implementation of the state, so a subclass overrides it
+        here and every path sees the override.
         """
         initializer = self.objective.initializer if initializer is None else initializer
         from dew.nn.inputs import request_key
@@ -430,7 +429,7 @@ class Trainer(Generic[Loss, Effects]):
                 f"the objective's tree has no params collection, only {sorted(params)}; "
                 "the optimizer moves params and treats every other collection as state")
         ema, opt_state = self.objective.ema, self._boxed_init(initialized, params["params"])
-        return TrainState(
+        state = TrainState(
             step=jnp.zeros((), jnp.int32),
             microstep=jnp.zeros((), jnp.int32),
             updates=jnp.zeros((), jnp.int32),
@@ -446,6 +445,7 @@ class Trainer(Generic[Loss, Effects]):
             key=run_key,
             consumed=None if self._examples is None else jnp.zeros((), jnp.int32),
             deferred=waiting(opt_state))
+        return state if self.diloco is None else self.diloco.started(state, self.device_mesh)
 
     @property
     def key(self) -> jax.Array:
@@ -528,6 +528,8 @@ class Trainer(Generic[Loss, Effects]):
 
     def _shardings(self, state: TrainState) -> Placement[TrainState]:
         mesh = self.state_mesh
+        if state.inner is not None:  # DiLoCo's groups' copies, each on its own devices (`grouped`)
+            return grouped(self._shardings, state)
         params = dict(state.variables)
         frozen = params.pop(FROZEN, None) if self.host_master else None
         placed = self.layout.shardings(mesh, dataclasses.replace(state, variables=params, accumulation=None))
@@ -572,18 +574,17 @@ class Trainer(Generic[Loss, Effects]):
         """What `fit` checks of the state before it places it (`Layout.validate`), read without
         placing anything, so a run is checked on a CPU host before a costly launch.
 
-        The state is a fresh run's: its parameters, optimizer state and EMA, and, given one
-        global `batch` as the run reads it, the accumulation its steps pool where `accumulation`
-        is above 1, read in the first of the splits its plan may take whose devices hold it, the
-        trainer's own where it fixes one (`splits`). It leaves out the narrow copies a step may read
-        (`TrainState.compute`), which the plan drops first where the step does not fit with them.
-        An `OptimConfig` is built over `steps`, as `fit(steps=...)` builds it. `capacity` is the
-        bytes each device has, for a mesh whose devices report none: a CPU mesh of
-        `--xla_force_host_platform_device_count` devices standing in for GPUs.
+        The state is a fresh run's: its parameters, optimizer state and EMA, and, given one global `batch` as
+        the run reads it, the accumulation its steps pool where `accumulation` is above 1, read in the first
+        of the splits its plan may take whose devices hold it, the trainer's own where it fixes one
+        (`splits`). It leaves out the narrow copies a step may read (`TrainState.compute`), which the plan
+        drops first where the step does not fit with them. An `OptimConfig` is built over `steps`, as
+        `fit(steps=...)` builds it. `capacity` is the bytes each device has, for a mesh whose devices report
+        none: a CPU mesh of `--xla_force_host_platform_device_count` devices standing in for GPUs.
 
-        Raises what `fit` raises before placing the state: `LayoutRefused` for a state over a
-        device's memory or a layout that replicates too much of the model, and ValueError for
-        rules that name an axis the mesh lacks.
+        Raises what `fit` raises before placing the state: `LayoutRefused` for a state over a device's memory
+        or a layout that replicates too much of the model, and ValueError for rules that name an axis the
+        mesh lacks.
         """
         self.scheduled(None if steps is None else steps // self.accumulation)
         state = jax.eval_shape(self.initial_state)
@@ -675,9 +676,9 @@ class Trainer(Generic[Loss, Effects]):
         state, position = checkpoints.restore(placed_shapes(abstract, shardings), resume, share=share,
                                               served=self.objective.served_groups(abstract.variables))
         state = restored(state, resume, self._examples)
-        if self._config is not None:
+        if (config := self._config) is not None:
             # The rate this run configures, not the one its checkpoint holds.
-            state = dataclasses.replace(state, opt_state=with_rates(state.opt_state, self._config.rates()))
+            state = rates_set(state, lambda held: with_rates(held, config.rates()))
         self._resume_rung(checkpoints.rung(resume))
         from dew.nn.inputs import request_key
         state = dataclasses.replace(state, key=jax.device_put(request_key(state.key), shardings.key))
@@ -1169,9 +1170,10 @@ class Trainer(Generic[Loss, Effects]):
         if shapes is not None:
             self._refuse_unpipelined(schedule)
         prepared = self._initialize_accumulation(state, batch, shapes, window=window, shape_only=True)
+        # DiLoCo's groups read their own parameters, which no narrow copy shadows.
         copies = (narrow_copies(self.objective, state, batch, self._model_batch, window=window, split=split,
                                 composed=self.step is None and not self.dynamic_scale)
-                  if (self._narrow if narrow is None else narrow) else {})
+                  if (self._narrow if narrow is None else narrow) and self.diloco is None else {})
         prepared = dataclasses.replace(prepared, compute=jax.eval_shape(
             lambda variables: narrowed(variables, copies), prepared.variables) if copies else None)
         return shapes, copies, prepared
@@ -1189,6 +1191,7 @@ class Trainer(Generic[Loss, Effects]):
         late = () if self.step is not None else tuple(set(COMMIT_FIELDS) & set(self.layout.host))
         body = self._step_body(shapes, copies, split, (lambda state: self._fetched(state, shardings, late))
                                if late else None, sampled)
+        body = body if self.diloco is None else self.diloco.step(body, self.device_mesh, split)
         moving, frozen = apart(shardings)
 
         def step(current, held, batch, part):
@@ -1683,7 +1686,7 @@ class Trainer(Generic[Loss, Effects]):
         state, shardings = placed()
         if int(state.step) != current:
             raise ValueError(f"the checkpoint of step {current} holds a state at step {int(state.step)}")
-        check_branches(bool(plan.branches) or pending, plan.suites, settable=settable_rates(state.opt_state))
+        check_branches(bool(plan.branches) or pending, plan.suites, settable=settable_rates(rated(state)))
         started = FitStarted(current, steps,
             checkpoints.source(current) if checkpoints is not None and position is not None else None,
             sum(leaf.size for leaf in jax.tree.leaves(state.variables["params"])), mesh.devices.size,
@@ -1884,7 +1887,7 @@ class Trainer(Generic[Loss, Effects]):
             raise ValueError("a cooldown branch reads on from the run's data position, and this stream "
                              "keeps none")
         assert run.partition is not None and run.notice is not None
-        began, at, held = time.perf_counter(), state.step, held_rates(state.opt_state)
+        began, at, held = time.perf_counter(), state.step, held_rates(rated(state))
         self._display.note(f"Cooldown branch from step {run.current}: {steps} steps")
         if checkpoints is not None:
             checkpoints.cooling(pending)
@@ -1926,9 +1929,8 @@ class Trainer(Generic[Loss, Effects]):
                     step, _, cooled = self._compiled_for(run.compiled, cooled, device, branched,
                                                          reported=run.current)
                     factor = decay(shape, done // self.accumulation, steps // self.accumulation)
-                    scaled = scaled_rates(cooled.opt_state, held, factor)
                     cooled, loss, aux, finite, _, committed = step(
-                        dataclasses.replace(cooled, opt_state=scaled), device)
+                        rates_set(cooled, functools.partial(scaled_rates, held=held, factor=factor)), device)
                     counted.count(batch, None, loss, finite, committed, aux)
                     branched.clock.stepped(self.objective.row_tokens(device), rows_of(device))
                     done, branched.current = done + 1, branched.current + 1
@@ -1981,7 +1983,7 @@ class Trainer(Generic[Loss, Effects]):
             self._read_taken(run)
         loss, aux, accepted = run.stepped
         run.taken = interval.take(run.current, loss, aux, accepted,
-                                  held(learning_rate(state.opt_state),
+                                  held(learning_rate(rated(state)),
                                        None if state.scale is None else state.scale.scale),
                                   {} if self.rollout is None else dict(_rollout_metrics(self.rollout)),
                                   {**plan.dataset.statistics(), **interval.consumption(self._examples)})
@@ -2217,14 +2219,12 @@ class Trainer(Generic[Loss, Effects]):
         on trials (`Trials`). A compile reads `run`'s pending log first: it holds the devices idle
         anyway, and its seconds are the next interval's.
 
-        A ramped run reads a new shape at every stage, so `compiled` keeps
-        one step per stage with the FLOPs measured for it. A batch whose
-        dtype, fields or a node's static field change at the same shapes is
-        another program, compiled as one: an executable refuses it. A step
-        that begins a ramp's or a schedule's stage gets its state with the
-        window a rejection left part filled dropped (`_staged`), the state
-        an AutoPGLE trial steps on too. A compile reports at `reported`, a
-        cooldown branch's at the run's step, else at the state's.
+        A ramped run reads a new shape at every stage, so `compiled` keeps one step per stage with the FLOPs
+        measured for it. A batch whose dtype, fields or a node's static field change at the same shapes is
+        another program, compiled as one: an executable refuses it. A step that begins a ramp's or a
+        schedule's stage gets its state with the window a rejection left part filled dropped (`_staged`), the
+        state an AutoPGLE trial steps on too. A compile reports at `reported`, a cooldown branch's at the
+        run's step, else at the state's.
         """
         state = self._staged(state, run.current)
         # Trials here serve only explicitly enabled AutoPGLE, never frontier timing.

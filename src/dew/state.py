@@ -74,6 +74,26 @@ def kept_window(held: Accumulation | None, pending: Accumulation, filled: int | 
 
 
 @struct.dataclass
+class Replicas:
+    """DiLoCo's inner copies (`dew.training.diloco`), each replica group's own state stacked on a first
+    axis that the mesh's diloco axis splits: its clocks of accepted microbatches and committed updates,
+    its variables, optimizer state, EMA, loss scale, pooling window and held tokens, each as a
+    `TrainState` field of one run holds them (`REPLICA_FIELDS`)."""
+    microstep: jax.Array
+    updates: jax.Array
+    variables: Variables
+    opt_state: optax.OptState
+    ema: Variables | None
+    scale: DynamicScale | None
+    accumulation: Accumulation | None
+    deferred: jax.Array | None
+
+
+REPLICA_FIELDS = tuple(field.name for field in dataclasses.fields(Replicas))
+"""The `TrainState` fields each DiLoCo replica holds its own of (`Replicas`)."""
+
+
+@struct.dataclass
 class TrainState:
     """Holds everything a run must checkpoint to resume where it stopped.
 
@@ -111,6 +131,10 @@ class TrainState:
     (`dew.held_updates.update_applied`), two uint32 words (`dew.training.model_flops._TokenCount`),
     committed with the update that applies them; None for an optimizer that applies every update, which
     a checkpoint that holds none restores."""
+    inner: Replicas | None = dataclasses.field(default=None, metadata={"optional": True})
+    """DiLoCo's replicas' inner state (`dew.training.diloco`), where the variables, the EMA and the
+    optimizer state above are the outer model's and its outer optimizer's; None in a run of one copy,
+    which a checkpoint that holds none restores."""
     compute: Variables | None = struct.field(default=None,
                                              metadata={'checkpointed': False, 'variables': True})
     """The lower-precision copies of the parameters that the forward pass reads, such as bf16 copies
