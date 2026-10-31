@@ -71,10 +71,10 @@ from dew.nn.flops import MissingFlopsCount
 from dew.pool import joins_pool, pool_cluster
 from dew.registry import models
 from dew.telemetry.benchmark import carried
-from dew.telemetry.instrumentation import model_flops_utilization
 from dew.telemetry.profile import capture_options
 from dew.telemetry.trace import communication_totals, device_events, window_split
 from dew.training import Trainer
+from dew.training.interval import throughput
 from dew.training.memory import recompute_record
 from dew.training.runtime import prepare_process
 
@@ -329,14 +329,27 @@ def communication(directory: str, steps: int, *, planes=None) -> dict[str, Any]:
     }
 
 
-def training_work(trainer: Trainer, case: Case, step_time: float) -> tuple[float | None, float | None]:
-    """The objective's training FLOPs on the case's batch, train/mfu's numerator, and that MFU over the
-    mesh's peak; both None where the model has no count."""
+def training_work(trainer: Trainer, case: Case) -> float | None:
+    """The objective's training FLOPs on the case's batch, train/mfu's numerator; None where the model
+    has no count."""
     try:
-        flops = trainer.objective.training_flops(None, global_batch(case))
+        return trainer.objective.training_flops(None, global_batch(case))
     except MissingFlopsCount:
-        return None, None
-    return flops, model_flops_utilization(flops / trainer.device_mesh.devices.size, step_time)
+        return None
+
+
+def rates(trainer: Trainer, rows: int, steps: int, elapsed: float,
+          work: float | None) -> tuple[float | None, float | None]:
+    """`steps` steps of `rows` rows over `elapsed` seconds, each `work` training FLOPs, rated as the
+    trainer's interval rates them (`dew.training.interval.throughput`): the step's HLO utilization, a
+    lower bound where it runs launches whose work went uncounted (`StepFlops.unsized`), and its MFU, the
+    work over the mesh's peak; each None where nothing counts it."""
+    flops = trainer.step_flops
+    scalars = throughput(elapsed, steps, rows * steps, None if flops is None else steps * flops,
+                         trainer.device_mesh.devices.size,
+                         training_flops=None if work is None else steps * work)
+    bound = "_lower_bound" if flops is not None and flops.unsized else ""
+    return scalars.get(f"train/hfu{bound}"), scalars.get("train/mfu")
 
 
 def measured_peak(case: Case, config: BenchmarkConfig) -> list[int | None]:
@@ -402,10 +415,10 @@ def measure(case: Case, config: BenchmarkConfig, peaks: list[int | None] | None)
                 planes = device_events(directory)[0]
                 timeline = {**device_timeline(directory, config.profile_steps, planes=planes),
                             **communication(directory, config.profile_steps, planes=planes)}
-        flops = trainer.step_flops and trainer.step_flops.hardware
+        flops = trainer.step_flops
         step_time = elapsed / config.steps
-        utilization = model_flops_utilization(flops, step_time)
-        training_flops, mfu = training_work(trainer, case, step_time)
+        training_flops = training_work(trainer, case)
+        utilization, mfu = rates(trainer, case.batch_size, config.steps, elapsed, training_flops)
         planned = step_bytes(trainer.executable)
         row: Row = {
             "architecture": case.architecture,
@@ -441,8 +454,11 @@ def measure(case: Case, config: BenchmarkConfig, peaks: list[int | None] | None)
             "p90_ms": round(float(p90), 3),
             "samples_per_sec": round(case.batch_size / step_time, 2),
             "tokens_per_sec": round(case.batch_size * case.seq_len / step_time, 1) if case.is_lm else None,
-            "flops_per_step": flops,
+            "flops_per_step": None if flops is None else flops.hardware,
             "utilization": utilization,
+            # The launches a step runs whose work no count holds; where any runs, `utilization` and
+            # `flops_per_step` are lower bounds, as the trainer's train/hfu_lower_bound is.
+            "unsized_kernels": None if flops is None else flops.unsized,
             "training_flops": training_flops,
             "mfu": mfu,
             "planned_device_bytes": planned,
@@ -491,6 +507,9 @@ def format_table(rows: list[Row]) -> str:
                 text = mesh_label(value)
             elif isinstance(value, (int, float)):
                 text = fmt.format(value * TABLE_SCALE.get(key, 1))
+                # A count some launch's work is missing from is a lower bound.
+                if key in ("flops_per_step", "utilization") and row.get("unsized_kernels"):
+                    text = ">=" + text
             else:
                 text = fmt.format(value)
             cells.append(text.ljust(width) if key == "architecture" else text.rjust(width))

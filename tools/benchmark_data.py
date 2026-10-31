@@ -544,9 +544,10 @@ def training_measure(factory, objective, config: Worker) -> dict:
     import optax
 
     from dew.distributed.batches import DevicePrefetchIterator
-    from dew.telemetry.instrumentation import model_flops_utilization
+    from dew.telemetry.instrumentation import NO_FLOPS
     from dew.telemetry.profile import capture_options
     from dew.training import Trainer
+    from dew.training.interval import throughput
 
     trainer = Trainer(objective, optax.adam(1e-4), key=0, checkpoints=None, tracker=None)
     state, _, _ = trainer.place()
@@ -570,9 +571,9 @@ def training_measure(factory, objective, config: Worker) -> dict:
                     segment_started = None
                 before = time.perf_counter()
                 compiled[key] = trainer.compile(state, batch)
-                flops[key] = None if trainer.step_flops is None else trainer.step_flops.hardware
+                flops[key] = trainer.step_flops
                 compiles.append({"signature": key, "seconds": time.perf_counter() - before,
-                                 "flops": flops[key]})
+                                 "flops": None if flops[key] is None else flops[key].hardware})
             before = time.perf_counter()
             # The step's commit telemetry (its sixth output) is not a signal this run reads.
             state, loss, _, finite, accepted = compiled[key](state, batch)[:5]
@@ -611,9 +612,14 @@ def training_measure(factory, objective, config: Worker) -> dict:
     seconds = completed_seconds
     padded = sum(row["padded_tokens"] for row in measured)
     hlo_flops = None if any(row["hlo_flops"] is None for row in measured) else sum(
-        row["hlo_flops"] for row in measured)
+        (row["hlo_flops"] for row in measured), NO_FLOPS)
     model_flops = None if any(row["model_flops"] is None for row in measured) else sum(
         row["model_flops"] for row in measured)
+    # Rated as the trainer's interval rates its steps: the objective's work over the whole mesh's peak,
+    # the compiled work a lower bound where a launch's went uncounted.
+    rates = throughput(seconds, len(measured), sum(row["rows"] for row in measured), hlo_flops,
+                       trainer.device_mesh.devices.size, training_flops=model_flops)
+    bound = "_lower_bound" if hlo_flops is not None and hlo_flops.unsized else ""
     return {"steps": len(measured), "data_wait_ms": statistics.mean(
                 row["wait_seconds"] for row in measured) * 1000,
             "step_ms": (seconds - sum(row["wait_seconds"] for row in measured)) * 1000 / len(measured),
@@ -625,11 +631,14 @@ def training_measure(factory, objective, config: Worker) -> dict:
             "compile_count": len(compiles), "compiles": compiles, "device_timeline": timeline,
             "losses": [float(resolved[row["signal_index"]][0]) for row in measured],
             "scope": "real asynchronous Trainer.compile updates; compilation boundaries excluded",
-            "model_mfu_bf16_peak": model_flops_utilization(model_flops, seconds),
-            "model_flops_scope": "objective.training_flops on real host lengths and layout; "
-                                 "custom image-mean model and frozen legacy API have no analytic count",
-            "hlo_utilization_bf16_peak": model_flops_utilization(hlo_flops, seconds),
+            "model_mfu_bf16_peak": rates.get("train/mfu"),
+            "model_flops_scope": "objective.training_flops on real host lengths and layout, over the mesh's "
+                                 "dense bf16 peak; custom image-mean model and frozen legacy API have no "
+                                 "analytic count",
+            "hlo_utilization_bf16_peak": rates.get(f"train/hfu{bound}"),
+            "unsized_kernels_per_step": None if hlo_flops is None else hlo_flops.unsized / len(measured),
             "utilization_scope": "optimized executable work, including padding, over dense bf16 peak; "
+                                 "a lower bound where unsized_kernels_per_step is not zero; "
                                  "not an analytic real-token MFU"}
 
 
