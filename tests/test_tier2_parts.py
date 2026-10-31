@@ -415,6 +415,86 @@ def test_an_embedding_dews_lookup_does_not_compute_is_refused_at_load(tmp_path):
                         trust_remote_code=True)
 
 
+BUILT_IN = {
+    "granite": {"embedding_multiplier": 12.0, "residual_multiplier": 0.22, "attention_multiplier": 0.0078125,
+                "logits_scaling": 8.0},
+    "smollm3": {},
+    "olmo2": {},
+    "hy_v3": {"num_experts": 8, "num_experts_per_tok": 2, "num_shared_experts": 1,
+              "moe_intermediate_size": 32, "router_scaling_factor": 2.826},
+    "glm4_moe_lite": {"head_dim": None, "num_key_value_heads": 4, "n_routed_experts": 8,
+                      "num_experts_per_tok": 2, "n_shared_experts": 1, "moe_intermediate_size": 32,
+                      "q_lora_rank": 24, "kv_lora_rank": 16, "qk_nope_head_dim": 16, "qk_rope_head_dim": 8,
+                      "v_head_dim": 16, "n_group": 2, "topk_group": 1, "routed_scaling_factor": 1.8},
+}
+"""transformers' own types that no registered family reads, each made of known parts, by their fields beside
+`tiny_config`'s: Granite's multipliers, SmolLM3's layers without positions (its fourth), OLMo 2's
+output-normed sublayers, HY-3's routed experts beside a shared one, and GLM-4.7-Flash's latent attention
+(DeepSeek V3's, whose `head_dim` names the rotated slice, so it is left to the config) with its grouped
+sigmoid router. Each type's first layer is dense and the others route."""
+
+BUILT_IN_SEEDS = {"granite": 8, "smollm3": 8, "olmo2": 8, "hy_v3": 8, "glm4_moe_lite": 8}
+"""Each built-in type's declared check-1 seeds for its logits, sized by `seeds_for` on armada."""
+
+
+@pytest.mark.parametrize("model_type", sorted(BUILT_IN))
+def test_a_built_in_type_of_known_parts_loads_natively(tmp_path, model_type):
+    """A type transformers builds and no registered family reads verifies from parts and loads as a
+    native decoder, its logits holding check 1 against transformers' own. A routed type's checkpoint
+    holds each expert's projections apart, as transformers saves them, which its load stacks into the
+    fused tensors its experts module holds (its conversion mapping): the load reads them as stored."""
+    from interop_support import tiny_config
+    from safetensors import safe_open
+    from transformers import AutoModelForCausalLM
+
+    torch.manual_seed(0)
+    config = tiny_config(model_type, **BUILT_IN[model_type])
+    model = AutoModelForCausalLM.from_config(config, dtype=torch.float32)
+    scatter_weights(model)
+    model.save_pretrained(tmp_path)
+    with safe_open(tmp_path / "model.safetensors", "pt") as stored:
+        names = set(stored.keys())
+    routed = model_type in ("hy_v3", "glm4_moe_lite")
+    assert ("model.layers.1.mlp.experts.0.gate_proj.weight" in names) == routed
+    verified = verify_mapping(json.loads((tmp_path / "config.json").read_text()))
+    assert isinstance(verified, VerifiedMapping) and verified.family == "parts"
+    loaded = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
+    forward = jax.jit(loaded.model.apply)
+
+    def built(dtype):
+        return AutoModelForCausalLM.from_pretrained(tmp_path, dtype=dtype, attn_implementation="eager",
+                                                    experts_implementation="eager").eval()
+
+    reference = built(torch.float32)
+    wide = float64_twin(reference, lambda: built(torch.float64)).eval()
+    draw = clearing_selections(loaded, token_draw(0x3070, model.config.vocab_size, (4, 24)), model_type)
+    assert_as_exact(as_given(lambda ids: np.asarray(forward(loaded.variables, ids), np.float64)),
+                    torch_logits(reference), draw, f"{model_type} logits", seeds=BUILT_IN_SEEDS[model_type],
+                    truth_fn=torch_logits(wide, float64))
+
+
+def test_a_stored_name_reads_as_the_sources_load_reads_it():
+    """An assembly reads a stored tensor's name as transformers' load does (`get_model_conversion_mapping`):
+    Mixtral's release stores each expert's projections apart, as `w1`, `w3` and `w2` under
+    `block_sparse_moe`, which its load renames and stacks into the fused tensors its experts hold; each
+    reads as its expert's canonical gate, up or down projection by its place among the merge's sources. A
+    backbone's name without the base model's prefix reads under it, and a name the source holds as stored
+    reads as stored."""
+    from interop_support import tiny_config
+    from transformers import AutoModelForCausalLM
+
+    with torch.device("meta"):
+        model = AutoModelForCausalLM.from_config(tiny_config("mixtral", num_local_experts=4))
+    assembly = parts.assemble(model)
+    layer = "model.layers.1"
+    assert [assembly.canonical(f"{layer}.block_sparse_moe.experts.2.{stored}.weight")
+            for stored in ("w1", "w3", "w2")] == [
+        f"{layer}.mlp.experts.2.{projection}.weight" for projection in ("gate_proj", "up_proj", "down_proj")]
+    assert assembly.canonical("layers.1.self_attn.q_proj.weight") == f"{layer}.self_attn.q_proj.weight"
+    assert assembly.canonical(f"{layer}.mlp.gate.weight") == f"{layer}.mlp.gate.weight"
+    assert assembly.canonical(f"{layer}.block_sparse_moe.experts.2.w4.weight") is None
+
+
 def test_a_remote_causal_lm_over_a_built_in_config_is_its_own(tmp_path):
     """A repository naming its own causal LM beside transformers' config for a type transformers
     builds verifies its own class, as transformers resolves the auto map: the renamed Llama over CWM's
