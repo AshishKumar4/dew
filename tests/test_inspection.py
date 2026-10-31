@@ -13,6 +13,7 @@ import numpy as np
 import optax
 import pytest
 import test_run_budgets
+from objective_cases import cases
 from reference_error import assert_computes_the_oracle
 from run_kinds import KINDS, lm, scalars
 
@@ -312,14 +313,15 @@ def test_watching_a_kind_no_module_is_refused():
 @pytest.mark.parametrize("kind", list(KINDS))
 def test_every_kinds_run_logs_the_activations_its_command_line_watches(kind, tmp_path):
     """A run of every kind watching module kinds on its command line (`trainer.inspection.modules`)
-    logs a summary of each watched module's output at its sampled step, its mean, standard deviation,
-    largest magnitude and non-finite share, and none at a step it does not sample."""
+    logs a summary of each watched module's output and of the loss's cotangent there at its sampled step,
+    its mean, standard deviation and non-finite share, the output's largest magnitude, and none at a step
+    it does not sample: every objective's model calls carry the step's cotangent probes (row 2324)."""
     record, runs = tmp_path / "record", tmp_path / "runs"
     (tmp_path / "data").mkdir()
     KINDS[kind](tmp_path / "data", drawn=False).save(str(record))
     inspection = {"class": "dew.training.inspection:Inspection",
                   "fields": {"modules": ["*Attention*", "*Block*", "*Mlp*", "*MLP*"], "every": 2,
-                             "targets": ["params"]}}
+                             "targets": ["params"], "cotangents": True}}
     settings = {"trainer.name": "watched", "trainer.checkpoint_dir": str(runs), "trainer.steps": "2",
                 "trainer.log_every": "1", "trainer.eval_every": "None", "trainer.checkpoint_every": "None",
                 "trainer.inspection": json.dumps(inspection), "trainer.multi_host": "False",
@@ -329,7 +331,9 @@ def test_every_kinds_run_logs_the_activations_its_command_line_watches(kind, tmp
     logged = scalars(runs / "watched")
     watched = {name.rsplit("/", 1)[1] for name in logged[2] if name.startswith("inspect/activations/")}
     assert {"mean", "std", "abs_max", "non_finite"} <= watched
-    assert not any(name.startswith("inspect/activations/") for name in logged[1])
+    cotangents = {name.rsplit("/", 1)[1] for name in logged[2] if name.startswith("inspect/cotangents/")}
+    assert {"mean", "std", "rms", "non_finite"} <= cotangents
+    assert not any(name.startswith("inspect/") for name in logged[1])
 
 
 class Headed(nn.Module):
@@ -461,7 +465,6 @@ def test_a_sampled_step_summarizes_its_trained_forward_at_no_forward_more(name):
     as an H100 would run it (`generation.assumed`), the sampled loss and gradient hold the unsampled's
     products and kernel launches, so no second forward rides on a compiler merging it, which two
     attention kernels of different forms never are (rows 2512 and 2718)."""
-    from objective_cases import cases
     from reference_error import equations
 
     from dew.nn.inspection import Watched, watching
@@ -674,3 +677,78 @@ def test_a_watched_layers_cotangent_is_summarized_as_the_losses_cotangent_there(
         assert_computes_the_oracle(watched[f"inspect/cotangents/Block_1/{statistic}"], expected[statistic],
                                    f"the watched block's cotangent {statistic}", roundings=ROWS.size)
     assert {name: value for name, value in watched.items() if "/cotangents/" not in name} == unwatched
+
+
+@pytest.fixture(scope="module")
+def windows(tmp_path_factory):
+    from objective_data import corpus_windows
+
+    return corpus_windows(tmp_path_factory.mktemp("corpus"))
+
+
+@pytest.mark.parametrize("name", sorted(set(cases(None)) - {"flow_grpo"}))
+def test_every_objectives_watched_cotangents_reach_its_model_calls(name, windows, tmp_path):
+    """Every objective's step that summarizes its watched outputs' cotangents (row 2324) carries its
+    cotangent probes to each model call it watches, which no step refuses, and the loss's cotangent
+    reaches each probe: a count of entries and a finite sum of their squares, the parameters' gradient
+    the unprobed step's to the bit. Flow-GRPO's, trained on rollouts, is `test_flow_grpo`'s."""
+    from test_whole_validation import runnable
+
+    from dew.nn.inspection import Watched
+    from dew.objectives.base import Step
+    from dew.training.transaction import probed_loss
+
+    objective, batch = runnable(name, windows, tmp_path)
+    if name == "ppo":
+        mask = np.asarray(batch["response_mask"], np.float32)
+        batch = {**batch, "old_values": np.zeros_like(mask), "returns": mask}
+    variables = objective.init(jax.random.key(0))
+    numeric = {key: value for key, value in batch.items()
+               if getattr(value, "dtype", None) is not None and value.dtype.kind in "biuf"}
+    held = {key: value for key, value in batch.items() if key not in numeric}
+    watched = Watched(("*Block*", "*Attention*", "*Mlp*", "*MLP*"), cotangents=True)
+
+    def step(watched):
+        return Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(1), ema=variables, watched=watched)
+
+    def reduced(stats):
+        return objective.reduce_loss(stats)[0]
+
+    def gradients(numeric):
+        stats, back, _ = probed_loss(objective, variables, {**numeric, **held}, step(watched))
+        _, seed = jax.vjp(reduced, stats)
+        return back(seed(jnp.ones(()))[0])
+
+    def plain(numeric):
+        def loss(params):
+            return reduced(objective._loss({**variables, "params": params}, {**numeric, **held},
+                                           step(Watched(watched.modules)))[0])
+        return jax.grad(loss)(variables["params"])
+
+    (params, probes), expected = jax.jit(gradients)(numeric), jax.jit(plain)(numeric)
+    assert probes and all(leaf[..., 0].min() > 0 and np.isfinite(leaf[..., 2]).all()
+                          for leaf in jax.tree.leaves(probes))
+    assert all((left == right).all()
+               for left, right in zip(jax.tree.leaves(params), jax.tree.leaves(expected), strict=True))
+
+
+@pytest.mark.mesh(devices=4)
+def test_a_pipelined_stacks_watched_cotangents_are_refused():
+    """A pipelined stack's watched cotangents are refused as the step traces (row 2324): a probe would be
+    laid out by the stage's microbatches while its stage reads variables by layer, so the step names
+    what it cannot summarize rather than summarize another layer's."""
+    from model_support import TINY_DECODER
+
+    from dew.objectives.lm import LMObjective
+    from dew.registry import models
+    from dew.training import MeshSpec
+
+    model = models.build("causal_transformer", vocab_size=64, **{**TINY_DECODER, "num_layers": 4},
+                         num_kv_heads=2)
+    run = Trainer(LMObjective(model, 16), optax.sgd(RATE), key=jax.random.key(0), microbatches=2,
+                  mesh=MeshSpec(fsdp=2, stage=2).build(jax.devices()[:4]),
+                  inspection=Inspection(modules=("*MLP",), targets=("params",), cotangents=True))
+    tokens = np.random.default_rng(1).integers(1, 64, size=(8, 17)).astype(np.int32)
+    with pytest.raises(ValueError):
+        inspected(run, {"text": tokens})
+
