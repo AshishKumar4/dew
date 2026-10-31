@@ -17,6 +17,7 @@ from .kernels.generation import INHERENT, bf16_dot_runs, capability, device_gene
 from .kernels.selection import Kernel, Op, Refusal, Requirement
 from .kernels.templates import attention_route
 from .kernels.templates.attention_triton import DTYPES as TEMPLATE_DTYPES
+from .precision import wide_cpu_arithmetic
 
 CUDNN_DTYPES = (jnp.bfloat16, jnp.float16)
 
@@ -403,6 +404,12 @@ XLA_SUPPORTS = (
     _Need('dtypes', lambda case: case.key_dtype == case.dtype,
           lambda case: f"jax.nn's attention takes a query of its keys' dtype, not {case.dtype} over "
                        f"{case.key_dtype} (`dot_product_attention`'s `_check_shape_and_dtype`)",
+          row=INHERENT, kind='handoff'),
+    _Need('wide_cpu', lambda case: not (wide_cpu_arithmetic() and generation.backend() == 'cpu'),
+          "a CPU under Dew's wide arithmetic (`WIDE_CPU_ARITHMETIC`) sums fp32 products in float64 "
+          "(`precision.accumulated`), where jax.nn's attention sums them in fp32: its reference path keeps "
+          "them, so a run under it records the products it computed (a process without the setting runs "
+          "jax.nn's kernel on a CPU as on any platform)",
           row=INHERENT, kind='handoff'),
     _Need('float64', lambda case: case.dtype != np.float64,
           "jax.nn's attention takes its softmax in float32 whatever its operands' dtype "

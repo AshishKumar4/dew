@@ -50,6 +50,7 @@ from dew.nn.inputs import CONTEXT, CONTEXT_LENGTHS, CrossContext, ModelInputs
 from dew.nn.kv_cache import KVCache
 from dew.nn.mlp import GatedMLP
 from dew.nn.ngpt import NGPT
+from dew.nn.precision import WIDE_CPU_ARITHMETIC
 from dew.objectives.lm import LMObjective
 from dew.sampling import Sampling
 from dew.training import Layout, MeshSpec, Trainer
@@ -184,14 +185,17 @@ def test_zero_gates_and_an_empty_context_leave_the_residual_as_it_is():
     assert not np.array_equal(np.asarray(out)[0], x[0]), "a row with a context moves"
 
 
-def test_a_block_whose_every_row_reads_one_context_token_moves_neither_its_query_nor_its_key_projection():
+def test_a_block_whose_every_row_reads_one_context_token_moves_neither_its_query_nor_its_key_projection(
+        monkeypatch):
     """A row that reads one context token attends it whatever the scores, so when every row does the
     gradients into the block's query and key projections are exactly zero, as IDEFICS's and float64's are,
     while its value projection moves: through jax.nn's xla kernel too, whose scaled logits XLA:CPU contracts
     with the subtraction of their maximum into one FMA in this program, leaving each token's weight a
     rounding off 1 (3e-7 of query and key gradient), where `_fused_attention` has its softmax take the
     textbook derivative, zero for any such weight (two of the 2,560 seeds of
-    `test_the_block_computes_and_differentiates_as_idefics` draw every row of one token)."""
+    `test_the_block_computes_and_differentiates_as_idefics` draw every row of one token), under a process's
+    own CPU arithmetic (the suite's wide one hands every xla call on, `XLA_SUPPORTS`)."""
+    monkeypatch.delenv(WIDE_CPU_ARITHMETIC, raising=False)
     x, context, params, _, cotangent = block_draw(0)
     _, _, _, gradients = dew_block(x, context, params, np.ones(B, np.int32), cotangent)
     for name in ("q_proj", "k_proj"):
