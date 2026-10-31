@@ -1359,10 +1359,7 @@ def learning_rate(opt_state: optax.OptState) -> jax.typing.ArrayLike | None:
                 read(node.inner_state)
 
     read(opt_state)
-    if len(rates) != 1:
-        return None
-    # A DiLoCo run's groups hold their rates stacked, each the same (`dew.training.diloco.rated`).
-    return rates[0] if jnp.ndim(rates[0]) == 0 else jnp.ravel(rates[0])[0]
+    return rates[0] if len(rates) == 1 else None
 
 
 def reclocked(opt_state: optax.OptState, made: optax.OptState) -> optax.OptState:

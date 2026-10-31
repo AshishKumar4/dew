@@ -29,11 +29,12 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from dew.distributed.placement import Placement
 from dew.mesh import DILOCO_AXIS
+from dew.optim import learning_rate
 from dew.state import REPLICA_FIELDS, Replicas, TrainState
 from dew.training.transaction import cleared, example_groups, window_dropped
 
-__all__ = ["DiLoCo", "dropped", "grouped", "on_groups", "rated", "rates_set", "regrouped", "shared_by_groups",
-           "windowed"]
+__all__ = ["DiLoCo", "dropped", "group_of", "grouped", "learning_rate_of", "on_groups", "rated", "rates_set",
+           "regrouped", "shared_by_groups", "windowed"]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -194,12 +195,36 @@ def rated(state: TrainState) -> optax.OptState:
     return state.opt_state if state.inner is None else state.inner.opt_state
 
 
+def learning_rate_of(state: TrainState) -> jax.typing.ArrayLike | None:
+    """The learning rate a run's optimizer state holds (`dew.optim.learning_rate`), under DiLoCo the first
+    group's, every group's alike."""
+    rate = learning_rate(rated(state))
+    return rate if state.inner is None or rate is None else jnp.asarray(rate)[0]
+
+
 def rates_set(state: TrainState, setting: Callable[[optax.OptState], optax.OptState]) -> TrainState:
     """`state` with its rated optimizer state (`rated`) as `setting` makes it, its other leaves its own."""
     if state.inner is None:
         return dataclasses.replace(state, opt_state=setting(state.opt_state))
     return dataclasses.replace(state, inner=dataclasses.replace(state.inner,
                                                                 opt_state=setting(state.inner.opt_state)))
+
+
+def group_of(state: TrainState, batch) -> tuple[TrainState, object]:
+    """The state and batch one group's step reads, its shapes: under DiLoCo its inner state, the first
+    group's clock as it is (every group's window holds as many microbatches), and its share of the
+    batch's rows; a run of one copy's as they are."""
+    if state.inner is None:
+        return state, batch
+    groups = jax.tree.leaves(state.inner.variables)[0].shape[0]
+    view = dataclasses.replace(state, inner=None, **{field: jax.tree.map(
+        lambda leaf: jax.ShapeDtypeStruct(leaf.shape[1:], leaf.dtype), getattr(state.inner, field))
+        for field in REPLICA_FIELDS})
+    if not isinstance(state.inner.microstep, jax.ShapeDtypeStruct):
+        view = dataclasses.replace(view, microstep=state.inner.microstep[0])
+    share = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(
+        (jnp.shape(leaf)[0] // groups, *jnp.shape(leaf)[1:]) if jnp.ndim(leaf) else (), leaf.dtype), batch)
+    return view, share
 
 
 def windowed(initialize: Callable, state: TrainState, batch,
@@ -213,11 +238,7 @@ def windowed(initialize: Callable, state: TrainState, batch,
     if state.inner is None:
         return initialize(state, batch, shape_only=place is None)
     groups = jax.tree.leaves(state.inner.variables)[0].shape[0]
-    view = dataclasses.replace(state, inner=None, **{field: jax.tree.map(
-        lambda leaf: jax.ShapeDtypeStruct(leaf.shape[1:], leaf.dtype), getattr(state.inner, field))
-        for field in REPLICA_FIELDS})
-    share = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(
-        (jnp.shape(leaf)[0] // groups, *jnp.shape(leaf)[1:]) if jnp.ndim(leaf) else (), leaf.dtype), batch)
+    view, share = group_of(state, batch)
     held = initialize(view, share, shape_only=True)
     if held.accumulation is view.accumulation:
         return state

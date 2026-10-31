@@ -163,12 +163,14 @@ class TrainState:
         return self.accumulation if self.inner is None else self.inner.accumulation
 
     @property
-    def first_window(self) -> Accumulation | None:
-        """The window whose tokens a run's clocks count pending (`TokenClock`): its own, or under DiLoCo the
-        first group's, each group counting the whole batch's tokens as the run commits them."""
-        if self.inner is None or self.inner.accumulation is None:
-            return self.accumulation
-        return jax.tree.map(lambda leaf: leaf[0], self.inner.accumulation)
+    def pending_tokens(self) -> jax.Array | None:
+        """The real tokens an update's open window holds (`Accumulation.tokens`, two words), which a run's
+        clocks count pending (`TokenClock`): its own window's, or under DiLoCo the first group's, each group
+        counting the whole batch's tokens as the run commits them; None for no window or no count."""
+        window = self.window
+        if window is None or window.tokens is None:
+            return None
+        return window.tokens if self.inner is None else window.tokens[0]
 
     def with_window(self, window: Accumulation | None) -> TrainState:
         """This state with `window` as the window its step reads (`window`)."""

@@ -106,7 +106,7 @@ from dew.objectives.base import (
     TrainingScalar,
     taken_record,
 )
-from dew.optim import held_rates, learning_rate, scaled_rates, settable_rates, with_rates
+from dew.optim import held_rates, scaled_rates, settable_rates, with_rates
 from dew.state import MODEL_STATE, Accumulation, TrainState, apart, drawn_in, kept_window, together
 from dew.telemetry import profile as telemetry_profile
 from dew.telemetry.instrumentation import StepFlops
@@ -139,7 +139,16 @@ from dew.training._fit import (
 from dew.training._lowering import KernelReport, Lowered, Routed, routed
 from dew.training.budget import Pause, Plateau
 from dew.training.cooldown import Cooldowns, Pending, check_branches, decay, resolved, schedule_ended
-from dew.training.diloco import DiLoCo, dropped, grouped, rated, rates_set, windowed
+from dew.training.diloco import (
+    DiLoCo,
+    dropped,
+    group_of,
+    grouped,
+    learning_rate_of,
+    rated,
+    rates_set,
+    windowed,
+)
 from dew.training.display import TRAINER_SHOWN, TrainingDisplay, goodput
 from dew.training.distributed import (
     check_batch,
@@ -1161,7 +1170,7 @@ class Trainer(Generic[Loss, Effects]):
         the copies the step builds, as it traces them over microbatches of `batch`'s shapes, none where
         `narrow` is off."""
         window = split * self.accumulation
-        shapes = None if self.step is not None else self._loss_shape(state, batch, window, split)
+        shapes = None if self.step is not None else self._loss_shape(*group_of(state, batch), window, split)
         if shapes is not None:
             self._refuse_unpipelined(schedule)
         prepared = windowed(lambda state, rows, *, shape_only: self._initialize_accumulation(
@@ -1443,7 +1452,7 @@ class Trainer(Generic[Loss, Effects]):
         compiled: dict[Signature, tuple[CompiledStep, StepFlops | None]] = run.compiled
         seen = 0
         run.notice = PreemptionNotice()
-        run.clock = TokenClock(*interval.clocked(state.first_window))
+        run.clock = TokenClock(*interval.clocked(state.pending_tokens))
         if run.cooling is not None and not plan.ended(run.current, run.clock.read, interval.consumed):
             # A branch a preemption cut short runs again before the run reads on from where it stood.
             state, cut = self._cooled(plan, run, interval, state, shardings, position, run.cooling)
@@ -1897,7 +1906,7 @@ class Trainer(Generic[Loss, Effects]):
         # as the run's do (`_scheduled`), read off the devices where its steps may have reached what it
         # reads next (`FitPlan.committed`); the stages it begins are its own, the run's kept as they were.
         counted = Interval(time.time(), None, tokens_before_log=interval.real_tokens)
-        branched.clock = TokenClock(*counted.clocked(state.first_window))
+        branched.clock = TokenClock(*counted.clocked(state.pending_tokens))
         starts = self._stage_starts
         cooled, done, cut = state, 0, False
         # A rollout run's branch draws its batches from the branch's own states (`rollout._branched`),
@@ -1978,7 +1987,7 @@ class Trainer(Generic[Loss, Effects]):
             self._read_taken(run)
         loss, aux, accepted = run.stepped
         run.taken = interval.take(run.current, loss, aux, accepted,
-                                  held(learning_rate(rated(state)),
+                                  held(learning_rate_of(state),
                                        None if state.scale is None else state.scale.scale),
                                   {} if self.rollout is None else dict(_rollout_metrics(self.rollout)),
                                   {**plan.dataset.statistics(), **interval.consumption(self._examples)})
