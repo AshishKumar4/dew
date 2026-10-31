@@ -782,7 +782,7 @@ def _solving(call: _Call) -> mosaic.Family:
 
 
 @_lowered_once
-def _solved(k, v, hi, lo, beta, taken, call: _Call, *, keeps: bool = True):
+def _solved(k, v, hi, lo, beta, taken, call: _Call, *, keeps: bool = True, applies: bool = True):
     """`(a [R, HV * C], w [R, HV * Dk], u [R, HV * Dv])` as `call.held` of each chunk and value head under a
     decay a head, fla's kkt_solve and recompute_w_u in one program (FlashQLA's first kernel): the keys'
     products (`algebra.keyed`) inverted by doubling on the chunk's tile (`algebra.doubled`, its merges in
@@ -791,18 +791,21 @@ def _solved(k, v, hi, lo, beta, taken, call: _Call, *, keeps: bool = True):
     staged once for every block's product: one launch's tiles and one load of the keys, where two launches
     stored and loaded the inverse between them. Where it `keeps` no inverse (a forward no backward reads,
     `a` None), its store's landing tile goes: an A100's launch then holds two programs a multiprocessor
-    (an inverse's 8 KB past half its shared memory kept it at one, SE-family-a100-0c8018352)."""
+    (an inverse's 8 KB past half its shared memory kept it at one, SE-family-a100-0c8018352). Where it
+    `applies` none, `(a,)` alone, which `_weighted` applies (`_solves_apart`)."""
     call = dataclasses.replace(call, family=_solving(call))
     width, value_width, family = call.width, call.value_width, call.family
     held = dataclasses.replace(call.held, rows=call.rows)
 
     def program(k_ref, v_ref, hi_ref, lo_ref, beta_ref, column_hi_ref, column_lo_ref, taken_ref, *outputs,
                 streams, staging, landing):
-        a_ref, w_ref, u_ref = outputs if keeps else (None, *outputs)
+        a_ref, w_ref, u_ref = ((*outputs, None, None) if not applies else outputs if keeps
+                               else (None, *outputs))
         n, h = _axis("chunks"), _axis("heads")
         row, span = n * CHUNK, pl.ds(n * CHUNK, CHUNK)
         views = _views(keys=call.given.views(k_ref, row, CHUNK, h // call.group * width, width),
-                       values=call.given.views(v_ref, row, CHUNK, h * value_width, value_width))
+                       **({"values": call.given.views(v_ref, row, CHUNK, h * value_width, value_width)}
+                          if applies else {}))
         vectors = {"gate": hi_ref, "low": lo_ref, "write": beta_ref, "column_gate": column_hi_ref,
                    "column_low": column_lo_ref}
         streamed = family.copies_vectors
@@ -834,6 +837,8 @@ def _solved(k, v, hi, lo, beta, taken, call: _Call, *, keeps: bool = True):
             lower = algebra.solved(system, _merging(merges, call))
             if keeps:
                 held.store(a_ref, lower, row, CHUNK, h * CHUNK, CHUNK, family=family, smem=landing["square"])
+            if not applies:
+                return carry, accumulators
             # The inverse staged once (the first set) for every block's product, a block staged in the
             # second: `Issuer` keeps a staged value for the products after it that take it.
             sets = [lower_tile, scaled_tile]
@@ -862,9 +867,9 @@ def _solved(k, v, hi, lo, beta, taken, call: _Call, *, keeps: bool = True):
         [_f32(CHUNK, CHUNK)] * 2 + _fragments(call, (call.given, CHUNK, call.block), (call.given, CHUNK,
                                                                                          call.block)),
         _doubling_held(call),
-        [_f32(CHUNK, CHUNK)] + [_f32(CHUNK, call.block)] * 2 + _held(call.given, CHUNK, call.block)
-        + _fragments(call, (held, CHUNK, CHUNK), (call.given, CHUNK, call.block))))
-    out_type = (held.shape(call.heads * width), held.shape(call.heads * value_width))
+        *([[_f32(CHUNK, CHUNK)] + [_f32(CHUNK, call.block)] * 2 + _held(call.given, CHUNK, call.block)
+           + _fragments(call, (held, CHUNK, CHUNK), (call.given, CHUNK, call.block))] if applies else [])))
+    out_type = (held.shape(call.heads * width), held.shape(call.heads * value_width)) if applies else ()
     if keeps:
         out_type = (held.shape(call.heads * CHUNK), *out_type)
     # The inverse's application stages in the doubling's merge tiles where they are its form (an fp32 call's
@@ -872,18 +877,27 @@ def _solved(k, v, hi, lo, beta, taken, call: _Call, *, keeps: bool = True):
     # shared memory, past an H100's block (SE-family-h100-e0de17766).
     merging = _merges(call)
     reused = (held.parts > 1 and merging[0][0].dtype == held.stored and call.block == CHUNK)
-    staging = merging if reused else (*merging, _staging(held, (CHUNK, CHUNK))[0],
-                                      _staging(held, (CHUNK, call.block))[0])
+    staging = merging if reused or not applies else (*merging, _staging(held, (CHUNK, CHUNK))[0],
+                                                     _staging(held, (CHUNK, call.block))[0])
     landing = {"square": held.landing(CHUNK, CHUNK)} if keeps else {}
-    landing["block"] = held.landing(CHUNK, call.block)
+    if applies:
+        landing["block"] = held.landing(CHUNK, call.block)
     solved = _kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
                      grid_names=("chunks", "heads"),
                      blocks=_streamed(keys=((CHUNK, width), call.given),
-                                      values=((CHUNK, value_width), call.given))
+                                      **({"values": ((CHUNK, value_width), call.given)} if applies else {}))
                      | _vector_blocks(call, "gate", "low", "write", "column_gate", "column_low"),
                      stages=1, live=_taken(7), work=work, held=held_tiles, staging=staging, landing=landing,
                      persistent=True, reduces=False)(k, v, hi, lo, beta, hi, lo, taken)
     return solved if keeps else (None, *solved)
+
+
+def _solves_apart(call: _Call) -> bool:
+    """Whether a decay a head's solve leaves its inverse's application to `_weighted`: where the doubling's
+    merges take parts (`_merged`). Beside the application's tiles the solve spilled 1168 bytes a thread in
+    an fp32 call's two parts and 196 in a ranged bf16 call's on an H100 (fast32-sm90 at 09bfe984c,
+    Qwen3.5-27B's gated delta net)."""
+    return _merged(call).parts > 1
 
 
 def _key_block(call: _Call, held: Callable[[int], _Held], consumers: int = 1) -> int:
@@ -1872,7 +1886,11 @@ def _prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles
     elif delta and inverse is None:
         # The forward's residuals come in pairs: a recomputed forward has neither.
         assert kept is None, "a kept forward keeps its inverse"
-        a, w, u = _solved(k, v, hi, lo, beta, taken, call, keeps=keeps)
+        if _solves_apart(call):
+            (a,) = _solved(k, v, hi, lo, beta, taken, call, applies=False)
+            w, u = _weighted(k, v, a, hi, lo, beta, taken, call)
+        else:
+            a, w, u = _solved(k, v, hi, lo, beta, taken, call, keeps=keeps)
     elif delta:
         a = inverse
         if kept is None:

@@ -148,8 +148,8 @@ def gradients(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None, fi
                     tiles=tiles, family=family, interpret=interpret, inverse=inverse, kept=kept,
                     firsts=firsts, rounded=rounded, ranged=ranged)
     call = run.call
-    if call.per_key or call.held.parts > 1:
-        raise NotImplementedError("the fast backward takes a decay a head in a 16-bit call")
+    if call.per_key:
+        raise NotImplementedError("the fast backward takes a decay a head")
     rows, heads, width, columns = call.rows, call.heads, call.width, call.value_width
     batch = run.batch
     laid_do = call.given.split(run.laid(_padded(do.astype(run.dtype), 3, columns)).reshape(rows, -1))
