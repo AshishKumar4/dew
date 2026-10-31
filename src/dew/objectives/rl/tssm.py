@@ -184,10 +184,10 @@ class TSSM(nn.Module):
         """A cache of `size` slots holding nothing, for acting from fresh episodes (`context` slots).
         Within an episode's first `size` steps acting reads what training's window does; past them the
         cache holds the last `size` steps' keys, each computed over the context before it."""
-        head = self.width // self.heads
-        zeros = jnp.zeros((rows, self.layers, size, self.heads, head), self.dtype)
-        return Cache(zeros, zeros, jnp.zeros((rows, size), bool), jnp.zeros(rows, jnp.int32),
-                     jnp.zeros(rows, jnp.int32))
+        shape = (rows, self.layers, size, self.heads, self.width // self.heads)
+        # Keys and values each their own buffer: a rollout donates the cache it steps, each buffer once.
+        return Cache(jnp.zeros(shape, self.dtype), jnp.zeros(shape, self.dtype),
+                     jnp.zeros((rows, size), bool), jnp.zeros(rows, jnp.int32), jnp.zeros(rows, jnp.int32))
 
     def step(self, x: jax.Array, first: jax.Array, cache: Cache) -> tuple[jax.Array, Cache]:
         """One step's state `[B, width]` from its input `x` `[B, width]`, attending to the cache and to
