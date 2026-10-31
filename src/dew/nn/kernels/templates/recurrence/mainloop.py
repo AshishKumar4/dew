@@ -596,19 +596,21 @@ def _planned_launch(call: _Call, scope: Callable[[int], resources.Scope], regist
 
 
 def _laid(call: _Call, scope: Callable[[int], resources.Scope], registers: int, tiles: int, *,
-          stages: int | None, consumers: int = 1) -> tuple[resources.LaunchPlan, int]:
+          stages: int | tuple[int, int] | None, consumers: int = 1) -> tuple[resources.LaunchPlan, int]:
     """A launch's plan and its programs: a persistent launch's (`stages` None) as many as a multiprocessor
     holds at once, at most its `tiles`, its rings two deep where they run on (`mosaic.RingFamily`'s) and two
     deep hold as many programs as one, so a tile's loads go out under the last tile's work: a launch of
     one-step tiles whose program holds a multiprocessor's registers alone (each launch's 255 registers a
     thread an H100 holds one of, long-scoreboard stalls 51 to 73% of its time, SE-family-h100-80a38c02d; an
     A100's launches held one program each, a quarter of the warps fla's held, SE-family-a100-8c5b5b16a);
-    any other a program a tile at its `stages`."""
+    any other a program a tile at its `stages`, or at the depth `resources.plan` takes between a `(floor,
+    most)` pair's."""
     if stages is None:
         most = 2 if isinstance(call.family, mosaic.RingFamily) else 1
         found = _planned_launch(call, scope, registers, floor=1, most=most)
         return found, min(tiles, (call.target.multiprocessors or 1) * found.programs)
-    return _planned_launch(call, scope, registers, floor=stages, most=stages, consumers=consumers), tiles
+    floor, most = stages if isinstance(stages, tuple) else (stages, stages)
+    return _planned_launch(call, scope, registers, floor=floor, most=most, consumers=consumers), tiles
 
 
 def _stated(work: Work, tiles: int, arrays, out_type) -> pl.CostEstimate:
@@ -620,7 +622,7 @@ def _stated(work: Work, tiles: int, arrays, out_type) -> pl.CostEstimate:
     return dataclasses.replace(stated, transcendentals=int(work.exponentials * tiles))
 
 
-def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, stages: int, live,
+def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, stages: int | tuple, live,
             work: Work, held: _Held, staging: tuple = (), once: dict | None = None,
             landing: dict | None = None, persistent: bool = False, reduces: bool = True,
             after: tuple = (), consumers: int = 1, swizzles: dict[str, int] | None = None):
@@ -930,11 +932,13 @@ def _intra_held(call: _Call, block: int) -> _Held:
 
 def _doubling_held(call: _Call) -> list:
     """A chunk's inverse by doubling as a thread holds it (`algebra.solved`): the inverse, its power and their
-    product beside the masks, merges in parts (`_merged`) splitting the inverse and the power into them; the
-    system, staged negated for the merges, held no longer."""
+    product beside the masks, merges in parts (`_merged`) splitting one operand into them at a time (`Issuer`
+    stages a product's left operand before it forms its right one); the system, staged negated for the
+    merges, held no longer. Both operands' parts at once stated 264 registers for a ranged bf16 call's solve
+    apart, which ptxas held spill-free at 255 on an H100 and an A100 (fast32e at cdcd620ef)."""
     merged = _merged(call)
     return ([_f32(CHUNK, CHUNK)] * 3 + _masks(CHUNK, CHUNK) * 2
-            + (_held(merged, CHUNK, CHUNK) * 2 if merged.parts > 1 else []))
+            + (_held(merged, CHUNK, CHUNK) if merged.parts > 1 else []))
 
 
 def _systems(call: _Call) -> _Operand:
