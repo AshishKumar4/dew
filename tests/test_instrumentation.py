@@ -330,9 +330,18 @@ def test_a_log_its_reader_reads_late_ends_where_the_loop_saw_its_step_done():
     _, _, done = early.read(None, None)
     _, elapsed, _ = late.read(None, done)
     assert done <= seen and elapsed >= 0.05
+    # A step found done at its take notes every watched step before it, though the earlier one has not yet
+    # said so, no later than itself.
+    fourth, fifth = (np.asarray(1.0).view(Pending) for _ in range(2))
+    pending = take(4, fourth)
+    fifth.finished = True
+    found = take(5, fifth)
+    _, _, before = pending.read(None, done)
+    assert found.done is not None and before <= found.done
+    found.read(None, before)
     # A step the loop notes done after its log was read is noted for no log: nothing waits on it.
     third = np.asarray(1.0).view(Pending)
-    take(3, third).read(None, done)
+    take(6, third).read(None, done)
     third.finished = True
     interval.seen()
     assert not interval.finished and not interval.watched

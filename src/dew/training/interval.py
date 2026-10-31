@@ -177,10 +177,11 @@ class Interval:
     """Held by the loop as it notes a step done (`seen`) and by the writer's reader as it ends a log's
     interval (`retired`), so a step is noted before its log's read ends the interval or not at all."""
 
-    def seen(self) -> None:
+    def seen(self, through: int = -1) -> None:
         """Note when the loop first sees each watched step done (`watched`, `finished`): a look at the
-        earliest, which never waits, then at each after it, as the devices finish steps in order."""
-        while self.watched and self.watched[0][1].is_ready():
+        earliest, which never waits, then at each after it, as the devices finish steps in order; each
+        step `through` a step seen done is done with it."""
+        while self.watched and (self.watched[0][0] <= through or self.watched[0][1].is_ready()):
             step, _ = self.watched.popleft()
             with self.noting:
                 if step > self.read_through:
@@ -302,8 +303,11 @@ class Interval:
         self.seen()
         done = None
         if isinstance(loss, _Settled):
-            done = time.time() if loss.is_ready() else None
-            if done is None:
+            if loss.is_ready():
+                # Every watched step before it finished first, noted no later than it.
+                self.seen(through=step)
+                done = time.time()
+            else:
                 self.watched.append((step, loss))
         taken = Taken(step, self, dataclasses.replace(self), reading, done)
         if self.tokens_counted and book is not None:
