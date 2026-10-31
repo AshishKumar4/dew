@@ -146,25 +146,62 @@ def test_fit_counts_each_cut_by_kind_and_none_where_the_question_is_whole():
     assert unread["_dew_cut"] == {"context": (1, len("a document the backbone reads no part of"))}
 
 
-def test_a_refused_row_keeps_the_cut_that_refused_it_and_its_corpus_counts_it():
-    """A row a declared budget cuts until its options read alike is refused (`options_alike`), and the
-    refusal keeps that cut (`Rejected.cut`), which its corpus counts beside the rows it delivered: the
-    run's data report says how much of its question the budget removed from the rows it refused too."""
-    from dew.data.mixing import CorpusCounts
+def _picked(options: list[str]) -> Example:
+    return Example("the state", {"q": Choice("Pick one", options)}, {"q": options[0]})
 
-    questions = {"q": Choice("Choose the banking intent", {
-        f"intent_{index}": f"the full meaning of banking intent {index}" for index in range(77)})}
-    example = Example("the state", questions, {"q": "intent_0"})
-    declared = StateFirstLayout(max_len=6144, labels=BYTE_LABELS, head_max_len=4096, option_tokens=1)
-    [row] = declared.rows(BYTES, BYTE_SPECIALS, example.state, questions)
-    refused = Fit(declared, BYTES, BYTE_SPECIALS, DecisionHead(64)).map({"example": example})
+
+# Options apart from their first word, and options alike but their last letter, which a budget of a few
+# tokens an option keeps apart and leaves alike.
+APART = _picked(["apple pie with cream on top", "banana split with cream on top"])
+ALIKE = _picked(["the order with cream on top a", "the order with cream on top b"])
+
+
+def test_a_refused_row_keeps_the_cut_that_refused_it_beside_its_records_earlier_cut():
+    """A row a declared budget cuts until its options read alike is refused (`options_alike`) with that
+    cut (`Rejected.cut`, the tokens it removed by what it cut), added to a cut an earlier step made of
+    its record. Grouped examples trained apart keep a refused member's cut beside its siblings', and a
+    group refused whole keeps every member's: a memory read, which counts its rows anew as it holds
+    them, counts them all beside the refusals, apart from the delivered rows' cuts."""
+    from dew.data.compile import compile
+    from dew.data.pipeline import ObjectiveData
+
+    layout = StateFirstLayout(max_len=512, labels=BYTE_LABELS, option_tokens=8)
+    [apart] = layout.rows(BYTES, BYTE_SPECIALS, APART.state, APART.questions)
+    [alike] = layout.rows(BYTES, BYTE_SPECIALS, ALIKE.state, ALIKE.questions)
+    assert layout.refusal(apart) is None and layout.refusal(alike) == "options_alike"
+    fit = Fit(layout, BYTES, BYTE_SPECIALS, DecisionHead(64))
+    refused = fit.map({"example": ALIKE, "_dew_cut": {"state": (1, 5), "options": (1, 2)}})
     assert isinstance(refused, Rejected) and refused.reason == "options_alike"
-    assert refused.cut["options"] == (1, row.options_cut) and row.options_cut > 0
-    counts = CorpusCounts("corpus", "corpus")
-    counts.refused_one(refused)
-    assert counts.rejected == {"options_alike": 1}
-    assert (counts.cut_examples["options"], counts.cut_rows["options"], counts.cut_removed["options"]) == (
-        1, 1, row.options_cut)
+    assert refused.cut == {"options": alike.cuts["options"] + 2, "state": 5}
+    records = [{"example": GroupedExamples((APART, ALIKE))}, {"example": GroupedExamples((ALIKE, ALIKE))},
+               {"example": APART}]
+    loader = compile(Memory(records).batch(1), read="memory", objective=ObjectiveData(train=(fit,)))
+    [counts] = loader.counts.values()
+    assert counts.accepted == 2 and counts.refused == {"options_alike": 2}
+    assert counts.refused_cut == {"options": 3 * alike.cuts["options"]}
+    assert counts.cut_removed == {"options": 2 * apart.cuts["options"]}
+
+
+def test_a_runs_summary_counts_the_cut_of_the_rows_it_refused(backbone):
+    """A run whose declared option budget keeps one question's options apart and leaves another's alike
+    reports, beside the delivered row's cut, the cut of the row it refused (`cut`'s `refused`)."""
+    data = (Memory([{"example": APART}, {"example": ALIKE}]).pipe(decisions).read("memory").batch(8)
+            .loading(Loading(workers=0)))
+    objective, _, _ = dataclasses.replace(_run(backbone, 2), data=data).prepare().train("x")
+
+    def laid(budget: int, example: Example):
+        layout = dataclasses.replace(objective.layout, option_tokens=budget)
+        [row] = layout.rows(objective.tokenizer, objective.specials, example.state, example.questions)
+        return row, layout.refusal(row)
+
+    budget = next(budget for budget in range(1, 64) if laid(budget, APART)[1] is None)
+    (apart, _), (alike, reason) = laid(budget, APART), laid(budget, ALIKE)
+    assert reason == "options_alike" and apart.cuts["options"] > 0
+    run = dataclasses.replace(_run(backbone, 2, option_tokens=budget), data=data)
+    _, _, summary = run.prepare().train("x")
+    [cut] = summary["cut"].values()
+    assert cut["options"]["removed"] == apart.cuts["options"]
+    assert cut["options"]["refused"] == alike.cuts["options"]
 
 
 def test_a_context_no_cross_attention_reads_counts_as_a_cut_of_it():
