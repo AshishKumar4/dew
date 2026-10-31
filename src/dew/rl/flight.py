@@ -1,26 +1,34 @@
 """First-person gate racing for a batch of quadrotors, any flight simulator behind it.
 
-The task is FlyDreamer's (AshishKumar4/FlyDreamer at 043c9ef382048278ccf26849e54814ef5510a737,
-embodied/envs/fpv), its values its run's (dreamerv3/configs.yaml `fpv`): a course of waypoints the drone
-must reach in order, each within `gate_radius`, paid by its navigation reward (rewards/navigation.py)
-and a bonus at each one reached, commanded in collective throttle and body rates (env.py
-`_action_to_command`). The policy sees the camera's image alone; the drone's `state` and its `goal`, the
-waypoint it heads for, are privileged (env.py `_compute_privileged_obs`), for a world model's auxiliary
-heads and a teacher. Each episode's course is drawn afresh from its own key (FlyDreamer reseeded the
-same course every reset).
+The reward is the one drone-racing RL has converged on: each step, the progress made toward the next gate's
+centre (Kaufmann et al., Nature 2023, Swift, Eq 8; Song et al., Sci. Robot. 2023, Eq 5; Romero et al., arXiv
+2501.14377, Eq 1; Verraest et al., arXiv 2510.14783, SkyDreamer, Sec II-C), less a cost on the body rates
+(Song 2023, b = 0.01 a step at 100 Hz, here 1 a second) and on the action's change (Swift's lambda5, its
+weight here over actions in [-1, 1]); a bonus on passing a gate, the more for passing it centred
+(SkyDreamer's r_gate); and a crash's penalty, which ends the episode (Song 2023's -10). A gate counts only
+when its plane is crossed through its opening in its direction; crossing the next gate's plane beside it
+misses it, a crash (SkyDreamer; Ferede et al., arXiv 2504.21586). Gates' frames and the ground are solid,
+the drone's path through each physics step tested against them (`struck`), so a fast drone cannot pass
+through a frame between two steps.
 
-Where FlyDreamer marked its waypoints with balloons in a scene that detected its own collisions, each
-waypoint here stands in a square gate facing along the course, solid as the ground is: the drone's path
-through each physics step is tested against both (`struck`), so a fast drone cannot pass through a
-frame between two steps.
+Each episode is flown on a course of its own (`drawn_track`): a published racing layout (uzh-rpg/agile_flight,
+MIT: Split-S and its real-world variant, AlphaPilot; and FlyDreamer's loop) with each gate moved by up to
+`jitter` (Song et al., IROS 2021, Sec IV-C), or a random closed loop; the `difficulty`, from 0 to 1, scales
+the jitter and the random loops' turns and climbs, a curriculum (Song 2021 raised it on the crash rate). An
+episode starts before a random gate of its course, facing it (Swift; SkyDreamer's Table III).
 
-The world frame is x forward, y left, z up, the body frame forward, left, up: FlyDreamer's NED and FRD
-frames turned half a turn about x, under which each term of its reward is unchanged (each reads a
-distance, an absolute offset, or squared or absolute body rates), its course's offsets are drawn alike,
-and its course (`FLYDREAMER_COURSE`) is (x, -y, -z).
+A drone is randomized each episode for transfer from simulation (`Airframe`): its thrust-to-weight and rate
+limit within `spread` of nominal (SkyDreamer's Table III, Ferede), a first-order lag on the commanded rates
+and a latency of whole control steps (Swift measured 40 ms; Song 2023 simulates it), its camera's uptilt,
+field of view and mount, and its image's brightness (HyperDrone, arXiv 2610.28950, Table 5). An action keeps
+FlyDreamer's semantics (env.py `_action_to_command`): its first entry is the throttle, zero the hover and the
+ends no thrust and full thrust; the rest the body rates over the drone's limit. The policy sees the camera's
+image alone; the state, the next gates' corners and the drone's randomized parameters are privileged, for a
+world model's auxiliary heads (SkyDreamer's privileged decoding) and a teacher (`TEACHER`, Swift's and Song
+2023's observation with the parameters).
 
-A simulator supplies the physics and the camera (`FlightBackend`); `GateRace` makes it a
-`dew.rl.simulator.Simulator`, the course, reward and collisions computed in JAX.
+The world frame is x forward, y left, z up (FLU), the body frame forward, left, up. A simulator supplies the
+physics and renders the camera (`FlightBackend`); `GateRace` makes it a `dew.rl.simulator.Simulator`.
 """
 
 from __future__ import annotations
@@ -31,70 +39,85 @@ from typing import Any, Protocol
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import struct
 
 from dew.rl.env import TimeStep
 from dew.rl.simulator import chosen, received
 
-FLYDREAMER_COURSE = ((8.0, 0.0, 3.0), (18.0, 0.0, 5.0), (30.0, 0.0, 5.0), (42.0, -3.0, 5.0),
-                     (52.0, -8.0, 5.0), (58.0, -15.0, 5.0), (58.0, -30.0, 5.0), (58.0, -44.0, 5.0),
-                     (52.0, -54.0, 5.0), (42.0, -60.0, 5.0), (28.0, -60.0, 5.0), (14.0, -60.0, 5.0))
-"""FlyDreamer's twelve waypoints in metres (configs.yaml `static_gates`), turned from NED: (x, -y, -z)."""
+LAYOUTS = {
+    "split_s": ((-0.9, -1.27, 3.48), (9.09, 6.26, 1.08), (9.27, -3.46, 1.17), (-4.5, -6.14, 3.4),
+                (-4.48, -5.94, 1.05), (4.45, -0.8, 1.09), (-2.65, 6.51, 1.3)),
+    "real_track": ((-0.6, -0.86, 3.48), (9.0, 6.45, 1.05), (8.85, -3.8, 1.05), (-4.3, -5.6, 3.3),
+                   (-4.3, -5.6, 1.25), (4.5, -0.45, 1.05), (-1.95, 6.81, 1.05)),
+    "alpha_pilot": ((17.25, 3.63, 6.31), (-10.23, 7.77, 2.02), (-10.05, 30.62, 2.9), (16.75, 39.57, 6.76),
+                    (2.33, 27.87, 2.55), (2.2, 9.0, 1.99), (-7.31, -12.14, 3.23), (-7.61, -28.47, 2.64),
+                    (-0.01, -33.91, 2.1), (5.87, -28.44, 2.57), (7.25, -11.79, 2.55)),
+    "flydreamer": ((8.0, 0.0, 3.0), (18.0, 0.0, 5.0), (30.0, 0.0, 5.0), (42.0, -3.0, 5.0), (52.0, -8.0, 5.0),
+                   (58.0, -15.0, 5.0), (58.0, -30.0, 5.0), (58.0, -44.0, 5.0), (52.0, -54.0, 5.0),
+                   (42.0, -60.0, 5.0), (28.0, -60.0, 5.0), (14.0, -60.0, 5.0)),
+}
+"""Racing layouts' gate centres in metres, FLU: uzh-rpg/agile_flight at
+03dc1179c011f414aba1264bb6db92679be66b4f (envsim/parameters/tracks/SplitS.yaml, real_track.yaml,
+AlphaPilot.yaml, MIT) and FlyDreamer's loop
+(AshishKumar4/FlyDreamer dreamerv3/configs.yaml `static_gates`, turned from NED). Each gate faces along the
+course (`facings`): the layouts' own gate rotations follow their simulator's model's axes, which the files
+do not state."""
+GATES = max(map(len, LAYOUTS.values()))
+"""The most gates a course holds; a shorter one's last are inactive."""
 
 
 @dataclasses.dataclass(frozen=True)
 class Racing:
-    """The task, FlyDreamer's run's (configs.yaml `fpv`). An episode's course is drawn about `course`'s
-    waypoints (waypoints/base.py `_apply_randomization`): each offset by a momentum-smoothed draw
-    (`smoothing`) of a point uniform in radius to `xy_radius` and in angle, and a height uniform in
-    `z_range`; then its height held to [`min_height`, `max_height`] and the waypoint pushed out to
-    `spacing` from the one before where nearer. The reward's terms are `raced`'s; an action maps to a
-    command by `commands`, `hover_throttle` the share of the drone's full thrust that holds it up; an
-    episode starts at `start`, heading `start_yaw`, and is cut after `max_steps` steps.
+    """The race. `layouts` names the layouts drawn (`LAYOUTS`) and `random_share` the share of courses that
+    are random loops; `jitter` the most a layout's gate moves across and up, at full `difficulty`. The
+    reward's weights are `raced`'s; `hz` the control rate; an episode is cut after `max_steps` steps (Swift's
+    1500 episodes). Gates' openings are `opening` square (1.5 m, SkyDreamer's and Ferede's) in a frame
+    `frame` wide; the drone is a sphere of `radius`. `spread` is each drone parameter's randomization about
+    nominal, `latency` the command latency's range in seconds, `lag` the rate response's time constant's,
+    `uptilt` the camera's tilt above the body's forward axis in degrees, `fov` its horizontal field of view
+    and `fov_spread` and `mount_spread` their randomization, `brightness` the image's gain's range."""
 
-    Each waypoint stands in a square gate, its opening `gate_opening` wide in a frame `gate_frame` wide,
-    facing along the course; with `solid`, a drone of `radius` that crosses a frame or sinks to the
-    ground collides (`struck`), and a backend that detects its own collisions passes False."""
-
-    course: tuple[tuple[float, float, float], ...] = FLYDREAMER_COURSE
-    xy_radius: float = 5.0
-    z_range: tuple[float, float] = (-2.0, 2.0)
-    min_height: float = 3.0
-    max_height: float = 10.0
-    spacing: float = 8.0
-    smoothing: float = 0.6
-    loop_start: int = 0
-    gate_radius: float = 1.6
-    gate_bonus: float = 60.0
-    gate_size: float = 1.6
-    gate_bonus_max_scale: float = 3.0
-    collision_penalty: float = -25.0
-    progress_scale: float = 5.0
-    progress_clip: tuple[float, float] = (-1.0, 1.0)
-    survival_bonus: float = 0.1
-    survival_decay: float = 200.0
-    time_penalty: float = -0.002
-    time_penalty_growth: float = 300.0
-    rate_penalty_scale: float = 0.3
-    rate_yaw_weight: float = 1.0
-    jerk_penalty_scale: float = 0.001
-    visibility_penalty: float = 0.5
-    camera_fov: float = 100.0
-    max_steps: int = 2000
-    hover_throttle: float = 0.35
-    effective_range: float = 0.5
-    rate_scales: tuple[float, float, float] = (2.0, 2.0, 2.0)
-    start: tuple[float, float, float] = (0.0, 0.0, 1.0)
-    start_yaw: float = 0.0
-    gate_opening: float = 1.6
-    gate_frame: float = 0.25
+    layouts: tuple[str, ...] = tuple(LAYOUTS)
+    random_share: float = 0.5
+    jitter: tuple[float, float] = (1.5, 0.75)
+    difficulty: float = 1.0
+    hz: float = 30.0
+    max_steps: int = 1500
+    opening: float = 1.5
+    frame: float = 0.25
     radius: float = 0.2
-    solid: bool = True
+    progress_scale: float = 1.0
+    rate_cost: float = 1.0
+    smoothness_cost: float = 0.005
+    gate_bonus: float = 6.0
+    crash_penalty: float = 10.0
+    miss_radius: float = 3.0
+    ceiling: float = 20.0
+    spread: float = 0.2
+    rate_limit: float = 10.0
+    latency: tuple[float, float] = (0.02, 0.05)
+    lag: tuple[float, float] = (0.02, 0.04)
+    uptilt: tuple[float, float] = (15.0, 35.0)
+    fov: float = 100.0
+    fov_spread: float = 5.0
+    mount_spread: float = 5.0
+    brightness: tuple[float, float] = (0.5, 1.5)
+
+    def __post_init__(self):
+        unknown = set(self.layouts) - set(LAYOUTS)
+        if unknown or not (self.layouts or self.random_share == 1) or not 0 <= self.random_share <= 1:
+            raise ValueError(f"a race draws layouts of {sorted(LAYOUTS)}, not {sorted(unknown)}, or random "
+                             "loops alone (random_share 1)")
 
     @property
-    def rate_limit(self) -> float:
-        """The body rate a full action commands, in radians a second."""
-        return max(self.rate_scales) / self.effective_range
+    def dt(self) -> float:
+        return 1.0 / self.hz
+
+    @property
+    def delays(self) -> tuple[int, int]:
+        """The latency's range in whole control steps."""
+        return round(self.latency[0] * self.hz), max(round(self.latency[1] * self.hz), 1)
 
 
 @struct.dataclass
@@ -110,107 +133,123 @@ class Kinematics:
 
 
 @struct.dataclass
+class Airframe:
+    """Each drone's randomized parameters for an episode: its thrust-to-weight's and rate limit's factors
+    over nominal, its rate response's smoothing factor a control step (from its lag), its latency in
+    control steps, its camera's uptilt and horizontal field of view (radians) and mount's roll and yaw, and
+    its image's brightness."""
+
+    thrust: jax.Array
+    rates: jax.Array
+    smoothing: jax.Array
+    delay: jax.Array
+    uptilt: jax.Array
+    fov: jax.Array
+    mount: jax.Array
+    brightness: jax.Array
+
+    def parameters(self) -> jax.Array:
+        """The parameters a world model learns to read off its latent `[B, 6]`."""
+        return jnp.stack([self.thrust, self.rates, self.smoothing, self.delay.astype(self.thrust.dtype),
+                          self.uptilt, self.fov], -1)
+
+
+@struct.dataclass
 class Track:
-    """Each drone's progress on its course `[B, G, 3]`: the waypoint it heads for, its distance from it
-    after the last step (the progress reward's reference), the body rates then and whether there were
-    any (the jerk penalty's), and the steps taken."""
+    """Each drone's episode: its course's gates `[B, G, 3]`, their facings `[B, G]` (radians) and count
+    `[B]`; the gate it heads for, its distance from it after the last step, the steps taken and the gates
+    passed; the last
+    action, the rates' command after its lag and the commands awaiting their latency `[B, L, 4]`; and its
+    `Airframe`."""
 
     course: jax.Array
+    facing: jax.Array
+    count: jax.Array
     index: jax.Array
     distance: jax.Array
-    rates: jax.Array
-    rated: jax.Array
     steps: jax.Array
+    passed: jax.Array
+    action: jax.Array
+    rates: jax.Array
+    pending: jax.Array
+    airframe: Airframe
 
 
 @struct.dataclass
 class Gates:
-    """Each drone's gates as a renderer shows them: their centres `[B, G, 3]`, the yaw of each one's facing
-    `[B, G]`, and the gate each drone heads for `[B]`."""
+    """Each drone's gates as a renderer shows them: their centres `[B, G, 3]`, facings `[B, G]` and how many
+    are its course's `[B]`."""
 
     center: jax.Array
-    yaw: jax.Array
-    target: jax.Array
+    facing: jax.Array
+    count: jax.Array
 
 
-def placed(racing: Racing, offsets: jax.Array) -> jax.Array:
-    """A course `[G, 3]` about `racing.course` from each waypoint's drawn offset `[G, 3]`, as FlyDreamer
-    places it (waypoints/base.py:66-108)."""
-
-    def place(carry, inputs):
-        momentum, previous = carry
-        waypoint, offset, following = inputs
-        momentum = racing.smoothing * momentum + (1 - racing.smoothing) * offset
-        point = waypoint + momentum
-        point = point.at[2].set(jnp.clip(point[2], racing.min_height, racing.max_height))
-        away = point - previous
-        gap = jnp.linalg.norm(away)
-        pushed = previous + away / jnp.where(gap > 1e-6, gap, 1.0) * racing.spacing
-        point = jnp.where(following & (gap < racing.spacing) & (gap > 1e-6), pushed, point)
-        return (momentum, point), point
-
-    course = jnp.asarray(racing.course, offsets.dtype)
-    following = jnp.arange(course.shape[0]) > 0
-    return jax.lax.scan(place, (jnp.zeros_like(offsets[0]), course[0]), (course, offsets, following))[1]
-
-
-def drawn_course(racing: Racing, key: jax.Array) -> jax.Array:
-    """An episode's course `[G, 3]` drawn from `key` (`placed`)."""
-    count = len(racing.course)
-    angle_key, radius_key, height_key = jax.random.split(key, 3)
-    angle = jax.random.uniform(angle_key, (count,), maxval=2 * jnp.pi)
-    radius = jax.random.uniform(radius_key, (count,), maxval=racing.xy_radius)
-    height = jax.random.uniform(height_key, (count,), minval=racing.z_range[0], maxval=racing.z_range[1])
-    return placed(racing, jnp.stack([radius * jnp.cos(angle), radius * jnp.sin(angle), height], -1))
-
-
-def _following(racing: Racing, index: jax.Array, count: int) -> jax.Array:
-    """The waypoint after each `index`, the course looping to `loop_start` (waypoints/base.py `advance`)."""
-    return jnp.where(index + 1 == count, racing.loop_start, index + 1)
-
-
-def gate_yaws(racing: Racing, courses: jax.Array) -> jax.Array:
-    """Each gate's facing `[B, G]`: the yaw of the level line from the point before it on the course (the
-    start, for the first) to the one after it (the course looping to `loop_start`)."""
-    count = courses.shape[1]
-    start = jnp.broadcast_to(jnp.asarray(racing.start, courses.dtype), courses[:, :1].shape)
-    before = jnp.concatenate([start, courses[:, :-1]], 1)
-    after = courses[:, _following(racing, jnp.arange(count), count)]
+def facings(course: jax.Array, count: jax.Array) -> jax.Array:
+    """Each gate's facing `[G]`: the yaw of the level line from the gate before it to the gate after it on
+    a course of `count` gates `[G, 3]`, which loops."""
+    order = jnp.arange(course.shape[0])
+    before = course[(order - 1) % count]
+    after = course[(order + 1) % count]
     along = after - before
-    return jnp.arctan2(along[..., 1], along[..., 0])
+    return jnp.arctan2(along[:, 1], along[:, 0])
 
 
-def struck(racing: Racing, courses: jax.Array, path: jax.Array) -> jax.Array:
-    """Whether each drone's path through a step `[B, S + 1, 3]`, its positions at each physics step's end
-    and the one before, struck the ground or a gate's frame `[B]`: a position within `radius` of the
-    ground, or a segment crossing a gate's plane where the drone, `radius` about the crossing, overlaps the
-    frame. A segment is the straight line between two physics steps; the ground being flat, its ends
-    alone can come nearest it."""
-    grounded = jnp.any(path[:, 1:, 2] < racing.radius, -1)
-    yaw = gate_yaws(racing, courses)[:, None]
-    normal = jnp.stack([jnp.cos(yaw), jnp.sin(yaw), jnp.zeros_like(yaw)], -1)
-    lateral = jnp.stack([-jnp.sin(yaw), jnp.cos(yaw)], -1)
-    begin, end = path[:, :-1, None], path[:, 1:, None]
-    center = courses[:, None]
-    before, after = (jnp.sum((point - center) * normal, -1) for point in (begin, end))
-    crossing = (before * after <= 0) & (before != after)
-    share = before / jnp.where(before != after, before - after, 1.0)
-    offset = begin + share[..., None] * (end - begin) - center
-    across = jnp.maximum(jnp.abs(jnp.sum(offset[..., :2] * lateral, -1)), jnp.abs(offset[..., 2]))
-    half = racing.gate_opening / 2
-    framed = (across >= half - racing.radius) & (across <= half + racing.gate_frame + racing.radius)
-    return grounded | jnp.any(crossing & framed, (1, 2))
+def _layout_courses() -> tuple[np.ndarray, np.ndarray]:
+    """Every layout, centred on its gates' mean across, its last gates repeating its first up to `GATES`,
+    and its gate count."""
+    courses, counts = [], []
+    for name in LAYOUTS:
+        gates = np.asarray(LAYOUTS[name], np.float32)
+        gates = gates - np.r_[gates[:, :2].mean(0), 0.0]
+        courses.append(np.concatenate([gates, np.repeat(gates[:1], GATES - len(gates), 0)]))
+        counts.append(len(gates))
+    return np.stack(courses), np.asarray(counts, np.int32)
 
 
-def commands(racing: Racing, action: jax.Array) -> jax.Array:
-    """Actions `[B, 4]` in [-1, 1] as commands `[B, 4]` (env.py `_action_to_command`): the collective
-    throttle in [0, 1], the hover throttle at zero, then the roll, pitch and yaw rates in radians a
-    second, each `rate_scales` at `effective_range` of the action and twice that at its end."""
-    action = jnp.clip(action, -1, 1) / racing.effective_range
-    hover = racing.hover_throttle
-    throttle = jnp.clip(hover + action[:, 0] * jnp.where(action[:, 0] >= 0, 1 - hover, hover), 0, 1)
-    rates = action[:, 1:] * jnp.asarray(racing.rate_scales, action.dtype)
-    return jnp.concatenate([throttle[:, None], rates], -1)
+def random_loop(key: jax.Array, difficulty: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """A random closed loop `[GATES, 3]` of 6 to 12 gates and its count: gates about an ellipse of radii 12 to
+    30 m, flown either way round, each moved along the ellipse and across it by up to a quarter of the
+    spacing and up to 3 m, and between 1.5 and 1.5 + 4.5 m high, the moves and heights growing with
+    `difficulty`."""
+    count_key, radii_key, turn_key, along_key, across_key, height_key, way_key = jax.random.split(key, 7)
+    count = jax.random.randint(count_key, (), 6, GATES + 1)
+    radii = jax.random.uniform(radii_key, (2,), minval=12.0, maxval=30.0)
+    step = 2 * jnp.pi / count
+    order = jnp.arange(GATES)
+    moved = jax.random.uniform(along_key, (GATES,), minval=-0.25, maxval=0.25)
+    angle = (order + difficulty * moved) * step
+    turned = jax.random.uniform(turn_key, (), maxval=2 * jnp.pi)
+    angle = jnp.where(jax.random.bernoulli(way_key), angle, -angle) + turned
+    across = 1 + difficulty * jax.random.uniform(across_key, (GATES,), minval=-0.1, maxval=0.1)
+    height = 1.5 + difficulty * jax.random.uniform(height_key, (GATES,), maxval=4.5)
+    gates = jnp.stack([radii[0] * across * jnp.cos(angle), radii[1] * across * jnp.sin(angle), height], -1)
+    return jnp.where((order < count)[:, None], gates, gates[0]), count
+
+
+def drawn_track(racing: Racing, key: jax.Array, difficulty: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """An episode's course `[GATES, 3]` and gate count: one of `racing.layouts`, its gates each moved by up
+    to `jitter` across and up (at `difficulty`) and no lower than 0.75 m, or with `random_share` a random
+    loop (`random_loop`)."""
+    courses, counts = _layout_courses()
+    kept = np.asarray([name in racing.layouts for name in LAYOUTS])
+    pick_key, jitter_key, loop_key, kind_key = jax.random.split(key, 4)
+    which = jax.random.choice(pick_key, len(LAYOUTS), p=jnp.asarray(kept / kept.sum(), jnp.float32))
+    across, up = racing.jitter
+    reach = jnp.asarray([across, across, up])
+    moved = jax.random.uniform(jitter_key, (GATES, 3), minval=-1.0, maxval=1.0) * reach
+    layout = jnp.asarray(courses)[which] + difficulty * moved
+    layout = layout.at[:, 2].set(jnp.maximum(layout[:, 2], 0.75))
+    loop, loop_count = random_loop(loop_key, difficulty)
+    looped = jax.random.uniform(kind_key) < racing.random_share
+    return jnp.where(looped, loop, layout), jnp.where(looped, loop_count, jnp.asarray(counts)[which])
+
+
+def quaternion(roll: jax.Array, pitch: jax.Array, yaw: jax.Array) -> jax.Array:
+    """Unit quaternions (w, x, y, z) of a yaw, then a pitch, then a roll."""
+    cr, sr, cp, sp, cy, sy = (f(angle / 2) for angle in (roll, pitch, yaw) for f in (jnp.cos, jnp.sin))
+    return jnp.stack([cr * cp * cy + sr * sp * sy, sr * cp * cy - cr * sp * sy, cr * sp * cy + sr * cp * sy,
+                      cr * cp * sy - sr * sp * cy], -1)
 
 
 def rotation(orientation: jax.Array) -> jax.Array:
@@ -222,102 +261,221 @@ def rotation(orientation: jax.Array) -> jax.Array:
         jnp.stack([2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)], -1)], -2)
 
 
-def started(kinematics: Kinematics, courses: jax.Array) -> Track:
-    """Each drone's track as an episode starts on its course `[B, G, 3]` (env.py `_reset`)."""
-    count = courses.shape[0]
-    distance = jnp.linalg.norm(courses[:, 0] - kinematics.position, axis=-1)
-    return Track(courses, jnp.zeros(count, jnp.int32), distance, jnp.zeros_like(kinematics.angular_velocity),
-                 jnp.zeros(count, bool), jnp.zeros(count, jnp.int32))
+def _gate_axes(facing: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """A gate's normal (its passing direction) and its left `[..., 3]`, level, from its facing."""
+    zero = jnp.zeros_like(facing)
+    normal = jnp.stack([jnp.cos(facing), jnp.sin(facing), zero], -1)
+    return normal, jnp.stack([-jnp.sin(facing), jnp.cos(facing), zero], -1)
 
 
-def raced(racing: Racing, track: Track, kinematics: Kinematics,
+def drawn_airframe(racing: Racing, key: jax.Array) -> Airframe:
+    """A drone's parameters for an episode (`Airframe`), each uniform in its range."""
+    keys = iter(jax.random.split(key, 9))
+
+    def within(low, high):
+        return jax.random.uniform(next(keys), (), minval=low, maxval=high)
+
+    lag = within(*racing.lag)
+    shortest, longest = racing.delays
+    mount = jnp.deg2rad(jax.random.uniform(next(keys), (2,), minval=-racing.mount_spread,
+                                           maxval=racing.mount_spread))
+    return Airframe(thrust=within(1 - racing.spread, 1 + racing.spread),
+                    rates=within(1 - racing.spread, 1 + racing.spread),
+                    smoothing=1 - jnp.exp(-racing.dt / lag),
+                    delay=jax.random.randint(next(keys), (), shortest, longest + 1),
+                    uptilt=jnp.deg2rad(within(*racing.uptilt)),
+                    fov=jnp.deg2rad(within(racing.fov - racing.fov_spread, racing.fov + racing.fov_spread)),
+                    mount=mount, brightness=within(*racing.brightness))
+
+
+def started(racing: Racing, key: jax.Array, difficulty: jax.Array) -> tuple[Track, jax.Array, jax.Array]:
+    """A drone's episode (`Track`) and its start's position and orientation: 2 to 4 m before a random gate of
+    a drawn course, up to 1 m aside and 0.5 m up or down, facing it to within 20 degrees of yaw and 10 of
+    roll and pitch (Swift starts at a random gate; SkyDreamer's Table III)."""
+    course_key, airframe_key, gate_key, place_key, turn_key = jax.random.split(key, 5)
+    course, count = drawn_track(racing, course_key, difficulty)
+    facing = facings(course, count)
+    index = jax.random.randint(gate_key, (), 0, count)
+    normal, left = _gate_axes(facing[index])
+    back, aside, up = jax.random.uniform(place_key, (3,), minval=jnp.asarray([2.0, -1.0, -0.5]),
+                                         maxval=jnp.asarray([4.0, 1.0, 0.5]))
+    position = course[index] - back * normal + aside * left + jnp.asarray([0.0, 0.0, 1.0]) * up
+    position = position.at[2].set(jnp.maximum(position[2], 0.5))
+    roll, pitch, yaw = jnp.deg2rad(jax.random.uniform(turn_key, (3,), minval=-1.0, maxval=1.0)
+                                   * jnp.asarray([10.0, 10.0, 20.0]))
+    orientation = quaternion(roll, pitch, facing[index] + yaw)
+    airframe = drawn_airframe(racing, airframe_key)
+    longest = racing.delays[1]
+    track = Track(course, facing, count, index, jnp.linalg.norm(course[index] - position),
+                  jnp.zeros((), jnp.int32), jnp.zeros((), jnp.int32), jnp.zeros(4), jnp.zeros(3),
+                  jnp.zeros((longest + 1, 4)), airframe)
+    return track, position, orientation
+
+
+def commanded(racing: Racing, track: Track, action: jax.Array, thrust_to_weight: float,
+              rate_limit: float) -> tuple[Track, jax.Array]:
+    """Each drone's action `[B, 4]` in [-1, 1] as the command the simulator steps, `[B, 4]` in [-1, 1] of its
+    collective acceleration's range (0 to `thrust_to_weight` g) and its rate range (`rate_limit`), and the
+    track after it. The throttle is a share of the drone's own full thrust, `racing`'s nominal times its
+    factor, the hover at zero; the rates its limit's share, through the drone's lag; the command then waits
+    out the drone's latency (`Track.pending`)."""
+    action = jnp.clip(action, -1, 1)
+    airframe = track.airframe
+    strongest = airframe.thrust * thrust_to_weight / (1 + racing.spread)
+    hover = 1 / strongest
+    throttle = hover + action[:, 0] * jnp.where(action[:, 0] >= 0, 1 - hover, hover)
+    collective = 2 * throttle * strongest / thrust_to_weight - 1
+    wanted = action[:, 1:] * (airframe.rates * racing.rate_limit)[:, None]
+    rates = track.rates + airframe.smoothing[:, None] * (wanted - track.rates)
+    command = jnp.concatenate([collective[:, None], rates / rate_limit], -1)
+    pending = jnp.concatenate([command[:, None], track.pending[:, :-1]], 1)
+    sent = pending[jnp.arange(pending.shape[0]), airframe.delay]
+    return track.replace(rates=rates, pending=pending), jnp.clip(sent, -1, 1)
+
+
+def struck(racing: Racing, track: Track, path: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Where each drone's path through a step `[B, S + 1, 3]` (its positions before it and after each
+    physics step, each pair joined by a straight segment) crashed, passed the gate it heads for, and how far
+    across from its centre it passed, `[B]` each. It crashes on coming within `radius` of the ground or
+    climbing past `ceiling`, on crossing a gate's plane where its sphere overlaps the frame, or on crossing
+    the next gate's plane in its direction outside the opening within `miss_radius` (a missed gate). It
+    passes that gate on crossing its plane in its direction with its sphere inside the opening."""
+    grounded = jnp.any((path[:, 1:, 2] < racing.radius) | (path[:, 1:, 2] > racing.ceiling), -1)
+    normal, left = _gate_axes(track.facing[:, None])
+    begin, end = path[:, :-1, None], path[:, 1:, None]
+    center = track.course[:, None]
+    before, after = (jnp.sum((point - center) * normal, -1) for point in (begin, end))
+    crossing = (before * after <= 0) & (before != after)
+    share = before / jnp.where(before != after, before - after, 1.0)
+    offset = begin + share[..., None] * (end - begin) - center
+    across = jnp.maximum(jnp.abs(jnp.sum(offset * left, -1)), jnp.abs(offset[..., 2]))
+    half = racing.opening / 2
+    active = (jnp.arange(track.course.shape[1]) < track.count[:, None])[:, None]
+    inner, outer = half - racing.radius, half + racing.frame + racing.radius
+    framed = crossing & active & (across > inner) & (across < outer)
+    target = jax.nn.one_hot(track.index, track.course.shape[1], dtype=bool)[:, None]
+    forward = crossing & target & (before < 0)
+    passed = forward & (across <= inner)
+    missed = forward & (across >= outer) & (across < racing.miss_radius)
+    crashed = grounded | jnp.any(framed | missed, (1, 2))
+    passed_any = jnp.any(passed, (1, 2))
+    centring = jnp.max(jnp.where(passed, across, -jnp.inf), (1, 2))
+    return crashed, passed_any & ~crashed, jnp.where(passed_any, centring, 0.0)
+
+
+def raced(racing: Racing, track: Track, action: jax.Array, kinematics: Kinematics, path: jax.Array,
           collided: jax.Array) -> tuple[Track, jax.Array, jax.Array, jax.Array]:
-    """A step's track, reward, and whether its episode `terminated` or was `truncated`, from the drones'
-    states after it and whether each `collided` (env.py `step`, rewards/navigation.py). A drone nearer
-    its waypoint than `gate_radius` reaches it: a bonus of `gate_bonus`, shrunk as the larger of its
-    lateral and vertical offsets from the waypoint nears `gate_size` and grown toward
-    `gate_bonus_max_scale` times along the course; it heads for the next, its progress reference that
-    one's distance. Then the reward toward the waypoint headed for: a decaying survival bonus, the
-    progress made times `progress_scale` clipped, a log penalty on the body rates eased while
-    progressing, a penalty on their change, a growing time penalty, and a penalty while the waypoint is
-    out of the camera's view; a collision pays `collision_penalty` in their place and ends the episode,
-    and an episode is cut after `max_steps` steps."""
+    """A step's track, reward, and whether its episode `terminated` or was `truncated`, from the action
+    taken, the drones' states and paths after it and whether the simulator saw each collide. The reward is
+    the progress toward the gate headed for, its distance before the step less its distance after (times
+    `progress_scale`), less `rate_cost` times the body rates' norm over the step, less `smoothness_cost`
+    times the squared change of the action; on passing that gate, `gate_bonus` times one less its offset's
+    share of half the opening, the drone heading for the next; and on a crash (`struck`, or the
+    simulator's), less `crash_penalty`, which ends the episode. An episode is cut after `max_steps` steps."""
+    crashed, passed, across = struck(racing, track, path)
+    crashed = crashed | collided
     rows = jnp.arange(track.index.shape[0])
-    count = track.course.shape[1]
-    position, rates = kinematics.position, kinematics.angular_velocity
-    offset = position - track.course[rows, track.index]
-    reached = jnp.linalg.norm(offset, axis=-1) < racing.gate_radius
-    widest = jnp.maximum(jnp.abs(offset[:, 1]), jnp.abs(offset[:, 2]))
-    decay = jnp.maximum(0.0, 1.0 - widest / racing.gate_size)
-    along = track.index.astype(position.dtype) / max(count - 1, 1)
-    grown = 1 + (racing.gate_bonus_max_scale - 1) * along ** 2
-    bonus = jnp.where(reached, racing.gate_bonus * decay * grown, 0.0)
-    index = jnp.where(reached, _following(racing, track.index, count), track.index)
-    to_go = track.course[rows, index] - position
-    distance = jnp.linalg.norm(to_go, axis=-1)
-    progress = jnp.where(reached, distance, track.distance) - distance
-
-    steps = track.steps.astype(distance.dtype)
-    survival = racing.survival_bonus * jnp.exp(-steps / racing.survival_decay)
-    gained = jnp.clip(progress * racing.progress_scale, *racing.progress_clip)
-    weighted = jnp.abs(rates[:, 0]) + jnp.abs(rates[:, 1]) + jnp.abs(rates[:, 2]) * racing.rate_yaw_weight
-    gate = jnp.maximum(0.0, 1.0 / (1.0 + jnp.exp(-5.0 * progress)) - 0.5) * 2.0
-    rate = -racing.rate_penalty_scale * jnp.log(1.0 + weighted ** 2) * (1.0 - 0.5 * gate)
-    change = jnp.sum(jnp.square(rates - track.rates), -1)
-    jerk = jnp.where(track.rated, -racing.jerk_penalty_scale * change, 0.0)
-    time = racing.time_penalty * (1 + steps / racing.time_penalty_growth)
-    ahead = jnp.einsum("bji,bj->bi", rotation(kinematics.orientation), to_go)
-    off_axis = jnp.arctan2(jnp.linalg.norm(ahead[:, 1:], axis=-1), ahead[:, 0])
-    unseen = (ahead[:, 0] <= 0) | (off_axis > jnp.deg2rad(racing.camera_fov / 2))
-    visibility = jnp.where(unseen, -racing.visibility_penalty, 0.0)
-    reward = jnp.where(collided, racing.collision_penalty,
-                       survival + gained + rate + jerk + time + visibility) + bonus
-
+    position = kinematics.position
+    distance = jnp.linalg.norm(track.course[rows, track.index] - position, axis=-1)
+    progress = racing.progress_scale * (track.distance - distance)
+    bonus = jnp.where(passed, racing.gate_bonus * (1 - across / (racing.opening / 2)), 0.0)
+    rate = racing.rate_cost * jnp.linalg.norm(kinematics.angular_velocity, axis=-1) * racing.dt
+    action = jnp.clip(action, -1, 1)
+    smoothness = racing.smoothness_cost * jnp.sum(jnp.square(action - track.action), -1)
+    index = jnp.where(passed, (track.index + 1) % track.count, track.index)
+    distance = jnp.linalg.norm(track.course[rows, index] - position, axis=-1)
+    reward = progress + bonus - rate - smoothness - jnp.where(crashed, racing.crash_penalty, 0.0)
     taken = track.steps + 1
-    following = Track(track.course, index, distance, rates, jnp.ones_like(track.rated), taken)
-    return following, reward, collided, ~collided & (taken >= racing.max_steps)
+    following = track.replace(index=index, distance=distance, steps=taken, action=action,
+                              passed=track.passed + passed)
+    return following, reward, crashed, ~crashed & (taken >= racing.max_steps)
 
 
-def privileged(track: Track, kinematics: Kinematics) -> dict[str, jax.Array]:
-    """FlyDreamer's privileged views (env.py `_compute_privileged_obs`): the `state` `[B, 13]`, position,
-    velocity, orientation and body rates, and the `goal` `[B, 4]`, the direction to the waypoint headed
-    for (zero within a micrometre of it) and its distance."""
-    to_go = track.course[jnp.arange(track.index.shape[0]), track.index] - kinematics.position
-    distance = jnp.linalg.norm(to_go, axis=-1, keepdims=True)
-    direction = jnp.where(distance > 1e-6, to_go / jnp.where(distance > 1e-6, distance, 1.0), 0.0)
+def corners(racing: Racing, track: Track, kinematics: Kinematics, ahead: int = 2) -> jax.Array:
+    """The corners of the openings of the gate headed for and of the `ahead - 1` after it, in the body frame
+    `[B, 12 * ahead]` (Song 2023's track observation)."""
+    rows = jnp.arange(track.index.shape[0])
+    half = racing.opening / 2
+    shown = []
+    world_to_body = jnp.swapaxes(rotation(kinematics.orientation), -1, -2)
+    for step in range(ahead):
+        index = (track.index + step) % track.count
+        _, left = _gate_axes(track.facing[rows, index])
+        center = track.course[rows, index]
+        up = jnp.broadcast_to(jnp.asarray([0.0, 0.0, 1.0], center.dtype), center.shape)
+        for sideways, upward in ((1, 1), (-1, 1), (-1, -1), (1, -1)):
+            corner = center + (sideways * left + upward * up) * half - kinematics.position
+            shown.append(jnp.einsum("bij,bj->bi", world_to_body, corner))
+    return jnp.concatenate(shown, -1)
+
+
+def privileged(racing: Racing, track: Track, kinematics: Kinematics) -> dict[str, jax.Array]:
+    """The privileged views: the `state` `[B, 13]` (position, velocity, orientation, body rates), the next
+    two `gates`' corners in the body frame `[B, 24]`, the drone's randomized `airframe` `[B, 6]`, the gates
+    `passed` so far in the episode `[B]`, and the `teacher`'s observation `[B, 43]`: the velocity and the
+    direction of gravity in the body frame, the body rates, the corners, the last action and the airframe,
+    each about unit size."""
+    world_to_body = jnp.swapaxes(rotation(kinematics.orientation), -1, -2)
+    velocity = jnp.einsum("bij,bj->bi", world_to_body, kinematics.velocity)
+    down = jnp.einsum("bij,j->bi", world_to_body, jnp.asarray([0.0, 0.0, -1.0], velocity.dtype))
+    gates = corners(racing, track, kinematics)
+    airframe = track.airframe.parameters()
     state = jnp.concatenate([kinematics.position, kinematics.velocity, kinematics.orientation,
                              kinematics.angular_velocity], -1)
-    return {"state": state, "goal": jnp.concatenate([direction, distance], -1)}
+    rates = kinematics.angular_velocity
+    teacher = jnp.concatenate([velocity / 10, down, rates / 10, gates / 10, track.action, airframe], -1)
+    return {"state": state, "gates": gates, "airframe": airframe, "passed": track.passed, "teacher": teacher}
+
+
+def cameras(track: Track, kinematics: Kinematics, aspect: float) -> jax.Array:
+    """Each drone's camera `[B, 12]` as HyperLux takes it (`set_cameras`: the position, the ray to the image's
+    first pixel's corner and the rays across a pixel row and down a column), its mount tilted up by the
+    drone's uptilt and turned by its mount's roll and yaw, its field of view the drone's: HyperDrone's
+    `camera_base_one` (hyperdrone/_native/dynamics/impl.cpp) of the mounted camera."""
+    airframe = track.airframe
+    mount = rotation(quaternion(airframe.mount[:, 0], -airframe.uptilt, airframe.mount[:, 1]))
+    axes = jnp.einsum("bij,bjk->bik", rotation(kinematics.orientation), mount)
+    forward, left, up = axes[..., 0], axes[..., 1], axes[..., 2]
+    scale = 2 * jnp.tan(airframe.fov / 2)[:, None]
+    across, down = -left * scale, -up * scale / aspect
+    first = forward - 0.5 * across - 0.5 * down
+    return jnp.concatenate([kinematics.position, first, across, down], -1)
 
 
 class FlightBackend(Protocol):
-    """A flight simulator for a batch of `count` drones. `reset(mask, position, orientation)` puts the
-    drones `mask` `[B]` selects at rest at their poses (`[B, 3]`, `[B, 4]`) and answers every drone's
-    `Kinematics`; `step(commands)` advances every drone by a control step under `[B, 4]` commands
-    (`commands`) and answers their `Kinematics`, their paths through it `[B, S + 1, 3]` (their positions
-    before it and after each of its `S` physics steps), and whether each collided with what the backend
-    itself detects (None for a backend that detects nothing); `render(gates)` answers each drone's
-    camera image `[B, H, W, C]` uint8 over its `Gates`. Arrays cross by DLPack
-    (`dew.rl.simulator.Arrays`)."""
+    """A flight simulator for a batch of `count` drones stepped at `hz`, whose commands span
+    `thrust_to_weight` g of collective acceleration and `rate_limit` radians a second of body rates, the
+    race's nominal drone's with its randomization's headroom (`Racing.spread`). `reset(mask, position,
+    orientation)` puts the drones `mask` `[B]` selects at rest at their poses (`[B, 3]`, `[B, 4]`) and
+    answers every drone's `Kinematics`; `step(commands)` advances every drone by a control step under
+    `[B, 4]` commands in [-1, 1] and answers their `Kinematics`, their paths through it `[B, S + 1, 3]`
+    (their positions before it and after each of its `S` physics steps), and whether each collided with
+    what the backend itself detects (None for a backend that detects nothing); `render(gates, cameras)`
+    answers each drone's image `[B, H, W, C]` uint8 of its `Gates` from its camera `[B, 12]` (`cameras`).
+    Arrays cross by DLPack (`dew.rl.simulator.Arrays`)."""
 
     count: int
+    hz: float
+    thrust_to_weight: float
+    rate_limit: float
+    aspect: float
 
     def reset(self, mask: jax.Array, position: jax.Array, orientation: jax.Array) -> Kinematics: ...
 
     def step(self, commands: jax.Array) -> tuple[Kinematics, Any, Any]: ...
 
-    def render(self, gates: Gates) -> Any: ...  # noqa: ANN401
+    def render(self, gates: Gates, cameras: jax.Array) -> Any: ...  # noqa: ANN401
 
 
-VIEWS = ("image", "state", "goal")
-"""What a gate race can show: the camera's image, and the privileged `state` and `goal`
-(`privileged`)."""
+VIEWS = ("image", "state", "gates", "airframe", "passed", "teacher")
+"""What a gate race can show: the camera's image, and the privileged views (`privileged`)."""
 
 
 class GateRace:
     """`backend` racing `racing`'s courses as a `dew.rl.simulator.Simulator`: actions `[B, 4]` in [-1, 1]
-    (`commands`); observations a dict of the `views` asked for (`VIEWS`), each `[B, ...]`; an episode
-    restarted at `racing.start` on a course drawn afresh."""
+    (`commanded`); observations a dict of the `views` asked for (`VIEWS`), each `[B, ...]`. An episode
+    restarts before a random gate of a course drawn afresh, at the race's `difficulty`, which a curriculum
+    may change between steps."""
 
     action_size = 4
 
@@ -325,52 +483,56 @@ class GateRace:
         if not views or not set(views) <= set(VIEWS):
             raise ValueError(f"a gate race shows some of {VIEWS}, not {views}")
         racing = Racing() if racing is None else racing
+        fastest = racing.rate_limit * (1 + racing.spread)
+        if backend.hz != racing.hz or backend.rate_limit < fastest * (1 - 1e-6):
+            raise ValueError(f"a race at {racing.hz} Hz and up to {fastest} rad/s needs a backend stepping "
+                             f"at it, not {backend.hz} Hz and {backend.rate_limit} rad/s")
         self.backend, self.racing, self.views, self.count = backend, racing, views, backend.count
-        self._courses = jax.jit(lambda key: jax.vmap(partial(drawn_course, racing))(
-            jax.random.split(key, self.count)))
-        self._commands = jax.jit(partial(commands, racing))
-        self._struck = jax.jit(partial(struck, racing))
+        self.difficulty = racing.difficulty
+        self._started = jax.jit(lambda key, difficulty: jax.vmap(partial(started, racing), (0, None))(
+            jax.random.split(key, self.count), difficulty))
+        self._commanded = jax.jit(partial(commanded, racing, thrust_to_weight=backend.thrust_to_weight,
+                                          rate_limit=backend.rate_limit))
         self._raced = jax.jit(partial(raced, racing))
-        self._started = jax.jit(started)
-        self._privileged = jax.jit(privileged)
-        self._gates = jax.jit(lambda track: Gates(track.course, gate_yaws(racing, track.course), track.index))
-        yaw = racing.start_yaw / 2
-        self._pose = (jnp.tile(jnp.asarray(racing.start), (self.count, 1)),
-                      jnp.tile(jnp.asarray([jnp.cos(yaw), 0.0, 0.0, jnp.sin(yaw)]), (self.count, 1)))
+        self._privileged = jax.jit(partial(privileged, racing))
+        self._cameras = jax.jit(partial(cameras, aspect=backend.aspect))
+        self._shown = jax.jit(lambda image, brightness: jnp.clip(
+            image.astype(jnp.float32) * brightness[:, None, None, None], 0, 255).astype(jnp.uint8))
         self._key = self._track = None
 
     def _observed(self, kinematics: Kinematics) -> dict[str, jax.Array]:
         shown = self._privileged(self._track, kinematics)
         if "image" in self.views:
-            shown["image"] = received(self.backend.render(self._gates(self._track)))
+            track = self._track
+            image = received(self.backend.render(Gates(track.course, track.facing, track.count),
+                                                 self._cameras(track, kinematics)))
+            shown["image"] = self._shown(image, track.airframe.brightness)
         return {view: shown[view] for view in self.views}
 
-    def _started_on(self, mask: jax.Array, courses: jax.Array) -> Kinematics:
-        kinematics = received(self.backend.reset(mask, *self._pose))
-        fresh = self._started(kinematics, courses)
+    def _started_on(self, mask: jax.Array) -> Kinematics:
+        self._key, key = jax.random.split(self._key)
+        fresh, position, orientation = self._started(key, jnp.asarray(self.difficulty, jnp.float32))
+        kinematics = received(self.backend.reset(mask, position, orientation))
         self._track = fresh if self._track is None else chosen(mask, fresh, self._track)
         return kinematics
 
     def reset(self, seed: int) -> dict[str, jax.Array]:
-        self._key, key = jax.random.split(jax.random.key(seed))
-        self._track = None
-        return self._observed(self._started_on(jnp.ones(self.count, bool), self._courses(key)))
+        self._key, self._track = jax.random.key(seed), None
+        return self._observed(self._started_on(jnp.ones(self.count, bool)))
 
     def restart(self, mask: jax.Array) -> dict[str, jax.Array]:
-        self._key, key = jax.random.split(self._key)
-        mask = jnp.asarray(mask, bool)
-        courses = jnp.where(mask[:, None, None], self._courses(key), self._track.course)
-        return self._observed(self._started_on(mask, courses))
+        return self._observed(self._started_on(jnp.asarray(mask, bool)))
 
     def step(self, action: jax.Array) -> TimeStep:
-        kinematics, path, collided = received(self.backend.step(self._commands(action)))
+        self._track, command = self._commanded(self._track, action)
+        kinematics, path, collided = received(self.backend.step(command))
         collided = jnp.zeros(self.count, bool) if collided is None else collided.astype(bool)
-        if self.racing.solid:
-            collided = collided | self._struck(self._track.course, path)
-        self._track, reward, terminated, truncated = self._raced(self._track, kinematics, collided)
+        raced = self._raced(self._track, action, kinematics, path, collided)
+        self._track, reward, terminated, truncated = raced
         return TimeStep(self._observed(kinematics), reward, terminated, truncated)
 
 
-__all__ = ["FLYDREAMER_COURSE", "VIEWS", "FlightBackend", "GateRace", "Gates", "Kinematics", "Racing",
-           "Track", "commands", "drawn_course", "gate_yaws", "placed", "privileged", "raced", "rotation",
-           "started", "struck"]
+__all__ = ["GATES", "LAYOUTS", "VIEWS", "Airframe", "FlightBackend", "GateRace", "Gates", "Kinematics",
+           "Racing", "Track", "cameras", "commanded", "corners", "drawn_airframe", "drawn_track", "facings",
+           "privileged",
+           "quaternion", "raced", "random_loop", "rotation", "started", "struck"]

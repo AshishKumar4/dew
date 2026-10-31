@@ -1,229 +1,294 @@
-"""First-person gate racing (`dew.rl.flight`) against FlyDreamer's own task (AshishKumar4/FlyDreamer at
-043c9ef382048278ccf26849e54814ef5510a737, embodied/envs/fpv, built from its run's config), its float64
-run recorded on drawn inputs (tools/flydreamer_worker.py through tools/venv_reference.py, an oracle):
-courses placed from the same draws, and drones flown through recorded states, paid, ended, shown and
-commanded as FlyDreamer pays, ends, shows and commands them; and each drone's path struck against the
-ground and its gates' frames."""
-
-from pathlib import Path
+"""First-person gate racing (`dew.rl.flight`), each rule held to a float64 NumPy transcription of it apart
+from Dew's code: a step's reward, passages, crashes and termination over drawn paths through, beside and
+around the gates; the commands' throttle, rate limit, lag and latency; the courses' layouts and loops; and
+the camera as HyperDrone builds it from a mounted frame. A race over a backend flying straight at each
+gate passes it."""
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from reference_error import assert_computes_the_oracle, chain_roundings
-from reference_runs import Oracle
 
 from dew.rl.flight import (
-    FLYDREAMER_COURSE,
+    GATES,
+    LAYOUTS,
     GateRace,
     Kinematics,
     Racing,
-    commands,
-    placed,
-    privileged,
+    cameras,
+    commanded,
+    drawn_track,
+    quaternion,
     raced,
+    rotation,
     started,
-    struck,
 )
-from dew.rl.simulator import simulator_rollout, simulator_start
 
-FIXTURES = Path(__file__).parent / "fixtures" / "flydreamer"
-DRONES, STEPS, MAX_STEPS = 4, 240, 100
-"""A race's drones and steps, and its episodes' cut."""
+RACING = Racing()
+DRONES = 512
 
 
-def draw_course(seed: int) -> dict[str, np.ndarray]:
-    """A course of twelve waypoints, each a step of 3 to 12 m from the last at a height of 0 to 13 m (some
-    nearer than the spacing, some outside the heights), and the randomization's draws for each."""
-    rng = np.random.default_rng([532, 2, seed])
-    heading = rng.uniform(0, 2 * np.pi, 12)
-    steps = rng.uniform(3, 12, (12, 1)) * np.stack([np.cos(heading), np.sin(heading)], -1)
-    course = np.concatenate([np.cumsum(steps, 0), rng.uniform(0, 13, (12, 1))], -1)
-    return {"course": course, "angle": rng.uniform(0, 2 * np.pi, 12), "radius": rng.uniform(0, 5, 12),
-            "height": rng.uniform(-2, 2, 12)}
+def tracks(racing: Racing, seed: int, count: int = DRONES):
+    """`count` drones' episodes as a race starts them, and their starts' positions."""
+    keys = jax.random.split(jax.random.key(seed), count)
+    return jax.vmap(lambda key: started(racing, key, jnp.asarray(1.0)))(keys)
 
 
-def quaternion(roll: np.ndarray, pitch: np.ndarray, yaw: np.ndarray) -> np.ndarray:
-    """Unit quaternions (w, x, y, z) of yaw, then pitch, then roll."""
-    cr, sr, cp, sp, cy, sy = (f(angle / 2) for angle in (roll, pitch, yaw) for f in (np.cos, np.sin))
-    return np.stack([cr * cp * cy + sr * sp * sy, sr * cp * cy - cr * sp * sy, cr * sp * cy + sr * cp * sy,
-                     cr * cp * sy - sr * sp * cy], -1)
+def axes(facing: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    return (np.stack([np.cos(facing), np.sin(facing), np.zeros_like(facing)], -1),
+            np.stack([-np.sin(facing), np.cos(facing), np.zeros_like(facing)], -1))
 
 
-def flown(rng: np.random.Generator, start: np.ndarray, length: int) -> np.ndarray:
-    """An episode's states `[length, 13]` (position, velocity, orientation, body rates) flying FlyDreamer's
-    course from `start` at a drawn speed, wandering from it by a drawn reach, facing about its way."""
-    points = np.concatenate([start[None], np.tile(np.asarray(FLYDREAMER_COURSE), (3, 1))])
-    along = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(points, axis=0), axis=-1))])
-    distance = rng.uniform(0.8, 1.6) * np.arange(1, length + 1)
-    path = np.stack([np.interp(distance, along, points[:, axis]) for axis in range(3)], -1)
-    frequency, phase = rng.uniform(0.05, 0.3, (3, 3)), rng.uniform(0, 2 * np.pi, (3, 3))
-    wander = np.sin(np.arange(length)[:, None, None] * frequency + phase).sum(-1) / np.sqrt(1.5)
-    position = path + rng.uniform(0.2, 2.5) * wander
-    velocity = 30 * np.diff(np.concatenate([start[None], position]), axis=0)
-    yaw = np.arctan2(velocity[:, 1], velocity[:, 0]) + rng.normal(0, 0.5, length)
-    orientation = quaternion(rng.normal(0, 0.3, length), rng.normal(0, 0.3, length), yaw)
-    return np.concatenate([position, velocity, orientation, rng.normal(0, 2, (length, 3))], -1)
+def oracle_step(racing: Racing, track, action, position, rates, path, collided):
+    """One step of the race's rules for each drone, in float64 loops: its reward, whether it crashed, the
+    gate it heads for after and whether its episode was cut."""
+    half, inner = racing.opening / 2, racing.opening / 2 - racing.radius
+    outer = half + racing.frame + racing.radius
+    rewards, crashes, indices, cuts = [], [], [], []
+    for drone in range(len(position)):
+        course, facing, count = track.course[drone], track.facing[drone], int(track.count[drone])
+        target = int(track.index[drone])
+        crashed, passed, centring = bool(collided[drone]), False, 0.0
+        for begin, end in zip(path[drone, :-1], path[drone, 1:], strict=True):
+            if end[2] < racing.radius or end[2] > racing.ceiling:
+                crashed = True
+            for gate in range(count):
+                normal, left = axes(facing[gate])
+                before, after = (begin - course[gate]) @ normal, (end - course[gate]) @ normal
+                if before * after > 0 or before == after:
+                    continue
+                point = begin + before / (before - after) * (end - begin) - course[gate]
+                across = max(abs(point @ left), abs(point[2]))
+                if inner < across < outer:
+                    crashed = True
+                if gate == target and before < 0:
+                    if across <= inner:
+                        passed, centring = True, max(centring, across)
+                    elif outer <= across < racing.miss_radius:
+                        crashed = True
+        passed = passed and not crashed
+        distance = np.linalg.norm(course[target] - position[drone])
+        reward = racing.progress_scale * (track.distance[drone] - distance)
+        if passed:
+            reward += racing.gate_bonus * (1 - centring / half)
+            target = (target + 1) % count
+        reward -= racing.rate_cost * np.linalg.norm(rates[drone]) / racing.hz
+        reward -= racing.smoothness_cost * np.sum((np.clip(action[drone], -1, 1) - track.action[drone]) ** 2)
+        reward -= racing.crash_penalty if crashed else 0.0
+        rewards.append(reward)
+        crashes.append(crashed)
+        indices.append(target)
+        cuts.append(not crashed and track.steps[drone] + 1 >= racing.max_steps)
+    return np.asarray(rewards), np.asarray(crashes), np.asarray(indices), np.asarray(cuts)
 
 
-def draw_race(seed: int) -> dict[str, np.ndarray]:
-    """Each drone's episodes flown one after another (`flown`), each from a start near the origin and
-    ended by a collision at a drawn step or cut at `MAX_STEPS`, and every step's action in [-1.3, 1.3]."""
-    rng = np.random.default_rng([532, 3, seed])
-    states, collisions, starts = [], [], []
-    for _ in range(DRONES):
-        flights, ended, begun = [], [], []
-        while sum(map(len, flights)) < STEPS:
-            start = np.concatenate([rng.uniform([-1, -1, 0.2], [1, 1, 1.5]), np.zeros(3),
-                                    quaternion(0.0, 0.0, rng.uniform(-0.3, 0.3)), np.zeros(3)])
-            collides = rng.random() < 0.5
-            length = int(rng.integers(1, MAX_STEPS + 1)) if collides else MAX_STEPS
-            begun.append(start)
-            flights.append(flown(rng, start[:3], length))
-            ended.append(np.arange(length) == length - 1 if collides else np.zeros(length, bool))
-        begun.append(begun[-1])
-        states.append(np.concatenate(flights)[:STEPS])
-        collisions.append(np.concatenate(ended)[:STEPS])
-        starts.append(np.stack(begun))
-    stacked = np.stack(states)
-    most = max(map(len, starts))
-    return {"position": stacked[..., :3], "velocity": stacked[..., 3:6], "orientation": stacked[..., 6:10],
-            "rates": stacked[..., 10:], "collided": np.stack(collisions),
-            "starts": np.stack([np.concatenate([held, np.repeat(held[-1:], most - len(held), 0)])
-                                for held in starts]),
-            "actions": rng.uniform(-1.3, 1.3, (STEPS, DRONES, 4)), "max_steps": np.asarray(MAX_STEPS)}
-
-
-COURSE = Oracle(FIXTURES / "course.npz", draw_course, 8)
-RACE = Oracle(FIXTURES / "race.npz", draw_race, 3)
-
-
-def test_courses_are_placed_as_flydreamer_places_them():
-    """Each course's waypoints offset by the momentum-smoothed draws, held to the heights and pushed out to
-    the spacing as FlyDreamer's randomization places them from the same draws, to float64 rounding."""
-    with jax.enable_x64(new_val=True):
-        for seed, recorded in enumerate(COURSE.recorded()):
-            drawn = draw_course(seed)
-            racing = Racing(course=tuple(map(tuple, drawn["course"].tolist())))
-            radius, angle = drawn["radius"], drawn["angle"]
-            offsets = jnp.stack([radius * np.cos(angle), radius * np.sin(angle), drawn["height"]], -1)
-            computed = jax.jit(lambda offsets, racing=racing: placed(racing, offsets))
-            roundings = chain_roundings(jax.make_jaxpr(computed)(offsets))
-            assert_computes_the_oracle(np.asarray(computed(offsets)), recorded["course"], f"course {seed}",
-                                       roundings=roundings)
-
-
-class Replay:
-    """A flight backend answering recorded states (`draw_race`): each step every drone's next, each reset
-    the selected drones' next starts; it keeps the commands it is given."""
-
-    def __init__(self, drawn: dict[str, np.ndarray]):
-        self.drawn, self.count = drawn, len(drawn["collided"])
-        self.steps, self.episodes, self.commands, self.held = 0, np.zeros(self.count, int), [], None
-
-    def kinematics(self) -> Kinematics:
-        return Kinematics(*np.split(self.held, [3, 6, 10], axis=-1))
-
-    def reset(self, mask, position, orientation):
-        mask = np.asarray(mask)
-        starts = self.drawn["starts"][np.arange(self.count), self.episodes]
-        self.held = starts if self.held is None else np.where(mask[:, None], starts, self.held)
-        self.episodes = self.episodes + mask
-        return self.kinematics()
-
-    def step(self, commands):
-        self.commands.append(np.asarray(commands))
-        before, at = self.held[:, :3], self.steps
-        self.steps += 1
-        names = ("position", "velocity", "orientation", "rates")
-        self.held = np.concatenate([self.drawn[name][:, at] for name in names], -1)
-        return self.kinematics(), np.stack([before, self.held[:, :3]], 1), self.drawn["collided"][:, at]
-
-
-def test_a_gate_race_pays_ends_shows_and_commands_as_flydreamer():
-    """Drones flown through recorded states, their courses FlyDreamer's run's and their collisions the
-    recorded ones, as a simulator rolled out (`GateRace` over a backend replaying them,
-    `simulator_rollout`): every step's reward FlyDreamer's (gates reached and their bonuses, progress, the
-    rates' and their changes' penalties, time, the waypoint out of view, collisions) to float64 rounding,
-    its episodes ended and cut on the same steps, each ended drone restarted on a fresh track, its
-    privileged state and goal FlyDreamer's, and each action commanded as FlyDreamer commands it (the
-    draws' trigonometry rounds alike to an ulp from machine to machine)."""
-    racing = Racing(xy_radius=0.0, z_range=(0.0, 0.0), max_steps=MAX_STEPS, solid=False)
-    with jax.enable_x64(new_val=True):
-        for seed, recorded in enumerate(RACE.recorded()):
-            drawn = draw_race(seed)
-            backend = Replay(drawn)
-            actions = jnp.asarray(drawn["actions"])
-
-            def replayed(params, observation, key, memory, actions=actions):
-                return actions[memory], {}, memory + 1
-
-            race = GateRace(backend, racing, views=("state", "goal"))
-            carry = simulator_start(race, jax.random.key(seed), jnp.zeros((), jnp.int32))
-            _, steps = simulator_rollout(race, replayed, None, carry, STEPS)
-            reached = jax.tree.map(lambda leaf: np.swapaxes(np.asarray(leaf), 0, 1), steps.following)
-            kinematics = Kinematics(*(jnp.zeros((DRONES, size)) for size in (3, 3, 4, 3)))
-            track = started(kinematics, jnp.zeros((DRONES, len(FLYDREAMER_COURSE), 3)))
-            roundings = chain_roundings(jax.make_jaxpr(lambda track, kinematics: raced(
-                racing, track, kinematics, jnp.zeros(DRONES, bool)))(track, kinematics))
-            assert_computes_the_oracle(reached.reward, recorded["reward"], f"race {seed}'s rewards",
-                                       roundings=roundings)
-            np.testing.assert_array_equal(reached.terminated, recorded["terminal"])
-            np.testing.assert_array_equal(reached.truncated, recorded["last"] & ~recorded["terminal"])
-            roundings = chain_roundings(jax.make_jaxpr(privileged)(track, kinematics))
-            for name in ("state", "goal"):
-                assert_computes_the_oracle(reached.observation[name], recorded[name],
-                                           f"race {seed}'s {name}s", roundings=roundings)
-            roundings = chain_roundings(jax.make_jaxpr(lambda action: commands(racing, action))(actions[0]))
-            assert_computes_the_oracle(np.stack(backend.commands, 1), recorded["command"],
-                                       f"race {seed}'s commands", roundings=roundings)
-
-
-def test_a_path_through_a_frame_or_into_the_ground_strikes_it():
-    """Drones crossing their gates' planes at drawn points, each crossing in the middle of a path whose
-    ends lie a control step apart on either side: a crossing within the frame (from the opening's edge to
-    the frame's outer edge, widened by the drone's radius either way) strikes it, one through the opening
-    or wide of the frame does not, nor does a path that stays on one side; a path dipping within the
-    drone's radius of the ground strikes it. Each gate faces along the course, the level line from the
-    waypoint before it (the start, for the first) to the one after it."""
-    racing = Racing()
-    rng = np.random.default_rng([532, 4])
-    count, gates = 256, len(FLYDREAMER_COURSE)
-    heading = rng.uniform(-0.6, 0.6, (count, 1)) + np.cumsum(rng.uniform(-0.25, 0.25, (count, gates)), 1)
-    steps = 12 * np.stack([np.cos(heading), np.sin(heading)], -1)
-    courses = np.concatenate([np.cumsum(steps, 1), rng.uniform(6, 10, (count, gates, 1))], -1)
-    gate = rng.integers(0, gates, count)
+def drawn_paths(racing: Racing, track, rng: np.random.Generator):
+    """Each drone's path through a step, three physics steps of a straight line, by its kind: through its
+    gate's opening, through its frame, beside it within the miss radius, far beside it, short of it, or
+    dipping to the ground; and the kinds."""
+    count = len(track.index)
     rows = np.arange(count)
-    before = np.where((gate == 0)[:, None], np.asarray(racing.start), courses[rows, gate - 1])
-    after = courses[rows, (gate + 1) % gates]
-    normal = np.concatenate([(after - before)[:, :2], np.zeros((count, 1))], -1)
-    normal /= np.linalg.norm(normal, axis=-1, keepdims=True)
-    lateral = np.stack([-normal[:, 1], normal[:, 0], np.zeros(count)], -1)
-    # Kind 0 crosses through the opening, 1 the frame, 2 wide of it; 3 stays on one side of the plane;
-    # 4 flies below the gates, dipping toward the ground.
-    kind = rng.integers(0, 5, count)
-    half, edge, margin = racing.gate_opening / 2, racing.gate_opening / 2 + racing.gate_frame, 0.02
-    bounds = [(0.0, half - racing.radius - margin),
-              (half - racing.radius + margin, edge + racing.radius - margin),
-              (edge + racing.radius + margin, 3.0)]
-    low, high = (np.asarray([bounds[min(each, 2)][side] for each in kind]) for side in (0, 1))
-    across = rng.uniform(low, high)
+    center = track.course[rows, track.index]
+    normal, left = axes(track.facing[rows, track.index])
+    half = racing.opening / 2
+    inner, outer = half - racing.radius, half + racing.frame + racing.radius
+    kind = rng.integers(0, 6, count)
+    miss = racing.miss_radius
+    bounds = np.asarray([(0.0, inner - 0.02), (inner + 0.02, outer - 0.02), (outer + 0.02, miss - 0.02),
+                         (miss + 0.5, miss + 2.0), (0.0, inner), (0.0, inner)])
+    across = rng.uniform(bounds[kind, 0], bounds[kind, 1])
     sideways = rng.random(count) < 0.5
     other = rng.uniform(-1, 1, count) * across
     widest = across * rng.choice([-1, 1], count)
-    offset = (np.where(sideways, widest, other)[:, None] * lateral
+    offset = (np.where(sideways, widest, other)[:, None] * left
               + np.where(sideways, other, widest)[:, None] * np.asarray([0.0, 0.0, 1.0]))
-    velocity = rng.uniform(0.5, 1.5, (count, 1)) * normal * rng.choice([-1, 1], (count, 1))
-    velocity += rng.normal(0, 0.1, (count, 3))
-    times = np.asarray([-1.5, -0.5, 0.5, 1.5])[:, None]
-    path = (courses[rows, gate] + offset)[:, None] + times * velocity[:, None]
-    aside = 3 * np.abs(np.sum(velocity * normal, -1))
-    path = np.where((kind == 3)[:, None, None], path + (aside[:, None] * normal)[:, None], path)
-    dip = rng.uniform(0.0, 2 * racing.radius, count)
-    below = np.repeat(path[:, :1], 4, 1) * np.asarray([1.0, 1.0, 0.0]) + np.asarray([0.0, 0.0, 2.5])
-    below[:, 1, 2] = dip
-    path = np.where((kind == 4)[:, None, None], below, path)
-    expected = (kind == 1) | ((kind == 4) & (dip < racing.radius))
-    computed = struck(racing, jnp.asarray(courses), jnp.asarray(path))
-    np.testing.assert_array_equal(np.asarray(computed), expected)
-    assert expected.any() and not expected.all()
+    lead = rng.uniform(0.3, 1.2, count)
+    times = np.asarray([-1.5, -0.5, 0.5, 1.5]) + np.where(kind == 4, -3.0, 0.0)[:, None]
+    path = (center + offset)[:, None] + times[..., None] * (lead[:, None] * normal)[:, None]
+    dipped = path.copy()
+    dipped[:, 2, 2] = rng.uniform(0, 2 * racing.radius, count)
+    return np.where((kind == 5)[:, None, None], dipped, path), kind
+
+
+def test_a_step_pays_passes_and_ends_as_the_race_rules():
+    """Drones flown through their next gate's opening, its frame, beside it within the miss radius and far
+    beside it, short of it, and down to the ground: each step's reward (progress, the gate's centring
+    bonus, the rates' and the action's costs, a crash's penalty), each crash, each gate headed for after the
+    step and each cut held to the race's rules in float64 loops: rewards to float64 rounding, the rest
+    exactly."""
+    rng = np.random.default_rng([532, 5])
+    with jax.enable_x64(new_val=True):
+        racing = Racing(max_steps=3)
+        track = jax.tree.map(np.asarray, tracks(racing, 0)[0])
+        track = track.replace(steps=rng.integers(0, 3, DRONES), action=rng.uniform(-1, 1, (DRONES, 4)))
+        path, kind = drawn_paths(racing, track, rng)
+        position = path[:, -1]
+        rates = rng.normal(0, 3, (DRONES, 3))
+        kinematics = Kinematics(position, rng.normal(0, 5, (DRONES, 3)),
+                                quaternion(*rng.normal(0, 0.3, (3, DRONES))), rates)
+        action = rng.uniform(-1.2, 1.2, (DRONES, 4))
+        collided = rng.random(DRONES) < 0.05
+        stepped = jax.jit(lambda *inputs: raced(racing, *inputs))
+        inputs = (jax.tree.map(jnp.asarray, track), jnp.asarray(action),
+                  jax.tree.map(jnp.asarray, kinematics), jnp.asarray(path), jnp.asarray(collided))
+        following, reward, terminated, truncated = stepped(*inputs)
+        expected, crashed, index, cut = oracle_step(racing, track, action, position, rates, path, collided)
+        roundings = chain_roundings(jax.make_jaxpr(stepped)(*inputs))
+        assert_computes_the_oracle(np.asarray(reward), expected, "a step's rewards", roundings=roundings)
+        np.testing.assert_array_equal(np.asarray(terminated), crashed)
+        np.testing.assert_array_equal(np.asarray(following.index), index)
+        np.testing.assert_array_equal(np.asarray(truncated), cut)
+        np.testing.assert_array_equal(np.asarray(following.passed), track.passed + (index != track.index))
+    for each in range(6):
+        assert (index[kind == each] != track.index[kind == each]).any() == (each == 0)
+    assert crashed[kind == 1].mean() > 0.9 and crashed[kind == 2].mean() > 0.9 and crashed[kind == 5].any()
+
+
+def test_commands_carry_each_drones_throttle_rates_lag_and_latency():
+    """Ten steps of drawn actions as the simulator's commands, held to the race's rules in float64 loops:
+    the throttle a share of the drone's own full thrust about its hover, the rates its limit's share
+    through its lag, each command sent after the drone's latency, all over the simulator's ranges."""
+    rng = np.random.default_rng([532, 6])
+    thrust_to_weight, rate_limit = 14.5, 12.0
+    with jax.enable_x64(new_val=True):
+        track = tracks(RACING, 1, 64)[0]
+        actions = rng.uniform(-1.3, 1.3, (10, 64, 4))
+        step = jax.jit(lambda track, action: commanded(RACING, track, action, thrust_to_weight, rate_limit))
+        sent = []
+        for action in actions:
+            track, command = step(track, jnp.asarray(action))
+            sent.append(np.asarray(command))
+        airframe = jax.tree.map(np.asarray, track.airframe)
+        expected = np.zeros((10, 64, 4))
+        for drone in range(64):
+            strongest = airframe.thrust[drone] * thrust_to_weight / (1 + RACING.spread)
+            rates, queue = np.zeros(3), [np.zeros(4)] * (RACING.delays[1] + 1)
+            for index, action in enumerate(np.clip(actions[:, drone], -1, 1)):
+                hover = 1 / strongest
+                throttle = hover + action[0] * ((1 - hover) if action[0] >= 0 else hover)
+                wanted = action[1:] * airframe.rates[drone] * RACING.rate_limit
+                rates = rates + airframe.smoothing[drone] * (wanted - rates)
+                command = np.r_[2 * throttle * strongest / thrust_to_weight - 1, rates / rate_limit]
+                queue = [command, *queue[:-1]]
+                expected[index, drone] = np.clip(queue[airframe.delay[drone]], -1, 1)
+        roundings = chain_roundings(jax.make_jaxpr(step)(track, jnp.asarray(actions[0])))
+        assert_computes_the_oracle(np.stack(sent), expected, "the commands", roundings=10 * roundings)
+    assert set(np.unique(airframe.delay)) == set(range(RACING.delays[0], RACING.delays[1] + 1))
+
+
+def test_courses_are_their_layouts_moved_or_random_loops():
+    """Courses drawn at no difficulty are the layouts as published, centred, or random loops of 6 to 12
+    gates between 1.5 and 6 m high, and every layout and loops are drawn; at full difficulty each layout's
+    gate moves within the jitter and every gate stays at least 0.75 m above the ground."""
+    racing = Racing(random_share=0.3)
+    keys = jax.random.split(jax.random.key(2), 2048)
+    draw = jax.jit(jax.vmap(lambda key, difficulty: drawn_track(racing, key, difficulty), (0, None)))
+    layouts = {name: np.asarray(gates) - np.r_[np.asarray(gates)[:, :2].mean(0), 0.0]
+               for name, gates in LAYOUTS.items()}
+    reach = np.r_[racing.jitter[0], racing.jitter[0], racing.jitter[1]] + 1e-4
+
+    def loop(gates):
+        return 6 <= len(gates) <= GATES and np.all((gates[:, 2] >= 1.5 - 1e-5) & (gates[:, 2] <= 6 + 1e-5))
+
+    seen = set()
+    for course, count in zip(*map(np.asarray, draw(keys, 0.0)), strict=True):
+        gates = course[:count]
+        named = [name for name, layout in layouts.items()
+                 if len(layout) == count and np.allclose(gates, layout, atol=1e-5)]
+        assert len(named) == 1 or (not named and loop(gates))
+        seen.update(named or ["loop"])
+    assert seen == {*LAYOUTS, "loop"}
+    for course, count in zip(*map(np.asarray, draw(keys, 1.0)), strict=True):
+        gates = course[:count]
+        floor = np.r_[-np.inf, -np.inf, 0.75]
+        moved = [np.abs(gates - np.maximum(layout, floor)) for layout in layouts.values()
+                 if len(layout) == count]
+        assert loop(gates) or any(np.all(each <= reach) for each in moved)
+        assert np.all(gates[:, 2] >= 0.75 - 1e-5)
+
+
+def test_a_camera_is_hyperdrones_of_its_mounted_frame():
+    """Each drone's camera is HyperDrone's camera basis (hyperdrone/_native/dynamics/impl.cpp
+    `camera_base_one`, transcribed here in float64) of the body frame turned by the drone's mount: rolled,
+    tilted up by its uptilt and turned, its field of view the drone's."""
+    rng = np.random.default_rng([532, 7])
+    with jax.enable_x64(new_val=True):
+        track = tracks(RACING, 3, 64)[0]
+        kinematics = Kinematics(jnp.asarray(rng.normal(0, 10, (64, 3))), jnp.zeros((64, 3)),
+                                quaternion(*jnp.asarray(rng.normal(0, 1, (3, 64)))), jnp.zeros((64, 3)))
+        computed = jax.jit(lambda track, kinematics: cameras(track, kinematics, 1.0))
+        airframe = jax.tree.map(np.asarray, track.airframe)
+        body = np.asarray(rotation(kinematics.orientation))
+        expected = []
+        for drone in range(64):
+            roll, yaw = airframe.mount[drone]
+            pitch = -airframe.uptilt[drone]
+            cr, sr, cp, sp = np.cos(roll), np.sin(roll), np.cos(pitch), np.sin(pitch)
+            cy, sy = np.cos(yaw), np.sin(yaw)
+            turned = np.asarray([[cy, -sy, 0], [sy, cy, 0], [0, 0, 1]])
+            tilted = np.asarray([[cp, 0, sp], [0, 1, 0], [-sp, 0, cp]])
+            mount = turned @ tilted @ np.asarray([[1, 0, 0], [0, cr, -sr], [0, sr, cr]])
+            frame = body[drone] @ mount
+            scale = 2 * np.tan(airframe.fov[drone] / 2)
+            du, dv = -frame[:, 1] * scale, frame[:, 2] * scale
+            first = frame[:, 0] - 0.5 * du + 0.5 * dv
+            expected.append(np.r_[np.asarray(kinematics.position)[drone], first, du, -dv])
+        roundings = chain_roundings(jax.make_jaxpr(computed)(track, kinematics))
+        assert_computes_the_oracle(np.asarray(computed(track, kinematics)), np.stack(expected), "the cameras",
+                                   roundings=roundings)
+
+
+class Straight:
+    """A flight backend whose drones fly straight at 0.4 m a control step, in three physics steps, ignoring
+    the commands, each toward the point it is aimed at (`aim`)."""
+
+    hz, thrust_to_weight, rate_limit, aspect = 30.0, 14.5, 12.0, 1.0
+
+    def __init__(self, count: int):
+        self.count = count
+
+    def reset(self, mask, position, orientation):
+        self.position = np.asarray(position)
+        still = np.zeros((self.count, 3))
+        return Kinematics(self.position, still, np.asarray(orientation), still)
+
+    def aim(self, points):
+        heading = np.asarray(points) - self.position
+        self.heading = heading / np.linalg.norm(heading, axis=-1, keepdims=True)
+
+    def step(self, commands):
+        travelled = np.asarray([0.0, 0.4 / 3, 0.8 / 3, 0.4])[:, None]
+        path = self.position[:, None] + travelled * self.heading[:, None]
+        self.position = path[:, -1]
+        upright = np.tile(np.asarray([1.0, 0.0, 0.0, 0.0]), (self.count, 1))
+        still = np.zeros((self.count, 3))
+        return Kinematics(self.position.copy(), 12 * self.heading, upright, still), path, None
+
+
+def test_a_race_over_a_backend_flying_at_each_gate_passes_it():
+    """A gate race (`GateRace`) over a backend flying each drone straight through its first gate's centre
+    pays each its progress and passes the gate, its `passed` counting it, within the steps its distance
+    takes and with no crash before."""
+    backend = Straight(64)
+    race = GateRace(backend, Racing(), views=("passed",))
+    race.reset(5)
+    track = race._track
+    backend.aim(np.asarray(track.course)[np.arange(64), np.asarray(track.index)])
+    passed, rewards = [], []
+    for _ in range(12):
+        step = race.step(jnp.zeros((64, 4)))
+        assert not np.asarray(step.terminated).any()
+        passed.append(np.asarray(step.observation["passed"]))
+        rewards.append(np.asarray(step.reward))
+    passed, rewards = np.stack(passed), np.stack(rewards)
+    assert (passed[-1] == 1).all()
+    first = passed.argmax(0)
+    assert (rewards[first, np.arange(64)] > 0.9 * RACING.gate_bonus).all()
+    assert (rewards[:first.min()] > 0.3).all()
+
+
+@pytest.mark.parametrize("asked", [{"layouts": ("nowhere",)}, {"layouts": (), "random_share": 0.5}])
+def test_a_race_of_unknown_or_no_courses_is_refused(asked):
+    with pytest.raises(ValueError):
+        Racing(**asked)

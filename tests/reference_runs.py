@@ -1,38 +1,10 @@
-"""A Dew computation against a reference run recorded over seeds in its own environment
-(tools/venv_reference.py): check 1 against the recording's evidence and its truth's sketch, Dew's float64
-run held to that sketch; or Dew's float64 run against the reference's float64 run recorded whole, as an
-oracle (`Oracle`)."""
-
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass
-from pathlib import Path
+"""Check 1 of a Dew computation against a reference run recorded over seeds in its own environment
+(tools/venv_reference.py): the recording's evidence and its truth's sketch, Dew's float64 run held to that
+sketch."""
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 from reference_error import assert_as_exact, indexed_recording, recording
-
-
-@dataclass(frozen=True)
-class Oracle:
-    """A reference's float64 run on a test's draws `draw(seed)`, each of the `seeds` below its count,
-    recorded whole at `fixture` by its worker (seed s's leaf `<s>.<leaf>`)."""
-
-    fixture: Path
-    draw: Callable[[int], dict[str, np.ndarray]]
-    seeds: int
-
-    @staticmethod
-    def outputs_of(answered: Mapping[str, np.ndarray]) -> dict[str, np.ndarray]:
-        """A worker's answer's float64 leaves (`truth.<leaf>`)."""
-        return {key.removeprefix("truth."): value for key, value in answered.items()
-                if key.startswith("truth.")}
-
-    def recorded(self) -> list[dict[str, np.ndarray]]:
-        """Each seed's recorded leaves."""
-        stored = recording(self.fixture)
-        return [{key.split(".", 1)[1]: value for key, value in stored.items() if key.startswith(f"{seed}.")}
-                for seed in range(self.seeds)]
 
 
 def assert_as_exact_as_recorded(fixture, site: str, seeds: int, draw, dew, label: str) -> None:
