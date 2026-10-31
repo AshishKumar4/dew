@@ -1018,6 +1018,24 @@ def test_a_clocked_runs_validation_records_the_examples_it_had_consumed():
     assert scored and not any("evaluation/examples_consumed" in scalars for scalars in scored)
 
 
+def test_a_clocked_runs_cooldown_evaluation_records_the_examples_its_branch_consumed():
+    """A clocked run's cooldown branch, scored once it ends, records the examples it had consumed then:
+    those of the run at the step it branched at and its branch's own, beyond the run's at that step."""
+    from dew.training import Cooldowns
+
+    (x,) = clocked_records(0)
+    held = Pipeline(Memory({"x": x[:BATCH]})).batch(BATCH)
+    tracker = RecordingTracker()
+    Trainer(Echoed(), OptimConfig(optimizer="adam", learning_rate=PEAK), key=0, tracker=tracker).fit(
+        clocked_chain(x), examples=CLOCKED_RECORDS, log_every=1, validation=held,
+        cooldowns=Cooldowns(at=("50%",), length=2))
+    trained = {step: scalars["train/examples_consumed"] for step, scalars in tracker.scalars
+               if "train/loss" in scalars}
+    cooled = [(step, scalars["evaluation/examples_consumed"]) for step, scalars in tracker.scalars
+              if any(name.startswith("cooldown_") for name in scalars)]
+    assert cooled and all(consumed > trained[step] for step, consumed in cooled)
+
+
 def test_a_causal_windows_last_target_is_consumed_by_the_window_that_holds_it():
     """A document whose last token is the last target of the stream's final causal window is consumed by
     that window, the first that holds it, though the next window's stride would begin at it."""
