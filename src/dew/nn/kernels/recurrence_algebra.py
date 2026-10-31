@@ -972,7 +972,7 @@ def key_memory_gradients(queries: TileLoad, keys: TileLoad, columns: int, gates:
     `entered(c, j)` and its gradient leaving `leaving(c, j)` `[BK, BV]`; `lower` the inverse less its unit
     diagonal (`L`, the inverse `I + L`), `betas` the write gates fp32. Per key block, over the value blocks:
     `dq = scale exp2(g) do h^T`, `dk = exp2(g_last - g) v_new dh^T`, the weights' `dw = -dv h^T` and the
-    decay's `sum(h dh) exp2(g_last)` on the last token; then through the WY representation
+    decay's `sum(h dh) exp2(g_last) + sum(k dk)` on the last token; then through the WY representation
     `w = (I + L) (k beta exp2(g))`, `u = (I + L) (v beta)`: `d(kg beta) = (I + L)^T dw`,
     `d(v beta) = (I + L)^T du` and `dA = -(I + L)^T (dw (kg beta)^T + du (v beta)^T) (I + L)^T`, strictly
     lower ('merge' each)."""
@@ -997,8 +997,11 @@ def key_memory_gradients(queries: TileLoad, keys: TileLoad, columns: int, gates:
         d_system = d_system - issue("merge", d_weight.astype(dtype),
                                     Transposed((gated * betas[:, None]).astype(dtype)))
         d_betas = d_betas + jnp.sum(d_gated * gated, axis=1)
+        # The chunk's last prefix's terms on its last token: the memory's decay across the chunk, and the
+        # gated keys' `exp2(g_last - g)` every token's.
         rows, _ = _grid(d_query.shape)
-        memory = jnp.where(rows == rows.shape[0] - 1, (d_memory * raised(*last(c)))[None, :], 0.0)
+        at_last = d_memory * raised(*last(c)) + jnp.sum(key * d_key, axis=0)
+        memory = jnp.where(rows == rows.shape[0] - 1, at_last[None, :], 0.0)
         emit("dq", c, d_query)
         emit("dk", c, d_key + d_gated * decays * betas[:, None])
         emit("dg", c, queries(c).value().astype(jnp.float32) * d_query - key * d_key + memory
