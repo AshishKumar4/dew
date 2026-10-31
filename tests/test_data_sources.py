@@ -860,7 +860,7 @@ def test_flat_and_sharded_token_indexes_read_the_same_spans_and_documents(token_
         np.testing.assert_array_equal(tokens[span], expected[span])
     with pytest.raises(ValueError):
         tokens[::2]
-    assert stored.documented
+    # The producer's records, its empty ones no document.
     assert stored.document_ends().tolist() == [3, 5, 9]
     for read in ("memory", "indexed", "streamed"):
         rows = iterate(Pipeline(stored), read=read, loading=Loading(workers=0, threads=1, read_buffer=0))

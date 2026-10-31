@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import io
 from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import cached_property
@@ -120,23 +119,12 @@ class TokenRecords:
         return {name: value for name, value in self.__dict__.items() if name not in ("shards", "spans")}
 
 
-def _document_ends(tokens: TokenRecords) -> np.ndarray:
-    """Each document ends just past its EOS, or at the stream's end for an unterminated tail; an
-    empty stream holds no document."""
-    block = 1 << 24
-    found = [
-        np.flatnonzero(tokens[start : start + block] == tokens.eos_id) + start + 1
-        for start in range(0, len(tokens), block)
-    ]
-    ends = np.concatenate([np.zeros(0, np.int64), *found]).astype(np.int64)
-    return ends if (ends[-1] if len(ends) else 0) == len(tokens) else np.append(ends, len(tokens))
-
-
 @dataclass(frozen=True)
 class TokenFiles(Dataset):
     """A committed token export (`dew.data.text.export_tokens`, `dew data export --tokenizer`): its
-    documents of token ids, the metadata its manifest states and where its documents end. An export
-    holds one split; validation tokens are an export of their own."""
+    documents of token ids, the metadata its manifest states and where its documents end, each a record
+    its producer wrote, as its length index states it (`document_ends`). An export holds one split;
+    validation tokens are an export of their own."""
 
     url: str
     storage_options: Mapping[str, object] | None = None
@@ -156,14 +144,6 @@ class TokenFiles(Dataset):
 
     def describe(self) -> str:
         return f"tokens:{self.url}:{_SPLIT}:field={self.field}"
-
-    @property
-    def document_index(self) -> Store:
-        return Store(self.url, self.storage_options).child(f"{_SPLIT}.documents.npy")
-
-    @cached_property
-    def mapped_documents(self) -> ArrayIndex:
-        return ArrayIndex(self.document_index.url, self.storage_options)
 
     @cached_property
     def meta(self) -> Mapping[str, object]:
@@ -222,8 +202,8 @@ class TokenFiles(Dataset):
     def _fingerprint(self) -> Mapping[str, object]:
         """Tokens and metadata, by the export's committed manifest and the files it names, each by its
         content and place in the manifest, not the name its writer gave it (`export_content`), so two
-        exports of the same documents agree: the document index is derived from the tokens' EOS
-        positions. The keys an export's fingerprint has always had (`_SPLIT`)."""
+        exports of the same documents agree: the documents are the producer's records, which its length
+        index states. The keys an export's fingerprint has always had (`_SPLIT`)."""
         store, _ = Store(self.url, self.storage_options).resolve()
         # A local store is named by its content, so hosts that mounted it at different paths agree.
         place = {} if local(store) else {"url": self.url}
@@ -248,47 +228,34 @@ class TokenFiles(Dataset):
         return True
 
     def provision(self) -> TokenFiles:
-        """Write where each document ends (`document_ends`), for an export with an EOS id, so no read
-        scans its tokens for them again."""
-        tokens = self.tokens
-        if tokens.eos_id is not None:
-            encoded = io.BytesIO()
-            np.save(encoded, _document_ends(tokens), allow_pickle=False)
-            self.document_index.write(encoded.getvalue())
-            self.__dict__.pop("mapped_documents", None)
-            self.__dict__.pop("_ends", None)
+        """Nothing to write: the producer's length index, which every export carries, states where each
+        document ends (`document_ends`)."""
         return self
 
     def records(self, read: Read) -> Records:
-        """Each document by index (`document_ends`), in every read; without EOS, one document, and an
-        export of no tokens none."""
-        ends = self.document_ends()
-        whole = np.asarray([len(self.tokens)] if len(self.tokens) else [], np.int64)
-        return _TokenDocuments(self.tokens, whole if ends is None else ends)
+        """Each document by index (`document_ends`), in every read."""
+        return _TokenDocuments(self.tokens, self.document_ends())
 
-    def document_ends(self) -> np.ndarray | None:
-        """Document ends from the persisted index or one EOS scan; None without an EOS id."""
+    def document_ends(self) -> np.ndarray:
+        """Where each document ends among the export's tokens: each record its producer wrote, by its
+        length index (`TokenRecords.shards`), a shard's after the shard before it, an EOS its tokens spell
+        within it or not, as the documents it exported were (`dew.data.text.export_tokens`). An empty
+        record holds no document, so none is read of it."""
         return self._ends
 
-    @property
-    def documented(self) -> bool:
-        """Whether an index or an EOS id states the documents, without scanning their tokens."""
-        fs, path = self.document_index.resolve()
-        return fs.exists(path) or self.tokens.eos_id is not None
-
     @cached_property
-    def _ends(self) -> np.ndarray | None:
-        fs, path = self.document_index.resolve()
-        if fs.exists(path):
-            return np.asarray(self.mapped_documents.values, np.int64)
-        return None if self.tokens.eos_id is None else _document_ends(self.tokens)
+    def _ends(self) -> np.ndarray:
+        tokens = self.tokens
+        each = (shard.ends.astype(np.int64) + tokens.spans.start(index)
+                for index, shard in enumerate(tokens.shards))
+        ends = np.concatenate([np.zeros(0, np.int64), *each])
+        return ends[np.diff(ends, prepend=0) > 0]
 
     def manifest(self) -> ShardManifest:
         return _indexed_manifest(self, self.url, 1024)
 
-    def lengths(self) -> np.ndarray | None:
-        ends = self.document_ends()
-        return None if ends is None else np.diff(ends, prepend=0)
+    def lengths(self) -> np.ndarray:
+        return np.diff(self.document_ends(), prepend=0)
 
 
 @dataclass(frozen=True)

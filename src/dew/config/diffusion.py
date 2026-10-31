@@ -213,19 +213,6 @@ class DiffusionRunConfig(RunConfig):
         elif self.preset is None:
             raise ValueError("preset None trains on the convention a pretrained pipeline's "
                              "scheduler reads; name a preset or --pretrained")
-        # EDM's sigma draw is the space's: pixels without an autoencoder,
-        # latents with one. A regime or sigmas the preset states win.
-        if (isinstance(self.preset, EDM) and self.preset.regime is None
-                and (self.preset.P_mean is None or self.preset.P_std is None)):
-            latent = self.autoencoder is not None or self.pretrained is not None
-            object.__setattr__(self, "preset", dataclasses.replace(
-                self.preset, regime="latent" if latent else "pixel"))
-        # A resolution shift is the data's: the token count of its images.
-        if (isinstance(self.preset, Flow) and self.preset.resolution_shift is not None
-                and self.preset.resolution_shift.tokens is None and self.data is not None):
-            height, width = self.sample_field().shape[-3:-1]
-            object.__setattr__(self, "preset", dataclasses.replace(
-                self.preset, resolution_shift=self.preset.resolution_shift.at(height, width)))
         if self.audio is not None and self.text is not None:
             raise ValueError(
                 "the models take one context under textcontext, and this run names both "
@@ -234,6 +221,25 @@ class DiffusionRunConfig(RunConfig):
                 self.chain().facts()["fields"], "the chain's fields"):
             raise ValueError("audio conditioning reads its clips' audio, and this chain's clips carry none "
                              "(dew.data.presets.clips(sample_rate=))")
+
+    def derived_preset(self) -> Preset | None:
+        """The run's preset as it builds its process, what it leaves to the run derived from the run as it
+        stands, so an override of what it derives from (the images' size, `data.images.size`, or the
+        autoencoder) derives it afresh, where the run records the preset as given: EDM's sigma draw the
+        space's, pixels without an autoencoder and latents with one, and a Flow resolution shift's token
+        count the data's images' (`ResolutionShift.at`). A regime, sigmas or token count the preset states
+        wins, a model whose grid is not the 16-pixel one stating its own."""
+        preset = self.preset
+        # A regime or sigmas the preset states win.
+        if isinstance(preset, EDM) and preset.regime is None and (
+                preset.P_mean is None or preset.P_std is None):
+            latent = self.autoencoder is not None or self.pretrained is not None
+            return dataclasses.replace(preset, regime="latent" if latent else "pixel")
+        shift = preset.resolution_shift if isinstance(preset, Flow) else None
+        if shift is not None and shift.tokens is None and self.data is not None:
+            height, width = self.sample_field().shape[-3:-1]
+            return dataclasses.replace(preset, resolution_shift=shift.at(height, width))
+        return preset
 
     def sample_field(self) -> Field:
         """Return the batch field the model generates, at the resolution the data comes in
@@ -277,7 +283,7 @@ class DiffusionRunConfig(RunConfig):
                                          else autoencoder.latent_channels)
         model = self.model.build(**fields)
         if isinstance(model, IntervalModel) and self.preset is not None:
-            built = self.preset()
+            built = self.derived_preset()()
             fields["interval"] = isinstance(built, Process) and built.interval
         if (issubclass(objectives[self.objective.name], MeanFlowObjective) and isinstance(model, TimeScaled)
                 and "time_scale" not in self.model.fields):
@@ -476,7 +482,9 @@ class DiffusionRunConfig(RunConfig):
         if self.preset is None:
             assert convention is not None
             return convention
-        process = build_process(self.preset)
+        preset = self.derived_preset()
+        assert preset is not None
+        process = build_process(preset)
         if convention is not None and (
                 type(process.schedule) is not type(convention.schedule)
                 or type(process.prediction) is not type(convention.prediction)):
