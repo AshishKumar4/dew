@@ -1987,34 +1987,33 @@ def test_a_leaf_read_from_its_rows_distances_is_the_leaf_read_whole():
         np.testing.assert_array_equal(getattr(empty, field), getattr(exact, field), err_msg=field)
 
 
-def bits_apart(x, w):
-    """A product whose last bits move from call to call, as a GPU reduction that adds with atomics does: its
-    first call exact, each later one an ulp or so off (`as_given`, its own call count)."""
-    bits_apart.calls = getattr(bits_apart, "calls", 0) + 1
-    out = np.asarray(x, np.float32) @ np.asarray(w, np.float32)
-    return out if bits_apart.calls % 2 else np.nextafter(out, np.float32(np.inf))
+def bits_apart():
+    """A product whose last bits alternate from call to call, as a GPU reduction that adds with atomics in
+    arrival order does: odd calls exact, even calls an ulp up (its calls counted in a list it closes over)."""
+    calls = []
+
+    def product(x, w):
+        calls.append(len(calls))
+        out = np.asarray(x, np.float32) @ np.asarray(w, np.float32)
+        return out if len(calls) % 2 else np.nextafter(out, np.float32(np.inf))
+    return as_given(product)
 
 
-def test_check_1_holds_an_arm_to_a_bitwise_repeat_only_where_one_is_promised(monkeypatch):
+@pytest.mark.parametrize(("backend", "deterministic", "refused"), [
+    ("gpu", False, False), ("gpu", True, True), ("cpu", False, True)])
+def test_check_1_holds_an_arm_to_a_bitwise_repeat_only_where_one_is_promised(
+        monkeypatch, request, backend, deterministic, refused):
     """Check 1 replays a site's arms on their first draw and requires their outputs again bit for bit only
     where the run promises a repeat (`_repeat_promised`, ledger 2842): on a GPU by default, whose reductions
     add with atomics in arrival order, an arm whose last bits move is not refused; on a GPU in deterministic
-    mode (--xla_gpu_deterministic_ops, as `with_deterministic_ops` sets it), and on a CPU, it is
-    (`UnpairedDraw`)."""
-    import os
-
-    import lane_environment
+    mode (`with_deterministic_ops`), and on a CPU, it is (`UnpairedDraw`)."""
     from reference_error import UnpairedDraw
 
-    arm = as_given(bits_apart)
-    plain = lane_environment.without_deterministic_ops(os.environ.get("XLA_FLAGS", ""))
-    monkeypatch.setattr(jax, "default_backend", lambda: "gpu")
-    monkeypatch.setenv("XLA_FLAGS", plain)
-    null_runs(arm, a_product_draw, "bits apart on a GPU", seeds=8, runs=1, truth_fn=jnp.matmul)
-    monkeypatch.setenv("XLA_FLAGS", f"{plain} {lane_environment.DETERMINISTIC_OPS}".strip())
-    with pytest.raises(UnpairedDraw):
-        null_runs(arm, a_product_draw, "bits apart, deterministic", seeds=8, runs=1, truth_fn=jnp.matmul)
-    monkeypatch.setattr(jax, "default_backend", lambda: "cpu")
-    monkeypatch.setenv("XLA_FLAGS", plain)
-    with pytest.raises(UnpairedDraw):
-        null_runs(arm, a_product_draw, "bits apart on a CPU", seeds=8, runs=1, truth_fn=jnp.matmul)
+    monkeypatch.setattr(jax, "default_backend", lambda: backend)
+    request.getfixturevalue("with_deterministic_ops" if deterministic else "without_deterministic_ops")
+    label = f"bits apart on a {backend}" + (", deterministic" if deterministic else "")
+    if refused:
+        with pytest.raises(UnpairedDraw):
+            null_runs(bits_apart(), a_product_draw, label, seeds=8, runs=1, truth_fn=jnp.matmul)
+    else:
+        null_runs(bits_apart(), a_product_draw, label, seeds=8, runs=1, truth_fn=jnp.matmul)
