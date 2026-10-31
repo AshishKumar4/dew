@@ -645,7 +645,8 @@ class ConfigureLayout:
     """The fewest options a choice holds to draw a "none of the above" (`Encoding`)."""
 
     def __call__(self, metadata: Mapping[str, object]) -> LayoutRows | EvaluateRows:
-        width = option_width(record(metadata["slots"], "decision slots"), self.none_of_the_above)
+        width = option_width(record(metadata["slots"], "decision slots"), self.none_of_the_above,
+                             self.none_of_the_above_options)
         if width < 1:
             raise ValueError("decision source slot maxima must be positive")
         encoding = Encoding(self.layout, self.tokenizer, self.specials, width, self.shuffle,
@@ -654,10 +655,12 @@ class ConfigureLayout:
         return LayoutRows(encoding) if self.train else EvaluateRows(encoding)
 
 
-def option_width(slots: Mapping[str, object], none_of_the_above: float) -> int:
+def option_width(slots: Mapping[str, object], none_of_the_above: float, fewest: int = 0) -> int:
     """The option slots a question of a run's rows takes: the most options a question of its data asks
-    (`slots`), and one more where a training read draws "none of the above" beside them."""
-    return integer(slots.get("options"), "slots.options") + int(none_of_the_above > 0)
+    (`slots`), and one more where a training read draws "none of the above" beside them, which it does
+    only on a choice of at least `fewest` options (`draws_none`)."""
+    widest = integer(slots.get("options"), "slots.options")
+    return widest + int(none_of_the_above > 0 and widest >= fewest)
 
 
 TRAINING_FIELDS = (QuestionField("labels", (), np.int32, when="trained"),

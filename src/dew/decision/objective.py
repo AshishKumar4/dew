@@ -509,7 +509,7 @@ class DecisionObjective(Objective[Ratio | Weighted]):
             return
         slots = record(widths["slots"], "decision slots")
         self.widths = (self.layout.row_questions(integer(slots.get("questions"), "slots.questions")),
-                       option_width(slots, self.none_of_the_above))
+                       option_width(slots, self.none_of_the_above, self.none_of_the_above_options))
 
     def task_settings(self) -> DecideSettings:
         """What a saved run rebuilds its task from beside the backbone.
