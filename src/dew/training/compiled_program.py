@@ -10,9 +10,10 @@ commit d867969800d4a8fd045505eabc65e1e66f30794f, which jax 0.12.0.1 pins.
 from __future__ import annotations
 
 import dataclasses
+import functools
 import itertools
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import TypeGuard
 
 import jax
@@ -23,6 +24,11 @@ from jax.core import ShapedArray
 VIEWS = frozenset({"reshape", "squeeze", "expand_dims"})
 """Primitives a row-major value's layout keeps as a bitcast of their operand (XLA's `ReshapeIsBitcast`
 under default layouts)."""
+
+UNEVALUATED = frozenset({"pure_callback", "io_callback", "debug_callback", "ffi_call", "pallas_call",
+                         "axis_index"})
+"""Primitives XLA's evaluator computes no offset through: those JAX lowers to a custom call, and the
+device's index, a partition or replica id (`GetLeafDependencies`, dynamic_slice_analysis.cc)."""
 
 ALIGNMENT = 256
 """The alignment of every buffer XLA allocates on a GPU (`kXlaAllocatedBufferAlignBytes`,
@@ -91,6 +97,10 @@ def compiled(program: jcore.Jaxpr, lowering: str) -> jcore.Jaxpr:
         if name == "shard_map" and math.prod(params["mesh"].shape[axis]
                                              for axis in params["newly_manual_axes"]) == 1:
             body = params["jaxpr"]
+        elif name == "pallas_call" and params["interpret"]:
+            run = functools.partial(interpreter(params.pop("interpret")), **params)
+            traced = jax.make_jaxpr(run)(*(value.aval for value in equation.invars))
+            body, consts = traced.jaxpr, traced.consts
         elif name == "cond" and params.get("branches_platforms") is not None:
             kept = next(index for index, platforms in enumerate(params["branches_platforms"])
                         if platforms is None or lowering in platforms)
@@ -120,13 +130,50 @@ def within(value, lowering: str):
     return value
 
 
+def interpreter(interpret) -> Callable:
+    """The function JAX lowers a Pallas call interpreted under `interpret` as (`_pallas_call_lowering`,
+    jax/_src/pallas/pallas_call.py): Mosaic's TPU or GPU interpreter for their parameters, and for any
+    other the HLO interpreter, the kernel discharged of its state run over its grid in a loop carrying
+    its whole outputs (`pallas_call_hlo_interpret`, jax/_src/pallas/hlo_interpreter.py)."""
+    from jax._src.pallas import hlo_interpreter
+    from jax._src.pallas.mosaic.interpret.interpret_pallas_call import interpret_pallas_call as on_tpu
+    from jax._src.pallas.mosaic_gpu.interpret.interpret_pallas_call import interpret_pallas_call as on_gpu
+    from jax.experimental.pallas import mosaic_gpu, tpu
+
+    if isinstance(interpret, tpu.InterpretParams):
+        return functools.partial(on_tpu, interpret_params=interpret)
+    if isinstance(interpret, mosaic_gpu.InterpretGPUParams):
+        return functools.partial(on_gpu, interpret_params=interpret)
+    return hlo_interpreter.pallas_call_hlo_interpret
+
+
 def opaque(equation: jcore.JaxprEqn) -> bool:
     """Whether XLA sees nothing of `equation`'s body: a native Pallas kernel's, one custom call whose
     results are its outputs alone, its body's values in registers and shared memory, its products
-    Triton's (`pallas_call_lowering`, jax/_src/pallas/triton/pallas_call_registration.py). An
-    interpreted one lowers to ordinary HLO (`pallas_call_hlo_interpret`, jax/_src/pallas/pallas_call.py)
-    and is read as its body."""
-    return equation.primitive.name == "pallas_call" and not equation.params.get("interpret")
+    Triton's (`pallas_call_lowering`, jax/_src/pallas/triton/pallas_call_registration.py). `compiled`
+    leaves no interpreted one: it is its interpreter's program (`interpreter`)."""
+    return equation.primitive.name == "pallas_call"
+
+
+def bodies(equation: jcore.JaxprEqn) -> list[jcore.Jaxpr]:
+    """The programs `equation` runs within it: a call's, a loop's, a branch's or a checkpoint's. A
+    native Pallas kernel runs none XLA sees (`opaque`)."""
+    if opaque(equation):
+        return []
+    found = []
+    for value in equation.params.values():
+        for each in value if isinstance(value, tuple | list) else (value,):
+            body = each.jaxpr if isinstance(each, jcore.ClosedJaxpr) else each
+            if isinstance(body, jcore.Jaxpr):
+                found.append(body)
+    return found
+
+
+def evaluable(equation: jcore.JaxprEqn) -> bool:
+    """Whether XLA's evaluator computes `equation` to find an offset: no side effect, no custom call and
+    no device index, in it or any program it runs (`UNEVALUATED`)."""
+    return (not equation.effects and equation.primitive.name not in UNEVALUATED
+            and all(evaluable(inner) for body in bodies(equation) for inner in body.eqns))
 
 
 def byte_strides(shape: Sequence[int], itemsize: int) -> list[int]:
@@ -184,7 +231,8 @@ class Slicing:
                     updated.update(_bitcast_sources(equation.invars[1], producers, readers))
             elif name in VIEWS and reads and reads[0] in sliced:
                 sliced.update(equation.outvars)
-            elif reads and all(read in counted for read in reads) and name not in ("scan", "while", "cond"):
+            elif (reads and all(read in counted for read in reads) and name not in ("scan", "while", "cond")
+                  and evaluable(equation)):
                 counted.update(equation.outvars)
                 counting.append(equation)
         # A transpose a matmul reads is folded into its dimensions (`TransposeFolding`,
@@ -199,9 +247,9 @@ class Slicing:
         """Whether `DynamicSliceAnnotator` annotates `equation`, a dynamic slice or update: contiguous
         and aligned, its offsets literals or computed from the loop's counter alone, whose byte offsets
         over the loop's turns, clamped as the slice clamps them or not, step evenly."""
-        whole = _dimensions(equation.invars[0])
+        whole = dimensions(equation.invars[0])
         updating = equation.primitive.name == "dynamic_update_slice"
-        part = _dimensions(equation.invars[1] if updating else equation.outvars[0])
+        part = dimensions(equation.invars[1] if updating else equation.outvars[0])
         itemsize = _itemsize(equation.invars[0])
         if not contiguous_aligned(whole, part, itemsize):
             return False
@@ -280,8 +328,11 @@ _RETURNED = _Returned()
 
 
 def _bitcast_sources(value: jcore.Var, producers: Mapping, readers: Mapping) -> set[jcore.Var]:
-    """`value` and each value it is a single-use bitcast of (`VIEWS`), back to the matmul that made it
-    (`ResolveSlicedResult`'s no-op path: each read once)."""
+    """`value`, read once, and each value it is a bitcast (`VIEWS`) of read once, back to the matmul
+    that made it (`ResolveNonTupleSlicedResult`: the matmul's sole user; `ResolveSlicedResult`'s no-op
+    path: each no-op's sole user); none where `value` is read more than once."""
+    if len(readers.get(value, ())) != 1:
+        return set()
     found = {value}
     while (equation := producers.get(value)) is not None and equation.primitive.name in VIEWS \
             and computed(equation.invars[0]) and len(readers.get(equation.invars[0], ())) == 1:
@@ -296,17 +347,17 @@ def _static_slice(equation: jcore.JaxprEqn) -> bool:
     strides = equation.params.get("strides")
     if strides is not None and any(stride != 1 for stride in strides):
         return False
-    return contiguous_aligned(_dimensions(equation.invars[0]), _dimensions(equation.outvars[0]),
+    return contiguous_aligned(dimensions(equation.invars[0]), dimensions(equation.outvars[0]),
                               _itemsize(equation.invars[0]))
 
 
 def _row_aligned(value: jcore.Var) -> bool:
     """Whether a turn's row `value` of a scan's stacked buffer keeps its alignment: the turn's slice is
     the stacked buffer's whole minor axes, contiguous by construction."""
-    return math.prod(_dimensions(value)) * _itemsize(value) % ALIGNMENT == 0
+    return math.prod(dimensions(value)) * _itemsize(value) % ALIGNMENT == 0
 
 
-def _dimensions(value) -> tuple[int, ...]:
+def dimensions(value) -> tuple[int, ...]:
     """`value`'s shape, none where it is no array."""
     aval = value.aval
     return tuple(int(size) for size in aval.shape) if isinstance(aval, ShapedArray) else ()
@@ -319,16 +370,23 @@ def _itemsize(value) -> int:
 
 
 def _evaluated(offsets: Sequence, counting: Sequence[jcore.JaxprEqn], counter, turn: int) -> list[int]:
-    """`offsets`' values at the loop's turn whose counter is `turn`, each computed from it by `counting`,
-    the equations computing values from the counter and literals alone, as XLA's evaluator computes
-    them at each turn (`EvaluateByteOffsetAtIteration`)."""
+    """`offsets`' values at the loop's turn whose counter is `turn`, each computed from it by those of
+    `counting`, the equations computing values from the counter and literals alone, it reads, as XLA's
+    evaluator computes them at each turn (`EvaluateByteOffsetAtIteration`)."""
     values: dict = {} if counter is None else {counter: np.int32(turn)}
 
     def read(value):
         return values[value] if computed(value) else value.val
 
-    with jax.ensure_compile_time_eval():
-        for equation in counting:
+    needed = {offset for offset in offsets if computed(offset)}
+    reading = []
+    for equation in reversed(counting):
+        if needed.intersection(equation.outvars):
+            reading.append(equation)
+            needed.update(value for value in equation.invars if computed(value))
+    # The evaluator computes on the host, outside any mesh a plan for compile-only devices sets.
+    with jax.set_mesh(None), jax.ensure_compile_time_eval():
+        for equation in reversed(reading):
             out = equation.primitive.bind(*map(read, equation.invars), **equation.params)
             values.update(zip(equation.outvars, out if equation.primitive.multiple_results else [out],
                               strict=True))

@@ -40,11 +40,12 @@ from dew.state import TrainState
 from dew.training.compiled_program import (
     VIEWS,
     Slicing,
+    bodies,
     compiled,
     computed,
     deviceless,
+    dimensions,
     lowering_platform,
-    opaque,
 )
 from dew.training.narrow import forward_variables
 from dew.training.transaction import with_ema
@@ -210,15 +211,18 @@ def bounded_below(program: jcore.Jaxpr, platform: str) -> bool:
 
 
 def peak_bytes(program: jcore.Jaxpr, platform: str, workspace: Workspace,
-               slicing: Slicing | None = None) -> int:
+               slicing: Slicing | None = None, carried: frozenset = frozenset()) -> int:
     """The most bytes `program` holds at once beside its inputs, its equations run in their traced
     order. A value XLA keeps a buffer of (`Frontier`) is held from the equation that computes it to the
     last that reads it, an output to the end. An equation that takes its operands from memory
     (`Frontier.fusing` says no: a matrix product, a call, a loop) holds beside them each operand a fused
     chain computes, while it runs, and a cuBLAS matrix product its workspace too (`Workspace`); a
     call's, a loop's or a checkpoint's own peak, its results among them, stands in for its results while
-    it runs, its body read with what it slices of the loop it runs in (`slicing`). No schedule XLA picks
-    is modelled: a compile confirms."""
+    it runs, its body read with what it slices of the loop it runs in (`slicing`). A loop's carried
+    value is one buffer from its initial value, where that is a buffer of the program's the loop reads
+    last, to its result, its body's returned value of it among them (`carry`; `carried`, the values
+    `program`, a loop's body, returns into it). No schedule XLA picks is modelled: a compile
+    confirms."""
     frontier = Frontier(program, platform, returned=True)
     last = {kept: index for index, equation in enumerate(program.eqns)
             for kept in frontier.reading(equation.invars)}
@@ -226,11 +230,12 @@ def peak_bytes(program: jcore.Jaxpr, platform: str, workspace: Workspace,
     sliced = (slicing or Slicing()).within(program)
     live, held, most = 0, set(), 0
     for index, equation in enumerate(program.eqns):
-        made = [out for out in equation.outvars if out in last and frontier.buffered(out)]
+        made = [out for out in equation.outvars
+                if out in last and frontier.buffered(out) and out not in carried]
         made_bytes = sum(map(device_share, made))
         if made or not frontier.fusing(equation):
-            inner = max((peak_bytes(body, platform, workspace, Slicing.entering(equation, body))
-                         for body in bodies(equation)), default=0)
+            inner = max((peak_bytes(body, platform, workspace, Slicing.entering(equation, body),
+                                    returned_carry(equation, body)) for body in bodies(equation)), default=0)
             operands = 0 if frontier.fusing(equation) else sum(
                 device_share(value) for value in {value for value in equation.invars if computed(value)}
                 if frontier.made_for(value))
@@ -238,7 +243,9 @@ def peak_bytes(program: jcore.Jaxpr, platform: str, workspace: Workspace,
                 workspace.sliced if sliced.fused(equation) else workspace.each)
             # A loop's results (its stacked outputs, its carry) are held beside each turn's own; a call's
             # results are what its body returns.
-            running = made_bytes + inner if equation.primitive.name in LOOPS else max(inner, made_bytes)
+            shared = sum(device_share(out) for out in sharing(frontier, last, index, equation) if out in made)
+            running = (made_bytes - shared + inner if equation.primitive.name in LOOPS
+                       else max(inner, made_bytes))
             most = max(most, live + running + operands + products)
         held.update(made)
         live += made_bytes
@@ -246,6 +253,48 @@ def peak_bytes(program: jcore.Jaxpr, platform: str, workspace: Workspace,
             held.discard(done)
             live -= device_share(done)
     return most
+
+
+def carry(equation: jcore.JaxprEqn) -> list[tuple]:
+    """Each value the loop `equation` carries, as its initial value and the loop's result of it. XLA
+    keeps the two, the body's parameter of it and the body's returned value of it in one buffer
+    (`ComputeAliasedValues`, xla/hlo/analysis/hlo_alias_analysis.cc), copying the initial value into
+    it where that is still read (copy insertion, xla/service/copy_insertion.cc)."""
+    if equation.primitive.name == "while":
+        start = equation.params["cond_nconsts"] + equation.params["body_nconsts"]
+        return list(zip(equation.invars[start:], equation.outvars, strict=True))
+    if equation.primitive.name == "scan":
+        _, started, _ = equation.params["ft_in"].update(equation.invars).unpack()
+        ended, _ = equation.params["ft_out"].update(equation.outvars).unpack()
+        return list(zip(started, ended, strict=True))
+    return []
+
+
+def returned_carry(equation: jcore.JaxprEqn, body: jcore.Jaxpr) -> frozenset:
+    """The values `body` returns into the buffers the loop `equation` carries, where it is the loop's
+    body (`carry`); none of any other program."""
+    if equation.primitive.name == "while" and body is equation.params["body_jaxpr"].jaxpr:
+        return frozenset(value for value in body.outvars if computed(value))
+    if equation.primitive.name == "scan" and body is equation.params["jaxpr"].jaxpr:
+        returned, _ = equation.params["ft_out"].update(body.outvars).unpack()
+        return frozenset(value for value in returned if computed(value))
+    return frozenset()
+
+
+def sharing(frontier: Frontier, last: Mapping, index: int, equation: jcore.JaxprEqn) -> set:
+    """The results of the loop `equation`, the program's `index`th, held in their initial value's buffer
+    (`carry`): one the program computes, not an input or a literal, whose buffers the loop reads last,
+    or which a fused chain computes into a buffer for the loop to read; each initial value one
+    result's."""
+    found, taken = set(), set()
+    for start, ended in carry(equation):
+        if not computed(start) or start in frontier.inputs or start in taken:
+            continue
+        kept = frontier.reading([start])
+        if frontier.made_for(start) or (kept and all(last[value] == index for value in kept)):
+            found.add(ended)
+            taken.add(start)
+    return found
 
 
 class Frontier:
@@ -370,26 +419,6 @@ def emitted_algorithm(equation: jcore.JaxprEqn) -> bool:
 def element_type(value) -> np.dtype | None:
     """`value`'s element type, none where it is no array."""
     return value.aval.dtype if isinstance(value.aval, ShapedArray) else None
-
-
-def dimensions(value) -> tuple[int, ...]:
-    """`value`'s shape, none where it is no array."""
-    aval = value.aval
-    return tuple(int(size) for size in aval.shape) if isinstance(aval, ShapedArray) else ()
-
-
-def bodies(equation: jcore.JaxprEqn) -> list[jcore.Jaxpr]:
-    """The programs `equation` runs within it: a call's, a loop's, a branch's or a checkpoint's. A
-    native Pallas kernel runs none XLA sees (`opaque`)."""
-    if opaque(equation):
-        return []
-    found = []
-    for value in equation.params.values():
-        for each in value if isinstance(value, tuple | list) else (value,):
-            body = each.jaxpr if isinstance(each, jcore.ClosedJaxpr) else each
-            if isinstance(body, jcore.Jaxpr):
-                found.append(body)
-    return found
 
 
 def recomputed(equation: jcore.JaxprEqn, platform: str) -> bool:
