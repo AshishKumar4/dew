@@ -398,6 +398,7 @@ class ConsistencyDistillationObjective(FlowDistillationObjective):
             # The student's first trained call records what it sows (`_network`): the consistency loss's,
             # or, for distribution matching alone, its simulation's.
             recorded: list[Variables] | None = [] if step.watched is not None else None
+            scored: list[Variables] | None = [] if step.watched is not None else None
             if self.consistency_weight > 0 and self.consistency == "discrete":
                 network = self._network(self.model, student_params, given, recorded)
                 u = draws.consistency_time * (1 - self.discrete_skip / self.discrete_steps)
@@ -420,33 +421,48 @@ class ConsistencyDistillationObjective(FlowDistillationObjective):
                                                  trained=lambda x, t: trig_prediction(observed, x, t)[1])
             if self.dmd_weight > 0:
                 distribution = self._distribution_matching(params, student_params, given, blank, draws,
-                                                           effective, recorded)
+                                                           effective, recorded, scored)
                 total = total + jnp.where(warm, 0.0, distribution)
-            return total, recorded[0] if recorded else None
+            return total, self._phase_sown(recorded, scored)
 
         def critic_losses(params):
-            # The student's first call in a critic phase, its simulation's start, records what it sows.
+            # The student's first call in a critic phase, its simulation's start, records what it sows, as
+            # does the fake score's, which trains.
             recorded: list[Variables] | None = [] if step.watched is not None else None
+            scored: list[Variables] | None = [] if step.watched is not None else None
             generated = jax.lax.stop_gradient(self._generated(
                 self.model_variables(params), given, draws, iteration - effective - 1, recorded))
             t = self._times(draws.critic_time, self.critic_times)
             noise = draws.critic_noise
             x = expand(jnp.cos(t), generated) * generated + expand(jnp.sin(t), generated) * noise
-            fake, _ = trig_prediction(self._network(self.fake_score, part(params, FAKE_SCORE), given), x, t)
-            return critic_loss(generated, fake, t), recorded[0] if recorded else None
+            fake, _ = trig_prediction(self._network(self.fake_score, part(params, FAKE_SCORE), given, scored),
+                                      x, t)
+            return critic_loss(generated, fake, t), self._phase_sown(recorded, scored)
 
         # Each phase's summaries are its own first call's, returned through the branch that runs it.
         losses, inspected = jax.lax.cond(student_phase, student_losses, critic_losses, variables)
         return self.row_mean(losses, batch), Aux(metrics={}, inspected=inspected)
 
+    def _phase_sown(self, recorded: list[Variables] | None,
+                    scored: list[Variables] | None) -> Variables | None:
+        """What a phase's watched calls sowed, laid out alike in both phases, which a `lax.cond` between them
+        requires: the student's first call's, and with distribution matching, under `FAKE_SCORE`, the fake
+        score's first call's, whose cotangent probes its variables' cut takes (`part`). The network a phase
+        does not train runs under no gradient, so its cotangent there is zero."""
+        if recorded is None or scored is None:
+            return None
+        fake = {FAKE_SCORE: scored[0]} if self.dmd_weight > 0 and scored else {}
+        return {**(recorded[0] if recorded else {}), **fake}
+
     def _distribution_matching(self, params, student_params, given, blank, draws: _Draws, iteration,
-                               recorded: list[Variables] | None = None):
+                               recorded: list[Variables] | None = None,
+                               scored: list[Variables] | None = None):
         generated = self._generated(student_params, given, draws, iteration, recorded)
         t = self._times(draws.critic_time, self.critic_times)
         noise = draws.critic_noise
         x = expand(jnp.cos(t), generated) * generated + expand(jnp.sin(t), generated) * noise
         frozen = jax.lax.stop_gradient(part(params, FAKE_SCORE))
-        fake, _ = trig_prediction(self._network(self.fake_score, frozen, given), x, t)
+        fake, _ = trig_prediction(self._network(self.fake_score, frozen, given, scored), x, t)
         teacher, _ = self._teacher(params, given, blank, x, t)
         return distribution_matching_loss(generated, jax.lax.stop_gradient(fake), teacher, self.dmd_weight)
 

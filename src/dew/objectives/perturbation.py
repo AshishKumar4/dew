@@ -192,6 +192,9 @@ class NodePerturbation[LossT, EffectsT](Objective[LossT, EffectsT]):
     def loss(self, variables: Variables, batch: Batch, step: Step):
         if not step.training:
             return super().loss(variables, batch, step)
+        if step.watched is not None and step.watched.cotangents:
+            raise ValueError("a node perturbation step backpropagates nothing, so it has no loss cotangent "
+                             "at a module to summarize; watch its activations without cotangents")
         held = {name: value for name, value in variables.items() if name != "params"}
 
         @jax.custom_vjp

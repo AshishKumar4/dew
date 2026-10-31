@@ -30,7 +30,15 @@ from dew.averaging import ema_update
 from dew.batch import EXAMPLE_ROWS, Batch, Variables, dicts, leaves_by_path, merge
 from dew.data.dataset import rows_of
 from dew.held_updates import holds_back, input_taken, refuse_untold, update_applied
-from dew.nn.inspection import PROBES, Watched, cotangent_summaries, discovering, flattened, probes_of
+from dew.nn.inspection import (
+    PROBES,
+    Watched,
+    cotangent_summaries,
+    discovering,
+    flattened,
+    probes_of,
+    unscaled,
+)
 from dew.nn.kernels.options import compiler_options
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import rows_spec
@@ -714,17 +722,14 @@ class Transaction:
         unapplied = jax.tree.map(jnp.zeros_like, jax.eval_shape(apply, current)[1])
         return *_only_when(native_finite, apply, lambda x: (x, unapplied), current), native_finite, norm
 
-    def watched_summaries(self, state, aux, probed) -> dict[str, jax.Array]:
+    def watched_summaries(self, aux, probed) -> dict[str, jax.Array]:
         """A sampled step's watched modules' summaries: their outputs' (`watched_activations`), and with
-        their probes' gradient `probed`, the loss's cotangents there, unscaled by the step's loss scale
-        (`dew.nn.inspection.cotangent_summaries`)."""
+        their probes' gradient `probed`, the loss's cotangents there (`dew.nn.inspection.cotangent_summaries`,
+        unscaled as the probes read them, `unscaled`)."""
         if self.watched is None:
             return {}
         found = watched_activations(self.watched, aux)
-        if probed is None:
-            return found
-        factor = jnp.asarray(1., jnp.float32) if state.scale is None else state.scale.scale
-        return {**found, **cotangent_summaries(probed, factor, self.watched.histogram)}
+        return found if probed is None else {**found, **cotangent_summaries(probed, self.watched.histogram)}
 
     def finish_attempt(self, state, batch, aux, pending, gradient, attempt, tokens, probed=None):
         """Commit the window when it is due, then advance the state's clocks.
@@ -787,7 +792,7 @@ class Transaction:
                 due, recopied, lambda x: (x, uncommitted, jnp.asarray(a=True), zero),
                 dataclasses.replace(numerical, accumulation=None))
             numerical = dataclasses.replace(numerical, accumulation=previous)
-        inspected = {**inspected, **self.watched_summaries(state, aux, probed)}
+        inspected = {**inspected, **self.watched_summaries(aux, probed)}
         finite = finite & native_finite
         if scale is not None:
             accepted = finite & _all_finite((numerical.variables, numerical.opt_state, numerical.ema))
@@ -876,7 +881,9 @@ class Transaction:
             slot = state.microstep % self.size
             step_info = self.attempt(state, state.variables, batch, attempt, part, slot)
             factor = jnp.asarray(1., jnp.float32) if state.scale is None else state.scale.scale
-            realized = realize(self.read(state.variables, state.compute), batch, step_info)
+            # A watched cotangent is read unscaled by the factor its backward is seeded with.
+            with unscaled(factor):
+                realized = realize(self.read(state.variables, state.compute), batch, step_info)
             loss, cotangent = reduce(realized.stats, factor)
             # A step that summarizes its cotangents takes its probes' gradient from the same backward.
             gradient, probed = (realized.pullback(cotangent), None) if realized.probed is None else (

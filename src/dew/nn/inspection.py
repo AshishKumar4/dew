@@ -104,6 +104,19 @@ the devices of a data axis), so the statistics follow from the total (`cotangent
 
 _DISCOVERING: contextvars.ContextVar[bool] = contextvars.ContextVar("discovering_probes", default=False)
 _LIVE: contextvars.ContextVar[jax.Array | None] = contextvars.ContextVar("live_rows", default=None)
+_SCALE: contextvars.ContextVar[jax.Array | None] = contextvars.ContextVar("loss_scale", default=None)
+
+
+@contextlib.contextmanager
+def unscaled(scale: jax.Array | None) -> Iterator[None]:
+    """Within the block, a probe reads its cotangent divided by `scale`, the loss scale the step's backward
+    is seeded with (`dew.training.transaction.Transaction.local_reduction`), so its statistics, a
+    histogram's decades among them, are the unscaled loss's; None scales nothing."""
+    token = _SCALE.set(scale)
+    try:
+        yield
+    finally:
+        _SCALE.reset(token)
 
 
 @contextlib.contextmanager
@@ -140,24 +153,27 @@ def sufficient(values: jax.Array, where: jax.Array | None, histogram: bool) -> j
     return jnp.stack(terms)
 
 
-@functools.partial(jax.custom_vjp, nondiff_argnums=(3,))
-def tapped(x: jax.Array, probe: jax.Array, where: jax.Array | None, histogram: bool) -> jax.Array:
-    """`x` itself, its cotangent passed through unchanged, and `probe`'s the cotangent's sufficient
-    statistics (`sufficient`) over `where`'s entries: a probe's gradient summarizes the loss's cotangent at
-    `x` without a tensor of its size."""
-    del probe, where
+@functools.partial(jax.custom_vjp, nondiff_argnums=(4,))
+def tapped(x: jax.Array, probe: jax.Array, where: jax.Array | None, scale: jax.Array,
+           histogram: bool) -> jax.Array:
+    """`x` itself, its cotangent passed through unchanged, and `probe`'s the sufficient statistics
+    (`sufficient`) over `where`'s entries of that cotangent over `scale`, the loss scale its backward was
+    seeded with: a probe's gradient summarizes the loss's cotangent at `x` without a tensor of its size."""
+    del probe, where, scale
     return x
 
 
-def _tapped_forward(x, probe, where, histogram):
+def _tapped_forward(x, probe, where, scale, histogram):
     del probe
-    return x, where
+    return x, (where, scale)
 
 
-def _tapped_backward(histogram, where, cotangent):
+def _tapped_backward(histogram, saved, cotangent):
+    where, scale = saved
     # The positions are booleans: their cotangent is float0's zero.
     unmoved = None if where is None else np.zeros(where.shape, jax.dtypes.float0)
-    return cotangent, sufficient(cotangent, where, histogram), unmoved
+    terms = sufficient(cotangent.astype(jnp.float32) / scale, where, histogram)
+    return cotangent, terms, unmoved, jnp.zeros_like(scale)
 
 
 tapped.defvjp(_tapped_forward, _tapped_backward)
@@ -193,18 +209,24 @@ def probes_of(inspected: Mapping) -> dict:
     return kept(inspected) or {}
 
 
-def cotangent_statistics(terms: jax.Array, factor: jax.Array, histogram: bool) -> dict[str, jax.Array]:
-    """The statistics of a cotangent whose sufficient statistics are `terms` (`sufficient`), its loss
-    scaled by `factor`: mean, standard deviation, root mean square, the share not finite and the share
-    exactly zero, and with `histogram` the share of its magnitudes in each decade."""
-    count = terms[0]
-    mean = terms[1] / factor / count
-    squares = terms[2] / jnp.square(factor) / count
+def cotangent_statistics(terms: jax.Array, *, histogram: bool) -> dict[str, jax.Array]:
+    """The statistics of a cotangent whose sufficient statistics are `terms` (`sufficient`): mean, standard
+    deviation, root mean square, the share not finite and the share exactly zero, and with `histogram` the
+    share of its magnitudes in each decade. A probe no cotangent reached, its call under no gradient (a
+    phase that trains another network), counts no entry: its cotangent is zero, as is every statistic but
+    the zero share, 1."""
+    reached = terms[0] > 0
+    count = jnp.where(reached, terms[0], 1)
+    mean = terms[1] / count
+    squares = terms[2] / count
     found = {"mean": mean, "std": jnp.sqrt(jnp.maximum(squares - jnp.square(mean), 0)),
-             "rms": jnp.sqrt(squares), "non_finite": terms[3] / count, "zero_fraction": terms[4] / count}
+             "rms": jnp.sqrt(squares), "non_finite": terms[3] / count,
+             "zero_fraction": jnp.where(reached, terms[4] / count, 1)}
     if histogram:
-        found.update({f"histogram_{index}": value / count
-                      for index, value in enumerate(terms[len(COTANGENT_TERMS):])})
+        # An unreached probe's zeros sit below the lowest decade.
+        bins = terms[len(COTANGENT_TERMS):]
+        found.update({f"histogram_{index}": jnp.where(reached, value / count, index == 0)
+                      for index, value in enumerate(bins)})
     return found
 
 
@@ -255,7 +277,8 @@ def watching(modules: tuple[str, ...], *, histogram: bool = False,
         if live is not None:
             rows = jnp.broadcast_to(live, first.shape[:1])
             where = rows if where is None else where & rows.reshape(rows.shape + (1,) * (where.ndim - 1))
-        leaves[index] = tapped(first, module.get_variable(PROBES, PROBE), where, histogram)
+        scale = jnp.asarray(1. if _SCALE.get() is None else _SCALE.get(), jnp.float32)
+        leaves[index] = tapped(first, module.get_variable(PROBES, PROBE), where, scale, histogram)
         return jax.tree.unflatten(tree, leaves)
 
     with nn.intercept_methods(interceptor):
@@ -277,7 +300,7 @@ def flattened(inspected: Mapping) -> dict[str, jax.Array]:
     return found
 
 
-def cotangent_summaries(gradients: Mapping, factor: jax.Array, histogram: bool) -> dict[str, jax.Array]:
+def cotangent_summaries(gradients: Mapping, histogram: bool) -> dict[str, jax.Array]:
     """A step's probes' gradients (`tapped`) as the statistics of each watched output's cotangent
     (`cotangent_statistics`), by name, `cotangents/<module path>/<statistic>`, a stacked probe's entries
     each by its index as `flattened` names an activation's."""
@@ -286,7 +309,7 @@ def cotangent_summaries(gradients: Mapping, factor: jax.Array, histogram: bool) 
         keys = [str(entry.key) if isinstance(entry, jax.tree_util.DictKey) else str(entry) for entry in path]
         module = [key for key in keys if key != PROBE]
         for index in np.ndindex(*leaf.shape[:-1]):
-            for statistic, value in cotangent_statistics(leaf[index], factor, histogram).items():
+            for statistic, value in cotangent_statistics(leaf[index], histogram=histogram).items():
                 found["/".join(["cotangents", *module, *map(str, index), statistic])] = value
     return found
 
