@@ -675,8 +675,8 @@ def _coords(family: mosaic.Family, spans: _Spans | None, row, first, k_first, sh
         # forward spilling 344 bytes, D128's training 64 x 64 72); a row's needs no remainder.
         return lax.broadcast_in_dim(start + family.iota((shape[axis],), 0, columns=axis == 1), shape, (axis,))
 
-    # Queries first, the queries' places a row's vector broadcast, built where each read is traced (`Coords`:
-    # an unread iota keeps no layout); keys first a tile (a query's column vector beside the tile finds no
+    # Queries first, the queries' places a row's vector broadcast, built at their first read (`Coords`: an
+    # unread iota keeps no layout); keys first a tile (a query's column vector beside the tile finds no
     # layout in Mosaic GPU's inference). The keys' a vector broadcast, a column's queries first, a row's keys
     # first.
     if q_pos is None:
