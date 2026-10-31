@@ -1881,6 +1881,28 @@ def test_a_plan_keeps_each_green_group_of_a_heavy_file_and_a_task_runs_a_group_w
     assert [len((tmp_path / f"runs-{name}").read_text()) for name in "cd"] == [1, 2]
 
 
+def test_a_kept_task_whose_deadline_runs_out_names_its_unread_groups_red_and_runs_none_past_it(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A kept task that must run a kept group whose green run it cannot read, past its deadline, reads and
+    runs no group after it: each is a red row its task's deadline cut off, and the task writes every row
+    (review: each later group was still read and run, a fresh grace and settle each, past the deadline)."""
+    verdict, _ = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
+    names = "cde"
+    written(tmp_path, {"test_c.py": "import time\nfrom pathlib import Path\n" + "".join(
+        f"def test_{name}():\n    Path('runs-{name}').write_text('x')\n    time.sleep(3)\n"
+        for name in names)})
+    (tmp_path / "tests/test_durations.json").write_text(json.dumps(
+        {f"tests/test_c.py::test_{name}": 250.0 for name in names}))
+    groups = " ".join(f"tests/test_c.py#{index}/3@GenuineIntel-6-143:0000" for index in (1, 2, 3))
+    monkeypatch.setattr(sys, "argv", ["ci.py", "task", "--python=3.12", f"--tests={groups}",
+                                      f"--out={verdict}", "--cache=on", "--deadline=1"])
+    assert ci.main() == 0
+    rows = json.loads(verdict.read_text())["rows"]
+    assert [(row["name"], row["exitCode"], row["kind"]) for row in rows] == [
+        (f"3.12:tests/test_c.py#{index}/3", 1, "deadline") for index in (1, 2, 3)]
+    assert [(tmp_path / f"runs-{name}").exists() for name in names] == [True, False, False]
+
+
 def test_a_kept_task_reuses_its_rows_after_another_commit_changes_the_recorded_dependencies(
         ci, tmp_path, monkeypatch, cache_worker):
     """A plan's kept task reuses the green rows the plan found though another commit's run, of other inputs

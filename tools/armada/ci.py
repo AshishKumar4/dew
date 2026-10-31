@@ -1075,10 +1075,18 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
         return code
     rows = json.loads(out.read_text())["rows"]
     for index, (name, group, at) in enumerate(groups, start=1):
+        left = deadline - (time.monotonic() - began)
+        if left <= 0:
+            # The task's deadline spent on the rows before it: this group is neither read nor run, and is red
+            # as a row its task's deadline cut off is (review).
+            rows.append({"name": row(python, name, group), "exitCode": 1, "seconds": 0.0,
+                         "output": f"{INTERRUPTED} of {deadline:.0f} s before this group was read or run",
+                         "tests": {}, "ynn_switched": [], "cells": {},
+                         "timings": {row(python, name, ""): 0.0}, **red_as("deadline", [])})
+            continue
         part = out.with_name(f"{out.name}.{index}")
-        code = max(code, tested(python, [name], group, part, max(deadline - (time.monotonic() - began), 0.0),
-                                cache, grace, common, {}, coverage, whole=whole, release=release,
-                                kept={name: at}))
+        code = max(code, tested(python, [name], group, part, left, cache, grace, common, {}, coverage,
+                                whole=whole, release=release, kept={name: at}))
         rows += json.loads(part.read_text())["rows"]
     out.write_text(json.dumps({"rows": rows}))
     return code
