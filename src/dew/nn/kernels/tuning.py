@@ -47,8 +47,10 @@ import contextlib
 import contextvars
 import dataclasses
 import enum
+import functools
 import hashlib
 import importlib
+import inspect
 import json
 import logging
 import os
@@ -559,6 +561,51 @@ class KernelOp(tokamax.Op):
         keys = jax.random.split(jax.random.key(seed), len(specs))
         return [jax.random.normal(key, spec.shape, spec.dtype) if jnp.issubdtype(spec.dtype, jnp.floating)
                 else jnp.zeros(spec.shape, spec.dtype) for key, spec in zip(keys, specs, strict=True)]
+
+
+def lowered_once(static: tuple[str, ...], *, unless: Callable[[], bool] = lambda: False
+                 ) -> Callable[[Callable], Callable]:
+    """A kernel launch jitted with the arguments its signature names among `static` static: JAX keys its
+    program on them and on its operands' shapes and dtypes, so each configuration is traced and lowered
+    once however many layers, passes and recomputations call it, and no operand is held (a model's layers'
+    identical kernels were each lowered again: a 9B step lowered 880 RMS norm calls for 15 programs, row
+    2440). A call whose static arguments reach a function closing over values (`holdable`), or one
+    `unless` names (a plan tracing every call), runs the launch itself: jit's cache would keep the
+    closure, and any array it reaches, alive."""
+    def decorate(launch: Callable) -> Callable:
+        signature = inspect.signature(launch)
+        names = tuple(name for name in static if name in signature.parameters)
+        jitted = jax.jit(launch, static_argnames=names)
+
+        @functools.wraps(launch)
+        def called(*args, **kwargs):
+            bound = signature.bind(*args, **kwargs).arguments
+            if unless() or not all(holdable(bound[name]) for name in names if name in bound):
+                return launch(*args, **kwargs)
+            return jitted(*args, **kwargs)
+
+        return called
+
+    return decorate
+
+
+def holdable(value: Hashable) -> bool:
+    """Whether a cache may hold `value` without holding an array through it: no array, and no function of
+    a closure or a bound method (a hook reading an operand's shape may reach the array its call made),
+    within a partial's arguments, a container or a dataclass's fields alike."""
+    if isinstance(value, (jax.Array, np.ndarray)) or inspect.ismethod(value):
+        return False
+    if isinstance(value, functools.partial):
+        return holdable(value.func) and all(map(holdable, (*value.args, *value.keywords.values())))
+    if inspect.isfunction(value):
+        return value.__closure__ is None and all(map(holdable, value.__defaults__ or ()))
+    if isinstance(value, (tuple, list)):
+        return all(map(holdable, value))
+    if isinstance(value, dict):
+        return all(map(holdable, value.values()))
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return all(holdable(getattr(value, field.name)) for field in dataclasses.fields(value))
+    return True
 
 
 def program(function: Callable, *arguments: jax.ShapeDtypeStruct) -> str:
