@@ -121,13 +121,6 @@ def _local_attention(query, key, value, *, window, chunk, places, segment_ids, m
                 else chunk_runs(places, segment_ids, valid, query.shape[0], length, chunk))
         return whole(implementation=implementation, causal=True, sliding_window=window,
                      segment_ids=segment_ids, max_segments=max_segments, key_valid=valid, key_runs=runs)
-    # A mask built here is at most `[S, 2W]` per head, which cuDNN takes as its additive bias where the
-    # window ran on flash, cuDNN or xla (`AttentionCase.mask_as_bias`): flash takes no mask, and the whole
-    # call's packed documents keep cuDNN off it, so the selector takes the band to cuDNN where it takes the
-    # call, a kernel a run's context forces as forced (`mask_kernel`).
-    masked = mask_kernel(implementation, query, key, as_bias=resolved in ('flash', 'cudnn', 'xla'),
-                         dtype=dtype, precision=precision, force_fp32_for_softmax=force_fp32_for_softmax,
-                         softcap=softcap, sinks=sinks is not None)
     if window is not None and valid is None:
         # An explicit 'tpu' at a length splash cannot tile would reach the
         # flash kernel, whose default 128-row blocks must divide the length
@@ -139,6 +132,13 @@ def _local_attention(query, key, value, *, window, chunk, places, segment_ids, m
         if on_splash or (packs and (windowed or length <= 2 * span)):
             return whole(implementation=implementation, causal=True, sliding_window=window,
                          segment_ids=segment_ids, max_segments=max_segments)
+    # Past the whole call, a mask built here is at most `[S, 2W]` per head, which cuDNN takes as its
+    # additive bias (`mask_kernel`'s `as_bias`): flash takes no mask, and the whole call's packed documents
+    # keep cuDNN off it, so the band goes to cuDNN where it takes the call, a kernel a run's context forces
+    # as forced.
+    masked = mask_kernel(implementation, query, key, as_bias=True, dtype=dtype, precision=precision,
+                         force_fp32_for_softmax=force_fp32_for_softmax, softcap=softcap,
+                         sinks=sinks is not None)
     shards = sequence_shards()
     # Under a sequence axis each shard's first block reads the previous
     # shard's last `span` rows, which only one neighbour holds when a shard's

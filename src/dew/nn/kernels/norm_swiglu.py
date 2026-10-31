@@ -643,6 +643,18 @@ class _Norm(NamedTuple):
     inverse_rounded: bool = False
 
 
+@functools.lru_cache(maxsize=256)
+def _kernel_call(kernel, name: str, outputs, grid: tuple[int, ...], warps: int, interpret: bool,
+                 **parameters):
+    """Keep a launch's identity across layers so Pallas reuses its trace and lowering. Only static
+    output specs and arithmetic enter this cache; JAX keys the returned call on the input avals."""
+    return pl.pallas_call(
+        functools.partial(kernel, interpret=interpret, **parameters), grid=grid, out_shape=outputs,
+        compiler_params=plgpu.CompilerParams(num_warps=warps, num_stages=1),
+        interpret=interpret, name=name,
+    )
+
+
 @dataclasses.dataclass(frozen=True)
 class RmsForward(tuning.KernelOp):
     """The norm's forward launch over `[rows, width]` (`_rms_forward`): the
@@ -657,16 +669,15 @@ class RmsForward(tuning.KernelOp):
              epsilon: float, dtype: str, offset: bool, stored: str, after_cast: bool, activation: str,
              interpret: bool, inverse_rounded: bool, config: RowsConfig, return_residuals: bool = False):
         rows, width = x.shape
-        return pl.pallas_call(
-            functools.partial(_rms_forward, row_block=config.rows, epsilon=epsilon, offset=offset,
-                              stored=jnp.dtype(stored), after_cast=after_cast,
-                              inverse_rounded=inverse_rounded, activation=activation, interpret=interpret),
+        return _kernel_call(
+            _rms_forward, "rms_norm_forward",
+            outputs=(jax.ShapeDtypeStruct((rows, width), jnp.dtype(dtype)),
+                     None if branch is None else jax.ShapeDtypeStruct((rows, width), x.dtype),
+                     jax.ShapeDtypeStruct((rows,), jnp.float32)),
             grid=(pl.cdiv(rows, config.rows),),
-            out_shape=(jax.ShapeDtypeStruct((rows, width), jnp.dtype(dtype)),
-                       None if branch is None else jax.ShapeDtypeStruct((rows, width), x.dtype),
-                       jax.ShapeDtypeStruct((rows,), jnp.float32)),
-            compiler_params=plgpu.CompilerParams(num_warps=config.warps, num_stages=1),
-            interpret=interpret, name="rms_norm_forward",
+            warps=config.warps, interpret=interpret, row_block=config.rows, epsilon=epsilon, offset=offset,
+            stored=jnp.dtype(stored), after_cast=after_cast, inverse_rounded=inverse_rounded,
+            activation=activation,
         )(x, branch, scale, gate), None
 
     def _get_heuristics_config(self, ba) -> RowsConfig:
@@ -695,16 +706,14 @@ class RmsBackward(tuning.KernelOp):
         rows, width = x.shape
         groups = max(1, min(config.programs, pl.cdiv(rows, config.rows)))
         partial = None if scale is None else jax.ShapeDtypeStruct((groups, width), jnp.float32)
-        return pl.pallas_call(
-            functools.partial(_rms_backward, row_block=config.rows, offset=offset, stored=jnp.dtype(stored),
-                              after_cast=after_cast, inverse_rounded=inverse_rounded, activation=activation,
-                              interpret=interpret),
-            grid=(groups,),
-            out_shape=(jax.ShapeDtypeStruct((rows, width), x.dtype),
-                       None if gate is None else jax.ShapeDtypeStruct((rows, width), gate.dtype),
-                       partial, partial),
-            compiler_params=plgpu.CompilerParams(num_warps=config.warps, num_stages=1),
-            interpret=interpret, name="rms_norm_backward",
+        return _kernel_call(
+            _rms_backward, "rms_norm_backward",
+            outputs=(jax.ShapeDtypeStruct((rows, width), x.dtype),
+                     None if gate is None else jax.ShapeDtypeStruct((rows, width), gate.dtype),
+                     partial, partial),
+            grid=(groups,), warps=config.warps, interpret=interpret, row_block=config.rows, offset=offset,
+            stored=jnp.dtype(stored), after_cast=after_cast, inverse_rounded=inverse_rounded,
+            activation=activation,
         )(x, scale, gate, mean_square, dy, ds), None
 
     def _get_heuristics_config(self, ba) -> ReverseConfig:
@@ -916,10 +925,8 @@ class _Elementwise(tuning.KernelOp):
 
 def _launch(kernel, name: str, operands, outputs, grid: tuple[int, ...], config: BlockConfig,
             interpret: bool):
-    return pl.pallas_call(
-        functools.partial(kernel, block=config.block, interpret=interpret), grid=grid, out_shape=outputs,
-        compiler_params=plgpu.CompilerParams(num_warps=config.warps, num_stages=1),
-        interpret=interpret, name=name,
+    return _kernel_call(
+        kernel, name, outputs, grid, config.warps, interpret, block=config.block,
     )(*operands), None
 
 
