@@ -109,9 +109,11 @@ def test_an_audio_condition_rebuilt_from_its_record_encodes_the_same(towers):
                                   np.asarray(condition.encoder.encode(saved, tokens).hidden))
 
 
-def test_an_audio_towers_identity_holds_the_extractor_files_it_reads(towers, tmp_path):
+@pytest.mark.parametrize("held", ["preprocessor_config.json", "processor_config.json"])
+def test_an_audio_towers_identity_holds_the_extractor_files_it_reads(towers, tmp_path, held):
     """The tower's identity (`dependencies`, which keys the audio a run's data plan encodes) holds the
-    hashes of the configuration and feature-extractor files it read: a checkpoint whose extractor no
+    hashes of the configuration and feature-extractor files it read, the extractor's settings in their
+    own file or nested in a processor's, which transformers reads first: a checkpoint whose extractor no
     longer normalizes encodes the same clip to other features, and its identity moves with them (row
     1871)."""
     import json
@@ -119,15 +121,20 @@ def test_an_audio_towers_identity_holds_the_extractor_files_it_reads(towers, tmp
 
     directory = tmp_path / "wav2vec2"
     shutil.copytree(towers / "wav2vec2", directory)
+    settings = json.loads((directory / "preprocessor_config.json").read_text())
+    assert settings["do_normalize"]
+
+    def holding(stated):
+        (directory / held).write_text(json.dumps(stated if held == "preprocessor_config.json"
+                                                 else {"feature_extractor": stated}))
 
     def loaded():
         encoder = HFAudio.from_pretrained(str(directory), seconds=0.25)
         return encoder.tokenize([_tone(330, 0.25)])["input_values"], encoder.dependencies()
 
+    holding(settings)
     features, recorded = loaded()
-    settings = json.loads((directory / "preprocessor_config.json").read_text())
-    assert settings["do_normalize"]
-    (directory / "preprocessor_config.json").write_text(json.dumps({**settings, "do_normalize": False}))
+    holding({**settings, "do_normalize": False})
     moved_features, moved = loaded()
     assert not np.array_equal(features, moved_features)
     assert moved != recorded
