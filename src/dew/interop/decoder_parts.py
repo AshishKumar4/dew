@@ -24,7 +24,7 @@ from dew import _records
 from dew._model_types import LAYER_SCALAR_COLLECTIONS, SANDWICH_NORMS
 from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.safetensors_io import LazyTensors, tensor_specs
-from dew.interop.streaming import WeightLayout
+from dew.interop.streaming import HostArray, WeightLayout
 from dew.interop.unread import Stored, equal, valued
 from dew.interop.weights import check_tree
 from dew.nn.activations import GatedActivation, Situ
@@ -1514,7 +1514,7 @@ def leaf_layouts(leaves: Mapping[tuple[str, ...], object],
         named = names(path)
         if named is None:
             continue
-        if not isinstance(value, (jax.Array, np.ndarray)):
+        if not isinstance(value, (jax.Array, np.ndarray, HostArray)):
             raise TypeError(f"{'.'.join(path)} is a {type(value).__name__}, not an array")
         if isinstance(named, str):
             slices, shape = [(named, None)], value.shape

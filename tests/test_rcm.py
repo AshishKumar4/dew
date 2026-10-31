@@ -372,7 +372,7 @@ def test_a_pretrained_run_distills_the_model_it_loads_without_a_teacher_run(tmp_
     assert (to_record(objective.task_settings(), ImageSettings)
             == to_record(direct.task_settings(), ImageSettings))
     assert objective.steps == direct.steps == 3 and objective.guidance is None
-    assert objective.grid is not None and objective.solver != source.schedule.solver
+    assert objective.grid is not None and objective.solver != source.solver
     expected = model_part(source.variables)
     held = objective.init(jax.random.PRNGKey(0))
     for tree in (objective.teacher_variables, held[TEACHER]):
