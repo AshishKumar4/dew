@@ -400,6 +400,14 @@ XLA_SUPPORTS = (
                 row=INHERENT, kind='handoff'),
     _Need('dropout', lambda case: not case.dropout, "jax.nn's attention takes no probability dropout",
           row=INHERENT, kind='handoff'),
+    _Need('dtypes', lambda case: case.key_dtype == case.dtype,
+          lambda case: f"jax.nn's attention takes a query of its keys' dtype, not {case.dtype} over "
+                       f"{case.key_dtype} (`dot_product_attention`'s `_check_shape_and_dtype`)",
+          row=INHERENT, kind='handoff'),
+    _Need('cpu_float16', lambda case: not (case.dtype == np.float16 and generation.backend() == 'cpu'),
+          "XLA's CPU compiler has no float16 dot into float32 (F16_F16_F32), the algorithm jax.nn's "
+          "attention names for a float16 query (`_dot_product_attention_core`), past its trace-time fallback",
+          row=INHERENT, kind='handoff'),
 )
 """jax.nn's xla attention's requirements: the generic kernel, which hands what it cannot honour to
 the reference path."""
