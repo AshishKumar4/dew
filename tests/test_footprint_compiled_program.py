@@ -2,6 +2,7 @@
 reads the jaxpr, XLA compiles the program JAX lowers it to, and four terms the walk counted are not in it.
 Each test states one, with the rule that removes it, on a program small enough to read."""
 
+
 import re
 
 import jax
@@ -10,7 +11,8 @@ import numpy as np
 import pytest
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from dew.training.footprint import Workspace, compiled, gemm_workspace, gradient_peak, peak_bytes
+from dew.training.compiled_program import compiled, deviceless, lowering_platform
+from dew.training.footprint import Workspace, gemm_workspace, gradient_peak, peak_bytes
 
 
 def test_a_shard_map_over_one_device_holds_what_it_would_inline():
@@ -44,13 +46,14 @@ def test_a_shard_map_over_one_device_holds_what_it_would_inline():
             through(layer), params, (rows,), platform="gpu", workspace=workspace)
 
 
-def test_a_pallas_kernel_holds_its_outputs_and_no_workspace():
-    """A Pallas kernel is one custom call to XLA, `__gpu$xla.gpu.triton`, whose results are the kernel's
-    outputs alone (`pallas_call_lowering`, jax/_src/pallas/triton/pallas_call_registration.py: the body is
-    serialized into the call's configuration). The matrix product in its body is Triton's, no HLO dot for
-    `GemmRewriter` to hand cuBLAS, and a workspace is added to cuBLAS custom calls alone
+def test_a_native_pallas_kernel_holds_its_outputs_and_no_workspace():
+    """A native Pallas kernel is one custom call to XLA, `__gpu$xla.gpu.triton`, whose results are the
+    kernel's outputs alone (`pallas_call_lowering`, jax/_src/pallas/triton/pallas_call_registration.py:
+    the body is serialized into the call's configuration). The matrix product in its body is Triton's,
+    no HLO dot for `GemmRewriter` to hand cuBLAS, and a workspace is added to cuBLAS custom calls alone
     (`GemmWorkspaceRewriteVisitor::HandleCustomCall`, xla/backends/gpu/transforms/gemm_rewriter.cc); the
-    values of its body live in registers and shared memory: the call holds its output."""
+    values of its body live in registers and shared memory: the call holds its output. An interpreted
+    one lowers to ordinary HLO (`pallas_call_hlo_interpret`), its body's product a cuBLAS call's."""
     from jax.experimental import pallas as pl
 
     shape = jax.ShapeDtypeStruct((64, 64), jnp.float32)
@@ -58,34 +61,45 @@ def test_a_pallas_kernel_holds_its_outputs_and_no_workspace():
     def kernel(left, right, out):
         out[...] = left[...] @ right[...]
 
-    def call(left, right):
-        return pl.pallas_call(kernel, out_shape=shape, interpret=True)(left, right)
+    def peak(interpret: bool) -> int:
+        program = jax.make_jaxpr(lambda left, right: pl.pallas_call(
+            kernel, out_shape=shape, interpret=interpret)(left, right))(shape, shape).jaxpr
+        assert [equation.primitive.name for equation in program.eqns] == ["pallas_call"]
+        return peak_bytes(program, "gpu", Workspace(1 << 20, 1 << 20))
 
-    program = jax.make_jaxpr(call)(shape, shape).jaxpr
-    assert [equation.primitive.name for equation in program.eqns] == ["pallas_call"]
-    assert peak_bytes(program, "gpu", Workspace(1 << 20, 1 << 20)) == 64 * 64 * 4
+    assert peak(interpret=False) == 64 * 64 * 4
+    assert peak(interpret=True) >= 1 << 20
 
 
-def test_a_platform_dependent_program_holds_the_branch_its_platform_lowers():
-    """A `platform_dependent` conditional lowers to the branch of the platform it is lowered for
-    (`_cond_lowering`, jax/_src/lax/control_flow/conditionals.py keeps `branches_kept`), so XLA never sees the
-    other branches: a GPU holds the CUDA branch's values, a CPU the default's, whichever is larger. The
-    platform index, an int32, is the program's own beside the branch."""
+@pytest.mark.parametrize("order", ["cuda-first", "rocm-first"])
+def test_a_platform_dependent_program_holds_the_branch_its_platform_lowers(order):
+    """A `platform_dependent` conditional lowers to the branch of the platform it is lowered for, inline,
+    no conditional around it (`_cond_lowering`, jax/_src/lax/control_flow/conditionals.py keeps the
+    branches whose platforms hold the lowering's and lowers a sole one as the computation itself), so XLA
+    never sees the other branches, whichever order they are named in, and fuses the kept one with what
+    reads it: CUDA holds its branch's values, a CPU the default's, as the branch alone in the program
+    would."""
     values = jax.ShapeDtypeStruct((256, 256), jnp.float32)
 
     def small(values):
-        return values * 2
+        return jnp.sin(values)
 
     def large(values):
         return jnp.tanh(jnp.exp(values) @ values) @ values
 
-    def peak(platform, **branches):
-        program = jax.make_jaxpr(lambda values: jax.lax.platform_dependent(values, **branches))(values).jaxpr
-        return peak_bytes(compiled(program, platform), platform, Workspace(0, 0))
+    def program(function):
+        return jax.make_jaxpr(lambda values: jnp.sum(function(values)))(values).jaxpr
 
-    alone = peak_bytes(jax.make_jaxpr(small)(values).jaxpr, "gpu", Workspace(0, 0))
-    assert peak("gpu", cuda=small, default=large) - alone <= 4
-    assert peak("cpu", cuda=large, default=small) - alone <= 4
+    def selected(**branches):
+        return lambda values: jax.lax.platform_dependent(values, **branches)
+
+    alone = peak_bytes(program(small), "gpu", Workspace(0, 0))
+    named = ({"cuda": small, "rocm": large} if order == "cuda-first" else {"rocm": large, "cuda": small})
+    lowered_for = (("cuda", {**named, "default": large}), ("cpu", {"cuda": large, "default": small}))
+    for lowering, branches in lowered_for:
+        lowered = compiled(program(selected(**branches)), lowering)
+        assert "cond" not in {equation.primitive.name for equation in lowered.eqns}
+        assert peak_bytes(lowered, "gpu", Workspace(0, 0)) == alone
 
 
 def compiled_workspaces(gpu, function, *specs) -> list[int]:
@@ -93,10 +107,10 @@ def compiled_workspaces(gpu, function, *specs) -> list[int]:
     with XLA's Triton GEMMs off, as the planner compiles a step, so every product is a cuBLAS call."""
     sharding = NamedSharding(Mesh(np.asarray([gpu]), ("data",)), P())
     placed = [jax.ShapeDtypeStruct(spec.shape, spec.dtype, sharding=sharding) for spec in specs]
-    compiled = jax.jit(jax.grad(lambda *arguments: function(*arguments)[0])).lower(*placed).compile(
+    program = jax.jit(jax.grad(lambda *arguments: function(*arguments)[0])).lower(*placed).compile(
         compiler_options={"xla_gpu_enable_triton_gemm": False}).as_text()
-    assert compiled, "the compile states no program"
-    return [int(size) for line in compiled.splitlines() if 'custom_call_target="__cublas' in line
+    assert program, "the compile states no program"
+    return [int(size) for line in program.splitlines() if 'custom_call_target="__cublas' in line
             for size in re.findall(r"s8\[(\d+)\]", line)]
 
 
@@ -155,3 +169,98 @@ def test_a_matmul_fused_with_its_loops_slice_keeps_the_workspace_its_rewrite_gav
     vast = 1 << 30
     assert vast <= peak(Workspace(vast, 0)) and vast <= peak(Workspace(0, vast))
     assert peak(Workspace(vast, vast)) < 2 * vast
+
+
+def test_a_compile_only_target_is_deviceless_and_lowers_for_cuda():
+    """A compile-only GPU is no device of a running backend (`deviceless`) and JAX lowers for it as CUDA;
+    a CPU of this process is a running backend's, lowered for as a CPU."""
+    from dew.training.ahead import compile_only_gpus
+
+    (gpu,) = compile_only_gpus("sm90", 1, 1 << 30)
+    cpu = jax.devices("cpu")[0]
+    assert deviceless(gpu) and not deviceless(cpu)
+    assert (lowering_platform(gpu), lowering_platform(cpu)) == ("cuda", "cpu")
+
+
+def scaled(product):
+    """A loss of `product`'s matmuls scaled by a scalar, its gradient's first argument: the gradient's
+    program holds the forward's matmuls alone, as the scale's cotangent reads them."""
+    def loss(scale, table, rows):
+        return scale * jnp.sum(jnp.tanh(product(table, rows))), ()
+
+    return loss
+
+
+def over_turns(tile):
+    """`tile(index, table, rows)`'s products summed over four turns of a `fori_loop`."""
+    def product(table, rows):
+        return jax.lax.fori_loop(0, 4, lambda index, total: total + jnp.sum(tile(index, table, rows)),
+                                 jnp.zeros(()))
+
+    return product
+
+
+def returned_update(table, rows):
+    """Each turn's product, of values computed (no slice), updated into the loop's carried buffer, which
+    the loop returns."""
+    def turn(index, buffer):
+        product = jnp.tanh(rows[:64]) @ jnp.tanh(table[:64]).T
+        return jax.lax.dynamic_update_slice_in_dim(buffer, product, index * 64, axis=0)
+
+    return jax.lax.fori_loop(0, 4, turn, jnp.zeros((256, 64)))
+
+
+def discarded_update(table, rows):
+    """Each turn's product, of values computed (no slice), updated into a scratch buffer reduced away,
+    which the loop never returns."""
+    def turn(index, total):
+        product = jnp.tanh(rows[:64]) @ jnp.tanh(table[:64]).T
+        scratch = jax.lax.dynamic_update_slice_in_dim(jnp.zeros((256, 64)), product, index * 64, axis=0)
+        return total + jnp.sum(scratch)
+
+    return jax.lax.fori_loop(0, 4, turn, jnp.zeros(()))
+
+
+PROGRAMS = {
+    # A static aligned contiguous slice, outside any loop.
+    "static-slice": lambda table, rows: rows @ table[:64].T,
+    # A tile its counter offsets evenly, the rows it cuts whole.
+    "counted-rows": over_turns(lambda index, table, rows: rows @ jax.lax.dynamic_slice_in_dim(
+        table, index * 64, 64).T),
+    # A tile cut in two axes: no contiguous run of the table's bytes.
+    "two-axis-cut": over_turns(lambda index, table, rows: rows[:, :32] @ jax.lax.dynamic_slice(
+        table, (index * 32, 0), (64, 32)).T),
+    # Offsets the counter squares: no linear progression of bytes.
+    "squared-offsets": over_turns(lambda index, table, rows: rows @ jax.lax.dynamic_slice_in_dim(
+        table, index * index * 16, 64).T),
+    # A tile transposed and reshaped across its axes before the product: no bitcast of the slice.
+    "mixed-reshape": over_turns(lambda index, table, rows: rows[:, :32] @ jax.lax.dynamic_slice_in_dim(
+        table, index * 64, 64).T.reshape(32, 128)),
+    "returned-update": returned_update,
+    "discarded-update": discarded_update,
+}
+
+
+@pytest.mark.parametrize("program", sorted(PROGRAMS))
+def test_a_deviceless_matmul_holds_the_workspace_its_slice_fusion_decides(program):
+    """On a compile-only Hopper, a cuBLAS matmul XLA fuses with a slice of its operand or of its
+    result's update (`DynamicSliceFusionRewriterV2`) keeps the rewriter's 32 MiB, and any other the
+    default config's 4 MiB: the derivation charges each matmul of a program the workspace XLA's own
+    compile gives it, slices fused and slices not alike."""
+    from dew.training.ahead import compile_only_gpus
+
+    (gpu,) = compile_only_gpus("sm90", 1, 1 << 30)
+    workspace = gemm_workspace(gpu)
+    loss = scaled(PROGRAMS[program])
+    specs = (jax.ShapeDtypeStruct((), jnp.float32), jax.ShapeDtypeStruct((256, 64), jnp.float32),
+             jax.ShapeDtypeStruct((512, 64), jnp.float32))
+    held = {"each" if size == workspace.each else "sliced" for size in compiled_workspaces(gpu, loss, *specs)}
+    vast = 1 << 30
+
+    def peak(charged: Workspace) -> int:
+        return gradient_peak(loss, specs[0], specs[1:], platform="gpu", workspace=charged).bytes
+
+    charged = {kind for kind, charge in (("each", Workspace(vast, 0)), ("sliced", Workspace(0, vast)))
+               if peak(charge) >= vast}
+    assert charged == held
+
