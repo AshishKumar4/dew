@@ -688,8 +688,7 @@ def test_two_mamba_layers_lower_the_template_scans_launches_once():
     (`tuning.lowered_once`), as many as one layer's. Built in each call, a model's layers' identical
     launches were each traced and lowered again (row 2969)."""
     def launches(layers: int) -> int:
-        text = _mamba1_lowered("sm90", layers).as_text(dialect="hlo")
-        return len(re.findall(r'custom_call_target="mosaic_gpu', text))
+        return len(_mosaic_calls(_operations(_mamba1_lowered("sm90", layers))))
 
     one = launches(1)
     assert one > 0 and launches(2) == one
