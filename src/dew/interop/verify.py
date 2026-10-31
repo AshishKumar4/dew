@@ -39,6 +39,7 @@ from collections.abc import Collection, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
+from types import NoneType
 from typing import TYPE_CHECKING
 
 import jax
@@ -308,10 +309,11 @@ class _Sizes:
 def shrink(hf_config: Mapping[str, object], source: ModelSource | None = None) -> Mapping[str, object]:
     """Return a config with the sizes the convention reads made small and the rest kept.
 
-    The layer count stays: a per-layer field the convention does not read
-    (SmolLM3's `no_rope_layers`, one entry per layer with every fourth
-    layer off) would read as all-on over two layers and hide the difference.
-    The query-to-key-head ratio stays, and so does whether the hidden width
+    The layer count stays here: a per-layer field the convention does not
+    read (SmolLM3's `no_rope_layers`, one entry per layer with every fourth
+    layer off) would read as all-on over two layers and hide the difference,
+    so `shallow` cuts it only to the layers that hold every kind the stated
+    depth builds. The query-to-key-head ratio stays, and so does whether the hidden width
     is the heads' total width; a stated window or chunk, and a rope ramp's
     stated original context, shrink below the probe's length so each acts,
     and a token id past the probe's vocabulary moves inside it. Each standard
@@ -530,6 +532,66 @@ def _assembled(source: ModelSource, hf_config: Mapping[str, object]) -> parts.As
     except parts.Ambiguous as error:
         raise _refuse(source.model_type, f"its real-sized model does not assemble as its probe did "
                       f"({error})") from error
+
+
+_LAYER_INDEXES = frozenset({'layer_idx', 'layer_id', 'layer_index', 'layer_number'})
+"""The attributes a layer's modules hold its own place under, which tell layers apart without telling
+their computations apart."""
+
+
+def _layer_kinds(source: ModelSource, fields: Mapping[str, object]) -> list[tuple] | None:
+    """Each decoder layer's kind in the model `fields` builds, on torch's meta device: its entry in each of
+    the config's per-layer lists (one as long as the depth, stated or derived: SmolLM3's
+    `no_rope_layers`, HY-3's `mlp_layer_types`), and each of its modules' class, public scalar
+    attributes (its place aside, `_LAYER_INDEXES`) and parameter and buffer shapes, across every module
+    list as long as the depth. None where no module list is."""
+    import torch
+
+    config = source.configured(fields)
+    depth = _records.integer(config.num_hidden_layers, 'num_hidden_layers')
+    with torch.device('meta'):
+        model = source.causal_lm(config)
+    stacks = [module for module in model.modules() if isinstance(module, torch.nn.ModuleList)
+              and len(module) == depth]
+    if not stacks:
+        return None
+    lists = sorted((name, tuple(value)) for name, value in vars(config).items()
+                   if isinstance(value, (list, tuple)) and len(value) == depth)
+
+    def kind(layer: torch.nn.Module) -> tuple:
+        return tuple((path, type(module).__module__, type(module).__qualname__,
+                      tuple(sorted((key, value) for key, value in vars(module).items()
+                                   if not key.startswith('_') and key not in _LAYER_INDEXES
+                                   and isinstance(value, (bool, int, float, str, NoneType)))),
+                      tuple((name, tuple(tensor.shape)) for name, tensor in (
+                          *module.named_parameters(recurse=False), *module.named_buffers(recurse=False))))
+                     for path, module in layer.named_modules())
+
+    return [(tuple(json.dumps(value, sort_keys=True, default=str) for _, value in
+                   ((name, values[index]) for name, values in lists)),
+             tuple(kind(stack[index]) for stack in stacks)) for index in range(depth)]
+
+
+def shallow(source: ModelSource, fields: Mapping[str, object]) -> Mapping[str, object]:
+    """`fields` (`shrink`'s) cut to the fewest first layers that hold every kind of layer its stated depth
+    builds (`_layer_kinds`), at least two, each stated per-layer list cut alike: HY-3's 80 layers probe as
+    its dense first and a routed one, SmolLM3's 36 as its first four, the fourth without positions. The
+    cut holds only where its layers are the deep model's first ones kind for kind; the depth stays
+    otherwise, as it does where no kind is told apart (no module list as long as the depth)."""
+    kinds = _layer_kinds(source, fields)
+    if kinds is None:
+        return fields
+    firsts = {}
+    for index, layer in enumerate(kinds):
+        firsts.setdefault(layer, index)
+    count = max(max(firsts.values()) + 1, min(2, len(kinds)))
+    if count == len(kinds):
+        return fields
+    key = _Sizes.of(fields, source).key('num_hidden_layers')
+    cut = {name: (list(value[:count]) if isinstance(value, (list, tuple)) and len(value) == len(kinds)
+                  and name != key else value) for name, value in fields.items()}
+    cut[key] = count
+    return cut if _layer_kinds(source, cut) == kinds[:count] else fields
 
 
 def _reference_config(source: ModelSource, fields: Mapping[str, object]) -> tuple[PretrainedConfig, int, str]:
@@ -821,8 +883,8 @@ def _verified(hf_config: Mapping[str, object], source: ModelSource) -> VerifiedM
             reasons[convention] = str(error)
     with _quiet():
         try:
-            fields = shrink(hf_config, source)
-            layers = _Sizes.of(hf_config, source).stated('num_hidden_layers')
+            fields = shallow(source, shrink(hf_config, source))
+            layers = _Sizes.of(fields, source).stated('num_hidden_layers')
         except (KeyError, ValueError) as error:
             # A reader may take a config by its own names or its defaults (OPT's
             # defaults every size); the probe shrinks it by the standard names.
