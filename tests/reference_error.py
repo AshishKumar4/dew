@@ -1209,10 +1209,22 @@ def _of_its_seed(label: str, draw, seed, inputs) -> None:
                            f"does not fix it")
 
 
+def _repeat_promised() -> bool:
+    """Whether a run promises its arms a bitwise repeat (docs/design/testing.md, check 1): on a CPU, or in
+    deterministic mode (`dew.devices.deterministic_ops_requested`). A GPU default that reduces with
+    atomics (a backward's dQ summed in arrival order) promises none."""
+    from dew.devices import deterministic_ops_requested
+
+    return jax.default_backend() == "cpu" or deterministic_ops_requested()
+
+
 def _of_its_inputs(label: str, name: str, fn, inputs, first) -> None:
     """Raise unless `fn`, `name` of a check's arms, gives `first` again on the same `inputs`: an arm that
     draws a noise of its own, or reads state its last call left, compares Dew with a reference on draws no
-    seed pairs (ledger 2641)."""
+    seed pairs (ledger 2641). Asked only where a repeat is promised (`_repeat_promised`, ledger 2842); the
+    CPU lane runs every check-1 site, so each arm is held to it there."""
+    if not _repeat_promised():
+        return
     if (where := _same_bits(first, fn(*inputs))) is not None:
         raise UnpairedDraw(f"{label}: {name} differs at {where} run again on the same inputs, so its output "
                            f"depends on more than them")
