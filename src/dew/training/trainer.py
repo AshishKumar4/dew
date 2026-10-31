@@ -81,6 +81,7 @@ from dew.distributed.placement import (
     placed_bytes,
     placed_shapes,
 )
+from dew.held_updates import waiting
 from dew.inputs import Field, InputSpec
 from dew.mesh import SEQUENCE_AXIS, STAGE_AXIS, TENSOR_AXIS, LayoutRefused, LogicalAxes
 from dew.nn.flops import MissingFlopsCount
@@ -131,7 +132,7 @@ from dew.training._fit import (
     pooled,
     pooled_first,
     pooled_read,
-    refuse_unclocked,
+    restored,
     stage_reached,
     unrecorded_parts,
     validation_read,
@@ -427,7 +428,7 @@ class Trainer(Generic[Loss, Effects]):
             raise ValueError(
                 f"the objective's tree has no params collection, only {sorted(params)}; "
                 "the optimizer moves params and treats every other collection as state")
-        ema = self.objective.ema
+        ema, opt_state = self.objective.ema, self._boxed_init(initialized, params["params"])
         return TrainState(
             step=jnp.zeros((), jnp.int32),
             microstep=jnp.zeros((), jnp.int32),
@@ -437,13 +438,13 @@ class Trainer(Generic[Loss, Effects]):
                 lambda leaf: jnp.array(leaf, copy=True), self._loss_scale),
             window_size=jnp.asarray(self.accumulation, jnp.int32),
             variables=params,
-            opt_state=self._boxed_init(initialized, params["params"]),
+            opt_state=opt_state,
             # The average starts equal to the parameters but as its own buffers: the step donates
             # the state, and a buffer can be donated once.
             ema=None if ema is None else jax.tree.map(jnp.copy, select(params, ema.select)),
             key=run_key,
             consumed=None if self._examples is None else jnp.zeros((), jnp.int32),
-        )
+            deferred=waiting(opt_state))
 
     @property
     def key(self) -> jax.Array:
@@ -672,7 +673,7 @@ class Trainer(Generic[Loss, Effects]):
         share = DataPartition.of(self.device_mesh) if positioned else None
         state, position = checkpoints.restore(placed_shapes(abstract, shardings), resume, share=share,
                                               served=self.objective.served_groups(abstract.variables))
-        refuse_unclocked(state, resume, self._examples)
+        state = restored(state, resume, self._examples)
         if self._config is not None:
             # The rate this run configures, not the one its checkpoint holds.
             state = dataclasses.replace(state, opt_state=with_rates(state.opt_state, self._config.rates()))
