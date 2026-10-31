@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from dew.training.footprint import Workspace, gemm_workspace, gradient_peak, peak_bytes
+from dew.training.footprint import Workspace, compiled, gemm_workspace, gradient_peak, peak_bytes
 
 
 def test_a_shard_map_over_one_device_holds_what_it_would_inline():
@@ -81,7 +81,7 @@ def test_a_platform_dependent_program_holds_the_branch_its_platform_lowers():
 
     def peak(platform, **branches):
         program = jax.make_jaxpr(lambda values: jax.lax.platform_dependent(values, **branches))(values).jaxpr
-        return peak_bytes(program, platform, Workspace(0, 0))
+        return peak_bytes(compiled(program, platform), platform, Workspace(0, 0))
 
     alone = peak_bytes(jax.make_jaxpr(small)(values).jaxpr, "gpu", Workspace(0, 0))
     assert peak("gpu", cuda=small, default=large) - alone <= 4
@@ -94,8 +94,10 @@ def compiled_workspaces(gpu, function, *specs) -> list[int]:
     sharding = NamedSharding(Mesh(np.asarray([gpu]), ("data",)), P())
     placed = [jax.ShapeDtypeStruct(spec.shape, spec.dtype, sharding=sharding) for spec in specs]
     compiled = jax.jit(jax.grad(lambda *arguments: function(*arguments)[0])).lower(*placed).compile(
-        compiler_options={"xla_gpu_enable_triton_gemm": False})
-    return [int(size) for size in re.findall(r"s8\[(\d+)\]", compiled.as_text())]
+        compiler_options={"xla_gpu_enable_triton_gemm": False}).as_text()
+    assert compiled, "the compile states no program"
+    return [int(size) for line in compiled.splitlines() if 'custom_call_target="__cublas' in line
+            for size in re.findall(r"s8\[(\d+)\]", line)]
 
 
 @pytest.mark.parametrize("generation", ["sm80", "sm90"])
@@ -123,11 +125,11 @@ def test_a_compile_only_gpus_gemm_holds_the_workspace_its_deviceless_compile_giv
 @pytest.mark.parametrize("generation", ["sm80", "sm90"])
 def test_a_matmul_fused_with_its_loops_slice_keeps_the_workspace_its_rewrite_gave_it(generation):
     """A matmul whose operand a loop slices per turn (a contiguous, aligned dynamic slice, its offset the
-    loop's counter's: `DynamicSliceFusionRewriterV2`, xla/backends/gpu/transforms/
-    dynamic_slice_fusion_rewriter_v2.cc, `AnalyzeDynamicSlice`, dynamic_slice_analysis.cc) is fused with
-    the slice, and the config assigner, which visits no fusion's computation, leaves it the workspace
-    `GemmWorkspaceRewriteVisitor` gave it: 32 MiB at Hopper, 4 MiB before, where the loop's other
-    matmuls hold the default config's 4 MiB. The derivation charges each its own."""
+    loop's induction variable's: `DynamicSliceFusionRewriterV2`, xla/backends/gpu/transforms/
+    dynamic_slice_fusion_rewriter_v2.cc, `AnalyzeDynamicSlice`, dynamic_slice_analysis.cc), its counter's
+    or a scan's turn of its stacked inputs, is fused with the slice, and the config assigner, which
+    visits no fusion's computation, leaves it the workspace `GemmWorkspaceRewriteVisitor` gave it: 32 MiB
+    at Hopper, 4 MiB before, where other matmuls hold the default config's 4 MiB."""
     from dew.training.ahead import compile_only_gpus
 
     (gpu,) = compile_only_gpus(generation, 1, 1 << 30)
@@ -138,11 +140,18 @@ def test_a_matmul_fused_with_its_loops_slice_keeps_the_workspace_its_rewrite_gav
             # Each turn's tile of the table, its offset the counter's: the slice the matmul is fused with.
             return total + jnp.sum(jnp.tanh(rows @ jax.lax.dynamic_slice_in_dim(table, index * 64, 64).T))
 
-        return jax.lax.fori_loop(0, 4, tile, jnp.zeros(())), ()
+        # Squared, so the loop's cotangent is a value each turn scales its residual by, not the seed.
+        return jax.lax.fori_loop(0, 4, tile, jnp.zeros(())) ** 2, ()
 
-    compiled = compiled_workspaces(gpu, loss, table, rows)
+    # XLA fuses the forward's matmul with the table's tile, which keeps the rewriter's workspace, and not
+    # the backward's, whose operand is the residual's turn scaled, which takes the default config's.
     workspace = gemm_workspace(gpu)
-    assert sorted(set(compiled)) == sorted({workspace.each, workspace.sliced})
-    derived = (gradient_peak(loss, table, (rows,), platform="gpu", workspace=workspace).bytes
-               - gradient_peak(loss, table, (rows,), platform="gpu", workspace=Workspace(0, 0)).bytes)
-    assert derived <= max(compiled)
+    assert sorted(compiled_workspaces(gpu, loss, table, rows)) == sorted([workspace.each, workspace.sliced])
+
+    def peak(workspace: Workspace) -> int:
+        return gradient_peak(loss, table, (rows,), platform="gpu", workspace=workspace).bytes
+
+    # The derivation charges each matmul as XLA does: one of either.
+    vast = 1 << 30
+    assert vast <= peak(Workspace(vast, 0)) and vast <= peak(Workspace(0, vast))
+    assert peak(Workspace(vast, vast)) < 2 * vast
