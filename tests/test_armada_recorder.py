@@ -392,6 +392,20 @@ def test_the_digest_of_dews_own_source_is_no_input_of_the_file_that_computed_it(
     assert reused()[0] is False
 
 
+def test_each_source_digest_the_recorder_exempts_is_a_function_dew_still_holds():
+    """`followed.DIGESTS` names each function by its file and its name: one renamed or moved would leave its
+    reads the input of every file that calls it again (the 38% of a suite's rows that hash Dew's source), and
+    no run of the suite would show it."""
+    import importlib
+    import inspect
+    import os
+
+    followed = load("followed", "tools/armada")
+    for file, name in followed.DIGESTS:
+        held = getattr(importlib.import_module(file.removesuffix(".py").replace("/", ".")), name)
+        assert inspect.unwrap(held).__code__.co_filename.endswith(os.sep + file), (file, name)
+
+
 def test_a_files_children_hold_what_they_held_at_once_and_each_start_must_leave_its_record(tmp_path):
     """The children's logs join the file that started them (`followed.gathered`): their files, and the
     GPU they held, the most a child that took the parent's fraction used, those children as shares and
