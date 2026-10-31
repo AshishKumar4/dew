@@ -53,7 +53,10 @@ def _dkv_allocations(family: mosaic.Family, config: BackwardTiles, width: int, v
     swizzle = mosaic.swizzle_for(dtype, rows, width, value_width) if split else None
     # Each holder's output stages, where it stores its own sums: the consumers sharing a key block store
     # theirs summed once, in a scope of their own after the walk's (`_summed_stored`).
-    outputs = [] if split else [
+    # Sums stored in a scope after the walk's, whose shared memory it reuses (`_summed_stored`,
+    # `_own_stored`), hold no output stage beside it: the consumers sharing a key block's, and a shared dQ's
+    # (FlashAttention 3's epilogue in the mainloop's shared memory).
+    outputs = [] if split or config.shared_dq else [
         plgpu.SMEM((holders, max(block_q, block_k), width // columns), jnp.float32),
         *([] if value_width == width
           else [plgpu.SMEM((holders, block_k, value_width // columns), jnp.float32)]),
@@ -322,10 +325,27 @@ def _summed_stored(family: mosaic.Family, sums: tuple, views: tuple, consumers: 
         pl.run_scoped(total, plgpu.SMEM(value.shape, jnp.float32), **mosaic.summing(value.shape, consumers),
                       collective_axes="wg")
 
+def _own_stored(family: mosaic.Family, sums: tuple, refs: tuple, consumers: int, block_k: int) -> None:
+    """Each consumer's own keys' dK and dV (`sums`, a shared dQ's consumers', `BackwardTiles.shared_dq`)
+    stored to its key block of `refs` in a scope after the walk's, whose shared memory it reuses, a stage
+    each."""
+    family.store_wait(0)
+    wg = lax.axis_index("wg")
+    out = (lax.axis_index("batch"), pl.ds((lax.axis_index("k_tiles") * consumers + wg) * block_k, block_k),
+           lax.axis_index("heads"))
+    for value, ref in zip(sums, refs, strict=True):
+        def stored(stage, value=value, ref=ref):
+            @pl.when(wg < consumers)
+            def _():
+                family.stored((value,), (ref.at[out],), smem=stage.at[wg])
+
+        pl.run_scoped(stored, plgpu.SMEM((consumers, *value.shape), jnp.float32), collective_axes="wg")
+
+
 def _dkv_scoped(refs, *, widths: bool, split: bool) -> tuple:
     """The dK/dV program's allocations (`_dkv_allocations`) by role: its resident keys and values, dK's output
-    stage and dV's (dK's where the head `widths` agree) and its key gradients' stage (none where its
-    consumers share its keys, `split`), its two loads' barriers and its logits' stage where it has one."""
+    stage and dV's (dK's where the head `widths` agree) and its key gradients' stage (none where its sums
+    are stored after the walk, `split`), its two loads' barriers and its logits' stage where it has one."""
     keys, values, refs = refs[0], refs[1], refs[2:]
     if split:
         return keys, values, None, None, None, *refs
@@ -428,7 +448,8 @@ def _dkv_built(walk: _Backward, operands: tuple, treedef, shares: tuple, grades:
 
     def body(*refs, streams):
         inputs, unflattened, outputs, held, (key_refs, tile_refs) = _dkv_refs(
-            refs, treedef, treedef.num_leaves, graded, widths=value_width == width, split=split,
+            refs, treedef, treedef.num_leaves, graded, widths=value_width == width,
+            split=split or program.tiles.shared_dq,
             fused=walk.fused)
         (spans_of, score_refs, drop_of, l_ref), (dq_ref, dk_ref, dv_ref) = unflattened, outputs
         q_ref, k_ref, v_ref, do_ref, *stat_refs = inputs
@@ -482,8 +503,9 @@ def _dkv_built(walk: _Backward, operands: tuple, treedef, shares: tuple, grades:
             if stage is not None:
                 # The read turn's last phase, past the walk's last product, observed.
                 family.turn(stage[2], consumers, arrive=False)
-            if split:
-                # The consumers' sums, added in a scope after the walk's (`_summed_stored`).
+            if split or program.tiles.shared_dq:
+                # The consumers' sums, added (`_summed_stored`) or each its own stored (`_own_stored`), in a
+                # scope after the walk's.
                 return dk, dv, *key_sums
             out = (row, pl.ds(k_first, block_k), head)
             key_views = tuple(ref.at[*shared_place(ref.shape, row, head), pl.ds(k_first, block_k)]
@@ -502,7 +524,10 @@ def _dkv_built(walk: _Backward, operands: tuple, treedef, shares: tuple, grades:
 
     def entry(*refs):
         summed = family.scoped(functools.partial(body, *refs), *scoped, streams=rings)
-        if summed is not None:
+        if program.tiles.shared_dq:
+            dk_ref, dv_ref = refs[9 + treedef.num_leaves + walk.fused:][:2]
+            _own_stored(family, summed, (dk_ref, dv_ref), consumers, program.tiles.block_k)
+        elif summed is not None:
             first = 9 + treedef.num_leaves + walk.fused
             grads = refs[first:first + len(graded)]
             outputs = refs[first + len(graded):first + len(graded) + 2]
