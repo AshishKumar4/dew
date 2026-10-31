@@ -430,7 +430,7 @@ def summed_wide(x, w):
 
 @pytest.mark.skipif(jax.default_backend() != "cpu", reason="the suite's wide arithmetic is a CPU's")
 def test_check_1_runs_each_arm_as_its_users_sum_their_products():
-    """On the CPU lane check 1 runs each arm with fp32 products summed in fp32 (`_summed_as_run`), the
+    """On the CPU lane check 1 runs each arm with fp32 products summed in fp32 (`summed_as_run`), the
     truth outside that: Dew's product, which sums in float64 only under the suite's wide arithmetic, is
     judged as its users run it, so XLA's plain fp32 dot is on par with it; and against the same
     product kept to its float64 sums, the plain dot fails, so the truth is still float64's."""

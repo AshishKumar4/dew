@@ -205,7 +205,7 @@ SSD kernel's host check 1 without YNNPACK"). The empty list, not the documented 
 because compiler options take no such spelling and that one leaves a scan's reductions fused."""
 
 
-def _summed_as_run():
+def summed_as_run():
     """The scope a check runs each arm in (`_drawn`), the truth and its terms outside it: on the CPU lane,
     the process's default backend (`jax.default_backend()`), fp32 products summed in fp32
     (`dew.nn.precision.FP32_SUMS`), as an accelerator sums them and as a CPU does in any process but
@@ -1230,8 +1230,8 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
         nonlocal names, widths
         inputs = draw(seed)
         # The site's arms' mode, decided on its first draw's inputs before any arm runs, no draw of its own,
-        # on the programs the arms run (their scope, `_summed_as_run`).
-        with _summed_as_run():
+        # on the programs the arms run (their scope, `summed_as_run`).
+        with summed_as_run():
             _ynn_decided(label, [dew_fn, *arms], inputs)
         truth, terms = truth_and_terms(inputs)
         if reference_seeds is None:
@@ -1247,7 +1247,7 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
                 raise ValueError(f"orders of {len(ordered)}; an orbit holds the draw's own and another")
         rows = [None for _ in arms]
         for mine_at, theirs_at in ordered:
-            with _summed_as_run():
+            with summed_as_run():
                 dew = dew_fn(*mine_at)
             names = names or [jax.tree_util.keystr(path)
                               for path, _ in jax.tree_util.tree_leaves_with_path(dew)]
@@ -1260,7 +1260,7 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
                 # sizing); the library arm runs on Dew's own inputs.
                 here, true_here, terms_here = ((theirs_at, their_truth, their_terms) if arm is reference_fn
                                                else (mine_at, truth, terms))
-                with _summed_as_run():
+                with summed_as_run():
                     other = dew if dew_fn is arm and here is mine_at else arm(*here)
                 evidence = _evidence(prepared, other, true_here, shared=true_here is truth,
                                      their_terms=terms_here)
