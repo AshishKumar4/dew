@@ -24,7 +24,7 @@ from typing import Literal, TypeGuard, Union
 
 import numpy as np
 
-from dew._records import JSON, boolean, earlier_fields, integer, json_value, numbers, record
+from dew._records import JSON, boolean, integer, json_value, numbers, record, renamed_fields
 from dew.batch import Batch
 from dew.data.dataset import Loading
 from dew.data.pipeline import Dataset, Mixture, Phases, Piped, Pipeline, Stage
@@ -480,8 +480,8 @@ def _read_source(written: Mapping[str, object]) -> Source | Mixture | Phases:
         return Phases(tuple(_read_chain(record(child, "phase")) for child in phases),
                       tuple(None if end is None else integer(end, clock) for end in until),
                       "tokens" if clock == "until_tokens" else "steps")
-    # A store recorded with fields its class renamed since reads under today's names (`earlier_fields`).
-    return from_record(Source, earlier_fields(json_value(dict(written), "chain's store")))
+    # A store recorded with fields its class renamed since reads under today's names (`renamed_fields`).
+    return from_record(Source, renamed_fields(written))
 
 
 def _read_stage(written: Mapping[str, object]) -> Stage:

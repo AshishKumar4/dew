@@ -397,26 +397,6 @@ _LIMIT = re.compile(r"Limit\(count=(\d+)\)")
 """A limit's record in an order's stages (`Limit`'s repr)."""
 
 
-def earlier_lengths(previous: Mapping[str, object], source: JSON,
-                    derived: Mapping[str, str]) -> Mapping[str, object]:
-    """`previous`, a saved plan's derived order, with today's lengths of each token store an earlier Dew
-    stated none for (`derived`'s): a store whose producer stated no EOS, which it read as one stream, its
-    documents neither stated nor packed, so the plan's positions counted none of them; today's are the
-    producer's records (row 3028). The saved plan's `source` names its stores, in the order its derived
-    facts number them. Carried to 1.0 (ledger 1552)."""
-    held = dict(previous)
-    stores = source.get("sources") if isinstance(source, Mapping) else None
-    for index, store in enumerate(stores if isinstance(stores, list) else []):
-        name = f"{index}/lengths"
-        if not isinstance(store, Mapping) or store.get("store") != "tokens":
-            continue
-        stated = store.get("metadata")
-        eos = stated.get("eos_id") if isinstance(stated, Mapping) else None
-        if name not in held and name in derived and eos is None:
-            held[name] = derived[name]
-    return held
-
-
 def grown_limits(saved: dict[str, JSON] | list[JSON] | str | int | float | bool | None,
                  current: dict[str, JSON] | list[JSON] | str | int | float | bool | None
                  ) -> frozenset[tuple[str, str]] | None:
@@ -485,6 +465,11 @@ class Plan:
     """A mixture's members, each what it reads and runs as one digest under its key, and its own
     stages under the empty key (`dew.data.analysis._member_manifests`): what a streamed mix's
     resume reads of a member that joined or left (`check`)."""
+    earlier: tuple[Callable[[object], bool] | None, ...] = dataclasses.field(default=(), compare=False,
+                                                                             repr=False)
+    """For each source its manifest lists, whether a fingerprint an earlier Dew's plan names it by names
+    the records it reads (`dew.data.sources.base.Earlier`), None where it is one no Dew fingerprinted
+    otherwise; no part of the plan's record."""
     version: ClassVar[int] = 7
 
     def record(self) -> dict[str, JSON]:
@@ -561,10 +546,8 @@ class Plan:
         grown = grown_limits(saved_order, unplaced(current["order"])) if edited is None else frozenset()
         if grown is None:
             raise ValueError(f"saved data plan order changed: {saved.get('order')!r} -> {current['order']!r}")
-        saved_manifest = record(json_value(saved.get("manifest", {}), "saved data manifest"), "data manifest")
-        saved_source = json_value(saved_manifest.get("source"), "saved data source")
-        previous = earlier_lengths(record(saved.get("derived", {}), "saved derived order"), saved_source,
-                                   self.derived)
+        saved = self._read_as_today(saved)
+        previous = record(saved.get("derived", {}), "saved derived order")
         for name in sorted(set(previous) | set(self.derived)) if edited is None else ():
             if previous.get(name) != self.derived.get(name):
                 raise ValueError(f"saved data plan derived order {name} changed")
@@ -611,6 +594,28 @@ class Plan:
         if edited:
             _log.warning("resuming a mixture whose members changed: %s", ", ".join(edited))
         return changes + (edited or ())
+
+    def _read_as_today(self, saved: Mapping[str, object]) -> Mapping[str, object]:
+        """`saved` with each source an earlier Dew fingerprinted otherwise named as today's, where that
+        fingerprint names the records the source reads (`earlier`, `dew.data.sources.base.Earlier`), and its
+        lengths, which that Dew stated otherwise or not at all, today's: the same records' (row 3028). Its
+        derived facts number its sources as its manifest lists them."""
+        manifest = record(saved.get("manifest", {}), "saved data manifest")
+        source = record(manifest.get("source", {}), "saved data source")
+        stores = source.get("sources")
+        current = record(self.manifest.semantic().get("source", {}), "data source").get("sources")
+        if not isinstance(stores, list) or not isinstance(current, list) or len(stores) != len(current):
+            return saved
+        stores, derived = list(stores), dict(record(saved.get("derived", {}), "saved derived order"))
+        for index, (store, today, reading) in enumerate(zip(stores, current, self.earlier, strict=False)):
+            if store == today or reading is None or not reading(store):
+                continue
+            stores[index] = today
+            lengths = f"{index}/lengths"
+            if lengths in self.derived:
+                derived[lengths] = self.derived[lengths]
+        named = {**manifest, "source": {**source, "sources": stores}}
+        return {**saved, "manifest": named, "derived": derived}
 
     def _edited_members(self, saved: Mapping[str, object]) -> tuple[str, ...] | None:
         """How a streamed mix's members changed from `saved`'s, which a resume takes: members that

@@ -123,6 +123,14 @@ class ShardManifest:
 
 
 @runtime_checkable
+class Earlier(Protocol):
+    """A source an earlier Dew fingerprinted otherwise than today's, which says whether a fingerprint a plan
+    it saved names the source by names the records this source reads (`dew.data.plan.Plan.check`)."""
+
+    def earlier(self, saved: object) -> bool: ...
+
+
+@runtime_checkable
 class Source(Protocol):
     """A store a pipeline reads, and the read modes it supports."""
 

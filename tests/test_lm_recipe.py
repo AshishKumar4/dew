@@ -871,24 +871,37 @@ def test_a_packed_runs_record_loads_where_its_token_store_is_not(tmp_path):
     assert int(config.run().step) == 1
 
 
-@pytest.mark.parametrize("eos", [None, 0], ids=["no-eos", "eos"])
-def test_a_plan_an_earlier_dew_saved_over_a_token_store_resumes_as_its_documents_were_read(tmp_path, eos):
-    """An earlier Dew stated no document lengths for a token store whose producer stated no EOS: it read
-    the store as one stream and packed none of it, so a plan it saved counted none of its documents and
-    resumes where today's states the producer's records (row 3028). A store stating an EOS had its
-    lengths stated then, so a plan without them is another's, refused."""
-    corpus = write_token_corpus(tmp_path / "tokens", np.arange(1, 40) % 7, eos_id=eos)
-    # Read whole into memory, its source's lengths among its derived facts.
-    plan = compile(TokenFiles(corpus.train).batch(1), read="memory", loading=Loading(workers=0)).plan
-    assert "0/lengths" in plan.derived
-    earlier = dataclasses.replace(plan, derived={name: value for name, value in plan.derived.items()
-                                                 if name != "0/lengths"})
+@pytest.mark.parametrize(("documents", "eos", "resumes"), [
+    ([[1, 2, 3, 4, 5]], None, True),
+    ([[1, 2, 0], [3, 0], [4, 5, 0]], 0, True),
+    ([[1, 0, 2], [3, 4, 5]], 0, False),
+    ([[1, 2], [3, 4]], None, False),
+], ids=["one-record", "eos-closed", "eos-within", "records-without-eos"])
+def test_a_plan_an_earlier_dew_saved_over_a_token_store_resumes_where_it_read_the_same_documents(
+        tmp_path, documents, eos, resumes):
+    """A Dew before row 3028 read a token store's documents by its EOS, or, stating none, its whole stream
+    as one, and named the store by a fingerprint without its documents' reading. A plan it saved resumes
+    where it read the documents today's reads, the producer's records (`TokenFiles.earlier`): one record
+    with no EOS, or records each closed by the EOS alone. Where an EOS falls within a record, or records
+    without an EOS were one stream to it, it counted other documents in as many records, and is refused."""
+    from dew.data import Memory
+    from dew.data.sinks import export
+
+    url = str(tmp_path / "tokens")
+    stated = {"token_store": True, "tokenizer": "byte", "vocab_size": 256, "dtype": "int32", "eos_id": eos}
+    export(Memory([{"text": np.asarray(document, np.int32)} for document in documents]), url,
+           format="array_record", length_field="text", metadata=stated)
+    plan = compile(TokenFiles(url).batch(1), read="memory", loading=Loading(workers=0)).plan
+    saved = json.loads(json.dumps(plan.record()))
+    (fingerprint,) = saved["manifest"]["source"]["sources"]
+    assert fingerprint.pop("documents") == "records"
+    saved["derived"].pop("0/lengths")
     assert plan.check(plan.record()) == ()
-    if eos is None:
-        assert plan.check(earlier.record()) == ()
+    if resumes:
+        assert plan.check(saved) == ()
     else:
         with pytest.raises(ValueError):
-            plan.check(earlier.record())
+            plan.check(saved)
 
 
 @pytest.mark.parametrize("eos", [None, 0], ids=["no-eos", "eos"])

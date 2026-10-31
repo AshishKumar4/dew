@@ -9,11 +9,12 @@ from functools import cached_property
 import grain.python as grain
 import numpy as np
 
-from dew._records import integer
+from dew._records import integer, json_value
 from dew.data.dataset import Records
 from dew.data.pipeline import Dataset
 from dew.data.sources.base import (
     _COUNTS,
+    Earlier,
     Read,
     Shard,
     ShardManifest,
@@ -54,6 +55,15 @@ class Concatenate(Dataset):
 
     def fingerprint(self) -> Mapping[str, object]:
         return {"concatenate": [source.fingerprint() for source in self.sources]}
+
+    def earlier(self, saved: object) -> bool:
+        """Whether `saved` names these sources as an earlier Dew did, each by its own fingerprint or one an
+        earlier Dew gave it for the same records (`Earlier`)."""
+        parts = saved.get("concatenate") if isinstance(saved, Mapping) else None
+        return isinstance(parts, list) and len(parts) == len(self.sources) and all(
+            json_value(source.fingerprint(), "source fingerprint") == part
+            or (isinstance(source, Earlier) and source.earlier(part))
+            for source, part in zip(self.sources, parts, strict=True))
 
     def supports(self, read: Read) -> bool:
         return all(source.supports(read) for source in self.sources)

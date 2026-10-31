@@ -8,6 +8,7 @@ from functools import cached_property
 
 import numpy as np
 
+from dew._records import json_value
 from dew.batch import Batch
 from dew.data.dataset import Ranges, Records
 from dew.data.declared import Declared
@@ -119,6 +120,17 @@ class TokenRecords:
         return {name: value for name, value in self.__dict__.items() if name not in ("shards", "spans")}
 
 
+def _earlier_ends(tokens: TokenRecords) -> np.ndarray:
+    """Where a Dew before row 3028 ended a token store's documents, which it read by their EOS: just past
+    each, or at the stream's end for an unterminated tail; an empty stream holds none. Read only to resume a
+    plan it saved (`TokenFiles.earlier`). Carried to 1.0 (ledger 1552)."""
+    block = 1 << 24
+    found = [np.flatnonzero(tokens[start:start + block] == tokens.eos_id) + start + 1
+             for start in range(0, len(tokens), block)]
+    ends = np.concatenate([np.zeros(0, np.int64), *found]).astype(np.int64)
+    return ends if (ends[-1] if len(ends) else 0) == len(tokens) else np.append(ends, len(tokens))
+
+
 @dataclass(frozen=True)
 class TokenFiles(Dataset):
     """A committed token export (`dew.data.text.export_tokens`, `dew data export --tokenizer`): its
@@ -219,7 +231,25 @@ class TokenFiles(Dataset):
             "index": None,
             "shard_rows": None,
             "producer": export_content(self.committed),
+            # Its documents read as its producer's records (row 3028), as no Dew before read them.
+            "documents": "records",
         }
+
+    def earlier(self, saved: object) -> bool:
+        """Whether `saved`, the fingerprint a plan an earlier Dew saved names this store by, names the
+        documents this store reads: the fingerprint it gave before a token store's documents were its
+        producer's records (`"documents"`, row 3028), where it read them as they are: stating an EOS, each
+        ended just past one or at the stream's end (`_earlier_ends`); stating none, the whole stream one.
+        Read once, on resuming such a plan. Carried to 1.0 (ledger 1552)."""
+        before = {name: value for name, value in self.fingerprint().items() if name != "documents"}
+        if saved != json_value(before, "token store fingerprint"):
+            return False
+        tokens = self.tokens
+        if tokens.eos_id is not None:
+            read = _earlier_ends(tokens)
+        else:
+            read = np.asarray([len(tokens)] if len(tokens) else [], np.int64)
+        return np.array_equal(read, self.document_ends())
 
     def supports(self, read: Read) -> bool:
         return True
