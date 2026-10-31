@@ -127,8 +127,8 @@ class Scripted:
 DRAWS = {
     "rectangle": [7, 11, 5, 9, 0],
     "ellipse": [7, 11, 5, 9, 1],
-    "whole image": [12, 20, 12, 20, 0],
-    "at the far corner": [5, 3, 12, 20, 1],
+    "whole image": [12, 20, 6, 10, 0],
+    "at the far corner": [5, 3, 10, 19, 1],
     "empty": [0, 0, 0, 0, 0],
 }
 """Draws over a 12-wide, 20-high image: size (width, height), centre (x, y), then the shape, at its
