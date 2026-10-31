@@ -238,14 +238,20 @@ def loaded(copies, issued: jax.Array | bool = True) -> None:
         plgpu.barrier_wait(barrier)
 
 
+def column_chunks(value: jax.Array, width: int) -> list[tuple[int, jax.Array]]:
+    """`value` `width` of its columns at a time, each chunk with its first column, the whole where it is no
+    wider: a stage narrower than the tile it moves (CUTLASS's sub-tiled epilogue, `staged_columns`)."""
+    if width >= value.shape[-1]:
+        return [(0, value)]
+    return [(first, value[..., first:first + width]) for first in range(0, value.shape[-1], width)]
+
+
 def chunked(value: jax.Array, view, smem) -> list[tuple[jax.Array, Ref]]:
-    """`value` and its `view` a chunk of `smem`'s columns at a time, the whole where `smem` holds every one:
-    a stage narrower than the tile it moves (CUTLASS's sub-tiled epilogue, `staged_columns`)."""
+    """`value` and its `view` a chunk of `smem`'s columns at a time (`column_chunks`)."""
     width = smem.shape[-1]
     if width >= value.shape[-1]:
         return [(value, view)]
-    return [(value[..., first:first + width], view.at[..., pl.ds(first, width)])
-            for first in range(0, value.shape[-1], width)]
+    return [(piece, view.at[..., pl.ds(first, width)]) for first, piece in column_chunks(value, width)]
 
 
 def stored(parts, views, *, smem, wait: bool = True) -> None:
@@ -1129,14 +1135,14 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
                 smem = smems[output].at[index]
                 buffers, width = smem.shape[0], smem.shape[-1]
                 row_start, first, stored, column, *ladder = place
-                for chunk in range(value.shape[1] // width):
+                for chunk, (start, piece) in enumerate(column_chunks(value, width)):
                     if chunk == 0 or chunk >= buffers:
                         # The buffer's last store (the last tile's, at its first chunk) has read it.
                         plgpu.wait_smem_to_gmem(0, wait_read_only=True)
                     buffer = smem.at[chunk % buffers]
-                    buffer[...] = value[:, chunk * width:(chunk + 1) * width].astype(smem.dtype)
+                    buffer[...] = piece.astype(smem.dtype)
                     plgpu.commit_smem()
-                    store_rows(buffer, ref, row_start, first, stored, column + chunk * width, *ladder)
+                    store_rows(buffer, ref, row_start, first, stored, column + start, *ladder)
 
             @plgpu.nd_loop(tiles, collective_axes=axis, init_carry=jnp.int32(0))
             def ended(loop: plgpu.NDLoopInfo, carry):
