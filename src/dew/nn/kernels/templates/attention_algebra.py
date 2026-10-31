@@ -1664,7 +1664,9 @@ def split_delta(others: jax.Array, own: jax.Array, others_total: jax.Array, tota
     product with dO, as the reference's output is, so none overflows where the sums are near fp32's
     largest (a state's)."""
     over = jnp.where(shift < 0, 1.0, inverse(power2(total, -shift)))
-    state_weight = state_total * inverse(total)
+    # The state's weight in one division: past 2^126 a total's inverse is subnormal, which flushes to 0,
+    # and the state's share of D about the anchor with it (row 2466).
+    state_weight = jnp.where(total > 0, state_total / jnp.where(total > 0, total, 1.0), 0.0)
     cotangent = dout.astype(jnp.float32)
     anchor_value = anchor_value.astype(jnp.float32)
     anchor = jnp.sum(anchor_value * cotangent, axis=-1)

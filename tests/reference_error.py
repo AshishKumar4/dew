@@ -63,6 +63,7 @@ arithmetic in float64 is held to the oracle first, within the float64
 rounding of the computation itself (`assert_computes_the_oracle`).
 """
 
+import contextlib
 import dataclasses
 import functools
 import hashlib
@@ -76,6 +77,7 @@ import numpy as np
 from float64_terms import float64_terms
 
 from dew.accuracy import distance, reduction_bound, within
+from dew.nn.precision import FP32_SUMS
 
 FACTOR = 2.0
 
@@ -201,6 +203,23 @@ check 1 between the two across PARITY by host; without the fusions the verdicts 
 of different instruction sets, though the bits still part with the host (docs/performance.md, "The
 SSD kernel's host check 1 without YNNPACK"). The empty list, not the documented `-individual_dot`,
 because compiler options take no such spelling and that one leaves a scan's reductions fused."""
+
+
+def summed_as_run():
+    """The scope a check runs each arm in (`_drawn`), the truth and its terms outside it: on the CPU lane,
+    the process's default backend (`jax.default_backend()`), fp32 products summed in fp32
+    (`dew.nn.precision.FP32_SUMS`), as an accelerator sums them and as a CPU does in any process but
+    the suite's, whose wide arithmetic (`WIDE_CPU_ARITHMETIC`) sums Dew's products in float64, so the
+    gate measures each arm as its users run it; elsewhere the process's own precision. A Dew arm that
+    sums wide only under the suite's setting is no nearer float64 here than its users' runs are, and
+    no route is kept off a CPU for summing narrower than that setting. The preset is JAX's default dot
+    algorithm in it: every dot of no stated precision takes float32 operands, a bfloat16's exactly,
+    and sums them in float32, as a GPU's fp32-accumulated product does, and a loop's running sum of
+    them is the plain one (`compensates_loops`); the setting's widened reductions, which are not
+    product sums, stay."""
+    if jax.default_backend() == "cpu":
+        return jax.default_matmul_precision(FP32_SUMS)
+    return contextlib.nullcontext()
 
 
 def without_ynn(fn, **jit_options):
@@ -807,6 +826,103 @@ def _interval(mine: np.ndarray, theirs: np.ndarray | None = None, control: np.nd
     return float(np.quantile(ratios, tails[0])), float(np.quantile(ratios, 1 - tails[1]))
 
 
+def _typical(mine: np.ndarray, theirs: np.ndarray) -> float:
+    """The typical draw's RMS ratio: the geometric mean over draws of each draw's RMS ratio,
+    exp(mean(log sqrt(a / b))), draws where both arms are exactly float64 left out, and not a number where
+    one arm is exact on a draw and the other is not (a ratio no log holds). Where the arms round apart (fp32
+    sums, `summed_as_run`) each draw's error is the draw's own scale times each arm's own rounding, both
+    heavy-tailed across draws: the pooled ratio's sums are ruled by its few largest draws and resolve only
+    past thousands of seeds, while this ratio's logs are light-tailed and resolve in a few hundred. Its
+    mean log is unbiased for the log of a factor Dew's rounding holds on every draw (the arms exchangeable,
+    the mean of their logs' difference is the factor's log, whatever their own distribution), and the
+    ratio itself consistent for the factor, Jensen's exp(var/4n) above it at n draws (ledger 2469)."""
+    if np.any((mine > 0) != (theirs > 0)):
+        return float("nan")
+    kept = mine > 0
+    return float(np.exp(np.mean(0.5 * np.log(mine[kept] / theirs[kept])))) if kept.any() else 1.0
+
+
+def _typical_interval(mine: np.ndarray, theirs: np.ndarray,
+                      tails: tuple[float, float] = (LOWER_TAIL, UPPER_TAIL)) -> tuple[float, float]:
+    """`_typical`'s bootstrap interval over seeds, Dew's and the reference's errors resampled by the same
+    seeds, its lower and upper `tails` left out (`_interval`'s, on the draws' log ratios)."""
+    if np.any((mine > 0) != (theirs > 0)):
+        return float("nan"), float("nan")
+    kept = mine > 0
+    logs = np.where(kept, 0.5 * np.log(np.where(kept, mine, 1) / np.where(kept, theirs, 1)), 0.0)
+    picks = np.random.default_rng(0).integers(0, len(mine), (BOOTSTRAP, len(mine)))
+    means = logs[picks].sum(axis=1) / np.maximum(kept[picks].sum(axis=1), 1)
+    return float(np.exp(np.quantile(means, tails[0]))), float(np.exp(np.quantile(means, 1 - tails[1])))
+
+
+QUALIFYING_SPREAD = 0.40
+"""The most a leaf's draws' log RMS ratios (`_log_ratios`) may spread, their standard deviation, for its
+typical draw to pass it (`_typical_status`): at it and under it, check 1's tail test (`_tail_sign`) with the
+spread itself refuses Dew three times the reference's RMS error on a fifth of the draws in at least 95% of
+runs at 256 seeds and more, Dew as exact passing (/mnt/local/dew/retained/gate/check1-qualifying-sim.py,
+the gate's own functions; ledger 2469). A fault on some draws only widens the spread, so a leaf whose fault
+the tail test misses is held inconclusive by it."""
+TAIL_SHARE = 0.1
+"""The share of a leaf's draws, the farthest from their median, the tail test reads (`_tail_sign`)."""
+
+
+def _log_ratios(mine: np.ndarray, theirs: np.ndarray) -> np.ndarray | None:
+    """Each draw's log RMS ratio, half the log of Dew's squared error over the reference's, the draws where
+    both are exactly float64 left out; None where one arm is exact on a draw and the other is not."""
+    if np.any((mine > 0) != (theirs > 0)):
+        return None
+    kept = mine > 0
+    return 0.5 * np.log(mine[kept] / theirs[kept])
+
+
+def _tail_sign(ratios: np.ndarray) -> float:
+    """The tail test's p-value: of the draws in the farthest TAIL_SHARE of their log ratios from the median,
+    the count above it against Binomial(n, 1/2). Where the two arms are equally exact their roundings are
+    exchangeable about the typical ratio, so a draw is as likely above it as below whatever their spread
+    (distribution-free); Dew worse by a factor on some draws puts their tail above it."""
+    from scipy import stats
+
+    centred = ratios - np.median(ratios)
+    tail = centred[np.abs(centred) >= np.quantile(np.abs(centred), 1 - TAIL_SHARE)]
+    return float(stats.binom.sf(int(np.sum(tail > 0)) - 1, len(tail), 0.5))
+
+
+def _typical_status(mine: np.ndarray, theirs: np.ndarray,
+                    tails: tuple[float, float] = (LOWER_TAIL, UPPER_TAIL)) -> tuple[str, float, float, float,
+                                                                                    str]:
+    """A leaf's verdict by its draws' paired ratios, asked only where its pooled ratio leaves it
+    inconclusive: "pass" where the typical draw's ratio passes (`_typical`, its interval `_status`), the
+    draws' log ratios spread no wider than QUALIFYING_SPREAD (where the tail test sees a fault on a fifth of
+    the draws) and their tail is not above the median's (`_tail_sign`, at the lower tail), else
+    "inconclusive", never "over"; with the reason it is not passed. A pass certifies the typical draw's
+    ratio under PARITY and no fault the tail test sees at that spread."""
+    ratio, (low, high) = _typical(mine, theirs), _typical_interval(mine, theirs, tails)
+    ratios = _log_ratios(mine, theirs)
+    if ratios is None or _status(ratio, low, high) != "pass":
+        return "inconclusive", ratio, low, high, "the typical draw's ratio does not pass"
+    if (spread := float(np.std(ratios))) > QUALIFYING_SPREAD:
+        return ("inconclusive", ratio, low, high,
+                f"its draws' log ratios spread {spread:.2f}, past the {QUALIFYING_SPREAD} the tail test "
+                f"sees at")
+    if (tail := _tail_sign(ratios)) < tails[0]:
+        return "inconclusive", ratio, low, high, f"its draws' tail lies above their median (p {tail:.1e})"
+    return "pass", ratio, low, high, ""
+
+
+def _sized(mine: np.ndarray, theirs: np.ndarray, typical: bool = False) -> bool:
+    """Whether a paired sizing takes a leaf as sized by these draws, Dew's squared errors `mine` against
+    the reference's `theirs`: its pooled ratio's interval resolved (no wider than PARITY), or, with
+    `typical` (a leaf the pooled ratio does not size within MOST_SEEDS, `seeds_for`), its typical draw's
+    interval (`_typical_interval`) resolved, its draws' log ratios within QUALIFYING_SPREAD and their tail
+    not above their median (`_typical_status`)."""
+    low, high = _interval(mine, theirs)
+    if _resolves(low, high):
+        return True
+    ratios = _log_ratios(mine, theirs)
+    return (typical and ratios is not None and _resolves(*_typical_interval(mine, theirs))
+            and float(np.std(ratios)) <= QUALIFYING_SPREAD and _tail_sign(ratios) >= LOWER_TAIL)
+
+
 def _resolves(low: float, high: float) -> bool:
     """Whether a pooled ratio's interval is no wider than PARITY, so it tells an equally exact
     computation from one PARITY off."""
@@ -1251,8 +1367,10 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
         inputs = draw(seed)
         if not at:
             _of_its_seed(label, draw, seed, inputs)
-        # The site's arms' mode, decided on its first draw's inputs before any arm runs, no draw of its own.
-        _ynn_decided(label, [dew_fn, *arms], inputs)
+        # The site's arms' mode, decided on its first draw's inputs before any arm runs, no draw of its own,
+        # on the programs the arms run (their scope, `summed_as_run`).
+        with summed_as_run():
+            _ynn_decided(label, [dew_fn, *arms], inputs)
         truth, terms = truth_and_terms(inputs)
         if reference_seeds is None:
             their_inputs, their_truth, their_terms = inputs, truth, terms
@@ -1267,9 +1385,11 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
                 raise ValueError(f"orders of {len(ordered)}; an orbit holds the draw's own and another")
         rows = [None for _ in arms]
         for mine_at, theirs_at in ordered:
-            dew = dew_fn(*mine_at)
-            if not at and mine_at is ordered[0][0]:
-                _of_its_inputs(label, "Dew's arm", dew_fn, mine_at, dew)
+            # Each arm, and its replay on the same inputs, in the arithmetic arms run in (`summed_as_run`).
+            with summed_as_run():
+                dew = dew_fn(*mine_at)
+                if not at and mine_at is ordered[0][0]:
+                    _of_its_inputs(label, "Dew's arm", dew_fn, mine_at, dew)
             names = names or [jax.tree_util.keystr(path)
                               for path, _ in jax.tree_util.tree_leaves_with_path(dew)]
             widths = widths or tuple(int(np.shape(leaf)[-1]) if np.ndim(leaf) >= 2 else 0
@@ -1281,9 +1401,10 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
                 # sizing); the library arm runs on Dew's own inputs.
                 here, true_here, terms_here = ((theirs_at, their_truth, their_terms) if arm is reference_fn
                                                else (mine_at, truth, terms))
-                other = dew if dew_fn is arm and here is mine_at else arm(*here)
-                if not at and arm is reference_fn and arm is not dew_fn and here is ordered[0][1]:
-                    _of_its_inputs(label, "the reference", arm, here, other)
+                with summed_as_run():
+                    other = dew if dew_fn is arm and here is mine_at else arm(*here)
+                    if not at and arm is reference_fn and arm is not dew_fn and here is ordered[0][1]:
+                        _of_its_inputs(label, "the reference", arm, here, other)
                 evidence = _evidence(prepared, other, true_here, shared=true_here is truth,
                                      their_terms=terms_here)
                 rows[at_arm] = evidence if rows[at_arm] is None else [
@@ -1443,9 +1564,11 @@ def _judged(draws: _Draws, index: int, tails: tuple[float, float] = (LOWER_TAIL,
 
 
 def _judgement(draws: _Draws, label: str, tails: tuple[float, float] = (LOWER_TAIL, UPPER_TAIL), *,
-               contained: bool = True) -> tuple[list[Finding], list[Finding]]:
+               contained: bool = True, typical: bool = False) -> tuple[list[Finding], list[Finding]]:
     """Check 1's findings over `draws` (`assert_as_exact`): each leaf over PARITY (`_status`), a row or
-    a value it fails, and each leaf its draws leave inconclusive."""
+    a value it fails, and each leaf its draws leave inconclusive; with `typical` (a final verdict), a
+    leaf its pooled ratio leaves inconclusive passed by its typical draw where that decides
+    (`_typical_status`)."""
     over, unresolved = [], []
     for index, name in enumerate(draws.names):
         leaf, count = label + name, len(draws.mine)
@@ -1466,11 +1589,18 @@ def _judgement(draws: _Draws, label: str, tails: tuple[float, float] = (LOWER_TA
             status = _status(ratio, low, high, contained=contained)
             # The ratio's log from its sums' logs, finite where a sum or the ratio itself would overflow.
             measure = (log_sum(a) - log_sum(b)) / 2
+            found = None
+            if status == "inconclusive" and contained and typical:
+                # The pooled ratio's sums unresolved: its draws' paired ratios pass it where they qualify.
+                found = _typical_status(a, b, tails)
+                status = found[0]
             if status == "inconclusive":
                 unresolved.append(Finding(
                     leaf, "inconclusive", measure, f"{leaf}: inconclusive: the pooled ratio {ratio:.3f}'s "
-                    f"interval over {count} seeds is [{low:.3f}, {high:.3f}], wider than {PARITY}; give the "
-                    f"site larger inputs or more seeds (`seeds_for`)"))
+                    f"interval over {count} seeds is [{low:.3f}, {high:.3f}], wider than {PARITY}"
+                    + ("" if found is None else f", and the typical draw's {found[1]:.3f}'s "
+                       f"[{found[2]:.3f}, {found[3]:.3f}]: {found[4]}")
+                    + "; give the site larger inputs or more seeds (`seeds_for`)"))
             elif status == "over":
                 over.append(Finding(leaf, "pooled", measure, f"{leaf}: dew's RMS error from float64 is "
                                     f"{ratio:.3f} times the reference's over {count} seeds, interval "
@@ -1543,7 +1673,9 @@ def _staged(drawn, seeds: int, label: str, *,
                       for index in range(len(draws.names)))
     if further:
         draws = draws.joined(drawn(seeds, (1 + REDRAW) * seeds))
-    return (*_judgement(draws, label, tails, contained=two_stage), 2 if further else 1)
+    # The stage drawn by the pooled ratio alone; the final verdict's leaves it leaves inconclusive asked of
+    # their typical draw (`_judgement`'s `typical`).
+    return (*_judgement(draws, label, tails, contained=two_stage, typical=two_stage), 2 if further else 1)
 
 
 STAGES_LOG = "DEW_CHECK1_STAGES"
@@ -1584,6 +1716,38 @@ class _SiteTerms:
         return terms
 
 
+def _cancelling_terms(draw, truth):
+    """The truth program a site's rows are sized by their terms with (`assert_as_exact`'s `terms`), where
+    its truth holds a row of float64 zero (below RESOLUTION of its leaf) on its first draw, decided from the
+    truth alone before any arm runs (bible §7, ledger 2851): a row whose truth is exactly zero or cancels is
+    judged at the size of what it sums, as the one-draw rule judges it, not held to the reference's residue
+    there (a fused attention's causal first row, whose one key makes its gradient exactly zero in float64,
+    its rounding's residue Dew's and the reference's alike). None where no row is zero, or where the
+    truth is not a JAX program its terms can be traced from (run as given, recorded, a window loop's)."""
+    if truth is None or isinstance(truth, _Windowed) or _given(truth) or getattr(truth, "recorded", False):
+        return None
+    with jax.enable_x64(new_val=True):
+        leaves = [np.asarray(leaf) for leaf in jax.tree.leaves(truth(*widened(draw(0))))]
+    # Every row of a leaf of rank two or more, sized as check 1 sizes it: zero below RESOLUTION.
+    if not np.any(_LaidTruths.of(leaves).sizes == 0):
+        return None
+    # Its terms read once, on the same draw: only a zero row whose terms are not zero too gains a size,
+    # so a site whose zero rows sum nothing (a query that keeps no key) keeps the reference's residue rule
+    # without tracing its terms a draw. A truth whose program cannot be traced op by op (host work on its
+    # values, NumPy or torch; a kernel chosen at float64 that refuses it) has no terms: it keeps the residue
+    # rule and runs as it always has, its own run reporting any failure of its own.
+    try:
+        with jax.enable_x64(new_val=True):
+            truths, terms = float64_terms(truth, *widened(draw(0)))
+    except Exception as untraced:
+        traced = f"untraced: {type(untraced).__name__}"
+    else:
+        plain, termed = _LaidTruths.of(jax.tree.leaves(truths)), _LaidTruths.of(
+            jax.tree.leaves(truths), _term_leaves(terms, truths))
+        traced = bool(np.any((plain.sizes == 0) & (termed.sizes > 0)))
+    return truth if traced is True else None
+
+
 def _site(dew_fn, reference_fn, label: str, *, seeds: int, truth_fn, library_fn, library_row, library_leaves,
           also, terms):
     """A check 1 site's arguments held to what it may ask (`assert_as_exact`): its term program, the
@@ -1617,7 +1781,7 @@ def _site(dew_fn, reference_fn, label: str, *, seeds: int, truth_fn, library_fn,
 def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn=None,
                     orders=None, library_fn=None, library_row: int | None = None,
                     library_leaves: Sequence[str] = (), also: Mapping[str, Callable] | None = None,
-                    terms: bool | Callable = False) -> None:
+                    terms: bool | Callable | None = None) -> None:
     """Check 1 of the gate: on par. Each leaf's RMS error from float64,
     pooled over the site's declared seeds, within PARITY times the reference's, and its worst row over
     those seeds within ROW_FACTOR times the reference's worst (NARROW_FACTORS' factor at rows of one or
@@ -1672,7 +1836,9 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     paired with Dew's arm (`_arms`), and a plain Dew arm,
     whose compilation its pairing decides, takes references of one kind, plain or `as_given`.
 
-    `terms` sizes each row by the larger of its float64 truth's RMS and its terms' (owner, 10-29): the
+    `terms` sizes each row by the larger of its float64 truth's RMS and its terms' (owner, 10-29); by
+    default (None) a site whose truth holds a row of float64 zero on its first draw is sized so
+    (`_cancelling_terms`, ledger 2851), False never: the
     truth program, `truth_fn` or the reference's, evaluated op by op with each output's terms
     (`float64_terms`), as the one-draw rule sizes a row that cancels (`row_errors`). A row whose truth
     cancels, exactly or but for one term holding most of its weight (an attention row that keeps one key),
@@ -1693,6 +1859,8 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     (tests/certified.py)."""
     terms_fn, also = _site(dew_fn, reference_fn, label, seeds=seeds, truth_fn=truth_fn, library_fn=library_fn,
                            library_row=library_row, library_leaves=library_leaves, also=also, terms=terms)
+    if terms_fn is None and terms is not False:
+        terms_fn = _cancelling_terms(draw, truth_fn if truth_fn is not None else reference_fn)
     narrow_leaves: list[str] = []
     _refuse_numpy_arms(draw, dew_fn, reference_fn, *([] if library_fn is None else [library_fn]),
                        *also.values())
@@ -1875,22 +2043,34 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
         if not wide:
             return count
         count *= 2
+    if dew_fn is not None:
+        # The leaves the pooled ratio does not size within `most`, its draws ruled by their largest (each arm
+        # rounding apart, ledger 2469), sized by their typical draw on the draws already held, every other
+        # leaf by its pooled ratio as before: the first count at which each is.
+        stubborn, count = tuple(wide), max(start, FEWEST_SEEDS)
+        while count <= most:
+            wide = _confirmed(drawn.names, drawn.theirs, count, drawn.mine, typical=stubborn)
+            if not wide:
+                return count
+            count *= 2
     compared = "the reference compared with itself" if dew_fn is None else "Dew paired with the reference"
     raise AssertionError(f"{label}: {compared} does not resolve {PARITY} within {most} seeds at {wide[:4]}; "
                          f"give the site larger inputs or fewer shared factors")
 
 
-def _confirmed(names, theirs: np.ndarray, count: int, mine: np.ndarray | None = None) -> list[str]:
+def _confirmed(names, theirs: np.ndarray, count: int, mine: np.ndarray | None = None,
+               typical: tuple = ()) -> list[str]:
     """The leaves `seeds_for` leaves unresolved at `count`: on the count's own block of draws or on the
     next block of as many (`seeds_for`'s confirmation), each judged as the sizing judges it: paired,
     `mine` Dew's squared errors against the reference's (`theirs`, seed by leaf) on the same draws, or
-    the reference compared with itself (`_unresolved_against_itself`, each block twice the count)."""
+    the reference compared with itself (`_unresolved_against_itself`, each block twice the count); the
+    leaves named in `typical` sized by their typical draw too (`_sized`)."""
     wide: list[str] = []
     for start in (0, count) if mine is not None else (0, 2 * count):
         if mine is not None:
             held, ours = theirs[start:start + count], mine[start:start + count]
             unresolved = [name for index, name in enumerate(names) if np.sum(held[:, index]) > 0
-                          and not _resolves(*_interval(ours[:, index], held[:, index]))]
+                          and not _sized(ours[:, index], held[:, index], name in typical)]
         else:
             unresolved = _unresolved_against_itself(theirs[start:start + 2 * count], names, count)
         wide += [name for name in unresolved if name not in wide]

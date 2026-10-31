@@ -11,6 +11,7 @@ import torch
 from one_draw import assert_as_exact_as_the_reference, assert_leaves_as_exact
 from reference_error import (
     FACTOR,
+    MOST_SEEDS,
     PARITY,
     REDRAW,
     GateFailure,
@@ -28,6 +29,8 @@ from reference_error import (
     seeds_for,
     widened,
 )
+
+from dew.nn.precision import accumulated
 
 
 @pytest.mark.skipif(jax.default_backend() != "cpu", reason="WITHOUT_YNN is XLA:CPU's")
@@ -329,15 +332,18 @@ def cancelling_draw(seed):
 def test_check_1_sizes_a_cancelling_row_by_its_terms_and_admits_nothing_else():
     """Term sizing (`assert_as_exact`'s `terms`, owner 10-29): a row whose truth cancels exactly, Dew's an
     ulp or so off its zero where the reference's sum cancels to it, is judged at its terms' size by the
-    row rule and admitted, where without terms it fails as a row of float64 zero against the reference's
+    row rule and admitted, by default too, its truth holding a row of float64 zero (`_cancelling_terms`,
+    ledger 2851), where without terms (False) it fails as a row of float64 zero against the reference's
     exact zero; and nothing else is: a dropped term in that row is refused, a residue on rows whose terms
     are zero too (no size) is refused as a row of float64 zero, and a truth with no terms (run as given)
     is refused at the site."""
     reference = cancelling(split=False)
     assert_as_exact(cancelling(split=True), reference, cancelling_draw, "a cancelling dot", seeds=16,
                     terms=True)
+    assert_as_exact(cancelling(split=True), reference, cancelling_draw, "by default", seeds=16)
     with pytest.raises(GateFailure):
-        assert_as_exact(cancelling(split=True), reference, cancelling_draw, "untermed", seeds=16)
+        assert_as_exact(cancelling(split=True), reference, cancelling_draw, "untermed", seeds=16,
+                        terms=False)
     with pytest.raises(GateFailure):
         assert_as_exact(cancelling(split=True, leak=True), reference, cancelling_draw, "a leaked term",
                         seeds=16, terms=True)
@@ -474,6 +480,36 @@ def test_check_1_sizes_a_row_that_cancels_behind_its_final_sum_by_the_sites_own_
     with pytest.raises(ValueError):
         assert_as_exact(mixed(cancelling(split=True)), reference, cancelling_draw, "another tree", seeds=16,
                         terms=lambda x, w: mixed_terms(x, w)["rows"])
+
+
+def long_dot_draw(seed):
+    """A [16, 4096] by [4096, 8] fp32 dot's operands: sums long enough that fp32's own rounding of them is
+    several times the half ulp of a float64 sum rounded once."""
+    rng = np.random.default_rng([1698, seed])
+    return (jnp.asarray(rng.standard_normal((16, 4096)), jnp.float32),
+            jnp.asarray(rng.standard_normal((4096, 8)), jnp.float32))
+
+
+def dews_product(x, w):
+    """Dew's product (`accumulated`): in the suite's wide CPU arithmetic, float64 sums rounded once."""
+    return accumulated(jnp.matmul, x, w)
+
+
+def summed_wide(x, w):
+    """Dew's product stating a precision of its own inside its arm, so it keeps the float64 sums."""
+    with jax.default_matmul_precision("highest"):
+        return dews_product(x, w)
+
+
+@pytest.mark.skipif(jax.default_backend() != "cpu", reason="the suite's wide arithmetic is a CPU's")
+def test_check_1_runs_each_arm_as_its_users_sum_their_products():
+    """On the CPU lane check 1 runs each arm with fp32 products summed in fp32 (`summed_as_run`), the
+    truth outside that: Dew's product, which sums in float64 only under the suite's wide arithmetic, is
+    judged as its users run it, so XLA's plain fp32 dot is on par with it; and against the same
+    product kept to its float64 sums, the plain dot fails, so the truth is still float64's."""
+    assert_as_exact(jnp.matmul, dews_product, long_dot_draw, "as its users sum", seeds=16)
+    with pytest.raises(GateFailure):
+        assert_as_exact(jnp.matmul, summed_wide, long_dot_draw, "summed wide", seeds=16)
 
 
 def test_further_references_judge_one_dew_arm_each_by_its_own_check_once_a_draw():
@@ -1014,7 +1050,10 @@ def test_check_one_is_inconclusive_where_its_seeds_cannot_resolve_the_factor():
     """Errors set seed by seed, alike on every host: Dew's squared error is 4 on even seeds and 0.01 on
     odd ones, the reference's 1 on each, so the pooled ratio (1.42) is under PARITY but its interval
     straddles it and is wider than it over 8 seeds and over the second stage's 40 alike: inconclusive,
-    never a pass. Fewer seeds than FEWEST_SEEDS are inconclusive whatever they read."""
+    never a pass. Its draws' paired ratios do not pass it either: their log ratios spread past
+    QUALIFYING_SPREAD (`_typical_status`, ledger 2469). Fewer seeds than FEWEST_SEEDS are inconclusive
+    whatever they read."""
+    from reference_error import _interval, _status, _typical_status
     def errors(seed):
         return (np.zeros(64, np.float32), np.full(64, 2.0 if seed % 2 == 0 else 0.1, np.float32),
                 np.ones(64, np.float32))
@@ -1031,6 +1070,9 @@ def test_check_one_is_inconclusive_where_its_seeds_cannot_resolve_the_factor():
     def truth(x, mine, theirs):
         return {"y": x}
 
+    mine, theirs = np.asarray([4.0, 0.01] * 20), np.ones(40)
+    assert _status(math.sqrt(2.005), *_interval(mine, theirs)) == "inconclusive"
+    assert _typical_status(mine, theirs)[4].startswith("its draws' log ratios spread")
     with pytest.raises(Inconclusive):
         assert_as_exact(dew, reference, errors, "straddling", seeds=8, truth_fn=truth)
     with pytest.raises(Inconclusive):
@@ -1985,3 +2027,80 @@ def test_a_leaf_read_from_its_rows_distances_is_the_leaf_read_whole():
                     leaf_summary(np.zeros((0, 4), np.float32), np.zeros((0, 4))))
     for field in ("mse", "worst", "zero_rows", "finite"):
         np.testing.assert_array_equal(getattr(empty, field), getattr(exact, field), err_msg=field)
+
+
+def rounding_apart(seed):
+    """A draw whose two arms round apart, as two programs under fp32 sums do (ledger 2469): a value, its
+    scale (lognormal, sigma 3, as a draw's conditioning sets it) and each arm's own rounding's size on it
+    (lognormal, sigma 0.2, each arm's own, so the draws' log RMS ratios spread about 0.28)."""
+    rng = np.random.default_rng([2469, seed])
+    return (rng.standard_normal(64).astype(np.float32), np.float32(np.exp(rng.normal(0, 3.0))),
+            np.exp(rng.normal(0, 0.2, 2)).astype(np.float32))
+
+
+def rounded_apart(arm: int, factor: float = 1.0, *, every: int = 1):
+    """`rounding_apart`'s arm `arm`: its value plus its own rounding, the draw's scale times its size times a
+    fixed pattern of its own; Dew's `factor` times further on every `every`th draw's value (by its first
+    element's bits)."""
+    @as_given
+    def run(x, scale, sizes):
+        pattern = np.random.default_rng([arm, int(np.asarray(x).view(np.uint32)[0])]).standard_normal(x.shape)
+        hit = int(np.asarray(x).view(np.uint32)[0]) % every == 0
+        return np.asarray(x, np.float64) + scale * sizes[arm] * 1e-7 * pattern * (factor if hit else 1.0)
+    return run
+
+
+def exact_value(x, scale, sizes):
+    return np.asarray(x, np.float64)
+
+
+def test_arms_rounding_apart_are_judged_by_the_typical_draw_and_a_fault_on_it_or_on_a_minority_is_refused():
+    """Where two arms round apart (each draw's error the draw's scale, heavy-tailed, times each arm's own
+    rounding), the pooled ratio does not resolve within MOST_SEEDS, and a final verdict it leaves
+    inconclusive asks the draws' paired ratios (`_typical_status`, ledger 2469): an equally exact pair,
+    its log ratios spread within QUALIFYING_SPREAD, passes at the count it sizes; a Dew twice off on every
+    draw is refused by its typical draw; one ten times off on a tenth of its draws, which the typical
+    draw's ratio leaves under PARITY, is refused by the spread its fault adds."""
+    from reference_error import _interval, _resolves, _typical_status
+
+    reference = rounded_apart(1)
+    seeds = seeds_for(reference, rounding_apart, "rounding apart", truth_fn=exact_value,
+                      dew_fn=rounded_apart(0))
+    # The pooled ratio does not resolve even at MOST_SEEDS: its sums are ruled by their largest draws.
+    def squared(arm, seed):
+        x, scale, sizes = rounding_apart(seed)
+        return float(np.mean((arm(x, scale, sizes) - exact_value(x, scale, sizes)) ** 2))
+
+    most = [[squared(arm, seed) for seed in range(MOST_SEEDS)] for arm in (rounded_apart(0), reference)]
+    low, high = _interval(*(np.asarray(errors) for errors in most))
+    assert high > PARITY * low and seeds <= MOST_SEEDS
+    assert_as_exact(rounded_apart(0), reference, rounding_apart, "rounding apart", seeds=seeds,
+                    truth_fn=exact_value)
+    with pytest.raises(GateFailure):
+        assert_as_exact(rounded_apart(0, 2.0), reference, rounding_apart, "twice off", seeds=seeds,
+                        truth_fn=exact_value)
+    with pytest.raises(GateFailure):
+        assert_as_exact(rounded_apart(0, 10.0, every=10), reference, rounding_apart, "a tenth ten times off",
+                        seeds=seeds, truth_fn=exact_value)
+    # Dew a hundred times the reference's squared error on 13 of 256 draws, equal on the rest: the pooled
+    # ratio 2.46, unresolved, the typical draw's ratio under PARITY; the spread of its log ratios refuses it.
+    mine, theirs = np.where(np.arange(256) < 13, 100.0, 1.0), np.ones(256)
+    assert not _resolves(*_interval(mine, theirs))
+    assert _typical_status(mine, theirs)[4].startswith("its draws' log ratios spread")
+
+
+def test_a_leaf_the_second_stage_finds_over_is_over_whatever_its_first_stages_typical_draw():
+    """The second stage is drawn by the pooled ratio alone, and its typical draw asked only of a final
+    verdict the pooled ratio leaves inconclusive: a leaf whose first 32 seeds straddle PARITY (Dew's squared
+    error 4 and 0.01 by turns, the reference's 1), whose typical draw would pass them, and whose further
+    seeds read 4, is over at the second stage."""
+    from reference_error import NO_ZERO_ROWS, _Draws, _staged
+
+    def drawn(start, stop):
+        count = stop - start
+        dew = np.asarray([4.0 if seed >= 32 or seed % 2 == 0 else 0.01 for seed in range(start, stop)])
+        return _Draws(["leaf"], dew[:, None], np.ones((count, 1)), np.zeros((count, 1, 2)),
+                      [[NO_ZERO_ROWS]] * count, np.ones((count, 1), bool), (0,))
+
+    over, unresolved, stage = _staged(drawn, 32, "over later")
+    assert stage == 2 and [finding.leaf for finding in over] == ["over laterleaf"] and not unresolved

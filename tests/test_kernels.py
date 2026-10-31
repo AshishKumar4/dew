@@ -28,7 +28,7 @@ from dew.nn.attention import scaled_dot_product_attention, weighted_values
 from dew.nn.attention_blocks import NormalAttention
 from dew.nn.kernels.selection import KernelRefused
 from dew.nn.kernels.templates import attention as template
-from dew.nn.precision import FP32_SUMS, at_least_fp32
+from dew.nn.precision import FP32_SUMS, WIDE_CPU_ARITHMETIC, at_least_fp32
 
 pytestmark = pytest.mark.kernel
 
@@ -838,25 +838,6 @@ def single_query_cudnn_decode_matches_float64_attention_and_gradients(without_de
 
 
 @pytest.mark.skipif(jax.default_backend() != 'cpu', reason="the float64 sum is a CPU's")
-def test_cpu_fp32_attention_rounds_closer_to_float64_than_jax_nn():
-    """Over 2048 keys of cross-attention-like inputs, Dew's fp32 attention on
-    XLA:CPU, its products summed in float64 (`dew.nn.precision.accumulated`),
-    is at most three quarters of jax.nn's xla distance from float64 (torch's
-    SDPA sits between, docs/performance.md)."""
-    rng = np.random.default_rng(0)
-    query, key = (rng.normal(size=(1, length, 2, 128)).astype(np.float32) * 0.6 for length in (128, 2048))
-    value = rng.normal(size=(1, 2048, 2, 128)).astype(np.float32)
-    q, k, v = (np.asarray(x, np.float64) for x in (query, key, value))
-    logits = np.einsum('btnh,bsnh->bnts', q, k) / np.sqrt(128)
-    probs = np.exp(logits - logits.max(-1, keepdims=True))
-    truth = np.einsum('bnts,bsnh->btnh', probs / probs.sum(-1, keepdims=True), v)
-    dew = scaled_dot_product_attention(query, key, value)
-    plain = jax.nn.dot_product_attention(query, key, value, implementation='xla')
-    mine, theirs = distance(dew, truth), distance(plain, truth)
-    assert mine <= 0.75 * theirs, (mine, theirs)
-
-
-@pytest.mark.skipif(jax.default_backend() != 'cpu', reason="the float64 sum is a CPU's")
 def test_cpu_fp32_attention_summed_in_float64_takes_forward_mode():
     """fp32 reference attention over 300 keys, whose products a CPU sums in float64
     (`dew.nn.precision.accumulated`), as a consistency model's JVP runs it under
@@ -885,6 +866,25 @@ def test_cpu_fp32_attention_summed_in_float64_takes_forward_mode():
     names = ("out", "tangent", "dq", "dk", "dv")
     for name, got, want, exact in zip(names, found, theirs, truth, strict=True):
         assert_as_exact_as_the_reference(np.asarray(got), np.asarray(want), np.asarray(exact), name)
+
+
+@pytest.mark.parametrize(("dtype", "key_dtype"), [(jnp.float16, jnp.float16), (jnp.float32, jnp.float64),
+                                                   (jnp.float64, jnp.float64)],
+                         ids=["float16", "float32-over-float64", "float64"])
+def test_a_call_jax_nn_cannot_take_on_a_cpu_runs_the_reference_path(dtype, key_dtype, monkeypatch):
+    """A call named onto jax.nn's xla kernel that it cannot take on a CPU, a float16 one (XLA's CPU compiler
+    has no F16_F16_F32 dot), a float32 query over float64 keys (jax.nn takes one dtype) or a float64 one
+    (jax.nn takes its softmax in float32, a float64 run's attention in float32 precision), hands off
+    (`attention_kernels.XLA_SUPPORTS`): it compiles and runs, its output the reference path's bit for
+    bit. (A process's own CPU arithmetic: the suite's wide one hands every xla call on, `XLA_SUPPORTS`.)"""
+    monkeypatch.delenv(WIDE_CPU_ARITHMETIC, raising=False)
+    with jax.enable_x64(new_val=True):
+        query, key, value = (jax.random.normal(jax.random.key(seed), (1, 16, 2, 8), kind)
+                             for seed, kind in zip(range(3), (dtype, key_dtype, key_dtype), strict=True))
+        named, reference = (jax.jit(functools.partial(scaled_dot_product_attention, implementation=name,
+                                                      causal=True))(query, key, value)
+                            for name in ("xla", "reference"))
+    np.testing.assert_array_equal(np.asarray(named), np.asarray(reference))
 
 
 def test_a_layer_that_builds_its_mask_is_on_par_with_the_reference_path():
@@ -968,14 +968,18 @@ def test_the_reference_path_is_flax_attention_op_for_op(dtype, forced, dropout_r
                     f"rate {dropout_rate}", seeds=FLAX_SEEDS, truth_fn=flax(softmax_in_fp32=False))
 
 
-@pytest.mark.skipif(jax.default_backend() != 'cpu', reason="the routing is a CPU's")
+@pytest.mark.skipif(jax.default_backend() != 'cpu', reason="'auto' takes jax.nn's xla kernel on a CPU")
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16, jnp.float16])
 @pytest.mark.parametrize("implementation", ["auto", "xla"])
-def test_a_cpu_attention_over_one_key_moves_no_query_or_key(implementation, dtype):
-    """A query that reads one key attends it whatever the scores, so its query's and its key's
-    gradients are exactly zero, as the softmax's own derivative gives them: on a CPU 'auto' and 'xla'
-    take the reference path in every dtype, where jax.nn's backward, through rowsum(dO * O), left
-    each a rounding's worth."""
+def test_an_attention_over_one_key_moves_no_query_or_key(implementation, dtype, monkeypatch):
+    """A query that reads one key attends it whatever the scores, so its query's and its key's gradients are
+    exactly zero, as the softmax's own derivative gives them and torch's does: through jax.nn's xla kernel
+    too, jitted. Its softmax differentiates `exp(x - max) / sum` by default, whose g / e - g e / e^2 is zero
+    only where that key's e is exactly 1, and XLA:CPU contracts the scaled logit and the subtraction of the
+    max into one FMA, which leaves e at 1 +- a rounding of the logit (2e-7 of gradient in float32, run op by
+    op there is none); `_fused_attention` takes jax's textbook derivative (`jax.softmax_custom_jvp`). (A
+    process's own CPU arithmetic: the suite's wide one hands every xla call on, `XLA_SUPPORTS`.)"""
+    monkeypatch.delenv(WIDE_CPU_ARITHMETIC, raising=False)
     keys = jax.random.split(jax.random.key(3), 4)
     query = jax.random.normal(keys[0], (2, 5, 4, 8), dtype)
     key, value = (jax.random.normal(drawn, (2, 7, 4, 8), dtype) for drawn in keys[1:3])
