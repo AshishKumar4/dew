@@ -97,9 +97,9 @@ def template_case(tokenizer, end: int, observation_role: str, *, reasoning: bool
 
 
 def audit_template(name: str, end_token: str | None) -> dict:
-    from transformers import AutoTokenizer
+    from dew.data.text import load_tokenizer
 
-    tokenizer = AutoTokenizer.from_pretrained(name)
+    tokenizer = load_tokenizer(name)
     end = tokenizer.convert_tokens_to_ids(end_token) if end_token else tokenizer.eos_token_id
     if end is None:
         raise ValueError("the tokenizer names no EOS; pass --end-token")
