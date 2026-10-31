@@ -147,11 +147,17 @@ class Mma(mosaic.Family):
         return min(depth, 8 * max(32 // (jnp.dtype(self.dtype).itemsize * 8), 1))
 
     def rhs_fragment_depth(self, depth: int, *, transposed: bool = False) -> int:
-        del transposed
-        return self.fragment_depth(depth)
+        # A transposed stage's rows are its depth: a load takes a whole swizzle tile of it (`products`).
+        return self._staged_depth(depth) if transposed else self.fragment_depth(depth)
 
     def lhs_fragment_depth(self, depth: int) -> int:
-        return self.fragment_depth(depth)
+        return self._staged_depth(depth)
+
+    def _staged_depth(self, depth: int) -> int:
+        """The depth a load of a stage whose rows are `depth` deep takes: one swizzle tile of the widest
+        swizzle its row bytes allow (`swizzled`, `_depth_granule`), the whole depth where it is narrower."""
+        itemsize = jnp.dtype(self.dtype).itemsize
+        return min(depth, plgpu.find_swizzle(depth * itemsize * 8) // itemsize)
     most_shared = 163 * 1024  # sm80's and sm87's opt-in block (sm86's and sm89's 99 KiB)
     copies_vectors = False  # cp.async spreads a copy over the warpgroup's threads, 128 elements at least
     reduction_scratch = plgpu.CompilerParams().reduction_scratch_bytes  # its kernels' default parameters
