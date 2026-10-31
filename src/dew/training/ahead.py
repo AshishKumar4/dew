@@ -25,8 +25,9 @@ A run's plan is the fewest microbatches at the least recomputation that fit, whi
 plan steps fastest, a rung that recomputes more at fewer microbatches or the plan's own, the GPUs alone
 tell. `--trainer.compile-ahead.frontier`, with each GPU's memory stated, lists past the plan each rung
 above it at its fewest microbatches that fit (`compile_ahead`'s `frontier`); tools/benchmark_step.py
-times each on the GPUs (a case's remat, head tile and batch read in the split's microbatches), and the
-run names the fastest by its own remat, head and microbatches. No run times plans of its own.
+times each on the GPUs, a case at its remat and head tile, a plan of s microbatches as its microbatch's
+rows accumulated s times (`accumulation`), whose s calls a step a split plan's are, and the run names the
+fastest by its model's remat, `--trainer.split` and `LMObjective.head_tile`. No run times plans itself.
 """
 
 from __future__ import annotations

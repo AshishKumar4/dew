@@ -617,19 +617,19 @@ class FitSearch[LossT, EffectsT]:
         return found, probes
 
     def above(self, candidates: Sequence[int]) -> None:
-        """Each rung above the objective's, at the fewest of `candidates` that fit there, compiled and kept in
-        `frontier` until a rung fits none: a rung that recomputes more takes no more microbatches than the
-        one below it needs, so each searches up to its split alone. The objective is left at the last."""
+        """Each rung above the objective's at the fewest of `candidates`, the admitted plan's splits and
+        fewer, that fit there, compiled and kept in `frontier`: a rung that fits at none of them recomputes
+        more at more microbatches than the plan, which no speed favours. A remat rung takes the run's own
+        head again (`recompute_more`), so it may need more microbatches than the tiled head below it, and
+        the search reads every rung to the ladder's end. The objective is left at the last."""
         while self.onward(lambda: recompute_more(self.objective, self.base)):
             asked = len(self.probes)
             fewest = planned(candidates, 0, self.fits_here, lambda: False,
                              lambda split: self.forecast.likely(self.rung(), split))
-            if fewest is None:
-                return
-            assert self.frontier is not None
-            self.frontier.append(next(probe for probe in self.probes[asked:] if probe.fits
-                                      and probe.split == fewest))
-            candidates = candidates[:candidates.index(fewest) + 1]
+            if fewest is not None:
+                assert self.frontier is not None
+                self.frontier.append(next(probe for probe in self.probes[asked:] if probe.fits
+                                          and probe.split == fewest))
 
     def derived_start(self, split: int) -> None:
         """Move the objective to the least-recompute rung whose derived footprint at `split`, the run's
