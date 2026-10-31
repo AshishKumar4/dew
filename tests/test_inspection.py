@@ -496,10 +496,10 @@ def test_a_sampled_step_summarizes_its_trained_forward_at_no_forward_more(name):
 
 
 def test_a_watched_summary_over_given_positions_is_their_statistics():
-    """Watched with the positions a summary reads (`watching`'s `positions`, `[rows, tokens]`), a module's
+    """Watched with the positions a summary reads (`watched_positions`, `[rows, tokens]`), a module's
     output is summarized over those positions alone, every feature of each, as its statistics over them
     are; an output whose leading axes are no `[rows, tokens]` is summarized whole."""
-    from dew.nn.inspection import INSPECTED, SOWN, watching
+    from dew.nn.inspection import INSPECTED, SOWN, watched_positions, watching
 
     class Mapped(nn.Module):
         @nn.compact
@@ -511,7 +511,7 @@ def test_a_watched_summary_over_given_positions_is_their_statistics():
     variables = Mapped().init(jax.random.key(0), values)
 
     def summarized(variables, values, positions):
-        with watching(("Dense", "Mapped"), positions=positions):
+        with watching(("Dense", "Mapped")), watched_positions(positions):
             output, sown = Mapped().apply(variables, values, mutable=[INSPECTED])
         inner = nn.Dense(3).apply({"params": variables["params"]["inner"]}, values)
         return sown[INSPECTED], inner, statistics(output)
@@ -524,25 +524,63 @@ def test_a_watched_summary_over_given_positions_is_their_statistics():
     assert jax.tree.map(float, sown[SOWN]) == jax.tree.map(float, whole)
 
 
-def test_a_language_models_watched_layers_read_none_of_its_padding():
-    """A language model's watched layers summarize their outputs at its real tokens alone (row 2324): two
-    rows padded past their text, once with one pad id and once with another, whose causal forward is the
-    same at every real token and differs at the padding, give the same summary of each MLP to the bit."""
+def padding_invariant_summaries(tail, *, packed: bool = False, pipelined: bool = False) -> dict[str, float]:
+    """A language model's watched MLP summaries over eight rows, two padded past their text: the pad id
+    `tail` fills them, or, `packed`, its coordinates mark them unreal (no pad id) and `tail` is what
+    they hold; `pipelined`, over two stages of two microbatches."""
     from model_support import TINY_DECODER
 
+    from dew.batch import coordinates
     from dew.objectives.lm import LMObjective
     from dew.registry import models
+    from dew.training import MeshSpec
 
-    def summaries(pad: int) -> dict[str, float]:
-        model = models.build("causal_transformer", vocab_size=64, **TINY_DECODER, num_kv_heads=2)
-        run = Trainer(LMObjective(model, 16, pad_id=pad), optax.sgd(RATE), key=jax.random.key(0),
-                      inspection=Inspection(modules=("layers_*/mlp",), targets=("params",)))
-        tokens = np.random.default_rng(1).integers(1, 63, size=(8, 17)).astype(np.int32)
-        tokens[1, 10:], tokens[6, 3:] = pad, pad
-        return {name: value for name, value in inspected(run, {"text": tokens}).items() if "/mlp/" in name}
+    model = models.build("causal_transformer", vocab_size=64, **{**TINY_DECODER, "num_layers": 4},
+                         num_kv_heads=2)
+    staged = ({"microbatches": 2, "mesh": MeshSpec(fsdp=2, stage=2).build(jax.devices()[:4])} if pipelined
+              else {})
+    run = Trainer(LMObjective(model, 16, pad_id=None if packed else tail), optax.sgd(RATE),
+                  key=jax.random.key(0), inspection=Inspection(modules=("*MLP",), targets=("params",)),
+                  **staged)
+    tokens = np.random.default_rng(1).integers(1, 63, size=(8, 17)).astype(np.int32)
+    real = np.ones(tokens.shape, bool)
+    real[1, 10:], real[6, 3:] = False, False
+    tokens[~real] = tail
+    batch = {"text": tokens, **({"text_coordinates": coordinates(valid=real, xp=np)} if packed else {})}
+    return {name: value for name, value in inspected(run, batch).items() if "activations" in name}
 
-    first, second = summaries(0), summaries(63)
-    assert len(first) >= 12 and first == second
+
+@pytest.mark.parametrize("layout", ["padded", "packed"])
+def test_a_language_models_watched_layers_read_none_of_its_padding(layout):
+    """A language model's watched layers summarize their outputs at its real tokens alone (row 2324): two
+    rows padded past their text, once with one id and once with another, whose causal forward is the
+    same at every real token and differs at the padding, give the same summary of each MLP to the bit,
+    the padding marked by the pad id or by the batch's coordinates."""
+    packed = layout == "packed"
+    first, second = (padding_invariant_summaries(pad, packed=packed) for pad in (0, 63))
+    assert len(first) >= 24 and first == second
+
+
+@pytest.mark.mesh(devices=4)
+def test_a_pipelined_language_models_watched_layers_read_none_of_its_padding():
+    """Pipelined over two stages of two microbatches, each microbatch's summary of a watched layer reads
+    that microbatch's real tokens alone: the two pad ids give the same summaries to the bit."""
+    first, second = (padding_invariant_summaries(pad, pipelined=True) for pad in (0, 63))
+    assert len(first) >= 48 and first == second
+
+
+def test_a_preference_runs_watched_layers_are_summarized():
+    """A preference pair objective's watched layers are summarized at its sampled step (row 2324): its
+    chosen and rejected rows, scored as one batch, read from what its scorer prepared."""
+    from objective_cases import preference_pairs
+
+    from dew.training import MeshSpec
+
+    objective, batch = preference_pairs()
+    run = Trainer(objective, optax.sgd(RATE), key=jax.random.key(0), mesh=MeshSpec().build(jax.devices()[:1]),
+                  inspection=Inspection(modules=("*MLP",), targets=("params",)))
+    watched = {name.rsplit("/", 1)[1] for name in inspected(run, batch) if "activations" in name}
+    assert {"mean", "std", "abs_max", "non_finite"} <= watched
 
 
 @pytest.mark.mesh(devices=4)
