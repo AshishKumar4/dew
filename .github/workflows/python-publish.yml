@@ -1,19 +1,19 @@
-name: Publish to PyPI
+name: Publish a release
 
-# Releases only. Pushes to main must not ship untested code to PyPI.
+# Releases only. Pushes to main ship nothing.
 #
 # A release publishes only what passed on its own commit: the whole CI
 # (lint, package and the suite on armada) runs here on the release's commit,
 # and its package job builds the wheel and sdist, installs them into an empty
 # environment, compiles them, runs their `dew` entry point and trains, then
-# hands that same artifact to the publish job, which uploads it without a rebuild.
+# hands that same artifact to the publish job, which attaches it to the release
+# without a rebuild.
 #
-# Trusted publishing: PyPI accepts this workflow's short-lived OIDC token, so
-# the repository holds no PyPI secret. PyPI's project `dewml` names this
-# repository, this workflow file and the `pypi` environment as its publisher
-# (for the first release, a pending publisher on the account that will own
-# the project). Only the publish job can mint the token, and it runs no code
-# from the repository.
+# Dew's package index, https://pypi.dewml.dev/simple, takes the release from
+# those assets (AshishKumar4/jax's publish-package workflow, run with this
+# release's tag): dewml installs from there beside Dew's JAX build, which PyPI
+# does not hold. PyPI's dewml is a pointer that installs nothing and names the
+# index (0.1.1), so no release goes to PyPI.
 on:
   release:
     types: [published]
@@ -45,15 +45,14 @@ jobs:
   publish:
     needs: [ci, tag]
     runs-on: ubuntu-latest
-    environment:
-      name: pypi
-      url: https://pypi.org/p/dewml
     permissions:
-      id-token: write
+      contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:
           name: dist
           path: dist/
-      - name: Publish
-        uses: pypa/gh-action-pypi-publish@release/v1
+      - name: Attach the tested sdist and wheel to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY"
