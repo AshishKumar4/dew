@@ -453,7 +453,7 @@ def test_a_release_runs_question_budgets_name_where_each_came_from(tmp_path):
     question budget, which its config states, and Laya's option budget, which its config leaves unstated
     and Laya's code fixes at 48 tokens (`LAYA_BUDGETS`), so the release reads as Laya reads it; a budget
     the run states is the run's."""
-    from test_run_options import TINY_LAYA, decision
+    from run_kinds import TINY_LAYA, decision
 
     run = decision(tmp_path, drawn=False)
     assert run.pretrained == str(TINY_LAYA)
