@@ -10,9 +10,6 @@ SSD, `recurrence_states` at Tiles(16, 3, None, 1): 96 of its 202 live registers 
 its need 200)."""
 
 
-import tempfile
-from pathlib import Path
-
 import kernel_compile
 import kernel_liveness
 import pytest
@@ -277,15 +274,12 @@ def test_the_pass_reads_no_more_than_ptxas_holds_an_attention_backward():
         def case(models: dict):
             return KernelCase("backward", lambda: (backward, (query, key, key, query, shapes)), models)
 
-        # Compiled once as the gate compiles a case (`kernel_compile._compiled_here`): the pass's count by
-        # launch (`_lowered_models`) and each launch's PTX's least spill-free cap by ptxas (`register_need`).
-        record = {"name": "backward", "generation": "sm90", "models": {}}
-        with tempfile.TemporaryDirectory() as directory:
-            kernel_compile._compiled(case(models), "sm90", record, directory)
-            lowered = kernel_compile._lowered_models(record, kernel_compile.mosaic_kernels(record), "sm90",
-                                                      models)
-            need = {path.stem: kernel_compile.register_need(path.read_text(), "sm90")
-                    for path in Path(directory).glob("*.ptx")}
-    checked = [(name, model.registers, need.get(name)) for name, model in lowered.items()]
-    assert checked and all(found is not None for _, _, found in checked), (checked, sorted(need))
+        # The pass's count by launch (`lowered_models`) and each launch's least spill-free cap by ptxas
+        # (`least`, `kernel_compile.register_need`).
+        (record,) = kernel_compile.compile_mosaic_kernels([case(models)], "sm90", least=True)
+    lowered = record.get("lowered_models", {})
+    least = {kernel_compile.report.launch_name(kernel["kernel"], kernel["launch"]): kernel["least"]
+             for kernel in record["kernels"]}
+    checked = [(name, model["registers"], least.get(name)) for name, model in lowered.items()]
+    assert checked and all(found is not None for _, _, found in checked), (checked, sorted(least))
     assert all(registers <= found for _, registers, found in checked), checked

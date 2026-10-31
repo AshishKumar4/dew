@@ -801,11 +801,20 @@ def _stores_shared(op) -> bool:
     if name == "nvvm.stmatrix":
         return True
     if name in ("llvm.store", "vector.store", "memref.store", "vector.transfer_write"):
-        return any("<3>" in str(operand.type) or "#gpu.address_space<workgroup>" in str(operand.type)
-                   for operand in op.operands)
+        return any(_shared(operand.type) for operand in op.operands)
     return (name == "llvm.inline_asm" and "asm_string" in op.attributes
             and re.search(r"\bst(matrix)?\.(.*\.)?shared", ir.StringAttr(op.attributes["asm_string"]).value)
             is not None)
+
+
+SHARED = re.compile(r"^!llvm\.ptr<3>$|^memref<.*,\s*(3|#gpu\.address_space<workgroup>)>$")
+"""A type in shared memory: an LLVM pointer of address space 3, or a memref whose memory space is 3 or the
+workgroup's."""
+
+
+def _shared(kind) -> bool:
+    """Whether `kind` (a type) addresses shared memory (`SHARED`)."""
+    return SHARED.match(str(kind)) is not None
 
 
 def _fences_shared_for_products(op) -> bool:
