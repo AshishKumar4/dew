@@ -397,6 +397,37 @@ _LIMIT = re.compile(r"Limit\(count=(\d+)\)")
 """A limit's record in an order's stages (`Limit`'s repr)."""
 
 
+def earlier_lengths(previous: Mapping[str, object], saved: Sequence[object], current: Sequence[object],
+                    derived: Mapping[str, str]) -> Mapping[str, object]:
+    """`previous`, a saved plan's derived order, with today's lengths (`derived`'s) of each source a Dew
+    before row 3028 stated none for (`_unstated_lengths`), where the plan names the source as today's does
+    (`saved` and `current`, its manifest's sources then and now, numbered as its derived facts number
+    them), so its documents are the ones that Dew read (`TokenFiles._read_alike`). Carried to 1.0 (ledger
+    1552)."""
+    held = dict(previous)
+    for index, (store, today) in enumerate(zip(saved, current, strict=False)):
+        name = f"{index}/lengths"
+        if (name not in held and name in derived and store == today and isinstance(today, Mapping)
+                and _unstated_lengths(today)):
+            held[name] = derived[name]
+    return held
+
+
+def _unstated_lengths(source: Mapping[str, object]) -> bool:
+    """Whether a Dew before row 3028 stated no lengths for the source fingerprinted `source`: a token store
+    stating no EOS, which it read as one stream, a concatenation holding one, whose lengths are its parts'
+    together, or a slice of records of either, whose lengths are its source's sliced."""
+    if source.get("store") == "tokens":
+        stated = source.get("metadata")
+        return isinstance(stated, Mapping) and stated.get("eos_id") is None
+    sliced = source.get("of")
+    if source.get("selection") == "slice" and isinstance(sliced, Mapping):
+        return _unstated_lengths(sliced)
+    parts = source.get("concatenate")
+    return isinstance(parts, list) and any(isinstance(part, Mapping) and _unstated_lengths(part)
+                                           for part in parts)
+
+
 def grown_limits(saved: dict[str, JSON] | list[JSON] | str | int | float | bool | None,
                  current: dict[str, JSON] | list[JSON] | str | int | float | bool | None
                  ) -> frozenset[tuple[str, str]] | None:
@@ -525,7 +556,7 @@ class Plan:
         if (not self.manifest.exact or not saved.get("exact", False)) and resume != "non-exact":
             raise ValueError(
                 "data plan contains a step without stable identity or a store given no name "
-                "(from_grain(..., name=), from_iter(..., name=)); resume='non-exact' is required"
+                "(from_grain(..., identity=), from_iter(..., identity=)); resume='non-exact' is required"
             )
         edited = self._edited_members(saved)
         # A mix whose members changed is compared member by member (`_edited_members`): each kept
@@ -541,7 +572,12 @@ class Plan:
         grown = grown_limits(saved_order, unplaced(current["order"])) if edited is None else frozenset()
         if grown is None:
             raise ValueError(f"saved data plan order changed: {saved.get('order')!r} -> {current['order']!r}")
-        previous = record(saved.get("derived", {}), "saved derived order")
+        saved_sources = record(record(saved.get("manifest", {}), "saved data manifest").get("source", {}),
+                               "saved data source").get("sources")
+        sources = record(self.manifest.semantic().get("source", {}), "data source").get("sources")
+        previous = earlier_lengths(record(saved.get("derived", {}), "saved derived order"),
+                                   saved_sources if isinstance(saved_sources, list) else [],
+                                   sources if isinstance(sources, list) else [], self.derived)
         for name in sorted(set(previous) | set(self.derived)) if edited is None else ():
             if previous.get(name) != self.derived.get(name):
                 raise ValueError(f"saved data plan derived order {name} changed")

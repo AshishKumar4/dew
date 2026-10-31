@@ -23,7 +23,7 @@ from dew.nn.precision import Dtypes, Numerics
 from dew.nn.vision import GemmaProjector, SiglipVision
 from dew.optim import OptimConfig
 from dew.registry import Aliases, ModelConfig, projectors, towers
-from dew.training import Checkpoints, Layout, MeshSpec, Wandb
+from dew.training import Checkpoints, Layout, LocalTracker, MeshSpec, Wandb
 
 
 @pytest.mark.parametrize("dataset", ["tfds", "arrayrecord_shards"])
@@ -363,10 +363,9 @@ def test_train_scores_every_named_validation_split(tmp_path):
               "test": lambda partition: iter([{"x": held["x"], "y": held["y"] + 1}])}
     run.train(Regression(), Loader(lambda partition: batches(), None, None, 8), name="splits",
               validation=splits)
-    rows = [json.loads(line) for line in
-            (tmp_path / "runs" / "splits" / "tracking" / "scalars.jsonl").read_text().splitlines()]
-    val, test = ({row["step"]: row["scalars"][f"{split}/loss"]
-                  for row in rows if f"{split}/loss" in row["scalars"]} for split in ("val", "test"))
+    reports = LocalTracker(tmp_path / "runs" / "splits" / "tracking").scalars()
+    val, test = ({step: values[f"{split}/loss"] for step, values in reports if f"{split}/loss" in values}
+                 for split in ("val", "test"))
     assert sorted(val) == sorted(test) == [1, 2]
     assert all(test[step] > val[step] for step in val), "the shifted test targets score a higher loss"
 
@@ -394,6 +393,27 @@ def test_train_runs_the_trainer_its_config_describes(tmp_path):
     assert state.scale is not None
     assert state.accumulation is not None
     assert any(path.is_file() for path in trace.rglob("*"))
+
+
+def test_a_saved_runs_profile_window_reads_its_capture_options_as_its_captures(tmp_path):
+    """A run saved while its profile window held its capture's options as its own fields
+    (`host_tracer_level`, `python_tracer_level`, `activity_cap`) loads with them its capture's
+    (`ProfileWindow.capture`, row 2932), so it captures as it did."""
+    from dew.telemetry.profile import CaptureOptions
+    from dew.training import ProfileWindow
+
+    capture = CaptureOptions(host_tracer_level=1, python_tracer_level=1, activity_cap=7)
+    window = ProfileWindow(str(tmp_path / "trace"), 3, capture=capture)
+    path = tmp_path / "run" / "run.json"
+    assert RunConfig(trainer=TrainerConfig(profile=window)).save(str(tmp_path / "run")) == str(path)
+    record = json.loads(path.read_text())
+    # A field that declares its class exactly is the record of its fields; a union's is a class record.
+    trainer = record["fields"]["trainer"]
+    written = trainer.get("fields", trainer)["profile"]
+    saved = written.get("fields", written)
+    saved.update(saved.pop("capture"))
+    path.write_text(json.dumps(record))
+    assert RunConfig.load(str(path)).trainer.profile == window
 
 
 class _Bucket:

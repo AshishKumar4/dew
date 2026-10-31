@@ -32,6 +32,7 @@ from dew.diffusion.presets import Flow
 from dew.inference import TextToImage
 from dew.inputs import Condition, Field, InputSpec
 from dew.interop import load_params
+from dew.training import LocalTracker
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -294,8 +295,8 @@ def test_sft_diffusion_gemma_images_smoke_trains_on_two_splits_and_captions_the_
                  if real]
     assert sorted(captioned) == sorted(ids["test"])
     run = tmp_path / "checkpoints" / "flowers-caption"
-    journal = [json.loads(row) for row in (run / "tracking" / "scalars.jsonl").read_text().splitlines()]
-    losses = [row["scalars"]["train/loss"] for row in journal if "train/loss" in row["scalars"]]
+    losses = [values["train/loss"] for _, values in LocalTracker(run / "tracking").scalars()
+              if "train/loss" in values]
     assert len(losses) == 4 and all(math.isfinite(loss) for loss in losses)
     checkpoints = Checkpoints(str(run))
     early, _ = checkpoints.restore(step=2)

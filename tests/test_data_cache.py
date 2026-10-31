@@ -1004,7 +1004,7 @@ def test_views_before_a_cache_of_a_grain_store_missing_inputs_read_its_present_o
 
     loading = Loading(workers=0, threads=1, read_buffer=1)
     records = [None if index == 2 else {"id": index} for index in range(6)]
-    source = from_grain(grain.MapDataset.source(records), name="missing-two")
+    source = from_grain(grain.MapDataset.source(records), identity="missing-two")
 
     def batches(cache):
         stepped = Pipeline(source).shuffle(1).map(Offset(10))
@@ -1325,8 +1325,8 @@ def test_an_empty_stream_publishes_an_empty_generation():
     from dew.data.pipeline import Pipeline
     from dew.data.sources import from_iter
 
-    generation = publish(Pipeline(from_iter(lambda: iter(()), name="empty@1", replay=True)).map(Offset(1)),
-                         _cache(), read="streamed")
+    empty = from_iter(lambda: iter(()), identity="empty@1", replay=True)
+    generation = publish(Pipeline(empty).map(Offset(1)), _cache(), read="streamed")
     assert len(generation) == 0
 
 
@@ -1858,7 +1858,8 @@ def test_a_named_stream_that_holds_other_inputs_than_its_generation_is_refused_u
     from dew.data.pipeline import Pipeline
 
     def stream(count):
-        return from_iter(lambda: iter([{"id": index} for index in range(count)]), name="rows@1", replay=True)
+        return from_iter(lambda: iter([{"id": index} for index in range(count)]), identity="rows@1",
+                         replay=True)
 
     generation = publish(_tagged(Pipeline(stream(10))), _cache(), read="streamed")
     trained, _ = Pipeline(stream(12)).holdout(0.25)
@@ -1895,8 +1896,8 @@ def test_a_records_holdout_over_a_stream_filled_generation_of_a_dataset_read_in_
     from dew.data.pipeline import Pipeline
 
     rows = [{"id": index} for index in range(12)]
-    source = (from_grain(grain.MapDataset.source(rows), name="rows@1") if store == "grain"
-              else from_hf(datasets.Dataset.from_list(rows), name="rows@1"))
+    source = (from_grain(grain.MapDataset.source(rows), identity="rows@1") if store == "grain"
+              else from_hf(datasets.Dataset.from_list(rows), identity="rows@1"))
     generation = publish(_tagged(Pipeline(source)), _cache(), read="streamed")
     parts = Pipeline(source).holdout(records=5)
     uncached = [_tags(_tagged(part)) for part in parts]
