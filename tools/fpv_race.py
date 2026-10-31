@@ -265,17 +265,26 @@ def teacher(out: Path, *, seconds: float = 6600.0, drones: int = 4096, hz: float
     return report
 
 
-def demonstrations(simulator, objective, variables, steps: int, capacity: int):
+def demonstrations(simulator, objective, variables, steps: int, capacity: int, chunk: int = 1000):
     """The teacher's greedy flight from every drone of `simulator` for `steps` steps, recorded in the
-    agent's convention, as a replay of `capacity` steps a drone the online agent goes on writing."""
+    agent's convention, as a replay of `capacity` steps a drone the online agent goes on writing. The flight
+    is written `chunk` steps at a time into the replay, which each write updates in place: a whole flight's
+    record beside the replay would hold its 96-pixel images several times over (16 drones' 18,000 steps
+    took the G4's 96 GB)."""
     from dew.rl.replay import ReplayBuffer
     from dew.rl.simulator import DrivenSimulator, simulator_rollout, simulator_start
 
     driven = DrivenSimulator(simulator)
-    _, taken = simulator_rollout(driven, teacher_policy(objective), variables,
-                                 simulator_start(driven, jax.random.key(3)), steps, reset=False)
-    stream = {**taken.observation, "action": taken.action}
-    return ReplayBuffer.empty(jax.tree.map(lambda leaf: leaf[0], stream), capacity).add(stream)
+    carry, replay = simulator_start(driven, jax.random.key(3)), None
+    added = jax.jit(lambda replay, stream: replay.add(stream), donate_argnums=0)
+    for start in range(0, steps, chunk):
+        carry, taken = simulator_rollout(driven, teacher_policy(objective), variables, carry,
+                                         min(chunk, steps - start), reset=False)
+        stream = {**taken.observation, "action": taken.action}
+        if replay is None:
+            replay = ReplayBuffer.empty(jax.tree.map(lambda leaf: leaf[0], stream), capacity)
+        replay = added(replay, stream)
+    return replay
 
 
 def _written(path: Path, text: str) -> None:
