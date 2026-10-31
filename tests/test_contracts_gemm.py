@@ -73,8 +73,8 @@ def test_a_grouped_gemm_holds_every_order(edge):
     """The GEMM template's grouped product (`template.gemm`, its custom derivative through
     `generation.linear_tangent`): every order runs in the rows and the matrices, the group sizes not
     differentiable, finite wherever float64 is a normal float32 and wherever the plain grouped product is
-    (each row's product with its group's matrix, by a mask, its float64 run the truth: XLA's ragged product
-    takes no reverse over reverse), at values whose products near float32's ends."""
+    (each row's product with its group's matrix, by a mask, its float64 run the truth), at values whose
+    products near float32's ends."""
     sizes = jnp.asarray([3, 0, 5], jnp.int32)
     groups = jnp.repeat(jnp.arange(3), sizes, total_repeat_length=8)
     primals = normal_draw(146, (8, 16), (3, 16, 4), scale=EDGES[edge])
@@ -87,9 +87,8 @@ def test_a_grouped_gemm_holds_every_order(edge):
     def plain(rows, matrices):
         return jnp.einsum("rg,rk,gkn->rn", jax.nn.one_hot(groups, 3, dtype=rows.dtype), rows, matrices)
 
-    # Its reverse over reverse does not run (ledger 2650); that row's head adds the order with its fix.
     assert_contract(grouped, primals, direction, cotangent, f"a grouped GEMM {edge}", truth_fn=plain,
-                    plain_fn=plain, without=("grad of grad",))
+                    plain_fn=plain)
 
 
 GROUPS = jnp.asarray([3, 0, 5], jnp.int32)
@@ -107,7 +106,7 @@ def test_a_portable_grouped_projection_holds_every_order(edge):
     """`grouped_matmul.portable_projection` (its custom derivative, the rounded operands' products): every
     order finite wherever float64 is a normal float32 and the masked grouped product as written is. Near the
     largest its primal overflows a partial sum the masked product does not (ledger 2711), that row's head
-    adds the edge; it takes no reverse over reverse (XLA's ragged product, ledger 2650)."""
+    adds the edge."""
     from dew.nn.kernels import grouped_matmul
 
     primals = normal_draw(1564, (8, 16), (3, 16, 4), scale=EDGES[edge])
@@ -117,8 +116,7 @@ def test_a_portable_grouped_projection_holds_every_order(edge):
         return grouped_matmul.portable_projection(rows, matrices, GROUPS, None, None)
 
     assert_contract(projected, primals, direction, cotangent, f"a portable grouped projection {edge}",
-                    truth_fn=masked_grouped_product, plain_fn=masked_grouped_product,
-                    without=("grad of grad",))
+                    truth_fn=masked_grouped_product, plain_fn=masked_grouped_product)
 
 
 def rms_producer(lhs, scale):
