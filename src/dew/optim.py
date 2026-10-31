@@ -36,6 +36,7 @@ import tyro
 from dew._hashing import fmix32
 from dew._records import share
 from dew.held_updates import refuse_untold, update_applied
+from dew.laprop import bias_corrected, laprop
 from dew.mesh import LogicalAxes
 from dew.newton_schulz import (
     NEWTON_SCHULZ,
@@ -774,80 +775,6 @@ def delta_gradient_descent(learning_rate: float | optax.Schedule) -> optax.Gradi
     return optax.GradientTransformationExtraArgs(init_fn, update_fn)
 
 
-def clip_by_agc(clip: float = 0.3, floor: float = 1e-3) -> optax.GradientTransformation:
-    """Adaptive gradient clipping (Brock et al., arXiv 2102.06171) as DreamerV3's code takes it
-    (embodied/jax/opt.py:109-123): each parameter's update scaled down until its norm is at most `clip`
-    times the parameter's own, which `floor` keeps from reaching zero with the parameter (a bias drawn at
-    zero still moves), one norm over the whole array. A `clip` of 0 clips nothing. The update reads the
-    parameters."""
-    if not clip:
-        return optax.identity()
-
-    def update_fn(updates, state, params=None):
-        if params is None:
-            raise ValueError("adaptive gradient clipping reads the parameters, so its update needs them")
-
-        def clipped(param, update):
-            limit = clip * jnp.maximum(floor, jnp.linalg.norm(param.ravel()))
-            return update * (1 / jnp.maximum(1.0, jnp.linalg.norm(update.ravel()) / limit))
-
-        return jax.tree.map(clipped, params, updates), state
-
-    return optax.GradientTransformation(lambda params: optax.EmptyState(), update_fn)
-
-
-def _dreamer_rate(count: jax.typing.ArrayLike) -> jax.Array:
-    """DreamerV3's learning rate after `count` updates (agent.py:342-379, configs.yaml `opt`): 4e-5, ramped
-    linearly from zero over the first 1000 updates. Formed in the run's own float dtype, where optax's
-    `linear_schedule` returns float32 whatever the run's, its ramp off by 1e-5 of itself at the start."""
-    return jnp.minimum(count, 1000) * (4e-5 / 1000)
-
-
-def scale_by_laprop(b1: float = 0.9, b2: float = 0.999, eps: float = 1e-20) -> optax.GradientTransformation:
-    """LaProp's direction (Ziyin et al., arXiv 2002.04839) as DreamerV3's code forms it
-    (embodied/jax/opt.py:126-164): each gradient over the root of its bias-corrected mean square (decay
-    `b2`, `eps` added outside the root), then the bias-corrected momentum of decay `b1` of those quotients.
-    Adam divides the momentum of the gradients; LaProp takes the momentum of the divided ones. Both bias
-    corrections form in double (`_bias_corrected`). The state is `optax.ScaleByAdamState`'s, its moments in
-    float32 at least, as the code keeps them."""
-
-    def moments(params):
-        return jax.tree.map(lambda param: jnp.zeros(param.shape, at_least_fp32(param.dtype)), params)
-
-    def init_fn(params):
-        return optax.ScaleByAdamState(count=jnp.zeros([], jnp.int32), mu=moments(params), nu=moments(params))
-
-    def update_fn(updates, state, params=None):
-        del params  # LaProp reads only the gradients
-        count = optax.safe_increment(state.count)
-
-        def widened(update, moment):
-            # A gradient narrower than its moments is widened before either reads it.
-            return update.astype(jnp.promote_types(update.dtype, moment.dtype))
-
-        updates = jax.tree.map(widened, updates, state.nu)
-        nu = optax.tree.update_moment_per_elem_norm(updates, state.nu, b2, 2)
-        normalized = jax.tree.map(lambda update, mean_square: update / (jnp.sqrt(mean_square) + eps), updates,
-                                  _bias_corrected(nu, b2, count))
-        mu = optax.tree.update_moment(normalized, state.mu, b1, 1)
-        return _bias_corrected(mu, b1, count), optax.ScaleByAdamState(count=count, mu=mu, nu=nu)
-
-    return optax.GradientTransformation(init_fn, update_fn)
-
-
-def laprop(learning_rate: float | optax.Schedule | None = None, b1: float = 0.9, b2: float = 0.999,
-           eps: float = 1e-20, agc: float = 0.3) -> optax.GradientTransformation:
-    """DreamerV3's optimizer (dreamerv3/agent.py:342-379): the update clipped adaptively to `agc` of each
-    parameter's norm (`clip_by_agc`), LaProp's direction of it (`scale_by_laprop`, momentum `b1`, mean
-    square `b2`, `eps`), stepped at `learning_rate`. Where that is None it is the code's, 4e-5 ramped
-    linearly from zero over the first 1000 updates."""
-    return optax.chain(
-        clip_by_agc(agc),
-        scale_by_laprop(b1, b2, eps),
-        optax.scale_by_learning_rate(_dreamer_rate if learning_rate is None else learning_rate),
-    )
-
-
 def stochastic_round_bf16(x: jax.Array, seed: jax.Array) -> jax.Array:
     """`x` rounded to bf16 up or down with the probability of its distance to
     each, from a hash of `seed` and each element's flat index.
@@ -866,22 +793,6 @@ def stochastic_round_bf16(x: jax.Array, seed: jax.Array) -> jax.Array:
     return stochastic_bf16(x, fmix32(index * jnp.uint32(0x9E3779B1) + seed.astype(jnp.uint32)))
 
 
-def _bias_corrected(moment, decay, count):
-    """`optax.tree.bias_correction`, with the correction of a Python `decay` in (0, 1) formed as
-    -expm1(count log decay), its log taken in double before the trace.
-
-    Optax forms 1 - decay**count inside a jit, where a Python decay is already rounded to float32:
-    0.999 becomes 0.99900001, so the correction at count 1 is 1.3e-5 off (2.2e-4 at 0.9999), where
-    torch forms it in double. A decay given as an array, a schedule's (`scheduled_solver`), takes
-    optax's own. google-deepmind/optax#1827 makes this optax's; delete this, and `scale_by_adam` and
-    `scale_by_laprop` with it, once a release carries it.
-    """
-    if isinstance(decay, (int, float)) and 0 < decay < 1:
-        correction = -jnp.expm1(count * math.log(decay))
-        return jax.tree.map(lambda leaf: leaf / correction.astype(leaf.dtype), moment)
-    return optax.tree.bias_correction(moment, decay, count)
-
-
 def moment_dtype(param, dtype):
     """The dtype a first moment of `param` is stored in under a requested `dtype`: the parameter's own
     where None, and for a complex parameter the complex type that holds `dtype`'s values in each
@@ -896,7 +807,7 @@ def moment_dtype(param, dtype):
 def scale_by_adam(b1=0.9, b2=0.999, eps=1e-8, eps_root=0.0, mu_dtype=None, *,
                   nesterov: bool = False, nu_dtype=None) -> optax.GradientTransformation:
     """`optax.scale_by_adam` (optax 0.2.8) with its bias corrections formed in double
-    (`_bias_corrected`): optax's moments, state layout (`optax.ScaleByAdamState`) and update,
+    (`bias_corrected`): optax's moments, state layout (`optax.ScaleByAdamState`) and update,
     composed from optax's public tree math. `nu_dtype` stores the second moment as `mu_dtype` does
     the first, each the parameter's dtype where None; a gradient narrower than its moment is
     widened before either reads it, so an fp16 gradient's square does not underflow first."""
@@ -921,11 +832,11 @@ def scale_by_adam(b1=0.9, b2=0.999, eps=1e-8, eps_root=0.0, mu_dtype=None, *,
         count = optax.safe_increment(state.count)
         if nesterov:
             mu_hat = jax.tree.map(lambda m, g: b1 * m + (1 - b1) * g,
-                                  _bias_corrected(mu, b1, optax.safe_increment(count)),
-                                  _bias_corrected(updates, b1, count))
+                                  bias_corrected(mu, b1, optax.safe_increment(count)),
+                                  bias_corrected(updates, b1, count))
         else:
-            mu_hat = _bias_corrected(mu, b1, count)
-        nu_hat = _bias_corrected(nu, b2, count)
+            mu_hat = bias_corrected(mu, b1, count)
+        nu_hat = bias_corrected(nu, b2, count)
         scaled = jax.tree.map(lambda m, v: None if m is None else m / (jnp.sqrt(v + eps_root) + eps),
                               mu_hat, nu_hat, is_leaf=lambda leaf: leaf is None)
         # A requested dtype is each leaf's own (`moment_dtype`): a complex leaf's first moment stays
