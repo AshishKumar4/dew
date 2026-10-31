@@ -792,15 +792,15 @@ def key_decayed_pairs(rows: Callable[[int], jax.Array], keys: Callable[[int], ja
         yield ("pairs", lambda: jnp.where((index >= place) & (index < place + sub), down, 0.0),
                lambda: Transposed(jnp.where(index < place + sub, keys(c) * between(start, prefix), 0.0)))
 
-    total = jnp.zeros((chunk, chunk), jnp.float32)
-    for c in range(columns):
+    def block(c, total):
         # A key block's prefix read once, before its sub-chunks' turns, which are rolled: each one's addresses
         # live within its own turn. Its rows gated down at once, each to its own sub-chunk's first token:
         # gated a sub-chunk at a time, every row was gated for each, and the exponentials were two thirds of
         # the launch (the intra launch 1.51 ms on an H100, 0.53 without them).
         prefix = separated(*gates(c))
         index, _ = _grid(prefix[0].shape)
-        def laid(s, below, c=c, index=index):
+
+        def laid(s, below):
             # Each sub-chunk's reference laid over its rows from its own on, read in a rolled turn: read at
             # static rows, their addresses were hoisted to the kernel's start and held through it (260 of an
             # H100's 475 registers at the peak).
@@ -810,8 +810,12 @@ def key_decayed_pairs(rows: Callable[[int], jax.Array], keys: Callable[[int], ja
 
         start = jax.lax.fori_loop(0, chunk // sub, laid, (jnp.zeros(index.shape, jnp.float32),) * 2)
         down = rows(c) * between(prefix, start)
-        total = jax.lax.fori_loop(0, chunk // sub, lambda s, total, c=c, prefix=prefix, down=down: (
+        return jax.lax.fori_loop(0, chunk // sub, lambda s, total: (
             total + summed(products(s, c, prefix, down), shape=(chunk, chunk))), total)
+
+    # The key blocks rolled too: unrolled, each block's body was lowered again, and the pairs' two calls were
+    # most of the intra launch's lowering (5.4 of its 6.5 seconds for Kimi Linear on an H100).
+    total = jax.lax.fori_loop(0, columns, block, jnp.zeros((chunk, chunk), jnp.float32))
     lag = _lags(total.shape)
     return jnp.where(lag > 0 if strict else lag >= 0, total, 0.0)
 
