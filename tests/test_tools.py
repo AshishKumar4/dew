@@ -1882,6 +1882,47 @@ def test_the_data_benchmark_checks_the_device_timelines_idle_and_reports_the_hos
     assert checked == (None if timeline is None else timeline < 0.05)
 
 
+def test_a_fixture_archive_names_nothing_of_the_machine_that_wrote_it_and_packs_as_xz_does_best(tmp_path):
+    """Every reference tool writes its archive through tools/fixture_archive: no member names its
+    writer's user, group or time, a saved config's absolute `_name_or_path` is emptied, a member a tool
+    leaves out stays out, and xz packs it at its strongest preset (a repack at tarfile's default grew a
+    fixture 3.2 times)."""
+    import tarfile
+
+    tool = load("fixture_archive")
+    saved = tmp_path / "saved" / "text_encoder"
+    saved.mkdir(parents=True)
+    (saved / "config.json").write_text(
+        '{\n  "_name_or_path": "/tmp/dew-reference-xl/text_encoder",\n  "dim": 8\n}\n')
+    (saved / "weights.bin").write_bytes(b"\x00" * 64)
+    (saved / "model.safetensors").write_bytes(bytes(range(256)) * 64)
+    destination = tmp_path / "fixture.tar.xz"
+    tool.write(destination, [(tmp_path / "saved", "saved")], kept=lambda name: not name.endswith(".bin"))
+    with tarfile.open(destination) as archive:
+        members = archive.getmembers()
+        config = archive.extractfile("saved/text_encoder/config.json").read().decode()
+    assert sorted(member.name for member in members) == [
+        "saved", "saved/text_encoder", "saved/text_encoder/config.json",
+        "saved/text_encoder/model.safetensors"]
+    assert {(member.uid, member.gid, member.uname, member.gname, member.mtime) for member in members} == {
+        (0, 0, "", "", 0)}
+    assert config == '{\n  "_name_or_path": "",\n  "dim": 8\n}\n'
+    # The first block's LZMA2 filter (0x21) names a 64 MiB dictionary (property 0x1c), preset 9's; preset
+    # 6's is 8 MiB.
+    assert destination.read_bytes()[13:17] == bytes([0x00, 0x21, 0x01, 0x1C])
+
+
+def test_a_data_scaling_receipt_names_no_directory_of_the_host_that_ran_it(tmp_path):
+    """The scaling receipt records its config's paths by their names outside the checkout (relative to it
+    within), so a receipt written on a CI host or a workstation names none of its directories (bible §2: a
+    receipt recorded /home/ci/work/... and /armada/task/... paths)."""
+    tool = load("benchmark_data")
+    tool.run_scaling(tool.Scaling(output=tmp_path / "scaling.json", work=tmp_path / "work", shards=2,
+                                  records=8, cycles=(1,), steps=2, warmup=0, batch=2, image_size=8))
+    config = json.loads((tmp_path / "scaling.json").read_text())["config"]
+    assert (config["output"], config["work"]) == ("scaling.json", "work")
+
+
 def test_the_data_benchmark_counts_a_grain_packing_and_dews_alike_as_the_objective_counts_them():
     """The data benchmark counts a batch's tokens and work as the run's objective counts them
     (`real_lengths`, `training_flops`), whichever packer laid the batch out: Grain's first-fit

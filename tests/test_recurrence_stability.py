@@ -365,7 +365,7 @@ TPU_ACCELERATED = [pytest.param(name, regime, id=f'{name}-{regime}-tpu',
 
 PAST_TARGET = {"gradient": {('rated', 'a fading memory'): 246}}
 """The gradient's cases whose draws take a group past its two minutes (seconds, train 270's CI on
-f58abb8a3, ledger 2125), which the whole suite runs (`timed`)."""
+66a222273, ledger 2125), which the whole suite runs (`timed`)."""
 
 
 @pytest.mark.parametrize('name, regime', timed(PAST_TARGET, "gradient", CASES + TPU_ACCELERATED))

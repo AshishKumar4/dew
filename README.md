@@ -1478,6 +1478,7 @@ To install the main branch without cloning it, run `uv pip install "dewml[cuda13
 - [Getting started](https://github.com/AshishKumar4/dew/blob/main/docs/getting-started.md): training a custom model.
 - [Custom objectives](https://github.com/AshishKumar4/dew/blob/main/docs/concepts/objectives.md): loss functions and mutable model state.
 - [Language models](https://github.com/AshishKumar4/dew/blob/main/docs/concepts/language_models.md): tokens, checkpoints, and generation.
+- [Diffusion language models](https://github.com/AshishKumar4/dew/blob/main/docs/concepts/diffusion_language_models.md): masked diffusion and DiffusionGemma.
 - [Post-training](https://github.com/AshishKumar4/dew/blob/main/docs/concepts/post_training.md): SFT, DPO, GRPO, and rewards.
 - [Diffusion](https://github.com/AshishKumar4/dew/blob/main/docs/guides/diffusion.md): image, video, conditioning, and latents.
 - [Representation learning](https://github.com/AshishKumar4/dew/blob/main/docs/guides/representation-learning.md): JEPA encoders and predictors.

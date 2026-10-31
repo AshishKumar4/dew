@@ -1,7 +1,7 @@
 """The products one request of a saved run's task multiplies, in a fresh interpreter of its own, for
 tests/saved_run_kinds.py's `computed`: `python tests/saved_run_products.py <run directory> [<step>]`
 prints, as JSON, each module's dtypes by its variable scope's path (`products`), a packed projection's at
-each of its members (`unpacked`), beside the projections the task's model packs (`packs`).
+each of its members (`unpacked`), beside the projections the task's model packs, by path (`packs`).
 
 The task loads at the step named, else its run's default, and answers one request (`answered`) with
 JAX writing the StableHLO of each program it lowers (`jax_dump_ir_to`): a fresh process holds no
@@ -25,7 +25,7 @@ from jax.extend.mlir import ir
 from jax.interpreters import mlir
 from saved_run_kinds import answered
 
-from dew.batch import thaw
+from dew.batch import Variables, thaw
 from dew.config import RunConfig
 from dew.registry import objectives
 
@@ -52,15 +52,17 @@ def scoping(variables) -> Callable:
 
     # A trunk held frozen is read as its whole tree is (`thaw`).
     walk(thaw(variables).get("params", {}), ())
-    rooted: dict[int, tuple[str, ...]] = {}
+    # Each root by its address, held so that no later root's scope, made after it was freed, takes its
+    # address and its branch (row 2867).
+    rooted: dict[int, tuple[Scope, tuple[str, ...]]] = {}
 
     def branch(root: Scope) -> tuple[str, ...]:
         if id(root) not in rooted:
             found = branches.get(signature(thaw(dict(root.variables())).get("params", {})), [()])
             if len(found) > 1:
                 raise ValueError(f"a root reads one of the branches {found}, alike in every leaf")
-            rooted[id(root)] = found[0]
-        return rooted[id(root)]
+            rooted[id(root)] = (root, found[0])
+        return rooted[id(root)][1]
 
     def scoped(next_fun, args, kwargs, context):
         scope = context.module.scope
@@ -73,17 +75,18 @@ def scoping(variables) -> Callable:
 
 def packed(task) -> dict[str, list[str]]:
     """The projections the task's decoder may serve packed (`dew.inference.projections.declared_groups`),
-    each packed projection's members by name: its model's, or its backbone's, the decoder a decision
-    model reads its rows through and packs to serve (`dew.decision.task._served`)."""
+    each packed projection's members, both by their paths in the task's tree: its model's, or its
+    backbone's under `backbone`, the decoder a decision model reads its rows through and packs to serve
+    (`dew.decision.task._served`). A trunk held frozen declares its groups as its whole tree does."""
     from dew.batch import part
     from dew.inference.projections import declared_groups
 
-    # A trunk held frozen declares its groups as its whole tree does (`thaw`).
-    held = [(task.model, thaw(task.variables))]
+    held: list[tuple[tuple[str, ...], nn.Module, Variables]] = [((), task.model, thaw(task.variables))]
     if hasattr(task.model, "backbone"):
-        held.append((task.model.backbone, thaw(part(task.variables, "backbone"))))
-    return {group.packed: list(group.members) for model, tree in held
-            for group in declared_groups(model, tree)}
+        held.append((("backbone",), task.model.backbone, thaw(part(task.variables, "backbone"))))
+    return {"/".join((*prefix, *group.path, group.packed)): ["/".join((*prefix, *group.path, member))
+                                                             for member in group.members]
+            for prefix, model, tree in held for group in declared_groups(model, tree)}
 
 
 def signature(tree) -> frozenset:
@@ -124,14 +127,14 @@ def products(modules: list[str]) -> dict[str, list[str]]:
 
 def unpacked(products: Mapping[str, list[str]], packs: Mapping[str, list[str]]) -> dict[str, list[str]]:
     """`products` with each packed projection's dtypes counted at each of its members instead, `packs`
-    naming each packed projection's members (`dew.nn.protocols.ProjectionGroup`): a task that serves a
-    decoder's q, k and v as one `qkv_proj` multiplies them in one product, which a task that does not
-    pack them multiplies in three, so the evidence reads alike whichever a main's task does."""
+    naming each packed projection's members by their paths (`packed`): a task that serves a decoder's q,
+    k and v as one `qkv_proj` multiplies them in one product, which a task that does not pack them
+    multiplies in three, so the evidence reads alike whichever a main's task does. A module of the same
+    name that no group declares keeps its own path."""
     found: dict[str, set[str]] = {}
     for path, dtypes in products.items():
-        parent, _, name = path.rpartition("/")
-        for member in packs.get(name, [name]):
-            found.setdefault(f"{parent}/{member}" if parent else member, set()).update(dtypes)
+        for member in packs.get(path, [path]):
+            found.setdefault(member, set()).update(dtypes)
     return {path: sorted(dtypes) for path, dtypes in sorted(found.items())}
 
 

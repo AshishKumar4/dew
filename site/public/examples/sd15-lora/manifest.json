@@ -1,7 +1,7 @@
 {
   "model": "SD1.5",
   "training_framework": "Dew",
-  "dew_commit": "fcdfa0070f49e0a4f8f344be02839d0573f40a98",
+  "dew_commit": "3a25313813a2c5eb64c2b2d655c82e57dc08f899",
   "rank": 16,
   "training_steps": 160,
   "sampling_steps": 30,

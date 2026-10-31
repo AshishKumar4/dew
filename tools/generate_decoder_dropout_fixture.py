@@ -1,7 +1,7 @@
 """Export the zero-dropout decoder's CPU fp32 forward and gradient graph, and with `--dtype float64`
 the same graph computed in float64, the truth its test measures both arms from.
 
-The committed exports were recorded at 42ddfc14, before the dropout change.
+The committed exports were recorded at 61037036, before the dropout change.
 Run this generator with PYTHONPATH naming that checkout's src directory. The
 exports name no source file (each location's file blanked by
 `jax_hlo_source_file_canonicalization_regex`, its frames cut to the user's

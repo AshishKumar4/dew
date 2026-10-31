@@ -52,7 +52,7 @@ SHARED_SEEDS = {"shared fresh": 8, "shared idefics": 8, "shared decode": 8, "sha
                 "alternating scan": 8, "context read mla": 8, "context read kpool": 8,
                 "context read v4": 8}
 """Check 1's declared seeds for each site of the file, sized paired by `seeds_for` on armada at
-edf94b090 (job IGXSIZE) and, for the IDEFICS read and the alternating scan, at db0cc076a (IGXSIZE3)."""
+57359d708 (job IGXSIZE) and, for the IDEFICS read and the alternating scan, at 0268ed035 (IGXSIZE3)."""
 
 
 def test_a_fresh_shared_read_computes_the_decoder_it_was_attached_to():
