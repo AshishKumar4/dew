@@ -81,8 +81,8 @@ def layer(dtype):
         "head_dim": HEAD_DIM, "mlp_features": 16, "norm_eps": EPSILON, "dtype": jnp.dtype(dtype).name,
         "hyper_connections": {"hc_mult": STREAMS},
         "engram": {"layer_ids": (0,), "num_embeddings": (sum(VOCAB_SIZES),), "max_ngram_size": MAX_NGRAM,
-                   "vocab_size": 64, "n_heads": HEADS, "head_dim": HEAD_DIM, "compressed_vocab_size": 64,
-                   "ple_conv_kernel_size": KERNEL, "ple_bias": True}})
+                   "vocab_size": VOCAB_SIZES[0], "n_heads": HEADS, "head_dim": HEAD_DIM,
+                   "compressed_vocab_size": 64, "ple_conv_kernel_size": KERNEL, "ple_bias": True}})
     return decoder.apply({}, method=lambda module: module.layers[0].engram)()
 
 
