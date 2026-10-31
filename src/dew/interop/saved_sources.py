@@ -188,8 +188,8 @@ def run_pipeline(run: SavedRun, checkpoint: str, *, dtype: str, param_dtype: str
     A run of another task, a revision of a directory, and `text=False`, which the restore of a run's
     tree cannot skip, are refused, as is a kernel other than `auto` for a denoiser that takes none. So
     are a run that tuned its autoencoder (`end_to_end`), whose tuned autoencoder a run started from it
-    records nothing of (ledger 2797), and a `size` other than the run's own, whose conditioning, grid
-    and process are bound to its size (ledger 2798)."""
+    records nothing of (ledger 2791), and a `size` other than the run's own, whose conditioning, grid
+    and process are bound to its size (ledger 2792)."""
     from dew._records import record
     from dew.diffusion.schedules.source import SourceGrid
     from dew.inference.images import ImageSettings, TextToImage, restored_tree
