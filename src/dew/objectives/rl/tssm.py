@@ -211,28 +211,31 @@ class TSSM(nn.Module):
         slot = cache.index % size
         written = jax.nn.one_hot(slot, size, dtype=bool)
         keys, values = cache.keys, cache.values
+        # A start whose imagined episode restarts reads its window no more, at this step or after.
+        window = cache.window
+        if window is not None:
+            window = window.replace(valid=window.valid & ~first[:, None])
         h = x[:, None]
         for layer, block in enumerate(self.blocks):
             query, key, value = block.projected(h, position[:, None])
             keys = keys.at[jnp.arange(x.shape[0]), layer, slot].set(key[:, 0])
             values = values.at[jnp.arange(x.shape[0]), layer, slot].set(value[:, 0])
             mask = (valid | written)[:, None, :]
-            if cache.window is None:
+            if window is None:
                 h = block.finished(h, query, keys[:, layer], values[:, layer], mask)
             else:
-                attended = _windowed(query, cache.window, layer, keys[:, layer], values[:, layer], mask[:, 0],
-                                     ~first)
+                attended = _windowed(query, window, layer, keys[:, layer], values[:, layer], mask[:, 0])
                 h = block.after(h, attended)
-        return self.out_norm(h[:, 0]), Cache(keys, values, valid | written, cache.index + 1, position + 1,
-                                             cache.window)
+        following = Cache(keys, values, valid | written, cache.index + 1, position + 1, window)
+        return self.out_norm(h[:, 0]), following
 
 
 def _windowed(query: jax.Array, window: Window, layer: int, keys: jax.Array, values: jax.Array,
-              mask: jax.Array, continuing: jax.Array) -> jax.Array:
+              mask: jax.Array) -> jax.Array:
     """`reference_attention` (wide logits) of each start's query `[B * T, 1, heads, head]` over the keys and
-    values of `window`'s `layer` its start reads (where it is `continuing` its episode) and its own `keys`
-    and `values` `[B * T, C, heads, head]` under `mask` `[B * T, C]`, one softmax over both: the window's
-    part one product for all of its starts, so no start holds a copy of its window."""
+    values of `window`'s `layer` its start reads and its own `keys` and `values` `[B * T, C, heads, head]`
+    under `mask` `[B * T, C]`, one softmax over both: the window's part one product for all of its starts,
+    so no start holds a copy of its window."""
     windows, _, length, heads, head = window.keys.shape
     wide = at_least_fp32(query.dtype)
     asked = query[:, 0].astype(wide)
@@ -240,7 +243,7 @@ def _windowed(query: jax.Array, window: Window, layer: int, keys: jax.Array, val
                             window.keys[:, layer].astype(wide)).reshape(-1, heads, length)
     own = float32_einsum("rhd,rchd->rhc", asked, keys.astype(wide))
     logits = jnp.concatenate([shared, own], -1) * head ** -0.5
-    seen = jnp.concatenate([window.valid & continuing[:, None], mask], -1)[:, None]
+    seen = jnp.concatenate([window.valid, mask], -1)[:, None]
     weights = jax.nn.softmax(jnp.where(seen, logits, jnp.finfo(query.dtype).min)).astype(values.dtype)
     spread = weights[..., :length].reshape(windows, length, heads, length)
     from_window = float32_einsum("bsht,bthd->bshd", spread, window.values[:, layer],

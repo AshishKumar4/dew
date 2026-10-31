@@ -191,3 +191,38 @@ def test_imagination_from_each_step_reads_the_window_up_to_it():
         roundings = chain_roundings(jax.make_jaxpr(imagined)(following))
         assert_computes_the_oracle(np.asarray(imagined(following)), np.stack(expected),
                                    "imagination from a window's steps", roundings=roundings)
+
+
+def test_imagination_that_restarts_reads_nothing_of_its_window():
+    """Imagination from each step of a window where every third start restarts its episode at the first
+    imagined step: those compute the written transformer's states over the imagined inputs alone, at that
+    step and the next, the window's history read no more; the rest over the window up to their start
+    extended by the imagined inputs; to float64 rounding."""
+    with jax.enable_x64(new_val=True):
+        model = tiny(jnp.float64)
+        held = variables(model)
+        x, first = window(4)
+        following = np.random.default_rng([2202, 5]).normal(size=(2, ROWS * LENGTH, WIDTH))
+        restarts = np.arange(ROWS * LENGTH) % 3 == 0
+
+        def imagined(following):
+            cache = model.apply(held, x, first, 2, method=TSSM.window_cache)
+            found = []
+            for step, starts in enumerate((restarts, np.zeros_like(restarts))):
+                h, cache = model.apply(held, following[step], jnp.asarray(starts), cache, method=TSSM.step)
+                found.append(h)
+            return jnp.stack(found, 1)
+
+        expected = []
+        for row in range(ROWS):
+            for k in range(LENGTH):
+                start = row * LENGTH + k
+                if restarts[start]:
+                    extended, starts = following[:, start][None], np.asarray([[True, False]])
+                else:
+                    extended = np.concatenate([x[row, :k + 1], following[:, start]])[None]
+                    starts = np.concatenate([first[row, :k + 1], [False, False]])[None]
+                expected.append(np.asarray(written_states(held, jnp.asarray(extended), starts))[0, -2:])
+        roundings = chain_roundings(jax.make_jaxpr(imagined)(following))
+        assert_computes_the_oracle(np.asarray(imagined(following)), np.stack(expected),
+                                   "imagination that restarts", roundings=roundings)
