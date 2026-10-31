@@ -925,7 +925,7 @@ def _bare(value, alike=lambda fingerprint: True):
 @pytest.mark.parametrize(("stores", "form", "resumes"), [
     ([([[1, 2, 0], [3, 0]], 0), ([[4, 5, 0], [6, 0]], 0)], "before", True),
     ([([[1, 0, 2], [3, 0]], 0), ([[4, 5, 0], [6, 0]], 0)], "before", False),
-    ([([[1, 2, 3]], None), ([[4, 5, 0], [6, 0]], 0)], "before", True),
+    ([([[1, 2, 3]], None), ([[4, 5, 6, 7]], None)], "before", True),
     ([([[1, 0, 2], [3, 0]], 0), ([[4, 5, 0], [6, 0]], 0)], "named", True),
 ], ids=["eos-closed", "eos-within", "one-record", "named-where-other"])
 def test_a_mix_an_earlier_dew_saved_over_token_stores_resumes_where_it_read_their_documents_alike(

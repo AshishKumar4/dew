@@ -477,8 +477,9 @@ def _documents_where(value: JSON, stores: Sequence[TokenFiles], kept: Callable[[
 
 
 def without_documents(value: JSON) -> JSON:
-    """`value`, a fingerprint of sources or a manifest holding them, each token store in it named as a Dew
-    before row 3028 named it, without `documents` (`earlier_plan`)."""
+    """`value`, a fingerprint of sources or a manifest holding them, a saved record's form made at its
+    boundary: each token store in it named as a Dew before row 3028 named it, without `documents`
+    (`earlier_plan`)."""
     if isinstance(value, list):
         return [without_documents(part) for part in value]
     if not isinstance(value, dict):
