@@ -5,7 +5,7 @@ in epochs, examples and tokens, a batch ramp, a profiler window, quantized train
 through a pipeline's stages, an update's token budget, a lowering for a GPU, a step compiled ahead and
 one handed to the run, W&B tracking and publishing, a kernel tuner on a GPU, and the options a kind's
 data, model or mesh refuses. The options each kind takes from Python and the rest of the command line
-are tests/test_run_options.py's. Nothing here reads a config's fields back."""
+are tests/test_run_options.py's, its runs tests/run_kinds.py's. Nothing here reads a config's fields back."""
 
 import dataclasses
 import json
@@ -14,7 +14,7 @@ import typing
 from pathlib import Path
 
 import pytest
-from test_run_options import KINDS, scalars
+from run_kinds import KINDS, scalars
 
 from dew.checkpoints import Checkpoints
 from dew.cli.main import main
@@ -261,8 +261,8 @@ def test_an_lm_run_over_token_batches_accumulates_its_update_token_budget(tmp_pa
     budget of two such batches (`update_tokens`) commits an update every second step, which its
     gradient's norm marks; the other kinds batch rows, and refuse the budget
     (`test_an_option_a_kinds_mesh_or_data_cannot_take_is_refused`)."""
+    from run_kinds import read
     from test_lm_recipe import SEQ, write_token_files
-    from test_run_options import read
 
     from dew.data import presets
     from dew.data.sources.tokens import TokenFiles

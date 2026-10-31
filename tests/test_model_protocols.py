@@ -62,7 +62,7 @@ from architecture_cases import CASES as ARCHITECTURES
 from checkpoint_cases import CHECKPOINTS, DECODERS, FIXTURES, LENGTH, OWN, PATHS, ROWS, loaded, reads
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jepa_cases import MASK
-from model_support import float64_twin
+from model_support import float64_twin, moved
 from reference_error import as_given, assert_as_exact, widened
 from tiny_models import build_model, tiny_inputs
 
@@ -692,15 +692,6 @@ def denoiser(architecture: str, rng):
     return build_model(architecture, "float32"), sample, args[0], tuple(args[1:]), conditions
 
 
-def perturbed(variables, rng):
-    """`variables` with noise on every parameter, so a zero-initialized head
-    hides nothing a change of input does."""
-    leaves, tree = jax.tree.flatten(variables["params"])
-    noisy = [leaf + 0.1 * jax.random.normal(key, leaf.shape, leaf.dtype)
-             for leaf, key in zip(leaves, jax.random.split(rng, len(leaves)), strict=True)]
-    return {**variables, "params": jax.tree.unflatten(tree, noisy)}
-
-
 @pytest.mark.parametrize("architecture", [architecture for architecture in sorted(models)
                                           if denoiser(architecture, jax.random.PRNGKey(0))])
 def test_a_denoiser_reads_the_text_interval_and_time_it_declares(architecture, rng):
@@ -730,7 +721,9 @@ def test_a_denoiser_reads_the_text_interval_and_time_it_declares(architecture, r
 
     def built(model, scale=None):
         model = model if scale is None else model.clone(time_scale=scale)
-        variables = perturbed(model.init(rng, sample, time, *rest, **conditions), rng)
+        # Noise on every parameter, so a zero-initialized head hides nothing a change of input does.
+        initialized = model.init(rng, sample, time, *rest, **conditions)
+        variables = {**initialized, "params": moved(initialized["params"], rng, 0.1)}
         return lambda at, **duration: model.apply(variables, sample, at, *rest, **duration, **conditions)
 
     duration = jnp.full_like(time, 0.25)
