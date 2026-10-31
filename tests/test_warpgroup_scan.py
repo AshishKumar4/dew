@@ -38,7 +38,7 @@ def _scanned(decays, writes, *, reverse: bool, interpret):
 
     vector = jax.ShapeDtypeStruct((positions,), jnp.float32)
     return plgpu.kernel(body, out_type=(vector, vector), grid=(1,), grid_names=("block",),
-                        scratch_shapes=(scan.scratch(),), compiler_params=mosaic.compiler_params(),
+                        scratch_types=(scan.scratch(),), compiler_params=mosaic.compiler_params(),
                         interpret=interpret)(decays, writes)
 
 
