@@ -72,20 +72,54 @@ class CustomCall:
 
 def _read[T](lowered: jax.stages.Lowered, read: Callable[[ir.Operation], T | None]) -> list[T]:
     """What `read` makes of each operation of a lowered program's StableHLO module, in program order: the
-    operations it makes something of."""
-    found: list[T] = []
-
-    def visit(operation: ir.Operation) -> ir.WalkResult:
-        made = read(operation)
-        if made is not None:
-            found.append(made)
-        return ir.WalkResult.ADVANCE
-
+    operations it makes something of, an operation of a function the program calls (a nested jit's, a
+    kernel `tuning.lowered_once` lowers once for every layer that calls it) once for each call that
+    reaches it from the entry (`_calls_from_entry`), as the program runs it."""
     module = lowered.compiler_ir(dialect="stablehlo")
     assert module is not None, "a lowered program always has its StableHLO module"
+    found: list[T] = []
     with module.context:
-        module.operation.walk(visit, ir.WalkOrder.PRE_ORDER)
+        functions = {ir.StringAttr(op.attributes["sym_name"]).value: op
+                     for op in module.body.operations if op.operation.name == "func.func"}
+        for name, times in _calls_from_entry(functions).items():
+
+            def visit(operation: ir.Operation, times: int = times) -> ir.WalkResult:
+                made = read(operation)
+                if made is not None:
+                    found.extend([made] * times)
+                return ir.WalkResult.ADVANCE
+
+            functions[name].operation.walk(visit, ir.WalkOrder.PRE_ORDER)
     return found
+
+
+def _calls_from_entry(functions: dict[str, ir.OpView]) -> dict[str, int]:
+    """How many times each of a module's `functions` runs a call of its entry (`main`), in the module's
+    order: each `func.call` site of a function that runs adds its own runs to its callee's. Functions
+    cannot recurse, so their calls form a DAG, read in topological order; one the entry cannot reach
+    runs none."""
+    callees: dict[str, Counter[str]] = {name: Counter() for name in functions}
+    for name, function in functions.items():
+
+        def note(operation: ir.Operation, name: str = name) -> ir.WalkResult:
+            if operation.name == "func.call":
+                callees[name][ir.FlatSymbolRefAttr(operation.attributes["callee"]).value] += 1
+            return ir.WalkResult.ADVANCE
+
+        function.operation.walk(note, ir.WalkOrder.PRE_ORDER)
+    assert "main" in functions, "a lowered program's entry is its module's main"
+    callers = Counter(callee for called in callees.values() for callee in called)
+    runs = dict.fromkeys(functions, 0)
+    runs["main"] = 1
+    ready = [name for name in functions if not callers[name]]
+    while ready:
+        name = ready.pop()
+        for callee, sites in callees[name].items():
+            runs[callee] += runs[name] * sites
+            callers[callee] -= 1
+            if not callers[callee]:
+                ready.append(callee)
+    return {name: times for name, times in runs.items() if times}
 
 
 def _read_calls[T](lowered: jax.stages.Lowered, read: Callable[[str, ir.Operation], T | None]) -> list[T]:
