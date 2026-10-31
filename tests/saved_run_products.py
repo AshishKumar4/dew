@@ -25,7 +25,7 @@ from jax.extend.mlir import ir
 from jax.interpreters import mlir
 from saved_run_kinds import answered
 
-from dew.batch import thaw
+from dew.batch import Variables, thaw
 from dew.config import RunConfig
 from dew.registry import objectives
 
@@ -79,7 +79,7 @@ def packed(task) -> dict[str, list[str]]:
     from dew.batch import part
     from dew.inference.projections import declared_groups
 
-    held: list[tuple[tuple[str, ...], object, object]] = [((), task.model, thaw(task.variables))]
+    held: list[tuple[tuple[str, ...], nn.Module, Variables]] = [((), task.model, thaw(task.variables))]
     if hasattr(task.model, "backbone"):
         held.append((("backbone",), task.model.backbone, thaw(part(task.variables, "backbone"))))
     return {"/".join((*prefix, *group.path, group.packed)): ["/".join((*prefix, *group.path, member))
