@@ -35,6 +35,8 @@ KERNEL_PROTO_VERSION = 4
 """The `MosaicGpuKernelProto` version jaxlib serializes (mosaic/gpu/custom_call.cc), which it alone reads."""
 MOSAIC_TARGET = b"mosaic_gpu_v2"
 """The custom call target of a Mosaic GPU kernel, which its thunk names (`_kernels`)."""
+SHARED_BYTES = 10
+"""The `MosaicGpuKernelProto` field of the dynamic shared memory a kernel's launch asks for (`smem_bytes`)."""
 REGISTER_COUNT, FRAME_SIZE = 0x2F, 0x11
 """A cubin's `.nv.info` attributes for a function's registers a thread and its stack frame's bytes
 (EIATTR_REGCOUNT, EIATTR_FRAME_SIZE), as ptxas states them: its frame holds what its registers spill."""
@@ -309,11 +311,13 @@ def _compiled_reported(lowered: jax.stages.Lowered, options: jax.stages.Compiler
 class Binary:
     """A Mosaic GPU kernel's binary as its executable carries it (`binaries`): its name and the launch that
     traced it (`Report.kernel`, `Report.launch`), its registers a thread and its stack frame's bytes a
-    thread, nonzero where its registers spill (`REGISTER_COUNT`, `FRAME_SIZE`)."""
+    thread, nonzero where its registers spill (`REGISTER_COUNT`, `FRAME_SIZE`), and the dynamic shared
+    memory its launch asks for (its kernel proto's `smem_bytes`), None where its proto states none."""
     kernel: str
     launch: str | None
     registers: int
     frame: int
+    shared: int | None = None
 
 
 def binaries(executable: jax.stages.Compiled) -> list[Binary]:
@@ -347,8 +351,9 @@ def binaries(executable: jax.stages.Compiled) -> list[Binary]:
 
 def _kernels(message: bytes) -> tuple[list[Binary], int]:
     """The kernels of each `MosaicGpuKernelProto` within a thunk's serialized proto (a message of jaxlib's
-    version, field 1, whose binary, 8, is an ELF and whose kernel name, 9, its function's), and how many
-    Mosaic GPU custom calls it names (`MOSAIC_TARGET`, a custom call thunk's target)."""
+    version, field 1, whose binary, 8, is an ELF, whose kernel name, 9, its function's, and whose
+    `SHARED_BYTES` its launch's dynamic shared memory), and how many Mosaic GPU custom calls it names
+    (`MOSAIC_TARGET`, a custom call thunk's target)."""
     parsed = empty_pb2.Empty()
     try:
         parsed.ParseFromString(message)
@@ -357,10 +362,11 @@ def _kernels(message: bytes) -> tuple[list[Binary], int]:
     fields: dict[int, list] = {}
     for field in UnknownFieldSet(parsed):
         fields.setdefault(field.field_number, []).append(field.data)
-    binary, name = fields.get(8, []), fields.get(9, [])
+    binary, name, shared = fields.get(8, []), fields.get(9, []), fields.get(SHARED_BYTES, [])
     if (fields.get(1) == [KERNEL_PROTO_VERSION] and len(binary) == len(name) == 1
             and isinstance(binary[0], bytes) and binary[0][:4] == b"\x7fELF" and isinstance(name[0], bytes)):
-        return [_binary(name[0].decode(), binary[0])], 0
+        stated = shared[0] if len(shared) == 1 and isinstance(shared[0], int) else None
+        return [dataclasses.replace(_binary(name[0].decode(), binary[0]), shared=stated)], 0
     found, calls = [], 0
     for values in fields.values():
         for value in values:
