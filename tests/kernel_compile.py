@@ -209,7 +209,7 @@ def _compiled(case, generation: str, record: dict,
         record["error"] = f"it does not lower: {str(error)[-800:]}"
         return None
     # Each kernel once, as JAX lowered it (a function's kernels however many calls reach them).
-    calls = [call for call in kernel_calls(lowered) if call.kind == "mosaic_gpu"]
+    calls = [call for call in kernel_calls(lowered, unrun=True) if call.kind == "mosaic_gpu"]
     named = [report.launch_name(call.name, call.launch) for call in calls]
     modules = kernel_modules(calls)
     if directory is not None:
@@ -253,9 +253,9 @@ def kernel_modules(calls: list) -> dict[str, str]:
 def _estimates(calls: list, printed: str) -> dict[str, str]:
     """Each Mosaic GPU call's resource estimate by its kernel's name and launch (`report.launch_name`), from
     what its lowering printed: Pallas prints one a kernel as it lowers it, in the order JAX lowers them,
-    which `calls` keep (`kernel_calls`: each kernel once, a function's where its first call is); a lowering
-    JAX cached prints none, its kernels' estimates kept by their module from the lowering that printed them
-    (`ESTIMATES`)."""
+    which `calls` keep (`kernel_calls`: each kernel once, a function's where its first call is, one no run
+    reaches too); a lowering JAX cached prints none, its kernels' estimates kept by their module from the
+    lowering that printed them (`ESTIMATES`)."""
     printed_estimates = ["Resources(" + part for part in printed.split("Resources(")[1:]]
     if len(printed_estimates) == len(calls):
         for call, estimate in zip(calls, printed_estimates, strict=True):

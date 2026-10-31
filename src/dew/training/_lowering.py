@@ -73,7 +73,8 @@ class CustomCall:
     operand_types: tuple[str, ...] = ()
 
 
-def _read[T](lowered: jax.stages.Lowered, read: Callable[[ir.Operation], T | None]) -> list[tuple[T, float]]:
+def _read[T](lowered: jax.stages.Lowered, read: Callable[[ir.Operation], T | None], *,
+             unrun: bool = False) -> list[tuple[T, float]]:
     """What `read` makes of each operation of a lowered program's StableHLO module, each once with the times
     it runs a call of the program, as `hlo_flops` weighs an executable's computations
     (`instrumentation.call_weights`): its function's runs from the entry (a nested jit's, a kernel
@@ -81,8 +82,9 @@ def _read[T](lowered: jax.stages.Lowered, read: Callable[[ir.Operation], T | Non
     a `stablehlo.while` body its static trip count, a scan of like layers its length); infinite where a loop
     around it states no static count. In the order JAX lowered them: the entry's operations in turn, a
     function's where its first call is (each lowered once, however many calls reach it), so a kernel's
-    compile reports printed as it lowered (Mosaic GPU's resource estimates) come in this order; a function
-    no run reaches (behind a loop of no trips, or none at all) at 0 times, where it is lowered."""
+    compile reports printed as it lowered (Mosaic GPU's resource estimates) come in this order. A function
+    no run reaches (behind a loop of no trips, or no call at all) runs none and is left out, or with
+    `unrun` given at 0 times, as JAX lowers and compiles it all the same."""
     module = lowered.compiler_ir(dialect="stablehlo")
     assert module is not None, "a lowered program always has its StableHLO module"
     found: list[tuple[T, float]] = []
@@ -101,6 +103,8 @@ def _read[T](lowered: jax.stages.Lowered, read: Callable[[ir.Operation], T | Non
 
         def lower(name: str) -> None:
             entered.add(name)
+            if not runs.get(name, 0.0) and not unrun:
+                return
             for operation, times in _walked(functions[name], runs.get(name, 0.0)):
                 if (made := read(operation)) is not None:
                     found.append((made, times))
@@ -189,17 +193,17 @@ def _constant(value: ir.Value) -> int | None:
     return ir.IntegerAttr(held.get_splat_value()).value
 
 
-def _read_calls[T](lowered: jax.stages.Lowered,
-                   read: Callable[[str, ir.Operation], T | None]) -> list[tuple[T, float]]:
+def _read_calls[T](lowered: jax.stages.Lowered, read: Callable[[str, ir.Operation], T | None], *,
+                   unrun: bool = False) -> list[tuple[T, float]]:
     """What `read` makes of each custom call a lowered program makes, given its target and its
-    operation, in the order JAX lowered them, each once with the times it runs (`_read`): the calls it makes
-    something of."""
+    operation, in the order JAX lowered them, each once with the times it runs (`_read`, `unrun` its):
+    the calls it makes something of."""
     def call(operation: ir.Operation) -> T | None:
         if operation.name != "stablehlo.custom_call":
             return None
         return read(ir.StringAttr(operation.attributes["call_target_name"]).value, operation)
 
-    return _read(lowered, call)
+    return _read(lowered, call, unrun=unrun)
 
 
 def operations(lowered: jax.stages.Lowered) -> list[str]:
@@ -222,15 +226,16 @@ def custom_calls(lowered: jax.stages.Lowered) -> list[CustomCall]:
         tuple(str(kind.element_type) for kind in ranked(operation.operands))))]
 
 
-def kernel_calls(lowered: jax.stages.Lowered) -> list[KernelCall]:
+def kernel_calls(lowered: jax.stages.Lowered, *, unrun: bool = False) -> list[KernelCall]:
     """Every kernel call a lowered program makes, as lowered (`_read`), each lowering once (`kernel_launches`
     with the times each runs): each custom call but those that run no matmul
     (`instrumentation.custom_call_kind`), the launches one dispatch expands into, forward and backward,
-    which only the lowered program shows (a dispatch's `generation.Route` holds its decision alone)."""
-    return [call for call, _ in kernel_launches(lowered)]
+    which only the lowered program shows (a dispatch's `generation.Route` holds its decision alone); with
+    `unrun`, those no run reaches too, which JAX compiles all the same (the compile gate's evidence)."""
+    return [call for call, _ in kernel_launches(lowered, unrun=unrun)]
 
 
-def kernel_launches(lowered: jax.stages.Lowered) -> list[tuple[KernelCall, float]]:
+def kernel_launches(lowered: jax.stages.Lowered, *, unrun: bool = False) -> list[tuple[KernelCall, float]]:
     """Each of `kernel_calls`, once, with the times it runs a call of the program (`_read`): from every
     layer that calls a kernel lowered once, and every trip of a loop around it; infinite where a loop
     around it states no static count."""
@@ -238,7 +243,7 @@ def kernel_launches(lowered: jax.stages.Lowered) -> list[tuple[KernelCall, float
         kind = custom_call_kind(target)
         return None if kind == "no_matmul" else _kernel_call(kind, target, operation)
 
-    return _read_calls(lowered, read)
+    return _read_calls(lowered, read, unrun=unrun)
 
 
 def _kernel_call(kind: str | None, target: str, operation: ir.Operation) -> KernelCall:
