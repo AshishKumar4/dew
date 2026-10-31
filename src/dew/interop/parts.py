@@ -343,8 +343,35 @@ def _read_sigmoid_router(view: PartView) -> Mapping[str, object]:
 def _read_ernie_attention(view: PartView) -> Mapping[str, object]:
     """ERNIE 4.5's attention: Llama's, its rotary turning adjacent pairs of each head (its
     `apply_rotary_pos_emb` repeats each angle over a pair and rotates `(x[2i], x[2i+1])`, in float32,
-    rounded once to the queries' dtype); a per-layer fact (`_with_adjacent_pairs`)."""
-    return {**_read_attention(view), _LAYER: {'pairs': 'adjacent'}}
+    rounded once to the queries' dtype); a per-layer fact (`_with_attention_fields`)."""
+    return {**_read_attention(view), _LAYER: {'attention': {'rotary_pairs': 'adjacent'}}}
+
+
+def _read_hunyuan_attention(view: PartView) -> Mapping[str, object]:
+    """Hunyuan's attention: Llama's, each head's queries and keys normed after their rotation
+    (`query_layernorm`, `key_layernorm`); a per-layer fact (`_with_attention_fields`)."""
+    return {**_read_attention(view), 'qk_norm': True, _LAYER: {'attention': {'qk_norm_after_rotary': True}}}
+
+
+def _read_hunyuan_router(view: PartView) -> Mapping[str, object]:
+    """Hunyuan's router: float32 logits (its `wg` held in float32) and their softmax, the `moe_topk` best
+    weighted by score renormalized over the chosen."""
+    return {_LAYER: {'top_k': int(view.top_k), 'experts': int(view.num_experts), 'norm_topk_prob': True,
+                     'score_function': 'softmax'}}
+
+
+def _read_alpha_rotary(view: PartView) -> Mapping[str, object]:
+    """Hunyuan's rotary: where its rope record is `dynamic` with an `alpha`, plain rotary positions at
+    `rope_theta * alpha ** (head_dim / (head_dim - 2))` (its DynamicNTKAlphaRotary), at every length.
+    transformers recomputes dynamic-NTK frequencies from a batch's longest position past
+    `max_position_embeddings`, which no serving stack reproduces: vLLM serves the static alpha base at
+    every length, as Dew does. Any other record is the rotary `_rope` reads."""
+    record = dict(view.config.rope_parameters or {})
+    if record.get('rope_type') != 'dynamic' or not record.get('alpha'):
+        return _rope(view.config)
+    width = _records.integer(view.config.head_dim, 'head_dim')
+    theta = _records.number(record['rope_theta'], 'rope_theta')
+    return {'rope_theta': theta * _records.number(record['alpha'], 'alpha') ** (width / (width - 2))}
 
 
 def _read_ernie_router(view: PartView) -> Mapping[str, object]:
@@ -533,6 +560,7 @@ _OLMOE = 'transformers.models.olmoe.modeling_olmoe'
 _STABLELM = 'transformers.models.stablelm.modeling_stablelm'
 _LFM2 = 'transformers.models.lfm2.modeling_lfm2'
 _ERNIE = 'transformers.models.ernie4_5_moe.modeling_ernie4_5_moe'
+_HUNYUAN = 'transformers.models.hunyuan_v1_moe.modeling_hunyuan_v1_moe'
 _LFM2_MOE = 'transformers.models.lfm2_moe.modeling_lfm2_moe'
 _DEEPSEEK_V3 = 'transformers.models.deepseek_v3.modeling_deepseek_v3'
 _GLM4_MOE = 'transformers.models.glm4_moe.modeling_glm4_moe'
@@ -566,6 +594,15 @@ KNOWN: tuple[KnownPart, ...] = (
     KnownPart('attention', f'{_STABLELM}:StableLmAttention', _ATTENTION_CHILDREN, _read_stablelm_attention),
     KnownPart('rotary', f'{_STABLELM}:StableLmRotaryEmbedding', {}, _read_partial_rotary, whole=True),
     KnownPart('norm', 'torch.nn:LayerNorm', {}, _read_layer_norm, ('weight', 'bias')),
+    KnownPart('attention', f'{_HUNYUAN}:HunYuanMoEV1Attention',
+              {**_ATTENTION_CHILDREN, 'query_layernorm': ('norm',), 'key_layernorm': ('norm',)},
+              _read_hunyuan_attention, canonical={'query_layernorm': 'q_norm', 'key_layernorm': 'k_norm'}),
+    KnownPart('moe', f'{_HUNYUAN}:HunYuanMoEV1Moe',
+              {'gate': ('router',), 'experts': ('experts',), 'shared_mlp': ('shared',)}, _read_shared_moe,
+              canonical={'shared_mlp': 'shared_experts'}),
+    KnownPart('router', f'{_HUNYUAN}:HunYuanMoEV1Gate', {'wg': ('linear',)}, _read_hunyuan_router,
+              canonical={'wg': ''}),
+    KnownPart('rotary', f'{_HUNYUAN}:HunYuanMoEV1RotaryEmbedding', {}, _read_alpha_rotary, whole=True),
     KnownPart('model', f'{_ERNIE}:Ernie4_5_MoeModel', _MODEL_CHILDREN, _read_llama_model),
     KnownPart('rotary', f'{_ERNIE}:Ernie4_5_MoeRotaryEmbedding', {}, _read_rotary, whole=True),
     KnownPart('attention', f'{_ERNIE}:Ernie4_5_MoeAttention', _ATTENTION_CHILDREN, _read_ernie_attention),
@@ -885,7 +922,7 @@ def assemble(model: PreTrainedModel) -> Assembly:
     routed = sorted(layer for layer, facts in assembler.layers.items() if facts.get('routed'))
     if routed:
         routes = {tuple(sorted((key, value) for key, value in assembler.layers[layer].items()
-                               if key not in ('routed', 'nope', 'conv', 'pairs'))) for layer in routed}
+                               if key not in ('routed', 'nope', 'conv', 'attention'))) for layer in routed}
         if len(routes) != 1:
             raise Ambiguous("the routed layers route differently")
         mixture = dict(routes.pop())
@@ -909,8 +946,8 @@ def assemble(model: PreTrainedModel) -> Assembly:
     fields.update(_without_positions(fields, unrotated))
     convolutions = {layer: facts['conv'] for layer, facts in assembler.layers.items() if 'conv' in facts}
     fields.update(_with_convolutions(fields, convolutions))
-    fields.update(_with_adjacent_pairs(fields, sorted(layer for layer, facts in assembler.layers.items()
-                                                      if facts.get('pairs') == 'adjacent')))
+    fields.update(_with_attention_fields(fields, {layer: facts['attention'] for layer, facts
+                                                  in assembler.layers.items() if 'attention' in facts}))
     capacity, context = decoder_parts.context_lengths(
         {'max_position_embeddings': model.config.to_dict().get('max_position_embeddings')})
     fields.update(max_seq_len=capacity, context_length=context)
@@ -923,14 +960,17 @@ def assemble(model: PreTrainedModel) -> Assembly:
                     tuple(assembler.dropouts), _load_names(model), frozenset(assembler.flat), depths)
 
 
-def _with_adjacent_pairs(fields: Mapping[str, object], layers: list[int]) -> Mapping[str, object]:
-    """The kinds that make every layer's attention turn adjacent pairs of each head (ERNIE 4.5's), its
-    layer types' kinds otherwise as they are."""
-    if not layers:
+def _with_attention_fields(fields: Mapping[str, object], stated: Mapping[int, object]
+                           ) -> Mapping[str, object]:
+    """The kinds that give every layer's attention the mixer fields its part states (`stated`, each
+    layer's): ERNIE 4.5's adjacent rotary pairs, Hunyuan's norm after the rotation; its layer types'
+    kinds otherwise as they are."""
+    if not stated:
         return {}
     count = _records.integer(fields['num_layers'], 'num_layers')
-    if layers != list(range(count)):
-        raise Ambiguous("only some layers turn adjacent pairs")
+    mixers = [dict(_records.record(mixer, 'attention')) for mixer in stated.values()]
+    if sorted(stated) != list(range(count)) or any(mixer != mixers[0] for mixer in mixers):
+        raise Ambiguous("the layers' attentions compute differently")
     stated_types = fields.get('layer_types')
     types = (list(_records.strings(stated_types, 'layer_types')) if stated_types
              else ['full_attention'] * count)
@@ -939,7 +979,7 @@ def _with_adjacent_pairs(fields: Mapping[str, object], layers: list[int]) -> Map
         kind = dict(_records.record(kinds[name], name)) if name in kinds else dict(native_fields(LayerKind)())
         if kind.get('mixer') is not None:
             raise Ambiguous(f"the {name} layers' mixer is stated elsewhere")
-        kind['mixer'] = {'class': 'attention', 'fields': {'rotary_pairs': 'adjacent'}}
+        kind['mixer'] = {'class': 'attention', 'fields': mixers[0]}
         kinds[name] = kind
     return {'layer_types': tuple(types), 'kinds': kinds}
 

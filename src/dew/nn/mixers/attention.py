@@ -327,6 +327,10 @@ class CausalSelfAttention(nn.Module):
     """Whether each of the `rotary_axes` turns its own channels in halves,
     Gemma 4's vision rope (`apply_multidimensional_rope`), where Qwen 3.5's
     turns the axes' angles together over the whole head."""
+    qk_norm_after_rotary: bool = False
+    """Whether each head's queries and keys are normed after their rotation, not before it:
+    Hunyuan's (modeling_hunyuan_v1_moe.py, HunYuanMoEV1Attention), a cached key normed as it is
+    written. The query's logit scale then multiplies after its norm, where a rotation folds it in."""
     packed: bool = False
     """Whether the queries, keys and values project through one kernel,
     `qkv_proj`, at init as from a checkpoint that stores them so (the Qwen 3.5
@@ -407,6 +411,10 @@ class CausalSelfAttention(nn.Module):
             self.ctx.attention_bias if self.ctx.o_proj_bias is None else self.ctx.o_proj_bias),
             **normal_kernel(self.ctx.init_std if self.ctx.output_init_std is None
                             else self.ctx.output_init_std))
+        if self.qk_norm_after_rotary and (not self.ctx.qk_norm or self.ctx.qk_norm_scope != 'head'
+                                          or self.nope or self.ctx.kv_shared or self.ctx.ngpt is not None):
+            raise ValueError("qk_norm_after_rotary norms each head's rotated queries and keys: it needs a "
+                             "per-head qk norm and a rotation of the layer's own keys")
         if self.ctx.qk_norm:
             if self.ctx.qk_norm_scope not in ('head', 'projection'):
                 raise ValueError(
@@ -649,7 +657,7 @@ class CausalSelfAttention(nn.Module):
         if whole:
             key = self.k_norm(key)
         key = key.reshape(batch, length, self.ctx.num_kv_heads, self.ctx.head_dim)
-        if self.ctx.qk_norm and not whole:
+        if self.ctx.qk_norm and not whole and not self.qk_norm_after_rotary:
             key = self.k_norm(key)
         if self.ctx.v_norm:
             value = self.values_norm(value)
@@ -669,10 +677,16 @@ class CausalSelfAttention(nn.Module):
             freqs_cos, freqs_sin = self._rotary_angles(rotary_positions, query, uncached, places)
             # Every kernel path scales the logits by 1/sqrt(head_dim) itself, so the
             # query carries the ratio to the scale the checkpoint asks for.
-            query = rotate(
-                self._turned(query), freqs_cos, freqs_sin, pairs=self.rotary_pairs,
-                scale=(None if self.ctx.attention_scale is None
-                       else self.ctx.attention_scale * math.sqrt(self.ctx.head_dim)))
+            ratio = (None if self.ctx.attention_scale is None
+                     else self.ctx.attention_scale * math.sqrt(self.ctx.head_dim))
+            if self.qk_norm_after_rotary:
+                turned = rotate(self._turned(query), freqs_cos, freqs_sin, pairs=self.rotary_pairs)
+                query = self.q_norm(turned)
+                if ratio is not None:
+                    query = scaled(query, ratio)
+            else:
+                query = rotate(self._turned(query), freqs_cos, freqs_sin, pairs=self.rotary_pairs,
+                               scale=ratio)
         return query, freqs_cos, freqs_sin
 
     def _tuned(self, query, places):
@@ -818,6 +832,8 @@ class CausalSelfAttention(nn.Module):
         if not self.ctx.kv_shared:
             if freqs_cos is not None and freqs_sin is not None:
                 key = rotate(self._turned(key), freqs_cos, freqs_sin, pairs=self.rotary_pairs)
+            if self.qk_norm_after_rotary:
+                key = self.k_norm(key)
             if self.ctx.ngpt is not None:
                 query, key = self._ngpt_rotated(self.ctx.ngpt, query, key)
             if kv_store is not None and self.ctx.kv_store_key is not None:
@@ -890,7 +906,7 @@ class CausalSelfAttention(nn.Module):
         if self.ctx.output_gate and self.gate_projection != 'query':
             gate = checkpoint_name(self.gate_proj(x), 'output_gate')
             gate = gate.reshape(B, S, self.ctx.num_heads, -1)
-        if self.ctx.qk_norm and not self._whole_norm:
+        if self.ctx.qk_norm and not self._whole_norm and not self.qk_norm_after_rotary:
             query = self.q_norm(query)
         # o_proj's sum returns to the residual placement in the block.
         return constrain(query, HEADS), gate, projected_kv
@@ -1516,6 +1532,9 @@ class AttentionMixer(MixerBase):
     rotary_pairs: Literal['half', 'adjacent'] = 'half'
     """The channels each rotary angle turns (`CausalSelfAttention.rotary_pairs`): halves, or
     adjacent pairs, as Llama 4's rotated layers turn them."""
+    qk_norm_after_rotary: bool = False
+    """Whether each head's queries and keys are normed after their rotation
+    (`CausalSelfAttention.qk_norm_after_rotary`), as Hunyuan's are."""
     temperature_tuning: tuple[float, float] | None = None
     """A (floor_scale, attn_scale) that scales each query by its position (`temperature_scale`,
     arXiv 2501.19399), as Llama 4's unrotated layers do; None scales none."""

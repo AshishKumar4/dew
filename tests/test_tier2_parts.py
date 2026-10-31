@@ -435,6 +435,9 @@ BUILT_IN = {
     "stablelm-parallel": {"model_type": "stablelm", "head_dim": None, "use_parallel_residual": True,
                           "rope_parameters": {"rope_type": "default", "rope_theta": 10000.0,
                                               "partial_rotary_factor": 0.5}},
+    "hunyuan_v1_moe": {"num_experts": 8, "moe_topk": 2,
+                       "rope_parameters": {"rope_type": "dynamic", "rope_theta": 10000.0, "alpha": 1000.0,
+                                           "factor": 1.0}},
     "ernie4_5_moe": {"head_dim": None, "moe_num_experts": 8, "moe_k": 2, "moe_intermediate_size": 32,
                      "moe_num_shared_experts": 1, "moe_layer_start_index": 1},
     "lfm2": {"head_dim": None, "layer_types": ["conv", "full_attention", "conv", "full_attention"],
@@ -455,17 +458,20 @@ convolutions between its attention layers, its modules under names of their own 
 `feed_forward.w1`, `out_proj`), and LFM2-MoE's, its layers past the first routed by sigmoid scores and a
 balancing bias, renormalized over a sum with its own epsilon; and ERNIE 4.5's routed layers past its
 first, a softmax router selecting with a `[1, experts]` correction bias beside a shared expert, its
-rotary turning adjacent pairs."""
+rotary turning adjacent pairs; and Hunyuan's every layer routed beside a shared MLP, each head's queries
+and keys normed after their rotation, at its dynamic-alpha base."""
 
 BUILT_IN_SEEDS = {"granite": 8, "smollm3": 8, "olmo2": 8, "hy_v3": 8, "glm4_moe_lite": 8, "olmoe": 8,
-                  "stablelm": 8, "stablelm-parallel": 8, "lfm2": 8, "lfm2_moe": 8, "ernie4_5_moe": 8}
+                  "stablelm": 8, "stablelm-parallel": 8, "lfm2": 8, "lfm2_moe": 8, "ernie4_5_moe": 8,
+                  "hunyuan_v1_moe": 8}
 """Each built-in type's declared check-1 seeds for its logits, sized by `seeds_for` on armada."""
 
 STORED_EXPERT = {"hy_v3": "model.layers.1.mlp.experts.0.gate_proj.weight",
                  "glm4_moe_lite": "model.layers.1.mlp.experts.0.gate_proj.weight",
                  "olmoe": "model.layers.1.mlp.experts.0.gate_proj.weight",
                  "lfm2_moe": "model.layers.1.feed_forward.experts.0.w1.weight",
-                 "ernie4_5_moe": "model.layers.1.mlp.experts.0.gate_proj.weight"}
+                 "ernie4_5_moe": "model.layers.1.mlp.experts.0.gate_proj.weight",
+                 "hunyuan_v1_moe": "model.layers.1.mlp.experts.0.gate_proj.weight"}
 """A routed type's first stored expert projection, as `save_pretrained` stores its experts one by one."""
 
 
@@ -597,6 +603,31 @@ def test_a_biased_short_convolution_is_left_to_tier_3():
                                                              layer_types=["conv", "full_attention"] * 2))
     with pytest.raises(parts.Ambiguous):
         parts.assemble(model)
+
+
+def test_a_decoder_norming_its_rotated_heads_decodes_through_its_cache_as_transformers_generates(tmp_path):
+    """Hunyuan's attention norms each head's queries and keys after their rotation, so a cached key is
+    normed as it is written: a cached greedy continuation of a decoder assembled from its parts draws the
+    tokens transformers' own generate draws."""
+    from interop_support import tiny_config
+    from transformers import AutoModelForCausalLM
+
+    from dew.sampling import Sampling, generate
+
+    torch.manual_seed(0)
+    config = tiny_config("hunyuan_v1_moe", **BUILT_IN["hunyuan_v1_moe"])
+    model = AutoModelForCausalLM.from_config(config, dtype=torch.float32)
+    scatter_weights(model)
+    model.save_pretrained(tmp_path)
+    loaded = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
+    source = AutoModelForCausalLM.from_pretrained(tmp_path, dtype=torch.float32, attn_implementation="eager",
+                                                  experts_implementation="eager").eval()
+    ids = torch.as_tensor(np.random.default_rng(0x3078).integers(3, config.vocab_size, (1, 6)))
+    with torch.no_grad():
+        drawn = source.generate(ids, max_new_tokens=8, min_new_tokens=8, do_sample=False)
+    generated = generate(loaded.model, loaded.variables, np.asarray(ids), 8, key=0,
+                         sampling=Sampling(temperature=0))
+    np.testing.assert_array_equal(np.asarray(generated.tokens), drawn.numpy())
 
 
 def test_a_stored_name_reads_as_the_sources_load_reads_it():
