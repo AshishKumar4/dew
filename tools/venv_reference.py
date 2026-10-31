@@ -5,8 +5,9 @@ and its truth's sketch (`record_case(..., summary=True)`).
 
     python tools/venv_reference.py SITE PYTHON [SOURCE]
 
-PYTHON is the interpreter of a virtual environment holding the site's package; SOURCE a checkout put on
-the worker's path where the package is a repository rather than a distribution.
+PYTHON is the interpreter of a virtual environment holding the site's package (a distribution's version
+checked against the site's); SOURCE a checkout put on the worker's path where the package is a
+repository rather than a distribution.
 """
 
 from __future__ import annotations
@@ -26,8 +27,12 @@ sys.path.insert(0, str(ROOT / "tools"))
 
 SITES = {"conv": {"test": "test_dreamerv3_conv", "worker": "dreamerv3_worker.py",
                   "reference": "danijar/dreamerv3 e01491fad6434b2245a3b8ca201dd7faedcc458c",
-                  "license": "MIT"}}
-"""Each site's test module (its `FIXTURE`, `draw`, `dew` and `OUTPUTS`), worker and reference."""
+                  "license": "MIT"},
+         **{site: {"test": f"test_maxtext_{site}", "worker": "maxtext_worker.py",
+                   "reference": "AI-Hypercomputer/maxtext 0.2.5", "license": "Apache-2.0",
+                   "distribution": ("maxtext", "0.2.5")} for site in ("gpt3", "engram")}}
+"""Each site's test module (its `FIXTURE`, `draw`, `dew` and `OUTPUTS`), worker and reference, and the
+distribution and version its environment must hold, where the reference is one."""
 
 
 def main() -> None:
@@ -38,6 +43,12 @@ def main() -> None:
     site, python = sys.argv[1], sys.argv[2]
     known = SITES[site]
     test = importlib.import_module(known["test"])
+    if "distribution" in known:
+        name, wanted = known["distribution"]
+        held = subprocess.run([python, "-c", f"import importlib.metadata as m; print(m.version({name!r}))"],
+                              capture_output=True, text=True, check=True).stdout.strip()
+        if held != wanted:
+            raise SystemExit(f"the recording is of {name} {wanted}; {python} holds {held}")
     environment = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
     environment |= {"JAX_PLATFORMS": "cpu", **({"PYTHONPATH": sys.argv[3]} if len(sys.argv) > 3 else {})}
     worker = subprocess.Popen([python, str(ROOT / "tools" / known["worker"]), site], stdin=subprocess.PIPE,
