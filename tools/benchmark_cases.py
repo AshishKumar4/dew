@@ -66,11 +66,11 @@ class Case:
     Other measurements and rows retain their ordinary single-draw path."""
     batch_size: int = 8
     accumulation: int = 1
+    """Microbatches of `batch_size` rows the trainer pools into one optimizer
+    step; a timed step is one microbatch."""
     optimizer: str = "adam"
     """The optimizer the case's trainer steps (`benchmark_models.OPTIMIZERS`): Adam, or AdamW a full
     fine-tune's."""
-    """Microbatches of `batch_size` rows the trainer pools into one optimizer
-    step; a timed step is one microbatch."""
     mesh: dict[str, int] = field(default_factory=dict)
     """`MeshSpec` fields, `{"fsdp": 2, "tensor": 2}`; the empty record is
     data parallelism over every device."""
