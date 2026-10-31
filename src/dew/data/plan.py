@@ -11,7 +11,7 @@ import json
 import logging
 import platform
 import re
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, runtime_checkable
 
@@ -423,21 +423,57 @@ def earlier_plan(saved: Mapping[str, object], plan: Plan) -> Mapping[str, object
 
 
 def _members_as_today(saved: Mapping[str, object], plan: Plan) -> dict[str, JSON]:
-    """`saved`'s member digests (`Plan.members`), a saved record read at its boundary, each a Dew before
-    row 3028 made of a member `plan` keeps as today's makes it, where it is the digest that Dew made of
-    today's member (`Plan.earlier_members`) and that Dew read the documents of each token store the member
-    reads as today's does (`TokenFiles.read_alike`); none where `saved` keeps no members."""
+    """`saved`'s member digests (`Plan.members`), a saved record read at its boundary, each an earlier Dew
+    made of a member `plan` keeps as today's makes it, where it is a digest that Dew made of today's
+    member (`_earlier_digests`); none where `saved` keeps no members."""
     members = saved.get("members")
     if not isinstance(members, dict):
         return {}
     held: dict[str, JSON] = {}
     for key, digest in members.items():
-        earlier, stores = plan.earlier_members.get(key, (None, ()))
         today = plan.members.get(key)
-        if digest != today and digest == earlier and all(store.read_alike() for store in stores):
+        if digest != today and key in plan.earlier_members and digest in _earlier_digests(
+                *plan.earlier_members[key]):
             digest = today
         held[key] = digest
     return {"members": held}
+
+
+def _earlier_digests(manifest: JSON, stores: Sequence[TokenFiles]) -> Iterator[str]:
+    """The digests earlier Dews made of a member whose manifest today is `manifest`, reading `stores`, each
+    only where that Dew read the stores' documents as today's does: one that named a store's reading
+    (`documents`) only where it read others of it, alike ones without (`TokenFiles.read_alike`); and one
+    before row 3028, which named none and stated no lengths of a store without an EOS, where it read
+    every store alike (`_unstated_lengths`)."""
+    yield fingerprint(_documents_where(manifest, stores, lambda store: not store.read_alike()))
+    if all(store.read_alike() for store in stores):
+        named = record(without_documents(manifest), "member manifest")
+        sources, derived = named.get("sources"), named.get("derived")
+        if isinstance(sources, list) and isinstance(derived, dict):
+            unstated = {f"{index}/lengths" for index, source in enumerate(sources)
+                        if isinstance(source, dict) and _unstated_lengths(source)}
+            named = {**named, "derived": {name: value for name, value in derived.items()
+                                          if name not in unstated}}
+        yield fingerprint(named)
+
+
+def _documents_where(value: JSON, stores: Sequence[TokenFiles], kept: Callable[[TokenFiles], bool]) -> JSON:
+    """`value`, a fingerprint of sources or a manifest holding them, a saved record's form made at its
+    boundary: each token store in it that is one of `stores` named with `documents` only where `kept`
+    holds of it."""
+    if isinstance(value, list):
+        return [_documents_where(part, stores, kept) for part in value]
+    if not isinstance(value, dict):
+        return value
+    if value.get("store") == "tokens" and "documents" in value:
+        bare = {name: part for name, part in value.items() if name != "documents"}
+        for store in stores:
+            before = record(json_value({name: part for name, part in store.fingerprint().items()
+                                        if name != "documents"}, "token store fingerprint"), "token store")
+            if all(bare.get(name) == part for name, part in before.items()):
+                return value if kept(store) else bare
+        return value
+    return {name: _documents_where(part, stores, kept) for name, part in value.items()}
 
 
 def without_documents(value: JSON) -> JSON:
@@ -557,11 +593,10 @@ class Plan:
     stores: tuple[TokenFiles, ...] = dataclasses.field(default=(), compare=False, repr=False)
     """The token stores beneath the plan's sources, which a plan a Dew before row 3028 saved names
     otherwise (`earlier_plan`); no part of the plan's record."""
-    earlier_members: Mapping[str, tuple[str, tuple[TokenFiles, ...]]] = dataclasses.field(
+    earlier_members: Mapping[str, tuple[JSON, tuple[TokenFiles, ...]]] = dataclasses.field(
         default_factory=dict, compare=False, repr=False)
-    """Each of `members`' digests as a Dew before row 3028 made it, its token stores named without
-    `documents` (`without_documents`), with the token stores the member reads (`earlier_plan`); no part
-    of the plan's record."""
+    """Each of `members`' manifests, undigested, with the token stores the member reads, from which a
+    resume makes the digests an earlier Dew made of it (`earlier_plan`); no part of the plan's record."""
     version: ClassVar[int] = 7
 
     def record(self) -> dict[str, JSON]:
