@@ -172,8 +172,8 @@ class Exchange:
 
 def per_role(index, roles: int, run: Callable[[int, jax.Array], None]) -> None:
     """`run(role, index)` for the role `index` names among `roles`, each role's built at its own static
-    index: Mosaic GPU slices a swizzled tile only at static columns (a role's share of a block's, ET's
-    shared keys at width 256: offsets from the traced index spilled 20 bytes, a static role's none)."""
+    index: Mosaic GPU slices a swizzled tile only at static columns (a role's share of a block's, shared
+    keys at width 256: offsets from the traced index spilled 20 bytes, a static role's none)."""
     for role in range(roles):
         pl.when(index == role)(functools.partial(run, role, index))
 
@@ -609,10 +609,9 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
         time (the left operand's it holds a step deep)."""
         return depth
 
-    def rhs_fragment_depth(self, depth: int, *, transposed: bool = False, swizzle: int | None = None) -> int:
-        """The right operand's depth held in registers, by its storage orientation and its stage's swizzle
-        (bytes; the family's default staging where None)."""
-        del transposed, swizzle
+    def rhs_fragment_depth(self, depth: int, *, transposed: bool = False) -> int:
+        """The right operand's depth held in registers, by its storage orientation."""
+        del transposed
         return self.fragment_depth(depth)
 
     def lhs_fragment_depth(self, depth: int) -> int:
