@@ -1046,10 +1046,10 @@ def test_a_failing_site_raises_its_findings_as_data():
 def test_check_one_is_inconclusive_where_its_seeds_cannot_resolve_the_factor():
     """Errors set seed by seed, alike on every host: Dew's squared error is 4 on even seeds and 0.01 on
     odd ones, the reference's 1 on each, so the pooled ratio (1.42) is under PARITY but its interval
-    straddles it and is wider than it over 8 seeds and over the second stage's 40 alike, never a pass by
-    it: the final verdict asks its typical draw (0.45), resolved under PARITY over the second stage's
-    seeds, with the pooled interval's high end under PARITY² (`_typical_status`, ledger 2469), and passes.
-    Fewer seeds than FEWEST_SEEDS are inconclusive whatever they read."""
+    straddles it and is wider than it over 8 seeds and over the second stage's 40 alike: inconclusive,
+    never a pass. Its draws' paired ratios do not pass it either: their log ratios spread past
+    QUALIFYING_SPREAD (`_typical_status`, ledger 2469). Fewer seeds than FEWEST_SEEDS are inconclusive
+    whatever they read."""
     from reference_error import _interval, _status, _typical_status
     def errors(seed):
         return (np.zeros(64, np.float32), np.full(64, 2.0 if seed % 2 == 0 else 0.1, np.float32),
@@ -1068,10 +1068,10 @@ def test_check_one_is_inconclusive_where_its_seeds_cannot_resolve_the_factor():
         return {"y": x}
 
     mine, theirs = np.asarray([4.0, 0.01] * 20), np.ones(40)
-    low, high = _interval(mine, theirs)
-    assert _status(math.sqrt(2.005), low, high) == "inconclusive" and high <= PARITY ** 2
-    assert _typical_status(mine, theirs, high)[0] == "pass"
-    assert_as_exact(dew, reference, errors, "straddling", seeds=8, truth_fn=truth)
+    assert _status(math.sqrt(2.005), *_interval(mine, theirs)) == "inconclusive"
+    assert _typical_status(mine, theirs)[4].startswith("its draws' log ratios spread")
+    with pytest.raises(Inconclusive):
+        assert_as_exact(dew, reference, errors, "straddling", seeds=8, truth_fn=truth)
     with pytest.raises(Inconclusive):
         assert_as_exact(_reordered, _product, _draw, "two seeds", seeds=2)
     # And seeds_for never declares fewer, whatever it is asked to start from.
@@ -2028,11 +2028,11 @@ def test_a_leaf_read_from_its_rows_distances_is_the_leaf_read_whole():
 
 def rounding_apart(seed):
     """A draw whose two arms round apart, as two programs under fp32 sums do (ledger 2469): a value, its
-    scale (lognormal, sigma 2, as a draw's conditioning sets it) and each arm's own rounding's size on it
-    (lognormal, sigma 0.5, each arm's own)."""
+    scale (lognormal, sigma 3, as a draw's conditioning sets it) and each arm's own rounding's size on it
+    (lognormal, sigma 0.2, each arm's own, so the draws' log RMS ratios spread about 0.28)."""
     rng = np.random.default_rng([2469, seed])
-    return (rng.standard_normal(64).astype(np.float32), np.float32(np.exp(rng.normal(0, 2.0))),
-            np.exp(rng.normal(0, 0.5, 2)).astype(np.float32))
+    return (rng.standard_normal(64).astype(np.float32), np.float32(np.exp(rng.normal(0, 3.0))),
+            np.exp(rng.normal(0, 0.2, 2)).astype(np.float32))
 
 
 def rounded_apart(arm: int, factor: float = 1.0, *, every: int = 1):
@@ -2052,13 +2052,13 @@ def exact_value(x, scale, sizes):
 
 
 def test_arms_rounding_apart_are_judged_by_the_typical_draw_and_a_fault_on_it_or_on_a_minority_is_refused():
-    """Where two arms round apart (each draw's error the draw's scale times each arm's own rounding, both
-    heavy-tailed), the pooled ratio does not resolve within MOST_SEEDS, and a final verdict it leaves
-    inconclusive asks the typical draw's ratio (`_typical_status`, ledger 2469): an equally exact pair passes
-    at the count it sizes; a Dew twice off on every draw is refused; one ten times off on a tenth of its
-    draws, which the typical draw's ratio leaves under PARITY, is refused by the pooled interval's high
-    end past PARITY², the certificate a pass gives."""
-    from reference_error import _interval, _typical_status
+    """Where two arms round apart (each draw's error the draw's scale, heavy-tailed, times each arm's own
+    rounding), the pooled ratio does not resolve within MOST_SEEDS, and a final verdict it leaves
+    inconclusive asks the draws' paired ratios (`_typical_status`, ledger 2469): an equally exact pair,
+    its log ratios spread within QUALIFYING_SPREAD, passes at the count it sizes; a Dew twice off on every
+    draw is refused by its typical draw; one ten times off on a tenth of its draws, which the typical
+    draw's ratio leaves under PARITY, is refused by the spread its fault adds."""
+    from reference_error import _interval, _resolves, _typical_status
 
     reference = rounded_apart(1)
     seeds = seeds_for(reference, rounding_apart, "rounding apart", truth_fn=exact_value,
@@ -2080,10 +2080,10 @@ def test_arms_rounding_apart_are_judged_by_the_typical_draw_and_a_fault_on_it_or
         assert_as_exact(rounded_apart(0, 10.0, every=10), reference, rounding_apart, "a tenth ten times off",
                         seeds=seeds, truth_fn=exact_value)
     # Dew a hundred times the reference's squared error on 13 of 256 draws, equal on the rest: the pooled
-    # ratio 2.46, unresolved, the typical draw's ratio under PARITY; its high end past PARITY² refuses it.
+    # ratio 2.46, unresolved, the typical draw's ratio under PARITY; the spread of its log ratios refuses it.
     mine, theirs = np.where(np.arange(256) < 13, 100.0, 1.0), np.ones(256)
-    low, high = _interval(mine, theirs)
-    assert high > PARITY ** 2 and _typical_status(mine, theirs, high)[0] == "inconclusive"
+    assert not _resolves(*_interval(mine, theirs))
+    assert _typical_status(mine, theirs)[4].startswith("its draws' log ratios spread")
 
 
 def test_a_leaf_the_second_stage_finds_over_is_over_whatever_its_first_stages_typical_draw():
