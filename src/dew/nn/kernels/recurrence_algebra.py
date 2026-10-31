@@ -784,7 +784,7 @@ def factored_range(floor: float, sub: int = SUB) -> bool:
 def key_decayed_pairs(rows: Callable[[int], jax.Array], keys: Callable[[int], jax.Array], columns: int,
                       gates: Callable[[int], tuple],
                       reference: Callable[[int, int], tuple], summed: Callable[..., jax.Array], *,
-                      chunk: int, strict: bool, sub: int = SUB):
+                      chunk: int, strict: bool, rolled: bool, sub: int = SUB):
     """A chunk's pairs' products under a decay a key dimension `[C, C]` fp32, `sum_k r_ik k_jk exp2(g_ik -
     g_jk)` for `j <= i` (`j < i` where `strict`), zero elsewhere: the rows `rows(c)` (the queries, or the
     write-gated keys) and keys `keys(c)` of each key block `c` of `columns`, fp32, `gates(c)` its prefix
@@ -796,7 +796,8 @@ def key_decayed_pairs(rows: Callable[[int], jax.Array], keys: Callable[[int], ja
     within a sub-chunk's range of zero down the rows (and up the keys); past it every pair's value is zero.
     The products accumulate in one sum as fla_kda's into its `b_A` (`summed`, an iterable of `(name, lhs,
     rhs)` taken a product at a time): each its own sum, added after, they were live together (Kimi delta
-    attention's intra launch, 1170 registers a thread on an A100, 519 on an H100)."""
+    attention's intra launch, 1170 registers a thread on an A100, 519 on an H100). The key blocks are a
+    rolled loop where `rolled`, else unrolled."""
     def products(s, c, prefix, down):
         place = s * sub
         start_whole, start_fraction = separated(*reference(s, c))
@@ -806,15 +807,15 @@ def key_decayed_pairs(rows: Callable[[int], jax.Array], keys: Callable[[int], ja
         yield ("pairs", lambda: jnp.where((index >= place) & (index < place + sub), down, 0.0),
                lambda: Transposed(jnp.where(index < place + sub, keys(c) * between(start, prefix), 0.0)))
 
-    total = jnp.zeros((chunk, chunk), jnp.float32)
-    for c in range(columns):
+    def block(c, total):
         # A key block's prefix read once, before its sub-chunks' turns, which are rolled: each one's addresses
         # live within its own turn. Its rows gated down at once, each to its own sub-chunk's first token:
         # gated a sub-chunk at a time, every row was gated for each, and the exponentials were two thirds of
         # the launch (the intra launch 1.51 ms on an H100, 0.53 without them).
         prefix = separated(*gates(c))
         index, _ = _grid(prefix[0].shape)
-        def laid(s, below, c=c, index=index):
+
+        def laid(s, below):
             # Each sub-chunk's reference laid over its rows from its own on, read in a rolled turn: read at
             # static rows, their addresses were hoisted to the kernel's start and held through it (260 of an
             # H100's 475 registers at the peak).
@@ -824,8 +825,15 @@ def key_decayed_pairs(rows: Callable[[int], jax.Array], keys: Callable[[int], ja
 
         start = jax.lax.fori_loop(0, chunk // sub, laid, (jnp.zeros(index.shape, jnp.float32),) * 2)
         down = rows(c) * between(prefix, start)
-        total = jax.lax.fori_loop(0, chunk // sub, lambda s, total, c=c, prefix=prefix, down=down: (
+        return jax.lax.fori_loop(0, chunk // sub, lambda s, total: (
             total + summed(products(s, c, prefix, down), shape=(chunk, chunk))), total)
+
+    total = jnp.zeros((chunk, chunk), jnp.float32)
+    if rolled:
+        total = jax.lax.fori_loop(0, columns, block, total)
+    else:
+        for c in range(columns):
+            total = block(c, total)
     lag = _lags(total.shape)
     return jnp.where(lag > 0 if strict else lag >= 0, total, 0.0)
 

@@ -587,6 +587,19 @@ def equations(graph, *, platform: str | None = None):
             yield from equations(value, platform=platform)
 
 
+def dot_precisions(function, *arguments) -> list:
+    """The precision of every dot_general `function` traces over `arguments` under JAX's own default
+    precision (the test lane sets 'highest' for every product that states none), with the dtype its
+    operands promote to and their shapes, sub-jaxprs included, as a GPU runs them: a CPU's float64
+    sums (`dew.nn.precision.accumulated`) are tests/test_cpu_accumulation.py's."""
+    with jax.default_matmul_precision(None):
+        graph = jax.make_jaxpr(function)(*arguments)
+    return [(equation.params["precision"],
+             jnp.result_type(*(variable.aval.dtype for variable in equation.invars)),
+             tuple(variable.aval.shape for variable in equation.invars))
+            for equation in equations(graph, platform="cuda") if equation.primitive.name == "dot_general"]
+
+
 def assert_fp32_reduction_bound(dew, reference, magnitudes, terms: int) -> None:
     """Two fp32 reductions differ by at most 2 gamma_n sum(abs(products))
     (`dew.accuracy.reduction_bound`): `magnitudes` holds the elementwise sum of

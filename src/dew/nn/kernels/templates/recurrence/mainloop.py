@@ -899,6 +899,13 @@ def _intra(q, k, hi, lo, beta, taken, call: _Call, *, scale: float):
     width, held, gates = call.width, dataclasses.replace(call.held, rows=call.rows), call.gates
     family = call.family
     keys = _key_block(call, functools.partial(_intra_held, call))
+    # The key blocks rolled where products read shared memory, unrolled where they read registers. Kimi
+    # Linear's forward, intra launch, rolled against unrolled: an H100 0.95 ms against 1.16
+    # (kda-rolled-h100-b93c360d8), an A100 2.58 against 2.27 (kda-intra-split-a100-aa7f58a7e). Unrolled, each
+    # block's body lowers again, most of the launch's lowering on an H100 (5.4 of 6.5 s).
+    rolled = not family.operands_in_registers
+    # The sub-chunks' references a key block's own row where a rolled key block indexes them.
+    referenced_shape = (2, CHUNK // algebra.SUB) + ((width // keys, keys) if rolled else (width,))
 
     def program(q_ref, k_ref, hi_ref, lo_ref, beta_ref, taken_ref, *outs, streams, staging, landing):
         n, h = _axis("chunks"), _axis("heads")
@@ -919,8 +926,13 @@ def _intra(q, k, hi, lo, beta, taken, call: _Call, *, scale: float):
             # its stalls on L1TEX scoreboards, JS-kdakept-h100-797377e5d).
             for half, ref in enumerate((hi_ref, lo_ref)):
                 for sub in range(CHUNK // algebra.SUB):
-                    referenced[half, sub, :] = family.columns_of(
-                        ref.at[row + sub * algebra.SUB, pl.ds(h * width, width)])
+                    if not rolled:
+                        referenced[half, sub, :] = family.columns_of(
+                            ref.at[row + sub * algebra.SUB, pl.ds(h * width, width)])
+                        continue
+                    for c in range(width // keys):
+                        referenced[half, sub, c, :] = family.columns_of(
+                            ref.at[row + sub * algebra.SUB, pl.ds(h * width + c * keys, keys)])
 
             def block(name, operand, c):
                 return _tile(slots, name, operand, columns=pl.ds(c * keys, keys)).value()
@@ -932,15 +944,15 @@ def _intra(q, k, hi, lo, beta, taken, call: _Call, *, scale: float):
                 """The sub-chunk's first token's prefix halves on key block `c`, a column's vectors, from the
                 step's plain tile of them (a stream's tiles carry their bundle's transforms, which a traced
                 row does not commute through)."""
-                columns = pl.ds(c * keys, keys)
-                return tuple(family.columns_of(referenced.at[half, sub, columns]) for half in (0, 1))
+                at = c if rolled else pl.ds(c * keys, keys)
+                return tuple(family.columns_of(referenced.at[half, sub, at]) for half in (0, 1))
 
             def gated(c):
                 return block("gates", gates, c), block("lows", gates, c)
 
             pairs = functools.partial(algebra.key_decayed_pairs, columns=width // keys, gates=gated,
                                       reference=reference, summed=Issuer(call, {"pairs": pairing}).summed,
-                                      chunk=CHUNK)
+                                      chunk=CHUNK, rolled=rolled)
             scores = pairs(operand("queries"), operand("keys"), strict=False) * scale
             held.store(outs[-1], scores, row, CHUNK, h * CHUNK, CHUNK, family=family, smem=landing["square"])
             if call.delta:
@@ -963,7 +975,7 @@ def _intra(q, k, hi, lo, beta, taken, call: _Call, *, scale: float):
     # The exponentials: a key block's rows gated down once, its keys up a sub-chunk at a time.
     work = Work(pairs * 2 * CHUNK * CHUNK * width + (_inverse_flops() if call.delta else 0),
                 exponentials=(CHUNK // algebra.SUB + 1) * (1 + call.delta) * CHUNK * width)
-    staging = (_pairing(call, keys), plgpu.SMEM((2, CHUNK // algebra.SUB, width), jnp.float32),
+    staging = (_pairing(call, keys), plgpu.SMEM(referenced_shape, jnp.float32),
                *(_merges(call) if call.delta else ()))
     return _kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
                    grid_names=("chunks", "heads"), blocks=blocks, stages=1, live=_taken(5), work=work,

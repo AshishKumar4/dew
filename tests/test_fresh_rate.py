@@ -121,8 +121,8 @@ def groups(root, name: str) -> tuple[ParamGroup, ...]:
 def context_run(root):
     """A decision run whose context layer draws a cross-attention block over its loaded backbone, an
     adapter on its queries."""
+    from run_kinds import decision
     from test_decision_recipe import QWEN
-    from test_run_options import decision
 
     from dew.lora import LoRA
 
@@ -145,7 +145,7 @@ def test_a_decision_run_records_its_default_fresh_group_over_its_block_and_head(
     """A decision run whose context layer draws a cross-attention block over its loaded backbone records
     the block's and its head's default group in its run.json, and its trained tree steps them in it, an
     adapter's factors and the backbone's every other parameter in the base group (row 2391)."""
-    from test_run_options import trained
+    from run_kinds import trained
 
     state, _ = trained(context_run(tmp_path), tmp_path, "default", trainer=SAVING)
     claimed(labelled(groups(tmp_path, "default"), state.variables["params"]))
@@ -155,7 +155,7 @@ def test_a_decision_run_records_its_default_fresh_group_over_its_block_and_head(
 def test_a_decision_run_that_names_its_groups_resumes_in_them(tmp_path):
     """A run that names its groups keeps its own, its fresh group claiming the block and the head;
     resumed from a recipe naming none, it trains on in the groups its record names (row 2391)."""
-    from test_run_options import trained
+    from run_kinds import trained
 
     run = context_run(tmp_path)
     claiming = dataclasses.replace(run, optim=dataclasses.replace(run.optim, param_groups=(FRESH, BASE)))
@@ -172,7 +172,7 @@ def test_a_run_resumes_its_groups_where_its_record_holds_a_chain_only_its_python
     """A run whose validation chain only its Python holds resumes in the groups its record names, which
     it reads alone, rebuilding nothing of the chain (row 2391's review): its default fresh group, over its
     context block and head, an adapter left out to keep the run small."""
-    from test_run_options import trained
+    from run_kinds import trained
 
     run = dataclasses.replace(context_run(tmp_path), lora=None)
     held = dataclasses.replace(run, validation=run.validation.map(lambda batch: batch))
@@ -184,7 +184,7 @@ def test_a_run_resumes_its_groups_where_its_record_holds_a_chain_only_its_python
 def test_a_tied_readout_takes_no_default_group_and_is_refused_a_named_one(tmp_path):
     """A run whose only drawn module, a tied readout, holds no parameter takes no default group, and is
     refused a fresh group it names (row 2391)."""
-    from test_run_options import trained
+    from run_kinds import trained
 
     from dew.decision.config import Letters
     from dew.decision.layout import Labels
@@ -205,7 +205,7 @@ def test_a_shared_form_run_draws_its_layers_gates_alone_in_its_fresh_group(tmp_p
     Vision's gated cross-attention names it), which its default group claims (row 2414): at layer 3,
     the fixture's one layer of full attention, its own projections reading the context behind the
     gate."""
-    from test_run_options import trained
+    from run_kinds import trained
 
     shared = dataclasses.replace(context_run(tmp_path), context_form="shared", context_layers=(3,))
     gated, _ = trained(shared, tmp_path, "shared")

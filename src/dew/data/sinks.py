@@ -4,7 +4,6 @@ format a native writer writes from one Arrow stream (`Writer`), all committed by
 from __future__ import annotations
 
 import dataclasses
-import hashlib
 import io
 import itertools
 import tempfile
@@ -20,13 +19,14 @@ import pyarrow.dataset as ds
 import pyarrow.fs as pafs
 from array_record.python.array_record_module import ArrayRecordWriter
 
+from dew._records import JSON
 from dew.batch import Batch
 from dew.data.dataset import Closeable
 from dew.data.sources.base import Source
 from dew.data.sources.codec import encode
 from dew.data.sources.files import Format, _arrow_filesystem, declared_format
 from dew.data.steps.text import count_rules, stated_rules
-from dew.data.storage import ObjectRef, Store, commit_export
+from dew.data.storage import Store, commit_export
 
 if TYPE_CHECKING:
     from dew.data.pipeline import Dataset, Pipeline
@@ -89,7 +89,8 @@ def _hub_export(
         return manifest
 
 
-def _length_index(root: Store, writer: str, number: int, batch, field: str | None) -> ObjectRef | None:
+def _length_index(root: Store, writer: str, number: int, batch,
+                  field: str | None) -> dict[str, JSON] | None:
     if field is None:
         return None
     lengths = []
@@ -101,7 +102,7 @@ def _length_index(root: Store, writer: str, number: int, batch, field: str | Non
     sizes = np.asarray(lengths, np.int64)
     np.save(encoded, np.column_stack((sizes, np.cumsum(sizes))), allow_pickle=False)
     path = f"_dew_indexes/{writer}/part-{number:06d}.lengths.npy"
-    return {"path": path, **root.child(path).verified(encoded.getvalue())}
+    return {"path": path, **root.child(path).published(encoded.getvalue())}
 
 
 def write_array_record(path: Path, payloads: Iterable[bytes]) -> None:
@@ -115,7 +116,7 @@ def write_array_record(path: Path, payloads: Iterable[bytes]) -> None:
         writer.close()
 
 
-def _array_shard(root: Store, writer: str, number: int, batch, index: ObjectRef | None):
+def _array_shard(root: Store, writer: str, number: int, batch, index: dict[str, JSON] | None):
     with tempfile.TemporaryDirectory(prefix="dew-export-") as temporary:
         path = Path(temporary) / "part.array_record"
         write_array_record(path, (encode(row) for row in batch))
@@ -124,7 +125,7 @@ def _array_shard(root: Store, writer: str, number: int, batch, index: ObjectRef 
             "path": relative,
             "rows": len(batch),
             "lengths": index,
-            **root.child(relative).verified(path.read_bytes()),
+            **root.child(relative).published(path.read_bytes()),
         }
 
 
@@ -188,18 +189,17 @@ def _streamed(chunks: Iterator[list[Batch | bytes | None]]) -> pa.RecordBatchRea
 
 def _written(target: Store, prefix: str) -> list[Mapping[str, object]]:
     """The files a writer left under `target`, each by its path under the export, `prefix` and its
-    path under `target`, its bytes and digest; the names Spark, Hadoop and Arrow pass over as hidden
-    (a part starting with `_` or `.`, as a `_SUCCESS` or a checksum's) left out, as their readers
-    leave them out."""
+    path under `target`, its bytes and digest, and the version its store holds it at (`Store.held_at`);
+    the names Spark, Hadoop and Arrow pass over as hidden (a part starting with `_` or `.`, as a
+    `_SUCCESS` or a checksum's) left out, as their readers leave them out, and an object store's
+    directory markers, which name no file."""
     fs, directory = target.resolve()
     files = []
     for path in sorted(fs.find(directory)) if fs.exists(directory) else []:
-        relative = path[len(directory):].lstrip("/")
-        if any(part.startswith(("_", ".")) for part in PurePosixPath(relative).parts):
+        relative = path[len(directory):].strip("/")
+        if not relative or any(part.startswith(("_", ".")) for part in PurePosixPath(relative).parts):
             continue
-        payload = fs.cat_file(path)
-        files.append({"path": f"{prefix}/{relative}", "bytes": len(payload),
-                      "sha256": hashlib.sha256(payload).hexdigest()})
+        files.append({"path": f"{prefix}/{relative}", **target.child(relative).held_at()})
     return files
 
 
