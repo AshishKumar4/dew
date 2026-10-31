@@ -883,6 +883,40 @@ def test_kernel_sums_preserve_decode_categories_counts_and_overlapping_streams(s
     assert sum(durations.values()) > split["busy"]
 
 
+
+def test_the_shared_image_set_reads_its_shards_in_the_order_given_as_dew_decodes_a_prepared_image(
+        tmp_path, monkeypatch):
+    """tools/reference_runs/image_set.py reads its prepared ArrayRecord shards through Dew's reader in the
+    order its command line names them, each record's pixels as Dew decodes a prepared image
+    (`DecodeImage`, its integers little-endian), and draws its epochs from its seed (row 3030)."""
+    from array_record.python.array_record_module import ArrayRecordWriter
+
+    from dew.data.sources.codec import pack_dict_of_byte_arrays
+
+    images = [np.arange(18, dtype=np.uint8).reshape(2, 3, 3) + 20 * value for value in range(5)]
+    shards = [str(tmp_path / f"{name}.array_record") for name in ("b", "a")]
+    for path, held in zip(shards, (images[:3], images[3:]), strict=True):
+        writer = ArrayRecordWriter(path, "group_size:1")
+        for image in held:
+            writer.write(pack_dict_of_byte_arrays({"shape": np.asarray([2, 3], "<i4").tobytes(),
+                                                   "image": image.tobytes(),
+                                                   "label": np.asarray([7], "<i4").tobytes()}))
+        writer.close()
+    monkeypatch.syspath_prepend(str(REPO_ROOT / "tools" / "reference_runs"))
+    tool = load("reference_runs/image_set")
+    out = tmp_path / "set.npz"
+    monkeypatch.setattr(sys, "argv", ["image_set.py", "--shards", *shards, "--images", "4", "--epochs", "2",
+                                      "--seed", "3", "--out", str(out)])
+    tool.main()
+    saved = np.load(out)
+    generator = np.random.default_rng(3)
+    np.testing.assert_array_equal(saved["images"], np.stack(images[:4]))
+    np.testing.assert_array_equal(saved["order"], np.stack([generator.permutation(4) for _ in range(2)]))
+    monkeypatch.setattr(sys, "argv", ["image_set.py", "--shards", *shards, "--images", "6",
+                                      "--out", str(out)])
+    with pytest.raises(ValueError):
+        tool.main()
+
 # ---------------------------------------------------------------------------
 # tools/reference_runs/scoreboard.py
 # ---------------------------------------------------------------------------
