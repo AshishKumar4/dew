@@ -753,6 +753,13 @@ _STACKED_EXPERTS: decoder_parts.Leaves = {
 """The canonical experts, each projection one tensor over every expert (`decoder_parts.FUSED_EXPERTS`)."""
 
 
+_PREDICTION_OWN = frozenset({'eh_proj.weight', 'enorm.weight', 'hnorm.weight', 'shared_head.norm.weight',
+                             'final_layernorm.weight'})
+"""A release's prediction depth's own tensors, by their names past `model.layers.{num_layers + d}.`
+(DeepSeek V3's layout, GLM-4.7-Flash's; HY-3 norms its output as `final_layernorm`), which no part of the
+trunk holds."""
+
+
 def family(model_type: str, assembly: Assembly) -> decoder_parts.DecoderFamily:
     """The decoder family a type verified from parts loads through (`dew.interop.verify`): `assembly`'s
     fields for its config, every field of which the source's own code read, and each stored tensor at
@@ -760,7 +767,10 @@ def family(model_type: str, assembly: Assembly) -> decoder_parts.DecoderFamily:
     first (`DecoderFamily.packed`), so an export writes each back under its stored name. A tensor of one
     of the release's prediction depths past the trunk (`Assembly.depths`, by `decoder_parts.layer_depth`)
     fills no leaf: the source's own code builds no depth and its load leaves them unread, so the decoder
-    assembled from that code has none (`prediction_depths` trims them before any is read)."""
+    assembled from that code has none (`prediction_depths` trims them before any is read). Only a depth's
+    own tensors (`_PREDICTION_OWN`) and its block's, a name a trunk layer's part holds, are so; its
+    copies of the trunk's table and head are the trunk's (`hf_decoders` checks each against it, and an
+    export writes it from the trunk's leaf)."""
     def translated(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
         used.update(hf_config)
         return assembly.fields.copy()
@@ -768,7 +778,15 @@ def family(model_type: str, assembly: Assembly) -> decoder_parts.DecoderFamily:
     def weight_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
         depth = decoder_parts.layer_depth(name, config)
         if depth is not None and depth < assembly.depths:
-            return None
+            tail = name.split('.', 3)[3]
+            head, table = assembly.tied
+            if tail == 'shared_head.head.weight':
+                return weight_path(table if config['tie_embeddings'] else head, config)
+            if tail == 'embed_tokens.weight':
+                return weight_path(table, config)
+            last = _records.integer(config['num_layers'], 'num_layers') - 1
+            if tail in _PREDICTION_OWN or assembly.canonical(f'model.layers.{last}.{tail}') is not None:
+                return None
         canonical = assembly.canonical(name)
         if canonical is None:
             raise ValueError(f"the checkpoint's {name!r} is held by no part of the assembled decoder")
