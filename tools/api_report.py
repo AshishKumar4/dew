@@ -8,7 +8,8 @@ A txtar archive of four sections, each a contract consumers outside the reposito
   keyword-only or no constructor argument marked so.
 - `cli`: each command of `dew` (`dew.cli.main.COMMANDS`, `DATA_COMMANDS` under `dew data`,
   `dew.cli.tpu.COMMANDS` under `dew tpu`), each argument as the command declares it to tyro: its field's
-  name, type (aliases resolved) and default, and the markers and spelling tyro is told of.
+  name, type (aliases resolved) and default, and the markers and spelling tyro is told of; and the
+  configuration each group passes tyro (`CONFIG`), which spells them all.
 - `records`: each run record type (`dew.telemetry.records.RECORD_TYPES`), its fields as `config`'s, and
   the schema versions the records, generations and kernel reports carry.
 
@@ -175,12 +176,22 @@ def arguments(cls) -> list[str]:
     return lines
 
 
+def configured(markers) -> str:
+    """A command group's tyro configuration, each marker by its name in `tyro.conf`."""
+    import tyro
+
+    names = {id(value): name for name, value in vars(tyro.conf).items() if not name.startswith("_")}
+    return ", ".join(names.get(id(marker), shown(marker)) for marker in markers)
+
+
 def cli() -> list[str]:
     from dew.cli import main, tpu
 
     lines = []
-    groups = (("dew", main.COMMANDS), ("dew data", main.DATA_COMMANDS), ("dew tpu", tpu.COMMANDS))
-    for prefix, commands in groups:
+    groups = (("dew", main.COMMANDS, main.CONFIG), ("dew data", main.DATA_COMMANDS, main.CONFIG),
+              ("dew tpu", tpu.COMMANDS, tpu.CONFIG))
+    for prefix, commands, markers in groups:
+        lines.append(f"{prefix}  [tyro config: {configured(markers)}]")
         for name, cls in sorted(commands.items()):
             lines.append(f"{prefix} {name}  [{cls.__module__}.{cls.__qualname__}]")
             lines.extend(arguments(cls))

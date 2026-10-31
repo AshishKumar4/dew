@@ -500,6 +500,7 @@ dew.config.sweep.OptunaSearch
 dew.config.sweep.RandomSearch
   seed: int = 0
 -- cli --
+dew  [tyro config: FlagCreatePairsOff, PositionalMetavarFromFieldName]
 dew export  [dew.cli.main.Export]
   run: str  [Positional]
   destination: str  [Positional]
@@ -537,6 +538,7 @@ dew train  [dew.cli.main.Train]
   run: str  [Positional]
   set: tuple[str, ...] = ()  [UseAppendAction]
   trust: tuple[str, ...] = ()
+dew data  [tyro config: FlagCreatePairsOff, PositionalMetavarFromFieldName]
 dew data export  [dew.cli.main.DataExport]
   data: str  [Positional]
   destination: str  [Positional]
@@ -555,6 +557,7 @@ dew data publish  [dew.cli.main.DataPublish]
   branch: Literal['train', 'validation'] = 'train'
   read: Literal['memory', 'indexed', 'streamed'] = 'streamed'
   provision: bool = False
+dew tpu  [tyro config: FlagCreatePairsOff, PositionalMetavarFromFieldName]
 dew tpu attach-disk  [dew.cli.tpu.AttachDisk]
   zone: str | None = None  [metavar='ZONE']
   dry_run: bool = False
