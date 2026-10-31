@@ -40,6 +40,8 @@ from flax.typing import Dtype, PrecisionLike
 from jax.extend import core
 from jax.typing import DTypeLike
 
+from dew.nn.sharding import explicit_spec
+
 __all__ = [
     "ACCURATE",
     "DTYPE_PRESETS",
@@ -219,7 +221,9 @@ def _doubled(value: jax.Array, shape: tuple[int, ...], axes: tuple[int, ...]) ->
         count = shape[axis]
         while value.shape[axis] < count:
             paired = jnp.stack([value, value], axis=axis + 1)
-            value = paired.reshape(*value.shape[:axis], 2 * value.shape[axis], *value.shape[axis + 1:])
+            # The doubled axis keeps the value's placement, an Explicit axis's on a size-one one among it.
+            doubled = (*value.shape[:axis], 2 * value.shape[axis], *value.shape[axis + 1:])
+            value = jax.lax.reshape(paired, doubled, out_sharding=explicit_spec(value))
         value = jax.lax.slice_in_dim(value, 0, count, axis=axis)
     return value
 

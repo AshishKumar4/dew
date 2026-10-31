@@ -153,6 +153,29 @@ def test_a_bias_spread_over_a_sharded_axis_keeps_its_sharding():
     assert np.asarray(gradient).tolist() == np.ones((2, 1, 4)).tolist()
 
 
+@pytest.mark.parametrize("wide", [True, False], ids=["test setting", "library"])
+def test_a_bias_spread_over_a_size_one_explicit_axis_keeps_its_placement(wide, monkeypatch):
+    """A bias `[1, 4]` placed on a size-one Explicit axis spreads to `[3, 4]` under jit, its placement
+    kept on the axis it doubles (`_doubled`, review of ledger 1698's bias sites), adds itself to
+    every position and takes its cotangents' sum."""
+    from jax.sharding import AxisType, NamedSharding, PartitionSpec
+
+    from dew.nn.precision import spread
+
+    if wide:
+        monkeypatch.setenv(WIDE_CPU_ARITHMETIC, "1")
+    else:
+        monkeypatch.delenv(WIDE_CPU_ARITHMETIC, raising=False)
+    mesh = jax.make_mesh((1,), ("row",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:1])
+    with jax.set_mesh(mesh):
+        value = jax.device_put(np.full((1, 4), 0.5, np.float32),
+                               NamedSharding(mesh, PartitionSpec("row", None)))
+        cotangent = np.ones((3, 4), np.float32)
+        out, gradient = jax.jit(with_gradients(lambda value: spread(value, (3, 4))))(value, cotangent)
+    assert np.asarray(out).tolist() == np.full((3, 4), 0.5).tolist()
+    assert np.asarray(gradient).tolist() == np.full((1, 4), 3.0).tolist()
+
+
 def test_another_threads_quantized_trace_leaves_this_threads_products_dews():
     """While one thread traces a quantized model's method (`QUANTIZED_TRACE`, whose products Qwix
     owns), a product another thread compiles, and the same program after that trace ends, sum in
