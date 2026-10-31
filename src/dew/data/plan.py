@@ -426,15 +426,17 @@ def _named_as_today(value: JSON, stores: Sequence[TokenFiles]) -> JSON:
     """`value`, a saved plan's fingerprint of its sources or a part of one, a saved record read at its
     boundary: each token store in it a Dew before row 3028 named without `documents` named with it, as
     today's names it, where it is one of `stores` and that Dew read its documents as today's does
-    (`TokenFiles.read_alike`, a scan of its tokens only here); anything else as it is."""
+    (`TokenFiles.read_alike`, a scan of its tokens only here); a fingerprint that extends a store's with
+    keys of its own (its windows') too. Anything else as it is."""
     if isinstance(value, list):
         return [_named_as_today(part, stores) for part in value]
     if not isinstance(value, dict):
         return value
     if value.get("store") == "tokens" and "documents" not in value:
         for store in stores:
-            before = {name: part for name, part in store.fingerprint().items() if name != "documents"}
-            if json_value(before, "token store fingerprint") == value and store.read_alike():
+            before = record(json_value({name: part for name, part in store.fingerprint().items()
+                                        if name != "documents"}, "token store fingerprint"), "token store")
+            if all(value.get(name) == part for name, part in before.items()) and store.read_alike():
                 return {**value, "documents": "records"}
         return value
     return {name: _named_as_today(part, stores) for name, part in value.items()}
