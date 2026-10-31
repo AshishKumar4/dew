@@ -185,7 +185,8 @@ def attention_terms(query, key, value, cotangent, keep, sinks=None, softcap=None
         if softcap is not None:
             logit_sizes = logit_sizes * jnp.abs(1 - jnp.tanh(raw / softcap) ** 2)
         if score is not None:
-            logit_sizes = logit_sizes * jnp.abs(jax.jvp(score, (raw,), (jnp.ones_like(raw),))[1])
+            # Its slope at each entry, read back (a hook of a custom derivative has no forward one).
+            logit_sizes = logit_sizes * jnp.abs(jax.vjp(score, raw)[1](jnp.ones_like(raw))[0])
 
         def per_key_head(x):
             return x.reshape(*x.shape[:2], kv_heads, heads // kv_heads, x.shape[-1]).sum(3)
