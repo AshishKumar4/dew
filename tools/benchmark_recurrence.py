@@ -45,6 +45,8 @@ from pathlib import Path
 
 import numpy as np
 
+from dew.nn.kernels.options import program
+
 
 @dataclasses.dataclass(frozen=True)
 class Shape:
@@ -189,8 +191,10 @@ def jax_arms(name: str, shape: Shape, warmup: int, repeats: int) -> list[dict]:
 
         arms = {'template': template, 'hand': hand, 'xla': xla}
 
+    # The cotangents are an argument: `program` keeps each function it compiled, and a closure over them
+    # would keep every shape's until the sweep ended.
     def forward_backward(fn):
-        def run(*args):
+        def run(cotangents, *args):
             outputs, pull = jax.vjp(fn, *args)
             return outputs, pull(jax.tree.map(lambda c, o: c.astype(o.dtype), cotangents, outputs))
         return run
@@ -202,9 +206,11 @@ def jax_arms(name: str, shape: Shape, warmup: int, repeats: int) -> list[dict]:
         if refusals.get(arm):
             row.update(fwd_ms=None, fwd_bwd_ms=None, error=f"refuses: {refusals[arm]}")
             continue
-        for part, compiled in (('fwd_ms', jax.jit(fn)), ('fwd_bwd_ms', jax.jit(forward_backward(fn)))):
+        parts = (('fwd_ms', program(fn), inputs),
+                 ('fwd_bwd_ms', program(forward_backward(fn)), (cotangents, *inputs)))
+        for part, compiled, given_args in parts:
             try:
-                measured = samples(compiled, *inputs, warmup=warmup, repeats=repeats)
+                measured = samples(compiled, *given_args, warmup=warmup, repeats=repeats)
                 row[part] = 1e3 * statistics.median(measured)
             except jax.errors.JaxRuntimeError as error:
                 row[part], row['error'] = None, _failure(error)

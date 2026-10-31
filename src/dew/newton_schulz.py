@@ -181,8 +181,9 @@ def ns_operands(dtype, preconditioning: Preconditioning = "frobenius",
     LR-h100-muon-2752c at 699d038ca, 8192 tokens a step) stepped in 844 ms with its iteration in bfloat16
     (`BF16_BF16_F32`), 1287 ms at TF32 (`TF32_TF32_F32`) and 4641 ms at IEEE float32 (`F32_F32_F32`), against
     AdamW's 495 ms, its loss at each of 30 steps within 0.07 of the float32 iteration's (0.02 on average);
-    at 65536 tokens an update, eight microbatches accumulated, a step in 469 ms against AdamW's 466 (ledger
-    2685, 2752)."""
+    at 65,536 tokens an update, eight microbatches, about 4156 ms an update against 3797, 9.4% over
+    AdamW, its update's microbatch 860 ms against 516 and the accumulating ones about AdamW's
+    (`dew.optim.muon`; ledger 2685, 2752)."""
     from dew.nn.kernels.generation import numerics
 
     if jnp.issubdtype(dtype, jnp.complexfloating):

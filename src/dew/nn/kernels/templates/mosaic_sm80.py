@@ -32,7 +32,7 @@ def _staging(block: tuple, swizzle: int | None) -> tuple:
 def swizzled(shape: tuple[int, ...], dtype) -> tuple:
     """A `[rows, columns]` shared-memory tile's transforms: 8-row tiles as wide as the swizzle its row
     bytes allow, swizzled (bank-conflict-free ldmatrix), as jax's Ampere examples stage their operands."""
-    return mosaic.swizzle_transforms(dtype, plgpu.find_swizzle(shape[-1] * jnp.dtype(dtype).itemsize * 8))
+    return mosaic.swizzle_transforms(dtype, mosaic.widest_swizzle(dtype, shape[-1]))
 
 
 def _depth_granule(ref, axis: int, instruction: int) -> int:
@@ -45,7 +45,7 @@ def _depth_granule(ref, axis: int, instruction: int) -> int:
         return instruction
     swizzle = max((transform.swizzle for transform in ref.transforms
                    if isinstance(transform, plgpu_core.UnswizzleRef)), default=0)
-    return max(instruction, swizzle // jnp.dtype(ref.dtype).itemsize)
+    return max(instruction, mosaic.swizzle_columns(ref.dtype, swizzle))
 
 
 class Slots:
@@ -165,9 +165,8 @@ class Mma(mosaic.Family):
         """The depth a load of a stage whose rows are `depth` deep takes: one tile of its `swizzle` (bytes;
         the widest its row bytes allow where None, `swizzled`, `_depth_granule`), the whole depth where it
         is narrower."""
-        itemsize = jnp.dtype(self.dtype).itemsize
-        swizzle = plgpu.find_swizzle(depth * itemsize * 8) if swizzle is None else swizzle
-        return max(self.fragment_depth(depth), min(depth, swizzle // itemsize))
+        swizzle = mosaic.widest_swizzle(self.dtype, depth) if swizzle is None else swizzle
+        return max(self.fragment_depth(depth), min(depth, mosaic.swizzle_columns(self.dtype, swizzle)))
     most_shared = 163 * 1024  # sm80's and sm87's opt-in block (sm86's and sm89's 99 KiB)
     copies_vectors = False  # cp.async spreads a copy over the warpgroup's threads, 128 elements at least
     adds_vectors = False  # its atomic adds take no layout replicating a vector's entries (a [bk] key sum's)
@@ -211,7 +210,7 @@ class Mma(mosaic.Family):
 
     def depths(self, dtype) -> tuple[int, ...]:
         # Its operand blocks' rows staged at a 128- or 64-byte swizzle (`swizzled`).
-        return tuple(swizzle // jnp.dtype(dtype).itemsize for swizzle in (mosaic.SWIZZLE_BYTES, 64))
+        return tuple(mosaic.swizzle_columns(dtype, swizzle) for swizzle in (mosaic.SWIZZLE_BYTES, 64))
 
     @property
     def layout(self):

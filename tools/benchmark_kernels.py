@@ -32,6 +32,7 @@ import optax
 from benchmark_cases import LM_DENSE, LM_MOE, Case
 from benchmark_models import build_trainer, compiled_step, timed_steps
 
+from dew.nn.kernels.options import program
 from dew.nn.moe import expert_projection
 from dew.optim import OptimConfig
 from dew.telemetry.benchmark import samples
@@ -61,25 +62,26 @@ def projection(args: argparse.Namespace) -> dict[str, object]:
     cotangent = jnp.asarray(rng.normal(size=(rows, features)), jnp.bfloat16)
     group_sizes = jnp.asarray(sizes)
 
-    def project(x, kernel):
+    # Arrays are arguments, not closures: `program` keeps each function it compiled.
+    def project(x, kernel, group_sizes):
         return jnp.asarray(expert_projection(x, kernel, group_sizes, jnp.bfloat16,
                                              args.implementation, None))
 
-    def loss(x, kernel):
-        return jnp.sum(project(x, kernel).astype(jnp.float32) * cotangent.astype(jnp.float32))
+    def loss(x, kernel, group_sizes, cotangent):
+        return jnp.sum(project(x, kernel, group_sizes).astype(jnp.float32) * cotangent.astype(jnp.float32))
 
-    forward = jax.jit(project)
-    both = jax.jit(jax.value_and_grad(loss, argnums=(0, 1)))
-    output = np.asarray(forward(x, kernel), np.float64)
-    _, (dx, dk) = both(x, kernel)
+    forward = program(project)
+    both = program(jax.value_and_grad(loss, argnums=(0, 1)))
+    output = np.asarray(forward(x, kernel, group_sizes), np.float64)
+    _, (dx, dk) = both(x, kernel, group_sizes, cotangent)
     oracle, dx_oracle, dk_oracle = grouped_oracle.products(x, kernel.astype(jnp.bfloat16), cotangent, sizes)
 
     def relative(value, reference):
         return float(np.abs(np.asarray(value, np.float64) - reference).max() / np.abs(reference).max())
 
     return {"implementation": args.implementation, "shape": [rows, width, features, experts],
-            "groups": sizes.tolist(), "forward": timed(forward, (x, kernel), args.repeats),
-            "forward_backward": timed(both, (x, kernel), args.repeats),
+            "groups": sizes.tolist(), "forward": timed(forward, (x, kernel, group_sizes), args.repeats),
+            "forward_backward": timed(both, (x, kernel, group_sizes, cotangent), args.repeats),
             "forward_error": relative(output, oracle), "input_gradient_error": relative(dx, dx_oracle),
             "kernel_gradient_error": relative(dk, dk_oracle)}
 

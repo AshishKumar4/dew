@@ -5,6 +5,7 @@ caller asked for, and keeps the declaration through every mainloop and its VJP's
 
 import dataclasses
 import itertools
+from collections.abc import Iterator
 
 import jax
 import jax.numpy as jnp
@@ -82,16 +83,25 @@ BF16_LARGEST = float(jnp.finfo(jnp.bfloat16).max)
 """bf16's largest finite value, `(2 - 2^-7) 2^127`, an fp32 value."""
 
 
+def bf16_parts(x: jax.Array, count: int, *, saturating: int) -> Iterator[jax.Array]:
+    """fp32 `x` as `count` bf16 parts, largest first, each the last's remainder rounded (exact) and formed
+    only as it is taken, so a mainloop retiring each part's product before the next holds one part's
+    registers: three sum to `x` exactly, two to 16 of its significand's bits. The first `saturating`
+    saturate at bf16's largest (an fp32 value past it rounds to infinity in bf16, its remainder then NaN),
+    the next parts taking the difference; on a finite `x` the later ones never reach it, so only a
+    nonfinite one tells them apart."""
+    rest = x
+    for index in range(count):
+        held = jnp.clip(rest, -BF16_LARGEST, BF16_LARGEST) if index < saturating else rest
+        part = held.astype(jnp.bfloat16)
+        yield part
+        if index + 1 < count:
+            rest = rest - part.astype(jnp.float32)
+
+
 def formed(x: jax.Array, count: int) -> tuple[jax.Array, ...]:
-    """fp32 `x` as `count` bf16 parts, largest first, each the last's remainder rounded (exact): three sum to
-    `x` exactly, two to 16 of its significand's bits. The first saturates at bf16's largest (an fp32 value
-    past it rounds to infinity in bf16, its remainder then NaN), the next parts taking the difference."""
-    pieces, rest = [], x
-    for _ in range(count):
-        piece = jnp.clip(rest, -BF16_LARGEST, BF16_LARGEST).astype(jnp.bfloat16)
-        pieces.append(piece)
-        rest = rest - piece.astype(jnp.float32)
-    return tuple(pieces)
+    """`bf16_parts` of `x`, every part saturating, all formed at once."""
+    return tuple(bf16_parts(x, count, saturating=count))
 
 
 def terms(left: int, right: int) -> list[tuple[int, int]]:

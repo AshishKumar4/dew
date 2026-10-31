@@ -11,7 +11,7 @@ deleted; the rest records the design as its review left it on `feat/mma-sync-fam
 One complete mma.sync Family bundle (`templates/mosaic_sm80.Mma`): the one every template's Ampere-class
 mainloop runs on. This round: two consumer warpgroups, a collective cp.async pipeline, hooks, the kernel
 gradient (dW), one resource descriptor and one derived launch. It is measured on an A100 and an L4 against
-the frozen Triton route.
+the Pallas-Triton route.
 
 Scope is sm80, sm86 and sm89, the parts whose copies are cp.async. On sm120 (consumer Blackwell) JAX picks the
 copy transport by compute capability, not by the MMA family (`pipeline.py:331`, `primitives.py:1088`): cp.async

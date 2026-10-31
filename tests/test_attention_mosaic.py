@@ -1519,9 +1519,11 @@ FORWARD_GATE = [(generation_name, width, training, "none") for generation_name i
 FORWARD_GATE += [(generation_name, width, training, hooks) for generation_name in GATED for width in (64, 128)
                  for training in (template.Kept.NONE, template.Kept.SPLIT)
                  for hooks in BACKWARD_HOOKS if hooks != "none"]
+FORWARD_GATE += [(generation_name, 256, template.Kept.NONE, "softcap") for generation_name in GATED]
 """The forward resource gate's cases: each GPU whose family the mainloop qualifies (`GATED`), a causal call's
-head widths, the inference and the training forward, hookless, and each score hook at the widths a hooked
-call's derivation takes (row 2281: its live set beside the walk's)."""
+head widths, the inference and the training forward, hookless, each score hook at the widths a hooked
+call's derivation takes (row 2281: its live set beside the walk's), and a softcap's inference forward 256
+wide (Gemma's)."""
 
 
 def _forward_kernels(op, ba, config) -> dict:

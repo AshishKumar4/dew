@@ -299,11 +299,8 @@ def _best_argument():
             return None
         if text.startswith(('{', '[')):
             policies = json.loads(text)
-            return (
-                tuple(Best(**policy) for policy in policies)
-                if isinstance(policies, list)
-                else Best(**policies)
-            )
+            kind = tuple[Best, ...] if isinstance(policies, list) else Best
+            return from_record(kind, policies, dtypes=False)
         return Best(text)
 
     def write(policy):
@@ -325,18 +322,6 @@ def _best_argument():
         str_from_instance=write)
 
 
-def _record_argument[T](kind: type[T]):
-    """A record's command-line form, its JSON (`to_record`'s, read back by `from_record`), or None."""
-    return tyro.constructors.PrimitiveConstructorSpec(
-        nargs=1,
-        metavar="JSON|None",
-        instance_from_str=lambda given: (None if given[0] == "None"
-                                         else from_record(kind, json.loads(given[0]))),
-        is_instance=lambda value: value is None or isinstance(value, kind),
-        str_from_instance=lambda value: ["None" if value is None else json.dumps(to_record(value, kind))],
-    )
-
-
 def _numerics_argument():
     """A run's numerics on the command line: a preset's name ("accurate", "default"), the usual dtypes'
     Lightning name ("bf16-true"), or a `Numerics` record's JSON (`dew.nn.precision.numerics_of`)."""
@@ -354,7 +339,7 @@ def _keep_argument():
     return tyro.constructors.PrimitiveConstructorSpec(
         nargs=1,
         metavar="LATEST|JSON",
-        instance_from_str=lambda given: Keep(**json.loads(given[0]))
+        instance_from_str=lambda given: from_record(Keep, json.loads(given[0]), dtypes=False)
         if given[0].startswith("{")
         else int(given[0]),
         is_instance=lambda keep: isinstance(keep, (int, Keep)),
@@ -402,7 +387,7 @@ class SourceOptions:
     block_bidirectional, each of a row's blocks read whole, which a run's rows then lie in
     (`Pretrained.load`'s `modeling_overrides`); None the checkpoint's own:
     `--source.attention full_attention block_bidirectional`."""
-    dex: Annotated[DifferentialExtension | None, _record_argument(DifferentialExtension)] = None
+    dex: Annotated[DifferentialExtension, record_argument(DifferentialExtension)] | None = None
     """DEX's differential on chosen heads (`dew.nn.dex`, `Pretrained.load`'s `dex`), its record as
     JSON: `--source.dex '{"layers": [[0, [1, 3]], [5, [0, 2]]], "anneal_steps": 1000}'`, its
     `trains` the paper's recipe unless "all"; None for none."""

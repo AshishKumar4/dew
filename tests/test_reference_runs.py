@@ -24,10 +24,8 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import NamedTuple
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
@@ -41,18 +39,6 @@ from dew.optim import Cosine, OptimConfig, ParamGroup
 from dew.training import MeshSpec, Trainer
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
-
-
-class NormState(NamedTuple):
-    norm: jax.Array
-
-
-def recorded_norm() -> optax.GradientTransformation:
-    """Pass the gradient on and keep its global norm, the value torch's
-    `clip_grad_norm_` returns, in the optimizer state."""
-    return optax.GradientTransformation(
-        lambda params: NormState(jnp.zeros((), jnp.float32)),
-        lambda updates, state, params=None: (updates, NormState(optax.tree.norm(updates))))
 
 
 def test_lm_fine_tune_steps_are_as_exact_as_torch():
@@ -69,15 +55,18 @@ def test_lm_fine_tune_steps_are_as_exact_as_torch():
     solver = OptimConfig(
         optimizer="adamw", b1=0.9, b2=0.95, optimizer_opts={"eps": 1e-8}, learning_rate=schedule,
         weight_decay=0.1, clip_grads=1.0, param_groups=(ParamGroup("all", ("*",)),)).build(steps)
-    trainer = Trainer(objective, optax.chain(recorded_norm(), solver), key=jax.random.key(0),
+    trainer = Trainer(objective, solver, key=jax.random.key(0),
                       mesh=MeshSpec(), checkpoints=None, tracker=None)
     state, _, _ = trainer.place()
     step = trainer.compile(state, {TEXT_KEY: tokens[0]})
     losses, norms = [], []
     for rows in tokens:
-        state, loss, _, _, _, _ = step(state, {TEXT_KEY: rows})
+        state, loss, _, _, _, committed = step(state, {TEXT_KEY: rows})
         losses.append(float(loss))
-        norms.append(float(state.opt_state[0].norm))
+        # The trainer's commit telemetry: the global norm of the gradient it handed the solver, the
+        # value torch's `clip_grad_norm_` returns.
+        assert int(committed.count) == 1
+        norms.append(float(committed.norm))
 
     np.testing.assert_allclose([schedule.schedule(steps)(index) for index in range(steps)],
                                fixture["lr"], rtol=1e-6)
@@ -265,3 +254,40 @@ assert seconds > 0 and len(samples) == 1 and record["finite_losses"]
     done = subprocess.run([sys.executable, "-c", script, str(REPO_ROOT), str(tmp_path / "work.json")],
                           env=env, capture_output=True, text=True, timeout=600)
     assert done.returncode == 0, done.stderr[-3000:]
+
+
+def test_dews_diffusion_reference_trains_dews_own_loss_on_its_batchs_draws(monkeypatch):
+    """The objective Dew's side of the diffusion reference trains (`fixed_draws`) loses, on a batch
+    holding its noise levels and noise, what Dew's own loss loses with those draws its step's tape: its
+    numerator and its mass. Any attempt's key gives that loss, other draws another, and each microbatch
+    of an update split in two, its rows at their places among the update's examples, loses what those
+    rows lose alone."""
+    from dew.objectives.base import Step
+
+    monkeypatch.syspath_prepend(str(REPO_ROOT / "tools" / "reference_runs"))
+    runner = load("reference_runs/diffusion")
+    counted = runner.counting_objective((8, 8, 3), "float32", "xla")
+    variables = counted.init(jax.random.key(0))
+    trained = runner.fixed_draws(counted, variables, None)
+    images = np.random.default_rng(0).integers(0, 255, (4, 8, 8, 3), dtype=np.uint8)
+    levels, noise = runner.draws(0, 2, 4, (8, 8, 3))
+
+    def step(key=0, places=None) -> Step:
+        return Step(np.int32(0), jax.random.key(key), variables,
+                    example_index=None if places is None else np.asarray(places, np.int32),
+                    example_count=None if places is None else 4)
+
+    def loss(levels, rows=(0, 1, 2, 3), key=0, places=None):
+        """What the trained objective loses on the batch's `rows` under `levels`."""
+        rows = list(rows)
+        batch = {"image": images[rows], "t": levels[rows], "noise": noise[0][rows]}
+        return trained.loss(variables, batch, step(key, places))[0]
+
+    whole = loss(levels[0])
+    own = counted.loss(variables, {"image": images}, step().replace(
+        tape={"times": levels[0], "noise": noise[0]}))[0]
+    assert (float(whole.total), float(whole.mass)) == (float(own.total), float(own.mass))
+    assert float(loss(levels[0], key=7).total) == float(whole.total)
+    assert float(loss(levels[1]).total) != float(whole.total)
+    for rows in ((0, 1), (2, 3)):
+        assert float(loss(levels[0], rows, 3, rows).total) == float(loss(levels[0], rows).total)

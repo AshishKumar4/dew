@@ -1041,23 +1041,13 @@ def _narrow_float(value) -> bool:
     return jnp.issubdtype(dtype, jnp.floating) and jnp.finfo(dtype).bits < 32
 
 
-@functools.partial(jax.custom_vjp, nondiff_argnums=(1, 2))
 def _accumulated(value: jax.Array, shape: tuple[int, ...], dimensions: tuple[int, ...]) -> jax.Array:
-    """`jax.lax.broadcast_in_dim`, whose gradient sums in fp32 and rounds once to `value`'s dtype."""
-    return jax.lax.broadcast_in_dim(value, shape, dimensions)
-
-
-def _accumulated_forward(value, shape, dimensions):
-    return _accumulated(value, shape, dimensions), value
-
-
-def _accumulated_backward(shape, dimensions, value, cotangent):
-    _, transpose = jax.vjp(lambda wide: jax.lax.broadcast_in_dim(wide, shape, dimensions),
-                           value.astype(jnp.float32))
-    return (transpose(cotangent.astype(jnp.float32))[0].astype(value.dtype),)
-
-
-_accumulated.defvjp(_accumulated_forward, _accumulated_backward)
+    """`jax.lax.broadcast_in_dim`, whose gradient sums in fp32 and rounds once to `value`'s dtype at every
+    order: the broadcast taken in fp32 between two casts, each exact, so its transpose, wherever JAX forms
+    one (a gradient, a gradient's gradient, forward over reverse), widens the cotangent, sums it in fp32
+    and rounds the sum once (ledger 2653). A custom VJP takes no forward mode, and a custom JVP over the
+    plain broadcast would sum its nested derivatives narrow."""
+    return jax.lax.broadcast_in_dim(value.astype(jnp.float32), shape, dimensions).astype(value.dtype)
 
 
 def _forward(model: PreTrainedModel, tokens: torch.Tensor, positions: torch.Tensor | None = None,

@@ -144,16 +144,7 @@ The presets in `dew.data.presets` prepare one kind of record for a model and end
 
 The same call runs on one device or many. `Trainer(..., mesh=MeshSpec(fsdp=4))` shards the parameters and optimizer state over four devices; the objective, the model and the data do not change.
 
-The trainer logs the loss, the objective's metrics and an injected learning rate, but not the gradient norm, which would be one more reduction over every gradient each step. To track it, chain a transformation that keeps the norm in the optimizer state and read `state.opt_state[0]` after `fit`. Next to `clip_by_global_norm`, XLA computes the norm once for both, so it costs nothing:
-
-```python
-import jax.numpy as jnp
-import optax
-
-record_norm = optax.GradientTransformation(
-    lambda params: jnp.zeros(()), lambda updates, state, params=None: (updates, optax.tree.norm(updates)))
-optimizer = optax.chain(record_norm, optax.clip_by_global_norm(1.0), optax.adamw(1e-3))
-```
+The trainer logs the loss, the objective's metrics, an injected learning rate and `train/grad_norm`: the mean global norm of the gradient each committed update hands the optimizer, before any clipping. A compiled step returns it as `Committed.norm` over `Committed.count`.
 
 ## Training state
 

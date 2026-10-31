@@ -159,14 +159,21 @@ class InputSpec:
         A `ModelInputs` field's shape is taken from its token rows. A batch that
         need not be `whole`, a validation split's that an objective may score
         from fewer fields (a rollout's prompts alone), is held to the shapes of
-        the fields it carries."""
+        the fields it carries, but for an inpainting spec's mask and the sample
+        it masks, which every draw and loss reads (ledger 2900)."""
         for condition in self.conditions.values():
             if condition.field not in batch and whole:
                 raise ValueError(
                     f"objective.inputs needs condition field {condition.field!r} in the training batch"
                 )
+        if self.mask is not None and self.mask.key not in batch:
+            raise ValueError(f"an inpainting objective reads each image's mask, {self.mask.key!r}, in every "
+                             "batch it trains on or scores: draw one with dew.data.images.RandomMask() "
+                             "(images(..., augment=RandomMask()), and rejects=False for a validation split, "
+                             "whose random steps draw by each record's own index), or decode a dataset's own")
+        masked = self.mask is not None
         for declared in (self.sample, self.mask):
-            if declared is None or (declared.key not in batch and not whole):
+            if declared is None or (declared.key not in batch and not whole and not masked):
                 continue
             if declared.key not in batch:
                 raise ValueError(f"objective.inputs needs field {declared.key!r} in the training batch")

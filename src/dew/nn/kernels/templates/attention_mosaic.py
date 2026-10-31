@@ -395,21 +395,25 @@ def _hook_live(family: mosaic.Family, block_q: int, block_k: int, params: tuple,
 
 
 PREDICATE_REGISTERS = 7
-"""The predicate registers a GPU thread holds (P0 to P6): a mask's predicates past them ptxas saves to
-general registers (P2R) until the selects that read them (`_mask_registers`)."""
+"""The predicate registers a GPU thread holds (P0 to P6): a step's predicates past them ptxas saves to
+general registers (P2R) until the selects that read them (`_anchor_registers`)."""
 
 
-def _mask_registers(family: mosaic.Family, block_q: int, block_k: int) -> int:
-    """The registers a queries-first backward step's mask holds (`algebra.seen`), from its logits to its
-    cotangents: its predicates packed a bit an entry; a row pass's of them, a role's rows, pending between
-    the compares that form them and the selects that read them, all but those its predicate registers hold
-    (`PREDICATE_REGISTERS`); and the coordinates it compares, the keys' column vector and the queries' row
-    vector, int32 (the SASS of dQ at 128 x 64, width 64, under sinks: 49 words, 2 packed, 27 pending and 20
-    coordinates; at 64 x 64, width 128, 44 in the accurate form, 1, 24 and 18, its need 255 unspilled)."""
+def _anchor_registers(family: mosaic.Family, block_q: int, block_k: int) -> int:
+    """The registers a queries-first backward step's anchor select holds (`at_anchor`, `algebra.grad_scores`)
+    across the step, from the compares that form it to the selects that read it: its predicates packed a
+    bit an entry; a row pass's of them, a role's rows, pending, all but those its predicate registers hold
+    (`PREDICATE_REGISTERS`); and the places it compares, the keys' column vector and the anchor keys' row
+    vector, int32. The SASS of dQ under ALiBi at 64 x 64, width 64, on an A100: 32 `key != anchor`
+    compares a thread packed into one word, 25 saved by P2R, restored by ISETP and FSEL, 43 words at its
+    need (200); the accurate form's at 64 x 64 and width 128 on an H100 1, 24 and 18, its need 255; dQ at
+    128 x 64, width 64, under sinks 2, 27 and 20. Priced beside every phase: beside its products alone, the
+    accurate form's dQ under a temperature took 64 x 64 at width 64, where it spills 232 bytes
+    (ET-PINBWD), its hook's slopes live across the select."""
     entries = block_q * block_k // resources.THREADS
     pending = max(0, family.role_rows * block_k // resources.THREADS - PREDICATE_REGISTERS)
-    coordinates = family.column_registers(block_k, jnp.int32) + family.row_registers(block_q, jnp.int32)
-    return -(-entries // 32) + pending + coordinates
+    places = family.column_registers(block_k, jnp.int32) + family.row_registers(block_q, jnp.int32)
+    return -(-entries // 32) + pending + places
 
 
 def _forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dtype, residuals: bool, *,
@@ -421,15 +425,17 @@ def _forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dt
     fragment holds, which its fragment's two rows share (an MMA accumulator's layout: half the tile's words;
     TWOPASS5-h100: uncounted, 64 x 128 on two consumers derived and spilled, 6.6 ms against 64 x 64's 1.06);
     its peak walk holds less. The `natural` form's exponential (`algebra.natural_exp`) holds at its peak the
-    scaled logits, their rounded product and its residual (`two_product`), three fp32 tiles, beside the
-    product's bit split, an int32 tile; a training walk's then its power's integral part built in bits, two
-    int32 tiles beside its weights (the corrected IR live set, ET-HOOKBREAK: 198 at 64 x 64 and width 128,
-    the acc's 66 beside 3 x 32 fp32 and 32 int32; a natural training walk 174 at width 64, its fold's 110
-    and 64 int32). A score hook's parameters are live beside the logits it reads (`_hook_live`), a phase of
-    their own: the hook adds them into its logits, dead past it (ET-PINFWD: key-bias and tile-bias at 64 x 64
-    on two consumers, width 64, ptxas 168 unspilled where they priced beside the weights 180 and 196). Where
-    its family reads operands from registers, its products' fragments beside their tiles (`_products`): the
-    logits' product of `width`-deep queries and keys, and the values' product of the weights."""
+    scaled logits' rounded product and its residual (`two_product`), two fp32 tiles, beside the product's
+    bit split, an int32 tile, the logits themselves read entry by entry into them (ET-PINSOFT: width 256
+    under a softcap at 64 x 64, ptxas 255 unspilled where three fp32 tiles priced 260; the IR's breadth-first
+    live set holds the third, ET-HOOKBREAK); a training walk's then its power's integral part built in bits,
+    two int32 tiles beside its weights (ET-HOOKBREAK: a natural training walk 174 at width 64, its fold's
+    110 and 64 int32). A score hook's parameters are live beside the logits it reads (`_hook_live`), a phase
+    of their own: the hook adds them into its logits, dead past it (ET-PINFWD: key-bias and tile-bias at
+    64 x 64 on two consumers, width 64, ptxas 168 unspilled where they priced beside the weights 180 and
+    196). Where its family reads operands from registers, its products' fragments beside their tiles
+    (`_products`): the logits' product of `width`-deep queries and keys, and the values' product of the
+    weights."""
     block_q, block_k = tiles.block_q, tiles.block_k
     hooked, vectors = _hook_live(family, block_q, block_k, params)
     logits, weights = (block_q, block_k, jnp.float32), (block_q, block_k, dtype)
@@ -439,7 +445,7 @@ def _forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dt
         step.append((block_q // 2, block_k, jnp.int32))
     phases = [step]
     if natural:
-        phases.append([logits] * 3 + [bits])
+        phases.append([logits] * 2 + [bits])
         if residuals:
             phases.append([logits, weights, weights, bits, bits])
     depth = value_width if width is None else width
@@ -568,10 +574,10 @@ def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int
     products = [logits] * 2 + [(block_q, block_k, jnp.int8)] + held
     pullback = products[1:] + [logits] * slopes
     if dq:
-        # dQ's mask priced as its SASS holds it (`_mask_registers`), its hook's parameters and gradients
-        # beside its pullback, not its products: they stream in and out of its entries (dQ under a tile
-        # bias at 64 x 64, width 128: S's and dP's accumulators the only float tiles at its peak).
-        mask = _mask_registers(family, block_q, block_k)
+        # dQ's anchor select priced as its SASS holds it (`_anchor_registers`); its hook's parameters and
+        # gradients beside its pullback, not its products: they stream in and out of its entries (dQ under
+        # a tile bias at 64 x 64, width 128: S's and dP's accumulators the only float tiles at its peak).
+        anchor = _anchor_registers(family, block_q, block_k)
         products = products[:2]
         pullback = products[1:] + [(block_q, block_k, jnp.float32)] * slopes + held
         carried = [(block_q, width // config.columns, jnp.float32)] * (2 if accurate else 1)
@@ -587,7 +593,7 @@ def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int
                               (block_q, block_k, width // config.columns, cotangents[1:], True, False),
                               narrow=config.narrow)
         phases = resources.live_registers(family, carried, products, pullback, cotangents, *fragments)
-        return phases + mask + rows + vectors
+        return phases + anchor + rows + vectors
     if config.shared_keys:
         # Shared keys (`attention_mosaic_coop`): a consumer's share of the head's columns of dK and dV
         # carried, beside a step's two products over its share of the keys and its share of the dQ tile,
@@ -702,7 +708,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
             # Every consumer's share of the keys whole rows of a swizzle the exchange stages them at
             # (`mosaic.swizzle_for`), its share of the columns whole swizzled rows (`attention_mosaic_coop`).
             share = _width(ba.arguments["query"].shape[-1], family, dtype) // config.consumers
-            narrowest = mosaic.NARROWEST_SWIZZLE_BYTES // jnp.dtype(dtype).itemsize
+            narrowest = family.narrowest_columns(dtype)
             return (config.fused and config.queries_first and config.consumers > 1 and config.columns == 1
                     and (config.block_k // config.consumers) % narrowest == 0
                     and share % family.column_unit(dtype) == 0)

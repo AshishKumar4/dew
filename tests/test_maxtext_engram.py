@@ -5,7 +5,7 @@ in one table, projected to a key per stream and a shared value with biases, the 
 on their normed keys through a signed root and a sigmoid, the gated values normed again through a
 causal depthwise conv of taps `max_ngram_size` apart and a SiLU, joined by the gated values, added to
 the streams. MaxText's layer over drawn weights, streams and buckets is recorded
-(tools/maxtext_reference.py engram); Dew's float32 output is as exact as MaxText's against float64
+(tools/venv_reference.py engram); Dew's float32 output is as exact as MaxText's against float64
 (check 1)."""
 
 from pathlib import Path
@@ -14,7 +14,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax.traverse_util import unflatten_dict
-from maxtext_recordings import assert_as_exact_as_maxtext
+from reference_runs import assert_as_exact_as_recorded
 
 FIXTURE = Path(__file__).parent / "fixtures" / "maxtext" / "engram.npz"
 VOCAB_SIZES = (11, 13, 17, 19)
@@ -86,21 +86,21 @@ def layer(dtype):
     return decoder.apply({}, method=lambda module: module.layers[0].engram)()
 
 
-OUTPUT = "streams"
-"""The name of what `dew` gives, the site's recorded leaf."""
+OUTPUTS = ("streams",)
+"""The names of what `dew` gives, the site's recorded leaves."""
 
 
 def dew(dtype, inputs) -> dict:
     """Dew's streams at `dtype` after the layer, each head's local bucket offset into the one table."""
     offsets = np.cumsum((0, *VOCAB_SIZES[:-1]))
-    return {OUTPUT: layer(dtype).apply(dew_variables(inputs), inputs["streams"], inputs["ids"] + offsets)}
+    return {OUTPUTS[0]: layer(dtype).apply(dew_variables(inputs), inputs["streams"], inputs["ids"] + offsets)}
 
 
 def test_the_ple_layer_computes_maxtexts_engram():
     """Dew's float32 streams after its PLE layer under MaxText's Engram weights are as exact as
     MaxText's own float32 layer against its float64 run (check 1 over the recorded seeds), Dew's float64
     run held to that run's recorded sketch."""
-    assert_as_exact_as_maxtext(FIXTURE, "engram", ENGRAM_SEEDS, draw, dew, "MaxText's Engram")
+    assert_as_exact_as_recorded(FIXTURE, "engram", ENGRAM_SEEDS, draw, dew, "MaxText's Engram")
 
 
 def test_a_bias_for_v41s_engram_layer_is_refused():

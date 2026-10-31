@@ -125,6 +125,21 @@ UNIQUIFIED = re.compile(r"__\d+$")
 
 
 @functools.cache
+def staged_copy(shape: tuple[int, ...], dtype):
+    """A Mosaic GPU kernel copying its operand through shared memory by TMA: the least Mosaic kernel a test
+    compiles for a generation."""
+    from jax.experimental.pallas import mosaic_gpu as plgpu
+
+    def body(source, out, staged, barrier):
+        plgpu.copy_gmem_to_smem(source, staged, barrier.at[0])
+        plgpu.barrier_wait(barrier.at[0])
+        plgpu.copy_smem_to_gmem(staged, out)
+        plgpu.wait_smem_to_gmem(0)
+
+    return plgpu.kernel(body, out_type=jax.ShapeDtypeStruct(shape, dtype), num_threads=1, thread_name="wg",
+                        scratch_types=[plgpu.SMEM(shape, dtype), plgpu.Barrier(num_barriers=1)])
+
+
 def _device(generation: str) -> Mesh:
     """A one-device mesh of a compile-only device of `generation`."""
     return Mesh(np.array(compile_only_gpus(generation)), ("data",))
