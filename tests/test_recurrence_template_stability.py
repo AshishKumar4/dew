@@ -95,14 +95,18 @@ def assert_finite(fn, truth, operands, regime: str) -> None:
 
 def reference_arm(hooks, forms: str | None):
     """The arm the template is held against for a form under `forms`, each in the call's dtype, where it runs
-    here: the port of mamba_ssm's kernels for the rated scan under the fast forms (its numbers mamba_ssm's),
-    else the portable math. The delta rule with a decay is held to recorded fla-core (`fla_recorded`)."""
+    here: the fla port for the gated delta net's formed gates, the port of mamba_ssm's kernels for the rated
+    scan under the fast forms (its numbers mamba_ssm's), else the portable math. The delta rule with a decay
+    on its operands as given is held to recorded fla-core (`fla_recorded`)."""
+    if hooks.delta and hooks.decay != 'none':
+        return functools.partial(chunk_on, 'fla', hooks)
     return functools.partial(chunk_on, 'pallas' if hooks.rated and forms == 'fast' else 'xla', hooks)
 
 
 def fla_recorded(hooks) -> bool:
-    """Whether a form's reference is recorded fla-core (`fla_sites`): the delta rule with a decay."""
-    return hooks.delta and hooks.decay != 'none'
+    """Whether a form's reference is recorded fla-core (`fla_sites`): the delta rule with a decay on its
+    operands as given, no gates formed in the rule."""
+    return hooks.delta and hooks.decay != 'none' and hooks.gates is None
 
 
 def under(forms: str | None):

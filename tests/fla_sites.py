@@ -115,7 +115,7 @@ def _stability_sites() -> dict[str, Site]:
 
     sites = {}
     for name, hooks in stability.SITES.items():
-        if not (hooks.delta and hooks.decay != 'none'):
+        if not template_stability.fla_recorded(hooks):
             continue
         for regime in stability.REGIMES:
             def forward(seed, hooks=hooks, regime=regime):
