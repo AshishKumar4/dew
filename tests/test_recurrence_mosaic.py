@@ -522,6 +522,21 @@ RESOURCE_SHAPES = {'qwen3.5-27b-gdn': (16, 48, 128, 128, False), 'kimi-linear-kd
 key heads, value heads, key and value widths, and whether the decay is a key dimension's."""
 
 
+def resource_operands(name: str, dtype, rows: int, length: int) -> list[jax.ShapeDtypeStruct]:
+    """`(q, k, v, g, beta, h0)` of `RESOURCE_SHAPES[name]`'s geometry over `rows` of `length` tokens, in
+    `dtype` (the decay and the initial memory fp32), as `mainloop.forward` takes them."""
+    key_heads, value_heads, key_width, value_width, per_key = RESOURCE_SHAPES[name]
+
+    def array(*shape, kind=dtype):
+        return jax.ShapeDtypeStruct(shape, kind)
+
+    decay = (rows, length, value_heads) + ((key_width,) if per_key else ())
+    return [array(rows, length, key_heads, key_width), array(rows, length, key_heads, key_width),
+            array(rows, length, value_heads, value_width), array(*decay, kind=jnp.float32),
+            array(rows, length, value_heads), array(rows, value_heads, key_width, value_width,
+                                                    kind=jnp.float32)]
+
+
 @lowers('sm90')
 def test_the_resource_gate_reads_each_launch_of_one_kernel_apart():
     """The 27B gated delta net's forward launched twice in one program on an H100, at its derived tiles and
@@ -533,16 +548,7 @@ def test_the_resource_gate_reads_each_launch_of_one_kernel_apart():
 
     target = 'sm90'
     family, facts = bundles.of(target, jnp.bfloat16), generation.gpu_target(target)
-    key_heads, value_heads, key_width, value_width, _ = RESOURCE_SHAPES['qwen3.5-27b-gdn']
-    rows, length = 1, 256
-
-    def array(*shape, kind=jnp.bfloat16):
-        return jax.ShapeDtypeStruct(shape, kind)
-
-    args = [array(rows, length, key_heads, key_width), array(rows, length, key_heads, key_width),
-            array(rows, length, value_heads, value_width), array(rows, length, value_heads, kind=jnp.float32),
-            array(rows, length, value_heads),
-            array(rows, value_heads, key_width, value_width, kind=jnp.float32)]
+    args = resource_operands('qwen3.5-27b-gdn', jnp.bfloat16, 1, 256)
     bound = template.MOSAIC.bind(*args, None, max_segments=None, floor=None)
     with generation.assumed(facts):
         derived, variant = template.MOSAIC.variants(bound)[:2]
@@ -563,9 +569,9 @@ def test_the_resource_gate_reads_each_launch_of_one_kernel_apart():
     for kernel in record['kernels']:
         assert not kernel['unread'], f"{kernel['kernel']}: {kernel['unread']}"
         launches.setdefault(kernel['kernel'], []).append((kernel['launch'], kernel['shared']))
-    # A launch whose module both tiles share is built once (`_lowered_once`), under the first launch's name.
-    twice = [found for found in launches.values() if len({launch for launch, _ in found}) == 2]
-    assert any(len({shared for _, shared in found}) == 2 for found in twice), launches
+    assert launches
+    assert all(len({launch for launch, _ in found}) == 2 for found in launches.values()), launches
+    assert any(len({shared for _, shared in found}) == 2 for found in launches.values()), launches
 
 
 @pytest.mark.parametrize('kernel', ['recurrence_states', 'recurrence_reverse'], ids=['forward', 'backward'])
@@ -575,13 +581,7 @@ def test_a_compile_refusing_the_joined_tiles_steps_the_derivation_down(kernel):
     narrower training block, which it takes (`fits`), and the forward's too where a forward launch spilled,
     which runs at both; a refusal of the joined tiles once matched none of the rules' candidates, and the
     call found none (`Unfitted`)."""
-    key_heads, value_heads, key_width, value_width, _ = RESOURCE_SHAPES['qwen3.5-27b-gdn']
-    rows, length = 1, 4096
-    keys = jax.ShapeDtypeStruct((rows, length, key_heads, key_width), jnp.bfloat16)
-    shapes = (((rows, length, value_heads, value_width), jnp.bfloat16),
-              ((rows, length, value_heads), jnp.float32), ((rows, length, value_heads), jnp.bfloat16),
-              ((rows, value_heads, key_width, value_width), jnp.float32))
-    args = [keys, keys, *(jax.ShapeDtypeStruct(shape, dtype) for shape, dtype in shapes)]
+    args = resource_operands('qwen3.5-27b-gdn', jnp.bfloat16, 1, 4096)
     bound = template.MOSAIC.bind(*args, None)
     with report.refusals(), generation.assumed('sm90'):
         target = template.Mosaic.launched()
@@ -650,17 +650,9 @@ def compiled_cases(target: str, plans: dict, refused: list, only: tuple | None =
     def cases(name: str, dtype, *, training: bool, packed: bool, variant: int | None) -> list:
         """The case's kernels at its derived tiles, or, one row's forward, at its `variant`-th other variant
         (`Mosaic.variants`)."""
-        key_heads, value_heads, key_width, value_width, per_key = RESOURCE_SHAPES[name]
-
-        def array(*shape, kind=dtype):
-            return jax.ShapeDtypeStruct(shape, kind)
-
-        decay = (rows, length, value_heads) + ((key_width,) if per_key else ())
-        args = [array(rows, length, key_heads, key_width), array(rows, length, key_heads, key_width),
-                array(rows, length, value_heads, value_width), array(*decay, kind=jnp.float32),
-                array(rows, length, value_heads), array(rows, value_heads, key_width, value_width,
-                                                        kind=jnp.float32)]
-        starts = array(rows, length, kind=jnp.bool_) if packed else None
+        per_key = RESOURCE_SHAPES[name][4]
+        args = resource_operands(name, dtype, rows, length)
+        starts = jax.ShapeDtypeStruct((rows, length), jnp.bool_) if packed else None
         bound = template.MOSAIC.bind(*args, starts, max_segments=8 if packed else None,
                                      floor=FLOOR if per_key else None)
         with generation.assumed(facts):
