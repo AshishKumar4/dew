@@ -86,17 +86,21 @@ def test_a_norm_that_drops_a_square_fails_at_its_sum():
                               norm_graph(xla), inputs, width_orbit(inputs), "lost square")
 
 
+def faulted_tail(fault):
+    """The norm graph with its pointwise tail's output passed through `fault`."""
+    dew = norm_graph(xla)
+    tail = Node("output", ("x", "squares", "scale"), Pointwise(),
+                jax.jit(lambda x, squares, scale: fault(dew.node("output").fn(x, squares, scale))))
+    return composed(dew.inputs, (dew.node("squares"), tail), ("output",), ("squares",))
+
+
 def test_a_pointwise_tail_an_ulp_off_where_the_reference_is_exact_fails():
     """Dew's tail one ulp past the reference's at every element: a pointwise node is held element by
     element on common parents, so even an ulp fails where the reference rounds correctly."""
     inputs = norm_inputs()
-    dew = norm_graph(xla)
-    off = Node("output", ("x", "squares", "scale"), Pointwise(),
-               jax.jit(lambda x, squares, scale:
-                       jnp.nextafter(dew.node("output").fn(x, squares, scale), jnp.inf)))
     with pytest.raises(AssertionError):
-        assert_graph_as_exact(composed(dew.inputs, (dew.node("squares"), off), ("output",), ("squares",)),
-                              norm_graph(xla), norm_graph(xla), inputs, width_orbit(inputs), "an ulp")
+        assert_graph_as_exact(faulted_tail(lambda output: jnp.nextafter(output, jnp.inf)), norm_graph(xla),
+                              norm_graph(xla), inputs, width_orbit(inputs), "an ulp")
 
 
 def test_a_witness_that_rounds_otherwise_than_its_graph_fails():
@@ -111,13 +115,9 @@ def test_a_witness_that_rounds_otherwise_than_its_graph_fails():
 
 def test_a_nan_at_one_element_fails():
     inputs = norm_inputs()
-    dew = norm_graph(xla)
-    broken = Node("output", ("x", "squares", "scale"), Pointwise(),
-                  jax.jit(lambda x, squares, scale:
-                          dew.node("output").fn(x, squares, scale).at[3, 5].set(jnp.nan)))
     with pytest.raises(AssertionError):
-        assert_graph_as_exact(composed(dew.inputs, (dew.node("squares"), broken), ("output",), ("squares",)),
-                              norm_graph(xla), norm_graph(xla), inputs, width_orbit(inputs), "nan")
+        assert_graph_as_exact(faulted_tail(lambda output: output.at[3, 5].set(jnp.nan)), norm_graph(xla),
+                              norm_graph(xla), inputs, width_orbit(inputs), "nan")
 
 
 def norm_backward(summed):
