@@ -255,11 +255,13 @@ def bundle(directory: str, destination: str) -> None:
     """Pack the saved transformers and the recorded arrays for the suite."""
     import tarfile
 
+    from diffusers_dc_ae_reference import unowned
+
     root = Path(directory)
     with tarfile.open(destination, "w:xz") as archive:
         for path in sorted(root.iterdir()):
             if path.name.endswith((".npz", ".json")) or path.is_dir():
-                archive.add(path, arcname=path.name)
+                archive.add(path, arcname=path.name, filter=unowned)
     print(f"{destination}: {Path(destination).stat().st_size / 1e6:.2f} MB")
 
 
