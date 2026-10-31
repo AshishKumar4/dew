@@ -78,6 +78,12 @@ family without one (mma.sync's, until its thin mainloop) takes another mainloop 
 `MosaicBackward.eligible`)."""
 
 
+def transposed_swizzles(tiles: "Tiles | BackwardTiles", *names: str) -> dict[str, int]:
+    """The swizzles `Family.streams` stages the streams `names` at, which a launch's products read
+    transposed: the narrowest where `tiles` stage them so (`Tiles.narrow`), the family's own otherwise."""
+    return dict.fromkeys(names, mosaic.NARROWEST_SWIZZLE_BYTES) if tiles.narrow else {}
+
+
 @dataclasses.dataclass(frozen=True, order=True)
 class Tiles:
     """A forward launch's config: each consumer's query block (`block_q`), the key tile (`block_k`), the key
@@ -100,6 +106,11 @@ class Tiles:
     relaunch_columns: int | None = None
     natural_form: bool = False
     columns: int | None = None
+    narrow: bool = False
+    """Whether the streams its products read transposed stage at the narrowest swizzle
+    (`transposed_swizzles`), where its family reads operands from registers: a load one instruction's depth
+    of them (`Family.rhs_fragment_depth`), not a wide swizzle tile's, a wide stage's bandwidth traded for
+    registers (ET-CENSUS80: a 64 x 192 forward's keys at the widest 162 of its 291 registers)."""
 
     def __post_init__(self):
         if self.stages < 2:
@@ -141,6 +152,11 @@ class BackwardTiles:
     """Whether the fused launch's consumers share one key block (`attention_mosaic_coop._coop_launch`):
     each forms the logits of its share of the keys and holds its share of the head's columns of dK, dV and
     dQ, where a consumer's own keys' whole dK and dV sums pass its registers (width 256's)."""
+    narrow: bool = False
+    """Whether the streams its products read transposed stage at the narrowest swizzle
+    (`transposed_swizzles`), where its family reads operands from registers: a load one instruction's depth
+    of them (`Family.rhs_fragment_depth`), not a wide swizzle tile's, a wide stage's bandwidth traded for
+    registers (ET-CENSUS80: a 64 x 192 forward's keys at the widest 162 of its 291 registers)."""
 
     @property
     def dkv(self) -> "BackwardTiles":

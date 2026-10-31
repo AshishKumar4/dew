@@ -80,15 +80,19 @@ def _derived[Config: (Tiles, BackwardTiles)](family: mosaic.Family, dtype, held:
     whole swizzled rows); the tile
     it walks the largest unit multiple of the `walked` extent whose live set a consumer's registers hold and
     whose two stages the block holds (`fits`), two the ring's busy depth, a slot loading while one is read;
-    fewer consumers where no tile of the family's count holds the block (a GPU of a smaller one).
-    `tiles(rows, walked, consumers)` builds the config. None where no tile fits."""
+    where its family's products read operands from registers, a tile its transposed streams staged at the
+    family's own swizzle do not fit fits them staged narrowest (`Tiles.narrow`), a wide stage's bandwidth
+    traded for the larger tile; fewer consumers where no tile of the family's count holds the block (a GPU
+    of a smaller one). `tiles(rows, walked, consumers)` builds the config. None where no tile fits."""
     rows = extents(family, dtype, held)[-1]
     most = family.consumers if overlapped else 1
+    stagings = (False, True) if family.operands_in_registers else (False,)
     for consumers in range(max(1, min(most, -(-held // rows))), 0, -1):
         for extent in extents(family, dtype, walked):
-            config = tiles(rows, extent, consumers)
-            if fits(config):
-                return config
+            for narrow in stagings:
+                config = dataclasses.replace(tiles(rows, extent, consumers), narrow=narrow)
+                if fits(config):
+                    return config
     return None
 
 
@@ -361,7 +365,7 @@ class MosaicForward(_Mainloop[Tiles]):
         return refused(query.dtype, query.shape[3], value.shape[3], hooks, backward=False, family=family)
 
 
-def _products(family: mosaic.Family, dtype, *products) -> list:
+def _products(family: mosaic.Family, dtype, *products, narrow: bool = False) -> list:
     """The phases a step's products hold where its family's read their operands from registers
     (`resources.operand_fragments`; none where they read shared memory, wgmma's): each product
     `(rows, depth, columns, beside, register_lhs, rhs_transposed)` its operands' fragments beside the tiles
@@ -369,12 +373,15 @@ def _products(family: mosaic.Family, dtype, *products) -> list:
     (`register_lhs`: the weights, the score cotangents) no fragment of its own, a right one read as the
     transpose of its stored tile (`rhs_transposed`: the keys of the logits, the values of dP) loaded at its
     stage's swizzle granule (`Family.rhs_fragment_depth`; mma.sync: ET-CENSUS80, a 64 x 192 forward's keys'
-    fragments 162 of its 291 registers at its peak, uncounted)."""
+    fragments 162 of its 291 registers at its peak, uncounted), the narrowest where its launch stages them
+    `narrow` (`Tiles.narrow`)."""
     if not family.operands_in_registers:
         return []
+    narrowest = mosaic.NARROWEST_SWIZZLE_BYTES if narrow else None
     return [list(beside) + resources.operand_fragments(family, rows, depth, columns, dtype, dtype,
                                                        lhs_parts=0 if register_lhs else 1,
-                                                       rhs_transposed=transposed)
+                                                       rhs_transposed=transposed,
+                                                       rhs_swizzle=narrowest if transposed else None)
             for rows, depth, columns, beside, register_lhs, transposed in products]
 
 
@@ -398,7 +405,7 @@ def _forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dt
         step.append((block_q // 2, block_k, jnp.int32))
     depth = value_width if width is None else width
     products = _products(family, dtype, (block_q, depth, block_k, [logits], False, True),
-                         (block_q, block_k, value_width, [weights], True, False))
+                         (block_q, block_k, value_width, [weights], True, False), narrow=tiles.narrow)
     return resources.live_registers(family, [(block_q, value_width, jnp.float32)], step, *products)
 
 
@@ -514,7 +521,8 @@ def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int
         # cotangents' beside them, and dQ's of the score cotangents in registers.
         fragments = _products(family, dtype, (block_q, width, block_k, [logits], False, True),
                               (block_q, value_width, block_k, [logits] * 2, False, True),
-                              (block_q, block_k, width // config.columns, cotangents[1:], True, False))
+                              (block_q, block_k, width // config.columns, cotangents[1:], True, False),
+                              narrow=config.narrow)
         return resources.live_registers(family, carried, products, cotangents, *fragments) + rows
     if config.shared_keys:
         # Shared keys (`attention_mosaic_coop`): a consumer's share of the head's columns of dK and dV
@@ -555,7 +563,7 @@ def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int
     fragments = _products(family, dtype, (block_k, width // columns, queries, step[:1], False, True),
                           (block_k, value_width // columns, queries, step, False, True),
                           (block_k, queries, value_width // columns, [weights], True, False),
-                          (block_k, queries, width // columns, [weights], True, False))
+                          (block_k, queries, width // columns, [weights], True, False), narrow=config.narrow)
     return resources.live_registers(family, carried, step, *added, *fragments) + statistics
 
 

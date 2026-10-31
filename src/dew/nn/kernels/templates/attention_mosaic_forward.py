@@ -67,6 +67,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     reducing,
     refused,
     stated,
+    transposed_swizzles,
 )
 
 
@@ -92,8 +93,8 @@ def _forward_allocations(family: mosaic.Family, tiles: Tiles, width: int, value_
     blocks = {"keys": ((block_k, width), dtype)}
     if not peaks:
         blocks["values"] = ((block_k, value_width), dtype)
-    # The logits' product reads the keys transposed (`Family.streams`' `transposed`).
-    return scoped, family.streams(blocks, stages, consumers, transposed=("keys",))
+    # The logits' product reads the keys transposed.
+    return scoped, family.streams(blocks, stages, consumers, swizzles=transposed_swizzles(tiles, "keys"))
 
 
 def guarded_columns(family: mosaic.Family, value_width: int, dtype) -> int:
