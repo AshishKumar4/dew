@@ -447,7 +447,7 @@ def _earlier_digests(manifest: JSON, stores: Sequence[TokenFiles]) -> Iterator[s
     every store alike (`_unstated_lengths`)."""
     yield fingerprint(_documents_where(manifest, stores, lambda store: not store.read_alike()))
     if all(store.read_alike() for store in stores):
-        named = record(without_documents(manifest), "member manifest")
+        named = record(_without_documents(manifest), "member manifest")
         sources, derived = named.get("sources"), named.get("derived")
         if isinstance(sources, list) and isinstance(derived, dict):
             unstated = {f"{index}/lengths" for index, source in enumerate(sources)
@@ -476,15 +476,15 @@ def _documents_where(value: JSON, stores: Sequence[TokenFiles], kept: Callable[[
     return {name: _documents_where(part, stores, kept) for name, part in value.items()}
 
 
-def without_documents(value: JSON) -> JSON:
+def _without_documents(value: JSON) -> JSON:
     """`value`, a fingerprint of sources or a manifest holding them, a saved record's form made at its
     boundary: each token store in it named as a Dew before row 3028 named it, without `documents`
     (`earlier_plan`)."""
     if isinstance(value, list):
-        return [without_documents(part) for part in value]
+        return [_without_documents(part) for part in value]
     if not isinstance(value, dict):
         return value
-    return {name: without_documents(part) for name, part in value.items()
+    return {name: _without_documents(part) for name, part in value.items()
             if not (name == "documents" and value.get("store") == "tokens")}
 
 
