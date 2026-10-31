@@ -19,6 +19,7 @@ import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
 import pytest
+from lane_environment import outside_suite
 
 import dew
 from dew.interop import load_params, save_params
@@ -483,8 +484,7 @@ def test_a_run_trained_in_one_process_exports_from_a_fresh_one(tmp_path):
 
 
     root = Path(__file__).resolve().parents[1]
-    env = {**{name: value for name, value in os.environ.items() if name != "XLA_FLAGS"},
-           "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(root / "src")}
+    env = {**outside_suite(os.environ), "PYTHONPATH": str(root / "src")}
     program = FRESH_TRAINING.format(module="lm", objective="LMObjective")
     trained = subprocess.run([sys.executable, "-c", program, str(tmp_path / "run")],
                              capture_output=True, text=True, env=env, timeout=600)

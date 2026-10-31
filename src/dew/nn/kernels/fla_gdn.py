@@ -938,7 +938,7 @@ def _wy_bwd_kernel(chunk_ref, k_ref, v_ref, beta_ref, g_ref, a_ref, dw_ref, du_r
             key = read(k_ref, columns)
             scaled = key * beta[:, None]
             # k k^T first, as fla takes it: taken after the dk store, sm90's pipelined loop returned
-            # a different dg on each call of one executable (FitBuzzard, dew-h100).
+            # a different dg on each call of one executable (an H100's repeated calls of one compile).
             products = products + _dot(key, key.T, exact=exact)
             d_key = _dot(d_l, key, exact=exact)
             through_w = _dot(inverse_t, read(dw_ref, columns), exact=exact) * (decay * beta)[:, None]
