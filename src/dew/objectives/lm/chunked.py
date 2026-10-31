@@ -26,10 +26,12 @@ and backward took 43.1 ms against 44.4 with the forward in whole chunks at a
 (1024, 8192) tile, and 35.6 against 36.3 at (4096, 8192), holding 0.18 and
 0.41 GiB of temporaries against 0.18 and 0.42.
 
-First-order reverse mode only: there is no JVP rule. On one RTX 4080, fp32,
-1,024 tokens by 2,816 features by 262,144 columns in four chunks, the default
-tile runs the head forward and backward in 250 ms holding 1.07 GiB of
-temporaries, against 249 ms and 3.55 GiB for recomputing whole chunks.
+Each head's backward is its own, and its forward derivative JAX's of its tiled
+forward, a tangent that transposes to that backward (`linear_tangent`). On one
+RTX 4080, fp32, 1,024 tokens by 2,816 features by 262,144 columns in four
+chunks, the default tile runs the head forward and backward in 250 ms holding
+1.07 GiB of temporaries, against 249 ms and 3.55 GiB for recomputing whole
+chunks.
 """
 
 import functools
@@ -371,12 +373,10 @@ def _shared_partition(outputs, normalizer, group: tuple[str, ...]):
     first, best, log_z = outputs
     peak, mass, rests = normalizer
     # A row's terms are free of the shift its sums are taken against, so the largest maximum takes no
-    # tangent, and each shard moves its sums to it by its own maximum's, `rescaled`'s shortcut where the
-    # two agree, which drops that tangent, left out: one exponential of 0 where they agree.
+    # tangent, and each shard moves its sums to it by its own maximum's (`rescaled`).
     larger = jax.lax.pmax(jax.lax.stop_gradient(peak), group)
-    moved = jnp.exp(jnp.where(peak == -jnp.inf, -jnp.inf, peak - larger))
-    mass = jax.lax.psum(mass * moved, group)
-    rests = jax.lax.psum(rests * moved, group)
+    mass = jax.lax.psum(rescaled(peak, mass, larger), group)
+    rests = jax.lax.psum(rescaled(peak, rests, larger), group)
     loss = target_loss(larger, mass, jax.lax.psum(first, group))
     outputs = (loss.reshape(first.shape), best, (larger + jnp.log(mass)).reshape(log_z.shape))
     return outputs, (larger, mass, rests)
@@ -629,9 +629,10 @@ def _whole_head_terms(hidden, table, targets, excluded, softcap, precision, pred
 
 def _whole_head(hidden, table, targets, excluded, softcap, chunks: int, precision: jax.lax.PrecisionLike,
                 predict: bool, temperature: float, columns: _Columns, picked: bool, group: tuple[str, ...]):
-    """The whole head's outputs behind a backward that keeps its fp32 logits (`_whole_head_bwd`); with
-    nothing to differentiate, and in forward mode, the tiled forward over one vocabulary tile, so an
-    evaluation, a scoring pass or a tangent holds no whole logits (`linear_tangent`)."""
+    """The whole head's outputs behind a backward that keeps its fp32 logits (`_whole_head_bwd`), which a
+    derivative's own forward forms whole; with nothing to differentiate, the tiled forward over one
+    vocabulary tile, a token tile's logits at a time, so an evaluation or a scoring pass holds no whole
+    logits, and a tangent is that tiled forward's (`linear_tangent`)."""
     statics = (chunks, precision, predict, temperature, picked, group)
     tiled = functools.partial(_whole_head_impl, *statics)
     return linear_tangent(functools.partial(_whole_head_fwd, *statics),
