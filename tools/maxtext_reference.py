@@ -60,7 +60,7 @@ def main() -> None:
     worker.stdin.close()
     worker.wait()
     written = save(test.FIXTURE, {**arrays, "provenance": provenance(
-        "maxtext", version, "cpu", f"python tools/maxtext_reference.py {site} {python}")},
+        "maxtext", version, "cpu", f"python tools/maxtext_reference.py {site} MAXTEXT_PYTHON")},
         reference=f"AI-Hypercomputer/maxtext {version}", license="Apache-2.0")
     print(f"{written}: {sorted(arrays)}")
 

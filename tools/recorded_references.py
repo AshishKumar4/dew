@@ -48,7 +48,11 @@ __all__ = ["merge_shards", "provenance", "record_case", "record_distances", "rec
 
 def provenance(reference: str, revision: str, device: str, command: str, **details) -> np.ndarray:
     """A recording's reference, its revision, the device and the public command that reproduces it,
-    as a JSON string array to save beside the recorded arrays."""
+    as a JSON string array to save beside the recorded arrays. The command is published with the
+    recording: a path of the recording machine's own (an argument from the root or the home) is
+    refused, the argument's name standing in its place."""
+    if any(word.startswith(("/", "~")) for word in command.split()):
+        raise ValueError(f"a recording's command is public, its machine's paths named, not given: {command}")
     return np.asarray(json.dumps({"reference": reference, "revision": revision, "device": device,
                                   "command": command, **details}))
 

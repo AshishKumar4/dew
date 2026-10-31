@@ -7,9 +7,10 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 - MaxText's GPT-3 builds as a decoder: `scale_offset` on a `'layer'` norm stores its weight as its
   offset from one (`dew.nn.norms.OffsetLayerNorm`), beside learned positions, biased attention and MLP
-  and tied logits; DeepSeek's Engram as MaxText computes it is the PLE layer with biased projections
-  (`Engram.ple_bias`). Each is held to MaxText 0.2.5's run (`tests/test_maxtext_gpt3.py`,
-  `tests/test_maxtext_engram.py`).
+  and tied logits; MaxText's Engram layer, from its bucket ids, is the PLE layer a decoder builds with
+  biased projections (`Engram.ple_bias`). Each is held to MaxText 0.2.5's run
+  (`tests/test_maxtext_gpt3.py`, `tests/test_maxtext_engram.py`). MaxText's hashing of tokens to buckets
+  is not Dew's: its prime bases per n-gram order, its seed and its multipliers bounded for int32.
 - A MoVA run saved while its value experts recorded their layer's dispatch loads again, and a trainer
   places a MoVA model's stacked value experts on the expert axis.
 - A run's numerics are named where they are set: `--trainer.precision accurate` (or a Lightning dtype

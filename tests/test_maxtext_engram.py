@@ -1,5 +1,6 @@
-"""MaxText's Engram (maxtext 0.2.5, maxtext/layers/engram.py, DeepSeek's conditional n-gram memory) as
-Dew's PLE layer computes it (`dew.nn.engram.PLELayer` with `use_bias`): each head's buckets looked up
+"""MaxText's Engram layer (maxtext 0.2.5, maxtext/layers/engram.py, DeepSeek's conditional n-gram memory)
+from its bucket ids, as the PLE layer a decoder builds of its Engram fields computes it
+(`dew.nn.engram.PLELayer`, `Engram.ple_bias`): each head's buckets looked up
 in one table, projected to a key per stream and a shared value with biases, the normed streams' gate
 on their normed keys through a signed root and a sigmoid, the gated values normed again through a
 causal depthwise conv of taps `max_ngram_size` apart and a SiLU, joined by the gated values, added to
@@ -9,6 +10,7 @@ the streams. MaxText's layer over drawn weights, streams and buckets is recorded
 
 from pathlib import Path
 
+import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax.traverse_util import unflatten_dict
@@ -67,10 +69,21 @@ def dew_variables(inputs) -> dict:
 
 
 def layer(dtype):
-    from dew.nn.engram import PLELayer
+    """The engram layer a decoder makes of its fields at `dtype`: one layer over `STREAMS` residual
+    streams whose lookup is a PLE layer of MaxText's sizes with biased projections (`Engram.ple_bias`)."""
+    from importlib import import_module
 
-    return PLELayer(rows=sum(VOCAB_SIZES), head_dim=HEAD_DIM, hc_mult=STREAMS, emb_features=WIDTH,
-                    norm_eps=EPSILON, kernel_size=KERNEL, dilation=MAX_NGRAM, use_bias=True, dtype=dtype)
+    from dew.registry import models
+
+    import_module("dew.nn.backbones")
+    decoder = models.build("causal_transformer", {
+        "vocab_size": 64, "emb_features": WIDTH, "num_layers": 1, "num_heads": 2, "num_kv_heads": 2,
+        "head_dim": HEAD_DIM, "mlp_features": 16, "norm_eps": EPSILON, "dtype": jnp.dtype(dtype).name,
+        "hyper_connections": {"hc_mult": STREAMS},
+        "engram": {"layer_ids": (0,), "num_embeddings": (sum(VOCAB_SIZES),), "max_ngram_size": MAX_NGRAM,
+                   "vocab_size": 64, "n_heads": HEADS, "head_dim": HEAD_DIM, "compressed_vocab_size": 64,
+                   "ple_conv_kernel_size": KERNEL, "ple_bias": True}})
+    return decoder.apply({}, method=lambda module: module.layers[0].engram)()
 
 
 OUTPUT = "streams"

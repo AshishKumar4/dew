@@ -20,7 +20,7 @@ The table rows and the "What dew needs" list describe Dew at `65fd2f4`, and the 
 
 - `lora_input_adapters_path` and `hf_lora_adapter_path` say "nothing". `dew.lora.LoRA` reads and writes a PEFT adapter directory (`adapter_config.json`, `adapter_model.safetensors`) and the Diffusers LoRA file (`src/dew/lora.py:26-33,67-69`). Loading a directory of several named adapters, as MaxText's first knob does, was not checked.
 - The distillation rows say "nothing". `DistillationObjective` mixes the student loss with a temperature-softened KL to a frozen teacher and a feature term over named layer pairs, following MaxText 0.2.4 (`src/dew/objectives/distillation.py:1-15,73-94`).
-- The manifold-constrained hyper-connection rows say "nothing". `CausalTransformer.hyper_connections` adds mHC's residual streams with Sinkhorn-Knopp mixing (`src/dew/nn/backbones/causal_transformer.py:1438`; `src/dew/nn/hyper_connections.py:15-25,56`). Engram is the PLE layer (`src/dew/nn/engram.py`, `PLELayer` with `Engram.ple_bias`), held to MaxText's own layer (`tests/test_maxtext_engram.py`).
+- The manifold-constrained hyper-connection rows say "nothing". `CausalTransformer.hyper_connections` adds mHC's residual streams with Sinkhorn-Knopp mixing (`src/dew/nn/backbones/causal_transformer.py:1438`; `src/dew/nn/hyper_connections.py:15-25,56`). Engram is the PLE layer (`src/dew/nn/engram.py`, `PLELayer` with `Engram.ple_bias`), held to MaxText's own layer from its bucket ids (`tests/test_maxtext_engram.py`); MaxText's hashing of tokens to buckets differs (the Engram table).
 - Item 8 of "What dew needs" lists DeepSeek V4 compressed attention, hash routing and mHC as missing. The `deepseek_v4` mixer (`src/dew/nn/deepseek_v4.py:535`), the router's `hash_vocab` (`src/dew/nn/moe.py:170-188`) and the hyper-connections above cover them.
 
 ## Where each workflow stands, 2026-10-21
@@ -45,7 +45,7 @@ This section is current, on main 84a421410; the inventory below it keeps the 202
 | DiLoCo | Missing [876] |
 | Dropless MoE, fused attention with sinks and softcaps, multi-token prediction, speculative decode | Run; target-complete GPU qualification [185] |
 | Sparse indexed attention and its indexer's warmup phase | Dense top-k masking only [877] |
-| GPT-3 and Engram | Dew's decoder computes MaxText's GPT-3 (`tests/test_maxtext_gpt3.py`) and its PLE layer MaxText's Engram (`tests/test_maxtext_engram.py`) [878] |
+| GPT-3 and Engram | Dew's decoder computes MaxText's GPT-3 (`tests/test_maxtext_gpt3.py`) and its PLE layer MaxText's Engram layer from its bucket ids (`tests/test_maxtext_engram.py`) [878] |
 | Vision-language models | Run for the families with towers; served multimodal log-probabilities [828] |
 | Audio-conditioned language models, Qwen3-Omni audio | Missing [879] |
 | Weighted mixtures with phases and resume, batch ramp-up | Run; a pinned text, code and chat example [236] |
@@ -962,13 +962,13 @@ Not planned, by design: MaxText's legacy AQT controls, the `minimal_flash` famil
 
 | Knob | What it is | Who ships it and source | Dew today | Gap | Fit |
 |---|---|---|---|---|---|
-| `engram_layers` | Decoder layers containing conditional n-gram memory. | MaxText [base.yml:1371][maxtext-base] | nothing | No mHC/mHC-lite or Engram. AltUp is a different residual-stream algorithm. | DecoderFamily registry and module kernels; do not reuse AltUp as a semantic substitute. |
-| `engram_max_ngram_size` | Maximum n-gram order in Engram. | MaxText [base.yml:1373][maxtext-base] | nothing | No mHC/mHC-lite or Engram. AltUp is a different residual-stream algorithm. | DecoderFamily registry and module kernels; do not reuse AltUp as a semantic substitute. |
-| `engram_num_heads` | Engram lookup head count. | MaxText [base.yml:1375][maxtext-base] | nothing | No mHC/mHC-lite or Engram. AltUp is a different residual-stream algorithm. | DecoderFamily registry and module kernels; do not reuse AltUp as a semantic substitute. |
-| `engram_head_dim` | Engram feature width per head. | MaxText [base.yml:1377][maxtext-base] | nothing | No mHC/mHC-lite or Engram. AltUp is a different residual-stream algorithm. | DecoderFamily registry and module kernels; do not reuse AltUp as a semantic substitute. |
-| `engram_vocab_bases` | Per-order Engram hash-table vocabulary sizes. | MaxText [base.yml:1379][maxtext-base] | nothing | No mHC/mHC-lite or Engram. AltUp is a different residual-stream algorithm. | DecoderFamily registry and module kernels; do not reuse AltUp as a semantic substitute. |
-| `engram_kernel_size` | Engram temporal convolution window. | MaxText [base.yml:1381][maxtext-base] | nothing | No mHC/mHC-lite or Engram. AltUp is a different residual-stream algorithm. | DecoderFamily registry and module kernels; do not reuse AltUp as a semantic substitute. |
-| `engram_seed` | Seed for Engram hash mapping. | MaxText [base.yml:1383][maxtext-base] | nothing | No mHC/mHC-lite or Engram. AltUp is a different residual-stream algorithm. | DecoderFamily registry and module kernels; do not reuse AltUp as a semantic substitute. |
+| `engram_layers` | Decoder layers containing conditional n-gram memory. | MaxText [base.yml:1371][maxtext-base] | `Engram.layer_ids` | None. | None. |
+| `engram_max_ngram_size` | Maximum n-gram order in Engram. | MaxText [base.yml:1373][maxtext-base] | `Engram.max_ngram_size` | None. | None. |
+| `engram_num_heads` | Engram lookup head count. | MaxText [base.yml:1375][maxtext-base] | `Engram.n_heads` | None. | None. |
+| `engram_head_dim` | Engram feature width per head. | MaxText [base.yml:1377][maxtext-base] | `Engram.head_dim` | None. | None. |
+| `engram_vocab_bases` | Per-order Engram hash-table vocabulary sizes. | MaxText [base.yml:1379][maxtext-base] | `Engram.vocab_size`, one base the primes of every order are searched from; or `Engram.num_embeddings`, each table's rows. | MaxText searches each n-gram order's primes from its own base (NgramHashMapping `_calculate_vocab_size_across_layers`). | A base per order in `Engram.primes`. |
+| `engram_kernel_size` | Engram temporal convolution window. | MaxText [base.yml:1381][maxtext-base] | `Engram.ple_conv_kernel_size` | None. | None. |
+| `engram_seed` | Seed for Engram hash mapping. | MaxText [base.yml:1383][maxtext-base] | `Engram.multiplier_seed`, Qwen4-Exp's SplitMix64 seed; unset, V4.1's draws at seed 10007 * layer. | MaxText draws its multipliers at `seed + 10007 * layer` bounded so a product fits int32 (`_calculate_multipliers_across_layers`); Dew's are bounded for int64, as DeepSeek's are. | MaxText's draw as an option of `Engram.multipliers`, with its buckets recorded. |
 
 ### Distillation
 
