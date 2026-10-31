@@ -1,7 +1,7 @@
 """The derivative contracts' harness (ledger 2641): each custom-derivative seam's orders (`orders`), the
 contract a seam is held to (`assert_contract`), the draws at float32's exponent edges (`EDGES`,
 `normal_draw`) and the orders a seam may not take (`FORWARD_ORDERS`, `REVERSE_ONLY` and the rest). The
-contracts themselves are tests/test_contracts_*.py, one a owning area, and tests/test_derivative_seams.py
+contracts themselves are tests/test_contracts_*.py, one an owning area, and tests/test_derivative_seams.py
 holds every seam to one.
 
 Float-range and nested-derivative contracts of Dew's custom-derivative seams (ledger row 2283, theme
@@ -164,24 +164,3 @@ def normal_draw(seed: int, *shapes, scale: float = 1.0) -> tuple:
     """Standard normal float32 arrays of `shapes` at `scale`, from `seed`."""
     rng = np.random.default_rng(seed)
     return tuple(jnp.asarray(rng.standard_normal(shape) * scale, jnp.float32) for shape in shapes)
-
-
-def joined(seam):
-    """`seam`'s two outputs, the stream and its norm, side by side along the features: one output a contract
-    pulls back."""
-    return lambda *inputs: jnp.concatenate(seam(*inputs), axis=-1)
-
-
-INTERPRETED = jax.default_backend() != "gpu"
-"""The ported kernels interpret off a GPU."""
-
-
-def flattened(fn):
-    """`fn`'s outputs as one vector, which the orders through its gradient sum against one cotangent."""
-    return lambda *operands: jnp.concatenate([out.ravel() for out in jax.tree.leaves(fn(*operands))])
-
-
-def positive_draw(seed: int, shape: tuple, scale: float) -> jax.Array:
-    """A float32 variance a row, positive, at `scale`: a draw's magnitude, at least a tenth of the scale."""
-    rng = np.random.default_rng(seed)
-    return jnp.asarray((np.abs(rng.standard_normal(shape)) + 0.1) * scale, jnp.float32)

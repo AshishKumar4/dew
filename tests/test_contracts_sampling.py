@@ -2,19 +2,19 @@
 transition's quadratic term and KL, the KL's forward mode, a guided prediction (ledger 2641; the harness
 is tests/contract_support.py)."""
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from contract_support import (
-    EDGES,
-    GRADIENT_ORDERS,
-    REVERSE_ORDERS,
-    assert_contract,
-    normal_draw,
-    positive_draw,
-)
+from contract_support import EDGES, GRADIENT_ORDERS, REVERSE_ORDERS, assert_contract, normal_draw
 
 from dew.diffusion.schedules.flow import time_shift
+
+
+def positive_draw(seed: int, shape: tuple, scale: float) -> jax.Array:
+    """A float32 variance a row, positive, at `scale`: a draw's magnitude, at least a tenth of the scale."""
+    rng = np.random.default_rng(seed)
+    return jnp.asarray((np.abs(rng.standard_normal(shape)) + 0.1) * scale, jnp.float32)
 
 
 @pytest.mark.parametrize("edge", ["normal", "near the least normal"])
