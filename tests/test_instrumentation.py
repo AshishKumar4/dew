@@ -330,6 +330,12 @@ def test_a_log_its_reader_reads_late_ends_where_the_loop_saw_its_step_done():
     _, _, done = early.read(None, None)
     _, elapsed, _ = late.read(None, done)
     assert done <= seen and elapsed >= 0.05
+    # A step the loop notes done after its log was read is noted for no log: nothing waits on it.
+    third = np.asarray(1.0).view(Pending)
+    take(3, third).read(None, done)
+    third.finished = True
+    interval.seen()
+    assert not interval.finished and not interval.watched
 
 
 class TickGatedTracker(RecordingTracker):
