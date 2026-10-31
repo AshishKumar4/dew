@@ -8,6 +8,7 @@ import itertools
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 from contract_support import EDGES, FORWARD_ORDERS, OWN_FORWARD_ORDERS, assert_contract, normal_draw
 
@@ -309,9 +310,9 @@ def test_a_quantized_convolution_holds_every_order_it_takes(groups, edge):
 @pytest.mark.parametrize("edge", EDGES)
 def test_a_broadcast_summing_its_gradient_wide_holds_every_order(edge):
     """`torchax_fallback._accumulated` (a broadcast whose gradient sums in float32 and rounds once to its
-    value's dtype, as torch's autograd reduces a bf16 gradient): every order runs, finite wherever float64
-    is a normal float32, at values near float32's ends, beside the plain broadcast; but forward mode,
-    which a custom_vjp takes none of, the orders ledger 2653 adds with its fix."""
+    value's dtype, as torch's autograd reduces a bf16 gradient): every order runs, forward mode's included
+    (ledger 2653), finite wherever float64 is a normal float32, at values near float32's ends, beside the
+    plain broadcast."""
     value, direction = normal_draw(959, (3, 1, 4), (3, 1, 4), scale=EDGES[edge])
     (cotangent,) = normal_draw(961, (3, 5, 4))
 
@@ -321,8 +322,29 @@ def test_a_broadcast_summing_its_gradient_wide_holds_every_order(edge):
     def plain(value):
         return jnp.broadcast_to(value, (3, 5, 4))
 
-    # Forward mode's orders (`orders`), which ledger 2653 lists.
-    forward = ("jvp", "jvp of grad", "second jvp", "jvp of grad, remat", "second jvp, remat",
-               "jvp of grad, nested jit", "jvp of grad, scanned")
     assert_contract(broadcast, (value,), (direction,), cotangent, f"a wide-summed broadcast {edge}",
-                    truth_fn=plain, plain_fn=plain, without=forward)
+                    truth_fn=plain, plain_fn=plain)
+
+
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16])
+def test_a_broadcast_sums_its_gradient_wide_at_every_order(dtype):
+    """`torchax_fallback._accumulated`'s transpose sums in float32 and rounds once wherever a derivative
+    forms one: a weighted square's gradient, the gradient's tangent (forward over reverse) and its gradient
+    (reverse over reverse) each sum 4096 terms of the value's narrow dtype, every product exact, to the
+    float32 sum rounded once, where a sum in the narrow dtype rounds its partial sums (ledger 2653)."""
+    rows = 4096
+    weights = jnp.asarray(1 + (np.arange(rows * 4).reshape(rows, 4) % 7) * 2.0**-7, dtype)
+    ones = jnp.ones(4, dtype)
+
+    def loss(value):
+        return jnp.sum(weights * jnp.square(torchax_fallback._accumulated(value, (rows, 4), (1,))))
+
+    # Each term 2 w, exact in the narrow dtype, summed exactly in float32 and rounded once.
+    expected = np.asarray(2 * np.asarray(weights, np.float32).sum(0)).astype(dtype)
+    gradient = jax.grad(loss)(ones)
+    tangent = jax.jvp(jax.grad(loss), (ones,), (ones,))[1]
+    curvature = jax.grad(lambda value: jnp.vdot(jax.grad(loss)(value), ones).astype(jnp.float32))(ones)
+    for derivative in (gradient, tangent, curvature):
+        np.testing.assert_array_equal(np.asarray(derivative), expected, strict=True)
+    narrow = np.asarray(2 * weights).sum(0, dtype=dtype)
+    assert not np.array_equal(narrow, expected), "a narrow sum rounds these terms apart"
