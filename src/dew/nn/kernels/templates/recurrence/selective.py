@@ -212,7 +212,7 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan):
     striped = plgpu.Layout.WG_STRIDED((positions,), vec_size=1)
 
     def entry(x_ref, dt_ref, b_ref, c_ref, parameters_ref, entered_ref, resets_ref, dy_ref, dfinal_ref,
-              db_ref, dc_ref, dx_ref, ddt_ref, da_ref, dd_ref, dstate_ref, exchanged, staged):
+              db_ref, dc_ref, dx_ref, ddt_ref, da_ref, dd_ref, dstate_ref, exchanged, staged, carried):
         row, channel = lax.axis_index("rows"), lax.axis_index("channels")
 
         def load(ref):
@@ -226,16 +226,16 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan):
             staged[...] = value
             plgpu.atomic_add(ref, plgpu.load(staged, layout=striped, optimized=False), optimized=False)
 
-        def block(i, carried):
-            g, d_rates, d_skip = carried
+        def block(i, d_skip):
             k = blocks - 1 - i
             span = pl.ds(k * positions, positions)
             xs, dts, dys = (load(ref.at[row, channel, span]) for ref in (x_ref, dt_ref, dy_ref))
             kept = 1.0 - load(resets_ref.at[row, span]) if scan.packed else None
-            dx = parameters_ref[states, channel] * dys
-            ddt = jnp.zeros((positions,), jnp.float32)
-            g, d_rates = list(g), list(d_rates)
-            for n in range(states):
+
+            def state(n, sums):
+                # A state a turn, rolled: unrolled, the states' operands lived together and spilled 12 KB
+                # a thread (255 registers, an H100's compile, scanbwd-ptxas-sm90 at 5de7abaa0).
+                dx, ddt = sums
                 rate = parameters_ref[n, channel]
                 bs, cs = load(b_ref.at[row, n, span]), load(c_ref.at[row, n, span])
                 a = jnp.exp2(dts * rate) if kept is None else jnp.exp2(dts * rate) * kept
@@ -244,28 +244,33 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan):
                 before, _ = block_scan.linear_scan(a, written, entering, exchanged, exclusive=True,
                                                    interpret=interpret)
                 read = cs * dys
-                after, g[n] = block_scan.linear_scan(a, a * read, g[n], exchanged, reverse=True,
-                                                     exclusive=True, interpret=interpret)
+                after, carried[0, n] = block_scan.linear_scan(
+                    a, a * read, carried[0, n], exchanged, reverse=True, exclusive=True, interpret=interpret)
                 cotangent = read + after
                 through = cotangent * before * a
-                dx = dx + cotangent * bs * dts
-                # `exp2(dt rate)`'s derivative in `dt` is `rate ln(2)` times it, in the rate `dt ln(2)`.
-                ddt = ddt + cotangent * bs * xs + through * (rate * math.log(2.0))
-                d_rates[n] = d_rates[n] + block_scan.summed(through * dts, exchanged, interpret=interpret)
+                summed = block_scan.summed(through * dts, exchanged, interpret=interpret)
+                carried[1, n] = carried[1, n] + summed
                 added(db_ref.at[row, n, span], cotangent * dts * xs)
                 added(dc_ref.at[row, n, span], dys * (a * before + written))
+                # `exp2(dt rate)`'s derivative in `dt` is `rate ln(2)` times it, in the rate `dt ln(2)`.
+                return (dx + cotangent * bs * dts,
+                        ddt + cotangent * bs * xs + through * (rate * math.log(2.0)))
+
+            zeros = jnp.zeros((positions,), jnp.float32)
+            dx, ddt = lax.fori_loop(0, states, state, (parameters_ref[states, channel] * dys, zeros))
             plgpu.store(dx_ref.at[row, channel, span], dx, optimized=False)
             plgpu.store(ddt_ref.at[row, channel, span], ddt, optimized=False)
-            d_skip = d_skip + block_scan.summed(dys * xs, exchanged, interpret=interpret)
-            return tuple(g), tuple(d_rates), d_skip
+            return d_skip + block_scan.summed(dys * xs, exchanged, interpret=interpret)
 
-        zero = jnp.zeros((), jnp.float32)
-        carried = (tuple(dfinal_ref[row, n, channel] for n in range(states)), (zero,) * states, zero)
-        g, d_rates, d_skip = lax.fori_loop(0, blocks, block, carried)
+        # Each state's cotangent carried from block to block and its rate's gradient summed, in shared
+        # memory, a state's a turn of the rolled loop.
         for n in range(states):
-            dstate_ref[row, n, channel] = g[n]
-            da_ref[row, n, channel] = d_rates[n]
-        dd_ref[row, channel] = d_skip
+            carried[0, n] = dfinal_ref[row, n, channel]
+            carried[1, n] = jnp.zeros((), jnp.float32)
+        dd_ref[row, channel] = lax.fori_loop(0, blocks, block, jnp.zeros((), jnp.float32))
+        for n in range(states):
+            dstate_ref[row, n, channel] = carried[0, n]
+            da_ref[row, n, channel] = carried[1, n]
 
     sized = jax.ShapeDtypeStruct
     out_type = (sized(x.shape, jnp.float32), sized(x.shape, jnp.float32),
@@ -274,7 +279,8 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan):
     launched = mosaic.kernel(entry, out_type=out_type, grid=(rows, channels), grid_names=("rows", "channels"),
                              warpgroups=1, interpret=interpret, family=scan.family.name,
                              name="selective_scan_backward",
-                             scratch=(block_scan.scratch(), plgpu.SMEM((positions,), jnp.float32)))
+                             scratch=(block_scan.scratch(), plgpu.SMEM((positions,), jnp.float32),
+                                      plgpu.SMEM((2, states), jnp.float32)))
     db, dc = (jax.new_ref(jnp.zeros(b.shape, jnp.float32)) for _ in range(2))
     dx, ddt, da, dd, dstate = launched(x, dt, b, c, parameters, entered, resets, dy, dfinal, db, dc)
     return dx, ddt, jax.freeze(db), jax.freeze(dc), da, dd, dstate
