@@ -18,6 +18,7 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from typing import Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -128,6 +129,20 @@ def materialize(tree: LazyTree) -> LazyTree:
             for name, value in tree.items()}
 
 
+@runtime_checkable
+class HostArray(Protocol):
+    """A leaf built on the host as it is read (`np.asarray`), its shape and dtype known before: a DEX
+    layer's folded output projection (`dew.nn.dex.FoldedKernel`), which an export folds as it writes it."""
+
+    @property
+    def shape(self) -> tuple[int, ...]: ...
+
+    @property
+    def dtype(self) -> np.dtype: ...
+
+    def __array__(self, dtype=None, copy=None) -> np.ndarray: ...
+
+
 @dataclass(frozen=True)
 class WeightLayout:
     """Holds an existing source tensor's location and reversible storage layout.
@@ -165,7 +180,7 @@ class WeightLayout:
     chunks: int | None = None
 
     def _leaf(self, variables: Mapping[str, object], path: tuple[str, ...],
-              scalar_mode: str | None) -> np.ndarray | jax.Array:
+              scalar_mode: str | None) -> np.ndarray | jax.Array | HostArray:
         if path[-1] == "layer_scalar":
             if scalar_mode not in LAYER_SCALAR_COLLECTIONS:
                 raise ValueError("layer_scalar export requires an explicit model mode")
@@ -175,7 +190,7 @@ class WeightLayout:
             if not isinstance(node, Mapping):
                 raise ValueError(f"parameter path {path} does not traverse a mapping")
             node = node[part]
-        if not isinstance(node, (np.ndarray, jax.Array)):
+        if not isinstance(node, (np.ndarray, jax.Array, HostArray)):
             raise ValueError(
                 f"{self.name} reads {path}, which holds {type(node).__name__} rather than an array"
             )
@@ -195,6 +210,8 @@ class WeightLayout:
                 # Slice the expert where the leaf lives. One stacked leaf
                 # answers for E source tensors, so copying it to the host
                 # per tensor would move the whole stack E times.
+                if not isinstance(node, (np.ndarray, jax.Array)):
+                    node = np.asarray(node)  # a leaf built as it is read, sliced once built
                 if node.ndim == 0 or not 0 <= self.expert_index < node.shape[0]:
                     raise ValueError(
                         f"{self.name} is expert {self.expert_index} of {path}, which "

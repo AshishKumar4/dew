@@ -39,7 +39,8 @@ from dew._coordination import read_home
 from dew.batch import leaves_by_path
 
 __all__ = ["DEX_COLLECTION", "DEX_CONSTANTS", "DEX_PARAMETERS", "DexStart", "DifferentialExtension",
-           "HeadOutputs", "LayerDex", "annealed", "diff_lambda_init", "differential", "folded"]
+           "FoldedKernel", "HeadOutputs", "LayerDex", "annealed", "diff_lambda_init", "differential",
+           "folded"]
 
 TRAINED_PROJECTIONS = ("k_proj", "v_proj", "o_proj")
 """The attention projections the paper's recipe trains beside the extension, the feed-forward and the
@@ -170,6 +171,40 @@ def differential(attention: jax.Array, heads: jax.Array | tuple[int, ...], proje
     return attention.at[:, :, chosen].add(-(strength.astype(attention.dtype) * moved))
 
 
+@dataclasses.dataclass(frozen=True, eq=False)
+class FoldedKernel:
+    """A layer's `o_proj` kernel with its differential folded in (`folded`), computed as it is read
+    (`__array__`): the kernel read home (`read_home`), each chosen head's rows `K_h` made
+    `(I - strength W_h) K_h` in float64 and rounded once to the kernel's dtype. An export reads one at
+    a time, so a host holds one folded kernel, not every layer's."""
+
+    kernel: jax.Array | np.ndarray
+    projection: np.ndarray
+    strength: np.ndarray
+    heads: np.ndarray
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        return tuple(self.kernel.shape)
+
+    @property
+    def dtype(self) -> np.dtype:
+        return np.dtype(self.kernel.dtype)
+
+    @property
+    def ndim(self) -> int:
+        return len(self.shape)
+
+    def __array__(self, dtype: DTypeLike | None = None, copy: bool | None = None) -> np.ndarray:
+        del copy  # every read builds a new array
+        wide = read_home(self.kernel).astype(np.float64)
+        width = self.projection.shape[-1]
+        for slot, head in enumerate(self.heads):
+            rows = slice(int(head) * width, (int(head) + 1) * width)
+            wide[rows] -= self.strength * self.projection[slot] @ wide[rows]
+        return wide.astype(self.dtype if dtype is None else dtype)
+
+
 def folded(variables: Mapping[str, Mapping], compute: DTypeLike | None) -> dict[str, Mapping]:
     """`variables` with each DEX layer's differential at its learned lambda folded into its output
     projection, the extension's parameters and constants dropped: a layer's `o_proj` kernel
@@ -178,27 +213,24 @@ def folded(variables: Mapping[str, Mapping], compute: DTypeLike | None) -> dict[
     does outside a run (`annealed`), `O'_h K_h = O_h (I - lambda W_h) K_h`. Lambda and `W_h` are the
     ones the layer multiplies by, rounded to its `compute` dtype as `differential` rounds them (None for
     its parameters' own). A layer whose heads' outputs pass through more before `o_proj` does not fold
-    (`HeadOutputs.dex_fold_refusal`). Each operand is read home as a pool's export reads it
-    (`read_home`), the layers in order, the same on every process."""
+    (`HeadOutputs.dex_fold_refusal`). Each layer's lambda, `W_h` and heads are read home as a pool's
+    export reads them (`read_home`), the layers in order, the same on every process, and each kernel
+    folds as it is read (`FoldedKernel`)."""
 
     def multiplied(value) -> np.ndarray:
         held = read_home(value)
         return np.asarray(held if compute is None else held.astype(jnp.dtype(compute)), np.float64)
 
     params: dict[tuple[str, ...], jax.Array | np.ndarray] = dict(leaves_by_path(variables["params"]))
+    folds: dict[tuple[str, ...], FoldedKernel] = {}
     held = leaves_by_path(variables.get(DEX_COLLECTION, {}))
     for prefix in [key[:-1] for key in params if key[-1] == "dex_projection"]:
         projection = multiplied(params.pop((*prefix, "dex_projection")))
         strength = multiplied(params.pop((*prefix, "dex_lambda")))
         heads = read_home(held.pop((*prefix, "dex_heads")))
         del held[(*prefix, "dex_lambda_init")]
-        kernel = params[(*prefix, "o_proj", "kernel")]
-        wide = read_home(kernel).astype(np.float64)
-        width = projection.shape[-1]
-        for slot, head in enumerate(heads):
-            rows = slice(int(head) * width, (int(head) + 1) * width)
-            wide[rows] -= strength * projection[slot] @ wide[rows]
-        params[(*prefix, "o_proj", "kernel")] = wide.astype(kernel.dtype)
+        path = (*prefix, "o_proj", "kernel")
+        folds[path] = FoldedKernel(params[path], projection, strength, heads)
     rest = {name: tree for name, tree in variables.items() if name not in ("params", DEX_COLLECTION)}
     kept = {DEX_COLLECTION: unflatten_dict(held)} if held else {}
-    return {**rest, "params": unflatten_dict(params), **kept}
+    return {**rest, "params": unflatten_dict({**params, **folds}), **kept}

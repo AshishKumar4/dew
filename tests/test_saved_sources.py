@@ -117,8 +117,9 @@ WORKER = Path(__file__).with_name("saved_export_worker.py")
 @pytest.mark.distributed
 @pytest.mark.mesh
 def test_a_pool_exports_a_model_spanning_its_processes_a_shard_at_a_time(tmp_path):
-    """Two real processes export a decoder whose kernels span both as a saved run's release (`export_run`,
-    ledger 2874), in a score of shards: each reads one tensor home at a time, together, so neither host's
+    """Two real processes export a decoder whose kernels span both, every layer's attention extended by
+    DEX, as a saved run's release (`export_run`, ledger 2874), in a score of shards, each output
+    projection folded as it is written: each reads one tensor home at a time, together, so neither host's
     allocations during the export peak at half the model, where the pool read the whole tree home
     first. The publishing process writes the tensors one process writes of the same weights unplaced,
     byte for byte, though the restored tree's key order may place one in another shard; the other

@@ -2,8 +2,9 @@
 (`dew.interop.saved_sources.export_run`).
 
 Driven by tests/test_saved_sources.py. Every process places one small decoder over a mesh across the
-pool and exports it as a saved run's release, the run's restore (`Pretrained.from_saved`) standing in
-for the placed decoder and the release cut into small shards, process 0 publishing and the other
+pool, extends each of its layers' attention with DEX (`dew.nn.dex`), whose export folds each output
+projection as it is written, and exports it as a saved run's release, the run's restore
+(`Pretrained.from_saved`) standing in for the placed decoder and the release cut into small shards, process 0 publishing and the other
 reading every tensor as it does (`publishes`). Each records the files it wrote, the peak of its host
 allocations during the export (`tracemalloc`, which counts NumPy's), and the model's size; outside the
 export's scope the write is refused. It also writes the same weights unplaced, as one process does.
@@ -54,6 +55,7 @@ def exported(args) -> dict:
     import jax.numpy as jnp
 
     from dew.inference.banks import HeldBanks
+    from dew.nn.dex import DifferentialExtension
     from dew.interop.pretrained import Pretrained, PretrainedDecoder
     from dew.interop.saved_sources import export_run
     from dew.registry import models
@@ -65,7 +67,9 @@ def exported(args) -> dict:
     placed = HeldBanks(variables).place(model, mesh=MeshSpec(fsdp=args.fsdp_size),
                                         layout=Layout(min_shard=TINY_SHARD, tolerance=1.0))
     leaves = jax.tree.leaves(placed)
-    bundle = PretrainedDecoder.from_model(model, placed)
+    extension = DifferentialExtension(tuple((layer, (0, 2)) for layer in range(FIELDS["num_layers"])),
+                                      anneal_steps=10)
+    bundle = PretrainedDecoder.from_model(model, placed).with_dex(extension, key=0)
     root = Path(args.run_dir)
     rank = jax.process_index()
     try:
@@ -81,7 +85,7 @@ def exported(args) -> dict:
     peak = tracemalloc.get_traced_memory()[1]
     tracemalloc.stop()
     alone = root / f"alone{rank}"
-    PretrainedDecoder.from_model(model, variables).save(alone)
+    PretrainedDecoder.from_model(model, variables).with_dex(extension, key=0).save(alone)
     written, own = tensors(destination), tensors(alone)
     return {"processes": jax.process_count(), "rank": rank,
             "differing": {name: [written.get(name), own.get(name)] for name in sorted({*written, *own})
