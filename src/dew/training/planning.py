@@ -257,6 +257,9 @@ class Probe:
     """Whether the executable is the step compiled ahead (`FitSearch.ahead`), not the search's own."""
     compile_seconds: float = 0.0
     """Time spent compiling or loading this program, apart from its shape trace and lowering."""
+    derived_headroom: int | None = None
+    """The headroom the derivation judged the candidate would leave (`derived_headroom`), None where it
+    judged none: beside `headroom`, which the compile measured, its error."""
 
     @classmethod
     def read(cls, split: int, candidate: Candidate, rung: Mapping[str, JSON], fit: bool,
@@ -271,7 +274,7 @@ class Probe:
         return {"split": self.split, "rows": self.rows, **self.rung, "fits": self.fits,
                 "headroom": self.headroom, "temp": self.temp, "argument": self.argument,
                 "derived": None if self.derived is None else self.derived.record(), "ahead": self.ahead,
-                "compile_seconds": self.compile_seconds}
+                "compile_seconds": self.compile_seconds, "derived_headroom": self.derived_headroom}
 
     def named(self) -> str:
         tile = ("" if self.rung["head_tile"] is None else ", the head tiled" if self.rung["head_fused"]
@@ -660,7 +663,8 @@ class FitSearch[LossT, EffectsT]:
         chooses its remat (`RematChoosing`) is read from no remat up to the run's own, which the walk
         never reads, and the run's own modules and head are put back. A run whose remat the ladder's climb
         from none never reaches (a policy off `DECODER_REMAT`, or a rung the climb passes over) is told
-        nothing, and traces nothing for it: no rung below its own is known."""
+        nothing, and traces nothing for it: no rung below its own is known. A layout the derivation cannot
+        judge (`walked`'s "unknown") is told so."""
         entries = self.objective.program_key()
         if not any(entry.trained and isinstance(entry.module, RematChoosing) for entry in entries):
             return
@@ -686,6 +690,11 @@ class FitSearch[LossT, EffectsT]:
             _log.warning("the run sets remat %s, and the derivation says the step fits from remat %s, which "
                          "recomputes less: leave the remat unset and the run compiles there first", own,
                          found)
+        elif label == "unknown":
+            # The derivation reads per-device residuals only where each split axis is data or fsdp (row 2615).
+            _log.warning("the run sets remat %s, and the derivation cannot judge its layout's footprint (a "
+                         "tensor, sequence, stage or expert axis), so it says nothing of a rung that "
+                         "recomputes less", own)
 
     def current(self) -> dict[str, JSON]:
         return rung_record(self.objective, self.xla_defaults, narrow=self.narrow)
@@ -757,7 +766,21 @@ class FitSearch[LossT, EffectsT]:
             fit, headroom = step_fits(compiled, self.mesh, candidate.held, self.capacity, candidate.built)
         seconds = time.perf_counter() - began
         probe = Probe.read(split, candidate, self.current(), fit, headroom, executable)
-        probe = dataclasses.replace(probe, ahead=taken, compile_seconds=seconds)
+        judged = None if candidate.footprint is None else derived_headroom(
+            candidate.footprint, local_devices(self.mesh), self.capacity, candidate.built)
+        probe = dataclasses.replace(probe, ahead=taken, compile_seconds=seconds, derived_headroom=judged)
+        if judged is not None and (judged >= 0) != fit:
+            # A derived peak bounded from below (`Footprint.exact`) admits provisionally: its miss names
+            # the need the compile found, which a sourced rule is to reach.
+            footprint = candidate.footprint
+            _log.warning("a model miss: the derivation judged %s %s with %d bytes to spare%s, and its "
+                         "compile %s with %s, its temporaries %s bytes against a derived peak of %s "
+                         "(derived terms %s); the compile decides, and the derivation is to fix",
+                         probe.named(), "fits" if judged >= 0 else "does not fit", judged,
+                         "" if footprint is None or footprint.exact else " (its peak a bound from below)",
+                         "fits" if fit else "does not fit", headroom, probe.temp,
+                         None if footprint is None else footprint.peak,
+                         None if probe.derived is None else probe.derived.record())
         return options, candidate, executable, probe
 
     def fits_here(self, split: int) -> bool:

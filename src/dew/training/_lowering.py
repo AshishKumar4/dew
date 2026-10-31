@@ -33,11 +33,12 @@ from dataclasses import asdict, dataclass, replace
 
 import jax
 from jax.extend.mlir import ir
+from jax.extend.mlir.dialects import stablehlo
 
 from dew.nn.kernels import generation
 from dew.nn.kernels.generation import Route
 from dew.nn.kernels.templates import report
-from dew.telemetry.instrumentation import call_weights, custom_call_kind, sizes
+from dew.telemetry.instrumentation import call_weights, counted_trips, custom_call_kind, sizes
 
 _log = logging.getLogger(__name__)
 
@@ -139,13 +140,12 @@ def _walked(operation: ir.Operation, times: float) -> Iterator[tuple[ir.Operatio
 def _trips(loop: ir.Operation) -> float:
     """The trip count of a `stablehlo.while` that counts one integer it carries from a constant start, by a
     constant positive step, while it is below a constant bound: the loop every `scan` and `fori_loop` with
-    static bounds lowers to, read as `instrumentation._counted_trips` reads the HLO loop. Infinite for any
-    other loop, and for one whose last step overflows its counter's type, since a wrapped counter need never
-    reach the bound."""
+    static bounds lowers to, by the rule an executable's loop is read by (`instrumentation.counted_trips`).
+    Infinite for any other loop."""
     condition, body = (region.blocks[0] for region in loop.regions)
     compare = _result_of(_terminator(condition).operands[0])
-    if (compare is None or compare.name != "stablehlo.compare"
-            or "LT" not in str(compare.attributes["comparison_direction"])):
+    if compare is None or compare.name != "stablehlo.compare" or stablehlo.ComparisonDirectionAttr(
+            compare.attributes["comparison_direction"]).value != "LT":
         return math.inf
     counter, bound = (operand.maybe_downcast() for operand in compare.operands)
     if not isinstance(counter, ir.BlockArgument):
@@ -160,15 +160,14 @@ def _trips(loop: ir.Operation) -> float:
                for side in sides):
             step = next((value for value in map(_constant, sides) if value is not None), None)
     kind = ir.RankedTensorType(counter.type).element_type.maybe_downcast()
-    if limit is None or start is None or step is None or step <= 0 or not isinstance(kind, ir.IntegerType):
+    if limit is None or start is None or step is None or not isinstance(kind, ir.IntegerType):
         return math.inf
-    trips = max(0, -(-(limit - start) // step))
-    # A compare states its type's signedness; one that states none compares signed, StableHLO's default.
-    stated = str(compare.attributes["compare_type"]) if "compare_type" in compare.attributes else ""
-    signed = "UNSIGNED" not in stated
-    if start + trips * step > (1 << (kind.width - signed)) - 1:
-        return math.inf
-    return float(trips)
+    # A compare states its type's signedness; one that states none (or NOTYPE) compares as its operands'
+    # type is, an unsigned integer's unsigned and a signless or signed one's signed.
+    stated = "compare_type" in compare.attributes and stablehlo.ComparisonTypeAttr(
+        compare.attributes["compare_type"]).value
+    unsigned = stated == "UNSIGNED" or (stated in (False, "NOTYPE") and kind.is_unsigned)
+    return counted_trips(start, limit, step, kind.width, signed=not unsigned)
 
 
 def _terminator(block: ir.Block) -> ir.Operation:
@@ -312,7 +311,7 @@ def triton_kernels(lowered: jax.stages.Lowered) -> dict[str, int]:
 class KernelReport:
     """Which kernels a step runs: each dispatch's decision over the step's trace (`routes`: its choice,
     kernel, the kernel it preferred and why that refused, its site; `generation.routes`) beside the
-    launches its lowered program makes (`calls`, `kernel_calls`: how many of each kernel, its config and
+    launches its lowered program makes (`calls`, `kernel_launches`: how many of each kernel, its config and
     the FLOPs it states). The run log, the run record (`StepCompiled.kernels`, through `Planned`'s) and
     the lowering tool (`Lowered.kernels`, tools/kernel_picks.py) read this one report, and the FLOP count
     sizes each call as its `unsized` does (`instrumentation.sizes`)."""
