@@ -97,7 +97,8 @@ def test_dew_train_trains_an_inpainting_pipeline_through_its_masks(inpainting, o
     runs = tmp_path / "runs"
     settings = {"trainer.name": "inpainting", "trainer.checkpoint_dir": str(runs), "trainer.steps": "1",
                 "trainer.log_every": "1", "trainer.eval_every": "None", "trainer.checkpoint_final": "True",
-                "trainer.multi_host": "False", "trainer.compilation_cache_dir": "None",
+                "trainer.checkpoint_every": "None", "trainer.multi_host": "False",
+                "trainer.compilation_cache_dir": "None",
                 "optim.learning_rate": "0.05"}
     assert main(["train", str(record / "run.json"),
                  *(flag for path, value in settings.items() for flag in ("--set", f"{path}={value}"))]) == 0
