@@ -220,13 +220,8 @@ def test_a_block_run_the_trainer_quantizes_reloads_quantized(tmp_path):
     canvas = jnp.arange(8, 8 + objective.canvas_size, dtype=jnp.int32)[None]
 
     def canvas_logits(model, variables):
-        # One program of the prefill and the canvas, as a served request compiles them: run op by op, a
-        # quantized model dispatches thousands of programs of one operation each (row 2788).
-        def logits(variables):
-            cache = prefill(model, variables, prompt)
-            return model.apply({**variables, "cache": cache}, canvas)
-
-        return np.asarray(jax.jit(logits)(variables))
+        cache = prefill(model, variables, prompt)
+        return np.asarray(model.apply({**variables, "cache": cache}, canvas))
 
     np.testing.assert_array_equal(canvas_logits(task.model, task.variables),
                                   canvas_logits(objective.model, state.variables))
