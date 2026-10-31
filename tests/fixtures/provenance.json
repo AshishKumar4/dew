@@ -2966,6 +2966,28 @@
    ],
    "note": "RoutedMoE.generate_masks' own body extracted from src/maxtext/layers/moe.py at the commit (SHA-256 checked), called on a stand-in self with its three fields and an identity sharding hint; dispatch and combine masks for four dropping cases. JAX 0.11.2.post3."
   },
+  "maxtext/gpt3.npz": {
+   "tool": "tools/maxtext_reference.py",
+   "sources": [
+    {
+     "repo": "AI-Hypercomputer/maxtext",
+     "version": "0.2.5",
+     "runs": "maxtext"
+    }
+   ],
+   "note": "MaxText's GPT-3 (decoder_block gpt3, model gpt3-52k at two layers, a vocabulary and position table of 64) run by tools/maxtext_worker.py gpt3 on the CPU over each seed's drawn weights and eight tokens, in float32 and, its validated config's dtypes set to float64 and its bfloat16 read of the tied table and its RMSNorm's float32 carried in float64 (float64_casts), in float64; kept as its evidence and its truth's sketch over 80 draws (16 declared seeds and their redraw)."
+  },
+  "maxtext/engram.npz": {
+   "tool": "tools/maxtext_reference.py",
+   "sources": [
+    {
+     "repo": "AI-Hypercomputer/maxtext",
+     "version": "0.2.5",
+     "runs": "maxtext"
+    }
+   ],
+   "note": "MaxText's Engram layer (maxtext/layers/engram.py: two heads for each of the 2- and 3-gram orders over prime buckets 11, 13, 17 and 19, two streams 8 wide, a conv of four taps three apart) run by tools/maxtext_worker.py engram on the CPU over each seed's drawn weights, streams and buckets, the caller's residual added, in float32 and, its validated config's dtypes set to float64, in float64; kept as its evidence and its truth's sketch."
+  },
   "mdlm/continuation.npz": {
    "tool": "tools/mdlm_sampling_reference.py",
    "sources": [{"repo": "kuleshov-group/mdlm", "version": "c112c526d193436838c98d81455ee51f90309470", "runs": "fetched"}, {"repo": "pytorch/pytorch", "version": "2.14.0", "runs": "torch"}],
