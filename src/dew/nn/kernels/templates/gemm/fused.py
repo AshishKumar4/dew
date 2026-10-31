@@ -39,11 +39,11 @@ import functools
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import fuser
 from jax.extend import core as jax_core
 
+from dew.nn.kernels.generation import tangent_zero
 from dew.nn.kernels.selection import Kernel, Op, Refusal, analysed, select
 from dew.nn.kernels.templates.gemm import template
 
@@ -225,13 +225,8 @@ def _whole_jvp(flat, leaves: tuple, places: tuple, shapes: tuple, base, *sides):
         if place is not None:
             inputs[place] = array.reshape(shape)
 
-    def zero(leaf):
-        if jnp.issubdtype(jnp.result_type(leaf), jnp.inexact):
-            return jnp.zeros_like(leaf)
-        return np.zeros(jnp.shape(leaf), jax.dtypes.float0)
-
     def pushed(d_base, *d_sides):
-        tangents = [zero(leaf) for leaf in inputs]
+        tangents = [tangent_zero(leaf) for leaf in inputs]
         for place, tangent, shape in zip(places, (d_base, *d_sides), shapes, strict=True):
             if place is not None:
                 tangents[place] = tangent.reshape(shape)
