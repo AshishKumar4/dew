@@ -357,3 +357,28 @@ def test_a_reload_after_a_cancelled_request_plans_the_next_pass_with_the_new_tas
     server.run()
     alone = narrow.systemone(many)
     assert answered.result() == alone
+
+
+def test_a_scoring_server_reports_the_share_of_each_pass_shapes_tokens_its_rows_held(decide):
+    """A served task counts, per pass shape, the tokens its passes computed, `rows` windows of `length`
+    tokens each, and the real tokens of the rows they scored (`PassTokens`, row 2772): the share of each
+    shape's, and of every pass's, reads what padding costs the server."""
+    from test_decision_batches import CASES
+
+    task, variables = decide.scoring()
+    server = ScoringServer.from_task(task, variables)
+    futures = [server.submit(body) for body in CASES.values()]
+    server.run()
+    for future in futures:
+        future.result()
+    held = [row for body in CASES.values() for row in task.admit(body).rows if row.media is None]
+    shapes = task.passes.computed
+    assert shapes and sum(task.passes.real.values()) == sum(len(row.encoded.tokens) for row in held)
+    assert set(shapes) <= set(decide.pass_shapes)
+    assert all(computed == task.passes.passes[shape] * shape.rows * shape.length
+               for shape, computed in shapes.items())
+    metrics = task.passes.metrics()
+    assert metrics["served/real_token_share"] == sum(task.passes.real.values()) / sum(shapes.values())
+    assert 0 < metrics["served/real_token_share"] < 1
+    assert {name for name in metrics if name.endswith("/passes")} == {
+        f"served/passes/{shape.rows}x{shape.length}/passes" for shape in shapes}

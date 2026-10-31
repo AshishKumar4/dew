@@ -1145,6 +1145,36 @@ class PassPlan:
         return list(self.placing[self.alive[0]].windows)
 
 
+@dataclass
+class PassTokens:
+    """What padding costs a served task's passes (`_DecideScoring.forward`), per pass shape: the tokens its
+    passes computed, each `rows` windows of `length` tokens, and the real tokens of the rows they scored.
+    `metrics` reads the share of each shape's, and of every pass's, as a run reads its own
+    (`train/real_token_share`, row 2772)."""
+
+    computed: dict[PassShape, int] = field(default_factory=dict)
+    real: dict[PassShape, int] = field(default_factory=dict)
+    passes: dict[PassShape, int] = field(default_factory=dict)
+
+    def add(self, shape: PassShape, rows: Sequence[Encoded]) -> None:
+        """Count a pass at `shape` over `rows`."""
+        self.passes[shape] = self.passes.get(shape, 0) + 1
+        self.computed[shape] = self.computed.get(shape, 0) + shape.rows * shape.length
+        self.real[shape] = self.real.get(shape, 0) + sum(len(row.tokens) for row in rows)
+
+    def metrics(self) -> dict[str, float]:
+        """`served/real_token_share`, of every pass's tokens the share its rows held, and each shape's
+        under `served/passes/<rows>x<length>/` beside its passes; none before a pass."""
+        computed = sum(self.computed.values())
+        if not computed:
+            return {}
+        shapes = {f"served/passes/{shape.rows}x{shape.length}": shape for shape in self.computed}
+        return {"served/real_token_share": sum(self.real.values()) / computed,
+                **{f"{name}/real_token_share": self.real[shape] / self.computed[shape]
+                   for name, shape in shapes.items()},
+                **{f"{name}/passes": float(self.passes[shape]) for name, shape in shapes.items()}}
+
+
 @dataclass(frozen=True)
 class _Admitted:
     """A Jev body as `WireScoring` admitted it: its questions and its rows, laid out by the task."""
@@ -1202,6 +1232,8 @@ class _DecideScoring[RequestT, PayloadT, AnswerT](
     bodies (`WireScoring`), runs these passes over the same compiled programs."""
 
     decide: Decide
+    passes: PassTokens = field(default_factory=PassTokens, compare=False)
+    """The tokens each pass shape's text passes computed and their rows held (`PassTokens.metrics`)."""
 
     def planned(self) -> "_WirePlan":
         return _WirePlan(self.decide)
@@ -1210,7 +1242,10 @@ class _DecideScoring[RequestT, PayloadT, AnswerT](
         # The server chose these rows as one pass (`planned`), so they run as one, over the weights it
         # hands the pass; the task's compiled forwards are kept across passes.
         if rows[0].media is None:
-            return self.decide.scored([row.encoded for row in rows], variables)
+            encoded = [row.encoded for row in rows]
+            shape = self.decide._shape(encoded)
+            self.passes.add(shape, encoded)
+            return self.decide._pass(encoded, variables, shape)
         return self.decide._seen_pass([(row.encoded, row.media) for row in rows if row.media is not None],
                                       variables)
 
