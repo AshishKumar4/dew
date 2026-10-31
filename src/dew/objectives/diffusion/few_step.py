@@ -25,6 +25,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 
+from dew.batch import Variables
 from dew.diffusion.presets import Preset
 from dew.diffusion.process import Process
 from dew.diffusion.schedules import FlowMatchingScheduler, expand
@@ -68,19 +69,20 @@ def guided_velocity(v, unconditional, conditional, omega, kappa):
     return omega * v + (1 - omega - kappa) * unconditional + kappa * conditional
 
 
-def mean_flow_target(velocity: Velocity, z, t, r, v) -> tuple[jax.Array, jax.Array]:
+def mean_flow_target(velocity: Velocity, z, t, r, v, trained: Velocity | None = None
+                     ) -> tuple[jax.Array, jax.Array]:
     """Return the model's average velocity at (z, t, r) and its regression target v - (t - r) du/dt.
 
     One JVP, traced for forward mode (`forward_mode_attention`), takes the
     derivative along (dz/dt, dt/dt, dr/dt) = (v, 1, 0); the velocity the loss
     trains comes from the ordinary forward, which a fused attention kernel
-    differentiates in reverse, as sCM's student does. No gradient flows
-    through the target.
+    differentiates in reverse, as sCM's student does, `trained`'s where given
+    (one that records what its call sows). No gradient flows through the target.
     """
     with forward_mode_attention():
         _, derivative = jax.jvp(velocity, (z, t, r), (v, jnp.ones_like(t), jnp.zeros_like(r)))
     target = v - expand(jnp.clip(t - r, 0.0, 1.0), derivative) * derivative
-    return velocity(z, t, r), jax.lax.stop_gradient(target)
+    return (velocity if trained is None else trained)(z, t, r), jax.lax.stop_gradient(target)
 
 
 def adaptive_loss(u, target, power: float, epsilon: float) -> jax.Array:
@@ -148,13 +150,20 @@ def _interval_velocity(model: nn.Module, process: Process, method: str, preset: 
 
 
 def _model_velocity(model: nn.Module, schedule, key: jax.Array, variables, conditions, *,
-                    train: bool) -> Velocity:
+                    train: bool, recorded: list[Variables] | None = None) -> Velocity:
     """`model` at `variables` as a `Velocity`: `(x, t, r)` to its output at `t`'s model time given the
-    `conditions` and the interval's model-time duration to `r`, with `key`'s dropout where `train`."""
+    `conditions` and the interval's model-time duration to `r`, with `key`'s dropout where `train`;
+    where `recorded` is given, each call opens what the watched modules sow (`INSPECTED`) and appends
+    it, in the trace that calls it."""
     def over(x, t, r) -> jax.Array:
-        output = model.apply(variables, x, schedule.model_time(t), **conditions,
-                             duration=schedule.model_time(t) - schedule.model_time(r),
-                             train=train, rngs=model_rngs(key, training=train))
+        arguments = (variables, x, schedule.model_time(t))
+        keywords = {**conditions, "duration": schedule.model_time(t) - schedule.model_time(r),
+                    "train": train, "rngs": model_rngs(key, training=train)}
+        if recorded is None:
+            output = model.apply(*arguments, **keywords)
+        else:
+            output, sown = model.apply(*arguments, **keywords, mutable=[INSPECTED])
+            recorded.append(dict(sown).get(INSPECTED, {}))
         assert isinstance(output, jax.Array)
         return output
     return over
@@ -246,13 +255,13 @@ class MeanFlowObjective(DiffusionObjective):
         conditions = jax.tree.map(lambda value, null: jnp.where(expand(dropped, value), null, value),
                                   given, blank)
         guided = jnp.where(expand(dropped, v), v, guided)
-        u, target = mean_flow_target(velocity(conditions, train=step.training), z, t, r, guided)
+        # The forward the loss trains records what the watched modules sow, the JVP's apart.
+        recorded: list[Variables] | None = [] if step.watched is not None else None
+        trained = None if recorded is None else velocity(conditions, train=step.training, recorded=recorded)
+        u, target = mean_flow_target(velocity(conditions, train=step.training), z, t, r, guided,
+                                     trained=trained)
         losses = adaptive_loss(u, target, self.norm_p, self.norm_eps)
-        # The student's forward the target's JVP runs, at the step's own interval, for its summaries.
-        inspected = self.watched_forward(
-            step, self.model, self.model_variables(variables), z, schedule.model_time(t), **conditions,
-            duration=schedule.model_time(t) - schedule.model_time(r), train=step.training,
-            rngs=model_rngs(dropout_key, training=step.training))
+        inspected = None if recorded is None else recorded[0]
         return self.row_mean(losses, batch), Aux(metrics={}, inspected=inspected)
 
 

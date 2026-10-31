@@ -330,8 +330,8 @@ class DecisionRunConfig(DecoderRunConfig):
 
         metrics = self.validation_metrics(validates=bool(held))
         after = calibrate if self.calibrate and held else None
-        return Prepared(self, lambda name: self.train(objective, dataset, name=name, metrics=metrics,
-                                                      summary=summary, after=after, validation=held))
+        return Prepared(self, objective, dataset, metrics=metrics, summary=summary, after=after,
+                        validation=held)
 
     def _row_fields(self) -> Budgets:
         """The run's fields that lay its rows out, by the layouts' field names (`ROW_FIELDS`), which
