@@ -410,7 +410,9 @@ def _forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dt
         phases.append([logits] * 3 + [bits] + hooked)
         if residuals:
             phases.append([logits, weights, weights, bits, bits, *hooked])
-    return resources.live_registers(family, [(block_q, value_width, jnp.float32)], *phases) + vectors
+    # A training walk's per-query rows (`TRAINING_ROWS`), in the accumulator's row layout.
+    rows = TRAINING_ROWS * family.row_registers(block_q, jnp.float32) if residuals else 0
+    return resources.live_registers(family, [(block_q, value_width, jnp.float32)], *phases) + vectors + rows
 
 
 @overload
@@ -490,6 +492,12 @@ def _scope(family: mosaic.Family, allocations: tuple, reducing_warpgroups: int) 
 
 DQ_ROWS = 7
 """The per-query rows a dQ step holds across its walk (`_backward_registers`)."""
+
+TRAINING_ROWS = 5
+"""The per-query rows a training forward's walk holds at its peak (`_forward_registers`): the maximum, the
+denominator and the anchor it carries, and its anchor reduction's shuffled and loaded rows (the corrected IR
+live set, ET-HOOKBREAK at the held term: 3 carried rows and 2 at the peak's shuffle beside its tiles, 174 and
+176 at 64 x 64 and width 64 where the model without them held 164 and 166)."""
 DKV_STATISTICS = 5
 """The per-query statistics a dK/dV step holds, the maximum, the denominator, the anchor, D and the anchor
 key (`attention_mosaic_scores._scores`): column vectors keys first, row vectors in a fused launch's queries
