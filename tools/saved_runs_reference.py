@@ -43,11 +43,12 @@ def anonymous(run: Path, name: str, places: dict[str, str]) -> bytes:
     a directory of the machine that wrote it (its scratch directory, its checkout), read in every text
     file as the place a later checkout reads it from, so the archive names no user, host or directory
     of the writer's; a binary file, which a later main reads as it was written, is kept as it is."""
+    import fixture_archive
+
     packed = io.BytesIO()
-    with tarfile.open(fileobj=packed, mode="w:xz") as archive:
+    with tarfile.open(fileobj=packed, mode="w:xz", preset=fixture_archive.PRESET) as archive:
         for path in sorted([run, *run.rglob("*")]):
-            info = tarfile.TarInfo((Path(name) / path.relative_to(run)).as_posix())
-            info.mtime, info.uid, info.gid, info.uname, info.gname = 0, 0, 0, "", ""
+            info = fixture_archive.anonymous(tarfile.TarInfo((Path(name) / path.relative_to(run)).as_posix()))
             if path.is_dir():
                 info.type, info.mode = tarfile.DIRTYPE, 0o755
                 archive.addfile(info)

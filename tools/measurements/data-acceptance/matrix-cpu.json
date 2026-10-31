@@ -25,8 +25,8 @@
       "config": {
         "engine": "dew",
         "workload": "image",
-        "source": "/home/ci/work/dew/dew/matrix-work/image",
-        "output": "/home/ci/work/dew/dew/matrix-work/0-image-dew.json",
+        "source": "matrix-work/image",
+        "output": "matrix-work/0-image-dew.json",
         "steps": 128,
         "warmup": 8,
         "train_steps": 16,
@@ -304,8 +304,8 @@
       "config": {
         "engine": "grain",
         "workload": "image",
-        "source": "/home/ci/work/dew/dew/matrix-work/image",
-        "output": "/home/ci/work/dew/dew/matrix-work/1-image-grain.json",
+        "source": "matrix-work/image",
+        "output": "matrix-work/1-image-grain.json",
         "steps": 128,
         "warmup": 8,
         "train_steps": 16,
@@ -580,8 +580,8 @@
       "config": {
         "engine": "dew",
         "workload": "text",
-        "source": "/home/ci/work/dew/dew/matrix-work/text",
-        "output": "/home/ci/work/dew/dew/matrix-work/2-text-dew.json",
+        "source": "matrix-work/text",
+        "output": "matrix-work/2-text-dew.json",
         "steps": 128,
         "warmup": 8,
         "train_steps": 16,
@@ -873,8 +873,8 @@
       "config": {
         "engine": "grain",
         "workload": "text",
-        "source": "/home/ci/work/dew/dew/matrix-work/text",
-        "output": "/home/ci/work/dew/dew/matrix-work/3-text-grain.json",
+        "source": "matrix-work/text",
+        "output": "matrix-work/3-text-grain.json",
         "steps": 128,
         "warmup": 8,
         "train_steps": 16,
@@ -1163,8 +1163,8 @@
       "config": {
         "engine": "grain_prepacked",
         "workload": "text",
-        "source": "/home/ci/work/dew/dew/matrix-work/text",
-        "output": "/home/ci/work/dew/dew/matrix-work/4-text-grain_prepacked.json",
+        "source": "matrix-work/text",
+        "output": "matrix-work/4-text-grain_prepacked.json",
         "steps": 128,
         "warmup": 8,
         "train_steps": 16,
@@ -1453,8 +1453,8 @@
       "config": {
         "engine": "dew",
         "workload": "image",
-        "source": "/home/ci/work/dew/dew/matrix-work/5-image-dew-cold.inputs",
-        "output": "/home/ci/work/dew/dew/matrix-work/5-image-dew-cold.json",
+        "source": "matrix-work/5-image-dew-cold.inputs",
+        "output": "matrix-work/5-image-dew-cold.json",
         "steps": 4,
         "warmup": 0,
         "train_steps": 0,
@@ -1520,8 +1520,8 @@
       "config": {
         "engine": "grain",
         "workload": "image",
-        "source": "/home/ci/work/dew/dew/matrix-work/6-image-grain-cold.inputs",
-        "output": "/home/ci/work/dew/dew/matrix-work/6-image-grain-cold.json",
+        "source": "matrix-work/6-image-grain-cold.inputs",
+        "output": "matrix-work/6-image-grain-cold.json",
         "steps": 4,
         "warmup": 0,
         "train_steps": 0,
@@ -1584,8 +1584,8 @@
       "config": {
         "engine": "dew",
         "workload": "text",
-        "source": "/home/ci/work/dew/dew/matrix-work/7-text-dew-cold.inputs",
-        "output": "/home/ci/work/dew/dew/matrix-work/7-text-dew-cold.json",
+        "source": "matrix-work/7-text-dew-cold.inputs",
+        "output": "matrix-work/7-text-dew-cold.json",
         "steps": 4,
         "warmup": 0,
         "train_steps": 0,
@@ -1651,8 +1651,8 @@
       "config": {
         "engine": "grain",
         "workload": "text",
-        "source": "/home/ci/work/dew/dew/matrix-work/8-text-grain-cold.inputs",
-        "output": "/home/ci/work/dew/dew/matrix-work/8-text-grain-cold.json",
+        "source": "matrix-work/8-text-grain-cold.inputs",
+        "output": "matrix-work/8-text-grain-cold.json",
         "steps": 4,
         "warmup": 0,
         "train_steps": 0,
@@ -1745,7 +1745,7 @@
     }
   ],
   "config": {
-    "output": "/armada/task/artifacts/matrix-cpu.json",
+    "output": "matrix-cpu.json",
     "work": "matrix-work",
     "seed": 17,
     "steps": 128,
