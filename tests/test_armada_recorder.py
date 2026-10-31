@@ -6,7 +6,7 @@ import json
 
 import pytest
 from armada_support import ON_SRC, PASSING, cached, interpreter, lifetime_task, loaded, reusable_now, written
-from tool_support import load
+from tool_support import REPO_ROOT, load
 
 
 @pytest.fixture
@@ -339,6 +339,28 @@ def test_each_files_record_is_its_own_where_files_share_a_process(ci, tmp_path, 
     names = ("tests/test_lazy.py", "tests/test_later.py")
     found = [ci.reused("3.12", name, "", common)["name"] for name in names]
     assert found == [f"3.12:{name}" for name in names]
+
+
+def test_a_release_runs_none_of_the_files_that_digest_dews_source_again(ci, tmp_path, monkeypatch,
+                                                                         cache_worker):
+    """`dew.cache.package_digest` names the records Dew's caches look for (the rung cache's, a verified
+    mapping's, a saved source's export) by every source file of the package, so a file that calls it runs
+    again for any edit to Dew, which a cache hit may have hidden from it, but not for a release's version
+    (`dew._version`), which no code computes from: train 396 reused 1 of 2,279 rows for its version bump."""
+    import shutil
+
+    package = tmp_path / "src" / "dew"
+    shutil.copytree(REPO_ROOT / "src" / "dew", package, ignore=shutil.ignore_patterns("__pycache__"))
+    (package / "_version.py").write_text('__version__ = "0.2.0"\n')
+    (package / "spare.py").write_text("def spare():\n    return 1\n")
+    reused = lifetime_task(ci, tmp_path, monkeypatch, cache_worker, {
+        "test_digested.py": ON_SRC + "from dew.cache import package_digest\n"
+                                     "def test_digested():\n    assert package_digest()\n"}, {})
+    assert reused() == [True]
+    (package / "_version.py").write_text('__version__ = "0.3.0"\n')
+    assert reused() == [True]
+    (package / "spare.py").write_text("def spare():\n    return 2\n")
+    assert reused() == [False]
 
 
 def test_a_files_children_hold_what_they_held_at_once_and_each_start_must_leave_its_record(tmp_path):

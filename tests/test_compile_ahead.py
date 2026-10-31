@@ -71,6 +71,29 @@ def test_compiling_ahead_plans_once_and_saves_the_selected_program(tmp_path, mon
     assert saved.plan == ahead.plan and saved.program == ahead.program
 
 
+def test_compiling_ahead_with_its_frontier_lists_each_rung_above_its_plan_that_fits(tmp_path, monkeypatch):
+    """With its frontier asked, a step compiled ahead reports, past the plan it takes and saves, each rung
+    that recomputes more at the fewest microbatches that fit there, every one compiled apart from the
+    plan's own search and fitting, none at more microbatches than the plan: the plans a run's speed is
+    chosen among on its GPUs (tools/benchmark_step.py times each), the run naming the one it takes (row
+    2115). The saved step is the plan's, which the run is left at."""
+    from dew.training.ahead import compile_ahead, compile_only_gpus
+
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "rungs"))
+    trainer = fine_tune(MeshSpec().build(compile_only_gpus("sm90", 1)))
+    with Compiles("step") as compiles:
+        ahead = compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1), capacity=2**30, frontier=True)
+    plan = record(ahead.plan, "plan")
+    probes = listed(plan["probes"], "probes", read=record, what="probes")
+    frontier = listed(plan["frontier"], "frontier", read=record, what="frontier")
+    assert compiles.count == len(probes) + len(frontier)
+    rungs = [json.dumps({name: entry[name] for name in ("remat", "head_tile", "head_fused")}, sort_keys=True)
+             for entry in (plan, *frontier)]
+    assert len(frontier) >= 2 and len(set(rungs)) == len(rungs)
+    assert all(entry["fits"] is True and entry["split"] <= plan["split"] for entry in frontier)
+    assert trainer.plan == ahead.plan and plan["remat"] == probes[-1]["remat"]
+
+
 def test_an_ahead_plan_that_fits_no_device_reports_every_refused_program(tmp_path, monkeypatch):
     """An absent GPU with less memory than even the arguments gets no executable to run. Its
     refusal keeps every candidate's compile evidence, so the offline gate can check refusals too. The
@@ -164,18 +187,9 @@ def test_a_compile_only_gpu_assembles_mosaic_gpus_architecture_specific_code(gen
     assembles. An sm120 stating no feature extension assembled for plain sm_120 and refused its own PTX
     ('.target sm_120a cannot be compiled for architecture sm_120')."""
     from fla_gdn_support import KernelCase
-    from jax.experimental.pallas import mosaic_gpu as plgpu
-    from kernel_compile import compile_mosaic_kernels
+    from kernel_compile import compile_mosaic_kernels, staged_copy
 
-    def body(source, out, staged, barrier):
-        plgpu.copy_gmem_to_smem(source, staged, barrier.at[0])
-        plgpu.barrier_wait(barrier.at[0])
-        plgpu.copy_smem_to_gmem(staged, out)
-        plgpu.wait_smem_to_gmem(0)
-
-    kernel = plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((64, 64), jnp.bfloat16), num_threads=1,
-                          thread_name="wg", scratch_types=[plgpu.SMEM((64, 64), jnp.bfloat16),
-                                                           plgpu.Barrier(num_barriers=1)])
+    kernel = staged_copy((64, 64), jnp.bfloat16)
     spec = jax.ShapeDtypeStruct((64, 64), jnp.bfloat16)
     record, = compile_mosaic_kernels([KernelCase("copy", lambda: (kernel, (spec,)), {})], generation)
     assert "error" not in record, record["error"]

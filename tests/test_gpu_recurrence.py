@@ -19,6 +19,9 @@ cases the CPU does not interpret, run in one process (`gpu_flow`), each cell its
   step and the step alone), its state held in fp32 and in bf16, on par with the portable step's; and the
   port on par with fla's own in fp32 and mixed dtypes (test_fla_gdn), fla run in the reference interpreter
   DEW_FLA_PYTHON names, which a GPU job provides to a file naming it.
+- The decode launches as a server runs them (test_linear_attention): the step kernel leaving an idle row's
+  state and output alone, bit for bit; the fused step's bits the same however its launches are timed; and
+  a layer choosing the fused step decoding over two GPUs, its rows or its heads split, as on one device.
 """
 
 import functools
@@ -26,6 +29,7 @@ import functools
 import gpu_flow
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 import selective_support
 import test_fla_gdn as fla_gdn
@@ -36,16 +40,20 @@ import test_recurrence_stability as stability
 import test_recurrence_template_stability as template_stability
 import test_selective_template as selective_template
 import test_short_conv as short_conv
-from gpu_flow import Cell, run_cells
-from reference_error import FEWEST_SEEDS, assert_as_exact, with_gradients
-from test_linear_attention import fused_case
+from delta_rule_support import fused_step
+from gpu_flow import Cell, run_cells, when
+from jax.sharding import NamedSharding, PartitionSpec
+from model_support import decode_through
+from reference_error import FEWEST_SEEDS, as_given, assert_as_exact, with_gradients
+from test_linear_attention import decode_operands, fused_case, fused_inputs
 
 from dew.batch import coordinates
 from dew.nn.inputs import AttentionMetadata, MixerCall
 from dew.nn.kda import KimiDeltaAttention
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates.recurrence import mainloop
-from dew.nn.linear import GatedDeltaNet
+from dew.nn.linear import GatedDeltaNet, decode_gated_delta_rule
+from dew.training import MeshSpec
 
 pytestmark = pytest.mark.gpu(reason="each recurrence route's native kernel: the Mosaic mainloop, the ports")
 
@@ -160,6 +168,70 @@ def decodes_on_its_kernel(kernel: str, held):
                     truth_fn=named(decoded(layer.clone(dtype=jnp.float64)), delta_decode="xla"))
 
 
+def the_decode_kernel_leaves_an_idle_row_alone():
+    """A serving step holds every slot, drawing or not: a row the step kernel (`decode_gated_delta_rule`)
+    marks idle, at Qwen3.5-0.8B's 16 heads 128 wide, keeps its state bit for bit, unread and unwritten, and
+    outputs zeros; the drawing rows step to the bits they take with every row active."""
+    query, key, value, g, beta, state = decode_operands(np.random.default_rng(1), 8, 16, 128)
+    held = np.asarray(state)
+    active = jnp.asarray([True, False, True, True, False, False, True, False])
+    every, every_state = jax.jit(decode_gated_delta_rule)(query, key, value, g, beta, state)
+    got, got_state = jax.jit(decode_gated_delta_rule)(query, key, value, g, beta, state, active)
+    drawing = np.asarray(active)
+    np.testing.assert_array_equal(np.asarray(got)[drawing], np.asarray(every)[drawing])
+    np.testing.assert_array_equal(np.asarray(got_state)[drawing], np.asarray(every_state)[drawing])
+    np.testing.assert_array_equal(np.asarray(got)[~drawing], 0)
+    np.testing.assert_array_equal(np.asarray(got_state)[~drawing], held[~drawing])
+
+
+def the_fused_decode_step_gives_the_same_bits_however_its_launches_are_timed():
+    """The fused decode step (`fused_step`) at Qwen3.5-0.8B's widths, a bf16 state, run 20 times, each run
+    beside a large matmul that holds most of the GPU or alone, gives the same output, history and state bits
+    every run: no value head reads a history or state another program is writing, whatever order they run
+    in."""
+    layer, variables, cache, token = fused_case(16, 128, 4, jnp.bfloat16, jnp.bfloat16)
+    operands = fused_inputs(layer, variables, cache, token)
+    load = jnp.ones((8192, 8192), jnp.bfloat16)
+    busy = jax.jit(lambda a: a @ a)
+    run = jax.jit(functools.partial(fused_step, epsilon=layer.norm_eps, activation=layer.gate_activation,
+                                    dtype=jnp.bfloat16))
+    first = jax.tree.map(np.asarray, run(*operands))
+    for repeat in range(20):
+        if repeat % 2:
+            busy(load)
+        for mine, theirs in zip(jax.tree.leaves(run(*operands)), jax.tree.leaves(first), strict=True):
+            np.testing.assert_array_equal(np.asarray(mine), theirs, err_msg=f"run {repeat}")
+
+
+def a_layer_choosing_the_fused_step_decodes_on_a_mesh_as_on_one_device(axis: str):
+    """A gated delta net choosing the fused step (`generation.chosen`) over two GPUs, its rows (`axis`
+    'data') or its heads ('tensor') split two ways (`_fused_token`: each shard's channels its heads'
+    queries, keys and values): 9 decode tokens after a 3-token prefill on par (check 1) with the same
+    layer's on one device, from the float64 parallel forward, over drawn hidden states and weights."""
+    module = GatedDeltaNet(emb_features=64, num_k_heads=2, num_v_heads=4, head_k_dim=32, head_v_dim=32,
+                           dtype=jnp.float32)
+    # The data axis takes the devices the others leave.
+    mesh = MeshSpec(**({} if axis == "data" else {axis: 2})).build(jax.devices()[:2])
+
+    def draw(seed):
+        hidden = jax.random.normal(jax.random.key(13 + 2 * seed), (2, 12, 64), jnp.float32)
+        return module.init(jax.random.key(14 + 2 * seed), hidden[:, :1]), hidden
+
+    def decoded(variables, hidden):
+        return decode_through(module, variables, hidden, prefill=3)[0]
+
+    split_run = jax.jit(named(decoded, delta_decode="fused"))
+
+    @as_given
+    def split(variables, hidden):
+        with jax.set_mesh(mesh):
+            return split_run(variables, jax.device_put(hidden, NamedSharding(mesh, PartitionSpec())))
+
+    assert_as_exact(split, named(decoded, delta_decode="fused"), draw,
+                    f"a layer choosing the fused step, decoding split over {axis}", seeds=FEWEST_SEEDS,
+                    truth_fn=module.clone(dtype=jnp.float64).apply)
+
+
 def test_the_recurrences_run_on_this_gpu():
     """Every recurrence cell above on this GPU (`gpu_flow.run_cells`), each one's failure kept and all raised
     together; every direct mainloop call keeps its own bound."""
@@ -224,6 +296,13 @@ def test_the_recurrences_run_on_this_gpu():
         *(Cell(f"a gated delta net decodes on its {kernel} kernel on par with the portable step, its state "
                f"held in {jnp.dtype(held).name}", functools.partial(decodes_on_its_kernel, kernel, held))
           for kernel in ("fused", "step") for held in (jnp.float32, jnp.bfloat16)),
+        Cell("the decode kernel leaves an idle row alone", the_decode_kernel_leaves_an_idle_row_alone),
+        Cell("the fused decode step gives the same bits however its launches are timed",
+             the_fused_decode_step_gives_the_same_bits_however_its_launches_are_timed),
+        *(Cell(f"a layer choosing the fused step decodes on a mesh as on one device: {axis}",
+               when(jax.device_count() >= 2, "needs two GPUs", functools.partial(
+                   a_layer_choosing_the_fused_step_decodes_on_a_mesh_as_on_one_device, axis)))
+          for axis in ("data", "tensor")),
         *(Cell(f"the port is as exact as fla's own: {'kda' if per_key else 'gdn'} {dtypes}",
                functools.partial(fla_gdn.the_port_is_as_exact_as_fla, per_key, dtypes))
           for per_key in (False, True) for dtypes in fla_gdn.FLA_DTYPES),
