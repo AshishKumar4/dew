@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 import jax
 import jax.numpy as jnp
@@ -112,9 +112,9 @@ class LogLinear(MaskingSchedule):
 class DiscreteProcess:
     """Masks tokens of a vocabulary whose mask token is `mask_id`."""
 
-    schedule: MaskingSchedule
+    schedule: MaskingSchedule = field(metadata={"derived": "preset"})
     mask_id: int
-    endpoint: float | None = None
+    endpoint: float | None = field(default=None, metadata={"derived": "source"})
     """The time a release's sampling grid runs to (Dream's releases' `eps`): `times` walks
     `linspace(T, endpoint, steps + 1)` with its last point taken to 0, where an `Unmask` step reveals
     every position still masked, as their last step does (`p_transfer = 1`); None is MDLM's grid to
