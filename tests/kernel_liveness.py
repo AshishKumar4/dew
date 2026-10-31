@@ -600,17 +600,7 @@ class _Pass:
         if name == "llvm.inline_asm":
             tied = _tied(op)
             if tied is not None and len(produced) == 1:
-                # An MMA accumulating in place keeps its tied inputs' registers. A word whose input holds none
-                # (a product into a fresh accumulator ties its outputs to zeros, `use_acc` false) is
-                # allocated at the product's issue: the sm90 dQ launch's two zero-started products, 128 words
-                # in flight, read as none.
-                held = [a for operand in tied for a in self.atoms.of.get(operand, [])]
-                words = len(self._lanes(produced[0].type))
-                held += [None] * (words - len(held))
-                if any(atom is None for atom in held):
-                    fresh = self.atoms.fresh(produced[0].type)
-                    held = [atom if atom is not None else fresh[k] for k, atom in enumerate(held)]
-                self.atoms.of[produced[0]] = held
+                self.atoms.of[produced[0]] = [a for operand in tied for a in self.atoms.of.get(operand, [])]
                 return True
             accumulated = self._accumulated(op)
             if accumulated is not None:
