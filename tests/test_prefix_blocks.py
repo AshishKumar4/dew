@@ -241,7 +241,7 @@ def test_a_saved_prefix_runs_bundle_serves_as_the_runs_own_task(tmp_path):
     from dew.training import Trainer
 
     decoder = blocky()
-    greedy = Sampling(temperature=0)
+    greedy = Sampling(temperature=0, eos_token_ids=(VOCAB - 1,), pad_token_id=VOCAB - 2)
     trained_in = Numerics(forms="accurate")
     objective = LMObjective(decoder, SEQ, prefix=PREFIX, samples=Samples([1, 2, 3], NEW, sampling=greedy))
     checkpoints = Checkpoints(str(tmp_path), keep=1)
@@ -267,8 +267,7 @@ def test_a_saved_prefix_runs_bundle_serves_as_the_runs_own_task(tmp_path):
     # A policy given in the run's place stops and pads where the run's does.
     given = bundle.text_generation(sampling=Sampling(temperature=0.5)).sampling
     assert given.temperature == 0.5
-    stated = task.sampling
-    assert (given.eos_token_ids, given.pad_token_id) == (stated.eos_token_ids, stated.pad_token_id)
+    assert (given.eos_token_ids, given.pad_token_id) == ((VOCAB - 1,), VOCAB - 2)
     bundle.save(tmp_path / "export")
     assert Pretrained.load(tmp_path / "export", dtype="float32").settings is None
 
