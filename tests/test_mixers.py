@@ -545,8 +545,9 @@ ONE_TAP_SEEDS = {"gated_delta_net": 8, "kimi_delta_attention": 8, "mamba": 8, "m
 def test_a_recurrent_mixer_whose_conv_takes_one_tap_decodes_as_its_whole_pass(kind):
     """A one-tap causal conv is a scale per channel with no history to hold: each recurrent mixer
     builds with one, and its decode (a 3-token prefill, then one token a step) is on par with its
-    whole pass from the float64 whole pass over drawn inputs (check 1)."""
-    from model_support import decode_through
+    passes, each step's at the width it reads (`as_stepped`), from the float64 whole pass over drawn
+    inputs (check 1)."""
+    from model_support import as_stepped, decode_through
 
     module = one_tap(kind)
     shape = (2, 9, module.emb_features)
@@ -559,5 +560,7 @@ def test_a_recurrent_mixer_whose_conv_takes_one_tap_decodes_as_its_whole_pass(ki
         return module.clone(dtype=jnp.float64).apply(widened(variables), hidden)
 
     assert_as_exact(lambda hidden: decode_through(module, variables, hidden, prefill=3)[0],
-                    lambda hidden: module.apply(variables, hidden), draw, f"{kind} decode",
+                    jax.jit(lambda hidden: as_stepped(lambda held: module.apply(variables, held), hidden,
+                                                      3)),
+                    draw, f"{kind} decode",
                     seeds=ONE_TAP_SEEDS[kind], truth_fn=truth)

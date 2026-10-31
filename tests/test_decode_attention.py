@@ -12,6 +12,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from attention_oracle import attention_terms, exact_attention, float64_weights
+from model_support import as_stepped
 from one_draw import assert_as_exact_as_the_reference
 from reference_error import FEWEST_SEEDS, assert_as_exact, assert_fp32_reduction_bound
 from whole_suite import timed
@@ -430,10 +431,10 @@ def test_a_windowed_layers_decode_step_reads_its_window_through_the_decode_kerne
 
 def test_a_windowed_decode_step_attends_as_its_whole_pass():
     """A windowed layer's decode, its keys from each row's first under a window of 5 over a 64-slot
-    cache at widths the decode kernel takes (heads 16 wide), gives what its whole pass gives at each
-    token, within tests/reference_error.py's rule of the whole pass against the float64 whole pass:
-    the starts the decode reads are the window's keys. On a GPU the same steps run the decode kernel
-    in every layer."""
+    cache at widths the decode kernel takes (heads 16 wide), gives what its whole passes give at each
+    token, each step's at the width it reads (`as_stepped`), within tests/reference_error.py's rule of
+    them against the float64 whole pass: the starts the decode reads are the window's keys. On a GPU
+    the same steps run the decode kernel in every layer."""
     from dew.nn.backbones.causal_transformer import CausalTransformer
 
     model = CausalTransformer(vocab_size=64, num_layers=2, emb_features=64, num_heads=4, num_kv_heads=2,
@@ -441,7 +442,7 @@ def test_a_windowed_decode_step_attends_as_its_whole_pass():
                               kinds={"sliding_attention": {"window": 5}}, attention_impl="xla")
     tokens = jax.random.randint(jax.random.key(3), (2, 12), 0, 64)
     variables = model.init(jax.random.key(0), tokens)
-    whole = model.apply(variables, tokens)
+    whole = as_stepped(jax.jit(lambda held: model.apply(variables, held)), tokens, 4)
     with jax.enable_x64(new_val=True):
         wide = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), variables)
         truth = np.asarray(model.clone(dtype=jnp.float64).apply(wide, tokens), np.float64)
