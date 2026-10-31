@@ -82,8 +82,9 @@ def decoder(**kwargs):
 def test_a_traced_program_counts_its_products_convolutions_scans_and_branches():
     """A traced count is two FLOPs a multiply-add of each product and convolution the program runs: a batched
     matrix product's, a strided convolution's of its output's elements by its kernel's taps and inputs, a
-    scan's body times its length, a branch's costliest arm, a gradient's backward products beside its
-    forward's; a while loop and a linear solve, whose run programs a trace does not tell, are refused."""
+    scan's body times its length, a branch's costliest arm, a platform choice's the branch an accelerator
+    runs, a gradient's backward products beside its forward's; a while loop and a linear solve, whose run
+    programs a trace does not tell, are refused."""
     def shaped(*shape):
         return jax.ShapeDtypeStruct(shape, jnp.float32)
 
@@ -105,6 +106,18 @@ def test_a_traced_program_counts_its_products_convolutions_scans_and_branches():
         return jax.lax.cond(x.sum() > 0, lambda: x @ w @ v, lambda: x @ w[:, :3])
 
     assert traced_flops(branched, shaped(4, 5), shaped(5, 6), shaped(6, 3)) == 2 * 4 * 5 * 6 + 2 * 4 * 6 * 3
+
+    def chosen(named):
+        def run(x, w):
+            return jax.lax.platform_dependent(x, w, cpu=lambda x, w: x @ w @ w,
+                                              default=lambda x, w: x @ w @ w @ w,
+                                              **({"cuda": lambda x, w: x @ w} if named else {}))
+        return run
+
+    # A platform choice is the branch an accelerator runs: the one that names it, else the default.
+    assert traced_flops(chosen(named=True), shaped(4, 5), shaped(5, 5)) == 2 * 4 * 5 * 5
+    assert traced_flops(chosen(named=False), shaped(4, 5), shaped(5, 5)) == 3 * 2 * 4 * 5 * 5
+
     gradient = jax.grad(lambda w, x: jnp.sum(jax.nn.relu(x @ w)))
     assert traced_flops(gradient, shaped(5, 7), shaped(3, 5)) == 2 * (2 * 3 * 5 * 7)
     with pytest.raises(MissingFlopsCount):
