@@ -97,9 +97,9 @@ def compiled(program: jcore.Jaxpr, lowering: str) -> jcore.Jaxpr:
             branch = params["branches"][kept]
             body, consts, reading = branch.jaxpr, branch.consts, operands[1:]
         if body is not None:
-            inner, results = inlined(compiled(body, lowering), reading, consts)
+            inner, returned = inlined(compiled(body, lowering), reading, consts)
             equations.extend(inner)
-            renamed.update(zip(equation.outvars, results, strict=True))
+            renamed.update(zip(equation.outvars, returned, strict=True))
             continue
         if not opaque(equation):
             params = {key: within(value, lowering) for key, value in params.items()}
