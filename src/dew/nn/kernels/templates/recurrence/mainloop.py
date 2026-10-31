@@ -1363,6 +1363,10 @@ def _states(k, w, u, hi, lo, beta, h0, sequences, taken, call: _Call, tiles: Til
                 before_store()
                 memories.store(h_ref, part, memory(n, i), call.block, column, bv, family=family,
                                smem=lands[f"memory{i}"], wait=False)
+            if call.gated_keys:
+                # The values as they are the write's operand and their own corrected values: none formed.
+                state = _keys_gated_write(call, slots, keys, values, loaded, state, issue, role, bv)
+                return state, accumulators
             tile = _tile(slots, "values", values, columns=pl.ds(role * bv, bv)).value()
             if delta:
                 def weights(i):
@@ -1371,15 +1375,11 @@ def _states(k, w, u, hi, lo, beta, h0, sequences, taken, call: _Call, tiles: Til
                 corrected = algebra.corrected(tile, weights, state, held.dtype, issue)
             else:
                 betas = family.rows_of(beta_ref.at[h, span]) if loaded is None else loaded[2]
-                written = tile if call.gated_keys else algebra.weighted("apply_u", None, tile, betas, issue)
+                written = algebra.weighted("apply_u", None, tile, betas, issue)
                 corrected = algebra.corrected(written, None, state, held.dtype, issue)
-            if stores_corrected:
-                before_store()
-                held.store(corrected_ref, corrected, n * CHUNK, CHUNK, h * value_width + column, bv,
-                           family=family, smem=lands["corrected"], wait=False)
-            if call.gated_keys:
-                state = _keys_gated_write(call, slots, keys, values, loaded, state, issue, role, bv)
-                return state, accumulators
+            before_store()
+            held.store(corrected_ref, corrected, n * CHUNK, CHUNK, h * value_width + column, bv,
+                       family=family, smem=lands["corrected"], wait=False)
             gated, decay = _gated_write(call, corrected, loaded, (hi_ref, lo_ref), last, h)
             # An fp32 call's last real token's write outside the product; a 16-bit call's is fla's product.
             separate = (_last_write(call, keys, k_ref, n * CHUNK, taken_ref[n] - 1, h // keyed * width,
