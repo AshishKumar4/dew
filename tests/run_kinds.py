@@ -295,8 +295,10 @@ def requested(task) -> object:
         return task([[4, 5, 6, 7]], max_new_tokens=2, key=0)
     if isinstance(task, Decide):
         question = {"team": Choice("which team", ["billing", "technical", "sales"])}
-        # A context beside the state where the backbone's cross-attention reads one (`context_length`).
-        context = None if task.context_length is None else {"plan": "enterprise"}
+        # A context beside the state where the backbone's cross-attention reads one (`context_length`),
+        # unless its layout reads the question there (`spans_in_context`), which reads no other.
+        reads = task.context_length is not None and not task.layout.spans_in_context
+        context = {"plan": "enterprise"} if reads else None
         # A state of plain text, which a row lays as written, its last word "down".
         return task([("the site is down", question)], contexts=[context])
     if isinstance(task, TextToImage):

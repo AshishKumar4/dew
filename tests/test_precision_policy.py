@@ -9,7 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from reference_error import assert_as_exact, assert_fp32_reduction_bound, equations
+from reference_error import assert_as_exact, assert_fp32_reduction_bound, dot_precisions
 
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -429,19 +429,6 @@ def test_quantizer_division_rounds_midpoint_neighbours_as_ieee_division():
     expected = (numerator.astype(np.float64) / denominator.astype(np.float64)).astype(np.float32)
     actual = np.asarray(jax.jit(correctly_rounded_divide)(numerator, denominator))
     np.testing.assert_array_equal(actual.view(np.uint32), expected.view(np.uint32))
-
-
-def dot_precisions(function, *arguments) -> list:
-    """The precision of every dot_general `function` traces over `arguments` under JAX's own default
-    precision (the test lane sets 'highest' for every product that states none), with the dtype its
-    operands promote to and their shapes, sub-jaxprs included, as a GPU runs them: a CPU's float64
-    sums (`dew.nn.precision.accumulated`) are tests/test_cpu_accumulation.py's."""
-    with jax.default_matmul_precision(None):
-        graph = jax.make_jaxpr(function)(*arguments)
-    return [(equation.params["precision"],
-             jnp.result_type(*(variable.aval.dtype for variable in equation.invars)),
-             tuple(variable.aval.shape for variable in equation.invars))
-            for equation in equations(graph, platform="cuda") if equation.primitive.name == "dot_general"]
 
 
 HIGHEST = (jax.lax.Precision.HIGHEST, jax.lax.Precision.HIGHEST)
