@@ -226,3 +226,75 @@ def test_each_replayed_step_draws_its_posterior_from_its_own_key():
 
     # The draws, not the straight-through values around them, which the two programs round apart.
     np.testing.assert_array_equal(np.argmax(stoch, -1), np.argmax(stepped(variables), -1))
+
+
+def demonstrations(count: int, length: int, seed: int) -> list[dict]:
+    """`count` target walks of `length` steps each, a scripted pilot steering toward 1, recorded in the
+    agent's convention: each row's observation, the reward that came with it, and the action taken at
+    it."""
+    rng = np.random.default_rng(seed)
+    episodes = []
+    for _ in range(count):
+        x, rows = rng.uniform(-1, 1), {"observation": [], "action": [], "reward": []}
+        reward = 0.0
+        for _ in range(length):
+            action = float(np.clip(2 * (1 - x), -1, 1))
+            rows["observation"].append([x])
+            rows["action"].append([action])
+            rows["reward"].append(reward)
+            x = x + 0.5 * action
+            reward = -(x - 1) ** 2
+        episodes.append({name: np.asarray(value, np.float32) for name, value in rows.items()})
+    return episodes
+
+
+def test_a_demonstration_replay_holds_each_episode_in_the_agents_convention():
+    """A replay of demonstrations holds every episode's rows in order, each row's action the one its
+    own observation was answered with, the episode's first and last steps flagged; its windows are
+    consecutive steps of the stream. A terminal step before an episode's last is refused."""
+    from dew.objectives.rl.dreamer import demonstration_replay
+
+    episodes = [{"observation": np.arange(n, dtype=np.float32)[:, None] + 10 * index,
+                 "action": -np.arange(n, dtype=np.float32)[:, None] - 10 * index,
+                 "reward": np.arange(n, dtype=np.float32)} for index, n in enumerate((5, 3, 4))]
+    replay = demonstration_replay(episodes)
+    data = jax.tree.map(lambda leaf: np.asarray(leaf)[:, 0], replay.data)
+    np.testing.assert_array_equal(data["observation"], np.concatenate([e["observation"] for e in episodes]))
+    np.testing.assert_array_equal(data["action"], -data["observation"])
+    np.testing.assert_array_equal(np.flatnonzero(data["first"]), [0, 5, 8])
+    np.testing.assert_array_equal(np.flatnonzero(data["last"]), [4, 7, 11])
+    windows = np.asarray(replay.sample(jax.random.key(0), 64, 4)["observation"])[..., 0]
+    starts = [np.flatnonzero(data["observation"][:, 0] == window[0])[0] for window in windows]
+    np.testing.assert_array_equal(windows, np.stack([data["observation"][s:s + 4, 0] for s in starts]))
+    with pytest.raises(ValueError):
+        demonstration_replay([{**episodes[0], "terminal": np.asarray([0, 1, 0, 0, 0], bool)}])
+
+
+def test_pretraining_from_demonstrations_learns_the_world_and_clones_the_pilot():
+    """A world model pretrained from a pilot's demonstrations alone, its actor cloning the pilot and its
+    critic untrained, predicts the demonstrations' observations and rewards better than at the start
+    and gives the pilot's actions more likelihood, on the same windows; imagination is skipped."""
+    from dew.data.dataset import Loader
+    from dew.objectives.base import Step
+    from dew.objectives.rl.dreamer import demonstration_replay
+    from dew.training import Trainer
+
+    replay = demonstration_replay(demonstrations(8, 20, 3))
+    objective = DreamerV3Objective(tiny(), scales={"policy": 0.0, "value": 0.0, "replay_value": 0.0},
+                                   imitation=1.0)
+    keys = iter(jax.random.split(jax.random.key(11), 1000))
+    data = Loader(train=lambda partition: (jax.device_get(replay.sample(next(keys), 8, 16))
+                                           for _ in itertools.count()), val=None, records=8, batch=8)
+    trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(7))
+    initial = jax.device_get(trainer.place()[0])
+    final = trainer.fit(data, steps=150, log_every=150)
+    windows = jax.device_get(replay.sample(jax.random.key(8), 8, 16))
+
+    def losses(state):
+        _, aux = objective.loss(state.variables, windows, Step(state.microstep, jax.random.key(9), state.ema))
+        return {name: float(value) for name, value in aux.metrics.items()}
+
+    before, after = losses(initial), losses(final)
+    assert "loss_policy" not in after
+    for name in ("loss_decoder", "loss_reward", "loss_imitation"):
+        assert after[name] < before[name], (name, before[name], after[name])

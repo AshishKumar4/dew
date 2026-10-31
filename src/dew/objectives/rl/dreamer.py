@@ -25,12 +25,13 @@ from __future__ import annotations
 
 import functools
 import math
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 from flax import linen as nn, struct
 
@@ -418,9 +419,20 @@ class DreamerV3Objective(Objective[Ratio]):
 
     def __init__(self, model: WorldModel, *, horizon: float = 333.0, imagination: int = 15,
                  lam: float = 0.95, entropy: float = 3e-4, free_nats: float = 1.0, slow_decay: float = 0.98,
-                 return_rate: float = 0.01, variables: Variables | None = None):
+                 return_rate: float = 0.01, variables: Variables | None = None,
+                 scales: Mapping[str, float] | None = None, imitation: float = 0.0):
+        """`scales` overrides the losses' weights by name (pretraining from demonstrations sets
+        `policy`, `value` and `replay_value` to 0, and imagination is then skipped); `imitation` weighs
+        behaviour cloning, the actor's negative log-likelihood of each replayed action at its posterior
+        state, which reaches the actor alone."""
         if imagination < 1 or not 0 <= lam <= 1 or horizon <= 1:
             raise ValueError("imagination must be positive, lam in [0, 1] and the horizon past one step")
+        unknown = set(scales or {}) - set(type(self).scales)
+        if unknown or imitation < 0:
+            raise ValueError(f"scales name the losses {sorted(type(self).scales)}, not {sorted(unknown)}, "
+                             "and imitation weighs at least 0")
+        imitating = {"imitation": imitation} if imitation else {}
+        self.scales = {**type(self).scales, **(scales or {}), **imitating}
         self.model = model
         self.horizon, self.imagination, self.lam = horizon, imagination, lam
         self.entropy, self.free_nats, self.return_rate = entropy, free_nats, return_rate
@@ -535,6 +547,14 @@ class DreamerV3Objective(Objective[Ratio]):
         alive = (1 - terminal) * (1 - 1 / self.horizon)
         logit = model.continue_(feature)
         losses["continue"] = -(alive * jax.nn.log_sigmoid(logit) + (1 - alive) * jax.nn.log_sigmoid(-logit))
+        if "imitation" in self.scales:
+            # Each replayed action at the state it was taken at; a last step's action takes no effect.
+            mean, std = model.policy(jax.lax.stop_gradient(feature))
+            losses["imitation"] = (1 - last) * -normal_log_prob(action, mean, std)
+        if not any(self.scales[name] for name in ("policy", "value", "replay_value")):
+            total = sum(self.scales[name] * jnp.mean(value) for name, value in losses.items())
+            metrics = {f"loss_{name}": jnp.mean(value) for name, value in losses.items()}
+            return Ratio(total, jnp.ones(())), Aux(metrics, variables={"returns": variables["returns"]})
 
         # Imagination from every replayed posterior state, its inputs held still (agent.py:189-196).
         env = LatentEnv(self.model, jax.lax.stop_gradient(variables), self.bins)
@@ -688,6 +708,29 @@ class DreamerRollout:
         self._ended = (float(total), int(count))
 
 
+def demonstration_replay(episodes: Sequence[Mapping[str, np.ndarray]]) -> ReplayBuffer:
+    """Demonstrations as a replay to pretrain from, one stream of every episode in order, in the
+    convention the agent records its own steps (`Driven`): an episode's row t holds the observation t,
+    the reward that came with it (none at its first), and the action taken at it, after it was seen
+    (FlyDreamer's recorder stored each action one row later, with the observation it produced, and so
+    shifted every action-conditioned prediction). An episode is `observation`, `action` and `reward`
+    along its steps, and `terminal` where it ended in a terminal state (only its last step can)."""
+    rows = []
+    for episode in episodes:
+        length = len(episode["reward"])
+        terminal = np.asarray(episode.get("terminal", np.zeros(length, bool)), bool)
+        if terminal[:-1].any() or any(len(episode[name]) != length for name in ("observation", "action")):
+            raise ValueError("an episode's fields hold one row a step, and only its last step is terminal")
+        steps = np.arange(length)
+        rows.append({"observation": np.asarray(episode["observation"]),
+                     "action": np.asarray(episode["action"]),
+                     "reward": np.asarray(episode["reward"], np.float32), "first": steps == 0,
+                     "last": steps == length - 1, "terminal": terminal})
+    stream = jax.tree.map(lambda *parts: np.concatenate(parts)[:, None], *rows)
+    example = jax.tree.map(lambda leaf: leaf[0], stream)
+    return ReplayBuffer.empty(example, len(stream["reward"])).add(stream)
+
+
 def episodes_return(objective: DreamerV3Objective, env: Env, variables: Variables, key: jax.Array,
                     steps: int) -> float:
     """The mean return of `env`'s environments over `steps` steps of the agent from fresh episodes,
@@ -704,5 +747,6 @@ def episodes_return(objective: DreamerV3Objective, env: Env, variables: Variable
     return float(run(variables, key))
 
 
-__all__ = ["Critic", "DreamerRollout", "DreamerV3Objective", "LatentEnv", "WorldModel", "episodes_return",
-           "lambda_return", "normal_entropy", "normal_log_prob"]
+__all__ = ["ConvDecoder", "ConvEncoder", "Critic", "DreamerRollout", "DreamerV3Objective", "LatentEnv",
+           "WorldModel", "demonstration_replay", "episodes_return", "lambda_return", "normal_entropy",
+           "normal_log_prob"]
