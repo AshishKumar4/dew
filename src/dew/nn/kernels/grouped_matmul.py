@@ -591,7 +591,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
             words = -(-config.block_k * config.block_m // config.warpgroups * jnp.dtype(dtype).itemsize
                       // 4 // resources.THREADS)
             staged = max(0, words - family.held_registers)
-        phases = [staged, self._prologue_registers(ba, config), self._epilogue_registers(ba, config)]
+        phases = [staged, self._prologue_registers(ba, config), self._epilogue_registers(ba, config, stored)]
         # A paired product's second accumulator, carried beside the first (`mosaic_gpu.gmm`'s `paired`).
         plain += accumulator if ba.arguments.get('paired') is not None else 0
         if ba.arguments.get('exact_sums'):
@@ -617,15 +617,23 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         return -(-share * ((1 + tiles) * 4 + stored) // (4 * resources.THREADS))
 
     @staticmethod
-    def _epilogue_registers(ba, config: mosaic_gpu.Tiles) -> int:
-        """The epilogue's side values beyond the mainloop's held set: its side vectors, each side tile of
-        the accumulator's shape in fp32 (a residual's: +94 at a 96-word accumulator, HOOKS1) and each output
-        but the last held in its stored dtype while the next is computed (a second output: +45..57 at 128
+    def _epilogue_registers(ba, config: mosaic_gpu.Tiles, stored: tuple) -> int:
+        """The epilogue's values beyond the mainloop's held set: a family that stages its stores through
+        shared memory holds one staged chunk of the output converted (`mosaic.output_staging`) and the
+        store's control (`resources.CONTROL_REGISTERS`); then its side vectors, each side tile of the
+        accumulator's shape in fp32 (a residual's: +94 at a 96-word accumulator, HOOKS1) and each output but
+        the last held in its stored dtype while the next is computed (a second output: +45..57 at 128
         words)."""
         hooks = ba.arguments['hooks']
-        if hooks.epilogue is None:
-            return 0
         family = mosaic_gpu.family_of(config, ba.arguments['tokens'].dtype)
+        share = config.block_m // config.warpgroups
+        staging = 0
+        if not family.stores_through_registers:
+            chunk, _ = mosaic.output_staging(config.block_n, stored)
+            widest = max(jnp.dtype(dtype).itemsize for dtype in stored)
+            staging = -(-share * chunk * widest // (4 * resources.THREADS)) + resources.CONTROL_REGISTERS
+        if hooks.epilogue is None:
+            return max(0, staging - family.held_registers)
         # Column vectors beside the accumulator, in its column layout (`Family.column_registers`), and a
         # paired product's combination of its two accumulators, which holds a row of its results, one fp32
         # column vector's worth (its SwiGLU spilled 32 bytes at 128 x 192 at 232, PAIRED-9, and fit 224 at
@@ -639,7 +647,8 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         tiles = sum(len(axes) > 1 for axes in hooks.epilogue_axes) * accumulator
         held = sum(-(-accumulator * jnp.dtype(dtype).itemsize // 4)
                    for dtype in (hooks.out_dtypes or ())[:-1])
-        return max(0, vectors + resources.CONTROL_REGISTERS - family.held_registers) + tiles + held
+        stage = max(staging, resources.CONTROL_REGISTERS) + vectors
+        return max(0, stage - family.held_registers) + tiles + held
 
     def register_budget(self, config: mosaic_gpu.Tiles) -> int:
         # Its family's budget a consumer, whatever the operands' dtype (`mosaic.Family.registers`).

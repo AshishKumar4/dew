@@ -66,38 +66,45 @@ HOOK_FORMS = {"bfloat16": (jnp.bfloat16, False), "float16": (jnp.float16, False)
 FED = {"dkv_family": "wgmma.fed", "dkv_consumers": 2}
 """The dK/dV launch on an H100's layout whose consumers feed their rings, its two consumers splitting each
 slot's queries (`attention_mosaic_scores.split_queries`), as the derivation takes it."""
-BACKWARD_FORMS = ("default", "fused", "fused-keys-first", "fused-shared-keys", "fused-shared-dq", "accurate")
+BACKWARD_FORMS = ("default", "fused", "fused-keys-first", "fused-shared-keys", "fused-shared-dq",
+                  "fused-producer-dq", "accurate")
 """The backward's forms (`_backward_form`): the fast in two launches and in one each way, and the
 accurate."""
 HOOKED_FORMS = ("default", "accurate")
 """The forms a hooked or dropping call takes: its fast form's one launch is a hookless call's alone."""
 
 
-FORM_WIDTHS = {"fused-keys-first": 64, "fused-shared-keys": 128, "fused-shared-dq": 128}
+FORM_WIDTHS = {"fused-keys-first": 64, "fused-shared-keys": 128, "fused-shared-dq": 128,
+               "fused-producer-dq": 128}
 """The head width a backward form takes where the checks' own (128, a call form's 64) is not one it holds:
 the keys-first one launch holds width 64 alone (its dK, dV and dQ tiles past a consumer's registers at
 128), the shared keys' consumers 128 and wider (each its share of the columns whole swizzled rows)."""
 
 
-def _backward_form(form: str) -> tuple[bool, attention_mosaic.BackwardTiles]:
+def _backward_form(form: str) -> tuple[bool, attention_mosaic.BackwardTiles | None]:
     """The backward form `form` names, `(accurate, config)`: two launches, the dQ launch one consumer's
     beside a producer and the keys-first dK/dV launch two consumers sharing a key block (`FED`), the
-    accurate form's sums in two column halves where it is `accurate-halves` (a width split's,
-    `BackwardTiles.columns`); or the fast form's one launch (`fused`), queries first on the dQ launch's
-    layout, or keys first on `FED`'s (`fused-keys-first`), each consumer 64 of a slot's 128 queries, or
-    queries first over keys its two consumers share on `FED`'s layout (`fused-shared-keys`), or keys first on
-    the dQ launch's layout, each of its two consumers its own keys, their score cotangents exchanged for a
-    shared dQ (`fused-shared-dq`, FlashAttention 3's width 128)."""
+    accurate form's at its derivation's tiles (None) or its sums in two column halves where it is
+    `accurate-halves` (a width split's, `BackwardTiles.columns`); or the fast form's one launch (`fused`),
+    queries first on the dQ launch's layout, or keys first on `FED`'s (`fused-keys-first`), each consumer
+    64 of a slot's 128 queries, or queries first over keys its two consumers share on `FED`'s layout
+    (`fused-shared-keys`), or keys first on the dQ launch's layout, each of its two consumers its own keys,
+    their score cotangents exchanged for a shared dQ (`fused-shared-dq`, FlashAttention 3's width 128), its
+    producer adding it (`fused-producer-dq`)."""
     if form == "fused":
         return False, attention_mosaic.BackwardTiles(64, 64, 2, 1, fused=True)
     if form == "fused-shared-keys":
         return False, attention_mosaic.BackwardTiles(64, 64, 2, 2, fused=True, family=FED["dkv_family"],
                                                      shared_keys=True)
-    if form == "fused-shared-dq":
+    if form in ("fused-shared-dq", "fused-producer-dq"):
         return False, attention_mosaic.BackwardTiles(64, 64, 2, 1, fused=True, dkv_family="wgmma",
-                                                     dkv_consumers=2, shared_dq=True)
+                                                     dkv_consumers=2, shared_dq=True, staged_logits=True,
+                                                     producer_dq=form == "fused-producer-dq")
     if form == "fused-keys-first":
         return False, attention_mosaic.BackwardTiles(128, 64, 2, 1, fused=True, **FED)
+    if form == "accurate":
+        # Its derivation's: two launches, its dK/dV programs' column shares its dQ's two sums' choice.
+        return True, None
     columns = 2 if form == "accurate-halves" else 1
     return form != "default", attention_mosaic.BackwardTiles(64, 64, 2, 1, columns=columns, **FED)
 
@@ -193,6 +200,22 @@ def _dropping(shape) -> template.Hooks:
         jnp.arange(shape[2], dtype=jnp.int32), DROP_RATE))
 
 
+def _takes_backward(spans: template.KeySpans, query, key, hooks: template.Hooks | None, *, accurate: bool,
+                    declined: bool) -> bool:
+    """Whether the Mosaic backward takes a call of `query`'s and `key`'s shapes and dtype under `hooks` on the
+    target in effect, checked against `declined`, the call one it declines for its registers
+    (`MosaicBackward.declined`'s resources, the route's next implementation's): the accurate form under a
+    query's temperature, whose dQ spills at every tile (ET-PINBWD: 232 bytes at 64 x 64, width 64, its keyed
+    sums beside the hook's three slopes and its mask)."""
+    query, key = (jnp.zeros(array.shape, array.dtype) for array in (query, key))
+    residuals = _residuals(query.shape)
+    op, args = attention_mosaic._backward_call(query, key, key, spans, hooks, query, residuals, scale=None,
+                                               natural=attention_mosaic.NATURAL, accurate=accurate)
+    reason = op.declined(op.bind(*args, interpret=False), generation.gpu_target())
+    assert (reason is not None) == declined and (reason is None or reason.code == "resources"), reason
+    return reason is None
+
+
 def _check_spans(label: str, spans: template.KeySpans, shape, *, interpret: bool, backward: bool = False,
                  form: str = "default", score: tuple = (), gate: bool = False, dtype=jnp.bfloat16,
                  natural: bool = False, seeds: int | None = None, width: int = 64,
@@ -220,6 +243,12 @@ def _check_spans(label: str, spans: template.KeySpans, shape, *, interpret: bool
                               output.output_mod, output.output_params)
 
     accurate, config = _backward_form(form)
+    if backward:
+        query, key = (jax.ShapeDtypeStruct((rows, queries, count, width), dtype) for count in shape[2:])
+        with _device(interpret):
+            if not _takes_backward(spans, query, key, hooked(*draw_hooks(0)), accurate=accurate,
+                                   declined=accurate and "temperature" in score):
+                return
 
     def ours(query, key, value, dout, params, initial):
         hooks = hooked(params, initial)
@@ -631,6 +660,10 @@ def test_padding_rows_reach_no_hook_gradient_interpreted(queries, form):
 
     params = (jnp.ones((1, 1, queries), jnp.float32), jnp.zeros((1,), jnp.float32))
     hooks = hooked(*params)
+    with _device(interpret=True):
+        # Its hook divides by a query's parameter, a temperature (`_takes_backward`).
+        if not _takes_backward(spans, query, key, hooks, accurate=accurate, declined=accurate):
+            return
     with _device(interpret=True), _pinned(backward=config):
         residuals = attention_mosaic.forward(query, key, value, spans, hooks, residuals=template.Kept.SPLIT,
                                              interpret=True)[1:]
@@ -1266,8 +1299,12 @@ def test_the_backward_under_every_score_hook_lowers_for_an_h100(hooks, accurate)
 
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
     with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
-        jax.jit(backward_of).trace(q, kv, kv, q, residuals, params, initial).lower(
-            lowering_platforms=("cuda",))
+        hooked = template.Hooks(score_mod, tuple(template.Param(value, kind)
+                                                 for value, kind in zip(params, kinds, strict=True)), initial)
+        if _takes_backward(spans, q, kv, hooked, accurate=accurate,
+                           declined=accurate and "temperature" in SCORE_HOOKS[hooks]):
+            jax.jit(backward_of).trace(q, kv, kv, q, residuals, params, initial).lower(
+                lowering_platforms=("cuda",))
 
 
 @ON_HOPPER

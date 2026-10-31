@@ -145,7 +145,7 @@ def _dkv_step(walk: _Backward, resident: tuple, rows_of, coords_of, params_of, s
     # Every tile masked, its queries' statistics read past its products: a tile chosen masked or whole at
     # run time joins both choices' tiles and its column statistics, 16 registers each, past a consumer's
     # (spilled 1184 bytes at 64 x 64, one consumer).
-    coords = coords_of(q_first, shape=shape)
+    coords = coords_of(q_first, shape=shape, read=walk.places_read(masked=True))
     if rows_of is None:
         # Streamed with the queries (`STATISTICS`), each read from its stage where it is used.
         def stage_of(name):
