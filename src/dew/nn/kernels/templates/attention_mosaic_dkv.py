@@ -87,13 +87,15 @@ def _dkv_allocations(family: mosaic.Family, config: BackwardTiles, width: int, v
     if config.shared_dq:
         # Its queries' statistics streamed beside them, read from their stage where a step uses each
         # (FlashAttention 3's LSE and dPsum): held a step in registers they took 80 of a consumer's.
-        blocks.update(dict.fromkeys(STATISTICS, ((block_q,), jnp.float32)))
+        blocks.update({name: ((block_q,), kept) for name, kept in STATISTICS.items()})
     swizzles = None if swizzle is None else dict.fromkeys(blocks, swizzle)
     return scoped, family.streams(blocks, stages, consumers, swizzles=swizzles)
 
-STATISTICS = ("peak", "total", "anchor", "delta", "chosen")
-"""The per-query statistics a dK/dV step reads (`_scores`' `peak`, `total`, `anchor`, `delta` and `chosen`),
-in the order of their arrays: a shared dQ's launch streams each beside its queries."""
+STATISTICS = MappingProxyType({"peak": jnp.float32, "total": jnp.float32, "anchor": jnp.float32,
+                               "delta": jnp.float32, "chosen": jnp.int32})
+"""The per-query statistics a dK/dV step reads (`_scores`' `peak`, `total`, `anchor`, `delta` and `chosen`, the
+anchor key's index), in the order of their arrays, and their dtypes: a shared dQ's launch streams each beside
+its queries."""
 
 
 def _holders(family: mosaic.Family, consumers: int) -> int:
