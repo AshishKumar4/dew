@@ -24,6 +24,7 @@ import optax
 import pytest
 from certified import assert_certified
 from flax import linen as nn
+from model_support import moved
 from one_draw import assert_as_exact_as_the_reference
 from recording import RecordingTracker
 from reference_error import (
@@ -52,7 +53,8 @@ from dew.training import Trainer
 from tools.parity_flow_grpo import RECORDED, dew_transition, transition_inputs
 
 SEEDS = {'guided walk': 8, 'converted': 8, 'rescored walk': 16, 'clipping': 32, 'kl': 8, 'rollout': 64,
-         'inpainting': 32, 'live policy': 64, 'mixed precision': 32, 'prompt evaluation': 16}
+         'inpainting': 32, 'inpainting update': 512, 'live policy': 64, 'mixed precision': 32,
+         'prompt evaluation': 16}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada)."""
 ROWS = 64
 """A drawn batch's rows: enough that a few seeds resolve a site."""
@@ -476,10 +478,7 @@ def test_flow_rollout_groups_rewards_selects_steps_and_preserves_likelihoods():
     initial = FlowGRPOObjective(model, process, inputs, guidance=guidance, steps=7).init(jax.random.key(20))
     # The DiT starts with its output zeroed, which no condition moves; noise in
     # every weight lets a guided transition part from an unguided one.
-    leaves, tree = jax.tree.flatten(initial["params"])
-    noise = jax.random.split(jax.random.key(22), len(leaves))
-    params = jax.tree.unflatten(tree, [leaf + 0.1 * jax.random.normal(key, leaf.shape, leaf.dtype)
-                                       for leaf, key in zip(leaves, noise, strict=True)])
+    params = moved(initial["params"], jax.random.key(22), 0.1)
     objective = FlowGRPOObjective(model, process, inputs, guidance=guidance, steps=7,
                                   variables={**initial, "params": params})
 
@@ -601,11 +600,41 @@ class Pooled(AutoEncoder):
         return 1
 
 
+def inpainting_loss(gain, batch, dtype):
+    """Flow-GRPO's clipped loss over a rollout's recorded transitions at the `Inpainting` policy of `gain`,
+    in closed form, in jnp at `dtype`: each transition's log density the authors' Gaussian at the velocity
+    of its masked-image inputs (`sde_density`'s, noise 0.7), its likelihood ratio to the recorded one per
+    latent value, PPO's clip at the objective's 1e-4 on advantages clipped to 5, averaged over the
+    selected transitions."""
+    gain = jnp.asarray(gain, dtype)
+    spatial = {name: jnp.asarray(value, dtype) for name, value in batch["spatial"].items()}
+    held = 0.3 * spatial["masked_image"] * (1 - spatial["mask"])
+    latents, following = (jnp.asarray(batch[name], dtype) for name in ("latents", "next_latents"))
+    sigma, after = (jnp.asarray(batch[name], dtype)[:, :, None, None, None]
+                    for name in ("timesteps", "next_timesteps"))
+    velocity = gain * latents + held[:, None] + 0.1 * sigma
+    g_squared = 0.7**2 * sigma / (1 - jnp.where(sigma == 1, after, sigma))
+    drift = velocity + g_squared / (2 * sigma) * (latents + (1 - sigma) * velocity)
+    mean, variance = latents + drift * (after - sigma), g_squared * (sigma - after)
+    density = -0.5 * (jnp.square(following - mean) / variance + jnp.log(2 * math.pi * variance))
+    current = density.sum((2, 3, 4))
+    values = math.prod(latents.shape[2:])
+    ratio = jnp.exp((current - jnp.asarray(batch["old_log_probs"], dtype)) / values)
+    advantage = jnp.clip(jnp.asarray(batch["advantages"], dtype), -5, 5)
+    advantage = advantage[:, None] if advantage.ndim == 1 else advantage
+    surrogate = jnp.maximum(-advantage * ratio, -advantage * jnp.clip(ratio, 1 - 1e-4, 1 + 1e-4))
+    kept = jnp.asarray(batch["transition_mask"], dtype)
+    return jnp.sum(kept * surrogate) / jnp.sum(kept)
+
+
 def test_an_inpainting_rollout_rescores_with_its_masked_image_inputs():
     """Flow-GRPO samples an inpainting model with the masked image and mask its inputs give,
     records them with each transition and rescores the transitions with them: the recorded
     likelihoods and their rescoring are on par with the authors' Gaussian at the model's velocity of
-    those inputs over rollouts (check 1), and a policy step through them has a gradient."""
+    those inputs over rollouts (check 1), and another mask rescores them otherwise. The first policy
+    update through them, its loss and its gradient in the policy, is on par with the closed form's
+    (`inpainting_loss`) from its float64 evaluation over rollouts (check 1), and a trained step moves
+    the policy (ledger 667)."""
     process = Process(FlowMatchingScheduler(), FlowMatchPredictionTransform())
     inputs = InputSpec(Field("image", (4, 4, 3)), mask=Field("mask", (4, 4, 1)))
     objective = FlowGRPOObjective(Inpainting(), process, inputs, autoencoder=Pooled(), guidance=None, steps=4)
@@ -631,10 +660,51 @@ def test_an_inpainting_rollout_rescores_with_its_masked_image_inputs():
                                 0.7, dtype)
 
     assert_rescores_as_walked(objective, variables, rolled, inpainted, "inpainting", SEEDS['inpainting'])
+    # The mask reaches the scoring: the batch's transitions under the other half masked score otherwise.
+    rescore = jax.jit(objective.log_probs)
+    flipped = {**batch, "spatial": {**batch["spatial"], "mask": 1 - batch["spatial"]["mask"]}}
+    other, own = np.asarray(rescore(variables, flipped)), np.asarray(rescore(variables, batch))
+    assert np.all(np.isfinite(other)) and np.all(np.isfinite(own))
+    assert np.all(other != own)
+
     step = Step(jnp.asarray(0), jax.random.key(43), None)
-    gradients = jax.grad(lambda p: objective.scalar_loss({**variables, "params": p}, batch, step)[0])(
-        variables["params"])
-    assert np.isfinite(float(optax.tree.norm(gradients)))
+    gain = objective.model_variables(variables)["params"]["gain"]
+
+    def updated(batch, one):
+        """Dew's first update: the loss at the rollout's own policy, and its gradient in the gain."""
+        def loss(params):
+            return objective.scalar_loss({**variables, "params": params}, batch, step)[0]
+        value, gradient = with_gradients(loss)(variables["params"], one)
+        return {"loss": value, "gradient": objective.model_variables({"params": gradient})["params"]["gain"]}
+
+    def closed(batch, one, dtype):
+        value, gradient = with_gradients(lambda gain: inpainting_loss(gain, batch, dtype))(
+            jnp.asarray(gain, dtype), jnp.asarray(one, dtype))
+        return {"loss": value, "gradient": gradient}
+
+    @as_given
+    def truth(batch, one):
+        with jax.enable_x64(new_val=True):
+            return closed(batch, one, jnp.float64)
+
+    assert_as_exact(updated, lambda batch, one: closed(batch, one, jnp.float32),
+                    lambda seed: (rolled(seed), np.float32(1)), "inpainting update",
+                    seeds=SEEDS['inpainting update'], truth_fn=truth)
+
+    # A trained step, the rollout its own, moves the policy: a row of the images a device.
+    from dew.data.dataset import Loader
+
+    trainer = Trainer(objective, optax.sgd(1e-1), key=jax.random.key(44), rollout=rollout)
+    initial = trainer.place()[0]
+    rows = np.arange(jax.device_count()) % len(pixels)
+    source = {"image": pixels[rows], "mask": mask[rows]}
+    data = Loader(train=lambda partition: itertools.repeat(source), val=None, records=len(rows),
+                  batch=len(rows))
+    final = trainer.fit(data, steps=1, log_every=1)
+    assert int(final.updates) == 1
+    moved = (objective.model_variables(final.variables)["params"]["gain"]
+             - objective.model_variables(initial.variables)["params"]["gain"])
+    assert np.isfinite(float(moved)) and float(moved) != 0
 
 
 def test_transition_matches_released_sampler_and_torch_distribution():
@@ -915,10 +985,7 @@ def test_conditioned_prompt_only_evaluation_preview_and_trainer_consumers():
     untrained = FlowGRPOObjective(model, process, inputs, guidance=CFG(1.5), beta=0.1, steps=3).init(
         jax.random.key(100))
     # Noise in every weight, the zeroed output head's too, so the evaluation reads its prompts.
-    leaves, tree = jax.tree.flatten(untrained["params"])
-    noise = jax.random.split(jax.random.key(103), len(leaves))
-    params = jax.tree.unflatten(tree, [leaf + 0.1 * jax.random.normal(key, leaf.shape, leaf.dtype)
-                                       for leaf, key in zip(leaves, noise, strict=True)])
+    params = moved(untrained["params"], jax.random.key(103), 0.1)
     objective = FlowGRPOObjective(model, process, inputs, guidance=CFG(1.5), beta=0.1, steps=3,
                                   variables={**untrained, "params": params})
     rollout = FlowRollout(objective, lambda images, batch: images.mean((1, 2, 3)), groups=2, steps=3)

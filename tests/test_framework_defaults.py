@@ -43,6 +43,7 @@ def test_a_users_persistent_cache_thresholds_stay_theirs(tmp_path, monkeypatch):
 
     sizes = jax.config.jax_persistent_cache_min_entry_size_bytes
     seconds = jax.config.jax_persistent_cache_min_compile_time_secs
+    directory = jax.config.jax_compilation_cache_dir
     try:
         monkeypatch.setenv("JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES", "4096")
         monkeypatch.setenv("JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS", "2.5")
@@ -59,6 +60,10 @@ def test_a_users_persistent_cache_thresholds_stay_theirs(tmp_path, monkeypatch):
     finally:
         jax.config.update("jax_persistent_cache_min_entry_size_bytes", sizes)
         jax.config.update("jax_persistent_cache_min_compile_time_secs", seconds)
+        # The suite's cache again, which the directories named here would otherwise leave this process
+        # compiling into.
+        if directory:
+            enable_compilation_cache(directory)
 
 
 def test_a_users_tokenizer_parallelism_stays_theirs(monkeypatch):
