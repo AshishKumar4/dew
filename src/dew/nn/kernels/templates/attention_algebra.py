@@ -844,6 +844,14 @@ def seen(spec: Forward, coords: Coords, like: jax.Array) -> jax.Array | None:
     return visible
 
 
+def reads_query_places(spec: Forward, *, masked: bool, positional: bool, dropped: bool) -> bool:
+    """Whether a tile's step reads its queries' places (`Coords.q_pos`): its score hook where it reads them
+    (`positional`), its dropout's draw (`dropped`, `drawn`), and where `masked`, a causal call's diagonal and
+    a call's padded queries (`seen`; a spans call's intervals read none)."""
+    return positional or dropped or (masked and spec.form != "spans"
+                                     and (spec.form == "causal" or spec.queries is not None))
+
+
 def _safe(spec: Forward, m: jax.Array) -> jax.Array:
     """`m`, with 0 for a query that has seen nothing where one can (`Forward.guarded`)."""
     return jnp.where(m == -jnp.inf, 0.0, m) if spec.guarded else m

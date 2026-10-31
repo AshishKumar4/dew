@@ -317,6 +317,24 @@ TILE_SIDES = (32, 64, 128, 192, 256)
 them."""
 
 
+def score_reads_queries(hooks: Hooks) -> bool:
+    """Whether the score hook reads its queries' places (its `q_pos`): traced, never run, on a tile."""
+    if not callable(hooks.score_mod):
+        return False
+    params = tuple((param.kind, kept_dtype(param.value.dtype)) for param in hooks.score_params)
+    return _reads_queries(hooks.score_mod, params)
+
+
+@functools.lru_cache(maxsize=256)
+def _reads_queries(score_mod, params: tuple) -> bool:
+    """`score_reads_queries` of `score_mod` under parameters of `params`' kinds and dtypes."""
+    side = TILE_SIDES[0]
+    jaxpr = _score_jaxprs(score_mod, params, (side, side), differentiated=False)[0]
+    places = jaxpr.invars[1]
+    return any(var is places for var in jaxpr.outvars) or any(
+        var is places for eqn in jaxpr.eqns for var in eqn.invars)
+
+
 def transposable(hooks: Hooks) -> bool:
     """Whether the score hook and its pullback run on a tile held keys first (`[bk, bq]`, the dK/dV
     program's) as written for the reference's `[bq, bk]` (`layout.transposed`): traced, never run, at every
@@ -657,14 +675,15 @@ def _streamed(reaches: list) -> tuple[jax.Array, jax.Array]:
 
 
 def _coords(family: mosaic.Family, spans: _Spans | None, row, first, k_first, shape: tuple[int, int],
-            q_pos=None, columns=None, *, keys_first: bool = False,
+            q_pos=None, columns=None, *, keys_first: bool = False, queries_read: bool = False,
             draw: Draw | None = None) -> algebra.Coords:
     """A tile's coordinates (`algebra.Coords`): its queries' and keys' places from `first` and `k_first`, the
     tile's entries in the accumulator's layout (`q_pos` the query places and `columns` the tile's key
     offsets, where the caller holds them; a hook reads them so, `_param`), and a spans call's queries'
     intervals and, with documents, both blocks' ids, and a dropping call's `draw`. A tile whose rows are its
     keys (`keys_first`, `shape` `[bk, bq]`) holds its queries' vectors in a column's layout and its keys' in
-    a row's."""
+    a row's; queries first, its queries' places a row's vector broadcast where the step reads them
+    (`queries_read`, `algebra.reads_query_places`), a tile otherwise."""
     query_axis, key_axis = (1, 0) if keys_first else (0, 1)
 
     def places(start, axis: int) -> jax.Array:
@@ -675,9 +694,13 @@ def _coords(family: mosaic.Family, spans: _Spans | None, row, first, k_first, sh
         # forward spilling 344 bytes, D128's training 64 x 64 72); a row's needs no remainder.
         return lax.broadcast_in_dim(start + family.iota((shape[axis],), 0, columns=axis == 1), shape, (axis,))
 
-    # The queries' places a tile (keys first, a query's column vector beside the tile finds no layout in
-    # Mosaic GPU's inference); the keys' a vector broadcast, a row's keys first and a column's queries first.
-    q_pos = first + family.iota(shape, query_axis) if q_pos is None else q_pos
+    # The queries' places a row's vector broadcast where the step reads them; a tile otherwise (Mosaic GPU
+    # keeps an unread vector's iota without its layout, which its inference cannot place, row 2977) and keys
+    # first (a query's column vector beside the tile finds no layout). The keys' a vector broadcast, a row's
+    # keys first and a column's queries first.
+    if q_pos is None:
+        q_pos = (places(first, query_axis) if queries_read and not keys_first
+                 else first + family.iota(shape, query_axis))
     k_pos = places(k_first, key_axis) if columns is None or keys_first else k_first + columns
     if spans is None:
         return algebra.Coords(q_pos, k_pos, drop=draw, keys_first=keys_first)

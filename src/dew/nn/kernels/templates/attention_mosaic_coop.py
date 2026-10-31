@@ -64,8 +64,9 @@ def _coop_step(walk: _Backward, share: int, resident: tuple, exchanged, rows_of,
     q_slot, do_slot = slots["queries"], slots["douts"]
     q_first = index * tiles.block_q
     own = pl.ds(share * keys, keys)
+    coords = coords_of(q_first, queries_read=walk.queries_read(masked))
     narrowed, part = _tile_scores(walk, (q_slot, do_slot), (k_smem.at[own], v_smem.at[own]), rows_of(q_first),
-                                  coords_of(q_first), whole(index), (tiles.block_q, keys), masked=masked)
+                                  coords, whole(index), (tiles.block_q, keys), masked=masked)
     weights_ref, cotangents_ref = exchanged.at[0], exchanged.at[1]
     exchange.claim()
     family.staged(narrowed, weights_ref.at[:, own])
