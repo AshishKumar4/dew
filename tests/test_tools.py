@@ -938,14 +938,14 @@ def test_the_quantized_serving_benchmark_samples_through_the_task_and_reads_its_
                          InputSpec(Field("image", (2, 2, 1))), {"params": {"scale": jnp.ones(())}}, steps=1,
                          guidance=None, solver=Euler())
     # The model's program's options reach the timed executable: an option `compiled_with` adds is one of
-    # them, and a bare jit dumps nothing (row 3062).
+    # them, and a bare jit of the step dumps nothing (row 3062); the prompts' own programs dump apart.
     dumps = tmp_path / "dumps"
     from dew.nn.kernels import options
 
     with options.compiled_with({"xla_dump_to": str(dumps)}):
         row = tool.forward(scaled)
     assert row["forward_ms"] > 0 and row["weights_mib"] >= 0
-    assert any(dumps.glob("*.txt"))
+    assert any(dumps.glob("*jit_step*.txt"))
 
 
 # ---------------------------------------------------------------------------
