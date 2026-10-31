@@ -1,7 +1,9 @@
 # Changelog
 
 Dew's releases, newest first. The version is `dew.__version__`, and a
-release's tag is that version with a `v` in front (`v0.1.0`).
+release's tag is that version with a `v` in front (`v0.1.0`). A release's
+notes are frozen once it is cut: its section's sha256 is recorded in
+tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
