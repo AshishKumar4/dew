@@ -145,7 +145,7 @@ def drawn_paths(racing: Racing, track, rng: np.random.Generator):
     aside = np.where(kind == 6, rng.uniform(0, reach - 0.02, count), rng.uniform(reach + 0.02, 1.0, count))
     aside *= rng.choice([-1, 1], count)
     reached = rng.uniform(half + 0.02, outer + 0.5, count)
-    swept = np.linspace(rng.uniform(0.0, inner - 0.02, count), reached, 4, -1)
+    swept = np.linspace(rng.uniform(0.0, inner - 0.02, count), reached, 4, axis=-1)
     along = np.where(sideways[:, None, None], left[:, None], np.asarray([0.0, 0.0, 1.0]))
     way = rng.choice([-1, 1], (count, 1, 1))
     alongside = (center + aside[:, None] * normal)[:, None] + swept[..., None] * along * way
