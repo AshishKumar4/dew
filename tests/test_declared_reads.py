@@ -375,6 +375,29 @@ def test_a_version_only_array_record_shard_is_refused_where_its_reader_needs_its
             list(manifest.reader(manifest.shards[0]))
 
 
+def test_an_indexed_reader_lets_go_of_idle_held_copies_where_the_mirror_needs_room(tmp_path):
+    """Indexed reads of files declared by their digest on a store no read can be held to a version of,
+    each read from its checked copy in Dew's mirror, need room for one copy at a time beside the indexes:
+    the copies a reader holds and no read uses let go where the next needs room."""
+    local = tmp_path / "local"
+    local.mkdir()
+    for index in range(3):
+        path = local / f"part-{index}.jsonl"
+        path.write_bytes(b"".join(json.dumps({"id": 2 * index + row}).encode() + b"\n" for row in range(2)))
+        Files(str(path)).provision()
+    objects = {f"/{path.name}": path.read_bytes() for path in local.iterdir()}
+    with etagged_server(objects) as url:
+        data = sorted(name for name in objects if name.endswith(".jsonl"))
+        facts = {url + name: {"bytes": len(objects[name]),
+                              "sha256": hashlib.sha256(objects[name]).hexdigest()} for name in data}
+        indexes = sum(len(payload) for name, payload in objects.items() if not name.endswith(".jsonl"))
+        options = {"dewcache": {"cache_storage": str(tmp_path / "mirror"),
+                                "max_bytes": indexes + max(len(objects[name]) for name in data)}}
+        records = Files(tuple(url + name for name in data), format="jsonl", file_info=facts,
+                        storage_options=options).records("indexed")
+        assert [records[position]["id"] for position in range(len(records))] == list(range(6))
+
+
 def test_declared_files_held_for_ranged_reads_keep_their_mirror_copy_while_held(tmp_path):
     """Files declared by their digest on a store no read can be held to a version of (an HTTP server
     whose ETags the declaration does not state), held for reads of ranges of them as an offset index
