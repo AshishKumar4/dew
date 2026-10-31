@@ -1496,7 +1496,8 @@ class Trainer(Generic[Loss, Effects]):
                     state, loss, aux, finite, accepted, committed = train_step(
                         state, device, sampled=self.inspection is not None and self.inspection.samples(
                             run.current + 1))
-                # Written off the loop, which never waits on it (row 2313).
+                # Written off the loop, which never waits on it (row 2313), its clock the step it sees done.
+                interval.seen()
                 self._read_taken(run, wait=False)
                 if self._unproven:
                     # A step's failure on the devices surfaces at the next program that reads its
@@ -1820,7 +1821,8 @@ class Trainer(Generic[Loss, Effects]):
             with region("evaluate"), run.held():
                 # A checkpoint that ranks the steps reads every suite's score.
                 names = None if ranked else due
-                run.evaluation = self._evaluation(plan, state, shardings, run.training, names)
+                run.evaluation = self._evaluation(plan, state, shardings, run.training, names,
+                                                  examples=self._consumed(interval))
                 run.scored = frozenset(plan.suites if names is None else names)
                 run.other += run.evaluation.elapsed_seconds
         scores = (
@@ -1943,7 +1945,8 @@ class Trainer(Generic[Loss, Effects]):
         else:
             suites = {f"cooldown_{name}": suite for name, suite in plan.suites.items()}
             self._evaluation(dataclasses.replace(plan, suites=suites, summaries=()),
-                             dataclasses.replace(cooled, step=step_at), shardings, {})
+                             dataclasses.replace(cooled, step=step_at), shardings, {},
+                             examples=self._consumed(interval, counted))
         if checkpoints is not None and not cut:
             checkpoints.cooling(None)
         for leaf in (leaf for leaf in jax.tree.leaves(apart(cooled)[0]) if not leaf.is_deleted()):
@@ -2077,7 +2080,8 @@ class Trainer(Generic[Loss, Effects]):
             missing = [name for name in plan.suites if name not in scored]
             if not plan.suites or missing:
                 run.evaluation = self._evaluation(plan, state, shardings, run.training, missing,
-                                                  joined=None if joined is None else joined.scores)
+                                                  joined=None if joined is None else joined.scores,
+                                                  examples=self._consumed(interval))
                 run.other += run.evaluation.elapsed_seconds
             assert run.evaluation is not None
             scores = run.evaluation.scores
@@ -2119,9 +2123,16 @@ class Trainer(Generic[Loss, Effects]):
             for split, suite in plan.suites.items():
                 admit_split(self.objective, suite.data, self.device_mesh, split)
 
+    def _consumed(self, *intervals: Interval) -> int | None:
+        """The examples a run on the examples clock had consumed, as its host counted them over `intervals`
+        (`Interval.consumed`: the run's, and a cooldown branch's beyond it), the count its log records;
+        None for a run counted in steps."""
+        return None if self._examples is None else sum(interval.consumed for interval in intervals)
+
     def _evaluation(self, plan: FitPlan, state: TrainState, shardings: Placement[TrainState],
                     training: Mapping[str, jax.Array], names: Sequence[str] | None = None, *,
-                    warm: bool = False, joined: Mapping[str, float] | None = None) -> Evaluation:
+                    warm: bool = False, joined: Mapping[str, float] | None = None,
+                    examples: int | None = None) -> Evaluation:
         """Score the suites in `names`, every suite when None, as one evaluation, joined to the scores
         the step's earlier evaluation of the others recorded (`joined`, `_wind_down`).
 
@@ -2133,7 +2144,7 @@ class Trainer(Generic[Loss, Effects]):
         chosen = list(plan.suites if names is None else names)
         if not chosen:
             return self._evaluate(state, shardings, None, (), plan.preview, split="val", training=reports,
-                                  warm=warm)
+                                  warm=warm, examples=examples)
         evaluations = []
         for split in chosen:
             suite = plan.suites[split]
@@ -2144,7 +2155,7 @@ class Trainer(Generic[Loss, Effects]):
                     and not any(metric.name == 'loss' for metric in suite.metrics))
             evaluations.append(self._evaluate(state, shardings, suite.data, suite.metrics, plan.preview,
                                               loss=loss, split=split, training=reports, warm=warm,
-                                              scored_to=plan.scored_to))
+                                              scored_to=plan.scored_to, examples=examples))
         scores = {**(joined or {}),
                   **{name: value for report in evaluations for name, value in report.scores.items()}}
         # Each summary is formed once a step, here, by the evaluation that completes the splits it weighs.
@@ -2415,6 +2426,7 @@ class Trainer(Generic[Loss, Effects]):
         training: Mapping[str, jax.Array] | None = None,
         warm: bool = False,
         scored_to: str | None = None,
+        examples: int | None = None,
     ) -> Evaluation:
         """Score the validation split with this state's variables and report
         it, returning the seconds it took: the run's, but not its steps',
@@ -2448,6 +2460,10 @@ class Trainer(Generic[Loss, Effects]):
                 averaged=averaged, preview=preview, mesh=mesh, loss=loss, split=split, training=training,
                 warm=warm, updates=state.updates,
                 scored_to=None if scored_to is None else os.path.join(scored_to, f"step-{int(state.step)}"))
+        # On the examples clock an evaluation is placed by the examples the run had consumed, as its host
+        # counted them, its record their coordinate beside its step.
+        if examples is not None:
+            evaluation = dataclasses.replace(evaluation, examples=examples)
         if not warm:
             # The training values ride along for ranking (`_ranking`); the log interval reports
             # them, so the evaluation's own report leaves them out.
