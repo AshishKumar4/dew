@@ -474,7 +474,7 @@ def test_a_dropping_call_under_x64_on_fp32_inputs_keeps_fp32_gradients():
 
 
 def a_dropping_route_call_on_a_gpu_runs_finite():
-    """On a GPU, a direct route call that drops runs, finite, on a mainloop that draws it (the frozen Triton
+    """On a GPU, a direct route call that drops runs, finite, on a mainloop that draws it (the Pallas-Triton
     mainloop's legality rule refuses it, `attention_triton.refused`, ledger row 1521)."""
     from dew.nn.kernels.templates import attention_route
 
@@ -485,7 +485,7 @@ def a_dropping_route_call_on_a_gpu_runs_finite():
 
 
 def test_the_gpu_mainloops_refuse_the_draws_they_do_not_take_at_every_entry():
-    """The frozen Triton mainloop takes no probability dropout, and Mosaic's none drawn at a sequence
+    """The Pallas-Triton mainloop takes no probability dropout, and Mosaic's none drawn at a sequence
     exchange's global places (`template.DropPlaces`, a table gather a tile): each entry point, the forward
     and the backward called directly, refuses such a call before any launch rather than run it undropped,
     and so does each legality rule (ledger rows 1521 and 1303)."""

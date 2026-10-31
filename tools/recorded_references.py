@@ -427,3 +427,16 @@ def _runs(seeds: np.ndarray) -> str:
     ordered = np.unique(seeds)
     breaks = np.flatnonzero(np.diff(ordered) != 1) + 1
     return ", ".join(f"{run[0]}-{run[-1]}" for run in np.split(ordered, breaks))
+
+
+def held_to_the_oracle(exact_run, arrays, truth: dict, roundings: int, label: str) -> None:
+    """Dew's float64 path `exact_run` on a seed's `arrays` held to the oracle's `truth`, leaf by leaf, within
+    float64's rounding of `roundings` operations (`assert_computes_the_oracle`): a recorder's cross-check
+    that its truth and the test's own float64 path compute the same function."""
+    from reference_error import assert_computes_the_oracle, widened
+
+    with jax.enable_x64(new_val=True):
+        twin = jax.tree.map(np.asarray, exact_run(widened(arrays)))
+    for name in truth:
+        assert_computes_the_oracle(twin[name], truth[name], f"{label} float64 {name}", roundings=roundings)
+

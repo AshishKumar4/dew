@@ -47,8 +47,8 @@ config, 128-key tiles among them, with the real dot. (Interpreted, XLA:CPU's fp3
 
 @pytest.fixture(autouse=True)
 def _interpreted_as_an_a100():
-    """An interpreted call in a CPU process states the GPU it emulates (`generation.assumed`): the frozen
-    Triton mainloop's tiles and their costs are an A100's, its target's facts, where a CPU has none."""
+    """An interpreted call in a CPU process states the GPU it emulates (`generation.assumed`): the
+    Pallas-Triton mainloop's tiles and their costs are an A100's, its target's facts, where a CPU has none."""
     if jax.default_backend() != "cpu":
         yield
         return
@@ -62,9 +62,10 @@ def geometry(case: dict) -> tuple[int, int]:
 
 
 PINNED = (attention_triton.Tiles(32, 32, 4, 2), attention_triton.Tiles(64, 32, 4, 2),
-          attention_triton.Tiles(32, 64, 8, 3), attention_triton.Tiles(128, 128, 8, 2))
-"""The configs each case runs at on the CPU, where interpreting all of `SPACE` would take hours; a GPU
-runs every config (`every_config_on_a_gpu`, a cell of tests/test_gpu_attention.py)."""
+          attention_triton.Tiles(128, 64, 4, 2))
+"""The configs each case runs at on the CPU, where interpreting every tile the derivation steps through
+(`FORWARD_STEPS`) would take hours; a GPU runs each (`every_config_on_a_gpu`, a cell of
+tests/test_gpu_attention.py)."""
 
 
 def drawing(queries: int, keys: int, dtype, width: int = 32, value_width: int = 32):
@@ -183,7 +184,7 @@ def test_the_plain_forward_is_on_par_over_runs(form, config):
 
 
 def test_the_frozen_mainloop_refuses_runs():
-    """The frozen Triton mainloop walks one key interval a query: called on a call's runs, its forward and
+    """The Pallas-Triton mainloop walks one key interval a query: called on a call's runs, its forward and
     backward refuse them before any launch rather than compute them as one interval (ledger 956)."""
     queries, keys = core_geometry(RUN_CASES["runs"])
     spans = template.spans(queries, keys, ROWS, **arguments(RUN_CASES["runs"]))
@@ -198,7 +199,7 @@ def test_the_frozen_mainloop_refuses_runs():
 @pytest.mark.parametrize("config", PINNED[:2], ids=str)
 def test_one_run_a_query_is_the_interval_the_frozen_mainloop_walks(config):
     """One run a query (`test_attention_template.ONE_RUN`, a chunked or banded local-attention layer's runs)
-    is one key interval, which the frozen Triton mainloop walks forward and backward (ledger 1991)."""
+    is one key interval, which the Pallas-Triton mainloop walks forward and backward (ledger 1991)."""
     check(ONE_RUN, HOOKS["none"], jnp.float32, config)
     check_backward(ONE_RUN, (), jnp.float32, config)
 
@@ -219,8 +220,8 @@ def test_the_forward_is_on_par_at_head_widths_padded_to_powers_of_two(width, val
 
 
 def every_config_on_a_gpu(config, case):
-    """Every config of the space, bf16, every hook: over causal documents under a window, and over the
-    irregular full and causal calls (`IRREGULAR`)."""
+    """Every tile the forward's derivation steps through (`FORWARD_STEPS`), bf16, every hook: over causal
+    documents under a window, and over the irregular full and causal calls (`IRREGULAR`)."""
     check({**CASES, **IRREGULAR}[case], HOOKS["all"], jnp.bfloat16, config, residuals=True)
 
 
@@ -664,11 +665,11 @@ def test_the_backward_walks_many_key_tiles(case):
 
 
 def every_backward_config_on_a_gpu(config, case):
-    """Every config of the backward's space, bf16, a softcap, sinks and ALiBi, over causal documents
-    under a window and over the irregular full and causal calls (`IRREGULAR`): each config the launch takes
-    at the call (`TritonBackward.fitting`: its threads within their registers, its programs within a block's
-    shared memory) on par with the reference, and each other refused where it is pinned
-    (`tuning.Unpinnable`), so no call runs it."""
+    """Every tile the backward's derivation steps through (`BACKWARD_STEPS`), bf16, a softcap, sinks and
+    ALiBi, over causal documents under a window and over the irregular full and causal calls (`IRREGULAR`):
+    each the launch holds at the call (`TritonBackward.legal`: its threads within their registers, its
+    programs within a block's shared memory) on par with the reference, and each other refused where it is
+    pinned (`tuning.Unpinnable`), so no call runs it."""
     import tokamax
 
     from dew.nn.kernels import generation
@@ -680,7 +681,7 @@ def every_backward_config_on_a_gpu(config, case):
               "key": jax.ShapeDtypeStruct((ROWS, keys, 2, 32), jnp.bfloat16),
               "value": jax.ShapeDtypeStruct((ROWS, keys, 2, 32), jnp.bfloat16)}
     op = attention_triton.TritonBackward()
-    takes = config in op.fitting(tokamax.BoundArguments(op, arrays), generation.gpu_target())
+    takes = op.legal(tokamax.BoundArguments(op, arrays), config, generation.gpu_target())
     tiles = attention_triton.Tiles
 
     def run():
@@ -826,3 +827,20 @@ def test_an_fp32_training_step_at_its_own_configs_compiles_within_an_a100s_block
 
     found = compile_kernels([KernelCase("step", lambda: (step, (query, key, key, query)))], "sm80")
     assert not failures(found), "\n".join(failures(found))
+
+
+def test_a_training_forward_derives_the_largest_tile_its_threads_hold():
+    """The forward's derivation on an A100 at 128-wide heads: a plain walk takes the measured 128 by 64; a
+    training walk, whose anchor value row holds 128 more registers a thread, steps down to 64 by 64 (160
+    a thread), where the fixed space it replaced fell to its next fitting entry, 32 by 32, at two to three
+    times the time."""
+    import tokamax
+
+    from dew.nn.kernels import generation
+
+    arrays = {name: jax.ShapeDtypeStruct((1, 1024, heads, 128), jnp.bfloat16)
+              for name, heads in (("query", 4), ("key", 2), ("value", 2))}
+    op, target = attention_triton.TritonForward(), generation.TARGETS["sm80"]
+    plain = op.derived(tokamax.BoundArguments(op, arrays), target)
+    training = op.derived(tokamax.BoundArguments(op, {**arrays, "residuals": True}), target)
+    assert (plain, training) == (attention_triton.Tiles(128, 64, 4, 2), attention_triton.Tiles(64, 64, 4, 2))

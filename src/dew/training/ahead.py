@@ -69,7 +69,10 @@ def target_config(generation: str, capacity: int | None = None) -> str:
     """The `gpu_device_info` XLA compiles for, from the CUDA `generation`'s target
     (`generation.TARGETS`): its compute capability, the shared memory a block may opt into, its
     multiprocessors, clock and bandwidth; CUDA's per-capability limits for the rest. The fields past
-    the capability and shared memory only steer XLA's own fusions, never a Triton kernel's code."""
+    the capability and shared memory only steer XLA's own fusions, never a Triton kernel's code. From
+    Hopper on, its capability states the architecture-specific features (sm_90a, sm_100a, sm_120a), which
+    Mosaic GPU's PTX targets: left unspecified, an sm120's assembled for plain sm_120 and refused its own
+    PTX ('.target sm_120a cannot be compiled for architecture sm_120')."""
     target, version = gpu_target(generation), capability(generation)
     shared, multiprocessors = target.shared_limit, target.multiprocessors
     clock, bandwidth = target.clock_hz, target.memory_bandwidth
@@ -94,6 +97,7 @@ def target_config(generation: str, capacity: int | None = None) -> str:
   cuda_compute_capability {{
     major: {major}
     minor: {minor}
+    feature_extension: {"ACCELERATED_FEATURES" if major >= 9 else "NONE"}
   }}
   registers_per_core_limit: 65536
   registers_per_block_limit: 65536
