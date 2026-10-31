@@ -42,6 +42,7 @@ import dataclasses
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import struct
 
 ARM = 0.17 * 0.5 ** 0.5
@@ -190,11 +191,12 @@ def rotation(orientation: jax.Array) -> jax.Array:
 
 def _mixer(quadrotor: Quadrotor) -> jax.Array:
     """The nominal map `[4, 4]` from (collective thrust, roll, pitch and yaw torques) to each rotor's
-    thrust: the inverse of the rotors' thrusts' sums, moments and drag torques."""
+    thrust: the inverse of the rotors' thrusts' sums, moments and drag torques, the nominal drone's, a
+    constant of the program (inverted once as it traces, not by the device each step)."""
     kappa = quadrotor.drag_coefficient / quadrotor.thrust_coefficient
-    rows = jnp.asarray([[1.0] * 4, [y for _, y in POSITIONS], [-x for x, _ in POSITIONS],
-                        [spin * kappa for spin in SPINS]])
-    return jnp.linalg.inv(rows)
+    rows = np.asarray([[1.0] * 4, [y for _, y in POSITIONS], [-x for x, _ in POSITIONS],
+                       [spin * kappa for spin in SPINS]])
+    return jnp.asarray(np.linalg.inv(rows), jnp.float32)
 
 
 def hovering(quadrotor: Quadrotor, body: Body, position: jax.Array, orientation: jax.Array) -> Flight:

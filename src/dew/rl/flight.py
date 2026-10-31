@@ -631,7 +631,7 @@ def nearest(race: Race) -> jax.Array:
     axis = jnp.concatenate([pillars[:, :2], height[:, None]], -1)
     active = pillars[:, 2] > 0
     reach = jnp.where(active, jnp.linalg.norm(axis - flight.position, axis=-1), jnp.inf)
-    order = jnp.argsort(reach)[:NEAREST]
+    order = jax.lax.top_k(-reach, NEAREST)[1]
     offset = (rotation(flight.orientation).T @ (axis[order] - flight.position).T).T
     shown = jnp.concatenate([offset, pillars[order, 2:3]], -1)
     return jnp.where(active[order][:, None], shown, 0.0).reshape(-1)
