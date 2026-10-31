@@ -397,9 +397,11 @@ def world(out: Path, *, teacher_weights: Path, assets: Path, drones: int = 16, h
                                      scales={"policy": 0.0, "value": 0.0, "replay_value": 0.0,
                                              **{name: 1.0 for name, _, _ in AUXILIARY}})
     drawn = itertools.count()
-    sample = jax.jit(lambda draw: replay.sample(jax.random.fold_in(jax.random.key(5), draw), 16, length))
-    windows = Loader(train=lambda partition: (jax.device_get(sample(next(drawn))) for _ in itertools.count()),
-                     val=None, records=16, batch=16)
+    # The replay an argument, not a constant the program would hold a copy of (16 GB).
+    sample = jax.jit(lambda replay, draw: replay.sample(jax.random.fold_in(jax.random.key(5), draw), 16,
+                                                        length))
+    windows = Loader(train=lambda partition: (jax.device_get(sample(replay, next(drawn)))
+                                              for _ in itertools.count()), val=None, records=16, batch=16)
     began = time.perf_counter()
     if progress["phase"] == "pretrain":
         pretrained_variables, progress = _pretrained(out, pretraining, windows, pretrain_updates, saved_every,
