@@ -37,7 +37,7 @@ from flax import linen as nn, struct
 
 from dew.batch import Batch, Variables, merge, under
 from dew.objectives.base import Aux, EMASpec, Objective, Ratio, Shown, Step
-from dew.objectives.rl.tssm import TSSM, Cache
+from dew.objectives.rl.tssm import TSSM, Cache, parameters_of
 from dew.rl.distributions import (
     categorical_kl,
     onehot_sample,
@@ -74,11 +74,14 @@ class _Layers(nn.Module):
 
     units: int
     count: int
+    dtype: jnp.dtype = jnp.float32
 
     @nn.compact
     def __call__(self, x: jax.Array) -> jax.Array:
+        held = parameters_of(self.dtype)
         for _ in range(self.count):
-            x = nn.silu(nn.RMSNorm(epsilon=1e-4)(nn.Dense(self.units, kernel_init=_init())(x)))
+            x = nn.Dense(self.units, kernel_init=_init(), dtype=self.dtype, param_dtype=held)(x)
+            x = nn.silu(nn.RMSNorm(epsilon=1e-4, dtype=self.dtype, param_dtype=held)(x))
         return x
 
 
@@ -93,8 +96,10 @@ class _BlockLinear(nn.Module):
     def __call__(self, x: jax.Array) -> jax.Array:
         grouped = x.reshape(*x.shape[:-1], self.blocks, x.shape[-1] // self.blocks)
         fan = grouped.shape[-1]
-        kernel = self.param("kernel", _init(), (self.blocks, fan, self.features // self.blocks), self.dtype)
-        bias = self.param("bias", nn.initializers.zeros, (self.features,), self.dtype)
+        held = parameters_of(self.dtype)
+        kernel = self.param("kernel", _init(), (self.blocks, fan, self.features // self.blocks), held)
+        bias = self.param("bias", nn.initializers.zeros, (self.features,), held)
+        grouped, kernel, bias = (value.astype(self.dtype) for value in (grouped, kernel, bias))
         return jnp.einsum("...gi,gio->...go", grouped, kernel).reshape(*x.shape[:-1], self.features) + bias
 
 
@@ -115,10 +120,11 @@ class ConvEncoder(nn.Module):
         x = image.reshape(-1, *image.shape[-3:]).astype(self.dtype) / 255 - 0.5
         for stage, mult in enumerate(self.mults):
             x = nn.Conv(self.depth * mult, (self.kernel, self.kernel), padding="SAME", kernel_init=_init(),
-                        dtype=self.dtype, param_dtype=self.dtype, name=f"cnn{stage}")(x)
+                        dtype=self.dtype, param_dtype=parameters_of(self.dtype), name=f"cnn{stage}")(x)
             rows, height, width, channels = x.shape
             x = x.reshape(rows, height // 2, 2, width // 2, 2, channels).max((2, 4))
-            norm = nn.RMSNorm(epsilon=1e-4, dtype=self.dtype, param_dtype=self.dtype, name=f"cnn{stage}norm")
+            norm = nn.RMSNorm(epsilon=1e-4, dtype=self.dtype, param_dtype=parameters_of(self.dtype),
+                              name=f"cnn{stage}norm")
             x = nn.silu(norm(x))
         return x.reshape(*lead, -1)
 
@@ -146,10 +152,12 @@ class ConvDecoder(nn.Module):
         height, width = (side // 2 ** len(depths) for side in self.image[:2])
         shape = (height, width, depths[-1])
         size = math.prod(shape)
-        dense = functools.partial(nn.Dense, kernel_init=_init(), dtype=self.dtype, param_dtype=self.dtype)
+        dense = functools.partial(nn.Dense, kernel_init=_init(), dtype=self.dtype,
+                                  param_dtype=parameters_of(self.dtype))
         conv = functools.partial(nn.Conv, kernel_size=(self.kernel, self.kernel), padding="SAME",
-                                 dtype=self.dtype, param_dtype=self.dtype)
-        norm = functools.partial(nn.RMSNorm, epsilon=1e-4, dtype=self.dtype, param_dtype=self.dtype)
+                                 dtype=self.dtype, param_dtype=parameters_of(self.dtype))
+        norm = functools.partial(nn.RMSNorm, epsilon=1e-4, dtype=self.dtype,
+                                 param_dtype=parameters_of(self.dtype))
         x0 = _BlockLinear(size, self.blocks, self.dtype, name="sp0")(deter.reshape(-1, deter.shape[-1]))
         # Each block's outputs its own channels of every position: '(g h w c) -> h w (g c)'.
         x0 = x0.reshape(-1, self.blocks, height, width, depths[-1] // self.blocks)
@@ -191,32 +199,42 @@ class WorldModel(nn.Module):
     unimix: float = 0.01
     min_std: float = 0.1
     max_std: float = 1.0
+    dtype: jnp.dtype = jnp.float32
+    """The networks' computation dtype, bfloat16 for speed (DreamerV3's COMPUTE_DTYPE): parameters stay at
+    least float32, and norms, distributions, heads' outputs and losses at least float32. A TSSM's
+    dynamics compute in its own dtype."""
 
     def setup(self) -> None:
+        dense = functools.partial(nn.Dense, kernel_init=_init(), dtype=self.dtype,
+                                  param_dtype=parameters_of(self.dtype))
+        norm = functools.partial(nn.RMSNorm, epsilon=1e-4, dtype=self.dtype,
+                                 param_dtype=parameters_of(self.dtype))
+        layers = functools.partial(_Layers, dtype=self.dtype)
         if self.image is None:
-            self.encoder = _Layers(self.units, 3)
-            self.decoder = _Layers(self.units, 3)
-            self.decoded = nn.Dense(self.observation_size, kernel_init=_init())
+            self.encoder = layers(self.units, 3)
+            self.decoder = layers(self.units, 3)
+            self.decoded = dense(self.observation_size)
         else:
-            self.encoder = ConvEncoder(self.conv_depth)
-            self.decoder = ConvDecoder(self.image, self.conv_depth, self.units, blocks=self.blocks)
-        self.dynamics_in = [nn.Dense(self.hidden, kernel_init=_init()) for _ in range(3)]
-        self.dynamics_norms = [nn.RMSNorm(epsilon=1e-4) for _ in range(3)]
-        self.dynamics_hidden = _BlockLinear(self.deter, self.blocks)
-        self.dynamics_hidden_norm = nn.RMSNorm(epsilon=1e-4)
-        self.gru = _BlockLinear(3 * self.deter, self.blocks)
-        self.posterior_layers = _Layers(self.hidden, 1)
-        self.posterior_logits = nn.Dense(self.stoch * self.classes, kernel_init=_init())
-        self.prior_layers = _Layers(self.hidden, 2)
-        self.prior_logits = nn.Dense(self.stoch * self.classes, kernel_init=_init())
-        self.reward_layers = _Layers(self.units, 1)
-        self.reward_logits = nn.Dense(self.bins, kernel_init=_init(0.0))
-        self.continue_layers = _Layers(self.units, 1)
-        self.continue_logit = nn.Dense(1, kernel_init=_init())
-        self.policy_layers = _Layers(self.units, 3)
-        self.policy_mean = nn.Dense(self.action_size, kernel_init=_init(0.01))
-        self.policy_std = nn.Dense(self.action_size, kernel_init=_init(0.01))
-        self.value = Critic(self.units, self.bins)
+            self.encoder = ConvEncoder(self.conv_depth, dtype=self.dtype)
+            self.decoder = ConvDecoder(self.image, self.conv_depth, self.units, blocks=self.blocks,
+                                       dtype=self.dtype)
+        self.dynamics_in = [dense(self.hidden) for _ in range(3)]
+        self.dynamics_norms = [norm() for _ in range(3)]
+        self.dynamics_hidden = _BlockLinear(self.deter, self.blocks, self.dtype)
+        self.dynamics_hidden_norm = norm()
+        self.gru = _BlockLinear(3 * self.deter, self.blocks, self.dtype)
+        self.posterior_layers = layers(self.hidden, 1)
+        self.posterior_logits = dense(self.stoch * self.classes)
+        self.prior_layers = layers(self.hidden, 2)
+        self.prior_logits = dense(self.stoch * self.classes)
+        self.reward_layers = layers(self.units, 1)
+        self.reward_logits = dense(self.bins, kernel_init=_init(0.0))
+        self.continue_layers = layers(self.units, 1)
+        self.continue_logit = dense(1)
+        self.policy_layers = layers(self.units, 3)
+        self.policy_mean = dense(self.action_size, kernel_init=_init(0.01))
+        self.policy_std = dense(self.action_size, kernel_init=_init(0.01))
+        self.value = Critic(self.units, self.bins, self.dtype)
 
     def __call__(self, observation: jax.Array, action: jax.Array) -> jax.Array:
         """Every network once, for initialization: a step from a zero latent."""
@@ -262,7 +280,8 @@ class WorldModel(nn.Module):
         reset, candidate, update = (part.reshape(*deter.shape[:-1], -1) for part in jnp.split(gates, 3, -1))
         candidate = jnp.tanh(jax.nn.sigmoid(reset) * candidate)
         update = jax.nn.sigmoid(update - 1)
-        return update * candidate + (1 - update) * deter
+        # The state carried at its own dtype, whatever the networks compute in.
+        return (update * candidate + (1 - update) * deter).astype(deter.dtype)
 
     def posterior(self, deter: jax.Array, tokens: jax.Array) -> jax.Array:
         """The posterior's log-probabilities `[..., stoch, classes]` (rssm.py:75-92); the TSSM's reads
@@ -295,23 +314,24 @@ class WorldModel(nn.Module):
     def reconstruction(self, deter: jax.Array, stoch: jax.Array, observation: jax.Array) -> jax.Array:
         """The decoder's squared error, summed over the observation: against a vector's symlog, or an
         image's pixels over 255 (rssm.py:345-355, outs.MSE summed over the image's axes)."""
-        decoded = self.decode(deter, stoch)
+        decoded = self.decode(deter, stoch).astype(jnp.float32)
         if self.image is None:
             return jnp.sum(jnp.square(decoded - symlog(observation)), -1)
         return jnp.sum(jnp.square(decoded - observation.astype(decoded.dtype) / 255), (-3, -2, -1))
 
     def reward(self, feature: jax.Array) -> jax.Array:
-        return self.reward_logits(self.reward_layers(feature))
+        return self.reward_logits(self.reward_layers(feature)).astype(jnp.float32)
 
     def continue_(self, feature: jax.Array) -> jax.Array:
-        return self.continue_logit(self.continue_layers(feature))[..., 0]
+        return self.continue_logit(self.continue_layers(feature))[..., 0].astype(jnp.float32)
 
     def policy(self, feature: jax.Array) -> tuple[jax.Array, jax.Array]:
         """The bounded normal's mean, tanh of its head, and its deviation between the floor and the
         ceiling (heads.py:146-155)."""
         x = self.policy_layers(feature)
-        std = (self.max_std - self.min_std) * jax.nn.sigmoid(self.policy_std(x) + 2.0) + self.min_std
-        return jnp.tanh(self.policy_mean(x)), std
+        mean, std = (head(x).astype(jnp.float32) for head in (self.policy_mean, self.policy_std))
+        std = (self.max_std - self.min_std) * jax.nn.sigmoid(std + 2.0) + self.min_std
+        return jnp.tanh(mean), std
 
 
 class Critic(nn.Module):
@@ -319,10 +339,13 @@ class Critic(nn.Module):
 
     units: int
     bins: int
+    dtype: jnp.dtype = jnp.float32
 
     @nn.compact
     def __call__(self, feature: jax.Array) -> jax.Array:
-        return nn.Dense(self.bins, kernel_init=_init(0.0))(_Layers(self.units, 3)(feature))
+        logits = nn.Dense(self.bins, kernel_init=_init(0.0), dtype=self.dtype,
+                          param_dtype=parameters_of(self.dtype))(_Layers(self.units, 3, self.dtype)(feature))
+        return logits.astype(jnp.float32)
 
 
 def _shifted(stoch: jax.Array) -> jax.Array:
