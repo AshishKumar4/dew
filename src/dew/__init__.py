@@ -94,7 +94,7 @@ if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
         WandbTracker,
     )
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 _EXPORTS = {
     "Best": "dew.training", "Keep": "dew.training", "Plateau": "dew.training", "EvalSuite": "dew.training",

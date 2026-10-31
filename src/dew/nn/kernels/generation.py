@@ -14,7 +14,7 @@ import dataclasses
 import functools
 import inspect
 import logging
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -33,7 +33,7 @@ class Assumption:
     key reads it, not by a target's identity or its partial hash."""
     generation: str
     target: GpuTarget | None = dataclasses.field(default=None, compare=False, hash=False)
-    facts: tuple | None = None
+    facts: Hashable = None
 
 
 def assumption() -> Assumption | None:
@@ -63,7 +63,7 @@ def assumed(generation: str | GpuTarget | None) -> Iterator[None]:
         yield
 
 
-def _facts(value):
+def _facts(value: Hashable | Mapping | list) -> Hashable:
     """`value`'s facts as a hashable tree, equal wherever the facts are: a dataclass's fields by name, a
     mapping's entries sorted by key, a sequence's items in order."""
     if dataclasses.is_dataclass(value) and not isinstance(value, type):

@@ -45,6 +45,7 @@ import tokamax
 import tyro
 
 from dew.nn.attention_kernels import ATTENTION
+from dew.nn.kernels.options import program
 from dew.telemetry.benchmark import largest_difference, samples
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -199,7 +200,8 @@ def measure(case: dict, config: BenchmarkConfig) -> dict:
         try:
             kernel = attention_fn(case['implementation'], config, causal, sinks, block_groups=block_groups,
                                   runs=runs)
-            fn = jax.jit(kernel)
+            # Dew's arm compiles as a run's program does (`program`: the spill step-down).
+            fn = program(kernel)
             out = fn(q, k, v)
             out.block_until_ready()
         except (ImportError, NotImplementedError, ValueError, jax.errors.JaxRuntimeError) as e:
@@ -211,16 +213,18 @@ def measure(case: dict, config: BenchmarkConfig) -> dict:
 
         row.update(served=True, forward_ms=time_call(fn, q, k, v))
 
-        def loss(q, k, v):
+        # The cotangent is an argument: `program` keeps each function it compiled, and a closure over it
+        # would keep every case's (128 to 256 MiB in fp32) until the sweep ended.
+        def loss(q, k, v, cotangent):
             return jnp.sum(kernel(q, k, v).astype(jnp.float32) * cotangent)
 
         grads = None
         if not config.forward_only:
-            grad = jax.jit(jax.grad(loss, argnums=(0, 1, 2)))
+            grad = program(jax.grad(loss, argnums=(0, 1, 2)))
             try:
-                grads = grad(q, k, v)
+                grads = grad(q, k, v, cotangent)
                 jax.block_until_ready(grads)
-                row['forward_backward_ms'] = time_call(grad, q, k, v)
+                row['forward_backward_ms'] = time_call(grad, q, k, v, cotangent)
             except (NotImplementedError, jax.errors.JaxRuntimeError) as e:
                 row['backward_reason'] = failure(e)
 

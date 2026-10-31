@@ -5,6 +5,48 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- Environments and reinforcement learning for control, in `dew.rl` and `dew.objectives`:
+  - Environments as two pure functions: an `Env`'s `reset` and `step`, batched, cut at a time limit, rolled
+    out by one `lax.scan` (`dew.rl.env`). MuJoCo Playground's environments are Envs (`dew.rl.playground`,
+    the `playground` extra).
+  - Simulators outside JAX, stepped from the host with their arrays crossing by DLPack
+    (`dew.rl.simulator`).
+  - A device replay (`dew.rl.replay`).
+  - Brax's PPO for continuous control (`dew.objectives.rl.control`).
+  - DreamerV3 as its code computes it (`dew.objectives.rl.dreamer`): vector or image observations, bfloat16
+    compute, privileged auxiliary heads, and pretraining from demonstrations with behaviour cloning.
+  - DreamerV3's optimizer, LaProp after adaptive gradient clipping (`dew.laprop`), as the `laprop`
+    optimizer of `dew.optim`, which `OptimConfig.optimizer` names.
+  - TransDreamer's transformer dynamics (`dew.objectives.rl.tssm`).
+  - Dreamer 4's shortcut-forcing world model (`dew.objectives.world_model`).
+  - DiffusionNFT (`dew.objectives.rl.nft`).
+  - `tools/rl_acceptance.py` runs these against their papers. `tutorials/12-world-models.ipynb` acts and
+    imagines in one loop.
+- A first-person drone gate race in JAX (`dew.rl.flight`), flown by a racing quadrotor's physics in JAX
+  (`dew.rl.quadrotor`: a 5-inch racer at 12 times its weight, first-order motors, a Betaflight-form rate
+  loop, rotor, body and vertical drag, ground effect, a LiPo pack's sag, disturbances and noise, each drawn
+  per episode):
+  - Progress-to-gate rewards, gates passed only through their openings, and frames, pillars and the ground
+    solid along each physics step.
+  - Courses of four families (published layouts, loops, Song's chained primitives with split-S and dives,
+    figure-eights) under a difficulty curriculum, the next gate lit for the camera.
+  - Each drone's physics, latency, camera and image randomized.
+  - HyperLux draws its cameras (`dew.rl.hyperlux`, the `hyperlux` extra) over textured grounds, skies,
+    pillars and props (`tools/fpv_assets.py`, CC0 textures).
+  - `tools/fpv_race.py` runs the race's phases: a privileged PPO teacher, its demonstrations, and a
+    DreamerV3 agent on the camera alone.
+## 0.2.0
+
+The first release on Dew's own package index, `pip install dewml --extra-index-url
+https://pypi.dewml.dev/simple`, beside Dew's JAX build, which PyPI does not hold. PyPI's `dewml` is a
+pointer from now on: its 0.1.1 installs nothing and names the index.
+- Muon's and MuonClip's AdamW group, the norms, biases and embeddings, keeps both moments in float32 by
+  default (`state_dtype`), as AdamW does: under bfloat16 or float16 weights its second moment no longer
+  underflows.
+- A distillation's `teacher_run` is read as its run's task loads it (`dew.inference.SavedRun`): the
+  model the run publishes, so a Flow-GRPO run's trained policy and not its KL reference; guidance
+  distillation's teacher objective is the run's own sampling task.
+
 - The fit search's derived first candidate counts what its gradient program holds at its peak, as JAX
   lowers it and the GPU's fusion keeps its values (a one-device `shard_map` inline, a Pallas kernel its
   outputs alone, a `platform_dependent` the platform's branch), and the GEMM workspace XLA gives each

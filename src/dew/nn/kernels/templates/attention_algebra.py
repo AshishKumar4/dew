@@ -33,7 +33,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew.nn.kernels.templates import layout
+from dew.nn.kernels.templates import layout, product
 from dew.nn.kernels.templates.attention import (
     LOG2E,
     NATURAL,
@@ -2085,19 +2085,6 @@ def _fp16_scaled(x: jax.Array) -> tuple[jax.Array, jax.Array]:
     return scaled.astype(jnp.float16), exponent
 
 
-BF16_LARGEST = float(jnp.finfo(jnp.bfloat16).max)
-"""bf16's largest finite value, `(2 - 2^-7) 2^127`, an fp32 value."""
-
-
-def _bf16(x: jax.Array) -> jax.Array:
-    """fp32 `x` narrowed to bf16, saturating at its largest: an fp32 value past it by more than half its ulp
-    (to fp32's largest, `(2 - 2^-23) 2^127`) rounds to infinity in bf16, so a finite score cotangent there
-    would make an infinite product, or a NaN against a zero operand. Every value bf16 holds narrows as
-    before; one past it narrows to its largest, the accurate form's later parts taking the difference whole
-    (`cotangent_parts`), the fast form's within 2^-8 of it."""
-    return jnp.clip(x, -BF16_LARGEST, BF16_LARGEST).astype(jnp.bfloat16)
-
-
 def cotangent_parts(cotangents: jax.Array, dtype, *, accurate: bool) -> Parts:
     """The parts a tile's score cotangents `[bq, bk]` (fp32, scaled) take to their product with an operand of
     `dtype` (`cotangent_product`), each narrowed to it, with the power of two its product takes back (None:
@@ -2126,16 +2113,12 @@ def formed_parts(cotangents: jax.Array, dtype, *, accurate: bool
     if dtype == jnp.float32:
         yield cotangents, None
         return
-    if dtype == jnp.bfloat16 and not accurate:
-        yield _bf16(cotangents), None
-        return
     if dtype == jnp.bfloat16:
-        high = _bf16(cotangents)
-        yield high, None
-        rest = cotangents - high.astype(jnp.float32)
-        middle = rest.astype(jnp.bfloat16)
-        yield middle, None
-        yield (rest - middle.astype(jnp.float32)).astype(jnp.bfloat16), None
+        # The leading part saturates at bf16's largest: an fp32 cotangent past it by more than half its ulp
+        # rounds to infinity in bf16, an infinite product, or a NaN against a zero operand. The accurate
+        # form's later parts take the difference whole, the fast form's one part is within 2^-8 of it.
+        for part in product.bf16_parts(cotangents, 3 if accurate else 1, saturating=1):
+            yield part, None
         return
     scaled, high_exponent = _scaled(cotangents)
     high = scaled.astype(dtype)
