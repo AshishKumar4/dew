@@ -8,7 +8,8 @@ from jax._src.interpreters import mlir as jax_mlir
 from jax.extend.mlir import ir
 from jaxlib.mlir import passmanager
 from jaxlib.mosaic.python import mosaic_gpu as mosaic_gpu_dialect
-from kernel_liveness import Compiler, kernel_peaks, lowered_registers
+
+from dew.nn.kernels.templates.liveness import Compiler, kernel_peaks, lowered_registers
 
 
 def serialized(body: str):
