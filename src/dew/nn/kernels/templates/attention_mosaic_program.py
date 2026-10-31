@@ -669,20 +669,16 @@ def _coords(family: mosaic.Family, spans: _Spans | None, row, first, k_first, sh
 
     def places(start, axis: int) -> jax.Array:
         # A tile's places along `axis` from a row's or a column's vector broadcast: each element's index its
-        # lane's base and an immediate. An iota of the whole tile computes each element's from its place
-        # (a remainder by the tile's width, seven instructions at 192), chains LLVM hoists out of the walk
-        # and ptxas holds across it (the held-term census: 45-127 such integers live at the peak, D64's
-        # 64 x 192 forward spilling 344 bytes, D128's training 64 x 64 72).
+        # lane's base and an immediate. An iota of the whole tile computes each column's from its place (a
+        # remainder by the tile's width, seven instructions at 192), chains LLVM hoists out of the walk and
+        # ptxas holds across it (the held-term census: 45-127 such integers live at the peak, D64's 64 x 192
+        # forward spilling 344 bytes, D128's training 64 x 64 72); a row's needs no remainder.
         return lax.broadcast_in_dim(start + family.iota((shape[axis],), 0, columns=axis == 1), shape, (axis,))
 
-    if keys_first:
-        # Keys first, the queries' places a tile (a query's column vector beside the tile's layout finds no
-        # layout in Mosaic GPU's inference), the keys' a row vector broadcast.
-        q_pos = first + family.iota(shape, query_axis) if q_pos is None else q_pos
-        k_pos = places(k_first, key_axis)
-    else:
-        q_pos = places(first, query_axis) if q_pos is None else q_pos
-        k_pos = places(k_first, key_axis) if columns is None else k_first + columns
+    # The queries' places a tile (keys first, a query's column vector beside the tile finds no layout in
+    # Mosaic GPU's inference); the keys' a vector broadcast, a row's keys first and a column's queries first.
+    q_pos = first + family.iota(shape, query_axis) if q_pos is None else q_pos
+    k_pos = places(k_first, key_axis) if columns is None or keys_first else k_first + columns
     if spans is None:
         return algebra.Coords(q_pos, k_pos, drop=draw, keys_first=keys_first)
     rows, keys = pl.ds(first, shape[query_axis]), pl.ds(k_first, shape[key_axis])
