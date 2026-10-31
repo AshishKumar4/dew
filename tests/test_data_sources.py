@@ -588,15 +588,19 @@ def test_a_declaration_without_a_digest_or_a_version_is_refused_where_it_is_read
 
 
 @contextlib.contextmanager
-def etagged_server(objects: dict[str, bytes]):
+def etagged_server(objects: dict[str, bytes], token: str | None = None):
     """An HTTP server of `objects`, by path, each named by its content's digest as its ETag and served
     whole or a range of it (`Range`), a read conditioned on another ETag refused (`If-Match`: 412, RFC
-    9110 13.1.1); its URL."""
+    9110 13.1.1), and with `token` a read without it as its bearer refused (401); its URL."""
     class Handler(http.server.BaseHTTPRequestHandler):
         def log_message(self, *args):
             pass
 
         def do_GET(self):
+            if token is not None and self.headers.get("Authorization") != f"Bearer {token}":
+                self.send_response(401)
+                self.end_headers()
+                return
             payload = objects.get(self.path)
             if payload is None:
                 self.send_response(404)
@@ -627,16 +631,19 @@ def etagged_server(objects: dict[str, bytes]):
 
 def test_an_http_line_file_read_on_its_published_etag_is_refused_once_replaced():
     """A line file served over HTTP, declared by its size and the ETag it was published at, is read a
-    range at a time, each read held to that ETag: replaced, its next read is refused, where an unheld
-    read would take the replacement's bytes under the declaration."""
+    range at a time, each read held to that ETag beside the headers its storage options send:
+    replaced, its next read is refused, where an unheld read would take the replacement's bytes under
+    the declaration."""
     objects = {"/rows.jsonl": b'{"id":0}\n{"id":1}\n'}
-    with etagged_server(objects) as url:
+    # A server that also asks for the bearer token the storage options send with every read.
+    with etagged_server(objects, token="secret") as url:
         location = url + "/rows.jsonl"
         facts = {location: {"bytes": len(objects["/rows.jsonl"]),
                             "ETag": '"' + hashlib.sha256(objects["/rows.jsonl"]).hexdigest() + '"'}}
+        options = {"headers": {"Authorization": "Bearer secret"}}
 
         def rows():
-            source = Files((location,), format="jsonl", file_info=facts)
+            source = Files((location,), format="jsonl", file_info=facts, storage_options=options)
             manifest = source.manifest()
             return [row["id"] for part in manifest.shards for row in manifest.reader(part)]
 
