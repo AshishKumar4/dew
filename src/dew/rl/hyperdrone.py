@@ -87,7 +87,7 @@ class HyperDroneFlight:
     aspect = 1.0
 
     def __init__(self, count: int, gates: int, *, size: int = 96, model: str = "flightmare",
-                 hz: float = 30.0, substeps: int = 3, rate_limit: float = 10.0, headroom: float = 1.2,
+                 hz: float = 60.0, substeps: int = 2, rate_limit: float = 10.0, headroom: float = 1.2,
                  opening: float = 1.5, frame: float = 0.25, extent: float = 200.0, tile: float = 5.0,
                  seed: int = 0, device: str = "cuda"):
         from hyperdrone import dynamics

@@ -119,7 +119,7 @@ def test_a_step_pays_passes_and_ends_as_the_race_rules():
     exactly."""
     rng = np.random.default_rng([532, 5])
     with jax.enable_x64(new_val=True):
-        racing = Racing(max_steps=3)
+        racing = Racing(episode_seconds=0.05)
         track = jax.tree.map(np.asarray, tracks(racing, 0)[0])
         track = track.replace(steps=rng.integers(0, 3, DRONES), action=rng.uniform(-1, 1, (DRONES, 4)))
         path, kind = drawn_paths(racing, track, rng)
@@ -243,7 +243,7 @@ class Straight:
     """A flight backend whose drones fly straight at 0.4 m a control step, in three physics steps, ignoring
     the commands, each toward the point it is aimed at (`aim`)."""
 
-    hz, thrust_to_weight, rate_limit, aspect = 30.0, 14.5, 12.0, 1.0
+    hz, thrust_to_weight, rate_limit, aspect = 60.0, 14.5, 12.0, 1.0
 
     def __init__(self, count: int):
         self.count = count

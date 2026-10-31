@@ -71,19 +71,21 @@ GATES = max(map(len, LAYOUTS.values()))
 class Racing:
     """The race. `layouts` names the layouts drawn (`LAYOUTS`) and `random_share` the share of courses that
     are random loops; `jitter` the most a layout's gate moves across and up, at full `difficulty`. The
-    reward's weights are `raced`'s; `hz` the control rate; an episode is cut after `max_steps` steps (Swift's
-    1500 episodes). Gates' openings are `opening` square (1.5 m, SkyDreamer's and Ferede's) in a frame
-    `frame` wide; the drone is a sphere of `radius`. `spread` is each drone parameter's randomization about
-    nominal, `latency` the command latency's range in seconds, `lag` the rate response's time constant's,
-    `uptilt` the camera's tilt above the body's forward axis in degrees, `fov` its horizontal field of view
-    and `fov_spread` and `mount_spread` their randomization, `brightness` the image's gain's range."""
+    reward's weights are `raced`'s; `hz` the control rate, 60 Hz (a teacher at 60 Hz passed 27% more gates
+    than at 30 in the same time and crashed less; Swift's and Song's run at 90 to 100 Hz); an episode is
+    cut after `episode_seconds` (Swift's 1500 steps). Gates' openings are `opening` square (1.5 m,
+    SkyDreamer's and Ferede's) in a frame `frame` wide; the drone is a sphere of `radius`. `spread` is each
+    drone parameter's randomization about nominal, `latency` the command latency's range in seconds, `lag`
+    the rate response's time constant's, `uptilt` the camera's tilt above the body's forward axis in
+    degrees, `fov` its horizontal field of view and `fov_spread` and `mount_spread` their randomization,
+    `brightness` the image's gain's range."""
 
     layouts: tuple[str, ...] = tuple(LAYOUTS)
     random_share: float = 0.5
     jitter: tuple[float, float] = (1.5, 0.75)
     difficulty: float = 1.0
-    hz: float = 30.0
-    max_steps: int = 1500
+    hz: float = 60.0
+    episode_seconds: float = 25.0
     opening: float = 1.5
     frame: float = 0.25
     radius: float = 0.2
@@ -113,6 +115,11 @@ class Racing:
     @property
     def dt(self) -> float:
         return 1.0 / self.hz
+
+    @property
+    def max_steps(self) -> int:
+        """The steps an episode is cut after."""
+        return round(self.episode_seconds * self.hz)
 
     @property
     def delays(self) -> tuple[int, int]:
@@ -371,7 +378,8 @@ def raced(racing: Racing, track: Track, action: jax.Array, kinematics: Kinematic
     `progress_scale`), less `rate_cost` times the body rates' norm over the step, less `smoothness_cost`
     times the squared change of the action; on passing that gate, `gate_bonus` times one less its offset's
     share of half the opening, the drone heading for the next; and on a crash (`struck`, or the
-    simulator's), less `crash_penalty`, which ends the episode. An episode is cut after `max_steps` steps."""
+    simulator's), less `crash_penalty`, which ends the episode. An episode is cut after `max_steps` steps
+    (`episode_seconds`)."""
     crashed, passed, across = struck(racing, track, path)
     crashed = crashed | collided
     # A crash voids a passage in the same step, the simulator's as the race's own.

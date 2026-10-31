@@ -13,8 +13,9 @@ writes a JSON report and its weights to OUT.
                                                          FlyDreamer's train ratio; the teacher, the cloned
                                                          agent and the online agent scored alike.
 
-`--hz` sets the control rate (30 by default; physics at 90 or 120 Hz). The world model's windows and
-imagination span the same seconds at any rate: 64 steps and 15 imagined at 30 Hz.
+`--hz` sets the control rate (60 by default, physics at 120 Hz; at 30, physics at 90). The world model's
+windows and imagination span the same seconds at any rate: 64 steps and 15 imagined at 30 Hz, 128 and 30
+at 60.
 
 An agent is scored on its drones' first episodes, each run to its end or to `Racing.max_steps`. The score
 records the return, the gates passed, the share of episodes that ended in a crash, and the steps flown.
@@ -52,7 +53,7 @@ def _idle() -> Loader:
                   records=8, batch=8)
 
 
-def race(drones: int, views: tuple[str, ...], *, hz: float = 30.0, size: int = 96):
+def race(drones: int, views: tuple[str, ...], *, hz: float = 60.0, size: int = 96):
     """A gate race of `drones` drones on HyperDrone at `hz`, its physics at 90 Hz or the nearest rate a
     whole number of steps a control step reaches."""
     from dew.rl.flight import GATES, GateRace, Racing
@@ -105,7 +106,7 @@ def teacher_policy(objective):
     return greedy
 
 
-def check(out: Path, *, hz: float = 30.0) -> dict:
+def check(out: Path, *, hz: float = 60.0) -> dict:
     """The race's first frames, and frames a second with images and without."""
     report = {"device": str(jax.devices()[0])}
     sample = race(16, ("image", "passed"), hz=hz)
@@ -135,7 +136,7 @@ def check(out: Path, *, hz: float = 30.0) -> dict:
     return report
 
 
-def teacher(out: Path, *, seconds: float = 6600.0, drones: int = 4096, hz: float = 30.0) -> dict:
+def teacher(out: Path, *, seconds: float = 6600.0, drones: int = 4096, hz: float = 60.0) -> dict:
     """PPO's teacher for `seconds`, scored every ten collections, the weights of the best greedy return at
     the highest difficulty reached kept (teacher.msgpack); the courses' difficulty starts at 0.2 and rises
     by 0.1, to 1, at each score whose crashes fall under a third (Song et al. 2021 raised it on the crash
@@ -190,7 +191,7 @@ def demonstrations(simulator, objective, variables, steps: int, capacity: int):
     return ReplayBuffer.empty(jax.tree.map(lambda leaf: leaf[0], stream), capacity).add(stream)
 
 
-def world(out: Path, *, teacher_weights: Path, drones: int = 16, hz: float = 30.0,
+def world(out: Path, *, teacher_weights: Path, drones: int = 16, hz: float = 60.0,
           demonstration_seconds: float = 546.0, pretrain_updates: int = 50_000,
           environment_seconds: float = 33_333.0, capacity_seconds: float = 1092.0) -> dict:
     """FlyDreamer's agent at its size (TransDreamer's dynamics, bfloat16) on the image alone: pretrained on
@@ -264,7 +265,7 @@ def main() -> None:
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("phase", choices=("check", "teacher", "world"))
     parser.add_argument("out", type=Path)
-    parser.add_argument("--hz", type=float, default=30.0)
+    parser.add_argument("--hz", type=float, default=60.0)
     parser.add_argument("--seconds", type=float, default=6600.0)
     parser.add_argument("--teacher", type=Path)
     parser.add_argument("--pretrain-updates", type=int, default=50_000)
