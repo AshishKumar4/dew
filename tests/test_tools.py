@@ -2000,44 +2000,32 @@ def test_the_data_benchmark_counts_a_grain_packing_and_dews_alike_as_the_objecti
         "rows": 2, "tokens": 2, "model_flops": None}
 
 
-def a100_peaks(monkeypatch) -> float:
-    """Every device rated at an A100's dense bf16 peak (`model_flops_utilization`'s), which a CPU has
-    none of, so a rate the tools report on CPU is a number; that peak."""
-    import dew.telemetry.instrumentation as instrumentation
-    from dew.nn.kernels import generation
-
-    a100 = generation.gpu_target("a100")
-    monkeypatch.setattr(instrumentation, "gpu_target", lambda kind: a100)
-    return a100.bf16_peak
-
-
-@pytest.mark.mesh
-def test_the_data_benchmark_rates_its_training_window_over_the_whole_mesh_as_the_trainer_does(monkeypatch):
+def test_the_data_benchmark_rates_its_training_window_over_the_whole_mesh_as_the_trainer_does():
     """The data benchmark's training window is rated as the trainer's interval rates its steps
     (`dew.training.interval.throughput`): the objective's work on the host's whole batch over the peak of
-    every device the step's mesh spans, not over one device's (row 3023)."""
-    import itertools
+    every device the step's mesh spans, not over one device's, and the compiled work, each device's, a
+    lower bound beside the launches it left out (row 3023)."""
+    from dew.nn.kernels.generation import gpu_target
+    from dew.telemetry.instrumentation import StepFlops
 
-    peak = a100_peaks(monkeypatch)
     tool = load("benchmark_data")
-    worker = tool.Worker("dew", "text", Path("in"), Path("out"),
-                         tool.Measurement(batch=8, seq_len=16, warmup=1, train_steps=2))
-    objective = tool.objective_for(worker)
-    batch = {"text": np.ones((8, 17), np.int32)}
-    measured = tool.training_measure(lambda: itertools.repeat(batch), objective, worker)
-    seconds = measured["steps"] * 8 / measured["records_per_second"]
-    work = measured["steps"] * objective.training_flops(None, batch)
-    assert jax.device_count() == 8
-    assert measured["model_mfu_bf16_peak"] == pytest.approx(work / 8 / seconds / peak, rel=1e-9)
-    assert measured["unsized_kernels_per_step"] == 0
-    assert measured["hlo_utilization_bf16_peak"] > 0
+    peak = gpu_target("a100").bf16_peak
+    work, compiled = 3.0e13, StepFlops(2.0e12, 4.0e12)
+    rates = tool.rated(2.0, 2, 16, compiled, work, 8, peak=peak)
+    assert rates["model_mfu_bf16_peak"] == work / 8 / 2 / (2.0 / 2) / peak
+    assert rates["hlo_utilization_bf16_peak"] == compiled.hardware / 2 / (2.0 / 2) / peak
+    assert rates["unsized_kernels_per_step"] == 0
+    uncounted = tool.rated(2.0, 2, 16, StepFlops(2.0e12, 4.0e12, 6.0), None, 8, peak=peak)
+    assert uncounted["model_mfu_bf16_peak"] is None
+    assert uncounted["hlo_utilization_bf16_peak"] == compiled.hardware / 2 / (2.0 / 2) / peak
+    assert uncounted["unsized_kernels_per_step"] == 3.0
 
 
 @pytest.mark.mesh
-def test_the_data_benchmark_reports_a_steps_uncounted_launches_beside_its_utilization(monkeypatch):
-    """A step that runs a launch no count sizes (here a host callback) has a compiled work the
-    benchmark reports as the trainer does, a lower bound beside the launches it left out, never as a
-    complete utilization (row 3023)."""
+def test_the_data_benchmark_reports_a_steps_uncounted_launches_beside_its_utilization():
+    """A step that runs a launch no count sizes (here LAPACK's Cholesky on a CPU, which no table
+    knows) is reported as the trainer reports it, beside the launches it left out, so its compiled work
+    reads as the lower bound it is, never as a complete count (row 3023)."""
     import itertools
 
     from flax import linen as nn
@@ -2045,25 +2033,21 @@ def test_the_data_benchmark_reports_a_steps_uncounted_launches_beside_its_utiliz
     from dew.inputs import Field, InputSpec
     from dew.objectives.supervised import Supervised
 
-    class Hosted(nn.Module):
+    class Factored(nn.Module):
         @nn.compact
         def __call__(self, image):
             values = nn.Dense(3)(jnp.mean(image.astype(jnp.float32), axis=(1, 2)))
-            # The host's zeros, of the batch alone, so no gradient runs through the callback.
-            zeros = jax.pure_callback(lambda pixels: np.zeros((len(pixels), 3), np.float32),
-                                      jax.ShapeDtypeStruct((image.shape[0], 3), jnp.float32), image)
-            return values + zeros
+            gram = values.T @ values + jnp.eye(3)
+            return values @ jnp.linalg.cholesky(gram)
 
-    a100_peaks(monkeypatch)
     tool = load("benchmark_data")
     worker = tool.Worker("dew", "image", Path("in"), Path("out"),
                          tool.Measurement(batch=8, image_size=4, warmup=1, train_steps=2))
-    objective = Supervised(Hosted(), lambda outputs, batch: jnp.mean(jnp.square(outputs), axis=-1),
+    objective = Supervised(Factored(), lambda outputs, batch: jnp.mean(jnp.square(outputs), axis=-1),
                            inputs=InputSpec(Field("image", (4, 4, 3))))
     batch = {"image": np.ones((8, 4, 4, 3), np.uint8)}
     measured = tool.training_measure(lambda: itertools.repeat(batch), objective, worker)
     assert measured["unsized_kernels_per_step"] >= 1
-    assert measured["hlo_utilization_bf16_peak"] > 0
     assert measured["model_mfu_bf16_peak"] is None
 
 

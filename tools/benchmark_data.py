@@ -547,7 +547,6 @@ def training_measure(factory, objective, config: Worker) -> dict:
     from dew.telemetry.instrumentation import NO_FLOPS
     from dew.telemetry.profile import Profiler
     from dew.training import Trainer
-    from dew.training.interval import throughput
 
     trainer = Trainer(objective, optax.adam(1e-4), key=0, checkpoints=None, tracker=None)
     state, _, _ = trainer.place()
@@ -617,11 +616,6 @@ def training_measure(factory, objective, config: Worker) -> dict:
         (row["hlo_flops"] for row in measured), NO_FLOPS)
     model_flops = None if any(row["model_flops"] is None for row in measured) else sum(
         row["model_flops"] for row in measured)
-    # Rated as the trainer's interval rates its steps: the objective's work over the whole mesh's peak,
-    # the compiled work a lower bound where a launch's went uncounted.
-    rates = throughput(seconds, len(measured), sum(row["rows"] for row in measured), hlo_flops,
-                       trainer.device_mesh.devices.size, training_flops=model_flops)
-    bound = "_lower_bound" if hlo_flops is not None and hlo_flops.unsized else ""
     return {"steps": len(measured), "data_wait_ms": statistics.mean(
                 row["wait_seconds"] for row in measured) * 1000,
             "step_ms": (seconds - sum(row["wait_seconds"] for row in measured)) * 1000 / len(measured),
@@ -633,12 +627,27 @@ def training_measure(factory, objective, config: Worker) -> dict:
             "compile_count": len(compiles), "compiles": compiles, "device_timeline": timeline,
             "losses": [float(resolved[row["signal_index"]][0]) for row in measured],
             "scope": "real asynchronous Trainer.compile updates; compilation boundaries excluded",
-            "model_mfu_bf16_peak": rates.get("train/mfu"),
+            **rated(seconds, len(measured), sum(row["rows"] for row in measured), hlo_flops, model_flops,
+                    trainer.device_mesh.devices.size)}
+
+
+def rated(seconds: float, steps: int, rows: int, hlo_flops, model_flops: float | None, devices: int, *,
+          peak: float | None = None) -> dict:
+    """A training window's `steps` steps of `rows` rows over `seconds`, their compiled work `hlo_flops`
+    (`StepFlops`, each device's) and the objective's `model_flops` (the whole mesh's), rated as the
+    trainer's interval rates its steps (`dew.training.interval.throughput`) on `devices` devices of dense
+    bf16 `peak` (the device's own by default): the objective's work over the whole mesh's peak, and the
+    compiled work a lower bound where a launch's went uncounted (`StepFlops.unsized`)."""
+    from dew.training.interval import throughput
+
+    rates = throughput(seconds, steps, rows, hlo_flops, devices, training_flops=model_flops, peak=peak)
+    bound = "_lower_bound" if hlo_flops is not None and hlo_flops.unsized else ""
+    return {"model_mfu_bf16_peak": rates.get("train/mfu"),
             "model_flops_scope": "objective.training_flops on real host lengths and layout, over the mesh's "
                                  "dense bf16 peak; custom image-mean model and frozen legacy API have no "
                                  "analytic count",
             "hlo_utilization_bf16_peak": rates.get(f"train/hfu{bound}"),
-            "unsized_kernels_per_step": None if hlo_flops is None else hlo_flops.unsized / len(measured),
+            "unsized_kernels_per_step": None if hlo_flops is None else hlo_flops.unsized / steps,
             "utilization_scope": "optimized executable work, including padding, over dense bf16 peak; "
                                  "a lower bound where unsized_kernels_per_step is not zero; "
                                  "not an analytic real-token MFU"}

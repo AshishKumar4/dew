@@ -329,13 +329,13 @@ def communication(directory: str, steps: int, *, planes=None) -> dict[str, Any]:
     }
 
 
-def training_work(trainer: Trainer, case: Case) -> float | None:
-    """The objective's training FLOPs on the case's batch, train/mfu's numerator; None where the model
-    has no count."""
+def training_work(trainer: Trainer, case: Case) -> tuple[float | None, str | None]:
+    """The objective's training FLOPs on the case's batch, train/mfu's numerator; None and the model's
+    reason where it has no count (`MissingFlopsCount`)."""
     try:
-        return trainer.objective.training_flops(None, global_batch(case))
-    except MissingFlopsCount:
-        return None
+        return trainer.objective.training_flops(None, global_batch(case)), None
+    except MissingFlopsCount as missing:
+        return None, str(missing)
 
 
 def rates(trainer: Trainer, rows: int, steps: int, elapsed: float,
@@ -409,7 +409,7 @@ def measure(case: Case, config: BenchmarkConfig, peaks: list[int | None] | None)
                             **communication(directory, config.profile_steps, planes=planes)}
         flops = trainer.step_flops
         step_time = elapsed / config.steps
-        training_flops = training_work(trainer, case)
+        training_flops, uncounted = training_work(trainer, case)
         utilization, mfu = rates(trainer, case.batch_size, config.steps, elapsed, training_flops)
         planned = step_bytes(trainer.executable)
         row: Row = {
@@ -452,6 +452,8 @@ def measure(case: Case, config: BenchmarkConfig, peaks: list[int | None] | None)
             # `flops_per_step` are lower bounds, as the trainer's train/hfu_lower_bound is.
             "unsized_kernels": None if flops is None else flops.unsized,
             "training_flops": training_flops,
+            # Why the model counts no training work, where it counts none, so no MFU is reported.
+            "training_flops_missing": uncounted,
             "mfu": mfu,
             "planned_device_bytes": planned,
             "loss": float(loss),

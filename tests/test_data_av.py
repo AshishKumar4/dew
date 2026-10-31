@@ -227,32 +227,35 @@ def test_the_clips_preset_batches_a_clip_and_its_sound_by_the_schema_and_passes_
     assert set(silent[0]) == {"video", "id"}
 
 
-def test_a_remote_media_path_is_read_from_dews_mirror_or_refused_where_it_has_no_room(monkeypatch):
+def test_a_remote_media_path_is_read_from_dews_mirror_or_refused_where_it_has_no_room():
     """A record's remote media path reaches its decoder as its copy in Dew's mirror, a local file the
     decoder opens by name (`dew.data.declared.mirrored`); one the mirror has no room for is refused
     (`Unmirrored`, a ValueError a decoder's rejects take), never handed on as a stream that names no
     local file (row 3029)."""
-    import functools
     from pathlib import Path
     from uuid import uuid4
 
     import fsspec
+    from fsspec.implementations.memory import MemoryFileSystem
 
     from dew.data.declared import Unmirrored
-    from dew.data.storage import BoundedFileCache
 
-    remote = fsspec.filesystem("memory")
-    small, large = (f"memory://media-{uuid4().hex}/{name}" for name in ("small", "large"))
-    remote.pipe_file(small, b"abcd")
-    remote.pipe_file(large, b"abcdefgh")
-    # A mirror of six bytes, built afresh here and dropped after, so no other test reads through it.
-    monkeypatch.setattr(BoundedFileCache, "__init__", functools.partialmethod(BoundedFileCache.__init__,
-                                                                              max_bytes=6))
-    BoundedFileCache.clear_instance_cache()
-    try:
-        with video.local_file(small) as path:
-            assert Path(path).read_bytes() == b"abcd"
-        with pytest.raises(Unmirrored), video.local_file(large):
-            pass
-    finally:
-        BoundedFileCache.clear_instance_cache()
+    class Oversized(MemoryFileSystem):
+        """A store whose objects state more bytes than Dew's mirror holds (8 GiB by default)."""
+
+        protocol = "oversized"
+
+        @classmethod
+        def _strip_protocol(cls, path):
+            return super()._strip_protocol(path.replace("oversized://", "memory://", 1))
+
+        def size(self, path):
+            return 9 * 2**30
+
+    fsspec.register_implementation("oversized", Oversized, clobber=True)
+    name = f"media-{uuid4().hex}/clip"
+    fsspec.filesystem("memory").pipe_file(f"memory://{name}", b"abcd")
+    with video.local_file(f"memory://{name}") as path:
+        assert Path(path).read_bytes() == b"abcd"
+    with pytest.raises(Unmirrored), video.local_file(f"oversized://{name}"):
+        pass
