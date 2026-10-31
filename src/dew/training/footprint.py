@@ -243,7 +243,7 @@ def peak_bytes(program: jcore.Jaxpr, platform: str, workspace: Workspace,
                 workspace.sliced if sliced.fused(equation) else workspace.each)
             # A loop's results (its stacked outputs, its carry) are held beside each turn's own; a call's
             # results are what its body returns.
-            running = (looped(frontier, last, index, equation, made) + inner
+            running = (looped(frontier, last, index, equation, made, carried) + inner
                        if equation.primitive.name in LOOPS else max(inner, made_bytes))
             most = max(most, live + running + operands + products)
         held.update(made)
@@ -278,16 +278,19 @@ def carry(equation: jcore.JaxprEqn) -> list[tuple]:
     return []
 
 
-def looped(frontier: Frontier, last: Mapping, index: int, equation: jcore.JaxprEqn, made: Sequence) -> int:
+def looped(frontier: Frontier, last: Mapping, index: int, equation: jcore.JaxprEqn, made: Sequence,
+           reserved: frozenset = frozenset()) -> int:
     """The bytes the loop `equation`, the program's `index`th, holds of its own while it runs, its body's
     aside: each result it makes (`made`) but a carry's, and each carried value its body changes, held in
     a buffer of the loop's whether its result is read after or not, but where it is held in its
-    initial value's (`sharing`)."""
-    carried = carry(equation)
-    ends = {ended for _, ended, _ in carried}
-    shared = sharing(frontier, last, index, equation)
+    initial value's (`sharing`) or in a buffer an enclosing loop holds it in (`reserved`, the values
+    the program it runs in, that loop's body, returns into that loop's carry: the carries' buffers are
+    one)."""
+    slots = carry(equation)
+    ends = {ended for _, ended, _ in slots}
+    shared = sharing(frontier, last, index, equation) | reserved
     return (sum(device_share(out) for out in made if out not in ends)
-            + sum(device_share(ended) for _, ended, changed in carried if changed and ended not in shared))
+            + sum(device_share(ended) for _, ended, changed in slots if changed and ended not in shared))
 
 
 def returned_carry(equation: jcore.JaxprEqn, body: jcore.Jaxpr) -> frozenset:
