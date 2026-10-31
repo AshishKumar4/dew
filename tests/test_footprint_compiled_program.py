@@ -46,29 +46,44 @@ def test_a_shard_map_over_one_device_holds_what_it_would_inline():
             through(layer), params, (rows,), platform="gpu", workspace=workspace)
 
 
-def test_a_native_pallas_kernel_holds_its_outputs_and_no_workspace():
+def test_a_pallas_kernel_holds_what_its_lowering_holds():
     """A native Pallas kernel is one custom call to XLA, `__gpu$xla.gpu.triton`, whose results are the
-    kernel's outputs alone (`pallas_call_lowering`, jax/_src/pallas/triton/pallas_call_registration.py:
-    the body is serialized into the call's configuration). The matrix product in its body is Triton's,
-    no HLO dot for `GemmRewriter` to hand cuBLAS, and a workspace is added to cuBLAS custom calls alone
-    (`GemmWorkspaceRewriteVisitor::HandleCustomCall`, xla/backends/gpu/transforms/gemm_rewriter.cc); the
-    values of its body live in registers and shared memory: the call holds its output. An interpreted
-    one lowers to ordinary HLO (`pallas_call_hlo_interpret`), its body's product a cuBLAS call's."""
+    kernel's outputs alone (`pallas_call_lowering`, jax/_src/pallas/triton/pallas_call_registration.py):
+    its products are Triton's, no cuBLAS call's, its body's values in registers and shared memory, so
+    the call holds its output. An interpreted one lowers to the HLO interpreter's program
+    (`pallas_call_hlo_interpret`, jax/_src/pallas/hlo_interpreter.py): the kernel discharged of its
+    state and run over its grid in a loop carrying its whole output, each block's product a cuBLAS call
+    whose workspace is live beside it, within what XLA's compile of it on a compile-only Hopper holds."""
     from jax.experimental import pallas as pl
 
-    shape = jax.ShapeDtypeStruct((64, 64), jnp.float32)
+    from dew.training.ahead import compile_only_gpus
+
+    (gpu,) = compile_only_gpus("sm90", 1, 1 << 30)
+    workspace = gemm_workspace(gpu)
+    output = jax.ShapeDtypeStruct((4096, 4096), jnp.float32)
+    specs = (jax.ShapeDtypeStruct((4096, 64), jnp.float32), jax.ShapeDtypeStruct((64, 4096), jnp.float32))
 
     def kernel(left, right, out):
         out[...] = left[...] @ right[...]
 
-    def peak(interpret: bool) -> int:
-        program = jax.make_jaxpr(lambda left, right: pl.pallas_call(
-            kernel, out_shape=shape, interpret=interpret)(left, right))(shape, shape).jaxpr
-        assert [equation.primitive.name for equation in program.eqns] == ["pallas_call"]
-        return peak_bytes(program, "gpu", Workspace(1 << 20, 1 << 20))
+    def call(interpret: bool):
+        return pl.pallas_call(kernel, out_shape=output, grid=(8, 8), interpret=interpret,
+                              in_specs=[pl.BlockSpec((512, 64), lambda row, column: (row, 0)),
+                                        pl.BlockSpec((64, 512), lambda row, column: (0, column))],
+                              out_specs=pl.BlockSpec((512, 512), lambda row, column: (row, column)))
 
-    assert peak(interpret=False) == 64 * 64 * 4
-    assert peak(interpret=True) >= 1 << 20
+    def peak(interpret: bool) -> int:
+        program = jax.make_jaxpr(call(interpret))(*specs).jaxpr
+        return peak_bytes(compiled(program, "cuda"), "gpu", workspace)
+
+    sharding = NamedSharding(Mesh(np.asarray([gpu]), ("data",)), P())
+    placed = [jax.ShapeDtypeStruct(spec.shape, spec.dtype, sharding=sharding) for spec in specs]
+    held = jax.jit(call(interpret=True)).lower(*placed).compile(
+        compiler_options={"xla_gpu_enable_triton_gemm": False}).memory_analysis()
+    assert held is not None, "the compile states no memory"
+    assert peak(interpret=False) == 4096 * 4096 * 4
+    assert 4096 * 4096 * 4 + workspace.each <= peak(interpret=True) <= (
+        held.output_size_in_bytes + held.temp_size_in_bytes)
 
 
 @pytest.mark.parametrize("order", ["cuda-first", "rocm-first"])
@@ -221,6 +236,37 @@ def discarded_update(table, rows):
     return jax.lax.fori_loop(0, 4, turn, jnp.zeros(()))
 
 
+def shared_product(table, rows):
+    """Each turn's product updated into the returned buffer and also reduced: two readers of it."""
+    def turn(index, carried):
+        buffer, total = carried
+        product = jnp.tanh(rows[:64]) @ jnp.tanh(table[:64]).T
+        return (jax.lax.dynamic_update_slice_in_dim(buffer, product, index * 64, axis=0),
+                total + jnp.sum(product))
+
+    buffer, total = jax.lax.fori_loop(0, 4, turn, (jnp.zeros((256, 64)), jnp.zeros(())))
+    return total + jnp.sum(buffer)
+
+
+def stacked_output(table, rows):
+    """Each turn's product a scan's stacked output, read by nothing else."""
+    def turn(total, tile):
+        return total, jnp.tanh(rows[:64]) @ jnp.tanh(tile).T
+
+    total, products = jax.lax.scan(turn, jnp.zeros(()), table.reshape(4, 64, 64))
+    return total + jnp.sum(products)
+
+
+def shared_output(table, rows):
+    """Each turn's product a scan's stacked output and also reduced into its carry."""
+    def turn(total, tile):
+        product = jnp.tanh(rows[:64]) @ jnp.tanh(tile).T
+        return total + jnp.sum(product), product
+
+    total, products = jax.lax.scan(turn, jnp.zeros(()), table.reshape(4, 64, 64))
+    return total + jnp.sum(products)
+
+
 PROGRAMS = {
     # A static aligned contiguous slice, outside any loop.
     "static-slice": lambda table, rows: rows @ table[:64].T,
@@ -238,6 +284,9 @@ PROGRAMS = {
         table, index * 64, 64).T.reshape(32, 128)),
     "returned-update": returned_update,
     "discarded-update": discarded_update,
+    "shared-product": shared_product,
+    "stacked-output": stacked_output,
+    "shared-output": shared_output,
 }
 
 
@@ -263,4 +312,30 @@ def test_a_deviceless_matmul_holds_the_workspace_its_slice_fusion_decides(progra
     charged = {kind for kind, charge in (("each", Workspace(vast, 0)), ("sliced", Workspace(0, vast)))
                if peak(charge) >= vast}
     assert charged == held
+
+
+def test_deriving_a_loops_offsets_runs_no_callback_of_it():
+    """XLA's evaluator computes an offset from the loop's counter only through operations of no side
+    effect and no custom call (`GetLeafDependencies`, dynamic_slice_analysis.cc), and computes no
+    operation the offset does not read: deriving a peak runs none of a loop's callbacks, neither one
+    beside its offsets nor one an offset reads, and a slice whose offset a callback computes is read
+    as fused with nothing."""
+    called = []
+
+    def offset(index):
+        called.append(index)
+        return index * 64
+
+    def tile(index, table, rows):
+        jax.debug.callback(called.append, index)
+        start = jax.pure_callback(offset, jax.ShapeDtypeStruct((), jnp.int32), index)
+        return rows @ jax.lax.dynamic_slice_in_dim(table, start, 64).T
+
+    loss = scaled(over_turns(tile))
+    specs = (jax.ShapeDtypeStruct((), jnp.float32), jax.ShapeDtypeStruct((256, 64), jnp.float32),
+             jax.ShapeDtypeStruct((512, 64), jnp.float32))
+    vast = 1 << 30
+    sliced = gradient_peak(loss, specs[0], specs[1:], platform="gpu", workspace=Workspace(0, vast)).bytes
+    assert called == []
+    assert sliced < vast
 
