@@ -409,18 +409,22 @@ class Mma(mosaic.Family):
         if interpret:
             # mma has no rule on a CPU: its sum, in fp32.
             return acc + jnp.dot(lhs[...], rhs[...], preferred_element_type=jnp.float32)
-        # Each operand loads only the fragments a group of instructions consumes, a whole swizzle tile of
-        # its staging at least; a register operand (an accumulator's value) is cast once and sliced.
+        # Each operand loads only the fragments the next instructions consume: a depth slice of its stage
+        # as narrow as its staging allows (a swizzled axis a whole swizzle tile, `_depth_granule`), each
+        # operand at its own; a register operand (an accumulator's value) is cast once and sliced.
         instruction = self.fragment_depth(int(rhs.shape[0]))
-        chunk = max(_depth_granule(lhs, 1, instruction), _depth_granule(rhs, 0, instruction))
+        lhs_depth, rhs_depth = _depth_granule(lhs, 1, instruction), _depth_granule(rhs, 0, instruction)
         held = self._left(lhs) if isinstance(lhs, jax.Array) else None
-        for start in range(0, rhs.shape[0], chunk):
-            left = (held[:, start:start + chunk] if held is not None
-                    else self._left(lhs.at[:, pl.ds(start, chunk)]))
-            right = plgpu.load(rhs.at[pl.ds(start, chunk)], layout=self.rhs)
-            for offset in range(0, chunk, instruction):
-                acc = plgpu.mma(acc, left[:, offset:offset + instruction],
-                                right[offset:offset + instruction], m_warps=self.m_warps)
+        left = right = None
+        for start in range(0, rhs.shape[0], instruction):
+            if held is None and start % lhs_depth == 0:
+                left = (self._left(lhs.at[:, pl.ds(start, lhs_depth)]), start)
+            if start % rhs_depth == 0:
+                right = (plgpu.load(rhs.at[pl.ds(start, rhs_depth)], layout=self.rhs), start)
+            lhs_part = (held[:, start:start + instruction] if held is not None
+                        else left[0][:, start - left[1]:start - left[1] + instruction])
+            rhs_part = right[0][start - right[1]:start - right[1] + instruction]
+            acc = plgpu.mma(acc, lhs_part, rhs_part, m_warps=self.m_warps)
         return acc
 
     def registers_product(self, lhs: jax.Array, rhs, interpret: bool) -> jax.Array:
