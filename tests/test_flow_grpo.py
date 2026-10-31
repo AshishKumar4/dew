@@ -24,6 +24,7 @@ import optax
 import pytest
 from certified import assert_certified
 from flax import linen as nn
+from model_support import moved
 from one_draw import assert_as_exact_as_the_reference
 from recording import RecordingTracker
 from reference_error import (
@@ -477,10 +478,7 @@ def test_flow_rollout_groups_rewards_selects_steps_and_preserves_likelihoods():
     initial = FlowGRPOObjective(model, process, inputs, guidance=guidance, steps=7).init(jax.random.key(20))
     # The DiT starts with its output zeroed, which no condition moves; noise in
     # every weight lets a guided transition part from an unguided one.
-    leaves, tree = jax.tree.flatten(initial["params"])
-    noise = jax.random.split(jax.random.key(22), len(leaves))
-    params = jax.tree.unflatten(tree, [leaf + 0.1 * jax.random.normal(key, leaf.shape, leaf.dtype)
-                                       for leaf, key in zip(leaves, noise, strict=True)])
+    params = moved(initial["params"], jax.random.key(22), 0.1)
     objective = FlowGRPOObjective(model, process, inputs, guidance=guidance, steps=7,
                                   variables={**initial, "params": params})
 
@@ -987,10 +985,7 @@ def test_conditioned_prompt_only_evaluation_preview_and_trainer_consumers():
     untrained = FlowGRPOObjective(model, process, inputs, guidance=CFG(1.5), beta=0.1, steps=3).init(
         jax.random.key(100))
     # Noise in every weight, the zeroed output head's too, so the evaluation reads its prompts.
-    leaves, tree = jax.tree.flatten(untrained["params"])
-    noise = jax.random.split(jax.random.key(103), len(leaves))
-    params = jax.tree.unflatten(tree, [leaf + 0.1 * jax.random.normal(key, leaf.shape, leaf.dtype)
-                                       for leaf, key in zip(leaves, noise, strict=True)])
+    params = moved(untrained["params"], jax.random.key(103), 0.1)
     objective = FlowGRPOObjective(model, process, inputs, guidance=CFG(1.5), beta=0.1, steps=3,
                                   variables={**untrained, "params": params})
     rollout = FlowRollout(objective, lambda images, batch: images.mean((1, 2, 3)), groups=2, steps=3)

@@ -18,6 +18,9 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   is not Dew's: its prime bases per n-gram order, its seed and its multipliers bounded for int32.
 - A MoVA run saved while its value experts recorded their layer's dispatch loads again, and a trainer
   places a MoVA model's stacked value experts on the expert axis.
+- A compilation cache directory a run names after its process first compiled (`prepare_process`,
+  `trainer.compilation_cache_dir`, a second run in a notebook) holds the programs compiled after, where
+  JAX kept the first directory.
 - A decision run's summary states each question budget with where it came from beside the window's
   (`capacities["question"]`, `capacities["option"]`: stated, the release's, Laya's where a release
   states none, or whole), and a row a budget's cut refuses keeps that cut, which the run's data report
