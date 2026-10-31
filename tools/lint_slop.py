@@ -1894,7 +1894,8 @@ def detections(module: Module) -> Iterator[Finding]:
                           "the version that has it")
 
 
-GATE = frozenset({"tests/reference_error.py", "tests/op_certificates.py", "tests/certified.py",
+GATE = frozenset({"tests/reference_error.py", "tests/check1_statistics.py", "tests/op_certificates.py",
+                  "tests/certified.py",
                   "tests/reference_graph.py", "tests/reference_trees.py", "tests/residual_orders.py",
                   "tests/reference_ensemble.py",
                   "tests/selection_margins.py", "tests/test_selection_margins.py",
