@@ -7,6 +7,7 @@ incorrectly charged to a decision model.
 """
 
 import dataclasses
+import itertools
 import json
 import threading
 from pathlib import Path
@@ -101,13 +102,48 @@ def test_a_traced_program_counts_its_products_convolutions_scans_and_branches():
     assert traced_flops(scanned, shaped(4, 5), shaped(5, 5)) == 6 * 2 * 4 * 5 * 5
 
     def branched(x, w, v):
-        return jax.lax.cond(x.sum() > 0, lambda: x @ w @ v, lambda: x @ w)
+        return jax.lax.cond(x.sum() > 0, lambda: x @ w @ v, lambda: x @ w[:, :3])
 
     assert traced_flops(branched, shaped(4, 5), shaped(5, 6), shaped(6, 3)) == 2 * 4 * 5 * 6 + 2 * 4 * 6 * 3
     gradient = jax.grad(lambda w, x: jnp.sum(jax.nn.relu(x @ w)))
     assert traced_flops(gradient, shaped(5, 7), shaped(3, 5)) == 2 * (2 * 3 * 5 * 7)
     with pytest.raises(MissingFlopsCount):
         traced_flops(lambda x: jax.lax.while_loop(lambda c: c.sum() < 9, lambda c: c @ c, x), shaped(2, 2))
+
+
+def test_a_world_model_run_reports_its_updates_gradient_programs_work():
+    """A Dreamer run's train/flops is its update's work as the program differentiating its loss runs it, the
+    independent count of that program's products: the world model's forward and backward on the replayed
+    windows, the imagination's rollout without a backward through the stopped world model."""
+    import optax
+    from test_dreamer import tiny
+
+    from dew.objectives.base import Step
+    from dew.objectives.rl.dreamer import DreamerV3Objective
+    from dew.training import Trainer
+
+    rng = np.random.default_rng(0)
+    batch = {"observation": rng.normal(size=(3, 6, 1)).astype(np.float32),
+             "action": rng.uniform(-1, 1, (3, 6, 1)).astype(np.float32),
+             "reward": rng.normal(size=(3, 6)).astype(np.float32), "first": np.zeros((3, 6), bool),
+             "last": np.zeros((3, 6), bool), "terminal": np.zeros((3, 6), bool)}
+    objective = DreamerV3Objective(tiny())
+    variables = objective.init(jax.random.key(0))
+    step = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(0), ema=None)
+    rest = {name: value for name, value in variables.items() if name != "params"}
+
+    def gradient(params, rest, batch):
+        def loss(params):
+            return objective.scalar_loss({**rest, "params": params}, batch, step)[0]
+
+        return jax.grad(loss)(params)
+
+    tracker = RecordingTracker()
+    data = Loader(train=lambda partition: itertools.repeat(batch), val=None, records=3, batch=3)
+    trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(1), tracker=tracker)
+    trainer.fit(data, steps=2, log_every=2)
+    reported = next(scalars["train/flops"] for _, scalars in tracker.scalars if "train/flops" in scalars)
+    assert reported == forward_products(gradient, variables["params"], rest, batch)
 
 
 def test_integer_token_counts_carry_across_words_on_a_partitioned_batch():

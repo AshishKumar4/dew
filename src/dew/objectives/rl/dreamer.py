@@ -37,7 +37,7 @@ from flax import linen as nn, struct
 
 from dew.batch import Batch, Variables, merge, under
 from dew.nn.precision import at_least_fp32, divided
-from dew.objectives.base import Aux, EMASpec, Objective, Ratio, Shown, Step
+from dew.objectives.base import Aux, EMASpec, Objective, Ratio, Shown, Step, traced_update_flops
 from dew.objectives.rl.tssm import TSSM, Cache
 from dew.rl.distributions import (
     categorical_kl,
@@ -609,15 +609,13 @@ class DreamerV3Objective(Objective[Ratio]):
         held = deter if dynamics is None else dynamics.empty_cache(count, dynamics.context)
         return AgentMemory(held, stoch, jnp.zeros((count, self.model.action_size)))
 
-    def model_flops(self, model: object, batch: Batch) -> float:
-        """One update's forward work on `batch` (the world model on its windows, the actor and critic in
-        imagination): its loss's traced matrix products and convolutions (`dew.nn.flops.traced_flops`), the
-        trainer's MFU three times it."""
-        from dew.nn.flops import traced_flops
+    def model_flops(self, model, batch: Batch) -> float:
+        """One update's forward work on `batch`, its loss's traced program's (`traced_update_flops`)."""
+        return traced_update_flops(self, batch)[0]
 
-        variables = jax.eval_shape(self.init, jax.random.key(0))
-        step = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(0), ema=None)
-        return traced_flops(lambda variables, batch: self.loss(variables, batch, step), variables, batch)
+    def training_flops(self, model, batch: Batch) -> float:
+        """One update's work on `batch`, its loss's gradient's traced program's (`traced_update_flops`)."""
+        return traced_update_flops(self, batch)[1]
 
     def loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[Ratio, Aux]:
         world_key, imagine_key = jax.random.split(step.key)

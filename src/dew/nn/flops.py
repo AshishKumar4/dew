@@ -11,6 +11,8 @@ from collections.abc import Callable, Mapping, Sequence
 
 import numpy as np
 from flax import linen as nn
+from jax.core import ShapedArray
+from jax.extend import core as jaxpr_core
 
 from .protocols import Counted, CountedParameters
 
@@ -171,44 +173,61 @@ def ssd_flops(lengths: np.ndarray, heads: int, state: int, channels: int) -> flo
     return per_real_token(lengths, 4 * heads * state * channels)
 
 
-def traced_flops(function: Callable[..., object], *arguments: object) -> float:
+def traced_flops[**Arguments, Result](function: Callable[Arguments, Result], *arguments: Arguments.args,
+                                      **keywords: Arguments.kwargs) -> float:
     """The forward work of `function` on `arguments` (arrays, or their `jax.ShapeDtypeStruct`s): two FLOPs a
     multiply-add of every matrix product and convolution its traced program runs (`dot_general`,
     `conv_general_dilated`), a scan's body times its length, a branch's the costliest of them, and every
     nested program's (a jitted call's, a rematerialized one's, a custom derivative's primal). Pointwise work
     is excluded, as the analytical counts exclude it. For a model whose work no closed form here counts (a
-    world model's loss with its imagination). A while loop's trips are unknown to a trace: refused."""
+    world model's loss with its imagination). The program is traced as for a CPU, where every product is
+    one the jaxpr shows (a GPU's kernels are custom calls, whose products it does not), and of a platform's
+    choice (`jax.lax.platform_dependent`) the accelerator's branch counts, the model's own products (a
+    CPU's sums them wide, `dew.nn.precision`). A while loop's trips are unknown to a trace: refused."""
     import jax
 
-    return _program_flops(jax.jit(function).trace(*arguments).jaxpr.jaxpr)
+    from dew.nn.kernels.generation import assumed
+
+    with assumed("cpu"):
+        traced = jax.jit(function).trace(*arguments, **keywords)
+    return _program_flops(traced.jaxpr)
 
 
-def _program_flops(jaxpr: object) -> float:
-    """`traced_flops` of a jaxpr."""
+def _program_flops(program: jaxpr_core.Jaxpr | jaxpr_core.ClosedJaxpr) -> float:
+    """`traced_flops` of a program."""
     total = 0.0
-    for equation in jaxpr.eqns:  # type: ignore[attr-defined]
+    for equation in program.eqns:
         name = equation.primitive.name
         if name == "dot_general":
             (contracted, _), _ = equation.params["dimension_numbers"]
-            left = equation.invars[0].aval.shape
+            left = _shape(equation.invars[0])
             products = math.prod(left[axis] for axis in contracted)
-            total += 2 * math.prod(equation.outvars[0].aval.shape) * products
+            total += 2 * math.prod(_shape(equation.outvars[0])) * products
         elif name == "conv_general_dilated":
-            kernel = equation.invars[1].aval.shape
+            kernel = _shape(equation.invars[1])
             outputs = kernel[equation.params["dimension_numbers"].rhs_spec[0]]
-            total += 2 * math.prod(equation.outvars[0].aval.shape) * math.prod(kernel) / outputs
+            total += 2 * math.prod(_shape(equation.outvars[0])) * math.prod(kernel) / outputs
         elif name == "scan":
-            total += equation.params["length"] * _program_flops(equation.params["jaxpr"].jaxpr)
+            total += equation.params["length"] * _program_flops(equation.params["jaxpr"])
         elif name == "cond":
-            total += max(_program_flops(branch.jaxpr) for branch in equation.params["branches"])
+            branches = equation.params["branches"]
+            platforms = equation.params.get("branches_platforms")
+            if platforms is not None:
+                branches = [branches[next(index for index, names in enumerate(platforms)
+                                          if names is None or "cuda" in names)]]
+            total += max(_program_flops(branch) for branch in branches)
         elif name == "while":
             raise MissingFlopsCount("a while loop's trips are unknown to a traced count")
         else:
             for value in equation.params.values():
-                for program in value if isinstance(value, tuple | list) else (value,):
-                    # A closed program holds its jaxpr beside its constants; an open one is its equations.
-                    if hasattr(program, "consts") and hasattr(program, "jaxpr"):
-                        total += _program_flops(program.jaxpr)
-                    elif hasattr(program, "eqns"):
-                        total += _program_flops(program)
+                for nested in value if isinstance(value, tuple | list) else (value,):
+                    if isinstance(nested, jaxpr_core.Jaxpr | jaxpr_core.ClosedJaxpr):
+                        total += _program_flops(nested)
     return total
+
+
+def _shape(variable: jaxpr_core.Var | jaxpr_core.Literal) -> tuple[int, ...]:
+    """The shape of an operand of a product or a convolution, an array's."""
+    if not isinstance(variable.aval, ShapedArray):
+        raise MissingFlopsCount(f"a product's operand is no array ({variable.aval})")
+    return variable.aval.shape
