@@ -32,14 +32,16 @@ def hold_progress_lock() -> None:
     bars.get_lock()
 
 
-def split_files(paths: Sequence[str], split: str, config: Mapping[str, object] | None = None) -> list[str]:
+def split_files(paths: Sequence[str], split: str, config: Mapping[str, object] | None = None,
+                roots: Sequence[str] = ()) -> list[str]:
     """The `paths` of a repository listing that `datasets` gives `split`: of a configuration its card
     states (`config`), by its `data_files` patterns, else by `datasets`' default patterns
     (`datasets.data_files.get_data_patterns`), under its `data_dir` where it names one, as `datasets`
     reads a card's configuration (`datasets.load.create_builder_configs_from_metadata_configs`); resolved
     as it resolves a split's patterns (`DataFilesList.from_patterns`), over an empty in-memory copy of
     the listing: the listing itself, which the Hub answered once and offline replays, is all the
-    patterns read."""
+    patterns read. A pattern that names the listing by a URL of its root (`roots`) reads it there; one
+    that names a file elsewhere leaves the split none of the listing's."""
     from datasets.data_files import DataFilesList, get_data_patterns, sanitize_patterns
     from fsspec.implementations.memory import MemoryFileSystem
 
@@ -58,13 +60,26 @@ def split_files(paths: Sequence[str], split: str, config: Mapping[str, object] |
         # A listing with no data files at all is datasets' FileNotFoundError (EmptyDatasetError).
         files = stated.get("data_files")
         found = sanitize_patterns(files) if isinstance(files, (str, list, dict)) else get_data_patterns(base)
-        patterns = {str(name): list(each) for name, each in found.items()}
-        resolved = set(DataFilesList.from_patterns(patterns.get(split, []), base_path=base))
+        patterns = next((list(each) for name, each in found.items() if str(name) == split), [])
+        if any("://" in pattern and not pattern.startswith(tuple(roots)) for pattern in patterns):
+            return []
+        located = [next((f"memory://{root}/" + pattern.removeprefix(url) for url in roots
+                         if pattern.startswith(url)), pattern) for pattern in patterns]
+        resolved = set(DataFilesList.from_patterns(located, base_path=base))
     except FileNotFoundError:
         resolved = set()
     finally:
         fs.rm(root, recursive=True)
     return sorted(url.split(root + "/", 1)[1] for url in resolved)
+
+
+def conversion_layout(paths: Sequence[str]) -> bool:
+    """Whether a commit's listing is laid out as the Hub's Parquet conversion lays its files out
+    (refs/convert/parquet): no card, and each file but its `.gitattributes` a Parquet shard in a
+    directory of its split in a directory of its configuration (`<config>/<split>/<shard>.parquet`,
+    `partial-<split>` for a split converted in part: https://huggingface.co/docs/dataset-viewer/parquet)."""
+    files = [path for path in paths if path != ".gitattributes"]
+    return bool(files) and all(path.count("/") == 2 and path.endswith(".parquet") for path in files)
 
 
 @dataclass(frozen=True)
@@ -241,12 +256,12 @@ class Hub(Dataset):
 
         def stated() -> Mapping[str, Mapping[str, object]]:
             from datasets.utils.metadata import MetadataConfigs
-            from huggingface_hub import DatasetCardData, HfApi
-            from huggingface_hub.repocard import metadata_load
+            from huggingface_hub import DatasetCard, DatasetCardData, HfFileSystem
 
-            card = metadata_load(HfApi().hf_hub_download(self.repo, "README.md", repo_type="dataset",
-                                                         revision=revision)) or {}
-            configs = MetadataConfigs.from_dataset_card_data(DatasetCardData(**card))
+            # Read through the Hub's file system, which raises OfflineModeIsEnabled offline, as every
+            # Hub call does, so an answer recorded online replays (`hub_answer`).
+            card = DatasetCard(HfFileSystem().read_text(f"datasets/{self.repo}@{revision}/README.md"))
+            configs = MetadataConfigs.from_dataset_card_data(DatasetCardData(**card.data.to_dict()))
             return {name: {field: params[field] for field in ("data_files", "data_dir", "default")
                            if field in params} for name, params in configs.items()}
 
@@ -275,19 +290,20 @@ class Hub(Dataset):
         where the card states them, else its sharded names, its split keywords in file and directory
         names, `dev` for `validation` among them, a lone file as `train`). A commit whose card states no
         configuration holds the default one alone, and none of another name, which its Parquet
-        conversion may hold. The conversion (`converted`) holds each configuration's splits in a
-        directory of its name (`<config>/<split>/`, `partial-<split>` for a split converted in part:
-        https://huggingface.co/docs/dataset-viewer/parquet) and no card, its configurations those of
-        the card of the commit it converts, else its directories."""
+        conversion may hold. The conversion (`converted`, or a commit laid out as one: `conversion_layout`)
+        holds each configuration's splits in a directory of its name, its configurations those of the
+        card of the commit it converts, else its directories."""
         listed = self._listed(revision)
-        if converted:
-            configs = self._configurations(self.commit) or {
+        configs = self._configurations(revision)
+        if converted or (not configs and conversion_layout(listed)):
+            configs = (self._configurations(self.commit) if converted else {}) or {
                 path.split("/", 1)[0]: {} for path in listed if "/" in path}
             directory = self._configuration(configs) + "/"
             paths = [directory + path for path in split_files(
                 [path.removeprefix(directory) for path in listed if path.startswith(directory)], self.split)]
-        elif configs := self._configurations(revision):
-            paths = split_files(listed, self.split, configs[self._configuration(configs)])
+        elif configs:
+            roots = (f"hf://datasets/{self.repo}@{revision}/", f"hf://datasets/{self.repo}/")
+            paths = split_files(listed, self.split, configs[self._configuration(configs)], roots)
         else:
             paths = split_files(listed, self.split) if self.name in (None, "default") else []
         # Not Arrow: the `.arrow` files a dataset repo holds are what `save_to_disk` and
