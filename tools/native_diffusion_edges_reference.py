@@ -165,10 +165,12 @@ def reload_source(source, exported):
 def bundle(directory, destination):
     """Package the focused numeric oracles and tiny source UNet."""
     import tarfile
+
+    from diffusers_dc_ae_reference import unowned
     root = Path(directory)
     with tarfile.open(destination, "w:xz") as archive:
         for path in (root / "schedulers.npz", root / "unet_reference.npz", root / "unet"):
-            archive.add(path, arcname=path.name)
+            archive.add(path, arcname=path.name, filter=unowned)
 
 
 if __name__ == "__main__":

@@ -1882,6 +1882,17 @@ def test_the_data_benchmark_checks_the_device_timelines_idle_and_reports_the_hos
     assert checked == (None if timeline is None else timeline < 0.05)
 
 
+def test_a_data_scaling_receipt_names_no_directory_of_the_host_that_ran_it(tmp_path):
+    """The scaling receipt records its config's paths by their names outside the checkout (relative to it
+    within), so a receipt written on a CI host or a workstation names none of its directories (bible §2: a
+    receipt recorded /home/ci/work/... and /armada/task/... paths)."""
+    tool = load("benchmark_data")
+    tool.run_scaling(tool.Scaling(output=tmp_path / "scaling.json", work=tmp_path / "work", shards=2,
+                                  records=8, cycles=(1,), steps=2, warmup=0, batch=2, image_size=8))
+    config = json.loads((tmp_path / "scaling.json").read_text())["config"]
+    assert (config["output"], config["work"]) == ("scaling.json", "work")
+
+
 def test_the_data_benchmark_counts_a_grain_packing_and_dews_alike_as_the_objective_counts_them():
     """The data benchmark counts a batch's tokens and work as the run's objective counts them
     (`real_lengths`, `training_flops`), whichever packer laid the batch out: Grain's first-fit

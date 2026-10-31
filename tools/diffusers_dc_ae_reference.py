@@ -114,6 +114,14 @@ def build(config: dict, root: Path) -> dict[str, np.ndarray]:
     return arrays
 
 
+def unowned(info):
+    """A fixture archive's member with no owner: the user and group that wrote it are the writer's machine's, which
+    no published archive names (bible §2: seven fixtures named their writer's user). Every reference tool that
+    writes an archive passes it as `tarfile.add`'s filter."""
+    info.uid, info.gid, info.uname, info.gname = 0, 0, "", ""
+    return info
+
+
 def bundle(directory: str, destination: str) -> None:
     """Pack every entry of `directory`, the saved models and the recorded
     arrays, into the xz tarball `destination` for the suite. The diffusers
@@ -123,7 +131,7 @@ def bundle(directory: str, destination: str) -> None:
     root = Path(directory)
     with tarfile.open(destination, "w:xz") as archive:
         for path in sorted(root.iterdir()):
-            archive.add(path, arcname=path.name)
+            archive.add(path, arcname=path.name, filter=unowned)
     print(f"{destination}: {Path(destination).stat().st_size / 1e6:.2f} MB")
 
 

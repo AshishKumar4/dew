@@ -133,9 +133,11 @@ def bundle(root, destination):
     "tests/fixtures/tiny_diffusers.tar.xz"). No model downloads.
     """
     import tarfile
+
+    from diffusers_dc_ae_reference import unowned
     from tools.native_diffusion_reference_files import convert
     def native_files(info):
-        return None if info.name.endswith(".bin") else info
+        return None if info.name.endswith(".bin") else unowned(info)
     with tarfile.open(destination, "w:xz") as archive:
         for task in ("sd", "xl", "img2img", "inpaint", "xl-img2img", "xl-inpaint", "refiner", "safety"):
             directory = (Path(root) / task).resolve()

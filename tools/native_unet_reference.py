@@ -108,11 +108,13 @@ def widen(root):
 def bundle(root, destination):
     """Archive source-compatible checkpoint files and numerical oracle arrays."""
     import tarfile
+
+    from diffusers_dc_ae_reference import unowned
     with tarfile.open(destination, "w:xz") as archive:
         for case in ("sd1", "sd2", "sdxl-inpaint", "refiner"):
             directory = Path(root) / case
             convert(directory)
-            archive.add(directory, arcname=case)
+            archive.add(directory, arcname=case, filter=unowned)
 
 
 if __name__ == "__main__":
