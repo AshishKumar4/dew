@@ -1397,5 +1397,6 @@ def test_a_kernel_report_states_the_share_of_its_launches_tile_grids_their_tails
              (call(gemm, grouped, tile), 2.0), (KernelCall("triton", "plain", b"", "c", None), 1.0))
     padded = {entry["name"]: entry["padded"] for entry in KernelReport((), calls).record()["launches"]}
     assert padded == {"Gmm": None, "MosaicForward": 1 - 100 * 200 / (128 * 256), "plain": None}
-    dense_only = {entry["name"]: entry["padded"] for entry in KernelReport((), calls[:2]).record()["launches"]}
+    dense_only = {entry["name"]: entry["padded"]
+                  for entry in KernelReport((), calls[:2]).record()["launches"]}
     assert dense_only["Gmm"] == 1 - 200 * 300 / (256 * 512)
