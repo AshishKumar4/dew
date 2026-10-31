@@ -436,11 +436,19 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
     # place the algebra passes through (`algebra.Keys.accumulate`), a constant no loop may carry.
     state_rows = (row, head, pl.ds(first, tiles.block_q))
     live = None if guard is None else family.rows_of(guard.live.at[state_rows]) > 0
-    if hooked.initial is not None:
+
+    def initial_state():
+        assert hooked.initial is not None
         m0, total0, acc0 = hooked.initial
-        start = algebra.resumed(spec, family.rows_of(m0.at[state_rows]),
-                                family.rows_of(total0.at[state_rows]), family.tile_of(acc0.at[state_rows]),
-                                live=live)
+        return algebra.resumed(spec, family.rows_of(m0.at[state_rows]), family.rows_of(total0.at[state_rows]),
+                               family.tile_of(acc0.at[state_rows]), live=live)
+
+    # A plain inference walk starts empty and merges the initial state past its keys (`algebra.merge`): read
+    # before the walk, the state's rows held live across it beside its products and the walk spilled 296
+    # bytes at D128's 64 x 128 (the held-term census), where an empty start's are constants.
+    merged = hooked.initial is not None and guard is None and residuals is None
+    if hooked.initial is not None and not merged:
+        start = initial_state()
     else:
         # `algebra.started`'s empty state, in the family's layouts.
         start = algebra.Partial(family.zeros((tiles.block_q, value_width)),
@@ -497,6 +505,8 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
     # The slots its partner reads around its own, the turns it would have taken (`Family.walk_own`).
     state, trained = family.walk_own(streams, views, (lo, hi), streamed, consumer, walked,
                                      between=lambda: (turn(), turn()))
+    if merged:
+        state = algebra.merge(spec, initial_state(), state)
     if residuals is not None:
         # The split sums as the walk left them, shift 0 (`algebra.split_residuals`' plain walk).
         family.stored((state.acc,), (residuals.others,), smem=out_smem)
