@@ -21,6 +21,7 @@ from dew.objectives.rl.control import (
 )
 from dew.rl.env import Batched, TimeLimit, TimeStep, env_rollout, start
 from dew.rl.replay import ReplayBuffer
+from dew.rl.simulator import STACKED
 
 
 @struct.dataclass
@@ -309,23 +310,25 @@ def heads_home(params, observation, key, memory):
     return -0.5 * jnp.sign(observation), {"seen": observation}, None
 
 
+@pytest.mark.parametrize("steps", [11, 2 * STACKED + 3])
 @pytest.mark.parametrize("policy", [heads_home, pushes], ids=["settled", "drawn"])
-def test_a_simulator_outside_jax_rolls_out_as_its_env_does(policy):
+def test_a_simulator_outside_jax_rolls_out_as_its_env_does(policy, steps):
     """A simulator stepped from the host (`simulator_rollout`), its arrays crossing by DLPack and its
     ended episodes restarted before the next step, records what `env_rollout` records of the same walks
     as a JAX environment: the observations acted on, the actions and the policy's extras, every step's reward,
     terminal and cut flags and the observation each episode ended at, bit for bit. Where the policy
-    draws, each action is drawn from the key the rollout's carry hands it, a step's split of it."""
+    draws, each action is drawn from the key the rollout's carry hands it, a step's split of it. A rollout
+    longer than a record's stack (`STACKED`) records its steps in order across the stacks it joins."""
     from dew.rl.simulator import simulator_rollout, simulator_start
 
     env = Batched(TimeLimit(Settled(), episode_length=3), 5)
     simulator = HostWalks(5, 3)
     carry = simulator_start(simulator, jax.random.key(4))
-    ended, simulated = simulator_rollout(simulator, policy, None, carry, 11)
+    ended, simulated = simulator_rollout(simulator, policy, None, carry, steps)
 
     # The same walks in JAX, each action drawn from the key the simulator's rollout drew it from.
     state, observation, key = env.reset(jax.random.key(5))[0], carry.observation, carry.key
-    for index in range(11):
+    for index in range(steps):
         key, act_key = jax.random.split(key)
         action, extras, _ = policy(None, observation, act_key, None)
         state, following = env.step(state, action)

@@ -150,7 +150,20 @@ def simulator_rollout(simulator: Stepped, policy: Policy, params: Params, carry:
             observation = chosen(following.done, received(restarting.restart(following.done)), observation)
         recorded.append(Transition(carry.observation, action, extras, following))
         carry = Carry(None, observation, key, memory)
-    return carry, jax.tree.map(lambda *leaves: jnp.stack(leaves), *recorded)
+    return carry, _stacked(recorded)
+
+
+STACKED = 256
+"""The steps a rollout's record stacks at once (`_stacked`)."""
+
+
+def _stacked(transitions: list[Transition]) -> Transition:
+    """The steps' transitions stacked along a leading step axis, `STACKED` at a time and the stacks joined:
+    one stack of every step compiles a program as wide as the rollout is long (18,000 steps of a gate race
+    compiled for over twenty minutes), where these compile once for each width."""
+    stacks = [jax.tree.map(lambda *leaves: jnp.stack(leaves), *transitions[start:start + STACKED])
+              for start in range(0, len(transitions), STACKED)]
+    return stacks[0] if len(stacks) == 1 else jax.tree.map(lambda *parts: jnp.concatenate(parts), *stacks)
 
 
 class DrivenSimulator:
