@@ -57,7 +57,7 @@ def pictures():
     return TFDS("dew_images", path=str(IMAGES), split="all")
 
 
-def masked_images(batch: int = 4):
+def masked_images(batch: int = 8):
     """The run's images at SIZE with a mask drawn for each (`RandomMask`)."""
     return pictures().pipe(presets.images, SIZE, batch=batch, augment=image_steps.RandomMask())
 
@@ -89,7 +89,7 @@ def test_dew_train_trains_an_inpainting_pipeline_through_its_masks(inpainting, o
     assert built.inputs.mask is not None and built.inputs.mask.shape == (SIZE, SIZE, 1)
     loader, _ = run.compiled(built.data(), run.chain(), None)
     masks = np.asarray(next(iter(loader.train(DataPartition())))["mask"])
-    assert masks.shape == (4, SIZE, SIZE, 1) and set(np.unique(masks)) <= {0.0, 1.0}
+    assert masks.shape == (8, SIZE, SIZE, 1) and set(np.unique(masks)) <= {0.0, 1.0}
     assert len({mask.tobytes() for mask in masks}) > 1, "each image draws its own mask"
 
     record = tmp_path / "record"
@@ -115,7 +115,7 @@ def test_an_inpainting_run_over_a_chain_without_masks_is_refused(inpainting):
     """An inpainting pipeline paints the region its mask marks: over images that carry no mask the run
     is refused as it builds."""
     run = DiffusionRunConfig(pretrained=str(inpainting["ddim"]), preset=None, model=precision(),
-                             data=pictures().pipe(presets.images, SIZE, batch=4), val_metrics=(),
+                             data=pictures().pipe(presets.images, SIZE, batch=8), val_metrics=(),
                              objective=RUNS["diffusion"][1]["objective"])
     with pytest.raises(ValueError):
         run.build()
