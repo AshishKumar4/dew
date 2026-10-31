@@ -12,6 +12,39 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   in-memory file is checked against its digest as a read opens it; any other remote file, and an
   ArrayRecord shard, which its reader opens by path, is read whole into Dew's mirror and checked there.
   Declared Parquet on S3 or GCS reads through Dew's ranged reads rather than Arrow's own clients.
+- A streamed Hub split reads the files of the configuration it names, or of the default its card
+  states, as `datasets` resolves its card's `configs` (`data_files` under `data_dir`), and its Parquet
+  conversion reads that configuration's directory: naming none, where a card states several and marks
+  no default, is refused, as is naming one it does not state, where every configuration's split of
+  that name was read before.
+- MaxText's GPT-3 builds as a decoder: `scale_offset` on a `'layer'` norm stores its weight as its
+  offset from one (`dew.nn.norms.OffsetLayerNorm`), beside learned positions, biased attention and MLP
+  and tied logits; MaxText's Engram layer, from its bucket ids, is the PLE layer a decoder builds with
+  biased projections (`Engram.ple_bias`). Each is held to MaxText 0.2.5's run
+  (`tests/test_maxtext_gpt3.py`, `tests/test_maxtext_engram.py`). MaxText's hashing of tokens to buckets
+  is not Dew's: its prime bases per n-gram order, its seed and its multipliers bounded for int32.
+- A MoVA run saved while its value experts recorded their layer's dispatch loads again, and a trainer
+  places a MoVA model's stacked value experts on the expert axis.
+- A decision run's summary states each question budget with where it came from beside the window's
+  (`capacities["question"]`, `capacities["option"]`: stated, the release's, Laya's where a release
+  states none, or whole), and a row a budget's cut refuses keeps that cut, which the run's data report
+  counts beside the delivered rows' (`Rejected.cut`).
+- A schedule's saved position holds the committed tokens each finished stage ended at, and a resume
+  whose finished stage ends at other tokens is refused, where it read the next stage at once.
+- An audio tower (`HFAudio`, `AudioCondition`) takes a `revision`, reads its configuration and feature
+  extractor from one commit's files, and holds their hashes in its identity, so an extractor that moved
+  under the checkpoint's name re-keys the encoded audio.
+- A run whose optimizer holds its whole update back on some calls (`optax.MultiSteps`, or
+  `optax.apply_every` last in a chain) counts its update count, EMA, committed tokens and
+  `power_profiles`' averages by the updates the optimizer applies, as its state says, where it counted
+  every call; the tokens of a held call wait in the state (`TrainState.deferred`) for the update that
+  applies them, an input `MultiSteps`' skip predicate discards commits none, and each held call draws
+  its examples afresh. A held update whose state does not say which call applied one is refused before
+  any step, naming the composition and the supported one: `optax.apply_if_finite` (drop non-finite
+  steps with `Trainer(dynamic_scale=...)`), `optax.conditionally_mask` anywhere but under
+  `dew.held_updates.phased`, which says each update trains one of the networks it alternates (the
+  consistency objective's phases), and a held update within another, under a mask, partition or
+  condition, or before a later transform.
 - Muon's and M3's Newton-Schulz multiply in the run's numerics: bfloat16 operands in its fast forms
   (the default) and float32 at `Numerics.matmul` in its accurate ones (`--trainer.precision accurate`:
   IEEE float32), each matrix whole on one device and the matrices spread over the mesh. A run states its

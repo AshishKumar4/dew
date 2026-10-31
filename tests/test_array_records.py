@@ -5,6 +5,7 @@ import hashlib
 import os
 import pickle
 import threading
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from uuid import uuid4
@@ -150,9 +151,11 @@ def test_arrayrecords_keep_busy_readers_alive_during_eviction_or_close(
         return {opened.fd for opened in psutil.Process().open_files() if opened.path == real}
 
     def blocked_read(reader, index):
+        # The first reader by a weak reference, which neither keeps it alive nor names a later reader
+        # made at its address once it is freed.
         if not first_reader:
-            first_reader.append(id(reader))
-        held = id(reader) == first_reader[0]
+            first_reader.append(weakref.ref(reader))
+        held = first_reader[0]() is reader
         payload = underlying_read(reader, index)
         # A failed read's traceback must not keep the external reader alive after Dew closes it.
         del reader

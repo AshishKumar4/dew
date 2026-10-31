@@ -1,4 +1,4 @@
 {
- "commit": "0b4eb412b",
+ "commit": "794e70385",
  "written": "the lettered run of tests/test_decision_letters_context.py trained one step at this main (DecisionRunConfig, its question read in context, its option lines' stream named), its run.json (checkpoint_dir made relative) and its checkpoint's inference record"
 }

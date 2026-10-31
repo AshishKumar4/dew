@@ -56,7 +56,7 @@ ROWS: list[dict] = [
                    ("MaxText default", "qwen3-1gpu-a100/c6-775e68d9/maxtext-default.json",
                     "MaxText defaults: full remat, scanned layers, cuDNN flash; synthetic tokens, random init; "
                     "another A100 VM")],
-     "experiments": [("dew at 157bc21a", "qwen3-1gpu-a100/c7-d60c090a/dew-bf16.json",
+     "experiments": [("dew at 28a7ca1c", "qwen3-1gpu-a100/c7-d60c090a/dew-bf16.json",
                       f"{DEW_BF16}, the chunked head; Dew's VM in session c7"),
                      ("torch.compile in session c7", "qwen3-1gpu-a100/c7-d60c090a/torch-autocast-compile.json",
                       "the same torch setup on the c7 VM, torch 2.11"),
@@ -74,7 +74,7 @@ ROWS: list[dict] = [
      "hardware": "RTX 4080 16 GiB",
      "shape": "batch 2 x 1024 tokens, AdamW, 40 steps (25 timed, 5 profiled)",
      "dew": [("dew", "qwen3-1gpu-4080/4d392f0a/qwen3-b2-r1.json", f"{DEW_BF16}, cuDNN attention")],
-     "experiments": [("dew at e868862f", "qwen3-1gpu-4080/e868862f/dew-bf16-b2.json",
+     "experiments": [("dew at 3ea3b9f1", "qwen3-1gpu-4080/e868862f/dew-bf16-b2.json",
                       f"{DEW_BF16}; the placed weights left a hole, so the fit ladder tiled the head "
                       "and kept only the projections")],
      "reference": [("torch.compile", "qwen3-1gpu-4080/42ddfc14/torch-autocast-compile-b2.json",

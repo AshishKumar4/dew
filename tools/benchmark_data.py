@@ -696,7 +696,7 @@ def matrix_worker(config: Worker) -> dict:
             config.engine](config, objective, loading)
         opened = time.perf_counter() - started
         loader = loader_measure(factory, config, objective)
-        result = {"engine": config.engine, "workload": config.workload, "config": asdict(config),
+        result = {"engine": config.engine, "workload": config.workload, "config": recorded(config),
             "policy": policy, "cold_open_seconds": opened, "loader": loader,
             "loading": asdict(loading),
             "device": jax.devices()[0].device_kind,
@@ -763,6 +763,26 @@ def comparison(rows: list[dict]) -> list[dict]:
     return verdicts
 
 
+def named(path: Path) -> str:
+    """`path` as a receipt records it: relative to the checkout inside it, by its name outside it, so no
+    receipt names the directories of the host that ran it (bible §2)."""
+    root, whole = Path(__file__).resolve().parents[1], path.resolve()
+    return str(whole.relative_to(root)) if whole.is_relative_to(root) else path.name
+
+
+def recorded(config: object) -> dict:
+    """`config`'s fields as a receipt records them, each path `named`."""
+    return {name: named(value) if isinstance(value, Path) else value
+            for name, value in asdict(config).items()}
+
+
+def recorded_inputs(inputs: dict) -> dict:
+    """The matrix's inputs as its receipt records them, each file's path and each source `named`; the run
+    itself reads them where they are (`inputs.json`)."""
+    return {workload: {key: named(Path(value)) if key in ("path", "source") else value
+                       for key, value in facts.items()} for workload, facts in inputs.items()}
+
+
 def run_matrix(config: Matrix) -> None:
     config.work.mkdir(parents=True, exist_ok=True)
     root = Path(__file__).resolve().parents[1]
@@ -806,8 +826,8 @@ def run_matrix(config: Matrix) -> None:
         rows.append({**row, "cold": cold})
         result = {"schema": 1, "commit": subprocess.check_output(
             ["git", "rev-parse", "HEAD"], cwd=root, text=True).strip(),
-            "inputs": inputs, "rows": rows,
-            "comparisons": comparison(rows), "config": asdict(config)}
+            "inputs": recorded_inputs(inputs), "rows": rows,
+            "comparisons": comparison(rows), "config": recorded(config)}
         config.output.write_text(json.dumps(result, indent=2, default=str) + "\n")
         arm = f"{workload}/{engine}{' cold' if cold else ''}"
         print(f"{arm}: " + (f"exit {done.returncode}" if done.returncode else
@@ -859,7 +879,7 @@ def run_scaling(config: Scaling) -> None:
         rows.append({"cycle": cycle, **measured})
         print(f"cycle {cycle}: {measured['records_per_second']:.1f} rows/s", flush=True)
     base = rows[0]["records_per_second"]
-    config.output.write_text(json.dumps({"schema": 1, "config": asdict(config), "rows": rows, "speedup": {
+    config.output.write_text(json.dumps({"schema": 1, "config": recorded(config), "rows": rows, "speedup": {
         str(row["cycle"]): row["records_per_second"] / base for row in rows}}, indent=2, default=str) + "\n")
 
 
@@ -991,7 +1011,7 @@ def run_caching(config: Caching) -> None:
         timed("replay", root)
         shutil.rmtree(root)
         timed("fill", root)
-    result = {"schema": 1, "config": asdict(config), "host": platform.processor() or platform.machine(),
+    result = {"schema": 1, "config": recorded(config), "host": platform.processor() or platform.machine(),
               "cpus": os.cpu_count(), "seconds": rows}
     config.output.write_text(json.dumps(result, indent=2, default=str) + "\n")
     print(json.dumps(result, default=str), flush=True)
