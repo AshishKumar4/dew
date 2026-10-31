@@ -30,7 +30,7 @@ import contextlib
 import dataclasses
 import functools
 import os
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Hashable, Sequence
 from typing import Literal, overload
 
 import jax
@@ -420,12 +420,13 @@ def _contraction(product: Callable, preferred_element_type) -> tuple | None:
     while isinstance(function, functools.partial):
         arguments, keywords = function.args + arguments, {**function.keywords, **keywords}
         function = function.func
-    key = (function, arguments, tuple(sorted(keywords.items())), preferred_element_type)
-    try:
-        hash(key)
-    except TypeError:
+    bound = (arguments, keywords, preferred_element_type)
+    # Arrays among its arguments are no key; every other leaf (a subscript, a precision, a dtype) is one.
+    if function not in CONTRACTIONS or not all(
+            isinstance(leaf, Hashable) and not isinstance(leaf, jax.Array | np.ndarray)
+            for leaf in jax.tree.leaves(bound)):
         return None
-    return key if function in CONTRACTIONS else None
+    return function, arguments, tuple(sorted(keywords.items())), preferred_element_type
 
 
 @functools.cache
