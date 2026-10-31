@@ -804,8 +804,11 @@ def planned_failures(found: list, plans: dict) -> list[str]:
     from which the tiles are derived): the recurrence's shared-memory model, beside the register model the
     shared gate holds to ptxas (`kernel_compile.mosaic_failures`)."""
     def planned(record: dict, kernel: dict) -> int:
-        return max((launch.shared for launch in plans[record['name']]
-                    if kernel['kernel'].startswith(launch.name)), default=0)
+        # A kernel's launches the longest names that begin its own: `recurrence_intra_solve` is no
+        # `recurrence_intra`.
+        named = [launch for launch in plans[record['name']] if kernel['kernel'].startswith(launch.name)]
+        longest = max((len(launch.name) for launch in named), default=0)
+        return max((launch.shared for launch in named if len(launch.name) == longest), default=0)
 
     return [f"{record['name']} {kernel['kernel']}: {kernel['shared']} shared bytes past its plan's "
             f"{planned(record, kernel)}" for record in found for kernel in record.get('kernels', ())
@@ -828,6 +831,19 @@ def apart_failures(found: list, apart: dict) -> list[str]:
         failed += mosaic_failures([{**record, "kernels": admitted}])
         record["evidence"] = _register_evidence(record)
     return failed
+
+
+def test_a_kernel_is_held_to_its_own_launchs_plan_where_another_launchs_name_begins_its_own():
+    """`planned_failures` holds `recurrence_intra_solve` to its own launch's shared memory, not to the larger
+    plan of `recurrence_intra`, whose name begins its own, and `recurrence_intra` to its own."""
+    import types
+
+    plans = {"case": [types.SimpleNamespace(name="recurrence_intra", shared=200_000),
+                      types.SimpleNamespace(name="recurrence_intra_solve", shared=65_568)]}
+    found = [{"name": "case", "kernels": [{"kernel": "recurrence_intra_solve", "shared": 100_000},
+                                          {"kernel": "recurrence_intra", "shared": 150_000}]}]
+    failed = planned_failures(found, plans)
+    assert [failure.split(":")[0] for failure in failed] == ["case recurrence_intra_solve"]
 
 
 def _gated(target: str, group: tuple):

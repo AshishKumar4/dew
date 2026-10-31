@@ -661,6 +661,14 @@ def doubled(a, issue: Issue):
     return inverse
 
 
+def solved(system, issue: Issue):
+    """`(I + A)^-1 - I` `[C, C]` of a chunk's strictly lower system `A`: `doubled`'s inverse of `-A`, its unit
+    diagonal taken off after the last level, as `weighted` takes it (it adds the diagonal outside its
+    product)."""
+    rows, cols = _grid(system.shape)
+    return doubled(-system, issue) - jnp.where(rows == cols, 1.0, 0.0)
+
+
 def inverted(blocks: dict, issue: Issue, *, neighbours_first: bool = False) -> dict:
     """`(I + A)^-1`'s blocks `{(i, j): [SUB, SUB]}` for `j <= i` from `A`'s strictly lower blocks `blocks`
     (the diagonal ones strictly lower themselves): forward substitution inverts each diagonal block

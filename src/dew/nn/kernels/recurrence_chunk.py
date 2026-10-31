@@ -1395,22 +1395,20 @@ def _ssd_ported(x, dt, A, B, C, D, state, chunk_size: int, starts):
 @dataclasses.dataclass(frozen=True)
 class SelectiveCase:
     """A selective scan (Mamba's, `dew.nn.mixers.mamba.selective_scan`) as its selector reads it
-    (`SELECTIVE`): whether a shard_map that checks varying axes holds its operands, its operands' dtype,
-    its tokens, channels and states, its device's instruction family (None off a GPU) and the
-    `product`."""
+    (`SELECTIVE`): whether a shard_map that checks varying axes holds its operands, its operands' dtype and
+    its states' rows' narrower one (B's or C's, which stream each in its own: the narrower's rows are the
+    shorter), its tokens, channels and states, whether the run's forms are the fast ones (`mamba_rounding`),
+    its device's instruction family (None off a GPU) and the `product`."""
 
     varying: bool
     dtype: np.dtype
+    state_dtype: np.dtype
     length: int
     channels: int
     states: int
+    fast: bool
     family: str | None = None
     product: str = 'forward'
-
-    @property
-    def cell(self) -> tuple[str | None, str]:
-        """The call's cell, its device's instruction family and its product (`SELECTIVE_CELLS`)."""
-        return self.family, self.product
 
 
 SELECTIVE_CHUNK = 32
@@ -1441,50 +1439,44 @@ SELECTIVE_SUPPORTS: tuple[Requirement[SelectiveCase], ...] = (
     Requirement('states', lambda case: case.states <= SELECTIVE_STATES,
                 lambda case: f"{case.states} states, past the {SELECTIVE_STATES} a thread's registers hold "
                              "three times", row='ledger 1300'),
-    Requirement('state rows', lambda case: case.states * case.dtype.itemsize % COPY_BYTES == 0,
-                lambda case: f"{case.states} states of {case.dtype}, a B or C row of no whole number of a "
-                             f"bulk copy's {COPY_BYTES} bytes, which its streams copy unpadded",
+    Requirement('state rows', lambda case: case.states * case.state_dtype.itemsize % COPY_BYTES == 0,
+                lambda case: f"{case.states} states of {case.state_dtype}, a B or C row of no whole number "
+                             f"of a bulk copy's {COPY_BYTES} bytes, which its streams copy unpadded",
                 row='ledger 1300'),
     Requirement('tokens', lambda case: case.length >= SELECTIVE_CHUNK,
                 lambda case: f"{case.length} tokens, fewer than a chunk of {SELECTIVE_CHUNK}: a decode "
                              "step's scan, the portable math's own steps", row=INHERENT, kind='handoff'),
+    Requirement('strided copies', lambda case: case.family != 'mma.sync',
+                "mma.sync's streams copy a channel block untiled by cp.async, which jax 0.12.0.1.post41 "
+                "addresses at the block's width, not its row's stride, reading the wrong rows "
+                "(cp-async-alone4-h100-3674febe1's unfixed run; the jax fork's fix ships in post42)",
+                row='ledger 1300'),
+    Requirement('forms', lambda case: case.fast,
+                "the run's accurate forms, whose sums the portable math compensates (row 1698); the template "
+                "sums at mamba_ssm's rounding, the fast forms' bar", row='ledger 2968', kind='measured'),
+    Requirement('qualified', lambda case: case.family == 'wgmma',
+                "the template's selective scan held to recorded mamba_ssm's distance from float64 on an H100 "
+                "alone (selective-recorded2-h100-497ea24e7), not on this GPU", row='ledger 2968',
+                kind='measured'),
 )
 """What the template's selective scan (`templates.recurrence.selective`) needs of a call: no caller's
 `shard_map` that checks varying axes, a GPU of a family its bundles cover, 16-bit or fp32 operands, whole
-blocks of channels, at most `SELECTIVE_STATES` states, and a chunk's tokens at least (a decode step hands
-off to the portable math)."""
-
-_STRIDED_CP_ASYNC = ("mma.sync's streams copy a block untiled by cp.async, which jax 0.12.0.1.post40 "
-                     "addresses at the block's width, not its row's stride: a channel block of a wider "
-                     "row read the wrong rows (cp-async-alone4-h100-3674febe1, before the fix the jax fork "
-                     "ships in post42)")
-
-_UNGATED = ("the template's selective scan has no gate of its own yet: no per-shard lowering, no mixer "
-            "parity at the mixer's fp32 operands, no GPU cell, no stability regimes (row 2968)")
-
-SELECTIVE_CELLS: dict[tuple[str | None, str], tuple[str, str]] = {
-    ('mma.sync', 'forward'): ('xla', _STRIDED_CP_ASYNC),
-    ('mma.sync', 'training'): ('xla', _STRIDED_CP_ASYNC),
-    ('wgmma', 'forward'): ('xla', _UNGATED),
-    ('wgmma', 'training'): ('xla', _UNGATED),
-}
-"""The cells, each an instruction family and a product (`SelectiveCase.cell`), where the selective scan
-runs the portable math though the template takes the call, each with its reason: the selector runs
-the portable math on them (`Op.declared`)."""
+blocks of channels, at most `SELECTIVE_STATES` states, a chunk's tokens at least (a decode step hands off
+to the portable math), no untiled strided copies (an A100's, until post42), the run's fast forms, and its
+qualification against recorded mamba_ssm on the GPU's family: on an H100 the template is as exact as
+mamba_ssm in every recorded case (tests/test_gpu_recurrence.py)."""
 
 SELECTIVE: Op[SelectiveCase] = Op('selective_scan', (Kernel('mosaic_gpu', SELECTIVE_SUPPORTS),
-                                                     Kernel('xla', (), generic=True)),
-                                  declared=SELECTIVE_CELLS)
+                                                     Kernel('xla', (), generic=True)))
 """The selective scan's selector: the recurrence template's scan (`templates.recurrence.selective`) where
-it takes the call, off a declared cell (`SELECTIVE_CELLS`), else the portable math. On an H100 the
-template's forward took 0.759 ms at 8x2048x5120 against mamba_ssm's 1.322, its training step 19.79 ms
-against mamba_ssm's 7.21 (mamba1-two-h100-e3b43f7d6)."""
+it takes the call, else the portable math. On an H100 the template's training step took 6.82 ms at
+8x2048x5120 against mamba_ssm's 7.21 (mamba1-scan2-h100-ac0dc3a9b)."""
 
 
-def selective_kernel(x, A, *, product: str = 'forward', report: bool = True) -> str:
+def selective_kernel(x, A, B, C, *, product: str = 'forward', report: bool = True) -> str:
     """The kernel the selective scan's selector (`SELECTIVE`) gives a scan over `x` `[B, S, D]` with rates
-    `A` `[D, N]` for `product` ('forward', 'training'), on the target: reported as its route, or not where
-    not `report`."""
+    `A` `[D, N]` and states' rows `B`, `C` `[B, S, N]` for `product` ('forward', 'training'), on the
+    target: reported as its route, or not where not `report`."""
     from .templates import bundles
 
     # A GPU's family where a bundle claims it (consumer Blackwell's and tcgen05's have none yet).
@@ -1492,8 +1484,10 @@ def selective_kernel(x, A, *, product: str = 'forward', report: bool = True) -> 
     bundled = on_gpu and bundles.of(generation.device_generation(), x.dtype) is not None
     family = generation.family(generation.device_generation()) if bundled else None
     case = SelectiveCase(varying=bool(jax.typeof(x).mat.varying), dtype=jnp.dtype(x.dtype),
-                         length=x.shape[1], channels=x.shape[-1], states=A.shape[-1], family=family,
-                         product=product)
+                         state_dtype=min(jnp.dtype(jnp.result_type(B)), jnp.dtype(jnp.result_type(C)),
+                                         key=lambda dtype: dtype.itemsize),
+                         length=x.shape[1], channels=x.shape[-1], states=A.shape[-1], fast=mamba_rounding(),
+                         family=family, product=product)
     return select(SELECTIVE, case).kernel if report else selected(SELECTIVE, case).name
 
 
@@ -1524,5 +1518,5 @@ def selective_scan(x, dt, A, B, C, D, state, starts, *, portable: Callable):
         specs = (three, three, P(None, None), three, three, P(None), three, P(rows, None))
         return manual_map(template, specs[:len(operands)], (three, three))(*operands)
 
-    return _per_product(lambda product: selective_kernel(x, A, product=product), run, x, dt, A, B, C, D,
+    return _per_product(lambda product: selective_kernel(x, A, B, C, product=product), run, x, dt, A, B, C, D,
                         state)
