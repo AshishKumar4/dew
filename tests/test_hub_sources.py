@@ -632,21 +632,23 @@ another (`data_dir`), its files of one language among two."""
 
 def carded_hub(monkeypatch, directory: Path, card: str, listings: dict[str, list[str]]):
     """A repository at commit `original` whose card is `card`, each revision listing its own files
-    (`listings`), its Parquet conversion at `converted`."""
+    (`listings`), its Parquet conversion at `converted`, which `refs/convert/parquet` names."""
     from types import SimpleNamespace
 
-    from huggingface_hub import HfApi
+    from huggingface_hub import HfApi, HfFileSystem
     from huggingface_hub.hf_api import GitRefInfo, GitRefs
 
     (directory / "README.md").write_text(card)
     conversion = GitRefInfo(name="parquet", ref="refs/convert/parquet", target_commit="converted")
-    monkeypatch.setattr(HfApi, "dataset_info", lambda self, repo, **kwargs: SimpleNamespace(sha="original"))
+    commits = {None: "original", "refs/convert/parquet": "converted"}
+    monkeypatch.setattr(HfApi, "dataset_info", lambda self, repo, revision=None, **kwargs: SimpleNamespace(
+        sha=commits.get(revision, revision)))
     monkeypatch.setattr(HfApi, "list_repo_files",
                         lambda self, repo, *, repo_type, revision: listings[revision])
     monkeypatch.setattr(HfApi, "list_repo_refs",
                         lambda self, repo, **kwargs: GitRefs(branches=[], converts=[conversion], tags=[]))
-    monkeypatch.setattr(HfApi, "hf_hub_download", lambda self, repo, filename, *, repo_type, revision: str(
-        directory / filename))
+    monkeypatch.setattr(HfFileSystem, "_open", lambda self, path, mode="rb", **options: io.BytesIO(
+        (directory / Path(path).name).read_bytes()))
     stated_shards(monkeypatch)
 
 
@@ -665,7 +667,6 @@ def test_a_hub_split_reads_the_files_of_the_configuration_its_card_states(tmp_pa
     it. Naming none where the card states several and marks no default, or naming one it does not state,
     is refused, as `datasets` refuses both. Offline, the split reads the files it read online."""
     from hub_support import offline
-    from huggingface_hub import HfApi
 
     from dew.data.sources import Hub
 
@@ -681,8 +682,6 @@ def test_a_hub_split_reads_the_files_of_the_configuration_its_card_states(tmp_pa
         return
     assert source.files.url == tuple(f"hf://datasets/owner/carded@original/{path}" for path in expected)
     offline(monkeypatch)
-    # The card unreachable too, as the Hub's every other answer is.
-    monkeypatch.setattr(HfApi, "hf_hub_download", HfApi.list_repo_files)
     assert Hub("owner/carded", name=name).files.url == source.files.url
 
 
@@ -710,4 +709,54 @@ def test_a_hub_splits_parquet_conversion_reads_its_configurations_directory(tmp_
             _ = source.files
         return
     assert source.files.url == (f"hf://datasets/owner/converted@converted/{expected}",)
+
+
+@pytest.mark.parametrize("revision", ["refs/convert/parquet", "converted"])
+@pytest.mark.parametrize("name, expected", [("cola", "cola/train/0000.parquet"), (None, None)],
+                         ids=["named", "several-unnamed"])
+def test_a_split_pinned_to_its_parquet_conversion_reads_its_configurations_directory(tmp_path, monkeypatch,
+                                                                                    revision, name, expected):
+    """A split pinned to the Hub's Parquet conversion, by its ref or its commit, reads the named
+    configuration's directory, never every configuration's split of that name; naming none where it
+    holds several is refused, as its listing, which holds no card, marks none the default."""
+    from dew.data.sources import Hub
+
+    carded_hub(monkeypatch, tmp_path, CARD, {
+        "converted": ["cola/train/0000.parquet", "cola/validation/0000.parquet", "wiki/train/0000.parquet"]})
+    source = Hub("owner/converted", name=name, revision=revision)
+    if expected is None:
+        with pytest.raises(ValueError):
+            _ = source.files
+        return
+    assert source.files.url == (f"hf://datasets/owner/converted@converted/{expected}",)
+
+
+@pytest.mark.parametrize("pattern, expected", [
+    ("hf://datasets/owner/carded/cola/train-*", "cola/train-00000-of-00001.parquet"),
+    ("hf://datasets/owner/carded@original/cola/train-*", "cola/train-00000-of-00001.parquet"),
+    ("hf://datasets/someone/else/train-*", None),
+], ids=["its-repository", "its-commit", "elsewhere"])
+def test_a_cards_pattern_naming_its_repository_by_url_reads_the_commits_listing(tmp_path, monkeypatch,
+                                                                                pattern, expected):
+    """A configuration whose card names its files by a URL of the repository, at its commit or none,
+    reads them from the commit's listing, with no file system the listing is not; one naming files of
+    another repository holds none of this commit's, so the split streams none of its files."""
+    from huggingface_hub import HfFileSystem
+
+    from dew.data.sources import Hub
+
+    def walked(*args, **options):
+        raise AssertionError("the Hub's file system walked")
+
+    card = f"---\nconfigs:\n- config_name: cola\n  data_files:\n  - split: train\n    path: {pattern}\n---\n"
+    carded_hub(monkeypatch, tmp_path, card, {
+        "original": ["README.md", "cola/train-00000-of-00001.parquet", "mnli/train-00000-of-00001.parquet"],
+        "converted": []})
+    monkeypatch.setattr(HfFileSystem, "glob", walked)
+    source = Hub("owner/carded", name="cola")
+    if expected is None:
+        with pytest.raises(FileNotFoundError):
+            _ = source.files
+        return
+    assert source.files.url == (f"hf://datasets/owner/carded@original/{expected}",)
 
