@@ -441,6 +441,21 @@ def _read_causal_lm(view: PartView) -> Mapping[str, object]:
     return {}
 
 
+def _read_scaled_causal_lm(view: PartView) -> Mapping[str, object]:
+    """Granite's head: Llama's, its logits divided by the config's `logits_scaling`."""
+    return {**_read_causal_lm(view), 'logits_scaling': float(view.config.logits_scaling)}
+
+
+def _read_scaled_model(view: PartView) -> Mapping[str, object]:
+    """Granite's model: Llama's, its embeddings times its `embedding_multiplier`."""
+    return {**_read_llama_model(view), 'embedding_multiplier': float(view.embedding_multiplier)}
+
+
+def _read_scaled_layer(view: PartView) -> Mapping[str, object]:
+    """Granite's layer: Llama's, each sublayer's output times its `residual_multiplier` into the residual."""
+    return {'residual_multiplier': float(view.residual_multiplier)}
+
+
 def _read_llama_model(view: PartView) -> Mapping[str, object]:
     layers = len(view.layers)
     if view.config.num_hidden_layers != layers:
@@ -498,6 +513,12 @@ def _read_qk_norm_attention(view: PartView) -> Mapping[str, object]:
     """Qwen3's attention: Llama's with an RMSNorm over each head's queries and keys (`q_norm`, `k_norm`,
     read as norms like the block's)."""
     return {**_read_attention(view), 'qk_norm': True}
+
+
+def _read_nope_attention(view: PartView) -> Mapping[str, object]:
+    """SmolLM3's attention: Llama's, rotating its queries and keys only where `use_rope` (each fourth layer
+    attends without positions, `no_rope_layers`), a per-layer fact `assemble` makes a kind of."""
+    return {**_read_attention(view), _LAYER: {'nope': not bool(view.use_rope)}}
 
 
 def _read_mlp(view: PartView) -> Mapping[str, object]:
@@ -584,6 +605,8 @@ _QWEN3_MOE = 'transformers.models.qwen3_moe.modeling_qwen3_moe'
 _GEMMA = 'transformers.models.gemma.modeling_gemma'
 _MISTRAL = 'transformers.models.mistral.modeling_mistral'
 _QWEN2 = 'transformers.models.qwen2.modeling_qwen2'
+_GRANITE = 'transformers.models.granite.modeling_granite'
+_SMOLLM3 = 'transformers.models.smollm3.modeling_smollm3'
 Children = Mapping[str, tuple[str, ...]]
 _MODEL_CHILDREN: Children = {'embed_tokens': ('embedding',), 'layers': ('layers',), 'norm': ('norm',),
                              'rotary_emb': ('rotary',)}
@@ -596,16 +619,21 @@ KNOWN: tuple[KnownPart, ...] = (
          _read_causal_lm),
     KnownPart('causal_lm', f'{_MIXTRAL}:MixtralForCausalLM', {'model': ('model',), 'lm_head': ('linear',)},
          _read_causal_lm),
+    KnownPart('causal_lm', f'{_GRANITE}:GraniteForCausalLM', {'model': ('model',), 'lm_head': ('linear',)},
+              _read_scaled_causal_lm),
     KnownPart('model', f'{_LLAMA}:LlamaModel', _MODEL_CHILDREN, _read_llama_model),
+    KnownPart('model', f'{_GRANITE}:GraniteModel', _MODEL_CHILDREN, _read_scaled_model),
     KnownPart('model', f'{_MIXTRAL}:MixtralModel', _MODEL_CHILDREN, _read_windowed_model),
     KnownPart('model', f'{_GEMMA}:GemmaModel', _MODEL_CHILDREN, _read_llama_model),
     KnownPart('model', f'{_MISTRAL}:MistralModel', _MODEL_CHILDREN, _read_windowed_model),
     KnownPart('model', f'{_QWEN2}:Qwen2Model', _MODEL_CHILDREN, _read_layer_typed_model),
     KnownPart('layer', f'{_LLAMA}:LlamaDecoderLayer', _LAYER_CHILDREN, _read_nothing),
     KnownPart('layer', f'{_MIXTRAL}:MixtralDecoderLayer', _LAYER_CHILDREN, _read_nothing),
+    KnownPart('layer', f'{_GRANITE}:GraniteDecoderLayer', _LAYER_CHILDREN, _read_scaled_layer),
     KnownPart('attention', f'{_LLAMA}:LlamaAttention', _ATTENTION_CHILDREN, _read_attention),
     KnownPart('attention', f'{_MIXTRAL}:MixtralAttention', _ATTENTION_CHILDREN, _read_attention),
     KnownPart('attention', f'{_QWEN2}:Qwen2Attention', _ATTENTION_CHILDREN, _read_attention),
+    KnownPart('attention', f'{_SMOLLM3}:SmolLM3Attention', _ATTENTION_CHILDREN, _read_nope_attention),
     KnownPart('attention', f'{_QWEN3}:Qwen3Attention',
          {**_ATTENTION_CHILDREN, 'q_norm': ('norm',), 'k_norm': ('norm',)}, _read_qk_norm_attention),
     KnownPart('mlp', f'{_LLAMA}:LlamaMLP', dict.fromkeys(('gate_proj', 'up_proj', 'down_proj'), ('linear',)),
@@ -780,7 +808,7 @@ def assemble(model: PreTrainedModel) -> Assembly:
     routed = sorted(layer for layer, facts in assembler.layers.items() if facts.get('routed'))
     if routed:
         routes = {tuple(sorted((key, value) for key, value in assembler.layers[layer].items()
-                               if key != 'routed')) for layer in routed}
+                               if key not in ('routed', 'nope'))) for layer in routed}
         if len(routes) != 1:
             raise Ambiguous("the routed layers route differently")
         mixture = dict(routes.pop())
@@ -795,6 +823,8 @@ def assemble(model: PreTrainedModel) -> Assembly:
                      'rope_theta'):
         if required not in fields:
             raise Ambiguous(f"no part states {required}")
+    unrotated = sorted(layer for layer, facts in assembler.layers.items() if facts.get('nope'))
+    _without_positions(fields, unrotated)
     capacity, context = decoder_parts.context_lengths(
         {'max_position_embeddings': model.config.to_dict().get('max_position_embeddings')})
     fields.update(max_seq_len=capacity, context_length=context)
@@ -803,6 +833,25 @@ def assemble(model: PreTrainedModel) -> Assembly:
     record['kinds'] = kinds
     return Assembly(record, assembler.names, tuple(dict.fromkeys(assembler.packed)), (head, table),
                     tuple(assembler.dropouts))
+
+
+def _without_positions(fields: dict[str, object], layers: list[int]) -> None:
+    """Each of `layers` (the ones whose attention rotates nothing, SmolLM3's NoPE layers) as a kind of its
+    own beside its layer type's, its attention taking no positions, as Llama 4's NoPE layers do."""
+    if not layers:
+        return
+    count = _records.integer(fields['num_layers'], 'num_layers')
+    types = list(fields.get('layer_types') or ('full_attention',) * count)
+    kinds = dict(_records.record(fields.get('kinds', {}), 'kinds'))
+    for layer in layers:
+        stated = types[layer]
+        unrotated = f'{stated}_nope'
+        if unrotated not in kinds:
+            kind = dict(_records.record(kinds.get(stated) or native_fields(LayerKind)(), stated))
+            kind['mixer'] = {'class': 'attention', 'fields': {'nope': True}}
+            kinds[unrotated] = kind
+        types[layer] = unrotated
+    fields['layer_types'], fields['kinds'] = tuple(types), kinds
 
 
 def _fused_experts(module: str, view: PartView) -> tuple[decoder_parts.Packed, ...]:
