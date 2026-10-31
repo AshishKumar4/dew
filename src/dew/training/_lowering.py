@@ -141,10 +141,12 @@ def _trips(loop: ir.Operation) -> float:
     kind = ir.RankedTensorType(counter.type).element_type.maybe_downcast()
     if limit is None or start is None or step is None or not isinstance(kind, ir.IntegerType):
         return math.inf
-    # A compare states its type's signedness; one that states none compares signed, StableHLO's default.
+    # A compare states its type's signedness; one that states none (or NOTYPE) compares as its operands'
+    # type is, an unsigned integer's unsigned and a signless or signed one's signed.
     stated = "compare_type" in compare.attributes and stablehlo.ComparisonTypeAttr(
         compare.attributes["compare_type"]).value
-    return counted_trips(start, limit, step, kind.width, signed=stated != "UNSIGNED")
+    unsigned = stated == "UNSIGNED" or (stated in (False, "NOTYPE") and kind.is_unsigned)
+    return counted_trips(start, limit, step, kind.width, signed=not unsigned)
 
 
 def _terminator(block: ir.Block) -> ir.Operation:
