@@ -122,7 +122,7 @@ Each setting's default is the recipe's own, which can differ from the configurat
 |---|---|
 | `--model.dtype` | The model's compute dtype, which each recipe's default model states. Parameters are stored in float32. A run-wide matmul precision is `jax.default_matmul_precision`; a model's own is `--model.precision`. |
 | `--model.attention-impl` | A name `AttentionImpl` declares ([dew/nn/attention.py](../src/dew/nn/attention.py)). The example uses `reference` so no device-specific kernel runs. |
-| `--optim.optimizer` | `adam`, `adamw`, `lamb`, `muon` or `muonclip`. |
+| `--optim.optimizer` | `adam`, `adamw`, `lamb`, `muon`, `muonclip` or `laprop`. |
 | `--optim.learning-rate` | The learning rate: a number, or a schedule's record as JSON (`'{"class": "cosine", "fields": {...}}'`). |
 | `--optim.state-dtype` | `bfloat16` stores Adam's moments stochastically rounded, and `int8` stores them blockwise in 8 bits, for `adam` and `adamw` only. |
 | `--trainer.steps` / `--trainer.epochs` | Run length; set one, not both. |

@@ -50,6 +50,7 @@ from dew.optim import (
     PowerTail,
     ScheduleBase,
     clips_qk,
+    laprop,
     learning_rate,
     muon_partition,
     muon_weight_dimension_numbers,
@@ -1233,6 +1234,79 @@ def test_a_configured_optimizer_is_optaxs_own_at_the_rate_its_state_holds(optimi
         for have, want in zip(jax.tree.leaves(updates), jax.tree.leaves(expected), strict=True):
             np.testing.assert_array_equal(np.asarray(have), np.asarray(want))
         params = optax.apply_updates(params, updates)
+
+
+def dreamerv3_updates(params, gradients, rate, *, agc=0.3, eps=1e-20, beta1=0.9, beta2=0.999):
+    """Each step's update of every parameter by DreamerV3's optimizer on `gradients` (a dict of arrays a
+    step), written out in NumPy float64 as its code does (embodied/jax/opt.py:109-164, agent.py:342-379):
+    adaptive gradient clipping to `agc` of each parameter's norm (at least 1e-3), the gradient over the
+    root of its bias-corrected mean square plus `eps`, the bias-corrected momentum of that, and minus
+    `rate(step)` times it, the rate read from step 0. `agc` 0 clips nothing."""
+    nu = {name: np.zeros_like(value) for name, value in params.items()}
+    mu = {name: np.zeros_like(value) for name, value in params.items()}
+    steps = {name: [] for name in params}
+    for step, gradient in enumerate(gradients, start=1):
+        for name, param in params.items():
+            update = gradient[name]
+            if agc:
+                upper = agc * max(1e-3, np.linalg.norm(param.ravel()))
+                update = update * (1 / max(1.0, np.linalg.norm(update.ravel()) / upper))
+            nu[name] = beta2 * nu[name] + (1 - beta2) * (update * update)
+            update = update / (np.sqrt(nu[name] / (1 - beta2 ** step)) + eps)
+            mu[name] = (1 - beta1) * update + beta1 * mu[name]
+            steps[name].append(-rate(step - 1) * (mu[name] / (1 - beta1 ** step)))
+    return {name: np.stack(values) for name, values in steps.items()}
+
+
+def test_laprop_is_dreamerv3s_optimizer_and_a_run_config_names_it():
+    """`laprop` steps as DreamerV3's optimizer does (embodied/jax/opt.py:109-164, agent.py:342-379): over
+    1,002 updates on gradients of changing scale, so that its adaptive clip binds at some and not at others,
+    at the code's rate (4e-5 ramped linearly from zero over 1,000 updates), a matrix, a vector and a bias
+    at zero (held to the clip's floor) take updates within float64 rounding of the code's clip, mean
+    square and momentum written out in NumPy. `OptimConfig(optimizer="laprop")` builds it, its betas,
+    `eps` and `agc` the config's and its rate the configured schedule's, a clip of 0 leaving the updates
+    whole; a weight decay, which it has none of, is refused."""
+    rng = np.random.default_rng(21)
+    params = {"kernel": rng.normal(size=(3, 4)), "vector": rng.normal(size=5), "bias": np.zeros(4)}
+
+    def drawn(steps):
+        scales = np.tile([0.1, 3.0, 0.5, 2.0, 0.02, 1.5], steps // 6 + 1)[:steps]
+        return [{name: scale * rng.normal(size=value.shape) for name, value in params.items()}
+                for scale in scales]
+
+    def run(solver, gradients):
+        """`solver`'s updates `[steps, ...]` of each parameter over `gradients` in float64, and the
+        roundings the longest chain of its program goes through."""
+        held = jax.tree.map(jnp.asarray, params)
+        stacked = jax.tree.map(lambda *steps: jnp.stack(steps), *gradients)
+
+        def scanned(stacked):
+            def step(state, gradient):
+                update, state = solver.update(gradient, state, held)
+                return state, update
+
+            return jax.lax.scan(step, solver.init(held), stacked)[1]
+
+        found = jax.tree.map(np.asarray, jax.jit(scanned)(stacked))
+        return found, chain_roundings(jax.make_jaxpr(scanned)(stacked))
+
+    long, short = drawn(1002), drawn(12)
+    with jax.enable_x64(new_val=True):
+        own = run(laprop(), long)
+        config = OptimConfig(optimizer="laprop", b1=0.85, b2=0.99, optimizer_opts={"eps": 1e-6, "agc": 0},
+                             learning_rate=Linear(peak_value=3e-3, warmup_steps=4, end_value=3e-3))
+        configured = run(config.build(len(short)), short)
+    truths = [
+        (own, dreamerv3_updates(params, long, lambda count: 4e-5 * min(count, 1000) / 1000)),
+        (configured, dreamerv3_updates(params, short, lambda count: 3e-3 * min(count, 4) / 4, agc=0, eps=1e-6,
+                                       beta1=0.85, beta2=0.99)),
+    ]
+    for (found, roundings), expected in truths:
+        for name in params:
+            assert_computes_the_oracle(found[name], expected[name], f"laprop's {name} updates",
+                                       roundings=roundings)
+    with pytest.raises(TypeError):
+        OptimConfig(optimizer="laprop", weight_decay=1e-2).build(10)
 
 
 def rate_fields(name: str, multiplier: float) -> dict[str, float]:

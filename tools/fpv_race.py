@@ -325,8 +325,7 @@ def _pretrained(out: Path, pretraining, windows: Loader, updates: int, saved_eve
     """The world model pretrained on `windows` to `updates` updates from where `progress` holds it, its
     weights written every `saved_every` updates (`_saved`), then the online phase made begun; and the run's
     progress."""
-    from rl_acceptance import laprop
-
+    from dew.optim import laprop
     from dew.training import Trainer
 
     done = progress["updates"]
@@ -361,10 +360,9 @@ def world(out: Path, *, teacher_weights: Path, assets: Path, drones: int = 16, h
     on a G4) the weights so far are written with where the run is (progress.json names the weight files it
     goes on from, `_committed`); a run whose `out` holds them goes on from there, its replay the
     demonstrations again and its optimizer's moments afresh."""
-    from rl_acceptance import laprop
-
     from dew.objectives.rl.dreamer import DreamerRollout, DreamerV3Objective, WorldModel
     from dew.objectives.rl.tssm import TSSM
+    from dew.optim import laprop
     from dew.training import Trainer
 
     scale = hz / 30

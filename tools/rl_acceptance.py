@@ -31,6 +31,7 @@ import numpy as np
 import optax
 
 from dew.data.dataset import Loader
+from dew.optim import laprop
 
 
 class _Tracker:
@@ -114,32 +115,6 @@ def ppo(
     }
     (out / "ppo.json").write_text(json.dumps(report, indent=1))
     return report
-
-
-def laprop(lr: float = 4e-5, warmup: int = 1000) -> optax.GradientTransformation:
-    """DreamerV3's optimizer (dreamerv3/agent.py:342-379): adaptive gradient clipping at 0.3, the RMS
-    of 0.999 with epsilon 1e-20, momentum 0.9 bias-corrected, the rate ramped over `warmup` updates."""
-
-    def clip_by_agc(clip: float = 0.3, floor: float = 1e-3) -> optax.GradientTransformation:
-        def update(updates, state, params=None):
-            def one(param, update):
-                limit = clip * jnp.maximum(floor, jnp.linalg.norm(param.ravel()))
-                return update / jnp.maximum(1.0, jnp.linalg.norm(update.ravel()) / limit)
-
-            return jax.tree.map(one, params, updates), state
-
-        return optax.GradientTransformation(lambda params: optax.EmptyState(), update)
-
-    schedule = optax.join_schedules(
-        [optax.linear_schedule(0.0, lr, warmup), optax.constant_schedule(lr)], [warmup]
-    )
-    # The RMS divides outside its root (opt.py:126-143); the momentum is an EMA, bias-corrected.
-    return optax.chain(
-        clip_by_agc(),
-        optax.scale_by_rms(0.999, eps=1e-20, eps_in_sqrt=False, bias_correction=True),
-        optax.ema(0.9, debias=True),
-        optax.scale_by_learning_rate(schedule),
-    )
 
 
 def dreamer(
