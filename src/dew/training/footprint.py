@@ -147,6 +147,30 @@ xla/debug_options_flags.cc); below it XLA's own emitters compute it (`IsMatrixMu
 ForRewriting`, xla/service/gpu/matmul_utils.cc)."""
 
 
+def traced_gradient(loss: Callable, params, arguments: Sequence) -> tuple[jcore.Jaxpr, int, list]:
+    """One trace of `loss(params, *arguments)`'s forward and backward: the program `jax.vjp`'s pullback
+    runs on a cotangent of ones, returning the gradient's leaves and then the pullback's own, its
+    residuals; how many gradient leaves lead its outputs; and the residuals' traced shapes."""
+    def both(params, *arguments):
+        outputs, pullback, _ = jax.vjp(lambda trainable: loss(trainable, *arguments), params, has_aux=True)
+        return pullback(jax.tree.map(jax.numpy.ones_like, outputs)), pullback
+    closed, (gradients, pullback) = jax.make_jaxpr(both, return_shape=True)(params, *arguments)
+    count = len(jax.tree.leaves(gradients))
+    return closed.jaxpr, count, jax.tree.leaves(pullback)
+
+
+def derived_terms(loss: Callable, params, arguments: Sequence, *, platform: str, workspace: Workspace,
+                  lowering: str | None = None) -> tuple[int, Peak]:
+    """`residual_bytes` and `gradient_peak` of `loss(params, *arguments)` from one trace of its forward and
+    backward (`traced_gradient`), as each derives it from its own."""
+    program, count, shapes = traced_gradient(loss, params, arguments)
+    lowering = lowering or LOWERED.get(platform, platform)
+    residuals = _residuals(compiled(program.replace(outvars=program.outvars[count:]), lowering), shapes,
+                           platform)
+    peak = compiled(program.replace(outvars=program.outvars[:count]), lowering)
+    return residuals, Peak(peak_bytes(peak, platform, workspace), not bounded_below(peak, platform))
+
+
 def residual_bytes(loss: Callable, params, arguments: Sequence, *, platform: str,
                    lowering: str | None = None) -> int:
     """The device bytes the pullback of `loss(params, *arguments)` in `params` keeps, a device's share,
@@ -160,10 +184,15 @@ def residual_bytes(loss: Callable, params, arguments: Sequence, *, platform: str
     or a scan's layer axis can have that size too."""
     def pullback(params, *arguments):
         return jax.vjp(lambda trainable: loss(trainable, *arguments), params, has_aux=True)[1]
-
     closed, shapes = jax.make_jaxpr(pullback, return_shape=True)(params, *arguments)
-    program = compiled(closed.jaxpr, lowering or LOWERED.get(platform, platform))
-    placed = {value: shape for value, shape in zip(program.outvars, jax.tree.leaves(shapes), strict=True)
+    return _residuals(compiled(closed.jaxpr, lowering or LOWERED.get(platform, platform)),
+                      jax.tree.leaves(shapes), platform)
+
+
+def _residuals(program: jcore.Jaxpr, shapes: Sequence, platform: str) -> int:
+    """`residual_bytes` of `program`, a pullback's traced program whose outputs are its residuals, each of
+    the traced `shapes`."""
+    placed = {value: shape for value, shape in zip(program.outvars, shapes, strict=True)
               if not isinstance(value, jcore.Literal)}
     frontier = Frontier(program, platform, returned=False)
     total = 0
@@ -190,7 +219,6 @@ def gradient_peak(loss: Callable, params, arguments: Sequence, *, platform: str,
     def gradient(params, *arguments):
         outputs, pullback, _ = jax.vjp(lambda trainable: loss(trainable, *arguments), params, has_aux=True)
         return pullback(jax.tree.map(jax.numpy.ones_like, outputs))
-
     program = jax.make_jaxpr(gradient)(params, *arguments).jaxpr
     lowered = compiled(program, lowering or LOWERED.get(platform, platform))
     return Peak(peak_bytes(lowered, platform, workspace), not bounded_below(lowered, platform))
@@ -553,10 +581,9 @@ def candidate_footprint[LossT, EffectsT](objective: Objective[LossT, EffectsT],
                 np.asarray([device]).reshape((1,) * len(mesh.axis_names)), mesh.axis_names,
                 axis_types=mesh.axis_types)):
             lowering = lowering_platform(target)
-            residuals = residual_bytes(trained, arguments[0]["params"], arguments, platform=target.platform,
-                                       lowering=lowering)
-            peak = gradient_peak(trained, arguments[0]["params"], arguments, platform=target.platform,
-                                 workspace=gemm_workspace(target), lowering=lowering)
+            residuals, peak = derived_terms(trained, arguments[0]["params"], arguments,
+                                            platform=target.platform, workspace=gemm_workspace(target),
+                                            lowering=lowering)
     resident = {name: device_bytes(value) for name, value in {
         "variables": prepared.variables, "optimizer": prepared.opt_state, "ema": prepared.ema,
         "accumulation": prepared.accumulation, "compute": prepared.compute}.items()}
