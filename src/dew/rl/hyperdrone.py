@@ -1,13 +1,14 @@
-"""HyperDrone's parts as a flight simulator for `dew.rl.flight`'s gate race (rl-tools/hyperdrone 0.1.10,
-the `hyperdrone` extra, on an NVIDIA GPU with OptiX).
+"""HyperDrone's parts as a flight simulator for `dew.rl.flight`'s gate race (Dew's build of
+rl-tools/hyperdrone 0.1.10, `hyperdrone==0.1.10.post1`, the `hyperdrone` extra, on an NVIDIA GPU with
+OptiX).
 
 HyperDrone's own environment holds one gate an instance and detects no collisions, so the race composes
 its two parts as its examples/drone_flythrough.py does: L2F's dynamics (`hyperdrone.dynamics.Sim`) under
-collective thrust and body rates with ideal actuation, on the CPU (0.1.10's CUDA build of that control
-does not compile: ptxas meets a host-only operation; 4096 drones step 18,000 times a second on one
-core), and HyperLux's batch ray tracer drawing each drone's front camera over a ground and its own
-course's gates, placed on the device each frame. The course, reward and collisions are the race's, in
-JAX.
+collective thrust and body rates with ideal actuation, on the GPU (Dew's build compiles that control's
+CUDA kernels, which 0.1.10's did not), and HyperLux's batch ray tracer drawing each drone's front camera
+over a ground and its own course's gates, placed on the device each frame. The states, commands and
+cameras cross between them and JAX by DLPack on the device. The course, reward and collisions are the
+race's, in JAX.
 
 The drone is L2F's `flightmare` quadrotor, the nearest it holds to a five-inch racer: 0.73 kg on arms
 of 0.17 m, its four rotors lifting 12.1 times its weight at full command (parameters/dynamics/
@@ -84,17 +85,18 @@ class HyperDroneFlight:
     def __init__(self, count: int, gates: int, *, size: int = 96, model: str = "flightmare",
                  hz: float = 30.0, substeps: int = 3, rate_limit: float = 4.0, fov: float = 100.0,
                  opening: float = 1.6, frame: float = 0.25, extent: float = 160.0, tile: float = 5.0,
-                 seed: int = 0):
+                 seed: int = 0, device: str = "cuda"):
         from hyperdrone import dynamics
 
         self.count, self.gates, self.substeps = count, gates, substeps
         self.rate_limit, self.fov = rate_limit, fov
         shared = {"dynamics": {"model": model}, "integration": {"dt": 1 / (hz * substeps)}}
-        loaded = dynamics.Sim(1, parameters={"dynamics": shared}, control="ctbr", actuation="ideal")
+        loaded = dynamics.Sim(1, parameters={"dynamics": shared}, device=device, control="ctbr",
+                              actuation="ideal")
         ratio = thrust_to_weight(loaded.parameters["dynamics"]["dynamics"])
         ideal = {"thrust_to_weight": ratio, "rate_limit": [rate_limit] * 3}
         self.sim = dynamics.Sim(count, parameters={"dynamics": {**shared, "ideal_rates": ideal}}, seed=seed,
-                                control="ctbr", actuation="ideal")
+                                device=device, control="ctbr", actuation="ideal")
         self.hover_throttle = 1 / ratio
         self._drawn = size, opening, frame, extent, tile
         self.renderer = None
@@ -145,7 +147,10 @@ class HyperDroneFlight:
         return bases.reshape(-1, 12)
 
     def _state(self, name: str) -> jax.Array:
-        """The sim's `name` state of every drone, on the default device."""
+        """The sim's `name` state of every drone, on the default device: a GPU sim's copied out of the
+        buffer it lends by DLPack before its next step overwrites it."""
+        if self.sim.device == "cuda":
+            return jnp.array(jax.dlpack.from_dlpack(self.sim.state_dlpack(name)), copy=True)
         return jnp.asarray(self.sim.state[name])
 
     def _kinematics(self) -> Kinematics:
@@ -164,7 +169,9 @@ class HyperDroneFlight:
 
     def step(self, commands: jax.Array) -> tuple[Kinematics, jax.Array, None]:
         normalized = jnp.concatenate([2 * commands[:, :1] - 1, commands[:, 1:] / self.rate_limit], -1)
-        normalized = np.asarray(jnp.clip(normalized, -1, 1), np.float32)
+        normalized = jnp.clip(normalized, -1, 1).astype(jnp.float32)
+        on_device = self.sim.device == "cuda"
+        normalized = jax.block_until_ready(normalized) if on_device else np.asarray(normalized)
         path = [self._state("position")]
         for _ in range(self.substeps):
             self.sim.step(normalized)
@@ -179,7 +186,11 @@ class HyperDroneFlight:
         bases = jax.block_until_ready(self._bases(gates))
         self.renderer.set_pose(self._placements, hyperlux.Pose(bases))
         self.renderer.update()
-        self.renderer.set_cameras(self.sim.camera_bases(fov=self.fov, aspect=self.renderer.aspect))
+        if self.sim.device == "cuda":
+            self.renderer.set_cameras(self.sim.camera_bases_dlpack(fov=self.fov, aspect=self.renderer.aspect),
+                                      stream=self.sim.stream)
+        else:
+            self.renderer.set_cameras(self.sim.camera_bases(fov=self.fov, aspect=self.renderer.aspect))
         self.renderer.render()
         blocks = [jax.dlpack.from_dlpack(block) for block in self.renderer.outputs[self._rgb].blocks]
         return jnp.concatenate(blocks)[..., :3]
