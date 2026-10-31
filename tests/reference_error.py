@@ -1872,26 +1872,25 @@ def _cancelling_terms(draw, truth):
     truth is not a JAX program its terms can be traced from (run as given, recorded, a window loop's)."""
     if truth is None or isinstance(truth, _Windowed) or _given(truth) or getattr(truth, "recorded", False):
         return None
-    with jax.enable_x64(new_val=True):
-        leaves = [np.asarray(leaf) for leaf in jax.tree.leaves(truth(*widened(draw(0))))]
-    # Every row of a leaf of rank two or more, sized as check 1 sizes it: zero below RESOLUTION.
-    if not np.any(_LaidTruths.of(leaves).sizes == 0):
-        return None
-    # Its terms read once, on the same draw: only a zero row whose terms are not zero too gains a size,
-    # so a site whose zero rows sum nothing (a query that keeps no key) keeps the reference's residue rule
-    # without tracing its terms a draw. A truth whose program cannot be traced op by op (host work on its
-    # values, NumPy or torch; a kernel chosen at float64 that refuses it) has no terms: it keeps the residue
-    # rule and runs as it always has, its own run reporting any failure of its own.
+    # The truth on the site's first draw, and its terms only where it holds a zero row: only a zero row whose
+    # terms are not zero too gains a size, so a site whose zero rows sum nothing (a query that keeps no key)
+    # keeps the reference's residue rule without tracing its terms a draw. A truth whose program cannot be
+    # run or traced so (host work on its values, NumPy or torch; a kernel that refuses float64) has no
+    # terms: it keeps the residue rule and runs as it always has, the gate's own run of it reporting any
+    # failure of its own.
     try:
         with jax.enable_x64(new_val=True):
+            leaves = [np.asarray(leaf) for leaf in jax.tree.leaves(truth(*widened(draw(0))))]
+            if not np.any(_LaidTruths.of(leaves).sizes == 0):
+                return None
             truths, terms = float64_terms(truth, *widened(draw(0)))
     except Exception as untraced:
-        traced = f"untraced: {type(untraced).__name__}"
+        found = f"untraced: {type(untraced).__name__}"
     else:
         plain, termed = _LaidTruths.of(jax.tree.leaves(truths)), _LaidTruths.of(
             jax.tree.leaves(truths), _term_leaves(terms, truths))
-        traced = bool(np.any((plain.sizes == 0) & (termed.sizes > 0)))
-    return truth if traced is True else None
+        found = bool(np.any((plain.sizes == 0) & (termed.sizes > 0)))
+    return truth if found is True else None
 
 
 def _site(dew_fn, reference_fn, label: str, *, seeds: int, truth_fn, library_fn, library_row, library_leaves,
