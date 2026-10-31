@@ -58,13 +58,12 @@ from collections.abc import Mapping
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 from flax import linen as nn
 
 from dew._distributions import counter_key
 from dew.batch import Batch, Variables, leaves_by_path
 from dew.data.dataset import rows_of
-from dew.nn.kernels.generation import linear_map
+from dew.nn.kernels.generation import linear_map, tangent_zero
 from dew.nn.precision import at_least_fp32, float32_einsum
 from dew.nn.protocols import OutputTable, RematChoosing, head_table
 from dew.objectives.base import Aux, Objective, Step, _has_aux, stream
@@ -74,13 +73,6 @@ NOISE = jnp.float32
 draws, and a bfloat16 site jitters by the draw cast to bfloat16."""
 
 Path = tuple[str, ...]
-
-
-def _still(leaf):
-    """A tangent of zero for `leaf`: float0's for one of no tangent space, an index or a count."""
-    if jnp.issubdtype(leaf.dtype, jnp.inexact):
-        return jnp.zeros_like(leaf)
-    return np.zeros(jnp.shape(leaf), jax.dtypes.float0)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -218,7 +210,7 @@ class NodePerturbation[LossT, EffectsT](Objective[LossT, EffectsT]):
             # The variables held, the batch and the step move nothing, as their cotangents are none.
             moved = linear_map(functools.partial(self._estimate_transposed, stats), self._estimate_of,
                                (params, rest), tangents[0])
-            return (stats, aux), (moved, jax.tree.map(_still, aux))
+            return (stats, aux), (moved, jax.tree.map(tangent_zero, aux))
 
         return estimated(variables["params"], (held, batch, step))
 
@@ -244,7 +236,7 @@ class NodePerturbation[LossT, EffectsT](Objective[LossT, EffectsT]):
             return self._estimate_of(residuals, jax.tree.unflatten(structure, whole))
 
         changed = jax.linear_transpose(pulled, *(leaves[index] for index in moving))(direction)
-        tangents = [_still(leaf) for leaf in leaves]
+        tangents = [tangent_zero(leaf) for leaf in leaves]
         for index, value in zip(moving, changed, strict=True):
             tangents[index] = value
         return jax.tree.unflatten(structure, tangents)

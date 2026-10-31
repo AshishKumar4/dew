@@ -46,7 +46,8 @@ def fetch(url: str = "url", to: str = "mp4", *, timeout: float = 30.0, max_bytes
 @contextlib.contextmanager
 def local_file(value: bytes | str) -> Iterator[str]:
     """A local file a decoder reads for a record's media `value`, its bytes or a local or remote path,
-    kept while the context is open."""
+    kept while the context is open: a remote one's copy in Dew's mirror (`dew.data.declared.mirrored`),
+    refused (`Unmirrored`, a ValueError a decoder's rejects take) where the mirror has no room for it."""
     if isinstance(value, bytes):
         with tempfile.NamedTemporaryFile() as file:
             file.write(value)
@@ -55,10 +56,10 @@ def local_file(value: bytes | str) -> Iterator[str]:
         return
     path = str(value)
     if "://" in path and not path.startswith("file://"):
+        from dew.data.declared import mirrored
         from dew.data.storage import Store
 
-        fs, target = Store(path if "::" in path else "dewcache::" + path).resolve()
-        with fs.open(target, "rb") as cached:
+        with mirrored(Store(path)) as cached:
             yield cached.name
         return
     yield path.removeprefix("file://")

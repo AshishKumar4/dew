@@ -210,6 +210,13 @@ means what today's, which has none, does. A saved run's records read without the
 saved data step's identity compares without them (`without_removed`). Carried to 1.0 (ledger 1552)."""
 
 
+RENAMED_FIELDS: Mapping[str, Mapping[str, str]] = {"dew.data.sources.iterator:Iterated": {"name": "identity"}}
+"""The fields a configuration renamed after runs were saved with them, by its class's import path, each
+earlier name by today's: an iterator's content version, `identity` as every opaque source names it (row
+3031). A record of one reads them under today's names wherever it is built from its fields
+(`dew.registry`). Carried to 1.0 (ledger 1552)."""
+
+
 def earlier_fields(value: JSON) -> JSON:
     """`value`, a saved run's records of components (a decision layout's segments, in its run.json or its
     checkpoint's task record), with each component's fields its class lost since (`REMOVED_FIELDS`) left

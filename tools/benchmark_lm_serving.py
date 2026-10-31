@@ -167,7 +167,6 @@ def profile_decode(server, prompts: np.ndarray, output: int, steps: int, directo
     host_wall = time.perf_counter() - began
     stream = io.StringIO()
     pstats.Stats(profile, stream=stream).sort_stats("tottime").print_stats(30)
-    previous = set(directory.rglob("*.xplane.pb"))
     with dew.Profiler(directory) as capture:
         for _ in range(steps):
             with capture.region("serve.decode"):
@@ -177,8 +176,9 @@ def profile_decode(server, prompts: np.ndarray, output: int, steps: int, directo
     server.run()
     assert all(ticket.done() for ticket in tickets)
     devices = {}
-    trace, = set(directory.rglob("*.xplane.pb")) - previous
-    for plane, events in device_events(trace.parent)[0].items():
+    # The capture just made, which the profiler names (`Profiler.captures`).
+    (captured,) = capture.captures
+    for plane, events in device_events(captured)[0].items():
         if not plane.startswith("/device:GPU") or not events:
             continue
         kernels = [(event.name, event.start_ns, event.start_ns + event.duration_ns) for event in events]

@@ -121,8 +121,8 @@ def write_seeded(scan, minimal, version, revision):
     import jax
     import jax.numpy as jnp
     import torch
-    from recorded_references import provenance, record_case, save
-    from reference_error import assert_computes_the_oracle, chain_roundings, widened
+    from recorded_references import held_to_the_oracle, provenance, record_case, save
+    from reference_error import chain_roundings, widened
     from ssd_support import mamba_ssd_draw, mamba_ssd_xla, ssd_orbit
 
     stored = {"precision": np.asarray("ieee")}
@@ -157,11 +157,7 @@ def write_seeded(scan, minimal, version, revision):
             reference = {name: value.detach().float().cpu().numpy() for name, value in
                          zip(names, (output, final, *grads), strict=True)}
             truth = minimal_truth(minimal, arrays, chunk)
-            with jax.enable_x64(new_val=True):
-                twin = jax.tree.map(np.asarray, exact_run(widened(arrays)))
-            for name in truth:
-                assert_computes_the_oracle(twin[name], truth[name], f"mamba_ssm float64 {name}",
-                                          roundings=roundings)
+            held_to_the_oracle(exact_run, arrays, truth, roundings, "mamba_ssm")
             return reference, truth
 
         stored.update(record_case(
