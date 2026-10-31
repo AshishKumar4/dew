@@ -123,10 +123,10 @@ def test_a_world_model_run_reports_its_updates_gradient_programs_work():
     from dew.training import Trainer
 
     rng = np.random.default_rng(0)
-    batch = {"observation": rng.normal(size=(3, 6, 1)).astype(np.float32),
-             "action": rng.uniform(-1, 1, (3, 6, 1)).astype(np.float32),
-             "reward": rng.normal(size=(3, 6)).astype(np.float32), "first": np.zeros((3, 6), bool),
-             "last": np.zeros((3, 6), bool), "terminal": np.zeros((3, 6), bool)}
+    batch = {"observation": rng.normal(size=(8, 6, 1)).astype(np.float32),
+             "action": rng.uniform(-1, 1, (8, 6, 1)).astype(np.float32),
+             "reward": rng.normal(size=(8, 6)).astype(np.float32), "first": np.zeros((8, 6), bool),
+             "last": np.zeros((8, 6), bool), "terminal": np.zeros((8, 6), bool)}
     objective = DreamerV3Objective(tiny())
     variables = objective.init(jax.random.key(0))
     step = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(0), ema=None)
@@ -139,7 +139,7 @@ def test_a_world_model_run_reports_its_updates_gradient_programs_work():
         return jax.grad(loss)(params)
 
     tracker = RecordingTracker()
-    data = Loader(train=lambda partition: itertools.repeat(batch), val=None, records=3, batch=3)
+    data = Loader(train=lambda partition: itertools.repeat(batch), val=None, records=8, batch=8)
     trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(1), tracker=tracker)
     trainer.fit(data, steps=2, log_every=2)
     reported = next(scalars["train/flops"] for _, scalars in tracker.scalars if "train/flops" in scalars)
