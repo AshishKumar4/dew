@@ -1020,6 +1020,12 @@ def gated_values_back(u_grad, values, beta) -> tuple[jax.Array, jax.Array]:
     return u_grad * beta[:, None], jnp.sum(u_grad * values, axis=1)
 
 
+def skipped_back(out_grad, values, skip) -> tuple[jax.Array, jax.Array]:
+    """The skip `y += D v`'s gradient on a tile of values from the output's gradient `out_grad`, fp32: the
+    values' own, `D do`, and the skip's own rows, `sum(v do)` over the tile's columns."""
+    return skip * out_grad, jnp.sum(out_grad * values, axis=1)
+
+
 def values_gradient(lower, values: TileLoad, blocks: int, u_grads: TileLoad, beta, dtype, issue: Issue, *,
                     emit: Callable[[str, int, jax.Array], None]) -> jax.Array:
     """The WY representation's backward under a decay a head, its values' part: each value block's gradient

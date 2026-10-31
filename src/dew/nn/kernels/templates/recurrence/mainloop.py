@@ -1580,18 +1580,21 @@ def _output_held(call: _Call, bv: int) -> _Held:
 
 @_lowered_once
 def _output(q, k, h, corrected, hi, lo, taken, beta, call: _Call, tiles: Tiles, *, scale: float, out_dtype,
-            scores=None):
+            scores=None, skip=None):
     """Each chunk's output `[R, HV * Dv]` in `out_dtype`, a program a chunk and value head and a step each
     value block: under a decay a head its own pairs' scores taken once, at the first step, and staged for
     every block's (`algebra.chunk_scores`, `chunk_output`), under one a key dimension the intra launch's
     (`scores`, `_intra`; `algebra.key_decayed_output`). Where the write gate takes the keys' side
-    (`_Call.gated_keys`) the scores' columns take `beta` `[HV, R]` before they are rounded."""
+    (`_Call.gated_keys`) the scores' columns take `beta` `[HV, R]` before they are rounded, and a `skip`
+    `[HV]` adds `D v` from the values the step holds (there the corrected ones)."""
+    assert skip is None or call.gated_keys, "a skip reads the values a call whose keys take the gate holds"
     width, value_width, bv, gates = call.width, call.value_width, tiles.output_block, call.gates
     held, memories, family = dataclasses.replace(call.held, rows=call.rows), call.memories, call.family
     steps = value_width // bv
 
     def program(q_ref, k_ref, h_ref, v_ref, hi_ref, lo_ref, column_hi_ref, column_lo_ref, taken_ref, beta_ref,
-                o_ref, *, streams, staging, landing):
+                *refs, streams, staging, landing):
+        *skip_ref, o_ref = refs
         n, h = _axis("chunks"), _axis("heads")
         row, span = n * CHUNK, pl.ds(n * CHUNK, CHUNK)
         (staged,) = staging
@@ -1661,6 +1664,8 @@ def _output(q, k, h, corrected, hi, lo, taken, beta, call: _Call, tiles: Tiles, 
 
                 out = algebra.chunk_output(queries.__getitem__, entered, width // call.block, gate, low,
                                            Parts(staged, held.dtype), value, scale, Issuer(call))
+            if skip_ref:
+                out = out + skip_ref[0][h] * value.value().astype(jnp.float32)
             view = o_ref.at[span, pl.ds(h * value_width + index * bv, bv)]
             family.stored([out.astype(o_ref.dtype)], [view], smem=landing["out"])
             return carry, accumulators
@@ -1679,7 +1684,8 @@ def _output(q, k, h, corrected, hi, lo, taken, beta, call: _Call, tiles: Tiles, 
                    held=_output_held(call, bv), staging=staging, landing={"out": ((CHUNK, bv), out_dtype)},
                    # A 16-bit call's takes no reduction (an A100's asked for its tiles' 49152 bytes alone).
                    persistent=True, reduces=held.parts > 1)(
-        q, k if scores is None else scores, h, corrected, hi, lo, hi, lo, taken, beta)
+        q, k if scores is None else scores, h, corrected, hi, lo, hi, lo, taken, beta,
+        *(() if skip is None else (skip.astype(jnp.float32),)))
 
 
 def prefix(g):
@@ -1745,7 +1751,7 @@ def forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts=None
             max_segments: int | None = None,
             scale: float | None = None, delta: bool = True, wide: bool = False,
             family: mosaic.Family | None = None, interpret: bool = False, floor: float | None = None,
-            rounded: bool = False, ranged: bool = False):
+            rounded: bool = False, ranged: bool = False, skip=None):
     """The chunked rule's forward on this mainloop: `(o [B, T, HV, Dv], final [B, HV, Dk, Dv])` for `q`, `k`
     `[B, T, H, Dk]`, `v` `[B, T, HV, Dv]`, the natural log decay `g`, a head's `[B, T, HV]` (the gated delta
     rule) or a key dimension's `[B, T, HV, Dk]` (Kimi delta attention), the write gate `beta` `[B, T, HV]` and
@@ -1765,11 +1771,12 @@ def forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts=None
     (Mamba2's SSD, whose 16-bit numbers are mamba_ssm's) it passes its values between launches in the
     operands' dtype, and an fp32 call's products take its operands in `FAST_PARTS` bf16 parts (`_prepared`,
     `_parts`). A `ranged` 16-bit delta rule, whose form proves no bound on its chunk inverse, solves it at
-    fp32's range (`_merged`)."""
+    fp32's range (`_merged`). A `skip` `[HV]` adds `D v` to the output of a call whose write gate takes the
+    keys' side (`_Call.gated_keys`, Mamba2's SSD), as mamba_ssm's output kernel adds it."""
     out, final, _ = kept_forward(q, k, v, g, beta, h0, starts=starts, firsts=firsts,
                                  max_segments=max_segments, scale=scale, delta=delta, tiles=tiles, wide=wide,
                                  family=family, interpret=interpret, floor=floor, keeps=False,
-                                 rounded=rounded, ranged=ranged)
+                                 rounded=rounded, ranged=ranged, skip=skip)
     return out, final
 
 
@@ -1778,7 +1785,8 @@ def kept_forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts
                  scale: float | None = None, delta: bool = True, wide: bool = False,
                  family: mosaic.Family | None = None, interpret: bool = False,
                  floor: float | None = None, keeps: bool = True,
-                 rounded: bool = False, ranged: bool = False) -> tuple[jax.Array, jax.Array, tuple]:
+                 rounded: bool = False, ranged: bool = False,
+                 skip=None) -> tuple[jax.Array, jax.Array, tuple]:
     """`forward`'s `(o, final)` and what the fast backward takes rather than compute again
     (`mainloop_backward.gradients`' `inverse` and `kept`): each chunk's inverse under a decay a head
     (`_solved`'s, None otherwise or where the call `keeps` none, `forward`'s), as fla's backward keeps its
@@ -1789,7 +1797,7 @@ def kept_forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts
                     rounded=rounded, ranged=ranged)
     call, tiles = run.call, run.tiles
     o = _output(run.q, run.k, run.h, run.corrected, run.hi, run.lo, run.taken, run.beta, call, tiles,
-                scale=run.scale, out_dtype=jnp.float32 if wide else run.dtype, scores=run.scores)
+                scale=run.scale, out_dtype=jnp.float32 if wide else run.dtype, scores=run.scores, skip=skip)
     o = run.unlaid(o.reshape(call.rows, call.heads, call.value_width))[..., :run.value_width]
     assert run.final is not None, "a forward runs its states launch"
     return o, run.final, (run.a, (run.w, run.h, run.corrected))

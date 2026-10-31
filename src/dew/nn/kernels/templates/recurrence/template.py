@@ -93,13 +93,14 @@ class Mosaic(base.Template[mainloop.Tiles]):
              state: jax.Array | None = None, starts: jax.Array | None = None, *,
              firsts: jax.Array | None = None, max_segments: int | None = None, scale: float | None = None,
              delta: bool = True, wide: bool = False, floor: float | None = None, bound: float | None = None,
-             rounded: bool = False, config: mainloop.Tiles, return_residuals: bool = False):
+             rounded: bool = False, skip: jax.Array | None = None, config: mainloop.Tiles,
+             return_residuals: bool = False):
         from dew.nn.kernels.recurrence_chunk import mosaic_rule
 
         del return_residuals
         return mosaic_rule(query, key, value, g, beta, state, tiles=config, starts=starts, firsts=firsts,
                            max_segments=max_segments, scale=scale, delta=delta, wide=wide, floor=floor,
-                           bound=bound, rounded=rounded), None
+                           bound=bound, rounded=rounded, skip=skip), None
 
     @staticmethod
     def launched() -> generation.GpuTarget:

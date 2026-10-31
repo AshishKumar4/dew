@@ -918,7 +918,7 @@ def _shard_specs(shape: tuple[int, ...], key_heads: int, decay_ndim: int) -> tup
     return four, P(rows, None, heads), P(rows, heads, None, None), P(*four[:decay_ndim]), P(rows, None)
 
 
-def template_rule(query, key, value, g, beta, state=None, starts=None, firsts=None, **options):
+def template_rule(query, key, value, g, beta, state=None, starts=None, firsts=None, skip=None, **options):
     """The recurrence template's op (`templates.recurrence.template.MOSAIC`, `mosaic_rule`) on each shard
     (`manual_map`), placed as `fla_rule`: its tiles derived from each shard's shapes, its forward and its
     gradient on each device's own rows. Called on the whole batch, every device of a 2xH100 FSDP run ran
@@ -928,14 +928,15 @@ def template_rule(query, key, value, g, beta, state=None, starts=None, firsts=No
     from .templates.recurrence import template
 
     four, three, memory, decays, resets = _shard_specs(value.shape, key.shape[2], g.ndim)
-    optional = [(state, memory), (starts, resets), (firsts, resets)]
+    optional = [(state, memory), (starts, resets), (firsts, resets),
+                (skip, jax.sharding.PartitionSpec(four[2]))]
     operands = (query, key, value, g, beta, *(x for x, _ in optional if x is not None))
     specs = (four, four, four, decays, three, *(spec for x, spec in optional if x is not None))
 
     def local(query, key, value, g, beta, *given):
         given = iter(given)
-        state, starts, firsts = (None if x is None else next(given) for x, _ in optional)
-        return template.MOSAIC(query, key, value, g, beta, state, starts, firsts=firsts, **options)
+        state, starts, firsts, skip = (None if x is None else next(given) for x, _ in optional)
+        return template.MOSAIC(query, key, value, g, beta, state, starts, firsts=firsts, skip=skip, **options)
 
     return manual_map(local, specs, (four, memory))(*operands)
 
@@ -943,7 +944,7 @@ def template_rule(query, key, value, g, beta, state=None, starts=None, firsts=No
 def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
                 max_segments: int | None = None, scale: float | None = None, delta: bool = True,
                 wide: bool = False, family=None, floor: float | None = None, bound: float | None = None,
-                firsts=None, rounded: bool = False):
+                firsts=None, rounded: bool = False, skip=None):
     """The chunked rule, a decay a head (`g` `[B, S, Hv]`) or a key dimension (`[B, S, Hv, Dk]`), with or
     without the `delta` rule, on the recurrence template's Mosaic GPU mainloop
     (`templates.recurrence.mainloop.forward`): `fla_rule`'s operands and results, the operands in their common
@@ -988,12 +989,12 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
     # The documents' starts and firsts operands, not closed over (a custom VJP's function closes over no
     # tracer).
     @jax.custom_vjp
-    def rule(query, key, value, g, beta, state, starts, firsts):
+    def rule(query, key, value, g, beta, state, starts, firsts, skip):
         # A forward without a gradient at its own tiles, no fast backward narrowing them (`Tiles.forward`).
         alone = {**run, "tiles": tiles.forward or tiles}
         return mainloop.forward(query, key, value, g, beta, state, starts=starts, firsts=firsts,
                                 max_segments=max_segments, scale=scale, delta=delta, wide=wide,
-                                rounded=rounded, **alone)
+                                rounded=rounded, skip=skip, **alone)
 
     def forward(*operands):
         if not fast:
@@ -1005,14 +1006,14 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
         out, final, (inverse, kept) = mainloop.kept_forward(*operands[:6], starts=operands[6],
                                                             firsts=operands[7], max_segments=max_segments,
                                                             scale=scale, delta=delta, wide=wide,
-                                                            rounded=rounded, **run)
+                                                            rounded=rounded, skip=operands[8], **run)
         kept = None if "delta_memory" in RECOMPUTED.get() else checkpoint_name(kept, 'delta_memory')
         return (out, final), (operands, (checkpoint_name(inverse, 'delta_inverse'), kept))
 
     def backward(saved, grads):
         operands, (inverse, kept) = saved
         out_grad, final_grad = grads
-        query, key, value, g, beta, state, starts, firsts = operands
+        query, key, value, g, beta, state, starts, firsts, skip = operands
         if not fast:
             form = (f"{dtype.name}, {'the delta rule' if delta else 'no delta rule'}, a decay a "
                     f"{'head' if g.ndim == 3 else 'key dimension'}")
@@ -1023,11 +1024,12 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
         grads = mainloop_backward.gradients(query, key, value, g, beta, state, out_grad, final_grad,
                                             starts=starts, firsts=firsts, max_segments=max_segments,
                                             scale=scale, inverse=inverse, kept=kept, delta=delta,
-                                            rounded=rounded, **run_back)
-        return (*grads[:5], None if state is None else grads[5], None, None)
+                                            rounded=rounded, skip=skip, **run_back)
+        return (*grads[:5], None if state is None else grads[5], None, None,
+                None if skip is None else grads[6].astype(skip.dtype))
 
     rule.defvjp(forward, backward)
-    return rule(query, key, value, g, beta, state, starts, firsts)
+    return rule(query, key, value, g, beta, state, starts, firsts, skip)
 
 
 RECOMPUTED: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar("recomputed", default=())
@@ -1152,10 +1154,14 @@ def _rated_scan(hooks: recurrence.Hooks, query, key, value, g, beta, given: dict
 
     def run(kernel, query, key, value, g, beta, rate, skip, state, starts, firsts):
         if kernel == 'mosaic_gpu':
-            out, final = template_rule(query, key, value, g, beta, state, starts, firsts,
-                                       max_segments=max_segments, scale=1.0, delta=False, wide=True,
-                                       rounded=fast_rounding())
-            return recurrence.skipped(hooks, out, value, {'skip': skip}, work), final
+            # The skip in the template's own output and walk (`mainloop._output`, `_reverse`), as
+            # mamba_ssm's kernels add it: added after, its fp32 output's skip and cast took 0.045 ms past an
+            # H100's launches, and its gradient's 0.094 (ssd-rounded-h100-fdab2424c,
+            # window-h100-c70aaa8-b8109ee).
+            # Its output in the operands' dtype where no epilogue reads it after (`hooks.output`'s norm).
+            return template_rule(query, key, value, g, beta, state, starts, firsts,
+                                 skip=skip if hooks.skip else None, max_segments=max_segments, scale=1.0,
+                                 delta=False, wide=hooks.output is not None, rounded=fast_rounding())
         operand = jnp.result_type(query, key, value)
         x, B, C = (jnp.asarray(t, operand) for t in (value, key, query))
         batch, _, heads, head_dim = x.shape
