@@ -72,19 +72,6 @@ def _planned(shapes: tuple, tiles: mainloop.Tiles, family: mosaic.Family, target
     return _PLANS[key]
 
 
-def inverse_refusal(dtype, delta: bool, bound: float | None, takes_tf32: bool) -> str | None:
-    """Why the mainloop refuses a call's delta-rule solve, None where it takes it: a 16-bit call's merges
-    stage the chunk's inverse in fp16 (`mainloop._merges`), whose range holds it where the call's form
-    proves its entries at most two (`bound`, `recurrence.Hooks.inverse_bound`), as a layer declares of its
-    keys and write gates; where it proves none, in fp32 as TF32 on a family whose products take it
-    (`takes_tf32`, the call `ranged`). An fp32 call's operands hold fp32's range."""
-    if not delta or jnp.dtype(dtype) == jnp.float32 or bound is not None or takes_tf32:
-        return None
-    return ("a 16-bit delta rule's solve stages its chunk inverse in fp16, which holds it where the layer "
-            "declares keys of unit norm and write gates at most two (recurrence.Hooks.inverse_bound); fp32's "
-            "range takes TF32 merges, which this family's products do not take")
-
-
 def ranged(dtype, delta: bool, bound: float | None) -> bool:
     """Whether a call's solve holds its chunk inverse at fp32's range (`mainloop._Call.ranged`): a 16-bit
     delta rule whose form proves no bound on the inverse's entries."""
@@ -139,9 +126,8 @@ class Mosaic(base.Template[mainloop.Tiles]):
         family = bundle(target, dtype)
         assert family is not None, f"no bundle of the mainloop claims {target.generation}"
         delta = arguments.get("delta", True)
-        forms = mainloop_backward.fast_backward_form(delta, arguments.get("rounded", False), dtype,
-                                                     family.takes_tf32)
-        fast = backward and forms and per_head
+        fast = backward and per_head and mainloop_backward.fast_backward_form(
+            delta, arguments.get("rounded", False), dtype)
         return _planned(shapes, config, family, target, arguments.get("max_segments"), delta, bool(fast),
                         arguments.get("floor"), arguments.get("rounded", False), arguments.get("wide", False),
                         ranged(dtype, delta, arguments.get("bound")))
@@ -306,9 +292,8 @@ class Mosaic(base.Template[mainloop.Tiles]):
             target = self.launched()
         arguments = ba.arguments
         dtype = jnp.result_type(*(arguments[name].dtype for name in ("query", "key", "value")))
-        family = bundle(target, dtype)
-        forms = family is not None and mainloop_backward.fast_backward_form(
-            arguments.get("delta", True), arguments.get("rounded", False), dtype, family.takes_tf32)
+        forms = mainloop_backward.fast_backward_form(arguments.get("delta", True),
+                                                     arguments.get("rounded", False), dtype)
         if not (forms and arguments["g"].ndim == 3):
             return False
         fits = self.fits(ba, target)
@@ -390,11 +375,10 @@ class Mosaic(base.Template[mainloop.Tiles]):
     def eligible(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> bool:
         """Whether the mainloop runs the call on `target`: 16-bit or fp32 operands, a decay a key dimension's
         in a 16-bit call under a declared floor its sub-chunks factor under (`mainloop.per_key_refusal`), a
-        16-bit delta rule's solve under the inverse's bound its form proves (`inverse_refusal`), a
-        bundle for the target's
-        family, the tensor rate its cost model reads, and a config whose launches the device holds at the
-        call's widths (`fits`: their shared memory and registers). Off a GPU (a CPU's), where the rule runs
-        its bundle interpreted, the target is the interpreted bundle's generation (`launched`)."""
+        16-bit delta rule's solve at fp32's range where its form proves no bound (`ranged`), a bundle for the
+        target's family, the tensor rate its cost model reads, and a config whose launches the device holds
+        at the call's widths (`fits`: their shared memory and registers). Off a GPU (a CPU's), where the rule
+        runs its bundle interpreted, the target is the interpreted bundle's generation (`launched`)."""
         if generation.backend() == "cpu" and bundle(target) is None:
             target = self.launched()
         arguments = ba.arguments
@@ -402,10 +386,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
         if dtype not in (jnp.bfloat16, jnp.float16, jnp.float32):
             return False
         factored = arguments["g"].ndim == 3 or mainloop.per_key_refusal(dtype, arguments.get("floor")) is None
-        family = bundle(target, dtype)
-        solved = family is not None and inverse_refusal(dtype, arguments.get("delta", True),
-                                                        arguments.get("bound"), family.takes_tf32) is None
-        if not (factored and solved and target.tensor_rate("16bit") is not None):
+        if not (factored and bundle(target, dtype) is not None and target.tensor_rate("16bit") is not None):
             return False
         return bool(self.fits(ba, target))
 

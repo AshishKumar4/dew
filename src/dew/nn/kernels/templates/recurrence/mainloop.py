@@ -129,11 +129,19 @@ def per_key_refusal(dtype, floor: float | None) -> str | None:
     return None
 
 
-def _parts(dtype, tf32: bool = False) -> int:
-    """The parts a product takes an operand of `dtype` as: one for 16 bits, and for fp32 one where its
-    products take it as TF32 (`tf32`: the run's fast forms on a family whose products take it,
-    `Family.takes_tf32`; JAX's default precision for an fp32 product, and fla's), else three."""
-    return PARTS if jnp.dtype(dtype) == jnp.float32 and not tf32 else 1
+FAST_PARTS = 2
+"""The bf16 parts of an fp32 operand under the run's fast forms: 16 of its significand's 24 bits, past
+TF32's 10, JAX's default precision for an fp32 product (and fla's), their products the parts' three pairs
+whose orders sum under two. TF32 itself takes no transposed operand on a warpgroup MMA ('Only f16 WGMMA
+supports transposes', tf32-sm90 at the gaps' first head) and none at all on Mosaic's mma.sync."""
+
+
+def _parts(dtype, fast: bool = False) -> int:
+    """The parts a product takes an operand of `dtype` as: one for 16 bits; for fp32 `FAST_PARTS` under the
+    run's fast forms (`fast`), else three."""
+    if jnp.dtype(dtype) != jnp.float32:
+        return 1
+    return FAST_PARTS if fast else PARTS
 
 
 def _diagonal(size: int, family: mosaic.Family) -> jax.Array:
@@ -209,8 +217,8 @@ class _Call:
     target: generation.GpuTarget
     ranged: bool = False
     """Whether its solve holds the chunk inverse at fp32's range: a 16-bit delta rule whose form proves no
-    bound on the inverse's entries (`recurrence.Hooks.inverse_bound`), its merges staged in fp32
-    (`_merges`)."""
+    bound on the inverse's entries (`recurrence.Hooks.inverse_bound`), its merges in bf16 parts
+    (`_merging`)."""
 
     @property
     def gated_keys(self) -> bool:
@@ -330,22 +338,25 @@ def _merges(call: _Call) -> tuple:
     its 16-row diagonal blocks by fp32 forward substitution and merges in TF32; every doubling level here
     rounds to fp16, about 2^-12 absolute on the inverse under aligned keys, a sixth of the bf16 rounding
     both arms share. fp16's range holds the inverse and each merge's product of it where the call's form
-    proves its entries at most two (`recurrence.Hooks.inverse_bound`: unit keys, write gates at most two),
-    the call's contract (`template.inverse_refusal`). Unnormalized keys with `beta |k|^2` past two grow it
-    geometrically, past fp16's largest in about 16 tokens (row 2381): fp32's range in bf16 parts spilled the
-    solve on an A100 and an H100 and one bf16 part put a normalized call's inverse 2.1 to 2.7 times as far
-    from float64, so such a `ranged` call's merges take fp32 itself, as TF32 (`Family.takes_tf32`), fla's own
-    merges; so does an fp32 call that takes its operands as TF32 (`_parts`)."""
-    if call.held.parts > 1:
-        dtype, parts = jnp.bfloat16, PARTS
-    elif call.held.dtype == jnp.float32 or call.ranged:
-        # fp32 itself, the products taking it as TF32 (`Family.takes_tf32`): an fp32 call's one part, and a
-        # 16-bit call's inverse at fp32's range where its form proves no bound, as fla merges in TF32.
-        dtype, parts = jnp.float32, 1
-    else:
-        dtype, parts = jnp.float16, 1
+    proves its entries at most two (`recurrence.Hooks.inverse_bound`: unit keys, write gates at most two).
+    Unnormalized keys with `beta |k|^2` past two grow it geometrically, past fp16's largest in about 16 tokens
+    (row 2381): such a `ranged` call's merges take fp32's range in bf16 parts (`_merged`), two of them, where
+    three spilled the solve on an A100 and an H100 and one put a normalized call's inverse 2.1 to 2.7 times as
+    far from float64; two keep 16 bits, past the TF32 fla merges in."""
+    merged = _merged(call)
     tile = (CHUNK, CHUNK)
-    return tuple(tuple(plgpu.SMEM(tile, dtype) for _ in range(parts)) for _ in range(3))
+    return tuple(tuple(plgpu.SMEM(tile, merged.stored) for _ in range(merged.parts)) for _ in range(3))
+
+
+def _merged(call: _Call) -> _Operand:
+    """The form the doubling's merges take the inverse and its power in (`_merges`): an fp32 call's parts;
+    a `ranged` 16-bit call's fp32 in `FAST_PARTS` bf16 parts, fp32's range at TF32's precision and past it;
+    else one fp16 part."""
+    if call.held.parts > 1:
+        return call.held
+    if call.ranged:
+        return _Operand(call.rows, FAST_PARTS, jnp.dtype(jnp.float32))
+    return _Operand(call.rows, 1, jnp.dtype(jnp.float16))
 
 
 def _summing(call: _Call) -> tuple:
@@ -901,10 +912,11 @@ def _intra_held(call: _Call, block: int) -> _Held:
 
 def _doubling_held(call: _Call) -> list:
     """A chunk's inverse by doubling as a thread holds it (`algebra.solved`): the inverse, its power and their
-    product beside the masks, an fp32 call's merges splitting the inverse and the power into their parts; the
+    product beside the masks, merges in parts (`_merged`) splitting the inverse and the power into them; the
     system, staged negated for the merges, held no longer."""
+    merged = _merged(call)
     return ([_f32(CHUNK, CHUNK)] * 3 + _masks(CHUNK, CHUNK) * 2
-            + (_held(call.held, CHUNK, CHUNK) * 2 if call.held.parts > 1 else []))
+            + (_held(merged, CHUNK, CHUNK) * 2 if merged.parts > 1 else []))
 
 
 def _systems(call: _Call) -> _Operand:
@@ -1733,9 +1745,9 @@ def forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts=None
     where None), interpreted where `interpret`. A decay a key dimension takes the layer's declared `floor`
     (`per_key_refusal`). A `rounded` call takes the run's fast forms' numbers: without the delta rule
     (Mamba2's SSD, whose 16-bit numbers are mamba_ssm's) it passes its values between launches in the
-    operands' dtype, and an fp32 call's products take its operands as TF32 where the family's do
-    (`_prepared`, `_parts`). A `ranged` 16-bit delta rule, whose form proves no bound on its chunk inverse,
-    solves it at fp32's range (`_merges`)."""
+    operands' dtype, and an fp32 call's products take its operands in `FAST_PARTS` bf16 parts (`_prepared`,
+    `_parts`). A `ranged` 16-bit delta rule, whose form proves no bound on its chunk inverse, solves it at
+    fp32's range (`_merged`)."""
     out, final, _ = kept_forward(q, k, v, g, beta, h0, starts=starts, firsts=firsts,
                                  max_segments=max_segments, scale=scale, delta=delta, tiles=tiles, wide=wide,
                                  family=family, interpret=interpret, floor=floor, keeps=False,
@@ -1831,7 +1843,7 @@ def _prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles
         h0 = jnp.where(starts[:, 0, None, None, None], 0.0, h0)
     chunks, taken, sequences, laid, unlaid = _layout(batch, length, starts, max_segments, firsts)
     rows = chunks * CHUNK
-    given = _Operand(rows, _parts(dtype, rounded and family.takes_tf32), dtype)
+    given = _Operand(rows, _parts(dtype, rounded), dtype)
     # What the launches pass between them: the delta rule's in the operands' dtype, as fla's rounds it (the
     # port is its reference). Without it, a `rounded` call's (the SSD's under the run's fast forms, which its
     # route resolves, `recurrence_chunk.fast_rounding`) in the operands' dtype too, as mamba_ssm rounds its

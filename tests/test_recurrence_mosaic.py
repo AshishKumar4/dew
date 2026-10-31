@@ -402,23 +402,38 @@ def diverging(width: int = 64) -> Chunk:
                  state=jnp.zeros((1, 1, width, width), jnp.float32))
 
 
-def test_a_16bit_delta_rule_whose_form_proves_no_range_takes_another_kernel():
-    """The diverging rule (`diverging`) in a 16-bit call whose form proves no bound on its chunk's inverse
-    (unnormalized keys, no declared write gate): the template's solve, whose fp16 merges gave NaN there
-    where the portable math gave 5.7e29 (row 2381), refuses it (`template.inverse_refusal`), the mainloop's
-    rule named for it too, and the delta rule's selector on an H100 gives it the port, which the same call
-    declaring its bound would not take from the template."""
+def test_a_16bit_delta_rule_whose_form_proves_no_range_solves_at_fp32s_range():
+    """The diverging rule (`diverging`), its keys drawn within 1e-3 of `2 e0`, in a 16-bit call whose form
+    proves no bound on its chunk's inverse (unnormalized keys, no declared write gate): the template's solve,
+    whose fp16 merges gave NaN there where the portable math gave 5.7e29 (row 2381), merges at fp32's range
+    in bf16 parts (`mainloop._merged`): its output on par from float64 with the portable math's, the token
+    recurrence the truth (check 1); and the delta rule's selector on an H100 gives the call the template."""
     from dew.nn.kernels.recurrence_chunk import port_kernel
 
+    hooks = recurrence.Hooks(decay='scalar', scale=diverging().key.shape[-1] ** -0.5)
+
+    def draw(seed):
+        drawn = diverging()
+        noise = 1e-3 * jax.random.normal(jax.random.key(59 + seed), drawn.key.shape)
+        return ((drawn.key.astype(jnp.float32) + noise).astype(jnp.bfloat16),)
+
+    def output(rule):
+        def run(key):
+            drawn = diverging()
+            found = rule(Chunk(key, key, drawn.value.astype(key.dtype), log_decay=drawn.log_decay,
+                               beta=drawn.beta.astype(key.dtype),
+                               state=drawn.state.astype(jnp.promote_types(key.dtype, jnp.float32))))
+            return found[0] if isinstance(found, tuple) else found
+        return run
+
+    assert_as_exact(output(functools.partial(chunk_on, 'mosaic_gpu', hooks)),
+                    output(functools.partial(chunk_on, 'xla', hooks)), draw,
+                    "the template's solve at fp32's range", seeds=SEEDS,
+                    truth_fn=output(functools.partial(token_by_token, hooks)))
     drawn = diverging()
-    hooks = recurrence.Hooks(decay='scalar', scale=drawn.key.shape[-1] ** -0.5)
-    with pytest.raises(REFUSED):
-        jax.eval_shape(functools.partial(chunk_on, 'mosaic_gpu', hooks), drawn)
     operands = (drawn.query, drawn.key, drawn.value, drawn.log_decay, drawn.beta, drawn.state)
     with generation.assumed('sm90'):
-        unproven = port_kernel(*operands, report=False)
-        declared = port_kernel(*operands, bound=1.0, report=False)
-    assert (unproven, declared) == ('fla', 'mosaic_gpu')
+        assert port_kernel(*operands, report=False) == 'mosaic_gpu'
 
 
 def test_the_solve_holds_a_negative_eigenvalue_rules_inverse():

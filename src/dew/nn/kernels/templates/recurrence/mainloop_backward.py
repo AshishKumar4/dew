@@ -54,7 +54,6 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     _views,
     _walk,
     _walk_stores,
-    family_of,
     kept_forward,
 )
 
@@ -98,14 +97,14 @@ def holds(launches: tuple[Launch, ...], family: mosaic.Family, shared: int) -> b
                for launch in launches)
 
 
-def fast_backward_form(delta: bool, rounded: bool, dtype, tf32: bool = False) -> bool:
+def fast_backward_form(delta: bool, rounded: bool, dtype) -> bool:
     """Whether the fast backward takes a call's form (a decay a head besides): the delta rule, fla's DAG at
     fla's rounding, or a bf16 `rounded` call without it (the SSD's under the run's fast forms, its route's),
     the same DAG without the delta rule's at mamba_ssm's rounding (`_prepared`), held to recorded mamba_ssm's
-    bf16 case; either in fp32 where its operands are one part, a `rounded` call's on a family whose products
-    take them as TF32 (`tf32`, `mainloop._parts`). An fp16 call without the delta rule, which no recording
-    holds, and an fp32 call's three parts (the accurate forms) take none."""
-    if jnp.dtype(dtype) == jnp.float32 and not (rounded and tf32):
+    bf16 case; either in fp32 under the run's fast forms (`rounded`), its operands in two bf16 parts
+    (`mainloop.FAST_PARTS`). An fp16 call without the delta rule, which no recording holds, and an fp32 call's
+    three parts (the accurate forms) take none."""
+    if jnp.dtype(dtype) == jnp.float32 and not rounded:
         return False
     return delta or (rounded and jnp.dtype(dtype) in (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float32)))
 
@@ -142,11 +141,9 @@ def gradients(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None, fi
     the delta rule there is no system: the corrected values are the values gated, `u = v beta`, whose gradient
     `du` (the reverse walk's) gives `dv = du beta` and `dbeta = sum(v du)`, and the memory walks back with no
     `w^T dv`."""
-    dtype = jnp.result_type(q, k, v)
-    family = family_of(dtype) if family is None else family
-    if not fast_backward_form(delta, rounded, dtype, family is not None and family.takes_tf32):
+    if not fast_backward_form(delta, rounded, jnp.result_type(q, k, v)):
         raise NotImplementedError("the fast backward takes the delta rule, or a rounded call without it "
-                                  "under the run's fast forms, in fp32 its operands as TF32")
+                                  "under the run's fast forms, an fp32 call's under them alone")
     run = _prepared(q, k, v, g, beta, h0, starts=starts, max_segments=max_segments, scale=scale, delta=delta,
                     tiles=tiles, family=family, interpret=interpret, inverse=inverse, kept=kept,
                     firsts=firsts, rounded=rounded, ranged=ranged)

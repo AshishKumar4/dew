@@ -486,7 +486,7 @@ def chunk_gated_delta_rule(query, key, value, g, beta, state=None, chunk_size: i
     which needs none. `floor` is the least log decay a token the layer declares (`recurrence.Hooks.floor`:
     Kimi delta attention's lower bound), which the recurrence template's factored form of a decay a key
     dimension reads; `write_bound` the largest write gate it declares of keys it l2-normalized
-    (`recurrence.Hooks.write_bound`), which the template's 16-bit solve needs (`template.inverse_refusal`).
+    (`recurrence.Hooks.write_bound`), which the template's 16-bit solve reads (`mainloop._merged`).
     """
     hooks = recurrence.Hooks(decay='vector' if g.ndim == 4 else 'scalar', scale=key.shape[-1] ** -0.5,
                              floor=floor, write_bound=write_bound)
@@ -728,27 +728,11 @@ call under either selector (`GATED_DELTA`, `SCAN`): its own launches' call (`Tem
 widths, a decay a key dimension's floor, a bundle for the device's family, a config that fits), a GPU, and for
 a training product its fast backward (`Mosaic.trains`; the rule's gradient takes no other, row 1926)."""
 
-def _inverse_range(case: PortCase) -> bool:
-    """Whether the template's solve holds the call's chunk inverse (`template.inverse_refusal`), its merges at
-    fp32's range where the device's products take TF32 (`Family.takes_tf32`)."""
-    from .templates import bundles
-    from .templates.recurrence import template
-
-    family = bundles.of(generation.device_generation(), case.dtype) if case.family is not None else None
-    return template.inverse_refusal(case.dtype, case.delta, case.bound,
-                                    family is not None and family.takes_tf32) is None
-
-
 MOSAIC_SUPPORTS: tuple[Requirement[PortCase], ...] = (
     *PORT_SUPPORTS[1:2],
-    Requirement('range', _inverse_range,
-                "a 16-bit delta rule's solve stages its chunk inverse in fp16, whose range holds it where "
-                "the layer declares keys of unit norm and write gates at most two, its entries then at most "
-                "that bound (`recurrence.Hooks.inverse_bound`); unnormalized keys grow it past fp16's "
-                "largest, which the port's TF32 merges and the portable math hold", row='ledger 2381'),
     *TEMPLATE_SUPPORTS)
 """What the recurrence template needs of a delta rule's call: the port's placement (a Pallas call's results),
-a 16-bit solve's range (`template.inverse_refusal`) and `TEMPLATE_SUPPORTS`, in
+and `TEMPLATE_SUPPORTS`, in
 every form its mainloop implements, the delta rule with a decay or without one and the forms without the
 delta rule alike (row 1963: the port's 'gated' form was the template's too). A declared port cell runs the
 port first where the port takes the call (`PORT_CELLS`, `GATED_DELTA`'s declared cells)."""
@@ -974,16 +958,14 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
     the template's config, `templates.recurrence.template`); a `family` given is the bundle it issues by,
     interpreted off a GPU of that family (a CPU's). A decay a key dimension takes the layer's declared
     `floor`, which the mainloop's intra launch reads (`mainloop.per_key_refusal`), and a 16-bit delta rule the
-    chunk inverse's `bound` its form proves, which its solve's range needs (`template.inverse_refusal`); a
-    `rounded` call without it (the SSD's under the run's fast forms, `fast_rounding`) takes mamba_ssm's
-    16-bit numbers (`mainloop.forward`)."""
+    chunk inverse's `bound` its form proves, its solve at fp32's range where it proves none
+    (`template.ranged`); a `rounded` call takes the run's fast forms' numbers (`fast_rounding`,
+    `mainloop.forward`)."""
     from .templates.recurrence import mainloop, mainloop_backward, template
 
     dtype = jnp.result_type(query, key, value)
     device, interpret = mainloop.family_of(dtype), generation.backend() != 'gpu'
     issuing = family or device or mainloop.INTERPRETED
-    if refused := template.inverse_refusal(dtype, delta, bound, issuing.takes_tf32):
-        raise NotImplementedError(refused)
     query, key, value = (x.astype(dtype) for x in (query, key, value))
     # The delta rule's write gate in the operands' dtype, as fla's layer holds it; without the delta rule the
     # call's own, as the portable math takes it (Mamba-2's fp32 `dt`).
@@ -996,7 +978,7 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
     run = {"family": issuing, "interpret": interpret, "tiles": tiles, "floor": floor,
            "ranged": template.ranged(dtype, delta, bound)}
     # The fast backward where its launches hold on the device (a derived launch spills nothing), else none.
-    fast = (mainloop_backward.fast_backward_form(delta, rounded, dtype, issuing.takes_tf32) and g.ndim == 3
+    fast = (mainloop_backward.fast_backward_form(delta, rounded, dtype) and g.ndim == 3
             and mainloop_backward.backward_holds(
                 query, key, value, g, beta, state, tiles=tiles, family=issuing,
                 shared=generation.shared_budget(template.Mosaic.launched()), starts=starts,
