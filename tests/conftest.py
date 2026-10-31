@@ -64,10 +64,11 @@ def bundle(node) -> str:
 
 def _marks_named(config) -> bool:
     """Whether the run names its marks (`-m EXPR` or `-mEXPR`, an empty expression among them), on its command
-    line or in PYTEST_ADDOPTS."""
+    line, in PYTEST_ADDOPTS or in its configuration's addopts."""
     import shlex
 
-    given = [*config.invocation_params.args, *shlex.split(os.environ.get("PYTEST_ADDOPTS", ""))]
+    given = [*config.invocation_params.args, *shlex.split(os.environ.get("PYTEST_ADDOPTS", "")),
+             *config.getini("addopts")]
     return any(arg.startswith("-m") and not arg.startswith("--") for arg in given)
 
 
