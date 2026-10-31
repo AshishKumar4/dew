@@ -4,6 +4,7 @@ scope and alias rules independently of ptxas's scheduling, before the resource g
 import io
 
 import pytest
+from generation_support import COMPILES_ON_CPU
 from jax._src.interpreters import mlir as jax_mlir
 from jax.extend.mlir import ir
 from jaxlib.mlir import passmanager
@@ -262,3 +263,65 @@ def test_a_launch_past_an_allocation_limit_has_no_residency():
     family = bundles.named("mma.sync", "bfloat16")
     assert resources.register_model(family, 1, 128, shared=target.shared_limit + 1, target=target).most == 0
     assert resources.register_model(family, 1, 128, target=target, tmem=target.tmem_columns + 1).most == 0
+
+
+def _masked_loop(x, *, masked: bool, rows: int = 64, steps: int = 4, columns: int = 224):
+    """Each row's maximum of `x` `[rows, steps * columns]` over a loop of `steps` tiles `columns` wide (not a
+    power of two, so its columns' positions take a multiply-high remainder), one fp32 tile carried beside it,
+    each tile masked by position (a column past its row reads -inf) where `masked`."""
+    import jax
+    import jax.numpy as jnp
+    from jax import lax
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import mosaic_gpu as plgpu
+
+    layout = plgpu.Layout.MMA_ACC(jnp.bfloat16, m_warps=4)
+
+    def body(x_ref, o_ref):
+        def step(j, state):
+            maximum, carried = state
+            tile = plgpu.load(x_ref.at[:, pl.ds(j * columns, columns)], layout=layout, optimized=False)
+            if masked:
+                column = j * columns + lax.broadcasted_iota(jnp.int32, (rows, columns), 1)
+                row = lax.broadcasted_iota(jnp.int32, (rows, columns), 0) + 3 * columns
+                tile = jnp.where(column <= row, tile, -jnp.inf)
+            return jnp.maximum(maximum, tile.max(axis=1)), carried + tile
+
+        maximum = plgpu.layout_cast(jnp.full((rows,), -jnp.inf, jnp.float32), layout.reduce(1))
+        carried = plgpu.layout_cast(jnp.zeros((rows, columns), jnp.float32), layout)
+        maximum, carried = lax.fori_loop(0, steps, step, (maximum, carried))
+        plgpu.store(o_ref, maximum + carried.sum(axis=1), optimized=False)
+
+    return plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((rows,), jnp.float32), grid=(1,),
+                        grid_names=("sm",), num_threads=1, thread_name="wg",
+                        compiler_params=plgpu.CompilerParams(approx_math=True))(x)
+
+
+@COMPILES_ON_CPU
+def test_a_hoisted_index_chain_longer_than_ptxas_recomputes_is_held_across_its_loop():
+    """A loop whose tile is masked by its columns' positions and the same loop unmasked, compiled for an A100
+    as the compile gate does: ptxas spills the masked one and not the other, so the pass puts the masked one
+    above the 255 registers a thread holds and the unmasked one under them. The positions are integer chains
+    over the thread id that LLVM hoists out of the loop; longer than ptxas's three recomputed instructions
+    (`kernel_liveness.RECOMPUTED`), they are kept, which the pass counted free."""
+    import functools
+
+    import jax
+    import jax.numpy as jnp
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels
+
+    from dew.nn.kernels import generation
+
+    spec = jax.ShapeDtypeStruct((64, 4 * 224), jnp.float32)
+    found = {}
+    for masked in (False, True):
+        with generation.assumed("sm80"):
+            record, = compile_mosaic_kernels(
+                [KernelCase(f"masked-{masked}", lambda masked=masked: (
+                    functools.partial(_masked_loop, masked=masked), (spec,)), {})], "sm80")
+        kernel, = record["kernels"]
+        peak, = (launch["registers"] for launches in record["lowered"].values() for launch in launches)
+        found[masked] = (kernel["spilled"], peak)
+    assert found[False][0] == 0 < found[True][0]
+    assert found[False][1] <= 255 < found[True][1]
