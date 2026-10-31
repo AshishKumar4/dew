@@ -213,9 +213,10 @@ def _softmax(block: _Block, scratch: _Scratch, outs, *, spec: algebra.Forward, t
     out_ref, maxima_ref, over_ref = outs
     rows, block_k = TCGEN05.rows, tiles.block_k
     value_width = scratch.acc_tmem.shape[1]
-    # A step's tile `PART` columns at a time, their places' layouts inferred from the logits they meet.
-    q_pos = block.first + lax.broadcasted_iota(jnp.int32, (rows, PART), 0)
-    columns = lax.broadcasted_iota(jnp.int32, (rows, PART), 1)
+    # A step's tile `PART` columns at a time, its places' layout stated: a full call reads neither, and an
+    # iota nothing reads takes no inferred layout (2977).
+    q_pos = block.first + plgpu.broadcasted_iota(jnp.int32, (rows, PART), 0, layout=TMEM)
+    columns = plgpu.broadcasted_iota(jnp.int32, (rows, PART), 1, layout=TMEM)
     parts = block_k // PART
 
     def logits(read, index, part, masked):
@@ -258,7 +259,7 @@ def _softmax(block: _Block, scratch: _Scratch, outs, *, spec: algebra.Forward, t
     if spec.form == "causal" or padded:
         # The blocks every query of the block sees whole, below its diagonal and before padding.
         whole = jnp.maximum(jnp.minimum(lax.div(block.first, block_k), blocks - padded), 0)
-    # Its layouts inferred from the walk's carry.
+    # Its layouts inferred from the row reductions the walk's carry meets.
     start = (jnp.full((rows,), -jnp.inf, jnp.float32), jnp.zeros((rows,), jnp.float32))
     def walked(index, carry):
         # A block the query block walks, masked from its first that some query sees in part.
