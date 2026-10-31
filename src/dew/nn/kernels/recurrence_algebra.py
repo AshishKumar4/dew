@@ -783,13 +783,13 @@ def key_decayed_pairs(rows: Callable[[int], jax.Array], keys: Callable[[int], ja
     sub-chunk's range of zero down the rows (and up the keys); past it every pair's value is zero. Every row
     and key is gated once, to its own sub-chunk's first token, and kept in shared memory (`kept`, a loader of
     it back): a key of an earlier sub-chunk is lifted to `s`'s by the decay between their first tokens,
-    `exp2(g_ref_s - g_ref_own)`, a vector a sub-chunk, `PAIR_CEILING` moved from the key's factor to its lift
-    so neither leaves the range `between` holds where their product is in it. Gated for every sub-chunk, every
-    key's exponentials were most of the intra launch (on an H100 1.51 ms, 0.53 without them); carried in
-    registers across the sub-chunks' rolled turns, the gated tiles halved its key block (1.84 ms). The
-    products accumulate in one sum as fla_kda's into its `b_A` (`summed`, an iterable of `(name, lhs, rhs)`
-    taken a product at a time): each its own sum, added after, they were live together (Kimi delta attention's
-    intra launch, 1170 registers a thread on an A100, 519 on an H100)."""
+    `exp2(g_ref_s - g_ref_own)`, a vector a sub-chunk, in two factors of half its exponent each, the key's
+    product with the first taken before the second, so no factor leaves fp32's range where the pair is in it.
+    Gated for every sub-chunk, every key's exponentials were most of the intra launch (on an H100 1.51 ms,
+    0.53 without them); carried in registers across the sub-chunks' rolled turns, the gated tiles halved its
+    key block (1.84 ms). The products accumulate in one sum as fla_kda's into its `b_A` (`summed`, an iterable
+    of `(name, lhs, rhs)` taken a product at a time): each its own sum, added after, they were live together
+    (Kimi delta attention's intra launch, 1170 registers a thread on an A100, 519 on an H100)."""
     def block(c, total):
         # A key block's prefix read once, before its sub-chunks' turns, which are rolled: each one's addresses
         # live within its own turn.
@@ -806,27 +806,31 @@ def key_decayed_pairs(rows: Callable[[int], jax.Array], keys: Callable[[int], ja
 
         own = jax.lax.fori_loop(0, chunk // sub, laid, (jnp.zeros(index.shape, jnp.float32),) * 2)
         down = kept("down", rows(c) * between(prefix, own))
-        # A key gated up to its own sub-chunk's first token, `PAIR_CEILING` taken out of it and given to its
-        # lift: gated up it reaches the ceiling (`factored_range`), and a lift across a steep sub-chunk falls
-        # below `PAIR_FLOOR` where the pair it weighs does not (base-2 prefixes -1, -106, -127 at tokens 0,
-        # 15 and 32: the lift 2^-126, the pair 2^-21).
-        up = kept("up", keys(c) * between((own[0] - PAIR_CEILING, own[1]), prefix))
+        up = kept("up", keys(c) * between(own, prefix))
 
         def turn(s, total):
             place = s * sub
             start = separated(*reference(s, c))
 
             def lifted(earlier, below):
-                # A key's lift from its own sub-chunk's first token to this one's (`between` of their
-                # references, a vector, at most `2^PAIR_CEILING`: this one's is later), laid over the
-                # earlier's keys.
-                lift = between((start[0] + PAIR_CEILING, start[1]), separated(*reference(earlier, c)))
-                return jnp.where(index >= earlier * sub, lift[None, :], below)
+                # A key's lift from its own sub-chunk's first token to this one's, a vector, laid over the
+                # earlier's keys as two factors, each its exponent's half: one power of two would fall below
+                # `PAIR_FLOOR` across a steep sub-chunk where the key it lifts, gated up by as much as
+                # `PAIR_CEILING`, keeps the pair in range (base-2 prefixes -1, -106, -127 at tokens 0, 15 and
+                # 32: the lift 2^-126, the key's factor 2^105, the pair 2^-21).
+                (whole, fraction) = separated(*reference(earlier, c))
+                exponent = jnp.maximum(start[0] - whole, 2 * PAIR_FLOOR)
+                half = jnp.floor(exponent / 2)
+                factors = (_scaled(jnp.exp2(start[1] - fraction), half),
+                           _scaled(jnp.ones_like(half), exponent - half))
+                return tuple(jnp.where(index >= earlier * sub, factor[None, :], under)
+                             for factor, under in zip(factors, below, strict=True))
 
-            lift = jax.lax.fori_loop(0, s + 1, lifted, jnp.zeros(index.shape, jnp.float32))
+            first, second = jax.lax.fori_loop(0, s + 1, lifted, (jnp.zeros(index.shape, jnp.float32),) * 2)
             rows_of = (index >= place) & (index < place + sub)
             return total + summed([("pairs", lambda: jnp.where(rows_of, down(), 0.0),
-                                    lambda: Transposed(jnp.where(index < place + sub, up() * lift, 0.0)))],
+                                    lambda: Transposed(jnp.where(index < place + sub, up() * first * second,
+                                                                 0.0)))],
                                   shape=(chunk, chunk))
 
         return jax.lax.fori_loop(0, chunk // sub, turn, total)
