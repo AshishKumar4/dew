@@ -305,7 +305,7 @@ seams: dependencies: {
 
 seams: "near-copies": {
 	kind:        "near-copy"
-	purpose:     "a sequence of steps written twice drifts apart: one copy is fixed and the other is not"
+	purpose:     "a sequence of steps written twice drifts apart: one copy is fixed and the other is not; an exact copy is tools/duplicates.py's to refuse, and this notes the near ones"
 	paths: ["src/dew/*.py", "src/dew/*/*.py", "src/dew/*/*/*.py", "src/dew/*/*/*/*.py", "src/dew/*/*/*/*/*.py",
 		"tests/*.py", "tools/*.py", "tools/*/*.py", "tools/*/*/*.py"]
 	containment: 0.9
