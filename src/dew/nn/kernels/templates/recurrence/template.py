@@ -128,7 +128,8 @@ class Mosaic(base.Template[mainloop.Tiles]):
         shapes = tuple(None if x is None else jax.ShapeDtypeStruct(x.shape, x.dtype) for x in given)
         dtype = jnp.result_type(*(arguments[name].dtype for name in names[:3]))
         per_head = arguments["g"].ndim == 3
-        forms = mainloop.fast_backward_form(arguments.get("delta", True), arguments.get("rounded", False))
+        forms = mainloop.fast_backward_form(arguments.get("delta", True), arguments.get("rounded", False),
+                                            dtype)
         fast = backward and forms and per_head and dtype != jnp.float32
         family = bundle(target, dtype)
         assert family is not None, f"no bundle of the mainloop claims {target.generation}"
@@ -296,7 +297,8 @@ class Mosaic(base.Template[mainloop.Tiles]):
         arguments = ba.arguments
         dtype = jnp.result_type(*(arguments[name].dtype for name in ("query", "key", "value")))
         sixteen = dtype in (jnp.bfloat16, jnp.float16)
-        forms = mainloop.fast_backward_form(arguments.get("delta", True), arguments.get("rounded", False))
+        forms = mainloop.fast_backward_form(arguments.get("delta", True), arguments.get("rounded", False),
+                                            dtype)
         if not (forms and arguments["g"].ndim == 3 and sixteen):
             return False
         fits = self.fits(ba, target)

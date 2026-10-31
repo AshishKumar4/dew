@@ -989,7 +989,7 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
     run = {"family": family or device or mainloop.INTERPRETED, "interpret": interpret, "tiles": tiles,
            "floor": floor}
     # The fast backward where its launches hold on the device (a derived launch spills nothing), else none.
-    fast = (mainloop.fast_backward_form(delta, rounded) and g.ndim == 3 and dtype != jnp.float32
+    fast = (mainloop.fast_backward_form(delta, rounded, dtype) and g.ndim == 3 and dtype != jnp.float32
             and mainloop.backward_holds(query, key, value, g, beta, state, tiles=tiles, family=run["family"],
                                         shared=generation.shared_budget(template.Mosaic.launched()),
                                         starts=starts, max_segments=max_segments, delta=delta,

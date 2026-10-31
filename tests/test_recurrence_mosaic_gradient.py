@@ -29,7 +29,7 @@ from test_recurrence_mosaic import (
 from whole_suite import timed
 
 from dew.nn.backbones.decoder_block import RematPolicy
-from dew.nn.kernels import recurrence
+from dew.nn.kernels import generation, recurrence
 from dew.nn.kernels.recurrence_chunk import Chunk, mosaic_rule, recomputing
 from dew.nn.kernels.templates import bundles
 from dew.nn.kernels.templates.recurrence import mainloop, template
@@ -156,6 +156,18 @@ def test_a_walk_of_two_roles_is_as_exact_as_its_reference(case, product):
     draws = functools.partial(drawn, jnp.bfloat16, **shape)
     assert_as_exact(with_gradients(walked), with_gradients(reference), draws,
                     f'a two-role walk\'s gradient, {case}', seeds=SEEDS, truth_fn=with_gradients(truth))
+
+
+def test_the_fast_backward_trains_a_bf16_rated_scan_alone():
+    """A rated scan's (Mamba2's SSD) 16-bit gradient under the run's fast forms, whose numbers are mamba_ssm's:
+    the template's fast backward takes a bf16 call and refuses an fp16 one, whose products would take its
+    scores' gradient's bf16 parts (`mainloop._score_grads`) against fp16 keys, so the port trains it
+    (`mainloop.fast_backward_form`)."""
+    hooks = recurrence.Hooks(decay='scalar', rated=True, delta=False, skip=True)
+    shape = geometry('one sequence')
+    with generation.run_precision(dataclasses.replace(generation.numerics(), forms='fast')):
+        assert trained(drawn(jnp.bfloat16, 0, **shape)[0], hooks)
+        assert not trained(drawn(jnp.float16, 0, **shape)[0], hooks)
 
 
 def trained(given: Chunk, hooks: recurrence.Hooks) -> bool:

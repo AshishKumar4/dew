@@ -1785,11 +1785,13 @@ def holds(launches: tuple[Launch, ...], family: mosaic.Family, shared: int) -> b
                for launch in launches)
 
 
-def fast_backward_form(delta: bool, rounded: bool) -> bool:
+def fast_backward_form(delta: bool, rounded: bool, dtype) -> bool:
     """Whether the fast backward takes a call's form (a decay a head in a 16-bit call besides): the delta
-    rule, fla's DAG at fla's rounding, or a `rounded` call without it under the run's fast forms, the same
-    DAG without the delta rule's at mamba_ssm's rounding (`_prepared`)."""
-    return delta or (rounded and generation.numerics().forms == "fast")
+    rule, fla's DAG at fla's rounding, or a bf16 `rounded` call without it under the run's fast forms, the
+    same DAG without the delta rule's at mamba_ssm's rounding (`_prepared`), whose two-part operands
+    (`_score_grads`) are bf16's and an fp16 call's products would take operands of two dtypes."""
+    fast = rounded and jnp.dtype(dtype) == jnp.bfloat16 and generation.numerics().forms == "fast"
+    return delta or fast
 
 
 def backward_holds(q, k, v, g, beta, h0=None, *, tiles: Tiles, family: mosaic.Family, shared: int,
@@ -1824,7 +1826,7 @@ def gradients(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None, fi
     delta rule); the accurate backward is the portable math's token adjoint. Without the delta rule there is
     no system: the corrected values are the values gated, `u = v beta`, whose gradient `du` (the reverse
     walk's) gives `dv = du beta` and `dbeta = sum(v du)`, and the memory walks back with no `w^T dv`."""
-    if not fast_backward_form(delta, rounded):
+    if not fast_backward_form(delta, rounded, jnp.result_type(q, k, v)):
         raise NotImplementedError("the fast backward takes the delta rule, or a rounded call without it "
                                   "under the run's fast forms")
     run = _prepared(q, k, v, g, beta, h0, starts=starts, max_segments=max_segments, scale=scale, delta=delta,
@@ -2073,9 +2075,9 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, call: _Call, tiles: Til
                        **({"w": ((CHUNK, width), held)} if call.delta else {}),
                        out=((CHUNK, walked_width), given), local=((CHUNK, walked_width), grads))
     finals = _streamed(**{f"final{i}": ((call.block, walked_width), final) for i in range(slices)})
-    # The memory's carried gradient: three memory products a chunk.
+    # The memory's carried gradient: three memory products a chunk, two without the delta rule's weights.
     steps = chunks / sequences.shape[0]
-    work = Work(2 * 3 * CHUNK * width * walked_width * steps, steps)
+    work = Work(2 * (2 + call.delta) * CHUNK * width * walked_width * steps, steps)
     # The memory's gradient carried, its key slices in fp32, and the one it gives the chunk before as it is
     # summed; a step's two fp32 tiles at once, the corrected values' gradient beside the local one it adds
     # or the decayed output's gradient read after it (`algebra.reverse_carried`: the local one folds into it
