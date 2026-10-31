@@ -980,9 +980,9 @@ class Trainer(Generic[Loss, Effects]):
     @ruled
     def _compiled_plan(self, state: TrainState, batch: Batch, trials: Trials | None, capacity: int | None,
                        frontier: bool = False) -> Planned:
-        """The shared device-step planner: its record and chosen rung, with `frontier` every rung above it
-        that fits too (`FitSearch.frontier`). The caller reads its lowering before releasing it (`compile`)
-        or serializing its executable (`compile_ahead`)."""
+        """The shared device-step planner: its record and chosen rung, with `frontier` the rungs above it
+        (`FitSearch.above`). The caller reads its lowering before releasing it (`compile`) or serializing its
+        executable (`compile_ahead`)."""
         mesh = self.device_mesh
         links = self._links(mesh)
         shaped = self._at_base_rung(batch)
@@ -1056,7 +1056,7 @@ class Trainer(Generic[Loss, Effects]):
         fits, guided under AutoPGLE (`Planned.guided`), with `plan` its record and the objective at its rung,
         and a microbatch's FLOPs (`plan_flops`). A plan recorded beside the compilation cache
         (`recorded_rung`) is the first candidate, kept untimed; `resumed` is a checkpoint's rung; `capacity`
-        the bytes a device that states none holds (`FitSearch.capacity`); `frontier` asks every rung above."""
+        the bytes a device that states none holds (`FitSearch.capacity`); `frontier` asks the rungs above."""
         replicated = NamedSharding(mesh, P())
         placement = batch_shardings(mesh, batch)
         candidates = splits(self._rows, batch, mesh, self.microbatches, self._split)
