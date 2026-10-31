@@ -875,9 +875,9 @@ def test_a_call_jax_nn_cannot_take_on_a_cpu_runs_the_reference_path(dtype, key_d
     has no F16_F16_F32 dot) or a float32 query over float64 keys (jax.nn takes one dtype), hands off
     (`attention_kernels.XLA_SUPPORTS`): it compiles and runs, its output the reference path's bit for
     bit."""
-    query, key, value = (jax.random.normal(jax.random.key(seed), (1, 16, 2, 8), kind)
-                         for seed, kind in zip(range(3), (dtype, key_dtype, key_dtype), strict=True))
     with jax.enable_x64(new_val=True):
+        query, key, value = (jax.random.normal(jax.random.key(seed), (1, 16, 2, 8), kind)
+                             for seed, kind in zip(range(3), (dtype, key_dtype, key_dtype), strict=True))
         named, reference = (jax.jit(functools.partial(scaled_dot_product_attention, implementation=name,
                                                       causal=True))(query, key, value)
                             for name in ("xla", "reference"))
