@@ -29,7 +29,7 @@ from typing_extensions import TypeVar
 from dew.averaging import ema_update
 from dew.batch import EXAMPLE_ROWS, Batch, Variables, dicts, merge
 from dew.data.dataset import rows_of
-from dew.held_updates import held_places, holds_back, refuse_untold, update_applied
+from dew.held_updates import held_places, holds_back, input_taken, refuse_untold, update_applied
 from dew.nn.inspection import Watched, flattened
 from dew.nn.kernels.options import compiler_options
 from dew.nn.precision import at_least_fp32
@@ -767,10 +767,12 @@ class Transaction:
             advanced = dataclasses.replace(advanced, scale=_advance_scale(scale, finite))
         # An update the optimizer holds back commits nothing yet: its tokens wait in the state
         # (`TrainState.deferred`) for the update that applies them (`update_applied`).
+        # An input the optimizer skipped trains no update, so its tokens wait for none (`input_taken`).
         done = update_applied(state.opt_state, advanced.opt_state)
         counted = due & accepted & done
         if state.deferred is not None:
-            held = _TokenCount.add(state.deferred, held)
+            taken = input_taken(state.opt_state, advanced.opt_state)
+            held = _TokenCount.add(state.deferred, jnp.where(taken, held, 0).astype(jnp.uint32))
             waiting = jnp.where(due & accepted & ~done, held, jnp.where(counted, 0, state.deferred))
             advanced = dataclasses.replace(advanced, deferred=waiting.astype(jnp.uint32))
         return advanced, loss, aux, Committed(

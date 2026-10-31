@@ -25,6 +25,8 @@ class _Hold(NamedTuple):
 
     name: str
     applied: Callable[[Any, Any], jax.Array]
+    taken: Callable[[Any, Any], jax.Array]
+    """Whether the call took its input in, to apply now or later: false where the wrapper skipped it."""
     place: Callable[[Any], jax.Array]
 
 
@@ -36,10 +38,14 @@ def _holds() -> Mapping[type, _Hold]:
     through its state, made here abstractly, so no backend opens."""
     every = type(jax.eval_shape(optax.apply_every().init, ()))
     return {
-        optax.MultiStepsState: _Hold("optax.MultiSteps",
-                                     lambda before, after: after.gradient_step != before.gradient_step,
-                                     lambda state: state.mini_step),
-        every: _Hold("optax.apply_every", lambda before, after: after.count == 0, lambda state: state.count),
+        # A skipped input (`should_skip_update_fn`) moves neither its mini-step nor its gradient step.
+        optax.MultiStepsState: _Hold(
+            "optax.MultiSteps", lambda before, after: after.gradient_step != before.gradient_step,
+            lambda before, after: (after.gradient_step != before.gradient_step)
+            | (after.mini_step != before.mini_step),
+            lambda state: state.mini_step),
+        every: _Hold("optax.apply_every", lambda before, after: after.count == 0,
+                     lambda before, after: jnp.asarray(a=True), lambda state: state.count),
     }
 
 
@@ -49,7 +55,7 @@ def _passed_through() -> Mapping[type, str]:
     from dew.optim import PowerProfilesState
 
     return {optax.InjectHyperparamsState: "inner_state", optax.InjectStatefulHyperparamsState: "inner_state",
-            PowerProfilesState: "inner"}
+            PowerProfilesState: "inner", PhasedState: "inner"}
 
 
 def _outermost(node) -> list:
@@ -85,6 +91,41 @@ def update_applied(before: optax.OptState, after: optax.OptState) -> jax.Array:
     return done
 
 
+def input_taken(before: optax.OptState, after: optax.OptState) -> jax.Array:
+    """Whether the call that took the optimizer's state from `before` to `after` took its input in, to
+    apply now or with a later update: false where the wrapper that holds the whole update back skipped it
+    (`optax.MultiSteps`' `should_skip_update_fn`), whose tokens no update trains on."""
+    table = _holds()
+    taken = jnp.asarray(a=True)
+    for previous, current in zip(_outermost(before), _outermost(after), strict=True):
+        taken = taken & table[type(current)].taken(previous, current)
+    return taken
+
+
+class PhasedState(NamedTuple):
+    """The state of an optimizer whose conditional masks route each update to one of the networks it
+    alternates (`phased`)."""
+
+    inner: optax.OptState
+
+
+def phased(transform: optax.GradientTransformation) -> optax.GradientTransformationExtraArgs:
+    """`transform`, whose conditional masks (`optax.conditionally_mask`) route each update to exactly one of
+    the networks it alternates, as an objective's complementary phases do (`Objective.optimizer`): its
+    update is `transform`'s, and the trainer counts each call an applied update, where it refuses a mask
+    it cannot see apply some network's update (`refuse_untold`)."""
+    inner = optax.with_extra_args_support(transform)
+
+    def init_fn(params):
+        return PhasedState(inner.init(params))
+
+    def update_fn(updates, state, params=None, **extra_args):
+        updates, held = inner.update(updates, state.inner, params, **extra_args)
+        return updates, PhasedState(held)
+
+    return optax.GradientTransformationExtraArgs(init_fn, update_fn)
+
+
 def waiting(opt_state: optax.OptState) -> jax.Array | None:
     """The tokens a fresh run's state holds waiting for an update the optimizer whose state is
     `opt_state` holds back (`TrainState.deferred`): none yet, two uint32 words; None for an optimizer that
@@ -109,55 +150,55 @@ def refuse_untold(opt_state: optax.OptState) -> None:
     """Refuse an optimizer, by its state `opt_state`, that holds an update back where its state does not
     say which call applied one, naming the composition and the one the trainer counts by (`_WHOLE`):
     `optax.apply_if_finite`, which applies a non-finite update past its `max_consecutive_errors`
-    unrecorded; `optax.conditionally_mask` over the whole update, whose condition its state does not hold
-    (one under a partition routes the update, as a consistency objective's phases do, and is not
-    refused); `optax.MultiSteps` with a skip predicate, which discards a skipped input unrecorded; and a
-    wrapper that holds updates back anywhere but over the whole update (`_outermost`): within another,
-    under a mask, a partition or a condition, before a later transform in a chain, or within a wrapper
-    the trainer does not know passes its update through."""
+    unrecorded; `optax.conditionally_mask` anywhere but where `phased` says it routes each update to one
+    network, whose condition its state does not hold; and a wrapper that holds updates back anywhere but
+    over the whole update (`_outermost`): within another, under a mask, a partition or a condition,
+    before a later transform in a chain, or within a wrapper the trainer does not know passes its update
+    through."""
     holds, passed = _holds(), _passed_through()
 
     def refused(composition: str, instead: str = _WHOLE) -> ValueError:
         return ValueError(f"the optimizer holds updates back where its state does not say which call "
                           f"applied one: {composition}; {instead}")
 
-    def visit(node, where: str | None) -> None:
+    def visit(node, where: str | None, routed: bool) -> None:
         if isinstance(node, optax.ApplyIfFiniteState):
             raise refused("optax.apply_if_finite", "drop non-finite steps with Trainer(dynamic_scale=...), "
                           "which leaves a non-finite attempt uncounted and draws its next one afresh")
-        if isinstance(node, optax.ConditionallyMaskState) and where is None:
-            raise refused("optax.conditionally_mask over the whole update")
+        if isinstance(node, optax.ConditionallyMaskState) and not routed:
+            raise refused("optax.conditionally_mask", "alternate networks under dew.held_updates.phased, "
+                          "which routes each update to one of them, or hold updates back with "
+                          "optax.MultiSteps")
         if isinstance(node, tuple(holds)):
             name = holds[type(node)].name
             if where is not None:
                 raise refused(f"{name} {where}")
-            if isinstance(node, optax.MultiStepsState) and jax.tree.leaves(node.skip_state):
-                raise refused("optax.MultiSteps with should_skip_update_fn", "drop non-finite steps with "
-                              "Trainer(dynamic_scale=...), and hold updates back with optax.MultiSteps alone")
             for field in node:
-                visit(field, f"within {name}")
+                visit(field, f"within {name}", routed)
             return
         if type(node) in passed:
-            visit(getattr(node, passed[type(node)]), where)
+            visit(getattr(node, passed[type(node)]), where, routed or isinstance(node, PhasedState))
             return
         if isinstance(node, (optax.MaskedState, optax.PartitionState)):
             inner = "under optax.masked" if isinstance(node, optax.MaskedState) else "under optax.partition"
             for field in node:
-                visit(field, inner)
+                visit(field, inner, routed)
             return
         if isinstance(node, (optax.ConditionallyMaskState, optax.ConditionallyTransformState)):
             for field in node:
-                visit(field, "under a condition (optax.conditionally_mask, optax.conditionally_transform)")
+                visit(field, "under a condition (optax.conditionally_mask, optax.conditionally_transform)",
+                      routed)
             return
         if type(node) in (tuple, list) or isinstance(node, dict):
             members = list(node.values()) if isinstance(node, dict) else list(node)
             for index, member in enumerate(members):
-                visit(member, where if index == len(members) - 1 else "before a later transform in its chain")
+                visit(member, where if index == len(members) - 1 else "before a later transform in its chain",
+                      routed)
             return
         if isinstance(node, tuple):
             unknown = (f"within {type(node).__name__}, which the trainer does not know passes its update "
                        "through")
             for field in node:
-                visit(field, unknown if where is None else where)
+                visit(field, unknown if where is None else where, routed)
 
-    visit(opt_state, None)
+    visit(opt_state, None, routed=False)

@@ -9,11 +9,13 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   `optax.apply_every` last in a chain) counts its update count, EMA, committed tokens and
   `power_profiles`' averages by the updates the optimizer applies, as its state says, where it counted
   every call; the tokens of a held call wait in the state (`TrainState.deferred`) for the update that
-  applies them, and each held call draws its examples afresh. A held update whose state does not say
-  which call applied one is refused before any step, naming the composition and the supported one:
-  `optax.apply_if_finite` (drop non-finite steps with `Trainer(dynamic_scale=...)`),
-  `optax.conditionally_mask` over the whole update, `optax.MultiSteps` with a skip predicate, and a held
-  update within another, under a mask, partition or condition, or before a later transform.
+  applies them, an input `MultiSteps`' skip predicate discards commits none, and each held call draws
+  its examples afresh. A held update whose state does not say which call applied one is refused before
+  any step, naming the composition and the supported one: `optax.apply_if_finite` (drop non-finite
+  steps with `Trainer(dynamic_scale=...)`), `optax.conditionally_mask` anywhere but under
+  `dew.held_updates.phased`, which says each update trains one of the networks it alternates (the
+  consistency objective's phases), and a held update within another, under a mask, partition or
+  condition, or before a later transform.
 - Muon's and M3's Newton-Schulz multiply in the run's numerics: bfloat16 operands in its fast forms
   (the default) and float32 at `Numerics.matmul` in its accurate ones (`--trainer.precision accurate`:
   IEEE float32), each matrix whole on one device and the matrices spread over the mesh. A run states its
