@@ -274,8 +274,10 @@ def _same_bindings(ours: Mapping[str, object], theirs: Mapping[str, object], nam
                    renaming: Renaming, seen: set, *, unbound: bool = False) -> bool:
     """Whether each pair of `names` is bound alike in `ours` and `theirs`: the same object, functions of
     the same code (`same_code`; a module-level helper reads no `self`, so `renaming` holds no
-    attributes), methods of the same function bound to instances alike, equal constants, or instances
-    of one class whose own state is alike (a decorator's context manager, `torch.no_grad()`). A name
+    attributes), methods of the same function bound to instances alike, equal constants, tuples whose
+    items are bound alike (a kernel decorator's parameter names, which LFM2-MoE's copy of LFM2's
+    convolution helpers holds), or instances of one class whose own state is alike (a decorator's
+    context manager, `torch.no_grad()`). A name
     neither binds is a NameError when it runs, not evidence of the same code, unless `unbound` (a name
     a nested scope binds, which reads its own)."""
     for our_name, their_name in names:
@@ -293,6 +295,12 @@ def _same_bindings(ours: Mapping[str, object], theirs: Mapping[str, object], nam
             return False
         elif isinstance(a, int | float | str | bool | bytes | NoneType):
             if a != b:
+                return False
+        elif isinstance(a, tuple) and isinstance(b, tuple):
+            if len(a) != len(b) or not _same_bindings(
+                    {str(index): item for index, item in enumerate(a)},
+                    {str(index): item for index, item in enumerate(b)},
+                    [(str(index), str(index)) for index in range(len(a))], renaming, seen):
                 return False
         # A grad-mode decorator keeps its whole state in its instance's attributes; any other object
         # computes alike only as itself.

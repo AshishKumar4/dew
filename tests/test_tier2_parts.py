@@ -435,6 +435,11 @@ BUILT_IN = {
     "stablelm-parallel": {"model_type": "stablelm", "head_dim": None, "use_parallel_residual": True,
                           "rope_parameters": {"rope_type": "default", "rope_theta": 10000.0,
                                               "partial_rotary_factor": 0.5}},
+    "lfm2": {"head_dim": None, "layer_types": ["conv", "full_attention", "conv", "full_attention"],
+             "conv_L_cache": 3, "block_auto_adjust_ff_dim": False},
+    "lfm2_moe": {"head_dim": None, "layer_types": ["conv", "full_attention", "conv", "full_attention"],
+                 "conv_L_cache": 3, "num_dense_layers": 1, "num_experts": 8, "num_experts_per_tok": 2,
+                 "moe_intermediate_size": 32, "routed_scaling_factor": 1.7},
 }
 """transformers' own types that no registered family reads, each made of known parts, by their fields beside
 `tiny_config`'s: Granite's multipliers, SmolLM3's layers without positions (its fourth), OLMo 2's
@@ -442,12 +447,21 @@ output-normed sublayers, HY-3's routed experts beside a shared one, and GLM-4.7-
 (DeepSeek V3's, whose `head_dim` names the rotated slice, so it is left to the config) with its grouped
 sigmoid router, each of these two's first layer dense and the others routed, and stating one prediction
 depth, which their releases store past the trunk (`with_prediction_depth`); OLMoE's every layer routed
-under OLMo 2's whole-projection query and key norms; and StableLM's layer-normed blocks turning a part of
-each head, in sequence or (`stablelm-parallel`) beside each other off one norm."""
+under OLMo 2's whole-projection query and key norms; StableLM's layer-normed blocks turning a part of
+each head, in sequence or (`stablelm-parallel`) beside each other off one norm; and LFM2's gated short
+convolutions between its attention layers, its modules under names of their own (`operator_norm`,
+`feed_forward.w1`, `out_proj`), and LFM2-MoE's, its layers past the first routed by sigmoid scores and a
+balancing bias, renormalized over a sum with its own epsilon."""
 
 BUILT_IN_SEEDS = {"granite": 8, "smollm3": 8, "olmo2": 8, "hy_v3": 8, "glm4_moe_lite": 8, "olmoe": 8,
-                  "stablelm": 8, "stablelm-parallel": 8}
+                  "stablelm": 8, "stablelm-parallel": 8, "lfm2": 8, "lfm2_moe": 8}
 """Each built-in type's declared check-1 seeds for its logits, sized by `seeds_for` on armada."""
+
+STORED_EXPERT = {"hy_v3": "model.layers.1.mlp.experts.0.gate_proj.weight",
+                 "glm4_moe_lite": "model.layers.1.mlp.experts.0.gate_proj.weight",
+                 "olmoe": "model.layers.1.mlp.experts.0.gate_proj.weight",
+                 "lfm2_moe": "model.layers.1.feed_forward.experts.0.w1.weight"}
+"""A routed type's first stored expert projection, as `save_pretrained` stores its experts one by one."""
 
 
 def with_prediction_depth(directory, layers: int, width: int, extra: tuple[str, ...] = ()) -> None:
@@ -533,8 +547,7 @@ def test_a_built_in_type_of_known_parts_loads_natively(tmp_path, case):
         with_prediction_depth(tmp_path, config.num_hidden_layers, config.hidden_size)
     with safe_open(tmp_path / "model.safetensors", "pt") as stored:
         names = set(stored.keys())
-    routed = model_type in ("hy_v3", "glm4_moe_lite", "olmoe")
-    assert ("model.layers.1.mlp.experts.0.gate_proj.weight" in names) == routed
+    assert model_type not in STORED_EXPERT or STORED_EXPERT[model_type] in names
     verified = verify_mapping(json.loads((tmp_path / "config.json").read_text()))
     assert isinstance(verified, VerifiedMapping) and verified.family == "parts"
     loaded = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
@@ -550,6 +563,35 @@ def test_a_built_in_type_of_known_parts_loads_natively(tmp_path, case):
     assert_as_exact(as_given(lambda ids: np.asarray(forward(loaded.variables, ids), np.float64)),
                     torch_logits(reference), draw, f"{case} logits", seeds=BUILT_IN_SEEDS[case],
                     truth_fn=torch_logits(wide, float64))
+
+
+def test_an_lfm2_of_convolutions_alone_assembles():
+    """An LFM2 whose layers are all gated short convolutions (Lfm2Config allows no attention layer) states
+    its head geometry through its model's config, as its rotary reads it, so it assembles: every layer a
+    `conv` kind, the head tied. transformers' own forward runs it only without a cache (a cache of
+    convolutions alone has no sequence length), as the probe runs every source."""
+    from interop_support import tiny_config
+    from transformers import AutoModelForCausalLM
+
+    with torch.device("meta"):
+        model = AutoModelForCausalLM.from_config(tiny_config("lfm2", head_dim=None, conv_L_cache=4,
+                                                             layer_types=["conv"] * 4))
+    fields = parts.assemble(model).fields
+    assert fields["layer_types"] == ("conv",) * 4 and (fields["num_heads"], fields["num_kv_heads"]) == (4, 2)
+
+
+def test_a_biased_short_convolution_is_left_to_tier_3():
+    """LFM2's biased convolution zeroes its padded slots before its input projection, so they still convolve
+    their bias terms into the next real tokens' history, which Dew's held convolution keeps empty: tier 2
+    assembles none of it."""
+    from interop_support import tiny_config
+    from transformers import AutoModelForCausalLM
+
+    with torch.device("meta"):
+        model = AutoModelForCausalLM.from_config(tiny_config("lfm2", head_dim=None, conv_bias=True,
+                                                             layer_types=["conv", "full_attention"] * 2))
+    with pytest.raises(parts.Ambiguous):
+        parts.assemble(model)
 
 
 def test_a_stored_name_reads_as_the_sources_load_reads_it():
