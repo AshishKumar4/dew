@@ -1716,6 +1716,14 @@ class _SiteTerms:
         return terms
 
 
+HOST_WORK = (jax.errors.TracerArrayConversionError, jax.errors.ConcretizationTypeError,
+             jax.errors.TracerIntegerConversionError, jax.errors.TracerBoolConversionError,
+             jax.errors.NonConcreteBooleanIndexError, TypeError, AttributeError)
+"""What tracing a truth that does host work raises (NumPy, torch or Python control flow on its values,
+torch's own conversions a TypeError or a missing `__dlpack_device__`): `_cancelling_terms` takes it as a
+truth with no program, never as a failure of the site, which the truth's own eager run reports."""
+
+
 def _cancelling_terms(draw, truth):
     """The truth program a site's rows are sized by their terms with (`assert_as_exact`'s `terms`), where
     its truth holds a row of float64 zero (below RESOLUTION of its leaf) on its first draw, decided from the
@@ -1733,12 +1741,18 @@ def _cancelling_terms(draw, truth):
         return None
     # Its terms read once, on the same draw: only a zero row whose terms are not zero too gains a size,
     # so a site whose zero rows sum nothing (a query that keeps no key) keeps the reference's residue rule
-    # without tracing its terms a draw.
-    with jax.enable_x64(new_val=True):
-        truths, terms = float64_terms(truth, *widened(draw(0)))
-    plain, termed = _LaidTruths.of(jax.tree.leaves(truths)), _LaidTruths.of(
-        jax.tree.leaves(truths), _term_leaves(terms, truths))
-    return truth if bool(np.any((plain.sizes == 0) & (termed.sizes > 0))) else None
+    # without tracing its terms a draw. A truth that does host work (NumPy or torch on its values) has no
+    # program to trace, so no terms: it keeps the residue rule, and runs as it always has.
+    try:
+        with jax.enable_x64(new_val=True):
+            truths, terms = float64_terms(truth, *widened(draw(0)))
+    except HOST_WORK as untraced:
+        traced = f"untraced: {type(untraced).__name__}"
+    else:
+        plain, termed = _LaidTruths.of(jax.tree.leaves(truths)), _LaidTruths.of(
+            jax.tree.leaves(truths), _term_leaves(terms, truths))
+        traced = bool(np.any((plain.sizes == 0) & (termed.sizes > 0)))
+    return truth if traced is True else None
 
 
 def _site(dew_fn, reference_fn, label: str, *, seeds: int, truth_fn, library_fn, library_row, library_leaves,
