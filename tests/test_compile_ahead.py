@@ -158,15 +158,14 @@ def test_a_step_compiled_ahead_saves_and_loads_whole_and_runs_only_on_its_own_gp
 
 @pytest.mark.parametrize("generation", ["sm90", "sm100", "sm120"])
 def test_a_compile_only_gpu_assembles_mosaic_gpus_architecture_specific_code(generation):
-    """A Mosaic GPU kernel compiled for a compile-only GPU of each generation from Hopper on: its PTX targets
-    the architecture-specific variant (sm_90a, sm_100a, sm_120a), which the device's capability states, so
-    it assembles. An sm120 stating no feature extension assembled for plain sm_120 and refused its own PTX
+    """A Mosaic GPU kernel compiled for a compile-only GPU of each generation from Hopper on, in a process
+    that assembles for that generation alone (`compile_mosaic_kernels`): its PTX targets the
+    architecture-specific variant (sm_90a, sm_100a, sm_120a), which the device's capability states, so it
+    assembles. An sm120 stating no feature extension assembled for plain sm_120 and refused its own PTX
     ('.target sm_120a cannot be compiled for architecture sm_120')."""
+    from fla_gdn_support import KernelCase
     from jax.experimental.pallas import mosaic_gpu as plgpu
-    from jax.sharding import NamedSharding, PartitionSpec
-
-    from dew.nn.kernels import generation as generations
-    from dew.training.ahead import compile_only_gpus
+    from kernel_compile import compile_mosaic_kernels
 
     def body(source, out, staged, barrier):
         plgpu.copy_gmem_to_smem(source, staged, barrier.at[0])
@@ -177,11 +176,9 @@ def test_a_compile_only_gpu_assembles_mosaic_gpus_architecture_specific_code(gen
     kernel = plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((64, 64), jnp.bfloat16), num_threads=1,
                           thread_name="wg", scratch_types=[plgpu.SMEM((64, 64), jnp.bfloat16),
                                                            plgpu.Barrier(num_barriers=1)])
-    devices = jax.sharding.Mesh(np.array(compile_only_gpus(generation)), ("data",))
-    spec = jax.ShapeDtypeStruct((64, 64), jnp.bfloat16, sharding=NamedSharding(devices, PartitionSpec()))
-    mesh = generations.gpu_mesh(devices, generation)
-    with generations.assumed(generation), jax.sharding.use_abstract_mesh(mesh):
-        jax.jit(kernel).trace(spec).lower().compile()
+    spec = jax.ShapeDtypeStruct((64, 64), jnp.bfloat16)
+    record, = compile_mosaic_kernels([KernelCase("copy", lambda: (kernel, (spec,)), {})], generation)
+    assert "error" not in record, record["error"]
 
 
 @pytest.mark.mesh(devices=8)
