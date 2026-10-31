@@ -244,15 +244,61 @@ def test_an_inner_product_of_vectors_takes_no_workspace():
 def test_a_ragged_product_holds_its_ragged_operand_once_a_group_on_a_gpu():
     """XLA's GPU compiler expands a ragged product its grouped kernels do not take, every float32 one, into
     a product over its groups (`RaggedDotRewriter`, xla/hlo/transforms/expanders/ragged_dot_rewriter.cc):
-    one of rows ragged in their non-contracting dimension holds those rows masked once a group while it
-    multiplies, as the select lays them out and groups first, with the mask, a byte an element; its
-    gradient in the weights, ragged in its contracting dimension, holds both operands so."""
+    rows ragged in their non-contracting dimension become a select of their broadcast once a group
+    (`RaggedToDense`), which the product contracts over its group and feature dimensions apart, so XLA's
+    dot decomposer lays it out again with those two adjacent (`DotDecomposer`): two buffers of the rows
+    once a group while it multiplies, on a CPU none."""
     from dew.training.footprint import peak_bytes
 
     rows, sizes = jax.ShapeDtypeStruct((64, 16), jnp.float32), jax.ShapeDtypeStruct((4,), jnp.int32)
     weights = jax.ShapeDtypeStruct((4, 16, 32), jnp.float32)
     program = jax.make_jaxpr(lambda rows, weights, sizes: jax.lax.ragged_dot(rows, weights, sizes))(
         rows, weights, sizes).jaxpr
-    # The output (64 x 32) beside the rows masked once for each of the 4 groups, twice, and the mask.
-    assert peak_bytes(program, "gpu", 0) == (64 * 32 + 2 * 4 * 64 * 16) * 4 + 4 * 64 * 16
+    # The output (64 x 32) beside the rows masked once for each of the 4 groups, in two layouts.
+    assert peak_bytes(program, "gpu", 0) == (64 * 32 + 2 * 4 * 64 * 16) * 4
     assert peak_bytes(program, "cpu", 0) == 64 * 32 * 4
+
+
+def test_a_ragged_products_mask_is_one_buffer_its_expansions_share():
+    """Two ragged products of operands of one shape, over one group sizes and ragged in one dimension,
+    compute one mask (XLA's common-subexpression elimination of `RaggedToDense`'s compares), which both
+    selects read, so it is held, a byte an element, beside both expansions; a product of its own reads
+    its mask within its select's fusion."""
+    from dew.training.footprint import peak_bytes
+
+    rows, sizes = jax.ShapeDtypeStruct((64, 16), jnp.float32), jax.ShapeDtypeStruct((4,), jnp.int32)
+    weights = jax.ShapeDtypeStruct((4, 16, 32), jnp.float32)
+
+    def twice(first, second, weights, sizes):
+        return jax.lax.ragged_dot(first, weights, sizes), jax.lax.ragged_dot(second, weights, sizes)
+
+    program = jax.make_jaxpr(twice)(rows, rows, weights, sizes).jaxpr
+    expansion, mask = 2 * 4 * 64 * 16 * 4, 4 * 64 * 16
+    # The first product's output held while the second expands, and the mask both share.
+    assert peak_bytes(program, "gpu", 0) == 64 * 32 * 4 * 2 + expansion + mask
+
+
+def test_ragged_products_over_one_operand_ragged_in_two_axes_expand_it_twice():
+    """Two ragged products of one square operand over one group sizes, ragged in its first dimension and
+    in its second, expand it twice: each expansion masks its own dimension (`RaggedToDense`'s iota runs
+    over the ragged one), so they are no common subexpression and are held together where their reads
+    overlap."""
+    from dew.training.footprint import peak_bytes
+
+    square, sizes = jax.ShapeDtypeStruct((32, 32), jnp.float32), jax.ShapeDtypeStruct((4,), jnp.int32)
+    weights = jax.ShapeDtypeStruct((4, 32, 8), jnp.float32)
+
+    def ragged_in(axis: int):
+        numbers = jax.lax.RaggedDotDimensionNumbers(
+            dot_dimension_numbers=(([1 - axis], [1]), ([], [])), lhs_ragged_dimensions=[axis],
+            rhs_group_dimensions=[0])
+        return lambda square, weights, sizes: jax.lax.ragged_dot_general(square, weights, sizes, numbers)
+
+    def both(square, weights, sizes):
+        first, second = ragged_in(0), ragged_in(1)
+        return first(square, weights, sizes) + second(square, weights, sizes) + first(square, weights, sizes)
+
+    alone = jax.make_jaxpr(ragged_in(0))(square, weights, sizes).jaxpr
+    program = jax.make_jaxpr(both)(square, weights, sizes).jaxpr
+    expansion = 2 * 4 * 32 * 32 * 4
+    assert peak_bytes(program, "gpu", 0) >= peak_bytes(alone, "gpu", 0) + expansion
