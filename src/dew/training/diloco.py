@@ -18,6 +18,7 @@ whose windows commit with the others' but where a group's loss is not finite.
 from __future__ import annotations
 
 import dataclasses
+import math
 from collections.abc import Callable
 
 import jax
@@ -29,7 +30,7 @@ from dew.distributed.placement import Placement
 from dew.mesh import DILOCO_AXIS
 from dew.state import REPLICA_FIELDS, Replicas, TrainState
 
-__all__ = ["DiLoCo", "grouped", "on_groups", "rated", "rates_set"]
+__all__ = ["DiLoCo", "grouped", "on_groups", "rated", "rates_set", "shared_by_groups"]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -143,13 +144,33 @@ def rates_set(state: TrainState, setting: Callable[[optax.OptState], optax.OptSt
 
 def grouped(shardings: Callable[[TrainState], Placement[TrainState]],
             state: TrainState) -> Placement[TrainState]:
-    """Where a DiLoCo state's fields sit (`Trainer.shardings`, `shardings`): the outer fields as one run's,
-    and each group's inner state as one run's state, stacked over the groups (`on_groups`)."""
+    """Where a DiLoCo state's fields sit (`Trainer.shardings`, `shardings`): each group's inner state as one
+    run's state, stacked over the groups (`on_groups`), and the outer model, its optimizer state and its
+    EMA as one run's, further split over the groups where a dimension divides (`shared_by_groups`): only
+    the groups' meeting reads them, so each group holds a share."""
     inner = shardings(dataclasses.replace(state, inner=None, **{field: jax.tree.map(
         lambda leaf: jax.ShapeDtypeStruct(leaf.shape[1:], leaf.dtype), getattr(state.inner, field))
         for field in REPLICA_FIELDS}))
-    return dataclasses.replace(shardings(dataclasses.replace(state, inner=None)), inner=Replicas(
+    outer = shardings(dataclasses.replace(state, inner=None))
+    outer = dataclasses.replace(outer, **{field: jax.tree.map(shared_by_groups, getattr(outer, field),
+                                                              getattr(state, field))
+                                          for field in ("variables", "opt_state", "ema")})
+    return dataclasses.replace(outer, inner=Replicas(
         **{field: jax.tree.map(on_groups, getattr(inner, field)) for field in REPLICA_FIELDS}))
+
+
+def shared_by_groups(sharding: NamedSharding, leaf) -> NamedSharding:
+    """`sharding` of a leaf of the outer state further split over the diloco axis on its first dimension
+    that the groups and the axes already splitting it divide; as it is where none does."""
+    groups = sharding.mesh.shape[DILOCO_AXIS]
+    shape = jnp.shape(leaf)
+    spec = list(sharding.spec) + [None] * (len(shape) - len(sharding.spec))
+    for dim, size in enumerate(shape):
+        names = () if spec[dim] is None else spec[dim] if isinstance(spec[dim], tuple) else (spec[dim],)
+        if groups > 1 and size % (groups * math.prod(sharding.mesh.shape[name] for name in names)) == 0:
+            spec[dim] = (DILOCO_AXIS, *names)
+            return NamedSharding(sharding.mesh, P(*spec), memory_kind=sharding.memory_kind)
+    return sharding
 
 
 def on_groups(sharding: NamedSharding) -> NamedSharding:
