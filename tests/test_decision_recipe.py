@@ -16,6 +16,7 @@ from dew.decision import Choice, Decide, decisions
 from dew.decision.config import DecisionRunConfig
 from dew.decision.scoring import ScoringRule
 from dew.registry import from_record
+from dew.training import LocalTracker
 from dew.training.evaluation import Summary
 
 pytestmark = pytest.mark.mesh
@@ -93,10 +94,9 @@ def test_a_decision_run_scores_each_split_with_its_own_metrics_and_ranks_by_thei
         default=DecisionRunConfig(data=asked(train), validation={"val": asked(held), "test": asked(held)}))
     config.run()
     run = tmp_path / "runs" / "splits"
-    logged = [json.loads(line) for line in (run / "tracking" / "scalars.jsonl").read_text().splitlines()]
     scores = {}
-    for row in logged:
-        scores.setdefault(row["step"], {}).update(row["scalars"])
+    for step, values in LocalTracker(run / "tracking").scalars():
+        scores.setdefault(step, {}).update(values)
     for step in (1, 2):
         names = {name for name in scores[step] if name.rpartition("/")[0] in ("val", "test", Summary.SPLIT)}
         assert names == {"val/loss", "val/accuracy", "test/loss", "test/accuracy", "test/brier", board}
@@ -308,8 +308,7 @@ def test_a_decision_run_fine_tunes_on_a_mixture_by_the_weights_its_descriptor_an
     [summary] = [entry["value"]["summary"] for entry in recorded if entry["type"] == "RunRecord"]
     assert summary["mixture"] == {"tickets": 3.0, "billing": 2.0}
     assert summary["made"] == json.loads(Path(descriptor).read_text())
-    logged = [json.loads(line) for line in (tracking / "scalars.jsonl").read_text().splitlines()]
-    assert any("val/loss" in row["scalars"] for row in logged)
+    assert any("val/loss" in values for _, values in LocalTracker(tracking).scalars())
     with pytest.raises(ValueError):
         mixture(str(tmp_path / "mixture"), weights={"tickets": 0.0, "billing": 0.0}, descriptor=descriptor)
 

@@ -513,9 +513,9 @@ def test_an_iterator_resumes_through_its_own_state_or_by_replaying():
     """A stateful iterator resumes through state= and load_state=, and one without them by
     replaying the records it already gave; both continue exactly where they stopped."""
     # The state is a NumPy array, as a library's own state often holds, through the JSON checkpoint.
-    for source in (from_iter(Countdown, name="countdown", state=lambda it: np.array([it.next]),
+    for source in (from_iter(Countdown, identity="countdown", state=lambda it: np.array([it.next]),
                              load_state=lambda it, saved: setattr(it, "next", int(saved[0]))),
-                   from_iter(Countdown, name="replayed", replay=True)):
+                   from_iter(Countdown, identity="replayed", replay=True)):
         reader = compile(source.repeat().batch(4), read="streamed", loading=READ).train(DataPartition())
         try:
             first = [next(reader)["i"].tolist() for _ in range(3)]
@@ -590,7 +590,7 @@ def test_an_iterator_without_a_position_or_a_declared_replay_does_not_resume():
     """A stateless iterator that declares no replay reads and reports how far
     it read, but refuses to resume, where one that declares either resumes
     (`test_an_iterator_resumes_through_its_own_state_or_by_replaying`)."""
-    source = from_iter(Countdown, name="undeclared")
+    source = from_iter(Countdown, identity="undeclared")
     reader = compile(source.repeat().batch(4), read="streamed", loading=READ).train(DataPartition())
     try:
         next(reader)
@@ -607,10 +607,11 @@ def test_an_iterator_without_a_position_or_a_declared_replay_does_not_resume():
 
 
 def test_an_iterator_resuming_through_its_state_cannot_also_declare_a_replay():
-    from_iter(Countdown, name="stateful", state=lambda it: 0, load_state=lambda it, saved: None)
-    from_iter(Countdown, name="replayed", replay=True)
+    from_iter(Countdown, identity="stateful", state=lambda it: 0, load_state=lambda it, saved: None)
+    from_iter(Countdown, identity="replayed", replay=True)
     with pytest.raises(ValueError):
-        from_iter(Countdown, name="both", state=lambda it: 0, load_state=lambda it, saved: None, replay=True)
+        from_iter(Countdown, identity="both", state=lambda it: 0, load_state=lambda it, saved: None,
+                  replay=True)
 
 
 def test_a_hugging_face_stream_resumes_exactly_and_its_own_shuffle_is_refused():
@@ -621,7 +622,7 @@ def test_a_hugging_face_stream_resumes_exactly_and_its_own_shuffle_is_refused():
     import datasets
 
     stream = datasets.IterableDataset.from_generator(lambda: ({"i": i} for i in range(40)))
-    source = from_hf(stream, name="counting@1")
+    source = from_hf(stream, identity="counting@1")
     reader = compile(source.repeat().batch(4), read="streamed", loading=READ).train(DataPartition())
     try:
         first = [next(reader)["i"].tolist() for _ in range(3)]
@@ -638,7 +639,7 @@ def test_a_hugging_face_stream_resumes_exactly_and_its_own_shuffle_is_refused():
         resumed.close()
     assert [row["i"] for row in source] == list(range(40))
     with pytest.raises(ValueError):
-        from_hf(stream.shuffle(seed=0, buffer_size=8).map(lambda row: row), name="shuffled@1")
+        from_hf(stream.shuffle(seed=0, buffer_size=8).map(lambda row: row), identity="shuffled@1")
     with pytest.raises(ValueError):
         from_hf(stream)
 
@@ -664,7 +665,7 @@ def test_hugging_face_stream_shares_are_disjoint_and_resume_exactly(shard_count,
     import datasets
 
     stream = datasets.IterableDataset.from_generator(hf_rows, gen_kwargs={"shards": list(range(shard_count))})
-    source = from_hf(stream, name=f"sharded-{shard_count}@1")
+    source = from_hf(stream, identity=f"sharded-{shard_count}@1")
     chain = (source.map(lambda row: {**row, "twice": 2 * row["i"]}, identity="twice@1")
              .interleave(2).repeat(1).batch(2))
     data = compile(chain, read="streamed", loading=dataclasses.replace(READ, workers=workers))
@@ -713,7 +714,7 @@ def test_a_hugging_face_stream_cache_publishes_only_its_store_shards(tmp_path, s
     path = tmp_path / "records.jsonl"
     path.write_text("".join(json.dumps({"i": index}) + "\n" for index in range(12)))
     stream = datasets.IterableDataset.from_generator(hf_file_rows, gen_kwargs={"shards": [str(path)]})
-    source = from_hf(stream, name="cached-counting@1")
+    source = from_hf(stream, identity="cached-counting@1")
     cache, key = Cache((tmp_path / "cache").as_uri()), Manifest(source.fingerprint())
     manifest = source.manifest()
     cached = dataclasses.replace(manifest, reader=cache.streamed(manifest.reader, key))
