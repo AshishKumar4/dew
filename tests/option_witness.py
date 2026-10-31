@@ -35,12 +35,6 @@ from dew.config import RunConfig
 from dew.decision.layout import QuestionSegment, Reads, built_in
 from dew.registry import objectives
 
-"""A learning rate no kind takes by default, which the run's optimizer logs as it steps."""
-
-
-"""A module of each kind's model a `lora` adapts."""
-"""A metric each kind scores where `val_metrics` names none, for the kinds that score one."""
-
 
 def members_of(annotation: type, base=None) -> list[object]:
     """The values of Dew's classes that are `annotation`s: every member of a registry kind
@@ -560,7 +554,7 @@ def unread(task, before: dict[str, object], option) -> str | None:
     """Why the loaded `task` does not consume `option`, None where it does: it holds it nowhere it held
     another before (`held`), or a request of it answers as the same task does holding there what it held
     before (`answers`): the same weights, drawn afresh so every part of the model answers its input
-    (`drawn_afresh`), the option alone apart, so what differs is the consumer's work with it, not its
+    (`model_support.moved`), the option alone apart, so what differs is the consumer's work with it, not its
     record. A request of one task answers alike twice, so an answer apart is the option's alone."""
     places = [path for path, inner in held(task).items()
               if same(inner, option) and path in before and not same(before[path], inner)]

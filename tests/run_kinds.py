@@ -35,6 +35,7 @@ TINY_LAYA = Path(__file__).parent / "fixtures" / "laya" / "tiny"
 QWEN_TINY = Path(__file__).parent / "fixtures" / "hf" / "qwen38-dense-tiny"
 DIFFUSION_GEMMA = Path(__file__).parent / "fixtures" / "hf" / "diffusion-gemma-sft"
 RATE = 0.0123
+"""A learning rate no kind takes by default, which the run's optimizer logs as it steps."""
 @dataclasses.dataclass(frozen=True)
 class MostlyKept:
     """A record kept by its draw three times in four (`Pipeline.random_filter_map`): which records a
@@ -134,7 +135,9 @@ def jepa(root: Path, drawn: bool) -> RunConfig:
 
 KINDS = {"lm": lm, "decision": decision, "diffusion": diffusion, "jepa": jepa}
 ADAPTED = {"lm": ("q_proj",), "decision": ("q_proj",), "diffusion": ("ada_proj",), "jepa": ("up_proj",)}
+"""A module of each kind's model a `lora` adapts."""
 DEFAULT_METRICS = {"lm": "val/perplexity", "decision": "val/accuracy"}
+"""A metric each kind scores where `val_metrics` names none, for the kinds that score one."""
 def scalars(run: Path) -> dict[int, dict[str, float]]:
     """Each step's scalars the run logged, joined."""
     logged = {}
