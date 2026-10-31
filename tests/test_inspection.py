@@ -838,3 +838,27 @@ def test_a_distribution_matching_student_updates_cotangent_reaches_its_trained_c
     probes = rcm_probes(windows, tmp_path, student=True, consistency_weight=0.0)
     trained = jax.tree.leaves({name: tree for name, tree in probes.items() if name != FAKE_SCORE})
     assert trained and all(leaf[..., 0].min() > 0 and np.isfinite(leaf[..., 2]).all() for leaf in trained)
+
+
+@pytest.mark.mesh(devices=4)
+@pytest.mark.parametrize("stacked", ["scanned", "pipelined"])
+def test_a_path_glob_selects_the_layer_its_log_names(stacked):
+    """A glob over a module's path names it as the log does, by its layer's place in the decoder (row
+    3126): `layers_2/*` summarizes layer 2's modules alone, whether the decoder scans its layers as one
+    run (`layers_0_3`) or pipelines them over two stages (`stages/layers_j`)."""
+    from model_support import TINY_DECODER
+
+    from dew.objectives.lm import LMObjective
+    from dew.registry import models
+    from dew.training import MeshSpec
+
+    fields = {**TINY_DECODER, "num_layers": 4, **({"scan_layers": True} if stacked == "scanned" else {})}
+    model = models.build("causal_transformer", vocab_size=64, **fields, num_kv_heads=2)
+    placed = ({"microbatches": 2, "mesh": MeshSpec(fsdp=2, stage=2).build(jax.devices()[:4])}
+              if stacked == "pipelined" else {})
+    run = Trainer(LMObjective(model, 16), optax.sgd(RATE), key=jax.random.key(0), **placed,
+                  inspection=Inspection(modules=("layers_2/*",), targets=("params",)))
+    tokens = np.random.default_rng(1).integers(1, 64, size=(8, 17)).astype(np.int32)
+    layers = {name.split("/")[2] for name in inspected(run, {"text": tokens})
+              if name.startswith("inspect/activations/")}
+    assert layers == {"layers_2"}
