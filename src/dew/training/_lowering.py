@@ -125,6 +125,40 @@ def _read_calls[T](lowered: jax.stages.Lowered, read: Callable[[str, ir.Operatio
     return _read(lowered, call)
 
 
+def lowered_kernels(lowered: jax.stages.Lowered) -> list[KernelCall]:
+    """Each kernel call operation a lowered program's StableHLO module holds once, in the order JAX lowered
+    them: the entry's operations in order, each function it calls lowered where its first call site is
+    (`jax.jit`'s and `tuning.lowered_once`'s callees, lowered once however many calls reach them). A
+    kernel's compile reports printed as it lowered (Mosaic GPU's resource estimate) come in this order."""
+    module = lowered.compiler_ir(dialect="stablehlo")
+    assert module is not None, "a lowered program always has its StableHLO module"
+    found: list[KernelCall] = []
+    with module.context:
+        functions = {ir.StringAttr(op.attributes["sym_name"]).value: op
+                     for op in module.body.operations if op.operation.name == "func.func"}
+        lowered_functions: set[str] = set()
+
+        def lower(name: str) -> None:
+            lowered_functions.add(name)
+
+            def visit(operation: ir.Operation) -> ir.WalkResult:
+                if operation.name == "func.call":
+                    callee = ir.FlatSymbolRefAttr(operation.attributes["callee"]).value
+                    if callee not in lowered_functions and callee in functions:
+                        lower(callee)
+                elif operation.name == "stablehlo.custom_call":
+                    target = ir.StringAttr(operation.attributes["call_target_name"]).value
+                    kind = custom_call_kind(target)
+                    if kind != "no_matmul":
+                        found.append(_kernel_call(kind, target, operation))
+                return ir.WalkResult.ADVANCE
+
+            functions[name].operation.walk(visit, ir.WalkOrder.PRE_ORDER)
+
+        lower("main")
+    return found
+
+
 def operations(lowered: jax.stages.Lowered) -> list[str]:
     """The name of every operation a lowered program's StableHLO module holds, in program order (a
     collective a `shard_map` body issues among them, `stablehlo.all_gather`)."""

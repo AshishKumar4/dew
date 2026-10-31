@@ -32,7 +32,7 @@ from kernel_liveness import Compiler, LoweredRegisters, lowered_registers
 
 from dew.nn.kernels.generation import assumed, capability, gpu_mesh, gpu_target
 from dew.nn.kernels.templates import report, resources
-from dew.training._lowering import kernel_calls, triton_kernels
+from dew.training._lowering import lowered_kernels, triton_kernels
 from dew.training.ahead import compile_only_gpus
 
 REFUSED = re.compile(r"Shared memory size limit exceeded: requested (\d+)")
@@ -215,12 +215,13 @@ def _compiled(case, generation: str, record: dict,
     except Exception as error:  # A case that does not lower is its own failure.
         record["error"] = f"it does not lower: {str(error)[-800:]}"
         return None
-    calls = [call for call in kernel_calls(lowered) if call.kind == "mosaic_gpu"]
+    # Each kernel once, as JAX lowered it (a function's kernels however many calls reach them).
+    calls = [call for call in lowered_kernels(lowered) if call.kind == "mosaic_gpu"]
     named = [traced(call.name, call.launch) for call in calls]
     modules = kernel_modules(calls)
     if directory is not None:
         record["modules"] = modules
-        record["estimates"] = _estimates(calls, named, "".join(estimated))
+        record["estimates"] = _estimates(calls, "".join(estimated))
     if "models" in record:
         record["lowered"] = {
             name: [dataclasses.asdict(launch) for launch in lowered_registers(call.ir, _compiler())]
@@ -256,17 +257,18 @@ def kernel_modules(calls: list) -> dict[str, str]:
     return modules
 
 
-def _estimates(calls: list, named: list[str], printed: str) -> dict[str, str]:
-    """Each Mosaic GPU call's resource estimate by its kernel's name and launch (`named`, `traced`), from
-    what its lowering printed: Pallas
-    prints one a kernel as it lowers it, in the program's order, which the calls keep; a lowering JAX
-    cached prints none, its kernels' estimates kept by their module from the lowering that printed them
-    (`ESTIMATES`)."""
+def _estimates(calls: list, printed: str) -> dict[str, str]:
+    """Each Mosaic GPU call's resource estimate by its kernel's name and launch (`traced`), from what its
+    lowering printed: Pallas prints one a kernel as it lowers it, in the order JAX lowers them, which
+    `calls` keep (`lowered_kernels`: a function's kernels where its first call is, once however many calls
+    reach it; `kernel_calls` counts each call and walks the program function by function, which paired a
+    nested launch's estimates with another's); a lowering JAX cached prints none, its kernels' estimates
+    kept by their module from the lowering that printed them (`ESTIMATES`)."""
     printed_estimates = ["Resources(" + part for part in printed.split("Resources(")[1:]]
     if len(printed_estimates) == len(calls):
         for call, estimate in zip(calls, printed_estimates, strict=True):
             ESTIMATES[call.config] = estimate
-    return {name: ESTIMATES[call.config] for name, call in zip(named, calls, strict=True)
+    return {traced(call.name, call.launch): ESTIMATES[call.config] for call in calls
             if call.config in ESTIMATES}
 
 
