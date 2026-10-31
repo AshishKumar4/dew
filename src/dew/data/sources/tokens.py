@@ -12,7 +12,7 @@ import numpy as np
 from dew.batch import Batch
 from dew.data.dataset import Ranges, Records
 from dew.data.pipeline import Dataset
-from dew.data.storage import Store, local
+from dew.data.storage import Declared, Store, local
 
 from .base import Read, ShardManifest, _indexed_manifest, url_label
 from .files import Files, export_content
@@ -52,12 +52,15 @@ class TokenRecords:
     field: str
     eos_id: int | None = None
     storage_options: Mapping[str, object] | None = None
+    declared: tuple[Declared, ...] = ()
+    """Each shard as the export's manifest declares it (`Declared`), read as declared or refused."""
 
     @cached_property
     def records(self):
         from .records import ArrayRecords
 
-        return ArrayRecords(self.paths, self.storage_options, counts=self.documents.counts)
+        return ArrayRecords(self.paths, self.storage_options, counts=self.documents.counts,
+                            declared=self.declared or None)
 
     @cached_property
     def documents(self) -> Ranges:
@@ -179,6 +182,7 @@ class TokenFiles(Dataset):
         root = Store(self.url, self.storage_options)
         indexes = []
         paths = []
+        declared = []
         entries = committed["files"]
         if not isinstance(entries, list):
             raise ValueError("token export files must be a list")
@@ -194,9 +198,10 @@ class TokenFiles(Dataset):
                 raise ValueError("token export index needs length and cumulative end columns")
             indexes.append(index)
             paths.append(root.child(entry["path"]).url)
+            declared.append(Declared(root.child(entry["path"]), entry))
         # The field of each record that holds its tokens, "text" where the export names none.
         return TokenRecords(tuple(paths), tuple(indexes), str(self.meta.get("dtype", "int32")),
-                            self.field or "text", eos, self.storage_options)
+                            self.field or "text", eos, self.storage_options, tuple(declared))
 
     def stated(self) -> Mapping[str, object]:
         """What the store's manifest says of its tokens, none of them read (`Dataset.facts`): their

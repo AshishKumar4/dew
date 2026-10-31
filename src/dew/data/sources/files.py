@@ -8,6 +8,7 @@ import io
 import itertools
 import json
 import math
+import os
 import posixpath
 import threading
 from collections.abc import Iterator, Mapping, Sequence
@@ -32,7 +33,16 @@ from dew.batch import Batch
 from dew.data.dataset import Ranges, Records
 from dew.data.pipeline import Dataset
 from dew.data.steps.generic import Fields
-from dew.data.storage import Readable, Store, commit_export, content_version, in_memory, local, on_gcs
+from dew.data.storage import (
+    Declared,
+    Readable,
+    Store,
+    commit_export,
+    content_version,
+    in_memory,
+    local,
+    on_gcs,
+)
 
 from .base import Read, Shard, ShardManifest, preparing, url_label
 from .index import ArrayIndex
@@ -175,13 +185,52 @@ def _fragment_rows(fragment) -> int:
     return fragment.count_rows()
 
 
-def _open_lines(fs: AbstractFileSystem, path: str):
+def _open_lines(opened: BinaryIO, path: str):
+    """The bytes of `opened`, the binary file at `path`, decompressed as its name says, by fsspec's
+    reader of its compression (zstd's, a stream reader)."""
     compression = infer_compression(path.lower())
+    if compression is None:
+        return opened
     if compression == "zstd":
         from zstandard import ZstdDecompressor
 
-        return io.BufferedReader(ZstdDecompressor().stream_reader(fs.open(path, "rb")))
-    return fs.open(path, "rb", compression=compression)
+        return io.BufferedReader(ZstdDecompressor().stream_reader(opened))
+    from fsspec.compression import compr
+
+    # fsspec's registry of readers, which its own opens apply, the ones an application registers among them.
+    reader = next((each for name, each in compr.items() if name == compression), None)
+    if reader is None:
+        raise ValueError(f"{path} is compressed as {compression}, which fsspec has no reader of")
+    return reader(opened, mode="rb")
+
+
+class _DeclaredHandler(pafs.FSSpecHandler):
+    """Arrow over `fs`, reading each file its producer declared (`declared`, by Arrow's path) as
+    declared (`Declared`): held to the version its store published it at, or checked."""
+
+    def __init__(self, fs: AbstractFileSystem, declared: Mapping[str, Declared]):
+        super().__init__(fs)
+        self.declared = dict(declared)
+
+    def __eq__(self, other) -> bool:
+        return isinstance(other, _DeclaredHandler) and self.fs == other.fs and self.declared == other.declared
+
+    def __hash__(self) -> int:
+        return hash(self.fs)
+
+    def open_input_file(self, path: str) -> pa.NativeFile:
+        if path not in self.declared:
+            return super().open_input_file(path)
+        # Each read one request: Arrow plans and coalesces its own.
+        opened = self.declared[path].unbuffered()
+        if local(self.fs) and os.path.exists(descriptor := f"/proc/self/fd/{opened.fileno()}"):
+            # A local file checked as it opened, read by Arrow's own reader of the descriptor checked.
+            with opened:
+                return pa.OSFile(descriptor)
+        return pa.PythonFile(opened, mode="r")
+
+    def open_input_stream(self, path: str) -> pa.NativeFile:
+        return self.open_input_file(path)
 
 
 def _record_starts(file: BinaryIO, size: int, parts: int, kind: Format) -> list[int]:
@@ -302,6 +351,23 @@ class Files(Dataset):
         return {
             Store(str(self.url), self.storage_options).child(entry["path"]).url: entry for entry in entries
         }
+
+    @cached_property
+    def _declared_objects(self) -> Mapping[str, Declared]:
+        """Each file its producer declared, read as declared (`Declared`): held to the version its
+        store published it at, or checked against its digest, so a file replaced under its declaration
+        is refused where it is read rather than read under it (row 1871)."""
+        # Its data files: an offset index it declares is read by `ArrayIndex`, checked by its digest there.
+        return {url: Declared(Store(url, self.storage_options), self.declared[url])
+                for url in self.paths if url in self.declared}
+
+    def _opened(self, url: str) -> BinaryIO:
+        """A binary file of `url`'s bytes: as its producer declared them where one did
+        (`_declared_objects`), else as its store holds them (`Store.readable`)."""
+        if url in self._declared_objects:
+            return self._declared_objects[url].open()
+        fs, path, _ = Store(url, self.storage_options).readable()
+        return fs.open(path, "rb")
 
     def _header(self, url: str) -> Mapping[str, object]:
         if url in self.declared:
@@ -553,8 +619,7 @@ class Files(Dataset):
         stores = [Store(url, self.storage_options).resolve() for url in self.paths]
         preparing(self, sum(fs.size(path) or 0 for fs, path in stores), "an offset index beside each file")
         for url in self.paths:
-            fs, path = Store(url, self.storage_options).resolve()
-            with _open_lines(fs, path) as file:
+            with _open_lines(self._opened(url), url) as file:
                 names = _header(file) if self.kind == "csv" else None
                 offsets = [(0, start, size) for _, start, size in _lines(self.kind, file, names)]
             encoded = io.BytesIO()
@@ -606,6 +671,7 @@ class Files(Dataset):
                       files=files)
         self.__dict__.pop("committed", None)
         self.__dict__.pop("declared", None)
+        self.__dict__.pop("_declared_objects", None)
         self.__dict__.pop("_file_facts", None)
         self.__dict__.pop("_snapshot", None)
         self.__dict__.pop("_metadata", None)
@@ -634,6 +700,7 @@ class Files(Dataset):
                 self.storage_options,
                 record_codec=committed is not None and committed.get("codec") == 1,
                 counts=counts,
+                declared=tuple(self._declared_objects.get(url) for url in self.paths),
             )
         else:
             rows = _IndexedLines(self)
@@ -659,7 +726,15 @@ class Files(Dataset):
         # Some of a Hub dataset's files in huggingface_hub's cache, on this host's disk, and some not.
         if len({local(place.fs) for place in located}) > 1:
             located = [Readable(*store.resolve(), None) for store in stores]
-        filesystem = _arrow_filesystem(located[0].fs)
+        declared = {url: self._declared_objects[url] for url in self.paths if url in self._declared_objects}
+        if declared:
+            # Arrow opens each declared file through Dew's reads of it, held to its version or checked
+            # as it opens; its own clients hold no read to a version.
+            filesystem = pafs.PyFileSystem(_DeclaredHandler(located[0].fs, {
+                place.path: declared[url] for place, url in zip(located, self.paths, strict=True)
+                if url in declared}))
+        else:
+            filesystem = _arrow_filesystem(located[0].fs)
         paths = tuple(filesystem.normalize_path(place.path) for place in located)
         names = dict(zip(paths, self.paths, strict=True))
         roots = [place.root for place in located if place.root is not None]
@@ -752,8 +827,7 @@ class Files(Dataset):
             if not planned:
                 break
             for number in planned:
-                fs, path, _ = Store(self.paths[number], self.storage_options).readable()
-                with _open_lines(fs, path) as file:
+                with _open_lines(self._opened(self.paths[number]), self.paths[number]) as file:
                     starts[number] = _record_starts(file, sizes[number], parts[number], self.kind)
                 if len(starts[number]) < parts[number]:
                     out.add(number)
@@ -784,12 +858,13 @@ class Files(Dataset):
                     (shard.uri,),
                     self.storage_options,
                     record_codec=self.committed is not None and self.committed.get("codec") == 1,
+                    declared=(self._declared_objects.get(shard.uri),),
                 )
             ).to_iter_dataset()
         if self.kind == "webdataset":
             from .webdataset import TarRows
 
-            return TarRows(shard.uri, self.storage_options)
+            return TarRows(shard.uri, self.storage_options, self._declared_objects.get(shard.uri))
         if self.kind == "files":
             return grain.MapDataset.source(_Paths((shard.uri,))).to_iter_dataset()
         return _Lines(self, shard)
@@ -994,8 +1069,7 @@ class _IndexedLines:
     def fieldnames(self) -> tuple[tuple[str, ...], ...]:
         headers = []
         for url in self.source.paths:
-            fs, path, _ = Store(url, self.source.storage_options).readable()
-            with _open_lines(fs, path) as file:
+            with _open_lines(self.source._opened(url), url) as file:
                 headers.append(_header(file))
         return tuple(headers)
 
@@ -1006,16 +1080,20 @@ class _IndexedLines:
         group, row = self.ranges.locate(index)
         entry = self.tables[group][row]
         shard = int(entry["shard"]) if self.source.index else group
-        fs, path, _ = Store(self.source.paths[shard], self.source.storage_options).readable()
+        url = self.source.paths[shard]
         names = self.fieldnames[shard] if self.source.kind == "csv" else None
         offset = int(entry["offset"])
-        compression = infer_compression(path.lower())
-        if compression is not None:
-            with _open_lines(fs, path) as file:
+        declared = self.source._declared_objects.get(url)
+        if infer_compression(url.lower()) is not None:
+            with _open_lines(self.source._opened(url), url) as file:
                 _seek_lines(file, offset)
                 payload = file.read(int(entry["bytes"]))
+        elif declared is not None:
+            payload = declared.read_range(offset, offset + int(entry["bytes"]))
         else:
+            fs, path, _ = Store(url, self.source.storage_options).readable()
             payload = fs.cat_file(path, start=offset, end=offset + int(entry["bytes"]))
+        path = url
         held = [line for line, _, _ in _lines(self.source.kind, io.BytesIO(payload), names)]
         if len(held) != 1:
             raise ValueError(f"{self.source.describe()}'s index names {len(held)} records, not one, at byte "
@@ -1089,9 +1167,8 @@ class _LineIterator(grain.DatasetIterator):
     def __init__(self, source: Files, shard: Shard):
         super().__init__()
         self.source, self.shard = source, shard
-        self.fs, self.path, _ = Store(shard.uri, source.storage_options).readable()
-        self.compression = infer_compression(self.path.lower())
-        self.file = _open_lines(self.fs, self.path)
+        self.compression = infer_compression(shard.uri.lower())
+        self.file = _open_lines(source._opened(shard.uri), shard.uri)
         self._opened = True
         self.names = _header(self.file) if source.kind == "csv" else None
         if self.names is None and shard.start:
@@ -1120,7 +1197,7 @@ class _LineIterator(grain.DatasetIterator):
         if self.compression is not None:
             # Zstandard streams seek forward only; restoration starts from a fresh decoder.
             self.file.close()
-            self.file = _open_lines(self.fs, self.path)
+            self.file = _open_lines(self.source._opened(self.shard.uri), self.shard.uri)
         _seek_lines(self.file, offset)
         # The records read on from the restored offset, after a pass that read them all too.
         self.records = _lines(self.source.kind, self.file, self.names, self.shard.stop)

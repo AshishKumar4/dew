@@ -1,4 +1,4 @@
-"""The tiny decoder and the parameter-tree view several model tests share."""
+"""The tiny decoder, the parameter-tree view and the weight draws several model tests share."""
 
 import dataclasses
 import functools
@@ -347,3 +347,15 @@ def stepped_decode(model, variables, ids):
     cache = model.init(jax.random.key(0), ids[:, :1], decode=True)["cache"]
     cache, steps = jax.lax.scan(step, cache, jnp.moveaxis(jnp.asarray(ids), 1, 0))
     return jnp.moveaxis(steps, 0, 1), cache
+
+
+def moved(tree, key: jax.Array, scale: float):
+    """`tree` with each floating leaf moved by `scale` times its own normal draw from `key`, its dtype
+    kept, so no zero-initialized layer answers every input alike or takes no gradient; other leaves as
+    they are."""
+    leaves, structure = jax.tree.flatten(tree)
+    keys = jax.random.split(key, len(leaves))
+    return jax.tree.unflatten(structure, [
+        (leaf + scale * np.asarray(jax.random.normal(each, np.shape(leaf)))).astype(leaf.dtype)
+        if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf
+        for leaf, each in zip(leaves, keys, strict=True)])

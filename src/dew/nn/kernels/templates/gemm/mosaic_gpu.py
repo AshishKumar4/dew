@@ -335,8 +335,6 @@ class Allocations:
     blocks: dict
     staged: tuple
     outputs: tuple
-    transposed: tuple[str, ...] = ()
-    """The streams a product reads as its right operand transposed (`mosaic.Family.streams`)."""
 
     def scope(self, family: mosaic.Family, tiles: "Tiles", steps: int | None = None) -> resources.Scope:
         """Its allocations by lifetime (`resources.shared_bytes`): a ring family's streams the program's,
@@ -351,8 +349,7 @@ class Allocations:
             return resources.Scope(program=(self.staged,), walks=(walk,),
                                    after=tuple((buffer.shape, buffer.dtype) for buffer in staging))
         multicast = ('matrix',) if tiles.cluster > 1 and 'matrix' in self.blocks else ()
-        streams = family.streams(self.blocks, tiles.stages, consumers, multicast=multicast,
-                                 transposed=self.transposed)
+        streams = family.streams(self.blocks, tiles.stages, consumers, multicast=multicast)
         return resources.Scope(program=(streams, self.staged, staging))
 
 
@@ -384,8 +381,7 @@ def gmm_allocations(tiles: "Tiles", family: mosaic.Family, *, dtype, rhs_dtype, 
     held = mosaic.staging('fixed', [(tuple(extent[axis] for axis in prologue_axes[i]),
                                      _typed(prologue_dtypes[i])) for i in fixed])
     return Allocations(blocks, (sides['side_smems'], sides['side_barriers'], held['fixed_smems'],
-                                held['fixed_barriers']), tuple((part, jnp.dtype(out)) for out in dtypes),
-                       tuple(name for name in ('matrix', 'paired') if transpose_rhs and name in blocks))
+                                held['fixed_barriers']), tuple((part, jnp.dtype(out)) for out in dtypes))
 
 
 def tgmm_allocations(tiles: "Tiles", family: mosaic.Family, *, lhs_dtype, rhs_dtype,
@@ -596,8 +592,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
 
         family.scoped(scope, *allocations.staged,
                       streams=family.streams(blocks, tiles.stages, consumers,
-                                             multicast=matrices if pair > 1 else (),
-                                             transposed=allocations.transposed))
+                                             multicast=matrices if pair > 1 else ()))
 
     out_type = tuple(jax.ShapeDtypeStruct((m, n), dtype) for dtype in dtypes)
     operands = (lhs, rhs) if paired is None else (lhs, rhs, paired)
