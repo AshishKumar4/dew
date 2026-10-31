@@ -47,7 +47,7 @@ from dew.objectives.base import (
 )
 from dew.optim import clips_qk, stepped
 from dew.state import Accumulation, TrainState, apart, together
-from dew.training.inspection import Inspection, summaries
+from dew.training.inspection import Inspection, Summaries, stacked, summaries
 from dew.training.model_flops import _TokenCount, step_counts
 from dew.training.narrow import forward_variables, narrowed
 
@@ -96,9 +96,9 @@ class Committed:
     norm: jax.Array
     count: jax.Array
     tokens: jax.Array
-    inspected: dict[str, jax.Array] = dataclasses.field(default_factory=dict)
-    """A sampled step's summaries (`dew.training.inspection.summaries`), zero where it committed nothing;
-    none in a step that samples nothing."""
+    inspected: Summaries | None = None
+    """A sampled step's summaries as one vector (`dew.training.inspection.Summaries`), zero where it
+    committed nothing; None in a step that samples nothing."""
 
 
 def _chosen(take, taken, kept):
@@ -782,8 +782,7 @@ class Transaction:
             advanced = dataclasses.replace(advanced, deferred=waiting.astype(jnp.uint32))
         return advanced, loss, aux, Committed(
             jnp.where(counted, norm, 0.), counted.astype(jnp.int32),
-            jnp.where(counted, held, jnp.zeros((2,), jnp.uint32)),
-            {name: jnp.where(counted, value, 0.) for name, value in inspected.items()})
+            jnp.where(counted, held, jnp.zeros((2,), jnp.uint32)), stacked(inspected, counted))
 
     def step(self, *, realize=None, host=False):
         """Build the function that runs one attempt over the shared phases.

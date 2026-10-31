@@ -9,7 +9,6 @@ import os
 from collections.abc import Mapping
 from typing import BinaryIO
 
-from fsspec.implementations.cached import CachingFileSystem
 from fsspec.implementations.http import HTTPFileSystem
 from fsspec.spec import AbstractFileSystem
 from gcsfs import GCSFileSystem
@@ -21,6 +20,7 @@ from dew.data.storage import (
     SourceChanged,
     Store,
     _local_file_key,
+    backing,
     content_version,
     in_memory,
     local,
@@ -78,17 +78,10 @@ PINNED_BUFFER = 8 << 20
 def stored_kind(fs: AbstractFileSystem) -> str | None:
     """The version a remote store `fs` holds an object at and a read of it can be held to (`STORED`),
     none for a store with none such."""
-    fs = _backing(fs)
+    fs = backing(fs)
     if isinstance(fs, S3FileSystem | HTTPFileSystem):
         return STORED["s3"]
     return STORED["gs"] if isinstance(fs, GCSFileSystem) else None
-
-
-def _backing(fs: AbstractFileSystem) -> AbstractFileSystem:
-    """The store `fs` reads from, through any transport cache over it."""
-    while isinstance(fs, CachingFileSystem):
-        fs = fs.fs
-    return fs
 
 
 def mirrored(store: Store, size: int | None = None, digest: str | None = None) -> io.BufferedReader:
@@ -208,7 +201,7 @@ class Declared:
         (Arrow's own clients) makes before and after it reads."""
         assert self.stored is not None, "a version to hold the object to"
         fs, path = self.store.resolve()
-        fs = _backing(fs)
+        fs = backing(fs)
         fs.invalidate_cache(path)
         [(kind, version)] = self.stored.items()
         found = fs.info(path).get("ETag" if kind == "etag" else kind)
@@ -291,7 +284,7 @@ def ranged(store: Store, start: int, end: int, stored: Mapping[str, str]) -> byt
     it there: an S3 range read on the object's ETag (`IfMatch`), an HTTP one on its ETag (`If-Match`,
     RFC 9110 13.1.1), a GCS one of its generation."""
     fs, path = store.resolve()
-    fs = _backing(fs)
+    fs = backing(fs)
     kind = stored_kind(fs)
     version = None if kind is None else stored.get(kind)
     if version is None:

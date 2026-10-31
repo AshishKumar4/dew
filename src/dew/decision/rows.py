@@ -7,11 +7,12 @@ import dataclasses
 import hashlib
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
+from typing import TypeGuard
 
 import grain.python as pygrain
 import numpy as np
 
-from dew._records import integer, record
+from dew._records import ADDED, integer, record
 from dew.batch import Batch
 from dew.data.pipeline import Pack, Rejected, composed, cut_counts
 from dew.data.text import Tokenizer
@@ -53,7 +54,9 @@ class Encoding:
     "none of the above" option with probability p, and half of those also
     lose their right option, which makes "none of the above" the right
     answer. That teaches the model to say
-    that no option fits instead of picking the nearest wrong one. Each scored
+    that no option fits instead of picking the nearest wrong one. A choice
+    of fewer than `none_of_the_above_options` options draws none: where a
+    choice is a yes or a no, "none of the above" changes what it asks. Each scored
     slot's target is its gold distribution (`Example.distribution`) in the
     order the row shows the options. A reader passes the state's `tokens` it
     fitted the example with (`Fit`), which the row lays out again.
@@ -73,6 +76,8 @@ class Encoding:
     grouped: bool = False
     """Whether each row carries its questions' consistency groups (`_grouped`), an objective with a
     consistency term's rows; every row then carries them, an example of none with none in each."""
+    none_of_the_above_options: int = field(default=0, repr=False, metadata={ADDED: True})
+    """The fewest options a choice holds to draw a "none of the above" (`draws_none`); 0, every choice."""
 
     def _rows(self, example: Example, asked: Mapping[str, Question], rng: np.random.Generator | None,
               tokens: np.ndarray | None) -> list[Encoded]:
@@ -109,7 +114,7 @@ class Encoding:
             gold = example.distribution(name) if name in labels else None
             if (
                 name in example.answers
-                and isinstance(question, Choice)
+                and draws_none(question, self.none_of_the_above_options)
                 and rng is not None
                 and rng.random() < self.none_of_the_above
             ):
@@ -250,6 +255,12 @@ def _grouped(group_of: GroupOf, encoded: Encoded, asked: Mapping[str, Question],
     return groups, canonical
 
 
+def draws_none(question: Question, fewest: int) -> TypeGuard[Choice]:
+    """Whether a training read may draw a "none of the above" on `question` (`Encoding`): a choice of at
+    least `fewest` options."""
+    return isinstance(question, Choice) and len(question.options) >= fewest
+
+
 def _none_of_the_above(question: Choice, label: int, *, drop: bool) -> tuple[Choice, int]:
     """`question` with a "none of the above" option last, and without its
     right option when `drop`; the new label. A question that offers the option
@@ -339,6 +350,8 @@ class Fit(pygrain.MapTransform):
     """Whether the rows are scored, as a validation pass or a server reads them, not trained on: a row
     whose declared budgets cut its options alike is laid out as its release answers it, counted
     (`options_alike` in its cut record), where training leaves it out (`Layout.refusal`)."""
+    none_of_the_above_options: int = field(default=0, repr=False, metadata={ADDED: True})
+    """The fewest options a choice holds to draw a "none of the above" (`Encoding`, `draws_none`)."""
     rejects = True
 
     def map(self, element: Batch) -> Batch | Rejected:
@@ -429,7 +442,7 @@ class Fit(pygrain.MapTransform):
         asked: dict[str, Question] = {}
         for laid in row.questions:
             question = example.questions[laid.name]
-            if laid.name in example.answers and isinstance(question, Choice):
+            if laid.name in example.answers and draws_none(question, self.none_of_the_above_options):
                 question = _none_of_the_above(question, labels[laid.name], drop=False)[0]
             asked[laid.name] = question
         if all(asked[laid.name].options == example.questions[laid.name].options for laid in row.questions):
@@ -479,9 +492,11 @@ class Fit(pygrain.MapTransform):
         example = row.example
         labels = example.labels()
 
+        fewest = self.none_of_the_above_options
+
         def laid_out(drop: bool) -> tuple[int, int]:
             asked = {name: (_none_of_the_above(question, labels[name], drop=drop)[0]
-                            if name in example.answers and isinstance(question, Choice) else question)
+                            if name in example.answers and draws_none(question, fewest) else question)
                      for name in row.names for question in (example.questions[name],)}
             laid = self.layout.rows(self.tokenizer, self.specials, example.state, asked,
                                     tokens=row.tokens.tolist())
@@ -626,20 +641,26 @@ class ConfigureLayout:
     train: bool
     context_length: int | None = None
     grouped: bool = False
+    none_of_the_above_options: int = field(default=0, repr=False, metadata={ADDED: True})
+    """The fewest options a choice holds to draw a "none of the above" (`Encoding`)."""
 
     def __call__(self, metadata: Mapping[str, object]) -> LayoutRows | EvaluateRows:
-        width = option_width(record(metadata["slots"], "decision slots"), self.none_of_the_above)
+        width = option_width(record(metadata["slots"], "decision slots"), self.none_of_the_above,
+                             self.none_of_the_above_options)
         if width < 1:
             raise ValueError("decision source slot maxima must be positive")
         encoding = Encoding(self.layout, self.tokenizer, self.specials, width, self.shuffle,
-                            self.none_of_the_above, self.context_length, self.grouped)
+                            self.none_of_the_above, self.context_length, self.grouped,
+                            none_of_the_above_options=self.none_of_the_above_options)
         return LayoutRows(encoding) if self.train else EvaluateRows(encoding)
 
 
-def option_width(slots: Mapping[str, object], none_of_the_above: float) -> int:
+def option_width(slots: Mapping[str, object], none_of_the_above: float, fewest: int = 0) -> int:
     """The option slots a question of a run's rows takes: the most options a question of its data asks
-    (`slots`), and one more where a training read draws "none of the above" beside them."""
-    return integer(slots.get("options"), "slots.options") + int(none_of_the_above > 0)
+    (`slots`), and one more where a training read draws "none of the above" beside them, which it does
+    only on a choice of at least `fewest` options (`draws_none`)."""
+    widest = integer(slots.get("options"), "slots.options")
+    return widest + int(none_of_the_above > 0 and widest >= fewest)
 
 
 TRAINING_FIELDS = (QuestionField("labels", (), np.int32, when="trained"),

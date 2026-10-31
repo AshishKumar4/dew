@@ -18,6 +18,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from generation_support import lowers
 from reference_error import assert_as_exact
 from test_recurrence_chunk import (
     FORMED,
@@ -521,6 +522,52 @@ RESOURCE_SHAPES = {'qwen3.5-27b-gdn': (16, 48, 128, 128, False), 'kimi-linear-kd
 key heads, value heads, key and value widths, and whether the decay is a key dimension's."""
 
 
+@lowers('sm90')
+def test_the_resource_gate_reads_each_launch_of_one_kernel_apart():
+    """The 27B gated delta net's forward launched twice in one program on an H100, at its derived tiles and
+    at a variant: a kernel's name compiled under both launches (`report.launching`) is gated on each
+    launch's evidence, the variant's shared memory its own; a gate that read a kernel by its name alone kept
+    one launch's and dropped the other's."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels
+
+    target = 'sm90'
+    family, facts = bundles.of(target, jnp.bfloat16), generation.gpu_target(target)
+    key_heads, value_heads, key_width, value_width, _ = RESOURCE_SHAPES['qwen3.5-27b-gdn']
+    rows, length = 1, 256
+
+    def array(*shape, kind=jnp.bfloat16):
+        return jax.ShapeDtypeStruct(shape, kind)
+
+    args = [array(rows, length, key_heads, key_width), array(rows, length, key_heads, key_width),
+            array(rows, length, value_heads, value_width), array(rows, length, value_heads, kind=jnp.float32),
+            array(rows, length, value_heads),
+            array(rows, value_heads, key_width, value_width, kind=jnp.float32)]
+    bound = template.MOSAIC.bind(*args, None, max_segments=None, floor=None)
+    with generation.assumed(facts):
+        derived, variant = template.MOSAIC.variants(bound)[:2]
+
+    def call():
+        def fn(*operands):
+            launched = []
+            for tiles in (derived, variant):
+                with report.launching(template.MOSAIC, bound, tiles):
+                    launched.append(mainloop.forward(*operands, tiles=tiles, starts=None, max_segments=None,
+                                                     family=family))
+            return launched
+
+        return fn, tuple(args)
+
+    (record,) = compile_mosaic_kernels([KernelCase('two launches', call)], target)
+    launches: dict[str, list] = {}
+    for kernel in record['kernels']:
+        assert not kernel['unread'], f"{kernel['kernel']}: {kernel['unread']}"
+        launches.setdefault(kernel['kernel'], []).append((kernel['launch'], kernel['shared']))
+    # A launch whose module both tiles share is built once (`_lowered_once`), under the first launch's name.
+    twice = [found for found in launches.values() if len({launch for launch, _ in found}) == 2]
+    assert any(len({shared for _, shared in found}) == 2 for found in twice), launches
+
+
 @pytest.mark.parametrize('kernel', ['recurrence_states', 'recurrence_reverse'], ids=['forward', 'backward'])
 def test_a_compile_refusing_the_joined_tiles_steps_the_derivation_down(kernel):
     """A compile that refused the 27B gated delta net's joined tiles on an H100 (`report.spilled`: a kernel
@@ -631,6 +678,7 @@ def compiled_cases(target: str, plans: dict, refused: list, only: tuple | None =
                              kind=kind) for tiles, kind in unheld]
             tiled = template.MOSAIC.variants(bound)
             if variant is not None:
+                assert len(tiled) - 1 <= NEIGHBOURS, f"{name} has {len(tiled) - 1} variants, past NEIGHBOURS"
                 return [case(name, dtype, args, starts, bound, tiles, training=training, packed=packed,
                              kind='') for tiles in tiled[1:][variant:variant + 1]]
             if training and not mainloop_backward.backward_holds(

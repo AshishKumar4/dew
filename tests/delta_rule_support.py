@@ -26,11 +26,11 @@ CHUNKED = 64
 re-cuts the decay by, each by default."""
 
 
-def rule_math(q, k, v, g, beta, h0):
+def rule_math(q, k, v, g, beta, h0, *, scale: float | None = None):
     """The gated delta rule token by token, in whatever dtype it is given: the reference both paths
     are held to, run in float64. `g` decays per head `[B, T, H]`, or per key dimension `[B, T, H, K]`
-    (Kimi's delta attention)."""
-    scale = q.shape[-1] ** -0.5
+    (Kimi's delta attention). The query is scaled by `scale`, the width's inverse root by default."""
+    scale = q.shape[-1] ** -0.5 if scale is None else scale
 
     def step(state, inputs):
         qt, kt, vt, gt, bt = inputs
