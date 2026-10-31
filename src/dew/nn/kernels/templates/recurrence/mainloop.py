@@ -600,8 +600,7 @@ def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, s
     allocations (of `blocks`, `stages` deep, and of `once`'s blocks, loaded once, one deep; `Family.opened`
     takes them with their views), its staging tiles and its stores' (`landing`, `_landed`) scoped, named for
     its launch (`recurrence_solved`, ...). `held` is what a consumer thread holds in registers (`_Held`).
-    Where `mainloop_backward.planned` collects launches, the launch's record instead (`Launch`, its `work`),
-    and zeros.
+    Where `mainloop_backward.planned` collects launches, the launch's record (`Launch`, its `work`) and zeros.
 
     A `persistent` launch runs `grid`'s tiles on as many programs as the device's multiprocessors hold at
     once, its streams' rings running on across them (`_planned_launch`); its program gives its tile's walk
