@@ -357,9 +357,12 @@ def example_fields(state, slot, split: int, batch, slots: int = 1, part=None, re
     key = jax.random.fold_in(jax.random.fold_in(jax.random.fold_in(state.key, EXAMPLE_STREAM),
                                                 state.updates), rejected)
     if holds_back(state.opt_state):
-        # The calls an optimizer holds an update back over, and those it skips, draw apart by the
-        # microbatches accepted before each (`microstep`, the state's where none is given).
-        key = jax.random.fold_in(key, state.microstep if microstep is None else microstep)
+        # Each input the optimizer takes, holds or skips draws apart: by the windows accepted before it,
+        # read off the microbatches accepted (`microstep`, the state's where none is given) over a
+        # window's (`slots`, its parts counted), so a window's slots and parts share its draw however
+        # its batch is split.
+        accepted = state.microstep if microstep is None else microstep
+        key = jax.random.fold_in(key, accepted // slots)
     index = example_places(slot, split, rows, batch.get(EXAMPLE_ROWS), part)
     return {"example_key": key, "example_index": placed_as_rows(index, batch), "example_count": slots * rows}
 
