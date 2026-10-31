@@ -33,6 +33,7 @@ from dew.decision.laya import LAYA
 from dew.decision.layout import (
     Framing,
     Instructions,
+    JointLayout,
     Labels,
     Layout,
     QuestionLayout,
@@ -235,10 +236,7 @@ class DecisionRunConfig(DecoderRunConfig):
                              "attention_impl are choices")
         dtype = self.compute_dtype()
         attention_impl = self.source_attention()
-        budgets = {"max_len": self.max_len, "head_max_len": self.head_max_len,
-                   "option_tokens": self.option_tokens, "max_state_tokens": self.max_state_tokens,
-                   "framing": self.framing, "segments": self.segments, "reads": self.reads,
-                   "parallel": self.parallel, "unit": self.unit, "order": self.order, "split": self.split}
+        budgets = self._row_fields()
         self._refuse_unread_context()
         derived = {}
         if self.context_layers is not None:
@@ -334,6 +332,11 @@ class DecisionRunConfig(DecoderRunConfig):
         return Prepared(self, objective, dataset, metrics=metrics, summary=summary, after=after,
                         validation=held)
 
+    def _row_fields(self) -> Budgets:
+        """The run's fields that lay its rows out, by the layouts' field names (`ROW_FIELDS`), which
+        `_budgeted` sets on the layout the run reads."""
+        return {name: getattr(self, name) for name in ROW_FIELDS}
+
     def _fresh_head(self, start, blocked: bool, budgets: Budgets) -> Mapping[str, object]:
         """The head a fresh backbone `start` reads and its rows' layout: the joint schema head, the
         letter readout of its own logits (`Letters`), its labels named by the backbone's tokenizer, or
@@ -408,7 +411,14 @@ class DecisionRunConfig(DecoderRunConfig):
 
 
 type Budgets = dict[str, int | bool | str | Framing | Labels | tuple[RowSegment, ...] | None]
-"""A run's budgets of a row's layout, by the layout's field names (`_budgeted`)."""
+"""A run's fields of a row's layout, by the layout's field names (`_budgeted`)."""
+
+ROW_FIELDS = tuple(sorted(
+    {entry.name for layout in (QuestionLayout, JointLayout) for entry in dataclasses.fields(layout)}
+    & {entry.name for entry in dataclasses.fields(DecisionRunConfig)}))
+"""The run's fields that lay out its rows: each a field of a decision layout (`QuestionLayout`,
+`JointLayout`) the run declares by the same name, so a layout field the run states reaches its layout
+(`_budgeted`) without a list of its own to keep."""
 
 
 def _fresh_layout(causal: bool, one_question: bool, budgets: Budgets, blocked: bool = False,

@@ -16,7 +16,8 @@ from test_lm_recipe import SEQ, write_token_files
 from dew.config import RunConfig, SourceOptions, TrainerConfig
 from dew.data import presets
 from dew.data.sources.tokens import TokenFiles
-from dew.decision.layout import built_in
+from dew.decision.config import Letters
+from dew.decision.layout import AnswerCue, Instructions, Labels, OptionLines, State, Text, built_in
 from dew.decision.task import Decide
 from dew.inference.images import TextToImage
 from dew.inference.tasks import BlockGeneration, MaskedGeneration, TextGeneration
@@ -66,6 +67,20 @@ def lettered(root: Path, drawn: bool) -> RunConfig:
     return dataclasses.replace(run_kinds.lettered(root, drawn), pretrained=QWEN)
 
 
+def lettered_in_context(root: Path, drawn: bool) -> RunConfig:
+    """A decision run of a letter readout whose question is read as the row's context (row 2008):
+    the state and the answer cue in the row, the question and its lettered options in the context its
+    cross-attention reads. A main whose option lines named their stream (0b4eb412b, rows 2008 to 2450)
+    recorded them so, which a later main reads (row 2627)."""
+    labels = Labels(variants=("{}",))
+    segments = (Text("STATE:\n"), State(), Instructions({"choice": "{}"}, stream="context"),
+                OptionLines(line="\n{label}. {option}", bare="\n{label}. {option}", join="",
+                            noul_first="false"),
+                AnswerCue(template="\nAnswer:", many="\nAnswer:"))
+    return dataclasses.replace(lettered(root, drawn), segments=segments, context_layers=(0,),
+                               head=Letters(labels=labels, count=4))
+
+
 def blockwise(root: Path, drawn: bool) -> RunConfig:
     """`run_kinds.blockwise`'s block-diffusion run over a release whose text decoder its model nests,
     its release and tokenizer, its token files' too, by their path in the repo."""
@@ -104,9 +119,10 @@ def stored(root: Path, drawn: bool) -> RunConfig:
     return dataclasses.replace(over(QWEN, root, drawn), source=SourceOptions(param_dtype="bfloat16"))
 
 
-def computed(directory: Path | str, step: int | None = None) -> dict[str, list[str]]:
+def computed(directory: Path | str, step: int | None = None) -> dict[str, dict[str, list[str]]]:
     """Each module's dtypes, by its variable scope's path, that one request of the task a saved run at
-    `directory` loads, at `step` or else its default, multiplies in: its products' operands'
+    `directory` loads, at `step` or else its default, multiplies in (`products`, a packed projection's at
+    each of its members), beside the projections its model packs (`packs`): its products' operands'
     (`saved_run_products`), read in a fresh interpreter, where every program the request runs lowers, as
     the corpus's writer reads them. A model whose outer module states bfloat16 while one projection of
     its decoder computes in float32 states float32 at that projection's scope. The products are the
@@ -116,7 +132,7 @@ def computed(directory: Path | str, step: int | None = None) -> dict[str, list[s
     # A record names the repo's sources by their path in it, read from the checkout's root.
     found = process_support.fresh(Path(__file__).with_name("saved_run_products.py"), str(directory),
                                   *([] if step is None else [str(step)]), cwd=process_support.REPO_ROOT)
-    assert found, "the request lowered no matrix product"
+    assert found["products"], "the request lowered no matrix product"
     return found
 
 
@@ -129,8 +145,9 @@ def answered(task) -> None:
     if isinstance(task, TextGeneration):
         assert task.decode(answer)
     elif isinstance(task, MaskedGeneration | BlockGeneration):
+        # A response of at least one token past the prompt, its decoder having stepped.
         generated = answer.host()
-        assert (np.asarray(generated.lengths) > 0).all()
+        assert (np.asarray(generated.lengths) > 0).all() and (np.asarray(generated.decoder_steps) > 0).all()
     elif isinstance(task, Decide):
         [answers] = answer
         assert answers["team"].choice in ("billing", "technical", "sales")
@@ -139,7 +156,9 @@ def answered(task) -> None:
 
 
 SAVED_KINDS = {**KINDS, "multimodal": multimodal, "decision-segments": segmented,
-               "decision-lettered": lettered, "block-diffusion": blockwise, "lm-examples": clocked,
+               "decision-lettered": lettered, "decision-lettered-context": lettered_in_context,
+               "block-diffusion": blockwise, "lm-examples": clocked,
                "lm-bf16": fresh, "lm-float16": scaled, "lm-scaled": chosen_scale, "lm-stored": stored}
 """Each kind the corpus saves a run of: every run kind (`run_kinds.KINDS`), an LM run whose decoder
-its source's model nests, and each serialized variant beside them."""
+its source's model nests, and each serialized variant beside them, a lettered question read in context
+among them."""

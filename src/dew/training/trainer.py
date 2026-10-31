@@ -157,7 +157,7 @@ from dew.training.distributed import (
     step_reads,
     traced_start,
 )
-from dew.training.evaluation import EvalSuite, Evaluation, Summary, admit_split
+from dew.training.evaluation import COOLDOWN, EvalSuite, Evaluation, Summary, admit_split
 from dew.training.footprint import candidate_footprint, traced_loss
 from dew.training.inspection import Inspection
 from dew.training.interval import Interval, Reading, Taken, TokenClock, held, logged_scalars
@@ -1323,7 +1323,7 @@ class Trainer(Generic[Loss, Effects]):
         one included, or without `Checkpoints` from the copy it held (`HeldBest`). Its optimizer state
         and the rest stay the final step's, so it is the best model, not a point to resume training
         from, which the run's checkpoints are. `cooldowns` branch the run into cooldowns, each scored by
-        every suite as `cooldown_<split>/<metric>` and discarded (`dew.training.cooldown.Cooldowns`).
+        every suite as `cooldown/<split>/<metric>` and discarded (`dew.training.cooldown.Cooldowns`).
 
         Every `checkpoint_every` steps (or "5%", `FitPlan.cadences`), the state and data position are written;
         `checkpoint_final=True` also writes the final state, independently of that cadence. A duration is
@@ -1335,7 +1335,8 @@ class Trainer(Generic[Loss, Effects]):
 
         Previews are generated only when `preview=True` and a tracker receives them; scalar reporting never
         triggers preview work. `scored_to`, a directory, takes every validation batch's scoring artifacts at
-        each evaluation, `<scored_to>/step-<step>/<split>-<batch>.npz` (`Evaluation.run`). `observe` takes
+        each evaluation, `<scored_to>/step-<step>/<split>-<batch>.npz` (`Evaluation.run`), a cooldown
+        branch's under `cooldown/` there. `observe` takes
         values of the state at a cadence of its own while the run trains (`Observe`). `device_prefetch`
         training batches are placed on the devices ahead of the step, which the step's memory plan holds
         room for. The process is readied first
@@ -1872,7 +1873,7 @@ class Trainer(Generic[Loss, Effects]):
                 pending: Pending) -> tuple[TrainState, bool]:
         """Train the cooldown branch `pending` from `state`, on the run's batches from its data `position`,
         by the run's own compiled steps at the rates its state holds times the branch's decay
-        (`scaled_rates`); score every suite on it as `cooldown_<split>` at the run's step, and discard
+        (`scaled_rates`); score every suite on it as `cooldown/<split>` at the run's step, and discard
         it. The run's moving state waits on the host and its stream is closed meanwhile, so the devices
         hold one state and one prefetcher, as the run's plan sized them (`Trials`). Returns the run's
         state, and whether a preemption cut the branch short: then it stays pending beside the
@@ -1941,10 +1942,8 @@ class Trainer(Generic[Loss, Effects]):
             self._display.note(f"The training data ran out {done} steps into the cooldown from step "
                                f"{run.current}, which records no score")
         else:
-            suites = {f"cooldown_{name}": suite for name, suite in plan.suites.items()}
-            self._evaluation(dataclasses.replace(plan, suites=suites, summaries=()),
-                             dataclasses.replace(cooled, step=step_at), shardings, {},
-                             examples=self._consumed(interval, counted))
+            self._evaluation(dataclasses.replace(plan, summaries=()), dataclasses.replace(
+                cooled, step=step_at), shardings, {}, examples=self._consumed(interval, counted), cooled=True)
         if checkpoints is not None and not cut:
             checkpoints.cooling(None)
         for leaf in (leaf for leaf in jax.tree.leaves(apart(cooled)[0]) if not leaf.is_deleted()):
@@ -2130,7 +2129,7 @@ class Trainer(Generic[Loss, Effects]):
     def _evaluation(self, plan: FitPlan, state: TrainState, shardings: Placement[TrainState],
                     training: Mapping[str, jax.Array], names: Sequence[str] | None = None, *,
                     warm: bool = False, joined: Mapping[str, float] | None = None,
-                    examples: int | None = None) -> Evaluation:
+                    examples: int | None = None, cooled: bool = False) -> Evaluation:
         """Score the suites in `names`, every suite when None, as one evaluation, joined to the scores
         the step's earlier evaluation of the others recorded (`joined`, `_wind_down`).
 
@@ -2142,7 +2141,7 @@ class Trainer(Generic[Loss, Effects]):
         chosen = list(plan.suites if names is None else names)
         if not chosen:
             return self._evaluate(state, shardings, None, (), plan.preview, split="val", training=reports,
-                                  warm=warm, examples=examples)
+                                  warm=warm, examples=examples, cooled=cooled)
         evaluations = []
         for split in chosen:
             suite = plan.suites[split]
@@ -2153,7 +2152,7 @@ class Trainer(Generic[Loss, Effects]):
                     and not any(metric.name == 'loss' for metric in suite.metrics))
             evaluations.append(self._evaluate(state, shardings, suite.data, suite.metrics, plan.preview,
                                               loss=loss, split=split, training=reports, warm=warm,
-                                              scored_to=plan.scored_to, examples=examples))
+                                              scored_to=plan.scored_to, examples=examples, cooled=cooled))
         scores = {**(joined or {}),
                   **{name: value for report in evaluations for name, value in report.scores.items()}}
         # Each summary is formed once a step, here, by the evaluation that completes the splits it weighs.
@@ -2426,6 +2425,7 @@ class Trainer(Generic[Loss, Effects]):
         warm: bool = False,
         scored_to: str | None = None,
         examples: int | None = None,
+        cooled: bool = False,
     ) -> Evaluation:
         """Score the validation split with this state's variables and report
         it, returning the seconds it took: the run's, but not its steps',
@@ -2458,11 +2458,15 @@ class Trainer(Generic[Loss, Effects]):
                 step=state.step, schedule_step=state.microstep * self.accumulation // state.window_size,
                 averaged=averaged, preview=preview, mesh=mesh, loss=loss, split=split, training=training,
                 warm=warm, updates=state.updates,
-                scored_to=None if scored_to is None else os.path.join(scored_to, f"step-{int(state.step)}"))
+                # A cooldown branch's beside the run's at the step it branched at (`COOLDOWN`).
+                scored_to=None if scored_to is None else os.path.join(
+                    scored_to, f"step-{int(state.step)}", *((COOLDOWN,) if cooled else ())))
         # On the examples clock an evaluation is placed by the examples the run had consumed, as its host
         # counted them, its record their coordinate beside its step.
         if examples is not None:
             evaluation = dataclasses.replace(evaluation, examples=examples)
+        # A cooldown branch's scores, named under `cooldown/` as its report and its ranking read them.
+        evaluation = evaluation.branched() if cooled else evaluation
         if not warm:
             # The training values ride along for ranking (`_ranking`); the log interval reports
             # them, so the evaluation's own report leaves them out.

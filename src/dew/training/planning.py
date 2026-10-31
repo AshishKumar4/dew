@@ -514,7 +514,7 @@ def spill_record(miss: report.Miss) -> dict[str, JSON]:
     """A kernel a compile found spilling (`report.Miss`), its launch's config by its text."""
     return {"kernel": miss.kernel, "op": miss.op,
             "config": None if miss.config is None else repr(miss.config), "registers": miss.registers,
-            "spilled": miss.spilled, "stepped": miss.stepped}
+            "frame": miss.frame, "stepped": miss.stepped}
 
 
 @dataclasses.dataclass

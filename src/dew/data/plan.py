@@ -20,7 +20,7 @@ import numpy as np
 
 from dew import _checkout
 from dew._hashing import array_header
-from dew._records import ADDED, JSON, json_value, record, set_added
+from dew._records import ADDED, JSON, json_value, record, set_added, without_removed
 from dew.data.compilation import checkout_now
 from dew.data.sources.codec import content_fingerprint
 from dew.position import PER_SHARE
@@ -551,7 +551,10 @@ class Plan:
                     or any(pools.get(name) != saved_pools.get(name) for name in compared)):
                 raise ValueError(f"saved per-share data plan topology changed (shares, workers or cycle "
                                  f"length): {PER_SHARE}")
-        manifest, semantic = record(saved.get("manifest"), "saved data manifest"), self.manifest.semantic()
+        # Each identity without the fields its configurations lost since runs were saved (`without_removed`).
+        manifest, semantic = (record(without_removed(found), "data manifest") for found in (
+            json_value(record(saved.get("manifest"), "saved data manifest"), "saved data manifest"),
+            json_value(self.manifest.semantic(), "data manifest")))
         # A bound the order grew is its steps' limit too.
         changed = tuple(name for name in _changed(manifest, semantic)
                         if not (name == "steps" and _steps_grown(json_value(manifest[name], "saved steps"),

@@ -22,6 +22,7 @@ import jax
 import pytest
 from reference_error import recording
 from saved_run_kinds import SAVED_KINDS, answered, computed
+from saved_run_products import unpacked
 
 from dew.checkpoints import Checkpoints
 from dew.config import RunConfig
@@ -99,7 +100,8 @@ def test_a_run_an_earlier_main_saved_loads_and_answers(tmp_path, recorded, kind)
         if task is not None and seen["version"] >= PRODUCTS:
             # The task loaded multiplies as the one the run saved did: one request's products, module by
             # module, in the dtypes they multiplied in then.
-            assert computed(run) == seen["products"]
+            found = computed(run)
+            assert found["products"] == unpacked(seen["products"], found["packs"])
     with Checkpoints(str(run)) as checkpoints:
         last = checkpoints.latest
         declared = checkpoints.artifact(last) is not None
@@ -161,11 +163,36 @@ def test_a_run_an_earlier_main_saved_resumes_from_its_checkpoint(tmp_path, monke
         # The model the resumed fit trained computes as the saved one did: the task its new step saves.
         task = objectives[recorded_run.objective.name].saved_task
         if task is not None and seen["version"] >= PRODUCTS:
-            assert computed(run, int(state.step)) == seen["products"]
+            found = computed(run, int(state.step))
+            assert found["products"] == unpacked(seen["products"], found["packs"])
         # The step the resumed fit compiled, at the rung it was admitted at.
         compiled = [row["value"] for row in records[resumed:] if row["type"] == "StepCompiled"][-1]
         assert compiled["remat"] == seen["remat"]
         assert {name: (compiled["plan"] or {}).get(name) for name in seen["plan"]} == seen["plan"]
+
+
+def test_a_packed_projections_products_count_at_each_of_its_members():
+    """A task that serves a group of projections packed (`dew.nn.protocols.ProjectionGroup`: a decoder's
+    q, k and v as `qkv_proj`) multiplies them in one product, which the evidence counts at each member
+    (`unpacked`), so a run a main saved before the task packed them compares with one it packs: the same
+    dtypes at the same members. A member whose dtype moved still differs; a module of the same name that
+    no group declares (a linear attention's own `qkv_proj`) keeps its path; and two groups of one packed
+    name unpack each to its own members."""
+    from saved_run_products import unpacked
+
+    packs = {"layers_0/self_attn/qkv_proj": ["layers_0/self_attn/q_proj", "layers_0/self_attn/k_proj",
+                                             "layers_0/self_attn/v_proj"],
+             "layers_0/mlp/gate_up_proj": ["layers_0/mlp/gate_proj", "layers_0/mlp/up_proj"],
+             "layers_1/self_attn/qkv_proj": ["layers_1/self_attn/q_proj", "layers_1/self_attn/kv_proj"]}
+    then = {"layers_0/self_attn/q_proj": ["float64"], "layers_0/self_attn/k_proj": ["float64"],
+            "layers_0/self_attn/v_proj": ["float64"], "layers_0/mlp/gate_proj": ["float32"],
+            "layers_0/mlp/up_proj": ["float32"], "layers_1/self_attn/q_proj": ["float64"],
+            "layers_1/self_attn/kv_proj": ["float64"], "layers_2/lightning/qkv_proj": ["float64"]}
+    now = {"layers_0/self_attn/qkv_proj": ["float64"], "layers_0/mlp/gate_up_proj": ["float32"],
+           "layers_1/self_attn/qkv_proj": ["float64"], "layers_2/lightning/qkv_proj": ["float64"]}
+    assert unpacked(now, packs) == unpacked(then, packs) == then
+    moved = {**then, "layers_0/mlp/up_proj": ["bfloat16"]}
+    assert unpacked(moved, packs) != unpacked(now, packs)
 
 
 def test_roots_applied_one_after_another_are_each_named_by_their_own_branch():
@@ -220,11 +247,13 @@ def test_a_requests_products_are_named_by_their_variable_scopes():
     of the module that runs them in the task's tree, whichever method or class runs them: a helper
     method's product is its owner's, a shared scope's its sharer's, two siblings' apart, two roots of one
     class applied over two branches of the tree apart, a renamed class's the same; and a projection whose
-    dtype moves moves alone. Two branches alike in every leaf, which no root's reading tells apart, are
-    refused."""
+    dtype moves moves alone, and a branch whose trunk is held frozen, read from two collections, its own.
+    Two branches alike in every leaf, which no root's reading tells apart, are refused."""
     import jax.numpy as jnp
     from flax import linen as nn
     from saved_run_products import products, scoping
+
+    from dew.batch import freeze, part, thaw
 
     class Pair(nn.Module):
         right: jnp.dtype
@@ -258,11 +287,15 @@ def test_a_requests_products_are_named_by_their_variable_scopes():
 
     x = jnp.ones((2, 4), jnp.float32)
 
-    def read(roots: dict[str, nn.Module]) -> dict[str, list[str]]:
+    def read(roots: dict[str, nn.Module], frozen: bool = False) -> dict[str, list[str]]:
         tree = {"params": {name: root.init(jax.random.key(0), x)["params"] for name, root in roots.items()}}
+        if frozen:
+            # Each root's right projection held frozen, as a run's frozen trunk is (`dew.batch.freeze`).
+            tree = freeze(tree, lambda path: "right" not in path)
 
         def request(tree, x):
-            return sum(root.apply({"params": tree["params"][name]}, x) for name, root in roots.items())
+            # Each root reads its trunk whole (`thaw`), as a run's model reads its frozen trunk.
+            return sum(root.apply(thaw(part(tree, name)), x) for name, root in roots.items())
 
         with nn.intercept_methods(scoping(tree)):
             lowered = jax.jit(request).lower(tree, x)
@@ -276,3 +309,6 @@ def test_a_requests_products_are_named_by_their_variable_scopes():
         "second/right": ["bfloat16"]}
     with pytest.raises(ValueError):
         read({"first": Pair(jnp.float32), "second": Pair(jnp.bfloat16)})
+    # A branch read from two collections, its trunk held frozen, is the branch its root reads.
+    assert read({"first": Pair(jnp.float32), "second": Pair(jnp.bfloat16, width=8)}, frozen=True) == read(
+        {"first": Pair(jnp.float32), "second": Pair(jnp.bfloat16, width=8)})
