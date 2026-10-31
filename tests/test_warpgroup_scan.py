@@ -30,7 +30,7 @@ def _scanned(decays, writes, *, reverse: bool, interpret):
 
     def body(a_gmem, b_gmem, states_gmem, last_gmem, exchanged):
         layout = scan.blocked(positions)
-        a, b = (plgpu.load(gmem, (), layout=layout, optimized=False) for gmem in (a_gmem, b_gmem))
+        a, b = (plgpu.load(gmem, layout=layout, optimized=False) for gmem in (a_gmem, b_gmem))
         states, last = scan.linear_scan(a, b, jnp.full((positions,), CARRIED, jnp.float32), exchanged,
                                         reverse=reverse, interpret=interpret is not None)
         plgpu.store(states_gmem, states, optimized=False)
