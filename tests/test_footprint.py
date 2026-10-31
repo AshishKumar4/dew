@@ -108,8 +108,8 @@ def test_a_gradients_peak_holds_the_gradient_beside_the_cotangent_each_residual_
 
     # Both gradients, 64 x 16 floats each, and the first layer's cotangent, 8 x 64.
     held = (2 * 64 * 16 + 8 * 64) * 4
-    assert gradient_peak(loss, params, (rows,), platform="gpu", workspace=0) == held
-    assert gradient_peak(loss, params, (rows,), platform="gpu", workspace=1 << 20) == held + (1 << 20)
+    assert gradient_peak(loss, params, (rows,), platform="gpu", workspace=0).bytes == held
+    assert gradient_peak(loss, params, (rows,), platform="gpu", workspace=1 << 20).bytes == held + (1 << 20)
 
 
 def test_a_fused_value_a_product_reads_is_held_while_it_multiplies():
@@ -123,7 +123,7 @@ def test_a_fused_value_a_product_reads_is_held_while_it_multiplies():
         return jnp.sum(jnp.tanh(jnp.exp(rows) @ weights)), ()
 
     # The gradient (16 x 32), the exponentials (8 x 16), the cotangent and the product (8 x 32 each).
-    assert gradient_peak(loss, weights, (rows,), platform="gpu", workspace=0) == (
+    assert gradient_peak(loss, weights, (rows,), platform="gpu", workspace=0).bytes == (
         16 * 32 + 8 * 16 + 2 * 8 * 32) * 4
 
 
@@ -136,7 +136,7 @@ def test_a_gradient_a_fused_chain_computes_is_held():
         return jnp.sin(params).sum(), ()
 
     for platform in ("gpu", "cpu"):
-        assert gradient_peak(sine, shape, (), platform=platform, workspace=0) == 8 * 16 * 4
+        assert gradient_peak(sine, shape, (), platform=platform, workspace=0).bytes == 8 * 16 * 4
 
 
 def test_a_called_program_holds_what_it_would_inline():
@@ -204,8 +204,8 @@ def test_a_product_too_small_for_cublas_takes_no_workspace():
 
     for shape, workspace in ((small, 0), (large, 1 << 20)):
         rows = jax.ShapeDtypeStruct((shape.shape[0], shape.shape[0]), jnp.float32)
-        with_workspace = gradient_peak(product, shape, (rows,), platform="gpu", workspace=1 << 20)
-        without = gradient_peak(product, shape, (rows,), platform="gpu", workspace=0)
+        with_workspace = gradient_peak(product, shape, (rows,), platform="gpu", workspace=1 << 20).bytes
+        without = gradient_peak(product, shape, (rows,), platform="gpu", workspace=0).bytes
         assert with_workspace - without == workspace
 
 
@@ -236,8 +236,8 @@ def test_an_inner_product_of_vectors_takes_no_workspace():
         return jnp.sum(other @ params), ()
 
     for loss, other, workspace in ((inner, vector, 0), (matrix_vector, matrix, 1 << 20)):
-        with_workspace = gradient_peak(loss, vector, (other,), platform="gpu", workspace=1 << 20)
-        without = gradient_peak(loss, vector, (other,), platform="gpu", workspace=0)
+        with_workspace = gradient_peak(loss, vector, (other,), platform="gpu", workspace=1 << 20).bytes
+        without = gradient_peak(loss, vector, (other,), platform="gpu", workspace=0).bytes
         assert with_workspace - without == workspace
 
 
@@ -245,37 +245,18 @@ def test_a_ragged_product_holds_its_ragged_operand_once_a_group_on_a_gpu():
     """XLA's GPU compiler expands a ragged product its grouped kernels do not take, every float32 one, into
     a product over its groups (`RaggedDotRewriter`, xla/hlo/transforms/expanders/ragged_dot_rewriter.cc):
     rows ragged in their non-contracting dimension become a select of their broadcast once a group
-    (`RaggedToDense`), which the product contracts over its group and feature dimensions apart, so XLA's
-    dot decomposer lays it out again with those two adjacent (`DotDecomposer`): two buffers of the rows
-    once a group while it multiplies, on a CPU none."""
-    from dew.training.footprint import peak_bytes
+    (`RaggedToDense`), which the product reads from memory, held while it multiplies; on a CPU none. What
+    XLA's layout assignment and fusion add beside it is theirs to choose, so a program that expands one
+    states its peak as a bound from below (`bounded_below`)."""
+    from dew.training.footprint import bounded_below, peak_bytes
 
     rows, sizes = jax.ShapeDtypeStruct((64, 16), jnp.float32), jax.ShapeDtypeStruct((4,), jnp.int32)
     weights = jax.ShapeDtypeStruct((4, 16, 32), jnp.float32)
     program = jax.make_jaxpr(lambda rows, weights, sizes: jax.lax.ragged_dot(rows, weights, sizes))(
         rows, weights, sizes).jaxpr
-    # The output (64 x 32) beside the rows masked once for each of the 4 groups, in two layouts.
-    assert peak_bytes(program, "gpu", 0) == (64 * 32 + 2 * 4 * 64 * 16) * 4
-    assert peak_bytes(program, "cpu", 0) == 64 * 32 * 4
-
-
-def test_a_ragged_products_mask_is_one_buffer_its_expansions_share():
-    """Two ragged products of operands of one shape, over one group sizes and ragged in one dimension,
-    compute one mask (XLA's common-subexpression elimination of `RaggedToDense`'s compares), which both
-    selects read, so it is held, a byte an element, beside both expansions; a product of its own reads
-    its mask within its select's fusion."""
-    from dew.training.footprint import peak_bytes
-
-    rows, sizes = jax.ShapeDtypeStruct((64, 16), jnp.float32), jax.ShapeDtypeStruct((4,), jnp.int32)
-    weights = jax.ShapeDtypeStruct((4, 16, 32), jnp.float32)
-
-    def twice(first, second, weights, sizes):
-        return jax.lax.ragged_dot(first, weights, sizes), jax.lax.ragged_dot(second, weights, sizes)
-
-    program = jax.make_jaxpr(twice)(rows, rows, weights, sizes).jaxpr
-    expansion, mask = 2 * 4 * 64 * 16 * 4, 4 * 64 * 16
-    # The first product's output held while the second expands, and the mask both share.
-    assert peak_bytes(program, "gpu", 0) == 64 * 32 * 4 * 2 + expansion + mask
+    # The output (64 x 32) beside the rows masked once for each of the 4 groups.
+    assert peak_bytes(program, "gpu", 0) == (64 * 32 + 4 * 64 * 16) * 4 and bounded_below(program, "gpu")
+    assert peak_bytes(program, "cpu", 0) == 64 * 32 * 4 and not bounded_below(program, "cpu")
 
 
 def test_ragged_products_over_one_operand_ragged_in_two_axes_expand_it_twice():
