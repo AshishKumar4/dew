@@ -148,9 +148,7 @@ def test_a_saved_runs_data_shaped_like_an_earlier_iterators_record_loads_as_it_w
     columns = Path(RunConfig(data=Memory({"payload": [payload]}).batch(1)).save(str(tmp_path / "columns")))
     assert list(RunConfig.load(str(columns)).data.source.values["payload"]) == [payload]
     rows = Path(RunConfig(data=Memory([payload]).batch(1)).save(str(tmp_path / "rows")))
-    loaded = RunConfig.load(str(rows)).data.source.values
-    assert {name: list(column) for name, column in loaded.items()} == {"class": [payload["class"]],
-                                                                      "fields": [payload["fields"]]}
+    assert list(RunConfig.load(str(rows)).data.source.values) == [payload]
 
 
 def test_a_run_recorded_while_a_held_out_iterators_identity_was_its_name_loads_its_view_renamed(tmp_path):

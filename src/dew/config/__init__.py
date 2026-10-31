@@ -1037,8 +1037,10 @@ def _renamed_call(call: JSON) -> JSON:
     settings, named = call.get("settings"), call["pipe"]
     if not isinstance(settings, dict) or not isinstance(named, str) or not named.startswith("dew."):
         return call
-    hints = typing.get_type_hints(registry.imported(named))
-    return {**call, "settings": {name: _renamed_stores(value) if _holds_store(hints.get(name)) else value
+    taken = parameters(registry.imported(named))[0]
+    hints = {name: registry.parameter_type(taken[name][1], name) if name in taken else None
+             for name in settings}
+    return {**call, "settings": {name: _renamed_stores(value) if _holds_store(hints[name]) else value
                                  for name, value in settings.items()}}
 
 
@@ -1079,11 +1081,13 @@ def _store_class(value: JSON) -> str | None:
 def _store_fields(named: str) -> frozenset[str]:
     """The fields of the store class at import path `named` that its declared types say hold stores (a
     concatenation's parts, a view's source)."""
-    hints = typing.get_type_hints(registry.imported(named))
-    return frozenset(name for name, hint in hints.items() if _holds_store(hint))
+    built = registry.imported(named)
+    assert isinstance(built, type)
+    return frozenset(field.name for field in dataclasses.fields(built)
+                     if _holds_store(declared_type(built, field.name)))
 
 
-def _holds_store(hint: registry.Annotation | typing.TypeVar) -> bool:
+def _holds_store(hint: Annotation | typing.TypeVar) -> bool:
     """Whether a declared type `hint` holds stores: Dew's store protocol (`Source`), a store or view class, or
     any type made of one (a tuple of them, an optional one, a view's type variable bound to one)."""
     from dew.data.sources.base import Source, View
