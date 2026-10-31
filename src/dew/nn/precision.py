@@ -30,7 +30,7 @@ import contextlib
 import dataclasses
 import functools
 import os
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Hashable, Sequence
 from typing import Literal, overload
 
 import jax
@@ -218,6 +218,15 @@ def spread(value: jax.Array, shape: tuple[int, ...]) -> jax.Array:
                  if size == 1 and total != 1)
     if not axes or not _sums_in_float64(value):
         return jnp.broadcast_to(value, shape)
+    outer, broadcast = _spreads(tuple(shape), axes)
+    return jax.lax.platform_dependent(value, cpu=outer, default=broadcast)
+
+
+@functools.lru_cache(maxsize=4096)
+def _spreads(shape: tuple[int, ...], axes: tuple[int, ...]) -> tuple[Callable, Callable]:
+    """`spread`'s two branches to `shape` over the size-one `axes`, the CPU's outer product and the
+    broadcast, built once a shape: `platform_dependent` traces its branches once a function, so the same
+    functions find JAX's traces of them cached (`_accumulation`)."""
     kept = tuple(axis for axis in range(len(shape)) if axis not in axes)
 
     def outer(value: jax.Array) -> jax.Array:
@@ -227,7 +236,10 @@ def spread(value: jax.Array, shape: tuple[int, ...]) -> jax.Array:
                               ones, jnp.squeeze(value, axes))
         return jnp.transpose(product, tuple(np.argsort((*axes, *kept))))
 
-    return jax.lax.platform_dependent(value, cpu=outer, default=lambda value: jnp.broadcast_to(value, shape))
+    def broadcast(value: jax.Array) -> jax.Array:
+        return jnp.broadcast_to(value, shape)
+
+    return outer, broadcast
 
 
 def precision_names(precision: jax.lax.PrecisionLike) -> frozenset[str]:
@@ -400,17 +412,60 @@ def accumulated(product: Callable[..., jax.Array], *operands,
     products here. A computation that stands for such a target, a reference for a kernel interpreted
     on a CPU, states its fp32 sums with JAX's dot algorithm for them, `with
     jax.default_matmul_precision(FP32_SUMS)`, which jit's cache keys as it keys every precision."""
+    if not _sums_in_float64(*operands):
+        return product(*operands, preferred_element_type=preferred_element_type)
+    shapes = tuple(jax.ShapeDtypeStruct(operand.shape, operand.dtype) for operand in operands)
+    branches = _accumulation(_keyed(product), preferred_element_type, shapes, jax.config.jax_enable_x64,
+                             jax.config.jax_default_matmul_precision)
+    if branches is None:
+        return product(*operands, preferred_element_type=preferred_element_type)
+    wide, narrow = branches
+    return jax.lax.platform_dependent(*operands, cpu=wide, default=narrow)
+
+
+@dataclasses.dataclass(frozen=True)
+class _Keyed:
+    """A product (`accumulated`) by what it computes, `key`, which alone compares (`_keyed`)."""
+
+    key: Hashable
+    product: Callable[..., jax.Array] = dataclasses.field(compare=False)
+
+
+def _keyed(product: Callable[..., jax.Array]) -> _Keyed:
+    """`product` keyed by what it computes: a partial by its function, arguments and keywords, so the
+    partials callers build apart at each call key one entry (`_accumulation`); any other product, or a
+    partial over an unhashable argument (an array), by itself."""
+    if not isinstance(product, functools.partial):
+        return _Keyed(product, product)
+    stated = (product.func, product.args, tuple(sorted(product.keywords.items())))
+    try:
+        hash(stated)
+    except TypeError:  # an unhashable argument: the partial keys by itself
+        return _Keyed(product, product)
+    return _Keyed(stated, product)
+
+
+@functools.lru_cache(maxsize=4096)
+def _accumulation(keyed: _Keyed, preferred_element_type: DTypeLike | None,
+                  shapes: tuple[jax.ShapeDtypeStruct, ...], x64: bool,
+                  matmul_precision: str | None) -> tuple[Callable, Callable] | None:
+    """`accumulated`'s two branches for `keyed`'s product over operands of `shapes`, the CPU's float64 sum
+    and the plain product, built once a product, operand types and the trace's x64 and matmul precision
+    settings: `platform_dependent` traces its branches once a function, so the same functions find
+    JAX's traces of them cached where a model forms the product again (each layer of a stack, each trace
+    of a step), where fresh ones traced both at every call. None where the products are not float32's,
+    or the product carries a backward of its own, which take the plain product."""
     from dew.nn.kernels.generation import linear_tangent
 
+    del x64, matmul_precision  # keys: what the traces read of the configuration
+    product = keyed.product
     narrow = functools.partial(product, preferred_element_type=preferred_element_type)
-    if not _sums_in_float64(*operands):
-        return narrow(*operands)
-    traced, shape = jax.make_jaxpr(narrow, return_shape=True)(*operands)
+    traced, shape = jax.make_jaxpr(narrow, return_shape=True)(*shapes)
     dtype = shape.dtype
     if jnp.promote_types(dtype, jnp.float32) != jnp.float32 or _own_backward(traced.jaxpr):
         # A wider result converts the operands to it, so the products are not float32's; a product
         # with a backward of its own is its library's.
-        return narrow(*operands)
+        return None
 
     def summed(*operands):
         return float64_sum(product, *operands, dtype=dtype)
@@ -437,7 +492,7 @@ def accumulated(product: Callable[..., jax.Array], *operands,
 
     # Forward mode differentiates `summed` as it traces, inside its scope; reverse mode runs `pulled`.
     wide = linear_tangent(lambda *operands: (summed(*operands), ()), pulled, summed, live_cotangents=True)
-    return jax.lax.platform_dependent(*operands, cpu=wide, default=narrow)
+    return wide, narrow
 
 
 L2NORM_EPS = 1e-6
