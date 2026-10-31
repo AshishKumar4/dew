@@ -94,7 +94,7 @@ def exported(args) -> dict:
             "spanning": sum(not leaf.is_fully_addressable for leaf in leaves),
             "refused_outside": refused, "release": digests(destination), "alone": digests(alone),
             "small_files": sorted(path.name for path in destination.iterdir()
-                                  if path.suffix != ".safetensors"),
+                                  if not path.name.endswith((".safetensors", ".safetensors.index.json"))),
             "peak": peak, "whole": sum(leaf.nbytes for leaf in leaves),
             "largest_leaf": max(leaf.nbytes for leaf in leaves)}
 
