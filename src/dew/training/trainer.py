@@ -2486,9 +2486,10 @@ class Trainer(Generic[Loss, Effects]):
         """Wait at the run's cleanup for every export its window left running (`export_wait`), a stop that
         failed on some rank included, whose peers' exports still run; a failed one raised on every rank
         where the run itself `agree`s, as one that failed does not. Then report a window that stopped on
-        process zero, its reports written."""
+        process zero, its reports written: a failed run reports none, as its ranks agree on nothing more
+        before its cleanup's own outcome."""
         export_wait(profile.directory, agree=agree)
-        if run.profiled is None:
+        if run.profiled is None or not agree:
             return
         traced, step = run.profiled
         self._report(ProfileWindowRecord(profile.directory, traced), step)

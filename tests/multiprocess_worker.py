@@ -924,10 +924,10 @@ def mode_profile_failure(args) -> dict:
 
 
 def mode_profile_stop_failure(args) -> dict:
-    """A profile window whose capture rank 0 cannot stop: its process directory made unwritable while the
-    window traces (by the tracker, which reports on rank 0 alone), so its trace cannot be written as the
-    window stops, while rank 1's stop starts its export. Every rank fails the stop together, and the run's
-    cleanup still waits for the export rank 1 started (`export_wait`): none outlives the fit."""
+    """A profile window whose capture rank 0 cannot stop: its capture's directory made unwritable while the
+    window traces (by an observer, which runs at each step on the loop), so its trace cannot be written as
+    the window stops, while rank 1's stop starts its export. Every rank fails the stop together, and the
+    run's cleanup still waits for the export rank 1 started (`export_wait`): none outlives the fit."""
     import os
     import stat
 
@@ -936,27 +936,24 @@ def mode_profile_stop_failure(args) -> dict:
 
     from dew._coordination import agree_process_phase
     from dew.telemetry import profile
-    from dew.training import ProfileWindow, Trainer
+    from dew.training import Observe, ProfileWindow, Trainer
 
     profile_dir = Path(args.profile_dir)
 
-    class Locking:
-        """Rank 0's tracker: its capture's directory unwritable from the window's first log on."""
-
-        def log(self, scalars, step):
+    def locked(state) -> int:
+        # On rank 0, the window's capture directory unwritable at the window's first step, before it stops.
+        if jax.process_index() == 0:
             for capture in (profile_dir / "process-0").glob("capture-*"):
                 os.chmod(capture, stat.S_IRUSR | stat.S_IXUSR)
-
-        def artifact(self, value, step):
-            pass
+        return 0
 
     loader = indexed_loader(args.records, BATCH // args.processes)
-    trainer = Trainer(make_objective(), optax.adam(1e-3), key=jax.random.key(0), tracker=Locking(),
+    trainer = Trainer(make_objective(), optax.adam(1e-3), key=jax.random.key(0),
                       profile=ProfileWindow(str(profile_dir), steps=2, warmup=0))
     error = None
     try:
         trainer.fit(Loader(lambda partition: iter(loader), None, batch=BATCH, records=None),
-                    steps=args.steps, log_every=1)
+                    steps=args.steps, log_every=1, observe=Observe(1, locked))
     except BaseException as failure:
         error = failure
     exporting = len(profile._exporting)
