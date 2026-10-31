@@ -2966,8 +2966,19 @@
    ],
    "note": "RoutedMoE.generate_masks' own body extracted from src/maxtext/layers/moe.py at the commit (SHA-256 checked), called on a stand-in self with its three fields and an identity sharding hint; dispatch and combine masks for four dropping cases. JAX 0.11.2.post3."
   },
+  "dreamerv3/conv.npz": {
+    "tool": "tools/venv_reference.py",
+    "sources": [
+      {
+        "repo": "danijar/dreamerv3",
+        "revision": "e01491fad6434b2245a3b8ca201dd7faedcc458c",
+        "runs": "dreamerv3/rssm.py Encoder and Decoder"
+      }
+    ],
+    "note": "DreamerV3's simple image encoder and decoder at the 1M size (depth 4, units 64, five-tap convolutions, block-diagonal deterministic input in 8 blocks) run by tools/dreamerv3_worker.py conv on the CPU over each seed's drawn weights, 64x64 RGB images, deterministic states and one-hot categoricals, in float32 and, the code's compute dtype and every module's float32 set to float64, in float64; kept as its evidence and its truth's sketch."
+  },
   "maxtext/gpt3.npz": {
-   "tool": "tools/maxtext_reference.py",
+   "tool": "tools/venv_reference.py",
    "sources": [
     {
      "repo": "AI-Hypercomputer/maxtext",
@@ -2978,7 +2989,7 @@
    "note": "MaxText's GPT-3 (decoder_block gpt3, model gpt3-52k at two layers, a vocabulary and position table of 64) run by tools/maxtext_worker.py gpt3 on the CPU over each seed's drawn weights and eight tokens, in float32 and, its validated config's dtypes set to float64 and its bfloat16 read of the tied table and its RMSNorm's float32 carried in float64 (float64_casts), in float64; kept as its evidence and its truth's sketch over 80 draws (16 declared seeds and their redraw)."
   },
   "maxtext/engram.npz": {
-   "tool": "tools/maxtext_reference.py",
+   "tool": "tools/venv_reference.py",
    "sources": [
     {
      "repo": "AI-Hypercomputer/maxtext",

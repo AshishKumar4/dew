@@ -21,6 +21,7 @@ from benchmark_recurrence_mosaic import measured
 
 from dew.nn.inputs import MixerCall
 from dew.nn.kernels import generation
+from dew.nn.kernels.options import program
 from dew.nn.linear import GatedDeltaNet
 
 SHAPES = {
@@ -55,11 +56,10 @@ def decode_token(name: str, rows: int):
     allocated = module.apply(variables, hidden[:, :1], call, mutable=['cache'])[1]
     _, cache = module.apply({**variables, **allocated}, hidden[:, :PREFILL], call, mutable=['cache'])
 
-    @jax.jit
     def step(cache, token):
         return module.apply({**variables, **cache}, token, call, mutable=['cache'])
 
-    return step, (cache, hidden[:, PREFILL:])
+    return program(step), (cache, hidden[:, PREFILL:])
 
 
 def main(argv=None) -> int:
