@@ -219,11 +219,12 @@ def _muon_groups(learning_rate, weight_decay=0.0, adam_weight_decay=None, *, ns_
 
     Its Newton-Schulz runs once an update, whatever its microbatches: a Qwen3.5-4B decision fine-tune on
     one H100 takes each accumulating microbatch of 8192 tokens about as AdamW does (471 ms against 469)
-    and its update's in 860 ms against AdamW's 516, so at 65,536 tokens an update, eight microbatches,
-    an update takes about 4156 ms against 3797, 9.4% over AdamW (the bfloat16 iteration); at 8192 tokens,
-    one microbatch an update, 844 ms against 495 (1.71x), the iteration undivided (node job
-    LR-h100-muon-2752c at 699d038ca; `ns_operands` holds each precision's; ledger 2637, 2685, 2752).
-    Larger updates and a partitioned state (FSDP) are untimed."""
+    and its update's in 860 ms against AdamW's 516 (the bfloat16 iteration), so an update of eight
+    microbatches, 65,536 tokens, takes about 4156 ms against 3797, 9.4% over AdamW, and one of 32,
+    262,144 tokens, 15,529 against 15,145, 2.5%; at 8192 tokens, one microbatch an update, 844 ms against
+    495 (1.71x), the iteration undivided (node jobs LR-h100-muon-2752c at 699d038ca and
+    LR-h100-muon-262144 at 8ac4afe5d; `ns_operands` holds each precision's; ledger 2637, 2685, 2752). A
+    state partitioned over devices (FSDP) is untimed."""
     def labels(params):
         return jax.tree.map(lambda numbers: "adam" if numbers is None else "muon",
                             muon_weight_dimension_numbers(params), is_leaf=muon_leaf)
