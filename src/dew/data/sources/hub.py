@@ -32,12 +32,15 @@ def hold_progress_lock() -> None:
     bars.get_lock()
 
 
-def split_files(paths: Sequence[str], split: str) -> list[str]:
-    """The `paths` of a repository listing that `datasets` gives `split`, by its default patterns
-    (`datasets.data_files.get_data_patterns`), resolved as it resolves a split's patterns
-    (`DataFilesList.from_patterns`), over an empty in-memory copy of the listing: the listing itself,
-    which the Hub answered once and offline replays, is all the patterns read."""
-    from datasets.data_files import DataFilesList, get_data_patterns
+def split_files(paths: Sequence[str], split: str, config: Mapping[str, object] | None = None) -> list[str]:
+    """The `paths` of a repository listing that `datasets` gives `split`: of a configuration its card
+    states (`config`), by its `data_files` patterns, else by `datasets`' default patterns
+    (`datasets.data_files.get_data_patterns`), under its `data_dir` where it names one, as `datasets`
+    reads a card's configuration (`datasets.load.create_builder_configs_from_metadata_configs`); resolved
+    as it resolves a split's patterns (`DataFilesList.from_patterns`), over an empty in-memory copy of
+    the listing: the listing itself, which the Hub answered once and offline replays, is all the
+    patterns read."""
+    from datasets.data_files import DataFilesList, get_data_patterns, sanitize_patterns
     from fsspec.implementations.memory import MemoryFileSystem
 
     if not paths:
@@ -48,11 +51,15 @@ def split_files(paths: Sequence[str], split: str) -> list[str]:
     fs, root = MemoryFileSystem(), f"/dew-hub-listing/{uuid.uuid4().hex}"
     for path in paths:
         fs.pipe_file(f"{root}/{path}", b"")
-    base = f"memory://{root}"
+    stated = {} if config is None else config
+    directory = stated.get("data_dir")
+    base = f"memory://{root}" + (f"/{directory}" if isinstance(directory, str) and directory else "")
     try:
         # A listing with no data files at all is datasets' FileNotFoundError (EmptyDatasetError).
-        patterns = {str(name): found for name, found in get_data_patterns(base).items()}
-        resolved = set(DataFilesList.from_patterns(list(patterns.get(split, ())), base_path=base))
+        files = stated.get("data_files")
+        found = sanitize_patterns(files) if isinstance(files, (str, list, dict)) else get_data_patterns(base)
+        patterns = {str(name): list(each) for name, each in found.items()}
+        resolved = set(DataFilesList.from_patterns(patterns.get(split, []), base_path=base))
     except FileNotFoundError:
         resolved = set()
     finally:
@@ -160,7 +167,7 @@ class Hub(Dataset):
             conversion = hub_answer(("dataset conversion", self.repo, revision), converted).value
             if conversion is not None and conversion != revision:
                 revision = conversion
-                paths, format = self._selected(revision)
+                paths, format = self._selected(revision, converted=True)
         return (revision, tuple(sorted(paths)), format) if paths else None
 
     @cached_property
@@ -224,15 +231,65 @@ class Hub(Dataset):
     def _listings(self) -> dict[str, list[str]]:
         return {}
 
-    def _selected(self, revision: str) -> tuple[list[str], Format]:
+    def _configurations(self, revision: str) -> Mapping[str, Mapping[str, object]]:
+        """The configurations the repo's card states at `revision` (its `configs`, as `datasets` reads
+        them: `datasets.utils.metadata.MetadataConfigs`), each by its name with the fields that choose
+        its files and its default (`data_files`, `data_dir`, `default`), as the Hub last answered
+        (`dew.cache.hub_answer`); none where the commit holds no card or its card states none."""
+        if "README.md" not in self._listed(revision):
+            return {}
+
+        def stated() -> Mapping[str, Mapping[str, object]]:
+            from datasets.utils.metadata import MetadataConfigs
+            from huggingface_hub import DatasetCardData, HfApi
+            from huggingface_hub.repocard import metadata_load
+
+            card = metadata_load(HfApi().hf_hub_download(self.repo, "README.md", repo_type="dataset",
+                                                         revision=revision)) or {}
+            configs = MetadataConfigs.from_dataset_card_data(DatasetCardData(**card))
+            return {name: {field: params[field] for field in ("data_files", "data_dir", "default")
+                           if field in params} for name, params in configs.items()}
+
+        return hub_answer(("dataset configurations", self.repo, revision), stated).value
+
+    def _configuration(self, configs: Mapping[str, Mapping[str, object]]) -> str:
+        """The configuration among `configs` this split reads: `name`, else their default as `datasets`
+        chooses it (`MetadataConfigs.get_default_config_name`: a lone one, one named "default" or the one
+        marked so). Raises ValueError where `name` is none of them, or none is named and none is the
+        default, as `datasets` refuses both."""
+        from datasets.utils.metadata import MetadataConfigs
+
+        chosen = self.name if self.name is not None else MetadataConfigs(
+            {name: dict(params) for name, params in configs.items()}).get_default_config_name()
+        if chosen is None:
+            raise ValueError(f"HF {self.repo!r} has the configurations {sorted(configs)} and marks none the "
+                             "default: name one (Hub(..., name=))")
+        if chosen not in configs:
+            raise ValueError(f"HF {self.repo!r} has no configuration {chosen!r}; it has {sorted(configs)}")
+        return chosen
+
+    def _selected(self, revision: str, converted: bool = False) -> tuple[list[str], Format]:
         """This split's native shards at `revision`, in the first format of Parquet and JSONL that has
-        any: the files `datasets` resolves to the split from the revision's listing
-        (`datasets.data_files.get_data_patterns` and `resolve_pattern`, its sharded names, its split
-        keywords in file and directory names, `dev` for `validation` among them, a lone file as
-        `train`), under the configuration's directory where one is named."""
-        listed = [path for path in self._listed(revision)
-                  if self.name is None or f"/{self.name}/" in "/" + path]
-        paths = split_files(listed, self.split)
+        any: the files `datasets` resolves to the split of the configuration this split reads
+        (`_configuration`) from the revision's listing (`split_files`: a configuration's own patterns
+        where the card states them, else its sharded names, its split keywords in file and directory
+        names, `dev` for `validation` among them, a lone file as `train`). A commit whose card states no
+        configuration holds the default one alone, and none of another name, which its Parquet
+        conversion may hold. The conversion (`converted`) holds each configuration's splits in a
+        directory of its name (`<config>/<split>/`, `partial-<split>` for a split converted in part:
+        https://huggingface.co/docs/dataset-viewer/parquet) and no card, its configurations those of
+        the card of the commit it converts, else its directories."""
+        listed = self._listed(revision)
+        if converted:
+            configs = self._configurations(self.commit) or {
+                path.split("/", 1)[0]: {} for path in listed if "/" in path}
+            directory = self._configuration(configs) + "/"
+            paths = [directory + path for path in split_files(
+                [path.removeprefix(directory) for path in listed if path.startswith(directory)], self.split)]
+        elif configs := self._configurations(revision):
+            paths = split_files(listed, self.split, configs[self._configuration(configs)])
+        else:
+            paths = split_files(listed, self.split) if self.name in (None, "default") else []
         # Not Arrow: the `.arrow` files a dataset repo holds are what `save_to_disk` and
         # `push_to_hub` write, Arrow's stream format, which no reader can cut into shards or count
         # without reading it whole; such a split streams its Parquet conversion, or is prepared.

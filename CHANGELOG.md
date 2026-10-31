@@ -5,6 +5,11 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- A streamed Hub split reads the files of the configuration it names, or of the default its card
+  states, as `datasets` resolves its card's `configs` (`data_files` under `data_dir`), and its Parquet
+  conversion reads that configuration's directory: naming none, where a card states several and marks
+  no default, is refused, as is naming one it does not state, where every configuration's split of
+  that name was read before.
 - Muon's and M3's Newton-Schulz multiply in the run's numerics: bfloat16 operands in its fast forms
   (the default) and float32 at `Numerics.matmul` in its accurate ones (`--trainer.precision accurate`:
   IEEE float32), each matrix whole on one device and the matrices spread over the mesh. A run states its
