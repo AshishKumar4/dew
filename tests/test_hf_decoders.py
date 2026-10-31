@@ -1740,3 +1740,21 @@ def test_a_wrappers_decoder_reads_as_its_language_model_load_reads_it():
     assert decoder_config(blocks)["modeling_overrides"] == blocks["modeling_overrides"]
     whole = json.loads((FIXTURES / "kimi-k25-tiny" / "config.json").read_text())
     assert decoder_config(whole) is whole
+
+
+def test_a_decoder_of_the_default_feed_forward_width_exports(tmp_path):
+    """A decoder that leaves its feed-forward width unstated computes four times its residual's, which its
+    export states, so the export reads back the model it was (`refuse_lossy_export`, ledger 3065): its
+    logits after a round trip are its own."""
+    from dew.interop.pretrained import Pretrained, PretrainedDecoder
+    from dew.registry import models
+
+    model = models.build("causal_transformer", vocab_size=64, emb_features=32, num_layers=2, num_heads=4,
+                         max_seq_len=16, dtype="float32")
+    assert model.mlp_features is None
+    variables = model.init(jax.random.key(0), jnp.ones((1, 4), jnp.int32))
+    PretrainedDecoder.from_model(model, variables).save(tmp_path)
+    back = Pretrained.load(tmp_path, dtype="float32")
+    ids = jnp.arange(8, dtype=jnp.int32)[None]
+    np.testing.assert_array_equal(np.asarray(back.model.apply(back.variables, ids)),
+                                  np.asarray(model.apply(variables, ids)))

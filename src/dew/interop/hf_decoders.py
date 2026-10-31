@@ -1283,6 +1283,9 @@ in fp32."""
 
 _RESOLVED: Mapping[str, Callable[[CausalTransformer], object]] = {
     "num_kv_heads": lambda model: model.kv_heads,
+    # Each layer's width, which an unstated width (four times the residual's) and its export state alike
+    # (ledger 3065).
+    "mlp_features": lambda model: model.mlp_widths,
     "head_dim": lambda model: model.features_per_head,
     "layer_types": lambda model: model.per_layer_types,
     "kinds": lambda model: tuple(model.kind_of(kind) for kind in sorted(set(model.per_layer_types))),
