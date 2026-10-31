@@ -524,8 +524,8 @@ RESOURCE_SHAPES = {'qwen3.5-27b-gdn': (16, 48, 128, 128, False), 'kimi-linear-kd
 value heads, key and value widths, and whether the decay is a key dimension's."""
 
 RATED = frozenset({'nemotron-h-4b-ssd'})
-"""The gate's rated scans (Mamba2's SSD): no delta rule, its call `rounded` under the fast forms, its
-launches the keys-gated ones (`mainloop._Call.gated_keys`), the accurate forms' fp32 call beside them."""
+"""The gate's rated scans (Mamba2's SSD): no delta rule, its 16-bit call `rounded` (the fast forms), its
+launches the keys-gated ones (`mainloop._Call.gated_keys`)."""
 
 
 @pytest.mark.parametrize('kernel', ['recurrence_states', 'recurrence_reverse'], ids=['forward', 'backward'])
@@ -581,6 +581,9 @@ GATE_GROUPS = [(name, dtype, training, packed, variant) for name in RESOURCE_SHA
                for dtype in (jnp.bfloat16, jnp.float32) for packed in (False, True)
                for training in (False, True) for variant in (None, *range(NEIGHBOURS))
                if not (RESOURCE_SHAPES[name][4] and dtype == jnp.float32)
+               # The rated scan's 16-bit call, its fast forms' launches; its fp32 forward's spill at an
+               # H100's derived tiles is row 2931's.
+               and not (name in RATED and dtype == jnp.float32)
                and not (training and (name, dtype) not in {('qwen3.5-27b-gdn', jnp.bfloat16),
                                                            ('nemotron-h-4b-ssd', jnp.bfloat16)})
                and not (variant is not None and (training or packed or dtype == jnp.float32))]
@@ -671,10 +674,8 @@ def compiled_cases(target: str, plans: dict, refused: list, only: tuple | None =
 
     def form(name: str, dtype) -> dict:
         """The call's form beside its operands: a rated scan's without the delta rule, wide for its skip,
-        a 16-bit one `rounded` (its fast forms, `mamba_rounding`), as the SSD's route gives it."""
-        if name not in RATED:
-            return {}
-        return {'delta': False, 'wide': True, 'rounded': jnp.dtype(dtype).itemsize == 2}
+        `rounded` (its fast forms, `mamba_rounding`), as the SSD's route gives it."""
+        return {'delta': False, 'wide': True, 'rounded': True} if name in RATED else {}
 
     def case(name: str, dtype, args, starts, bound, tiles, *, training: bool, packed: bool, kind: str):
         _, value_heads, key_width, value_width, per_key = RESOURCE_SHAPES[name]

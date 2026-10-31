@@ -61,11 +61,13 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
 def planned(q, k, v, g, beta, h0=None, *, tiles: Tiles, family: mosaic.Family, starts=None,
             max_segments: int | None = None, delta: bool = True, backward: bool = False,
             floor: float | None = None, target: generation.GpuTarget | None = None,
-            rounded: bool = False) -> tuple[Launch, ...]:
+            rounded: bool = False, wide: bool = False) -> tuple[Launch, ...]:
     """The launches a call over operands of these shapes (`jax.ShapeDtypeStruct`s, `forward`'s) runs at
     `tiles` by `family`'s bundle on `target` (the device's, or the assumed one's, where None), in order, as
     planned (`Launch`): its arrays abstract (`jax.eval_shape`), its kernels declared and not built
-    (`_kernel`); with `backward`, the fast backward's too (`gradients`)."""
+    (`_kernel`); with `backward`, the fast backward's too (`gradients`). A `wide` call's output lands in
+    fp32 (`forward`'s): planned in the operands' dtype, the SSD's output launch asked 16 KB past its plan
+    (204800 bytes against 188544 on an H100's compile, the resource gate's)."""
     found: list[Launch] = []
 
     def run(q, k, v, g, beta, h0, starts):
@@ -73,7 +75,7 @@ def planned(q, k, v, g, beta, h0=None, *, tiles: Tiles, family: mosaic.Family, s
         try:
             out, final, (inverse, kept) = kept_forward(q, k, v, g, beta, h0, tiles=tiles, starts=starts,
                                                        max_segments=max_segments, delta=delta, family=family,
-                                                       floor=floor, rounded=rounded)
+                                                       floor=floor, rounded=rounded, wide=wide)
             if backward:
                 gradients(q, k, v, g, beta, h0, out, final, tiles=tiles, starts=starts,
                           max_segments=max_segments, family=family, inverse=inverse, kept=kept, delta=delta,

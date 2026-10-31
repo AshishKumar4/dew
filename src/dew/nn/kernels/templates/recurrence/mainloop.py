@@ -1396,15 +1396,8 @@ def _states(k, w, u, hi, lo, beta, h0, sequences, taken, call: _Call, tiles: Til
                        prefetch=None if call.per_key else prefetch,
                        landing=lambda role: roled(role)[1].get("final"), walkers=walkers)
 
-    out_type = (memories.shape(value_width),
-                *((held.shape(call.heads * value_width),) if stores_corrected else ()),
-                jax.ShapeDtypeStruct((batch * call.heads * width, value_width), jnp.float32))
-    blocks = _streamed(**({"w": ((CHUNK, width), held)} if delta else {}), keys=((CHUNK, width), keys),
-                       values=((CHUNK, walked_width), values))
-    initials = _streamed(**{f"initial{i}": ((call.block, walked_width), initial) for i in range(slices)})
-    # A sequence's chunks, the mean over the laid sequences; two products a chunk.
-    steps = call.chunks / sequences.shape[0]
-    work = Work(4 * CHUNK * width * walked_width * steps, steps)
+    out_type, blocks, initials, work = _states_launch(call, tiles, delta, keys, values, batch,
+                                                      sequences.shape[0], stores_corrected)
     final_landing, after = _final_landing(call, bv)
     launched = _kernel(program, call, out_type=out_type,
                      grid=(value_width // walked_width, sequences.shape[0], call.heads),
@@ -1426,6 +1419,25 @@ def _states(k, w, u, hi, lo, beta, h0, sequences, taken, call: _Call, tiles: Til
     assert jnp.dtype(u.dtype) == held.dtype, "the values as given are held so (`_Call.gated_keys`)"
     h, final = launched
     return h, u, final
+
+
+def _states_launch(call: _Call, tiles: Tiles, delta: bool, keys: _Operand, values: _Operand, batch: int,
+                   sequences: int, stores_corrected: bool) -> tuple:
+    """`_states`' outputs (the memories, the corrected values where it stores them, the final memories),
+    its streamed blocks and its initial memories' at `tiles`, and its `Work` over `sequences`."""
+    width, value_width, walked_width = call.width, call.value_width, tiles.block_v * tiles.walkers
+    held, initial = dataclasses.replace(call.held, rows=call.rows), _Operand(batch * call.heads * width, 1,
+                                                                            jnp.dtype(jnp.float32))
+    out_type = (call.memories.shape(value_width),
+                *((held.shape(call.heads * value_width),) if stores_corrected else ()),
+                jax.ShapeDtypeStruct((batch * call.heads * width, value_width), jnp.float32))
+    blocks = _streamed(**({"w": ((CHUNK, width), held)} if delta else {}), keys=((CHUNK, width), keys),
+                       values=((CHUNK, walked_width), values))
+    initials = _streamed(**{f"initial{i}": ((call.block, walked_width), initial)
+                            for i in range(width // call.block)})
+    # A sequence's chunks, the mean over the laid sequences; two products a chunk.
+    steps = call.chunks / sequences
+    return out_type, blocks, initials, Work(4 * CHUNK * width * walked_width * steps, steps)
 
 
 def _output_streams(call: _Call, bv: int) -> tuple[dict, tuple]:
