@@ -150,7 +150,9 @@ def the_layer_is_as_exact_under_the_template(packed: bool, held: bool, *, length
 @pytest.mark.parametrize("packed, held", [(False, False), (True, False), (False, True)],
                          ids=["one row", "packed documents", "a held state"])
 def test_a_mamba_layer_is_as_exact_under_the_template_interpreted(packed, held):
-    the_layer_is_as_exact_under_the_template(packed, held)
+    """The layer's cases interpreted, a held state's two calls a chunk each: as two ragged calls of 35 tokens
+    it took 191 s on armada (f6c529d85), past a test's two minutes."""
+    the_layer_is_as_exact_under_the_template(packed, held, length=64 if held else 70)
 
 
 def routed(target: str, states: int, c_dtype=jnp.float32, *, forms: str = "fast", named: bool = False):
