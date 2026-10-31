@@ -29,10 +29,9 @@ def _staging(block: tuple, swizzle: int | None) -> tuple:
 
 
 def swizzled(shape: tuple[int, ...], dtype) -> tuple:
-    """A shared-memory operand's transforms: 8-row tiles at the narrowest legal swizzle, so a depth
-    fragment loads without retaining the rest of its pipeline stage."""
-    del shape
-    return mosaic.swizzle_transforms(dtype, mosaic.NARROWEST_SWIZZLE_BYTES)
+    """A `[rows, columns]` shared-memory tile's transforms: 8-row tiles as wide as the swizzle its row
+    bytes allow, swizzled (bank-conflict-free ldmatrix), as jax's Ampere examples stage their operands."""
+    return mosaic.swizzle_transforms(dtype, plgpu.find_swizzle(shape[-1] * jnp.dtype(dtype).itemsize * 8))
 
 
 def _depth_granule(ref, axis: int, instruction: int) -> int:
