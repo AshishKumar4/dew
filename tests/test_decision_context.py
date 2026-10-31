@@ -202,9 +202,10 @@ def test_a_unit_whose_contexts_outgrow_a_windows_trains_its_examples_apart():
     assert "decision_unit" not in apart and len(apart["decision_rows"]) == 2
 
 
-PACKED_CONTEXT_SEEDS = 8
-"""Check 1's declared seeds for packed rows reading their own contexts against each row alone, sized
-paired (`seeds_for` with the packed windows as `dew_fn`) on armada."""
+PACKED_CONTEXT_SEEDS = {"table": 128, "backbone": 8}
+"""Check 1's declared seeds for packed rows reading their own contexts against each row alone, by encoder,
+sized paired (`seeds_for` with the packed windows as `dew_fn`) on armada: the table's under fp32 sums
+(ledger 1698, rows/1698-fp32-sums at 9f68891e0d, size-ctx), 8 before them."""
 
 
 def packed_arms(packed: DecisionObjective, alone: DecisionObjective, rows):
@@ -276,7 +277,7 @@ def test_packed_rows_each_read_their_own_context_as_each_does_alone(encoder):
     document, the real options' logits on par from float64 (check 1, over drawn parameters)."""
     packed, alone = conditioned(encoder=encoder, segments=3), conditioned(encoder=encoder, segments=1)
     assert_packed_as_alone(packed, alone, examples()[:12], f"packed contexts by {encoder}",
-                           PACKED_CONTEXT_SEEDS)
+                           PACKED_CONTEXT_SEEDS[encoder])
 
 
 def test_a_backbone_with_fresh_context_layers_scores_every_row_as_its_source_does():
