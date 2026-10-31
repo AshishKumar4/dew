@@ -341,42 +341,30 @@ def test_each_files_record_is_its_own_where_files_share_a_process(ci, tmp_path, 
     assert found == [f"3.12:{name}" for name in names]
 
 
-DIGESTS = {
-    "dew/cache.py": (
-        "import functools\nimport hashlib\nfrom pathlib import Path\n\n\n@functools.cache\n"
-        "def package_digest():\n    digest = hashlib.sha256()\n"
-        "    for path in sorted(Path(__file__).parent.rglob('*.py')):\n"
-        "        digest.update(path.name.encode() + path.read_bytes())\n    return digest.hexdigest()\n",
-        "from dew.cache import package_digest as digest"),
-    "dew/training/rungs.py": (
-        "import functools\nimport hashlib\nimport sys\nfrom pathlib import Path\n\n\n@functools.cache\n"
-        "def _code():\n    digest = hashlib.sha256()\n"
-        "    for name in sorted(module for module in sys.modules if module.startswith('dew')):\n"
-        "        path = vars(sys.modules[name]).get('__file__')\n"
-        "        if path is not None and path.endswith('.py'):\n"
-        "            digest.update(name.encode() + Path(path).read_bytes())\n    return digest.hexdigest()\n",
-        "from dew.training.rungs import _code as digest"),
-}
+DIGEST = (
+    "import functools\nimport hashlib\nfrom pathlib import Path\n\n\n@functools.cache\n"
+    "def package_digest():\n    digest = hashlib.sha256()\n"
+    "    for path in sorted(Path(__file__).parent.rglob('*.py')):\n"
+    "        digest.update(path.name.encode() + path.read_bytes())\n    return digest.hexdigest()\n")
+"""`dew.cache.package_digest` as a scratch package's dew/cache.py holds it."""
 
 
-@pytest.mark.parametrize("module", list(DIGESTS), ids=["package_digest", "rungs._code"])
-def test_the_digest_of_dews_own_source_is_no_input_of_the_file_that_computed_it(
-        ci, tmp_path, monkeypatch, cache_worker, module):
-    """`dew.cache.package_digest` hashes every source file of the package and `dew.training.rungs._code` every
-    module the process imported, each only to name the record a cache looks for: the files it reads are no
-    input of the file that called it, which would otherwise run again for an edit to any module of Dew
-    (train 396 reused 0.0% of its rows for one line of src/dew/__init__.py). What a file executes of those
-    modules stays its input, and so does a module's text it reads itself."""
+def test_the_digest_of_dews_own_source_is_no_input_of_the_file_that_computed_it(ci, tmp_path, monkeypatch,
+                                                                                cache_worker):
+    """`dew.cache.package_digest` hashes every source file of the package only to name the record a cache
+    looks for (the rung cache's, a saved source's export): the files it reads are no input of the file that
+    called it, which would otherwise run again for an edit to any module of Dew (train 396 reused 0.0% of
+    its rows for one line of src/dew/__init__.py). What a file executes of those modules stays its input,
+    and so does a module's text it reads itself."""
     sources = tmp_path / "src"
     package = sources / "dew"
     (package / "training").mkdir(parents=True)
     for name in ("__init__.py", "training/__init__.py"):
         (package / name).write_text("")
     (package / "spare.py").write_text("def spare():\n    return 1\n")
-    source, imported = DIGESTS[module]
-    (sources / module).write_text(source)
+    (package / "cache.py").write_text(DIGEST)
     reused = lifetime_task(ci, tmp_path, monkeypatch, cache_worker, {
-        "test_digested.py": ON_SRC + f"import dew.spare\n{imported}\n"
+        "test_digested.py": ON_SRC + "import dew.spare\nfrom dew.cache import package_digest as digest\n"
                                      "def test_digested():\n    assert digest()\n",
         "test_reader.py": ON_SRC + "import dew.spare\nfrom pathlib import Path\n"
                                    "def test_reader():\n"
@@ -388,7 +376,7 @@ def test_the_digest_of_dews_own_source_is_no_input_of_the_file_that_computed_it(
     assert reused() == [True, True]
     # The digest's own code is what the file executed: an edit to it runs the file (and the files its process
     # ran after it, which what it ran may serve) again.
-    (sources / module).write_text(source.replace("hexdigest()", "hexdigest()[:8]"))
+    (package / "cache.py").write_text(DIGEST.replace("hexdigest()", "hexdigest()[:8]"))
     assert reused()[0] is False
 
 

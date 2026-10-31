@@ -139,13 +139,13 @@ def reads_backend(code: types.CodeType) -> bool:
     return decided[code]
 
 
-DIGESTS = (("dew/cache.py", "package_digest"), ("dew/training/rungs.py", "_code"))
+DIGESTS = (("dew/cache.py", "package_digest"),)
 """The functions that hash Dew's own source files to name the record a cache looks for
-(`dew.cache.package_digest`: every file of the package; `dew.training.rungs._code`: every module the process
-imported): what one reads is no input of the run that called it, whose outcome a digest never decides, and
-which would otherwise run again for an edit to any module of Dew (train 396: 0.0% of its rows reused, for one
-line of src/dew/__init__.py, 38% of them because they hashed it). What the run executes of those modules, and
-every read it makes itself, stay its inputs."""
+(`dew.cache.package_digest`: every file of the package, for the rung cache's and a saved source's records):
+what one reads is no input of the run that called it, whose outcome a digest never decides, and which would
+otherwise run again for an edit to any module of Dew (train 396: 0.0% of its rows reused, for one line of
+src/dew/__init__.py, 38% of them because they hashed it). What the run executes of those modules, and every
+read it makes itself, stay its inputs."""
 DIGEST_DEPTH = 8
 """How far above a read a digest's function may be: pathlib's `read_bytes`, `open` and a listing between."""
 
