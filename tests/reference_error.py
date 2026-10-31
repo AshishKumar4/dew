@@ -1716,6 +1716,31 @@ class _SiteTerms:
         return terms
 
 
+def _cancelling_terms(draw, truth):
+    """The truth program a site's rows are sized by their terms with (`assert_as_exact`'s `terms`), where
+    its truth holds a row of float64 zero (below RESOLUTION of its leaf) on its first draw, decided from the
+    truth alone before any arm runs (bible §7, ledger 2851): a row whose truth is exactly zero or cancels is
+    judged at the size of what it sums, as the one-draw rule judges it, not held to the reference's residue
+    there (a fused attention's causal first row, whose one key makes its gradient exactly zero in float64,
+    its rounding's residue Dew's and the reference's alike). None where no row is zero, or where the
+    truth is not a JAX program its terms can be traced from (run as given, recorded, a window loop's)."""
+    if truth is None or isinstance(truth, _Windowed) or _given(truth) or getattr(truth, "recorded", False):
+        return None
+    with jax.enable_x64(new_val=True):
+        leaves = [np.asarray(leaf) for leaf in jax.tree.leaves(truth(*widened(draw(0))))]
+    # Every row of a leaf of rank two or more, sized as check 1 sizes it: zero below RESOLUTION.
+    if not np.any(_LaidTruths.of(leaves).sizes == 0):
+        return None
+    # Its terms read once, on the same draw: only a zero row whose terms are not zero too gains a size,
+    # so a site whose zero rows sum nothing (a query that keeps no key) keeps the reference's residue rule
+    # without tracing its terms a draw.
+    with jax.enable_x64(new_val=True):
+        truths, terms = float64_terms(truth, *widened(draw(0)))
+    plain, termed = _LaidTruths.of(jax.tree.leaves(truths)), _LaidTruths.of(
+        jax.tree.leaves(truths), _term_leaves(terms, truths))
+    return truth if bool(np.any((plain.sizes == 0) & (termed.sizes > 0))) else None
+
+
 def _site(dew_fn, reference_fn, label: str, *, seeds: int, truth_fn, library_fn, library_row, library_leaves,
           also, terms):
     """A check 1 site's arguments held to what it may ask (`assert_as_exact`): its term program, the
@@ -1749,7 +1774,7 @@ def _site(dew_fn, reference_fn, label: str, *, seeds: int, truth_fn, library_fn,
 def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn=None,
                     orders=None, library_fn=None, library_row: int | None = None,
                     library_leaves: Sequence[str] = (), also: Mapping[str, Callable] | None = None,
-                    terms: bool | Callable = False) -> None:
+                    terms: bool | Callable | None = None) -> None:
     """Check 1 of the gate: on par. Each leaf's RMS error from float64,
     pooled over the site's declared seeds, within PARITY times the reference's, and its worst row over
     those seeds within ROW_FACTOR times the reference's worst (NARROW_FACTORS' factor at rows of one or
@@ -1804,7 +1829,9 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     paired with Dew's arm (`_arms`), and a plain Dew arm,
     whose compilation its pairing decides, takes references of one kind, plain or `as_given`.
 
-    `terms` sizes each row by the larger of its float64 truth's RMS and its terms' (owner, 10-29): the
+    `terms` sizes each row by the larger of its float64 truth's RMS and its terms' (owner, 10-29); by
+    default (None) a site whose truth holds a row of float64 zero on its first draw is sized so
+    (`_cancelling_terms`, ledger 2851), False never: the
     truth program, `truth_fn` or the reference's, evaluated op by op with each output's terms
     (`float64_terms`), as the one-draw rule sizes a row that cancels (`row_errors`). A row whose truth
     cancels, exactly or but for one term holding most of its weight (an attention row that keeps one key),
@@ -1825,6 +1852,8 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     (tests/certified.py)."""
     terms_fn, also = _site(dew_fn, reference_fn, label, seeds=seeds, truth_fn=truth_fn, library_fn=library_fn,
                            library_row=library_row, library_leaves=library_leaves, also=also, terms=terms)
+    if terms_fn is None and terms is not False:
+        terms_fn = _cancelling_terms(draw, truth_fn if truth_fn is not None else reference_fn)
     narrow_leaves: list[str] = []
     _refuse_numpy_arms(draw, dew_fn, reference_fn, *([] if library_fn is None else [library_fn]),
                        *also.values())

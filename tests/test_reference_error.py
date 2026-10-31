@@ -332,15 +332,18 @@ def cancelling_draw(seed):
 def test_check_1_sizes_a_cancelling_row_by_its_terms_and_admits_nothing_else():
     """Term sizing (`assert_as_exact`'s `terms`, owner 10-29): a row whose truth cancels exactly, Dew's an
     ulp or so off its zero where the reference's sum cancels to it, is judged at its terms' size by the
-    row rule and admitted, where without terms it fails as a row of float64 zero against the reference's
+    row rule and admitted, by default too, its truth holding a row of float64 zero (`_cancelling_terms`,
+    ledger 2851), where without terms (False) it fails as a row of float64 zero against the reference's
     exact zero; and nothing else is: a dropped term in that row is refused, a residue on rows whose terms
     are zero too (no size) is refused as a row of float64 zero, and a truth with no terms (run as given)
     is refused at the site."""
     reference = cancelling(split=False)
     assert_as_exact(cancelling(split=True), reference, cancelling_draw, "a cancelling dot", seeds=16,
                     terms=True)
+    assert_as_exact(cancelling(split=True), reference, cancelling_draw, "by default", seeds=16)
     with pytest.raises(GateFailure):
-        assert_as_exact(cancelling(split=True), reference, cancelling_draw, "untermed", seeds=16)
+        assert_as_exact(cancelling(split=True), reference, cancelling_draw, "untermed", seeds=16,
+                        terms=False)
     with pytest.raises(GateFailure):
         assert_as_exact(cancelling(split=True, leak=True), reference, cancelling_draw, "a leaked term",
                         seeds=16, terms=True)
