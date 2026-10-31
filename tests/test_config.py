@@ -23,7 +23,7 @@ from dew.nn.precision import Dtypes, Numerics
 from dew.nn.vision import GemmaProjector, SiglipVision
 from dew.optim import OptimConfig
 from dew.registry import Aliases, ModelConfig, projectors, towers
-from dew.training import Checkpoints, Layout, MeshSpec, Wandb
+from dew.training import Checkpoints, Layout, LocalTracker, MeshSpec, Wandb
 
 
 @pytest.mark.parametrize("dataset", ["tfds", "arrayrecord_shards"])
@@ -363,10 +363,9 @@ def test_train_scores_every_named_validation_split(tmp_path):
               "test": lambda partition: iter([{"x": held["x"], "y": held["y"] + 1}])}
     run.train(Regression(), Loader(lambda partition: batches(), None, None, 8), name="splits",
               validation=splits)
-    rows = [json.loads(line) for line in
-            (tmp_path / "runs" / "splits" / "tracking" / "scalars.jsonl").read_text().splitlines()]
-    val, test = ({row["step"]: row["scalars"][f"{split}/loss"]
-                  for row in rows if f"{split}/loss" in row["scalars"]} for split in ("val", "test"))
+    reports = LocalTracker(tmp_path / "runs" / "splits" / "tracking").scalars()
+    val, test = ({step: values[f"{split}/loss"] for step, values in reports if f"{split}/loss" in values}
+                 for split in ("val", "test"))
     assert sorted(val) == sorted(test) == [1, 2]
     assert all(test[step] > val[step] for step in val), "the shifted test targets score a higher loss"
 

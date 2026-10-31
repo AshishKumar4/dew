@@ -23,7 +23,7 @@ from dew.diffusion.presets import Flow
 from dew.optim import ScheduleSpec
 from dew.registry import import_path, record_argument
 from dew.sampling import Heun
-from dew.training import MeshSpec
+from dew.training import LocalTracker, MeshSpec
 
 pytestmark = pytest.mark.mesh
 
@@ -369,8 +369,7 @@ def test_a_jepa_run_without_probes_trains_and_validates_its_loss(tmp_path, size)
                               eval_every=1, checkpoint_every=None))
     trained = run.prepare().train("jepa-loss")
     assert int(trained.updates) == 1
-    reports = [json.loads(line)["scalars"] for line in
-               (tmp_path / "jepa-loss" / "tracking" / "scalars.jsonl").read_text().splitlines()]
+    reports = [values for _, values in LocalTracker(tmp_path / "jepa-loss" / "tracking").scalars()]
     assert any("val/loss" in report and np.isfinite(report["val/loss"]) for report in reports)
     assert not any("probe" in name for report in reports for name in report)
 
