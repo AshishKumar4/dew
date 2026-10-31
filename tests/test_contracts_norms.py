@@ -6,10 +6,16 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from contract_support import EDGES, OWN_FORWARD_ORDERS, assert_contract, joined, normal_draw
+from contract_support import EDGES, OWN_FORWARD_ORDERS, assert_contract, normal_draw
 
 from dew.nn import precision
 from dew.nn.activations import exact_gelu
+
+
+def joined(seam):
+    """`seam`'s two outputs, the stream and its norm, side by side along the features: one output a contract
+    pulls back."""
+    return lambda *inputs: jnp.concatenate(seam(*inputs), axis=-1)
 
 
 @pytest.mark.parametrize("edge", EDGES)
