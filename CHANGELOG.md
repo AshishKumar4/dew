@@ -38,6 +38,8 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 - A run's watched activations (`Inspection.modules`) name a module by its class or its path, and a language
   model's are summarized over its real tokens alone, its scorer's as it prepared them, through a pipelined
   stack's microbatches too; a preference pair lays out each half's real tokens (`real_mask`).
+- `Inspection(cotangents=True)` logs the loss's cotangent at each watched output (`inspect/cotangents/...`),
+  from a probe's gradient, every objective's model calls carrying the probes.
 ## 0.2.0
 
 The first release on Dew's own package index, `pip install dewml --extra-index-url
