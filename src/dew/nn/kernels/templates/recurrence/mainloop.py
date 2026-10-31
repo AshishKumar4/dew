@@ -2319,7 +2319,7 @@ def _scores_back(q, k, corrected, do, hi, lo, taken, call: _Call, *, scale: floa
             ds, pairs = algebra.scores_gradient(
                 functools.partial(column, "queries", given), functools.partial(column, "keys", given),
                 width // call.block, functools.partial(column, "values", held),
-                functools.partial(column, "out", given), blocks, gate, low, scale, held.dtype, Issuer(call),
+                functools.partial(column, "out", given), blocks, gate, low, scale, grads.dtype, Issuer(call),
                 laid=laid)
             grads.store(ds_ref, ds, row, CHUNK, h * CHUNK, CHUNK, family=family, smem=landing["square"])
             decay_ref.at[h, span][...] = algebra.summed_pairs(pairs, summed, columns)
