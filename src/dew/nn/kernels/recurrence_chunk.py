@@ -1399,6 +1399,9 @@ SELECTIVE_BLOCK = 128
 """The channels a program of the template's selective scan takes, one a thread of its consumer warpgroup
 (`templates.recurrence.selective`)."""
 
+COPY_BYTES = 16
+"""The bytes a bulk copy's rows come in a whole number of (TMA's, cp.async's widest)."""
+
 SELECTIVE_STATES = 16
 """The most states a channel of the template's selective scan carries, each three times in a thread's
 registers (its rates, cotangents and the rates' gradients): its backward at Mamba's 16, 125 registers a
@@ -1417,6 +1420,10 @@ SELECTIVE_SUPPORTS: tuple[Requirement[SelectiveCase], ...] = (
     Requirement('states', lambda case: case.states <= SELECTIVE_STATES,
                 lambda case: f"{case.states} states, past the {SELECTIVE_STATES} a thread's registers hold "
                              "three times", row='ledger 1300'),
+    Requirement('state rows', lambda case: case.states * case.dtype.itemsize % COPY_BYTES == 0,
+                lambda case: f"{case.states} states of {case.dtype}, a B or C row of no whole number of a "
+                             f"bulk copy's {COPY_BYTES} bytes, which its streams copy unpadded",
+                row='ledger 1300'),
     Requirement('tokens', lambda case: case.length >= SELECTIVE_CHUNK,
                 lambda case: f"{case.length} tokens, fewer than a chunk of {SELECTIVE_CHUNK}: a decode "
                              "step's scan, the portable math's own steps", row=INHERENT, kind='handoff'),
@@ -1452,7 +1459,12 @@ def selective_kernel(x, A, *, product: str = 'forward', report: bool = True) -> 
     """The kernel the selective scan's selector (`SELECTIVE`) gives a scan over `x` `[B, S, D]` with rates
     `A` `[D, N]` for `product` ('forward', 'training'), on the target: reported as its route, or not where
     not `report`."""
-    family = generation.family(generation.device_generation()) if generation.backend() == 'gpu' else None
+    from .templates import bundles
+
+    # A GPU's family where a bundle claims it (consumer Blackwell's and tcgen05's have none yet).
+    on_gpu = generation.backend() == 'gpu'
+    bundled = on_gpu and bundles.of(generation.device_generation(), x.dtype) is not None
+    family = generation.family(generation.device_generation()) if bundled else None
     case = SelectiveCase(varying=bool(jax.typeof(x).mat.varying), dtype=jnp.dtype(x.dtype),
                          length=x.shape[1], channels=x.shape[-1], states=A.shape[-1], family=family,
                          product=product)
@@ -1472,6 +1484,7 @@ def selective_scan(x, dt, A, B, C, D, state, starts, *, portable: Callable):
         interpret = generation.backend() != 'gpu'
         family = (mainloop.INTERPRETED if interpret
                   else bundles.of(generation.device_generation(), jnp.result_type(x)))
+        assert family is not None, "a bundle claims the device's family (`selective_kernel`)"
         return selective.selective_scan(x, dt, A, B, C, D, state, *(starts or (None,)), family=family,
                                         chunk=SELECTIVE_CHUNK, block=SELECTIVE_BLOCK, interpret=interpret)
 

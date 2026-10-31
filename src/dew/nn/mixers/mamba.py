@@ -96,11 +96,6 @@ def selective_scan(x, dt, A, B, C, D, state=None, starts=None, chunk_size: int =
     return out.astype(dtype), final.astype(dtype)
 
 
-def _portable_scan(x, dt, A, B, C, D, state, starts, *, chunk_size: int):
-    """`selective_scan` in `chunk_size` chunks, its operands as the scan's selector passes them."""
-    return selective_scan(x, dt, A, B, C, D, state, starts, chunk_size)
-
-
 @logical_axes({
     ("in_proj",): ("embed", "linear"),
     ("out_proj",): ("attention", "embed"),
@@ -226,7 +221,7 @@ class Mamba(nn.Module):
         # The scan on the kernel its selector gives each product (`recurrence_chunk.SELECTIVE`).
         return recurrence_chunk.selective_scan(
             xs, step, -jnp.exp(jnp.asarray(self.A_log, wide)), B, C, jnp.asarray(self.D, wide), held, starts,
-            portable=functools.partial(_portable_scan, chunk_size=self.chunk_size))
+            portable=functools.partial(selective_scan, chunk_size=self.chunk_size))
 
 
 class _StepProjection(nn.Module):

@@ -12,6 +12,7 @@ replays its chunk from."""
 import dataclasses
 import functools
 import math
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -222,24 +223,22 @@ class _Chunk:
     """A backward step's chunk: its streams' slots (`x`, `dt` `[C, block]`, `b`, `c` `[C, N]`, `dy`, and
     the resets where the scan is packed), the program's rates, and its shared tiles: each token's kept states
     `[C + 1, size, block]`, the channels' terms `[2 C size, block]` (the readout's rows, then the write's),
-    and the tokens' write and decay gradients' sums `[C, block]`."""
+    and the tokens' write and decay gradients' sums `[C, block]`; its group's states `size` and its tokens
+    `chunk`."""
 
-    xs: mosaic.Ref
-    dts: mosaic.Ref
-    bs: mosaic.Ref
-    cs: mosaic.Ref
-    dys: mosaic.Ref
-    resets: mosaic.Ref | None
+    xs: Any
+    dts: Any
+    bs: Any
+    cs: Any
+    dys: Any
+    resets: Any
     rates: list
-    kept: mosaic.Ref
-    terms: mosaic.Ref
-    writes: mosaic.Ref
-    decays: mosaic.Ref
+    kept: Any
+    terms: Any
+    writes: Any
+    decays: Any
     size: int
-
-    @property
-    def chunk(self) -> int:
-        return self.xs.shape[0]
+    chunk: int
 
     def row(self, ref, t) -> jax.Array:
         """Token `t`'s row of a stream's slot, fp32."""
@@ -368,7 +367,7 @@ def backward(x, dt, b, c, parameters, entered, resets, dy, dfinal, scan: Scan):
                     n_chunk = chunks - 1 - index
                     walk = _Chunk(slots["x"], slots["dt"], slots["b"], slots["c"], slots["dy"],
                                   slots["resets"] if scan.packed else None, rates, kept_smem, terms,
-                                  writes_smem, decays_smem, size)
+                                  writes_smem, decays_smem, size, chunk)
                     writes_smem[...] = jnp.zeros(writes_smem.shape, jnp.float32)
                     decays_smem[...] = jnp.zeros(decays_smem.shape, jnp.float32)
 
