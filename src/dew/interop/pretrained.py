@@ -75,7 +75,16 @@ from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.multimodal import MultimodalTransformer
 from dew.nn.precision import Numerics, numerics_of
 from dew.objectives.base import SavedTask
-from dew.registry import DtypeName, dtype_name, from_record, projectors, record_fields, resolve_dtype, towers
+from dew.registry import (
+    DtypeName,
+    ModelConfig,
+    dtype_name,
+    from_record,
+    projectors,
+    record_fields,
+    resolve_dtype,
+    towers,
+)
 from dew.sampling.text import Sampling
 
 if TYPE_CHECKING:
@@ -186,9 +195,10 @@ class Pretrained:
     diffusion pipeline, and `PretrainedFallback` for transformers' own forward run
     through torchax. Every kind saves back to the source's format.
 
-    `model_config` is the record the model was built from, in Dew's own
-    vocabulary with the run's compute dtype and attention kernel, so a caller can
-    log exactly the model it ran.
+    `model_config` is the record the model was built from at its load, in Dew's
+    own vocabulary with the run's compute dtype and attention kernel; `declaration`
+    is the model's record as it is now, an adapter, DEX, cross-attention or a
+    loop it was given since included, which a caller logs to name the model it ran.
     """
 
     model: nn.Module
@@ -276,6 +286,13 @@ class Pretrained:
         """The end-of-sequence ids the source's generation stops at, from its generation config or
         its config (`eos_token_id`), none where neither names one."""
         return eos_ids(self.config, self.generation_config)
+    @property
+    def declaration(self) -> ModelConfig:
+        """The record of the model this bundle holds now (`ModelConfig.from_model`): its class, every field
+        and each wrapper it was made in, an extension given since its load included, where `model_config`
+        keeps the record it was loaded as (ledger 3009)."""
+        return ModelConfig.from_model(self.model)
+
     def map_variables(self, transform: Callable[[Variables], Variables]) -> Self:
         """This bundle with its variable tree transformed, for placement or a shape-only load.
         Composite bundles apply the same transformation to each component."""
