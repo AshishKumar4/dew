@@ -587,14 +587,6 @@ def _decode_delta(planes: jax.Array, live: jax.Array, dtype) -> jax.Array:
     return _from_delta_planes(planes, live).astype(dtype)
 
 
-@functools.cache
-def _delta_encoder(sharding):
-    """`_delta_planes` compiled for planes placed as `_planes_sharding(sharding)` says: one program per
-    leaf signature and placement, as `_decode_delta` is one per signature, kept for the process, so a
-    run's every save after its first compiles none."""
-    return jax.jit(_delta_planes, out_shardings=_planes_sharding(sharding))
-
-
 def _planes_sharding(sharding):
     """Where a leaf's byte planes go: the leaf's placement, with the plane axis
     whole on every device, in device memory."""
@@ -650,7 +642,8 @@ def _with_ema_deltas(state_tree: dict[str, StateLeaf]) -> tuple[dict[str, StateL
     if not chosen:
         return state_tree, []
     for index in chosen:
-        leaves[index] = _delta_encoder(leaves[index].sharding)(leaves[index], lives[index])
+        encode = jax.jit(_delta_planes, out_shardings=_planes_sharding(leaves[index].sharding))
+        leaves[index] = encode(leaves[index], lives[index])
     return ({**state_tree, 'ema': jax.tree.unflatten(structure, leaves)},
             [jax.tree_util.keystr(paths_leaves[index][0]) for index in chosen])
 
