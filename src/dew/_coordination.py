@@ -27,6 +27,8 @@ import numpy as np
 from jax.experimental import multihost_utils
 from jax.sharding import NamedSharding, PartitionSpec
 
+from dew._records import JSON
+
 if TYPE_CHECKING:
     from jax._src.distributed import State
 
@@ -215,6 +217,34 @@ def agreed_next[T](phase: str, stream: Iterator[T]) -> T | None:
         raise ValueError(f"{phase}: the stream ended on {ended} of {jax.process_count()} processes and the "
                          "others read on: each process's stream must hold as many items")
     return read
+
+
+def agreed_reads[T](phase: str, stream: Iterator[T],
+                    said: Callable[[T], JSON]) -> tuple[T | None, list[JSON]]:
+    """`stream`'s next item on this rank, or None where it has run out, with what `said` gives of each rank's
+    item (None for a rank whose stream has run out), in rank order, learned in one round: a pool's shares
+    that end apart, each reading on until every one has (a run on the examples clock). A rank that fails
+    stops every rank, as `agreed` does."""
+    held: tuple[T | None] | None = None
+    error: BaseException | None = None
+    try:
+        held = (next(stream, None),)
+    except BaseException as failure:
+        error = failure
+    word = json.dumps(None if held is None or held[0] is None else said(held[0]))
+    if jax.process_count() == 1:
+        if error is not None:
+            raise error
+        words = [word]
+    else:
+        try:
+            words = _agree(phase, error, word)
+        except BaseException as failure:
+            if error is None:
+                raise PeerFailure(str(failure)) from failure
+            raise
+    assert held is not None
+    return held[0], [json.loads(spoken) for spoken in words]
 
 
 def agreed_count[T](phase: str, operation: Callable[[], T], counted: Callable[[T], bool]) -> tuple[T, int]:

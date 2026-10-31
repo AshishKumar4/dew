@@ -69,6 +69,17 @@ class PassesProgress[L, E]:
         return self.make(objective, optimizer)
 
 
+def refuse_unpassed_progress[L, E](objective: Objective[L, E], *, passes: bool) -> None:
+    """Refuse a custom training step that does not say it passes the run's progress (`passes`,
+    `PassesProgress`) over a module of `objective`'s that reads it (`Objective.progress_readers`): it
+    would train the module at the run's end."""
+    for module in () if passes else objective.progress_readers()[:1]:
+        raise ValueError(f"a custom training step (Trainer(step=)) passes a {type(module).__name__}, which "
+                         "reads the run's progress (dew.nn.progress), none unless it says it does: pass "
+                         "Progress(state.updates) as the model's progress= and wrap the step's factory in "
+                         "dew.training.PassesProgress, or it trains at the run's end")
+
+
 @struct.dataclass
 class Committed:
     """Telemetry from one admitted optimizer commit, not objective metrics or checkpoint state.

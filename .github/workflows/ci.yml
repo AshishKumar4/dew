@@ -159,6 +159,8 @@ jobs:
     - uses: actions/checkout@v4
       with:
         fetch-depth: 0
+    # tools/armada/ci.py runs itself under the one Python every key is computed by (HASHED_BY), through uv.
+    - uses: astral-sh/setup-uv@v6
     - id: policy
       env:
         DEW_TEST_CACHE: ${{ (github.event_name == 'schedule' || startsWith(github.ref_name, 'ci/full-')) && 'off' || '' }}
@@ -243,6 +245,9 @@ jobs:
         # which it finds in the history.
         fetch-depth: 0
     - uses: oven-sh/setup-bun@v2
+    # The plan armada runs here (.armada.json's local plan) runs tools/armada/ci.py under the one Python every
+    # task keys its records by (HASHED_BY), through uv, so it finds the records the tasks wrote.
+    - uses: astral-sh/setup-uv@v6
     # Installed once, before the suite's and the gangs' clients start together: two bunx runs of one
     # package at once install it into one place, and one failed copying from bun's cache (train 37's
     # gangs: "ENOENT: failed copying files from cache to destination for package armada").

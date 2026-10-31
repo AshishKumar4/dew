@@ -339,10 +339,12 @@ def torch_logits(model, ids, mask=None, positions=None):
         return model(**inputs).logits.numpy()
 
 
-def write_probes(directory: Path, model, vocab: int) -> None:
+def write_probes(directory: Path, model, vocab: int, continued=None) -> None:
     """A torch causal LM's probe arrays into `directory`, as tests/test_hf_reference_decoders.py reads
     them: `verify.probe_ids`' ids, their left-padded rows (`padded_probe`) and mask, the logits of both,
-    and the greedy continuation of the first four ids by six."""
+    and the greedy continuation of the first four ids by six, `continued(model, ids, tokens)` where the
+    release's own cached decoding is the reference (`torch_generated`), else a full forward a token
+    (`torch_greedy`)."""
     import numpy as np
 
     from dew.interop.verify import probe_ids
@@ -351,10 +353,19 @@ def write_probes(directory: Path, model, vocab: int) -> None:
     mask, padded, positions = padded_probe(ids)
     arrays = {'input_ids': ids, 'attention_mask': mask, 'logits': torch_logits(model, ids),
               'padded_logits': torch_logits(model, padded, mask, positions),
-              'generated': torch_greedy(model, ids[:, :4], 6)}
+              'generated': (continued or torch_greedy)(model, ids[:, :4], 6)}
     for name, array in arrays.items():
         np.save(directory / f'{name}.npy', array)
     print(f"{directory}: {sorted(path.name for path in directory.iterdir())}")
+
+
+def torch_generated(model, ids, tokens: int):
+    """`ids` continued `tokens` tokens greedily by the model's own cached `generate`, no stop token."""
+    import torch
+
+    with torch.no_grad():
+        return model.generate(torch.from_numpy(ids).long(), do_sample=False, max_new_tokens=tokens,
+                              eos_token_id=None, pad_token_id=0).numpy()
 
 
 def torch_greedy(model, ids, tokens: int):
