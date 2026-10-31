@@ -15,6 +15,7 @@ os.environ.update(lane_environment.configured(os.environ))
 import jax
 import pytest
 import remote_cache
+from tool_support import load
 
 from dew.cache import default_compilation_cache_dir, enable_compilation_cache
 
@@ -61,25 +62,24 @@ def bundle(node) -> str:
                                os.environ.get("PYTEST_XDIST_WORKER"))
 
 
-def _selection() -> str:
-    """CI's selection of tests (tools/armada/session.py's `SELECTION`), read from the module the plan and
-    every task share, which needs the standard library alone."""
-    import importlib.util
+def _marks_named(config) -> bool:
+    """Whether the run names its marks (`-m EXPR`, `-mEXPR`, `--markexpr`, an empty expression among them),
+    on its command line or in PYTEST_ADDOPTS."""
+    import shlex
 
-    path = Path(__file__).resolve().parents[1] / "tools" / "armada" / "session.py"
-    spec = importlib.util.spec_from_file_location("ci_session", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module.SELECTION[1]
+    given = [*config.invocation_params.args, *shlex.split(os.environ.get("PYTEST_ADDOPTS", ""))]
+    return any(arg in ("-m", "--markexpr") or arg.startswith("--markexpr=")
+               or (arg.startswith("-m") and not arg.startswith("--")) for arg in given)
 
 
 def pytest_configure(config):
-    """A run that names no marks (`-m`) selects as CI does: the network-marked tests, which reach the Hub and
-    a GPU node's memory and run on the network lane (`ci.py gpu-lane --network`), set aside, counted as
-    deselected. So a plain `pytest tests/test_x.py`, or an armada map of it, grades what CI grades, never a
-    real checkpoint's download on a container's disk (gpt-oss-20b's filled one, 2026-10-31)."""
-    if not config.option.markexpr:
-        config.option.markexpr = _selection()
+    """A run that names no marks selects as CI does (tools/armada/session.py's `SELECTION`): the
+    network-marked tests, which reach the Hub and a GPU node's memory and run on the network lane (`ci.py
+    gpu-lane --network`), set aside, counted as deselected. So a plain `pytest tests/test_x.py`, or an armada
+    map of it, grades what CI grades, never a real checkpoint's download on a container's disk (gpt-oss-20b's
+    filled one, 2026-10-31). A run that names its marks, an empty expression included, chooses."""
+    if not _marks_named(config):
+        config.option.markexpr = load("session", "tools/armada").SELECTION[1]
 
 
 def pytest_collectstart(collector):
@@ -270,7 +270,6 @@ def rng():
 @pytest.fixture(scope="module")
 def lint():
     """tools/lint_slop.py, as the lint tests read it."""
-    from tool_support import load
 
     return load("lint_slop")
 
