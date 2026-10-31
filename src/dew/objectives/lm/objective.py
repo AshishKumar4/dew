@@ -1030,6 +1030,12 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
                 f"no {ROLES_KEY} column; train this objective on the chat data path")
         return xp.asarray(batch[ROLES_KEY])
 
+    def watched_positions(self, batch: Batch) -> jax.Array:
+        """Each real query, its token real and not the pad id (`_query_weights`), the positions a watched
+        layer's summary reads."""
+        raw = batch[TEXT_KEY]
+        return self._query_weights(raw if isinstance(raw, ModelInputs) else ModelInputs(raw), bool)
+
     def _query_weights(self, prepared: ModelInputs, dtype):
         """Mark every real query whose router statistics and indexer KL count.
 

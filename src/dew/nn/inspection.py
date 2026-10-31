@@ -27,19 +27,29 @@ HISTOGRAM_EDGES = tuple(float(edge) for edge in range(-8, 5))
 first, above 1e4 in the last, one bin a decade between."""
 
 
-def statistics(values: jax.Array, *, histogram: bool = False) -> dict[str, jax.Array]:
+def statistics(values: jax.Array, *, histogram: bool = False,
+               where: jax.Array | None = None) -> dict[str, jax.Array]:
     """A tensor's summary in float32 over its global array: mean, standard deviation, root mean square,
     largest magnitude, the share of its entries that are not finite, which makes the others non-finite as
     they are of the values, and the share that is exactly zero; with `histogram`, the share of its
-    magnitudes in each decade (`HISTOGRAM_EDGES`), one scalar a bin, `histogram_<bin>`."""
+    magnitudes in each decade (`HISTOGRAM_EDGES`), one scalar a bin, `histogram_<bin>`. `where`, given,
+    holds the entries summarized, its axes the values' leading ones, each true entry's every trailing
+    one in."""
     values = values.astype(jnp.float32)
-    found = {"mean": values.mean(), "std": values.std(), "rms": jnp.sqrt(jnp.square(values).mean()),
-             "abs_max": jnp.abs(values).max(), "non_finite": (~jnp.isfinite(values)).mean(),
-             "zero_fraction": (values == 0).mean()}
+    keep = None if where is None else jnp.broadcast_to(
+        where.reshape(where.shape + (1,) * (values.ndim - where.ndim)), values.shape)
+    magnitudes = jnp.abs(values)
+    found = {"mean": jnp.mean(values, where=keep), "std": jnp.std(values, where=keep),
+             "rms": jnp.sqrt(jnp.mean(jnp.square(values), where=keep)),
+             "abs_max": magnitudes.max() if keep is None else jnp.max(magnitudes, where=keep, initial=0.0),
+             "non_finite": jnp.mean(~jnp.isfinite(values), where=keep),
+             "zero_fraction": jnp.mean(values == 0, where=keep)}
     if histogram:
-        exponents = jnp.log10(jnp.maximum(jnp.abs(values), 1e-30)).reshape(-1)
+        exponents = jnp.log10(jnp.maximum(magnitudes, 1e-30)).reshape(-1)
         bins = jnp.searchsorted(jnp.asarray(HISTOGRAM_EDGES, jnp.float32), exponents)
-        counts = jnp.zeros(len(HISTOGRAM_EDGES) + 1, jnp.float32).at[bins].add(1.0) / exponents.size
+        weights = 1.0 if keep is None else keep.reshape(-1).astype(jnp.float32)
+        counted = exponents.size if keep is None else jnp.sum(keep)
+        counts = jnp.zeros(len(HISTOGRAM_EDGES) + 1, jnp.float32).at[bins].add(weights) / counted
         found.update({f"histogram_{index}": counts[index] for index in range(counts.shape[0])})
     return found
 
@@ -50,12 +60,16 @@ variable, so it never collides with a module's own (a DiT's `output` head)."""
 
 
 @contextlib.contextmanager
-def watching(modules: tuple[str, ...], *, histogram: bool = False) -> Iterator[None]:
+def watching(modules: tuple[str, ...], *, histogram: bool = False,
+             positions: jax.Array | None = None) -> Iterator[None]:
     """Within the block, each module whose class name or path (`layers_3/attn`) a glob of `modules` matches
     (`*Attention`, `MLP`, `layers_3/*`) sows its output's summary (`statistics`) into `INSPECTED` where
     its apply opened it, under `SOWN`, the latest call's where a module runs more than once. A module
-    whose output is no single array (a tuple, a cache) sows its first array's. Nothing is sown where the
-    apply opened no such collection, as a module sows nothing into a collection it cannot write."""
+    whose output is no single array (a tuple, a cache) sows its first array's. `positions`, given, are the
+    `[rows, tokens]` positions a summary reads of an output whose leading axes are theirs (a language
+    model's real tokens, `Objective.watched_positions`); another output is summarized whole. Nothing is
+    sown where the apply opened no such collection, as a module sows nothing into a collection it cannot
+    write."""
     def interceptor(next_fun, args, kwargs, context):
         output = next_fun(*args, **kwargs)
         module = context.module
@@ -67,7 +81,10 @@ def watching(modules: tuple[str, ...], *, histogram: bool = False) -> Iterator[N
             return output
         arrays = [leaf for leaf in jax.tree.leaves(output) if isinstance(leaf, jax.Array)]
         if arrays:
-            module.sow(INSPECTED, SOWN, statistics(arrays[0], histogram=histogram),
+            first = arrays[0]
+            where = (positions if positions is not None and first.shape[:positions.ndim] == positions.shape
+                     else None)
+            module.sow(INSPECTED, SOWN, statistics(first, histogram=histogram, where=where),
                        init_fn=dict, reduce_fn=lambda previous, latest: latest)
         return output
 
