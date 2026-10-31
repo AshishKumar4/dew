@@ -1,26 +1,28 @@
 """MaxText's models run on drawn weights and inputs, in float32 and float64: the reference arm of
-tools/maxtext_reference.py, run in an environment holding maxtext 0.2.5 (its JAX stack, apart from
-Dew's), on the CPU.
+tools/venv_reference.py's `gpt3` and `engram` sites, run in an environment holding maxtext 0.2.5 (its JAX
+stack, apart from Dew's), on the CPU.
 
     python tools/maxtext_worker.py SITE    `IN OUT` lines on stdin, each answered `done`
 
 SITE is `gpt3` (maxtext/models/gpt3.py's decoder, gpt3-52k at `GPT3`) or `engram` (maxtext/layers/
 engram.py's layer at `ENGRAM`). IN holds cases `<case>.<input>` and `<case>.param.<path>` each
-parameter by its path (`/`-joined) in MaxText's own layout; OUT gets `<case>.reference` and
-`<case>.truth`, the output in float32 and float64. MaxText's config takes float32 at widest; its
-float64 run is the same model with its computation's and weights' dtypes set to float64 after the
-config validates, its own arithmetic carried in float64, the narrower dtypes it casts to whatever its
-dtype among it (`float64_casts`): its float64 run computes the architecture, its float32 run MaxText's
-own arithmetic.
+parameter by its path (`/`-joined) in MaxText's own layout; OUT gets `<case>.reference.<leaf>` and
+`<case>.truth.<leaf>`, the output (`logits`, `streams`) in float32 and float64. MaxText's config takes
+float32 at widest; its float64 run is the same model with its computation's and weights' dtypes set to
+float64 after the config validates, its own arithmetic carried in float64, the narrower dtypes it casts
+to whatever its dtype among it (`float64_casts`): its float64 run computes the architecture, its
+float32 run MaxText's own arithmetic.
 """
 
 from __future__ import annotations
 
 import contextlib
+import functools
 import os
 import sys
+from collections.abc import Iterator
 
-import numpy as np
+from reference_worker import Applied, answered, serve
 
 GPT3 = {"base_emb_dim": 16, "base_num_query_heads": 2, "base_num_kv_heads": 2, "head_dim": 8,
         "base_mlp_dim": 64, "base_num_decoder_layers": 2, "vocab_size": 64, "trainable_position_size": 64,
@@ -59,7 +61,7 @@ def mesh(held):
 
 
 def gpt3(dtype: str):
-    """`apply(params, case)`: MaxText's GPT-3 logits of a case's `ids` `[B, T]` at positions 0..T-1, one
+    """`apply(params, case)`: MaxText's GPT-3 `logits` of a case's `ids` `[B, T]` at positions 0..T-1, one
     document."""
     import jax
     import jax.numpy as jnp
@@ -83,15 +85,15 @@ def gpt3(dtype: str):
 
     def apply(params, case):
         tree = unflatten_dict({tuple(path.split("/")): value for path, value in params.items()})
-        return forward(tree, jnp.asarray(case["ids"], jnp.int32))
+        return {"logits": forward(tree, jnp.asarray(case["ids"], jnp.int32))}
 
     return apply
 
 
 def engram(dtype: str):
-    """`apply(params, case)`: MaxText's Engram layer over a case's `streams` `[B, S, G, D]` and each head's
-    local bucket `ids` `[B, S, H_total]`, the caller's residual added (the layer leaves it to its caller,
-    maxtext/layers/engram.py:621-695)."""
+    """`apply(params, case)`: MaxText's Engram layer's `streams` over a case's `streams` `[B, S, G, D]` and
+    each head's local bucket `ids` `[B, S, H_total]`, the caller's residual added (the layer leaves it to
+    its caller, maxtext/layers/engram.py:621-695)."""
     import jax.numpy as jnp
     from flax import nnx
     from maxtext.layers.engram import Engram
@@ -110,13 +112,14 @@ def engram(dtype: str):
     def apply(params, case):
         given = [(path, leaf.replace(params[named(path)])) for path, leaf in flat]
         nnx.update(module, nnx.from_flat_state(given))
-        return forward(module, jnp.asarray(case["streams"], dtype), jnp.asarray(case["ids"], jnp.int32))
+        return {"streams": forward(module, jnp.asarray(case["streams"], dtype),
+                                   jnp.asarray(case["ids"], jnp.int32))}
 
     return apply
 
 
 SITES = {"gpt3": gpt3, "engram": engram}
-_BUILT: dict = {}
+_BUILT: dict[tuple[str, str], Applied] = {}
 
 
 class _Widened:
@@ -149,38 +152,15 @@ def float64_casts(dtype: str):
         yield
 
 
-def run(site: str, cases: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
-    import jax
-    import jax.numpy as jnp
-
-    names = sorted({key.split(".", 1)[0] for key in cases})
-    out = {}
-    for dtype, kind, wide in (("float32", "reference", False), ("float64", "truth", True)):
-        jax.config.update("jax_enable_x64", wide)
-        with float64_casts(dtype):
-            if (site, dtype) not in _BUILT:
-                _BUILT[site, dtype] = SITES[site](dtype)
-            apply = _BUILT[site, dtype]
-            for name in names:
-                prefix, given = f"{name}.param.", f"{name}."
-                params = {key.removeprefix(prefix): jnp.asarray(value, dtype) for key, value in cases.items()
-                          if key.startswith(prefix)}
-                case = {key.removeprefix(given): value for key, value in cases.items()
-                        if key.startswith(given) and not key.startswith(prefix)}
-                out[f"{name}.{kind}"] = np.asarray(apply(params, case), dtype)
-    return out
-
-
-def serve(site: str) -> None:
-    """Each line on stdin an `IN OUT` pair of paths, answered by `run` and a line `done` on stdout, each
-    program compiled once for every case."""
-    for line in sys.stdin:
-        given, out = line.split()
-        with np.load(given) as cases:
-            np.savez(out, **run(site, dict(cases)))
-        print("done", flush=True)
+@contextlib.contextmanager
+def applying(site: str, dtype: str) -> Iterator[Applied]:
+    """The site's run at `dtype`, built once for each and traced under `float64_casts`."""
+    with float64_casts(dtype):
+        if (site, dtype) not in _BUILT:
+            _BUILT[site, dtype] = SITES[site](dtype)
+        yield _BUILT[site, dtype]
 
 
 if __name__ == "__main__":
     os.environ.setdefault("JAX_PLATFORMS", "cpu")
-    serve(sys.argv[1])
+    serve(lambda cases: answered(cases, functools.partial(applying, sys.argv[1])))

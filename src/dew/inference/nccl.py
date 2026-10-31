@@ -35,11 +35,11 @@ from __future__ import annotations
 import base64
 import ctypes
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import FIRST_EXCEPTION, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, ClassVar, Protocol
 
 import jax
 import jax.numpy as jnp
@@ -94,6 +94,25 @@ def _nonblocking() -> _Config:
     """A config that opens a nonblocking communicator, every other field NCCL's default."""
     undefined = -2 ** 31
     return _Config(ctypes.sizeof(_Config), 0xCAFEBEEF, 21700, 0, undefined, undefined, undefined, None)
+
+
+class Collectives(Protocol):
+    """The collective calls a push makes over its sending device: NCCL's (`_Library`), or a stand-in's
+    that a caller hands the push instead (`NCCLPush.library`)."""
+
+    def unique_id(self) -> _UniqueId: ...
+
+    def open(self, uid: _UniqueId, rank: int, world: int) -> ctypes.c_void_p: ...
+
+    def all_reduce(self, comm: ctypes.c_void_p, pointer: int, count: int, dtype: str) -> None: ...
+
+    def broadcast(self, comm: ctypes.c_void_p, pointer: int, count: int, dtype: str) -> None: ...
+
+    def ready(self, comms: Sequence[ctypes.c_void_p], peers: Sequence[Future[httpx.Response]]) -> None: ...
+
+    def settled(self, comms: Sequence[ctypes.c_void_p], peers: Sequence[Future[httpx.Response]]) -> None: ...
+
+    def abort(self, comm: ctypes.c_void_p) -> None: ...
 
 
 class _Library:
@@ -231,7 +250,9 @@ class NCCLPush:
       the pool to process 0 first.
     - `engines` are the replicas' root URLs, not their `/v1` API URLs.
     - `library` is the engine's own libnccl.so.2, because NCCL refuses a
-      peer of another version when the group opens.
+      peer of another version when the group opens; or a maker of the
+      push's `Collectives` from the sending device's CUDA ordinal, which
+      makes its calls instead (an emulation of NCCL over the host).
     - `chunk` bounds the bytes of tensors placed on the sender device beside
       the trainer's state. The next chunk is copied over while the current
       one broadcasts, so a push holds at most two chunks there, or two of its
@@ -249,19 +270,19 @@ class NCCLPush:
 
     source: Pretrained
     engines: tuple[str, ...]
-    library: str
+    library: str | Callable[[int], Collectives]
     dtype: str = "bfloat16"
     chunk: int = 512 * 2 ** 20
     timeout: float = 600.0
     timings: dict[str, float] = field(default_factory=dict, init=False)
-    _library: _Library | None = field(default=None, init=False, repr=False)
+    _library: Collectives | None = field(default=None, init=False, repr=False)
     _groups: dict[str, ctypes.c_void_p] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if len(set(self.engines)) != len(self.engines):
             raise ValueError("every replica is published to once: a replica listed twice would wait on its "
                              "second /update_weights for a broadcast that never comes")
-        if not Path(self.library).is_file():
+        if isinstance(self.library, str) and not Path(self.library).is_file():
             raise ValueError(f"no NCCL library at {self.library}; pass the engine's own libnccl.so.2")
 
     def __call__(self, variables: Variables, version: int) -> None:
@@ -308,7 +329,7 @@ class NCCLPush:
                           lambda: self._deliver(library, target, names, tensors, version), stamped=True)
         self.timings["send"] = time.perf_counter() - began
 
-    def _deliver(self, library: _Library, target: SingleDeviceSharding, names: Sequence[str],
+    def _deliver(self, library: Collectives, target: SingleDeviceSharding, names: Sequence[str],
                  tensors: Sequence[np.ndarray], version: int) -> Mapping[str, BaseException]:
         """Load `tensors` into every paused replica over its group and finish the update under `version`.
 
@@ -348,10 +369,11 @@ class NCCLPush:
             return failures
         return _on_every(self.engines, finish)
 
-    def _opened(self, target: SingleDeviceSharding, ordinal: int) -> _Library:
+    def _opened(self, target: SingleDeviceSharding, ordinal: int) -> Collectives:
         """The library bound to the sending device, CUDA `ordinal`, with a group open to every replica."""
         if self._library is None:
-            self._library = _Library(self.library, ordinal)
+            made = self.library
+            self._library = _Library(made, ordinal) if isinstance(made, str) else made(ordinal)
         library = self._library
         for root in self.engines:
             if root in self._groups:
@@ -378,7 +400,7 @@ class NCCLPush:
         return library
 
     def _broadcast(
-        self, library: _Library, target: SingleDeviceSharding, tensors: Sequence[np.ndarray],
+        self, library: Collectives, target: SingleDeviceSharding, tensors: Sequence[np.ndarray],
         receives: Sequence[Future[httpx.Response]],
     ) -> None:
         """Broadcast `tensors` in order to every group, `chunk` bytes resident at a time.
