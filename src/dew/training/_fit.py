@@ -342,6 +342,9 @@ class FitRun:
     emptied: Emptied | None = None
     """A pooled run's batches of the pool's tree with nothing in them, which a share that ran out steps
     with (`pooled_read`)."""
+    profiled: tuple[int, int] | None = None
+    """The steps a stopped profile window traced and the step it stopped at, whose export the run's
+    cleanup waits for before it reports the window (`Trainer._exported_profile`)."""
     best: HeldBest = dataclasses.field(default_factory=HeldBest)
     """The log taken at the latest logging step and not yet read."""
     stepped: tuple[jax.Array, dict[str, jax.Array], jax.Array] | None = None
