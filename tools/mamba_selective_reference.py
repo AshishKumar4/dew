@@ -154,15 +154,23 @@ def _extension(checkout: str):
 def serve(checkout: str) -> None:
     """The torch side: each request a line naming a case's inputs (an npz) and where to write mamba_ssm's
     outputs and the oracle's (`<path>.reference.npz`, `<path>.truth.npz`), answered with a line `done`."""
+    import re
+    import types
+
     import torch
 
     sys.modules["selective_scan_cuda"] = _extension(checkout)
-    sys.path.insert(0, checkout)
-    from mamba_ssm import __version__
+    # The package without its `__init__`, which imports its models and through them a transformers
+    # version of its own: the scan's interface alone.
+    package = types.ModuleType("mamba_ssm")
+    package.__path__ = [os.path.join(checkout, "mamba_ssm")]
+    sys.modules["mamba_ssm"] = package
     from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
     from reference_source import git_head
 
-    print(f"ready {__version__} {git_head(checkout)} {torch.cuda.get_device_name()}", flush=True)
+    init = Path(checkout, "mamba_ssm", "__init__.py").read_text()
+    version = re.search(r'__version__ = "([^"]+)"', init).group(1)
+    print(f"ready {version} {git_head(checkout)} {torch.cuda.get_device_name()}", flush=True)
     for line in sys.stdin:
         path, dtype = line.split()
         with np.load(path) as stored:
