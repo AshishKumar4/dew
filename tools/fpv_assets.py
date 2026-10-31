@@ -40,7 +40,9 @@ TONEMAPPED = "https://dl.polyhaven.org/file/ph-assets/HDRIs/extra/Tonemapped%20J
 
 
 def fetched(url: str) -> bytes:
-    with urllib.request.urlopen(url, timeout=60) as response:
+    """`url`'s body, asked for by this tool's name: Poly Haven's API refuses urllib's agent (HTTP 403)."""
+    request = urllib.request.Request(url, headers={"User-Agent": "dew-fpv-assets/1.0"})
+    with urllib.request.urlopen(request, timeout=60) as response:
         return response.read()
 
 
