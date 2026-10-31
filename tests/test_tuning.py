@@ -533,13 +533,21 @@ class _Scaled:
         return x * self.by
 
 
-@pytest.mark.parametrize(("hook", "cached"), [(jnp.tanh, True), (_Scaled(2.0), True),
-                                              (_Holding(jnp.ones(3)), False), (lambda x: x, True)],
-                         ids=["function", "dataclass", "array-holding-object", "plain-lambda"])
-def test_a_launch_lowered_once_traces_again_only_for_a_hook_that_may_hold_an_array(hook, cached):
+def _doubled(x):
+    return 2 * x
+
+
+@pytest.mark.parametrize(("made", "cached"), [(lambda: _doubled, True), (lambda: _Scaled(2.0), True),
+                                              (lambda: _Holding(jnp.ones(3)), False),
+                                              (lambda: jnp.tanh, False)],
+                         ids=["function", "dataclass", "array-holding-object", "jitted-callable"])
+def test_a_launch_lowered_once_traces_again_only_for_a_hook_that_may_hold_an_array(made, cached):
     """`tuning.lowered_once` traces a launch once for a static hook it may hold (a function of no closure,
     a dataclass of values), and again each call for one that may reach an array (a callable object's
-    attributes, which no check sees): run uncached, it keeps nothing alive."""
+    attributes, which no check sees, a jitted function's among them): run uncached, it keeps nothing
+    alive. (Each hook made in the test: an array drawn as the module loads would start JAX's backend before
+    a worker process joins its pool, `tuning_worker`.)"""
+    hook = made()
     traced = []
 
     @tuning.lowered_once(("hook",))
