@@ -23,6 +23,7 @@ from typing import BinaryIO, NamedTuple, Protocol, TypedDict, runtime_checkable
 import fsspec
 from filelock import FileLock, Timeout
 from fsspec.implementations.cached import CachingFileSystem, WholeFileCacheFileSystem
+from fsspec.implementations.http import HTTPFileSystem
 from fsspec.implementations.local import LocalFileSystem
 from fsspec.spec import AbstractFileSystem
 from gcsfs import GCSFileSystem
@@ -458,7 +459,7 @@ def stored_kind(fs: AbstractFileSystem) -> str | None:
     none for a store with none such."""
     while isinstance(fs, CachingFileSystem):
         fs = fs.fs
-    if isinstance(fs, S3FileSystem):
+    if isinstance(fs, S3FileSystem | HTTPFileSystem):
         return STORED["s3"]
     if isinstance(fs, GCSFileSystem):
         return STORED["gs"]
@@ -519,22 +520,14 @@ class Declared:
         self.digest = None if digest is None else text(digest, "declared digest")
         kind = stored_kind(fs)
         stored = declared.get("stored")
+        # An ETag the declaration states is a version an S3 or HTTP read of it is held to.
         stored = dict(stored) if isinstance(stored, Mapping) else (
             {"etag": declared["ETag"]} if kind == "etag" and "ETag" in declared else {})
         self.stored = {kind: str(stored[kind])} if kind is not None and kind in stored else None
         self.pinned = pinned_by_url(fs, path)
-        self.lock = threading.Lock()
         if not (self.pinned or self.stored or self.digest):
             raise ValueError(f"{store.url} is declared with neither a digest nor its store's version of "
                              "it, so no read of it can be held to the declaration: state its sha256")
-
-    def __getstate__(self) -> Mapping[str, object]:
-        # A reader in another process checks or mirrors the object for itself.
-        return {key: value for key, value in self.__dict__.items() if key not in ("handle", "lock")}
-
-    def __setstate__(self, state: Mapping[str, object]) -> None:
-        self.__dict__.update(state)
-        self.lock = threading.Lock()
 
     def __eq__(self, other) -> bool:
         return isinstance(other, Declared) and self._identity() == other._identity()
@@ -574,18 +567,14 @@ class Declared:
         each read one request, any other as `open` gives it."""
         return Pinned(self.store, self.stored, self.size) if self.stored is not None else self.open()
 
-    @functools.cached_property
-    def handle(self) -> BinaryIO:
-        """One file of the declared bytes, checked as it opens, which ranges are read from."""
-        return self.open()
-
     def read_range(self, start: int, end: int) -> bytes:
-        """The declared bytes `start` to `end`, in one request where they are held to a version."""
+        """The declared bytes `start` to `end`: in one request where they are held to a version, else
+        from a file opened, checked, for the read alone, which holds nothing open after it."""
         if self.stored is not None:
             return self.store.read_range(start, end, self.stored)
-        with self.lock:
-            self.handle.seek(start)
-            return self.handle.read(end - start)
+        with self.open() as opened:
+            opened.seek(start)
+            return opened.read(end - start)
 
     def leased(self) -> tuple[str, BinaryIO]:
         """A path on this host's disk to the declared bytes, for a reader that opens paths alone
@@ -593,18 +582,16 @@ class Declared:
         (by its open descriptor where the host names one, `/proc/self/fd`, so the path reads the file
         checked), or its copy in Dew's mirror."""
         fs, path = self.store.resolve()
-        if local(fs) and self.digest is not None:
+        if self.digest is None:
+            # Its whole bytes are checked by their digest; a version alone holds ranged reads only.
+            raise ValueError(f"{self.store.url} is read by its path, which needs the sha256 of its bytes "
+                             "declared, and its declaration states only its store's version of it")
+        if local(fs):
             opened = checked_open(fs, path, self.size, self.digest)
             descriptor = f"/proc/self/fd/{opened.fileno()}"
             return (descriptor if os.path.exists(descriptor) else path), opened
         held = self.mirrored()
         return held.name, held
-
-    def close(self) -> None:
-        """Close the file ranges were read from, which a later read opens and checks again."""
-        handle = self.__dict__.pop("handle", None)
-        if handle is not None:
-            handle.close()
 
 
 class Readable(NamedTuple):
@@ -756,12 +743,25 @@ class Store:
     def read_range(self, start: int, end: int, stored: Mapping[str, str]) -> bytes:
         """Bytes `start` to `end` of this object as its store holds it at the version `stored` names
         (`STORED`), in one request held to it, which raises `Replaced` where the store no longer holds
-        it there: an S3 range read on the object's ETag (`IfMatch`), a GCS one of its generation, a Hub
-        file's at its commit."""
-        fs, path, scheme = self._backend()
-        version = stored.get(STORED.get(scheme, ""))
+        it there: an S3 range read on the object's ETag (`IfMatch`), an HTTP one on its ETag (`If-Match`,
+        RFC 9110 13.1.1), a GCS one of its generation, a Hub file's at its commit."""
+        fs, path = self.resolve()
+        while isinstance(fs, CachingFileSystem):
+            fs = fs.fs
+        kind = stored_kind(fs)
+        version = None if kind is None else stored.get(kind)
         if version is None:
             raise ValueError(f"{self.url} names no version its store holds it at: {dict(stored)}")
+        if isinstance(fs, HTTPFileSystem):
+            from aiohttp import ClientResponseError
+
+            try:
+                return fs.cat_file(path, start=start, end=end, headers={"If-Match": version})
+            except ClientResponseError as error:
+                if error.status == 412:
+                    raise Replaced(f"{self.url} is no longer the object published at ETag "
+                                   f"{version}") from error
+                raise
         if isinstance(fs, S3FileSystem):
             from botocore.exceptions import ClientError
             from fsspec.asyn import sync
