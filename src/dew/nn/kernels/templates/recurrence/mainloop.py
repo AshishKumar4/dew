@@ -1032,7 +1032,7 @@ def _intra(q, k, hi, lo, beta, taken, call: _Call, *, scale: float):
                    grid_names=("chunks", "heads"), blocks=blocks, stages=1, live=_taken(5), work=work,
                    held=_intra_held(call, keys), staging=staging, landing=landing, persistent=True,
                    # Each stream staged at its key block's row: a tile slices only whole swizzle rows.
-                   swizzles={name: min(keys * jnp.dtype(dtype).itemsize, mosaic.SWIZZLE_BYTES)
+                   swizzles={name: mosaic.widest_swizzle(dtype, keys)
                              for name, (_, dtype) in blocks.items()})(
         q, k, hi, lo, beta, taken)
 
@@ -1166,8 +1166,7 @@ def _weighted(k, v, a, hi, lo, beta, taken, call: _Call):
                             **({"keyed": held.landing(CHUNK, keyed)} if call.per_key else {})},
                    persistent=True,
                    # A key block's streams staged at its row: a tile slices only whole swizzle rows.
-                   swizzles={f"{name}{p}": min(keyed * jnp.dtype(operand.stored).itemsize,
-                                                mosaic.SWIZZLE_BYTES)
+                   swizzles={f"{name}{p}": mosaic.widest_swizzle(operand.stored, keyed)
                              for name, (_, operand) in given.items() if name in ("keys", "gates", "lows")
                              for p in range(operand.parts)})(
         k, v, k if a is None else a, hi, lo, beta, taken)
