@@ -457,7 +457,9 @@ def walked_launches[O](spec: Forward, launch: Launch[O], kept: Callable[[jax.Arr
     outputs, maxima, over = launch(spec, None)
     if not spec.base2:
         return guarded_launch(spec, outputs, over)
-    reach = reach_of(maxima, unseen=spec.form == "spans")
+    # The call's own rows alone: a padded query's maximum is -inf, a row that reads nothing (`seen`).
+    reach = reach_of(maxima if spec.queries is None else maxima[..., :spec.queries],
+                     unseen=spec.form == "spans")
     natural = unfolded(spec)
 
     def unfolded_launch() -> O:

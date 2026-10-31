@@ -647,7 +647,7 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
     name = (f"attention_{kind}{'_natural' if spec.natural else ''}{'_kept' if kept else ''}"
             f"{'_guarded' if guard is not None else ''}{'' if columns is None else f'_columns{columns}'}")
     # The hooks' functions and their arrays' shapes and dtypes static, their arrays the programs' operands.
-    return _launched(query, key, value, (spans, hooked, guard, anchors), jax.tree.leaves(hooks),
+    return _launched(query, key, value, (spans, hooked, guard, anchors),
                      hooks=jax.tree.map(lambda array: jax.ShapeDtypeStruct(array.shape, array.dtype), hooks),
                      spec=spec, tiles=tiles, family=family, training=training, interpret=interpret,
                      peaks=peaks, out_dtype=None if out_dtype is None else jnp.dtype(out_dtype),
@@ -657,17 +657,16 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
 
 @tuning.lowered_once(("hooks", "spec", "tiles", "family", "training", "interpret", "peaks", "out_dtype",
                       "counted", "finishes", "target", "names"))
-def _launched(query, key, value, read: tuple, hook_arrays: list, *, hooks: Hooks,
-              spec: algebra.Forward, tiles: Tiles, family: mosaic.Family, training: bool, interpret: bool,
+def _launched(query, key, value, read: tuple, *, hooks: Hooks, spec: algebra.Forward, tiles: Tiles,
+              family: mosaic.Family, training: bool, interpret: bool,
               peaks: bool, out_dtype, counted: bool, finishes: bool, target: generation.GpuTarget,
               names: tuple[str, str | None]):
-    """`_launch`'s kernel launched on its operands, the arrays its programs read beside them (`read`) and its
-    hooks' (`hook_arrays`, the static `hooks` holding their shapes and dtypes in their place, so its
-    functions are a key's and `tuning.holdable` reads them), lowered once for every call of its static facts
+    """`_launch`'s kernel launched on its operands and the arrays its programs read beside them (`read`, the
+    hooks' among them, `_Hooked`), its static `hooks` holding their arrays' shapes and dtypes in their place
+    (its functions a key's, which `tuning.holdable` reads), lowered once for every call of its static facts
     and its operands' shapes and dtypes (`tuning.lowered_once`); `target` the GPU its config is derived for,
     `names` its name and the one its trace reports (`report.named`)."""
     del target
-    hooks = jax.tree.unflatten(jax.tree.structure(hooks), hook_arrays)
     leaves, treedef = jax.tree.flatten(read)
     name, kernel_name = names
     batch, queries, heads, width = query.shape
