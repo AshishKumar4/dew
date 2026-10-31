@@ -284,12 +284,16 @@ class FetchLike:
 
 class CutThirds:
     """Refuses every third row under the cut that refused it, three tokens of its text, as a budget
-    refuses a row it cut until it no longer fits."""
+    refuses a row it cut until it no longer fits; the rows it was called on (`calls`)."""
 
     rejects = True
     identity = "cut-thirds@1"
 
+    def __init__(self):
+        self.calls: list[int] = []
+
     def __call__(self, row):
+        self.calls.append(row["i"])
         return Rejected("third", cut={"text": 3}) if row["i"] % 3 == 0 else row
 
 
@@ -301,16 +305,16 @@ class ConfigureFetch:
         return FetchLike()
 
 
-def fetched_generation(chain, directory, fetch=None):
-    """The fetch outcomes of `chain`, its step `fetch` (a `FetchLike` by default), sealed as the
-    generation of its prefix: the keyed manifest publication records, filled once through the cache."""
+def fetched_generation(chain, directory):
+    """The fetch outcomes of `chain`, sealed as the generation of its prefix: the keyed
+    manifest publication records, filled once through the cache."""
     from dew.data.analysis import _cache_manifest
     from dew.data.compile import _prepared
 
     (prepared,) = _prepared((chain,), "indexed", provision=False)
     source = prepared.source
     cache = Cache((directory / "fetched").as_uri())
-    fetch = FetchLike() if fetch is None else fetch
+    fetch = FetchLike()
     manifest = _cache_manifest(source, prepared.stages, "indexed")
     stored = cache.mapped(grain.MapDataset.source(source.records("indexed")), manifest,
                           transform=lambda index, row: (fetch(row),))
@@ -899,24 +903,28 @@ def test_a_runs_truncated_share_is_of_the_rows_it_delivered():
 def test_a_refused_records_cut_counts_beside_its_refusal_in_every_read(tmp_path, read, cached):
     """A record a step refuses keeps the cut that refused it (`Rejected.cut`), which every read counts
     beside the refusal (`data/cut_refused`): a memory read, which counts its rows anew as it holds them,
-    its step run or its outcomes read from a sealed generation, and an indexed or streamed read, whose
-    filter counts its refusals within the reader's counts. The delivered rows' cuts count none of it."""
-    source = Memory(rows("sample", 6)).named("sample")
-    chain = source.filter_map(CutThirds())
+    its step run or, through a cache, filled and then read back without running it; and an indexed or
+    streamed read, whose filter counts its refusals within the reader's counts. The delivered rows' cuts
+    count none of it."""
+    steps = [CutThirds() for _ in range(2 if cached else 1)]
+    for step in steps:
+        chain = Memory(rows("sample", 6)).named("sample").filter_map(step)
+        data = compile((chain.cache(str(tmp_path / "cache")) if cached else chain).batch(1), read=read,
+                       loading=READ)
+        stream = data.train(DataPartition())
+        try:
+            for _ in range(4):
+                next(stream)
+        finally:
+            stream.close()
+        counts = data.statistics()
+        assert counts["data/rejected/sample/third"] >= 2
+        assert counts["data/cut_refused/sample/text"] == 3 * counts["data/rejected/sample/third"]
+        delivered = ("data/cut/", "data/cut_examples/", "data/cut_removed/")
+        assert not any(name.startswith(delivered) for name in counts)
     if cached:
-        chain = chain.cache(fetched_generation(chain, tmp_path, CutThirds()))
-    data = compile(chain.batch(1), read=read, loading=READ)
-    stream = data.train(DataPartition())
-    try:
-        for _ in range(4):
-            next(stream)
-    finally:
-        stream.close()
-    counts = data.statistics()
-    assert counts["data/rejected/sample/third"] >= 2
-    assert counts["data/cut_refused/sample/text"] == 3 * counts["data/rejected/sample/third"]
-    delivered = ("data/cut/", "data/cut_examples/", "data/cut_removed/")
-    assert not any(name.startswith(delivered) for name in counts)
+        # The second read took the refusals and their cuts from the cache its first filled.
+        assert steps[-1].calls == []
 
 
 def test_successive_cuts_of_a_record_compose_in_its_record():
