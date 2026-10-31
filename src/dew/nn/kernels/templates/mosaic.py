@@ -158,8 +158,7 @@ class Outbox:
 
     def opened(self) -> None:
         """The producer's every stage freed before its first step, so a consumer's first put waits as its
-        others do (a wait of its own past the first put's step held its value across a branch: ptxas
-        spilled 364 bytes where the consumers' own adds spill 72, a shared dQ at width 128)."""
+        others do, with no branch of its own."""
         for share in range(self.smem.shape[0]):
             plgpu.barrier_arrive(self.empty.at[share])
 
