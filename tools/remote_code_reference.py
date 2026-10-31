@@ -10,7 +10,7 @@ ids, in fp32 for logits.npy and in float64 for logits_f64.npy, the exact
 value the tests measure both fp32 runs from (tests/reference_error.py).
 
 The weights and ids are inputs, read here as they are: drawn by
-tools/hf_reference.py's write_diffusion_tiny as of commit 18511496038f
+tools/hf_reference.py's write_diffusion_tiny as of commit ab9e7635af21
 (dew.interop.verify's scatter_weights at seed 1234 over a port of each
 release's module order, which drawing over the release's own order does
 not reproduce, and probe_ids).

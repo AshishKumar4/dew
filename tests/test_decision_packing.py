@@ -311,7 +311,7 @@ and 256 for the parallel arm (SF-a100-packing-seeds), armada 16 and 8 (run-tests
 sf-packing-cpu-sizing-898ec4ac6). The marker arm's one window a draw (`PACKING_WINDOWS`) took 64 on an
 H100, 32 on an A100 (node receipts TL-h100-sizing-1851-679, TL-a100-sizing-1851-679) and 8 on armada
 (run-tests rows-memory-probe12-8ce8072b5), each with its confirming block, the largest declared as
-docs/design/testing.md's check 1 rules (d28b1c318);
+docs/design/testing.md's check 1 rules (6eafb57ba);
 the flash arm's is an A100's, and the readout arm's 8 is an A100's
 (SF-readout-sizing), an H100's and armada's. The A100's are the head's gradients whose float64
 truth is zero by symmetry, which both arms err at by 0 to 3 fp32 ulps: the marker and parallel arms'

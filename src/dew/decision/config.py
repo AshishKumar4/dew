@@ -33,6 +33,7 @@ from dew.decision.laya import LAYA
 from dew.decision.layout import (
     Framing,
     Instructions,
+    JointLayout,
     Labels,
     Layout,
     QuestionLayout,
@@ -235,10 +236,7 @@ class DecisionRunConfig(DecoderRunConfig):
                              "attention_impl are choices")
         dtype = self.compute_dtype()
         attention_impl = self.source_attention()
-        budgets = {"max_len": self.max_len, "head_max_len": self.head_max_len,
-                   "option_tokens": self.option_tokens, "max_state_tokens": self.max_state_tokens,
-                   "framing": self.framing, "segments": self.segments, "reads": self.reads,
-                   "parallel": self.parallel, "unit": self.unit, "order": self.order, "split": self.split}
+        budgets = self._row_fields()
         self._refuse_unread_context()
         derived = {}
         if self.context_layers is not None:
@@ -271,6 +269,7 @@ class DecisionRunConfig(DecoderRunConfig):
             start = start.with_cross_attention(blocks, key=jax.random.fold_in(
                 jax.random.key(self.trainer.key), 1), frozen=self.context_frozen)
         start = start if self.lora is None else start.adapt(self.lora, key=self.trainer.key)
+        assumed = start.assumed if isinstance(start, PretrainedDecision) else frozenset()
         if isinstance(start, PretrainedDecision):
             # A release lays its rows out as it states, its blocks where its overrides read them; the run
             # trains the model's own tree, its projections unpacked (`Decide.released`).
@@ -281,7 +280,7 @@ class DecisionRunConfig(DecoderRunConfig):
         objective = self.objective.build(backbone=start, **derived)
         assert isinstance(objective, DecisionObjective), "a decision run's objective is a DecisionObjective"
         summary: dict[str, object] = {"pretrained": self.pretrained,
-                                      "capacities": self._capacities(objective, release)}
+                                      "capacities": self._capacities(objective, release, assumed)}
         # A mixture's weights and the manifest it was made by, as the chain states them (`Dataset.facts`).
         facts = self.chain().facts()
         if "mixture_weights" in facts:
@@ -292,20 +291,22 @@ class DecisionRunConfig(DecoderRunConfig):
         # Compiled once: `train` reads the run's length and cadences off this loader and trains on it.
         dataset, held = self.compiled(objective.data(), self.chain(), self.validation)
         summary["records"] = dataset.records
-        # The rows each layout refused, by reason, and the rows and tokens each cut removed, as the
-        # run's data counters count them (`Layout.refusal`, `Encoded.cuts`).
+        # The rows each layout refused, by reason, and the rows and tokens each cut removed, of the
+        # rows it delivered and the tokens of those it refused, as the run's data counters count them
+        # (`Layout.refusal`, `Encoded.cuts`, `Rejected.cut`).
         for reason in ("unfit", "options_alike"):
             refused = {name: counter.refused.get(reason, 0) for name, counter in dataset.counts.items()}
             refused["held out"] = sum(counter.refused.get(reason, 0)
                                       for counter in dataset.validation_counts.values())
             if any(refused.values()):
                 summary[reason] = refused
-        cut = {name: {kind: {"examples": counter.cut_examples[kind], "rows": rows,
-                             "removed": counter.cut_removed[kind], "unit": cut_unit(kind)}
-                      for kind, rows in counter.cut_rows.items()}
+        cut = {name: {kind: {"examples": counter.cut_examples[kind], "rows": counter.cut_rows[kind],
+                             "removed": counter.cut_removed[kind], "refused": counter.refused_cut[kind],
+                             "unit": cut_unit(kind)}
+                      for kind in {**counter.cut_rows, **counter.refused_cut}}
                for name, counter in {**dataset.counts, **{f"{name} (held out)": counter for name, counter
                                                            in dataset.validation_counts.items()}}.items()
-               if counter.cut_rows}
+               if counter.cut_rows or counter.refused_cut}
         if cut:
             summary["cut"] = cut
         # The rows whose "none of the above" a training read declines where it draws it, by why their
@@ -331,6 +332,11 @@ class DecisionRunConfig(DecoderRunConfig):
         return Prepared(self, lambda name: self.train(objective, dataset, name=name, metrics=metrics,
                                                       summary=summary, after=after, validation=held))
 
+    def _row_fields(self) -> Budgets:
+        """The run's fields that lay its rows out, by the layouts' field names (`ROW_FIELDS`), which
+        `_budgeted` sets on the layout the run reads."""
+        return {name: getattr(self, name) for name in ROW_FIELDS}
+
     def _fresh_head(self, start, blocked: bool, budgets: Budgets) -> Mapping[str, object]:
         """The head a fresh backbone `start` reads and its rows' layout: the joint schema head, the
         letter readout of its own logits (`Letters`), its labels named by the backbone's tokenizer, or
@@ -351,15 +357,24 @@ class DecisionRunConfig(DecoderRunConfig):
         layout = _fresh_layout(start.model.causal, one_question, budgets, blocked, labels)
         return {"layout": layout} if head is None else {"head": head, "layout": layout}
 
-    def _capacities(self, objective: DecisionObjective, release: bool) -> Mapping[str, Mapping[str, object]]:
+    def _capacities(self, objective: DecisionObjective, release: bool,
+                    assumed: frozenset[str]) -> Mapping[str, Mapping[str, object]]:
         """Each capacity the run's rows take and where it came from, beside the cuts it causes
         (`summary["cut"]`): the row's window in tokens, stated, the release's, or the layout's default;
-        the context the cross-attention reads, where it reads one; and the labels a letter readout
-        holds, stated, from the data's questions, or every label the tokenizer letters."""
+        a question layout's question and option budgets, stated, the release's, Laya's where the
+        release states none (`assumed`, `LAYA_BUDGETS`), or whole; the context the cross-attention
+        reads, where it reads one; and the labels a letter readout holds, stated, from the data's
+        questions, or every label the tokenizer letters."""
         layout = objective.layout
         found: dict[str, dict[str, object]] = {"window": {
             "tokens": layout.max_len,
             "from": "stated" if self.max_len is not None else "release" if release else "default"}}
+        if isinstance(layout, QuestionLayout):
+            for capacity, name in (("question", "head_max_len"), ("option", "option_tokens")):
+                held = getattr(layout, name)
+                origin = ("stated" if getattr(self, name) is not None else "whole" if held is None
+                          else "laya" if name in assumed else "release")
+                found[capacity] = {"tokens": held, "from": origin}
         if self.context_layers is not None:
             stated = self.context_length != type(self).context_length
             found["context"] = {"tokens": self.context_length, "from": "stated" if stated else "default"}
@@ -396,7 +411,14 @@ class DecisionRunConfig(DecoderRunConfig):
 
 
 type Budgets = dict[str, int | bool | str | Framing | Labels | tuple[RowSegment, ...] | None]
-"""A run's budgets of a row's layout, by the layout's field names (`_budgeted`)."""
+"""A run's fields of a row's layout, by the layout's field names (`_budgeted`)."""
+
+ROW_FIELDS = tuple(sorted(
+    {entry.name for layout in (QuestionLayout, JointLayout) for entry in dataclasses.fields(layout)}
+    & {entry.name for entry in dataclasses.fields(DecisionRunConfig)}))
+"""The run's fields that lay out its rows: each a field of a decision layout (`QuestionLayout`,
+`JointLayout`) the run declares by the same name, so a layout field the run states reaches its layout
+(`_budgeted`) without a list of its own to keep."""
 
 
 def _fresh_layout(causal: bool, one_question: bool, budgets: Budgets, blocked: bool = False,

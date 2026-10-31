@@ -35,6 +35,7 @@ import tyro
 
 from dew._hashing import fmix32
 from dew._records import share
+from dew.held_updates import refuse_untold, update_applied
 from dew.mesh import LogicalAxes
 from dew.newton_schulz import (
     NEWTON_SCHULZ,
@@ -1154,19 +1155,25 @@ def power_profiles(solver: optax.GradientTransformation,
     solver = optax.with_extra_args_support(solver)
 
     def init_fn(params):
+        inner = solver.init(params)
+        # Its averages move on the updates `solver` applies, which its state must say (`update_applied`).
+        refuse_untold(inner)
         return PowerProfilesState(updates=jnp.zeros([], jnp.int32), stds=jnp.asarray(stds, jnp.float32),
                                   powers=jnp.asarray([exponent(std) + 1 for std in stds], jnp.float32),
-                                  averages=tuple(jax.tree.map(jnp.copy, params) for _ in stds),
-                                  inner=solver.init(params))
+                                  averages=tuple(jax.tree.map(jnp.copy, params) for _ in stds), inner=inner)
 
     def update_fn(updates, state, params=None, **extra_args):
         if params is None:
             raise ValueError("power_profiles averages the parameters, so its update needs them")
         updates, inner = solver.update(updates, state.inner, params, **extra_args)
         produced = stepped(params, updates, state.inner, inner)
-        averages = tuple(ema_update(average, produced, powered_decay(state.powers[index])(state.updates))
-                         for index, average in enumerate(state.averages))
-        return updates, PowerProfilesState(state.updates + 1, state.stds, state.powers, averages, inner)
+        # An update `solver` holds back moves no average and no count (`update_applied`).
+        done = update_applied(state.inner, inner)
+        averages = tuple(jax.tree.map(lambda new, old: jnp.where(done, new, old), ema_update(
+            average, produced, powered_decay(state.powers[index])(state.updates)), average)
+            for index, average in enumerate(state.averages))
+        return updates, PowerProfilesState(state.updates + done.astype(state.updates.dtype), state.stds,
+                                           state.powers, averages, inner)
 
     return optax.GradientTransformationExtraArgs(init_fn, update_fn)
 
@@ -2410,6 +2417,6 @@ class OptimConfig:
         return {group.name: group.rates(self.learning_rate) for group in self.param_groups}
 
 
-__all__ = ["NEWTON_SCHULZ", "BoundsState", "Cosine", "DeltaState", "Exponential", "Linear", "M3State",
+__all__ = ["BoundsState", "Cosine", "DeltaState", "Exponential", "Linear", "M3State",
            "OneCycle", "OptimConfig", "ParamGroup", "Power", "PowerProfilesState", "PowerTail",
            "QKClipState", "ScheduleBase", "ScheduleSpec", "delta_gradient_descent", "scale_by_m3", "stepped"]

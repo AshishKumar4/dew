@@ -542,7 +542,7 @@ def _dispatched(kernel, portable, interpret_on_cpu: bool, *operands):
     its branch alone, so a CPU's would skip the selection the kernel's branch makes (its routes, a named
     kernel's refusal): an eager call is first traced abstractly as a jit traces it, every branch
     selecting, then runs its platform's branch eagerly, op by op as any eager call does: run under a jit
-    of its own (83d19a780), a quantized block's reload no longer computed its logits bit for bit
+    of its own (23c59c5fb), a quantized block's reload no longer computed its logits bit for bit
     (test_wrapped_runs)."""
     branches, default = grouped_matmul._on_platform(kernel, portable, interpret_on_cpu)
 

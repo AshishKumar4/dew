@@ -41,6 +41,18 @@ class PreconditionFailed(FileExistsError):
     """The object changed since the caller read its version."""
 
 
+class SourceChanged(OSError):
+    """An object Dew's mirror downloaded holding other bytes than those it was to hold: the size and
+    digest a caller named (`source_snapshot`), or its store's version of it as the download began."""
+
+
+STORED = {"s3": "etag", "gs": "generation", "gcs": "generation"}
+"""The version each remote store names an object it holds by and changes as it is replaced
+(`Store.get_versioned`), which a read of a range of it can be held to (`dew.data.declared.ranged`): an S3
+object's ETag, a GCS object's generation. A Hub file is held by its URL instead, at a commit
+(`Store.pinned`)."""
+
+
 @runtime_checkable
 class ConditionalWrites(Protocol):
     """An fsspec filesystem that supplies its own conditional writes (`Store`)."""
@@ -51,10 +63,6 @@ class ConditionalWrites(Protocol):
 class ObjectInfo(TypedDict):
     bytes: int
     sha256: str
-
-
-class ObjectRef(ObjectInfo):
-    path: str
 
 
 def object_info(payload: bytes | io.BufferedReader) -> ObjectInfo:
@@ -269,7 +277,7 @@ class BoundedFileCache(WholeFileCacheFileSystem):
                 self.fs.get_file(path, str(pending))
                 unchanged = self.fs.ukey(path) == version
             if pending.stat().st_size != size or not unchanged:
-                raise OSError(f"dewcache source changed while downloading {path}")
+                raise SourceChanged(f"dewcache source changed while downloading {path}")
             with FileLock(str(local.parent / ".dew-lock")):
                 self.load_cache()
                 os.replace(pending, local)
@@ -379,6 +387,15 @@ def content_version(fs: AbstractFileSystem, path: str, size: int) -> str:
         return checksum
 
 
+def pinned_by_url(fs: AbstractFileSystem, path: str) -> bool:
+    """Whether the object at `path` is one version by its URL alone: a Hub repository's file at a full
+    commit, which no write moves."""
+    if not isinstance(fs, HfFileSystem):
+        return False
+    revision = parse_hf_uri(f"hf://{path}").revision
+    return revision is not None and REGEX_COMMIT_HASH.fullmatch(revision) is not None
+
+
 def local(fs: AbstractFileSystem) -> bool:
     """Whether `fs` is this host's own disk, whose paths are where it mounted a file."""
     return isinstance(fs, LocalFileSystem)
@@ -452,15 +469,24 @@ class Store:
         (HF_HUB_OFFLINE) and without a request online; any other object, and a
         Hub file the cache lacks, where `resolve` places it."""
         fs, path = self.resolve()
-        if isinstance(fs, HfFileSystem):
+        if pinned_by_url(fs, path):
             uri = parse_hf_uri(f"hf://{path}")
-            if uri.revision is not None and REGEX_COMMIT_HASH.fullmatch(uri.revision):
+            if uri.revision is not None:
                 held = try_to_load_from_cache(uri.id, uri.path_in_repo, revision=uri.revision,
                                               repo_type=uri.type)
                 if isinstance(held, str):
                     depth = len(PurePosixPath(uri.path_in_repo).parts)
                     return Readable(LocalFileSystem(), held, str(Path(held).parents[depth - 1]))
         return Readable(fs, path, None)
+
+    def pinned(self) -> Store:
+        """This object at the commit its revision names now, where it is a Hub repository's file at a
+        branch or a tag, which a later commit moves (a file at a commit is one version by its URL,
+        `pinned_by_url`); this object itself on any other store, and at a commit already."""
+        fs, path = self.resolve()
+        if not isinstance(fs, HfFileSystem) or pinned_by_url(fs, path):
+            return self
+        return Store("hf://" + _hub_commit(fs, path)[1], self.storage_options, self.retention)
 
     def cached(self) -> Store:
         if self.url.startswith("dewcache::"):
@@ -522,12 +548,26 @@ class Store:
             return
         write_atomically(path, payload)
 
-    def verified(self, payload: bytes) -> ObjectInfo:
-        """Write `payload` here where nothing is, and read it back as written."""
+    def verified(self, payload: bytes) -> dict[str, JSON]:
+        """Write `payload` here where nothing is, and read it back as written: its size and digest, and
+        on a remote store the version it holds it at (`held_at`), to which a read of it is held
+        (`dew.data.declared.Declared`)."""
         self.put_if_absent(payload)
-        written = object_info(payload)
-        matching(object_info(self.read()), written, self.url)
-        return written
+        return self.held_at(object_info(payload))
+
+    def held_at(self, written: ObjectInfo | None = None) -> dict[str, JSON]:
+        """This object's size and digest, read in one request with the version its store holds it at
+        (`get_versioned`, named by `STORED`, on a remote store), refused unless they are `written`'s
+        where given."""
+        held = self.get_versioned()
+        found = object_info(held.data)
+        if written is not None:
+            matching(found, written, self.url)
+        _, _, scheme = self._backend()
+        facts: dict[str, JSON] = {"bytes": found["bytes"], "sha256": found["sha256"]}
+        if scheme in STORED:
+            facts["stored"] = {STORED[scheme]: held.version}
+        return facts
 
     def checked(self, committed: Mapping[str, object]) -> bytes:
         """This object's bytes, refused unless they are the size and digest `committed` states."""
@@ -626,19 +666,7 @@ class Store:
             return Versioned(fs.cat_file(path, generation=version, concurrency=1), version)
         if not isinstance(fs, HfFileSystem):
             raise ValueError(f"conditional publication is unavailable for {self.url}")
-        resolved = fs.resolve_path(path)
-        if not isinstance(resolved, HfFileSystemResolvedRepositoryPath):
-            raise ValueError(f"conditional HF publication needs a repository object URL: {self.url}")
-        from huggingface_hub import HfApi
-
-        version = (
-            HfApi(token=fs.token)
-            .repo_info(resolved.repo_id, repo_type=resolved.repo_type, revision=resolved.revision)
-            .sha
-        )
-        if version is None:
-            raise ValueError(f"Hub source {self.url} did not resolve to a commit")
-        pinned = f"{resolved.repo_type}s/{resolved.repo_id}@{version}/{resolved.path_in_repo}"
+        version, pinned = _hub_commit(fs, path)
         return Versioned(fs.cat_file(pinned), version)
 
     def put_if_absent(self, payload: bytes) -> str:
@@ -741,6 +769,20 @@ class Store:
                 raise PreconditionFailed(self.url) from error
             raise
         return outcome.oid
+
+
+def _hub_commit(fs: HfFileSystem, path: str) -> tuple[str, str]:
+    """The commit the revision of `path`, a Hub repository's file, names now, and the file's path at it."""
+    resolved = fs.resolve_path(path)
+    if not isinstance(resolved, HfFileSystemResolvedRepositoryPath):
+        raise ValueError(f"a Hub object at a commit needs a repository file's URL: hf://{path}")
+    from huggingface_hub import HfApi
+
+    version = (HfApi(token=fs.token)
+               .repo_info(resolved.repo_id, repo_type=resolved.repo_type, revision=resolved.revision).sha)
+    if version is None:
+        raise ValueError(f"Hub source hf://{path} did not resolve to a commit")
+    return version, f"{resolved.repo_type}s/{resolved.repo_id}@{version}/{resolved.path_in_repo}"
 
 
 @functools.cache

@@ -99,7 +99,7 @@ decode runs (`decode_ops`): a prediction depth's, and a block drafter's, which r
 
 PAST_TARGET = {"greedy": {"dspark": 124}}
 """The greedy-walk cases a group's 120 s target sends to the whole suite (`timed`), each its seconds on
-armada at 09fab1340: the drafter's, whose crossing its cheaper siblings hold every train, a block across
+armada at 5163cd0bd: the drafter's, whose crossing its cheaper siblings hold every train, a block across
 the change answering each token as the walk does and the crossing reseeding the drafter's windows (each
 `[drafter]`)."""
 

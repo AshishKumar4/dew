@@ -2,6 +2,8 @@
 
 import dataclasses
 import hashlib
+import http.server
+import importlib
 import importlib.machinery
 import io
 import itertools
@@ -359,7 +361,6 @@ def test_a_fetch_from_a_server_that_trickles_its_response_ends_at_its_timeout(tr
     to send, where it once read on byte by byte, each byte inside the socket's timeout, to the
     response's end (row 1947: the end is the timeout's, read off the response, not a wall-clock
     bound)."""
-    import http.server
     import time
 
     from dew.data.pipeline import Rejected
@@ -1127,13 +1128,15 @@ def test_remote_indexed_arrayrecords_read_only_the_selected_physical_shard(monke
     )
     filesystem, _ = root.resolve()
     downloaded = []
-    get_file = filesystem.get_file
+    opened = filesystem.open
 
-    def download(remote, local, **kwargs):
-        downloaded.append(remote)
-        return get_file(remote, local, **kwargs)
+    def download(path, *args, **kwargs):
+        # A shard's bytes read whole into Dew's mirror, where its digest is checked.
+        if str(path).endswith(".array_record"):
+            downloaded.append(path)
+        return opened(path, *args, **kwargs)
 
-    monkeypatch.setattr(filesystem, "get_file", download)
+    monkeypatch.setattr(filesystem, "open", download)
     rows = Files(root.url, format="array_record").records("indexed")
     assert len(rows) == 12
     assert downloaded == []

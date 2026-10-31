@@ -90,6 +90,7 @@ import argparse
 import ast
 import collections
 import concurrent.futures
+import dataclasses
 import functools
 import hashlib
 import heapq
@@ -148,7 +149,7 @@ run the files whose behaviour changed with it (`NEWEST_FILES`). `pythons` prints
 tools/armada/install.sh, and `pythons --check` holds .python-version and the environment's smoke
 (.armada.json) to them."""
 NEWEST_FILES = (
-    # Annotations, which 3.14 evaluates lazily (PEP 649): records and their config (326e40fd5).
+    # Annotations, which 3.14 evaluates lazily (PEP 649): records and their config (ec3c5fb54).
     "tests/test_config.py", "tests/test_encoders.py", "tests/test_registry_records.py",
     "tests/test_records.py", "tests/test_record_keys.py", "tests/test_linen_records.py",
     "tests/test_run_records.py",
@@ -156,12 +157,12 @@ NEWEST_FILES = (
     "tests/test_config_cli.py", "tests/test_tpu_cli.py",
     # Serialization.
     "tests/test_pickle_sources.py",
-    # Data loading: providers without TensorFlow (54a52a57d, 1a276e6a5, d3cc21fe6) and a
-    # fetcher pool under 3.14's forkserver start (c9dbce717).
+    # Data loading: providers without TensorFlow (5cec9cc9d, ee7fa9ee0, 20294b686) and a
+    # fetcher pool under 3.14's forkserver start (1b8a67804).
     "tests/test_data.py", "tests/test_providers.py", "tests/test_hf_data.py", "tests/test_data_mixtures.py",
     "tests/test_online_loader.py",
-    # Threads at interpreter exit, which 3.14 ends differently (13a271177, d00ed72cd), and the
-    # compilation cache's codec (23f5adffe).
+    # Threads at interpreter exit, which 3.14 ends differently (e8fececd5, 72caf7ed6), and the
+    # compilation cache's codec (931d6f2e1).
     "tests/test_iterator_lifecycle.py", "tests/test_native_rollout_server.py", "tests/test_distribution.py",
     "tests/test_instrumentation.py",
 )
@@ -415,25 +416,51 @@ def shapes(module: types.CodeType) -> list[list]:
     return sorted(found, key=json.dumps)
 
 
-def cache_key(common: str, name: str, split: str, depends: list[str]) -> str:
+@dataclasses.dataclass
+class Reading:
+    """One reading of the checkout's inputs (`cache_key`): each input's part by its path, and each module's
+    units by its path, read once, by whichever of the threads looking rows up asks first. A reading lasts
+    while the checkout stands still: a plan's lookups, gpu_tier's, a task's before its tests run (2026-10-31:
+    train 368's plan read each of a row's ~3,000 inputs again for each of 1,682 rows, 9.5 minutes before its
+    first task)."""
+
+    parts: dict[str, bytes] = dataclasses.field(default_factory=dict)
+    modules: dict[str, dict[str, bytes] | bytes] = dataclasses.field(default_factory=dict)
+    lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
+
+    def part(self, path: str) -> bytes:
+        """Input `path`'s part of a key: a unit's digest (`unit`), or its contents' (`contents`)."""
+        found = self.parts.get(path)
+        if found is None:
+            with self.lock:
+                found = self.parts.get(path)
+                if found is None:
+                    found = self.parts[path] = self.read(path)
+        return found
+
+    def read(self, path: str) -> bytes:
+        module, _, executed = path.partition(followed.CODE)
+        if not executed or not Path(module).is_file():
+            return contents(path)
+        if module not in self.modules:
+            self.modules[module] = units(module)
+        found = self.modules[module]
+        return found.get(executed, b"missing") if isinstance(found, dict) else found
+
+
+def cache_key(common: str, name: str, split: str, depends: list[str],
+              reading: Reading | None = None) -> str:
     """The key of test file `name`'s row in `split`'s group whose run executed or read `depends`
     (executed.py): its `inputs`' contents, its directories' entries, `common`, and for a group of a split
     file, the group and the tests split.py cuts into it from the durations record (`members`), the record's
     only part a run's outcome depends on: not their seconds, which each train's fold of main's durations
-    moves (the maintainer, 2026-10-28: every train re-keyed its split files and reran them cold, row 2000)."""
+    moves (the maintainer, 2026-10-28: every train re-keyed its split files and reran them cold, row 2000).
+    The inputs as `reading` finds them: the keys of one reading read each input once, however many rows
+    name it."""
     digest = hashlib.sha256(common.encode())
-    # A module's units read from one reading of its text.
-    read: dict[str, dict[str, bytes] | bytes] = {}
+    reading = Reading() if reading is None else reading
     for path in inputs(name, depends):
-        module, _, executed = path.partition(followed.CODE)
-        if executed and Path(module).is_file():
-            if module not in read:
-                read[module] = units(module)
-            found = read[module]
-            part = found.get(executed, b"missing") if isinstance(found, dict) else found
-        else:
-            part = contents(path)
-        digest.update(path.encode() + part)
+        digest.update(path.encode() + reading.part(path))
     if split and split != COLLECT:
         digest.update(split.encode() + json.dumps(members(name, split)).encode())
     return digest.hexdigest()
@@ -450,16 +477,28 @@ def inputs(name: str, depends: list[str]) -> list[str]:
     harness's own modules (tools/armada/, which runs every test process and records it, `SHARED`) are no
     import of a test's, so their directories are none of its inputs (the maintainer, 2026-10-29: tools/'s
     entries keyed every row, and train 296's one added tool reran 1,794 of 1,795)."""
-    files = (each.partition(followed.CODE)[0] for each in depends)
-    packages = {str(parent) for path in files
-                if path.startswith(("src/", "tools/")) and path.endswith(".py") and not path.startswith(HARNESS)
-                for parent in Path(path).parents
-                if parent.parts[:1] in (("src",), ("tools",)) and parent != Path("src")}
-    # A build's output (an editable install's metadata, bytecode) is the environment's, which the locks key
-    # (`shared`): a planner's checkout has none (train 300's plan reused none of 501 files).
-    kept = (path for path in depends
-            if not built(Path(path.removeprefix("probe:").partition(followed.CODE)[0])))
-    return sorted({name, *kept, *packages})
+    return sorted({name, *(path for path in depends if not built_input(path)),
+                   *(package for path in depends for package in packages(path.partition(followed.CODE)[0]))})
+
+
+@functools.cache
+def packages(path: str) -> tuple[str, ...]:
+    """The directories under src/ or tools/ above module `path` whose entries an import of it reads
+    (`inputs`), none for any other path. A function of the path's text alone, kept: a plan asks it of each of
+    a row's ~3,000 inputs for every row."""
+    if not path.startswith(("src/", "tools/")) or not path.endswith(".py") or path.startswith(HARNESS):
+        return ()
+    return tuple(str(parent) for parent in Path(path).parents
+                 if parent.parts[:1] in (("src",), ("tools",)) and parent != Path("src"))
+
+
+@functools.cache
+def built_input(path: str) -> bool:
+    """Whether input `path` (a file, a unit of one, or a probe of one) is a build's output (`built`). A
+    build's output (an editable install's metadata, bytecode) is the environment's, which the locks key
+    (`shared`): a planner's checkout has none (train 300's plan reused none of 501 files). Kept, as
+    `packages` is."""
+    return built(Path(path.removeprefix("probe:").partition(followed.CODE)[0]))
 
 
 @functools.cache
@@ -588,11 +627,13 @@ def reusable(python: str, rows: list[tuple[str, str]], common: str) -> dict[tupl
     token, held = os.environ.get(READ_TOKEN), pinned_classes()
     if not token or not held or "DEW_XLA_CACHE_URL" not in os.environ:
         return {}
+    # The plan's one reading of the checkout, which every row's key reads its inputs from.
+    reading = Reading()
 
     def hit(each_row: tuple[str, str]) -> str | None:
         name, group = each_row
         for each in held:
-            found = green_record(python, name, group, common, token, [each])
+            found = green_record(python, name, group, common, token, [each], reading)
             # Kept only where its green run is kept by its key, as the task reads it.
             if found is not None and recorded(green_key(python, row(python, name, group), each, found["key"]),
                                               token) is not None:
@@ -617,6 +658,32 @@ def kept_token(name: str, group: str, at: str) -> str:
     return f"{name}{GROUP_AT + group if group else ''}{KEPT_AT}{at}"
 
 
+KEPT_BYTES = 64 * 1024
+"""The most bytes of tokens and row names a kept task holds: its entry travels whole as one environment
+string (armada's ARMADA_ITEM) and its tokens as one argument (--tests), each of which Linux starts no process
+with past 131,071 bytes (MAX_ARG_STRLEN); half of that, for the entry's other fields (2026-10-31: main
+de315f9a05's kept rows were one task, whose 149,515-byte argument started none)."""
+
+
+def kept_tasks(python: str, found: Mapping[tuple[str, str], str],
+               target: float) -> list[list[tuple[str, str]]]:
+    """The rows `found` kept (`reusable`), in tasks of at most the target's lookups, a lookup a row in
+    seconds, so no kept task outlasts the rest of the run, and at most `KEPT_BYTES` of their tokens and
+    names."""
+    tasks: list[list[tuple[str, str]]] = []
+    held: list[tuple[str, str]] = []
+    size = 0
+    for name, group in sorted(found):
+        # Its token, its row's name, and the JSON quotes and separators around them.
+        cost = len(f"{kept_token(name, group, found[(name, group)])} {row(python, name, group)}".encode()) + 6
+        if held and (len(held) >= max(int(target), 1) or size + cost > KEPT_BYTES):
+            tasks.append(held)
+            held, size = [], 0
+        held.append((name, group))
+        size += cost
+    return tasks + ([held] if held else [])
+
+
 def kept_of(tests: list[str]) -> tuple[list[str], dict[tuple[str, str], tuple[str, str]]]:
     """A task's `tests`, each a file's name, or a kept row's token, its file's name with its group where it
     has one and where its green run is kept (`KEPT_AT`): the files the task runs whole, those kept among
@@ -634,17 +701,18 @@ def kept_of(tests: list[str]) -> tuple[list[str], dict[tuple[str, str], tuple[st
 
 
 def green_record(python: str, name: str, split: str, common: str, token: str,
-                 classes: list[str]) -> dict | None:
+                 classes: list[str], reading: Reading | None = None) -> dict | None:
     """The record of test file `name`'s row (in `split`'s group) that ran green on exactly these inputs on one
-    of `classes`, the first found; else None. The plan (`reusable`) and a task (`reused`) read it alike."""
+    of `classes`, the first found; else None. The plan (`reusable`) and a task (`reused`) read it alike, from
+    one reading of the inputs (`Reading`)."""
     for each in classes:
         found = recorded(record_key(python, row(python, name, split), each, common), token)
-        if found is not None and fresh(found, name, common):
+        if found is not None and fresh(found, name, common, reading):
             return found
         # The last run's record is another commit's: its file's inputs, as that run found them, hashed
         # here, name the green run of exactly these, kept by its key (`green_key`) whatever ran since.
         if found is not None and found["depends"] is not None:
-            key = cache_key(common, name, split, found["depends"])
+            key = cache_key(common, name, split, found["depends"], reading)
             kept = recorded(green_key(python, row(python, name, split), each, key), token)
             if kept is not None and kept["key"] == key:
                 return kept
@@ -660,28 +728,29 @@ def reused_classes(network: bool = False) -> list[str]:
 
 
 def reused(python: str, name: str, split: str, common: str, network: bool = False,
-           kept: tuple[str, str] | None = None) -> dict | None:
+           kept: tuple[str, str] | None = None, reading: Reading | None = None) -> dict | None:
     """The green row of test file `name` (in `split`'s group) recorded on a class this host reuses
     (`reused_classes`), if it ran green there on exactly these inputs; else None. A file its plan kept
     (`kept`: its green run's class and key, `reusable`) reads that run, fresh here; any other, the record of
     the last run on these shared inputs: a key hashes them (`cache_key`), so no run on others, whose record
-    the last run's may be, can be fresh here."""
+    the last run's may be, can be fresh here, all from one reading of the inputs (`Reading`)."""
     token = os.environ.get("DEW_XLA_CACHE_TOKEN")
     if not token or "DEW_XLA_CACHE_URL" not in os.environ:
         return None
     if kept is not None:
         found = recorded(green_key(python, row(python, name, split), *kept), token)
-        if found is not None and found["key"] == kept[1] and fresh(found, name, common):
+        if found is not None and found["key"] == kept[1] and fresh(found, name, common, reading):
             return found["row"]
-    found = green_record(python, name, split, common, token, reused_classes(network))
+    found = green_record(python, name, split, common, token, reused_classes(network), reading)
     return None if found is None else found["row"]
 
 
-def fresh(recorded: dict, name: str, common: str) -> bool:
-    """Whether test file `name`'s record was made by a green run on exactly these inputs. A red run,
-    or one of a file that started another Python process, whose code no event saw, leaves no key."""
+def fresh(recorded: dict, name: str, common: str, reading: Reading | None = None) -> bool:
+    """Whether test file `name`'s record was made by a green run on exactly these inputs, as `reading` finds
+    them (`cache_key`). A red run, or one of a file that started another Python process, whose code no event
+    saw, leaves no key."""
     return recorded["key"] is not None and recorded["key"] == cache_key(
-        common, name, parsed_row(recorded["row"]["name"])[2], recorded["depends"])
+        common, name, parsed_row(recorded["row"]["name"])[2], recorded["depends"], reading)
 
 
 RECORD_TRIES = 4
@@ -874,10 +943,10 @@ def plan(target: float, timings: dict) -> list[dict]:
     timed runs alone, so however long it takes it holds up no other file, and its time is known from
     then on. Files marked `torchax` (`APART`) share tasks only with one another. Each entry carries
     the test cache's policy, DEW_TEST_CACHE here (`policy`), to its task. Under the policy "on", the files
-    whose rows the cache holds for exactly these inputs (`reusable`) share one task, which looks each up
-    again in its container, so the verdict names every file and containers scale with the change. Under the
-    policy "off" every task's weight carries COLD_SECONDS, so armada sizes the pool by the work, not the
-    longest task, as warm estimates did."""
+    whose rows the cache holds for exactly these inputs (`reusable`) share tasks of the target's lookups each,
+    which look each up again in their containers, so the verdict names every file and containers scale with
+    the change. Under the policy "off" every task's weight carries COLD_SECONDS, so armada sizes the pool by
+    the work, not the longest task, as warm estimates did."""
     cache = os.environ.get("DEW_TEST_CACHE") or "on"
     # The whole suite's run alone (DEW_WHOLE_SUITE, every fifth publish) runs whole_suite cells (`selected`).
     cells = "1" if os.environ.get("DEW_WHOLE_SUITE") else "0"
@@ -902,9 +971,9 @@ def plan(target: float, timings: dict) -> list[dict]:
         rows_of = [(name, "") for name in timed if name not in groups] + [
             (name, group) for name, cut in groups.items() for group, _ in cut]
         found = reusable(python, rows_of, shared(python)) if cache == "on" else {}
-        kept = sorted(found)
-        # A lookup a row, in seconds: the task's weight is its container's start and those lookups.
-        tasks: list[tuple[list[tuple[str, str]], float]] = [(kept, float(len(kept)))] if kept else []
+        # A lookup a row, in seconds: a kept task's weight is its container's start and those lookups.
+        tasks: list[tuple[list[tuple[str, str]], float]] = [
+            (held, float(len(held))) for held in kept_tasks(python, found, target)]
         tasks += [([(name, "")], target) for name, seconds in timed.items()
                   if seconds is None and (name, "") not in found]
         tasks += [([(name, group)], weight) for name, cut in groups.items() for group, weight in cut
@@ -1107,10 +1176,12 @@ def pytest_command(run: list[str], tests: list[str], split: str, release: str) -
 def reused_rows(python: str, tests: list[str], group: str, common: str, network: bool,
                 kept: Mapping[str, tuple[str, str]] | None = None) -> list[dict]:
     """The green rows of `tests` in `group` recorded on these inputs on this host's class (`reused`), those
-    its plan kept read where it found them (`kept`), said."""
+    its plan kept read where it found them (`kept`), said. They are looked up before any test runs, from one
+    reading of the checkout (`Reading`)."""
     kept = kept or {}
+    reading = Reading()
     rows = [found for name in tests
-            if (found := reused(python, name, group, common, network, kept.get(name)))]
+            if (found := reused(python, name, group, common, network, kept.get(name), reading))]
     if rows:
         print(f"{len(rows)} files ran green on these inputs on {', '.join(reused_classes(network))}; "
               "their rows are reused")
@@ -1340,13 +1411,15 @@ def gpu_tier(python: str) -> dict[str, list[str]]:
         raise SystemExit("the GPU tier is chosen from the test cache's records, which need its URL and token")
     inputs = (shared(python), lane_inputs(python))
     prefix = f"{CACHE_PREFIX}/{python}/"
+    # One reading of the checkout, which every record's key reads its inputs from.
+    reading = Reading()
 
     def evidence_of(key: str) -> tuple[str, list[str]]:
         _, name, _ = key_parts(key)
         found = recorded(f"{prefix}{key}", token)
         if found is None:
             return name, ["unrecorded"]
-        current = any(fresh(found, name, common) for common in inputs)
+        current = any(fresh(found, name, common, reading) for common in inputs)
         return name, found["reads"] or ([] if current else ["changed"])
 
     try:

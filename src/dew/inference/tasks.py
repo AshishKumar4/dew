@@ -29,7 +29,7 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 from jax.typing import ArrayLike, DTypeLike
 
 from dew._coordination import agreed
-from dew._records import earlier_segments, integer, record as named_fields, strings, text as named
+from dew._records import earlier_fields, integer, json_value, record as named_fields, strings, text as named
 from dew.batch import (
     COORDINATES_FIELD,
     PARAMETER_ROOTS,
@@ -531,7 +531,10 @@ def earlier_shapes(record: Mapping[str, object]) -> Mapping[str, object]:
         fields = laid["fields"]
         segments = fields.get("segments")
         if isinstance(segments, list | tuple):
-            current["layout"] = {**laid, "fields": {**fields, "segments": earlier_segments(segments)}}
+            # The layout's segments, each component in today's fields (`earlier_fields`).
+            migrated = earlier_fields(json_value(segments, "layout segments"))
+            assert isinstance(migrated, list)
+            current["layout"] = {**laid, "fields": {**fields, "segments": migrated}}
     if "attention_form" in current:
         # The form a step trained in, which its numerics' forms hold now (ledger 2500).
         current["precision"] = {"forms": current.pop("attention_form")}
@@ -598,18 +601,34 @@ def _declared_decoders(name: str, fields: Mapping[str, object]) -> Mapping[str, 
             for field, value in fields.items()}
 
 
+_LAYER_DISPATCH = ("implementation", "dispatch", "capacity_factor")
+"""The routed MLP's dispatch an earlier record wrote into its value experts' fields, which run under
+the layer's `Mixture` alone today (`dew.nn.value_experts.RoutedValues.mixture`, ledger 2751)."""
+
+
 def _decoder_fields(fields: Mapping[str, object]) -> Mapping[str, object]:
     """A decoder's fields and its layer kinds' with an earlier YaRN field read as their rope scaling
-    (`_one_scaling`), and an earlier cross-attention, IDEFICS's block recorded by its fields alone
+    (`_one_scaling`), an earlier cross-attention, IDEFICS's block recorded by its fields alone
     when the field declared that class, as its class record (`dew.nn.cross_attention.CrossBlocks`,
-    ledger 2320)."""
-    kinds, cross = fields.get("kinds"), fields.get("cross_attention")
-    return {**_one_scaling(fields), **({"kinds": {
+    ledger 2320), and earlier value experts without the layer dispatch they recorded at its defaults
+    (`_LAYER_DISPATCH`)."""
+    kinds, cross, values = fields.get("kinds"), fields.get("cross_attention"), fields.get("value_experts")
+    return {**_one_scaling(fields), **({"value_experts": _without_dispatch(values)}
+                                       if isinstance(values, Mapping) else {}), **({"kinds": {
         kind: ({**held, "fields": _one_scaling(held["fields"])} if "class" in held
                else _one_scaling(held)) if isinstance(held, Mapping) else held
         for kind, held in kinds.items()}} if isinstance(kinds, Mapping) else {}),
         **({"cross_attention": {"class": "dew.nn.cross_attention:CrossAttention", "fields": dict(cross)}}
            if isinstance(cross, Mapping) and "class" not in cross else {})}
+
+
+def _without_dispatch(values: Mapping[str, object]) -> Mapping[str, object]:
+    """Value experts' record without the layer dispatch an earlier one wrote (`_LAYER_DISPATCH`), in its
+    class record's fields where it has one."""
+    held = values.get("fields")
+    if "class" in values and isinstance(held, Mapping):
+        return {**values, "fields": _without_dispatch(held)}
+    return {name: value for name, value in values.items() if name not in _LAYER_DISPATCH}
 
 
 def _one_scaling(fields: Mapping[str, object]) -> Mapping[str, object]:
