@@ -98,14 +98,11 @@ def teacher_objective(observation_size: int | None = None):
 
 
 def warmed(path: Path):
-    """A teacher's weights for the race's view from a teacher of its first race's (`dew.rl.flight.INTERFACE`
-    entries): every weight its own, each first layer's weights from the view's new entries zero, so it acts
-    as it did."""
-    from dew.rl.flight import INTERFACE
-
-    old = serialization.from_bytes(teacher_objective(INTERFACE).init(jax.random.key(0)), path.read_bytes())
+    """A teacher's weights for the race's view from a teacher of the race's or of its first race's
+    (`dew.rl.flight.INTERFACE` entries): every weight its own, each first layer's weights from the view's new
+    entries zero, so it acts as it did."""
     new = jax.device_get(teacher_objective().init(jax.random.key(0)))
-    previous = traverse_util.flatten_dict(serialization.to_state_dict(old))
+    previous = traverse_util.flatten_dict(serialization.msgpack_restore(path.read_bytes()))
     fresh = traverse_util.flatten_dict(serialization.to_state_dict(new))
     for name, value in fresh.items():
         held = np.asarray(previous[name])
@@ -215,9 +212,12 @@ def teacher(out: Path, *, seconds: float = 6600.0, drones: int = 4096, hz: float
     from dew.rl.flight import FlightEnv
     from dew.training import Trainer
 
+    def families_at(level: float):
+        return TRAINING if level >= 0.3 else (("loop", 1.0),)
+
     def env_at(level: float):
-        families = TRAINING if level >= 0.3 else (("loop", 1.0),)
-        return Batched(FlightEnv(racing_at(hz, families), ("teacher",), difficulty=level, ramp=level), drones)
+        flight = FlightEnv(racing_at(hz, families_at(level)), ("teacher",), difficulty=level, ramp=level)
+        return Batched(flight, drones)
 
     def judged_at(level: float, families) -> Batched:
         shown = ("teacher", "passed")
@@ -235,7 +235,7 @@ def teacher(out: Path, *, seconds: float = 6600.0, drones: int = 4096, hz: float
     best, began, updates = (-1.0, -np.inf), time.perf_counter(), 0
     every = 10 * rollout.epochs * rollout.minibatches
     horizon, penalty = round(20 * hz), racing_at(hz).crash_penalty
-    trained, held_out = judged_at(level, TRAINING), judged_at(level, HELD_OUT)
+    trained, held_out = judged_at(level, families_at(level)), judged_at(level, HELD_OUT)
     while time.perf_counter() - began < seconds:
         state = trainer.fit(_idle(), steps=updates + every, log_every=every, state=state)
         updates += every
@@ -252,7 +252,7 @@ def teacher(out: Path, *, seconds: float = 6600.0, drones: int = 4096, hz: float
         if point["crashed"] < 1 / 3 and level < 1.0:
             level = round(min(1.0, level + 0.1), 1)
             rollout.env = env_at(level)
-            trained, held_out = judged_at(level, TRAINING), judged_at(level, HELD_OUT)
+            trained, held_out = judged_at(level, families_at(level)), judged_at(level, HELD_OUT)
         (out / "teacher.json").write_text(json.dumps(report, indent=1))
     kept = (out / "teacher.msgpack").read_bytes()
     variables = serialization.from_bytes(jax.device_get(state.variables), kept)
