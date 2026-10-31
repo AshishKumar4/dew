@@ -524,22 +524,31 @@ def test_a_watched_summary_over_given_positions_is_their_statistics():
     assert jax.tree.map(float, sown[SOWN]) == jax.tree.map(float, whole)
 
 
-def padding_invariant_summaries(tail, *, packed: bool = False, pipelined: bool = False) -> dict[str, float]:
+def padding_invariant_summaries(tail, *, packed: bool = False, pipelined: bool = False,
+                                warmup: bool = False) -> dict[str, float]:
     """A language model's watched MLP summaries over eight rows, two padded past their text: the pad id
     `tail` fills them, or, `packed`, its coordinates mark them unreal (no pad id) and `tail` is what
-    they hold; `pipelined`, over two stages of two microbatches."""
+    they hold; `pipelined`, over two stages of two microbatches; `warmup`, an MLA decoder's indexer
+    warm-up, whose loss is the indexer's alone."""
     from model_support import TINY_DECODER
 
     from dew.batch import coordinates
-    from dew.objectives.lm import LMObjective
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.objectives.lm import IndexerTraining, LMObjective
     from dew.registry import models
     from dew.training import MeshSpec
 
-    model = models.build("causal_transformer", vocab_size=64, **{**TINY_DECODER, "num_layers": 4},
-                         num_kv_heads=2)
+    model = (CausalTransformer(vocab_size=64, emb_features=32, num_layers=2, num_heads=2, head_dim=16,
+                               mlp_features=64, max_seq_len=16, mixer={"class": "mla", "fields": {
+                                   "q_lora_rank": 8, "kv_lora_rank": 8, "qk_nope_head_dim": 8,
+                                   "qk_rope_head_dim": 8, "v_head_dim": 8, "index_topk": None,
+                                   "index_n_heads": 2, "index_head_dim": 16}}) if warmup
+             else models.build("causal_transformer", vocab_size=64, **{**TINY_DECODER, "num_layers": 4},
+                               num_kv_heads=2))
+    indexer = {"indexer": IndexerTraining("warmup")} if warmup else {}
     staged = ({"microbatches": 2, "mesh": MeshSpec(fsdp=2, stage=2).build(jax.devices()[:4])} if pipelined
               else {})
-    run = Trainer(LMObjective(model, 16, pad_id=None if packed else tail), optax.sgd(RATE),
+    run = Trainer(LMObjective(model, 16, pad_id=None if packed else tail, **indexer), optax.sgd(RATE),
                   key=jax.random.key(0), inspection=Inspection(modules=("*MLP",), targets=("params",)),
                   **staged)
     tokens = np.random.default_rng(1).integers(1, 63, size=(8, 17)).astype(np.int32)
@@ -550,15 +559,15 @@ def padding_invariant_summaries(tail, *, packed: bool = False, pipelined: bool =
     return {name: value for name, value in inspected(run, batch).items() if "activations" in name}
 
 
-@pytest.mark.parametrize("layout", ["padded", "packed"])
+@pytest.mark.parametrize("layout", ["padded", "packed", "indexer warm-up"])
 def test_a_language_models_watched_layers_read_none_of_its_padding(layout):
     """A language model's watched layers summarize their outputs at its real tokens alone (row 2324): two
     rows padded past their text, once with one id and once with another, whose causal forward is the
     same at every real token and differs at the padding, give the same summary of each MLP to the bit,
     the padding marked by the pad id or by the batch's coordinates."""
-    packed = layout == "packed"
-    first, second = (padding_invariant_summaries(pad, packed=packed) for pad in (0, 63))
-    assert len(first) >= 24 and first == second
+    first, second = (padding_invariant_summaries(pad, packed=layout == "packed",
+                                                 warmup=layout == "indexer warm-up") for pad in (0, 63))
+    assert len(first) >= 12 and first == second
 
 
 @pytest.mark.mesh(devices=4)
@@ -569,9 +578,10 @@ def test_a_pipelined_language_models_watched_layers_read_none_of_its_padding():
     assert len(first) >= 48 and first == second
 
 
-def test_a_preference_runs_watched_layers_are_summarized():
-    """A preference pair objective's watched layers are summarized at its sampled step (row 2324): its
-    chosen and rejected rows, scored as one batch, read from what its scorer prepared."""
+def test_a_preference_runs_watched_layers_read_none_of_its_padding():
+    """A preference pair objective's watched layers are summarized at its sampled step over each half's
+    real tokens alone (row 2324), its prompt and its completion, the padding past them read nowhere:
+    the pairs' padding filled with another id gives the same summaries to the bit."""
     from objective_cases import preference_pairs
 
     from dew.training import MeshSpec
@@ -579,8 +589,12 @@ def test_a_preference_runs_watched_layers_are_summarized():
     objective, batch = preference_pairs()
     run = Trainer(objective, optax.sgd(RATE), key=jax.random.key(0), mesh=MeshSpec().build(jax.devices()[:1]),
                   inspection=Inspection(modules=("*MLP",), targets=("params",)))
-    watched = {name.rsplit("/", 1)[1] for name in inspected(run, batch) if "activations" in name}
-    assert {"mean", "std", "abs_max", "non_finite"} <= watched
+    ids = np.asarray(batch["input_ids"])
+    real = np.arange(ids.shape[-1]) < np.array([4, 3])[None, :, None]
+    refilled = {**batch, "input_ids": np.where(real, ids, 7).astype(ids.dtype)}
+    first, second = ({name: value for name, value in inspected(run, rows).items() if "activations" in name}
+                     for rows in (batch, refilled))
+    assert first and first == second
 
 
 @pytest.mark.mesh(devices=4)
