@@ -85,9 +85,7 @@ class HyperDroneFlight:
                  hz: float = 30.0, substeps: int = 3, rate_limit: float = 4.0, fov: float = 100.0,
                  opening: float = 1.6, frame: float = 0.25, extent: float = 160.0, tile: float = 5.0,
                  seed: int = 0):
-        import hyperlux
         from hyperdrone import dynamics
-        from hyperlux.camera import RGB, CameraSpec
 
         self.count, self.gates, self.substeps = count, gates, substeps
         self.rate_limit, self.fov = rate_limit, fov
@@ -98,25 +96,37 @@ class HyperDroneFlight:
         self.sim = dynamics.Sim(count, parameters={"dynamics": {**shared, "ideal_rates": ideal}}, seed=seed,
                                 control="ctbr", actuation="ideal")
         self.hover_throttle = 1 / ratio
+        self._drawn = size, opening, frame, extent, tile
+        self.renderer = None
+        self._bases = jax.jit(self._placed)
+
+    def _built(self) -> None:
+        """The renderer, built the first time an image is asked for (a race that shows none needs none):
+        the ground and sky, and each drone's gates as placements of its own overlay, its camera's alone."""
+        import hyperlux
+        from hyperlux.camera import RGB, CameraSpec
+
+        size, opening, frame, extent, tile = self._drawn
         scene = hyperlux.Scene()
         scene.add_object(_ground(extent, tile))
         scene.add_light(hyperlux.SceneLight.directional(direction=(0.3, 0.2, -1.0), color=(1.0, 1.0, 1.0)))
         scene.add_light(hyperlux.SceneLight.directional(direction=(-0.5, 0.4, -0.3), color=(0.4, 0.4, 0.5)))
-        scene.set_environment(mode="solid", ambient=(0.3, 0.3, 0.3), background=SKY)
+        scene.set_environment(ambient=(0.3, 0.3, 0.3), background=SKY)
         pool = hyperlux.AssetPool()
         plain, target = (pool.add_assembly(_gate(opening, frame, color)) for color in (GATE, TARGET))
         self._rgb = RGB("rgba8")
-        self.renderer = hyperlux.HyperLux(size, size, batch_size=count, fidelity="medium", num_probes=0,
-                                          cameras=(CameraSpec("front", (self._rgb,)),), num_overlays=count,
-                                          max_overlay_instances=4 * (gates + 1), max_overlays_per_camera=1)
+        self.renderer = hyperlux.HyperLux(
+            size, size, batch_size=self.count, fidelity="medium", num_probes=0,
+            cameras=(CameraSpec("front", (self._rgb,)),), num_overlays=self.count,
+            max_overlay_instances=4 * (self.gates + 1), max_overlays_per_camera=1)
         self.renderer.init(scene, asset_pool=pool)
+        self._scene, self._pool = scene, pool
         placements = []
-        for drone in range(count):
+        for drone in range(self.count):
             self.renderer.attach(drone, drone)
-            placements += [self.renderer.spawn(drone, plain) for _ in range(gates)]
+            placements += [self.renderer.spawn(drone, plain) for _ in range(self.gates)]
             placements.append(self.renderer.spawn(drone, target))
         self._placements = self.renderer.placement_batch(placements)
-        self._bases = jax.jit(self._placed)
 
     def _placed(self, gates: Gates) -> jax.Array:
         """Each placement's base `[count * (gates + 1), 12]`: a drone's gates where they stand, but the one
@@ -164,13 +174,15 @@ class HyperDroneFlight:
     def render(self, gates: Gates) -> jax.Array:
         import hyperlux
 
+        if self.renderer is None:
+            self._built()
         bases = jax.block_until_ready(self._bases(gates))
         self.renderer.set_pose(self._placements, hyperlux.Pose(bases))
         self.renderer.update()
         self.renderer.set_cameras(self.sim.camera_bases(fov=self.fov, aspect=self.renderer.aspect))
         self.renderer.render()
         blocks = [jax.dlpack.from_dlpack(block) for block in self.renderer.outputs[self._rgb].blocks]
-        return jnp.concatenate(blocks)[:, 0, ..., :3]
+        return jnp.concatenate(blocks)[..., :3]
 
 
 __all__ = ["HyperDroneFlight", "thrust_to_weight"]

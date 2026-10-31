@@ -249,7 +249,7 @@ def raced(racing: Racing, track: Track, kinematics: Kinematics,
     reached = jnp.linalg.norm(offset, axis=-1) < racing.gate_radius
     widest = jnp.maximum(jnp.abs(offset[:, 1]), jnp.abs(offset[:, 2]))
     decay = jnp.maximum(0.0, 1.0 - widest / racing.gate_size)
-    along = track.index / max(count - 1, 1)
+    along = track.index.astype(position.dtype) / max(count - 1, 1)
     grown = 1 + (racing.gate_bonus_max_scale - 1) * along ** 2
     bonus = jnp.where(reached, racing.gate_bonus * decay * grown, 0.0)
     index = jnp.where(reached, _following(racing, track.index, count), track.index)
