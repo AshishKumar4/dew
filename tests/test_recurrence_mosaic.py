@@ -828,8 +828,8 @@ def apart_failures(found: list, apart: dict) -> list[str]:
         for kernel in (k for k in kernels if k["kernel"] in refused):
             budget = record["models"][refused[kernel["kernel"]]]["budget"]
             if not kernel["spilled"] and (kernel["registers"] is None or kernel["registers"] < budget):
-                failed.append(f"{record['name']} {kernel['kernel']}: its model refuses it, and ptxas holds it "
-                              f"spill-free in {kernel['registers']} registers, under its budget {budget}")
+                failed.append(f"{record['name']} {kernel['kernel']}: its model refuses it, and ptxas holds "
+                              f"it spill-free in {kernel['registers']} registers, under its budget {budget}")
     return failed
 
 
