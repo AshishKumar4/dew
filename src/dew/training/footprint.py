@@ -141,17 +141,17 @@ ForRewriting`, xla/service/gpu/matmul_utils.cc)."""
 def residual_bytes(loss: Callable, params, arguments: Sequence, *, platform: str) -> int:
     """The device bytes the pullback of `loss(params, *arguments)` in `params` keeps, a device's share,
     as XLA's fusion for `platform` keeps them: each value its traced program (`jax.make_jaxpr` of
-    `jax.vjp`'s pullback) closes over counts the values it is computed from without a buffer
-    (`Frontier.reading`),
-    once, but those the program reads, which the state and the batch already hold, and literals; a value
-    in pinned host memory counts none. A value the pullback closes over keeps its own traced sharding;
-    one whose trace states none, and every other value, count whole. Matching an axis's size to the
-    batch size cannot identify its sharding: a weight or a scan's layer axis can have that size too."""
+    `jax.vjp`'s pullback, as XLA compiles it: `compiled`) closes over counts the values it is computed
+    from without a buffer (`Frontier.reading`), once, but those the program reads, which the state and
+    the batch already hold, and literals; a value in pinned host memory counts none. A value the
+    pullback closes over keeps its own traced sharding; one whose trace states none, and every other
+    value, count whole. Matching an axis's size to the batch size cannot identify its sharding: a weight
+    or a scan's layer axis can have that size too."""
     def pullback(params, *arguments):
         return jax.vjp(lambda trainable: loss(trainable, *arguments), params, has_aux=True)[1]
 
     closed, shapes = jax.make_jaxpr(pullback, return_shape=True)(params, *arguments)
-    program = closed.jaxpr
+    program = compiled(closed.jaxpr, platform)
     placed = {value: shape for value, shape in zip(program.outvars, jax.tree.leaves(shapes), strict=True)
               if not isinstance(value, jcore.Literal)}
     frontier = Frontier(program, platform, returned=False)
@@ -168,7 +168,8 @@ def residual_bytes(loss: Callable, params, arguments: Sequence, *, platform: str
     return total
 
 
-def gradient_peak(loss: Callable, params, arguments: Sequence, *, platform: str, workspace: int) -> Peak:
+def gradient_peak(loss: Callable, params, arguments: Sequence, *, platform: str,
+                  workspace: Workspace) -> Peak:
     """The most device bytes the gradient of `loss(params, *arguments)` in `params` holds at once, a
     device's share, as XLA's fusion for `platform` keeps its values and each matrix product takes
     `workspace` bytes beside them (`peak_bytes`), and whether that is the program's own or a bound from
@@ -179,7 +180,8 @@ def gradient_peak(loss: Callable, params, arguments: Sequence, *, platform: str,
         return pullback(jax.tree.map(jax.numpy.ones_like, outputs))
 
     program = jax.make_jaxpr(gradient)(params, *arguments).jaxpr
-    return Peak(peak_bytes(program, platform, workspace), not bounded_below(program, platform))
+    return Peak(peak_bytes(compiled(program, platform), platform, workspace),
+                not bounded_below(program, platform))
 
 
 def bounded_below(program: jcore.Jaxpr, platform: str) -> bool:
@@ -196,30 +198,33 @@ def bounded_below(program: jcore.Jaxpr, platform: str) -> bool:
         for equation in program.eqns)
 
 
-def peak_bytes(program: jcore.Jaxpr, platform: str, workspace: int) -> int:
+def peak_bytes(program: jcore.Jaxpr, platform: str, workspace: Workspace,
+               slicing: Slicing | None = None) -> int:
     """The most bytes `program` holds at once beside its inputs, its equations run in their traced
     order. A value XLA keeps a buffer of (`Frontier`) is held from the equation that computes it to the
     last that reads it, an output to the end. An equation that takes its operands from memory
     (`Frontier.fusing` says no: a matrix product, a call, a loop) holds beside them each operand a fused
-    chain computes, while it runs, and a matrix product `workspace` bytes too; a call's, a loop's or a
-    checkpoint's own peak, its results among them, stands in for its results while it runs. No schedule
-    XLA picks is modelled: a compile confirms."""
+    chain computes, while it runs, and a cuBLAS matrix product its workspace too (`Workspace`); a
+    call's, a loop's or a checkpoint's own peak, its results among them, stands in for its results while
+    it runs, its body read with what it slices of the loop it runs in (`slicing`). No schedule XLA picks
+    is modelled: a compile confirms."""
     frontier = Frontier(program, platform, returned=True)
     last = {kept: index for index, equation in enumerate(program.eqns)
             for kept in frontier.reading(equation.invars)}
     last.update({kept: len(program.eqns) for kept in frontier.reading(program.outvars)})
-    # A ragged operand's dense expansion, one per operand and group sizes however many ragged products
-    # read it (XLA's common-subexpression elimination), from the first that reads it to the last.
+    sliced = (slicing or Slicing()).within(program, frontier)
     live, held, most = 0, set(), 0
     for index, equation in enumerate(program.eqns):
         made = [out for out in equation.outvars if out in last and frontier.buffered(out)]
         made_bytes = sum(map(device_share, made))
         if made or not frontier.fusing(equation):
-            inner = max((peak_bytes(body, platform, workspace) for body in bodies(equation)), default=0)
+            inner = max((peak_bytes(body, platform, workspace, Slicing.entering(equation, body, frontier))
+                         for body in bodies(equation)), default=0)
             operands = 0 if frontier.fusing(equation) else sum(
                 device_share(value) for value in {value for value in equation.invars if computed(value)}
                 if frontier.made_for(value))
-            products = workspace if cublas_product(equation) else 0
+            products = 0 if not cublas_product(equation) else (
+                workspace.sliced if sliced.fused(equation) else workspace.each)
             # A loop's results (its stacked outputs, its carry) are held beside each turn's own; a call's
             # results are what its body returns.
             running = made_bytes + inner if equation.primitive.name in LOOPS else max(inner, made_bytes)
@@ -230,6 +235,98 @@ def peak_bytes(program: jcore.Jaxpr, platform: str, workspace: int) -> int:
             held.discard(done)
             live -= device_share(done)
     return most
+
+
+ALIGNMENT = 256
+"""The alignment of every buffer XLA allocates on a GPU (`kXlaAllocatedBufferAlignBytes`,
+xla/service/gpu/gpu_constants.h), which a slice fused into a matmul's call must keep."""
+
+
+@dataclasses.dataclass(frozen=True)
+class Slicing:
+    """What a program a loop runs slices of the loop's buffers, which XLA fuses with the cuBLAS matmuls
+    that read or write them (`DynamicSliceFusionRewriterV2`, xla/backends/gpu/transforms/
+    dynamic_slice_fusion_rewriter_v2.cc: a matmul whose operand is, through bitcasts alone, a slice
+    `DynamicSliceAnnotator` annotated, or whose one user updates such a slice into the loop's result;
+    `AnalyzeDynamicSlice`, dynamic_slice_analysis.cc, annotates a contiguous slice whose offsets the
+    loop's induction variable decides). Each turn's slice of a scan's stacked inputs is such a slice
+    (`sliced`), its stacked outputs are updated so (`updated`), and so are the slices a loop's counter
+    offsets (`counter`, the values computed from it alone `counted`), contiguous and aligned
+    (`contiguous_aligned`)."""
+
+    counter: jcore.Var | None = None
+    counted: frozenset = frozenset()
+    sliced: frozenset = frozenset()
+    updated: frozenset = frozenset()
+
+    def within(self, program: jcore.Jaxpr, frontier: Frontier) -> Slicing:
+        """This slicing completed over `program`'s equations: the values computed from the counter and
+        literals alone, the slices they offset, and the views of a slice, which XLA lays out as bitcasts
+        of it or folds into the matmul that reads it (`TransposeFolding`, xla/service/
+        transpose_folding.cc)."""
+        counted = {self.counter} if self.counter is not None else set()
+        sliced, updated = set(self.sliced), set(self.updated)
+        for equation in program.eqns:
+            name = equation.primitive.name
+            reads = [read for read in equation.invars if computed(read)]
+            if name in ("dynamic_slice", "dynamic_update_slice"):
+                offsets = [offset for offset in equation.invars[1 if name == "dynamic_slice" else 2:]
+                           if computed(offset)]
+                if offsets and all(offset in counted for offset in offsets) and contiguous_aligned(equation):
+                    if name == "dynamic_slice":
+                        sliced.update(equation.outvars)
+                    elif computed(update := equation.invars[1]) and frontier.readers[update] == 1:
+                        updated.add(update)
+            elif name in VIEWS | TRANSPOSES and reads and reads[0] in sliced:
+                sliced.update(equation.outvars)
+            elif reads and all(read in counted for read in reads) and not bodies(equation):
+                counted.update(equation.outvars)
+        return dataclasses.replace(self, counted=frozenset(counted), sliced=frozenset(sliced),
+                                   updated=frozenset(updated))
+
+    def fused(self, equation: jcore.JaxprEqn) -> bool:
+        """Whether XLA fuses `equation`, a cuBLAS matmul, with a slice of its loop's buffers: one of its
+        operands is one, or its result is updated as one."""
+        return (any(operand in self.sliced for operand in equation.invars)
+                or any(out in self.updated for out in equation.outvars))
+
+    @staticmethod
+    def entering(equation: jcore.JaxprEqn, body: jcore.Jaxpr, frontier: Frontier) -> Slicing:
+        """The slicing `body`, a program `equation` runs, reads of its loop: for a scan, each turn's slice
+        of its stacked inputs, each stacked output's update where the body computes it for that alone,
+        and its first carry where its turns count it by one (the counter a `fori_loop` over fixed bounds
+        carries); nothing for any other program, which no loop of its own slices."""
+        if equation.primitive.name != "scan":
+            return Slicing()
+        _, carried, stacked = equation.params["ft_in"].update(body.invars).unpack()
+        returned, outputs = equation.params["ft_out"].update(body.outvars).unpack()
+        body_frontier = Frontier(body, frontier.platform, returned=True)
+        sliced = {value for value in stacked if device_share(value) % ALIGNMENT == 0}
+        updated = {value for value in outputs if computed(value) and body_frontier.readers[value] == 1
+                   and device_share(value) % ALIGNMENT == 0}
+        counter = None
+        if carried and returned and carried[0].aval.dtype == np.int32:
+            stepped = any(step.outvars == [returned[0]] and step.primitive.name == "add"
+                          and step.invars[0] is carried[0] and isinstance(step.invars[1], jcore.Literal)
+                          and step.invars[1].val == 1 for step in body.eqns)
+            counter = carried[0] if stepped else None
+        return Slicing(counter, sliced=frozenset(sliced), updated=frozenset(updated))
+
+
+def contiguous_aligned(equation: jcore.JaxprEqn) -> bool:
+    """Whether `equation`, a dynamic slice or update, takes a contiguous extent of its buffer whose bytes
+    keep its alignment (`IsContiguousSlice`, xla/service/gpu/ir_emission_utils.cc: every dimension after
+    the first it cuts whole, its row-major layout's; `IsAlignedSlice`, dynamic_slice_fusion_rewriter_v2.cc:
+    a multiple of `ALIGNMENT` bytes)."""
+    whole = dimensions(equation.invars[0])
+    taken = equation.outvars[0] if equation.primitive.name == "dynamic_slice" else equation.invars[1]
+    part = dimensions(taken)
+    if not whole or len(whole) != len(part):
+        return False
+    cut = next((axis for axis, (full, size) in enumerate(zip(whole, part, strict=True)) if size < full), None)
+    contiguous = cut is None or all(size == 1 for size in part[:cut])
+    element = element_type(equation.invars[0])
+    return contiguous and element is not None and math.prod(part) * element.itemsize % ALIGNMENT == 0
 
 
 class Frontier:
@@ -300,6 +397,61 @@ class Frontier:
         return found
 
 
+def compiled(program: jcore.Jaxpr, platform: str) -> jcore.Jaxpr:
+    """`program` as JAX lowers it for `platform` and XLA compiles it: each `shard_map` over manual axes
+    of one device inline, as its body's equations (`_shard_map_lowering_shardy`, jax/_src/shard_map.py,
+    makes no manual computation of it, so XLA's fusion reads its body with the rest), and each
+    `platform_dependent` conditional the branch the platform lowers alone (`_cond_lowering`,
+    jax/_src/lax/control_flow/conditionals.py keeps one branch, no conditional around it), as a call of
+    it; through every program an equation runs but a Pallas kernel's, which XLA never sees (`bodies`)."""
+    lowered = {"gpu": ("cuda", "rocm")}.get(platform, (platform,))
+    renamed: dict[jcore.Var, jcore.Var | jcore.Literal] = {}
+    equations: list[jcore.JaxprEqn] = []
+
+    def read(value):
+        return renamed.get(value, value) if computed(value) else value
+
+    for equation in program.eqns:
+        name = equation.primitive.name
+        if name == "shard_map" and math.prod(equation.params["mesh"].shape[axis]
+                                             for axis in equation.params["newly_manual_axes"]) == 1:
+            body = compiled(equation.params["jaxpr"], platform)
+            # Its own values, fresh, as one body traced once may be mapped more than once.
+            local = {inner: read(outer) for inner, outer in zip(body.invars, equation.invars, strict=True)}
+            for each in body.eqns:
+                fresh = [out if isinstance(out, jcore.DropVar) else jcore.Var(out.aval)
+                         for out in each.outvars]
+                equations.append(each.replace(invars=[local.get(value, value) if computed(value) else value
+                                                      for value in each.invars], outvars=fresh))
+                local.update(zip(each.outvars, fresh, strict=True))
+            renamed.update({outer: local.get(inner, inner) if computed(inner) else inner
+                            for outer, inner in zip(equation.outvars, body.outvars, strict=True)})
+            continue
+        if name == "pallas_call":
+            equations.append(equation.replace(invars=[read(value) for value in equation.invars]))
+            continue
+        params = dict(equation.params)
+        if name == "cond" and params.get("branches_platforms") is not None:
+            kept = next(index for index, platforms in enumerate(params["branches_platforms"])
+                        if platforms is None or any(each in platforms for each in lowered))
+            params = {**params, "branches": (params["branches"][kept],), "branches_platforms": (None,)}
+        for key, value in params.items():
+            params[key] = within(value, platform)
+        equations.append(equation.replace(invars=[read(value) for value in equation.invars], params=params))
+    return program.replace(eqns=equations, outvars=[read(value) for value in program.outvars])
+
+
+def within(value, platform: str):
+    """`value`, an equation's parameter, with each program in it as `compiled` makes it."""
+    if isinstance(value, jcore.ClosedJaxpr):
+        return value.replace(jaxpr=compiled(value.jaxpr, platform))
+    if isinstance(value, jcore.Jaxpr):
+        return compiled(value, platform)
+    if isinstance(value, tuple | list):
+        return type(value)(within(each, platform) for each in value)
+    return value
+
+
 def computed(value) -> TypeGuard[jcore.Var]:
     """Whether `value` is a program's variable, not a literal it reads."""
     return isinstance(value, jcore.Var) and not isinstance(value, jcore.Literal)
@@ -368,7 +520,12 @@ def dimensions(value) -> tuple[int, ...]:
 
 
 def bodies(equation: jcore.JaxprEqn) -> list[jcore.Jaxpr]:
-    """The programs `equation` runs within it: a call's, a loop's, a branch's or a checkpoint's."""
+    """The programs `equation` runs within it: a call's, a loop's, a branch's or a checkpoint's. A
+    Pallas kernel runs none XLA sees: it is one custom call whose results are its outputs alone, its
+    body's values in registers and shared memory, its products Triton's, no cuBLAS call's
+    (`pallas_call_lowering`, jax/_src/pallas/triton/pallas_call_registration.py)."""
+    if equation.primitive.name == "pallas_call":
+        return []
     found = []
     for value in equation.params.values():
         for each in value if isinstance(value, tuple | list) else (value,):
@@ -394,15 +551,36 @@ def recomputed(equation: jcore.JaxprEqn, platform: str) -> bool:
     return name in CHEAP
 
 
-def gemm_workspace(device) -> int:
-    """The workspace XLA hands each cuBLAS matmul a step on `device` runs, one buffer at a time: from
-    Hopper on 32 MiB, before it 4 MiB (xla/backends/gpu/transforms/gemm_rewriter.cc's
-    `GemmWorkspaceRewriteVisitor`; `GemmConfig::kHopperWorkspace`, `kDefaultWorkspace`,
-    xla/service/gpu/matmul_utils.h); none where the device is no CUDA GPU, whose matmuls take none."""
+class Workspace(NamedTuple):
+    """The workspaces a step's cuBLAS matmuls hold, one buffer at a time (`gemm_workspace`): `each`
+    matmul's, as its config sets it, and `sliced`, a matmul's that XLA fuses with its loop's slice of its
+    operand or its result (`Slicing.fused`), which keeps the one the GEMM rewriter gave it."""
+
+    each: int
+    sliced: int
+
+
+DEFAULT_WORKSPACE = 4 << 20
+"""The workspace of cuBLASLt's default config (`CublasLtBackend::GetDefaultConfig`,
+xla/backends/gpu/autotuner/cublaslt.cc; `GemmConfig::kDefaultWorkspace`, xla/service/gpu/matmul_utils.h)."""
+
+
+def gemm_workspace(device) -> Workspace:
+    """The workspaces XLA hands the cuBLAS matmuls of a step on `device` (`Workspace`): the GEMM
+    rewriter gives each 32 MiB from Hopper on, 4 MiB before (`GemmWorkspaceRewriteVisitor`,
+    xla/backends/gpu/transforms/gemm_rewriter.cc; `GemmConfig::kHopperWorkspace`, matmul_utils.h). On a
+    device the compile autotunes on its config keeps that (`CublasLtBackend::ApplyConfig`, cublaslt.cc);
+    with none (a compile-only GPU, `compile_only_gpus`, no device of this run's), each matmul takes the
+    default config's (`DEFAULT_WORKSPACE`: `GetConfigAssignerOptions`,
+    xla/service/gpu/autotuning/config_assigner_pass.cc, turns autotuning off without a device), but one
+    in a dynamic-slice fusion, whose computation the config assigner does not visit
+    (`ExtractEquivalentInstructions`, xla/backends/autotuner/hlo_extractor.cc). None where the device is
+    no CUDA GPU, whose matmuls take none."""
     capability = _compute_capability(device) if device.platform == 'gpu' else None
     if not capability:
-        return 0
-    return (32 if int(capability.split('.')[0]) >= 9 else 4) << 20
+        return Workspace(0, 0)
+    rewritten = (32 if int(capability.split('.')[0]) >= 9 else 4) << 20
+    return Workspace(rewritten if device in jax.devices() else DEFAULT_WORKSPACE, rewritten)
 
 
 def traced_loss[LossT, EffectsT](objective: Objective[LossT, EffectsT], state: TrainState, window: int

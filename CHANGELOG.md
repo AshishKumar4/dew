@@ -5,9 +5,11 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
-- The fit search's derived first candidate counts what its gradient program holds at its peak, as the
-  GPU's fusion keeps its values, and the GEMM workspace XLA gives that GPU (32 MiB from Hopper on, 4 MiB
-  before). Every compile's plan record carries `derived_headroom` beside its measured `headroom`, and a
+- The fit search's derived first candidate counts what its gradient program holds at its peak, as JAX
+  lowers it and the GPU's fusion keeps its values (a one-device `shard_map` inline, a Pallas kernel its
+  outputs alone, a `platform_dependent` the platform's branch), and the GEMM workspace XLA gives each
+  matmul (32 MiB from Hopper on, 4 MiB before; a compile-only GPU's 4 MiB, but a matmul fused with its
+  loop's slice). A program with a ragged product states its peak as a bound from below. Every compile's plan record carries `derived_headroom` beside its measured `headroom`, and a
   compile the derivation judged otherwise logs a model miss.
 - An inspection's `every` counts windows of the run's accumulation steps; MeanFlow's and LADD's sampled
   steps summarize the forward their loss trains, with no second forward. `dew inspect` views a run
